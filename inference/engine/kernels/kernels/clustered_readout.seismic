@@ -12,6 +12,14 @@ fn cluster_token_rows[M, C, B, K](selected: &tensor[M, K, 2] i32,
                     rows[row, rank * B + offset] = token_order[cluster, offset]
     return rows
 
+# Extract canonical vocabulary IDs from `draft_top_k`'s `(token, 0)` candidate pairs.
+fn shortlist_token_rows[M, K](selected: &tensor[M, K, 2] i32) -> tensor[M, K] i32:
+    let mut rows = tensor[M, K] i32
+    parallel for row in 0..M:
+        parallel for rank in 0..K:
+            rows[row, rank] = selected[row, rank, 0]
+    return rows
+
 # Place compact scores in canonical vocabulary order. Exclusion belongs to
 # proposal policy; this operation never approximates target readout.
 # Each row has unique canonical IDs, established by the model permutation
@@ -40,6 +48,23 @@ native cluster_token_rows for vulkan from "vulkan/cluster_token_rows.comp":
         threads_per_threadgroup (256, 1, 1)
 native cluster_token_rows for cpu from "cpu/cluster_token_rows.rs":
     launch cluster_token_rows:
+        threadgroups (M, 1, 1)
+        threads_per_threadgroup (1, 1, 1)
+
+native shortlist_token_rows for metal from "metal/shortlist_token_rows.metal":
+    launch shortlist_token_rows:
+        threadgroups (ceil_div(K, 256), M, 1)
+        threads_per_threadgroup (256, 1, 1)
+native shortlist_token_rows for cuda from "cuda/shortlist_token_rows.cu":
+    launch shortlist_token_rows:
+        threadgroups (ceil_div(K, 256), min(M, 65535), 1)
+        threads_per_threadgroup (256, 1, 1)
+native shortlist_token_rows for vulkan from "vulkan/shortlist_token_rows.comp":
+    launch shortlist_token_rows:
+        threadgroups (min(ceil_div(M * K, 256), 65535), 1, 1)
+        threads_per_threadgroup (256, 1, 1)
+native shortlist_token_rows for cpu from "cpu/shortlist_token_rows.rs":
+    launch shortlist_token_rows:
         threadgroups (M, 1, 1)
         threads_per_threadgroup (1, 1, 1)
 

@@ -1871,6 +1871,9 @@ pub struct HeadBinding {
     pub feed_forward: FeedForwardProgramSlot,
     pub output_norm: Element,
     pub projection: ReadoutHead,
+    /// Narrow coarse vocabulary projection (`HeadBlock(0), DraftOutput`) when
+    /// shortlist drafting is planned for this head block.
+    pub shortlist: Option<Element>,
     pub activation: Element,
 }
 
@@ -2735,6 +2738,11 @@ impl ModelLoadPlan {
                     component,
                     operators::head_weights(head).map_err(|error| error.to_string())?,
                 )?;
+                if let Some(shortlist) =
+                    plan_head_shortlist(definition, head, &target, target_form, layout)?
+                {
+                    plans.push(shortlist);
+                }
                 Some(HeadWeightsPlan {
                     weights: plans,
                     own_history: head.history == HeadHistory::Own,
@@ -4053,6 +4061,87 @@ fn weight_scale(
 /// The resident dense element of a role (`operators::resident_dtype`).
 pub(super) fn resident_dtype(role: WeightRole, activation: DType) -> DType {
     operators::resident_dtype(role.kind, activation)
+}
+
+/// Plan a narrow 2-bit coarse shortlist copy of the target's `Output`
+/// projection for a causal draft head that projects through the target's
+/// full-precision vocabulary table (`VocabularyProjection::Target`,
+/// `ProposalReadoutPolicy::Full`). Skipped when the target output is
+/// progressive-eligible (`Q8_0` without softcap, which replaces packed
+/// `Output` with planes), when the vocabulary is small, or when the target
+/// output is already narrow.
+fn plan_head_shortlist(
+    definition: &ModelDefinition,
+    head: &magnitude_family_contracts::Head,
+    target: &[WeightPlan],
+    form: ResidentForm,
+    layout: seismic::Layout,
+) -> Result<Option<WeightPlan>, String> {
+    let Some(block) = head.blocks.first() else {
+        return Ok(None);
+    };
+    if operators::CausalHeadBlock::of(head, block).is_err() {
+        return Ok(None);
+    }
+    let Some(output) = target.iter().find(|weight| {
+        weight.role
+            == WeightRole {
+                scope: WeightScope::Target,
+                kind: WeightKind::Output,
+            }
+    }) else {
+        return Ok(None);
+    };
+    if !output.descriptor.transforms.is_empty() || output.upload != output.source {
+        return Ok(None);
+    }
+    // Progressive planes replace packed `Target::Output`, leaving no packed
+    // table for shortlist exact refinement.
+    let progressive_eligible = definition.decoder.exit.softcap.is_none_or(|cap| cap == 0.0)
+        && output.scale.is_none()
+        && crate::import_transforms::progressive_matrix(
+            ProgressiveCodeDepth::Eight,
+            &output.shape,
+            output.source,
+        )
+        .is_some();
+    if progressive_eligible {
+        return Ok(None);
+    }
+    if !crate::shortlist::benefits_from_shortlist(output.source, &output.shape) {
+        return Ok(None);
+    }
+    let upload = crate::shortlist::upload_element();
+    let Some(resident) = resident_storage(upload, ScaledActivations::Rounded, form.activation, layout) else {
+        return Ok(None);
+    };
+    let mut descriptor = WeightDescriptor {
+        transforms: vec![ImportTransform::Shortlist],
+        ..output.descriptor.clone()
+    };
+    let shape =
+        crate::import_transforms::admit_transforms(&descriptor, &output.shape, output.source)?;
+    descriptor.shape = shape.clone();
+    let source_bytes = representation_bytes(upload, &shape)?;
+    let resident_bytes = representation_bytes(resident, &shape)?;
+    let bound = packing_bound(resident, &shape);
+    Ok(Some(WeightPlan {
+        role: WeightRole {
+            scope: WeightScope::HeadBlock(0),
+            kind: WeightKind::DraftOutput,
+        },
+        component: output.component,
+        source: output.source,
+        upload,
+        resident,
+        shape,
+        descriptor,
+        source_bytes,
+        resident_bytes,
+        scale: None,
+        bound,
+        holding: Holding::Whole,
+    }))
 }
 
 fn plan_vision(

@@ -142,6 +142,12 @@ impl WeightDescriptor {
         }
     }
 
+    /// Whether the descriptor places a narrow coarse shortlist projection
+    /// (`ImportTransform::Shortlist`), as its sole transform.
+    pub fn is_shortlist(&self) -> bool {
+        matches!(self.transforms[..], [ImportTransform::Shortlist])
+    }
+
     /// The logical shape `transforms` make of a stored tensor of `stored`
     /// shape.
     pub fn transformed_shape(&self, stored: &[u64]) -> Result<Vec<u64>, DefinitionError> {
@@ -304,6 +310,14 @@ impl WeightDescriptor {
                     }
                     shape = plane.shape(rows, columns, *depth);
                 }
+                ImportTransform::Shortlist => {
+                    if shape.len() != 2 || !shape[1].is_multiple_of(64) {
+                        return Err(DefinitionError::new(format!(
+                            "{:?} is not a matrix of whole 64-value groups",
+                            self.name
+                        )));
+                    }
+                }
             }
         }
         Ok(shape)
@@ -385,6 +399,10 @@ pub enum ImportTransform {
         plane: ProgressivePlane,
         depth: ProgressiveCodeDepth,
     },
+    /// A narrow 2-bit coarse copy of a vocabulary projection matrix for
+    /// draft-head shortlist candidate generation (exact refinement still
+    /// reads the target's full-precision `Output`).
+    Shortlist,
 }
 
 impl ImportTransform {
@@ -618,6 +636,7 @@ impl std::hash::Hash for ImportTransform {
                 plane.hash(state);
                 depth.hash(state);
             }
+            Self::Shortlist => {}
         }
     }
 }
@@ -781,6 +800,10 @@ pub enum WeightKind {
     /// A plane of the output projection's progressive placement
     /// (`ImportTransform::Progressive`), which then replaces `Output`.
     OutputPlane(ProgressivePlane),
+    /// A narrow coarse vocabulary projection derived from the target's
+    /// `Output` (`ImportTransform::Shortlist`) for draft-head shortlist
+    /// candidate generation.
+    DraftOutput,
     HeadEmbeddingNorm,
     HeadHiddenNorm,
     HeadCombine,

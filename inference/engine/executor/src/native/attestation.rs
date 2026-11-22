@@ -256,6 +256,7 @@ pub(crate) struct AttestedHeadBlock {
     pub feed_forward: AttestedFeedForward,
     pub features: NativeKernel<readout_features_rows::Entry>,
     pub logits: ProjectionKernels,
+    pub shortlist: Option<super::ShortlistReadoutKernels>,
 }
 
 /// The entries of a draft head reading target history, in pass order: the
@@ -1260,6 +1261,16 @@ impl AttestedPrograms {
                         },
                         features: slot(&handles.features, binding, "readout_features_rows")?,
                         logits,
+                        shortlist: binding
+                            .shortlist
+                            .map(|_| {
+                                handles
+                                    .shortlist
+                                    .get(&binding)
+                                    .cloned()
+                                    .ok_or_else(|| missing("shortlist_readout", binding))
+                            })
+                            .transpose()?,
                     });
                 }
                 Some(AttestedDrafter::Head(Box::new(AttestedHead {

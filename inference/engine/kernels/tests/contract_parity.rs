@@ -655,6 +655,7 @@ fn contract_node_shape_presence_matches_native_implementation_all_entries() {
         attention_decode_k8v4,
         attention_prefill_k8v4,
         cluster_token_rows,
+        shortlist_token_rows,
         place_logits_rows,
         corrector_features,
         corrector_rows,

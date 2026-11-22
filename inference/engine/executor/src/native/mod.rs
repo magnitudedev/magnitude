@@ -27,6 +27,7 @@ pub(crate) use draft::{
 };
 use glue::GlueKernels;
 use head::HeadKernels;
+pub(crate) use head::ShortlistReadoutKernels;
 pub(crate) use import::ImportKernels;
 use preparation::{NativePreparationCache, PreparedDrafter};
 pub(crate) use specialization::entry_statics;

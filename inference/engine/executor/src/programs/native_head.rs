@@ -81,8 +81,9 @@ use magnitude_kernels::constants::{
     VERIFY_ROWS,
 };
 use magnitude_kernels::{
-    attention_project, draft_rows, feature_copy, guess_chain, readout_features_rows,
-    sample_rows, shape_rows, token_confidence,
+    attention_project, draft_rows, draft_top_k, feature_copy, guess_chain, place_logits_rows,
+    readout_features_rows, readout_project_rows, sample_rows, shape_rows, shortlist_token_rows,
+    token_confidence,
 };
 use magnitude_state::LayerRef;
 use seismic::{
@@ -313,12 +314,20 @@ struct HeadGraphEntries<'a, G: GraphDraft + 'a> {
     feed_forward: HeadFeedForwardEntries<'a, G>,
     features: G::Binding<'a, readout_features_rows::Entry>,
     logits: readout::ProjectionEntries<'a, G>,
+    shortlist: Option<ShortlistEntries<'a, G>>,
     shape: G::Binding<'a, shape_rows::Entry>,
     sample: G::Binding<'a, sample_rows::Entry>,
     /// A drafting graph's proposals' confidences.
     confidence: G::Binding<'a, token_confidence::Entry>,
     /// Of a load that fronts, the chain at its front graphs' tail.
     chain: Option<G::Binding<'a, guess_chain::Entry>>,
+}
+
+struct ShortlistEntries<'a, G: GraphDraft + 'a> {
+    coarse: G::Ranged<'a, readout_project_rows::Entry>,
+    selection: G::Binding<'a, draft_top_k::Entry>,
+    rows: G::Binding<'a, shortlist_token_rows::Entry>,
+    placement: G::Binding<'a, place_logits_rows::Entry>,
 }
 
 enum HeadFeedForwardEntries<'a, G: GraphDraft + 'a> {
@@ -358,6 +367,12 @@ impl<'a> HeadGraphEntries<'a, NativeGraph> {
             },
             features: &block.features,
             logits: readout::ProjectionEntries::prepared(&block.logits),
+            shortlist: block.shortlist.as_ref().map(|shortlist| ShortlistEntries {
+                coarse: &shortlist.coarse,
+                selection: &shortlist.selection,
+                rows: &shortlist.rows,
+                placement: &shortlist.placement,
+            }),
             shape: &head.shape,
             sample: &head.sample,
             confidence: &head.confidence,
@@ -377,6 +392,7 @@ struct CheckedHeadEntries {
     feed_forward: CheckedHeadFeedForwardEntries,
     features: [(&'static str, Element); 2],
     logits: readout::CheckedProjectionEntries,
+    shortlist: Option<[(&'static str, Element); 2]>,
     selection: [(&'static str, Element); 0],
     /// Whether its front graphs' selections feed the chain
     /// (`ModelLoadPlan::fronts`), beside its transactions' proposals.
@@ -428,6 +444,9 @@ impl CheckedHeadEntries {
                 binding.activation,
                 true,
             ),
+            shortlist: binding
+                .shortlist
+                .map(|coarse| [("OW", coarse), ("A", binding.activation)]),
             selection: [],
             fronts: load.fronts(),
         })
@@ -455,6 +474,12 @@ impl CheckedHeadEntries {
             },
             features: G::bind(&self.features),
             logits: self.logits.entries(),
+            shortlist: self.shortlist.as_ref().map(|coarse| ShortlistEntries {
+                coarse: G::bind_ranged(coarse),
+                selection: G::bind(&self.selection),
+                rows: G::bind(&self.selection),
+                placement: G::bind(&self.selection),
+            }),
             shape: G::bind(&self.selection),
             sample: G::bind(&self.selection),
             confidence: G::bind(&self.selection),
@@ -579,6 +604,8 @@ struct HeadDrafting {
     projection: readout::StoredHead,
     /// Whether its passes select through the certified levels.
     certified: bool,
+    /// Whether its passes run narrow coarse-to-exact shortlist readout.
+    shortlist: bool,
 }
 
 /// A head's feed-forward as its builder branches on it.
@@ -735,6 +762,7 @@ struct HeadSplit<'h> {
     feed_forward: (HeadFeedForward<f64>, HeadFeedForwardNumbers<u64>),
     /// The target projection as the head's drafting passes read it.
     plans: readout::HeadPlans<'h>,
+    shortlist: bool,
     weights: GraphWeights<u64>,
 }
 
@@ -811,6 +839,12 @@ impl<'h> HeadSplit<'h> {
             streams,
             feed_forward,
             plans: readout::HeadPlans::for_recipe(load, WeightScope::Target, WeightScope::HeadBlock(0), true)?,
+            shortlist: load
+                .weight_by_role(WeightRole {
+                    scope: WeightScope::HeadBlock(0),
+                    kind: WeightKind::DraftOutput,
+                })
+                .is_some(),
             weights: GraphWeights::of(load, head_reads),
         })
     }
@@ -839,6 +873,7 @@ impl<'h> HeadSplit<'h> {
             steps,
             projection: self.plans.selected(),
             certified: self.plans.certifies(class.slots()),
+            shortlist: self.shortlist,
         });
         // A causal-only transaction only publishes its entry rows' K/V
         // history: nothing reads their attention output, so its pass ends at
@@ -986,6 +1021,29 @@ fn head_graph_draft<'a, G: GraphDraft + 'a>(
             drafting.projection.ports(&mut graph, drafting.certified, &mut readout::PlannedPorts(planned))
         })
         .transpose()?;
+    let shortlist_projection = if topology.drafting.is_some_and(|drafting| drafting.shortlist) {
+        let role = WeightRole {
+            scope: head,
+            kind: WeightKind::DraftOutput,
+        };
+        let port = crate::programs::native_target_graph::weight_port(
+            &mut graph,
+            planned,
+            role,
+            crate::programs::native_target_graph::WeightPart::Values,
+            &mut weights,
+        )?;
+        let empty_scale = GraphConstant::f32(&mut graph, &[])?;
+        let scale = empty_scale.port().clone();
+        constants.push(empty_scale);
+        Some(readout::ProjectionPorts::Packed {
+            weight: port,
+            scale,
+            scale_extent: Dim::from(0),
+        })
+    } else {
+        None
+    };
 
     let entry_dims = [
         ("M", entry_rows.clone()),
@@ -1117,6 +1175,7 @@ fn head_graph_draft<'a, G: GraphDraft + 'a>(
         output_norm: output_norm.as_ref(),
         out_rows: out_rows.as_ref(),
         projection: projection.as_ref(),
+        shortlist: shortlist_projection.as_ref(),
         selections: selections.as_ref(),
         selecting: &selecting,
     };
@@ -1255,6 +1314,7 @@ struct HeadPassContext<'r, 'a, G: GraphDraft + 'a> {
     /// Its selecting passes' projection and selections, and what the
     /// selections feed ([`Selecting`]).
     projection: Option<&'r readout::ProjectionPorts>,
+    shortlist: Option<&'r readout::ProjectionPorts>,
     selections: Option<&'r NativePort>,
     selecting: &'r Selecting<'a, G>,
 }
@@ -1732,41 +1792,136 @@ fn pass_selection<'a, G: GraphDraft + 'a>(
     let (entries, numbers) = (context.entries, context.numbers);
     let (slots, hidden, vocabulary) = (&numbers.slots, &numbers.hidden, &numbers.vocabulary);
     let projection_entries = entries.logits.borrowed();
-    let input = match projection {
-        readout::ProjectionPorts::Packed { .. } => {
-            readout::ReadoutInput::PreparedFeatures {
-                features,
-                canonical_rows: None,
-            }
-        }
-        readout::ProjectionPorts::Progressive { .. } => readout::ReadoutInput::RawRms {
-            hidden: mixed,
-            norm: output_norm,
-            form: context.form,
-            out_rows: pass_rows,
-            epsilon: context.epsilon,
-        },
-    };
     let readout::Readout {
         mut logits,
         certified,
-    } = readout::project_readout(
-        graph,
-        projection_entries,
-        projection,
-        input,
-        readout::ProjectionGeometry {
-            rows: rows.clone(),
-            projected: slots.clone(),
-            selected: slots.clone(),
-            vocabulary: vocabulary.clone(),
-            hidden: hidden.clone(),
-            columns: vocabulary.clone(),
-        },
-        Argument::from(0.0),
-        Some(entries.sample),
-        constants,
-    )?;
+    } = if let (Some(shortlist_entries), Some(shortlist_ports)) =
+        (&entries.shortlist, context.shortlist)
+    {
+        let coarse_logits = readout::project_readout(
+            graph,
+            readout::ProjectionEntries::PreparedPacked(shortlist_entries.coarse),
+            shortlist_ports,
+            readout::ReadoutInput::PreparedFeatures {
+                features,
+                canonical_rows: None,
+            },
+            readout::ProjectionGeometry {
+                rows: rows.clone(),
+                projected: slots.clone(),
+                selected: Dim::from(0),
+                vocabulary: vocabulary.clone(),
+                hidden: hidden.clone(),
+                columns: vocabulary.clone(),
+            },
+            Argument::from(0.0),
+            None,
+            constants,
+        )?
+        .logits;
+        let k = Dim::from(crate::shortlist::SHORTLIST_K);
+        let top_dims = [
+            ("M", slots.clone()),
+            ("V", vocabulary.clone()),
+            ("K", k.clone()),
+        ];
+        let candidates_port = graph.local_for(shortlist_entries.selection, "candidates", &top_dims)?;
+        let unary_port = graph.local_for(shortlist_entries.selection, "unary", &top_dims)?;
+        let mut candidates = candidates_port.tensor().clone();
+        let mut unary = unary_port.tensor().clone();
+        graph.enqueue(
+            shortlist_entries.selection,
+            &top_dims,
+            draft_top_k::WorkflowArgs {
+                logits: (&coarse_logits).into(),
+                candidates: (&mut candidates).into(),
+                unary: (&mut unary).into(),
+            },
+        )?;
+        let token_rows = graph
+            .enqueue(
+                shortlist_entries.rows,
+                &[("M", slots.clone()), ("K", k.clone())],
+                shortlist_token_rows::WorkflowArgs {
+                    selected: (&candidates.reshape(&[slots.clone(), k.clone(), Dim::from(2)])).into(),
+                },
+            )?
+            .value;
+        let compact = readout::project_readout(
+            graph,
+            projection_entries,
+            projection,
+            readout::ReadoutInput::PreparedFeatures {
+                features,
+                canonical_rows: Some(&token_rows),
+            },
+            readout::ProjectionGeometry {
+                rows: rows.clone(),
+                projected: slots.clone(),
+                selected: Dim::from(0),
+                vocabulary: vocabulary.clone(),
+                hidden: hidden.clone(),
+                columns: k.clone(),
+            },
+            Argument::from(0.0),
+            None,
+            constants,
+        )?
+        .logits;
+        let placement_dims = [
+            ("M", slots.clone()),
+            ("V", vocabulary.clone()),
+            ("S", k),
+        ];
+        let logits_port = graph.local_for(shortlist_entries.placement, "logits", &placement_dims)?;
+        let mut placed = logits_port.tensor().clone();
+        graph.enqueue(
+            shortlist_entries.placement,
+            &placement_dims,
+            place_logits_rows::WorkflowArgs {
+                scores: (&compact).into(),
+                token_rows: (&token_rows).into(),
+                logits: (&mut placed).into(),
+            },
+        )?;
+        readout::Readout {
+            logits: placed,
+            certified: None,
+        }
+    } else {
+        let input = match projection {
+            readout::ProjectionPorts::Packed { .. } => {
+                readout::ReadoutInput::PreparedFeatures {
+                    features,
+                    canonical_rows: None,
+                }
+            }
+            readout::ProjectionPorts::Progressive { .. } => readout::ReadoutInput::RawRms {
+                hidden: mixed,
+                norm: output_norm,
+                form: context.form,
+                out_rows: pass_rows,
+                epsilon: context.epsilon,
+            },
+        };
+        readout::project_readout(
+            graph,
+            projection_entries,
+            projection,
+            input,
+            readout::ProjectionGeometry {
+                rows: rows.clone(),
+                projected: slots.clone(),
+                selected: slots.clone(),
+                vocabulary: vocabulary.clone(),
+                hidden: hidden.clone(),
+                columns: vocabulary.clone(),
+            },
+            Argument::from(0.0),
+            Some(entries.sample),
+            constants,
+        )?
+    };
     let mut result = selections
         .tensor()
         .slice_leading(slots * pass, slots * (pass + 1));

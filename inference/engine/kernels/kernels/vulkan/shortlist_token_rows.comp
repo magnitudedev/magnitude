@@ -1,0 +1,10 @@
+#include <seismic/element.glsl>
+void shortlist_token_rows() {
+    const uint64_t selected = SEISMIC_PTR(SEISMIC_BUFFER_SELECTED), rows = SEISMIC_PTR(SEISMIC_RESULT_0_BUFFER);
+    for (seismic_walk at = seismic_walk_grid(SEISMIC_DIM_M * SEISMIC_DIM_K, u64vec3(1ul, 1ul, SEISMIC_DIM_K));
+            at.index < SEISMIC_DIM_M * SEISMIC_DIM_K; seismic_walk_next(at)) {
+        const uint64_t row = at.axes.x, rank = at.axes.w;
+        const int token = element_i32_at(selected + (row * SEISMIC_SELECTED_STRIDE_0 + rank * SEISMIC_SELECTED_STRIDE_1) * 4ul);
+        element_i32_put(rows + (row * SEISMIC_RESULT_0_STRIDE_0 + rank * SEISMIC_RESULT_0_STRIDE_1) * 4ul, token);
+    }
+}

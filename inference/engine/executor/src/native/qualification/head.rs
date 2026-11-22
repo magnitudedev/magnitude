@@ -238,7 +238,7 @@ impl<'a> QualificationView<'a> {
                 }
                 logits => logits,
             };
-            match (logits, binding.projection) {
+            match (logits, binding.projection, &block.shortlist, binding.shortlist) {
                 (
                     ProjectionKernels::PreparedPacked(kernel),
                     ReadoutHead::Packed {
@@ -249,6 +249,126 @@ impl<'a> QualificationView<'a> {
                         weight: element,
                         weight_scale,
                     },
+                    Some(shortlist),
+                    Some(coarse_element),
+                ) => {
+                    let k = crate::shortlist::SHORTLIST_K;
+                    let coarse_weight = semantic_pattern(
+                        charges,
+                        coarse_element,
+                        &[vocabulary, hidden],
+                        "head",
+                        &label,
+                    )?;
+                    let empty_rows = semantic_zeros(
+                        charges,
+                        Element::i32(),
+                        &[out_rows.extents()[0], 0, vocabulary],
+                        "head",
+                        &label,
+                    )?;
+                    let no_scale = semantic_ones(charges, Element::f32(), &[0], "head", &label)?;
+                    let coarse_logits = shortlist
+                        .coarse
+                        .first()
+                        .call(charges, readout_project_rows::Args {
+                            features: &projected_features,
+                            weight: &coarse_weight,
+                            token_rows: &empty_rows,
+                            weight_scale: &no_scale,
+                            softcap: 0.0,
+                        })
+                        .map_err(|error| {
+                            qualification_dynamic("readout_project_rows(shortlist coarse)", &label, error)
+                        })?
+                        .value;
+                    require_finite_nonzero_f32(&coarse_logits, "readout_project_rows(shortlist coarse)", &label)?;
+                    let mut candidates = semantic_zeros(
+                        charges,
+                        Element::i32(),
+                        &[out_rows.extents()[0] * k, 2],
+                        "head",
+                        &label,
+                    )?;
+                    let mut unary = semantic_zeros(
+                        charges,
+                        Element::f32(),
+                        &[out_rows.extents()[0], k],
+                        "head",
+                        &label,
+                    )?;
+                    shortlist
+                        .selection
+                        .call(charges, magnitude_kernels::draft_top_k::Args {
+                            logits: &coarse_logits,
+                            candidates: &mut candidates,
+                            unary: &mut unary,
+                        })
+                        .map_err(|error| qualification_dynamic("draft_top_k", &label, error))?;
+                    let candidates_3d = candidates
+                        .reshape(&[out_rows.extents()[0], k, 2])
+                        .map_err(|error| qualification_dynamic("shortlist_token_rows", &label, error))?;
+                    let token_rows = shortlist
+                        .rows
+                        .call(charges, magnitude_kernels::shortlist_token_rows::Args {
+                            selected: &candidates_3d,
+                        })
+                        .map_err(|error| qualification_dynamic("shortlist_token_rows", &label, error))?
+                        .value;
+                    let token_rows_3d = token_rows
+                        .reshape(&[out_rows.extents()[0], 1, k])
+                        .map_err(|error| qualification_dynamic("readout_project_rows", &label, error))?;
+                    let projection =
+                        semantic_pattern(charges, element, &[vocabulary, hidden], "head", &label)?;
+                    let scale = semantic_ones(
+                        charges,
+                        Element::f32(),
+                        &[u64::from(weight_scale)],
+                        "head",
+                        &label,
+                    )?;
+                    let compact = kernel
+                        .first()
+                        .call(charges, readout_project_rows::Args {
+                            features: &projected_features,
+                            weight: &projection,
+                            token_rows: &token_rows_3d,
+                            weight_scale: &scale,
+                            softcap: 0.0,
+                        })
+                        .map_err(|error| {
+                            qualification_dynamic("readout_project_rows(shortlist refine)", &label, error)
+                        })?
+                        .value;
+                    require_finite_nonzero_f32(&compact, "readout_project_rows(shortlist refine)", &label)?;
+                    let mut placed = semantic_zeros(
+                        charges,
+                        Element::f32(),
+                        &[out_rows.extents()[0], vocabulary],
+                        "head",
+                        &label,
+                    )?;
+                    shortlist
+                        .placement
+                        .call(charges, magnitude_kernels::place_logits_rows::Args {
+                            scores: &compact,
+                            token_rows: &token_rows,
+                            logits: &mut placed,
+                        })
+                        .map_err(|error| qualification_dynamic("place_logits_rows", &label, error))?;
+                }
+                (
+                    ProjectionKernels::PreparedPacked(kernel),
+                    ReadoutHead::Packed {
+                        weight: element,
+                        weight_scale,
+                    }
+                    | ReadoutHead::Qualified {
+                        weight: element,
+                        weight_scale,
+                    },
+                    None,
+                    None,
                 ) => {
                     let projection =
                         semantic_pattern(charges, element, &[vocabulary, hidden], "head", &label)?;

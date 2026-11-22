@@ -1404,21 +1404,37 @@ impl ResidencyStore {
             self.execution.device().backend(),
         );
         // The plan dequantizes a packed weight on the host when its kernels
-        // read dense weights only: it uploads F32 and becomes dense.
+        // read dense weights only: it uploads F32 and becomes dense. A
+        // shortlist projection quantizes the target output to `gguf_q2_0` on
+        // the host and repacks it into `q2g64` via the standard importer.
         let dequantized = planned.upload != planned.source;
-        let (upload, actual_resident) = match stored {
-            Stored::Dense { .. } => (actual_source, Element::dense(target)),
-            Stored::GgmlBlocks { .. } if dequantized => (Element::f32(), Element::dense(target)),
-            Stored::GgmlBlocks { .. } => (
-                actual_source,
+        let (upload, actual_resident) = if descriptor.is_shortlist() {
+            let shortlist = crate::shortlist::upload_element();
+            (
+                shortlist,
                 crate::planning::resident_storage(
-                    actual_source,
-                    crate::import_transforms::scaled_activations(descriptor),
+                    shortlist,
+                    magnitude_family_contracts::ScaledActivations::Rounded,
                     target,
                     layout,
                 )
-                .ok_or_else(|| invalid("unsupported packed resident representation"))?,
-            ),
+                .ok_or_else(|| invalid("unsupported shortlist resident representation"))?,
+            )
+        } else {
+            match stored {
+                Stored::Dense { .. } => (actual_source, Element::dense(target)),
+                Stored::GgmlBlocks { .. } if dequantized => (Element::f32(), Element::dense(target)),
+                Stored::GgmlBlocks { .. } => (
+                    actual_source,
+                    crate::planning::resident_storage(
+                        actual_source,
+                        crate::import_transforms::scaled_activations(descriptor),
+                        target,
+                        layout,
+                    )
+                    .ok_or_else(|| invalid("unsupported packed resident representation"))?,
+                ),
+            }
         };
         // The importer uploads the transformed source: its logical shape in
         // the upload representation.

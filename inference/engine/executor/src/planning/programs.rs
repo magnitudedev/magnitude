@@ -1039,6 +1039,16 @@ pub(super) fn derive_program_plan(
                                 WeightScope::Target,
                                 readout_choices,
                             )?,
+                            shortlist: weights
+                                .iter()
+                                .find(|weight| {
+                                    weight.role
+                                        == WeightRole {
+                                            scope,
+                                            kind: WeightKind::DraftOutput,
+                                        }
+                                })
+                                .map(|weight| weight.resident),
                             activation: active_element,
                         });
                     }

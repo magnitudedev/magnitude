@@ -165,6 +165,14 @@ pub(crate) fn admit_transforms(
                     ));
                 }
             }
+            ImportTransform::Shortlist => {
+                if !descriptor.is_shortlist() || !crate::shortlist::admits_matrix(source, stored) {
+                    return Err(format!(
+                        "{:?}: a shortlist projection must be its descriptor's only transform on a decodable 64-aligned matrix",
+                        descriptor.name
+                    ));
+                }
+            }
             _ => {}
         }
         // The shape after this transform: its prefix's, which also checks
@@ -321,6 +329,12 @@ pub(crate) fn apply(
                     descriptor.name
                 ));
             }
+            ImportTransform::Shortlist => {
+                return Err(format!(
+                    "{:?}: a shortlist projection is quantized by `upload_bytes`",
+                    descriptor.name
+                ));
+            }
         }
     }
     Ok(planes.planar(&shape))
@@ -392,6 +406,9 @@ pub(crate) fn upload_bytes(
     let shape = stored.shape();
     if let Some((plane, placement)) = placement(&plan.descriptor, shape, plan.source)? {
         return Ok(crate::progressive::plane(plane, &placement, &bytes));
+    }
+    if plan.descriptor.is_shortlist() {
+        return crate::shortlist::quantize(plan.source, shape, &bytes);
     }
     let grid = stored
         .grid()

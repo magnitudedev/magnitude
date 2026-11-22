@@ -507,10 +507,28 @@ pub(crate) fn import_optional_head(
                     .draft()
                     .ok_or_else(|| invalid("a separate draft head has no draft component"))?,
             };
+            let mut resident_weights =
+                ResidentRoles::import(weights, residency, charges, artifact, activation)?;
+            let shortlist_role = WeightRole {
+                scope: WeightScope::HeadBlock(0),
+                kind: WeightKind::DraftOutput,
+            };
+            if let Some(plan) = residency.planned(shortlist_role) {
+                let descriptor = plan.descriptor.clone();
+                let weight = residency.import_gguf(
+                    charges,
+                    package.target(),
+                    &descriptor,
+                    operators::resident_dtype(shortlist_role.kind, activation),
+                )?;
+                if resident_weights.0.insert(shortlist_role, weight).is_some() {
+                    return Err(invalid(format!("weight role {shortlist_role:?} is bound twice")));
+                }
+            }
             Ok(ResidentHead {
                 embedding,
                 depth: head.depth(),
-                weights: ResidentRoles::import(weights, residency, charges, artifact, activation)?,
+                weights: resident_weights,
                 output,
             })
         })

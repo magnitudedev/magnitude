@@ -57,6 +57,7 @@ mod operators;
 mod planning;
 pub mod programs;
 mod progressive;
+mod shortlist;
 mod slot_directory;
 mod storage_thread;
 mod two_row;
