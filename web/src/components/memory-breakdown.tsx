@@ -2,7 +2,7 @@ import { Option } from "effect"
 import type { LocalInferenceHardware, ModelInstanceAllocation, ModelStreamingStatus } from "@magnitudedev/sdk"
 import {
   deriveHardwareMemoryView,
-  formatMemorySize,
+  formatMemoryCapacity,
   memoryDomainBarLayout,
   participatingMemoryDomains,
   streamingResidencySummary,
@@ -21,8 +21,8 @@ function DomainMemoryBar({ layout }: { readonly layout: MemoryDomainBarLayout })
       <span className="settings-memory-domain-label">{domain.label}</span>
       <span className="settings-memory-total">
         {modelBytes !== null
-          ? <><strong data-memory-bytes={modelBytes}>{formatMemorySize(modelBytes)}</strong><span>model · {formatMemorySize(domain.totalBytes)} total</span></>
-          : <span>{formatMemorySize(domain.totalBytes)} total</span>}
+          ? <><strong data-memory-bytes={modelBytes}>{formatMemoryCapacity(modelBytes)}</strong><span>model · {formatMemoryCapacity(domain.totalBytes)} total</span></>
+          : <span>{formatMemoryCapacity(domain.totalBytes)} total</span>}
       </span>
     </div>
     <div className="settings-memory-bar" aria-hidden="true">
@@ -44,17 +44,17 @@ function DomainMemoryBar({ layout }: { readonly layout: MemoryDomainBarLayout })
             {leftSegments.map(segment => <span key={segment.key} className="settings-memory-item">
               <span aria-hidden="true" className={`settings-memory-key ${segment.key}`} />
               <span>{segment.label}</span>
-              <strong data-memory-category={segment.label} data-bytes={segment.bytes}>{formatMemorySize(segment.bytes)}</strong>
+              <strong data-memory-category={segment.label} data-bytes={segment.bytes}>{formatMemoryCapacity(segment.bytes)}</strong>
             </span>)}
             {freeBytes !== null && <span className="settings-memory-item">
               <span aria-hidden="true" className="settings-memory-key free" />
               <span>Free</span>
-              <strong data-memory-category="Free" data-bytes={freeBytes}>{formatMemorySize(freeBytes)}</strong>
+              <strong data-memory-category="Free" data-bytes={freeBytes}>{formatMemoryCapacity(freeBytes)}</strong>
             </span>}
             {rightSegment !== null && <span className="settings-memory-item">
               <span aria-hidden="true" className="settings-memory-key other" />
               <span>{rightSegment.label}</span>
-              <strong data-memory-category={rightSegment.label} data-bytes={rightSegment.bytes}>{formatMemorySize(rightSegment.bytes)}</strong>
+              <strong data-memory-category={rightSegment.label} data-bytes={rightSegment.bytes}>{formatMemoryCapacity(rightSegment.bytes)}</strong>
             </span>}
           </div>
           {domain.notice !== null && <span className="settings-memory-notice">{domain.notice}</span>}
@@ -95,13 +95,13 @@ function ModelOnlyMemoryBar({ allocation }: { readonly allocation: Option.Option
     <div className="settings-memory-legend">
       <span className="settings-memory-total">
         <span>Model memory</span>
-        <strong data-memory-bytes={total}>{formatMemorySize(total)}</strong>
+        <strong data-memory-bytes={total}>{formatMemoryCapacity(total)}</strong>
       </span>
       <div className="settings-memory-parts">
         {segments.map(segment => <span key={segment.label} className="settings-memory-item">
           <span aria-hidden="true" className={`settings-memory-key ${segment.color}`} />
           <span>{segment.label}</span>
-          <strong data-memory-category={segment.label} data-bytes={segment.bytes}>{formatMemorySize(segment.bytes)}</strong>
+          <strong data-memory-category={segment.label} data-bytes={segment.bytes}>{formatMemoryCapacity(segment.bytes)}</strong>
         </span>)}
       </div>
     </div>

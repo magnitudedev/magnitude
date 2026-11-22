@@ -2,10 +2,12 @@ import { renderToStaticMarkup } from "react-dom/server"
 import { expect, it } from "vitest"
 import { Option, Schema } from "effect"
 import { ModelInstanceAllocationSchema } from "@magnitudedev/sdk"
-import { formatMemorySize } from "@magnitudedev/client-common"
+import { formatMemoryCapacity } from "@magnitudedev/client-common"
 import { servingHardware } from "@magnitudedev/client-common/fixtures/hardware"
 import { streamingStatus } from "@magnitudedev/client-common/fixtures/model"
 import { MemoryFigures } from "./memory-breakdown"
+import { MachineCard } from "./models/parts"
+import { machineView } from "./models/machine"
 
 const GiB = 1024 ** 3
 const discreteHardware = Option.some(servingHardware("Discrete"))
@@ -34,7 +36,8 @@ it("renders one full-capacity bar on unified memory with model left, free in the
   expect(html).toContain('data-memory-domain="system"')
   expect(html).toContain("Unified memory")
   expect(html).toContain(`data-memory-bytes="${6 * GiB}"`)
-  expect(html).toContain(`model · ${formatMemorySize(16 * GiB)} total`)
+  expect(html).toContain(`model · ${formatMemoryCapacity(16 * GiB)} total`)
+  expect(html).toContain("model · 16 GB total")
   for (const [label, bytes] of [
     ["Weights", 3.5 * GiB],
     ["Context", 2 * GiB],
@@ -59,6 +62,25 @@ it("renders stacked full-capacity bars for GPU memory and system memory on discr
   expect(html).toContain("System memory")
   expect(html).toContain(`data-memory-bytes="${4.5 * GiB}"`)
   expect(html).toContain(`data-memory-bytes="${1.5 * GiB}"`)
+})
+
+it("matches MachineCard hardware capacity units for GPU and RAM totals", () => {
+  const base = servingHardware("Discrete")
+  const hw = {
+    ...base,
+    totalSystemMemoryBytes: 32 * GiB,
+    memoryDomains: base.memoryDomains.map(domain => domain.kind === "PhysicalDevice"
+      ? { ...domain, totalBytes: Math.round(8.5 * GiB), availableBytes: Option.none() }
+      : { ...domain, totalBytes: 32 * GiB, availableBytes: Option.some(24 * GiB) }),
+  }
+  const machineHtml = renderToStaticMarkup(<MachineCard machine={machineView(hw)} />)
+  const statusHtml = renderToStaticMarkup(<MemoryFigures allocation={Option.some(splitAllocation)} hardware={Option.some(hw)} />)
+  expect(machineHtml).toContain(">8.5 GB<")
+  expect(machineHtml).toContain(">32 GB<")
+  expect(statusHtml).toContain("8.5 GB total")
+  expect(statusHtml).toContain("32 GB total")
+  expect(statusHtml).not.toContain("9.1 GB total")
+  expect(statusHtml).not.toContain("34.4 GB total")
 })
 
 it("renders a single compact streaming residency row for streamed models and nothing for resident models", () => {
