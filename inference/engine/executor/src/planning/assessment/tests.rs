@@ -2850,3 +2850,59 @@ fn stable_live_status_and_live_ledger_agree_on_store_demands() {
         }
     );
 }
+
+/// On Windows WDDM Vulkan (e.g. AMD V710 8.5 GiB where `VK_EXT_memory_budget`
+/// permanently caps idle headroom at `8,055,599,104` B below the `9,126,805,504` B
+/// physical heap), `MemoryBudget::stable` and `MemoryBudget::live_status` agree
+/// on the budgeted ceiling so static catalog assessment never recommends a
+/// context tier that immediately fails load with `409 memory_shortage`.
+#[test]
+fn wddm_vulkan_stable_and_live_status_agree_on_heap_budget() {
+    use crate::MemoryBudget;
+
+    const HEAP_BYTES: u64 = 9_126_805_504;
+    const WDDM_BUDGET: u64 = 8_055_599_104;
+    const OVER_BUDGET_32K: u64 = 8_556_619_612;
+    const FITTING_16K: u64 = 7_913_000_000;
+
+    let mut reports = seismic::fixtures::rtx3090_host();
+    let mut vulkan = seismic::fixtures::rtx3090_vulkan(seismic::fixtures::rtx3090_uuid());
+    vulkan.memory.heaps[0].bytes = HEAP_BYTES;
+    vulkan.memory.heaps[0].budget = Some(WDDM_BUDGET);
+    for kind in &mut vulkan.kinds {
+        if let seismic::KindMemory::Heap { index: 0, bytes, .. } = &mut kind.memory {
+            *bytes = HEAP_BYTES;
+        }
+    }
+    reports.vulkan.push(vulkan);
+    let topo = seismic::fixtures::topology(&reports);
+    let exec = executor(&topo, BackendName::Vulkan);
+    let path_id = exec.paths(seismic::Contract::DeviceOnly)[0];
+    let mut status = unopened(&topo);
+    status.sample.grants.push((
+        path_id,
+        Ok(seismic::Reported::new(WDDM_BUDGET, seismic::ReportedBy::VulkanHeapBudget)),
+    ));
+
+    let stable = MemoryBudget::stable(&topo, exec, &status).unwrap();
+    let live = MemoryBudget::live_status(&topo, exec, &status).unwrap();
+    assert_eq!(stable.capacity(), WDDM_BUDGET);
+    assert_eq!(stable.available(), WDDM_BUDGET);
+    assert_eq!(live.capacity(), WDDM_BUDGET);
+    assert_eq!(live.available(), WDDM_BUDGET);
+    assert!(!live.live_below_capacity());
+
+    let over_charge = fixture_charge(OVER_BUDGET_32K, 256 << 20);
+    assert!(matches!(
+        stable.fit(&topo, exec, &over_charge).unwrap().verdict,
+        AssessmentFitVerdict::DoesNotFit { .. }
+    ));
+    assert!(matches!(
+        live.fit(&topo, exec, &over_charge).unwrap().verdict,
+        AssessmentFitVerdict::DoesNotFit { .. }
+    ));
+
+    let fit_charge = fixture_charge(FITTING_16K, 256 << 20);
+    assert_eq!(stable.fit(&topo, exec, &fit_charge).unwrap().verdict, AssessmentFitVerdict::Fits);
+    assert_eq!(live.fit(&topo, exec, &fit_charge).unwrap().verdict, AssessmentFitVerdict::Fits);
+}

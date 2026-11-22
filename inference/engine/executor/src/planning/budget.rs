@@ -134,21 +134,24 @@ impl MemoryBudget {
         let at = reading.room_after(ledgers);
         let host_ram = topology.host_ram().id();
         let unified_host = DomainRole::of(topology, executor, host_ram) == DomainRole::Allocation;
-        let device_store = if unified_host {
-            host_ram
-        } else {
+        let device_path = (!unified_host).then(|| {
             executor
                 .paths(Contract::DeviceOnly)
                 .first()
                 .and_then(|id| topology.access_path(*id))
-                .map(|path| path.store())
                 .expect("invariant violated: executor has no device storage path")
+        });
+        let device_store = device_path.map_or(host_ram, |path| path.store());
+        let device_available = at.device.room().saturating_add(held);
+        let device_capacity = match device_path.and_then(|path| path.grant()) {
+            Some(grant) => at.device.capacity().min(grant.bytes.value).max(device_available),
+            None => at.device.capacity(),
         };
         let device = StoreBudget {
             store: Some(device_store),
             role: DomainRole::Allocation,
-            capacity: at.device.capacity(),
-            available: at.device.room().saturating_add(held),
+            capacity: device_capacity,
+            available: device_available,
         };
         let host = if unified_host {
             None

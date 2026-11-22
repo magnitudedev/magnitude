@@ -175,6 +175,12 @@ pub struct VulkanHeap {
     pub bytes: u64,
     /// `VK_MEMORY_HEAP_DEVICE_LOCAL_BIT`.
     pub device_local: bool,
+    /// `VK_EXT_memory_budget` `heapBudget` observed at discovery (`None` when
+    /// unreported, e.g. in static fixtures). On Windows WDDM this is
+    /// permanently below `bytes` even on an idle GPU (~10–15% OS carve-out);
+    /// static `Grant` sizing caps at this budget so catalog assessment agrees
+    /// with live `VK_EXT_memory_budget` headroom.
+    pub budget: Option<u64>,
 }
 
 /// One display adapter as the OS reports it.
@@ -611,13 +617,23 @@ pub fn build(revision: Revision, reports: &Reports) -> DeviceTopology {
         // imported host pages.
         let alike = match placement {
             Ok(Decided::Host) => {
-                let total = heaps.heaps.iter().map(|heap| heap.bytes).sum::<u64>();
+                let raw_total = heaps.heaps.iter().map(|heap| heap.bytes).sum::<u64>();
+                let budgeted_total = heaps
+                    .heaps
+                    .iter()
+                    .map(|heap| heap.budget.map_or(heap.bytes, |budget| budget.min(heap.bytes)))
+                    .sum::<u64>();
+                let total = if budgeted_total < raw_total {
+                    Reported::new(budgeted_total, ReportedBy::VulkanHeapBudget)
+                } else {
+                    Reported::new(raw_total, ReportedBy::VulkanHeaps)
+                };
                 let all = (0..heaps.heaps.len()).collect::<Vec<_>>();
                 Some(host_class_paths(
                     &mut executor,
                     own,
                     host_ram,
-                    Reported::new(total, ReportedBy::VulkanHeaps),
+                    total,
                     ReportedBy::VulkanHeapsBeyondDedicated,
                     GrantKind::HostBudget,
                     |before| {
@@ -644,10 +660,16 @@ pub fn build(revision: Revision, reports: &Reports) -> DeviceTopology {
                         if !is_window(kind) =>
                     {
                         vec![*local.entry(index).or_insert_with(|| {
+                            let granted = match heaps.heaps.get(index).and_then(|heap| heap.budget) {
+                                Some(budget) if budget < bytes => {
+                                    Reported::new(budget, ReportedBy::VulkanHeapBudget)
+                                }
+                                _ => Reported::new(bytes, ReportedBy::VulkanHeap),
+                            };
                             executor.granted(
                                 own.expect("a device-local heap is its own memory").0,
                                 Grant {
-                                    bytes: Reported::new(bytes, ReportedBy::VulkanHeap),
+                                    bytes: granted,
                                     kind: GrantKind::DeviceUnopened,
                                 },
                                 Some(GrantSource::VulkanHeaps {
@@ -866,6 +888,7 @@ mod tests {
                 heaps: vec![VulkanHeap {
                     bytes: WINDOW_BYTES,
                     device_local: true,
+                    budget: None,
                 }],
             },
             kinds: vec![KindReport {

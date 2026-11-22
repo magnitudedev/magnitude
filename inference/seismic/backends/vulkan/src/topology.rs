@@ -35,9 +35,26 @@ pub(crate) fn kinds(info: &crate::DeviceInfo) -> Vec<KindReport> {
     layout_kinds(&info.memory)
 }
 
-/// `layout`'s heaps as its report states them.
-fn heaps(layout: &crate::MemoryLayout) -> Vec<VulkanHeap> {
-    layout.heaps.iter().map(|heap| VulkanHeap { bytes: heap.bytes, device_local: heap.device_local }).collect()
+/// `layout`'s heaps as its report states them, pairing each heap with its
+/// discovery-time `VK_EXT_memory_budget` `heapBudget` when the device meets
+/// the floor and reports a positive budget.
+fn heaps(layout: &crate::MemoryLayout, budgets: Option<&[crate::HeapBudget]>) -> Vec<VulkanHeap> {
+    layout
+        .heaps
+        .iter()
+        .enumerate()
+        .map(|(index, heap)| {
+            let budget = budgets
+                .and_then(|budgets| budgets.get(index))
+                .map(|entry| entry.budget.min(heap.bytes))
+                .filter(|&budget| budget > 0);
+            VulkanHeap {
+                bytes: heap.bytes,
+                device_local: heap.device_local,
+                budget,
+            }
+        })
+        .collect()
 }
 
 /// Every Vulkan device's report, with its handle, which status samples
@@ -81,6 +98,10 @@ fn vulkan_report(description: &crate::Description) -> VulkanReport {
         crate::DeviceType::Discrete => ExecutorKind::DiscreteGpu,
         crate::DeviceType::Other => ExecutorKind::Other,
     };
+    let budgets = description
+        .floor
+        .is_ok()
+        .then(|| description.handle.heap_budgets());
     VulkanReport {
         uuid: device.uuid,
         kind,
@@ -97,7 +118,7 @@ fn vulkan_report(description: &crate::Description) -> VulkanReport {
         host_node: HostNode::Any,
         memory: VulkanMemory {
             luid: device.luid,
-            heaps: heaps(&device.memory),
+            heaps: heaps(&device.memory, budgets.as_deref()),
         },
         kinds: kinds(device),
         properties: description
@@ -159,5 +180,27 @@ mod tests {
             let layout = layout(&report, recorded);
             assert_eq!(layout_kinds(&layout), report.kinds, "{}", report.name);
         }
+    }
+
+    #[test]
+    fn heaps_record_positive_clamped_budgets_and_ignore_zero() {
+        let layout = MemoryLayout {
+            heaps: vec![
+                MemoryHeap { bytes: 9_126_805_504, device_local: true },
+                MemoryHeap { bytes: 16 << 30, device_local: false },
+                MemoryHeap { bytes: 256 << 20, device_local: true },
+            ],
+            types: Vec::new(),
+        };
+        let budgets = [
+            crate::HeapBudget { budget: 8_055_599_104, usage: 0 },
+            crate::HeapBudget { budget: 20 << 30, usage: 0 },
+            crate::HeapBudget { budget: 0, usage: 0 },
+        ];
+        let reported = super::heaps(&layout, Some(&budgets));
+        assert_eq!(reported[0].budget, Some(8_055_599_104));
+        assert_eq!(reported[1].budget, Some(16 << 30));
+        assert_eq!(reported[2].budget, None);
+        assert!(super::heaps(&layout, None).iter().all(|heap| heap.budget.is_none()));
     }
 }

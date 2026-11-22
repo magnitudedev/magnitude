@@ -442,6 +442,7 @@ fn a_small_bar_counts_as_host_ram() {
     vulkan.memory.heaps.push(crate::VulkanHeap {
         bytes: crate::WINDOW_BYTES,
         device_local: true,
+        budget: None,
     });
     let window = vulkan.memory.heaps.len() - 1;
     vulkan.kinds[2].memory = crate::KindMemory::Heap { index: window, device_local: true, bytes: crate::WINDOW_BYTES };
@@ -1069,4 +1070,73 @@ fn rtx3090_topology(driver: &str) -> Arc<DeviceTopology> {
     let mut reports = rtx3090();
     reports.vulkan[0].driver = driver.into();
     Arc::new(topology(&reports))
+}
+
+/// On Windows WDDM, `VK_EXT_memory_budget` (`VulkanHeap::budget`) is
+/// permanently below raw heap size even on an idle GPU (e.g. 8.055 GB of
+/// 9.127 GB on AMD V710 8.5 GiB). The physical `DeviceMemory` store keeps the
+/// hardware heap size, while the Vulkan executor's `DeviceOnly` grant caps at
+/// `VulkanHeap::budget` (`ReportedBy::VulkanHeapBudget`) so static catalog
+/// assessment (`MemoryBudget::stable`) agrees with live WDDM headroom.
+#[test]
+fn vulkan_discrete_grant_caps_at_wddm_heap_budget_while_keeping_store_capacity() {
+    const HEAP_BYTES: u64 = 9_126_805_504; // 8.50 GiB AMD V710 device-local heap
+    const WDDM_BUDGET: u64 = 8_055_599_104; // 7.50 GiB WDDM VK_EXT_memory_budget (idle)
+
+    let mut reports = rtx3090_host();
+    let mut vulkan = rtx3090_vulkan(rtx3090_uuid());
+    vulkan.memory.heaps[0].bytes = HEAP_BYTES;
+    vulkan.memory.heaps[0].budget = Some(WDDM_BUDGET);
+    for kind in &mut vulkan.kinds {
+        if let crate::KindMemory::Heap { index: 0, bytes, .. } = &mut kind.memory {
+            *bytes = HEAP_BYTES;
+        }
+    }
+    reports.vulkan.push(vulkan);
+
+    let topo = topology(&reports);
+    let gpu = PhysicalIdentity::Uuid(rtx3090_uuid());
+    let exec = executor(&topo, BackendName::Vulkan, &gpu);
+    let path = topo
+        .access_path(exec.paths(Contract::DeviceOnly)[0])
+        .expect("Vulkan device-local access path");
+    let store = topo.store(path.store()).expect("device-local store");
+    assert_eq!(
+        store.capacity(),
+        Reported::new(HEAP_BYTES, ReportedBy::VulkanHeap),
+        "physical DeviceMemory store retains full VRAM heap size"
+    );
+    assert_eq!(
+        path.grant().expect("Vulkan grant").bytes,
+        Reported::new(WDDM_BUDGET, ReportedBy::VulkanHeapBudget),
+        "Vulkan DeviceOnly grant caps at discovery VK_EXT_memory_budget"
+    );
+}
+
+/// Unified Vulkan devices whose heaps report a `VK_EXT_memory_budget` total
+/// below raw heap sizes cap their `HostBudget` grant at the budgeted total.
+#[test]
+fn vulkan_unified_grant_caps_at_heap_budget_total() {
+    let mut reports = strix_halo_windows();
+    for heap in &mut reports.vulkan[0].memory.heaps {
+        heap.budget = Some(heap.bytes / 2);
+    }
+    let expected_total: u64 = reports.vulkan[0]
+        .memory
+        .heaps
+        .iter()
+        .map(|heap| heap.budget.unwrap())
+        .sum();
+    let topo = topology(&reports);
+    let exec = topo
+        .executors()
+        .iter()
+        .find(|exec| exec.backend() == BackendName::Vulkan)
+        .expect("unified Vulkan executor");
+    let granted_total: u64 = exec
+        .paths(Contract::DeviceOnly)
+        .iter()
+        .map(|&id| topo.access_path(id).unwrap().grant().unwrap().bytes.value)
+        .sum();
+    assert_eq!(granted_total, expected_total);
 }

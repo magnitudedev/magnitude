@@ -310,6 +310,7 @@ pub fn vulkan(
                 .map(|&(bytes, device_local)| VulkanHeap {
                     bytes,
                     device_local,
+                    budget: None,
                 })
                 .collect(),
         },
