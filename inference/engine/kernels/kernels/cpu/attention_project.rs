@@ -35,10 +35,11 @@ fn attention_project_rows<L: Isa, E: Elements>(
         _ => 1.0,
     };
     if segment < 2 && cx.arg_project_mode() != 0 {
-        let zero = vec![0.0f32; rows.len()];
+        const ZERO: [f32; projection::MAX_ROWS] = [0.0; projection::MAX_ROWS];
+        let zero = &ZERO[..rows.len()];
         for row in 0..m {
             // SAFETY: this work item owns these columns of this segment's result.
-            activation::store::<E::Y>(&zero, unsafe {
+            activation::store::<E::Y>(zero, unsafe {
                 result.span_mut([row, rows.start], rows.len())
             });
         }

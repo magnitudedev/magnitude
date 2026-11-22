@@ -9,6 +9,13 @@ use lib::core::{activation, functions, reduce};
 /// The most streams a row's coefficients hold in place.
 const MAX_STREAMS: usize = 8;
 
+/// The most mix outputs a row holds in place (`2 * S + S * S` at `MAX_STREAMS`).
+const MAX_MIXES: usize = 2 * MAX_STREAMS + MAX_STREAMS * MAX_STREAMS;
+
+/// Columns of one stream processed together so the active input slice (1 KiB)
+/// stays hot in L1D across `sum_squares` and all `2 * S + S * S` mix dots.
+const CHUNK: usize = 256;
+
 #[inline(always)]
 fn stream_mix_sinkhorn<L: Isa, E: Elements>(
     _l: L,
@@ -18,28 +25,41 @@ fn stream_mix_sinkhorn<L: Isa, E: Elements>(
 ) {
     let row = group[0] as usize;
     let (h, s) = (cx.dim_h() as usize, cx.dim_s() as usize);
+    let mix_count = 2 * s + s * s;
     let (epsilon, norm_epsilon) = (cx.arg_epsilon(), cx.arg_norm_epsilon());
     let (hidden, function, base, scale) =
         (cx.arg_hidden(), cx.arg_function(), cx.arg_base(), cx.arg_scale());
     let streams: [&[f32]; MAX_STREAMS] =
         std::array::from_fn(|stream| if stream < s { hidden.row([row, stream, 0]) } else { &[] });
     let streams = &streams[..s];
+    let function_rows: [&[f32]; MAX_MIXES] =
+        std::array::from_fn(|j| if j < mix_count { function.row([j, 0]) } else { &[] });
+    let function_rows = &function_rows[..mix_count];
     // Plain loops, not closures: a closure is compiled outside the entry's
     // target features, so the vector reductions inside it would not inline.
+    // Cache-block each stream in `CHUNK`-float slices (1 KiB) so `x_chunk` is
+    // loaded once into L1D and reused across `squares` and every mix row.
     let mut squares = 0.0f32;
-    for x in streams {
-        squares += reduce::sum_squares(x);
+    let mut mix = [0.0f32; MAX_MIXES];
+    let mix = &mut mix[..mix_count];
+    for (stream, x) in streams.iter().enumerate() {
+        let base_col = stream * h;
+        let mut c0 = 0;
+        while c0 < h {
+            let c1 = (c0 + CHUNK).min(h);
+            let x_chunk = &x[c0..c1];
+            squares += reduce::sum_squares(x_chunk);
+            let col0 = base_col + c0;
+            let col1 = base_col + c1;
+            for (m, weights) in mix.iter_mut().zip(function_rows) {
+                *m += reduce::dot(&weights[col0..col1], x_chunk);
+            }
+            c0 = c1;
+        }
     }
     let inverse = 1.0 / (squares / (s * h) as f32 + norm_epsilon).sqrt();
-    // Mix j of the row: function row j against the flattened streams.
-    let mut mix = [0.0f32; 2 * MAX_STREAMS + MAX_STREAMS * MAX_STREAMS];
-    for (j, mix) in mix[..2 * s + s * s].iter_mut().enumerate() {
-        let weights = function.row([j, 0]);
-        let mut projected = 0.0f32;
-        for (stream, x) in streams.iter().enumerate() {
-            projected += reduce::dot(&weights[stream * h..(stream + 1) * h], x);
-        }
-        *mix = projected * inverse;
+    for m in mix.iter_mut() {
+        *m *= inverse;
     }
     // SAFETY: each work item writes its own row of every result.
     let (input, mut join) = unsafe { (cx.result_0().row_mut([row, 0]), cx.result_2().row_mut([row, 0])) };

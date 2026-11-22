@@ -11,12 +11,28 @@ fn draft_convolve_residual<L: Isa, E: Elements>(_l: L, cx: &Context<'_, E>, grou
     let residual = cx.arg_residual().row([row, 0]);
     // SAFETY: each work item writes its own row.
     let mut result = unsafe { cx.result_0().row_mut([row, 0]) };
-    for (column, value) in result.iter_mut().enumerate() {
-        let mut sum = 0.0f32;
-        for offset in 0..taps.min(position + 1) {
-            let coefficient = base.get([1, offset, column]) + dynamic.get([row, 1, offset, column / channels]);
-            sum = coefficient.mul_add(output.get([row - offset, column]), sum);
+    result.compute(|sums| {
+        if channels == 0 || sums.is_empty() {
+            return;
         }
-        value.set(residual[column] + sum);
-    }
+        sums.fill(0.0);
+        for offset in 0..taps.min(position + 1) {
+            let base_row = base.row([1, offset, 0]);
+            let out_row = output.row([row - offset, 0]);
+            for (g, ((sum_group, base_group), out_group)) in sums
+                .chunks_exact_mut(channels)
+                .zip(base_row.chunks_exact(channels))
+                .zip(out_row.chunks_exact(channels))
+                .enumerate()
+            {
+                let dyn_val = dynamic.get([row, 1, offset, g]);
+                for ((sum, &base_val), &out_val) in sum_group.iter_mut().zip(base_group).zip(out_group) {
+                    *sum = (base_val + dyn_val).mul_add(out_val, *sum);
+                }
+            }
+        }
+        for (sum, &res) in sums.iter_mut().zip(residual) {
+            *sum = res + *sum;
+        }
+    });
 }

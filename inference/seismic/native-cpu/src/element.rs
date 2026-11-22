@@ -109,10 +109,7 @@ impl<'a, E: Dense> Store<'a, E> {
     /// Stores each of `values` rounded to `E`, from the start.
     #[inline(always)]
     pub fn store(&mut self, values: &[f32]) {
-        let row = &mut self.row[..values.len()];
-        for (target, value) in row.iter_mut().zip(values) {
-            *target = E::narrow(*value);
-        }
+        E::narrow_slice(values, &mut self.row[..values.len()]);
     }
 
     /// Moves `values`, elements a tensor of `E` holds (a row relocated, never one computed), here
@@ -195,6 +192,68 @@ pub trait Dense: for<'a> Element<Writable<'a> = Store<'a, Self>> {
     /// `values` holds eight values.
     #[cfg(target_arch = "aarch64")]
     unsafe fn widen_neon(values: *const Self::Storage) -> [std::arch::aarch64::float32x4_t; 2];
+
+    /// The eight values in `values` narrowed into `out`, each exactly as
+    /// [`Dense::narrow`]: its AVX2 (+ F16C for `F16`) vector form.
+    ///
+    /// # Safety
+    /// `out` holds space for eight values, and the calling tier has AVX2
+    /// (and F16C for `F16`).
+    #[cfg(target_arch = "x86_64")]
+    unsafe fn narrow_x86(values: std::arch::x86_64::__m256, out: *mut Self::Storage);
+
+    /// The eight values in `values` (0..4 and 4..8) narrowed into `out`,
+    /// each exactly as [`Dense::narrow`]: its NEON vector form.
+    ///
+    /// # Safety
+    /// `out` holds space for eight values.
+    #[cfg(target_arch = "aarch64")]
+    unsafe fn narrow_neon(values: [std::arch::aarch64::float32x4_t; 2], out: *mut Self::Storage);
+
+    /// Narrows every value in `values` into `out[..values.len()]`, each
+    /// bit-for-bit as [`Dense::narrow`].
+    #[inline(always)]
+    fn narrow_slice(values: &[f32], out: &mut [Self::Storage]) {
+        let out = &mut out[..values.len()];
+        #[cfg(target_arch = "x86_64")]
+        let offset = if values.len() >= 8
+            && std::arch::is_x86_feature_detected!("avx2")
+            && std::arch::is_x86_feature_detected!("f16c")
+        {
+            #[inline]
+            #[target_feature(enable = "avx2,f16c")]
+            unsafe fn narrow_chunks<E: Dense>(values: &[f32], out: &mut [E::Storage]) -> usize {
+                let chunks = values.len() / 8;
+                for i in 0..chunks {
+                    unsafe {
+                        let v = std::arch::x86_64::_mm256_loadu_ps(values.as_ptr().add(i * 8));
+                        E::narrow_x86(v, out.as_mut_ptr().add(i * 8));
+                    }
+                }
+                chunks * 8
+            }
+            unsafe { narrow_chunks::<Self>(values, out) }
+        } else {
+            0
+        };
+        #[cfg(target_arch = "aarch64")]
+        let offset = {
+            let chunks = values.len() / 8;
+            for i in 0..chunks {
+                unsafe {
+                    let lo = std::arch::aarch64::vld1q_f32(values.as_ptr().add(i * 8));
+                    let hi = std::arch::aarch64::vld1q_f32(values.as_ptr().add(i * 8 + 4));
+                    Self::narrow_neon([lo, hi], out.as_mut_ptr().add(i * 8));
+                }
+            }
+            chunks * 8
+        };
+        #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+        let offset = 0;
+        for (target, value) in out[offset..].iter_mut().zip(&values[offset..]) {
+            *target = Self::narrow(*value);
+        }
+    }
 }
 
 macro_rules! elements {
@@ -283,6 +342,27 @@ impl Dense for F32 {
         use std::arch::aarch64::*;
         unsafe { [vld1q_f32(values), vld1q_f32(values.add(4))] }
     }
+
+    #[cfg(target_arch = "x86_64")]
+    #[inline(always)]
+    unsafe fn narrow_x86(values: std::arch::x86_64::__m256, out: *mut f32) {
+        unsafe { std::arch::x86_64::_mm256_storeu_ps(out, values) }
+    }
+
+    #[cfg(target_arch = "aarch64")]
+    #[inline(always)]
+    unsafe fn narrow_neon(values: [std::arch::aarch64::float32x4_t; 2], out: *mut f32) {
+        use std::arch::aarch64::*;
+        unsafe {
+            vst1q_f32(out, values[0]);
+            vst1q_f32(out.add(4), values[1]);
+        }
+    }
+
+    #[inline(always)]
+    fn narrow_slice(values: &[f32], out: &mut [f32]) {
+        out[..values.len()].copy_from_slice(values);
+    }
 }
 
 impl Dense for Bf16 {
@@ -316,6 +396,48 @@ impl Dense for Bf16 {
                 vreinterpretq_f32_u32(vshll_n_u16::<16>(vget_low_u16(words))),
                 vreinterpretq_f32_u32(vshll_high_n_u16::<16>(words)),
             ]
+        }
+    }
+
+    /// Branchless [`f32_to_bf16`] lane by lane, NaN quiet-bit and payload included.
+    #[cfg(target_arch = "x86_64")]
+    #[inline(always)]
+    unsafe fn narrow_x86(values: std::arch::x86_64::__m256, out: *mut u16) {
+        use std::arch::x86_64::*;
+        unsafe {
+            let bits = _mm256_castps_si256(values);
+            let abs = _mm256_and_si256(bits, _mm256_set1_epi32(0x7fff_ffff));
+            let is_nan = _mm256_cmpgt_epi32(abs, _mm256_set1_epi32(0x7f80_0000));
+            let shifted = _mm256_srli_epi32::<16>(bits);
+            let lsb = _mm256_and_si256(shifted, _mm256_set1_epi32(1));
+            let rounding = _mm256_add_epi32(_mm256_set1_epi32(0x7fff), lsb);
+            let rounded = _mm256_srli_epi32::<16>(_mm256_add_epi32(bits, rounding));
+            let nan = _mm256_or_si256(shifted, _mm256_set1_epi32(0x0040));
+            let result = _mm256_blendv_epi8(rounded, nan, is_nan);
+            let lo = _mm256_castsi256_si128(result);
+            let hi = _mm256_extracti128_si256::<1>(result);
+            _mm_storeu_si128(out.cast(), _mm_packus_epi32(lo, hi));
+        }
+    }
+
+    /// Branchless [`f32_to_bf16`] lane by lane, NaN quiet-bit and payload included.
+    #[cfg(target_arch = "aarch64")]
+    #[inline(always)]
+    unsafe fn narrow_neon(values: [std::arch::aarch64::float32x4_t; 2], out: *mut u16) {
+        use std::arch::aarch64::*;
+        unsafe {
+            let narrow4 = |v: float32x4_t| -> uint16x4_t {
+                let bits = vreinterpretq_u32_f32(v);
+                let abs = vandq_u32(bits, vdupq_n_u32(0x7fff_ffff));
+                let is_nan = vcgtq_u32(abs, vdupq_n_u32(0x7f80_0000));
+                let shifted = vshrq_n_u32::<16>(bits);
+                let lsb = vandq_u32(shifted, vdupq_n_u32(1));
+                let rounding = vaddq_u32(vdupq_n_u32(0x7fff), lsb);
+                let rounded = vshrq_n_u32::<16>(vaddq_u32(bits, rounding));
+                let nan = vorrq_u32(shifted, vdupq_n_u32(0x0040));
+                vmovn_u32(vbslq_u32(is_nan, nan, rounded))
+            };
+            vst1q_u16(out, vcombine_u16(narrow4(values[0]), narrow4(values[1])));
         }
     }
 }
@@ -404,6 +526,40 @@ impl Dense for F16 {
                     vshll_high_n_u16::<16>(signs),
                 ),
             ]
+        }
+    }
+
+    /// Hardware F16C round-to-nearest-even narrowing, bit-exact with [`f32_to_f16`].
+    #[cfg(target_arch = "x86_64")]
+    #[inline(always)]
+    unsafe fn narrow_x86(values: std::arch::x86_64::__m256, out: *mut u16) {
+        use std::arch::x86_64::*;
+        unsafe {
+            let packed = _mm256_cvtps_ph::<_MM_FROUND_TO_NEAREST_INT>(values);
+            _mm_storeu_si128(out.cast(), packed);
+        }
+    }
+
+    /// Baseline ARMv8 AdvSIMD `fcvtn`/`fcvtn2` round-to-nearest-even narrowing,
+    /// bit-exact with [`f32_to_f16`].
+    #[cfg(target_arch = "aarch64")]
+    #[inline(always)]
+    unsafe fn narrow_neon(values: [std::arch::aarch64::float32x4_t; 2], out: *mut u16) {
+        use std::arch::aarch64::*;
+        let packed: uint16x8_t;
+        // Rust's f16 NEON intrinsics are not stable yet; `fcvtn`/`fcvtn2` are
+        // baseline ARMv8.0-A AdvSIMD. `out` is early-clobber (`out`, not
+        // `lateout`) because `fcvtn` writes it before `fcvtn2` reads `hi`.
+        unsafe {
+            std::arch::asm!(
+                "fcvtn {out:v}.4h, {lo:v}.4s",
+                "fcvtn2 {out:v}.8h, {hi:v}.4s",
+                lo = in(vreg) values[0],
+                hi = in(vreg) values[1],
+                out = out(vreg) packed,
+                options(pure, nomem, nostack, preserves_flags),
+            );
+            vst1q_u16(out, packed);
         }
     }
 }
@@ -652,5 +808,129 @@ mod tests {
         assert_eq!(<F32 as Dense>::narrow(f32::INFINITY), f32::INFINITY);
         assert_eq!(f32_to_bf16(f32::NEG_INFINITY), 0xff80);
         assert_eq!(f32_to_f16(f32::NEG_INFINITY), 0xfc00);
+    }
+
+    /// `Store::store` matches scalar `Dense::narrow` bit for bit across
+    /// normals, subnormals, signed zeros, tie-to-even boundaries, overflows,
+    /// infinities, signaling/quiet NaNs, and non-multiple-of-8 lengths.
+    #[test]
+    fn store_narrowing_matches_scalar_bit_for_bit() {
+        let cases: Vec<f32> = [
+            // Signed zeros
+            0.0f32,
+            -0.0f32,
+            // Normal values
+            1.0,
+            -1.0,
+            0.5,
+            -0.5,
+            std::f32::consts::PI,
+            -42.125,
+            1024.0,
+            -65504.0,
+            // F16 tie-to-even & overflow boundaries
+            1.0 + 2f32.powi(-11),
+            1.0 + 3.0 * 2f32.powi(-11),
+            -(1.0 + 2f32.powi(-11)),
+            -(1.0 + 3.0 * 2f32.powi(-11)),
+            65519.0,
+            65520.0,
+            -65519.0,
+            -65520.0,
+            1e30,
+            -1e30,
+            // F16 subnormals and underflow boundaries
+            2f32.powi(-14),
+            2f32.powi(-15),
+            2f32.powi(-24),
+            -2f32.powi(-24),
+            2f32.powi(-24) * 1.5,
+            2f32.powi(-24) * 2.5,
+            2f32.powi(-24) * 3.5,
+            2f32.powi(-25),
+            -2f32.powi(-25),
+            2f32.powi(-25) * 1.5,
+            2f32.powi(-26),
+            // F32 subnormals
+            f32::from_bits(0x0000_0001),
+            f32::from_bits(0x8000_0001),
+            f32::from_bits(0x007f_ffff),
+            f32::from_bits(0x807f_ffff),
+            // BF16 tie-to-even & overflow boundaries
+            f32::from_bits(0x3f80_8000),
+            f32::from_bits(0x3f81_8000),
+            f32::from_bits(0x3f80_8001),
+            f32::from_bits(0xbf80_8000),
+            f32::from_bits(0xbf81_8000),
+            f32::from_bits(0x7f7f_8000),
+            f32::from_bits(0x7f7f_ffff),
+            f32::from_bits(0xff7f_ffff),
+            // Infinities
+            f32::INFINITY,
+            f32::NEG_INFINITY,
+            // Signaling and quiet NaNs (positive & negative, varied payloads)
+            f32::from_bits(0x7f80_0001),
+            f32::from_bits(0xff80_0001),
+            f32::from_bits(0x7fa0_0000),
+            f32::from_bits(0xffa0_2000),
+            f32::from_bits(0x7fbf_ffff),
+            f32::from_bits(0x7fc0_0000),
+            f32::from_bits(0xffc0_0000),
+            f32::from_bits(0x7fc0_1234),
+            f32::from_bits(0x7fff_ffff),
+            f32::from_bits(0xffff_ffff),
+        ]
+        .to_vec();
+
+        fn check_u16<E: Dense<Storage = u16>>(values: &[f32]) {
+            // Check every prefix length (0, 1, ..., 7, 8, 9, ..., values.len())
+            // to cover vector chunks, scalar tails, and < 8 inputs.
+            for len in 0..=values.len() {
+                let slice = &values[..len];
+                let mut buf = vec![0xbeefu16; len + 3];
+                let mut store = E::writable(&mut buf);
+                store.store(slice);
+                for (i, (&actual, &input)) in buf[..len].iter().zip(slice).enumerate() {
+                    assert_eq!(
+                        actual,
+                        E::narrow(input),
+                        "{} len={len} i={i} input={:#010x}",
+                        E::NAME,
+                        input.to_bits()
+                    );
+                }
+                assert!(buf[len..].iter().all(|&sentinel| sentinel == 0xbeef));
+            }
+        }
+
+        check_u16::<Bf16>(&cases);
+        check_u16::<F16>(&cases);
+
+        // Also check F32 copy fast path across all prefix lengths.
+        for len in 0..=cases.len() {
+            let slice = &cases[..len];
+            let mut buf = vec![f32::from_bits(0xdead_beef); len + 2];
+            let mut store = F32::writable(&mut buf);
+            store.store(slice);
+            for (i, (&actual, &input)) in buf[..len].iter().zip(slice).enumerate() {
+                assert_eq!(actual.to_bits(), input.to_bits(), "f32 len={len} i={i}");
+            }
+            assert!(buf[len..].iter().all(|v| v.to_bits() == 0xdead_beef));
+        }
+
+        // Exhaustive check over every 16-bit half and bfloat16 widened to f32.
+        let all_f16: Vec<f32> = (0..=u16::MAX).map(f16_to_f32).collect();
+        let mut out_f16 = vec![0u16; all_f16.len()];
+        F16::writable(&mut out_f16).store(&all_f16);
+        for (bits, (&actual, &input)) in out_f16.iter().zip(&all_f16).enumerate() {
+            assert_eq!(actual, f32_to_f16(input), "all_f16 bits={bits:#06x}");
+        }
+
+        let all_bf16: Vec<f32> = (0..=u16::MAX).map(bf16_to_f32).collect();
+        let mut out_bf16 = vec![0u16; all_bf16.len()];
+        Bf16::writable(&mut out_bf16).store(&all_bf16);
+        for (bits, (&actual, &input)) in out_bf16.iter().zip(&all_bf16).enumerate() {
+            assert_eq!(actual, f32_to_bf16(input), "all_bf16 bits={bits:#06x}");
+        }
     }
 }

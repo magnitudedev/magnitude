@@ -144,25 +144,92 @@ pub trait Prologue {
     fn row(&mut self, row: usize) -> Inputs<'_>;
 }
 
-/// `values` (a state row's columns) scaled by a row's `decays` decay factors:
-/// the head's one for every column, or one each. A rule's `decays` is its
-/// constant, so the branch resolves at compile time.
+/// Scales `values` (a state row's columns) by a row's `decays` decay factors
+/// (the head's one for every column, or one each) and accumulates its dot
+/// product with `key` in the defined lane order of `seismic::cpu::reduce`.
+/// A rule's `decays` is its constant, so the branch resolves at compile time.
 #[inline(always)]
-fn scale_columns(values: &mut [f32], decay: &[f32], decays: usize) {
+fn scale_and_dot(values: &mut [f32], key: &[f32], decay: &[f32], decays: usize) -> f32 {
+    use seismic::cpu::reduce::{combine, LANES};
+    let full = values.len() / LANES * LANES;
+    let mut lanes = [0.0f32; LANES];
     if decays == 1 {
         let factor = decay[0];
-        for value in values.iter_mut() {
-            *value *= factor;
+        for (v, k) in values[..full]
+            .chunks_exact_mut(LANES)
+            .zip(key[..full].chunks_exact(LANES))
+        {
+            for lane in 0..LANES {
+                let scaled = v[lane] * factor;
+                v[lane] = scaled;
+                lanes[lane] = scaled.mul_add(k[lane], lanes[lane]);
+            }
+        }
+        for (lane, (v, k)) in values[full..].iter_mut().zip(&key[full..]).enumerate() {
+            let scaled = *v * factor;
+            *v = scaled;
+            lanes[lane] = scaled.mul_add(*k, lanes[lane]);
         }
     } else {
-        for (value, factor) in values.iter_mut().zip(decay) {
-            *value *= factor;
+        for ((v, k), d) in values[..full]
+            .chunks_exact_mut(LANES)
+            .zip(key[..full].chunks_exact(LANES))
+            .zip(decay[..full].chunks_exact(LANES))
+        {
+            for lane in 0..LANES {
+                let scaled = v[lane] * d[lane];
+                v[lane] = scaled;
+                lanes[lane] = scaled.mul_add(k[lane], lanes[lane]);
+            }
+        }
+        for (lane, ((v, k), d)) in values[full..]
+            .iter_mut()
+            .zip(&key[full..])
+            .zip(&decay[full..])
+            .enumerate()
+        {
+            let scaled = *v * *d;
+            *v = scaled;
+            lanes[lane] = scaled.mul_add(*k, lanes[lane]);
         }
     }
+    combine(lanes)
+}
+
+/// Updates `values` with `residual.mul_add(key[i], values[i])` and accumulates
+/// its dot product with `query` in the defined lane order of
+/// `seismic::cpu::reduce`.
+#[inline(always)]
+fn update_and_dot(values: &mut [f32], key: &[f32], query: &[f32], residual: f32) -> f32 {
+    use seismic::cpu::reduce::{combine, LANES};
+    let full = values.len() / LANES * LANES;
+    let mut lanes = [0.0f32; LANES];
+    for ((v, k), q) in values[..full]
+        .chunks_exact_mut(LANES)
+        .zip(key[..full].chunks_exact(LANES))
+        .zip(query[..full].chunks_exact(LANES))
+    {
+        for lane in 0..LANES {
+            let updated = residual.mul_add(k[lane], v[lane]);
+            v[lane] = updated;
+            lanes[lane] = updated.mul_add(q[lane], lanes[lane]);
+        }
+    }
+    for (lane, ((v, k), q)) in values[full..]
+        .iter_mut()
+        .zip(&key[full..])
+        .zip(&query[full..])
+        .enumerate()
+    {
+        let updated = residual.mul_add(*k, *v);
+        *v = updated;
+        lanes[lane] = updated.mul_add(*q, lanes[lane]);
+    }
+    combine(lanes)
 }
 
 /// A tape entry's update of a state row: value * factor + innovation * key
-/// for each column, the factors as in `scale_columns`.
+/// for each column, the factors as in `scale_and_dot`.
 #[inline(always)]
 fn replay_columns(values: &mut [f32], key: &[f32], innovation: f32, decay: &[f32], decays: usize) {
     if decays == 1 {
@@ -593,13 +660,10 @@ pub trait Rule<'a> {
                 entry.map(|entry| unsafe { r.tape.span_mut([slot.target, entry, head * w + rows.start], rows.len()) });
             for index in 0..rows.len() {
                 let values = &mut state[index * w..(index + 1) * w];
-                scale_columns(values, inputs.decay, decays);
-                let remembered = reduce::dot(values, inputs.key);
+                let remembered = scale_and_dot(values, inputs.key, inputs.decay, decays);
                 let residual = (inputs.value[index] - remembered) * inputs.beta;
-                for (value, key) in values.iter_mut().zip(inputs.key) {
-                    *value = residual.mul_add(*key, *value);
-                }
-                mixed[index] = activation::publish::<Self::Act>(reduce::dot(values, inputs.query));
+                let output = update_and_dot(values, inputs.key, inputs.query, residual);
+                mixed[index] = activation::publish::<Self::Act>(output);
                 if let Some(innovations) = &mut innovations {
                     innovations.set(index, residual);
                 }

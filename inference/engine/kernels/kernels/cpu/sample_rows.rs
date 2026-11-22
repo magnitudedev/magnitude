@@ -15,16 +15,14 @@
 // 1 no competing token, 2 some logit of the row is NaN or +inf.
 
 use lib::core::{arrive, flat};
+use seismic::cpu::reduce::LANES;
 
 const NO_TOKEN: u32 = u32::MAX;
 
 /// The Philox4x32-10 Gumbel score of `value` at `token` (the portable body's
-/// perturbation), or `value` when the row draws greedily.
+/// perturbation).
 #[inline(always)]
-fn score(value: f32, token: u32, draw: &[u32]) -> f32 {
-    if draw[0] != 1 {
-        return value;
-    }
+fn gumbel(value: f32, token: u32, draw: &[u32]) -> f32 {
     let mut counter = [token, draw[3], draw[4], draw[5]];
     let mut key = [draw[1], draw[2]];
     for _ in 0..10 {
@@ -50,6 +48,47 @@ fn better(score: f32, token: u32, best: f32, best_token: u32) -> bool {
     best_token == NO_TOKEN || (token != NO_TOKEN && (score > best || (score == best && token < best_token)))
 }
 
+/// Branch-light greedy scan over a contiguous slice of logits starting at
+/// token `start`: tracks the maximum finite score (lowest token on ties) and
+/// whether any value is NaN or +inf.
+#[inline(always)]
+fn greedy_unconstrained(values: &[f32], start: usize) -> (f32, u32, u32) {
+    let mut best_val = [f32::NEG_INFINITY; LANES];
+    let mut best_idx = [NO_TOKEN; LANES];
+    let mut bad_lanes = [0u32; LANES];
+    let mut chunks = values.chunks_exact(LANES);
+    let mut base = start as u32;
+    for chunk in &mut chunks {
+        for lane in 0..LANES {
+            let value = chunk[lane];
+            bad_lanes[lane] |= u32::from(value.is_nan() || value == f32::INFINITY);
+            if value > best_val[lane] {
+                best_val[lane] = value;
+                best_idx[lane] = base + lane as u32;
+            }
+        }
+        base += LANES as u32;
+    }
+    let mut best = f32::NEG_INFINITY;
+    let mut best_token = NO_TOKEN;
+    let mut bad = 0u32;
+    for lane in 0..LANES {
+        bad |= bad_lanes[lane];
+        if better(best_val[lane], best_idx[lane], best, best_token) {
+            best = best_val[lane];
+            best_token = best_idx[lane];
+        }
+    }
+    for (offset, &value) in chunks.remainder().iter().enumerate() {
+        bad |= u32::from(value.is_nan() || value == f32::INFINITY);
+        if value > best {
+            best = value;
+            best_token = base + offset as u32;
+        }
+    }
+    (best, best_token, bad)
+}
+
 #[inline(always)]
 fn sample_rows_partition<L: Isa, E: Elements>(_l: L, cx: &Context<'_, E>, group: [u64; 3], _shared: &mut [u8]) {
     let (span, spans) = (group[0] as usize, cx.groups()[0] as usize);
@@ -68,26 +107,32 @@ fn sample_rows_partition<L: Isa, E: Elements>(_l: L, cx: &Context<'_, E>, group:
         let values = cx.arg_logits().row([row, 0]);
         let draw = cx.arg_draws().row([row, 0]);
         // An unconstrained row admits every token; its mask row is never read.
+        let noisy = draw[0] == 1;
         let masked = constrained.get([row]) != 0;
-        let mut best = f32::NEG_INFINITY;
-        let mut best_token = NO_TOKEN;
-        let mut bad = 0u32;
-        for token in piece.columns {
-            let value = values[token];
-            bad |= u32::from(value.is_nan() || value == f32::INFINITY);
-            if !value.is_finite() {
-                continue;
+        let (best, best_token, bad) = if !noisy && !masked {
+            greedy_unconstrained(&values[piece.columns.clone()], piece.columns.start)
+        } else {
+            let mut best = f32::NEG_INFINITY;
+            let mut best_token = NO_TOKEN;
+            let mut bad = 0u32;
+            for token in piece.columns {
+                let value = values[token];
+                bad |= u32::from(value.is_nan() || value == f32::INFINITY);
+                if !value.is_finite() {
+                    continue;
+                }
+                if masked && (mask.get([row, token / 32]) >> (token % 32)) & 1 == 0 {
+                    continue;
+                }
+                let token = token as u32;
+                let score = if noisy { gumbel(value, token, draw) } else { value };
+                if better(score, token, best, best_token) {
+                    best = score;
+                    best_token = token;
+                }
             }
-            if masked && (mask.get([row, token / 32]) >> (token % 32)) & 1 == 0 {
-                continue;
-            }
-            let token = token as u32;
-            let score = score(value, token, draw);
-            if better(score, token, best, best_token) {
-                best = score;
-                best_token = token;
-            }
-        }
+            (best, best_token, bad)
+        };
         // SAFETY: each piece's slot is its own (`Flat`).
         unsafe { cx.scratch_partials().slice_mut::<u32>(12 * piece.slot, 3) }.copy_from_slice(&[best.to_bits(), best_token, bad]);
         let pieces = flat.spans_of(row);

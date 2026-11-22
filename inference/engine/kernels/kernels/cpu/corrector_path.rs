@@ -2,6 +2,8 @@
 // work item per slot walks its lattice greedily, each mask row selecting the
 // first best-scoring candidate after the previous row's selection.
 
+use lib::core::reduce;
+
 #[inline(always)]
 fn corrector_path<L: Isa, E: Elements>(_l: L, cx: &Context<'_, E>, group: [u64; 3], _shared: &mut [u8]) {
     let slot = group[0] as usize;
@@ -16,12 +18,7 @@ fn corrector_path<L: Isa, E: Elements>(_l: L, cx: &Context<'_, E>, group: [u64; 
         };
         let (mut best, mut chosen) = (f32::NEG_INFINITY, 0usize);
         for candidate in 0..count {
-            let score = incoming
-                .row([slot, step, candidate, 0])
-                .iter()
-                .zip(other)
-                .map(|(a, b)| a * b)
-                .sum::<f32>();
+            let score = reduce::dot(incoming.row([slot, step, candidate, 0]), other);
             if score > best {
                 best = score;
                 chosen = candidate;

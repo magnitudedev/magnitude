@@ -2,6 +2,8 @@
 // work item per row scores its candidates in order and selects the first
 // highest-scoring one.
 
+use lib::core::reduce;
+
 #[inline(always)]
 fn draft_path_step<L: Isa, E: Elements>(_l: L, cx: &Context<'_, E>, group: [u64; 3], shared: &mut [u8]) {
     let row = group[0] as usize;
@@ -18,11 +20,7 @@ fn draft_path_step<L: Isa, E: Elements>(_l: L, cx: &Context<'_, E>, group: [u64;
     for candidate in 0..count {
         let at = row * count + candidate;
         cx.arg_successor().decode_row(at, successor);
-        let score = joint
-            .iter()
-            .zip(successor.iter())
-            .fold(0.0f32, |sum, (joint, successor)| joint.mul_add(*successor, sum))
-            + cx.arg_unary().get([row, candidate]);
+        let score = reduce::dot(joint, successor) + cx.arg_unary().get([row, candidate]);
         if score > best {
             best = score;
             chosen = at;

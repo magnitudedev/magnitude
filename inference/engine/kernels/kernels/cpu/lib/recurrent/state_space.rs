@@ -15,12 +15,14 @@
 // functions, so the entries give the same bits, and a work item's state-row
 // block never changes them.
 //
-// Numerics: the portable body's arithmetic in F32, in its order: the decayed
-// state `S * decay` is rounded before the update `fma(u, B, S * decay)`, and
-// the output `S C` is the body's ascending FMA chain over the state columns.
+// Numerics: the portable body's arithmetic in F32: the decayed state
+// `S * decay` is rounded before the update `fma(u, B, S * decay)`, and the
+// output `S C` is summed in the defined order of `seismic::cpu::reduce`
+// (fused with the state update in a single pass over each state row).
 
 use super::super::core::activation;
 use super::versions::{Slot, Slots};
+use seismic::cpu::reduce::{combine, LANES};
 use seismic::cpu::slab::SlabTensor;
 use seismic::cpu::{math, Dense, Stored, Tensor, F32};
 use std::ops::Range;
@@ -287,14 +289,35 @@ impl<'a, A: Dense> StateSpace<'a, A> {
             let mut recorded_inputs = entry.map(|entry| unsafe {
                 self.tape.span_mut([slot.target, entry, head * self.head_width + rows.start], rows.len())
             });
+            let (b, c, decay) = (&inputs.b[..n], &inputs.c[..n], inputs.decay);
+            let full = n / LANES * LANES;
             for index in 0..rows.len() {
                 let value = inputs.x[index];
                 let input = inputs.delta * value;
-                let mut output = 0.0f32;
-                for ((s, b), c) in state[index * n..(index + 1) * n].iter_mut().zip(inputs.b).zip(inputs.c) {
-                    *s = input.mul_add(*b, *s * inputs.decay);
-                    output = s.mul_add(*c, output);
+                let mut lanes = [0.0f32; LANES];
+                let state_row = &mut state[index * n..(index + 1) * n];
+                for ((s, b), c) in state_row[..full]
+                    .chunks_exact_mut(LANES)
+                    .zip(b[..full].chunks_exact(LANES))
+                    .zip(c[..full].chunks_exact(LANES))
+                {
+                    for lane in 0..LANES {
+                        let updated = input.mul_add(b[lane], s[lane] * decay);
+                        s[lane] = updated;
+                        lanes[lane] = updated.mul_add(c[lane], lanes[lane]);
+                    }
                 }
+                for (lane, ((s, &b), &c)) in state_row[full..]
+                    .iter_mut()
+                    .zip(&b[full..])
+                    .zip(&c[full..])
+                    .enumerate()
+                {
+                    let updated = input.mul_add(b, *s * decay);
+                    *s = updated;
+                    lanes[lane] = updated.mul_add(c, lanes[lane]);
+                }
+                let output = combine(lanes);
                 mixed.set(index, skip.mul_add(value, output));
                 if let Some(recorded_inputs) = &mut recorded_inputs {
                     recorded_inputs.set(index, input);

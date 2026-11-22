@@ -10,26 +10,36 @@ fn vision_pool<L: Isa, E: Elements>(_l: L, cx: &Context<'_, E>, group: [u64; 3],
     let (g, h) = (cx.dim_g() as usize, cx.dim_h() as usize);
     let (weight, scale) = (cx.arg_weight(), cx.arg_scale());
     let source = cx.arg_source();
-    let shared = seismic::cpu::tensor::floats(shared, 2 * h);
-    let (bias, standard_scale) = shared.split_at_mut(h);
     let standardize = (cx.dim_ns() == 1).then(|| {
+        let shared = seismic::cpu::tensor::floats(shared, 2 * h);
+        let (bias, standard_scale) = shared.split_at_mut(h);
         (
             vision::decode_vector(&cx.arg_standard_bias(), bias),
             vision::decode_vector(&cx.arg_standard_scale(), standard_scale),
         )
     });
-    let result = cx.result_0();
     // SAFETY: each work item writes its own row.
-    let mut out = unsafe { result.span_mut([row, 0], h) };
-    for (column, target) in out.iter_mut().enumerate() {
-        let mut sum = 0.0f32;
-        for member in 0..g {
-            sum += source.get([row, member, column]) * weight;
+    unsafe { cx.result_0().row_mut([row, 0]) }.compute(|out| {
+        if g == 0 {
+            out.fill(0.0);
+        } else {
+            for (acc, &value) in out.iter_mut().zip(source.row([row, 0, 0])) {
+                *acc = value * weight;
+            }
+            for member in 1..g {
+                for (acc, &value) in out.iter_mut().zip(source.row([row, member, 0])) {
+                    *acc = value.mul_add(weight, *acc);
+                }
+            }
         }
-        let mut value = sum * scale;
         if let Some((bias, standard_scale)) = standardize {
-            value = (value - bias[column]) * standard_scale[column];
+            for ((value, &b), &s) in out.iter_mut().zip(bias).zip(standard_scale) {
+                *value = (*value * scale - b) * s;
+            }
+        } else {
+            for value in out.iter_mut() {
+                *value *= scale;
+            }
         }
-        target.set(value);
-    }
+    });
 }

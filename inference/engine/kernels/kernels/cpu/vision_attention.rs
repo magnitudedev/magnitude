@@ -17,8 +17,27 @@ fn vision_attention_prepare<L: Isa, E: Elements>(_l: L, cx: &Context<'_, E>, gro
     let heads = kv_heads * cx.dim_g() as usize;
     let (w, slots) = (4 * p, heads + 2 * kv_heads);
     let epsilon = cx.arg_epsilon();
-    let coordinates = cx.arg_coordinates();
-    let coordinates = [coordinates.get([row, 0]), coordinates.get([row, 1])];
+    let log_base = cx.arg_log_base();
+    let half = 2 * p;
+    let mut stack_cos = [0.0f32; 128];
+    let mut stack_sin = [0.0f32; 128];
+    let mut heap_cos = Vec::new();
+    let mut heap_sin = Vec::new();
+    let turns: Option<(&[f32], &[f32])> = if log_base != 0.0 {
+        let coordinates = cx.arg_coordinates();
+        let coordinates = [coordinates.get([row, 0]), coordinates.get([row, 1])];
+        if half <= stack_cos.len() {
+            vision::rotate_turns(coordinates, p, log_base, &mut stack_cos[..half], &mut stack_sin[..half]);
+            Some((&stack_cos[..half], &stack_sin[..half]))
+        } else {
+            heap_cos.resize(half, 0.0);
+            heap_sin.resize(half, 0.0);
+            vision::rotate_turns(coordinates, p, log_base, heap_cos.as_mut_slice(), heap_sin.as_mut_slice());
+            Some((heap_cos.as_slice(), heap_sin.as_slice()))
+        }
+    } else {
+        None
+    };
     let source = seismic::cpu::tensor::floats(shared, w);
     // SAFETY: each work item writes its own row of the scratch.
     let operands = unsafe { cx.scratch_operands().slice_mut::<f32>(4 * row * slots * w, slots * w) };
@@ -34,8 +53,8 @@ fn vision_attention_prepare<L: Isa, E: Elements>(_l: L, cx: &Context<'_, E>, gro
             } else {
                 target.copy_from_slice(source);
             }
-            if cx.arg_log_base() != 0.0 {
-                vision::rotate::<E::A>(target, coordinates, p, cx.arg_log_base());
+            if let Some((cosines, sines)) = turns {
+                vision::rotate_with_turns::<E::A>(target, p, cosines, sines);
             } else {
                 for element in target.iter_mut() {
                     *element = activation::publish::<E::A>(*element);

@@ -6,8 +6,11 @@
 // backend. The successor window is no slot's source, so the publishing work
 // items run beside the row work items.
 
+use lib::core::activation;
 use lib::recurrent::versions::{Slot, Slots};
 use seismic::cpu::slab::SlabTensor;
+
+const MAX_STACK_TAPS: usize = 8;
 
 #[inline(always)]
 fn short_conv_rows<L: Isa, E: Elements>(_l: L, cx: &Context<'_, E>, group: [u64; 3], shared: &mut [u8]) {
@@ -24,7 +27,8 @@ fn short_conv_rows<L: Isa, E: Elements>(_l: L, cx: &Context<'_, E>, group: [u64;
     let window = SlabTensor::from_bound(cx.arg_window(), cx.arg_slab_banks() as usize);
     let gated = cx.result_0();
     let channels = cx.dim_ch() as usize;
-    let taps = cx.dim_c() as usize - 1;
+    let width = cx.dim_c() as usize;
+    let taps = width - 1;
     let rows = cx.dim_m() as usize;
     let item = group[0] as usize;
     // The input row at slot-local `position`: the source version's window rows
@@ -50,23 +54,66 @@ fn short_conv_rows<L: Isa, E: Elements>(_l: L, cx: &Context<'_, E>, group: [u64;
         }
         return;
     }
-    // SAFETY: each work item writes its own row.
-    let mut out = unsafe { gated.row_mut([item, 0]) };
     let Some(slot) = slots.slot_of_row(item) else {
-        out.fill(0.0);
+        // SAFETY: each work item writes its own row.
+        unsafe { gated.row_mut([item, 0]) }.fill(0.0);
         return;
     };
     let local = (item - slot.lo) as isize;
-    let gate = &projection.row([item, 0])[channels..];
+    let gate = &projection.row([item, 0])[channels..2 * channels];
     let sum = seismic::cpu::tensor::floats(shared, channels);
-    sum.fill(0.0);
-    for tap in 0..=taps {
-        let values = input(&slot, local + tap as isize - taps as isize);
-        for ((sum, value), channel) in sum.iter_mut().zip(values.storage()).zip(0..channels) {
-            *sum = convolution.get([channel, tap]).mul_add(*value, *sum);
+    if width <= MAX_STACK_TAPS {
+        assert_eq!(convolution.extent(1), width);
+        let mut sources: [&[f32]; MAX_STACK_TAPS] = [&[]; MAX_STACK_TAPS];
+        for tap in 0..width {
+            sources[tap] = &input(&slot, local + tap as isize - taps as isize).storage()[..channels];
+        }
+        match width {
+            3 => {
+                let (s0, s1, s2) = (sources[0], sources[1], sources[2]);
+                for ch in 0..channels {
+                    let w = convolution.row([ch, 0]);
+                    let acc = w[0].mul_add(s0[ch], 0.0);
+                    let acc = w[1].mul_add(s1[ch], acc);
+                    let acc = w[2].mul_add(s2[ch], acc);
+                    sum[ch] = gate[ch] * acc;
+                }
+            }
+            4 => {
+                let (s0, s1, s2, s3) = (sources[0], sources[1], sources[2], sources[3]);
+                for ch in 0..channels {
+                    let w = convolution.row([ch, 0]);
+                    let acc = w[0].mul_add(s0[ch], 0.0);
+                    let acc = w[1].mul_add(s1[ch], acc);
+                    let acc = w[2].mul_add(s2[ch], acc);
+                    let acc = w[3].mul_add(s3[ch], acc);
+                    sum[ch] = gate[ch] * acc;
+                }
+            }
+            _ => {
+                let sources = &sources[..width];
+                for ch in 0..channels {
+                    let w = convolution.row([ch, 0]);
+                    let mut acc = 0.0f32;
+                    for (weight, src) in w.iter().zip(sources) {
+                        acc = weight.mul_add(src[ch], acc);
+                    }
+                    sum[ch] = gate[ch] * acc;
+                }
+            }
+        }
+    } else {
+        sum.fill(0.0);
+        for tap in 0..width {
+            let values = input(&slot, local + tap as isize - taps as isize);
+            for ((sum, value), channel) in sum.iter_mut().zip(values.storage()).zip(0..channels) {
+                *sum = convolution.get([channel, tap]).mul_add(*value, *sum);
+            }
+        }
+        for (sum, &g) in sum.iter_mut().zip(gate) {
+            *sum *= g;
         }
     }
-    for ((out, sum), gate) in out.iter_mut().zip(sum.iter()).zip(gate) {
-        out.set(gate * sum);
-    }
+    // SAFETY: each work item writes its own row.
+    activation::store::<E::A>(sum, unsafe { gated.row_mut([item, 0]) });
 }

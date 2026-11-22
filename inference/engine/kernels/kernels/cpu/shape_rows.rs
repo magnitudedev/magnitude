@@ -22,11 +22,22 @@
 use lib::core::functions::finite_ordered_key;
 use lib::core::{arrive, flat};
 
-/// exp(value - maximum) as a 64-bit 2^-32 fixed-point mass.
+/// Quantizes a precomputed `exp(value - maximum)` weight to 2^-32 fixed-point mass.
 #[inline(always)]
-fn mass(value: f32, maximum: f32) -> u64 {
-    let weight = seismic::cpu::math::exp(value - maximum);
+fn mass_from_weight(weight: f32) -> u64 {
     if weight >= 1.0 { 1 << 32 } else { (weight * 4_294_967_296.0) as u64 }
+}
+
+/// exp(diff) as a 64-bit 2^-32 fixed-point mass.
+///
+/// For `diff < -25.0`, `exp(-25.0) * 2^32 < 0.06 < 1.0`, so the quantized
+/// `u64` mass is provably `0` without evaluating `exp`.
+#[inline(always)]
+fn mass_from_diff(diff: f32) -> u64 {
+    if diff < -25.0 {
+        return 0;
+    }
+    mass_from_weight(seismic::cpu::math::exp(diff))
 }
 
 /// ceil(top_p * total) exactly: top_p = m * 2^-shift with m a 24-bit
@@ -153,23 +164,44 @@ fn shape_piece<E: Elements>(cx: &Context<'_, E>, row: usize, columns: std::ops::
             *value = *value - s.presence - s.frequency * count as f32;
             first += count;
         }
-        if s.temperature != 0.0 {
-            for value in values.iter_mut() {
-                *value /= s.temperature;
-            }
-        }
-        // A constrained row removes every rejected value but NaN and +inf, which
-        // keep the row unfiltered for sampling to report.
+        // Divide by temperature, apply any constrained mask, and collect the
+        // piece's maximum and non-finite flag in a single pass. A constrained
+        // row removes every rejected value but NaN and +inf, which keep the
+        // row unfiltered for sampling to report.
+        let mut maximum = f32::NEG_INFINITY;
+        let mut nonfinite = false;
+        let tempered = s.temperature != 0.0;
         if cx.arg_constrained().get([row]) != 0 {
             let mask = cx.arg_mask();
-            for (token, value) in (begin..end).zip(values.iter_mut()) {
-                if (mask.get([row, token / 32]) >> (token % 32)) & 1 == 0 && *value < f32::INFINITY {
-                    *value = f32::NEG_INFINITY;
+            for (token, slot) in (begin..end).zip(values.iter_mut()) {
+                let mut v = *slot;
+                if tempered {
+                    v /= s.temperature;
                 }
+                if v < f32::INFINITY {
+                    if (mask.get([row, token / 32]) >> (token % 32)) & 1 == 0 {
+                        v = f32::NEG_INFINITY;
+                    }
+                } else {
+                    nonfinite = true;
+                }
+                *slot = v;
+                maximum = maximum.max(v);
+            }
+        } else if tempered {
+            let temperature = s.temperature;
+            for slot in values.iter_mut() {
+                let v = *slot / temperature;
+                *slot = v;
+                maximum = maximum.max(v);
+                nonfinite |= !(v < f32::INFINITY);
+            }
+        } else {
+            for &v in values.iter() {
+                maximum = maximum.max(v);
+                nonfinite |= !(v < f32::INFINITY);
             }
         }
-        let maximum = values.iter().copied().fold(f32::NEG_INFINITY, f32::max);
-        let nonfinite = values.iter().any(|value| value.is_nan() || *value == f32::INFINITY);
         (maximum, nonfinite)
     })
 }
@@ -207,12 +239,37 @@ fn shape_rows_filter<L: Isa, E: Elements>(_l: L, cx: &Context<'_, E>, group: [u6
         } else {
             0
         };
-        let survives = |value: f32| {
-            finite_ordered_key(value) >= threshold && !(min_p && seismic::cpu::math::exp(value - maximum) < s.min_p)
+        // Precompute a conservative guard band around `ln(min_p)` in
+        // `value - maximum` space so tokens clearly below or above the
+        // threshold avoid evaluating `exp`.
+        let (min_p_lo, min_p_hi) = if min_p {
+            let ln_min_p = s.min_p.ln();
+            let margin = 1e-3 * ln_min_p.abs().max(1.0);
+            (ln_min_p - margin, ln_min_p + margin)
+        } else {
+            (f32::NEG_INFINITY, f32::NEG_INFINITY)
+        };
+        // Returns `None` if rejected by `min_p`, `Some(None)` if accepted
+        // without evaluating `exp`, or `Some(Some(weight))` if `exp(diff)` was
+        // evaluated inside the guard band and accepted.
+        let check_min_p = |diff: f32| -> Option<Option<f32>> {
+            if !min_p {
+                return Some(None);
+            }
+            if diff < min_p_lo {
+                return None;
+            }
+            if diff > min_p_hi {
+                return Some(None);
+            }
+            let weight = seismic::cpu::math::exp(diff);
+            if weight < s.min_p { None } else { Some(Some(weight)) }
         };
         if !top_p {
             for value in values.iter_mut() {
-                if !survives(*value) {
+                if finite_ordered_key(*value) < threshold
+                    || (min_p && check_min_p(*value - maximum).is_none())
+                {
                     *value = f32::NEG_INFINITY;
                 }
             }
@@ -224,13 +281,22 @@ fn shape_rows_filter<L: Isa, E: Elements>(_l: L, cx: &Context<'_, E>, group: [u6
         let mut survivors = 0;
         let mut total = 0u64;
         for (token, value) in values.iter_mut().enumerate() {
-            if survives(*value) {
-                order[survivors] = (u64::from(!finite_ordered_key(*value)) << 32) | token as u64;
-                survivors += 1;
-                total += mass(*value, maximum);
-            } else {
+            let key = finite_ordered_key(*value);
+            if key < threshold {
                 *value = f32::NEG_INFINITY;
+                continue;
             }
+            let diff = *value - maximum;
+            let Some(weight) = check_min_p(diff) else {
+                *value = f32::NEG_INFINITY;
+                continue;
+            };
+            order[survivors] = (u64::from(!key) << 32) | token as u64;
+            survivors += 1;
+            total += match weight {
+                Some(w) => mass_from_weight(w),
+                None => mass_from_diff(diff),
+            };
         }
         let target = top_p_target(s.top_p, total);
         let ranked = &mut order[..survivors];
@@ -239,7 +305,7 @@ fn shape_rows_filter<L: Isa, E: Elements>(_l: L, cx: &Context<'_, E>, group: [u6
         for entry in ranked.iter() {
             let token = (*entry & 0xffff_ffff) as usize;
             if before < target {
-                before += mass(values[token], maximum);
+                before += mass_from_diff(values[token] - maximum);
             } else {
                 values[token] = f32::NEG_INFINITY;
             }

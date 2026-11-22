@@ -114,6 +114,138 @@ pub fn output_gate(function: i32, z: f32) -> f32 {
     }
 }
 
+const MAX_INLINE_STREAMS: usize = 8;
+
+#[inline(always)]
+fn mix_8<const ACCUMULATE: bool>(
+    weights: [f32; 8],
+    srcs: [&[f32]; 8],
+    out: &mut [f32],
+    mut finalize: impl FnMut(usize, f32) -> f32,
+) {
+    let len = out.len();
+    let [w0, w1, w2, w3, w4, w5, w6, w7] = weights;
+    let [s0, s1, s2, s3, s4, s5, s6, s7] = [
+        &srcs[0][..len],
+        &srcs[1][..len],
+        &srcs[2][..len],
+        &srcs[3][..len],
+        &srcs[4][..len],
+        &srcs[5][..len],
+        &srcs[6][..len],
+        &srcs[7][..len],
+    ];
+    for c in 0..len {
+        let base = if ACCUMULATE { out[c] } else { 0.0 };
+        let sum = (((((((base + w0 * s0[c]) + w1 * s1[c]) + w2 * s2[c]) + w3 * s3[c])
+            + w4 * s4[c])
+            + w5 * s5[c])
+            + w6 * s6[c])
+            + w7 * s7[c];
+        out[c] = finalize(c, sum);
+    }
+}
+
+#[inline(always)]
+fn mix_fallback<const ACCUMULATE: bool>(
+    weights: &[f32],
+    srcs: &[&[f32]],
+    out: &mut [f32],
+    mut finalize: impl FnMut(usize, f32) -> f32,
+) {
+    let len = out.len();
+    for c in 0..len {
+        let mut sum = if ACCUMULATE { out[c] } else { 0.0 };
+        for (&w, &s) in weights.iter().zip(srcs) {
+            sum += w * s[c];
+        }
+        out[c] = finalize(c, sum);
+    }
+}
+
+#[inline(always)]
+fn mix_streams<'r>(
+    streams: usize,
+    weight: impl Fn(usize) -> f32,
+    stream: impl Fn(usize) -> &'r [f32],
+    out: &mut [f32],
+    mut finalize: impl FnMut(usize, f32) -> f32,
+) {
+    let len = out.len();
+    let mut weights = [0.0f32; MAX_INLINE_STREAMS];
+    let mut srcs: [&[f32]; MAX_INLINE_STREAMS] = [&[]; MAX_INLINE_STREAMS];
+    if streams <= MAX_INLINE_STREAMS {
+        for i in 0..streams {
+            weights[i] = weight(i);
+            srcs[i] = &stream(i)[..len];
+        }
+        match streams {
+            0 => {
+                for (c, dst) in out.iter_mut().enumerate() {
+                    *dst = finalize(c, 0.0);
+                }
+            }
+            1 => {
+                let w0 = weights[0];
+                let s0 = &srcs[0][..len];
+                for c in 0..len {
+                    out[c] = finalize(c, 0.0 + w0 * s0[c]);
+                }
+            }
+            2 => {
+                let (w0, w1) = (weights[0], weights[1]);
+                let (s0, s1) = (&srcs[0][..len], &srcs[1][..len]);
+                for c in 0..len {
+                    out[c] = finalize(c, (0.0 + w0 * s0[c]) + w1 * s1[c]);
+                }
+            }
+            4 => {
+                let (w0, w1, w2, w3) = (weights[0], weights[1], weights[2], weights[3]);
+                let (s0, s1, s2, s3) = (
+                    &srcs[0][..len],
+                    &srcs[1][..len],
+                    &srcs[2][..len],
+                    &srcs[3][..len],
+                );
+                for c in 0..len {
+                    let sum = (((0.0 + w0 * s0[c]) + w1 * s1[c]) + w2 * s2[c]) + w3 * s3[c];
+                    out[c] = finalize(c, sum);
+                }
+            }
+            8 => mix_8::<false>(weights, srcs, out, finalize),
+            _ => mix_fallback::<false>(&weights[..streams], &srcs[..streams], out, finalize),
+        }
+        return;
+    }
+
+    for i in 0..MAX_INLINE_STREAMS {
+        weights[i] = weight(i);
+        srcs[i] = &stream(i)[..len];
+    }
+    mix_8::<false>(weights, srcs, out, |_, sum| sum);
+
+    let mut base = MAX_INLINE_STREAMS;
+    while base + MAX_INLINE_STREAMS < streams {
+        for i in 0..MAX_INLINE_STREAMS {
+            weights[i] = weight(base + i);
+            srcs[i] = &stream(base + i)[..len];
+        }
+        mix_8::<true>(weights, srcs, out, |_, sum| sum);
+        base += MAX_INLINE_STREAMS;
+    }
+
+    let rem = streams - base;
+    for i in 0..rem {
+        weights[i] = weight(base + i);
+        srcs[i] = &stream(base + i)[..len];
+    }
+    if rem == MAX_INLINE_STREAMS {
+        mix_8::<true>(weights, srcs, out, finalize);
+    } else {
+        mix_fallback::<true>(&weights[..rem], &srcs[..rem], out, finalize);
+    }
+}
+
 /// `scatter` (functions.seismic) of columns of one row into stream
 /// `stream`: each column `c` of `out` the stream's joined value from the
 /// output `y(c)`, the row's `inject_width` (`IN`) inject values
@@ -134,24 +266,26 @@ pub fn scatter<'r>(
 ) {
     out.compute(|out| {
         if inject_width > streams {
-            out.fill(0.0);
-            for from in 0..streams {
-                let weight = inject(streams + from * streams + stream);
-                for (mixed, value) in out.iter_mut().zip(residual(from)) {
-                    *mixed = *mixed + weight * *value;
-                }
-            }
-        } else {
-            out.copy_from_slice(residual(stream));
-        }
-        if inject_width == 0 {
-            for (column, target) in out.iter_mut().enumerate() {
-                *target = *target + y(column);
-            }
-        } else {
             let factor = inject(stream);
-            for (column, target) in out.iter_mut().enumerate() {
-                *target = *target + y(column) * factor;
+            mix_streams(
+                streams,
+                |from| inject(streams + from * streams + stream),
+                residual,
+                out,
+                |column, mixed| mixed + y(column) * factor,
+            );
+        } else {
+            let len = out.len();
+            let res = &residual(stream)[..len];
+            if inject_width == 0 {
+                for c in 0..len {
+                    out[c] = res[c] + y(c);
+                }
+            } else {
+                let factor = inject(stream);
+                for c in 0..len {
+                    out[c] = res[c] + y(c) * factor;
+                }
             }
         }
     });
@@ -168,13 +302,7 @@ pub fn collapse<'r>(
     mut out: Store<'_, F32>,
 ) {
     out.compute(|out| {
-        out.fill(0.0);
-        for index in 0..streams {
-            let weight = weight(index);
-            for (sum, value) in out.iter_mut().zip(stream(index)) {
-                *sum = *sum + weight * value;
-            }
-        }
+        mix_streams(streams, weight, stream, out, |_, sum| sum);
     });
 }
 

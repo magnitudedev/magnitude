@@ -11,18 +11,16 @@ fn stored_rows<L: Isa, E: Elements>(_l: L, cx: &Context<'_, E>, group: [u64; 3],
     let slot = gathered::row(cx.arg_tokens().get([row, 0]), cx.dim_r(), cx.dim_f(), |entry, field| {
         cx.arg_directory().get([entry, field])
     });
-    let values = seismic::cpu::tensor::floats(shared, cx.dim_w() as usize);
+    // SAFETY: each work item writes its own row.
+    let mut out = unsafe { cx.result_0().row_mut([row, 0]) };
     // A row without a slot reads zeros.
     match slot {
         Some(slot) => {
+            let values = seismic::cpu::tensor::floats(shared, cx.dim_w() as usize);
             let per = cx.dim_p() as usize;
-            cx.arg_slots().record(slot / per).decode_row(slot % per, values)
+            cx.arg_slots().record(slot / per).decode_row(slot % per, values);
+            activation::store::<E::A>(values, out);
         }
-        None => values.fill(0.0),
+        None => out.fill(0.0),
     }
-    for value in values.iter_mut() {
-        *value = activation::publish::<E::A>(*value);
-    }
-    // SAFETY: each work item writes its own row.
-    activation::store::<E::A>(values, unsafe { cx.result_0().row_mut([row, 0]) });
 }

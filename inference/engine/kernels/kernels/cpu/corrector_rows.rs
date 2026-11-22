@@ -2,7 +2,7 @@
 // work item per row: values plus bias, then by form the identity, silu or unit
 // length, plus the residual row when there is one, stored to Y.
 
-use lib::core::activation;
+use lib::core::{activation, reduce};
 
 #[inline(always)]
 fn corrector_rows<L: Isa, E: Elements>(_l: L, cx: &Context<'_, E>, group: [u64; 3], shared: &mut [u8]) {
@@ -20,9 +20,9 @@ fn corrector_rows<L: Isa, E: Elements>(_l: L, cx: &Context<'_, E>, group: [u64; 
             }
         }
         2 => {
-            let length = values.iter().map(|value| value * value).sum::<f32>().sqrt().max(cx.arg_epsilon());
+            let inv_length = 1.0 / reduce::sum_squares(values).sqrt().max(cx.arg_epsilon());
             for value in values.iter_mut() {
-                *value /= length;
+                *value *= inv_length;
             }
         }
         _ => {}

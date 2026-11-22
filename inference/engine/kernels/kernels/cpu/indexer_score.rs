@@ -2,26 +2,34 @@
 // work item per (256 scores, row) prepares the row's query heads (normed
 // when NQ = 1, rotated at the row's coordinates, rounded from the norm and
 // rotation held in A), then scores the
-// rows of its share of the row's list: scale * sum_h relu(q[h] . K) * w[h],
-// each dot an ascending FMA chain. Scores past the list are -inf.
+// rows of its share of the row's list: scale * sum_h relu(q[h] . K) * w[h].
+// Scores past the list are -inf.
 
 use lib::attention::attention::{self, Layout};
-use lib::core::{rounding::Rounding, spans};
+use lib::core::{reduce, rounding::Rounding, spans};
 use seismic::cpu::slab::SlabTensor;
+
+const SHARE: usize = 256;
+const STACK_HEADS: usize = 64;
 
 #[inline(always)]
 fn indexer_score<L: Isa, E: Elements>(_l: L, cx: &Context<'_, E>, group: [u64; 3], shared: &mut [u8]) {
     let (share, row) = (group[0] as usize, group[1] as usize);
     let (h, p, w) = (cx.dim_h() as usize, cx.dim_p() as usize, (2 * cx.dim_p() + cx.dim_s()) as usize);
     let (n, r) = (cx.dim_n() as usize, cx.dim_r() as usize);
-    let (first, last) = (share * 256, (share * 256 + 256).min(n));
+    let (first, last) = (share * SHARE, (share * SHARE + SHARE).min(n));
     let scores = cx.result_0();
     // The row's list: the plane rows of its spans in order.
     let bounds = cx.arg_spans();
-    let list = spans::rows(&|span, bound| bounds.get([row, span, bound]), r)
-        .skip(first)
-        .take(last - first)
-        .collect::<Vec<_>>();
+    let mut list_buf = [0i32; SHARE];
+    let mut list_len = 0;
+    for (slot, at) in list_buf[..last - first].iter_mut().zip(
+        spans::rows(&|span, bound| bounds.get([row, span, bound]), r).skip(first),
+    ) {
+        *slot = at;
+        list_len += 1;
+    }
+    let list = &list_buf[..list_len];
     for ordinal in first + list.len()..last {
         // SAFETY: each work item writes its own share of its row.
         unsafe { scores.set([row, ordinal], f32::NEG_INFINITY) };
@@ -32,7 +40,7 @@ fn indexer_score<L: Isa, E: Elements>(_l: L, cx: &Context<'_, E>, group: [u64; 3
     let storage = seismic::cpu::tensor::floats(shared, 2 * p + (h + 1) * w);
     let (angles, vectors) = storage.split_at_mut(2 * p);
     let (cosines, sines) = angles.split_at_mut(p);
-    let (queries, key) = vectors.split_at_mut(h * w);
+    let (queries, scratch) = vectors.split_at_mut(h * w);
     attention::scaled_angles(
         cx.arg_coordinates().row([row, 0]),
         cx.arg_rotary_components().row([0]),
@@ -48,10 +56,10 @@ fn indexer_score<L: Isa, E: Elements>(_l: L, cx: &Context<'_, E>, group: [u64; 3
     let hold = rounding.map(|_| lib::core::activation::publish::<E::A>);
     let query = cx.arg_query();
     for head in 0..h {
-        lib::core::activation::widen::<E::A>(query.row([row, head, 0]), key);
+        lib::core::activation::widen::<E::A>(query.row([row, head, 0]), scratch);
         let prepared = &mut queries[head * w..][..w];
         attention::prepare_rounded_head::<seismic::cpu::F32>(
-            key,
+            scratch,
             norm,
             layout,
             cosines,
@@ -62,20 +70,24 @@ fn indexer_score<L: Isa, E: Elements>(_l: L, cx: &Context<'_, E>, group: [u64; 3
             prepared,
         );
     }
-    let mut weights = vec![1.0f32; h];
+    let mut weights_stack = [1.0f32; STACK_HEADS];
+    let mut weights_heap = Vec::new();
+    let weights: &mut [f32] = if h <= STACK_HEADS {
+        &mut weights_stack[..h]
+    } else {
+        weights_heap.resize(h, 1.0f32);
+        &mut weights_heap
+    };
     if cx.dim_hw() > 0 {
-        lib::core::activation::widen::<E::A>(cx.arg_head_weights().row([row, 0]), &mut weights);
+        lib::core::activation::widen::<E::A>(cx.arg_head_weights().row([row, 0]), weights);
     }
     let keys = SlabTensor::from_bound(cx.arg_keys(), cx.arg_slab_rows() as usize);
     let scale = cx.arg_scale();
-    for (ordinal, &at) in (first..).zip(&list) {
-        key.copy_from_slice(keys.row([at as usize, 0]));
+    for (ordinal, &at) in (first..).zip(list) {
+        let key_row = keys.row([at as usize, 0]);
         let mut score = 0.0f32;
-        for (head, weight) in weights.iter().enumerate() {
-            let mut dot = 0.0f32;
-            for (q, x) in queries[head * w..][..w].iter().zip(key.iter()) {
-                dot = q.mul_add(*x, dot);
-            }
+        for (head, &weight) in weights.iter().enumerate() {
+            let dot = reduce::dot(&queries[head * w..][..w], key_row);
             score += dot.max(0.0) * weight;
         }
         // SAFETY: each work item writes its own share of its row.

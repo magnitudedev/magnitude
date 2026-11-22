@@ -187,17 +187,34 @@ pub fn project_bias(
 // ---------------------------------------------------------------------------
 // 2D rotary embedding.
 
-/// The portable `vision_rotate` of one head row of width 4P, in place, each
-/// value published to `A`: column i < 2P pairs with i + 2P; pair p = i % 2P
-/// turns by coordinates[p / P] * exp(-log_base * (p % P) / P).
+/// The cosines and sines of a row's 2P rotary pairs: pair p < 2P turns by
+/// `coordinates[p / P] * exp(-log_base * (p % P) / P)`. `cosines` and `sines`
+/// each have length at least `2 * quarter`.
 #[inline(always)]
-pub fn rotate<A: Dense>(head: &mut [f32], coordinates: [i32; 2], quarter: usize, log_base: f32) {
+pub fn rotate_turns(coordinates: [i32; 2], quarter: usize, log_base: f32, cosines: &mut [f32], sines: &mut [f32]) {
+    let (c0, c1) = cosines[..2 * quarter].split_at_mut(quarter);
+    let (s0, s1) = sines[..2 * quarter].split_at_mut(quarter);
+    let (coord0, coord1) = (coordinates[0] as f32, coordinates[1] as f32);
+    let q = quarter as f32;
+    for (i, ((c0, s0), (c1, s1))) in
+        c0.iter_mut().zip(s0.iter_mut()).zip(c1.iter_mut().zip(s1.iter_mut())).enumerate()
+    {
+        let inv_freq = (-log_base * i as f32 / q).exp();
+        (*s0, *c0) = seismic::cpu::math::sin_cos(coord0 * inv_freq);
+        (*s1, *c1) = seismic::cpu::math::sin_cos(coord1 * inv_freq);
+    }
+}
+
+/// The portable `vision_rotate` of one head row of width 4P, in place, each
+/// value published to `A`, using the precomputed `cosines` and `sines` from
+/// [`rotate_turns`]: column i < 2P pairs with i + 2P.
+#[inline(always)]
+pub fn rotate_with_turns<A: Dense>(head: &mut [f32], quarter: usize, cosines: &[f32], sines: &[f32]) {
     let half = 2 * quarter;
     let (first, second) = head[..2 * half].split_at_mut(half);
-    for (pair, (x, partner)) in first.iter_mut().zip(second.iter_mut()).enumerate() {
-        let frequency = (pair % quarter) as f32;
-        let angle = coordinates[pair / quarter] as f32 * (-log_base * frequency / quarter as f32).exp();
-        let (s, c) = seismic::cpu::math::sin_cos(angle);
+    for ((x, partner), (&c, &s)) in
+        first.iter_mut().zip(second.iter_mut()).zip(cosines[..half].iter().zip(sines[..half].iter()))
+    {
         let (a, b) = (*x, *partner);
         *x = activation::publish::<A>(a * c - b * s);
         *partner = activation::publish::<A>(b * c + a * s);

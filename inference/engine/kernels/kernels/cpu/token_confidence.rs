@@ -5,7 +5,43 @@
 // a selection's slices and publishes the probability of the selected token (0
 // when its selection failed).
 
+use seismic::cpu::reduce::{LANES, combine};
+
 const PARTS: usize = 64;
+
+#[inline(always)]
+fn max_f32(values: &[f32]) -> f32 {
+    let mut lanes = [f32::NEG_INFINITY; LANES];
+    let chunks = values.chunks_exact(LANES);
+    let tail = chunks.remainder();
+    for chunk in chunks {
+        for lane in 0..LANES {
+            lanes[lane] = lanes[lane].max(chunk[lane]);
+        }
+    }
+    for (lane, &value) in tail.iter().enumerate() {
+        lanes[lane] = lanes[lane].max(value);
+    }
+    let a = lanes[0].max(lanes[4]).max(lanes[2].max(lanes[6]));
+    let b = lanes[1].max(lanes[5]).max(lanes[3].max(lanes[7]));
+    a.max(b)
+}
+
+#[inline(always)]
+fn sum_exp_shifted(values: &[f32], maximum: f32) -> f32 {
+    let mut lanes = [0.0f32; LANES];
+    let chunks = values.chunks_exact(LANES);
+    let tail = chunks.remainder();
+    for chunk in chunks {
+        for lane in 0..LANES {
+            lanes[lane] += (chunk[lane] - maximum).exp();
+        }
+    }
+    for (lane, &value) in tail.iter().enumerate() {
+        lanes[lane] += (value - maximum).exp();
+    }
+    combine(lanes)
+}
 
 #[inline(always)]
 fn token_confidence_partition<L: Isa, E: Elements>(_l: L, cx: &Context<'_, E>, group: [u64; 3], _shared: &mut [u8]) {
@@ -15,8 +51,8 @@ fn token_confidence_partition<L: Isa, E: Elements>(_l: L, cx: &Context<'_, E>, g
     let begin = (part * span).min(vocabulary);
     let end = (begin + span).min(vocabulary);
     let line = &cx.arg_logits().row([cx.arg_rows().get([row]) as usize, 0])[begin..end];
-    let maximum = line.iter().copied().fold(f32::NEG_INFINITY, f32::max);
-    let total = line.iter().map(|logit| (logit - maximum).exp()).sum::<f32>();
+    let maximum = max_f32(line);
+    let total = sum_exp_shifted(line, maximum);
     // SAFETY: each work item writes its own (row, part) pair.
     let out = unsafe { cx.scratch_partials().slice_mut::<f32>(8 * (row * PARTS + part), 2) };
     out.copy_from_slice(&[maximum, total]);
@@ -25,17 +61,17 @@ fn token_confidence_partition<L: Isa, E: Elements>(_l: L, cx: &Context<'_, E>, g
 #[inline(always)]
 fn token_confidence_merge<L: Isa, E: Elements>(_l: L, cx: &Context<'_, E>, group: [u64; 3], _shared: &mut [u8]) {
     let row = group[0] as usize;
-    // SAFETY: the partition launch wrote every pair before this launch.
-    let partials = unsafe { cx.scratch_partials().slice::<f32>(8 * row * PARTS, 2 * PARTS) };
-    let maximum = partials.chunks_exact(2).map(|pair| pair[0]).fold(f32::NEG_INFINITY, f32::max);
-    let total = partials
-        .chunks_exact(2)
-        .filter(|pair| pair[1] > 0.0)
-        .map(|pair| pair[1] * (pair[0] - maximum).exp())
-        .sum::<f32>();
-    let line = cx.arg_logits().row([cx.arg_rows().get([row]) as usize, 0]);
     let selection = cx.arg_selection();
     let probability = if selection.get([row, 1]) == 0 {
+        // SAFETY: the partition launch wrote every pair before this launch.
+        let partials = unsafe { cx.scratch_partials().slice::<f32>(8 * row * PARTS, 2 * PARTS) };
+        let maximum = partials.chunks_exact(2).map(|pair| pair[0]).fold(f32::NEG_INFINITY, f32::max);
+        let total = partials
+            .chunks_exact(2)
+            .filter(|pair| pair[1] > 0.0)
+            .map(|pair| pair[1] * (pair[0] - maximum).exp())
+            .sum::<f32>();
+        let line = cx.arg_logits().row([cx.arg_rows().get([row]) as usize, 0]);
         (line[selection.get([row, 0]) as usize] - maximum).exp() / total
     } else {
         0.0

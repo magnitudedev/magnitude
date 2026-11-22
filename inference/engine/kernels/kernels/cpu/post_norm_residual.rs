@@ -10,14 +10,16 @@ fn post_norm_residual<L: Isa, E: Elements>(_l: L, cx: &Context<'_, E>, group: [u
     let d = cx.dim_d() as usize;
     let norm = seismic::cpu::tensor::floats(shared, d);
     cx.arg_norm().decode_row(0, norm);
-    let projected = cx.arg_projected().row([row, 0]);
+    let projected = &cx.arg_projected().row([row, 0])[..d];
     let source = cx.arg_out_rows().get([row]) as usize;
-    let residual = cx.arg_residual().row([source, 0]);
+    let residual = &cx.arg_residual().row([source, 0])[..d];
     let inverse = reduce::rms_inverse(projected, cx.arg_epsilon());
     let scale = cx.arg_scale();
     // SAFETY: each work item writes its own row.
-    let mut out = unsafe { cx.result_0().row_mut([row, 0]) };
-    for (((target, r), p), w) in out.iter_mut().zip(residual).zip(projected).zip(norm.iter()) {
-        target.set((r + p * inverse * w) * scale);
-    }
+    unsafe { cx.result_0().row_mut([row, 0]) }.compute(|out| {
+        let out = &mut out[..d];
+        for i in 0..d {
+            out[i] = (residual[i] + projected[i] * inverse * norm[i]) * scale;
+        }
+    });
 }
