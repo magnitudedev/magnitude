@@ -79,6 +79,8 @@ export function useRecommendations(usOnly: boolean, memory: ServingMemory): Reco
   const recommendations = useAtomValue(client.Models.GetRecommendations({ developerCountry })).result
   const hardware = useLocalInferenceHardware()
   const freeDiskBytes = Result.isSuccess(hardware) ? Option.getOrNull(Option.map(hardware.value.modelStorage, storage => storage.freeBytes)) : null
+  const hasGpu = Result.isSuccess(hardware)
+    && hardware.value.accelerators.some(accelerator => accelerator.executors.some(executor => executor.deviceId === hardware.value.activeDeviceId))
   const models = useLocalModels()
   return useMemo(() => {
     if (!Result.isSuccess(recommendations) || !Result.isSuccess(models)) return { ready: false, benchmark: null, offered: [], roomShortfall: null, families: [] }
@@ -86,7 +88,7 @@ export function useRecommendations(usOnly: boolean, memory: ServingMemory): Reco
     const byId = new Map<string, LocalModel>(models.value.models.map(model => [model.modelId, model]))
     return {
       ready: true,
-      benchmark: hardwareBenchmarkView(models.value.preparation.measurement, complete),
+      benchmark: hardwareBenchmarkView(models.value.preparation.measurement, complete, hasGpu),
       offered: recommendations.value.models.flatMap(recommendation => {
         const model = offeredFromRecommendation(recommendation, byId, memory, freeDiskBytes)
         return model ? [{ recommendation, model }] : []
@@ -94,5 +96,5 @@ export function useRecommendations(usOnly: boolean, memory: ServingMemory): Reco
       roomShortfall: Option.getOrNull(recommendations.value.roomShortfall),
       families: recommendations.value.families.map(runnableFamily),
     }
-  }, [recommendations, models, memory, freeDiskBytes])
+  }, [recommendations, models, memory, freeDiskBytes, hasGpu])
 }

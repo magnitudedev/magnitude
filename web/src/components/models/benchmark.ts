@@ -32,6 +32,7 @@ const retryLabel = (retryAt: number): string => {
 export const hardwareBenchmarkView = (
   measurement: MachineMeasurement | null,
   complete: boolean,
+  hasGpu = true,
 ): HardwareBenchmarkView | null => {
   if (complete) return null
   if (measurement === null) {
@@ -47,7 +48,7 @@ export const hardwareBenchmarkView = (
     case "Unmeasured":
       return {
         title: HARDWARE_BENCHMARK_TITLE,
-        subtitle: "Waiting for your GPU to be free",
+        subtitle: hasGpu ? "Waiting for your GPU to be free" : "Waiting for your machine to be ready",
         percent: null,
         fraction: null,
         failed: false,
