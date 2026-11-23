@@ -7166,6 +7166,7 @@ impl ServedForm {
                 UG: gate.resident,
                 UU: up.resident,
                 UD: down.resident,
+                A: seismic::Element::bf16(),
             }),
             &specialize(&[("K", k)], &[]),
         )
@@ -8059,6 +8060,11 @@ fn streaming_a_landing_converts_records_appended_late_out_of_order() {
         let (served, appended) = (file.clone(), landing.clone());
         let [gate, up, down] = bank.each_mut();
         let grid = land_grid(&device, true);
+        let empty_routes = seismic::Tensor::zeros(&charges, seismic::Element::i32(), &[0, k]).unwrap();
+        let empty_weights = seismic::Tensor::zeros(&charges, seismic::Element::f32(), &[0, k]).unwrap();
+        let empty_norm = seismic::Tensor::zeros(&charges, seismic::Element::bf16(), &[0, form.down.matrix[0]]).unwrap();
+        let mut empty_site = seismic::Tensor::zeros(&charges, seismic::Element::i32(), &[0, 0]).unwrap();
+        let mut empty_site_rows = seismic::Tensor::zeros(&charges, seismic::Element::f32(), &[0, constants::VERIFY_ROWS, form.down.matrix[0]]).unwrap();
         let args = routed_land::Args {
             step: &step,
             file: &mut file,
@@ -8072,6 +8078,11 @@ fn streaming_a_landing_converts_records_appended_late_out_of_order() {
             up,
             down,
             grid: &grid,
+            routes: &empty_routes,
+            weights: &empty_weights,
+            normalized: &empty_norm,
+            site: &mut empty_site,
+            site_rows: &mut empty_site_rows,
         };
         if in_kernels {
             std::thread::scope(|scope| {
@@ -8136,6 +8147,11 @@ fn streaming_a_landing_stops_once_its_slot_is_answered_or_failed() {
             let mut sources = decode_sources(&device, 1, k, &[0, -1, -1, -1]);
             let mut bank = form.records(&device, true, 6, |_, _| None);
             let [gate, up, down] = bank.each_mut();
+            let empty_routes = seismic::Tensor::zeros(&charges, seismic::Element::i32(), &[0, k]).unwrap();
+            let empty_weights = seismic::Tensor::zeros(&charges, seismic::Element::f32(), &[0, k]).unwrap();
+            let empty_norm = seismic::Tensor::zeros(&charges, seismic::Element::bf16(), &[0, form.down.matrix[0]]).unwrap();
+            let mut empty_site = seismic::Tensor::zeros(&charges, seismic::Element::i32(), &[0, 0]).unwrap();
+            let mut empty_site_rows = seismic::Tensor::zeros(&charges, seismic::Element::f32(), &[0, constants::VERIFY_ROWS, form.down.matrix[0]]).unwrap();
             kernel
                 .call_answered(&charges, routed_land::Args {
                     step: &step,
@@ -8150,6 +8166,11 @@ fn streaming_a_landing_stops_once_its_slot_is_answered_or_failed() {
                     up,
                     down,
                     grid: &land_grid(&device, true),
+                    routes: &empty_routes,
+                    weights: &empty_weights,
+                    normalized: &empty_norm,
+                    site: &mut empty_site,
+                    site_rows: &mut empty_site_rows,
                 })
                 .unwrap();
             for (tensor, stack) in bank.iter().enumerate() {
@@ -8246,6 +8267,11 @@ fn streaming_repeated_answered_land_and_round_complete_without_deadlock() {
         let mut sources = decode_sources(&device, 1, k, &[0, -1, -1, -1]);
         let mut bank = form.records(&device, true, 6, |_, _| None);
         let [gate, up, down] = bank.each_mut();
+        let empty_routes = seismic::Tensor::zeros(&charges, seismic::Element::i32(), &[0, k]).unwrap();
+        let empty_weights = seismic::Tensor::zeros(&charges, seismic::Element::f32(), &[0, k]).unwrap();
+        let empty_norm = seismic::Tensor::zeros(&charges, seismic::Element::bf16(), &[0, form.down.matrix[0]]).unwrap();
+        let mut empty_site = seismic::Tensor::zeros(&charges, seismic::Element::i32(), &[0, 0]).unwrap();
+        let mut empty_site_rows = seismic::Tensor::zeros(&charges, seismic::Element::f32(), &[0, constants::VERIFY_ROWS, form.down.matrix[0]]).unwrap();
         land_kernel
             .call_answered(&charges, routed_land::Args {
                 step: &step,
@@ -8260,6 +8286,11 @@ fn streaming_repeated_answered_land_and_round_complete_without_deadlock() {
                 up,
                 down,
                 grid: &grid,
+                routes: &empty_routes,
+                weights: &empty_weights,
+                normalized: &empty_norm,
+                site: &mut empty_site,
+                site_rows: &mut empty_site_rows,
             })
             .unwrap();
         assert_eq!(read_i32(&landing)[landing_done(0)], low, "routed_land run {run}: DONE");
@@ -8300,6 +8331,11 @@ fn streaming_overlapping_land_steps_isolate_counters_and_order_heads() {
     let landing_proto = shared_i32(&device, &[constants::LANDING_ENTRY(3)], &landing_words(0, 0, &[], 3));
     let bank_proto = form.records(&device, true, 6, |_, _| None);
     let grid = land_grid(&device, true);
+    let empty_routes = seismic::Tensor::zeros(&charges, seismic::Element::i32(), &[0, k]).unwrap();
+    let empty_weights = seismic::Tensor::zeros(&charges, seismic::Element::f32(), &[0, k]).unwrap();
+    let empty_norm = seismic::Tensor::zeros(&charges, seismic::Element::bf16(), &[0, form.down.matrix[0]]).unwrap();
+    let empty_site = seismic::Tensor::zeros(&charges, seismic::Element::i32(), &[0, 0]).unwrap();
+    let empty_site_rows = seismic::Tensor::zeros(&charges, seismic::Element::f32(), &[0, constants::VERIFY_ROWS, form.down.matrix[0]]).unwrap();
 
     let mut graph = device.native_graph();
     let park_port = graph.timeline(seismic::timeline::Park);
@@ -8310,6 +8346,11 @@ fn streaming_overlapping_land_steps_isolate_counters_and_order_heads() {
     let policy_port = port(&policy);
     let mut landing_port = port(&landing_proto);
     let grid_port = port(&grid);
+    let routes_port = port(&empty_routes);
+    let weights_port = port(&empty_weights);
+    let norm_port = port(&empty_norm);
+    let mut site_port = port(&empty_site);
+    let mut site_rows_port = port(&empty_site_rows);
     let staging_ports = [&staging[0], &staging[1], &staging[2]].map(&mut port);
     let bank_ports = [&bank_proto[0], &bank_proto[1], &bank_proto[2]].map(&mut port);
     let [mut gate_port, mut up_port, mut down_port] = bank_ports.clone();
@@ -8329,6 +8370,11 @@ fn streaming_overlapping_land_steps_isolate_counters_and_order_heads() {
                 up: up_port.tensor_mut().into(),
                 down: down_port.tensor_mut().into(),
                 grid: grid_port.tensor().into(),
+                routes: routes_port.tensor().into(),
+                weights: weights_port.tensor().into(),
+                normalized: norm_port.tensor().into(),
+                site: site_port.tensor_mut().into(),
+                site_rows: site_rows_port.tensor_mut().into(),
             },
         )
         .unwrap();
@@ -8393,6 +8439,11 @@ fn streaming_overlapping_land_steps_isolate_counters_and_order_heads() {
                 (&bank_ports[1], &bank[1]),
                 (&bank_ports[2], &bank[2]),
                 (&grid_port, &grid),
+                (&routes_port, &empty_routes),
+                (&weights_port, &empty_weights),
+                (&norm_port, &empty_norm),
+                (&site_port, &empty_site),
+                (&site_rows_port, &empty_site_rows),
             ] {
                 bindings.set(&charges, port, tensor).unwrap();
             }
@@ -8526,11 +8577,30 @@ fn native_landings_match_the_portable_body() {
         inputs.extend(bank.iter().map(|tensor| dense(tensor, DType::F32)));
         let groups = magnitude_kernels::land_groups(placed);
         inputs.push(ints(&[3], &[groups, 1, 1]));
-        let outcome = interpret(&module, "routed_land", &DENSE_LANDING, inputs);
+        inputs.push(ints(&[0, k], &[]));
+        inputs.push(floats(&[0, k], &[]));
+        inputs.push(Input::Tensor(DType::BF16, vec![0, form.down.matrix[0] as usize], vec![]));
+        inputs.push(ints(&[0, 0], &[]));
+        inputs.push(floats(&[0, constants::VERIFY_ROWS as usize, form.down.matrix[0] as usize], &[]));
+        let land_bindings: [(&str, DType); 7] = [
+            DENSE_LANDING[0],
+            DENSE_LANDING[1],
+            DENSE_LANDING[2],
+            DENSE_LANDING[3],
+            DENSE_LANDING[4],
+            DENSE_LANDING[5],
+            ("A", DType::BF16),
+        ];
+        let outcome = interpret(&module, "routed_land", &land_bindings, inputs);
 
         let mut sources = i32_tensor(&device, &[constants::SOURCE_ROWS, 1, k as u64], &source_words);
         let mut landing_tensor = shared_i32(&device, &[landing.len() as u64], &landing);
         let [gate, up, down] = bank.each_mut();
+        let empty_routes = seismic::Tensor::zeros(&charges, seismic::Element::i32(), &[0, k as u64]).unwrap();
+        let empty_weights = seismic::Tensor::zeros(&charges, seismic::Element::f32(), &[0, k as u64]).unwrap();
+        let empty_norm = seismic::Tensor::zeros(&charges, seismic::Element::bf16(), &[0, form.down.matrix[0]]).unwrap();
+        let mut empty_site = seismic::Tensor::zeros(&charges, seismic::Element::i32(), &[0, 0]).unwrap();
+        let mut empty_site_rows = seismic::Tensor::zeros(&charges, seismic::Element::f32(), &[0, constants::VERIFY_ROWS, form.down.matrix[0]]).unwrap();
         form.land_kernel(&device, k as u64)
             .call_answered(&charges, routed_land::Args {
                 step: &streaming_step(&device),
@@ -8545,6 +8615,11 @@ fn native_landings_match_the_portable_body() {
                 up,
                 down,
                 grid: &land_grid(&device, placed),
+                routes: &empty_routes,
+                weights: &empty_weights,
+                normalized: &empty_norm,
+                site: &mut empty_site,
+                site_rows: &mut empty_site_rows,
             })
             .unwrap();
         assert_eq!(read_i32(&sources), as_i32(input(&outcome, 2)), "{label}: sources");
@@ -9487,6 +9562,8 @@ fn a_streamed_route_skips_what_only_a_front_row_lacks() {
         let (table, mut file, mut sources, mut routing, mut front_ring, tier, mut land_grid) = ports(m, e, k);
         let mut routes = zeros(seismic::Element::i32(), &[m, k]);
         let mut scores = zeros(f32, &[m, k]);
+        let mut empty_site = zeros(seismic::Element::i32(), &[0, 0]);
+        let mut empty_site_rows = zeros(f32, &[0, constants::VERIFY_ROWS, h]);
         kernel
             .call(&charges, routed_route_streamed::Args {
                 residual: &f32_tensor(&device, &[m, h], &rows),
@@ -9512,6 +9589,8 @@ fn a_streamed_route_skips_what_only_a_front_row_lacks() {
                 front: &mut front_ring,
                 land_grid: &mut land_grid,
                 land_groups: LANDING,
+                site: &mut empty_site,
+                site_rows: &mut empty_site_rows,
             })
             .unwrap();
         let case = format!("routed_route_streamed on {:?}, front rows {front:#b}", device.backend());
@@ -9838,6 +9917,8 @@ fn a_streamed_route_keys_every_expert_as_it_ranks_them() {
                     specialization.with_static(name.clone(), *value)
                 });
                 let kernel = entry.prepare(&device, &implementation.default_specialization(&statics).unwrap()).unwrap();
+                let mut empty_site = seismic::Tensor::zeros(&charges, seismic::Element::i32(), &[0, 0]).unwrap();
+                let mut empty_site_rows = seismic::Tensor::zeros(&charges, seismic::Element::f32(), &[0, constants::VERIFY_ROWS, h]).unwrap();
                 kernel
                     .call(&charges, routed_route_streamed::Args {
                         residual: &f32_tensor(&device, &[m, h], &residual),
@@ -9863,6 +9944,8 @@ fn a_streamed_route_keys_every_expert_as_it_ranks_them() {
                         front: &mut front_ring,
                         land_grid: &mut land_grid,
                         land_groups: LANDING,
+                        site: &mut empty_site,
+                        site_rows: &mut empty_site_rows,
                     })
                     .unwrap();
                 let [slots, width] = table.extents().map(|extent| extent as usize);
@@ -9890,6 +9973,8 @@ fn a_streamed_route_keys_every_expert_as_it_ranks_them() {
                     ints(&[constants::HINT_ENTRY(choices) as usize], &vec![0; constants::HINT_ENTRY(choices) as usize]),
                     ints(&[3], &[0; 3]),
                     Input::I32(LANDING),
+                    ints(&[0, 0], &[]),
+                    floats(&[0, constants::VERIFY_ROWS as usize, hu], &[]),
                 ];
                 let bindings = [
                     ("NW", DType::BF16),
@@ -10154,7 +10239,21 @@ fn portable_landing_routes_a_landed_record_to_its_side() {
         ];
         inputs.extend(DENSE_LANDING.map(|(_, dtype)| Input::Tensor(dtype, vec![0, 1, 1], vec![])));
         inputs.push(ints(&[3], &[1, 1, 1]));
-        let outcome = interpret(&module, "routed_land", &DENSE_LANDING, inputs);
+        inputs.push(ints(&[0, k], &[]));
+        inputs.push(floats(&[0, k], &[]));
+        inputs.push(Input::Tensor(DType::BF16, vec![0, 1], vec![]));
+        inputs.push(ints(&[0, 0], &[]));
+        inputs.push(floats(&[0, constants::VERIFY_ROWS as usize, 1], &[]));
+        let land_bindings: [(&str, DType); 7] = [
+            DENSE_LANDING[0],
+            DENSE_LANDING[1],
+            DENSE_LANDING[2],
+            DENSE_LANDING[3],
+            DENSE_LANDING[4],
+            DENSE_LANDING[5],
+            ("A", DType::BF16),
+        ];
+        let outcome = interpret(&module, "routed_land", &land_bindings, inputs);
         assert_eq!(
             as_i32(input(&outcome, 2)),
             magnitude_kernels::source_words(&expected_records, &expected_sites),
@@ -10267,6 +10366,158 @@ fn portable_sited_combine_adds_an_answered_step_alone() {
             .collect::<Vec<_>>();
         let value = result(&outcome, 0).into_iter().map(|value| (value as f32).to_bits()).collect::<Vec<_>>();
         assert_eq!(value, expected, "{case}");
+    }
+}
+
+/// Single-launch `routed_output_streamed` on CUDA matches `routed_output`
+/// bit-for-bit when no choice is CPU-sited (M=1 summed and M=4 gathered), and
+/// adds `site_output[slot, row, :]` identically when one or more choices are
+/// CPU-sited and answered.
+#[test]
+fn streaming_output_streamed_matches_reference() {
+    use magnitude_kernels::routed_output_streamed;
+    let Some(device) = streaming_device() else {
+        return;
+    };
+    if device.backend() != seismic::BackendName::Cuda {
+        return;
+    }
+    let charges = seismic::Charges::tally(&device);
+    let bf16 = seismic::Element::bf16();
+    let (h, e, k, f, s) = (256u64, 4u64, 2u64, 128u64, 128u64);
+    let q = (1u64 << 32) + 5;
+    let slot = (q % FLIGHT) as usize;
+    let table = SlotTable::site(FLIGHT, 4 * k);
+    let sw = table.width();
+    let verify_rows = constants::VERIFY_ROWS;
+    let statics = &[("H", h), ("SN", 1), ("IN", 0), ("K", k), ("F", f), ("S", s)];
+    let resident_kernel = declared::prepared(
+        &device,
+        &routed_output::native_entry_with(routed_output::Elements {
+            EDW: bf16,
+            SDW: bf16,
+            A: bf16,
+            NW: bf16,
+        }),
+        &specialize(statics, &[]),
+    )
+    .unwrap();
+    let streamed_kernel = declared::prepared(
+        &device,
+        &routed_output_streamed::native_entry_with(routed_output_streamed::Elements {
+            EDW: bf16,
+            SDW: bf16,
+            A: bf16,
+        }),
+        &specialize(statics, &[]),
+    )
+    .unwrap();
+    let expert_down = bf16_tensor(&device, &[e, h, f], &pattern((e * h * f) as usize, 11, 0.25));
+    let shared_down = bf16_tensor(&device, &[h, s], &pattern((h * s) as usize, 13, 0.25));
+    let tier_down = seismic::Tensor::zeros(&charges, bf16, &[0, h, f]).unwrap();
+    let operand_norm = seismic::Tensor::zeros(&charges, bf16, &[0]).unwrap();
+    let step = i32_tensor(&device, &[constants::STEP_WORDS], &step_words(q));
+    let mut site_output_host = vec![0.0f32; (FLIGHT * verify_rows * h) as usize];
+    for row in 0..4usize {
+        for col in 0..h as usize {
+            site_output_host[(slot * verify_rows as usize + row) * h as usize + col] =
+                ((row * 7 + col) as f32) * 0.01 - 0.5;
+        }
+    }
+    let site_output = f32_tensor(&device, &[FLIGHT, verify_rows, h], &site_output_host);
+
+    for m in [1u64, 4u64] {
+        let residual = f32_tensor(&device, &[m, h], &pattern((m * h) as usize, 17, 1.0));
+        let inject = seismic::Tensor::zeros(&charges, seismic::Element::f32(), &[m, 0]).unwrap();
+        let expert_product = bf16_tensor(&device, &[m, k, f], &pattern((m * k * f) as usize, 19, 0.5));
+        let shared_product = bf16_tensor(&device, &[m, s], &pattern((m * s) as usize, 23, 0.5));
+        let routes_host: Vec<i32> = (0..(m * k) as i32).map(|i| i % e as i32).collect();
+        let routes = i32_tensor(&device, &[m, k], &routes_host);
+        let scores = f32_tensor(&device, &[m, k], &pattern((m * k) as usize, 29, 0.5));
+        let coefficient = f32_tensor(&device, &[m], &pattern(m as usize, 31, 0.5));
+
+        for sited_any in [false, true] {
+            let mut records = routes_host.clone();
+            let mut sites = vec![-1i32; (m * k) as usize];
+            if sited_any {
+                // Mark choice 0 of row 0 as CPU-sited (GPU skips it, CPU provides site_output).
+                records[0] = -1;
+                sites[0] = 0;
+            }
+            let sources = i32_tensor(
+                &device,
+                &[constants::SOURCE_ROWS, m, k],
+                &magnitude_kernels::source_words(&records, &sites),
+            );
+            let mut site_words = vec![0i32; (FLIGHT * sw) as usize];
+            if sited_any {
+                let at = table.lane(q, 0);
+                set_pair(&mut site_words, at + constants::SLOT_REQUEST, q);
+                set_pair(&mut site_words, at + constants::SLOT_ANSWER, q);
+            }
+            let mut site = shared_i32(&device, &[FLIGHT, sw], &site_words);
+
+            let baseline = resident_kernel
+                .call(
+                    &charges,
+                    routed_output::Args {
+                        residual: &residual,
+                        inject: &inject,
+                        expert_product: &expert_product,
+                        shared_product: &shared_product,
+                        routes: &routes,
+                        sources: &sources,
+                        scores: &scores,
+                        coefficient: &coefficient,
+                        expert_down: &expert_down,
+                        tier_down: &tier_down,
+                        shared_down: &shared_down,
+                        operand_norm: &operand_norm,
+                        operand_epsilon: 0.0,
+                    },
+                )
+                .unwrap();
+            let got = streamed_kernel
+                .call_answered(
+                    &charges,
+                    routed_output_streamed::Args {
+                        residual: &residual,
+                        inject: &inject,
+                        expert_product: &expert_product,
+                        shared_product: &shared_product,
+                        routes: &routes,
+                        sources: &sources,
+                        scores: &scores,
+                        coefficient: &coefficient,
+                        expert_down: &expert_down,
+                        tier_down: &tier_down,
+                        shared_down: &shared_down,
+                        step: &step,
+                        site: &mut site,
+                        site_output: &site_output,
+                    },
+                )
+                .unwrap();
+            let base_f32 = read_f32(&baseline.value);
+            let got_f32 = read_f32(&got.value);
+            for row in 0..m as usize {
+                for col in 0..h as usize {
+                    let idx = row * h as usize + col;
+                    let expected = if sited_any {
+                        base_f32[idx] + site_output_host[(slot * verify_rows as usize + row) * h as usize + col]
+                    } else {
+                        base_f32[idx]
+                    };
+                    let diff = (got_f32[idx] - expected).abs();
+                    assert!(
+                        diff <= 1e-5,
+                        "M={m} sited={sited_any} row={row} col={col}: got {} expected {} (diff {diff})",
+                        got_f32[idx],
+                        expected
+                    );
+                }
+            }
+        }
     }
 }
 
@@ -10523,20 +10774,31 @@ struct TierLanding {
     staging: [seismic::Tensor; 3],
     bank: [seismic::Tensor; 3],
     grid: seismic::Tensor,
+    routes: seismic::Tensor,
+    weights: seismic::Tensor,
+    normalized: seismic::Tensor,
+    site: seismic::Tensor,
+    site_rows: seismic::Tensor,
 }
 
 impl TierLanding {
     fn new(device: &seismic::Device) -> Self {
         let form = ServedForm::dense(false, seismic::Element::f32(), 1, 1);
+        let charges = seismic::Charges::tally(device);
         Self {
             kernel: form.land_kernel(device, 1),
-            charges: seismic::Charges::tally(device),
             step: streaming_step(device),
             policy: shared_i32(device, &[constants::POLICY_WORDS], &[0; constants::POLICY_WORDS as usize]),
             landing: shared_i32(device, &[constants::LANDING_ENTRY(1)], &landing_words(STREAMING_SEQUENCE, 0, &[], 1)),
             staging: form.records(device, false, 0, |_, _| None),
             bank: form.records(device, true, 0, |_, _| None),
             grid: land_grid(device, false),
+            routes: seismic::Tensor::zeros(&charges, seismic::Element::i32(), &[0, 1]).unwrap(),
+            weights: seismic::Tensor::zeros(&charges, seismic::Element::f32(), &[0, 1]).unwrap(),
+            normalized: seismic::Tensor::zeros(&charges, seismic::Element::bf16(), &[0, 1]).unwrap(),
+            site: seismic::Tensor::zeros(&charges, seismic::Element::i32(), &[0, 0]).unwrap(),
+            site_rows: seismic::Tensor::zeros(&charges, seismic::Element::f32(), &[0, constants::VERIFY_ROWS, 1]).unwrap(),
+            charges,
         }
     }
 
@@ -10556,6 +10818,11 @@ impl TierLanding {
                 up,
                 down,
                 grid: &self.grid,
+                routes: &self.routes,
+                weights: &self.weights,
+                normalized: &self.normalized,
+                site: &mut self.site,
+                site_rows: &mut self.site_rows,
             })
             .map(|_| ())
     }

@@ -1747,12 +1747,16 @@ impl<'a> Preparation<'a> {
                         Pooling::Identity => PooledProjectInput::Tokens { width: shape.widths.width },
                     },
                 )?;
-                let widen = fixed!(
-                    self.spec,
-                    widen_rows,
-                    format!("A={}", activation.name()),
-                    widen_rows::Elements { A: activation }
-                );
+                let widen = match rows.pooling {
+                    Pooling::Identity => fixed!(
+                        self.spec,
+                        widen_rows,
+                        format!("A={}", activation.name()),
+                        widen_rows::Elements { A: activation }
+                    )
+                    .map(Some),
+                    Pooling::Grouped => Some(None),
+                };
                 let width = [("P", pairs), ("S", shape.widths.width - 2 * pairs)];
                 let pool = match rows.pooling {
                     Pooling::Identity => fixed!(
@@ -1906,18 +1910,13 @@ impl<'a> Preparation<'a> {
                 binding.norm,
                 keys.projection,
                 keys.gate,
+                Pooling::Grouped,
             ),
             segments: [Some(WeightKind::IndexerKey), keys.gate.map(|_| WeightKind::IndexerKeyGate)],
             input: PooledProjectInput::Hidden { hidden: shape.widths.hidden },
             scopes: scopes.to_vec(),
             epsilon: self.epsilon,
         })?;
-        let widen = fixed!(
-            self.spec,
-            widen_rows,
-            format!("A={}", activation.name()),
-            widen_rows::Elements { A: activation }
-        );
         let pool = fixed!(
             self.spec,
             pool_rows,
@@ -1942,10 +1941,10 @@ impl<'a> Preparation<'a> {
         )?;
         let reads = fixed!(self.spec, unit_reads, format!("{selection:?}"));
         let rows = fixed!(self.spec, candidate_rows, format!("{selection:?}"));
-        Ok(match (project, widen, pool, indexer, reads, rows, prefill) {
-            (Some(project), Some(widen), Some(pool), Some(indexer), Some(reads), Some(rows), Some(prefill)) => {
+        Ok(match (project, pool, indexer, reads, rows, prefill) {
+            (Some(project), Some(pool), Some(indexer), Some(reads), Some(rows), Some(prefill)) => {
                 Some(SelectionKernels {
-                    keys: SelectionKeyKernels { project, widen, pool },
+                    keys: SelectionKeyKernels { project, pool },
                     indexer,
                     reads,
                     rows,
@@ -2852,6 +2851,11 @@ impl<'a> Preparation<'a> {
         // into its resident one; an up-only record's gate views are empty,
         // in its up's elements.
         let gate = gate.unwrap_or(up);
+        let activation = match slot {
+            crate::planning::BankedFeedForward::Routed(binding) => binding.activation,
+            crate::planning::BankedFeedForward::GeneralRouted(binding)
+            | crate::planning::BankedFeedForward::Parallel(crate::ParallelBinding { routed: binding, .. }) => binding.activation,
+        };
         let land = spec.fixed(
             &bindings,
             &[("K", selected)],
@@ -2862,6 +2866,7 @@ impl<'a> Preparation<'a> {
                 UG: gate.resident,
                 UU: up.resident,
                 UD: down.resident,
+                A: activation,
             }),
         )?;
         let step = spec.fixed(&bindings, &[], routed_step::native_entry())?;
@@ -3022,16 +3027,25 @@ impl<'a> Preparation<'a> {
                 let resident = self.resident_outputs.get(&b).cloned().ok_or_else(|| {
                     failure("routed_output_project", "a streamed layer's output was not prepared before it".into())
                 })?;
-                let case = RoutedOutputProjectTuning { resident: resident.clone(), layers: layers.to_vec() };
-                let project = self.served_projection_following(DECODE_SERVED, case, resident)?;
-                let (streams, inject) =
-                    self.tuning.model().join(layers).map_err(|outcome| failure("routed_output_sited", outcome))?;
-                let sited = self.spec.fixed(
-                    bindings,
-                    &[("H", b.hidden), ("SN", streams), ("IN", inject), ("K", bank.selected)],
-                    routed_output_sited::native_entry_with(routed_output_sited::Elements { A: b.activation }),
-                )?;
-                let combine = project.zip(sited).map(|(project, sited)| super::BankCombine::Fused { project, sited });
+                let combine = if <magnitude_kernels::routed_output_streamed::Entry as seismic::EntryContract>::contract_node_shape(self.spec.backend()).is_ok() {
+                    let case = crate::native::tuning::routed::RoutedOutputStreamedTuning {
+                        resident: resident.clone(),
+                        layers: layers.to_vec(),
+                    };
+                    self.served_projection_following(DECODE_SERVED, case, resident)?
+                        .map(super::BankCombine::FusedInline)
+                } else {
+                    let case = RoutedOutputProjectTuning { resident: resident.clone(), layers: layers.to_vec() };
+                    let project = self.served_projection_following(DECODE_SERVED, case, resident)?;
+                    let (streams, inject) =
+                        self.tuning.model().join(layers).map_err(|outcome| failure("routed_output_sited", outcome))?;
+                    let sited = self.spec.fixed(
+                        bindings,
+                        &[("H", b.hidden), ("SN", streams), ("IN", inject), ("K", bank.selected)],
+                        routed_output_sited::native_entry_with(routed_output_sited::Elements { A: b.activation }),
+                    )?;
+                    project.zip(sited).map(|(project, sited)| super::BankCombine::Fused { project, sited })
+                };
                 (b.hidden, combine)
             }
             BankedFeedForward::GeneralRouted(b) | BankedFeedForward::Parallel(crate::ParallelBinding { routed: b, .. }) => {

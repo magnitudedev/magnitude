@@ -11,6 +11,7 @@
 #include "lib/streaming/control.cuh"
 #include "../streaming/hint.hpp"
 #include "../streaming/resolve.hpp"
+#include "../streaming/site.hpp"
 #include "lib/routed/resolve.cuh"
 
 SEISMIC_PROGRAMMATIC_DEPENDENCY
@@ -80,4 +81,36 @@ extern "C" __global__ void routed_route_streamed_ordered_gemv(SEISMIC_KERNEL_PAR
     const ResolvePorts bank =
         ROUTED_RESOLVE_PORTS(SEISMIC_OUT_SCORES.stored(), SEISMIC_SCORES_STRIDE_0, SEISMIC_SCORES_STRIDE_1);
     routed_resolve(bank, false, words, seismic_words_value);
+    if (SEISMIC_DIM_SF > 0) {
+        __syncthreads();
+        if (SEISMIC_PARAM_SITED == 2 || bank.land_grid[0] == 0) {
+            const unsigned choices = static_cast<unsigned>(SEISMIC_DIM_M) * static_cast<unsigned>(SEISMIC_DIM_K);
+            if (streaming_site_any(bank.sources, SEISMIC_SOURCES_STRIDE_0, SEISMIC_SOURCES_STRIDE_1,
+                    SEISMIC_SOURCES_STRIDE_2, choices)) {
+                const u64 q = streaming_step(bank.step, SEISMIC_STEP_STRIDE_0);
+                const u64 slot = q % (u64)SEISMIC_DIM_SF;
+                using A = ELEMENT_OF(SEISMIC_ELEMENT_A);
+                const typename A::storage *norm =
+                    reinterpret_cast<const typename A::storage *>(SEISMIC_RESULT_0_OUT.stored());
+                const element::Out<element::F32> rows = SEISMIC_OUT_SITE_ROWS;
+                const u64 count = SEISMIC_DIM_M * SEISMIC_DIM_H;
+                for (u64 i = threadIdx.x; i < count; i += blockDim.x) {
+                    const u64 m = i / SEISMIC_DIM_H, n = i % SEISMIC_DIM_H;
+                    rows.put_system(slot * SEISMIC_SITE_ROWS_STRIDE_0 + m * SEISMIC_SITE_ROWS_STRIDE_1
+                                        + n * SEISMIC_SITE_ROWS_STRIDE_2,
+                                    A::load(__ldcg(norm + m * SEISMIC_RESULT_0_STRIDE_0
+                                                   + n * SEISMIC_RESULT_0_STRIDE_1)));
+                }
+                streaming_publish_barrier();
+                if (threadIdx.x == 0) {
+                    streaming_system_fence();
+                    streaming_site_publish(q, bank.routes, SEISMIC_ROUTES_STRIDE_0, SEISMIC_ROUTES_STRIDE_1,
+                        bank.weights, bank.weights0, bank.weights1, bank.sources, SEISMIC_SOURCES_STRIDE_0,
+                        SEISMIC_SOURCES_STRIDE_1, SEISMIC_SOURCES_STRIDE_2, choices,
+                        reinterpret_cast<int *>(SEISMIC_PTR(SEISMIC_BUFFER_SITE)) + slot * SEISMIC_SITE_STRIDE_0,
+                        SEISMIC_SITE_STRIDE_1);
+                }
+            }
+        }
+    }
 }

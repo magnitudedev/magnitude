@@ -17,6 +17,7 @@
 #include "lib/streaming/control.h"
 #include "../streaming/hint.hpp"
 #include "../streaming/resolve.hpp"
+#include "../streaming/site.hpp"
 #include "lib/routed/keys.h"
 
 typedef activation::Act Act;
@@ -44,6 +45,8 @@ constant constexpr bool NVFP4_SHARED = projection::OperandRecipe<
     SYSTEM const int *policy [[buffer(SEISMIC_BUFFER_POLICY)]],                             \
     SYSTEM int *front [[buffer(SEISMIC_BUFFER_FRONT)]],                                     \
     device int *land_grid [[buffer(SEISMIC_BUFFER_LAND_GRID)]],                             \
+    SYSTEM int *site [[buffer(SEISMIC_BUFFER_SITE)]],                                       \
+    SEISMIC_OUT_SITE_ROWS_PARAM(site_rows_cells),                                           \
     SEISMIC_RESULT_0_PARAM(normalized_cells),                                               \
     SEISMIC_RESULT_1_PARAM(coefficient_cells),                                              \
     SEISMIC_RESULT_2_PARAM(shared_product_cells),                                           \
@@ -101,6 +104,38 @@ constant constexpr bool NVFP4_SHARED = projection::OperandRecipe<
                 file, SEISMIC_FILE_STRIDE_0, SEISMIC_FILE_STRIDE_1,                         \
                 policy, front, SEISMIC_FRONT_STRIDE_0,                                      \
                 land_grid, SEISMIC_LAND_GRID_STRIDE_0, int(SEISMIC_PARAM_LAND_GROUPS), words, tid, simdgroups * 32u);       \
+            if (SEISMIC_DIM_SF > 0) {                                                       \
+                threadgroup_barrier(mem_flags::mem_threadgroup);                            \
+                if (SEISMIC_PARAM_SITED == 2 || land_grid[0] == 0) {                        \
+                    const uint choices = m * uint(SEISMIC_DIM_K);                           \
+                    if (streaming_site_any(sources, SEISMIC_SOURCES_STRIDE_0, SEISMIC_SOURCES_STRIDE_1, \
+                            SEISMIC_SOURCES_STRIDE_2, choices)) {                           \
+                        const ulong q = streaming_step(step, SEISMIC_STEP_STRIDE_0);        \
+                        const ulong slot = q % ulong(SEISMIC_DIM_SF);                       \
+                        const auto site_rows = element::system(element::Out<element::F32>(site_rows_cells)); \
+                        device const typename Act::storage *norm_in =                       \
+                            reinterpret_cast<device const typename Act::storage *>(normalized_cells); \
+                        const ulong cols = SEISMIC_DIM_H;                                   \
+                        for (ulong i = tid; i < ulong(m) * cols; i += simdgroups * 32u) {   \
+                            const ulong r = i / cols, n = i % cols;                         \
+                            site_rows.put(slot * SEISMIC_SITE_ROWS_STRIDE_0                 \
+                                    + r * SEISMIC_SITE_ROWS_STRIDE_1                        \
+                                    + n * SEISMIC_SITE_ROWS_STRIDE_2,                       \
+                                Act::load(norm_in[r * SEISMIC_RESULT_0_STRIDE_0             \
+                                    + n * SEISMIC_RESULT_0_STRIDE_1]));                     \
+                        }                                                                   \
+                        streaming_publish_barrier();                                        \
+                        if (tid == 0)                                                       \
+                            streaming_site_publish(q, routes, SEISMIC_ROUTES_STRIDE_0,      \
+                                SEISMIC_ROUTES_STRIDE_1,                                    \
+                                reinterpret_cast<device const int *>(scores_out.stored()),  \
+                                SEISMIC_SCORES_STRIDE_0, SEISMIC_SCORES_STRIDE_1, sources,  \
+                                SEISMIC_SOURCES_STRIDE_0, SEISMIC_SOURCES_STRIDE_1,         \
+                                SEISMIC_SOURCES_STRIDE_2, choices,                          \
+                                site + slot * SEISMIC_SITE_STRIDE_0, SEISMIC_SITE_STRIDE_1); \
+                    }                                                                       \
+                }                                                                           \
+            }                                                                               \
         }                                                                                   \
     } while (0)
 

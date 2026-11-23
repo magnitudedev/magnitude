@@ -60,6 +60,11 @@ const ENTRY_EXCEPTIONS: &[(&str, &[BackendName], &str)] = &[
         &[BackendName::Metal, BackendName::Cuda],
         "the full exact readout over the progressive head's planes (decode rows)",
     ),
+    (
+        "routed_output_streamed",
+        &[BackendName::Cuda],
+        "single-launch streamed fused decode output with inline CPU-site await in the last-arriving block",
+    ),
 ];
 
 /// Expert streaming's entries (routed.seismic's streaming section), on the

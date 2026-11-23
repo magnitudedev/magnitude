@@ -176,6 +176,12 @@ pub(super) fn qualify_bank(
     let mut bank = records.as_ref().try_map(|_, fixture| views(&fixture.records.records))?;
     let staging_gate = staging.gate.clone().map_or_else(|| none(&staging.up), Ok)?;
     let mut gate = bank.gate.take().map_or_else(|| none(&bank.up), Ok)?;
+    let hidden = binding.record.up.matrix[1];
+    let zero_tensor = |element: Element, extents: &[u64]| {
+        Tensor::zeros(charges, element, extents).map_err(|error| qualification_dynamic(entry, label, error))
+    };
+    let mut empty_site = zero_tensor(Element::i32(), &[0, 0])?;
+    let mut empty_site_rows = zero_tensor(Element::f32(), &[0, constants::VERIFY_ROWS, hidden])?;
     land.call_answered(charges, routed_land::Args {
         step: &step,
         file: &mut file,
@@ -189,6 +195,11 @@ pub(super) fn qualify_bank(
         up: &mut bank.up,
         down: &mut bank.down,
         grid: &words(&[3], &[(0, groups), (1, 1), (2, 1)], entry)?,
+        routes: &zero_tensor(Element::i32(), &[0, count])?,
+        weights: &zero_tensor(Element::f32(), &[0, count])?,
+        normalized: &zero_tensor(Element::bf16(), &[0, hidden])?,
+        site: &mut empty_site,
+        site_rows: &mut empty_site_rows,
     })
     .map_err(|error| qualification_dynamic(entry, label, error))?;
     require_words(&sources, &[(SOURCE_RECORD * count, landed), (SOURCE_SITE * count, -1)], entry, label)?;
@@ -660,6 +671,8 @@ impl<'a> Served<'a> {
                     let kernel = route.first();
                     let (h, e) = (b.hidden, b.experts);
                     let norm = rows.norm(charges, b.norm, h, entry, label)?;
+                    let mut empty_site = zeros(Element::i32(), &[0, 0], entry)?;
+                    let mut empty_site_rows = zeros(Element::f32(), &[0, constants::VERIFY_ROWS, h], entry)?;
                     kernel
                         .call(charges, routed_route_streamed::Args {
                             residual: &rows.input(charges, 1, h, entry, label)?,
@@ -685,6 +698,8 @@ impl<'a> Served<'a> {
                             front: &mut front,
                             land_grid: &mut land_grid,
                             land_groups,
+                            site: &mut empty_site,
+                            site_rows: &mut empty_site_rows,
                         })
                         .map_err(|error| qualification_dynamic(entry, label, error))?;
                 }
@@ -1128,6 +1143,9 @@ mod tests {
         let gate = gated.unwrap_or(up);
         let table = bank.words.scratch();
         let scratch = [("FLIGHT", table.slots()), ("LANES", table.lanes())];
+        let activation = match &route {
+            BankRouteKernels::Fused { activation, .. } | BankRouteKernels::General { activation, .. } => *activation,
+        };
         let land = prepare(device, routed_land::native_entry_with(routed_land::Elements {
                 SG: gate.source,
                 SU: up.source,
@@ -1135,6 +1153,7 @@ mod tests {
                 UG: gate.resident,
                 UU: up.resident,
                 UD: down.resident,
+                A: activation,
             }), &[("K", bank.selected)]);
         let record_statics = |tensor: RecordTensor, list: u64| {
             let [n, k] = tensor.matrix;

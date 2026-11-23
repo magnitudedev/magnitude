@@ -9,6 +9,7 @@
 #include "lib/core/activation.glsl"
 #include "lib/projection/projection.glsl"
 #include "lib/routed/streamed.glsl"
+#include "../streaming/site.hpp"
 #define ROUTE_E uint(SEISMIC_DIM_E)
 #define ROUTE_STRIDE (uint(SEISMIC_DIM_E) + 1u)
 #include "lib/routed/route.glsl"
@@ -78,6 +79,36 @@ void routed_route_finish(const bool whole) {
         route_select_row(SEISMIC_PTR(SEISMIC_BUFFER_SCRATCH_LOGITS), live ? placed : SEISMIC_DIM_M - 1ul, live);
     }
     routed_resolve(whole, out_stored(SEISMIC_OUT_SCORES, 0ul), SEISMIC_SCORES_STRIDE_0, SEISMIC_SCORES_STRIDE_1);
+    if (SEISMIC_DIM_SF > 0ul) {
+        barrier();
+        if (SEISMIC_PARAM_SITED == 2 || streaming_device_load(SEISMIC_PTR(SEISMIC_BUFFER_LAND_GRID)) == 0) {
+            const uint choices = uint(SEISMIC_DIM_M) * uint(SEISMIC_DIM_K);
+            if (streaming_site_any(SEISMIC_PTR(SEISMIC_BUFFER_SOURCES), SEISMIC_SOURCES_STRIDE_0,
+                    SEISMIC_SOURCES_STRIDE_1, SEISMIC_SOURCES_STRIDE_2, choices)) {
+                const uint64_t q = streaming_step(SEISMIC_PTR(SEISMIC_BUFFER_STEP), SEISMIC_STEP_STRIDE_0);
+                const uint64_t slot = streaming_modulo(q, SEISMIC_DIM_SF);
+                const uint64_t rows = SEISMIC_DIM_M, columns = SEISMIC_DIM_H;
+                for (seismic_walk at = seismic_walk_begin(gl_LocalInvocationIndex, gl_WorkGroupSize.x, rows * columns,
+                            u64vec3(1ul, 1ul, columns));
+                        at.index < rows * columns; seismic_walk_next(at)) {
+                    const uint64_t m = at.axes.x, n = at.axes.w;
+                    out_put(SEISMIC_OUT_SITE_ROWS, slot * SEISMIC_SITE_ROWS_STRIDE_0
+                            + m * SEISMIC_SITE_ROWS_STRIDE_1 + n * SEISMIC_SITE_ROWS_STRIDE_2,
+                        element_at(ACTIVATION_A, out_stored(SEISMIC_RESULT_0_OUT, 0ul),
+                            m * SEISMIC_RESULT_0_STRIDE_0 + n * SEISMIC_RESULT_0_STRIDE_1));
+                }
+                streaming_publish_barrier();
+                if (gl_LocalInvocationIndex == 0u) {
+                    streaming_system_fence();
+                    streaming_site_publish(q, SEISMIC_PTR(SEISMIC_BUFFER_ROUTES), SEISMIC_ROUTES_STRIDE_0,
+                        SEISMIC_ROUTES_STRIDE_1, out_stored(SEISMIC_OUT_SCORES, 0ul), SEISMIC_SCORES_STRIDE_0,
+                        SEISMIC_SCORES_STRIDE_1, SEISMIC_PTR(SEISMIC_BUFFER_SOURCES), SEISMIC_SOURCES_STRIDE_0,
+                        SEISMIC_SOURCES_STRIDE_1, SEISMIC_SOURCES_STRIDE_2, choices,
+                        SEISMIC_PTR(SEISMIC_BUFFER_SITE) + slot * SEISMIC_SITE_STRIDE_0 * 4ul, SEISMIC_SITE_STRIDE_1);
+                }
+            }
+        }
+    }
 }
 
 void routed_route_streamed_select() { routed_route_finish(false); }

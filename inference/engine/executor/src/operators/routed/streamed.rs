@@ -73,8 +73,9 @@ use magnitude_family_contracts::{WeightRole, WeightScope};
 use magnitude_kernels::{
     routed_copy, routed_down_project, routed_down_sited, routed_gate_up, routed_gate_up_part,
     routed_hint_route, routed_hint_select, routed_land, routed_list_grid, routed_output_project,
-    routed_output_sited, routed_pass_map, routed_round, routed_route_streamed, routed_scratch_grids,
-    routed_scratch_request, routed_seed_commit, routed_select_streamed, routed_site_request, routed_step,
+    routed_output_sited, routed_output_streamed, routed_pass_map, routed_round, routed_route_streamed,
+    routed_scratch_grids, routed_scratch_request, routed_seed_commit, routed_select_streamed,
+    routed_site_request, routed_step,
 };
 use seismic::{
     Dim, Element, NativeGraph, NativePort, NativeTimelinePort, WorkflowTensor,
@@ -135,6 +136,7 @@ pub(crate) struct BankSiteEntries<'a, G: GraphDraft + 'a> {
 /// projections (by row range), then their sum waiting for the answer
 /// (`native::BankCombine`).
 pub(crate) enum BankCombineEntry<'a, G: GraphDraft + 'a> {
+    FusedInline(G::Ranged<'a, routed_output_streamed::Entry>),
     Fused {
         project: G::Ranged<'a, routed_output_project::Entry>,
         sited: G::Binding<'a, routed_output_sited::Entry>,
@@ -211,6 +213,7 @@ impl<'a> From<&'a ExpertBankKernels> for BankGraphEntries<'a, NativeGraph> {
             site: kernels.site.as_ref().map(|site| BankSiteEntries {
                 request: &site.request,
                 combine: match &site.combine {
+                    crate::native::BankCombine::FusedInline(inline) => BankCombineEntry::FusedInline(inline),
                     crate::native::BankCombine::Fused { project, sited } => BankCombineEntry::Fused { project, sited },
                     crate::native::BankCombine::General { project, sited } => BankCombineEntry::General { project, sited },
                 },
@@ -238,8 +241,10 @@ enum CheckedRoute {
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub(crate) struct CheckedBankEntries {
     route: CheckedRoute,
-    /// A landing launch's, decode's and a round's alike: each routed
-    /// tensor's stored and resident elements.
+    /// `routed_land`'s: each routed tensor's stored and resident elements plus
+    /// the activation element for inline site publication.
+    land: [(&'static str, Element); 7],
+    /// `routed_round`'s: each routed tensor's stored and resident elements.
     landing: [(&'static str, Element); 6],
     none: [(&'static str, Element); 0],
     /// The seed copy's.
@@ -262,6 +267,7 @@ struct CheckedSite {
 /// A combine's projections' and sum's element assignments.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 enum CheckedCombine {
+    FusedInline([(&'static str, Element); 3]),
     Fused([(&'static str, Element); 3], [(&'static str, Element); 1]),
     General([(&'static str, Element); 2], [(&'static str, Element); 2]),
 }
@@ -277,6 +283,20 @@ impl CheckedBankEntries {
         // What a landing launch converts from (staging, a round's conveyor)
         // and into: an up-only record's gate views are empty (`GV`, `GS`
         // 0), in its up's elements.
+        let activation = match slot {
+            BankedFeedForward::Routed(binding) => binding.activation,
+            BankedFeedForward::GeneralRouted(binding)
+            | BankedFeedForward::Parallel(crate::ParallelBinding { routed: binding, .. }) => binding.activation,
+        };
+        let land = [
+            ("SG", gate.map_or(up.source, |gate| gate.source)),
+            ("SU", up.source),
+            ("SD", down.source),
+            ("UG", gate.map_or(up.resident, |gate| gate.resident)),
+            ("UU", up.resident),
+            ("UD", down.resident),
+            ("A", activation),
+        ];
         let landing = [
             ("SG", gate.map_or(up.source, |gate| gate.source)),
             ("SU", up.source),
@@ -331,10 +351,18 @@ impl CheckedBankEntries {
         let site = crate::native::BankSite::served(slot, bank, backend)?.then(|| match slot {
             BankedFeedForward::Routed(binding) => CheckedSite {
                 request: [("A", binding.activation)],
-                combine: CheckedCombine::Fused(
-                    [("EDW", binding.expert_down), ("SDW", binding.shared_down), ("A", binding.activation)],
-                    [("A", binding.activation)],
-                ),
+                combine: if <routed_output_streamed::Entry as seismic::EntryContract>::contract_node_shape(backend).is_ok() {
+                    CheckedCombine::FusedInline([
+                        ("EDW", binding.expert_down),
+                        ("SDW", binding.shared_down),
+                        ("A", binding.activation),
+                    ])
+                } else {
+                    CheckedCombine::Fused(
+                        [("EDW", binding.expert_down), ("SDW", binding.shared_down), ("A", binding.activation)],
+                        [("A", binding.activation)],
+                    )
+                },
             },
             BankedFeedForward::GeneralRouted(binding) | BankedFeedForward::Parallel(crate::ParallelBinding { routed: binding, .. }) => {
                 CheckedSite {
@@ -348,6 +376,7 @@ impl CheckedBankEntries {
         });
         Ok(Self {
             route,
+            land,
             landing,
             none: [],
             seed: bank.record.map(|_, tensor| [("U", tensor.resident)]),
@@ -372,7 +401,7 @@ impl CheckedBankEntries {
                     hints: [Some(G::bind(&hints[..])); HINT_LEADS as usize],
                 },
             },
-            land: G::bind(&self.landing),
+            land: G::bind(&self.land),
             step: G::bind(&self.none),
             scratch_request: G::bind(&self.none),
             round: G::bind(&self.landing),
@@ -386,6 +415,9 @@ impl CheckedBankEntries {
             site: self.site.as_ref().map(|site| BankSiteEntries {
                 request: G::bind(&site.request[..]),
                 combine: match &site.combine {
+                    CheckedCombine::FusedInline(inline) => {
+                        BankCombineEntry::FusedInline(G::bind_ranged(&inline[..]))
+                    }
                     CheckedCombine::Fused(project, sited) => BankCombineEntry::Fused {
                         project: G::bind_ranged(&project[..]),
                         sited: G::bind(&sited[..]),
@@ -970,11 +1002,16 @@ impl<'p, 'a, G: GraphDraft + 'a, W: PlannedWeights + ?Sized> StreamedLayer<'p, '
         &mut self,
         graph: &mut G,
         ports: LandPorts<'_>,
+        site_choices: Option<&StepChoices<'_>>,
         shape: &DecodeShape,
         constants: &mut Vec<GraphConstant>,
     ) -> Result<(), GraphError> {
-        let LandPorts { decode: DecodePorts { step, policy, file, land_grid, .. }, sources, records } = ports;
-        self.land_inner(graph, step, policy, file, land_grid, sources, records, shape, constants)
+        let LandPorts { decode: DecodePorts { step, policy, file, land_grid, site, .. }, sources, records } = ports;
+        let inline_site = site
+            .as_mut()
+            .zip(site_choices)
+            .map(|(site, choices)| (&mut site.table, &mut site.rows, choices));
+        self.land_inner(graph, step, policy, file, land_grid, sources, records, inline_site, shape, constants)
     }
 
     /// Whether `RunStage::DecodeFront` must run `routed_land` on the device.
@@ -990,18 +1027,25 @@ impl<'p, 'a, G: GraphDraft + 'a, W: PlannedWeights + ?Sized> StreamedLayer<'p, '
     }
 
     /// [`Self::land`] for `RunStage::DecodeFront`'s minimal [`DecodeFrontPorts`].
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn land_front(
         &mut self,
         graph: &mut G,
         ports: &mut DecodeFrontPorts,
         sources: &mut WorkflowTensor,
         records: RecordTensors<&mut NativePort>,
+        site_choices: Option<&StepChoices<'_>>,
         shape: &DecodeShape,
         constants: &mut Vec<GraphConstant>,
     ) -> Result<(), GraphError> {
         if !self.needs_front_land() {
             return Ok(());
         }
+        let inline_site = ports
+            .site
+            .as_mut()
+            .zip(site_choices)
+            .map(|(site, choices)| (&mut site.table, &mut site.rows, choices));
         self.land_inner(
             graph,
             &ports.step,
@@ -1010,9 +1054,19 @@ impl<'p, 'a, G: GraphDraft + 'a, W: PlannedWeights + ?Sized> StreamedLayer<'p, '
             &ports.land_grid,
             sources,
             records,
+            inline_site,
             shape,
             constants,
         )
+    }
+
+    /// Publishes a site request already written by `routed_route_streamed` or
+    /// `routed_land` where parks are submission boundaries (Vulkan); a no-op
+    /// on backends that park in kernels (CUDA, Metal) or unsited layers.
+    pub(crate) fn publish_site(&mut self, graph: &mut G) {
+        if self.entries.site.is_some() {
+            self.publish(graph);
+        }
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -1025,6 +1079,7 @@ impl<'p, 'a, G: GraphDraft + 'a, W: PlannedWeights + ?Sized> StreamedLayer<'p, '
         land_grid: &NativePort,
         sources: &mut WorkflowTensor,
         records: RecordTensors<&mut NativePort>,
+        inline_site: Option<(&mut NativePort, &mut NativePort, &StepChoices<'_>)>,
         shape: &DecodeShape,
         constants: &mut Vec<GraphConstant>,
     ) -> Result<(), GraphError> {
@@ -1051,6 +1106,40 @@ impl<'p, 'a, G: GraphDraft + 'a, W: PlannedWeights + ?Sized> StreamedLayer<'p, '
             None => Dim::from(0),
         };
         let [features, hidden] = numbers.matrix.up.clone();
+        let activation = match self.entries.route {
+            BankRoute::Fused { activation, .. } | BankRoute::General { activation, .. } => activation,
+        };
+        let (sm, sf, sr) = match &inline_site {
+            Some(_) => (shape.rows.clone(), numbers.site_slots.clone(), numbers.site_width.clone()),
+            None => (Dim::from(0), Dim::from(0), Dim::from(0)),
+        };
+        let empty_routes = inline_site
+            .is_none()
+            .then(|| GraphConstant::empty_of(graph, Element::i32(), &[Dim::from(0), numbers.selected.clone()], constants))
+            .transpose()?;
+        let empty_weights = inline_site
+            .is_none()
+            .then(|| GraphConstant::empty_of(graph, Element::f32(), &[Dim::from(0), numbers.selected.clone()], constants))
+            .transpose()?;
+        let empty_norm = inline_site
+            .is_none()
+            .then(|| GraphConstant::empty_of(graph, activation, &[Dim::from(0), hidden.clone()], constants))
+            .transpose()?;
+        let mut empty_site = inline_site
+            .is_none()
+            .then(|| GraphConstant::empty_port(graph, Element::i32(), &[Dim::from(0), Dim::from(0)], constants))
+            .transpose()?;
+        let mut empty_site_rows = inline_site
+            .is_none()
+            .then(|| {
+                GraphConstant::empty_port(
+                    graph,
+                    Element::f32(),
+                    &[Dim::from(0), Dim::from(magnitude_kernels::constants::VERIFY_ROWS), hidden.clone()],
+                    constants,
+                )
+            })
+            .transpose()?;
         let dimensions = [
             ("M", shape.rows.clone()),
             ("K", numbers.selected.clone()),
@@ -1063,6 +1152,9 @@ impl<'p, 'a, G: GraphDraft + 'a, W: PlannedWeights + ?Sized> StreamedLayer<'p, '
             ("GS", gated(&into)),
             ("F", features),
             ("H", hidden),
+            ("SM", sm),
+            ("SF", sf),
+            ("SR", sr),
         ];
         let staging_gate = match &staging.gate {
             Some(gate) => gate.clone(),
@@ -1071,6 +1163,22 @@ impl<'p, 'a, G: GraphDraft + 'a, W: PlannedWeights + ?Sized> StreamedLayer<'p, '
         let mut gate = match destination.gate.take() {
             Some(gate) => gate,
             None => destination.up.slice_leading(0, 0),
+        };
+        let (routes_ref, weights_ref, norm_ref, site_ref, site_rows_ref) = match inline_site {
+            Some((site_table, site_rows, choices)) => (
+                choices.routes.into(),
+                choices.weights.into(),
+                choices.input.into(),
+                site_table.tensor_mut().into(),
+                site_rows.tensor_mut().into(),
+            ),
+            None => (
+                empty_routes.as_ref().unwrap().into(),
+                empty_weights.as_ref().unwrap().into(),
+                empty_norm.as_ref().unwrap().into(),
+                empty_site.as_mut().unwrap().tensor_mut().into(),
+                empty_site_rows.as_mut().unwrap().tensor_mut().into(),
+            ),
         };
         let park = land_launch(
             graph,
@@ -1089,6 +1197,11 @@ impl<'p, 'a, G: GraphDraft + 'a, W: PlannedWeights + ?Sized> StreamedLayer<'p, '
                 up: (&mut destination.up).into(),
                 down: (&mut destination.down).into(),
                 grid: land_grid.tensor().into(),
+                routes: routes_ref,
+                weights: weights_ref,
+                normalized: norm_ref,
+                site: site_ref,
+                site_rows: site_rows_ref,
             },
             policy,
         )?;
@@ -1225,9 +1338,21 @@ impl<'p, 'a, G: GraphDraft + 'a, W: PlannedWeights + ?Sized> StreamedLayer<'p, '
     ) -> Result<(), GraphError> {
         let shape = DecodeShape { rows: choices.rows };
         let mut sources = step.locals.sources.tensor().clone();
-        self.land(graph, LandPorts { decode: &mut step.ports, sources: &mut sources, records }, &shape, constants)?;
-        let snapshot = step.locals.snapshot();
-        self.site_request(graph, &mut step.ports, choices.routes, choices.weights, &snapshot, choices.input, &shape)
+        let inline_site = matches!(self.entries.route, BankRoute::Fused { .. });
+        self.land(
+            graph,
+            LandPorts { decode: &mut step.ports, sources: &mut sources, records },
+            inline_site.then_some(choices),
+            &shape,
+            constants,
+        )?;
+        if inline_site {
+            self.publish_site(graph);
+            Ok(())
+        } else {
+            let snapshot = step.locals.snapshot();
+            self.site_request(graph, &mut step.ports, choices.routes, choices.weights, &snapshot, choices.input, &shape)
+        }
     }
 
     /// A gated layer's decode gate/up around its landing ([`Self::settle`]), in
@@ -2007,16 +2132,21 @@ impl<'p, 'a, G: GraphDraft + 'a, W: PlannedWeights + ?Sized> StreamedLayer<'p, '
 
     /// Minimal bank ports for `RunStage::DecodeBack`: reads `BankPart::Step`
     /// only when sited (without re-enqueueing `routed_step`), `BankPart::Policy`
-    /// only when sited or `needs_policy` (general `routed_down`),
-    /// `BankPart::Tier { kind }` records only when a host tier exists, and
-    /// `BankPart::SiteTable` + `BankPart::SiteOutput` only when sited.
+    /// only when the sited combine is split (`Fused`/`General`) or `needs_policy`
+    /// (general `routed_down`), `BankPart::Tier { kind }` records only when a
+    /// host tier exists, and `BankPart::SiteTable` + `BankPart::SiteOutput`
+    /// only when sited.
     pub(crate) fn decode_back_ports(&mut self, graph: &mut G, needs_policy: bool) -> Result<DecodeBackPorts, GraphError> {
         let sited = self.entries.site.is_some();
+        let split_sited = matches!(
+            self.entries.site.map(|site| site.combine),
+            Some(BankCombineEntry::Fused { .. } | BankCombineEntry::General { .. })
+        );
         let step = sited.then(|| self.part(graph, BankPart::Step)).transpose()?;
         let tier_records = (!self.numbers.tier.is_zero())
             .then(|| self.parts(graph, |kind| BankPart::Tier { kind }))
             .transpose()?;
-        let policy = (sited || needs_policy)
+        let policy = (split_sited || needs_policy)
             .then(|| self.part(graph, BankPart::Policy))
             .transpose()?;
         let site = sited

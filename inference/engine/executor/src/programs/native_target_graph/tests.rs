@@ -1577,12 +1577,14 @@ mod sinkhorn_graph_tests {
             }
             assert!(saw_front && saw_back, "{label}: expected both DecodeFront and DecodeBack stages to be sealed");
             // Verify `routed_site_request` runs at the tail of `DecodeFront`
-            // (overlapping CPU `expert-compute` with host-driven `DecodeDma`)
-            // and never in `DecodeBack` (which only awaits `routed_*_sited`).
+            // for general form (fused form folds site publish inline into
+            // `routed_route_streamed` / `routed_land`) and never in `DecodeBack`.
             let sited = load.expert_bank().expect("bank").sited(0);
+            let is_fused = label.contains("fused");
+            let expected_front_site = if is_fused { 0usize } else { usize::from(sited) };
             for (stage, expected_site_requests, expected_joins) in [
-                (RunStage::Whole, usize::from(sited), 1usize),
-                (RunStage::DecodeFront, usize::from(sited), 0usize),
+                (RunStage::Whole, expected_front_site, 1usize),
+                (RunStage::DecodeFront, expected_front_site, 0usize),
                 (RunStage::DecodeBack, 0usize, 1usize),
             ] {
                 let inputs = BlockGraphInputs::of_class(

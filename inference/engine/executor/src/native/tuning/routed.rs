@@ -26,8 +26,8 @@ use magnitude_kernels::constants::{
 };
 use magnitude_kernels::{
     routed_combine, routed_expand, routed_experts, routed_gate_up, routed_gate_up_part, routed_group,
-    routed_hint_route, routed_output, routed_output_project, routed_route, routed_route_shared,
-    routed_route_streamed,
+    routed_hint_route, routed_output, routed_output_project, routed_output_streamed, routed_route,
+    routed_route_shared, routed_route_streamed,
 };
 use seismic::{BuildError, Element, Tensor};
 use std::ops::Range;
@@ -623,6 +623,8 @@ pub(crate) struct RoutedRouteStreamedTuning {
 pub(crate) struct RoutedRouteStreamedCase {
     route: RoutedRouteSharedCase,
     bank: BankOperands,
+    site: Tensor,
+    site_rows: Tensor,
 }
 
 impl RoutedRouteStreamedTuning {
@@ -671,10 +673,14 @@ impl EntryTuning for RoutedRouteStreamedTuning {
         over.rotation(inputs, point)?
             .into_iter()
             .map(|route| {
-                Ok(RoutedRouteStreamedCase {
-                    bank: BankOperands::new(inputs, self.bank, point.rows)?,
-                    route,
-                })
+                let bank = BankOperands::new(inputs, self.bank, point.rows)?;
+                let site = Tensor::zeros(&inputs.charges, Element::i32(), &[0, 0])?;
+                let site_rows = Tensor::zeros(
+                    &inputs.charges,
+                    Element::f32(),
+                    &[0, magnitude_kernels::constants::VERIFY_ROWS, self.resident.route.shape.hidden],
+                )?;
+                Ok(RoutedRouteStreamedCase { bank, site, site_rows, route })
             })
             .collect()
     }
@@ -683,6 +689,8 @@ impl EntryTuning for RoutedRouteStreamedTuning {
         let RoutedRouteStreamedCase {
             route: shared,
             bank,
+            site,
+            site_rows,
         } = case;
         let route = &mut shared.route;
         routed_route_streamed::Args {
@@ -709,6 +717,8 @@ impl EntryTuning for RoutedRouteStreamedTuning {
             front: bank.front.tensor_mut(),
             land_grid: bank.land_grid.tensor_mut(),
             land_groups: bank.land_groups,
+            site,
+            site_rows,
         }
     }
 
@@ -1507,6 +1517,104 @@ impl EntryTuning for RoutedOutputProjectTuning {
     }
 
     generated_entry!(routed_output_project, this => routed_output_project::Elements {
+        EDW: this.resident.expert_down,
+        SDW: this.resident.shared_down,
+        A: this.resident.activation,
+    });
+}
+
+/// Tuning case for `routed_output_streamed`: wraps `RoutedOutputCase` with
+/// empty site buffers (no choices CPU-sited during tuning so no wait occurs).
+pub(crate) struct RoutedOutputStreamedCase {
+    base: RoutedOutputCase,
+    step: Tensor,
+    site: CaseState,
+    site_output: Tensor,
+}
+
+/// Single-launch streamed fused decode output (`routed_output_streamed`):
+/// follows `resident`'s output arithmetic and launch tuning on backends that
+/// park in kernels (CUDA).
+#[derive(Clone)]
+pub(crate) struct RoutedOutputStreamedTuning {
+    /// The resident output it follows, over every layer of the binding.
+    pub resident: RoutedOutputTuning,
+    /// The streamed layers that launch it.
+    pub layers: Vec<WeightScope>,
+}
+
+impl EntryTuning for RoutedOutputStreamedTuning {
+    type Entry = magnitude_kernels::routed_output_streamed::Entry;
+    type Case = RoutedOutputStreamedCase;
+
+    fn launches(&self) -> usize {
+        self.layers.len()
+    }
+
+    fn bindings(&self) -> String {
+        self.resident.bindings()
+    }
+
+    fn statics(&self, inputs: &ModelInputs<'_>) -> Result<Vec<(&'static str, u64)>, String> {
+        self.resident.statics(inputs)
+    }
+
+    fn points(&self, limits: TuningLimits) -> Vec<PointShape> {
+        decode_points(limits)
+    }
+
+    fn rotation(
+        &self,
+        inputs: &mut TuningInputs<'_, '_>,
+        point: &PointShape,
+    ) -> Result<Vec<Self::Case>, BuildError> {
+        let mut over = self.resident.clone();
+        over.scopes = self.layers.clone();
+        let shape = self.resident.shape;
+        let table = routes(point.rows, RoutedShape { experts: self.resident.experts, ..shape });
+        let step_words = magnitude_kernels::constants::STEP_WORDS;
+        let sw = magnitude_kernels::constants::SLOT_PAYLOAD;
+        let verify_rows = magnitude_kernels::constants::VERIFY_ROWS;
+        over.rotation(inputs, point)?
+            .into_iter()
+            .map(|mut output| {
+                output.sources = bank_sources(inputs, point.rows, shape.selected, &table)?;
+                let step = Tensor::zeros(&inputs.charges, Element::i32(), &[step_words])?;
+                let site = written(inputs, Tensor::zeros(&inputs.charges, Element::i32(), &[1, sw])?)?;
+                let site_output = Tensor::zeros(
+                    &inputs.charges,
+                    Element::f32(),
+                    &[1, verify_rows, shape.hidden],
+                )?;
+                Ok(RoutedOutputStreamedCase { base: output, step, site, site_output })
+            })
+            .collect()
+    }
+
+    fn args<'a>(case: &'a mut Self::Case) -> magnitude_kernels::routed_output_streamed::Args<'a> {
+        magnitude_kernels::routed_output_streamed::Args {
+            residual: &case.base.residual,
+            inject: &case.base.inject,
+            expert_product: &case.base.expert_product,
+            shared_product: &case.base.shared_product,
+            routes: &case.base.routes,
+            sources: &case.base.sources,
+            scores: &case.base.scores,
+            coefficient: &case.base.coefficient,
+            expert_down: &case.base.expert_down,
+            tier_down: &case.base.tier_down,
+            shared_down: &case.base.shared_down,
+            step: &case.step,
+            site: case.site.tensor_mut(),
+            site_output: &case.site_output,
+        }
+    }
+
+    fn state(case: &Self::Case) -> Vec<(&'static str, &CaseState)> {
+        vec![("site", &case.site)]
+    }
+
+    generated_entry!(routed_output_streamed, this => routed_output_streamed::Elements {
         EDW: this.resident.expert_down,
         SDW: this.resident.shared_down,
         A: this.resident.activation,

@@ -33,7 +33,7 @@ fn vulkan_streaming_forms() {
         request("routed_scratch_grids", &[], &[]),
         request("routed_round", &[("SG", g), ("SU", g), ("SD", g), ("UG", w), ("UU", w), ("UD", w)], &[]),
         request("routed_round", &[("SG", b), ("SU", b), ("SD", b), ("UG", h), ("UU", h), ("UD", h)], &[]),
-        request("routed_land", &[("SG", g), ("SU", g), ("SD", g), ("UG", w), ("UU", w), ("UD", w)], &[("K", 8)]),
+        request("routed_land", &[("SG", g), ("SU", g), ("SD", g), ("UG", w), ("UU", w), ("UD", w), ("A", b)], &[("K", 8)]),
     ];
     // The decode entries over bank and host tier records.
     for weight in [w, b] {

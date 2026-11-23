@@ -546,6 +546,230 @@ impl ExpertWeights {
 /// built as its front or its back (`split`), a front's output the residual
 /// it read; its resident form (`LayerBank::Home`) decodes as a resident
 /// layer does, over its whole bank's home records.
+/// M7 split decode front for a fused streamed layer: route + hints +
+/// file-miss landing (`routed_land`, when `needs_front_land`) + inline site
+/// publish. Extracted out of [`routed`] to keep its stack frame bounded.
+#[inline(never)]
+#[allow(clippy::too_many_arguments)]
+fn decode_front<'a, G: GraphDraft + 'a, W: PlannedWeights + ?Sized>(
+    graph: &mut G,
+    layer: &mut StreamedLayer<'_, 'a, G, W>,
+    part: WeightPart,
+    shape: &ExpertShape,
+    planned: &W,
+    scope: WeightScope,
+    weights: &mut Vec<(WeightPort, NativePort)>,
+    constants: &mut Vec<GraphConstant>,
+    input: SublayerInput<'_>,
+    residual: &WorkflowTensor,
+    rows: &Dim,
+    epsilon: Argument<f32>,
+    crossing: &mut super::split::DecodeCrossing<NativePort>,
+) -> Result<(WorkflowTensor, Option<StepInputs>), GraphError> {
+    let route_weights = RouteWeights::of(graph, planned, scope, weights, constants, input)?;
+    let [parts, norm_extent] = input.form.dimensions(shape.hidden.clone());
+    let RouteWeights { norm, router, shared_router, expert_scale } = &route_weights;
+    let shared_gate = weight_port(
+        graph,
+        planned,
+        WeightRole { scope, kind: WeightKind::SharedGate },
+        WeightPart::Values,
+        weights,
+    )?
+    .tensor()
+    .clone();
+    let shared_up = weight_port(
+        graph,
+        planned,
+        WeightRole { scope, kind: WeightKind::SharedUp },
+        WeightPart::Values,
+        weights,
+    )?
+    .tensor()
+    .clone();
+    let normalize = shape.normalize()?;
+    let bank = layer.numbers();
+    let mut ports = layer.decode_front_ports(graph, rows, constants)?;
+    let mut routing = layer.part(graph, BankPart::Routing)?;
+    let mut front = layer.part(graph, BankPart::Front)?;
+    let tier = layer.front_route_tier(graph, &ports, constants)?;
+    let mut keys = layer.route_keys(graph)?;
+    let (sf, sr) = match &ports.site {
+        Some(_) => (bank.site_slots.clone(), bank.site_width.clone()),
+        None => (Dim::from(0), Dim::from(0)),
+    };
+    let mut empty_site = ports
+        .site
+        .is_none()
+        .then(|| GraphConstant::empty_port(graph, Element::i32(), &[Dim::from(0), Dim::from(0)], constants))
+        .transpose()?;
+    let mut empty_site_rows = ports
+        .site
+        .is_none()
+        .then(|| {
+            GraphConstant::empty_port(
+                graph,
+                Element::f32(),
+                &[Dim::from(0), Dim::from(magnitude_kernels::constants::VERIFY_ROWS), shape.hidden.clone()],
+                constants,
+            )
+        })
+        .transpose()?;
+    let route_dims = [
+        ("M", rows.clone()),
+        ("H", shape.hidden.clone()),
+        ("E", shape.count.clone()),
+        ("K", shape.selected.clone()),
+        ("S", shape.shared_intermediate.clone()),
+        parts.clone(),
+        norm_extent.clone(),
+        ("ES", expert_scale.extent.clone()),
+        ("FW", bank.file_width.clone()),
+        ("FLIGHT", bank.flight.clone()),
+        ("RING", bank.ring_words.clone()),
+        ("P", bank.choices.clone()),
+        ("GM", bank.map_words.clone()),
+        ("TM", tier.experts.clone()),
+        ("SF", sf),
+        ("SR", sr),
+    ];
+    let BankRoute::Fused { activation, route, hints: hint_kernels } = layer.route() else {
+        return Err("a fused layer's bank holds another form's route".into());
+    };
+    let route = G::pick(route, rows);
+    let sited_mode = if ports.site.is_some() {
+        if layer.needs_front_land() { 1 } else { 2 }
+    } else {
+        0
+    };
+    let (site_ref, site_rows_ref) = match ports.site.as_mut() {
+        Some(site) => (site.table.tensor_mut().into(), site.rows.tensor_mut().into()),
+        None => (
+            empty_site.as_mut().unwrap().tensor_mut().into(),
+            empty_site_rows.as_mut().unwrap().tensor_mut().into(),
+        ),
+    };
+    let routed = graph.enqueue(
+        route,
+        &route_dims,
+        routed_route_streamed::WorkflowArgs {
+            residual: input.rows.into(),
+            norm: norm.into(),
+            router: router.into(),
+            shared_router: shared_router.into(),
+            shared_gate: (&shared_gate).into(),
+            shared_up: (&shared_up).into(),
+            routes: crossing.routes.tensor_mut().into(),
+            scores: crossing.weights.tensor_mut().into(),
+            eps: epsilon.into(),
+            normalize,
+            expert_scale: (&expert_scale.tensor).into(),
+            map: ports.map.tensor().into(),
+            tier: (&tier.map).into(),
+            policy: ports.policy.tensor().into(),
+            sited: sited_mode.into(),
+            step: ports.step.tensor().into(),
+            file: ports.file.tensor_mut().into(),
+            sources: crossing.sources.tensor_mut().into(),
+            routing: routing.tensor_mut().into(),
+            keys: keys.tensor_mut().into(),
+            front: front.tensor_mut().into(),
+            land_grid: ports.land_grid.tensor_mut().into(),
+            land_groups: layer.land_groups().into(),
+            site: site_ref,
+            site_rows: site_rows_ref,
+        },
+    )?;
+    if let Some(mut hints) = layer.hints(graph, weights, [norm, router], ports.policy.tensor())? {
+        let hint = hint_kernels[hints.ahead as usize - 1]
+            .ok_or("a streamed layer's lead was not prepared with its binding")?;
+        let empty = GraphConstant::empty_of(graph, activation, &[Dim::from(0u64), shape.selected.clone()], constants)?;
+        let hint_dims = [
+            ("M", rows.clone()),
+            ("H", shape.hidden.clone()),
+            parts.clone(),
+            norm_extent.clone(),
+            ("K", shape.selected.clone()),
+            ("AHEAD", Dim::from(hints.ahead)),
+            ("RING", bank.ring_words.clone()),
+            ("EN", bank.next_experts.clone()),
+        ];
+        graph.enqueue_under(
+            hint,
+            &hint_dims,
+            routed_hint_route::WorkflowArgs {
+                residual: input.rows.into(),
+                activation: (&empty).into(),
+                next_norm: (&hints.weights[0][0]).into(),
+                next_router: (&hints.weights[0][1]).into(),
+                after_norm: (&hints.weights[1][0]).into(),
+                after_router: (&hints.weights[1][1]).into(),
+                eps: epsilon.into(),
+                step: ports.step.tensor().into(),
+                next_policy: (&hints.policy).into(),
+                rings: hints.rings.tensor_mut().into(),
+            },
+            &ports.policy,
+            magnitude_kernels::constants::POLICY_HINTS,
+            LaunchEncoding::WhileSet,
+        )?;
+    }
+    let mut sources_tensor = crossing.sources.tensor().clone();
+    if layer.needs_front_land() {
+        let mut gate_records = weight_port(
+            graph,
+            planned,
+            WeightRole { scope, kind: WeightKind::ExpertGate },
+            part,
+            weights,
+        )?;
+        let mut up_records = weight_port(
+            graph,
+            planned,
+            WeightRole { scope, kind: WeightKind::ExpertUp },
+            part,
+            weights,
+        )?;
+        let mut down_records = weight_port(
+            graph,
+            planned,
+            WeightRole { scope, kind: WeightKind::ExpertDown },
+            part,
+            weights,
+        )?;
+        let site_choices = StepChoices {
+            routes: crossing.routes.tensor(),
+            weights: crossing.weights.tensor(),
+            input: &routed.r0,
+            rows,
+        };
+        layer.land_front(
+            graph,
+            &mut ports,
+            &mut sources_tensor,
+            RecordTensors {
+                gate: Some(&mut gate_records),
+                up: &mut up_records,
+                down: &mut down_records,
+            },
+            Some(&site_choices),
+            &super::streamed::DecodeShape { rows },
+            constants,
+        )?;
+    }
+    graph.store(&routed.r0, &mut crossing.normalized)?;
+    let Some(into_coeff) = crossing.coefficient.as_mut() else {
+        return Err("a fused decode front crosses no coefficient".into());
+    };
+    graph.store(&routed.r1, into_coeff)?;
+    let Some(into_shared) = crossing.shared_product.as_mut() else {
+        return Err("a fused decode front crosses no shared product".into());
+    };
+    graph.store(&routed.r2, into_shared)?;
+    layer.publish_site(graph);
+    Ok((residual.clone(), ports.inputs.take()))
+}
+
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn routed<'a, G: GraphDraft + 'a>(
     graph: &mut G,
@@ -607,177 +831,9 @@ pub(crate) fn routed<'a, G: GraphDraft + 'a>(
         // Declares ONLY ports consumed by `DecodeFront` (no `SharedDown`,
         // no `gate_scale`/`up_scale`, no `Tier { kind }`, no `Site*`).
         (Some(Split::DecodeFront(crossing)), Some(layer)) if decode => {
-            let route_weights = RouteWeights::of(graph, planned, scope, weights, constants, input)?;
-            let [parts, norm_extent] = input.form.dimensions(shape.hidden.clone());
-            let RouteWeights { norm, router, shared_router, expert_scale } = &route_weights;
-            let shared_gate = weight_port(
-                graph,
-                planned,
-                WeightRole { scope, kind: WeightKind::SharedGate },
-                WeightPart::Values,
-                weights,
-            )?
-            .tensor()
-            .clone();
-            let shared_up = weight_port(
-                graph,
-                planned,
-                WeightRole { scope, kind: WeightKind::SharedUp },
-                WeightPart::Values,
-                weights,
-            )?
-            .tensor()
-            .clone();
-            let normalize = shape.normalize()?;
-            let bank = layer.numbers();
-            let mut ports = layer.decode_front_ports(graph, rows, constants)?;
-            let mut routing = layer.part(graph, BankPart::Routing)?;
-            let mut front = layer.part(graph, BankPart::Front)?;
-            let tier = layer.front_route_tier(graph, &ports, constants)?;
-            let mut keys = layer.route_keys(graph)?;
-            let route_dims = [
-                ("M", rows.clone()),
-                ("H", shape.hidden.clone()),
-                ("E", shape.count.clone()),
-                ("K", shape.selected.clone()),
-                ("S", shape.shared_intermediate.clone()),
-                parts.clone(),
-                norm_extent.clone(),
-                ("ES", expert_scale.extent.clone()),
-                ("FW", bank.file_width.clone()),
-                ("FLIGHT", bank.flight.clone()),
-                ("RING", bank.ring_words.clone()),
-                ("P", bank.choices.clone()),
-                ("GM", bank.map_words.clone()),
-                ("TM", tier.experts.clone()),
-            ];
-            let BankRoute::Fused { activation, route, hints: hint_kernels } = layer.route() else {
-                return Err("a fused layer's bank holds another form's route".into());
-            };
-            let route = G::pick(route, rows);
-            let routed = graph.enqueue(
-                route,
-                &route_dims,
-                routed_route_streamed::WorkflowArgs {
-                    residual: input.rows.into(),
-                    norm: norm.into(),
-                    router: router.into(),
-                    shared_router: shared_router.into(),
-                    shared_gate: (&shared_gate).into(),
-                    shared_up: (&shared_up).into(),
-                    routes: crossing.routes.tensor_mut().into(),
-                    scores: crossing.weights.tensor_mut().into(),
-                    eps: epsilon.into(),
-                    normalize,
-                    expert_scale: (&expert_scale.tensor).into(),
-                    map: ports.map.tensor().into(),
-                    tier: (&tier.map).into(),
-                    policy: ports.policy.tensor().into(),
-                    sited: (ports.sited()).into(),
-                    step: ports.step.tensor().into(),
-                    file: ports.file.tensor_mut().into(),
-                    sources: crossing.sources.tensor_mut().into(),
-                    routing: routing.tensor_mut().into(),
-                    keys: keys.tensor_mut().into(),
-                    front: front.tensor_mut().into(),
-                    land_grid: ports.land_grid.tensor_mut().into(),
-                    land_groups: layer.land_groups().into(),
-                },
-            )?;
-            if let Some(mut hints) = layer.hints(graph, weights, [norm, router], ports.policy.tensor())? {
-                let hint = hint_kernels[hints.ahead as usize - 1]
-                    .ok_or("a streamed layer's lead was not prepared with its binding")?;
-                let empty = GraphConstant::empty_of(graph, activation, &[Dim::from(0u64), shape.selected.clone()], constants)?;
-                let hint_dims = [
-                    ("M", rows.clone()),
-                    ("H", shape.hidden.clone()),
-                    parts.clone(),
-                    norm_extent.clone(),
-                    ("K", shape.selected.clone()),
-                    ("AHEAD", Dim::from(hints.ahead)),
-                    ("RING", bank.ring_words.clone()),
-                    ("EN", bank.next_experts.clone()),
-                ];
-                graph.enqueue_under(
-                    hint,
-                    &hint_dims,
-                    routed_hint_route::WorkflowArgs {
-                        residual: input.rows.into(),
-                        activation: (&empty).into(),
-                        next_norm: (&hints.weights[0][0]).into(),
-                        next_router: (&hints.weights[0][1]).into(),
-                        after_norm: (&hints.weights[1][0]).into(),
-                        after_router: (&hints.weights[1][1]).into(),
-                        eps: epsilon.into(),
-                        step: ports.step.tensor().into(),
-                        next_policy: (&hints.policy).into(),
-                        rings: hints.rings.tensor_mut().into(),
-                    },
-                    &ports.policy,
-                    magnitude_kernels::constants::POLICY_HINTS,
-                    LaunchEncoding::WhileSet,
-                )?;
-            }
-            // Land any file misses (`POLICY_RESOLVED == 0`) into the host tier
-            // and update `crossing.sources` before `DecodeFront` signals the host.
-            let mut sources_tensor = crossing.sources.tensor().clone();
-            if layer.needs_front_land() {
-                let mut gate_records = weight_port(
-                    graph,
-                    planned,
-                    WeightRole { scope, kind: WeightKind::ExpertGate },
-                    part,
-                    weights,
-                )?;
-                let mut up_records = weight_port(
-                    graph,
-                    planned,
-                    WeightRole { scope, kind: WeightKind::ExpertUp },
-                    part,
-                    weights,
-                )?;
-                let mut down_records = weight_port(
-                    graph,
-                    planned,
-                    WeightRole { scope, kind: WeightKind::ExpertDown },
-                    part,
-                    weights,
-                )?;
-                layer.land_front(
-                    graph,
-                    &mut ports,
-                    &mut sources_tensor,
-                    RecordTensors {
-                        gate: Some(&mut gate_records),
-                        up: &mut up_records,
-                        down: &mut down_records,
-                    },
-                    &super::streamed::DecodeShape { rows },
-                    constants,
-                )?;
-            }
-            graph.store(&routed.r0, &mut crossing.normalized)?;
-            let Some(into_coeff) = crossing.coefficient.as_mut() else {
-                return Err("a fused decode front crosses no coefficient".into());
-            };
-            graph.store(&routed.r1, into_coeff)?;
-            let Some(into_shared) = crossing.shared_product.as_mut() else {
-                return Err("a fused decode front crosses no shared product".into());
-            };
-            graph.store(&routed.r2, into_shared)?;
-            // Publish CPU-sited choices at the tail of `DecodeFront` so
-            // `expert-compute` overlaps 100% with host-driven `DecodeDma`.
-            let sources_view = sources_tensor.slice_leading(0, magnitude_kernels::constants::SOURCE_ROWS);
-            layer.site_request_front(
-                graph,
-                &mut ports,
-                crossing.routes.tensor(),
-                crossing.weights.tensor(),
-                &sources_view,
-                &routed.r0,
-                &super::streamed::DecodeShape { rows },
-            )?;
-            return Ok((residual.clone(), ports.inputs.take()));
+            return decode_front(
+                graph, layer, part, shape, planned, scope, weights, constants, input, residual, rows, epsilon, crossing,
+            );
         }
         (Some(Split::DecodeBack(crossing)), Some(_)) if decode => Some(crossing),
         _ => return Err("a routed layer's graph disagrees with how its experts are served".into()),
@@ -874,7 +930,7 @@ pub(crate) fn routed<'a, G: GraphDraft + 'a>(
                 let sited = ports.site.map(|site| {
                     (
                         site,
-                        ports.policy.expect("sited DecodeBackPorts binds Policy"),
+                        ports.policy,
                         ports.step.expect("sited DecodeBackPorts binds Step"),
                     )
                 });
@@ -1046,6 +1102,27 @@ pub(crate) fn routed<'a, G: GraphDraft + 'a>(
                             let mut front = layer.part(graph, BankPart::Front)?;
                             let tier = layer.route_tier(graph, &ports, constants)?;
                             let mut keys = layer.route_keys(graph)?;
+                            let (sf, sr) = match &ports.site {
+                                Some(_) => (bank.site_slots.clone(), bank.site_width.clone()),
+                                None => (Dim::from(0), Dim::from(0)),
+                            };
+                            let mut empty_site = ports
+                                .site
+                                .is_none()
+                                .then(|| GraphConstant::empty_port(graph, Element::i32(), &[Dim::from(0), Dim::from(0)], constants))
+                                .transpose()?;
+                            let mut empty_site_rows = ports
+                                .site
+                                .is_none()
+                                .then(|| {
+                                    GraphConstant::empty_port(
+                                        graph,
+                                        Element::f32(),
+                                        &[Dim::from(0), Dim::from(magnitude_kernels::constants::VERIFY_ROWS), shape.hidden.clone()],
+                                        constants,
+                                    )
+                                })
+                                .transpose()?;
                             let route_dims = [
                                 ("M", rows.clone()),
                                 ("H", shape.hidden.clone()),
@@ -1061,6 +1138,8 @@ pub(crate) fn routed<'a, G: GraphDraft + 'a>(
                                 ("P", bank.choices.clone()),
                                 ("GM", bank.map_words.clone()),
                                 ("TM", tier.experts.clone()),
+                                ("SF", sf),
+                                ("SR", sr),
                             ];
                             let BankRoute::Fused { activation, route, hints: hint_kernels } = layer.route() else {
                                 return Err("a fused layer's bank holds another form's route".into());
@@ -1069,6 +1148,14 @@ pub(crate) fn routed<'a, G: GraphDraft + 'a>(
                             // The step's sources, which the route writes and its
                             // later entries read.
                             let mut locals = RouteLocals { sources: graph.local_for(route, "sources", &route_dims)? };
+                            let sited_mode = ports.sited();
+                            let (site_ref, site_rows_ref) = match ports.site.as_mut() {
+                                Some(site) => (site.table.tensor_mut().into(), site.rows.tensor_mut().into()),
+                                None => (
+                                    empty_site.as_mut().unwrap().tensor_mut().into(),
+                                    empty_site_rows.as_mut().unwrap().tensor_mut().into(),
+                                ),
+                            };
                             let routed = graph.enqueue(
                                 route,
                                 &route_dims,
@@ -1087,7 +1174,7 @@ pub(crate) fn routed<'a, G: GraphDraft + 'a>(
                                     map: ports.map.tensor().into(),
                                     tier: (&tier.map).into(),
                                     policy: ports.policy.tensor().into(),
-                                    sited: (ports.sited()).into(),
+                                    sited: sited_mode.into(),
                                     step: ports.step.tensor().into(),
                                     file: ports.file.tensor_mut().into(),
                                     sources: locals.sources.tensor_mut().into(),
@@ -1096,6 +1183,8 @@ pub(crate) fn routed<'a, G: GraphDraft + 'a>(
                                     front: front.tensor_mut().into(),
                                     land_grid: ports.land_grid.tensor_mut().into(),
                                     land_groups: layer.land_groups().into(),
+                                    site: site_ref,
+                                    site_rows: site_rows_ref,
                                 },
                             )?;
                             if let Some(mut hints) = layer.hints(
@@ -1170,7 +1259,7 @@ pub(crate) fn routed<'a, G: GraphDraft + 'a>(
                             )?;
                             let mut ports = step.ports;
                             let sequence = ports.inputs.take();
-                            let sited = ports.site.map(|site| (site.into_combine(), ports.policy, ports.step));
+                            let sited = ports.site.map(|site| (site.into_combine(), Some(ports.policy), ports.step));
                             (product, routed.r1, routed.r2, reads, experts, sequence, sited)
                         }
                     };
@@ -1191,38 +1280,15 @@ pub(crate) fn routed<'a, G: GraphDraft + 'a>(
                 )
             };
         let inject = join.inject(graph, rows, constants)?;
-        // The norm the operand is formed under, or none (`NO` 0).
-        let (operand_norm, operand_epsilon) = match &operand {
-            Some(operand) => (operand.norm.clone(), operand.epsilon),
-            None => (GraphConstant::empty(graph, handle.operand_norm, constants)?, 0.0),
-        };
         let mut dimensions = output_dims;
         dimensions[2] = ("E", experts);
         [dimensions[8], dimensions[9]] = reads.dimensions();
-        let resident_args = || routed_output::WorkflowArgs {
-            residual: residual.into(),
-            inject: (&inject).into(),
-            expert_product: (&expert_product).into(),
-            shared_product: (&shared_product).into(),
-            routes: (&routes_tensor).into(),
-            sources: (&reads.sources).into(),
-            scores: (&scores_tensor).into(),
-            coefficient: (&coefficient).into(),
-            expert_down: down_records.tensor().into(),
-            tier_down: (&reads.tier.down).into(),
-            shared_down: (&shared_down).into(),
-            operand_norm: (&operand_norm).into(),
-            operand_epsilon: operand_epsilon.into(),
-        };
-        // A layer with a site combines, while its group is not whole
-        // (`policy[POLICY_WHOLE]` clear), with the CPU's answer: its
-        // projections (`routed_output_project`), beside the CPU, then their
-        // join (`routed_output_sited`), which waits for the answer when a
-        // choice of the step is the CPU's; while its group is whole, as a
-        // resident layer does (`routed_output`), at no cost and with its
-        // numerics. The two are exclusive by their conditions, so one
-        // storage holds the output (`GraphDraft::share`). Any other layer
-        // combines resident, unconditioned.
+        // A layer with a site combines, on backends that park in kernels
+        // (CUDA), in one launch (`routed_output_streamed`), or else while its
+        // group is not whole (`policy[POLICY_WHOLE]` clear) in two launches
+        // (`routed_output_project` then `routed_output_sited`) beside the
+        // whole-group `routed_output`. Only the arms that enqueue
+        // `routed_output` declare the empty `operand_norm` constant port.
         let combine = match (streamed.as_mut(), sited) {
             (Some(layer), Some((site, policy, step))) => {
                 layer.site_combine().map(|combine| (layer, site, combine, policy, step))
@@ -1234,10 +1300,64 @@ pub(crate) fn routed<'a, G: GraphDraft + 'a>(
             Some(_) if operand.is_some() => {
                 return Err("a routed layer with a site forms no operand for another graph".into());
             }
+            Some((layer, mut site, (BankCombineEntry::FusedInline(inline), site_dimensions), _, step)) => {
+                // Single-launch streamed fused combine: projections into
+                // scratch + lock-free `arrive::last` block that awaits the CPU
+                // site only when `streaming_site_any` is true (zero waiting
+                // when 0 experts are CPU-sited, including when whole).
+                // On CUDA (`parks_in_kernels`), `park_site` is a zero-cost
+                // graph marker satisfying Seismic's `&await` contract.
+                layer.park_site(graph);
+                let inline_dims = [
+                    &dimensions[0..8],
+                    &[dimensions[9].clone()],
+                    site_dimensions.as_slice(),
+                ]
+                .concat();
+                graph
+                    .enqueue(
+                        G::pick(inline, rows),
+                        &inline_dims,
+                        magnitude_kernels::routed_output_streamed::WorkflowArgs {
+                            residual: residual.into(),
+                            inject: (&inject).into(),
+                            expert_product: (&expert_product).into(),
+                            shared_product: (&shared_product).into(),
+                            routes: (&routes_tensor).into(),
+                            sources: (&reads.sources).into(),
+                            scores: (&scores_tensor).into(),
+                            coefficient: (&coefficient).into(),
+                            expert_down: down_records.tensor().into(),
+                            tier_down: (&reads.tier.down).into(),
+                            shared_down: (&shared_down).into(),
+                            step: step.tensor().into(),
+                            site: site.table.tensor_mut().into(),
+                            site_output: site.output.tensor().into(),
+                        },
+                    )?
+                    .value
+            }
             Some((layer, mut site, (BankCombineEntry::Fused { project, sited }, site_dimensions), policy, step)) => {
+                let operand_norm = GraphConstant::empty(graph, handle.operand_norm, constants)?;
+                let resident_args = routed_output::WorkflowArgs {
+                    residual: residual.into(),
+                    inject: (&inject).into(),
+                    expert_product: (&expert_product).into(),
+                    shared_product: (&shared_product).into(),
+                    routes: (&routes_tensor).into(),
+                    sources: (&reads.sources).into(),
+                    scores: (&scores_tensor).into(),
+                    coefficient: (&coefficient).into(),
+                    expert_down: down_records.tensor().into(),
+                    tier_down: (&reads.tier.down).into(),
+                    shared_down: (&shared_down).into(),
+                    operand_norm: (&operand_norm).into(),
+                    operand_epsilon: 0.0.into(),
+                };
+                let policy = policy.expect("split sited combine binds Policy");
                 let whole = magnitude_kernels::constants::POLICY_WHOLE;
                 let resident = graph
-                    .enqueue_under(G::pick(handle.output, rows), &dimensions, resident_args(), &policy, whole, LaunchEncoding::WhileSet)?
+                    .enqueue_under(G::pick(handle.output, rows), &dimensions, resident_args, &policy, whole, LaunchEncoding::WhileSet)?
                     .value;
                 let published = graph
                     .enqueue_under(
@@ -1284,7 +1404,33 @@ pub(crate) fn routed<'a, G: GraphDraft + 'a>(
             Some((_, _, (BankCombineEntry::General { .. }, _), _, _)) => {
                 return Err("a fused layer's bank holds another form's combine".into());
             }
-            None => graph.enqueue(G::pick(handle.output, rows), &dimensions, resident_args())?.value,
+            None => {
+                let (operand_norm, operand_epsilon) = match &operand {
+                    Some(operand) => (operand.norm.clone(), operand.epsilon),
+                    None => (GraphConstant::empty(graph, handle.operand_norm, constants)?, 0.0),
+                };
+                graph
+                    .enqueue(
+                        G::pick(handle.output, rows),
+                        &dimensions,
+                        routed_output::WorkflowArgs {
+                            residual: residual.into(),
+                            inject: (&inject).into(),
+                            expert_product: (&expert_product).into(),
+                            shared_product: (&shared_product).into(),
+                            routes: (&routes_tensor).into(),
+                            sources: (&reads.sources).into(),
+                            scores: (&scores_tensor).into(),
+                            coefficient: (&coefficient).into(),
+                            expert_down: down_records.tensor().into(),
+                            tier_down: (&reads.tier.down).into(),
+                            shared_down: (&shared_down).into(),
+                            operand_norm: (&operand_norm).into(),
+                            operand_epsilon: operand_epsilon.into(),
+                        },
+                    )?
+                    .value
+            }
         };
         if let Some(operand) = &operand {
             graph.carry_out(&output, operand.carry, operand.forms)?;

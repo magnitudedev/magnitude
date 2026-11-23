@@ -51,11 +51,12 @@ use seismic::{Argument, Dim, Element, NativePort, WorkflowTensor, WorkflowTensor
 
 /// An own source's rows' entries at one graph class: the `u` and `g`
 /// projections (the query and gate segments), their widening to the F32
-/// rows the pooling reads where they are published in A (an ungated pool),
-/// the pooling, and its index keys' projection and write.
+/// rows the key projection reads at rate 1 (where `u` is published in A for
+/// `attention_append_dense`), the pooling, and its index keys' projection and
+/// write.
 pub(crate) struct PooledEntries<'a, G: GraphDraft + 'a> {
     pub project: G::Ranged<'a, attention_project::Entry>,
-    pub widen: G::Binding<'a, widen_rows::Entry>,
+    pub widen: Option<G::Binding<'a, widen_rows::Entry>>,
     pub pool: PoolEntry<'a, G>,
     pub key_project: G::Ranged<'a, attention_project::Entry>,
     pub keys: G::Binding<'a, indexer_keys::Entry>,
@@ -166,14 +167,23 @@ impl PickedElements {
                 // A mean or identity pool's absent gate segment binds a
                 // zero-row view of the projection, at its element (as
                 // `attention::binding`'s absent segments bind the query's).
-                PickedBinding::Own(pooled) => Some(PooledElements {
-                    project: tokens_project(activation, binding.norm, pooled.projection, pooled.gate),
-                    key_project: match Pooling::of(pooled.rate) {
-                        Pooling::Grouped => segment(activation, pooled.key_norm, pooled.key, activation),
-                        Pooling::Identity => segment(activation, pooled.norm, pooled.key, activation),
-                    },
-                    pooling: Pooling::of(pooled.rate),
-                }),
+                PickedBinding::Own(pooled) => {
+                    let pooling = Pooling::of(pooled.rate);
+                    Some(PooledElements {
+                        project: tokens_project(
+                            activation,
+                            binding.norm,
+                            pooled.projection,
+                            pooled.gate,
+                            pooling,
+                        ),
+                        key_project: match pooling {
+                            Pooling::Grouped => segment(activation, pooled.key_norm, pooled.key, activation),
+                            Pooling::Identity => segment(activation, pooled.norm, pooled.key, activation),
+                        },
+                        pooling,
+                    })
+                }
                 PickedBinding::Reindex { .. } | PickedBinding::Reused => None,
             },
         })
@@ -182,13 +192,17 @@ impl PickedElements {
 
 /// The `u | g` projection's elements over `x` under the input norm `norm`:
 /// `u` through `projection` and, gated, `g` through `gate` (a mean pool's
-/// absent gate a zero-row view of the projection), published in F32 for a
-/// softmax-gated pool and in A otherwise.
+/// absent gate a zero-row view of the projection), published in F32 for any
+/// grouped pool (`Pooling::Grouped`, both gated and ungated mean) so
+/// `pool_rows` reads `u` directly without a `widen_rows` launch, and in A
+/// only for an identity pool (`Pooling::Identity`, whose `u` goes to
+/// `attention_append_dense` in A).
 pub(crate) fn tokens_project(
     activation: Element,
     norm: Element,
     projection: Element,
     gate: Option<Element>,
+    pooling: Pooling,
 ) -> [(&'static str, Element); 7] {
     [
         ("NW", norm),
@@ -197,7 +211,10 @@ pub(crate) fn tokens_project(
         ("KW", projection),
         ("VW", projection),
         ("A", activation),
-        ("Y", if gate.is_some() { Element::f32() } else { activation }),
+        ("Y", match pooling {
+            Pooling::Grouped => Element::f32(),
+            Pooling::Identity => activation,
+        }),
     ]
 }
 
@@ -481,24 +498,20 @@ fn own_rows<'a, G: GraphDraft + 'a>(
             value_bound: (&absent).into(),
         },
     )?;
-    let widen = |graph: &mut G, narrow: &WorkflowTensor, columns: &Dim| {
-        Ok::<_, GraphError>(
-            graph
-                .enqueue(
-                    entries.widen,
-                    &[("M", rows.clone()), ("D", columns.clone())],
-                    widen_rows::WorkflowArgs {
-                        rows: narrow.into(),
-                    },
-                )?
-                .value,
-        )
-    };
-    // A softmax-gated pool's projections are published in F32
-    // (`PooledElements`); the others' are widened from A.
-    let u = match gate {
-        Some(_) => projected.r0.clone(),
-        None => widen(graph, &projected.r0, width)?,
+    // A grouped pool's projections are published directly in F32
+    // (`tokens_project`); an identity pool publishes in A for
+    // `attention_append_dense` and widens `u` to F32 for its key projection.
+    let u = match entries.widen {
+        Some(widen) => graph
+            .enqueue(
+                widen,
+                &[("M", rows.clone()), ("D", width.clone())],
+                widen_rows::WorkflowArgs {
+                    rows: (&projected.r0).into(),
+                },
+            )?
+            .value,
+        None => projected.r0.clone(),
     };
     let rounding = RoundingArguments::of(own.rounding)?;
     let [components, frequencies, amplitudes] = rotary;

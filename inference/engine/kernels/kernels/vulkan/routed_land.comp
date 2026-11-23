@@ -6,7 +6,9 @@
 // claims (streaming/land.hpp over `lib/streaming/land.glsl`); then
 // workgroup 0 writes the absent choices' sources (streaming/tier_wait.hpp).
 // Where the tier places, the one workgroup only sources.
+#define KERNEL_A SEISMIC_ELEMENT_A
 #include <seismic/slab.glsl>
+#include "lib/core/activation.glsl"
 #include "lib/streaming/control.glsl"
 #include "lib/streaming/window.glsl"
 
@@ -18,6 +20,7 @@
 #define LAND_SOURCE_DOWN_BUFFER SEISMIC_BUFFER_STAGING_DOWN
 #include "lib/streaming/land.glsl"
 #include "../streaming/tier_wait.hpp"
+#include "../streaming/site.hpp"
 
 void routed_land() {
     const uint tid = gl_LocalInvocationIndex;
@@ -28,8 +31,36 @@ void routed_land() {
             STREAMING_AT(file, streaming_modulo(q, uint64_t(SEISMIC_DIM_FLIGHT)) * SEISMIC_FILE_STRIDE_0), SEISMIC_FILE_STRIDE_1, q,
             SEISMIC_PTR(SEISMIC_BUFFER_SCRATCH_COUNTERS), uint(SEISMIC_DIM_L),
             gl_NumWorkGroups.x * gl_NumWorkGroups.y * gl_NumWorkGroups.z, 0u, tid);
-    if (gl_WorkGroupID.x == 0u)
+    if (gl_WorkGroupID.x == 0u) {
         streaming_tier_wait(SEISMIC_PTR(SEISMIC_BUFFER_STEP), SEISMIC_STEP_STRIDE_0, file, SEISMIC_FILE_STRIDE_0,
             SEISMIC_FILE_STRIDE_1, SEISMIC_PTR(SEISMIC_BUFFER_SOURCES), SEISMIC_SOURCES_STRIDE_0,
             SEISMIC_SOURCES_STRIDE_1, SEISMIC_SOURCES_STRIDE_2, tid, gl_WorkGroupSize.x);
+        if (SEISMIC_DIM_SF > 0ul) {
+            barrier();
+            const uint choices = uint(SEISMIC_DIM_M) * uint(SEISMIC_DIM_K);
+            if (streaming_site_any(SEISMIC_PTR(SEISMIC_BUFFER_SOURCES), SEISMIC_SOURCES_STRIDE_0,
+                    SEISMIC_SOURCES_STRIDE_1, SEISMIC_SOURCES_STRIDE_2, choices)) {
+                const uint64_t slot = streaming_modulo(q, SEISMIC_DIM_SF);
+                const uint64_t rows = SEISMIC_DIM_M, columns = SEISMIC_DIM_H;
+                for (seismic_walk at = seismic_walk_begin(tid, gl_WorkGroupSize.x, rows * columns,
+                            u64vec3(1ul, 1ul, columns));
+                        at.index < rows * columns; seismic_walk_next(at)) {
+                    const uint64_t m = at.axes.x, n = at.axes.w;
+                    out_put(SEISMIC_OUT_SITE_ROWS, slot * SEISMIC_SITE_ROWS_STRIDE_0
+                            + m * SEISMIC_SITE_ROWS_STRIDE_1 + n * SEISMIC_SITE_ROWS_STRIDE_2,
+                        element_at(ACTIVATION_A, SEISMIC_PTR(SEISMIC_BUFFER_NORMALIZED),
+                            m * SEISMIC_NORMALIZED_STRIDE_0 + n * SEISMIC_NORMALIZED_STRIDE_1));
+                }
+                streaming_publish_barrier();
+                if (tid == 0u) {
+                    streaming_system_fence();
+                    streaming_site_publish(q, SEISMIC_PTR(SEISMIC_BUFFER_ROUTES), SEISMIC_ROUTES_STRIDE_0,
+                        SEISMIC_ROUTES_STRIDE_1, SEISMIC_PTR(SEISMIC_BUFFER_WEIGHTS), SEISMIC_WEIGHTS_STRIDE_0,
+                        SEISMIC_WEIGHTS_STRIDE_1, SEISMIC_PTR(SEISMIC_BUFFER_SOURCES), SEISMIC_SOURCES_STRIDE_0,
+                        SEISMIC_SOURCES_STRIDE_1, SEISMIC_SOURCES_STRIDE_2, choices,
+                        SEISMIC_PTR(SEISMIC_BUFFER_SITE) + slot * SEISMIC_SITE_STRIDE_0 * 4ul, SEISMIC_SITE_STRIDE_1);
+                }
+            }
+        }
+    }
 }

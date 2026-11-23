@@ -740,7 +740,7 @@ mod tests {
     use super::*;
     use magnitude_kernels::{
         routed_down, routed_down_project, routed_gate_up, routed_gate_up_part, routed_output,
-        routed_output_project, routed_route_shared, routed_route_streamed, routed_select,
+        routed_output_project, routed_output_streamed, routed_route_shared, routed_route_streamed, routed_select,
         routed_select_streamed,
     };
     use seismic::BackendName;
@@ -804,6 +804,9 @@ mod tests {
             follows::<routed_select::Entry, routed_select_streamed::Entry>(backend);
             follows::<routed_gate_up::Entry, routed_gate_up_part::Entry>(backend);
             follows::<routed_output::Entry, routed_output_project::Entry>(backend);
+            if matches!(backend, BackendName::Cuda) {
+                follows::<routed_output::Entry, routed_output_streamed::Entry>(backend);
+            }
             follows::<routed_down::Entry, routed_down_project::Entry>(backend);
         }
     }

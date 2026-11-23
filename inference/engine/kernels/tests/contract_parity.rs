@@ -525,6 +525,15 @@ fn packed_and_non_float_element_admission_parity() {
         ("UG", q2k_rows16),
         ("UU", q2k_rows16),
         ("UD", q2k_rows16),
+        ("A", Element::bf16()),
+    ];
+    let routed_round_elems = [
+        ("SG", gguf_q2_k),
+        ("SU", gguf_q2_k),
+        ("SD", gguf_q2_k),
+        ("UG", q2k_rows16),
+        ("UU", q2k_rows16),
+        ("UD", q2k_rows16),
     ];
     let routed_land_dims = [
         ("M", 1),
@@ -538,6 +547,9 @@ fn packed_and_non_float_element_admission_parity() {
         ("GS", 8),
         ("F", 512),
         ("H", 256),
+        ("SM", 0),
+        ("SF", 0),
+        ("SR", 0),
     ];
     assert_admits::<magnitude_kernels::routed_land::Entry>(
         "routed_land/q2k",
@@ -562,7 +574,7 @@ fn packed_and_non_float_element_admission_parity() {
     assert_admits::<magnitude_kernels::routed_round::Entry>(
         "routed_round/q2k",
         &[BackendName::Cuda, BackendName::Metal],
-        &routed_land_elems,
+        &routed_round_elems,
         &routed_round_dims,
     );
 
@@ -779,11 +791,13 @@ fn contract_node_shape_presence_matches_native_implementation_all_entries() {
         routed_select_streamed,
         routed_hint_select,
         routed_site_request,
+        site_publish,
         any_sited,
         routed_down_project,
         routed_down_sited,
         routed_output_project,
         routed_output_sited,
+        routed_output_streamed,
         landed_entries,
         land_tensor,
         land,

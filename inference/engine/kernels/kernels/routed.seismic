@@ -2557,7 +2557,7 @@ fn assign[M, K](routes: &tensor[M, K] i32, policy: &tensor[POLICY_WORDS] i32, ro
 # Its host answers the step's slot of the layer's `file` table as it lands
 # the absent experts (`routed_land` awaits it), and reads the experts
 # its front rows skip from the layer's front ring `front` (`resolve`).
-fn routed_route_streamed[M, H, PT, NM, E, K, S, ES, FW, FLIGHT, RING, P, GM, TM](residual: &tensor[M, PT * H] f32,
+fn routed_route_streamed[M, H, PT, NM, E, K, S, ES, FW, FLIGHT, RING, P, GM, TM, SF, SR](residual: &tensor[M, PT * H] f32,
     norm: &tensor[NM] NW, router: &tensor[E, H] RW, shared_router: &tensor[H] SRW,
     shared_gate: &tensor[S, H] SGW, shared_up: &tensor[S, H] SUW,
     routes: &mut tensor[M, K] i32, scores: &mut tensor[M, K] f32,
@@ -2566,9 +2566,10 @@ fn routed_route_streamed[M, H, PT, NM, E, K, S, ES, FW, FLIGHT, RING, P, GM, TM]
     sited: i32, step: &tensor[STEP_WORDS] i32,
     file: &mut tensor[FLIGHT, FW] i32, sources: &mut tensor[SOURCE_ROWS, M, K] i32,
     routing: &mut tensor[FLIGHT, ROUTING_WORDS(P)] i32, keys: &mut tensor[FLIGHT, VERIFY_ROWS, E] i32,
-    front: &mut tensor[RING] i32, land_grid: &mut tensor[3] i32, land_groups: i32)
+    front: &mut tensor[RING] i32, land_grid: &mut tensor[3] i32, land_groups: i32,
+    site: &mut tensor[SF, SR] i32, site_rows: &mut tensor[SF, VERIFY_ROWS, H] f32)
     -> (tensor[M, H] A, tensor[M] f32, tensor[M, S] A)
-    where NM >= 0 and ((NM == H and PT == 1) or (NM == 0 and PT >= 1)) and ES >= 0 and (ES == 0 or ES == E) and operands(RW) == 0 and operands(SRW) == 0 and operands(SGW) == operands(SUW) and M <= VERIFY_ROWS and FW >= FILE_ENTRY(P) and FW % 2 == 0 and FLIGHT > 0 and FLIGHT < 65536 and P >= M * K and GM >= E and TM >= 0 and (TM == 0 or TM == E) and RING >= HINT_ENTRY(M * K):
+    where NM >= 0 and ((NM == H and PT == 1) or (NM == 0 and PT >= 1)) and ES >= 0 and (ES == 0 or ES == E) and operands(RW) == 0 and operands(SRW) == 0 and operands(SGW) == operands(SUW) and M <= VERIFY_ROWS and FW >= FILE_ENTRY(P) and FW % 2 == 0 and FLIGHT > 0 and FLIGHT < 65536 and P >= M * K and GM >= E and TM >= 0 and (TM == 0 or TM == E) and RING >= HINT_ENTRY(M * K) and SF >= 0 and SF < 65536 and ((SF == 0 and SR == 0) or (SF > 0 and SR >= SITE_ENTRY(M * K) and SR % 2 == 0)):
     let mut normalized = tensor[M, H] A
     let mut coefficient = tensor[M] f32
     let mut shared_product = tensor[M, S] A
@@ -2577,6 +2578,8 @@ fn routed_route_streamed[M, H, PT, NM, E, K, S, ES, FW, FLIGHT, RING, P, GM, TM]
         normalize, expert_scale, routes, scores, normalized, coefficient, shared_product, ranked)
     resolve[P = P, E = E](routes, scores, ranked, map, tier, policy, sited, step, file, routing, keys, sources,
         front, land_grid, land_groups)
+    if SF > 0 and SR >= SITE_ENTRY(M * K) and SR % 2 == 0 and (sited == 2 or land_grid[0] == 0):
+        site_publish[FLIGHT = SF, R = SR](step, routes, sources, scores, normalized, site, site_rows)
     return (normalized, coefficient, shared_product)
 
 # Gate-ahead hints (`hint`) for the next one or two streamed fused layers
@@ -2662,7 +2665,7 @@ fn routed_hint_select[M, H, K, AHEAD, RING, EN](residual: &tensor[M, H] f32,
 # nothing). The CPU pool spins on the slot for the step (no host thread
 # relays it) and answers it (`site_output[s]`, then the slot's answer),
 # which the combine awaits (`routed_down_sited`, `routed_output_sited`).
-fn routed_site_request[M, H, K, FLIGHT, R](step: &tensor[STEP_WORDS] i32,
+fn site_publish[M, H, K, FLIGHT, R](step: &tensor[STEP_WORDS] i32,
     routes: &tensor[M, K] i32, sources: &tensor[SOURCE_ROWS, M, K] i32, weights: &tensor[M, K] f32,
     normalized: &tensor[M, H] A, site: &mut tensor[FLIGHT, R] i32,
     site_rows: &mut tensor[FLIGHT, VERIFY_ROWS, H] f32)
@@ -2685,6 +2688,13 @@ fn routed_site_request[M, H, K, FLIGHT, R](step: &tensor[STEP_WORDS] i32,
                     count = count + 1
         site[slot, SITE_COUNT] = count
         request_slot(site, slot, 0, q)
+
+fn routed_site_request[M, H, K, FLIGHT, R](step: &tensor[STEP_WORDS] i32,
+    routes: &tensor[M, K] i32, sources: &tensor[SOURCE_ROWS, M, K] i32, weights: &tensor[M, K] f32,
+    normalized: &tensor[M, H] A, site: &mut tensor[FLIGHT, R] i32,
+    site_rows: &mut tensor[FLIGHT, VERIFY_ROWS, H] f32)
+    where FLIGHT > 0 and FLIGHT < 65536 and M <= VERIFY_ROWS and R >= SITE_ENTRY(M * K) and R % 2 == 0:
+    site_publish[FLIGHT = FLIGHT, R = R](step, routes, sources, weights, normalized, site, site_rows)
 
 # Whether any choice of the step is the CPU's (SOURCE_SITE >= 0).
 fn any_sited[M, K](sources: &tensor[SOURCE_ROWS, M, K] i32) -> bool:
@@ -2749,6 +2759,30 @@ fn routed_output_sited[M, H, SN, IN, K, FLIGHT, SW](residual: &tensor[M, SN * H]
     site_output: &await tensor[FLIGHT, VERIFY_ROWS, H] f32) -> tensor[M, SN * H] f32
     where IN >= 0 and ((IN == 0 and SN == 1) or (IN == SN and SN >= 1)) and FLIGHT > 0 and FLIGHT < 65536 and M <= VERIFY_ROWS and SW % 2 == 0 and SW >= SLOT_PAYLOAD:
     let mut value = tensor[M, SN * H] f32
+    let q = step_sequence(step)
+    let slot = flight_slot[FLIGHT = FLIGHT](q)
+    decode_output_join(residual, inject, published, scores, coefficient, site_output, slot,
+        any_sited(sources) and slot_succeeded(site, slot, q), value)
+    return value
+
+# A streamed decode layer's combine, Qwen's fused form, in one launch on
+# backends that park in kernels: the projections (`decode_output_published`)
+# into scratch, and in each channel tile's last-arriving block the wait for
+# the CPU's answer (no wait when no choice is the CPU's) and the join
+# (`decode_output_join`).
+fn routed_output_streamed[M, H, SN, IN, E, K, F, S, TR, FLIGHT, SW](residual: &tensor[M, SN * H] f32,
+    inject: &tensor[M, IN] f32,
+    expert_product: &tensor[M, K, F] A, shared_product: &tensor[M, S] A,
+    routes: &tensor[M, K] i32, sources: &tensor[SOURCE_ROWS, M, K] i32, scores: &tensor[M, K] f32,
+    coefficient: &tensor[M] f32, expert_down: &tensor[E, H, F] EDW,
+    tier_down: &tensor[TR, H, F] EDW, shared_down: &tensor[H, S] SDW,
+    step: &tensor[STEP_WORDS] i32, site: &await mut tensor[FLIGHT, SW] i32,
+    site_output: &await tensor[FLIGHT, VERIFY_ROWS, H] f32) -> tensor[M, SN * H] f32
+    where IN >= 0 and ((IN == 0 and SN == 1) or (IN == SN and SN >= 1)) and TR >= 0 and FLIGHT > 0 and FLIGHT < 65536 and M <= VERIFY_ROWS and SW % 2 == 0 and SW >= SLOT_PAYLOAD:
+    let mut value = tensor[M, SN * H] f32
+    let mut published = tensor[M, K + 1, H] A
+    decode_output_published(expert_product, shared_product, routes, sources, expert_down, tier_down, shared_down,
+        published)
     let q = step_sequence(step)
     let slot = flight_slot[FLIGHT = FLIGHT](q)
     decode_output_join(residual, inject, published, scores, coefficient, site_output, slot,
@@ -2897,20 +2931,24 @@ fn source_landed[M, K, FLIGHT, FW](file: &tensor[FLIGHT, FW] i32, slot: i32, q: 
 # landed when it runs. A slot not this step's request on a grid that runs
 # is no state the protocol reaches: the slot's SLOT_VIOLATED is stored
 # (`streaming/tier_wait.hpp`), and nothing is written.
-fn routed_land[M, K, FW, FLIGHT, L, V, GV, S, GS, F, H](step: &tensor[STEP_WORDS] i32,
+fn routed_land[M, K, FW, FLIGHT, L, V, GV, S, GS, F, H, SM, SF, SR](step: &tensor[STEP_WORDS] i32,
     file: &await mut tensor[FLIGHT, FW] i32, sources: &mut tensor[SOURCE_ROWS, M, K] i32,
     policy: &tensor[POLICY_WORDS] i32,
     landing: &await mut tensor[LANDING_ENTRY(L)] i32,
     staging_gate: &tensor[GV, F, H] SG, staging_up: &tensor[V, F, H] SU, staging_down: &tensor[V, H, F] SD,
     gate: &mut tensor[GS, F, H] UG, up: &mut tensor[S, F, H] UU, down: &mut tensor[S, H, F] UD,
-    grid: &tensor[3] i32)
-    where FW >= FILE_ENTRY(M * K) and FW % 2 == 0 and FLIGHT > 0 and FLIGHT < 65536 and ((V > 0 and S > 0) or (V == 0 and S == 0)) and ((GV == V and GS == S) or (GV == 0 and GS == 0)):
+    grid: &tensor[3] i32,
+    routes: &tensor[SM, K] i32, weights: &tensor[SM, K] f32, normalized: &tensor[SM, H] A,
+    site: &mut tensor[SF, SR] i32, site_rows: &mut tensor[SF, VERIFY_ROWS, H] f32)
+    where FW >= FILE_ENTRY(M * K) and FW % 2 == 0 and FLIGHT > 0 and FLIGHT < 65536 and ((V > 0 and S > 0) or (V == 0 and S == 0)) and ((GV == V and GS == S) or (GV == 0 and GS == 0)) and SM >= 0 and SM <= VERIFY_ROWS and SF >= 0 and SF < 65536 and ((SF == 0 and SR == 0 and SM == 0) or (SF > 0 and SM == M and M <= VERIFY_ROWS and SR >= SITE_ENTRY(M * K) and SR % 2 == 0)):
     let q = step_sequence(step)
     let slot = flight_slot[FLIGHT = FLIGHT](q)
     if policy[POLICY_RESOLVED] == 0 and grid[0] > 0:
         if pair_at(file, slot, SLOT_REQUEST) == q:
             land[L = L](landing, step, staging_gate, staging_up, staging_down, gate, up, down)
             source_landed(file, slot, q, sources)
+            if SF > 0 and SM > 0 and SR >= SITE_ENTRY(SM * K) and SR % 2 == 0:
+                site_publish[FLIGHT = SF, R = SR](step, routes, sources[:, 0:SM, :], weights, normalized, site, site_rows)
         else:
             file[slot, SLOT_VIOLATED] = i32(u32(q & u64(4294967295)) | u32(VIOLATED_STAMP))
 

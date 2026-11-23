@@ -150,14 +150,17 @@ impl BankSite {
     ) -> Result<bool, String> {
         use crate::planning::BankedFeedForward;
         use magnitude_kernels::{
-            routed_down_project, routed_down_sited, routed_output_project, routed_output_sited, routed_site_request,
+            routed_down_project, routed_down_sited, routed_output_project, routed_output_sited,
+            routed_output_streamed, routed_site_request,
         };
         fn declares<E: seismic::EntryContract>(backend: seismic::BackendName) -> bool {
             E::contract_node_shape(backend).is_ok()
         }
         let combine = match slot {
             BankedFeedForward::Routed(_) => {
-                declares::<routed_output_project::Entry>(backend) && declares::<routed_output_sited::Entry>(backend)
+                declares::<routed_output_streamed::Entry>(backend)
+                    || (declares::<routed_output_project::Entry>(backend)
+                        && declares::<routed_output_sited::Entry>(backend))
             }
             BankedFeedForward::GeneralRouted(_) | BankedFeedForward::Parallel(_) => {
                 declares::<routed_down_project::Entry>(backend) && declares::<routed_down_sited::Entry>(backend)
@@ -177,6 +180,7 @@ impl BankSite {
 /// down (`routed_down_project`, `routed_down_sited`).
 #[derive(Clone, Debug)]
 pub enum BankCombine {
+    FusedInline(RangedKernels<magnitude_kernels::routed_output_streamed::Entry>),
     Fused {
         project: RangedKernels<magnitude_kernels::routed_output_project::Entry>,
         sited: NativeKernel<magnitude_kernels::routed_output_sited::Entry>,
@@ -511,13 +515,13 @@ pub struct PickedKernels {
 }
 
 /// An own source's rows' entries: the tokens' `u` and `g` projections
-/// (`attention_project`'s query and gate segments) in F32 (published so
-/// when softmax-gated, else widened), its pooling, and its index keys'
-/// projection and write.
+/// (`attention_project`'s query and gate segments) in F32 (published so for
+/// any grouped pool, else widened from A for an identity pool), its pooling,
+/// and its index keys' projection and write.
 #[derive(Clone, Debug)]
 pub struct PooledKernels {
     pub project: RangedKernels<attention_project::Entry>,
-    pub widen: NativeKernel<widen_rows::Entry>,
+    pub widen: Option<NativeKernel<widen_rows::Entry>>,
     pub pool: PoolKernel,
     pub key_project: RangedKernels<attention_project::Entry>,
     pub keys: NativeKernel<indexer_keys::Entry>,
@@ -575,13 +579,11 @@ pub struct SelectionKernels {
 }
 
 /// A selected read's keys' entries: the tokens' `u` (and gated, `g`)
-/// projection over `x` (`attention_project`), the widening of an ungated
-/// `u` published in A to F32 (`widen_rows`), and the pooling into F32 keys
-/// (`pool_rows`).
+/// projection over `x` (`attention_project`, published directly in F32), and
+/// the pooling into F32 keys (`pool_rows`).
 #[derive(Clone, Debug)]
 pub struct SelectionKeyKernels {
     pub project: RangedKernels<attention_project::Entry>,
-    pub widen: NativeKernel<widen_rows::Entry>,
     pub pool: NativeKernel<pool_rows::Entry>,
 }
 

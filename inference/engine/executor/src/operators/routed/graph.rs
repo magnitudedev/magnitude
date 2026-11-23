@@ -998,6 +998,7 @@ pub(crate) fn general_routed<'a, G: GraphDraft + 'a>(
                         up: &mut up_records,
                         down: &mut down_records,
                     },
+                    None,
                     &super::streamed::DecodeShape { rows },
                     constants,
                 )?;
@@ -1410,7 +1411,7 @@ pub(crate) fn general_routed<'a, G: GraphDraft + 'a>(
             graph.share(&summed, &resident)?;
             resident
         }
-        Some((_, _, (BankCombineEntry::Fused { .. }, _), _, _)) => {
+        Some((_, _, (BankCombineEntry::Fused { .. } | BankCombineEntry::FusedInline(_), _), _, _)) => {
             return Err("a general layer's bank holds another form's combine".into());
         }
         None => graph.enqueue(G::pick(down, rows), &down_dimensions, resident_args())?.value,

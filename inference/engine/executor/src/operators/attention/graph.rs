@@ -91,11 +91,10 @@ impl<'a, G: GraphDraft + 'a> Clone for LowRankQueryEntries<'a, G> {
     }
 }
 
-/// A selected read's entries ([`select`]): its keys' projection, widening
-/// and pooling, its indexer, its reads and the codec's WorkList prefill.
+/// A selected read's entries ([`select`]): its keys' projection and pooling,
+/// its indexer, its reads and the codec's WorkList prefill.
 pub(crate) struct SelectionGraphEntries<'a, G: GraphDraft + 'a> {
     pub project: G::Ranged<'a, attention_project::Entry>,
-    pub widen: G::Binding<'a, widen_rows::Entry>,
     pub pool: G::Binding<'a, pool_rows::Entry>,
     pub indexer: IndexerEntries<'a, G>,
     pub reads: G::Binding<'a, unit_reads::Entry>,
@@ -241,7 +240,6 @@ impl<'a> From<&'a AttentionKernels> for AttentionGraphEntries<'a, NativeGraph> {
                 .as_ref()
                 .map(|selection| SelectionGraphEntries {
                     project: &selection.keys.project,
-                    widen: &selection.keys.widen,
                     pool: &selection.keys.pool,
                     indexer: (&selection.indexer).into(),
                     reads: &selection.reads,
@@ -265,7 +263,7 @@ impl<'a> From<&'a AttentionKernels> for AttentionGraphEntries<'a, NativeGraph> {
             picked: kernels.picked.as_ref().map(|picked| PickedEntries {
                 rows: picked.rows.as_ref().map(|rows| PooledEntries {
                     project: &rows.project,
-                    widen: &rows.widen,
+                    widen: rows.widen.as_ref(),
                     pool: match &rows.pool {
                         PoolKernel::Grouped(kernel) => PoolEntry::Grouped(kernel),
                         PoolKernel::Identity(kernel) => PoolEntry::Identity(kernel),
@@ -350,7 +348,7 @@ impl CheckedPickedEntries {
         PickedEntries {
             rows: self.elements.rows.as_ref().map(|rows| PooledEntries {
                 project: G::bind_ranged(&rows.project[..]),
-                widen: G::bind(&self.activation[..]),
+                widen: matches!(rows.pooling, Pooling::Identity).then(|| G::bind(&self.activation[..])),
                 pool: match rows.pooling {
                     Pooling::Identity => PoolEntry::Identity(G::bind(&self.activation[..])),
                     Pooling::Grouped => PoolEntry::Grouped(G::bind(&self.pool[..])),
@@ -398,13 +396,12 @@ impl CheckedIndexerEntries {
 }
 
 /// A selected read's entry elements: its keys' `u | g` projection
-/// (`pooled::tokens_project`), the activation element `widen_rows` reads,
-/// `pool_rows`' (its keys stored in F32), and its indexer's (`unit_reads`
-/// and `candidate_rows` read none).
+/// (`pooled::tokens_project`, published directly in F32), `pool_rows`'
+/// (its keys stored in F32), and its indexer's (`unit_reads` and
+/// `candidate_rows` read none).
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 struct CheckedSelectionEntries {
     project: [(&'static str, Element); 7],
-    activation: [(&'static str, Element); 1],
     pool: [(&'static str, Element); 2],
     indexer: CheckedIndexerEntries,
 }
@@ -418,8 +415,8 @@ impl CheckedSelectionEntries {
                 binding.norm,
                 selection.keys.projection,
                 selection.keys.gate,
+                Pooling::Grouped,
             ),
-            activation: [("A", activation)],
             pool: [("A", activation), ("Y", Element::f32())],
             indexer: CheckedIndexerEntries::new(IndexerElements::of(binding, selection.indexer), activation),
         }
@@ -431,7 +428,6 @@ impl CheckedSelectionEntries {
     ) -> SelectionGraphEntries<'a, G> {
         SelectionGraphEntries {
             project: G::bind_ranged(&self.project[..]),
-            widen: G::bind(&self.activation[..]),
             pool: G::bind(&self.pool[..]),
             indexer: self.indexer.entries(),
             reads: G::bind(&[]),
@@ -905,22 +901,13 @@ fn select<'a, G: GraphDraft + 'a>(
             value_bound: (&absent).into(),
         },
     )?;
-    // A softmax-gated pool's projections are published in F32
-    // (`pooled::tokens_project`); a mean's `u` is widened from A.
-    let (u, g) = match gate {
-        Some(_) => (projected.r0.clone(), projected.r1.reshape(&[rows.clone(), gate_rows.clone()])),
-        None => {
-            let u = graph
-                .enqueue(
-                    entries.widen,
-                    &[("M", rows.clone()), ("D", width.clone())],
-                    widen_rows::WorkflowArgs { rows: (&projected.r0).into() },
-                )?
-                .value;
-            // No gate scores: zero columns of the F32 rows.
-            let g = u.slice_leading(0, 0).reshape(&[rows.clone(), Dim::from(0)]);
-            (u, g)
-        }
+    // Grouped pool projections are published directly in F32
+    // (`pooled::tokens_project`).
+    let u = projected.r0.clone();
+    let g = match gate {
+        Some(_) => projected.r1.reshape(&[rows.clone(), gate_rows.clone()]),
+        // No gate scores: zero columns of the F32 rows.
+        None => u.slice_leading(0, 0).reshape(&[rows.clone(), Dim::from(0)]),
     };
     // The keys: each pending token's in the Window, each unit's in the Block.
     let place = if read.keys.place { read.block.clone() } else { Dim::from(0) };

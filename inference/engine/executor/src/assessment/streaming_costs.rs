@@ -179,6 +179,7 @@ impl ConvertForm {
                 UG: gate.resident,
                 UU: up.resident,
                 UD: down.resident,
+                A: Element::bf16(),
             }),
             &[("K", 1)],
         )
@@ -313,6 +314,12 @@ fn convert_point(
     let [mut gate_records, mut up_records, mut down_records] = [gate_records?, up_records?, down_records?];
     // The launch parks, as the load's does: its park node is bound answered
     // below, as every word it awaits already holds its answer.
+    let [_, hidden] = up.matrix;
+    let empty_routes = port(Element::i32(), &[0, 1])?;
+    let empty_weights = port(Element::f32(), &[0, 1])?;
+    let empty_norm = port(Element::bf16(), &[0, hidden])?;
+    let mut empty_site = port(Element::i32(), &[0, 0])?;
+    let mut empty_site_rows = port(Element::f32(), &[0, constants::VERIFY_ROWS, hidden])?;
     let park = land_launch(
         &mut graph,
         kernel,
@@ -330,6 +337,11 @@ fn convert_point(
             up: up_records.tensor_mut().into(),
             down: down_records.tensor_mut().into(),
             grid: grid.tensor().into(),
+            routes: empty_routes.tensor().into(),
+            weights: empty_weights.tensor().into(),
+            normalized: empty_norm.tensor().into(),
+            site: empty_site.tensor_mut().into(),
+            site_rows: empty_site_rows.tensor_mut().into(),
         },
         &policy,
     )
@@ -343,6 +355,11 @@ fn convert_point(
         // The grid the route writes of a step that requested: every group,
         // where the bank places.
         (grid, shared(&[3], &[(0, crate::planning::Placer::Bank.land_groups()), (1, 1), (2, 1)])?),
+        (empty_routes, Tensor::zeros(&charges, Element::i32(), &[0, 1]).map_err(|cause| error(&cause))?),
+        (empty_weights, Tensor::zeros(&charges, Element::f32(), &[0, 1]).map_err(|cause| error(&cause))?),
+        (empty_norm, Tensor::zeros(&charges, Element::bf16(), &[0, hidden]).map_err(|cause| error(&cause))?),
+        (empty_site, Tensor::zeros(&charges, Element::i32(), &[0, 0]).map_err(|cause| error(&cause))?),
+        (empty_site_rows, Tensor::zeros(&charges, Element::f32(), &[0, constants::VERIFY_ROWS, hidden]).map_err(|cause| error(&cause))?),
     ];
     let zeros = |(element, extents): (Element, [u64; 3])| Tensor::zeros(charges, element, &extents).map_err(|cause| error(&cause));
     for ((staging, records), (tensor, held)) in staging.into_iter().zip([gate_records, up_records, down_records]).zip(tensors) {
