@@ -440,6 +440,7 @@ impl Residency {
             return false;
         }
         self.core.retired = frontier;
+        self.core.directory.drain_pending(frontier);
         self.core.directory.drain_staging(self.prefetch.reached(), &self.core.steps);
         if let Some(past) = self.shared.steps.retire_groups(frontier) {
             self.advance(past);

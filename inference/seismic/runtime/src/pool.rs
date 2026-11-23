@@ -1071,10 +1071,17 @@ pub(crate) struct Slots {
     /// `repointed()`, `moves::submit()`, or `point_many()`.
     mutate: Mutex<()>,
     slabs: Mutex<Vec<Option<Slab>>>,
-    /// The device work that last wrote the table ([`Self::adopt`]), while
-    /// it may still run: a later repoint is ordered after it, never a host
-    /// write it could land over. Changed under the mutate lock.
+    /// The device work that last wrote the table ([`Self::adopt`] or
+    /// [`Self::point_many`]), while it may still run: a later repoint is
+    /// ordered after it, never a host write it could land over. Changed under
+    /// the mutate lock.
     repointed: Mutex<Option<Arc<dyn DeviceCompletion>>>,
+    /// Monotonic counter incremented whenever a table repoint was submitted to
+    /// the device compute queue (`moves::submit`) rather than written
+    /// synchronously on the host: lets live growth callers observe whether
+    /// `add_slabs` deferred table visibility behind already-submitted GPU work
+    /// without touching driver queries.
+    device_repoints: AtomicU64,
 }
 
 impl Slots {
@@ -1216,7 +1223,11 @@ impl Slots {
                         });
                     }
                 }
-                *repointed = moves::submit(&self.device, &self.table, &words)?;
+                let completion = moves::submit(&self.device, &self.table, &words)?;
+                if completion.is_some() {
+                    self.device_repoints.fetch_add(1, Ordering::Release);
+                }
+                *repointed = completion;
             }
         }
         Ok(())
@@ -1565,6 +1576,7 @@ impl Slots {
             mutate: Mutex::new(()),
             slabs: Mutex::new(slabs),
             repointed: Mutex::new(None),
+            device_repoints: AtomicU64::new(0),
         }))
     }
 }
@@ -1732,6 +1744,7 @@ impl SlabStore {
             mutate: Mutex::new(()),
             slabs: Mutex::new(Vec::new()),
             repointed: Mutex::new(None),
+            device_repoints: AtomicU64::new(0),
         });
         let words = seismic_lang::registry::record_table((0..slots.offsets.len()).flat_map(|region| {
             let slots = &slots;
@@ -1775,6 +1788,15 @@ impl SlabStore {
     /// bumping `Slab::views`.
     pub fn is_backed(&self, slot: usize) -> bool {
         self.slots.is_backed(slot)
+    }
+
+    /// Count of device-ordered table repoints (`moves::submit`) submitted for
+    /// this store so far. Callers that grow slabs concurrently with in-flight
+    /// GPU work compare this before and after [`Self::add_slabs`] to know
+    /// whether the new table entries are queued behind already-submitted device
+    /// work rather than immediately visible.
+    pub fn device_repoints(&self) -> u64 {
+        self.slots.device_repoints.load(Ordering::Acquire)
     }
 
     /// Region `region`'s table: `[capacity, 2]` u32, one 64-bit address an
@@ -1948,7 +1970,11 @@ impl SlabStore {
                 }
             }
             let mut repointed = slots.repointed();
-            *repointed = moves::submit(&slots.device, &slots.table, &copies)?;
+            let completion = moves::submit(&slots.device, &slots.table, &copies)?;
+            if completion.is_some() {
+                slots.device_repoints.fetch_add(1, Ordering::Release);
+            }
+            *repointed = completion;
         } else {
             let updates: Vec<(usize, u64)> = claimed.iter().map(|item| (item.slot, item.address)).collect();
             slots.point_many(&updates)?;

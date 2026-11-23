@@ -56,7 +56,7 @@ fn a_resize_between_flights_keeps_the_most_recent_experts() {
     // A regrowth backs the holes, which the next seeds take; it joins
     // beside a running step, at the watcher's next pass.
     let running = harness.step();
-    shared.join(super::Join::Bank { records: vec![vec![0, 1]] });
+    shared.join(super::Join::Bank { records: vec![vec![0, 1]], ready_at: 0 });
     shared.joins.wait_taken();
     drop(running);
     assert_eq!(shared.costs().records, [4]);
@@ -286,7 +286,7 @@ fn a_host_shrink_right_after_a_growth_answers_beside_its_landings() {
     harness.tier_ready();
     let shared = harness.watcher.shared().clone();
     let step = harness.step();
-    shared.join(super::Join::Landed { records: vec![vec![7]], views: vec![harness.host.views(8)] });
+    shared.join(super::Join::Landed { records: vec![vec![7]], views: vec![harness.host.views(8)], ready_at: 0 });
     shared.joins.wait_taken();
     drop(step);
     // The landing held in flight until the shrink is served, as in
@@ -324,7 +324,7 @@ fn a_growth_covering_the_tier_joins_at_once_and_starts_its_reads() {
     std::thread::sleep(Duration::from_millis(50));
     assert!((0..EXPERTS).all(|expert| harness.in_tier(0, expert).is_none()), "a tier short of every expert reads none ahead of use");
     let ahead = Ahead::queue("cover-grown-ahead");
-    shared.join(super::Join::Landed { records: vec![vec![EXPERTS as u32 - 1]], views: vec![harness.host.views(EXPERTS as u32)] });
+    shared.join(super::Join::Landed { records: vec![vec![EXPERTS as u32 - 1]], views: vec![harness.host.views(EXPERTS as u32)], ready_at: 0 });
     shared.joins.wait_taken();
     assert_eq!(residency::lock(&harness.watcher.state).core.directory.host(0).records(), EXPERTS as u32, "the growth joined");
     eventually("the covered tier never read ahead", || residency::lock(&harness.watcher.state).prefetch.outstanding());
@@ -383,7 +383,7 @@ fn a_host_tier_grows_by_its_records_alone() {
     harness.request(&[0]).complete().unwrap();
     let shared = harness.watcher.shared();
     let step = harness.step();
-    shared.join(super::Join::Landed { records: vec![vec![STAGING + 1]], views: vec![harness.host.views(STAGING + 2)] });
+    shared.join(super::Join::Landed { records: vec![vec![STAGING + 1]], views: vec![harness.host.views(STAGING + 2)], ready_at: 0 });
     shared.joins.wait_taken();
     drop(step);
     let step = harness.request(&[1]);
@@ -681,11 +681,53 @@ fn promotions_and_requests_never_enter_blocking_allocation() {
         .unwrap()
         .expect("shrink evicts two records");
     let rejoined: Vec<usize> = evicted.records[0].iter().map(|&r| r as usize).collect();
-    shared.join(super::Join::Bank { records: vec![rejoined] });
+    shared.join(super::Join::Bank { records: vec![rejoined], ready_at: 0 });
     shared.joins.wait_taken();
     // Promote new experts into the rejoined records (resolved on demand from
     // `Group::bank`) and serve a decode request.
     harness.promoted(0, &[4, 5]);
     harness.request(&[4, 5]).complete().unwrap();
     assert_eq!(shared.life.ended(), None, "serving never tripped the no-blocking-allocation guard");
+}
+
+/// Regression test for F-048: a live bank growth whose slab-table repoint was
+/// queued on the device compute stream behind an already-running step
+/// (`ready_at = next_unbegun()`) must NOT hand the newly backed records to
+/// promotions or prompt seeds while that step is still running (otherwise the
+/// running step reads/writes `pool.absent` and leaves the newly claimed
+/// `SlabFill::Unwritten` granule containing raw VRAM garbage). Once the
+/// running step ends and `frontier` reaches `ready_at`, the pending records
+/// become free immediately and serve subsequent promotions and requests.
+#[test]
+fn device_repointed_bank_growth_waits_for_in_flight_step_before_serving() {
+    let harness = promoting("deferred-bank-repoint", 4, TIER);
+    harness.promoted(0, &[0, 1, 2, 3]);
+    let shared = harness.watcher.shared();
+    let evicted = shared
+        .shrink(Evicting::Bank, Candidates::one(2, vec![2]), None)
+        .unwrap()
+        .expect("shrink evicts two records");
+    let rejoined: Vec<usize> = evicted.records[0].iter().map(|&r| r as usize).collect();
+
+    // Begin a running step ahead of the simulated `moves::submit` table repoint
+    // and land fresh host-tier experts while it is in flight.
+    let running = harness.step();
+    harness.request_at(&running, 0, &[4, 5]);
+    let ready_at = shared.steps.next_unbegun();
+    assert!(ready_at > shared.steps.frontier(), "running step keeps frontier strictly below next_unbegun");
+
+    // Rejoin the evicted records with `ready_at`: counted immediately as backed
+    // storage, but kept `Record::Pending` so no promotion or seed takes them
+    // while `running` is still executing ahead of `moves::submit`.
+    shared.join(super::Join::Bank { records: vec![rejoined], ready_at });
+    shared.joins.wait_taken();
+    std::thread::sleep(std::time::Duration::from_millis(30));
+    assert_eq!(shared.costs().records, [4], "pending records count as backed storage");
+    assert_eq!(shared.held()[0].len(), 2, "pending records must not be promoted into while running step is in flight");
+
+    // Ending `running` advances `frontier` to `ready_at`, immediately releasing
+    // the pending records to `Record::Free` so promotions fill all 4 records.
+    running.complete().unwrap();
+    eventually("pending bank records promoted once running step ended", || shared.held()[0].len() == 4);
+    assert_eq!(shared.life.ended(), None);
 }

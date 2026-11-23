@@ -99,6 +99,14 @@ pub(super) enum Record {
         batch: Option<u64>,
         parity: u8,
     },
+    /// Backed by storage whose slab-table repoint was queued on the device
+    /// compute queue (`moves::submit`) behind already-submitted steps: no step
+    /// below `ready_at` may write (prompt seed `routed_copy`) or read
+    /// (`LinkMover` promotion) it, because its device table entry still points
+    /// at `pool.absent` until `moves::submit` runs. Drains to `Record::Free`
+    /// once `Steps::frontier() >= ready_at`, and stays cleanly evictable on a
+    /// shrink meanwhile.
+    Pending { ready_at: Step },
     /// A hole: the bank holds no storage for it, so nothing is placed in it
     /// until a growth backs it again.
     Absent,
@@ -144,7 +152,7 @@ struct Records {
 impl Records {
     fn new(count: usize) -> Self {
         let mut records = Self { contents: Vec::new(), free: Vec::new(), present: 0, lent: 0 };
-        records.grow(0..count);
+        records.grow(0..count, Record::Free);
         records
     }
 
@@ -170,8 +178,10 @@ impl Records {
         self.lent = self.lent + lent(content) - lent(old);
     }
 
-    /// Back `records`, each a hole or past every record: free from now.
-    fn grow(&mut self, records: impl IntoIterator<Item = usize>) {
+    /// Back `records`, each a hole or past every record, with `content`
+    /// (`Record::Free` or `Record::Pending`). Returns the backed record indices.
+    fn grow(&mut self, records: impl IntoIterator<Item = usize>, content: Record) -> Vec<usize> {
+        let mut added = Vec::new();
         for record in records {
             if record >= self.contents.len() {
                 // Past every record: holes up to it, which `set` then fills.
@@ -179,8 +189,10 @@ impl Records {
                 self.free.resize((record + 1).div_ceil(64), 0);
             }
             assert_eq!(self.contents[record], Record::Absent, "a growth backs record {record}, which the bank holds");
-            self.set(record, Record::Free);
+            self.set(record, content);
+            added.push(record);
         }
+        added
     }
 }
 
@@ -192,12 +204,14 @@ pub(super) struct BankRecords {
     /// The experts a promotion or a seed takes a record for: no second
     /// placement takes one, so an expert is in one record at most.
     placing: HashSet<Staged>,
-    /// The records promotions, releases, fills and opportunistic staging take,
-    /// (group, record), in the order they were taken.
+    /// The records promotions, releases, fills, opportunistic staging, and
+    /// device-repoint-pending growths take, (group, record), in the order they
+    /// were taken.
     promoting: Vec<(usize, usize)>,
     releasing: Vec<(usize, usize)>,
     filling: Vec<(usize, usize)>,
     staging: Vec<(usize, usize)>,
+    pending: Vec<(usize, usize)>,
     /// Whether a record was freed, or one a promotion could use was taken,
     /// since the promotions last asked ([`Self::take_changed`]).
     changed: bool,
@@ -264,6 +278,7 @@ impl BankRecords {
             releasing: Vec::new(),
             filling: Vec::new(),
             staging: Vec::new(),
+            pending: Vec::new(),
             changed: false,
             tier,
             stage_rings,
@@ -549,6 +564,7 @@ impl BankRecords {
     /// its entry was mapped for has passed its layer or ended
     /// (`Steps::served`), so no step reads it. Whether any was.
     pub fn drain(&mut self, progress: Point, steps: &super::watcher::Steps) -> bool {
+        let mut drained_any = self.drain_pending(steps.frontier());
         let (drained, releasing) = std::mem::take(&mut self.releasing).into_iter().partition::<Vec<_>, _>(|&(group, record)| {
             let Record::Releasing { layer, from, until, back } = self.groups[group].contents[record] else {
                 panic!("record {record} of group {group} is listed releasing");
@@ -556,6 +572,27 @@ impl BankRecords {
             back.is_none() && steps.served(from, until, layer, progress)
         });
         self.releasing = releasing;
+        for &(group, record) in &drained {
+            self.set(group, record, Record::Free);
+        }
+        drained_any |= !drained.is_empty();
+        drained_any
+    }
+
+    /// Promote any `Record::Pending` records whose device-ordered slab table
+    /// repoint (`ready_at`) is strictly ahead of every remaining running step
+    /// (`ready_at <= frontier`) into `Record::Free`.
+    pub fn drain_pending(&mut self, frontier: Step) -> bool {
+        if self.pending.is_empty() {
+            return false;
+        }
+        let (drained, pending) = std::mem::take(&mut self.pending).into_iter().partition::<Vec<_>, _>(|&(group, record)| {
+            let Record::Pending { ready_at } = self.groups[group].contents[record] else {
+                panic!("record {record} of group {group} is listed pending");
+            };
+            ready_at <= frontier
+        });
+        self.pending = pending;
         for &(group, record) in &drained {
             self.set(group, record, Record::Free);
         }
@@ -997,7 +1034,12 @@ impl BankRecords {
     /// writes or reads in place. Each with what it holds.
     pub fn evictable(&self, group: usize) -> impl Iterator<Item = (usize, Record)> + '_ {
         let lent = self.seeded_from(group);
-        self.groups[group].contents.iter().copied().enumerate().skip(lent).filter(|(_, content)| matches!(content, Record::Free | Record::Releasing { back: None, .. } | Record::Held(_)))
+        self.groups[group].contents.iter().copied().enumerate().skip(lent).filter(|(_, content)| {
+            matches!(
+                content,
+                Record::Pending { .. } | Record::Free | Record::Releasing { back: None, .. } | Record::Held(_)
+            )
+        })
     }
 
     /// Evict `records` of group `group` ([`Self::evictable`] each): holes
@@ -1015,6 +1057,10 @@ impl BankRecords {
             assert!(!self.is_stage_slot(group, record), "a shrink evicts staging ring record {record} of group {group}");
             match self.groups[group].contents[record] {
                 Record::Free => assert!(exit.is_none(), "a free record has no exit"),
+                Record::Pending { .. } => {
+                    assert!(exit.is_none(), "a pending record has no exit");
+                    self.pending.retain(|&taken| taken != (group, record));
+                }
                 Record::Releasing { back: None, .. } => {
                     assert!(exit.is_none(), "a releasing record's expert left already");
                     self.releasing.retain(|&taken| taken != (group, record));
@@ -1027,12 +1073,19 @@ impl BankRecords {
         evicted
     }
 
-    /// Back group `group`'s `records`, holes or past every record: free
-    /// from now.
-    pub fn grow(&mut self, group: usize, records: impl IntoIterator<Item = usize>) {
-        let before = self.groups[group].present;
-        self.groups[group].grow(records);
-        self.changed |= self.groups[group].present > before;
+    /// Back group `group`'s `records`, holes or past every record: free from
+    /// now when `ready_at == 0`, else `Record::Pending { ready_at }` until
+    /// `drain_pending(frontier)` observes `frontier >= ready_at`.
+    pub fn grow(&mut self, group: usize, records: impl IntoIterator<Item = usize>, ready_at: Step) {
+        let content = if ready_at == 0 { Record::Free } else { Record::Pending { ready_at } };
+        let added = self.groups[group].grow(records, content);
+        if ready_at == 0 {
+            self.changed |= !added.is_empty();
+        } else {
+            for record in added {
+                self.pending.push((group, record));
+            }
+        }
     }
 }
 
@@ -1244,7 +1297,7 @@ mod tests {
         assert_eq!((bank.held(0, 5), view.resolve(5, 9)), (Some(3), Some(3)), "the kept expert stays in its record");
         assert_eq!(bank.counts(), [3]);
         assert!(!bank.free(0).any(|record| record == 2), "a hole is never free");
-        bank.grow(0, [2, 5]);
+        bank.grow(0, [2, 5], 0);
         assert_eq!(bank.counts(), [5]);
         assert!(bank.free(0).any(|record| record == 2) && bank.free(0).any(|record| record == 5));
         assert_eq!(bank.records(0)[4], Record::Absent, "a growth past every record leaves the holes below it");
@@ -1266,7 +1319,30 @@ mod tests {
     #[should_panic(expected = "which the bank holds")]
     fn growing_a_held_record_panics() {
         let (mut bank, _) = bank();
-        bank.grow(0, [3]);
+        bank.grow(0, [3], 0);
+    }
+
+    /// Regression test for F-048: bank records grown with a device-ordered
+    /// slab-table repoint (`ready_at > 0`) stay `Record::Pending` (counted in
+    /// `counts()` and cleanly evictable on shrink, but invisible to `free()`,
+    /// seeding, and promotions) until `frontier >= ready_at`, so no step
+    /// submitted ahead of `moves::submit` can read or write `pool.absent`.
+    #[test]
+    fn pending_grown_records_wait_for_frontier_and_evict_cleanly() {
+        let (mut bank, _) = bank();
+        bank.grow(0, [4, 5], 7);
+        assert_eq!(bank.counts(), [6], "pending records count as backed storage");
+        assert!(!bank.free(0).any(|r| r == 4 || r == 5), "pending records are never free before ready_at");
+        assert!(bank.evictable(0).any(|(r, _)| r == 4), "pending records remain evictable on shrink");
+        assert!(!bank.drain_pending(6), "frontier 6 < ready_at 7 must not release pending records");
+        // Shrinking one pending record removes it cleanly without panicking.
+        assert!(bank.evict(0, &[4], |_| UnmapStep::at(7), vec![None]).is_empty());
+        assert_eq!(bank.counts(), [5]);
+        assert_eq!(bank.records(0)[4], Record::Absent);
+        // Once frontier reaches ready_at, remaining pending records become free.
+        assert!(bank.drain_pending(7));
+        assert!(bank.free(0).any(|r| r == 5), "record 5 becomes free once frontier reaches ready_at");
+        assert!(!bank.drain_pending(8));
     }
 
     /// `Record::Staging` lives in a dedicated even/odd double-buffered ring in

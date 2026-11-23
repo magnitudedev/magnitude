@@ -1742,9 +1742,9 @@ impl Directory {
     /// Back group `group`'s host `records`, holes or past every record:
     /// ready from now, the ranking's pool too where the tier is the one
     /// store.
-    pub fn grow_host(&mut self, group: usize, records: Vec<u32>) {
+    pub fn grow_host(&mut self, group: usize, records: Vec<u32>, ready_at: Step) {
         let before = self.host[group].records();
-        self.host[group].grow(records);
+        self.host[group].grow(records, ready_at);
         self.resize_pool(group);
         if self.host[group].records() != before {
             self.resized(group, self.host_tier());
@@ -2419,14 +2419,14 @@ impl Directory {
         let (mut idle, mut held) = (Vec::new(), Vec::new());
         for (record, content) in self.bank.evictable(group) {
             match content {
-                Record::Free => idle.push((0, record)),
+                Record::Pending { .. } | Record::Free => idle.push((0, record)),
                 Record::Releasing { .. } => idle.push((1, record)),
                 Record::Held((layer, expert)) => {
                     if !(skip_protected && self.is_layer_whole_published(layer)) {
                         held.push((layer, expert, last_read(layer, expert), record));
                     }
                 }
-                _ => unreachable!("an evictable record is free, releasing or held"),
+                _ => unreachable!("an evictable record is pending, free, releasing or held"),
             }
         }
         idle.sort_unstable();
@@ -2512,15 +2512,26 @@ impl Directory {
         }
     }
 
-    /// Back group `group`'s `records`, holes or past every record: free
-    /// from now.
-    pub fn grow(&mut self, group: usize, records: Vec<usize>) {
+    /// Back group `group`'s `records`, holes or past every record: free from
+    /// now when `ready_at == 0`, else `Record::Pending { ready_at }` until
+    /// `drain_pending(frontier)` observes `frontier >= ready_at`.
+    pub fn grow(&mut self, group: usize, records: Vec<usize>, ready_at: Step) {
         let before = self.bank.counts()[group];
-        self.bank.grow(group, records);
+        self.bank.grow(group, records, ready_at);
         self.resize_pool(group);
         if self.bank.counts()[group] != before {
             self.resized(group, Tier::COMPUTE);
         }
+    }
+
+    /// Release any bank or host records whose device-ordered slab table repoint
+    /// is ahead of every remaining running step (`ready_at <= frontier`).
+    pub fn drain_pending(&mut self, frontier: Step) -> bool {
+        let mut drained = self.bank.drain_pending(frontier);
+        for host in &mut self.host {
+            drained |= host.drain_pending(frontier);
+        }
+        drained
     }
 }
 

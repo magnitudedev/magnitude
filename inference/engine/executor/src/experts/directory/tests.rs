@@ -336,7 +336,7 @@ fn a_shrink_keeps_the_most_recent_experts_where_they_are() {
     assert_eq!((directory.held(0, 1), directory.held(1, 1)), (None, None));
     assert_eq!(directory.records()[0], 2);
     assert_eq!(directory.evictions(0, 2, |layer, expert| reads[layer][expert]), Vec::<usize>::new(), "at its target it evicts nothing");
-    directory.grow(0, vec![1, 3]);
+    directory.grow(0, vec![1, 3], 0);
     assert_eq!(directory.records()[0], 4);
     let placed = directory.place(at(2, 0), prompt_of(at(2, 0)), 0, &[0], &[4, 5], |_| 9).unwrap();
     assert_eq!(placed.records, [BankRecord(1), BankRecord(3)], "the regrown records are free");
@@ -798,7 +798,7 @@ fn a_grown_bank_beside_a_full_tier_leaves_the_rest_to_the_file() {
     // The device promotes 1 and 3 into the bank; 0 and 2 stay alone.
     directory.place(at(2, 0), prompt_of(at(2, 0)), 0, &[], &[1, 3], |_| 0).unwrap();
     directory.retired(past(2), |_, _| 2, |_| Ending::Ended);
-    directory.grow(0, vec![2]);
+    directory.grow(0, vec![2], 0);
     let (experts, slots) = (4, directory.records()[0]);
     let (held, alone) = (directory.held_count(0), directory.alone(0));
     assert_eq!((slots, held, alone), (3, 2, 2));

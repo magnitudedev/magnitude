@@ -1012,6 +1012,17 @@ impl Steps {
         self.frontier.load(Ordering::Acquire)
     }
 
+    /// The first step not yet begun (`last + 1`), read under the steps' lock.
+    /// When a background growth queues a device-ordered slab table repoint
+    /// (`moves::submit`) on the compute queue and reads `next_unbegun()`
+    /// immediately afterwards, every step `< ready_at` may have been submitted
+    /// ahead of the repoint while every step `>= ready_at` is guaranteed to
+    /// begin and submit after it; once `frontier() >= ready_at`, no running
+    /// step can observe the stale `pool.absent` table entry.
+    pub(in crate::experts) fn next_unbegun(&self) -> Step {
+        self.lock().last + 1
+    }
+
     /// Whether step `step` has ended, by whichever exit: below the
     /// frontier, or above it and ended out of order.
     pub(in crate::experts) fn ended(&self, step: Step) -> bool {

@@ -11,7 +11,7 @@
 //! watcher's telemetry reads.
 
 use super::Shared;
-use super::steps::{ScratchGroup, UnmapStep};
+use super::steps::{ScratchGroup, Step, UnmapStep};
 use super::core::PlacedWords;
 use super::residency::Residency;
 use super::telemetry::GroupReadWords;
@@ -89,14 +89,17 @@ pub(super) enum Ask {
 /// its holding.
 pub(crate) enum Join {
     /// Each group of the bank holds `records` more, beside a host tier
-    /// (holes or past every record): the directory takes them, free, and
+    /// (holes or past every record): the directory takes them, free when
+    /// `ready_at == 0` or `Pending { ready_at }` when their slab-table repoint
+    /// was queued behind in-flight device steps (`moves::submit`), and
     /// promotions resolve their views on demand via `Group::bank`.
-    Bank { records: Vec<Vec<usize>> },
+    Bank { records: Vec<Vec<usize>>, ready_at: Step },
     /// Each group's records the host lands into (its host tier's, or the
     /// one store's where the host places) hold `records` more, addressed by
     /// `views` (each group's record tensors' records the store holds now):
-    /// the directory takes them, ready.
-    Landed { records: Vec<Vec<u32>>, views: Vec<Vec<Records>> },
+    /// the directory takes them, ready when `ready_at == 0` or `Pending`
+    /// until `Steps::frontier() >= ready_at`.
+    Landed { records: Vec<Vec<u32>>, views: Vec<Vec<Records>>, ready_at: Step },
 }
 
 /// The slots a running growth has joined, in order, until the watcher
@@ -252,6 +255,13 @@ impl Shared {
         self.events().notify();
     }
 
+    /// The first step not yet begun (`Steps::next_unbegun`), used by background
+    /// bank/host growth to fence device-ordered slab table repoints behind
+    /// already-submitted steps.
+    pub(in crate::experts) fn next_unbegun(&self) -> Step {
+        self.steps.next_unbegun()
+    }
+
     /// The bank holds `words` for the places a group holds from now,
     /// between flights (`ExpertBank::hold_places`): every step retired, the
     /// watcher serves each place's scratch requests and the telemetry reads
@@ -350,12 +360,12 @@ impl Residency {
         let mut coalesced: Vec<Join> = Vec::new();
         for join in joins {
             match (coalesced.last_mut(), join) {
-                (Some(Join::Bank { records: acc }), Join::Bank { records }) => {
+                (Some(Join::Bank { records: acc, ready_at: acc_ready }), Join::Bank { records, ready_at }) if *acc_ready == ready_at => {
                     for (dst, src) in acc.iter_mut().zip(records) {
                         dst.extend(src);
                     }
                 }
-                (Some(Join::Landed { records: acc, views: acc_views }), Join::Landed { records, views }) => {
+                (Some(Join::Landed { records: acc, views: acc_views, ready_at: acc_ready }), Join::Landed { records, views, ready_at }) if *acc_ready == ready_at => {
                     for (dst, src) in acc.iter_mut().zip(records) {
                         dst.extend(src);
                     }
@@ -367,20 +377,21 @@ impl Residency {
         }
         for join in coalesced {
             match join {
-                Join::Bank { records } => {
+                Join::Bank { records, ready_at } => {
                     for (group, records) in records.into_iter().enumerate() {
-                        self.core.directory.grow(group, records);
+                        self.core.directory.grow(group, records, ready_at);
                     }
                 }
-                Join::Landed { records, views } => {
+                Join::Landed { records, views, ready_at } => {
                     for (group, records) in records.into_iter().enumerate() {
-                        self.core.directory.grow_host(group, records);
+                        self.core.directory.grow_host(group, records, ready_at);
                     }
                     self.address_tier(views);
                 }
             }
         }
         if count > 0 {
+            self.core.directory.drain_pending(self.shared.steps.frontier());
             self.owed.joined += count;
         }
         count > 0

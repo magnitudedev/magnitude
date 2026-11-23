@@ -419,6 +419,12 @@ enum Host {
     /// the file rather than waiting on the transfer queue (which CUDA may
     /// hold behind the parked step).
     WritingBack { staged: Staged },
+    /// Backed by storage whose slab-table repoint was queued on the device
+    /// compute queue (`moves::submit`) behind already-submitted steps: held
+    /// out of `ready` until `Steps::frontier() >= ready_at` so no earlier step
+    /// reads stale `pool.absent`, while staying counted in `present` and
+    /// cleanly evictable on a shrink.
+    Pending { ready_at: Step },
     /// A hole: the store holds no storage for it, so nothing lands in it
     /// until a growth backs it again ([`HostRecords::grow`]).
     Absent,
@@ -471,6 +477,7 @@ pub(super) struct HostRecords {
     /// keeps or lands, per layer the experts held alone and the experts
     /// kept, answering, landing or seeding, and the records claimed.
     ready: BTreeSet<u32>,
+    pending: Vec<u32>,
     graced: Vec<u32>,
     banked: BTreeSet<u32>,
     answering: Vec<u32>,
@@ -554,6 +561,7 @@ impl HostRecords {
         let mut host = Self {
             records: Vec::new(),
             ready: BTreeSet::new(),
+            pending: Vec::new(),
             graced: Vec::new(),
             banked: BTreeSet::new(),
             answering: Vec::new(),
@@ -579,7 +587,7 @@ impl HostRecords {
             protected_layers: Arc::from([]),
         };
         assert!(lent <= records, "a tier lends {lent} of its {records} records");
-        host.grow(0..records);
+        host.grow(0..records, 0);
         host
     }
 
@@ -640,6 +648,7 @@ impl HostRecords {
                 }
             }
             Host::Graced { .. } => self.graced.retain(|&graced| graced != record),
+            Host::Pending { .. } => self.pending.retain(|&pending| pending != record),
             Host::Claimed => self.claimed -= 1,
             Host::Seeding { staged } | Host::WritingBack { staged } => self.holding[staged.0] -= 1,
             Host::Absent => self.present += 1,
@@ -666,6 +675,7 @@ impl HostRecords {
                 }
             }
             Host::Graced { .. } => self.graced.push(record),
+            Host::Pending { .. } => self.pending.push(record),
             Host::Claimed => self.claimed += 1,
             Host::Seeding { staged } | Host::WritingBack { staged } => self.holding[staged.0] += 1,
             Host::Absent => self.present -= 1,
@@ -855,16 +865,38 @@ impl HostRecords {
         self.holdings
     }
 
-    /// Back `records`, each a hole or past every record: ready from now.
-    pub fn grow(&mut self, records: impl IntoIterator<Item = u32>) {
+    /// Back `records`, each a hole or past every record: ready from now when
+    /// `ready_at == 0`, else `Host::Pending { ready_at }` until
+    /// [`Self::drain_pending`] observes `frontier >= ready_at`.
+    pub fn grow(&mut self, records: impl IntoIterator<Item = u32>, ready_at: Step) {
+        let content = if ready_at == 0 { Host::Ready } else { Host::Pending { ready_at } };
         for record in records {
             if record >= self.extent() {
                 // Past every record: holes up to it, which `set` fills.
                 self.records.resize(record as usize + 1, Host::Absent);
             }
             assert_eq!(self.records[record as usize], Host::Absent, "a growth backs record {record}, which the store holds");
+            self.set(record, content);
+        }
+    }
+
+    /// Release any `Host::Pending` records whose device-ordered slab table
+    /// repoint is ahead of every remaining running step (`ready_at <= frontier`)
+    /// into `Host::Ready`.
+    pub fn drain_pending(&mut self, frontier: Step) -> bool {
+        if self.pending.is_empty() {
+            return false;
+        }
+        let drained: Vec<u32> = self
+            .pending
+            .iter()
+            .copied()
+            .filter(|&record| matches!(self.records[record as usize], Host::Pending { ready_at } if ready_at <= frontier))
+            .collect();
+        for &record in &drained {
             self.set(record, Host::Ready);
         }
+        !drained.is_empty()
     }
 
     /// Kept record `record`'s place in the taking order at `rank`; none for
@@ -1805,7 +1837,8 @@ impl HostRecords {
                 | Host::Graced { .. }
                 | Host::Landing { .. }
                 | Host::Seeding { .. }
-                | Host::WritingBack { .. } => {}
+                | Host::WritingBack { .. }
+                | Host::Pending { .. } => {}
                 Host::Absent => unreachable!("lent record {record} is a hole: the floor holds every lent record"),
             }
         }
@@ -1926,7 +1959,14 @@ impl HostRecords {
         let kept = self.taking_order(&rank, false, None, |record| {
             record >= self.lent && self.unheld(record) && !(skip_protected && self.layer_protected(record))
         });
-        self.ready.iter().copied().filter(past_lent).chain(graced).chain(kept).collect()
+        self.pending
+            .iter()
+            .copied()
+            .filter(past_lent)
+            .chain(self.ready.iter().copied().filter(past_lent))
+            .chain(graced)
+            .chain(kept)
+            .collect()
     }
 
     /// Evict `records` ([`Self::evictable`] each): holes from now, nothing
@@ -1942,7 +1982,7 @@ impl HostRecords {
         for &record in records {
             assert!(record >= self.lent, "a shrink evicts lent record {record}");
             match self.records[record as usize] {
-                Host::Ready => {}
+                Host::Ready | Host::Pending { .. } => {}
                 Host::Kept(Whole { staged, holds: 0, .. }) | Host::Graced { whole: Whole { staged, .. }, answer: None, .. } => {
                     self.unmap_from(staged, record, until(staged));
                 }
@@ -2303,7 +2343,7 @@ mod tests {
         // is one record.
         let evicted = tier.evictable(&rank)[0];
         tier.evict(&[evicted], |_| None);
-        tier.grow([evicted]);
+        tier.grow([evicted], 0);
         assert_eq!((tier.lacked(), tier.ready()), (1, 1));
         assert!(!refill(&mut tier, 2, &rank, &Unbegun::at(1)), "one record ready covers the one lacked");
         let lacked = (0..3).map(|expert| (0, expert)).find(|&staged| tier.located(staged) == Located::Lacked).expect("one lacked");
@@ -2566,9 +2606,17 @@ mod tests {
         assert_eq!([10, 11, 13].map(|expert| maps.held((0, expert))), [Some(3), None, Some(0)], "the kept stay where their bytes are");
         assert_eq!(tier.alone(), [2]);
         assert_eq!(tier.take((0, 12), 0), None, "a hole is never ready");
-        tier.grow([1]);
+        tier.grow([1], 0);
         assert_eq!(tier.records(), 3);
         assert_eq!(tier.take((0, 12), 0), Some(1), "the grown record is ready");
+        // Pending host growth stays out of `ready` until frontier >= ready_at
+        // and remains cleanly evictable meanwhile.
+        tier.grow([2], 5);
+        assert_eq!(tier.records(), 4);
+        assert_eq!(tier.take((0, 11), 0), None, "pending record must not be claimed before ready_at");
+        assert!(!tier.drain_pending(4));
+        assert!(tier.drain_pending(5));
+        assert_eq!(tier.take((0, 11), 0), Some(2), "pending record becomes ready once frontier reaches ready_at");
     }
 
     /// A shrink never evicts a record in flight: a landing's record and one

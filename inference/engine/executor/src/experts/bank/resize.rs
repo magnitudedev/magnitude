@@ -123,6 +123,12 @@ impl Stores {
         self.group(group).backed_count() as u64
     }
 
+    /// Count of device-ordered table repoints (`moves::submit`) submitted for
+    /// group `group`'s slab store so far.
+    pub(super) fn device_repoints(&self, group: usize) -> u64 {
+        self.group(group).device_repoints()
+    }
+
     /// What the pool charges the records: whole blocks (`BlockSize::charge`)
     /// holding a granule for each record beyond the lent ones (the same
     /// formula as `ExpertBankPlan::resident_charge` and `host_charge`).
@@ -437,7 +443,7 @@ pub(super) fn grow_by_slots<S>(
     stop: &AtomicBool,
     begin: impl Fn() -> Option<S>,
 ) -> Grown {
-    grow_by_slots_gated(stores, (from, to), records, joining, changes, post, (slots, rises, None), stop, begin, None)
+    grow_by_slots_gated(stores, (from, to), records, joining, changes, post, (slots, rises, None), stop, begin, None, || 0)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -452,6 +458,7 @@ fn grow_by_slots_gated<S>(
     stop: &AtomicBool,
     begin: impl Fn() -> Option<S>,
     can_allocate: Option<&dyn Fn(u64) -> bool>,
+    next_unbegun: impl Fn() -> crate::experts::watcher::Step,
 ) -> Grown {
     let groups = stores.groups.len();
     let mut reached = from;
@@ -490,9 +497,14 @@ fn grow_by_slots_gated<S>(
             };
             changes.back(|_| {
                 let mut claimed: Vec<Vec<usize>> = Vec::with_capacity(groups);
+                let mut deferred = false;
                 for group in 0..groups {
+                    let before = stores.device_repoints(group);
                     match stores.claim_to(group, records(group, at)) {
-                        Ok(records) => claimed.push(records),
+                        Ok(records) => {
+                            deferred |= stores.device_repoints(group) != before;
+                            claimed.push(records);
+                        }
                         Err(refusal) => {
                             // The slot joins nothing: what its groups claimed
                             // before returns at once, never read.
@@ -503,17 +515,22 @@ fn grow_by_slots_gated<S>(
                         }
                     }
                 }
-                Ok(claimed)
+                Ok((claimed, deferred))
             })
         };
-        let claimed = match claimed {
+        let (claimed, deferred) = match claimed {
             Ok(claimed) => claimed,
             Err(refusal) => return Grown { at: reached, joined, cut: Cut::Refused(refusal), spent },
         };
+        // If any group repointed its slab table via `moves::submit` on the
+        // device compute queue, already-submitted steps (`< ready_at`) run
+        // ahead of that repoint and still see `pool.absent`; hold the new
+        // records `Pending { ready_at }` until `Steps::frontier() >= ready_at`.
+        let ready_at = if deferred { next_unbegun() } else { 0 };
         let joining_at = Instant::now();
         spent.claim += joining_at - claiming;
         let join = match &views {
-            None => Join::Bank { records: claimed },
+            None => Join::Bank { records: claimed, ready_at },
             Some(views) => {
                 let records = claimed
                     .iter()
@@ -522,7 +539,7 @@ fn grow_by_slots_gated<S>(
                     })
                     .collect::<Result<Vec<_>, _>>();
                 match records {
-                    Ok(records) => Join::Landed { records, views: views.clone() },
+                    Ok(records) => Join::Landed { records, views: views.clone(), ready_at },
                     Err(reason) => return Grown { at: reached, joined, cut: Cut::Unjoined(reason), spent },
                 }
             }
@@ -773,6 +790,7 @@ impl ExpertBank {
                 &stopping,
                 slot,
                 guard,
+                || shared.next_unbegun(),
             )
         });
         Growing { from, charged, decided, stop, done }

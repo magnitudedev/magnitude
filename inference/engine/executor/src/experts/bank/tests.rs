@@ -51,7 +51,7 @@ fn a_growth_joins_each_slot_as_every_group_holds_it() {
         Joining::Bank,
         &changes,
         |join| {
-            let Join::Bank { records } = join else { panic!("a bank's join") };
+            let Join::Bank { records, .. } = join else { panic!("a bank's join") };
             let at = records[0][0] as u64 + 1;
             assert_eq!(records, vec![vec![at as usize - 1]; 2], "each group claims the slot's record in its lowest hole");
             assert!((0..2).all(|group| stores.present(group) >= at), "slot {at} joined before every group holds it");

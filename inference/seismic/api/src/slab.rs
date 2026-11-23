@@ -225,6 +225,12 @@ impl SlabTensor {
         self.store.add_slabs(count, fill)
     }
 
+    /// Count of device-ordered table repoints (`moves::submit`) submitted for
+    /// this store so far.
+    pub fn device_repoints(&self) -> u64 {
+        self.store.device_repoints()
+    }
+
     /// Free slot `index`: its table entries name the pool's zero slab from
     /// now, and its granule returns to the pool once no view of it remains
     /// and the device work submitted by then completes, so work in flight
