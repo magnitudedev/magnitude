@@ -41,7 +41,7 @@ use magnitude_service_contracts::{
 use magnitude_service_models::candidate_files::{
     CandidateFileRole, CandidateGguf, GgufGroup, RecognizedArchitectures, display_name,
     base_model_repositories, group_ggufs, header_inspection,
-    hugging_face_repository_from_url, is_q4_k_class, local_directory, version_label,
+    hugging_face_repository_from_url, is_q4_k_class, local_directory, split_shard, version_label,
 };
 use magnitude_service_models::developers::DeveloperEvidence;
 use magnitude_service_models::lineage::{
@@ -5185,11 +5185,38 @@ fn working_context(profile: &ServingProfile, served: &ServingProfile) -> bool {
     served.context_length >= profile.context_length.min(WORKING_CONTEXT)
 }
 
+fn stem_without_shard(path: &Path) -> String {
+    if let Some((prefix, _, _)) = split_shard(path) {
+        return prefix;
+    }
+    path.file_stem()
+        .and_then(|stem| stem.to_str())
+        .unwrap_or_default()
+        .to_owned()
+}
+
+fn path_without_shard(path: &Path) -> String {
+    if let Some((prefix, _, _)) = split_shard(path) {
+        let extension = path
+            .extension()
+            .and_then(|ext| ext.to_str())
+            .unwrap_or("gguf");
+        let file = format!("{prefix}.{extension}");
+        let stripped = match path.parent() {
+            Some(parent) if !parent.as_os_str().is_empty() => parent.join(file),
+            _ => PathBuf::from(file),
+        };
+        return path_string(&stripped);
+    }
+    path_string(path)
+}
+
 /// Each version's label, distinct among its candidate's: its quantization label (see
 /// `version_label`); among versions sharing one, `· MTP` for those whose header carries built-in
 /// prediction heads; then the quantization each file's name spells, where those differ; then the
 /// name words that tell them apart (those not every one of them has, `· QAD` for `…-QAD-Q4_0`
-/// beside `…-Q4_0`); and the file path only when even those don't.
+/// beside `…-Q4_0`, ignoring GGUF multi-shard suffixes); and the file path only when even those
+/// don't.
 fn distinct_labels(versions: &[(&GgufGroup, Option<&str>, bool)]) -> Vec<String> {
     fn duplicated(labels: &[String]) -> BTreeMap<String, Vec<usize>> {
         let mut by_label = BTreeMap::<String, Vec<usize>>::new();
@@ -5227,7 +5254,7 @@ fn distinct_labels(versions: &[(&GgufGroup, Option<&str>, bool)]) -> Vec<String>
         }
     }
     let words = |index: usize| {
-        let name = versions[index].0.primary().path.file_stem().and_then(|stem| stem.to_str()).unwrap_or_default().to_owned();
+        let name = stem_without_shard(&versions[index].0.primary().path);
         name.split(['-', '.'])
             .filter(|word| !word.is_empty())
             .map(str::to_owned)
@@ -5247,6 +5274,11 @@ fn distinct_labels(versions: &[(&GgufGroup, Option<&str>, bool)]) -> Vec<String>
             if !distinct.is_empty() {
                 labels[index] = format!("{} · {}", labels[index], distinct.join("-"));
             }
+        }
+    }
+    for indices in duplicated(&labels).into_values() {
+        for index in indices {
+            labels[index] = path_without_shard(&versions[index].0.primary().path);
         }
     }
     for indices in duplicated(&labels).into_values() {
@@ -5610,6 +5642,57 @@ mod tests {
             distinct_labels(&[(&gemma[0], Some("Q8_0"), false), (&gemma[1], Some("Q8_0"), false)]),
             ["Q8_0", "UD-Q8_K_XL"],
             "one header label over two spelled quantizations takes each name's spelling"
+        );
+        let sharded_words = [
+            group("Model-Q4_K_M-00001-of-00002.gguf"),
+            group("Model-QAD-Q4_K_M-00001-of-00003.gguf"),
+        ];
+        assert_eq!(
+            distinct_labels(&[
+                (&sharded_words[0], Some("Q4_K_M"), false),
+                (&sharded_words[1], Some("Q4_K_M"), false),
+            ]),
+            ["Q4_K_M", "Q4_K_M · QAD"],
+            "multi-shard suffixes are stripped before splitting stems"
+        );
+        let mixed_sharded = [
+            group("Model-Q4_K_M.gguf"),
+            group("Model-QAD-Q4_K_M-00001-of-00002.gguf"),
+        ];
+        assert_eq!(
+            distinct_labels(&[
+                (&mixed_sharded[0], Some("Q4_K_M"), false),
+                (&mixed_sharded[1], Some("Q4_K_M"), false),
+            ]),
+            ["Q4_K_M", "Q4_K_M · QAD"],
+            "a sharded sibling beside an unsharded file never leaks 00001-of-0000N into its label"
+        );
+        let sharded_paths = [
+            group("a/Model-Q4_K_M-00001-of-00002.gguf"),
+            group("b/Model-Q4_K_M-00001-of-00003.gguf"),
+        ];
+        assert_eq!(
+            distinct_labels(&[
+                (&sharded_paths[0], Some("Q4_K_M"), false),
+                (&sharded_paths[1], Some("Q4_K_M"), false),
+            ]),
+            ["a/Model-Q4_K_M.gguf", "b/Model-Q4_K_M.gguf"],
+            "path fallback strips shard suffixes when directories already disambiguate"
+        );
+        let same_dir_sharded = [
+            group("Model-Q4_K_M-00001-of-00002.gguf"),
+            group("Model-Q4_K_M-00001-of-00003.gguf"),
+        ];
+        assert_eq!(
+            distinct_labels(&[
+                (&same_dir_sharded[0], Some("Q4_K_M"), false),
+                (&same_dir_sharded[1], Some("Q4_K_M"), false),
+            ]),
+            [
+                "Model-Q4_K_M-00001-of-00002.gguf",
+                "Model-Q4_K_M-00001-of-00003.gguf",
+            ],
+            "same-directory collisions that differ only by shard count retain the full path so labels stay distinct"
         );
     }
 
