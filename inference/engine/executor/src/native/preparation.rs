@@ -1838,15 +1838,19 @@ impl<'a> Preparation<'a> {
             })
         };
         let hidden = PooledProjectInput::Hidden { hidden: shape.widths.hidden };
-        let query_project = project(
-            self,
-            elements.query_project,
-            WeightKind::IndexerQuery,
-            match elements.query_rank {
-                None => hidden,
-                Some(rank) => PooledProjectInput::QueryRank { rank },
-            },
-        )?;
+        let query_project = match elements.query_project {
+            None => Some(None),
+            Some(query_elements) => project(
+                self,
+                query_elements,
+                WeightKind::IndexerQuery,
+                match elements.query_rank {
+                    None => hidden,
+                    Some(rank) => PooledProjectInput::QueryRank { rank },
+                },
+            )?
+            .map(Some),
+        };
         let weights_project = match elements.weights_project {
             None => Some(None),
             Some(elements) => project(self, elements, WeightKind::IndexerHeadWeights, hidden)?.map(Some),
@@ -1904,19 +1908,25 @@ impl<'a> Preparation<'a> {
         let activation = binding.activation;
         let (keys, index) = (selection.keys, selection.indexer);
         let pairs = shape.widths.rotary_pairs;
-        let project = self.projection(PooledProjectTuning {
-            elements: crate::operators::attention::pooled::tokens_project(
-                activation,
-                binding.norm,
-                keys.projection,
-                keys.gate,
-                Pooling::Grouped,
-            ),
-            segments: [Some(WeightKind::IndexerKey), keys.gate.map(|_| WeightKind::IndexerKeyGate)],
-            input: PooledProjectInput::Hidden { hidden: shape.widths.hidden },
-            scopes: scopes.to_vec(),
-            epsilon: self.epsilon,
-        })?;
+        let fused = binding.fuses_selection_projections();
+        let project = if fused {
+            Some(None)
+        } else {
+            self.projection(PooledProjectTuning {
+                elements: crate::operators::attention::pooled::tokens_project(
+                    activation,
+                    binding.norm,
+                    keys.projection,
+                    keys.gate,
+                    Pooling::Grouped,
+                ),
+                segments: [Some(WeightKind::IndexerKey), keys.gate.map(|_| WeightKind::IndexerKeyGate)],
+                input: PooledProjectInput::Hidden { hidden: shape.widths.hidden },
+                scopes: scopes.to_vec(),
+                epsilon: self.epsilon,
+            })?
+            .map(Some)
+        };
         let pool = fixed!(
             self.spec,
             pool_rows,
@@ -1936,7 +1946,11 @@ impl<'a> Preparation<'a> {
         );
         let indexer = self.indexer(
             binding,
-            crate::operators::attention::selection::IndexerElements::of(binding, index),
+            crate::operators::attention::selection::IndexerElements::of(
+                binding,
+                index,
+                fused && !binding.key_value_only,
+            ),
             scopes,
         )?;
         let reads = fixed!(self.spec, unit_reads, format!("{selection:?}"));

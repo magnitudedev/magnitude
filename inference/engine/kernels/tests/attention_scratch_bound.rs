@@ -43,7 +43,15 @@ const V41_MIX: [(&str, u64); 15] = [
 /// its head geometry with projected values.
 fn v41_statics(entry: &str) -> Vec<(&'static str, u64)> {
     match entry {
-        "attention_project" => vec![("D", 4096), ("Q", 64 * 512), ("GR", 0), ("K", 512), ("V", 0)],
+        "attention_project" => vec![
+            ("D", 4096),
+            ("Q", 64 * 512),
+            ("GR", 0),
+            ("K", 512),
+            ("V", 0),
+            ("IQ", 0),
+            ("IK", 0),
+        ],
         "attention_output" => vec![("D", 4096), ("Q", 64), ("W", 512)],
         entry if entry.ends_with("_k8v4") => V41_MIX
             .iter()

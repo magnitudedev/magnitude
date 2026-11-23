@@ -149,8 +149,8 @@ pub(crate) struct PickedElements {
 /// and its pooling, which names its pooling entry ([`PoolEntry`]).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub(crate) struct PooledElements {
-    pub project: [(&'static str, Element); 7],
-    pub key_project: [(&'static str, Element); 7],
+    pub project: [(&'static str, Element); 10],
+    pub key_project: [(&'static str, Element); 10],
     pub pooling: Pooling,
 }
 
@@ -162,7 +162,7 @@ impl PickedElements {
         let indexer = picked.indexer()?;
         let activation = binding.activation;
         Some(Self {
-            indexer: IndexerElements::of(binding, indexer),
+            indexer: IndexerElements::of(binding, indexer, false),
             rows: match picked {
                 // A mean or identity pool's absent gate segment binds a
                 // zero-row view of the projection, at its element (as
@@ -203,18 +203,22 @@ pub(crate) fn tokens_project(
     projection: Element,
     gate: Option<Element>,
     pooling: Pooling,
-) -> [(&'static str, Element); 7] {
+) -> [(&'static str, Element); 10] {
+    let published = match pooling {
+        Pooling::Grouped => Element::f32(),
+        Pooling::Identity => activation,
+    };
     [
         ("NW", norm),
         ("QW", projection),
         ("GW", gate.unwrap_or(projection)),
         ("KW", projection),
         ("VW", projection),
+        ("IQW", projection),
+        ("IKW", projection),
         ("A", activation),
-        ("Y", match pooling {
-            Pooling::Grouped => Element::f32(),
-            Pooling::Identity => activation,
-        }),
+        ("Y", published),
+        ("IY", published),
     ]
 }
 
@@ -457,6 +461,8 @@ fn own_rows<'a, G: GraphDraft + 'a>(
                 ("GR", gate_rows.clone()),
                 ("K", Dim::from(0)),
                 ("V", Dim::from(0)),
+                ("IQ", Dim::from(0)),
+                ("IK", Dim::from(0)),
                 ("QS", projection.scale.extent.clone()),
                 ("GS", operand(gate_operands.map(|operands| &operands.scale.extent))),
                 ("KS", Dim::from(0)),
@@ -480,6 +486,8 @@ fn own_rows<'a, G: GraphDraft + 'a>(
             },
             key_weight: (&empty).into(),
             value_weight: (&empty).into(),
+            indexer_query_weight: (&empty).into(),
+            indexer_key_weight: (&empty).into(),
             epsilon: inputs.epsilon,
             project_mode: 0.into(),
             query_scale: (&projection.scale.tensor).into(),
@@ -919,6 +927,7 @@ pub(crate) fn picked<'a, G: GraphDraft + 'a>(
                 norm: inputs.qr_norm,
                 epsilon: inputs.qr_epsilon,
             },
+            preprojected_query: None,
             query_norm: query_norm.as_ref(),
             head_weights,
             write,

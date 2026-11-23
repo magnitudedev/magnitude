@@ -1482,13 +1482,15 @@ fn attention_project_statics(
     kv: usize,
     g: usize,
     w: usize,
-) -> [(&'static str, usize); 5] {
+) -> [(&'static str, usize); 7] {
     [
         ("D", d),
         ("Q", kv * g * 2 * w),
         ("GR", 0),
         ("K", kv * w),
         ("V", kv * w),
+        ("IQ", 0),
+        ("IK", 0),
     ]
 }
 
@@ -2153,8 +2155,11 @@ fn metal_attention_project_matrix_gemv_matches_the_batched_rows() {
                         ("GW", Element::bf16()),
                         ("KW", element),
                         ("VW", element),
+                        ("IQW", Element::bf16()),
+                        ("IKW", Element::bf16()),
                         ("A", act.element()),
                         ("Y", act.element()),
+                        ("IY", act.element()),
                     ];
                     let specialization =
                         attention_project_specialization_on(&device, &attention_project_statics(d, kv, g, w), mapping);
@@ -2183,8 +2188,11 @@ fn metal_attention_project_matrix_gemv_matches_the_batched_rows() {
                             GW: Element::bf16(),
                             KW: element,
                             VW: element,
+                            IQW: Element::bf16(),
+                            IKW: Element::bf16(),
                             A: act.element(),
                             Y: act.element(),
+                            IY: act.element(),
                         }),
                         &specialization,
                     )
@@ -2196,6 +2204,8 @@ fn metal_attention_project_matrix_gemv_matches_the_batched_rows() {
                         gate_weight: &act_tensor(&device, Act::Bf16, &[0, d], &[]),
                         key_weight: &weights[1].tensor(&device),
                         value_weight: &weights[2].tensor(&device),
+                        indexer_query_weight: &act_tensor(&device, Act::Bf16, &[0, d], &[]),
+                        indexer_key_weight: &act_tensor(&device, Act::Bf16, &[0, d], &[]),
                         epsilon: 1e-6,
                         project_mode,
                         query_scale: &no_scale(&device),
@@ -2283,8 +2293,11 @@ fn metal_tall_segmented_projections_are_bit_identical_to_the_staged_tiles() {
                     GW: Element::bf16(),
                     KW: reprs[1].resident(&device),
                     VW: reprs[2].resident(&device),
+                    IQW: Element::bf16(),
+                    IKW: Element::bf16(),
                     A: act.element(),
                     Y: act.element(),
+                    IY: act.element(),
                 }),
                 &attention_project_specialization_on(
                     &device,
@@ -2300,6 +2313,8 @@ fn metal_tall_segmented_projections_are_bit_identical_to_the_staged_tiles() {
                 gate_weight: &act_tensor(&device, Act::Bf16, &[0, d], &[]),
                 key_weight: &weights[1].tensor(&device),
                 value_weight: &weights[2].tensor(&device),
+                indexer_query_weight: &act_tensor(&device, Act::Bf16, &[0, d], &[]),
+                indexer_key_weight: &act_tensor(&device, Act::Bf16, &[0, d], &[]),
                 epsilon: 1e-6,
                 project_mode,
                 query_scale: &no_scale(&device),
@@ -3401,8 +3416,11 @@ fn metal_packed_recurrent_and_attention_projections_agree_with_the_staged_tiles(
                         GW: Element::bf16(),
                         KW: project_reprs[1].resident(&device),
                         VW: project_reprs[2].resident(&device),
+                        IQW: Element::bf16(),
+                        IKW: Element::bf16(),
                         A: act.element(),
                         Y: act.element(),
+                        IY: act.element(),
                     }),
                     &match pack {
                         Some(pack) => with_pack::<attention_project::Entry>(specialization, pack),
@@ -3417,6 +3435,8 @@ fn metal_packed_recurrent_and_attention_projections_agree_with_the_staged_tiles(
                     gate_weight: &act_tensor(&device, Act::Bf16, &[0, d], &[]),
                     key_weight: &project_weights[1].tensor(&device),
                     value_weight: &project_weights[2].tensor(&device),
+                    indexer_query_weight: &act_tensor(&device, Act::Bf16, &[0, d], &[]),
+                    indexer_key_weight: &act_tensor(&device, Act::Bf16, &[0, d], &[]),
                     epsilon: 1e-6,
                     project_mode,
                     query_scale: &no_scale(&device),
@@ -3655,8 +3675,11 @@ fn metal_packed_attention_project_agrees_with_the_staged_tiles_over_low_bit_weig
                         GW: Element::bf16(),
                         KW: repr.resident(&device),
                         VW: repr.resident(&device),
+                        IQW: Element::bf16(),
+                        IKW: Element::bf16(),
                         A: act.element(),
                         Y: act.element(),
+                        IY: act.element(),
                     }),
                     &match pack {
                         Some(pack) => with_pack::<attention_project::Entry>(specialization, pack),
@@ -3671,6 +3694,8 @@ fn metal_packed_attention_project_agrees_with_the_staged_tiles_over_low_bit_weig
                     gate_weight: &act_tensor(&device, Act::Bf16, &[0, d], &[]),
                     key_weight: &weights[1].tensor(&device),
                     value_weight: &weights[2].tensor(&device),
+                    indexer_query_weight: &act_tensor(&device, Act::Bf16, &[0, d], &[]),
+                    indexer_key_weight: &act_tensor(&device, Act::Bf16, &[0, d], &[]),
                     epsilon: 1e-6,
                     project_mode: 0,
                     query_scale: &no_scale(&device),
@@ -5010,8 +5035,11 @@ fn attention_projections_match_their_portable_bodies_and_the_host_reference_on(
                     GW: Element::bf16(),
                     KW: reprs[1].resident(&device),
                     VW: reprs[2].resident(&device),
+                    IQW: Element::bf16(),
+                    IKW: Element::bf16(),
                     A: act.element(),
                     Y: act.element(),
+                    IY: act.element(),
                 }),
                 &attention_project_specialization_on(
                     device,
@@ -5028,6 +5056,8 @@ fn attention_projections_match_their_portable_bodies_and_the_host_reference_on(
                     gate_weight: &act_tensor(&device, Act::Bf16, &[0, d], &[]),
                     key_weight: &weights[1].tensor(&device),
                     value_weight: &weights[2].tensor(&device),
+                    indexer_query_weight: &act_tensor(device, Act::Bf16, &[0, d], &[]),
+                    indexer_key_weight: &act_tensor(device, Act::Bf16, &[0, d], &[]),
                     epsilon: 1e-6,
                     project_mode,
                     query_scale: &no_scale(&device),
@@ -5084,8 +5114,11 @@ fn attention_projections_match_their_portable_bodies_and_the_host_reference_on(
                     ("GW", registry::dense(DType::BF16)),
                     ("KW", reprs[1].storage()),
                     ("VW", reprs[2].storage()),
+                    ("IQW", registry::dense(DType::BF16)),
+                    ("IKW", registry::dense(DType::BF16)),
                     ("A", registry::dense(DType::BF16)),
                     ("Y", registry::dense(DType::BF16)),
+                    ("IY", registry::dense(DType::BF16)),
                 ],
                 vec![
                     floats(&[rows, d], &hidden),
@@ -5094,6 +5127,8 @@ fn attention_projections_match_their_portable_bodies_and_the_host_reference_on(
                     activations(Act::Bf16, &[0, d], &[]),
                     Input::Data(weights[1].oracle()),
                     Input::Data(weights[2].oracle()),
+                    activations(Act::Bf16, &[0, d], &[]),
+                    activations(Act::Bf16, &[0, d], &[]),
                     Input::F32(1e-6),
                     Input::I32(0),
                     // No scales, no packing bounds.
@@ -5329,6 +5364,8 @@ fn scaled_projections_on(device: &Device) {
                     ("GR", segments[1]),
                     ("K", segments[2]),
                     ("V", segments[3]),
+                    ("IQ", 0),
+                    ("IK", 0),
                     ("QS", 1),
                     ("GS", 1),
                     ("KS", 1),
@@ -5340,6 +5377,7 @@ fn scaled_projections_on(device: &Device) {
                 .iter()
                 .map(|projection| projection.tensor(device))
                 .collect::<Vec<_>>();
+            let empty = weights[0].slice_leading(0, 0).unwrap();
             let scales = SCALES.map(|scale| f32_tensor(device, &[1], &[scale]));
             let out = declared::prepared(
                 device,
@@ -5349,8 +5387,11 @@ fn scaled_projections_on(device: &Device) {
                     GW: repr.resident(device),
                     KW: repr.resident(device),
                     VW: repr.resident(device),
+                    IQW: repr.resident(device),
+                    IKW: repr.resident(device),
                     A: act.element(),
                     Y: act.element(),
+                    IY: act.element(),
                 }),
                 &match pack {
                     Some(pack) => with_pack::<attention_project::Entry>(specialization, pack),
@@ -5365,6 +5406,8 @@ fn scaled_projections_on(device: &Device) {
                 gate_weight: &weights[1],
                 key_weight: &weights[2],
                 value_weight: &weights[3],
+                indexer_query_weight: &empty,
+                indexer_key_weight: &empty,
                 epsilon: 1e-6,
                 project_mode: 0,
                 query_scale: &scales[0],
@@ -5475,8 +5518,11 @@ fn scaled_projections_on(device: &Device) {
                 ("GW", repr.storage()),
                 ("KW", repr.storage()),
                 ("VW", repr.storage()),
+                ("IQW", repr.storage()),
+                ("IKW", repr.storage()),
                 ("A", registry::dense(DType::BF16)),
                 ("Y", registry::dense(DType::BF16)),
+                ("IY", registry::dense(DType::BF16)),
             ],
             [
                 floats(&[rows, d], &hidden),
@@ -5484,6 +5530,10 @@ fn scaled_projections_on(device: &Device) {
             ]
             .into_iter()
             .chain(projections.iter().map(|projection| Input::Data(projection.oracle())))
+            .chain([
+                Input::Data(weight(repr, 0, d, 0, 1.0).oracle()),
+                Input::Data(weight(repr, 0, d, 0, 1.0).oracle()),
+            ])
             .chain([Input::F32(1e-6), Input::I32(0)])
             // Every segment's scale; no bound.
             .chain(SCALES.map(|scale| floats(&[1], &[scale])))
@@ -6541,8 +6591,11 @@ fn query_key_project(
             GW: element,
             KW: element,
             VW: element,
+            IQW: element,
+            IKW: element,
             A: act.element(),
             Y: act.element(),
+            IY: act.element(),
         }),
         &attention_project_specialization_on(
             device,
@@ -6552,6 +6605,8 @@ fn query_key_project(
                 ("GR", 0),
                 ("K", key.map_or(0, |key| key.rows)),
                 ("V", 0),
+                ("IQ", 0),
+                ("IK", 0),
             ],
             mapping,
         ),
@@ -6567,6 +6622,8 @@ fn query_key_project(
             gate_weight: &empty,
             key_weight: &key_weight,
             value_weight: &empty,
+            indexer_query_weight: &empty,
+            indexer_key_weight: &empty,
             epsilon,
             project_mode: 0,
             query_scale: &no_scale(device),
@@ -7166,6 +7223,8 @@ fn metal_absent_query_projection_preserves_key_value() {
                     ("GR", 0),
                     ("K", kv),
                     ("V", kv),
+                    ("IQ", 0),
+                    ("IK", 0),
                 ],
                 gemm_mapping(64, 64, 1),
             );
@@ -7177,8 +7236,11 @@ fn metal_absent_query_projection_preserves_key_value() {
                     GW: Element::bf16(),
                     KW: Element::bf16(),
                     VW: Element::bf16(),
+                    IQW: Element::bf16(),
+                    IKW: Element::bf16(),
                     A: Element::bf16(),
                     Y: Element::bf16(),
+                    IY: Element::bf16(),
                 }),
                 &spec,
             )
@@ -7191,6 +7253,8 @@ fn metal_absent_query_projection_preserves_key_value() {
                     gate_weight: &empty,
                     key_weight: &key,
                     value_weight: &value,
+                    indexer_query_weight: &empty,
+                    indexer_key_weight: &empty,
                     epsilon: 1e-6,
                     project_mode: if absent { 0 } else { 1 },
                     query_scale: &no_scale(&device),
@@ -7795,6 +7859,203 @@ fn dense_output_gemm_timing_at_shape() {
                     );
                 }
             }
+        }
+    }
+}
+
+/// 6-segment `attention_project` (Q | GR=0 | K | V | IQ(BF16) | IK(F32)) over
+/// mixed quantized + dense BF16 weights at M = 1, 2, 12 matches the portable
+/// body on every backend (Metal, CUDA, Vulkan, CPU).
+#[test]
+fn attention_project_six_segments_matches_portable_body() {
+    let module = crate::common::kernels();
+    let act = Act::Bf16;
+    let (d, q, k, v, iq, ik) = (256usize, 128usize, 64usize, 64usize, 96usize, 32usize);
+    let q_wt = weight(Repr::Q4k, q, d, 901, 1.0);
+    let k_wt = weight(Repr::Q8, k, d, 902, 1.0);
+    let v_wt = weight(Repr::Q8, v, d, 903, 1.0);
+    let iq_wt = weight(Repr::Bf16, iq, d, 904, 1.0);
+    let ik_wt = weight(Repr::Bf16, ik, d, 905, 1.0);
+    let norm = norm_values(d, 906);
+    let statics = [
+        ("D", d),
+        ("Q", q),
+        ("GR", 0),
+        ("K", k),
+        ("V", v),
+        ("IQ", iq),
+        ("IK", ik),
+    ];
+    let host_matmul = |x: &[f32], rows: usize, wt: &Weight| -> Vec<f32> {
+        let mut out = vec![0.0f32; rows * wt.rows];
+        for r in 0..rows {
+            let xr = &x[r * d..(r + 1) * d];
+            for n in 0..wt.rows {
+                let wr = &wt.values[n * d..(n + 1) * d];
+                out[r * wt.rows + n] = xr.iter().zip(wr).map(|(a, b)| a * b).sum();
+            }
+        }
+        out
+    };
+    let check = |label: &str, backend: BackendName, rows: usize, got: &[f32], want: &[f32], tol: f64| {
+        assert_eq!(got.len(), want.len(), "{label}: length mismatch");
+        let (rel, worst) = relative_difference(
+            &want.iter().map(|&x| f64::from(x)).collect::<Vec<_>>(),
+            &got.iter().map(|&x| f64::from(x)).collect::<Vec<_>>(),
+        );
+        assert!(
+            rel <= tol,
+            "{label} on {backend:?} M={rows}: rel={rel:.2e}, worst={worst:.2e}",
+        );
+    };
+    let cases: Vec<(usize, Vec<f32>, [Vec<f32>; 5])> = [1usize, 2, 12]
+        .into_iter()
+        .map(|rows| {
+            let mut rng = Rng::new(910 + rows as u64);
+            let hidden: Vec<f32> = (0..rows * d).map(|_| rng.symmetric() * 2.0).collect();
+            let mut normed = Vec::with_capacity(rows * d);
+            for r in 0..rows {
+                let (row, _) = rms_row(BackendName::Cpu, act, &hidden[r * d..(r + 1) * d], &norm, 1e-6);
+                normed.extend(row);
+            }
+            let refs = [
+                host_matmul(&normed, rows, &q_wt),
+                host_matmul(&normed, rows, &k_wt),
+                host_matmul(&normed, rows, &v_wt),
+                host_matmul(&normed, rows, &iq_wt),
+                host_matmul(&normed, rows, &ik_wt),
+            ];
+            (rows, hidden, refs)
+        })
+        .collect();
+    // Verify the portable Seismic body against the host reference at M = 1.
+    {
+        let (rows, hidden, refs) = &cases[0];
+        let portable = interpret(
+            module,
+            "attention_project",
+            &[
+                ("NW", registry::dense(DType::BF16)),
+                ("QW", Repr::Q4k.storage()),
+                ("GW", Repr::Q4k.storage()),
+                ("KW", Repr::Q8.storage()),
+                ("VW", Repr::Q8.storage()),
+                ("IQW", registry::dense(DType::BF16)),
+                ("IKW", registry::dense(DType::BF16)),
+                ("A", registry::dense(DType::BF16)),
+                ("Y", registry::dense(DType::BF16)),
+                ("IY", registry::dense(DType::F32)),
+            ],
+            vec![
+                floats(&[*rows, d], hidden),
+                activations(Act::Bf16, &[d], &norm),
+                Input::Data(q_wt.oracle()),
+                Input::Data(weight(Repr::Q4k, 0, d, 0, 1.0).oracle()),
+                Input::Data(k_wt.oracle()),
+                Input::Data(v_wt.oracle()),
+                Input::Data(iq_wt.oracle()),
+                Input::Data(ik_wt.oracle()),
+                Input::F32(1e-6),
+                Input::I32(0),
+                floats(&[0], &[]),
+                floats(&[0], &[]),
+                floats(&[0], &[]),
+                floats(&[0], &[]),
+                floats(&[0], &[]),
+                floats(&[0], &[]),
+                floats(&[0], &[]),
+                floats(&[0], &[]),
+            ],
+        );
+        check("portable Q", BackendName::Cpu, *rows, &result(&portable, 0), &refs[0], 2e-2);
+        check("portable K", BackendName::Cpu, *rows, &result(&portable, 2), &refs[1], 2e-2);
+        check("portable V", BackendName::Cpu, *rows, &result(&portable, 3), &refs[2], 2e-2);
+        check("portable IQ", BackendName::Cpu, *rows, &result(&portable, 4), &refs[3], 2e-2);
+        check("portable IK(f32)", BackendName::Cpu, *rows, &result(&portable, 5), &refs[4], 1e-3);
+    }
+    let test_devices = seismic_native_tests::first_and_cpu(
+        &[BackendName::Cuda, BackendName::Metal, BackendName::Vulkan],
+        &[BackendName::Cuda, BackendName::Metal, BackendName::Vulkan, BackendName::Cpu],
+    );
+    for device in test_devices {
+        let charges = seismic::Charges::tally(&device);
+        let spec = if device.backend() == BackendName::Cuda {
+            let mut s = NativeSpecialization::new();
+            for &(name, value) in &statics {
+                s = s.with_static(name, value as u64);
+            }
+            for &(name, value) in &[
+                ("PT", 1u64),
+                ("NM", d as u64),
+                ("QS", 0),
+                ("GS", 0),
+                ("KS", 0),
+                ("VS", 0),
+                ("QB", 0),
+                ("GB", 0),
+                ("KB", 0),
+                ("VB", 0),
+            ] {
+                s = s.with_static(name, value);
+            }
+            s
+        } else {
+            attention_project_specialization_on(&device, &statics, gemm_mapping(64, 64, 1))
+        };
+        let kernel = declared::prepared(
+            &device,
+            &attention_project::native_entry_with(attention_project::Elements {
+                NW: Element::bf16(),
+                QW: Repr::Q4k.resident(&device),
+                GW: Repr::Q4k.resident(&device),
+                KW: Repr::Q8.resident(&device),
+                VW: Repr::Q8.resident(&device),
+                IQW: Element::bf16(),
+                IKW: Element::bf16(),
+                A: act.element(),
+                Y: act.element(),
+                IY: Element::f32(),
+            }),
+            &spec,
+        )
+        .unwrap();
+        let q_t = q_wt.tensor(&device);
+        let empty_q = q_t.slice_leading(0, 0).unwrap();
+        let k_t = k_wt.tensor(&device);
+        let v_t = v_wt.tensor(&device);
+        let iq_t = iq_wt.tensor(&device);
+        let ik_t = ik_wt.tensor(&device);
+        let norm_t = bf16_norm(&device, &norm);
+        for (rows, hidden, refs) in &cases {
+            let rows = *rows;
+            let out = kernel
+                .call(&charges, attention_project::Args {
+                    hidden: &f32_tensor(&device, &[rows, d], hidden),
+                    input_norm: &norm_t,
+                    query_weight: &q_t,
+                    gate_weight: &empty_q,
+                    key_weight: &k_t,
+                    value_weight: &v_t,
+                    indexer_query_weight: &iq_t,
+                    indexer_key_weight: &ik_t,
+                    epsilon: 1e-6,
+                    project_mode: 0,
+                    query_scale: &no_scale(&device),
+                    gate_scale: &no_scale(&device),
+                    key_scale: &no_scale(&device),
+                    value_scale: &no_scale(&device),
+                    query_bound: &absent_bound(&device),
+                    gate_bound: &absent_bound(&device),
+                    key_bound: &absent_bound(&device),
+                    value_bound: &absent_bound(&device),
+                })
+                .unwrap();
+            let b = device.backend();
+            check("Q", b, rows, &read_act(act, &out.r0), &refs[0], 2e-2);
+            check("K", b, rows, &read_act(act, &out.r2), &refs[1], 2e-2);
+            check("V", b, rows, &read_act(act, &out.r3), &refs[2], 2e-2);
+            check("IQ", b, rows, &read_act(act, &out.r4), &refs[3], 2e-2);
+            check("IK(f32)", b, rows, &read_f32(&out.r5), &refs[4], 1e-3);
         }
     }
 }

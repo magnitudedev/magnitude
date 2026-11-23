@@ -662,12 +662,12 @@ inline float3 packing_norms(float4 even, float4 odd, uint folds) {
 // the format's bound alone certifies the gains.
 template <uint SERVED>
 struct packing_bounds {
-    static_assert(SERVED < 16, "an operand serves at most four weights");
-    device const float *tables[4];
+    static_assert(SERVED < 256, "an operand serves at most eight weights");
+    device const float *tables[8];
     float at(uint run) const {
         float bound = 0.0f;
         PROJECTION_UNROLL
-        for (uint i = 0; i < 4; ++i) {
+        for (uint i = 0; i < 8; ++i) {
             if ((SERVED >> i) & 1u)
                 bound = metal::max(bound, tables[i][run]);
         }

@@ -62,8 +62,11 @@ impl StateSpaceProjectTuning {
             GW: b.projection,
             KW: b.projection,
             VW: b.projection,
+            IQW: b.projection,
+            IKW: b.projection,
             A: b.activation,
             Y: b.activation,
+            IY: b.activation,
         }
     }
 }
@@ -166,6 +169,8 @@ impl EntryTuning for StateSpaceProjectTuning {
             gate_weight: &case.empty,
             key_weight: &case.empty,
             value_weight: &case.empty,
+            indexer_query_weight: &case.empty,
+            indexer_key_weight: &case.empty,
             epsilon: case.epsilon,
             project_mode: 0,
             query_scale: &case.scale,

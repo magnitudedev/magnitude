@@ -161,7 +161,7 @@ enum CheckedForm {
         step: StepForm,
     },
     Kimi {
-        project: [(&'static str, Element); 7],
+        project: [(&'static str, Element); 10],
         up: [[(&'static str, Element); 3]; 2],
     },
 }
@@ -192,8 +192,11 @@ impl CheckedRecurrentEntries {
                     ("GW", binding.gate),
                     ("KW", binding.alpha),
                     ("VW", binding.beta),
+                    ("IQW", binding.qkv),
+                    ("IKW", binding.qkv),
                     ("A", binding.activation),
                     ("Y", binding.activation),
+                    ("IY", binding.activation),
                 ],
                 up: [gate_up, alpha_up].map(|weight| {
                     [("A", binding.activation), ("W", weight), ("Y", binding.activation)]
@@ -781,6 +784,7 @@ pub(crate) fn recurrent<'a, G: GraphDraft + 'a>(
                 unreachable!("a per-channel layer's block has its ranks and decay lower bound")
             };
             // q | k | v, the gate's and decay's down products and beta, in A.
+            let empty = qkv.weight.slice_leading(0, 0);
             let projection = graph.enqueue(
                 G::pick(project, &block.rows),
                 &[
@@ -790,6 +794,8 @@ pub(crate) fn recurrent<'a, G: GraphDraft + 'a>(
                     ("GR", gate_rank.clone()),
                     ("K", alpha_rank.clone()),
                     ("V", block.value_heads.clone()),
+                    ("IQ", Dim::from(0)),
+                    ("IK", Dim::from(0)),
                     ("QS", qkv.operands.scale.extent.clone()),
                     ("GS", gate.operands.scale.extent.clone()),
                     ("KS", alpha.operands.scale.extent.clone()),
@@ -808,6 +814,8 @@ pub(crate) fn recurrent<'a, G: GraphDraft + 'a>(
                     gate_weight: (&gate.weight).into(),
                     key_weight: (&alpha.weight).into(),
                     value_weight: (&beta.weight).into(),
+                    indexer_query_weight: (&empty).into(),
+                    indexer_key_weight: (&empty).into(),
                     epsilon: topology.epsilon.f32(),
                     project_mode: 0.into(),
                     query_scale: (&qkv.operands.scale.tensor).into(),

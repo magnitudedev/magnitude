@@ -45,15 +45,22 @@ pub(crate) struct IndexerElements {
     pub indexer: crate::IndexerBinding,
     /// The `qr` rows' width for a query over them; none over `x`.
     pub query_rank: Option<u64>,
-    pub query_project: [(&'static str, Element); 7],
-    pub weights_project: Option<[(&'static str, Element); 7]>,
+    /// Separate query projection elements; `None` when fused into the main
+    /// 6-segment `attention_project`.
+    pub query_project: Option<[(&'static str, Element); 10]>,
+    pub weights_project: Option<[(&'static str, Element); 10]>,
 }
 
 impl IndexerElements {
     /// `indexer`'s elements in `binding`. A query over `qr` reads the
     /// low-rank query's rows, which `Decoder::validate` holds such an
-    /// indexer to.
-    pub(crate) fn of(binding: crate::AttentionBinding, indexer: crate::IndexerBinding) -> Self {
+    /// indexer to. When `query_fused` is true, the query projection runs as
+    /// segment 4 of the main `attention_project` and needs no separate entry.
+    pub(crate) fn of(
+        binding: crate::AttentionBinding,
+        indexer: crate::IndexerBinding,
+        query_fused: bool,
+    ) -> Self {
         let activation = binding.activation;
         let (query_rank, query_norm) = match indexer.input {
             IndexerInput::Hidden => (None, binding.norm),
@@ -67,7 +74,8 @@ impl IndexerElements {
         Self {
             indexer,
             query_rank,
-            query_project: segment(activation, query_norm, indexer.query, activation),
+            query_project: (!query_fused)
+                .then(|| segment(activation, query_norm, indexer.query, activation)),
             weights_project: indexer
                 .head_weights
                 .map(|weights| segment(activation, binding.norm, weights, activation)),
@@ -88,24 +96,28 @@ pub(crate) fn segment(
     norm: Element,
     weight: Element,
     published: Element,
-) -> [(&'static str, Element); 7] {
+) -> [(&'static str, Element); 10] {
     [
         ("NW", norm),
         ("QW", weight),
         ("GW", weight),
         ("KW", weight),
         ("VW", weight),
+        ("IQW", weight),
+        ("IKW", weight),
         ("A", activation),
         ("Y", published),
+        ("IY", published),
     ]
 }
 
 /// The indexer's entries at one graph class.
 pub(crate) struct IndexerEntries<'a, G: GraphDraft + 'a> {
     /// Its projections, each bound to its own weight's and input norm's
-    /// elements and by row range: the query's and, for projected head
-    /// weights, the head weights'.
-    pub query_project: G::Ranged<'a, attention_project::Entry>,
+    /// elements and by row range: the query's (`None` when fused into the
+    /// main 6-segment `attention_project`) and, for projected head weights,
+    /// the head weights'.
+    pub query_project: Option<G::Ranged<'a, attention_project::Entry>>,
     pub weights_project: Option<G::Ranged<'a, attention_project::Entry>>,
     pub score: G::Binding<'a, indexer_score::Entry>,
     pub topk: G::Binding<'a, rows_topk::Entry>,
@@ -177,6 +189,9 @@ pub(crate) struct IndexerInputs<'v, 'a, G: GraphDraft + 'a> {
     /// `IndexerInput` names) and its projection under the query's norm.
     pub query_input: ProjectionInput<'v>,
     pub query: Projection<'v>,
+    /// Pre-projected query rows `[rows, heads * width]` in A when fused into
+    /// the main 6-segment `attention_project`.
+    pub preprojected_query: Option<WorkflowTensor>,
     /// The query heads' own norm `[1, width]` (`IndexerQuery::norm`), if any.
     pub query_norm: Option<&'v WorkflowTensorView>,
     /// The layer's input `x` and the head weights' projection under the
@@ -291,6 +306,8 @@ fn project<'a, G: GraphDraft + 'a>(
                 gate_weight: (&empty).into(),
                 key_weight: (&empty).into(),
                 value_weight: (&empty).into(),
+                indexer_query_weight: (&empty).into(),
+                indexer_key_weight: (&empty).into(),
                 epsilon: projection.epsilon,
                 project_mode: 0.into(),
                 query_scale: (&operands.scale.tensor).into(),
@@ -383,15 +400,15 @@ pub(crate) fn indexer<'a, G: GraphDraft + 'a>(
         (None, None) => {}
         _ => return Err("an indexer's keys and their write disagree".into()),
     }
-    let query = project(
-        graph,
-        entries.query_project,
-        rows,
-        heads * width,
-        &inputs.query_input,
-        &inputs.query,
-        constants,
-    )?
+    let query = match inputs.preprojected_query {
+        Some(query) => query,
+        None => {
+            let entry = entries
+                .query_project
+                .ok_or("an indexer without its query projection or preprojected query")?;
+            project(graph, entry, rows, heads * width, &inputs.query_input, &inputs.query, constants)?
+        }
+    }
     .reshape(&[rows.clone(), heads.clone(), width.clone()]);
     let head_weights = match (&inputs.head_weights, entries.weights_project) {
         (Some((input, projection)), Some(entry)) => {

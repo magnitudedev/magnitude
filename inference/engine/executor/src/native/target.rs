@@ -542,7 +542,7 @@ pub enum PoolKernel {
 /// indexer's candidate pool's block scores and rows.
 #[derive(Clone, Debug)]
 pub struct IndexerKernels {
-    pub query_project: RangedKernels<attention_project::Entry>,
+    pub query_project: Option<RangedKernels<attention_project::Entry>>,
     pub weights_project: Option<RangedKernels<attention_project::Entry>>,
     pub score: NativeKernel<indexer_score::Entry>,
     pub topk: NativeKernel<rows_topk::Entry>,
@@ -583,7 +583,7 @@ pub struct SelectionKernels {
 /// the pooling into F32 keys (`pool_rows`).
 #[derive(Clone, Debug)]
 pub struct SelectionKeyKernels {
-    pub project: RangedKernels<attention_project::Entry>,
+    pub project: Option<RangedKernels<attention_project::Entry>>,
     pub pool: NativeKernel<pool_rows::Entry>,
 }
 

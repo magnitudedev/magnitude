@@ -51,7 +51,7 @@ impl<'a> From<&'a StateSpaceKernels> for StateSpaceGraphEntries<'a, NativeGraph>
 /// empty segments are views of the projection weight.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub(crate) struct CheckedStateSpaceEntries {
-    project: [(&'static str, Element); 7],
+    project: [(&'static str, Element); 10],
     activation: [(&'static str, Element); 1],
     output: [(&'static str, Element); 2],
 }
@@ -65,8 +65,11 @@ impl CheckedStateSpaceEntries {
                 ("GW", binding.projection),
                 ("KW", binding.projection),
                 ("VW", binding.projection),
+                ("IQW", binding.projection),
+                ("IKW", binding.projection),
                 ("A", binding.activation),
                 ("Y", binding.activation),
+                ("IY", binding.activation),
             ],
             activation: [("A", binding.activation)],
             output: [("OW", binding.output), ("A", binding.activation)],
@@ -228,6 +231,8 @@ pub(crate) fn state_space<'a, G: GraphDraft + 'a>(
                 gate_weight: (&empty).into(),
                 key_weight: (&empty).into(),
                 value_weight: (&empty).into(),
+                indexer_query_weight: (&empty).into(),
+                indexer_key_weight: (&empty).into(),
                 epsilon: topology.epsilon.f32(),
                 project_mode: 0.into(),
                 query_scale: (&projection_weight.scale.tensor).into(),

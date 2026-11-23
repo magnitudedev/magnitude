@@ -10,6 +10,8 @@
 #define KERNEL_W1 SEISMIC_GATE_WEIGHT
 #define KERNEL_W2 SEISMIC_KEY_WEIGHT
 #define KERNEL_W3 SEISMIC_VALUE_WEIGHT
+#define KERNEL_W4 SEISMIC_INDEXER_QUERY_WEIGHT
+#define KERNEL_W5 SEISMIC_INDEXER_KEY_WEIGHT
 #include "lib/projection/projection.h"
 #include "lib/projection/packing.h"
 #include "lib/projection/operator.h"
@@ -18,12 +20,15 @@
 #endif
 
 typedef activation::Act activation_element;
-// The results' element Y (A, or F32 for a pooled source's projections).
+// The results' element Y (A, or F32 for a pooled source's projections) and IY
+// (segment 5, indexer key: F32 for grouped pooled keys, A otherwise).
 typedef ELEMENT_OF(SEISMIC_ELEMENT_Y) published;
+typedef ELEMENT_OF(SEISMIC_ELEMENT_IY) published_ik;
 typedef ELEMENT_OF(SEISMIC_INPUT_NORM) norm_element;
 // The rows every weight takes (the normalized rows, or NVFP4 operands).
 constant constexpr bool NVFP4 = projection::OperandRecipe<packets::W0_OPERANDS_NVFP4, packets::W1_OPERANDS_NVFP4,
-    packets::W2_OPERANDS_NVFP4, packets::W3_OPERANDS_NVFP4>::NVFP4;
+    packets::W2_OPERANDS_NVFP4, packets::W3_OPERANDS_NVFP4, packets::W4_OPERANDS_NVFP4,
+    packets::W5_OPERANDS_NVFP4>::NVFP4;
 typedef projection::operands<NVFP4> Operands;
 
 #define PROJECTION_ARGUMENTS                                                            \
@@ -33,10 +38,14 @@ typedef projection::operands<NVFP4> Operands;
     device const uchar *gate_weight [[buffer(SEISMIC_BUFFER_GATE_WEIGHT)]],             \
     device const uchar *key_weight [[buffer(SEISMIC_BUFFER_KEY_WEIGHT)]],               \
     device const uchar *value_weight [[buffer(SEISMIC_BUFFER_VALUE_WEIGHT)]],           \
+    device const uchar *indexer_query_weight [[buffer(SEISMIC_BUFFER_INDEXER_QUERY_WEIGHT)]], \
+    device const uchar *indexer_key_weight [[buffer(SEISMIC_BUFFER_INDEXER_KEY_WEIGHT)]], \
     SEISMIC_RESULT_0_PARAM(query_cells),                                                \
     SEISMIC_RESULT_1_PARAM(gate_cells),                                                 \
     SEISMIC_RESULT_2_PARAM(key_cells),                                                  \
     SEISMIC_RESULT_3_PARAM(value_cells),                                                \
+    SEISMIC_RESULT_4_PARAM(indexer_query_cells),                                        \
+    SEISMIC_RESULT_5_PARAM(indexer_key_cells),                                          \
     device uchar *normalized [[buffer(SEISMIC_BUFFER_SCRATCH_NORMALIZED)]],             \
     device float *packed [[buffer(SEISMIC_BUFFER_SCRATCH_PACKED)]],                     \
     device half *token_factors [[buffer(SEISMIC_BUFFER_SCRATCH_TOKEN_FACTORS)]],        \
@@ -55,15 +64,17 @@ typedef projection::operands<NVFP4> Operands;
 
 // A segment's result after its weight's second-level scale, where the
 // segment's scale port (static extent EXTENT) is present.
-#define ATTENTION_PROJECT_SCALED(EXTENT, SCALE, RESULT, STRIDE_0, STRIDE_1)             \
+#define ATTENTION_PROJECT_SCALED(OUT_EL, EXTENT, SCALE, RESULT, STRIDE_0, STRIDE_1)     \
     projection::scaling<(EXTENT != 0)>::wrap(                                           \
-        projection::Store<published>{RESULT, STRIDE_0, STRIDE_1, 0},                    \
+        projection::Store<OUT_EL>{RESULT, STRIDE_0, STRIDE_1, 0},                       \
         projection::scale_factor(SCALE, EXTENT, 0, 0), 1.0f)
 
 #define PROJECTION_N0 SEISMIC_DIM_Q
 #define PROJECTION_N1 SEISMIC_DIM_GR
 #define PROJECTION_N2 SEISMIC_DIM_K
 #define PROJECTION_N3 SEISMIC_DIM_V
+#define PROJECTION_N4 SEISMIC_DIM_IQ
+#define PROJECTION_N5 SEISMIC_DIM_IK
 
 // `raw` is the residual rows under the norm prologue; `in` the normalized
 // rows every form past the GEMV reads.
@@ -77,14 +88,20 @@ typedef projection::operands<NVFP4> Operands;
     projection::Weights<packets::W1> w1{{gate_weight, KERNEL_W1_LAYOUT(k), k}};         \
     projection::Weights<packets::W2> w2{{key_weight, KERNEL_W2_LAYOUT(k), k}};          \
     projection::Weights<packets::W3> w3{{value_weight, KERNEL_W3_LAYOUT(k), k}};        \
-    const auto out0 = ATTENTION_PROJECT_SCALED(SEISMIC_DIM_QS, query_scale, element::Out<published>(query_cells),      \
+    projection::Weights<packets::W4> w4{{indexer_query_weight, KERNEL_W4_LAYOUT(k), k}}; \
+    projection::Weights<packets::W5> w5{{indexer_key_weight, KERNEL_W5_LAYOUT(k), k}};  \
+    const auto out0 = ATTENTION_PROJECT_SCALED(published, SEISMIC_DIM_QS, query_scale, element::Out<published>(query_cells), \
         SEISMIC_RESULT_0_STRIDE_0, SEISMIC_RESULT_0_STRIDE_1);                          \
-    const auto out1 = ATTENTION_PROJECT_SCALED(SEISMIC_DIM_GS, gate_scale, element::Out<published>(gate_cells),        \
+    const auto out1 = ATTENTION_PROJECT_SCALED(published, SEISMIC_DIM_GS, gate_scale, element::Out<published>(gate_cells), \
         SEISMIC_RESULT_1_STRIDE_0, SEISMIC_RESULT_1_STRIDE_1);                          \
-    const auto out2 = ATTENTION_PROJECT_SCALED(SEISMIC_DIM_KS, key_scale, element::Out<published>(key_cells),          \
+    const auto out2 = ATTENTION_PROJECT_SCALED(published, SEISMIC_DIM_KS, key_scale, element::Out<published>(key_cells), \
         SEISMIC_RESULT_2_STRIDE_0, SEISMIC_RESULT_2_STRIDE_1);                          \
-    const auto out3 = ATTENTION_PROJECT_SCALED(SEISMIC_DIM_VS, value_scale, element::Out<published>(value_cells),      \
-        SEISMIC_RESULT_3_STRIDE_0, SEISMIC_RESULT_3_STRIDE_1)
+    const auto out3 = ATTENTION_PROJECT_SCALED(published, SEISMIC_DIM_VS, value_scale, element::Out<published>(value_cells), \
+        SEISMIC_RESULT_3_STRIDE_0, SEISMIC_RESULT_3_STRIDE_1);                          \
+    const auto out4 = projection::Store<published>{element::Out<published>(indexer_query_cells), \
+        SEISMIC_RESULT_4_STRIDE_0, SEISMIC_RESULT_4_STRIDE_1, 0};                       \
+    const auto out5 = projection::Store<published_ik>{element::Out<published_ik>(indexer_key_cells), \
+        SEISMIC_RESULT_5_STRIDE_0, SEISMIC_RESULT_5_STRIDE_1, 0}
 
 // The GEMV's rows: the norm applied as they stage, from their sums of
 // squares over the threadgroup.
@@ -98,7 +115,7 @@ typedef projection::operands<NVFP4> Operands;
 #define PROJECTION_BOUNDED                                                              \
     ((SEISMIC_DIM_QB != 0 ? 1u : 0u) | (SEISMIC_DIM_GB != 0 ? 2u : 0u) | (SEISMIC_DIM_KB != 0 ? 4u : 0u) \
         | (SEISMIC_DIM_VB != 0 ? 8u : 0u))
-#define PROJECTION_BOUND_TABLES {query_bound, gate_bound, key_bound, value_bound}
+#define PROJECTION_BOUND_TABLES {query_bound, gate_bound, key_bound, value_bound, nullptr, nullptr}
 #define PROJECTION_COLUMNS(s) false
 #define PROJECTION_GEMV_PROLOGUE(s)
 #define PROJECTION_BATCH_PROLOGUE(s)

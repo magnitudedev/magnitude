@@ -17,15 +17,23 @@ fn attention_project_rows<L: Isa, E: Elements>(
     _shared: &mut [u8],
 ) {
     let (m, d) = (cx.dim_m() as usize, cx.dim_d() as usize);
-    let segments = [cx.dim_q() as usize, cx.dim_gr() as usize, cx.dim_k() as usize, cx.dim_v() as usize];
+    let segments = [
+        cx.dim_q() as usize,
+        cx.dim_gr() as usize,
+        cx.dim_k() as usize,
+        cx.dim_v() as usize,
+        cx.dim_iq() as usize,
+        cx.dim_ik() as usize,
+    ];
     let (segment, rows) = projection::segment_rows(group[0], cx.param_rows(), &segments);
     let weights = [
         cx.arg_query_weight(),
         cx.arg_gate_weight(),
         cx.arg_key_weight(),
         cx.arg_value_weight(),
+        cx.arg_indexer_query_weight(),
+        cx.arg_indexer_key_weight(),
     ][segment];
-    let result = [cx.result_0(), cx.result_1(), cx.result_2(), cx.result_3()][segment];
     // The segment weight's second-level scale, 1 where its port is absent.
     let scale = match segment {
         0 if cx.dim_qs() != 0 => cx.arg_query_scale().get([0]),
@@ -35,6 +43,7 @@ fn attention_project_rows<L: Isa, E: Elements>(
         _ => 1.0,
     };
     if segment < 2 && cx.arg_project_mode() != 0 {
+        let result = [cx.result_0(), cx.result_1()][segment];
         const ZERO: [f32; projection::MAX_ROWS] = [0.0; projection::MAX_ROWS];
         let zero = &ZERO[..rows.len()];
         for row in 0..m {
@@ -48,7 +57,23 @@ fn attention_project_rows<L: Isa, E: Elements>(
     // SAFETY: the form launch (or the hidden rows' producer) wrote every row before this launch.
     let normalized = unsafe { cx.scratch_rows().slice::<f32>(0, m * d) };
     let quantized = (cx.param_int8() == 1).then(|| unsafe {
-        projection::quantized(cx.scratch_quantized(), 0, m, d, projection::tiled(m, &[&cx.arg_query_weight(), &cx.arg_gate_weight(), &cx.arg_key_weight(), &cx.arg_value_weight()]))
+        projection::quantized(
+            cx.scratch_quantized(),
+            0,
+            m,
+            d,
+            projection::tiled(
+                m,
+                &[
+                    &cx.arg_query_weight(),
+                    &cx.arg_gate_weight(),
+                    &cx.arg_key_weight(),
+                    &cx.arg_value_weight(),
+                    &cx.arg_indexer_query_weight(),
+                    &cx.arg_indexer_key_weight(),
+                ],
+            ),
+        )
     });
     projection::project_staged_arithmetic(
         &weights,
@@ -62,9 +87,22 @@ fn attention_project_rows<L: Isa, E: Elements>(
                 *target = scale * value;
             }
             // SAFETY: each work item writes its own columns of every row of its segment's result.
-            activation::store::<E::Y>(scaled, unsafe {
-                result.span_mut([row, rows.start], rows.len())
-            });
+            if segment == 5 {
+                activation::store::<E::IY>(scaled, unsafe {
+                    cx.result_5().span_mut([row, rows.start], rows.len())
+                });
+            } else {
+                let result = [
+                    cx.result_0(),
+                    cx.result_1(),
+                    cx.result_2(),
+                    cx.result_3(),
+                    cx.result_4(),
+                ][segment];
+                activation::store::<E::Y>(scaled, unsafe {
+                    result.span_mut([row, rows.start], rows.len())
+                });
+            }
         },
     );
 }

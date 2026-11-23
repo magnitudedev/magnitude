@@ -1589,6 +1589,89 @@ impl AttentionBinding {
         self.value().unwrap_or_else(|| self.query_segment())
     }
 
+    /// Whether this attention layer fuses its selected-read indexer query (`IQ`)
+    /// and pooled indexer key (`IK`) into the main 6-segment `attention_project`
+    /// launch instead of emitting separate `attention_project` launches over the
+    /// same normalized input `x`.
+    pub fn fuses_selection_projections(&self) -> bool {
+        let Some(selection) = self.selection else {
+            return false;
+        };
+        if selection.keys.gate.is_some()
+            || !matches!(
+                selection.indexer.input,
+                magnitude_family_contracts::IndexerInput::Hidden
+            )
+        {
+            return false;
+        }
+        let recipe = self.query_segment().operand_recipe();
+        recipe == seismic::OperandRecipe::Rounded
+            && selection.keys.projection.operand_recipe() == recipe
+            && (self.key_value_only || selection.indexer.query.operand_recipe() == recipe)
+    }
+
+    /// The weight segment 4 (`indexer_query_weight`) reads: the selected read's
+    /// indexer query weight when fused (and not key-value-only), else `query_segment()`.
+    pub fn indexer_query_segment(&self) -> Element {
+        if self.fuses_selection_projections() && !self.key_value_only {
+            self.selection
+                .expect("fuses_selection_projections implies selection")
+                .indexer
+                .query
+        } else {
+            self.query_segment()
+        }
+    }
+
+    /// The weight segment 5 (`indexer_key_weight`) reads: the selected read's
+    /// pooled key projection weight when fused, else `query_segment()`.
+    pub fn indexer_key_segment(&self) -> Element {
+        if self.fuses_selection_projections() {
+            self.selection
+                .expect("fuses_selection_projections implies selection")
+                .keys
+                .projection
+        } else {
+            self.query_segment()
+        }
+    }
+
+    /// The output element `IY` of segment 5 (`indexer_key`): F32 when fused
+    /// (grouped pooled keys), else `activation`.
+    pub fn indexer_key_output(&self) -> Element {
+        if self.fuses_selection_projections() {
+            Element::f32()
+        } else {
+            self.activation
+        }
+    }
+
+    /// `IQ`: the rows segment 4 (`indexer_query`) projects when fused and attended.
+    pub fn indexer_query_rows(&self) -> u64 {
+        if self.fuses_selection_projections() && !self.key_value_only {
+            let indexer = self
+                .selection
+                .expect("fuses_selection_projections implies selection")
+                .indexer;
+            indexer.heads * indexer.width
+        } else {
+            0
+        }
+    }
+
+    /// `IK`: the rows segment 5 (`indexer_key`) projects when fused.
+    pub fn indexer_key_rows(&self) -> u64 {
+        if self.fuses_selection_projections() {
+            self.selection
+                .expect("fuses_selection_projections implies selection")
+                .indexer
+                .width
+        } else {
+            0
+        }
+    }
+
     /// `Q`: the rows its query projection (a low-rank query's up) yields:
     /// the attended query rows, or an absorbed query's heads at their own
     /// width (`AttentionBlock::query_projection_rows`).

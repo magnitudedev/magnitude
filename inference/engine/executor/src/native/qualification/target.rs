@@ -855,6 +855,7 @@ fn recurrent_kimi(
     let decay_lower = f32::from_bits(decay_lower);
     let gate = zeros(binding.gate, &[gate_rank, hidden])?;
     let alpha = zeros(binding.alpha, &[alpha_rank, hidden])?;
+    let empty_qkv = zeros(binding.qkv, &[0, hidden])?;
     let time_bias = zeros(Element::f32(), &[value_heads * w])?;
     let project = kimi.project.first();
     let scale = |name| unit_scale(charges, project, name, "attention_project", label);
@@ -867,6 +868,8 @@ fn recurrent_kimi(
             gate_weight: &gate,
             key_weight: &alpha,
             value_weight: &fixture.beta,
+            indexer_query_weight: &empty_qkv,
+            indexer_key_weight: &empty_qkv,
             epsilon: 1.0e-5,
             project_mode: 0,
             query_scale: &scale("QS")?,
@@ -1833,6 +1836,8 @@ fn qualify_state_space(
             gate_weight: &empty,
             key_weight: &empty,
             value_weight: &empty,
+            indexer_query_weight: &empty,
+            indexer_key_weight: &empty,
             epsilon: 1.0e-5,
             project_mode: 0,
             query_scale: &scale(binding.scales.projection)?,

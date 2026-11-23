@@ -353,8 +353,11 @@ mod tests {
                 ("GW", weights),
                 ("KW", weights),
                 ("VW", weights),
+                ("IQW", weights),
+                ("IKW", weights),
                 ("A", rows),
                 ("Y", rows),
+                ("IY", rows),
             ],
         ));
         let key_of = at("attention_project", &projection, ("RESIDUE", 1));
@@ -450,8 +453,11 @@ mod tests {
                 ("GW", bf16),
                 ("KW", bf16),
                 ("VW", bf16),
+                ("IQW", bf16),
+                ("IKW", bf16),
                 ("A", bf16),
                 ("Y", bf16),
+                ("IY", bf16),
             ],
         ));
         for name in ["SIMDGROUPS", "ROWS"] {

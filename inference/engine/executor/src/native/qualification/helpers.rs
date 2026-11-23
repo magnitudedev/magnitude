@@ -378,6 +378,21 @@ fn project_attention(
 ) -> Result<MixInputs, CatalogFailure> {
     let shape = binding.shape;
     let (kv_heads, width, heads) = (shape.widths.kv_heads, shape.widths.width, shape.heads());
+    let hidden = shape.widths.hidden;
+    let indexer_query = semantic_zeros(
+        charges,
+        binding.indexer_query_segment(),
+        &[binding.indexer_query_rows(), hidden],
+        ATTENTION,
+        label,
+    )?;
+    let indexer_key = semantic_zeros(
+        charges,
+        binding.indexer_key_segment(),
+        &[binding.indexer_key_rows(), hidden],
+        ATTENTION,
+        label,
+    )?;
     let kernel = kernels.project.first();
     let scale = |name| unit_scale(charges, kernel, name, ATTENTION, label);
     let projected = kernel
@@ -388,6 +403,8 @@ fn project_attention(
             gate_weight: &fixture.gate,
             key_weight: &fixture.key,
             value_weight: &fixture.value,
+            indexer_query_weight: &indexer_query,
+            indexer_key_weight: &indexer_key,
             epsilon: 1.0e-5,
             project_mode: 0,
             query_scale: &scale("QS")?,
@@ -471,6 +488,8 @@ fn project_low_rank_query(
             gate_weight: &empty,
             key_weight: &empty,
             value_weight: &empty,
+            indexer_query_weight: &empty,
+            indexer_key_weight: &empty,
             epsilon: 1.0e-5,
             project_mode: 0,
             query_scale: &scale("QS")?,

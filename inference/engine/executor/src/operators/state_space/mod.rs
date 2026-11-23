@@ -90,7 +90,7 @@ impl StateSpaceShape {
         self.dims().state_statics().map(|(name, dim)| (name, dim.fixed()))
     }
 
-    pub fn project_dimensions(&self, rows: u64) -> [(&'static str, u64); 6] {
+    pub fn project_dimensions(&self, rows: u64) -> [(&'static str, u64); 8] {
         self.dims()
             .project_dimensions(&Dim::from(rows))
             .map(|(name, dim)| (name, dim.fixed()))
@@ -144,7 +144,7 @@ impl StateSpaceShape<Dim> {
     }
 
     /// `attention_project`'s dimensions: the query segment only.
-    pub fn project_dimensions(&self, rows: &Dim) -> [(&'static str, Dim); 6] {
+    pub fn project_dimensions(&self, rows: &Dim) -> [(&'static str, Dim); 8] {
         [
             ("M", rows.clone()),
             ("D", self.hidden.clone()),
@@ -152,6 +152,8 @@ impl StateSpaceShape<Dim> {
             ("GR", Dim::from(0u64)),
             ("K", Dim::from(0u64)),
             ("V", Dim::from(0u64)),
+            ("IQ", Dim::from(0u64)),
+            ("IK", Dim::from(0u64)),
         ]
     }
 

@@ -7,6 +7,8 @@
 #define KERNEL_W1 SEISMIC_GATE_WEIGHT
 #define KERNEL_W2 SEISMIC_KEY_WEIGHT
 #define KERNEL_W3 SEISMIC_VALUE_WEIGHT
+#define KERNEL_W4 SEISMIC_INDEXER_QUERY_WEIGHT
+#define KERNEL_W5 SEISMIC_INDEXER_KEY_WEIGHT
 #include "lib/projection/operator.cuh"
 
 SEISMIC_PROGRAMMATIC_DEPENDENCY
@@ -14,23 +16,25 @@ SEISMIC_PROGRAMMATIC_DEPENDENCY
 using Raw = projection::Input<ELEMENT_OF(SEISMIC_INPUT_NORM), projection::AllRows, SEISMIC_DIM_NM, SEISMIC_DIM_PT>;
 using Pro = projection::Operands<
     projection::OperandRecipe<packets::W0_OPERANDS_NVFP4, packets::W1_OPERANDS_NVFP4, packets::W2_OPERANDS_NVFP4,
-                              packets::W3_OPERANDS_NVFP4>::NVFP4,
+                              packets::W3_OPERANDS_NVFP4, packets::W4_OPERANDS_NVFP4, packets::W5_OPERANDS_NVFP4>::NVFP4,
     Raw>;
 // A segment's result, after its weight's second-level scale where any
-// segment has a scale port (an absent port's factor is 1), published in Y.
+// segment has a scale port (an absent port's factor is 1), published in Y
+// (segments 0..4) or IY (segment 5, indexer key).
 using Store = projection::Store<ELEMENT_OF(SEISMIC_ELEMENT_Y)>;
+using StoreIK = projection::Store<ELEMENT_OF(SEISMIC_ELEMENT_IY)>;
 using Scaling = projection::scaling<(SEISMIC_DIM_QS != 0 || SEISMIC_DIM_GS != 0 || SEISMIC_DIM_KS != 0 ||
                                      SEISMIC_DIM_VS != 0)>;
 using Out = Scaling::type<Store>;
 
-// The four segments: rows, weights and results in segment order.
-#define SEGMENT_ROWS SEISMIC_DIM_Q, SEISMIC_DIM_GR, SEISMIC_DIM_K, SEISMIC_DIM_V
-using Segments = projection::op::SegmentSet<1, projection::op::Types<packets::W0, packets::W1, packets::W2, packets::W3>,
-                                            projection::op::Types<Out, Out, Out, Out>,
-                                            projection::op::empty_mask(SEGMENT_ROWS)>;
+// The six segments: rows, weights and results in segment order.
+#define SEGMENT_ROWS SEISMIC_DIM_Q, SEISMIC_DIM_GR, SEISMIC_DIM_K, SEISMIC_DIM_V, SEISMIC_DIM_IQ, SEISMIC_DIM_IK
+using Segments = projection::op::SegmentSet<
+    1, projection::op::Types<packets::W0, packets::W1, packets::W2, packets::W3, packets::W4, packets::W5>,
+    projection::op::Types<Out, Out, Out, Out, Store, StoreIK>, projection::op::empty_mask(SEGMENT_ROWS)>;
 
-#define SEGMENT_OUT(RESULT, STRIDE, SCALE, EXTENT)                                                        \
-    Scaling::wrap(Store{RESULT, STRIDE, 0}, projection::scale_factor(SEISMIC_PTR(SCALE), EXTENT, 0, 0), \
+#define SEGMENT_OUT(STORE, RESULT, STRIDE, SCALE, EXTENT)                                                 \
+    Scaling::wrap(STORE{RESULT, STRIDE, 0}, projection::scale_factor(SEISMIC_PTR(SCALE), EXTENT, 0, 0),   \
                   1.0f)
 
 #define PROJECTION_M SEISMIC_DIM_M
@@ -39,7 +43,8 @@ using Segments = projection::op::SegmentSet<1, projection::op::Types<packets::W0
 // An empty segment's binding is irrelevant to the INT8 path.
 #define PROJECTION_INT8                                                                                      \
     SEISMIC_DIM_Q == 0 || PACKETS_FORM_INT8(KERNEL_W0), SEISMIC_DIM_GR == 0 || PACKETS_FORM_INT8(KERNEL_W1), \
-        SEISMIC_DIM_K == 0 || PACKETS_FORM_INT8(KERNEL_W2), SEISMIC_DIM_V == 0 || PACKETS_FORM_INT8(KERNEL_W3)
+        SEISMIC_DIM_K == 0 || PACKETS_FORM_INT8(KERNEL_W2), SEISMIC_DIM_V == 0 || PACKETS_FORM_INT8(KERNEL_W3), \
+        SEISMIC_DIM_IQ == 0 || PACKETS_FORM_INT8(KERNEL_W4), SEISMIC_DIM_IK == 0 || PACKETS_FORM_INT8(KERNEL_W5)
 #define PROJECTION_WEIGHT_TYPES Segments::Weights
 #define PROJECTION_ROWS(g)                                                                                \
     Pro {                                                                                                 \
@@ -57,15 +62,19 @@ using Segments = projection::op::SegmentSet<1, projection::op::Types<packets::W0
             {KERNEL_W0_AT(SEISMIC_PTR(SEISMIC_BUFFER_QUERY_WEIGHT)),                                       \
              KERNEL_W1_AT(SEISMIC_PTR(SEISMIC_BUFFER_GATE_WEIGHT)),                                        \
              KERNEL_W2_AT(SEISMIC_PTR(SEISMIC_BUFFER_KEY_WEIGHT)),                                         \
-             KERNEL_W3_AT(SEISMIC_PTR(SEISMIC_BUFFER_VALUE_WEIGHT))},                                      \
-        {SEGMENT_OUT(SEISMIC_RESULT_0_OUT, SEISMIC_RESULT_0_STRIDE_0, SEISMIC_BUFFER_QUERY_SCALE,     \
-                        SEISMIC_DIM_QS),                                                                  \
-                SEGMENT_OUT(SEISMIC_RESULT_1_OUT, SEISMIC_RESULT_1_STRIDE_0, SEISMIC_BUFFER_GATE_SCALE, \
-                            SEISMIC_DIM_GS),                                                              \
-                SEGMENT_OUT(SEISMIC_RESULT_2_OUT, SEISMIC_RESULT_2_STRIDE_0, SEISMIC_BUFFER_KEY_SCALE,  \
-                            SEISMIC_DIM_KS),                                                              \
-                SEGMENT_OUT(SEISMIC_RESULT_3_OUT, SEISMIC_RESULT_3_STRIDE_0, SEISMIC_BUFFER_VALUE_SCALE, \
-                            SEISMIC_DIM_VS)}                                                              \
+             KERNEL_W3_AT(SEISMIC_PTR(SEISMIC_BUFFER_VALUE_WEIGHT)),                                       \
+             KERNEL_W4_AT(SEISMIC_PTR(SEISMIC_BUFFER_INDEXER_QUERY_WEIGHT)),                               \
+             KERNEL_W5_AT(SEISMIC_PTR(SEISMIC_BUFFER_INDEXER_KEY_WEIGHT))},                                \
+        {SEGMENT_OUT(Store, SEISMIC_RESULT_0_OUT, SEISMIC_RESULT_0_STRIDE_0, SEISMIC_BUFFER_QUERY_SCALE,   \
+                     SEISMIC_DIM_QS),                                                                      \
+         SEGMENT_OUT(Store, SEISMIC_RESULT_1_OUT, SEISMIC_RESULT_1_STRIDE_0, SEISMIC_BUFFER_GATE_SCALE,    \
+                     SEISMIC_DIM_GS),                                                                      \
+         SEGMENT_OUT(Store, SEISMIC_RESULT_2_OUT, SEISMIC_RESULT_2_STRIDE_0, SEISMIC_BUFFER_KEY_SCALE,     \
+                     SEISMIC_DIM_KS),                                                                      \
+         SEGMENT_OUT(Store, SEISMIC_RESULT_3_OUT, SEISMIC_RESULT_3_STRIDE_0, SEISMIC_BUFFER_VALUE_SCALE,   \
+                     SEISMIC_DIM_VS),                                                                      \
+         Store{SEISMIC_RESULT_4_OUT, SEISMIC_RESULT_4_STRIDE_0, 0},                                        \
+         StoreIK{SEISMIC_RESULT_5_OUT, SEISMIC_RESULT_5_STRIDE_0, 0}}                                      \
     }
 
 #ifdef SEISMIC_FORMING_ATTENTION_PROJECT_STAGE

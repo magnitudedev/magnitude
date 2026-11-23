@@ -200,8 +200,11 @@ fn attention_project_cases(sets: &[[Format; 3]], seed: u64) {
                 GW: formats[0].resident(),
                 KW: formats[1].resident(),
                 VW: formats[2].resident(),
+                IQW: formats[0].resident(),
+                IKW: formats[0].resident(),
                 A: Element::bf16(),
                 Y: Element::bf16(),
+                IY: Element::bf16(),
             }),
             |_: &Device, mapping: Mapping| {
                 mapping.projection_params(statics_specialization(&[
@@ -212,6 +215,8 @@ fn attention_project_cases(sets: &[[Format; 3]], seed: u64) {
                     ("GR", 0),
                     ("K", keys),
                     ("V", keys),
+                    ("IQ", 0),
+                    ("IK", 0),
                     ("QS", 0),
                     ("GS", 0),
                     ("KS", 0),
@@ -246,6 +251,8 @@ fn attention_project_cases(sets: &[[Format; 3]], seed: u64) {
                             gate_weight: &gate,
                             key_weight: &weights[1].tensor,
                             value_weight: &weights[2].tensor,
+                            indexer_query_weight: &gate,
+                            indexer_key_weight: &gate,
                             epsilon: EPSILON,
                             project_mode,
                             query_scale: &f32_tensor(&device, &[0], &[]),
@@ -392,8 +399,11 @@ fn cuda_scaled_projections_match_host_model() {
                 GW: format.resident(),
                 KW: format.resident(),
                 VW: format.resident(),
+                IQW: format.resident(),
+                IKW: format.resident(),
                 A: Element::bf16(),
                 Y: Element::bf16(),
+                IY: Element::bf16(),
             }),
             |_: &Device, mapping: Mapping| {
                 mapping.projection_params(statics_specialization(&[
@@ -404,6 +414,8 @@ fn cuda_scaled_projections_match_host_model() {
                     ("GR", segments[1]),
                     ("K", segments[2]),
                     ("V", segments[3]),
+                    ("IQ", 0),
+                    ("IK", 0),
                     ("QS", 1),
                     ("GS", 1),
                     ("KS", 1),
@@ -431,6 +443,7 @@ fn cuda_scaled_projections_match_host_model() {
             }) {
                 let (x, operand) = operand_rows(&normed, d, mapping, Some(format));
                 let slack = sum_slack(&flips, &operand);
+                let empty = projections[0].tensor.slice_leading(0, 0).unwrap();
                 let projected = projection
                     .kernel(&device, mapping)
                     .call(&charges, attention_project::Args {
@@ -440,6 +453,8 @@ fn cuda_scaled_projections_match_host_model() {
                         gate_weight: &projections[1].tensor,
                         key_weight: &projections[2].tensor,
                         value_weight: &projections[3].tensor,
+                        indexer_query_weight: &empty,
+                        indexer_key_weight: &empty,
                         epsilon: EPSILON,
                         project_mode: 0,
                         query_scale: &scales[0],

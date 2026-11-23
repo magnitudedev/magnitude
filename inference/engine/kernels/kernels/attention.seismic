@@ -233,36 +233,45 @@ native attention_output for cpu from "cpu/attention_output.rs":
 # ---------------------------------------------------------------------------
 
 # RMS prologue over the F32 residual, then one segmented projection query |
-# gate | key | value, each segment with its own representation (Q = KV * G *
-# (W + I), GR = KV * G * U, K = V = KV * W). A segment of zero rows is
+# gate | key | value | indexer_query | indexer_key, each segment with its own
+# representation (Q = KV * G * (W + I), GR = KV * G * U, K = V = KV * W, and
+# optional selected-read indexer segments IQ and IK). A segment of zero rows is
 # skipped: GR = 0 without a separate gate, K = V = 0 for a layer without its
-# own keys, V = 0 when the value is the raw key. Every backend runs its K1
-# projection library (see `dense.seismic` for its launches); the segments
-# enumerate their tile groups or block columns in segment order. Mode 1 is
-# draft-history injection: Q/gate outputs are zero and only K/V is consumed.
-# Native backends may omit the Q/gate projection work in that mode. Each
-# segment's weight has its accumulator-scale port (QS, GS, KS, VS; see
-# `dense.seismic`), as `attention_output`'s weight has OS. The
-# normalized rows are A; the results are published in Y: A where attention
-# reads them, F32 where a pooled source pools them (`pooled.seismic`).
-fn attention_project[M, D, PT, NM, Q, GR, K, V, QS, GS, KS, VS, QB, GB, KB, VB](hidden: &tensor[M, PT * D] f32,
+# own keys, V = 0 when the value is the raw key, IQ = IK = 0 when unused. Every
+# backend runs its K1 projection library (see `dense.seismic` for its launches);
+# the segments enumerate their tile groups or block columns in segment order.
+# Mode 1 is draft-history injection: Q/gate outputs are zero and only K/V is
+# consumed. Native backends may omit the Q/gate projection work in that mode.
+# Each segment's weight has its accumulator-scale port (QS, GS, KS, VS; see
+# `dense.seismic`), as `attention_output`'s weight has OS. The normalized rows
+# are A; segments 0..4 are published in Y (A where attention reads them, F32
+# where a pooled source pools them, `pooled.seismic`), and segment 5
+# (`indexer_key`) is published in IY (F32 for grouped pooled keys, A
+# otherwise).
+fn attention_project[M, D, PT, NM, Q, GR, K, V, IQ, IK, QS, GS, KS, VS, QB, GB, KB, VB](hidden: &tensor[M, PT * D] f32,
     input_norm: &tensor[NM] NW,
     query_weight: &tensor[Q, D] QW, gate_weight: &tensor[GR, D] GW,
-    key_weight: &tensor[K, D] KW, value_weight: &tensor[V, D] VW, epsilon: f32,
-    project_mode: i32, query_scale: &tensor[QS] f32, gate_scale: &tensor[GS] f32,
-    key_scale: &tensor[KS] f32, value_scale: &tensor[VS] f32, query_bound: &tensor[QB] f32,
-    gate_bound: &tensor[GB] f32, key_bound: &tensor[KB] f32, value_bound: &tensor[VB] f32)
-    -> (tensor[M, Q] Y, tensor[M, GR] Y, tensor[M, K] Y, tensor[M, V] Y)
-    where Q >= 0 and GR >= 0 and K >= 0 and V >= 0 and QS >= 0 and QS <= 1 and GS >= 0 and GS <= 1 and KS >= 0 and KS <= 1 and VS >= 0 and VS <= 1 and QB >= 0 and GB >= 0 and KB >= 0 and VB >= 0 and (QB == 0 or D % QB == 0) and (GB == 0 or D % GB == 0) and (KB == 0 or D % KB == 0) and (VB == 0 or D % VB == 0) and NM >= 0 and ((NM == D and PT == 1) or (NM == 0 and PT >= 1)) and operands(QW) == operands(GW) and operands(QW) == operands(KW) and operands(QW) == operands(VW):
+    key_weight: &tensor[K, D] KW, value_weight: &tensor[V, D] VW,
+    indexer_query_weight: &tensor[IQ, D] IQW, indexer_key_weight: &tensor[IK, D] IKW,
+    epsilon: f32, project_mode: i32, query_scale: &tensor[QS] f32, gate_scale: &tensor[GS] f32,
+    key_scale: &tensor[KS] f32, value_scale: &tensor[VS] f32,
+    query_bound: &tensor[QB] f32, gate_bound: &tensor[GB] f32,
+    key_bound: &tensor[KB] f32, value_bound: &tensor[VB] f32)
+    -> (tensor[M, Q] Y, tensor[M, GR] Y, tensor[M, K] Y, tensor[M, V] Y, tensor[M, IQ] Y, tensor[M, IK] IY)
+    where Q >= 0 and GR >= 0 and K >= 0 and V >= 0 and IQ >= 0 and IK >= 0 and QS >= 0 and QS <= 1 and GS >= 0 and GS <= 1 and KS >= 0 and KS <= 1 and VS >= 0 and VS <= 1 and QB >= 0 and GB >= 0 and KB >= 0 and VB >= 0 and (QB == 0 or D % QB == 0) and (GB == 0 or D % GB == 0) and (KB == 0 or D % KB == 0) and (VB == 0 or D % VB == 0) and NM >= 0 and ((NM == D and PT == 1) or (NM == 0 and PT >= 1)) and operands(QW) == operands(GW) and operands(QW) == operands(KW) and operands(QW) == operands(VW) and operands(QW) == operands(IQW) and operands(QW) == operands(IKW):
     let mut normalized = tensor[M, D] A
     let mut query = tensor[M, Q] Y
     let mut gate = tensor[M, GR] Y
     let mut key = tensor[M, K] Y
     let mut value = tensor[M, V] Y
+    let mut indexer_query = tensor[M, IQ] Y
+    let mut indexer_key = tensor[M, IK] IY
     let mut query_sum = tensor[M, Q] f32
     let mut gate_sum = tensor[M, GR] f32
     let mut key_sum = tensor[M, K] f32
     let mut value_sum = tensor[M, V] f32
+    let mut indexer_query_sum = tensor[M, IQ] f32
+    let mut indexer_key_sum = tensor[M, IK] f32
     form_input(hidden, input_norm, normalized, epsilon)
     if Q > 0 and project_mode == 0:
         linear(normalized, query_weight, query_sum)
@@ -284,7 +293,17 @@ fn attention_project[M, D, PT, NM, Q, GR, K, V, QS, GS, KS, VS, QB, GB, KB, VB](
     if V > 0:
         linear(normalized, value_weight, value_sum)
         scale_rows(value_sum, value_scale, value)
-    return query, gate, key, value
+    if IQ > 0:
+        linear(normalized, indexer_query_weight, indexer_query_sum)
+        parallel for row in 0..M:
+            parallel for column in 0..IQ:
+                indexer_query[row, column] = indexer_query_sum[row, column]
+    if IK > 0:
+        linear(normalized, indexer_key_weight, indexer_key_sum)
+        parallel for row in 0..M:
+            parallel for column in 0..IK:
+                indexer_key[row, column] = indexer_key_sum[row, column]
+    return query, gate, key, value, indexer_query, indexer_key
 
 # Metal: the `dense` projection (`dense.seismic`), segmented, over the
 # normalized rows: the GEMVs and the batched rows normalize while staging;
@@ -292,9 +311,9 @@ fn attention_project[M, D, PT, NM, Q, GR, K, V, QS, GS, KS, VS, QB, GB, KB, VB](
 # `stage_tall` in the tall GEMM's order. Mode 1's query and gate segments
 # are zeros in every form.
 native attention_project for metal from "metal/attention_project.metal":
-    static (D, PT, NM, Q, GR, K, V, QS, GS, KS, VS, QB, GB, KB, VB)
+    static (D, PT, NM, Q, GR, K, V, IQ, IK, QS, GS, KS, VS, QB, GB, KB, VB)
     where D > 0
-    project dense segmented (query_weight, gate_weight, key_weight, value_weight)
+    project dense segmented (query_weight, gate_weight, key_weight, value_weight, indexer_query_weight, indexer_key_weight)
     scratch normalized bytes ((M + TALL * (ceil_div(M, 64) * 64 - M)) * D * 2) when M > 16 or M >= MATRIX_FROM
     launch attention_project_stage before batch when (M > 16 or M >= MATRIX_FROM) and (M <= 64 or TALL == 0 or PACK == 1):
         staging
@@ -320,15 +339,15 @@ native attention_project for metal from "metal/attention_project.metal":
 # the 1..8-row launch's 8; sharing one setting, 8 would make its 16 rows 6%
 # slower on the 3090 (51.5 against 48.5), which no order requires.
 native attention_project for cuda from "cuda/attention_project.cu":
-    static (D, PT, NM, Q, GR, K, V, QS, GS, KS, VS)
+    static (D, PT, NM, Q, GR, K, V, IQ, IK, QS, GS, KS, VS)
     where D > 0
-    project dense segmented (query_weight, gate_weight, key_weight, value_weight) rows rms
+    project dense segmented (query_weight, gate_weight, key_weight, value_weight, indexer_query_weight, indexer_key_weight) rows rms
 
 # Vulkan: the `dense` projection (segmented) over the normalized rows.
 native attention_project for vulkan from "vulkan/attention_project.comp":
-    static (D, PT, NM, Q, GR, K, V, QS, GS, KS, VS)
+    static (D, PT, NM, Q, GR, K, V, IQ, IK, QS, GS, KS, VS)
     where D > 0
-    project dense segmented (query_weight, gate_weight, key_weight, value_weight) rows rms
+    project dense segmented (query_weight, gate_weight, key_weight, value_weight, indexer_query_weight, indexer_key_weight) rows rms
 
 # CPU: the hidden rows under the input norm are the projection's operand:
 # the operator's `form` launch forms each normalized row as F32 (NVFP4
@@ -338,9 +357,9 @@ native attention_project for vulkan from "vulkan/attention_project.comp":
 native attention_project for cpu from "cpu/attention_project.rs":
     static (D, QS, GS, KS, VS)
     where D > 0
-    project quantized tiled (QW, GW, KW, VW) over (M, D) operand (hidden normed (input_norm, epsilon))
+    project quantized tiled (QW, GW, KW, VW, IQW, IKW) over (M, D) operand (hidden normed (input_norm, epsilon))
     launch attention_project_rows:
-        threadgroups (ceil_div(Q, ROWS) + ceil_div(GR, ROWS) + ceil_div(K, ROWS) + ceil_div(V, ROWS), 1, 1)
+        threadgroups (ceil_div(Q, ROWS) + ceil_div(GR, ROWS) + ceil_div(K, ROWS) + ceil_div(V, ROWS) + ceil_div(IQ, ROWS) + ceil_div(IK, ROWS), 1, 1)
         threads_per_threadgroup (1, 1, 1)
 
 # A row as the model holds it in its activation element A: each value

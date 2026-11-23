@@ -91,10 +91,11 @@ impl<'a, G: GraphDraft + 'a> Clone for LowRankQueryEntries<'a, G> {
     }
 }
 
-/// A selected read's entries ([`select`]): its keys' projection and pooling,
-/// its indexer, its reads and the codec's WorkList prefill.
+/// A selected read's entries ([`select`]): its keys' projection (`None` when
+/// fused into the main 6-segment `attention_project`) and pooling, its
+/// indexer, its reads and the codec's WorkList prefill.
 pub(crate) struct SelectionGraphEntries<'a, G: GraphDraft + 'a> {
-    pub project: G::Ranged<'a, attention_project::Entry>,
+    pub project: Option<G::Ranged<'a, attention_project::Entry>>,
     pub pool: G::Binding<'a, pool_rows::Entry>,
     pub indexer: IndexerEntries<'a, G>,
     pub reads: G::Binding<'a, unit_reads::Entry>,
@@ -239,7 +240,7 @@ impl<'a> From<&'a AttentionKernels> for AttentionGraphEntries<'a, NativeGraph> {
                 .selection
                 .as_ref()
                 .map(|selection| SelectionGraphEntries {
-                    project: &selection.keys.project,
+                    project: selection.keys.project.as_ref(),
                     pool: &selection.keys.pool,
                     indexer: (&selection.indexer).into(),
                     reads: &selection.reads,
@@ -280,7 +281,7 @@ impl<'a> From<&'a AttentionKernels> for AttentionGraphEntries<'a, NativeGraph> {
 impl<'a> From<&'a crate::native::IndexerKernels> for IndexerEntries<'a, NativeGraph> {
     fn from(indexer: &'a crate::native::IndexerKernels) -> Self {
         IndexerEntries {
-            query_project: &indexer.query_project,
+            query_project: indexer.query_project.as_ref(),
             weights_project: indexer.weights_project.as_ref(),
             score: &indexer.score,
             topk: &indexer.topk,
@@ -292,11 +293,13 @@ impl<'a> From<&'a crate::native::IndexerKernels> for IndexerEntries<'a, NativeGr
     }
 }
 
+type CheckedLowRankQueryEntries = ([(&'static str, Element); 1], [(&'static str, Element); 10]);
+
 /// Entry element assignments from the same program binding used by native
 /// preparation. The checked graph obtains all shapes from the entries.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub(crate) struct CheckedAttentionEntries {
-    project: [(&'static str, Element); 7],
+    project: [(&'static str, Element); 10],
     mix: [(&'static str, Element); 1],
     output: [(&'static str, Element); 2],
     grouped: Option<[(&'static str, Element); 3]>,
@@ -313,7 +316,7 @@ pub(crate) struct CheckedAttentionEntries {
     /// A selected read's keys' projection and indexer's elements.
     selection: Option<CheckedSelectionEntries>,
     /// A low-rank query's widening and up projection.
-    low_rank_query: Option<([(&'static str, Element); 1], [(&'static str, Element); 7])>,
+    low_rank_query: Option<CheckedLowRankQueryEntries>,
     /// An indexing index-list source's entries.
     picked: Option<CheckedPickedEntries>,
 }
@@ -379,7 +382,11 @@ impl CheckedIndexerEntries {
         &self,
     ) -> IndexerEntries<'_, G> {
         IndexerEntries {
-            query_project: G::bind_ranged(&self.elements.query_project[..]),
+            query_project: self
+                .elements
+                .query_project
+                .as_ref()
+                .map(|elements| G::bind_ranged(&elements[..])),
             weights_project: self
                 .elements
                 .weights_project
@@ -396,12 +403,12 @@ impl CheckedIndexerEntries {
 }
 
 /// A selected read's entry elements: its keys' `u | g` projection
-/// (`pooled::tokens_project`, published directly in F32), `pool_rows`'
-/// (its keys stored in F32), and its indexer's (`unit_reads` and
-/// `candidate_rows` read none).
+/// (`pooled::tokens_project`, published directly in F32; `None` when fused
+/// into the main 6-segment `attention_project`), `pool_rows`' (its keys stored
+/// in F32), and its indexer's (`unit_reads` and `candidate_rows` read none).
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 struct CheckedSelectionEntries {
-    project: [(&'static str, Element); 7],
+    project: Option<[(&'static str, Element); 10]>,
     pool: [(&'static str, Element); 2],
     indexer: CheckedIndexerEntries,
 }
@@ -409,16 +416,22 @@ struct CheckedSelectionEntries {
 impl CheckedSelectionEntries {
     fn new(binding: AttentionBinding, selection: crate::SelectionBinding) -> Self {
         let activation = binding.activation;
+        let fused = binding.fuses_selection_projections();
         Self {
-            project: super::pooled::tokens_project(
-                activation,
-                binding.norm,
-                selection.keys.projection,
-                selection.keys.gate,
-                Pooling::Grouped,
-            ),
+            project: (!fused).then(|| {
+                super::pooled::tokens_project(
+                    activation,
+                    binding.norm,
+                    selection.keys.projection,
+                    selection.keys.gate,
+                    Pooling::Grouped,
+                )
+            }),
             pool: [("A", activation), ("Y", Element::f32())],
-            indexer: CheckedIndexerEntries::new(IndexerElements::of(binding, selection.indexer), activation),
+            indexer: CheckedIndexerEntries::new(
+                IndexerElements::of(binding, selection.indexer, fused && !binding.key_value_only),
+                activation,
+            ),
         }
     }
 
@@ -427,7 +440,10 @@ impl CheckedSelectionEntries {
         prefill: SelectedPrefillEntries<'a, G>,
     ) -> SelectionGraphEntries<'a, G> {
         SelectionGraphEntries {
-            project: G::bind_ranged(&self.project[..]),
+            project: self
+                .project
+                .as_ref()
+                .map(|elements| G::bind_ranged(&elements[..])),
             pool: G::bind(&self.pool[..]),
             indexer: self.indexer.entries(),
             reads: G::bind(&[]),
@@ -498,8 +514,11 @@ impl CheckedAttentionEntries {
                         ("GW", binding.query),
                         ("KW", binding.query),
                         ("VW", binding.query),
+                        ("IQW", binding.query),
+                        ("IKW", binding.query),
                         ("A", binding.activation),
                         ("Y", binding.activation),
+                        ("IY", binding.activation),
                     ],
                 )
             }),
@@ -512,8 +531,11 @@ impl CheckedAttentionEntries {
                 ("GW", binding.gate_segment()),
                 ("KW", binding.key_segment()),
                 ("VW", binding.value_segment()),
+                ("IQW", binding.indexer_query_segment()),
+                ("IKW", binding.indexer_key_segment()),
                 ("A", binding.activation),
                 ("Y", binding.activation),
+                ("IY", binding.indexer_key_output()),
             ],
             mix: [("A", binding.activation)],
             output: [("OW", binding.output), ("A", binding.activation)],
@@ -781,7 +803,7 @@ pub(crate) fn query_projection_dimensions<D: From<u64>>(
     rows: D,
     inputs: D,
     outputs: D,
-) -> [(&'static str, D); 6] {
+) -> [(&'static str, D); 8] {
     [
         ("M", rows),
         ("D", inputs),
@@ -789,6 +811,8 @@ pub(crate) fn query_projection_dimensions<D: From<u64>>(
         ("GR", D::from(0)),
         ("K", D::from(0)),
         ("V", D::from(0)),
+        ("IQ", D::from(0)),
+        ("IK", D::from(0)),
     ]
 }
 
@@ -804,6 +828,10 @@ pub(crate) struct SelectionInputs<'n, 'v, 'a, G: GraphDraft + 'a> {
     pub input_norm: &'v WorkflowTensorView,
     pub epsilon: Argument<f32>,
     pub qr: Option<(ProjectionInput<'v>, &'v WorkflowTensorView, Argument<f32>)>,
+    /// Pre-projected indexer key (`u`, F32) and query (`A`) from the fused
+    /// 6-segment `attention_project` when `entries.project` is `None`.
+    pub preprojected_key: Option<WorkflowTensor>,
+    pub preprojected_query: Option<WorkflowTensor>,
     pub selection: SelectionPart<'n>,
 }
 
@@ -842,72 +870,93 @@ fn select<'a, G: GraphDraft + 'a>(
     let source = &read.source;
     let width = &source.width;
     let gt = axis(read.keys.gated);
-    let gate_rows = &gt * width;
-    // The tokens' `u` and `g` under the input norm, then in F32.
-    let empty = weights.projection.weight.slice_leading(0, 0);
-    let absent = GraphConstant::absent(graph, constants)?.tensor().clone();
-    let gate = weights.gate.as_ref();
-    let (projection, gate_operands) = (&weights.projection.operands, gate.map(|gate| &gate.operands));
-    let operand = |extent: Option<&Dim>| extent.cloned().unwrap_or(Dim::from(0));
+    let gate_rows = gt * *width;
+    // The tokens' `u` and `g` under the input norm, then in F32. When fused
+    // into the main 6-segment `attention_project`, `preprojected_key` holds `u`
+    // directly and no separate `attention_project` launch is emitted.
     let x = &selection.x;
-    let projected = graph.enqueue(
-        G::pick(entries.project, rows),
-        &[
-            [
-                ("M", rows.clone()),
-                ("D", x.width.clone()),
-                ("Q", width.clone()),
-                ("GR", gate_rows.clone()),
-                ("K", Dim::from(0)),
-                ("V", Dim::from(0)),
-                ("QS", projection.scale.extent.clone()),
-                ("GS", operand(gate_operands.map(|operands| &operands.scale.extent))),
-                ("KS", Dim::from(0)),
-                ("VS", Dim::from(0)),
-                ("QB", projection.bound.extent.clone()),
-                ("GB", operand(gate_operands.map(|operands| &operands.bound.extent))),
-                ("KB", Dim::from(0)),
-                ("VB", Dim::from(0)),
-            ]
-            .as_slice(),
-            &x.form.dimensions(x.width.clone()),
-        ]
-        .concat(),
-        attention_project::WorkflowArgs {
-            hidden: x.rows.into(),
-            input_norm: selection.input_norm.into(),
-            query_weight: (&weights.projection.weight).into(),
-            gate_weight: match gate {
-                Some(gate) => (&gate.weight).into(),
-                None => (&empty).into(),
-            },
-            key_weight: (&empty).into(),
-            value_weight: (&empty).into(),
-            epsilon: selection.epsilon,
-            project_mode: 0.into(),
-            query_scale: (&projection.scale.tensor).into(),
-            gate_scale: match gate_operands {
-                Some(operands) => (&operands.scale.tensor).into(),
-                None => (&absent).into(),
-            },
-            key_scale: (&absent).into(),
-            value_scale: (&absent).into(),
-            query_bound: (&projection.bound.tensor).into(),
-            gate_bound: match gate_operands {
-                Some(operands) => (&operands.bound.tensor).into(),
-                None => (&absent).into(),
-            },
-            key_bound: (&absent).into(),
-            value_bound: (&absent).into(),
-        },
-    )?;
-    // Grouped pool projections are published directly in F32
-    // (`pooled::tokens_project`).
-    let u = projected.r0.clone();
-    let g = match gate {
-        Some(_) => projected.r1.reshape(&[rows.clone(), gate_rows.clone()]),
-        // No gate scores: zero columns of the F32 rows.
-        None => u.slice_leading(0, 0).reshape(&[rows.clone(), Dim::from(0)]),
+    let (u, g) = match &selection.preprojected_key {
+        Some(u) => {
+            if weights.gate.is_some() {
+                return Err("fused selected-read projection with a gated pool".into());
+            }
+            (u.clone(), u.slice_leading(0, 0).reshape(&[*rows, Dim::from(0)]))
+        }
+        None => {
+            let project_entry = entries
+                .project
+                .ok_or("a selected read without its key projection entry or preprojected key")?;
+            let empty = weights.projection.weight.slice_leading(0, 0);
+            let absent = GraphConstant::absent(graph, constants)?.tensor().clone();
+            let gate = weights.gate.as_ref();
+            let (projection, gate_operands) =
+                (&weights.projection.operands, gate.map(|gate| &gate.operands));
+            let operand = |extent: Option<&Dim>| extent.copied().unwrap_or(Dim::from(0));
+            let projected = graph.enqueue(
+                G::pick(project_entry, rows),
+                &[
+                    [
+                        ("M", *rows),
+                        ("D", x.width),
+                        ("Q", *width),
+                        ("GR", gate_rows),
+                        ("K", Dim::from(0)),
+                        ("V", Dim::from(0)),
+                        ("IQ", Dim::from(0)),
+                        ("IK", Dim::from(0)),
+                        ("QS", projection.scale.extent),
+                        ("GS", operand(gate_operands.map(|operands| &operands.scale.extent))),
+                        ("KS", Dim::from(0)),
+                        ("VS", Dim::from(0)),
+                        ("QB", projection.bound.extent),
+                        ("GB", operand(gate_operands.map(|operands| &operands.bound.extent))),
+                        ("KB", Dim::from(0)),
+                        ("VB", Dim::from(0)),
+                    ]
+                    .as_slice(),
+                    &x.form.dimensions(x.width),
+                ]
+                .concat(),
+                attention_project::WorkflowArgs {
+                    hidden: x.rows.into(),
+                    input_norm: selection.input_norm.into(),
+                    query_weight: (&weights.projection.weight).into(),
+                    gate_weight: match gate {
+                        Some(gate) => (&gate.weight).into(),
+                        None => (&empty).into(),
+                    },
+                    key_weight: (&empty).into(),
+                    value_weight: (&empty).into(),
+                    indexer_query_weight: (&empty).into(),
+                    indexer_key_weight: (&empty).into(),
+                    epsilon: selection.epsilon,
+                    project_mode: 0.into(),
+                    query_scale: (&projection.scale.tensor).into(),
+                    gate_scale: match gate_operands {
+                        Some(operands) => (&operands.scale.tensor).into(),
+                        None => (&absent).into(),
+                    },
+                    key_scale: (&absent).into(),
+                    value_scale: (&absent).into(),
+                    query_bound: (&projection.bound.tensor).into(),
+                    gate_bound: match gate_operands {
+                        Some(operands) => (&operands.bound.tensor).into(),
+                        None => (&absent).into(),
+                    },
+                    key_bound: (&absent).into(),
+                    value_bound: (&absent).into(),
+                },
+            )?;
+            // Grouped pool projections are published directly in F32
+            // (`pooled::tokens_project`).
+            let u = projected.r0.clone();
+            let g = match gate {
+                Some(_) => projected.r1.reshape(&[*rows, gate_rows]),
+                // No gate scores: zero columns of the F32 rows.
+                None => u.slice_leading(0, 0).reshape(&[*rows, Dim::from(0)]),
+            };
+            (u, g)
+        }
     };
     // The keys: each pending token's in the Window, each unit's in the Block.
     let place = if read.keys.place { read.block.clone() } else { Dim::from(0) };
@@ -1072,6 +1121,7 @@ fn select<'a, G: GraphDraft + 'a>(
                 norm: query_norm_input,
                 epsilon: query_epsilon,
             },
+            preprojected_query: selection.preprojected_query.clone(),
             query_norm: query_norm.as_ref(),
             head_weights,
             write: None,
@@ -1433,14 +1483,14 @@ impl AttentionWeights {
                                 )
                             })
                             .transpose()?,
-                        indexer: (attends && read.scored)
+                        indexer: (attends && (read.scored || (!read.keys.gated && !read.query_rank)))
                             .then(|| {
                                 indexer_weights(
                                     graph,
                                     planned,
                                     scope,
-                                    read.source.head_weights,
-                                    selection.indexer.query_norm.is_some(),
+                                    read.scored && read.source.head_weights,
+                                    read.scored && selection.indexer.query_norm.is_some(),
                                     ports,
                                     constants,
                                 )
@@ -1522,6 +1572,46 @@ pub(crate) fn attention<'a, G: GraphDraft + 'a>(
     let active_gate = (!inject_only).then(|| weights.gate.separate()).flatten();
     let active_key = weights.key_value.key();
     let active_value = weights.key_value.value();
+    let fuse_selection = kernels.selection.is_some_and(|sel| sel.project.is_none());
+    let (active_indexer_query, active_indexer_key, empty_indexer_weight, indexer_dims) =
+        if fuse_selection {
+            let (Some(sel_weights), Some(sel_part)) = (weights.selection.as_deref(), block.selection)
+            else {
+                return Err("fused selection entries without selection weights or block".into());
+            };
+            let active_iq = (!inject_only)
+                .then(|| sel_weights.indexer.as_ref().map(|i| &i.query))
+                .flatten();
+            let active_ik = Some(&sel_weights.projection);
+            if let Some(iq) = active_iq {
+                assert_eq!(
+                    iq.operands.scale.extent,
+                    Dim::from(0),
+                    "fused indexer_query_weight must not carry a second-level scale"
+                );
+            }
+            if let Some(ik) = active_ik {
+                assert_eq!(
+                    ik.operands.scale.extent,
+                    Dim::from(0),
+                    "fused indexer_key_weight must not carry a second-level scale"
+                );
+            }
+            let iq_rows = if active_iq.is_some() {
+                sel_part.read.source.heads * sel_part.read.source.width
+            } else {
+                Dim::from(0)
+            };
+            let ik_rows = sel_part.read.source.width;
+            (active_iq, active_ik, empty_weight.clone(), [("IQ", iq_rows), ("IK", ik_rows)])
+        } else {
+            (
+                None,
+                None,
+                empty_weight.clone(),
+                [("IQ", Dim::from(0)), ("IK", Dim::from(0))],
+            )
+        };
     let absent = (active_query.is_none()
         || active_gate.is_none()
         || active_key.is_none()
@@ -1571,6 +1661,7 @@ pub(crate) fn attention<'a, G: GraphDraft + 'a>(
             }
             .as_slice(),
             weights.project_dimensions(inject_only).as_slice(),
+            &indexer_dims,
             &input.form.dimensions(hidden.clone()),
         ]
         .concat(),
@@ -1581,6 +1672,8 @@ pub(crate) fn attention<'a, G: GraphDraft + 'a>(
             gate_weight: opt_weight(active_gate, &empty_gate_weight),
             key_weight: opt_weight(active_key, &empty_weight),
             value_weight: opt_weight(active_value, &empty_weight),
+            indexer_query_weight: opt_weight(active_indexer_query, &empty_indexer_weight),
+            indexer_key_weight: opt_weight(active_indexer_key, &empty_weight),
             epsilon: topology.epsilon.f32(),
             project_mode: 0.into(),
             query_scale: opt_scale(active_query, absent.as_ref()).into(),
@@ -1593,6 +1686,8 @@ pub(crate) fn attention<'a, G: GraphDraft + 'a>(
             value_bound: opt_bound(active_value, absent.as_ref()).into(),
         },
     )?;
+    let preprojected_indexer_query = active_indexer_query.map(|_| projected.r4.clone());
+    let preprojected_indexer_key = active_indexer_key.map(|_| projected.r5.clone());
     // A low-rank query's `qr` rows (`[rows, rank]`, the query segment),
     // widened to F32: the intermediate later stages read. The up projection
     // normalizes them by their norm in its prologue and projects the query
@@ -1634,6 +1729,8 @@ pub(crate) fn attention<'a, G: GraphDraft + 'a>(
                         gate_weight: (&empty).into(),
                         key_weight: (&empty).into(),
                         value_weight: (&empty).into(),
+                        indexer_query_weight: (&empty).into(),
+                        indexer_key_weight: (&empty).into(),
                         epsilon: low_rank.epsilon.f32(),
                         project_mode: 0.into(),
                         query_scale: (&up_operands.scale.tensor).into(),
@@ -1749,6 +1846,8 @@ pub(crate) fn attention<'a, G: GraphDraft + 'a>(
                 )),
                 (true, None) => return Err("a selected read's query over the absent `qr` rows".into()),
             },
+            preprojected_key: preprojected_indexer_key,
+            preprojected_query: preprojected_indexer_query,
             selection,
         }),
         _ => return Err("attention selection entries, weights and block disagree".into()),

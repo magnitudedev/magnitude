@@ -55,10 +55,12 @@ pub(crate) struct AttentionProjectCase {
     gate: Tensor,
     key: Tensor,
     value: Tensor,
+    indexer_query: Tensor,
+    indexer_key: Tensor,
     epsilon: f32,
-    /// The segments' scales, query, gate, key, value.
+    /// The first four segments' scales: query, gate, key, value.
     scales: [Tensor; 4],
-    /// The segments' packing bounds, in the same order.
+    /// The first four segments' packing bounds: query, gate, key, value.
     bounds: [Tensor; 4],
 }
 
@@ -101,10 +103,10 @@ pub(super) fn segment_bounds(
 }
 
 impl AttentionProjectTuning {
-    /// The segments' weight kinds whose scales and packing bounds the
-    /// projection binds, in `attention_project`'s order; none for an absent
-    /// segment (and for the query and gate of a key-value-only projection),
-    /// as the block's graph binds them.
+    /// The segments' weight kinds whose scales the projection binds, in
+    /// `attention_project`'s order; none for an absent segment (and for the
+    /// query, gate and indexer query of a key-value-only projection), as the
+    /// block's graph binds them.
     fn operand_kinds(&self, query: WeightKind) -> [Option<WeightKind>; 4] {
         let shape = self.binding.shape;
         let projects = !self.binding.key_value_only;
@@ -124,8 +126,11 @@ impl AttentionProjectTuning {
             GW: b.gate_segment(),
             KW: b.key_segment(),
             VW: b.value_segment(),
+            IQW: b.indexer_query_segment(),
+            IKW: b.indexer_key_segment(),
             A: b.activation,
             Y: b.activation,
+            IY: b.indexer_key_output(),
         }
     }
 }
@@ -152,13 +157,16 @@ impl EntryTuning for AttentionProjectTuning {
     fn bindings(&self) -> String {
         let b = self.binding;
         format!(
-            "NW={},QW={},GW={},KW={},VW={},A={}",
+            "NW={},QW={},GW={},KW={},VW={},IQW={},IKW={},A={},IY={}",
             b.norm.name(),
             b.query_segment().name(),
             b.gate_segment().name(),
             b.key_segment().name(),
             b.value_segment().name(),
-            b.activation.name()
+            b.indexer_query_segment().name(),
+            b.indexer_key_segment().name(),
+            b.activation.name(),
+            b.indexer_key_output().name(),
         )
     }
 
@@ -175,6 +183,10 @@ impl EntryTuning for AttentionProjectTuning {
             return Err("the query projection disagrees with the binding".into());
         }
         let mut statics = statics.to_vec();
+        statics.extend([
+            ("IQ", self.binding.indexer_query_rows()),
+            ("IK", self.binding.indexer_key_rows()),
+        ]);
         let [query, gate, key, value] = self.operand_kinds(query);
         statics.extend(scale_statics(
             inputs,
@@ -203,6 +215,9 @@ impl EntryTuning for AttentionProjectTuning {
         let shape = self.binding.shape;
         let query_kind = operators::attention::query_segment_kind(operator(inputs, &self.scopes)?);
         let (parts, norm) = inputs.input_form(&self.scopes, shape.widths.hidden)?;
+        let iq_rows = self.binding.indexer_query_rows();
+        let ik_rows = self.binding.indexer_key_rows();
+        let kinds = self.operand_kinds(query_kind);
         TuningInputs::rotation_scopes(&self.scopes, point)
             .into_iter()
             .enumerate()
@@ -228,6 +243,8 @@ impl EntryTuning for AttentionProjectTuning {
                     },
                     key: segment(shape.key_rows(), WeightKind::Key)?,
                     value: segment(shape.value_rows(), WeightKind::Value)?,
+                    indexer_query: segment(iq_rows, WeightKind::IndexerQuery)?,
+                    indexer_key: segment(ik_rows, WeightKind::IndexerKey)?,
                     hidden: inputs.activation(
                         Element::f32(),
                         &[point.rows, parts * shape.widths.hidden],
@@ -247,8 +264,8 @@ impl EntryTuning for AttentionProjectTuning {
                         query
                     },
                     epsilon: self.epsilon,
-                    scales: segment_scales(inputs, scope, self.operand_kinds(query_kind))?,
-                    bounds: segment_bounds(inputs, scope, self.operand_kinds(query_kind))?,
+                    scales: segment_scales(inputs, scope, kinds)?,
+                    bounds: segment_bounds(inputs, scope, kinds)?,
                 })
             })
             .collect()
@@ -262,6 +279,8 @@ impl EntryTuning for AttentionProjectTuning {
             gate_weight: &case.gate,
             key_weight: &case.key,
             value_weight: &case.value,
+            indexer_query_weight: &case.indexer_query,
+            indexer_key_weight: &case.indexer_key,
             epsilon: case.epsilon,
             project_mode: 0,
             query_scale: &case.scales[0],
@@ -302,8 +321,11 @@ impl LowRankQueryProjectTuning {
             GW: query,
             KW: query,
             VW: query,
+            IQW: query,
+            IKW: query,
             A: self.binding.activation,
             Y: self.binding.activation,
+            IY: self.binding.activation,
         }
     }
 }
@@ -362,6 +384,7 @@ impl EntryTuning for LowRankQueryProjectTuning {
         let query_kind = operators::attention::query_kind(attention);
         let (_, epsilon) = operators::attention::low_rank_query(attention)
             .ok_or("the binding's low-rank query is a full query")?;
+        let kinds = Self::operand_kinds(query_kind);
         TuningInputs::rotation_scopes(&self.scopes, point)
             .into_iter()
             .enumerate()
@@ -373,7 +396,9 @@ impl EntryTuning for LowRankQueryProjectTuning {
                 Ok(AttentionProjectCase {
                     gate: empty.clone(),
                     key: empty.clone(),
-                    value: empty,
+                    value: empty.clone(),
+                    indexer_query: empty.clone(),
+                    indexer_key: empty,
                     hidden: inputs.activation(
                         Element::f32(),
                         &[point.rows, rank],
@@ -382,8 +407,8 @@ impl EntryTuning for LowRankQueryProjectTuning {
                     input_norm: inputs.weight(scope, WeightKind::QueryDownNorm)?,
                     query,
                     epsilon: epsilon as f32,
-                    scales: segment_scales(inputs, scope, Self::operand_kinds(query_kind))?,
-                    bounds: segment_bounds(inputs, scope, Self::operand_kinds(query_kind))?,
+                    scales: segment_scales(inputs, scope, kinds)?,
+                    bounds: segment_bounds(inputs, scope, kinds)?,
                 })
             })
             .collect()
@@ -420,7 +445,7 @@ pub(crate) enum PooledProjectInput {
 /// `operators::attention::pooled::PickedElements` assigns.
 #[derive(Clone)]
 pub(crate) struct PooledProjectTuning {
-    pub elements: [(&'static str, Element); 7],
+    pub elements: [(&'static str, Element); 10],
     pub segments: [Option<WeightKind>; 2],
     pub input: PooledProjectInput,
     pub scopes: Vec<WeightScope>,
@@ -448,8 +473,11 @@ impl PooledProjectTuning {
             GW: self.element("GW"),
             KW: self.element("KW"),
             VW: self.element("VW"),
+            IQW: self.element("IQW"),
+            IKW: self.element("IKW"),
             A: self.element("A"),
             Y: self.element("Y"),
+            IY: self.element("IY"),
         }
     }
 
@@ -535,6 +563,8 @@ impl EntryTuning for PooledProjectTuning {
             ("GR", gate_rows),
             ("K", 0),
             ("V", 0),
+            ("IQ", 0),
+            ("IK", 0),
         ];
         let [query, gate, key, value] = self.operand_kinds();
         statics.extend(scale_statics(
@@ -564,6 +594,7 @@ impl EntryTuning for PooledProjectTuning {
         let [query_kind, gate_kind] = self.segments;
         let query_kind = query_kind.ok_or("a pooled projection without its query segment")?;
         let norm_element = self.element("NW");
+        let kinds = self.operand_kinds();
         TuningInputs::rotation_scopes(&self.scopes, point)
             .into_iter()
             .enumerate()
@@ -576,7 +607,9 @@ impl EntryTuning for PooledProjectTuning {
                         None => empty.clone(),
                     },
                     key: empty.clone(),
-                    value: empty,
+                    value: empty.clone(),
+                    indexer_query: empty.clone(),
+                    indexer_key: empty,
                     hidden: inputs.activation(
                         Element::f32(),
                         &[point.rows, parts * width],
@@ -585,8 +618,8 @@ impl EntryTuning for PooledProjectTuning {
                     input_norm: inputs.input_norm(scope, norm, norm_element, norm_extent)?,
                     query,
                     epsilon,
-                    scales: segment_scales(inputs, scope, self.operand_kinds())?,
-                    bounds: segment_bounds(inputs, scope, self.operand_kinds())?,
+                    scales: segment_scales(inputs, scope, kinds)?,
+                    bounds: segment_bounds(inputs, scope, kinds)?,
                 })
             })
             .collect()

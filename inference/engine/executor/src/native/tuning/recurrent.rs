@@ -849,8 +849,9 @@ pub(crate) struct KimiProjectCase {
     hidden: Tensor,
     input_norm: Tensor,
     /// The segments' weights, scales and packing bounds, in
-    /// [`KIMI_SEGMENTS`]'s order.
+    /// [`KIMI_SEGMENTS`]'s order, plus an empty weight for unused segments 4..5.
     weights: [Tensor; 4],
+    empty: Tensor,
     scales: [Tensor; 4],
     bounds: [Tensor; 4],
     epsilon: f32,
@@ -864,8 +865,11 @@ impl KimiProjectTuning {
             GW: self.gate,
             KW: self.alpha,
             VW: self.beta,
+            IQW: self.qkv,
+            IKW: self.qkv,
             A: self.activation,
             Y: self.activation,
+            IY: self.activation,
         }
     }
 }
@@ -909,6 +913,8 @@ impl EntryTuning for KimiProjectTuning {
             ("GR", gate_rank),
             ("K", alpha_rank),
             ("V", heads),
+            ("IQ", 0),
+            ("IK", 0),
             ("PT", parts),
             ("NM", norm),
         ];
@@ -946,6 +952,9 @@ impl EntryTuning for KimiProjectTuning {
                     inputs.weight(scope, alpha)?,
                     inputs.weight(scope, beta)?,
                 ];
+                let empty = weights[0]
+                    .slice_leading(0, 0)
+                    .map_err(|error| error.to_string())?;
                 let hidden = weights[0].extents()[1];
                 let (parts, norm) = inputs.input_form(&self.shape.scopes, hidden)?;
                 Ok(KimiProjectCase {
@@ -956,6 +965,7 @@ impl EntryTuning for KimiProjectTuning {
                     )?,
                     input_norm: inputs.input_norm(scope, WeightKind::InputNorm, self.norm, norm)?,
                     weights,
+                    empty,
                     scales: segment_scales(inputs, scope, KIMI_SEGMENTS.map(Some))?,
                     bounds: segment_bounds(inputs, scope, KIMI_SEGMENTS.map(Some))?,
                     epsilon: self.epsilon,
@@ -972,6 +982,8 @@ impl EntryTuning for KimiProjectTuning {
             gate_weight: &case.weights[1],
             key_weight: &case.weights[2],
             value_weight: &case.weights[3],
+            indexer_query_weight: &case.empty,
+            indexer_key_weight: &case.empty,
             epsilon: case.epsilon,
             project_mode: 0,
             query_scale: &case.scales[0],

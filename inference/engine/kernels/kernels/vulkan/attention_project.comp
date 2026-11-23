@@ -8,6 +8,8 @@
 #define KERNEL_W1 SEISMIC_GATE_WEIGHT
 #define KERNEL_W2 SEISMIC_KEY_WEIGHT
 #define KERNEL_W3 SEISMIC_VALUE_WEIGHT
+#define KERNEL_W4 SEISMIC_INDEXER_QUERY_WEIGHT
+#define KERNEL_W5 SEISMIC_INDEXER_KEY_WEIGHT
 // The projection's decoding launches stage their weights' tables (`packets.glsl`).
 #define PACKETS_CONFIG_STAGED_TABLES 1
 #include "lib/core/activation.glsl"
@@ -34,6 +36,8 @@
 #define PROJECT_GATE_ROWS uint(SEISMIC_DIM_GR)
 #define PROJECT_KEY_ROWS uint(SEISMIC_DIM_K)
 #define PROJECT_VALUE_ROWS uint(SEISMIC_DIM_V)
+#define PROJECT_INDEXER_QUERY_ROWS uint(SEISMIC_DIM_IQ)
+#define PROJECT_INDEXER_KEY_ROWS uint(SEISMIC_DIM_IK)
 
 projection_prologue projected_input(uint g) {
     return projection_operands(projection_input(PROJECT_ACT, SEISMIC_PTR(SEISMIC_BUFFER_HIDDEN),
@@ -53,6 +57,12 @@ projection_weights attention_project_key() {
 }
 projection_weights attention_project_value() {
     return projection_weights(SEISMIC_PTR(SEISMIC_BUFFER_VALUE_WEIGHT), PACKETS_W3_ROWS, PROJECT_K, 0ul, 1ul, 0u);
+}
+projection_weights attention_project_indexer_query() {
+    return projection_weights(SEISMIC_PTR(SEISMIC_BUFFER_INDEXER_QUERY_WEIGHT), PACKETS_W4_ROWS, PROJECT_K, 0ul, 1ul, 0u);
+}
+projection_weights attention_project_indexer_key() {
+    return projection_weights(SEISMIC_PTR(SEISMIC_BUFFER_INDEXER_KEY_WEIGHT), PACKETS_W5_ROWS, PROJECT_K, 0ul, 1ul, 0u);
 }
 
 // Each segment's result, after its weight's second-level scale where it has
@@ -77,6 +87,14 @@ projection_epilogue attention_project_value_out() {
         SEISMIC_RESULT_3_STRIDE_0, SEISMIC_RESULT_3_STRIDE_1, 0ul),
         projection_scale_factor(SEISMIC_PTR(SEISMIC_BUFFER_VALUE_SCALE), SEISMIC_DIM_VS, 0ul, 0ul), 1.0);
 }
+projection_epilogue attention_project_indexer_query_out() {
+    return projection_store(SEISMIC_RESULT_4_OUT,
+        SEISMIC_RESULT_4_STRIDE_0, SEISMIC_RESULT_4_STRIDE_1, 0ul);
+}
+projection_epilogue attention_project_indexer_key_out() {
+    return projection_store(SEISMIC_RESULT_5_OUT,
+        SEISMIC_RESULT_5_STRIDE_0, SEISMIC_RESULT_5_STRIDE_1, 0ul);
+}
 
 #define PROJECTION_M uint(SEISMIC_DIM_M)
 #define PROJECTION_K PROJECT_K
@@ -86,14 +104,20 @@ projection_epilogue attention_project_value_out() {
 #define PROJECTION_N1 PROJECT_GATE_ROWS
 #define PROJECTION_N2 PROJECT_KEY_ROWS
 #define PROJECTION_N3 PROJECT_VALUE_ROWS
+#define PROJECTION_N4 PROJECT_INDEXER_QUERY_ROWS
+#define PROJECTION_N5 PROJECT_INDEXER_KEY_ROWS
 #define PROJECTION_WEIGHT0 attention_project_query()
 #define PROJECTION_WEIGHT1 attention_project_gate()
 #define PROJECTION_WEIGHT2 attention_project_key()
 #define PROJECTION_WEIGHT3 attention_project_value()
+#define PROJECTION_WEIGHT4 attention_project_indexer_query()
+#define PROJECTION_WEIGHT5 attention_project_indexer_key()
 #define PROJECTION_OUTPUT0 attention_project_query_out()
 #define PROJECTION_OUTPUT1 attention_project_gate_out()
 #define PROJECTION_OUTPUT2 attention_project_key_out()
 #define PROJECTION_OUTPUT3 attention_project_value_out()
+#define PROJECTION_OUTPUT4 attention_project_indexer_query_out()
+#define PROJECTION_OUTPUT5 attention_project_indexer_key_out()
 // Mode 1 has no query or gate projection.
 #define PROJECTION_ZEROED(s) (SEISMIC_PARAM_PROJECT_MODE != 0 && s < 2)
 
