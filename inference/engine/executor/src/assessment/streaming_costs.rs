@@ -331,6 +331,7 @@ fn convert_point(
             down: down_records.tensor_mut().into(),
             grid: grid.tensor().into(),
         },
+        &policy,
     )
     .map_err(|cause| error(&cause))?;
     let mut bound = vec![

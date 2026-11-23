@@ -393,11 +393,21 @@ pub struct RequestRows {
 impl RequestRows {
     /// The rule of the load `plan` places.
     pub fn of(plan: &crate::planning::ExecutionPlan) -> Self {
-        let method = plan.policy().method();
+        Self::from_plan_parts(
+            plan.resources().target_state().context_rows,
+            plan.policy().limits().max_launch_rows,
+            plan.policy().method(),
+        )
+    }
+
+    /// The rule from a plan's context limit, maximum launch rows, and method:
+    /// the single owner shared by [`crate::planning::StateResourcePlan::request_slot_bytes`]
+    /// and runtime [`Self::of`].
+    pub fn from_plan_parts(context_rows: usize, max_launch_rows: usize, method: crate::PlannedMethod) -> Self {
         Self {
-            window: plan.policy().limits().max_launch_rows as u64,
+            window: max_launch_rows as u64,
             method,
-            limit: crate::domain::claimed_through(0, plan.resources().target_state().context_rows, method),
+            limit: crate::domain::claimed_through(0, context_rows, method),
         }
     }
 

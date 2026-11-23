@@ -1687,13 +1687,11 @@ fn header_terms_include_exact_selected_weights_history_and_bounds() {
 
     let header = AssessmentHeaderBounds::derive(&load).unwrap();
     assert_eq!(
-        header.startup_additional_bytes,
-        AttestedPrograms::qualification_peak_bytes(&load)
-            .unwrap()
-            .max(load.target_upload_peak_bytes())
+        header.qualification_peak_bytes,
+        AttestedPrograms::qualification_peak_bytes(&load).unwrap()
     );
     assert_eq!(
-        header.staging_upload_bytes,
+        header.target_upload_peak_bytes,
         load.target_upload_peak_bytes()
     );
     assert_eq!(
@@ -1747,8 +1745,12 @@ fn header_terms_include_exact_selected_weights_history_and_bounds() {
         AttestedPrograms::DEVICE_BYTES + graph.total_bytes + device_process.bytes().unwrap()
     );
     assert_eq!(
-        bounds.startup_additional_bytes,
-        header.startup_additional_bytes
+        bounds.qualification_peak_bytes,
+        header.qualification_peak_bytes
+    );
+    assert_eq!(
+        bounds.target_upload_peak_bytes,
+        header.target_upload_peak_bytes
     );
     let state_bytes = state.capacity().workload_state_bytes;
     let history = state.target_state().sole_history().unwrap();
@@ -1765,14 +1767,15 @@ fn header_terms_include_exact_selected_weights_history_and_bounds() {
     let charge = terms
         .charge(bounds, state_bytes, startup_state, crate::PassLaunches::FLOOR)
         .unwrap();
+    let phase_b = terms.exact_resident_bytes(0).unwrap()
+        + bounds.prepared_resource_bytes().unwrap()
+        + (state_bytes + bounds.component_upload_bytes)
+            .max(startup_state + bounds.target_upload_peak_bytes);
     assert_eq!(
         charge.allocation_bytes,
-        terms.exact_resident_bytes(0).unwrap()
-            + bounds.prepared_resource_bytes().unwrap()
-            + (state_bytes + bounds.component_upload_bytes)
-                .max(startup_state + bounds.startup_additional_bytes)
+        bounds.qualification_phase_bytes().unwrap().max(phase_b)
     );
-    assert_eq!(charge.staging_bytes, header.staging_upload_bytes);
+    assert_eq!(charge.staging_bytes, header.target_upload_peak_bytes);
 
     // The fit depth is the served context limit, uncapped.
     definition.decoder.context_limit = 262_144;
@@ -1815,9 +1818,9 @@ fn fixture_charge(allocation_bytes: u64, staging_bytes: u64) -> AssessmentMemory
             graph_bytes: 0,
             recorded_graph_bytes: 0,
             recorded_graph_upload_bytes: 0,
-            startup_additional_bytes: 0,
+            qualification_peak_bytes: 0,
+            target_upload_peak_bytes: staging_bytes,
             component_upload_bytes: 0,
-            staging_upload_bytes: staging_bytes,
             sealed_graph_host_bytes: SealedGraphHostBytes {
                 at_most: 0,
                 at_least: 0,
@@ -1828,10 +1831,12 @@ fn fixture_charge(allocation_bytes: u64, staging_bytes: u64) -> AssessmentMemory
             device_process: NO_DEVICE_PROCESS,
         },
         serving_bytes: allocation_bytes,
+        phase_b_allocation_bytes: allocation_bytes,
         allocation_bytes,
         staging_bytes,
         host_table_bytes: 0,
         weight_demand: ClaimDemand::default(),
+        deferred_bank_bytes: 0,
         held_pass: crate::PassLaunches::FLOOR,
     }
 }
@@ -1849,6 +1854,7 @@ fn workload_charge_composes_exact_terms_and_upper_bounds() {
         conversations: 1,
         host_table_bytes: 30,
         weight_demand: ClaimDemand::default(),
+        deferred_bank_bytes: 0,
     };
     assert_eq!(terms.exact_resident_bytes(50).unwrap(), 100 + 20 + 5 + 50);
     let bounds = AssessmentMemoryBounds {
@@ -1856,9 +1862,11 @@ fn workload_charge_composes_exact_terms_and_upper_bounds() {
         graph_bytes: 40 - AttestedPrograms::DEVICE_BYTES,
         recorded_graph_bytes: 0,
         recorded_graph_upload_bytes: 0,
-        startup_additional_bytes: 60,
+        // Disjoint Phase A qualification peak (does not stack on Phase B).
+        qualification_peak_bytes: 80,
+        // Target-only upload peak during Phase B1.
+        target_upload_peak_bytes: 60,
         component_upload_bytes: 0,
-        staging_upload_bytes: 7,
         sealed_graph_host_bytes: SealedGraphHostBytes {
             at_most: 0,
             at_least: 0,
@@ -1868,15 +1876,16 @@ fn workload_charge_composes_exact_terms_and_upper_bounds() {
         host_process: NO_HOST_PROCESS,
         device_process: NO_DEVICE_PROCESS,
     };
-    // The workload's state outgrows the load's startup state and peak:
-    // the peak is not charged on top of it.
+    // The workload's state outgrows the load's startup state and target upload:
+    // the upload peak is not charged on top of it, and qualification (80 + 4)
+    // is disjoint from Phase B (125 + 40 + 90).
     let charge = terms.charge(bounds, 90, 10, crate::PassLaunches::FLOOR).unwrap();
     assert_eq!(charge.exact_resident_bytes, 100 + 20 + 5 + 90);
     assert_eq!(charge.allocation_bytes, 125 + 40 + 90);
     assert_eq!(charge.serving_bytes, 125 + 40 + 90);
-    assert_eq!(charge.staging_bytes, 7);
-    // The load's startup state and peak exceed the workload's state:
-    // serving holds the workload's state, not the load's peak.
+    assert_eq!(charge.staging_bytes, 60);
+    // The load's startup state and target upload exceed the workload's state:
+    // serving holds the workload's state, not the target upload peak.
     let loading = terms.charge(bounds, 50, 10, crate::PassLaunches::FLOOR).unwrap();
     assert_eq!(loading.allocation_bytes, 125 + 40 + (10 + 60));
     assert_eq!(loading.serving_bytes, 125 + 40 + 50);
@@ -1886,16 +1895,25 @@ fn workload_charge_composes_exact_terms_and_upper_bounds() {
     // import uploads beside the workload's state: serving's peak, and a
     // dedicated device stages the larger of the two.
     let component = AssessmentMemoryBounds {
-        component_upload_bytes: 30,
+        component_upload_bytes: 80,
         ..bounds
     };
     let loaded = terms.charge(component, 90, 10, crate::PassLaunches::FLOOR).unwrap();
-    assert_eq!(loaded.allocation_bytes, 125 + 40 + 90 + 30);
+    assert_eq!(loaded.allocation_bytes, 125 + 40 + 90 + 80);
     assert_eq!(loaded.serving_bytes, 125 + 40 + 90);
-    assert_eq!(loaded.staging_bytes, 30);
-    // The load's own peak still bounds it where it is the larger.
-    let early = terms.charge(component, 20, 10, crate::PassLaunches::FLOOR).unwrap();
-    assert_eq!(early.allocation_bytes, 125 + 40 + (10 + 60));
+    assert_eq!(loaded.staging_bytes, 80);
+    // When Phase A (qualification) exceeds Phase B, qualification alone sets
+    // allocation_bytes (still never stacked on weights + prepared).
+    let huge_qual = AssessmentMemoryBounds {
+        qualification_peak_bytes: 500,
+        ..bounds
+    };
+    let qual_bound = terms.charge(huge_qual, 90, 10, crate::PassLaunches::FLOOR).unwrap();
+    assert_eq!(
+        qual_bound.allocation_bytes,
+        AttestedPrograms::DEVICE_BYTES + 500
+    );
+    assert_eq!(qual_bound.phase_b_allocation_bytes, 125 + 40 + 90);
     assert!(
         AssessmentMemoryTerms {
             history_per_token: u64::MAX,
@@ -1903,6 +1921,196 @@ fn workload_charge_composes_exact_terms_and_upper_bounds() {
         }
         .history_at_fit_depth()
         .is_err()
+    );
+}
+
+#[test]
+fn qualification_phase_is_disjoint_from_weights_and_prepared_on_unified_and_split() {
+    let weight_demand = ClaimDemand {
+        device: 10 * GIB,
+        host: 6 * GIB,
+        ..ClaimDemand::default()
+    };
+    let bounds = AssessmentMemoryBounds {
+        graph_bytes: 2 * GIB - AttestedPrograms::DEVICE_BYTES,
+        recorded_graph_bytes: 0,
+        recorded_graph_upload_bytes: 0,
+        // 4 GiB qualification peak: smaller than Phase B (18 GiB total, 12 GiB
+        // device), so it must add ZERO bytes on top of weights + prepared.
+        qualification_peak_bytes: 4 * GIB,
+        target_upload_peak_bytes: 256 << 20,
+        component_upload_bytes: 0,
+        sealed_graph_host_bytes: SealedGraphHostBytes {
+            at_most: 0,
+            at_least: 0,
+        },
+        bound_graph_host_bytes: 0,
+        drafter_graph_host_bytes: 0,
+        host_process: NO_HOST_PROCESS,
+        device_process: NO_DEVICE_PROCESS,
+    };
+    let state_slab = 1 * GIB;
+    let startup_state = 64 << 20;
+    let charge = AssessmentMemoryCharge::compose(
+        weight_demand.checked_bytes().unwrap(),
+        weight_demand,
+        bounds,
+        state_slab,
+        startup_state,
+        0,
+        0,
+        crate::PassLaunches::FLOOR,
+    )
+    .unwrap();
+    // Phase B = 16 GiB weights + 2 GiB prepared + 1 GiB state = 19 GiB.
+    // Qualification (4 GiB + 4B) is NOT added on top of Phase B!
+    assert_eq!(charge.allocation_bytes, 19 * GIB);
+    assert_eq!(charge.phase_b_allocation_bytes, 19 * GIB);
+
+    // Split topology (RTX 3090 CUDA): device has 10 GiB device weights + 2 GiB
+    // prepared + 1 GiB state = 13 GiB; host has 6 GiB host weights + 256 MiB staging.
+    let split_topology = recorded::rtx3090();
+    let split_executor = executor(&split_topology, BackendName::Cuda);
+    assert_eq!(
+        charge.store_demands(&split_topology, split_executor).unwrap(),
+        StoreDemands::Split {
+            device: 13 * GIB,
+            host: 6 * GIB + (256 << 20),
+        }
+    );
+
+    // Split topology where Phase A (15 GiB device) > Phase B device (13 GiB),
+    // even though Phase A (15 GiB) < Phase B total (19 GiB): host_weights MUST
+    // NOT be subtracted from qualification_phase_bytes!
+    let large_qual = AssessmentMemoryCharge::compose(
+        weight_demand.checked_bytes().unwrap(),
+        weight_demand,
+        AssessmentMemoryBounds {
+            qualification_peak_bytes: 15 * GIB,
+            ..bounds
+        },
+        state_slab,
+        startup_state,
+        0,
+        0,
+        crate::PassLaunches::FLOOR,
+    )
+    .unwrap();
+    assert_eq!(large_qual.allocation_bytes, 19 * GIB);
+    assert_eq!(
+        large_qual.store_demands(&split_topology, split_executor).unwrap(),
+        StoreDemands::Split {
+            device: 15 * GIB + AttestedPrograms::DEVICE_BYTES,
+            host: 6 * GIB + (256 << 20),
+        }
+    );
+}
+
+#[test]
+fn target_startup_upload_excludes_lazy_head_upload_peak() {
+    let (definition, mut manifest) = target_reading_head_fixture();
+    // Store the draft head weights in F32 so the largest head tensor (98_304 B)
+    // exceeds the largest target tensor (65_536 B), mirroring GLM-5.3 MTP.
+    if let Some(draft) = manifest.draft.as_mut() {
+        let mut offset = 0;
+        for tensor in &mut draft.tensors {
+            tensor.encoding = magnitude_artifacts::gguf::Encoding::F32;
+            tensor.nbytes = tensor.shape.iter().product::<u64>() * 4;
+            tensor.offset = offset;
+            offset += tensor.nbytes;
+        }
+        draft.files[0].size = offset;
+    }
+    let load = ModelLoadPlan::derive(
+        &manifest,
+        &definition,
+        ComponentSelection { head: true, vision: false },
+        Layout::Rows16,
+        crate::PlannedMethod::Plain,
+        crate::planning::fixtures::LIMITS,
+    )
+    .unwrap();
+    let target_peak = load.target_upload_peak_bytes();
+    let head_peak = load.head_upload_peak_bytes();
+    assert!(
+        head_peak > target_peak,
+        "test setup requires head_upload_peak_bytes ({head_peak}) > target_upload_peak_bytes ({target_peak})"
+    );
+    let header = AssessmentHeaderBounds::derive(&load).unwrap();
+    assert_eq!(header.target_upload_peak_bytes, target_peak);
+    assert_eq!(header.component_upload_bytes, head_peak);
+    assert!(header.target_upload_peak_bytes < header.component_upload_bytes);
+}
+
+#[test]
+fn transient_target_upload_does_not_steal_streamed_bank_slots_past_floor() {
+    let weight_demand = ClaimDemand {
+        device: 20 * GIB, // 14 GiB non-banked+floor + 6 GiB bank slots past floor
+        ..ClaimDemand::default()
+    };
+    let deferred_bank_bytes = 6 * GIB;
+    let bounds = AssessmentMemoryBounds {
+        graph_bytes: 1 * GIB - AttestedPrograms::DEVICE_BYTES,
+        recorded_graph_bytes: 0,
+        recorded_graph_upload_bytes: 0,
+        qualification_peak_bytes: 2 * GIB,
+        // 1 GiB target upload > 400 MiB serving state, so without Fix #3
+        // loading_phase would steal 624 MiB from bank slots past floor.
+        target_upload_peak_bytes: 1 * GIB,
+        component_upload_bytes: 0,
+        sealed_graph_host_bytes: SealedGraphHostBytes {
+            at_most: 0,
+            at_least: 0,
+        },
+        bound_graph_host_bytes: 0,
+        drafter_graph_host_bytes: 0,
+        host_process: NO_HOST_PROCESS,
+        device_process: NO_DEVICE_PROCESS,
+    };
+    let state_slab = 400 << 20;
+    let startup_state = 50 << 20;
+    let charge = AssessmentMemoryCharge::compose(
+        weight_demand.checked_bytes().unwrap(),
+        weight_demand,
+        bounds,
+        state_slab,
+        startup_state,
+        0,
+        deferred_bank_bytes,
+        crate::PassLaunches::FLOOR,
+    )
+    .unwrap();
+    // Phase B1 = (20 - 6) GiB + 1 GiB prepared + 50 MiB startup + 1 GiB upload = 16 GiB + 50 MiB.
+    // Phase B2 = 20 GiB + 1 GiB prepared + 400 MiB state = 21 GiB + 400 MiB.
+    // Target upload does NOT stack on top of the 6 GiB of bank slots past floor!
+    assert_eq!(charge.allocation_bytes, 21 * GIB + (400 << 20));
+    assert_eq!(charge.deferred_bank_bytes, deferred_bank_bytes);
+
+    // At floor (deferred = 0, device = 14 GiB), Phase B1 = 16 GiB + 50 MiB >
+    // Phase B2 = 15 GiB + 400 MiB; bank_growth_slack exposes the exact
+    // 674 MiB difference so settle_bank can grow slots past floor into it.
+    let floor_demand = ClaimDemand {
+        device: 14 * GIB,
+        ..ClaimDemand::default()
+    };
+    let floor_charge = AssessmentMemoryCharge::compose(
+        floor_demand.checked_bytes().unwrap(),
+        floor_demand,
+        bounds,
+        state_slab,
+        startup_state,
+        0,
+        0,
+        crate::PassLaunches::FLOOR,
+    )
+    .unwrap();
+    let split_topology = recorded::rtx3090();
+    let split_executor = executor(&split_topology, BackendName::Cuda);
+    assert_eq!(
+        floor_charge
+            .bank_growth_slack(&split_topology, split_executor)
+            .unwrap(),
+        (1 * GIB + startup_state) - state_slab
     );
 }
 

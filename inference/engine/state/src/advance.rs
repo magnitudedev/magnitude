@@ -634,6 +634,9 @@ impl OwnedStateAdvance {
     pub fn visible_ranges(&self, domain: HistoryDomainId, from: usize) -> Vec<(usize, usize)> {
         self.state.visible_ranges(domain, from)
     }
+    pub fn domain_span_count(&self, domain: HistoryDomainId) -> usize {
+        self.state.domain_span_count(domain)
+    }
     pub fn span_count(&self) -> usize {
         self.state.span_count()
     }
@@ -1147,6 +1150,9 @@ impl OwnedSuccessorAdvance {
         let domain = &self.domains[domain.0];
         ranges_from(&domain.ranges, domain.start, from)
     }
+    pub fn domain_span_count(&self, domain: HistoryDomainId) -> usize {
+        self.domains[domain.0].ranges.len()
+    }
     pub fn span_count(&self) -> usize {
         self.domains
             .iter()
@@ -1442,6 +1448,15 @@ impl TentativeAdvance {
             Self::Accepted(advance) => advance.visible_ranges(domain, from),
             Self::Successor(advance) => advance.visible_ranges(domain, from),
             Self::Chained(chunk) => chunk.advance.visible_ranges(domain, from),
+        }
+    }
+
+    /// The spans of `domain`'s history.
+    pub fn domain_span_count(&self, domain: HistoryDomainId) -> usize {
+        match self {
+            Self::Accepted(advance) => advance.domain_span_count(domain),
+            Self::Successor(advance) => advance.domain_span_count(domain),
+            Self::Chained(chunk) => chunk.advance.domain_span_count(domain),
         }
     }
 

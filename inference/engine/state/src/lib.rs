@@ -27,7 +27,7 @@ pub use codec::{
 };
 pub use layout::{
     HistoryGeometry, HistoryPages, MAX_HISTORY_SPANS, ModelStateLayout, SLAB_ROW_TILE, bank_regions, bank_slab_bytes, banks_per_slab, history_codec,
-    history_geometry, history_pages, kv_codec_policy, smallest_slabs, window_pages,
+    history_geometry, history_pages, history_smallest_slabs, kv_codec_policy, recurrent_smallest_slab, smallest_slabs, window_pages,
 };
 
 use seismic::{DType, Device, Pool, SlabFill, SlabTensor, Tensor};
@@ -1267,20 +1267,22 @@ mod backing {
                 .chain(self.recurrent.iter().map(RecurrentBacking::slabs))
         }
 
-        /// Drop cached views (which hold slab slots), count owned slabs, and
-        /// drop every slab tensor before returning granules to the pool.
+        /// Drop cached views (which hold slab slots), count owned history and
+        /// recurrent slabs separately, and drop every slab tensor before
+        /// returning granules to their pools.
         pub(super) fn drop_and_count_owned_slabs(
             &mut self,
             count_owned: impl Fn(&SlabTensor) -> u64,
-        ) -> u64 {
+        ) -> (u64, u64) {
             self.history.views = None;
             if let Some(recurrent) = &mut self.recurrent {
                 recurrent.views = None;
             }
-            let owned = self.all_slabs().map(count_owned).sum();
+            let history = self.history.slabs.iter().map(|h| count_owned(&h.slabs)).sum();
+            let recurrent = self.recurrent.as_ref().map_or(0, |r| count_owned(r.slabs()));
             self.history.slabs.clear();
             self.recurrent = None;
-            owned
+            (history, recurrent)
         }
     }
 }
@@ -1412,14 +1414,46 @@ impl HistoryDomain {
 /// immutable bank. A checkpoint retains both without copying tensor
 /// contents.
 ///
+/// Granule pools backing a [`StateStore`]: one pool for KV history slabs and
+/// an optional dedicated pool for recurrent-state bank slabs (so large
+/// recurrent banks on hybrid models never inflate KV history slabs' granule).
+#[derive(Clone)]
+pub struct StatePools {
+    pub history: Pool,
+    pub recurrent: Option<Pool>,
+}
+
+impl From<Pool> for StatePools {
+    fn from(history: Pool) -> Self {
+        Self { history, recurrent: None }
+    }
+}
+
+/// Bytes freed from each state pool by [`StoreBindings::shrink_by_pool`].
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct ShrinkRelease {
+    pub history: u64,
+    pub recurrent: u64,
+}
+
+impl ShrinkRelease {
+    pub fn total(self) -> u64 {
+        self.history + self.recurrent
+    }
+}
+
 /// Each domain's reserved rows and the bank capacity are reservations
 /// sealed into graphs. Backing slabs are added as demand grows and released
 /// when empty, only through the store's [`StoreBindings`].
 pub struct StateStore {
     device: Device,
-    /// The granule pool of the store the slabs lie in, shared with every
-    /// other slab store there: each backed slab is one of its granules.
+    /// The granule pool for history slabs: each backed history slab is one of
+    /// its granules.
     pool: Pool,
+    /// The granule pool for recurrent bank slabs (when `component_specs` is
+    /// non-empty); may be distinct from `pool` so large recurrent banks do not
+    /// inflate history granules.
+    recurrent_pool: Option<Pool>,
     context_capacity: usize,
     domains: Vec<HistoryDomain>,
     /// Layers of Shared domains and the stored layers they read.
@@ -1501,6 +1535,12 @@ impl StoreBindings {
     pub fn shrink(&mut self, next: &NextSteps) -> Result<u64, Error> {
         self.store.shrink(next)
     }
+
+    /// Like [`Self::shrink`], returning history and recurrent bytes separately
+    /// so callers return each to its own pool.
+    pub fn shrink_by_pool(&mut self, next: &NextSteps) -> Result<ShrinkRelease, Error> {
+        self.store.shrink_by_pool(next)
+    }
 }
 
 /// The bytes of the slabs a state growth adds: each slab's bytes, which a
@@ -1512,8 +1552,8 @@ pub struct StateGrowthClaim {
 }
 
 impl Drop for StateStore {
-    /// The store's slabs leave its pool with it, and the bytes their
-    /// granules held return through the pool's one return path
+    /// The store's slabs leave its pool(s) with it, and the bytes their
+    /// granules held return through each pool's one return path
     /// ([`Pool::return_freed`]): dropping a store returns its memory as
     /// releasing its slabs does, granules a flight still reads returning
     /// as it completes. A view of a slab's rows still holds its granule.
@@ -1526,17 +1566,26 @@ impl Drop for StateStore {
     /// process before it reports.
     fn drop(&mut self) {
         // The cached logical views hold the slab stores' slots.
-        let freed = self
+        let (history_slabs, recurrent_slabs) = self
             .backing
             .get_mut()
-            .drop_and_count_owned_slabs(owned_slabs)
-            * self.pool.granule();
-        if let Err(error) = self.pool.return_freed(freed) {
-            if std::thread::panicking() {
-                tracing::error!(freed, %error, "a state store dropped while panicking could not return its bytes to the OS: they stay owed");
+            .drop_and_count_owned_slabs(owned_slabs);
+        let return_pool = |pool: &Pool, slabs: u64| {
+            let freed = slabs * pool.granule();
+            if freed == 0 {
                 return;
             }
-            panic!("a dropped state store's {freed} bytes could not return to the OS: {error}");
+            if let Err(error) = pool.return_freed(freed) {
+                if std::thread::panicking() {
+                    tracing::error!(freed, %error, "a state store dropped while panicking could not return its bytes to the OS: they stay owed");
+                    return;
+                }
+                panic!("a dropped state store's {freed} bytes could not return to the OS: {error}");
+            }
+        };
+        return_pool(&self.pool, history_slabs);
+        if let Some(recurrent_pool) = &self.recurrent_pool {
+            return_pool(recurrent_pool, recurrent_slabs);
         }
     }
 }
@@ -1568,13 +1617,14 @@ impl StateStore {
     #[allow(clippy::too_many_arguments)]
     pub fn new(
         charges: &seismic::Charges,
-        pool: Pool,
+        pools: impl Into<StatePools>,
         context_capacity: usize,
         max_advance: usize,
         domains: Vec<HistoryDomainPlan>,
         component_specs: Vec<ComponentSpec>,
         bank_capacity: BankCapacity,
     ) -> Result<(Rc<Self>, StoreBindings), Error> {
+        let StatePools { history: pool, recurrent: recurrent_pool_opt } = pools.into();
         if context_capacity == 0 {
             return Err(Error::Request(
                 "history capacity must fit a positive sequence context".into(),
@@ -1584,36 +1634,43 @@ impl StateStore {
         let reads = HistoryReads::new(&stored, &shared);
         let recurrent_bank_bytes = recurrent_bank_bytes(&component_specs)?;
         let regions = bank_regions(&component_specs);
-        let bank_slab_banks = if component_specs.is_empty() {
-            0
-        } else {
-            banks_per_slab(&regions, pool.granule()).map_err(Error::Request)?
+        let recurrent_pool = (!component_specs.is_empty())
+            .then(|| recurrent_pool_opt.unwrap_or_else(|| pool.clone()));
+        let bank_slab_banks = match &recurrent_pool {
+            None => 0,
+            Some(rpool) => banks_per_slab(&regions, rpool.granule()).map_err(Error::Request)?,
         };
         let reserved_banks = bank_capacity.storage_total()?;
         // Banks of a store without recurrent components have no storage.
-        let (committed_banks, startup_slabs) = if component_specs.is_empty() {
-            (reserved_banks, 0)
+        // When `bank_slab_banks == 1`, slab 0 holds `ZERO_SEED_BANK` alone:
+        // kernels never write it, and an unbacked slab slot already maps to
+        // the pool's zeroed `absent` granule, so slab 0 stays unbacked.
+        let (committed_banks, startup_slabs, bank_start_slab) = if component_specs.is_empty() {
+            (reserved_banks, 0, 0)
+        } else if bank_slab_banks == 1 {
+            let writable = bank_capacity.startup_banks()?.saturating_sub(1);
+            ((1 + writable).min(reserved_banks), writable, 1)
         } else {
             let slabs = bank_capacity.startup_banks()?.div_ceil(bank_slab_banks);
-            ((slabs * bank_slab_banks).min(reserved_banks), slabs)
+            ((slabs * bank_slab_banks).min(reserved_banks), slabs, 0)
         };
         let (banks, zero_seed) = BankPool::new(bank_capacity, committed_banks)?;
-        let recurrent = if component_specs.is_empty() {
-            None
-        } else {
-            let slabs = SlabTensor::in_pool(
-                charges,
-                &pool,
-                bank_slab_banks as u64,
-                reserved_banks as u64,
-                &regions,
-            )?;
-            // Kernels read a bank (the zero seed above all) before any
-            // writes it.
-            for _ in 0..startup_slabs {
-                slabs.add_slab(SlabFill::Zeroed)?;
+        let recurrent = match &recurrent_pool {
+            None => None,
+            Some(rpool) => {
+                let slabs = SlabTensor::in_pool(
+                    charges,
+                    rpool,
+                    bank_slab_banks as u64,
+                    reserved_banks as u64,
+                    &regions,
+                )?;
+                // Kernels read a bank before any writes it.
+                if startup_slabs > 0 {
+                    slabs.add_slabs_from(bank_start_slab, startup_slabs, SlabFill::Zeroed)?;
+                }
+                Some(RecurrentBacking::new(slabs, committed_banks))
             }
-            Some(RecurrentBacking::new(slabs, committed_banks))
         };
         let mut history = Vec::with_capacity(stored.len());
         let mut domains = Vec::with_capacity(stored.len());
@@ -1647,6 +1704,7 @@ impl StateStore {
         let store = Rc::new(Self {
             device: charges.device(),
             pool,
+            recurrent_pool,
             context_capacity,
             domains,
             shared,
@@ -1696,15 +1754,24 @@ impl StateStore {
             .as_ref()
             .map_or_else(|| self.banks.committed(), RecurrentBacking::banks)
     }
-    /// The granule pool its slabs are drawn from: its store's one pool,
-    /// which others draw from too, so its holder counts it once.
+    /// The granule pool its history slabs are drawn from.
     pub fn pool(&self) -> &Pool {
         &self.pool
     }
 
+    /// The granule pool its recurrent bank slabs are drawn from, when the
+    /// store has recurrent components.
+    pub fn recurrent_pool(&self) -> Option<&Pool> {
+        self.recurrent_pool.as_ref()
+    }
+
+    fn bank_start_slab(&self) -> usize {
+        usize::from(self.bank_slab_banks == 1)
+    }
+
     /// Physical bytes of the committed backing: each slab store's address
     /// table and its backed slabs' bytes. The slabs are granules of the
-    /// store's pool, which is charged for whole blocks of them.
+    /// store's pool(s), which are charged for whole blocks of them.
     pub fn committed_bytes(&self) -> u64 {
         let backing = self.backing.borrow();
         let tables = backing
@@ -1714,22 +1781,22 @@ impl StateStore {
         tables + self.backed_slab_bytes()
     }
 
-    /// Bytes of the backed slabs alone, granules of the store's pool: the
+    /// Bytes of the backed slabs alone, granules of the store's pool(s): the
     /// committed backing less its address tables, which their own claim
     /// commits.
     pub fn backed_slab_bytes(&self) -> u64 {
         let backing = self.backing.borrow();
         backing
             .all_slabs()
-            .map(|slabs| slabs.backed().len() as u64 * slabs.pool().granule())
+            .map(|slabs| slabs.backed_count() as u64 * slabs.pool().granule())
             .sum()
     }
 
     /// Bytes of the backed slabs that still hold at least one referenced
-    /// history row or claimed recurrent bank (including the zero seed slab,
-    /// matching [`Self::shrink`]), in pool granule units. Used by
-    /// `StateSlabs::settle` so `backed`, `referenced`, and `written` share
-    /// the same slab-granule unit.
+    /// history row or claimed recurrent bank (including the zero seed slab
+    /// when backed, matching [`Self::shrink`]), in each pool's granule units.
+    /// Used by `StateSlabs::settle` so `backed`, `referenced`, and `written`
+    /// share the same slab-granule units.
     pub fn referenced_slab_bytes(&self) -> u64 {
         let backing = self.backing.borrow();
         let history_slabs: u64 = self
@@ -1741,10 +1808,10 @@ impl StateStore {
                 history.slabs.backed().into_iter().filter(|&slab| !arena.empty_slab(slab)).count() as u64
             })
             .sum();
-        let recurrent_slabs: u64 = backing.recurrent.as_ref().map_or(0, |recurrent| {
+        let recurrent_bytes: u64 = backing.recurrent.as_ref().map_or(0, |recurrent| {
             let occupied = self.banks.claimed();
             let reserved = self.bank_capacity.storage_total().unwrap_or(usize::MAX);
-            recurrent
+            let slabs = recurrent
                 .slabs()
                 .backed()
                 .into_iter()
@@ -1753,9 +1820,10 @@ impl StateStore {
                     let end = (start + self.bank_slab_banks).min(reserved);
                     (start..end).any(|bank| occupied.contains(&bank))
                 })
-                .count() as u64
+                .count() as u64;
+            slabs * recurrent.slabs().pool().granule()
         });
-        (history_slabs + recurrent_slabs) * self.pool.granule()
+        history_slabs * self.pool.granule() + recurrent_bytes
     }
 
     /// The state its holders reference: every row some history claims and
@@ -2146,7 +2214,12 @@ impl StateStore {
     /// A released slab a caller still views keeps its granule until the view
     /// drops.
     fn shrink(&self, next: &NextSteps) -> Result<u64, Error> {
-        let mut released = 0u64;
+        self.shrink_by_pool(next).map(ShrinkRelease::total)
+    }
+
+    fn shrink_by_pool(&self, next: &NextSteps) -> Result<ShrinkRelease, Error> {
+        let mut history_released = 0u64;
+        let mut recurrent_released = 0u64;
         let mut backing = self.backing.borrow_mut();
         for index in 0..self.domains.len() {
             let domain = &self.domains[index];
@@ -2175,13 +2248,15 @@ impl StateStore {
                     for slab in victims {
                         assert!(history.slabs.free_slab(slab)?, "a backed history slab frees");
                         domain.arena.borrow_mut().unback_empty_slab(slab);
-                        released += 1;
+                        history_released += 1;
                     }
                     history.rows = domain.backed_extent(&history.slabs);
                     Ok(())
                 })?;
         }
+        let mut recurrent_granule = 0u64;
         if let Some(recurrent) = backing.recurrent.as_mut() {
+            recurrent_granule = recurrent.slabs().pool().granule();
             let reserved = self.bank_capacity.storage_total()?;
             let span = |slab: usize| {
                 let start = slab * self.bank_slab_banks;
@@ -2211,7 +2286,7 @@ impl StateStore {
                 recurrent.mutate_slabs(|slabs, banks| -> Result<(), Error> {
                     for slab in victims {
                         assert!(slabs.free_slab(slab)?, "a backed bank slab frees");
-                        released += 1;
+                        recurrent_released += 1;
                         let range = span(slab);
                         self.banks.mark_slab_unavailable(range.start, range.end);
                     }
@@ -2220,7 +2295,7 @@ impl StateStore {
                         .into_iter()
                         .map(|slab| span(slab).end)
                         .max()
-                        .expect("zero seed slab stays backed");
+                        .unwrap_or(1);
                     if extent < *banks {
                         self.banks.resize(*banks, extent);
                         *banks = extent;
@@ -2229,7 +2304,10 @@ impl StateStore {
                 })?;
             }
         }
-        Ok(released * self.pool.granule())
+        Ok(ShrinkRelease {
+            history: history_released * self.pool.granule(),
+            recurrent: recurrent_released * recurrent_granule,
+        })
     }
 
     /// A copy of rows `from` to rows `to` in one history domain's slabs.
@@ -2285,27 +2363,29 @@ impl StateStore {
             })
     }
 
-    /// Add whole bank slabs into the lowest unbacked slots.
+    /// Add whole bank slabs into the lowest unbacked writable slots.
     fn add_bank_slabs(&self, count: usize) -> Result<(), Error> {
         if count == 0 {
             return Ok(());
         }
+        let start_slab = self.bank_start_slab();
         let mut backing = self.backing.borrow_mut();
         let recurrent = backing
             .recurrent
             .as_mut()
             .expect("recurrent layout has slabs");
+        let rpool = self.recurrent_pool.as_ref().unwrap_or(&self.pool);
         recurrent.mutate_slabs(|slab, banks| -> Result<(), Error> {
             let mut added = Vec::new();
             for _ in 0..count {
-                match slab.add_slab(SlabFill::Zeroed) {
+                match slab.add_slab_from(start_slab, SlabFill::Zeroed) {
                     Ok(index) => added.push(index),
                     Err(error) => {
                         for index in &added {
                             slab.free_slab(*index)?;
                         }
-                        self.pool
-                            .return_freed(added.len() as u64 * self.pool.granule())?;
+                        rpool
+                            .return_freed(added.len() as u64 * rpool.granule())?;
                         return Err(error.into());
                     }
                 }
@@ -2643,6 +2723,12 @@ impl SequenceState {
             self.snapshot.domains[domain.0].start,
             from,
         )
+    }
+    /// The spans of `domain`'s accepted history.
+    pub fn domain_span_count(&self, domain: HistoryDomainId) -> usize {
+        self.snapshot.domains[domain.0]
+            .claims
+            .entry(|entry| entry.ranges.len())
     }
     /// The most spans any domain's history has.
     pub fn span_count(&self) -> usize {

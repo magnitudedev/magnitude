@@ -784,6 +784,7 @@ struct ImportedTarget {
     constants_claim: Held,
     request_slot: Claim,
     drafter_reserve: Option<Held>,
+    recorded_graphs_reserve: Option<Held>,
     site_requests: Vec<Option<magnitude_executor::assessment::SiteRequest>>,
     head_enabled: bool,
     primes_drafter: bool,
@@ -945,18 +946,21 @@ fn import_target(
                 ..
             }
         );
-    // Reserve the peak upload window across target and (when enabled) head
-    // import, and the drafter's resident weights, binding constants, and
-    // priming boundary BEFORE `claim_target_import` sizes the expert bank.
-    let target_upload = execution_plan.load().target_upload_peak_bytes();
-    let head_upload = if head_enabled { execution_plan.load().head_upload_peak_bytes() } else { 0 };
-    let upload = target_upload.max(head_upload);
-    let upload_window = startup.claim_as(
-        "target import",
-        CommittedKind::Upload,
-        ClaimDemand { device: upload, staged: upload, ..ClaimDemand::default() },
-    )?;
+    // Reserve the target-only upload window (head and vision are lazy-loaded
+    // later via `bind_component`) and the drafter's resident weights, binding
+    // constants, and priming boundary BEFORE target import claims weights.
+    let target_upload = execution_plan.load().target_upload_demand().map_err(internal)?;
+    let upload_window = startup.claim_as("target import", CommittedKind::Upload, target_upload)?;
     let drafter_reserve = reserve_drafter(&mut startup, &plan, &programs, manifest, head_enabled, primes_drafter)?;
+    // Reserve the startup recorded-graph memory (CUDA/Vulkan graph pools
+    // instantiated during `ExecutorDomain::new` / warm-up) before sizing the
+    // expert bank so bank growth never consumes VRAM needed for graph binding.
+    let recorded_graphs_demand = plan
+        .recorded_graph_demand(device.graph_cost())
+        .map_err(internal)?;
+    let recorded_graphs_reserve = (recorded_graphs_demand.bytes() > 0)
+        .then(|| startup.claim_as("recorded graphs", CommittedKind::Arena, recorded_graphs_demand))
+        .transpose()?;
     // Each store's one granule pool, opened once at the store's granule
     // BEFORE `claim_target_import`: each pool allocates its absent granule
     // (claimed at the load's reading) and the initial state stores allocate
@@ -967,29 +971,47 @@ fn import_target(
             OpenPoolError::Short { purpose, short } => refused(&purpose, short),
             OpenPoolError::Internal(reason) => internal(reason),
         })?;
-    let target_state = state_tables.allocate(&device, |charges| plan.allocate_target_state(charges, pools.state.clone())).map_err(internal)?;
+    let target_state = state_tables.allocate(&device, |charges| plan.allocate_target_state(charges, pools.state_pools())).map_err(internal)?;
     let head_state = plan
         .head_state()
         .map(|state| state_tables.allocate(&device, |charges| state.allocate(charges, pools.state.clone())).map_err(internal))
         .transpose()?;
-    // The target import holds the bank at its derived target now, beside
-    // the allocations claimed and the speed guarantee, at most its planned
-    // slots (and host slots, down to 0 = landing reserve floor); the bank
-    // grows toward its ceiling as it serves.
-    let (execution_plan, planned, mut weights) = match startup.claim_target_import(execution_plan.load())? {
-        Imported::Planned(weights) => (execution_plan, planned, weights),
-        Imported::Fitted(slots, host_slots, weights) => (
-            execution_plan.with_load_slots(slots, host_slots).map_err(|error| internal(error.to_string()))?,
-            planned.with_load_slots(slots, host_slots).map_err(|error| internal(error.to_string()))?,
-            weights,
-        ),
-    };
-    startup.recorded.record(state_tables);
     // The served file's volume as the job probed it; with no record it reads
     // at its bounds until a later load's.
     if let Some(root) = &manifest.kernel_cache {
         adopt_volumes(root, &device, package.target(), execution_plan.load().expert_bank()).map_err(internal)?;
     }
+    // For a streamed expert bank (`!bank.whole()`), claim only the bank's floor
+    // beside `upload_window`, import non-banked target weights, release
+    // `upload_window`, and THEN size and open the bank's slots past floor so
+    // transient `target_upload_peak_bytes` never steals bank slots.
+    let streamed_bank_floor = execution_plan
+        .load()
+        .expert_bank()
+        .filter(|bank| !bank.whole())
+        .map(|bank| bank.floor());
+    let (mut execution_plan, mut planned, initial_plan, floor_demand, mut weights) =
+        if let Some(floor) = streamed_bank_floor {
+            let floor_plan = execution_plan
+                .clone()
+                .with_load_slots(floor, 0)
+                .map_err(|error| internal(error.to_string()))?;
+            let floor_demand = floor_plan.load().target_weight_demand().map_err(internal)?;
+            let weights = startup.claim("target import", floor_demand)?;
+            (execution_plan, planned, floor_plan, Some(floor_demand), weights)
+        } else {
+            let (execution_plan, planned, weights) = match startup.claim_target_import(execution_plan.load())? {
+                Imported::Planned(weights) => (execution_plan, planned, weights),
+                Imported::Fitted(slots, host_slots, weights) => (
+                    execution_plan.with_load_slots(slots, host_slots).map_err(|error| internal(error.to_string()))?,
+                    planned.with_load_slots(slots, host_slots).map_err(|error| internal(error.to_string()))?,
+                    weights,
+                ),
+            };
+            let initial = execution_plan.clone();
+            (execution_plan, planned, initial, None, weights)
+        };
+    startup.recorded.record(state_tables);
     // A linked host tier backs to its load-time slots from the bank's open
     // (`ExpertBank::back_host`): its claim is split from the target import's
     // as the store is made, allocated as each slot backs, never before it
@@ -997,7 +1019,7 @@ fn import_target(
     let mut residency = ResidencyStore::for_target(
         device.clone(),
         programs.clone(),
-        execution_plan.clone(),
+        initial_plan,
         resource_identity.clone(),
         &startup.ledgers,
         &mut weights,
@@ -1012,25 +1034,49 @@ fn import_target(
         residency.keep_cpu_site(stored_cpu_site(cache, &device, &site_requests).map_err(internal)?);
     }
     let import_progress = progress.clone();
+    let observer = Box::new(move |completed_bytes, total_bytes| {
+        import_progress(LoadProgress::ImportingWeights {
+            completed_bytes,
+            total_bytes,
+        });
+    });
     // The import and its record, its host tables' row caches with it, are
     // one change: the caches charged to their own claim.
-    let target = weights.allocate(&device, |charges| {
-        residency
-            .load_target(
-                charges,
-                &manifest.definition,
-                package,
-                &host_tables,
-                Box::new(move |completed_bytes, total_bytes| {
-                    import_progress(LoadProgress::ImportingWeights {
-                        completed_bytes,
-                        total_bytes,
-                    });
-                }),
-            )
-            .map_err(|error| import_refused(error, &device, &startup.ledgers))
+    let mut target = weights.allocate(&device, |charges| {
+        if floor_demand.is_some() {
+            residency.load_target_without_bank(charges, &manifest.definition, package, &host_tables, observer)
+        } else {
+            residency.load_target(charges, &manifest.definition, package, &host_tables, observer)
+        }
+        .map_err(|error| import_refused(error, &device, &startup.ledgers))
     })?;
     residency.release_upload();
+    if let Some(floor_demand) = floor_demand {
+        let (sized_plan, sized_planned, mut bank_growth) =
+            match startup.claim_bank_growth(execution_plan.load(), floor_demand)? {
+                Imported::Planned(growth) => (execution_plan, planned, growth),
+                Imported::Fitted(slots, host_slots, growth) => (
+                    execution_plan.with_load_slots(slots, host_slots).map_err(|error| internal(error.to_string()))?,
+                    planned.with_load_slots(slots, host_slots).map_err(|error| internal(error.to_string()))?,
+                    growth,
+                ),
+            };
+        execution_plan = sized_plan;
+        planned = sized_planned;
+        weights.allocate(&device, |charges| {
+            residency
+                .open_target_bank(
+                    charges,
+                    &startup.ledgers,
+                    execution_plan.clone(),
+                    &mut bank_growth,
+                    package.target(),
+                    &mut target,
+                )
+                .map_err(|error| import_refused(error, &device, &startup.ledgers))
+        })?;
+        startup.recorded.record(bank_growth);
+    }
     startup.recorded.record(weights);
     startup.recorded.record(host_tables);
     tracing::info!(
@@ -1071,6 +1117,7 @@ fn import_target(
         constants_claim,
         request_slot,
         drafter_reserve,
+        recorded_graphs_reserve,
         site_requests,
         head_enabled,
         primes_drafter,
@@ -1104,6 +1151,7 @@ fn assemble_domain(
         constants_claim,
         request_slot,
         drafter_reserve,
+        recorded_graphs_reserve,
         site_requests,
         head_enabled,
         primes_drafter,
@@ -1149,9 +1197,13 @@ fn assemble_domain(
     .map_err(|error| domain_refused(error, &startup.ledgers))?;
     report_load_phase("state and domain allocation", &mut phase_started);
     report_load_memory("domain allocated", &device);
-    // Release the pre-claimed drafter reserve into the ledger right before
-    // `warm_up` so `bind_component(Head)` claims those exact bytes cleanly.
+    // Release the pre-claimed drafter and recorded-graph reserves into the
+    // ledger right before `warm_up` so `bind_component(Head)` and recorded
+    // graph instantiation claim/use those bytes cleanly.
     if let Some(reserve) = drafter_reserve {
+        startup.ledgers.changes().change(|_| drop(reserve));
+    }
+    if let Some(reserve) = recorded_graphs_reserve {
         startup.ledgers.changes().change(|_| drop(reserve));
     }
     // What the load is doing from its warm-up until it serves, in the
@@ -1172,9 +1224,6 @@ fn assemble_domain(
     let pricing = LoadPricing::new(manifest, resident, planned, (*device).clone(), bank)?;
     domain
         .measure_load(load_measures(&pricing).map_err(internal)?, &mut bindings)
-        .map_err(|error| internal(error.to_string()))?;
-    domain
-        .begin_host_backing()
         .map_err(|error| internal(error.to_string()))?;
     phase.enter("serving");
     Ok(Box::new(NativeDomain {
@@ -2038,6 +2087,59 @@ impl Startup {
                 (floor, most),
                 (0, most_host),
                 demand,
+            )
+        })?;
+        match admitted {
+            Ok((slots, host_slots, held)) if slots == planned && host_slots == planned_host => Ok(Imported::Planned(held)),
+            Ok((slots, host_slots, held)) => {
+                tracing::info!(
+                    "the target import holds {slots} of the expert bank's {planned} planned slots \
+                     and {host_slots} of {planned_host} planned host slots: \
+                     its derived target now, beside the allocations claimed before it and the speed guarantee",
+                );
+                Ok(Imported::Fitted(slots, host_slots, held))
+            }
+            Err(short) => Err(refused(PURPOSE, short)),
+        }
+    }
+
+    /// Claim the streamed expert bank's slots past its floor (and host tier
+    /// slots past 0) AFTER `upload_window` has been released and `floor_demand`
+    /// is already held on `self.ledgers`. Refreshes `self.reading` via
+    /// `settled_read` first so live device headroom (including actual CUDA /
+    /// Vulkan block-packing overhead from non-banked weight imports) is
+    /// observed before sizing the bank.
+    fn claim_bank_growth(&mut self, load: &ModelLoadPlan, floor_demand: ClaimDemand) -> Result<Imported, LoadError> {
+        const PURPOSE: &str = "target import";
+        self.reading = self.reader.settled_read(&self.ledgers);
+        let bank = load
+            .expert_bank()
+            .expect("invariant violated: claim_bank_growth requires an expert bank");
+        let delta = |slots: u64, host_slots: u64| -> Result<ClaimDemand, LoadError> {
+            let full = load
+                .clone()
+                .with_load_slots(slots, host_slots)
+                .map_err(|error| internal(error.to_string()))?
+                .target_weight_demand()
+                .map_err(internal)?;
+            full.checked_minus(floor_demand)
+                .ok_or_else(|| internal("bank growth demand underflows floor demand"))
+        };
+        let device = self.reader.device();
+        let at_load = self.reading.room_after(&self.ledgers);
+        // `floor_demand` is already claimed on `self.ledgers`, so `beside` is 0.
+        let most = magnitude_executor::import_slots(&at_load, &self.ledgers, device, bank, ClaimDemand::default());
+        let most_host = magnitude_executor::import_host_slots(&at_load, &self.ledgers, device, bank, ClaimDemand::default());
+        let (floor, planned, planned_host) = (bank.floor(), bank.slots, bank.host_slots);
+        let admitted = self.ledgers.changes().change(|keeping| {
+            self.ledgers.admit_most_pair(
+                &keeping.claims(),
+                &self.reading,
+                device,
+                CommittedKind::Load,
+                (floor, most),
+                (0, most_host),
+                delta,
             )
         })?;
         match admitted {

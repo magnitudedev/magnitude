@@ -176,14 +176,17 @@ fn main_charge(base: &AssessmentMemoryCharge, backend: BackendName) -> Assessmen
         + bounds.graph_bytes
         + bounds.recorded_graph_bytes
         + bounds.device_process.bytes().unwrap();
-    let loading = base.startup_state_bytes + bounds.startup_additional_bytes;
+    let loading = base.startup_state_bytes + bounds.target_upload_peak_bytes;
     let serving_peak = base.state_bytes + bounds.component_upload_bytes;
+    let phase_b = prepared + serving_peak.max(loading);
+    let qualification = bounds.qualification_phase_bytes().unwrap();
     AssessmentMemoryCharge {
         exact_resident_bytes: weights + base.state_bytes,
         bounds,
         serving_bytes: prepared + base.state_bytes,
-        allocation_bytes: prepared + serving_peak.max(loading),
-        staging_bytes: bounds.staging_upload_bytes.max(bounds.component_upload_bytes),
+        phase_b_allocation_bytes: phase_b,
+        allocation_bytes: qualification.max(phase_b),
+        staging_bytes: bounds.target_upload_peak_bytes.max(bounds.component_upload_bytes),
         ..base.clone()
     }
 }
@@ -216,7 +219,7 @@ fn terms(charge: &AssessmentMemoryCharge, chain: usize, successors: usize) -> St
         gb(bounds.recorded_graph_bytes - bounds.recorded_graph_upload_bytes),
         gb(bounds.recorded_graph_upload_bytes),
         gb(bounds.device_process.bytes().unwrap()),
-        gb(bounds.startup_additional_bytes),
+        gb(bounds.target_upload_peak_bytes),
         gb(bounds.component_upload_bytes),
         gb(charge.allocation_bytes),
     )

@@ -1139,14 +1139,12 @@ impl ResidencyStore {
         };
         // A table the expert bank holds is reserved, resized as the bank's
         // one owner prices it (`ExpertBankPlan::tables`).
-        let banked = self
-            .execution
-            .load()
-            .expert_bank()
-            .is_some_and(|bank| bank.tables.iter().any(|table| table.role == plan.role));
+        let bank = self.execution.load().expert_bank();
+        let banked = bank.is_some_and(|bank| bank.tables.iter().any(|table| table.role == plan.role));
         let slots = match banked {
             true => {
-                let pool = self.pools.records.clone().expect("invariant violated: a banked table's load opens its records pool");
+                let bank = bank.expect("a banked table belongs to a bank");
+                let pool = self.pools.table_pool(bank).expect("invariant violated: a banked table's load opens its records pool");
                 crate::stored_table::StoredSlots::Banked { pool, records, record_rows }
             }
             false => crate::stored_table::StoredSlots::Whole { pool: self.pools.state.clone(), records, record_rows },
@@ -1697,16 +1695,45 @@ impl ResidencyStore {
         definition: &magnitude_family_contracts::ModelDefinition,
         package: &magnitude_artifacts::Package,
         host_tables: &crate::memory::ledger::Held,
+        observer: ImportObserver,
+    ) -> Result<crate::ResidentTarget, crate::ResidencyError> {
+        self.load_target_inner(charges, definition, package, host_tables, observer, true)
+    }
+
+    /// Import the target's non-banked weights without opening its expert bank.
+    /// Used for streamed banks (`!bank.whole()`) so `release_upload()` frees
+    /// `upload_window` before bank slots past floor are claimed and opened.
+    pub fn load_target_without_bank(
+        &mut self,
+        charges: &seismic::Charges,
+        definition: &magnitude_family_contracts::ModelDefinition,
+        package: &magnitude_artifacts::Package,
+        host_tables: &crate::memory::ledger::Held,
+        observer: ImportObserver,
+    ) -> Result<crate::ResidentTarget, crate::ResidencyError> {
+        self.load_target_inner(charges, definition, package, host_tables, observer, false)
+    }
+
+    fn load_target_inner(
+        &mut self,
+        charges: &seismic::Charges,
+        definition: &magnitude_family_contracts::ModelDefinition,
+        package: &magnitude_artifacts::Package,
+        host_tables: &crate::memory::ledger::Held,
         mut observer: ImportObserver,
+        open_bank: bool,
     ) -> Result<crate::ResidentTarget, crate::ResidencyError> {
         crate::resident_weights::validate_definition_package(definition, package)?;
         let weights = self.execution.load().target().to_vec();
         let mut storage = HashSet::new();
-        let bank = self
-            .execution
-            .load()
-            .expert_bank()
-            .map_or(Ok(0), crate::ExpertBankPlan::charged_beyond_records);
+        let bank = if open_bank {
+            self.execution
+                .load()
+                .expert_bank()
+                .map_or(Ok(0), crate::ExpertBankPlan::charged_beyond_records)
+        } else {
+            Ok(0)
+        };
         let total = weights
             .iter()
             .filter(|weight| storage.insert(weight.storage_identity()))
@@ -1728,7 +1755,16 @@ impl ResidencyStore {
                 crate::resident_weights::activation_dtype(definition.decoder.activation_dtype),
             )
             .map_err(crate::ResidencyError::from)
-            .and_then(|()| crate::resident_weights::import_target(definition, package, self, charges, host_tables));
+            .and_then(|()| {
+                crate::resident_weights::import_target(
+                    definition,
+                    package,
+                    self,
+                    charges,
+                    host_tables,
+                    open_bank,
+                )
+            });
         let mut progress = self
             .import_progress
             .take()
@@ -1737,6 +1773,31 @@ impl ResidencyStore {
             (progress.observer)(progress.total, progress.total);
         }
         target
+    }
+
+    /// Open the target's streamed expert bank after `release_upload()` has
+    /// freed `upload_window` and `bank_growth` has claimed slots past floor,
+    /// attaching it to `target`.
+    pub fn open_target_bank(
+        &mut self,
+        charges: &seismic::Charges,
+        ledgers: &crate::memory::ledger::DeviceLedgers,
+        execution: ExecutionPlan,
+        bank_growth: &mut crate::memory::ledger::Held,
+        artifact: &GgufArtifact,
+        target: &mut crate::ResidentTarget,
+    ) -> Result<(), crate::ResidencyError> {
+        self.host_backing = ledgers
+            .host_backing(bank_growth, execution.load())
+            .map_err(crate::ResidencyError::Invalid)?;
+        ledgers
+            .split_bank_growth_records(bank_growth, execution.load())
+            .map_err(crate::ResidencyError::Invalid)?;
+        self.execution = execution;
+        target.bank = self
+            .open_expert_bank(charges, artifact)
+            .map_err(crate::ResidencyError::from)?;
+        Ok(())
     }
 
     pub fn load_head(

@@ -215,6 +215,11 @@ impl SlabTensor {
         self.store.add_slab(fill)
     }
 
+    /// Like [`Self::add_slab`], skipping slots below `start_slot`.
+    pub fn add_slab_from(&self, start_slot: usize, fill: SlabFill) -> Result<usize, TensorError> {
+        self.store.add_slab_from(start_slot, fill)
+    }
+
     /// Back the `count` lowest free slots with granules of the pool in one
     /// batch, growing the pool by blocks, admitted by its entry, where none
     /// are free: the slots in ascending order. Refused where fewer than
@@ -223,6 +228,11 @@ impl SlabTensor {
     /// work.
     pub fn add_slabs(&self, count: usize, fill: SlabFill) -> Result<Vec<usize>, TensorError> {
         self.store.add_slabs(count, fill)
+    }
+
+    /// Like [`Self::add_slabs`], skipping slots below `start_slot`.
+    pub fn add_slabs_from(&self, start_slot: usize, count: usize, fill: SlabFill) -> Result<Vec<usize>, TensorError> {
+        self.store.add_slabs_from(start_slot, count, fill)
     }
 
     /// Count of device-ordered table repoints (`moves::submit`) submitted for

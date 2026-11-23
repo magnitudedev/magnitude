@@ -543,12 +543,14 @@ pub struct StructuralCharge {
     host_table_bytes: u64,
     /// Upload windows invariant with bank slots and context.
     component_upload_bytes: u64,
-    staging_upload_bytes: u64,
-    /// Bank `(slots, host_slots)` for which `prepared_weight_demand` and
-    /// `prepared_startup_additional_bytes` were derived.
+    target_upload_peak_bytes: u64,
+    /// Bank `(slots, host_slots)` for which `prepared_weight_demand`,
+    /// `prepared_qualification_peak_bytes`, and `prepared_deferred_bank_bytes`
+    /// were derived.
     prepared_bank_slots: Option<(u64, u64)>,
     prepared_weight_demand: ClaimDemand,
-    prepared_startup_additional_bytes: u64,
+    prepared_qualification_peak_bytes: u64,
+    prepared_deferred_bank_bytes: u64,
     /// Precomputed O(layers) slot-scaling model for banked plans so `assess_execution_fit`
     /// can evaluate any bank slot count without cloning `ExecutionPlanDraft` / `ModelLoadPlan`
     /// or re-scanning all weights.
@@ -618,19 +620,12 @@ impl StateSizer {
 #[derive(Clone, Debug)]
 struct BankSlotModel {
     bank_template: crate::planning::ExpertBankPlan,
-    /// Total `weight_demands` minus the bank-varying pooled records and
-    /// `storage_beyond_records` terms (all non-banked weights plus banked
-    /// weights' invariant scale/bound device demands).
+    /// Total `weight_demands` minus `bank.storage_demand()` (all non-banked
+    /// weights plus invariant banked-weight/table metadata).
     base_weight_demand: ClaimDemand,
     /// `bank.storage_demand()` minus its `places`, `paths`, and `pooled`
     /// terms so `storage_demand` at any `(slots, places, paths)` is O(1).
     bank_storage_base: ClaimDemand,
-    /// Invariant device-side deductions in `ExpertBankPlan::storage_beyond_records`
-    /// (banked scale bytes + stored table held bytes).
-    bank_deductions_device: u64,
-    /// Whether `ExpertBankPlan::storage_beyond_records` deducts lent records
-    /// from `device` (`Contract::DeviceOnly`) or `shared`.
-    bank_lent_is_device: bool,
     qual_peak: crate::native::QualificationPeakModel,
 }
 
@@ -641,14 +636,11 @@ impl BankSlotModel {
             .ok_or_else(|| "a bank slot model requires an expert bank".to_owned())?;
         let initial_total = ClaimDemand::checked_sum(load.weight_demands()?)
             .ok_or_else(|| "weight demand overflows".to_owned())?;
-        let initial_records = Self::sum_banked_records(bank)?.0;
-        let initial_beyond = bank.storage_beyond_records()?;
+        let initial_storage = bank.storage_demand()?;
         let base_weight_demand = initial_total
-            .checked_minus(ClaimDemand::pooled(crate::planning::BankTier::Bank, initial_records))
-            .and_then(|d| d.checked_minus(initial_beyond))
+            .checked_minus(initial_storage)
             .ok_or_else(|| "base weight demand underflows".to_owned())?;
 
-        let initial_storage = bank.storage_demand()?;
         let initial_places_demand = bank.places_storage_demand(bank.places)?;
         let initial_paths_demand = bank.paths_layout_demand(bank.paths)?;
         let initial_pooled_demand = bank.pooled_demand_at(bank.slots, bank.paths)?;
@@ -658,23 +650,6 @@ impl BankSlotModel {
             .and_then(|d| d.checked_minus(initial_pooled_demand))
             .ok_or_else(|| "bank storage base underflows".to_owned())?;
 
-        let initial_pooled = initial_records.min(bank.resident_charge(bank.slots)?);
-        let bank_lent_is_device = matches!(
-            bank.host().contract(crate::planning::BankTier::Bank),
-            seismic::Contract::DeviceOnly
-        );
-        let initial_lent_device = if bank_lent_is_device {
-            initial_records - initial_pooled
-        } else {
-            0
-        };
-        let bank_deductions_device = initial_storage
-            .device
-            .checked_sub(initial_beyond.device)
-            .and_then(|d| d.checked_sub(initial_pooled))
-            .and_then(|d| d.checked_sub(initial_lent_device))
-            .ok_or_else(|| "bank deductions underflow".to_owned())?;
-
         let qual_peak = AttestedPrograms::qualification_peak_model(load)?;
         let mut bank_template = bank.clone();
         bank_template.ceiling = bank_template.widest().get();
@@ -682,8 +657,6 @@ impl BankSlotModel {
             bank_template,
             base_weight_demand,
             bank_storage_base,
-            bank_deductions_device,
-            bank_lent_is_device,
             qual_peak,
         })
     }
@@ -732,38 +705,15 @@ impl BankSlotModel {
     fn weight_demand_for_bank(
         &self,
         bank: &crate::planning::ExpertBankPlan,
-        records: u64,
     ) -> Result<ClaimDemand, String> {
         let places_demand = bank.places_storage_demand(bank.places)?;
         let paths_demand = bank.paths_layout_demand(bank.paths)?;
         let pooled_demand = bank.pooled_demand_at(bank.slots, bank.paths)?;
-        let bank_storage = self
-            .bank_storage_base
-            .checked_plus(places_demand)
+        self.base_weight_demand
+            .checked_plus(self.bank_storage_base)
+            .and_then(|d| d.checked_plus(places_demand))
             .and_then(|d| d.checked_plus(paths_demand))
             .and_then(|d| d.checked_plus(pooled_demand))
-            .ok_or_else(|| "bank storage demand overflows".to_owned())?;
-        let mut beyond = bank_storage;
-        beyond.device = beyond
-            .device
-            .checked_sub(self.bank_deductions_device)
-            .ok_or("a bank holds less than its banked scales or stored tables charge")?;
-        let pooled = records.min(bank.resident_charge(bank.slots)?);
-        beyond.device = beyond
-            .device
-            .checked_sub(pooled)
-            .ok_or("a bank holds less than its pooled records charge")?;
-        let lent = if self.bank_lent_is_device {
-            &mut beyond.device
-        } else {
-            &mut beyond.shared
-        };
-        *lent = lent
-            .checked_sub(records - pooled)
-            .ok_or("a bank holds less than its banked records charge")?;
-        self.base_weight_demand
-            .checked_plus(ClaimDemand::pooled(crate::planning::BankTier::Bank, records))
-            .and_then(|d| d.checked_plus(beyond))
             .ok_or_else(|| "weight demand overflows".to_owned())
     }
 
@@ -776,8 +726,7 @@ impl BankSlotModel {
         paths: crate::planning::BankPaths,
     ) -> Result<ClaimDemand, String> {
         let bank = self.bank_at(slots, places, paths)?;
-        let (records, _) = Self::sum_banked_records(&bank)?;
-        self.weight_demand_for_bank(&bank, records)
+        self.weight_demand_for_bank(&bank)
     }
 
     fn charge_terms(
@@ -786,12 +735,13 @@ impl BankSlotModel {
         slots: u64,
         places: u64,
         paths: crate::planning::BankPaths,
-    ) -> Result<(ClaimDemand, u64), String> {
+    ) -> Result<(ClaimDemand, u64, u64), String> {
         let bank = self.bank_at(slots, places, paths)?;
-        let (records, per_layer) = Self::sum_banked_records(&bank)?;
-        let weight_demand = self.weight_demand_for_bank(&bank, records)?;
+        let (_, per_layer) = Self::sum_banked_records(&bank)?;
+        let weight_demand = self.weight_demand_for_bank(&bank)?;
         let qualification_peak = self.qual_peak.peak_bytes_from_layers(&per_layer)?;
-        Ok((weight_demand, qualification_peak))
+        let deferred_bank_bytes = crate::planning::deferred_bank_bytes_of_bank(&bank)?;
+        Ok((weight_demand, qualification_peak, deferred_bank_bytes))
     }
 }
 
@@ -947,6 +897,17 @@ impl StructuralCharge {
     /// structure's only in its pass (`ModelLoadPlan::pass`): its target
     /// family certified at that pass beside everything else as it is
     /// (`AssessmentGraphResourceBounds::at_pass_with_cache`), which no pass moves.
+    pub fn idle_class_bytes(
+        &self,
+        places: usize,
+        limits: crate::ResourceLimits,
+        fronts: bool,
+    ) -> Result<u64, AssessmentError> {
+        self.graph
+            .idle_class_bytes(places, limits, fronts)
+            .map_err(AssessmentError::Plan)
+    }
+
     pub fn at_pass(&self, definition: &ModelDefinition, draft: &ExecutionPlanDraft) -> Result<Self, AssessmentError> {
         let _scope =
             crate::programs::graph::sizing::SizingScope::enter_with_device(draft.device().properties());
@@ -973,10 +934,11 @@ impl StructuralCharge {
             state_sizer: std::sync::Arc::clone(&self.state_sizer),
             host_table_bytes: self.host_table_bytes,
             component_upload_bytes: self.component_upload_bytes,
-            staging_upload_bytes: self.staging_upload_bytes,
+            target_upload_peak_bytes: self.target_upload_peak_bytes,
             prepared_bank_slots: self.prepared_bank_slots,
             prepared_weight_demand: self.prepared_weight_demand,
-            prepared_startup_additional_bytes: self.prepared_startup_additional_bytes,
+            prepared_qualification_peak_bytes: self.prepared_qualification_peak_bytes,
+            prepared_deferred_bank_bytes: self.prepared_deferred_bank_bytes,
             bank_slot_model: self.bank_slot_model.clone(),
             base_weight_placement: self.base_weight_placement,
             target_cache: Some(cache),
@@ -1056,6 +1018,8 @@ impl StructuralCharge {
         } else {
             None
         };
+        let prepared_deferred_bank_bytes =
+            crate::planning::deferred_bank_bytes(load).map_err(AssessmentError::Memory)?;
         Ok((
             Self {
                 graph,
@@ -1066,10 +1030,11 @@ impl StructuralCharge {
                 state_sizer,
                 host_table_bytes,
                 component_upload_bytes: header.component_upload_bytes,
-                staging_upload_bytes: header.staging_upload_bytes,
+                target_upload_peak_bytes: header.target_upload_peak_bytes,
                 prepared_bank_slots: bank_slots_key(load),
                 prepared_weight_demand,
-                prepared_startup_additional_bytes: header.startup_additional_bytes,
+                prepared_qualification_peak_bytes: header.qualification_peak_bytes,
+                prepared_deferred_bank_bytes,
                 bank_slot_model,
                 base_weight_placement,
                 target_cache,
@@ -1090,13 +1055,14 @@ impl StructuralCharge {
         &self,
         state_bytes: (u64, u64),
         weight_demand: ClaimDemand,
-        startup_additional_bytes: u64,
+        qualification_peak_bytes: u64,
+        deferred_bank_bytes: u64,
         graph_cost: seismic::GraphCost,
     ) -> Result<AssessmentMemoryCharge, AssessmentError> {
         let header = AssessmentHeaderBounds {
-            startup_additional_bytes,
+            qualification_peak_bytes,
+            target_upload_peak_bytes: self.target_upload_peak_bytes,
             component_upload_bytes: self.component_upload_bytes,
-            staging_upload_bytes: self.staging_upload_bytes,
         };
         let bounds = header
             .with_graph_resource_bound(
@@ -1116,6 +1082,7 @@ impl StructuralCharge {
             state_bytes.0,
             state_bytes.1,
             self.host_table_bytes,
+            deferred_bank_bytes,
             self.graph.target.group_bytes.most(),
         )
         .map_err(AssessmentError::Memory)
@@ -1161,9 +1128,13 @@ impl StructuralCharge {
         pricing: crate::platform::GraphPricing,
     ) -> Result<AssessmentMemoryCharge, AssessmentError> {
         let load = draft.load();
-        let (weight_demand, startup_additional_bytes) =
+        let (weight_demand, qualification_peak_bytes, deferred_bank_bytes) =
             if bank_slots_key(load) == self.prepared_bank_slots {
-                (self.prepared_weight_demand, self.prepared_startup_additional_bytes)
+                (
+                    self.prepared_weight_demand,
+                    self.prepared_qualification_peak_bytes,
+                    self.prepared_deferred_bank_bytes,
+                )
             } else {
                 let weight_demand = load
                     .weight_demands()
@@ -1172,12 +1143,19 @@ impl StructuralCharge {
                             .ok_or_else(|| "weight demand overflows".to_owned())
                     })
                     .map_err(AssessmentError::Memory)?;
-                let startup_additional_bytes = AttestedPrograms::qualification_peak_bytes(load)
-                    .map_err(AssessmentError::Memory)?
-                    .max(self.staging_upload_bytes);
-                (weight_demand, startup_additional_bytes)
+                let qualification_peak_bytes = AttestedPrograms::qualification_peak_bytes(load)
+                    .map_err(AssessmentError::Memory)?;
+                let deferred_bank_bytes = crate::planning::deferred_bank_bytes(load)
+                    .map_err(AssessmentError::Memory)?;
+                (weight_demand, qualification_peak_bytes, deferred_bank_bytes)
             };
-        self.compose_charge(state_bytes, weight_demand, startup_additional_bytes, pricing.cost())
+        self.compose_charge(
+            state_bytes,
+            weight_demand,
+            qualification_peak_bytes,
+            deferred_bank_bytes,
+            pricing.cost(),
+        )
     }
 
     /// The charge of this banked structure at `(slots, places, paths)` and
@@ -1196,11 +1174,16 @@ impl StructuralCharge {
             .bank_slot_model
             .as_ref()
             .expect("invariant violated: charge_at_slots_places_and_paths requires a banked StructuralCharge");
-        let (weight_demand, qualification_peak) = model
+        let (weight_demand, qualification_peak, deferred_bank_bytes) = model
             .charge_terms(bank, slots, places, paths)
             .map_err(AssessmentError::Memory)?;
-        let startup_additional_bytes = qualification_peak.max(self.staging_upload_bytes);
-        self.compose_charge(state_bytes, weight_demand, startup_additional_bytes, pricing.cost())
+        self.compose_charge(
+            state_bytes,
+            weight_demand,
+            qualification_peak,
+            deferred_bank_bytes,
+            pricing.cost(),
+        )
     }
 }
 
@@ -1355,6 +1338,7 @@ impl<'a> BankPathPricer<'a> {
         let slots = usize::try_from(slots)
             .map_err(|_| AssessmentError::Memory("a bank's slots exceed usize".into()))?;
         let held = HeldSlots::bank(slots);
+        let saturation_bytes = seismic_io::disk::FULL_DEPTH * seismic_io::disk::FULL_READ;
         let records = self
             .layers
             .path_records(
@@ -1365,6 +1349,7 @@ impl<'a> BankPathPricer<'a> {
                 crate::planning::HINT_LEADS,
                 self.num_layers,
                 self.decode_rows,
+                saturation_bytes,
             )
             .unwrap_or(magnitude_cost_model::PathRecords::NONE);
         Ok(crate::planning::BankPaths::Priced {

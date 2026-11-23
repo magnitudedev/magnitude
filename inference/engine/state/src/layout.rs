@@ -192,6 +192,32 @@ pub fn banks_per_slab(regions: &[SlabRegion], granule: u64) -> Result<usize, Str
     usize::try_from(banks).map_err(|_| "recurrent slab bank count exceeds host domain".into())
 }
 
+/// The smallest slab each stored history domain takes: one page at `context`
+/// and advances of at most `max_advance` rows.
+pub fn history_smallest_slabs(
+    domains: &[HistoryDomainLayout],
+    context: usize,
+    max_advance: usize,
+) -> Result<Vec<SlabLayout>, crate::Error> {
+    domains
+        .iter()
+        .filter(|domain| !domain.components().is_empty())
+        .map(|domain| {
+            let rows = domain.pages(domains, context, max_advance)?.page_rows as u64;
+            Ok(SlabLayout::for_regions(rows, rows, &crate::slab_regions(domain.components()))?)
+        })
+        .collect()
+}
+
+/// The smallest slab a store's recurrent banks take: one bank of `recurrent`'s
+/// components; `None` when `recurrent` is empty.
+pub fn recurrent_smallest_slab(recurrent: &[ComponentSpec]) -> Result<Option<SlabLayout>, crate::Error> {
+    if recurrent.is_empty() {
+        return Ok(None);
+    }
+    Ok(Some(SlabLayout::for_regions(1, 1, &bank_regions(recurrent))?))
+}
+
 /// The smallest slab each of a store's slab stores takes, which its granule
 /// holds at least: one page of each stored history domain of `domains` at
 /// `context` and advances of at most `max_advance` rows, and one bank of
@@ -202,16 +228,9 @@ pub fn smallest_slabs(
     context: usize,
     max_advance: usize,
 ) -> Result<Vec<SlabLayout>, crate::Error> {
-    let mut slabs = domains
-        .iter()
-        .filter(|domain| !domain.components().is_empty())
-        .map(|domain| {
-            let rows = domain.pages(domains, context, max_advance)?.page_rows as u64;
-            Ok(SlabLayout::for_regions(rows, rows, &crate::slab_regions(domain.components()))?)
-        })
-        .collect::<Result<Vec<_>, crate::Error>>()?;
-    if !recurrent.is_empty() {
-        slabs.push(SlabLayout::for_regions(1, 1, &bank_regions(recurrent))?);
+    let mut slabs = history_smallest_slabs(domains, context, max_advance)?;
+    if let Some(recurrent) = recurrent_smallest_slab(recurrent)? {
+        slabs.push(recurrent);
     }
     Ok(slabs)
 }

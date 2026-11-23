@@ -308,6 +308,7 @@ pub(crate) fn import_target(
     residency: &mut ResidencyStore,
     charges: &seismic::Charges,
     host_tables: &crate::memory::ledger::Held,
+    open_bank: bool,
 ) -> Result<ResidentTarget, ResidencyError> {
     validate_definition_package(definition, package)?;
     let decoder = &definition.decoder;
@@ -396,7 +397,11 @@ pub(crate) fn import_target(
         output,
         fusion,
         per_layer,
-        bank: residency.open_expert_bank(charges, target)?,
+        bank: if open_bank {
+            residency.open_expert_bank(charges, target)?
+        } else {
+            None
+        },
         imports: residency.imports(),
     })
 }

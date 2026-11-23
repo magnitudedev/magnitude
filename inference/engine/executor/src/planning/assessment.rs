@@ -47,16 +47,20 @@ pub struct AssessmentMemoryTerms {
     pub host_table_bytes: u64,
     /// Complete physical weight demand of every selected component.
     pub weight_demand: ClaimDemand,
+    /// Device bytes of a streamed expert bank's slots above its floor, which
+    /// are claimed and opened only after `upload_window` is released and
+    /// therefore never coexist with `target_upload_peak_bytes`.
+    pub deferred_bank_bytes: u64,
 }
 
 /// Upper bounds for every nonresident charge of a clean load. The prepared
 /// resources (`prepared_resource_bytes`) are all steady native holdings: the
 /// prepared programs' owner, the graph pools with their output, upload
 /// regions and bound constants, recorded graphs and the worker's device
-/// bytes; the startup bound covers the additional qualification/import peak;
-/// the component bound is the import peak of an optional component a served
-/// request loads; the staging bound is the host upload peak of a dedicated
-/// device's imports.
+/// bytes; `qualification_peak_bytes` is the Phase A qualification fixture
+/// peak (disjoint from weights, graph pools, and state); `target_upload_peak_bytes`
+/// is the target-only upload window held during target import; `component_upload_bytes`
+/// is the import peak of an optional component a served request loads.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct AssessmentMemoryBounds {
     /// Every graph pool and bound constant
@@ -67,9 +71,16 @@ pub struct AssessmentMemoryBounds {
     pub recorded_graph_bytes: u64,
     /// The part of `recorded_graph_bytes` in its upload storage.
     pub recorded_graph_upload_bytes: u64,
-    pub startup_additional_bytes: u64,
+    /// Phase A program qualification fixture peak (runs beside
+    /// `AttestedPrograms::DEVICE_BYTES` and is dropped before weights, graph
+    /// pools, or state are allocated).
+    pub qualification_peak_bytes: u64,
+    /// Target-only upload window held during target weight import (never
+    /// includes lazy `head` or `vision` upload peaks).
+    pub target_upload_peak_bytes: u64,
+    /// Import upload peak of an optional component (`head` or `vision`) loaded
+    /// lazily during serving or warm-up.
     pub component_upload_bytes: u64,
-    pub staging_upload_bytes: u64,
     /// Host heap of the sealed target graphs
     /// (`TargetGraphBounds::sealed`): system RAM
     /// like the host tables, held from sealing on.
@@ -99,6 +110,16 @@ impl AssessmentMemoryBounds {
         .into_iter()
         .try_fold(0u64, |total, bytes| total.checked_add(bytes))
         .ok_or_else(|| "assessment prepared resource bound overflow".to_owned())
+    }
+
+    /// Peak device memory held during Phase A (program preparation and
+    /// qualification), before any model weights, graph pools, or state exist.
+    pub fn qualification_phase_bytes(&self) -> Result<u64, String> {
+        AttestedPrograms::DEVICE_BYTES
+            .checked_add(self.qualification_peak_bytes)
+            .and_then(|bytes| bytes.checked_add(self.device_process.context))
+            .and_then(|bytes| bytes.checked_add(self.device_process.programs))
+            .ok_or_else(|| "assessment qualification phase bound overflow".to_owned())
     }
 }
 
@@ -548,17 +569,18 @@ pub struct SealedGraphHostBytes {
     pub at_least: u64,
 }
 
-/// Header-derived charges that are known before graph formation. The startup
-/// charge is the same qualification/import upper bound used by the production
-/// resource planner; the component charge is the import uploads an optional
+/// Header-derived charges that are known before graph formation.
+/// `qualification_peak_bytes` is the Phase A program qualification fixture
+/// peak (disjoint from weights, graph pools, and state);
+/// `target_upload_peak_bytes` is the target-only upload window held during
+/// target import; `component_upload_bytes` is the import uploads an optional
 /// head or vision component claims beside its weights when a request first
-/// needs it (`ExecutorDomain::bind_component`); the staging charge is the
-/// largest selected source tensor's import upload.
+/// needs it (`ExecutorDomain::bind_component`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct AssessmentHeaderBounds {
-    pub startup_additional_bytes: u64,
+    pub qualification_peak_bytes: u64,
+    pub target_upload_peak_bytes: u64,
     pub component_upload_bytes: u64,
-    pub staging_upload_bytes: u64,
 }
 
 /// The standard workload's charge in each memory role a load touches.
@@ -575,7 +597,11 @@ pub struct AssessmentMemoryCharge {
     /// serves at the fit depth: the weights, every prepared resource and the
     /// workload's state. A first load's tuning holds no more than this.
     pub serving_bytes: u64,
-    /// Everything the device's allocation domain holds at the clean-load peak.
+    /// Everything the device's allocation domain holds at the Phase B
+    /// (target load / serving) peak: `max(loading_phase_bytes, serving_phase_bytes)`.
+    pub phase_b_allocation_bytes: u64,
+    /// Everything the device's allocation domain holds at the clean-load peak:
+    /// `max(qualification_phase_bytes, phase_b_allocation_bytes)`.
     pub allocation_bytes: u64,
     /// Host RAM a dedicated device's staged import holds at its peak.
     pub staging_bytes: u64,
@@ -585,6 +611,9 @@ pub struct AssessmentMemoryCharge {
     /// Complete physical weight demand, part of `allocation_bytes`: each
     /// allocation in the storage it lies in (`assess_fit`).
     pub weight_demand: ClaimDemand,
+    /// Device bytes of a streamed expert bank's slots above its floor, which
+    /// never coexist with `target_upload_peak_bytes`.
+    pub deferred_bank_bytes: u64,
     /// The pass its certified family holds, within the arena's cap
     /// (`TargetGraphBounds::group_bytes`): the most places a prompt group's
     /// class claims as it opens (`ExecutorDomain::open_group`), part of no
@@ -759,6 +788,44 @@ pub struct AssessmentGraphResourceBounds {
 }
 
 impl AssessmentGraphResourceBounds {
+    /// Additional device bytes held warm in `IdleClass` (`CacheKind::GraphSlots`)
+    /// after a prompt group of `places` places closes: the extra activations
+    /// and output slots beyond the 1-place floor across target, readout, and
+    /// head graph pools. Since `IdleClass` stays warm across decode under the
+    /// Ledger's single-owner policy, `settle_bank` subtracts these bytes when
+    /// pricing steady-state decode expert slots for each candidate `pass`.
+    pub fn idle_class_bytes(
+        &self,
+        places: usize,
+        limits: super::ResourceLimits,
+        fronts: bool,
+    ) -> Result<u64, String> {
+        if places <= 1 {
+            return Ok(0);
+        }
+        let floor = limits.class_slots(1, fronts);
+        let grown = limits.class_slots(places, fronts);
+        let delta = |charge: &NativeGraphCharge, lo: crate::GraphSlots, hi: crate::GraphSlots| {
+            super::class_bytes(
+                charge.activation_bytes(),
+                hi.activations.saturating_sub(lo.activations),
+                charge.output_bytes,
+                hi.output.saturating_sub(lo.output),
+            )
+            .map_err(str::to_owned)
+        };
+        let target = delta(&self.target.charge, floor.target, grown.target)?;
+        let readout = delta(&self.readout, floor.readout, grown.readout)?;
+        let head = self
+            .head
+            .as_ref()
+            .map_or(Ok(0), |charge| delta(charge, floor.head, grown.head))?;
+        target
+            .checked_add(readout)
+            .and_then(|bytes| bytes.checked_add(head))
+            .ok_or_else(|| "idle class byte count overflows".to_owned())
+    }
+
     pub fn derive(
         definition: &ModelDefinition,
         load: &ModelLoadPlan,
@@ -1503,18 +1570,42 @@ fn state_bank_capacity(state: &super::StateResourcePlan) -> Option<BankCapacity>
         .then_some(state.target_state().bank_capacity)
 }
 
+/// Device bytes of a streamed expert bank's slots above its floor.
+/// When `!bank.whole()`, non-banked target weights are imported while
+/// `upload_window` is held, then `upload_window` is released before the
+/// expert bank claims and opens its slots past floor; therefore those slots
+/// never coexist with `target_upload_peak_bytes`. When `bank.whole()`,
+/// `import_whole` uses upload storage alongside the bank, so nothing is
+/// deferred.
+pub(crate) fn deferred_bank_bytes_of_bank(bank: &super::ExpertBankPlan) -> Result<u64, String> {
+    if bank.whole() {
+        return Ok(0);
+    }
+    let current = bank.resident_charge(bank.slots)?;
+    let floor = bank.resident_charge(bank.floor())?;
+    current
+        .checked_sub(floor)
+        .ok_or_else(|| "bank resident charge underflows floor".to_owned())
+}
+
+pub(crate) fn deferred_bank_bytes(load: &ModelLoadPlan) -> Result<u64, String> {
+    match load.expert_bank() {
+        Some(bank) => deferred_bank_bytes_of_bank(bank),
+        None => Ok(0),
+    }
+}
+
 impl AssessmentHeaderBounds {
     pub fn derive(load: &ModelLoadPlan) -> Result<Self, String> {
-        let import_peak = load.imports().peak_bytes();
-        let startup_additional_bytes =
-            AttestedPrograms::qualification_peak_bytes(load)?.max(import_peak);
+        let qualification_peak_bytes = AttestedPrograms::qualification_peak_bytes(load)?;
+        let target_upload_peak_bytes = load.target_upload_peak_bytes();
         let component_upload_bytes = load
             .head_upload_peak_bytes()
             .max(load.vision_upload_peak_bytes());
         Ok(Self {
-            startup_additional_bytes,
+            qualification_peak_bytes,
+            target_upload_peak_bytes,
             component_upload_bytes,
-            staging_upload_bytes: import_peak,
         })
     }
 
@@ -1540,9 +1631,9 @@ impl AssessmentHeaderBounds {
                 .checked_add(recorded.upload)
                 .ok_or("the startup graphs' memory overflows")?,
             recorded_graph_upload_bytes: recorded.upload,
-            startup_additional_bytes: self.startup_additional_bytes,
+            qualification_peak_bytes: self.qualification_peak_bytes,
+            target_upload_peak_bytes: self.target_upload_peak_bytes,
             component_upload_bytes: self.component_upload_bytes,
-            staging_upload_bytes: self.staging_upload_bytes,
             // The target's sealed plans, the prepared graphs that hold
             // them and the family's constant values, and the state copy
             // graphs, which the plan fixes.
@@ -1653,6 +1744,7 @@ impl AssessmentMemoryTerms {
             conversations: limits.conversations.get() as u64,
             host_table_bytes: load.host_table_bytes()?,
             weight_demand: ClaimDemand::checked_sum(demands).ok_or("weight demand overflows")?,
+            deferred_bank_bytes: deferred_bank_bytes(load)?,
         })
     }
 
@@ -1686,15 +1778,20 @@ impl AssessmentMemoryTerms {
         })
     }
 
-    /// The charge of each memory role. The allocation domain holds the
-    /// weights and every prepared resource, plus the larger of two phases
-    /// that never coexist: serving, the workload's state at the fit depth,
-    /// which grows only after the load is ready, with the import uploads of
-    /// an optional component a request loads there; and the load itself,
-    /// its startup state with the qualification/import peak, then its state
-    /// once loaded. A dedicated device's staging domain holds the larger
-    /// upload window. The pass the load holds, `held_pass`, is carried
-    /// beside them, in none of them.
+    /// The charge of each memory role. Three disjoint phases never coexist:
+    /// - Phase A (program qualification): `AttestedPrograms::DEVICE_BYTES +
+    ///   qualification_peak_bytes` (+ driver context/programs), dropped before
+    ///   graph sealing, state tables, or weight import.
+    /// - Phase B1 (target import): `(weight_bytes - deferred_bank_bytes) +
+    ///   prepared_resource_bytes + startup_state_bytes + target_upload_peak_bytes`,
+    ///   where streamed bank slots past floor are claimed and opened only after
+    ///   `upload_window` is released.
+    /// - Phase B2 (serving): `weight_bytes + prepared_resource_bytes +
+    ///   state_slab_bytes + component_upload_bytes`, holding the workload's
+    ///   state at the fit depth and any lazy optional component's upload window.
+    /// A dedicated device's staging domain holds the larger upload window.
+    /// The pass the load holds, `held_pass`, is carried beside them, in none
+    /// of them.
     pub fn charge(
         self,
         bounds: AssessmentMemoryBounds,
@@ -1709,6 +1806,7 @@ impl AssessmentMemoryTerms {
             state_slab_bytes,
             startup_state_bytes,
             self.host_table_bytes,
+            self.deferred_bank_bytes,
             held_pass,
         )
     }
@@ -1719,6 +1817,7 @@ impl AssessmentMemoryCharge {
     /// from the weights' bytes (`weight_bytes`, which `weight_demand`
     /// places), the bounds and the state's phases: the one owner of how the
     /// roles compose.
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn compose(
         weight_bytes: u64,
         weight_demand: ClaimDemand,
@@ -1726,59 +1825,69 @@ impl AssessmentMemoryCharge {
         state_slab_bytes: u64,
         startup_state_bytes: u64,
         host_table_bytes: u64,
+        deferred_bank_bytes: u64,
         held_pass: super::PassLaunches,
     ) -> Result<Self, String> {
         let exact_resident_bytes = weight_bytes
             .checked_add(state_slab_bytes)
             .ok_or("assessment resident bytes overflow")?;
-        let loading_bytes = startup_state_bytes
-            .checked_add(bounds.startup_additional_bytes)
-            .ok_or("assessment startup charge overflow")?;
+        let prepared_resources = bounds.prepared_resource_bytes()?;
         let prepared_bytes = weight_bytes
-            .checked_add(bounds.prepared_resource_bytes()?)
+            .checked_add(prepared_resources)
             .ok_or("assessment prepared charge overflow")?;
         let serving_bytes = prepared_bytes
             .checked_add(state_slab_bytes)
             .ok_or("assessment serving charge overflow")?;
-        let serving_peak_bytes = state_slab_bytes
+        let qualification_phase_bytes = bounds.qualification_phase_bytes()?;
+        let loading_weight_bytes = weight_bytes
+            .checked_sub(deferred_bank_bytes)
+            .ok_or("deferred bank bytes exceed weight bytes")?;
+        let loading_phase_bytes = loading_weight_bytes
+            .checked_add(prepared_resources)
+            .and_then(|bytes| bytes.checked_add(startup_state_bytes))
+            .and_then(|bytes| bytes.checked_add(bounds.target_upload_peak_bytes))
+            .ok_or("assessment startup charge overflow")?;
+        let serving_phase_bytes = serving_bytes
             .checked_add(bounds.component_upload_bytes)
             .ok_or("assessment serving peak overflow")?;
-        let allocation_bytes = prepared_bytes
-            .checked_add(serving_peak_bytes.max(loading_bytes))
-            .ok_or("assessment allocation charge overflow")?;
+        let phase_b_allocation_bytes = serving_phase_bytes.max(loading_phase_bytes);
+        let allocation_bytes = qualification_phase_bytes.max(phase_b_allocation_bytes);
         Ok(Self {
             exact_resident_bytes,
             state_bytes: state_slab_bytes,
             startup_state_bytes,
             bounds,
             serving_bytes,
+            phase_b_allocation_bytes,
             allocation_bytes,
             staging_bytes: bounds
-                .staging_upload_bytes
+                .target_upload_peak_bytes
                 .max(bounds.component_upload_bytes),
             host_table_bytes,
             weight_demand,
+            deferred_bank_bytes,
             held_pass,
         })
     }
 
     /// The charge of `load`, a load that differs from this charge's only in
     /// its expert bank's slots: of its weight demand (all of its weights, a
-    /// bank's committed records among them) and its header bounds' startup
-    /// peak, the two terms a bank's slots move. Every other term is of the
-    /// bank's structure alone (`assessment::StructuralCharge`); its upload
-    /// windows are, which `load`'s must agree with.
+    /// bank's committed records among them), its deferred bank bytes, and its
+    /// header bounds' qualification peak, the terms a bank's slots move. Every
+    /// other term is of the bank's structure alone (`assessment::StructuralCharge`);
+    /// its upload windows are, which `load`'s must agree with.
     pub fn at_bank_slots(self, load: &ModelLoadPlan) -> Result<Self, String> {
         let weight_demand = ClaimDemand::checked_sum(load.weight_demands()?).ok_or("weight demand overflows")?;
-        let startup_additional_bytes = AttestedPrograms::qualification_peak_bytes(load)?
-            .max(self.bounds.staging_upload_bytes);
+        let qualification_peak_bytes = AttestedPrograms::qualification_peak_bytes(load)?;
+        let deferred = deferred_bank_bytes(load)?;
         Self::compose(
             weight_demand.checked_bytes().ok_or("weight demand overflows")?,
             weight_demand,
-            AssessmentMemoryBounds { startup_additional_bytes, ..self.bounds },
+            AssessmentMemoryBounds { qualification_peak_bytes, ..self.bounds },
             self.state_bytes,
             self.startup_state_bytes,
             self.host_table_bytes,
+            deferred,
             self.held_pass,
         )
     }
@@ -1789,15 +1898,23 @@ impl AssessmentMemoryCharge {
     /// host tier grown past the floor its bank commits at load is such
     /// storage (`ExecutionPlanDraft::with_host_tier`).
     pub fn with_weights(self, more: ClaimDemand) -> Result<Self, String> {
-        let bytes = more.checked_bytes().ok_or("weight demand overflows")?;
-        let grown = |figure: u64| figure.checked_add(bytes).ok_or("assessment charge overflows");
-        Ok(Self {
-            exact_resident_bytes: grown(self.exact_resident_bytes)?,
-            serving_bytes: grown(self.serving_bytes)?,
-            allocation_bytes: grown(self.allocation_bytes)?,
-            weight_demand: self.weight_demand.checked_plus(more).ok_or("weight demand overflows")?,
-            ..self
-        })
+        let weight_demand = self
+            .weight_demand
+            .checked_plus(more)
+            .ok_or("weight demand overflows")?;
+        let weight_bytes = weight_demand
+            .checked_bytes()
+            .ok_or("weight demand overflows")?;
+        Self::compose(
+            weight_bytes,
+            weight_demand,
+            self.bounds,
+            self.state_bytes,
+            self.startup_state_bytes,
+            self.host_table_bytes,
+            self.deferred_bank_bytes,
+            self.held_pass,
+        )
     }
 
 
@@ -1872,10 +1989,11 @@ impl AssessmentMemoryCharge {
             Ok(StoreDemands::Unified { total })
         } else {
             let host_weights = self.split_host_weight_bytes(topology, executor)?;
-            let device = self
-                .allocation_bytes
+            let phase_b_device = self
+                .phase_b_allocation_bytes
                 .checked_sub(host_weights)
                 .ok_or_else(|| "host weight storage exceeds allocation charge".to_owned())?;
+            let device = self.bounds.qualification_phase_bytes()?.max(phase_b_device);
             let host = host_bytes
                 .checked_add(host_weights)
                 .and_then(|bytes| bytes.checked_add(self.staging_bytes))
@@ -1884,9 +2002,43 @@ impl AssessmentMemoryCharge {
         }
     }
 
-    /// Per-store startup peak demand (weights + prepared resources + startup
-    /// state + startup transient, plus host-side bytes, excluding elastic KV
-    /// history allocated on demand as prompts grow).
+    /// Slack in the allocation store between the overall peak
+    /// ([`Self::store_demands`]) and the Phase B2 serving peak
+    /// (`serving_bytes + component_upload_bytes`). When Phase A
+    /// (qualification) or Phase B1 (target upload) exceeds Phase B2 at a
+    /// bank's floor, streamed bank slots past floor absorb this slack before
+    /// growing `allocation_bytes`.
+    pub(crate) fn bank_growth_slack(
+        &self,
+        topology: &DeviceTopology,
+        executor: &Executor,
+    ) -> Result<u64, String> {
+        let serving_peak = self
+            .serving_bytes
+            .checked_add(self.bounds.component_upload_bytes)
+            .ok_or_else(|| "assessment serving peak overflow".to_owned())?;
+        let unified_host = DomainRole::of(topology, executor, topology.host_ram().id())
+            == DomainRole::Allocation;
+        let serving_allocation = if unified_host {
+            serving_peak
+                .checked_add(self.host_bytes()?)
+                .ok_or_else(|| "unified serving peak overflows".to_owned())?
+        } else {
+            let host_weights = self.split_host_weight_bytes(topology, executor)?;
+            serving_peak
+                .checked_sub(host_weights)
+                .ok_or_else(|| "host weight storage exceeds serving peak".to_owned())?
+        };
+        let peak_allocation = self.store_demands(topology, executor)?.allocation_bytes();
+        Ok(peak_allocation.saturating_sub(serving_allocation))
+    }
+
+    /// Per-store startup peak demand: the max of Phase A (qualification),
+    /// Phase B1 (non-banked + floor target weights + prepared resources +
+    /// startup state + target upload window), and Phase B1.5 (all weights +
+    /// prepared resources + startup state after the upload window is released
+    /// and the bank opens), plus host-side bytes, excluding elastic KV history
+    /// allocated on demand as prompts grow.
     pub fn startup_store_demands(
         &self,
         topology: &DeviceTopology,
@@ -1896,29 +2048,36 @@ impl AssessmentMemoryCharge {
             .weight_demand
             .checked_bytes()
             .ok_or_else(|| "weight demand overflows".to_owned())?;
-        let prepared = weight_bytes
-            .checked_add(self.bounds.prepared_resource_bytes()?)
-            .ok_or_else(|| "startup prepared bytes overflow".to_owned())?;
-        let loading = self
-            .startup_state_bytes
-            .checked_add(self.bounds.startup_additional_bytes)
-            .ok_or_else(|| "startup loading bytes overflow".to_owned())?;
-        let raw_startup = prepared
-            .checked_add(loading)
-            .ok_or_else(|| "startup byte count overflow".to_owned())?;
+        let prepared_resources = self.bounds.prepared_resource_bytes()?;
+        let qualification = self.bounds.qualification_phase_bytes()?;
+        let loading_weights = weight_bytes
+            .checked_sub(self.deferred_bank_bytes)
+            .ok_or_else(|| "deferred bank bytes exceed weight bytes".to_owned())?;
+        let phase_b1 = loading_weights
+            .checked_add(prepared_resources)
+            .and_then(|bytes| bytes.checked_add(self.startup_state_bytes))
+            .and_then(|bytes| bytes.checked_add(self.bounds.target_upload_peak_bytes))
+            .ok_or_else(|| "startup target load bytes overflow".to_owned())?;
+        let phase_b1_opened = weight_bytes
+            .checked_add(prepared_resources)
+            .and_then(|bytes| bytes.checked_add(self.startup_state_bytes))
+            .ok_or_else(|| "startup opened bytes overflow".to_owned())?;
+        let phase_b_startup = phase_b1.max(phase_b1_opened);
         let host_bytes = self.host_bytes()?;
         let unified_host = DomainRole::of(topology, executor, topology.host_ram().id())
             == DomainRole::Allocation;
         if unified_host {
-            let total = raw_startup
+            let total = qualification
+                .max(phase_b_startup)
                 .checked_add(host_bytes)
                 .ok_or_else(|| "unified startup byte count overflow".to_owned())?;
             Ok(StoreDemands::Unified { total })
         } else {
             let host_weights = self.split_host_weight_bytes(topology, executor)?;
-            let device = raw_startup
+            let phase_b_device = phase_b_startup
                 .checked_sub(host_weights)
                 .ok_or_else(|| "host weight storage exceeds startup charge".to_owned())?;
+            let device = qualification.max(phase_b_device);
             let host = host_bytes
                 .checked_add(host_weights)
                 .and_then(|bytes| bytes.checked_add(self.staging_bytes))

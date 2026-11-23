@@ -4,6 +4,23 @@ use super::*;
 use crate::planning::graph_demand;
 use magnitude_state::{GrowthChoice, RowDemand, StateStore, StoreCopy};
 
+/// Map a tensor allocation failure in [`ExecutorDomain::ensure_head_features`]
+/// so ledger/device capacity refusals (such as `AllocationCapacity` when a
+/// newly claimed cache yield has not yet released) surface as retryable
+/// [`DomainError::Capacity`] rather than a permanent [`DomainError::Input`].
+fn feature_allocation_error(error: seismic::TensorError) -> DomainError {
+    match error {
+        seismic::TensorError::Execution(execution)
+            if execution.capacity_refusal().is_some()
+                || matches!(execution, seismic::ExecutionError::AllocationFailed(_)) =>
+        {
+            let (required, available) = execution.capacity_refusal().unwrap_or((1, 0));
+            DomainError::Capacity(CapacityError::new(ResourceKind::DeviceMemory, required, available))
+        }
+        other => DomainError::Input(other.to_string()),
+    }
+}
+
 /// The storage of `kind` this executor places first: its store.
 pub(super) fn storage_store(topology: &seismic::DeviceTopology, executor: &seismic::Executor, kind: seismic::Contract) -> Option<seismic::StoreId> {
     executor.paths(kind).first().and_then(|path| topology.access_path(*path)).map(|path| path.store())
@@ -129,7 +146,7 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
             let device = self.domain.device();
             let tensor = held
                 .allocate(device, |charges| Tensor::zeros(charges, element, &[1, width]))
-                .map_err(|error| DomainError::Input(error.to_string()))?;
+                .map_err(feature_allocation_error)?;
             self.domain
                 .publish_features(tensor, held.into_claims())
                 .map_err(|error| DomainError::Input(error.to_string()))
@@ -470,14 +487,16 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
         // Advance each request's reservation reach only after every fallible
         // provisioning step succeeds, so a refused launch never inflates
         // `Reservation::through()`.
-        self.change_state(|this, _| {
-            for (sequence, through) in state_rows {
-                this.resident_mut(sequence)
-                    .expect("invariant violated: a resident request is missing")
-                    .claim
-                    .grow(through);
-            }
-        });
+        if !state_rows.is_empty() {
+            self.change_state(|this, _| {
+                for (sequence, through) in state_rows {
+                    this.resident_mut(sequence)
+                        .expect("invariant violated: a resident request is missing")
+                        .claim
+                        .grow(through);
+                }
+            });
+        }
         Ok(())
     }
 
@@ -851,31 +870,44 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
         Ok(StateShrink { state, slots })
     }
 
-    /// The one granule pool backing the domain's state stores (both target and
-    /// head share `LoadPools::state`).
+    /// The history granule pool backing the domain's state stores.
     pub(super) fn state_pool(&self) -> &seismic::Pool {
         self.target_store.pool()
     }
 
+    /// All granule pools backing the domain's state stores: history pool, plus
+    /// the dedicated recurrent pool when present.
+    pub(super) fn state_pools(&self) -> impl Iterator<Item = &seismic::Pool> {
+        std::iter::once(self.target_store.pool()).chain(self.target_store.recurrent_pool())
+    }
+
     /// Release both stores' slabs beyond the live requests' next steps
     /// ([`Self::shrink_store`]), moving no row or bank, and return what
-    /// they freed to the OS through the state's pool, which empties its
+    /// they freed to the OS through each state pool, which empties its
     /// emptiest blocks where whole blocks fall short of it
     /// (`seismic::Pool::return_freed`): the one copy. The queued steps are
     /// orphaned first: their launch bindings pin slab placement.
     pub(super) fn yield_state(&mut self, unchained: &mut Unchained<'_>) -> Result<StateYield, DomainError> {
         self.conclude_chain()?;
         let bindings = unchained.bindings();
-        let pool = self.state_pool().clone();
+        let history_pool = self.target_store.pool().clone();
+        let recurrent_pool = self.target_store.recurrent_pool().cloned();
         self.change_state(|this, _| {
-            let mut released = this.shrink_store(bindings, false)?;
+            let mut freed = this.shrink_store(bindings, false)?;
             if this.head_store.is_some() {
-                released += this.shrink_store(bindings, true)?;
+                let head = this.shrink_store(bindings, true)?;
+                freed.history += head.history;
+                freed.recurrent += head.recurrent;
             }
-            let returned = pool
-                .return_freed(released)
-                .map_err(|error| DomainError::invariant(format!("the state's pool could not return its slabs' blocks: {error}")))?;
-            Ok(StateYield { released, returned })
+            let mut returned = history_pool
+                .return_freed(freed.history)
+                .map_err(|error| DomainError::invariant(format!("the state's history pool could not return its slabs' blocks: {error}")))?;
+            if let Some(rpool) = &recurrent_pool {
+                returned += rpool
+                    .return_freed(freed.recurrent)
+                    .map_err(|error| DomainError::invariant(format!("the state's recurrent pool could not return its slabs' blocks: {error}")))?;
+            }
+            Ok(StateYield { released: freed.total(), returned })
         })
     }
 
@@ -891,7 +923,12 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
         }
         let done = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         self.state_pool_release = Some(done.clone());
-        self.state_pool().wake_on_release(move || {
+        let pool = self
+            .state_pools()
+            .find(|pool| pool.releasing())
+            .cloned()
+            .unwrap_or_else(|| self.state_pool().clone());
+        pool.wake_on_release(move || {
             done.store(true, std::sync::atomic::Ordering::Release);
             wake.complete();
         });
@@ -920,7 +957,7 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
     }
 
     /// At a flight boundary: consume any finished async state-pool release
-    /// watch and drain settled owed blocks from the state pool (so fenced
+    /// watch and drain settled owed blocks from the state pool(s) (so fenced
     /// granules from an earlier state shrink or rollback vacate on the next
     /// boundary once their flight ends). Returns `true` when a watched async
     /// release finished or settled blocks returned synchronously, signalling
@@ -928,8 +965,8 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
     pub fn advance_state_pool_release(&mut self) -> bool {
         let mut completed = self.take_finished_state_pool_release();
         let changes = self.resources.ledgers().changes().clone();
-        let pool = self.state_pool();
-        if pool.owed() > 0 {
+        let owed_pools: Vec<_> = self.state_pools().filter(|pool| pool.owed() > 0).cloned().collect();
+        for pool in owed_pools {
             match changes.change(|_| pool.return_freed(0)) {
                 Ok(returned) if returned > 0 && !pool.releasing() => completed = true,
                 Ok(_) => {}
@@ -967,7 +1004,10 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
         if self.group_class.is_some() {
             return Ok(());
         }
-        let capacity = self.chain_capacity().get();
+        let capacity = self
+            .chain_capacity()
+            .get()
+            .min(self.execution.load().pass(self.execution.policy().limits()).get());
         let chunks = match (operations, self.behind_within(operations, capacity)) {
             ([_], super::queue::Behind::Chain { chunks }) => chunks.len() + 1,
             _ => return Ok(()),
@@ -1363,9 +1403,9 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
 
     /// Release one store's slabs beyond the room its live requests'
     /// reservations and next steps claim
-    /// (`magnitude_state::StoreBindings::shrink`), moving no row or bank:
-    /// the bytes of the granules released.
-    fn shrink_store(&mut self, bindings: &mut StateBindings, head: bool) -> Result<u64, DomainError> {
+    /// (`magnitude_state::StoreBindings::shrink_by_pool`), moving no row or bank:
+    /// the bytes of the granules released in each state pool.
+    fn shrink_store(&mut self, bindings: &mut StateBindings, head: bool) -> Result<magnitude_state::ShrinkRelease, DomainError> {
         // A live request's steps in flight (its next, and the one queued
         // behind it where the load pipelines or chains) each append a row
         // and take a successor bank, and every row its reservation holds is
@@ -1381,7 +1421,7 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
             }
         }
         let next = magnitude_state::NextSteps { rows, banks: steps * count };
-        Ok(bindings.store(head).shrink(&next)?)
+        Ok(bindings.store(head).shrink_by_pool(&next)?)
     }
 
     fn submit_store_copy(
@@ -1421,7 +1461,7 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
 
 /// The bytes of the load `execution`'s request slot
 /// (`CommittedKind::RequestSlot`): one request's opening reservation, of a
-/// request about to write no rows (`RequestRows::opening`), by the page
+/// minimal 1-row request (`RequestRows::opening(1)`), by the page
 /// rule its reservations are sized by (`LoadShape::state_bytes`); at least
 /// the state stores' first slabs, which construction backs as granules
 /// within it.
@@ -1846,6 +1886,23 @@ mod group_demand_tests {
             domain.resident(request).unwrap().claim.through(),
             0,
             "a refused provision must not inflate Reservation::through()"
+        );
+    }
+
+    #[test]
+    fn ensure_head_features_capacity_refusal_maps_to_capacity_not_input() {
+        let error = seismic::TensorError::Execution(seismic::ExecutionError::AllocationCapacity {
+            required: 49152u64.into(),
+            available: 49151,
+        });
+        let mapped = super::feature_allocation_error(error);
+        assert!(
+            matches!(
+                mapped,
+                DomainError::Capacity(ref cap)
+                    if cap.resource == ResourceKind::DeviceMemory && cap.required == 49152 && cap.available == 49151
+            ),
+            "49152/49151 AllocationCapacity must map to DomainError::Capacity for relief, got {mapped:?}"
         );
     }
 }

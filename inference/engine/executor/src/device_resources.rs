@@ -70,12 +70,28 @@ impl fmt::Debug for TensorBacking {
     }
 }
 
-#[derive(Debug)]
 pub(crate) struct FeatureAllocation {
     tensor: Option<TensorBacking>,
+    /// Class-padded leading view of the same graph output arena (`>= row_class(rows)`),
+    /// allowing single-slot device-conditioned `Operation::Head` to bind directly
+    /// without D2H/H2D copy even when `rows` is not a power of two (e.g. `M = 3, 5`).
+    padded: Option<GraphOutputTensor>,
     boundary: Option<FeatureRef>,
     rows: usize,
     width: usize,
+}
+
+impl fmt::Debug for FeatureAllocation {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("FeatureAllocation")
+            .field("tensor", &self.tensor)
+            .field("padded", &self.padded.as_ref().map(|t| t.tensor().extents()))
+            .field("boundary", &self.boundary)
+            .field("rows", &self.rows)
+            .field("width", &self.width)
+            .finish()
+    }
 }
 
 impl FeatureAllocation {
@@ -83,6 +99,26 @@ impl FeatureAllocation {
     /// pool; standalone feature tensors own their charge directly.
     pub(crate) fn is_graph_backed(&self) -> bool {
         matches!(self.tensor.as_ref(), Some(TensorBacking::Graph(_)))
+    }
+
+    /// Return a zero-copy `GraphOutputTensor` with at least `entry_rows` leading
+    /// rows for device-conditioned `HeadConditioning::Features`, if this
+    /// allocation is graph-backed with sufficient leading extent.
+    pub(crate) fn graph_conditioning(&self, entry_rows: usize) -> Option<GraphOutputTensor> {
+        let needed = entry_rows as u64;
+        if let Some(padded) = &self.padded {
+            if padded.tensor().extents().first().is_some_and(|&rows| rows >= needed) {
+                return Some(padded.clone());
+            }
+        }
+        match self.tensor.as_ref() {
+            Some(TensorBacking::Graph(tensor))
+                if tensor.tensor().extents().first().is_some_and(|&rows| rows >= needed) =>
+            {
+                Some(tensor.clone())
+            }
+            _ => None,
+        }
     }
 
     pub fn tensor(&self) -> Result<&Tensor, ResourceError> {
@@ -261,6 +297,7 @@ impl FeatureRef {
             domain,
             allocation: Rc::new(FeatureAllocation {
                 tensor: None,
+                padded: None,
                 boundary: None,
                 rows,
                 width,
@@ -289,6 +326,7 @@ impl FeatureRef {
             domain: self.domain,
             allocation: Rc::new(FeatureAllocation {
                 tensor: self.allocation.tensor.clone(),
+                padded: self.allocation.padded.clone(),
                 rows: self.allocation.rows,
                 width: self.allocation.width,
                 boundary: Some(boundary),
@@ -308,6 +346,24 @@ impl FeatureRef {
             .chunks_exact(4)
             .map(|word| f32::from_le_bytes(word.try_into().expect("four bytes")))
             .collect())
+    }
+
+    /// Whether this lease is backed by an on-device graph output tensor that
+    /// can condition a single-slot `Operation::Head` directly on the device
+    /// without D2H/H2D copying.
+    pub fn is_device_backed(&self) -> bool {
+        self.allocation.is_graph_backed()
+    }
+
+    /// Read leading `0..count` rows as raw activation [`crate::FeatureRows`].
+    pub fn read_rows_to_host(&self, count: usize) -> Result<crate::FeatureRows, ResourceError> {
+        let bytes = self
+            .allocation
+            .slice(0..count)?
+            .read_to_host()
+            .map_err(|error| ResourceError::Tensor(error.to_string()))?;
+        crate::FeatureRows::new(bytes.into(), count)
+            .map_err(|_| ResourceError::InvalidFeatureShape)
     }
 
     pub fn rows(&self) -> usize {
@@ -518,7 +574,7 @@ impl ResourceDomain {
     /// those its allocation was made under, until its last view drops.
     pub fn publish_features(&self, tensor: Tensor, claims: Vec<crate::memory::ledger::Claim>) -> Result<FeatureRef, ResourceError> {
         let observation = tensor.observe_storage();
-        let feature = self.publish_feature_backing(OwnedTensor::new(tensor, claims))?;
+        let feature = self.publish_feature_backing(OwnedTensor::new(tensor, claims), None)?;
         let mut census = self.owned_features.borrow_mut();
         census.retain(|tensor| tensor.charged_bytes().is_some());
         census.push(observation);
@@ -528,9 +584,20 @@ impl ResourceDomain {
         &self,
         tensor: GraphOutputTensor,
     ) -> Result<FeatureRef, ResourceError> {
-        self.publish_feature_backing(TensorBacking::Graph(tensor))
+        self.publish_feature_backing(TensorBacking::Graph(tensor), None)
     }
-    fn publish_feature_backing(&self, tensor: TensorBacking) -> Result<FeatureRef, ResourceError> {
+    pub fn publish_graph_features_padded(
+        &self,
+        tensor: GraphOutputTensor,
+        padded: Option<GraphOutputTensor>,
+    ) -> Result<FeatureRef, ResourceError> {
+        self.publish_feature_backing(TensorBacking::Graph(tensor), padded)
+    }
+    fn publish_feature_backing(
+        &self,
+        tensor: TensorBacking,
+        padded: Option<GraphOutputTensor>,
+    ) -> Result<FeatureRef, ResourceError> {
         self.validate(tensor.tensor())?;
         let [rows, width] = tensor.tensor().extents() else {
             return Err(ResourceError::InvalidFeatureShape);
@@ -546,6 +613,7 @@ impl ResourceDomain {
             domain: self.id.clone(),
             allocation: Rc::new(FeatureAllocation {
                 tensor: Some(tensor),
+                padded,
                 boundary: None,
                 rows,
                 width,

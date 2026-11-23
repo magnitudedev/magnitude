@@ -35,7 +35,7 @@ use seismic::{BackendName, Element};
 const STREAMED: &Words = &[
     ("policy", magnitude_kernels::constants::POLICY_WHOLE, false),
     ("policy", magnitude_kernels::constants::POLICY_RESOLVED, false),
-    ("next_policy", magnitude_kernels::constants::POLICY_RESOLVED, false),
+    ("next_policy", magnitude_kernels::constants::POLICY_WHOLE, false),
 ];
 
 /// The words a banked plan's decode is encoded under when held whole-resident:
@@ -43,7 +43,7 @@ const STREAMED: &Words = &[
 const WHOLE: &Words = &[
     ("policy", magnitude_kernels::constants::POLICY_WHOLE, true),
     ("policy", magnitude_kernels::constants::POLICY_RESOLVED, true),
-    ("next_policy", magnitude_kernels::constants::POLICY_RESOLVED, true),
+    ("next_policy", magnitude_kernels::constants::POLICY_WHOLE, true),
 ];
 
 /// An amount of one weight format's, summed per format.

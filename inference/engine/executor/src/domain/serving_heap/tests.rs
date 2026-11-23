@@ -256,12 +256,11 @@ fn an_open_refused_short_idles_the_components_it_kept() {
     let _ = std::fs::remove_dir_all(directory);
 }
 
-/// An exogenous supply drop shrinking the bank suppresses immediate small
-/// bounce-back regrows during the 3 s cooldown (stopping 10 ms ping-pong),
-/// while letting the bank regrow after the cooldown expires or immediately
-/// when released memory jumps past the rebound margin.
+/// After an exogenous supply drop shrinks the bank, subsequent room recovery
+/// regrows immediately from the ledger's valuation alone (zero cooldown
+/// hysteresis).
 #[test]
-fn exogenous_shrink_damps_ping_pong_until_cooldown_or_large_release() {
+fn bank_regrows_immediately_from_ledger_valuation_after_shrink() {
     use crate::domain::ProgramFamily as _;
     let read_host = |ledger: &Ledger, free_beyond_target: i64, at: Instant| {
         let sample = seismic::HostSample {
@@ -288,7 +287,6 @@ fn exogenous_shrink_damps_ping_pong_until_cooldown_or_large_release() {
         let (mut domain, mut bindings) = banked(backend, 4, 4);
         let row = bank_row(&domain);
         let ledger = domain.resources.ledgers().device().clone();
-        // Set baseline headroom leaving bank comfortable at 4 slots (1 slot free), then establish calm baseline.
         let mut t = Instant::now();
         read_host(&ledger, row as i64, t);
         t += Duration::from_millis(100);
@@ -303,43 +301,17 @@ fn exogenous_shrink_damps_ping_pong_until_cooldown_or_large_release() {
         let shrunk_to = domain.family.expert_bank().expect("bank").slots();
         assert!(shrunk_to < 4, "{backend:?}: shrunk_to={shrunk_to}");
 
-        // Within 100ms, exogenous pressure recovers modestly (enough to regrow,
-        // still below the rebound margin): 3s cooldown suppresses ping-pong.
+        // As soon as room recovers, the bank regrows immediately from the ledger's valuation.
         t += Duration::from_millis(100);
-        read_host(&ledger, (row * 2) as i64, t);
-        assert_eq!(domain.follow_cache_targets(&mut bindings, wake(), wake()).unwrap(), Followed::Holds, "{backend:?}: ping-pong suppressed during cooldown");
-        assert_eq!(pending_move(&domain), None, "{backend:?}");
-
-        // After > 3s calm availability at the same room, cooldown expires cleanly.
-        t += Duration::from_secs(4);
         read_host(&ledger, (row * 2) as i64, t);
         assert!(
             matches!(
                 pending_move(&domain),
                 Some((crate::BankHolding::Experts, crate::experts::derived::BankMove::Grow { to })) if to > shrunk_to
             ),
-            "{backend:?}: regrows past shrunk_to={shrunk_to} after cooldown"
+            "{backend:?}: regrows immediately past shrunk_to={shrunk_to} without hysteresis"
         );
     }
-
-    // Large exogenous release (>= rebound margin) bypasses the 3s cooldown immediately.
-    let backend = bank_backends()[0];
-    let (mut domain, mut bindings) = banked(backend, 4, 4);
-    let row = bank_row(&domain);
-    let ledger = domain.resources.ledgers().device().clone();
-    let mut t = Instant::now();
-    read_host(&ledger, row as i64, t);
-    t += Duration::from_millis(100);
-    read_host(&ledger, -((row * 5 / 2) as i64), t);
-    assert_eq!(domain.follow_cache_targets(&mut bindings, wake(), wake()).unwrap(), Followed::Shrank(BankStep::Begun(crate::planning::BankTier::Bank)));
-    while domain.advance_expert_bank(wake()).unwrap().is_none() {}
-    t += Duration::from_millis(50);
-    read_host(&ledger, (row * 6) as i64, t);
-    assert_eq!(
-        pending_move(&domain),
-        Some((crate::BankHolding::Experts, crate::experts::derived::BankMove::Grow { to: 4 })),
-        "large exogenous release bypasses cooldown immediately"
-    );
 }
 
 /// A component an earlier claim took part of is no longer whole: the next
@@ -512,7 +484,6 @@ fn a_whole_banked_domain_prices_two_row_passes() {
     }
 }
 
-/// Distinct device (VRAM) and host (RAM) ledgers for multi-store bank move tests.
 fn discrete_ledgers(at: Instant) -> (Ledger, Ledger) {
     use crate::memory::ledger::{Ledgers, LoadShape};
     let scope = Ledgers::new();
@@ -535,11 +506,6 @@ fn sub_noise_experts_grow_does_not_starve_host_grow() {
 
     let slot_bytes: u64 = 16 << 20;
     let block_bytes: u64 = 2 << 20;
-    let (device, host) = discrete_ledgers(Instant::now());
-    let ledger_of = |tier| match tier {
-        BankTier::Bank => &device,
-        BankTier::Host => &host,
-    };
 
     // sat_charge = 512 * 16 MiB = 8 GiB -> sat_charge / 64 = 128 MiB = min_partial.
     // Growing Experts 100 -> 101 gains 16 MiB (< 128 MiB) while still below saturation (512).
@@ -560,70 +526,23 @@ fn sub_noise_experts_grow_does_not_starve_host_grow() {
         charge: Box::new(move |slots| slots * slot_bytes),
     };
 
-    // Sanity check: Experts alone is filtered out by min_partial.
-    assert_eq!(super::select_bank_move(&[(&experts, 101)], ledger_of, None, &[None; BankTier::COUNT]), None);
-    // With Host eligible to grow, Host is selected instead of returning None.
-    assert_eq!(
-        super::select_bank_move(&[(&experts, 101), (&host_target, 512)], ledger_of, None, &[None; BankTier::COUNT]),
-        Some((BankHolding::Host, BankMove::Grow { to: 512 })),
-    );
-    // Shrink on a later holding still beats an eligible grow on an earlier holding.
-    assert_eq!(
-        super::select_bank_move(&[(&experts, 512), (&host_target, 100)], ledger_of, None, &[None; BankTier::COUNT]),
-        Some((BankHolding::Host, BankMove::Shrink { to: 100 })),
-    );
-}
-
-/// An `ExogenousShrink` cooldown on `DeviceMemory` suppresses `BankHolding::Experts`
-/// regrow without starving `BankHolding::Host` on `HostRam`.
-#[test]
-fn exogenous_shrink_cooldown_on_device_does_not_starve_host_grow() {
-    use crate::domain::BankHolding;
-    use crate::experts::derived::{BankMove, BankShape, HoldingTarget};
-    use crate::planning::BankTier;
-
-    let slot_bytes: u64 = 16 << 20;
-    let block_bytes: u64 = 2 << 20;
-    let t0 = Instant::now();
-    let (device, host) = discrete_ledgers(t0);
-    let est = device.estimate();
-    let shrink = super::ExogenousShrink {
-        store: device.store(),
-        at: est.at().at(),
-        committed: est.committed(),
-        hold_room: est.hold_room(),
-        block: block_bytes,
-    };
-    // Advance within the 3 s cooldown with unchanged headroom/committed bytes.
-    read(&device, t0 + Duration::from_millis(100));
-
+    let (device, host) = discrete_ledgers(Instant::now());
     let ledger_of = |tier| match tier {
         BankTier::Bank => &device,
         BankTier::Host => &host,
     };
-    let experts = HoldingTarget {
-        holding: BankHolding::Experts,
-        tier: BankTier::Bank,
-        at: 100,
-        owed: 0,
-        shape: BankShape::new(block_bytes, 8, 512, 512),
-        charge: Box::new(move |slots| slots * slot_bytes),
-    };
-    let host_target = HoldingTarget {
-        holding: BankHolding::Host,
-        tier: BankTier::Host,
-        at: 146,
-        owed: 0,
-        shape: BankShape::new(block_bytes, 0, 512, 512),
-        charge: Box::new(move |slots| slots * slot_bytes),
-    };
 
-    // Sanity check: saturation grow on Experts is suppressed by DeviceMemory cooldown.
-    assert_eq!(super::select_bank_move(&[(&experts, 512)], ledger_of, Some(&shrink), &[None; BankTier::COUNT]), None);
-    // Host on HostRam is unaffected by DeviceMemory's cooldown and is selected to grow.
+    // Sanity check: Experts alone is filtered out by min_partial.
+    assert_eq!(super::select_bank_move(&[(&experts, 101)], ledger_of, &[None; BankTier::COUNT]), None);
+    // With Host eligible to grow, Host is selected instead of returning None.
     assert_eq!(
-        super::select_bank_move(&[(&experts, 512), (&host_target, 512)], ledger_of, Some(&shrink), &[None; BankTier::COUNT]),
+        super::select_bank_move(&[(&experts, 101), (&host_target, 512)], ledger_of, &[None; BankTier::COUNT]),
         Some((BankHolding::Host, BankMove::Grow { to: 512 })),
+    );
+    // Shrink on a later holding still beats an eligible grow on an earlier holding.
+    assert_eq!(
+        super::select_bank_move(&[(&experts, 512), (&host_target, 100)], ledger_of, &[None; BankTier::COUNT]),
+        Some((BankHolding::Host, BankMove::Shrink { to: 100 })),
     );
 }
 
@@ -682,14 +601,14 @@ fn growth_refusal_latches_store_until_release_or_room_grows_without_starving_oth
     };
 
     // Unchanged store: Experts growth is latched (no retry spam).
-    assert_eq!(super::select_bank_move(&[(&experts, 512)], ledger_of, None, &refused), None);
+    assert_eq!(super::select_bank_move(&[(&experts, 512)], ledger_of, &refused), None);
     // Sub-unit jitter (< block_bytes) still stays latched.
     let t2 = t1 + Duration::from_millis(50);
     device.read(device.sampled(t2), Reading::device(TOTAL, TOTAL - OTHERS - block_bytes + (block_bytes - 1), NO_LAG));
-    assert_eq!(super::select_bank_move(&[(&experts, 512)], ledger_of, None, &refused), None);
+    assert_eq!(super::select_bank_move(&[(&experts, 512)], ledger_of, &refused), None);
     // Host on BankTier::Host is NOT starved while BankTier::Bank is latched.
     assert_eq!(
-        super::select_bank_move(&[(&experts, 512), (&host_target, 512)], ledger_of, None, &refused),
+        super::select_bank_move(&[(&experts, 512), (&host_target, 512)], ledger_of, &refused),
         Some((BankHolding::Host, BankMove::Grow { to: 512 })),
     );
 
@@ -697,26 +616,26 @@ fn growth_refusal_latches_store_until_release_or_room_grows_without_starving_oth
     let t3 = t2 + Duration::from_millis(50);
     device.read(device.sampled(t3), Reading::device(TOTAL, TOTAL - OTHERS, NO_LAG));
     assert_eq!(
-        super::select_bank_move(&[(&experts, 512)], ledger_of, None, &refused),
+        super::select_bank_move(&[(&experts, 512)], ledger_of, &refused),
         Some((BankHolding::Experts, BankMove::Grow { to: 512 })),
     );
 
     // Reset reading back to refusal baseline, then release >= block_bytes of own allocation.
     let t4 = t3 + Duration::from_millis(50);
     device.read(device.sampled(t4), Reading::device(TOTAL, TOTAL - OTHERS - block_bytes, NO_LAG));
-    assert_eq!(super::select_bank_move(&[(&experts, 512)], ledger_of, None, &refused), None);
+    assert_eq!(super::select_bank_move(&[(&experts, 512)], ledger_of, &refused), None);
     device.change(|_| {
         held.entry().freed(&held.entry().change(), block_bytes, seismic::memory::Wiring::Pageable);
         drop(held);
     });
     assert_eq!(
-        super::select_bank_move(&[(&experts, 512)], ledger_of, None, &refused),
+        super::select_bank_move(&[(&experts, 512)], ledger_of, &refused),
         Some((BankHolding::Experts, BankMove::Grow { to: 512 })),
     );
 }
 
-/// Post-load/warm-up settled baseline (`read_after(..., true)`, as called by
-/// `ExecutorDomain::begin_host_backing`) absorbs one-time uncharged load/warm-up
+/// Post-domain settled baseline (`read_after(..., true)`, as called before
+/// `family.begin_host_backing` in `ExecutorDomain::with_family`) absorbs one-time uncharged load/warm-up
 /// host overhead into `others` and `pinned_budget()` without poisoning
 /// `guarantee()` (`read.rise`), so `pinned_import_room()` and
 /// `live_pinned_headroom()` do not double-subtract warm-up overhead.
@@ -788,4 +707,20 @@ fn post_warmup_settled_read_absorbs_load_overhead_without_poisoning_pinned_headr
     let serving = host.read(host.sampled(t3), Reading::host(&s3));
     assert_eq!(serving.guarantee(), GIB);
     assert_eq!(serving.live_pinned_headroom(&late), expected_late_imm - RESERVE - GIB);
+}
+
+#[test]
+fn release_yielded_never_returns_pending_without_active_async_release() {
+    let (mut domain, mut bindings) = crate::domain::fixtures::fixture(None);
+    let yielded = domain
+        .release_yielded(&mut bindings, crate::CompletionWake::new(|| {}))
+        .unwrap();
+    if matches!(yielded, crate::domain::Yielded::Pending) {
+        assert!(
+            domain.releasing_slots(),
+            "Yielded::Pending requires an active async release that will wake the owner"
+        );
+    } else {
+        assert!(!domain.releasing_slots());
+    }
 }

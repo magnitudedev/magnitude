@@ -603,7 +603,8 @@ impl DeviceLedgers {
         class: PoolClass,
         granule: u64,
     ) -> Result<seismic::Pool, OpenPoolError> {
-        self.open_pool_sized(reading, device, contract, class, granule, device.native_allocations())
+        let mut pools = self.open_pools_at(reading, device, contract, class, &[granule], device.native_allocations())?;
+        Ok(pools.pop().expect("one granule opens one pool"))
     }
 
     #[cfg(any(test, feature = "fixtures"))]
@@ -615,40 +616,119 @@ impl DeviceLedgers {
         granule: u64,
         allocations: seismic::NativeAllocations,
     ) -> Result<seismic::Pool, String> {
-        self.open_pool_sized(None, device, contract, class, granule, allocations)
-            .map_err(|error| error.to_string())
+        let mut pools = self
+            .open_pools_at(None, device, contract, class, &[granule], allocations)
+            .map_err(|error| error.to_string())?;
+        Ok(pools.pop().expect("one granule opens one pool"))
     }
 
-    fn open_pool_sized(
+    /// Open the load's state granule pool(s) under [`PoolClass::State`]: one
+    /// pool at `history_granule` for KV history slabs and, when the model has
+    /// recurrent components (`recurrent_granule.is_some()`), a separate pool
+    /// at `recurrent_granule` for recurrent-state bank slabs so large
+    /// recurrent banks never inflate KV history granules. Both share the one
+    /// `PoolClass::State` ledger entry and composite reclaimer, while each
+    /// claims its own `CommittedKind::Absent(PoolClass::State)` granule.
+    pub fn open_state_pools_at(
+        &self,
+        reading: Option<&DeviceReading>,
+        device: &seismic::Device,
+        contract: seismic::Contract,
+        history_granule: u64,
+        recurrent_granule: Option<u64>,
+    ) -> Result<(seismic::Pool, Option<seismic::Pool>), OpenPoolError> {
+        let mut granules = Vec::with_capacity(1 + usize::from(recurrent_granule.is_some()));
+        granules.push(history_granule);
+        if let Some(granule) = recurrent_granule {
+            granules.push(granule);
+        }
+        let mut pools = self.open_pools_at(reading, device, contract, PoolClass::State, &granules, device.native_allocations())?;
+        let recurrent = if recurrent_granule.is_some() { pools.pop() } else { None };
+        let history = pools.pop().expect("history pool");
+        Ok((history, recurrent))
+    }
+
+    /// Open the load's expert-bank records granule pool(s) under
+    /// [`PoolClass::Records`]: one pool per distinct group granule in
+    /// `granules` (1 for uniform models), sized with `device.native_allocations()`
+    /// (matching both VRAM allocation granularity and Linux 2 MiB large-page
+    /// host registration granularity so linked host tiers pack multiple
+    /// records per `cuMemHostRegister` block). All pools share the one
+    /// `PoolClass::Records` ledger entry and composite reclaimer, while each
+    /// claims its own `CommittedKind::Absent(PoolClass::Records)` granule.
+    pub fn open_records_pools_at(
+        &self,
+        reading: Option<&DeviceReading>,
+        device: &seismic::Device,
+        contract: seismic::Contract,
+        granules: &[u64],
+    ) -> Result<Vec<seismic::Pool>, OpenPoolError> {
+        self.open_pools_at(reading, device, contract, PoolClass::Records, granules, device.native_allocations())
+    }
+
+    /// Open one or more granule pools of `class` in the store `device` places
+    /// `contract` in, one per granule in `granules`, sized with `allocations`:
+    /// all pools share one `PoolClass` ledger entry and one composite
+    /// [`PoolReclaimer`], while each claims its own
+    /// `CommittedKind::Absent(class)` granule.
+    fn open_pools_at(
         &self,
         reading: Option<&DeviceReading>,
         device: &seismic::Device,
         contract: seismic::Contract,
         class: PoolClass,
-        granule: u64,
+        granules: &[u64],
         allocations: seismic::NativeAllocations,
-    ) -> Result<seismic::Pool, OpenPoolError> {
-        let sizing = seismic::BlockSizing { granule, allocations };
-        let block = seismic::block_bytes(sizing)
-            .map_err(|error| OpenPoolError::Internal(format!("the {contract:?} store's {class:?} pool blocks: {error:?}")))?;
+    ) -> Result<Vec<seismic::Pool>, OpenPoolError> {
+        assert!(!granules.is_empty(), "invariant violated: open_pools_at called with no granules");
+        let blocks = granules
+            .iter()
+            .map(|&granule| {
+                seismic::block_bytes(seismic::BlockSizing { granule, allocations })
+                    .map_err(|error| OpenPoolError::Internal(format!("the {contract:?} store's {class:?} pool blocks: {error:?}")))
+            })
+            .collect::<Result<Vec<_>, _>>()?;
         let ledger = self.of_contract(device, contract);
         let held = self
             .judged(reading)
             .into_iter()
             .find_map(|(candidate, estimate)| Arc::ptr_eq(&candidate.store, &ledger.store).then_some(estimate))
             .flatten();
-        let absent = self
-            .changes()
-            .change(|keeping| ledger.claim_at(&keeping.claims(), held, CommittedKind::Absent(class), block.absent))
-            .map_err(|short| OpenPoolError::Short {
-                purpose: format!("the {contract:?} store's {class:?} pool"),
-                short,
-            })?;
-        let entries = ledger.pool_block_with_absent(class, NonZeroU64::new(block.held).expect("a block holds a granule"), absent);
-        let pool = seismic::Pool::open(&entries.charges(device, contract), contract, granule, block.bytes)
+        let mut absents = Vec::with_capacity(blocks.len());
+        for block in &blocks {
+            let absent = self
+                .changes()
+                .change(|keeping| ledger.claim_at(&keeping.claims(), held, CommittedKind::Absent(class), block.absent))
+                .map_err(|short| OpenPoolError::Short {
+                    purpose: format!("the {contract:?} store's {class:?} pool"),
+                    short,
+                })?;
+            absents.push(absent);
+        }
+        let largest_block = blocks.iter().map(|block| block.held).max().expect("non-empty blocks");
+        let mut absents_iter = absents.into_iter();
+        let first_absent = absents_iter.next().expect("non-empty absents");
+        let first_entries = ledger.pool_block_with_absent(
+            class,
+            NonZeroU64::new(largest_block).expect("a block holds a granule"),
+            first_absent,
+        );
+        let shared_blocks = first_entries.blocks.clone();
+        let mut pools = Vec::with_capacity(granules.len());
+        let first_pool = seismic::Pool::open(&first_entries.charges(device, contract), contract, granules[0], blocks[0].bytes)
             .map_err(|error| OpenPoolError::Internal(format!("the {contract:?} store's {class:?} pool: {error}")))?;
-        ledger.register_pool_reclaimer(class, Arc::new(PoolReclaimer(pool.downgrade())));
-        Ok(pool)
+        pools.push(first_pool);
+        for ((&granule, block), absent) in granules[1..].iter().zip(&blocks[1..]).zip(absents_iter) {
+            let entries = PoolEntries { blocks: shared_blocks.clone(), absent: absent.entry() };
+            let pool = seismic::Pool::open(&entries.charges(device, contract), contract, granule, block.bytes)
+                .map_err(|error| OpenPoolError::Internal(format!("the {contract:?} store's {class:?} pool: {error}")))?;
+            pools.push(pool);
+        }
+        let mut order: Vec<usize> = (0..pools.len()).collect();
+        order.sort_by(|&a, &b| blocks[b].held.cmp(&blocks[a].held).then_with(|| b.cmp(&a)));
+        let reclaim_pools = order.into_iter().map(|i| pools[i].downgrade()).collect();
+        ledger.register_pool_reclaimer(class, Arc::new(PoolReclaimer(reclaim_pools)));
+        Ok(pools)
     }
 
     /// The ledger of the store `device` places `contract`'s fixed storage
@@ -742,18 +822,47 @@ impl DeviceLedgers {
         }
         Ok(())
     }
+
+    /// Split the pooled records of `load`'s expert bank above its floor out of
+    /// `growth` as a [`CommittedKind::Backing`] claim so `ServedBank::new`
+    /// carves them cleanly from `Recorded`.
+    pub fn split_bank_growth_records(&self, growth: &mut Held, load: &crate::planning::ModelLoadPlan) -> Result<(), String> {
+        let Some(bank) = load.expert_bank() else {
+            return Ok(());
+        };
+        let above = bank
+            .resident_charge(bank.slots)?
+            .checked_sub(bank.resident_charge(bank.floor())?)
+            .ok_or_else(|| "bank growth record charge underflows floor".to_owned())?;
+        if above > 0 {
+            let backing = growth.split_backing(self.of(BankTier::Bank), above);
+            growth.claims.push(backing);
+        }
+        Ok(())
+    }
 }
 
 /// Synchronous reclaimer for a granule pool's spare/releasing blocks, held
 /// weakly so it never extends the pool's lifetime.
-struct PoolReclaimer(seismic::WeakPool);
+struct PoolReclaimer(Vec<seismic::WeakPool>);
 
 impl CacheReclaimer for PoolReclaimer {
     fn reclaim(&self, need: u64) -> Result<u64, ReclaimError> {
-        let Some(pool) = self.0.upgrade() else {
-            return Err(ReclaimError::AtFloor);
-        };
-        match pool.return_freed_sync(need).map_err(|error| ReclaimError::Invariant(error.to_string()))? {
+        let mut freed_total = 0u64;
+        for weak in &self.0 {
+            let remaining = need.saturating_sub(freed_total);
+            if remaining == 0 {
+                break;
+            }
+            let Some(pool) = weak.upgrade() else {
+                continue;
+            };
+            let freed = pool
+                .return_freed_sync(remaining)
+                .map_err(|error| ReclaimError::Invariant(error.to_string()))?;
+            freed_total = freed_total.saturating_add(freed);
+        }
+        match freed_total {
             0 => Err(ReclaimError::AtFloor),
             freed => Ok(freed),
         }

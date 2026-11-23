@@ -291,7 +291,30 @@ fn prepared_appended_rows(
             .any(|component| component.layer == *source),
         _ => false,
     });
+    // Selected-read (indexed) domains read their launch's earlier rows as
+    // stored history (`cached_causal_domain`), because their indexer selects
+    // among stored rows and each row reads only itself fresh.
+    let indexed = components.iter().any(|component| {
+        let keys = match component.layer {
+            LayerRef::Target(block) => LayerRef::IndexKeys { block, part: 0 },
+            LayerRef::Head(block) => LayerRef::HeadIndexKeys { block, part: 0 },
+            _ => return false,
+        };
+        domains.iter().any(|domain| {
+            domain
+                .components()
+                .iter()
+                .any(|c| !c.attended() && c.layer == keys)
+        })
+    });
+    // A draft head's chained launches read all earlier rows of their advance
+    // as stored history (`SlotAppends::every_domain`).
+    let head = components
+        .iter()
+        .any(|component| matches!(component.layer, LayerRef::Head(_)));
     if read
+        || indexed
+        || head
         || components
             .iter()
             .any(ComponentDescriptor::causal_rows_use_cache)

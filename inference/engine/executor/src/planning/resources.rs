@@ -802,13 +802,18 @@ pub struct StateStorePlan {
     pub recurrent_bank_bytes: u64,
     pub zero_seed_bytes: u64,
     pub recurrent_pool_bytes: u64,
-    /// The bytes of a granule of the state's pool ([`state_granule`]): each
-    /// slab takes one, and holds as many whole pages or banks as fit it.
+    /// The bytes of a granule of the state's history pool ([`state_granule`]):
+    /// each history slab takes one, and holds as many whole pages as fit it.
     pub granule: u64,
-    /// The state pool's block of those granules (`seismic::block_bytes`),
+    /// The state history pool's block of those granules (`seismic::block_bytes`),
     /// what a load opens it at: its slabs are charged in whole blocks
     /// ([`Self::slab_charge`]).
     pub block: seismic::BlockSize,
+    /// The bytes of a granule of the state's recurrent bank pool, when the
+    /// store has recurrent components; `None` for pure-attention stores.
+    pub recurrent_granule: Option<u64>,
+    /// The state recurrent pool's block of those granules (`seismic::block_bytes`).
+    pub recurrent_block: Option<seismic::BlockSize>,
     pub(crate) cached_bank_slab: BankSlabCache,
 }
 
@@ -1058,7 +1063,8 @@ impl StateStorePlan {
             .banks
             .get_or_init(|| {
                 let regions = magnitude_state::bank_regions(&self.recurrent_components);
-                u32::try_from(magnitude_state::banks_per_slab(&regions, self.granule)?)
+                let granule = self.recurrent_granule.unwrap_or(self.granule);
+                u32::try_from(magnitude_state::banks_per_slab(&regions, granule)?)
                     .map_err(|_| "bank slab count exceeds u32".into())
             })
             .clone()
@@ -1099,6 +1105,24 @@ impl StateStorePlan {
         })
     }
 
+    /// The first history slabs `StateStore::new` backs (one granule per stored
+    /// history domain), without tables.
+    pub fn startup_history_slab_bytes(&self) -> Result<u64, String> {
+        (self.domains.len() as u64)
+            .checked_mul(self.granule)
+            .ok_or_else(|| "initial history slab charge overflows".into())
+    }
+
+    /// The first recurrent bank slabs `StateStore::new` backs, without tables.
+    pub fn startup_bank_slab_bytes(&self) -> Result<u64, String> {
+        if self.bank_slab_layout()?.is_none() {
+            return Ok(0);
+        }
+        self.bank_slab_bytes_at_count(
+            self.bank_capacity.startup_banks().map_err(|error| error.to_string())? as u64,
+        )
+    }
+
     /// The address table and the slabs of the banks committed at
     /// construction ([`magnitude_state::BankCapacity::startup_banks`]).
     pub fn startup_bank_bytes(&self) -> Result<u64, String> {
@@ -1109,8 +1133,16 @@ impl StateStorePlan {
         if self.bank_slab_layout()?.is_none() {
             return Ok(0);
         }
-        let slabs = banks.max(1).div_ceil(u64::from(self.bank_slab_banks()?));
-        self.granule
+        let per_slab = u64::from(self.bank_slab_banks()?);
+        let slabs = if per_slab == 1 {
+            // Bank 0 (`ZERO_SEED_BANK`) is unbacked and reads the pool's zeroed
+            // `absent` granule, so only writable banks occupy backed slabs.
+            banks.saturating_sub(1)
+        } else {
+            banks.max(1).div_ceil(per_slab)
+        };
+        self.recurrent_granule
+            .unwrap_or(self.granule)
             .checked_mul(slabs)
             .ok_or_else(|| "bank slab fit charge overflows".into())
     }
@@ -1159,26 +1191,52 @@ impl StateStorePlan {
             .ok_or_else(|| "state tables exceed the state's committed bytes".into())
     }
 
-    /// What `slab_bytes` of the state pool's granules cost: the whole blocks
-    /// holding them ([`seismic::BlockSize::charge`]).
+    /// What `slab_bytes` of the state history pool's granules cost: the whole
+    /// blocks holding them ([`seismic::BlockSize::charge`]).
     pub fn slab_charge(&self, slab_bytes: u64) -> Result<u64, String> {
         self.block.charge(self.granule, slab_bytes.div_ceil(self.granule)).ok_or_else(|| "state slab charge overflows".into())
     }
 
+    /// What `slab_bytes` of the state recurrent pool's granules cost: the whole
+    /// blocks holding them (`0` when the store has no recurrent pool or
+    /// `slab_bytes == 0`).
+    pub fn recurrent_slab_charge(&self, slab_bytes: u64) -> Result<u64, String> {
+        match (self.recurrent_granule, self.recurrent_block) {
+            (Some(granule), Some(block)) if slab_bytes > 0 => block
+                .charge(granule, slab_bytes.div_ceil(granule))
+                .ok_or_else(|| "recurrent slab charge overflows".into()),
+            _ => Ok(0),
+        }
+    }
+
+    /// Total absent-granule bytes committed when opening the state pool(s).
+    pub fn absent_bytes(&self) -> u64 {
+        self.block.absent + self.recurrent_block.map_or(0, |b| b.absent)
+    }
+
     /// The planned store and its one binding right, its tables allocated
-    /// through `charges`, its slabs granules of `pool`, the granule pool of
-    /// the store the state lies in, whose granule is the plan's.
-    pub fn allocate(&self, charges: &seismic::Charges, pool: Pool) -> Result<StoreBindings, String> {
-        if pool.granule() != self.granule {
+    /// through `charges`, its slabs granules of `pools`, whose granules match
+    /// the plan's.
+    pub fn allocate(&self, charges: &seismic::Charges, pools: impl Into<magnitude_state::StatePools>) -> Result<StoreBindings, String> {
+        let pools = pools.into();
+        if pools.history.granule() != self.granule {
             return Err(format!(
-                "state planned in {}-byte granules given a pool of {}-byte granules",
+                "state planned in {}-byte history granules given a pool of {}-byte granules",
                 self.granule,
-                pool.granule()
+                pools.history.granule()
             ));
+        }
+        if let Some(expected) = self.recurrent_granule {
+            let actual = pools.recurrent.as_ref().map_or(pools.history.granule(), Pool::granule);
+            if actual != expected {
+                return Err(format!(
+                    "state planned in {expected}-byte recurrent granules given a pool of {actual}-byte granules",
+                ));
+            }
         }
         let (store, bindings) = StateStore::new(
             charges,
-            pool,
+            pools,
             self.context_rows,
             self.max_advance,
             self.history.clone(),
@@ -1290,6 +1348,25 @@ impl ResourcePlan {
         arena_bytes(&self.graph_charges())
     }
 
+    /// Startup recorded-graph demand on a device of `graph_cost`: the device
+    /// and upload storage that `ExecutorDomain::new` and initial warm-up
+    /// launches record for the startup activations' graphs, matching
+    /// `AssessmentMemoryBounds::recorded_graph_bytes`.
+    pub fn recorded_graph_demand(
+        &self,
+        graph_cost: seismic::GraphCost,
+    ) -> Result<crate::memory::ClaimDemand, String> {
+        let census = startup_graphs(&self.graph_charges())?;
+        let bytes = graph_cost
+            .bytes(census)
+            .ok_or_else(|| "the startup graphs' memory overflows".to_owned())?;
+        Ok(crate::memory::ClaimDemand {
+            device: bytes.device,
+            upload: bytes.upload,
+            ..crate::memory::ClaimDemand::default()
+        })
+    }
+
     /// The plan, its pooled charge checked against Seismic's footprints. Whether the load fits
     /// is decided once, by assessment before the load, and each allocation is then admitted before
     /// it is made (the engine's startup admissions), whose refusal is the typed memory shortage: the plan
@@ -1323,8 +1400,8 @@ impl ResourcePlan {
         &self.state_graph
     }
 
-    pub fn allocate_target_state(&self, charges: &seismic::Charges, pool: Pool) -> Result<StoreBindings, String> {
-        self.target_state.allocate(charges, pool)
+    pub fn allocate_target_state(&self, charges: &seismic::Charges, pools: impl Into<magnitude_state::StatePools>) -> Result<StoreBindings, String> {
+        self.target_state.allocate(charges, pools)
     }
 }
 
@@ -1413,21 +1490,27 @@ impl StateResourcePlan {
         limits: ResourceLimits,
         method: PlannedMethod,
     ) -> Result<u64, String> {
-        let initial = head_state
-            .map_or(Ok(0), StateStorePlan::initial_slab_bytes)
+        let initial_history = head_state
+            .map_or(Ok(0), StateStorePlan::startup_history_slab_bytes)
             .and_then(|head| {
                 target_state
-                    .initial_slab_bytes()?
+                    .startup_history_slab_bytes()?
                     .checked_add(head)
-                    .ok_or_else(|| "initial state slab charge overflows".to_owned())
+                    .ok_or_else(|| "initial history slab charge overflows".to_owned())
             })?;
-        let limit = crate::domain::claimed_through(0, target_state.context_rows, method);
-        let opening_rows = crate::domain::claimed_through(0, 0, method)
-            .saturating_add(limits.max_launch_rows as u64)
-            .min(limit);
-        let opening = crate::memory::ledger::LoadShape::of_states(target_state, head_state)
+        let initial_banks = target_state.startup_bank_slab_bytes()?;
+        let opening_rows = crate::memory::ledger::RequestRows::from_plan_parts(
+            target_state.context_rows,
+            limits.max_launch_rows,
+            method,
+        )
+        .opening(1);
+        let opening_history = crate::memory::ledger::LoadShape::of_states(target_state, head_state)
             .state_bytes(opening_rows);
-        Ok(opening.max(initial))
+        opening_history
+            .max(initial_history)
+            .checked_add(initial_banks)
+            .ok_or_else(|| "request slot byte charge overflows".to_owned())
     }
 
     pub fn target_state(&self) -> &StateStorePlan {
@@ -1456,7 +1539,7 @@ impl StateResourcePlan {
             .banks
             .get()
             .and_then(|res| res.as_ref().ok().copied())
-            .map(|banks| (self.target_state.granule, banks));
+            .map(|banks| (self.target_state.recurrent_granule.unwrap_or(self.target_state.granule), banks));
         let target_history = self
             .target_state
             .history
@@ -1559,11 +1642,18 @@ impl ResourcePlanner {
         let recurrent_bank_bytes = recurrent_bank_bytes(&target_recurrent)?;
         let context = state_context(context_limit)?;
         let max_advance = limits.max_launch_rows;
-        let granule = state_granule_parts(&target_history, &target_recurrent, &head_history, context, max_advance)?;
-        // The state pool's block, by the rule a load opens it by
-        // (`memory::ledger::Ledgers::open_pool`).
+        let granule = history_granule_parts(&target_history, &head_history, context, max_advance)?;
+        // The state history pool's block, by the rule a load opens it by
+        // (`memory::ledger::DeviceLedgers::open_state_pools_at`).
         let block = seismic::block_bytes(seismic::BlockSizing { granule, allocations: capacity_bytes.allocations })
             .map_err(|error| format!("the state pool's blocks: {error:?}"))?;
+        let recurrent_granule = recurrent_granule_parts(&target_recurrent)?;
+        let recurrent_block = recurrent_granule
+            .map(|granule| {
+                seismic::block_bytes(seismic::BlockSizing { granule, allocations: capacity_bytes.allocations })
+                    .map_err(|error| format!("the state recurrent pool's blocks: {error:?}"))
+            })
+            .transpose()?;
         // A checkpoint's window rows: `n` per Window(n) domain.
         let checkpoint_window_bytes = history_domains()
             .filter(|domain| matches!(domain.kind(), HistoryDomainKind::Window { .. }))
@@ -1656,14 +1746,16 @@ impl ResourcePlanner {
             bank_capacity,
             granule,
             block,
+            recurrent_granule,
+            recurrent_block,
         )?;
         if let Some((seeded_granule, banks)) = seeded_banks {
-            if granule == seeded_granule {
+            if recurrent_granule.unwrap_or(granule) == seeded_granule {
                 let _ = target_state.cached_bank_slab.banks.set(Ok(banks));
             }
         }
         let head_state = (!head_history.is_empty())
-            .then(|| state_store_plan(rows, head_history, Vec::new(), bank_capacity, granule, block))
+            .then(|| state_store_plan(rows, head_history, Vec::new(), bank_capacity, granule, block, None, None))
             .transpose()?;
         let planned_recurrent = target_state
             .recurrent_pool_bytes
@@ -1688,14 +1780,12 @@ impl ResourcePlanner {
                     .unwrap_or(0),
             )
             .ok_or("startup bank slab charge overflows")?;
-        // What the stores' construction commits: their tables, the state pool's
-        // absent granule (`block.absent`, allocated when the pool opens), and
-        // the whole blocks of the one state pool holding at least the opening
-        // request-slot reservation (max of their first slabs and the opening
-        // request slot, which startup claims beside the import window), of
-        // which the history's share is the rest beside the banks'.
+        // What the stores' construction commits: their tables, the state
+        // pool(s)' absent granule(s), and the whole blocks of the history and
+        // recurrent pools holding at least the opening request-slot
+        // reservation, of which the history's share is the rest beside the
+        // banks'.
         let stores = || std::iter::once(&target_state).chain(head_state.as_ref());
-        let slabs = stores().try_fold(0u64, |total, store| total.checked_add(store.initial_slab_bytes()?).ok_or_else(|| String::from("startup slab charge overflows")))?;
         let tables = stores().try_fold(0u64, |total, store| total.checked_add(store.table_bytes()?).ok_or_else(|| String::from("startup table charge overflows")))?;
         let request_slot_bytes = StateResourcePlan::request_slot_bytes_for(
             &target_state,
@@ -1703,35 +1793,40 @@ impl ResourcePlanner {
             limits,
             method,
         )?;
-        let startup_slabs = slabs.max(request_slot_bytes);
-        let history = target_state
-            .slab_charge(startup_slabs)?
+        let startup_bank_slabs = target_state.startup_bank_slab_bytes()?;
+        let startup_history_slabs = request_slot_bytes
+            .checked_sub(startup_bank_slabs)
+            .ok_or("request slot bytes below startup bank slabs")?;
+        let startup_total_slabs = target_state
+            .slab_charge(startup_history_slabs)?
+            .checked_add(target_state.recurrent_slab_charge(startup_bank_slabs)?)
+            .ok_or("startup state slab charge overflows")?;
+        let history = startup_total_slabs
             .checked_add(tables)
-            .and_then(|committed| committed.checked_add(target_state.block.absent))
+            .and_then(|committed| committed.checked_add(target_state.absent_bytes()))
             .and_then(|committed| committed.checked_sub(planned_recurrent))
             .ok_or("startup history slab charge overflows")?;
         // What the standard workload charges of the stores, exactly as
         // assessment does: retained prefixes are held only within it.
         // The page rule's slabs of `conversations` histories at the fit depth
         // (`magnitude_state::state_bytes`, the one state-size estimator), plus
-        // each stored domain's address table and the state pool's absent
-        // granule, which a slab count leaves out and opening the pool and
-        // `StateStore::new` commit.
+        // the recurrent bank slabs in their own pool, plus each stored domain's
+        // address table and the state pool(s)' absent granule(s).
         let fit_depth = context_limit;
         let conversations = limits.conversations.get() as u64;
-        let mut workload_slabs = 0u64;
+        let mut workload_history_slabs = 0u64;
         for store in std::iter::once(&target_state).chain(head_state.as_ref()) {
             let slabs = crate::memory::ledger::StoreShape::of(store)
                 .state_bytes(conversations, fit_depth)
                 .map_err(|error| error.to_string())?;
-            workload_slabs = workload_slabs.checked_add(slabs).ok_or("state fit charge overflows")?;
+            workload_history_slabs = workload_history_slabs.checked_add(slabs).ok_or("state fit charge overflows")?;
         }
         let bank_slabs = target_state.bank_slab_bytes_at_count(assessment::conversation_banks(limits)?)?;
-        workload_slabs = workload_slabs.checked_add(bank_slabs).ok_or("state fit charge overflows")?;
         let workload_state_bytes = target_state
-            .slab_charge(workload_slabs)?
-            .checked_add(tables)
-            .and_then(|committed| committed.checked_add(target_state.block.absent))
+            .slab_charge(workload_history_slabs)?
+            .checked_add(target_state.recurrent_slab_charge(bank_slabs)?)
+            .and_then(|committed| committed.checked_add(tables))
+            .and_then(|committed| committed.checked_add(target_state.absent_bytes()))
             .ok_or("state fit charge overflows")?;
         let capacity = StateCapacityPlan {
             live_requests: possible_requests,
@@ -1931,8 +2026,7 @@ impl ResourcePlanner {
         if std::env::var_os("MAGNITUDE_TRACE_RESOURCES").is_some() {
             let capacity_bytes = state.capacity_bytes;
             let required = bytes.total()?;
-            let qualification_peak_bytes = crate::AttestedPrograms::qualification_peak_bytes(load)?
-                .max(load.imports().peak_bytes());
+            let qualification_peak_bytes = crate::AttestedPrograms::qualification_peak_bytes(load)?;
             eprintln!(
                 "resource plan domain_capacity={} required={} qualification_peak={} weights=[{},{},{}] history={} recurrent_banks={} prepared_programs={} scratch={} graph=[target:{},readout:{},head:{},vision:{},state:{}]",
                 capacity_bytes.domain_bytes,
@@ -2043,22 +2137,37 @@ fn state_context(context_limit: u64) -> Result<usize, String> {
     usize::try_from(context_limit).map_err(|_| "context limit exceeds host domain".into())
 }
 
-/// The granule of the pool `layout`'s state slabs lie in, its histories at
-/// `context` advanced at most `max_advance` rows at a time: the state's own
-/// class (§4.7), whatever bank lies beside it, of its smallest slabs
-/// ([`state_pool_granule`]).
+/// The granule of the history pool `layout`'s KV history slabs lie in, its
+/// histories at `context` advanced at most `max_advance` rows at a time:
+/// sized from history domains alone so large recurrent-state banks on hybrid
+/// models never inflate KV history granules ([`state_pool_granule`]).
 pub(crate) fn state_granule(layout: &ModelStateLayout, context: usize, max_advance: usize) -> Result<u64, String> {
-    state_granule_parts(&layout.target_history, &layout.target_recurrent, &layout.head_history, context, max_advance)
+    history_granule_parts(&layout.target_history, &layout.head_history, context, max_advance)
 }
 
-fn state_granule_parts(
+fn history_granule_parts(
     target_history: &[HistoryDomainLayout],
-    target_recurrent: &[ComponentSpec],
     head_history: &[HistoryDomainLayout],
     context: usize,
     max_advance: usize,
 ) -> Result<u64, String> {
-    state_pool_granule(smallest_slab_parts(target_history, target_recurrent, head_history, context, max_advance)?)
+    let slab = [target_history, head_history]
+        .into_iter()
+        .try_fold(None, |slab: Option<super::PoolSlab>, history| {
+            magnitude_state::history_smallest_slabs(history, context, max_advance)
+                .map_err(|error| error.to_string())?
+                .iter()
+                .map(super::PoolSlab::of)
+                .try_fold(slab, |slab, store| slab.map_or(Ok(store), |slab| slab.with(store)).map(Some))
+        })?;
+    state_pool_granule(slab)
+}
+
+fn recurrent_granule_parts(target_recurrent: &[ComponentSpec]) -> Result<Option<u64>, String> {
+    magnitude_state::recurrent_smallest_slab(target_recurrent)
+        .map_err(|error| error.to_string())?
+        .map(|slab| super::PoolSlab::of(&slab).granule())
+        .transpose()
 }
 
 /// The granule of a state pool whose slab stores each fit `slab`: `slab`'s
@@ -2072,26 +2181,7 @@ pub(crate) fn state_pool_granule(slab: Option<super::PoolSlab>) -> Result<u64, S
     slab.map_or(Ok(seismic::BLOCK_ALIGNMENT), super::PoolSlab::granule)
 }
 
-/// The slab every slab store of `layout`'s state stores fits: the largest
-/// of their smallest slabs, at a multiple of every one's alignment; none
-/// without state slabs.
-fn smallest_slab_parts(
-    target_history: &[HistoryDomainLayout],
-    target_recurrent: &[ComponentSpec],
-    head_history: &[HistoryDomainLayout],
-    context: usize,
-    max_advance: usize,
-) -> Result<Option<super::PoolSlab>, String> {
-    let stores = [(target_history, target_recurrent), (head_history, &[][..])];
-    stores.into_iter().try_fold(None, |slab: Option<super::PoolSlab>, (history, recurrent)| {
-        magnitude_state::smallest_slabs(history, recurrent, context, max_advance)
-            .map_err(|error| error.to_string())?
-            .iter()
-            .map(super::PoolSlab::of)
-            .try_fold(slab, |slab, store| slab.map_or(Ok(store), |slab| slab.with(store)).map(Some))
-    })
-}
-
+#[allow(clippy::too_many_arguments)]
 fn state_store_plan(
     rows: HistoryRows,
     history: Vec<HistoryDomainLayout>,
@@ -2099,6 +2189,8 @@ fn state_store_plan(
     bank_capacity: BankCapacity,
     granule: u64,
     block: seismic::BlockSize,
+    recurrent_granule: Option<u64>,
+    recurrent_block: Option<seismic::BlockSize>,
 ) -> Result<StateStorePlan, String> {
     let layouts = history;
     // The rows the store reserves for each stored domain (whole pages), which
@@ -2165,6 +2257,8 @@ fn state_store_plan(
         recurrent_pool_bytes,
         granule,
         block,
+        recurrent_granule,
+        recurrent_block,
         cached_bank_slab: BankSlabCache::default(),
     })
 }
@@ -2304,6 +2398,8 @@ mod slab_plan_tests {
             // Vulkan's are: the store's slabs are granules of it whatever
             // the block, and the plan agrees with the store.
             seismic::BlockSize { bytes: 3 * GRANULE, held: 3 * GRANULE + (1 << 20), absent: GRANULE },
+            Some(GRANULE),
+            Some(seismic::BlockSize { bytes: 3 * GRANULE, held: 3 * GRANULE + (1 << 20), absent: GRANULE }),
         )
         .unwrap();
         // Each slab is a granule of the store's pool.
@@ -2417,6 +2513,281 @@ mod slab_plan_tests {
         )
         .unwrap();
         assert_eq!(from_layout_startup, startup);
+    }
+
+    #[test]
+    fn hybrid_model_separates_history_and_recurrent_granules_and_leaves_zero_seed_unbacked() {
+        let history_tok = ComponentDescriptor::new(
+            LayerRef::Target(0),
+            KvCodec::Dense.spec(DType::BF16, 4, 64),
+            1,
+        )
+        .unwrap();
+        let history_win = ComponentDescriptor::new(
+            LayerRef::Target(1),
+            KvCodec::Dense.spec(DType::BF16, 4, 64),
+            1,
+        )
+        .unwrap();
+        let target_history = vec![
+            HistoryDomainLayout::Token { components: vec![history_tok] },
+            HistoryDomainLayout::Window { rows: 64, components: vec![history_win] },
+        ];
+        // 64 MiB recurrent bank (1 bank per slab), much larger than the small
+        // KV history pages (~128 KiB).
+        let target_recurrent = vec![ComponentSpec {
+            shape: vec![16 * 1024 * 1024],
+            dtype: DType::F32,
+        }];
+        let limits = ResourceLimits {
+            max_launch_rows: 512,
+            max_launch_slots: 64,
+            max_selected_rows: 8,
+            max_drafting_slots: 8,
+            exported_logits_rows: 0,
+            max_images_per_request: 1,
+            max_image_cells: 0,
+            lookahead: true,
+            chain_capacity: NonZeroUsize::MIN,
+            conversations: NonZeroUsize::MIN,
+        };
+        let capacity = ResourceCapacity {
+            domain_bytes: 8 << 30,
+            tensor_operations: TensorOperations::Absent,
+            allocations: seismic::NativeAllocations::EXACT,
+        };
+        let planned = ResourcePlanner::plan_state_from_layout(
+            target_history,
+            target_recurrent,
+            Vec::new(),
+            4096,
+            PlannedMethod::Plain,
+            limits,
+            capacity,
+            None,
+        )
+        .unwrap();
+        let ts = &planned.target_state;
+        assert!(
+            ts.granule < 4 << 20,
+            "history granule ({}) must not be inflated by the 64 MiB recurrent bank",
+            ts.granule
+        );
+        assert_eq!(ts.recurrent_granule, Some(64 << 20));
+        assert_eq!(ts.bank_slab_banks().unwrap(), 1);
+        // `startup_banks()` is 1 (zero seed) + in_flight/active (2) = 3; with
+        // `bank_slab_banks == 1`, bank 0 (ZERO_SEED_BANK) stays unbacked so
+        // only 2 writable slabs are backed at startup.
+        let startup_banks = ts.bank_capacity.startup_banks().unwrap() as u64;
+        assert_eq!(
+            ts.startup_bank_slab_bytes().unwrap(),
+            (startup_banks - 1) * (64 << 20)
+        );
+        let device = crate::test_support::open_backend(&seismic::Devices::discover(&[]).unwrap(), BackendName::Cpu).unwrap();
+        let charges = seismic::Charges::tally(&device);
+        let history_pool = seismic::Pool::open(
+            &seismic::PoolCharges::one(&charges),
+            seismic::Contract::DeviceOnly,
+            ts.granule,
+            ts.block.bytes,
+        )
+        .unwrap();
+        let recurrent_pool = seismic::Pool::open(
+            &seismic::PoolCharges::one(&charges),
+            seismic::Contract::DeviceOnly,
+            ts.recurrent_granule.unwrap(),
+            ts.recurrent_block.unwrap().bytes,
+        )
+        .unwrap();
+        let mut bindings = ts
+            .allocate(
+                &charges,
+                magnitude_state::StatePools {
+                    history: history_pool.clone(),
+                    recurrent: Some(recurrent_pool.clone()),
+                },
+            )
+            .unwrap();
+        assert_eq!(
+            bindings.committed_bytes(),
+            ts.initial_committed_bytes().unwrap(),
+            "committed bytes match planned initial_committed_bytes (history in small pool, zero-seed unbacked)"
+        );
+        let shrunk = bindings.shrink_by_pool(&magnitude_state::NextSteps::default()).unwrap();
+        assert_eq!(shrunk.recurrent, (startup_banks - 1) * (64 << 20));
+    }
+
+    #[test]
+    fn request_slot_covers_one_row_warmup_across_slab_boundary() {
+        // Large per-row KV history (multiple layers) so `max_launch_rows = 512`
+        // aligns to whole history slabs and `opening(1)` = 513+ rows crosses
+        // into the next slab (reproducing DeepSeek-V4.1 warm-up on Metal).
+        let target_history = vec![HistoryDomainLayout::Token {
+            components: (0..16)
+                .map(|layer| {
+                    ComponentDescriptor::new(
+                        LayerRef::Target(layer),
+                        KvCodec::Dense.spec(DType::BF16, 16, 128),
+                        1,
+                    )
+                    .unwrap()
+                })
+                .collect(),
+        }];
+        let limits = ResourceLimits {
+            max_launch_rows: 512,
+            max_launch_slots: 64,
+            max_selected_rows: 8,
+            max_drafting_slots: 8,
+            exported_logits_rows: 0,
+            max_images_per_request: 1,
+            max_image_cells: 0,
+            lookahead: true,
+            chain_capacity: NonZeroUsize::MIN,
+            conversations: NonZeroUsize::MIN,
+        };
+        let capacity = ResourceCapacity {
+            domain_bytes: 8 << 30,
+            tensor_operations: TensorOperations::Absent,
+            allocations: seismic::NativeAllocations::EXACT,
+        };
+        for (label, recurrent, method) in [
+            ("pure_plain", Vec::new(), PlannedMethod::Plain),
+            (
+                "pure_mtp",
+                Vec::new(),
+                PlannedMethod::Mtp {
+                    greedy_proposals: 3,
+                    sampled_proposals: 3,
+                    widths: crate::DraftWidths::Adaptive,
+                },
+            ),
+            (
+                "hybrid_plain",
+                vec![ComponentSpec { shape: vec![16 * 1024 * 1024], dtype: DType::F32 }],
+                PlannedMethod::Plain,
+            ),
+        ] {
+            let planned = ResourcePlanner::plan_state_from_layout(
+                target_history.clone(),
+                recurrent,
+                Vec::new(),
+                4096,
+                method,
+                limits,
+                capacity,
+                None,
+            )
+            .unwrap();
+            let shape = crate::memory::ledger::LoadShape::of_states(
+                &planned.target_state,
+                planned.head_state.as_ref(),
+            );
+            let warmup_rows = crate::memory::ledger::RequestRows::from_plan_parts(
+                planned.target_state.context_rows,
+                limits.max_launch_rows,
+                method,
+            )
+            .opening(1);
+            let warmup_bytes = shape.state_bytes(warmup_rows);
+            assert!(
+                planned.request_slot_bytes >= warmup_bytes,
+                "{label}: request_slot_bytes ({}) must cover 1-row warm-up reservation ({warmup_bytes} for {warmup_rows} rows)",
+                planned.request_slot_bytes,
+            );
+        }
+    }
+
+    #[test]
+    fn recorded_graph_demand_reserves_pooled_startup_graphs_for_cuda_and_zero_for_metal() {
+        let planned_state = ResourcePlanner::plan_state_from_layout(
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            1024,
+            PlannedMethod::Plain,
+            crate::planning::fixtures::LIMITS,
+            ResourceCapacity {
+                domain_bytes: 32 << 30,
+                tensor_operations: TensorOperations::Absent,
+                allocations: seismic::NativeAllocations::EXACT,
+            },
+            None,
+        )
+        .unwrap();
+        let empty_graph = NativeGraphCharge {
+            workspace_bytes: 0,
+            sync_bytes: 0,
+            output_bytes: 0,
+            upload_regions: Vec::new(),
+            activations: 1,
+            output_slots: 1,
+            committed_bytes: 0,
+            graphs: seismic::LaunchGraphs::default(),
+        };
+        let target_graph = NativeGraphCharge {
+            graphs: seismic::LaunchGraphs {
+                pinned: seismic::GraphCensus {
+                    graphs: 682,
+                    launches: 9221,
+                    arguments: 0,
+                    largest: 0,
+                },
+                union: seismic::GraphCensus {
+                    graphs: 682,
+                    launches: 9221,
+                    arguments: 0,
+                    largest: 0,
+                },
+                chained: Vec::new(),
+            },
+            ..empty_graph.clone()
+        };
+        let plan = ResourcePlan {
+            domain_capacity_bytes: 32 << 30,
+            capacity: planned_state.capacity,
+            target_state: planned_state.target_state,
+            head_state: None,
+            retained_entry_bytes: 0,
+            request_slot_bytes: 0,
+            bytes: ResourceBytes {
+                target_weights: 0,
+                head_weights: 0,
+                vision_weights: 0,
+                history: 0,
+                recurrent_banks: 0,
+                prepared_programs: 0,
+                scratch: 0,
+            },
+            target_graph,
+            target_readout_graph: empty_graph.clone(),
+            target_readout_chunk_graph: empty_graph.clone(),
+            head_graph: None,
+            vision_graph: None,
+            state_graph: empty_graph,
+        };
+        // Metal / CPU (`GraphCost::None`) reserve 0 bytes.
+        assert_eq!(
+            plan.recorded_graph_demand(seismic::GraphCost::None).unwrap(),
+            crate::memory::ClaimDemand::default()
+        );
+        // CUDA (`GraphCost::Pooled`) reserves the exact startup graph pool bytes.
+        let cuda_cost = seismic::GraphCost::Pooled {
+            graph: 114_200,
+            launch: 2_514,
+            granule: 2 << 20,
+        };
+        let demand = plan.recorded_graph_demand(cuda_cost).unwrap();
+        let expected = cuda_cost
+            .bytes(startup_graphs(&plan.graph_charges()).unwrap())
+            .unwrap();
+        assert_eq!(demand.device, expected.device);
+        assert_eq!(demand.upload, expected.upload);
+        assert!(
+            demand.device > 100_000_000,
+            "expected >100 MB CUDA graph reserve, got {}",
+            demand.device
+        );
     }
 }
 

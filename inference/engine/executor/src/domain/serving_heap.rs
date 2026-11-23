@@ -7,17 +7,12 @@
 //! the seconds its holding saves per byte, counted over its uses since it
 //! was retained and never decayed, the order the ledger takes cache in.
 
-use super::{BankHolding, BankStep, ComponentLoader, DomainError, ExogenousShrink, ExecutorDomain, OptionalComponent, ProgramFamily, StateBindings};
+use super::{BankHolding, BankStep, ComponentLoader, DomainError, ExecutorDomain, OptionalComponent, ProgramFamily, StateBindings};
 use crate::experts::derived::BankMove;
 use crate::memory::ledger::{CacheKind, Cached, Claim, CommittedKind, Keeping, Value};
 use magnitude_cost_model::WorkloadRates;
-use std::time::{Duration, Instant};
+use std::time::Instant;
 
-/// Cooldown after an exogenous bank shrink before a modest room recovery can
-/// regrow, damping desktop app allocation/GC ping-pong while letting large exits
-/// or freed own-claims regrow immediately.
-const EXOGENOUS_REGROW_COOLDOWN: Duration = Duration::from_secs(3);
-const REBOUND_MARGIN_MIN: u64 = 512 * (1 << 20);
 const PARTIAL_GROW_MIN_CAP: u64 = 256 * (1 << 20);
 
 /// What the form and depth of a decode launch's guessed rows are decided
@@ -450,13 +445,13 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
 
     /// The one resize toward `bank`'s derived targets, at the decode's price
     /// now: a shrink before any growth, filtering out sub-noise partial grows
-    /// on small-slot banks and post-shrink ping-pong rebounds per holding so a
-    /// suppressed growth never starves another holding (such as the host tier
-    /// or a table) while letting shrinks, saturation grows, own-claim frees,
-    /// and large exogenous releases through immediately.
+    /// on small-slot banks so a suppressed growth never starves another
+    /// holding (such as the host tier or a table) while deciding every shrink
+    /// and growth from the ledger's valuation alone with zero cooldown
+    /// hysteresis.
     fn next_bank_move(&self, bank: &dyn super::ElasticBank) -> Result<Option<(BankHolding, BankMove)>, DomainError> {
         self.derive_bank(bank, |derived| {
-            select_bank_move(derived, |tier| self.resources.ledgers().of(tier), self.exogenous_shrink.as_ref(), &self.growth_refused)
+            select_bank_move(derived, |tier| self.resources.ledgers().of(tier), &self.growth_refused)
         })
     }
 
@@ -502,10 +497,6 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
         let step = bank.grow(self.resources.ledgers(), holding, to, wake)?;
         if let BankStep::Begun(tier) = step {
             self.resize_held.begin(tier, started);
-            let grew_store = self.resources.ledgers().of(tier).store();
-            if self.exogenous_shrink.as_ref().is_some_and(|s| s.store == grew_store) {
-                self.exogenous_shrink = None;
-            }
             self.growth_refused[tier.index()] = None;
         }
         Ok(step)
@@ -546,22 +537,6 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
             BankStep::Begun(tier) => {
                 self.resize_held.begin(tier, started);
                 self.shrink_step = true;
-                let block = bank
-                    .targets()?
-                    .into_iter()
-                    .find(|t| t.holding == holding)
-                    .map_or(0, |t| t.shape.block_bytes());
-                let ledger = self.resources.ledgers().of(tier);
-                let est = ledger.estimate();
-                if matches!(holding, BankHolding::Experts | BankHolding::Host) {
-                    self.exogenous_shrink = Some(ExogenousShrink {
-                        store: ledger.store(),
-                        at: est.at().at(),
-                        committed: est.committed(),
-                        hold_room: est.hold_room(),
-                        block,
-                    });
-                }
             }
             _ => self.resize_held.hold(started, super::HeldSource::Decision),
         }
@@ -692,19 +667,19 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
         let (mut released, mut returned) = (0, 0);
         if let Some(mut unchained) = self.unchained(bindings).filter(|_| self.state_slabs.spare_owed() > 0) {
             // The stores release the slabs beyond the live requests' next
-            // steps, moving no row, and the pool returns what they freed.
+            // steps, moving no row, and each state pool returns what they freed.
             let state = self.yield_state(&mut unchained)?;
             (released, returned) = (state.released, state.returned);
             freed |= released + returned > 0;
         }
-        // Only report `Yielded::Pending` for the state pool when an async
+        // Only report `Yielded::Pending` for the state pool(s) when an async
         // block drop or fence waiter is genuinely in flight (`pool.releasing()`
         // or an uncompleted watch). A non-zero `pool.owed()` with
         // `!pool.releasing()` means freed granules sit in partially-occupied
         // blocks that cannot vacate right now; nothing async is under way, so
         // `relieve` must retry (when granules were released) or continue to
         // remaining cache tiers rather than parking on an unwakeable wait.
-        if self.state_pool().releasing() || self.state_pool_release.is_some() {
+        if self.state_pools().any(|pool| pool.releasing()) || self.state_pool_release.is_some() {
             self.watch_state_pool_release(wake);
             return Ok(Yielded::Pending);
         }
@@ -717,13 +692,18 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
         if self.idle_class.taken() {
             // Release warm group buffers first (between flights) before
             // releasing the idle graph slots on the release thread; with no
-            // slot idling any more, their cache is let go at once.
+            // slot idling any more, their cache is let go at once. If the
+            // expert bank is not yet in a gap (`self.quiet().is_none()`),
+            // return `Yielded::Nothing` (never `Yielded::Pending`, since no
+            // background release or wakeup was started) so `owner.relieve()`
+            // can continue to remaining cache tiers (e.g. `CacheKind::Bank`)
+            // without parking an idle owner in an unwakeable `WaitsOn::Memory`.
             if self.idle_class.held_places().is_some() {
                 if self.quiet().is_none() && self.unchained(bindings).is_some() {
                     self.conclude_chain()?;
                 }
                 let Some(quiet) = self.quiet() else {
-                    return Ok(Yielded::Pending);
+                    return Ok(Yielded::Nothing);
                 };
                 let changes = self.resources.ledgers().changes().clone();
                 changes.change(|_| self.family.release_group(quiet).map_err(DomainError::invariant))?;
@@ -958,12 +938,10 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
 }
 
 /// Choose the next eligible resize toward `derived` targets: the first shrink
-/// unconditionally, else the first growth passing [`allow_bank_grow`] for its
-/// holding and store.
+/// unconditionally, else the first growth passing [`allow_bank_grow`].
 fn select_bank_move<'a>(
     derived: &[(&crate::experts::derived::HoldingTarget<'_>, u64)],
     ledger_of: impl Fn(crate::planning::BankTier) -> &'a crate::memory::ledger::Ledger,
-    exogenous_shrink: Option<&ExogenousShrink>,
     growth_refused: &[Option<super::GrowthRefusal>; crate::planning::BankTier::COUNT],
 ) -> Option<(BankHolding, BankMove)> {
     let mut first_grow = None;
@@ -977,7 +955,6 @@ fn select_bank_move<'a>(
                         target,
                         to,
                         ledger_of(target.tier),
-                        exogenous_shrink,
                         growth_refused[target.tier.index()].as_ref(),
                     )
                 {
@@ -990,19 +967,17 @@ fn select_bank_move<'a>(
 }
 
 /// Whether a derived growth of `target` to `to` passes the sub-noise partial
-/// grow guard, the per-tier allocator-refusal latch, and the post-shrink
-/// exogenous cooldown on `ledger`.
+/// grow guard (saturating grows always pass; partial grows require at least
+/// one block and 1/64th of saturation up to `PARTIAL_GROW_MIN_CAP`) and the
+/// per-tier allocator-refusal latch on `ledger`.
 fn allow_bank_grow(
     target: &crate::experts::derived::HoldingTarget<'_>,
     to: u64,
     ledger: &crate::memory::ledger::Ledger,
-    exogenous_shrink: Option<&ExogenousShrink>,
     growth_refused: Option<&super::GrowthRefusal>,
 ) -> bool {
     let sat = target.shape.saturation_slots();
     let sat_charge = (target.charge)(sat);
-    let floor_charge = (target.charge)(target.shape.floor_slots());
-    let sat_cache = sat_charge.saturating_sub(floor_charge);
     let gained = (target.charge)(to).saturating_sub((target.charge)(target.at));
     let min_partial = target.shape.block_bytes().max((sat_charge / 64).min(PARTIAL_GROW_MIN_CAP));
     if to < sat && gained < min_partial {
@@ -1015,16 +990,6 @@ fn allow_bank_grow(
         let free_grew = est.free().saturating_sub(refusal.free) >= unit;
         let budget_grew = est.budget().saturating_sub(refusal.budget) >= unit;
         if !released && !free_grew && !budget_grew {
-            return false;
-        }
-    }
-    if let Some(shrink) = exogenous_shrink.filter(|s| s.store == ledger.store()) {
-        let est = ledger.estimate();
-        let own_committed_freed = est.committed() < shrink.committed;
-        let elapsed = est.at().at().saturating_duration_since(shrink.at);
-        let rebound_margin = shrink.block.saturating_mul(4).max(REBOUND_MARGIN_MIN).min(sat_cache.max(shrink.block));
-        let large_release = est.hold_room() >= shrink.hold_room.saturating_add(rebound_margin);
-        if !own_committed_freed && elapsed < EXOGENOUS_REGROW_COOLDOWN && !large_release {
             return false;
         }
     }

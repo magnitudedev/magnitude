@@ -1100,3 +1100,50 @@ fn a_window_historys_pages_stay_within_its_capped_state_bytes() {
     assert_eq!(most, cap, "a window straddling a page boundary in flight holds the capped pages");
     assert_eq!(state_bytes(&single, context, max_advance, granule, 1, context as u64).unwrap(), cap.div_ceil(slab_rows) as u64 * granule);
 }
+
+/// Selected-read (indexed) target domains and draft head domains read earlier
+/// rows of their launch/advance as stored history (`cached_causal_domain`,
+/// `SlotAppends::every_domain`), so their `span_limit` must budget those
+/// appended spans instead of `ceil(context / page) + 1`.
+#[test]
+fn indexed_and_head_domains_budget_appended_spans_in_span_limit() {
+    let (context, max_advance) = (5120, 512);
+    // GLM-5.3-Flash shape: dense MLA Token domain + Block pooled IndexKeys domain.
+    let target_kv = ComponentDescriptor::new(
+        LayerRef::Target(0),
+        CodecSpec::dense(DType::BF16, 4, 4),
+        1,
+    )
+    .unwrap();
+    let index_keys = ComponentDescriptor::produced(
+        LayerRef::IndexKeys { block: 0, part: 0 },
+        DType::BF16,
+        4,
+        false,
+    )
+    .unwrap();
+    let domains = vec![
+        HistoryDomainLayout::Token { components: vec![target_kv] },
+        HistoryDomainLayout::Block { rate: 16, components: vec![index_keys] },
+    ];
+    let token_pages = domains[0].pages(&domains, context, max_advance).unwrap();
+    let expected = history_pages(context, max_advance);
+    assert_eq!(token_pages.span_limit, expected.span_limit);
+    assert!(
+        token_pages.span_limit > history_pages(context, 0).span_limit,
+        "indexed Token domain must include appended spans (got {}, bare {})",
+        token_pages.span_limit,
+        history_pages(context, 0).span_limit,
+    );
+
+    // Draft head with its own Token domain (chained launches read earlier advance rows).
+    let head_kv = ComponentDescriptor::new(
+        LayerRef::Head(0),
+        CodecSpec::dense(DType::BF16, 4, 4),
+        1,
+    )
+    .unwrap();
+    let head_domains = vec![HistoryDomainLayout::Token { components: vec![head_kv] }];
+    let head_pages = head_domains[0].pages(&head_domains, context, max_advance).unwrap();
+    assert_eq!(head_pages.span_limit, expected.span_limit);
+}
