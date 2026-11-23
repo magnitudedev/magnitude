@@ -1152,7 +1152,7 @@ fn assemble_domain(
         })
         .transpose()
         .map_err(|error| internal(error.to_string()))?;
-    let (mut domain, bindings) = ExecutorDomain::new(
+    let (mut domain, mut bindings) = ExecutorDomain::new(
         Rc::new(execution_plan),
         definition,
         startup.reader,
@@ -1179,13 +1179,15 @@ fn assemble_domain(
     if let Some(reserve) = recorded_graphs_reserve {
         startup.ledgers.changes().change(|_| drop(reserve));
     }
-    // What the load is doing from its warm-up until it serves, in the
-    // process's report on demand (`magnitude_executor::diagnostics`).
-    let phase = magnitude_executor::diagnostics::Phase::new("load", "warm-up forward");
-    let mut bindings = warm_up(&mut domain, bindings, primes_drafter)?;
-    phase.enter("loaded memory report");
-    report_loaded_memory(&domain, &device).map_err(internal)?;
-    phase.enter("pricing the load: its step, shrink moves and host storage's routes");
+    // What the load is doing from its pricing and warm-up until it serves, in
+    // the process's report on demand (`magnitude_executor::diagnostics`).
+    // Price the load BEFORE `warm_up` so a tiered bank's `TierCopyCosts`
+    // (already measured before `open_target_bank`) and cost lines are installed
+    // before the warm-up forward runs any demand miss or bank release.
+    let phase = magnitude_executor::diagnostics::Phase::new(
+        "load",
+        "pricing the load: its step, shrink moves and host storage's routes",
+    );
     let bank = planned
         .load()
         .expert_bank()
@@ -1198,6 +1200,10 @@ fn assemble_domain(
     domain
         .measure_load(load_measures(&pricing).map_err(internal)?, &mut bindings)
         .map_err(|error| internal(error.to_string()))?;
+    phase.enter("warm-up forward");
+    let bindings = warm_up(&mut domain, bindings, primes_drafter)?;
+    phase.enter("loaded memory report");
+    report_loaded_memory(&domain, &device).map_err(internal)?;
     phase.enter("serving");
     Ok(Box::new(NativeDomain {
         domain,

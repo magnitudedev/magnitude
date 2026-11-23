@@ -798,6 +798,22 @@ impl BankRecords {
         !self.promoting.is_empty() || !self.releasing.is_empty() || self.staging_in_flight()
     }
 
+    /// Whether any transfer-queue copy is queued or in flight: a promotion, an
+    /// opportunistic staging DMA batch, or a release whose exit writes back to
+    /// the host tier (`back.is_some()`). Excludes stamped-unmap-only releases
+    /// (`back.is_none()`, e.g. from demand-pool replenishment), which use no
+    /// link transfer and drain without `TierCopyCosts`.
+    pub fn link_moving(&self) -> bool {
+        !self.promoting.is_empty()
+            || self.staging_in_flight()
+            || self.releasing.iter().any(|&(group, record)| {
+                matches!(
+                    self.groups[group].contents[record],
+                    Record::Releasing { back: Some(_), .. }
+                )
+            })
+    }
+
     /// The promotions in flight, releases draining, and active staging slots,
     /// for the exchange's watchdog.
     pub fn describe(&self) -> String {
@@ -1627,5 +1643,26 @@ mod tests {
         disjoint.stage(0, 2, (0, 5), 2, HostRecord(10), 99, 0);
         assert!(disjoint.lease(ScratchGroup::at(4, 1), Vec::new()).is_empty());
         assert!(disjoint.leased(), "prompt lease on 0..2 succeeds without colliding with staging ring 2..4");
+    }
+
+    #[test]
+    fn link_moving_distinguishes_stamped_unmap_releases_from_writeback_releases() {
+        let (mut bank, _view) = bank();
+        promoted(&mut bank, 2, 3, 4);
+        promoted(&mut bank, 3, 5, 4);
+        // Stamped-unmap release without write-back (`Exit::to_file`) marks
+        // `moving()` (draining a release) but NOT `link_moving()` (no transfer
+        // queue copy needed).
+        bank.release(0, BankRecord(2), UnmapStep::at(9), Exit::to_file((0, 3)));
+        assert!(bank.moving());
+        assert!(!bank.link_moving());
+
+        // A release with a host-tier write-back (`Exit::written_back`) DOES
+        // mark `link_moving()` until `backed()` clears the write-back.
+        bank.release(0, BankRecord(3), UnmapStep::at(9), Exit::written_back((0, 5), HostRecord(3)));
+        assert!(bank.link_moving());
+        bank.backed(0, BankRecord(3));
+        assert!(bank.moving());
+        assert!(!bank.link_moving());
     }
 }

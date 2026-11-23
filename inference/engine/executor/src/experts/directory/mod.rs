@@ -1669,6 +1669,12 @@ impl Directory {
         self.bank.moving()
     }
 
+    /// Whether any link transfer (promotion, staging DMA, or write-back
+    /// release) is queued or in flight ([`BankRecords::link_moving`]).
+    pub fn link_moving(&self) -> bool {
+        self.bank.link_moving()
+    }
+
     /// Find a free parity-half staging slot in `group`'s dedicated staging ring
     /// for `target_step` ([`BankRecords::free_stage_slot`]).
     pub fn free_stage_slot(&self, group: usize, target_step: Step) -> Option<usize> {
