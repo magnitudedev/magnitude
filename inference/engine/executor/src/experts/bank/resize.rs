@@ -1033,6 +1033,19 @@ impl ExpertBank {
         self.commitment().resizing()
     }
 
+    /// The granule pool of `tier` if it still has shrunk blocks awaiting GPU
+    /// fence completion before dropping to the OS/driver (`Pool::releasing`).
+    /// Growing while `releasing()` is true would allocate brand-new Metal/VRAM
+    /// blocks on top of blocks still wired in `currentAllocatedSize`.
+    pub(super) fn pool_releasing(&self, tier: BankTier) -> Option<seismic::Pool> {
+        match tier {
+            BankTier::Bank => self.stores.pool.releasing().then(|| self.stores.pool.clone()),
+            BankTier::Host => self
+                .host()
+                .and_then(|host| host.stores.pool.releasing().then(|| host.stores.pool.clone())),
+        }
+    }
+
     /// At a submission boundary of the scratch-served chain, prompt group
     /// `chain`'s steps, every pass of its blocks through
     /// `submitted` submitted (none where no block's is), the bank's release

@@ -534,6 +534,11 @@ impl ElasticBank for ServedBank {
         if self.growth_waits()? {
             return Ok(BankStep::Running);
         }
+        let tier = self.storage(holding)?;
+        if let Some(pool) = self.bank.pool_releasing(tier) {
+            pool.wake_on_release(move || wake.complete());
+            return Ok(BankStep::Running);
+        }
         let at = self.size(holding);
         if to <= at {
             return Ok(BankStep::AtLimit);
@@ -543,7 +548,7 @@ impl ElasticBank for ServedBank {
         // again.
         let from = self.holding_charge(holding, at)?;
         let bytes = self.holding_charge(holding, to)? - from;
-        let ledger = ledgers.of(self.storage(holding)?);
+        let ledger = ledgers.of(tier);
         let Ok(claim) = ledger.change(|keeping| ledger.backing(&keeping.claims(), crate::memory::ledger::PoolClass::Records, bytes)) else {
             return Ok(BankStep::Deferred);
         };

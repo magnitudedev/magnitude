@@ -642,12 +642,13 @@ fn wired_stays_under_the_ceiling() {
     os.wired = Some((40 * GB, 6 * GB));
     os.hot = 4 * GB;
     let mut machine = filled(os, 0);
+    let headroom = (40 * GB) >> 5;
     for _ in 0..10 {
         machine.step(300);
         let held = machine.ledger.estimate().allocated();
-        assert!(held + 6 * GB <= 40 * GB - GRANULE, "wired {held} past the ceiling minus wired headroom");
+        assert!(held + 6 * GB <= 40 * GB - headroom, "wired {held} past the ceiling minus wired headroom");
     }
-    assert!(machine.ledger.estimate().allocated() + 6 * GB + 2 * GRANULE > 40 * GB, "the ceiling minus wired headroom binds");
+    assert!(machine.ledger.estimate().allocated() + 6 * GB + headroom + GRANULE > 40 * GB, "the ceiling minus wired headroom binds");
     machine.os.wired = Some((40 * GB, 10 * GB));
     for _ in 0..5 {
         machine.step(300);
@@ -996,8 +997,9 @@ fn an_idle_span_past_the_residency_lapse_moves_nothing() {
     }
     let before = wired(&machine);
     assert_eq!(before, (Some(6 * GB), Some(34 * GB)));
+    let headroom = (40 * GB) >> 5;
     let (bank, resizes) = (machine.bank_bytes(), machine.resizes);
-    assert_eq!(bank, 14 * GB - GRANULE, "the grant less the weights and wired bank headroom");
+    assert_eq!(bank, 14 * GB - headroom, "the grant less the weights and wired bank headroom");
     machine.step(3000);
     assert_eq!(wired(&machine), before, "across the idle span");
     machine.step(100);

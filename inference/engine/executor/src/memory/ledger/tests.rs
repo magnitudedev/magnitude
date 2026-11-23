@@ -2837,16 +2837,17 @@ fn live_iogpu_wire_count_does_not_attribute_own_growth_to_others_while_counted_l
 
 /// On Apple Silicon Metal (`HostGrant::Wired`), elastic bank targets
 /// (`import_room`, `hold_room`, `target`) preserve at least
-/// `max(block_unit, 256 MiB)` below `recommendedMaxWorkingSetSize` so
-/// dynamic bank growth never pins `MTLDevice.currentAllocatedSize` to the
-/// hard command-buffer OOM cliff, while `budget()` remains exact for
-/// committed claims and host-RAM-tight readings waste zero bytes.
+/// `max(block_unit, 256 MiB, ceiling >> 5)` below `grant` so dynamic bank
+/// growth never pins `MTLDevice.currentAllocatedSize` to the hard command-
+/// buffer OOM cliff on 16 GiB Metal 3 or 32+ GiB Metal 4, while `budget()`
+/// remains exact for committed claims and host-RAM-tight readings waste zero
+/// bytes.
 #[test]
 fn metal_wired_ceiling_reserves_command_buffer_headroom_for_elastic_bank() {
     const TOTAL_16G: u64 = 16 * GB;
     const WORKING_SET: u64 = 11_453_251_584; // 16 GB M1 recommendedMaxWorkingSetSize
-    const MIN_HEADROOM: u64 = 256 << 20;
-    const BLOCK_384M: u64 = 384 << 20;
+    const PROPORTIONAL_16G: u64 = WORKING_SET >> 5; // 357.9 MB (> 256 MiB floor)
+    const BLOCK_512M: u64 = 512 << 20;
     const COMMITTED: u64 = 6 * GB;
 
     let scope = Ledgers::new();
@@ -2878,22 +2879,62 @@ fn metal_wired_ceiling_reserves_command_buffer_headroom_for_elastic_bank() {
     let t2 = clock.next();
     let est = ledger.read(ledger.sampled(t2), Reading::unified(&sample_with(t2, COMMITTED, 8 * GB), WORKING_SET));
     assert_eq!(est.budget(), WORKING_SET, "committed budget stays exact at working set");
-    assert_eq!(est.import_room(), WORKING_SET - MIN_HEADROOM - COMMITTED);
-    assert_eq!(est.hold_room(), WORKING_SET - MIN_HEADROOM - COMMITTED);
-    assert_eq!(est.target(), WORKING_SET - MIN_HEADROOM - COMMITTED);
+    assert_eq!(est.import_room(), WORKING_SET - PROPORTIONAL_16G - COMMITTED);
+    assert_eq!(est.hold_room(), WORKING_SET - PROPORTIONAL_16G - COMMITTED);
+    assert_eq!(est.target(), WORKING_SET - PROPORTIONAL_16G - COMMITTED);
 
-    // Opening a pool with a 384 MiB block preserves the full block unit below `grant`.
-    let _records = ledger.pool_block(PoolClass::Records, NonZeroU64::new(BLOCK_384M).unwrap()).blocks;
+    // Opening a pool with a 512 MiB block preserves the full block unit below `grant`.
+    let _records = ledger.pool_block(PoolClass::Records, NonZeroU64::new(BLOCK_512M).unwrap()).blocks;
     let t3 = clock.next();
     let est_pool = ledger.read(ledger.sampled(t3), Reading::unified(&sample_with(t3, COMMITTED, 8 * GB), WORKING_SET));
-    assert_eq!(est_pool.import_room(), WORKING_SET - BLOCK_384M - COMMITTED);
-    assert_eq!(est_pool.target(), WORKING_SET - BLOCK_384M - COMMITTED);
+    assert_eq!(est_pool.import_room(), WORKING_SET - BLOCK_512M - COMMITTED);
+    assert_eq!(est_pool.target(), WORKING_SET - BLOCK_512M - COMMITTED);
 
     // When host RAM supply is tighter than `grant - headroom`, zero bytes are wasted.
     let t4 = clock.next();
     let est_tight = ledger.read(ledger.sampled(t4), Reading::unified(&sample_with(t4, COMMITTED, 3 * GB), WORKING_SET));
     assert_eq!(est_tight.budget(), 9 * GB);
     assert_eq!(est_tight.hold_room(), 9 * GB - COMMITTED);
+
+    // On a 32 GiB Metal 4 M2 Pro (`26,800,603,136` recommended working set) with
+    // ~516 MB `others_wired`, proportional 3.125% headroom (~837.5 MB) keeps
+    // elastic bank targets well clear of Metal 4's command-buffer OOM cliff.
+    const TOTAL_32G: u64 = 32 * GB;
+    const WORKING_SET_M2PRO: u64 = 26_800_603_136;
+    const OTHERS_WIRED_M2PRO: u64 = 515_842_180;
+    const PROPORTIONAL_M2PRO: u64 = WORKING_SET_M2PRO >> 5;
+    const COMMITTED_M2PRO: u64 = 7 * GB;
+    let scope32 = Ledgers::new();
+    let ledger32 = scope32.ledger(seismic::StoreIdentity::HostRam, shape());
+    let sample32 = |at: Instant, own_wired: u64, free: u64| seismic::HostSample {
+        at,
+        counted: seismic::Counted { at, lag: Duration::ZERO },
+        wired: Some(seismic::WiredFigures {
+            limit: seismic::WiredLimit::OsDefault,
+            wire_count: own_wired + OTHERS_WIRED_M2PRO,
+            at,
+        }),
+        ..host_sample(TOTAL_32G, free)
+    };
+    let s0 = clock.next();
+    ledger32.read(ledger32.sampled(s0), Reading::unified(&sample32(s0, 0, 28 * GB), WORKING_SET_M2PRO));
+    let base32 = ledger32
+        .change(|keeping| ledger32.claim_at(&keeping.claims(), None, CommittedKind::Load, COMMITTED_M2PRO))
+        .expect("committed fits");
+    ledger32
+        .change(|_| base32.entry().take(&base32.entry().change(), COMMITTED_M2PRO, seismic::memory::Wiring::Wired))
+        .expect("committed wired");
+    let s1 = clock.next();
+    ledger32.read(ledger32.sampled(s1), Reading::unified(&sample32(s1, COMMITTED_M2PRO, 21 * GB), WORKING_SET_M2PRO));
+    let s2 = clock.next();
+    let est32 = ledger32.read(ledger32.sampled(s2), Reading::unified(&sample32(s2, COMMITTED_M2PRO, 21 * GB), WORKING_SET_M2PRO));
+    let wired_grant = WORKING_SET_M2PRO - OTHERS_WIRED_M2PRO;
+    assert_eq!(est32.budget(), wired_grant);
+    assert_eq!(est32.target(), wired_grant - PROPORTIONAL_M2PRO - COMMITTED_M2PRO);
+    assert!(
+        COMMITTED_M2PRO + est32.target() <= WORKING_SET_M2PRO - (1 << 30),
+        "32 GiB Metal 4 target must leave >1 GiB below recommendedMaxWorkingSetSize"
+    );
 }
 
 /// Live `MTLDevice.currentAllocatedSize` headroom (`left = working_set -
@@ -2906,7 +2947,7 @@ fn metal_working_set_left_reconciles_uncharged_metal_allocations() {
     const WORKING_SET: u64 = 11_453_251_584;
     const COMMITTED: u64 = 8 * GB;
     const UNCHARGED_METAL: u64 = 400 << 20;
-    const MIN_HEADROOM: u64 = 256 << 20;
+    const HEADROOM: u64 = WORKING_SET >> 5;
 
     let scope = Ledgers::new();
     let ledger = scope.ledger(seismic::StoreIdentity::HostRam, shape());
@@ -2952,7 +2993,7 @@ fn metal_working_set_left_reconciles_uncharged_metal_allocations() {
     );
     assert_eq!(
         est.target(),
-        WORKING_SET - UNCHARGED_METAL - MIN_HEADROOM - COMMITTED,
-        "elastic bank target must stay >= 256 MiB below remaining Metal working set"
+        WORKING_SET - UNCHARGED_METAL - HEADROOM - COMMITTED,
+        "elastic bank target must stay >= proportional headroom below remaining Metal working set"
     );
 }

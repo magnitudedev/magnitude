@@ -13,11 +13,15 @@ use super::vocabulary::CacheKind;
 /// (`HostGrant::Wired`, e.g. Metal's `recommendedMaxWorkingSetSize`) when
 /// sizing elastic bank holdings (`import_room`, `hold_room`, `target`).
 /// Metal fails `MTLCommandBuffer` commits with `OutOfMemory` (`device_lost`)
-/// when `currentAllocatedSize` plus transient command-buffer, encoder, and
-/// incoming KV/scratch allocations crosses `recommendedMaxWorkingSetSize`.
-/// Elastic banks preserve `max(block_unit, WIRED_BANK_HEADROOM_MIN)` below
-/// `grant`, while `budget()` stays exact for committed claims.
+/// when `currentAllocatedSize` plus `others_wired` jitter, transient command
+/// buffers, residency-set commits, and incoming KV/scratch allocations crosses
+/// `recommendedMaxWorkingSetSize`. Elastic banks preserve
+/// `max(block_unit, WIRED_BANK_HEADROOM_MIN, ceiling.limit >> WIRED_BANK_HEADROOM_SHIFT)`
+/// (at least 256 MiB and 3.125% of the wired ceiling, e.g. ~341 MiB on 16 GiB
+/// M1, ~799 MiB on 32 GiB M2 Pro, ~1.125 GiB on 48 GiB M4 Pro) below `grant`,
+/// while `budget()` stays exact for committed claims.
 const WIRED_BANK_HEADROOM_MIN: u64 = 256 * (1 << 20);
+const WIRED_BANK_HEADROOM_SHIFT: u32 = 5;
 
 /// A reading as the ledger estimated it (§4.1-4.3): every figure of one
 /// sample's instant, the process's own as the sample shows it.
@@ -326,15 +330,16 @@ impl Estimate {
 
     /// Effective budget ceiling for elastic bank holdings (`import_room`,
     /// `hold_room`, `target`): on a wired GPU ceiling (`HostGrant::Wired`),
-    /// preserves `max(block_unit, WIRED_BANK_HEADROOM_MIN)` below `grant` so
-    /// elastic bank growth never pins `MTLDevice.currentAllocatedSize` against
-    /// `recommendedMaxWorkingSetSize` and starves Metal command buffers or
-    /// incoming KV/scratch allocations.
+    /// preserves `max(block_unit, WIRED_BANK_HEADROOM_MIN, ceiling.limit >> 5)`
+    /// below `grant` so elastic bank growth never pins
+    /// `MTLDevice.currentAllocatedSize` against `recommendedMaxWorkingSetSize`
+    /// and starves Metal command buffers or incoming KV/scratch allocations.
     fn bank_budget(&self) -> u64 {
         let budget = self.budget();
         match (self.read.ceiling, self.read.grant) {
-            (Some(_), Some(grant)) => {
-                let headroom = self.read.unit.max(WIRED_BANK_HEADROOM_MIN);
+            (Some(ceiling), Some(grant)) => {
+                let proportional = ceiling.limit >> WIRED_BANK_HEADROOM_SHIFT;
+                let headroom = self.read.unit.max(WIRED_BANK_HEADROOM_MIN).max(proportional);
                 budget.min(grant.saturating_sub(headroom))
             }
             _ => budget,
