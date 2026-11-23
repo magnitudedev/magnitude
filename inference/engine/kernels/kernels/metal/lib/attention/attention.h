@@ -3923,15 +3923,18 @@ inline void decode_matrix(History history, device const Scalar *query, device co
     // eight matrix rows over the whole head width, with no score exchange;
     // the four tokens share each
     // tile's K and V, decoded once into separate regions.
-    constexpr uint PACKED_QUERY_BYTES = TOKENS * 8 * W * 2;
+    constexpr uint STAGE_TOKENS = TOKENS > 4 ? 4 : TOKENS;
+    constexpr uint PACKED_QUERY_BYTES = STAGE_TOKENS * 8 * W * 2;
     constexpr uint PACKED_TILE_BYTES = KEYS * W * 4;
     constexpr uint PACKED_SHARED_BYTES =
         (PACKED_QUERY_BYTES > PACKED_TILE_BYTES ? PACKED_QUERY_BYTES : PACKED_TILE_BYTES) + 8 * 8;
-    constexpr bool BANDED = History::AFFINE && HEAD_BAND == 8;
-    constexpr bool PACKED = BANDED || (History::AFFINE && TOKENS == 4 && G <= 8 && (W == 128 || W == 256)
-        && SIMDS == TOKENS && PACKED_SHARED_BYTES <= uint(SEISMIC_DEVICE_SHARED_BYTES_PER_GROUP));
-    static_assert(HEAD_BAND == 0 || (HEAD_BAND == 8 && TOKENS == 2 && SIMDS == 4),
-        "head bands own two tokens and two column slices per token");
+    constexpr bool BANDED = History::AFFINE && HEAD_BAND == 8 && TOKENS == 2 && SIMDS == 4;
+    constexpr bool PACKED_BAND = History::AFFINE && (TOKENS == 4 || TOKENS == 8) && SIMDS == TOKENS
+        && (HEAD_BAND == 8 || G <= 8) && (W == 64 || W == 128 || W == 256)
+        && (KEYS % SIMDS == 0) && PACKED_SHARED_BYTES <= uint(SEISMIC_DEVICE_SHARED_BYTES_PER_GROUP);
+    constexpr bool PACKED = BANDED || PACKED_BAND;
+    static_assert(HEAD_BAND == 0 || BANDED || PACKED_BAND,
+        "head bands own two tokens with two column slices or four/eight packed tokens");
     static_assert(GROUP == G || !PACKED, "packed tokens hold their kv head's whole group");
     // Unpacked matrix rows are the tile's TOKENS x GROUP (token-major,
     // head-minor), padded to whole 8-row blocks; a block's columns split into
@@ -3999,38 +4002,64 @@ inline void decode_matrix(History history, device const Scalar *query, device co
         : (TILE_BYTES + EXCHANGE_BYTES > MERGED_BYTES ? TILE_BYTES + EXCHANGE_BYTES : MERGED_BYTES);
     threadgroup float *states = reinterpret_cast<threadgroup float *>(middle + WORK_BYTES);
 
-    // Packed tokens pad their query heads to eight matrix rows; other forms
+    // Packed tokens pad their query heads to eight matrix rows and keep their
+    // query fragments in registers (staged in batches of at most STAGE_TOKENS
+    // so shared memory stays bounded for TOKENS = 8) so the shared query tile
+    // can be reused by the decoded K/V tile and score exchange. Other forms
     // use matrix row i for row row0 + i / GROUP, head head_base + i % GROUP.
     // Queries are rotary-prepared and rounded to the activation dtype (as the
     // contract publishes them); padding rows are zero.
-    for (uint g = PACKED ? 0 : simd; g < ROWS; g += PACKED ? 1 : SIMDS) {
-        float x[E];
-        const uint global_g = PACKED ? team * ROWS + g : g;
-        const ulong row = row0 + (PACKED ? team : global_g / GROUP);
-        const uint head = head_base + (PACKED ? g : global_g % GROUP);
-        if (head < G && (PACKED || global_g < TOKENS * GROUP) && row < rows) {
-            head_rotary<ATTENTION_QUERY_NORM>(query + (row * KV * G + kv_head * G + head) * ATTENTION_QUERY_STRIDE,
-                query_norm, coordinates + row * 4, rotary_components, rotary_frequencies, rotary_amplitudes, epsilon,
-                lane, x);
-        } else {
+    simdgroup_matrix<KeyOperand, 8, 8> prepared_query[DB];
+    if constexpr (PACKED) {
+        for (uint batch = 0; batch < TOKENS; batch += STAGE_TOKENS) {
+            if (team >= batch && team < batch + STAGE_TOKENS) {
+                for (uint g = 0; g < ROWS; ++g) {
+                    float x[E];
+                    const ulong row = row0 + team;
+                    const uint head = head_base + g;
+                    if (head < G && row < rows) {
+                        head_rotary<ATTENTION_QUERY_NORM>(
+                            query + (row * KV * G + kv_head * G + head) * ATTENTION_QUERY_STRIDE, query_norm,
+                            coordinates + row * 4, rotary_components, rotary_frequencies, rotary_amplitudes, epsilon,
+                            lane, x);
+                    } else {
+                        ATTENTION_UNROLL
+                        for (uint i = 0; i < E; ++i)
+                            x[i] = 0.0f;
+                    }
+                    ATTENTION_UNROLL
+                    for (uint i = 0; i < E; ++i)
+                        if (slice == 0)
+                            queries[((team - batch) * ROWS + g) * W + lane * E + i] =
+                                KeyOperand(activation::Act::round(x[i]));
+                }
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            if (team >= batch && team < batch + STAGE_TOKENS) {
+                ATTENTION_UNROLL
+                for (uint d = 0; d < DB; ++d)
+                    simdgroup_load(prepared_query[d], queries + (team - batch) * ROWS * W + col0 + d * 8, W);
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+        }
+    } else {
+        for (uint g = simd; g < ROWS; g += SIMDS) {
+            float x[E];
+            const ulong row = row0 + g / GROUP;
+            const uint head = head_base + g % GROUP;
+            if (head < G && g < TOKENS * GROUP && row < rows) {
+                head_rotary<ATTENTION_QUERY_NORM>(query + (row * KV * G + kv_head * G + head) * ATTENTION_QUERY_STRIDE,
+                    query_norm, coordinates + row * 4, rotary_components, rotary_frequencies, rotary_amplitudes,
+                    epsilon, lane, x);
+            } else {
+                ATTENTION_UNROLL
+                for (uint i = 0; i < E; ++i)
+                    x[i] = 0.0f;
+            }
             ATTENTION_UNROLL
             for (uint i = 0; i < E; ++i)
-                x[i] = 0.0f;
+                queries[g * W + lane * E + i] = KeyOperand(activation::Act::round(x[i]));
         }
-        ATTENTION_UNROLL
-        for (uint i = 0; i < E; ++i)
-            if (!PACKED || slice == 0)
-                queries[global_g * W + lane * E + i] = KeyOperand(activation::Act::round(x[i]));
-    }
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-
-    // Packed tokens keep their query fragments in registers so the shared
-    // query tile can be reused by the decoded K/V tile and score exchange.
-    simdgroup_matrix<KeyOperand, 8, 8> prepared_query[DB];
-    if (PACKED) {
-        ATTENTION_UNROLL
-        for (uint d = 0; d < DB; ++d)
-            simdgroup_load(prepared_query[d], queries + team * ROWS * W + col0 + d * 8, W);
         threadgroup_barrier(mem_flags::mem_threadgroup);
     }
 

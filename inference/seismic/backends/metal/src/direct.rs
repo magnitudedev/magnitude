@@ -1058,6 +1058,7 @@ impl DirectBatch {
             .expect("DirectBatch holds its command buffer until consumed");
         let committed = self.mode.commit(previous);
         self.committed.push(committed);
+        self.used = false;
         Ok(())
     }
 

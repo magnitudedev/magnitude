@@ -296,13 +296,16 @@ native stream_mix_down for cpu from "cpu/stream_mix_down.rs":
         threads_per_threadgroup (1, 1, 1)
 
 # Metal: the `dense` projection (single) over the plain low-rank rows, with
-# the `Mix` epilogue; one GEMV mapping for every row count below VERIFY_ROWS,
-# as it ran before the projection.
+# the `Mix` epilogue; keep `gemv_rows` at 16 simdgroups (qualified at M=3..4)
+# and `gemv_pair` at 8 simdgroups (1.50x faster at M=2).
 native stream_mix_up for metal from "metal/stream_mix_up.metal":
     static (H, S, LR)
     where H % 32 == 0 and LR % 32 == 0
     project dense single (up_weight)
-    restate single_gemv
+    restate gemv_rows SIMDGROUPS in [16, 8, 4, 2, 32] default 16
+    restate gemv_rows ROWS in [1, 2, 4] default 1
+    restate gemv_pair SIMDGROUPS in [16, 8, 4, 2, 32] default 8
+    restate gemv_pair ROWS in [1, 2, 4] default 1
 
 # CUDA: the `dense` projection (single) over the low-rank rows read in
 # place, without split-K by default (S * H columns are many).

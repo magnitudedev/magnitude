@@ -49,14 +49,33 @@ kernel void routed_output_project_gather(
     device const int *sources [[buffer(SEISMIC_BUFFER_SOURCES)]],
     device routed::Worklist *worklist [[buffer(SEISMIC_BUFFER_SCRATCH_WORKLIST)]],
     device int *gather_grid [[buffer(SEISMIC_BUFFER_SCRATCH_GATHER_GRID)]],
+    device int *gather_one_grid [[buffer(SEISMIC_BUFFER_SCRATCH_GATHER_ONE_GRID)]],
     constant ulong *seismic_words [[buffer(SEISMIC_BUFFER_WORDS)]],
     uint lane [[thread_index_in_simdgroup]]) {
-    threadgroup int cache[2u * routed::WORKLIST_CACHE];
+    threadgroup int cache[routed::WORKLIST_CACHE_WORDS];
     constexpr uint GROUP_TILE = routed::GATHERED_SUMMED_SIMDGROUPS * routed::output_tile<ROWS, LANES>();
     const uint x_groups = (uint(SEISMIC_DIM_H) + GROUP_TILE - 1u) / GROUP_TILE;
     routed::build_worklist(routes, SEISMIC_ROUTES_STRIDE_0, SEISMIC_ROUTES_STRIDE_1, sources, ROUTED_SOURCE_ROWS,
         SEISMIC_SOURCES_STRIDE_1, SEISMIC_SOURCES_STRIDE_2, uint(SEISMIC_DIM_M), uint(SEISMIC_DIM_K), x_groups, 1u,
-        worklist, gather_grid, cache, lane);
+        worklist, gather_grid, gather_one_grid, cache, lane);
+}
+#endif
+
+#ifdef SEISMIC_FORMING_ROUTED_OUTPUT_PROJECT_GATHERED_ONE
+template <uint ROWS, uint LANES>
+kernel void routed_output_project_gathered_one(
+    ROUTED_OUTPUT_PROJECT_PORTS,
+    device const routed::Worklist *worklist [[buffer(SEISMIC_BUFFER_SCRATCH_WORKLIST)]]) {
+    constexpr uint TILE = routed::output_tile<ROWS, LANES>();
+    constexpr uint SLOTS = uint(SEISMIC_DIM_K) + 1;
+    threadgroup routed::GatheredSummedShared<LANES, true> tg;
+    const uint first = group.x * (routed::GATHERED_SUMMED_SIMDGROUPS * TILE);
+    const routed::OutPublishedSlots<SLOTS> published{
+        element::Out<ELEMENT_OF(SEISMIC_RESULT_0)>(published_cells),
+        SEISMIC_RESULT_0_STRIDE_0, SEISMIC_RESULT_0_STRIDE_1, SEISMIC_RESULT_0_STRIDE_2};
+    routed::output_project_gathered<ROWS, LANES, true>(expert_product, shared_product, worklist, expert_down,
+        tier_down, shared_down, uint(SEISMIC_DIM_M), group.y, first, tid, sg, lane, tg, published,
+        seismic_words);
 }
 #endif
 
@@ -67,12 +86,12 @@ kernel void routed_output_project_gathered(
     device const routed::Worklist *worklist [[buffer(SEISMIC_BUFFER_SCRATCH_WORKLIST)]]) {
     constexpr uint TILE = routed::output_tile<ROWS, LANES>();
     constexpr uint SLOTS = uint(SEISMIC_DIM_K) + 1;
-    threadgroup routed::GatheredSummedShared<LANES> tg;
+    threadgroup routed::GatheredSummedShared<LANES, false> tg;
     const uint first = group.x * (routed::GATHERED_SUMMED_SIMDGROUPS * TILE);
     const routed::OutPublishedSlots<SLOTS> published{
         element::Out<ELEMENT_OF(SEISMIC_RESULT_0)>(published_cells),
         SEISMIC_RESULT_0_STRIDE_0, SEISMIC_RESULT_0_STRIDE_1, SEISMIC_RESULT_0_STRIDE_2};
-    routed::output_project_gathered<ROWS, LANES>(expert_product, shared_product, worklist, expert_down,
+    routed::output_project_gathered<ROWS, LANES, false>(expert_product, shared_product, worklist, expert_down,
         tier_down, shared_down, uint(SEISMIC_DIM_M), group.y, first, tid, sg, lane, tg, published,
         seismic_words);
 }

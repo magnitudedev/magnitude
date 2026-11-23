@@ -3570,11 +3570,16 @@ fn metal_packed_recurrent_and_attention_projections_agree_with_the_staged_tiles(
                             &activation,
                         );
                     }
-                    // The operand is laid out for the query's Q4_K runs, which
-                    // do not serve the Q6_K value weights.
-                    assert!(
-                        same(&actual[2], &expected[2]),
-                        "attention_project value mode {mode} rows {rows} {pack:?}"
+                    // Multi-class segmented packing emits a dedicated operand
+                    // for the Q6_K value weights too, so value runs packed.
+                    judge(
+                        format!("attention_project value mode {mode} rows {rows} {pack:?} {input}"),
+                        packed_operand(&device, project_reprs[2], pack),
+                        (normed.as_slice(), flips.as_slice()),
+                        &project_weights[2],
+                        None,
+                        &wide(&actual[2]),
+                        &activation,
                     );
                 }
             }

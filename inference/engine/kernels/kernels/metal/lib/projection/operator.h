@@ -791,16 +791,14 @@ inline void segment_tall(thread const In &in, thread const Out &out, thread cons
 #define PROJECTION_PACKING_4 PROJECTION_PACKING_3 PROJECTION_PACKING_ROWS(3)
 #define PROJECTION_PACKING_OF_COUNT(COUNT) PROJECTION_PACKING_##COUNT
 #define PROJECTION_PACKING_EXPANDED(COUNT) PROJECTION_PACKING_OF_COUNT(COUNT)
-// The shared operand coded for WIDTH residue bits where it has them; its
-// layout (folds, centre, the weights it serves) is every width's.
-#define PROJECTION_PACKING_OF(WIDTH)                                                                            \
-    projection::packing_shared<WIDTH PROJECTION_PACKING_EXPANDED(SEISMIC_PROJECTION_SEGMENTS)>
-#define PROJECTION_PACKING PROJECTION_PACKING_OF(1)
+// The segmented operand classes coded for WIDTH residue bits where present;
+// every `N % 32 == 0` packable segment is served by its own class slot.
+#define PROJECTION_PACKING_CLASSES_OF(WIDTH)                                                                    \
+    projection::packing_classes<WIDTH PROJECTION_PACKING_EXPANDED(SEISMIC_PROJECTION_SEGMENTS)>
+#define PROJECTION_PACKING_CLASSES PROJECTION_PACKING_CLASSES_OF(1)
 #define PROJECTION_SERVED(s)                                                                                    \
     (PROJECTION_N##s != 0 && PROJECTION_N##s % 32 == 0                                                          \
-        && projection::packing_serves<PROJECTION_PACKET(s), PROJECTION_PACKING::folds, PROJECTION_PACKING::residue, \
-            PROJECTION_PACKING::sums>::value)
-#define PROJECTION_SERVED_BIT(s, ...) (PROJECTION_SERVED(s) ? 1u << s##u : 0u) |
+        && projection::packing_codes<PROJECTION_PACKET(s)>::available)
 #define PROJECTION_ADMITTED(s, ...)                                                                             \
     (packets::admits<PROJECTION_PACKET(s)>::pack && PROJECTION_N##s != 0 && PROJECTION_N##s % 32 == 0) ||
 // PACK = 1 names the packed GEMM of a segment of weights admitted to it (the
@@ -808,13 +806,29 @@ inline void segment_tall(thread const In &in, thread const Out &out, thread cons
 #define PROJECTION_PACKING_ADMITTED                                                                             \
     static_assert(PROJECTION_EACH_SEGMENT(PROJECTION_ADMITTED, ) false,                                         \
         "PACK = 1 names the packed GEMM of a segment of weights admitted to it")
-// Segment s's factor tables, beside the shared operand: the served weights'
-// factors are its layout's (two F16 a row and block, four with each run's
-// sums).
-#define PROJECTION_SEGMENT_SCRATCH(s)                                                                           \
-    projection::packing_scratch{packed, token_factors, token_scales,                                            \
-        factors + ulong(PROJECTION_FIRST_##s) * (k / 32u) * (PROJECTION_PACKING::sums ? 4u : 2u),              \
+// Segment s's factor tables beside class `slot`'s operand slice: each class
+// holds its own `packed`, `token_factors`, and `token_scales` slice in
+// canonical class order; segment weights' factors are laid out with 4 halfs
+// per (row, 32 cols) when any segment uses `sums`, else 2.
+#define PROJECTION_SEGMENT_SCRATCH_AT(s, slot, factor_mult, padded_rows)                                        \
+    projection::packing_scratch{                                                                                \
+        packed + ulong(slot) * (ulong(padded_rows) * k / 2u + 256u),                                            \
+        token_factors + ulong(slot) * ulong(padded_rows) * (k / 32u) * 2u * (factor_mult),                      \
+        token_scales + ulong(slot) * ulong(padded_rows),                                                        \
+        factors + ulong(PROJECTION_FIRST_##s) * (k / 32u) * (PROJECTION_PACKING_CLASSES::any_sums ? 4u : 2u),   \
         scales + PROJECTION_FIRST_##s}
+
+#define PROJECTION_SEGMENTED_PACK_CLASS(CLS, SLOT)                                                              \
+    if constexpr (CLS::active) {                                                                                \
+        if (slot == (SLOT)) {                                                                                   \
+            constexpr uint BOUNDS = projection::packing_bounded<CLS::mask, PROJECTION_BOUNDED>::value;          \
+            const projection::packing_bounds<BOUNDS> bounds{PROJECTION_BOUND_TABLES};                           \
+            projection::packing_operand<CLS::centre, CLS::folds, CLS::sums, CLS::residue, BOUNDS>(              \
+                in, PROJECTION_SEGMENT_SCRATCH_AT(0, SLOT, factor_mult, padded), bounds, m, k, local_index,     \
+                peaks, thread_index, sg, lane);                                                                 \
+            return;                                                                                             \
+        }                                                                                                       \
+    }
 
 #define PROJECTION_SEGMENTED_PACK                                                                               \
     PROJECTION_PACKING_ADMITTED;                                                                                \
@@ -822,18 +836,22 @@ inline void segment_tall(thread const In &in, thread const Out &out, thread cons
         return;                                                                                                 \
     threadgroup float peaks[projection::packing_peaks()];                                                       \
     PROJECTION_OPERANDS;                                                                                        \
-    constexpr uint SERVED = PROJECTION_EACH_SEGMENT(PROJECTION_SERVED_BIT, ) 0u;                                \
-    constexpr uint BOUNDS = projection::packing_bounded<SERVED, PROJECTION_BOUNDED>::value;                     \
-    const projection::packing_bounds<BOUNDS> bounds{PROJECTION_BOUND_TABLES};                                   \
-    projection::packing_operand<PROJECTION_PACKING::centre, PROJECTION_PACKING::folds, PROJECTION_PACKING::sums, \
-        PROJECTION_PACKING_OF(RESIDUE)::residue, BOUNDS>(in, PROJECTION_SEGMENT_SCRATCH(0), bounds, m,          \
-        k, index, peaks, thread_index, sg, lane)
+    typedef PROJECTION_PACKING_CLASSES_OF(RESIDUE) classes;                                                     \
+    const uint padded = projection::packing_padded(m, 2u);                                                      \
+    const uint groups_per_class = padded / 4u;                                                                  \
+    const uint slot = index / groups_per_class;                                                                 \
+    const uint local_index = index % groups_per_class;                                                          \
+    constexpr uint factor_mult = RESIDUE > (classes::any_sums ? 2u : 1u) ? RESIDUE : (classes::any_sums ? 2u : 1u); \
+    PROJECTION_SEGMENTED_PACK_CLASS(classes::c_one, classes::slot_one)                                          \
+    PROJECTION_SEGMENTED_PACK_CLASS(classes::c_two, classes::slot_two)                                          \
+    PROJECTION_SEGMENTED_PACK_CLASS(classes::c_summed, classes::slot_summed)                                    \
+    PROJECTION_SEGMENTED_PACK_CLASS(classes::c_bytes, classes::slot_bytes)
 
 #define PROJECTION_SEGMENT_COEFFICIENTS(s, ...)                                                                 \
     if (row < uint(PROJECTION_N##s)) {                                                                          \
         if constexpr (PROJECTION_SERVED(s))                                                                     \
-            projection::packing_coefficients(w##s, PROJECTION_SEGMENT_SCRATCH(s), uint(PROJECTION_N##s), k,     \
-                row, lane);                                                                                     \
+            projection::packing_coefficients(w##s, PROJECTION_SEGMENT_SCRATCH_AT(s, 0u, 1u, 0u),                \
+                uint(PROJECTION_N##s), k, row, lane);                                                           \
         return;                                                                                                 \
     }                                                                                                           \
     row -= uint(PROJECTION_N##s);
@@ -846,16 +864,20 @@ inline void segment_tall(thread const In &in, thread const Out &out, thread cons
     PROJECTION_EACH_SEGMENT(PROJECTION_SEGMENT_COEFFICIENTS, )
 
 #define PROJECTION_SEGMENT_PACKED(s, ...)                                                                       \
-    if (projection::gemm_packed_segment<PROJECTION_PACKET(s), PROJECTION_SERVED(s), CODED,                      \
-            PACK_TOKENS, WEIGHTS_AHEAD>(out##s, w##s, PROJECTION_SEGMENT_SCRATCH(s), PROJECTION_ZEROED(s) ? 0u : m, padded,  \
-            uint(PROJECTION_N##s), k, group, projection::packing_simdgroups, sg, lane))                         \
+    if (projection::gemm_packed_segment<PROJECTION_PACKET(s), PROJECTION_SERVED(s),                             \
+            classes::template of<PROJECTION_PACKET(s)>::residue, PACK_TOKENS, WEIGHTS_AHEAD>(                   \
+            out##s, w##s,                                                                                       \
+            PROJECTION_SEGMENT_SCRATCH_AT(s, classes::template of<PROJECTION_PACKET(s)>::slot, factor_mult, padded), \
+            PROJECTION_ZEROED(s) ? 0u : m, padded, uint(PROJECTION_N##s), k, group,                             \
+            projection::packing_simdgroups, sg, lane))                                                          \
         return;
 
 #define PROJECTION_SEGMENTED_PACKED                                                                             \
     PROJECTION_PACKING_ADMITTED;                                                                                \
     PROJECTION_OPERANDS;                                                                                        \
+    typedef PROJECTION_PACKING_CLASSES_OF(RESIDUE) classes;                                                     \
     const uint padded = projection::packing_padded(m, 2u);                                                      \
-    constexpr uint CODED = PROJECTION_PACKING_OF(RESIDUE)::residue;                                             \
+    constexpr uint factor_mult = RESIDUE > (classes::any_sums ? 2u : 1u) ? RESIDUE : (classes::any_sums ? 2u : 1u); \
     uint group = index;                                                                                         \
     PROJECTION_EACH_SEGMENT(PROJECTION_SEGMENT_PACKED, )
 
@@ -1781,42 +1803,39 @@ inline void ordered_gemm_col1_run(thread const In &in, thread const Out &out, th
         return;
     const uint full_packets = k >> 5u;
     const bool has_tail = (k & 31u) != 0u;
-    threadgroup float *x_tile = reinterpret_cast<threadgroup float *>(shared);
-    threadgroup float *w_tile = reinterpret_cast<threadgroup float *>(shared + 4096);
+    constexpr uint BUF_FLOATS = 3072u; // 64*32 X (2048) + 32*32 W (1024)
+    threadgroup float *base = reinterpret_cast<threadgroup float *>(shared);
+    const uint tid = sg * 32u + lane;
     const uint u = lane & 7u;
     const uint gn = lane >> 3u;
-    const uint act_lo = tile_m * 32u + sg * 4u;
+    const uint act_lo = tile_m * 64u + sg * 8u;
     const uint dec_row = tile_n * 32u;
-    float acc[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+    const uint x_row = tile_m * 64u + (tid >> 2u);
+    float acc[8] = {0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f};
     uint4 x_pref = uint4(0u);
     float w_pref = 0.0f;
     if (full_packets > 0u) {
-        if (sg >= 4u) {
-            const uint x_tid = (sg - 4u) * 32u + lane;
-            const uint x_row = tile_m * 32u + (x_tid >> 2u);
-            x_pref = (x_row < m) ? in.words8_full(x_row, 8u * (x_tid & 3u)) : uint4(0u);
-        } else if (sg == 0u) {
+        x_pref = (x_row < m) ? in.words8_full(x_row, 8u * (tid & 3u)) : uint4(0u);
+        if (sg == 0u)
             w_pref = ordered_weight_at(w, dec_row, lane);
-        }
     }
     for (uint p = 0; p < full_packets; ++p) {
         const uint k0 = 32u * p;
-        if (p > 0u)
-            threadgroup_barrier(mem_flags::mem_threadgroup);
-        if (sg >= 4u) {
-            const uint x_tid = (sg - 4u) * 32u + lane;
+        threadgroup float *x_tile = base + (p & 1u) * BUF_FLOATS;
+        threadgroup float *w_tile = x_tile + 2048u;
+        {
             float4 xe, xo;
             A::split8(x_pref, xe, xo);
-            threadgroup float4 *xdst4 = reinterpret_cast<threadgroup float4 *>(x_tile) + 2u * x_tid;
+            threadgroup float4 *xdst4 = reinterpret_cast<threadgroup float4 *>(x_tile) + 2u * tid;
             xdst4[0] = float4(xe.x, xo.x, xe.y, xo.y);
             xdst4[1] = float4(xe.z, xo.z, xe.w, xo.w);
-            const uint next_col = k0 + 32u + 8u * (x_tid & 3u);
-            const uint x_row = tile_m * 32u + (x_tid >> 2u);
+            const uint next_col = k0 + 32u + 8u * (tid & 3u);
             if (p + 1u < full_packets)
                 x_pref = (x_row < m) ? in.words8_full(x_row, next_col) : uint4(0u);
             else if (has_tail)
                 x_pref = (x_row < m && next_col < k) ? in.words8(x_row, next_col) : uint4(0u);
-        } else if (sg == 0u) {
+        }
+        if (sg == 0u) {
             w_tile[lane] = w_pref;
             const uint next_col = k0 + 32u + lane;
             if (p + 1u < full_packets)
@@ -1826,59 +1845,52 @@ inline void ordered_gemm_col1_run(thread const In &in, thread const Out &out, th
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
         if (act_lo < m && gn == 0u) {
-            const threadgroup float *my_x = x_tile + sg * 128u + u;
+            const threadgroup float *my_x = x_tile + sg * 256u + u;
             PROJECTION_UNROLL
             for (uint s = 0; s < 4; ++s) {
                 const float wv0 = w_tile[8u * s + u];
-                acc[0] = metal::fma(my_x[0u * 32u + 8u * s], wv0, acc[0]);
-                acc[1] = metal::fma(my_x[1u * 32u + 8u * s], wv0, acc[1]);
-                acc[2] = metal::fma(my_x[2u * 32u + 8u * s], wv0, acc[2]);
-                acc[3] = metal::fma(my_x[3u * 32u + 8u * s], wv0, acc[3]);
+                PROJECTION_UNROLL
+                for (uint i = 0; i < 8; ++i)
+                    acc[i] = metal::fma(my_x[i * 32u + 8u * s], wv0, acc[i]);
             }
         }
     }
     if (has_tail) {
         const uint k0 = 32u * full_packets;
-        if (full_packets > 0u) {
-            threadgroup_barrier(mem_flags::mem_threadgroup);
-        } else {
-            if (sg >= 4u) {
-                const uint x_tid = (sg - 4u) * 32u + lane;
-                const uint x_row = tile_m * 32u + (x_tid >> 2u);
-                const uint col = 8u * (x_tid & 3u);
-                x_pref = (x_row < m && col < k) ? in.words8(x_row, col) : uint4(0u);
-            } else if (sg == 0u) {
+        threadgroup float *x_tile = base + (full_packets & 1u) * BUF_FLOATS;
+        threadgroup float *w_tile = x_tile + 2048u;
+        if (full_packets == 0u) {
+            const uint col = 8u * (tid & 3u);
+            x_pref = (x_row < m && col < k) ? in.words8(x_row, col) : uint4(0u);
+            if (sg == 0u)
                 w_pref = (lane < k) ? ordered_weight_at(w, dec_row, lane) : 0.0f;
-            }
         }
-        if (sg >= 4u) {
-            const uint x_tid = (sg - 4u) * 32u + lane;
+        {
             float4 xe, xo;
             A::split8(x_pref, xe, xo);
-            threadgroup float4 *xdst4 = reinterpret_cast<threadgroup float4 *>(x_tile) + 2u * x_tid;
+            threadgroup float4 *xdst4 = reinterpret_cast<threadgroup float4 *>(x_tile) + 2u * tid;
             xdst4[0] = float4(xe.x, xo.x, xe.y, xo.y);
             xdst4[1] = float4(xe.z, xo.z, xe.w, xo.w);
-        } else if (sg == 0u) {
-            w_tile[lane] = w_pref;
         }
+        if (sg == 0u)
+            w_tile[lane] = w_pref;
         threadgroup_barrier(mem_flags::mem_threadgroup);
         if (act_lo < m && gn == 0u) {
-            const threadgroup float *my_x = x_tile + sg * 128u + u;
+            const threadgroup float *my_x = x_tile + sg * 256u + u;
             PROJECTION_UNROLL
             for (uint s = 0; s < 4; ++s) {
                 if (k0 + 8u * s + u < k) {
                     const float wv0 = w_tile[8u * s + u];
-                    acc[0] = metal::fma(my_x[0u * 32u + 8u * s], wv0, acc[0]);
-                    acc[1] = metal::fma(my_x[1u * 32u + 8u * s], wv0, acc[1]);
-                    acc[2] = metal::fma(my_x[2u * 32u + 8u * s], wv0, acc[2]);
-                    acc[3] = metal::fma(my_x[3u * 32u + 8u * s], wv0, acc[3]);
+                    PROJECTION_UNROLL
+                    for (uint i = 0; i < 8; ++i)
+                        acc[i] = metal::fma(my_x[i * 32u + 8u * s], wv0, acc[i]);
                 }
             }
         }
     }
     if (act_lo < m) {
         PROJECTION_UNROLL
-        for (uint i = 0; i < 4; ++i) {
+        for (uint i = 0; i < 8; ++i) {
             const uint out_r = act_lo + i;
             if (out_r < m) {
                 const float sum = ordered_combine8(acc[i]);
@@ -1897,77 +1909,74 @@ inline void ordered_gemm_run(thread const In &in, thread const Out &out, thread 
         return;
     const uint full_packets = k >> 5u;
     const bool has_tail = (k & 31u) != 0u;
-    threadgroup float *x_tile = reinterpret_cast<threadgroup float *>(shared);
-    threadgroup float *w_tile = reinterpret_cast<threadgroup float *>(shared + 4096);
+    constexpr uint BUF_FLOATS = 3072u; // 64*32 X (2048) + 32*32 W (1024)
+    threadgroup float *base = reinterpret_cast<threadgroup float *>(shared);
+    const uint tid = sg * 32u + lane;
     const uint u = lane & 7u;
     const uint gn = lane >> 3u;
-    const uint act_lo = tile_m * 32u + sg * 4u;
-    const threadgroup float *w_cur0 = w_tile + lane;
-    const threadgroup float *w_cur1 = w_tile + (lane ^ 8u);
-    const threadgroup float *w_cur2 = w_tile + (lane ^ 16u);
-    const threadgroup float *w_cur3 = w_tile + (lane ^ 24u);
-    float acc[4][8];
+    const uint act_lo = tile_m * 64u + sg * 8u;
+    const uint x_row = tile_m * 64u + (tid >> 2u);
+    const uint c_dec = tid >> 2u, s_dec = tid & 3u;
+    const uint dec_row = tile_n * 32u + c_dec;
+    const uint j_dec = c_dec & 7u, gn_dec = c_dec >> 3u;
+    const uint w_slot = (s_dec * 8u + j_dec) * 4u + (gn_dec ^ (j_dec & 3u));
+    float acc[8][8];
     PROJECTION_UNROLL
-    for (uint i = 0; i < 4; ++i)
+    for (uint i = 0; i < 8; ++i)
         PROJECTION_UNROLL
         for (uint j = 0; j < 8; ++j)
             acc[i][j] = 0.0f;
-    GemmPrefetch<W> pref;
+    uint4 x_pref = uint4(0u);
+    GemmPrefetch<W> w_pref;
     if (full_packets > 0u) {
-        const uint tid = sg * 32u + lane;
-        if (sg >= 4u) {
-            const uint x_tid = tid - 128u;
-            pref.fetch_x_full(in, tile_m * 32u + (x_tid >> 2u), 8u * (x_tid & 3u), m);
-        } else {
-            const uint c_dec = tid >> 2u, s_dec = tid & 3u;
-            const uint dec_row = tile_n * 32u + c_dec;
-            pref.fetch_w_full(w, dec_row, 0u, s_dec, dec_row < n);
-        }
+        x_pref = (x_row < m) ? in.words8_full(x_row, 8u * (tid & 3u)) : uint4(0u);
+        if (sg < 4u)
+            w_pref.fetch_w_full(w, dec_row, 0u, s_dec, dec_row < n);
     }
     for (uint p = 0; p < full_packets; ++p) {
         const uint k0 = 32u * p;
-        if (p > 0u)
-            threadgroup_barrier(mem_flags::mem_threadgroup);
+        threadgroup float *x_tile = base + (p & 1u) * BUF_FLOATS;
+        threadgroup float *w_tile = x_tile + 2048u;
         {
-            const uint tid = sg * 32u + lane;
-            if (sg >= 4u) {
-                const uint x_tid = tid - 128u;
-                float4 xe, xo;
-                A::split8(pref.take_x(), xe, xo);
-                threadgroup float4 *xdst4 = reinterpret_cast<threadgroup float4 *>(x_tile) + 2u * x_tid;
-                xdst4[0] = float4(xe.x, xo.x, xe.y, xo.y);
-                xdst4[1] = float4(xe.z, xo.z, xe.w, xo.w);
-                const uint next_col = k0 + 32u + 8u * (x_tid & 3u);
-                const uint x_row = tile_m * 32u + (x_tid >> 2u);
-                if (p + 1u < full_packets)
-                    pref.fetch_x_full(in, x_row, next_col, m);
-                else if (has_tail)
-                    pref.fetch_x_tail(in, x_row, next_col, m, k);
-            } else {
-                const uint c_dec = tid >> 2u, s_dec = tid & 3u;
-                const uint dec_row = tile_n * 32u + c_dec;
-                float w_vals[8];
-                pref.decode_w_full(s_dec, dec_row < n, w_vals);
-                const uint j_dec = c_dec & 7u, gn_dec = c_dec >> 3u;
-                const uint w_slot = (s_dec * 8u + j_dec) * 4u + (gn_dec ^ (j_dec & 3u));
-                threadgroup float4 *wdst4 = reinterpret_cast<threadgroup float4 *>(w_tile) + 2u * w_slot;
-                wdst4[0] = float4(w_vals[0], w_vals[1], w_vals[2], w_vals[3]);
-                wdst4[1] = float4(w_vals[4], w_vals[5], w_vals[6], w_vals[7]);
-                if (p + 1u < full_packets)
-                    pref.fetch_w_full(w, dec_row, p + 1u, s_dec, dec_row < n);
-                else if (has_tail)
-                    pref.fetch_w_tail(w, dec_row, p + 1u, s_dec, dec_row < n, k0 + 32u + 8u * s_dec, k);
-            }
+            float4 xe, xo;
+            A::split8(x_pref, xe, xo);
+            threadgroup float4 *xdst4 = reinterpret_cast<threadgroup float4 *>(x_tile) + 2u * tid;
+            xdst4[0] = float4(xe.x, xo.x, xe.y, xo.y);
+            xdst4[1] = float4(xe.z, xo.z, xe.w, xo.w);
+            const uint next_col = k0 + 32u + 8u * (tid & 3u);
+            if (p + 1u < full_packets)
+                x_pref = (x_row < m) ? in.words8_full(x_row, next_col) : uint4(0u);
+            else if (has_tail)
+                x_pref = (x_row < m && next_col < k) ? in.words8(x_row, next_col) : uint4(0u);
+        }
+        if (sg < 4u) {
+            float w_vals[8];
+            w_pref.decode_w_full(s_dec, dec_row < n, w_vals);
+            threadgroup float4 *wdst4 = reinterpret_cast<threadgroup float4 *>(w_tile) + 2u * w_slot;
+            wdst4[0] = float4(w_vals[0], w_vals[1], w_vals[2], w_vals[3]);
+            wdst4[1] = float4(w_vals[4], w_vals[5], w_vals[6], w_vals[7]);
+            if (p + 1u < full_packets)
+                w_pref.fetch_w_full(w, dec_row, p + 1u, s_dec, dec_row < n);
+            else if (has_tail)
+                w_pref.fetch_w_tail(w, dec_row, p + 1u, s_dec, dec_row < n, k0 + 32u + 8u * s_dec, k);
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
         if (act_lo < m && (tile_n * 32u + 8u * gn) < n) {
-            const threadgroup float *my_x = x_tile + sg * 128u + u;
+            const threadgroup float *my_x = x_tile + sg * 256u + u;
+            const threadgroup float *w_cur0 = w_tile + lane;
+            const threadgroup float *w_cur1 = w_tile + (lane ^ 8u);
+            const threadgroup float *w_cur2 = w_tile + (lane ^ 16u);
+            const threadgroup float *w_cur3 = w_tile + (lane ^ 24u);
             PROJECTION_UNROLL
             for (uint s = 0; s < 4; ++s) {
                 const float xv0 = my_x[0u * 32u + 8u * s];
                 const float xv1 = my_x[1u * 32u + 8u * s];
                 const float xv2 = my_x[2u * 32u + 8u * s];
                 const float xv3 = my_x[3u * 32u + 8u * s];
+                const float xv4 = my_x[4u * 32u + 8u * s];
+                const float xv5 = my_x[5u * 32u + 8u * s];
+                const float xv6 = my_x[6u * 32u + 8u * s];
+                const float xv7 = my_x[7u * 32u + 8u * s];
                 PROJECTION_UNROLL
                 for (uint j = 0; j < 8; ++j) {
                     const threadgroup float *w_ptr = ((j & 3u) == 0u) ? w_cur0
@@ -1977,49 +1986,45 @@ inline void ordered_gemm_run(thread const In &in, thread const Out &out, thread 
                     acc[1][j] = metal::fma(xv1, wv, acc[1][j]);
                     acc[2][j] = metal::fma(xv2, wv, acc[2][j]);
                     acc[3][j] = metal::fma(xv3, wv, acc[3][j]);
+                    acc[4][j] = metal::fma(xv4, wv, acc[4][j]);
+                    acc[5][j] = metal::fma(xv5, wv, acc[5][j]);
+                    acc[6][j] = metal::fma(xv6, wv, acc[6][j]);
+                    acc[7][j] = metal::fma(xv7, wv, acc[7][j]);
                 }
             }
         }
     }
     if (has_tail) {
         const uint k0 = 32u * full_packets;
-        if (full_packets > 0u) {
-            threadgroup_barrier(mem_flags::mem_threadgroup);
-        } else {
-            const uint tid = sg * 32u + lane;
-            if (sg >= 4u) {
-                const uint x_tid = tid - 128u;
-                pref.fetch_x_tail(in, tile_m * 32u + (x_tid >> 2u), 8u * (x_tid & 3u), m, k);
-            } else {
-                const uint c_dec = tid >> 2u, s_dec = tid & 3u;
-                const uint dec_row = tile_n * 32u + c_dec;
-                pref.fetch_w_tail(w, dec_row, 0u, s_dec, dec_row < n, 8u * s_dec, k);
-            }
+        threadgroup float *x_tile = base + (full_packets & 1u) * BUF_FLOATS;
+        threadgroup float *w_tile = x_tile + 2048u;
+        if (full_packets == 0u) {
+            const uint col = 8u * (tid & 3u);
+            x_pref = (x_row < m && col < k) ? in.words8(x_row, col) : uint4(0u);
+            if (sg < 4u)
+                w_pref.fetch_w_tail(w, dec_row, 0u, s_dec, dec_row < n, 8u * s_dec, k);
         }
         {
-            const uint tid = sg * 32u + lane;
-            if (sg >= 4u) {
-                const uint x_tid = tid - 128u;
-                float4 xe, xo;
-                A::split8(pref.take_x(), xe, xo);
-                threadgroup float4 *xdst4 = reinterpret_cast<threadgroup float4 *>(x_tile) + 2u * x_tid;
-                xdst4[0] = float4(xe.x, xo.x, xe.y, xo.y);
-                xdst4[1] = float4(xe.z, xo.z, xe.w, xo.w);
-            } else {
-                const uint c_dec = tid >> 2u, s_dec = tid & 3u;
-                const uint dec_row = tile_n * 32u + c_dec;
-                float w_vals[8];
-                pref.decode_w_tail(s_dec, k0 + 8u * s_dec, k, dec_row < n, w_vals);
-                const uint j_dec = c_dec & 7u, gn_dec = c_dec >> 3u;
-                const uint w_slot = (s_dec * 8u + j_dec) * 4u + (gn_dec ^ (j_dec & 3u));
-                threadgroup float4 *wdst4 = reinterpret_cast<threadgroup float4 *>(w_tile) + 2u * w_slot;
-                wdst4[0] = float4(w_vals[0], w_vals[1], w_vals[2], w_vals[3]);
-                wdst4[1] = float4(w_vals[4], w_vals[5], w_vals[6], w_vals[7]);
-            }
+            float4 xe, xo;
+            A::split8(x_pref, xe, xo);
+            threadgroup float4 *xdst4 = reinterpret_cast<threadgroup float4 *>(x_tile) + 2u * tid;
+            xdst4[0] = float4(xe.x, xo.x, xe.y, xo.y);
+            xdst4[1] = float4(xe.z, xo.z, xe.w, xo.w);
+        }
+        if (sg < 4u) {
+            float w_vals[8];
+            w_pref.decode_w_tail(s_dec, k0 + 8u * s_dec, k, dec_row < n, w_vals);
+            threadgroup float4 *wdst4 = reinterpret_cast<threadgroup float4 *>(w_tile) + 2u * w_slot;
+            wdst4[0] = float4(w_vals[0], w_vals[1], w_vals[2], w_vals[3]);
+            wdst4[1] = float4(w_vals[4], w_vals[5], w_vals[6], w_vals[7]);
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
         if (act_lo < m && (tile_n * 32u + 8u * gn) < n) {
-            const threadgroup float *my_x = x_tile + sg * 128u + u;
+            const threadgroup float *my_x = x_tile + sg * 256u + u;
+            const threadgroup float *w_cur0 = w_tile + lane;
+            const threadgroup float *w_cur1 = w_tile + (lane ^ 8u);
+            const threadgroup float *w_cur2 = w_tile + (lane ^ 16u);
+            const threadgroup float *w_cur3 = w_tile + (lane ^ 24u);
             PROJECTION_UNROLL
             for (uint s = 0; s < 4; ++s) {
                 if (k0 + 8u * s + u < k) {
@@ -2027,6 +2032,10 @@ inline void ordered_gemm_run(thread const In &in, thread const Out &out, thread 
                     const float xv1 = my_x[1u * 32u + 8u * s];
                     const float xv2 = my_x[2u * 32u + 8u * s];
                     const float xv3 = my_x[3u * 32u + 8u * s];
+                    const float xv4 = my_x[4u * 32u + 8u * s];
+                    const float xv5 = my_x[5u * 32u + 8u * s];
+                    const float xv6 = my_x[6u * 32u + 8u * s];
+                    const float xv7 = my_x[7u * 32u + 8u * s];
                     PROJECTION_UNROLL
                     for (uint j = 0; j < 8; ++j) {
                         const threadgroup float *w_ptr = ((j & 3u) == 0u) ? w_cur0
@@ -2036,6 +2045,10 @@ inline void ordered_gemm_run(thread const In &in, thread const Out &out, thread 
                         acc[1][j] = metal::fma(xv1, wv, acc[1][j]);
                         acc[2][j] = metal::fma(xv2, wv, acc[2][j]);
                         acc[3][j] = metal::fma(xv3, wv, acc[3][j]);
+                        acc[4][j] = metal::fma(xv4, wv, acc[4][j]);
+                        acc[5][j] = metal::fma(xv5, wv, acc[5][j]);
+                        acc[6][j] = metal::fma(xv6, wv, acc[6][j]);
+                        acc[7][j] = metal::fma(xv7, wv, acc[7][j]);
                     }
                 }
             }
@@ -2043,7 +2056,7 @@ inline void ordered_gemm_run(thread const In &in, thread const Out &out, thread 
     }
     if (act_lo < m) {
         PROJECTION_UNROLL
-        for (uint i = 0; i < 4; ++i) {
+        for (uint i = 0; i < 8; ++i) {
             const uint out_r = act_lo + i;
             if (out_r < m) {
                 PROJECTION_UNROLL

@@ -154,15 +154,32 @@ impl PassLayers {
     }
 }
 
+/// Per-expert block height (`TILE_ROWS`) that grouped prefill pads each active
+/// expert's token list to.
+pub(crate) const ROUTED_TILE_ROWS: f64 = 32.0;
+
+/// Expected GEMM rows executed for `choices` routed token-expert assignments
+/// across `experts` active experts when each active expert pads to a multiple
+/// of [`ROUTED_TILE_ROWS`]: at least one full tile per active expert, and half
+/// a tile of trailing zero-padding on average.
+pub(crate) fn routed_padded_choices(experts: f64, choices: f64) -> f64 {
+    if experts > 0.0 {
+        (choices + experts * ((ROUTED_TILE_ROWS - 1.0) / 2.0)).max(experts * ROUTED_TILE_ROWS)
+    } else {
+        0.0
+    }
+}
+
 /// The routed seconds a prompt of `prompt_rows` rows takes in passes over
 /// `launches` launches of `region_rows` rows each, on the executor's costs
 /// (`passes`): each pass reads, at every routed layer, the union its rows
 /// choose of the layer's experts ([`expert_union`]), and computes their
-/// choices, each routed kind once at its layers' count; and it reads from
-/// storage the misses of that union a partial bank does not hold (`reads`,
-/// a pass's seconds by its rows; none where the bank holds every expert).
-/// Fewer, longer passes read each expert fewer times, from the device's
-/// memory and from storage alike.
+/// choices (padded to [`ROUTED_TILE_ROWS`] per active expert), each routed kind
+/// once at its layers' count; and it reads from storage the misses of that
+/// union a partial bank does not hold (`reads`, a pass's seconds by its rows;
+/// none where the bank holds every expert). Fewer, longer passes read each
+/// expert fewer times, from the device's memory and from storage alike, and
+/// pay per-expert tile padding fewer times.
 ///
 /// # Panics
 /// Where `region_rows` or `launches` is zero, or their product overflows `u64`.
@@ -184,7 +201,9 @@ pub(crate) fn routed_prompt_seconds(
             .iter()
             .map(|kind| {
                 let union = expert_union(kind.experts, kind.selected, rows);
-                kind.layers as f64 * windows * passes.kind_seconds(kind.kind, union / windows, (rows * kind.selected) as f64 / windows)
+                let experts = union / windows;
+                let choices = (rows * kind.selected) as f64 / windows;
+                kind.layers as f64 * windows * passes.kind_seconds(kind.kind, experts, routed_padded_choices(experts, choices))
             })
             .sum::<f64>()
             + reads(rows)

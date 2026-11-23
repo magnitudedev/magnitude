@@ -329,6 +329,106 @@ kernel void attention_decode_k8v4_partial(
 #endif
 }
 
+// L1 (multi-row shared-KV packed matrix form for M >= 2): 8 simdgroups pack up
+// to 8 decode rows per threadgroup (and 8 query heads per head band when
+// G > 8), decoding each K8/V4 tile once into shared memory across all rows.
+kernel void attention_decode_k8v4_partial_multi(
+    device const attention::Scalar *query [[buffer(SEISMIC_BUFFER_QUERY)]],
+    device const attention::Scalar *key [[buffer(SEISMIC_BUFFER_KEY)]],
+    device const attention::Scalar *value [[buffer(SEISMIC_BUFFER_VALUE)]],
+    device const float *query_norm [[buffer(SEISMIC_BUFFER_QUERY_NORM)]],
+    device const float *key_norm [[buffer(SEISMIC_BUFFER_KEY_NORM)]],
+    device const float *value_norm [[buffer(SEISMIC_BUFFER_VALUE_NORM)]],
+    device const int *rotary_components [[buffer(SEISMIC_BUFFER_ROTARY_COMPONENTS)]],
+    device const float *rotary_frequencies [[buffer(SEISMIC_BUFFER_ROTARY_FREQUENCIES)]],
+    device const float *rotary_amplitudes [[buffer(SEISMIC_BUFFER_ROTARY_AMPLITUDES)]],
+    device const int *coordinates [[buffer(SEISMIC_BUFFER_COORDINATES)]],
+    device const int *visible [[buffer(SEISMIC_BUFFER_VISIBLE)]],
+    device const int *fresh [[buffer(SEISMIC_BUFFER_FRESH)]],
+    device const int *destinations [[buffer(SEISMIC_BUFFER_DESTINATIONS)]],
+    device const ulong *key_codes [[buffer(SEISMIC_BUFFER_HISTORY_KEY_CODES)]],
+    SEISMIC_OUT_HISTORY_KEY_COEFFICIENTS_PARAM(key_coefficients),
+    device const ulong *value_codes [[buffer(SEISMIC_BUFFER_HISTORY_VALUE_CODES)]],
+    SEISMIC_OUT_HISTORY_VALUE_COEFFICIENTS_PARAM(value_coefficients),
+    device float *partials [[buffer(SEISMIC_BUFFER_SCRATCH_PARTIALS)]],
+    device float *statistics [[buffer(SEISMIC_BUFFER_SCRATCH_STATISTICS)]],
+    constant ulong *seismic_words [[buffer(SEISMIC_BUFFER_WORDS)]],
+    threadgroup float *shared [[threadgroup(0)]],
+    uint3 group [[threadgroup_position_in_grid]],
+    uint thread_index [[thread_index_in_threadgroup]],
+    uint simd [[simdgroup_index_in_threadgroup]],
+    uint lane [[thread_index_in_simdgroup]]) {
+#if SEISMIC_TUNE_MATRIX && SEISMIC_TUNE_TOKENS == 1 && SEISMIC_TUNE_HEAD_BAND == 0 && (SEISMIC_TUNE_KEYS % 8 == 0)
+    constexpr uint W = ATTENTION_W;
+    if constexpr (W == 64 || W == 128 || W == 256) {
+    typedef attention::lane_codes<ATTENTION_KEY_BITS> key_lane;
+    typedef attention::lane_codes<ATTENTION_VALUE_BITS> value_lane;
+    constexpr uint E = ATTENTION_E;
+    constexpr uint KV = SEISMIC_DIM_KV;
+    constexpr uint G = SEISMIC_DIM_G;
+    constexpr uint PARTS = SEISMIC_TUNE_PARTS;
+    constexpr uint MULTI_TOKENS = 8;
+    constexpr uint MULTI_SIMDS = 8;
+    constexpr uint MULTI_HEAD_BAND = G > 8 ? 8 : 0;
+    constexpr uint HEAD_BANDS = (G + 7) / 8;
+    const uint kv_head = group.x / HEAD_BANDS;
+    const uint head_band = group.x % HEAD_BANDS;
+    const uint head_base = head_band * 8;
+    const uint partition = group.y;
+    const ulong row0 = group.z * MULTI_TOKENS;
+    const float epsilon = as_type<float>(uint(SEISMIC_PARAM_EPSILON));
+    const float scale = as_type<float>(uint(SEISMIC_PARAM_SCALE));
+
+    auto fresh_key = [&](ulong token) {
+        float x[E];
+        attention::fresh_row<true>(key, value, key_norm, value_norm, coordinates, rotary_components,
+            rotary_frequencies, rotary_amplitudes, token, kv_head, epsilon, rounding::none(), lane, x);
+        return attention::held_encoding<true>(x);
+    };
+    auto fresh_value = [&](ulong token) {
+        float x[E];
+        attention::fresh_row<false>(key, value, key_norm, value_norm, coordinates, rotary_components,
+            rotary_frequencies, rotary_amplitudes, token, kv_head, epsilon, rounding::none(), lane, x);
+        return attention::held_encoding<false>(x);
+    };
+
+    for (uint item = simd; ATTENTION_FRESH && partition == 0 && head_band == 0 && item < 2 * MULTI_TOKENS;
+         item += MULTI_SIMDS) {
+        const ulong appended = row0 + item / 2;
+        if (appended >= SEISMIC_DIM_M)
+            break;
+        const int destination = destinations[appended];
+        if (destination >= 0) {
+            const ulong vector = kv_head;
+            const ulong slab_rows = ulong(SEISMIC_PARAM_SLAB_ROWS);
+            if (item % 2 == 0)
+                attention::store<ATTENTION_KEY_BITS>(fresh_key(appended),
+                    slab::row<uint>(key_codes, ulong(destination), slab_rows, KV * key_lane::row_words)
+                        + vector * key_lane::row_words,
+                    slab::out_row(key_coefficients, ulong(destination), slab_rows, KV * key_lane::pairs * 2)
+                        .offset(vector * key_lane::pairs * 2), lane);
+            else
+                attention::store<ATTENTION_VALUE_BITS>(fresh_value(appended),
+                    slab::row<uint>(value_codes, ulong(destination), slab_rows, KV * value_lane::row_words)
+                        + vector * value_lane::row_words,
+                    slab::out_row(value_coefficients, ulong(destination), slab_rows, KV * value_lane::pairs * 2)
+                        .offset(vector * value_lane::pairs * 2), lane);
+        }
+    }
+
+    if (int(uint(SEISMIC_PARAM_GATE_FUNCTION)) == -1)
+        return;
+    attention::decode_matrix<MULTI_SIMDS, SEISMIC_TUNE_KEYS, SEISMIC_TUNE_SPAN, PARTS, MULTI_TOKENS, MULTI_HEAD_BAND>(
+        attention::affine_planes{key_codes, key_coefficients, value_codes, value_coefficients,
+            ulong(SEISMIC_PARAM_SLAB_ROWS)}.reads(),
+        query, key, value, query_norm, key_norm, value_norm, rotary_components, rotary_frequencies, rotary_amplitudes,
+        coordinates, visible, fresh, partials, statistics, reinterpret_cast<threadgroup uchar *>(shared), SEISMIC_DIM_R,
+        SEISMIC_DIM_M, epsilon, scale * ATTENTION_LOG2E, kv_head, partition, group.z, thread_index, simd, lane,
+        head_base);
+    }
+#endif
+}
+
 // L2: threadgroup (query head, row), one thread per column (W threads): the
 // fixed-order merge of the row's partitions (with the head's sink when
 // SK = 1), the output rotary in F32 when RO = 1, and the output gate.

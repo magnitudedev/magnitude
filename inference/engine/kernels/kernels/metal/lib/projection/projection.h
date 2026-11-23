@@ -817,15 +817,44 @@ struct gemm_tile {
     threadgroup float4 name##_words[projection::gemm_tile<TM, TN>::bytes / 16];                     \
     threadgroup uchar *name = reinterpret_cast<threadgroup uchar *>(name##_words)
 
-// The staging buffer's A tile (activation scalars E) and B tile (half).
-template <uint TM, uint TN, typename E>
+// Whether W is a dense 16-bit weight (f16 or bf16) that `gemm` stages directly
+// without 32-element packet decoding or f32 -> half round-trips.
+template <typename W>
+struct gemm_dense16 {
+    static constant constexpr bool value = false;
+    typedef half native;
+    typedef element::F16 elem;
+};
+template <typename E>
+struct gemm_dense16<packets::Dense<E>> {
+    static constant constexpr bool value = (E::bytes == 2u);
+    typedef typename E::native native;
+    typedef E elem;
+};
+
+// Shared-memory B element type for a GEMM tile of activation element `A` and
+// weights `W` (and `U` when `PAIRED`): native `bfloat` when both weights are
+// dense BF16 and the activation is `bfloat` (avoiding `bf16 -> f32 -> half`
+// conversion and precision loss), else `half` (which mixes with both `half`
+// and `bfloat` activations in `simdgroup_multiply_accumulate`).
+template <typename A, typename W, typename U, bool PAIRED>
+struct gemm_b_element {
+    static constant constexpr bool bf16 =
+        metal::is_same<A, bfloat>::value
+        && metal::is_same<W, packets::Dense<element::Bf16>>::value
+        && (!PAIRED || metal::is_same<U, packets::Dense<element::Bf16>>::value);
+    typedef typename metal::conditional<bf16, bfloat, half>::type type;
+};
+
+// The staging buffer's A tile (activation scalars E) and B tile (B = half or bfloat).
+template <uint TM, uint TN, typename E, typename B = half>
 struct gemm_buffer {
     threadgroup E *a;
-    threadgroup half *b;
+    threadgroup B *b;
     static gemm_buffer at(threadgroup uchar *base) {
         gemm_buffer buffer;
         buffer.a = reinterpret_cast<threadgroup E *>(base);
-        buffer.b = reinterpret_cast<threadgroup half *>(buffer.a + TM * gemm_lda);
+        buffer.b = reinterpret_cast<threadgroup B *>(buffer.a + TM * gemm_lda);
         return buffer;
     }
 };
@@ -867,11 +896,18 @@ inline void gemm_store_a(thread const gemm_a_registers<ITEMS> &regs, threadgroup
 // tile's local row i / gemm_step_halves.
 // A thread stages the same weight rows on every step, so it keeps each
 // item's coefficient run (`packets::Block`) in registers across steps.
-template <typename W, uint COUNT>
+template <typename W, uint COUNT, bool DENSE16 = gemm_dense16<W>::value>
 struct gemm_b_registers {
     typename W::packet packet[COUNT];
     typename packets::Block<W>::state run[COUNT];
     bool valid[COUNT];
+};
+
+// Dense 16-bit weights load only their own 16-element half-packet (two uint4
+// = 32 bytes) directly, avoiding 2x global memory loads and packet decoding.
+template <typename W, uint COUNT>
+struct gemm_b_registers<W, COUNT, true> {
+    uint4 words[COUNT][2];
 };
 
 // Whether a TM-row tile keeps coefficient runs. On simdgroup matrices a
@@ -889,7 +925,7 @@ constexpr bool gemm_runs() {
 // open a run as they enter it.
 template <typename W, uint THREADS, uint COUNT, bool RUNS>
 inline void gemm_load_b(thread const Weights<W> &w, uint first, uint count, uint rows, uint k0,
-    uint k, uint thread_index, bool fresh, thread gemm_b_registers<W, COUNT> &regs) {
+    uint k, uint thread_index, bool fresh, thread gemm_b_registers<W, COUNT, false> &regs) {
     PROJECTION_UNROLL
     for (uint j = 0; j < COUNT; ++j) {
         uint item = thread_index + j * THREADS;
@@ -909,6 +945,39 @@ inline void gemm_load_b(thread const Weights<W> &w, uint first, uint count, uint
     }
 }
 
+template <typename W, uint THREADS, uint COUNT, bool RUNS>
+inline void gemm_load_b(thread const Weights<W> &w, uint first, uint count, uint rows, uint k0,
+    uint k, uint thread_index, bool, thread gemm_b_registers<W, COUNT, true> &regs) {
+    typedef typename gemm_dense16<W>::elem WE;
+    PROJECTION_UNROLL
+    for (uint j = 0; j < COUNT; ++j) {
+        uint item = thread_index + j * THREADS;
+        uint local = item / gemm_step_halves;
+        uint half_index = item % gemm_step_halves;
+        uint col = k0 + 16u * half_index;
+        if (local < count && col < k) {
+            uint n = min(first + local, rows - 1u);
+            const packets::weight_bytes ptr = packets::Dense<WE>::row_values(w.locate(n)) + ulong(col) * 2u;
+            if (col + 16u <= k) {
+                const auto v = slab::as<uint4>(ptr);
+                regs.words[j][0] = v[0];
+                regs.words[j][1] = v[1];
+            } else {
+                const auto s = slab::as<ushort>(ptr);
+                ushort buf[16];
+                PROJECTION_UNROLL
+                for (uint t = 0; t < 16u; ++t)
+                    buf[t] = (col + t < k) ? s[t] : ushort(0);
+                regs.words[j][0] = *reinterpret_cast<thread const uint4 *>(buf);
+                regs.words[j][1] = *reinterpret_cast<thread const uint4 *>(buf + 8);
+            }
+        } else {
+            regs.words[j][0] = uint4(0);
+            regs.words[j][1] = uint4(0);
+        }
+    }
+}
+
 // Step `step` of a packet into its 8 columns of B tile row `row`, as every
 // GEMM form stages it: the packet's values (`W::values`), rounded to half.
 template <typename W>
@@ -923,9 +992,9 @@ inline void gemm_store_step(thread const typename W::packet &k, uint step, threa
 // Decode the staged packets (`gemm_store_step`). Local
 // row r of this tensor becomes tile row tile_row0 + r * spacing (a paired
 // tile interleaves gate and up rows).
-template <typename W, uint THREADS, uint COUNT>
-inline void gemm_store_b(thread const gemm_b_registers<W, COUNT> &regs, uint count, uint tile_row0,
-    uint spacing, threadgroup half *b, uint thread_index) {
+template <typename W, uint THREADS, uint COUNT, typename B>
+inline void gemm_store_b(thread const gemm_b_registers<W, COUNT, false> &regs, uint count, uint tile_row0,
+    uint spacing, threadgroup B *b, uint thread_index) {
     PROJECTION_UNROLL
     for (uint j = 0; j < COUNT; ++j) {
         uint item = thread_index + j * THREADS;
@@ -934,15 +1003,46 @@ inline void gemm_store_b(thread const gemm_b_registers<W, COUNT> &regs, uint cou
             continue;
         uint tile_row = tile_row0 + local * spacing;
         uint within = half_index & 1u;   // half of its packet
-        threadgroup half4 *out = reinterpret_cast<threadgroup half4 *>(b + tile_row * gemm_lda + 16u * half_index);
+        threadgroup half4 *out = reinterpret_cast<threadgroup half4 *>(
+            reinterpret_cast<threadgroup half *>(b) + tile_row * gemm_lda + 16u * half_index);
         if (regs.valid[j]) {
             PROJECTION_UNROLL
             for (uint s = 0; s < 2; ++s)
-                gemm_store_step<W>(regs.packet[j], 2u * within + s, b + tile_row * gemm_lda);
+                gemm_store_step<W>(regs.packet[j], 2u * within + s,
+                    reinterpret_cast<threadgroup half *>(b) + tile_row * gemm_lda);
         } else {
             PROJECTION_UNROLL
             for (uint s = 0; s < 4; ++s)
                 out[s] = half4(0.0h);
+        }
+    }
+}
+
+template <typename W, uint THREADS, uint COUNT, typename B>
+inline void gemm_store_b(thread const gemm_b_registers<W, COUNT, true> &regs, uint count, uint tile_row0,
+    uint spacing, threadgroup B *b, uint thread_index) {
+    typedef typename gemm_dense16<W>::elem WE;
+    PROJECTION_UNROLL
+    for (uint j = 0; j < COUNT; ++j) {
+        uint item = thread_index + j * THREADS;
+        uint local = item / gemm_step_halves, half_index = item % gemm_step_halves;
+        if (local >= count)
+            continue;
+        uint tile_row = tile_row0 + local * spacing;
+        if constexpr (metal::is_same<B, typename WE::native>::value) {
+            threadgroup uint4 *out = reinterpret_cast<threadgroup uint4 *>(b + tile_row * gemm_lda + 16u * half_index);
+            out[0] = regs.words[j][0];
+            out[1] = regs.words[j][1];
+        } else {
+            threadgroup half4 *out = reinterpret_cast<threadgroup half4 *>(
+                reinterpret_cast<threadgroup half *>(b) + tile_row * gemm_lda + 16u * half_index);
+            PROJECTION_UNROLL
+            for (uint p = 0; p < 2u; ++p) {
+                const ushort4 lo = as_type<ushort4>(regs.words[j][p].xy);
+                const ushort4 hi = as_type<ushort4>(regs.words[j][p].zw);
+                out[2u * p] = half4(half(WE::load(lo.x)), half(WE::load(lo.y)), half(WE::load(lo.z)), half(WE::load(lo.w)));
+                out[2u * p + 1u] = half4(half(WE::load(hi.x)), half(WE::load(hi.y)), half(WE::load(hi.z)), half(WE::load(hi.w)));
+            }
         }
     }
 }
@@ -990,30 +1090,31 @@ using gemm_accumulators = simdgroup_float8x8[gemm_tile<TM, TN>::fm][gemm_tile<TM
 // The B fragment of B tile rows n .. n + 7 at columns k .. k + 7, `at`
 // being this lane's element (row n + x, column k + y): it holds rows x and
 // x + 1 at column y.
-inline simdgroup_half8x8 gemm_b_fragment(threadgroup const half *at) {
-    simdgroup_half8x8 b;
-    reinterpret_cast<thread half2 &>(b.thread_elements()) = half2(at[0], at[gemm_lda]);
+template <typename B>
+inline simdgroup_matrix<B, 8, 8> gemm_b_fragment(threadgroup const B *at) {
+    simdgroup_matrix<B, 8, 8> b;
+    reinterpret_cast<thread vec<B, 2> &>(b.thread_elements()) = vec<B, 2>(at[0], at[gemm_lda]);
     return b;
 }
 
-template <uint TM, uint TN, typename E, uint FM>
-inline void gemm_multiply(gemm_buffer<TM, TN, E> buffer, gemm_fragments<TM, TN> at,
+template <uint TM, uint TN, typename E, typename B, uint FM>
+inline void gemm_multiply(gemm_buffer<TM, TN, E, B> buffer, gemm_fragments<TM, TN> at,
     thread gemm_accumulators<TM, TN> &acc) {
     constexpr uint FN = gemm_tile<TM, TN>::fn;
     threadgroup const E *a_lane = buffer.a + (at.row0 + at.coordinate.y) * gemm_lda + at.coordinate.x;
-    threadgroup const half *b_lane = buffer.b + (at.column0 + at.coordinate.x) * gemm_lda + at.coordinate.y;
+    threadgroup const B *b_lane = buffer.b + (at.column0 + at.coordinate.x) * gemm_lda + at.coordinate.y;
     PROJECTION_UNROLL
     for (uint step = 0; step < gemm_k / 8u; ++step) {
         uint kk = step * 8u;
         simdgroup_matrix<E, 8, 8> a[FM];
-        simdgroup_half8x8 b[FN];
+        simdgroup_matrix<B, 8, 8> b[FN];
         PROJECTION_UNROLL
         for (uint i = 0; i < FM; ++i)
             reinterpret_cast<thread vec<E, 2> &>(a[i].thread_elements()) =
                 *reinterpret_cast<threadgroup const vec<E, 2> *>(a_lane + 8u * i * gemm_lda + kk);
         PROJECTION_UNROLL
         for (uint j = 0; j < FN; ++j)
-            b[j] = gemm_b_fragment(b_lane + 8u * j * gemm_lda + kk);
+            b[j] = gemm_b_fragment<B>(b_lane + 8u * j * gemm_lda + kk);
         PROJECTION_UNROLL
         for (uint i = 0; i < FM; ++i)
             PROJECTION_UNROLL
@@ -1032,15 +1133,15 @@ inline uint gemm_live_fragments(gemm_fragments<TM, TN> at, uint m0, uint m_rows)
     return first >= m_rows ? 0u : min(FM, (m_rows - first + 7u) / 8u);
 }
 
-template <uint TM, uint TN, typename E>
-inline void gemm_multiply_live(gemm_buffer<TM, TN, E> buffer, gemm_fragments<TM, TN> at, uint live,
+template <uint TM, uint TN, typename E, typename B>
+inline void gemm_multiply_live(gemm_buffer<TM, TN, E, B> buffer, gemm_fragments<TM, TN> at, uint live,
     thread gemm_accumulators<TM, TN> &acc) {
     static_assert(gemm_tile<TM, TN>::fm == 4, "live counts are instantiated for 4 fragment rows");
     switch (live) {
-    case 4: gemm_multiply<TM, TN, E, 4>(buffer, at, acc); break;
-    case 3: gemm_multiply<TM, TN, E, 3>(buffer, at, acc); break;
-    case 2: gemm_multiply<TM, TN, E, 2>(buffer, at, acc); break;
-    case 1: gemm_multiply<TM, TN, E, 1>(buffer, at, acc); break;
+    case 4: gemm_multiply<TM, TN, E, B, 4>(buffer, at, acc); break;
+    case 3: gemm_multiply<TM, TN, E, B, 3>(buffer, at, acc); break;
+    case 2: gemm_multiply<TM, TN, E, B, 2>(buffer, at, acc); break;
+    case 1: gemm_multiply<TM, TN, E, B, 1>(buffer, at, acc); break;
     default: break;
     }
 }
@@ -1087,9 +1188,9 @@ struct gemm_fragment_engine {
     }
 };
 
-template <uint TM, uint TN, typename E, bool PAIRED>
-inline void gemm_step(gemm_buffer<TM, TN, E> buffer, thread gemm_fragment_engine<TM, TN, E, PAIRED> &engine) {
-    gemm_multiply_live<TM, TN, E>(buffer, engine.at, engine.live, engine.acc);
+template <uint TM, uint TN, typename E, typename B, bool PAIRED>
+inline void gemm_step(gemm_buffer<TM, TN, E, B> buffer, thread gemm_fragment_engine<TM, TN, E, PAIRED> &engine) {
+    gemm_multiply_live<TM, TN, E, B>(buffer, engine.at, engine.live, engine.acc);
 }
 
 #if SEISMIC_HAS_TENSOR_OPS
@@ -1100,7 +1201,7 @@ inline void gemm_step(gemm_buffer<TM, TN, E> buffer, thread gemm_fragment_engine
 // both destinations share one layout and element i of each is the same
 // (row, feature). Live rows are not distinguished: padding rows multiply
 // their staged zeros. Cooperative tensors live in the caller's frame.
-template <uint TM, uint TN, typename E, bool PAIRED>
+template <uint TM, uint TN, typename E, typename B, bool PAIRED>
 struct gemm_tensor {
     typedef gemm_tile<TM, TN> tile;
     static constant constexpr uint columns = PAIRED ? TN / 2u : TN;
@@ -1108,7 +1209,7 @@ struct gemm_tensor {
     typedef metal::extents<int32_t, gemm_k, TM> a_extents;
     typedef metal::extents<int32_t, gemm_k, columns> b_extents;
     typedef metal::tensor<threadgroup E, a_extents, metal::tensor_inline> a_tensor;
-    typedef metal::tensor<threadgroup half, b_extents, metal::tensor_inline> b_tensor;
+    typedef metal::tensor<threadgroup B, b_extents, metal::tensor_inline> b_tensor;
     typedef mpp::tensor_ops::matmul2d<
         mpp::tensor_ops::matmul2d_descriptor(TM, columns, gemm_k, false, true, false,
             mpp::tensor_ops::matmul2d_descriptor::mode::multiply_accumulate),
@@ -1126,11 +1227,11 @@ struct gemm_tensor {
     }
 
     // B rows from `row` (0 or 1) at the tile's B row pitch.
-    static b_tensor weights(gemm_buffer<TM, TN, E> buffer, uint row) {
+    static b_tensor weights(gemm_buffer<TM, TN, E, B> buffer, uint row) {
         return b_tensor(buffer.b + row * gemm_lda, b_extents(), metal::array<int32_t, 2>{1, pitch});
     }
 
-    static a_tensor activations(gemm_buffer<TM, TN, E> buffer) {
+    static a_tensor activations(gemm_buffer<TM, TN, E, B> buffer) {
         return a_tensor(buffer.a, a_extents(), metal::array<int32_t, 2>{1, int32_t(gemm_lda)});
     }
 
@@ -1147,18 +1248,18 @@ struct gemm_tensor {
 };
 
 // A plain tile's step (one destination), and a paired tile's (one per stream).
-template <uint TM, uint TN, typename E, typename D>
-inline void gemm_step(gemm_buffer<TM, TN, E> buffer, thread D &acc) {
-    typedef gemm_tensor<TM, TN, E, false> T;
+template <uint TM, uint TN, typename E, typename B, typename D>
+inline void gemm_step(gemm_buffer<TM, TN, E, B> buffer, thread D &acc) {
+    typedef gemm_tensor<TM, TN, E, B, false> T;
     typename T::operation op;
     auto a = T::activations(buffer);
     auto b = T::weights(buffer, 0);
     op.run(a, b, acc);
 }
 
-template <uint TM, uint TN, typename E, typename D>
-inline void gemm_step(gemm_buffer<TM, TN, E> buffer, thread D &gate, thread D &up) {
-    typedef gemm_tensor<TM, TN, E, true> T;
+template <uint TM, uint TN, typename E, typename B, typename D>
+inline void gemm_step(gemm_buffer<TM, TN, E, B> buffer, thread D &gate, thread D &up) {
+    typedef gemm_tensor<TM, TN, E, B, true> T;
     typename T::operation op;
     auto a = T::activations(buffer);
     auto g = T::weights(buffer, 0);
@@ -1179,11 +1280,12 @@ inline void gemm_accumulate(thread const In &in, thread const Weights<W> &w,
     thread Acc &... acc) {
     typedef gemm_tile<TM, TN> tile;
     typedef typename In::activation::native E;
+    typedef typename gemm_b_element<E, W, U, PAIRED>::type B;
     constexpr uint count = PAIRED ? TN / 2u : TN;
     constexpr uint spacing = PAIRED ? 2u : 1u;
     constexpr uint items = (count * gemm_step_halves + tile::threads - 1) / tile::threads;
     uint thread_index = sg * 32u + lane;
-    gemm_buffer<TM, TN, E> buffer = gemm_buffer<TM, TN, E>::at(shared);
+    gemm_buffer<TM, TN, E, B> buffer = gemm_buffer<TM, TN, E, B>::at(shared);
     if (step_begin >= step_end)
         return;
     gemm_a_registers<tile::a_items> a_regs;
@@ -1228,8 +1330,9 @@ inline void gemm_run(thread const In &in, thread const Weights<W> &w, thread con
     uint first, uint rows, uint m0, uint m_rows, uint k, uint step_begin, uint step_end, uint live_rows,
     threadgroup uchar *shared, uint sg, uint lane, thread const F &emit) {
     typedef typename In::activation::native E;
+    typedef typename gemm_b_element<E, W, U, PAIRED>::type B;
 #if SEISMIC_HAS_TENSOR_OPS
-    typedef gemm_tensor<TM, TN, E, PAIRED> T;
+    typedef gemm_tensor<TM, TN, E, B, PAIRED> T;
     typename T::destination acc = T::zero();
     if constexpr (PAIRED) {
         typename T::destination acc2 = T::zero();

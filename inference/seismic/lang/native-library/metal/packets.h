@@ -832,13 +832,21 @@ struct Grid {
             // binary, scaled and moved by the delta in their conversion.
             moved_points<DELTA_EXPONENT>(entry, DELTA ? half(delta(entry)) : 0.0h, even, odd);
         } else {
-            // The signed values + 128 as bytes, four at a time.
+            // Unpack unsigned magnitudes directly into half2 pairs and apply
+            // sign bits via bit-15 XOR (matching `pair`), avoiding two
+            // constant-memory `sign_bytes` table lookups per step.
             uint s = signs(entry);
             uint2 point = points::point(entry);
-            float4 low = byte_floats(signed_bytes(point.x, s & 15u), 1152.0h);
-            float4 high = byte_floats(signed_bytes(point.y, s >> 4), 1152.0h);
-            even = float4(low.x, low.z, high.x, high.z);
-            odd = float4(low.y, low.w, high.y, high.w);
+            const uint e0 = as_type<uint>(as_type<half2>((point.x & 0x00ff00ffu) | 0x64006400u) - half2(1024.0h))
+                ^ (((s & 1u) << 15) | ((s & 4u) << 29));
+            const uint o0 = as_type<uint>(as_type<half2>(((point.x >> 8) & 0x00ff00ffu) | 0x64006400u) - half2(1024.0h))
+                ^ (((s & 2u) << 14) | ((s & 8u) << 28));
+            const uint e1 = as_type<uint>(as_type<half2>((point.y & 0x00ff00ffu) | 0x64006400u) - half2(1024.0h))
+                ^ (((s & 16u) << 11) | ((s & 64u) << 25));
+            const uint o1 = as_type<uint>(as_type<half2>(((point.y >> 8) & 0x00ff00ffu) | 0x64006400u) - half2(1024.0h))
+                ^ (((s & 32u) << 10) | ((s & 128u) << 24));
+            even = float4(float2(as_type<half2>(e0)), float2(as_type<half2>(e1)));
+            odd = float4(float2(as_type<half2>(o0)), float2(as_type<half2>(o1)));
         }
     }
     // Lanes 2j and 2j + 1 of the same.

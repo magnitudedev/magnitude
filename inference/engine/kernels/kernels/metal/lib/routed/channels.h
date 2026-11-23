@@ -309,12 +309,13 @@ inline void project_channels_slice(thread const In &in, thread const projection:
 // stays staged.
 constexpr constant uint GATHERED_SUMMED_SIMDGROUPS = 4u;
 
-template <uint LANES>
+template <uint LANES, bool ONE = false>
 struct GatheredSummedShared {
     static constexpr uint stage_pkts() { return LANES >= 8u ? LANES : 8u; }
-    uint4 staged[SEISMIC_CONST_VERIFY_ROWS * 4u * stage_pkts()];
-    uint products[SEISMIC_CONST_VERIFY_ROWS];
-    ulong offsets[SEISMIC_CONST_VERIFY_ROWS];
+    static constexpr uint stage_rows() { return ONE ? 1u : 4u; }
+    uint4 staged[stage_rows() * 4u * stage_pkts()];
+    uint products[ONE ? 1u : SEISMIC_CONST_VERIFY_ROWS];
+    ulong offsets[ONE ? 1u : SEISMIC_CONST_VERIFY_ROWS];
 };
 
 // Batched decode down projection of `m_rows` (<= MAXM) rows against one weight
@@ -385,13 +386,14 @@ inline void project_channels_published(thread const In &raw, thread const projec
 // project every choice of it in one weight pass over this simdgroup's channel
 // slice `[first, first + TILE)`, publishing each choice's slot directly into
 // `published`.
-template <typename W, uint ROWS, uint LANES, uint SLOTS, uint COLUMNS, uint H, bool NVFP4, typename Published>
+template <typename W, uint ROWS, uint LANES, uint SLOTS, uint COLUMNS, uint H, bool NVFP4, bool ONE = false,
+    typename Published>
 inline void project_gathered_expert(device const uchar *product, ulong p0, ulong p1, ulong p2,
     device const WorkEntry &entry, device const ulong *expert_down, device const ulong *tier_down,
-    packets::Rows16 layout, uint first, uint tid, uint lane, threadgroup GatheredSummedShared<LANES> &tg,
+    packets::Rows16 layout, uint first, uint tid, uint lane, threadgroup GatheredSummedShared<LANES, ONE> &tg,
     Published published) {
     constexpr uint TILE = (32u / LANES) * ROWS;
-    const uint m_rows = entry.count;
+    const uint m_rows = ONE ? 1u : entry.count;
     const slab::Source source{entry.source};
     if (tid < m_rows) {
         const uint packed = entry.packed[tid];
@@ -409,11 +411,22 @@ inline void project_gathered_expert(device const uchar *product, ulong p0, ulong
         return;
     }
     const bool aligned = p2 == 1ul && (p0 & 7ul) == 0ul && (p1 & 7ul) == 0ul;
-    const GatheredProduct in{product, tg.offsets, p2, COLUMNS, aligned};
     const auto down = expert_matrix<W>(Experts{expert_down, tier_down}, source, layout, COLUMNS);
-    PROJECTION_FOR_ROWS(m_rows,
-        (project_channels_published<W, ROWS, LANES, MAXM, COLUMNS, H, NVFP4>(
-            in, down, m_rows, tg.products, first, H, COLUMNS, tg.staged, published, tid, lane)));
+    if constexpr (ONE) {
+        const GatheredProduct in{product, tg.offsets, p2, COLUMNS, aligned};
+        project_channels_published<W, ROWS, LANES, 1u, COLUMNS, H, NVFP4>(
+            in, down, 1u, tg.products, first, H, COLUMNS, tg.staged, published, tid, lane);
+    } else {
+        for (uint base = 0u; base < m_rows; base += 4u) {
+            const uint chunk = min(4u, m_rows - base);
+            if (base > 0u)
+                threadgroup_barrier(mem_flags::mem_threadgroup);
+            const GatheredProduct in{product, tg.offsets + base, p2, COLUMNS, aligned};
+            PROJECTION_FOR_ROWS_24(chunk,
+                (project_channels_published<W, ROWS, LANES, MAXM, COLUMNS, H, NVFP4>(
+                    in, down, chunk, tg.products + base, first, H, COLUMNS, tg.staged, published, tid, lane)));
+        }
+    }
 }
 
 } // namespace routed

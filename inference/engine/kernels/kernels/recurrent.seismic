@@ -519,16 +519,30 @@ fn gated_delta_step_convolved[M, B, S, NK, NV, W, T](
         previous_bank, previous_tape, following_bank, delta, tape, norm_epsilon, epsilon, grouped,
         gate_function)
 
-# Metal: `gated_delta_step`'s launch and arithmetic, whose prologue loads the
-# convolved channels: a simdgroup L2-normalizes a q or k row with one
-# simd_sum, and the value channels are loaded as they are.
+# Metal: for M < 3, `gated_delta_step`'s launch and arithmetic, whose prologue
+# loads the convolved channels (a simdgroup L2-normalizes a q or k row with one
+# simd_sum, and the value channels are loaded as they are). For M >= 3, a
+# staging launch (`prepare`) L2-normalizes q and k once per (row, key_head) and
+# computes beta and decay once per (row, value_head) into L2-resident scratch,
+# so `prepared` drops the 16 KiB q/k threadgroup blocks and redundant prologues
+# while keeping bit-identical arithmetic (`alike`).
 native gated_delta_step_convolved for metal from "metal/gated_delta_step_convolved.metal":
     static (NK, NV, W)
     params (ROWS in [32, 16, 64] default 32)
     where W % 32 == 0 and W <= 256 and ROWS <= W and W % ROWS == 0
     scratch mixed bytes (M * NV * W * 4)
     scratch arrivals bytes (NV * 4) sync
-    launch gated_delta_step_convolved:
+    scratch qk_norm bytes (M * 2 * NK * W * 4) when M >= 3
+    scratch gates bytes (M * NV * 2 * 4) when M >= 3
+    launch gated_delta_step_convolved when M < 3:
+        threadgroups (NV, W / ROWS, B)
+        threads_per_threadgroup (128, 1, 1)
+    launch gated_delta_step_convolved_prepare when M >= 3:
+        staging
+        threadgroups (M, ceil_div(2 * NK, 4), 1)
+        threads_per_threadgroup (128, 1, 1)
+    launch gated_delta_step_convolved_prepared when M >= 3:
+        alike (gated_delta_step_convolved)
         threadgroups (NV, W / ROWS, B)
         threads_per_threadgroup (128, 1, 1)
 

@@ -560,6 +560,62 @@ struct packing_shared {
     static constant constexpr uint centre = ab > cd ? ab : cd;
 };
 
+// All distinct `(folds, residue, sums)` packing classes present among the
+// segments A .. D of RA .. RD weight rows (in canonical order: one, two,
+// summed, bytes). Each present class gets a contiguous operand slot in
+// `0 .. count - 1`, its own maximum `centre`, and its own `mask` of served
+// segments so every `N % 32 == 0` packable segment of a segmented projection
+// runs `gemm_packed_segment` with no `unpacked` fallback.
+template <uint WIDTH, typename A, uint RA, typename B = A, uint RB = 0, typename C = A, uint RC = 0,
+    typename D = A, uint RD = 0>
+struct packing_classes {
+    static_assert(WIDTH == 1 || WIDTH == 2, "an operand's residue is one or two bits");
+    template <uint FOLDS, uint RESIDUE, bool SUMS>
+    struct info {
+        static constant constexpr bool s0 = RA != 0 && packing_serves<A, FOLDS, RESIDUE, SUMS>::value;
+        static constant constexpr bool s1 = RB != 0 && packing_serves<B, FOLDS, RESIDUE, SUMS>::value;
+        static constant constexpr bool s2 = RC != 0 && packing_serves<C, FOLDS, RESIDUE, SUMS>::value;
+        static constant constexpr bool s3 = RD != 0 && packing_serves<D, FOLDS, RESIDUE, SUMS>::value;
+        static constant constexpr bool active = s0 || s1 || s2 || s3;
+        static constant constexpr uint mask = (s0 ? 1u : 0u) | (s1 ? 2u : 0u) | (s2 ? 4u : 0u) | (s3 ? 8u : 0u);
+        static constant constexpr uint c0 = s0 ? packing_codes<A>::centre : 0u;
+        static constant constexpr uint c1 = s1 ? packing_codes<B>::centre : 0u;
+        static constant constexpr uint c2 = s2 ? packing_codes<C>::centre : 0u;
+        static constant constexpr uint c3 = s3 ? packing_codes<D>::centre : 0u;
+        static constant constexpr uint c01 = c0 > c1 ? c0 : c1;
+        static constant constexpr uint c23 = c2 > c3 ? c2 : c3;
+        static constant constexpr uint centre = c01 > c23 ? c01 : c23;
+        static constant constexpr uint folds = FOLDS;
+        static constant constexpr uint residue = RESIDUE;
+        static constant constexpr bool sums = SUMS;
+    };
+    typedef info<1, 0, false> c_one;
+    typedef info<2, 0, false> c_two;
+    typedef info<2, 0, true> c_summed;
+    typedef info<1, WIDTH, false> c_bytes;
+    static constant constexpr uint slot_one = 0u;
+    static constant constexpr uint slot_two = c_one::active ? 1u : 0u;
+    static constant constexpr uint slot_summed = slot_two + (c_two::active ? 1u : 0u);
+    static constant constexpr uint slot_bytes = slot_summed + (c_summed::active ? 1u : 0u);
+    static constant constexpr uint count = slot_bytes + (c_bytes::active ? 1u : 0u);
+    // Matches `most(W, form(W, PACK_SUMS))` in `dense.seismic`.
+    static constant constexpr bool any_sums =
+        (packing_codes<A>::available && packing_codes<A>::sums)
+        || (packing_codes<B>::available && packing_codes<B>::sums)
+        || (packing_codes<C>::available && packing_codes<C>::sums)
+        || (packing_codes<D>::available && packing_codes<D>::sums);
+    template <typename W>
+    struct of {
+        static constant constexpr bool served = packing_codes<W>::available;
+        static constant constexpr uint slot =
+            packing_serves<W, 1, 0, false>::value ? slot_one :
+            packing_serves<W, 2, 0, false>::value ? slot_two :
+            packing_serves<W, 2, 0, true>::value ? slot_summed : slot_bytes;
+        static constant constexpr uint residue =
+            (served && packing_codes<W>::residue != 0) ? WIDTH : 0u;
+    };
+};
+
 // A token's norms of a run from its eight columns of a chunk, joined over
 // the run's lanes (four neighbouring lanes hold a block, two a run of 16):
 // the sum of the magnitudes, the largest, and the sum of the squares.

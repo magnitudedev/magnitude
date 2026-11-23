@@ -7,7 +7,8 @@
 // Every row of a choice with no record is zero.
 
 #define KERNEL_A SEISMIC_ELEMENT_A
-#if defined(SEISMIC_FORMING_ROUTED_GATE_UP_RESIDENT) || defined(SEISMIC_FORMING_ROUTED_GATE_UP_GATHERED_RESIDENT)
+#if defined(SEISMIC_FORMING_ROUTED_GATE_UP_RESIDENT) || defined(SEISMIC_FORMING_ROUTED_GATE_UP_GATHERED_ONE_RESIDENT) \
+    || defined(SEISMIC_FORMING_ROUTED_GATE_UP_GATHERED_RESIDENT)
 // A resident layer's: nothing lands in its records while it runs, so plain
 // loads read them.
 #define PACKETS_CONFIG_PLAIN_RECORDS
@@ -65,9 +66,27 @@ kernel void routed_gate_up_gather(
     device const int *sources [[buffer(SEISMIC_BUFFER_SOURCES)]],
     device routed::Worklist *worklist [[buffer(SEISMIC_BUFFER_SCRATCH_WORKLIST)]],
     device int *gather_grid [[buffer(SEISMIC_BUFFER_SCRATCH_GATHER_GRID)]],
+    device int *gather_one_grid [[buffer(SEISMIC_BUFFER_SCRATCH_GATHER_ONE_GRID)]],
     constant ulong *seismic_words [[buffer(SEISMIC_BUFFER_WORDS)]],
     uint lane [[thread_index_in_simdgroup]]) {
     ROUTED_GATE_UP_GATHER_BODY
+}
+#endif
+#ifdef SEISMIC_FORMING_ROUTED_GATE_UP_GATHERED_ONE
+template <uint ROWS, uint LANES>
+kernel void routed_gate_up_gathered_one(
+    ROUTED_GATE_UP_PORTS,
+    device const routed::Worklist *worklist [[buffer(SEISMIC_BUFFER_SCRATCH_WORKLIST)]]) {
+    ROUTED_GATE_UP_GATHERED_ONE_BODY
+}
+#endif
+#ifdef SEISMIC_FORMING_ROUTED_GATE_UP_GATHERED_ONE_RESIDENT
+// A resident layer's (XS 0), its records read with plain loads.
+template <uint ROWS, uint LANES>
+kernel void routed_gate_up_gathered_one_resident(
+    ROUTED_GATE_UP_PORTS,
+    device const routed::Worklist *worklist [[buffer(SEISMIC_BUFFER_SCRATCH_WORKLIST)]]) {
+    ROUTED_GATE_UP_GATHERED_ONE_BODY
 }
 #endif
 #ifdef SEISMIC_FORMING_ROUTED_GATE_UP_GATHERED

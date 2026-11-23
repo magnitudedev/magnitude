@@ -1,7 +1,7 @@
 //! The cost model's interface: launch prices as main priced them call by
 //! call, in each form, and the step model's two evaluations agreeing.
 
-use crate::bank::routed_prompt_seconds;
+use crate::bank::{routed_padded_choices, routed_prompt_seconds};
 use crate::compute::launch_terms;
 use crate::*;
 use seismic_measure::pricing::{self, Bytes, Experts, Figures, Flops, Format, HistoryFigure, HistoryLadder, HistoryRead, Layout, PriceError, Pricing, Rates, Storage, Work};
@@ -169,7 +169,10 @@ fn a_prompts_routed_seconds_are_main_per_layer_sum() {
             experts
                 .iter()
                 .enumerate()
-                .map(|(layer, &experts)| 2. * pass.seconds(layer, pricing::expert_union(experts, 8, rows) / 2., (rows * 8) as f64 / 2.))
+                .map(|(layer, &experts)| {
+                    let active = pricing::expert_union(experts, 8, rows) / 2.;
+                    2. * pass.seconds(layer, active, routed_padded_choices(active, (rows * 8) as f64 / 2.))
+                })
                 .sum::<f64>()
                 + reads(rows)
         };

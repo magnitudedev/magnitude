@@ -126,7 +126,7 @@ constant constexpr uint TALL_TILES = (uint(SEISMIC_DIM_T) + 63u) / 64u;
 // with each run's code sums where `sums`.
 #define EXPERTS_UP_OPERAND_ROWS ((ulong(SEISMIC_DIM_B) * SEISMIC_DIM_T + 63u) / 64u * 64u)
 #define EXPERTS_UP_TABLE(block, weights, weight, bytes)                                                         \
-    routed::weight_table(tables, uint(SEISMIC_DIM_B), routed::ordinals(tables)[block], weights, weight, bytes)
+    routed::weight_table(tables, uint(SEISMIC_DIM_B), routed::block_ordinal(tables, block), weights, weight, bytes)
 #define EXPERTS_UP_INT8(block, weights, weight, n, k)                                                           \
     routed::int8_forms(operand, EXPERTS_UP_OPERAND_ROWS,                                                        \
         EXPERTS_UP_TABLE(block, weights, weight, routed::int8_table_bytes(n, k)), n, k)
@@ -294,7 +294,8 @@ kernel void routed_experts_up_pack_coefficients(EXPERTS_UP_ARGUMENTS, PROJECTION
 #endif
 
 // A threadgroup's four simdgroups take the 32-token tile's four 32 weight
-// rows.
+// rows, or coalesce consecutive 32-row blocks of the same expert into a
+// 64-token (`PACK_TOKENS = 4`) tile over half the weight rows per threadgroup.
 #ifdef SEISMIC_FORMING_ROUTED_EXPERTS_UP_PACKED
 template <uint WEIGHTS_AHEAD>
 kernel void routed_experts_up_packed(EXPERTS_UP_ARGUMENTS, PROJECTION_TILE_ARGUMENTS) {
@@ -304,6 +305,20 @@ kernel void routed_experts_up_packed(EXPERTS_UP_ARGUMENTS, PROJECTION_TILE_ARGUM
     const uint f = uint(SEISMIC_DIM_F), h = uint(SEISMIC_DIM_H);
     EXPERTS_UP_BLOCK(block);
     EXPERTS_UP_EXPANSION;
+    if constexpr (BLOCK_TILES == 1u) {
+        const uint role = routed::block_pair_role(tables, block);
+        if (role != 0u) {
+            const uint first_block = (role == routed::ORDINAL_PAIR_ODD) ? (block - 1u) : block;
+            const uint pair_first_row = first_block * 32u;
+            const uint pair_m_rows = (first_block + 1u) * 32u + EXPERTS_UP_LIVE(first_block + 1u);
+            const uint side = (role == routed::ORDINAL_PAIR_ODD) ? 1u : 0u;
+            const auto out = routed::positioned(EXPERTS_UP_PRODUCTS(first_block), pair_first_row);
+            projection::gemm_packed_tile<packets::W0, 1, 4, WEIGHTS_AHEAD>(
+                out, up, EXPERTS_UP_PACKING(block, 1, 0, f, h, packets::W0),
+                pair_m_rows, pair_first_row, tile.x * 128u + side * 64u + sg * 16u, f, h, lane);
+            return;
+        }
+    }
     const auto out = routed::positioned(EXPERTS_UP_PRODUCTS(block), first_row);
     projection::gemm_packed_tile<packets::W0, 1, 2, WEIGHTS_AHEAD>(
         out, up, EXPERTS_UP_PACKING(block, 1, 0, f, h, packets::W0),
@@ -467,7 +482,8 @@ kernel void routed_experts_up_down_pack_coefficients(EXPERTS_UP_ARGUMENTS, PROJE
 #endif
 
 // A threadgroup's four simdgroups take the 32-token tile's four 32 weight
-// rows.
+// rows, or coalesce consecutive 32-row blocks of the same expert into a
+// 64-token (`PACK_TOKENS = 4`) tile over half the weight rows per threadgroup.
 #ifdef SEISMIC_FORMING_ROUTED_EXPERTS_UP_DOWN_PACKED
 template <uint DOWN_WEIGHTS_AHEAD>
 kernel void routed_experts_up_down_packed(EXPERTS_UP_ARGUMENTS, PROJECTION_TILE_ARGUMENTS) {
@@ -477,6 +493,22 @@ kernel void routed_experts_up_down_packed(EXPERTS_UP_ARGUMENTS, PROJECTION_TILE_
     const uint h = uint(SEISMIC_DIM_H), f = uint(SEISMIC_DIM_F);
     EXPERTS_UP_BLOCK(block);
     EXPERTS_UP_DOWN;
+    if constexpr (BLOCK_TILES == 1u) {
+        const uint role = routed::block_pair_role(tables, block);
+        if (role != 0u) {
+            const uint first_block = (role == routed::ORDINAL_PAIR_ODD) ? (block - 1u) : block;
+            const uint pair_first_row = first_block * 32u;
+            const uint pair_m_rows = (first_block + 1u) * 32u + EXPERTS_UP_LIVE(first_block + 1u);
+            const uint side = (role == routed::ORDINAL_PAIR_ODD) ? 1u : 0u;
+            const routed::BlockOutput<ELEMENT_OF(SEISMIC_RESULT_0)> out{
+                element::Out<ELEMENT_OF(SEISMIC_RESULT_0)>(output_cells),
+                SEISMIC_RESULT_0_STRIDE_0, SEISMIC_RESULT_0_STRIDE_1, SEISMIC_RESULT_0_STRIDE_2, uint(SEISMIC_DIM_T)};
+            projection::gemm_packed_tile<packets::W1, 1, 4, DOWN_WEIGHTS_AHEAD>(
+                out, down, EXPERTS_UP_PACKING(block, 1, 0, h, f, packets::W1),
+                pair_m_rows, pair_first_row, tile.x * 128u + side * 64u + sg * 16u, h, f, lane);
+            return;
+        }
+    }
     const auto out = routed::positioned(EXPERTS_UP_OUTPUT(block), first_row);
     projection::gemm_packed_tile<packets::W1, 1, 2, DOWN_WEIGHTS_AHEAD>(
         out, down, EXPERTS_UP_PACKING(block, 1, 0, h, f, packets::W1),

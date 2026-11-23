@@ -1475,7 +1475,7 @@ fn metal_stream_mix_up_admits_tall_k64_at_rank_320() {
         NW: seismic::Element::f32(),
         A: seismic::Element::bf16(),
     });
-    let specialization = declared::declared(&device, &entry, |name| {
+    let default_spec = declared::declared(&device, &entry, |name| {
         statics[..3]
             .iter()
             .find(|(given, _)| *given == name)
@@ -1483,8 +1483,17 @@ fn metal_stream_mix_up_admits_tall_k64_at_rank_320() {
             .1
     }, &[])
     .unwrap();
+    assert_eq!(default_spec.param("TALL"), Some(0), "dense bf16 stream_mix_up defaults to TALL=0 (direct gemm)");
+    let specialization = declared::declared(&device, &entry, |name| {
+        statics[..3]
+            .iter()
+            .find(|(given, _)| *given == name)
+            .unwrap_or_else(|| panic!("static {name} is given"))
+            .1
+    }, &[("TALL", 1)])
+    .unwrap();
     let tall = crate::common::metal_launch::<stream_mix_up::Entry>("tall");
-    assert_eq!(specialization.param("TALL"), Some(1), "stream_mix_up at LR=320 admits TALL=1");
+    assert_eq!(specialization.param("TALL"), Some(1), "stream_mix_up at LR=320 admits explicit TALL=1");
     assert_eq!(
         specialization.launch_param(tall, "TALL_K"),
         Some(64),

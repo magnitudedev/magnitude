@@ -251,6 +251,182 @@ inline void store_state_rows(element::Out<element::F32> published, ulong stride,
     }
 }
 
+// Pre-normalized q | k channels (`qk_norm`, [M, 2 * NK, W] F32), pre-computed
+// (beta, decay) gates (`prepared_gates`, [M, NV] float2), and convolved v
+// channels (`convolved`, stride `convolved_stride`). Formed once per row by a
+// staging launch so step threadgroups drop q/k/v threadgroup blocks and
+// redundant per-threadgroup prologues.
+struct PreparedConvolved {
+    device const float *qk_norm;
+    device const float2 *prepared_gates;
+    device const float *convolved;
+    ulong convolved_stride;
+};
+
+// Loads a q or k channel's COLUMNS elements for this lane, L2-normalizes the
+// whole W-wide vector with one simd_sum (+ epsilon, scaled by 1/sqrt(W) for q),
+// and writes the scaled elements into `out`. Shared by the staged prologue and
+// the staging `prepare_convolved` launch so both produce identical bits.
+template <uint COLUMNS, typename Row>
+inline void normalize_qk_channel(Row channels, ulong channel0, bool is_key, float epsilon, float query_scale,
+    thread float (&out)[COLUMNS], constant ulong *seismic_words) {
+    float squares = 0.0f;
+    if constexpr (COLUMNS % 4 == 0) {
+        RECURRENT_UNROLL for (uint j = 0; j < COLUMNS; j += 4) {
+            const float4 v = channels.at4(channel0 + j, seismic_words);
+            out[j + 0] = v.x;
+            out[j + 1] = v.y;
+            out[j + 2] = v.z;
+            out[j + 3] = v.w;
+            squares = metal::fma(v.x, v.x, squares);
+            squares = metal::fma(v.y, v.y, squares);
+            squares = metal::fma(v.z, v.z, squares);
+            squares = metal::fma(v.w, v.w, squares);
+        }
+    } else {
+        RECURRENT_UNROLL for (uint j = 0; j < COLUMNS; ++j) {
+            out[j] = channels.at(channel0 + j, seismic_words);
+            squares = metal::fma(out[j], out[j], squares);
+        }
+    }
+    const float inverse = metal::rsqrt(simd_sum(squares) + epsilon) * (is_key ? 1.0f : query_scale);
+    RECURRENT_UNROLL for (uint j = 0; j < COLUMNS; ++j) {
+        out[j] *= inverse;
+    }
+}
+
+// Loads a simdgroup's initial LANE_ROWS x COLUMNS state rows from `delta`,
+// replays any taped updates when starting at `slot.lo`, and publishes if
+// `slot.stop == 0`. Returns the target bank's output view for later publish.
+template <uint LANE_ROWS, uint COLUMNS, uint DECAYS, uint LANE_DECAYS>
+inline element::Out<element::F32> load_initial_state(device const slab::Table<element::F32> *delta,
+    device const slab::Table<element::F32> *tape, Slot slot, long begin, ulong head, ulong key, ulong row0,
+    ulong first_column, ulong tape_decays, thread float (&state)[LANE_ROWS][COLUMNS], constant ulong *seismic_words) {
+    const ulong width = SEISMIC_DIM_W;
+    const long lo = slot.lo;
+    const long publish = lo + slot.stop;
+    const ulong lane_state = head * SEISMIC_DELTA_STRIDE_1 + row0 * SEISMIC_DELTA_STRIDE_2 + first_column;
+    device const float *initial = versions::bank_view(delta, begin == lo ? slot.source : slot.target,
+        SEISMIC_DELTA_STRIDE_0, seismic_words) + lane_state;
+    const element::Out<element::F32> published =
+        versions::bank(delta, slot.target, SEISMIC_DELTA_STRIDE_0, seismic_words).offset(lane_state);
+    load_state_rows(initial, SEISMIC_DELTA_STRIDE_2, state);
+    for (long entry = 0; begin == lo && entry < slot.taped; ++entry) {
+        device const float *row = tape_view(tape, slot.source, entry, seismic_words);
+        float k[COLUMNS];
+        // One decay per value head is loaded once.
+        float factor[LANE_DECAYS];
+        load_contiguous(row + RECURRENT_TAPE_K + key * width + first_column, k);
+        load_contiguous(row + tape_decays, factor);
+        RECURRENT_UNROLL for (uint r = 0; r < LANE_ROWS; ++r) {
+            const float innovation = row[RECURRENT_TAPE_U + head * width + row0 + r];
+            RECURRENT_UNROLL for (uint j = 0; j < COLUMNS; ++j) {
+                state[r][j] *= factor[j % LANE_DECAYS];
+                state[r][j] = metal::fma(innovation, k[j], state[r][j]);
+            }
+        }
+    }
+    if (begin == lo && publish == lo) {
+        store_state_rows(published, SEISMIC_DELTA_STRIDE_2, state);
+    }
+    return published;
+}
+
+// Advances one row of the delta rule on a simdgroup's LANE_ROWS x COLUMNS
+// state rows, records the successor tape when past `publish`, stores the raw
+// output to `mixed`, and publishes the state when reaching `publish`.
+template <uint LANE_ROWS, uint COLUMNS, uint DECAYS, uint LANE_DECAYS, typename Mixed>
+inline void advance_single_row(thread float (&state)[LANE_ROWS][COLUMNS], thread const float (&query)[COLUMNS],
+    thread const float (&key_values)[COLUMNS], thread const float (&values)[LANE_ROWS],
+    thread const float (&factor)[LANE_DECAYS], float beta, device const slab::Table<element::F32> *tape, Mixed mixed,
+    element::Out<element::F32> published, Slot slot, long row, long publish, long recorded, bool records,
+    bool records_keys, ulong head, ulong key, ulong row0, ulong first_column, ulong tape_decays, uint lane,
+    constant ulong *seismic_words) {
+    const ulong width = SEISMIC_DIM_W;
+    float remembered[LANE_ROWS];
+    RECURRENT_UNROLL for (uint r = 0; r < LANE_ROWS; ++r) {
+        remembered[r] = 0.0f;
+        RECURRENT_UNROLL for (uint j = 0; j < COLUMNS; ++j) {
+            state[r][j] *= factor[j % LANE_DECAYS];
+            remembered[r] = metal::fma(state[r][j], key_values[j], remembered[r]);
+        }
+    }
+    // Rows after the stop row are recorded in the successor's tape.
+    const element::Out<element::F32> entry = row >= publish && row - publish < recorded
+        ? tape_row(tape, slot.target, row - publish, seismic_words) : element::Out<element::F32>(nullptr);
+    if (entry.present() && records_keys) {
+        store_contiguous(entry, RECURRENT_TAPE_K + key * width + first_column, key_values);
+    }
+    if (entry.present() && records && (DECAYS != 1 || lane == 0)) {
+        store_contiguous(entry, tape_decays, factor);
+    }
+    float output[LANE_ROWS];
+    RECURRENT_UNROLL for (uint r = 0; r < LANE_ROWS; ++r) {
+        const float residual = (values[r] - simd_sum(remembered[r])) * beta;
+        if (entry.present() && lane == r) {
+            entry.put(RECURRENT_TAPE_U + head * width + row0 + r, residual);
+        }
+        output[r] = 0.0f;
+        RECURRENT_UNROLL for (uint j = 0; j < COLUMNS; ++j) {
+            state[r][j] = metal::fma(residual, key_values[j], state[r][j]);
+            output[r] = metal::fma(state[r][j], query[j], output[r]);
+        }
+        output[r] = simd_sum(output[r]);
+    }
+    if (lane < LANE_ROWS) {
+        float mine = output[0];
+        RECURRENT_UNROLL for (uint r = 1; r < LANE_ROWS; ++r) {
+            mine = lane == r ? output[r] : mine;
+        }
+        mixed[raw_index(ulong(row), head, row0 + lane, seismic_words)] = activation::Act::store(mine);
+    }
+    if (row + 1 == publish) {
+        store_state_rows(published, SEISMIC_DELTA_STRIDE_2, state);
+    }
+}
+
+// Staging pass for `gated_delta_step_convolved` when M >= 3: L2-normalizes q
+// and k once per (row, key_head) into `qk_norm` ([M, 2 * NK, W] F32) and
+// computes (beta, decay) once per (row, value_head) into `prepared_gates`
+// ([M, NV] float2), with `advance_rows`'s exact arithmetic.
+inline void prepare_convolved(Convolved inputs, HeadRule rule, device float *qk_norm, device float2 *prepared_gates,
+    uint3 group, uint thread_index, uint simdgroup, uint lane, constant ulong *seismic_words) {
+    constexpr uint COLUMNS = SEISMIC_DIM_W / 32;
+    const ulong width = SEISMIC_DIM_W;
+    const ulong key_heads = SEISMIC_DIM_NK;
+    const ulong row = group.x;
+    const ulong task = ulong(group.y) * 4 + simdgroup;
+    if (task < 2 * key_heads) {
+        const bool is_key = task >= key_heads;
+        const ulong key = is_key ? task - key_heads : task;
+        const ulong first_column = ulong(lane) * COLUMNS;
+        const float epsilon = as_type<float>(uint(SEISMIC_PARAM_NORM_EPSILON));
+        const float query_scale = metal::rsqrt(float(width));
+        const Convolved::Row channels = inputs.row(long(row), seismic_words);
+        const ulong channel0 = (is_key ? key_heads + key : key) * width + first_column;
+        float scaled[COLUMNS];
+        normalize_qk_channel<COLUMNS>(channels, channel0, is_key, epsilon, query_scale, scaled, seismic_words);
+        device float *destination = qk_norm + (row * 2 * key_heads + task) * width + first_column;
+        if constexpr (COLUMNS % 4 == 0) {
+            RECURRENT_UNROLL for (uint j = 0; j < COLUMNS; j += 4) {
+                *reinterpret_cast<device float4 *>(destination + j) =
+                    float4(scaled[j + 0], scaled[j + 1], scaled[j + 2], scaled[j + 3]);
+            }
+        } else {
+            RECURRENT_UNROLL for (uint j = 0; j < COLUMNS; ++j) {
+                destination[j] = scaled[j];
+            }
+        }
+    }
+    if (group.y == 0) {
+        for (ulong head = thread_index; head < SEISMIC_DIM_NV; head += 128) {
+            float beta;
+            const float decay = metal::exp(rule.gates(head, seismic_words).at(row, 0, beta, seismic_words));
+            prepared_gates[row * SEISMIC_DIM_NV + head] = float2(beta, decay);
+        }
+    }
+}
+
 // The row-sequential delta rule over the slot's rows [begin, hi) with value
 // head `head`'s gates `gates` (`HeadGates`): S <- S diag(d) + beta (v -
 // S diag(d) k) k^T, output S q, the arithmetic of the step entries (a
@@ -285,9 +461,8 @@ inline void advance_rows(Inputs inputs, RowGates gates,
     const ulong width = SEISMIC_DIM_W;
     const ulong key_heads = SEISMIC_DIM_NK;
     const ulong key = key_head(head, seismic_words);
-    const long lo = slot.lo;
     const long hi = slot.hi;
-    const long publish = lo + slot.stop;
+    const long publish = slot.lo + slot.stop;
     const float epsilon = as_type<float>(uint(SEISMIC_PARAM_NORM_EPSILON));
     const float query_scale = metal::rsqrt(float(width));
     const ulong first_column = ulong(lane) * COLUMNS;
@@ -303,32 +478,11 @@ inline void advance_rows(Inputs inputs, RowGates gates,
 
     // This simdgroup's state rows, loaded first so their traffic overlaps the
     // prologue.
-    const ulong lane_state = head * SEISMIC_DELTA_STRIDE_1 + row0 * SEISMIC_DELTA_STRIDE_2 + first_column;
-    device const float *initial = versions::bank_view(delta, begin == lo ? slot.source : slot.target,
-        SEISMIC_DELTA_STRIDE_0, seismic_words) + lane_state;
-    const element::Out<element::F32> published =
-        versions::bank(delta, slot.target, SEISMIC_DELTA_STRIDE_0, seismic_words).offset(lane_state);
     float state[LANE_ROWS][COLUMNS];
-    load_state_rows(initial, SEISMIC_DELTA_STRIDE_2, state);
-    for (long entry = 0; begin == lo && entry < slot.taped; ++entry) {
-        device const float *row = tape_view(tape, slot.source, entry, seismic_words);
-        float k[COLUMNS];
-        // One decay per value head is loaded once.
-        float factor[LANE_DECAYS];
-        load_contiguous(row + RECURRENT_TAPE_K + key * width + first_column, k);
-        load_contiguous(row + tape_decays, factor);
-        RECURRENT_UNROLL for (uint r = 0; r < LANE_ROWS; ++r) {
-            const float innovation = row[RECURRENT_TAPE_U + head * width + row0 + r];
-            RECURRENT_UNROLL for (uint j = 0; j < COLUMNS; ++j) {
-                state[r][j] *= factor[j % LANE_DECAYS];
-                state[r][j] = metal::fma(innovation, k[j], state[r][j]);
-            }
-        }
-    }
-    if (begin == lo && publish == lo) {
-        store_state_rows(published, SEISMIC_DELTA_STRIDE_2, state);
-    }
+    const element::Out<element::F32> published = load_initial_state<LANE_ROWS, COLUMNS, DECAYS, LANE_DECAYS>(
+        delta, tape, slot, begin, head, key, row0, first_column, tape_decays, state, seismic_words);
     const ulong value_channel = (2 * key_heads + head) * width + block_row0;
+    const ulong local_row = row0 - block_row0;
     for (long first = begin; first < hi; first += SPAN) {
         const ulong rows = ulong(metal::min(long(SPAN), hi - first));
         // A simdgroup forms and L2-normalizes a whole q or k row.
@@ -338,38 +492,18 @@ inline void advance_rows(Inputs inputs, RowGates gates,
             const long row = first + long(i);
             const typename Inputs::Row channels = inputs.row(row, seismic_words);
             const ulong channel0 = (is_key ? key_heads + key : key) * width + first_column;
-            float values[COLUMNS];
-            float squares = 0.0f;
-            if constexpr (COLUMNS % 4 == 0) {
-                RECURRENT_UNROLL for (uint j = 0; j < COLUMNS; j += 4) {
-                    const float4 v = channels.at4(channel0 + j, seismic_words);
-                    values[j + 0] = v.x;
-                    values[j + 1] = v.y;
-                    values[j + 2] = v.z;
-                    values[j + 3] = v.w;
-                    squares = metal::fma(v.x, v.x, squares);
-                    squares = metal::fma(v.y, v.y, squares);
-                    squares = metal::fma(v.z, v.z, squares);
-                    squares = metal::fma(v.w, v.w, squares);
-                }
-            } else {
-                RECURRENT_UNROLL for (uint j = 0; j < COLUMNS; ++j) {
-                    values[j] = channels.at(channel0 + j, seismic_words);
-                    squares = metal::fma(values[j], values[j], squares);
-                }
-            }
-            const float inverse = metal::rsqrt(simd_sum(squares) + epsilon)
-                * (is_key ? 1.0f : query_scale);
+            float scaled[COLUMNS];
+            normalize_qk_channel<COLUMNS>(channels, channel0, is_key, epsilon, query_scale, scaled, seismic_words);
             threadgroup float *destination = (is_key ? key_block : query_block) + i * QK_STRIDE
                 + first_column;
             if constexpr (COLUMNS % 4 == 0) {
                 RECURRENT_UNROLL for (uint j = 0; j < COLUMNS; j += 4) {
-                    const float4 scaled = float4(values[j + 0], values[j + 1], values[j + 2], values[j + 3]) * inverse;
-                    *reinterpret_cast<threadgroup packed_float4 *>(destination + j) = packed_float4(scaled);
+                    const float4 v = float4(scaled[j + 0], scaled[j + 1], scaled[j + 2], scaled[j + 3]);
+                    *reinterpret_cast<threadgroup packed_float4 *>(destination + j) = packed_float4(v);
                 }
             } else {
                 RECURRENT_UNROLL for (uint j = 0; j < COLUMNS; ++j) {
-                    destination[j] = values[j] * inverse;
+                    destination[j] = scaled[j];
                 }
             }
         }
@@ -395,56 +529,64 @@ inline void advance_rows(Inputs inputs, RowGates gates,
             float factor[LANE_DECAYS];
             float query[COLUMNS];
             float key_values[COLUMNS];
-            float remembered[LANE_ROWS];
+            float values[LANE_ROWS];
             load_contiguous(decay_block + i * DECAYS + first_decay, factor);
             load_contiguous(query_block + i * QK_STRIDE + first_column, query);
             load_contiguous(key_block + i * QK_STRIDE + first_column, key_values);
             RECURRENT_UNROLL for (uint r = 0; r < LANE_ROWS; ++r) {
-                remembered[r] = 0.0f;
-                RECURRENT_UNROLL for (uint j = 0; j < COLUMNS; ++j) {
-                    state[r][j] *= factor[j % LANE_DECAYS];
-                    remembered[r] = metal::fma(state[r][j], key_values[j], remembered[r]);
-                }
+                values[r] = value_block[i * V_STRIDE + local_row + r];
             }
-            const ulong local_row = row0 - block_row0;
-            // Rows after the stop row are recorded in the successor's tape.
-            const element::Out<element::F32> entry = row >= publish && row - publish < recorded
-                ? tape_row(tape, slot.target, row - publish, seismic_words) : element::Out<element::F32>(nullptr);
-            if (entry.present() && records_keys) {
-                store_contiguous(entry, RECURRENT_TAPE_K + key * width + first_column, key_values);
-            }
-            if (entry.present() && records && (DECAYS != 1 || lane == 0)) {
-                store_contiguous(entry, tape_decays, factor);
-            }
-            float output[LANE_ROWS];
-            RECURRENT_UNROLL for (uint r = 0; r < LANE_ROWS; ++r) {
-                const float residual = (value_block[i * V_STRIDE + local_row + r]
-                    - simd_sum(remembered[r])) * beta;
-                if (entry.present() && lane == r) {
-                    entry.put(RECURRENT_TAPE_U + head * width + row0 + r, residual);
-                }
-                output[r] = 0.0f;
-                RECURRENT_UNROLL for (uint j = 0; j < COLUMNS; ++j) {
-                    state[r][j] = metal::fma(residual, key_values[j], state[r][j]);
-                    output[r] = metal::fma(state[r][j], query[j], output[r]);
-                }
-                output[r] = simd_sum(output[r]);
-            }
-            if (lane < LANE_ROWS) {
-                float mine = output[0];
-                RECURRENT_UNROLL for (uint r = 1; r < LANE_ROWS; ++r) {
-                    mine = lane == r ? output[r] : mine;
-                }
-                mixed[raw_index(ulong(row), head, row0 + lane, seismic_words)] = activation::Act::store(mine);
-            }
-            if (row + 1 == publish) {
-                store_state_rows(published, SEISMIC_DELTA_STRIDE_2, state);
-            }
+            advance_single_row<LANE_ROWS, COLUMNS, DECAYS, LANE_DECAYS>(state, query, key_values, values, factor,
+                beta, tape, mixed, published, slot, row, publish, recorded, records, records_keys, head, key, row0,
+                first_column, tape_decays, lane, seismic_words);
         }
         // The next span restages the threadgroup rows.
         if (first + long(SPAN) < hi) {
             threadgroup_barrier(mem_flags::mem_threadgroup);
         }
+    }
+}
+
+// Row-sequential delta rule over pre-normalized q/k and pre-computed (beta,
+// decay) gates (`prepare_convolved`): reads q, k, v, beta, and decay directly
+// from L2-resident scratch/convolved with zero threadgroup staging memory and
+// zero barriers inside the row loop.
+template <uint LANE_ROWS, typename Mixed>
+inline void advance_rows_prepared(PreparedConvolved prepared,
+    device const slab::Table<element::F32> *delta, device const slab::Table<element::F32> *tape, Mixed mixed,
+    Slot slot, long begin, ulong head, ulong row0, uint lane, constant ulong *seismic_words) {
+    constexpr uint COLUMNS = SEISMIC_DIM_W / 32;
+    constexpr uint DECAYS = HeadGates::DECAYS;
+    constexpr uint LANE_DECAYS = 1;
+    const ulong width = SEISMIC_DIM_W;
+    const ulong key_heads = SEISMIC_DIM_NK;
+    const ulong key = key_head(head, seismic_words);
+    const long hi = slot.hi;
+    const long publish = slot.lo + slot.stop;
+    const ulong first_column = ulong(lane) * COLUMNS;
+    const ulong tape_decays = tape_decay<DECAYS>(head, first_column, seismic_words);
+    const long recorded = versions::tape_rows(slot, long(SEISMIC_DIM_T));
+    const bool records = row0 == 0;
+    const bool records_keys = records && records_key(head, seismic_words);
+
+    float state[LANE_ROWS][COLUMNS];
+    const element::Out<element::F32> published = load_initial_state<LANE_ROWS, COLUMNS, DECAYS, LANE_DECAYS>(
+        delta, tape, slot, begin, head, key, row0, first_column, tape_decays, state, seismic_words);
+    const ulong value_row_channel = (2 * key_heads + head) * width + row0;
+    const ulong qk_row_stride = 2 * key_heads * width;
+    for (long row = begin; row < hi; ++row) {
+        const float2 bd = prepared.prepared_gates[ulong(row) * SEISMIC_DIM_NV + head];
+        const float factor[1] = {bd.y};
+        device const float *qk_row = prepared.qk_norm + ulong(row) * qk_row_stride;
+        float query[COLUMNS];
+        float key_values[COLUMNS];
+        float values[LANE_ROWS];
+        load_contiguous(qk_row + key * width + first_column, query);
+        load_contiguous(qk_row + (key_heads + key) * width + first_column, key_values);
+        load_contiguous(prepared.convolved + ulong(row) * prepared.convolved_stride + value_row_channel, values);
+        advance_single_row<LANE_ROWS, COLUMNS, DECAYS, LANE_DECAYS>(state, query, key_values, values, factor, bd.x,
+            tape, mixed, published, slot, row, publish, recorded, records, records_keys, head, key, row0,
+            first_column, tape_decays, lane, seismic_words);
     }
 }
 
@@ -651,6 +793,27 @@ inline void step(Inputs inputs, Rule rule, GateInput gate, device const uchar *n
         advance_rows<LANE_ROWS, SEISMIC_TUNE_ROWS, SPAN, SEISMIC_DIM_W, SEISMIC_TUNE_ROWS>(inputs,
             rule.gates(head, seismic_words), delta, tape, mixed, slot, slot.lo, head, block_row0, row0, query_block,
             key_block, value_block, beta_block, decay_block, thread_index, threads, simdgroup, lane, seismic_words);
+    }
+    const uint expected = uint(SEISMIC_DIM_W / SEISMIC_TUNE_ROWS * SEISMIC_DIM_B);
+    if (!arrive::last(arrivals + head, expected, last, thread_index))
+        return;
+    gate_head(mixed, covered, gate, norm, gated, head, thread_index, threads, seismic_words);
+}
+
+// A step entry's threadgroup over pre-normalized q/k and pre-computed gates
+// (`prepare_convolved`): advances with `advance_rows_prepared` (no q/k/v/gate
+// threadgroup staging) and gates on arrival identically to `step`.
+template <uint LANE_ROWS>
+inline void step_prepared(PreparedConvolved prepared, GateInput gate, device const uchar *norm,
+    element::Out<activation::Act> gated, arrive::coherent_device<Storage> mixed, device atomic_uint *arrivals,
+    device const slab::Table<element::F32> *delta, device const slab::Table<element::F32> *tape, Slot slot,
+    long covered, uint3 group, threadgroup uint *last, uint thread_index, uint threads, uint simdgroup, uint lane,
+    constant ulong *seismic_words) {
+    const ulong head = group.x;
+    const ulong row0 = ulong(group.y) * SEISMIC_TUNE_ROWS + ulong(simdgroup) * LANE_ROWS;
+    if (slot.lo < slot.hi) {
+        advance_rows_prepared<LANE_ROWS>(prepared, delta, tape, mixed, slot, slot.lo, head, row0, lane,
+            seismic_words);
     }
     const uint expected = uint(SEISMIC_DIM_W / SEISMIC_TUNE_ROWS * SEISMIC_DIM_B);
     if (!arrive::last(arrivals + head, expected, last, thread_index))

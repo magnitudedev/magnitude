@@ -5,7 +5,8 @@
 // channels of every row.
 
 #define KERNEL_A SEISMIC_ELEMENT_A
-#if defined(SEISMIC_FORMING_ROUTED_OUTPUT_RESIDENT) || defined(SEISMIC_FORMING_ROUTED_OUTPUT_GATHERED_RESIDENT)
+#if defined(SEISMIC_FORMING_ROUTED_OUTPUT_RESIDENT) || defined(SEISMIC_FORMING_ROUTED_OUTPUT_GATHERED_ONE_RESIDENT) \
+    || defined(SEISMIC_FORMING_ROUTED_OUTPUT_GATHERED_RESIDENT)
 // A resident layer's: nothing lands in its records while it runs, so plain
 // loads read them.
 #define PACKETS_CONFIG_PLAIN_RECORDS
@@ -76,17 +77,17 @@
 // shared expert at `u == worklist->count`); the last of the tile's
 // `worklist->count + 1` threadgroups to arrive joins the tile's channels of
 // every row, four contiguous channels per thread with a scalar tail.
-#define ROUTED_OUTPUT_GATHERED_BODY                                                                              \
+#define ROUTED_OUTPUT_GATHERED_BODY(ONE)                                                                         \
     constexpr uint TILE = routed::output_tile<ROWS, LANES>();                                                    \
     constexpr uint SLOTS = uint(SEISMIC_DIM_K) + 1;                                                              \
     constexpr uint SG_COUNT = routed::GATHERED_SUMMED_SIMDGROUPS;                                                \
     constexpr uint GROUP_TILE = SG_COUNT * TILE;                                                                 \
     constexpr uint H = uint(SEISMIC_DIM_H);                                                                      \
-    threadgroup routed::GatheredSummedShared<LANES> tg;                                                          \
+    threadgroup routed::GatheredSummedShared<LANES, ONE> tg;                                                     \
     threadgroup uint last;                                                                                       \
     const uint first = group.x * GROUP_TILE;                                                                     \
     const element::Out<ELEMENT_OF(SEISMIC_RESULT_0)> value(value_cells);                                         \
-    routed::output_project_gathered<ROWS, LANES>(expert_product, shared_product, worklist, expert_down,          \
+    routed::output_project_gathered<ROWS, LANES, ONE>(expert_product, shared_product, worklist, expert_down,     \
         tier_down, shared_down, uint(SEISMIC_DIM_M), group.y, first, tid, sg, lane, tg, published,               \
         seismic_words);                                                                                          \
     if (!arrive::last(arrivals + group.x, worklist->count + 1u, &last, tid))                                     \
@@ -146,26 +147,40 @@ kernel void routed_output_gather(
     device const int *sources [[buffer(SEISMIC_BUFFER_SOURCES)]],
     device routed::Worklist *worklist [[buffer(SEISMIC_BUFFER_SCRATCH_WORKLIST)]],
     device int *gather_grid [[buffer(SEISMIC_BUFFER_SCRATCH_GATHER_GRID)]],
+    device int *gather_one_grid [[buffer(SEISMIC_BUFFER_SCRATCH_GATHER_ONE_GRID)]],
     constant ulong *seismic_words [[buffer(SEISMIC_BUFFER_WORDS)]],
     uint lane [[thread_index_in_simdgroup]]) {
-    threadgroup int cache[2u * routed::WORKLIST_CACHE];
+    threadgroup int cache[routed::WORKLIST_CACHE_WORDS];
     constexpr uint GROUP_TILE = routed::GATHERED_SUMMED_SIMDGROUPS * routed::output_tile<ROWS, LANES>();
     const uint x_groups = (uint(SEISMIC_DIM_H) + GROUP_TILE - 1u) / GROUP_TILE;
     routed::build_worklist(routes, SEISMIC_ROUTES_STRIDE_0, SEISMIC_ROUTES_STRIDE_1, sources, ROUTED_SOURCE_ROWS,
         SEISMIC_SOURCES_STRIDE_1, SEISMIC_SOURCES_STRIDE_2, uint(SEISMIC_DIM_M), uint(SEISMIC_DIM_K), x_groups, 1u,
-        worklist, gather_grid, cache, lane);
+        worklist, gather_grid, gather_one_grid, cache, lane);
+}
+#endif
+#ifdef SEISMIC_FORMING_ROUTED_OUTPUT_GATHERED_ONE
+template <uint ROWS, uint LANES>
+kernel void routed_output_gathered_one(ROUTED_OUTPUT_GATHERED_PORTS) {
+    ROUTED_OUTPUT_GATHERED_BODY(true)
+}
+#endif
+#ifdef SEISMIC_FORMING_ROUTED_OUTPUT_GATHERED_ONE_RESIDENT
+// A resident layer's (XS 0), its records read with plain loads.
+template <uint ROWS, uint LANES>
+kernel void routed_output_gathered_one_resident(ROUTED_OUTPUT_GATHERED_PORTS) {
+    ROUTED_OUTPUT_GATHERED_BODY(true)
 }
 #endif
 #ifdef SEISMIC_FORMING_ROUTED_OUTPUT_GATHERED
 template <uint ROWS, uint LANES>
 kernel void routed_output_gathered(ROUTED_OUTPUT_GATHERED_PORTS) {
-    ROUTED_OUTPUT_GATHERED_BODY
+    ROUTED_OUTPUT_GATHERED_BODY(false)
 }
 #endif
 #ifdef SEISMIC_FORMING_ROUTED_OUTPUT_GATHERED_RESIDENT
 // A resident layer's (XS 0), its records read with plain loads.
 template <uint ROWS, uint LANES>
 kernel void routed_output_gathered_resident(ROUTED_OUTPUT_GATHERED_PORTS) {
-    ROUTED_OUTPUT_GATHERED_BODY
+    ROUTED_OUTPUT_GATHERED_BODY(false)
 }
 #endif

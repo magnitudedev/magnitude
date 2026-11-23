@@ -375,19 +375,21 @@ inline void gemv(thread const In &in, thread const Out &out, thread const Weight
     gemv_body<W, W, false, R, MAXM, LANES>(in, out, w, w, m_rows, rows, k, tile, shared, SG, sg, lane);
 }
 
-template <typename W, uint R, uint MAXM, uint LANES = 32, bool F32 = false, typename In, typename Out>
+template <typename W, uint R, uint MAXM, uint LANES = 32, bool F32 = false,
+    uint STAGE_ROWS = gemv_stage_packet_rows, typename In, typename Out>
 inline void gemv_runtime(thread const In &in, thread const Out &out, thread const Weights<W> &w,
     uint m_rows, uint rows, uint k, uint tile, threadgroup uchar *shared,
     uint simdgroups, uint sg, uint lane, uint first_packet = 0) {
-    gemv_body<W, W, false, R, MAXM, LANES, false, F32>(in, out, w, w, m_rows, rows, k, tile, shared,
+    gemv_body<W, W, false, R, MAXM, LANES, false, F32, STAGE_ROWS>(in, out, w, w, m_rows, rows, k, tile, shared,
         simdgroups, sg, lane, first_packet);
 }
 
-template <typename G, typename U, uint R, uint MAXM, uint LANES = 32, typename In, typename Out>
+template <typename G, typename U, uint R, uint MAXM, uint LANES = 32,
+    uint STAGE_ROWS = gemv_stage_packet_rows, typename In, typename Out>
 inline void gemv_paired_runtime(thread const In &in, thread const Out &out, thread const Weights<G> &gate,
     thread const Weights<U> &up, uint m_rows, uint rows, uint k, uint tile,
     threadgroup uchar *shared, uint simdgroups, uint sg, uint lane) {
-    gemv_body<G, U, true, R, MAXM, LANES>(in, out, gate, up, m_rows, rows, k, tile, shared,
+    gemv_body<G, U, true, R, MAXM, LANES, false, false, STAGE_ROWS>(in, out, gate, up, m_rows, rows, k, tile, shared,
         simdgroups, sg, lane);
 }
 
@@ -1002,6 +1004,15 @@ inline void unordered_from_ordered_maxm_run(thread const RawIn &raw, thread cons
         else if ((rows) <= 2) { constexpr uint MAXM = 2; __VA_ARGS__; }         \
         else if ((rows) <= 4) { constexpr uint MAXM = 4; __VA_ARGS__; }         \
         else { constexpr uint MAXM = 8; __VA_ARGS__; }                          \
+    } while (0)
+
+// Instantiate a GEMV body for the activation-row bound MAXM in {2, 4}
+// (multi-row gathered kernels handle r == 1 in a dedicated MAXM = 1 launch
+// and chunk r > 4 by 4, eliminating both 1-row and 8-row register bloat).
+#define PROJECTION_FOR_ROWS_24(rows, ...)                                       \
+    do {                                                                        \
+        if ((rows) <= 2) { constexpr uint MAXM = 2; __VA_ARGS__; }              \
+        else { constexpr uint MAXM = 4; __VA_ARGS__; }                          \
     } while (0)
 
 // The same in the launches of an entry that launches its GEMV per row count,

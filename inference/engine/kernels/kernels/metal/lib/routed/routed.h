@@ -117,7 +117,9 @@ struct WorkEntry {
 
 struct Worklist {
     uint count;
-    uint pad[3];
+    uint one_count;
+    uint multi_count;
+    uint capacity;
     WorkEntry entries[1];
 };
 
@@ -138,24 +140,38 @@ inline Gathered unpack_work_entry(device const WorkEntry &entry, ulong p0, ulong
 }
 
 constexpr constant uint WORKLIST_CACHE = 256u;
+constexpr constant uint WORKLIST_CACHE_WORDS = 2u * WORKLIST_CACHE + SEISMIC_CONST_VERIFY_ROWS;
 
 // Build the compact unique-expert worklist in `worklist` using one simdgroup
-// (32 lanes), and write the indirect dispatch grid `(x_groups, count + extra_y, 1)`
-// into `gather_grid`. `cache` holds `2 * WORKLIST_CACHE` ints in threadgroup
-// memory (declared in the `*_gather` kernel). Choices group where they are
-// active (`active(c, source)`), share `(expert, source)`, and `source` is not
-// none (-1); an active choice with `source == -1` forms a singleton entry so
-// it zeroes its own row/slot.
+// (32 lanes), partitioning singletons (`r == 1`) from the front of
+// `worklist->entries` (`gather_one_grid`: `(x_groups, one_count, 1)`) and
+// multi-row experts (`r >= 2`) from the back (`gather_grid`:
+// `(x_groups, multi_count + extra_y, 1)`). `cache` holds `WORKLIST_CACHE_WORDS`
+// ints in threadgroup memory (declared in the `*_gather` kernel).
 template <typename Active>
 inline void build_worklist(device const int *routes, ulong r0, ulong r1, device const int *sources, ulong source_rows,
     ulong src1, ulong src2, uint m_rows, uint slots, uint x_groups, uint extra_y, device Worklist *worklist,
-    device int *gather_grid, threadgroup int *cache, uint lane, Active active) {
+    device int *gather_grid, device int *gather_one_grid, threadgroup int *cache, uint lane, Active active) {
     constexpr uint CACHE = WORKLIST_CACHE;
     threadgroup int *cached_expert = cache;
     threadgroup int *cached_source = cache + CACHE;
+    threadgroup uint *tmp_packed = reinterpret_cast<threadgroup uint *>(cache + 2u * CACHE);
 
     const uint total = m_rows * slots;
-    uint unique_count = 0u;
+    uint one_count = 0u;
+    uint multi_count = 0u;
+    auto emit_entry = [&](int ex, int src, uint count) {
+        const uint slot = count == 1u ? one_count++ : (total - 1u - multi_count++);
+        if (lane < count)
+            worklist->entries[slot].packed[lane] = tmp_packed[lane];
+        if (lane == 0u) {
+            worklist->entries[slot].expert = ex;
+            worklist->entries[slot].source = src;
+            worklist->entries[slot].count = count;
+            worklist->entries[slot].pad = 0u;
+        }
+        simdgroup_barrier(mem_flags::mem_threadgroup);
+    };
     if (total <= CACHE) {
         uint active_mask[CACHE / 32u];
         uint claimed[CACHE / 32u];
@@ -186,15 +202,10 @@ inline void build_worklist(device const int *routes, ulong r0, ulong r1, device 
             const int src = cached_source[at];
             if (src == -1) {
                 claimed[word] |= bit;
-                if (lane == 0u) {
-                    const uint m = at / slots, k = at % slots;
-                    worklist->entries[unique_count].expert = ex;
-                    worklist->entries[unique_count].source = -1;
-                    worklist->entries[unique_count].count = 1u;
-                    worklist->entries[unique_count].pad = 0u;
-                    worklist->entries[unique_count].packed[0] = (m << 16u) | k;
-                }
-                ++unique_count;
+                if (lane == 0u)
+                    tmp_packed[0] = ((at / slots) << 16u) | (at % slots);
+                simdgroup_barrier(mem_flags::mem_threadgroup);
+                emit_entry(ex, -1, 1u);
                 continue;
             }
             uint count = 0u;
@@ -211,18 +222,13 @@ inline void build_worklist(device const int *routes, ulong r0, ulong r1, device 
                     const uint pos = count + metal::popcount(mask & lt_mask);
                     if (match && pos < uint(SEISMIC_CONST_VERIFY_ROWS)) {
                         const uint m = c / slots, k = c % slots;
-                        worklist->entries[unique_count].packed[pos] = (m << 16u) | k;
+                        tmp_packed[pos] = (m << 16u) | k;
                     }
                     count = metal::min(count + metal::popcount(mask), uint(SEISMIC_CONST_VERIFY_ROWS));
                 }
             }
-            if (lane == 0u) {
-                worklist->entries[unique_count].expert = ex;
-                worklist->entries[unique_count].source = src;
-                worklist->entries[unique_count].count = count;
-                worklist->entries[unique_count].pad = 0u;
-            }
-            ++unique_count;
+            simdgroup_barrier(mem_flags::mem_threadgroup);
+            emit_entry(ex, src, count);
         }
     } else {
         for (uint at = 0u; at < total; ++at) {
@@ -232,14 +238,10 @@ inline void build_worklist(device const int *routes, ulong r0, ulong r1, device 
             if (!active(at, at_src))
                 continue;
             if (at_src.none()) {
-                if (lane == 0u) {
-                    worklist->entries[unique_count].expert = ex;
-                    worklist->entries[unique_count].source = -1;
-                    worklist->entries[unique_count].count = 1u;
-                    worklist->entries[unique_count].pad = 0u;
-                    worklist->entries[unique_count].packed[0] = (at_m << 16u) | at_k;
-                }
-                ++unique_count;
+                if (lane == 0u)
+                    tmp_packed[0] = (at_m << 16u) | at_k;
+                simdgroup_barrier(mem_flags::mem_threadgroup);
+                emit_entry(ex, -1, 1u);
                 continue;
             }
             bool earlier_hit = false;
@@ -272,39 +274,39 @@ inline void build_worklist(device const int *routes, ulong r0, ulong r1, device 
                     const uint pos = count + metal::popcount(mask & lt_mask);
                     if (match && pos < uint(SEISMIC_CONST_VERIFY_ROWS)) {
                         const uint m = c / slots, k = c % slots;
-                        worklist->entries[unique_count].packed[pos] = (m << 16u) | k;
+                        tmp_packed[pos] = (m << 16u) | k;
                     }
                     count = metal::min(count + metal::popcount(mask), uint(SEISMIC_CONST_VERIFY_ROWS));
                 }
             }
             if (!earlier_hit) {
-                if (lane == 0u) {
-                    worklist->entries[unique_count].expert = ex;
-                    worklist->entries[unique_count].source = at_src.code;
-                    worklist->entries[unique_count].count = count;
-                    worklist->entries[unique_count].pad = 0u;
-                }
-                ++unique_count;
+                simdgroup_barrier(mem_flags::mem_threadgroup);
+                emit_entry(ex, at_src.code, count);
             }
         }
     }
     if (lane == 0u) {
-        worklist->count = unique_count;
-        write_grid(gather_grid, x_groups, unique_count + extra_y);
+        worklist->count = one_count + multi_count;
+        worklist->one_count = one_count;
+        worklist->multi_count = multi_count;
+        worklist->capacity = total;
+        write_grid(gather_one_grid, x_groups, one_count);
+        write_grid(gather_grid, x_groups, multi_count + extra_y);
     }
 }
 
 inline void build_worklist(device const int *routes, ulong r0, ulong r1, device const int *sources, ulong source_rows,
     ulong src1, ulong src2, uint m_rows, uint slots, uint x_groups, uint extra_y, device Worklist *worklist,
-    device int *gather_grid, threadgroup int *cache, uint lane) {
+    device int *gather_grid, device int *gather_one_grid, threadgroup int *cache, uint lane) {
     build_worklist(routes, r0, r1, sources, source_rows, src1, src2, m_rows, slots, x_groups, extra_y, worklist,
-        gather_grid, cache, lane, [](uint, slab::Source) { return true; });
+        gather_grid, gather_one_grid, cache, lane, [](uint, slab::Source) { return true; });
 }
 
 inline void build_worklist(device const int *routes, ulong r0, ulong r1, uint m_rows, uint slots, uint x_groups,
-    uint extra_y, device Worklist *worklist, device int *gather_grid, threadgroup int *cache, uint lane) {
-    build_worklist(routes, r0, r1, nullptr, 0, 0, 0, m_rows, slots, x_groups, extra_y, worklist, gather_grid, cache,
-        lane);
+    uint extra_y, device Worklist *worklist, device int *gather_grid, device int *gather_one_grid,
+    threadgroup int *cache, uint lane) {
+    build_worklist(routes, r0, r1, nullptr, 0, 0, 0, m_rows, slots, x_groups, extra_y, worklist, gather_grid,
+        gather_one_grid, cache, lane);
 }
 
 // The activation rows a gathered GEMV reads: row r is `rows[r]`.
@@ -516,8 +518,22 @@ inline device uchar *block_fragments(device uchar *fragments, uint block, uint t
 // form's block coefficients and biases, or the PACK form's block factors
 // (twice them where each run has its code sums, `packing_codes::sums`) and
 // weight scales (`*_table_bytes`).
+// Top two bits of each ordinal word encode the block's pairing role when an
+// even block `2k` and `2k + 1` belong to the same expert so they coalesce into
+// a 64-row `PACK_TOKENS = 4` tile without extra scratch or grid changes.
+constexpr constant uint ORDINAL_MASK = 0x3fffffffu;
+constexpr constant uint ORDINAL_PAIR_EVEN = 0x40000000u;
+constexpr constant uint ORDINAL_PAIR_ODD = 0x80000000u;
+constexpr constant uint ORDINAL_PAIR_MASK = ORDINAL_PAIR_EVEN | ORDINAL_PAIR_ODD;
+
 inline device int *ordinals(device uchar *tables) {
     return reinterpret_cast<device int *>(tables);
+}
+inline int block_ordinal(device uchar *tables, uint block) {
+    return int(uint(ordinals(tables)[block]) & ORDINAL_MASK);
+}
+inline uint block_pair_role(device uchar *tables, uint block) {
+    return uint(ordinals(tables)[block]) & ORDINAL_PAIR_MASK;
 }
 inline ulong int8_coef_bytes(uint rows, uint columns) {
     return ulong(rows) * metal::max(columns / 32u, 3u) * 4u;
@@ -579,6 +595,27 @@ inline Positioned<Out> positioned(thread const Out &out, uint first) {
     return Positioned<Out>{out, first};
 }
 
+// An epilogue of grouped blocks' output rows (`[B, T, H]`): grouped row `m`
+// maps to block `m / tile_rows`, row `m % tile_rows`, so a 64-row paired tile
+// spanning two consecutive blocks stays exact even for strided outputs.
+template <typename OutElem>
+struct BlockOutput {
+    element::Out<OutElem> y;
+    ulong stride0;
+    ulong stride1;
+    ulong stride2;
+    uint tile_rows;
+    struct Row {
+        element::Out<OutElem> row;
+        ulong stride2;
+        void store(uint n, float value) const { row.put(ulong(n) * stride2, value); }
+    };
+    Row row(uint m) const {
+        return Row{y.offset(ulong(m / tile_rows) * stride0 + ulong(m % tile_rows) * stride1), stride2};
+    }
+    void store(uint m, uint n, float value) const { row(m).store(n, value); }
+};
+
 // Whether used block `b` is its expert's first: an expert's blocks are
 // consecutive (`routed_group`), and its first forms what they share (the
 // weights' tables of the INT8 and PACK forms, one an expert).
@@ -586,13 +623,22 @@ inline bool first_block(device const int *blocks, ulong stride, uint b) {
     return b == 0u || blocks[ulong(b - 1u) * stride] != blocks[ulong(b) * stride];
 }
 
-// Each of the `used` blocks' expert ordinals among the used experts.
+// Each of the `used` blocks' expert ordinals among the used experts, tagged
+// with its pairing role when an even block `2k` and `2k + 1` belong to the
+// same expert (sharing one 64-token packed operand tile `tile_m = k`).
 inline void write_ordinals(device const int *blocks, ulong stride, uint used, device int *ordinals) {
     int ordinal = -1;
     for (uint b = 0; b < used; ++b) {
         if (first_block(blocks, stride, b))
             ++ordinal;
-        ordinals[b] = ordinal;
+        uint flags = 0u;
+        if ((b & 1u) == 0u) {
+            if (b + 1u < used && blocks[ulong(b + 1u) * stride] == blocks[ulong(b) * stride])
+                flags = ORDINAL_PAIR_EVEN;
+        } else if (blocks[ulong(b - 1u) * stride] == blocks[ulong(b) * stride]) {
+            flags = ORDINAL_PAIR_ODD;
+        }
+        ordinals[b] = int(uint(ordinal) | flags);
     }
 }
 
