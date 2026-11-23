@@ -11,6 +11,8 @@ export const cardClass = "rounded-xl border border-slate-200 bg-white dark:borde
 
 export const formatSpeed = (speed: number) => speed < 1 ? "<1 tok/s" : `${Math.round(speed)} tok/s`
 
+export const bitWidthLabel = (bits: number): string | null => bits > 0 ? `${bits}-bit` : null
+
 export const quantSource = (quant: Pick<QuantView, "publisher" | "name">) => quant.publisher ? `${quant.publisher} ${quant.name}` : quant.name
 
 export function LabMark({ lab, className = "size-8" }: { lab: ModelLab | undefined; className?: string }) {
@@ -80,8 +82,9 @@ export function PlacementBar({ quant }: { quant: QuantView }) {
   const tiers = quant.placement.filter(tier => tier.bytes > 0)
   const total = tiers.reduce((sum, tier) => sum + tier.bytes, 0)
   if (total === 0) return null
+  const bits = bitWidthLabel(quant.bits)
   return <div>
-    <p className="mb-2 text-xs font-medium text-slate-700 dark:text-slate-300">How {quant.bits}-bit runs on your machine</p>
+    <p className="mb-2 text-xs font-medium text-slate-700 dark:text-slate-300">{bits ? `How ${bits} runs on your machine` : "How this model runs on your machine"}</p>
     <div className="flex gap-0.5">
       {tiers.map(tier => <div key={tier.kind} className={cn("h-2 min-w-1 rounded-full", tierColor[tier.kind])} style={{ width: `${tier.bytes / total * 100}%` }} />)}
     </div>
@@ -153,7 +156,7 @@ export function QuantLadder({ quants, selected, recommended, owned, limit, onSel
           : quant.fits && quant.speed !== null ? `~${formatSpeed(quant.speed)}` : fitLabel(quant)
       return <button key={quant.key} type="button" disabled={!quant.fits || quant.measuring || noRoom} onClick={() => onSelect(quant.key)} title={quant.quality ?? undefined}
         className={cn("flex min-w-0 flex-col items-start rounded-lg border px-3 py-2.5 text-left", ((!quant.fits && !quant.measuring) || noRoom) && "opacity-40", active ? "border-blue-600 bg-blue-50/60 ring-1 ring-blue-600/30 dark:border-blue-400 dark:bg-slate-800" : "border-slate-200 bg-white hover:border-slate-300 dark:border-slate-750 dark:bg-slate-850")}>
-        <span className="flex w-full items-center justify-between gap-1 whitespace-nowrap text-[13px] font-medium"><span>{quant.bits}-bit</span>
+        <span className="flex w-full items-center justify-between gap-1 whitespace-nowrap text-[13px] font-medium"><span>{bitWidthLabel(quant.bits) ?? quant.name}</span>
           {owned.has(quant.key) ? <Badge>Downloaded</Badge> : recommended === quant.key && <Badge tone="blue">Best</Badge>}</span>
         <span className="w-full truncate text-[11px] text-slate-500">{quantSource(quant)}</span>
         {quant.fits && quant.servedContext !== null && limit !== null && quant.servedContext < limit && <span className="w-full truncate text-[11px] text-orange-700 dark:text-orange-300">{formatContext(quant.servedContext)} context</span>}
@@ -173,12 +176,14 @@ export function QuantList({ quants, selected, recommended, owned, onSelect }: {
   return <div className="divide-y divide-slate-200 overflow-hidden rounded-lg border border-slate-200 bg-white dark:divide-slate-750 dark:border-slate-750 dark:bg-slate-850">
     {quants.map(quant => {
       const active = selected === quant.key
+      const bits = bitWidthLabel(quant.bits)
+      const source = quantSource(quant)
       // The whole row chooses the size, from a button laid over it; only the icon beside the name opens Hugging Face.
       return <div key={quant.key} className={cn("relative grid w-full grid-cols-[52px_minmax(0,1fr)_auto_72px_64px] items-center gap-3 px-3 py-2 text-left text-[13px]", active ? "bg-blue-50/60 dark:bg-slate-800" : "hover:bg-slate-50 dark:hover:bg-slate-800/50", !quant.fits && !quant.measuring && "opacity-40")}>
-        <button type="button" aria-label={`${quant.bits}-bit ${quantSource(quant)}`} aria-pressed={active} disabled={!quant.fits || quant.measuring} onClick={() => onSelect(quant.key)}
+        <button type="button" aria-label={bits ? `${bits} ${source}` : source} aria-pressed={active} disabled={!quant.fits || quant.measuring} onClick={() => onSelect(quant.key)}
           className="absolute inset-0 cursor-pointer focus-visible:outline-2 focus-visible:-outline-offset-2 focus-visible:outline-blue-500 disabled:cursor-default" />
-        <span className={cn("font-medium", active && "text-blue-700 dark:text-blue-400")}>{quant.bits}-bit</span>
-        <span className="flex min-w-0 items-center gap-1 text-xs text-slate-500"><span className="truncate">{quantSource(quant)}</span>{quant.repository && <RepositoryIconLink repository={quant.repository} />}</span>
+        <span className={cn("font-medium", active && "text-blue-700 dark:text-blue-400")}>{bits ?? "—"}</span>
+        <span className="flex min-w-0 items-center gap-1 text-xs text-slate-500"><span className="truncate">{source}</span>{quant.repository && <RepositoryIconLink repository={quant.repository} />}</span>
         <span>{owned.has(quant.key) ? <Badge>Downloaded</Badge> : recommended === quant.key && <Badge tone="blue">Best</Badge>}</span>
         <span className="text-right text-xs tabular-nums text-slate-700 dark:text-slate-300">{quant.fits && quant.speed !== null ? `~${formatSpeed(quant.speed)}` : fitLabel(quant)}</span>
         <span className="text-right text-xs tabular-nums text-slate-500">{formatStorageSize(quant.sizeBytes)}</span>

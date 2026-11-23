@@ -120,7 +120,7 @@ function ModelMenu({ model, onExploreQuants, onRemove }: { model: OwnedModel; on
     </div>}
     <Dialog open={confirming} onOpenChange={setConfirming}>
       <DialogContent showCloseButton={false}>
-        <DialogTitle className="font-heading text-base font-semibold">Delete {model.name} {model.quant.bits}-bit?</DialogTitle>
+        <DialogTitle className="font-heading text-base font-semibold">Delete {model.name}{model.quant.bits > 0 ? ` ${model.quant.bits}-bit` : ""}?</DialogTitle>
         <p className="text-[13px] text-slate-600 dark:text-slate-400">This removes its {formatStorageSize(model.quant.sizeBytes)} of files from this computer.{model.support === null && model.unsupported === null && " You can download it again later."}</p>
         <div className="flex justify-end gap-2">
           <Button variant="ghost" onClick={() => setConfirming(false)}>Cancel</Button>
@@ -132,8 +132,11 @@ function ModelMenu({ model, onExploreQuants, onRemove }: { model: OwnedModel; on
 }
 
 function QuantLine({ model }: { model: OwnedModel }) {
-  return <span className="block truncate text-xs text-slate-500"><span className="font-medium text-slate-700 dark:text-slate-300">{model.quant.bits}-bit</span> · {model.quant.publisher ? `${model.quant.publisher} ` : ""}{model.quant.name}
-    {model.quant.servedContext !== null && <> · <ContextText quant={model.quant} limit={model.contextLimit} modelName={model.name} /></>}</span>
+  return <span className="block truncate text-xs text-slate-500">
+    {model.quant.bits > 0 && <><span className="font-medium text-slate-700 dark:text-slate-300">{model.quant.bits}-bit</span>{" · "}</>}
+    {model.quant.publisher ? `${model.quant.publisher} ` : ""}{model.quant.name}
+    {model.quant.servedContext !== null && <> · <ContextText quant={model.quant} limit={model.contextLimit} modelName={model.name} /></>}
+  </span>
 }
 
 /** What opening a model shows: how it runs here, then where it came from and what goes with it. */

@@ -70,7 +70,6 @@ export function modelRowAction(
       <Button size="sm" variant="outline" onClick={onRetryInstall}>Retry</Button>
     </span>
   }
-  if (state._tag === "Unavailable") return <Status tone="failed" title={state.failure.message}>Files unavailable</Status>
   if (view.unsupported !== null) {
     return <Status>
       Not supported
@@ -80,6 +79,7 @@ export function modelRowAction(
       />
     </Status>
   }
+  if (state._tag === "Unavailable") return <Status tone="failed" title={state.failure.message}>Files unavailable</Status>
   if (view.assessmentFailure !== null) {
     return <Status tone="failed">
       Assessment failed
