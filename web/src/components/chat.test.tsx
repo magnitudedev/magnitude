@@ -160,12 +160,12 @@ describe("Chat presentation", () => {
     ["finalizing", live({ type: "model_loading", stage: "finalizing" }), "Finalizing model"],
     ["prefill", live({ type: "prefill" }), "Processing prompt"],
   ] as const
-  it.each(statuses)("renders the %s status with the request's elapsed time", (_, current, title) => {
+  it.each(statuses)("renders the %s status with the activity's elapsed time", (kind, current, title) => {
     const html = renderToStaticMarkup(<ChatActivityStatus response={running()} live={current} now={1100} />)
     expect(html).toContain('role="status"')
     expect(html).toContain(`aria-label="${title}"`)
-    expect(html).toContain('aria-label="Request elapsed time"')
-    expect(html).toContain("00:01")
+    expect(html).toContain('aria-label="Activity elapsed time"')
+    expect(html).toContain(kind === "optimizing" ? "00:01 / 01:00" : "00:01")
     expect(html).not.toContain('role="progressbar"')
     expect(html).not.toContain("aria-expanded")
     expect(html).not.toContain("·")
@@ -188,12 +188,17 @@ describe("Chat presentation", () => {
     const html = renderToStaticMarkup(
       <ChatActivityStatus response={running()} live={live({ type: "model_loading", stage: "optimizing" }, tuning("measure"))} now={1100} />
     )
-    expect(html).toContain("Testing kernel variants")
+    expect(html).toContain("Testing kernel variants (one-time, up to 1 min)")
     expect(html).toContain("155 tested")
+    expect(html).toContain("00:01 / 01:00")
     expect(html).not.toContain("programs")
     expect(html).not.toContain("budget")
     expect(html).not.toContain("attention_decode")
     expect(html).not.toContain('role="progressbar"')
+    const clamped = renderToStaticMarkup(
+      <ChatActivityStatus response={running()} live={live({ type: "model_loading", stage: "optimizing" }, tuning("measure"))} now={75_000} activityStartedAt={1_000} />
+    )
+    expect(clamped).toContain("01:00 / 01:00")
   })
   it("keeps optimization wording stable across rapid tuning operations and missing work details", () => {
     const render = (operation?: string) => renderToStaticMarkup(

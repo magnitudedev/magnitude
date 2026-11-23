@@ -1,3 +1,4 @@
+import { useRef } from "react"
 import { useNow } from "./shared"
 import { DateTime, Option } from "effect"
 import {
@@ -29,12 +30,13 @@ const phases = {
   prefill: "Processing prompt",
   thinking: "Thinking",
 }
+const OPTIMIZING_BUDGET_MS = 60_000
 const substatuses = {
   starting: "Connecting to inference",
   model_queued: "Awaiting model availability",
   preparing_model: "Preparing inference runtime",
   queued: "Awaiting execution",
-  optimizing: "Testing kernel variants",
+  optimizing: "Testing kernel variants (one-time, up to 1 min)",
   loading: "Importing weights",
   finalizing: "Preparing model for inference",
   preparing: "Preparing conversation",
@@ -79,16 +81,29 @@ export function ChatRequestStatus({
   live: Option.Option<LiveResponse>
 }) {
   const now = useNow()
-  return <ChatActivityStatus response={response} live={live} now={now} />
+  const activity = responseActivity(response, Option.flatMap(live, (r) => r.phase))
+  const started = useRef<{ responseId: string; activity: Activity | undefined; at: number }>({
+    responseId: response.id,
+    activity,
+    at: DateTime.toEpochMillis(response.started),
+  })
+  if (started.current.responseId !== response.id) {
+    started.current = { responseId: response.id, activity, at: DateTime.toEpochMillis(response.started) }
+  } else if (started.current.activity !== activity) {
+    started.current = { responseId: response.id, activity, at: now }
+  }
+  return <ChatActivityStatus response={response} live={live} now={now} activityStartedAt={started.current.at} />
 }
 export function ChatActivityStatus({
   response,
   live,
   now,
+  activityStartedAt,
 }: {
   response: ChatAssistantMessage
   live: Option.Option<LiveResponse>
   now: number
+  activityStartedAt?: number
 }) {
   const current = Option.flatMap(live, (r) => r.phase)
   const activity = responseActivity(response, current)
@@ -115,6 +130,10 @@ export function ChatActivityStatus({
   }
   const phase = phases[activity]
   const substatus = substatuses[activity]
+  const phaseElapsed = Math.max(0, now - (activityStartedAt ?? DateTime.toEpochMillis(response.started)))
+  const timer = activity === "optimizing"
+    ? `${elapsed(Math.min(phaseElapsed, OPTIMIZING_BUDGET_MS))} / ${elapsed(OPTIMIZING_BUDGET_MS)}`
+    : elapsed(phaseElapsed)
   return <div className="chat-request-status mb-2">
     <div role="status" aria-label={phase} className="chat-status-line">
       <CircleNotchIcon aria-hidden="true" className="chat-status-spinner motion-safe:animate-spin" />
@@ -127,7 +146,7 @@ export function ChatActivityStatus({
         </span>}
         {measures.map(text => <span key={text} className="chat-status-measure">{text}</span>)}
       </div>
-      <time className="chat-status-elapsed" aria-label="Request elapsed time">{elapsed(now - DateTime.toEpochMillis(response.started))}</time>
+      <time className="chat-status-elapsed" aria-label="Activity elapsed time">{timer}</time>
     </div>
   </div>
 }

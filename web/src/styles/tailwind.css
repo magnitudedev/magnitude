@@ -427,7 +427,7 @@
 @keyframes chat-status-sheen { from { background-position: 100% 0; } to { background-position: -150% 0; } }
 @media (prefers-reduced-motion: reduce) { .chat-status-shimmer { animation: none; background: none; -webkit-text-fill-color: currentColor; } }
 .chat-request-status { container-type: inline-size; container-name: chat-progress; }
-.chat-status-line { display: grid; grid-template-columns: 14px minmax(0, 1fr) 6ch; align-items: center; column-gap: 12px; min-height: 32px; padding: 4px 2px; font-size: 12px; line-height: 22px; font-variant-numeric: tabular-nums; }
+.chat-status-line { display: grid; grid-template-columns: 14px minmax(0, 1fr) auto; align-items: center; column-gap: 12px; min-height: 32px; padding: 4px 2px; font-size: 12px; line-height: 22px; font-variant-numeric: tabular-nums; }
 .chat-status-spinner { width: 14px; height: 14px; color: var(--magnitude-slate-500); }
 .chat-status-content { min-width: 0; display: flex; flex-wrap: nowrap; align-items: center; gap: 10px; overflow: hidden; white-space: nowrap; }
 .chat-status-title { flex-shrink: 0; font-weight: 500; }

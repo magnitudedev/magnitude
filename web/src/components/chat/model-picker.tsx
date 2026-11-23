@@ -27,8 +27,7 @@ export const thinkingSuffix = (model: InferenceModel | undefined, selected: Opti
 
 /**
  * The composer's model and thinking control: one pill naming the model and its thinking level, opening a popover
- * with the thinking levels on top and the models below. Choosing a model keeps it open so its thinking can be set
- * next; Enter on a model chooses it and closes.
+ * with the thinking levels on top and the models below. Choosing a model selects it and closes the popover.
  */
 export function ModelPicker({ models, model, name, selected, onModel, onEffort, onManage }: {
   models: readonly PickerModel[]
@@ -82,7 +81,7 @@ export function ModelPicker({ models, model, name, selected, onModel, onEffort, 
             {models.map(entry => {
               const current = entry.model.id === model?.id
               return <button key={entry.model.id} type="button" role="option" aria-selected={current}
-                onClick={() => onModel(entry.model)}
+                onClick={() => { onModel(entry.model); setOpen(false) }}
                 onKeyDown={event => { if (event.key === "Enter") { event.preventDefault(); onModel(entry.model); setOpen(false) } }}>
                 <span className="chat-popover-row">
                   <NamedLogo name={entry.model.name} lab={labForName(entry.model.name)} className="size-3 shrink-0" />
