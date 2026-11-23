@@ -11,9 +11,16 @@ use std::sync::{Arc, Mutex, MutexGuard};
 
 use super::watcher::Step;
 
-/// A position on the token axis: tokens emitted before a step.
-#[derive(Clone, Copy, Debug, PartialEq, PartialOrd)]
-pub(crate) struct Tokens(f64);
+/// A position or duration on the token axis: tokens emitted before a step.
+///
+/// Stored as an exact integer part (`whole`) plus a normalized fractional part
+/// (`0.0 <= frac < 1.0`) so advancing the clock across powers of two never
+/// loses precision to IEEE-754 rounding when differences are taken later.
+#[derive(Clone, Copy, Debug, Default, PartialEq, PartialOrd)]
+pub(crate) struct Tokens {
+    whole: u64,
+    frac: f64,
+}
 
 /// Monotonic identifier of the physical tier/residency regime under which
 /// decode pass prices and miss deltas are measured.
@@ -72,24 +79,81 @@ pub(crate) fn policy_fingerprint(flags: impl IntoIterator<Item = (bool, bool)>) 
 }
 
 impl Tokens {
-    pub(crate) const ZERO: Self = Self(0.0);
+    pub(crate) const ZERO: Self = Self { whole: 0, frac: 0.0 };
+    pub(crate) const ONE: Self = Self { whole: 1, frac: 0.0 };
 
     /// Panics where `tokens` is not finite and at least zero: no position
     /// on the clock is either.
     pub(crate) fn new(tokens: f64) -> Self {
         assert!(tokens.is_finite() && tokens >= 0.0, "{tokens} tokens is no position on the clock");
-        Self(tokens)
+        let floor = tokens.floor();
+        assert!(floor < (u64::MAX as f64), "{tokens} tokens exceeds clock range");
+        let whole = floor as u64;
+        let frac = tokens - floor;
+        if frac >= 1.0 {
+            Self { whole: whole.checked_add(1).expect("token clock overflow"), frac: 0.0 }
+        } else if frac == 0.0 {
+            Self { whole, frac: 0.0 }
+        } else {
+            Self { whole, frac }
+        }
+    }
+
+    /// Exact whole-plus-rational token advance: `whole + numerator / denominator`.
+    pub(crate) fn from_ratio(whole: u64, numerator: u64, denominator: u32) -> Self {
+        assert!(denominator > 0, "token ratio denominator must be positive");
+        let denom = u64::from(denominator);
+        let mut total_whole = whole.checked_add(numerator / denom).expect("token clock overflow");
+        let rem = numerator % denom;
+        let mut frac = rem as f64 / denom as f64;
+        if frac >= 1.0 {
+            total_whole = total_whole.checked_add(1).expect("token clock overflow");
+            frac = 0.0;
+        }
+        Self { whole: total_whole, frac }
+    }
+
+    pub(crate) const fn whole(self) -> u64 {
+        self.whole
     }
 
     pub(crate) fn get(self) -> f64 {
-        self.0
+        self.whole as f64 + self.frac
+    }
+
+    /// Exact sum of two token positions/durations, carrying fractional overflow
+    /// into `whole` without losing whole tokens to IEEE-754 power-of-two shifts.
+    pub(crate) fn add(self, rhs: Self) -> Self {
+        let mut whole = self.whole.checked_add(rhs.whole).expect("token clock overflow");
+        let sum = self.frac + rhs.frac;
+        let frac = if sum >= 1.0 {
+            whole = whole.checked_add(1).expect("token clock overflow");
+            let carry = sum - 1.0;
+            if carry == 0.0 { 0.0 } else { carry }
+        } else if sum == 0.0 {
+            0.0
+        } else {
+            sum
+        };
+        Self { whole, frac }
     }
 
     /// The tokens from `earlier` to `self`. Panics where `earlier` is
     /// later: the clock never runs back.
     pub(crate) fn since(self, earlier: Self) -> Self {
-        assert!(earlier.0 <= self.0, "{earlier:?} is after {self:?}");
-        Self(self.0 - earlier.0)
+        assert!(earlier <= self, "{earlier:?} is after {self:?}");
+        if self.frac >= earlier.frac {
+            let frac = self.frac - earlier.frac;
+            Self { whole: self.whole - earlier.whole, frac: if frac == 0.0 { 0.0 } else { frac } }
+        } else {
+            let whole = self.whole - earlier.whole - 1;
+            let frac = 1.0 - (earlier.frac - self.frac);
+            if frac >= 1.0 {
+                Self { whole: whole + 1, frac: 0.0 }
+            } else {
+                Self { whole, frac }
+            }
+        }
     }
 }
 
@@ -151,7 +215,7 @@ impl Clock {
         }
         let emitted = match advance {
             Advance::Known(tokens) => {
-                assert!(tokens.get() >= 1.0, "step {step} emits {tokens:?}, below one token");
+                assert!(tokens.whole() >= 1, "step {step} emits {tokens:?}, below one token");
                 Emitted::Known(tokens)
             }
             Advance::Pending { requests } => {
@@ -164,7 +228,7 @@ impl Clock {
         }
         self.ring.push_back((step, self.total, emitted));
         if let Emitted::Known(tokens) = emitted {
-            self.total = Tokens(self.total.0 + tokens.0);
+            self.total = self.total.add(tokens);
         }
     }
 
@@ -183,9 +247,9 @@ impl Clock {
         *decided += 1;
         *rows += u64::from(accepted);
         if *decided == *requests {
-            let advance = Tokens::new(1.0 + *rows as f64 / f64::from(*requests));
+            let advance = Tokens::from_ratio(1, *rows, *requests);
             self.ring.back_mut().expect("the pending step").2 = Emitted::Known(advance);
-            self.total = Tokens(self.total.0 + advance.0);
+            self.total = self.total.add(advance);
         }
     }
 
@@ -204,7 +268,7 @@ impl Clock {
     /// reads this T.
     pub(crate) fn through_latest(&self) -> Tokens {
         match self.ring.back() {
-            Some(&(_, position, Emitted::Pending { .. })) => Tokens(position.0 + 1.0),
+            Some(&(_, position, Emitted::Pending { .. })) => position.add(Tokens::ONE),
             _ => self.total,
         }
     }
@@ -264,7 +328,7 @@ pub(crate) enum Horizon {
 /// The counts of one complete epoch of a turnover.
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub(crate) struct Span {
-    pub(crate) tokens: f64,
+    pub(crate) tokens: Tokens,
     pub(crate) steps: u64,
     pub(crate) moves: u64,
 }
@@ -322,7 +386,7 @@ impl Turnover {
             Self::Unturned { epoch, since, running } | Self::Turned { epoch, since, running, .. } => {
                 running.moves += 1;
                 if running.moves >= records && running.steps > 0 {
-                    let previous = Span { tokens: now.since(*since).get(), steps: running.steps, moves: running.moves };
+                    let previous = Span { tokens: now.since(*since), steps: running.steps, moves: running.moves };
                     *self = Self::Turned { epoch: *epoch + 1, previous, since: now, running: Counts::default() };
                 }
             }
@@ -353,7 +417,7 @@ impl Turnover {
     pub(crate) fn horizon(&self, reader: Reader, records: u64, clock: &Clock) -> Option<Horizon> {
         assert!(records > 0, "a horizon asked of a tier of no records");
         let window = self.window(clock)?;
-        let capacity = records as f64 * window.tokens;
+        let capacity = records as f64 * window.tokens.get();
         Some(match (reader, window.moves) {
             (Reader::Observe, 0) => Horizon::Unbounded,
             (Reader::Observe, moves) => Horizon::Tokens(Tokens::new(capacity / moves as f64)),
@@ -364,7 +428,7 @@ impl Turnover {
     /// ā: tokens per decode step over the window, T/S. Exactly 1 at the
     /// first step; `None` before it.
     pub(crate) fn tokens_per_step(&self, clock: &Clock) -> Option<f64> {
-        self.window(clock).map(|window| window.tokens / window.steps as f64)
+        self.window(clock).map(|window| window.tokens.get() / window.steps as f64)
     }
 
     /// The epoch now running; it only grows.
@@ -382,14 +446,14 @@ impl Turnover {
             Self::Turned { previous, since, running, .. } => (*previous, since, running),
         };
         let window = Span {
-            tokens: previous.tokens + clock.through_latest().since(*since).get(),
+            tokens: previous.tokens.add(clock.through_latest().since(*since)),
             steps: previous.steps + running.steps,
             moves: previous.moves + running.moves,
         };
         if window.steps == 0 {
             return None;
         }
-        assert!(window.tokens >= window.steps as f64, "{window:?}: a step emits at least one token");
+        assert!(window.tokens.whole() >= window.steps, "{window:?}: a step emits at least one token");
         Some(window)
     }
 }
@@ -599,7 +663,7 @@ impl<T: Tally> RegimeAged<T> {
 /// holds, the open one in the time.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub(crate) struct Hold {
-    finished_tokens: f64,
+    finished_tokens: Tokens,
     finished: u64,
     latest: Tokens,
 }
@@ -615,13 +679,13 @@ pub(crate) enum Held {
 impl Hold {
     /// A choice first made at `now`: its first hold opens.
     pub(crate) fn started(now: Tokens) -> Self {
-        Self { finished_tokens: 0.0, finished: 0, latest: now }
+        Self { finished_tokens: Tokens::ZERO, finished: 0, latest: now }
     }
 
     /// The choice changed at `now`: the open hold finishes and another
     /// opens. Panics where `now` is before the latest change.
     pub(crate) fn changed(&mut self, now: Tokens) {
-        self.finished_tokens += now.since(self.latest).get();
+        self.finished_tokens = self.finished_tokens.add(now.since(self.latest));
         self.finished += 1;
         self.latest = now;
     }
@@ -630,10 +694,10 @@ impl Hold {
     /// `Unbounded` before the first change. Panics where `now` is before
     /// the latest change.
     pub(crate) fn expected(&self, now: Tokens) -> Held {
-        let open = now.since(self.latest).get();
+        let total = self.finished_tokens.add(now.since(self.latest)).get();
         match self.finished {
             0 => Held::Unbounded,
-            finished => Held::Tokens(Tokens::new((self.finished_tokens + open) / finished as f64)),
+            finished => Held::Tokens(Tokens::new(total / finished as f64)),
         }
     }
 
@@ -1054,5 +1118,55 @@ mod tests {
         assert_eq!(times.group_epoch(0), after_resize + 2);
         assert_eq!(times.tokens_per_step(0), Some(1.0));
         assert_eq!(tau(&times, 0, Tier::COMPUTE, Reader::Observe), Horizon::Tokens(tokens(2.0 / 7.0)));
+    }
+
+    /// Regression test for F-049: crossing powers of two (1024, 2048, 4096)
+    /// after fractional multi-request verify steps must preserve the exact
+    /// whole-token invariant on `Tokens::since`, `Clock::register`, and
+    /// `Turnover::window` without losing 1 ULP to `0.9999999999998863`.
+    #[test]
+    fn fractional_clock_crossing_powers_of_two_preserves_one_token_invariant() {
+        // Confirm raw f64 reproduces the exact 1-ULP subtraction errors across
+        // both 1024 (2/3 -> 1 - 2^-43) and 2048 (1/3 -> 1 - 2^-42).
+        let raw_1023 = 1023.0_f64 + 2.0 / 3.0;
+        assert_eq!((raw_1023 + 1.0) - raw_1023, 0.9999999999998863_f64);
+        let raw_2047 = 2047.0_f64 + 1.0 / 3.0;
+        assert!((raw_2047 + 1.0) - raw_2047 < 1.0);
+
+        let time = Time::new(&[vec![4]], 8);
+        let mut times = time.lock();
+        let mut prev_clock = Tokens::ZERO;
+        for step in 1..=2500u64 {
+            if step == 1 || step == 1024 || step == 2048 {
+                // Inject 1 + 2/3 tokens so the clock holds fractional 2/3 across 1024 and 2048.
+                times.register(step, Advance::Pending { requests: 3 });
+                times.decided(step, 2);
+                times.decided(step, 0);
+                times.decided(step, 0);
+            } else {
+                times.register(step, front());
+            }
+            let at = times.clock.at(step);
+            if step > 1 {
+                let emitted = at.since(prev_clock);
+                assert!(emitted.whole() >= 1, "step {step} emitted {emitted:?}");
+                assert!(emitted.get() >= 1.0, "step {step} emitted {emitted:?}");
+            }
+            prev_clock = at;
+            if step % 4 == 0 {
+                times.moved(0, Tier::COMPUTE);
+            }
+            let tps = times.tokens_per_step(0).expect("decode step registered");
+            assert!(tps >= 1.0, "step {step} tokens_per_step {tps} < 1.0");
+            let _ = tau(&times, 0, Tier::COMPUTE, Reader::Move);
+        }
+        assert!(times.clock.through_latest().whole() > 2500);
+    }
+
+    #[test]
+    #[should_panic(expected = "below one token")]
+    fn sub_one_token_advance_still_panics() {
+        let mut clock = Clock::new(4);
+        clock.register(1, Advance::Known(Tokens::new(0.9999999999998863)));
     }
 }

@@ -552,7 +552,7 @@ impl Shadows {
         let next_clock = self.log[decode_indices[0]].clock;
         let emitted = next_clock.since(step.clock);
         assert!(
-            emitted.get() >= 1.0,
+            emitted.whole() >= 1,
             "decode step {} emitted {emitted:?}, below one token",
             step.sequence,
         );
@@ -564,10 +564,10 @@ impl Shadows {
         }
         let spans: Vec<(u64, u64, Option<usize>)> = (0..clocks.len())
             .map(|i| {
-                let first = clocks[i].0.get().floor() as u64;
+                let first = clocks[i].0.whole();
                 let span = clocks
                     .get(i + 1)
-                    .map_or(1, |&(next, _)| (next.get().floor() as u64).saturating_sub(first).max(1));
+                    .map_or(1, |&(next, _)| next.whole().saturating_sub(first).max(1));
                 (first, span, clocks[i].1)
             })
             .collect();
@@ -926,5 +926,52 @@ mod tests {
             "warm-seeded shadow ({warm_u:.3}) must avoid cold-start miss inflation ({cold_u:.3})"
         );
         assert!(warm_u.abs() < 1e-9, "all 4 experts were already warm in seeded pool: {warm_u}");
+    }
+
+    /// Regression test for F-049: accumulating fractional verify-step advances
+    /// across powers of two (1024, 2048, 4096) caused single-`f64` clock
+    /// subtraction `(clock + 1.0) - clock` to underflow by 1 ULP to
+    /// `0.9999999999998863`, tripping `Shadows::step`'s one-token invariant.
+    #[test]
+    fn fractional_clock_crossing_powers_of_two_never_panics_in_shadows() {
+        // Prove raw f64 exhibits the exact 1-ULP underflow reported in F-049.
+        let raw_before = 1023.0_f64 + 2.0 / 3.0;
+        let raw_after = raw_before + 1.0;
+        assert_eq!(raw_after - raw_before, 0.9999999999998863_f64);
+
+        let time = crate::experts::horizon::Time::new(&[vec![4]], 16);
+        let mut shadows = Shadows::new(&[8], &[0], &[2]);
+        let mut step = 1u64;
+
+        // First advance to ~1023 + 2/3 using fractional 3-request verify steps
+        // (1 + 2/3 tokens each) plus plain 1-token steps, then continue well
+        // past 2048 so both 1024 and 2048 power-of-two boundaries are crossed
+        // while Shadows::step drains the lookahead window on every step.
+        let mut fed = Vec::with_capacity(2600);
+        while step <= 2600 {
+            let clock = {
+                let mut times = time.lock();
+                if step % 3 == 1 {
+                    times.register(step, Advance::Pending { requests: 3 });
+                    times.decided(step, 2);
+                    times.decided(step, 0);
+                    times.decided(step, 0);
+                } else {
+                    times.register(step, Advance::Known(Tokens::ONE));
+                }
+                times.clock.at(step)
+            };
+            let expert = (step as usize) % 4;
+            fed.push(ShadowFeed::Read {
+                read: RoutedRead { sequence: step, layer: 0, experts: vec![expert], choices: 1 },
+                rows: Some(Arc::new(Rows::of(1, &[0], &keys(8, &[expert])))),
+                evidence: Evidence::Decode,
+                clock,
+            });
+            step += 1;
+        }
+        shadows.read_log(fed);
+        assert!(time.lock().clock.through_latest().whole() > 3000);
+        assert!(shadows.misses()[0].is_some());
     }
 }
