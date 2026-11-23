@@ -1098,6 +1098,7 @@ static std::vector<std::string> specialized_handler_context_variables(specialize
             return { "enable_thinking", "reasoning_effort", "reasoning_strength" };
         case specialized_handler::deepseek_v3_2:
         case specialized_handler::minimax_m3:
+        case specialized_handler::qwen3_coder:
         case specialized_handler::none:
             return { "enable_thinking" };
         case specialized_handler::ministral_3:
@@ -1111,7 +1112,6 @@ static std::vector<std::string> specialized_handler_context_variables(specialize
         case specialized_handler::gigachat_v3:
         case specialized_handler::gemma4:
         case specialized_handler::minicpm5:
-        case specialized_handler::qwen3_coder:
             return {};
     }
     return {};

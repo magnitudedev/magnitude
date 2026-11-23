@@ -59,9 +59,31 @@ common_chat_params common_chat_params_init_qwen3_coder(const common_chat_templat
         data.prompt += data.generation_prompt;
     }
 
-    const bool thinking_opened = data.generation_prompt.find("<think>") != std::string::npos;
+    const bool reasoning_disabled = inputs.enable_thinking.has_value() && !*inputs.enable_thinking;
+    if (supports_reasoning && reasoning_disabled && !inputs.has_continuation()) {
+        const auto pos = data.generation_prompt.rfind("<think>");
+        if (pos != std::string::npos &&
+            data.generation_prompt.find("</think>", pos + 7) == std::string::npos &&
+            trim_whitespace(data.generation_prompt.substr(pos + 7)).empty()) {
+            data.generation_prompt += "</think>";
+            data.prompt            += "</think>";
+        }
+    }
 
-    common_chat_apply_cached_parser(tmpl, inputs, thinking_opened ? "<think>" : "", data, [&](common_chat_params & data) {
+    const auto think_pos = data.generation_prompt.rfind("<think>");
+    const bool reasoning_closed_in_prefix =
+        supports_reasoning && reasoning_disabled && !inputs.has_continuation() &&
+        think_pos != std::string::npos &&
+        data.generation_prompt.find("</think>", think_pos + 7) != std::string::npos;
+    const bool thinking_opened =
+        supports_reasoning && !reasoning_closed_in_prefix &&
+        think_pos != std::string::npos &&
+        data.generation_prompt.find("</think>", think_pos + 7) == std::string::npos;
+    const bool parse_reasoning = supports_reasoning && extract_reasoning && !reasoning_closed_in_prefix;
+    const std::string parser_prefix = reasoning_closed_in_prefix ? data.generation_prompt : GEN_PREFIX;
+    const std::string parser_key    = reasoning_closed_in_prefix ? data.generation_prompt : (thinking_opened ? "<think>" : "");
+
+    common_chat_apply_cached_parser(tmpl, inputs, parser_key, data, [&](common_chat_params & data) {
     std::vector<std::string> tool_call_starts = { "<tool_call>" };
 
     if (is_qwen3_coder) {
@@ -75,10 +97,10 @@ common_chat_params common_chat_params_init_qwen3_coder(const common_chat_templat
     }
 
     auto parser = build_chat_peg_parser([&](common_chat_peg_builder & p) {
-        auto generation_prompt = p.literal(GEN_PREFIX);
+        auto generation_prompt = p.literal(parser_prefix);
 
         auto reasoning = p.eps();
-        if (supports_reasoning && extract_reasoning) {
+        if (parse_reasoning) {
             // Reasoning closes with </think>, at a tool call, or with the output.
             reasoning = p.optional("<think>" + p.space() +
                                    p.rule("reasoning-text", p.reasoning(p.until_one_of({ "</think>", "<tool_call>" }))) +
@@ -89,8 +111,11 @@ common_chat_params common_chat_params_init_qwen3_coder(const common_chat_templat
         // reasoning: an implicit close before a tool call has no GBNF form
         // here and would let reasoning run into the response.
         if (has_response_format) {
+            if (reasoning_closed_in_prefix) {
+                return generation_prompt << p.content(p.schema(p.json(), "response-format", inputs.json_schema));
+            }
             auto response_reasoning = p.eps();
-            if (supports_reasoning && extract_reasoning) {
+            if (parse_reasoning) {
                 response_reasoning = p.optional("<think>" + p.space() + p.reasoning(p.until("</think>")) + "</think>");
             }
             return generation_prompt + (response_reasoning << p.content(p.schema(p.json(), "response-format", inputs.json_schema)));
@@ -200,8 +225,10 @@ common_chat_params common_chat_params_init_qwen3_coder(const common_chat_templat
             auto tool_calls = p.trigger_rule("tool-call-root", p.repeat(calls, min_calls, 1));
             auto content    = p.rule("content-text", p.content(p.until_one_of(tool_call_starts)));
 
-            auto body = reasoning << p.text_before_calls(content, inputs.tool_choice) << tool_calls;
-            if (supports_reasoning && extract_reasoning) {
+            auto body = reasoning_closed_in_prefix
+                ? (p.text_before_calls(content, inputs.tool_choice) << tool_calls)
+                : (reasoning << p.text_before_calls(content, inputs.tool_choice) << tool_calls);
+            if (parse_reasoning) {
                 // GBNF has no lookahead. Reasoning closed implicitly by a tool
                 // call is exactly reasoning followed directly by the calls;
                 // rendering the peek as empty would let reasoning run into
@@ -230,6 +257,9 @@ common_chat_params common_chat_params_init_qwen3_coder(const common_chat_templat
         }
 
         // Content only parser
+        if (reasoning_closed_in_prefix) {
+            return generation_prompt + p.content(p.rest());
+        }
         return generation_prompt + (reasoning << p.content(p.rest()));
     });
 

@@ -163,6 +163,17 @@ extraction disabled so no whitespace inside the empty block leaks into `reasonin
 constrained grammars begin directly after the closed block. The generic autoparser declares
 `enable_thinking` in `handler_context_variables` so pruned and unpruned reasoning discovery agree.
 
+Patch 0040 brings the same thinking-disabled behavior to the Qwen3-Coder (used by LFM3, Qwen3.5,
+Qwen3.6, and Nemotron) and LFM2 specialized handlers. In `qwen3-coder.cpp`, an unclosed `<think>`
+left at the end of `generation_prompt` when `enable_thinking` is false is closed with `</think>`,
+`thinking_opened` checks for an unclosed `<think>` rather than any `<think>` substring (which
+previously misfired on closed `<think></think>` prefixes), and when `enable_thinking` is false with
+a closed `<think>...</think>` prefix, both `qwen3-coder.cpp` and `lfm2.cpp` match the closed
+`generation_prompt` literally with reasoning extraction disabled so plain text, tool-call, and
+JSON-schema replies start directly after the closed block with zero `<think>` rules in the grammar.
+`specialized_handler::qwen3_coder` declares `enable_thinking` in `handler_context_variables` so
+pruned and unpruned reasoning discovery agree.
+
 To refresh the extraction, use the provenance record and patch series in a maintainer workflow,
 then check in the resulting patched sources. Source preparation is deliberately not part of a
 consumer build.

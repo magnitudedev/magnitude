@@ -418,6 +418,10 @@ fn pruned_and_unpruned_reasoning_inspection_are_identical() {
             include_str!("../../templates/tests/assets/LFM2.5-8B-A1B.jinja"),
         ),
         (
+            "LFM3-1.7B.jinja",
+            include_str!("../../templates/tests/assets/LFM3-1.7B.jinja"),
+        ),
+        (
             "Laguna-S-2.1.jinja",
             include_str!("../../templates/tests/assets/Laguna-S-2.1.jinja"),
         ),
@@ -491,4 +495,29 @@ fn pruned_and_unpruned_reasoning_inspection_are_identical() {
     for item in &payload.sources {
         assert_parity(&format!("gguf:glm53:{}", item.name), &item.source);
     }
+}
+
+/// LFM3 1.7B exposes `none` (via `enable_thinking: false`, rendering
+/// `<think></think>`) alongside its default `high` reasoning mode.
+#[test]
+fn lfm3_exposes_none_and_high_reasoning_efforts() {
+    let profile = asset_profile(include_str!("../../templates/tests/assets/LFM3-1.7B.jinja"));
+    assert_eq!(
+        profile
+            .mappings
+            .iter()
+            .map(|mapping| mapping.effort.as_str())
+            .collect::<Vec<_>>(),
+        ["none", "high"]
+    );
+    assert_eq!(profile.default_effort.as_deref(), Some("high"));
+    assert_eq!(profile.supports_reasoning_output, Some(true));
+    assert_eq!(
+        profile.resolve(&effort("none")).unwrap().controls,
+        BTreeMap::from([("enable_thinking".into(), json!(false))])
+    );
+    assert_eq!(
+        profile.resolve(&ReasoningIntent::Disabled).unwrap().controls,
+        BTreeMap::from([("enable_thinking".into(), json!(false))])
+    );
 }
