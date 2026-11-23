@@ -87,11 +87,14 @@ pub struct ModelPlacement {
 impl ModelPlacement {
     /// The placement of `load`'s weights in a fit of `domains`: its table
     /// rows no slot holds go where the OS file cache holds them, in host RAM
-    /// when its remaining room takes them all (the device's memory, of
-    /// unified memory), else on disk.
+    /// when its remaining room beside any linked host expert tier cache takes
+    /// them all (the device's memory, of unified memory), else on disk.
     pub fn of(load: &crate::ModelLoadPlan, domains: &[DomainFit], topology: &DeviceTopology) -> Result<Self, String> {
         let crate::WeightPlacement { held, host, streamed, tables } = load.weight_placement()?;
-        Self::from_parts(held, host, streamed, tables, domains, topology)
+        let host_tier_cache = load
+            .expert_bank()
+            .map_or(Ok(0), |bank| bank.host_cache(bank.host_slots))?;
+        Self::from_parts(held, host, streamed, tables, host_tier_cache, domains, topology)
     }
 
     pub(crate) fn of_bank(
@@ -103,11 +106,12 @@ impl ModelPlacement {
     ) -> Result<Self, String> {
         let host = bank.map_or(Ok(0), crate::planning::ExpertBankPlan::host_only_bytes)?;
         let streamed = bank.map_or(Ok(0), crate::planning::ExpertBankPlan::unheld_bytes)?;
+        let host_tier_cache = bank.map_or(Ok(0), |bank| bank.host_cache(bank.host_slots))?;
         let held = [host, streamed, tables]
             .into_iter()
             .try_fold(stored, u64::checked_sub)
             .ok_or("a plan's tiers hold more than its weights")?;
-        Self::from_parts(held, host, streamed, tables, domains, topology)
+        Self::from_parts(held, host, streamed, tables, host_tier_cache, domains, topology)
     }
 
     fn from_parts(
@@ -115,13 +119,22 @@ impl ModelPlacement {
         host: u64,
         streamed: u64,
         tables: u64,
+        host_tier_cache: u64,
         domains: &[DomainFit],
         topology: &DeviceTopology,
     ) -> Result<Self, String> {
         let host_ram = domains.iter().find(|domain| {
             topology.store(domain.domain).is_some_and(|store| matches!(store.kind(), seismic::StoreKind::HostRam))
         });
-        let cached = host_ram.is_none_or(|domain| u64::try_from(domain.remaining_bytes).is_ok_and(|room| room >= tables));
+        // `DomainFit::remaining_bytes` on HostRam only deducts the host tier's
+        // required floor, not its elastic cache (`ExpertBankPlan::host_cache`).
+        // Subtract `host_tier_cache` before deciding whether lookup tables also
+        // fit in the OS file cache so host RAM is never double-spent between
+        // the host expert tier and lookup tables (F-051).
+        let cached = host_ram.is_none_or(|domain| {
+            u64::try_from(domain.remaining_bytes)
+                .is_ok_and(|room| room.saturating_sub(host_tier_cache) >= tables)
+        });
         let overflow = || "placement bytes overflow".to_owned();
         Ok(match (cached, host_ram.map(|domain| domain.role)) {
             (false, _) => Self { device_bytes: held, host_bytes: host, disk_bytes: streamed, lookup_disk_bytes: tables },
@@ -2421,5 +2434,72 @@ pub(crate) mod tests {
             expected_resident,
             streamed_tps,
         );
+    }
+
+    /// Reproduces F-051 on `cliqa-r3-cuda` (30.97 GiB host RAM, A10G 23 GiB,
+    /// `qwen3.8-flash-next:gguf:q2`): `DomainFit::remaining_bytes` on `HostRam`
+    /// excludes the host expert tier's elastic cache (`28.93 GB`), so checking
+    /// `remaining_bytes (28.96 GB) >= tables (28.43 GB)` without subtracting
+    /// `host_tier_cache` double-spent host RAM and reported an impossible
+    /// `host_bytes = 49.64 GB` on a 30.97 GiB host.
+    #[test]
+    fn placement_subtracts_host_tier_cache_before_caching_lookup_tables_in_ram() {
+        let (topology, _, _) = rtx3090_cuda(33_258_901_504);
+        let host_ram = topology.host_ram().id();
+
+        const TOTAL_RAM: u64 = 33_258_901_504; // 30.97 GiB
+        const REQUIRED_RAM: u64 = 4_303_246_443;
+        const REMAINING_RAM: i64 = (TOTAL_RAM - REQUIRED_RAM) as i64; // 28.96 GB
+        const DEVICE_HELD: u64 = 14_799_694_272;
+        const HOST_ONLY_EXPERTS: u64 = 21_211_968_640;
+        const HOST_TIER_CACHE: u64 = 28_930_211_840; // inclusive host tier cache
+        const STREAMED_EXPERTS: u64 = 5_507_481_600;
+        const LOOKUP_TABLES: u64 = 28_430_000_000;
+
+        let tight_domains = [DomainFit {
+            role: DomainRole::Staging,
+            domain: host_ram,
+            capacity_bytes: TOTAL_RAM,
+            required_bytes: REQUIRED_RAM,
+            remaining_bytes: REMAINING_RAM,
+        }];
+        let tight = ModelPlacement::from_parts(
+            DEVICE_HELD,
+            HOST_ONLY_EXPERTS,
+            STREAMED_EXPERTS,
+            LOOKUP_TABLES,
+            HOST_TIER_CACHE,
+            &tight_domains,
+            &topology,
+        )
+        .unwrap();
+        assert_eq!(tight.device_bytes, DEVICE_HELD);
+        assert_eq!(tight.host_bytes, HOST_ONLY_EXPERTS, "host_bytes must not double-spend RAM with host tier cache");
+        assert!(tight.host_bytes < TOTAL_RAM, "host_bytes ({}) must not exceed physical RAM ({TOTAL_RAM})", tight.host_bytes);
+        assert_eq!(tight.disk_bytes, STREAMED_EXPERTS);
+        assert_eq!(tight.lookup_disk_bytes, LOOKUP_TABLES, "lookup tables stay on SSD when host tier cache consumes RAM");
+
+        // When host RAM genuinely fits BOTH host tier cache and lookup tables
+        // (e.g. 128 GiB host), lookup tables are cached in host RAM.
+        const LARGE_RAM: u64 = 128 * (1 << 30);
+        let large_domains = [DomainFit {
+            role: DomainRole::Staging,
+            domain: host_ram,
+            capacity_bytes: LARGE_RAM,
+            required_bytes: REQUIRED_RAM,
+            remaining_bytes: (LARGE_RAM - REQUIRED_RAM) as i64,
+        }];
+        let large = ModelPlacement::from_parts(
+            DEVICE_HELD,
+            HOST_ONLY_EXPERTS,
+            STREAMED_EXPERTS,
+            LOOKUP_TABLES,
+            HOST_TIER_CACHE,
+            &large_domains,
+            &topology,
+        )
+        .unwrap();
+        assert_eq!(large.host_bytes, HOST_ONLY_EXPERTS + LOOKUP_TABLES);
+        assert_eq!(large.lookup_disk_bytes, 0);
     }
 }
