@@ -1000,14 +1000,8 @@ fn import_target(
             let weights = startup.claim("target import", floor_demand)?;
             (execution_plan, planned, floor_plan, Some(floor_demand), weights)
         } else {
-            let (execution_plan, planned, weights) = match startup.claim_target_import(execution_plan.load())? {
-                Imported::Planned(weights) => (execution_plan, planned, weights),
-                Imported::Fitted(slots, host_slots, weights) => (
-                    execution_plan.with_load_slots(slots, host_slots).map_err(|error| internal(error.to_string()))?,
-                    planned.with_load_slots(slots, host_slots).map_err(|error| internal(error.to_string()))?,
-                    weights,
-                ),
-            };
+            let imported = startup.claim_target_import(execution_plan.load())?;
+            let (execution_plan, planned, weights) = imported.fit(execution_plan, planned)?;
             let initial = execution_plan.clone();
             (execution_plan, planned, initial, None, weights)
         };
@@ -1052,15 +1046,8 @@ fn import_target(
     })?;
     residency.release_upload();
     if let Some(floor_demand) = floor_demand {
-        let (sized_plan, sized_planned, mut bank_growth) =
-            match startup.claim_bank_growth(execution_plan.load(), floor_demand)? {
-                Imported::Planned(growth) => (execution_plan, planned, growth),
-                Imported::Fitted(slots, host_slots, growth) => (
-                    execution_plan.with_load_slots(slots, host_slots).map_err(|error| internal(error.to_string()))?,
-                    planned.with_load_slots(slots, host_slots).map_err(|error| internal(error.to_string()))?,
-                    growth,
-                ),
-            };
+        let imported = startup.claim_bank_growth(execution_plan.load(), floor_demand)?;
+        let (sized_plan, sized_planned, mut bank_growth) = imported.fit(execution_plan, planned)?;
         execution_plan = sized_plan;
         planned = sized_planned;
         weights.allocate(&device, |charges| {
@@ -1984,6 +1971,23 @@ enum Imported {
     /// The import with its expert bank at `(slots, host_slots)`, fewer than
     /// planned, its weights claimed.
     Fitted(u64, u64, Held),
+}
+
+impl Imported {
+    /// The load's plans at the slots this import admitted, and its claim:
+    /// as planned, or with the expert bank at the fitted slots. Its own
+    /// frame, beside the load's.
+    #[inline(never)]
+    fn fit(self, execution_plan: ExecutionPlan, planned: ExecutionPlanDraft) -> Result<(ExecutionPlan, ExecutionPlanDraft, Held), LoadError> {
+        match self {
+            Self::Planned(held) => Ok((execution_plan, planned, held)),
+            Self::Fitted(slots, host_slots, held) => Ok((
+                execution_plan.with_load_slots(slots, host_slots).map_err(|error| internal(error.to_string()))?,
+                planned.with_load_slots(slots, host_slots).map_err(|error| internal(error.to_string()))?,
+                held,
+            )),
+        }
+    }
 }
 
 /// A load's memory as it starts: the device's reader; the one reading of
