@@ -1246,51 +1246,99 @@ __device__ __forceinline__ void attend(const Inputs &in, const History &history,
                     }
                     active_parts = max(active_parts, (tiles_of(total) + PICK_TILES + run - 1) / run);
                 }
+                // The union of the rows' spans and each row's place in it, 32
+                // spans a round (lanes over spans), the rows in order inside a
+                // round. A row is a contiguous part of the union's key
+                // sequence while each non-empty span after its first starts
+                // at the union's, and no non-empty span follows its end (a
+                // non-empty span ending short of the union's, or an empty one
+                // where the union is not). Lane `r` holds row r's state
+                // (started, ended, ok, start) between rounds. The history
+                // spans come first and the fresh span (index `spans`) is the
+                // last round, so the history figures are the state before it.
                 int u_base = 0;
                 bool started = false, ended = false, row_ok = true;
                 int r_start_lane = 0;
                 bool hist_row_ok = true, hist_started = false;
                 int r_hist_start_lane = 0;
                 bool cached_fresh_lane = true;
-                for (int index = 0; index <= spans; ++index) {
-                    const Span own = lane < valid
-                        ? span(in, static_cast<u64>(first_token + lane), static_cast<u64>(index), static_cast<u64>(spans))
-                        : Span{0, 0};
-                    const int len = max(own.hi - own.lo, 0);
-                    int u_lo = len > 0 ? own.lo : 0x7fffffff;
-                    int u_hi = len > 0 ? own.hi : -0x7fffffff;
-                    for (int offset = 16; offset > 0; offset >>= 1) {
-                        u_lo = min(u_lo, __shfl_xor_sync(0xffffffffu, u_lo, offset));
-                        u_hi = max(u_hi, __shfl_xor_sync(0xffffffffu, u_hi, offset));
+                // Spans [base, base + count) (count <= 32; the fresh span alone
+                // when base is `spans`); returns the union's start of the
+                // round's first span.
+                auto union_round = [&](int base, int count) {
+                    const u64 index = static_cast<u64>(base + lane);
+                    const bool inside = lane < count;
+                    auto own_span = [&](int r) {
+                        return inside ? span(in, static_cast<u64>(first_token + r), index, static_cast<u64>(spans))
+                                      : Span{0, 0};
+                    };
+                    int u_lo = 0x7fffffff, u_hi = -0x7fffffff;
+                    for (int r = 0; r < valid; ++r) {
+                        const Span s = own_span(r);
+                        if (s.hi > s.lo) {
+                            u_lo = min(u_lo, s.lo);
+                            u_hi = max(u_hi, s.hi);
+                        }
                     }
                     if (u_hi <= u_lo) u_lo = u_hi = 0;
-                    const int u_len = max(u_hi - u_lo, 0);
-                    if (index == spans) {
-                        hist_row_ok = row_ok;
-                        hist_started = started;
-                        r_hist_start_lane = r_start_lane;
-                        u_hist = u_base;
-                        u_fresh = u_lo - u_hist;
-                        if (lane < valid) {
-                            cached_fresh_lane = (own.lo == u_lo + lane && own.hi == u_lo + lane + 1);
+                    const int u_len = u_hi - u_lo;
+                    const int u_inclusive = reduce::lanes_inclusive_add(u_len, lane);
+                    // The union ordinal of this lane's span's first key.
+                    const int u_at = u_base + u_inclusive - u_len;
+                    for (int r = 0; r < valid; ++r) {
+                        const Span own = own_span(r);
+                        const int len = max(own.hi - own.lo, 0);
+                        const unsigned filled = __ballot_sync(0xffffffffu, len > 0);
+                        const unsigned short_end = __ballot_sync(0xffffffffu, len > 0 && own.hi < u_hi);
+                        const unsigned gap = __ballot_sync(0xffffffffu, len == 0 && u_len > 0);
+                        const unsigned moved = __ballot_sync(0xffffffffu, len > 0 && own.lo != u_lo);
+                        bool r_started = __shfl_sync(0xffffffffu, started ? 1 : 0, r) != 0;
+                        bool r_ended = __shfl_sync(0xffffffffu, ended ? 1 : 0, r) != 0;
+                        bool r_ok = __shfl_sync(0xffffffffu, row_ok ? 1 : 0, r) != 0;
+                        int r_start = __shfl_sync(0xffffffffu, r_start_lane, r);
+                        // The lanes after the row's first non-empty span: all
+                        // of them once it started in an earlier round.
+                        unsigned after = 0xffffffffu;
+                        if (!r_started && filled != 0u) {
+                            const int first = __ffs(filled) - 1;
+                            r_started = true;
+                            r_start = __shfl_sync(0xffffffffu, u_at + (own.lo - u_lo), first);
+                            after = first == 31 ? 0u : 0xffffffffu << (first + 1);
                         }
-                    }
-                    if (lane < valid) {
-                        if (len == 0) {
-                            if (started && u_len > 0) ended = true;
-                        } else {
-                            if (ended) row_ok = false;
-                            if (!started) {
-                                started = true;
-                                r_start_lane = u_base + (own.lo - u_lo);
-                            } else if (own.lo != u_lo) {
-                                row_ok = false;
+                        if (r_started) {
+                            if ((moved & after) != 0u) r_ok = false;
+                            const unsigned events = short_end | (gap & after);
+                            if (r_ended) {
+                                if ((filled & after) != 0u) r_ok = false;
+                            } else if (events != 0u) {
+                                const int e = __ffs(events) - 1;
+                                if (e < 31 && (filled & (0xffffffffu << (e + 1))) != 0u) r_ok = false;
+                                r_ended = true;
                             }
-                            if (own.hi < u_hi) ended = true;
+                        }
+                        if (lane == r) {
+                            started = r_started;
+                            ended = r_ended;
+                            row_ok = r_ok;
+                            r_start_lane = r_start;
+                        }
+                        // The fresh round: whether the row's fresh span is its
+                        // own key, the union's r-th.
+                        if (base == spans) {
+                            const bool own_fresh =
+                                __shfl_sync(0xffffffffu, own.lo == u_lo + r && own.hi == u_lo + r + 1 ? 1 : 0, 0) != 0;
+                            if (lane == r) cached_fresh_lane = own_fresh;
                         }
                     }
-                    u_base += u_len;
-                }
+                    u_base += __shfl_sync(0xffffffffu, u_inclusive, 31);
+                    return __shfl_sync(0xffffffffu, u_lo, 0);
+                };
+                for (int base = 0; base < spans; base += 32) union_round(base, min(32, spans - base));
+                hist_row_ok = row_ok;
+                hist_started = started;
+                r_hist_start_lane = r_start_lane;
+                u_hist = u_base;
+                u_fresh = union_round(spans, 1) - u_hist;
                 u_total = u_base;
                 u_run = run_of(u_total);
                 row_starts = r_start_lane;
@@ -1328,13 +1376,13 @@ __device__ __forceinline__ void attend(const Inputs &in, const History &history,
                     const int u_tail = pref_mode == 2 ? hist_tail_row : tail_row;
                     const int u_first = partition * u_run * KEYS;
                     if (u_first < u_total) {
-                        int base = 0;
-                        for (int index = 0; index <= spans; ++index) {
-                            Span s = span(in, static_cast<u64>(first_token + u_head), static_cast<u64>(index),
-                                          static_cast<u64>(spans));
+                        // The first span of the head and tail rows' union
+                        // ending past `u_first` (`reduce::span_locate`).
+                        const auto merged = [&](u64 index) {
+                            Span s = span(in, static_cast<u64>(first_token + u_head), index, static_cast<u64>(spans));
                             if (u_tail != u_head) {
-                                const Span s1 = span(in, static_cast<u64>(first_token + u_tail),
-                                                     static_cast<u64>(index), static_cast<u64>(spans));
+                                const Span s1 =
+                                    span(in, static_cast<u64>(first_token + u_tail), index, static_cast<u64>(spans));
                                 if (s1.hi > s1.lo) {
                                     if (s.hi > s.lo) {
                                         s.lo = min(s.lo, s1.lo);
@@ -1344,13 +1392,19 @@ __device__ __forceinline__ void attend(const Inputs &in, const History &history,
                                     }
                                 }
                             }
-                            const int len = max(s.hi - s.lo, 0);
-                            if (u_first < base + len) {
-                                u_shift0 = s.lo - base;
-                                u_end0 = base + len;
-                                break;
-                            }
-                            base += len;
+                            return s;
+                        };
+                        const reduce::Located at = reduce::span_locate(
+                            static_cast<u64>(spans) + 1, u_first,
+                            [&](u64 index) {
+                                const Span s = merged(index);
+                                return max(s.hi - s.lo, 0);
+                            },
+                            lane);
+                        if (at.span <= static_cast<u64>(spans)) {
+                            const Span s = merged(at.span);
+                            u_shift0 = s.lo - static_cast<int>(at.offset);
+                            u_end0 = static_cast<int>(at.offset) + max(s.hi - s.lo, 0);
                         }
                     }
                 }
@@ -1526,57 +1580,68 @@ __device__ __forceinline__ void attend(const Inputs &in, const History &history,
                 : min(max(plan->walk[step.index].historical - step.first, 0), KEYS);
         else return step.span < spans ? KEYS : 0;
     };
-    // Rare multi-span straddling history tile (`step.first + held > w.span0_end`):
-    // lane `lane_r` resolves row `lane_r`'s history token once per tile (`KEYS <= 32`)
-    // from `plan` behind a value barrier so the hot loop carries no span state.
+    // A straddling history tile (`step.first + held > w.span0_end`: rare in
+    // dense history, every tile past a walk's first span in selected
+    // history): lane r places key `s_first` + r of the walk's sequence (its
+    // row's spans, or prefixed the union of its head and tail rows'). The
+    // warp takes the spans 32 a round, an inclusive prefix of their lengths
+    // per round, and each lane finds its key's span by a binary search of the
+    // round's prefix, so no lane walks the spans one by one. The plan is read
+    // behind a value barrier so the hot loop carries no span state. The whole
+    // warp calls it (`lane_r` its lane).
     static_assert(KEYS <= 32, "a key tile's rows fit one warp's lanes");
     auto cold_lane_token = [&](int s_idx, int s_first, int &s_held, int lane_r) -> int {
         u8 *p_base = reinterpret_cast<u8 *>(plan);
         asm volatile("" : "+r"(s_idx), "+r"(s_first), "+r"(s_held), "+l"(p_base));
         const PositionPlan *lp = reinterpret_cast<const PositionPlan *>(p_base);
         const PositionWalk &w = lp->walk[s_idx];
-        int st = -1;
-        if (lane_r < s_held) {
-            const int ordinal = s_first + lane_r;
-            if (ordinal < w.span0_end) {
-                st = ordinal + w.shift0;
-            } else {
-                const int *vis = lp->visible;
-                const u64 s0 = lp->vis_s0;
-                const u64 s1 = lp->vis_s1;
-                const int *vis_head = vis + static_cast<u64>(lp->first_token + w.row) * s0;
-                const int tail_row = lp->prefixed ? lp->single.tail_row : w.row;
-                const int *vis_tail = vis + static_cast<u64>(lp->first_token + tail_row) * s0;
-                const int nspans = lp->spans;
-                int base = 0;
-                for (int index = 0; index < nspans; ++index) {
-                    const int *sp0 = vis_head + static_cast<u64>(index) * s1;
-                    int lo = sp0[0];
-                    int hi = sp0[SEISMIC_VISIBLE_STRIDE_2];
-                    if (tail_row != w.row) {
-                        const int *sp1 = vis_tail + static_cast<u64>(index) * s1;
-                        const int lo1 = sp1[0];
-                        const int hi1 = sp1[SEISMIC_VISIBLE_STRIDE_2];
-                        if (hi1 > lo1) {
-                            if (hi > lo) {
-                                lo = min(lo, lo1);
-                                hi = max(hi, hi1);
-                            } else {
-                                lo = lo1;
-                                hi = hi1;
-                            }
+        const int ordinal = s_first + lane_r;
+        const bool wanted = lane_r < s_held;
+        int st = wanted && ordinal < w.span0_end ? ordinal + w.shift0 : -1;
+        const int *vis = lp->visible;
+        const u64 s0 = lp->vis_s0;
+        const u64 s1 = lp->vis_s1;
+        const int *vis_head = vis + static_cast<u64>(lp->first_token + w.row) * s0;
+        const int tail_row = lp->prefixed ? lp->single.tail_row : w.row;
+        const int *vis_tail = vis + static_cast<u64>(lp->first_token + tail_row) * s0;
+        const int nspans = lp->spans;
+        int carried = 0;
+        for (int base = 0; base < nspans && __any_sync(0xffffffffu, wanted && st < 0); base += 32) {
+            const int index = base + lane_r;
+            int lo = 0, length = 0;
+            if (index < nspans) {
+                const int *sp0 = vis_head + static_cast<u64>(index) * s1;
+                lo = sp0[0];
+                int hi = sp0[SEISMIC_VISIBLE_STRIDE_2];
+                if (tail_row != w.row) {
+                    const int *sp1 = vis_tail + static_cast<u64>(index) * s1;
+                    const int lo1 = sp1[0];
+                    const int hi1 = sp1[SEISMIC_VISIBLE_STRIDE_2];
+                    if (hi1 > lo1) {
+                        if (hi > lo) {
+                            lo = min(lo, lo1);
+                            hi = max(hi, hi1);
+                        } else {
+                            lo = lo1;
+                            hi = hi1;
                         }
                     }
-                    const int length = max(hi - lo, 0);
-                    if (ordinal < base + length) {
-                        st = lo + ordinal - base;
-                        break;
-                    }
-                    base += length;
                 }
-                if (st < 0) __trap();
+                length = max(hi - lo, 0);
             }
+            const int end = carried + reduce::lanes_inclusive_add(length, lane_r);
+            // The round's first span ending past this lane's key (ends ascend).
+            int at = 0;
+#pragma unroll
+            for (int step = 16; step > 0; step >>= 1)
+                if (__shfl_sync(0xffffffffu, end, at + step - 1) <= ordinal) at += step;
+            const int at_end = __shfl_sync(0xffffffffu, end, at);
+            const int at_lo = __shfl_sync(0xffffffffu, lo, at);
+            const int at_length = __shfl_sync(0xffffffffu, length, at);
+            if (wanted && st < 0 && ordinal < at_end) st = at_lo + ordinal - (at_end - at_length);
+            carried = __shfl_sync(0xffffffffu, end, 31);
         }
+        if (wanted && st < 0) __trap();
         return st;
     };
     auto tokens_at = [](int row_tokens) {

@@ -2351,7 +2351,7 @@ fn decode_reads_spans_crossing_affine_history_slabs() {
 /// and the row's key count without walking the table serially.
 #[test]
 fn decode_reads_scattered_selected_runs() {
-    scattered_selected_runs(GROUPED);
+    scattered_selected_runs(GROUPED, false);
 }
 
 /// A selected read at Flash Next's attention geometry (12 query heads a kv
@@ -2359,12 +2359,22 @@ fn decode_reads_scattered_selected_runs() {
 /// one team and two teams of slices each gather the runs' keys into tiles.
 #[test]
 fn decode_reads_scattered_selected_runs_in_column_slices() {
-    scattered_selected_runs(SLICED);
+    scattered_selected_runs(SLICED, false);
+}
+
+/// Verify rows sharing a selected read (the same scattered runs, each row its
+/// own fresh rows) at Flash Next's attention geometry: the matrix form walks
+/// the rows' union once, its key tiles straddling runs across several rounds
+/// of 32 spans.
+#[test]
+fn decode_reads_shared_scattered_selected_runs() {
+    scattered_selected_runs(SLICED, true);
 }
 
 /// Rows reading scattered few-key runs (QSA's selected blocks) beside one
-/// long run, and a second row mixing runs of other lengths.
-fn scattered_selected_runs(geometry: Geometry) {
+/// long run, and a second row mixing runs of other lengths, or (`shared`)
+/// reading the first row's runs.
+fn scattered_selected_runs(geometry: Geometry, shared: bool) {
     let mut scattered = (0..70).map(|block| (8 * block, 8 * block + 4)).collect::<Vec<_>>();
     scattered.extend([(560, 573), (0, 0), (0, 0), (0, 0)]);
     let mut mixed = vec![(3, 9), (0, 0), (30, 34)];
@@ -2373,16 +2383,16 @@ fn scattered_selected_runs(geometry: Geometry) {
     mixed.push((540, 572));
     let rows = [
         Row {
-            spans: scattered,
+            spans: scattered.clone(),
             fresh: (0, 1),
             destination: 573,
             position: 573,
         },
         Row {
-            spans: mixed,
-            fresh: (1, 2),
+            spans: if shared { scattered.clone() } else { mixed },
+            fresh: if shared { (0, 2) } else { (1, 2) },
             destination: 574,
-            position: 572,
+            position: if shared { 574 } else { 572 },
         },
     ];
     let spans = rows[0].spans.len();
