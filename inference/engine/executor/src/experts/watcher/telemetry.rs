@@ -2146,14 +2146,19 @@ impl SiteRequests {
 /// Whether the workload is GPU-bound so within-token hint launches
 /// (`routed_hint_route`) add pure GPU overhead without hiding a binding path:
 /// neither drive nor link approaches compute (`max(drive, link) < 0.5 * C`)
-/// and the measured drive busy fraction is below 0.25 (never suppressing while
-/// `drive_busy_fraction` is still `None` / warming up, or on a discrete GPU
-/// whose drive is busy).
-fn hints_suppressed_gpu_bound(terms: magnitude_cost_model::Terms, drive_busy_fraction: Option<f64>) -> bool {
+/// and either the host tier holds every expert (`tier_complete`, zero NVMe
+/// reads) or the measured drive busy fraction is below 0.25 (never suppressing
+/// while `drive_busy_fraction` is still `None` / warming up on a drive-backed
+/// load, or when the drive is busy).
+fn hints_suppressed_gpu_bound(
+    terms: magnitude_cost_model::Terms,
+    drive_busy_fraction: Option<f64>,
+    tier_complete: bool,
+) -> bool {
     let path = terms.drive.max(terms.link);
     terms.compute > 0.0
         && path < 0.5 * terms.compute
-        && drive_busy_fraction.is_some_and(|fraction| fraction < 0.25)
+        && (tier_complete || drive_busy_fraction.is_some_and(|fraction| fraction < 0.25))
 }
 
 impl Telemetry {
@@ -3354,8 +3359,8 @@ impl Telemetry {
         // drive-bound or link-bound workloads.
         let gpu_bound = costs
             .passes
-            .terms()
-            .is_some_and(|(terms, _)| hints_suppressed_gpu_bound(terms, busy));
+            .pass_terms()
+            .is_some_and(|terms| hints_suppressed_gpu_bound(terms, busy, link_line.is_some()));
         let latest = costs.passes.latest();
         costs.hints_gate.decide(whole, prices, miss, latest, |target, lead, miss| {
             !gpu_bound && admitted(target, lead, miss)
@@ -4118,31 +4123,37 @@ mod served_tests {
 
         // M4 Pro Qwen3.8 87.5% resident: GPU-bound, drive_busy_fraction=0.043.
         let gpu_bound_terms = Terms { compute: 0.030, drive: 0.0014, link: 0.0, cpu: 0.0, memory: 0.0 };
-        assert!(super::hints_suppressed_gpu_bound(gpu_bound_terms, Some(0.043)));
-        // Never suppress while drive_busy_fraction is still None (warming up).
-        assert!(!super::hints_suppressed_gpu_bound(gpu_bound_terms, None));
+        assert!(super::hints_suppressed_gpu_bound(gpu_bound_terms, Some(0.043), false));
+        // Never suppress while drive_busy_fraction is still None (warming up) on drive-backed loads.
+        assert!(!super::hints_suppressed_gpu_bound(gpu_bound_terms, None, false));
 
         // Drive busy >= 0.25 keeps hints active even if mean drive term is still ramping.
-        assert!(!super::hints_suppressed_gpu_bound(gpu_bound_terms, Some(0.25)));
-        assert!(!super::hints_suppressed_gpu_bound(gpu_bound_terms, Some(0.80)));
+        assert!(!super::hints_suppressed_gpu_bound(gpu_bound_terms, Some(0.25), false));
+        assert!(!super::hints_suppressed_gpu_bound(gpu_bound_terms, Some(0.80), false));
 
         // Drive-bound (GLM-5.3 / DeepSeek on M2 Pro / M4 Pro): hints stay active.
         let drive_bound_terms = Terms { compute: 0.030, drive: 0.045, link: 0.0, cpu: 0.0, memory: 0.0 };
-        assert!(!super::hints_suppressed_gpu_bound(drive_bound_terms, Some(0.85)));
-        assert!(!super::hints_suppressed_gpu_bound(drive_bound_terms, Some(0.10)));
+        assert!(!super::hints_suppressed_gpu_bound(drive_bound_terms, Some(0.85), false));
+        assert!(!super::hints_suppressed_gpu_bound(drive_bound_terms, Some(0.10), false));
 
-        // Link-bound discrete GPU (100% RAM, drive_busy_fraction=0.0): hints stay active.
+        // Link-bound discrete GPU (100% RAM, drive_busy_fraction=0.0 or None): hints stay active.
         let link_bound_terms = Terms { compute: 0.030, drive: 0.0, link: 0.020, cpu: 0.0, memory: 0.0 };
-        assert!(!super::hints_suppressed_gpu_bound(link_bound_terms, Some(0.0)));
+        assert!(!super::hints_suppressed_gpu_bound(link_bound_terms, Some(0.0), true));
+        assert!(!super::hints_suppressed_gpu_bound(link_bound_terms, None, true));
+
+        // GPU-bound 100%-RAM discrete GPU (tier_complete = true, zero drive bursts -> None):
+        // hints are suppressed because link is far below compute.
+        let light_link_terms = Terms { compute: 0.030, drive: 0.002, link: 0.005, cpu: 0.0, memory: 0.0 };
+        assert!(super::hints_suppressed_gpu_bound(light_link_terms, None, true));
+        assert!(super::hints_suppressed_gpu_bound(light_link_terms, Some(0.0), true));
 
         // Discrete GPU (terms.link > 0) with active drive (978bf6b5: RTX 5090
         // Qwen3.8, drive_busy_fraction = 0.268) or warming up (None): hints stay active.
-        let light_link_terms = Terms { compute: 0.030, drive: 0.002, link: 0.005, cpu: 0.0, memory: 0.0 };
-        assert!(!super::hints_suppressed_gpu_bound(light_link_terms, Some(0.268)));
-        assert!(!super::hints_suppressed_gpu_bound(light_link_terms, Some(0.25)));
-        assert!(!super::hints_suppressed_gpu_bound(light_link_terms, None));
-        // Only suppress when both path < 0.5 * compute AND drive_busy_fraction < 0.25.
-        assert!(super::hints_suppressed_gpu_bound(light_link_terms, Some(0.0)));
+        assert!(!super::hints_suppressed_gpu_bound(light_link_terms, Some(0.268), false));
+        assert!(!super::hints_suppressed_gpu_bound(light_link_terms, Some(0.25), false));
+        assert!(!super::hints_suppressed_gpu_bound(light_link_terms, None, false));
+        // Only suppress on drive-backed loads when both path < 0.5 * compute AND drive_busy_fraction < 0.25.
+        assert!(super::hints_suppressed_gpu_bound(light_link_terms, Some(0.0), false));
 
         // DriveEngagement::drive_busy_fraction returns None before decode bursts, Some after.
         let engagement = super::DriveEngagement::default();

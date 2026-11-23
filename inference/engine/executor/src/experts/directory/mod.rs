@@ -1927,6 +1927,59 @@ impl Directory {
         if short == 0 {
             return 0;
         }
+        let reuse = self.reuse_now();
+        let mut released = 0usize;
+        if self.prompt_reads.is_empty() {
+            // Fast O(short) path: `top_order(group)` is ascending by rank
+            // (lowest-ranked first). Collect up to `want_cands` unwanted
+            // usable+reusable held experts (and up to `want_cands` lowest-ranked
+            // wanted held experts as fallback if fewer than `short` unwanted
+            // exist), stopping as soon as enough unwanted victims are found.
+            let want_cands = short.saturating_add(8);
+            let mut unwanted_cands: Vec<(Staged, usize)> = Vec::with_capacity(want_cands.min(64));
+            let mut wanted_cands: Vec<(Staged, usize)> = Vec::new();
+            for &(_, layer, expert) in reuse.top_order(group) {
+                if self.is_layer_whole_published(layer) {
+                    continue;
+                }
+                let Some(record) = self.bank.held(layer, expert) else {
+                    continue;
+                };
+                if !self.bank.usable_when(group, record, lending) || !can_reuse(record) {
+                    continue;
+                }
+                if self.unwanted[layer].contains(&expert) {
+                    unwanted_cands.push(((layer, expert), record));
+                    if unwanted_cands.len() >= want_cands {
+                        break;
+                    }
+                } else if wanted_cands.len() < want_cands {
+                    wanted_cands.push(((layer, expert), record));
+                }
+            }
+            drop(reuse);
+            for (staged @ (layer, expert), record) in unwanted_cands.into_iter().chain(wanted_cands) {
+                if released >= short {
+                    break;
+                }
+                let exit = self.exit_now(group, record, staged);
+                // Skip victims that require a write-back copy into HostTier;
+                // demand replenishment only needs fast stamped-unmap releases.
+                if exit.back().is_some() {
+                    continue;
+                }
+                self.bank.release(group, BankRecord(record as u32), at.into(), exit);
+                self.left_bank(layer, expert, None);
+                released += 1;
+            }
+            if released >= short {
+                return released;
+            }
+            // Rare fallback (e.g. >8 write-back skips on a 3-tier bank): scan
+            // remaining eligible experts for the remaining shortfall.
+        } else {
+            drop(reuse);
+        }
         let members = self.homes[group].iter().map(|&(_, layer)| layer).collect::<Vec<_>>();
         let reuse = self.reuse_now();
         let ranker = reuse.ranker(group, Tier::COMPUTE, Reader::Move);
@@ -1950,7 +2003,6 @@ impl Directory {
         }
         drop(reuse);
         candidates.sort_unstable_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.cmp(&b.1)));
-        let mut released = 0usize;
         for (_, _, staged @ (layer, expert), record) in candidates {
             if released >= short {
                 break;
@@ -2015,12 +2067,22 @@ impl Directory {
                     if held_total + replenish_target < self.bank.capacity(group) {
                         uses >= 0.0
                     } else {
-                        let min_floor = members
-                            .iter()
-                            .filter(|&&l| !self.is_layer_whole_published(l))
-                            .flat_map(|&l| self.unwanted[l].iter().map(move |&e| (l, e)))
-                            .map(|s| self.uses(ranker, s))
-                            .reduce(f64::min);
+                        let min_floor = if self.prompt_reads.is_empty() {
+                            reuse
+                                .top_order(group)
+                                .iter()
+                                .find(|&&(_, l, e)| {
+                                    !self.is_layer_whole_published(l) && self.unwanted[l].contains(&e)
+                                })
+                                .map(|&(_, l, e)| self.uses(ranker, (l, e)))
+                        } else {
+                            members
+                                .iter()
+                                .filter(|&&l| !self.is_layer_whole_published(l))
+                                .flat_map(|&l| self.unwanted[l].iter().map(move |&e| (l, e)))
+                                .map(|s| self.uses(ranker, s))
+                                .reduce(f64::min)
+                        };
                         min_floor.is_some_and(|floor| uses >= floor)
                     }
                 }

@@ -211,7 +211,7 @@ pub(crate) fn merge_set_seeded_tiered(plans: &[PrefillPlan]) -> Vec<(i32, i32)> 
 /// zero-miss resident layers gate onto pipelined `RunStage::Whole` and probe
 /// periodically for working-set shifts.
 const SPLIT_DMA_MIN_BYTES: u64 = 1;
-const SPLIT_DMA_WARMUP_CALLS: u32 = 8;
+const SPLIT_DMA_WARMUP_CALLS: u32 = 2;
 const SPLIT_DMA_COOLDOWN_STEPS: u32 = 256;
 const SPLIT_DMA_STAGGER_SLOTS: u32 = 64;
 const SPLIT_DMA_STAGGER_STRIDE: u32 = 4;
@@ -868,6 +868,15 @@ impl ExpertTransport {
             .lock()
             .expect("transport registry")
             .can_reuse_slot(dest)
+    }
+
+    /// Evaluate `f` with a batch slot-reuse predicate under a single
+    /// `registry` mutex acquisition (avoids per-slot lock churn when scanning
+    /// candidate slots in `Directory`).
+    pub(crate) fn with_slot_reuse<R>(&self, f: impl FnOnce(&mut dyn FnMut(DestSlot) -> bool) -> R) -> R {
+        let reg = self.registry.lock().expect("transport registry");
+        let mut check = |dest: DestSlot| reg.can_reuse_slot(dest);
+        f(&mut check)
     }
 
     /// Detach a single demand consumer without cancelling pending DMA or

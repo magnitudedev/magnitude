@@ -65,7 +65,7 @@ extern "C" __global__ void __launch_bounds__(attention::prefill::MMA_THREADS + a
             reinterpret_cast<float *>(SEISMIC_PTR(SEISMIC_BUFFER_SCRATCH_PARTIALS)),
             reinterpret_cast<float *>(SEISMIC_PTR(SEISMIC_BUFFER_SCRATCH_STATISTICS))},
         attention::prefill::Block{static_cast<int>(blockIdx.z), static_cast<int>(blockIdx.x),
-                                static_cast<int>(blockIdx.y), SEISMIC_TUNE_PARTS});
+                                static_cast<int>(blockIdx.y), static_cast<int>(gridDim.y)});
 }
 
 #else
@@ -230,10 +230,11 @@ extern "C" __global__ void __launch_bounds__(WARPS * 32)
 
     // Equal partitions of the row's keys, then equal key-group ranges of this
     // one.
+    const int active_parts = static_cast<int>(gridDim.y);
     const u64 spans = SEISMIC_DIM_R;
     const long long total = attention::visible_total(in, row, spans, lane);
     const attention::Range partition =
-        attention::partition(attention::Range{0, total}, attention::partition_run(total, 1, PARTS), part);
+        attention::partition(attention::Range{0, total}, attention::partition_run(total, 1, active_parts), part);
     const attention::Range slice = attention::partition(
         partition, (partition.hi - partition.lo + GROUPS - 1) / GROUPS, warp / SLICES);
 
@@ -313,7 +314,7 @@ extern "C" __global__ void __launch_bounds__(WARPS * 32)
     }
     fold(state, bias);
     attention::publish<WARPS, PARTS, SLICES>(state, exchange, warp_stats, partials, statistics, row,
-                                             kv, part, warp, lane);
+                                             kv, part, warp, lane, active_parts);
 }
 
 #endif
@@ -322,9 +323,13 @@ extern "C" __global__ void attention_decode_k8v4_merge(SEISMIC_KERNEL_PARAMS) {
     // Let a programmatic dependent start (its first weight loads overlap this
     // launch; it still waits for this launch's completion).
     seismic_dependents_launch();
+    constexpr int Q_TILE =
+        SEISMIC_TUNE_MATRIX ? ((SEISMIC_TUNE_WARPS * 16 / SEISMIC_DIM_G) > 0 ? (SEISMIC_TUNE_WARPS * 16 / SEISMIC_DIM_G) : 1) : 1;
+    const int row_slices = static_cast<int>((SEISMIC_DIM_M + Q_TILE - 1) / Q_TILE);
+    const int active_parts = (SEISMIC_TUNE_PARTS + row_slices - 1) / row_slices;
     attention::decode_gate<SEISMIC_TUNE_PARTS>(
         ATTENTION_INPUTS(),
         reinterpret_cast<const float *>(SEISMIC_PTR(SEISMIC_BUFFER_SCRATCH_PARTIALS)),
         reinterpret_cast<const float *>(SEISMIC_PTR(SEISMIC_BUFFER_SCRATCH_STATISTICS)),
-        SEISMIC_RESULT_0_OUT, blockIdx.x, blockIdx.y, threadIdx.x);
+        SEISMIC_RESULT_0_OUT, blockIdx.x, blockIdx.y, threadIdx.x, active_parts);
 }

@@ -596,7 +596,7 @@ struct DecodeRows {
             const long long token = first_token + i / G;
             if (token >= rows_total) continue;
             const u64 slot =
-                (static_cast<u64>(token) * KV * G + block.kv * G + i % G) * PARTS + block.partition;
+                (static_cast<u64>(token) * KV * G + block.kv * G + i % G) * block.parts + block.partition;
             statistics[slot * 2 + 0] = -__int_as_float(0x7f800000);
             statistics[slot * 2 + 1] = 0.0f;
         }
@@ -641,7 +641,7 @@ struct DecodeRows {
                                           int half, int t, float maximum,
                                           float denominator) const {
         const u64 slot =
-            (static_cast<u64>(token) * KV * G + query_head) * PARTS + block.partition;
+            (static_cast<u64>(token) * KV * G + query_head) * block.parts + block.partition;
 #pragma unroll
         for (int n = 0; n < N; ++n) {
 #pragma unroll

@@ -487,7 +487,7 @@ projection routed for cuda:
     where STAGES * (TILE * 144 + SERVED * 10240) + SERVED * COEF_BYTES <= device.shared_bytes_per_group for grouped
     where (OPERAND == 0 or INT8 == 0) for grouped
     where (INT8 == 0 or each(W, form(W, INT8) == 1)) for grouped
-    scratch operands bytes (M * WIDTH * 2) when (SHARED == 1 or (GATHERED == 1 and M >= 2 and M <= VERIFY_ROWS and PER_ROW == 0)) and any(W, operands(W) == 1) for choice
+    scratch operands bytes (M * WIDTH * 2) when (SHARED == 1 or ((GATHERED == 1 or M >= 4) and M >= 2 and M <= VERIFY_ROWS and PER_ROW == 0)) and any(W, operands(W) == 1) for choice
     each W:
         scratch operands bytes (M * K * WIDTH * 2) when STACKED == 1 and (SHARED == 1 or M > 1) and operands(W) == 1 for summed
         scratch operands bytes (M * WIDTH * 2) when STACKED == 0 and operands(W) == 1 for summed
@@ -501,16 +501,16 @@ projection routed for cuda:
     scratch expand_grid bytes (12) when STACKED == 1 for grouped
     scratch quantize_grid bytes (12) when STACKED == 1 for grouped
     scratch down_grid bytes (12) when STACKED == 1 for grouped
-    launch stage for choice when (SHARED == 1 or (GATHERED == 1 and M >= 2 and M <= VERIFY_ROWS and PER_ROW == 0)) and any(W, operands(W) == 1):
+    launch stage for choice when (SHARED == 1 or ((GATHERED == 1 or M >= 4) and M >= 2 and M <= VERIFY_ROWS and PER_ROW == 0)) and any(W, operands(W) == 1):
         staging
         threadgroups (M, 1, 1)
         threads_per_threadgroup (256, 1, 1)
-    launch choice for choice when GATHERED == 0 or M < 2 or M > VERIFY_ROWS or PER_ROW == 1:
+    launch choice for choice when (GATHERED == 0 and M < 4) or M < 2 or M > VERIFY_ROWS or PER_ROW == 1:
         reads (TPW, KSPLIT)
         threadgroups (DECODE_GROUPS, M * K + SHARED, 1)
         threads_per_threadgroup (128, 1, 1)
         shared_bytes (most(W, WIDTH) * SHARED_ROW_PAIR_BYTES / 2)
-    launch gathered for choice when GATHERED == 1 and M >= 2 and M <= VERIFY_ROWS and PER_ROW == 0:
+    launch gathered for choice when (GATHERED == 1 or M >= 4) and M >= 2 and M <= VERIFY_ROWS and PER_ROW == 0:
         reads (GATHER_TPW, KSPLIT)
         threadgroups (GATHER_GROUPS, M * K + SHARED, 1)
         threads_per_threadgroup (128, 1, 1)

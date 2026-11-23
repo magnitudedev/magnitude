@@ -1108,8 +1108,10 @@ impl Watcher {
         let mut held = residency::lock(&self.state);
         let lending = held.core.steps.lending();
         let transport = self.shared.transport.clone();
-        held.core.directory.claim_demand_landing(group, tier_record, lending, |slot| {
-            transport.can_reuse_slot(crate::experts::transport::DestSlot { group, slot })
+        transport.with_slot_reuse(|can_reuse| {
+            held.core.directory.claim_demand_landing(group, tier_record, lending, |slot| {
+                can_reuse(crate::experts::transport::DestSlot { group, slot })
+            })
         })
     }
 
@@ -1132,8 +1134,10 @@ impl Watcher {
         let core = &mut held.core;
         let (directory, steps) = (&mut core.directory, &core.steps);
         let _released = steps.unbegun(|at| {
-            directory.replenish_demand_free(group, want_free, at, |slot| {
-                transport.can_reuse_slot(crate::experts::transport::DestSlot { group, slot })
+            transport.with_slot_reuse(|can_reuse| {
+                directory.replenish_demand_free(group, want_free, at, |slot| {
+                    can_reuse(crate::experts::transport::DestSlot { group, slot })
+                })
             })
         });
     }
@@ -1155,31 +1159,46 @@ impl Watcher {
         let progress = held.core.steps.point(sequence, layer, sequence);
         let transport = self.shared.transport.clone();
         let mut promoted_any = false;
+        let mut landed_at_home = false;
         let core = &mut held.core;
         let (directory, steps) = (&mut core.directory, &core.steps);
-        for &slot in slots {
-            let can_reuse = transport.can_reuse_slot(crate::experts::transport::DestSlot {
-                group: slot.group,
-                slot: slot.slot,
-            });
-            promoted_any |= directory.finish_demand_landing(
-                slot.group,
-                slot.slot,
-                slot.staged,
-                progress,
-                steps,
-                can_reuse,
-            );
-        }
+        transport.with_slot_reuse(|can_reuse| {
+            for &slot in slots {
+                let reusable = can_reuse(crate::experts::transport::DestSlot {
+                    group: slot.group,
+                    slot: slot.slot,
+                });
+                let promoted = directory.finish_demand_landing(
+                    slot.group,
+                    slot.slot,
+                    slot.staged,
+                    progress,
+                    steps,
+                    reusable,
+                );
+                if promoted {
+                    promoted_any = true;
+                    if let Some((staged_layer, staged_expert)) = slot.staged {
+                        if slot.slot == directory.home(staged_layer) + staged_expert {
+                            landed_at_home = true;
+                        }
+                    }
+                }
+            }
+            if promoted_any {
+                let group = slots[0].group;
+                steps.unbegun(|at| {
+                    directory.replenish_demand_free(group, 0, at, |slot| {
+                        can_reuse(crate::experts::transport::DestSlot { group, slot })
+                    })
+                });
+            }
+        });
         if promoted_any {
-            let group = slots[0].group;
-            steps.unbegun(|at| {
-                directory.replenish_demand_free(group, 0, at, |slot| {
-                    transport.can_reuse_slot(crate::experts::transport::DestSlot { group, slot })
-                })
-            });
             held.publish_held();
-            held.publish_policy();
+            if landed_at_home {
+                held.publish_policy();
+            }
         }
     }
 }

@@ -346,6 +346,12 @@ impl Passes {
         (all.pass.reads > 0.).then(|| (terms, all.pass.drive / all.pass.reads))
     }
 
+    /// Per-pass cost terms whenever at least one decode pass has been timed
+    /// (including 100%-RAM `tier_complete` loads where `all.pass.reads == 0`).
+    pub fn pass_terms(&mut self) -> Option<Terms> {
+        self.all().terms()
+    }
+
     /// What a Drive-path read ahead is admitted by over the window
     /// ([`PathAdmission`]), given the drive's measured read line (`drive_line`).
     pub fn read_admission(&mut self, drive_line: Option<ReadLine>) -> PathAdmission {

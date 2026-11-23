@@ -394,7 +394,7 @@ __device__ __forceinline__ float merge(const float *statistics, u64 stride, cons
 // convergently; `statistics` is 8-byte aligned.
 template <int COUNT>
 __device__ __forceinline__ float merge_weights(const float *statistics, float *weights,
-                                               float &denominator, int lane) {
+                                               float &denominator, int lane, int count = COUNT) {
     static_assert(COUNT > 0, "merge_weights requires at least one partition");
     constexpr int PER_LANE = (COUNT + 31) / 32;
     float2 stat[PER_LANE];
@@ -402,7 +402,7 @@ __device__ __forceinline__ float merge_weights(const float *statistics, float *w
 #pragma unroll
     for (int i = 0; i < PER_LANE; ++i) {
         const int p = lane + i * 32;
-        if (p < COUNT) {
+        if (p < count) {
             const float2 s = reinterpret_cast<const float2 *>(statistics)[p];
             stat[i] = s;
             if (s.y > 0.0f) local_max = fmaxf(local_max, s.x);
@@ -413,7 +413,7 @@ __device__ __forceinline__ float merge_weights(const float *statistics, float *w
 #pragma unroll
     for (int i = 0; i < PER_LANE; ++i) {
         const int p = lane + i * 32;
-        if (p < COUNT) {
+        if (p < count) {
             const float l = stat[i].y;
             float weight = 0.0f;
             if (l > 0.0f) {
@@ -437,13 +437,13 @@ __device__ __forceinline__ float merge_weights(const float *statistics, float *w
 template <int WARPS, int PARTS, int SLICES = 1, int H>
 __device__ __forceinline__ void publish(const Heads<H> &state, float *exchange, float *warp_stats,
                                         float *partials, float *statistics, u64 row, int kv,
-                                        int part, int warp, int lane) {
+                                        int part, int warp, int lane, int parts = PARTS) {
     static_assert(H * SLICES == G && WARPS % SLICES == 0, "slices split the group and the warps");
     constexpr int GROUPS = WARPS / SLICES;
     if constexpr (GROUPS == 1) {
 #pragma unroll
         for (int h = 0; h < H; ++h) {
-            const u64 at = (row * KV * G + kv * G + warp * H + h) * PARTS + part;
+            const u64 at = (row * KV * G + kv * G + warp * H + h) * parts + part;
             element::f32_span_store(partials + at * W + lane * DPL, state.accumulator[h]);
             if (lane == 0) {
                 reinterpret_cast<float2 *>(statistics)[at] =
@@ -489,14 +489,14 @@ __device__ __forceinline__ void publish(const Heads<H> &state, float *exchange, 
                 }
                 stats[g * STAT_STRIDE] = weight;
             }
-            const u64 at = (row * KV * G + kv * G + slice * H + h) * PARTS + part;
+            const u64 at = (row * KV * G + kv * G + slice * H + h) * parts + part;
             reinterpret_cast<float2 *>(statistics)[at] = make_float2(maximum, denominator);
         }
         __syncthreads();
         for (int item = threadIdx.x; item < SLICES * W; item += WARPS * 32) {
             const int slice = item / W;
             const int column = item % W;
-            const u64 at = (row * KV * G + kv * G + slice * H + h) * PARTS + part;
+            const u64 at = (row * KV * G + kv * G + slice * H + h) * parts + part;
             const float *weights = warp_stats + (slice * H + h) * 2;
             const float *values = exchange + slice * W + column;
             float accumulator = 0.0f;
