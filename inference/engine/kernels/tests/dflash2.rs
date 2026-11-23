@@ -556,7 +556,98 @@ fn partitioned_top_k_matches_full_vocabulary_on_accelerators() {
         let backend = device.backend();
         for vocabulary in [8192usize, 8193, 8199, 65_536, 248_320] {
             top_k_orders_by_value_then_token(&device, vocabulary, 16);
-            eprintln!("{backend:?} partitioned top-k V={vocabulary} passed exact host comparison");
+            eprintln!("{backend:?} partitioned top-k V={vocabulary} K=16 passed exact host comparison");
+        }
+        // Shortlist K=64 (tile merge) and K=128 (streaming merge on V=248_320)
+        // with heavy cross-partition ties at the K-th rank.
+        for count in [64usize, 128] {
+            top_k_orders_by_value_then_token(&device, 248_320, count);
+            eprintln!("{backend:?} partitioned top-k V=248320 K={count} passed exact host comparison");
+        }
+        top_k_breaks_heavy_ties_across_partitions(&device);
+    }
+}
+
+fn top_k_breaks_heavy_ties_across_partitions(device: &Device) {
+    let charges = seismic::Charges::tally(device);
+    let (rows, vocabulary, count) = (2usize, 12_288usize, 64usize);
+    let mut logits = vec![-1.0f32; rows * vocabulary];
+    // Row 0: 200 tied tokens at 5.0 scattered across all 3 partitions (must pick
+    // the 64 lowest token indices), plus 10 strictly higher tokens at 8.0.
+    for i in 0..10 {
+        logits[i * 1000 + 300] = 8.0;
+    }
+    for i in 0..200 {
+        let tok = (i * 59 + 17) % vocabulary;
+        if logits[tok] < 5.0 {
+            logits[tok] = 5.0;
         }
     }
+    // Row 1: mix of -0.0, +0.0, and negative values with ties at 0.0.
+    for tok in (0..vocabulary).step_by(37) {
+        logits[vocabulary + tok] = if tok % 2 == 0 { -0.0f32 } else { 0.0f32 };
+    }
+    let implementation = draft_top_k::native_implementation(device)
+        .unwrap()
+        .expect("draft_top_k has a native implementation on every device");
+    let kernel = declared::prepared(
+        device,
+        &draft_top_k::native_entry(),
+        &specialization(
+            &implementation.statics,
+            |fixed| implementation.default_specialization(fixed).unwrap(),
+            &[
+                ("M", rows as u64),
+                ("V", vocabulary as u64),
+                ("K", count as u64),
+            ],
+        ),
+    )
+    .unwrap();
+    let mut candidates = tensor(
+        device,
+        Element::i32(),
+        &[rows * count, 2],
+        &i32_bytes(&vec![-7; rows * count * 2]),
+    );
+    let mut unary = tensor(
+        device,
+        Element::f32(),
+        &[rows, count],
+        &f32_bytes(&vec![0.0; rows * count]),
+    );
+    kernel
+        .call(&charges, draft_top_k::Args {
+            logits: &tensor(
+                device,
+                Element::f32(),
+                &[rows, vocabulary],
+                &f32_bytes(&logits),
+            ),
+            candidates: &mut candidates,
+            unary: &mut unary,
+        })
+        .unwrap();
+    let mut expected_tokens = Vec::new();
+    let mut expected_values = Vec::new();
+    for row in 0..rows {
+        let mut order = (0..vocabulary).collect::<Vec<_>>();
+        let line = &logits[row * vocabulary..][..vocabulary];
+        order.sort_by(|a, b| {
+            let va = if line[*a] == 0.0 { 0.0f32 } else { line[*a] };
+            let vb = if line[*b] == 0.0 { 0.0f32 } else { line[*b] };
+            vb.total_cmp(&va).then(a.cmp(b))
+        });
+        for &token in &order[..count] {
+            expected_tokens.extend([token as i32, 0]);
+            expected_values.push(line[token]);
+        }
+    }
+    assert_eq!(
+        i32_values(&candidates.read_to_host().unwrap()),
+        expected_tokens,
+        "{:?} draft_top_k heavy ties candidates",
+        device.backend()
+    );
+    assert_eq!(f32_values(&unary.read_to_host().unwrap()), expected_values);
 }
