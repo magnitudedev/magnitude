@@ -144,9 +144,6 @@ fn readout_project_rows[O, V, D, S, I, WS](features: &tensor[O, D] A,
 native readout_project_rows for metal from "metal/readout_project_rows.metal":
     static (V, D, S, I, WS)
     project dense single (weight) gathered token_rows
-    restate single_gemv
-    restate GATHER_SIMDGROUPS in [16, 8, 4, 2] default 16
-    restate arithmetic GATHER_LANES in [16, 32] default 16
     scratch staged bytes (O * D * 2) when I == 0 and (O > PROJECTION_GEMV_MAX_M or O >= MATRIX_FROM) and operands(OW) == 1
     launch readout_project_rows_stage before batch when I == 0 and (O > PROJECTION_GEMV_MAX_M or O >= MATRIX_FROM) and operands(OW) == 1:
         staging
@@ -161,8 +158,6 @@ native readout_project_rows for metal from "metal/readout_project_rows.metal":
 native readout_project_rows for cuda from "cuda/readout_project_rows.cu":
     static (V, D, S, I, WS)
     project dense single (weight) gathered token_rows
-    restate arithmetic KSPLIT in [4] default 4
-    restate arithmetic GATHER_KSPLIT in [4] default 4
     restate arithmetic SPLIT in [1, 2] default 1
 
 # Vulkan: as Metal, where I is 0 the `dense` projection (single) over the
@@ -173,7 +168,6 @@ native readout_project_rows for vulkan from "vulkan/readout_project_rows.comp":
     static (V, D, S, I, WS)
     where (I > 0 or ceil_div(S, SIMDGROUPS * ROWS * 32 / LANES) <= device.max_grid_x) and (I == 0 or ceil_div(S, GATHER_SIMDGROUPS * GATHER_ROWS) <= device.max_grid_x)
     project dense single (weight) gathered token_rows
-    restate GATHER_SIMDGROUPS in [8, 4, 2] default 8
 
 native readout_project_rows for cpu from "cpu/readout_project_rows.rs":
     static (WS, I)

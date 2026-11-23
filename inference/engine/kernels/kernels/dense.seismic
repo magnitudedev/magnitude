@@ -360,15 +360,6 @@ projection dense for metal:
     launch unpacked when ORDERED_ANY == 0 and M > 64 and PACK == 1 and PLANES == 0:
         threadgroups (tiles(W, ceil_div(N, 64 / SERVED)), ceil_div(M, 64), 1)
         threads_per_threadgroup (128, 1, 1)
-    # An entry that ran one GEMV launch for every row count below
-    # VERIFY_ROWS takes the `gemv` launch's tile mapping and lanes for the
-    # other two (`restate single_gemv`); the launches' own defaults are the
-    # entries that ran a launch per row class.
-    mapping single_gemv:
-        restate gemv_rows SIMDGROUPS in [16, 8, 4, 2, 32] default 16
-        restate gemv_rows ROWS in [1, 2, 4] default 1
-        restate gemv_pair SIMDGROUPS in [16, 8, 4, 2, 32] default 16
-        restate gemv_pair ROWS in [1, 2, 4] default 1
 
 # CUDA: the K1 projection library (`cuda/common/projection.cuh`). Every K1
 # CUDA entry runs the GEMV to 16 rows and the GEMM beyond, in two row bands.
@@ -692,7 +683,8 @@ projection dense for vulkan:
     let MIXED_GEMV8_HELD = MIXED_GEMV8_REGION + TABLE_REGION * (1 - min(1, 16 * ceil_div(MIXED_GEMV8_REGION + TABLE_REGION, 16) / (device.shared_bytes_per_group + 1)))
     let SPLITS = 1 for paired | segmented
     let SPLITS = SPLIT for single
-    params (SIMDGROUPS in [16, 8, 4, 2, 32] default (16 - 8 * ORDERED_ANY), ROWS in [1, 2, 4] default 1, arithmetic LANES in [16, 32] default (16 + 16 * ORDERED_ANY * (1 - ORDERED_ALL)),
+    params (SIMDGROUPS in [16, 8, 4, 2, 32] default greatest where SIMDGROUPS == 2 or (SIMDGROUPS <= (16 - 8 * ORDERED_ANY) and SIMDGROUPS * 32 <= device.max_group_threads and (GATHERED == 1 or P * G * (1 - GATHERED) * tiles(W, ORDERED * ceil_div(N, 4 * SIMDGROUPS) + (1 - ORDERED) * ceil_div(N, SIMDGROUPS * (2 - ORDERED_ANY * (1 - ORDERED_ALL)))) >= 2 * device.units)),
+        ROWS in [1, 2, 4] default 1, arithmetic LANES in [16, 32] default (16 + 16 * ORDERED_ANY * (1 - ORDERED_ALL)),
         TILE_M in [128, 64, 32] default 64, TILE_N in [128, 64] default 128, SUB_M in [32, 64] default 32, SUB_N in [32, 64] default 32,
         form STAGE in [0, 1] default 0, form DECODE in [0, 1] default 0,
         arithmetic SPLIT in [1, 2, 4] default 1 for single)

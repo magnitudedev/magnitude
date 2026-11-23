@@ -159,7 +159,6 @@ fn readout_selected_rows[M, O, V, D, PT, NM, Sv](hidden: &tensor[M, PT * D] f32,
 native readout_selected_rows for metal from "metal/readout_selected_rows.metal":
     static (V, D, PT, NM)
     project dense single (weight) gathered selected
-    restate single_gemv
     scratch normalized bytes (O * D * 2) when O > PROJECTION_GEMV_MAX_M
     launch readout_selected_rows_stage before batch when O > PROJECTION_GEMV_MAX_M:
         staging
@@ -454,10 +453,7 @@ fn readout_planes_rows[M, O, V, D, PT, NM, P](hidden: &tensor[M, PT, D] f32, nor
 native readout_top_rows for metal from "metal/readout_top_rows.metal":
     static (V, D, PT, NM, P)
     project dense single (planes (top, bit3, rest, scales) over (V, D))
-    restate batch arithmetic BATCH_PARTS in [2] default 2
-    restate SIMDGROUPS in [16, 8, 4, 2, 32] default 16
-    restate ROWS in [1, 2, 4] default 1
-    restate arithmetic LANES in [16, 32] default 16
+    restate SIMDGROUPS in [16, 8, 4, 2, 32] default greatest where SIMDGROUPS <= 16 and (SIMDGROUPS == 2 or ceil_div(V, SIMDGROUPS * 32 / LANES) >= 2 * device.units)
     scratch bounds bytes (4 * VERIFY_ROWS) sync
     launch readout_top_rows_stage before gemv:
         staging
@@ -502,10 +498,6 @@ native readout_exact_rows for metal from "metal/readout_exact_rows.metal":
 native readout_planes_rows for metal from "metal/readout_planes_rows.metal":
     static (V, D, PT, NM, P)
     project dense single (planes (top, bit3, rest, scales) over (V, D))
-    restate batch arithmetic BATCH_PARTS in [2] default 2
-    restate SIMDGROUPS in [16, 8, 4, 2, 32] default 16
-    restate ROWS in [1, 2, 4] default 1
-    restate arithmetic LANES in [16, 32] default 16
     scratch normalized bytes (O * D * 2) when O > 16
     launch readout_planes_rows_stage before gemm when O > 16:
         staging

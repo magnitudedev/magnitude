@@ -207,11 +207,11 @@ native indexer_score for cuda from "cuda/indexer_score.cu":
 # chunks fitting 32 KiB.
 native indexer_score for vulkan from "vulkan/indexer_score.comp":
     static (H, P, S, NQ, HW, RA, RT)
-    where RA <= 1 and RT <= 1 and NQ <= 1 and H <= 64 and (9 * (2 * P + S) + 4) * 4 <= 32768 and (9 * (2 * P + S) + 4) * 4 <= device.shared_bytes_per_group and (2 * P + S) % 32 == 0 and P % ((2 * P + S) / 32) == 0 and (RA == 0 or (2 * P + S) % 64 == 0 or 2 * P + S == 32)
+    where RA <= 1 and RT <= 1 and NQ <= 1 and H <= 64 and (9 * (2 * P + S) + 4) * 4 <= device.shared_bytes_per_group and (2 * P + S) % 32 == 0 and P % ((2 * P + S) / 32) == 0 and (RA == 0 or (2 * P + S) % 64 == 0 or 2 * P + S == 32)
     launch indexer_score:
         threadgroups (ceil_div(N, 256), M, 1)
         threads_per_threadgroup (256, 1, 1)
-        shared_bytes (min((H * (2 * P + S + 4) + 8 * (2 * P + S)) * 4, 32768))
+        shared_bytes (min((H * (2 * P + S + 4) + 8 * (2 * P + S)) * 4, device.shared_bytes_per_group))
 
 # CPU: one work item per (256 scores, row), each preparing the row's query
 # heads.

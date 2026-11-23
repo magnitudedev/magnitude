@@ -104,7 +104,6 @@ fn gated_delta_project[M, H, PT, NM, NK, NV, W, QB, ZB](hidden: &tensor[M, PT * 
 native gated_delta_project for metal from "metal/gated_delta_project.metal":
     static (H, PT, NM, NK, NV, W, QB, ZB)
     project dense segmented (qkv_weight, gate_weight, alpha_weight, beta_weight)
-    restate single_gemv
     scratch normalized bytes ((M + TALL * (ceil_div(M, 64) * 64 - M)) * H * 2) when M > 16 or M >= MATRIX_FROM
     launch gated_delta_project_stage before batch when (M > 16 or M >= MATRIX_FROM) and (M <= 64 or TALL == 0 or PACK == 1):
         staging
@@ -496,7 +495,6 @@ fn gated_delta_project_convolved[M, B, S, H, PT, NM, NK, NV, W, C, T](hidden: &t
 native gated_delta_project_convolved for metal from "metal/gated_delta_project_convolved.metal":
     static (H, PT, NM, NK, NV, W, C)
     project dense segmented (qkv_weight, gate_weight, alpha_weight, beta_weight)
-    restate batch BATCH_ROWS in [1, 2, 4] default 1
     restate gemv_rows ROWS in [2, 1, 4] default 2
     restate gemv_pair ROWS in [2, 1, 4] default 2
     scratch normalized bytes (M * H * 2) when M >= MATRIX_FROM

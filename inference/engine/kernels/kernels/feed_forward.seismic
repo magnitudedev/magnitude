@@ -134,7 +134,6 @@ native dense_output for cuda from "cuda/dense_output.cu":
     static (H, F, DS)
     where DS <= 1
     project dense single (down_weight)
-    restate gemv RESIDENCY in [1, 2, 0] default 1
 
 native dense_output for cpu from "cpu/dense_output.rs":
     static (DS)
@@ -174,7 +173,6 @@ native dense_up for metal from "metal/dense_up.metal":
     static (H, F, US)
     where US <= 1
     project dense single (up_weight)
-    restate single_gemv
     scratch normalized bytes (O * H * 2) when O > PROJECTION_GEMV_MAX_M or O >= MATRIX_FROM
     launch dense_up_normalize before batch when O > PROJECTION_GEMV_MAX_M or O >= MATRIX_FROM:
         staging
@@ -192,7 +190,6 @@ native dense_up for cuda from "cuda/dense_up.cu":
     where US <= 1
     project dense single (up_weight) rows rms
     restate arithmetic SPLIT in [2, 1] default 1
-    restate gemv RESIDENCY in [1, 2, 0] default 1
 
 native dense_up for cpu from "cpu/dense_up.rs":
     static (US)

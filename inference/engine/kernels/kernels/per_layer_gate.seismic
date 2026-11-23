@@ -32,7 +32,6 @@ native per_layer_gate for metal from "metal/per_layer_gate.metal":
     static (D, L, P, GS)
     where GS <= 1
     project dense single (gate_weight)
-    restate single_gemv
     scratch rounded bytes (M * D * 2)
     launch per_layer_gate_stage before gemv:
         staging

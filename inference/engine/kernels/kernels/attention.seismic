@@ -752,7 +752,7 @@ native attention_decode for metal from "metal/attention_decode.metal":
 # so the query tile and operand stages share storage.
 native attention_decode for cuda from "cuda/attention_decode.cu":
     static (KV, G, P, S, I, U, F, NQ, N, NV, SK, RA, RT, RO, VK, KR, AB, KS)
-    params (arithmetic PARTS in [12, 24, 48, 96] default least where KV * PARTS >= 2 * device.units or PARTS == 96, arithmetic WARPS in [4, 8, 1, 2] default 4,
+    params (arithmetic PARTS in [12, 24, 48, 96, 192, 384] default least where KV * PARTS >= 2 * device.units or PARTS == 384, arithmetic WARPS in [4, 8, 1, 2] default 4,
         arithmetic form MATRIX in [0, 1] default least where MATRIX == 1 or (2 * P + S) > 256 or G < 4 or G > WARPS * 16 or max(WARPS * 16 * (2 * P + S), 128 * (2 * P + S)) * 2 + WARPS * (2 * P + S) * 4 + 576 > device.shared_bytes_per_group reference 0,
         arithmetic SLICES in [1, 2, 4, 8] default least where (MATRIX == 1 and SLICES == 1) or (MATRIX == 0 and G % SLICES == 0 and WARPS % SLICES == 0 and ((G / SLICES) * (2 * P + S) <= 1024 or SLICES == WARPS or G % (2 * SLICES) != 0)),
         arithmetic STAGES in [2, 3, 4] default 2, arithmetic COLUMNS in [1, 2, 4] default 1, arithmetic QREG in [0, 1] default MATRIX)
@@ -1627,7 +1627,7 @@ native attention_decode_k8v4 for metal from "metal/attention_decode_k8v4.metal":
 # wider heads, or 48 KB devices fall back to the MATRIX = 0 vector form.
 native attention_decode_k8v4 for cuda from "cuda/attention_decode_k8v4.cu":
     static (KV, G, P, S, I, U, F, NQ, N, NV, KC, KP, VC, VP, SK, RA, RT, RO, VK)
-    params (arithmetic PARTS in [12, 24, 48, 96] default least where KV * PARTS >= 2 * device.units or PARTS == 96, arithmetic WARPS in [4, 8, 1, 2] default least where WARPS >= 4 and (WARPS == 8 or G % 8 != 0 or G * (2 * P + S) <= 4096),
+    params (arithmetic PARTS in [12, 24, 48, 96, 192, 384] default least where KV * PARTS >= 2 * device.units or PARTS == 384, arithmetic WARPS in [4, 8, 1, 2] default least where WARPS >= 4 and (WARPS == 8 or G % 8 != 0 or G * (2 * P + S) <= 4096),
         arithmetic form MATRIX in [0, 1] default least where MATRIX == 1 or (2 * P + S) > 256 or G < 4 or G > WARPS * 16 or 2 * WARPS * 32 > device.max_group_threads or max(WARPS * 16 * (2 * P + S), 128 * (2 * P + S)) * 2 + WARPS * (2 * P + S) * 4 + 576 > device.shared_bytes_per_group,
         arithmetic SLICES in [1, 2, 4, 8] default least where (MATRIX == 1 and SLICES == 1) or (MATRIX == 0 and G % SLICES == 0 and WARPS % SLICES == 0 and ((G / SLICES) * ((2 * P + S) / 32) <= 32 or SLICES == WARPS or G % (2 * SLICES) != 0)),
         arithmetic STAGES in [2, 3, 4] default 2, arithmetic COLUMNS in [1, 2, 4] default 1, arithmetic QREG in [0, 1] default MATRIX)

@@ -239,9 +239,6 @@ native stream_mix_down for metal from "metal/stream_mix_down.metal":
     static (H, S, LR, C)
     where H % 32 == 0 and C <= 1
     project dense segmented (down_weight, inject_weight) parts S rows rms
-    restate gemv_rows ROWS in [1, 2, 4] default 1
-    restate gemv_pair ROWS in [1, 2, 4] default 1
-    restate batch BATCH_ROWS in [1, 2, 4] default 1
     scratch normalized bytes ((M + TALL * (ceil_div(M, 64) * 64 - M)) * S * H * 2) when M > 16
     launch stream_mix_down_stage before gemm when M > 16 and (M <= 64 or TALL == 0 or PACK == 1):
         staging
@@ -276,7 +273,6 @@ native stream_mix_down for vulkan from "vulkan/stream_mix_down.comp":
     static (H, S, LR, C)
     where H % 32 == 0 and C <= 1
     project dense segmented (down_weight, inject_weight) parts S rows rms
-    restate SIMDGROUPS in [16, 8, 4, 2, 32] default 4
 
 # CPU: one work item per row normalizes its streams (the norm decoded into
 # its shared bytes) and publishes the inverses; then the combined weight rows
@@ -302,10 +298,6 @@ native stream_mix_up for metal from "metal/stream_mix_up.metal":
     static (H, S, LR)
     where H % 32 == 0 and LR % 32 == 0
     project dense single (up_weight)
-    restate gemv_rows SIMDGROUPS in [16, 8, 4, 2, 32] default 16
-    restate gemv_rows ROWS in [1, 2, 4] default 1
-    restate gemv_pair SIMDGROUPS in [16, 8, 4, 2, 32] default 8
-    restate gemv_pair ROWS in [1, 2, 4] default 1
 
 # CUDA: the `dense` projection (single) over the low-rank rows read in
 # place, without split-K by default (S * H columns are many).
