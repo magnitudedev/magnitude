@@ -39,6 +39,7 @@
     "@magnitudedev/version": "0.0.1"
   },
   "changesets": [
+    "alpha-qa-fixes",
     "cli-only-install",
     "engine-gpu-performance",
     "expert-streaming",
