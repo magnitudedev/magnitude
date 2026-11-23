@@ -1295,6 +1295,45 @@ enum Provisioned {
     Refused(OperationGroup, RequestError),
 }
 
+/// Sub-phase breakdown of `pre_submit_ms` (from target `finish()` return to
+/// head `submit_group()` entry) emitted under `MAGNITUDE_TRACE_FLIGHTS`.
+struct PreSubmitTrace {
+    finish_done: Instant,
+    reconcile_target: Duration,
+    step_boundary: Duration,
+    publish_members: Duration,
+    finish_round: Duration,
+    step_idle: Duration,
+    publish_ready: Duration,
+    select: Duration,
+    plan_prompt: Duration,
+    provision: Duration,
+    drive_exits: usize,
+}
+
+impl PreSubmitTrace {
+    fn new(finish_done: Instant) -> Self {
+        Self {
+            finish_done,
+            reconcile_target: Duration::ZERO,
+            step_boundary: Duration::ZERO,
+            publish_members: Duration::ZERO,
+            finish_round: Duration::ZERO,
+            step_idle: Duration::ZERO,
+            publish_ready: Duration::ZERO,
+            select: Duration::ZERO,
+            plan_prompt: Duration::ZERO,
+            provision: Duration::ZERO,
+            drive_exits: 0,
+        }
+    }
+}
+
+fn trace_flights_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var_os("MAGNITUDE_TRACE_FLIGHTS").is_some())
+}
+
 /// Everything the owner holds except its pipeline.
 struct Service<F: ProgramFamily> {
     /// Boxed as it is made (`ExecutorDomain::with_family`).
@@ -1314,6 +1353,7 @@ struct Service<F: ProgramFamily> {
     /// ([`Self::ran`]).
     reread: Reread,
     wakes: Arc<dyn Wakes>,
+    pre_submit: Option<PreSubmitTrace>,
 }
 
 /// One bank tier's resize state: its running resize (if any) and the reading
@@ -1524,6 +1564,7 @@ impl<F: ProgramFamily> Owner<F> {
                 unloaded: false,
                 reread: Reread::Unread,
                 wakes,
+                pre_submit: None,
             },
             pipeline: Pipeline::Idle(bindings),
         })
@@ -2156,6 +2197,9 @@ impl<F: ProgramFamily> Service<F> {
                             return Err((Some(round.members), error));
                         }
                         unload |= std::mem::take(&mut self.unloaded);
+                        if let Some(trace) = &mut self.pre_submit {
+                            trace.drive_exits += 1;
+                        }
                         return Ok((Pipeline::InFlight(round, active), self.ran(true, unload)));
                     }
                     // Reconciling reads memory at the flight's boundary and
@@ -2164,7 +2208,11 @@ impl<F: ProgramFamily> Service<F> {
                     self.reconcile(round, active)?
                 }
                 Pipeline::Idle(mut bindings) => {
+                    let t_step = self.pre_submit.is_some().then(Instant::now);
                     self.step(Some(&mut bindings), false).map_err(|error| (None, error))?;
+                    if let (Some(trace), Some(t)) = (&mut self.pre_submit, t_step) {
+                        trace.step_idle += t.elapsed();
+                    }
                     unload |= std::mem::take(&mut self.unloaded);
                     // Unloading terminated every request: nothing is left to
                     // select, and observing again would decide it again.
@@ -2172,8 +2220,17 @@ impl<F: ProgramFamily> Service<F> {
                         self.publish_ready().map_err(|error| (None, error))?;
                         return Ok((Pipeline::Idle(bindings), self.ran(false, true)));
                     }
+                    let t_pub = self.pre_submit.is_some().then(Instant::now);
                     self.publish_ready().map_err(|error| (None, error))?;
-                    match self.select(&mut bindings)? {
+                    if let (Some(trace), Some(t)) = (&mut self.pre_submit, t_pub) {
+                        trace.publish_ready += t.elapsed();
+                    }
+                    let t_sel = self.pre_submit.is_some().then(Instant::now);
+                    let selected = self.select(&mut bindings)?;
+                    if let (Some(trace), Some(t)) = (&mut self.pre_submit, t_sel) {
+                        trace.select += t.elapsed();
+                    }
+                    match selected {
                         Selected::Round(round) => {
                             submitted = true;
                             self.advance(round, bindings)?
@@ -2182,6 +2239,7 @@ impl<F: ProgramFamily> Service<F> {
                         Selected::Empty => {
                             // Waiting for work is no launch's service.
                             self.domain.host_idle();
+                            self.pre_submit = None;
                             let ran = self.ran(false, unload);
                             if ran.reread == Reread::Settled {
                                 self.memory.reading.mark_settled(self.domain.readings_generation());
@@ -3205,8 +3263,12 @@ impl<F: ProgramFamily> Service<F> {
     fn advance(&mut self, mut round: Round, mut bindings: StateBindings) -> Result<Pipeline<F>, Fatal> {
         loop {
             let Some(group_) = round.groups.pop_front() else {
+                let t_fin = self.pre_submit.is_some().then(Instant::now);
                 self.finish_round(round)
                     .map_err(|error| (None, error))?;
+                if let (Some(trace), Some(t)) = (&mut self.pre_submit, t_fin) {
+                    trace.finish_round += t.elapsed();
+                }
                 return Ok(Pipeline::Idle(bindings));
             };
             // Work of a request that ended while the round ran is dropped.
@@ -3235,22 +3297,33 @@ impl<F: ProgramFamily> Service<F> {
                 }
                 continue;
             }
-            let chunk_rows = self.scheduler.limits().prefill_tokens.max(1);
-            let decode_owed = round.selection.contended().then(|| self.scheduler.limits().decode_owed());
-            let alone = round.members.len() == 1
-                && !self
-                    .requests
-                    .values()
-                    .any(|other| competes(other, self.status(other)));
-            // A chain opens only behind the round's last group: a later one would orphan it.
-            let last = round.groups.is_empty();
-            let planned = self.domain.plan_prompt(decode_owed, alone, last, |chunks| {
-                planned_prefill(&round, group_.operations(), chunk_rows, chunks)
-            });
-            if let Err(error) = planned {
-                return Err((Some(round.members), error));
+            if group_.lane() != crate::domain::DomainLane::Head {
+                let chunk_rows = self.scheduler.limits().prefill_tokens.max(1);
+                let decode_owed = round.selection.contended().then(|| self.scheduler.limits().decode_owed());
+                let alone = round.members.len() == 1
+                    && !self
+                        .requests
+                        .values()
+                        .any(|other| competes(other, self.status(other)));
+                // A chain opens only behind the round's last group: a later one would orphan it.
+                let last = round.groups.is_empty();
+                let t_plan = self.pre_submit.is_some().then(Instant::now);
+                let planned = self.domain.plan_prompt(decode_owed, alone, last, |chunks| {
+                    planned_prefill(&round, group_.operations(), chunk_rows, chunks)
+                });
+                if let (Some(trace), Some(t)) = (&mut self.pre_submit, t_plan) {
+                    trace.plan_prompt += t.elapsed();
+                }
+                if let Err(error) = planned {
+                    return Err((Some(round.members), error));
+                }
             }
-            let group_ = match self.provision(&mut bindings, &mut round, group_) {
+            let t_prov = self.pre_submit.is_some().then(Instant::now);
+            let provisioned = self.provision(&mut bindings, &mut round, group_);
+            if let (Some(trace), Some(t)) = (&mut self.pre_submit, t_prov) {
+                trace.provision += t.elapsed();
+            }
+            let group_ = match provisioned {
                 Ok(Provisioned::Fits(group_)) => group_,
                 Ok(Provisioned::Split(leading, trailing)) => {
                     round.groups.push_front(trailing);
@@ -3267,6 +3340,27 @@ impl<F: ProgramFamily> Service<F> {
                 }
                 Err(error) => return Err((Some(round.members), error)),
             };
+            if group_.lane() == crate::domain::DomainLane::Head {
+                if let Some(trace) = self.pre_submit.take() {
+                    let ms = |d: Duration| d.as_secs_f64() * 1000.0;
+                    eprintln!(
+                        "flight head pre_submit total_ms={:.3} reconcile_target_ms={:.3} step_boundary_ms={:.3} publish_members_ms={:.3} finish_round_ms={:.3} step_idle_ms={:.3} publish_ready_ms={:.3} select_ms={:.3} plan_prompt_ms={:.3} provision_ms={:.3} drive_exits={}",
+                        ms(trace.finish_done.elapsed()),
+                        ms(trace.reconcile_target),
+                        ms(trace.step_boundary),
+                        ms(trace.publish_members),
+                        ms(trace.finish_round),
+                        ms(trace.step_idle),
+                        ms(trace.publish_ready),
+                        ms(trace.select),
+                        ms(trace.plan_prompt),
+                        ms(trace.provision),
+                        trace.drive_exits,
+                    );
+                }
+            } else {
+                self.pre_submit = None;
+            }
             match submit_group(&mut self.domain, bindings, &group_, self.wakes.completion()) {
                 Ok(flight) => {
                     let mut prefix_uses = Vec::new();
@@ -3512,12 +3606,21 @@ impl<F: ProgramFamily> Service<F> {
             Ok(finished) => finished,
             Err(error) => return Err((Some(round.members), classify_domain_error(error))),
         };
+        if trace_flights_enabled() && matches!(outcomes, FlightOutcomes::Target(_)) {
+            self.pre_submit = Some(PreSubmitTrace::new(Instant::now()));
+        } else if !matches!(outcomes, FlightOutcomes::Priming(_)) {
+            self.pre_submit = None;
+        }
+        let t_reconcile = self.pre_submit.is_some().then(Instant::now);
         let reconciled = match outcomes {
             FlightOutcomes::Target(pending) => self.reconcile_target(&mut round, pending, &operations),
             FlightOutcomes::Head(pending) => self.reconcile_method(&mut round, pending, &operations),
             FlightOutcomes::Vision(item) => self.reconcile_vision(&mut round, item, &operations),
             FlightOutcomes::Priming(_) => Ok(()),
         };
+        if let (Some(trace), Some(t)) = (&mut self.pre_submit, t_reconcile) {
+            trace.reconcile_target += t.elapsed();
+        }
         if let Err(error) = reconciled {
             return Err((Some(round.members), error));
         }
@@ -3538,8 +3641,12 @@ impl<F: ProgramFamily> Service<F> {
         };
         self.epoch.advance();
         // The flight's boundary: memory is read once here.
+        let t_step = self.pre_submit.is_some().then(Instant::now);
         if let Err(error) = self.step(Some(&mut bindings), true) {
             return Err((Some(round.members), error));
+        }
+        if let (Some(trace), Some(t)) = (&mut self.pre_submit, t_step) {
+            trace.step_boundary += t.elapsed();
         }
         if self.unloaded {
             // The unload terminated every request outside the round; the
@@ -3549,7 +3656,11 @@ impl<F: ProgramFamily> Service<F> {
             self.finish_round(round).map_err(|error| (None, error))?;
             return Ok(Pipeline::Idle(bindings));
         }
+        let t_pub = self.pre_submit.is_some().then(Instant::now);
         self.publish_members(&mut round);
+        if let (Some(trace), Some(t)) = (&mut self.pre_submit, t_pub) {
+            trace.publish_members += t.elapsed();
+        }
         self.advance(round, bindings)
     }
 
@@ -4585,7 +4696,7 @@ mod pending_retention_tests {
             request: RequestId(1),
             phase: HeadPhase::Priming { draft_from: 3 },
             tokens: vec![magnitude_generation::TokenId(3)],
-            conditioning: FeatureRows::new(vec![0u8; 4].into(), 1).unwrap(),
+            conditioning: FeatureRows::new(vec![0u8; 4].into(), 1).unwrap().into(),
             position: 2,
             proposals: Vec::new(),
             form: DraftForm::Chained,
@@ -4900,7 +5011,7 @@ let Ok(residency) = service.make_resident(id, &mut record, generation, bindings)
                 hi = mid;
             }
         }
-        let one_req_need = lo + 1;
+        let one_req_need = (lo + 1).max(2);
         let plan = service
             .domain
             .plan_relief(resource, one_req_need, Relief::CacheAndRequests(&evictable))
@@ -5160,7 +5271,7 @@ let Ok(residency) = service.make_resident(id, &mut record, generation, bindings)
             request: peer,
             phase: magnitude_executor::HeadPhase::Priming { draft_from: 5 },
             tokens: vec![TokenId(4)],
-            conditioning: magnitude_executor::FeatureRows::new(vec![0u8; 4].into(), 1).unwrap(),
+            conditioning: magnitude_executor::FeatureRows::new(vec![0u8; 4].into(), 1).unwrap().into(),
             position: 3,
             proposals: Vec::new(),
             form: magnitude_executor::DraftForm::Chained,

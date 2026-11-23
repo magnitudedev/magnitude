@@ -128,10 +128,19 @@ fn submit<F: ProgramFamily>(
     group: &OperationGroup,
 ) -> Result<DomainFlight<F>, SubmitFailure> {
     let operations = group.operations.as_slice();
+    let reserve_started = (group.lane == DomainLane::Head
+        && std::env::var_os("MAGNITUDE_TRACE_FLIGHTS").is_some())
+    .then(std::time::Instant::now);
     let resources = match domain.reserve(&mut bindings, operations) {
         Ok(reservation) => reservation.into_resources(),
         Err(error) => return Err(SubmitFailure::Refused(error, bindings)),
     };
+    if let Some(started) = reserve_started {
+        eprintln!(
+            "flight head reserve_ms={:.3}",
+            started.elapsed().as_secs_f64() * 1000.0
+        );
+    }
     let submitted = match (group.lane, resources) {
         (DomainLane::Target, ReservedResources::Target(reservation)) => domain
             .submit_target(bindings, operations, reservation)

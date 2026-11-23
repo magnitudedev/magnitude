@@ -12,7 +12,9 @@ impl<F: ProgramFamily> FeatureReader for ExecutorDomain<F> {
             .map_err(|error| error.to_string())?;
         let bytes = source.read_to_host().map_err(|error| error.to_string())?;
         let result = FeatureRows::new(bytes.into(), span.count).map_err(|error| error.to_string());
-        if std::env::var_os("MAGNITUDE_TRACE_FEATURE_READS").is_some() {
+        if std::env::var_os("MAGNITUDE_TRACE_FEATURE_READS").is_some()
+            || std::env::var_os("MAGNITUDE_TRACE_FLIGHTS").is_some()
+        {
             eprintln!(
                 "feature_read rows={} elapsed_ms={:.3}",
                 span.count,

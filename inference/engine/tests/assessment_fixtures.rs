@@ -606,7 +606,7 @@ fn a_discrete_banks_conveyor_lies_in_host_storage() {
     assert!(scratch.records <= committed, "{} scratch records beyond the lender's {committed}", scratch.records);
     let arena = conveyor.conveyor.bytes.iter().map(|(_, &bytes)| bytes).sum::<u64>();
     let charged_arena = (0..=bank.slots).rev().find(|&slots| weights(slots) + arena <= cap).unwrap();
-    let slot_granules = bank.layers().len() as u64 * bank.granule();
+    let slot_granules: u64 = bank.layers().iter().map(|layer| bank.group_granule(layer.group)).sum();
     assert!(bank.slots - charged_arena >= arena / slot_granules, "{charged_arena} slots beside a charged conveyor");
 }
 

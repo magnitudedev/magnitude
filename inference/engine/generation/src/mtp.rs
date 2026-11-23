@@ -39,8 +39,9 @@ use crate::{
 };
 use crate::{front::FrontState, DraftHistory, DraftRoundState};
 use magnitude_executor::{
-    Demand, DraftForm, FeatureReader, FeatureRef, FeatureRows, FeatureSpan, HeadPhase, LaunchDuration,
-    Guess, GuessKind, Operation, Outcome, RequestId, SelectSpec, Selected, StreamedVerifyPrior, TokenId,
+    Demand, DraftForm, FeatureReader, FeatureRef, FeatureRows, FeatureSpan, HeadFeatures, HeadPhase,
+    LaunchDuration, Guess, GuessKind, Operation, Outcome, RequestId, SelectSpec, Selected,
+    StreamedVerifyPrior, TokenId,
 };
 use std::{num::NonZeroUsize, sync::Arc};
 
@@ -299,11 +300,54 @@ impl HeadTransaction {
         proposals: Vec<SelectSpec>,
         form: DraftForm,
     ) -> Result<Self, String> {
+        Self::with_conditioning(
+            request,
+            phase,
+            pairs.tokens,
+            HeadFeatures::Host(pairs.features),
+            position,
+            proposals,
+            form,
+        )
+    }
+
+    /// Enter `tokens` conditioned by leading `0..tokens.len()` rows of on-device
+    /// `features` at `position`, drafting a proposal per `proposals` (zero D2H/H2D).
+    pub(crate) fn new_device(
+        request: RequestId,
+        phase: HeadPhase,
+        tokens: Vec<TokenId>,
+        features: FeatureRef,
+        position: usize,
+        proposals: Vec<SelectSpec>,
+        form: DraftForm,
+    ) -> Result<Self, String> {
+        let rows = tokens.len();
+        Self::with_conditioning(
+            request,
+            phase,
+            tokens,
+            HeadFeatures::Device { features, rows },
+            position,
+            proposals,
+            form,
+        )
+    }
+
+    fn with_conditioning(
+        request: RequestId,
+        phase: HeadPhase,
+        tokens: Vec<TokenId>,
+        conditioning: HeadFeatures,
+        position: usize,
+        proposals: Vec<SelectSpec>,
+        form: DraftForm,
+    ) -> Result<Self, String> {
         let operation = Operation::Head {
             request,
             phase,
-            tokens: pairs.tokens,
-            conditioning: pairs.features,
+            tokens,
+            conditioning,
             position,
             proposals,
             form,
@@ -399,6 +443,13 @@ enum OwnHistoryTail {
     /// Complete pairs awaiting entry whose final pair is the current anchor:
     /// the last accepted token with the target feature that selected it.
     Anchored(PendingRows),
+    /// Anchored pairs whose conditioning features remain on the device
+    /// (`FeatureRef`, zero D2H copy) until the next `Operation::Head` consumes
+    /// them directly on-device. Never retained inside a checkpoint.
+    AnchoredDevice {
+        tokens: Vec<TokenId>,
+        features: FeatureRef,
+    },
 }
 
 impl OwnHistoryTail {
@@ -414,6 +465,7 @@ impl OwnHistoryTail {
         match self {
             Self::Empty => 0,
             Self::Unanchored(rows) | Self::Anchored(rows) => rows.tokens.len(),
+            Self::AnchoredDevice { tokens, .. } => tokens.len(),
             Self::Open { pending, .. } => pending.as_ref().map_or(0, |rows| rows.tokens.len()),
         }
     }
@@ -424,7 +476,7 @@ impl OwnHistoryTail {
 
     fn host_bytes(&self) -> usize {
         match self {
-            Self::Empty => 0,
+            Self::Empty | Self::AnchoredDevice { .. } => 0,
             Self::Unanchored(rows) | Self::Anchored(rows) => rows.features.bytes().len(),
             Self::Open { pending, open } => {
                 pending
@@ -447,6 +499,27 @@ impl OwnHistoryTail {
             Self::Empty | Self::Open { pending: None, .. } => return Ok(None),
             Self::Unanchored(rows) => (rows, Kind::Unanchored),
             Self::Anchored(rows) => (rows, Kind::Anchored),
+            Self::AnchoredDevice { tokens, features } => {
+                let Some(entered) = tokens.len().checked_sub(keep).filter(|&n| n > 0) else {
+                    return Ok(None);
+                };
+                let all = features
+                    .read_rows_to_host(tokens.len())
+                    .map_err(|error| error.to_string())?;
+                let to_enter = PendingRows {
+                    tokens: tokens[..entered].to_vec(),
+                    features: all.slice(0, entered).map_err(|error| error.to_string())?,
+                };
+                let kept = (keep > 0)
+                    .then(|| {
+                        Ok::<_, String>(PendingRows {
+                            tokens: tokens[entered..].to_vec(),
+                            features: all.slice(entered, keep).map_err(|error| error.to_string())?,
+                        })
+                    })
+                    .transpose()?;
+                return Ok(Some((to_enter, kept.map_or(Self::Empty, Self::Anchored))));
+            }
             Self::Open {
                 pending: Some(rows),
                 open,
@@ -881,6 +954,10 @@ impl MethodState for DrafterState {
                         OwnHistoryTail::Unanchored(pending) | OwnHistoryTail::Anchored(pending) => {
                             (Some(pending), None)
                         }
+                        OwnHistoryTail::AnchoredDevice { tokens, features } => {
+                            let rows = Self::read(reader, features, 0, tokens.len())?;
+                            (Some(PendingRows::joined(None, tokens, rows)?), None)
+                        }
                         OwnHistoryTail::Open { pending, open } => (pending, Some(open)),
                     };
                 if let Some(open_feature) = open_feature {
@@ -979,7 +1056,7 @@ impl MethodState for DrafterState {
                     }
                     HistoryState::TargetReading { anchor: Some(_), .. }
                     | HistoryState::OwnHistory {
-                        tail: OwnHistoryTail::Anchored(_),
+                        tail: OwnHistoryTail::Anchored(_) | OwnHistoryTail::AnchoredDevice { .. },
                         ..
                     } => {
                         let position = self.history.target_position();
@@ -1000,7 +1077,7 @@ impl MethodState for DrafterState {
                 }
             }
         };
-        let (position, pairs) = match &self.history {
+        let (position, device_pairs, host_pairs) = match &self.history {
             HistoryState::OwnHistory {
                 position,
                 tail: OwnHistoryTail::Anchored(rows),
@@ -1014,12 +1091,25 @@ impl MethodState for DrafterState {
                         .expect("pending pairs slice by their own rows");
                     return Propose::Pending(effects.operations);
                 }
-                (*position, rows.clone())
+                (*position, None, Some(rows.clone()))
+            }
+            HistoryState::OwnHistory {
+                position,
+                tail: OwnHistoryTail::AnchoredDevice { tokens, features },
+                ..
+            } => {
+                if tokens.len() > entry_bound {
+                    let effects = self
+                        .flush(request, 1, HeadPhase::Generation, Some(generated))
+                        .expect("pending pairs slice by their own rows");
+                    return Propose::Pending(effects.operations);
+                }
+                (*position, Some((tokens.clone(), features.clone())), None)
             }
             HistoryState::TargetReading {
                 position,
                 anchor: Some(anchor),
-            } => (*position, anchor.clone().into_pending()),
+            } => (*position, None, Some(anchor.clone().into_pending())),
             HistoryState::TargetReading { anchor: None, .. }
             | HistoryState::OwnHistory {
                 tail:
@@ -1033,14 +1123,27 @@ impl MethodState for DrafterState {
                 .map(|(call, _)| call.map(|call| call.position)),
             Ok(Some(position)),
         );
-        let Ok(transaction) = HeadTransaction::new(
-            request,
-            HeadPhase::Generation,
-            pairs,
-            position,
-            selects[..generated.get()].to_vec(),
-            self.drafter.form(),
-        ) else {
+        let transaction = match (device_pairs, host_pairs) {
+            (Some((tokens, features)), None) => HeadTransaction::new_device(
+                request,
+                HeadPhase::Generation,
+                tokens,
+                features,
+                position,
+                selects[..generated.get()].to_vec(),
+                self.drafter.form(),
+            ),
+            (None, Some(pairs)) => HeadTransaction::new(
+                request,
+                HeadPhase::Generation,
+                pairs,
+                position,
+                selects[..generated.get()].to_vec(),
+                self.drafter.form(),
+            ),
+            _ => unreachable!(),
+        };
+        let Ok(transaction) = transaction else {
             self.round = RoundStage::Declined;
             return Propose::Tokens(Vec::new());
         };
@@ -1128,22 +1231,37 @@ impl MethodState for DrafterState {
                 tail,
                 skipped,
             } => {
-                if let OwnHistoryTail::Anchored(rows) = &*tail {
-                    if rows
-                        .tokens
-                        .last()
-                        .is_some_and(|anchor| *anchor != verification.inputs[0])
+                match &*tail {
+                    OwnHistoryTail::Anchored(rows)
+                        if rows
+                            .tokens
+                            .last()
+                            .is_some_and(|anchor| *anchor != verification.inputs[0]) =>
                     {
                         return Err(format!(
                             "{name} pending anchor differs from the verified anchor"
                         ));
                     }
+                    OwnHistoryTail::AnchoredDevice { tokens, .. }
+                        if tokens
+                            .last()
+                            .is_some_and(|anchor| *anchor != verification.inputs[0]) =>
+                    {
+                        return Err(format!(
+                            "{name} pending anchor differs from the verified anchor"
+                        ));
+                    }
+                    _ => {}
                 }
                 // After a replay the last replayed row's feature selected the anchor.
                 let pending = match std::mem::replace(tail, OwnHistoryTail::Empty) {
                     OwnHistoryTail::Empty => None,
                     OwnHistoryTail::Unanchored(pending) | OwnHistoryTail::Anchored(pending) => {
                         Some(pending)
+                    }
+                    OwnHistoryTail::AnchoredDevice { tokens, features } => {
+                        let rows = Self::read(reader, features, 0, tokens.len())?;
+                        Some(PendingRows::joined(None, tokens, rows)?)
                     }
                     OwnHistoryTail::Open { pending, open } => Some(PendingRows::joined(
                         pending,
@@ -1170,16 +1288,29 @@ impl MethodState for DrafterState {
                 .observed(accepted)?;
                 // Committed row i's feature selected the token after it: the next
                 // accepted input, or the round's successor after the last row.
-                let rows = Self::read(reader, features, 0, accepted)?;
                 let mut tokens = verification.inputs[1..accepted].to_vec();
                 tokens.push(verification.next);
-                let joined = PendingRows::joined(pending, tokens, rows)?;
-                let joined_len = joined.tokens.len();
-                *tail = OwnHistoryTail::Anchored(joined);
-                debug_assert_eq!(
-                    round_state_of(DraftHistory::Own, entry_bound, *position, joined_len, false),
-                    transition.appended
-                );
+                if pending.is_none()
+                    && transition.maintenance.is_none()
+                    && self.drafter == Drafter::Mtp
+                    && features.is_device_backed()
+                {
+                    let joined_len = tokens.len();
+                    *tail = OwnHistoryTail::AnchoredDevice { tokens, features };
+                    debug_assert_eq!(
+                        round_state_of(DraftHistory::Own, entry_bound, *position, joined_len, false),
+                        transition.appended
+                    );
+                } else {
+                    let rows = Self::read(reader, features, 0, accepted)?;
+                    let joined = PendingRows::joined(pending, tokens, rows)?;
+                    let joined_len = joined.tokens.len();
+                    *tail = OwnHistoryTail::Anchored(joined);
+                    debug_assert_eq!(
+                        round_state_of(DraftHistory::Own, entry_bound, *position, joined_len, false),
+                        transition.appended
+                    );
+                }
                 transition.maintenance.is_some()
             }
         };
@@ -1319,6 +1450,18 @@ impl MethodState for DrafterState {
                     },
                     OwnHistoryTail::Anchored(rows) => {
                         let (pending, last) = rows.clone().opened();
+                        DraftTail::Trailing {
+                            pending,
+                            open: Some(OpenFeature::Host(last)),
+                        }
+                    }
+                    OwnHistoryTail::AnchoredDevice { tokens, features } => {
+                        let rows = features
+                            .read_rows_to_host(tokens.len())
+                            .map_err(|_| MethodCheckpointError::Unresolved)?;
+                        let pending = PendingRows::joined(None, tokens.clone(), rows)
+                            .map_err(|_| MethodCheckpointError::Unresolved)?;
+                        let (pending, last) = pending.opened();
                         DraftTail::Trailing {
                             pending,
                             open: Some(OpenFeature::Host(last)),

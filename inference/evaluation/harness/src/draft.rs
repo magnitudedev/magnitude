@@ -211,9 +211,10 @@ fn draft_at(
             request: sequence.request,
             phase: HeadPhase::Generation,
             tokens: tokens[start + 1..end + 1].to_vec(),
-            conditioning: rows
-                .slice(0, end - start)
-                .map_err(|error| error.to_string())?,
+            conditioning: magnitude_executor::HeadFeatures::Host(
+                rows.slice(0, end - start)
+                    .map_err(|error| error.to_string())?,
+            ),
             position: *start,
             proposals: Vec::new(),
             form: drafter.form,
@@ -227,9 +228,11 @@ fn draft_at(
         request: sequence.request,
         phase: HeadPhase::Generation,
         tokens: vec![tokens[anchor]],
-        conditioning: last_rows
-            .slice(anchor - 1 - last_start, 1)
-            .map_err(|error| error.to_string())?,
+        conditioning: magnitude_executor::HeadFeatures::Host(
+            last_rows
+                .slice(anchor - 1 - last_start, 1)
+                .map_err(|error| error.to_string())?,
+        ),
         position: if drafter.keeps_history {
             anchor - 1
         } else {

@@ -55,8 +55,10 @@ impl FeatureReader for Rows {
 }
 
 /// The (feature id, row) of every row, in order.
-fn row_ids(rows: &FeatureRows) -> Vec<(u8, u8)> {
-    rows.bytes()
+fn row_ids(rows: &magnitude_executor::HeadFeatures) -> Vec<(u8, u8)> {
+    rows.host()
+        .expect("expected host feature rows")
+        .bytes()
         .chunks_exact(4)
         .map(|row| (row[0], row[1]))
         .collect()

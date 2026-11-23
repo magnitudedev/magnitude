@@ -1792,7 +1792,7 @@ impl DrafterSteps {
                     request,
                     phase: crate::HeadPhase::Generation,
                     tokens: (0..entry_rows).map(|row| TokenId(((at + row) * 13 % 256) as u32)).collect(),
-                    conditioning: crate::FeatureRows::new(vec![0; self.row_bytes * entry_rows].into(), entry_rows).unwrap(),
+                    conditioning: crate::FeatureRows::new(vec![0; self.row_bytes * entry_rows].into(), entry_rows).unwrap().into(),
                     position: at,
                     proposals: (1..=proposals).map(|step| Self::greedy(at + step)).collect(),
                     form: crate::DraftForm::Chained,
@@ -3433,29 +3433,32 @@ fn cpu_loads_whole_and_tier_placed_expert_banks() {
             .changes()
             .change(|keeping| ledgers.claim(&keeping.claims(), &device, crate::memory::ledger::CommittedKind::Load, host_tables))
             .unwrap();
-        // On CPU both `DeviceOnly` and `Shared` lie in `HostRam` at the bank's
-        // one uniform granule, so a tier-placed CPU fixture shares that single
-        // `Records` pool across `records` and `host`.
-        let pools = match execution.load().expert_bank().filter(|bank| bank.host_granule().is_some()) {
+        // On CPU both `DeviceOnly` and `Shared` lie in `HostRam`, so a
+        // tier-placed CPU fixture shares those `Records` pools across
+        // `records` and `host`.
+        let pools = match execution.load().expert_bank().filter(|bank| bank.tiered()) {
             Some(bank) => {
-                let state = ledgers
-                    .open_pool(
+                let target_state = execution.resources().target_state();
+                let (state, recurrent) = ledgers
+                    .open_state_pools_at(
+                        None,
                         &device,
                         seismic::Contract::DeviceOnly,
-                        crate::memory::ledger::PoolClass::State,
-                        execution.resources().target_state().granule,
+                        target_state.granule,
+                        target_state.recurrent_granule,
                     )
                     .unwrap();
                 let records = ledgers
-                    .open_pool(
+                    .open_records_pools_at(
+                        None,
                         &device,
                         seismic::Contract::DeviceOnly,
-                        crate::memory::ledger::PoolClass::Records,
-                        bank.granule(),
+                        bank.granules(),
                     )
                     .unwrap();
                 crate::LoadPools {
                     state,
+                    recurrent,
                     records: Some(records.clone()),
                     host: Some(records),
                 }

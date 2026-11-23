@@ -683,7 +683,7 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
             demand |= *next;
             segments = segments.max(reserved_segments(
                 &self.target_store,
-                advance.span_count(),
+                |domain| advance.domain_span_count(domain),
                 tokens.len(),
             ));
         }
@@ -1093,15 +1093,29 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
                 {
                     panic!("invariant violated: request feature rows are not contiguous in physical output");
                 }
-                let view = output
+                let features_output = output
                     .as_ref()
                     .map(|result| &result.features)
-                    .expect("invariant violated: target feature output is absent")
+                    .expect("invariant violated: target feature output is absent");
+                let view = features_output
                     .slice_leading(first as u64, (first + feature_outputs.len()) as u64)
+                    .map_err(|error| error.to_string())?;
+                let padded = magnitude_batching::row_class(feature_outputs.len())
+                    .filter(|&class_rows| {
+                        features_output
+                            .tensor()
+                            .extents()
+                            .first()
+                            .is_some_and(|&total| (first + class_rows) as u64 <= total)
+                    })
+                    .map(|class_rows| {
+                        features_output.slice_leading(first as u64, (first + class_rows) as u64)
+                    })
+                    .transpose()
                     .map_err(|error| error.to_string())?;
                 let aggregate = self
                     .domain
-                    .publish_graph_features(view)
+                    .publish_graph_features_padded(view, padded)
                     .map_err(|error| error.to_string())?;
                 let aggregate = match &boundary {
                     Some(boundary) => aggregate
@@ -1244,6 +1258,11 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
         self.begin_host_turn(pending.iter().map(|item| item.request));
         if verified {
             let epochs = self.family.expert_bank().map(|bank| (bank.regime_epoch(), bank.bank_epoch()));
+            if let Some(bank) = self.family.expert_bank() {
+                if let Some(estimated_seconds) = self.verify_turns.mean(bank.regime_epoch(), bank.bank_epoch()).filter(|&s| s > 0.0) {
+                    bank.draft_window(estimated_seconds);
+                }
+            }
             self.verify_turns.begin(finish_started, epochs, pending.iter().map(|item| item.request).collect());
         }
         Ok(pending)
@@ -1937,24 +1956,32 @@ impl SlotAppends {
 /// of a cached-causal or produced domain when an earlier row of its launch
 /// appended them, and a Block domain's row the blocks the advance completed
 /// through it, the one it completes even alone (`advance_blocks`).
-pub(super) fn reserved_segments(store: &StateStore, spans: usize, rows: usize) -> usize {
-    // A Shared reader also sees the rows its source appends in the advance:
-    // the rest of the source's last page, then whole pages (see
-    // `magnitude_state::history_geometry`).
-    spans
-        + store
-            .history_reads()
-            .shared_sources()
-            .iter()
-            .copied()
-            .chain(store.history_domains().filter(|&domain| {
-                matches!(
+pub(super) fn reserved_segments(
+    store: &StateStore,
+    domain_spans: impl Fn(magnitude_state::HistoryDomainId) -> usize,
+    rows: usize,
+) -> usize {
+    // Compute the bound per domain: `max_d(spans_d + appended_d)` rather than
+    // `max_d(spans_d) + max_d(appended_d)`. Every domain whose launch rows
+    // read appended rows (`Shared` source, `Block`, or for `rows > 1`
+    // `cached_causal_domain` / `is_produced_domain`) includes those appended
+    // spans in its own `span_limit` (`magnitude_state::history_pages`), so
+    // each domain's sum is guaranteed `<= domain.span_limit <= store.max_span_limit()`.
+    let shared_sources = store.history_reads().shared_sources();
+    store
+        .history_domains()
+        .map(|domain| {
+            let base = domain_spans(domain);
+            let reads_appended = shared_sources.contains(&domain)
+                || matches!(
                     store.history_domain_kind(domain),
                     magnitude_state::HistoryDomainKind::Block { .. }
-                ) || (rows > 1
-                    && (cached_causal_domain(store, domain) || store.is_produced_domain(domain)))
-            }))
-            .map(|domain| {
+                )
+                || (rows > 1
+                    && (cached_causal_domain(store, domain) || store.is_produced_domain(domain)));
+            let appended = if !reads_appended {
+                0
+            } else {
                 let page = store.history_page_rows(domain);
                 match store.history_domain_kind(domain) {
                     // An advance of `rows` rows completes at most
@@ -1968,9 +1995,11 @@ pub(super) fn reserved_segments(store: &StateStore, spans: usize, rows: usize) -
                     }
                     _ => rows.div_ceil(page) + 1,
                 }
-            })
-            .max()
-            .unwrap_or(0)
+            };
+            base + appended
+        })
+        .max()
+        .unwrap_or(0)
 }
 
 /// The accepted-history ranges row `index` of `advance` reads in stored
@@ -2297,6 +2326,74 @@ mod appended_runs_tests {
                 }
             }
         }
+    }
+
+    /// `reserved_segments` computes `max_d(spans_d + appended_d)` per domain
+    /// instead of summing `max_d(spans_d) + max_d(appended_d)` across domains,
+    /// and never exceeds `store.max_span_limit()` for an indexed Token + Block
+    /// layout (GLM-5.3-Flash at context=5120).
+    #[test]
+    fn reserved_segments_stays_within_max_span_limit_across_token_and_block_domains() {
+        use magnitude_state::{
+            BankCapacity, CodecSpec, ComponentDescriptor, HistoryDomainId, HistoryDomainLayout,
+            HistoryDomainPlan, LayerRef, StatePools, StateStore,
+        };
+        let device = crate::test_support::open_backend(
+            &seismic::Devices::discover(&[]).unwrap(),
+            seismic::BackendName::Cpu,
+        )
+        .unwrap();
+        let charges = seismic::Charges::tally(&device);
+        let granule = 1 << 20;
+        let pool = seismic::Pool::open(
+            &seismic::PoolCharges::one(&charges),
+            seismic::Contract::DeviceOnly,
+            granule,
+            granule,
+        )
+        .unwrap();
+        let (context, max_advance) = (5120, 512);
+        let token_kv = ComponentDescriptor::new(
+            LayerRef::Target(0),
+            CodecSpec::dense(seismic::DType::BF16, 4, 4),
+            1,
+        )
+        .unwrap();
+        let index_keys = ComponentDescriptor::produced(
+            LayerRef::IndexKeys { block: 0, part: 0 },
+            seismic::DType::BF16,
+            4,
+            false,
+        )
+        .unwrap();
+        let (store, _) = StateStore::new(
+            &charges,
+            StatePools { history: pool, recurrent: None },
+            context,
+            max_advance,
+            vec![
+                HistoryDomainPlan {
+                    layout: HistoryDomainLayout::Token { components: vec![token_kv] },
+                    logical_rows: context,
+                },
+                HistoryDomainPlan {
+                    layout: HistoryDomainLayout::Block { rate: 16, components: vec![index_keys] },
+                    logical_rows: context / 16,
+                },
+            ],
+            vec![],
+            BankCapacity { active: 1, in_flight: 1, retained: 0 },
+        )
+        .unwrap();
+        let limit = store.max_span_limit();
+        // Domain 0 (Token, indexed) at 21 spans + Domain 1 (Block) at 2 spans:
+        // single-row decode must not add Domain 1's Block append onto Domain 0's 21 spans.
+        let spans = |d: HistoryDomainId| if d.0 == 0 { 21 } else { 2 };
+        assert_eq!(super::reserved_segments(&store, spans, 1), 21);
+        assert!(super::reserved_segments(&store, spans, 1) <= limit);
+        // Multi-row verify (e.g. 5 rows) and full prefill chunk (max_advance) stay within limit.
+        assert!(super::reserved_segments(&store, spans, 5) <= limit);
+        assert!(super::reserved_segments(&store, spans, max_advance) <= limit);
     }
 }
 

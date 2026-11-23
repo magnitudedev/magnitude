@@ -15,7 +15,7 @@ struct HeadOp<'a> {
     request: RequestId,
     phase: crate::HeadPhase,
     tokens: &'a [TokenId],
-    conditioning: &'a FeatureRows,
+    conditioning: &'a crate::HeadFeatures,
     position: usize,
     proposals: &'a [SelectSpec],
     form: DraftForm,
@@ -81,6 +81,7 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
         graph_output: NativeGraphOutputLease,
         reservation: HeadReservation,
     ) -> Result<HeadFlight<F>, SubmitFailure> {
+        let entered_submit = Instant::now();
         let advances = match reservation {
             HeadReservation::Advances(advances) => advances,
             HeadReservation::TargetReads(states) => {
@@ -90,6 +91,7 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
                     graph_workspace,
                     graph_output,
                     states,
+                    entered_submit,
                 );
             }
         };
@@ -206,12 +208,46 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
                 return Err(SubmitFailure::Refused(error.into(), bindings));
             }
         };
-        let conditioning = HeadConditioning::Rows(
-            heads
-                .iter()
-                .map(|head| head.conditioning.clone())
-                .collect(),
-        );
+        let conditioning = if heads.len() == 1 && form == DraftForm::Chained {
+            match heads[0].conditioning {
+                crate::HeadFeatures::Host(rows) => HeadConditioning::Rows(vec![rows.clone()]),
+                crate::HeadFeatures::Device { features, rows } => {
+                    if let Some(current) =
+                        features.allocation().graph_conditioning(batch.class().rows())
+                    {
+                        HeadConditioning::Features {
+                            current,
+                            previous: None,
+                        }
+                    } else {
+                        match self.read_head_device_features(features, *rows) {
+                            Ok(host_rows) => HeadConditioning::Rows(vec![host_rows]),
+                            Err(error) => {
+                                self.restore_head_advances(&metadata, advances);
+                                return Err(SubmitFailure::Refused(error.into(), bindings));
+                            }
+                        }
+                    }
+                }
+            }
+        } else {
+            let mut host_rows = Vec::with_capacity(heads.len());
+            for head in &heads {
+                match head.conditioning {
+                    crate::HeadFeatures::Host(rows) => host_rows.push(rows.clone()),
+                    crate::HeadFeatures::Device { features, rows } => {
+                        match self.read_head_device_features(features, *rows) {
+                            Ok(rows) => host_rows.push(rows),
+                            Err(error) => {
+                                self.restore_head_advances(&metadata, advances);
+                                return Err(SubmitFailure::Refused(error.into(), bindings));
+                            }
+                        }
+                    }
+                }
+            }
+            HeadConditioning::Rows(host_rows)
+        };
         // A block drafter's first draft anchors at `draft_from` and its
         // windowed layers read history only from `draft_from + 1 - window`:
         // priming rows before that every window drops unread.
@@ -241,7 +277,7 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
         let trace_launches = steps > 0
             && std::env::var_os("MAGNITUDE_TRACE_HEAD_LAUNCHES").is_some()
             && heads.iter().any(|head| head.position >= trace_position);
-        self.launch_head(inputs, &store, metadata, steps, trace_launches, bindings)
+        self.launch_head(inputs, &store, metadata, steps, trace_launches, bindings, entered_submit)
     }
 
     /// Submit one batch of transactions of a head that keeps no history.
@@ -257,6 +293,7 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
         graph_workspace: NativeGraphWorkspaceLease,
         graph_output: NativeGraphOutputLease,
         states: Vec<SequenceState>,
+        entered_submit: Instant,
     ) -> Result<HeadFlight<F>, SubmitFailure> {
         let launch = self.target_reading_launch(operations, &states);
         let (batch, history, conditioning, metadata, steps) = match launch {
@@ -274,11 +311,12 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
             graph_output,
         );
         let store = self.target_store.clone();
-        self.launch_head(inputs, &store, metadata, steps, false, bindings)
+        self.launch_head(inputs, &store, metadata, steps, false, bindings, entered_submit)
     }
 
     /// Validate and submit a prepared head launch, returning its held state to
     /// the domain if validation or submission fails.
+    #[allow(clippy::too_many_arguments)]
     fn launch_head(
         &mut self,
         inputs: HeadLaunchInputs,
@@ -287,6 +325,7 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
         steps: usize,
         trace_launches: bool,
         bindings: StateBindings,
+        entered_submit: Instant,
     ) -> Result<HeadFlight<F>, SubmitFailure> {
         let launch = match ValidatedHeadLaunch::new(
             inputs,
@@ -316,6 +355,25 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
         } else {
             None
         };
+        let anchors: Vec<(RequestId, crate::operation::TokenId)> = if steps > 0 {
+            let upload = launch.batch().upload();
+            let actual = upload.actual_rows;
+            let mut per_slot = vec![None; metadata.len()];
+            for row in 0..actual {
+                if let (Ok(slot), Ok(tok)) = (usize::try_from(upload.row_slots[row]), u32::try_from(upload.tokens[row])) {
+                    if slot < per_slot.len() {
+                        per_slot[slot] = Some(crate::operation::TokenId(tok));
+                    }
+                }
+            }
+            metadata
+                .iter()
+                .zip(per_slot)
+                .filter_map(|(&(request, ..), tok)| tok.map(|tok| (request, tok)))
+                .collect()
+        } else {
+            Vec::new()
+        };
         let started = Instant::now();
         let epoch = self.launch_epoch();
         let submission = match self.family.submit_head(launch) {
@@ -326,16 +384,18 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
                 return Err(SubmitFailure::Failed(error.into()));
             }
         };
-        if steps > 0 {
+        let after_family_submit = Instant::now();
+        if !anchors.is_empty() {
             if let Some(bank) = self.family.expert_bank() {
-                if let Some(estimated_seconds) = self.verify_turns.mean(bank.regime_epoch(), bank.bank_epoch()).filter(|&s| s > 0.0) {
-                    bank.draft_window(estimated_seconds);
+                for (request, anchor) in anchors {
+                    bank.draft_tokens(request, &[anchor]);
                 }
             }
         }
         let requests = metadata.iter().map(|(request, ..)| *request).collect::<Vec<_>>();
         Ok(HeadFlight {
             started: self.service_start(&requests, started),
+            phases: (entered_submit, started, after_family_submit),
             epoch,
             requests: metadata,
             steps,
@@ -459,8 +519,35 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
                 })
             })
             .collect::<Result<Vec<_>, String>>()?;
-        let conditioning = heads.iter().map(|head| head.conditioning.clone()).collect();
+        let conditioning = heads
+            .iter()
+            .map(|head| match head.conditioning {
+                crate::HeadFeatures::Host(rows) => Ok(rows.clone()),
+                crate::HeadFeatures::Device { features, rows } => {
+                    self.read_head_device_features(features, *rows)
+                }
+            })
+            .collect::<Result<Vec<_>, _>>()?;
         Ok((batch, history, conditioning, metadata, steps))
+    }
+
+    /// Fallback host read for `HeadFeatures::Device` when a launch cannot bind
+    /// `HeadConditioning::Features` directly (multi-slot batch, `DraftForm::Block`,
+    /// target-reading head, or logical contract-test lease).
+    fn read_head_device_features(
+        &self,
+        features: &FeatureRef,
+        rows: usize,
+    ) -> Result<FeatureRows, String> {
+        match features.read_rows_to_host(rows) {
+            Ok(rows) => Ok(rows),
+            Err(crate::ResourceError::LogicalLease) => {
+                let row_bytes = self.head_conditioning_bytes();
+                FeatureRows::new(vec![0u8; rows * row_bytes].into(), rows)
+                    .map_err(|error| error.to_string())
+            }
+            Err(error) => Err(error.to_string()),
+        }
     }
 
     /// One transaction of a head reading target history, padded to `steps`
@@ -724,11 +811,13 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
             steps,
             submission,
             started,
+            phases: (entered_submit, before_family_submit, after_family_submit),
             epoch,
             launch_trace,
             bindings,
         } = flight;
         let completed = submission.finish().map_err(DomainError::Device)?;
+        let finished_wait = Instant::now();
         if let Some(trace) = &launch_trace {
             let submissions = trace
                 .collect()
@@ -766,9 +855,14 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
             }
         }
         if std::env::var_os("MAGNITUDE_TRACE_FLIGHTS").is_some() {
+            let ms = |d: Duration| d.as_secs_f64() * 1000.0;
             eprintln!(
-                "flight head duration_ms={:.3} requests={:?}",
-                started.elapsed().as_secs_f64() * 1000.0,
+                "flight head duration_ms={:.3} pre_submit_ms={:.3} prep_ms={:.3} queue_ms={:.3} wait_ms={:.3} requests={:?}",
+                ms(finished_wait.saturating_duration_since(started)),
+                ms(entered_submit.saturating_duration_since(started)),
+                ms(before_family_submit.saturating_duration_since(entered_submit)),
+                ms(after_family_submit.saturating_duration_since(before_family_submit)),
+                ms(finished_wait.saturating_duration_since(after_family_submit)),
                 requests
             );
         }
@@ -855,6 +949,23 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
                 })
                 .collect::<Vec<_>>(),
         };
+        if steps > 0 {
+            if let Some(bank) = self.family.expert_bank() {
+                for (slot, (request, _, proposals)) in requests.iter().enumerate() {
+                    if *proposals > 0 {
+                        let drafted: Vec<crate::operation::TokenId> = (0..*proposals)
+                            .filter_map(|step| match selected[step * slot_class + slot] {
+                                crate::operation::Selected::Token(tok) => Some(tok),
+                                _ => None,
+                            })
+                            .collect();
+                        if !drafted.is_empty() {
+                            bank.draft_tokens(*request, &drafted);
+                        }
+                    }
+                }
+            }
+        }
         let mut pending: Vec<PendingOperationOutcome> = requests
             .into_iter()
             .zip(advances)

@@ -552,6 +552,9 @@ impl ValidatedHeadLaunch {
     pub fn domain(&self) -> &ResourceDomainId {
         &self.core.domain
     }
+    pub fn batch(&self) -> &ValidatedHeadBatch {
+        &self.core.batch
+    }
     pub fn class(&self) -> PoolClass {
         PoolClass::Head(self.core.batch.class())
     }

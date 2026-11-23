@@ -200,7 +200,7 @@ fn transact(
         request,
         phase: magnitude_executor::HeadPhase::Generation,
         tokens: tokens.to_vec(),
-        conditioning,
+        conditioning: conditioning.into(),
         position,
         proposals: (0..proposals)
             .map(|proposal| greedy(position + entered + 1 + proposal))

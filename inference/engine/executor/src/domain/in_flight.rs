@@ -192,6 +192,9 @@ pub struct HeadFlight<F: ProgramFamily = NativeFamily> {
     pub(super) steps: usize,
     pub(super) submission: F::HeadSubmission,
     pub(super) started: Instant,
+    /// Host phase timestamps for `MAGNITUDE_TRACE_FLIGHTS` attribution:
+    /// `(entered_submit, before_family_submit, after_family_submit)`.
+    pub(super) phases: (Instant, Instant, Instant),
     /// The epoch the flight's launches are timed across ([`LaunchEpoch`]).
     pub(super) epoch: Option<LaunchEpoch>,
     /// Optional one-flight launch attribution for diagnosing a proposing head.

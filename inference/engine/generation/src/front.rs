@@ -34,6 +34,15 @@ use magnitude_executor::{
     SelectSpec, TokenId,
 };
 
+/// Unentered verify pairs whose conditioning features remain on the device
+/// (`FeatureRef`, zero D2H copy) until the immediately following `Operation::Head`
+/// consumes them on-device. Never retained inside a checkpoint.
+#[derive(Clone)]
+struct DevicePending {
+    tokens: Vec<TokenId>,
+    features: FeatureRef,
+}
+
 /// A head decoding in front and verify passes, of its own history.
 #[derive(Clone)]
 pub(crate) struct FrontState {
@@ -44,6 +53,9 @@ pub(crate) struct FrontState {
     /// host by a head transaction; trailing them by the pairs a verify
     /// pass accepted, or history the device did not enter.
     tail: DraftTail,
+    /// On-device pending pairs from a verify pass (`PassForm::Verify`), kept
+    /// off the host until consumed by the next round's `Operation::Head`.
+    pending_device: Option<DevicePending>,
     /// The in-flight round work, if any: a target pass started from the
     /// level head, or a host head transaction entering pairs.
     round: FrontRound,
@@ -78,6 +90,7 @@ impl FrontState {
                 return Ok(Self {
                     position: 0,
                     tail: DraftTail::EMPTY,
+                    pending_device: None,
                     round: FrontRound::Idle,
                 });
             }
@@ -90,6 +103,7 @@ impl FrontState {
         Ok(Self {
             position: state.position,
             tail: state.tail.clone(),
+            pending_device: None,
             round: FrontRound::Idle,
         })
     }
@@ -111,6 +125,32 @@ impl FrontState {
             operations: vec![operation],
         })
     }
+
+    /// Enter `tokens` conditioned by leading `0..tokens.len()` rows of on-device
+    /// `features` at the head's position, drafting a proposal per `proposals`.
+    fn enter_device(
+        &mut self,
+        request: RequestId,
+        tokens: Vec<TokenId>,
+        features: FeatureRef,
+        phase: HeadPhase,
+        proposals: &[SelectSpec],
+    ) -> Result<MethodEffects, String> {
+        let transaction = HeadTransaction::new_device(
+            request,
+            phase,
+            tokens,
+            features,
+            self.position,
+            proposals.to_vec(),
+            DraftForm::Chained,
+        )?;
+        let operation = transaction.operation().clone();
+        self.round = FrontRound::Head(transaction);
+        Ok(MethodEffects {
+            operations: vec![operation],
+        })
+    }
 }
 
 impl MethodState for FrontState {
@@ -125,6 +165,9 @@ impl MethodState for FrontState {
     /// token (a prefix resumed past a closing chunk's or a pass's entry),
     /// its entry is the chunk's pairs past that token (`Priming`).
     fn priming_position(&self) -> Option<usize> {
+        if self.pending_device.is_some() {
+            return None;
+        }
         match (&self.tail, &self.round) {
             (
                 DraftTail::Trailing {
@@ -196,17 +239,21 @@ impl MethodState for FrontState {
         // pairs the chunk's first token with the feature before the chunk,
         // unless it entered that pair already.
         let tail = std::mem::replace(&mut self.tail, DraftTail::EMPTY);
-        let mut pending = match tail {
-            DraftTail::Entered(token) if token == first => None,
-            DraftTail::Entered(_) => {
+        let mut pending = match (self.pending_device.take(), tail) {
+            (Some(device), _) => {
+                let device_rows = DrafterState::read(reader, device.features, 0, device.tokens.len())?;
+                Some(PendingRows::joined(None, device.tokens, device_rows)?)
+            }
+            (None, DraftTail::Entered(token)) if token == first => None,
+            (None, DraftTail::Entered(_)) => {
                 return Err("the chunk's first token differs from the successor MTP entered".into());
             }
-            DraftTail::Trailing { pending, open: Some(open) } => Some(PendingRows::joined(
+            (None, DraftTail::Trailing { pending, open: Some(open) }) => Some(PendingRows::joined(
                 pending,
                 vec![first],
                 DrafterState::open_rows(reader, open)?,
             )?),
-            DraftTail::Trailing { pending, open: None } => pending,
+            (None, DraftTail::Trailing { pending, open: None }) => pending,
         };
         if !rest.is_empty() {
             pending = Some(PendingRows::joined(
@@ -258,6 +305,16 @@ impl MethodState for FrontState {
             FrontRound::Idle | FrontRound::Pass(_) => {}
             FrontRound::Head(_) => return Err("MTP already has an unresolved head transaction".into()),
         }
+        if let Some(device) = self.pending_device.take() {
+            if device.tokens.last() != Some(&pending) {
+                return Err("MTP trails a decode with no pair of its pending token to enter".into());
+            }
+            self.tail = DraftTail::Entered(pending);
+            return Ok(FrontEntry::Pending(
+                self.enter_device(request, device.tokens, device.features, HeadPhase::Generation, selects)?
+                    .operations,
+            ));
+        }
         match &self.tail {
             DraftTail::Entered(token) if *token == pending => {
                 let (form, entry) = match grant {
@@ -292,7 +349,7 @@ impl MethodState for FrontState {
     }
 
     fn trails(&self) -> bool {
-        matches!(self.tail, DraftTail::Trailing { .. })
+        self.pending_device.is_some() || matches!(self.tail, DraftTail::Trailing { .. })
     }
 
     /// A pass committed from the token the head entered. A front pass
@@ -337,13 +394,21 @@ impl MethodState for FrontState {
                 let features = verification
                     .features
                     .ok_or("a verify pass publishes its rows' features")?;
-                let rows = DrafterState::read(reader, features, 0, accepted)?;
                 let mut tokens = verification.inputs[1..accepted].to_vec();
                 tokens.push(verification.next);
-                self.tail = DraftTail::Trailing {
-                    pending: Some(PendingRows::joined(None, tokens, rows)?),
-                    open: None,
-                };
+                if features.is_device_backed() {
+                    // Keep the target's output features on the device (zero D2H
+                    // copy) until the immediately following `Operation::Head`
+                    // consumes them directly via `HeadConditioning::Features`.
+                    self.pending_device = Some(DevicePending { tokens, features });
+                    self.tail = DraftTail::EMPTY;
+                } else {
+                    let rows = DrafterState::read(reader, features, 0, accepted)?;
+                    self.tail = DraftTail::Trailing {
+                        pending: Some(PendingRows::joined(None, tokens, rows)?),
+                        open: None,
+                    };
+                }
             }
         }
         self.round = FrontRound::Idle;
@@ -376,18 +441,32 @@ impl MethodState for FrontState {
             FrontRound::Idle | FrontRound::Pass(_) => {}
             FrontRound::Head(_) => return Err(MethodCheckpointError::Unresolved),
         }
-        let tail = match &self.tail {
+        let tail = if let Some(device) = &self.pending_device {
+            let rows = device
+                .features
+                .read_rows_to_host(device.tokens.len())
+                .map_err(|_| MethodCheckpointError::Unresolved)?;
+            let pending = PendingRows::joined(None, device.tokens.clone(), rows)
+                .map_err(|_| MethodCheckpointError::Unresolved)?;
+            let (pending, last) = pending.opened();
             DraftTail::Trailing {
-                pending: Some(pending),
-                open: None,
-            } => {
-                let (pending, last) = pending.clone().opened();
-                DraftTail::Trailing {
-                    pending,
-                    open: Some(OpenFeature::Host(last)),
-                }
+                pending,
+                open: Some(OpenFeature::Host(last)),
             }
-            tail => tail.clone(),
+        } else {
+            match &self.tail {
+                DraftTail::Trailing {
+                    pending: Some(pending),
+                    open: None,
+                } => {
+                    let (pending, last) = pending.clone().opened();
+                    DraftTail::Trailing {
+                        pending,
+                        open: Some(OpenFeature::Host(last)),
+                    }
+                }
+                tail => tail.clone(),
+            }
         };
         Ok(MethodCheckpoint::Mtp(DraftCheckpoint {
             position: self.position,
@@ -399,10 +478,147 @@ impl MethodState for FrontState {
     fn evict(&mut self) {
         self.position = 0;
         self.tail = DraftTail::EMPTY;
+        self.pending_device = None;
         self.round = FrontRound::Idle;
     }
 
     fn reclaimable(&self) -> u64 {
         self.tail.host_bytes() as u64
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use magnitude_executor::{
+        FeatureRows, FeatureSpan, HeadFeatures, ResourceDomainId, Sampling, Selected, Shaping,
+    };
+
+    struct CountingReader {
+        reads: usize,
+        row_bytes: usize,
+    }
+
+    impl FeatureReader for CountingReader {
+        fn read(&mut self, span: &FeatureSpan) -> Result<FeatureRows, String> {
+            self.reads += 1;
+            let mut bytes = Vec::with_capacity(span.count * self.row_bytes);
+            for row in 0..span.count {
+                bytes.extend_from_slice(&((span.start + row) as u32).to_le_bytes());
+            }
+            FeatureRows::new(bytes.into(), span.count).map_err(|e| e.to_string())
+        }
+    }
+
+    fn select() -> SelectSpec {
+        SelectSpec {
+            sampling: Sampling::Greedy,
+            shaping: Shaping::default(),
+            seed: 0,
+            position: 0,
+            domain: 0,
+            mask: None,
+            history: None,
+        }
+    }
+
+    #[test]
+    fn front_verify_logical_fallback_and_device_pending_enter_exact_tokens() {
+        let domain = ResourceDomainId::new("front-test").unwrap();
+        let req = RequestId(1);
+        let mut reader = CountingReader { reads: 0, row_bytes: 4 };
+
+        // Start entered at token 10, position 5.
+        let mut state = FrontState {
+            position: 5,
+            tail: DraftTail::Entered(TokenId(10)),
+            pending_device: None,
+            round: FrontRound::Idle,
+        };
+
+        // Start a Verify pass of 3 tokens [10, 11, 12], accepting all 3 and producing next = 13.
+        let entry = state
+            .front(req, TokenId(10), FrontGrant::Verify(3), &[select(), select()])
+            .unwrap();
+        assert!(matches!(entry, FrontEntry::Verify));
+        let logical = FeatureRef::logical(domain.clone(), 3, 1).unwrap();
+        assert!(!logical.is_device_backed());
+        state
+            .observe(
+                req,
+                Verification {
+                    inputs: &[TokenId(10), TokenId(11), TokenId(12)],
+                    accepted: 3,
+                    next: TokenId(13),
+                    features: Some(logical),
+                },
+                &mut reader,
+            )
+            .unwrap();
+        assert_eq!(reader.reads, 1, "logical fallback reads via FeatureReader");
+        assert!(state.trails());
+
+        let FrontEntry::Pending(ops) = state
+            .front(req, TokenId(13), FrontGrant::UpTo(2), &[select(), select()])
+            .unwrap()
+        else {
+            panic!("expected pending head transaction");
+        };
+        let [op @ Operation::Head { tokens, conditioning, position: 5, proposals, .. }] = ops.as_slice() else {
+            panic!("expected one Head op: {ops:?}");
+        };
+        assert_eq!(tokens, &[TokenId(11), TokenId(12), TokenId(13)]);
+        assert_eq!(conditioning.rows(), 3);
+        assert!(conditioning.host().is_some());
+        assert_eq!(proposals.len(), 2);
+        state
+            .reconcile(
+                op,
+                Outcome::Head {
+                    proposals: vec![Selected::Token(TokenId(14)), Selected::Token(TokenId(15))],
+                    confidence: None,
+                },
+            )
+            .unwrap();
+        assert_eq!(state.position, 8);
+        assert!(!state.trails());
+
+        // Now verify DevicePending path emits HeadFeatures::Device with ZERO FeatureReader reads.
+        let device_ref = FeatureRef::logical(domain, 3, 1).unwrap();
+        state.pending_device = Some(DevicePending {
+            tokens: vec![TokenId(14), TokenId(15), TokenId(16)],
+            features: device_ref.clone(),
+        });
+        state.tail = DraftTail::EMPTY;
+        assert!(state.trails());
+        assert_eq!(state.priming_position(), None);
+        let reads_before = reader.reads;
+        let FrontEntry::Pending(ops) = state
+            .front(req, TokenId(16), FrontGrant::UpTo(2), &[select(), select()])
+            .unwrap()
+        else {
+            panic!("expected device-conditioned pending head transaction");
+        };
+        assert_eq!(reader.reads, reads_before, "device-pending path must never call FeatureReader");
+        let [op @ Operation::Head { tokens, conditioning, position: 8, proposals, .. }] = ops.as_slice() else {
+            panic!("expected one device Head op: {ops:?}");
+        };
+        assert_eq!(tokens, &[TokenId(14), TokenId(15), TokenId(16)]);
+        assert_eq!(
+            conditioning,
+            &HeadFeatures::Device { features: device_ref, rows: 3 }
+        );
+        assert_eq!(proposals.len(), 2);
+        state
+            .reconcile(
+                op,
+                Outcome::Head {
+                    proposals: vec![Selected::Token(TokenId(17)), Selected::Token(TokenId(18))],
+                    confidence: None,
+                },
+            )
+            .unwrap();
+        assert_eq!(state.position, 11);
+        assert!(!state.trails());
     }
 }

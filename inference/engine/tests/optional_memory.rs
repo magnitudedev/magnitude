@@ -337,7 +337,7 @@ fn mtp_head_charge_releases_and_reloads_after_idle() {
             request,
             phase: magnitude_executor::HeadPhase::Priming { draft_from: 1 },
             tokens: vec![TokenId(1)],
-            conditioning: FeatureRows::new(vec![0; row_bytes].into(), 1).unwrap(),
+            conditioning: FeatureRows::new(vec![0; row_bytes].into(), 1).unwrap().into(),
             position: 0,
             proposals: Vec::new(),
             form: magnitude_executor::DraftForm::Chained,

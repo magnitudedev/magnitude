@@ -919,7 +919,7 @@ impl Engine {
                 request: sequence.request,
                 phase: HeadPhase::Generation,
                 tokens,
-                conditioning: features,
+                conditioning: magnitude_executor::HeadFeatures::Host(features),
                 position: sequence.position - entered,
                 proposals: (0..drafts).map(|proposal| Self::greedy(sequence.position + proposal)).collect(),
                 form: DraftForm::Chained,

@@ -828,7 +828,7 @@ fn bind_domain(
         false => None,
     };
     let plan = execution.resources().clone();
-    let target_state = plan.allocate_target_state(charges, pools.state.clone()).unwrap();
+    let target_state = plan.allocate_target_state(charges, pools.state_pools()).unwrap();
     let head_state = plan.head_state().map(|state| state.allocate(charges, pools.state.clone()).unwrap());
     // The constants its domain binds, as the engine's load claims them.
     let constants = crate::memory::ClaimDemand {

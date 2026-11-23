@@ -504,24 +504,30 @@ fn fixture_over_with_state_block_granules(
     // What the load allocates as it starts, each allocation charged to its
     // claim as the load's are.
     let mut recorded = crate::memory::ledger::Recorded::default();
-    // The state pool as a load opens it: at the plan's state granule.
-    let state_granule = execution.resources().target_state().granule;
-    let pool = if min_state_block_granules > 1 {
+    // The state pool(s) as a load opens them: history at `granule`, plus a
+    // dedicated recurrent pool when the model has recurrent components.
+    let target_plan = execution.resources().target_state();
+    let (pool, recurrent_pool) = if min_state_block_granules > 1 {
         let mut allocations = device.native_allocations();
-        allocations.least = allocations.least.max(state_granule * min_state_block_granules);
-        ledgers
+        allocations.least = allocations.least.max(target_plan.granule * min_state_block_granules);
+        let pool = ledgers
             .open_pool_with_allocations(
                 &device,
                 seismic::Contract::DeviceOnly,
                 crate::memory::ledger::PoolClass::State,
-                state_granule,
+                target_plan.granule,
                 allocations,
             )
-            .expect("the fixture's device opens its multi-granule state pool")
+            .expect("the fixture's device opens its multi-granule state pool");
+        (pool, None)
     } else {
         ledgers
-            .open_pool(&device, seismic::Contract::DeviceOnly, crate::memory::ledger::PoolClass::State, state_granule)
+            .open_state_pools_at(None, &device, seismic::Contract::DeviceOnly, target_plan.granule, target_plan.recurrent_granule)
             .expect("the fixture's device opens its state pool")
+    };
+    let state_pools = magnitude_state::StatePools {
+        history: pool.clone(),
+        recurrent: recurrent_pool,
     };
     let scratch = crate::memory::ClaimDemand { device: execution.resources().bytes().scratch, ..Default::default() };
     let arena = crate::memory::ledger::CommittedKind::Arena;
@@ -552,7 +558,7 @@ fn fixture_over_with_state_block_granules(
     let tables = crate::memory::ClaimDemand { device: target_state.table_bytes().unwrap() + head_tables, ..Default::default() };
     let kind = crate::memory::ledger::CommittedKind::StateTables;
     let (store, head) = fixture_charged(&device, &ledgers, &mut recorded, kind, tables, |charges| {
-        let store = target_state.allocate(charges, pool.clone());
+        let store = target_state.allocate(charges, state_pools);
         let head = match head_plan {
             Some(state) => Some(state.allocate(charges, pool.clone()).unwrap()),
             None => head.then(|| spare_head_store(charges, pool.clone())),
@@ -578,8 +584,6 @@ fn fixture_over_with_state_block_granules(
             pressed,
             clock,
             reading,
-            has_host_tier: std::cell::Cell::new(false),
-            host_backing_started: std::cell::Cell::new(0),
         },
         recorded,
         request_slot,
@@ -1172,10 +1176,6 @@ pub struct TestFamily {
     clock: TestClock,
     /// The reader its domain samples memory through.
     reading: Rc<dyn StatusReading>,
-    /// Whether `has_planned_host_tier` reports a host tier awaiting backing.
-    pub(crate) has_host_tier: std::cell::Cell<bool>,
-    /// How many times `begin_host_backing` was invoked on this family.
-    pub(crate) host_backing_started: std::cell::Cell<usize>,
 }
 
 /// A fake elastic expert bank (`ElasticBank`): a slab store of a slot a
@@ -1571,6 +1571,7 @@ impl ElasticBank for FakeBank {
     }
 
     fn draft_window(&self, _estimated_seconds: f64) {}
+    fn draft_tokens(&self, _request: crate::operation::RequestId, _tokens: &[crate::operation::TokenId]) {}
 
     /// Its slots shrink to `to`, at least one; its host tier releases
     /// nothing.
@@ -1911,15 +1912,6 @@ impl ProgramFamily for TestFamily {
         self.bank.as_ref().map(|bank| bank as &dyn ElasticBank)
     }
 
-    fn has_planned_host_tier(&self) -> bool {
-        self.has_host_tier.get()
-    }
-
-    fn begin_host_backing(&self, _ledgers: &crate::memory::ledger::DeviceLedgers) -> Result<(), super::DomainError> {
-        self.host_backing_started.set(self.host_backing_started.get() + 1);
-        Ok(())
-    }
-
     fn hold_group(
         &self,
         _charges: &seismic::Charges,
@@ -1984,6 +1976,7 @@ impl ProgramFamily for TestFamily {
                     stored_reads: STORED_READS
                         .with(|reads| std::mem::take(&mut *reads.borrow_mut())),
                     expert_step: EXPERT_STEPS.with(|steps| steps.borrow_mut().take()),
+                    decode_landings: Vec::new(),
                 },
             )
         }))

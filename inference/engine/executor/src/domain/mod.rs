@@ -769,15 +769,6 @@ pub enum MemoryStanding {
     Active,
 }
 
-#[derive(Clone, Debug)]
-struct ExogenousShrink {
-    store: seismic::StoreIdentity,
-    at: std::time::Instant,
-    committed: u64,
-    hold_room: u64,
-    block: u64,
-}
-
 /// Snapshot of a store's ledger figures when a bank growth on that tier was
 /// refused by the allocator (`BankResized::GrowthRefused` or partial
 /// `BankResized::Grown { refused: Some(_), .. }`). Suppresses retrying growth
@@ -789,7 +780,6 @@ struct GrowthRefusal {
     free: u64,
     budget: u64,
 }
-
 /// Native executor with no erased stage or executor type parameters. The
 /// accepted map is vacant while that request's advance is in flight.
 pub struct ExecutorDomain<F: ProgramFamily = NativeFamily> {
@@ -894,10 +884,6 @@ pub struct ExecutorDomain<F: ProgramFamily = NativeFamily> {
     /// kept as its slots were made; elsewhere it records its graphs at
     /// first use, as any new shape's.
     shrink_step: bool,
-    /// Records the most recent bank shrink's reading state so transient external
-    /// room jitter cannot immediately ping-pong back into a small grow while
-    /// still letting own-claim frees and large app exits regrow immediately.
-    exogenous_shrink: Option<ExogenousShrink>,
     /// Per-tier latch set when a bank growth is refused by the allocator
     /// (`BankResized::GrowthRefused` or `Grown { refused: Some(_), .. }`),
     /// preventing repeated failing allocation calls until memory is released or
@@ -1168,22 +1154,6 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
         tracing::info!(costs = measures.costs.as_ref().err().map_or("measured", String::as_str), "the load is priced");
         self.measures = Some(measures);
         Ok(())
-    }
-
-    /// Start background backing of any planned host tier, clamped to live
-    /// post-warm-up `HostRam` room. Called after warm-up and load pricing so
-    /// tens of gigabytes of pinned host-tier allocation neither stall warm-up
-    /// nor contaminate pricing measurements.
-    pub fn begin_host_backing(&self) -> Result<(), DomainError> {
-        if !self.family.has_planned_host_tier() {
-            return Ok(());
-        }
-        // Establish a clean post-load/post-warm-up baseline (`after_idle = true`)
-        // so one-time uncharged driver/JIT/warm-up host RSS is absorbed into
-        // `others` and `pinned_budget()` without poisoning `guarantee` (`read.rise`)
-        // and double-subtracting it from `pinned_import_room()` / `live_pinned_headroom()`.
-        self.memory.borrow_mut().settled_read_after(self.resources.ledgers(), true);
-        self.family.begin_host_backing(self.resources.ledgers())
     }
 
     /// The load's costs; none before [`Self::measure_load`], or where
@@ -2563,19 +2533,32 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
                                     .into(),
                             ));
                         }
-                        Operation::Head { conditioning, .. }
-                            if conditioning.row_bytes() != self.head_conditioning_bytes() =>
-                        {
-                            return Err(DomainError::Input(
-                                "head conditioning rows differ from the activation width".into(),
-                            ));
-                        }
+                        Operation::Head { conditioning, .. } => match conditioning {
+                            crate::HeadFeatures::Host(rows)
+                                if rows.row_bytes() != self.head_conditioning_bytes() =>
+                            {
+                                return Err(DomainError::Input(
+                                    "head conditioning rows differ from the activation width".into(),
+                                ));
+                            }
+                            crate::HeadFeatures::Device { features, rows }
+                                if features.domain() != self.domain.id()
+                                    || *rows == 0
+                                    || *rows > features.rows() =>
+                            {
+                                return Err(DomainError::Input(
+                                    "head device conditioning differs from resource domain or row count"
+                                        .into(),
+                                ));
+                            }
+                            _ => {}
+                        },
                         _ => {}
                     }
                     segments = segments.max(if lane == ReservationLane::Target {
                         target::reserved_segments(
                             &self.target_store,
-                            state.span_count(),
+                            |domain| state.domain_span_count(domain),
                             operation.row_count(),
                         )
                     } else {
@@ -2769,6 +2752,14 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
     /// after a fresh import, the loader is unloaded so weight bytes are never
     /// leaked on the ledger.
     fn bind_component(&mut self, lane: ReservationLane) -> Result<(), DomainError> {
+        let needs_bind = match lane {
+            ReservationLane::Head => !self.family.head_is_bound(),
+            ReservationLane::Vision => !self.family.vision_is_bound(),
+            ReservationLane::Target => false,
+        };
+        if !needs_bind {
+            return Ok(());
+        }
         let changes = self.resources.ledgers().changes().clone();
         changes.change(|keeping| {
             let claiming = &keeping.claims();
@@ -3185,7 +3176,15 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
         // thread stands beside it, they are judged by the last reading with
         // every claim since counted; the owner's first step owes a reading
         // and takes it.
-        if memory.read_at_event_after(resources.ledgers(), true).is_none() {
+        if family.has_planned_host_tier() {
+            // Take a settled post-domain reading (`after_idle = true`) before
+            // starting host-tier backing so one-time uncharged load/driver/graph
+            // host RSS is absorbed into `others` and `pinned_budget()` without
+            // poisoning `guarantee` (`read.rise`), and the host-tier target is
+            // clamped to live host room.
+            memory.settled_read_after(resources.ledgers(), true);
+            family.begin_host_backing(resources.ledgers())?;
+        } else if memory.read_at_event_after(resources.ledgers(), true).is_none() {
             tracing::debug!(target: MEMORY_TRACE, "the domain's opening memory read deferred: a change of ours stood beside the sample");
         }
         // The arena: the load's graph scratch and the target graphs' bound
@@ -3229,7 +3228,6 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
             measures: None,
             resize_held: ResizeHeld::default(),
             shrink_step: false,
-            exogenous_shrink: None,
             growth_refused: [None; crate::planning::BankTier::COUNT],
             running_release: None,
             _owner: owner,
@@ -3300,21 +3298,5 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
     /// Host timing of the most recently finished target step.
     pub fn target_timing(&self) -> Option<TargetHostTiming> {
         self.target_timing
-    }
-}
-
-#[cfg(test)]
-mod host_backing_deferral_tests {
-    use super::fixtures;
-
-    #[test]
-    fn host_tier_backing_starts_only_when_requested_after_domain_open() {
-        let (domain, _bindings) = fixtures::fixture(None);
-        domain.family.has_host_tier.set(true);
-        // Domain construction never launches background host-tier backing.
-        assert_eq!(domain.family.host_backing_started.get(), 0);
-        // Explicit post-warm-up/pricing invocation starts it.
-        domain.begin_host_backing().expect("host tier backing starts cleanly");
-        assert_eq!(domain.family.host_backing_started.get(), 1);
     }
 }

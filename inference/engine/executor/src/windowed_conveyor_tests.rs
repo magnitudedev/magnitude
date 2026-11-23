@@ -269,7 +269,7 @@ fn open_domain(
     recorded.record(weights);
     recorded.record(host_tables);
     let plan = execution.resources().clone();
-    let target_state = plan.allocate_target_state(&seismic::Charges::tally(&device), pools.state.clone()).unwrap();
+    let target_state = plan.allocate_target_state(&seismic::Charges::tally(&device), pools.state_pools()).unwrap();
     let constants = crate::memory::ClaimDemand {
         device: programs.target_graphs().unwrap().binding_constant_bytes().unwrap(),
         ..Default::default()

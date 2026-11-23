@@ -1505,7 +1505,7 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
             }
             segments = segments.max(super::target::reserved_segments(
                 &self.target_store,
-                advance.span_count(),
+                |domain| advance.domain_span_count(domain),
                 operation.row_count(),
             ));
             slots.push(slot);

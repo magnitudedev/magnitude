@@ -280,6 +280,9 @@ pub(crate) fn head_graph_classes(
             for steps in 1..=proposals as u64 {
                 for &selection in &selecting {
                     classes.push(transaction(entry_rows, slots, steps, selection, false, false));
+                    if slots == 1 {
+                        classes.push(transaction(entry_rows, 1, steps, selection, true, false));
+                    }
                 }
             }
         }
@@ -852,11 +855,11 @@ impl<'h> HeadSplit<'h> {
     /// `class`'s graph as its builder takes it: its topology and its numbers.
     fn class(&self, class: HeadGraphClass) -> Result<(HeadForm<f64, Arc<[u8]>>, HeadNumbers<u64>), GraphError> {
         let consistent = match class.launch {
-            HeadLaunchClass::Transaction { slots, steps, shaped, scored, device, .. } => {
+            HeadLaunchClass::Transaction { slots, steps, shaped, scored, device, prefix } => {
                 slots != 0
                     && slots <= class.entry_rows
                     && (steps != 0 || !(shaped || scored))
-                    && (!device || (steps == 0 && slots == 1))
+                    && (!device || (slots == 1 && (!prefix || steps == 0)))
             }
             HeadLaunchClass::Front { prefix, .. } => {
                 class.entry_rows <= VERIFY_ROWS && (!prefix || class.entry_rows == 1)
@@ -3179,5 +3182,25 @@ mod composition_tests {
         )
         .unwrap();
         assert_eq!(composed_resources, laid_resources);
+        // Verify single-slot device-conditioned drafting classes (`device: true,
+        // prefix: false, steps: 1..=proposals`) are sealed and certified.
+        for steps in 1..=max_steps {
+            let device_draft = HeadGraphClass {
+                entry_rows: 4,
+                history: geometry,
+                launch: HeadLaunchClass::Transaction {
+                    slots: 1,
+                    steps,
+                    shaped: false,
+                    scored: false,
+                    device: true,
+                    prefix: false,
+                },
+            };
+            assert!(
+                classes.contains(&device_draft),
+                "expected device-conditioned drafting class {device_draft:?} to be sealed"
+            );
+        }
     }
 }

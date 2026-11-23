@@ -181,7 +181,7 @@ fn head_conditioning_rows_must_match_its_entry_rows() {
         request: RequestId(3),
         phase: magnitude_executor::HeadPhase::Generation,
         tokens: vec![TokenId(4); tokens],
-        conditioning: rows(conditioning),
+        conditioning: rows(conditioning).into(),
         position: 0,
         proposals: vec![select(); proposals],
         form: magnitude_executor::DraftForm::Chained,

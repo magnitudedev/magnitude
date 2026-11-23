@@ -537,6 +537,54 @@ impl AheadVerdict {
     }
 }
 
+/// Conditioning features for [`Operation::Head`]: either host-resident
+/// [`FeatureRows`] or a leading `0..rows` slice of an executor-owned on-device
+/// [`FeatureRef`] (zero-copy: no D2H read and no H2D upload).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum HeadFeatures {
+    Host(FeatureRows),
+    Device {
+        features: FeatureRef,
+        rows: usize,
+    },
+}
+
+impl HeadFeatures {
+    pub fn rows(&self) -> usize {
+        match self {
+            Self::Host(rows) => rows.rows(),
+            Self::Device { rows, .. } => *rows,
+        }
+    }
+
+    pub fn host(&self) -> Option<&FeatureRows> {
+        match self {
+            Self::Host(rows) => Some(rows),
+            Self::Device { .. } => None,
+        }
+    }
+
+    pub fn device(&self) -> Option<(&FeatureRef, usize)> {
+        match self {
+            Self::Device { features, rows } => Some((features, *rows)),
+            Self::Host(_) => None,
+        }
+    }
+
+    pub fn host_bytes(&self) -> usize {
+        match self {
+            Self::Host(rows) => rows.bytes().len(),
+            Self::Device { .. } => 0,
+        }
+    }
+}
+
+impl From<FeatureRows> for HeadFeatures {
+    fn from(rows: FeatureRows) -> Self {
+        Self::Host(rows)
+    }
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub enum Operation {
     Forward {
@@ -571,7 +619,7 @@ pub enum Operation {
         request: RequestId,
         phase: HeadPhase,
         tokens: Vec<TokenId>,
-        conditioning: FeatureRows,
+        conditioning: HeadFeatures,
         position: usize,
         proposals: Vec<SelectSpec>,
         form: DraftForm,
@@ -932,6 +980,14 @@ impl Operation {
             } => {
                 if matches!(phase, HeadPhase::Priming { .. }) && !proposals.is_empty() {
                     return Err(OperationError::PrimingHeadProposals);
+                }
+                if let HeadFeatures::Device { features, rows } = conditioning {
+                    if *rows == 0 || *rows > features.rows() {
+                        return Err(OperationError::FeatureSpan {
+                            count: features.rows(),
+                            rows: *rows,
+                        });
+                    }
                 }
                 if conditioning.rows() != tokens.len() {
                     return Err(OperationError::FeatureSpan {

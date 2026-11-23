@@ -132,7 +132,7 @@ pub use native::{
     ZeroTuningWeights, attention_points, row_points,
 };
 pub use operation::{
-    AheadVerdict, ChainEntry, CommittedClass, DraftForm, DraftShape, ExecutableKind, FeatureReader, FeatureRows, FeatureSpan, FrontKind, FrontRow, FrontRows, Guess, GuessKind,
+    AheadVerdict, ChainEntry, CommittedClass, DraftForm, DraftShape, ExecutableKind, FeatureReader, FeatureRows, FeatureSpan, FrontKind, FrontRow, FrontRows, Guess, GuessKind, HeadFeatures,
     HeadPhase, Operation, OperationError, Outcome, Priming, RequestId,
     ResourceDomainId, RowResult, Rows, Sampling, SelectSpec, Selected, Shaping, TokenId, WorkKind,
 };

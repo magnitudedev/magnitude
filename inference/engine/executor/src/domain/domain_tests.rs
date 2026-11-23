@@ -391,7 +391,7 @@ fn drafter_work_resolves_its_requests_lookahead_before_provisioning() {
         request,
         phase: crate::HeadPhase::Generation,
         tokens: vec![crate::TokenId(1)],
-        conditioning: crate::FeatureRows::new(vec![0u8; 4].into(), 1).unwrap(),
+        conditioning: crate::FeatureRows::new(vec![0u8; 4].into(), 1).unwrap().into(),
         position: 1,
         proposals: Vec::new(),
         form: crate::DraftForm::Chained,
@@ -1570,11 +1570,13 @@ fn pending_head_and_vision_device_failures_consume_the_bindings() {
 
     let (mut head_domain, bindings) = fixture(None);
     let head_control = PendingControl::default();
+    let now = Instant::now();
     let mut head = HeadFlight {
         requests: Vec::new(),
         steps: 0,
         submission: PendingFailureSubmission::<CompletedHeadWork>::new(head_control.clone()).into(),
-        started: Instant::now(),
+        started: now,
+        phases: (now, now, now),
         epoch: None,
         launch_trace: None,
         bindings,
@@ -2983,7 +2985,7 @@ fn causal_heads_launch_apart_from_chained_drafts() {
         request: RequestId(request),
         phase: crate::HeadPhase::Generation,
         tokens: vec![crate::TokenId(1)],
-        conditioning: crate::FeatureRows::new(vec![0u8; 4].into(), 1).unwrap(),
+        conditioning: crate::FeatureRows::new(vec![0u8; 4].into(), 1).unwrap().into(),
         position: 1,
         proposals: vec![select.clone(); proposals],
         form: crate::DraftForm::Chained,

@@ -556,6 +556,10 @@ impl ValidatedTargetLaunch {
         self.core.slot(index)
     }
 
+    pub(crate) fn tokens(&self) -> &TargetTokens {
+        self.core.tokens()
+    }
+
     pub fn domain(&self) -> &ResourceDomainId {
         &self.core.domain
     }

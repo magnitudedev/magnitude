@@ -88,6 +88,9 @@ pub trait ElasticBank {
     /// An MTP head draft launched after a verify step completed: the drive is
     /// idle for `estimated_seconds` until the next verify step begins.
     fn draft_window(&self, estimated_seconds: f64);
+    /// Drafted tokens for `request`'s upcoming burst, feeding token-conditioned
+    /// cross-burst foresight (`Source::Token`) in `NameLedger`.
+    fn draft_tokens(&self, request: crate::operation::RequestId, tokens: &[crate::operation::TokenId]);
     /// A tier copy costs `costs` from now on: the blocks it takes, and
     /// the price a promotion's copy is weighed at.
     fn tier_copy(&self, costs: &crate::assessment::TierCopyCosts) -> Result<(), super::DomainError>;
