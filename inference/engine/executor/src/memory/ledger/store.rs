@@ -488,12 +488,20 @@ impl DeviceLedgers {
                 seismic::GrantKind::DeviceUnopened => {
                     let capacity = topology.store(path.store()).expect("a path's store is of its revision").capacity().value;
                     let free = sample.grant.map_or_else(grant_from_status, |grant| grant.left);
-                    DeviceGrant::Own { capacity, free }
+                    let cache_reserve = match device.backend() {
+                        seismic::BackendName::Cuda => crate::memory::supply::cuda_context_cache_reserve(capacity),
+                        _ => 0,
+                    };
+                    DeviceGrant::Own { capacity, free, cache_reserve }
                 }
                 seismic::GrantKind::DeviceOpened => {
                     let capacity = topology.store(path.store()).expect("a path's store is of its revision").capacity().value;
                     let free = grant_from_status();
-                    DeviceGrant::Own { capacity, free }
+                    let cache_reserve = match device.backend() {
+                        seismic::BackendName::Cuda => crate::memory::supply::cuda_context_cache_reserve(capacity),
+                        _ => 0,
+                    };
+                    DeviceGrant::Own { capacity, free, cache_reserve }
                 }
             },
         };
@@ -529,10 +537,15 @@ impl DeviceLedgers {
             (true, DeviceGrant::HostBudget { capacity, left }) => {
                 DeviceReading { device: self.host.read_after(at, Reading::host_budget(sample.host(), capacity, left), after_idle), host: None }
             }
-            (false, DeviceGrant::Own { capacity, free }) => {
+            (false, DeviceGrant::Own { capacity, free, cache_reserve }) => {
                 let host = self.host.read_after(at, Reading::host(sample.host()), after_idle);
                 let lag = own_lag(&self.device.store.identity, sample.host());
-                DeviceReading { device: self.device.read_after(at, Reading::device(capacity, free, lag), after_idle), host: Some(host) }
+                let device = self.device.read_after(
+                    at,
+                    Reading::device(capacity, free, lag).with_cache_reserve(cache_reserve),
+                    after_idle,
+                );
+                DeviceReading { device, host: Some(host) }
             }
             (unified, grant) => {
                 let stores = if unified { "one store" } else { "two stores" };
@@ -808,8 +821,10 @@ pub enum DeviceGrant {
     /// `capacity` beyond current heap usage).
     HostBudget { capacity: u64, left: u64 },
     /// A store of the device's own: `free` of its `capacity` that its grant
-    /// leaves, read in step with what the ledger counts.
-    Own { capacity: u64, free: u64 },
+    /// leaves, read in step with what the ledger counts, plus an elastic-cache
+    /// reserve kept free for external contexts (e.g. CUDA primary context
+    /// creation) without reducing `budget()` or resident admission.
+    Own { capacity: u64, free: u64, cache_reserve: u64 },
 }
 
 /// Each store's estimate as one reading of a device's stores left it

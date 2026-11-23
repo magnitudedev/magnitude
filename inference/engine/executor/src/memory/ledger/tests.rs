@@ -2997,3 +2997,71 @@ fn metal_working_set_left_reconciles_uncharged_metal_allocations() {
         "elastic bank target must stay >= proportional headroom below remaining Metal working set"
     );
 }
+
+/// Reproduces F-050 on discrete CUDA GPUs (A10G 23 GiB / RTX 4090 24.6 GiB):
+/// `Reading::with_cache_reserve` reserves `cuda_context_cache_reserve(capacity)`
+/// strictly from elastic bank cache sizing (`import_room`, `hold_room`,
+/// `target`) so background VRAM bank growth leaves enough free VRAM for an
+/// external CUDA process's `cuDevicePrimaryCtxRetain`, while leaving `budget`,
+/// `room`, `free`, and `allocatable` untouched for resident model admission.
+#[test]
+fn cuda_device_cache_reserve_bounds_elastic_bank_without_reducing_resident_admission() {
+    use crate::memory::supply::cuda_context_cache_reserve;
+
+    const MIB: u64 = 1 << 20;
+    const VRAM: u64 = 23 * GB; // A10G 23 GiB
+    const RESERVE: u64 = 512 * MIB;
+    const COMMITTED: u64 = 10 * GB;
+    const EXTERNAL_CTX: u64 = 260 * MIB;
+
+    assert_eq!(cuda_context_cache_reserve(VRAM), RESERVE);
+    assert_eq!(cuda_context_cache_reserve(12 * GB), 384 * MIB);
+    assert_eq!(cuda_context_cache_reserve(8 * GB), 384 * MIB);
+
+    let (_scope, ledger, _pool) = host();
+    let mut clock = Clock::new();
+    let t0 = clock.next();
+    ledger.read(
+        ledger.sampled(t0),
+        Reading::device(VRAM, VRAM, NOW).with_cache_reserve(RESERVE),
+    );
+    let _committed = commit(&ledger, COMMITTED);
+
+    let est = ledger.estimate();
+    assert_eq!(est.cache_reserve(), RESERVE);
+    // Resident admission paths (`budget`, `room`, `free`, `allocatable`) see
+    // full VRAM without subtracting the elastic cache reserve.
+    assert_eq!(est.budget(), VRAM);
+    assert_eq!(est.room(), VRAM - COMMITTED);
+    assert_eq!(est.free(), VRAM - COMMITTED);
+    assert_eq!(est.allocatable(), VRAM - COMMITTED);
+    // Elastic bank cache sizing (`import_room`, `hold_room`, `target`) leaves
+    // `RESERVE` free so external `cuDevicePrimaryCtxRetain` succeeds.
+    assert_eq!(est.import_room(), VRAM - COMMITTED - RESERVE);
+    assert_eq!(est.hold_room(), VRAM - COMMITTED - RESERVE);
+    assert_eq!(est.target(), VRAM - COMMITTED - RESERVE);
+
+    // Fill elastic bank cache up to `target()` (leaving `RESERVE` free VRAM).
+    let bank_bytes = VRAM - COMMITTED - RESERVE;
+    let _bank = ledger.cached(CacheKind::Bank, bank_bytes).expect("bank fits");
+    let t1 = clock.next();
+    ledger.read(
+        ledger.sampled(t1),
+        Reading::device(VRAM, RESERVE, NOW).with_cache_reserve(RESERVE),
+    );
+    let steady = ledger.estimate();
+    assert_eq!(steady.hold_room(), bank_bytes);
+    assert_eq!(steady.target(), bank_bytes);
+
+    // External CUDA process retains its primary context (`+260 MiB`): VRAM
+    // stays non-zero (`512 - 260 = 252 MiB` free), and `hold_room` drops by
+    // `260 MiB` so the bank shrinks smoothly to restore the reserve.
+    let t2 = clock.next();
+    ledger.read(
+        ledger.sampled(t2),
+        Reading::device(VRAM, RESERVE - EXTERNAL_CTX, NOW).with_cache_reserve(RESERVE),
+    );
+    let pressed = ledger.estimate();
+    assert_eq!(pressed.hold_room(), bank_bytes - EXTERNAL_CTX);
+    assert_eq!(pressed.budget(), VRAM - EXTERNAL_CTX);
+}

@@ -40,6 +40,11 @@ pub(super) struct Read {
     /// OS/container reserve that unreclaimable pinned host allocations must
     /// leave untouched (`Reading::pinned_reserve(unit)`): 0 on device stores.
     pinned_reserve: u64,
+    /// Elastic-cache-only headroom reserved below `budget()` on discrete
+    /// device stores (`Reading::cache_reserve`, e.g. CUDA primary-context
+    /// headroom); 0 on host stores. Never subtracted from `budget()` or
+    /// resident admission `room()`.
+    cache_reserve: u64,
     /// The store's pool block unit at the reading (`State::unit`).
     unit: u64,
     /// What the process had allocated as the sample shows it (including any
@@ -328,14 +333,21 @@ impl Estimate {
         self.pending
     }
 
+    /// Elastic-cache-only headroom reserved below `budget()` on discrete device
+    /// stores (`Reading::cache_reserve`): 0 on host stores.
+    pub fn cache_reserve(&self) -> u64 {
+        self.read.cache_reserve
+    }
+
     /// Effective budget ceiling for elastic bank holdings (`import_room`,
-    /// `hold_room`, `target`): on a wired GPU ceiling (`HostGrant::Wired`),
-    /// preserves `max(block_unit, WIRED_BANK_HEADROOM_MIN, ceiling.limit >> 5)`
-    /// below `grant` so elastic bank growth never pins
-    /// `MTLDevice.currentAllocatedSize` against `recommendedMaxWorkingSetSize`
-    /// and starves Metal command buffers or incoming KV/scratch allocations.
+    /// `hold_room`, `target`): subtracts any discrete `cache_reserve`, and on a
+    /// wired GPU ceiling (`HostGrant::Wired`), preserves
+    /// `max(block_unit, WIRED_BANK_HEADROOM_MIN, ceiling.limit >> 5)` below
+    /// `grant` so elastic bank growth never pins `MTLDevice.currentAllocatedSize`
+    /// against `recommendedMaxWorkingSetSize` and starves Metal command buffers
+    /// or incoming KV/scratch allocations.
     fn bank_budget(&self) -> u64 {
-        let budget = self.budget();
+        let budget = self.budget().saturating_sub(self.read.cache_reserve);
         match (self.read.ceiling, self.read.grant) {
             (Some(ceiling), Some(grant)) => {
                 let proportional = ceiling.limit >> WIRED_BANK_HEADROOM_SHIFT;
@@ -703,6 +715,7 @@ impl State {
         let unit = self.block_unit();
         let immediate_supply = reading.immediate_supply();
         let pinned_reserve = reading.pinned_reserve(unit);
+        let cache_reserve = reading.cache_reserve();
         let (cap, grows) = (self.boundary.cap(), !paged || self.boundary.admits_growth());
         let read = Read {
             at,
@@ -710,6 +723,7 @@ impl State {
             supply,
             immediate_supply,
             pinned_reserve,
+            cache_reserve,
             unit,
             visible: visible_allocated,
             nonresident,

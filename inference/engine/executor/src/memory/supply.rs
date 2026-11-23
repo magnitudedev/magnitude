@@ -102,6 +102,24 @@ pub(crate) fn scarcity_threshold(reclaim_band: u64, unit: u64, others_step: u64)
     reclaim_band.saturating_add(unit).saturating_add(others_step)
 }
 
+/// Elastic VRAM cache reserve for discrete CUDA devices so background
+/// expert-bank growth leaves enough free VRAM for an external process to
+/// retain a CUDA primary context (`cuDevicePrimaryCtxRetain`, ~258 MiB on A10G
+/// and ~300–450 MiB on RTX 4090/5090 or Seismic device open) and trigger
+/// Magnitude's live shrink path instead of failing immediately with
+/// `CUDA_ERROR_OUT_OF_MEMORY` (F-050).
+///
+/// Applied strictly to elastic bank cache sizing (`import_room`, `hold_room`,
+/// `target`), never to `budget()` / `room()` / resident model admission.
+pub(crate) fn cuda_context_cache_reserve(capacity: u64) -> u64 {
+    const MIB: u64 = 1 << 20;
+    const GIB: u64 = 1 << 30;
+    if capacity < 4 * GIB {
+        return (capacity / 8).min(384 * MIB);
+    }
+    (capacity / 32).clamp(384 * MIB, 512 * MIB)
+}
+
 /// One store's figures at one sample: the ledger's one OS input
 /// ([`super::ledger::Ledger::read`]). Fields are private: `supply ≤ total`
 /// holds by construction.
@@ -112,6 +130,11 @@ pub struct Reading {
     /// The OS's active reclaim band above the floor already subtracted from
     /// `supply.free_beyond_target` (`0` on non-host device stores).
     reclaim_band: u64,
+    /// Elastic-cache-only headroom reserved below `budget()` on discrete device
+    /// stores (e.g. CUDA primary-context headroom for external processes); `0`
+    /// on host stores and non-CUDA devices. Never subtracted from `budget()` or
+    /// resident admission `room()`.
+    cache_reserve: u64,
     /// A unified device's grant over host RAM (§4.3).
     grant: Option<HostGrant>,
     /// Host RAM's paging signals, where the store is host RAM.
@@ -179,6 +202,7 @@ impl Reading {
             total: sample.total,
             supply: sample.supply,
             reclaim_band: sample.reclaim_band,
+            cache_reserve: 0,
             grant: None,
             paging: Some(Paging {
                 harm: sample.harm,
@@ -257,7 +281,18 @@ impl Reading {
     pub fn device(capacity: u64, free: u64, lag: seismic::Lag) -> Self {
         assert!(free <= capacity, "invariant violated: a device's grant leaves {free} of its {capacity} bytes");
         let supply = seismic::Supply { free_beyond_target: i64::try_from(free).expect("a store's bytes fit i64"), clean_cache: 0, cold_reclaimable: 0 };
-        Self { total: capacity, supply, reclaim_band: 0, grant: None, paging: None, own_reclaimed: None, lag }
+        Self { total: capacity, supply, reclaim_band: 0, cache_reserve: 0, grant: None, paging: None, own_reclaimed: None, lag }
+    }
+
+    /// Attach an elastic-cache-only headroom reserve to a discrete device
+    /// reading (never subtracted from `budget()` or resident admission).
+    pub fn with_cache_reserve(mut self, reserve: u64) -> Self {
+        self.cache_reserve = reserve.min(self.total);
+        self
+    }
+
+    pub(crate) fn cache_reserve(&self) -> u64 {
+        self.cache_reserve
     }
 
     pub fn total(&self) -> u64 {
