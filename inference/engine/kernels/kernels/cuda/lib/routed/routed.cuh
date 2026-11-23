@@ -273,12 +273,11 @@ __device__ __forceinline__ void write_grid(u8 *grid, u64 x, u64 y, u64 z) {
 
 // The grids of an expert pass over rows[0] grouped rows and used[0] blocks
 // of `tile_rows` rows (`routed_experts`): a stage block per row, a quantize
-// block per block row, and the expand's and down's column blocks by the
-// coalesced super-blocks (`tiles_out`: uint2(first_block, live_rows)). When
-// `tile_rows <= TILE_M`, consecutive full blocks of the same expert are
-// merged into one super-block of up to `TILE_M` rows (grid y = 1); otherwise
-// each block spans ceil(tile_rows / TILE_M) row tiles in grid y.
-template <u32 TILE_M>
+// block per 8 rows (INT8, 1 warp/row) or per row (NVFP4 in-place), and the
+// expand's and down's column blocks by the coalesced super-blocks (`tiles_out`:
+// uint2(first_block, live_rows)). Executed by a 256-thread block so all
+// `block_rows` binary searches run in parallel across 256-block chunks.
+template <u32 TILE_M, u32 INT8>
 __device__ __forceinline__ void expert_grids(const u8 *rows, const u8 *used_ptr, const int *blocks,
                                              u64 blocks_stride, const int *order, u64 order_stride_0,
                                              u64 order_stride_1, u64 tile_rows, u64 expand_columns,
@@ -287,39 +286,72 @@ __device__ __forceinline__ void expert_grids(const u8 *rows, const u8 *used_ptr,
     const u64 grouped = (u64)*reinterpret_cast<const int *>(rows);
     const u64 used = (u64)*reinterpret_cast<const int *>(used_ptr);
     uint2 *descriptors = reinterpret_cast<uint2 *>(tiles_out);
+    const u32 tid = threadIdx.x;
     if (tile_rows <= TILE_M) {
+        __shared__ int s_expert[256];
+        __shared__ u32 s_live[256];
         u64 groups = 0;
-        u64 b = 0;
-        while (b < used) {
-            const int expert = blocks[b * blocks_stride];
-            const u64 b0 = b;
-            u32 last_live = block_rows(order + b * order_stride_0, order_stride_1, (u32)tile_rows);
-            u32 live = last_live;
-            ++b;
-            while (b < used && last_live == (u32)tile_rows && blocks[b * blocks_stride] == expert &&
-                   live + (u32)tile_rows <= TILE_M) {
-                last_live = block_rows(order + b * order_stride_0, order_stride_1, (u32)tile_rows);
-                live += last_live;
-                ++b;
+        bool has_open = false;
+        int open_expert = 0;
+        u64 open_b0 = 0;
+        u32 open_live = 0;
+        u32 open_last = 0;
+        for (u64 base = 0; base < used; base += 256) {
+            const u64 b = base + tid;
+            if (b < used) {
+                s_expert[tid] = blocks[b * blocks_stride];
+                s_live[tid] = block_rows(order + b * order_stride_0, order_stride_1, (u32)tile_rows);
             }
-            if (live > 0u) {
-                descriptors[groups] = make_uint2((u32)b0, live);
+            __syncthreads();
+            if (tid == 0) {
+                const u64 count = (used - base) < 256 ? (used - base) : 256;
+                for (u64 i = 0; i < count; ++i) {
+                    const int expert = s_expert[i];
+                    const u32 live = s_live[i];
+                    if (has_open && open_last == (u32)tile_rows && expert == open_expert &&
+                        open_live + (u32)tile_rows <= TILE_M) {
+                        open_live += live;
+                        open_last = live;
+                    } else {
+                        if (has_open && open_live > 0u) {
+                            descriptors[groups] = make_uint2((u32)open_b0, open_live);
+                            ++groups;
+                        }
+                        has_open = true;
+                        open_expert = expert;
+                        open_b0 = base + i;
+                        open_live = live;
+                        open_last = live;
+                    }
+                }
+            }
+            __syncthreads();
+        }
+        if (tid == 0) {
+            if (has_open && open_live > 0u) {
+                descriptors[groups] = make_uint2((u32)open_b0, open_live);
                 ++groups;
             }
+            write_grid(expand, expand_columns, 1, groups);
+            write_grid(down, down_columns, 1, groups);
         }
-        write_grid(expand, expand_columns, 1, groups);
-        write_grid(down, down_columns, 1, groups);
     } else {
-        for (u64 b = 0; b < used; ++b) {
+        for (u64 b = tid; b < used; b += 256) {
             const u32 live = block_rows(order + b * order_stride_0, order_stride_1, (u32)tile_rows);
             descriptors[b] = make_uint2((u32)b, live);
         }
-        const u64 row_tiles = (tile_rows + TILE_M - 1) / TILE_M;
-        write_grid(expand, expand_columns, row_tiles, used);
-        write_grid(down, down_columns, row_tiles, used);
+        if (tid == 0) {
+            const u64 row_tiles = (tile_rows + TILE_M - 1) / TILE_M;
+            write_grid(expand, expand_columns, row_tiles, used);
+            write_grid(down, down_columns, row_tiles, used);
+        }
     }
-    write_grid(stage, grouped, 1, 1);
-    write_grid(quantize, used * tile_rows, 1, 1);
+    if (tid == 0) {
+        write_grid(stage, grouped, 1, 1);
+        const u64 q_rows = used * tile_rows;
+        const u64 q_blocks = INT8 ? (q_rows + 7) / 8 : q_rows;
+        write_grid(quantize, q_blocks, 1, 1);
+    }
 }
 
 } // namespace routed

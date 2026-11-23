@@ -6,17 +6,21 @@
 
 use crate::programs::graph::facts::{Numbers, constant};
 use crate::programs::graph::{GraphError, draft::GraphDraft};
-use magnitude_family_contracts::{Decoder, RoutedFfn};
+use magnitude_family_contracts::{Decoder, HyperConnectionMixing, ResidualForm, RoutedFfn, SinkhornInput};
 use seismic::{Dim, Element, NativePort};
 
 /// What decides a routed layer's crossed and merged values beside their
 /// numbers ([`SplitLayer`]): the element of the experts' input (the
-/// decoder's activations), and whether the layer is of the fused form,
-/// which crosses its shared expert's coefficient.
+/// decoder's activations), whether the layer is of the fused form (which
+/// crosses its shared expert's coefficient), and the widths of the
+/// hyper-connection stream `join` and Sinkhorn `pre` rows crossed from front
+/// to back (`0` when absent).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub(crate) struct SplitForm {
     pub activation: Element,
     pub fused: bool,
+    pub join_width: u64,
+    pub pre_width: u64,
 }
 
 /// The numbers of a routed layer's crossed and merged values: its experts,
@@ -46,10 +50,32 @@ impl<D> Numbers<D> for SplitLayer<D> {
 /// reading of the model they make.
 pub(crate) fn split(routed: &RoutedFfn, geometry: &Decoder) -> (SplitForm, SplitLayer<u64>) {
     let fused = super::is_fused(routed);
+    let (join_width, pre_width) = if fused {
+        match &geometry.residual {
+            ResidualForm::HyperConnections(form) => {
+                let s = form.streams;
+                match form.mixing {
+                    HyperConnectionMixing::LowRankGated { .. } => (s, 0),
+                    HyperConnectionMixing::Sinkhorn { input, .. } => (
+                        s + s * s,
+                        match input {
+                            SinkhornInput::PreviousSite => s,
+                            SinkhornInput::OwnSite => 0,
+                        },
+                    ),
+                }
+            }
+            _ => (0, 0),
+        }
+    } else {
+        (0, 0)
+    };
     (
         SplitForm {
             activation: crate::programs::native_target_graph::activation(geometry),
             fused,
+            join_width,
+            pre_width,
         },
         SplitLayer {
             experts: routed.experts,
@@ -185,6 +211,8 @@ pub(crate) struct Crossing<T> {
     pub weights: T,
     pub normalized: T,
     pub coefficient: Option<T>,
+    pub join: Option<T>,
+    pub pre: Option<T>,
 }
 
 /// What a merge set's pass reads of its rows' crossing ([`Crossing::pass`]):
@@ -196,11 +224,14 @@ pub(crate) struct PassCrossing<T> {
 }
 
 /// What a back reads of its rows' crossing ([`Crossing::back`]): their
-/// weights, and the fused form's shared expert's input.
+/// weights, the fused form's shared expert's input, and any hyper-connection
+/// stream `join` / Sinkhorn `pre` values carried from the front.
 #[derive(Clone)]
 pub(crate) struct BackCrossing<T> {
     pub weights: T,
     pub shared: Option<SharedInput<T>>,
+    pub join: Option<T>,
+    pub pre: Option<T>,
 }
 
 /// The fused form's shared expert's input, which its back combines: the
@@ -305,6 +336,8 @@ pub(crate) struct DecodeCrossing<T> {
     pub normalized: T,
     pub coefficient: Option<T>,
     pub shared_product: Option<T>,
+    pub join: Option<T>,
+    pub pre: Option<T>,
     pub sources: T,
 }
 
@@ -318,6 +351,8 @@ pub(crate) struct DecodeCrossingBuffers<T> {
     pub normalized: T,
     pub coefficient: Option<T>,
     pub shared_product: Option<T>,
+    pub join: Option<T>,
+    pub pre: Option<T>,
 }
 
 /// The ports of a split layer's front or back ([`Stage`]): a front writes
@@ -446,6 +481,8 @@ impl<T> Crossing<T> {
         [&self.routes, &self.weights, &self.normalized]
             .into_iter()
             .chain(&self.coefficient)
+            .chain(&self.join)
+            .chain(&self.pre)
     }
 
     pub(crate) fn try_map<U, E>(&self, mut map: impl FnMut(&T) -> Result<U, E>) -> Result<Crossing<U>, E> {
@@ -453,7 +490,9 @@ impl<T> Crossing<T> {
             routes: map(&self.routes)?,
             weights: map(&self.weights)?,
             normalized: map(&self.normalized)?,
-            coefficient: self.coefficient.as_ref().map(map).transpose()?,
+            coefficient: self.coefficient.as_ref().map(&mut map).transpose()?,
+            join: self.join.as_ref().map(&mut map).transpose()?,
+            pre: self.pre.as_ref().map(map).transpose()?,
         })
     }
 
@@ -463,7 +502,8 @@ impl<T> Crossing<T> {
     }
 
     /// What a back reads of these values: the fused form's (which crosses a
-    /// coefficient) also its shared expert's input.
+    /// coefficient) also its shared expert's input, plus any crossed stream
+    /// join / Sinkhorn pre values.
     pub(crate) fn back(&self) -> BackCrossing<&T> {
         BackCrossing {
             weights: &self.weights,
@@ -471,6 +511,8 @@ impl<T> Crossing<T> {
                 .coefficient
                 .as_ref()
                 .map(|coefficient| SharedInput { normalized: &self.normalized, coefficient }),
+            join: self.join.as_ref(),
+            pre: self.pre.as_ref(),
         }
     }
 }
@@ -489,6 +531,8 @@ impl<T> BackCrossing<T> {
     pub(crate) fn iter(&self) -> impl Iterator<Item = &T> {
         std::iter::once(&self.weights)
             .chain(self.shared.iter().flat_map(|shared| [&shared.normalized, &shared.coefficient]))
+            .chain(&self.join)
+            .chain(&self.pre)
     }
 
     pub(crate) fn try_map<U, E>(&self, mut map: impl FnMut(&T) -> Result<U, E>) -> Result<BackCrossing<U>, E> {
@@ -499,6 +543,8 @@ impl<T> BackCrossing<T> {
                 .as_ref()
                 .map(|shared| Ok(SharedInput { normalized: map(&shared.normalized)?, coefficient: map(&shared.coefficient)? }))
                 .transpose()?,
+            join: self.join.as_ref().map(&mut map).transpose()?,
+            pre: self.pre.as_ref().map(map).transpose()?,
         })
     }
 }
@@ -545,6 +591,8 @@ impl SplitValues<Extents> {
                 weights: at(&self.crossing.weights),
                 normalized: at(&self.crossing.normalized),
                 coefficient: self.crossing.coefficient.as_ref().map(at),
+                join: self.crossing.join.as_ref().map(at),
+                pre: self.crossing.pre.as_ref().map(at),
             },
             merged: Merged {
                 inverse: at(&self.merged.inverse),
@@ -565,17 +613,21 @@ impl SplitValues<Extents> {
                 .fold(length(value(first)), |(element, longest), (_, length)| (element, longest.max(length)));
             (element, vec![longest])
         };
-        let coefficient = std::iter::once(first)
-            .chain(rest)
-            .filter_map(|layer| layer.crossing.coefficient.as_ref().map(length))
-            .reduce(|(element, longest), (_, length)| (element, longest.max(length)))
-            .map(|(element, longest)| (element, vec![longest]));
+        let optional_widest = |value: fn(&Self) -> &Option<Extents>| {
+            std::iter::once(first)
+                .chain(rest)
+                .filter_map(|layer| value(layer).as_ref().map(length))
+                .reduce(|(element, longest), (_, length)| (element, longest.max(length)))
+                .map(|(element, longest)| (element, vec![longest]))
+        };
         Self {
             crossing: Crossing {
                 routes: widest(|layer| &layer.crossing.routes),
                 weights: widest(|layer| &layer.crossing.weights),
                 normalized: widest(|layer| &layer.crossing.normalized),
-                coefficient,
+                coefficient: optional_widest(|layer| &layer.crossing.coefficient),
+                join: optional_widest(|layer| &layer.crossing.join),
+                pre: optional_widest(|layer| &layer.crossing.pre),
             },
             merged: Merged {
                 experts: widest(|layer| &layer.merged.experts),
@@ -608,6 +660,8 @@ impl SplitValues<seismic::Tensor> {
                 weights: view(&self.crossing.weights, &layer.crossing.weights)?,
                 normalized: view(&self.crossing.normalized, &layer.crossing.normalized)?,
                 coefficient: optional(&self.crossing.coefficient, &layer.crossing.coefficient)?,
+                join: optional(&self.crossing.join, &layer.crossing.join)?,
+                pre: optional(&self.crossing.pre, &layer.crossing.pre)?,
             },
             merged: Merged {
                 experts: view(&self.merged.experts, &layer.merged.experts)?,
@@ -622,7 +676,8 @@ impl Crossing<Extents<Dim>> {
     /// The element and extents of each value a layer of `form` and `layer`
     /// crosses over `rows` rows: `[rows, K]` routes and weights, the
     /// experts' `[rows, H]` input in the decoder's activation (in the latent
-    /// width where latent), and the fused form's `[rows]` coefficient.
+    /// width where latent), the fused form's `[rows]` coefficient, and any
+    /// hyper-connection stream `join` / Sinkhorn `pre` rows.
     pub(crate) fn at(form: &SplitForm, layer: &SplitLayer, rows: &Dim) -> Self {
         let choices = vec![rows.clone(), layer.selected.clone()];
         Crossing {
@@ -630,6 +685,8 @@ impl Crossing<Extents<Dim>> {
             weights: (Element::f32(), choices),
             normalized: (form.activation, vec![rows.clone(), layer.width.clone()]),
             coefficient: form.fused.then(|| (Element::f32(), vec![rows.clone()])),
+            join: (form.join_width > 0).then(|| (Element::f32(), vec![*rows, Dim::from(form.join_width)])),
+            pre: (form.pre_width > 0).then(|| (Element::f32(), vec![*rows, Dim::from(form.pre_width)])),
         }
     }
 }
@@ -644,6 +701,8 @@ impl Crossing<Extents> {
             weights: fixed(crossing.weights),
             normalized: fixed(crossing.normalized),
             coefficient: crossing.coefficient.map(fixed),
+            join: crossing.join.map(fixed),
+            pre: crossing.pre.map(fixed),
         }
     }
 }
@@ -656,6 +715,8 @@ impl<T> DecodeCrossing<T> {
             normalized: map(&self.normalized)?,
             coefficient: self.coefficient.as_ref().map(&mut map).transpose()?,
             shared_product: self.shared_product.as_ref().map(&mut map).transpose()?,
+            join: self.join.as_ref().map(&mut map).transpose()?,
+            pre: self.pre.as_ref().map(&mut map).transpose()?,
             sources: map(&self.sources)?,
         })
     }
@@ -672,6 +733,8 @@ impl DecodeCrossing<Extents<Dim>> {
             shared_product: form
                 .fused
                 .then(|| (form.activation, vec![rows.clone(), layer.shared.clone()])),
+            join: (form.join_width > 0).then(|| (Element::f32(), vec![*rows, Dim::from(form.join_width)])),
+            pre: (form.pre_width > 0).then(|| (Element::f32(), vec![*rows, Dim::from(form.pre_width)])),
             sources: (
                 Element::i32(),
                 vec![
@@ -690,6 +753,8 @@ impl<T> DecodeCrossingBuffers<T> {
             .into_iter()
             .chain(&self.coefficient)
             .chain(&self.shared_product)
+            .chain(&self.join)
+            .chain(&self.pre)
     }
 }
 
@@ -703,6 +768,8 @@ impl DecodeCrossingBuffers<Extents> {
             normalized: fixed(crossing.normalized),
             coefficient: crossing.coefficient.map(fixed),
             shared_product: crossing.shared_product.map(fixed),
+            join: crossing.join.map(fixed),
+            pre: crossing.pre.map(fixed),
         }
     }
 
@@ -728,6 +795,8 @@ impl DecodeCrossingBuffers<Extents> {
             normalized: widest(|layer| &layer.normalized),
             coefficient: optional_widest(|layer| &layer.coefficient),
             shared_product: optional_widest(|layer| &layer.shared_product),
+            join: optional_widest(|layer| &layer.join),
+            pre: optional_widest(|layer| &layer.pre),
         }
     }
 }
@@ -752,6 +821,8 @@ impl DecodeCrossingBuffers<seismic::Tensor> {
             normalized: view(&self.normalized, &layer.normalized)?,
             coefficient: optional(&self.coefficient, &layer.coefficient)?,
             shared_product: optional(&self.shared_product, &layer.shared_product)?,
+            join: optional(&self.join, &layer.join)?,
+            pre: optional(&self.pre, &layer.pre)?,
         })
     }
 }

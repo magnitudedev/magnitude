@@ -11,6 +11,7 @@
 #define PROJECTION_N2 SEISMIC_DIM_S
 #define PROJECTION_PARTNER_2 w_up
 #define PROJECTION_PARTNER_PACKET_2 packets::W3
+#include <seismic/coherent.h>
 #include "lib/projection/projection.h"
 #include "lib/projection/gemv.h"
 #include "lib/routed/route.h"

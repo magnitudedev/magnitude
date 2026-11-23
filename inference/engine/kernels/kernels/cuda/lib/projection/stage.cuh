@@ -593,10 +593,125 @@ __device__ __forceinline__ void stage_row_s8(const Pro &pro, u32 m, u64 K, u8 *q
             }
             words[w] = word;
         }
-        uint4 *out = reinterpret_cast<uint4 *>(q + m * K + group * 32);
+        uint4 *out = reinterpret_cast<uint4 *>(q + (u64)m * K + group * 32);
         out[0] = make_uint4(words[0], words[1], words[2], words[3]);
         out[1] = make_uint4(words[4], words[5], words[6], words[7]);
-        groups[m * (K / 32) + group] = make_float2(d, d * (float)total);
+        groups[(u64)m * (K / 32) + group] = make_float2(d, d * (float)total);
+    }
+}
+
+// Single-warp quantization of one plain activation row (`Pro::FACTORS == 0`,
+// no block-wide barrier) into its s8 codes and (d, d * sum q) groups, bit-for-bit
+// identical to `stage_row_s8`. Lets a 256-thread CTA process 8 rows in parallel.
+template <bool ENTRIES, class Pro>
+__device__ __forceinline__ void stage_row_s8_warp(const Pro &pro, u32 m, u64 K, u8 *q, float2 *groups) {
+    static_assert(Pro::FACTORS == 0, "stage_row_s8_warp requires a factor-free prologue");
+    const float factors[1] = {0.0f};
+    const bool vec4 = pro_can_vec4(pro, m);
+    for (u64 group = threadIdx.x & 31u; group < K / 32; group += 32) {
+        float values[32];
+        float maximum = 0.0f;
+        const u64 base = group * 32;
+        if (vec4) {
+#pragma unroll
+            for (int j = 0; j < 32; j += 4) {
+                float v[4];
+                pro_value4(pro, factors, m, base + j, v);
+                values[j + 0] = v[0];
+                values[j + 1] = v[1];
+                values[j + 2] = v[2];
+                values[j + 3] = v[3];
+                maximum = packets::peak_with(maximum, v[0]);
+                maximum = packets::peak_with(maximum, v[1]);
+                maximum = packets::peak_with(maximum, v[2]);
+                maximum = packets::peak_with(maximum, v[3]);
+            }
+        } else {
+#pragma unroll
+            for (int j = 0; j < 32; ++j) {
+                values[j] = pro.value(factors, m, base + j);
+                maximum = packets::peak_with(maximum, values[j]);
+            }
+        }
+        const float d = packets::int8_scale_of(maximum);
+        int total = 0;
+        u32 words[8];
+#pragma unroll
+        for (int w = 0; w < 8; ++w) {
+            u32 word = 0;
+#pragma unroll
+            for (int b = 0; b < 4; ++b) {
+                const int code = packets::int8_code_of(values[s8_real_offset<ENTRIES>(4 * w + b)], d);
+                total += code;
+                word |= ((u32)code & 0xFFu) << (8 * b);
+            }
+            words[w] = word;
+        }
+        uint4 *out = reinterpret_cast<uint4 *>(q + (u64)m * K + group * 32);
+        out[0] = make_uint4(words[0], words[1], words[2], words[3]);
+        out[1] = make_uint4(words[4], words[5], words[6], words[7]);
+        groups[(u64)m * (K / 32) + group] = make_float2(d, d * (float)total);
+    }
+}
+
+// Single-pass staging of row `m` for mixed segmented projections (some segments
+// INT8-admitted, others 16-bit): writes the 16-bit `Storage` row into `act_out`
+// and the s8 codes + groups into `q` / `groups` from the same normalized values.
+template <bool ENTRIES, class Storage = Act, class Pro>
+__device__ __forceinline__ void stage_row_s8_and_act(const Pro &pro, u32 m, u64 K, u8 *act_out, u8 *q,
+                                                     float2 *groups) {
+    static_assert(Storage::bytes == 2, "projection physical operands are 16-bit");
+    __shared__ float factors[Pro::FACTORS > 0 ? Pro::FACTORS : 1];
+    __shared__ float scratch[32];
+    pro.prepare_row(factors, m, scratch);
+    __syncthreads();
+    const element::Out<Storage> act_dst = element::out_over_scratch<Storage>(act_out);
+    const u64 row_base = (u64)m * K;
+    const bool vec4 = pro_can_vec4(pro, m);
+    for (u64 group = threadIdx.x; group < K / 32; group += blockDim.x) {
+        float values[32];
+        float maximum = 0.0f;
+        const u64 base = group * 32;
+        if (vec4) {
+#pragma unroll
+            for (int j = 0; j < 32; j += 4) {
+                float v[4];
+                pro_value4(pro, factors, m, base + j, v);
+                values[j + 0] = v[0];
+                values[j + 1] = v[1];
+                values[j + 2] = v[2];
+                values[j + 3] = v[3];
+                maximum = packets::peak_with(maximum, v[0]);
+                maximum = packets::peak_with(maximum, v[1]);
+                maximum = packets::peak_with(maximum, v[2]);
+                maximum = packets::peak_with(maximum, v[3]);
+            }
+        } else {
+#pragma unroll
+            for (int j = 0; j < 32; ++j) {
+                values[j] = pro.value(factors, m, base + j);
+                maximum = packets::peak_with(maximum, values[j]);
+            }
+        }
+        act_dst.template put_span<32>(row_base + base, values);
+        const float d = packets::int8_scale_of(maximum);
+        int total = 0;
+        u32 words[8];
+#pragma unroll
+        for (int w = 0; w < 8; ++w) {
+            u32 word = 0;
+#pragma unroll
+            for (int b = 0; b < 4; ++b) {
+                const int code = packets::int8_code_of(values[s8_real_offset<ENTRIES>(4 * w + b)], d);
+                total += code;
+                word |= ((u32)code & 0xFFu) << (8 * b);
+            }
+            words[w] = word;
+        }
+        uint4 *out = reinterpret_cast<uint4 *>(q + row_base + base);
+        out[0] = make_uint4(words[0], words[1], words[2], words[3]);
+        out[1] = make_uint4(words[4], words[5], words[6], words[7]);
+        groups[(u64)m * (K / 32) + group] = make_float2(d, d * (float)total);
     }
 }
 

@@ -1857,7 +1857,9 @@ struct GemmShape {
     // 16 B, the larger of WA's and WB's. COEF_WARP is 16 B a row.
     static constexpr int COEF_WARP = NJ * 16 * 16;
     template <class W, bool S8>
-    static constexpr int COEF_ROW = (W::GROUPS * coefficient_words<W, S8>() * 4 + 15) / 16 * 16;
+    static constexpr int COEF_ROW = (W::DENSE || Same<W, NoWeight>::value)
+                                        ? 0
+                                        : (W::GROUPS * coefficient_words<W, S8>() * 4 + 15) / 16 * 16;
     template <class WA, class WB, bool S8>
     static constexpr int COEF_AREA =
         NJ * 16 * (COEF_ROW<WA, S8> > COEF_ROW<WB, S8> ? COEF_ROW<WA, S8> : COEF_ROW<WB, S8>);
@@ -3098,6 +3100,13 @@ template <unsigned INT8, bool... ADMITTED> __host__ __device__ constexpr bool in
     return INT8 == 1;
 }
 
+// Segmented projections admit INT8 = 1 whenever at least one active segment is
+// INT8-admitted; non-INT8 segments stay on the 16-bit path.
+template <unsigned INT8, bool... ADMITTED> __host__ __device__ constexpr bool int8_path_any() {
+    static_assert(INT8 == 0 || (ADMITTED || ...), "INT8 = 1 requires at least one INT8-admitted segment");
+    return INT8 == 1;
+}
+
 // A selected materialized operand view owns its storage even when its type
 // equals semantic Act. Its producer must write every row; in-place eligibility
 // of the semantic source cannot turn that write into a no-op.
@@ -3130,7 +3139,7 @@ __device__ __forceinline__ void form_operands_in_place(u8 *rows, u32 m) {
 // otherwise the GEMV retains semantic Act and either matrix tile band reads
 // the selected representation. Plain semantic
 // sources remain in place, while an owned physical view is always produced.
-template <bool S8, bool GEMV_ENTRIES, bool GEMM_ENTRIES, class Operands, class Pro>
+template <bool S8, bool GEMV_ENTRIES, bool GEMM_ENTRIES, class Operands, bool MIXED_S8 = false, class Pro>
 __device__ __forceinline__ void stage_projection_row(const Pro &pro, u32 m, u32 rows, u64 K,
                                                      u8 *staged, void *groups) {
     static_assert(!S8 || Same<Operands, SemanticGemmOperands>::value,
@@ -3138,6 +3147,9 @@ __device__ __forceinline__ void stage_projection_row(const Pro &pro, u32 m, u32 
     if (rows <= GEMV_ROWS) {
         if constexpr (Pro::STAGED)
             form_row(pro, m, K, staged);
+    } else if constexpr (S8 && MIXED_S8) {
+        stage_row_s8_and_act<GEMM_ENTRIES, typename Operands::Storage>(
+            pro, m, K, staged, staged + (u64)rows * K * 2, reinterpret_cast<float2 *>(groups));
     } else if constexpr (S8) {
         stage_row_s8<GEMM_ENTRIES>(pro, m, K, staged, reinterpret_cast<float2 *>(groups));
     } else if constexpr (Pro::STAGED || Operands::MATERIALIZE) {

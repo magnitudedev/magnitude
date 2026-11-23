@@ -933,6 +933,25 @@ impl BlockSublayers<'_> {
     }
 }
 
+/// Stores a split routed front's stream `join` and Sinkhorn `pre` tensors into
+/// its crossing ports so the back can reuse them without re-running `stream_mix`.
+fn store_crossed_read<G: GraphDraft>(
+    graph: &mut G,
+    read: &SublayerRead,
+    join: Option<&mut NativePort>,
+    pre: Option<&mut NativePort>,
+) -> Result<(), GraphError> {
+    if let Some(into_join) = join {
+        let values = read.join.values.as_ref().ok_or("a split streams front produced no join values")?;
+        graph.store(values, into_join)?;
+    }
+    if let Some(into_pre) = pre {
+        let pre_values = read.pre.as_ref().ok_or("a split Sinkhorn front produced no pre values")?;
+        graph.store(pre_values, into_pre)?;
+    }
+    Ok(())
+}
+
 /// The weight scope of sublayer `index` of a block of `lane`.
 fn scope_of(lane: BlockLane, index: SublayerIndex) -> WeightScope {
     match lane {
@@ -1041,6 +1060,38 @@ impl<W: PlannedWeights + ?Sized> SublayerGraph<'_, W> {
                     form: read.form(geometry.streams),
                     join: Join::streams(geometry, site.join, Some("M")),
                     pre: site.pre,
+                })
+            }
+        }
+    }
+
+    /// Reconstructs the `Join` and Sinkhorn `pre` that a split routed layer's
+    /// front crossed to its back, skipping the redundant sublayer `stream_mix`.
+    fn crossed_read(
+        &self,
+        read: ReadTopology,
+        carry: &ResidualCarry<WorkflowTensor>,
+        join: Option<&NativePort>,
+        pre: Option<&NativePort>,
+    ) -> Result<SublayerRead, GraphError> {
+        match read {
+            ReadTopology::Norm => Ok(SublayerRead {
+                input: carry.rows.clone(),
+                form: InputForm::SINGLE,
+                join: Join::single(Some("M")),
+                pre: carry.pre.clone(),
+            }),
+            ReadTopology::Mix { .. } | ReadTopology::Sinkhorn(_) => {
+                let geometry = self.streams_geometry()?;
+                let join_values = join
+                    .ok_or("a split streams back crosses no join values")?
+                    .tensor()
+                    .clone();
+                Ok(SublayerRead {
+                    input: carry.rows.clone(),
+                    form: read.form(geometry.streams),
+                    join: Join::streams(geometry, join_values, Some("M")),
+                    pre: pre.map(|port| port.tensor().clone()),
                 })
             }
         }
@@ -1299,8 +1350,30 @@ impl<W: PlannedWeights + ?Sized> SublayerGraph<'_, W> {
                 FeedForwardEntries::Routed(entries),
             ) => {
                 let read = read.ok_or("a routed feed-forward without its input source")?;
-                let SublayerRead { input: input_rows, form, join, pre } =
-                    self.read(graph, read, streams, 1, &carry, weights, constants)?;
+                let mut split = split;
+                // A split layer's back (`Combine` / `DecodeBack`) never reads
+                // the sublayer input — only its `join` (and Sinkhorn `pre`),
+                // which the front already computed and crossed. Reusing them
+                // avoids running `stream_mix` twice per layer.
+                let SublayerRead { input: input_rows, form, join, pre } = match &mut split {
+                    Some(Split::Combine(back, _)) => {
+                        self.crossed_read(read, &carry, back.crossing.join.as_ref(), back.crossing.pre.as_ref())?
+                    }
+                    Some(Split::DecodeBack(crossing)) => {
+                        self.crossed_read(read, &carry, crossing.join.as_ref(), crossing.pre.as_ref())?
+                    }
+                    Some(Split::Front(crossing)) => {
+                        let sublayer_read = self.read(graph, read, streams, 1, &carry, weights, constants)?;
+                        store_crossed_read(graph, &sublayer_read, crossing.join.as_mut(), crossing.pre.as_mut())?;
+                        sublayer_read
+                    }
+                    Some(Split::DecodeFront(crossing)) => {
+                        let sublayer_read = self.read(graph, read, streams, 1, &carry, weights, constants)?;
+                        store_crossed_read(graph, &sublayer_read, crossing.join.as_mut(), crossing.pre.as_mut())?;
+                        sublayer_read
+                    }
+                    None => self.read(graph, read, streams, 1, &carry, weights, constants)?,
+                };
                 let (output, sequence) = routed_graph::routed(
                     graph,
                     entries,

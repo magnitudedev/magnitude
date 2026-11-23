@@ -535,9 +535,9 @@ projection routed for cuda:
         threadgroups (GATHER_GROUPS, M * K + SHARED, 1)
         threads_per_threadgroup (128, 1, 1)
     launch grids for grouped when STACKED == 1:
-        reads (BM)
+        reads (INT8, BM)
         threadgroups (1, 1, 1)
-        threads_per_threadgroup (1, 1, 1)
+        threads_per_threadgroup (256, 1, 1)
     launch stage for grouped when (OPERAND == 1 or INT8 == 1 or any(W, FIRST == 1 and operands(W) == 1)):
         reads (INT8, OPERAND)
         staging
@@ -552,7 +552,7 @@ projection routed for cuda:
         shared_bytes (STAGES * (TILE * 144 + SERVED * 10240) + SERVED * COEF_BYTES)
     launch quantize for grouped when INT8 == 1 or (STACKED == 1 and any(W, FIRST == 0 and operands(W) == 1)):
         reads (INT8, OPERAND)
-        threadgroups (PRODUCT_ROWS, 1, 1)
+        threadgroups (ceil_div(PRODUCT_ROWS, 1 + 7 * INT8), 1, 1)
         grid (quantize_grid)
         threads_per_threadgroup (256, 1, 1)
     launch down for grouped:

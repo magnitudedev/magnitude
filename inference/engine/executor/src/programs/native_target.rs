@@ -2604,6 +2604,12 @@ impl NativeTargetProgram {
                         if let (Some(port), Some(buffer)) = (&ports.shared_product, &crossing.shared_product) {
                             bindings.set(&self.unallocating(), port, &slice(buffer)?).map_err(device)?;
                         }
+                        if let (Some(port), Some(buffer)) = (&ports.join, &crossing.join) {
+                            bindings.set(&self.unallocating(), port, &slice(buffer)?).map_err(device)?;
+                        }
+                        if let (Some(port), Some(buffer)) = (&ports.pre, &crossing.pre) {
+                            bindings.set(&self.unallocating(), port, &slice(buffer)?).map_err(device)?;
+                        }
                         let bank = bank.ok_or_else(|| invalid("M7 decode split stage without an expert bank"))?;
                         let sources = bank.decode_sources_view(rows).map_err(invalid)?;
                         bindings.set(&self.unallocating(), &ports.sources, &sources).map_err(device)?;

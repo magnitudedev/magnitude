@@ -149,14 +149,17 @@ __global__ void routed_combine_expand(SEISMIC_KERNEL_PARAMS) {
 #endif
 
 // Each product row's s8 row and groups, the int8 down GEMM's operands (a
-// launch of INT8 = 1 alone).
+// launch of INT8 = 1 alone, 8 rows per 256-thread block, 1 warp/row).
 #ifdef SEISMIC_FORMING_ROUTED_COMBINE_QUANTIZE
 template <unsigned INT8, unsigned OPERAND>
 __global__ void routed_combine_quantize(SEISMIC_KERNEL_PARAMS) {
-    projection::stage_row_s8<DOWN_ENTRIES>(
+    const projection::u64 row = (projection::u64)blockIdx.x * 8u + (threadIdx.x >> 5);
+    if (row >= SEISMIC_DIM_M)
+        return;
+    projection::stage_row_s8_warp<DOWN_ENTRIES>(
         projection::Plain<Act, projection::AllRows>{SEISMIC_PTR(SEISMIC_BUFFER_SCRATCH_PRODUCT), SEISMIC_DIM_S,
                                                     projection::AllRows{}},
-        blockIdx.x, SEISMIC_DIM_S, SEISMIC_PTR(SEISMIC_BUFFER_SCRATCH_PRODUCT_CODES),
+        (projection::u32)row, SEISMIC_DIM_S, SEISMIC_PTR(SEISMIC_BUFFER_SCRATCH_PRODUCT_CODES),
         reinterpret_cast<float2 *>(SEISMIC_PTR(SEISMIC_BUFFER_SCRATCH_PRODUCT_GROUPS)));
 }
 #endif

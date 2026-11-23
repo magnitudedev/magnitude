@@ -804,7 +804,7 @@ pub(crate) fn routed<'a, G: GraphDraft + 'a>(
         // its experts (none while its layer is whole).
         (Some(Split::Front(crossing)), layer) if !decode => {
             let route = RouteWeights::of(graph, planned, scope, weights, constants, input)?;
-            let Crossing { routes, weights: scores, normalized: into, coefficient: Some(into_coefficient) } = crossing
+            let Crossing { routes, weights: scores, normalized: into, coefficient: Some(into_coefficient), .. } = crossing
             else {
                 return Err("a fused layer's front crosses no coefficient".into());
             };

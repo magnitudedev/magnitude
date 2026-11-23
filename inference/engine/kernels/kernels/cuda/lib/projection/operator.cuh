@@ -120,11 +120,13 @@ __device__ __forceinline__ void gemv(const Pro &pro, const u8 *staged, const voi
 
 // The stage launch's row: the prologue's rows for the GEMV above (M <= 16),
 // or the operands the matrix bands read (int8 rows in the GEMV's order,
-// GEMV_ENTRIES, or the GEMM's, GEMM_ENTRIES).
-template <bool S8, bool GEMV_ENTRIES, bool GEMM_ENTRIES, class Operands, class Pro>
+// GEMV_ENTRIES, or the GEMM's, GEMM_ENTRIES). Under MIXED_S8 (segmented
+// projections with both INT8-admitted and 16-bit segments), both 16-bit and
+// s8 rows are staged in one pass.
+template <bool S8, bool GEMV_ENTRIES, bool GEMM_ENTRIES, class Operands, bool MIXED_S8 = false, class Pro>
 __device__ __forceinline__ void stage(const Pro &pro, u32 M, u64 K, u8 *staged, void *groups) {
     seismic_dependency_start();
-    stage_projection_row<S8, GEMV_ENTRIES, GEMM_ENTRIES, Operands>(pro, blockIdx.x, M, K, staged, groups);
+    stage_projection_row<S8, GEMV_ENTRIES, GEMM_ENTRIES, Operands, MIXED_S8>(pro, blockIdx.x, M, K, staged, groups);
 }
 
 // One GEMM block: K share `part` of `parts` of a single weight (published as
@@ -369,25 +371,56 @@ __device__ __forceinline__ void gemv_segmented(const Pro &pro, const u8 *staged,
                                segment, s, zero);
 }
 
-// One segment's GEMM block, over its weight or served pair.
-template <int I, class Shape, bool S8, bool ENTRIES, class Operands, class Segments>
-__device__ __forceinline__ void gemm_segment_of(u8 *shared, const u8 *rows, const void *groups, u32 M, u64 K,
-                                                u64 column, const Segments &s) {
-    constexpr int A = first_weight<Segments, I>();
-    if constexpr (Segments::served(I) == 2)
-        gemm_run<Shape, S8, ENTRIES, Operands>(shared, rows, K, groups, M, K, column, s.rows[I], weight_of<A>(s),
-                                               weight_of<A + 1>(s), out_of<I>(s));
+// Per-weight INT8 admission flags for segmented projections, enabling
+// INT8-admitted segments to run on the s8 IMMA path while non-INT8 segments
+// (e.g. BF16 alpha/beta in gated_delta_project) stay on the 16-bit path.
+template <bool... ADMITTED> struct Int8Flags {
+    static constexpr bool values[sizeof...(ADMITTED)] = {ADMITTED...};
+    __host__ __device__ static constexpr bool at(int i) { return values[i]; }
+};
+struct AllInt8Flags {
+    __host__ __device__ static constexpr bool at(int) { return true; }
+};
+
+template <class Segments, class Flags, int I> __host__ __device__ constexpr bool segment_int8() {
+    if constexpr (Segments::empty(I))
+        return false;
+    else if constexpr (Segments::served(I) == 2)
+        return Flags::at(first_weight<Segments, I>()) && Flags::at(first_weight<Segments, I>() + 1);
     else
-        gemm_run<Shape, S8, ENTRIES, Operands>(shared, rows, K, groups, M, K, column, s.rows[I], weight_of<A>(s),
-                                               NoWeight{}, out_of<I>(s));
+        return Flags::at(first_weight<Segments, I>());
+}
+
+template <class Segments, class Flags, int I = 0> __host__ __device__ constexpr bool segments_has_non_int8() {
+    if constexpr (I >= Segments::COUNT)
+        return false;
+    else
+        return (!Segments::empty(I) && !segment_int8<Segments, Flags, I>()) ||
+               segments_has_non_int8<Segments, Flags, I + 1>();
+}
+
+// One segment's GEMM block, over its weight or served pair.
+template <int I, class Shape, bool S8, bool ENTRIES, class Operands, class Flags, class Segments>
+__device__ __forceinline__ void gemm_segment_of(u8 *shared, const u8 *rows, const u8 *s8_rows, const void *groups,
+                                                u32 M, u64 K, u64 column, const Segments &s) {
+    constexpr int A = first_weight<Segments, I>();
+    constexpr bool SEG_S8 = S8 && segment_int8<Segments, Flags, I>();
+    const u8 *src = SEG_S8 ? s8_rows : rows;
+    if constexpr (Segments::served(I) == 2)
+        gemm_run<Shape, SEG_S8, ENTRIES, Operands>(shared, src, K, groups, M, K, column, s.rows[I], weight_of<A>(s),
+                                                   weight_of<A + 1>(s), out_of<I>(s));
+    else
+        gemm_run<Shape, SEG_S8, ENTRIES, Operands>(shared, src, K, groups, M, K, column, s.rows[I], weight_of<A>(s),
+                                                   NoWeight{}, out_of<I>(s));
 }
 
 // The segmented GEMM of one row band over the staged rows: block column
 // `gemm_column` of the segments in order.
-template <class Shape, bool S8, bool ENTRIES, class Operands, class Segments>
+template <class Shape, bool S8, bool ENTRIES, class Operands, class Flags = AllInt8Flags, class Segments>
 __device__ __forceinline__ void gemm_segmented(u8 *shared, const u8 *rows, const void *groups, u32 M, u64 K,
-                                               const Segments &s, unsigned zero) {
+                                               const Segments &s, unsigned zero, const u8 *s8_rows = nullptr) {
     seismic_dependency_start();
+    const u8 *s8_src = s8_rows != nullptr ? s8_rows : rows;
     u64 column = gemm_column<Shape>();
     u64 columns[Segments::COUNT];
 #pragma unroll
@@ -402,19 +435,19 @@ __device__ __forceinline__ void gemm_segmented(u8 *shared, const u8 *rows, const
     switch (segment) {
     case 0:
         if constexpr (!Segments::empty(0))
-            gemm_segment_of<0, Shape, S8, ENTRIES, Operands>(shared, rows, groups, M, K, column, s);
+            gemm_segment_of<0, Shape, S8, ENTRIES, Operands, Flags>(shared, rows, s8_src, groups, M, K, column, s);
         break;
     case 1:
         if constexpr (Segments::COUNT > 1 && !Segments::empty(1))
-            gemm_segment_of<1, Shape, S8, ENTRIES, Operands>(shared, rows, groups, M, K, column, s);
+            gemm_segment_of<1, Shape, S8, ENTRIES, Operands, Flags>(shared, rows, s8_src, groups, M, K, column, s);
         break;
     case 2:
         if constexpr (Segments::COUNT > 2 && !Segments::empty(2))
-            gemm_segment_of<2, Shape, S8, ENTRIES, Operands>(shared, rows, groups, M, K, column, s);
+            gemm_segment_of<2, Shape, S8, ENTRIES, Operands, Flags>(shared, rows, s8_src, groups, M, K, column, s);
         break;
     case 3:
         if constexpr (Segments::COUNT > 3 && !Segments::empty(3))
-            gemm_segment_of<3, Shape, S8, ENTRIES, Operands>(shared, rows, groups, M, K, column, s);
+            gemm_segment_of<3, Shape, S8, ENTRIES, Operands, Flags>(shared, rows, s8_src, groups, M, K, column, s);
         break;
     }
 }
@@ -653,7 +686,15 @@ __device__ __forceinline__ void gemv_parts(const Row &row, const Rows &rows, flo
 // (`dense.seismic`) as its template and `SEISMIC_KERNEL_PARAMS` as its
 // arguments.
 
+#if SEISMIC_PROJECTION_SEGMENTS
+#define PROJECTION_S8 (projection::int8_path_any<INT8, PROJECTION_INT8>())
+#define PROJECTION_INT8_FLAGS projection::op::Int8Flags<PROJECTION_INT8>
+#define PROJECTION_MIXED_S8                                                                                        \
+    (PROJECTION_S8 && projection::op::segments_has_non_int8<Segments, PROJECTION_INT8_FLAGS>())
+#else
 #define PROJECTION_S8 (projection::int8_path<INT8, PROJECTION_INT8>())
+#define PROJECTION_MIXED_S8 false
+#endif
 // The order of the int8 rows the GEMV reads, its weights' own
 // (`projection::s8_entries`), and the GEMM's (`projection::gemm_s8_entries`),
 // in which the stage launch forms the GEMM's rows.
@@ -669,8 +710,9 @@ __device__ __forceinline__ void gemv_parts(const Row &row, const Rows &rows, flo
 // rows run only G = 1), from the entry's prologue, or from the rows `ROWS`
 // where the rows are `staged` (formed from a source of their own).
 #define PROJECTION_STAGE_OF(ROWS)                                                                                  \
-    projection::op::stage<PROJECTION_S8, PROJECTION_S8_ENTRIES, PROJECTION_GEMM_ENTRIES, PROJECTION_OPERANDS>(     \
-        ROWS, PROJECTION_M, PROJECTION_K, PROJECTION_STAGING, PROJECTION_GROUPS)
+    projection::op::stage<PROJECTION_S8, PROJECTION_S8_ENTRIES, PROJECTION_GEMM_ENTRIES, PROJECTION_OPERANDS,      \
+                          PROJECTION_MIXED_S8>(ROWS, PROJECTION_M, PROJECTION_K, PROJECTION_STAGING,               \
+                                               PROJECTION_GROUPS)
 #define PROJECTION_STAGE PROJECTION_STAGE_OF(PROJECTION_ROWS(0u))
 
 // A GEMV launch over NB column blocks, group g at grid z (its kernel states
@@ -730,10 +772,14 @@ __device__ __forceinline__ void gemv_parts(const Row &row, const Rows &rows, flo
 #define PROJECTION_SEGMENTED_GEMM(SHAPE, OPERANDS_)                                                                \
     do {                                                                                                           \
         constexpr bool S8 = PROJECTION_S8;                                                                         \
+        constexpr bool MIXED = PROJECTION_MIXED_S8;                                                                \
         extern __shared__ uint4 dynamic_shared[];                                                                  \
-        projection::op::gemm_segmented<SHAPE, S8, PROJECTION_GEMM_ENTRIES, OPERANDS_>(                             \
-            reinterpret_cast<projection::u8 *>(dynamic_shared), PROJECTION_STAGING, PROJECTION_GROUPS,             \
-            (unsigned)PROJECTION_M, PROJECTION_K, PROJECTION_SEGMENTS, (unsigned)PROJECTION_ZERO);                 \
+        const projection::u8 *staged_ = PROJECTION_STAGING;                                                        \
+        const projection::u8 *s8_staged_ = MIXED ? staged_ + (projection::u64)PROJECTION_M * PROJECTION_K * 2      \
+                                                 : staged_;                                                        \
+        projection::op::gemm_segmented<SHAPE, S8, PROJECTION_GEMM_ENTRIES, OPERANDS_, PROJECTION_INT8_FLAGS>(      \
+            reinterpret_cast<projection::u8 *>(dynamic_shared), staged_, PROJECTION_GROUPS,                        \
+            (unsigned)PROJECTION_M, PROJECTION_K, PROJECTION_SEGMENTS, (unsigned)PROJECTION_ZERO, s8_staged_);     \
     } while (0)
 
 // ---------------------------------------------------------------------------

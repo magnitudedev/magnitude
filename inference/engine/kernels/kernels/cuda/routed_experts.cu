@@ -57,9 +57,9 @@ constexpr bool EXPAND_NVFP4 =
 #define DOWN_ENTRIES (projection::gemm_s8_entries<GROUPED_S8, packets::W2>())
 
 #ifdef SEISMIC_FORMING_ROUTED_EXPERTS_GRIDS
-template <unsigned BM>
+template <unsigned INT8, unsigned BM>
 __global__ void routed_experts_grids(SEISMIC_KERNEL_PARAMS) {
-    routed::expert_grids<BM>(
+    routed::expert_grids<BM, INT8>(
                          SEISMIC_PTR(SEISMIC_BUFFER_ROWS), SEISMIC_PTR(SEISMIC_BUFFER_USED),
                          reinterpret_cast<const int *>(SEISMIC_PTR(SEISMIC_BUFFER_BLOCKS)), SEISMIC_BLOCKS_STRIDE_0,
                          reinterpret_cast<const int *>(SEISMIC_PTR(SEISMIC_BUFFER_ORDER)), SEISMIC_ORDER_STRIDE_0,
@@ -144,25 +144,35 @@ __device__ void routed_experts_expand_block(SEISMIC_KERNEL_PARAMS) {
 #endif
 
 // Each live product row as the down GEMM's operands: its s8 row and groups
-// (INT8), or its NVFP4 operands in place. One block per row of the used
-// blocks' [used * T, F] products.
+// (INT8, 8 rows per 256-thread block, 1 warp/row), or its NVFP4 operands in
+// place (1 block per row).
 #ifdef SEISMIC_FORMING_ROUTED_EXPERTS_QUANTIZE
 template <unsigned INT8, unsigned OPERAND>
 __device__ void routed_experts_quantize_block(SEISMIC_KERNEL_PARAMS) {
-    const projection::u64 block = blockIdx.x / SEISMIC_DIM_T, lane = blockIdx.x % SEISMIC_DIM_T;
-    if (ROUTED_BLOCK_ORDER(block)[lane * SEISMIC_ORDER_STRIDE_1] < 0 || EXPERT_SLOT(ROUTED_BLOCK_EXPERT(block)) == -1)
-        return;
-    // The product the expand stored, as the down GEMM's operands.
-    if constexpr (GROUPED_S8)
-        projection::stage_row_s8<DOWN_ENTRIES>(
+    if constexpr (GROUPED_S8) {
+        const projection::u64 used = (projection::u64)*reinterpret_cast<const int *>(SEISMIC_PTR(SEISMIC_BUFFER_USED));
+        const projection::u64 row = (projection::u64)blockIdx.x * 8u + (threadIdx.x >> 5);
+        const projection::u64 block = row / SEISMIC_DIM_T;
+        if (block >= used)
+            return;
+        const projection::u64 lane = row % SEISMIC_DIM_T;
+        if (ROUTED_BLOCK_ORDER(block)[lane * SEISMIC_ORDER_STRIDE_1] < 0 ||
+            EXPERT_SLOT(ROUTED_BLOCK_EXPERT(block)) == -1)
+            return;
+        projection::stage_row_s8_warp<DOWN_ENTRIES>(
             projection::Plain<Act, projection::AllRows>{SEISMIC_PTR(SEISMIC_BUFFER_SCRATCH_PRODUCT), SEISMIC_DIM_F,
                                                         projection::AllRows{}},
-            blockIdx.x, SEISMIC_DIM_F, SEISMIC_PTR(SEISMIC_BUFFER_SCRATCH_PRODUCT_CODES),
+            (projection::u32)row, SEISMIC_DIM_F, SEISMIC_PTR(SEISMIC_BUFFER_SCRATCH_PRODUCT_CODES),
             reinterpret_cast<float2 *>(SEISMIC_PTR(SEISMIC_BUFFER_SCRATCH_PRODUCT_GROUPS)));
-    else
+    } else {
+        const projection::u64 block = blockIdx.x / SEISMIC_DIM_T, lane = blockIdx.x % SEISMIC_DIM_T;
+        if (ROUTED_BLOCK_ORDER(block)[lane * SEISMIC_ORDER_STRIDE_1] < 0 ||
+            EXPERT_SLOT(ROUTED_BLOCK_EXPERT(block)) == -1)
+            return;
         projection::form_operands_in_place<projection::GemmOperandsOf<OPERAND, packets::W2>,
                                            typename projection::GemmOperandsOf<OPERAND, packets::W0, packets::W1>::Storage,
                                            SEISMIC_DIM_F, 256>(SEISMIC_PTR(SEISMIC_BUFFER_SCRATCH_PRODUCT), blockIdx.x);
+    }
 }
 #endif
 

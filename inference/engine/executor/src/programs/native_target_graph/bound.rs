@@ -383,6 +383,8 @@ impl GroupBuffers {
                     normalized: zeros(charges, &values.normalized)?,
                     coefficient: values.coefficient.as_ref().map(|v| zeros(charges, v)).transpose()?,
                     shared_product: values.shared_product.as_ref().map(|v| zeros(charges, v)).transpose()?,
+                    join: values.join.as_ref().map(|v| zeros(charges, v)).transpose()?,
+                    pre: values.pre.as_ref().map(|v| zeros(charges, v)).transpose()?,
                 })
             })
             .transpose()?;
