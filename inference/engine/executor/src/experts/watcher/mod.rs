@@ -1131,14 +1131,11 @@ impl Watcher {
         let transport = self.shared.transport.clone();
         let core = &mut held.core;
         let (directory, steps) = (&mut core.directory, &core.steps);
-        let released = steps.unbegun(|at| {
+        let _released = steps.unbegun(|at| {
             directory.replenish_demand_free(group, want_free, at, |slot| {
                 transport.can_reuse_slot(crate::experts::transport::DestSlot { group, slot })
             })
         });
-        if released > 0 {
-            self.shared.events().notify();
-        }
     }
 
     /// Zero-recopy O(1) completion of freshly landed `DemandSlot`s: promotes
@@ -1175,6 +1172,12 @@ impl Watcher {
             );
         }
         if promoted_any {
+            let group = slots[0].group;
+            steps.unbegun(|at| {
+                directory.replenish_demand_free(group, 0, at, |slot| {
+                    transport.can_reuse_slot(crate::experts::transport::DestSlot { group, slot })
+                })
+            });
             held.publish_held();
             held.publish_policy();
         }

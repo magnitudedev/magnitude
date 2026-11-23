@@ -1430,7 +1430,14 @@ impl Directory {
                 .bank
                 .free(group)
                 .filter(|&record| !lending && self.bank.lends(group, record) && self.bank.usable_when(group, record, false));
-            let free = non_lent.chain(lent_free).take(take).collect::<Vec<_>>();
+            let all_free: Vec<usize> = non_lent.chain(lent_free).collect();
+            let demand_reserve = if self.bank.capacity(group) > 16 {
+                self.demand_free_floor(group)
+            } else {
+                0
+            };
+            let available = all_free.len().saturating_sub(demand_reserve);
+            let free = all_free.into_iter().take(take.min(available)).collect::<Vec<_>>();
             let promoted = free.len();
             budget_left -= promoted;
             let short = wanted.len() - promoted;
@@ -1464,9 +1471,12 @@ impl Directory {
             }
         }
         // What it took is asked for: only what changes after asks again,
-        // unless copy-engine budget capped remaining wants.
+        // unless copy-engine budget capped remaining wants AND this pass
+        // actually made progress (otherwise nothing can change until a
+        // release drains or the ranking updates).
         self.bank.take_changed();
-        self.stirred |= capped;
+        let progressed = !asked.promotions.is_empty() || !asked.releases.is_empty();
+        self.stirred |= capped && progressed;
         self.withheld = withheld.then(|| self.reuse_now().reads());
         asked
     }
@@ -1887,6 +1897,17 @@ impl Directory {
         }
     }
 
+    /// Target `Free + Releasing` headroom maintained by
+    /// [`Self::replenish_demand_free`]: `demand_free_floor` for zero-overflow
+    /// immediate claims plus an equal per-step promotion budget so
+    /// [`Self::finish_demand_landing`] can promote ranked landings in place
+    /// without ever dipping below `demand_free_floor`.
+    fn demand_replenish_target(&self, group: usize) -> usize {
+        let floor = self.demand_free_floor(group);
+        let cap = self.bank.capacity(group);
+        (floor * 2).min(cap / 3).max(floor)
+    }
+
     /// Asynchronously release up to `want_free` lowest-ranked unpinned
     /// `Record::Held` victims in `group` (with `!is_layer_whole_published` and
     /// `can_reuse(slot)`) into `Record::Releasing` (stamped unmap via
@@ -1901,7 +1922,7 @@ impl Directory {
         mut can_reuse: impl FnMut(usize) -> bool,
     ) -> usize {
         let lending = at.lending();
-        let want_free = want_free.max(self.demand_free_floor(group));
+        let want_free = want_free.max(self.demand_replenish_target(group));
         let short = want_free.saturating_sub(self.bank.covering_when(group, lending));
         if short == 0 {
             return 0;
@@ -1954,7 +1975,11 @@ impl Directory {
     /// in place and publish via `StampedMap::map_covering` under
     /// `steps.unresolved(progress, ...)`, then `tier.banked` + `resettle`.
     /// Otherwise return to `Record::Free` (or defer via `defer_demand_release`
-    /// if a joined consumer still pins the slot).
+    /// if a joined consumer still pins the slot). Promotion only proceeds while
+    /// `free_now >= free_floor` so remaining layers in the current step never
+    /// starve of immediate `Record::Free` slots; [`Self::replenish_demand_free`]
+    /// maintains `demand_replenish_target` (`2 * free_floor`) so ranked landings
+    /// promote in place each step while preserving the floor.
     pub fn finish_demand_landing(
         &mut self,
         group: usize,
@@ -1965,6 +1990,7 @@ impl Directory {
         can_reuse: bool,
     ) -> bool {
         let free_floor = self.demand_free_floor(group);
+        let replenish_target = self.demand_replenish_target(group);
         let free_now = self.bank.free(group).count();
         let should_promote = if let Some(staged @ (layer, expert)) = staged {
             if self.bank.held(layer, expert).is_some()
@@ -1981,12 +2007,12 @@ impl Directory {
                     // With `copy_hits = 0.0` (bytes already in VRAM!), keep
                     // the expert if its expected uses meet or exceed the
                     // lowest-valued usable held expert in this group (or if
-                    // the group has free capacity past `free_floor`).
+                    // the group has free capacity past `replenish_target`).
                     let ranker = reuse.ranker(group, Tier::COMPUTE, Reader::Move);
                     let uses = self.uses(ranker, staged);
                     let members = self.homes[group].iter().map(|&(_, l)| l).collect::<Vec<_>>();
                     let held_total: usize = members.iter().map(|&l| self.bank.held_count(l)).sum();
-                    if held_total + free_floor < self.bank.capacity(group) {
+                    if held_total + replenish_target < self.bank.capacity(group) {
                         uses >= 0.0
                     } else {
                         let min_floor = members

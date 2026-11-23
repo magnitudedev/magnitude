@@ -329,9 +329,14 @@ impl<'p> StepSubmitter<'p> {
     /// Release all held decode DMA landings (must only be called once
     /// `DecodeBack` is proven complete on the GPU or after `wait_all`).
     fn release_decode_landings(&mut self) {
-        for (bank, landing) in self.decode_landings.drain(..) {
-            bank.complete_decode_landing(landing);
-        }
+        complete_decode_landings(std::mem::take(&mut self.decode_landings));
+    }
+
+    /// Take all held decode DMA landings, for the caller to complete
+    /// ([`complete_decode_landings`]) once it may: their `DecodeBack` is
+    /// proven complete on the GPU.
+    fn take_decode_landings(&mut self) -> Vec<(Arc<crate::experts::ExpertBank>, crate::experts::transport::DecodeLanding)> {
+        std::mem::take(&mut self.decode_landings)
     }
 
     /// Queue `ready`, `register` given its outputs before anything queued
@@ -505,6 +510,14 @@ impl<'p> StepSubmitter<'p> {
             Some((block, through)) if through >= block => self.flush(),
             _ => Ok(()),
         }
+    }
+}
+
+/// Complete decode DMA landings whose `DecodeBack` is proven complete on
+/// the GPU: their slots are promoted in place or released.
+fn complete_decode_landings(landings: Vec<(Arc<crate::experts::ExpertBank>, crate::experts::transport::DecodeLanding)>) {
+    for (bank, landing) in landings {
+        bank.complete_decode_landing(landing);
     }
 }
 
@@ -2169,17 +2182,27 @@ impl NativeTargetProgram {
             submitter.flush_and_wait()?;
             // Previous layer's `DecodeBack` preceded this `DecodeFront` on the
             // same Compute stream, so its VRAM slots are now 100% done on GPU.
-            submitter.release_decode_landings();
-            if let Some(bank) = &run.bank {
-                if let Some(landing) = bank.land_decode_misses(index, rows).map_err(invalid)? {
-                    for sync in &landing.syncs {
-                        submitter.follow_transfer(sync.clone());
+            // They are settled once this layer's copy and `DecodeBack` are
+            // submitted, so the settling runs beside them, not before them.
+            let finished = submitter.take_decode_landings();
+            let backed = (|| {
+                if let Some(bank) = &run.bank {
+                    if let Some(landing) = bank.land_decode_misses(index, rows).map_err(invalid)? {
+                        for sync in &landing.syncs {
+                            submitter.follow_transfer(sync.clone());
+                        }
+                        submitter.hold_decode_landing(bank.bank.clone(), landing);
                     }
-                    submitter.hold_decode_landing(bank.bank.clone(), landing);
+                    bank.record_dma_host_wait(dma_wait_start.elapsed());
                 }
-                bank.record_dma_host_wait(dma_wait_start.elapsed());
-            }
-            self.run_stage(run, index, &class, RunStage::DecodeBack, rotation, submitter)?;
+                self.run_stage(run, index, &class, RunStage::DecodeBack, rotation, submitter)?;
+                // Submitted now, not with the next layer's `DecodeFront`:
+                // the device starts it while the host settles the previous
+                // layer's landings and queues that front.
+                submitter.flush()
+            })();
+            complete_decode_landings(finished);
+            backed?;
             run.back = None;
             return Ok(());
         }

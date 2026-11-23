@@ -153,6 +153,16 @@ pub struct TransferSync {
 }
 
 impl TransferSync {
+    /// Whether `self` and `other` are one batch's handle, so following
+    /// one follows the other.
+    pub fn same_batch(&self, other: &Self) -> bool {
+        match (&self.cuda, &other.cuda) {
+            (Some(ours), Some(theirs)) => Arc::ptr_eq(ours, theirs),
+            (None, None) => true,
+            _ => false,
+        }
+    }
+
     pub(super) fn cuda_event(&self) -> Option<&seismic_cuda::Event> {
         self.cuda.as_deref()
     }

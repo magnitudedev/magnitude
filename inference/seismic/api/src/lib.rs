@@ -1582,6 +1582,14 @@ pub struct TransferSync {
     inner: seismic_runtime::native::transfer::TransferSync,
 }
 
+impl TransferSync {
+    /// Whether `self` and `other` are one batch's handle, so following
+    /// one follows the other.
+    pub fn same_batch(&self, other: &Self) -> bool {
+        self.inner.same_batch(&other.inner)
+    }
+}
+
 impl Transfer {
     /// The transfer queue of `device`; why it has none.
     pub fn new(device: &Device) -> Result<Self, TransferError> {

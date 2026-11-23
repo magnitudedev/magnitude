@@ -113,7 +113,6 @@ impl Drop for ConsumerLease {
 
 /// Result of joining an existing in-flight or landed transfer.
 pub(crate) struct JoinedTransfer {
-    pub transfer_id: TransferId,
     pub dest: DestSlot,
     /// `Some(sync)` while the transfer is still in flight on the copy engine;
     /// `None` once DMA has already completed (`Landed`).
@@ -206,12 +205,12 @@ pub(crate) fn merge_set_seeded_tiered(plans: &[PrefillPlan]) -> Vec<(i32, i32)> 
 /// `RunStage::Whole` (which already gets `LinkMover` `MAP_STAGE` hits and falls
 /// back to SM zero-copy for occasional misses with zero per-layer host sync).
 ///
-/// At ~11 GB/s SM zero-copy vs ~45 GB/s hardware DMA, 4 MiB saves ~0.28 ms of
-/// PCIe wire time, breaking even with the split-graph + `flush_and_wait()`
-/// pipeline cost. Layers well above this (e.g. GLM-5.3 at ~97 MB/layer) stay
-/// 100% on M7 Decode DMA; layers far below (e.g. Qwen3.8 at ~0.7 MB/layer,
-/// 67% zero-miss) stay on pipelined `RunStage::Whole` and probe periodically.
-const SPLIT_DMA_MIN_BYTES: u64 = 4 * 1024 * 1024;
+/// Minimum EWMA host-tier miss bytes per layer call to keep split M7 decode DMA
+/// active. Any layer with host-tier misses (`>= 1` byte) stays on hardware DMA
+/// rather than falling back to slower SM zero-copy in `RunStage::Whole`; only
+/// zero-miss resident layers gate onto pipelined `RunStage::Whole` and probe
+/// periodically for working-set shifts.
+const SPLIT_DMA_MIN_BYTES: u64 = 1;
 const SPLIT_DMA_WARMUP_CALLS: u32 = 8;
 const SPLIT_DMA_COOLDOWN_STEPS: u32 = 256;
 const SPLIT_DMA_STAGGER_SLOTS: u32 = 64;
@@ -919,7 +918,6 @@ impl ExpertTransport {
         };
         self.demand_joins.fetch_add(1, Ordering::Relaxed);
         Some(JoinedTransfer {
-            transfer_id: id,
             dest,
             sync,
             lease: ConsumerLease {
@@ -966,7 +964,6 @@ impl ExpertTransport {
         };
         self.demand_joins.fetch_add(1, Ordering::Relaxed);
         Some(JoinedTransfer {
-            transfer_id: id,
             dest,
             sync,
             lease: ConsumerLease {
@@ -1104,7 +1101,11 @@ impl ExpertTransport {
         let expert_bytes: u64 = region_bytes.iter().copied().sum();
 
         let mut resolved: Vec<(usize, usize)> = Vec::with_capacity(unique_a.len());
-        let mut latest_joined_sync: Option<(TransferId, TransferSync)> = None;
+        // Every distinct batch a joined transfer lands in: joined batches
+        // sit on several queues (staging and promotions on the link's,
+        // demand on this one) and are issued by priority, not by id, so no
+        // one of them orders the others.
+        let mut joined_syncs: Vec<TransferSync> = Vec::new();
         let mut latest_dma_sync: Option<TransferSync> = None;
         let mut leases: Vec<ConsumerLease> = Vec::new();
         let mut demand_ids: Vec<TransferId> = Vec::new();
@@ -1135,11 +1136,8 @@ impl ExpertTransport {
                     if let Some(joined) = self.join_by_tier_record(group, layer, tier_record) {
                         resolved.push((tier_record, joined.dest.slot));
                         if let Some(sync) = joined.sync {
-                            if latest_joined_sync
-                                .as_ref()
-                                .is_none_or(|(prev_id, _)| joined.transfer_id.0 > prev_id.0)
-                            {
-                                latest_joined_sync = Some((joined.transfer_id, sync));
+                            if !joined_syncs.iter().any(|seen| seen.same_batch(&sync)) {
+                                joined_syncs.push(sync);
                             }
                         }
                         leases.push(joined.lease);
@@ -1342,10 +1340,7 @@ impl ExpertTransport {
 
         record_dma(false, resolved.len() as u64, bytes_landed, overflow_experts);
 
-        let mut syncs: Vec<TransferSync> = Vec::with_capacity(2);
-        if let Some((_, sync)) = latest_joined_sync {
-            syncs.push(sync);
-        }
+        let mut syncs = joined_syncs;
         if let Some(sync) = latest_dma_sync {
             syncs.push(sync);
         }
@@ -1576,7 +1571,7 @@ mod tests {
         let joined_1 = transport
             .join_by_key(key, source)
             .expect("consumer 1 must join in-flight hint");
-        assert_eq!(joined_1.transfer_id, hint_id);
+        assert_eq!(joined_1.lease.transfer_id, hint_id);
         assert_eq!(joined_1.dest, dest);
         assert_eq!(transport.transfers_issued(), 1, "joining must NOT issue a second transfer");
         assert_eq!(transport.demand_joins(), 1);
@@ -1585,7 +1580,7 @@ mod tests {
         let joined_2 = transport
             .join_by_key(key, source)
             .expect("consumer 2 must join same in-flight hint");
-        assert_eq!(joined_2.transfer_id, hint_id);
+        assert_eq!(joined_2.lease.transfer_id, hint_id);
         assert_eq!(joined_2.dest, dest);
         assert_eq!(transport.transfers_issued(), 1, "still exactly one physical transfer");
         assert_eq!(transport.demand_joins(), 2);
@@ -1763,11 +1758,20 @@ mod tests {
             high.observe(1, 64 * 1024 * 1024);
         }
 
-        // Low-miss regime (Qwen3.8: 0.7 MB/layer alternating with 0-miss calls).
+        // Moderate-miss regime (1.4 MB/layer alternating with 0-miss calls):
+        // must stay on split hardware DMA rather than falling back to SM zero-copy.
+        let moderate = DecodeDmaGate::for_layer(0);
+        for i in 0..SPLIT_DMA_WARMUP_CALLS {
+            assert!(moderate.should_split(1), "warmup call {i} should measure split DMA");
+            moderate.observe(1, if i % 3 == 0 { 1_400_000 } else { 0 });
+        }
+        assert!(moderate.should_split(1), "layers with misses must stay on split DMA");
+
+        // Zero-miss resident regime: gates onto pipelined `Whole` after warmup.
         let low = DecodeDmaGate::for_layer(0);
         for i in 0..SPLIT_DMA_WARMUP_CALLS {
             assert!(low.should_split(1), "warmup call {i} should measure split DMA");
-            low.observe(1, if i % 3 == 0 { 1_400_000 } else { 0 });
+            low.observe(1, 0);
         }
         // Immediately after warmup, `SPLIT_DMA_COOLDOWN_STEPS` calls at M=1 must stay on pipelined `Whole`.
         for step in 0..SPLIT_DMA_COOLDOWN_STEPS {
