@@ -3811,10 +3811,10 @@ fn routes_over_a_multiple_of_101_slots_draw_distinct_experts_per_row() {
     }
 }
 
-/// Synthetic routes use canonical Zipf locality (`1 / (r + 1)`), so a
-/// multi-row decode batch (`M=8, E=512, K=10`, Qwen3.8-Flash-Next verify
-/// shape) shares hot experts across rows rather than touching nearly every
-/// slot once (`M * K = 80`).
+/// Synthetic routes use Zipf locality (`1 / (r + 1)^1.4`), so a multi-row
+/// decode verify burst (`M=8, E=512, K=10`, Qwen3.8-Flash-Next verify shape)
+/// shares ~45-55% of its picks (`U(8) ~ 38-42` unique experts out of 80)
+/// matching real speculative-decode overlap.
 #[test]
 fn routes_share_hot_experts_across_multi_row_decode() {
     let (rows, selected) = (8, 10);
@@ -3833,8 +3833,8 @@ fn routes_share_hot_experts_across_multi_row_decode() {
     }
     let unique = table.iter().collect::<std::collections::BTreeSet<_>>().len();
     assert!(
-        (selected as usize + 1..=60).contains(&unique),
-        "expected realistic multi-row expert sharing well below M*K=80, got {unique}"
+        (34..=46).contains(&unique),
+        "expected realistic speculative-decode 45-55% overlap (34..=46 unique of 80), got {unique}"
     );
 }
 

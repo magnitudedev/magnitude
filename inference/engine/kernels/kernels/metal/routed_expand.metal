@@ -107,20 +107,37 @@ kernel void routed_expand_choice(ROUTED_EXPAND_PORTS) {
 }
 #endif
 
+#ifdef SEISMIC_FORMING_ROUTED_EXPAND_GATHER
+template <uint ROWS, uint LANES>
+kernel void routed_expand_gather(
+    device const int *routes [[buffer(SEISMIC_BUFFER_ROUTES)]],
+    device routed::Worklist *worklist [[buffer(SEISMIC_BUFFER_SCRATCH_WORKLIST)]],
+    device int *gather_grid [[buffer(SEISMIC_BUFFER_SCRATCH_GATHER_GRID)]],
+    constant ulong *seismic_words [[buffer(SEISMIC_BUFFER_WORDS)]],
+    uint lane [[thread_index_in_simdgroup]]) {
+    threadgroup int cache[2u * routed::WORKLIST_CACHE];
+    const uint max_n = uint(SEISMIC_DIM_F) > uint(SEISMIC_DIM_S) ? uint(SEISMIC_DIM_F) : uint(SEISMIC_DIM_S);
+    const uint per_group = uint(SEISMIC_RUNTIME_SIMDGROUPS) * ROWS * (32u / LANES);
+    const uint x_groups = (max_n + per_group - 1u) / per_group;
+    routed::build_worklist(routes, SEISMIC_ROUTES_STRIDE_0, SEISMIC_ROUTES_STRIDE_1, uint(SEISMIC_DIM_M),
+        uint(SEISMIC_DIM_K), x_groups, 1u, worklist, gather_grid, cache, lane);
+}
+#endif
+
 #ifdef SEISMIC_FORMING_ROUTED_EXPAND_GATHERED
 template <uint ROWS, uint LANES>
-kernel void routed_expand_gathered(ROUTED_EXPAND_PORTS) {
+kernel void routed_expand_gathered(
+    ROUTED_EXPAND_PORTS,
+    device const routed::Worklist *worklist [[buffer(SEISMIC_BUFFER_SCRATCH_WORKLIST)]]) {
     constexpr uint R = ROWS;
     constexpr uint L = LANES;
     typedef routed::Act A;
     ROUTED_EXPAND_RESULTS;
     const uint tile = group.x;
-    if (group.y < SEISMIC_DIM_M * SEISMIC_DIM_K) {
+    if (group.y < worklist->count) {
         if (ulong(tile) * simdgroups * R * (32u / L) >= SEISMIC_DIM_F) return;
-        const routed::Gathered chosen = routed::gather(routes, SEISMIC_ROUTES_STRIDE_0, SEISMIC_ROUTES_STRIDE_1,
-            uint(SEISMIC_DIM_M), uint(SEISMIC_DIM_K), group.y, SEISMIC_RESULT_0_STRIDE_0, SEISMIC_RESULT_0_STRIDE_1,
-            lane);
-        if (chosen.count == 0) return;
+        const routed::Gathered chosen = routed::unpack_work_entry(worklist->entries[group.y],
+            SEISMIC_RESULT_0_STRIDE_0, SEISMIC_RESULT_0_STRIDE_1);
         const projection::Plain<A, routed::Listed> in{normalized, SEISMIC_NORMALIZED_STRIDE_0,
             SEISMIC_NORMALIZED_STRIDE_1, uint(SEISMIC_DIM_H), routed::Listed{chosen.rows}};
         const auto gate = routed::record_weights<packets::W0>(expert_gate, chosen.expert,

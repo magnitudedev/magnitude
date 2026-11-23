@@ -106,41 +106,45 @@ struct ArrivedProjections4 {
                 seismic_words);                                                                                   \
     }
 
-// The gathered ports: the side-by-side form's, the published projections and
-// the channel tiles' arrival counters.
-#define ROUTED_DOWN_GATHERED_PORTS                                                  \
-    ROUTED_DOWN_PORTS,                                                              \
-        routed::PublishedSlots published [[buffer(SEISMIC_BUFFER_SCRATCH_PUBLISHED)]], \
+// The gathered ports: the side-by-side form's, the compact worklist, the
+// published projections and the channel tiles' arrival counters.
+#define ROUTED_DOWN_GATHERED_PORTS                                                      \
+    ROUTED_DOWN_PORTS,                                                                  \
+        device const routed::Worklist *worklist [[buffer(SEISMIC_BUFFER_SCRATCH_WORKLIST)]], \
+        routed::PublishedSlots published [[buffer(SEISMIC_BUFFER_SCRATCH_PUBLISHED)]],  \
         device atomic_uint *arrivals [[buffer(SEISMIC_BUFFER_SCRATCH_ARRIVALS)]]
 
-// The gathered body (`routed::down_project_gathered`): threadgroup (x, m)'s
-// simdgroups publish their batched projections of tile x; the last of the
-// tile's M threadgroups to arrive sums the tile's channels of every row.
+// The gathered body (`routed::down_project_gathered`): threadgroup (x, u)'s
+// `GATHERED_SUMMED_SIMDGROUPS` (4) simdgroups cooperatively stage the expert's
+// rows and split the tile's `4 * TILE` channels for unique expert `u`; the last
+// of the tile's `worklist->count` threadgroups to arrive sums the tile's
+// channels of every row.
 #define ROUTED_DOWN_GATHERED_BODY                                                                                 \
     constexpr uint TILE = routed::down_tile<ROWS, LANES>();                                                       \
-    constexpr uint REGION = routed::down_region<ROWS, LANES>();                                                   \
     constexpr uint SLOTS = uint(SEISMIC_DIM_K);                                                                   \
+    constexpr uint SG_COUNT = routed::GATHERED_SUMMED_SIMDGROUPS;                                                 \
+    constexpr uint GROUP_TILE = SG_COUNT * TILE;                                                                  \
     constexpr uint H = uint(SEISMIC_DIM_H);                                                                       \
-    constexpr uint QUADS = (TILE + 3u) / 4u;                                                                      \
-    threadgroup float projected[SLOTS][REGION];                                                                   \
+    constexpr uint QUADS = (GROUP_TILE + 3u) / 4u;                                                                \
+    threadgroup routed::GatheredSummedShared<LANES> tg;                                                           \
     threadgroup uint last;                                                                                        \
-    const uint first = group.x * TILE;                                                                            \
+    const uint first = group.x * GROUP_TILE;                                                                      \
     const element::Out<ELEMENT_OF(SEISMIC_RESULT_0)> value(value_cells);                                          \
-    routed::down_project_gathered<ROWS, LANES>(product, routes, sources, expert_down, tier_down,                  \
-        uint(SEISMIC_DIM_M), group.y, first, sg, lane, projected[sg], published, seismic_words);                  \
-    if (!arrive::last(arrivals + group.x, uint(SEISMIC_DIM_M), &last, tid))                                       \
+    routed::down_project_gathered<ROWS, LANES>(product, worklist, expert_down, tier_down, group.y, first, tid,    \
+        sg, lane, tg, published, seismic_words);                                                                  \
+    if (!arrive::last(arrivals + group.x, worklist->count, &last, tid))                                           \
         return;                                                                                                   \
-    for (uint item = tid; item < uint(SEISMIC_DIM_M) * QUADS; item += 32u * SLOTS) {                              \
+    for (uint item = tid; item < uint(SEISMIC_DIM_M) * QUADS; item += 32u * SG_COUNT) {                           \
         const ulong m = item / QUADS;                                                                             \
         const uint c = (item % QUADS) * 4u;                                                                       \
         const uint n = first + c;                                                                                 \
         if (n >= H)                                                                                               \
             continue;                                                                                             \
-        if (c + 4u <= TILE && n + 4u <= H) {                                                                      \
+        if (c + 4u <= GROUP_TILE && n + 4u <= H) {                                                                \
             routed::down_publish4(base, weights, value, m, n, ArrivedProjections4<SLOTS, H>{published, m, n},     \
                 routed::Answer4{false, float4(0.0f)}, seismic_words);                                             \
         } else {                                                                                                  \
-            for (uint i = 0u; i < 4u && c + i < TILE && n + i < H; ++i)                                           \
+            for (uint i = 0u; i < 4u && c + i < GROUP_TILE && n + i < H; ++i)                                     \
                 routed::down_publish(base, weights, value, m, n + i,                                              \
                     routed::ArrivedProjections<SLOTS, H>{published, m, n + i}, routed::Answer{false, 0.0f},       \
                     seismic_words);                                                                               \
@@ -165,6 +169,23 @@ kernel void routed_down_whole(ROUTED_DOWN_PORTS) {
 template <uint ROWS, uint LANES>
 kernel void routed_down_resident(ROUTED_DOWN_PORTS) {
     ROUTED_DOWN_BODY
+}
+#endif
+#ifdef SEISMIC_FORMING_ROUTED_DOWN_GATHER
+template <uint ROWS, uint LANES>
+kernel void routed_down_gather(
+    device const int *routes [[buffer(SEISMIC_BUFFER_ROUTES)]],
+    device const int *sources [[buffer(SEISMIC_BUFFER_SOURCES)]],
+    device routed::Worklist *worklist [[buffer(SEISMIC_BUFFER_SCRATCH_WORKLIST)]],
+    device int *gather_grid [[buffer(SEISMIC_BUFFER_SCRATCH_GATHER_GRID)]],
+    constant ulong *seismic_words [[buffer(SEISMIC_BUFFER_WORDS)]],
+    uint lane [[thread_index_in_simdgroup]]) {
+    threadgroup int cache[2u * routed::WORKLIST_CACHE];
+    constexpr uint GROUP_TILE = routed::GATHERED_SUMMED_SIMDGROUPS * routed::down_tile<ROWS, LANES>();
+    const uint x_groups = (uint(SEISMIC_DIM_H) + GROUP_TILE - 1u) / GROUP_TILE;
+    routed::build_worklist(routes, SEISMIC_ROUTES_STRIDE_0, SEISMIC_ROUTES_STRIDE_1, sources, ROUTED_SOURCE_ROWS,
+        SEISMIC_SOURCES_STRIDE_1, SEISMIC_SOURCES_STRIDE_2, uint(SEISMIC_DIM_M), uint(SEISMIC_DIM_K), x_groups, 0u,
+        worklist, gather_grid, cache, lane);
 }
 #endif
 #ifdef SEISMIC_FORMING_ROUTED_DOWN_GATHERED

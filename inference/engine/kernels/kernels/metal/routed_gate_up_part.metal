@@ -55,9 +55,25 @@ kernel void routed_gate_up_part_choice(ROUTED_GATE_UP_PART_PORTS) {
     ROUTED_GATE_UP_BODY
 }
 #endif
+#ifdef SEISMIC_FORMING_ROUTED_GATE_UP_PART_GATHER
+template <uint ROWS, uint LANES>
+kernel void routed_gate_up_part_gather(
+    device const int *routes [[buffer(SEISMIC_BUFFER_ROUTES)]],
+    device const int *sources [[buffer(SEISMIC_BUFFER_SOURCES)]],
+    SYSTEM const int *routing [[buffer(SEISMIC_BUFFER_ROUTING)]],
+    device const int *step [[buffer(SEISMIC_BUFFER_STEP)]],
+    device routed::Worklist *worklist [[buffer(SEISMIC_BUFFER_SCRATCH_WORKLIST)]],
+    device int *gather_grid [[buffer(SEISMIC_BUFFER_SCRATCH_GATHER_GRID)]],
+    constant ulong *seismic_words [[buffer(SEISMIC_BUFFER_WORDS)]],
+    uint lane [[thread_index_in_simdgroup]]) {
+    ROUTED_GATE_UP_GATHER_BODY
+}
+#endif
 #ifdef SEISMIC_FORMING_ROUTED_GATE_UP_PART_GATHERED
 template <uint ROWS, uint LANES>
-kernel void routed_gate_up_part_gathered(ROUTED_GATE_UP_PART_PORTS) {
+kernel void routed_gate_up_part_gathered(
+    ROUTED_GATE_UP_PART_PORTS,
+    device const routed::Worklist *worklist [[buffer(SEISMIC_BUFFER_SCRATCH_WORKLIST)]]) {
     ROUTED_GATE_UP_GATHERED_BODY
 }
 #endif

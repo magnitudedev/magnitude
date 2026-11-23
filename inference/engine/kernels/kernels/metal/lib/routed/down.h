@@ -64,21 +64,23 @@ inline void down_project(device const uchar *product, device const int *routes, 
         uint(SEISMIC_DIM_H), uint(SEISMIC_DIM_F), projected, lane);
 }
 
-// Gathered decode down projections: projects every choice sharing `(m, sg)`'s
-// expert and source in one weight pass (`project_gathered_expert`), publishing
-// each choice's slot directly in A into `published`.
+// Gathered decode down projections: threadgroup `(group.x, u)` owns unique
+// expert `u < worklist->count`, and all `GATHERED_SUMMED_SIMDGROUPS` (4)
+// simdgroups cooperatively stage the expert's rows once into `tg` and split
+// the threadgroup's `4 * TILE` output channels (`sg_first = group_first + sg * TILE`).
+// Each choice's slot is published directly in A into `published`.
 template <uint ROWS, uint LANES, typename Published>
-inline void down_project_gathered(device const uchar *product, device const int *routes, device const int *sources,
-    device const ulong *expert_down, device const ulong *tier_down, uint m_rows, uint m, uint first, uint sg,
-    uint lane, threadgroup float *projected, Published published, constant ulong *seismic_words) {
+inline void down_project_gathered(device const uchar *product, device const Worklist *worklist,
+    device const ulong *expert_down, device const ulong *tier_down, uint u, uint group_first, uint tid, uint sg,
+    uint lane, threadgroup GatheredSummedShared<LANES> &tg, Published published, constant ulong *seismic_words) {
     constexpr uint K = uint(SEISMIC_DIM_K);
     constexpr uint H = uint(SEISMIC_DIM_H);
+    constexpr uint TILE = down_tile<ROWS, LANES>();
+    const uint sg_first = group_first + sg * TILE;
     constexpr bool NVFP4 = projection::OperandRecipe<packets::W0_OPERANDS_NVFP4>::NVFP4;
-    project_gathered_expert<packets::W0, ROWS, LANES, K, K, uint(SEISMIC_DIM_F), down_stage<LANES>(), H, NVFP4>(
-        product, SEISMIC_PRODUCT_STRIDE_0, SEISMIC_PRODUCT_STRIDE_1, SEISMIC_PRODUCT_STRIDE_2, routes,
-        SEISMIC_ROUTES_STRIDE_0, SEISMIC_ROUTES_STRIDE_1, sources, ROUTED_SOURCE_ROWS, SEISMIC_SOURCES_STRIDE_1,
-        SEISMIC_SOURCES_STRIDE_2, expert_down, tier_down, KERNEL_W0_LAYOUT(SEISMIC_DIM_F), m_rows, m, first, sg, lane,
-        projected, published);
+    project_gathered_expert<packets::W0, ROWS, LANES, K, uint(SEISMIC_DIM_F), H, NVFP4>(
+        product, SEISMIC_PRODUCT_STRIDE_0, SEISMIC_PRODUCT_STRIDE_1, SEISMIC_PRODUCT_STRIDE_2, worklist->entries[u],
+        expert_down, tier_down, KERNEL_W0_LAYOUT(SEISMIC_DIM_F), sg_first, tid, lane, tg, published);
 }
 
 } // namespace routed

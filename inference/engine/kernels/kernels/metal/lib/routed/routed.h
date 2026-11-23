@@ -102,86 +102,209 @@ struct Gathered {
     uint products[SEISMIC_CONST_VERIFY_ROWS];
 };
 
-// The active choices sharing choice `at`'s expert and record source over
-// `m_rows` rows of `slots` choices (`routes` at strides `s0`, `s1`; `sources`
-// of `source_rows` rows at strides `src1`, `src2`), in flat order, their
-// product rows at strides `p0`, `p1`; none where `at` is inactive or an
-// earlier active choice shares its expert and source, and `at` alone where its
-// source is none (for instance a front row's skipped choice beside an exact
-// row's record). The simdgroup scans 32 choices per step via `simd_ballot`
-// and every lane receives the same result. The form is admitted at
-// M <= VERIFY_ROWS, and a row names an expert once, so the bound on `count`
-// never binds; it keeps the tables in bounds.
-template <typename Active>
-inline Gathered gather(device const int *routes, ulong s0, ulong s1, device const int *sources, ulong source_rows,
-    ulong src1, ulong src2, uint m_rows, uint slots, uint at, ulong p0, ulong p1, uint lane, Active active) {
+// Compact unique-expert worklist emitted once by a 1-simdgroup `*_gather`
+// launch for the gathered decode forms (`choice` and `summed`), replacing
+// per-threadgroup `M * K` global route scans and enabling hardware indirect
+// dispatch over only the active unique `(expert, source)` groups.
+struct WorkEntry {
+    int expert;
+    int source;
+    uint count;
+    uint pad;
+    // Flat choice encoded as `(m << 16) | k` (M <= VERIFY_ROWS, K < 65536).
+    uint packed[SEISMIC_CONST_VERIFY_ROWS];
+};
+
+struct Worklist {
+    uint count;
+    uint pad[3];
+    WorkEntry entries[1];
+};
+
+// Unpack a compact worklist entry into `Gathered` with product offsets at
+// strides `p0`, `p1`.
+inline Gathered unpack_work_entry(device const WorkEntry &entry, ulong p0, ulong p1) {
     Gathered chosen;
-    const uint at_m = at / slots, at_k = at % slots;
-    chosen.expert = routes[ulong(at_m) * s0 + ulong(at_k) * s1];
-    chosen.count = 0;
-    const slab::Source at_source = decode_source(sources, source_rows, src1, src2, at_m, at_k, chosen.expert);
-    if (!active(at, at_source))
-        return chosen;
-    if (at_source.none()) {
-        chosen.rows[0] = at_m;
-        chosen.products[0] = uint(ulong(at_m) * p0 + ulong(at_k) * p1);
-        chosen.count = 1;
-        return chosen;
-    }
-    // Whether choice c (row m, slot k) is an active choice of `at`'s expert
-    // and source.
-    auto shares = [&](uint c, uint m, uint k) {
-        if (routes[ulong(m) * s0 + ulong(k) * s1] != chosen.expert)
-            return false;
-        const slab::Source source = decode_source(sources, source_rows, src1, src2, m, k, chosen.expert);
-        return source.code == at_source.code && active(c, source);
-    };
-    const uint total = m_rows * slots;
-    for (uint base = 0; base < total; base += 32u) {
-        const uint c = base + lane;
-        uint m = 0u, k = 0u;
-        bool match = false;
-        if (c < total) {
-            if (c == at) {
-                m = at_m;
-                k = at_k;
-                match = true;
-            } else {
-                m = c / slots;
-                k = c % slots;
-                match = shares(c, m, k);
-            }
-        }
-        uint mask = uint(uint64_t(metal::simd_ballot(match)));
-        if (base < at) {
-            const uint earlier = at - base >= 32u ? 0xffffffffu : ((1u << (at - base)) - 1u);
-            if ((mask & earlier) != 0u)
-                return chosen;
-        }
-        while (mask != 0u && chosen.count < uint(SEISMIC_CONST_VERIFY_ROWS)) {
-            const uint bit = metal::ctz(mask);
-            mask &= mask - 1u;
-            const uint hit_m = metal::simd_shuffle(m, ushort(bit));
-            const uint hit_k = metal::simd_shuffle(k, ushort(bit));
-            chosen.rows[chosen.count] = hit_m;
-            chosen.products[chosen.count] = uint(ulong(hit_m) * p0 + ulong(hit_k) * p1);
-            ++chosen.count;
-        }
-        if (chosen.count >= uint(SEISMIC_CONST_VERIFY_ROWS))
-            break;
+    chosen.expert = entry.expert;
+    chosen.count = entry.count;
+    for (uint r = 0u; r < entry.count; ++r) {
+        const uint packed = entry.packed[r];
+        const uint m = packed >> 16u;
+        const uint k = packed & 0xffffu;
+        chosen.rows[r] = m;
+        chosen.products[r] = uint(ulong(m) * p0 + ulong(k) * p1);
     }
     return chosen;
 }
 
-inline Gathered gather(device const int *routes, ulong s0, ulong s1, device const int *sources, ulong source_rows,
-    ulong src1, ulong src2, uint m_rows, uint slots, uint at, ulong p0, ulong p1, uint lane) {
-    return gather(routes, s0, s1, sources, source_rows, src1, src2, m_rows, slots, at, p0, p1, lane,
-        [](uint, slab::Source) { return true; });
+constexpr constant uint WORKLIST_CACHE = 256u;
+
+// Build the compact unique-expert worklist in `worklist` using one simdgroup
+// (32 lanes), and write the indirect dispatch grid `(x_groups, count + extra_y, 1)`
+// into `gather_grid`. `cache` holds `2 * WORKLIST_CACHE` ints in threadgroup
+// memory (declared in the `*_gather` kernel). Choices group where they are
+// active (`active(c, source)`), share `(expert, source)`, and `source` is not
+// none (-1); an active choice with `source == -1` forms a singleton entry so
+// it zeroes its own row/slot.
+template <typename Active>
+inline void build_worklist(device const int *routes, ulong r0, ulong r1, device const int *sources, ulong source_rows,
+    ulong src1, ulong src2, uint m_rows, uint slots, uint x_groups, uint extra_y, device Worklist *worklist,
+    device int *gather_grid, threadgroup int *cache, uint lane, Active active) {
+    constexpr uint CACHE = WORKLIST_CACHE;
+    threadgroup int *cached_expert = cache;
+    threadgroup int *cached_source = cache + CACHE;
+
+    const uint total = m_rows * slots;
+    uint unique_count = 0u;
+    if (total <= CACHE) {
+        uint active_mask[CACHE / 32u];
+        uint claimed[CACHE / 32u];
+        for (uint w = 0u; w < CACHE / 32u; ++w) {
+            active_mask[w] = 0u;
+            claimed[w] = 0u;
+        }
+        for (uint base = 0u; base < total; base += 32u) {
+            const uint c = base + lane;
+            bool is_active = false;
+            if (c < total) {
+                const uint m = c / slots, k = c % slots;
+                const int ex = routes[ulong(m) * r0 + ulong(k) * r1];
+                const slab::Source src = decode_source(sources, source_rows, src1, src2, m, k, ex);
+                cached_expert[c] = ex;
+                cached_source[c] = src.code;
+                is_active = active(c, src);
+            }
+            active_mask[base >> 5u] = uint(uint64_t(metal::simd_ballot(is_active)));
+        }
+        simdgroup_barrier(mem_flags::mem_threadgroup);
+
+        for (uint at = 0u; at < total; ++at) {
+            const uint word = at >> 5u, bit = 1u << (at & 31u);
+            if (((active_mask[word] & ~claimed[word]) & bit) == 0u)
+                continue;
+            const int ex = cached_expert[at];
+            const int src = cached_source[at];
+            if (src == -1) {
+                claimed[word] |= bit;
+                if (lane == 0u) {
+                    const uint m = at / slots, k = at % slots;
+                    worklist->entries[unique_count].expert = ex;
+                    worklist->entries[unique_count].source = -1;
+                    worklist->entries[unique_count].count = 1u;
+                    worklist->entries[unique_count].pad = 0u;
+                    worklist->entries[unique_count].packed[0] = (m << 16u) | k;
+                }
+                ++unique_count;
+                continue;
+            }
+            uint count = 0u;
+            const uint start_base = at & ~31u;
+            for (uint base = start_base; base < total; base += 32u) {
+                const uint c = base + lane;
+                const uint w = base >> 5u;
+                const bool live = c < total && c >= at && ((active_mask[w] & ~claimed[w]) & (1u << lane)) != 0u;
+                const bool match = live && (c == at || (cached_expert[c] == ex && cached_source[c] == src));
+                const uint mask = uint(uint64_t(metal::simd_ballot(match)));
+                if (mask != 0u) {
+                    claimed[w] |= mask;
+                    const uint lt_mask = (1u << lane) - 1u;
+                    const uint pos = count + metal::popcount(mask & lt_mask);
+                    if (match && pos < uint(SEISMIC_CONST_VERIFY_ROWS)) {
+                        const uint m = c / slots, k = c % slots;
+                        worklist->entries[unique_count].packed[pos] = (m << 16u) | k;
+                    }
+                    count = metal::min(count + metal::popcount(mask), uint(SEISMIC_CONST_VERIFY_ROWS));
+                }
+            }
+            if (lane == 0u) {
+                worklist->entries[unique_count].expert = ex;
+                worklist->entries[unique_count].source = src;
+                worklist->entries[unique_count].count = count;
+                worklist->entries[unique_count].pad = 0u;
+            }
+            ++unique_count;
+        }
+    } else {
+        for (uint at = 0u; at < total; ++at) {
+            const uint at_m = at / slots, at_k = at % slots;
+            const int ex = routes[ulong(at_m) * r0 + ulong(at_k) * r1];
+            const slab::Source at_src = decode_source(sources, source_rows, src1, src2, at_m, at_k, ex);
+            if (!active(at, at_src))
+                continue;
+            if (at_src.none()) {
+                if (lane == 0u) {
+                    worklist->entries[unique_count].expert = ex;
+                    worklist->entries[unique_count].source = -1;
+                    worklist->entries[unique_count].count = 1u;
+                    worklist->entries[unique_count].pad = 0u;
+                    worklist->entries[unique_count].packed[0] = (at_m << 16u) | at_k;
+                }
+                ++unique_count;
+                continue;
+            }
+            bool earlier_hit = false;
+            uint count = 0u;
+            for (uint base = 0u; base < total; base += 32u) {
+                const uint c = base + lane;
+                bool match = false;
+                if (c < total) {
+                    if (c == at) {
+                        match = true;
+                    } else {
+                        const uint m = c / slots, k = c % slots;
+                        const int oex = routes[ulong(m) * r0 + ulong(k) * r1];
+                        if (oex == ex) {
+                            const slab::Source osrc = decode_source(sources, source_rows, src1, src2, m, k, oex);
+                            match = osrc.code == at_src.code && active(c, osrc);
+                        }
+                    }
+                }
+                const uint mask = uint(uint64_t(metal::simd_ballot(match)));
+                if (base < at) {
+                    const uint earlier = at - base >= 32u ? 0xffffffffu : ((1u << (at - base)) - 1u);
+                    if ((mask & earlier) != 0u) {
+                        earlier_hit = true;
+                        break;
+                    }
+                }
+                if (mask != 0u) {
+                    const uint lt_mask = (1u << lane) - 1u;
+                    const uint pos = count + metal::popcount(mask & lt_mask);
+                    if (match && pos < uint(SEISMIC_CONST_VERIFY_ROWS)) {
+                        const uint m = c / slots, k = c % slots;
+                        worklist->entries[unique_count].packed[pos] = (m << 16u) | k;
+                    }
+                    count = metal::min(count + metal::popcount(mask), uint(SEISMIC_CONST_VERIFY_ROWS));
+                }
+            }
+            if (!earlier_hit) {
+                if (lane == 0u) {
+                    worklist->entries[unique_count].expert = ex;
+                    worklist->entries[unique_count].source = at_src.code;
+                    worklist->entries[unique_count].count = count;
+                    worklist->entries[unique_count].pad = 0u;
+                }
+                ++unique_count;
+            }
+        }
+    }
+    if (lane == 0u) {
+        worklist->count = unique_count;
+        write_grid(gather_grid, x_groups, unique_count + extra_y);
+    }
 }
 
-inline Gathered gather(device const int *routes, ulong s0, ulong s1, uint m_rows, uint slots, uint at, ulong p0,
-    ulong p1, uint lane) {
-    return gather(routes, s0, s1, nullptr, 0, 0, 0, m_rows, slots, at, p0, p1, lane);
+inline void build_worklist(device const int *routes, ulong r0, ulong r1, device const int *sources, ulong source_rows,
+    ulong src1, ulong src2, uint m_rows, uint slots, uint x_groups, uint extra_y, device Worklist *worklist,
+    device int *gather_grid, threadgroup int *cache, uint lane) {
+    build_worklist(routes, r0, r1, sources, source_rows, src1, src2, m_rows, slots, x_groups, extra_y, worklist,
+        gather_grid, cache, lane, [](uint, slab::Source) { return true; });
+}
+
+inline void build_worklist(device const int *routes, ulong r0, ulong r1, uint m_rows, uint slots, uint x_groups,
+    uint extra_y, device Worklist *worklist, device int *gather_grid, threadgroup int *cache, uint lane) {
+    build_worklist(routes, r0, r1, nullptr, 0, 0, 0, m_rows, slots, x_groups, extra_y, worklist, gather_grid, cache,
+        lane);
 }
 
 // The activation rows a gathered GEMV reads: row r is `rows[r]`.
@@ -240,7 +363,7 @@ inline void publish_zero(Published published, uint row, uint first, uint lane) {
 struct GatheredProduct {
     typedef Act activation;
     device const uchar *x;
-    thread const ulong *offsets;
+    threadgroup const ulong *offsets;
     ulong stride;
     uint columns;
     bool aligned;

@@ -67,23 +67,18 @@ typedef projection::operands<NVFP4> Operands;
     projection::gemv_runtime<packets::W0, ROWS, 1, LANES>(x, out, up, 1, SEISMIC_DIM_F, SEISMIC_DIM_H, tile,           \
         shared, simdgroups, sg, lane);
 
-// The gathered body (`routed::gather`): choice y's threadgroups run where it
-// is its expert's first choice, over the rows of every choice of the expert.
+// The gathered body: threadgroup `(tile, u)` reads compact worklist entry `u`
+// in O(1) (dispatched indirectly over the exact active unique count).
 #define ROUTED_UP_GATHERED_BODY                                                                                        \
     typedef routed::Act A;                                                                                             \
     const element::Out<ELEMENT_OF(SEISMIC_RESULT_0)> product(product_cells);                                           \
     const uint tile = group.x;                                                                                         \
     if (ulong(tile) * simdgroups * ROWS * (32u / LANES) >= SEISMIC_DIM_F)                                              \
         return;                                                                                                        \
-    const routed::Gathered chosen = routed::gather(routes, SEISMIC_ROUTES_STRIDE_0, SEISMIC_ROUTES_STRIDE_1,           \
-        sources, SEISMIC_DIM_XS, SEISMIC_SOURCES_STRIDE_1, SEISMIC_SOURCES_STRIDE_2,                                   \
-        uint(SEISMIC_DIM_M), uint(SEISMIC_DIM_K), group.y, SEISMIC_RESULT_0_STRIDE_0, SEISMIC_RESULT_0_STRIDE_1,       \
-        lane);                                                                                                         \
-    if (chosen.count == 0)                                                                                             \
-        return;                                                                                                        \
-    /* Every choice of an expert has its one source. */                                                                \
-    const slab::Source source = routed::decode_source(sources, SEISMIC_DIM_XS, SEISMIC_SOURCES_STRIDE_1,               \
-        SEISMIC_SOURCES_STRIDE_2, group.y / SEISMIC_DIM_K, group.y % SEISMIC_DIM_K, chosen.expert);                    \
+    device const routed::WorkEntry &entry = worklist->entries[group.y];                                                \
+    const routed::Gathered chosen =                                                                                    \
+        routed::unpack_work_entry(entry, SEISMIC_RESULT_0_STRIDE_0, SEISMIC_RESULT_0_STRIDE_1);                        \
+    const slab::Source source{entry.source};                                                                           \
     if (source.none()) {                                                                                               \
         if (tile == 0)                                                                                                 \
             for (uint r = 0; r < chosen.count; ++r)                                                                    \
@@ -120,16 +115,37 @@ kernel void routed_up_resident(ROUTED_UP_PORTS) {
     ROUTED_UP_BODY
 }
 #endif
+#ifdef SEISMIC_FORMING_ROUTED_UP_GATHER
+template <uint ROWS, uint LANES>
+kernel void routed_up_gather(
+    device const int *routes [[buffer(SEISMIC_BUFFER_ROUTES)]],
+    device const int *sources [[buffer(SEISMIC_BUFFER_SOURCES)]],
+    device routed::Worklist *worklist [[buffer(SEISMIC_BUFFER_SCRATCH_WORKLIST)]],
+    device int *gather_grid [[buffer(SEISMIC_BUFFER_SCRATCH_GATHER_GRID)]],
+    constant ulong *seismic_words [[buffer(SEISMIC_BUFFER_WORDS)]],
+    uint lane [[thread_index_in_simdgroup]]) {
+    threadgroup int cache[2u * routed::WORKLIST_CACHE];
+    const uint per_group = uint(SEISMIC_RUNTIME_SIMDGROUPS) * ROWS * (32u / LANES);
+    const uint x_groups = (uint(SEISMIC_DIM_F) + per_group - 1u) / per_group;
+    routed::build_worklist(routes, SEISMIC_ROUTES_STRIDE_0, SEISMIC_ROUTES_STRIDE_1, sources, SEISMIC_DIM_XS,
+        SEISMIC_SOURCES_STRIDE_1, SEISMIC_SOURCES_STRIDE_2, uint(SEISMIC_DIM_M), uint(SEISMIC_DIM_K), x_groups, 0u,
+        worklist, gather_grid, cache, lane);
+}
+#endif
 #ifdef SEISMIC_FORMING_ROUTED_UP_GATHERED
 template <uint ROWS, uint LANES>
-kernel void routed_up_gathered(ROUTED_UP_PORTS) {
+kernel void routed_up_gathered(
+    ROUTED_UP_PORTS,
+    device const routed::Worklist *worklist [[buffer(SEISMIC_BUFFER_SCRATCH_WORKLIST)]]) {
     ROUTED_UP_GATHERED_BODY
 }
 #endif
 #ifdef SEISMIC_FORMING_ROUTED_UP_GATHERED_RESIDENT
 // A resident layer's (XS 0), its records read with plain loads.
 template <uint ROWS, uint LANES>
-kernel void routed_up_gathered_resident(ROUTED_UP_PORTS) {
+kernel void routed_up_gathered_resident(
+    ROUTED_UP_PORTS,
+    device const routed::Worklist *worklist [[buffer(SEISMIC_BUFFER_SCRATCH_WORKLIST)]]) {
     ROUTED_UP_GATHERED_BODY
 }
 #endif

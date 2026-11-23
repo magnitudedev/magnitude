@@ -12,4 +12,8 @@
 #include "lib/routed/output_sum.glsl"
 
 void routed_output_project() { routed_output_projection(); }
+void routed_output_gather() { routed_output_gather_worklist(); }
+void routed_output_gathered2() { routed_output_gathered_bounded(2u); }
+void routed_output_gathered4() { routed_output_gathered_bounded(4u); }
+void routed_output_gathered8() { routed_output_gathered_bounded(8u); }
 void routed_output_combine() { routed_output_join(false, 0ul); }

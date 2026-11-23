@@ -133,6 +133,7 @@ projection routed for metal:
     let CHOICE_SHARED = min(ceil_div(WIDTH, 32) * (1 + SHARED * (min(M, 2) - 1 + 2 * min(M / 3, 1) + 4 * min(M / 5, 1))), 448) * 64 for choice
     let GATHERED_SHARED = min(ceil_div(WIDTH, 32) * (min(M, 2) + 2 * min(M / 3, 1) + 4 * min(M / 5, 1)), 448) * 64 for choice
     let SUMMED_GROUPS = ceil_div(most(W, N), ROWS * 32 / LANES) for summed
+    let GATHERED_SUMMED_GROUPS = ceil_div(most(W, N), 4 * ROWS * 32 / LANES) for summed
     let SUMMED_PACKETS = ceil_div(most(W, WIDTH), 32) for summed
     let SUMMED_STAGE = min(SUMMED_PACKETS, (device.shared_bytes_per_group / 2) / ((K + SHARED) * 64)) for summed
     let SUMMED_STAGES_16 = (1 - SHARED) * min(1, ceil_div(SUMMED_PACKETS, 16) / 3) for summed
@@ -178,6 +179,10 @@ projection routed for metal:
     where (PACK == 0 or ((STACKED == 1 or TALL_M == 128) and TALL_K == 64 and STAGERS == 2)) for grouped
     where (DOWN_PACK == 0 or ((STACKED == 1 or DOWN_TALL_M == 128) and DOWN_TALL_K == 64 and DOWN_STAGERS == 2)) for grouped
     where (STACKED == 0 or TALL == 0 or DOWN_TALL == 0 or (TILE_M == 32 and TILE_N == 128)) for grouped
+    scratch worklist bytes (16 + M * K * (16 + VERIFY_ROWS * 4)) when GATHERED == 1 and M >= 2 and M <= VERIFY_ROWS and PER_ROW == 0 for choice
+    scratch gather_grid bytes (12) when PER_ROW == 0 for choice
+    scratch worklist bytes (16 + M * K * (16 + VERIFY_ROWS * 4)) when GATHERED == 1 and M >= 2 and M <= VERIFY_ROWS for summed
+    scratch gather_grid bytes (12) for summed
     scratch staged bytes (M * WIDTH * 2) when STACKED == 1 and any(W, FIRST == 1 and operands(W) == 1) for grouped
     scratch product bytes (STACKED * B * T * N * 2 + (1 - STACKED) * M * N * 2) for grouped
     scratch stage_grid bytes (12) when STACKED == 1 for grouped
@@ -199,15 +204,21 @@ projection routed for metal:
         threadgroups (CHOICE_GROUPS, M * K + SHARED, 1)
         threads_per_threadgroup (32 * SIMDGROUPS, 1, 1)
         shared_bytes (CHOICE_SHARED)
+    launch gather for choice when GATHERED == 1 and M >= 2 and M <= VERIFY_ROWS and PER_ROW == 0:
+        reads (SIMDGROUPS, ROWS, LANES)
+        threadgroups (1, 1, 1)
+        threads_per_threadgroup (32, 1, 1)
     launch gathered for choice when GATHERED == 1 and M >= 2 and M <= VERIFY_ROWS and PER_ROW == 0 and (RECORDS == 0 or SHARED == 1 or XS > 0):
         reads (ROWS, LANES)
         threadgroups (CHOICE_GROUPS, M * K + SHARED, 1)
+        grid (gather_grid)
         threads_per_threadgroup (32 * SIMDGROUPS, 1, 1)
         shared_bytes (GATHERED_SHARED)
     launch gathered_resident for choice when GATHERED == 1 and M >= 2 and M <= VERIFY_ROWS and RECORDS == 1 and SHARED == 0 and XS == 0:
         reads (ROWS, LANES)
         records (W)
         threadgroups (CHOICE_GROUPS, M * K + SHARED, 1)
+        grid (gather_grid)
         threads_per_threadgroup (32 * SIMDGROUPS, 1, 1)
         shared_bytes (GATHERED_SHARED)
     launch summed for summed when (GATHERED == 0 or M == 1 or M > VERIFY_ROWS) and XS > 0 and WHOLE == 0:
@@ -229,25 +240,33 @@ projection routed for metal:
         records (W)
         threadgroups (SUMMED_GROUPS, M, 1)
         threads_per_threadgroup (32 * (K + SHARED), 1, 1)
+    launch gather for summed when GATHERED == 1 and M >= 2 and M <= VERIFY_ROWS:
+        reads (ROWS, LANES)
+        threadgroups (1, 1, 1)
+        threads_per_threadgroup (32, 1, 1)
     launch gathered for summed when GATHERED == 1 and M >= 2 and M <= VERIFY_ROWS and XS > 0 and WHOLE == 0:
         reads (ROWS, LANES)
-        threadgroups (SUMMED_GROUPS, M, 1)
-        threads_per_threadgroup (32 * (K + SHARED), 1, 1)
+        threadgroups (GATHERED_SUMMED_GROUPS, M * K + SHARED, 1)
+        grid (gather_grid)
+        threads_per_threadgroup (128, 1, 1)
     launch gathered for summed when GATHERED == 1 and M >= 2 and M <= VERIFY_ROWS and XS > 0 and WHOLE == 1:
         reads (ROWS, LANES)
-        threadgroups (SUMMED_GROUPS, M, 1)
+        threadgroups (GATHERED_SUMMED_GROUPS, M * K + SHARED, 1)
+        grid (gather_grid)
         unless (policy[POLICY_WHOLE])
-        threads_per_threadgroup (32 * (K + SHARED), 1, 1)
+        threads_per_threadgroup (128, 1, 1)
     launch gathered_whole for summed when GATHERED == 1 and M >= 2 and M <= VERIFY_ROWS and XS > 0 and WHOLE == 1:
         reads (ROWS, LANES)
-        threadgroups (SUMMED_GROUPS, M, 1)
+        threadgroups (GATHERED_SUMMED_GROUPS, M * K + SHARED, 1)
+        grid (gather_grid)
         if (policy[POLICY_WHOLE])
-        threads_per_threadgroup (32 * (K + SHARED), 1, 1)
+        threads_per_threadgroup (128, 1, 1)
     launch gathered_resident for summed when GATHERED == 1 and M >= 2 and M <= VERIFY_ROWS and XS == 0:
         reads (ROWS, LANES)
         records (W)
-        threadgroups (SUMMED_GROUPS, M, 1)
-        threads_per_threadgroup (32 * (K + SHARED), 1, 1)
+        threadgroups (GATHERED_SUMMED_GROUPS, M * K + SHARED, 1)
+        grid (gather_grid)
+        threads_per_threadgroup (128, 1, 1)
     launch grids for grouped when STACKED == 1:
         reads (TILE_M, TILE_N, TALL, INT8, PACK, DOWN_INT8, DOWN_PACK)
         threadgroups (1, 1, 1)
@@ -518,6 +537,7 @@ projection routed for vulkan:
     let CHOICE_SHARED = 256 + 32 * most(W, operands(W)) + min(8 * ceil_div(WIDTH, 32), 288) * 72 for choice
     let SUMMED_GROUPS = ceil_div(most(W, N), SIMDGROUPS * ROWS * 32 / LANES) for summed
     let SUMMED_SHARED = 256 + 32 * most(W, operands(W)) + min(ceil_div(most(W, WIDTH), 32), 288) * 72 for summed
+    let GATHERED_SUMMED_SHARED = 256 + 32 * most(W, operands(W)) + min(8 * ceil_div(most(W, WIDTH), 32), 288) * 72 for summed
     let ROW_TILES = STACKED * B * ceil_div(T, TILE_M) + (1 - STACKED) * ceil_div(M, TILE_M) for grouped
     let GEMM_THREADS = TILE_M * TILE_N * 32 / (SUB_M * SUB_N) for grouped
     let GEMM_REGION = (TILE_M + TILE_N) * 80 for grouped
@@ -526,7 +546,7 @@ projection routed for vulkan:
     let GEMM_HELD = GEMM_REGION + TABLE_REGION * (1 - min(1, 16 * ceil_div(GEMM_REGION + TABLE_REGION, 16) / (device.shared_bytes_per_group + 1))) for grouped
     params (SIMDGROUPS in [2, 4, 8] default greatest where SIMDGROUPS * 32 <= device.max_group_threads and (SIMDGROUPS == 2 or ceil_div(most(W, N), SIMDGROUPS) * (K + SHARED) >= 2 * device.units) for choice | summed,
         ROWS in [1, 2, 4] default 1 for choice, ROWS in [2, 1, 4] default 2 for summed,
-        form GATHERED in [0, 1] default 1 for choice,
+        form GATHERED in [0, 1] default 1 for choice | summed,
         arithmetic LANES in [8, 16, 32] default least where LANES == 32 or most(W, WIDTH) / (32 * LANES) <= 4 reference 32 for summed,
         TILE_M in [32, 64, 128] default 32 for grouped, TILE_N in [128, 64] default 128 for grouped,
         SUB_M in [32, 64] default 32 for grouped, SUB_N in [32, 64] default 32 for grouped)
@@ -537,14 +557,17 @@ projection routed for vulkan:
     where TILE_M * TILE_N >= 2 * SUB_M * SUB_N for grouped
     where TILE_M * TILE_N * 32 / (SUB_M * SUB_N) <= device.max_group_threads for grouped
     where each(W, form(W, DECODED) == 1)
-    scratch gathered bytes (M * K * (1 + 2 * VERIFY_ROWS) * 4) when GATHERED == 1 and PER_ROW == 0 for choice
+    scratch worklist bytes (16 + M * K * (16 + 2 * VERIFY_ROWS * 4)) when GATHERED == 1 and M >= 2 and M <= VERIFY_ROWS and PER_ROW == 0 for choice
+    scratch gather_grid bytes (12) when PER_ROW == 0 for choice
+    scratch worklist bytes (16 + M * K * (16 + 2 * VERIFY_ROWS * 4)) when GATHERED == 1 and M >= 2 and M <= VERIFY_ROWS for summed
+    scratch gather_grid bytes (12) for summed
     scratch staged bytes (M * WIDTH * 2) when STACKED == 1 and any(W, FIRST == 1 and operands(W) == 1) for grouped
     scratch product bytes (STACKED * B * T * N * 2 + (1 - STACKED) * M * N * 2) for grouped
     scratch stage_grid bytes (12) when STACKED == 1 for grouped
     scratch expand_grid bytes (12) when STACKED == 1 for grouped
     scratch quantize_grid bytes (12) when STACKED == 1 for grouped
     scratch down_grid bytes (12) when STACKED == 1 for grouped
-    launch choice for choice when (GATHERED == 0 or PER_ROW == 1) and (SHARED == 0 or M <= 1):
+    launch choice for choice when (GATHERED == 0 or M <= 1 or M > VERIFY_ROWS or PER_ROW == 1) and (SHARED == 0 or M <= 1):
         threadgroups (CHOICE_GROUPS, M * K + SHARED, 1)
         threads_per_threadgroup (32 * SIMDGROUPS, 1, 1)
         shared_bytes (CHOICE_SHARED)
@@ -558,41 +581,61 @@ projection routed for vulkan:
         threadgroups (CHOICE_GROUPS, M * K + SHARED, 1)
         threads_per_threadgroup (32 * SIMDGROUPS, 1, 1)
         shared_bytes (CHOICE_SHARED)
-    launch choice8 for choice when (GATHERED == 0 or PER_ROW == 1) and SHARED == 1 and M >= 5:
+    launch choice8 for choice when (GATHERED == 0 or M > VERIFY_ROWS or PER_ROW == 1) and SHARED == 1 and M >= 5:
         alike (choice)
         threadgroups (CHOICE_GROUPS, M * K + SHARED, 1)
         threads_per_threadgroup (32 * SIMDGROUPS, 1, 1)
         shared_bytes (CHOICE_SHARED)
-    launch gather for choice when GATHERED == 1 and PER_ROW == 0:
+    launch gather for choice when GATHERED == 1 and M >= 2 and M <= VERIFY_ROWS and PER_ROW == 0:
         threadgroups (1, 1, 1)
-        threads_per_threadgroup (256, 1, 1)
-    launch gathered1 for choice when GATHERED == 1 and PER_ROW == 0 and M <= 1:
-        threadgroups (CHOICE_GROUPS, M * K + SHARED, 1)
-        threads_per_threadgroup (32 * SIMDGROUPS, 1, 1)
-        shared_bytes (CHOICE_SHARED)
+        threads_per_threadgroup (64, 1, 1)
+        shared_bytes (4096)
     launch gathered2 for choice when GATHERED == 1 and PER_ROW == 0 and M == 2:
-        alike (gathered1)
         threadgroups (CHOICE_GROUPS, M * K + SHARED, 1)
+        grid (gather_grid)
         threads_per_threadgroup (32 * SIMDGROUPS, 1, 1)
         shared_bytes (CHOICE_SHARED)
     launch gathered4 for choice when GATHERED == 1 and PER_ROW == 0 and M >= 3 and M <= 4:
-        alike (gathered1)
+        alike (gathered2)
         threadgroups (CHOICE_GROUPS, M * K + SHARED, 1)
+        grid (gather_grid)
         threads_per_threadgroup (32 * SIMDGROUPS, 1, 1)
         shared_bytes (CHOICE_SHARED)
-    launch gathered8 for choice when GATHERED == 1 and PER_ROW == 0 and M >= 5:
-        alike (gathered1)
+    launch gathered8 for choice when GATHERED == 1 and PER_ROW == 0 and M >= 5 and M <= VERIFY_ROWS:
+        alike (gathered2)
         threadgroups (CHOICE_GROUPS, M * K + SHARED, 1)
+        grid (gather_grid)
         threads_per_threadgroup (32 * SIMDGROUPS, 1, 1)
         shared_bytes (CHOICE_SHARED)
-    launch summed for summed when SHARED == 0:
+    launch summed for summed when SHARED == 0 and (GATHERED == 0 or M <= 1 or M > VERIFY_ROWS):
         threadgroups (SUMMED_GROUPS, M, 1)
         threads_per_threadgroup (32 * SIMDGROUPS, 1, 1)
         shared_bytes (SUMMED_SHARED)
-    launch project for summed when SHARED == 1:
+    launch project for summed when SHARED == 1 and (GATHERED == 0 or M <= 1 or M > VERIFY_ROWS):
         threadgroups (SUMMED_GROUPS, M * (K + 1), 1)
         threads_per_threadgroup (32 * SIMDGROUPS, 1, 1)
         shared_bytes (SUMMED_SHARED)
+    launch gather for summed when GATHERED == 1 and M >= 2 and M <= VERIFY_ROWS:
+        threadgroups (1, 1, 1)
+        threads_per_threadgroup (64, 1, 1)
+        shared_bytes (4096)
+    launch gathered2 for summed when GATHERED == 1 and M == 2:
+        threadgroups (SUMMED_GROUPS, M * K + SHARED, 1)
+        grid (gather_grid)
+        threads_per_threadgroup (32 * SIMDGROUPS, 1, 1)
+        shared_bytes (GATHERED_SUMMED_SHARED)
+    launch gathered4 for summed when GATHERED == 1 and M >= 3 and M <= 4:
+        alike (gathered2)
+        threadgroups (SUMMED_GROUPS, M * K + SHARED, 1)
+        grid (gather_grid)
+        threads_per_threadgroup (32 * SIMDGROUPS, 1, 1)
+        shared_bytes (GATHERED_SUMMED_SHARED)
+    launch gathered8 for summed when GATHERED == 1 and M >= 5 and M <= VERIFY_ROWS:
+        alike (gathered2)
+        threadgroups (SUMMED_GROUPS, M * K + SHARED, 1)
+        grid (gather_grid)
+        threads_per_threadgroup (32 * SIMDGROUPS, 1, 1)
+        shared_bytes (GATHERED_SUMMED_SHARED)
     launch grids for grouped when STACKED == 1:
         threadgroups (1, 1, 1)
         threads_per_threadgroup (1, 1, 1)
@@ -927,7 +970,7 @@ native routed_output for metal from "metal/routed_output.metal":
     records (expert_down, tier_down)
     project routed summed (expert_down) shared (shared_down)
     scratch published bytes (M * (K + 1) * H * 2) when GATHERED == 1 and M >= 2 and M <= VERIFY_ROWS
-    scratch arrivals bytes (ceil_div(H, ROWS * 32 / LANES) * 4) sync when GATHERED == 1 and M >= 2 and M <= VERIFY_ROWS
+    scratch arrivals bytes (ceil_div(H, 4 * ROWS * 32 / LANES) * 4) sync when GATHERED == 1 and M >= 2 and M <= VERIFY_ROWS
 
 # CUDA: the swap-AB GEMV (TPW, KSPLIT as in the expansion), the choices and
 # the shared expert in separate blocks publishing A-rounded channels per
@@ -1843,18 +1886,17 @@ native routed_down for metal from "metal/routed_down.metal":
     records (expert_down, tier_down)
     project routed summed (expert_down)
     scratch published bytes (M * K * H * 2) when GATHERED == 1 and M >= 2 and M <= VERIFY_ROWS
-    scratch arrivals bytes (ceil_div(H, ROWS * 32 / LANES) * 4) sync when GATHERED == 1 and M >= 2 and M <= VERIFY_ROWS
+    scratch arrivals bytes (ceil_div(H, 4 * ROWS * 32 / LANES) * 4) sync when GATHERED == 1 and M >= 2 and M <= VERIFY_ROWS
 
 # CUDA: the choices' projections in parallel blocks, A-rounded into
-# `projected`, then the slot-order combine, which adds the sum to the base.
+# `published`; the last block of a channel tile to arrive (`arrivals`)
+# combines them in slot order and adds the sum to `base`.
 native routed_down for cuda from "cuda/routed_down.cu":
     static (H, K, F)
     records (expert_down, tier_down)
     project routed summed (expert_down)
     scratch published bytes (M * K * H * 2)
-    launch routed_down_combine:
-        threadgroups (ceil_div(H, 256), M, 1)
-        threads_per_threadgroup (256, 1, 1)
+    scratch arrivals bytes (ceil_div(H, 16) * 4) sync
 
 # Vulkan: the choices' weighted projections in slot order, in one launch
 # (`lib/routed/down.glsl`, `down_sum.glsl`). A tier-served choice reads its
@@ -1863,6 +1905,10 @@ native routed_down for vulkan from "vulkan/routed_down.comp":
     static (H, K, F)
     records (expert_down, tier_down)
     project routed summed (expert_down)
+    scratch projected bytes (M * K * H * 2) when GATHERED == 1 and M >= 2 and M <= VERIFY_ROWS
+    launch routed_down_combine when GATHERED == 1 and M >= 2 and M <= VERIFY_ROWS:
+        threadgroups (ceil_div(H, 256), M, 1)
+        threads_per_threadgroup (256, 1, 1)
 
 # CPU: work item (x, m) owns ROWS output channels of row m: the choices'
 # weighted projections in slot order.

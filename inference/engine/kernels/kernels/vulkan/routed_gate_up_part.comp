@@ -36,14 +36,16 @@
 void routed_gate_up_part_choice() { routed_gate_up_rows(gl_WorkGroupID.y, 0ul, 0ul, 1u, 1u); }
 
 void routed_gate_up_part_gather() {
-    routed_gather(SEISMIC_PTR(SEISMIC_BUFFER_ROUTES), SEISMIC_ROUTES_STRIDE_0, SEISMIC_ROUTES_STRIDE_1,
+    const uint per_group = SEISMIC_TUNE_SIMDGROUPS * SEISMIC_TUNE_ROWS;
+    const uint x_groups = (uint(SEISMIC_DIM_F) + per_group - 1u) / per_group;
+    routed_build_worklist(SEISMIC_PTR(SEISMIC_BUFFER_ROUTES), SEISMIC_ROUTES_STRIDE_0, SEISMIC_ROUTES_STRIDE_1,
         SEISMIC_PTR(SEISMIC_BUFFER_SOURCES), SEISMIC_CONST_SOURCE_ROWS,
         SEISMIC_SOURCES_STRIDE_0, SEISMIC_SOURCES_STRIDE_1, SEISMIC_SOURCES_STRIDE_2,
         uint(SEISMIC_DIM_M), uint(SEISMIC_DIM_K), ROUTED_GATE_UP_PRODUCT_STRIDE_0, ROUTED_GATE_UP_PRODUCT_STRIDE_1,
-        SEISMIC_PTR(SEISMIC_BUFFER_SCRATCH_GATHERED));
+        0u, x_groups, 0u, SEISMIC_PTR(SEISMIC_BUFFER_SCRATCH_WORKLIST),
+        SEISMIC_PTR(SEISMIC_BUFFER_SCRATCH_GATHER_GRID));
 }
 
-void routed_gate_up_part_gathered1() { routed_gate_up_gathered_bounded(1u); }
 void routed_gate_up_part_gathered2() { routed_gate_up_gathered_bounded(2u); }
 void routed_gate_up_part_gathered4() { routed_gate_up_gathered_bounded(4u); }
 void routed_gate_up_part_gathered8() { routed_gate_up_gathered_bounded(8u); }

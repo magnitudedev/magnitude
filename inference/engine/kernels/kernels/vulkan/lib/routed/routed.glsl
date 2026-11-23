@@ -39,15 +39,17 @@ projection_weights routed_expert_matrix(slab_experts experts, slab_source source
     return routed_weights(slab_experts_matrix(experts, source), geometry, 0ul, k);
 }
 
-// The gathered decode form's tables (`routed_gather`): ROUTED_GATHER_WORDS
-// I32 a choice, from `table` + choice * ROUTED_GATHER_WORDS * 4: the count of
-// the choices reading the choice's record where it is the first of them in
-// choice order (row-major), else 0; then those choices' rows (each its GEMV
-// row's activation row, at most one a row); then their products' element
-// offsets. A choice reading no record (-1) is its own group. A gathered GEMV
-// reads each chosen record once a step, for every row that reads it: a host
-// tier record read once per row would cost its link bytes again for each.
-#define ROUTED_GATHER_WORDS (1u + 2u * uint(SEISMIC_CONST_VERIFY_ROWS))
+// Compact unique-expert worklist emitted once by a 1-workgroup `*_gather`
+// launch for the gathered decode forms (`choice` and `summed`), enabling
+// hardware indirect dispatch (`vkCmdDispatchIndirect`) over only the active
+// unique `(expert, source)` groups.
+// Layout: 16-byte header (`count` at +0), then `count` entries of
+// `ROUTED_WORK_WORDS` 32-bit words each:
+//   [0] expert, [1] source, [2] count, [3] pad,
+//   [4 .. 4 + VERIFY_ROWS)              rows[r],
+//   [4 + VERIFY_ROWS .. +2*VERIFY_ROWS) outputs[r].
+#define ROUTED_WORK_WORDS (4u + 2u * uint(SEISMIC_CONST_VERIFY_ROWS))
+#define ROUTED_WORK_BYTES (uint64_t(ROUTED_WORK_WORDS) * 4ul)
 
 // Whether flat choice `choice`, reading `source`, runs in this pass: a
 // two-pass entry defines ROUTED_CHOICE_ACTIVE(choice, source) before
@@ -70,73 +72,179 @@ int routed_choice_expert(uint64_t routes, uint64_t routes0, uint64_t routes1, ui
     return element_i32_at(routes + (m * routes0 + k * routes1) * 4ul);
 }
 
-// Writes the tables of the `rows` x `slots` choices of `routes` (strides
-// `routes0`, `routes1`; sources as `routed_decode_source`) whose products lie
-// at element strides `product0`, `product1`, an invocation a choice. Choices
-// group where they name one expert in one record, as CUDA's and Metal's
-// gathers do. Only
-// active choices (ROUTED_CHOICE_ACTIVE) group: an inactive one has count 0
-// and joins no group, so it neither runs nor shadows an active choice of its
-// record. The form runs at most VERIFY_ROWS rows, a row's choices distinct
-// records, so a choice's count never reaches the bound; the bound (Metal's
-// `routed::gather`'s) keeps the tables in bounds where routes break that
-// invariant, since Vulkan has no trap.
-void routed_gather(uint64_t routes, uint64_t routes0, uint64_t routes1, uint64_t sources, uint64_t source_rows,
-    uint64_t source0, uint64_t source1, uint64_t source2, uint rows, uint slots, uint64_t product0,
-    uint64_t product1, uint64_t table) {
-    for (uint choice = gl_LocalInvocationIndex; choice < rows * slots; choice += gl_WorkGroupSize.x) {
-        const slab_source source = routed_choice_source(routes, routes0, routes1, sources, source_rows, source0,
-            source1, source2, slots, choice);
-        const int record = source.code;
-        const int expert = routed_choice_expert(routes, routes0, routes1, slots, choice);
-        const uint64_t at = table + uint64_t(choice) * ROUTED_GATHER_WORDS * 4ul;
-        bool first = ROUTED_CHOICE_ACTIVE(choice, source);
-        for (uint c = 0u; c < choice && record != -1; ++c) {
-            const slab_source other = routed_choice_source(routes, routes0, routes1, sources, source_rows, source0,
+void routed_write_grid(uint64_t grid, uint x, uint y) {
+    element_i32_put(grid, int(x));
+    element_i32_put(grid + 4ul, int(y));
+    element_i32_put(grid + 8ul, 1);
+}
+
+// Row/output encoding modes for `routed_build_worklist`:
+//   0 (choice): rows[r] = m, outputs[r] = m * out0 + k * out1
+//   1 (summed contiguous): rows[r] = m * slots + k, outputs[r] = (m << 16) | k
+//   2 (summed strided):    rows[r] = m * out0 + k * out1, outputs[r] = (m << 16) | k
+void routed_store_work_item(uint64_t entry_at, uint idx, uint m, uint k, uint slots, uint64_t out0, uint64_t out1,
+    uint mode) {
+    int row_val;
+    int out_val;
+    if (mode == 0u) {
+        row_val = int(m);
+        out_val = int(uint64_t(m) * out0 + uint64_t(k) * out1);
+    } else {
+        row_val = mode == 1u ? int(m * slots + k) : int(uint64_t(m) * out0 + uint64_t(k) * out1);
+        out_val = int((m << 16u) | k);
+    }
+    element_i32_put(entry_at + uint64_t(4u + idx) * 4ul, row_val);
+    element_i32_put(entry_at + uint64_t(4u + uint(SEISMIC_CONST_VERIFY_ROWS) + idx) * 4ul, out_val);
+}
+
+// Builds the compact unique-expert worklist at `worklist` and writes the
+// indirect dispatch grid `(x_groups, unique_count + extra_y, 1)` to
+// `gather_grid`. Requires 64-invocation workgroup with 4096 bytes of shared
+// memory (`seismic_shared_i32[0..1023]`).
+void routed_build_worklist(uint64_t routes, uint64_t routes0, uint64_t routes1, uint64_t sources, uint64_t source_rows,
+    uint64_t source0, uint64_t source1, uint64_t source2, uint rows, uint slots, uint64_t out0, uint64_t out1,
+    uint mode, uint x_groups, uint extra_y, uint64_t worklist, uint64_t gather_grid) {
+    const uint total = rows * slots;
+    const uint tid = gl_LocalInvocationIndex;
+    if (total <= 256u) {
+        for (uint c = tid; c < total; c += gl_WorkGroupSize.x) {
+            const int ex = routed_choice_expert(routes, routes0, routes1, slots, c);
+            const slab_source src = routed_choice_source(routes, routes0, routes1, sources, source_rows, source0,
                 source1, source2, slots, c);
-            first = first && !(other.code == record
-                && routed_choice_expert(routes, routes0, routes1, slots, c) == expert && ROUTED_CHOICE_ACTIVE(c, other));
+            seismic_shared_i32[c] = ex;
+            seismic_shared_i32[256u + c] = src.code;
+            seismic_shared_i32[768u + c] = ROUTED_CHOICE_ACTIVE(c, src) ? 1 : 0;
         }
-        uint count = 0u;
-        for (uint c = choice; first && c < rows * slots && count < uint(SEISMIC_CONST_VERIFY_ROWS); ++c) {
-            const uint64_t m = uint64_t(c / slots), k = uint64_t(c % slots);
-            bool joins = c == choice;
-            if (!joins && record != -1) {
+        barrier();
+        for (uint c = tid; c < total; c += gl_WorkGroupSize.x) {
+            bool first = seismic_shared_i32[768u + c] != 0;
+            const int ex = seismic_shared_i32[c];
+            const int rec = seismic_shared_i32[256u + c];
+            if (first && rec != -1) {
+                for (uint j = 0u; j < c; ++j) {
+                    if (seismic_shared_i32[768u + j] != 0 && seismic_shared_i32[256u + j] == rec
+                        && seismic_shared_i32[j] == ex) {
+                        first = false;
+                        break;
+                    }
+                }
+            }
+            seismic_shared_i32[512u + c] = first ? 1 : 0;
+        }
+        barrier();
+        if (tid == 0u) {
+            uint unique_count = 0u;
+            for (uint c = 0u; c < total; ++c) {
+                const int flag = seismic_shared_i32[512u + c];
+                seismic_shared_i32[512u + c] = flag != 0 ? int(unique_count) : -1;
+                if (flag != 0)
+                    ++unique_count;
+            }
+            element_i32_put(worklist, int(unique_count));
+            routed_write_grid(gather_grid, x_groups, unique_count + extra_y);
+        }
+        barrier();
+        for (uint c = tid; c < total; c += gl_WorkGroupSize.x) {
+            const int slot_idx = seismic_shared_i32[512u + c];
+            if (slot_idx < 0)
+                continue;
+            const int ex = seismic_shared_i32[c];
+            const int rec = seismic_shared_i32[256u + c];
+            const uint64_t at = worklist + 16ul + uint64_t(slot_idx) * ROUTED_WORK_BYTES;
+            element_i32_put(at, ex);
+            element_i32_put(at + 4ul, rec);
+            element_i32_put(at + 12ul, 0);
+            uint count = 0u;
+            if (rec == -1) {
+                routed_store_work_item(at, 0u, c / slots, c % slots, slots, out0, out1, mode);
+                count = 1u;
+            } else {
+                for (uint j = c; j < total && count < uint(SEISMIC_CONST_VERIFY_ROWS); ++j) {
+                    if (j == c || (seismic_shared_i32[768u + j] != 0 && seismic_shared_i32[256u + j] == rec
+                            && seismic_shared_i32[j] == ex)) {
+                        routed_store_work_item(at, count, j / slots, j % slots, slots, out0, out1, mode);
+                        ++count;
+                    }
+                }
+            }
+            element_i32_put(at + 8ul, int(count));
+        }
+        return;
+    }
+    if (tid == 0u) {
+        uint unique_count = 0u;
+        for (uint c = 0u; c < total; ++c) {
+            const slab_source src = routed_choice_source(routes, routes0, routes1, sources, source_rows, source0,
+                source1, source2, slots, c);
+            const int rec = src.code;
+            const int ex = routed_choice_expert(routes, routes0, routes1, slots, c);
+            bool first = ROUTED_CHOICE_ACTIVE(c, src);
+            for (uint j = 0u; first && j < c && rec != -1; ++j) {
                 const slab_source other = routed_choice_source(routes, routes0, routes1, sources, source_rows,
-                    source0, source1, source2, slots, c);
-                joins = other.code == record && routed_choice_expert(routes, routes0, routes1, slots, c) == expert
-                    && ROUTED_CHOICE_ACTIVE(c, other);
+                    source0, source1, source2, slots, j);
+                if (other.code == rec && routed_choice_expert(routes, routes0, routes1, slots, j) == ex
+                    && ROUTED_CHOICE_ACTIVE(j, other))
+                    first = false;
             }
-            if (joins) {
-                element_i32_put(at + uint64_t(1u + count) * 4ul, int(m));
-                element_i32_put(at + uint64_t(1u + uint(SEISMIC_CONST_VERIFY_ROWS) + count) * 4ul,
-                    int(m * product0 + k * product1));
-                ++count;
+            if (!first)
+                continue;
+            const uint64_t at = worklist + 16ul + uint64_t(unique_count) * ROUTED_WORK_BYTES;
+            element_i32_put(at, ex);
+            element_i32_put(at + 4ul, rec);
+            element_i32_put(at + 12ul, 0);
+            uint count = 0u;
+            if (rec == -1) {
+                routed_store_work_item(at, 0u, c / slots, c % slots, slots, out0, out1, mode);
+                count = 1u;
+            } else {
+                for (uint j = c; j < total && count < uint(SEISMIC_CONST_VERIFY_ROWS); ++j) {
+                    bool joins = j == c;
+                    if (!joins) {
+                        const slab_source other = routed_choice_source(routes, routes0, routes1, sources, source_rows,
+                            source0, source1, source2, slots, j);
+                        joins = other.code == rec && routed_choice_expert(routes, routes0, routes1, slots, j) == ex
+                            && ROUTED_CHOICE_ACTIVE(j, other);
+                    }
+                    if (joins) {
+                        routed_store_work_item(at, count, j / slots, j % slots, slots, out0, out1, mode);
+                        ++count;
+                    }
+                }
             }
+            element_i32_put(at + 8ul, int(count));
+            ++unique_count;
         }
-        element_i32_put(at, int(count));
+        element_i32_put(worklist, int(unique_count));
+        routed_write_grid(gather_grid, x_groups, unique_count + extra_y);
     }
 }
 
-void routed_gather(uint64_t routes, uint64_t routes0, uint64_t routes1, uint rows, uint slots, uint64_t product0,
-    uint64_t product1, uint64_t table) {
-    routed_gather(routes, routes0, routes1, 0ul, 0ul, 0ul, 0ul, 0ul, rows, slots, product0, product1, table);
+void routed_build_worklist(uint64_t routes, uint64_t routes0, uint64_t routes1, uint rows, uint slots, uint64_t out0,
+    uint64_t out1, uint mode, uint x_groups, uint extra_y, uint64_t worklist, uint64_t gather_grid) {
+    routed_build_worklist(routes, routes0, routes1, 0ul, 0ul, 0ul, 0ul, 0ul, rows, slots, out0, out1, mode, x_groups,
+        extra_y, worklist, gather_grid);
 }
 
-// The GEMV rows of choice `choice` in the tables at `table`
-// (`routed_gather`): their count (0 where it is not its expert's first
-// choice), the table of their activation rows and that of their products'
-// element offsets.
-struct routed_gathered_rows {
+uint routed_worklist_count(uint64_t worklist) {
+    return uint(element_i32_at(worklist));
+}
+
+struct routed_work_entry {
+    int expert;
+    slab_source source;
     uint count;
     uint64_t rows;
     uint64_t outputs;
 };
 
-routed_gathered_rows routed_gathered(uint64_t table, uint choice) {
-    const uint64_t at = table + uint64_t(choice) * ROUTED_GATHER_WORDS * 4ul;
-    return routed_gathered_rows(uint(element_i32_at(at)), at + 4ul,
-        at + (1ul + uint64_t(SEISMIC_CONST_VERIFY_ROWS)) * 4ul);
+routed_work_entry routed_worklist_entry(uint64_t worklist, uint u) {
+    const uint64_t at = worklist + 16ul + uint64_t(u) * ROUTED_WORK_BYTES;
+    return routed_work_entry(
+        element_i32_at(at),
+        slab_source(element_i32_at(at + 4ul)),
+        uint(element_i32_at(at + 8ul)),
+        at + 16ul,
+        at + (4ul + uint64_t(SEISMIC_CONST_VERIFY_ROWS)) * 4ul);
 }
 
 // Zeroes features [first, first + count) of `features` of each of the epilogue's
@@ -149,12 +257,6 @@ void routed_zero_features(projection_epilogue out_, uint rows, uint first, uint 
         if (n < features)
             out_put(out_.y, projection_out_row(out_, i / count) + uint64_t(n) * out_.y1, 0.0);
     }
-}
-
-void routed_write_grid(uint64_t grid, uint x, uint y) {
-    element_i32_put(grid, int(x));
-    element_i32_put(grid + 4ul, int(y));
-    element_i32_put(grid + 8ul, 1);
 }
 
 // The grids of an expert pass over `rows` grouped rows and `used` blocks of

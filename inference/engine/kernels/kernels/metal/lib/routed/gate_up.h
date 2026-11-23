@@ -60,23 +60,29 @@ typedef projection::operands<NVFP4> Operands;
     projection::gemv_paired_runtime<packets::W0, packets::W1, ROWS, 1, LANES>(x, out, gate, up, 1,                     \
         SEISMIC_DIM_F, SEISMIC_DIM_H, tile, shared, simdgroups, sg, lane);
 
-// The gathered body (`routed::gather`): choice y's threadgroups run where it
-// is the first active choice of its expert and source, over the rows of every
-// active choice sharing them.
+// The compact worklist builder (`routed::build_worklist`): emits unique active
+// `(expert, source)` entries and the indirect grid `(CHOICE_GROUPS, count, 1)`.
+#define ROUTED_GATE_UP_GATHER_BODY                                                                                     \
+    threadgroup int cache[2u * routed::WORKLIST_CACHE];                                                                \
+    const uint per_group = uint(SEISMIC_RUNTIME_SIMDGROUPS) * ROWS * (32u / LANES);                                    \
+    const uint x_groups = (uint(SEISMIC_DIM_F) + per_group - 1u) / per_group;                                          \
+    routed::build_worklist(routes, SEISMIC_ROUTES_STRIDE_0, SEISMIC_ROUTES_STRIDE_1, sources, ROUTED_SOURCE_ROWS,      \
+        SEISMIC_SOURCES_STRIDE_1, SEISMIC_SOURCES_STRIDE_2, uint(SEISMIC_DIM_M), uint(SEISMIC_DIM_K), x_groups, 0u,    \
+        worklist, gather_grid, cache, lane,                                                                            \
+        [&](uint c, slab::Source source) { return ROUTED_GATE_UP_ACTIVE(c, source); });
+
+// The gathered body: threadgroup `(tile, u)` reads compact worklist entry `u`
+// in O(1) (dispatched indirectly over the exact active unique count).
 #define ROUTED_GATE_UP_GATHERED_BODY                                                                                   \
     typedef routed::Act A;                                                                                             \
     const element::Out<A> product(product_cells);                                                                      \
     const uint tile = group.x;                                                                                         \
     if (ulong(tile) * simdgroups * ROWS * (32u / LANES) >= SEISMIC_DIM_F)                                              \
         return;                                                                                                        \
-    const routed::Gathered chosen = routed::gather(routes, SEISMIC_ROUTES_STRIDE_0, SEISMIC_ROUTES_STRIDE_1,           \
-        sources, ROUTED_SOURCE_ROWS, SEISMIC_SOURCES_STRIDE_1, SEISMIC_SOURCES_STRIDE_2, uint(SEISMIC_DIM_M),          \
-        uint(SEISMIC_DIM_K), group.y, ROUTED_GATE_UP_PRODUCT_STRIDE_0, ROUTED_GATE_UP_PRODUCT_STRIDE_1, lane,          \
-        [&](uint c, slab::Source source) { return ROUTED_GATE_UP_ACTIVE(c, source); });                                \
-    if (chosen.count == 0)                                                                                             \
-        return;                                                                                                        \
-    const slab::Source source = routed::decode_source(sources, ROUTED_SOURCE_ROWS, SEISMIC_SOURCES_STRIDE_1,           \
-        SEISMIC_SOURCES_STRIDE_2, group.y / SEISMIC_DIM_K, group.y % SEISMIC_DIM_K, chosen.expert);                    \
+    device const routed::WorkEntry &entry = worklist->entries[group.y];                                                \
+    const routed::Gathered chosen =                                                                                    \
+        routed::unpack_work_entry(entry, ROUTED_GATE_UP_PRODUCT_STRIDE_0, ROUTED_GATE_UP_PRODUCT_STRIDE_1);            \
+    const slab::Source source{entry.source};                                                                           \
     if (source.none()) {                                                                                               \
         if (tile == 0)                                                                                                 \
             for (uint r = 0; r < chosen.count; ++r)                                                                    \

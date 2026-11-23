@@ -49,6 +49,7 @@ struct ChoiceProjectedEpi {
 #define ROUTED_DOWN_SUMMED_BODY(TPW, KSPLIT)                                                                       \
     using Shape = routed::DecodeShape<TPW, KSPLIT>;                                                                \
     using Readers = routed::DecodeReaders<packets::W0>;                                                            \
+    constexpr projection::u64 CHANNELS = Shape::GROUPS * TPW * 16;                                                 \
     __shared__ projection::GemvShared<Shape, projection::SharedRow, 0, routed::DecodePoints<packets::W0>> shared;  \
     const projection::u64 m = blockIdx.y / SEISMIC_DIM_K, k = blockIdx.y % SEISMIC_DIM_K;                          \
     const int *routes = reinterpret_cast<const int *>(SEISMIC_PTR(SEISMIC_BUFFER_ROUTES));                         \
@@ -59,17 +60,18 @@ struct ChoiceProjectedEpi {
     if (down.stack == nullptr) {                                                                                   \
         seismic_dependency_start();                                                                                \
         routed::zero_block_rows<Shape>(SEISMIC_DIM_H, [&](projection::u64 n) { projected.put(n * s2, 0.0f); });    \
-        return;                                                                                                    \
+    } else {                                                                                                       \
+        projection::stage_points(Readers{});                                                                       \
+        const Pro pro{Raw{SEISMIC_PTR(SEISMIC_BUFFER_PRODUCT) +                                                    \
+                              (m * SEISMIC_PRODUCT_STRIDE_0 + k * SEISMIC_PRODUCT_STRIDE_1) * 2,                   \
+                          0, projection::AllRows{}}};                                                              \
+        const projection::u64 group = Shape::tile_group();                                                         \
+        projection::gemv_segment_ready<Shape>(shared, projection::shared_row_after_dependency(pro, SEISMIC_DIM_F), \
+                                              1u, SEISMIC_DIM_F / 64, group, SEISMIC_DIM_H,                        \
+                                              PACKETS_MATRIX(KERNEL_W0, down), projection::NoWeight{},             \
+                                              ProjectedEpi{projected, s2});                                        \
     }                                                                                                              \
-    projection::stage_points(Readers{});                                                                           \
-    const Pro pro{Raw{SEISMIC_PTR(SEISMIC_BUFFER_PRODUCT) +                                                        \
-                          (m * SEISMIC_PRODUCT_STRIDE_0 + k * SEISMIC_PRODUCT_STRIDE_1) * 2,                       \
-                      0, projection::AllRows{}}};                                                                  \
-    const projection::u64 group = Shape::tile_group();                                                             \
-    projection::gemv_segment_ready<Shape>(shared, projection::shared_row_after_dependency(pro, SEISMIC_DIM_F),     \
-                                          1u, SEISMIC_DIM_F / 64, group, SEISMIC_DIM_H,                            \
-                                          PACKETS_MATRIX(KERNEL_W0, down), projection::NoWeight{},                 \
-                                          ProjectedEpi{projected, s2});
+    ROUTED_DOWN_ARRIVED(m, static_cast<unsigned>(SEISMIC_DIM_K), m * gridDim.x + blockIdx.x, blockIdx.x * CHANNELS, CHANNELS)
 
 #define ROUTED_DOWN_STAGE_BODY                                                                                     \
     seismic_dependency_start();                                                                                    \
@@ -80,39 +82,51 @@ struct ChoiceProjectedEpi {
     projection::form_row(projection::Nvfp4Rows<Raw>{row}, 0u, SEISMIC_DIM_F,                                       \
                          SEISMIC_PTR(SEISMIC_BUFFER_SCRATCH_EXPERT_DOWN_OPERANDS) + blockIdx.x * SEISMIC_DIM_F * 2);
 
+#ifndef ROUTED_DOWN_ARRIVED
+#define ROUTED_DOWN_ARRIVED(m, blocks, arrival, first, channels)
+#endif
+#ifndef ROUTED_DOWN_GATHERED_ARRIVED
+#define ROUTED_DOWN_GATHERED_ARRIVED(blocks, arrival, first, channels)
+#endif
+
 #define ROUTED_DOWN_GATHERED_BODY(TPW, KSPLIT)                                                                     \
     using Shape = routed::DecodeShape<TPW, KSPLIT>;                                                                \
     using Readers = routed::DecodeReaders<packets::W0>;                                                            \
+    constexpr projection::u64 CHANNELS = Shape::GROUPS * TPW * 16;                                                 \
     __shared__ projection::GemvShared<Shape, Raw, 0, routed::DecodePoints<packets::W0>> shared;                    \
     __shared__ routed::Gathered table;                                                                             \
     const int *routes = reinterpret_cast<const int *>(SEISMIC_PTR(SEISMIC_BUFFER_ROUTES));                         \
-    const unsigned choice = blockIdx.y, slots = (unsigned)SEISMIC_DIM_K;                                           \
+    const unsigned at = blockIdx.y, slots = (unsigned)SEISMIC_DIM_K;                                               \
     const auto record = [&](unsigned c) {                                                                          \
         const int ex = routed::route(routes, SEISMIC_ROUTES_STRIDE_0, SEISMIC_ROUTES_STRIDE_1, slots, c);          \
         return routed::ChoiceKey{ex, DOWN_SOURCE(c / slots, c % slots, ex).code, true};                            \
     };                                                                                                             \
     const projection::u64 row0 = NVFP4 ? SEISMIC_DIM_K * SEISMIC_DIM_F : SEISMIC_PRODUCT_STRIDE_0;                 \
     const projection::u64 row1 = NVFP4 ? SEISMIC_DIM_F : SEISMIC_PRODUCT_STRIDE_1;                                 \
-    if (!routed::gather(table, record, (unsigned)SEISMIC_DIM_M, slots, choice, row0, row1,                         \
-                        ROUTED_PROJECTED_S0, ROUTED_PROJECTED_S1)) {                                               \
+    if (routed::gather(table, record, (unsigned)SEISMIC_DIM_M, slots, at, row0, row1,                              \
+                       ROUTED_PROJECTED_S0, ROUTED_PROJECTED_S1)) {                                                \
+        const slab::Matrix down = DOWN_WEIGHTS(at / slots, at % slots, table.expert);                              \
+        const projection::u64 s2 = ROUTED_PROJECTED_S2;                                                            \
+        const element::Out<activation::Act> projected = ROUTED_PROJECTED_OUT;                                      \
+        if (down.stack == nullptr) {                                                                               \
+            seismic_dependency_start();                                                                            \
+            for (unsigned r = 0; r < table.count; ++r)                                                             \
+                routed::zero_block_rows<Shape>(                                                                    \
+                    SEISMIC_DIM_H, [&](projection::u64 n) { projected.put(table.products[r] + n * s2, 0.0f); });   \
+        } else {                                                                                                   \
+            projection::stage_points(Readers{});                                                                   \
+            const projection::u64 group = Shape::tile_group();                                                     \
+            const projection::u8 *rows =                                                                           \
+                NVFP4 ? SEISMIC_PTR(SEISMIC_BUFFER_SCRATCH_EXPERT_DOWN_OPERANDS)                                   \
+                      : SEISMIC_PTR(SEISMIC_BUFFER_PRODUCT);                                                       \
+            projection::gemv_segment_ready<Shape>(shared,                                                          \
+                                                  projection::after_dependency(routed::GatheredRows{rows,          \
+                                                                                                    table.rows}),  \
+                                                  table.count, SEISMIC_DIM_F / 64, group, SEISMIC_DIM_H,           \
+                                                  PACKETS_MATRIX(KERNEL_W0, down), projection::NoWeight{},         \
+                                                  ChoiceProjectedEpi{projected, table.products, s2});              \
+        }                                                                                                          \
+    } else {                                                                                                       \
         seismic_dependency_start();                                                                                \
-        return;                                                                                                    \
     }                                                                                                              \
-    const slab::Matrix down = DOWN_WEIGHTS(choice / slots, choice % slots, table.expert);                          \
-    const projection::u64 s2 = ROUTED_PROJECTED_S2;                                                                \
-    const element::Out<activation::Act> projected = ROUTED_PROJECTED_OUT;                                          \
-    if (down.stack == nullptr) {                                                                                   \
-        seismic_dependency_start();                                                                                \
-        for (unsigned r = 0; r < table.count; ++r)                                                                 \
-            routed::zero_block_rows<Shape>(                                                                        \
-                SEISMIC_DIM_H, [&](projection::u64 n) { projected.put(table.products[r] + n * s2, 0.0f); });       \
-        return;                                                                                                    \
-    }                                                                                                              \
-    projection::stage_points(Readers{});                                                                           \
-    const projection::u64 group = Shape::tile_group();                                                             \
-    const projection::u8 *rows =                                                                                   \
-        NVFP4 ? SEISMIC_PTR(SEISMIC_BUFFER_SCRATCH_EXPERT_DOWN_OPERANDS) : SEISMIC_PTR(SEISMIC_BUFFER_PRODUCT);    \
-    projection::gemv_segment_ready<Shape>(shared, projection::after_dependency(routed::GatheredRows{rows, table.rows}), \
-                                          table.count, SEISMIC_DIM_F / 64, group, SEISMIC_DIM_H,                   \
-                                          PACKETS_MATRIX(KERNEL_W0, down), projection::NoWeight{},                 \
-                                          ChoiceProjectedEpi{projected, table.products, s2});
+    ROUTED_DOWN_GATHERED_ARRIVED(gridDim.y, blockIdx.x, blockIdx.x * CHANNELS, CHANNELS)

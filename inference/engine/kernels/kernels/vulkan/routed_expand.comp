@@ -111,27 +111,46 @@ void routed_expand_choice4() { routed_expand_choice_bounded(4u); }
 void routed_expand_choice8() { routed_expand_choice_bounded(8u); }
 
 void routed_expand_gather() {
-    routed_gather(SEISMIC_PTR(SEISMIC_BUFFER_ROUTES), SEISMIC_ROUTES_STRIDE_0, SEISMIC_ROUTES_STRIDE_1,
-        uint(SEISMIC_DIM_M), uint(SEISMIC_DIM_K), SEISMIC_RESULT_0_STRIDE_0, SEISMIC_RESULT_0_STRIDE_1,
-        SEISMIC_PTR(SEISMIC_BUFFER_SCRATCH_GATHERED));
+    const uint max_n = uint(SEISMIC_DIM_F) > uint(SEISMIC_DIM_S) ? uint(SEISMIC_DIM_F) : uint(SEISMIC_DIM_S);
+    const uint per_group = SEISMIC_TUNE_SIMDGROUPS * SEISMIC_TUNE_ROWS;
+    const uint x_groups = (max_n + per_group - 1u) / per_group;
+    routed_build_worklist(SEISMIC_PTR(SEISMIC_BUFFER_ROUTES), SEISMIC_ROUTES_STRIDE_0, SEISMIC_ROUTES_STRIDE_1,
+        uint(SEISMIC_DIM_M), uint(SEISMIC_DIM_K), SEISMIC_RESULT_0_STRIDE_0, SEISMIC_RESULT_0_STRIDE_1, 0u,
+        x_groups, 1u, SEISMIC_PTR(SEISMIC_BUFFER_SCRATCH_WORKLIST),
+        SEISMIC_PTR(SEISMIC_BUFFER_SCRATCH_GATHER_GRID));
 }
 
-// The gathered form at activation-row bound `maxm`: choice y over its
-// expert's rows where it is the expert's first choice (`routed_gather`'s
-// table), and the shared expert.
+// The gathered form at activation-row bound `maxm`: workgroup `(tile, u)`
+// projects unique expert `u < count` across all its choices in one weight pass,
+// or the shared expert at `u == count` across all M rows.
 void routed_expand_gathered_bounded(const uint maxm) {
-    if (uint64_t(gl_WorkGroupID.y) >= SEISMIC_DIM_M * SEISMIC_DIM_K) {
+    const uint64_t worklist = SEISMIC_PTR(SEISMIC_BUFFER_SCRATCH_WORKLIST);
+    if (gl_WorkGroupID.y >= routed_worklist_count(worklist)) {
         routed_expand_shared(maxm);
         return;
     }
-    const routed_gathered_rows gathered = routed_gathered(SEISMIC_PTR(SEISMIC_BUFFER_SCRATCH_GATHERED),
-        gl_WorkGroupID.y);
-    if (gathered.count == 0u)
+    const uint rows_per_tile = SEISMIC_SUBGROUPS * SEISMIC_TUNE_ROWS;
+    const uint tile = gl_WorkGroupID.x;
+    if (uint64_t(tile) * rows_per_tile >= SEISMIC_DIM_F)
         return;
-    routed_expand_choices(gl_WorkGroupID.y, gathered.rows, gathered.outputs, gathered.count, maxm);
+    const routed_work_entry entry = routed_worklist_entry(worklist, gl_WorkGroupID.y);
+    const uint hidden = uint(SEISMIC_DIM_H);
+    const uint64_t expert = uint64_t(entry.expert);
+    const projection_prologue x = projection_operands(projection_plain(ROUTED_ACT,
+        SEISMIC_PTR(SEISMIC_BUFFER_NORMALIZED), SEISMIC_NORMALIZED_STRIDE_0, SEISMIC_NORMALIZED_STRIDE_1, hidden,
+        entry.rows), EXPERT_OPERANDS);
+    const projection_weights gate = routed_record_weights(SEISMIC_PTR(SEISMIC_BUFFER_EXPERT_GATE), expert,
+        PACKETS_W0_STACKED_ROWS, hidden);
+    const projection_weights up = routed_record_weights(SEISMIC_PTR(SEISMIC_BUFFER_EXPERT_UP), expert,
+        PACKETS_W1_STACKED_ROWS, hidden);
+    const projection_epilogue out_ = projection_scaled(projection_gathered(projection_silu_mul(ROUTED_ACT,
+            SEISMIC_RESULT_0_OUT, 0ul, SEISMIC_RESULT_0_STRIDE_2), entry.outputs),
+        projection_scale_factor(SEISMIC_PTR(SEISMIC_BUFFER_GATE_SCALE), SEISMIC_DIM_GS, SEISMIC_GATE_SCALE_STRIDE_0, expert),
+        projection_scale_factor(SEISMIC_PTR(SEISMIC_BUFFER_UP_SCALE), SEISMIC_DIM_US, SEISMIC_UP_SCALE_STRIDE_0, expert));
+    projection_gemv(PACKETS_W0, PACKETS_W1, true, SEISMIC_TUNE_ROWS, 32u, maxm, false, false,
+        PROJECTION_NORM_NONE, x, out_, gate, up, entry.count, uint(SEISMIC_DIM_F), hidden, tile);
 }
 
-void routed_expand_gathered1() { routed_expand_gathered_bounded(1u); }
 void routed_expand_gathered2() { routed_expand_gathered_bounded(2u); }
 void routed_expand_gathered4() { routed_expand_gathered_bounded(4u); }
 void routed_expand_gathered8() { routed_expand_gathered_bounded(8u); }

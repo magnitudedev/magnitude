@@ -60,12 +60,32 @@ void routed_gate_up_rows(const uint64_t choice, uint64_t rows, uint64_t outputs,
         PROJECTION_NORM_NONE, x, out_, gate, up, count, uint(SEISMIC_DIM_F), hidden, tile);
 }
 
-// Choice y's GEMV over its record's rows where it is the first choice
-// reading it (`routed_gather`'s table), at activation-row bound `maxm`.
+// Compact worklist entry `gl_WorkGroupID.y`'s GEMV over its record's rows
+// (dispatched indirectly over only the active unique `(expert, source)` groups),
+// at activation-row bound `maxm`.
 void routed_gate_up_gathered_bounded(const uint maxm) {
-    const routed_gathered_rows gathered = routed_gathered(SEISMIC_PTR(SEISMIC_BUFFER_SCRATCH_GATHERED),
-        gl_WorkGroupID.y);
-    if (gathered.count == 0u)
+    const routed_work_entry entry =
+        routed_worklist_entry(SEISMIC_PTR(SEISMIC_BUFFER_SCRATCH_WORKLIST), gl_WorkGroupID.y);
+    const uint rows_per_tile = SEISMIC_SUBGROUPS * SEISMIC_TUNE_ROWS;
+    const uint tile = gl_WorkGroupID.x;
+    const uint hidden = uint(SEISMIC_DIM_H);
+    const uint64_t expert = uint64_t(entry.expert);
+    const projection_prologue x = projection_operands(projection_plain(ROUTED_ACT,
+        SEISMIC_PTR(SEISMIC_BUFFER_NORMALIZED), SEISMIC_NORMALIZED_STRIDE_0, SEISMIC_NORMALIZED_STRIDE_1, hidden,
+        entry.rows), ROUTED_OPERANDS);
+    const projection_weights gate = routed_expert_matrix(slab_experts(SEISMIC_PTR(SEISMIC_BUFFER_EXPERT_GATE),
+        SEISMIC_PTR(SEISMIC_BUFFER_TIER_GATE)), entry.source, PACKETS_W0_STACKED_ROWS, hidden);
+    const projection_weights up = routed_expert_matrix(slab_experts(SEISMIC_PTR(SEISMIC_BUFFER_EXPERT_UP),
+        SEISMIC_PTR(SEISMIC_BUFFER_TIER_UP)), entry.source, PACKETS_W1_STACKED_ROWS, hidden);
+    const projection_epilogue out_ = projection_scaled(projection_gathered(projection_glu(ROUTED_ACT,
+            ROUTED_GATE_UP_PRODUCT, 0ul, ROUTED_GATE_UP_PRODUCT_STRIDE_2,
+            int(SEISMIC_PARAM_ACTIVATION)), entry.outputs),
+        projection_scale_factor(SEISMIC_PTR(SEISMIC_BUFFER_GATE_SCALE), SEISMIC_DIM_GS, SEISMIC_GATE_SCALE_STRIDE_0, expert),
+        projection_scale_factor(SEISMIC_PTR(SEISMIC_BUFFER_UP_SCALE), SEISMIC_DIM_US, SEISMIC_UP_SCALE_STRIDE_0, expert));
+    if (slab_source_none(entry.source)) {
+        routed_zero_features(out_, entry.count, tile * rows_per_tile, rows_per_tile, uint(SEISMIC_DIM_F));
         return;
-    routed_gate_up_rows(gl_WorkGroupID.y, gathered.rows, gathered.outputs, gathered.count, maxm);
+    }
+    projection_gemv(PACKETS_W0, PACKETS_W1, true, SEISMIC_TUNE_ROWS, 32u, maxm, false, false,
+        PROJECTION_NORM_NONE, x, out_, gate, up, entry.count, uint(SEISMIC_DIM_F), hidden, tile);
 }

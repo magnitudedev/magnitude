@@ -9,3 +9,7 @@
 #include "lib/routed/down.glsl"
 
 void routed_down_project_summed() { routed_down_publish(); }
+void routed_down_project_gather() { routed_down_gather_worklist(); }
+void routed_down_project_gathered2() { routed_down_gathered_bounded(2u); }
+void routed_down_project_gathered4() { routed_down_gathered_bounded(4u); }
+void routed_down_project_gathered8() { routed_down_gathered_bounded(8u); }
