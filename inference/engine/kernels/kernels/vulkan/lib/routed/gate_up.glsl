@@ -86,6 +86,17 @@ void routed_gate_up_gathered_bounded(const uint maxm) {
         routed_zero_features(out_, entry.count, tile * rows_per_tile, rows_per_tile, uint(SEISMIC_DIM_F));
         return;
     }
-    projection_gemv(PACKETS_W0, PACKETS_W1, true, SEISMIC_TUNE_ROWS, 32u, maxm, false, false,
-        PROJECTION_NORM_NONE, x, out_, gate, up, entry.count, uint(SEISMIC_DIM_F), hidden, tile);
+    for (uint row_base = 0u; row_base < entry.count; row_base += maxm) {
+        const uint slice_m = min(maxm, entry.count - row_base);
+        projection_prologue slice_x = x;
+        projection_epilogue slice_out = out_;
+        if (row_base != 0u) {
+            slice_x.rows += uint64_t(row_base) * 4ul;
+            slice_out.outputs += uint64_t(row_base) * 4ul;
+        }
+        projection_gemv(PACKETS_W0, PACKETS_W1, true, SEISMIC_TUNE_ROWS, 32u, maxm, false, false,
+            PROJECTION_NORM_NONE, slice_x, slice_out, gate, up, slice_m, uint(SEISMIC_DIM_F), hidden, tile);
+        if (row_base + maxm < entry.count)
+            barrier();
+    }
 }

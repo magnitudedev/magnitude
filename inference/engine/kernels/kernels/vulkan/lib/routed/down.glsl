@@ -91,40 +91,53 @@ void routed_down_gather_worklist() {
 }
 
 // Gathered projection launch at activation-row bound `maxm`: workgroup `(tile, u)`
-// projects unique expert `u` across all its choices in one weight pass.
+// projects unique expert `u` across all its choices in slices of at most `maxm` rows.
 void routed_down_gathered_bounded(const uint maxm) {
     const uint tile = gl_WorkGroupID.x;
     const uint hidden = uint(SEISMIC_DIM_H);
     const uint first = projection_gemv_first_row(DOWN_R, DOWN_LANES, tile);
     const routed_work_entry entry =
         routed_worklist_entry(SEISMIC_PTR(SEISMIC_BUFFER_SCRATCH_WORKLIST), gl_WorkGroupID.y);
-    float totals[PROJECTION_GEMV_SUMS], unused[PROJECTION_GEMV_SUMS];
     if (slab_source_none(entry.source)) {
-        [[unroll]] for (uint sum = 0u; sum < PROJECTION_GEMV_SUMS; ++sum)
-            totals[sum] = 0.0;
-    } else {
-        const uint64_t row_stride =
-            (SEISMIC_PRODUCT_STRIDE_0 == SEISMIC_DIM_K * SEISMIC_PRODUCT_STRIDE_1)
-            ? SEISMIC_PRODUCT_STRIDE_1 : 1ul;
-        const projection_prologue x = projection_operands(projection_plain(ROUTED_ACT,
-            SEISMIC_PTR(SEISMIC_BUFFER_PRODUCT), row_stride, SEISMIC_PRODUCT_STRIDE_2,
-            uint(SEISMIC_DIM_F), entry.rows), DOWN_OPERANDS);
-        const projection_weights down = routed_expert_matrix(slab_experts(SEISMIC_PTR(SEISMIC_BUFFER_EXPERT_DOWN),
-            SEISMIC_PTR(SEISMIC_BUFFER_TIER_DOWN)), entry.source, PACKETS_W0_STACKED_ROWS, uint(SEISMIC_DIM_F));
-        projection_gemv_sums(PACKETS_W0, PACKETS_W0, false, DOWN_R, DOWN_LANES, maxm, false, false,
-            PROJECTION_NORM_NONE, x, down, down, entry.count, hidden, uint(SEISMIC_DIM_F), tile, totals, unused);
-    }
-    for (uint i = 0u; i < maxm; ++i) {
-        if (i < entry.count) {
+        for (uint i = 0u; i < entry.count; ++i) {
             const uint packed = uint(element_i32_at(entry.outputs + uint64_t(i) * 4ul));
             const uint64_t m = uint64_t(packed >> 16u);
             const uint64_t k = uint64_t(packed & 0xffffu);
             [[unroll]] for (uint r = 0u; r < PROJECTION_GEMV_MAX_R; ++r) {
                 const uint n = first + r;
                 if (r < DOWN_R && n < hidden && SEISMIC_LANE % DOWN_LANES == r)
-                    ROUTED_PROJECTED_PUT(m, k, uint64_t(n), totals[r * PROJECTION_GEMV_MAX_M + i]);
+                    ROUTED_PROJECTED_PUT(m, k, uint64_t(n), 0.0);
             }
         }
+        return;
+    }
+    const uint64_t row_stride =
+        (SEISMIC_PRODUCT_STRIDE_0 == SEISMIC_DIM_K * SEISMIC_PRODUCT_STRIDE_1)
+        ? SEISMIC_PRODUCT_STRIDE_1 : 1ul;
+    const projection_weights down = routed_expert_matrix(slab_experts(SEISMIC_PTR(SEISMIC_BUFFER_EXPERT_DOWN),
+        SEISMIC_PTR(SEISMIC_BUFFER_TIER_DOWN)), entry.source, PACKETS_W0_STACKED_ROWS, uint(SEISMIC_DIM_F));
+    float totals[PROJECTION_GEMV_SUMS], unused[PROJECTION_GEMV_SUMS];
+    for (uint row_base = 0u; row_base < entry.count; row_base += maxm) {
+        const uint slice_m = min(maxm, entry.count - row_base);
+        const projection_prologue x = projection_operands(projection_plain(ROUTED_ACT,
+            SEISMIC_PTR(SEISMIC_BUFFER_PRODUCT), row_stride, SEISMIC_PRODUCT_STRIDE_2,
+            uint(SEISMIC_DIM_F), entry.rows + uint64_t(row_base) * 4ul), DOWN_OPERANDS);
+        projection_gemv_sums(PACKETS_W0, PACKETS_W0, false, DOWN_R, DOWN_LANES, maxm, false, false,
+            PROJECTION_NORM_NONE, x, down, down, slice_m, hidden, uint(SEISMIC_DIM_F), tile, totals, unused);
+        for (uint i = 0u; i < maxm; ++i) {
+            if (i < slice_m) {
+                const uint packed = uint(element_i32_at(entry.outputs + uint64_t(row_base + i) * 4ul));
+                const uint64_t m = uint64_t(packed >> 16u);
+                const uint64_t k = uint64_t(packed & 0xffffu);
+                [[unroll]] for (uint r = 0u; r < PROJECTION_GEMV_MAX_R; ++r) {
+                    const uint n = first + r;
+                    if (r < DOWN_R && n < hidden && SEISMIC_LANE % DOWN_LANES == r)
+                        ROUTED_PROJECTED_PUT(m, k, uint64_t(n), totals[r * PROJECTION_GEMV_MAX_M + i]);
+                }
+            }
+        }
+        if (row_base + maxm < entry.count)
+            barrier();
     }
 }
 #endif

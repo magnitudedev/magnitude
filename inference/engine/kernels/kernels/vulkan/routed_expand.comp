@@ -92,8 +92,21 @@ void routed_expand_shared(const uint maxm) {
     const projection_weights up = routed_weights(SEISMIC_PTR(SEISMIC_BUFFER_SHARED_UP), PACKETS_W3_ROWS, 0ul, hidden);
     const projection_epilogue out_ = projection_silu_mul(ROUTED_ACT, SEISMIC_RESULT_1_OUT,
         SEISMIC_RESULT_1_STRIDE_0, SEISMIC_RESULT_1_STRIDE_1);
-    projection_gemv(PACKETS_W2, PACKETS_W3, true, SEISMIC_TUNE_ROWS, 32u, maxm, false, false,
-        PROJECTION_NORM_NONE, x, out_, gate, up, uint(SEISMIC_DIM_M), uint(SEISMIC_DIM_S), hidden, tile);
+    const uint m_rows = uint(SEISMIC_DIM_M);
+    for (uint row_base = 0u; row_base < m_rows; row_base += maxm) {
+        const uint slice_m = min(maxm, m_rows - row_base);
+        projection_prologue slice_x = x;
+        projection_epilogue slice_out = out_;
+        if (row_base != 0u) {
+            slice_x.x = stored_offset(slice_x.x, uint64_t(row_base) * slice_x.x0);
+            slice_out.y = out_offset(slice_out.y, uint64_t(row_base) * slice_out.y0);
+            slice_out.y_f32 = out_offset(slice_out.y_f32, uint64_t(row_base) * slice_out.y0);
+        }
+        projection_gemv(PACKETS_W2, PACKETS_W3, true, SEISMIC_TUNE_ROWS, 32u, maxm, false, false,
+            PROJECTION_NORM_NONE, slice_x, slice_out, gate, up, slice_m, uint(SEISMIC_DIM_S), hidden, tile);
+        if (row_base + maxm < m_rows)
+            barrier();
+    }
 }
 
 // The per-choice form with the shared expert's activation-row bound `maxm`:
@@ -147,8 +160,19 @@ void routed_expand_gathered_bounded(const uint maxm) {
             SEISMIC_RESULT_0_OUT, 0ul, SEISMIC_RESULT_0_STRIDE_2), entry.outputs),
         projection_scale_factor(SEISMIC_PTR(SEISMIC_BUFFER_GATE_SCALE), SEISMIC_DIM_GS, SEISMIC_GATE_SCALE_STRIDE_0, expert),
         projection_scale_factor(SEISMIC_PTR(SEISMIC_BUFFER_UP_SCALE), SEISMIC_DIM_US, SEISMIC_UP_SCALE_STRIDE_0, expert));
-    projection_gemv(PACKETS_W0, PACKETS_W1, true, SEISMIC_TUNE_ROWS, 32u, maxm, false, false,
-        PROJECTION_NORM_NONE, x, out_, gate, up, entry.count, uint(SEISMIC_DIM_F), hidden, tile);
+    for (uint row_base = 0u; row_base < entry.count; row_base += maxm) {
+        const uint slice_m = min(maxm, entry.count - row_base);
+        projection_prologue slice_x = x;
+        projection_epilogue slice_out = out_;
+        if (row_base != 0u) {
+            slice_x.rows += uint64_t(row_base) * 4ul;
+            slice_out.outputs += uint64_t(row_base) * 4ul;
+        }
+        projection_gemv(PACKETS_W0, PACKETS_W1, true, SEISMIC_TUNE_ROWS, 32u, maxm, false, false,
+            PROJECTION_NORM_NONE, slice_x, slice_out, gate, up, slice_m, uint(SEISMIC_DIM_F), hidden, tile);
+        if (row_base + maxm < entry.count)
+            barrier();
+    }
 }
 
 void routed_expand_gathered2() { routed_expand_gathered_bounded(2u); }

@@ -2253,7 +2253,7 @@ fn native_decode_experts_match_host_reference_at_catalog_shapes() {
     let devices = devices();
     for shape in EXPERT_SHAPES {
         let block = ExpertBlock::new(shape);
-        let cases = [1, 8].map(|rows| ExpertCase::new(&block, rows));
+        let cases = [1, 8, constants::VERIFY_ROWS as usize].map(|rows| ExpertCase::new(&block, rows));
         let (h, f, k) = (shape.hidden, shape.features, shape.selected);
         let statics = [("H", h), ("K", k), ("F", f)];
         for device in &devices {

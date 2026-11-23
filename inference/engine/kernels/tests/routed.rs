@@ -3417,7 +3417,7 @@ fn native_decode_expand_and_output_match_reference_on(device: &seismic::Device, 
         device,
         PackedBlock::new(device, Experts::Packed),
         int8,
-        &[1, 2, 3, 8],
+        &[1, 2, 3, 8, constants::VERIFY_ROWS as usize],
         decode_mappings(device),
     );
     // Every value of the Metal output's one top-level LANES, which every
