@@ -9,11 +9,11 @@
       "fingerprint": "f7ff4a61764aa3dce807609edd2ef4f2168f83fced8389e74777d7c227a352e0"
     }
   },
-  "cliVersion": "0.3.0-alpha.1",
-  "revision": 69,
+  "cliVersion": "0.3.0-alpha.2",
+  "revision": 70,
   "rpc": {
-    "version": 17,
-    "fingerprint": "f1178d0fe7d2d9e788e8d4575492b356caae517f0dfbec27705cba00d7bd3455"
+    "version": 18,
+    "fingerprint": "f7ac68061ae40fcea8cc6ca91df2aec43b41f2339a9b7d39cd39ad2ba972dd6b"
   },
   "semanticBreaks": [],
   "plugins": []
