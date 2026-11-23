@@ -915,18 +915,9 @@ impl<'m> Subject<'m> {
         let Some(declaration) = module.native_implementation(info.id, backend) else {
             return Ok(None);
         };
-        // Coverage forms whole programs offline, on no device: a
-        // declaration whose admission constraint reads the device cannot be
-        // evaluated here. A parameter default that reads the device only
-        // picks which admissible configuration runs by default, so coverage
-        // falls back to the first admissible configuration (`base_specialization`).
-        if declaration.constraint.as_ref().is_some_and(|constraint| {
-            let mut reads = Vec::new();
-            constraint.device_reads(&mut reads);
-            !reads.is_empty()
-        }) {
-            return Err(CoverageError::DeviceDependent(info.name.clone()));
-        }
+        // Coverage forms whole programs offline against the backend's
+        // conservative floor (`BackendFloor`), so declarations whose
+        // constraints or defaults read device properties evaluate against it.
         let asset = module
             .native_asset(info.id, backend)
             .expect("a checked module captures every native asset");
@@ -1139,18 +1130,16 @@ impl<'m> Subject<'m> {
         let implementation = self.implementation(&row.bindings);
         Ok(match dialect {
             Dialect::Vulkan(_) => {
-                let formed = super::formed_launches(
-                    &implementation
-                        .at_device(&seismic_lang::device::BackendFloor(implementation.backend)),
-                    &row.specialization,
-                );
-                let entries = super::vulkan_entries(&self.info.name, implementation, &row.specialization, &formed)?;
+                let bound = implementation
+                    .at_device(&seismic_lang::device::BackendFloor(implementation.backend));
+                let formed = super::formed_launches(&bound, &row.specialization);
+                let entries = super::vulkan_entries(&self.info.name, &bound, &row.specialization, &formed)?;
                 vec![ProgramSource {
                     text: render_source(
                         dialect,
                         &logical,
                         &row.bindings,
-                        implementation,
+                        &bound,
                         &row.specialization,
                         self.asset,
                     ),
@@ -2602,24 +2591,39 @@ fn form_request(
         &request.statics,
     )
     .map_err(|error| RequestFailure::Inadmissible(error.to_string()))?;
-    let row = Row {
-        bindings: request.bindings.clone(),
-        specialization,
-        configuration: forms.former.base(),
+    let configurations: Vec<Configuration> = match forms.former.base() {
+        Configuration::Vulkan(facts) => [false, true]
+            .into_iter()
+            .map(|maximal_reconvergence| {
+                Configuration::Vulkan(seismic_vulkan::FormationTarget {
+                    maximal_reconvergence,
+                    ..facts
+                })
+            })
+            .collect(),
+        base => vec![base],
     };
-    let reached = evaluate(&subject, std::slice::from_ref(&row))
-        .map_err(|error| RequestFailure::Formation(error.to_string()))?
-        .reached
-        .pop()
-        .expect("one row evaluated");
-    if reached.is_none() {
-        return Err(RequestFailure::Unimplemented);
+    for configuration in configurations {
+        let row = Row {
+            bindings: request.bindings.clone(),
+            specialization: specialization.clone(),
+            configuration,
+        };
+        let reached = evaluate(&subject, std::slice::from_ref(&row))
+            .map_err(|error| RequestFailure::Formation(error.to_string()))?
+            .reached
+            .pop()
+            .expect("one row evaluated");
+        if reached.is_none() {
+            return Err(RequestFailure::Unimplemented);
+        }
+        match form_row(&subject, forms, &row) {
+            RowOutcome::Formed(_) | RowOutcome::Unformable => {}
+            RowOutcome::Rejected => return Err(RequestFailure::Unimplemented),
+            RowOutcome::Failed(error) => return Err(RequestFailure::Formation(error)),
+        }
     }
-    match form_row(&subject, forms, &row) {
-        RowOutcome::Formed(_) | RowOutcome::Unformable => Ok(()),
-        RowOutcome::Rejected => Err(RequestFailure::Unimplemented),
-        RowOutcome::Failed(error) => Err(RequestFailure::Formation(error)),
-    }
+    Ok(())
 }
 
 #[cfg(test)]

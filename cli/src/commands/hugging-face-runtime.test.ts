@@ -1,10 +1,10 @@
 import { Effect, Option } from "effect"
 import { describe, expect, it, vi } from "vitest"
-import { CatalogFormModelIdSchema } from "@magnitudedev/sdk"
-import { acquisitionHint, parseCatalogComponent, pull, pullComponent, pullJson, renderInspection, renderPull, type PullResult } from "./hugging-face-runtime"
+import { CatalogFormModelIdSchema, ModelSourceUnavailable } from "@magnitudedev/sdk"
+import { acquisitionHint, parseCatalogComponent, pull, pullComponent, pullJson, readSearch, renderInspection, renderPull, type PullResult } from "./hugging-face-runtime"
 import type { CliModelsClient } from "./inference-client"
 import { parseDrafterArgument, parsePullReference } from "./model-references"
-import { fitsAssessment, makeInspection, TEST_REPOSITORY } from "./fixtures/inference"
+import { fitsAssessment, makeHardware, makeInspection, TEST_REPOSITORY } from "./fixtures/inference"
 
 const catalogModel = CatalogFormModelIdSchema.make("qwen-test:gguf:q4")
 const [tooLarge, onDisk, recommended, unsupported] = makeInspection().versions
@@ -126,5 +126,23 @@ describe("downloading one catalog component", () => {
   it("accepts only projector or drafter", () => {
     expect(Effect.runSync(parseCatalogComponent("Drafter"))).toBe("Drafter")
     expect(Effect.runSync(Effect.flip(parseCatalogComponent("weights"))).message).toBe("--only takes projector or drafter, not weights.")
+  })
+})
+
+describe("offline Hugging Face search error", () => {
+  it("normalizes raw upstream search failures to a clean user-facing message", async () => {
+    const client = {
+      models: {
+        searchHuggingFaceModels: () => Effect.fail(new ModelSourceUnavailable({
+          reason: "SourceUnreachable",
+          message: "reqwest::Error { kind: Request, source: failed to lookup address information }",
+          retryable: true,
+        })),
+        getLocalEnvironment: () => Effect.succeed({ hardware: makeHardware() }),
+      },
+    } as unknown as CliModelsClient
+    const error = await Effect.runPromise(Effect.flip(readSearch(client, "qwen", Option.none(), Option.none())))
+    expect(error).toBeInstanceOf(ModelSourceUnavailable)
+    expect((error as ModelSourceUnavailable).message).toBe("Hugging Face search failed. Check your connection and try again.")
   })
 })

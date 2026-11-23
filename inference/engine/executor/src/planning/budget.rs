@@ -223,14 +223,33 @@ impl MemoryBudget {
                     PlanError::ResourcePlanning("executor has no device storage path".into())
                 })?
         };
+        let wired_reserve = if unified_host && executor.backend() == seismic::BackendName::Metal {
+            crate::memory::supply::Ceiling::execution_reserve_for(device_placement.stable_bytes)
+        } else {
+            0
+        };
+        let device_capacity = device_placement.stable_bytes.saturating_sub(wired_reserve);
         let device_available = match mode {
-            FitMode::Stable => device_placement.stable_bytes,
-            FitMode::Live => device_placement.ceiling_bytes,
+            FitMode::Stable => device_capacity,
+            FitMode::Live => {
+                let mut live = device_placement.ceiling_bytes.min(device_capacity);
+                if unified_host && executor.backend() == seismic::BackendName::Metal {
+                    if let Some(wired) = status.sample.host.wired {
+                        let limit = match wired.limit {
+                            seismic::WiredLimit::OsDefault => device_placement.stable_bytes,
+                            seismic::WiredLimit::Set(bytes) => bytes.min(device_placement.stable_bytes),
+                        };
+                        let reserve = crate::memory::supply::Ceiling::execution_reserve_for(limit);
+                        live = live.min(limit.saturating_sub(wired.wire_count).saturating_sub(reserve));
+                    }
+                }
+                live
+            }
         };
         let device = StoreBudget {
             store: Some(device_store),
             role: DomainRole::Allocation,
-            capacity: device_placement.stable_bytes,
+            capacity: device_capacity,
             available: device_available,
         };
         let host = if unified_host {

@@ -57,6 +57,17 @@ describe("installation script generation", () => {
     expect(script).toContain("$publisher = 'Publisher''s Name'")
     expect(script).not.toMatch(/@MAGNITUDE_[A-Z_]+@/)
   })
+  it("supports opt-in -Channel alpha and uses System32\\tar.exe in install.ps1", async () => {
+    const script = await Effect.runPromise(renderWindowsInstallationScript({ origin: "https://magnitude.dev", publisher: "Magnitude" }).pipe(Effect.provide(NodeContext.layer)))
+    expect(script).toContain("[ValidateSet('stable', 'alpha')]")
+    expect(script).toContain("[string]$Channel = $(if ($env:MAGNITUDE_CHANNEL) { $env:MAGNITUDE_CHANNEL } else { 'stable' })")
+    expect(script).toContain("Assert-ReleaseChannel $version")
+    expect(script).toContain("package=cli-only$channelQuery&offer=1")
+    expect(script).toContain("package=windows-exe$channelQuery&offer=1")
+    // Never invoke bare 'tar.exe', which may resolve to Git Bash/MSYS tar on PATH.
+    expect(script).not.toMatch(/Invoke-InstallerProcess\s+'tar\.exe'/)
+    expect(script.match(/Join-Path \$env:SystemRoot 'System32\\tar\.exe'/g)).toHaveLength(2)
+  })
   it("pins publisher configuration and emits valid shell syntax", async () => {
     const script = await Effect.runPromise(render())
     expect(script).not.toContain("@MAGNITUDE_")

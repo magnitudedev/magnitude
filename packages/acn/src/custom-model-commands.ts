@@ -236,6 +236,9 @@ export const noGgufFilesMessage = "This repository has no GGUF files Magnitude c
 export const unreadableFileMessage = "Magnitude couldn't read this file. It may be incomplete, damaged, "
   + "or use a format Magnitude doesn't support yet."
 
+/** The product message when Hugging Face search fails due to a network or upstream error. */
+export const huggingFaceSearchFailedMessage = "Hugging Face search failed. Check your connection and try again."
+
 /** The ICN error type: a failure reported after an inspection stream began has no status of its own. */
 const remoteType = (cause: GeneratedClientError<unknown>): string | undefined => {
   if (cause._tag !== "GeneratedClientRemoteError") return undefined
@@ -798,7 +801,17 @@ export const CustomModelCommandsLive: Layer.Layer<
       limit: Option.getOrElse(limit, () => 20),
       cursor,
     }).pipe(
-      Effect.catchAll(candidateFailed(query)),
+      Effect.catchAll((cause) => candidateFailed(query)(cause).pipe(
+        Effect.catchTag("ModelSourceUnavailable", (error) => Effect.fail(
+          error.reason === "ServiceUnreachable"
+            ? error
+            : new ModelSourceUnavailable({
+                reason: error.reason,
+                message: huggingFaceSearchFailedMessage,
+                retryable: error.retryable,
+              }),
+        )),
+      )),
       Effect.map(({ results, nextCursor }) => ({
         nextCursor,
         results: results.flatMap((result) => {

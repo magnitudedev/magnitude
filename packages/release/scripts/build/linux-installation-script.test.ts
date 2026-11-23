@@ -19,7 +19,7 @@ const managers = [
 ] as const
 
 describe.skipIf(process.platform !== "linux").each(managers)("Linux installation shell verification with $manager", ({ manager, package: format, receipt: expected }) => {
-  it.each(["valid", "signature", "digest", "architecture", "channel"])("admits the package manager only for %s input", async scenario => {
+  it.each(["valid", "valid-alpha", "signature", "digest", "architecture", "channel"])("admits the package manager only for %s input", async scenario => {
     if (format === "pacman" && process.arch !== "x64") return
     const root = mkdtempSync(join(tmpdir(), "magnitude shell ' "))
     try {
@@ -42,7 +42,7 @@ describe.skipIf(process.platform !== "linux").each(managers)("Linux installation
       const packagePath = join(root, "package.deb"), offerPath = join(root, "offer.json"), receipt = join(root, "receipt")
       writeFileSync(packagePath, scenario === "digest" ? Buffer.from("modified package fixture") : bytes)
       const arch = process.arch === "arm64" ? "arm64" : "x64"
-      const release = await Effect.runPromise(signUpdateRelease({ version: scenario === "channel" ? "0.1.6-beta.1" : "0.1.6",
+      const release = await Effect.runPromise(signUpdateRelease({ version: scenario === "channel" ? "0.1.6-beta.1" : scenario === "valid-alpha" ? "0.1.6-alpha.1" : "0.1.6",
         bytes: bytes.length, sha256: createHash("sha256").update(bytes).digest("hex") },
       { os: "linux", arch: scenario === "architecture" ? (arch === "arm64" ? "x64" : "arm64") : arch, package: format }, keys.privateKey))
       writeFileSync(offerPath, JSON.stringify({ release: scenario === "signature" ? { ...release, signature: "A".repeat(86) + "==" } : release,
@@ -51,9 +51,10 @@ describe.skipIf(process.platform !== "linux").each(managers)("Linux installation
         publicKey: keys.publicKey.export({ type: "spki", format: "pem" }).toString() }).pipe(Effect.provide(NodeContext.layer)))
       const isolated = script.replace("server_marker=/etc/magnitude/server", `server_marker="${join(root, "server")}"`)
       // setsid: no controlling terminal, as when an agent runs the installer.
-      const result = spawnSync(setsid, ["-w", "/bin/sh", "-s", "--", "--desktop"], { input: isolated, encoding: "utf8", timeout: 15000,
+      const args = scenario === "valid-alpha" ? ["--desktop", "--channel", "alpha"] : ["--desktop"]
+      const result = spawnSync(setsid, ["-w", "/bin/sh", "-s", "--", ...args], { input: isolated, encoding: "utf8", timeout: 15000,
         env: { ...process.env, PATH: `${bin}:${tools}`, HOME: root, TEST_OFFER: offerPath, TEST_PACKAGE: packagePath, TEST_APT_RECEIPT: receipt } })
-      if (scenario === "valid") {
+      if (scenario === "valid" || scenario === "valid-alpha") {
         expect(result.status, result.stderr).toBe(0)
         expect(readFileSync(receipt, "utf8")).toMatch(expected)
       } else {

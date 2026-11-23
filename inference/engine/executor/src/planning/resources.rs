@@ -1691,12 +1691,31 @@ impl ResourcePlanner {
         // bank and history row is committed on demand under a heap claim. A
         // live request holds its accepted bank and, in flight, a successor
         // (two with lookahead); a branch checkpoint or retention entry holds
-        // one more. Retention is bounded by what the domain could back.
+        // one more. Retention is bounded by what the domain could back:
+        // - With recurrent state, each retained entry holds one recurrent bank.
+        // - Without recurrent state (pure attention), entries share KV rows on
+        //   the same path and only hold the rows up to their position (bounded
+        //   at runtime by `workload_state_bytes` and `CacheKind::Prefix`
+        //   eviction), so dividing by `full_context_kv` would truncate to 0
+        //   when admitted under tight live RAM and silently disable prefix
+        //   caching. Size the entry bound from the minimum prefix hit (64 rows
+        //   plus window rows) and always admit at least `CONVERSATION_CHECKPOINTS`.
         let retention_entries = if retained_entry_bytes == 0 {
             0
-        } else {
-            usize::try_from(capacity_bytes.domain_bytes / retained_entry_bytes)
+        } else if recurrent_bank_bytes != 0 {
+            usize::try_from(capacity_bytes.domain_bytes / recurrent_bank_bytes)
                 .unwrap_or(usize::MAX)
+                .max(1)
+        } else {
+            let min_prefix_rows = context_limit.clamp(1, 64);
+            let min_prefix_bytes = checkpoint_history_row_bytes
+                .checked_mul(min_prefix_rows)
+                .and_then(|bytes| bytes.checked_add(checkpoint_window_bytes))
+                .ok_or("minimum prefix state byte count overflow")?
+                .max(1);
+            usize::try_from(capacity_bytes.domain_bytes / min_prefix_bytes)
+                .unwrap_or(usize::MAX)
+                .max(assessment::CONVERSATION_CHECKPOINTS)
         };
         let history_bound =
             usize::try_from(capacity_bytes.domain_bytes / checkpoint_history_row_bytes.max(1))
@@ -2788,6 +2807,90 @@ mod slab_plan_tests {
             "expected >100 MB CUDA graph reserve, got {}",
             demand.device
         );
+    }
+
+    #[test]
+    fn pure_attention_retention_entries_never_truncates_to_zero_under_tight_domain() {
+        let domain = HistoryDomainLayout::Token {
+            components: (0..32)
+                .map(|layer| {
+                    ComponentDescriptor::new(
+                        LayerRef::Target(layer),
+                        KvCodec::Dense.spec(DType::BF16, 8, 128),
+                        1,
+                    )
+                    .unwrap()
+                })
+                .collect(),
+        };
+        let row_bytes = domain.row_bytes().unwrap();
+        assert!(row_bytes > 0);
+
+        // Full 131,072-token context KV exceeds live domain (tight_domain = full / 4).
+        let context_limit = 131_072u64;
+        let full_context_kv = row_bytes * context_limit;
+        let tight_domain = full_context_kv / 4;
+        assert!(tight_domain < full_context_kv);
+
+        let planned = ResourcePlanner::plan_state_from_layout(
+            vec![domain.clone()],
+            Vec::new(),
+            Vec::new(),
+            context_limit,
+            PlannedMethod::Plain,
+            crate::planning::fixtures::LIMITS,
+            ResourceCapacity {
+                domain_bytes: tight_domain,
+                tensor_operations: TensorOperations::Absent,
+                allocations: seismic::NativeAllocations::EXACT,
+            },
+            None,
+        )
+        .unwrap();
+        assert_eq!(planned.retained_entry_bytes, full_context_kv);
+        assert_eq!(planned.recurrent_banks_bytes, 0);
+        assert_eq!(
+            planned.capacity.retention_entries,
+            usize::try_from(tight_domain / (64 * row_bytes)).unwrap(),
+            "pure-attention prefix retention must size against minimum prefix hit, not full_context_kv"
+        );
+        assert!(planned.capacity.retention_entries >= assessment::CONVERSATION_CHECKPOINTS);
+
+        // Even an extremely tight domain below 64 rows still admits CONVERSATION_CHECKPOINTS.
+        let tiny = ResourcePlanner::plan_state_from_layout(
+            vec![domain],
+            Vec::new(),
+            Vec::new(),
+            context_limit,
+            PlannedMethod::Plain,
+            crate::planning::fixtures::LIMITS,
+            ResourceCapacity {
+                domain_bytes: row_bytes,
+                tensor_operations: TensorOperations::Absent,
+                allocations: seismic::NativeAllocations::EXACT,
+            },
+            None,
+        )
+        .unwrap();
+        assert_eq!(tiny.capacity.retention_entries, assessment::CONVERSATION_CHECKPOINTS);
+
+        // A model with no history and no recurrent state keeps 0 retention entries.
+        let empty = ResourcePlanner::plan_state_from_layout(
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            1024,
+            PlannedMethod::Plain,
+            crate::planning::fixtures::LIMITS,
+            ResourceCapacity {
+                domain_bytes: tight_domain,
+                tensor_operations: TensorOperations::Absent,
+                allocations: seismic::NativeAllocations::EXACT,
+            },
+            None,
+        )
+        .unwrap();
+        assert_eq!(empty.capacity.retention_entries, 0);
     }
 }
 

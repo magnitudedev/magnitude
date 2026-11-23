@@ -101,13 +101,19 @@ const program = Effect.scoped(Effect.gen(function* () {
   if (owner._tag === "Forwarded") { exiting = true; app.quit(); return }
   if (yield* isUpdateInstallationActive(stateDir)) return "Quit" as const
   if (app.isPackaged && !isolatedProfile) yield* absorbStandaloneInstallation({ home: homedir(), platform: process.platform }).pipe(Effect.provide(NodeContext.layer))
+  let macInstallationReadOnly = false
   if (process.platform === "darwin" && app.isPackaged) {
+    const bundle = dirname(dirname(dirname(process.execPath)))
     startupUpdateDeferred = yield* Effect.gen(function* () {
       const installation = yield* MacApplicationInstallation
-      return yield* installation.isInstalling(dirname(dirname(dirname(process.execPath))))
+      return yield* installation.isInstalling(bundle)
     }).pipe(Effect.provide(NativeMacApplicationInstallation))
-    yield* acquireMacApplicationInstallationLease(dirname(dirname(dirname(process.execPath)))).pipe(
+    const leaseStatus = yield* acquireMacApplicationInstallationLease(bundle).pipe(
       Effect.provide(nativeMacUpdateAdmission(addonPath)))
+    macInstallationReadOnly = leaseStatus === "ReadOnly"
+    if (macInstallationReadOnly) {
+      yield* Effect.logWarning("Running Magnitude from an installation owned by another user; in-place updates are disabled.")
+    }
   }
   const preferenceWrites = yield* Effect.makeSemaphore(1)
   const appearance = yield* makeAppearancePreferences(dataDir).pipe(Effect.provide(NodeContext.layer))
@@ -138,6 +144,7 @@ const program = Effect.scoped(Effect.gen(function* () {
   const updates = Option.isNone(updateConfiguration) ? unavailableApplicationUpdate("SetupFailed", "Application update configuration is invalid.")
     : isolatedProfile && !updateConfiguration.value.acceptance ? unavailableApplicationUpdate("NotInThisBuild", "Application updates are available in the installed Magnitude app.")
     : !app.isPackaged ? unavailableApplicationUpdate("NotInThisBuild", "Application update recovery is unavailable in this build.")
+    : macInstallationReadOnly ? unavailableApplicationUpdate("NotInThisBuild", "Application updates must be installed by the user who owns this Magnitude installation.")
     : yield* Effect.gen(function* () {
       const privateFiles = (process.platform === "win32" ? windowsPrivateFilePermissions(addonPath) : unixPrivateFilePermissions).pipe(Layer.provideMerge(NodeContext.layer))
       if (process.platform === "win32") {

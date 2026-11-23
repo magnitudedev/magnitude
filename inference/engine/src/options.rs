@@ -267,6 +267,30 @@ impl ResolvedMethod {
         }
     }
 
+    /// Cap this resolved method's proposal counts to at most `max_proposals`,
+    /// matching what the loaded executor domain actually prepared (e.g. after
+    /// a tight-memory `decode_rows` step-down from 16 to 8).
+    pub fn capped_to(self, max_proposals: u8) -> Self {
+        if max_proposals == 0 {
+            return Self::Plain;
+        }
+        match self {
+            Self::Plain => Self::Plain,
+            Self::Mtp {
+                greedy_proposals,
+                sampled_proposals,
+                history,
+            } => Self::Mtp {
+                greedy_proposals: greedy_proposals.min(max_proposals),
+                sampled_proposals: sampled_proposals.min(max_proposals),
+                history,
+            },
+            Self::DFlash { proposals } => Self::DFlash {
+                proposals: proposals.min(max_proposals),
+            },
+        }
+    }
+
     /// The definition a load of this method executes: it carries at most
     /// the drafter the method runs (a plain load keeps its draft head, which
     /// it never selects).
@@ -353,6 +377,34 @@ impl ResolvedModelPolicy {
                 }))
             }
             _ => self.method.factory(artifact_identity),
+        }
+    }
+
+    /// Align this resolved policy with the drafting width actually prepared by
+    /// the loaded executor domain (`ExecutorDomain::execution_method`), so
+    /// generation never proposes a block width the loaded graphs did not seal.
+    pub fn capped_to_execution_method(
+        &self,
+        prepared: magnitude_executor::PlannedMethod,
+    ) -> Self {
+        let cap_usize = prepared.draft_rows().min(usize::from(u8::MAX));
+        let cap = cap_usize as u8;
+        let method = self.method.capped_to(cap);
+        let draft_policy = self.draft_policy.map(|policy| match policy {
+            DraftPolicy::Adaptive => DraftPolicy::Adaptive,
+            DraftPolicy::Fixed(budget) => {
+                let generated = budget.generated.min(cap_usize);
+                let verified = budget.verified.min(generated);
+                DraftPolicy::Fixed(DraftBudget {
+                    generated,
+                    verified: if generated == 0 { 0 } else { verified.max(1) },
+                })
+            }
+        });
+        Self {
+            method,
+            draft_policy,
+            ..self.clone()
         }
     }
 }
@@ -1257,5 +1309,61 @@ pub(crate) mod tests {
             ReleaseRate::of_machine(None),
         )
         .unwrap()
+    }
+
+    #[test]
+    fn capped_to_execution_method_aligns_dflash_mtp_and_plain() {
+        use magnitude_executor::{DraftWidths, PlannedMethod};
+        let base = ResolvedModelPolicy {
+            draft_policy: Some(DraftPolicy::Fixed(DraftBudget {
+                generated: 15,
+                verified: 15,
+            })),
+            method: ResolvedMethod::DFlash { proposals: 15 },
+            kv_codec: KvCodec::Dense,
+            lookahead: false,
+            exported_logits_rows: 1,
+            numerical_profile: None,
+            weight_bound: None,
+            record_routes: false,
+        };
+        let stepped = base.capped_to_execution_method(PlannedMethod::DFlash {
+            proposals: 7,
+            widths: DraftWidths::Adaptive,
+        });
+        assert_eq!(stepped.method, ResolvedMethod::DFlash { proposals: 7 });
+        assert_eq!(
+            stepped.draft_policy,
+            Some(DraftPolicy::Fixed(DraftBudget {
+                generated: 7,
+                verified: 7,
+            }))
+        );
+        assert!(stepped.factory("test-artifact", false).is_ok());
+
+        let mtp_fronting = ResolvedModelPolicy {
+            draft_policy: Some(DraftPolicy::Fixed(DraftBudget {
+                generated: 0,
+                verified: 0,
+            })),
+            method: ResolvedMethod::Mtp {
+                greedy_proposals: 1,
+                sampled_proposals: 1,
+                history: HeadHistory::Own,
+            },
+            ..base.clone()
+        };
+        let kept = mtp_fronting.capped_to_execution_method(PlannedMethod::Mtp {
+            greedy_proposals: 1,
+            sampled_proposals: 1,
+            widths: DraftWidths::Fixed(0),
+        });
+        assert_eq!(kept.method, mtp_fronting.method);
+        assert_eq!(kept.draft_policy, mtp_fronting.draft_policy);
+        assert!(kept.factory("test-artifact", true).is_ok());
+
+        let plain = base.capped_to_execution_method(PlannedMethod::Plain);
+        assert_eq!(plain.method, ResolvedMethod::Plain);
+        assert!(plain.factory("test-artifact", false).is_ok());
     }
 }

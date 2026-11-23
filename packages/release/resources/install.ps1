@@ -2,9 +2,12 @@
 # & ([scriptblock]::Create((irm https://magnitude.dev/install.ps1))) -Desktop - installs the desktop app, which includes the CLI.
 # CmdletBinding refuses unknown parameters, so a mistyped -Desktop never silently installs the CLI only.
 [CmdletBinding()]
-param([switch]$Desktop)
+param(
+  [switch]$Desktop,
+  [ValidateSet('stable', 'alpha')]
+  [string]$Channel = $(if ($env:MAGNITUDE_CHANNEL) { $env:MAGNITUDE_CHANNEL } else { 'stable' })
+)
 $ErrorActionPreference = 'Stop'
-$Channel = 'stable'
 $origin = '@MAGNITUDE_INSTALL_ORIGIN@'
 $publisher = '@MAGNITUDE_WINDOWS_PUBLISHER@'
 if ($env:OS -ne 'Windows_NT' -or -not [Environment]::Is64BitOperatingSystem) { throw 'This installer requires 64-bit Windows.' }
@@ -282,6 +285,15 @@ function Assert-CliFiles([string]$Directory) {
     if (-not (Test-Path -LiteralPath (Join-Path $Directory $name) -PathType Leaf)) { throw "The CLI download is missing $name." }
   }
 }
+function Assert-ReleaseChannel([string]$Version) {
+  $withoutMeta = $Version.Split('+')[0]
+  if ($Channel -eq 'stable' -and $withoutMeta -like '*-*') {
+    throw 'Application release verification failed: Release does not match the selected channel.'
+  }
+  if ($Channel -eq 'alpha' -and $withoutMeta -like '*-*' -and $withoutMeta -notmatch '-alpha(?:\.|$)') {
+    throw 'Application release verification failed: Release does not match the selected channel.'
+  }
+}
 function Install-MagnitudeCli {
   if (Test-Path -LiteralPath $desktopExecutable -PathType Leaf) {
     Write-Output 'The Magnitude desktop app is installed and already includes the magnitude command. Nothing was changed.'
@@ -292,10 +304,12 @@ function Install-MagnitudeCli {
   [Console]::Error.WriteLine("`nInstalling the Magnitude CLI`nWindows $([char]0xb7) x64`n")
   $offerPath = Join-Path $scratch 'offer.json'
   # The landing server counts each request and answers with the publisher-signed offer.
-  Get-InstallerFile "$origin/api/installer?os=windows&arch=x64&package=cli-only&offer=1" $offerPath 16384 'Checking latest release' 'Checked latest release'
+  $channelQuery = if ($Channel -eq 'stable') { '' } else { "&channel=$Channel" }
+  Get-InstallerFile "$origin/api/installer?os=windows&arch=x64&package=cli-only$channelQuery&offer=1" $offerPath 16384 'Checking latest release' 'Checked latest release'
   $offer = Get-Content -LiteralPath $offerPath -Raw | ConvertFrom-Json
   $version = [string]$offer.release.version
   if ($version.Length -gt 96 -or $version -notmatch '^[0-9]+\.[0-9]+\.[0-9]+(?:-[A-Za-z0-9.-]+)?(?:\+[A-Za-z0-9.-]+)?$') { throw 'Invalid application version.' }
+  Assert-ReleaseChannel $version
   $download = [string]$offer.download
   if ($download -notmatch '^https://github\.com/magnitudedev/magnitude/releases/download/[^\s?#]+$') { throw 'Unexpected CLI download location.' }
   $bytes = [long]$offer.release.bytes
@@ -365,10 +379,12 @@ function Install-MagnitudeDesktop {
   $offerPath = Join-Path $scratch 'offer.json'
   # The landing server counts each request and answers with the publisher-signed offer.
   [Console]::Error.WriteLine("`nInstalling Magnitude`nWindows $([char]0xb7) x64`n")
-  Get-InstallerFile "$origin/api/installer?os=windows&arch=x64&package=windows-exe&offer=1" $offerPath 16384 'Checking latest release' 'Checked latest release'
+  $channelQuery = if ($Channel -eq 'stable') { '' } else { "&channel=$Channel" }
+  Get-InstallerFile "$origin/api/installer?os=windows&arch=x64&package=windows-exe$channelQuery&offer=1" $offerPath 16384 'Checking latest release' 'Checked latest release'
   $offer = Get-Content -LiteralPath $offerPath -Raw | ConvertFrom-Json
   $version = [string]$offer.release.version
   if ($version.Length -gt 96 -or $version -notmatch '^[0-9]+\.[0-9]+\.[0-9]+(?:-[A-Za-z0-9.-]+)?(?:\+[A-Za-z0-9.-]+)?$') { throw 'Invalid application version.' }
+  Assert-ReleaseChannel $version
   [Console]::Error.WriteLine("Magnitude $version")
   $download = [string]$offer.download
   if ($download -notmatch '^https://github\.com/magnitudedev/magnitude/releases/download/[^\s?#]+$') { throw 'Unexpected installer download location.' }
@@ -376,7 +392,7 @@ function Install-MagnitudeDesktop {
   $tag = [Uri]::EscapeDataString('@magnitudedev') + '/' + [Uri]::EscapeDataString('cli@' + $version)
   Get-InstallerFile "https://github.com/magnitudedev/magnitude/releases/download/$tag/magnitude-cli-windows-x64-msvc.tar.gz" $archive 268435456 'Downloading installer helper' 'Downloaded installer helper'
   # Extract only the expected command, then authenticate it before executing any bootstrap code.
-  Invoke-InstallerProcess 'tar.exe' @('-xf', $archive, '-C', $scratch, 'bin/magnitude-cli.exe') 'Extracting installer helper' 'Extracted installer helper'
+  Invoke-InstallerProcess (Join-Path $env:SystemRoot 'System32\tar.exe') @('-xf', $archive, '-C', $scratch, 'bin/magnitude-cli.exe') 'Extracting installer helper' 'Extracted installer helper'
   $verifier = Join-Path $scratch 'bin\magnitude-cli.exe'
   Start-InstallerProgress 'Verifying helper signature'
   Assert-Publisher $verifier

@@ -9,20 +9,6 @@ use super::changes::Sampled;
 use super::state::{FoldedReading, State};
 use super::vocabulary::CacheKind;
 
-/// Minimum working-set execution headroom reserved below a wired GPU ceiling
-/// (`HostGrant::Wired`, e.g. Metal's `recommendedMaxWorkingSetSize`) when
-/// sizing elastic bank holdings (`import_room`, `hold_room`, `target`).
-/// Metal fails `MTLCommandBuffer` commits with `OutOfMemory` (`device_lost`)
-/// when `currentAllocatedSize` plus `others_wired` jitter, transient command
-/// buffers, residency-set commits, and incoming KV/scratch allocations crosses
-/// `recommendedMaxWorkingSetSize`. Elastic banks preserve
-/// `max(block_unit, WIRED_BANK_HEADROOM_MIN, ceiling.limit >> WIRED_BANK_HEADROOM_SHIFT)`
-/// (at least 256 MiB and 3.125% of the wired ceiling, e.g. ~341 MiB on 16 GiB
-/// M1, ~799 MiB on 32 GiB M2 Pro, ~1.125 GiB on 48 GiB M4 Pro) below `grant`,
-/// while `budget()` stays exact for committed claims.
-const WIRED_BANK_HEADROOM_MIN: u64 = 256 * (1 << 20);
-const WIRED_BANK_HEADROOM_SHIFT: u32 = 5;
-
 /// A reading as the ledger estimated it (§4.1-4.3): every figure of one
 /// sample's instant, the process's own as the sample shows it.
 #[derive(Clone, Copy, Debug)]
@@ -67,8 +53,12 @@ pub(super) struct Read {
     others: u64,
     /// Others' rise since the reading before.
     rise: u64,
+    /// Others' wired rise since the reading before; applied only to growth
+    /// targets (`import_room` / `target`), never baked into `grant` or
+    /// `hold_room`, so single-sample wired jitter does not trigger shrink thrash.
+    wired_rise: u64,
     /// The wired ceiling's grant: the limit less others' wired bytes and
-    /// their rise; none where no ceiling bounds the store.
+    /// `Ceiling::execution_reserve()`; none where no ceiling bounds the store.
     pub(super) grant: Option<u64>,
     /// The system's wired ceiling and wire count at the reading, as the
     /// sample gave them; none where no ceiling bounds the store.
@@ -339,21 +329,16 @@ impl Estimate {
         self.read.cache_reserve
     }
 
-    /// Effective budget ceiling for elastic bank holdings (`import_room`,
-    /// `hold_room`, `target`): subtracts any discrete `cache_reserve`, and on a
-    /// wired GPU ceiling (`HostGrant::Wired`), preserves
-    /// `max(block_unit, WIRED_BANK_HEADROOM_MIN, ceiling.limit >> 5)` below
-    /// `grant` so elastic bank growth never pins `MTLDevice.currentAllocatedSize`
-    /// against `recommendedMaxWorkingSetSize` and starves Metal command buffers
-    /// or incoming KV/scratch allocations.
+    /// Effective budget ceiling for elastic bank holdings (`hold_room`):
+    /// subtracts any discrete `cache_reserve`, and on a wired GPU ceiling
+    /// (`HostGrant::Wired`), keeps a dedicated `block_unit` cushion below
+    /// `grant` (which already excludes `Ceiling::execution_reserve()`) so
+    /// minor KV/scratch growth does not immediately force synchronous bank
+    /// reclaim on every turn.
     fn bank_budget(&self) -> u64 {
         let budget = self.budget().saturating_sub(self.read.cache_reserve);
         match (self.read.ceiling, self.read.grant) {
-            (Some(ceiling), Some(grant)) => {
-                let proportional = ceiling.limit >> WIRED_BANK_HEADROOM_SHIFT;
-                let headroom = self.read.unit.max(WIRED_BANK_HEADROOM_MIN).max(proportional);
-                budget.min(grant.saturating_sub(headroom))
-            }
+            (Some(_), Some(grant)) => budget.min(grant.saturating_sub(self.read.unit)),
             _ => budget,
         }
     }
@@ -361,10 +346,24 @@ impl Estimate {
     /// The room the store leaves the bank and its records pool's spare
     /// granules before growth's harm/step gate (`Self::target`): `bank_budget`
     /// less committed memory, other caches, unreleased shed cache, and the
-    /// guarantee, bounded by `cap`. Load import sizes what the store's room
-    /// holds at open (`experts::derived::import_target`).
+    /// growth rise (`read.rise` against host supply and `read.wired_rise`
+    /// against a wired GPU ceiling's grant), bounded by `cap`. Load import
+    /// sizes what the store's room holds at open (`experts::derived::import_target`).
     pub fn import_room(&self) -> u64 {
-        self.room_in(self.bank_budget(), self.guarantee())
+        match (self.read.ceiling, self.read.grant) {
+            (Some(_), Some(grant)) => {
+                let supply_room = u64::try_from((i128::from(self.read.in_use()) + i128::from(self.read.supply)).max(0))
+                    .expect("a store's bytes fit u64");
+                let supply_budget = supply_room
+                    .saturating_sub(self.read.cache_reserve)
+                    .saturating_sub(self.guarantee());
+                let wired_budget = grant
+                    .saturating_sub(self.read.unit)
+                    .saturating_sub(self.read.wired_rise);
+                self.room_in(supply_budget.min(wired_budget), 0)
+            }
+            _ => self.room_in(self.bank_budget(), self.guarantee()),
+        }
     }
 
     /// The room the store leaves the bank and its records pool's spare
@@ -669,18 +668,19 @@ impl State {
         };
         let mut wired_others = prev.and_then(|before| before.wired_others);
         let mut unwired = 0;
+        let mut wired_rise = 0;
         let grant = match reading.grant() {
             Some(HostGrant::Wired { ceiling, left }) => {
                 // Others' wired bytes: what the OS wires beyond the process's
                 // own wired bytes at the instant `ceiling.wired` was sampled
                 // (`wired_at`). The process's pageable memory is never in the
                 // count.
-                let (others_wired, wired_rise) = match ceiling.wired.checked_sub(wired_own) {
+                let (others_wired, rise) = match ceiling.wired.checked_sub(wired_own) {
                     Some(others_wired) => {
                         let judged = !settled && prev_read.is_some_and(|before| before.shown) && shown;
-                        let wired_rise = wired_others.filter(|_| judged).map_or(0, |before| others_wired.saturating_sub(before));
+                        let rise = wired_others.filter(|_| judged).map_or(0, |before| others_wired.saturating_sub(before));
                         wired_others = Some(others_wired);
-                        (others_wired, wired_rise)
+                        (others_wired, rise)
                     }
                     // The count shows less than the process wires: a residency
                     // set the OS let lapse, not yet wired again when the
@@ -696,9 +696,11 @@ impl State {
                         (wired_others.unwrap_or(ceiling.wired), 0)
                     }
                 };
-                let wired_grant = ceiling.limit.saturating_sub(others_wired).saturating_sub(wired_rise);
+                wired_rise = rise;
+                let reserve = ceiling.execution_reserve();
+                let wired_grant = ceiling.limit.saturating_sub(others_wired).saturating_sub(reserve);
                 let grant = match left {
-                    Some(left) => wired_grant.min(visible_allocated.saturating_add(left).min(ceiling.limit)),
+                    Some(left) => wired_grant.min(visible_allocated.saturating_add(left).min(ceiling.limit).saturating_sub(reserve)),
                     None => wired_grant,
                 };
                 Some(grant)
@@ -731,6 +733,7 @@ impl State {
             credited,
             others,
             rise,
+            wired_rise,
             grant,
             ceiling: reading.ceiling(),
             unwired,

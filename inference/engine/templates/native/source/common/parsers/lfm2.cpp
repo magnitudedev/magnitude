@@ -79,9 +79,21 @@ common_chat_params common_chat_params_init_lfm2(const common_chat_template &    
         data.prompt += data.generation_prompt;
     }
 
-    common_chat_apply_cached_parser(tmpl, inputs, "", data, [&](common_chat_params & data) {
+    const bool reasoning_disabled = inputs.enable_thinking.has_value() && !*inputs.enable_thinking;
+    const auto think_pos = data.generation_prompt.rfind(THINK_START);
+    const bool reasoning_closed_in_prefix =
+        supports_reasoning && reasoning_disabled && !inputs.has_continuation() &&
+        think_pos != std::string::npos &&
+        data.generation_prompt.find(THINK_END, think_pos + THINK_START.size()) != std::string::npos;
+    if (reasoning_closed_in_prefix) {
+        extract_reasoning = false;
+    }
+    const std::string parser_prefix = reasoning_closed_in_prefix ? data.generation_prompt : GEN_PROMPT;
+    const std::string parser_key    = reasoning_closed_in_prefix ? data.generation_prompt : "";
+
+    common_chat_apply_cached_parser(tmpl, inputs, parser_key, data, [&](common_chat_params & data) {
     auto parser = build_chat_peg_parser([&](common_chat_peg_builder & p) {
-        auto generation_prompt = p.literal(GEN_PROMPT);
+        auto generation_prompt = p.literal(parser_prefix);
         auto end = p.end();
 
         auto reasoning      = p.eps();

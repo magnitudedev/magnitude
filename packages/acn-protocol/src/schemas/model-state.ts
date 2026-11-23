@@ -2030,6 +2030,7 @@ export const LocalInferenceHardwareSchema = Schema.Struct({
   activeDeviceId: LocalInferenceDeviceIdSchema,
   memoryDomains: Schema.Array(LocalInferenceMemoryDomainSchema),
   modelStorage: Schema.optionalWith(LocalInferenceModelStorageSchema, { as: "Option", exact: true }),
+  gpuUnusedReason: Schema.optional(NonEmptyString),
 }).pipe(Schema.filter((hardware) => {
   const memoryDomainIds = hardware.memoryDomains.map(({ memoryDomainId }) => memoryDomainId)
   const acceleratorIds = hardware.accelerators.map(({ acceleratorId }) => acceleratorId)

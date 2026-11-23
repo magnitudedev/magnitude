@@ -91,97 +91,97 @@ impl LinkMover {
     /// frontier. Permanent moves report to `Telemetry::moved`; opportunistic
     /// staging reports separately to `Telemetry::staged_link`.
     pub(super) fn settle(&mut self, core: &mut Core, ledger: &mut Ledger, shared: &Shared, copier: &Copier, progress: Point) -> bool {
-        let Some(copy) = line(core, shared) else {
-            return false;
-        };
         let mut moved = false;
-        let bytes = record_bytes(core);
+        if let Some(copy) = line(core, shared) {
+            let bytes = record_bytes(core);
 
-        // 1. Write-backs completed.
-        for (group, record, batch) in core.directory.backing() {
-            match copier.copies.completed(batch) {
-                Ok(false) => {}
-                Ok(true) => {
-                    core.directory.written_back(group, record, true);
-                    shared.telemetry.moved(copy.back.transfer_seconds(bytes[group] as f64), 1);
-                    moved = true;
-                }
-                Err(error) => {
-                    core.directory.written_back(group, record, false);
-                    shared.end_serving(format!("a release's write-back into the host tier: {error}"));
-                    moved = true;
-                }
-            }
-        }
-
-        // 2. Permanent promotions completed.
-        let mut completed = Vec::new();
-        for (group, record, batch) in core.directory.copying() {
-            match copier.copies.completed(batch) {
-                Ok(false) => {}
-                Ok(true) => completed.push((group, record)),
-                Err(error) => {
-                    core.directory.unpromoted(group, record);
-                    shared.end_serving(format!("a promotion's copy into the bank: {error}"));
-                    moved = true;
-                }
-            }
-        }
-        if !completed.is_empty() {
-            let link = completed.iter().map(|&(group, _)| copy.transfer.transfer_seconds(bytes[group] as f64)).sum::<f64>();
-            shared.telemetry.moved(link, completed.len());
-            for &(group, record) in &completed {
-                shared
-                    .transport
-                    .try_release_hint_slot(crate::experts::transport::DestSlot { group, slot: record.index() });
-            }
-            core.directory.promoted(completed, progress, &core.steps);
-            moved = true;
-        }
-
-        // 3. Opportunistic staging copies completed (separated telemetry).
-        let mut staged_bytes = 0u64;
-        let mut staged_count = 0usize;
-        let now = Instant::now();
-        for (group, slot, batch) in core.directory.staging_copying() {
-            match copier.copies.completed(batch) {
-                Ok(false) => {}
-                Ok(true) => {
-                    let (layer, expert) = core.directory.staged_landed(group, slot);
-                    if let Some((target_step, issued_at)) = self.stage_issued.remove(&(group, slot)) {
-                        ledger.link_landed(target_step, layer, expert, issued_at, now);
+            // 1. Write-backs completed.
+            for (group, record, batch) in core.directory.backing() {
+                match copier.copies.completed(batch) {
+                    Ok(false) => {}
+                    Ok(true) => {
+                        core.directory.written_back(group, record, true);
+                        shared.telemetry.moved(copy.back.transfer_seconds(bytes[group] as f64), 1);
+                        moved = true;
                     }
-                    staged_bytes += bytes[group];
-                    staged_count += 1;
-                    moved = true;
-                }
-                Err(error) => {
-                    self.stage_issued.remove(&(group, slot));
-                    core.directory.unstage(group, slot);
-                    shared.end_serving(format!("an opportunistic staging copy into the bank: {error}"));
-                    moved = true;
+                    Err(error) => {
+                        core.directory.written_back(group, record, false);
+                        shared.end_serving(format!("a release's write-back into the host tier: {error}"));
+                        moved = true;
+                    }
                 }
             }
-        }
-        if staged_count > 0 {
-            let link = copy.transfer.transfer_seconds(staged_bytes as f64);
-            shared.telemetry.staged_link(link, staged_count);
-            let was = self.staged_total;
-            self.staged_total = self.staged_total.saturating_add(staged_count as u64);
-            if was == 0 {
-                shared.time.lock().update_residency(|state| {
-                    state.link_staging = true;
-                });
-                tracing::info!(
-                    staged_count,
-                    staged_bytes,
-                    "LinkMover async DMA staging ring active (MAP_STAGE)"
-                );
+
+            // 2. Permanent promotions completed.
+            let mut completed = Vec::new();
+            for (group, record, batch) in core.directory.copying() {
+                match copier.copies.completed(batch) {
+                    Ok(false) => {}
+                    Ok(true) => completed.push((group, record)),
+                    Err(error) => {
+                        core.directory.unpromoted(group, record);
+                        shared.end_serving(format!("a promotion's copy into the bank: {error}"));
+                        moved = true;
+                    }
+                }
+            }
+            if !completed.is_empty() {
+                let link = completed.iter().map(|&(group, _)| copy.transfer.transfer_seconds(bytes[group] as f64)).sum::<f64>();
+                shared.telemetry.moved(link, completed.len());
+                for &(group, record) in &completed {
+                    shared
+                        .transport
+                        .try_release_hint_slot(crate::experts::transport::DestSlot { group, slot: record.index() });
+                }
+                core.directory.promoted(completed, progress, &core.steps);
+                moved = true;
+            }
+
+            // 3. Opportunistic staging copies completed (separated telemetry).
+            let mut staged_bytes = 0u64;
+            let mut staged_count = 0usize;
+            let now = Instant::now();
+            for (group, slot, batch) in core.directory.staging_copying() {
+                match copier.copies.completed(batch) {
+                    Ok(false) => {}
+                    Ok(true) => {
+                        let (layer, expert) = core.directory.staged_landed(group, slot);
+                        if let Some((target_step, issued_at)) = self.stage_issued.remove(&(group, slot)) {
+                            ledger.link_landed(target_step, layer, expert, issued_at, now);
+                        }
+                        staged_bytes += bytes[group];
+                        staged_count += 1;
+                        moved = true;
+                    }
+                    Err(error) => {
+                        self.stage_issued.remove(&(group, slot));
+                        core.directory.unstage(group, slot);
+                        shared.end_serving(format!("an opportunistic staging copy into the bank: {error}"));
+                        moved = true;
+                    }
+                }
+            }
+            if staged_count > 0 {
+                let link = copy.transfer.transfer_seconds(staged_bytes as f64);
+                shared.telemetry.staged_link(link, staged_count);
+                let was = self.staged_total;
+                self.staged_total = self.staged_total.saturating_add(staged_count as u64);
+                if was == 0 {
+                    shared.time.lock().update_residency(|state| {
+                        state.link_staging = true;
+                    });
+                    tracing::info!(
+                        staged_count,
+                        staged_bytes,
+                        "LinkMover async DMA staging ring active (MAP_STAGE)"
+                    );
+                }
             }
         }
 
-        // 4. Drain releases, deferred demand landings, and landed staging slots
-        //    no longer pinned by any joined demand consumer in `ExpertTransport`.
+        // 4. Drain releases (including stamped-unmap releases without write-back),
+        //    deferred demand landings, and landed staging slots no longer pinned
+        //    by any joined demand consumer in `ExpertTransport`.
         moved |= core.directory.drain(progress, &core.steps);
         moved |= core.directory.drain_demand_landings(|group, slot| {
             shared
@@ -227,10 +227,10 @@ impl LinkMover {
         held: bool,
         progress: Point,
     ) -> bool {
-        let Some(copy) = line(core, shared) else {
-            return false;
-        };
         let mut moved = self.settle(core, ledger, shared, copier, progress);
+        let Some(copy) = line(core, shared) else {
+            return moved;
+        };
         if held || shared.life.ended().is_some() {
             return moved;
         }
@@ -717,7 +717,10 @@ fn permanent_post_depth(base_depth: usize, total_flight: usize, staging_in_fligh
 /// The transfer queue's line a link move is priced and paced by.
 fn line(core: &Core, shared: &Shared) -> Option<TierCopyCosts> {
     let copy = shared.copy.lock().expect("a copy's price").clone();
-    assert!(copy.is_some() || !core.directory.moving(), "a link move runs before the transfer queue's line is measured");
+    assert!(
+        copy.is_some() || !core.directory.link_moving(),
+        "a link move runs before the transfer queue's line is measured"
+    );
     copy
 }
 

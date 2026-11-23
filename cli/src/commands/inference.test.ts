@@ -65,6 +65,7 @@ import {
   removeModel,
   removeModelFolder,
   renderFamilies,
+  renderHardware,
   renderInspection,
   renderPreparation,
   downloadSizeLine,
@@ -1243,5 +1244,79 @@ describe("--json internal identities", () => {
     const inspection = encode(inspectionJson, { inspection: makeInspection(), drafters: [], models: [], memory: "Device" })
     expect((inspection.inspection as { versions: { assessment?: Record<string, unknown> }[] }).versions[3]!.assessment)
       .toMatchObject({ _tag: "Unsupported", reasons: [{ _tag: "WeightTypes" }] })
+  })
+})
+
+describe("hardware output", () => {
+  const GiB = 1024 ** 3
+
+  it("surfaces why a GPU is unavailable when running on CPU", () => {
+    const cpuOnly = makeHardware({
+      accelerators: [],
+      activeDeviceId: LocalInferenceDeviceIdSchema.make("host-cpu"),
+      gpuUnusedReason: "vulkan: Vulkan loader not found",
+    })
+    expect(describeLocalHardware(cpuOnly).system.details).toContain("GPU unavailable: vulkan: Vulkan loader not found")
+    expect(renderHardware({ hardware: cpuOnly, models: [] })).toContain("GPU unavailable: vulkan: Vulkan loader not found")
+  })
+
+  it("omits zero-byte model breakdown rows for non-participating domains and inconsistent domains", () => {
+    const base = makeHardware()
+    const systemId = LocalInferenceMemoryDomainIdSchema.make("system")
+    const gpuId = base.accelerators[0]!.executors[0]!.memoryDomainIds[0]!
+    const hardware = {
+      ...base,
+      memoryDomains: [
+        { memoryDomainId: systemId, kind: "System" as const, totalBytes: 64 * GiB, availableBytes: Option.some(50 * GiB) },
+        { memoryDomainId: gpuId, kind: "PhysicalDevice" as const, totalBytes: 24 * GiB, availableBytes: Option.some(4 * GiB) },
+      ],
+    }
+    const installed = makeInstalledCatalogModel()
+    if (installed.acquisitionState._tag !== "Installed") throw new Error("expected installed fixture")
+    const readyOnGpu = makeInstalledCatalogModel({
+      acquisitionState: {
+        ...installed.acquisitionState,
+        residencyState: {
+          _tag: "Ready",
+          allocation: {
+            contextWindowTokens: 32_768,
+            memoryDomains: [{
+              memoryDomainId: gpuId,
+              modelBytes: 16 * GiB,
+              contextBytes: 2 * GiB,
+              computeBytes: 1 * GiB,
+              auxiliaryBytes: 0,
+            }],
+            promptGroupPlaces: { held: 1, capacity: 1 },
+            streaming: Option.none(),
+          },
+          device: { deviceId: LocalInferenceDeviceIdSchema.make("cuda:0"), backend: "cuda" },
+        },
+      },
+    })
+    const output = renderHardware({ hardware, models: [readyOnGpu] })
+    const systemSection = output.slice(output.indexOf("  System memory"), output.indexOf("  Test GPU · GPU 1"))
+    const gpuSection = output.slice(output.indexOf("  Test GPU · GPU 1"), output.indexOf("Current model"))
+    expect(systemSection).not.toContain("Weights")
+    expect(systemSection).not.toContain("Context")
+    expect(systemSection).not.toContain("Overhead")
+    expect(gpuSection).toContain("Weights")
+    expect(gpuSection).toContain("Context")
+    expect(gpuSection).toContain("Overhead")
+
+    // When allocation exceeds reported used bytes beyond tolerance, domain.status === "inconsistent".
+    const inconsistentHardware = {
+      ...hardware,
+      memoryDomains: [
+        hardware.memoryDomains[0]!,
+        { memoryDomainId: gpuId, kind: "PhysicalDevice" as const, totalBytes: 24 * GiB, availableBytes: Option.some(23 * GiB) },
+      ],
+    }
+    const inconsistentOutput = renderHardware({ hardware: inconsistentHardware, models: [readyOnGpu] })
+    const inconsistentGpu = inconsistentOutput.slice(inconsistentOutput.indexOf("  Test GPU · GPU 1"), inconsistentOutput.indexOf("Current model"))
+    expect(inconsistentGpu).toContain("Allocation and resident usage could not be reconciled.")
+    expect(inconsistentGpu).not.toContain("Weights")
+    expect(inconsistentGpu).not.toContain("Context")
+    expect(inconsistentGpu).not.toContain("Overhead")
   })
 })

@@ -283,4 +283,56 @@ describe("the user's models", () => {
     expect(html).toContain("Has parts Magnitude doesn&#x27;t recognize (lfm3.attention.causal)")
     expect(html).not.toContain("Doesn’t fit")
   })
+
+  it("shows Not supported before Files unavailable when an unsupported model is also Unavailable", () => {
+    const assessed = baseModel.servingState._tag === "Assessed" ? baseModel.servingState : (() => { throw new Error("expected assessed") })()
+    const unsupportedUnavailable: LocalModel = {
+      _tag: "Custom",
+      modelId: "hf:org/repo/model.gguf" as never,
+      origin: { _tag: "Added", repository: "org/repo" as never, commit: "1a75d474b9b3b91f150e391a42ef96cf134401e9" },
+      presentation: {
+        displayName: "Unsupported Model",
+        variantLabel: "unknown-variant" as never,
+        sourceLabel: "Added",
+        variantOf: Option.none(),
+        developer: Option.none(),
+        license: Option.none(),
+        sourceUrls: [],
+      },
+      drafter: Option.none(),
+      drafterPending: false,
+      drafterChoice: { _tag: "Auto" },
+      recommendedDrafter: Option.none(),
+      acquisitionState: {
+        _tag: "Unavailable",
+        failure: { _tag: "MissingFiles", message: "GGUF missing" },
+      } as never,
+      servingState: {
+        ...assessed,
+        assessment: {
+          _tag: "Unsupported",
+          environmentId: assessed.assessment.environmentId,
+          profile: Option.none(),
+          reasons: [{ _tag: "Architecture", architecture: "mamba2" }],
+          detail: "unsupported architecture mamba2",
+        },
+      },
+      storageBytes: 1_480_000_000,
+    }
+    const view = ownedModel(unsupportedUnavailable, "Unified")
+    expect(view.quant.bits).toBe(0)
+    const html = renderToStaticMarkup(
+      <YourModels
+        models={[view]}
+        action={item => modelRowAction(item, unsupportedUnavailable, noopActions)}
+        onExploreQuants={() => {}}
+        onRemove={() => {}}
+        onDrafter={() => {}}
+      />,
+    )
+    expect(html).toContain("Not supported")
+    expect(html).toContain("mamba2 architecture")
+    expect(html).not.toContain("Files unavailable")
+    expect(html).not.toContain("0-bit")
+  })
 })

@@ -100,7 +100,7 @@ export function Onboarding({ machine, preparation, discovered, unrunnable, recom
           {discovered.map(entry => <span key={entry.key} className="inline-flex max-w-full items-center gap-2 rounded-lg bg-slate-100 py-1.5 pl-2 pr-2.5 text-[13px] dark:bg-slate-800">
             <LabMark lab={entry.lab} className="size-4" />
             <span className="truncate">{entry.name}</span>
-            <span className="text-slate-500">{entry.bits}-bit</span>
+            {entry.bits > 0 && <span className="text-slate-500">{entry.bits}-bit</span>}
             <span className="h-3 w-px bg-slate-300 dark:bg-slate-600" />
             <span className="inline-flex shrink-0 items-center gap-1 text-xs text-slate-500">
               {entry.fromHuggingFaceCache ? <HuggingFaceLogo className="size-3" /> : <FolderSimpleIcon className="size-3" />}{entry.source}

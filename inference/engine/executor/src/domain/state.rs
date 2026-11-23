@@ -1223,7 +1223,9 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
     pub fn execute_relief(&self, plan: crate::memory::ledger::ReliefPlan) -> crate::memory::ledger::Owed {
         let ledgers = self.resources.ledgers();
         match ledgers.keeping(&plan.store()) {
-            Some(ledger) => ledger.change(|keeping| ledger.execute(&keeping.claims(), plan)),
+            Some(ledger) => ledger.change(|keeping| {
+                ledger.execute(&keeping.claims(), plan, crate::memory::ledger::ReliefBoundary::Idle)
+            }),
             None => panic!("invariant violated: a relief plan of a store the load does not reach"),
         }
     }

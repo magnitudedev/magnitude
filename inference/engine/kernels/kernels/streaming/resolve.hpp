@@ -323,6 +323,9 @@ STREAMING_FN void streaming_resolve(STREAMING_DEVICE_READ routes, u64 routes0, u
 #endif
     const int home = STREAMING_GROUP(STREAMING_RESOLVE_POLICY(choices, SEISMIC_CONST_POLICY_HOME));
     const bool is_whole = whole || STREAMING_GROUP(STREAMING_RESOLVE_POLICY(choices, SEISMIC_CONST_POLICY_WHOLE)) != 0;
+    const bool priced = STREAMING_GROUP(STREAMING_RESOLVE_POLICY(choices, SEISMIC_CONST_POLICY_PRICED)) != 0;
+    if (!whole)
+        streaming_barrier();
     const u64 q = streaming_step(step, step0);
     STREAMING_SYSTEM_WORDS record = streaming_slot_of(routing, routing0, q, flight);
     if (is_whole) {
@@ -387,8 +390,7 @@ STREAMING_FN void streaming_resolve(STREAMING_DEVICE_READ routes, u64 routes0, u
             STREAMING_GROUP(STREAMING_RESOLVE_SOURCE(choices, c)) = rec;
     }
     streaming_barrier();
-    const bool assigns = tiered != 0 && sited != 0
-        && STREAMING_GROUP(STREAMING_RESOLVE_POLICY(choices, SEISMIC_CONST_POLICY_PRICED)) != 0;
+    const bool assigns = tiered != 0 && sited != 0 && priced;
     for (u32 c = tid; c < choices; c += threads) {
         const int expert = STREAMING_GROUP(STREAMING_RESOLVE_EXPERT(c));
         const u32 first = u32(STREAMING_GROUP(STREAMING_RESOLVE_ROWS(choices, c)));

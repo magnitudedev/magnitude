@@ -821,7 +821,8 @@ impl Wake {
     /// holds the wake ([`driver::Stream::wakes`]).
     fn behind(self: &Arc<Self>, writer: &driver::Stream, written: &Event) -> Result<(), ExecutionError> {
         let context = writer.context();
-        let wakes = writer.wakes().map_err(submission)?.raw();
+        let wakes_stream = writer.wakes().map_err(submission)?;
+        let wakes = wakes_stream.raw();
         let _current = context.enter().map_err(submission)?;
         let issue = context.enqueue();
         // SAFETY: both handles are this context's; the event may be
@@ -834,8 +835,9 @@ impl Wake {
             if status != 0 {
                 drop(Arc::from_raw(wake.cast::<Wake>().cast_const()));
             }
-            context.driver.check(status, "wake launch").map_err(submission)
+            context.driver.check(status, "wake launch").map_err(submission)?;
         }
+        wakes_stream.flush_submission().map_err(submission)
     }
 }
 
@@ -1244,6 +1246,7 @@ impl DirectBatch {
         } = self;
         let end = Event::new(device.context()).and_then(|end| {
             end.record(&stream)?;
+            stream.flush_submission()?;
             Ok(end)
         });
         match end {

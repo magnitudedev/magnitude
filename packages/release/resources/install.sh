@@ -5,18 +5,32 @@ set -eu
 origin='@MAGNITUDE_INSTALL_ORIGIN@'
 apple_team='@MAGNITUDE_APPLE_TEAM@'
 publisher_key='@MAGNITUDE_PUBLISHER_KEY@'
-channel=stable
+channel=${MAGNITUDE_CHANNEL:-stable}
 destination=/Applications/Magnitude.app
 linux_desktop=/usr/lib/magnitude-desktop/resources/magnitude
 server_marker=/etc/magnitude/server
 fail() { [ -z "${progress_pid:-}" ] || stop_progress; printf '%s\n' "$*" >&2; exit 1; }
 usage='Run `curl -fsSL https://magnitude.dev/install.sh | sh` for the CLI only, or `curl -fsSL https://magnitude.dev/install.sh | sh -s -- --desktop` for the desktop app.'
 # No options installs the CLI only; --desktop installs the desktop app, which includes the CLI.
+# --channel <stable|alpha> (or MAGNITUDE_CHANNEL) selects the release channel.
 desktop=no
-case "$#:${1:-}" in
-  0:) ;;
-  1:--desktop) desktop=yes ;;
-  *) fail "install.sh does not accept: $*. $usage" ;;
+raw_args=$*
+while [ "$#" -gt 0 ]; do
+  case "$1" in
+    --desktop) desktop=yes; shift ;;
+    --channel)
+      [ "$#" -ge 2 ] || fail "install.sh does not accept: $raw_args. $usage"
+      channel=$2
+      shift 2 ;;
+    --channel=*)
+      channel=${1#--channel=}
+      shift ;;
+    *) fail "install.sh does not accept: $raw_args. $usage" ;;
+  esac
+done
+case "$channel" in
+  stable|alpha) ;;
+  *) fail "install.sh does not accept channel: $channel. Supported channels: stable, alpha." ;;
 esac
 case "$origin" in https://*) ;; *) fail 'The installation script has no release origin.' ;; esac
 case "$(uname -m)" in arm64|aarch64) arch=arm64 ;; x86_64) arch=x64 ;; *) fail 'This architecture is not supported.' ;; esac
@@ -178,7 +192,18 @@ download() {
 # The landing server counts each request and answers with the publisher-signed offer for this target.
 offer() {
   start_progress 'Checking latest release'
-  download "$origin/api/installer?os=$1&arch=$arch&package=$2&offer=1" "$scratch/offer.json" 16384
+  channel_query=''
+  [ "$channel" = stable ] || channel_query="&channel=$channel"
+  download "$origin/api/installer?os=$1&arch=$arch&package=$2$channel_query&offer=1" "$scratch/offer.json" 16384
+}
+# The stable channel takes no prerelease; the alpha channel admits stable and -alpha.* prereleases.
+check_release_channel() {
+  case "$channel:${1%%+*}" in
+    stable:*-*) fail 'Application release verification failed: Release does not match the selected channel' ;;
+    alpha:*-alpha|alpha:*-alpha.*) ;;
+    alpha:*-*) fail 'Application release verification failed: Release does not match the selected channel' ;;
+    *) ;;
+  esac
 }
 # Answers come from the terminal, never from the script's piped stdin.
 has_terminal() { (: </dev/tty) 2>/dev/null; }
@@ -257,6 +282,7 @@ read_mac_offer() {
   version=$(/usr/bin/plutil -extract release.version raw -o - "$scratch/offer.json")
   case "$version" in ''|.*|*[!0-9A-Za-z.+-]*) fail 'Invalid application version.' ;; esac
   [ "${#version}" -le 96 ] || fail 'Invalid application version.'
+  check_release_channel "$version"
 }
 # Fetches the offer for a Linux package and verifies its publisher signature with openssl alone, then sets
 # its fields. The offer is the landing server's exact encoding, so anything else is refused.
@@ -269,8 +295,7 @@ read_linux_offer() {
   version=$2 bytes=$3 digest=$4 signature=$5 url=$6
   printf '%s' "$version" | grep -Eq '^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)(-[0-9A-Za-z.-]+)?(\+[0-9A-Za-z.-]+)?$' \
     || fail 'Application release verification failed: Invalid release version'
-  # The stable channel takes no prerelease.
-  case "${version%%+*}" in *-*) fail 'Application release verification failed: Release does not match the selected channel' ;; esac
+  check_release_channel "$version"
   [ "$bytes" -le 2147483648 ] || fail 'Application release verification failed: Invalid application size'
   case "$url" in *%2[fF]*|*%5[cC]*|*%00*) fail 'Application release verification failed: Unexpected application download location' ;; esac
   case "${url#https://github.com/magnitudedev/magnitude/releases/download/}" in */?*) ;; *) fail 'Application release verification failed: Unexpected application download location' ;; esac

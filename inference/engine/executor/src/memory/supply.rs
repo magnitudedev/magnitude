@@ -173,6 +173,29 @@ pub(crate) struct Ceiling {
     pub(crate) at: Instant,
 }
 
+impl Ceiling {
+    /// Execution headroom reserved below Metal's wired working-set ceiling
+    /// (`recommendedMaxWorkingSetSize` or `iogpu.wired_limit_mb`) for command
+    /// buffers, residency-set commits, driver heaps, and transient kernel/IOGPU
+    /// wiring. Subtracted from `Read::grant`, `Reading::capacity`, and
+    /// `MemoryBudget::stable` / `live_status` so committed claims
+    /// (`PromptScratch`, KV slabs, graph slots) cannot consume it and static
+    /// assessment agrees with live load headroom.
+    ///
+    /// `max(512 MiB, limit / 12)` reserves ~954 MB on a 16 GB M1 (11.45 GB
+    /// working set), ~2.23 GB on a 32 GB M2 Pro (26.80 GB working set, well
+    /// past the 1.48 GB Metal 4 OOM cliff observed under 4K-token prompt
+    /// prefill), and ~3.22 GB on a 48 GB M4 Pro (38.65 GB working set).
+    pub(crate) fn execution_reserve_for(limit: u64) -> u64 {
+        const MIN_RESERVE: u64 = 512 << 20;
+        (limit / 12).max(MIN_RESERVE).min(limit)
+    }
+
+    pub(crate) fn execution_reserve(&self) -> u64 {
+        Self::execution_reserve_for(self.limit)
+    }
+}
+
 /// Host RAM's counters at a sample, as of when they show the machine
 /// (`counted`): cumulative pages brought in, the machine's and the
 /// process's own, of `page_bytes` each, where the OS counts the process's
@@ -302,9 +325,14 @@ impl Reading {
     /// The store's structural capacity: the most bytes it could grant the
     /// process beside nothing else, bounding a load's growth ceiling
     /// (`PlanningRoom::capacity`) independently of momentary free supply.
+    /// On unified Metal (`HostGrant::Wired`), excludes
+    /// [`Ceiling::execution_reserve`] so structural capacity agrees with live
+    /// `Read::grant` and static assessment (`MemoryBudget::stable`).
     pub fn capacity(&self) -> u64 {
         match self.grant {
-            Some(HostGrant::Wired { ceiling, .. }) => self.total.min(ceiling.limit),
+            Some(HostGrant::Wired { ceiling, .. }) => {
+                self.total.min(ceiling.limit).saturating_sub(ceiling.execution_reserve())
+            }
             Some(HostGrant::Limit(limit)) => self.total.min(limit),
             Some(HostGrant::Budget { capacity, .. }) => self.total.min(capacity),
             None => self.total,

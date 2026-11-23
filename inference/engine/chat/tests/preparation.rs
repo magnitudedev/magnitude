@@ -625,3 +625,148 @@ fn last_message_boundary_needs_rendered_content_after_an_added_token() {
         assert_eq!(chat.last_message_boundary(&bundle, &request, &selection), None);
     }
 }
+
+fn parse_generated(
+    prepared: &PreparedChat,
+    tokenizer: &ByteBpeTokenizer,
+    text: &str,
+) -> (String, String) {
+    let mut stream = TokenChatStream::new(prepared, tokenizer, vec![], 1 << 16).unwrap();
+    let tokens = tokenizer.encode(text, SpecialTokens::Recognize).unwrap();
+    let mut events = Vec::new();
+    for (index, token) in tokens.into_iter().enumerate() {
+        events.extend(
+            stream
+                .feed(&OutputToken { index, token })
+                .unwrap(),
+        );
+    }
+    events.extend(stream.finish(FinishReason::Stop).unwrap());
+    let mut reasoning = String::new();
+    let mut content = String::new();
+    for event in events {
+        match event {
+            Event::Reasoning { text } => reasoning.push_str(&text),
+            Event::Content { text } => content.push_str(&text),
+            _ => {}
+        }
+    }
+    (reasoning, content)
+}
+
+/// Raw GBNF grammars constrain token 0 directly and cannot emit `<think>...</think>`.
+/// On both toggle-reasoning (Qwen3.5) and fixed-reasoning (LFM2.5) models, raw GBNF
+/// closes any open reasoning block in the prompt and parses token 0 directly into
+/// `content`, while `json_schema` remains completely unaffected and preserves reasoning.
+#[test]
+fn raw_grammar_routes_token_zero_to_content_while_json_schema_preserves_reasoning() {
+    use magnitude_chat::ReasoningIntent;
+
+    const QWEN35: &str = include_str!("../../templates/tests/assets/Qwen3.5-4B.jinja");
+    const LFM25: &str = include_str!("../../templates/tests/assets/LFM2.5-2.6B.jinja");
+
+    let tokenizer = support::byte_tokenizer("<|im_end|>");
+    let mut vocabulary = support::vocabulary(&tokenizer);
+    let selection = TemplateSelection::default();
+    let raw_gbnf = r#"root ::= "yes" | "no""#;
+
+    // 1. Toggle-reasoning model (Qwen3.5) with raw GBNF (default reasoning):
+    //    disables thinking on the prompt and parses token 0 directly as content.
+    let qwen_bundle = support::bundle(QWEN35, "<|endoftext|>", "<|im_end|>");
+    let mut qwen_grammar_req = ChatRequest::new(
+        vec![serde_json::json!({"role": "user", "content": "Answer yes or no."})],
+        946684800,
+    );
+    qwen_grammar_req.grammar = Some(raw_gbnf.into());
+    let qwen_grammar =
+        PreparedChat::prepare(&qwen_bundle, &tokenizer, &qwen_grammar_req, &selection).unwrap();
+    assert!(
+        qwen_grammar
+            .prompt()
+            .ends_with("<|im_start|>assistant\n<think>\n\n</think>\n\n"),
+        "expected closed think block in Qwen3.5 prompt, got: {:?}",
+        qwen_grammar.prompt()
+    );
+    let plan = qwen_grammar.input().constraint.as_ref().unwrap();
+    assert!(plan.prefix.is_empty());
+    let state = vocabulary.bind(&plan.grammar, &plan.prefix).unwrap();
+    let mut yes_tokens = tokenizer.encode("yes", SpecialTokens::Recognize).unwrap();
+    yes_tokens.push(TokenId(256));
+    assert!(state.advance(&yes_tokens).is_ok());
+    assert_eq!(
+        parse_generated(&qwen_grammar, &tokenizer, "yes"),
+        ("".into(), "yes".into())
+    );
+
+    // 2. Toggle-reasoning model (Qwen3.5) with raw GBNF and explicit ReasoningIntent::Enabled:
+    //    still closes the open `<think>` tag and parses token 0 directly as content.
+    let mut qwen_explicit_req = qwen_grammar_req.clone();
+    qwen_explicit_req.reasoning = ReasoningIntent::Enabled;
+    let qwen_explicit =
+        PreparedChat::prepare(&qwen_bundle, &tokenizer, &qwen_explicit_req, &selection).unwrap();
+    assert!(
+        qwen_explicit.prompt().ends_with("</think>"),
+        "expected closed think tag on explicit reasoning + raw grammar, got: {:?}",
+        qwen_explicit.prompt()
+    );
+    assert_eq!(
+        parse_generated(&qwen_explicit, &tokenizer, "no"),
+        ("".into(), "no".into())
+    );
+
+    // 3. Fixed-reasoning model (LFM2.5-2.6B) with raw GBNF:
+    //    closes the unconditionally opened `<think>` and parses token 0 directly as content.
+    let lfm_bundle = support::bundle(LFM25, "<|startoftext|>", "<|im_end|>");
+    let lfm_grammar =
+        PreparedChat::prepare(&lfm_bundle, &tokenizer, &qwen_grammar_req, &selection).unwrap();
+    assert!(
+        lfm_grammar
+            .prompt()
+            .ends_with("<|im_start|>assistant\n<think></think>"),
+        "expected closed think block in LFM2.5 prompt, got: {:?}",
+        lfm_grammar.prompt()
+    );
+    assert_eq!(
+        parse_generated(&lfm_grammar, &tokenizer, "yes"),
+        ("".into(), "yes".into())
+    );
+
+    // 4. `json_schema` on a reasoning model (Qwen3.5) is completely unaffected:
+    //    prompt keeps `<think>` open, reasoning lands in `reasoning`, JSON lands in `content`.
+    let mut qwen_schema_req = ChatRequest::new(
+        vec![serde_json::json!({"role": "user", "content": "Return answer=42."})],
+        946684800,
+    );
+    qwen_schema_req.json_schema = Some(serde_json::json!({
+        "type": "object",
+        "properties": {"answer": {"type": "integer"}},
+        "required": ["answer"]
+    }));
+    let qwen_schema =
+        PreparedChat::prepare(&qwen_bundle, &tokenizer, &qwen_schema_req, &selection).unwrap();
+    assert!(
+        qwen_schema
+            .prompt()
+            .ends_with("<|im_start|>assistant\n<think>\n"),
+        "expected open think block for json_schema on Qwen3.5, got: {:?}",
+        qwen_schema.prompt()
+    );
+    let schema_plan = qwen_schema.input().constraint.as_ref().unwrap();
+    assert!(!schema_plan.prefix.is_empty());
+    let state = vocabulary
+        .bind(&schema_plan.grammar, &schema_plan.prefix)
+        .unwrap();
+    let mut reasoned_json = tokenizer
+        .encode("Let me think.</think>{\"answer\": 42}", SpecialTokens::Recognize)
+        .unwrap();
+    reasoned_json.push(TokenId(256));
+    assert!(state.advance(&reasoned_json).is_ok());
+    assert_eq!(
+        parse_generated(
+            &qwen_schema,
+            &tokenizer,
+            "Let me think.</think>{\"answer\": 42}"
+        ),
+        ("Let me think.".into(), "{\"answer\": 42}".into())
+    );
+}

@@ -219,7 +219,7 @@ by one watch per process (the macOS memory-pressure source, a Linux PSI trigger,
 Windows' low-memory notification), lowers B by one pool block while the level is set.
 Where the OS counts no share of the process's own, harm cannot be judged and growth is
 bounded by supply alone; where it delivers no event there is no pressure step. On unified Metal the grant is further
-bounded by the wired ceiling: the wired limit less others' wired bytes.
+bounded by the wired ceiling: the wired limit less others' wired bytes and Metal's execution reserve.
 
 The budget is `min(grant, in_use + supply)`, `in_use` the process's own bytes in RAM.
 Free room is the budget less everything held, and a claim admits against it, with cache

@@ -634,26 +634,27 @@ fn pressure_yields_a_block_per_event_and_regrows_only_on_evidence() {
 }
 
 /// The wired ceiling: on unified Metal what the process holds stays under
-/// the system's wired limit less others' wired memory, and others' wired
-/// rise lowers the grant at once.
+/// the system's wired limit less others' wired memory, Metal's execution
+/// reserve, and the elastic bank's block_unit cushion.
 #[test]
 fn wired_stays_under_the_ceiling() {
     let mut os = Os::new();
     os.wired = Some((40 * GB, 6 * GB));
     os.hot = 4 * GB;
     let mut machine = filled(os, 0);
-    let headroom = (40 * GB) >> 5;
+    let reserve = (40 * GB) / 12;
+    let cushion = GRANULE;
     for _ in 0..10 {
         machine.step(300);
         let held = machine.ledger.estimate().allocated();
-        assert!(held + 6 * GB <= 40 * GB - headroom, "wired {held} past the ceiling minus wired headroom");
+        assert!(held + 6 * GB <= 40 * GB - reserve - cushion, "wired {held} past the ceiling minus reserve and bank cushion");
     }
-    assert!(machine.ledger.estimate().allocated() + 6 * GB + headroom + GRANULE > 40 * GB, "the ceiling minus wired headroom binds");
+    assert!(machine.ledger.estimate().allocated() + 6 * GB + reserve + cushion + GRANULE > 40 * GB, "the ceiling minus reserve and bank cushion binds");
     machine.os.wired = Some((40 * GB, 10 * GB));
     for _ in 0..5 {
         machine.step(300);
         let held = machine.ledger.estimate().allocated();
-        assert!(held + 10 * GB <= 40 * GB, "wired {held} past the ceiling");
+        assert!(held + 10 * GB <= 40 * GB - reserve, "wired {held} past the ceiling minus execution reserve");
     }
 }
 
@@ -842,18 +843,19 @@ fn wired(machine: &Machine) -> (Option<u64>, Option<u64>) {
 /// the process's pageable memory (anonymous host memory, a buffer outside
 /// the residency set) is not in it, so it never lowers others' wired bytes
 /// nor raises the grant, while the process's wired memory is in it and is
-/// subtracted from it as the process's own. A 40 GB ceiling, others wiring
-/// 6 GB: beside 20 GB of wired weights, 4 GB of pageable memory and a wired
-/// bank granule leave others' wired bytes at 6 GB and the grant at 34 GB;
-/// others wiring 2 GB more lower it to 30 GB, their 8 GB and their 2 GB
-/// rise.
+/// subtracted from it as the process's own. A 40 GB ceiling (2 GB execution
+/// reserve), others wiring 6 GB: beside 20 GB of wired weights, 4 GB of
+/// pageable memory and a wired bank granule leave others' wired bytes at 6 GB
+/// and the grant at 32 GB; others wiring 2 GB more lower the grant to 30 GB
+/// (with `wired_rise` applied to growth targets rather than baked into `grant`).
 #[test]
 fn only_wired_memory_is_the_processs_in_the_wire_count() {
+    let reserve = (40 * GB) / 12;
     let mut os = Os::new();
     os.wired = Some((40 * GB, 6 * GB));
     os.hot = 4 * GB;
     let mut machine = Machine::load(os, 20 * GB, 0);
-    assert_eq!(wired(&machine), (Some(6 * GB), Some(34 * GB)));
+    assert_eq!(wired(&machine), (Some(6 * GB), Some(34 * GB - reserve)));
     machine.tick(100);
     let anonymous = machine.ledger.change(|keeping| machine.ledger.claim_at(&keeping.claims(), None, CommittedKind::Load, 4 * GB)).expect("room");
     machine.ledger.change(|_| { let entry = anonymous.entry(); entry.take(&entry.change(), 4 * GB, Wiring::Pageable) }).expect("the claim's own bytes");
@@ -862,7 +864,7 @@ fn only_wired_memory_is_the_processs_in_the_wire_count() {
     machine.read();
     let wired_bytes = machine.ledger.state().wired;
     assert_eq!((wired_bytes, machine.ledger.estimate().allocated()), (20 * GB, 24 * GB));
-    assert_eq!(wired(&machine), (Some(6 * GB), Some(34 * GB)), "pageable memory is not in the wire count");
+    assert_eq!(wired(&machine), (Some(6 * GB), Some(34 * GB - reserve)), "pageable memory is not in the wire count");
     machine.tick(100);
     let _granule = machine.ledger.cache(CacheKind::Bank, GRANULE, super::Reclaim::Unbacked).expect("room");
     machine.ledger.change(|_| { let entry = &machine.pool; entry.take(&entry.change(), GRANULE, Wiring::Wired) }).expect("the pool's block for the granule is admitted");
@@ -871,12 +873,12 @@ fn only_wired_memory_is_the_processs_in_the_wire_count() {
     for _ in 0..2 {
         machine.tick(SNAPSHOT_MS);
         machine.read();
-        assert_eq!(wired(&machine), (Some(6 * GB), Some(34 * GB)), "wired memory is the process's in the count");
+        assert_eq!(wired(&machine), (Some(6 * GB), Some(34 * GB - reserve)), "wired memory is the process's in the count");
     }
     machine.os.wired = Some((40 * GB, 8 * GB));
     machine.tick(SNAPSHOT_MS);
     machine.read();
-    assert_eq!(wired(&machine), (Some(8 * GB), Some(30 * GB)), "others' wired rise lowers the grant");
+    assert_eq!(wired(&machine), (Some(8 * GB), Some(32 * GB - reserve)), "others' wired rise lowers the grant by 1x");
 }
 
 /// The OS swaps the process's own pages out (others' burst came and went)
@@ -961,22 +963,23 @@ fn an_exact_count_leaves_no_bytes_unobserved_but_an_accounting_error() {
 /// snapshot.
 #[test]
 fn a_wire_count_short_of_the_processs_is_a_shortfall() {
+    let reserve = (40 * GB) / 12;
     let mut os = Os::new();
     os.wired = Some((40 * GB, 0));
     let mut machine = Machine::load(os, 20 * GB, 0);
-    assert_eq!(wired(&machine), (Some(0), Some(40 * GB)));
+    assert_eq!(wired(&machine), (Some(0), Some(40 * GB - reserve)));
     machine.os.lapsed = 4 * GB;
     machine.tick(SNAPSHOT_MS);
     machine.read();
     let estimate = machine.ledger.estimate();
     assert_eq!((estimate.unwired_shortfall(), estimate.unwired_readings()), (4 * GB, 1), "the shortfall and its reading");
-    assert_eq!(wired(&machine), (Some(0), Some(40 * GB)), "others' wired bytes stand");
+    assert_eq!(wired(&machine), (Some(0), Some(40 * GB - reserve)), "others' wired bytes stand");
     machine.os.lapsed = 0;
     machine.tick(SNAPSHOT_MS);
     machine.read();
     let estimate = machine.ledger.estimate();
     assert_eq!((estimate.unwired_shortfall(), estimate.unwired_readings()), (0, 1), "wired again");
-    assert_eq!(wired(&machine), (Some(0), Some(40 * GB)), "and no rise as it is");
+    assert_eq!(wired(&machine), (Some(0), Some(40 * GB - reserve)), "and no rise as it is");
 }
 
 /// An idle span longer than Metal's residency lapse (macOS un-wires a
@@ -984,10 +987,11 @@ fn a_wire_count_short_of_the_processs_is_a_shortfall() {
 /// residency on the process's own events, so the OS's wire count keeps the
 /// process's wired bytes across the span, and neither others' wired bytes
 /// nor the grant moves, at the span's end or the reading after it. A 40 GB
-/// ceiling, others wiring 6 GB, the load's 20 GB and its 14 GB bank wired,
+/// ceiling, others wiring 6 GB, the load's 20 GB and its bank wired,
 /// idle for 3 s.
 #[test]
 fn an_idle_span_past_the_residency_lapse_moves_nothing() {
+    let reserve = (40 * GB) / 12;
     let mut os = Os::new();
     os.wired = Some((40 * GB, 6 * GB));
     os.hot = 4 * GB;
@@ -996,10 +1000,13 @@ fn an_idle_span_past_the_residency_lapse_moves_nothing() {
         machine.step(300);
     }
     let before = wired(&machine);
-    assert_eq!(before, (Some(6 * GB), Some(34 * GB)));
-    let headroom = (40 * GB) >> 5;
+    assert_eq!(before, (Some(6 * GB), Some(34 * GB - reserve)));
     let (bank, resizes) = (machine.bank_bytes(), machine.resizes);
-    assert_eq!(bank, 14 * GB - headroom, "the grant less the weights and wired bank headroom");
+    assert_eq!(
+        bank,
+        (14 * GB - reserve - GRANULE) / GRANULE * GRANULE,
+        "the grant less the weights and bank block_unit cushion, rounded down to whole bank granules"
+    );
     machine.step(3000);
     assert_eq!(wired(&machine), before, "across the idle span");
     machine.step(100);
@@ -1146,7 +1153,7 @@ fn an_idle_load_with_cache_above_its_floor_admits_new_work_when_cache_meets_harm
     assert!(excess > 0);
     assert!(!shortage.response.admission_waits, "cache meets sustained thrash excess above floor");
     let plan = shortage.response.relief.expect("the bank covers the harm");
-    assert_eq!(machine.ledger.change(|keeping| machine.ledger.execute(&keeping.claims(), plan)).yielded, excess);
+    assert_eq!(machine.ledger.change(|keeping| machine.ledger.execute(&keeping.claims(), plan, ReliefBoundary::Idle)).yielded, excess);
     let admitted = machine.ledger.change(|keeping| machine.ledger.reserve(&keeping.claims(), &machine.slot, RequestId(1), 2 * super::tests::page_rows()));
     assert!(admitted.is_ok(), "the first request is admitted once cache meets the shortage: {:?}", admitted.err());
 }
@@ -1362,7 +1369,7 @@ fn non_pooled_cache_without_open_pool_reads_and_relieves_under_pressure() {
     assert!(matches!(shortage.cause, shortage::Cause::Pressure(seismic::PressureLevel::Warn)));
     let plan = shortage.response.relief.expect("cache covers pressure relief");
     assert_eq!(plan.covers(), drafter_bytes);
-    let owed = ledger.change(|keeping| ledger.execute(&keeping.claims(), plan));
+    let owed = ledger.change(|keeping| ledger.execute(&keeping.claims(), plan, ReliefBoundary::Idle));
     assert_eq!(owed.yielded, drafter_bytes);
     os.release(*now.lock().expect("the clock"), drafter_bytes, Wiring::Pageable);
 

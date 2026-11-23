@@ -29,8 +29,8 @@ export function ExpandingModel({ model, note, expanded, onToggle, quantChoice, o
   if (!current) return null
   return <ModelCardShell lab={model.lab} title={model.name} note={note} quant={current} active={expanded} onSelect={onToggle}
     detail={<>
-      <span className="font-medium text-slate-700 dark:text-slate-300">{current.bits}-bit</span>
-      {" · "}{current.repository ? <RepositoryLink repository={current.repository}>{quantSource(current)}</RepositoryLink> : quantSource(current)}
+      {current.bits > 0 && <><span className="font-medium text-slate-700 dark:text-slate-300">{current.bits}-bit</span>{" · "}</>}
+      {current.repository ? <RepositoryLink repository={current.repository}>{quantSource(current)}</RepositoryLink> : quantSource(current)}
       {model.fineTuneOf ? ` · Fine-tune of ${model.fineTuneOf}` : ""}
       {model.drafter ? ` · ${model.drafter.method}` : ""}
       {current.servedContext !== null && <>{" · "}<ContextText quant={current} limit={model.contextLimit} modelName={model.name} /></>}

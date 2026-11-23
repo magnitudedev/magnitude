@@ -27,8 +27,8 @@ pub use client::{
 };
 pub use preparation::{
     load_prepared, observe_worker_process, prepare, run_priced, start_worker_process,
-    AcquiredDevice, ChildTransport, Preparation, PricedError, PricedFailure, WorkerEnd,
-    WorkerProcess, WorkerReport,
+    ChildTransport, Preparation, PricedError, PricedFailure, WorkerEnd, WorkerProcess,
+    WorkerReport,
 };
 
 use crate::census::AllocationCensus;
@@ -370,7 +370,9 @@ fn load(
             LoadAttempt::Loaded(built) => *built,
             LoadAttempt::Unprepared => return Err(Stopped::Unprepared),
         };
-        let model = manifest.model.clone();
+        let model = manifest
+            .model
+            .capped_to_execution_method(built.domain.execution_method());
         let method = model
             .factory(&manifest.package.identity.to_string(), built.domain.fronts())
             .map_err(internal)?;

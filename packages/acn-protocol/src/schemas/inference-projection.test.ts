@@ -170,6 +170,27 @@ it("explains an unused GPU from its own reason, then the backend diagnostic, and
   expect(reason([gpu.executors[0]], { backend_diagnostics: [diagnostic] })).toEqual(Option.some("cuda: no driver"))
   expect(reason([gpu.executors[0]])).toEqual(Option.some("cuda: not selected"))
 })
+it("falls back to non-CPU backend diagnostics when no physical GPU executor is present", () => {
+  const withDiagnostics = snapshot({
+    backend_diagnostics: [
+      { source: { type: "host" }, message: "ignored host note" },
+      { source: { type: "backend", backend: "cpu" }, message: "ignored cpu note" },
+      { source: { type: "backend", backend: "vulkan" }, message: "Vulkan loader not found" },
+    ],
+  })
+  expect(Effect.runSync(summarizeInferenceHardware(withDiagnostics, none)).gpuUnusedReason)
+    .toEqual(Option.some("vulkan: Vulkan loader not found"))
+  expect(Effect.runSync(projectInferenceHardware(withDiagnostics, none)).gpuUnusedReason)
+    .toBe("vulkan: Vulkan loader not found")
+
+  const onlyCpuDiagnostics = snapshot({
+    backend_diagnostics: [{ source: { type: "backend", backend: "cpu" }, message: "cpu note" }],
+  })
+  expect(Effect.runSync(summarizeInferenceHardware(onlyCpuDiagnostics, none)).gpuUnusedReason)
+    .toEqual(Option.none())
+  expect(Effect.runSync(projectInferenceHardware(onlyCpuDiagnostics, none)).gpuUnusedReason)
+    .toBeUndefined()
+})
 it("reports no GPU fields on a CPU-only machine", () => {
   const summary = Effect.runSync(summarizeInferenceHardware(snapshot({ cpu_model: null }), none))
   expect(summary).toEqual({ backend: "cpu", gpuName: Option.none(), gpuKind: Option.none(), gpuMemoryBytes: Option.none(),

@@ -109,18 +109,13 @@ pub(crate) fn host_sample(total: u64, available: u64) -> seismic::HostSample {
     }
 }
 
-/// Read `ledger` at `total` and `available`; a wired ceiling letting the
-/// process wire `grant` in all where given (unified Metal, nothing wired
-/// but what the process charged as wired).
+/// Read `ledger` at `total` and `available`, bounded by a static host-memory
+/// grant `grant` where given.
 fn read(ledger: &Ledger, clock: &mut Clock, total: u64, available: u64, grant: Option<u64>) {
     let at = clock.next();
     let reading = match grant {
         None => device(total, available),
-        Some(grant) => {
-            let sample = host_sample(total, available);
-            let wired = seismic::WiredFigures { limit: seismic::WiredLimit::Set(grant), wire_count: ledger.state().wired, at: sample.at };
-            Reading::unified(&seismic::HostSample { wired: Some(wired), ..sample }, u64::MAX)
-        }
+        Some(grant) => Reading::host_limit(&host_sample(total, available), grant),
     };
     ledger.read(ledger.sampled(at), reading);
 }
@@ -630,7 +625,7 @@ fn a_rise_shortfall_covered_by_cache_above_floor_does_not_wait_admission() {
     let plan = shortage.response.relief.expect("cache covers the rise shortfall");
     assert!(plan.preempt().is_empty());
     assert_eq!(plan.covers(), 4 * GB);
-    let owed = ledger.change(|keeping| ledger.execute(&keeping.claims(), plan));
+    let owed = ledger.change(|keeping| ledger.execute(&keeping.claims(), plan, ReliefBoundary::Idle));
     assert_eq!(owed.yielded, 4 * GB);
     assert_eq!(bank.bytes(), 4 * GB, "bank remains above floor after covering the shortfall");
 }
@@ -656,7 +651,7 @@ fn a_rise_shortfall_past_cache_drains_cache_before_waiting_admission() {
     let plan = shortage.response.relief.expect("remaining cache drains to floor");
     assert!(plan.preempt().is_empty());
     assert_eq!(plan.covers(), 8 * GB);
-    let owed = ledger.change(|keeping| ledger.execute(&keeping.claims(), plan));
+    let owed = ledger.change(|keeping| ledger.execute(&keeping.claims(), plan, ReliefBoundary::Idle));
     assert_eq!(owed.yielded, 8 * GB);
     assert_eq!(bank.bytes(), 0, "bank reached its floor");
 }
@@ -680,7 +675,7 @@ fn a_floor_shortfall_with_cache_drains_cache_before_unloading() {
     assert!(!first.response.unload, "must drain cache before unloading");
     let plan = first.response.relief.expect("remaining cache drains to floor");
     assert_eq!(plan.covers(), 4 * GB);
-    ledger.change(|keeping| ledger.execute(&keeping.claims(), plan));
+    ledger.change(|keeping| ledger.execute(&keeping.claims(), plan, ReliefBoundary::Idle));
     assert_eq!(bank.bytes(), 0);
     // Next reading past λ with cache empty: now unloads.
     read(&ledger, &mut clock, 64 * GB, 40 * GB, None);
@@ -742,7 +737,7 @@ fn a_relief_plan_covers_its_need_whole_or_takes_nothing() {
     assert_eq!(ledger.plan_relief(cached + 1, Relief::CacheOnly, crate::memory::ledger::Frees::Room), None, "cache alone cannot cover it");
     let after = ledger.estimate();
     assert_eq!((after.cache_of(CacheKind::Bank), after.cache_of(CacheKind::Prefix)), (cached - page, page), "no plan took the bank or the prefix");
-    let owed = ledger.change(|keeping| ledger.execute(&keeping.claims(), plan));
+    let owed = ledger.change(|keeping| ledger.execute(&keeping.claims(), plan, ReliefBoundary::Idle));
     assert_eq!((owed.yielded, owed.preempt), (cached, vec![RequestId(4), RequestId(3)]));
     assert_eq!((bank.bytes(), prefix.bytes()), (0, 0), "the plan carried out whole");
 }
@@ -1293,7 +1288,7 @@ fn a_claim_allocates_taken_cache_only_as_its_holder_frees_it() {
     read(&ledger, &mut clock, 64 * GB, 4 * GB, None);
     assert!(held(&ledger, 10 * GB).is_err(), "deferred cache is not admitted without physical free");
     let plan = ledger.plan_relief(6 * GB, Relief::CacheOnly, crate::memory::ledger::Frees::Room).expect("bank covers 6 GB");
-    assert_eq!(ledger.change(|keeping| ledger.execute(&keeping.claims(), plan)).yielded, 6 * GB);
+    assert_eq!(ledger.change(|keeping| ledger.execute(&keeping.claims(), plan, ReliefBoundary::Idle)).yielded, 6 * GB);
     assert_eq!((bank.bytes(), bank.releasing()), (34 * GB, 0), "the bank yields 6 GB, the pool's still");
     let held_est = ledger.estimate();
     assert_eq!((held_est.allocated(), held_est.releasing(), held_est.allocatable()), (60 * GB, 6 * GB, 4 * GB), "only the free 4 GB are allocatable");
@@ -1322,7 +1317,7 @@ fn a_shortages_yield_is_free_only_once_freed() {
     let bank = ledger.cached_with(CacheKind::Bank, 20 * GB, Reclaim::Deferred).expect("free room");
     assert_eq!(ledger.estimate().free(), 4 * GB);
     let plan = ledger.plan_relief(8 * GB, Relief::CacheOnly, crate::memory::ledger::Frees::Room).expect("the bank covers it");
-    assert_eq!(ledger.change(|keeping| ledger.execute(&keeping.claims(), plan)).yielded, 8 * GB);
+    assert_eq!(ledger.change(|keeping| ledger.execute(&keeping.claims(), plan, ReliefBoundary::Idle)).yielded, 8 * GB);
     assert_eq!((bank.bytes(), ledger.estimate().free()), (12 * GB, 4 * GB), "shed, still allocated: not free");
     assert!(ledger.cached(CacheKind::Prefix, 5 * GB).is_err());
     ledger.change(|_| pool.freed(&pool.change(), 8 * GB, Pageable));
@@ -1361,7 +1356,7 @@ fn a_dropped_bank_leaves_spare_granules_until_the_pool_frees_them() {
     read(&ledger, &mut clock, 64 * GB, 64 * GB, None);
     let bank = ledger.cached_with(CacheKind::Bank, 64 * GB, Reclaim::Deferred).expect("free room");
     let plan = ledger.plan_relief(8 * GB, Relief::CacheOnly, crate::memory::ledger::Frees::Room).expect("the bank covers 8 GB");
-    assert_eq!(ledger.change(|keeping| ledger.execute(&keeping.claims(), plan)).yielded, 8 * GB);
+    assert_eq!(ledger.change(|keeping| ledger.execute(&keeping.claims(), plan, ReliefBoundary::Idle)).yielded, 8 * GB);
     drop(bank);
     let dropped = ledger.estimate();
     assert_eq!((dropped.allocated(), dropped.releasing(), dropped.cache_of(CacheKind::Spare)), (64 * GB, 8 * GB, 56 * GB));
@@ -1607,7 +1602,7 @@ fn cache_yields_by_value_per_byte() {
     bank.value(Value::per_byte(1.0, gb));
     prefix.value(Value::recompute(0.5, 4, gb));
     let plan = ledger.plan_relief(12 * GB, Relief::CacheOnly, crate::memory::ledger::Frees::Room).expect("the cache covers it");
-    assert_eq!(ledger.change(|keeping| ledger.execute(&keeping.claims(), plan)).yielded, 12 * GB);
+    assert_eq!(ledger.change(|keeping| ledger.execute(&keeping.claims(), plan, ReliefBoundary::Idle)).yielded, 12 * GB);
     assert_eq!((spare.bytes(), bank.bytes(), prefix.bytes()), (0, 4 * GB, 8 * GB), "spare, then the bank worth less");
 }
 
@@ -1651,7 +1646,7 @@ fn a_change_keeps_cache_whole_or_not_at_all() {
     rest.value(Value::per_byte(1.0, NonZeroU64::new(59 * GB).unwrap()));
     // The binding, worth least, yields first to relief.
     let plan = ledger.plan_relief(GB / 2, Relief::CacheOnly, crate::memory::ledger::Frees::Room).expect("binding covers 0.5 GB");
-    assert_eq!(ledger.change(|keeping| ledger.execute(&keeping.claims(), plan)).yielded, GB / 2);
+    assert_eq!(ledger.change(|keeping| ledger.execute(&keeping.claims(), plan, ReliefBoundary::Idle)).yielded, GB / 2);
     let before = ledger.estimate();
     let kept = ledger.change(|keeping| keeping.keep(vec![weights, binding], CommittedKind::Component));
     let cached = kept.err().expect("the binding was taken in part");
@@ -1773,7 +1768,8 @@ fn a_loads_claims_find_the_room_its_search_priced() {
 #[test]
 fn the_m4_pros_recorded_sample_prices_the_wired_grant() {
     const STORE: u64 = 51_539_607_552;
-    const GRANT: u64 = 36_858_904_576;
+    const RESERVE: u64 = seismic::fixtures::M4_PRO_WORKING_SET / 12;
+    const GRANT: u64 = 36_858_904_576 - RESERVE;
     let scope = Ledgers::new();
     let recorded = seismic::host_samples::m4_pro();
     assert_eq!(recorded.total, STORE);
@@ -1782,7 +1778,7 @@ fn the_m4_pros_recorded_sample_prices_the_wired_grant() {
     let ledger = ledgers.device();
     let held = &reading.device;
     assert_eq!((held.supply(), held.others()), (47_779_758_080, 3_759_849_472), "free above the target and clean cache; others' the rest");
-    assert_eq!(held.budget(), GRANT, "the working set less others' wired bytes");
+    assert_eq!(held.budget(), GRANT, "the working set less others' wired bytes and Metal's execution reserve");
     let room = reading.room_after(&ledgers).device.room();
     assert_eq!(room, GRANT, "the grant");
     let _plan = ledger.change(|keeping| ledger.claim_at(&keeping.claims(), Some(held), CommittedKind::Load, room)).expect("the room the load prices is admitted");
@@ -1830,8 +1826,8 @@ fn planning_room_capacity_is_structural_not_momentary_free() {
     assert_eq!(budget.available(), FREE_20G, "momentary free room at load is 20 GiB");
     assert_eq!(
         budget.capacity(),
-        WORKING_SET_48G,
-        "structural capacity is 48 GiB working set, not momentary 20 GiB free"
+        WORKING_SET_48G - WORKING_SET_48G / 12,
+        "structural capacity is 48 GiB working set less Metal execution reserve, not momentary 20 GiB free"
     );
 
     // Unified Linux CUDA (128 GiB host, 120 GiB CUDA limit) with 30 GiB free at load.
@@ -2019,10 +2015,11 @@ fn a_settled_idle_sleep_opens_a_fresh_baseline_at_the_next_reading() {
         wired: Some(seismic::WiredFigures { limit: seismic::WiredLimit::Set(22 * GB), wire_count: 4 * GB, at: wake }),
         ..host_sample(48 * GB, 20 * GB)
     };
+    let reserve = (22 * GB) / 12;
     let woken = ledger.read_after(ledger.sampled(wake), Reading::unified(&woken_sample, u64::MAX), true);
     assert_eq!(woken.guarantee(), 0, "an unmonitored sleep is not one step's supply rise");
-    assert_eq!(woken.budget(), 18 * GB, "wired ceiling takes the new wired baseline without a wake wired_rise");
-    assert_eq!(woken.room(), 18 * GB);
+    assert_eq!(woken.budget(), 18 * GB - reserve, "wired ceiling takes the new wired baseline less execution reserve");
+    assert_eq!(woken.room(), 18 * GB - reserve);
     assert_eq!(woken.cap(), None, "paging while asleep sets no active boundary");
     assert!(ledger.shortage(&std::collections::BTreeSet::new()).is_none(), "paging while asleep raises no active harm shortage");
     assert_eq!(ledger.standing(), None, "waking into ample free supply raises no false standing");
@@ -2038,8 +2035,9 @@ fn a_settled_idle_sleep_opens_a_fresh_baseline_at_the_next_reading() {
     };
     let chained = ledger.read(ledger.sampled(active), Reading::unified(&active_sample, u64::MAX));
     assert_eq!(chained.guarantee(), 2 * GB, "active readings after waking chain supply rise");
-    assert_eq!(chained.budget(), 16 * GB, "active readings after waking chain wired_rise (22 - 5 - 1 = 16 GB)");
-    assert_eq!(chained.room(), 14 * GB);
+    assert_eq!(chained.budget(), 17 * GB - reserve, "budget reflects current others_wired without double-dipping wired_rise");
+    assert_eq!(chained.room(), 15 * GB - reserve);
+    assert_eq!(chained.import_room(), 15 * GB - reserve, "import_room applies bank block_unit (1 GB) and wired_rise (1 GB) to wired growth ceiling");
     assert_eq!(ledger.others_interval(), Some(Duration::from_millis(100)));
 
     // A pressure event arriving during an idle sleep is never suppressed as an unmonitored wake.
@@ -2441,7 +2439,7 @@ fn relief_skips_at_floor_pool_and_reclaims_bank_synchronously() {
     let plan1 = ledger
         .plan_relief_excluding(1 * GB, Relief::CacheOnly, Frees::Room, &exhausted)
         .expect("first plan covers 1 GB from state pool spare");
-    let owed1 = ledger.change(|keeping| ledger.execute(&keeping.claims(), plan1));
+    let owed1 = ledger.change(|keeping| ledger.execute(&keeping.claims(), plan1, ReliefBoundary::Idle));
     assert_eq!(owed1.reclaimed, 0);
     assert_eq!(owed1.yielded, 0);
     assert!(!owed1.exhausted.is_empty());
@@ -2451,7 +2449,7 @@ fn relief_skips_at_floor_pool_and_reclaims_bank_synchronously() {
     let plan2 = ledger
         .plan_relief_excluding(1 * GB, Relief::CacheOnly, Frees::Room, &exhausted)
         .expect("second plan covers 1 GB from bank cache");
-    let owed2 = ledger.change(|keeping| ledger.execute(&keeping.claims(), plan2));
+    let owed2 = ledger.change(|keeping| ledger.execute(&keeping.claims(), plan2, ReliefBoundary::Idle));
     assert_eq!(owed2.reclaimed, 1 * GB);
     assert!(owed2.exhausted.is_empty());
 
@@ -2791,6 +2789,7 @@ fn graph_slots_yield_to_bank_only_when_bank_value_exceeds_rebuild_value() {
 fn live_iogpu_wire_count_does_not_attribute_own_growth_to_others_while_counted_lags() {
     const LAG_1S: Duration = Duration::from_secs(1);
     const WORKING_SET: u64 = 36 * GB;
+    const RESERVE: u64 = WORKING_SET / 12;
     const OTHERS_WIRED: u64 = 142 << 20;
     const GROWTH: u64 = 750 << 20;
 
@@ -2812,12 +2811,12 @@ fn live_iogpu_wire_count_does_not_attribute_own_growth_to_others_while_counted_l
 
     // Baseline reading with 34 GiB wired and 7 GiB free.
     ledger.read(ledger.sampled(t0), Reading::unified(&sample_at(t0, counted_t0, 0, 41 * GB), WORKING_SET));
-    let base_claim = ledger.change(|keeping| ledger.claim_at(&keeping.claims(), None, CommittedKind::Load, 34 * GB)).expect("base fits");
-    ledger.change(|_| base_claim.entry().take(&base_claim.entry().change(), 34 * GB, seismic::memory::Wiring::Wired)).expect("base wired");
+    let base_claim = ledger.change(|keeping| ledger.claim_at(&keeping.claims(), None, CommittedKind::Load, 32 * GB)).expect("base fits");
+    ledger.change(|_| base_claim.entry().take(&base_claim.entry().change(), 32 * GB, seismic::memory::Wiring::Wired)).expect("base wired");
     let t1 = t0 + Duration::from_secs(2);
     let counted_t1 = t1 - Duration::from_millis(200);
-    let est1 = ledger.read(ledger.sampled(t1), Reading::unified(&sample_at(t1, counted_t1, 34 * GB, 7 * GB), WORKING_SET));
-    assert_eq!(est1.budget(), WORKING_SET - OTHERS_WIRED);
+    let est1 = ledger.read(ledger.sampled(t1), Reading::unified(&sample_at(t1, counted_t1, 32 * GB, 9 * GB), WORKING_SET));
+    assert_eq!(est1.budget(), WORKING_SET - OTHERS_WIRED - RESERVE);
     assert_eq!(est1.unwired_shortfall(), 0);
 
     // Grow wired bank by +750 MiB, then read 25 ms later while `counted.at` is
@@ -2826,27 +2825,26 @@ fn live_iogpu_wire_count_does_not_attribute_own_growth_to_others_while_counted_l
     let grow_claim = ledger.change(|keeping| ledger.claim_at(&keeping.claims(), None, CommittedKind::Load, GROWTH)).expect("growth fits");
     ledger.change(|_| grow_claim.entry().take(&grow_claim.entry().change(), GROWTH, seismic::memory::Wiring::Wired)).expect("growth wired");
     let t2 = t1 + Duration::from_millis(25);
-    let est2 = ledger.read(ledger.sampled(t2), Reading::unified(&sample_at(t2, counted_t1, 34 * GB + GROWTH, 7 * GB - GROWTH), WORKING_SET));
+    let est2 = ledger.read(ledger.sampled(t2), Reading::unified(&sample_at(t2, counted_t1, 32 * GB + GROWTH, 9 * GB - GROWTH), WORKING_SET));
     assert_eq!(
         est2.budget(),
-        WORKING_SET - OTHERS_WIRED,
+        WORKING_SET - OTHERS_WIRED - RESERVE,
         "live IOGPU wire_count must not misattribute own wired growth as others_wired when counted.at lags"
     );
     assert_eq!(est2.unwired_shortfall(), 0);
 }
 
-/// On Apple Silicon Metal (`HostGrant::Wired`), elastic bank targets
-/// (`import_room`, `hold_room`, `target`) preserve at least
-/// `max(block_unit, 256 MiB, ceiling >> 5)` below `grant` so dynamic bank
-/// growth never pins `MTLDevice.currentAllocatedSize` to the hard command-
-/// buffer OOM cliff on 16 GiB Metal 3 or 32+ GiB Metal 4, while `budget()`
-/// remains exact for committed claims and host-RAM-tight readings waste zero
+/// On Apple Silicon Metal (`HostGrant::Wired`), `Read::grant` subtracts
+/// `Ceiling::execution_reserve()` (`max(512 MiB, limit / 12)`) directly so
+/// committed claims (`PromptScratch`, KV slabs) cannot eat the execution
+/// reserve, while `bank_budget()` keeps an additional `block_unit` cushion
+/// below `grant` for elastic banks, and host-RAM-tight readings waste zero
 /// bytes.
 #[test]
 fn metal_wired_ceiling_reserves_command_buffer_headroom_for_elastic_bank() {
     const TOTAL_16G: u64 = 16 * GB;
     const WORKING_SET: u64 = 11_453_251_584; // 16 GB M1 recommendedMaxWorkingSetSize
-    const PROPORTIONAL_16G: u64 = WORKING_SET >> 5; // 357.9 MB (> 256 MiB floor)
+    const RESERVE_16G: u64 = WORKING_SET / 12; // ~954.4 MB (> 512 MiB floor)
     const BLOCK_512M: u64 = 512 << 20;
     const COMMITTED: u64 = 6 * GB;
 
@@ -2878,31 +2876,35 @@ fn metal_wired_ceiling_reserves_command_buffer_headroom_for_elastic_bank() {
     ledger.read(ledger.sampled(t1), Reading::unified(&sample_with(t1, COMMITTED, 8 * GB), WORKING_SET));
     let t2 = clock.next();
     let est = ledger.read(ledger.sampled(t2), Reading::unified(&sample_with(t2, COMMITTED, 8 * GB), WORKING_SET));
-    assert_eq!(est.budget(), WORKING_SET, "committed budget stays exact at working set");
-    assert_eq!(est.import_room(), WORKING_SET - PROPORTIONAL_16G - COMMITTED);
-    assert_eq!(est.hold_room(), WORKING_SET - PROPORTIONAL_16G - COMMITTED);
-    assert_eq!(est.target(), WORKING_SET - PROPORTIONAL_16G - COMMITTED);
+    assert_eq!(est.budget(), WORKING_SET - RESERVE_16G, "committed budget preserves Metal execution reserve");
+    assert_eq!(est.import_room(), WORKING_SET - RESERVE_16G - COMMITTED);
+    assert_eq!(est.hold_room(), WORKING_SET - RESERVE_16G - COMMITTED);
+    assert_eq!(est.target(), WORKING_SET - RESERVE_16G - COMMITTED);
 
-    // Opening a pool with a 512 MiB block preserves the full block unit below `grant`.
+    // Opening a pool with a 512 MiB block preserves an additional full block_unit
+    // cushion below `budget()` for elastic bank targets.
     let _records = ledger.pool_block(PoolClass::Records, NonZeroU64::new(BLOCK_512M).unwrap()).blocks;
     let t3 = clock.next();
     let est_pool = ledger.read(ledger.sampled(t3), Reading::unified(&sample_with(t3, COMMITTED, 8 * GB), WORKING_SET));
-    assert_eq!(est_pool.import_room(), WORKING_SET - BLOCK_512M - COMMITTED);
-    assert_eq!(est_pool.target(), WORKING_SET - BLOCK_512M - COMMITTED);
+    assert_eq!(est_pool.budget(), WORKING_SET - RESERVE_16G);
+    assert_eq!(est_pool.import_room(), WORKING_SET - RESERVE_16G - BLOCK_512M - COMMITTED);
+    assert_eq!(est_pool.hold_room(), WORKING_SET - RESERVE_16G - BLOCK_512M - COMMITTED);
+    assert_eq!(est_pool.target(), WORKING_SET - RESERVE_16G - BLOCK_512M - COMMITTED);
 
-    // When host RAM supply is tighter than `grant - headroom`, zero bytes are wasted.
+    // When host RAM supply is tighter than `grant - block_unit`, zero bytes are wasted.
     let t4 = clock.next();
     let est_tight = ledger.read(ledger.sampled(t4), Reading::unified(&sample_with(t4, COMMITTED, 3 * GB), WORKING_SET));
     assert_eq!(est_tight.budget(), 9 * GB);
     assert_eq!(est_tight.hold_room(), 9 * GB - COMMITTED);
 
     // On a 32 GiB Metal 4 M2 Pro (`26,800,603,136` recommended working set) with
-    // ~516 MB `others_wired`, proportional 3.125% headroom (~837.5 MB) keeps
-    // elastic bank targets well clear of Metal 4's command-buffer OOM cliff.
+    // ~516 MB `others_wired`, execution_reserve (~1.34 GB) sits below `grant`
+    // for all claims, and opening a records pool adds a dedicated block_unit
+    // cushion on top for elastic banks.
     const TOTAL_32G: u64 = 32 * GB;
     const WORKING_SET_M2PRO: u64 = 26_800_603_136;
     const OTHERS_WIRED_M2PRO: u64 = 515_842_180;
-    const PROPORTIONAL_M2PRO: u64 = WORKING_SET_M2PRO >> 5;
+    const RESERVE_M2PRO: u64 = WORKING_SET_M2PRO / 12;
     const COMMITTED_M2PRO: u64 = 7 * GB;
     let scope32 = Ledgers::new();
     let ledger32 = scope32.ledger(seismic::StoreIdentity::HostRam, shape());
@@ -2924,30 +2926,32 @@ fn metal_wired_ceiling_reserves_command_buffer_headroom_for_elastic_bank() {
     ledger32
         .change(|_| base32.entry().take(&base32.entry().change(), COMMITTED_M2PRO, seismic::memory::Wiring::Wired))
         .expect("committed wired");
+    let _records32 = ledger32.pool_block(PoolClass::Records, NonZeroU64::new(BLOCK_512M).unwrap()).blocks;
     let s1 = clock.next();
     ledger32.read(ledger32.sampled(s1), Reading::unified(&sample32(s1, COMMITTED_M2PRO, 21 * GB), WORKING_SET_M2PRO));
     let s2 = clock.next();
     let est32 = ledger32.read(ledger32.sampled(s2), Reading::unified(&sample32(s2, COMMITTED_M2PRO, 21 * GB), WORKING_SET_M2PRO));
-    let wired_grant = WORKING_SET_M2PRO - OTHERS_WIRED_M2PRO;
+    let wired_grant = WORKING_SET_M2PRO - OTHERS_WIRED_M2PRO - RESERVE_M2PRO;
     assert_eq!(est32.budget(), wired_grant);
-    assert_eq!(est32.target(), wired_grant - PROPORTIONAL_M2PRO - COMMITTED_M2PRO);
+    assert_eq!(est32.target(), wired_grant - BLOCK_512M - COMMITTED_M2PRO);
     assert!(
-        COMMITTED_M2PRO + est32.target() <= WORKING_SET_M2PRO - (1 << 30),
-        "32 GiB Metal 4 target must leave >1 GiB below recommendedMaxWorkingSetSize"
+        COMMITTED_M2PRO + est32.target() <= WORKING_SET_M2PRO - (1_500_000_000),
+        "32 GiB Metal 4 target must leave >1.5 GB below recommendedMaxWorkingSetSize"
     );
 }
 
 /// Live `MTLDevice.currentAllocatedSize` headroom (`left = working_set -
 /// currentAllocatedSize`) is reconciled into `HostGrant::Wired` so uncharged
 /// Metal allocations (pipelines, driver heaps, command rings) reduce `grant`,
-/// `budget()`, and elastic bank targets byte-for-byte.
+/// `budget()`, and elastic bank targets byte-for-byte while preserving
+/// `Ceiling::execution_reserve()` and any pool `block_unit` cushion.
 #[test]
 fn metal_working_set_left_reconciles_uncharged_metal_allocations() {
     const TOTAL_16G: u64 = 16 * GB;
     const WORKING_SET: u64 = 11_453_251_584;
+    const RESERVE: u64 = WORKING_SET / 12;
     const COMMITTED: u64 = 8 * GB;
     const UNCHARGED_METAL: u64 = 400 << 20;
-    const HEADROOM: u64 = WORKING_SET >> 5;
 
     let scope = Ledgers::new();
     let ledger = scope.ledger(seismic::StoreIdentity::HostRam, shape());
@@ -2988,13 +2992,13 @@ fn metal_working_set_left_reconciles_uncharged_metal_allocations() {
     );
     assert_eq!(
         est.budget(),
-        WORKING_SET - UNCHARGED_METAL,
-        "uncharged Metal allocations in currentAllocatedSize must reduce wired grant byte-for-byte"
+        WORKING_SET - UNCHARGED_METAL - RESERVE,
+        "uncharged Metal allocations in currentAllocatedSize must reduce wired grant byte-for-byte while preserving execution reserve"
     );
     assert_eq!(
         est.target(),
-        WORKING_SET - UNCHARGED_METAL - HEADROOM - COMMITTED,
-        "elastic bank target must stay >= proportional headroom below remaining Metal working set"
+        WORKING_SET - UNCHARGED_METAL - RESERVE - COMMITTED,
+        "elastic bank target must stay below remaining Metal working set minus execution reserve"
     );
 }
 
@@ -3064,4 +3068,231 @@ fn cuda_device_cache_reserve_bounds_elastic_bank_without_reducing_resident_admis
     let pressed = ledger.estimate();
     assert_eq!(pressed.hold_room(), bank_bytes - EXTERNAL_CTX);
     assert_eq!(pressed.budget(), VRAM - EXTERNAL_CTX);
+}
+
+/// Executing a relief plan at `ReliefBoundary::InFlight` must NEVER invoke a
+/// synchronous `Reclaim::Backed` reclaimer (which would self-deadlock the
+/// owner thread waiting for active steps to go idle); instead it records a
+/// logical yield in the ledger so `release_running` or the next idle boundary
+/// releases the cache safely. At `ReliefBoundary::Idle`, the backed reclaimer
+/// is invoked synchronously as usual.
+#[test]
+fn in_flight_relief_defers_backed_reclaimer_and_idle_reclaims_synchronously() {
+    use seismic::memory::Wiring::Pageable;
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+
+    struct GuardedBankReclaimer {
+        ledger: Ledger,
+        pool: Arc<dyn seismic::memory::Entry>,
+        piece: std::sync::Mutex<Option<Cached>>,
+        in_flight: Arc<AtomicBool>,
+        calls: Arc<AtomicUsize>,
+    }
+
+    impl CacheReclaimer for GuardedBankReclaimer {
+        fn reclaim(&self, need: u64) -> Result<u64, ReclaimError> {
+            assert!(
+                !self.in_flight.load(Ordering::Acquire),
+                "Reclaim::Backed must never be invoked at ReliefBoundary::InFlight"
+            );
+            self.calls.fetch_add(1, Ordering::AcqRel);
+            let mut guard = self.piece.lock().unwrap();
+            let Some(cached) = guard.as_mut() else {
+                return Err(ReclaimError::AtFloor);
+            };
+            let cut = cached.bytes().min(need);
+            if cut == 0 {
+                return Err(ReclaimError::AtFloor);
+            }
+            let split = cached.split(cut, CacheKind::Bank);
+            self.ledger.change(|_| {
+                drop(split);
+                self.pool.freed(&self.pool.change(), cut, Pageable);
+            });
+            Ok(cut)
+        }
+    }
+
+    let (_scope, ledger, pools) = host();
+    let mut clock = Clock::new();
+    read(&ledger, &mut clock, 16 * GB, 16 * GB, None);
+    let bank_claim = ledger
+        .change(|keeping| ledger.backing(&keeping.claims(), PoolClass::Records, 4 * GB))
+        .expect("bank backing fits");
+    ledger
+        .change(|_| pools.records.take(&pools.records.change(), 4 * GB, Pageable))
+        .expect("records pool allocates");
+
+    let in_flight = Arc::new(AtomicBool::new(true));
+    let calls = Arc::new(AtomicUsize::new(0));
+    let reclaimer = Arc::new(GuardedBankReclaimer {
+        ledger: ledger.clone(),
+        pool: pools.records.clone(),
+        piece: std::sync::Mutex::new(None),
+        in_flight: in_flight.clone(),
+        calls: calls.clone(),
+    });
+    let weak = Arc::downgrade(&reclaimer) as std::sync::Weak<dyn CacheReclaimer>;
+    let bank_cache = ledger.change(|_| bank_claim.into_backed_cache(CacheKind::Bank, Reclaim::Backed(weak)));
+    *reclaimer.piece.lock().unwrap() = Some(bank_cache);
+
+    // 1. In-flight relief: records logical yield without invoking the backed reclaimer.
+    let plan_in_flight = ledger
+        .plan_relief(2 * GB, Relief::CacheOnly, Frees::Room)
+        .expect("bank cache covers 2 GB in-flight");
+    let owed = ledger.change(|keeping| ledger.execute(&keeping.claims(), plan_in_flight, ReliefBoundary::InFlight));
+    assert_eq!(calls.load(Ordering::Acquire), 0, "in-flight relief must not invoke backed reclaimer");
+    assert_eq!(owed.yielded, 2 * GB);
+    assert_eq!(owed.reclaimed, 0);
+    assert!(owed.exhausted.is_empty());
+    let after_in_flight = ledger.estimate();
+    assert_eq!(after_in_flight.cache_of(CacheKind::Bank), 2 * GB);
+    assert_eq!(after_in_flight.releasing(), 2 * GB);
+
+    // 2. Once the flight ends (Idle boundary), relief invokes the backed reclaimer cleanly
+    //    and returning the previously yielded pool blocks clears releasing back to 0.
+    in_flight.store(false, Ordering::Release);
+    let plan_idle = ledger
+        .plan_relief(1 * GB, Relief::CacheOnly, Frees::Room)
+        .expect("remaining bank cache covers 1 GB at idle");
+    let owed_idle = ledger.change(|keeping| ledger.execute(&keeping.claims(), plan_idle, ReliefBoundary::Idle));
+    assert_eq!(calls.load(Ordering::Acquire), 1, "idle relief invokes backed reclaimer synchronously");
+    assert_eq!(owed_idle.reclaimed, 1 * GB);
+    assert_eq!(owed_idle.yielded, 1 * GB);
+    assert_eq!(ledger.estimate().cache_of(CacheKind::Bank), 1 * GB);
+
+    // Return the 2 GB that yielded logically while in-flight, plus the final 1 GB on drop.
+    ledger.change(|_| {
+        pools.records.freed(&pools.records.change(), 2 * GB, Pageable);
+        let remaining = reclaimer.piece.lock().unwrap().take();
+        drop(remaining);
+        pools.records.freed(&pools.records.change(), 1 * GB, Pageable);
+    });
+    assert_eq!(ledger.estimate().releasing(), 0);
+    assert_eq!(ledger.estimate().cache_of(CacheKind::Bank), 0);
+}
+
+/// Regression test for A-3 (Metal OOM + 52-growth resize thrash):
+/// 1. Committed `Scratch` claims reclaim elastic bank slots instead of
+///    consuming Metal's `Ceiling::execution_reserve()`, and a claim exceeding
+///    `budget()` is refused before touching the reserve.
+/// 2. `bank_budget()` keeps a dedicated `block_unit` cushion below `budget()`
+///    so minor KV/scratch growth fits without reclaiming elastic bank slots.
+/// 3. Single-sample `wired_rise` jitter in `others_wired` lowers `hold_room()`
+///    by the actual wired delta (1x, never 2x), while holding back growth in
+///    `import_room()` / `target()` by an extra `wired_rise`.
+#[test]
+fn metal_execution_reserve_bank_cushion_and_wired_jitter_stability() {
+    const TOTAL_32G: u64 = 32 * GB;
+    const WORKING_SET: u64 = 26_800_603_136; // M2 Pro 32 GB
+    const RESERVE: u64 = WORKING_SET / 12; // ~2.23 GB
+    const BLOCK_UNIT: u64 = 256 << 20; // 256 MiB records pool block
+    const COMMITTED: u64 = 10 * GB;
+    const OTHERS_WIRED: u64 = 512 << 20;
+
+    let scope = Ledgers::new();
+    let ledger = scope.ledger(seismic::StoreIdentity::HostRam, shape());
+    let mut clock = Clock::new();
+    let sample_with = |at: Instant, own_wired: u64, others_wired: u64, free: u64| seismic::HostSample {
+        at,
+        counted: seismic::Counted { at, lag: Duration::ZERO },
+        wired: Some(seismic::WiredFigures {
+            limit: seismic::WiredLimit::OsDefault,
+            wire_count: own_wired + others_wired,
+            at,
+        }),
+        ..host_sample(TOTAL_32G, free)
+    };
+
+    let t0 = clock.next();
+    ledger.read(ledger.sampled(t0), Reading::unified(&sample_with(t0, 0, OTHERS_WIRED, 28 * GB), WORKING_SET));
+    let base = ledger
+        .change(|keeping| ledger.claim_at(&keeping.claims(), None, CommittedKind::Load, COMMITTED))
+        .expect("base committed fits");
+    ledger
+        .change(|_| base.entry().take(&base.entry().change(), COMMITTED, seismic::memory::Wiring::Wired))
+        .expect("base wired");
+    let _records = ledger.pool_block(PoolClass::Records, NonZeroU64::new(BLOCK_UNIT).unwrap()).blocks;
+
+    // Settle two calm readings so growth is judged.
+    let t1 = clock.next();
+    ledger.read(ledger.sampled(t1), Reading::unified(&sample_with(t1, COMMITTED, OTHERS_WIRED, 18 * GB), WORKING_SET));
+    let t2 = clock.next();
+    let est = ledger.read(ledger.sampled(t2), Reading::unified(&sample_with(t2, COMMITTED, OTHERS_WIRED, 18 * GB), WORKING_SET));
+
+    let expected_grant = WORKING_SET - OTHERS_WIRED - RESERVE;
+    assert_eq!(est.budget(), expected_grant, "grant excludes execution_reserve");
+    assert_eq!(
+        est.hold_room(),
+        expected_grant - BLOCK_UNIT - COMMITTED,
+        "bank_budget keeps a full block_unit cushion below budget()"
+    );
+    assert_eq!(est.import_room(), est.hold_room());
+    assert_eq!(est.target(), est.hold_room());
+
+    // Fill elastic bank right up to `target()`, leaving `BLOCK_UNIT` free below `budget()`.
+    let bank_bytes = est.target();
+    let bank = ledger.cache(CacheKind::Bank, bank_bytes, Reclaim::Unbacked).expect("bank fits target");
+    assert_eq!(ledger.estimate().free(), BLOCK_UNIT, "block_unit cushion remains free below budget()");
+
+    // (3) Minor scratch/KV claim (128 MiB < BLOCK_UNIT) fits inside the cushion
+    // without touching the elastic bank at all.
+    let minor = ledger
+        .change(|keeping| ledger.claim_at(&keeping.claims(), None, CommittedKind::Scratch, 128 << 20))
+        .expect("minor scratch fits inside block_unit cushion");
+    assert_eq!(bank.bytes(), bank_bytes, "minor scratch within block_unit cushion must not reclaim bank slots");
+    ledger.change(|_| drop(minor));
+
+    // (1) Larger PromptScratch claim (512 MiB > BLOCK_UNIT) reclaims bank slots
+    // instead of eating into Metal's execution_reserve, and a claim that would
+    // exceed `budget()` (into execution_reserve) is refused.
+    let scratch_bytes = 512 << 20;
+    let prompt_scratch = ledger
+        .change(|keeping| ledger.claim_at(&keeping.claims(), None, CommittedKind::Scratch, scratch_bytes))
+        .expect("PromptScratch reclaims bank slots within budget()");
+    assert_eq!(
+        bank_bytes - bank.bytes(),
+        scratch_bytes - BLOCK_UNIT,
+        "PromptScratch beyond block_unit cushion must reclaim elastic bank slots"
+    );
+    let over_budget = ledger.estimate().room() + 1;
+    assert!(
+        ledger
+            .change(|keeping| ledger.claim_at(&keeping.claims(), None, CommittedKind::Scratch, over_budget))
+            .is_err(),
+        "committed claim cannot eat into Metal's execution_reserve"
+    );
+    ledger.change(|_| drop(prompt_scratch));
+    ledger.change(|_| drop(bank));
+
+    // (2) Single-sample `others_wired` jitter (+128 MiB): `budget()` and `hold_room()`
+    // drop by 1x jitter (128 MiB), NOT 2x (256 MiB), while `import_room()` / `target()`
+    // drop by 2x jitter (128 MiB grant + 128 MiB wired_rise) to pause bank growth.
+    let jitter: u64 = 128 << 20;
+    let t3 = clock.next();
+    let settled_before = ledger.read(
+        ledger.sampled(t3),
+        Reading::unified(&sample_with(t3, COMMITTED, OTHERS_WIRED, 18 * GB), WORKING_SET),
+    );
+    let t4 = clock.next();
+    let jittered = ledger.read(
+        ledger.sampled(t4),
+        Reading::unified(&sample_with(t4, COMMITTED, OTHERS_WIRED + jitter, 18 * GB), WORKING_SET),
+    );
+    assert_eq!(
+        settled_before.budget() - jittered.budget(),
+        jitter,
+        "budget drops by 1x wired jitter, not 2x"
+    );
+    assert_eq!(
+        settled_before.hold_room() - jittered.hold_room(),
+        jitter,
+        "hold_room drops by 1x wired jitter (no double-dip shrink thrash)"
+    );
+    assert_eq!(
+        settled_before.import_room() - jittered.import_room(),
+        2 * jitter,
+        "import_room applies wired_rise on top of grant drop to hold back growth"
+    );
+    assert_eq!(jittered.target(), jittered.import_room());
 }

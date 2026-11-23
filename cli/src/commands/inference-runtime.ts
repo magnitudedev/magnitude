@@ -373,19 +373,28 @@ export const renderHardware = ({ hardware, models }: HardwareView): string => {
     ...presentation.accelerators.flatMap((accelerator) => ["", accelerator.name, `  ${accelerator.details}`]),
     "",
     "Memory",
-    ...memory.domains.flatMap((domain) => [
-      `  ${domain.label}`,
-      ...(domain.usedBytes === null || domain.freeBytes === null ? [`  ${domain.notice ?? "Current memory usage is unavailable."}`] : [
-        `  ${formatMemoryCapacity(domain.usedBytes)} / ${formatMemoryCapacity(domain.totalBytes)} used`,
-        ...(Option.isSome(allocation) ? [
-          `  Weights       ${formatMemoryCapacity(domain.weightsBytes ?? 0)}`,
-          `  Context       ${formatMemoryCapacity(domain.kvCacheBytes ?? 0)}`,
-          `  Overhead      ${formatMemoryCapacity(domain.overheadBytes ?? 0)}`,
-          `  System & apps ${formatMemoryCapacity(domain.systemAndAppsBytes ?? 0)}`,
-        ] : []),
-        `  Free          ${formatMemoryCapacity(domain.freeBytes)}`,
-      ]),
-    ]),
+    ...memory.domains.flatMap((domain) => {
+      const hasModelBreakdown = domain.status !== "inconsistent"
+        && domain.weightsBytes !== null
+        && domain.kvCacheBytes !== null
+        && domain.overheadBytes !== null
+        && domain.systemAndAppsBytes !== null
+        && domain.weightsBytes + domain.kvCacheBytes + domain.overheadBytes > 0
+      return [
+        `  ${domain.label}`,
+        ...(domain.usedBytes === null || domain.freeBytes === null ? [`  ${domain.notice ?? "Current memory usage is unavailable."}`] : [
+          `  ${formatMemoryCapacity(domain.usedBytes)} / ${formatMemoryCapacity(domain.totalBytes)} used`,
+          ...(domain.status === "inconsistent" && domain.notice !== null ? [`  ${domain.notice}`] : []),
+          ...(hasModelBreakdown ? [
+            `  Weights       ${formatMemoryCapacity(domain.weightsBytes)}`,
+            `  Context       ${formatMemoryCapacity(domain.kvCacheBytes)}`,
+            `  Overhead      ${formatMemoryCapacity(domain.overheadBytes)}`,
+            `  System & apps ${formatMemoryCapacity(domain.systemAndAppsBytes)}`,
+          ] : []),
+          `  Free          ${formatMemoryCapacity(domain.freeBytes)}`,
+        ]),
+      ]
+    }),
     "",
     "Current model",
     ...(current === undefined ? ["  None"] : [

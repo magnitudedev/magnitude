@@ -91,6 +91,7 @@ export const projectInferenceHardware = (
   const host = hardware.host_ram
   const placements = yield* resolvePlacements(hardware)
   const active = yield* resolveActive(hardware, instances)
+  const gpuUnusedReason = resolveGpuUnusedReason(hardware, active, deviceBytes(hardware, placements))
   const accelerators = hardware.physical_devices.flatMap(physical => {
     const executors = physical.executors.filter(executor => executor.availability.type === "available")
     const [first] = executors
@@ -150,6 +151,7 @@ export const projectInferenceHardware = (
       Option.fromNullable(hardware.volumes.find(volume => volume.roles.includes("model_store"))),
       volume => ({ freeBytes: volume.current_free_bytes }),
     ),
+    ...(Option.isSome(gpuUnusedReason) ? { gpuUnusedReason: gpuUnusedReason.value } : {}),
   }
 })
 
@@ -183,6 +185,38 @@ const deviceBytes = (
   }
 }
 
+/**
+ * Why a GPU is not being used when running on CPU: the largest physical GPU executor's
+ * unavailability or backend diagnostic (or "not selected"), and when no physical GPU executor
+ * was reported at all, the first non-CPU backend diagnostic.
+ */
+const resolveGpuUnusedReason = (
+  hardware: InferenceSchema.HardwareSnapshot,
+  active: SnapshotExecutor,
+  bytes: (entry: SnapshotExecutor) => number,
+): Option.Option<string> => {
+  if (active.physical.kind !== "cpu") return Option.none()
+  const diagnostics = Option.getOrElse(hardware.backend_diagnostics, () => [])
+  const largestFirst = snapshotExecutors(hardware).filter(({ physical }) => physical.kind !== "cpu")
+    .sort((a, b) => bytes(b) - bytes(a))
+  const unused = largestFirst[0]
+  if (unused !== undefined) {
+    if (unused.executor.availability.type === "unavailable") {
+      return Option.some(unused.executor.availability.reason)
+    }
+    const diagnostic = diagnostics.find(item => item.source.type === "backend" && item.source.backend === unused.executor.backend)
+    if (diagnostic) return Option.some(`${unused.executor.backend}: ${diagnostic.message}`)
+    return Option.some(`${unused.executor.backend}: not selected`)
+  }
+  const backendDiagnostic = diagnostics.find(
+    (item): item is InferenceSchema.HardwareBackendDiagnostic & { readonly source: { readonly type: "backend"; readonly backend: InferenceSchema.ExecutionBackend } } =>
+      item.source.type === "backend" && item.source.backend !== "cpu" && item.message.trim().length > 0,
+  )
+  return backendDiagnostic === undefined
+    ? Option.none()
+    : Option.some(`${backendDiagnostic.source.backend}: ${backendDiagnostic.message.trim()}`)
+}
+
 /** The machine as one record: the active device's backend, its GPU if it is one, and why a present GPU is not used. */
 export const summarizeInferenceHardware = (
   hardware: InferenceSchema.HardwareSnapshot,
@@ -191,23 +225,13 @@ export const summarizeInferenceHardware = (
   const bytes = deviceBytes(hardware, yield* resolvePlacements(hardware))
   const active = yield* resolveActive(hardware, instances)
   const used = active.physical.kind === "cpu" ? undefined : active
-  const largestFirst = snapshotExecutors(hardware).filter(({ physical }) => physical.kind !== "cpu")
-    .sort((a, b) => bytes(b) - bytes(a))
-  const diagnostics = Option.getOrElse(hardware.backend_diagnostics, () => [])
-  const unusedReason = ({ executor }: SnapshotExecutor): string => {
-    if (executor.availability.type === "unavailable") return executor.availability.reason
-    const diagnostic = diagnostics.find(item => item.source.type === "backend" && item.source.backend === executor.backend)
-    if (diagnostic) return `${executor.backend}: ${diagnostic.message}`
-    return `${executor.backend}: not selected`
-  }
-  const unused = used ? undefined : largestFirst[0]
   return {
     backend: active.executor.backend,
     gpuName: Option.fromNullable(used?.executor.name).pipe(Option.filter(name => name.length > 0)),
     gpuKind: used ? Option.some(used.physical.kind === "integrated_gpu" ? "integrated" : "discrete") : Option.none(),
     gpuMemoryBytes: used ? Option.some(bytes(used)) : Option.none(),
     gpuCount: hardware.physical_devices.filter(physical => physical.kind !== "cpu").length,
-    gpuUnusedReason: unused ? Option.some(unusedReason(unused)) : Option.none(),
+    gpuUnusedReason: resolveGpuUnusedReason(hardware, active, bytes),
     cpuModel: Option.flatMap(hardware.cpu_model, Option.fromNullable).pipe(Option.filter(model => model.trim().length > 0)),
     cpuPoolCores: hardware.cpu_pool_cores,
     logicalCpus: hardware.logical_cpus,

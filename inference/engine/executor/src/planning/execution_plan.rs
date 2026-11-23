@@ -2,9 +2,11 @@
 
 use super::{
     ArtifactComponent, ArtifactComponentKind, AssessmentMemoryCharge, CapabilityPlan,
-    ComponentPlan, ComponentSelection, HostTier, MAX_DRAFT_PROPOSALS, MemoryBudget, ModelLoadPlan, PassLaunches, PlannedMethod,
+    ComponentPlan, ComponentSelection, HostTier, MAX_DRAFT_PROPOSALS, ModelLoadPlan, PassLaunches, PlannedMethod,
     ProgramPlan, ReadoutClassChoice, ResourceLimits, ResourcePlan, WeightPlan,
 };
+#[cfg(test)]
+use super::MemoryBudget;
 use crate::{
     ExecutionPath, UnstreamedExperts,
     assessment::{Priced, stage_timer},
@@ -554,76 +556,25 @@ impl ExecutionPlanDraft {
         let ceiling = match self.bank_ceiling(definition, bound, Some(prices))? {
             Ok(ceiling) => ceiling,
             Err(NoBank::Unstreamed(reason)) => {
-                let Some(chains) = self.whole_chains(definition, bound)? else {
-                    return placed(figures, Placing::None(NoBank::Unstreamed(reason)));
+                let mut outcome = self.place_whole_resident(definition, bound, held, budget, confirm, &mut figures, &reason)?;
+                if matches!(outcome, Err(NoBank::Short { .. })) && self.bank_decode_rows() > 8 {
+                    let stepped = self.with_decode_rows_cap(8);
+                    match stepped.place_whole_resident(definition, bound, held, budget, confirm, &mut figures, &reason)? {
+                        Ok(found) => outcome = Ok(found),
+                        Err(short @ NoBank::Short { deficit_bytes, .. }) => {
+                            if let Err(NoBank::Short { deficit_bytes: least, .. }) = &outcome {
+                                if deficit_bytes < *least {
+                                    outcome = Err(short);
+                                }
+                            }
+                        }
+                        Err(_) => {}
+                    }
+                }
+                return match outcome {
+                    Ok((draft, charge, found)) => placed(figures, Placing::Whole { draft, charge, found }),
+                    Err(no) => placed(figures, Placing::None(no)),
                 };
-                // The longest chain the budget holds, each as `confirm` decides it.
-                // When live headroom sits below structural capacity (e.g. an idle
-                // 16 GB Mac whose OS leaves 8.9-10.7 GB below Metal's 11.45 GB
-                // working set), elastic KV history is allocated on demand after
-                // load: if no chain holds full-context KV upfront, admit the
-                // longest chain whose full workload fits structural capacity and
-                // whose actual startup demand (`fit_startup`) fits live headroom.
-                let mut last_short = None;
-                let mut startup_fallback: Option<Box<(Self, C, super::WholeFit)>> = None;
-                for places in chains {
-                    let resident = self.held_whole_at(definition, places)?;
-                    let charge = held.charge(definition, &resident)?;
-                    let fit = budget.fit_whole(&resident, charge.charge())?;
-                    figures.resident = Some(Need { fit: Some(fit), terms: NeedTerms::of(&resident, charge.charge())? });
-                    if let Some(deficit_bytes) = fit.short {
-                        if budget.live_below_capacity() && budget.fits_capacity(&resident, charge.charge())? {
-                            let startup_fit = budget.fit_startup(&resident, charge.charge())?;
-                            if let Some(startup_deficit) = startup_fit.short {
-                                last_short = Some(NoBank::Short {
-                                    deficit_bytes: startup_deficit,
-                                    required: startup_fit.limiting_required,
-                                    available: startup_fit.limiting_available,
-                                });
-                            } else if startup_fallback.is_none() {
-                                startup_fallback = Some(Box::new((resident, charge, startup_fit)));
-                            }
-                        } else {
-                            last_short = Some(NoBank::Short {
-                                deficit_bytes,
-                                required: fit.limiting_required,
-                                available: fit.limiting_available,
-                            });
-                        }
-                    } else {
-                        match confirm(&resident, charge.charge())? {
-                            Ok(found) => {
-                                figures.form = Some(WholeForm::Resident);
-                                return placed(figures, Placing::Whole { draft: resident, charge, found });
-                            }
-                            Err(deficit_bytes) => {
-                                last_short = Some(NoBank::Short {
-                                    deficit_bytes,
-                                    required: fit.limiting_required,
-                                    available: fit.limiting_available,
-                                });
-                            }
-                        }
-                    }
-                }
-                if let Some(fallback) = startup_fallback {
-                    let (resident, charge, fit) = *fallback;
-                    figures.resident = Some(Need { fit: Some(fit), terms: NeedTerms::of(&resident, charge.charge())? });
-                    match confirm(&resident, charge.charge())? {
-                        Ok(found) => {
-                            figures.form = Some(WholeForm::Resident);
-                            return placed(figures, Placing::Whole { draft: resident, charge, found });
-                        }
-                        Err(deficit_bytes) => {
-                            last_short = Some(NoBank::Short {
-                                deficit_bytes,
-                                required: fit.limiting_required,
-                                available: fit.limiting_available,
-                            });
-                        }
-                    }
-                }
-                return placed(figures, Placing::None(last_short.unwrap_or(NoBank::Unstreamed(reason))));
             }
             Err(no) => return placed(figures, Placing::None(no)),
         };
@@ -817,6 +768,89 @@ impl ExecutionPlanDraft {
     }
 
     #[allow(clippy::too_many_arguments)]
+    fn place_whole_resident<C: HeldCharge, T, E: From<PlanError>>(
+        &self,
+        definition: &ModelDefinition,
+        bound: HeldBound,
+        held: &mut HeldCharges<C>,
+        budget: &super::MemoryBudget,
+        confirm: &mut impl FnMut(&Self, &AssessmentMemoryCharge) -> Result<Result<T, NonZeroU64>, E>,
+        figures: &mut PlacementFigures,
+        reason: &UnstreamedExperts,
+    ) -> Result<Result<(Self, C, T), NoBank>, E> {
+        let Some(chains) = self.whole_chains(definition, bound)? else {
+            return Ok(Err(NoBank::Unstreamed(reason.clone())));
+        };
+        // The longest chain the budget holds, each as `confirm` decides it.
+        // When live headroom sits below structural capacity (e.g. an idle
+        // 16 GB Mac whose OS leaves 8.9-10.7 GB below Metal's working set),
+        // elastic KV history is allocated on demand after load: if no chain
+        // holds full-context KV upfront, admit the longest chain whose full
+        // workload fits structural capacity and whose actual startup demand
+        // (`fit_startup`) fits live headroom.
+        let mut last_short = None;
+        let mut startup_fallback: Option<Box<(Self, C, super::WholeFit)>> = None;
+        for places in chains {
+            let resident = self.held_whole_at(definition, places)?;
+            let charge = held.charge(definition, &resident)?;
+            let fit = budget.fit_whole(&resident, charge.charge())?;
+            figures.resident = Some(Need { fit: Some(fit), terms: NeedTerms::of(&resident, charge.charge())? });
+            if let Some(deficit_bytes) = fit.short {
+                if budget.live_below_capacity() && budget.fits_capacity(&resident, charge.charge())? {
+                    let startup_fit = budget.fit_startup(&resident, charge.charge())?;
+                    if let Some(startup_deficit) = startup_fit.short {
+                        last_short = Some(NoBank::Short {
+                            deficit_bytes: startup_deficit,
+                            required: startup_fit.limiting_required,
+                            available: startup_fit.limiting_available,
+                        });
+                    } else if startup_fallback.is_none() {
+                        startup_fallback = Some(Box::new((resident, charge, startup_fit)));
+                    }
+                } else {
+                    last_short = Some(NoBank::Short {
+                        deficit_bytes,
+                        required: fit.limiting_required,
+                        available: fit.limiting_available,
+                    });
+                }
+            } else {
+                match confirm(&resident, charge.charge())? {
+                    Ok(found) => {
+                        figures.form = Some(WholeForm::Resident);
+                        return Ok(Ok((resident, charge, found)));
+                    }
+                    Err(deficit_bytes) => {
+                        last_short = Some(NoBank::Short {
+                            deficit_bytes,
+                            required: fit.limiting_required,
+                            available: fit.limiting_available,
+                        });
+                    }
+                }
+            }
+        }
+        if let Some(fallback) = startup_fallback {
+            let (resident, charge, fit) = *fallback;
+            figures.resident = Some(Need { fit: Some(fit), terms: NeedTerms::of(&resident, charge.charge())? });
+            match confirm(&resident, charge.charge())? {
+                Ok(found) => {
+                    figures.form = Some(WholeForm::Resident);
+                    return Ok(Ok((resident, charge, found)));
+                }
+                Err(deficit_bytes) => {
+                    last_short = Some(NoBank::Short {
+                        deficit_bytes,
+                        required: fit.limiting_required,
+                        available: fit.limiting_available,
+                    });
+                }
+            }
+        }
+        Ok(Err(last_short.unwrap_or_else(|| NoBank::Unstreamed(reason.clone()))))
+    }
+
+    #[allow(clippy::too_many_arguments)]
     fn settled_in<C: HeldCharge, T, E: From<PlanError>>(
         &self,
         ceiling: &BankCeiling,
@@ -885,6 +919,7 @@ impl ExecutionPlanDraft {
         let cap = decode_rows.clamp(1, magnitude_kernels::constants::VERIFY_ROWS) as usize;
         policy.method = policy.method.capped_to_decode_rows(decode_rows);
         policy.limits.max_launch_slots = policy.limits.max_launch_slots.min(cap);
+        policy.limits.max_drafting_slots = policy.limits.max_drafting_slots.min(policy.limits.max_launch_slots);
         if policy.method.drafts() {
             let rows_per_slot = policy.method.draft_rows() + 1;
             policy.limits.max_drafting_slots = policy.limits.max_drafting_slots.min((cap / rows_per_slot).max(1));
@@ -1882,6 +1917,27 @@ fn command_buffer_capacity(
         .saturating_add(service_cbs)
 }
 
+/// Structural key for a cached banked charge: every field of a draft's bank
+/// and policy that [`AssessmentMemoryCharge::at_bank_slots`] cannot derive
+/// from a previously certified charge.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct BankChargeKey {
+    pass: PassLaunches,
+    resident: bool,
+    window_slots: u64,
+    decode_rows: u64,
+    paths: super::BankPaths,
+    limits: ResourceLimits,
+    method: PlannedMethod,
+}
+
+/// Structural key for a cached whole-plan charge.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct WholeChargeKey {
+    limits: ResourceLimits,
+    method: PlannedMethod,
+}
+
 /// The charge of each way [`ExecutionPlanDraft::with_held_experts`] holds
 /// a draft's experts, once charged: through a bank, at whatever slots, or
 /// whole. A bank search's plans differ only in their slots, whose charges
@@ -1891,14 +1947,11 @@ fn command_buffer_capacity(
 /// ([`crate::assessment::StructuralCharge`]) once in a search, as a `C` ([`HeldCharge`]).
 #[derive(Clone, Debug)]
 pub struct HeldCharges<C = AssessmentMemoryCharge> {
-    /// A bank's, by the pass size it was certified at, whether it holds
-    /// a resident form, and its scratch window slots (`W`).
-    banked: Option<((PassLaunches, bool, u64), C)>,
-    /// A whole plan's, by the launches its prompt groups chain: a chain
-    /// sizes the target family's pass buffers, bound constants and graphs
-    /// (`ExecutionPlanDraft::whole_chains`), so a whole plan of another
-    /// chain is charged from its structure again.
-    whole: Option<(NonZeroUsize, C)>,
+    /// A bank's, by the structural inputs its certification depended on.
+    banked: Option<(BankChargeKey, C)>,
+    /// A whole plan's, by the policy limits (including chain launches) and
+    /// method it was certified at.
+    whole: Option<(WholeChargeKey, C)>,
 }
 
 impl<C> Default for HeldCharges<C> {
@@ -1937,13 +1990,24 @@ impl<C: HeldCharge> HeldCharges<C> {
     /// The charge of `draft`, of its way of holding its experts.
     fn charge(&mut self, definition: &ModelDefinition, draft: &ExecutionPlanDraft) -> Result<C, PlanError> {
         let Some(bank) = draft.load.bank.as_ref() else {
-            let chain = draft.policy.limits.chain_capacity;
+            let structure = WholeChargeKey {
+                limits: draft.policy.limits,
+                method: draft.policy.method,
+            };
             return match &self.whole {
-                Some((of, whole)) if *of == chain => Ok(whole.clone()),
-                _ => Ok(self.whole.insert((chain, C::of(definition, draft)?)).1.clone()),
+                Some((of, whole)) if *of == structure => Ok(whole.clone()),
+                _ => Ok(self.whole.insert((structure, C::of(definition, draft)?)).1.clone()),
             };
         };
-        let structure = (bank.pass, bank.resident, bank.window_slots());
+        let structure = BankChargeKey {
+            pass: bank.pass,
+            resident: bank.resident,
+            window_slots: bank.window_slots(),
+            decode_rows: bank.decode_rows(),
+            paths: bank.paths,
+            limits: draft.policy.limits,
+            method: draft.policy.method,
+        };
         match &self.banked {
             Some((of, held)) if *of == structure => {
                 let charge = held.charge().clone().at_bank_slots(&draft.load).map_err(PlanError::ResourcePlanning)?;
@@ -3935,7 +3999,8 @@ mod tests {
     }
 
     /// [`far_larger`]'s bank on the recorded M4 Pro as a plan of it under
-    /// `bound` holds it, with room beside its mandatory part for 20 GB.
+    /// `bound` holds it, with room beside its mandatory part for 16 GB (below
+    /// M4 Pro's ~18 GB post-reserve capacity beside mandatory).
     fn far_larger_bank(bound: impl FnOnce(u64) -> HeldBound) -> super::super::ExpertBankPlan {
         let (_, _, device) = recorded(seismic::fixtures::recorded::m4_pro(), BackendName::Metal, 0, seismic::GraphCost::None);
         let (definition, draft) = far_larger(device);
@@ -3960,7 +4025,7 @@ mod tests {
         planned.draft().load().expert_bank().unwrap().clone()
     }
 
-    const FAR_ROOM: u64 = 20_000_000_000;
+    const FAR_ROOM: u64 = 16_000_000_000;
 
     /// On a machine whose prices are not measured, a load's plan of a bank
     /// waits for them.
@@ -4646,10 +4711,26 @@ mod tests {
             ),
         }
 
-        // If full served context exceeds structural capacity, refuse even when
-        // startup fits live room.
+        // Compute the stepped-down 8-row floor bounds (since `place` steps
+        // dense plans from 16 -> 8 decode rows before refusing).
+        let floor_8_charge = draft
+            .with_decode_rows_cap(8)
+            .held_whole_at(&definition, 1)
+            .unwrap()
+            .memory_charge(&definition)
+            .unwrap();
+        let floor_8_full = floor_8_charge
+            .store_demands(&topology, &device.info)
+            .unwrap()
+            .allocation_bytes();
+        let floor_8_startup = floor_8_charge
+            .startup_required_bytes(&topology, &device.info)
+            .unwrap();
+
+        // If full served context exceeds structural capacity even after stepping
+        // down to 8 decode rows, refuse even when startup fits live room.
         let mut over_capacity = super::MemoryBudget::fixed(live_available, None);
-        over_capacity.device.capacity = floor_full - 1;
+        over_capacity.device.capacity = floor_8_full - 1;
         assert!(
             matches!(
                 draft
@@ -4660,9 +4741,10 @@ mod tests {
             "dense model exceeding structural capacity must be refused"
         );
 
-        // If startup demand itself exceeds live headroom, refuse immediately
-        // reporting exact startup required vs live available.
-        let short_live = floor_startup - 1;
+        // If startup demand itself exceeds live headroom even after stepping
+        // down to 8 decode rows, refuse immediately reporting exact startup
+        // required vs live available.
+        let short_live = floor_8_startup - 1;
         let mut short_budget = super::MemoryBudget::fixed(short_live, None);
         short_budget.device.capacity = structural_capacity;
         let err = match draft.placed::<AssessmentMemoryCharge>(&definition, None, &synthetic(), &short_budget) {
@@ -4672,6 +4754,245 @@ mod tests {
         };
         assert_eq!(err.resource, crate::ResourceKind::DeviceMemory);
         assert_eq!(err.available, short_live);
-        assert_eq!(err.required, floor_startup);
+        assert_eq!(err.required, floor_8_startup);
+    }
+
+    /// Stepping a plain (non-drafting) draft's decode rows cap down below
+    /// `max_drafting_slots` must still preserve `max_drafting_slots <= max_launch_slots`
+    /// so state validation never rejects the stepped-down draft.
+    #[test]
+    fn with_decode_rows_cap_clamps_max_drafting_slots_for_plain_and_drafting_models() {
+        use crate::planning::fixtures::{LIMITS, RoutedShape, gemma_moe_fixture_manifest, routed_fixture_definition};
+
+        let (_, _, device) = recorded(seismic::fixtures::recorded::m4_pro(), BackendName::Metal, 0, seismic::GraphCost::None);
+        let definition = routed_fixture_definition(RoutedShape {
+            layers: 4,
+            experts: 32,
+            selected: 4,
+            hidden: 1024,
+            intermediate: 512,
+        });
+        let manifest = gemma_moe_fixture_manifest(&definition);
+        let plain_draft = ExecutionPlanner::prepare(
+            &device,
+            &manifest,
+            &definition,
+            ComponentSelection { head: false, vision: false },
+            ExecutionPath::Native,
+            PlannedMethod::Plain,
+            KvCodec::Dense,
+            LIMITS,
+        )
+        .unwrap();
+        assert!(plain_draft.policy().limits().max_launch_slots > 8);
+        assert!(plain_draft.policy().limits().max_drafting_slots > 8);
+
+        let stepped = plain_draft.with_decode_rows_cap(8);
+        assert_eq!(stepped.policy().limits().max_launch_slots, 8);
+        assert_eq!(stepped.policy().limits().max_drafting_slots, 8);
+        stepped
+            .memory_charge(&definition)
+            .expect("stepped-down plain draft must pass state input validation");
+
+        // Also verify a drafting method caps both proposals and max_drafting_slots.
+        let mut drafting_draft = plain_draft.clone();
+        drafting_draft.policy.method = PlannedMethod::DFlash {
+            proposals: 15,
+            widths: crate::planning::DraftWidths::Adaptive,
+        };
+        let stepped_drafting = drafting_draft.with_decode_rows_cap(8);
+        assert_eq!(stepped_drafting.policy().limits().max_launch_slots, 8);
+        assert_eq!(stepped_drafting.policy().method().draft_rows(), 7);
+        assert_eq!(stepped_drafting.policy().limits().max_drafting_slots, 1);
+    }
+
+    /// Stepping a banked draft down from `decode_rows = 16` to `decode_rows = 8`
+    /// in `settled_in` must not reuse the stale 16-row entry from `HeldCharges`,
+    /// which otherwise disagrees with `settle_bank`'s fresh 8-row pricing.
+    #[test]
+    fn settled_in_stepdown_from_16_to_8_recomputes_held_charge() {
+        use crate::planning::fixtures::{LIMITS, RoutedShape, gemma_moe_fixture_manifest, routed_fixture_definition};
+
+        let (topology, _, device) =
+            recorded(seismic::fixtures::recorded::m4_pro(), BackendName::Metal, 0, seismic::GraphCost::None);
+        let definition = routed_fixture_definition(RoutedShape {
+            layers: 4,
+            experts: 64,
+            selected: 4,
+            hidden: 1024,
+            intermediate: 512,
+        });
+        let manifest = gemma_moe_fixture_manifest(&definition);
+        let draft = ExecutionPlanner::prepare(
+            &device,
+            &manifest,
+            &definition,
+            ComponentSelection { head: false, vision: false },
+            ExecutionPath::Native,
+            PlannedMethod::Plain,
+            KvCodec::Dense,
+            LIMITS,
+        )
+        .unwrap();
+        assert_eq!(draft.bank_decode_rows(), 16);
+
+        let bound = HeldBound::room(u64::MAX);
+        let prices = synthetic();
+        let c16 = draft
+            .bank_ceiling_at(16, &definition, bound, Some(&prices))
+            .unwrap()
+            .unwrap();
+        let stepped = draft.with_decode_rows_cap(8);
+        let c8 = stepped
+            .bank_ceiling_at(8, &definition, bound, Some(&prices))
+            .unwrap()
+            .unwrap();
+
+        let floor_16_draft = c16
+            .whole
+            .resized(c16.whole.bank().floor(), c16.ceiling, PassLaunches::FLOOR)
+            .unwrap();
+        let floor_8_draft = c8
+            .whole
+            .resized(c8.whole.bank().floor(), c8.ceiling, PassLaunches::FLOOR)
+            .unwrap();
+
+        // Direct HeldCharges regression check: same (pass, resident, window_slots)
+        // across different decode_rows/limits must miss the cache and match fresh charge.
+        let mut held = HeldCharges::<AssessmentMemoryCharge>::default();
+        let cached_16 = held.charge(&definition, &floor_16_draft).unwrap();
+        let cached_8 = held.charge(&definition, &floor_8_draft).unwrap();
+        let fresh_8 = floor_8_draft.memory_charge(&definition).unwrap();
+        let bytes_16 = cached_16.store_demands(&topology, &device.info).unwrap().allocation_bytes();
+        let bytes_8 = cached_8.store_demands(&topology, &device.info).unwrap().allocation_bytes();
+        let fresh_bytes_8 = fresh_8.store_demands(&topology, &device.info).unwrap().allocation_bytes();
+        assert_eq!(bytes_8, fresh_bytes_8, "HeldCharges must recompute when decode_rows/limits change");
+        assert!(
+            bytes_16 > bytes_8,
+            "16-row floor ({bytes_16}) must exceed 8-row floor ({bytes_8}) to exercise stepdown"
+        );
+
+        // End-to-end settled_in regression check: pin c16 at its smallest
+        // window (so the window ladder at decode_rows = 16 is exhausted) and
+        // size room strictly below that 16-row floor but >= the 8-row floor.
+        let min_window_16 = *c16.whole.bank().window_ladder().last().unwrap();
+        let c16_min = draft
+            .with_window(&c16.whole, &definition, bound, min_window_16, CeilingPaths::Fixed)
+            .unwrap()
+            .unwrap();
+        let min_16_draft = c16_min
+            .whole
+            .resized(c16_min.whole.bank().floor(), c16_min.ceiling, PassLaunches::FLOOR)
+            .unwrap();
+        let min_bytes_16 = min_16_draft
+            .memory_charge(&definition)
+            .unwrap()
+            .store_demands(&topology, &device.info)
+            .unwrap()
+            .allocation_bytes();
+        let min_window_8 = *c8.whole.bank().window_ladder().last().unwrap();
+        let c8_min = stepped
+            .with_window(&c8.whole, &definition, bound, min_window_8, CeilingPaths::Fixed)
+            .unwrap()
+            .unwrap();
+        let min_8_draft = c8_min
+            .whole
+            .resized(c8_min.whole.bank().floor(), c8_min.ceiling, PassLaunches::FLOOR)
+            .unwrap();
+        let min_bytes_8 = min_8_draft
+            .memory_charge(&definition)
+            .unwrap()
+            .store_demands(&topology, &device.info)
+            .unwrap()
+            .allocation_bytes();
+        assert!(
+            min_bytes_16 > min_bytes_8,
+            "minimum-window 16-row floor ({min_bytes_16}) must exceed 8-row floor ({min_bytes_8})"
+        );
+
+        let tight_room = min_bytes_8 + (min_bytes_16 - min_bytes_8) / 2;
+        let budget = super::MemoryBudget::fixed(tight_room, None);
+        let mut settle_held = HeldCharges::<AssessmentMemoryCharge>::default();
+        let settled = draft
+            .settled_in(&c16_min, HeldBound::room(tight_room), &definition, &prices, &mut settle_held, &budget, &mut |d, c| {
+                Ok::<_, PlanError>(match budget.fit_whole(d, c)?.short {
+                    None => Ok(()),
+                    Some(deficit) => Err(deficit),
+                })
+            })
+            .unwrap()
+            .expect("settled_in must step down from 16 to 8 decode rows when room lies between their floors");
+        assert_eq!(settled.0.bank().decode_rows(), 8);
+        assert_eq!(settled.0.policy().limits().max_launch_slots, 8);
+        assert_eq!(settled.0.policy().limits().max_drafting_slots, 8);
+        assert!(
+            settled.1.store_demands(&topology, &device.info).unwrap().allocation_bytes() <= tight_room
+        );
+    }
+
+    /// A dense (unstreamable) model whose 16-row decode/verify graph pools exceed
+    /// a tight budget steps down via `with_decode_rows_cap(8)` in `place()`,
+    /// matching banked models and recomputing its charge cleanly.
+    #[test]
+    fn dense_whole_model_steps_down_from_16_to_8_decode_rows_under_tight_budget() {
+        use crate::planning::fixtures::{LIMITS, fixture_definition, fixture_manifest};
+
+        let (topology, _, device) =
+            recorded(seismic::fixtures::recorded::m4_pro(), BackendName::Metal, 0, seismic::GraphCost::None);
+        let definition = fixture_definition();
+        let manifest = fixture_manifest(&definition);
+        let draft = ExecutionPlanner::prepare(
+            &device,
+            &manifest,
+            &definition,
+            ComponentSelection { head: false, vision: false },
+            ExecutionPath::Native,
+            PlannedMethod::Plain,
+            KvCodec::Dense,
+            LIMITS,
+        )
+        .unwrap();
+        assert_eq!(draft.bank_decode_rows(), 16);
+
+        let bytes_16 = draft
+            .held_whole_at(&definition, 1)
+            .unwrap()
+            .memory_charge(&definition)
+            .unwrap()
+            .store_demands(&topology, &device.info)
+            .unwrap()
+            .allocation_bytes();
+        let bytes_8 = draft
+            .with_decode_rows_cap(8)
+            .held_whole_at(&definition, 1)
+            .unwrap()
+            .memory_charge(&definition)
+            .unwrap()
+            .store_demands(&topology, &device.info)
+            .unwrap()
+            .allocation_bytes();
+        assert!(
+            bytes_16 > bytes_8,
+            "16-row dense plan ({bytes_16}) must charge more than 8-row plan ({bytes_8})"
+        );
+
+        let tight_room = bytes_8 + (bytes_16 - bytes_8) / 2;
+        let budget = super::MemoryBudget::fixed(tight_room, None);
+        let Placed::Whole(admitted) = draft
+            .placed::<AssessmentMemoryCharge>(&definition, None, &synthetic(), &budget)
+            .expect("dense model must step down to 8 decode rows when tight room lies between 8-row and 16-row charges")
+        else {
+            panic!("dense model must be Placed::Whole");
+        };
+        assert_eq!(admitted.draft().policy().limits().max_launch_slots, 8);
+        assert_eq!(admitted.draft().policy().limits().max_drafting_slots, 8);
+        assert!(
+            admitted
+                .charge()
+                .store_demands(&topology, &device.info)
+                .unwrap()
+                .allocation_bytes()
+                <= tight_room
+        );
     }
 }

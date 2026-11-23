@@ -4,11 +4,22 @@ import type { RecommendedModel } from "@magnitudedev/sdk"
 import { onboardingChoices, recommendationsSettled, recommendedForYourMachine, type OfferedRecommendation, type RecommendationsView } from "./recommendations"
 import type { OfferedModel } from "./expanding-model"
 
-const offer = (base: string, options: { chosen?: boolean; floor?: boolean; speed?: number | null; measuring?: boolean }): OfferedRecommendation => {
+const offer = (base: string, options: { chosen?: boolean; floor?: boolean; speed?: number | null; measuring?: boolean; fits?: boolean; bits?: number; name?: string }): OfferedRecommendation => {
   const key = `${base}:gguf:q4`
   return {
     recommendation: { base, chosen: options.chosen === false ? Option.none() : Option.some(key), meetsOnboardingFloor: options.floor ?? false } as unknown as RecommendedModel,
-    model: { key: base, recommended: options.chosen === false ? null : key, quants: [{ key, bits: 4, speed: options.speed ?? null, measuring: options.measuring ?? false }] } as unknown as OfferedModel,
+    model: {
+      key: base,
+      recommended: options.chosen === false ? null : key,
+      quants: [{
+        key,
+        name: options.name ?? "Q4_K_M",
+        bits: options.bits ?? 4,
+        fits: options.fits ?? true,
+        speed: options.speed ?? null,
+        measuring: options.measuring ?? false,
+      }],
+    } as unknown as OfferedModel,
   }
 }
 
@@ -19,14 +30,28 @@ describe("onboarding's choices", () => {
     expect(speedUnknown).toBe(false)
   })
 
+  it("falls back to fitting measured models sorted fastest-first (capped at 3) when none meets the floor", () => {
+    const { choices, speedUnknown } = onboardingChoices([
+      offer("slowest", { speed: 2 }),
+      offer("fast3", { speed: 8 }),
+      offer("mid", { speed: 5 }),
+      offer("fastest", { speed: 9 }),
+      offer("unmeasured", { speed: null }),
+      offer("pending", { speed: null, measuring: true }),
+      offer("unfit", { speed: 12, fits: false }),
+    ])
+    expect(choices.map(entry => entry.model.key)).toEqual(["fastest", "fast3", "mid"])
+    expect(speedUnknown).toBe(false)
+  })
+
   it("offers models that fit with their speed unknown where no speed can be measured, such as on a CPU", () => {
     const { choices, speedUnknown } = onboardingChoices([offer("lfm3", { speed: null }), offer("lfm25", { speed: null })])
     expect(choices.map(entry => entry.model.key)).toEqual(["lfm3", "lfm25"])
     expect(speedUnknown).toBe(true)
   })
 
-  it("never offers a model measured as too slow, or one still being measured", () => {
-    expect(onboardingChoices([offer("slow", { speed: 3 }), offer("pending", { speed: null, measuring: true })]).choices).toEqual([])
+  it("never offers a model still being measured", () => {
+    expect(onboardingChoices([offer("pending", { speed: null, measuring: true })]).choices).toEqual([])
   })
 })
 
@@ -44,8 +69,14 @@ describe("Recommended for your machine", () => {
       .toEqual([["smart", "Smartest that runs well here"], ["quick", "Fastest"], ["other", undefined]])
   })
 
+  it("names the fastest fitting model when none meets the onboarding speed floor", () => {
+    expect(notes([offer("slower", { speed: 3 }), offer("faster", { speed: 7 })]))
+      .toEqual([["faster", "Fastest on this computer"], ["slower", undefined]])
+  })
+
   it("says which quant is already here, and that the speed is unknown where it can't be measured", () => {
     expect(notes([offer("lfm", { floor: true, speed: 40 })], ["lfm:gguf:q4"])).toEqual([["lfm", "You have the 4-bit quant"]])
+    expect(notes([offer("custom", { floor: true, speed: 40, bits: 0, name: "CUSTOM" })], ["custom:gguf:q4"])).toEqual([["custom", "You have CUSTOM"]])
     expect(notes([offer("cpu", { speed: null }), offer("cpu2", { speed: null })]))
       .toEqual([["cpu", "Fits this computer; its speed can’t be measured here"], ["cpu2", undefined]])
   })

@@ -1,6 +1,7 @@
 import { renderToStaticMarkup } from "react-dom/server"
 import { describe, expect, it } from "vitest"
-import { QuantLadder, QuantList, visibleLadderRungs } from "./parts"
+import { ExpandingModel, type OfferedModel } from "./expanding-model"
+import { PlacementBar, QuantLadder, QuantList, visibleLadderRungs } from "./parts"
 import type { QuantView } from "./view"
 
 const quant = {
@@ -54,5 +55,52 @@ describe("visibleLadderRungs", () => {
     expect(html).toContain("grid-template-columns:repeat(4, minmax(0, 1fr))")
     expect(html).toContain('aria-label="Measuring"')
     expect(html).not.toContain("6-bit")
+  })
+
+  it("never renders 0-bit when a quant has an unknown bit width", () => {
+    const unknownBits: QuantView = {
+      key: "hf:org/repo/custom.gguf",
+      name: "CUSTOM",
+      publisher: "org",
+      repository: "org/repo",
+      bits: 0,
+      fits: true,
+      measuring: false,
+      speed: 42,
+      phrase: null,
+      sizeBytes: 4e9,
+      downloadBytes: 4e9,
+      drafterBytes: 0,
+      drafterTarget: null,
+      placement: [{ kind: "Device", bytes: 4e9 }],
+      servedContext: 32_768,
+      quality: null,
+      missingDiskBytes: 0,
+    }
+    const offered: OfferedModel = {
+      key: "custom",
+      catalog: false,
+      name: "Custom Model",
+      lab: undefined,
+      country: null,
+      fineTuneOf: null,
+      drafter: null,
+      contextLimit: 32_768,
+      quants: [unknownBits],
+      recommended: unknownBits.key,
+      checking: false,
+    }
+    const listHtml = renderToStaticMarkup(<QuantList quants={[unknownBits]} selected={null} recommended={null} owned={new Set()} onSelect={() => {}} />)
+    const ladderHtml = renderToStaticMarkup(<QuantLadder quants={[unknownBits]} selected={unknownBits.key} recommended={unknownBits.key} owned={new Set()} limit={null} onSelect={() => {}} />)
+    const barHtml = renderToStaticMarkup(<PlacementBar quant={unknownBits} />)
+    const cardHtml = renderToStaticMarkup(
+      <ExpandingModel model={offered} expanded onToggle={() => {}} quantChoice={null} onQuantChoice={() => {}} owned={new Set()} />,
+    )
+    for (const html of [listHtml, ladderHtml, barHtml, cardHtml]) {
+      expect(html).not.toContain("0-bit")
+    }
+    expect(listHtml).toContain('aria-label="org CUSTOM"')
+    expect(ladderHtml).toContain("CUSTOM")
+    expect(barHtml).toContain("How this model runs on your machine")
   })
 })

@@ -97,7 +97,7 @@ pub use changes::{Changes, Changing, Claiming, Keeping, OpenChange, Owner, Sampl
 pub use claims::{ArenaClaim, Cached, Claim};
 pub use estimate::Estimate;
 pub use grant::{Footprints, Grant, SystemFootprints};
-pub use relief::{Owed, Relief, ReliefPlan};
+pub use relief::{Owed, Relief, ReliefBoundary, ReliefPlan};
 pub use state::EntryId;
 pub use reservation::Reservation;
 pub use view::{ChargeClasses, Ledger, Standing};

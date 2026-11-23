@@ -1,11 +1,16 @@
 import { Command, CommandExecutor, FileSystem } from "@effect/platform"
 import { BunContext } from "@effect/platform-bun"
-import { Effect, Option, Scope, Stream } from "effect"
+import { Effect, Layer, Option, Scope, Stream } from "effect"
+import { existsSync } from "node:fs"
 import { createRequire } from "node:module"
 import { join } from "node:path"
 import { fileURLToPath } from "node:url"
 import { describe, expect, it } from "vitest"
-import { MacUpdateAdmission, nativeMacUpdateAdmission } from "./mac-update-lease"
+import {
+  acquireMacApplicationInstallationLease,
+  MacUpdateAdmission,
+  nativeMacUpdateAdmission,
+} from "./mac-update-lease"
 
 const addon = fileURLToPath(new URL(`../../dist/native/darwin-${process.arch}/desktop-host.node`, import.meta.url))
 const run = <A, E>(effect: Effect.Effect<A, E, FileSystem.FileSystem | CommandExecutor.CommandExecutor | MacUpdateAdmission | Scope.Scope>) =>
@@ -162,4 +167,37 @@ describe.skipIf(process.platform !== "darwin")("macOS installation admission", (
       expect(() => native.validateMacUpdateLease(retained)).toThrow()
     })
   })))
+
+  it("degrades cleanly to read-only for shared launch of an unowned bundle without a lock, while refusing exclusive locks", () => run(Effect.gen(function* () {
+    const { admission, bundle } = yield* fixture
+    expect(yield* acquireMacApplicationInstallationLease(bundle)).toBe("Leased")
+
+    const unownedBundle = "/System/Applications/Calculator.app"
+    if (process.getuid?.() !== 0 && existsSync(unownedBundle)) {
+      const shared = yield* admission.shared(unownedBundle)
+      expect(Option.isSome(shared)).toBe(true)
+      expect(Option.getOrThrow(shared).readOnly).toBe(true)
+      yield* Option.getOrThrow(shared).validate
+      expect(yield* acquireMacApplicationInstallationLease(unownedBundle)).toBe("ReadOnly")
+      expect(yield* admission.exclusive(unownedBundle).pipe(Effect.isFailure)).toBe(true)
+    }
+  })))
+})
+
+describe("acquireMacApplicationInstallationLease", () => {
+  it("returns Leased or ReadOnly from shared admission and fails when admission is busy", async () => {
+    const withShared = (shared: MacUpdateAdmission["shared"]) =>
+      Effect.runPromise(acquireMacApplicationInstallationLease("/Applications/Magnitude.app").pipe(
+        Effect.scoped,
+        Effect.provide(Layer.succeed(MacUpdateAdmission, {
+          shared,
+          exclusive: () => Effect.die("unused"),
+          adopt: () => Effect.die("unused"),
+        })),
+        Effect.either,
+      ))
+    expect(await withShared(() => Effect.succeed(Option.some({ readOnly: false, validate: Effect.void })))).toMatchObject({ _tag: "Right", right: "Leased" })
+    expect(await withShared(() => Effect.succeed(Option.some({ readOnly: true, validate: Effect.void })))).toMatchObject({ _tag: "Right", right: "ReadOnly" })
+    expect((await withShared(() => Effect.succeed(Option.none())))._tag).toBe("Left")
+  })
 })

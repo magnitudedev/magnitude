@@ -24,7 +24,7 @@ use magnitude_engine::error::{LoadError, PreviewError, RequestError};
 use magnitude_engine::host::HostArtifacts;
 use magnitude_engine::preview::LoadPreview;
 use magnitude_engine::worker::{
-    AcquiredDevice, EngineClient, Preparation, PricedError, PricedFailure, load_prepared,
+    EngineClient, Preparation, PricedError, PricedFailure, load_prepared,
     run_priced,
 };
 use magnitude_engine::worker::protocol::{LoadProgress, MemoryObservation, RoomAnswer};
@@ -868,16 +868,16 @@ impl EngineResidency {
                         self.defer_unpriced(instance_id, &resolved.configuration),
                     )
                 },
-                |_| async {
+                || async {
                     let held = self.demand.lock().expect("device demand").clone();
                     match held {
                         Some(device) => {
                             environment.device.admit_request().await;
-                            Ok(AcquiredDevice::immediate(device))
+                            Ok(device)
                         }
                         None => {
-                            let (device, waited) = match environment.device.try_share() {
-                                Some(device) => (Arc::new(device), false),
+                            let device = match environment.device.try_share() {
+                                Some(device) => Arc::new(device),
                                 None => {
                                     self.progress(instance_id, ModelLoadStage::Queued, None);
                                     tracing::info!(
@@ -885,11 +885,11 @@ impl EngineResidency {
                                     );
                                     let device = Arc::new(environment.device.share().await);
                                     self.progress(instance_id, ModelLoadStage::Preparing, None);
-                                    (device, true)
+                                    device
                                 }
                             };
                             *self.demand.lock().expect("device demand") = Some(Arc::clone(&device));
-                            Ok(AcquiredDevice { device, waited })
+                            Ok(device)
                         }
                     }
                 },
@@ -1356,7 +1356,7 @@ mod tests {
                             Ok(())
                         })
                     },
-                    |_| std::future::ready(Ok(AcquiredDevice::immediate(()))),
+                    || std::future::ready(Ok(())),
                     |()| {},
                     (),
                     |&plan, &(), ()| std::future::ready(Ok::<_, PricedFailure<ModelOperationFailure, ()>>(plan)),
@@ -1403,7 +1403,7 @@ mod tests {
                         }
                     },
                     || settle_prices(&device, &measurement, async { Ok(()) }),
-                    |_| std::future::ready(Ok(AcquiredDevice::immediate(()))),
+                    || std::future::ready(Ok(())),
                     |()| {},
                     (),
                     |&plan, &(), ()| {
@@ -1444,7 +1444,7 @@ mod tests {
                 }
             },
             || settle_prices(&device, &measurement, async { Ok(()) }),
-            |_| std::future::ready(Ok(AcquiredDevice::immediate(()))),
+            || std::future::ready(Ok(())),
             |()| {},
             (),
             |&plan, &(), ()| {
@@ -1472,6 +1472,67 @@ mod tests {
         assert_eq!(direct.code(), "device_unavailable");
         assert_eq!(direct.message(), reason);
         assert!(!direct.retryable());
+    }
+
+    /// When a background job (measurement or optimization) holds the device and occupies VRAM
+    /// (for example after a worker crash released residency's share), a load's `run_priced`
+    /// preempts and waits for that job to release the device before `preview` observes memory,
+    /// avoiding a spurious `InsufficientMemory` (`memory_shortage`) failure.
+    #[tokio::test]
+    async fn a_load_preempts_a_background_job_before_preview_observes_memory() {
+        use std::sync::atomic::AtomicBool;
+        let device = DeviceLock::default();
+        let (_tx, measurement) = test_measurement(TestRecords::Pending);
+        let job_holding_vram = Arc::new(AtomicBool::new(true));
+        let mut job = device.try_job().expect("background job holds device");
+        let job_task = tokio::spawn({
+            let job_holding_vram = Arc::clone(&job_holding_vram);
+            async move {
+                job.preempted().await;
+                job_holding_vram.store(false, Ordering::Release);
+                drop(job);
+            }
+        });
+        let demand = Arc::new(std::sync::Mutex::new(None::<Arc<DeviceShare>>));
+        let (plan, _, _share) = run_priced(
+            || {
+                let busy = job_holding_vram.load(Ordering::Acquire);
+                async move {
+                    if busy {
+                        Err(PreviewError::InsufficientMemory(
+                            magnitude_engine::error::InsufficientMemory {
+                                required: 10 << 30,
+                                available: 2 << 30,
+                            },
+                        ))
+                    } else {
+                        Ok("clean-plan")
+                    }
+                }
+            },
+            || settle_prices(&device, &measurement, async { Ok(()) }),
+            || {
+                let device = device.clone();
+                let demand = Arc::clone(&demand);
+                async move {
+                    let share = Arc::new(device.share().await);
+                    *demand.lock().expect("demand") = Some(Arc::clone(&share));
+                    Ok::<_, ModelOperationFailure>(share)
+                }
+            },
+            |share| {
+                demand.lock().expect("demand").take();
+                drop(share);
+            },
+            (),
+            |&plan, _share, ()| {
+                std::future::ready(Ok::<_, PricedFailure<ModelOperationFailure, ()>>(plan))
+            },
+        )
+        .await
+        .expect("load must preempt background job before previewing");
+        job_task.await.expect("background job retired");
+        assert_eq!(plan, "clean-plan");
     }
 
     /// When measurements transition to `Unavailable` while `settle_prices` is waiting for a

@@ -13,6 +13,7 @@ const LFM25_MOE: &str = include_str!("assets/LFM2.5-8B-A1B.jinja");
 const LFM25_SMALL_THINKING: &str = include_str!("assets/LFM2.5-1.2B-Thinking.jinja");
 const LFM25_SMALL_INSTRUCT: &str = include_str!("assets/LFM2.5-1.2B-Instruct.jinja");
 const LFM25_TBRILLIANCE: &str = include_str!("assets/LFM2.5-8B-A1B-Q3.8-TBrilliance.jinja");
+const LFM3: &str = include_str!("assets/LFM3-1.7B.jinja");
 const LAGUNA: &str = include_str!("assets/Laguna-S-2.1.jinja");
 const MINICPM5: &str = include_str!("assets/MiniCPM5-2B.jinja");
 const MUSE: &str = include_str!("assets/Muse-Glimmer-30B.jinja");
@@ -512,6 +513,182 @@ fn autoparser_closes_unconditionally_opened_reasoning_when_disabled() {
         parse(&schema_prepared, "{\"answer\": 42}").unwrap(),
         Transcript {
             content: "{\"answer\": 42}".into(),
+            ..Default::default()
+        }
+    );
+}
+
+/// LFM3 1.7B uses XML `<tool_call><function=...><parameter=...>` tool calls
+/// (the Qwen3-Coder specialized handler) and closes `<think></think>` when
+/// `enable_thinking` is false. Verify that disabled thinking matches the closed
+/// prefix literally with reasoning extraction disabled across plain text, tool
+/// calls, and JSON schema, that an unconditionally opened Qwen3-Coder template
+/// closes its open `<think>`, and that an LFM2 template closing `<think></think>`
+/// also disables reasoning extraction cleanly.
+#[test]
+fn lfm3_and_lfm2_closed_prefix_disable_reasoning_extraction() {
+    let lfm3 = Template::new(LFM3, &special("<|startoftext|>", "<|im_end|>")).unwrap();
+    let base = || {
+        Request::new(
+            vec![json!({"role":"user","content":"What is 2 + 2?"})],
+            946684800,
+        )
+    };
+
+    // Default (thinking enabled): opens `<think>` and parses reasoning + content.
+    let enabled = lfm3.prepare(&base()).unwrap();
+    assert!(enabled
+        .description()
+        .prompt
+        .ends_with("<|im_start|>assistant\n<think>"));
+    assert_eq!(
+        enabled.description().generation_prefix,
+        "<|im_start|>assistant\n<think>"
+    );
+    assert_eq!(
+        parse(&enabled, "2 + 2 = 4.</think>4").unwrap(),
+        Transcript {
+            reasoning: "2 + 2 = 4.".into(),
+            content: "4".into(),
+            ..Default::default()
+        }
+    );
+
+    // Disabled thinking (`reasoning_effort: none` -> `enable_thinking: false`):
+    // renders `<think></think>`, disables reasoning extraction, and preserves leading whitespace.
+    let mut disabled_req = base();
+    disabled_req
+        .template_arguments
+        .insert("enable_thinking".into(), json!(false));
+    let disabled = lfm3.prepare(&disabled_req).unwrap();
+    let desc = disabled.description();
+    assert!(desc.prompt.ends_with("<|im_start|>assistant\n<think></think>"));
+    assert_eq!(desc.generation_prefix, "<|im_start|>assistant\n<think></think>");
+    assert_eq!(
+        parse(&disabled, "  4").unwrap(),
+        Transcript {
+            content: "  4".into(),
+            ..Default::default()
+        }
+    );
+
+    // JSON schema with thinking disabled: grammar starts at the closed prefix with no `<think>` rule.
+    let mut schema_req = disabled_req.clone();
+    schema_req.json_schema = Some(json!({
+        "type": "object",
+        "properties": {"answer": {"type": "integer"}},
+        "required": ["answer"]
+    }));
+    let schema_prepared = lfm3.prepare(&schema_req).unwrap();
+    assert_eq!(
+        schema_prepared.description().grammar_initial_prefix,
+        "<|im_start|>assistant\n<think></think>"
+    );
+    assert!(
+        !schema_prepared.description().grammar.contains("reasoning-text"),
+        "disabled-thinking JSON schema grammar must not contain reasoning rules"
+    );
+    assert_eq!(
+        parse(&schema_prepared, "{\"answer\": 4}").unwrap(),
+        Transcript {
+            content: "{\"answer\": 4}".into(),
+            ..Default::default()
+        }
+    );
+
+    // Tool calls with thinking disabled: grammar starts at the closed prefix with no `<think>` rule.
+    let mut tool_req = self::request(false);
+    tool_req
+        .template_arguments
+        .insert("enable_thinking".into(), json!(false));
+    let tool_prepared = lfm3.prepare(&tool_req).unwrap();
+    assert_eq!(
+        tool_prepared.description().grammar_initial_prefix,
+        "<|im_start|>assistant\n<think></think>"
+    );
+    assert!(
+        !tool_prepared.description().grammar.contains("reasoning-text"),
+        "disabled-thinking tool grammar must not contain reasoning rules"
+    );
+    assert_eq!(
+        parse(
+            &tool_prepared,
+            "<tool_call>\n<function=get_weather>\n<parameter=city>\nParis\n</parameter>\n<parameter=note>\nclear\n</parameter>\n</function>\n</tool_call>"
+        )
+        .unwrap(),
+        Transcript {
+            calls: vec![(
+                "get_weather".into(),
+                "{\"city\":\"Paris\",\"note\":\"clear\"}".into(),
+            )],
+            ..Default::default()
+        }
+    );
+
+    // An unconditionally opened Qwen3-Coder template closes `<think>` when disabled.
+    const OPEN_QWEN3_CODER: &str = r#"{%- for m in messages -%}
+<|im_start|>{{ m.role }}
+{{ m.content or '' }}
+{%- if m.tool_calls -%}{%- for tc in m.tool_calls -%}<tool_call>
+<function={{ tc.function.name }}>
+<parameter=city>
+{{ tc.function.arguments.city }}
+</parameter>
+</function>
+</tool_call>{%- endfor -%}{%- endif -%}<|im_end|>
+{%- endfor -%}
+{%- if add_generation_prompt -%}<|im_start|>assistant
+<think>{%- endif -%}"#;
+    let open_qwen = Template::new(OPEN_QWEN3_CODER, &Default::default()).unwrap();
+    let open_disabled = open_qwen.prepare(&disabled_req).unwrap();
+    assert!(open_disabled
+        .description()
+        .prompt
+        .ends_with("<|im_start|>assistant\n<think></think>"));
+    assert_eq!(
+        parse(&open_disabled, "Direct answer.").unwrap(),
+        Transcript {
+            content: "Direct answer.".into(),
+            ..Default::default()
+        }
+    );
+
+    // An LFM2 template that closes `<think></think>` on `enable_thinking=false`
+    // disables reasoning extraction and starts JSON schema directly after the closed block.
+    const TOGGLE_LFM2: &str = r#"{%- if tools -%}<|im_start|>system
+<|tool_list_start|>[{{ tools | map('tojson') | join(', ') }}]<|tool_list_end|><|im_end|>
+{%- endif -%}
+{%- for m in messages -%}<|im_start|>{{ m.role }}
+{{ m.content or '' }}<|im_end|>
+{%- endfor -%}
+{%- if add_generation_prompt -%}<|im_start|>assistant
+{% if enable_thinking is defined and enable_thinking is false -%}<think></think>{%- else -%}<think>{%- endif -%}{%- endif -%}"#;
+    let toggle_lfm2 = Template::new(TOGGLE_LFM2, &Default::default()).unwrap();
+    let lfm2_disabled = toggle_lfm2.prepare(&disabled_req).unwrap();
+    assert_eq!(
+        lfm2_disabled.description().generation_prefix,
+        "<|im_start|>assistant\n<think></think>"
+    );
+    assert_eq!(
+        parse(&lfm2_disabled, "Direct answer.").unwrap(),
+        Transcript {
+            content: "Direct answer.".into(),
+            ..Default::default()
+        }
+    );
+    let lfm2_schema = toggle_lfm2.prepare(&schema_req).unwrap();
+    assert_eq!(
+        lfm2_schema.description().grammar_initial_prefix,
+        "<|im_start|>assistant\n<think></think>"
+    );
+    assert!(
+        !lfm2_schema.description().grammar.contains("reasoning-block"),
+        "disabled-thinking LFM2 schema grammar must not contain reasoning-block"
+    );
+    assert_eq!(
+        parse(&lfm2_schema, "{\"answer\": 4}").unwrap(),
+        Transcript {
+            content: "{\"answer\": 4}".into(),
             ..Default::default()
         }
     );
