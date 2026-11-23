@@ -757,7 +757,7 @@ impl<'a> Served<'a> {
                     let Some(kernel) = kernel.as_ref() else { continue };
                     let ahead = index as u64 + 1;
                     for next_resolved in [0, 1] {
-                        let next_policy = words(&[POLICY_WORDS], &[(POLICY_RESOLVED, next_resolved)], hint_entry)?;
+                        let next_policy = words(&[POLICY_WORDS], &[(POLICY_WHOLE, next_resolved)], hint_entry)?;
                         let mut rings = words(&[ahead, ring], &[], hint_entry)?;
                         kernel
                             .call(charges, routed_hint_route::Args {
@@ -791,7 +791,7 @@ impl<'a> Served<'a> {
                     let Some(kernel) = kernel.as_ref() else { continue };
                     let ahead = index as u64 + 1;
                     for next_resolved in [0, 1] {
-                        let next_policy = words(&[POLICY_WORDS], &[(POLICY_RESOLVED, next_resolved)], hint_entry)?;
+                        let next_policy = words(&[POLICY_WORDS], &[(POLICY_WHOLE, next_resolved)], hint_entry)?;
                         let mut rings = words(&[ahead, ring], &[], hint_entry)?;
                         kernel
                             .call(charges, routed_hint_select::Args {

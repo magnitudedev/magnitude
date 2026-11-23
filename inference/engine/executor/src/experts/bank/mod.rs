@@ -22,7 +22,8 @@ use seismic::{Device, Tensor};
 use std::sync::atomic::Ordering;
 use std::sync::{Arc, Mutex};
 use super::{copies, HostCompute, Machine};
-use resize::{Commitment, HostTier, Stores};
+pub(in crate::experts) use resize::Stores;
+use resize::{Commitment, HostTier};
 use crate::storage_thread::StorageThread;
 pub use open::LoadPools;
 pub(crate) use served::ServedBank;
@@ -134,6 +135,10 @@ pub(crate) struct ExpertBank {
     /// Each group's records' store in the device's pool
     /// (`BankAllocation::Records`): what the bank's slots commit.
     stores: Arc<Stores>,
+    /// Direct handle to the host tier's slab stores (same `Arc<Stores>` as
+    /// `host.stores`), so prefill DMA resolves slab views without locking
+    /// `host` during background host-tier resizes.
+    host_stores: Option<Arc<Stores>>,
     /// A host tier's records' stores and the host slots they commit; none
     /// on unified memory.
     host: Option<Mutex<HostTier>>,
@@ -174,6 +179,9 @@ pub(crate) struct ExpertBank {
     /// recorded allocated in as their storage is backed, on the resize
     /// thread ([`resize::grow_by_slots`]).
     pub(super) cache: Arc<cache::BankCache>,
+    /// Unified copy-engine-first `ExpertTransport` owning `LinkMover` hint
+    /// tracking, M7 on-demand decode DMA, and producer-enqueued prefill DMA.
+    transport: Arc<super::transport::ExpertTransport>,
 }
 
 /// The threads a bank's resizes keep busy beside decode: the host tier's
@@ -246,6 +254,95 @@ impl ExpertBank {
     /// which the job measured).
     pub fn tier_copy_blocks(&self, blocks: u32) -> Result<(), String> {
         write_blocks(&self.layout.load.tier_grid, blocks)
+    }
+
+    /// Unified copy-engine-first [`super::transport::ExpertTransport`].
+    pub(crate) fn transport(&self) -> &Arc<super::transport::ExpertTransport> {
+        &self.transport
+    }
+
+    /// Whether M7 on-demand async DMA decode landing (`DecodeFront -> DMA -> DecodeBack`)
+    /// is active for streamed layer `layer` over `rows` rows (gated by
+    /// `ExpertTransport`'s row-aware adaptive physics threshold so narrow
+    /// `M = 1..2` cooldowns never strand wide `M >= 4` verify bursts).
+    pub(crate) fn dma_decode_active(&self, layer: usize, rows: u64) -> bool {
+        let group = self.plan.layers()[layer].group;
+        self.transport.should_split_decode(group, layer, rows)
+    }
+
+    /// Contiguous `[SOURCE_ROWS, rows, K] i32` view of the pinned host-mapped
+    /// `DecodeSources` buffer for `DecodeFront` and `DecodeBack`.
+    pub(crate) fn decode_sources_view(&self, rows: u64) -> Result<Tensor, String> {
+        self.transport.decode_sources_view(rows)
+    }
+
+    /// Inspect pinned `DecodeSources` written by `DecodeFront` for streamed
+    /// layer `layer` over `rows` rows, joining any in-flight or landed
+    /// `LinkMover` (`Promote`/`Stage`) or demand transfers and batch-DMAing
+    /// remaining fresh host-tier misses into unified `Record::DemandLanding`
+    /// slots via [`super::transport::ExpertTransport`].
+    pub(crate) fn land_decode_misses(
+        &self,
+        layer: usize,
+        sequence: u64,
+        rows: u64,
+    ) -> Result<Option<super::transport::DecodeLanding>, String> {
+        let group = self.plan.layers()[layer].group;
+        let shared = self.watcher.shared();
+        self.transport.land_decode_misses(
+            group,
+            layer,
+            sequence,
+            rows,
+            |g, tier_record| self.watcher.claim_demand_slot(g, tier_record),
+            |aborted| self.watcher.abort_demand_slots(aborted),
+            |g, want| self.watcher.replenish_demand_free(g, want),
+            || shared.wake_site_noticer(),
+            || shared.is_ended(),
+            |fast_path, experts, bytes, overflow| {
+                shared.record_dma_call(fast_path, experts, bytes, overflow);
+            },
+        )
+    }
+
+    /// Complete a decode DMA landing once `DecodeBack` has finished on the GPU:
+    /// releases transport leases + drains deferred syncs outside `Residency`,
+    /// then performs zero-recopy O(1) promotion (`DemandLanding -> Held`) or
+    /// releases unpromoted slots back to `Free`.
+    pub(crate) fn complete_decode_landing(&self, landing: super::transport::DecodeLanding) {
+        let (layer, sequence, demand_slots) = landing.release_transport(&self.transport);
+        self.watcher.finish_demand_landings(layer, sequence, &demand_slots);
+    }
+
+    /// Whether prefill fills copy host-tier experts into VRAM scratch via
+    /// producer-enqueued hardware DMA instead of SM zero-copy `routed_copy`.
+    pub fn tier_copy_dma(&self) -> bool {
+        self.plan.tier_copy_dma()
+    }
+
+    /// Coalesce and enqueue hardware DMA copies on `NativeQueue::Fill` for
+    /// all host-tier prefill plans published for `layer` across a merge set.
+    /// Returns `Ok(None)` with zero device calls when no host-tier copies are
+    /// needed.
+    pub(crate) fn submit_prefill_dma(
+        &self,
+        layer: usize,
+        plans: &[super::transport::PrefillPlan],
+    ) -> Result<Option<seismic::NativeGraphCompletion>, String> {
+        self.transport.submit_prefill_dma(
+            &self.device,
+            &self.plan,
+            &self.scratch[layer],
+            self.host_stores.as_ref(),
+            &self.stores,
+            layer,
+            plans,
+        )
+    }
+
+    /// Record wall time spent waiting on `DecodeFront` + submitting M7 decode DMA.
+    pub(crate) fn record_dma_host_wait(&self, elapsed: std::time::Duration) {
+        self.watcher.shared().record_dma_host_wait(elapsed);
     }
 
     /// Each bank group's device convert takes its `lines` from now on

@@ -18,21 +18,35 @@ use crate::experts::site::site_lines;
 /// A load's granule pools, each opened once for the load, each class at
 /// its own granule (§4.7): its device store's state pool at the state's
 /// granule (`StateStorePlan::granule`), which the target and head state
-/// slabs claim from; where the load has a bank, the records pool of the
-/// store its records are placed in, at the bank's granule
-/// (`ExpertBankPlan::granule`), which its records and its banked stored
-/// tables claim from; and a linked host tier's own records pool of host
-/// storage (`ExpertBankPlan::host_granule`).
+/// slabs claim from; where the load has a bank, one records pool per distinct
+/// group granule (`ExpertBankPlan::granules`, 1 for uniform models) in the
+/// bank's store, which its records and banked stored tables claim from; and
+/// for a linked host tier, one records pool per distinct group granule in host
+/// RAM (sized at host page granularity).
 #[derive(Clone)]
 pub struct LoadPools {
     pub state: seismic::Pool,
-    pub records: Option<seismic::Pool>,
-    pub host: Option<seismic::Pool>,
+    pub recurrent: Option<seismic::Pool>,
+    pub records: Option<Vec<seismic::Pool>>,
+    pub host: Option<Vec<seismic::Pool>>,
 }
 
 impl LoadPools {
+    /// The state pools as [`magnitude_state::StatePools`] for `StateStore::new`.
+    pub fn state_pools(&self) -> magnitude_state::StatePools {
+        magnitude_state::StatePools {
+            history: self.state.clone(),
+            recurrent: self.recurrent.clone(),
+        }
+    }
+
+    /// The records pool holding banked stored tables (`ExpertBankPlan::table_pool`).
+    pub fn table_pool(&self, plan: &ExpertBankPlan) -> Option<seismic::Pool> {
+        self.records.as_ref().map(|pools| pools[plan.table_pool()].clone())
+    }
+
     /// `execution`'s pools on `device`, charged to the pool entries of
-    /// `ledgers`' stores (`DeviceLedgers::open_pool`).
+    /// `ledgers`' stores (`DeviceLedgers::open_records_pools_at`).
     pub fn open(device: &Device, ledgers: &crate::memory::ledger::DeviceLedgers, execution: &crate::planning::ExecutionPlan) -> Result<Self, String> {
         Self::open_at(device, ledgers, None, execution).map_err(|error| error.to_string())
     }
@@ -45,18 +59,35 @@ impl LoadPools {
         reading: Option<&crate::memory::ledger::DeviceReading>,
         execution: &crate::planning::ExecutionPlan,
     ) -> Result<Self, crate::memory::ledger::OpenPoolError> {
-        use crate::memory::ledger::PoolClass;
-        let granule = execution.resources().target_state().granule;
-        let state = ledgers.open_pool_at(reading, device, seismic::Contract::DeviceOnly, PoolClass::State, granule)?;
+        let target_state = execution.resources().target_state();
+        let (state, recurrent) = ledgers.open_state_pools_at(
+            reading,
+            device,
+            seismic::Contract::DeviceOnly,
+            target_state.granule,
+            target_state.recurrent_granule,
+        )?;
         let Some(plan) = execution.load().expert_bank() else {
-            return Ok(Self { state, records: None, host: None });
+            return Ok(Self { state, recurrent, records: None, host: None });
         };
-        let records = ledgers.open_pool_at(reading, device, plan.host().contract(BankTier::Bank), PoolClass::Records, plan.granule())?;
+        let records = ledgers.open_records_pools_at(
+            reading,
+            device,
+            plan.host().contract(BankTier::Bank),
+            plan.granules(),
+        )?;
         let host = plan
-            .host_granule()
-            .map(|granule| ledgers.open_pool_at(reading, device, plan.host().contract(BankTier::Host), PoolClass::Records, granule))
+            .tiered()
+            .then(|| {
+                ledgers.open_records_pools_at(
+                    reading,
+                    device,
+                    plan.host().contract(BankTier::Host),
+                    plan.granules(),
+                )
+            })
             .transpose()?;
-        Ok(Self { state, records: Some(records), host })
+        Ok(Self { state, recurrent, records: Some(records), host })
     }
 }
 
@@ -127,12 +158,14 @@ impl ExpertBank {
             })
             .collect::<Result<Vec<_>, String>>()?;
         let lent_of = |tier: BankTier, group: usize| lent.iter().find(|((of, at), _)| (*of, *at) == (tier, group)).map(|(_, tensors)| tensors);
-        // Each tier's stores: a group's records a slab each of its pool's
-        // granules, every expert of its layers (`ExpertBankPlan::records`,
+        // Each tier's stores: a group's records a slab each of its own
+        // granule pool, every expert of its layers (`ExpertBankPlan::records`,
         // `host_extent`), its leading records its lent ones.
-        let stores = |tier: BankTier, pool: seismic::Pool| -> Result<Arc<Stores>, WeightImportError> {
+        let stores = |tier: BankTier, pools: Vec<seismic::Pool>, blocks: &[seismic::BlockSize]| -> Result<Arc<Stores>, WeightImportError> {
+            assert_eq!(pools.len(), blocks.len(), "invariant violated: records pools and blocks count mismatch");
             let groups = (0..plan.groups().len())
                 .map(|group| {
+                    let pool = &pools[plan.group_pool(group)];
                     let (extent, lent) = match tier {
                         BankTier::Bank => (plan.records(group), plan.lent(group)),
                         BankTier::Host => (plan.host_extent(group), plan.host_lent(group)),
@@ -144,27 +177,28 @@ impl ExpertBank {
                         .map(|&kind| record.get(kind).ok_or("a region of a tensor the record lacks")?.record_bytes())
                         .collect::<Result<Vec<_>, String>>()?;
                     let store = match lent {
-                        0 => SlabTensor::in_pool(charges, &pool, 1, extent, &regions),
+                        0 => SlabTensor::in_pool(charges, pool, 1, extent, &regions),
                         _ => {
                             let tensors = lent_of(tier, group).ok_or("a group's lent records beside no lent allocation")?;
                             let views = kinds
                                 .iter()
                                 .map(|&kind| tensors.get(kind).cloned().ok_or("lent records of a tensor the record lacks"))
                                 .collect::<Result<Vec<_>, _>>()?;
-                            SlabTensor::in_pool_over(charges, &pool, 1, extent, &regions, views)
+                            SlabTensor::in_pool_over(charges, pool, 1, extent, &regions, views)
                         }
                     }
                     .map_err(|error| WeightImportError::allocating(plan.host().contract(tier), &error))?;
                     Ok((store, lent, bytes))
                 })
                 .collect::<Result<Vec<_>, WeightImportError>>()?;
-            Ok(Arc::new(Stores::new(pool, plan.block(), groups)))
+            let paired = pools.into_iter().zip(blocks.iter().copied()).collect();
+            Ok(Arc::new(Stores::new(paired, plan.group_pools().to_vec(), groups)))
         };
-        let LoadPools { records, host: host_pool, .. } = pools;
-        let bank_pool = records.expect("invariant violated: a banked load opens its records pool");
-        let bank_stores = stores(BankTier::Bank, bank_pool)?;
-        let host_stores = match (plan.tiered(), host_pool) {
-            (true, Some(pool)) => Some(stores(BankTier::Host, pool)?),
+        let LoadPools { records, host: host_pools, .. } = pools;
+        let bank_pools = records.expect("invariant violated: a banked load opens its records pools");
+        let bank_stores = stores(BankTier::Bank, bank_pools, plan.blocks())?;
+        let host_stores = match (plan.tiered(), host_pools) {
+            (true, Some(pools)) => Some(stores(BankTier::Host, pools, plan.blocks())?),
             (false, None) => None,
             (tiered, _) => return Err(format!("a bank whose host tier is {tiered} opened with the other's pools").into()),
         };
@@ -273,20 +307,37 @@ impl ExpertBank {
             .collect::<Result<Vec<_>, String>>()?;
         let floor = allocate_placed(charges, plan, std::num::NonZeroU64::MIN)
             .map_err(|error| crate::residency::WeightImportError::of_allocation(seismic::Contract::Words, error))?;
-        // The slots the bank commits, which its watcher's telemetry reads.
+        // The slots the bank and its host tier commit, which the watcher's telemetry reads.
         let slots = Arc::new(AtomicU64::new(plan.slots));
+        let host_slots = Arc::new(AtomicU64::new(0));
         let landed = match plan.placer() {
             Placer::Tier => host_stores.as_ref().ok_or("a bank the device places beside no host tier")?,
             Placer::Bank => &bank_stores,
         };
-        let (watcher, lines, scratch_tables) =
-            watch(plan, artifact, &layout, (&bank_stores, landed), &slot_maps, &floor, &pool_of, &conveyors, &scratch, sites, lines, cpu, slots.clone())?;
+        let (watcher, lines, scratch_tables, transport) = watch(
+            charges,
+            plan,
+            artifact,
+            &layout,
+            (&bank_stores, landed),
+            &slot_maps,
+            &floor,
+            &pool_of,
+            &conveyors,
+            &scratch,
+            sites,
+            lines,
+            cpu,
+            slots.clone(),
+            host_slots.clone(),
+        )?;
+        let host_stores_direct = host_stores.clone();
         let host = host_stores
             .map(|stores| {
                 let ceiling = plan.host_ceiling().ok_or("a host tier's records beside a plan without one")?;
                 Ok::<_, String>(Mutex::new(HostTier {
                     stores,
-                    commitment: Commitment::new(Arc::new(AtomicU64::new(0))),
+                    commitment: Commitment::new(host_slots),
                     ceiling,
                     thread: StorageThread::start("expert-bank-host-tier")?,
                     last_resize: None,
@@ -305,6 +356,7 @@ impl ExpertBank {
             #[cfg(test)]
             resident_decodes: std::sync::atomic::AtomicU64::new(0),
             stores: bank_stores,
+            host_stores: host_stores_direct,
             host,
             slot_maps,
             layer_residents,
@@ -318,6 +370,7 @@ impl ExpertBank {
             plan: plan.clone(),
             counts,
             cache: Arc::new(super::cache::BankCache::new(changes)),
+            transport,
         };
         let bank = Arc::new(bank);
         bank.cache.set_reclaimer(BankTier::Bank, super::resize::BankReclaimer::new(&bank, BankTier::Bank));
@@ -326,8 +379,8 @@ impl ExpertBank {
         }
         // Register the open host-tier backing claim now so `ServedBank::new`
         // finds it; actual background slot allocation (`ExpertBank::back_host_to`)
-        // starts only after warm-up and load pricing (`ExecutorDomain::begin_host_backing`),
-        // clamped to live host room.
+        // starts only after domain allocation and its fresh post-domain `HostRam`
+        // reading (`ServedBank::begin_host_backing`), clamped to live host room.
         bank.cache.open_host(plan.host_slots, host_backing);
         Ok(bank)
     }
@@ -344,6 +397,7 @@ impl ExpertBank {
 /// into (the host tier's, or where the host places the bank's own).
 #[allow(clippy::too_many_arguments)]
 fn watch(
+    charges: &seismic::Charges,
     plan: &ExpertBankPlan,
     artifact: &GgufArtifact,
     layout: &BankLayout<Tensor>,
@@ -357,7 +411,16 @@ fn watch(
     lines: std::sync::Arc<[crate::assessment::BankLines]>,
     cpu: &crate::assessment::StoredCpuSite,
     slots: Arc<AtomicU64>,
-) -> Result<(Watcher, std::sync::Arc<[crate::assessment::BankLines]>, Vec<ExchangeTable>), String> {
+    host_slots: Arc<AtomicU64>,
+) -> Result<
+    (
+        Watcher,
+        std::sync::Arc<[crate::assessment::BankLines]>,
+        Vec<ExchangeTable>,
+        Arc<crate::experts::transport::ExpertTransport>,
+    ),
+    crate::residency::WeightImportError,
+> {
     let words = |tensor: &Tensor, initial| Words::new(tensor.clone(), tensor.byte_len() / 4, initial);
     let binding = plan.binding(0)?;
     // The steps the watcher serves, under whose lock the host writes every
@@ -573,18 +636,6 @@ fn watch(
             scratch: scratch_pools,
         })
     };
-    // What promotions copy with, beside a host tier: the device's transfer
-    // queue, and the bank's records each copy writes, whose form is the
-    // tier's (`BankPart::Tier`'s, the bank's resident one).
-    let copier = match plan.placer() {
-        Placer::Tier => {
-            let copies = seismic::Transfer::new(&device)
-                .map(|transfer| super::copies::Copies::new(transfer, steps.events().clone()))
-                .map_err(|error| format!("the device's transfers: {error}"))?;
-            Some(Copier { copies })
-        }
-        Placer::Bank => None,
-    };
     let carrier = Carrier {
         records: usize::try_from(conveyor.conveyor.records).map_err(|_| "conveyor records exceed the host")?,
         slots: if addressed {
@@ -628,38 +679,90 @@ fn watch(
                 // at verify burst width (`VERIFY_ROWS`) scaled by the group's
                 // actual VRAM miss fraction, bounded to a small share of
                 // available records so permanent residency is preserved.
+                // Also reserve a disjoint per-group M7 on-demand decode DMA
+                // landing slice (`lent + stage_slots .. lent + stage_slots + dma_slots`)
+                // on CUDA partial banks so `DecodeFront -> DMA -> DecodeBack`
+                // lands unpredicted misses at full PCIe line rate with zero
+                // residency-lock contention.
                 let k = plan.selected() as usize;
                 let verify_rows = magnitude_kernels::constants::VERIFY_ROWS as usize;
                 let lookahead_layers = crate::planning::HINT_LEADS as usize + 1;
-                let stage_slots = (0..tiers.len())
-                    .map(|group| {
-                        if plan.whole() {
-                            return 0;
-                        }
-                        let present = bank.present(group) as usize;
-                        let start = if group == lender.group { lent } else { 0 };
-                        let avail = present.saturating_sub(start);
-                        let group_layers = plan.groups()[group].layers.len();
-                        let active_layers = lookahead_layers.min(group_layers);
-                        let total_experts = plan.group_experts(group) as usize;
-                        let miss_frac = (1.0 - (present as f64 / total_experts.max(1) as f64)).clamp(0.0, 1.0);
-                        // Expected unique misses per layer across VERIFY_ROWS
-                        // (accounting for ~50% cross-row expert overlap, at least K).
-                        let misses_per_layer = ((miss_frac * (k * verify_rows) as f64 * 0.5).ceil() as usize).max(k);
-                        let want = active_layers.saturating_mul(misses_per_layer).saturating_mul(2);
-                        // Cap at 1/16th of available records (with a 2*K floor when
-                        // capacity allows), always even and leaving >= 1 permanent record.
-                        let share_cap = (avail / 16).max(k.saturating_mul(2));
-                        let max_stage = share_cap.min(avail.saturating_sub(1)) & !1;
-                        want.min(max_stage)
-                    })
-                    .collect();
+                let enable_dma = crate::experts::decode_dma_enabled(device.backend()) && !plan.whole();
+                let mut stage_slots = Vec::with_capacity(tiers.len());
+                for group in 0..tiers.len() {
+                    if plan.whole() {
+                        stage_slots.push(0);
+                        continue;
+                    }
+                    let present = bank.present(group) as usize;
+                    let start = if group == lender.group { lent } else { 0 };
+                    let group_layers = plan.groups()[group].layers.len();
+                    let total_experts = plan.group_experts(group) as usize;
+                    let stage = stage_slot_count(
+                        present,
+                        start,
+                        group_layers,
+                        total_experts,
+                        k,
+                        verify_rows,
+                        lookahead_layers,
+                        enable_dma,
+                    );
+                    stage_slots.push(stage);
+                }
                 Placement::Tier { bank_maps, tier_maps: landing_maps, lent: (lender.group, lent), stage_slots }
             }
             Placer::Bank => Placement::Bank { landing_maps },
         };
         let reserve = usize::try_from(plan.tier_reserve()).map_err(|_| "the tier's reserve exceeds the host")?;
         TierStart { records, lent, reserve, placement }
+    };
+    // Single owner `ExpertTransport` shared across `LinkMover` (`Copies`),
+    // `Scratch` (prefill DMA plans), and `ExpertBank` (M7 decode DMA + prefill DMA).
+    let decode_dma = if crate::experts::decode_dma_enabled(charges.device().backend())
+        && plan.placer() == Placer::Tier
+        && !plan.whole()
+    {
+        let transfer = seismic::Transfer::new(&charges.device())
+            .map_err(|error| format!("M7 decode DMA transfer queue: {error}"))?;
+        let selected = usize::try_from(plan.selected()).map_err(|_| "selected experts exceed host")?;
+        let words_count = magnitude_kernels::constants::SOURCE_ROWS
+            * magnitude_kernels::constants::VERIFY_ROWS
+            * plan.selected();
+        let sources = Tensor::words(charges, seismic::Element::i32(), &[words_count]).map_err(|error| {
+            crate::residency::WeightImportError::of_allocation(
+                seismic::Contract::Words,
+                crate::resources::AllocationError::Tensor(error),
+            )
+        })?;
+        let sources_words = Words::new(sources.clone(), words_count, 0)?;
+        let file_tables: Vec<ExchangeTable> = watched.iter().map(|layer| layer.file.clone()).collect();
+        Some(crate::experts::transport::DecodeDmaState::new(
+            transfer,
+            landed.clone(),
+            bank.clone(),
+            sources,
+            sources_words,
+            selected,
+            plan.layers().len(),
+            file_tables,
+            steps.events().clone(),
+        ))
+    } else {
+        None
+    };
+    let transport = crate::experts::transport::ExpertTransport::new(decode_dma);
+    // What promotions and opportunistic staging copy with, beside a host tier:
+    // the device's transfer queue, wired to `transport` so decode demand joins
+    // in-flight staging copies.
+    let copier = match plan.placer() {
+        Placer::Tier => {
+            let copies = seismic::Transfer::new(&device)
+                .map(|transfer| super::copies::Copies::with_transport(transfer, steps.events().clone(), transport.clone()))
+                .map_err(|error| format!("the device's transfers: {error}"))?;
+            Some(Copier { copies })
+        }
+        Placer::Bank => None,
     };
     // A group's commits span its ceiling, as its entries bind them, so a
     // resize keeps them. For `Placer::Tier`, `Group::bank` resolves bank slab
@@ -711,6 +814,7 @@ fn watch(
             recording: plan.recording,
         },
         slots,
+        host_slots,
         whole: plan.whole(),
         staging: u32::try_from(binding.staging).map_err(|_| "staging records exceed u32")?,
         host,
@@ -722,6 +826,142 @@ fn watch(
         spans: device.backend().times_spans() && device.backend().parks_in_kernels(),
         trip: crate::experts::exchange::abort(),
         line: plan.paths.line(),
+        transport: transport.clone(),
     })
-    .map(|watcher| (watcher, lines, tables))
+    .map(|watcher| (watcher, lines, tables, transport))
+    .map_err(Into::into)
+}
+
+/// Compute `stage_slots` for one partial discrete-GPU bank group.
+///
+/// The staging ring lives in `start .. start + stage_slots` (disjoint from
+/// prompt scratch `0..lent` and leaving at least 1 permanent record past
+/// `start`). On-demand decode DMA allocates directly from the unified
+/// `Record::Free` pool (`Record::DemandLanding -> Record::Held`) with zero
+/// fixed DMA carve-out, so permanent decode VRAM receives `>= 97%` of group
+/// capacity while `LinkMover` opportunistic staging stays compact (`<= 2.5%`
+/// of group capacity, even) when `DecodeDma` is active.
+pub(crate) fn stage_slot_count(
+    present: usize,
+    start: usize,
+    group_layers: usize,
+    total_experts: usize,
+    k: usize,
+    verify_rows: usize,
+    lookahead_layers: usize,
+    enable_dma: bool,
+) -> usize {
+    let avail = present.saturating_sub(start);
+    if avail <= 1 {
+        return 0;
+    }
+    let active_layers = lookahead_layers.min(group_layers);
+    let miss_frac = (1.0 - (present as f64 / total_experts.max(1) as f64)).clamp(0.0, 1.0);
+    // Expected unique misses per layer across VERIFY_ROWS
+    // (accounting for ~50% cross-row expert overlap, at least K).
+    let misses_per_layer = ((miss_frac * (k * verify_rows) as f64 * 0.5).ceil() as usize).max(k);
+    let want_stage = active_layers.saturating_mul(misses_per_layer).saturating_mul(2);
+    if enable_dma {
+        let transient_cap = (present / 10).max(k).min(avail.saturating_sub(1));
+        let max_stage = transient_cap.saturating_sub(k).min(transient_cap / 4) & !1;
+        want_stage.min(max_stage)
+    } else {
+        let share_cap = (avail / 16).max(k.saturating_mul(2));
+        let max_stage = share_cap.min(avail.saturating_sub(1)) & !1;
+        want_stage.min(max_stage)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::stage_slot_count;
+    use crate::experts::Words;
+    use crate::experts::map::StampedMap;
+    use crate::experts::records::BankRecords;
+    use magnitude_kernels::constants::MAP_WORDS;
+
+    fn decode_permanent_capacity(
+        slots_per_layer: usize,
+        group_layers: &[usize],
+        experts_per_layer: usize,
+        lender_group: usize,
+        lent: usize,
+        k: usize,
+    ) -> (usize, usize, usize) {
+        let verify_rows = magnitude_kernels::constants::VERIFY_ROWS as usize;
+        let lookahead_layers = crate::planning::HINT_LEADS as usize + 1;
+        let present: Vec<usize> = group_layers.iter().map(|&n| n * slots_per_layer).collect();
+        let mut stage_slots = Vec::with_capacity(group_layers.len());
+        for (group, &layers) in group_layers.iter().enumerate() {
+            let start = if group == lender_group { lent } else { 0 };
+            let stage = stage_slot_count(
+                present[group],
+                start,
+                layers,
+                layers * experts_per_layer,
+                k,
+                verify_rows,
+                lookahead_layers,
+                true,
+            );
+            stage_slots.push(stage);
+        }
+        let cpu = crate::test_support::open_backend(&seismic::Devices::discover(&[]).unwrap(), seismic::BackendName::Cpu).unwrap();
+        let mut layers = Vec::new();
+        let mut maps = Vec::new();
+        for (group, &count) in group_layers.iter().enumerate() {
+            for _ in 0..count {
+                layers.push((group, experts_per_layer));
+                let words = experts_per_layer as u64 * MAP_WORDS;
+                let tensor = seismic::Tensor::shared(
+                    &seismic::Charges::tally(&cpu),
+                    seismic::Element::i32(),
+                    &[experts_per_layer as u64, MAP_WORDS],
+                )
+                .unwrap();
+                maps.push(StampedMap::new(Words::new(tensor, words, 0).unwrap()));
+            }
+        }
+        let bank = BankRecords::new(
+            &present,
+            &layers,
+            Some((maps, (lender_group, lent), stage_slots.clone())),
+        );
+        let total: usize = present.iter().sum();
+        let permanent: usize = (0..group_layers.len()).map(|g| bank.capacity(g)).sum();
+        let total_stage: usize = stage_slots.iter().sum();
+        (total, permanent, total_stage)
+    }
+
+    #[test]
+    fn deepseek_like_bank_exposes_at_least_90_percent_vram_during_decode() {
+        // 40 layers across 8 mixed-quant groups, 41 slots/layer = 1,640 records,
+        // lender group 0 lending 480 records for prefill scratch.
+        let (total, permanent, stage) =
+            decode_permanent_capacity(41, &[20, 4, 4, 4, 2, 2, 2, 2], 384, 0, 480, 8);
+        assert_eq!(total, 1_640);
+        assert_eq!(permanent + stage, total);
+        let pct = permanent as f64 / total as f64;
+        assert!(
+            pct >= 0.90,
+            "expected >= 90% permanent VRAM during decode, got {permanent}/{total} ({:.1}%, stage={stage})",
+            pct * 100.0
+        );
+    }
+
+    #[test]
+    fn glm_like_bank_exposes_at_least_90_percent_vram_during_decode() {
+        // 42 layers across 3 mixed-quant groups, 58 slots/layer = 2,436 records,
+        // lender group 0 lending 360 records for prefill scratch.
+        let (total, permanent, stage) =
+            decode_permanent_capacity(58, &[30, 8, 4], 288, 0, 360, 8);
+        assert_eq!(total, 2_436);
+        assert_eq!(permanent + stage, total);
+        let pct = permanent as f64 / total as f64;
+        assert!(
+            pct >= 0.90,
+            "expected >= 90% permanent VRAM during decode, got {permanent}/{total} ({:.1}%, stage={stage})",
+            pct * 100.0
+        );
+    }
 }

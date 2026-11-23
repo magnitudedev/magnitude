@@ -143,6 +143,21 @@ impl DeviceCompletion for BatchFence {
     }
 }
 
+/// A device-side completion handle for a transfer batch, which a
+/// [`super::graph::NativeGraphSequence`] can wait on via cross-stream event
+/// synchronization (`cuStreamWaitEvent` on CUDA) without blocking the host or
+/// using `cuStreamWaitValue32`.
+#[derive(Clone)]
+pub struct TransferSync {
+    cuda: Option<Arc<seismic_cuda::Event>>,
+}
+
+impl TransferSync {
+    pub(super) fn cuda_event(&self) -> Option<&seismic_cuda::Event> {
+        self.cuda.as_deref()
+    }
+}
+
 /// One device's transfer queue.
 pub struct TransferInner {
     device: Arc<DeviceInner>,
@@ -187,6 +202,17 @@ impl TransferInner {
     /// (written) and every signal's word (written): host access to them,
     /// and their storage's release, wait for it.
     pub fn copy(&self, items: &[TransferItem<'_>]) -> Result<u64, TransferError> {
+        self.copy_inner(items, false).map(|(value, _)| value)
+    }
+
+    /// [`Self::copy`], also returning a [`TransferSync`] event handle so a
+    /// [`super::graph::NativeGraphSequence`] can wait on the batch via
+    /// cross-stream event synchronization (`cuStreamWaitEvent` on CUDA).
+    pub fn copy_synced(&self, items: &[TransferItem<'_>]) -> Result<(u64, TransferSync), TransferError> {
+        self.copy_inner(items, true)
+    }
+
+    fn copy_inner(&self, items: &[TransferItem<'_>], record_event: bool) -> Result<(u64, TransferSync), TransferError> {
         seismic_memory::assert_blocking_allocation_allowed("TransferInner::copy");
         for item in items {
             match item {
@@ -225,6 +251,7 @@ impl TransferInner {
         let _issuing = self.issuing.lock().expect("transfer queue lock is never poisoned");
         // A batch takes its value once queued: a refused one takes none.
         let value = self.next.load(Ordering::Relaxed);
+        let mut cuda_event = None;
         match &self.queue.kind {
             TransferKind::Cpu { done } => {
                 // Every item's addresses first: a batch is refused before any
@@ -296,7 +323,11 @@ impl TransferInner {
                     })
                     .collect::<Vec<_>>();
                 // The word holds a value's low 32 bits, compared cyclically.
-                queue.copy(&items, value as u32).map_err(TransferError::Execution)?;
+                if record_event {
+                    cuda_event = Some(queue.copy_event(&items, value as u32).map_err(TransferError::Execution)?);
+                } else {
+                    queue.copy(&items, value as u32).map_err(TransferError::Execution)?;
+                }
             }
             #[cfg(not(target_os = "macos"))]
             TransferKind::Vulkan(queue) => {
@@ -327,7 +358,7 @@ impl TransferInner {
             allocation.record_device_use(DeviceQueue::Transfer, fence.clone(), *write);
         }
         drop(permits);
-        Ok(value)
+        Ok((value, TransferSync { cuda: cuda_event }))
     }
 
     /// A run copies between live views of this device's tensors, each

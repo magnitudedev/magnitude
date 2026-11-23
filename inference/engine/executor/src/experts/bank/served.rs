@@ -35,7 +35,7 @@ impl CacheReclaimer for TableReclaimer {
         if from <= self.floor {
             return Err(ReclaimError::AtFloor);
         }
-        let (block, granule) = (bank.plan.block(), bank.plan.granule());
+        let (block, granule) = (bank.plan.table_block(), bank.plan.table_granule());
         let charge = |records: u64| crate::planning::BankTable::charge(block, granule, records).map_err(ReclaimError::Invariant);
         let Some(to) = crate::planning::releasing(from, self.floor, need, charge)? else {
             return Err(ReclaimError::AtFloor);
@@ -159,10 +159,11 @@ impl ServedBank {
         self.bank.plan.host_slots > 0 && self.bank.host_tier().is_some()
     }
 
-    /// Start background backing of the linked host tier after warm-up and load
-    /// pricing, clamped to what the fresh `HostRam` reading actually admits.
-    /// Any slots trimmed below `plan.host_slots` are shed from `BankCache`
-    /// immediately so no phantom `CacheKind::Bank` bytes remain in the ledger.
+    /// Start background backing of the linked host tier after domain
+    /// allocation, clamped to what the fresh post-domain `HostRam` reading
+    /// actually admits. Any slots trimmed below `plan.host_slots` are shed
+    /// from `BankCache` immediately so no phantom `CacheKind::Bank` bytes
+    /// remain in the ledger.
     pub(crate) fn begin_host_backing(&self, ledgers: &DeviceLedgers) -> Result<(), DomainError> {
         if !self.has_planned_host_tier() {
             return Ok(());
@@ -205,7 +206,7 @@ impl ServedBank {
         match holding {
             BankHolding::Experts => Ok(counts.resident_charge(at)),
             BankHolding::Host => Ok(counts.host_charge(at)),
-            BankHolding::Table { .. } => crate::planning::BankTable::charge(self.bank.plan.block(), self.bank.plan.granule(), at).map_err(DomainError::invariant),
+            BankHolding::Table { .. } => crate::planning::BankTable::charge(self.bank.plan.table_block(), self.bank.plan.table_granule(), at).map_err(DomainError::invariant),
         }
     }
 
@@ -358,6 +359,10 @@ impl ElasticBank for ServedBank {
         self.bank.watcher.shared().draft_window(estimated_seconds);
     }
 
+    fn draft_tokens(&self, request: crate::operation::RequestId, tokens: &[crate::operation::TokenId]) {
+        self.bank.watcher.shared().draft_tokens(request, tokens.to_vec());
+    }
+
     fn stop_growths(&self) {
         // Both stores: a claim's hold would leave either one's slots waiting.
         self.bank.stop_growth(BankTier::Bank);
@@ -460,18 +465,19 @@ impl ElasticBank for ServedBank {
     fn targets(&self) -> Result<Vec<HoldingTarget<'_>>, DomainError> {
         let plan = &self.bank.plan;
         let counts = &self.bank.counts;
-        let block = plan.block().held;
+        let bank_block = plan.tier_block_bytes(BankTier::Bank);
         let at = self.bank.slots();
         let mut targets = vec![HoldingTarget {
             holding: BankHolding::Experts,
             tier: self.storage(BankHolding::Experts)?,
             at,
             owed: self.bank.cache.owed(BankHolding::Experts, self.above_floor(BankHolding::Experts, at)?),
-            shape: BankShape::new(block, counts.floor(), plan.ceiling, plan.ceiling),
+            shape: BankShape::new(bank_block, counts.floor(), plan.ceiling, plan.ceiling),
             charge: Box::new(move |slots| counts.resident_charge(slots)),
         }];
         if let Some((host, ceiling)) = self.bank.host_tier() {
-            assert!(plan.host_granule().is_some(), "invariant violated: a host tier beside a plan without its pool");
+            assert!(plan.tiered(), "invariant violated: a host tier beside a plan without its pool");
+            let host_block = plan.tier_block_bytes(BankTier::Host);
             let bound = match self.bank.host_backing() {
                 true => host,
                 false => ceiling,
@@ -481,13 +487,13 @@ impl ElasticBank for ServedBank {
                 tier: self.storage(BankHolding::Host)?,
                 at: host,
                 owed: self.bank.cache.owed(BankHolding::Host, self.above_floor(BankHolding::Host, host)?),
-                shape: BankShape::host(block, ceiling, bound, plan.whole_at(self.bank.slots())),
+                shape: BankShape::host(host_block, ceiling, bound, plan.whole_at(self.bank.slots())),
                 charge: Box::new(move |slots| counts.host_charge(slots)),
             });
         }
         for (index, held) in self.tables.iter().enumerate() {
             let holding = BankHolding::Table { table: index };
-            let (block, granule) = (plan.block(), plan.granule());
+            let (block, granule) = (plan.table_block(), plan.table_granule());
             let records = held.table.records();
             let ceiling = held.plan.records.get();
             targets.push(HoldingTarget {
@@ -582,6 +588,9 @@ impl ElasticBank for ServedBank {
                 // The host tier's backing at open settles its cache entry alone.
                 Some((backed, false)) => {
                     self.bank.cache.settle(&backed);
+                    if matches!(backed, BankResized::GrowthRefused { .. } | BankResized::Grown { refused: Some(_), .. }) {
+                        self.bank.watcher.shared().record_growth_refusal();
+                    }
                     self.bank.cache.fit(BankHolding::Host, self.above_floor(BankHolding::Host, self.bank.host_slots())?);
                     self.finished.lock().expect("table resize outcome").pop_front()
                 }
@@ -590,6 +599,9 @@ impl ElasticBank for ServedBank {
         };
         if let Some(resized) = &finished {
             self.bank.cache.settle(resized);
+            if matches!(resized, BankResized::GrowthRefused { .. } | BankResized::Grown { refused: Some(_), .. }) {
+                self.bank.watcher.shared().record_growth_refusal();
+            }
             if let BankResized::Grown { holding, .. } = *resized {
                 self.bank.cache.fit(holding, self.above_floor(holding, self.size(holding))?);
             }

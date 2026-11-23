@@ -162,10 +162,11 @@ pub struct ExpertBankPlan {
     backend: seismic::BackendName,
     /// How its device makes native allocations ([`Self::substrate`]).
     allocations: seismic::NativeAllocations,
-    /// Its records pools' block, of granules of [`Self::granule`]: what
-    /// their granules are charged in ([`Self::resident_charge`],
-    /// [`Self::host_charge`]).
-    block: seismic::BlockSize,
+    /// Per-distinct-granule pool blocks for the bank's records pools (and a
+    /// linked host tier's, which registers large-page blocks at the same
+    /// granularity), indexed by `structured.granules()`: what each pool's
+    /// granules are charged in ([`Self::resident_charge`], [`Self::host_charge`]).
+    blocks: Vec<seismic::BlockSize>,
     /// `S`: the committed records each routed layer adds to its group, at
     /// least the floor ([`Self::floor`], which may be none: each group then
     /// holds its least records, [`Self::least_records`]) and at most its
@@ -762,6 +763,14 @@ impl ExpertBankPlan {
         self.host() == HostTier::Linked
     }
 
+    /// Whether prefill fills copy host-tier experts into VRAM scratch via
+    /// producer-enqueued hardware DMA (`cuMemcpyHtoDAsync` on
+    /// `NativeStream::Fill`, ordered into `NativeStream::Compute` via
+    /// `cuStreamWaitEvent`) instead of SM zero-copy `routed_copy`.
+    pub fn tier_copy_dma(&self) -> bool {
+        self.tiered() && self.backend.fills_beside_compute()
+    }
+
     /// The slab regions of group `group`'s store, a record a slab: each
     /// routed tensor's resident record, in [`RecordTensors::iter`]'s order
     /// (a host tier's store has the same).
@@ -803,32 +812,63 @@ impl ExpertBankPlan {
         }
     }
 
-    /// What the bank's pool is charged for its records at `slots`: the
-    /// whole blocks ([`Self::pooled_charge`]) holding a granule
-    /// ([`Self::granule`]) for each record each group commits beyond its
-    /// lent ones ([`Self::lent`], charged at load as the lender's lent
-    /// allocation), so a shrink is priced by the blocks it returns.
+    /// What the bank's records pools are charged for its records at `slots`:
+    /// the whole blocks ([`Self::pooled_charge_for`]) holding each group's
+    /// granule for each record it commits beyond its lent ones
+    /// ([`Self::lent`], charged at load as the lender's lent allocation), so a
+    /// shrink is priced by the blocks it returns.
     pub fn resident_charge(&self, slots: u64) -> Result<u64, String> {
-        let granules = (0..self.groups().len()).try_fold(0u64, |total, group| {
-            let pooled = self
-                .records_at(group, slots)
+        self.pooled_charge_for(&self.blocks, |group| {
+            self.records_at(group, slots)
                 .checked_sub(self.lent(group))
-                .expect("a group's committed records hold its lent ones");
-            total.checked_add(pooled).ok_or_else(|| "bank record count overflows".to_owned())
-        })?;
-        self.pooled_charge(granules).ok_or_else(|| "bank record charge overflows".to_owned())
+                .expect("a group's committed records hold its lent ones")
+        })
+        .ok_or_else(|| "bank record charge overflows".to_owned())
     }
 
-    /// Its records pools' block ([`seismic::block_bytes`]).
-    pub fn block(&self) -> seismic::BlockSize {
-        self.block
+    /// Each distinct granule's records pool block ([`seismic::block_bytes`]),
+    /// indexed by [`Self::granules`].
+    pub fn blocks(&self) -> &[seismic::BlockSize] {
+        &self.blocks
     }
 
-    /// What `granules` of a records pool cost: whole blocks
-    /// ([`seismic::BlockSize::charge`]), the backend's rounding of each
-    /// block with them.
-    pub(super) fn pooled_charge(&self, granules: u64) -> Option<u64> {
-        self.block.charge(self.granule(), granules)
+    /// The pool block of the pool holding banked stored tables
+    /// ([`Self::table_pool`]).
+    pub fn table_block(&self) -> seismic::BlockSize {
+        self.blocks[self.table_pool()]
+    }
+
+    /// The largest pool block's held bytes among the bank's records pools: the
+    /// minimum resize step for [`crate::experts::derived::BankShape`].
+    pub fn tier_block_bytes(&self, tier: BankTier) -> u64 {
+        if tier == BankTier::Host && !self.tiered() {
+            return 0;
+        }
+        self.blocks.iter().map(|block| block.held).max().unwrap_or(0)
+    }
+
+    /// What each group's pooled records (`pooled_of(group)`) cost across the
+    /// deduplicated per-granule pools whose blocks are `blocks`: each pool
+    /// sums the granules of every group mapped to it and charges whole blocks
+    /// ([`seismic::BlockSize::charge`]), then sums across pools.
+    pub(super) fn pooled_charge_for(
+        &self,
+        blocks: &[seismic::BlockSize],
+        pooled_of: impl Fn(usize) -> u64,
+    ) -> Option<u64> {
+        let granules = self.granules();
+        let mut per_pool = vec![0u64; granules.len()];
+        for group in 0..self.groups().len() {
+            let pool = self.group_pool(group);
+            per_pool[pool] = per_pool[pool].checked_add(pooled_of(group))?;
+        }
+        blocks
+            .iter()
+            .zip(granules)
+            .zip(per_pool)
+            .try_fold(0u64, |total, ((block, &granule), count)| {
+                total.checked_add(block.charge(granule, count)?)
+            })
     }
 
     /// Staging records only demand takes. Every earlier request's records
@@ -1091,12 +1131,14 @@ impl ExpertBankPlan {
 
     /// The absent granules the bank's records pools allocate when they open
     /// (`LoadPools::open_at`), held for the load's life outside any slot count:
-    /// one in the bank's store and, for a linked host tier, one in host RAM.
+    /// one per distinct granule in the bank's store and, for a linked host
+    /// tier, one per distinct granule in host RAM.
     pub fn absent_demand(&self) -> ClaimDemand {
-        let mut demand = ClaimDemand::pooled(BankTier::Bank, self.block.absent);
-        if self.host_granule().is_some() {
+        let absent: u64 = self.blocks.iter().map(|block| block.absent).sum();
+        let mut demand = ClaimDemand::pooled(BankTier::Bank, absent);
+        if self.tiered() {
             demand = demand
-                .checked_plus(ClaimDemand::pooled(BankTier::Host, self.block.absent))
+                .checked_plus(ClaimDemand::pooled(BankTier::Host, absent))
                 .expect("bank absent granule demand fits u64");
         }
         demand
@@ -1105,22 +1147,21 @@ impl ExpertBankPlan {
     /// The pools' granules of the records the bank commits at its load, by
     /// what commits them: the bank's for its slots
     /// ([`Self::resident_charge`]), for its stored tables, every record
-    /// held ([`Self::tables_charge`]), its records pool's absent granule,
+    /// held ([`Self::tables_charge`]), its records pools' absent granules,
     /// and a host tier's at no host slots ([`Self::host_charge`]) and its
-    /// pool's absent granule, where the bank has a tier.
+    /// pools' absent granules, where the bank has a tier.
     pub(super) fn pooled_charges(&self) -> Result<Vec<(&'static str, ClaimDemand)>, String> {
+        let absent: u64 = self.blocks.iter().map(|block| block.absent).sum();
         let mut pooled = vec![
             ("group: records", ClaimDemand::pooled(BankTier::Bank, self.resident_charge(self.slots)?)),
-            ("pool: absent", ClaimDemand::pooled(BankTier::Bank, self.block.absent)),
+            ("pool: absent", ClaimDemand::pooled(BankTier::Bank, absent)),
         ];
         if !self.tables.is_empty() {
             pooled.push(("stored tables", ClaimDemand::pooled(BankTier::Bank, self.tables_charge()?)));
         }
         if self.tiered() {
             pooled.push(("host tier", ClaimDemand::pooled(BankTier::Host, self.host_charge(0)?)));
-            if self.host_granule().is_some() {
-                pooled.push(("host pool: absent", ClaimDemand::pooled(BankTier::Host, self.block.absent)));
-            }
+            pooled.push(("host pool: absent", ClaimDemand::pooled(BankTier::Host, absent)));
         }
         Ok(pooled)
     }
@@ -1132,8 +1173,9 @@ impl ExpertBankPlan {
     /// records are its own ([`BankTable::held_bytes`]); the rest are the
     /// pool's spare granules.
     pub fn tables_charge(&self) -> Result<u64, String> {
+        let (block, granule) = (self.table_block(), self.table_granule());
         self.tables.iter().try_fold(0u64, |sum, table| {
-            BankTable::charge(self.block, self.granule(), table.records.get())?
+            BankTable::charge(block, granule, table.records.get())?
                 .checked_add(sum)
                 .ok_or_else(|| "banked table charge overflows".to_owned())
         })
@@ -1182,8 +1224,9 @@ impl ExpertBankPlan {
         demand.device -= pooled;
         // Each stored table's held records are its weight's, every one in
         // the pool (`BankTable::plan`).
+        let table_granule = self.table_granule();
         for table in &self.tables {
-            demand.device = demand.device.checked_sub(BankTable::held_bytes(self.granule(), table.records.get())?)
+            demand.device = demand.device.checked_sub(BankTable::held_bytes(table_granule, table.records.get())?)
                 .ok_or("a bank holds less than its stored tables' records charge")?;
         }
         let lent = match self.host().contract(BankTier::Bank) {
@@ -1202,12 +1245,9 @@ impl ExpertBankPlan {
         let (selected, host, groups, _) = self.structured.into_parts();
         let structured = conveyor::Structured::new(selected, host, groups, layers, Some(window_slots))
             .expect("the layers keep the bank's lending");
-        let block = seismic::block_bytes(seismic::BlockSizing {
-            granule: structured.granule(),
-            allocations: self.allocations,
-        })
-        .expect("the layers size a valid block");
-        Self { structured, block, ..self }
+        let blocks = size_pool_blocks(structured.granules(), self.allocations)
+            .expect("the layers size valid bank blocks");
+        Self { structured, blocks, ..self }
     }
 
     /// The layer whose weights are of `scope` and its index, when the bank
@@ -1295,17 +1335,15 @@ impl ExpertBankPlan {
         needed
     }
 
-    /// What the bank's pool is charged for its records at `slots` and `paths`
+    /// What the bank's pools are charged for its records at `slots` and `paths`
     /// (matching [`Self::resident_charge`] with `self.paths = paths`).
     pub fn resident_charge_with_paths(&self, slots: u64, paths: BankPaths) -> Result<u64, String> {
-        let granules = (0..self.groups().len()).try_fold(0u64, |total, group| {
-            let pooled = self
-                .records_at_with_paths(group, slots, paths)
+        self.pooled_charge_for(&self.blocks, |group| {
+            self.records_at_with_paths(group, slots, paths)
                 .checked_sub(self.lent(group))
-                .expect("a group's committed records hold its lent ones");
-            total.checked_add(pooled).ok_or_else(|| "bank record count overflows".to_owned())
-        })?;
-        self.pooled_charge(granules).ok_or_else(|| "bank record charge overflows".to_owned())
+                .expect("a group's committed records hold its lent ones")
+        })
+        .ok_or_else(|| "bank record charge overflows".to_owned())
     }
 
     /// Group `group`'s committed host tier records ([`Self::host_records`])
@@ -1323,20 +1361,18 @@ impl ExpertBankPlan {
         }
     }
 
-    /// What the host tier's pool is charged ([`Self::host_charge`]) at
+    /// What the host tier's pools are charged ([`Self::host_charge`]) at
     /// `host_slots` and `paths`.
     pub fn host_charge_with_paths(&self, host_slots: u64, paths: BankPaths) -> Result<u64, String> {
-        if self.host_granule().is_none() {
+        if !self.tiered() {
             return Ok(0);
         }
-        let granules = (0..self.groups().len()).try_fold(0u64, |total, group| {
-            let pooled = self
-                .host_records_with_paths(group, host_slots, paths)
+        self.pooled_charge_for(&self.blocks, |group| {
+            self.host_records_with_paths(group, host_slots, paths)
                 .checked_sub(self.host_lent(group))
-                .expect("a group's host records hold its lent ones");
-            total.checked_add(pooled).ok_or_else(|| "host tier records overflow".to_owned())
-        })?;
-        self.pooled_charge(granules).ok_or_else(|| "host tier bytes overflow".to_owned())
+                .expect("a group's host records hold its lent ones")
+        })
+        .ok_or_else(|| "host tier bytes overflow".to_owned())
     }
 
     /// The pools' granules demanded at `slots` and `paths` (matching
@@ -1374,6 +1410,20 @@ impl ExpertBankPlan {
             .and_then(|d| d.checked_plus(pooled_demand))
             .ok_or_else(|| "bank storage demand overflows".to_owned())
     }
+}
+
+/// Size each distinct granule's pool block under `allocations`.
+pub(super) fn size_pool_blocks(
+    granules: &[u64],
+    allocations: seismic::NativeAllocations,
+) -> Result<Vec<seismic::BlockSize>, String> {
+    granules
+        .iter()
+        .map(|&granule| {
+            seismic::block_bytes(seismic::BlockSizing { granule, allocations })
+                .map_err(|error| format!("the bank's records pool blocks: {error:?}"))
+        })
+        .collect()
 }
 
 #[cfg(test)]

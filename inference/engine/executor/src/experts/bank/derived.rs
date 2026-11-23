@@ -120,7 +120,7 @@ pub fn import_slots(
     plan: &crate::planning::ExpertBankPlan,
     floor: crate::memory::ClaimDemand,
 ) -> u64 {
-    let shape = BankShape::new(plan.block().held, plan.floor(), plan.ceiling, plan.slots);
+    let shape = BankShape::new(plan.tier_block_bytes(BankTier::Bank), plan.floor(), plan.ceiling, plan.slots);
     let charge = |slots| plan.resident_charge(slots).expect("invariant violated: a bank plan charges every size within its ceiling");
     let beside = ledgers.placed_in(device, floor, BankTier::Bank);
     import_target(at_load.of(BankTier::Bank), beside, &shape, &charge)
@@ -136,13 +136,10 @@ pub fn import_host_slots(
     plan: &crate::planning::ExpertBankPlan,
     floor: crate::memory::ClaimDemand,
 ) -> u64 {
-    if plan.host_slots == 0 {
+    if plan.host_slots == 0 || !plan.tiered() {
         return 0;
     }
-    if plan.host_granule().is_none() {
-        return 0;
-    }
-    let shape = BankShape::new(plan.block().held, 0, plan.host_slots, plan.host_slots);
+    let shape = BankShape::new(plan.tier_block_bytes(BankTier::Host), 0, plan.host_slots, plan.host_slots);
     let charge = |slots| plan.host_charge(slots).expect("invariant violated: a bank plan charges every host size within its ceiling");
     let beside = ledgers.placed_in(device, floor, BankTier::Host);
     target_slots(at_load.of(BankTier::Host).pinned_import_room().saturating_sub(beside), &shape, &charge)
@@ -159,10 +156,10 @@ pub fn clamped_host_slots(
     host_estimate: &Estimate,
     plan: &crate::planning::ExpertBankPlan,
 ) -> u64 {
-    if plan.host_slots == 0 || plan.host_granule().is_none() {
+    if plan.host_slots == 0 || !plan.tiered() {
         return 0;
     }
-    let shape = BankShape::new(plan.block().held, 0, plan.host_slots, plan.host_slots);
+    let shape = BankShape::new(plan.tier_block_bytes(BankTier::Host), 0, plan.host_slots, plan.host_slots);
     let charge = |slots| plan.host_charge(slots).expect("invariant violated: a bank plan charges every host size within its ceiling");
     target_slots(host_estimate.pinned_import_room(), &shape, &charge)
 }

@@ -50,6 +50,12 @@ pub(crate) enum Committed {
 
 impl DeviceCompletion for Committed {
     fn completed(&self) -> Result<bool, ExecutionError> {
+        // Querying a backend submission calls into the device driver (e.g.
+        // `cuEventQuery` on CUDA), which acquires the driver context mutex and
+        // can deadlock if called inside a no-blocking-allocation scope (such as
+        // `residency` or `expert-requests`) while a submitting thread holds the
+        // driver mutex behind a spinning kernel.
+        seismic_memory::assert_blocking_allocation_allowed("Committed::completed");
         match self {
             Self::Cpu { outcome, .. } => outcome.clone().map(|()| true),
             #[cfg(target_os = "macos")]
@@ -60,6 +66,7 @@ impl DeviceCompletion for Committed {
         }
     }
     fn ended(&self) -> Result<(), ExecutionError> {
+        seismic_memory::assert_blocking_allocation_allowed("Committed::ended");
         match self {
             Self::Cpu { outcome, .. } => outcome.clone(),
             #[cfg(target_os = "macos")]

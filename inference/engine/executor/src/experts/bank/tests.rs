@@ -32,7 +32,11 @@ fn a_growth_joins_each_slot_as_every_group_holds_it() {
     let charges = seismic::Charges::tally(&device);
     let pool = seismic::Pool::open(&entries.charges(&device, seismic::Contract::Shared), seismic::Contract::Shared, granule, 2 * granule).unwrap();
     let groups = (0..2).map(|_| (seismic::SlabTensor::in_pool(&charges, &pool, 1, 8, &regions).unwrap(), 0, vec![64])).collect();
-    let stores = Arc::new(Stores::new(pool, seismic::BlockSize { bytes: 2 * granule, held: 2 * granule, absent: granule }, groups));
+    let stores = Arc::new(Stores::new(
+        vec![(pool, seismic::BlockSize { bytes: 2 * granule, held: 2 * granule, absent: granule })],
+        vec![0, 0],
+        groups,
+    ));
     let opened = ledger.estimate().allocated();
     let records: RecordsAt = Arc::new(|_, at| at);
     // The first slot's records, claimed as the bank opened; the growth's
@@ -108,7 +112,11 @@ fn a_pools_absent_granule_is_committed_never_spare() {
     let charges = seismic::Charges::tally(&device);
     let pool = seismic::Pool::open(&entries.charges(&device, seismic::Contract::Shared), seismic::Contract::Shared, granule, 2 * granule).unwrap();
     let groups = vec![(seismic::SlabTensor::in_pool(&charges, &pool, 1, 2, &regions).unwrap(), 0, vec![64])];
-    let stores = Arc::new(Stores::new(pool, seismic::BlockSize { bytes: 2 * granule, held: 2 * granule, absent: granule }, groups));
+    let stores = Arc::new(Stores::new(
+        vec![(pool, seismic::BlockSize { bytes: 2 * granule, held: 2 * granule, absent: granule })],
+        vec![0],
+        groups,
+    ));
     let opened = ledger.estimate();
     assert!(opened.allocated() >= granule, "the pool allocated its absent granule as it opened");
     assert_eq!((opened.cache(), opened.committed()), (0, opened.allocated()), "committed, none of it spare");
@@ -193,7 +201,11 @@ fn a_long_growth_beside_settled_samples_never_starves_or_panics_them() {
     let pool = seismic::Pool::open(&entries.charges(&device, seismic::Contract::Shared), seismic::Contract::Shared, granule, 2 * granule).unwrap();
     // A store of a slot for each of the ninety.
     let groups = (0..2).map(|_| (seismic::SlabTensor::in_pool(&charges, &pool, 1, SLOTS, &regions).unwrap(), 0, vec![64])).collect();
-    let stores = Arc::new(Stores::new(pool, seismic::BlockSize { bytes: 2 * granule, held: 2 * granule, absent: granule }, groups));
+    let stores = Arc::new(Stores::new(
+        vec![(pool, seismic::BlockSize { bytes: 2 * granule, held: 2 * granule, absent: granule })],
+        vec![0, 0],
+        groups,
+    ));
     let opened = ledger.estimate().allocated();
     let records: RecordsAt = Arc::new(|_, at| at);
     changes.change(|_| (0..2).for_each(|group| assert_eq!(stores.claim_to(group, 1).unwrap(), [0])));
@@ -312,7 +324,11 @@ fn pooled_records_do_not_pin_idle_slabs_against_pool_vacation() {
     let charges = seismic::Charges::tally(&device);
     let pool = seismic::Pool::open(&entries.charges(&device, seismic::Contract::Shared), seismic::Contract::Shared, granule, block_bytes).unwrap();
     let store = seismic::SlabTensor::in_pool(&charges, &pool, 1, 8, &regions).unwrap();
-    let stores = Arc::new(Stores::new(pool.clone(), seismic::BlockSize { bytes: block_bytes, held: block_bytes, absent: granule }, vec![(store, 0, vec![64])]));
+    let stores = Arc::new(Stores::new(
+        vec![(pool.clone(), seismic::BlockSize { bytes: block_bytes, held: block_bytes, absent: granule })],
+        vec![0],
+        vec![(store, 0, vec![64])],
+    ));
     let claim = ledger
         .change(|keeping| ledger.backing(&keeping.claims(), crate::memory::ledger::PoolClass::Records, 8 * granule))
         .expect("8 slabs fit");
@@ -360,7 +376,7 @@ fn stores_charged_uses_whole_blocks_and_owed_drains_settled_blocks() {
     let charges = seismic::Charges::tally(&device);
     let pool = seismic::Pool::open(&entries.charges(&device, seismic::Contract::Shared), seismic::Contract::Shared, granule, block_bytes).unwrap();
     let store = seismic::SlabTensor::in_pool(&charges, &pool, 1, 8, &regions).unwrap();
-    let stores = Arc::new(Stores::new(pool.clone(), block, vec![(store, 0, vec![64])]));
+    let stores = Arc::new(Stores::new(vec![(pool.clone(), block)], vec![0], vec![(store, 0, vec![64])]));
     let claim = ledger
         .change(|keeping| ledger.backing(&keeping.claims(), crate::memory::ledger::PoolClass::Records, 8 * granule))
         .expect("8 slabs fit");
@@ -423,7 +439,7 @@ fn fragmented_multiblock_reclaim_vacates_one_block_without_collateral_wipeout() 
     let charges = seismic::Charges::tally(&device);
     let pool = seismic::Pool::open(&entries.charges(&device, seismic::Contract::Shared), seismic::Contract::Shared, granule, block_bytes).unwrap();
     let store = seismic::SlabTensor::in_pool(&charges, &pool, 1, TOTAL_SLOTS, &regions).unwrap();
-    let stores = Arc::new(Stores::new(pool.clone(), block, vec![(store, 0, vec![64])]));
+    let stores = Arc::new(Stores::new(vec![(pool.clone(), block)], vec![0], vec![(store, 0, vec![64])]));
     let claim = ledger
         .change(|keeping| ledger.backing(&keeping.claims(), crate::memory::ledger::PoolClass::Records, TOTAL_SLOTS * granule))
         .expect("200 slabs fit");

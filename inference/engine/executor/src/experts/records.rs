@@ -88,6 +88,13 @@ pub(super) enum Record {
     /// `evictable()`, `seed()`, `promote()`, `fill()`, and `shrink()` cannot
     /// name it by construction.
     StageIdle,
+    /// Taken by an on-demand decode DMA landing (`DecodeFront -> DMA -> DecodeBack`)
+    /// from the unified group pool (`Record::Free -> DemandLanding`).
+    /// While in flight or pinned by joined consumers, excluded from `free()`,
+    /// `evictable()`, `seed()`, `promote()`, `fill()`, and `shrink()` by
+    /// construction. On completion, transitions O(1) to `Record::Held(staged)`
+    /// (zero-recopy promotion) or back to `Record::Free`.
+    DemandLanding(Option<Staged>),
     /// Taken by an opportunistic DMA staging copy of `staged` for `target_step`
     /// in parity half `parity` (`0` = even steps, `1` = odd steps). `tier` and
     /// `batch` are `Some` while the DMA batch is in flight and `None` once
@@ -211,6 +218,10 @@ pub(super) struct BankRecords {
     releasing: Vec<(usize, usize)>,
     filling: Vec<(usize, usize)>,
     staging: Vec<(usize, usize)>,
+    /// Unpromoted `Record::DemandLanding` slots waiting for joined consumers
+    /// in `ExpertTransport` to drop their `ConsumerLease` before returning to
+    /// `Record::Free`.
+    draining_demand: Vec<(usize, usize)>,
     pending: Vec<(usize, usize)>,
     /// Whether a record was freed, or one a promotion could use was taken,
     /// since the promotions last asked ([`Self::take_changed`]).
@@ -226,6 +237,12 @@ pub(super) struct BankRecords {
     /// `LinkMover` stages Host-RAM misses even when `lent == 0` or on
     /// non-lender groups. Empty (`0..0`) on unified memory or whole banks.
     stage_rings: Vec<std::ops::Range<usize>>,
+    /// Whether a prompt group's scratch lease is currently active on `0..lent`.
+    /// While `false` (decode), `0..lent` are usable for permanent decode
+    /// residency and counted in [`Self::capacity`]; while `true` (prefill),
+    /// `0..lent` are excluded from [`Self::usable`] and [`Self::capacity`] and
+    /// held exclusively for the prompt group's scratch until [`Self::unlend`].
+    leasing: bool,
     /// Bumped as any expert comes to be held or leaves: what each layer
     /// holds changed since a reader last saw it ([`Self::holdings`]).
     holdings: u64,
@@ -246,20 +263,17 @@ impl BankRecords {
                 assert_eq!(maps.len(), layers.len(), "each layer has its map");
                 assert_eq!(stage_slots.len(), records.len(), "each group has its staging ring count");
                 assert!(lent <= records[lender], "a group lends {lent} of its {} records", records[lender]);
-                let rings = records
-                    .iter()
-                    .enumerate()
-                    .map(|(group, &count)| {
-                        let start = if group == lender { lent } else { 0 };
-                        let slots = stage_slots[group];
-                        assert!(slots % 2 == 0, "group {group} staging ring count {slots} must be even");
-                        assert!(
-                            start + slots <= count,
-                            "group {group} lent ({start}) + staging ({slots}) exceeds its {count} records"
-                        );
-                        start..start + slots
-                    })
-                    .collect();
+                let mut rings = Vec::with_capacity(records.len());
+                for (group, &count) in records.iter().enumerate() {
+                    let start = if group == lender { lent } else { 0 };
+                    let slots = stage_slots[group];
+                    assert!(slots % 2 == 0, "group {group} staging ring count {slots} must be even");
+                    assert!(
+                        start + slots <= count,
+                        "group {group} lent ({start}) + staging ({slots}) exceeds its {count} records"
+                    );
+                    rings.push(start..start + slots);
+                }
                 (Some((maps, (lender, lent))), rings)
             }
             None => (None, vec![0..0; records.len()]),
@@ -278,10 +292,12 @@ impl BankRecords {
             releasing: Vec::new(),
             filling: Vec::new(),
             staging: Vec::new(),
+            draining_demand: Vec::new(),
             pending: Vec::new(),
             changed: false,
             tier,
             stage_rings,
+            leasing: false,
             holdings: 0,
         }
     }
@@ -328,6 +344,11 @@ impl BankRecords {
     /// The record holding `layer`'s `expert`.
     pub fn held(&self, layer: usize, expert: usize) -> Option<usize> {
         self.layers[layer].1[expert]
+    }
+
+    /// Number of experts currently held in `layer`.
+    pub fn held_count(&self, layer: usize) -> usize {
+        self.layers[layer].1.iter().filter(|slot| slot.is_some()).count()
     }
 
     /// Whether a promotion or a seed takes a record for `staged`.
@@ -436,24 +457,134 @@ impl BankRecords {
     }
 
     /// Whether a promotion or a release may take record `record` of group
-    /// `group`: any but a lent scratch record or a dedicated staging-ring slot.
+    /// `group`: any non-staging, non-DMA record, excluding `0..lent` while a
+    /// prompt group's lease is active.
     pub fn usable(&self, group: usize, record: usize) -> bool {
-        !self.lends(group, record) && !self.is_stage_slot(group, record)
+        self.usable_when(group, record, false)
+    }
+
+    /// [`Self::usable`], also excluding `0..lent` when `lending` is true
+    /// (a prompt group has begun under `Steps`'s lock even before `lease()`).
+    pub fn usable_when(&self, group: usize, record: usize, lending: bool) -> bool {
+        (!(self.leasing || lending) || !self.lends(group, record))
+            && !self.is_stage_slot(group, record)
     }
 
     /// Group `group`'s records a promotion may take now or once released:
-    /// those free or releasing, but a lent one.
+    /// those free or releasing that are usable now.
     pub fn covering(&self, group: usize) -> usize {
-        let free = self.free(group).filter(|&record| self.usable(group, record)).count();
-        let releasing = self.releasing.iter().filter(|&&(of, record)| of == group && self.usable(group, record)).count();
+        self.covering_when(group, false)
+    }
+
+    /// [`Self::covering`] under `lending` (excluding `0..lent` when a prompt
+    /// group has begun or holds its lease).
+    pub fn covering_when(&self, group: usize, lending: bool) -> usize {
+        let free = self.free(group).filter(|&record| self.usable_when(group, record, lending)).count();
+        let releasing = self.releasing.iter().filter(|&&(of, record)| of == group && self.usable_when(group, record, lending)).count();
         free + releasing
     }
 
     /// Decode's capacity in group `group`: the records the bank holds
-    /// storage for, less the lent ones (the scratch's) and the dedicated
-    /// DMA staging ring.
+    /// storage for, less the dedicated DMA staging ring and (only while a
+    /// prompt group holds its lease) the lent scratch records. During decode
+    /// (`!self.leasing`), `0..lent` are reclaimed for permanent decode
+    /// residency and demand-landing slots share the unified pool.
     pub fn capacity(&self, group: usize) -> usize {
-        self.groups[group].present - self.seeded_from(group) - self.stage_rings[group].len()
+        let lent = if self.leasing { self.seeded_from(group) } else { 0 };
+        self.groups[group].present
+            - lent
+            - self.stage_rings[group].len()
+    }
+
+    /// Whether `staged` is currently being placed by a promotion or seed.
+    pub fn placing_contains(&self, staged: Staged) -> bool {
+        self.placing.contains(&staged)
+    }
+
+    /// Claim a `Record::Free` usable slot in `group` for an on-demand decode
+    /// DMA landing (`Record::Free -> Record::DemandLanding(staged)`), filtered
+    /// by `can_reuse` (no active consumer leases or fault quarantine).
+    pub fn claim_demand_landing(
+        &mut self,
+        group: usize,
+        staged: Option<Staged>,
+        lending: bool,
+        mut can_reuse: impl FnMut(usize) -> bool,
+    ) -> Option<usize> {
+        let record = self
+            .free(group)
+            .find(|&record| self.usable_when(group, record, lending) && can_reuse(record))?;
+        self.set(group, record, Record::DemandLanding(staged));
+        Some(record)
+    }
+
+    /// O(1) zero-recopy promotion of a completed `Record::DemandLanding` slot
+    /// directly to `Record::Held(staged)` and mapped via `StampedMap::map_covering`
+    /// from `from(staged.0)`. Returns `false` (and leaves the slot for release)
+    /// if `staged` is already held or being placed elsewhere.
+    pub fn promote_demand_landing(
+        &mut self,
+        group: usize,
+        record: usize,
+        staged: Staged,
+        from: impl Fn(usize) -> super::watcher::MapFrom,
+    ) -> bool {
+        assert!(
+            matches!(self.groups[group].contents[record], Record::DemandLanding(_)),
+            "record {record} of group {group} is not a DemandLanding ({:?})",
+            self.groups[group].contents[record]
+        );
+        assert_eq!(self.layers[staged.0].0, group, "demand landing layer {} belongs to group {}, not {group}", staged.0, self.layers[staged.0].0);
+        if self.layers[staged.0].1[staged.1].is_some() || self.placing.contains(&staged) {
+            return false;
+        }
+        self.hold(staged, record);
+        self.map(staged, record, from(staged.0).into());
+        true
+    }
+
+    /// Return a `Record::DemandLanding` slot directly to `Record::Free` once
+    /// no consumer pins it.
+    pub fn release_demand_landing(&mut self, group: usize, record: usize) {
+        assert!(
+            matches!(self.groups[group].contents[record], Record::DemandLanding(_)),
+            "record {record} of group {group} is not a DemandLanding ({:?})",
+            self.groups[group].contents[record]
+        );
+        self.draining_demand.retain(|&taken| taken != (group, record));
+        self.set(group, record, Record::Free);
+    }
+
+    /// Record an unpromoted `Record::DemandLanding` slot whose joined consumers
+    /// still pin it so [`Self::drain_demand_landings`] returns it to `Record::Free`
+    /// the instant the last consumer releases its lease.
+    pub fn defer_demand_release(&mut self, group: usize, record: usize) {
+        assert!(
+            matches!(self.groups[group].contents[record], Record::DemandLanding(_)),
+            "record {record} of group {group} is not a DemandLanding ({:?})",
+            self.groups[group].contents[record]
+        );
+        if !self.draining_demand.contains(&(group, record)) {
+            self.draining_demand.push((group, record));
+        }
+    }
+
+    /// Drain deferred unpromoted `Record::DemandLanding` slots once `can_reuse`
+    /// confirms no consumer lease or quarantine pins them.
+    pub fn drain_demand_landings(&mut self, mut can_reuse: impl FnMut(usize, usize) -> bool) -> bool {
+        if self.draining_demand.is_empty() {
+            return false;
+        }
+        let (drained, kept): (Vec<_>, Vec<_>) = std::mem::take(&mut self.draining_demand)
+            .into_iter()
+            .partition(|&(group, record)| can_reuse(group, record));
+        self.draining_demand = kept;
+        for &(group, record) in &drained {
+            if matches!(self.groups[group].contents[record], Record::DemandLanding(_)) {
+                self.set(group, record, Record::Free);
+            }
+        }
+        !drained.is_empty()
     }
 
     /// `staged` held in `record` of its group from now.
@@ -764,11 +895,23 @@ impl BankRecords {
     /// Never frees a slot whose DMA batch is still in flight (`batch.is_some()`),
     /// nor a slot staged for a future step that has not yet begun.
     pub fn drain_staging(&mut self, progress: Point, steps: &super::watcher::Steps) -> bool {
+        self.drain_staging_with(progress, steps, |_, _| true)
+    }
+
+    /// [`Self::drain_staging`], additionally gating each candidate slot on
+    /// `can_release(group, slot)` so slots still pinned by a joined demand
+    /// consumer (or quarantined) in `ExpertTransport` are never recycled early.
+    pub fn drain_staging_with(
+        &mut self,
+        progress: Point,
+        steps: &super::watcher::Steps,
+        mut can_release: impl FnMut(usize, usize) -> bool,
+    ) -> bool {
         let (drained, kept) = std::mem::take(&mut self.staging).into_iter().partition::<Vec<_>, _>(|&(group, record)| {
             let Record::Staging { staged: (layer, _), target_step, batch, .. } = self.groups[group].contents[record] else {
                 panic!("record {record} of group {group} is listed staging");
             };
-            batch.is_none() && steps.step_served(target_step, layer, progress)
+            batch.is_none() && steps.step_served(target_step, layer, progress) && can_release(group, record)
         });
         self.staging = kept;
         for &(group, record) in &drained {
@@ -967,17 +1110,31 @@ impl BankRecords {
             .collect()
     }
 
+    /// Any `Moving::Queued` promotions currently targeting `0..lent`, each
+    /// `(group, BankRecord)`, so `Directory::lease_records` can cancel and
+    /// resettle them before granting the prompt group's lease.
+    pub fn lent_queued(&self) -> Vec<(usize, BankRecord)> {
+        let Some((group, records)) = self.lent() else {
+            return Vec::new();
+        };
+        (0..records)
+            .filter_map(|record| match self.groups[group].contents[record] {
+                Record::Promoting(_, Moving::Queued) => Some((group, bank_record(record))),
+                _ => None,
+            })
+            .collect()
+    }
+
     /// Grant scratch group `scratch_group` its lease of the lent records as
-    /// the conveyor serves it, before it takes any hit: each a free one at
-    /// once; each holding an expert (a home of a bank imported whole) as
-    /// that expert leaves the bank by its exit in `exits`
-    /// ([`Self::lent_held`]), unmapped from the group's first step on (the
-    /// steps before it, which may read it, run before the group writes
-    /// it): at once where its exit writes nothing back, else released
-    /// ([`Self::release_from`]) and granted by a later call once its
-    /// write-back has ended and it drained. Nothing else is ever in one: no
-    /// promotion, release or seed takes a lent record. The experts that
-    /// left the bank.
+    /// the conveyor serves it, before it takes any hit: sets `leasing = true`
+    /// so no further promotion targets `0..lent`; grants each free record at
+    /// once; cancels any queued (unposted) promotion; evicts each held expert
+    /// by its exit in `exits` ([`Self::lent_held`]), unmapped from the group's
+    /// first step on (at once where its exit writes nothing back, else
+    /// released via [`Self::release_from`] and granted on a later call once
+    /// drained); and waits for any already-in-flight `Moving::Copying`
+    /// promotion to complete before granting it on a later call. Returns the
+    /// experts that left the bank.
     pub fn lease(&mut self, scratch_group: ScratchGroup, exits: Vec<Exit>) -> Vec<Staged> {
         let mut left = Vec::new();
         let mut exits = exits.into_iter().map(|exit| (exit.staged(), exit)).collect::<std::collections::HashMap<_, _>>();
@@ -985,6 +1142,7 @@ impl BankRecords {
             assert!(exits.is_empty(), "exits from lent records where none is lent");
             return left;
         };
+        self.leasing = true;
         for record in 0..records {
             match self.groups[group].contents[record] {
                 Record::Free => {}
@@ -996,9 +1154,20 @@ impl BankRecords {
                     }
                     left.extend(self.vacate(group, record, scratch_group.into(), Some(exit)));
                 }
-                // Granted already, its write-back still reads it, or an
-                // opportunistic staging slot is draining past the frontier.
-                Record::Lent { .. } | Record::Releasing { .. } | Record::Staging { .. } => continue,
+                Record::Promoting(staged, Moving::Queued) => {
+                    assert!(self.placing.remove(&staged), "queued promotion of {staged:?} was not placing");
+                    self.promoting.retain(|&taken| taken != (group, record));
+                }
+                // Granted already, its write-back still reads it, an
+                // already-issued promotion copy is completing, an
+                // opportunistic staging/demand-landing slot is draining, or a
+                // newly grown slab's device repoint is pending past the frontier.
+                Record::Lent { .. }
+                | Record::Releasing { .. }
+                | Record::Promoting(_, Moving::Copying { .. })
+                | Record::Staging { .. }
+                | Record::DemandLanding(_)
+                | Record::Pending { .. } => continue,
                 other => panic!("lent record {record} leased from {other:?}"),
             }
             self.set(group, record, Record::Lent { from: scratch_group.first() });
@@ -1014,8 +1183,9 @@ impl BankRecords {
     }
 
     /// The prompt group the records were leased to is past: every one is
-    /// free.
+    /// free and returned to permanent decode residency.
     pub fn unlend(&mut self) {
+        self.leasing = false;
         let Some((group, records)) = self.lent() else {
             return;
         };
@@ -1207,38 +1377,83 @@ mod tests {
         assert_eq!((view.resolve(5, 0), view.resolve(5, 4), view.resolve(5, 6)), (None, Some(3), Some(3)));
     }
 
-    /// No promotion and no release takes a lent record: those are the
-    /// scratch's, so no copy into one runs as a lease takes them.
+    /// While a prompt group's lease is active (`leasing == true`), no
+    /// promotion and no release may take a lent record.
     #[test]
     #[should_panic(expected = "a promotion into lent record 1")]
-    fn a_promotion_into_a_lent_record_panics() {
+    fn a_promotion_into_a_lent_record_panics_while_leased() {
         let (mut bank, _) = bank();
+        bank.lease(ScratchGroup::at(3, 2), Vec::new());
         bank.promote(&promotion(1, 6));
     }
 
     #[test]
     #[should_panic(expected = "a release of lent record 1")]
-    fn a_release_of_a_lent_record_panics() {
+    fn a_release_of_a_lent_record_panics_while_leased() {
         let (mut bank, _) = bank();
-        bank.hold((0, 5), 1);
+        bank.lease(ScratchGroup::at(3, 2), Vec::new());
         bank.release(0, BankRecord(1), UnmapStep::at(7), Exit::to_file((0, 5)));
     }
 
-    /// The lease takes every lent record at once, a home one held (a bank
-    /// imported whole) unmapped for every step of the group, so no step of
-    /// it resolves a hit in a lent record; a second grant takes nothing,
-    /// and the return frees them. Neither covers a want, nor counts in
-    /// decode's capacity.
+    /// During decode (`!leasing`), `0..lent` are reclaimed for permanent
+    /// decode residency (promotions, releases, and `capacity()`). When a
+    /// prompt group calls `lease()`, `capacity()` shrinks by `lent`, held
+    /// experts in `0..lent` are evicted, queued promotions are cancelled,
+    /// in-flight `Moving::Copying` promotions finish before `leased()` becomes
+    /// true, and `unlend()` restores full decode capacity.
+    #[test]
+    fn decode_reclaims_lent_records_and_lease_evicts_held_and_in_flight_promotions() {
+        let (mut bank, view) = bank();
+        assert_eq!((bank.covering(0), bank.capacity(0)), (4, 4), "during decode 0..lent are usable");
+        // Promote into lent record 0 and complete it; release it and re-promote.
+        promoted(&mut bank, 0, 4, 1);
+        assert_eq!((bank.held(0, 4), view.resolve(4, 1)), (Some(0), Some(0)));
+        assert_eq!(bank.release(0, BankRecord(0), UnmapStep::at(2), Exit::to_file((0, 4))), (0, 4));
+        let steps = super::super::watcher::Steps::new(crate::planning::FlightDepth::SERIAL, 4, crate::experts::exchange::Pulse::new());
+        steps.begin_through(5);
+        assert!(bank.drain(Point::whole(2, 0, 2), &steps));
+
+        // Put a Queued promotion in lent record 0 and an in-flight Copying promotion in lent record 1.
+        bank.promote(&promotion(0, 5));
+        bank.promote(&promotion(1, 6));
+        bank.copy(0, BankRecord(1), HostRecord(9), 77);
+        assert_eq!(bank.lent_queued(), vec![(0, BankRecord(0))]);
+
+        // Lease cancels Queued record 0 immediately, waits for Copying record 1.
+        assert!(bank.lease(ScratchGroup::at(3, 2), Vec::new()).is_empty());
+        assert!(!bank.leased(), "in-flight copy on record 1 holds back the lease");
+        assert_eq!(bank.capacity(0), 2, "capacity drops by lent while leased");
+        assert!(!bank.usable(0, 0) && !bank.usable(0, 1));
+
+        // Once the in-flight copy completes, a follow-up lease evicts record 1 and completes the lease.
+        bank.promoted(vec![(0, BankRecord(1))], |_| MapFrom::at(2));
+        assert_eq!(bank.lent_held(), vec![(0, 1, (0, 6))]);
+        assert_eq!(bank.lease(ScratchGroup::at(3, 2), vec![Exit::to_file((0, 6))]), vec![(0, 6)]);
+        assert!(bank.leased());
+        assert_eq!(bank.resolve(0, 6, 3), None);
+
+        // Returning the lease restores 0..lent to full decode capacity.
+        bank.unlend();
+        assert!(!bank.leased());
+        assert_eq!(bank.capacity(0), 4);
+        assert!(bank.usable(0, 0) && bank.usable(0, 1));
+    }
+
+    /// The lease takes every lent record at once, a home one held unmapped for
+    /// every step of the group, so no step of it resolves a hit in a lent
+    /// record; a second grant takes nothing, and the return frees them back to
+    /// permanent decode capacity.
     #[test]
     fn a_lease_is_whole_at_once_and_leaves_no_hit_in_a_lent_record() {
         let (mut bank, view) = bank();
         bank.hold((0, 4), 1);
         bank.map((0, 4), 1, MapStep::EVERY);
         promoted(&mut bank, 2, 5, 1);
-        assert_eq!((bank.covering(0), bank.capacity(0)), (1, 2), "the lent records cover no want, and hold no decode expert");
+        assert_eq!((bank.covering(0), bank.capacity(0)), (2, 4), "during decode, lent records count in capacity and cover wants");
         assert_eq!(bank.lent_held(), [(0, 1, (0, 4))]);
         assert_eq!(bank.lease(ScratchGroup::at(3, 2), vec![Exit::to_file((0, 4))]), [(0, 4)]);
         assert!(bank.leased(), "it took every lent record at once");
+        assert_eq!((bank.covering(0), bank.capacity(0)), (1, 2), "while leased, lent records leave decode capacity");
         assert!(bank.lease(ScratchGroup::at(3, 2), Vec::new()).is_empty(), "and a second grant takes nothing");
         assert_eq!((view.resolve(4, 2), view.resolve(4, 3)), (Some(1), None));
         assert_eq!(bank.resolve(0, 4, 3), None);
@@ -1246,7 +1461,7 @@ mod tests {
         bank.unlend();
         assert!(!bank.leased());
         assert_eq!(bank.free(0).collect::<Vec<_>>(), [0, 1, 3]);
-        assert_eq!(bank.covering(0), 1);
+        assert_eq!((bank.covering(0), bank.capacity(0)), (3, 4));
     }
 
     /// A lent record whose expert's exit writes it back is released into

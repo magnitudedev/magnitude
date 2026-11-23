@@ -23,6 +23,7 @@
 //! [`Copies::completed`] reads only what the two threads learned.
 
 use super::events::Events;
+use super::transport::{ExpertTransport, TransferId};
 use seismic::{Tensor, Transfer, TransferItem, TransferRun};
 use std::collections::{BTreeMap, VecDeque};
 use std::sync::{Arc, Mutex};
@@ -33,6 +34,15 @@ use std::time::Duration;
 /// whether the load stopped: a bound, not a latency, as the batch's
 /// completion ends the wait.
 const BOUND: Duration = Duration::from_millis(50);
+
+/// Maximum number of batches submitted concurrently to `Copies`'s hardware
+/// transfer stream (double-buffered: 1 actively transferring + 1 queued right
+/// behind it so the copy engine never bubbles). Keeping remaining batches in
+/// `State::waiting` preserves strict `TransferPriority` preemption, `reprice`,
+/// and `cancel`, prevents background promotions from flooding the H2D copy
+/// engine against on-demand `DecodeDma`, and strictly bounds head-of-line
+/// wait when `ExpertTransport::land_decode_misses` joins an in-flight hint.
+const MAX_RUNNING: usize = 2;
 
 /// One run of a batch (`seismic::TransferRun`): `bytes` from `source` at
 /// `source_offset` to `destination` at `destination_offset`, held by the
@@ -65,18 +75,18 @@ pub(in crate::experts) enum BatchItem {
 }
 
 /// Dispatch priority for queued DMA batches on [`Copies`]:
-/// `WriteBack > Stage { step, layer, p } > Promote`.
+/// `WriteBack > Promote > Stage { step, layer, p }`.
 ///
 /// Write-backs free bank records that promotions and prompt leases wait for.
-/// Opportunistic staging copies carry hard per-step/per-layer deadlines
-/// (soonest step first, then earliest layer to race ahead of layer-by-layer
-/// compute, then highest probability). Permanent promotions are background
-/// work with no step deadline.
+/// Permanent promotions earn hits across every future token and take priority
+/// over 1-step opportunistic staging hints (`Stage`), which carry per-step/
+/// per-layer deadlines (soonest step first, then earliest layer, then highest
+/// probability).
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub(in crate::experts) enum TransferPriority {
     WriteBack,
-    Stage { step: u64, layer: usize, p: f64 },
     Promote,
+    Stage { step: u64, layer: usize, p: f64 },
 }
 
 impl TransferPriority {
@@ -84,8 +94,8 @@ impl TransferPriority {
     fn cmp_dispatch(&self, other: &Self) -> std::cmp::Ordering {
         let rank = |prio: &Self| match prio {
             Self::WriteBack => 0u8,
-            Self::Stage { .. } => 1,
-            Self::Promote => 2,
+            Self::Promote => 1,
+            Self::Stage { .. } => 2,
         };
         rank(self).cmp(&rank(other)).then_with(|| match (*self, *other) {
             (
@@ -101,6 +111,7 @@ struct QueuedBatch {
     ticket: u64,
     priority: TransferPriority,
     items: Vec<BatchItem>,
+    stage_transfer: Option<TransferId>,
 }
 
 /// The device's transfer queue, shared by every holder of it: the batches
@@ -114,6 +125,7 @@ pub(in crate::experts) struct Copies {
 struct Inner {
     transfer: Transfer,
     events: Arc<Events>,
+    transport: Option<Arc<ExpertTransport>>,
     state: Mutex<State>,
 }
 
@@ -132,13 +144,15 @@ struct State {
     /// Every ticket issued so far (for diagnostics).
     issued: u64,
     /// The batches issued and not yet complete: each ticket, the value its
-    /// batch completes at, and its items, held until then, in issue order
-    /// (which is completion order on the single transfer stream).
-    running: VecDeque<(u64, u64, Vec<BatchItem>)>,
+    /// batch completes at, its items (held until then), and any tracked
+    /// `ExpertTransport` transfer id, in issue order (completion order on the
+    /// single transfer stream).
+    running: VecDeque<(u64, u64, Vec<BatchItem>, Option<TransferId>)>,
     /// The batches the queue refused as issued, and why.
     refused: BTreeMap<u64, String>,
-    /// Cancelled unbegun batches whose tensors are deferred for drop on the
-    /// issuer thread (outside `residency` and `NoBlockingAllocationGuard`).
+    /// Cancelled batches' items deferred to drop on the issuer thread (outside
+    /// `residency` and `NoBlockingAllocationGuard`, since dropping a final
+    /// `SlabHold`/`Allocation` may touch pool or driver locks).
     cancelled: Vec<Vec<BatchItem>>,
     /// Why the queue faulted, once it has: no batch completes from then.
     fault: Option<String>,
@@ -174,16 +188,14 @@ impl State {
 
     /// Cancel an unbegun waiting batch; returns `true` only if it was still in
     /// `waiting` and removed before `issue` popped it. Never cancels an
-    /// issuing or running DMA batch. Deferred items drop on the issuer thread
-    /// so cancellation under `residency` / `NoBlockingAllocationGuard` never
-    /// drops slab views or device fences in place.
-    fn cancel(&mut self, ticket: u64) -> bool {
-        let Some(pos) = self.waiting.iter().position(|entry| entry.ticket == ticket) else {
-            return false;
-        };
+    /// issuing or running DMA batch. Defers dropping its items to the issuer
+    /// thread so calling `cancel` inside `residency` / `NoBlockingAllocationGuard`
+    /// can never drop a final `SlabHold`/`Allocation` under the lock.
+    fn cancel(&mut self, ticket: u64) -> Option<Option<TransferId>> {
+        let pos = self.waiting.iter().position(|entry| entry.ticket == ticket)?;
         let removed = self.waiting.swap_remove(pos);
         self.cancelled.push(removed.items);
-        true
+        Some(removed.stage_transfer)
     }
 
     /// Whether `ticket` is still unbegun in `waiting`.
@@ -195,13 +207,18 @@ impl State {
     fn is_in_flight(&self, ticket: u64) -> bool {
         self.is_waiting(ticket)
             || self.issuing.is_some_and(|(t, _)| t == ticket)
-            || self.running.iter().any(|&(t, _, _)| t == ticket)
+            || self.running.iter().any(|&(t, _, _, _)| t == ticket)
     }
 }
 
 impl Copies {
+    #[cfg(test)]
     pub fn new(transfer: Transfer, events: Arc<Events>) -> Self {
-        Self { inner: Arc::new(Inner { transfer, events, state: Mutex::default() }) }
+        Self { inner: Arc::new(Inner { transfer, events, transport: None, state: Mutex::default() }) }
+    }
+
+    pub fn with_transport(transfer: Transfer, events: Arc<Events>, transport: Arc<ExpertTransport>) -> Self {
+        Self { inner: Arc::new(Inner { transfer, events, transport: Some(transport), state: Mutex::default() }) }
     }
 
     fn state(&self) -> std::sync::MutexGuard<'_, State> {
@@ -211,12 +228,12 @@ impl Copies {
     /// Post `items` as a batch at `priority`: its ticket. The queue's issuer
     /// issues batches in [`TransferPriority`] order ([`Self::start`]); nothing
     /// that posts waits for the device's queue.
-    fn post(&self, priority: TransferPriority, items: Vec<BatchItem>) -> u64 {
+    fn post(&self, priority: TransferPriority, items: Vec<BatchItem>, stage_transfer: Option<TransferId>) -> u64 {
         let ticket = {
             let mut state = self.state();
             state.posted += 1;
             let ticket = state.posted;
-            state.waiting.push(QueuedBatch { ticket, priority, items });
+            state.waiting.push(QueuedBatch { ticket, priority, items, stage_transfer });
             ticket
         };
         self.inner.events.notify();
@@ -246,6 +263,21 @@ impl Copies {
         priority: TransferPriority,
         form: impl FnOnce() -> (Vec<BatchItem>, T),
     ) -> Result<Option<(T, u64)>, String> {
+        self.post_tracked_within(depth, priority, || {
+            let (items, formed) = form();
+            (items, formed, None)
+        })
+    }
+
+    /// Post a mixed run/signal batch optionally tracked by `ExpertTransport`
+    /// (`TransferId`), so `Copies::issue` records its `TransferSync` event and
+    /// `Copies::watch` marks it landed.
+    pub fn post_tracked_within<T>(
+        &self,
+        depth: usize,
+        priority: TransferPriority,
+        form: impl FnOnce() -> (Vec<BatchItem>, T, Option<TransferId>),
+    ) -> Result<Option<(T, u64)>, String> {
         assert!(depth > 0, "a transfer queue keeps a batch in flight");
         {
             let state = self.state();
@@ -256,8 +288,8 @@ impl Copies {
                 return Ok(None);
             }
         }
-        let (items, formed) = form();
-        Ok(Some((formed, self.post(priority, items))))
+        let (items, formed, stage_transfer) = form();
+        Ok(Some((formed, self.post(priority, items, stage_transfer))))
     }
 
     /// Reprice an unbegun queued batch; returns `true` if the batch was still
@@ -270,10 +302,15 @@ impl Copies {
     /// not yet been popped by the issuer. Never cancels an in-flight DMA.
     pub fn cancel(&self, ticket: u64) -> bool {
         let cancelled = self.state().cancel(ticket);
-        if cancelled {
+        if let Some(stage_transfer) = cancelled {
+            if let (Some(transport), Some(id)) = (&self.inner.transport, stage_transfer) {
+                transport.cancel_unbegun_hint(id);
+            }
             self.inner.events.notify();
+            true
+        } else {
+            false
         }
-        cancelled
     }
 
     /// Whether `ticket` has already begun issuing (not waiting in the queue).
@@ -325,7 +362,7 @@ impl Copies {
             state.waiting.len(),
             state.issuing.map(|(ticket, since)| (ticket, since.elapsed())),
             state.issued,
-            state.running.iter().map(|&(ticket, value, _)| (ticket, value)).collect::<Vec<_>>(),
+            state.running.iter().map(|&(ticket, value, _, _)| (ticket, value)).collect::<Vec<_>>(),
             state.refused,
             state.fault,
         )
@@ -371,15 +408,19 @@ impl Copies {
             if stopped() {
                 return;
             }
-            let (cancelled, next) = {
+            let (next, cancelled) = {
                 let mut state = self.state();
                 let cancelled = std::mem::take(&mut state.cancelled);
-                let next = state.pop_next();
+                let next = if state.running.len() < MAX_RUNNING {
+                    state.pop_next()
+                } else {
+                    None
+                };
                 state.issuing = next.as_ref().map(|entry| (entry.ticket, std::time::Instant::now()));
-                (cancelled, next)
+                (next, cancelled)
             };
             drop(cancelled);
-            let Some(QueuedBatch { ticket, items: batch, .. }) = next else {
+            let Some(QueuedBatch { ticket, items: batch, stage_transfer, .. }) = next else {
                 events.wait(seen);
                 continue;
             };
@@ -400,15 +441,33 @@ impl Copies {
                     },
                 })
                 .collect::<Vec<_>>();
-            let issued = self.inner.transfer.copy(&items);
+            let issued = if stage_transfer.is_some() {
+                self.inner.transfer.copy_synced(&items).map(|(value, sync)| (value, Some(sync)))
+            } else {
+                self.inner.transfer.copy(&items).map(|value| (value, None))
+            };
             drop(items);
-            {
-                let mut state = self.state();
-                state.issuing = None;
-                state.issued = ticket;
-                match issued {
-                    Ok(value) => state.running.push_back((ticket, value, batch)),
-                    Err(error) => drop(state.refused.insert(ticket, error.to_string())),
+            match issued {
+                Ok((value, sync)) => {
+                    if let (Some(transport), Some(id), Some(sync)) = (&self.inner.transport, stage_transfer, sync) {
+                        transport.attach_sync(id, sync);
+                        transport.drain_deferred_syncs();
+                    }
+                    let mut state = self.state();
+                    state.issuing = None;
+                    state.issued = ticket;
+                    state.running.push_back((ticket, value, batch, stage_transfer));
+                }
+                Err(error) => {
+                    let msg = error.to_string();
+                    if let (Some(transport), Some(id)) = (&self.inner.transport, stage_transfer) {
+                        transport.fault_transfer(id, msg.clone());
+                        transport.drain_deferred_syncs();
+                    }
+                    let mut state = self.state();
+                    state.issuing = None;
+                    state.issued = ticket;
+                    state.refused.insert(ticket, msg);
                 }
             }
             events.notify();
@@ -425,7 +484,7 @@ impl Copies {
             }
             let earliest = {
                 let state = self.state();
-                state.fault.is_none().then(|| state.running.front().map(|&(_, value, _)| value)).flatten()
+                state.fault.is_none().then(|| state.running.front().map(|&(_, value, _, _)| value)).flatten()
             };
             let Some(value) = earliest else {
                 events.wait(seen);
@@ -435,9 +494,30 @@ impl Copies {
                 Ok(false) => continue,
                 Ok(true) => {
                     let completed = self.state().running.pop_front();
-                    drop(completed);
+                    if let Some((_, _, items, stage_transfer)) = completed {
+                        drop(items);
+                        if let Some(id) = stage_transfer {
+                            if let Some(transport) = &self.inner.transport {
+                                transport.complete_dma(id);
+                                transport.drain_deferred_syncs();
+                            }
+                        }
+                    }
                 }
-                Err(error) => self.state().fault = Some(error.to_string()),
+                Err(error) => {
+                    let msg = error.to_string();
+                    let faulted_ids: Vec<TransferId> = {
+                        let mut state = self.state();
+                        state.fault = Some(msg.clone());
+                        state.running.iter().filter_map(|&(_, _, _, id)| id).collect()
+                    };
+                    if let Some(transport) = &self.inner.transport {
+                        for id in faulted_ids {
+                            transport.fault_transfer(id, msg.clone());
+                        }
+                        transport.drain_deferred_syncs();
+                    }
+                }
             }
             events.notify();
         }
@@ -451,11 +531,11 @@ mod tests {
     fn push(state: &mut State, priority: TransferPriority) -> u64 {
         state.posted += 1;
         let ticket = state.posted;
-        state.waiting.push(QueuedBatch { ticket, priority, items: Vec::new() });
+        state.waiting.push(QueuedBatch { ticket, priority, items: Vec::new(), stage_transfer: None });
         ticket
     }
 
-    /// Priority ordering (`WriteBack > Stage { step, layer, p } > Promote`),
+    /// Priority ordering (`WriteBack > Promote > Stage { step, layer, p }`),
     /// `reprice`, and `cancel` (only unbegun queued batches; never issuing/running).
     #[test]
     fn priority_preemption_reprice_and_cancel_never_cancels_in_flight() {
@@ -467,17 +547,20 @@ mod tests {
         let t_stage_l0 = push(&mut state, TransferPriority::Stage { step: 4, layer: 0, p: 0.3 });
         let t_wb = push(&mut state, TransferPriority::WriteBack);
 
-        // WriteBack preempts all Stage and Promote batches.
+        // WriteBack preempts Promote and all Stage batches.
         let first = state.pop_next().unwrap();
         assert_eq!(first.ticket, t_wb);
-        // Simulate `first` now issuing -> cancel must return false!
+        // Simulate `first` now issuing -> cancel must return None!
         state.issuing = Some((first.ticket, std::time::Instant::now()));
-        assert!(!state.cancel(t_wb), "cannot cancel a batch already being issued");
+        assert!(state.cancel(t_wb).is_none(), "cannot cancel a batch already being issued");
         assert!(state.is_in_flight(t_wb));
         state.issuing = None;
-        state.running.push_back((t_wb, 1, Vec::new()));
-        assert!(!state.cancel(t_wb), "cannot cancel a running DMA batch");
+        state.running.push_back((t_wb, 1, Vec::new(), None));
+        assert!(state.cancel(t_wb).is_none(), "cannot cancel a running DMA batch");
         assert!(state.is_in_flight(t_wb));
+
+        // Promote dispatches strictly ahead of all opportunistic Stage hints.
+        assert_eq!(state.pop_next().unwrap().ticket, t_promote);
 
         // Reprice `t_stage_late` to step 4, layer 0, p = 0.95 -> jumps ahead of `t_stage_l0`.
         assert!(state.reprice(t_stage_late, TransferPriority::Stage { step: 4, layer: 0, p: 0.95 }));
@@ -487,15 +570,14 @@ mod tests {
         // Cancel `t_stage_l1_low` while still unbegun -> succeeds, removes it
         // from flight, and defers its batch items to `cancelled` for drop on
         // the issuer thread rather than dropping under the caller's lock.
-        assert!(state.cancel(t_stage_l1_low));
+        assert!(state.cancel(t_stage_l1_low).is_some());
         assert!(!state.is_in_flight(t_stage_l1_low));
         assert_eq!(state.cancelled.len(), 1, "cancelled batch items are deferred for drop on the issuer thread");
-        assert!(!state.cancel(t_stage_l1_low), "second cancel returns false");
+        assert!(state.cancel(t_stage_l1_low).is_none(), "second cancel returns None");
         assert_eq!(state.cancelled.len(), 1);
 
-        // Remaining order: `t_stage_l1_high`, then `t_promote`.
+        // Remaining order: `t_stage_l1_high`.
         assert_eq!(state.pop_next().unwrap().ticket, t_stage_l1_high);
-        assert_eq!(state.pop_next().unwrap().ticket, t_promote);
         assert!(state.pop_next().is_none());
     }
 }

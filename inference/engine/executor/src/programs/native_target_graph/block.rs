@@ -693,7 +693,15 @@ impl<'a> BlockGraphInputs<'a> {
         // Both sides of a boundary run each decode step at one row, whole,
         // in either form of a streamed block (`RunStage::Resident`).
         let carries = match stage {
-            Stage::Run(run) if rows == CARRIED_ROWS && run.place() == RunStage::Whole => carries.sized(),
+            Stage::Run(RunStage::Whole | RunStage::Resident) if rows == CARRIED_ROWS => carries.sized(),
+            Stage::Run(RunStage::DecodeFront) if rows == CARRIED_ROWS => BlockCarries {
+                carry_in: carries.sized().carry_in,
+                carry_out: None,
+            },
+            Stage::Run(RunStage::DecodeBack) if rows == CARRIED_ROWS => BlockCarries {
+                carry_in: None,
+                carry_out: carries.sized().carry_out,
+            },
             _ => BlockCarries::default(),
         };
         Ok((
@@ -789,8 +797,10 @@ pub(super) fn stage_input(geometry: &Decoder, block_index: usize, stage: Stage) 
         _ => ResidualCarry::rows(geometry.hidden),
     };
     Ok(match stage {
-        Stage::Run(RunStage::Whole | RunStage::Resident | RunStage::Front) => Some(carry(block_index > 0)),
-        Stage::Run(RunStage::Combine) => Some(carry(true)),
+        Stage::Run(RunStage::Whole | RunStage::Resident | RunStage::Front | RunStage::DecodeFront) => {
+            Some(carry(block_index > 0))
+        }
+        Stage::Run(RunStage::Combine | RunStage::DecodeBack) => Some(carry(true)),
         Stage::Once(_) => None,
     })
 }
@@ -896,7 +906,8 @@ fn block_graph<'a, G: GraphDraft + 'a>(
     // A whole block whose routed layer streams, in either form, is marked
     // at its ends: a mark at a graph's edge adds no node and divides
     // nothing, and is stamped only on a sampled run (`seismic::NativeSpans`).
-    let begun = (stage.place() == RunStage::Whole && feed_forward.bank.banked()).then(|| graph.span_mark());
+    let begun = (matches!(stage, RunStage::Whole | RunStage::Resident) && feed_forward.bank.banked())
+        .then(|| graph.span_mark());
     // A front writes the taps before the feed-forward, a back the output's.
     let [entry, middle, output] = stage.taps();
     let mut taps = tap_entry
@@ -941,8 +952,8 @@ fn block_graph<'a, G: GraphDraft + 'a>(
     let mut operand_in = None;
     // A back reads the carry its front's mixer left.
     let (mixed, mut state_ports) = match stage {
-        RunStage::Combine => (hidden, BlockState::default()),
-        RunStage::Whole | RunStage::Resident | RunStage::Front => {
+        RunStage::Combine | RunStage::DecodeBack => (hidden, BlockState::default()),
+        RunStage::Whole | RunStage::Resident | RunStage::Front | RunStage::DecodeFront => {
             if let Some(taps) = taps.as_mut().filter(|taps| taps.positions.entry) {
                 taps.ports.entry = Some(if streams.is_some() && !shape.first {
                     taps.tap_streams(graph, &hidden.rows, constants)?
@@ -1013,8 +1024,9 @@ fn block_graph<'a, G: GraphDraft + 'a>(
     )?;
     let operand = operand.map(|(_, ports, _)| ports);
     let ports = StagePorts::Run(split.map(SplitBuild::into_ports));
-    // A front ends with its request: its output is the residual it mixed.
-    if stage == RunStage::Front {
+    // A front ends with its request (or route + land for DecodeFront): its
+    // output is the residual it mixed.
+    if matches!(stage, RunStage::Front | RunStage::DecodeFront) {
         return Ok(BlockGraphParts {
             residual: None,
             output,

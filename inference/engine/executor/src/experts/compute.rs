@@ -452,8 +452,19 @@ impl Compute {
         }
         let _rest = self.inner.rest.lock().expect("compute rest");
         self.inner.flights.fetch_add(1, Ordering::AcqRel);
-        self.inner.wake.notify_all();
+        // Only one noticing worker polls for incoming site requests; the
+        // remaining workers stay parked until `site.take()` actually claims
+        // work, avoiding burning all CPU cores when a flight issues zero
+        // CPU-site misses (e.g. M7 async DMA decode).
+        self.inner.wake.notify_one();
         Some(Flight { inner: self.inner.clone() })
+    }
+
+    /// Wake the parked noticing worker immediately when `DecodeFront` has
+    /// published at least one CPU-site choice (`SOURCE_SITE >= 0`), eliminating
+    /// the `NOTICER_PARK_INTERVAL` wakeup latency while `DecodeDma` is issued.
+    pub(crate) fn wake_noticer(&self) {
+        self.inner.wake.notify_one();
     }
 
     /// Run `job`'s pieces on the workers, then its end. A job submitted once
@@ -560,12 +571,20 @@ impl Compute {
 /// once the site's issuing closed (`HostCompute::drop`), so no request is
 /// issued after it found none but its own, which it serves first.
 fn work(inner: &Inner, worker: usize) {
+    const NOTICER_SPIN_LIMIT: u32 = 64;
+    const NOTICER_YIELD_LIMIT: u32 = 128;
+    const WORKER_SPIN_LIMIT: u32 = 32;
+    const NOTICER_PARK_INTERVAL: std::time::Duration = std::time::Duration::from_micros(100);
     let mut seen = 0;
+    let mut idle_spins: u32 = 0;
     loop {
         let stopping = inner.stop.load(Ordering::Acquire);
         let served = inner.site.serve(worker, &mut seen);
         match served {
-            WorkerTurn::Ran => continue,
+            WorkerTurn::Ran => {
+                idle_spins = 0;
+                continue;
+            }
             WorkerTurn::Idle if stopping => {
                 inner.site.release(worker);
                 return;
@@ -573,23 +592,68 @@ fn work(inner: &Inner, worker: usize) {
             WorkerTurn::Idle | WorkerTurn::Waiting => {}
         }
         let flying = inner.flights.load(Ordering::Acquire) > 0;
-        if flying && inner.site.notice(worker) && inner.site.take() {
+        let noticing = flying && inner.site.notice(worker);
+        if noticing && inner.site.take() {
+            idle_spins = 0;
+            // Wake parked sibling workers now that an actual CPU-site request
+            // has been taken (`inner.site.busy()` is true).
+            let _rest = inner.rest.lock().expect("compute rest");
+            inner.wake.notify_all();
             continue;
         }
         if served == WorkerTurn::Waiting {
+            idle_spins = 0;
             std::hint::spin_loop();
             continue;
         }
         if inner.queued.load(Ordering::Acquire) > 0 {
             inner.site.release(worker);
+            if noticing && flying {
+                let _rest = inner.rest.lock().expect("compute rest");
+                inner.wake.notify_one();
+            }
         }
         if piece(inner) {
+            idle_spins = 0;
             continue;
         }
         if flying {
-            std::hint::spin_loop();
+            idle_spins = idle_spins.saturating_add(1);
+            if noticing {
+                if idle_spins <= NOTICER_SPIN_LIMIT {
+                    std::hint::spin_loop();
+                    continue;
+                }
+                if idle_spins <= NOTICER_YIELD_LIMIT {
+                    std::thread::yield_now();
+                    continue;
+                }
+                let rest = inner.rest.lock().expect("compute rest");
+                if !inner.stop.load(Ordering::Acquire)
+                    && inner.queued.load(Ordering::Acquire) == 0
+                    && !inner.site.busy()
+                    && inner.flights.load(Ordering::Acquire) > 0
+                {
+                    let _ = inner.wake.wait_timeout(rest, NOTICER_PARK_INTERVAL).expect("compute rest");
+                }
+                continue;
+            }
+            if idle_spins <= WORKER_SPIN_LIMIT {
+                std::hint::spin_loop();
+                continue;
+            }
+            let rest = inner.rest.lock().expect("compute rest");
+            let idle = |_: &mut ()| {
+                !inner.stop.load(Ordering::Acquire)
+                    && inner.queued.load(Ordering::Acquire) == 0
+                    && !inner.site.busy()
+                    && (inner.flights.load(Ordering::Acquire) == 0 || inner.site.has_noticer())
+            };
+            drop(inner.wake.wait_while(rest, idle).expect("compute rest"));
+            idle_spins = 0;
             continue;
         }
+        idle_spins = 0;
         inner.site.release(worker);
         let rest = inner.rest.lock().expect("compute rest");
         let idle = |_: &mut ()| {

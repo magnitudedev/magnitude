@@ -47,6 +47,14 @@
 //!
 //! Word layouts and failure rules are `streaming_words.seismic`'s.
 
+/// Whether M7 on-demand async DMA decode landing (`DecodeFront -> DMA -> DecodeBack`)
+/// is enabled (default `true` on CUDA `Placer::Tier` partial banks; set
+/// `MAGNITUDE_DECODE_DMA=0` to measure Part A `LinkMover` lookahead alone).
+pub(crate) fn decode_dma_enabled(backend: seismic::BackendName) -> bool {
+    backend == seismic::BackendName::Cuda
+        && std::env::var_os("MAGNITUDE_DECODE_DMA").is_none_or(|v| v != "0")
+}
+
 mod bank;
 mod compute;
 mod conveyor;
@@ -65,6 +73,7 @@ mod reuse;
 mod site;
 mod source;
 mod staging;
+pub(crate) mod transport;
 mod watcher;
 mod yielding;
 

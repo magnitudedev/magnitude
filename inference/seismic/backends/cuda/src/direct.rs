@@ -1018,11 +1018,18 @@ impl DirectBatch {
     /// another of the device's streams, has completed (`cuStreamWaitEvent`
     /// on its end event): device work, waiting for no host.
     pub fn follow(&mut self, other: &DirectSubmission) -> Result<(), ExecutionError> {
+        self.follow_event(&other.end)
+    }
+
+    /// The batch's following work waits until `event`, recorded on another
+    /// stream of the same context (e.g. a `TransferQueue` copy stream), has
+    /// completed (`cuStreamWaitEvent`): device work, waiting for no host.
+    pub fn follow_event(&mut self, event: &Event) -> Result<(), ExecutionError> {
         let context = self.device.context();
         let _current = context.enter().map_err(submission)?;
-        // SAFETY: the stream and the event are this context's, and the end
-        // event was recorded when its submission committed.
-        let status = unsafe { context.enqueue().stream_wait_event(self.stream.raw(), other.end.raw()) };
+        // SAFETY: the stream and the event are this context's, and the event
+        // was recorded on its producing stream before this call.
+        let status = unsafe { context.enqueue().stream_wait_event(self.stream.raw(), event.raw()) };
         context.driver.check(status, "cross-stream wait").map_err(submission)?;
         self.fence.arm(&self.stream);
         Ok(())
@@ -1077,6 +1084,9 @@ impl DirectBatch {
     /// stream's preceding work, before its following work, waiting for no
     /// host.
     pub fn copy(&mut self, destination: u64, source: u64, bytes: u64) -> Result<(), ExecutionError> {
+        if bytes == 0 {
+            return Ok(());
+        }
         let count = usize::try_from(bytes)
             .map_err(|_| ExecutionError::SubmissionFailed("a device copy exceeds the host's address space".into()))?;
         let context = self.device.context();
@@ -1085,6 +1095,32 @@ impl DirectBatch {
         // context, which the caller keeps until the batch completes.
         let status = unsafe { context.enqueue().memcpy_device_async(destination, source, count, self.stream.raw()) };
         context.driver.check(status, "device copy").map_err(submission)?;
+        self.fence.arm(&self.stream);
+        Ok(())
+    }
+
+    /// Copy `bytes` bytes of pinned host memory at `source` to device memory
+    /// at `destination` in stream order (`cuMemcpyHtoDAsync`): after the
+    /// stream's preceding work, before its following work, waiting for no
+    /// host.
+    ///
+    /// # Safety
+    /// `source` must point to at least `bytes` bytes of live pinned host
+    /// memory mapped in this context, and `destination` must lie in a live
+    /// device allocation of this context, both kept alive until the batch
+    /// completes.
+    pub unsafe fn upload(&mut self, destination: u64, source: *const u8, bytes: u64) -> Result<(), ExecutionError> {
+        if bytes == 0 {
+            return Ok(());
+        }
+        let count = usize::try_from(bytes)
+            .map_err(|_| ExecutionError::SubmissionFailed("a host upload exceeds the host's address space".into()))?;
+        let context = self.device.context();
+        let _current = context.enter().map_err(submission)?;
+        // SAFETY: caller upholds live pinned host `source` and device
+        // `destination` for `count` bytes until the batch completes.
+        let status = unsafe { context.enqueue().upload_async(destination, source.cast(), count, self.stream.raw()) };
+        context.driver.check(status, "host-to-device copy").map_err(submission)?;
         self.fence.arm(&self.stream);
         Ok(())
     }
@@ -1300,8 +1336,10 @@ impl DirectSubmission {
     /// Wait for the work to end and report its outcome: its fault where it
     /// ended without completing.
     pub fn finish(&self) -> Result<(), ExecutionError> {
-        self.end.synchronize().map_err(submission)?;
-        self.complete.store(true, std::sync::atomic::Ordering::Relaxed);
+        if !self.complete.load(std::sync::atomic::Ordering::Relaxed) {
+            self.end.synchronize().map_err(submission)?;
+            self.complete.store(true, std::sync::atomic::Ordering::Relaxed);
+        }
         Ok(())
     }
 

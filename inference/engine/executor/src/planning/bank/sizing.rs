@@ -181,23 +181,21 @@ impl ExpertBankPlan {
         }
     }
 
-    /// What the host tier's pool is charged at `host_slots` host slots: the
-    /// whole blocks ([`Self::pooled_charge`]) holding a granule of it
-    /// ([`Self::host_granule`]) for each record each group commits there
-    /// beyond its lent ones ([`Self::host_lent`], charged at
-    /// load as the lender's lent allocation); none without a tier.
+    /// What the host tier's pools are charged at `host_slots` host slots: the
+    /// whole blocks ([`Self::pooled_charge_for`]) holding each group's granule
+    /// for each record it commits there beyond its lent ones
+    /// ([`Self::host_lent`], charged at load as the lender's lent allocation);
+    /// none without a tier.
     pub fn host_charge(&self, host_slots: u64) -> Result<u64, String> {
-        if self.host_granule().is_none() {
+        if !self.tiered() {
             return Ok(0);
         }
-        let granules = (0..self.groups().len()).try_fold(0u64, |total, group| {
-            let pooled = self
-                .host_records(group, host_slots)
+        self.pooled_charge_for(self.blocks(), |group| {
+            self.host_records(group, host_slots)
                 .checked_sub(self.host_lent(group))
-                .expect("a group's host records hold its lent ones");
-            total.checked_add(pooled).ok_or_else(|| "host tier records overflow".to_owned())
-        })?;
-        self.pooled_charge(granules).ok_or_else(|| "host tier bytes overflow".to_owned())
+                .expect("a group's host records hold its lent ones")
+        })
+        .ok_or_else(|| "host tier bytes overflow".to_owned())
     }
 
     /// What the host tier at `host_slots` holds past its floor: cache,

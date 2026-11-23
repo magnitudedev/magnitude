@@ -25,7 +25,7 @@ pub use assessment::{
     AssessmentMemoryBounds, AssessmentMemoryCharge, AssessmentMemoryTerms, CONVERSATION_CHECKPOINTS,
     DeviceProcessBytes, HostProcessBytes, SealedGraphHostBytes, StoreDemands, TargetGraphBounds, UndraftedBounds, VisionGraphBounds, measurement_process_bytes,
 };
-pub(crate) use assessment::fit_depth;
+pub(crate) use assessment::{deferred_bank_bytes, deferred_bank_bytes_of_bank, fit_depth};
 pub(crate) use resources::{DomainRows, HeadHistoryGeometry};
 #[cfg(test)]
 pub use bank::BankLayers;

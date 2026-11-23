@@ -2010,6 +2010,27 @@ fn head_component_scope(scope: WeightScope) -> Result<bool, String> {
 }
 
 impl ModelLoadPlan {
+    #[cfg(test)]
+    pub(super) fn for_bank_test(target: Vec<WeightPlan>, bank: super::ExpertBankPlan) -> Self {
+        let mut plan = Self {
+            target,
+            head: None,
+            vision: None,
+            host_tables: Vec::new(),
+            readout_candidates: Vec::new(),
+            readout_choices: Vec::new(),
+            unplaced_output: Vec::new(),
+            bank: Some(bank),
+            record_ports: None,
+            recorded_routes: false,
+            role_index: FxHashMap::default(),
+            bank_table_index: FxHashMap::default(),
+        };
+        plan.rebuild_role_index();
+        plan.rebuild_bank_table_index();
+        plan
+    }
+
     pub(crate) fn residual_conditioning(&self) -> Option<u64> {
         self.head.as_ref().and_then(|head| head.residual_conditioning)
     }
@@ -2352,17 +2373,35 @@ fn visit_weight_storages(
 fn weight_demands_by_component(load: &ModelLoadPlan) -> Result<[ClaimDemand; 3], String> {
     let mut demands = [ClaimDemand::default(); 3];
     visit_weight_storages(load, |index, weight| {
+        let demand = if weight.banked().is_some() {
+            // The bank's `storage_demand()` is the single owner of all banked
+            // expert records, lent allocations, and scales; retain only any
+            // per-weight device metadata (packing bound / record table).
+            let full = load.weight_storage_demand(weight)?;
+            let scale = weight.scale.as_ref().map_or(0, |scale| scale.resident_bytes);
+            let device = full
+                .device
+                .checked_sub(weight.resident_bytes)
+                .and_then(|d| d.checked_sub(scale))
+                .ok_or("banked weight device metadata underflows")?;
+            ClaimDemand { device, ..ClaimDemand::default() }
+        } else if load.bank_table(weight).is_some() {
+            // The bank's `storage_demand()` owns every banked table's pooled
+            // records (`tables_charge`); retain its host-shared directory and
+            // slot address table.
+            let full = load.weight_storage_demand(weight)?;
+            ClaimDemand { shared: full.shared, ..ClaimDemand::default() }
+        } else {
+            load.weight_storage_demand(weight)?
+        };
         demands[index] = demands[index]
-            .checked_plus(load.weight_storage_demand(weight)?)
+            .checked_plus(demand)
             .ok_or("resident weight byte count overflow")?;
         Ok(())
     })?;
-    // The bank's committed records are charged by its banked weights; what
-    // it is charged beyond them is the target's weights' too (a cap bounds
-    // every weight byte the plan holds).
     if let Some(bank) = &load.bank {
         demands[0] = demands[0]
-            .checked_plus(bank.storage_beyond_records()?)
+            .checked_plus(bank.storage_demand()?)
             .ok_or("resident weight byte count overflow")?;
     }
     Ok(demands)

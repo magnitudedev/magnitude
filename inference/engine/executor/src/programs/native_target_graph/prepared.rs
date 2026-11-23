@@ -1414,34 +1414,57 @@ impl PreparedTargetGraphs {
             blocks_by_class[index].untapped.push((class, graph));
         }
         // Every decode boundary's graphs agree on its carry, in each form a
-        // step runs either side in (tapped or untapped, whole or
-        // resident): none into the first block, none out of the last.
-        let decode_runs = |graphs: &BlockGraphs| {
+        // step runs either side in (tapped or untapped, whole, resident, or
+        // M7 DecodeBack -> DecodeFront): none into the first block, none out
+        // of the last.
+        let decode_out = |graphs: &BlockGraphs| {
             graphs
                 .runs
                 .iter()
                 .chain(&graphs.untapped)
-                .filter(|((class, stage), _)| class.0 == 1 && matches!(stage, Stage::Run(run) if run.place() == RunStage::Whole))
+                .filter(|((class, stage), _)| {
+                    class.0 == 1
+                        && matches!(
+                            stage,
+                            Stage::Run(RunStage::Whole | RunStage::Resident | RunStage::DecodeBack)
+                        )
+                })
                 .map(|(_, graph)| Arc::clone(graph))
                 .collect::<Vec<_>>()
         };
-        let decodes = blocks_by_class.iter().map(decode_runs).collect::<Vec<_>>();
+        let decode_in = |graphs: &BlockGraphs| {
+            graphs
+                .runs
+                .iter()
+                .chain(&graphs.untapped)
+                .filter(|((class, stage), _)| {
+                    class.0 == 1
+                        && matches!(
+                            stage,
+                            Stage::Run(RunStage::Whole | RunStage::Resident | RunStage::DecodeFront)
+                        )
+                })
+                .map(|(_, graph)| Arc::clone(graph))
+                .collect::<Vec<_>>()
+        };
+        let outs = blocks_by_class.iter().map(decode_out).collect::<Vec<_>>();
+        let ins = blocks_by_class.iter().map(decode_in).collect::<Vec<_>>();
         let unpaired = |graphs: &[Arc<PreparedTargetBlockGraph>], side: fn(&PreparedTargetBlockGraph) -> bool| {
             graphs.iter().any(|graph| side(graph))
         };
-        if decodes.first().is_some_and(|first| unpaired(first, |graph| graph.operand_in.is_some()))
-            || decodes.last().is_some_and(|last| unpaired(last, |graph| graph.operand.is_some()))
+        if ins.first().is_some_and(|first| unpaired(first, |graph| graph.operand_in.is_some()))
+            || outs.last().is_some_and(|last| unpaired(last, |graph| graph.operand.is_some()))
         {
             return Err("an operand carried into the first block or out of the last".into());
         }
-        for (index, pair) in decodes.windows(2).enumerate() {
-            for from in &pair[0] {
-                for to in &pair[1] {
+        for index in 0..outs.len().saturating_sub(1) {
+            for from in &outs[index] {
+                for to in &ins[index + 1] {
                     certify_carry(index, from, to)?;
                 }
             }
         }
-        let has_carry = decodes.iter().flatten().any(|graph| graph.operand.is_some());
+        let has_carry = outs.iter().flatten().any(|graph| graph.operand.is_some());
         assert_eq!(
             has_carry,
             certificate_group.operand_carry.is_some(),

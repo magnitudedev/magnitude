@@ -1234,7 +1234,7 @@ impl<W: PlannedWeights + ?Sized> SublayerGraph<'_, W> {
         let mixed = &carry.rows;
         // A split layer's front exports the carry it read; the others carry
         // their output rows on with the site's pre.
-        let front = matches!(split, Some(Split::Front(_)));
+        let front = matches!(split, Some(Split::Front(_) | Split::DecodeFront(_)));
         let carried = |output: WorkflowTensor, pre: Option<WorkflowTensor>| match front {
             true => carry.clone(),
             false => ResidualCarry { rows: output, pre },

@@ -60,6 +60,7 @@ struct GroupExtents {
     tokens: Option<Extents>,
     guesses: Option<Extents>,
     split: Option<SplitValues<Extents>>,
+    decode_crossing: Option<crate::operators::routed::split::DecodeCrossingBuffers<Extents>>,
     /// The `[rows, quantized]` extents of one operand carry and the group's
     /// places: each place holds two alternating carries.
     operand_carry: Option<([Extents; 2], usize)>,
@@ -76,12 +77,20 @@ impl GroupExtents {
         served: &[BlockServed],
         rows: u64,
     ) -> Self {
+        let decode_crossing = {
+            let mut layers = served.iter().filter_map(|block| block.decode_crossing.clone());
+            layers.next().map(|first| {
+                let rest: Vec<_> = layers.collect();
+                crate::operators::routed::split::DecodeCrossingBuffers::widest(&first, &rest)
+            })
+        };
         Self {
             taps: taps.map(|(element, [_, width])| (element, vec![rows, width])),
             per_layer: per_layer.map(|[_, width]| (Element::f32(), vec![rows, width])),
             tokens: tokens.map(|[_, width]| (Element::i32(), vec![rows, width])),
             guesses: guesses.map(|[_, width]| (Element::i32(), vec![rows, width])),
             split: SplitLayers::of(served).map(|layers| layers.at_rows(rows)),
+            decode_crossing,
             operand_carry: None,
         }
     }
@@ -98,6 +107,7 @@ impl GroupExtents {
     /// The group's own buffers.
     fn owned(&self) -> impl Iterator<Item = &Extents> {
         let split = self.split.iter().flat_map(|split| split.crossing.iter().chain([&split.merged.inverse]));
+        let decode_crossing = self.decode_crossing.iter().flat_map(|c| c.iter());
         let operand_carry = self
             .operand_carry
             .iter()
@@ -108,6 +118,7 @@ impl GroupExtents {
             .chain(&self.tokens)
             .chain(&self.guesses)
             .chain(split)
+            .chain(decode_crossing)
             .chain(operand_carry)
     }
 

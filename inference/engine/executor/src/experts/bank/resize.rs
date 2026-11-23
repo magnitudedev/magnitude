@@ -82,14 +82,18 @@ impl RiseGate {
     }
 }
 
-/// One store's records: each group's slab store in the store's pool, a
-/// record a slab, its leading `lent` records over the lender's lent
-/// allocation for the load's life, each region one routed tensor's record
-/// of `record_bytes`. `SlabTensor` provides interior mutability so no outer
-/// per-group mutex is ever held across `add_slab` / `allocate_block`.
-pub(super) struct Stores {
-    pool: Pool,
-    block: seismic::BlockSize,
+/// One store's records: each group's slab store in the pool matching its
+/// record-slab granule, a record a slab, its leading `lent` records over the
+/// lender's lent allocation for the load's life, each region one routed
+/// tensor's record of `record_bytes`. `SlabTensor` provides interior
+/// mutability so no outer per-group mutex is ever held across `add_slab` /
+/// `allocate_block`.
+pub(in crate::experts) struct Stores {
+    /// One pool per distinct group granule (1 for uniform models), paired with
+    /// its `BlockSize`.
+    pools: Vec<(Pool, seismic::BlockSize)>,
+    /// Index into `pools` for each bank group.
+    group_pool: Vec<usize>,
     groups: Vec<SlabTensor>,
     lent: Vec<u64>,
     record_bytes: Vec<Vec<u64>>,
@@ -98,15 +102,27 @@ pub(super) struct Stores {
 
 impl Stores {
     /// `groups`, each a store with its leading `lent` records and its
-    /// regions' record bytes, in `pool` whose blocks are sized by `block`.
-    pub(super) fn new(pool: Pool, block: seismic::BlockSize, groups: Vec<(SlabTensor, u64, Vec<u64>)>) -> Self {
+    /// regions' record bytes, each group `g` backed by `pools[group_pool[g]]`.
+    pub(in crate::experts) fn new(
+        pools: Vec<(Pool, seismic::BlockSize)>,
+        group_pool: Vec<usize>,
+        groups: Vec<(SlabTensor, u64, Vec<u64>)>,
+    ) -> Self {
+        assert!(!pools.is_empty(), "invariant violated: Stores opened with no pools");
+        assert_eq!(group_pool.len(), groups.len(), "invariant violated: group_pool length mismatch");
+        assert!(group_pool.iter().all(|&p| p < pools.len()), "invariant violated: group_pool index out of bounds");
         let (mut stores, mut lent, mut record_bytes) = (Vec::new(), Vec::new(), Vec::new());
         for (store, leading, bytes) in groups {
             stores.push(store);
             lent.push(leading);
             record_bytes.push(bytes);
         }
-        Self { pool, block, groups: stores, lent, record_bytes, rise_gate: Arc::new(RiseGate::new()) }
+        Self { pools, group_pool, groups: stores, lent, record_bytes, rise_gate: Arc::new(RiseGate::new()) }
+    }
+
+    /// The pool at index `pool`.
+    pub(super) fn pool(&self, pool: usize) -> &Pool {
+        &self.pools[pool].0
     }
 
     /// Waiter-priority gate paired with the bank's `rises` mutex.
@@ -129,13 +145,32 @@ impl Stores {
         self.group(group).device_repoints()
     }
 
-    /// What the pool charges the records: whole blocks (`BlockSize::charge`)
-    /// holding a granule for each record beyond the lent ones (the same
-    /// formula as `ExpertBankPlan::resident_charge` and `host_charge`).
+    /// Per-pool whole-block charge (`BlockSize::charge`) holding a granule for
+    /// each record beyond the lent ones in every group mapped to that pool.
+    pub(super) fn charged_per_pool(&self) -> Vec<u64> {
+        let mut per_pool = vec![0u64; self.pools.len()];
+        for group in 0..self.groups.len() {
+            per_pool[self.group_pool[group]] += self.present(group) - self.lent[group];
+        }
+        self.pools
+            .iter()
+            .zip(per_pool)
+            .map(|((pool, block), granules)| {
+                block
+                    .charge(pool.granule(), granules)
+                    .expect("invariant violated: bank record charge overflows")
+            })
+            .collect()
+    }
+
+    /// What the pools charge the records: the sum of each distinct-granule
+    /// pool's whole-block charge (`BlockSize::charge`) for each record beyond
+    /// the lent ones (the same formula as `ExpertBankPlan::resident_charge`
+    /// and `host_charge`).
     pub(super) fn charged(&self) -> u64 {
-        let granules: u64 = (0..self.groups.len()).map(|group| self.present(group) - self.lent[group]).sum();
-        self.block
-            .charge(self.pool.granule(), granules)
+        self.charged_per_pool()
+            .into_iter()
+            .try_fold(0u64, u64::checked_add)
             .expect("invariant violated: bank record charge overflows")
     }
 
@@ -154,7 +189,7 @@ impl Stores {
     /// promotion copy or file read writes every byte and completes. The
     /// records claimed, the lowest free first; on a refusal, none (those
     /// claimed before it are returned cleanly, never having been published).
-    pub(super) fn claim_to(&self, group: usize, records: u64) -> Result<Vec<usize>, TensorError> {
+    pub(in crate::experts) fn claim_to(&self, group: usize, records: u64) -> Result<Vec<usize>, TensorError> {
         seismic::memory::assert_blocking_allocation_allowed("Stores::claim_to");
         let store = self.group(group);
         let have = store.backed_count() as u64;
@@ -189,20 +224,94 @@ impl Stores {
         records.iter().try_for_each(|&record| store.free_slab(record as usize).map(drop))
     }
 
-    /// Return `freed` bytes of the pool to the OS, what a shrink freed:
+    /// Return each pool's freed bytes to the OS, what a shrink freed per pool:
     /// every empty block, then the emptiest emptied while those fall short
-    /// (`seismic::Pool::return_freed`). The bytes returned.
-    fn return_freed(&self, freed: u64) -> Result<u64, TensorError> {
-        seismic::memory::assert_blocking_allocation_allowed("Stores::return_freed");
-        self.pool.return_freed(freed)
+    /// (`seismic::Pool::return_freed`). The total bytes returned.
+    fn return_freed_per_pool(&self, per_pool: &[u64]) -> Result<u64, TensorError> {
+        seismic::memory::assert_blocking_allocation_allowed("Stores::return_freed_per_pool");
+        let mut returned = 0u64;
+        for ((pool, _), &freed) in self.pools.iter().zip(per_pool) {
+            if freed > 0 || pool.owed() > 0 {
+                returned = returned.saturating_add(pool.return_freed(freed)?);
+            }
+        }
+        Ok(returned)
+    }
+
+    /// Drain settled blocks owed to the OS/driver across all pools.
+    fn drain_owed(&self) -> Result<u64, TensorError> {
+        seismic::memory::assert_blocking_allocation_allowed("Stores::drain_owed");
+        let mut returned = 0u64;
+        for (pool, _) in &self.pools {
+            if pool.owed() > 0 {
+                returned = returned.saturating_add(pool.return_freed(0)?);
+            }
+        }
+        Ok(returned)
+    }
+
+    /// Whether any pool has unsettled owed bytes waiting to return.
+    fn has_owed(&self) -> bool {
+        self.pools.iter().any(|(pool, _)| pool.owed() > 0)
+    }
+
+    /// Synchronously return at least `need` bytes across the pools
+    /// (`seismic::Pool::return_freed_sync`).
+    fn return_freed_sync(&self, need: u64) -> Result<u64, TensorError> {
+        seismic::memory::assert_blocking_allocation_allowed("Stores::return_freed_sync");
+        let mut returned = 0u64;
+        for (pool, _) in &self.pools {
+            let remaining = need.saturating_sub(returned);
+            if remaining == 0 {
+                break;
+            }
+            returned = returned.saturating_add(pool.return_freed_sync(remaining)?);
+        }
+        Ok(returned)
+    }
+
+    /// Synchronously return each pool's `per_pool` released bytes, then any
+    /// remaining shortfall up to `need` across pools.
+    fn return_freed_sync_per_pool(&self, per_pool: &[u64], need: u64) -> Result<u64, TensorError> {
+        seismic::memory::assert_blocking_allocation_allowed("Stores::return_freed_sync_per_pool");
+        let mut returned = 0u64;
+        for ((pool, _), &freed) in self.pools.iter().zip(per_pool) {
+            if freed > 0 {
+                returned = returned.saturating_add(pool.return_freed_sync(freed)?);
+            }
+        }
+        if returned < need {
+            returned = returned.saturating_add(self.return_freed_sync(need - returned)?);
+        }
+        Ok(returned)
+    }
+
+    /// Largest block size across the pools.
+    fn max_block_bytes(&self) -> u64 {
+        self.pools.iter().map(|(pool, _)| pool.block_bytes()).max().expect("non-empty pools")
+    }
+
+    /// Whether any pool has at least one full block's worth of free granules.
+    fn has_free_block(&self) -> bool {
+        self.pools.iter().any(|(pool, _)| pool.free_granules() as u64 * pool.granule() >= pool.block_bytes())
+    }
+
+    /// Total free granule bytes across all pools.
+    fn free_bytes(&self) -> u64 {
+        self.pools.iter().map(|(pool, _)| pool.free_granules() as u64 * pool.granule()).sum()
     }
 
     /// Record `record` of group `group`'s region `region`, while it is
     /// held. Safe inside a no-blocking-allocation scope: `Stores::groups`
     /// holds no outer mutex and `SlabTensor::slab_region` acquires only the
     /// `Slots::slabs` leaf lock (never held across allocation or submission).
-    pub(super) fn view(&self, group: usize, region: usize, record: usize) -> Option<Tensor> {
+    pub(in crate::experts) fn view(&self, group: usize, region: usize, record: usize) -> Option<Tensor> {
         self.group(group).slab_region(record, region).expect("a record and region lie in their group's store")
+    }
+
+    /// Record byte sizes of every routed-tensor region in `group`.
+    pub(in crate::experts) fn region_bytes(&self, group: usize) -> &[u64] {
+        &self.record_bytes[group]
     }
 
     /// Each group's routed tensors' records the host addresses, resolved on
@@ -824,13 +933,13 @@ impl ExpertBank {
     /// the very next boundary instead of leaving them trapped in fragmented
     /// blocks.
     fn drain_owed(&self, stores: &Stores, label: &str) -> Result<u64, DomainError> {
-        if stores.pool.owed() == 0 {
+        if !stores.has_owed() {
             return Ok(0);
         }
         self.cache
             .changes()
             .clone()
-            .change(|_| stores.return_freed(0))
+            .change(|_| stores.drain_owed())
             .map_err(|error| DomainError::invariant(format!("the {label}'s pool could not return settled blocks: {error}")))
     }
 
@@ -950,14 +1059,18 @@ impl ExpertBank {
             BankTier::Host => BankHolding::Host,
         };
         self.cache.changes().clone().back(|_| {
+            let before_per_pool = stores.charged_per_pool();
             for (group, records) in evicted.iter().enumerate() {
                 stores.free(group, records).map_err(|refusal| DomainError::invariant(format!("the expert bank's pool refused a shrink's release: {refusal}")))?;
             }
-            let released = charged.checked_sub(stores.charged()).ok_or_else(|| DomainError::invariant("a shrink raised its records' charge"))?;
+            let after_per_pool = stores.charged_per_pool();
+            let released_per_pool: Vec<u64> = before_per_pool.iter().zip(&after_per_pool).map(|(&before, &after)| before.saturating_sub(after)).collect();
+            let after: u64 = after_per_pool.into_iter().sum();
+            let released = charged.checked_sub(after).ok_or_else(|| DomainError::invariant("a shrink raised its records' charge"))?;
             self.cache.fit(holding, self.above_floor(tier, to));
             let returned = match sync_need {
-                Some(need) => stores.pool.return_freed_sync(released.max(need)),
-                None => stores.return_freed(released),
+                Some(need) => stores.return_freed_sync_per_pool(&released_per_pool, released.max(need)),
+                None => stores.return_freed_per_pool(&released_per_pool),
             }
             .map_err(|error| DomainError::invariant(format!("the expert bank's pool could not return a shrink's blocks: {error}")))?;
             tracing::debug!(?holding, released, returned, sync = sync_need.is_some(), "a shrink's granules return to the pool, its empty blocks to the OS");
@@ -1057,10 +1170,19 @@ impl ExpertBank {
     /// blocks on top of blocks still wired in `currentAllocatedSize`.
     pub(super) fn pool_releasing(&self, tier: BankTier) -> Option<seismic::Pool> {
         match tier {
-            BankTier::Bank => self.stores.pool.releasing().then(|| self.stores.pool.clone()),
-            BankTier::Host => self
-                .host()
-                .and_then(|host| host.stores.pool.releasing().then(|| host.stores.pool.clone())),
+            BankTier::Bank => self
+                .stores
+                .pools
+                .iter()
+                .find(|(pool, _)| pool.releasing())
+                .map(|(pool, _)| pool.clone()),
+            BankTier::Host => self.host().and_then(|host| {
+                host.stores
+                    .pools
+                    .iter()
+                    .find(|(pool, _)| pool.releasing())
+                    .map(|(pool, _)| pool.clone())
+            }),
         }
     }
 
@@ -1147,23 +1269,26 @@ impl ExpertBank {
         Ok(())
     }
 
-    /// Return `freed` bytes of `tier`'s pool to the OS, what a shrink of a
-    /// holding in it freed (`seismic::Pool::return_freed`): the bytes
+    /// Return `freed` bytes of `tier`'s table pool to the OS, what a shrink of
+    /// a banked stored table freed (`seismic::Pool::return_freed`): the bytes
     /// returned now.
     pub(super) fn return_freed(&self, tier: BankTier, freed: u64) -> Result<u64, DomainError> {
+        let table_pool = self.plan.table_pool();
         let pool = match tier {
-            BankTier::Bank => self.stores.pool.clone(),
-            BankTier::Host => self.host().ok_or_else(|| DomainError::invariant("a host tier's pool without one"))?.stores.pool.clone(),
+            BankTier::Bank => self.stores.pool(table_pool).clone(),
+            BankTier::Host => self.host().ok_or_else(|| DomainError::invariant("a host tier's pool without one"))?.stores.pool(table_pool).clone(),
         };
         pool.return_freed(freed).map_err(|error| DomainError::invariant(format!("the {tier:?} pool could not return a shrink's blocks: {error}")))
     }
 
-    /// Synchronously return at least `freed` bytes of `tier`'s pool to the OS
-    /// (`seismic::Pool::return_freed_sync`), for synchronous admission reclaim.
+    /// Synchronously return at least `freed` bytes of `tier`'s table pool to
+    /// the OS (`seismic::Pool::return_freed_sync`), for synchronous admission
+    /// reclaim of a banked stored table.
     pub(super) fn return_freed_sync(&self, tier: BankTier, freed: u64) -> Result<u64, DomainError> {
+        let table_pool = self.plan.table_pool();
         let pool = match tier {
-            BankTier::Bank => self.stores.pool.clone(),
-            BankTier::Host => self.host().ok_or_else(|| DomainError::invariant("a host tier's pool without one"))?.stores.pool.clone(),
+            BankTier::Bank => self.stores.pool(table_pool).clone(),
+            BankTier::Host => self.host().ok_or_else(|| DomainError::invariant("a host tier's pool without one"))?.stores.pool(table_pool).clone(),
         };
         pool.return_freed_sync(freed).map_err(|error| DomainError::invariant(format!("the {tier:?} pool could not return a shrink's blocks: {error}")))
     }
@@ -1307,7 +1432,7 @@ impl ExpertBank {
             BankTier::Host => self.host().map_or(0, |h| h.commitment.slots.load(Ordering::Acquire)),
         };
         let mut current_from = initial_from;
-        let block_bytes = stores.pool.block_bytes();
+        let block_bytes = stores.max_block_bytes();
         let charge_fn = self.tier_charge(tier);
         let charge = |at| Ok::<_, std::convert::Infallible>(charge_fn(&self.counts, at));
 
@@ -1320,14 +1445,14 @@ impl ExpertBank {
                 .cache
                 .changes()
                 .clone()
-                .back(|_| stores.pool.return_freed_sync(deficit))
+                .back(|_| stores.return_freed_sync(deficit))
                 .map_err(|error| ReclaimError::Invariant(error.to_string()))?;
             // If at least one full block's worth of granules is already free
-            // in the pool yet nothing returned, an in-flight promotion or
+            // in any pool yet nothing returned, an in-flight promotion or
             // landing may momentarily hold a temporary view on the candidate
             // block. Drain in-flight traffic so those views drop, then retry
             // returning before evicting additional live slots.
-            if flushed == 0 && stores.pool.free_granules() as u64 * stores.pool.granule() >= block_bytes {
+            if flushed == 0 && stores.has_free_block() {
                 if _traffic.is_none() {
                     _traffic = Some(self.watcher.shared().hold_traffic());
                     self.watcher.shared().wait_traffic_quiet().map_err(ReclaimError::Invariant)?;
@@ -1336,7 +1461,7 @@ impl ExpertBank {
                     .cache
                     .changes()
                     .clone()
-                    .back(|_| stores.pool.return_freed_sync(deficit))
+                    .back(|_| stores.return_freed_sync(deficit))
                     .map_err(|error| ReclaimError::Invariant(error.to_string()))?;
             }
             total_returned = total_returned.saturating_add(flushed);
@@ -1355,7 +1480,7 @@ impl ExpertBank {
             }
 
             let evict_bytes = if !evicted_any {
-                let already_free = stores.pool.free_granules() as u64 * stores.pool.granule();
+                let already_free = stores.free_bytes();
                 let target_blocks = deficit.div_ceil(block_bytes).saturating_mul(block_bytes);
                 match target_blocks.saturating_sub(already_free) {
                     0 => deficit,

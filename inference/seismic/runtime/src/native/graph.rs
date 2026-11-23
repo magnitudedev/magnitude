@@ -21,7 +21,7 @@ use super::timeline::{
     TimelineRole, ValuedRole,
 };
 use super::{
-    charge_emissions, merge_access, submit, CallLaunches, Dispatch, DispatchList, FormedAt, LaunchGeometry,
+    charge_emissions, merge_access, CallLaunches, Dispatch, DispatchList, FormedAt, LaunchGeometry,
     NativeOperandNorm, NativePrepared, NativeQueue, NativeRoute, NativeSubmission, NativeTensorSpec, ScratchNeed,
     ScratchOperand, BUFFER_ALIGNMENT, MINIMUM_SCRATCH_BYTES,
 };
@@ -1744,6 +1744,11 @@ impl NativeGraphMetadataDraft {
             timelines: Vec::new(),
             marks: Vec::new(),
         }
+    }
+
+    /// Number of enqueued nodes whose checked entry name equals `entry`.
+    pub fn entry_count(&self, entry: &str) -> usize {
+        self.nodes.iter().filter(|node| node.entry == entry).count()
     }
 
     /// A span mark after every node enqueued so far
@@ -6808,6 +6813,9 @@ pub struct NativeGraphSequence {
     /// Keep slab placements and pinned reserved regions fixed until the
     /// submission records its fences.
     binding_leases: Vec<Arc<TensorInner>>,
+    /// Device-side transfer completion events this sequence waits on via
+    /// cross-stream `cuStreamWaitEvent` before running any graph.
+    after_transfers: Vec<super::transfer::TransferSync>,
 }
 
 impl NativeGraphSequence {
@@ -6819,7 +6827,14 @@ impl NativeGraphSequence {
             runs: Vec::new(),
             access: Vec::new(),
             binding_leases: Vec::new(),
+            after_transfers: Vec::new(),
         }
+    }
+
+    /// Wait on a transfer batch's completion event (`cuStreamWaitEvent` on
+    /// CUDA) before running any work queued in this sequence.
+    pub fn follow_transfer(&mut self, sync: super::transfer::TransferSync) {
+        self.after_transfers.push(sync);
     }
 
     pub fn is_empty(&self) -> bool {
@@ -6880,7 +6895,7 @@ impl NativeGraphSequence {
             #[cfg(any(test, target_os = "macos"))]
             access_summary,
         };
-        let mut submission = submit(&list, &access, retained, 1, observed, self.queue)?;
+        let mut submission = super::submit_after_transfers(&list, &access, retained, 1, observed, self.queue, &self.after_transfers)?;
         // The runs own the storage their work reaches; it retires with this
         // completion, never with the replay caches the plans' retention
         // reaches, GraphPoint conversion included. The binding leases only
@@ -7422,6 +7437,9 @@ pub struct NativeGraphCompletion {
 }
 
 impl NativeGraphCompletion {
+    pub(super) fn from_submission(submission: NativeSubmission) -> Self {
+        Self { submission }
+    }
     /// Whether the run ended, so [`Self::wait`] reports its outcome without
     /// blocking: it completed, or faulted.
     pub fn is_complete(&self) -> bool {

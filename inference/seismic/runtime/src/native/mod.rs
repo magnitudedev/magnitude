@@ -3647,6 +3647,18 @@ pub(crate) fn submit(
     observed: bool,
     queue: NativeQueue,
 ) -> Result<NativeSubmission, CallError> {
+    submit_after_transfers(list, access, retained, repetitions, observed, queue, &[])
+}
+
+pub(crate) fn submit_after_transfers(
+    list: &impl DispatchList,
+    access: &[(Arc<Allocation>, bool)],
+    retained: Arc<dyn std::any::Any + Send + Sync>,
+    repetitions: usize,
+    observed: bool,
+    queue: NativeQueue,
+    after_transfers: &[transfer::TransferSync],
+) -> Result<NativeSubmission, CallError> {
     if list.count() == 0 {
         return Err(CallError::Workflow(crate::api::WorkflowError::Empty));
     }
@@ -3698,6 +3710,7 @@ pub(crate) fn submit(
         retained: &retained,
         queue,
         after: &after,
+        after_transfers,
     };
     let route = Arc::new(
         encode(first, &work)
@@ -3730,6 +3743,130 @@ pub(crate) fn submit(
         barriers: resident_barriers(list, access),
         _retained: retained,
     })
+}
+
+/// One byte-identical copy in [`submit_fill_copies`].
+pub struct FillCopyRun<'a> {
+    pub source: &'a crate::api::tensor::TensorInner,
+    pub source_offset: u64,
+    pub destination: &'a crate::api::tensor::TensorInner,
+    pub destination_offset: u64,
+    pub bytes: u64,
+}
+
+/// Queue `runs` as one hardware-ordered copy batch on `NativeQueue::Fill`
+/// (on CUDA: `cuMemcpyHtoDAsync` / `cuMemcpyDtoDAsync` on `NativeStream::Fill`,
+/// followed by `cuEventRecord` so subsequent `NativeQueue::Compute` work
+/// reading any written allocation waits via `cuStreamWaitEvent`).
+pub fn submit_fill_copies(
+    device: &Arc<crate::api::device::DeviceInner>,
+    runs: &[FillCopyRun<'_>],
+) -> Result<graph::NativeGraphCompletion, CallError> {
+    if runs.is_empty() {
+        return Err(CallError::Workflow(crate::api::WorkflowError::Empty));
+    }
+    seismic_memory::assert_blocking_allocation_allowed("submit_fill_copies");
+    let refused = |why: String| CallError::Execution(ExecutionError::SubmissionFailed(why));
+    for run in runs {
+        if !Arc::ptr_eq(run.source.device(), device) || !Arc::ptr_eq(run.destination.device(), device) {
+            return Err(refused("a fill copy tensor belongs to another device".into()));
+        }
+        if run.source.is_slab_view() || run.destination.is_slab_view() {
+            return Err(refused("a fill copy cannot transfer a slab view directly".into()));
+        }
+        if run.destination.allocation().storage().read_only() {
+            return Err(refused("a fill copy destination is read-only".into()));
+        }
+        let within = |tensor: &crate::api::tensor::TensorInner, offset: u64| {
+            offset.checked_add(run.bytes).is_some_and(|end| end <= tensor.byte_len())
+        };
+        if !within(run.source, run.source_offset) || !within(run.destination, run.destination_offset) {
+            return Err(refused("a fill copy range lies outside its tensor".into()));
+        }
+    }
+    for run in runs {
+        run.source.wait_adopted().map_err(CallError::Execution)?;
+        run.destination.wait_adopted().map_err(CallError::Execution)?;
+    }
+    let access = merge_access(runs.iter().flat_map(|run| {
+        [
+            (run.source.allocation().clone(), false),
+            (run.destination.allocation().clone(), true),
+        ]
+    }));
+    let mut issued = IssuedWork(None);
+    let permits = access
+        .iter()
+        .map(|(allocation, write)| allocation.acquire_for_device(*write))
+        .collect::<Vec<_>>();
+    let _order = device
+        .native
+        .order
+        .lock()
+        .expect("native submission order lock is never poisoned");
+    let queue = NativeQueue::Fill.on(device.info().backend());
+    let mut after: Vec<Arc<dyn DeviceCompletion>> = Vec::new();
+    for (allocation, write) in &access {
+        for fence in allocation.queue_order(queue, *write).map_err(CallError::Execution)? {
+            if !after.iter().any(|known| Arc::ptr_eq(known, &fence)) {
+                after.push(fence);
+            }
+        }
+    }
+    device.ran_work();
+    let encoded: Result<Committed, EncodeFailure> = match &device.kind {
+        OpenedKind::Cuda(opened) => cuda::encode_fill_copies(opened.service(), &after, runs),
+        OpenedKind::Cpu(_) => {
+            let start = trace::host_seconds();
+            let mut steps = Vec::with_capacity(runs.len());
+            for run in runs {
+                if run.bytes == 0 {
+                    continue;
+                }
+                let src_base = typed_buffer::<seismic_cpu::Cpu, seismic_cpu::Executor>(run.source.allocation())
+                    .data_pointer()
+                    .cast_const();
+                let dst_base = run
+                    .destination
+                    .allocation()
+                    .storage()
+                    .host_address()
+                    .ok_or_else(|| refused("a CPU fill copy destination has no host address".into()))?;
+                let src_off = (run.source.byte_offset() + run.source_offset) as usize;
+                let dst_off = (run.destination.byte_offset() + run.destination_offset) as usize;
+                // SAFETY: bounds checked above.
+                steps.push((unsafe { src_base.add(src_off) }, unsafe { dst_base.as_ptr().add(dst_off) }, run.bytes as usize));
+            }
+            for (src, dst, len) in steps {
+                // SAFETY: live, bounds-checked views held by `access` permits.
+                unsafe { std::ptr::copy(src, dst, len) };
+            }
+            let end = trace::host_seconds();
+            Ok(Committed::Cpu { outcome: Ok(()), interval: (start, end), launches: None })
+        }
+        #[cfg(target_os = "macos")]
+        OpenedKind::Metal(_) => Err(EncodeFailure::uncommitted(refused(
+            "fill DMA copies are not supported on Metal".into(),
+        ))),
+        #[cfg(not(target_os = "macos"))]
+        OpenedKind::Vulkan(_) => Err(EncodeFailure::uncommitted(refused(
+            "fill DMA copies are not supported on Vulkan".into(),
+        ))),
+    };
+    let route = Arc::new(encoded.map(RouteSubmission::Committed).or_else(EncodeFailure::completion)?);
+    let route = issued.0.insert(route);
+    let completion: Arc<dyn DeviceCompletion> = route.clone();
+    for (allocation, write) in &access {
+        allocation.record_device_use(crate::driver::DeviceQueue::Native(queue), completion.clone(), *write);
+    }
+    drop(permits);
+    let retained: Vec<Arc<Allocation>> = access.into_iter().map(|(allocation, _)| allocation).collect();
+    Ok(graph::NativeGraphCompletion::from_submission(NativeSubmission {
+        route: issued.take(),
+        gates: Vec::new(),
+        barriers: Vec::new(),
+        _retained: Arc::new(retained),
+    }))
 }
 
 /// Each resident launch's barrier of `list` (`NativeLaunch::resident`), once:
@@ -3858,11 +3995,12 @@ struct Encoding<'a, L> {
     retained: &'a Arc<dyn std::any::Any + Send + Sync>,
     queue: NativeQueue,
     after: &'a [Arc<dyn DeviceCompletion>],
+    after_transfers: &'a [transfer::TransferSync],
 }
 
 /// Encode and commit `work`.
 fn encode(first: &NativePrepared, work: &Encoding<'_, impl DispatchList>) -> Result<Committed, EncodeFailure> {
-    let Encoding { list, repetitions, timed, observed, retained: _, queue, after } = *work;
+    let Encoding { list, repetitions, timed, observed, retained: _, queue, after, after_transfers: _ } = *work;
     #[cfg(target_os = "macos")]
     let mut buffers = Vec::new();
     assert!(

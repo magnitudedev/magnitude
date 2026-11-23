@@ -143,6 +143,18 @@ impl SubmissionChunks {
 /// mix of places and classes records nothing once each shape has run. A
 /// scratch-served chain's submissions are its release's boundaries
 /// ([`RunningRelease`]).
+/// One queued `OnceStage::Fill` awaiting producer-enqueued host-tier -> VRAM
+/// scratch DMA (`ExpertTransport::submit_prefill_dma`) before its consuming
+/// `Pass` runs on `NativeQueue::Compute`.
+struct PendingPrefillDma {
+    bank: Arc<crate::experts::ExpertBank>,
+    block: usize,
+    layer: usize,
+    place: usize,
+    sequence: u64,
+    window: u64,
+}
+
 struct StepSubmitter<'p> {
     device: Device,
     release: Option<RunningRelease<'p>>,
@@ -150,6 +162,14 @@ struct StepSubmitter<'p> {
     queued: usize,
     schedule: SubmissionChunks,
     completions: Vec<NativeGraphCompletion>,
+    /// Active M7 decode DMA landings (`TransferSync` + pinning `ConsumerLease`s)
+    /// held until the next layer's `DecodeFront` (or step completion) proves
+    /// `DecodeBack` has finished reading the landed/joined VRAM slots.
+    decode_landings: Vec<(Arc<crate::experts::ExpertBank>, crate::experts::transport::DecodeLanding)>,
+    /// Queued `OnceStage::Fill` launches whose host-tier -> scratch DMA will
+    /// be coalesced and submitted right before their consuming `Pass` without
+    /// draining `Compute` or calling `cuEventSynchronize`.
+    pending_prefill_dma: Vec<PendingPrefillDma>,
     /// The stored-table reads of the runs since the last submission, the
     /// first `queued_reads` of them the queued runs', then of the submitted
     /// runs.
@@ -206,6 +226,8 @@ impl<'p> StepSubmitter<'p> {
             queued: 0,
             schedule: SubmissionChunks::new(),
             completions: Vec::new(),
+            decode_landings: Vec::new(),
+            pending_prefill_dma: Vec::new(),
             pending_reads: Vec::new(),
             queued_reads: 0,
             reads: Vec::new(),
@@ -229,12 +251,32 @@ impl<'p> StepSubmitter<'p> {
     /// stored-table reads of already-submitted runs so their failure records
     /// are not leaked, and abandon the stored-table steps of runs never
     /// submitted (whose landed reads drop unsubmitted).
-    fn abandon_unsubmitted(self) {
+    fn abandon_unsubmitted(mut self) {
+        self.release_decode_landings();
+        self.pending_prefill_dma.clear();
         for read in self.reads {
             read.table.retire(read.value);
         }
         for read in self.pending_reads {
             let _ = read.table.abandon(read.value);
+        }
+    }
+
+    /// Pin a decode layer's landed/joined VRAM slots until the next layer's
+    /// `DecodeFront` or step completion proves `DecodeBack` has finished.
+    fn hold_decode_landing(
+        &mut self,
+        bank: Arc<crate::experts::ExpertBank>,
+        landing: crate::experts::transport::DecodeLanding,
+    ) {
+        self.decode_landings.push((bank, landing));
+    }
+
+    /// Release all held decode DMA landings (must only be called once
+    /// `DecodeBack` is proven complete on the GPU or after `wait_all`).
+    fn release_decode_landings(&mut self) {
+        for (bank, landing) in self.decode_landings.drain(..) {
+            bank.complete_decode_landing(landing);
         }
     }
 
@@ -283,6 +325,7 @@ impl<'p> StepSubmitter<'p> {
     fn fill(
         &mut self,
         ready: seismic::ReadyNativeGraphRun<'_>,
+        prefill_dma: Option<PendingPrefillDma>,
         register: impl FnOnce(&NativeGraphOutputs),
     ) -> Result<(), SubmitError> {
         self.flush()?;
@@ -293,6 +336,56 @@ impl<'p> StepSubmitter<'p> {
         let outputs = ready.queue(&mut sequence).map_err(device)?;
         register(&outputs);
         self.completions.push(sequence.submit().map_err(device)?);
+        if let Some(pending) = prefill_dma {
+            self.pending_prefill_dma.push(pending);
+        }
+        Ok(())
+    }
+
+    /// Producer-enqueued prefill `HostTier -> Scratch` (+ seeded `Scratch -> Bank`)
+    /// hardware DMA for `(block, set, window)`:
+    ///
+    /// - Never blocks `run_fill` or drains `Compute` with `cuEventSynchronize`.
+    /// - Flushes any queued independent `Compute` work (`Front` / `Combine`)
+    ///   so the GPU stays saturated while taking the `PrefillPlan`s that
+    ///   `Watcher` (`Scratch::fix_rounds`) published directly on the host.
+    /// - Coalesces all chunks in `set` into ONE `submit_fill_copies` batch on
+    ///   `NativeQueue::Fill` (ordered into the consuming `Pass` via
+    ///   `cuStreamWaitEvent`), or skips with ZERO device calls when no
+    ///   host-tier copies are needed.
+    fn enqueue_prefill_dma(
+        &mut self,
+        block: usize,
+        set: &std::ops::Range<usize>,
+        window: u64,
+    ) -> Result<(), SubmitError> {
+        if self.pending_prefill_dma.is_empty() {
+            return Ok(());
+        }
+        let (matching, remaining): (Vec<_>, Vec<_>) = std::mem::take(&mut self.pending_prefill_dma)
+            .into_iter()
+            .partition(|p| p.block == block && set.contains(&p.place) && p.window == window);
+        self.pending_prefill_dma = remaining;
+        if matching.is_empty() {
+            return Ok(());
+        }
+        // Flush any queued independent Compute work (`Front`/`Combine`) first
+        // so it runs on the GPU while we collect the host-published plans.
+        self.flush()?;
+        let bank = matching[0].bank.clone();
+        let layer = matching[0].layer;
+        let mut plans = Vec::with_capacity(matching.len());
+        for pending in matching {
+            let plan = pending
+                .bank
+                .transport()
+                .take_prefill_plan(pending.layer, pending.sequence, pending.window)
+                .map_err(device)?;
+            plans.push(plan);
+        }
+        if let Some(completion) = bank.submit_prefill_dma(layer, &plans).map_err(device)? {
+            self.completions.push(completion);
+        }
         Ok(())
     }
 
@@ -313,6 +406,36 @@ impl<'p> StepSubmitter<'p> {
             }
         }
         (self.queued_reads, self.queued_landed) = (0, 0);
+        Ok(())
+    }
+
+    /// Wait on a transfer batch's completion event (`cuStreamWaitEvent` on
+    /// CUDA) before running any work queued in the current compute sequence.
+    fn follow_transfer(&mut self, sync: seismic::TransferSync) {
+        self.sequence.follow_transfer(sync);
+    }
+
+    /// Submit everything queued so far and wait for the latest submission's
+    /// CUDA completion event (used between `DecodeFront` and `DecodeBack` so
+    /// pinned `DecodeSources` is visible to the host before batched DMA).
+    /// Polls non-blockingly (`cuEventQuery`) for a brief spin window so the
+    /// driving thread avoids `CU_EVENT_BLOCKING_SYNC` OS sleep/CFS wakeup
+    /// latency on fast GPU layers, falling back to blocking `wait()` if the
+    /// layer is parked on slow I/O.
+    /// Holds zero residency locks and uses zero `cuStreamWaitValue32`.
+    fn flush_and_wait(&mut self) -> Result<(), SubmitError> {
+        self.flush()?;
+        if let Some(completion) = self.completions.pop() {
+            const FAST_POLL_BUDGET: std::time::Duration = std::time::Duration::from_micros(200);
+            let started = std::time::Instant::now();
+            while !completion.is_complete() {
+                if started.elapsed() >= FAST_POLL_BUDGET {
+                    break;
+                }
+                std::hint::spin_loop();
+            }
+            completion.wait().map_err(device)?;
+        }
         Ok(())
     }
 
@@ -422,6 +545,17 @@ pub struct TargetOutput {
     pub stored_reads: Vec<StoredRead>,
     /// The step of a streamed load's expert bank, until it completes.
     pub(crate) expert_step: Option<crate::experts::ExpertStep>,
+    /// Final layer's M7 decode DMA landings, released once the step's GPU
+    /// completions finish.
+    pub(crate) decode_landings: Vec<(Arc<crate::experts::ExpertBank>, crate::experts::transport::DecodeLanding)>,
+}
+
+impl Drop for TargetOutput {
+    fn drop(&mut self) {
+        for (bank, landing) in self.decode_landings.drain(..) {
+            bank.complete_decode_landing(landing);
+        }
+    }
 }
 
 /// A target step's output once the step completed (or will never be used,
@@ -467,6 +601,9 @@ impl TargetOutput {
         batch: &magnitude_batching::ValidatedTargetBatch,
         recorded: Option<crate::experts::Recording>,
     ) -> Result<CompletedTargetOutput, crate::InvariantError> {
+        for (bank, landing) in self.decode_landings.drain(..) {
+            bank.complete_decode_landing(landing);
+        }
         let landing = std::mem::take(&mut self.landed_reads)
             .into_iter()
             .map(SubmittedRead::complete)
@@ -511,7 +648,9 @@ impl TargetOutput {
         for read in &self.stored_reads {
             read.table.retire(read.value);
         }
-        let Self { boundary, readout, commits, .. } = self;
+        let boundary = self.boundary.take();
+        let readout = self.readout.take();
+        let commits = self.commits;
         Ok(CompletedTargetOutput { boundary, readout, commits, failures, experts, expert_step })
     }
 }
@@ -524,6 +663,7 @@ struct DeviceStep {
     landed_reads: Vec<SubmittedRead>,
     stored_reads: Vec<StoredRead>,
     expert_step: Option<crate::experts::ExpertStep>,
+    decode_landings: Vec<(Arc<crate::experts::ExpertBank>, crate::experts::transport::DecodeLanding)>,
 }
 
 /// One launch of a chain once its readout is queued: its readout, its
@@ -1502,8 +1642,10 @@ impl NativeTargetProgram {
                             let rows = upload.actual_rows;
                             let (slots, front) = (&upload.row_slots[..rows], &upload.front[..rows]);
                             let positions = upload.coordinates[..rows].iter().map(|row| row[0] as u64);
+                            let tokens = matches!(launch.tokens(), crate::lanes::TargetTokens::Host(_))
+                                .then(|| &upload.tokens[..rows]);
                             step.decoding(
-                                decode_rows(positions, slots, front, upload.stop, |slot| {
+                                decode_rows(positions, slots, front, upload.stop, tokens, |slot| {
                                     launch.slot(slot).expect("a row's slot is in range").request
                                 })
                                 .into_iter(),
@@ -1573,6 +1715,7 @@ impl NativeTargetProgram {
                         stored_reads: Vec::new(),
                         landed_reads: Vec::new(),
                         expert_step: banked.map(|(_, step)| step),
+                        decode_landings: Vec::new(),
                     };
                     taken = runs.sequences;
                     (launch, step)
@@ -1584,6 +1727,7 @@ impl NativeTargetProgram {
                 let (_, last) = steps.last_mut();
                 last.stored_reads = submitter.reads;
                 last.landed_reads = submitter.landed;
+                last.decode_landings = submitter.decode_landings;
                 Ok(steps)
             }
             Err((error, steps)) => {
@@ -2000,6 +2144,31 @@ impl NativeTargetProgram {
             scored,
         };
         let stages = self.graphs.prepared.stages(index, rows);
+        // M7 on-demand async DMA decode landing (`DecodeFront -> batched
+        // cuMemcpyHtoDAsync -> cuStreamWaitEvent -> DecodeBack`) on partial
+        // discrete-GPU CUDA layers.
+        if crate::operators::routed::fused_graph::decodes(rows)
+            && run.bank.as_ref().is_some_and(|bank| bank.block_dma_decode(index, rows))
+        {
+            self.run_stage(run, index, &class, RunStage::DecodeFront, rotation, submitter)?;
+            let dma_wait_start = std::time::Instant::now();
+            submitter.flush_and_wait()?;
+            // Previous layer's `DecodeBack` preceded this `DecodeFront` on the
+            // same Compute stream, so its VRAM slots are now 100% done on GPU.
+            submitter.release_decode_landings();
+            if let Some(bank) = &run.bank {
+                if let Some(landing) = bank.land_decode_misses(index, rows).map_err(invalid)? {
+                    for sync in &landing.syncs {
+                        submitter.follow_transfer(sync.clone());
+                    }
+                    submitter.hold_decode_landing(bank.bank.clone(), landing);
+                }
+                bank.record_dma_host_wait(dma_wait_start.elapsed());
+            }
+            self.run_stage(run, index, &class, RunStage::DecodeBack, rotation, submitter)?;
+            run.back = None;
+            return Ok(());
+        }
         // A run whose block's streamed layer is whole takes the whole decode
         // block's resident form (`RunStage::Resident`).
         let resident = run.bank.as_ref().is_some_and(|bank| bank.block_decode_resident(index));
@@ -2121,17 +2290,28 @@ impl NativeTargetProgram {
         };
         let (graph, bound) = self.graphs.fill(index).map_err(invalid)?;
         let mut bindings = bound.bindings();
+        let mut prefill_dma = None;
         if let Some(bank) = &run.bank {
             bank.bind(graph, index, run.region.place, &self.unallocating(), &mut bindings).map_err(invalid)?;
             bank.bind_window(graph, index, window, &self.unallocating(), &mut bindings).map_err(invalid)?;
             bank.fill_followed(index, window, followed).map_err(invalid)?;
+            if let Some(layer) = bank.tier_copy_dma_layer(index).map_err(invalid)? {
+                prefill_dma = Some(PendingPrefillDma {
+                    bank: bank.bank.clone(),
+                    block: index,
+                    layer,
+                    place: run.region.place,
+                    sequence: bank.sequence,
+                    window,
+                });
+            }
         }
         let mut active = run.launch.graph_workspace.slot_mut().activate(&graph.plan).map_err(device)?;
         let ready = active
             .attach(bindings, graph.plan.new_outputs(&self.unallocating()).map_err(device)?)
             .map_err(device)?;
         let mut registered = Ok(());
-        submitter.fill(ready, |outputs| {
+        submitter.fill(ready, prefill_dma, |outputs| {
             registered = run.bank.as_ref().map_or(Ok(()), |bank| bank.register_fill_parks(graph, index, window, outputs));
         })?;
         registered.map_err(invalid)
@@ -2153,6 +2333,12 @@ impl NativeTargetProgram {
         reads: Option<(&crate::experts::ExpertBank, usize)>,
         submitter: &mut StepSubmitter,
     ) -> Result<(), SubmitError> {
+        // Enqueue producer-published host-tier -> VRAM scratch DMA for this
+        // `(index, set, window)` on `NativeQueue::Fill` right before `Pass` is
+        // queued on `NativeQueue::Compute`, so `Allocation::queue_order` emits
+        // `cuStreamWaitEvent(compute_stream, dma_done)` with zero
+        // `cuEventSynchronize` drains.
+        submitter.enqueue_prefill_dma(index, &set, window)?;
         let launches = runs.len();
         let mut backs = runs
             .iter_mut()
@@ -2313,14 +2499,15 @@ impl NativeTargetProgram {
                 bank.bind(graph, index, run.region.place, &self.unallocating(), &mut bindings).map_err(invalid)?;
             }
             if let Some(ports) = &graph.ports {
-                let SplitValues { crossing, merged } = run.region.group.split(index).map_err(invalid)?;
                 match ports {
                     SplitPorts::Front(ports) => {
+                        let SplitValues { crossing, .. } = run.region.group.split(index).map_err(invalid)?;
                         for (port, buffer) in ports.iter().zip(crossing.iter()) {
                             bindings.set(&self.unallocating(), port, &run.region.rows(buffer, rows)?).map_err(device)?;
                         }
                     }
                     SplitPorts::Back(ports) => {
+                        let SplitValues { crossing, merged } = run.region.group.split(index).map_err(invalid)?;
                         for (port, buffer) in ports.crossing.iter().zip(crossing.back().iter()) {
                             bindings.set(&self.unallocating(), port, &run.region.rows(buffer, rows)?).map_err(device)?;
                         }
@@ -2328,6 +2515,22 @@ impl NativeTargetProgram {
                         bindings
                             .set(&self.unallocating(), &ports.inverse, &run.region.rows(&merged.inverse, rows)?)
                             .map_err(device)?;
+                    }
+                    SplitPorts::DecodeFront(ports) | SplitPorts::DecodeBack(ports) => {
+                        let crossing = run.region.group.decode_crossing(index).map_err(invalid)?;
+                        let slice = |buffer: &seismic::Tensor| buffer.slice_leading(0, rows).map_err(device);
+                        bindings.set(&self.unallocating(), &ports.routes, &slice(&crossing.routes)?).map_err(device)?;
+                        bindings.set(&self.unallocating(), &ports.weights, &slice(&crossing.weights)?).map_err(device)?;
+                        bindings.set(&self.unallocating(), &ports.normalized, &slice(&crossing.normalized)?).map_err(device)?;
+                        if let (Some(port), Some(buffer)) = (&ports.coefficient, &crossing.coefficient) {
+                            bindings.set(&self.unallocating(), port, &slice(buffer)?).map_err(device)?;
+                        }
+                        if let (Some(port), Some(buffer)) = (&ports.shared_product, &crossing.shared_product) {
+                            bindings.set(&self.unallocating(), port, &slice(buffer)?).map_err(device)?;
+                        }
+                        let bank = bank.ok_or_else(|| invalid("M7 decode split stage without an expert bank"))?;
+                        let sources = bank.decode_sources_view(rows).map_err(invalid)?;
+                        bindings.set(&self.unallocating(), &ports.sources, &sources).map_err(device)?;
                     }
                 }
             }
@@ -2956,6 +3159,7 @@ impl TargetProgram for NativeTargetProgram {
                     landed_reads: queued.landed_reads,
                     stored_reads: queued.stored_reads,
                     expert_step: queued.expert_step,
+                    decode_landings: queued.decode_landings,
                 },
             )
         }))
@@ -2974,6 +3178,7 @@ fn decode_rows(
     slots: &[i32],
     front: &[bool],
     stop: &[i32],
+    tokens: Option<&[i32]>,
     request: impl Fn(usize) -> crate::operation::RequestId,
 ) -> Vec<DecodeRow> {
     positions
@@ -2987,7 +3192,11 @@ fn decode_rows(
                 let acceptable = of_slot().filter(|&other| !front[other]).count().saturating_sub(exact);
                 AheadOf::new(exact, acceptable, index)
             });
-            DecodeRow { position, request: request(slot), ahead }
+            let token = tokens
+                .and_then(|tokens| tokens.get(row).copied())
+                .and_then(|id| u32::try_from(id).ok())
+                .map(crate::operation::TokenId);
+            DecodeRow { position, request: request(slot), ahead, token }
         })
         .collect()
 }
@@ -2999,7 +3208,7 @@ mod decode_rows_tests {
 
     fn rows(slots: &[i32], front: &[bool], stop: &[i32]) -> Vec<Option<AheadOf>> {
         let requests = [RequestId(10), RequestId(11)];
-        let decoded = decode_rows((0..slots.len() as u64).map(|row| 100 + row), slots, front, stop, |slot| requests[slot]);
+        let decoded = decode_rows((0..slots.len() as u64).map(|row| 100 + row), slots, front, stop, None, |slot| requests[slot]);
         assert!(decoded.iter().enumerate().all(|(row, decoded)| decoded.position == 100 + row as u64 && decoded.request == requests[slots[row] as usize]));
         decoded.into_iter().map(|DecodeRow { ahead, .. }| ahead).collect()
     }

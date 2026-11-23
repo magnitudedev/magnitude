@@ -1,5 +1,5 @@
 use super::{BankGroup, BankLayers, ExpertBankPlan, HostTier, RecordForm, RecordTensor, RecordTensors, RoutedTensor};
-use super::records::{decode_choices, decode_set, record_bytes, records_slab};
+use super::records::{decode_choices, decode_set, record_bytes, record_slab};
 use seismic::Element;
 
 /// A staging pool: records of one routed tensor in one stored form, which
@@ -143,15 +143,22 @@ pub(super) struct Structured {
     /// `W`: scratch window slots (`round_records <= W <= widest`).
     window_slots: u64,
     lending: Lending,
-    granule: u64,
+    /// Deduplicated distinct record-slab granules across groups (1 for uniform
+    /// models), in order of first appearance.
+    granules: Vec<u64>,
+    /// Index into `granules` for each bank group.
+    group_pool: Vec<usize>,
+    /// Index into `granules` of the largest granule, which banked stored tables
+    /// (`BankTable`) claim from.
+    table_pool: usize,
 }
 
 impl Structured {
     /// The structure of `groups` over `layers`, `selected` experts a row,
     /// beside `host`, with its scratch bounded to `window_slots` (defaulting
-    /// to `widest`), its lending ([`BankStructure::lending`]) and its
-    /// records' granule ([`ExpertBankPlan::granule`]); or why its lending or
-    /// its granule cannot be made.
+    /// to `widest`), its lending ([`BankStructure::lending`]) and each group's
+    /// record slab granule ([`ExpertBankPlan::granules`]); or why its lending
+    /// or a granule cannot be made.
     pub(super) fn new(
         selected: u64,
         host: HostTier,
@@ -167,13 +174,46 @@ impl Structured {
             return Err(format!("scratch window slots {window_slots} must lie in {round}..={widest}"));
         }
         let lending = structure.lending()?;
-        let granule = records_slab(groups.iter().map(|group| &group.record))?.granule()?;
-        Ok(Self { selected, host, groups, layers, window_slots, lending, granule })
+        let mut granules = Vec::new();
+        let mut group_pool = Vec::with_capacity(groups.len());
+        for group in &groups {
+            let granule = record_slab(&group.record)?.granule()?;
+            let pool = match granules.iter().position(|&known| known == granule) {
+                Some(index) => index,
+                None => {
+                    granules.push(granule);
+                    granules.len() - 1
+                }
+            };
+            group_pool.push(pool);
+        }
+        let table_pool = granules
+            .iter()
+            .enumerate()
+            .max_by_key(|&(_, &g)| g)
+            .expect("a bank holds a group")
+            .0;
+        Ok(Self { selected, host, groups, layers, window_slots, lending, granules, group_pool, table_pool })
     }
 
-    /// [`ExpertBankPlan::granule`].
-    pub(super) fn granule(&self) -> u64 {
-        self.granule
+    /// [`ExpertBankPlan::granules`].
+    pub(super) fn granules(&self) -> &[u64] {
+        &self.granules
+    }
+
+    /// [`ExpertBankPlan::group_pools`].
+    pub(super) fn group_pools(&self) -> &[usize] {
+        &self.group_pool
+    }
+
+    /// [`ExpertBankPlan::table_pool`].
+    pub(super) fn table_pool(&self) -> usize {
+        self.table_pool
+    }
+
+    /// [`ExpertBankPlan::table_granule`].
+    pub(super) fn table_granule(&self) -> u64 {
+        self.granules[self.table_pool]
     }
 
     /// [`ExpertBankPlan::window_slots`].
@@ -218,24 +258,39 @@ impl ExpertBankPlan {
         self.structured.selected
     }
 
-    /// The bytes of a granule of the bank's records' pools (its store's
-    /// records pool, and a linked host tier's): the largest group's record
-    /// slab ([`Self::regions`]) at a multiple of every one's alignment,
-    /// whatever the state beside it, which is pooled at its own granule
-    /// (`StateStorePlan::granule`). A record of every group takes one, and
-    /// so does each of a stored table's records (`BankTable`).
-    pub fn granule(&self) -> u64 {
-        self.structured.granule
+    /// The deduplicated distinct record-slab granules across the bank's groups
+    /// (1 for uniform models), in order of first appearance: each group claims
+    /// records from the pool of its own granule ([`Self::group_pool`],
+    /// [`Self::group_granule`]), so smaller groups are never charged a larger
+    /// group's slab size.
+    pub fn granules(&self) -> &[u64] {
+        self.structured.granules()
     }
 
-    /// The bytes of a granule of a linked host tier's own pool, which holds
-    /// only its records: the bank's granule ([`Self::granule`]); none
-    /// without a linked tier.
-    pub fn host_granule(&self) -> Option<u64> {
-        match self.structured.host {
-            HostTier::Linked => Some(self.structured.granule),
-            HostTier::Unified(_) => None,
-        }
+    /// The index into [`Self::granules`] (and [`Self::blocks`]) for bank group `group`.
+    pub fn group_pool(&self, group: usize) -> usize {
+        self.structured.group_pools()[group]
+    }
+
+    /// Each bank group's index into [`Self::granules`].
+    pub fn group_pools(&self) -> &[usize] {
+        self.structured.group_pools()
+    }
+
+    /// The bytes of a granule of group `group`'s records pool.
+    pub fn group_granule(&self, group: usize) -> u64 {
+        self.structured.granules()[self.group_pool(group)]
+    }
+
+    /// The index into [`Self::granules`] of the pool holding banked stored
+    /// tables (`BankTable`): the largest granule pool.
+    pub fn table_pool(&self) -> usize {
+        self.structured.table_pool()
+    }
+
+    /// The granule bytes of the pool holding banked stored tables (`BankTable`).
+    pub fn table_granule(&self) -> u64 {
+        self.structured.table_granule()
     }
 
     /// What its device gives it ([`BankSubstrate`]).

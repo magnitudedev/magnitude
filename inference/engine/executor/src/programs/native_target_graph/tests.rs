@@ -128,7 +128,7 @@ mod upload_region_tests {
             }
         };
         let upload = |rows: u64, stage: RunStage| match stage {
-            RunStage::Whole | RunStage::Resident => 40,
+            RunStage::Whole | RunStage::Resident | RunStage::DecodeFront | RunStage::DecodeBack => 40,
             RunStage::Front => 100 * rows,
             RunStage::Combine => 4,
         };
@@ -572,7 +572,7 @@ mod resource_template_tests {
         };
         let enumeration = enumerate_block_graphs(
             &outline,
-            &block_served(&load, geometry, limits, 64, passes).unwrap(),
+            &block_served(BackendName::Cpu, &load, geometry, limits, 64, passes).unwrap(),
             passes,
             &state,
             plan.target(),
@@ -1063,7 +1063,7 @@ mod resource_template_tests {
                 let passes = certificate.passes;
                 let pass_rows = passes.rows();
                 assert!(pass_rows <= chain_rows && passes.region == 64, "{passes:?}");
-                let served = block_served(&load, geometry, limits, chain_rows, passes).unwrap();
+                let served = block_served(BackendName::Cpu, &load, geometry, limits, chain_rows, passes).unwrap();
                 // Resident experts split only to merge a chain's launches.
                 for (index, block) in served.iter().enumerate() {
                     let routed = block_routed(geometry, index).unwrap().is_some();
@@ -1486,5 +1486,134 @@ mod sinkhorn_graph_tests {
             super::super::classes::slot_classes(128).collect::<Vec<_>>(),
             vec![1, 2, 4, 8, 16, 32, 64, 128]
         );
+    }
+
+    /// M7 `RunStage::DecodeFront` and `RunStage::DecodeBack` graphs must seal
+    /// with zero unbound ports (`NativePortUnbound`) on CUDA discrete-GPU
+    /// (`HostTier::Linked`, `Placer::Tier`, partial bank `!whole`) for general
+    /// (`routed_fixture_definition`), fused (`qwen4exp`), and Sinkhorn-streamed
+    /// general (`sinkhorn_fixture_definition`) routed blocks. On Sinkhorn blocks,
+    /// `DecodeFront` must export the mixer's carry without joining the
+    /// feed-forward branch (`stream_join` count == 0, matching `Front`), while
+    /// `DecodeBack` performs the single feed-forward `stream_join` (`== 1`).
+    #[test]
+    fn decode_front_and_back_bind_every_port_on_cuda_discrete_tier() {
+        use crate::planning::{HostTier, fixtures};
+        let general_def = fixtures::routed_fixture_definition(fixtures::RoutedShape {
+            layers: 3,
+            experts: 64,
+            selected: 4,
+            hidden: 512,
+            intermediate: 512,
+        });
+        let general_manifest = fixtures::gemma_moe_fixture_manifest(&general_def);
+        let qwen_def = fixtures::qwen4exp_fixture_definition_of(1, 64);
+        let qwen_manifest = fixtures::streamed_experts_manifest(&qwen_def);
+        let mut sinkhorn_def = fixtures::sinkhorn_fixture_definition(2);
+        for block in &mut sinkhorn_def.decoder.blocks {
+            if let magnitude_family_contracts::Operator::RoutedFfn(routed) = &mut block.sublayers[1].op {
+                routed.selected = 4;
+            }
+        }
+        let sinkhorn_manifest = fixtures::fixture_manifest(&sinkhorn_def);
+        let cases = [
+            ("general (64 experts)", (general_def, general_manifest), false),
+            ("qwen4exp fused (64 experts)", (qwen_def, qwen_manifest), false),
+            ("sinkhorn general (32 experts, top-4)", (sinkhorn_def, sinkhorn_manifest), true),
+        ];
+        let codec = KvCodec::Dense;
+        let limits = fixtures::LIMITS;
+        let backend = BackendName::Cuda;
+        for (label, (definition, manifest), is_sinkhorn) in cases {
+            let selection = ComponentSelection { head: false, vision: false };
+            let layout = resident_layout(ExecutionPath::Native, backend);
+            let resident = ModelLoadPlan::derive(&manifest, &definition, selection, layout, PlannedMethod::Plain, limits)
+                .unwrap_or_else(|e| panic!("{label}: derive failed: {e}"));
+            let substrate = crate::planning::bank_substrate(
+                backend,
+                seismic::NativeAllocations::EXACT,
+                Some(HostTier::Linked),
+                &definition,
+            )
+            .unwrap_or_else(|e| panic!("{label}: bank_substrate failed: {e}"));
+            let load = resident
+                .with_expert_bank_at_floor(&definition, substrate)
+                .unwrap_or_else(|e| panic!("{label}: with_expert_bank_at_floor failed: {e}"));
+            assert!(
+                !load.expert_bank().expect("bank").whole(),
+                "{label}: test fixture must be a partial bank so DecodeFront/DecodeBack are sealed"
+            );
+            let capacity = ResourceCapacity {
+                domain_bytes: 1 << 30,
+                tensor_operations: crate::TensorOperations::Absent,
+                allocations: seismic::NativeAllocations::EXACT,
+            };
+            let state = ResourcePlanner::state_plan(&definition, &load, PlannedMethod::Plain, codec, limits, capacity)
+                .unwrap_or_else(|e| panic!("{label}: state_plan failed: {e}"));
+            let plan = load
+                .program_plan(&definition, codec)
+                .unwrap_or_else(|e| panic!("{label}: program_plan failed: {e}"));
+            let certified = certify_target_family::<NativeGraphLayout>(
+                backend,
+                &load,
+                &definition.decoder,
+                &state,
+                plan.target(),
+                limits,
+                crate::PassLaunches::whole_chain(limits),
+            )
+            .unwrap_or_else(|e| panic!("{label}: certify_target_family failed: {e}"));
+            let mut saw_front = false;
+            let mut saw_back = false;
+            for block in &certified.blocks {
+                for &(_, _, _, stage, _) in block.keys() {
+                    if stage == Stage::Run(RunStage::DecodeFront) {
+                        saw_front = true;
+                    }
+                    if stage == Stage::Run(RunStage::DecodeBack) {
+                        saw_back = true;
+                    }
+                }
+            }
+            assert!(saw_front && saw_back, "{label}: expected both DecodeFront and DecodeBack stages to be sealed");
+            // Verify `routed_site_request` runs at the tail of `DecodeFront`
+            // (overlapping CPU `expert-compute` with host-driven `DecodeDma`)
+            // and never in `DecodeBack` (which only awaits `routed_*_sited`).
+            let sited = load.expert_bank().expect("bank").sited(0);
+            for (stage, expected_site_requests, expected_joins) in [
+                (RunStage::Whole, usize::from(sited), 1usize),
+                (RunStage::DecodeFront, usize::from(sited), 0usize),
+                (RunStage::DecodeBack, 0usize, 1usize),
+            ] {
+                let inputs = BlockGraphInputs::of_class(
+                    &load,
+                    &definition.decoder,
+                    &state,
+                    0,
+                    ((1, 1, 1, 0, 0), Stage::Run(stage)),
+                    1,
+                    BlockCarries::default(),
+                );
+                let (draft, _, _) = checked_block_graph_draft(
+                    NativeGraphMetadata::new(backend),
+                    plan.target().blocks()[0],
+                    None,
+                    inputs,
+                )
+                .unwrap_or_else(|e| panic!("{label}: {stage:?} draft failed: {e}"));
+                assert_eq!(
+                    draft.entry_count("routed_site_request"),
+                    expected_site_requests,
+                    "{label}: {stage:?} routed_site_request count mismatch"
+                );
+                if is_sinkhorn {
+                    assert_eq!(
+                        draft.entry_count("stream_join"),
+                        expected_joins,
+                        "{label}: {stage:?} stream_join count mismatch"
+                    );
+                }
+            }
+        }
     }
 }

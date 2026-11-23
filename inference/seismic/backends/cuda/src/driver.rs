@@ -804,7 +804,7 @@ impl Drop for Stream {
 /// CUDA event pair timing uses the device event timebase. Elapsed values are
 /// returned in nanoseconds without discarding the driver's fractional
 /// millisecond resolution; uncertainty is attached by profile acquisition.
-pub(crate) struct Event {
+pub struct Event {
     raw: Handle,
     context: Arc<Context>,
 }
@@ -821,6 +821,9 @@ unsafe impl Sync for Event {}
 /// driving thread of a decode step. Every host wait on the device therefore
 /// goes through such an event ([`Context::synchronize`], [`Event::new`]).
 const EVENT_BLOCKING_SYNC: c_uint = 0x1;
+/// `CU_EVENT_DISABLE_TIMING`: an event used only for stream ordering
+/// (`cuStreamWaitEvent`), with no GPU timestamp overhead.
+const EVENT_DISABLE_TIMING: c_uint = 0x2;
 
 impl Event {
     /// An event whose synchronization blocks ([`EVENT_BLOCKING_SYNC`]).
@@ -832,6 +835,11 @@ impl Event {
     /// it, so recording it wakes no host.
     pub fn stamp(context: &Arc<Context>) -> Result<Self, DriverError> {
         Self::with_flags(context, 0)
+    }
+
+    /// A stream-ordering event with timing disabled ([`EVENT_DISABLE_TIMING`]).
+    pub(crate) fn sync_only(context: &Arc<Context>) -> Result<Self, DriverError> {
+        Self::with_flags(context, EVENT_DISABLE_TIMING)
     }
 
     fn with_flags(context: &Arc<Context>, flags: c_uint) -> Result<Self, DriverError> {

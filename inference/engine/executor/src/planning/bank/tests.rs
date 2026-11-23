@@ -152,12 +152,12 @@ fn bank_of(groups: &[usize], slots: u64, experts: impl Fn(usize) -> u64, form: R
     let layers = BankLayers::new(layers).unwrap();
     let structured = conveyor::Structured::new(8, HostTier::Linked, groups, layers, None).unwrap();
     let allocations = seismic::NativeAllocations::EXACT;
-    let block = seismic::block_bytes(seismic::BlockSizing { granule: structured.granule(), allocations }).unwrap();
+    let blocks = size_pool_blocks(structured.granules(), allocations).unwrap();
     ExpertBankPlan {
         structured,
         backend: seismic::BackendName::Cuda,
         allocations,
-        block,
+        blocks,
         slots,
         ceiling: slots,
         resident: false,
@@ -193,12 +193,8 @@ fn restructured(
     let (selected, mut host, mut groups, layers) = plan.structured.into_parts();
     change(&mut host, &mut groups);
     let structured = conveyor::Structured::new(selected, host, groups, layers, None).unwrap();
-    let block = seismic::block_bytes(seismic::BlockSizing {
-        granule: structured.granule(),
-        allocations: plan.allocations,
-    })
-    .unwrap();
-    ExpertBankPlan { structured, block, ..plan }
+    let blocks = size_pool_blocks(structured.granules(), plan.allocations).unwrap();
+    ExpertBankPlan { structured, blocks, ..plan }
 }
 
 /// `plan` with its scratch bounded to `window_slots` experts of a layer,
@@ -336,13 +332,14 @@ fn multi_quant_conveyor_shares_one_slot_array_and_linked_uses_two_rounds() {
     assert!(layout.bytes.gate.unwrap() < records * sum_down, "3 down pools share one slot array, not end-to-end");
 }
 
-/// A bank's granule holds a record of every group, a slab of its regions
-/// (each routed tensor's resident record, in its record's order), and no
-/// more: the largest group's slab at a multiple of every slab's alignment,
-/// whatever state is pooled beside it (each class at its own granule); a
-/// linked tier's own pool has the same granule, and a unified bank none.
+/// Each bank group gets its own record-slab granule (deduplicated across
+/// identical groups, so uniform models still open 1 pool), so a mixed-quant
+/// bank charges `sum(group_granule * group_records)` instead of
+/// `max_granule * total_records` for both VRAM and Host RAM, and a linked host
+/// tier sizes its host pools at 4 KiB host page granularity rather than VRAM's
+/// 2 MiB granularity.
 #[test]
-fn a_banks_granule_is_its_largest_record_slab() {
+fn per_group_granules_charge_each_groups_own_slab_on_vram_and_host() {
     let plan = bank(&[3, 1], 64);
     let slabs = (0..plan.groups().len())
         .map(|group| {
@@ -355,14 +352,65 @@ fn a_banks_granule_is_its_largest_record_slab() {
     for (group, slab) in slabs.iter().enumerate() {
         let record = plan.groups()[group].record.iter().map(|(_, tensor)| tensor.record_bytes().unwrap()).sum::<u64>();
         assert!(slab.bytes >= record, "group {group}'s slab holds its record");
+        assert_eq!(plan.group_granule(group), slab.granule().unwrap(), "group {group} gets its own exact slab granule");
     }
-    let both = slabs[0].with(slabs[1]).unwrap();
-    assert_eq!(plan.granule(), both.bytes.next_multiple_of(both.alignment), "the largest record slab, aligned for every one");
-    assert_eq!(plan.host_granule(), Some(plan.granule()), "a linked tier pools its records at the bank's granule");
-    assert_eq!(beside(plan.clone(), HostTier::Unified(Parking::InKernels)).host_granule(), None);
-    // Each record committed past the lent ones is a granule of its pool.
-    let charge = (0..plan.groups().len()).map(|group| plan.records_at(group, 64) - plan.lent(group)).sum::<u64>() * plan.granule();
-    assert_eq!(plan.resident_charge(64).unwrap(), charge);
+    let small_granule = plan.group_granule(0);
+    let large_granule = plan.group_granule(1);
+    assert!(small_granule < large_granule, "q4k group granule ({small_granule}) must be smaller than q6k group granule ({large_granule})");
+    assert_eq!(plan.granules(), &[small_granule, large_granule], "distinct granules deduplicated in group order");
+    assert_eq!(plan.group_pools(), &[0, 1]);
+    assert_eq!(plan.table_granule(), large_granule, "banked stored tables use the largest granule pool");
+    assert!(plan.tiered());
+    assert!(!beside(plan.clone(), HostTier::Unified(Parking::InKernels)).tiered());
+
+    // VRAM charge at slots = 128 (past group 0's lent scratch records, so BOTH
+    // groups hold pooled records): each group is charged its own granule (under
+    // EXACT allocations), strictly less than charging all groups at max_granule.
+    let slots = 128;
+    assert!(plan.records_at(0, slots) > plan.lent(0), "group 0 must hold pooled VRAM records at {slots} slots");
+    assert!(plan.records_at(1, slots) > plan.lent(1), "group 1 must hold pooled VRAM records at {slots} slots");
+    let vram_expected: u64 = (0..plan.groups().len())
+        .map(|group| (plan.records_at(group, slots) - plan.lent(group)) * plan.group_granule(group))
+        .sum();
+    let vram_max_granule: u64 = (0..plan.groups().len())
+        .map(|group| plan.records_at(group, slots) - plan.lent(group))
+        .sum::<u64>()
+        * large_granule;
+    assert_eq!(plan.resident_charge(slots).unwrap(), vram_expected);
+    assert!(vram_expected < vram_max_granule, "per-group VRAM charge ({vram_expected}) must save over max-granule ({vram_max_granule})");
+
+    // Host RAM charge: each group charged its own granule in the device's
+    // native allocation blocks (matching Linux 2 MiB large-page registration
+    // granularity), strictly less than charging all groups at max_granule.
+    let blocks = plan.blocks();
+    let host_expected: u64 = (0..plan.groups().len())
+        .map(|group| {
+            let pool = plan.group_pool(group);
+            let pooled = plan.host_records(group, 64) - plan.host_lent(group);
+            blocks[pool].charge(plan.group_granule(group), pooled).unwrap()
+        })
+        .sum();
+    let host_max_granule: u64 = (0..plan.groups().len())
+        .map(|group| plan.host_records(group, 64) - plan.host_lent(group))
+        .sum::<u64>()
+        * large_granule;
+    assert_eq!(plan.host_charge(64).unwrap(), host_expected);
+    assert!(host_expected < host_max_granule, "per-group Host charge ({host_expected}) must save over max-granule ({host_max_granule})");
+
+    // Uniform 1-group bank opens only 1 distinct granule pool (zero overhead).
+    let uniform = bank(&[4], 64);
+    assert_eq!(uniform.granules().len(), 1);
+    assert_eq!(uniform.blocks().len(), 1);
+
+    // Under CUDA's 2 MiB granularity, a 1.4 MiB granule packs multiple records
+    // per block so linked host tiers batch `cuMemHostRegister` into 2 MiB-aligned
+    // large-page blocks rather than 1-record allocations.
+    let cuda_allocs = seismic::NativeAllocations { least: 0, granularity: 2 << 20 };
+    let cuda_blocks = size_pool_blocks(&[1_468_006u64.next_multiple_of(4096)], cuda_allocs).unwrap();
+    assert!(
+        cuda_blocks[0].granules(1_468_006u64.next_multiple_of(4096)) > 1,
+        "2 MiB registration granularity must batch multiple ~1.4 MiB records per block"
+    );
 }
 
 /// A host tier grows in one step from `from` toward every expert, its
@@ -488,12 +536,16 @@ fn a_host_tier_holds_each_groups_records_in_their_resident_form() {
     }
     assert!(without.layout().unwrap().host.is_none());
     assert_eq!(layout.staging, without.layout().unwrap().staging, "staging is the tier's alike");
-    // Charged a granule of the tier's pool a record past the lent ones,
-    // which their lent allocation holds.
-    let granule = plan.host_granule().unwrap();
+    // Charged each group's granule in its host pool's blocks past the lent
+    // ones, which their lent allocation holds.
+    let blocks = plan.blocks();
+    let charge_host = |g0: u64, g1: u64| {
+        blocks[0].charge(plan.group_granule(0), g0).unwrap()
+            + blocks[1].charge(plan.group_granule(1), g1).unwrap()
+    };
     assert_eq!(plan.host_lent(0), lent);
-    assert_eq!(plan.host_charge(30).unwrap(), (90 + 80) * granule);
-    assert_eq!(plan.host_charge(0).unwrap(), (80 + 80) * granule);
+    assert_eq!(plan.host_charge(30).unwrap(), charge_host(90, 80));
+    assert_eq!(plan.host_charge(0).unwrap(), charge_host(80, 80));
     assert_eq!(without.host_charge(2).unwrap(), 0);
     // A host tier adds its records, host memory, and the words the
     // device serves from it by: each layer's tier map; and each layer's
@@ -700,9 +752,10 @@ fn a_slot_commits_a_record_of_every_layer() {
             .sum::<u64>()
     };
     assert_eq!(records(&large) - records(&small), small.slot_bytes().unwrap());
-    // A record of each of the five layers, a granule each.
+    // A record of each of the five layers, its own group's granule each.
     let pooled = large.resident_charge(130).unwrap() - small.resident_charge(129).unwrap();
-    assert_eq!(pooled, 5 * small.granule());
+    let expected_pooled: u64 = small.layers().iter().map(|layer| small.group_granule(layer.group)).sum();
+    assert_eq!(pooled, expected_pooled);
     assert_eq!(
         large.charged_beyond_records().unwrap() - small.charged_beyond_records().unwrap(),
         pooled - small.slot_bytes().unwrap(),
@@ -774,7 +827,7 @@ fn a_bank_holds_its_stored_table_in_granule_records() {
     let [table] = &bank.tables[..] else {
         panic!("the bank holds the stored table");
     };
-    let granule = bank.granule();
+    let granule = bank.table_granule();
     let row = representation_bytes(fixed.resident, &[1, width]).unwrap();
     let (records, record_rows, record_bytes) = (table.records.get(), table.record_rows.get(), table.record_bytes.get());
     assert_eq!(record_rows, granule / row);
@@ -791,8 +844,8 @@ fn a_bank_holds_its_stored_table_in_granule_records() {
     // spare granules in the last block, the bank's pool's, which the bank
     // is charged beyond its records' (`ExpertBankPlan::storage_beyond_records`).
     assert_eq!(held.resident_bytes, BankTable::held_bytes(granule, records).unwrap());
-    assert_ne!(records % bank.block().granules(granule), 0, "the table's records leave spare granules in their last block");
-    let blocks = BankTable::charge(bank.block(), granule, records).unwrap();
+    assert_ne!(records % bank.table_block().granules(granule), 0, "the table's records leave spare granules in their last block");
+    let blocks = BankTable::charge(bank.table_block(), granule, records).unwrap();
     assert!(blocks > held.resident_bytes);
     assert_eq!(bank.tables_charge().unwrap(), blocks);
     let bare = ExpertBankPlan { tables: Vec::new(), ..bank.clone() };
@@ -884,9 +937,9 @@ fn a_bank_plans_every_routed_layer_into_its_groups_records() {
     }
     assert_eq!(three.target().iter().filter(|weight| weight.banked().is_some()).count(), 6);
     // A slot past the floor commits a record of each layer, a granule of
-    // the pool each.
-    assert_eq!(four.weight_bytes().unwrap() - three.weight_bytes().unwrap(), 2 * bank.granule());
-    assert!(bank.granule() >= bank.slot_bytes().unwrap() / 2);
+    // its group's pool each.
+    assert_eq!(four.weight_bytes().unwrap() - three.weight_bytes().unwrap(), 2 * bank.group_granule(0));
+    assert!(bank.group_granule(0) >= bank.slot_bytes().unwrap() / 2);
     let programs = three
         .program_plan(&definition, magnitude_state::KvCodec::AffineK8V4)
         .unwrap();
@@ -1414,4 +1467,60 @@ fn layers_with_different_shared_down_quants_get_distinct_routed_kinds_in_census(
     };
     let census = Census::new([call("q4k", 1024, 0), call("q6k", 1536, 1)], 0, decode_rows);
     assert_eq!(census.kinds().len(), 2);
+}
+
+/// On unified memory (`HostTier::Unified`, where lent allocations live in
+/// `Contract::Shared` while pooled records live in `device`), growing a
+/// mixed-quant bank from `floor` to any `slots > floor` — including while the
+/// lender group is still below `lent(lender)` — must keep `shared` constant
+/// and grow `device` monotonically by `resident_charge(slots) - resident_charge(floor)`,
+/// so `full.checked_minus(floor_demand)` never underflows.
+#[test]
+fn unified_mixed_quant_target_weight_demand_never_underflows_floor() {
+    let mut plan = beside(bank(&[3, 1], 64), HostTier::Unified(Parking::InKernels));
+    let floor = plan.floor();
+    let widest = plan.widest().get();
+    plan.slots = floor;
+    plan.ceiling = widest;
+    let mut target = Vec::new();
+    for (index, layer) in plan.layers().iter().enumerate() {
+        let banked = plan.banked_bytes(index).unwrap();
+        for (kind, mut weight) in layer.resident.clone().into_tensors() {
+            weight.role = WeightRole {
+                scope: WeightScope::TargetSublayer(magnitude_family_contracts::SublayerIndex { block: index as u32, sublayer: 0 }),
+                kind: kind.kind(),
+            };
+            weight.descriptor.name = format!("layer{index}.{kind:?}");
+            weight.shape[0] = plan.records(layer.group);
+            weight.source_bytes = 0;
+            weight.resident_bytes = *banked.get(kind).unwrap();
+            weight.holding = Holding::Banked { group: layer.group };
+            target.push(weight);
+        }
+    }
+    let load = ModelLoadPlan::for_bank_test(target, plan);
+
+    let floor_plan = load.clone().with_load_slots(floor, 0).unwrap();
+    let floor_demand = floor_plan.target_weight_demand().unwrap();
+    let floor_bank = floor_plan.expert_bank().unwrap();
+    let floor_resident = floor_bank.resident_charge(floor).unwrap();
+
+    // Exercise the exact regime where `slots > floor` while the lender group
+    // (group 0) still commits only its lent records.
+    let mut exercised_lent_regime = false;
+    for slots in floor..=widest {
+        let sized = load.clone().with_load_slots(slots, 0).unwrap();
+        let full = sized.target_weight_demand().unwrap();
+        let delta = full
+            .checked_minus(floor_demand)
+            .unwrap_or_else(|| panic!("bank growth demand underflowed floor demand at slots={slots} (floor={floor})"));
+        let resident = sized.expert_bank().unwrap().resident_charge(slots).unwrap();
+        assert_eq!(delta.shared, 0, "shared/lent demand must stay constant at slots={slots}");
+        assert_eq!(delta.device, resident - floor_resident, "device delta must equal pooled record growth at slots={slots}");
+        assert_eq!(delta.host, 0);
+        if slots > floor && floor_bank.records_at(0, slots) == floor_bank.least_records(0) {
+            exercised_lent_regime = true;
+        }
+    }
+    assert!(exercised_lent_regime, "test must exercise slots > floor while lender group is still at its lent floor");
 }

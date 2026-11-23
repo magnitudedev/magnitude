@@ -84,6 +84,48 @@ impl BankRun {
         };
         self.serving.layer_whole(layer)
     }
+
+    /// Whether M7 on-demand async DMA decode landing (`DecodeFront -> DMA -> DecodeBack`)
+    /// is active for block `index` over `rows` rows (partial layer on CUDA `Placer::Tier`).
+    pub(crate) fn block_dma_decode(&self, index: usize, rows: u64) -> bool {
+        let Ok(layer) = block_layer(self.bank.plan(), index) else {
+            return false;
+        };
+        !self.serving.layer_whole(layer) && self.bank.dma_decode_active(layer, rows)
+    }
+
+    /// Contiguous `[SOURCE_ROWS, rows, K] i32` view of pinned `DecodeSources`.
+    pub(crate) fn decode_sources_view(&self, rows: u64) -> Result<seismic::Tensor, String> {
+        self.bank.decode_sources_view(rows)
+    }
+
+    /// Batch-DMA unpredicted host-tier misses (`source <= -2`) for block `index`
+    /// after `DecodeFront` completes, joining any in-flight `LinkMover` hint
+    /// transfers and returning the `DecodeLanding` (`TransferSync` events +
+    /// pinning consumer leases) for `DecodeBack` (or `None` when all choices
+    /// are already resident/staged).
+    pub(crate) fn land_decode_misses(
+        &self,
+        index: usize,
+        rows: u64,
+    ) -> Result<Option<crate::experts::transport::DecodeLanding>, String> {
+        let layer = block_layer(self.bank.plan(), index)?;
+        self.bank.land_decode_misses(layer, self.sequence, rows)
+    }
+
+    /// If prefill copies host-tier experts into VRAM scratch via hardware DMA
+    /// (`ExpertBank::tier_copy_dma`), returns the streamed layer index for
+    /// block `index`; otherwise `None`.
+    pub(crate) fn tier_copy_dma_layer(&self, index: usize) -> Result<Option<usize>, String> {
+        if !self.bank.tier_copy_dma() {
+            return Ok(None);
+        }
+        block_layer(self.bank.plan(), index).map(Some)
+    }
+
+    pub(crate) fn record_dma_host_wait(&self, elapsed: std::time::Duration) {
+        self.bank.record_dma_host_wait(elapsed);
+    }
     /// Bind `graph`'s bank parts for this run as block `index` at chain
     /// place `place` (`placed_banks`), and its park and publication nodes
     /// to the bank's park timeline (`crate::experts::Parks`); the run takes
@@ -287,6 +329,10 @@ pub(crate) struct GroupBuffers {
     /// buffers, of a load whose blocks split.
     split: Option<SplitValues<seismic::Tensor>>,
     blocks: Vec<Option<SplitValues<seismic::Tensor>>>,
+    /// M7 decode-split crossing buffers (~150 KiB total), reused sequentially
+    /// across layers in `DecodeFront -> DecodeBack`.
+    decode_crossing: Option<crate::operators::routed::split::DecodeCrossingBuffers<seismic::Tensor>>,
+    decode_blocks: Vec<Option<crate::operators::routed::split::DecodeCrossingBuffers<seismic::Tensor>>>,
     /// Per place, the two operand carries its run alternates between, of a
     /// load whose decode graphs carry (`GroupExtents::operand_carry`):
     /// a block's graph reads the one the block before wrote and writes the
@@ -327,6 +373,28 @@ impl GroupBuffers {
             // No block splits.
             None => Vec::new(),
         };
+        let decode_crossing = extents
+            .decode_crossing
+            .as_ref()
+            .map(|values| {
+                Ok::<_, AllocationError>(crate::operators::routed::split::DecodeCrossingBuffers {
+                    routes: zeros(charges, &values.routes)?,
+                    weights: zeros(charges, &values.weights)?,
+                    normalized: zeros(charges, &values.normalized)?,
+                    coefficient: values.coefficient.as_ref().map(|v| zeros(charges, v)).transpose()?,
+                    shared_product: values.shared_product.as_ref().map(|v| zeros(charges, v)).transpose()?,
+                })
+            })
+            .transpose()?;
+        let decode_blocks = match &decode_crossing {
+            Some(buffers) => prepared
+                .served
+                .iter()
+                .map(|block| block.decode_crossing.as_ref().map(|layer| buffers.view(layer)).transpose())
+                .collect::<Result<Vec<_>, String>>()
+                .map_err(invariant)?,
+            None => Vec::new(),
+        };
         let allocate = |value: &Option<Extents>| value.as_ref().map(|value| zeros(charges, value)).transpose();
         let operands = match &extents.operand_carry {
             None => Vec::new(),
@@ -345,6 +413,8 @@ impl GroupBuffers {
             kept_guesses: allocate(&extents.guesses)?,
             split,
             blocks,
+            decode_crossing,
+            decode_blocks,
             operands,
         })
     }
@@ -368,11 +438,30 @@ impl GroupBuffers {
             .ok_or_else(|| format!("block {index} splits without a routed layer"))
     }
 
+    /// Block `index`'s routed layer's views of the M7 decode crossing buffers.
+    pub(crate) fn decode_crossing(
+        &self,
+        index: usize,
+    ) -> Result<&crate::operators::routed::split::DecodeCrossingBuffers<seismic::Tensor>, String> {
+        self.decode_blocks
+            .get(index)
+            .and_then(Option::as_ref)
+            .ok_or_else(|| format!("block {index} decode-splits without crossing buffers"))
+    }
+
     /// The buffers the group owns.
     fn storage(&self) -> impl Iterator<Item = &seismic::Tensor> {
         let split = self.split.iter().flat_map(|split| split.crossing.iter().chain([&split.merged.inverse]));
+        let decode_crossing = self.decode_crossing.iter().flat_map(|c| c.iter());
         let operands = self.operands.iter().flatten().flatten();
-        self.taps.iter().chain(&self.per_layer_rows).chain(&self.token_rows).chain(&self.kept_guesses).chain(split).chain(operands)
+        self.taps
+            .iter()
+            .chain(&self.per_layer_rows)
+            .chain(&self.token_rows)
+            .chain(&self.kept_guesses)
+            .chain(split)
+            .chain(decode_crossing)
+            .chain(operands)
     }
 }
 

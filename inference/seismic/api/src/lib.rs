@@ -835,6 +835,25 @@ impl Device {
             inner: seismic_runtime::native::graph::NativeGraphSequence::new(&self.inner, queue),
         }
     }
+    /// Queue byte-identical copies on the device's fill queue
+    /// (`NativeQueue::Fill`), ordered against compute work by allocation
+    /// hazards (on CUDA: `cuMemcpyHtoDAsync` / `cuMemcpyDtoDAsync` on
+    /// `NativeStream::Fill`, followed by `cuEventRecord` so subsequent
+    /// `NativeQueue::Compute` readers wait via `cuStreamWaitEvent`).
+    pub fn submit_fill_copies(&self, runs: &[TransferRun<'_>]) -> Result<NativeGraphCompletion, CallError> {
+        let runs = runs
+            .iter()
+            .map(|run| seismic_runtime::native::FillCopyRun {
+                source: run.source.inner(),
+                source_offset: run.source_offset,
+                destination: run.destination.inner(),
+                destination_offset: run.destination_offset,
+                bytes: run.bytes,
+            })
+            .collect::<Vec<_>>();
+        seismic_runtime::native::submit_fill_copies(&self.inner, &runs)
+            .map(|inner| NativeGraphCompletion { inner })
+    }
     /// The native programs this device has formed (compiled, or loaded from
     /// its artifact store) and the seconds forming took: for checks that
     /// preparation forms nothing, and a load's account of its time.
@@ -1555,6 +1574,14 @@ pub enum TransferItem<'a> {
     },
 }
 
+/// A device-side completion handle for a [`Transfer`] batch, which a
+/// [`NativeGraphSequence`] can wait on via cross-stream event synchronization
+/// (`cuStreamWaitEvent` on CUDA) without blocking the host.
+#[derive(Clone)]
+pub struct TransferSync {
+    inner: seismic_runtime::native::transfer::TransferSync,
+}
+
 impl Transfer {
     /// The transfer queue of `device`; why it has none.
     pub fn new(device: &Device) -> Result<Self, TransferError> {
@@ -1567,6 +1594,25 @@ impl Transfer {
     /// queues it only once the device work that read the bytes it
     /// overwrites has ended.
     pub fn copy(&self, items: &[TransferItem<'_>]) -> Result<u64, TransferError> {
+        self.copy_with(items, |inner, items| inner.copy(items))
+    }
+
+    /// [`Self::copy`], also returning a [`TransferSync`] handle so a
+    /// [`NativeGraphSequence`] can wait on the batch via `cuStreamWaitEvent`.
+    pub fn copy_synced(&self, items: &[TransferItem<'_>]) -> Result<(u64, TransferSync), TransferError> {
+        self.copy_with(items, |inner, items| {
+            inner.copy_synced(items).map(|(value, sync)| (value, TransferSync { inner: sync }))
+        })
+    }
+
+    fn copy_with<R>(
+        &self,
+        items: &[TransferItem<'_>],
+        f: impl FnOnce(
+            &seismic_runtime::native::transfer::TransferInner,
+            &[seismic_runtime::native::transfer::TransferItem<'_>],
+        ) -> Result<R, TransferError>,
+    ) -> Result<R, TransferError> {
         use seismic_runtime::native::transfer as native;
         let items = items
             .iter()
@@ -1592,7 +1638,7 @@ impl Transfer {
                 }
             })
             .collect::<Result<Vec<_>, TransferError>>()?;
-        self.inner.copy(&items)
+        f(&self.inner, &items)
     }
 
     /// Whether the batch that took `value` is complete; why none can
@@ -3246,6 +3292,11 @@ impl NativeGraphMetadata {
         self.backend
     }
 
+    /// Number of enqueued nodes whose checked entry name equals `entry`.
+    pub fn entry_count(&self, entry: &str) -> usize {
+        self.inner.entry_count(entry)
+    }
+
     /// A timeline node after every node enqueued so far
     /// (`NativeGraph::timeline`).
     pub fn timeline<N: timeline::TimelineNodeKind>(&mut self, node: N) -> NativeTimelinePort<N::Role> {
@@ -4651,6 +4702,11 @@ pub struct NativeGraphSequence {
 impl NativeGraphSequence {
     pub fn is_empty(&self) -> bool {
         self.inner.is_empty()
+    }
+    /// Wait on `sync` (`cuStreamWaitEvent` on CUDA) before running any work
+    /// queued in this sequence.
+    pub fn follow_transfer(&mut self, sync: TransferSync) {
+        self.inner.follow_transfer(sync.inner);
     }
     /// Submit every queued run without waiting; the completion reports all
     /// of them.

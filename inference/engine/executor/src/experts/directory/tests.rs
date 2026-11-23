@@ -192,23 +192,100 @@ fn a_prompt_group_is_lent_its_bank_records_and_returns_them_free() {
     assert_eq!(directory.place(at(3, 0), prompt_of(at(3, 0)), 0, &[], &[1, 2], |_| 0).unwrap().records, [BankRecord(0), BankRecord(1)]);
 }
 
-/// No promotion takes a lent bank record, the scratch's, and no release
-/// one held (a home): the wanted experts take the other records, and the
-/// ranking's pool is the records less the lent ones, so it wants no more
-/// than they hold.
+/// During decode (`!lending`), `0..lent` are reclaimed for permanent decode
+/// residency: the ranking's pool is all 4 records, and promotions fill
+/// non-lent records (`2, 3`) first before overflowing into `0..lent` (`0, 1`).
+/// While a prompt group is lending (`Unbegun::lending_at` / `lease`), no
+/// promotion targets `0..lent` and the pool shrinks to the records past `lent`.
 #[test]
-fn no_promotion_is_planned_into_a_lent_record() {
+fn decode_reclaims_lent_records_and_lending_excludes_them() {
     let mut directory = Directory::new(&[4], &[0], &[8], tiered(&[8], 1, 8, 2));
     directory.price_copies(0, Some(0.));
-    assert_eq!(directory.reuse_now().records(0), 2, "the pool is the records less the lent ones");
+    assert_eq!(directory.reuse_now().records(0), 4, "during decode, the pool includes 0..lent");
     for expert in 0..6 {
         let record = directory.land(0, expert, 0).unwrap();
         directory.landed(0, record, expert, Some(1));
     }
     log(&directory, 2, 0, &[0, 1, 2, 3, 4, 5]);
     let records = |wants: &Wants| wants.promotions.iter().map(|promotion| promotion.record).collect::<Vec<_>>();
+    // While a prompt group has begun (`lending == true`), promotions only take records past `lent`.
+    let lending_asked = directory.promotions(&crate::experts::watcher::Unbegun::lending_at(3), usize::MAX);
+    assert_eq!((records(&lending_asked), lending_asked.releases), (vec![BankRecord(2), BankRecord(3)], vec![]));
+    // Cancel those queued promotions so we can verify decode fills `2, 3` first then `0, 1`.
+    directory.unpromoted(0, BankRecord(2));
+    directory.unpromoted(0, BankRecord(3));
+    let decode_asked = directory.promote();
+    assert_eq!(
+        (records(&decode_asked), decode_asked.releases),
+        (vec![BankRecord(2), BankRecord(3), BankRecord(0), BankRecord(1)], vec![]),
+        "decode fills non-lent records first, then reclaims 0..lent"
+    );
+    // Leasing cancels queued promotions in 0..lent and shrinks the pool to 2.
+    assert!(directory.lease(0, ScratchGroup::at(4, 1), false, None));
+    assert_eq!(directory.reuse_now().records(0), 2, "while leased, the pool excludes 0..lent");
+    // Ending the prompt group restores the full decode pool of 4.
+    directory.end_prompt_group(0);
+    assert_eq!(directory.reuse_now().records(0), 4, "after unlend, 0..lent return to the decode pool");
+}
+
+/// Promoting an expert into the lent scratch slice `0..lent` retains its
+/// host-tier copy (`Kept::Alone`, not surrendered), whereas promoting into a
+/// permanent record (`>= lent`) still surrenders the host copy so permanent
+/// VRAM and Host RAM remain disjoint. When a prompt group leases `0..lent`,
+/// the lent experts vacate immediately with zero D2H write-backs and remain
+/// resident in Host RAM (never dropped to NVMe).
+#[test]
+fn lent_vram_promotion_retains_host_copy_so_prefill_lease_has_zero_writebacks_or_drops() {
+    let steps = steps();
+    steps.begin_through(20);
+    let mut directory = Directory::new(&[4], &[0], &[8], tiered(&[6], 1, 8, 2));
+    directory.price_copies(0, Some(0.));
+    directory.price_write_backs(
+        0,
+        Some(WriteBack {
+            terms: magnitude_cost_model::Terms { compute: 0., drive: 1., link: 0., cpu: 0., memory: 0. },
+            drive: 1.,
+            link: 0.,
+        }),
+    );
+    for expert in 0..4 {
+        let record = directory.land(0, expert, 0).unwrap();
+        directory.landed(0, record, expert, Some(1));
+    }
+    log(&directory, 2, 0, &[0, 1, 2, 3]);
     let asked = directory.promote();
-    assert_eq!((records(&asked), asked.releases), (vec![BankRecord(2), BankRecord(3)], vec![]));
+    assert_eq!(asked.promotions.len(), 4);
+    let mut non_lent_experts = Vec::new();
+    let mut lent_experts = Vec::new();
+    let mut completed = Vec::new();
+    for p in &asked.promotions {
+        let tier = directory.hold_tier(p.layer, p.expert).expect("in host tier");
+        directory.copy(p.group, p.record, tier, p.record.0 as u64);
+        completed.push((p.group, p.record));
+        if p.record.index() < 2 {
+            lent_experts.push(p.expert);
+        } else {
+            non_lent_experts.push(p.expert);
+        }
+    }
+    directory.promoted(completed, Point::whole(2, 0, 2), &steps);
+    // Run a promotions turn to trigger `host.surrender(at)` and retire graces.
+    directory.promotions(&Unbegun::at(3), 0);
+    directory.retire_graces(Point::whole(3, 1, 3), &steps);
+    for &e in &non_lent_experts {
+        assert!(directory.tier_record(0, e).is_none(), "non-lent VRAM expert {e} must be surrendered from host tier");
+    }
+    for &e in &lent_experts {
+        assert!(directory.tier_record(0, e).is_some(), "lent VRAM expert {e} must retain its host-tier copy");
+    }
+    // Prefill lease vacates `0..lent` immediately with zero write-backs, and
+    // every vacated lent expert remains resident in Host RAM.
+    assert!(directory.lease(0, ScratchGroup::at(4, 1), false, None), "lease must complete in one pass without D2H write-backs");
+    assert!(directory.backs_queued().is_empty(), "no D2H write-backs may be queued for 0..lent");
+    for &e in &lent_experts {
+        assert!(directory.held(0, e).is_none(), "lent expert {e} vacated VRAM");
+        assert!(directory.tier_record(0, e).is_some(), "lent expert {e} still resident in Host RAM (zero NVMe drop)");
+    }
 }
 
 /// A group of steps 2 and 3 runs layer-major: step 3's request at layer
@@ -470,9 +547,9 @@ fn the_reserve_is_graced_through_its_layer_of_the_latest_step_begun() {
     assert!(directory.land(0, 3, 0).is_some(), "the device past layer 0 of step 5");
 }
 
-/// A wanted expert enters only once its reads pay for its copy: priced
-/// past what one read weighs, it waits, and it is asked again when its
-/// price falls.
+/// A wanted expert that must displace a held record enters only once its reads
+/// pay for its copy: priced past what one read weighs, it waits, and it is
+/// asked again when its price falls.
 #[test]
 fn a_promotion_waits_until_its_reads_earn_its_copy() {
     let mut directory = Directory::new(&[3], &[0, 0], &[8, 8], HostTier::replay(vec![16]));
@@ -480,6 +557,10 @@ fn a_promotion_waits_until_its_reads_earn_its_copy() {
         let record = directory.land(layer, expert, 0).unwrap();
         directory.landed(layer, record, expert, None);
     }
+    // Fill all three bank records with cold experts so promotions must displace
+    // a resident record (`displaced > 0` path in `earning`).
+    directory.place(at(1, 0), prompt_of(at(1, 0)), 0, &[], &[0, 1, 2], |_| 0).unwrap();
+    directory.retired(past(1), |_, _| 1, |_| Ending::Ended);
     // Priced at four reads, past the turnover set by three moves of the
     // three-record pool (τ = 3·T / 4 ≤ 3 over steps 1..4).
     {
@@ -504,7 +585,130 @@ fn a_promotion_waits_until_its_reads_earn_its_copy() {
     log(&directory, 4, 0, &[4]);
     assert!(!directory.settle_changes(), "no read earns such a want, so none withholds it and a read asks nothing again");
     directory.price_copies(0, Some(0.));
-    assert_eq!(directory.promote().promotions.len(), 1, "the price fell, and the want is asked again");
+    assert_eq!(directory.promote().releases.len(), 1, "the price fell, and the want releases a victim");
+}
+
+/// Cold-start promotions into completely free bank slots (`displaced == 0`)
+/// fill available VRAM slots even when `τ_0 = K * T / (moves + 1)` has
+/// collapsed below `copy_hits`, while once slots are full the displacement
+/// check still gates swaps.
+#[test]
+fn cold_start_free_slot_admission_fills_empty_vram_despite_tau_collapse() {
+    let mut directory = Directory::new(&[4], &[0], &[16], HostTier::replay(vec![16]));
+    for expert in 0..16 {
+        let record = directory.land(0, expert, 0).unwrap();
+        directory.landed(0, record, expert, None);
+    }
+    // Collapse τ_0 on step 1: K = 4, T = 1, moves = 39 -> τ_0 = 4 * 1 / 40 = 0.1 steps.
+    {
+        let time = directory.time();
+        let mut times = time.lock();
+        for _ in 0..39 {
+            times.moved(0, crate::experts::horizon::Tier::COMPUTE);
+        }
+    }
+    // High copy_hits (4.0) would starve every promotion if checked against τ_0 = 0.1.
+    directory.price_copies(0, Some(4.0));
+    log(&directory, 1, 0, &[0, 1, 2, 3]);
+    let asked = directory.promote();
+    assert_eq!(
+        asked.promotions.len(),
+        4,
+        "all 4 free VRAM slots must be admitted despite collapsed τ_0: {asked:?}"
+    );
+    assert!(asked.releases.is_empty(), "free slots require no releases");
+    // Complete all 4 promotions so the bank is now completely full (0 free slots).
+    for promo in &asked.promotions {
+        directory.complete(promo);
+    }
+    // Now a new expert (4) wants a slot, but bank is full (`displaced > 0`):
+    // with copy_hits = 4.0 and collapsed τ_0, displacement must still be withheld!
+    log(&directory, 2, 0, &[4]);
+    let full_asked = directory.promote();
+    assert_eq!(
+        full_asked,
+        Wants::default(),
+        "once bank is full, unearned displacement must remain withheld"
+    );
+}
+
+/// Request 2 domain switch regression: Request 1 fills all 30 VRAM slots with
+/// hot experts `0..30` and completes 61 decode steps (`has_decode() == true`).
+/// Request 2 then runs a prefill routing hot experts `100..130`.
+/// 1. `Directory::seed` must replace Request 1's stale `0..30` with Request 2's
+///    `100..130` in VRAM (not lock them out via stale `in_top` or ignore prefill counts).
+/// 2. On Request 2 Decode Step 1, `Directory::promotions()` must NOT evict
+///    `100..130` back to Request 1's stale `0..30`.
+#[test]
+fn request_2_prefill_seeding_replaces_stale_request_1_experts_and_survives_decode_step_1() {
+    use crate::experts::reuse::{Evidence, Rows};
+
+    let mut directory = Directory::new(&[30], &[0], &[256], HostTier::replay(vec![256]));
+    for expert in 0..256 {
+        let record = directory.land(0, expert, 0).unwrap();
+        directory.landed(0, record, expert, None);
+    }
+    directory.price_copies(0, Some(1.0));
+
+    // Request 1: place all 30 hot experts `0..30` into VRAM and run 61 decode steps
+    // (6 experts per step cycling through `0..30`, so all 30 are hot and `in_top`).
+    let req1_hot: Vec<usize> = (0..30).collect();
+    directory.place(at(1, 0), prompt_of(at(1, 0)), 0, &[], &req1_hot, |_| 0).unwrap();
+    directory.retired(past(1), |_, _| 1, |_| Ending::Ended);
+    for step in 2..=62u64 {
+        let base = ((step as usize - 2) * 6) % 30;
+        let mut chosen: Vec<usize> = (0..6).map(|i| (base + i) % 30).collect();
+        chosen.sort_unstable();
+        log(&directory, step, 0, &chosen);
+    }
+    assert!(
+        (0..30).all(|e| directory.held(0, e).is_some() && directory.reuse_now().in_top(0, e)),
+        "Request 1's 0..30 must fill VRAM and be in_top before Request 2"
+    );
+
+    // Request 2 prefill at step 100: routes hot experts `100..130` heavily (count = 200 each).
+    let req2_routed: Vec<(usize, u32, Step)> = (100..130).map(|e| (e, 200, 100)).collect();
+    let (seeds, evicted) = directory.seed(at(100, 0), prompt_of(at(100, 0)), 0, &req2_routed, &[], |_| true);
+    assert_eq!(seeds.len(), 30, "all 30 Request 2 hot experts must be seeded into VRAM");
+    assert_eq!(evicted.len(), 30, "all 30 stale Request 1 experts must be evicted");
+    directory.retired(past(100), |_, _| 100, |_| Ending::Ended);
+    for e in 100..130 {
+        assert!(directory.held(0, e).is_some(), "Request 2 expert {e} must be resident in VRAM");
+    }
+    for e in 0..30 {
+        assert!(directory.held(0, e).is_none(), "stale Request 1 expert {e} must be evicted from VRAM");
+    }
+
+    // Request 2 prompt group completes and logs `Evidence::Prompt` into `Reuse`.
+    let req2_counts: Vec<(usize, u32)> = (100..130).map(|e| (e, 200)).collect();
+    let req2_read = RoutedRead { sequence: 100, layer: 0, experts: (100..130).collect(), choices: 6 };
+    let req2_union = std::sync::Arc::new(Rows::union(256, 6, &req2_counts));
+    Reuse::of(&directory.ranking).read(&req2_read, Some(req2_union), Evidence::Prompt);
+
+    // Request 2 prefill Chunk 2 (step 101): must NOT thrash Chunk 1's `in_top`
+    // experts `100..130` out of VRAM!
+    let req2_chunk2: Vec<(usize, u32, Step)> = (150..180).map(|e| (e, 200, 101)).collect();
+    let (chunk2_seeds, chunk2_evicted) = directory.seed(at(101, 0), prompt_of(at(101, 0)), 0, &req2_chunk2, &[], |_| true);
+    assert!(
+        chunk2_seeds.is_empty() && chunk2_evicted.is_empty(),
+        "Request 2 prefill Chunk 2 must NOT thrash Chunk 1's in_top VRAM experts: seeds={chunk2_seeds:?} evicted={chunk2_evicted:?}"
+    );
+
+    // Request 2 Decode Step 1 (step 102): routes experts from `100..130`.
+    log(&directory, 102, 0, &[100, 101, 102, 103, 104, 105]);
+    let wants = directory.promote();
+    assert!(
+        wants.releases.iter().all(|r| !(100..130).contains(&r.expert)),
+        "Decode Step 1 must NOT evict Request 2's 100..130 back to Request 1's 0..30: {wants:?}"
+    );
+    assert!(
+        wants.promotions.iter().all(|p| !(0..30).contains(&p.expert)),
+        "Decode Step 1 must NOT promote Request 1's stale 0..30 over Request 2's 100..130: {wants:?}"
+    );
+    assert!(
+        (100..130).all(|e| directory.held(0, e).is_some()),
+        "all 30 Request 2 experts must remain resident in VRAM after Decode Step 1"
+    );
 }
 
 /// A want is weighed against its victim by one measure, expected uses
@@ -573,6 +777,7 @@ fn promotions_bring_the_groups_pool_into_the_bank() {
         Wants {
             promotions: vec![Promotion { group: 0, record: BankRecord(2), layer: 0, expert: 4 }],
             releases: vec![Release { group: 0, record: BankRecord(0), layer: 0, expert: 0 }],
+            surrendered: vec![],
         },
         "the free record taken by the first of the wants, then a release for the want left without one"
     );
@@ -594,7 +799,7 @@ fn promotions_bring_the_groups_pool_into_the_bank() {
     // 5 is wanted again, and releases the one record outside the pool (1).
     assert_eq!(
         directory.promote(),
-        Wants { promotions: vec![], releases: vec![Release { group: 0, record: BankRecord(1), layer: 0, expert: 1 }] }
+        Wants { promotions: vec![], releases: vec![Release { group: 0, record: BankRecord(1), layer: 0, expert: 1 }], surrendered: vec![] }
     );
 }
 
@@ -649,6 +854,7 @@ fn a_reserve_lets_a_promotion_copy_at_once() {
         Wants {
             promotions: vec![Promotion { group: 0, record: free, layer: 0, expert: 2 }],
             releases: vec![Release { group: 0, record: zero, layer: 0, expert: 0 }],
+            surrendered: vec![],
         }
     );
     directory.drain(Point::START, &steps());
@@ -1553,13 +1759,15 @@ fn seed_skips_lent_and_stage_ring_and_keeps_seeded_from_at_lent() {
     steps.begin_through(10);
 
     // `seeded_from` MUST stay equal to `lent` (matching GPU `routed_seed_commit`).
+    // During decode (`!leasing`), `0..lent` are reclaimed for permanent decode residency.
     assert_eq!(directory.seeded_from(0), lent);
-    assert_eq!(directory.capacity(0), total_records - lent - stage_slots);
+    assert_eq!(directory.capacity(0), total_records - stage_slots);
     assert_eq!(directory.stage_ring_half(0), stage_slots / 2);
 
     // Lease `0..lent` for prompt group starting at step 1, then seed 4 experts.
     let group = ScratchGroup::at(1, 1);
     assert!(directory.lease(0, group, false, None), "lent records 0..2 lease cleanly");
+    assert_eq!(directory.capacity(0), total_records - lent - stage_slots, "while leased, 0..lent leave decode capacity");
 
     let routed = [(0usize, 10u32, 1u64), (1, 10, 1), (2, 10, 1), (3, 10, 1)];
     let (seeds, evicted) = directory.seed(at(1, 0), group, 0, &routed, &[], |_| true);
@@ -1578,4 +1786,79 @@ fn seed_skips_lent_and_stage_ring_and_keeps_seeded_from_at_lent() {
     // Staging ring `2..6` remains completely untouched and ready for even/odd DMA staging.
     assert_eq!(directory.free_stage_slot(0, 2), Some(2));
     assert_eq!(directory.free_stage_slot(0, 3), Some(4));
+}
+
+#[test]
+fn claim_carryover_prices_eviction_on_full_two_tier_bank() {
+    use crate::experts::host_records::{Claim, Taking};
+
+    // 2-tier unified bank (`Placement::Bank`): 4 total records (2 kept + 2 reserve).
+    let experts = 8usize;
+    let map_words = magnitude_kernels::constants::MAP_WORDS;
+    let steps = steps();
+    let host = HostTier {
+        records: vec![4],
+        lent: vec![0],
+        reserve: 2,
+        placement: Placement::Bank {
+            landing_maps: vec![LandingMap::Bank {
+                map: std::sync::Arc::new(StampedMap::new(cpu_words(&[experts as u64, map_words], 0))),
+                steps: std::sync::Arc::new(steps),
+            }],
+        },
+    };
+    let mut directory = Directory::new(&[0], &[0], &[experts], host);
+    // Land experts 0 and 1 so the 2 non-reserve slots are full of resident experts.
+    for expert in 0..2 {
+        let Claim::Taken(grant) = directory.claim_landing(0, expert, 0, Taking::Out, (|_, _| (), |_, _| true)) else {
+            panic!("expected free slot for resident expert {expert}");
+        };
+        directory.landed(0, HostRecord(grant.record()), expert, Some(1));
+    }
+
+    // 1. Non-positive net_benefit is ALWAYS rejected (even if reserve slots exist).
+    assert!(matches!(directory.claim_carryover(0, 2, 1, Taking::Ahead, 0.0), Claim::Short));
+    assert!(matches!(directory.claim_carryover(0, 2, 1, Taking::Ahead, -0.25), Claim::Short));
+
+    // 2. Positive net_benefit exceeding victim_uses - cand_uses admits on a full 2-tier bank.
+    let claim = directory.claim_carryover(0, 2, 1, Taking::Ahead, 0.5);
+    assert!(matches!(claim, Claim::Taken(_)), "profitable carryover must admit on full 2-tier bank");
+}
+
+#[test]
+fn alone_excludes_lent_slot_dual_resident_experts() {
+    use crate::experts::host_records::{Claim, Taking};
+
+    let experts = 4usize;
+    let lent = 2usize;
+    let map_words = magnitude_kernels::constants::MAP_WORDS;
+    let host = HostTier {
+        records: vec![experts as u32],
+        lent: vec![0],
+        reserve: 0,
+        placement: Placement::Tier {
+            bank_maps: vec![StampedMap::new(cpu_words(&[experts as u64, map_words], 0))],
+            tier_maps: vec![LandingMap::Tier(cpu_words(&[experts as u64], -1))],
+            lent: (0, lent),
+            stage_slots: vec![0],
+        },
+    };
+    let mut directory = Directory::new(&[lent], &[0], &[experts], host);
+    let steps = steps();
+    steps.begin_through(2);
+    for expert in 0..experts {
+        let Claim::Taken(grant) = directory.claim_landing(0, expert, 0, Taking::Out, (|_, _| (), |_, _| true)) else {
+            panic!("expected host slot for expert {expert}");
+        };
+        directory.landed(0, HostRecord(grant.record()), expert, Some(1));
+    }
+    let DemandSlotClaim::Allocated { staged, slot } = directory.claim_demand_landing(0, 0, false, |_| true) else {
+        panic!("expected free lent slot for demand landing");
+    };
+    assert!(directory.bank_lends(0, slot));
+    assert!(directory.finish_demand_landing(0, slot, staged, at(1, 0), &steps, true));
+    assert_eq!(directory.held_count(0), 1);
+    assert_eq!(directory.host(0).alone()[0], experts, "host copy of lent-slot expert stays retained");
+    assert_eq!(directory.alone(0), experts - 1, "Directory::alone excludes dual-resident lent-slot expert");
+    assert!(directory.held_count(0) + directory.alone(0) <= experts);
 }

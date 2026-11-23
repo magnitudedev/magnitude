@@ -677,6 +677,7 @@ impl Answer {
             let slot = self.pending.fetch_sub(1, std::sync::atomic::Ordering::AcqRel) == 1;
             if slot {
                 self.file.answer(sequence, 0, false);
+                self.steps.events().notify();
             }
             seismic_io::timeline::note(seismic_io::timeline::Kind::Noted("answer"), sequence as u64, (self.layer as i64, record.is_some() as i64, slot as i64));
         });

@@ -816,8 +816,23 @@ fn collect_run_tasks(
     let has_prefill = !crate::operators::attention::graph::decodes(ctx.outline.largest_rows);
     let mut prefill_listings: Vec<BlockListings> = Vec::with_capacity(entries.len());
     let mut tasks: Vec<RunTask> = Vec::new();
+    let bank_decode_dma = crate::experts::decode_dma_enabled(ctx.outline.backend)
+        && ctx
+            .load
+            .expert_bank()
+            .is_some_and(|bank| bank.placer() == crate::planning::Placer::Tier && !bank.whole());
     for (slot_idx, &(index, of_untapped, split, resident)) in entries.iter().enumerate() {
         let slot = ctx.plan.blocks()[index];
+        let decode_split = bank_decode_dma
+            && ctx.load.expert_bank().is_some_and(|bank| {
+                bank.layers().iter().any(|layer| {
+                    matches!(
+                        layer.scope,
+                        magnitude_family_contracts::WeightScope::TargetSublayer(s) if s.block == index as u32
+                    )
+                })
+            })
+            && block_routed(ctx.geometry, index)?.is_some();
         let listings = if has_prefill {
             block_listings(ctx.state, ctx.outline.backend, slot, index, ctx.outline.largest_rows)?
         } else {
@@ -828,7 +843,7 @@ fn collect_run_tasks(
         for (regime_idx, regime_rows) in ctx.regimes.iter().enumerate() {
             let largest = *regime_rows.last().expect("a regime holds a row class");
             let is_decode = crate::operators::attention::graph::decodes(largest);
-            let stages = RunStage::sealed(split, resident, largest);
+            let stages = RunStage::sealed(split, resident, decode_split, largest);
             let has_stage = stages.iter().any(|&stage| (stage == RunStage::Combine) == group);
             if !has_stage {
                 continue;
@@ -1683,7 +1698,7 @@ impl<L: Certified + Send + Sync> FamilyLayouts<L> {
                 }
             }
         }
-        let served = block_served(load, geometry, limits, outline.chain_rows, passes)?;
+        let served = block_served(outline.backend, load, geometry, limits, outline.chain_rows, passes)?;
         // Flat index of every distinct certified block graph by `(holder, topology)`.
         let mut by_holder: FxHashMap<(Holder, Topology), &CertifiedBlockGraph<L>> = fx_map();
         let mut holder_maps: FxHashMap<Holder, (&ShapeLayouts<L>, &ShapeLayouts<L>)> = fx_map();
@@ -2160,6 +2175,7 @@ impl TargetFamilyComposition {
             scores: bool,
             streams: bool,
             resident: bool,
+            decode_split: bool,
             is_split: bool,
             listings: &'a BlockListings,
             count: u64,
@@ -2174,6 +2190,7 @@ impl TargetFamilyComposition {
             let block_scores = scores[index];
             let streams = served[index].streams;
             let resident = served[index].resident;
+            let decode_split = served[index].decode_split;
             let is_split = served[index].split.is_some();
             let listings = &prefill_listings[index];
 
@@ -2184,6 +2201,7 @@ impl TargetFamilyComposition {
                     && g.scores == block_scores
                     && g.streams == streams
                     && g.resident == resident
+                    && g.decode_split == decode_split
                     && g.is_split == is_split
                     && g.listings == listings
             }) {
@@ -2209,6 +2227,7 @@ impl TargetFamilyComposition {
                     scores: block_scores,
                     streams,
                     resident,
+                    decode_split,
                     is_split,
                     listings,
                     count: 1,
@@ -2295,7 +2314,7 @@ impl TargetFamilyComposition {
                     if !matches {
                         continue;
                     }
-                    for &stage in RunStage::sealed(g.is_split, g.resident, rows) {
+                    for &stage in RunStage::sealed(g.is_split, g.resident, g.decode_split, rows) {
                         let axes = stage_axes.of(g.first, form, stage);
                         let topo = (form, listed > 0 && axes.listed, scored && axes.segments, Stage::Run(stage), 0);
                         let id = graphed_ids[&Graphed::Block(g.first, topo)];

@@ -922,6 +922,7 @@ const MARKS: usize = STAGE_ENDS + STAGES;
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct SiteServed {
     pub requests: u64,
+    pub experts: u64,
     pub terms: [std::time::Duration; SITE_TERMS],
 }
 
@@ -937,6 +938,7 @@ impl SiteServed {
     pub fn since(&self, before: &Self) -> Self {
         Self {
             requests: self.requests - before.requests,
+            experts: self.experts - before.experts,
             terms: std::array::from_fn(|term| self.terms[term] - before.terms[term]),
         }
     }
@@ -945,6 +947,7 @@ impl SiteServed {
 /// The site's running sums of [`SiteServed`], in nanoseconds.
 struct ServedSums {
     requests: AtomicU64,
+    experts: AtomicU64,
     terms: [AtomicU64; SITE_TERMS],
 }
 
@@ -1485,6 +1488,7 @@ impl Site {
             began: std::time::Instant::now(),
             served: ServedSums {
                 requests: AtomicU64::new(0),
+                experts: AtomicU64::new(0),
                 terms: std::array::from_fn(|_| AtomicU64::new(0)),
             },
         })
@@ -1546,6 +1550,11 @@ impl Site {
         if self.noticer.load(Ordering::Relaxed) == worker {
             self.noticer.store(usize::MAX, Ordering::Release);
         }
+    }
+
+    /// Whether some worker currently holds the noticing role.
+    pub(super) fn has_noticer(&self) -> bool {
+        self.noticer.load(Ordering::Acquire) != usize::MAX
     }
 
     /// Record that the site failed step `step`'s request at streamed layer
@@ -1764,7 +1773,7 @@ impl Site {
         // the device makes only after the answer below.
         cell.answered.store(step, Ordering::Release);
         self.answer(layer, step, false);
-        self.count(marks);
+        self.count(marks, experts);
         self.open.fetch_sub(1, Ordering::AcqRel);
     }
 
@@ -1775,12 +1784,13 @@ impl Site {
 
     /// Count an answered request whose path reached its points at `marks`,
     /// its answer written now.
-    fn count(&self, marks: [u64; MARKS]) {
+    fn count(&self, marks: [u64; MARKS], experts: u64) {
         let now = self.began.elapsed().as_nanos() as u64;
         let ends = marks.iter().skip(1).copied().chain([now]);
         for (term, (start, end)) in marks.iter().zip(ends).enumerate() {
             self.served.terms[term].fetch_add(end.saturating_sub(*start), Ordering::Relaxed);
         }
+        self.served.experts.fetch_add(experts, Ordering::Relaxed);
         self.served.requests.fetch_add(1, Ordering::Relaxed);
     }
 
@@ -1807,6 +1817,7 @@ impl Site {
     pub(super) fn served(&self) -> SiteServed {
         SiteServed {
             requests: self.served.requests.load(Ordering::Relaxed),
+            experts: self.served.experts.load(Ordering::Relaxed),
             terms: std::array::from_fn(|term| std::time::Duration::from_nanos(self.served.terms[term].load(Ordering::Relaxed))),
         }
     }

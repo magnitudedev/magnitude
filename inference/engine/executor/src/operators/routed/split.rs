@@ -20,33 +20,46 @@ pub(crate) struct SplitForm {
 }
 
 /// The numbers of a routed layer's crossed and merged values: its experts,
-/// its selected experts and the width its experts act in.
+/// its selected experts, the width its experts act in, and its fused shared
+/// intermediate width (0 when not fused).
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub(crate) struct SplitLayer<D = Dim> {
     pub experts: D,
     pub selected: D,
     pub width: D,
+    pub shared: D,
 }
 
 impl<D> Numbers<D> for SplitLayer<D> {
     type Of<E> = SplitLayer<E>;
     fn map<E>(self, f: &mut impl FnMut(D) -> E) -> SplitLayer<E> {
-        SplitLayer { experts: f(self.experts), selected: f(self.selected), width: f(self.width) }
+        SplitLayer {
+            experts: f(self.experts),
+            selected: f(self.selected),
+            width: f(self.width),
+            shared: f(self.shared),
+        }
     }
 }
 
 /// The form and numbers of `routed`'s split values in `geometry`: the only
 /// reading of the model they make.
 pub(crate) fn split(routed: &RoutedFfn, geometry: &Decoder) -> (SplitForm, SplitLayer<u64>) {
+    let fused = super::is_fused(routed);
     (
         SplitForm {
             activation: crate::programs::native_target_graph::activation(geometry),
-            fused: super::is_fused(routed),
+            fused,
         },
         SplitLayer {
             experts: routed.experts,
             selected: routed.selected,
             width: routed.expert_hidden(geometry.hidden),
+            shared: if fused {
+                routed.shared.as_ref().map_or(0, |s| s.intermediate)
+            } else {
+                0
+            },
         },
     )
 }
@@ -84,6 +97,15 @@ pub(crate) enum RunStage {
     Resident,
     Front,
     Combine,
+    /// M7 split decode front: mixer + route + hints + file-miss landing
+    /// (`routed_land`), writing `sources` to pinned host memory so the host
+    /// can DMA-land unpredicted host-tier misses (`source <= -2`) before
+    /// `DecodeBack`.
+    DecodeFront,
+    /// M7 split decode back: `routed_site_request` + single-pass `routed_gate_up`
+    /// + `routed_output`/`routed_down` + post-FFN sublayers, exit, and
+    /// next-block operand carry-out.
+    DecodeBack,
 }
 
 /// A graph sealed once: a streamed layer's fill, or a merge set's pass.
@@ -97,8 +119,8 @@ impl RunStage {
     /// Which of a block's draft taps, at its entry, before its
     /// feed-forward and at its output, a graph of this stage writes.
     pub(crate) fn taps(self) -> [bool; 3] {
-        let mixes = matches!(self, Self::Whole | Self::Resident | Self::Front);
-        [mixes, mixes, matches!(self, Self::Whole | Self::Resident | Self::Combine)]
+        let mixes = matches!(self, Self::Whole | Self::Resident | Self::Front | Self::DecodeFront);
+        [mixes, mixes, matches!(self, Self::Whole | Self::Resident | Self::Combine | Self::DecodeBack)]
     }
 
     /// The stages of `rows` rows of a block whose prompt rows `split`, their
@@ -112,21 +134,27 @@ impl RunStage {
     }
 
     /// The stages a block's graphs of `rows` rows are sealed in: those its
-    /// runs take ([`Self::served`]), and beside a decode block's whole graph
-    /// its resident form, where its streamed layer's bank was planned whole
-    /// (`resident`).
-    pub(crate) fn sealed(split: bool, resident: bool, rows: u64) -> &'static [Self] {
-        match resident && super::fused_graph::decodes(rows) {
-            true => &[Self::Whole, Self::Resident],
-            false => Self::served(split, rows),
+    /// runs take ([`Self::served`]), plus `Resident` where planned whole and
+    /// `DecodeFront`/`DecodeBack` where M7 decode DMA split is enabled.
+    pub(crate) fn sealed(split: bool, resident: bool, decode_split: bool, rows: u64) -> &'static [Self] {
+        if super::fused_graph::decodes(rows) {
+            return match (resident, decode_split) {
+                (true, true) => &[Self::Whole, Self::Resident, Self::DecodeFront, Self::DecodeBack],
+                (true, false) => &[Self::Whole, Self::Resident],
+                (false, true) => &[Self::Whole, Self::DecodeFront, Self::DecodeBack],
+                (false, false) => &[Self::Whole],
+            };
         }
+        Self::served(split, rows)
     }
 
     /// The stage whose place in a run this one's graph takes: the resident
-    /// form takes its whole block's.
+    /// form and M7 decode split stages take the whole block's place (and
+    /// `DecodeFront` / `DecodeBack` run in separate submissions, never sharing
+    /// an upload region concurrently).
     pub(crate) fn place(self) -> Self {
         match self {
-            Self::Resident => Self::Whole,
+            Self::Resident | Self::DecodeFront | Self::DecodeBack => Self::Whole,
             stage => stage,
         }
     }
@@ -265,22 +293,51 @@ impl BackPorts {
     }
 }
 
+/// Values crossed between `RunStage::DecodeFront` and `RunStage::DecodeBack`
+/// beside the residual carry (`mixed`): device-side `routes`, `weights` (or
+/// `scores`), `normalized`, optional fused `coefficient` and `shared_product`,
+/// plus `sources` bound to `ExpertBank`'s pinned host-mapped `DecodeSources`
+/// buffer so the host can inspect & patch it for batched `cuMemcpyHtoDAsync`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct DecodeCrossing<T> {
+    pub routes: T,
+    pub weights: T,
+    pub normalized: T,
+    pub coefficient: Option<T>,
+    pub shared_product: Option<T>,
+    pub sources: T,
+}
+
+/// Device-side crossing buffers owned by `GroupBuffers` for M7 decode split
+/// (everything in [`DecodeCrossing`] except `sources`, which is owned by
+/// `ExpertBank::decode_dma` in pinned host-mapped memory).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct DecodeCrossingBuffers<T> {
+    pub routes: T,
+    pub weights: T,
+    pub normalized: T,
+    pub coefficient: Option<T>,
+    pub shared_product: Option<T>,
+}
+
 /// The ports of a split layer's front or back ([`Stage`]): a front writes
 /// every crossed value.
 #[derive(Clone)]
 pub(crate) enum SplitPorts {
     Front(Crossing<NativePort>),
     Back(BackPorts),
+    DecodeFront(DecodeCrossing<NativePort>),
+    DecodeBack(DecodeCrossing<NativePort>),
 }
 
 /// A split layer's graph ([`Stage`]): its front, which routes into the
-/// crossing's ports and requests where scratch-served; or its back after
-/// its merge set's pass (`fused_graph::group_pass`, `graph::general_pass`),
-/// which combines its rows from the merged ports, of the expert tiles its
-/// graph's merged experts hold.
+/// crossing's ports and requests where scratch-served; its back after
+/// its merge set's pass; or an M7 decode split's front / back.
 pub(crate) enum Split<'c> {
     Front(&'c mut Crossing<NativePort>),
     Combine(&'c BackPorts, &'c Dim),
+    DecodeFront(&'c mut DecodeCrossing<NativePort>),
+    DecodeBack(&'c DecodeCrossing<NativePort>),
 }
 
 /// A split layer's ports as its graph is built: its stage's ports
@@ -289,6 +346,8 @@ pub(crate) enum Split<'c> {
 pub(crate) enum SplitBuild {
     Front(Crossing<NativePort>),
     Back(BackPorts, Dim),
+    DecodeFront(DecodeCrossing<NativePort>),
+    DecodeBack(DecodeCrossing<NativePort>),
 }
 
 impl SplitBuild {
@@ -296,6 +355,8 @@ impl SplitBuild {
         match self {
             Self::Front(crossing) => Split::Front(crossing),
             Self::Back(back, blocks) => Split::Combine(back, blocks),
+            Self::DecodeFront(crossing) => Split::DecodeFront(crossing),
+            Self::DecodeBack(crossing) => Split::DecodeBack(crossing),
         }
     }
 
@@ -304,6 +365,8 @@ impl SplitBuild {
         match self {
             Self::Front(crossing) => SplitPorts::Front(crossing),
             Self::Back(back, _) => SplitPorts::Back(back),
+            Self::DecodeFront(crossing) => SplitPorts::DecodeFront(crossing),
+            Self::DecodeBack(crossing) => SplitPorts::DecodeBack(crossing),
         }
     }
 }
@@ -340,6 +403,15 @@ impl SplitPorts {
                 let (element, selected) = (merged.inverse.0, merged.inverse.1[1].clone());
                 let inverse = graph.port(element, &[rows.clone(), selected])?;
                 Some(SplitBuild::Back(BackPorts { crossing, experts, inverse }, merged.blocks()))
+            }
+            RunStage::DecodeFront | RunStage::DecodeBack => {
+                let (form, layer) = routed()?;
+                let crossing = DecodeCrossing::at(form, layer, rows).try_map(|value| crossed(graph, value))?;
+                Some(match stage {
+                    RunStage::DecodeFront => SplitBuild::DecodeFront(crossing),
+                    RunStage::DecodeBack => SplitBuild::DecodeBack(crossing),
+                    _ => unreachable!(),
+                })
             }
         })
     }
@@ -573,5 +645,113 @@ impl Crossing<Extents> {
             normalized: fixed(crossing.normalized),
             coefficient: crossing.coefficient.map(fixed),
         }
+    }
+}
+
+impl<T> DecodeCrossing<T> {
+    pub(crate) fn try_map<U, E>(&self, mut map: impl FnMut(&T) -> Result<U, E>) -> Result<DecodeCrossing<U>, E> {
+        Ok(DecodeCrossing {
+            routes: map(&self.routes)?,
+            weights: map(&self.weights)?,
+            normalized: map(&self.normalized)?,
+            coefficient: self.coefficient.as_ref().map(&mut map).transpose()?,
+            shared_product: self.shared_product.as_ref().map(&mut map).transpose()?,
+            sources: map(&self.sources)?,
+        })
+    }
+}
+
+impl DecodeCrossing<Extents<Dim>> {
+    pub(crate) fn at(form: &SplitForm, layer: &SplitLayer, rows: &Dim) -> Self {
+        let choices = vec![rows.clone(), layer.selected.clone()];
+        DecodeCrossing {
+            routes: (Element::i32(), choices.clone()),
+            weights: (Element::f32(), choices),
+            normalized: (form.activation, vec![rows.clone(), layer.width.clone()]),
+            coefficient: form.fused.then(|| (Element::f32(), vec![rows.clone()])),
+            shared_product: form
+                .fused
+                .then(|| (form.activation, vec![rows.clone(), layer.shared.clone()])),
+            sources: (
+                Element::i32(),
+                vec![
+                    Dim::from(magnitude_kernels::constants::SOURCE_ROWS),
+                    rows.clone(),
+                    layer.selected.clone(),
+                ],
+            ),
+        }
+    }
+}
+
+impl<T> DecodeCrossingBuffers<T> {
+    pub(crate) fn iter(&self) -> impl Iterator<Item = &T> {
+        [&self.routes, &self.weights, &self.normalized]
+            .into_iter()
+            .chain(&self.coefficient)
+            .chain(&self.shared_product)
+    }
+}
+
+impl DecodeCrossingBuffers<Extents> {
+    pub(crate) fn of(routed: &RoutedFfn, geometry: &Decoder, rows: u64) -> Self {
+        let (form, layer) = split(routed, geometry);
+        let crossing = DecodeCrossing::at(&form, &constant(layer), &Dim::from(rows));
+        DecodeCrossingBuffers {
+            routes: fixed(crossing.routes),
+            weights: fixed(crossing.weights),
+            normalized: fixed(crossing.normalized),
+            coefficient: crossing.coefficient.map(fixed),
+            shared_product: crossing.shared_product.map(fixed),
+        }
+    }
+
+    pub(crate) fn widest(first: &Self, rest: &[Self]) -> Self {
+        let length = |(element, extents): &Extents| (*element, extents.iter().product::<u64>());
+        let widest = |value: fn(&Self) -> &Extents| {
+            let (element, longest) = rest
+                .iter()
+                .map(|layer| length(value(layer)))
+                .fold(length(value(first)), |(element, longest), (_, length)| (element, longest.max(length)));
+            (element, vec![longest])
+        };
+        let optional_widest = |value: fn(&Self) -> &Option<Extents>| {
+            std::iter::once(first)
+                .chain(rest)
+                .filter_map(|layer| value(layer).as_ref().map(length))
+                .reduce(|(element, longest), (_, length)| (element, longest.max(length)))
+                .map(|(element, longest)| (element, vec![longest]))
+        };
+        DecodeCrossingBuffers {
+            routes: widest(|layer| &layer.routes),
+            weights: widest(|layer| &layer.weights),
+            normalized: widest(|layer| &layer.normalized),
+            coefficient: optional_widest(|layer| &layer.coefficient),
+            shared_product: optional_widest(|layer| &layer.shared_product),
+        }
+    }
+}
+
+impl DecodeCrossingBuffers<seismic::Tensor> {
+    pub(crate) fn view(&self, layer: &DecodeCrossingBuffers<Extents>) -> Result<Self, String> {
+        let view = |buffer: &seismic::Tensor, (_, extents): &Extents| {
+            buffer
+                .slice_leading(0, extents.iter().product())
+                .and_then(|leading| leading.reshape(extents))
+                .map_err(|error| format!("a layer's view of a decode crossing buffer: {error}"))
+        };
+        let optional = |buffer: &Option<seismic::Tensor>, value: &Option<Extents>| {
+            value
+                .as_ref()
+                .map(|value| view(buffer.as_ref().ok_or("a layer's decode crossing value has no buffer")?, value))
+                .transpose()
+        };
+        Ok(DecodeCrossingBuffers {
+            routes: view(&self.routes, &layer.routes)?,
+            weights: view(&self.weights, &layer.weights)?,
+            normalized: view(&self.normalized, &layer.normalized)?,
+            coefficient: optional(&self.coefficient, &layer.coefficient)?,
+            shared_product: optional(&self.shared_product, &layer.shared_product)?,
+        })
     }
 }

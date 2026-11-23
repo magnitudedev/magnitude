@@ -117,6 +117,13 @@ pub(super) fn encode(
     // Nothing is issued yet: a failed wait abandons no work.
     follow_fences(&mut batch, work.after)
         .map_err(|error| EncodeFailure::uncommitted(CallError::Execution(error)))?;
+    for sync in work.after_transfers {
+        if let Some(event) = sync.cuda_event() {
+            batch
+                .follow_event(event)
+                .map_err(|error| EncodeFailure::uncommitted(CallError::Execution(error)))?;
+        }
+    }
     match issue(&mut batch, device, replays, budget, work) {
         Ok(()) => batch
             .commit()
@@ -172,6 +179,76 @@ pub(super) fn encode_moves(
         .commit()
         .unwrap_or_else(|error| panic!("invariant violated: ordered moves were issued but their end was not recorded: {error}"));
     Ok(Committed::Cuda(committed))
+}
+
+/// Encode a batch of host-to-device (`cuMemcpyHtoDAsync`) and device-to-device
+/// (`cuMemcpyDtoDAsync`) byte copies on `NativeStream::Fill`, after `after`
+/// (cross-queue fences from `Allocation::queue_order`), ending with
+/// `cuEventRecord` (`DirectBatch::commit`) so subsequent compute work reading
+/// the written allocations waits via `DirectBatch::follow` (`cuStreamWaitEvent`).
+pub(super) fn encode_fill_copies(
+    device: &seismic_cuda::Device,
+    after: &[Arc<dyn DeviceCompletion>],
+    runs: &[super::FillCopyRun<'_>],
+) -> Result<Committed, EncodeFailure> {
+    enum CheckedCopy {
+        Upload { source: *const u8, destination: u64, bytes: u64 },
+        Within { source: u64, destination: u64, bytes: u64 },
+    }
+    let refused = |why: &str| EncodeFailure::uncommitted(CallError::Execution(ExecutionError::SubmissionFailed(why.into())));
+    let mut checked = Vec::with_capacity(runs.len());
+    for run in runs {
+        if run.bytes == 0 {
+            continue;
+        }
+        let src_buf = typed_buffer::<Cuda, Executor>(run.source.allocation());
+        let dst_buf = typed_buffer::<Cuda, Executor>(run.destination.allocation());
+        let src_off = run.source.byte_offset() + run.source_offset;
+        let dst_off = run.destination.byte_offset() + run.destination_offset;
+        let dst_ptr = dst_buf.pointer() + dst_off;
+        let src_host = run.source.allocation().storage().host_address();
+        let dst_host = run.destination.allocation().storage().host_address();
+        match (src_host, dst_host) {
+            (Some(mapped), None) => {
+                let offset = usize::try_from(src_off).map_err(|_| refused("fill copy source offset exceeds host address space"))?;
+                // SAFETY: `src_off + run.bytes <= source.byte_len()` was verified by the caller.
+                let source = unsafe { mapped.as_ptr().add(offset) };
+                checked.push(CheckedCopy::Upload { source, destination: dst_ptr, bytes: run.bytes });
+            }
+            (None, None) => {
+                checked.push(CheckedCopy::Within {
+                    source: src_buf.pointer() + src_off,
+                    destination: dst_ptr,
+                    bytes: run.bytes,
+                });
+            }
+            (_, Some(_)) => {
+                return Err(refused("fill DMA destination must be device memory"));
+            }
+        }
+    }
+    let mut batch = DirectBatch::new(device, NativeStream::Fill)
+        .map_err(|error| EncodeFailure::uncommitted(CallError::Execution(error)))?;
+    follow_fences(&mut batch, after)
+        .map_err(|error| EncodeFailure::uncommitted(CallError::Execution(error)))?;
+    for step in checked {
+        let issued = match step {
+            // SAFETY: caller retains every source and destination allocation until completion.
+            CheckedCopy::Upload { source, destination, bytes } => unsafe { batch.upload(destination, source, bytes) },
+            CheckedCopy::Within { source, destination, bytes } => batch.copy(destination, source, bytes),
+        };
+        if let Err(error) = issued {
+            let error = CallError::Execution(error);
+            return Err(match batch.abandon() {
+                Ok(fenced) => EncodeFailure { error, committed: Some(Committed::Cuda(fenced)) },
+                Err(fence) => EncodeFailure::uncommitted(CallError::Unfenced { issue: Box::new(error), fence }),
+            });
+        }
+    }
+    batch
+        .commit()
+        .map(Committed::Cuda)
+        .map_err(|error| EncodeFailure::uncommitted(CallError::Execution(error)))
 }
 
 /// One segment of a sealed-plan submission: its work (if any) and the

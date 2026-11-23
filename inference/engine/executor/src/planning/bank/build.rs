@@ -128,30 +128,31 @@ impl ModelLoadPlan {
         let structured = conveyor::Structured::new(selected, host, groups, layers, window_slots)
             .map_err(PlanError::InvalidDefinition)?;
         // Every stored table whose slots the host fills in place, held in
-        // granules of the bank's pool: only where the host writes it.
+        // granules of the bank's largest records pool: only where the host
+        // writes it.
         let mut tables = Vec::new();
-        let granule = structured.granule();
-        // The records pools' blocks, which every charge of their granules is
-        // whole blocks of: the rule a load opens them by
-        // (`memory::ledger::Ledgers::open_pool`).
-        let block = seismic::block_bytes(seismic::BlockSizing { granule, allocations })
-            .map_err(|error| PlanError::ResourcePlanning(format!("the bank's records pool blocks: {error:?}")))?;
+        let table_granule = structured.table_granule();
+        // Each distinct granule's records pool blocks, which every charge of
+        // its granules is whole blocks of: the rule a load opens them by
+        // (`memory::ledger::DeviceLedgers::open_records_pools_at`).
+        let blocks = super::size_pool_blocks(structured.granules(), allocations)
+            .map_err(PlanError::ResourcePlanning)?;
         for weight in self.target.iter_mut().filter(|weight| weight.stored_in_slots() && matches!(host, super::HostTier::Unified(_))) {
             let heads = stored_table_heads(definition, weight.role)?;
             let step_rows = heads
                 .checked_mul(magnitude_batching::MAX_CLASS_ROWS as u64)
                 .ok_or(PlanError::Arithmetic("a step's table rows overflow"))?;
-            let Some(table) = BankTable::of(weight, step_rows, granule).map_err(PlanError::InvalidDefinition)? else {
+            let Some(table) = BankTable::of(weight, step_rows, table_granule).map_err(PlanError::InvalidDefinition)? else {
                 continue;
             };
-            *weight = table.plan(granule).map_err(PlanError::ResourcePlanning)?;
+            *weight = table.plan(table_granule).map_err(PlanError::ResourcePlanning)?;
             tables.push(table);
         }
         let bank = ExpertBankPlan {
             structured,
             backend,
             allocations,
-            block,
+            blocks,
             slots,
             ceiling: slots,
             resident: false,

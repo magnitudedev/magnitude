@@ -568,12 +568,14 @@ pub(crate) fn routed<'a, G: GraphDraft + 'a>(
     let part = bank.stacks();
     let mut streamed = StreamedLayer::of(planned, &topology.bank, shape.bank.as_ref(), scope, bank)?;
     let decode = decodes(rows);
-    if operand.is_some() && (!decode || split.is_some()) {
-        return Err("a routed layer forms an operand only at a whole decode".into());
+    if operand.is_some()
+        && (!decode || matches!(split, Some(Split::Front(_) | Split::Combine(..) | Split::DecodeFront(_))))
+    {
+        return Err("a routed layer forms an operand only at a whole or back decode".into());
     }
     let scratch = streamed.is_some() && !decode;
-    match (split, &mut streamed) {
-        (None, _) if !scratch => {}
+    let decode_back = match (split, &mut streamed) {
+        (None, _) if !scratch => None,
         // A front routes into its crossing; a scratch-served one requests
         // its experts (none while its layer is whole).
         (Some(Split::Front(crossing)), layer) if !decode => {
@@ -600,34 +602,192 @@ pub(crate) fn routed<'a, G: GraphDraft + 'a>(
             let output = combine(graph, &handle, &shared, &back.pass(blocks), combined, residual, join, rows, shape, constants)?;
             return Ok((output, None));
         }
+        // M7 split decode front: route + hints + file-miss landing (`routed_land`)
+        // writing `sources` to the host-visible `DecodeSources` port.
+        // Declares ONLY ports consumed by `DecodeFront` (no `SharedDown`,
+        // no `gate_scale`/`up_scale`, no `Tier { kind }`, no `Site*`).
+        (Some(Split::DecodeFront(crossing)), Some(layer)) if decode => {
+            let route_weights = RouteWeights::of(graph, planned, scope, weights, constants, input)?;
+            let [parts, norm_extent] = input.form.dimensions(shape.hidden.clone());
+            let RouteWeights { norm, router, shared_router, expert_scale } = &route_weights;
+            let shared_gate = weight_port(
+                graph,
+                planned,
+                WeightRole { scope, kind: WeightKind::SharedGate },
+                WeightPart::Values,
+                weights,
+            )?
+            .tensor()
+            .clone();
+            let shared_up = weight_port(
+                graph,
+                planned,
+                WeightRole { scope, kind: WeightKind::SharedUp },
+                WeightPart::Values,
+                weights,
+            )?
+            .tensor()
+            .clone();
+            let normalize = shape.normalize()?;
+            let bank = layer.numbers();
+            let mut ports = layer.decode_front_ports(graph, rows, constants)?;
+            let mut routing = layer.part(graph, BankPart::Routing)?;
+            let mut front = layer.part(graph, BankPart::Front)?;
+            let tier = layer.front_route_tier(graph, &ports, constants)?;
+            let mut keys = layer.route_keys(graph)?;
+            let route_dims = [
+                ("M", rows.clone()),
+                ("H", shape.hidden.clone()),
+                ("E", shape.count.clone()),
+                ("K", shape.selected.clone()),
+                ("S", shape.shared_intermediate.clone()),
+                parts.clone(),
+                norm_extent.clone(),
+                ("ES", expert_scale.extent.clone()),
+                ("FW", bank.file_width.clone()),
+                ("FLIGHT", bank.flight.clone()),
+                ("RING", bank.ring_words.clone()),
+                ("P", bank.choices.clone()),
+                ("GM", bank.map_words.clone()),
+                ("TM", tier.experts.clone()),
+            ];
+            let BankRoute::Fused { activation, route, hints: hint_kernels } = layer.route() else {
+                return Err("a fused layer's bank holds another form's route".into());
+            };
+            let route = G::pick(route, rows);
+            let routed = graph.enqueue(
+                route,
+                &route_dims,
+                routed_route_streamed::WorkflowArgs {
+                    residual: input.rows.into(),
+                    norm: norm.into(),
+                    router: router.into(),
+                    shared_router: shared_router.into(),
+                    shared_gate: (&shared_gate).into(),
+                    shared_up: (&shared_up).into(),
+                    routes: crossing.routes.tensor_mut().into(),
+                    scores: crossing.weights.tensor_mut().into(),
+                    eps: epsilon.into(),
+                    normalize,
+                    expert_scale: (&expert_scale.tensor).into(),
+                    map: ports.map.tensor().into(),
+                    tier: (&tier.map).into(),
+                    policy: ports.policy.tensor().into(),
+                    sited: (ports.sited()).into(),
+                    step: ports.step.tensor().into(),
+                    file: ports.file.tensor_mut().into(),
+                    sources: crossing.sources.tensor_mut().into(),
+                    routing: routing.tensor_mut().into(),
+                    keys: keys.tensor_mut().into(),
+                    front: front.tensor_mut().into(),
+                    land_grid: ports.land_grid.tensor_mut().into(),
+                    land_groups: layer.land_groups().into(),
+                },
+            )?;
+            if let Some(mut hints) = layer.hints(graph, weights, [norm, router], ports.policy.tensor())? {
+                let hint = hint_kernels[hints.ahead as usize - 1]
+                    .ok_or("a streamed layer's lead was not prepared with its binding")?;
+                let empty = GraphConstant::empty_of(graph, activation, &[Dim::from(0u64), shape.selected.clone()], constants)?;
+                let hint_dims = [
+                    ("M", rows.clone()),
+                    ("H", shape.hidden.clone()),
+                    parts.clone(),
+                    norm_extent.clone(),
+                    ("K", shape.selected.clone()),
+                    ("AHEAD", Dim::from(hints.ahead)),
+                    ("RING", bank.ring_words.clone()),
+                    ("EN", bank.next_experts.clone()),
+                ];
+                graph.enqueue_under(
+                    hint,
+                    &hint_dims,
+                    routed_hint_route::WorkflowArgs {
+                        residual: input.rows.into(),
+                        activation: (&empty).into(),
+                        next_norm: (&hints.weights[0][0]).into(),
+                        next_router: (&hints.weights[0][1]).into(),
+                        after_norm: (&hints.weights[1][0]).into(),
+                        after_router: (&hints.weights[1][1]).into(),
+                        eps: epsilon.into(),
+                        step: ports.step.tensor().into(),
+                        next_policy: (&hints.policy).into(),
+                        rings: hints.rings.tensor_mut().into(),
+                    },
+                    &ports.policy,
+                    magnitude_kernels::constants::POLICY_HINTS,
+                    LaunchEncoding::WhileSet,
+                )?;
+            }
+            // Land any file misses (`POLICY_RESOLVED == 0`) into the host tier
+            // and update `crossing.sources` before `DecodeFront` signals the host.
+            let mut sources_tensor = crossing.sources.tensor().clone();
+            if layer.needs_front_land() {
+                let mut gate_records = weight_port(
+                    graph,
+                    planned,
+                    WeightRole { scope, kind: WeightKind::ExpertGate },
+                    part,
+                    weights,
+                )?;
+                let mut up_records = weight_port(
+                    graph,
+                    planned,
+                    WeightRole { scope, kind: WeightKind::ExpertUp },
+                    part,
+                    weights,
+                )?;
+                let mut down_records = weight_port(
+                    graph,
+                    planned,
+                    WeightRole { scope, kind: WeightKind::ExpertDown },
+                    part,
+                    weights,
+                )?;
+                layer.land_front(
+                    graph,
+                    &mut ports,
+                    &mut sources_tensor,
+                    RecordTensors {
+                        gate: Some(&mut gate_records),
+                        up: &mut up_records,
+                        down: &mut down_records,
+                    },
+                    &super::streamed::DecodeShape { rows },
+                    constants,
+                )?;
+            }
+            graph.store(&routed.r0, &mut crossing.normalized)?;
+            let Some(into_coeff) = crossing.coefficient.as_mut() else {
+                return Err("a fused decode front crosses no coefficient".into());
+            };
+            graph.store(&routed.r1, into_coeff)?;
+            let Some(into_shared) = crossing.shared_product.as_mut() else {
+                return Err("a fused decode front crosses no shared product".into());
+            };
+            graph.store(&routed.r2, into_shared)?;
+            // Publish CPU-sited choices at the tail of `DecodeFront` so
+            // `expert-compute` overlaps 100% with host-driven `DecodeDma`.
+            let sources_view = sources_tensor.slice_leading(0, magnitude_kernels::constants::SOURCE_ROWS);
+            layer.site_request_front(
+                graph,
+                &mut ports,
+                crossing.routes.tensor(),
+                crossing.weights.tensor(),
+                &sources_view,
+                &routed.r0,
+                &super::streamed::DecodeShape { rows },
+            )?;
+            return Ok((residual.clone(), ports.inputs.take()));
+        }
+        (Some(Split::DecodeBack(crossing)), Some(_)) if decode => Some(crossing),
         _ => return Err("a routed layer's graph disagrees with how its experts are served".into()),
-    }
-    let route = RouteWeights::of(graph, planned, scope, weights, constants, input)?;
-    let choices = route.choices(input, rows, shape);
-    let [parts, norm_extent] = input.form.dimensions(shape.hidden.clone());
-    let RouteWeights {
-        norm,
-        router,
-        shared_router,
-        expert_scale,
-    } = &route;
+    };
     let ExpertWeights {
         stacks: [mut gate_records, mut up_records, mut down_records],
         gate_scale,
         up_scale,
     } = ExpertWeights::of(graph, planned, scope, weights, constants, part)?;
-    let [shared_gate, shared_up, shared_down] = shared_weights(graph, planned, scope, weights)?;
     let [streams, injected] = join.dimensions();
-    let experts_dims = [
-        ("M", rows.clone()),
-        ("H", shape.hidden.clone()),
-        ("E", shape.count.clone()),
-        ("K", shape.selected.clone()),
-        ("F", shape.intermediate.clone()),
-        ("S", shape.shared_intermediate.clone()),
-        ("GS", gate_scale.extent.clone()),
-        ("US", up_scale.extent.clone()),
-    ];
     let output_dims = [
         ("M", rows.clone()),
         ("H", shape.hidden.clone()),
@@ -644,26 +804,131 @@ pub(crate) fn routed<'a, G: GraphDraft + 'a>(
             None => Dim::from(0),
         }),
     ];
-    let mut routes = graph.local_for(handle.route, "routes", &choices)?;
-    let mut scores = graph.local_for(handle.route, "scores", &choices)?;
-    let normalize = shape.normalize()?;
 
     if decode {
-        // The expansion's and output's inputs: the experts' product, the
-        // shared product, the coefficient, where they read each choice's
-        // record (`DecodeReads`), `E` of what they read, and the sequence
-        // of a layer that sets a bank-served launch's step.
-        let resident = |graph: &mut G, constants: &mut Vec<GraphConstant>| {
-            let stacks = RecordTensors {
-                gate: Some(gate_records.tensor()),
-                up: up_records.tensor(),
-                down: down_records.tensor(),
-            };
-            DecodeReads::resident(graph, rows, &shape.selected, stacks, constants)
-        };
-        let (expert_product, shared_product, coefficient, reads, experts, sequence, sited) = match handle
-            .decode
-        {
+        let (routes_tensor, scores_tensor, shared_down, expert_product, shared_product, coefficient, reads, experts, sequence, sited) =
+            if let Some(crossing) = decode_back {
+                let shared_down = weight_port(
+                    graph,
+                    planned,
+                    WeightRole { scope, kind: WeightKind::SharedDown },
+                    WeightPart::Values,
+                    weights,
+                )?
+                .tensor()
+                .clone();
+                let RoutedDecodeEntries::SharedRoute { choices: gate_up, .. } = handle.decode else {
+                    return Err("M7 decode back requires SharedRoute decode entries".into());
+                };
+                let layer = streamed.as_mut().expect("DecodeBack requires a streamed layer");
+                let ports = layer.decode_back_ports(graph, false)?;
+                let sources_view = crossing
+                    .sources
+                    .tensor()
+                    .slice_leading(0, magnitude_kernels::constants::SOURCE_ROWS);
+                let reads = layer.reads_back(graph, &ports, sources_view, constants)?;
+                let experts = layer.numbers().records.clone();
+                let dimensions = [
+                    [
+                        ("M", rows.clone()),
+                        ("H", shape.hidden.clone()),
+                        ("E", experts.clone()),
+                        ("K", shape.selected.clone()),
+                        ("F", shape.intermediate.clone()),
+                        ("GS", gate_scale.extent.clone()),
+                        ("US", up_scale.extent.clone()),
+                        ("LB", Dim::from(magnitude_family_contracts::GluLimit::word(None))),
+                    ]
+                    .as_slice(),
+                    &reads.dimensions(),
+                ]
+                .concat();
+                let glu_limit = crate::operators::glu_limit(crossing.routes.tensor(), None);
+                let product = graph
+                    .enqueue(
+                        G::pick(gate_up, rows),
+                        &dimensions,
+                        choices_args(
+                            crossing.normalized.tensor(),
+                            crossing.routes.tensor(),
+                            &reads,
+                            tier_gate(&reads)?,
+                            [gate_records.tensor(), up_records.tensor()],
+                            [&gate_scale, &up_scale],
+                            &glu_limit,
+                        ),
+                    )?
+                    .value;
+                let coefficient = crossing
+                    .coefficient
+                    .as_ref()
+                    .ok_or("a fused decode back crosses no coefficient")?
+                    .tensor()
+                    .clone();
+                let shared_product = crossing
+                    .shared_product
+                    .as_ref()
+                    .ok_or("a fused decode back crosses no shared product")?
+                    .tensor()
+                    .clone();
+                let sited = ports.site.map(|site| {
+                    (
+                        site,
+                        ports.policy.expect("sited DecodeBackPorts binds Policy"),
+                        ports.step.expect("sited DecodeBackPorts binds Step"),
+                    )
+                });
+                (
+                    crossing.routes.tensor().clone(),
+                    crossing.weights.tensor().clone(),
+                    shared_down,
+                    product,
+                    shared_product,
+                    coefficient,
+                    reads,
+                    experts,
+                    None,
+                    sited,
+                )
+            } else {
+                let route = RouteWeights::of(graph, planned, scope, weights, constants, input)?;
+                let choices = route.choices(input, rows, shape);
+                let [parts, norm_extent] = input.form.dimensions(shape.hidden.clone());
+                let RouteWeights {
+                    norm,
+                    router,
+                    shared_router,
+                    expert_scale,
+                } = &route;
+                let [shared_gate, shared_up, shared_down] = shared_weights(graph, planned, scope, weights)?;
+                let experts_dims = [
+                    ("M", rows.clone()),
+                    ("H", shape.hidden.clone()),
+                    ("E", shape.count.clone()),
+                    ("K", shape.selected.clone()),
+                    ("F", shape.intermediate.clone()),
+                    ("S", shape.shared_intermediate.clone()),
+                    ("GS", gate_scale.extent.clone()),
+                    ("US", up_scale.extent.clone()),
+                ];
+                let mut routes = graph.local_for(handle.route, "routes", &choices)?;
+                let mut scores = graph.local_for(handle.route, "scores", &choices)?;
+                let normalize = shape.normalize()?;
+                // The expansion's and output's inputs: the experts' product, the
+                // shared product, the coefficient, where they read each choice's
+                // record (`DecodeReads`), `E` of what they read, and the sequence
+                // of a layer that sets a bank-served launch's step.
+                let resident = |graph: &mut G, constants: &mut Vec<GraphConstant>| {
+                    let stacks = RecordTensors {
+                        gate: Some(gate_records.tensor()),
+                        up: up_records.tensor(),
+                        down: down_records.tensor(),
+                    };
+                    DecodeReads::resident(graph, rows, &shape.selected, stacks, constants)
+                };
+                let (expert_product, shared_product, coefficient, reads, experts, sequence, sited) = match handle
+                    .decode
+                {
             RoutedDecodeEntries::Expand(expand) => {
                 super::streamed::expand_form(streamed.is_some())?;
                 let (expert_gate, expert_up) =
@@ -905,13 +1170,26 @@ pub(crate) fn routed<'a, G: GraphDraft + 'a>(
                             )?;
                             let mut ports = step.ports;
                             let sequence = ports.inputs.take();
-                            let sited = ports.site.is_some().then_some(ports);
+                            let sited = ports.site.map(|site| (site.into_combine(), ports.policy, ports.step));
                             (product, routed.r1, routed.r2, reads, experts, sequence, sited)
                         }
                     };
                 (expert_product, shared, coefficient, reads, experts, sequence, sited)
             }
         };
+                (
+                    routes.tensor().clone(),
+                    scores.tensor().clone(),
+                    shared_down,
+                    expert_product,
+                    shared_product,
+                    coefficient,
+                    reads,
+                    experts,
+                    sequence,
+                    sited,
+                )
+            };
         let inject = join.inject(graph, rows, constants)?;
         // The norm the operand is formed under, or none (`NO` 0).
         let (operand_norm, operand_epsilon) = match &operand {
@@ -926,9 +1204,9 @@ pub(crate) fn routed<'a, G: GraphDraft + 'a>(
             inject: (&inject).into(),
             expert_product: (&expert_product).into(),
             shared_product: (&shared_product).into(),
-            routes: routes.tensor().into(),
+            routes: (&routes_tensor).into(),
             sources: (&reads.sources).into(),
-            scores: scores.tensor().into(),
+            scores: (&scores_tensor).into(),
             coefficient: (&coefficient).into(),
             expert_down: down_records.tensor().into(),
             tier_down: (&reads.tier.down).into(),
@@ -946,8 +1224,8 @@ pub(crate) fn routed<'a, G: GraphDraft + 'a>(
         // storage holds the output (`GraphDraft::share`). Any other layer
         // combines resident, unconditioned.
         let combine = match (streamed.as_mut(), sited) {
-            (Some(layer), Some(mut ports)) => {
-                ports.site.take().zip(layer.site_combine()).map(|(site, combine)| (layer, site, combine, ports))
+            (Some(layer), Some((site, policy, step))) => {
+                layer.site_combine().map(|combine| (layer, site, combine, policy, step))
             }
             _ => None,
         };
@@ -956,8 +1234,8 @@ pub(crate) fn routed<'a, G: GraphDraft + 'a>(
             Some(_) if operand.is_some() => {
                 return Err("a routed layer with a site forms no operand for another graph".into());
             }
-            Some((layer, mut site, (BankCombineEntry::Fused { project, sited }, site_dimensions), ports)) => {
-                let (policy, whole) = (ports.policy, magnitude_kernels::constants::POLICY_WHOLE);
+            Some((layer, mut site, (BankCombineEntry::Fused { project, sited }, site_dimensions), policy, step)) => {
+                let whole = magnitude_kernels::constants::POLICY_WHOLE;
                 let resident = graph
                     .enqueue_under(G::pick(handle.output, rows), &dimensions, resident_args(), &policy, whole, LaunchEncoding::WhileSet)?
                     .value;
@@ -968,7 +1246,7 @@ pub(crate) fn routed<'a, G: GraphDraft + 'a>(
                         routed_output_project::WorkflowArgs {
                             expert_product: (&expert_product).into(),
                             shared_product: (&shared_product).into(),
-                            routes: routes.tensor().into(),
+                            routes: (&routes_tensor).into(),
                             sources: (&reads.sources).into(),
                             expert_down: down_records.tensor().into(),
                             tier_down: (&reads.tier.down).into(),
@@ -989,9 +1267,9 @@ pub(crate) fn routed<'a, G: GraphDraft + 'a>(
                             inject: (&inject).into(),
                             published: (&published).into(),
                             sources: (&reads.sources).into(),
-                            scores: scores.tensor().into(),
+                            scores: (&scores_tensor).into(),
                             coefficient: (&coefficient).into(),
-                            step: ports.step.tensor().into(),
+                            step: step.tensor().into(),
                             site: site.table.tensor_mut().into(),
                             site_output: site.output.tensor().into(),
                         },
@@ -1003,7 +1281,7 @@ pub(crate) fn routed<'a, G: GraphDraft + 'a>(
                 graph.share(&joined, &resident)?;
                 resident
             }
-            Some((_, _, (BankCombineEntry::General { .. }, _), _)) => {
+            Some((_, _, (BankCombineEntry::General { .. }, _), _, _)) => {
                 return Err("a fused layer's bank holds another form's combine".into());
             }
             None => graph.enqueue(G::pick(handle.output, rows), &dimensions, resident_args())?.value,
@@ -1014,6 +1292,11 @@ pub(crate) fn routed<'a, G: GraphDraft + 'a>(
         return Ok((output, sequence));
     }
 
+    let route = RouteWeights::of(graph, planned, scope, weights, constants, input)?;
+    let choices = route.choices(input, rows, shape);
+    let [shared_gate, shared_up, shared_down] = shared_weights(graph, planned, scope, weights)?;
+    let mut routes = graph.local_for(handle.route, "routes", &choices)?;
+    let mut scores = graph.local_for(handle.route, "scores", &choices)?;
     let (normalized, coefficient) =
         route.route(graph, handle.route, input, &mut routes, &mut scores, rows, shape, epsilon)?;
     let experts = ExpertWeights {

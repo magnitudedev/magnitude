@@ -23,6 +23,7 @@ mod registry;
 pub mod toolchain;
 pub mod topology;
 pub mod transfer;
+pub use driver::Event;
 
 /// What `process` holds on the NVIDIA GPU `uuid` (`cuDeviceGetUuid_v2`,
 /// Vulkan's `deviceUUID`) through CUDA or graphics contexts, as NVML counts

@@ -356,16 +356,6 @@ pub(super) fn record_slab(record: &RecordTensors<RecordTensor>) -> Result<PoolSl
         .map_err(|error| format!("a bank record's slab: {error}"))
 }
 
-/// The slab a slab store of each of `records` fits ([`PoolSlab::with`]).
-pub(super) fn records_slab<'a>(
-    records: impl IntoIterator<Item = &'a RecordTensors<RecordTensor>>,
-) -> Result<PoolSlab, String> {
-    records
-        .into_iter()
-        .map(record_slab)
-        .try_fold(PoolSlab { bytes: 0, alignment: 1 }, |pool, slab| pool.with(slab?))
-}
-
 /// The record form of an expert stack planned resident: refused when its
 /// bytes are uploaded other than as stored, or it does not hold each of its
 /// `experts` experts as one range of its stored experts' bytes

@@ -838,7 +838,6 @@ impl HostRecords {
     }
 
     /// Whether the tier holds `staged` alone.
-    #[cfg(test)]
     pub fn holds_alone(&self, staged: Staged) -> bool {
         self.kept.get(&staged).is_some_and(|&record| self.records[record as usize].whole().is_some_and(|whole| whole.kept == Kept::Alone))
     }
@@ -1440,8 +1439,8 @@ impl HostRecords {
     /// group's lease is out (`at`), as the refill's does. A tier that
     /// covers its experts ([`Self::covers`]) gives up none: no other expert
     /// could take the record, and the cover would read the expert back.
-    /// The experts given up.
-    pub fn surrender(&mut self, at: &Unbegun) -> Vec<Staged> {
+    /// The experts given up, along with their tier record indices.
+    pub fn surrender_records(&mut self, at: &Unbegun) -> Vec<(u32, Staged)> {
         if self.covers() {
             return Vec::new();
         }
@@ -1451,9 +1450,14 @@ impl HostRecords {
             .map(|record| {
                 let staged = self.records[record as usize].whole().expect("a banked record keeps its expert whole").staged;
                 self.grace(record, at);
-                staged
+                (record, staged)
             })
             .collect()
+    }
+
+    /// The experts given up.
+    pub fn surrender(&mut self, at: &Unbegun) -> Vec<Staged> {
+        self.surrender_records(at).into_iter().map(|(_, staged)| staged).collect()
     }
 
     /// Whether `record` keeps an expert whole, kept or answering, and no

@@ -149,12 +149,15 @@ pub(super) fn bank_layer_by_block(load: &ModelLoadPlan, block_count: usize) -> V
 pub(super) struct BlockServed {
     pub(super) streams: bool,
     pub(super) resident: bool,
+    pub(super) decode_split: bool,
     pub(super) split: Option<SplitValues<Extents>>,
+    pub(super) decode_crossing: Option<crate::operators::routed::split::DecodeCrossingBuffers<Extents>>,
 }
 
 /// Each block's `BlockServed`, its rows crossed over a chain of
 /// `chain_rows` rows and merged by the group's `passes`.
 pub(super) fn block_served(
+    backend: seismic::BackendName,
     load: &ModelLoadPlan,
     geometry: &Decoder,
     limits: ResourceLimits,
@@ -164,6 +167,10 @@ pub(super) fn block_served(
     let block_count = geometry.blocks.len();
     let bank_layers = bank_layer_by_block(load, block_count);
     let bank_resident = load.expert_bank().is_some_and(|bank| bank.resident);
+    let bank_decode_dma = crate::experts::decode_dma_enabled(backend)
+        && load
+            .expert_bank()
+            .is_some_and(|bank| bank.placer() == crate::planning::Placer::Tier && !bank.whole());
     let chain_merges = limits.chain_capacity.get() > 1;
     let prompts = magnitude_batching::row_classes(limits.max_launch_rows)
         .last()
@@ -171,17 +178,32 @@ pub(super) fn block_served(
     (0..block_count)
         .map(|index| {
             let streams = bank_layers[index].is_some();
+            let routed = block_routed(geometry, index)?;
             let split = if prompts && (chain_merges || streams) {
-                block_routed(geometry, index)?
+                routed
                     .map(|routed| SplitValues::of(routed, geometry, chain_rows, passes.rows()))
                     .transpose()?
+            } else {
+                None
+            };
+            let decode_split = streams && bank_decode_dma && routed.is_some();
+            let decode_crossing = if decode_split {
+                routed.map(|routed| {
+                    crate::operators::routed::split::DecodeCrossingBuffers::of(
+                        routed,
+                        geometry,
+                        magnitude_kernels::constants::VERIFY_ROWS,
+                    )
+                })
             } else {
                 None
             };
             Ok(BlockServed {
                 streams,
                 resident: streams && bank_resident,
+                decode_split,
                 split,
+                decode_crossing,
             })
         })
         .collect()
@@ -194,9 +216,10 @@ pub(super) fn block_stages(served: &[BlockServed], index: usize, rows: u64) -> &
 }
 
 /// The stages block `index`'s graphs of `rows` rows are sealed in
-/// (`RunStage::sealed`): its runs' stages and its resident form.
+/// (`RunStage::sealed`): its runs' stages, its resident form, and its M7
+/// decode split front/back where active.
 pub(super) fn block_sealed_stages(served: &[BlockServed], index: usize, rows: u64) -> &'static [RunStage] {
-    RunStage::sealed(served[index].split.is_some(), served[index].resident, rows)
+    RunStage::sealed(served[index].split.is_some(), served[index].resident, served[index].decode_split, rows)
 }
 
 /// Whether a launch of `rows` rows splits at block `index`

@@ -19,7 +19,7 @@
 
 use crate::buffer::Buffer;
 use crate::direct::HostWord;
-use crate::driver::Stream;
+use crate::driver::{Event, Stream};
 use crate::executor::Device;
 use seismic_compiler::errors::ExecutionError;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -108,14 +108,51 @@ impl TransferQueue {
     /// ([`Self::completed`]). The caller keeps every run's bytes untouched
     /// until the batch is complete.
     pub fn copy(&self, items: &[TransferItem<'_>], value: u32) -> Result<(), ExecutionError> {
+        self.copy_inner(items, value, false).map(|_| ())
+    }
+
+    /// [`Self::copy`], also recording a device-only CUDA [`Event`] on the
+    /// transfer stream right after the batch's copies so a compute
+    /// [`crate::direct::DirectBatch::follow_event`] can wait on it via
+    /// `cuStreamWaitEvent` with zero host round-trip and zero `cuStreamWaitValue32`.
+    pub fn copy_event(&self, items: &[TransferItem<'_>], value: u32) -> Result<Arc<Event>, ExecutionError> {
+        self.copy_inner(items, value, true)
+            .map(|event| event.expect("copy_inner with record_event=true returns an event"))
+    }
+
+    fn copy_inner(&self, items: &[TransferItem<'_>], value: u32, record_event: bool) -> Result<Option<Arc<Event>>, ExecutionError> {
         let checked = items.iter().map(Self::check).collect::<Result<Vec<_>, _>>()?;
+        let event = if record_event {
+            Some(Arc::new(Event::sync_only(self.device.context()).map_err(submission)?))
+        } else {
+            None
+        };
         let mut faulted_now = false;
         {
             let mut fault = self.fault.lock().expect("transfer queue lock is never poisoned");
             if let Some(reason) = fault.as_deref() {
                 return Err(ExecutionError::SubmissionFailed(format!("the transfer queue faulted: {reason}")));
             }
-            if let Err(error) = self.queue(&checked, value).map_err(submission).and_then(|()| self.done.wake_after(&self.stream)) {
+            let queued = self
+                .queue(&checked, value)
+                .and_then(|()| {
+                    if let Some(ev) = &event {
+                        ev.record(&self.stream)?;
+                    }
+                    Ok(())
+                })
+                .map_err(submission)
+                .and_then(|()| {
+                    if record_event {
+                        // Stream-synced callers (`copy_event`) synchronize via
+                        // `cuStreamWaitEvent` on `event` and never sleep on
+                        // `self.done`; skip the blocking event + `cuLaunchHostFunc`.
+                        Ok(())
+                    } else {
+                        self.done.wake_after(&self.stream)
+                    }
+                });
+            if let Err(error) = queued {
                 *fault = Some(error.to_string());
                 self.faulted.store(true, Ordering::Release);
                 faulted_now = true;
@@ -126,7 +163,7 @@ impl TransferQueue {
             // `fault` already released and `faulted` published.
             self.done.wake();
         }
-        Ok(())
+        Ok(event)
     }
 
     /// Wait at most `timeout` for batch `value` ([`Self::completed`]),
