@@ -491,6 +491,11 @@ impl ElasticBank for ServedBank {
                 charge: Box::new(move |slots| counts.host_charge(slots)),
             });
         }
+        // Auxiliary tables have small granules (~4-6 MiB) compared to OS wired
+        // memory jitter (~8-20 MiB); give them a 64 MiB hysteresis deadband so
+        // jitter does not trigger synchronous resizes between prefill steps
+        // (while `owed > 0` still sheds at exact pool block granularity).
+        const TABLE_HYSTERESIS_BYTES: u64 = 64 * 1024 * 1024;
         for (index, held) in self.tables.iter().enumerate() {
             let holding = BankHolding::Table { table: index };
             let (block, granule) = (plan.table_block(), plan.table_granule());
@@ -501,7 +506,7 @@ impl ElasticBank for ServedBank {
                 tier: self.storage(holding)?,
                 at: records,
                 owed: self.bank.cache.owed(holding, self.above_floor(holding, records)?),
-                shape: BankShape::new(block.held, held.plan.floor, ceiling, ceiling),
+                shape: BankShape::new(block.held, held.plan.floor, ceiling, ceiling).with_deadband(TABLE_HYSTERESIS_BYTES),
                 charge: Box::new(move |records| {
                     crate::planning::BankTable::charge(block, granule, records).expect("invariant violated: a table's charge fits u64 at every size it holds")
                 }),

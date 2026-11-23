@@ -147,9 +147,15 @@ kernel void routed_experts_up_grids(EXPERTS_UP_ARGUMENTS) {
     const uint t = uint(SEISMIC_DIM_T), f = uint(SEISMIC_DIM_F), h = uint(SEISMIC_DIM_H), blocks_used = uint(used[0]);
     routed::expert_grids(uint(rows[0]), blocks_used, t, (t + TILE_M - 1) / TILE_M, (f + TILE_N - 1) / TILE_N,
         (h + TILE_N - 1) / TILE_N, stage_grid, expand_grid, quantize_grid, down_grid);
-    if (int(SEISMIC_RUNTIME_TALL) != 0)
-        routed::form_grids(routed::form_of(int(SEISMIC_RUNTIME_INT8), int(SEISMIC_RUNTIME_PACK)), blocks_used, t, f,
-            h, 1, expand_grid, table_grid, tile_grid);
+    if (int(SEISMIC_RUNTIME_TALL) != 0) {
+        const auto form = routed::form_of(int(SEISMIC_RUNTIME_INT8), int(SEISMIC_RUNTIME_PACK));
+        const bool coalesce = (SEISMIC_DIM_T == 32) && (form == routed::gemm_form::tall);
+        const uint count = coalesce
+            ? routed::write_tall_tiles(blocks, SEISMIC_BLOCKS_STRIDE_0, blocks_used,
+                  routed::tall_tiles(tables, uint(SEISMIC_DIM_B)))
+            : blocks_used;
+        routed::form_grids(form, count, coalesce ? 64u : t, f, h, 1, expand_grid, table_grid, tile_grid);
+    }
     if (int(SEISMIC_RUNTIME_INT8) + int(SEISMIC_RUNTIME_PACK) + int(SEISMIC_RUNTIME_DOWN_INT8)
             + int(SEISMIC_RUNTIME_DOWN_PACK) != 0)
         routed::write_ordinals(blocks, SEISMIC_BLOCKS_STRIDE_0, blocks_used, routed::ordinals(tables));
@@ -183,9 +189,21 @@ kernel void routed_experts_up_expand(EXPERTS_UP_ARGUMENTS, PROJECTION_TILE_ARGUM
 #endif
 
 // TALL: each block's rows in the tall GEMM's order, then its 64-row tall
-// tiles (those past its live rows absent).
+// tiles (when T == 32, consecutive blocks of the same expert coalesce into
+// one 64-row tall tile; tiles past live rows are skipped).
 #ifdef SEISMIC_FORMING_ROUTED_EXPERTS_UP_RELAYOUT
 kernel void routed_experts_up_relayout(EXPERTS_UP_ARGUMENTS, PROJECTION_ITEM_ARGUMENTS) {
+    if constexpr (SEISMIC_DIM_T == 32) {
+        const uint packed = routed::tall_tiles(tables, uint(SEISMIC_DIM_B))[position.y];
+        const uint block = packed >> 1u;
+        const uint span_rows = (1u + (packed & 1u)) * 32u;
+        EXPERTS_UP_BLOCK(block);
+        (void)source;
+        const routed::Grouped in = EXPERTS_UP_BLOCK_ROWS(block);
+        projection::tall_relayout(in, routed::block_fragments(operand, position.y, 64u, uint(SEISMIC_DIM_H)),
+            span_rows, uint(SEISMIC_DIM_H), position.x);
+        return;
+    }
     EXPERTS_UP_BLOCK(position.y);
     (void)source;
     const routed::Grouped in = EXPERTS_UP_BLOCK_ROWS(position.y);
@@ -198,6 +216,22 @@ kernel void routed_experts_up_relayout(EXPERTS_UP_ARGUMENTS, PROJECTION_ITEM_ARG
 template <uint TALL_K, uint STAGERS>
 kernel void routed_experts_up_tall(EXPERTS_UP_ARGUMENTS, PROJECTION_TILE_ARGUMENTS) {
     PROJECTION_GEMM_TALL_SHARED(shared, TALL_K);
+    if constexpr (SEISMIC_DIM_T == 32) {
+        const uint packed = routed::tall_tiles(tables, uint(SEISMIC_DIM_B))[tile.y];
+        const uint block = packed >> 1u;
+        const bool two = (packed & 1u) != 0u;
+        const uint span_rows = two ? (32u + EXPERTS_UP_LIVE(block + 1u)) : EXPERTS_UP_LIVE(block);
+        if (span_rows == 0u)
+            return;
+        EXPERTS_UP_BLOCK(block);
+        EXPERTS_UP_EXPANSION;
+        const routed::Grouped in = EXPERTS_UP_BLOCK_ROWS(block);
+        const auto out = EXPERTS_UP_PRODUCTS(block);
+        projection::gemm_tall<packets::W0, 64, TALL_K, STAGERS>(projection::tall_operand(in,
+            routed::block_fragments(operand, tile.y, 64u, uint(SEISMIC_DIM_H))), out, up,
+            span_rows, uint(SEISMIC_DIM_F), uint(SEISMIC_DIM_H), 0u, tile.x, shared, sg, lane);
+        return;
+    }
     const uint block = tile.y / TALL_TILES, tm = tile.y % TALL_TILES;
     if (tm * 64u >= EXPERTS_UP_LIVE(block))
         return;
@@ -358,9 +392,15 @@ kernel void routed_experts_up_quantize(EXPERTS_UP_ARGUMENTS,
 // launches have run.
 #ifdef SEISMIC_FORMING_ROUTED_EXPERTS_UP_DOWN_GRIDS
 kernel void routed_experts_up_down_grids(EXPERTS_UP_ARGUMENTS) {
-    routed::form_grids(routed::form_of(int(SEISMIC_RUNTIME_DOWN_INT8), int(SEISMIC_RUNTIME_DOWN_PACK)),
-        uint(used[0]), uint(SEISMIC_DIM_T), uint(SEISMIC_DIM_H), uint(SEISMIC_DIM_F), 1, down_grid, table_grid,
-        tile_grid);
+    const auto form = routed::form_of(int(SEISMIC_RUNTIME_DOWN_INT8), int(SEISMIC_RUNTIME_DOWN_PACK));
+    const uint blocks_used = uint(used[0]);
+    const bool coalesce = (SEISMIC_DIM_T == 32) && (form == routed::gemm_form::tall);
+    const uint count = coalesce
+        ? routed::write_tall_tiles(blocks, SEISMIC_BLOCKS_STRIDE_0, blocks_used,
+              routed::tall_tiles(tables, uint(SEISMIC_DIM_B)))
+        : blocks_used;
+    routed::form_grids(form, count, coalesce ? 64u : uint(SEISMIC_DIM_T), uint(SEISMIC_DIM_H), uint(SEISMIC_DIM_F), 1,
+        down_grid, table_grid, tile_grid);
 }
 #endif
 
@@ -382,6 +422,18 @@ kernel void routed_experts_up_down(EXPERTS_UP_ARGUMENTS, PROJECTION_TILE_ARGUMEN
 // The down GEMM's forms, over the blocks' products.
 #ifdef SEISMIC_FORMING_ROUTED_EXPERTS_UP_DOWN_RELAYOUT
 kernel void routed_experts_up_down_relayout(EXPERTS_UP_ARGUMENTS, PROJECTION_ITEM_ARGUMENTS) {
+    if constexpr (SEISMIC_DIM_T == 32) {
+        const uint packed = routed::tall_tiles(tables, uint(SEISMIC_DIM_B))[position.y];
+        const uint block = packed >> 1u;
+        const bool two = (packed & 1u) != 0u;
+        const uint span_rows = two ? (32u + EXPERTS_UP_LIVE(block + 1u)) : EXPERTS_UP_LIVE(block);
+        EXPERTS_UP_BLOCK(block);
+        (void)source;
+        const auto in = EXPERTS_UP_BLOCK_PRODUCTS(block);
+        projection::tall_relayout(in, routed::block_fragments(operand, position.y, 64u, uint(SEISMIC_DIM_F)),
+            span_rows, uint(SEISMIC_DIM_F), position.x);
+        return;
+    }
     EXPERTS_UP_BLOCK(position.y);
     (void)source;
     const auto in = EXPERTS_UP_BLOCK_PRODUCTS(position.y);
@@ -394,6 +446,24 @@ kernel void routed_experts_up_down_relayout(EXPERTS_UP_ARGUMENTS, PROJECTION_ITE
 template <uint DOWN_TALL_K, uint DOWN_STAGERS>
 kernel void routed_experts_up_down_tall(EXPERTS_UP_ARGUMENTS, PROJECTION_TILE_ARGUMENTS) {
     PROJECTION_GEMM_TALL_SHARED(shared, DOWN_TALL_K);
+    if constexpr (SEISMIC_DIM_T == 32) {
+        const uint packed = routed::tall_tiles(tables, uint(SEISMIC_DIM_B))[tile.y];
+        const uint block = packed >> 1u;
+        const bool two = (packed & 1u) != 0u;
+        const uint span_rows = two ? (32u + EXPERTS_UP_LIVE(block + 1u)) : EXPERTS_UP_LIVE(block);
+        if (span_rows == 0u)
+            return;
+        EXPERTS_UP_BLOCK(block);
+        EXPERTS_UP_DOWN;
+        const auto in = EXPERTS_UP_BLOCK_PRODUCTS(block);
+        const routed::BlockOutput<ELEMENT_OF(SEISMIC_RESULT_0)> block_out{
+            element::Out<ELEMENT_OF(SEISMIC_RESULT_0)>(output_cells).offset(ulong(block) * SEISMIC_RESULT_0_STRIDE_0),
+            SEISMIC_RESULT_0_STRIDE_0, SEISMIC_RESULT_0_STRIDE_1, SEISMIC_RESULT_0_STRIDE_2, 32u};
+        projection::gemm_tall<packets::W1, 64, DOWN_TALL_K, DOWN_STAGERS>(projection::tall_operand(in,
+            routed::block_fragments(operand, tile.y, 64u, uint(SEISMIC_DIM_F))), block_out, down,
+            span_rows, uint(SEISMIC_DIM_H), uint(SEISMIC_DIM_F), 0u, tile.x, shared, sg, lane);
+        return;
+    }
     const uint block = tile.y / TALL_TILES, tm = tile.y % TALL_TILES;
     if (tm * 64u >= EXPERTS_UP_LIVE(block))
         return;

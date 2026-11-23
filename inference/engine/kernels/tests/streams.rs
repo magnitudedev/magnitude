@@ -1610,6 +1610,7 @@ fn metal_q3k_and_iq4xs_default_to_tall_k128() {
     let q3k = seismic::Element::stored("q3k", resident).unwrap();
     let iq4xs = seismic::Element::stored("iq4xs", resident).unwrap();
     let q4k = seismic::Element::stored("q4k", resident).unwrap();
+    let q2g64 = seismic::Element::stored("q2g64", resident).unwrap();
     fn default_metal_spec<E: seismic::Entry>(
         elements: &[(&str, seismic::Element)],
         statics: impl Fn(&str) -> u64,
@@ -1679,4 +1680,19 @@ fn metal_q3k_and_iq4xs_default_to_tall_k128() {
         assert_eq!(spec.param("DOWN_PACK"), Some(0), "routed_experts {name} defaults to DOWN_PACK=0");
         assert_eq!(spec.launch_param(routed_down_tall, "DOWN_TALL_K"), Some(128), "routed_experts {name} defaults to DOWN_TALL_K=128");
     }
+    let q2g64_spec = default_metal_spec::<magnitude_kernels::routed_experts::Entry>(
+        &[
+            ("A", seismic::Element::bf16()),
+            ("EGW", q2g64),
+            ("EUW", q2g64),
+            ("EDW", q2g64),
+        ],
+        |dim| match dim {
+            "H" | "F" => 512,
+            "T" => 32,
+            "GS" | "US" | "LB" => 0,
+            other => panic!("unexpected static {other}"),
+        },
+    );
+    assert_eq!(q2g64_spec.param("PACK"), Some(1), "routed_experts q2g64 retains PACK=1");
 }

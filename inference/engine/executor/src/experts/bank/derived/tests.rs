@@ -437,3 +437,29 @@ fn tight_ram_swapless_cma_host_clamps_and_guards_host_tier_below_oom() {
     };
     assert_eq!(est.live_pinned_headroom(&near_floor), 0);
 }
+
+#[test]
+fn deadband_suppresses_table_jitter_while_preserving_owed_shedding_and_ceiling_growth() {
+    const MIB: u64 = 1024 * 1024;
+    const BLOCK: u64 = 4 * MIB;
+    const DEADBAND: u64 = 64 * MIB;
+    let charge = |records: u64| records * BLOCK;
+    let shape = BankShape::new(BLOCK, 2, 40, 40).with_deadband(DEADBAND);
+    // Holding 20 records (18 above floor = 72 MiB).
+    let at = 20;
+    let above = (at - 2) * BLOCK;
+    // ±20 MiB jitter (< 64 MiB deadband) neither shrinks nor grows.
+    assert_eq!(held_target_in(above - 20 * MIB, above - 20 * MIB, at, 0, &shape, &charge), at);
+    assert_eq!(held_target_in(above + 20 * MIB, above + 20 * MIB, at, 0, &shape, &charge), at);
+    // Deficit >= 64 MiB shrinks cleanly.
+    assert_eq!(held_target_in(above - DEADBAND, above - DEADBAND, at, 0, &shape, &charge), 4);
+    // Gain >= 64 MiB grows cleanly.
+    assert_eq!(held_target_in(above + DEADBAND, above + DEADBAND, at, 0, &shape, &charge), 36);
+    // Real claim pressure (`owed > 0`) sheds immediately at `BLOCK` granularity, never over-shedding `DEADBAND`.
+    assert_eq!(held_target_in(above, above, at, BLOCK, &shape, &charge), at - 1);
+    // Small table whose remaining capacity to ceiling is < deadband still reaches ceiling when room headroom >= deadband.
+    let small = BankShape::new(BLOCK, 2, 10, 10).with_deadband(DEADBAND);
+    assert_eq!(held_target_in(0, 100 * MIB, 2, 0, &small, &charge), 10);
+    // But near ceiling with sub-deadband headroom, it stays put rather than oscillating.
+    assert_eq!(held_target_in(28 * MIB, 36 * MIB, 9, 0, &small, &charge), 9);
+}

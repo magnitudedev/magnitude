@@ -22,8 +22,12 @@ use crate::planning::BankTier;
 /// them is chosen.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct BankShape {
-    /// The granule pool's block: the least resize either way.
+    /// The granule pool's block: the least resize either way, and the unit
+    /// for shedding `owed` bytes.
     block_bytes: u64,
+    /// Minimum room delta for opportunistic grow/shrink hysteresis when
+    /// `owed == 0` (at least `block_bytes`).
+    deadband_bytes: u64,
     /// The slots one decode step holds at once, held as committed memory
     /// (`CommittedKind::BankFloor`), never cache.
     floor_slots: u64,
@@ -43,7 +47,14 @@ impl BankShape {
     /// Where the floor lies past the ceiling: a plan that is no bank.
     pub fn new(block_bytes: u64, floor: u64, ceiling: u64, bound: u64) -> Self {
         assert!(floor <= ceiling, "invariant violated: a bank floor of {floor} slots past its ceiling of {ceiling}");
-        Self { block_bytes, floor_slots: floor, saturation_slots: ceiling.min(bound).max(floor) }
+        Self { block_bytes, deadband_bytes: block_bytes, floor_slots: floor, saturation_slots: ceiling.min(bound).max(floor) }
+    }
+
+    /// Raise the opportunistic grow/shrink hysteresis deadband to at least
+    /// `deadband_bytes` while keeping `block_bytes` for `owed` shedding.
+    pub fn with_deadband(mut self, deadband_bytes: u64) -> Self {
+        self.deadband_bytes = deadband_bytes.max(self.block_bytes);
+        self
     }
 
     /// The granule pool's block: the least resize either way, so a target
@@ -188,12 +199,18 @@ pub fn held_target_in(
     charge: &dyn Fn(u64) -> u64,
 ) -> u64 {
     let block = shape.block_bytes.max(1);
+    let deadband = shape.deadband_bytes.max(block);
     let floor_charge = charge(shape.floor_slots);
     let above_floor = charge(at).saturating_sub(floor_charge);
     let fits_hold = target_slots(hold_room, shape, charge);
     let fits_grow = target_slots(grow_room, shape, charge);
-    let should_shrink = at > shape.saturation_slots || (fits_hold < at && above_floor.saturating_sub(hold_room) >= block);
-    let should_grow = owed == 0 && !should_shrink && fits_grow > at && charge(fits_grow) - charge(at) >= block;
+    let should_shrink = at > shape.saturation_slots || (fits_hold < at && above_floor.saturating_sub(hold_room) >= deadband);
+    let gain = charge(fits_grow).saturating_sub(charge(at));
+    let should_grow = owed == 0
+        && !should_shrink
+        && fits_grow > at
+        && gain >= block
+        && (gain >= deadband || (fits_grow == shape.saturation_slots && grow_room.saturating_sub(above_floor) >= deadband));
     let held = if should_shrink {
         fits_hold
     } else if should_grow {

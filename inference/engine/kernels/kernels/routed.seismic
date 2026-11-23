@@ -151,7 +151,7 @@ projection routed for metal:
     let EXPANSION_TABLES = sum(W, FIRST * (INT8 * (N * max(WIDTH / 32, 3) * 4 + ceil_div(N, 32) * 32 * ceil_div(WIDTH, 1024) * 64) + PACK * (N * (WIDTH / 32) * 4 * (1 + form(W, PACK_SUMS)) + N * 4))) for grouped
     let DOWN_TABLES = sum(W, (1 - FIRST) * (DOWN_INT8 * (N * max(WIDTH / 32, 3) * 4 + ceil_div(N, 32) * 32 * ceil_div(WIDTH, 1024) * 64) + DOWN_PACK * (N * (WIDTH / 32) * 4 * (1 + form(W, PACK_SUMS)) + N * 4))) for grouped
     let USED_EXPERTS = STACKED * min(E, B) + 1 - STACKED for grouped
-    let ORDINAL_BYTES = STACKED * ceil_div(B, 4) * 16 for grouped
+    let ORDINAL_BYTES = STACKED * ceil_div(B, 4) * 32 for grouped
     params (SIMDGROUPS in [2, 4, 8, 16] default greatest where SIMDGROUPS <= 8 + 8 * PER_ROW and SIMDGROUPS * 32 <= device.max_group_threads and (SIMDGROUPS == 2 or ceil_div(most(W, N), SIMDGROUPS * 2) * (K + SHARED) >= 2 * device.units) for choice,
         ROWS in [1, 2, 4] default greatest where ROWS == 1 or (ROWS == 2 and most(W, row_bytes(W, codes, 32)) <= 24) for choice,
         arithmetic LANES in [16, 32] default 16 for choice, form GATHERED in [0, 1] default 1 for choice,
@@ -197,7 +197,7 @@ projection routed for metal:
     scratch table_grid bytes (12) when STACKED == 1 for grouped
     scratch tile_grid bytes (12) when STACKED == 1 for grouped
     scratch operand bytes (max(EXPANSION_OPERAND, DOWN_OPERAND)) when (STACKED == 1 or M > 64) and (TALL == 1 or DOWN_TALL == 1) for grouped
-    scratch tables bytes (ORDINAL_BYTES + USED_EXPERTS * max(EXPANSION_TABLES, DOWN_TABLES)) when (STACKED == 1 or M > 64) and INT8 + PACK + DOWN_INT8 + DOWN_PACK > 0 for grouped
+    scratch tables bytes (ORDINAL_BYTES + USED_EXPERTS * max(EXPANSION_TABLES, DOWN_TABLES)) when (STACKED == 1 or M > 64) and (INT8 + PACK + DOWN_INT8 + DOWN_PACK > 0 or (STACKED == 1 and (TALL == 1 or DOWN_TALL == 1))) for grouped
     launch choice for choice when (GATHERED == 0 or M == 1 or M > VERIFY_ROWS or PER_ROW == 1) and (RECORDS == 0 or SHARED == 1 or XS > 0):
         reads (ROWS, LANES)
         threadgroups (CHOICE_GROUPS, M * K + SHARED, 1)

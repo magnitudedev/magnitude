@@ -529,6 +529,21 @@ constexpr constant uint ORDINAL_PAIR_MASK = ORDINAL_PAIR_EVEN | ORDINAL_PAIR_ODD
 inline device int *ordinals(device uchar *tables) {
     return reinterpret_cast<device int *>(tables);
 }
+// Coalesced 64-row tall-tile descriptors for T == 32: each entry encodes
+// `(first_block << 1) | (paired ? 1 : 0)`, stored in the second 16-byte-aligned
+// region of `tables` so it never collides with `ordinals` or `weight_table`.
+inline device uint *tall_tiles(device uchar *tables, uint blocks) {
+    return reinterpret_cast<device uint *>(tables + ulong((blocks + 3u) / 4u) * 16u);
+}
+inline uint write_tall_tiles(device const int *blocks, ulong stride, uint used, device uint *tiles) {
+    uint count = 0u;
+    for (uint b = 0u; b < used;) {
+        const bool paired = (b + 1u < used) && (blocks[ulong(b + 1u) * stride] == blocks[ulong(b) * stride]);
+        tiles[count++] = (b << 1u) | (paired ? 1u : 0u);
+        b += paired ? 2u : 1u;
+    }
+    return count;
+}
 inline int block_ordinal(device uchar *tables, uint block) {
     return int(uint(ordinals(tables)[block]) & ORDINAL_MASK);
 }
@@ -546,7 +561,7 @@ inline ulong packing_table_bytes(uint rows, uint columns, bool sums) {
 }
 inline device uchar *weight_table(device uchar *tables, uint blocks, int ordinal, uint weights, uint weight,
     ulong bytes) {
-    return tables + ulong((blocks + 3u) / 4u) * 16u + (ulong(ordinal) * weights + weight) * bytes;
+    return tables + ulong((blocks + 3u) / 4u) * 32u + (ulong(ordinal) * weights + weight) * bytes;
 }
 // The INT8 and PACK forms' scratch of a weight whose table is `table` (the
 // operand's own passes take no table: `rows` 0); PACK's a
