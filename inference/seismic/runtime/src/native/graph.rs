@@ -6886,7 +6886,6 @@ impl ReadyNativeGraphRun<'_> {
                 .filter(|tensor| tensor.holds_binding_lease())
                 .cloned(),
         );
-        #[cfg(any(test, target_os = "macos"))]
         let slabs = self
             .externals
             .iter()
@@ -6906,7 +6905,6 @@ impl ReadyNativeGraphRun<'_> {
         let mut run = QueuedRun {
             plan,
             externals,
-            #[cfg(any(test, target_os = "macos"))]
             slabs,
             workspace: self.slot.workspace.clone(),
             workspace_records: self.slot.workspace_records.clone(),
@@ -7062,15 +7060,12 @@ impl NativeGraphSequence {
             }
             first += run.plan.topology.nodes.len();
         }
-        #[cfg(any(test, target_os = "macos"))]
-        let access_summary = SequenceAccessSummary::of(&self.runs, &nodes);
         let list = SequenceList {
             runs: &self.runs,
             nodes,
             boundaries,
             stamps,
-            #[cfg(any(test, target_os = "macos"))]
-            access_summary,
+            access_summary: std::sync::OnceLock::new(),
         };
         let mut submission = super::submit_after_transfers(&list, &access, retained, 1, observed, self.queue, &self.after_transfers)?;
         // The runs own the storage their work reaches; it retires with this
@@ -7098,7 +7093,6 @@ struct QueuedRun {
     externals: Vec<Option<External>>,
     /// Each port bound to a slab view, with what it reaches (the
     /// encodings order by it).
-    #[cfg(any(test, target_os = "macos"))]
     slabs: Vec<(usize, Arc<crate::api::tensor::SlabReach>)>,
     workspace: Option<Arc<Allocation>>,
     /// The slot's workspace record table (`NativeGraphSlot::workspace_records`).
@@ -7141,7 +7135,6 @@ impl QueuedRun {
 
     /// What device work reaches through the slab view bound to `port`,
     /// where a slab view is bound there.
-    #[cfg(any(test, target_os = "macos"))]
     fn slab(&self, port: u32) -> Option<&crate::api::tensor::SlabReach> {
         self.slabs
             .iter()
@@ -7242,7 +7235,9 @@ struct SequenceList<'a> {
     boundaries: Vec<Vec<TimelineOperation>>,
     /// Per dispatch boundary, the sampled runs' stamps there, in run order.
     stamps: Vec<Vec<Stamp>>,
-    /// Per-sequence access summary for Metal hazard scheduling:
+    /// Per-sequence access summary for hazard scheduling (Metal and Vulkan),
+    /// computed lazily on first [`DispatchList::reaches`] call so CUDA pays
+    /// zero per-step cost:
     /// - `written_groups`: access groups written by at least one dispatch.
     ///   Strictly read-only sites are omitted from `reaches`.
     /// - `plain_groups`: access groups touched by any non-slab binding.
@@ -7250,17 +7245,14 @@ struct SequenceList<'a> {
     /// is summarized in O(1) via `SlabReach::extend_logical` (emitting exact
     /// physical bytes for any leading lent slabs and one logical range for all
     /// pool slabs).
-    #[cfg(any(test, target_os = "macos"))]
-    access_summary: SequenceAccessSummary,
+    access_summary: std::sync::OnceLock<SequenceAccessSummary>,
 }
 
-#[cfg(any(test, target_os = "macos"))]
 struct SequenceAccessSummary {
     written_groups: std::collections::HashSet<usize>,
     plain_groups: std::collections::HashSet<usize>,
 }
 
-#[cfg(any(test, target_os = "macos"))]
 impl SequenceAccessSummary {
     fn of(runs: &[QueuedRun], nodes: &[(usize, usize)]) -> Self {
         let mut written_groups = std::collections::HashSet::new();
@@ -7525,13 +7517,9 @@ impl DispatchList for SequenceList<'_> {
     }
 
     fn reaches(&self, index: usize, reaches: &mut Vec<Reach>) {
-        #[cfg(not(any(test, target_os = "macos")))]
-        {
-            let _ = (index, reaches);
-            unreachable!("SequenceList::reaches is only used on Metal");
-        }
-        #[cfg(any(test, target_os = "macos"))]
-        {
+        let access_summary = self
+            .access_summary
+            .get_or_init(|| SequenceAccessSummary::of(self.runs, &self.nodes));
         let (run, node) = self.nodes[index];
         let run = &self.runs[run];
         let region = |region: &Option<Arc<Allocation>>| {
@@ -7548,10 +7536,10 @@ impl DispatchList for SequenceList<'_> {
                            bytes: u64,
                            reaches: &mut Vec<Reach>| {
             let group = table.access_identity();
-            if !self.access_summary.slab_written(group, slab) {
+            if !access_summary.slab_written(group, slab) {
                 return;
             }
-            if self.access_summary.slab_is_logical(group) {
+            if access_summary.slab_is_logical(group) {
                 slab.extend_logical(buffer, table, table_offset, offset, bytes, reaches);
             } else {
                 slab.extend(buffer, table, table_offset, offset, bytes, reaches);
@@ -7578,7 +7566,7 @@ impl DispatchList for SequenceList<'_> {
                         ),
                         None => {
                             if records.storage.as_ref().is_none_or(|(storage, _)| {
-                                self.access_summary
+                                access_summary
                                     .written_groups
                                     .contains(&storage.access_identity())
                             }) {
@@ -7606,8 +7594,7 @@ impl DispatchList for SequenceList<'_> {
                         extend_slab(buffer, slab, allocation, *start, site_offset, site_bytes, reaches);
                         continue;
                     }
-                    if !self
-                        .access_summary
+                    if !access_summary
                         .written_groups
                         .contains(&allocation.access_identity())
                     {
@@ -7628,7 +7615,6 @@ impl DispatchList for SequenceList<'_> {
                 bytes,
                 through: Through::Binding,
             });
-        }
         }
     }
 

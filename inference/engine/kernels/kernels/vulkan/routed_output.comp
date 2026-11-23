@@ -1,19 +1,98 @@
 // Decode output (M <= VERIFY_ROWS): the projections (`lib/routed/output.glsl`)
-// into scratch, in A, and their join (`lib/routed/output_sum.glsl`). The
-// Vulkan form of `metal/routed_output.metal`.
+// into coherent scratch, in A, the last arriving workgroup of each channel tile
+// joining them (`lib/routed/output_sum.glsl`). The Vulkan form of
+// `cuda/routed_output.cu`.
+layout(buffer_reference, scalar, buffer_reference_align = 2) coherent buffer routed_output_coherent_u16 { uint16_t v; };
+layout(buffer_reference, scalar, buffer_reference_align = 4) coherent buffer routed_output_arrival_u32 { uint v; };
+
 #define ROUTED_SOURCE_ROWS SEISMIC_DIM_XS
 #define ROUTED_PROJECTED_KIND ROUTED_ACT
+#define ROUTED_PROJECTED_COHERENT
 #define ROUTED_PROJECTED_BASE SEISMIC_PTR(SEISMIC_BUFFER_SCRATCH_PROJECTED)
 #define ROUTED_PROJECTED_INDEX(m, k, n) (((m) * (SEISMIC_DIM_K + 1ul) + (k)) * SEISMIC_DIM_H + (n))
-#define ROUTED_PROJECTED_PUT(m, k, n, value) \
-    out_put(out_over_scratch(ROUTED_PROJECTED_KIND, ROUTED_PROJECTED_BASE), ROUTED_PROJECTED_INDEX(m, k, n), value)
+#define ROUTED_PROJECTED_PUT(m, k, n, value)                                                                           \
+    do {                                                                                                               \
+        const uint16_t packed =                                                                                        \
+            (ROUTED_PROJECTED_KIND == ELEMENT_BF16) ? seismic_f32_to_bf16(value) : seismic_f32_to_f16(value);          \
+        routed_output_coherent_u16(ROUTED_PROJECTED_BASE + ROUTED_PROJECTED_INDEX(m, k, n) * 2ul).v = packed;          \
+    } while (false)
 #define KERNEL_A SEISMIC_ELEMENT_A
 #include "lib/routed/output.glsl"
 #include "lib/routed/output_sum.glsl"
 
-void routed_output_project() { routed_output_projection(); }
+// Whether this workgroup is the last of `expected` to arrive at `counter`
+// (over `sync` scratch, zero when the launch starts and restored to zero by
+// the last arriving workgroup).
+bool routed_output_arrive_last(const uint64_t counter, const uint expected) {
+    memoryBarrierBuffer();
+    barrier();
+    if (SEISMIC_THREAD == 0u) {
+        memoryBarrierBuffer();
+        const uint ticket = atomicAdd(routed_output_arrival_u32(counter).v, 1u);
+        const bool is_last = (ticket == expected - 1u);
+        if (is_last) {
+            memoryBarrierBuffer();
+            atomicStore(routed_output_arrival_u32(counter).v, 0u,
+                gl_ScopeDevice, gl_StorageSemanticsNone, gl_SemanticsRelaxed);
+        }
+        seismic_shared_u32[0] = is_last ? 1u : 0u;
+    }
+    memoryBarrierShared();
+    barrier();
+    const bool is_last = (seismic_shared_u32[0] != 0u);
+    if (is_last)
+        memoryBarrierBuffer();
+    return is_last;
+}
+
+void routed_output_project() {
+    routed_output_projection();
+    const uint tile = gl_WorkGroupID.x;
+    const uint per_group = SEISMIC_TUNE_SIMDGROUPS * OUTPUT_R * (32u / OUTPUT_LANES);
+    const uint hidden = uint(SEISMIC_DIM_H);
+    const uint summed_groups = (hidden + per_group - 1u) / per_group;
+    uint64_t m, choice;
+    seismic_split(gl_WorkGroupID.y, SEISMIC_DIM_K + 1ul, m, choice);
+    const uint64_t counter = SEISMIC_PTR(SEISMIC_BUFFER_SCRATCH_ARRIVALS)
+        + (m * uint64_t(summed_groups) + uint64_t(tile)) * 4ul;
+    if (!routed_output_arrive_last(counter, uint(SEISMIC_DIM_K) + 1u))
+        return;
+    const uint first = tile * per_group;
+    if (first >= hidden)
+        return;
+    const uint span = min(per_group, hidden - first);
+    const uint threads = 32u * SEISMIC_TUNE_SIMDGROUPS;
+    for (uint c = SEISMIC_THREAD; c < span; c += threads)
+        routed_output_join_channel(m, uint64_t(first + c), false, 0ul);
+}
+
 void routed_output_gather() { routed_output_gather_worklist(); }
-void routed_output_gathered2() { routed_output_gathered_bounded(2u); }
-void routed_output_gathered4() { routed_output_gathered_bounded(4u); }
-void routed_output_gathered8() { routed_output_gathered_bounded(8u); }
-void routed_output_combine() { routed_output_join(false, 0ul); }
+
+void routed_output_gathered_join(const uint maxm) {
+    routed_output_gathered_bounded(maxm);
+    const uint tile = gl_WorkGroupID.x;
+    const uint64_t worklist = SEISMIC_PTR(SEISMIC_BUFFER_SCRATCH_WORKLIST);
+    const uint expected = routed_worklist_count(worklist) + 1u;
+    const uint64_t counter = SEISMIC_PTR(SEISMIC_BUFFER_SCRATCH_ARRIVALS)
+        + uint64_t(tile) * 4ul;
+    if (!routed_output_arrive_last(counter, expected))
+        return;
+    const uint per_group = SEISMIC_TUNE_SIMDGROUPS * OUTPUT_R * (32u / OUTPUT_LANES);
+    const uint hidden = uint(SEISMIC_DIM_H);
+    const uint first = tile * per_group;
+    if (first >= hidden)
+        return;
+    const uint span = min(per_group, hidden - first);
+    const uint rows = uint(SEISMIC_DIM_M);
+    const uint total = rows * span;
+    const uint threads = 32u * SEISMIC_TUNE_SIMDGROUPS;
+    for (uint item = SEISMIC_THREAD; item < total; item += threads) {
+        const uint m = item / span;
+        const uint c = item - m * span;
+        routed_output_join_channel(uint64_t(m), uint64_t(first + c), false, 0ul);
+    }
+}
+
+void routed_output_gathered2() { routed_output_gathered_join(2u); }
+void routed_output_gathered4() { routed_output_gathered_join(4u); }
+void routed_output_gathered8() { routed_output_gathered_join(8u); }

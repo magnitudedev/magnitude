@@ -41,6 +41,7 @@
 //! a submission of their own.
 
 use super::graph_replays::{Replays, Shaped};
+use super::hazard::{self, LevelLaunch, PlacementScratch};
 use super::timeline::{TimelineAction, TimelineKind, TimelineOperation, VulkanTimeline};
 use super::{graph_segments, DispatchList, EncodeFailure, Encoding, NativeRoute, ReplayKeys};
 use crate::completion::Committed;
@@ -72,6 +73,7 @@ const DIVISION_LIMIT_SECONDS: f64 = 0.4;
 pub(crate) struct VulkanReplays {
     graphs: Replays<Divided>,
     costs: Arc<LaunchCosts<LaunchKind>>,
+    placement: Mutex<PlacementScratch>,
 }
 
 impl VulkanReplays {
@@ -128,7 +130,9 @@ impl super::graph_replays::RecordedGraph for Divided {
 
 struct Divided {
     launches: Vec<LaunchKind>,
-    /// The marks the graph holds, each the launch it precedes, in order.
+    /// ASAP hazard-level schedule of the segment's launches (in recorded order).
+    schedule: Vec<LevelLaunch>,
+    /// The marks the graph holds, each the scheduled launch it precedes, in order.
     marks: Vec<usize>,
     parts: Vec<Part>,
     graph: Option<DirectGraph>,
@@ -176,6 +180,7 @@ pub(super) fn encode(
                 &segments,
                 &encoded,
                 &replays.costs,
+                false,
                 &mut submissions,
                 || DirectBatch::timed(device, launches),
                 QueueSubmission::Timed,
@@ -186,6 +191,7 @@ pub(super) fn encode(
                 &segments,
                 &encoded,
                 &replays.costs,
+                true,
                 &mut submissions,
                 || DirectBatch::new(device),
                 QueueSubmission::Measured,
@@ -203,31 +209,35 @@ pub(super) fn encode(
     };
     let segments = graph_segments(list, Some(&runs));
     let keys = ReplayKeys { runs, encoded: Some(&encoded) };
-    let (graphed, shaped): (Vec<Range<usize>>, Vec<Shaped>) = segments
-        .iter()
-        .filter(|(calls, _)| !calls.is_empty())
-        .map(|(calls, _)| {
-            let (bound, grids) = bindings(list, calls.clone(), &encoded);
-            (calls.clone(), keys.shaped(calls, grids, bound))
-        })
-        .unzip();
+    let (graphed, shaped): (Vec<Range<usize>>, Vec<Shaped>) = {
+        let mut scratch = replays
+            .placement
+            .lock()
+            .expect("vulkan placement scratch is never poisoned");
+        segments
+            .iter()
+            .filter(|(calls, _)| !calls.is_empty())
+            .map(|(calls, _)| {
+                let (bound, grids) = bindings(list, calls.clone(), &encoded);
+                let placement = hazard::relative_placement_with(&mut scratch, list, calls.clone());
+                (calls.clone(), keys.shaped(calls, grids.into_iter().chain(placement), bound))
+            })
+            .unzip()
+    };
     // Recording a division takes nothing a park's answer needs (a Vulkan
     // park is a submission boundary, and recording command buffers holds
     // no device-wide lock), so it waits for nothing.
     let taken = replays.graphs.record(&shaped, budget, retained, || Ok(()), |index| {
-        let (mut launches, mut marks) = (Vec::new(), Vec::new());
-        let mut held = keys.marks(&graphed[index]).peekable();
-        for call in graphed[index].clone() {
-            while held.next_if_eq(&call).is_some() {
-                marks.push(launches.len());
-            }
-            each_launch(list, call..call + 1, &encoded, |launch| {
-                launches.extend(launch.map(DirectLaunch::kind));
-                Ok(())
-            })?;
-        }
+        let marks_in: Vec<usize> = keys.marks(&graphed[index]).collect();
+        let (schedule, marks) = hazard::schedule_calls(list, graphed[index].clone(), &encoded, &marks_in);
+        let mut launches = Vec::with_capacity(schedule.len());
+        each_scheduled_launch(list, graphed[index].start, &schedule, |launch, _| {
+            launches.push(launch.kind());
+            Ok(())
+        })?;
         Ok(Divided {
             launches,
+            schedule,
             marks,
             parts: Vec::new(),
             graph: None,
@@ -251,16 +261,17 @@ pub(super) fn encode(
                             Ok(())
                         },
                         |divided| {
-                            if divided.refresh(device, list, calls.clone(), &encoded, &replays.costs)? {
+                            if divided.refresh(device, list, calls.start, &replays.costs)? {
                                 replays.graphs.count_recorded(&shaped.key);
                             }
                             // The launches' argument blocks as this run
-                            // binds them, which its first part rewrites.
+                            // binds them, in scheduled launch order, which its
+                            // first part rewrites.
                             let mut rebind = None;
                             if std::mem::take(&mut divided.stale) {
-                                let mut blocks = Vec::new();
-                                each_launch(list, calls.clone(), &encoded, |launch| {
-                                    blocks.extend(launch.map(DirectLaunch::argument_block));
+                                let mut blocks = Vec::with_capacity(divided.schedule.len());
+                                each_scheduled_launch(list, calls.start, &divided.schedule, |launch, _| {
+                                    blocks.push(launch.argument_block());
                                     Ok(())
                                 })?;
                                 rebind = Some(blocks);
@@ -311,8 +322,7 @@ impl Divided {
         &mut self,
         device: &seismic_vulkan::Device,
         list: &impl DispatchList,
-        calls: Range<usize>,
-        encoded: &[Vec<bool>],
+        calls_start: usize,
         costs: &LaunchCosts<LaunchKind>,
     ) -> Result<bool, CallError> {
         let current = self.measured
@@ -347,16 +357,13 @@ impl Divided {
         let mut builder = DirectGraphBuilder::new(device).map_err(CallError::Execution)?;
         let mut index = 0usize;
         let mut segment = 0usize;
-        each_launch(list, calls, encoded, |launch| {
-            let Some(launch) = launch else {
-                return Ok(());
-            };
+        each_scheduled_launch(list, calls_start, &self.schedule, |launch, barrier| {
             while ends[segment] <= index && segment + 1 < ends.len() {
                 segment += 1;
                 builder.segment()?;
             }
             index += 1;
-            builder.launch(launch)
+            builder.launch_with_barrier(launch, barrier)
         })?;
         for _ in segment + 1..ends.len() {
             builder.segment().map_err(CallError::Execution)?;
@@ -787,17 +794,55 @@ pub(crate) struct VulkanSubmission {
     feedback: Mutex<Option<Feedback>>,
 }
 
+/// Queue one ungraphed launch into `batch`, splitting into a new queue
+/// submission if adding it would exceed [`SUBMISSION_SECONDS`] (or either
+/// side is unmeasured).
+#[allow(clippy::too_many_arguments)]
+fn queue_ungraphed_launch<T: Timing>(
+    launch: &DirectLaunch<'_>,
+    barrier: bool,
+    costs: &LaunchCosts<LaunchKind>,
+    batch: &mut DirectBatch<T>,
+    queued: &mut Option<f64>,
+    kinds: &mut Vec<(LaunchKind, u32)>,
+    batch_kinds: &mut Vec<Vec<(LaunchKind, u32)>>,
+    submissions: &mut Issuing,
+    new_batch: &mut impl FnMut() -> Result<DirectBatch<T>, ExecutionError>,
+    wrap: &impl Fn(DirectSubmission<T>) -> QueueSubmission,
+) -> Result<(), ExecutionError> {
+    let kind = launch.kind();
+    let estimate = costs.estimate_one(kind);
+    if !kinds.is_empty() && !fits_submission(*queued, estimate) {
+        let next = new_batch()?;
+        submissions.push(wrap(std::mem::replace(batch, next).commit()?));
+        batch_kinds.push(std::mem::take(kinds));
+        *queued = Some(0.0);
+    }
+    *queued = if kinds.is_empty() {
+        estimate
+    } else {
+        queued.zip(estimate).map(|(queued, estimate)| queued + estimate)
+    };
+    match kinds.iter_mut().find(|(seen, _)| *seen == kind) {
+        Some((_, count)) => *count += 1,
+        None => kinds.push((kind, 1)),
+    }
+    batch.launch_with_barrier(launch, barrier)
+}
+
 /// Encode an ungraphed list (timed or plain measured) into one or more queue
 /// submissions split at timeline boundaries and whenever adding the next launch
 /// would exceed [`SUBMISSION_SECONDS`] (or either the batch or launch is
 /// unmeasured, matching [`Queued`]). Returns each committed submission's launch
 /// kinds so completion teaches [`LaunchCosts`].
+#[allow(clippy::too_many_arguments)]
 fn encode_ungraphed<T: Timing>(
     list: &impl DispatchList,
     repetitions: usize,
     segments: &[(Range<usize>, usize)],
     encoded: &[Vec<bool>],
     costs: &LaunchCosts<LaunchKind>,
+    use_asap: bool,
     submissions: &mut Issuing,
     mut new_batch: impl FnMut() -> Result<DirectBatch<T>, ExecutionError>,
     wrap: impl Fn(DirectSubmission<T>) -> QueueSubmission,
@@ -806,34 +851,57 @@ fn encode_ungraphed<T: Timing>(
     let mut queued: Option<f64> = Some(0.0);
     let mut kinds: Vec<(LaunchKind, u32)> = Vec::new();
     let mut batch_kinds: Vec<Vec<(LaunchKind, u32)>> = Vec::new();
+    let schedules: Vec<Vec<LevelLaunch>> = if use_asap {
+        segments
+            .iter()
+            .map(|(calls, _)| hazard::schedule_calls(list, calls.clone(), encoded, &[]).0)
+            .collect()
+    } else {
+        Vec::new()
+    };
     for _ in 0..repetitions {
-        for (calls, boundary) in segments {
-            each_launch(list, calls.clone(), encoded, |launch| match launch {
-                Some(launch) => {
-                    let kind = launch.kind();
-                    let estimate = costs.estimate_one(kind);
-                    if !kinds.is_empty() && !fits_submission(queued, estimate) {
-                        let next = new_batch()?;
-                        submissions.push(wrap(std::mem::replace(&mut batch, next).commit()?));
-                        batch_kinds.push(std::mem::take(&mut kinds));
-                        queued = Some(0.0);
+        for (seg_idx, (calls, boundary)) in segments.iter().enumerate() {
+            if use_asap {
+                let mut first = true;
+                each_scheduled_launch(list, calls.start, &schedules[seg_idx], |launch, barrier| {
+                    // The first launch of each segment/repetition must barrier
+                    // against any earlier work already recorded in `batch`;
+                    // `DirectBatch::launch_with_barrier` elides it when nothing
+                    // precedes it in the batch.
+                    let barrier = barrier || std::mem::take(&mut first);
+                    queue_ungraphed_launch(
+                        launch,
+                        barrier,
+                        costs,
+                        &mut batch,
+                        &mut queued,
+                        &mut kinds,
+                        &mut batch_kinds,
+                        submissions,
+                        &mut new_batch,
+                        &wrap,
+                    )
+                })?;
+            } else {
+                each_launch(list, calls.clone(), encoded, |launch| match launch {
+                    Some(launch) => queue_ungraphed_launch(
+                        launch,
+                        true,
+                        costs,
+                        &mut batch,
+                        &mut queued,
+                        &mut kinds,
+                        &mut batch_kinds,
+                        submissions,
+                        &mut new_batch,
+                        &wrap,
+                    ),
+                    None => {
+                        batch.skip();
+                        Ok(())
                     }
-                    queued = if kinds.is_empty() {
-                        estimate
-                    } else {
-                        queued.zip(estimate).map(|(queued, estimate)| queued + estimate)
-                    };
-                    match kinds.iter_mut().find(|(seen, _)| *seen == kind) {
-                        Some((_, count)) => *count += 1,
-                        None => kinds.push((kind, 1)),
-                    }
-                    batch.launch(launch)
-                }
-                None => {
-                    batch.skip();
-                    Ok(())
-                }
-            })?;
+                })?;
+            }
             for stamp in list.stamps(*boundary) {
                 batch.stamp(vulkan_stamps(stamp), stamp.mark);
             }
@@ -1167,6 +1235,50 @@ fn encoded_launch(
     ordinal: usize,
 ) -> Option<super::LaunchGeometry> {
     launch.filter(|launch| encoded[index][ordinal] && !launch.is_empty())
+}
+
+/// Visit every launch of `schedule` (with offsets relative to `base`) in
+/// scheduled order, passing whether a compute barrier must precede it.
+fn each_scheduled_launch(
+    list: &impl DispatchList,
+    base: usize,
+    schedule: &[LevelLaunch],
+    mut visit: impl FnMut(&DirectLaunch<'_>, bool) -> Result<(), ExecutionError>,
+) -> Result<(), CallError> {
+    let mut buffers = Vec::new();
+    let mut typed = Vec::new();
+    for &LevelLaunch { offset, ordinal, barrier } in schedule {
+        let index = base + offset;
+        buffers.clear();
+        let dispatch = list.dispatch(index, &mut buffers);
+        let NativeRoute::Vulkan { launches, .. } = &dispatch.kernel.route else {
+            unreachable!("one device has one native route");
+        };
+        typed.clear();
+        typed.extend(
+            buffers
+                .iter()
+                .map(|(allocation, offset)| (vulkan_buffer(allocation), *offset)),
+        );
+        let scalars = dispatch
+            .kernel
+            .scalar_slots()
+            .map(|slots| (vulkan_buffer(slots), 0));
+        let launch = dispatch.launches[ordinal]
+            .expect("scheduled launch is active and non-empty");
+        let (module, function) = launches.launch(ordinal);
+        let direct = DirectLaunch {
+            module,
+            function,
+            buffers: &typed,
+            words: super::word_bytes(dispatch.words),
+            scalar_results: scalars,
+            groups: launch.groups,
+            grid: launch.grid.map(|buffer| typed[dispatch.kernel.argument(buffer)]),
+        };
+        visit(&direct, barrier).map_err(CallError::Execution)?;
+    }
+    Ok(())
 }
 
 /// Visit every launch of the calls `calls` of one pass over `list` in

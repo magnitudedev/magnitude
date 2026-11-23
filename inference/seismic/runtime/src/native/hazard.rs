@@ -27,17 +27,88 @@
 //! before one it does. CUDA's graphs keep stream order. Timeline operations
 //! bound the reordering: no launch crosses one.
 
-#[cfg(any(test, target_os = "macos"))]
-use super::DispatchList;
 use super::Dispatch;
-#[cfg(any(test, target_os = "macos"))]
+use super::DispatchList;
 use crate::api::tensor::{Records, SlabReach};
-#[cfg(any(test, target_os = "macos"))]
 use crate::driver::Allocation;
-#[cfg(any(test, target_os = "macos"))]
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, HashMap};
 use std::ops::Range;
+
+/// One scheduled launch inside a timeline-free segment (for Vulkan ASAP
+/// barrier scheduling, [`schedule_calls`]).
+#[cfg(any(test, not(target_os = "macos")))]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct LevelLaunch {
+    /// Call offset relative to `calls.start` in the [`DispatchList`], so a
+    /// cached graph's schedule is independent of where its segment lies in a
+    /// later submission.
+    pub(crate) offset: usize,
+    /// Launch ordinal within the dispatch.
+    pub(crate) ordinal: usize,
+    /// Whether a compute memory barrier must precede this launch (true for
+    /// the first launch of every level after the first).
+    pub(crate) barrier: bool,
+}
+
+/// Order the encoded non-empty launches of `calls` into ASAP hazard levels,
+/// breaking at `marks` (sorted call indices inside `calls` that no launch may
+/// cross). Returns the scheduled launches (with offsets relative to
+/// `calls.start`) and each mark's position in that sequence (the number of
+/// scheduled launches preceding the mark).
+#[cfg(any(test, not(target_os = "macos")))]
+pub(crate) fn schedule_calls(
+    list: &impl DispatchList,
+    calls: Range<usize>,
+    encoded: &[Vec<bool>],
+    marks: &[usize],
+) -> (Vec<LevelLaunch>, Vec<usize>) {
+    let base = calls.start;
+    let mut out = Vec::new();
+    let mut mark_positions = Vec::with_capacity(marks.len());
+    let mut order = Order::default();
+    let mut segment: Vec<(usize, usize, usize)> = Vec::new();
+    let mut buffers = Vec::new();
+    let mut reaches = Vec::new();
+    let mut accesses = Vec::new();
+    let mut held = marks.iter().copied().peekable();
+
+    let flush = |segment: &mut Vec<(usize, usize, usize)>, out: &mut Vec<LevelLaunch>| {
+        segment.sort_by_key(|(level, ..)| *level);
+        for level in segment.chunk_by(|first, second| first.0 == second.0) {
+            for (pos, &(_, offset, ordinal)) in level.iter().enumerate() {
+                let barrier = pos == 0 && !out.is_empty();
+                out.push(LevelLaunch { offset, ordinal, barrier });
+            }
+        }
+        segment.clear();
+    };
+
+    for index in calls {
+        if held.peek() == Some(&index) {
+            flush(&mut segment, &mut out);
+            order = Order::default();
+            while held.next_if_eq(&index).is_some() {
+                mark_positions.push(out.len());
+            }
+        }
+        buffers.clear();
+        let dispatch = list.dispatch(index, &mut buffers);
+        reaches.clear();
+        list.reaches(index, &mut reaches);
+        accesses.clear();
+        dispatch_accesses(&dispatch, &reaches, &mut accesses);
+        for (ordinal, launch) in dispatch.launches.iter().enumerate() {
+            let Some(launch) = launch.filter(|launch| encoded[index][ordinal] && !launch.is_empty()) else {
+                continue;
+            };
+            let alone = launch.barrier.is_some();
+            segment.push((order.place_next(&accesses, alone), index - base, ordinal));
+        }
+    }
+    flush(&mut segment, &mut out);
+    (out, mark_positions)
+}
 
 /// One step of encoding a submission ([`schedule`]).
 #[cfg(any(test, target_os = "macos"))]
@@ -123,7 +194,6 @@ impl super::graph_replays::RecordedGraph for Schedule {
 
 /// Reusable scratch buffers for computing [`relative_placement_with`] and
 /// [`schedule_key`] without per-step heap allocations.
-#[cfg(any(test, target_os = "macos"))]
 #[derive(Default)]
 pub(crate) struct PlacementScratch {
     first: HashMap<u64, (u64, u64)>,
@@ -140,7 +210,6 @@ pub(crate) struct PlacementScratch {
 /// of different allocations never meet, so every dependency of one is the
 /// other's ([`Order`]). A slab view's reaches name the slabs its table
 /// backs.
-#[cfg(any(test, target_os = "macos"))]
 pub(crate) fn relative_placement_with(
     scratch: &mut PlacementScratch,
     list: &impl DispatchList,
@@ -243,7 +312,6 @@ pub(crate) enum Through {
     Slab,
 }
 
-#[cfg(any(test, target_os = "macos"))]
 impl SlabReach {
     /// The reaches of buffer `buffer`, bound to this slab view's bytes
     /// `[offset, offset + bytes)` through its table, whose entry 0 is at
@@ -286,7 +354,6 @@ impl SlabReach {
     ///   exactly), and
     /// - 0 or 1 logical `Through::Slab` reach over the pool-backed suffix in
     ///   `self.logical_allocation`.
-    #[cfg(any(test, target_os = "macos"))]
     pub(crate) fn extend_logical(
         &self,
         buffer: usize,
@@ -342,7 +409,6 @@ impl SlabReach {
     }
 }
 
-#[cfg(any(test, target_os = "macos"))]
 impl Records {
     /// The reach of buffer `buffer`, bound to the table entries of records
     /// `[first, first + count)` of this view, which lie in storage of their
@@ -435,7 +501,6 @@ struct IntervalLevels {
 
 impl IntervalLevels {
     /// Maximum level among all stored intervals meeting `range`.
-    #[cfg(any(test, target_os = "macos"))]
     fn max_overlap(&self, range: &Range<u64>) -> Option<usize> {
         if range.is_empty() || self.intervals.is_empty() {
             return None;
@@ -516,7 +581,6 @@ impl IntervalLevels {
 
     /// Raise every byte in `range` to at least `level` (for a read, preserving
     /// higher levels on any sub-range already read at a deeper level).
-    #[cfg(any(test, target_os = "macos"))]
     fn raise(&mut self, range: Range<u64>, level: usize) {
         if range.is_empty() {
             return;
@@ -576,7 +640,6 @@ impl IntervalLevels {
 /// a later launch can still depend on. A later read depends on the writes
 /// it meets; a later write on the reads and writes. A write supersedes every
 /// earlier read and write of its bytes.
-#[cfg(any(test, target_os = "macos"))]
 #[derive(Default)]
 struct Allocated {
     reads: IntervalLevels,
@@ -584,7 +647,6 @@ struct Allocated {
 }
 
 /// The levels of one segment's launches, in submission order ([`schedule`]).
-#[cfg(any(test, target_os = "macos"))]
 #[derive(Default)]
 pub(crate) struct Order {
     reached: HashMap<u64, Allocated>,
@@ -595,7 +657,6 @@ pub(crate) struct Order {
     floor: usize,
 }
 
-#[cfg(any(test, target_os = "macos"))]
 impl Order {
     /// Place the next launch, which reaches `accesses`: its level, one past
     /// the highest of its conflicting earlier launches' (0 with none), and
@@ -1613,5 +1674,61 @@ mod tests {
             }
             assert_eq!(reach, naive, "DagOrder reachability diverged from naive hazard reachability");
         }
+    }
+
+    #[test]
+    fn schedule_calls_groups_independent_levels_and_breaks_at_marks() {
+        let device = cpu_device();
+        let kernel = copy_kernel(&device);
+        let storage = (0..5)
+            .map(|_| crate::memory::Charges::tally(&device).allocate(64, 64).unwrap())
+            .collect::<Vec<_>>();
+        let [a, b, c, d, e] = [
+            &*storage[0],
+            &*storage[1],
+            &*storage[2],
+            &*storage[3],
+            &*storage[4],
+        ];
+        // 0: a -> b (level 0)
+        // 1: b -> c (level 1, depends on 0)
+        // 2: a -> d (level 0, independent of 0 and 1 -> reordered ahead of 1)
+        // --- mark at call 3 ---
+        // 3: c -> e[0..32] (level 0 of post-mark segment, barrier after mark)
+        // 4: d -> e[32..64] (level 0 of post-mark segment, concurrent with 3)
+        let calls = Calls {
+            kernel: &kernel,
+            calls: vec![
+                Some([(a, 0..64), (b, 0..64)]),
+                Some([(b, 0..64), (c, 0..64)]),
+                Some([(a, 0..64), (d, 0..64)]),
+                Some([(c, 0..64), (e, 0..32)]),
+                Some([(d, 0..64), (e, 32..64)]),
+            ],
+            timelines: HashMap::new(),
+        };
+        let encoded = calls.encoded();
+        let (scheduled, marks) = schedule_calls(&calls, 0..5, &encoded, &[3]);
+        assert_eq!(marks, vec![3]);
+        assert_eq!(
+            scheduled,
+            vec![
+                LevelLaunch { offset: 0, ordinal: 0, barrier: false },
+                LevelLaunch { offset: 2, ordinal: 0, barrier: false },
+                LevelLaunch { offset: 1, ordinal: 0, barrier: true },
+                LevelLaunch { offset: 3, ordinal: 0, barrier: true },
+                LevelLaunch { offset: 4, ordinal: 0, barrier: false },
+            ]
+        );
+        // Non-zero segment base returns offsets relative to `calls.start`.
+        let (sub_scheduled, sub_marks) = schedule_calls(&calls, 3..5, &encoded, &[]);
+        assert!(sub_marks.is_empty());
+        assert_eq!(
+            sub_scheduled,
+            vec![
+                LevelLaunch { offset: 0, ordinal: 0, barrier: false },
+                LevelLaunch { offset: 1, ordinal: 0, barrier: false },
+            ]
+        );
     }
 }

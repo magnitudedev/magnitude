@@ -1162,7 +1162,6 @@ pub mod tensor {
         /// byte `.1`, which the encodings order by (`native::hazard`); none
         /// for a slab view's, one record a slab, which its slab reach orders
         /// ([`TensorInner::slab_reach`]).
-        #[cfg(any(test, target_os = "macos"))]
         pub(crate) storage: Option<(Arc<Allocation>, u64)>,
     }
 
@@ -1206,21 +1205,17 @@ pub mod tensor {
         backed: Vec<usize>,
         /// Distinct `Allocation::access_identity()` values of any lent slab
         /// lenders in this view's store (empty when no slabs are lent).
-        #[cfg(any(test, target_os = "macos"))]
         pub(crate) lender_groups: Box<[usize]>,
         /// Globally unique logical allocation identity for this view's
         /// `(Slots, region)` (`Slots::region_identity`), used to summarize
         /// pool-backed slabs in O(1) reaches instead of O(slabs).
-        #[cfg(any(test, target_os = "macos"))]
         pub(crate) logical_allocation: u64,
         /// Starting slot index of this view within its `Slots` store.
-        #[cfg(any(test, target_os = "macos"))]
         pub(crate) first_slot: usize,
         /// Contiguous physical lender range for this view's leading lent
         /// slots, if any: `(lender_allocation_id, lender_byte_base, lent_bytes)`
         /// where view byte `b < lent_bytes` lies at `lender_byte_base + b` in
         /// `lender_allocation_id`.
-        #[cfg(any(test, target_os = "macos"))]
         pub(crate) lent_region: Option<(u64, u64, u64)>,
     }
 
@@ -1238,10 +1233,10 @@ pub mod tensor {
             table_bytes: u64,
             slab_bytes: u64,
             regions: Vec<Option<(u64, u64, u64)>>,
-            #[cfg(any(test, target_os = "macos"))] lender_groups: Box<[usize]>,
-            #[cfg(any(test, target_os = "macos"))] logical_allocation: u64,
-            #[cfg(any(test, target_os = "macos"))] first_slot: usize,
-            #[cfg(any(test, target_os = "macos"))] lent_region: Option<(u64, u64, u64)>,
+            lender_groups: Box<[usize]>,
+            logical_allocation: u64,
+            first_slot: usize,
+            lent_region: Option<(u64, u64, u64)>,
         ) -> Self {
             let backed = std::iter::once(0)
                 .chain(regions.iter().scan(0, |backed, region| {
@@ -1254,19 +1249,14 @@ pub mod tensor {
                 slab_bytes,
                 regions,
                 backed,
-                #[cfg(any(test, target_os = "macos"))]
                 lender_groups,
-                #[cfg(any(test, target_os = "macos"))]
                 logical_allocation,
-                #[cfg(any(test, target_os = "macos"))]
                 first_slot,
-                #[cfg(any(test, target_os = "macos"))]
                 lent_region,
             }
         }
 
         /// The slots that hold the view's bytes `[offset, offset + bytes)`.
-        #[cfg(any(test, target_os = "macos"))]
         pub(crate) fn slots(&self, offset: u64, bytes: u64) -> std::ops::Range<usize> {
             slots_holding(self.slab_bytes, offset, bytes)
         }
@@ -1310,7 +1300,6 @@ pub mod tensor {
         /// The bytes device work reaches for the view's bytes `[offset,
         /// offset + bytes)`: in each slot holding some, the slab's bytes
         /// that hold them ([`Self::slot_bytes`]); a free slot's none.
-        #[cfg(any(test, target_os = "macos"))]
         pub(crate) fn bytes(
             &self,
             offset: u64,
@@ -1522,7 +1511,6 @@ pub mod tensor {
             match &*cached {
                 Some((read, reach)) if *read == generation => reach.clone(),
                 _ => {
-                    #[cfg(any(test, target_os = "macos"))]
                     let lender_groups = {
                         let mut groups: Vec<usize> = self
                             .slots
@@ -1533,7 +1521,6 @@ pub mod tensor {
                         groups.dedup();
                         groups.into_boxed_slice()
                     };
-                    #[cfg(any(test, target_os = "macos"))]
                     let lent_region = self.slots.lent_region(self.region).and_then(|(lender, start)| {
                         let lent_slots = self.slots.lent().saturating_sub(self.first).min(self.count);
                         let lent_bytes = lent_slots as u64 * self.slab_bytes;
@@ -1549,13 +1536,9 @@ pub mod tensor {
                         seismic_lang::registry::record_table_entry(self.count as u64),
                         self.slab_bytes,
                         self.slots.reach(self.region, self.first, self.count, self.slab_bytes),
-                        #[cfg(any(test, target_os = "macos"))]
                         lender_groups,
-                        #[cfg(any(test, target_os = "macos"))]
                         self.slots.region_identity(self.region),
-                        #[cfg(any(test, target_os = "macos"))]
                         self.first,
-                        #[cfg(any(test, target_os = "macos"))]
                         lent_region,
                     ));
                     *cached = Some((generation, reach.clone()));
@@ -2026,7 +2009,6 @@ pub mod tensor {
                     table_offset: self.byte_offset,
                     count: self.extents[0],
                     record,
-                    #[cfg(any(test, target_os = "macos"))]
                     storage: None,
                 },
                 TensorBacking::Slabs { .. } => {
@@ -2041,7 +2023,6 @@ pub mod tensor {
                         table_offset,
                         count: self.extents[0],
                         record,
-                        #[cfg(any(test, target_os = "macos"))]
                         storage: Some((self.allocation.clone(), self.byte_offset)),
                     }
                 }

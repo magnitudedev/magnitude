@@ -200,7 +200,7 @@ enum Dispatch<'a> {
     Indirect(&'a Buffer, u64),
 }
 
-/// Record one launch: its barrier after the previous launch's writes, the
+/// Record one launch: an optional barrier after prior launches' writes, the
 /// pipeline, the argument block and tables addresses, the dispatch.
 unsafe fn record_launch(
     device: &Device,
@@ -208,10 +208,10 @@ unsafe fn record_launch(
     launch: &DirectLaunch<'_>,
     address: u64,
     dispatch: Dispatch<'_>,
-    first: bool,
+    barrier_before: bool,
 ) {
     let raw = &device.inner.device;
-    if !first {
+    if barrier_before {
         compute_barrier(raw, command);
     }
     raw.cmd_bind_pipeline(
@@ -342,6 +342,8 @@ pub struct DirectGraphBuilder {
     /// Each launch's argument block, in launch order.
     blocks: Vec<Block>,
     launched: bool,
+    /// Compute barriers recorded between launches in this graph.
+    barriers: usize,
     /// The launches recorded so far ([`DirectGraph::census`]).
     launches: GraphCensus,
 }
@@ -363,6 +365,7 @@ impl DirectGraphBuilder {
             arguments_used: ARGUMENT_CHUNK_BYTES,
             blocks: Vec::new(),
             launched: false,
+            barriers: 0,
             launches: GraphCensus::default(),
         })
     }
@@ -392,9 +395,20 @@ impl DirectGraphBuilder {
         Ok(())
     }
 
-    /// Append a launch after every launch added before it; an empty direct
-    /// grid adds nothing.
+    /// Append a launch after a compute barrier (serialized after every launch
+    /// added before it); an empty direct grid adds nothing.
     pub fn launch(&mut self, launch: &DirectLaunch<'_>) -> Result<(), ExecutionError> {
+        self.launch_with_barrier(launch, true)
+    }
+
+    /// Append a launch, emitting a compute barrier before it when
+    /// `barrier_before` is true and an earlier launch has been recorded;
+    /// an empty direct grid adds nothing.
+    pub fn launch_with_barrier(
+        &mut self,
+        launch: &DirectLaunch<'_>,
+        barrier_before: bool,
+    ) -> Result<(), ExecutionError> {
         let Some(dispatch) = validate_launch(&self.device, launch)? else {
             return Ok(());
         };
@@ -407,6 +421,10 @@ impl DirectGraphBuilder {
             launch,
         )?;
         self.blocks.push(block);
+        let emit_barrier = self.launched && barrier_before;
+        if emit_barrier {
+            self.barriers += 1;
+        }
         unsafe {
             record_launch(
                 &self.device,
@@ -414,7 +432,7 @@ impl DirectGraphBuilder {
                 launch,
                 address,
                 dispatch,
-                !self.launched,
+                emit_barrier,
             )
         };
         self.launched = true;
@@ -443,6 +461,7 @@ impl DirectGraphBuilder {
         Ok(DirectGraph {
             inner: std::sync::Arc::new(self.graph),
             blocks: self.blocks,
+            barriers: self.barriers,
             device_bytes: command + arguments,
             census,
         })
@@ -457,6 +476,8 @@ pub struct DirectGraph {
     /// Each launch's argument block as the device holds it once the work
     /// queued so far ran ([`DirectBatch::rebind`]).
     blocks: Vec<Block>,
+    /// Compute barriers recorded between launches in this graph.
+    barriers: usize,
     device_bytes: u64,
     /// What the graph is made of, as its memory follows it.
     census: GraphCensus,
@@ -470,6 +491,11 @@ impl DirectGraph {
     /// Its launches (each not [`DirectLaunch::is_empty`]).
     pub fn launches(&self) -> usize {
         self.blocks.len()
+    }
+
+    /// Compute barriers recorded between launches in this graph.
+    pub fn barriers(&self) -> usize {
+        self.barriers
     }
 
     /// Forget what its argument blocks hold, after a rewrite queued in a
@@ -1094,6 +1120,17 @@ impl<T: Timing> DirectBatch<T> {
     }
 
     pub fn launch(&mut self, launch: &DirectLaunch<'_>) -> Result<(), ExecutionError> {
+        self.launch_with_barrier(launch, true)
+    }
+
+    /// Record a launch, emitting a compute barrier before it when
+    /// `barrier_before` is true and an earlier launch has been recorded. A
+    /// [`Timed`] batch always barriers and stamps before each launch.
+    pub fn launch_with_barrier(
+        &mut self,
+        launch: &DirectLaunch<'_>,
+        barrier_before: bool,
+    ) -> Result<(), ExecutionError> {
         let Some(dispatch) = validate_launch(&self.device, launch)? else {
             self.skip();
             return Ok(());
@@ -1102,7 +1139,7 @@ impl<T: Timing> DirectBatch<T> {
         let mut recording = device.recording()?;
         let address = self.arguments.write(&device, &mut recording, launch)?;
         if self.timing.mark(&device.inner.device, self.command, self.launched) {
-            unsafe { record_launch(&device, self.command, launch, address, dispatch, true) };
+            unsafe { record_launch(&device, self.command, launch, address, dispatch, false) };
         } else {
             unsafe {
                 record_launch(
@@ -1111,7 +1148,7 @@ impl<T: Timing> DirectBatch<T> {
                     launch,
                     address,
                     dispatch,
-                    !self.launched,
+                    self.launched && barrier_before,
                 )
             };
         }

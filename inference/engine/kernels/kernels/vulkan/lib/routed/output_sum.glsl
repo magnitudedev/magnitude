@@ -4,6 +4,42 @@
 // (ROUTED_PROJECTED_KIND at ROUTED_PROJECTED_BASE, slot k of row m at
 // ROUTED_PROJECTED_INDEX(m, k, n), slot K the shared expert's).
 
+// One channel of slot k of row m from the includer's projected tensor:
+// coherent when joined within the same launch (`ROUTED_PROJECTED_COHERENT`),
+// plain across launches (`routed_output_sited`).
+float routed_output_projected1(const uint64_t m, const uint64_t k, const uint64_t n) {
+#ifdef ROUTED_PROJECTED_COHERENT
+    const uint16_t raw = routed_output_coherent_u16(
+        ROUTED_PROJECTED_BASE + ROUTED_PROJECTED_INDEX(m, k, n) * 2ul).v;
+    return (ROUTED_PROJECTED_KIND == ELEMENT_BF16) ? seismic_bf16_to_f32(raw) : seismic_f16_to_f32(raw);
+#else
+    return element_at(ROUTED_PROJECTED_KIND, ROUTED_PROJECTED_BASE, ROUTED_PROJECTED_INDEX(m, k, n));
+#endif
+}
+
+// One channel `c` of row `m`: choices weighted in slot order, plus the CPU's
+// answer where `answered`, then the shared expert and the residual.
+void routed_output_join_channel(const uint64_t m, const uint64_t c, const bool answered, const uint64_t slot) {
+    float selected = 0.0;
+    for (uint64_t choice = 0ul; choice < SEISMIC_DIM_K; ++choice) {
+        const float score = element_f32_at(SEISMIC_PTR(SEISMIC_BUFFER_SCORES)
+            + (m * SEISMIC_SCORES_STRIDE_0 + choice * SEISMIC_SCORES_STRIDE_1) * 4ul);
+        const float projected = routed_output_projected1(m, choice, c);
+        selected = seismic_fma_rn(score, projected, selected);
+    }
+#ifdef ROUTED_SITED
+    selected = routed_sited(selected, answered, slot, m, c);
+#endif
+    const float projected_shared = routed_output_projected1(m, SEISMIC_DIM_K, c);
+    const float coefficient = element_f32_at(SEISMIC_PTR(SEISMIC_BUFFER_COEFFICIENT)
+        + m * SEISMIC_COEFFICIENT_STRIDE_0 * 4ul);
+    projection_routed_join(SEISMIC_RESULT_0_OUT, SEISMIC_RESULT_0_STRIDE_0, SEISMIC_RESULT_0_STRIDE_1,
+        SEISMIC_PTR(SEISMIC_BUFFER_RESIDUAL), SEISMIC_RESIDUAL_STRIDE_0, SEISMIC_RESIDUAL_STRIDE_1,
+        SEISMIC_PTR(SEISMIC_BUFFER_INJECT), SEISMIC_INJECT_STRIDE_0, uint(SEISMIC_DIM_IN), uint(SEISMIC_DIM_SN),
+        uint(SEISMIC_DIM_H), m, c, selected,
+        projected_shared * coefficient);
+}
+
 // Four contiguous channels of slot k of row m from the includer's projected
 // tensor, vectorized when unit-strided and aligned (16 bytes for F32, 8 bytes
 // for 16-bit), scalar otherwise.
@@ -75,28 +111,8 @@ void routed_output_join(const bool answered, const uint64_t slot) {
         return;
 
     if (n + 4ul > SEISMIC_DIM_H) {
-        for (uint64_t c = n; c < SEISMIC_DIM_H; ++c) {
-            float selected = 0.0;
-            for (uint64_t choice = 0ul; choice < SEISMIC_DIM_K; ++choice) {
-                const float score = element_f32_at(SEISMIC_PTR(SEISMIC_BUFFER_SCORES)
-                    + (m * SEISMIC_SCORES_STRIDE_0 + choice * SEISMIC_SCORES_STRIDE_1) * 4ul);
-                const float projected =
-                    element_at(ROUTED_PROJECTED_KIND, ROUTED_PROJECTED_BASE, ROUTED_PROJECTED_INDEX(m, choice, c));
-                selected = seismic_fma_rn(score, projected, selected);
-            }
-#ifdef ROUTED_SITED
-            selected = routed_sited(selected, answered, slot, m, c);
-#endif
-            const float projected_shared =
-                element_at(ROUTED_PROJECTED_KIND, ROUTED_PROJECTED_BASE, ROUTED_PROJECTED_INDEX(m, SEISMIC_DIM_K, c));
-            const float coefficient = element_f32_at(SEISMIC_PTR(SEISMIC_BUFFER_COEFFICIENT)
-                + m * SEISMIC_COEFFICIENT_STRIDE_0 * 4ul);
-            projection_routed_join(SEISMIC_RESULT_0_OUT, SEISMIC_RESULT_0_STRIDE_0, SEISMIC_RESULT_0_STRIDE_1,
-                SEISMIC_PTR(SEISMIC_BUFFER_RESIDUAL), SEISMIC_RESIDUAL_STRIDE_0, SEISMIC_RESIDUAL_STRIDE_1,
-                SEISMIC_PTR(SEISMIC_BUFFER_INJECT), SEISMIC_INJECT_STRIDE_0, uint(SEISMIC_DIM_IN), uint(SEISMIC_DIM_SN),
-                uint(SEISMIC_DIM_H), m, c, selected,
-                projected_shared * coefficient);
-        }
+        for (uint64_t c = n; c < SEISMIC_DIM_H; ++c)
+            routed_output_join_channel(m, c, answered, slot);
         return;
     }
 

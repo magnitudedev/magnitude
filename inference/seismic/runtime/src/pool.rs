@@ -1083,7 +1083,6 @@ pub(crate) struct Slots {
     /// Per region, a globally unique synthetic allocation identity
     /// (`fresh_allocation_identity`), disjoint from every physical
     /// `Allocation::identity()` and from every other `(Slots, region)`.
-    #[cfg(any(test, target_os = "macos"))]
     region_ids: Vec<u64>,
     /// The device address every free slot names: a whole slab's bytes.
     absent: u64,
@@ -1138,7 +1137,6 @@ impl Slots {
     }
 
     /// The unique logical allocation identity for region `region` of this store.
-    #[cfg(any(test, target_os = "macos"))]
     pub(crate) fn region_identity(&self, region: usize) -> u64 {
         self.region_ids[region]
     }
@@ -1600,7 +1598,6 @@ impl Slots {
             capacity,
             slab_bytes: crate::layout::canonical(representation, extents)?.byte_len,
             offsets: vec![0],
-            #[cfg(any(test, target_os = "macos"))]
             region_ids: vec![crate::driver::fresh_allocation_identity()],
             absent,
             lent: 0,
@@ -1765,7 +1762,6 @@ impl SlabStore {
             table,
             capacity,
             slab_bytes: geometry.slab_bytes,
-            #[cfg(any(test, target_os = "macos"))]
             region_ids: (0..offsets.len())
                 .map(|_| crate::driver::fresh_allocation_identity())
                 .collect(),

@@ -99,13 +99,7 @@ impl DispatchList for BatchCalls<'_> {
     }
 
     fn reaches(&self, index: usize, reaches: &mut Vec<hazard::Reach>) {
-        #[cfg(any(test, target_os = "macos"))]
         self.0[index].1.reaches(reaches);
-        #[cfg(not(any(test, target_os = "macos")))]
-        {
-            let _ = (index, reaches);
-            unreachable!("reaches on batched calls are only used on Metal");
-        }
     }
 
     fn encodes(&self, index: usize, ordinal: usize) -> bool {

@@ -64,7 +64,6 @@ pub(crate) mod vulkan;
 
 use crate::api::device::DeviceInner;
 use crate::api::kernel::{DecodedResults, DecodedValue, EncodedArgs, EncodedOutputs, PrepareError};
-#[cfg(any(test, target_os = "macos"))]
 use crate::api::tensor::Records;
 use crate::api::tensor::{exclusive_pairs, Reaching, TensorInner};
 use crate::api::{CallError, OutputError};
@@ -3012,9 +3011,7 @@ impl NativePrepared {
         let (sync, body) = arena.holding(regions)?;
 
         let mut buffers = Vec::new();
-        #[cfg(any(test, target_os = "macos"))]
         let mut slabs = Vec::new();
-        #[cfg(any(test, target_os = "macos"))]
         let mut records = Vec::new();
         let mut representations = Vec::new();
         let mut access = collect_native_access(schema, &args);
@@ -3053,16 +3050,12 @@ impl NativePrepared {
                     bound.table_offset,
                     seismic_lang::registry::record_table_entry(bound.count),
                 ));
-                #[cfg(any(test, target_os = "macos"))]
-                {
-                    if let Some(slab) = tensor.slab_reach() {
-                        slabs.push((buffer, slab));
-                    }
-                    records.push((buffer, bound));
+                if let Some(slab) = tensor.slab_reach() {
+                    slabs.push((buffer, slab));
                 }
+                records.push((buffer, bound));
             } else if let Some(slab) = tensor.slab_reach() {
                 let table_bytes = slab.table_bytes;
-                #[cfg(any(test, target_os = "macos"))]
                 slabs.push((buffer, slab));
                 buffers.push((
                     tensor.allocation().clone(),
@@ -3108,9 +3101,7 @@ impl NativePrepared {
         Ok(NativeBoundCall {
             results,
             buffers,
-            #[cfg(any(test, target_os = "macos"))]
             slabs,
-            #[cfg(any(test, target_os = "macos"))]
             records,
             representations: bound,
             words: shape.words,
@@ -3302,11 +3293,9 @@ struct NativeBoundCall {
     buffers: Vec<(Arc<Allocation>, u64, u64)>,
     /// Each buffer bound to a slab view, by ABI ordinal, with what it
     /// reaches (the encodings order by it).
-    #[cfg(any(test, target_os = "macos"))]
     slabs: Vec<(usize, Arc<crate::api::tensor::SlabReach>)>,
     /// Each buffer bound to a record port, by ABI ordinal, with the records
     /// its table reaches.
-    #[cfg(any(test, target_os = "macos"))]
     records: Vec<(usize, Arc<Records>)>,
     /// The bound buffers' representations, in argument order.
     representations: Vec<&'static str>,
@@ -3360,7 +3349,6 @@ fn metal_resident_groups(
     work.min((cores.saturating_mul(per_core) / 2).max(1))
 }
 
-#[cfg(any(test, target_os = "macos"))]
 impl NativeBoundCall {
     /// What the call's launches reach, into `reaches`.
     fn reaches(&self, reaches: &mut Vec<hazard::Reach>) {
@@ -3430,13 +3418,7 @@ impl DispatchList for StandaloneCalls<'_> {
     }
 
     fn reaches(&self, index: usize, reaches: &mut Vec<hazard::Reach>) {
-        #[cfg(any(test, target_os = "macos"))]
         self.calls[index].reaches(reaches);
-        #[cfg(not(any(test, target_os = "macos")))]
-        {
-            let _ = (index, reaches);
-            unreachable!("reaches on standalone calls are only used on Metal");
-        }
     }
 
     fn encodes(&self, index: usize, ordinal: usize) -> bool {
