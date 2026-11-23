@@ -325,7 +325,7 @@ impl VolumeLines {
             }
             None => {
                 let points = self.lines.values().flat_map(|(_, points)| points.iter().copied()).collect::<Vec<_>>();
-                if points.is_empty() { Shape::PENDING } else { Shape::of(&points, None) }
+                if points.is_empty() { Shape::pending_for(urgent) } else { Shape::of(&points, None) }
             }
         }
     }
@@ -428,9 +428,9 @@ impl Shape {
         reads.dedup();
         let cores_at = |line: &[Point], window: u64| line.iter().filter(|point| point.window <= window).map(|point| point.cores).fold(0., f64::max);
         let (ahead_read, knee, ahead_cores) = match &request {
-            // The range line's latency knee, its reads ahead whole ranges.
+            // The range line's measured knee, its reads ahead whole ranges.
             Some(request) => {
-                let knee = latency_knee(request.urgent, request.ranges);
+                let knee = range_knee(request.ranges);
                 (request.urgent.whole_range(), knee, cores_at(request.ranges, knee))
             }
             // Each size reaching the best rate, at its knee.
@@ -443,7 +443,20 @@ impl Shape {
                 (read, knee, cores_at(&line(read), knee))
             }
         };
-        let due_read = request.as_ref().map_or(ahead_read, |request| request.lone.iter().min_by(|a, b| a.seconds.total_cmp(&b.seconds)).expect("a request's lone times").read);
+        let due_read = request.as_ref().map_or(ahead_read, |request| {
+            let best = request
+                .lone
+                .iter()
+                .min_by(|a, b| a.seconds.total_cmp(&b.seconds))
+                .expect("a request's lone times");
+            request
+                .lone
+                .iter()
+                .filter(|lone| lone.seconds <= best.seconds + best.error + lone.error)
+                .map(|lone| lone.read)
+                .max()
+                .expect("the best lone time is within its own error")
+        });
         let due_line = line(due_read);
         let full = full_rate(&due_line);
         Self {
@@ -456,24 +469,21 @@ impl Shape {
     }
 }
 
-/// The bytes `urgent`'s reads ahead may hold in flight, by its range line
-/// `line` ("A volume's curve": the knee depth): `⌈D/R₁⌉` whole ranges, `D`
-/// the line's best rate and `R₁` its rate one range deep. A range of `b`
-/// bytes alone reads in `λ + b/D` ("How reads share the engine"), so
-/// `R₁ = b/(λ + b/D)` and `D/R₁ = 1 + λ/(b/D)`: the fewest ranges in flight
-/// whose transfers cover the next one's latency, so the drive reads with
-/// no gap. A parked read arriving behind them waits only for what its own
-/// latency does not cover, `k·b/D − λ < 2·b/D`, at most two ranges'
-/// transfer, a fraction of one expert's read; each range more adds no rate
-/// and delays it `b/D` more.
-fn latency_knee(urgent: &Urgent, line: &[Point]) -> u64 {
-    let span = urgent.span();
-    let top = line.iter().map(|point| point.rate).fold(0., f64::max);
-    let lone = line.iter().min_by_key(|point| point.window).expect("a probed range line");
-    assert_eq!(lone.window, span, "a range line starts one range deep");
-    let ranges = (top / lone.rate).ceil();
-    assert!(ranges.is_finite() && ranges >= 1., "a range line's best rate {top} over one range's {}", lone.rate);
-    ranges as u64 * span
+/// The bytes `urgent`'s reads ahead may hold in flight, by its measured range
+/// line `line`: the narrowest window on `line` whose measured rate reaches
+/// within the noise of the line's best rate. Multi-channel NVMe and SSD
+/// controllers scale sublinearly with queue depth (`R(k) < k · R₁`), so a
+/// single-channel linear estimate `⌈D/R₁⌉` systematically under-sizes the knee
+/// on fast drives (e.g. picking 3 ranges = 6.5 MiB on a Gen5 NVMe that needs
+/// 10–12 ranges to saturate its 11+ GB/s bus). Using the measured knee aligns
+/// request curves with the same rule [`Shape::of`] uses for unrequested lines.
+fn range_knee(line: &[Point]) -> u64 {
+    let top = line.iter().max_by(|a, b| a.rate.total_cmp(&b.rate)).expect("a probed range line");
+    line.iter()
+        .filter(|point| point.rate + point.spread + top.spread >= top.rate)
+        .map(|point| point.window)
+        .min()
+        .expect("the best point reaches its own rate")
 }
 
 /// Of a line's points, the full rate's: the widest window within the noise
@@ -634,19 +644,24 @@ fn lone(key: Volume, file: &Arc<SourceFile>, urgent: &Urgent, reads: &[u64]) -> 
 /// `urgent`'s range line through `file` ("A volume's curve": the knee
 /// depth): at each of its depths in turn, the rate and cores of that many
 /// of its ranges kept in flight through the read engine, the median of
-/// [`PASSES`] passes, to the first depth within the noise of the one before:
-/// the knee is the narrowest window within the noise of the line's best, so
-/// no deeper point moves it, and a drive whose knee is 3 ranges is probed at
-/// 4 depths.
+/// [`PASSES`] passes, stopping early only once doubling past the best depth
+/// seen so far yields no improvement beyond noise (a real plateau, never a
+/// single noisy step on a sublinear NVMe curve).
 fn range_line(key: Volume, file: &Arc<SourceFile>, urgent: &Urgent) -> Result<Vec<Point>, Error> {
     let mut line = Vec::<Point>::new();
+    let mut best: Option<Point> = None;
     for depth in urgent.depths() {
         let passes = (0..PASSES).map(|_| ranges_rate(key, file, urgent, depth)).collect::<Result<Vec<_>, _>>()?;
         let point = Curve::range_point(urgent, depth, 0., 0., 0.);
         let point = Point::of(point.read, point.window, &passes);
-        let flat = line.last().is_some_and(|before| point.rate <= before.rate + before.spread + point.spread);
+        let plateau = best.is_some_and(|best| {
+            point.window >= 2 * best.window && point.rate <= best.rate + best.spread + point.spread
+        });
+        if best.is_none_or(|best| point.rate > best.rate) {
+            best = Some(point);
+        }
         line.push(point);
-        if flat {
+        if plateau {
             break;
         }
     }
@@ -713,15 +728,15 @@ fn ranges_rate(key: Volume, file: &Arc<SourceFile>, urgent: &Urgent, depth: u64)
 
 #[cfg(test)]
 mod tests {
-    use super::{latency_knee, Curve, Urgent, WIDEST_WINDOW};
+    use super::{range_knee, Curve, Urgent, WIDEST_WINDOW};
 
     /// A tensor wider than `WIDEST_WINDOW` still probes depth 1 so
-    /// `latency_knee` never sees an empty range line.
+    /// `range_knee` never sees an empty range line.
     #[test]
     fn urgent_depths_includes_one_when_widest_exceeds_widest_window() {
         let urgent = Urgent { parts: vec![WIDEST_WINDOW + 1024], records: 1 };
         assert_eq!(urgent.depths(), vec![1]);
         let line = vec![Curve::range_point(&urgent, 1, 1e9, 0.0, 0.1)];
-        assert_eq!(latency_knee(&urgent, &line), urgent.span());
+        assert_eq!(range_knee(&line), urgent.span());
     }
 }

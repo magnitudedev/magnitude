@@ -754,10 +754,10 @@ fn a_cancelled_read_ahead_ends_with_what_it_had_in_flight_and_the_due_one_lands(
 }
 
 /// An unprobed volume falls back to `Shape::PENDING` with modern NVMe/SSD
-/// defaults: 1 MiB reads (avoiding 128 KiB fragmentation), a 4 MiB knee so
-/// speculative read-ahead cannot pile up behind parked demand reads, and a
-/// `WIDEST_WINDOW` (32 MiB) due depth (`queue_depth() == 37`) so demand bursts
-/// are not capped to a handful of pieces in flight.
+/// defaults: 1 MiB reads (avoiding 128 KiB fragmentation), a `WIDEST_WINDOW`
+/// (32 MiB) knee (scaling to `4 * expert_bytes` for >8 MiB experts so `QD = 4`
+/// stays full for GLM-5.3/DeepSeek speculative read-ahead), and a
+/// `WIDEST_WINDOW` due depth (`queue_depth() == 65`).
 #[test]
 fn unprobed_volume_uses_sane_pending_shape() {
     const MIB: u64 = 1024 * 1024;
@@ -766,11 +766,16 @@ fn unprobed_volume_uses_sane_pending_shape() {
     for shape in [Shape::PENDING, lines.shape(None), lines.shape(Some(&urgent))] {
         assert_eq!(shape, Shape::PENDING);
         assert_eq!(shape.due, WIDEST_WINDOW);
-        assert_eq!(shape.knee, 4 * MIB);
+        assert_eq!(shape.knee, WIDEST_WINDOW);
         assert_eq!(shape.due_read, MIB);
         assert_eq!(shape.ahead_read, MIB);
-        assert_eq!(shape.queue_depth(), 37);
+        assert_eq!(shape.queue_depth(), 65);
     }
+    // Large 8.66 MiB DeepSeek-like expert scales unprobed knee to 4 full experts (QD = 4).
+    let deepseek = Urgent { parts: vec![3 * MIB; 3], records: 8 };
+    let ds_shape = lines.shape(Some(&deepseek));
+    assert_eq!(ds_shape.knee, 36 * MIB);
+    assert_eq!(ds_shape.due, 36 * MIB);
 }
 
 /// Due reads hold the widest window at the full rate of their line: past
@@ -829,7 +834,7 @@ fn a_links_depths_come_from_its_curve() {
     let expert = Urgent { parts: vec![589_824, 589_824, 720_896], records: 1 };
     let ranges = range_line(&expert, &[(1, 1.2), (2, 2.3), (4, 4.2), (8, 7.0), (16, 9.9), (32, 10.0)]);
     let shape = Shape::of(&gb10, Some(Request { urgent: &expert, lone: &lone, ranges: &ranges }));
-    assert_eq!((shape.ahead_read, shape.knee, shape.due_read, shape.due), (8 * LEAST_READ, 9 * expert.span(), LEAST_READ, 32 * mib));
+    assert_eq!((shape.ahead_read, shape.knee, shape.due_read, shape.due), (8 * LEAST_READ, 16 * expert.span(), LEAST_READ, 32 * mib));
 }
 
 /// A due depth holds a step's whole request: where the due size's line
@@ -849,17 +854,15 @@ fn a_due_depth_holds_a_steps_whole_request() {
     assert_eq!(Shape::of(&internal, Some(Request { urgent: &one, lone: &lone, ranges: &ranges })).due, 4 * mib, "the line's full-rate window holds one");
 }
 
-/// A request's knee is its range line's: the fewest ranges whose transfers
-/// at the line's best rate cover one range's latency, `⌈D/R₁⌉`, wherever
-/// its noise flattens. An M4 Pro's internal drive reads its 580–710 KiB
-/// ranges at 1.9 GB/s alone and 3.95 at best, so 3 ranges, though its line
-/// is within the noise of its best only 4 deep, and its 1 MiB reads' line
-/// peaks at 4 MiB; a drive whose lone range reads at more than half its
-/// best rate (a latency under one range's transfer) reads ahead 2 deep.
-/// Its reads ahead are cut whole, each range one piece, as the line read
-/// them.
+/// A request's knee is its range line's measured knee: the narrowest window
+/// whose measured rate reaches within the noise of the line's best rate.
+/// On sublinear multi-channel NVMe drives (e.g. Gen5 NVMe with 2.2 MiB ranges
+/// reaching 11.27 GB/s at 12 ranges vs 3.8 GB/s alone), the measured knee
+/// picks 12 ranges rather than the linear `⌈D/R₁⌉ = 3` ranges (which only
+/// reaches ~7.2 GB/s). Its reads ahead are cut whole, each range one piece,
+/// as the line read them.
 #[test]
-fn a_requests_knee_covers_one_ranges_latency() {
+fn a_requests_knee_matches_its_measured_range_line() {
     let mib = 1024 * 1024;
     let read = 8 * LEAST_READ;
     let internal = recorded(&[(read, &[(1, 2.1), (2, 3.6), (4, 5.05), (8, 4.6), (16, 4.5), (32, 4.5)])]);
@@ -868,10 +871,25 @@ fn a_requests_knee_covers_one_ranges_latency() {
     assert_eq!(Shape::of(&internal, None).knee, 4 * mib, "the 1 MiB reads' knee");
     let ranges = range_line(&step, &[(1, 1.9), (2, 3.2), (4, 3.9), (8, 3.95), (16, 3.9), (32, 3.9)]);
     let shape = Shape::of(&internal, Some(Request { urgent: &step, lone: &lone, ranges: &ranges }));
-    assert_eq!((shape.knee, shape.ahead_read), (3 * step.span(), read), "three ranges, each one piece");
+    assert_eq!((shape.knee, shape.ahead_read), (4 * step.span(), read), "four ranges reach within noise of 3.95 GB/s");
     let quick = range_line(&step, &[(1, 2.2), (2, 3.9), (3, 4.0), (4, 4.05), (5, 4.05)]);
     let shape = Shape::of(&internal, Some(Request { urgent: &step, lone: &lone, ranges: &quick }));
-    assert_eq!(shape.knee, 2 * step.span(), "4.05 over 2.2: two ranges");
+    assert_eq!(shape.knee, 2 * step.span(), "two ranges already reach within noise of 4.05 GB/s");
+    // Gen5 NVMe sublinear scaling with 2.2 MiB ranges: R(1) = 3.8 GB/s,
+    // R(3) = 7.2 GB/s, saturating at 11.27 GB/s by 12 ranges.
+    let gen5_step = Urgent { parts: vec![2_260_000; 3], records: 8 };
+    let gen5_points = recorded(&[
+        (LEAST_READ, &[(1, 0.9), (8, 5.2), (32, 9.5), (64, 11.1), (128, 11.25), (256, 11.27)]),
+        (8 * LEAST_READ, &[(1, 2.8), (4, 7.6), (8, 10.2), (16, 11.20), (32, 11.27)]),
+    ]);
+    let gen5_lone = [
+        Lone { read: LEAST_READ, seconds: 4.80e-3, error: 0.08e-3 },
+        Lone { read: 8 * LEAST_READ, seconds: 4.83e-3, error: 0.08e-3 },
+    ];
+    let gen5_ranges = range_line(&gen5_step, &[(1, 3.8), (2, 5.9), (3, 7.2), (4, 8.2), (6, 9.6), (8, 10.4), (10, 10.8), (12, 11.27), (15, 11.25)]);
+    let gen5_shape = Shape::of(&gen5_points, Some(Request { urgent: &gen5_step, lone: &gen5_lone, ranges: &gen5_ranges }));
+    assert_eq!(gen5_shape.knee, 12 * gen5_step.span(), "measured knee reaches within noise of 11.27 GB/s instead of linear ceil(11.27/3.8)=3");
+    assert_eq!(gen5_shape.due_read, 8 * LEAST_READ, "widest lone read size within measurement error avoids 128 KiB fragmentation");
     assert_eq!(step.depths(), vec![1, 2, 3, 4, 5, 6, 7, 8, 10, 12, 15, 18, 22, 27, 33, 41], "every depth to 8, a quarter more past it, to 32 MiB of 704 KiB ranges");
 }
 
@@ -1336,4 +1354,55 @@ fn alignment_and_buffer_match_platform_direct_read_alignment() {
         assert_eq!(region_len, length);
         assert_eq!(base.as_ptr() as usize % ALIGNMENT as usize, 0);
     }
+}
+
+/// Concurrent workers reading unaligned 32-byte-grain GGUF-like expert ranges
+/// of varying sizes (exercising worker-local `scratch` reuse and growth across
+/// both demand and read-ahead requests) land every byte identically.
+#[test]
+fn concurrent_unaligned_gguf_reads_land_byte_exact_across_worker_scratch_reuse() {
+    let _volume = temporary_volume();
+    let total = 3 * 1024 * 1024 + 97;
+    let payload: Vec<u8> = (0..total).map(|i| ((i * 131 + (i >> 8) * 17) & 0xff) as u8).collect();
+    let path = temporary("unaligned-gguf-concurrent", &payload);
+    let reader = Reader::open(&path, CachePolicy::Uncached).unwrap();
+
+    // Mix of unaligned 32-byte offsets and varying lengths (from 64 KiB up to
+    // 512 KiB) so workers reuse and grow their local bounce buffers under load.
+    let specs: Vec<(u64, usize, bool)> = (0..24)
+        .map(|i| {
+            let offset = (i as u64 * 97_280 + 32 * (i as u64 % 17 + 1)) % (total as u64 - 524_288);
+            let length = match i % 4 {
+                0 => 64 * 1024 + 32,
+                1 => 192 * 1024 + 96,
+                2 => 384 * 1024 + 64,
+                _ => 512 * 1024 - 32,
+            };
+            let due = i % 3 == 0;
+            (offset, length, due)
+        })
+        .collect();
+
+    let mut handles = Vec::with_capacity(specs.len());
+    for (index, &(offset, length, due)) in specs.iter().enumerate() {
+        let sink = Arc::new(Buffer::new(length));
+        let want = if due { Want::now() } else { Want::expected(index as u64 + 1, 0.9) };
+        let range = Range { offset, length, into: sink.clone(), at: 0 };
+        // SAFETY: `sink` is exclusively owned by this request until `wait()`.
+        let handle = unsafe { reader.request(vec![range], want) }.unwrap();
+        handles.push((handle, sink, offset, length));
+    }
+
+    for (handle, sink, offset, length) in handles {
+        let Ended::Read { failed } = handle.wait() else {
+            panic!("concurrent unaligned read panicked");
+        };
+        assert!(failed.is_empty(), "unexpected read failure: {failed:?}");
+        // SAFETY: the request has ended.
+        let got = unsafe { sink.bytes() };
+        assert_eq!(got, &payload[offset as usize..offset as usize + length], "mismatch at offset {offset} len {length}");
+    }
+
+    drop(reader);
+    std::fs::remove_file(path).unwrap();
 }

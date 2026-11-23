@@ -494,6 +494,11 @@ impl Drop for Need {
 /// One that finds nothing to take while the pool holds more workers than
 /// its claims need leaves it.
 fn work(engine: &'static Engine, slot: FlightSlot) {
+    // Each worker reuses its own aligned bounce buffer across back-to-back
+    // pieces (zero `Buffers` mutex contention on the hot path) and returns it
+    // to `engine.buffers` whenever the queue goes idle or the worker retires,
+    // so no buffer outlives the last open reader.
+    let mut scratch: Option<Buffer> = None;
     loop {
         let taken = {
             let mut queue = engine.queue();
@@ -507,6 +512,9 @@ fn work(engine: &'static Engine, slot: FlightSlot) {
                         "a piece in flight beyond the pool's workers: a read the line admits would wait for a thread"
                     );
                     break taken;
+                }
+                if let Some(buffer) = scratch.take() {
+                    engine.buffers.give(buffer);
                 }
                 if engine.retire() {
                     return;
@@ -534,14 +542,14 @@ fn work(engine: &'static Engine, slot: FlightSlot) {
         // only some of them need, or in a gap between them none needs: each
         // part's own span is read again, and only those that fail fail.
         let file = &taken.file;
-        let read = taken.state.submitter.run(|| match file.fetch(piece, &engine.buffers) {
+        let read = taken.state.submitter.run(|| match file.fetch(piece, &mut scratch, &engine.buffers) {
             Ok(fetched) => Ok(fetched),
             Err(error) if piece.parts.len() == 1 => Err(vec![(piece.parts[0].range, Arc::new(error))]),
             Err(_) => Err(piece
                 .parts_alone()
                 .filter_map(|alone| {
                     let range = alone.parts[0].range;
-                    file.read_piece(&alone, &engine.buffers).err().map(|error| (range, Arc::new(error)))
+                    file.read_piece(&alone, &mut scratch, &engine.buffers).err().map(|error| (range, Arc::new(error)))
                 })
                 .collect()),
         });
@@ -561,7 +569,7 @@ fn work(engine: &'static Engine, slot: FlightSlot) {
         let read = read.and_then(|read| {
             taken.state.submitter.run(|| match read {
                 Ok(fetched) => {
-                    fetched.land(piece, &engine.buffers);
+                    fetched.land(piece, &mut scratch);
                     Vec::new()
                 }
                 Err(failed) => failed,

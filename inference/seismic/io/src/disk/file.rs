@@ -19,8 +19,8 @@ pub(crate) enum Fetched {
 
 impl Fetched {
     /// Land `piece`'s parts: each one's bytes copied out of the buffer that
-    /// holds them, which goes back to `buffers`.
-    pub(crate) fn land(self, piece: &Piece, buffers: &Buffers) {
+    /// holds them, which returns to the worker's `scratch` for the next piece.
+    pub(crate) fn land(self, piece: &Piece, scratch: &mut Option<Buffer>) {
         let Self::Held(mut buffer) = self else {
             return;
         };
@@ -30,7 +30,7 @@ impl Fetched {
             // writes alone until the job ends (`Reader::submit`).
             unsafe { std::ptr::copy_nonoverlapping(bytes[part.from..].as_ptr(), part.sink.as_ptr(), part.length) };
         }
-        buffers.give(buffer);
+        *scratch = Some(buffer);
     }
 }
 
@@ -85,17 +85,19 @@ impl Through {
 impl SourceFile {
     /// Read `piece` and land its parts: straight into the one sink of an
     /// uncached piece that lies within one range where the sink meets the
-    /// reader's alignment, otherwise through a buffer of `buffers`.
-    pub(crate) fn read_piece(&self, piece: &Piece, buffers: &Buffers) -> Result<(), Error> {
-        let fetched = self.fetch(piece, buffers)?;
-        fetched.land(piece, buffers);
+    /// reader's alignment, otherwise through the worker's `scratch` buffer
+    /// (falling back to `buffers` only when `scratch` is absent or too small).
+    pub(crate) fn read_piece(&self, piece: &Piece, scratch: &mut Option<Buffer>, buffers: &Buffers) -> Result<(), Error> {
+        let fetched = self.fetch(piece, scratch, buffers)?;
+        fetched.land(piece, scratch);
         Ok(())
     }
 
     /// Read `piece` from the volume: straight into its one sink where it
-    /// lands straight ([`Self::lands_straight`]), otherwise into a buffer of
-    /// `buffers`, its parts still to land ([`Fetched::land`]).
-    pub(crate) fn fetch(&self, piece: &Piece, buffers: &Buffers) -> Result<Fetched, Error> {
+    /// lands straight ([`Self::lands_straight`]), otherwise into the worker's
+    /// `scratch` buffer (borrowing from `buffers` only when `scratch` is empty
+    /// or smaller than `span`), its parts still to land ([`Fetched::land`]).
+    pub(crate) fn fetch(&self, piece: &Piece, scratch: &mut Option<Buffer>, buffers: &Buffers) -> Result<Fetched, Error> {
         let span = (piece.end - piece.start) as usize;
         if self.lands_straight(piece) {
             // SAFETY: the piece's one part's sink is `span` bytes the pool
@@ -104,11 +106,19 @@ impl SourceFile {
                 unsafe { std::slice::from_raw_parts_mut(piece.parts[0].sink.as_ptr(), span) };
             return self.read_block(piece.start, sink).map(|()| Fetched::Landed);
         }
-        let mut buffer = buffers.take(span);
+        let mut buffer = match scratch.take() {
+            Some(buffer) if buffer.len() >= span => buffer,
+            smaller => {
+                if let Some(smaller) = smaller {
+                    buffers.give(smaller);
+                }
+                buffers.take(span)
+            }
+        };
         match self.read_block(piece.start, &mut buffer.bytes_mut()[..span]) {
             Ok(()) => Ok(Fetched::Held(buffer)),
             Err(error) => {
-                buffers.give(buffer);
+                *scratch = Some(buffer);
                 Err(error)
             }
         }

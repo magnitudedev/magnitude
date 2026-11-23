@@ -35,6 +35,16 @@ impl Buffer {
         Self { base, layout, length }
     }
 
+    /// Its length in bytes.
+    pub fn len(&self) -> usize {
+        self.length
+    }
+
+    /// Whether it holds no bytes.
+    pub fn is_empty(&self) -> bool {
+        self.length == 0
+    }
+
     /// Its bytes.
     ///
     /// # Safety

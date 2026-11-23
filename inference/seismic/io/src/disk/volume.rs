@@ -47,18 +47,34 @@ impl std::fmt::Display for Shape {
 
 impl Shape {
     /// How a volume is read before any probe of it: 1 MiB reads (avoiding
-    /// 128 KiB fragmentation on NVMe/SSD drives while keeping each piece at
-    /// most half the knee), a 4 MiB knee so speculative read-ahead never
-    /// queues tens of MiB behind a parked demand read, and a [`WIDEST_WINDOW`]
-    /// (32 MiB) due depth so multi-piece demand bursts saturate modern NVMe
-    /// drives without capping the worker pool.
+    /// 128 KiB fragmentation on NVMe/SSD drives), a [`WIDEST_WINDOW`] (32 MiB)
+    /// knee so speculative read-ahead sustains `QD >= 4` for 8 MiB MoE experts
+    /// (GLM-5.3, DeepSeek) on Apple Silicon and NVMe SSDs instead of capping at
+    /// `QD = 1`, and a [`WIDEST_WINDOW`] due depth.
     pub(crate) const PENDING: Self = Self {
         due: WIDEST_WINDOW,
-        knee: 4 * 1024 * 1024,
+        knee: WIDEST_WINDOW,
         ahead_read: 1024 * 1024,
         due_read: 1024 * 1024,
         cores: 0.,
     };
+
+    /// Unprobed fallback shape for `urgent`: starts from [`Self::PENDING`]
+    /// (`knee = 32 MiB`) and raises `knee` (and `due`) to at least `4` full
+    /// expert spans when a single expert exceeds 8 MiB (e.g. DeepSeek 8.66 MiB)
+    /// so `QD = 4` stays full for speculative read-ahead.
+    pub(crate) fn pending_for(urgent: Option<&Urgent>) -> Self {
+        let mut shape = Self::PENDING;
+        if let Some(urgent) = urgent {
+            let expert_bytes: u64 = urgent.parts.iter().copied().sum();
+            let qd4 = expert_bytes.saturating_mul(4);
+            if qd4 > shape.knee {
+                shape.knee = qd4;
+                shape.due = shape.due.max(shape.knee);
+            }
+        }
+        shape
+    }
 
     /// The size a piece is cut at, due or not.
     pub(crate) fn read(&self, due: bool) -> u64 {
@@ -101,14 +117,14 @@ impl EarlierChoice {
 
 impl Curve {
     /// The rule a curve is kept by, a term of a stored curve's key, so a
-    /// curve probed by another is probed again: 7, every point kept,
-    /// windows from one read, each lone time a step's whole request's, and
-    /// the request's range line read ahead through the engine's queue in
-    /// ranges of their aligned span, its knee (6 held the line by a thread a
+    /// curve probed by another is probed again: 8, range lines probed until a
+    /// doubling plateau (never stopping on a single noisy step) and the
+    /// measured range knee taken directly (7 stopped on the first flat step
+    /// and approximated the knee as `⌈D/R₁⌉`; 6 held the line by a thread a
     /// range and counted a range by its bytes; 5 had none and took the knee
     /// of the power-of-two read sizes; 4 timed one record of a request;
     /// [`EarlierChoice`] the rule before).
-    pub const SCHEMA: u64 = 7;
+    pub const SCHEMA: u64 = 8;
 }
 
 /// Each volume's lines, by volume.
