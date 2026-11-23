@@ -985,26 +985,8 @@ fn import_target(
     // beside `upload_window`, import non-banked target weights, release
     // `upload_window`, and THEN size and open the bank's slots past floor so
     // transient `target_upload_peak_bytes` never steals bank slots.
-    let streamed_bank_floor = execution_plan
-        .load()
-        .expert_bank()
-        .filter(|bank| !bank.whole())
-        .map(|bank| bank.floor());
-    let (mut execution_plan, mut planned, initial_plan, floor_demand, mut weights) =
-        if let Some(floor) = streamed_bank_floor {
-            let floor_plan = execution_plan
-                .clone()
-                .with_load_slots(floor, 0)
-                .map_err(|error| internal(error.to_string()))?;
-            let floor_demand = floor_plan.load().target_weight_demand().map_err(internal)?;
-            let weights = startup.claim("target import", floor_demand)?;
-            (execution_plan, planned, floor_plan, Some(floor_demand), weights)
-        } else {
-            let imported = startup.claim_target_import(execution_plan.load())?;
-            let (execution_plan, planned, weights) = imported.fit(execution_plan, planned)?;
-            let initial = execution_plan.clone();
-            (execution_plan, planned, initial, None, weights)
-        };
+    let ImportClaim { mut execution_plan, mut planned, initial_plan, floor_demand, mut weights } =
+        startup.claim_import(execution_plan, planned)?;
     startup.recorded.record(state_tables);
     // A linked host tier backs to its load-time slots from the bank's open
     // (`ExpertBank::back_host`): its claim is split from the target import's
@@ -1973,6 +1955,17 @@ enum Imported {
     Fitted(u64, u64, Held),
 }
 
+/// The target import's claim ([`Startup::claim_import`]): the load's plans
+/// at the slots it admits, the plan the import opens at, the bank's floor
+/// when the bank is streamed, and the weights claimed.
+struct ImportClaim {
+    execution_plan: ExecutionPlan,
+    planned: ExecutionPlanDraft,
+    initial_plan: ExecutionPlan,
+    floor_demand: Option<ClaimDemand>,
+    weights: Held,
+}
+
 impl Imported {
     /// The load's plans at the slots this import admitted, and its claim:
     /// as planned, or with the expert bank at the fitted slots. Its own
@@ -2037,6 +2030,28 @@ impl Startup {
     /// [`Self::claim`] of `bytes` of device storage.
     fn claim_device(&self, purpose: &str, bytes: u64) -> Result<Held, LoadError> {
         self.claim(purpose, ClaimDemand { device: bytes, ..ClaimDemand::default() })
+    }
+
+    /// The target import's claim: for a streamed expert bank only its floor,
+    /// beside the upload window, the bank's slots past it sized once the
+    /// non-banked weights are imported ([`Self::claim_bank_growth`]), so the
+    /// transient upload peak never steals bank slots; otherwise the whole
+    /// import, fitted to what the device admits. Its own frame, beside the
+    /// load's.
+    #[inline(never)]
+    fn claim_import(&mut self, execution_plan: ExecutionPlan, planned: ExecutionPlanDraft) -> Result<ImportClaim, LoadError> {
+        let streamed_bank_floor = execution_plan.load().expert_bank().filter(|bank| !bank.whole()).map(|bank| bank.floor());
+        if let Some(floor) = streamed_bank_floor {
+            let initial_plan = execution_plan.clone().with_load_slots(floor, 0).map_err(|error| internal(error.to_string()))?;
+            let floor_demand = initial_plan.load().target_weight_demand().map_err(internal)?;
+            let weights = self.claim("target import", floor_demand)?;
+            Ok(ImportClaim { execution_plan, planned, initial_plan, floor_demand: Some(floor_demand), weights })
+        } else {
+            let imported = self.claim_target_import(execution_plan.load())?;
+            let (execution_plan, planned, weights) = imported.fit(execution_plan, planned)?;
+            let initial_plan = execution_plan.clone();
+            Ok(ImportClaim { execution_plan, planned, initial_plan, floor_demand: None, weights })
+        }
     }
 
     /// Claim the target import of `load`: each weight allocation in the
