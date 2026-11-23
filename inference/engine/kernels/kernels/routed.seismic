@@ -158,12 +158,12 @@ projection routed for metal:
         ROWS in [2, 1, 4, 8] default 2 for summed, arithmetic LANES in [8, 16, 32, 4] default greatest where LANES == 8 or (LANES == 16 and SUMMED_PACKETS > 32 and (SHARED == 0 or SUMMED_PACKETS <= 64)) reference 8 for summed,
         form GATHERED in [0, 1] default 1 for summed,
         TILE_M in [32, 64, 128] default 32 for grouped, TILE_N in [128, 64] default 128 for grouped,
-        form TALL in [0, 1] default greatest where TALL == 0 or STACKED == 0 or (device.tensor_ops == 0 and T % 32 == 0 and WIDTH % 128 == 0 and WIDTH < 1048576 and N % (64 / SERVED) == 0 and each(W, FIRST == 0 or form(W, PACK) == 1) and sum(W, FIRST * form(W, PACK_FOLDS)) == SERVED * most(W, FIRST * form(W, PACK_FOLDS)) and sum(W, FIRST * form(W, PACK_RESIDUE)) % SERVED == 0 and sum(W, FIRST * form(W, PACK_SUMS)) % SERVED == 0) for grouped,
+        form TALL in [0, 1] default greatest where TALL == 0 or STACKED == 0 or (device.tensor_ops == 0 and T % 32 == 0 and WIDTH % 64 == 0 and ((WIDTH % 128 == 0 and WIDTH < 1048576 and N % (64 / SERVED) == 0 and each(W, FIRST == 0 or form(W, PACK) == 1) and sum(W, FIRST * form(W, PACK_FOLDS)) == SERVED * most(W, FIRST * form(W, PACK_FOLDS)) and sum(W, FIRST * form(W, PACK_RESIDUE)) % SERVED == 0 and sum(W, FIRST * form(W, PACK_SUMS)) % SERVED == 0) or any(W, FIRST == 1 and (form(W, PACK_FOLDS) == 2 or form(W, PACK_RESIDUE) == 1)))) for grouped,
         arithmetic form INT8 in [0, 1] default 0 for grouped,
-        arithmetic form PACK in [0, 1] default greatest where PACK == 0 or (device.tensor_ops == 0 and TALL == 1 and INT8 == 0 and WIDTH % 128 == 0 and WIDTH < 1048576 and N % (64 / SERVED) == 0 and each(W, FIRST == 0 or form(W, PACK) == 1) and sum(W, FIRST * form(W, PACK_FOLDS)) == SERVED * most(W, FIRST * form(W, PACK_FOLDS)) and sum(W, FIRST * form(W, PACK_RESIDUE)) % SERVED == 0 and sum(W, FIRST * form(W, PACK_SUMS)) % SERVED == 0) reference 0 for grouped,
-        form DOWN_TALL in [0, 1] default greatest where DOWN_TALL == 0 or STACKED == 0 or (device.tensor_ops == 0 and T % 32 == 0 and each(W, FIRST == 1 or (WIDTH % 128 == 0 and WIDTH < 1048576 and N % 64 == 0 and form(W, PACK) == 1))) for grouped,
+        arithmetic form PACK in [0, 1] default greatest where PACK == 0 or (device.tensor_ops == 0 and TALL == 1 and INT8 == 0 and WIDTH % 128 == 0 and WIDTH < 1048576 and N % (64 / SERVED) == 0 and each(W, FIRST == 0 or (form(W, PACK) == 1 and form(W, PACK_FOLDS) == 1 and form(W, PACK_RESIDUE) == 0)) and sum(W, FIRST * form(W, PACK_FOLDS)) == SERVED * most(W, FIRST * form(W, PACK_FOLDS)) and sum(W, FIRST * form(W, PACK_RESIDUE)) % SERVED == 0 and sum(W, FIRST * form(W, PACK_SUMS)) % SERVED == 0) reference 0 for grouped,
+        form DOWN_TALL in [0, 1] default greatest where DOWN_TALL == 0 or STACKED == 0 or (device.tensor_ops == 0 and T % 32 == 0 and each(W, FIRST == 1 or WIDTH % 64 == 0) and (each(W, FIRST == 1 or (WIDTH % 128 == 0 and WIDTH < 1048576 and N % 64 == 0 and form(W, PACK) == 1)) or any(W, FIRST == 0 and (form(W, PACK_FOLDS) == 2 or form(W, PACK_RESIDUE) == 1)))) for grouped,
         arithmetic form DOWN_INT8 in [0, 1] default 0 for grouped,
-        arithmetic form DOWN_PACK in [0, 1] default greatest where DOWN_PACK == 0 or (device.tensor_ops == 0 and DOWN_TALL == 1 and DOWN_INT8 == 0 and each(W, FIRST == 1 or (WIDTH % 128 == 0 and WIDTH < 1048576 and N % 64 == 0 and form(W, PACK) == 1))) reference 0 for grouped)
+        arithmetic form DOWN_PACK in [0, 1] default greatest where DOWN_PACK == 0 or (device.tensor_ops == 0 and DOWN_TALL == 1 and DOWN_INT8 == 0 and each(W, FIRST == 1 or (WIDTH % 128 == 0 and WIDTH < 1048576 and N % 64 == 0 and form(W, PACK) == 1 and form(W, PACK_FOLDS) == 1 and form(W, PACK_RESIDUE) == 0))) reference 0 for grouped)
     where K + SHARED <= device.max_group_threads / device.subgroup_width for summed
     where ROWS * ceil_div(SUMMED_PACKETS - (1 - min(1, LANES / 16) + (min(1, LANES / 16) - LANES / 32) * SUMMED_STAGES_16) * (SUMMED_PACKETS - SUMMED_STAGE), LANES) <= 8 for summed
     where GATHERED == 0 or LANES <= 16 for summed
@@ -326,11 +326,14 @@ projection routed for metal:
         grid (expand_grid)
         threads_per_threadgroup (256, 1, 1)
     launch tall for grouped when STACKED == 0 and TALL == 1 and INT8 == 0 and PACK == 0 and M > 64:
-        params (TALL_M in [128, 256, 512] default 128, TALL_K in [64, 128] default 64, STAGERS in [2, 1] default 2)
+        params (TALL_M in [128, 256, 512] default 128,
+            TALL_K in [64, 128] default greatest where TALL_K == 64 or (TALL_K == 128 and PACK == 0 and WIDTH % 128 == 0 and any(W, FIRST == 1 and (form(W, PACK_FOLDS) == 2 or form(W, PACK_RESIDUE) == 1))),
+            STAGERS in [2, 1] default 2)
         threadgroups (ceil_div(N, 32 / SERVED), ceil_div(M, TALL_M), 1)
         threads_per_threadgroup ((TALL_M / 32 + STAGERS) * 32, 1, 1)
     launch tall for grouped when STACKED == 1 and TALL == 1 and INT8 == 0 and PACK == 0:
-        params (TALL_K in [64, 128] default 64, STAGERS in [2, 1] default 2)
+        params (TALL_K in [64, 128] default greatest where TALL_K == 64 or (TALL_K == 128 and PACK == 0 and WIDTH % 128 == 0 and any(W, FIRST == 1 and (form(W, PACK_FOLDS) == 2 or form(W, PACK_RESIDUE) == 1))),
+            STAGERS in [2, 1] default 2)
         threadgroups (ceil_div(N, 32 / SERVED), B * ceil_div(T, 64), 1)
         grid (tile_grid)
         threads_per_threadgroup ((2 + STAGERS) * 32, 1, 1)
@@ -390,11 +393,14 @@ projection routed for metal:
         grid (down_grid)
         threads_per_threadgroup (256, 1, 1)
     launch down_tall for grouped when STACKED == 0 and DOWN_TALL == 1 and DOWN_INT8 == 0 and DOWN_PACK == 0 and M > 64:
-        params (DOWN_TALL_M in [128, 256, 512] default 128, DOWN_TALL_K in [64, 128] default 64, DOWN_STAGERS in [2, 1] default 2)
+        params (DOWN_TALL_M in [128, 256, 512] default 128,
+            DOWN_TALL_K in [64, 128] default greatest where DOWN_TALL_K == 64 or (DOWN_TALL_K == 128 and DOWN_PACK == 0 and each(W, FIRST == 1 or WIDTH % 128 == 0) and any(W, FIRST == 0 and (form(W, PACK_FOLDS) == 2 or form(W, PACK_RESIDUE) == 1))),
+            DOWN_STAGERS in [2, 1] default 2)
         threadgroups (ceil_div(WIDTH, 32), ceil_div(M, DOWN_TALL_M), 1)
         threads_per_threadgroup ((DOWN_TALL_M / 32 + DOWN_STAGERS) * 32, 1, 1)
     launch down_tall for grouped when STACKED == 1 and DOWN_TALL == 1 and DOWN_INT8 == 0 and DOWN_PACK == 0:
-        params (DOWN_TALL_K in [64, 128] default 64, DOWN_STAGERS in [2, 1] default 2)
+        params (DOWN_TALL_K in [64, 128] default greatest where DOWN_TALL_K == 64 or (DOWN_TALL_K == 128 and DOWN_PACK == 0 and each(W, FIRST == 1 or WIDTH % 128 == 0) and any(W, FIRST == 0 and (form(W, PACK_FOLDS) == 2 or form(W, PACK_RESIDUE) == 1))),
+            DOWN_STAGERS in [2, 1] default 2)
         threadgroups (ceil_div(WIDTH, 32), B * ceil_div(T, 64), 1)
         grid (tile_grid)
         threads_per_threadgroup ((2 + DOWN_STAGERS) * 32, 1, 1)

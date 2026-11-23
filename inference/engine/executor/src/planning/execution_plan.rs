@@ -1378,12 +1378,23 @@ impl ExecutionPlanDraft {
             let slack = charge
                 .bank_growth_slack(mandatory.device.topology(), mandatory.device.executor())
                 .map_err(PlanError::ResourcePlanning)?;
-            // Account for the upload-window slack released before bank growth
-            // and the warm `IdleClass` (`CacheKind::GraphSlots`) bytes a
-            // `pass`-place prompt group retains across decode so `settle_bank`
-            // prices the true steady-state decode expert slots of each pass.
-            let decode_free = free.saturating_add(slack).saturating_sub(idle_class);
-            let slots = count(slots_within(decode_free, (points[0], *ceiling), &reserved)?)?;
+            // Serving-phase room above the bank floor once transient startup
+            // upload slack is released (`serving_allocation + serving_room == fits_within`).
+            let serving_room = free.saturating_add(slack);
+            // Prefill-phase hard safety invariant: opening a `pass`-place
+            // prompt group claims `idle_class` additional `GraphSlots` beyond
+            // the 1-place startup slots. Even if the expert bank shrinks to its
+            // floor, a `pass` that cannot fit its own prompt-group slots in
+            // `serving_room` would over-commit unified memory on cold prefill
+            // or alternating prefill/decode requests.
+            if idle_class > serving_room {
+                break;
+            }
+            // Steady-state decode pricing: idle prompt-group `GraphSlots`
+            // (`IdleClass`) are reclaimable cache that yields to
+            // `CacheKind::Bank` growth during decode (`serving_heap::grow_expert_bank`),
+            // matching `settle_bank_at`'s `room + slack` bank sizing.
+            let slots = count(slots_within(serving_room, (points[0], *ceiling), &reserved)?)?;
             let held = magnitude_cost_model::HeldSlots { slots, host };
             // The smallest pass leaves the most slots.
             let most = *most.get_or_insert(held);
@@ -4993,6 +5004,103 @@ mod tests {
                 .unwrap()
                 .allocation_bytes()
                 <= tight_room
+        );
+    }
+
+    /// On M4 Pro 48 GiB with a Qwen3.8-shaped streamed MoE model (16 prompt
+    /// places), `settle_bank` reaches `pass=16` instead of capping at `pass=4`
+    /// because idle prompt-group `GraphSlots` (`IdleClass`) yield to decode
+    /// bank growth rather than permanently reducing steady-state decode slots.
+    /// When serving room is tightened below `pass=16`'s `idle_class_bytes`,
+    /// `settle_bank` steps `pass` down so prefill never over-commits unified
+    /// memory.
+    #[test]
+    fn m4_pro_streamed_bank_reaches_pass_16_and_enforces_prefill_idle_class_bound() {
+        use crate::planning::fixtures::{LIMITS, RoutedShape, gemma_moe_fixture_manifest, routed_fixture_definition};
+
+        let (topology, _, device) = recorded(seismic::fixtures::recorded::m4_pro(), BackendName::Metal, 0, seismic::GraphCost::None);
+        let mut definition = routed_fixture_definition(RoutedShape {
+            layers: 40,
+            experts: 256,
+            selected: 8,
+            hidden: 4096,
+            intermediate: 1536,
+        });
+        definition.decoder.context_limit = 8192;
+        let manifest = gemma_moe_fixture_manifest(&definition);
+        let draft = ExecutionPlanner::prepare(
+            &device,
+            &manifest,
+            &definition,
+            ComponentSelection { head: false, vision: false },
+            ExecutionPath::Native,
+            PlannedMethod::Plain,
+            KvCodec::Dense,
+            LIMITS,
+        )
+        .unwrap();
+        let capacity = super::MemoryBudget::of_stable(draft.device()).unwrap().capacity();
+        let bound = HeldBound::of(None, capacity);
+        let BankCeiling { whole, ceiling, places } = draft.bank_ceiling(&definition, bound, None).unwrap().unwrap();
+        assert_eq!(places.get(), 16, "8192 context should plan 16 prompt places");
+
+        let floor_slots = whole.bank().floor();
+        let mandatory_floor = whole.resized(floor_slots, ceiling, PassLaunches::FLOOR).unwrap();
+        let structure = crate::assessment::StructuralCharge::of(&definition, &mandatory_floor).unwrap();
+        let floor_charge = structure.charge(&definition, &mandatory_floor).unwrap();
+        let floor_bytes = floor_charge
+            .store_demands(&topology, mandatory_floor.device().executor())
+            .unwrap()
+            .allocation_bytes();
+
+        let pass16 = PassLaunches::new(NonZeroUsize::new(16).unwrap());
+        let mandatory_16 = whole.resized(floor_slots, ceiling, pass16).unwrap();
+        let structure_16 = structure.at_pass(&definition, &mandatory_16).unwrap();
+        let charge_16 = structure_16.charge(&definition, &mandatory_16).unwrap();
+        let idle_16 = structure_16
+            .idle_class_bytes(16, mandatory_16.policy().limits(), mandatory_16.load().fronts())
+            .unwrap();
+        assert!(idle_16 > 0, "pass=16 must carry nonzero extra GraphSlots beyond 1-place floor");
+        let mandatory_16_bytes = charge_16
+            .store_demands(&topology, mandatory_16.device().executor())
+            .unwrap()
+            .allocation_bytes();
+        let slack_16 = charge_16
+            .bank_growth_slack(&topology, mandatory_16.device().executor())
+            .unwrap();
+
+        // With 32 GiB of serving room beyond pass=16's mandatory + idle-class
+        // bytes (well below whole-model residency), settle_bank must reach
+        // pass=16 rather than capping at pass=4.
+        let wide_budget = super::MemoryBudget::fixed(mandatory_16_bytes + idle_16 + (32_u64 << 30), None);
+        let (planned, ()) = draft
+            .with_held_experts(&definition, bound, &synthetic(), &wide_budget, |_, _| {
+                Ok::<_, PlanError>(Ok(()))
+            })
+            .unwrap()
+            .unwrap_or_else(|no| panic!("Qwen3.8-shaped MoE streams at pass=16 on M4 Pro: {no:?}"));
+        let held = planned.draft().load().expert_bank().unwrap();
+        assert!(held.slots < held.widest().get(), "expected streamed bank, got {} of {}", held.slots, held.widest());
+        assert_eq!(held.pass, pass16, "M4 Pro streamed bank should reach pass=16, got {:?}", held.pass);
+        assert_eq!(planned.charge().held_pass, pass16);
+
+        // Tightening room strictly below pass=16's prefill-phase serving peak
+        // (`mandatory_16_bytes - slack_16 + idle_16`) must step `pass` down
+        // below 16 so cold prefill / alternating prefill-decode never
+        // over-commits unified memory.
+        let tight_bytes = (mandatory_16_bytes.saturating_sub(slack_16) + idle_16 - 1).max(floor_bytes);
+        let tight_budget = super::MemoryBudget::fixed(tight_bytes, None);
+        let (tight_planned, ()) = draft
+            .with_held_experts(&definition, bound, &synthetic(), &tight_budget, |_, _| {
+                Ok::<_, PlanError>(Ok(()))
+            })
+            .unwrap()
+            .unwrap_or_else(|no| panic!("Qwen3.8-shaped MoE steps down pass cleanly under tight room: {no:?}"));
+        let tight_held = tight_planned.draft().load().expert_bank().unwrap();
+        assert!(
+            tight_held.pass < pass16,
+            "tight room ({tight_bytes} bytes) must step down below pass=16, got {:?}",
+            tight_held.pass,
         );
     }
 }

@@ -988,6 +988,73 @@ struct PartPartial {
         return;                                                                                                 \
     PROJECTION_SEGMENT_CHAIN                                                                                    \
     PROJECTION_EACH_SEGMENT(PROJECTION_SEGMENT_PART_COMBINE, )
+
+// Split-K GEMM and reduction for parted segmented projections (`stream_mix_down`,
+// SERVED == 1).
+//
+// Threadgroup memory math for TM x TN staged tile (gemm_k = 32, gemm_lda = 40):
+//   A tile = TM * gemm_lda * 2 bytes; B tile = TN * gemm_lda * 2 bytes.
+//   64x32: A = 64 * 40 * 2 = 5,120 B, B = 32 * 40 * 2 = 2,560 B -> 7,680 B (7.5 KB <= 32 KB).
+//   64x64: A = 5,120 B, B = 5,120 B -> 10,240 B (10.0 KB <= 32 KB).
+//   128x128: A = 10,240 B, B = 10,240 B -> 20,480 B (20.0 KB <= 32 KB).
+// Single `PROJECTION_GEMM_SHARED` declaration outside the `SPLIT == 1` branch so
+// MSL never allocates two static threadgroup buffers.
+//
+// Tail bounds & reduction order:
+//   - M tail: `gemm_load_a` zero-pads rows >= m, `gemm_store` clips `m0 + r < m`.
+//   - N tail: `gemm_load_b` clamps weight rows to `rows - 1`, `gemm_store` clips `first + c < rows`.
+//   - K tail: `steps = ceil_div(k, 32)` is partitioned contiguously across
+//     `part = 0 .. split - 1` as `[part * steps / split, (part + 1) * steps / split)`;
+//     `gemm_load_a` / `gemm_load_b` zero-pad columns >= k in the final step.
+//   - Reduction: `PROJECTION_SEGMENTED_PARTS_REDUCE` sums raw F32 partials in
+//     strict ascending `part` order (0 .. split - 1) before applying each
+//     segment's epilogue once, matching `PartPartial` layout
+//     `partials[(row * split + part) * outputs + PROJECTION_FIRST_s + col]`.
+#define PROJECTION_SEGMENT_PART_GEMM(s, TM, TN)                                                                 \
+    else if (segment == s##u) {                                                                                 \
+        const projection::PartPartial seg_sums{sums.y, sums.row, sums.column + PROJECTION_FIRST_##s};           \
+        projection::gemm_run<PROJECTION_PACKET(s), PROJECTION_PACKET(s), false, TM, TN>(in, w##s, w##s,         \
+            local * (TN), uint(PROJECTION_N##s), tile.y * (TM), m, k, step_begin, step_end, m, shared, sg,      \
+            lane, projection::gemm_store<projection::PartPartial>{seg_sums, tile.y * (TM), m, local * (TN),     \
+                uint(PROJECTION_N##s)});                                                                        \
+    }
+
+#define PROJECTION_SEGMENTED_PARTS_GEMM(SPLIT)                                                                  \
+    PROJECTION_GEMM_SHARED(shared, TILE_M, TILE_N);                                                             \
+    PROJECTION_OPERANDS;                                                                                        \
+    PROJECTION_SEGMENT_FIND_TILES(tile.x, TILE_N);                                                              \
+    if ((SPLIT) == 1u) {                                                                                        \
+        PROJECTION_SEGMENTED_ZEROS(tile.y * (TILE_M), TILE_M, TILE_N, max(TILE_M, 64u) * TILE_N / 32u);         \
+        PROJECTION_SEGMENT_CHAIN                                                                                \
+        PROJECTION_EACH_SEGMENT(PROJECTION_SEGMENT_TILES, TILE_M, TILE_N, PROJECTION_NONE)                      \
+    } else {                                                                                                    \
+        const uint split = (SPLIT);                                                                             \
+        const uint outputs = 0u PROJECTION_EACH_SEGMENT(PROJECTION_ADD_ROWS, );                                 \
+        const uint steps = (k + projection::gemm_k - 1u) / projection::gemm_k;                                  \
+        const uint step_begin = tile.z * steps / split;                                                         \
+        const uint step_end = (tile.z + 1u) * steps / split;                                                    \
+        const projection::PartPartial sums{partials, ulong(split) * outputs, ulong(tile.z) * outputs};          \
+        PROJECTION_SEGMENT_CHAIN                                                                                \
+        PROJECTION_EACH_SEGMENT(PROJECTION_SEGMENT_PART_GEMM, TILE_M, TILE_N)                                   \
+    }
+
+#define PROJECTION_SEGMENT_PART_REDUCE(s, ...)                                                                  \
+    else if (col < PROJECTION_FIRST_##s + uint(PROJECTION_N##s))                                                \
+        out##s.store(row, col - PROJECTION_FIRST_##s, sum);
+
+#define PROJECTION_SEGMENTED_PARTS_REDUCE(SPLIT)                                                                \
+    PROJECTION_OPERANDS;                                                                                        \
+    const uint outputs = 0u PROJECTION_EACH_SEGMENT(PROJECTION_ADD_ROWS, );                                     \
+    const uint index = position.x;                                                                              \
+    if (index >= m * outputs)                                                                                   \
+        return;                                                                                                 \
+    const uint row = index / outputs, col = index % outputs;                                                    \
+    const uint split = (SPLIT);                                                                                 \
+    float sum = 0.0f;                                                                                           \
+    for (uint p = 0u; p < split; ++p)                                                                           \
+        sum += partials[(ulong(row) * split + p) * outputs + col];                                              \
+    PROJECTION_SEGMENT_CHAIN                                                                                    \
+    PROJECTION_EACH_SEGMENT(PROJECTION_SEGMENT_PART_REDUCE, )
 #endif
 
 // ---------------------------------------------------------------------------

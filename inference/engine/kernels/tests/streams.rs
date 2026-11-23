@@ -1527,3 +1527,156 @@ fn metal_stream_mix_up_admits_tall_k64_at_rank_320() {
         1e-4,
     );
 }
+
+/// Metal `stream_mix_down` defaults to `64x32` `SPLIT=4` (`TALL=0`) for dense
+/// weights with `K >= 1024`, and matches the host reference bit-accurately on
+/// odd tails (`M` not divisible by 64, `LR` not divisible by 32, `K` not
+/// divisible by `SPLIT * 32`, and both `C = 1` and `C = 0` exit site).
+#[test]
+fn metal_stream_mix_down_64x32_split4_defaults_and_odd_tails() {
+    let Some(device) = devices().into_iter().find(|device| device.backend() == seismic::BackendName::Metal) else {
+        return;
+    };
+    let entry = stream_mix_down::native_entry_with(stream_mix_down::Elements {
+        NW: seismic::Element::f32(),
+        DW: seismic::Element::bf16(),
+        IW: seismic::Element::f32(),
+        A: seismic::Element::bf16(),
+    });
+    // At K = S * H = 4 * 256 = 1024 (>= 1024), dense stream_mix_down defaults
+    // to SPLIT = 4, TALL = 0, TILE_M = 64, TILE_N = 32.
+    let wide = Case::new((256, 4, 320), 1, 70);
+    let wide_statics = wide.statics();
+    let default_spec = declared::declared(&device, &entry, |name| {
+        wide_statics
+            .iter()
+            .find(|(given, _)| *given == name)
+            .unwrap_or_else(|| panic!("static {name} is given"))
+            .1
+    }, &[])
+    .unwrap();
+    let gemm = crate::common::metal_launch::<stream_mix_down::Entry>("gemm");
+    assert_eq!(default_spec.param("SPLIT"), Some(4), "dense stream_mix_down at K=1024 defaults to SPLIT=4");
+    assert_eq!(default_spec.param("TALL"), Some(0), "dense stream_mix_down with SPLIT=4 defaults to TALL=0");
+    assert_eq!(default_spec.launch_param(gemm, "TILE_M"), Some(64), "stream_mix_down defaults to TILE_M=64");
+    assert_eq!(default_spec.launch_param(gemm, "TILE_N"), Some(32), "stream_mix_down defaults to TILE_N=32");
+
+    // Odd tails: M = 73 (% 64 != 0), LR = 35 (% 32 != 0), S = 3, H = 160
+    // (K = 480 = 15 K-steps, not divisible by SPLIT = 4), for both C = 1
+    // (inject N1 = 3, odd tail) and C = 0 (exit site, N1 = 0).
+    for c in [1usize, 0] {
+        let case = Case::new((160, 3, 35), c, 73);
+        let expected = case.host();
+        let [low, inject, inverse] = case.mixed(&device, |spec| {
+            spec.with_param("SPLIT", 4)
+                .with_param("TALL", 0)
+                .with_launch_param(gemm, "TILE_M", 64)
+                .with_launch_param(gemm, "TILE_N", 32)
+        });
+        assert_close(
+            &format!("Metal stream_mix_down 64x32 SPLIT=4 C={c} low"),
+            &low,
+            &expected[0],
+            1e-2,
+            1e-2,
+        );
+        if c > 0 {
+            assert_close(
+                &format!("Metal stream_mix_down 64x32 SPLIT=4 C={c} inject"),
+                &inject,
+                &expected[1],
+                1e-4,
+                1e-4,
+            );
+        }
+        assert_close(
+            &format!("Metal stream_mix_down 64x32 SPLIT=4 C={c} inverse"),
+            &inverse,
+            &expected[2],
+            1e-5,
+            1e-5,
+        );
+    }
+}
+
+/// On Metal without tensor operations, `q3k` (`PACK_FOLDS == 2`) and `iq4xs`
+/// (`PACK_RESIDUE == 1`) route to `TALL = 1, PACK = 0, TALL_K = 128` by default
+/// in both dense (`dense_output`) and stacked routed (`routed_experts`)
+/// projections, while single-fold `q4k` retains `PACK = 1`.
+#[test]
+fn metal_q3k_and_iq4xs_default_to_tall_k128() {
+    let backend = seismic::BackendName::Metal;
+    let resident = backend.resident_layout();
+    let q3k = seismic::Element::stored("q3k", resident).unwrap();
+    let iq4xs = seismic::Element::stored("iq4xs", resident).unwrap();
+    let q4k = seismic::Element::stored("q4k", resident).unwrap();
+    fn default_metal_spec<E: seismic::Entry>(
+        elements: &[(&str, seismic::Element)],
+        statics: impl Fn(&str) -> u64,
+    ) -> seismic::NativeSpecialization {
+        let backend = seismic::BackendName::Metal;
+        let native = seismic::generated::native_implementation_at::<E>(backend, elements)
+            .unwrap()
+            .expect("Metal native implementation");
+        let bound = native.at_device(&seismic::device::BackendFloor(backend));
+        let at = bound
+            .statics
+            .iter()
+            .fold(seismic::NativeSpecialization::new(), |at, name| {
+                at.with_static(name.clone(), statics(name))
+            });
+        bound.default_specialization(&at).unwrap()
+    }
+    let dense_tall = crate::common::metal_launch::<magnitude_kernels::dense_output::Entry>("tall");
+    for (name, weight) in [("q3k", q3k), ("iq4xs", iq4xs)] {
+        let spec = default_metal_spec::<magnitude_kernels::dense_output::Entry>(
+            &[("A", seismic::Element::bf16()), ("DW", weight)],
+            |dim| match dim {
+                "H" | "F" => 512,
+                "DS" | "DB" => 0,
+                other => panic!("unexpected static {other}"),
+            },
+        );
+        assert_eq!(spec.param("TALL"), Some(1), "dense_output {name} defaults to TALL=1");
+        assert_eq!(spec.param("PACK"), Some(0), "dense_output {name} defaults to PACK=0");
+        assert_eq!(spec.launch_param(dense_tall, "TALL_K"), Some(128), "dense_output {name} defaults to TALL_K=128");
+    }
+    let q4k_spec = default_metal_spec::<magnitude_kernels::dense_output::Entry>(
+        &[("A", seismic::Element::bf16()), ("DW", q4k)],
+        |dim| match dim {
+            "H" | "F" => 512,
+            "DS" | "DB" => 0,
+            other => panic!("unexpected static {other}"),
+        },
+    );
+    assert_eq!(q4k_spec.param("PACK"), Some(1), "dense_output q4k retains PACK=1");
+
+    let routed_tall = crate::common::metal_launch::<magnitude_kernels::routed_experts::Entry>("tall");
+    let routed_down_tall = crate::common::metal_launch::<magnitude_kernels::routed_experts::Entry>("down_tall");
+    for (name, gate, up, down) in [
+        ("q3k", q3k, q3k, q3k),
+        ("iq4xs", iq4xs, iq4xs, iq4xs),
+        ("mixed_iq4xs_q3k", iq4xs, q3k, q3k),
+    ] {
+        let spec = default_metal_spec::<magnitude_kernels::routed_experts::Entry>(
+            &[
+                ("A", seismic::Element::bf16()),
+                ("EGW", gate),
+                ("EUW", up),
+                ("EDW", down),
+            ],
+            |dim| match dim {
+                "H" | "F" => 512,
+                "T" => 32,
+                "GS" | "US" | "LB" => 0,
+                other => panic!("unexpected static {other}"),
+            },
+        );
+        assert_eq!(spec.param("TALL"), Some(1), "routed_experts {name} defaults to TALL=1");
+        assert_eq!(spec.param("PACK"), Some(0), "routed_experts {name} defaults to PACK=0");
+        assert_eq!(spec.launch_param(routed_tall, "TALL_K"), Some(128), "routed_experts {name} defaults to TALL_K=128");
+        assert_eq!(spec.param("DOWN_TALL"), Some(1), "routed_experts {name} defaults to DOWN_TALL=1");
+        assert_eq!(spec.param("DOWN_PACK"), Some(0), "routed_experts {name} defaults to DOWN_PACK=0");
+        assert_eq!(spec.launch_param(routed_down_tall, "DOWN_TALL_K"), Some(128), "routed_experts {name} defaults to DOWN_TALL_K=128");
+    }
+}
