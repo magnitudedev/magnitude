@@ -536,7 +536,7 @@ fn pieces_are_taken_most_urgent_first() {
     // Each take as (the request's index in submission, the piece), ended.
     let take = |queue: &mut Queue, states: &[Arc<RequestState>]| {
         let taken = queue.take().unwrap();
-        queue.ended(taken.returned(Instant::now()));
+        queue.ended(taken.returned(Instant::now(), true));
         let request = states.iter().position(|known| Arc::ptr_eq(known, &taken.state));
         (request.unwrap(), taken.piece.start)
     };
@@ -568,7 +568,7 @@ fn a_certain_expectation_stays_read_ahead() {
     queue.push(parked, Want::now());
     let first = queue.take().unwrap();
     assert!(Arc::ptr_eq(&first.state, &parked_state) && first.standing.due(), "the parked read first");
-    queue.ended(first.returned(Instant::now()));
+    queue.ended(first.returned(Instant::now(), true));
     assert!(!queue.take().unwrap().standing.due(), "an expectation parks nothing");
 }
 
@@ -660,7 +660,7 @@ fn a_read_returning_under_a_held_lock_is_ended_by_its_next_holder() {
     queued.pieces = [Piece { start: 0, end: LEAST_READ, parts: vec![Part { range: 0, from: 0, length: LEAST_READ as usize, sink: NonNull::dangling() }] }].into();
     engine.queue().push(queued, Want::undated(0.));
     let taken = engine.queue().take().expect("a piece to take");
-    let returned = taken.returned(Instant::now());
+    let returned = taken.returned(Instant::now(), true);
     let held = engine.queue();
     engine.read_returned(returned);
     assert_eq!(held.links[&taken.volume.id].flight.ahead, LEAST_READ, "ended while another held the lock");
@@ -1061,7 +1061,7 @@ fn a_read_ahead_overlaps_parked_pieces_in_flight_but_never_starts_while_one_is_q
     let first = queue.take().expect("a due piece");
     assert!(first.standing.due());
     assert!(queue.take().is_none(), "a read ahead started while a due piece was queued");
-    queue.ended(first.returned(Instant::now()));
+    queue.ended(first.returned(Instant::now(), true));
     let second = queue.take().expect("the second due piece");
     assert_eq!((second.piece.start, second.standing.due()), (4, true));
     let ahead = queue.take().expect("the read ahead, beside the parked piece in flight within the knee");
@@ -1086,10 +1086,10 @@ fn a_draining_park_refills_the_knee_from_reads_ahead_soonest_step_first() {
     queue.push(queued_on(&link, &[(16, 18)]), Want::expected(2, 0.8));
     assert!(queue.take().is_none(), "the parked bytes fill the knee");
     let [first, second] = parked;
-    queue.ended(first.returned(Instant::now()));
+    queue.ended(first.returned(Instant::now(), true));
     let taken = [(); 3].map(|_| queue.take().map(|taken| (taken.piece.start, taken.standing)));
     assert_eq!(taken, [Some((10, Standing::Ahead)), Some((12, Standing::Ahead)), None], "step 1's, to the knee");
-    queue.ended(second.returned(Instant::now()));
+    queue.ended(second.returned(Instant::now(), true));
     let taken = [(); 3].map(|_| queue.take().map(|taken| taken.piece.start));
     assert_eq!(taken, [Some(16), Some(20), None], "step 2's then step 3's, to the knee");
 }
@@ -1110,7 +1110,7 @@ fn a_parked_read_preempts_the_unbegun_pieces_of_a_read_ahead() {
     assert_eq!((parked.piece.start, parked.standing), (16, Standing::Parked));
     assert!(queue.take().is_none(), "an unbegun piece read ahead started past the knee");
     for piece in begun {
-        queue.ended(piece.returned(Instant::now()));
+        queue.ended(piece.returned(Instant::now(), true));
     }
     let taken = [(); 2].map(|_| queue.take().map(|taken| (taken.piece.start, taken.standing)));
     assert_eq!(taken, [Some((4, Standing::Ahead)), Some((6, Standing::Ahead))], "the read ahead resumes beside the parked piece in flight");
@@ -1135,7 +1135,7 @@ fn a_streams_due_reads_leave_the_fill_its_knee() {
     let more = queue.take().expect("4 + 4 is the knee");
     assert_eq!(more.piece.start, 12);
     assert!(queue.take().is_none(), "the due depth and the knee are full");
-    queue.ended(streamed.returned(Instant::now()));
+    queue.ended(streamed.returned(Instant::now(), true));
     assert_eq!(queue.take().map(|taken| (taken.piece.start, taken.standing)), Some((4, Standing::Streamed)), "due first");
 }
 
@@ -1152,7 +1152,7 @@ fn a_parked_read_holds_the_fill_back_beside_a_stream() {
     queue.push(queued_on(&link, &[(4, 8)]), Want::now());
     queue.push(queued_on(&link, &[(8, 10)]), Want::undated(0.));
     assert!(queue.take().is_none(), "a fill started while a parked piece was queued");
-    queue.ended(streamed.returned(Instant::now()));
+    queue.ended(streamed.returned(Instant::now(), true));
     assert_eq!(queue.take().map(|taken| (taken.piece.start, taken.standing)), Some((4, Standing::Parked)));
     assert_eq!(queue.take().map(|taken| (taken.piece.start, taken.standing)), Some((8, Standing::Ahead)), "within the knee once nothing parked is queued");
 }
@@ -1174,7 +1174,7 @@ fn a_piece_read_ahead_starts_only_while_everything_in_flight_fits_the_knee() {
     let other = volume(11, (8, 8), 4);
     queue.push(queued_on(&other, &[(0, 2)]), ahead());
     assert_eq!(queue.take().map(|taken| (taken.volume.id, taken.piece.start)), Some((Volume(11), 0)), "another link's room is its own");
-    queue.ended(due.returned(Instant::now()));
+    queue.ended(due.returned(Instant::now(), true));
     assert_eq!(queue.take().map(|taken| taken.piece.start), Some(8));
     assert_eq!(queue.take().map(|taken| taken.piece.start), Some(10), "8 of 8 read ahead");
     assert!(queue.take().is_none(), "past the knee");
@@ -1245,7 +1245,7 @@ fn a_volumes_book_counts_busy_time_depth_and_bytes_due_and_ahead() {
     let ms = |ms: u64| at + Duration::from_millis(ms);
     book.began(true, ms(0));
     book.began(false, ms(2));
-    book.ended(true, 1_000_000, ms(4));
+    book.ended(true, 1_000_000, true, ms(4));
     // A look while the piece read ahead is in flight: counted to 5 ms.
     let middle = book.totals_at(ms(5));
     assert!(close(middle.busy, 0.005) && close(middle.depth, 0.007), "{middle:?}");
@@ -1256,10 +1256,10 @@ fn a_volumes_book_counts_busy_time_depth_and_bytes_due_and_ahead() {
     let ahead = middle.ahead;
     assert_eq!((ahead.bytes, ahead.requests), (0, 0), "a piece's bytes count at its end");
     assert!(close(ahead.busy, 0.003) && close(ahead.depth, 0.003), "{ahead:?}");
-    book.ended(false, 500_000, ms(8));
+    book.ended(false, 500_000, false, ms(8));
     // Idle 8 to 30 ms: no busy time.
     book.began(false, ms(30));
-    book.ended(false, 250_000, ms(34));
+    book.ended(false, 250_000, true, ms(34));
     let later = book.totals_at(ms(40));
     assert!(close(later.busy, 0.012) && close(later.depth, 0.014), "{later:?}");
     assert_eq!((later.bytes(), later.requests()), (1_750_000, 3));
@@ -1283,19 +1283,19 @@ fn a_due_requests_wait_splits_by_what_it_waited_behind() {
     // A piece read ahead in flight, then another request's due piece.
     book.began(false, ms(0));
     let mut wait = Wait::new(2, true, &mut book, ms(0));
-    book.ended(false, 1, ms(3));
+    book.ended(false, 1, true, ms(3));
     book.began(true, ms(3));
     // Its first piece: 3 ms behind the read ahead, 2 behind the due piece.
     book.began(true, ms(5));
     wait.taken(true, &mut book, ms(5));
-    book.ended(true, 1, ms(7));
+    book.ended(true, 1, true, ms(7));
     assert!(!wait.ended(&mut book, ms(7)), "a request with a piece queued has not ended");
     assert_eq!(book.totals_at(ms(7)).due.waits.requests, 0, "a request with a piece queued has not ended");
     // Its second piece, behind due pieces alone.
     book.began(true, ms(9));
     wait.taken(true, &mut book, ms(9));
-    book.ended(true, 1, ms(10));
-    book.ended(true, 1, ms(12));
+    book.ended(true, 1, true, ms(10));
+    book.ended(true, 1, false, ms(12));
     assert!(wait.ended(&mut book, ms(12)), "its last piece ended it");
     let waits = book.totals_at(ms(12)).due.waits;
     assert_eq!(waits.requests, 1);
@@ -1324,10 +1324,10 @@ fn a_link_holds_at_most_its_due_depth_in_flight() {
     assert_eq!(other, (Volume(0), 0), "2 + 2 passes the due depth; 2 + 1 would not, but waits");
     assert!(taken(&mut queue).is_none());
     assert!(urgent_state.started.get().is_some(), "its first piece was taken");
-    assert!(queue.ended(urgent_first.returned(Instant::now())), "a piece was held back");
+    assert!(queue.ended(urgent_first.returned(Instant::now(), true)), "a piece was held back");
     assert_eq!(taken(&mut queue).map(|taken| taken.0), Some((Volume(1), 2)));
     assert_eq!(taken(&mut queue).map(|taken| taken.0), Some((Volume(1), 8)), "2 + 1 is within the due depth");
-    assert!(!queue.ended(other_piece.returned(Instant::now())));
+    assert!(!queue.ended(other_piece.returned(Instant::now(), true)));
     // A piece wider than the depth is read alone.
     queue.push(queued_on(&VolumeReads { id: Volume(2), ..narrow }, &[(0, 5)]), Want::now());
     assert_eq!(taken(&mut queue).map(|taken| taken.0), Some((Volume(2), 0)));
@@ -1354,7 +1354,7 @@ fn a_burst_of_small_pieces_never_admits_past_the_links_queue_depth() {
     assert_eq!(queue.taken(), depth);
     assert_eq!(queue.push(queued_on(&link, &[(200, 204)]), ahead()).1, 0);
     assert!(queue.take().is_none(), "no further piece is admitted at queue_depth");
-    queue.ended(in_flight.pop().unwrap().returned(Instant::now()));
+    queue.ended(in_flight.pop().unwrap().returned(Instant::now(), true));
     assert_eq!(queue.taken(), depth - 1);
     assert!(queue.take().is_some(), "ending one piece frees one queue_depth slot");
     assert_eq!(queue.taken(), depth);
@@ -1446,6 +1446,145 @@ fn concurrent_unaligned_gguf_reads_land_byte_exact_across_worker_scratch_reuse()
         let got = unsafe { sink.bytes() };
         assert_eq!(got, &payload[offset as usize..offset as usize + length], "mismatch at offset {offset} len {length}");
     }
+
+    drop(reader);
+    std::fs::remove_file(path).unwrap();
+}
+
+/// `AlignedRange` + `Buffer::with_headroom` lands unaligned GGUF-like offsets
+/// directly with 0% bounce rate and exact byte equality, while unaligned
+/// `Range`s into `Buffer::new` bounce 100%.
+#[test]
+fn aligned_range_with_headroom_eliminates_bounce_copies() {
+    let _volume = temporary_volume();
+    let total = (2 * 1024 * 1024) + ALIGNMENT as usize;
+    let payload: Vec<u8> = (0..total).map(|i| ((i * 73 + (i >> 9) * 29) & 0xff) as u8).collect();
+    let path = temporary("zero-bounce-aligned-range", &payload);
+    let reader = Reader::open(&path, CachePolicy::Uncached).unwrap();
+    let volume = reader.volume();
+
+    // Unaligned 32-byte-grain offsets and lengths inside the aligned body of the file.
+    let specs = [
+        (32u64, 64 * 1024 + 96),
+        (ALIGNMENT + 128, 128 * 1024 + 64),
+        (5 * ALIGNMENT + 4095, 256 * 1024 + 33),
+        (17 * ALIGNMENT + 3, 512 * 1024 - 19),
+    ];
+
+    // 1) Baseline: unaligned Range into Buffer::new -> bounces 100%.
+    let before = accounting::totals(volume);
+    for &(offset, length) in &specs {
+        let sink = Arc::new(Buffer::new(length));
+        let range = Range { offset, length, into: sink.clone(), at: 0 };
+        let handle = unsafe { reader.request(vec![range], Want::now()) }.unwrap();
+        assert!(matches!(handle.wait(), Ended::Read { failed } if failed.is_empty()));
+        assert_eq!(unsafe { sink.bytes() }, &payload[offset as usize..offset as usize + length]);
+    }
+    let bounced_span = accounting::totals(volume).since(&before);
+    assert_eq!(bounced_span.direct_bytes + bounced_span.bounced_bytes, bounced_span.bytes());
+    assert_eq!(bounced_span.direct_bytes, 0, "unaligned Range must bounce: {bounced_span:?}");
+    assert_eq!(bounced_span.bounce_rate(), Some(1.0));
+
+    // 2) Zero-bounce: AlignedRange + Buffer::with_headroom -> lands 100% direct.
+    let before = accounting::totals(volume);
+    for &(offset, length) in &specs {
+        let sink = Arc::new(Buffer::with_headroom(length));
+        let aligned = reader.aligned_range(offset, length, sink.clone(), 0);
+        let handle = unsafe { reader.request(vec![aligned.range.clone()], Want::now()) }.unwrap();
+        assert!(matches!(handle.wait(), Ended::Read { failed } if failed.is_empty()));
+        assert_eq!(
+            aligned.slice(unsafe { sink.bytes() }),
+            &payload[offset as usize..offset as usize + length],
+            "AlignedRange byte mismatch at offset {offset} len {length}"
+        );
+    }
+    let direct_span = accounting::totals(volume).since(&before);
+    assert_eq!(direct_span.direct_bytes + direct_span.bounced_bytes, direct_span.bytes());
+    assert_eq!(direct_span.bounced_bytes, 0, "AlignedRange must land 100% direct: {direct_span:?}");
+    assert!(direct_span.direct_bytes > 0);
+    assert_eq!(direct_span.bounce_rate(), Some(0.0));
+
+    // 3) Reader::stream on an unaligned offset also lands 100% direct.
+    let stream_offset = 1024 + 37;
+    let stream_len = 1024 * 1024 + 123;
+    let before = accounting::totals(volume);
+    let mut streamed = vec![0u8; stream_len];
+    reader
+        .stream::<std::io::Error>(stream_offset, stream_len as u64, Want::undated(1.0), |at, bytes| {
+            streamed[at as usize..at as usize + bytes.len()].copy_from_slice(bytes);
+            Ok(())
+        })
+        .unwrap();
+    let stream_span = accounting::totals(volume).since(&before);
+    assert_eq!(streamed, payload[stream_offset as usize..stream_offset as usize + stream_len]);
+    assert_eq!(stream_span.bounced_bytes, 0, "Reader::stream must land 100% direct: {stream_span:?}");
+    assert_eq!(stream_span.bounce_rate(), Some(0.0));
+
+    // 4) Edge cases: empty range and out-of-bounds range via AlignedRange.
+    let sink = Arc::new(Buffer::with_headroom(64));
+    let empty = reader.aligned_range(32, 0, sink.clone(), 0);
+    assert_eq!(empty.slice(unsafe { sink.bytes() }), &[]);
+    let oob = reader.aligned_range(total as u64 - 16, 64, sink, 0);
+    let handle = unsafe { reader.request(vec![oob.range], Want::now()) }.unwrap();
+    assert!(matches!(handle.wait(), Ended::Read { failed } if failed.len() == 1));
+
+    drop(reader);
+    std::fs::remove_file(path).unwrap();
+}
+
+/// Multiple contiguous aligned ranges coalesced into a single piece land
+/// directly via scatter-gather `preadv` on Unix (0% bounce), while overlapping
+/// or gapped ranges fall back to the bounce buffer and still land exact bytes.
+#[cfg(unix)]
+#[test]
+fn contiguous_aligned_multipart_piece_lands_direct_via_preadv() {
+    let _volume = temporary_volume();
+    let part_len = (4 * ALIGNMENT) as usize;
+    let total = 8 * part_len;
+    let payload: Vec<u8> = (0..total).map(|i| ((i * 53 + (i >> 7) * 11) & 0xff) as u8).collect();
+    let path = temporary("zero-bounce-preadv", &payload);
+    let reader = Reader::open(&path, CachePolicy::Uncached).unwrap();
+    let volume = reader.volume();
+
+    // Four separate aligned buffers receiving four contiguous aligned file ranges
+    // in one request -> coalesced into one piece, served by direct `preadv`.
+    let sinks: Vec<Arc<Buffer>> = (0..4).map(|_| Arc::new(Buffer::new(part_len))).collect();
+    let ranges: Vec<Range> = sinks
+        .iter()
+        .enumerate()
+        .map(|(i, sink)| Range {
+            offset: (i * part_len) as u64,
+            length: part_len,
+            into: sink.clone(),
+            at: 0,
+        })
+        .collect();
+    let before = accounting::totals(volume);
+    let handle = unsafe { reader.request(ranges, Want::now()) }.unwrap();
+    assert!(matches!(handle.wait(), Ended::Read { failed } if failed.is_empty()));
+    let span = accounting::totals(volume).since(&before);
+    for (i, sink) in sinks.iter().enumerate() {
+        assert_eq!(unsafe { sink.bytes() }, &payload[i * part_len..(i + 1) * part_len]);
+    }
+    assert_eq!(span.bounced_bytes, 0, "contiguous aligned multi-part piece must land direct: {span:?}");
+    assert_eq!(span.direct_bytes, (4 * part_len) as u64);
+
+    // Gapped ranges within COALESCE_GAP coalesce into one piece with a hole -> must bounce safely.
+    let gap_sinks = [Arc::new(Buffer::new(part_len)), Arc::new(Buffer::new(part_len))];
+    let gap_ranges = vec![
+        Range { offset: 0, length: part_len, into: gap_sinks[0].clone(), at: 0 },
+        Range { offset: part_len as u64 + ALIGNMENT, length: part_len, into: gap_sinks[1].clone(), at: 0 },
+    ];
+    let before = accounting::totals(volume);
+    let handle = unsafe { reader.request(gap_ranges, Want::now()) }.unwrap();
+    assert!(matches!(handle.wait(), Ended::Read { failed } if failed.is_empty()));
+    let gap_span = accounting::totals(volume).since(&before);
+    assert_eq!(unsafe { gap_sinks[0].bytes() }, &payload[..part_len]);
+    assert_eq!(
+        unsafe { gap_sinks[1].bytes() },
+        &payload[part_len + ALIGNMENT as usize..2 * part_len + ALIGNMENT as usize]
+    );
+    assert!(gap_span.bounced_bytes > 0, "gapped coalesced piece must bounce safely: {gap_span:?}");
 
     drop(reader);
     std::fs::remove_file(path).unwrap();

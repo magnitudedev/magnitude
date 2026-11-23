@@ -3,7 +3,7 @@
 //! ("A volume's curve", [`probe_volume`]), and the reader a caller makes
 //! requests through.
 
-use crate::scheduler::{self, Ended, Handle, Outstanding, Range, Want};
+use crate::scheduler::{self, AlignedRange, Ended, Handle, Outstanding, Range, Want};
 use crate::{Buffer, Destination, Error};
 use std::fs::File;
 use std::io;
@@ -22,7 +22,7 @@ pub use probe::{Curve, Lone, Point, Urgent};
 pub use storage::{StorageProbe, FULL_DEPTH, FULL_READ, LONE_READ, STORAGE_PROBE_BYTES};
 pub use volume::{adopt_earlier, adopt_volume, link_shape, probe_volume, read_cores, EarlierChoice, Shape};
 
-pub(crate) use file::{SourceFile, Through};
+pub(crate) use file::{Fetched, SourceFile, Through};
 pub(crate) use probe::LEAST_READ;
 pub(crate) use volume::VolumeReads;
 
@@ -247,13 +247,21 @@ impl Reader {
         ended(request.wait())
     }
 
+    /// Align `[offset, offset + length)` of this file to [`ALIGNMENT`]
+    /// boundaries for zero-bounce direct landing into `into` at `at`
+    /// ([`AlignedRange::new`]).
+    pub fn aligned_range(&self, offset: u64, length: usize, into: Arc<dyn Destination>, at: usize) -> AlignedRange {
+        AlignedRange::new(offset, length, self.file.size, into, at)
+    }
+
     /// Read the `length` bytes from `offset` in order, as requests for
     /// `want` of half the link's knee each (at least one read), handing each
     /// chunk to `sink` with its offset in the range as it lands: three
     /// requested at once, so the link holds its knee while `sink` takes one
-    /// and the stream holds a knee and a half of the file. The first
-    /// error, the read's or `sink`'s, ends it; the requests not yet taken
-    /// are cancelled.
+    /// and the stream holds a knee and a half of the file. Each chunk buffer
+    /// carries [`crate::ALIGNED_HEADROOM`] so unaligned offsets land directly
+    /// with zero bounce copy. The first error, the read's or `sink`'s, ends
+    /// it; the requests not yet taken are cancelled.
     pub fn stream<E: From<io::Error>>(
         &self,
         offset: u64,
@@ -266,7 +274,7 @@ impl Reader {
             .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "read offset overflow"))?;
         let chunk = (self.knee() / 2).max(LEAST_READ) as usize;
         let depth = 3;
-        let mut flight = std::collections::VecDeque::<(Handle, Arc<Buffer>, u64, usize)>::new();
+        let mut flight = std::collections::VecDeque::<(Handle, Arc<Buffer>, u64, usize, usize)>::new();
         let mut spare = Vec::<Arc<Buffer>>::new();
         let mut next = 0u64;
         loop {
@@ -275,20 +283,20 @@ impl Reader {
                 let range_offset = offset
                     .checked_add(next)
                     .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "read offset overflow"))?;
-                let buffer = spare.pop().unwrap_or_else(|| Arc::new(Buffer::new(chunk)));
-                let range = Range { offset: range_offset, length: bytes, into: buffer.clone(), at: 0 };
+                let buffer = spare.pop().unwrap_or_else(|| Arc::new(Buffer::with_headroom(chunk)));
+                let aligned = self.aligned_range(range_offset, bytes, buffer.clone(), 0);
                 // SAFETY: the buffer is the stream's alone, read by it only
                 // once its request has ended (`wait`).
-                let request = unsafe { self.request(vec![range], want) }.map_err(io_error)?;
-                flight.push_back((request, buffer, next, bytes));
+                let request = unsafe { self.request(vec![aligned.range], want) }.map_err(io_error)?;
+                flight.push_back((request, buffer, next, aligned.lead, bytes));
                 next += bytes as u64;
             }
-            let Some((request, buffer, at, bytes)) = flight.pop_front() else {
+            let Some((request, buffer, at, lead, bytes)) = flight.pop_front() else {
                 return Ok(());
             };
             ended(request.wait())?;
             // SAFETY: its one request has ended.
-            sink(at, &unsafe { buffer.bytes() }[..bytes])?;
+            sink(at, &unsafe { buffer.bytes() }[lead..lead + bytes])?;
             spare.push(buffer);
         }
     }

@@ -146,8 +146,16 @@ pub(crate) struct Taken {
 
 impl Taken {
     /// This piece, its read returned at `at`, to end ([`Queue::ended`]).
-    pub(crate) fn returned(&self, at: Instant) -> Returned {
-        Returned { id: self.id, volume: self.volume.id, standing: self.standing, bytes: self.piece.end - self.piece.start, at, need: self.need.clone() }
+    pub(crate) fn returned(&self, at: Instant, direct: bool) -> Returned {
+        Returned {
+            id: self.id,
+            volume: self.volume.id,
+            standing: self.standing,
+            bytes: self.piece.end - self.piece.start,
+            direct,
+            at,
+            need: self.need.clone(),
+        }
     }
 }
 
@@ -158,6 +166,7 @@ pub(crate) struct Returned {
     volume: Volume,
     standing: Standing,
     bytes: u64,
+    direct: bool,
     at: Instant,
     need: Arc<Need>,
 }
@@ -416,12 +425,12 @@ impl Queue {
     /// book and its request's wait: whether the link holds a request
     /// queued, whose next piece the room it freed may admit.
     pub(crate) fn ended(&mut self, returned: Returned) -> bool {
-        let Returned { id, volume, standing, bytes, at, need } = returned;
+        let Returned { id, volume, standing, bytes, direct, at, need } = returned;
         need.ended(1);
         let link = self.links.get_mut(&volume).expect("an ended piece was in flight");
         self.taken -= 1;
         link.flight.end(standing, bytes);
-        link.book.ended(standing.due(), bytes, at);
+        link.book.ended(standing.due(), bytes, direct, at);
         settle(&mut self.waits, id, |wait| wait.ended(&mut link.book, at));
         !(link.requests.is_empty() && link.streamed.is_empty())
     }

@@ -15,6 +15,13 @@ pub unsafe trait Destination: Send + Sync {
     fn region(&self) -> (NonNull<u8>, usize);
 }
 
+/// Staging headroom needed beside any payload length so an arbitrary
+/// unaligned file range `[offset, offset + length)` can land in an
+/// [`crate::ALIGNMENT`]-aligned direct read without a bounce copy: up to
+/// `ALIGNMENT - 1` leading bytes before `offset` and `ALIGNMENT - 1`
+/// trailing bytes after `offset + length`.
+pub const ALIGNED_HEADROOM: usize = 2 * crate::ALIGNMENT as usize;
+
 /// A heap destination: `length` bytes whose first is [`crate::ALIGNMENT`]-aligned.
 pub struct Buffer {
     base: NonNull<u8>,
@@ -33,6 +40,13 @@ impl Buffer {
         // SAFETY: the layout's size is nonzero.
         let base = NonNull::new(unsafe { std::alloc::alloc_zeroed(layout) }).unwrap_or_else(|| std::alloc::handle_alloc_error(layout));
         Self { base, layout, length }
+    }
+
+    /// A heap destination with [`ALIGNED_HEADROOM`] extra bytes beyond
+    /// `payload_length`, so any unaligned range of `payload_length` bytes
+    /// lands directly via [`crate::AlignedRange`] with zero bounce copy.
+    pub fn with_headroom(payload_length: usize) -> Self {
+        Self::new(payload_length.checked_add(ALIGNED_HEADROOM).expect("buffer length with headroom overflow"))
     }
 
     /// Its length in bytes.

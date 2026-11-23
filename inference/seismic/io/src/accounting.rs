@@ -69,6 +69,12 @@ pub struct Totals {
     /// The seconds a due piece and a piece read ahead were in flight at
     /// once.
     pub shared: f64,
+    /// Bytes of pieces that landed straight into their destination with no
+    /// worker bounce buffer or copy.
+    pub direct_bytes: u64,
+    /// Bytes of pieces that went through a worker bounce buffer and copy
+    /// (or failed).
+    pub bounced_bytes: u64,
     /// Of the pieces due when a worker took them, and of those read ahead.
     pub due: Class,
     pub ahead: Class,
@@ -136,6 +142,8 @@ impl std::iter::Sum for Totals {
             busy: left.busy + right.busy,
             depth: left.depth + right.depth,
             shared: left.shared + right.shared,
+            direct_bytes: left.direct_bytes + right.direct_bytes,
+            bounced_bytes: left.bounced_bytes + right.bounced_bytes,
             due: class(left.due, right.due),
             ahead: class(left.ahead, right.ahead),
         })
@@ -187,6 +195,14 @@ impl Totals {
         (self.busy > 0.).then(|| self.depth / self.busy)
     }
 
+    /// Fraction of ended bytes that went through a worker bounce buffer
+    /// (`bounced_bytes / (direct_bytes + bounced_bytes)`), none before any
+    /// byte ended.
+    pub fn bounce_rate(&self) -> Option<f64> {
+        let total = self.direct_bytes + self.bounced_bytes;
+        (total > 0).then(|| self.bounced_bytes as f64 / total as f64)
+    }
+
     /// What happened between `earlier`, a look at the same volume, and
     /// this one.
     pub fn since(&self, earlier: &Self) -> Self {
@@ -206,6 +222,8 @@ impl Totals {
             busy: self.busy - earlier.busy,
             depth: self.depth - earlier.depth,
             shared: self.shared - earlier.shared,
+            direct_bytes: self.direct_bytes - earlier.direct_bytes,
+            bounced_bytes: self.bounced_bytes - earlier.bounced_bytes,
             due: class(&self.due, &earlier.due),
             ahead: class(&self.ahead, &earlier.ahead),
         }
@@ -240,14 +258,20 @@ impl Book {
         self.flight[usize::from(!due)] += 1;
     }
 
-    /// A piece of `bytes`, due when taken or not, ended at `now`.
-    pub(crate) fn ended(&mut self, due: bool, bytes: u64, now: Instant) {
+    /// A piece of `bytes`, due when taken or not, ended at `now`, having
+    /// landed directly (`direct == true`) or through a bounce buffer.
+    pub(crate) fn ended(&mut self, due: bool, bytes: u64, direct: bool, now: Instant) {
         self.advance(now);
         // Instants taken on several threads may reach the queue's lock out of
         // order: the latest end stands.
         self.last_ended = self.last_ended.max(Some(now));
         let flight = &mut self.flight[usize::from(!due)];
         *flight = flight.checked_sub(1).expect("an ended piece was in flight");
+        if direct {
+            self.totals.direct_bytes += bytes;
+        } else {
+            self.totals.bounced_bytes += bytes;
+        }
         let counted = self.totals.kind_mut(due);
         counted.bytes += bytes;
         counted.requests += 1;
@@ -444,8 +468,8 @@ mod tests {
         let mut due_wait = Wait::new(1, true, &mut book, ms(0));
         book.began(true, ms(0));
         due_wait.taken(true, &mut book, ms(0));
-        book.ended(false, 1_000_000, ms(1));
-        book.ended(true, 1_000_000, ms(1));
+        book.ended(false, 1_000_000, true, ms(1));
+        book.ended(true, 1_000_000, true, ms(1));
         assert!(due_wait.ended(&mut book, ms(1)));
 
         let before = book.totals_at(ms(1));
@@ -479,12 +503,12 @@ mod tests {
         let mut wait = Wait::new(2, false, &mut book, ms(0));
         book.began(false, ms(0));
         wait.taken(false, &mut book, ms(0));
-        book.ended(false, 1_000_000, ms(1));
+        book.ended(false, 1_000_000, false, ms(1));
         assert!(!wait.ended(&mut book, ms(1)));
 
         book.began(true, ms(1));
         wait.taken(true, &mut book, ms(1));
-        book.ended(true, 1_000_000, ms(2));
+        book.ended(true, 1_000_000, true, ms(2));
         assert!(wait.ended(&mut book, ms(2)));
 
         let totals = book.totals_at(ms(2));

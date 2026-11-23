@@ -574,7 +574,8 @@ fn work(engine: &'static Engine, slot: FlightSlot) {
         // being reported in flight ([`engine_work`]).
         let now = Instant::now();
         crate::timeline::note_at(now, crate::timeline::Kind::Read, 0, (piece.start as i64, (piece.end - piece.start) as i64, 0));
-        engine.read_returned(taken.returned(now));
+        let direct = matches!(read, Ok(Ok(crate::disk::Fetched::Landed)));
+        engine.read_returned(taken.returned(now, direct));
         slot.set(None);
         let read = read.and_then(|read| {
             taken.state.submitter.run(|| match read {

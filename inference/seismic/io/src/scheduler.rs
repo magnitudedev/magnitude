@@ -17,9 +17,9 @@ pub use handle::{Ending, Handle};
 
 pub(crate) use engine::{need, reading, totals, Buffers, Need, Reading};
 pub(crate) use handle::RequestState;
-pub(crate) use queue::{pieces, Piece, Queued, Span};
+pub(crate) use queue::{pieces, Part, Piece, Queued, Span};
 #[cfg(test)]
-pub(crate) use {engine::Engine, queue::{Part, Queue}};
+pub(crate) use {engine::Engine, queue::Queue};
 
 use engine::engine;
 
@@ -209,6 +209,58 @@ pub struct Range {
     pub length: usize,
     pub into: Arc<dyn Destination>,
     pub at: usize,
+}
+
+/// A [`Range`] widened to [`crate::ALIGNMENT`] boundaries for zero-bounce
+/// direct I/O, together with the `lead` offset where the requested payload
+/// begins inside the landed region.
+///
+/// The destination at `at` must be [`crate::ALIGNMENT`]-aligned and have at
+/// least `length + ALIGNED_HEADROOM` bytes of capacity (or at least the
+/// aligned span covering `[offset, offset + length)`). Once the request
+/// ends, the requested bytes lie at `at + lead .. at + lead + payload`.
+#[derive(Clone, Debug)]
+pub struct AlignedRange {
+    pub range: Range,
+    /// Byte offset from `range.at` where `offset`'s first byte lands.
+    pub lead: usize,
+    /// Requested payload length in bytes.
+    pub payload: usize,
+}
+
+impl AlignedRange {
+    /// Align `[offset, offset + length)` of a file of `file_size` bytes to
+    /// [`crate::ALIGNMENT`] boundaries into `into` at `at`.
+    ///
+    /// An empty or out-of-bounds range is passed through unchanged so
+    /// [`crate::Reader::request`] reports its normal outcome.
+    pub fn new(offset: u64, length: usize, file_size: u64, into: Arc<dyn Destination>, at: usize) -> Self {
+        if length == 0 || offset.checked_add(length as u64).is_none_or(|end| end > file_size) {
+            return Self {
+                range: Range { offset, length, into, at },
+                lead: 0,
+                payload: length,
+            };
+        }
+        let align = crate::ALIGNMENT;
+        let lead = (offset % align) as usize;
+        let aligned_start = offset - lead as u64;
+        let aligned_end = (offset + length as u64).div_ceil(align) * align;
+        let read_end = aligned_end.min(file_size);
+        let read_len = (read_end - aligned_start) as usize;
+        Self {
+            range: Range { offset: aligned_start, length: read_len, into, at },
+            lead,
+            payload: length,
+        }
+    }
+
+    /// The requested payload slice inside the destination's byte slice once
+    /// the request has ended.
+    pub fn slice<'a>(&self, bytes: &'a [u8]) -> &'a [u8] {
+        let start = self.range.at + self.lead;
+        &bytes[start..start + self.payload]
+    }
 }
 
 impl std::fmt::Debug for Range {
