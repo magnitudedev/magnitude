@@ -1974,3 +1974,107 @@ fn regime_epoch_change_with_derived_plain_prior_does_not_burn_plain_look_bursts(
         "derived plain prior (37 ms = 27 tok/s) is far slower than drafting (~61 tok/s), so plain_look must burn 0 width-0 bursts"
     );
 }
+
+/// Reproduces `b927c8` (M4 Pro GLM-5.3, 79.6% acceptance) and `675f0d` (5090
+/// GLM-5.3, 73.4% acceptance): a streamed MoE with ~75% draft acceptance and
+/// noisy SSD-exposed verify latencies (periodic 2.5x spikes + a lucky 0.5x
+/// low-miss plain round) must sustain wide bursts (`M >= 4`) instead of
+/// collapsing to `M = 1`.
+#[test]
+fn streamed_moe_high_acceptance_with_noisy_verify_does_not_collapse_to_plain() {
+    let load = Arc::new(DraftLoad::default());
+    // Sub-linear streamed verify prior matching ~40% expert dedup at M = 8:
+    // V(1) = 250 ms (4.0 tok/s), V(4) = 550 ms, V(8) = 850 ms (3.4x).
+    load.observe_streamed(Some(StreamedVerifyPrior {
+        regime_epoch: 1,
+        verify_seconds: vec![0.250, 0.360, 0.460, 0.550, 0.630, 0.710, 0.780, 0.850],
+    }));
+
+    let mut ctrl = DraftController::new(7, load.clone());
+    let mut plain_rounds = 0usize;
+    let mut total_verified = 0usize;
+    let rounds = 40usize;
+    for r in 0..rounds {
+        let g = ctrl.generate(7, CONTEXT, true);
+        if g == 0 {
+            plain_rounds += 1;
+            // Even a lucky low-miss plain round (120 ms) must not poison verify(M).
+            ctrl.timed(TimedLaunch::Target, Some(LaunchDuration::settled(Duration::from_millis(120))), 1, 1);
+            ctrl.committed(&[TokenId(1)]);
+            continue;
+        }
+        ctrl.timed(TimedLaunch::Draft, Some(LaunchDuration::settled(Duration::from_millis(15))), 1, g);
+        let block: Vec<TokenId> = (1..=g as u32).map(TokenId).collect();
+        ctrl.drafted(g, &block, None);
+        let v = ctrl.verify(7);
+        total_verified += v;
+        // Noisy verify timing: periodic 2.5x SSD spike on round 0 and every 7th round!
+        let base_ms = match v {
+            0 => 250,
+            1 => 360,
+            2 => 460,
+            3 => 550,
+            4 => 630,
+            5 => 710,
+            6 => 780,
+            _ => 850,
+        };
+        let dur_ms = if r % 7 == 0 { base_ms * 5 / 2 } else { base_ms };
+        ctrl.timed(TimedLaunch::Target, Some(LaunchDuration::settled(Duration::from_millis(dur_ms))), 1, v + 1);
+        // ~75% per-token acceptance (deterministic pattern: accept 3, 4, 2, 0 -> ~75% token match).
+        let accepted = match r % 4 {
+            0 => v.min(3),
+            1 => v.min(4),
+            2 => v.min(2),
+            _ => v.min(4),
+        };
+        let mut committed = block[..accepted].to_vec();
+        committed.push(TokenId(999));
+        ctrl.committed(&committed);
+    }
+    let avg_verified = total_verified as f64 / rounds as f64;
+    assert_eq!(plain_rounds, 0, "high-acceptance streamed MoE must not collapse to M = 1 plain rounds");
+    assert!(
+        avg_verified >= 3.0,
+        "high-acceptance streamed MoE must sustain wide bursts (avg verified >= 3.0 / M >= 4), got {avg_verified:.2}"
+    );
+}
+
+/// Reproduces `42ca76` (`rtx5090-64g-gen5` GLM-5.3, 90% acceptance): cold
+/// Request 1 recorded slow `verify(8) = 400 ms` at rounds 1..3 while residency
+/// was still warming up; by round 22, warm `verify(4)` runs at `80 ms`.
+/// Warmup-drift expiry must expire the stale `400 ms` `verify(8)` measurement
+/// and widen immediately to `K = 7` (`M = 8`) instead of staying locked at
+/// `K = 3` (`M = 4`) for 100 rounds.
+#[test]
+fn cold_wide_verify_expires_when_narrow_residency_warms_up() {
+    let load = Arc::new(DraftLoad::default());
+    load.observe_streamed(Some(StreamedVerifyPrior {
+        regime_epoch: 1,
+        verify_seconds: vec![0.050, 0.070, 0.085, 0.100, 0.115, 0.130, 0.145, 0.160],
+    }));
+    let ctx = CONTEXT.max(1).next_power_of_two();
+    {
+        let mut state = load.lock();
+        state
+            .draft_costs
+            .entry((ctx, 1))
+            .or_default()
+            .insert(7, super::Durations::settled(&[(1, 0.015), (2, 0.015), (3, 0.015)]));
+        let target = state.target_costs.entry((Some(1), ctx, 1)).or_default();
+        // Cold Request 1 measured slow verify(8) = 400 ms at rounds 1..3.
+        target
+            .verify
+            .insert(8, super::Durations::settled(&[(1, 0.400), (2, 0.400), (3, 0.400)]));
+        // Warm Request 2 measured fast verify(4) = 80 ms at rounds 20..22.
+        target
+            .verify
+            .insert(4, super::Durations::settled(&[(20, 0.080), (21, 0.080), (22, 0.080)]));
+        state.rounds = 22;
+    }
+
+    let mut ctrl = DraftController::new(7, load.clone());
+    // High ~90% acceptance: DraftController must widen to K = 7 (M = 8) right away.
+    let g = ctrl.generate(7, CONTEXT, true);
+    assert_eq!(g, 7, "stale cold verify(8) must expire when warm verify(4) drops >1.5x, widening to K = 7 (got {g})");
+}

@@ -58,6 +58,10 @@ const MAX_COST_BUCKETS: usize = 64;
 /// and a plain decode not taken for that long is taken again, so a price
 /// left by a busier or freer machine lasts no longer.
 const STALE_ROUNDS: u64 = 100;
+/// Minimum rounds before an older streamed verify width that is >1.5x slower
+/// than what a more recent, warmed-up narrower width predicts expires on read,
+/// preventing cold-start residency timings from locking out `K = 7` (`M = 8`).
+const WARMUP_DRIFT_ROUNDS: u64 = 16;
 /// The share of decode time spent on looks: wider and plain, each scaled
 /// down where little can be gained.
 const LOOK_SHARE: f64 = 0.01;
@@ -676,8 +680,8 @@ impl<'a> RoundCosts<'a> {
 
     /// Derived prior duration for plain decode (`rows == self.sequences`) from
     /// the current regime's `StreamedVerifyPrior` (anchored to the nearest
-    /// fresh measured verify width if any) or non-banked `LaunchPrices`, without
-    /// falling back to stale `lesser_target()` measurements.
+    /// proven, fresh measured verify width if any) or non-banked `LaunchPrices`,
+    /// without falling back to stale `lesser_target()` measurements.
     fn derived_plain_prior(&self) -> Option<f64> {
         let rows = self.sequences.max(1);
         if let Some(prior) = self.verify_prior {
@@ -685,7 +689,7 @@ impl<'a> RoundCosts<'a> {
                 if let Some((&ref_rows, ref_dur)) = self.own_target().and_then(|own| {
                     own.verify
                         .iter()
-                        .filter(|(_, d)| d.is_fresh(self.round))
+                        .filter(|(_, d)| d.proven() && d.is_fresh(self.round))
                         .min_by_key(|(&r, _)| r.abs_diff(rows))
                 }) {
                     if let Some(prior_ref) =
@@ -718,23 +722,58 @@ impl<'a> RoundCosts<'a> {
 
     fn verify(&self, rows: usize) -> f64 {
         let is_non_plain = rows > self.sequences.max(1);
+        // On streamed MoE (`verify_prior.is_some()`), single-round SSD/miss
+        // bursts vary 2-4x from token to token: require a proven median
+        // (`COST_SAMPLES = 3`) before overriding the anchored `StreamedVerifyPrior`
+        // so one noisy verify spike or one lucky low-miss plain round cannot
+        // collapse draft width to M = 1.
+        let streamed = self.verify_prior.is_some();
         let has_live = self.own_target().is_some_and(|own| {
-            own.verify
-                .get(&rows)
-                .is_some_and(|d| !is_non_plain || d.is_fresh(self.round))
+            own.verify.get(&rows).is_some_and(|d| {
+                let valid = (!streamed || d.proven()) && (!is_non_plain || d.is_fresh(self.round));
+                if !valid {
+                    return false;
+                }
+                // On streamed MoE, if residency warmed up after `d` was measured
+                // (a narrower width measured more recently implies >1.5x lower
+                // cost via `StreamedVerifyPrior` and `d` is at least
+                // `WARMUP_DRIFT_ROUNDS` old), expire `d` so wide bursts (`M=8`)
+                // are re-measured instead of staying locked out for 100 rounds.
+                if streamed && is_non_plain && self.round.saturating_sub(d.latest()) >= WARMUP_DRIFT_ROUNDS {
+                    if let Some(prior) = self.verify_prior {
+                        if let Some(prior_rows) = Self::prior_verify_seconds(prior, self.sequences, rows) {
+                            let warmed_up = own.verify.iter().any(|(&ref_rows, ref_dur)| {
+                                ref_rows < rows
+                                    && ref_dur.proven()
+                                    && ref_dur.is_fresh(self.round)
+                                    && ref_dur.latest() > d.latest()
+                                    && Self::prior_verify_seconds(prior, self.sequences, ref_rows)
+                                        .filter(|&p| p > 0.0)
+                                        .is_some_and(|prior_ref| {
+                                            ref_dur.cost() * (prior_rows / prior_ref) < d.cost() * 0.65
+                                        })
+                            });
+                            if warmed_up {
+                                return false;
+                            }
+                        }
+                    }
+                }
+                true
+            })
         });
         if !has_live {
             if let Some(prior) = self.verify_prior {
                 if let Some(prior_rows) = Self::prior_verify_seconds(prior, self.sequences, rows) {
-                    // Anchor the streamed verify prior to the nearest fresh
-                    // measured verify width in the current regime via ratio
-                    // scaling (`measured(ref) * prior(rows) / prior(ref)`),
+                    // Anchor the streamed verify prior to the nearest proven,
+                    // fresh measured verify width in the current regime via
+                    // ratio scaling (`measured(ref) * prior(rows) / prior(ref)`),
                     // preventing scale mismatches between live measured widths
                     // and unmeasured wider widths from locking out exploration.
                     if let Some((&ref_rows, ref_dur)) = self.own_target().and_then(|own| {
                         own.verify
                             .iter()
-                            .filter(|(_, d)| d.is_fresh(self.round))
+                            .filter(|&(&r, d)| r != rows && d.proven() && d.is_fresh(self.round))
                             .min_by_key(|(&r, _)| r.abs_diff(rows))
                     }) {
                         if let Some(prior_ref) =
@@ -1401,7 +1440,11 @@ impl DraftController {
         // or a machine since freed, would otherwise price it for good.
         let round = state.rounds;
         let plain = costs.own_target().and_then(|own| own.verify.get(&costs.sequences));
+        // On streamed MoE (`verify_prior.is_some()`), `derived_plain_prior()`
+        // already prices `V(1)` in the current regime: do not hijack active
+        // drafting rounds into back-to-back M = 1 plain decode bursts.
         let plain_unsettled = fastest > 0
+            && costs.verify_prior.is_none()
             && plain.is_some_and(|plain| {
                 !plain.proven() || round.saturating_sub(plain.latest()) >= STALE_ROUNDS
             });
@@ -1797,6 +1840,7 @@ impl DraftController {
         let Some(took) = took else {
             return;
         };
+        let streamed = load.verify_prior.is_some();
         let target = load.target_costs.entry(target_key).or_default();
         if let (Some(switch), Some(steady), Some(drafter_took)) =
             (switch, steady, drafter.seconds())
@@ -1815,6 +1859,14 @@ impl DraftController {
         };
         let seconds = (took - paid).max(0.0);
         let scaled_factor = match (size, self.choice.generated) {
+            // On streamed MoE, plain decode latency varies 2-4x from token to
+            // token with miss-count noise rather than GPU clock scaling: record
+            // the plain duration directly without rescaling `verify(rows > 1)`
+            // or `draft_costs` by `plain_new / plain_old`.
+            (1, 0) if streamed => {
+                LaunchCosts::record(&mut target.verify, round, 1, seconds, covering);
+                None
+            }
             (1, 0) => target.record_plain(round, seconds, covering),
             // A drafting round that verified nothing decoded one row behind
             // its drafter's launch, not in a decode pipeline.
