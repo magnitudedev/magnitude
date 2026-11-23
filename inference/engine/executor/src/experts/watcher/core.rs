@@ -101,6 +101,10 @@ pub(in crate::experts) struct Layer {
     /// reads may carry a stored expert, read into its base
     /// (`Conveyor::take`).
     pub slots: Option<Vec<Records>>,
+    /// Device scratch views for each routed tensor of this layer (leading
+    /// extent `layer_window`), used by async-DMA prefill (`PrefillFill` on
+    /// `Copies`) to copy `HostTier -> ScratchRing` and `ScratchRing -> Bank`.
+    pub scratch_tensors: Option<Vec<seismic::Tensor>>,
     /// Its scratch form of each routed tensor, in record order
     /// (`ExpertBankPlan::layer_scratch_forms`): layers of one form lay each
     /// slot in the same bytes.
@@ -372,6 +376,10 @@ pub(in crate::experts) struct Extents {
     /// device does, landings are into tier records, answered as -2 - t;
     /// where the host does, into bank records, answered as themselves.
     pub placer: crate::planning::Placer,
+    /// Whether prefill uses host-side repack + `Copies` async DMA +
+    /// `ScratchRing` (`ExpertBankPlan::tier_copy_dma`: CUDA `Placer::Tier`),
+    /// eliminating GPU-spinning `routed_round` and `routed_copy`.
+    pub tier_copy_dma: bool,
     /// Whether the load traces its routes (`ExpertBankPlan::recording`).
     pub recording: bool,
 }

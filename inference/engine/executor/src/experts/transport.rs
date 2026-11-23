@@ -35,8 +35,7 @@ use super::Words;
 use super::bank::Stores;
 use crate::planning::{ExpertBankPlan, RecordTensors};
 use seismic::{Device, Tensor, Transfer, TransferItem, TransferRun, TransferSync};
-use std::collections::{HashMap, HashSet};
-use std::ops::Range;
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 
@@ -502,11 +501,23 @@ impl Registry {
     }
 }
 
+/// Identifies a prefill `Pass(layer, set_start, window)` whose completion
+/// releases its `ScratchRing` slot reservation on the host.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub(crate) struct PassKey {
+    pub layer: usize,
+    pub set_start: usize,
+    pub window: u64,
+}
+
 #[derive(Default)]
 struct PrefillRendezvous {
     /// Plans published by `Watcher` (`Scratch::fix_rounds`) keyed by
     /// `(layer, sequence, window)`.
     plans: HashMap<(usize, u64, u64), PrefillPlan>,
+    /// Async DMA completion syncs published by `Copies::issue` (or `None` when
+    /// a fill had 0 copies) keyed by `(layer, sequence, window)`.
+    syncs: HashMap<(usize, u64, u64), Option<TransferSync>>,
     /// Steps that failed before round 0 (`scratch::fail`).
     failed_steps: HashMap<u64, String>,
     /// Fatal serving error (`Shared::end_serving`).
@@ -518,6 +529,10 @@ pub(crate) struct ExpertTransport {
     registry: Mutex<Registry>,
     prefill: Mutex<PrefillRendezvous>,
     prefill_ready: Condvar,
+    /// In-flight prefill `Pass(L)` completions tracked so `Requests::serve`
+    /// releases each pass's `ScratchRing` slots immediately when `Pass(L)`
+    /// finishes on the GPU (BEFORE `Combine(L)` and `Front(L+1)`).
+    pass_completions: Mutex<VecDeque<(PassKey, seismic::NativeGraphCompletion)>>,
     decode: Option<DecodeDmaState>,
     /// Diagnostic counters (lock-free).
     transfers_issued: AtomicU64,
@@ -545,6 +560,7 @@ impl ExpertTransport {
             registry: Mutex::default(),
             prefill: Mutex::default(),
             prefill_ready: Condvar::new(),
+            pass_completions: Mutex::default(),
             decode: None,
             transfers_issued: AtomicU64::new(0),
             demand_joins: AtomicU64::new(0),
@@ -559,6 +575,7 @@ impl ExpertTransport {
             registry: Mutex::default(),
             prefill: Mutex::default(),
             prefill_ready: Condvar::new(),
+            pass_completions: Mutex::default(),
             decode,
             transfers_issued: AtomicU64::new(0),
             demand_joins: AtomicU64::new(0),
@@ -1399,6 +1416,97 @@ impl ExpertTransport {
             prefill.ended = Some(reason);
         }
         self.prefill_ready.notify_all();
+    }
+
+    /// Called by `Copies::issue` (with `Some(sync)`) or `Scratch` (with `None`
+    /// when a fill has 0 copies) once a prefill fill batch is submitted on
+    /// `Copies`'s transfer stream. Pure in-memory insert + condvar notify.
+    pub(crate) fn publish_prefill_sync(
+        &self,
+        layer: usize,
+        sequence: u64,
+        window: u64,
+        sync: Option<TransferSync>,
+    ) {
+        let mut prefill = self.prefill.lock().expect("transport prefill rendezvous");
+        prefill.syncs.insert((layer, sequence, window), sync);
+        self.prefill_ready.notify_all();
+    }
+
+    /// Wait on the host condvar (zero `cuEventSynchronize`!) for `Copies` to
+    /// publish the `TransferSync` for `(layer, sequence, window)`.
+    pub(crate) fn take_prefill_sync(
+        &self,
+        layer: usize,
+        sequence: u64,
+        window: u64,
+    ) -> Result<Option<TransferSync>, String> {
+        let mut prefill = self.prefill.lock().expect("transport prefill rendezvous");
+        loop {
+            if let Some(sync) = prefill.syncs.remove(&(layer, sequence, window)) {
+                if sync.is_some() {
+                    self.prefill_dma_batches.fetch_add(1, Ordering::Relaxed);
+                } else {
+                    self.prefill_dma_skipped.fetch_add(1, Ordering::Relaxed);
+                }
+                return Ok(sync);
+            }
+            if let Some(reason) = prefill.failed_steps.get(&sequence) {
+                return Err(reason.clone());
+            }
+            if let Some(reason) = &prefill.ended {
+                return Err(reason.clone());
+            }
+            prefill = self
+                .prefill_ready
+                .wait(prefill)
+                .expect("transport prefill rendezvous");
+        }
+    }
+
+    /// Track an in-flight prefill `Pass` completion emitted immediately after
+    /// `run_pass(L)` (before `Combine(L)` and `Front(L+1)`).
+    pub(crate) fn track_pass_completion(
+        &self,
+        key: PassKey,
+        completion: seismic::NativeGraphCompletion,
+    ) {
+        self.pass_completions
+            .lock()
+            .expect("transport pass completions")
+            .push_back((key, completion));
+    }
+
+    /// Non-blocking poll of tracked prefill `Pass` completions. Pops every
+    /// completed pass under a short mutex, then calls `completion.wait()`
+    /// OUTSIDE all locks so CUDA event teardown never runs under a mutex or
+    /// `NoBlockingAllocationGuard`.
+    pub(crate) fn poll_completed_passes(&self) -> (Vec<PassKey>, Option<String>) {
+        seismic::memory::assert_blocking_allocation_allowed("ExpertTransport::poll_completed_passes");
+        let done = {
+            let mut queue = self
+                .pass_completions
+                .lock()
+                .expect("transport pass completions");
+            let mut ready = Vec::new();
+            while queue.front().is_some_and(|(_, comp)| comp.is_complete()) {
+                if let Some(entry) = queue.pop_front() {
+                    ready.push(entry);
+                }
+            }
+            ready
+        };
+        let mut keys = Vec::with_capacity(done.len());
+        let mut first_error = None;
+        for (key, completion) in done {
+            if let Err(error) = completion.wait() {
+                if first_error.is_none() {
+                    first_error = Some(error.to_string());
+                }
+            }
+            keys.push(key);
+        }
+        (keys, first_error)
     }
 
     /// Wait on the host condvar (zero `cuEventSynchronize`!) for `Watcher` to

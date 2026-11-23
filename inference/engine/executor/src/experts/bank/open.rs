@@ -552,6 +552,9 @@ fn watch(
             site: site_layers.iter().find(|site| site.layer() == index).map(|site| site.slots().clone()),
             stored: stored.into(),
             slots,
+            scratch_tensors: plan.tier_copy_dma().then(|| {
+                scratch[index].iter().map(|(_, tensor)| tensor.clone()).collect()
+            }),
             scratch_form,
             landing: match plan.placer() {
                 Placer::Tier => None,
@@ -811,6 +814,7 @@ fn watch(
             selected: usize::try_from(binding.selected).map_err(|_| "choices exceed the host")?,
             demand: usize::try_from(plan.demand_records()).map_err(|_| "the demand reserve exceeds the host")?,
             placer: plan.placer(),
+            tier_copy_dma: plan.tier_copy_dma(),
             recording: plan.recording,
         },
         slots,

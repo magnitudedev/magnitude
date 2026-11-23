@@ -320,6 +320,17 @@ impl ExpertBank {
         self.plan.tier_copy_dma()
     }
 
+    /// Track an in-flight prefill `Pass` completion emitted immediately after
+    /// `run_pass(L)` so `Requests::serve` releases its `ScratchRing` slots
+    /// before `Combine(L)` and `Front(L+1)` finish.
+    pub(crate) fn track_pass_completion(
+        &self,
+        key: super::transport::PassKey,
+        completion: seismic::NativeGraphCompletion,
+    ) {
+        self.transport.track_pass_completion(key, completion);
+    }
+
     /// Coalesce and enqueue hardware DMA copies on `NativeQueue::Fill` for
     /// all host-tier prefill plans published for `layer` across a merge set.
     /// Returns `Ok(None)` with zero device calls when no host-tier copies are

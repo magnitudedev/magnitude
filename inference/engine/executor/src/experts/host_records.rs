@@ -1388,6 +1388,15 @@ impl HostRecords {
     /// own step, which would hold its lease behind it. The work here is a
     /// check, a map store and a state change a victim.
     pub fn refill(&mut self, victims: Vec<(u32, Staged)>, at: &Unbegun) -> bool {
+        self.refill_with(victims, at, false)
+    }
+
+    /// Like [`Self::refill`], but when `immediate` is `true` (only valid on
+    /// `tier_copy_dma` when `at.all_scratch()` holds so zero GPU kernels read
+    /// `tier_map` and every `HostTier` reader holds `whole.holds > 0`), unmaps
+    /// each unheld victim under `at` and transitions it directly to
+    /// `Host::Ready` instead of `Host::Graced`.
+    pub fn refill_with(&mut self, victims: Vec<(u32, Staged)>, at: &Unbegun, immediate: bool) -> bool {
         let mut unmapped = false;
         for (record, chosen) in victims {
             // Chosen in the same turn of residency, nothing between: only
@@ -1397,7 +1406,15 @@ impl HostRecords {
             if at.lending() && record < self.lent {
                 continue;
             }
-            self.grace(record, at);
+            if immediate {
+                self.unkeep(record);
+                if let Some(map) = &self.maps[chosen.0] {
+                    map.store_unbegun(chosen.1, None, Some(at));
+                }
+                self.set(record, Host::Ready);
+            } else {
+                self.grace(record, at);
+            }
             unmapped = true;
         }
         unmapped

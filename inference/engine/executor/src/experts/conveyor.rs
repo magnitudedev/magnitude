@@ -405,6 +405,31 @@ impl Conveyor {
         ended
     }
 
+    /// Every `(layer, expert, record)` currently held whole in a conveyor
+    /// record (`State::Held`) that does not yet have an active
+    /// [`ConveyorLanding`] in flight.
+    pub fn held_without_landing(&self) -> Vec<(usize, usize, u32)> {
+        let mut out = Vec::new();
+        for (layer, experts) in self.carried.iter().enumerate() {
+            for (expert, state) in experts.iter().enumerate() {
+                if let Some(State::Held { record }) = *state {
+                    if !self.landings.iter().any(|l| l.layer == layer && l.expert == expert) {
+                        out.push((layer, expert, record));
+                    }
+                }
+            }
+        }
+        out
+    }
+
+    /// Release a conveyor record held whole (`State::Held`) once its host-side
+    /// `Converting` landing into `HostTier` has completed (no-op if not held).
+    pub fn release_held(&mut self, layer: usize, expert: usize) {
+        if matches!(self.carried[layer][expert], Some(State::Held { .. })) {
+            self.yield_record(layer, expert);
+        }
+    }
+
     /// Expert `expert` of `layer` takes record `record` for its read: a
     /// conveyor record, or a scratch slot (one `Scratch::lendable_slot`
     /// found free of every step's use until the expert's round converts

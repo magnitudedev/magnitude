@@ -1574,3 +1574,365 @@ fn reclaim_slots_yielded_borrower_in_same_round_re_conveys_immediately() {
     step.complete().unwrap();
     harness.retired();
 }
+
+/// Local end-to-end stress test replicating DeepSeek-V4.1's `tier_copy_dma`
+/// prefill regime:
+/// - 8 layers across 4 distinct mixed-quant `scratch_form`s (`layer % 4`),
+/// - `windows == 1` with 8 chain places and multi-set merges (`1`, `4`, `8`),
+/// - tight `HostTier` (< 2 layers) and tight `Conveyor` (< 1 layer),
+/// - exact `native_target.rs::run_sets` wavefront where `Front(L+1, set 0)`
+///   publishes before `Pass(L, set 1..)` runs,
+/// - mid-prefill `HostTier` growth (`from.step() > last`),
+/// - byte-for-byte verification of every cold expert landed in `ScratchRing`.
+#[test]
+fn async_dma_scratch_ring_deepseek_stress() {
+    use crate::experts::copies::Copies;
+    use crate::experts::transport::{ExpertTransport, PassKey};
+    use crate::programs::native_target_graph::Passes;
+
+    const STRESS_LAYERS: usize = 8;
+    const STRESS_EXPERTS: usize = 8;
+    const STRESS_PLACES: usize = 8;
+    const STRESS_CONVEYOR: u64 = 3;
+    const STRESS_STAGING: u32 = 2;
+    const STRESS_TIER_INIT: u32 = 5; // < 1 full layer (8) and << 64 total cold experts!
+    const STRESS_TIER_MAX: u32 = 14;
+    const STRESS_BANK_RECORDS: u64 = 16; // 2 per layer
+
+    let _alone = alone();
+    let device = cpu();
+    let charges = seismic::Charges::tally(&device);
+    let words = |count: u64, initial| cpu_words(&device, count, initial);
+
+    let file = std::env::temp_dir().join(format!(
+        "expert-watcher-deepseek-stress-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos(),
+    ));
+    let bytes: Vec<u8> = (0..3)
+        .flat_map(|kind| {
+            (0..STRESS_EXPERTS).flat_map(move |expert| [(100 * kind + expert) as u8; RECORD as usize])
+        })
+        .collect();
+    std::fs::write(&file, &bytes).unwrap();
+
+    let stress_words = RegionWords {
+        choices: 4,
+        rounds: 4,
+        flight: crate::FlightDepth::PIPELINED.steps(STRESS_PLACES as u64),
+        sites: crate::FlightDepth::PIPELINED.steps(1),
+    };
+    let steps = Arc::new(Steps::new(
+        crate::FlightDepth::PIPELINED,
+        STRESS_PLACES as u64,
+        crate::experts::exchange::Pulse::driven(),
+    ));
+    let transport = ExpertTransport::new_registry_only();
+    let copies = Copies::with_transport(
+        seismic::Transfer::new(&device).unwrap(),
+        steps.events().clone(),
+        transport.clone(),
+    );
+
+    let lent = STRESS_CONVEYOR as usize;
+    let tier_total = STRESS_TIER_INIT + lent as u32;
+    let tier_extent = u64::from(STRESS_TIER_MAX + lent as u32);
+    let shared_rows = |records: u64| Tensor::shared(&charges, Element::i32(), &[records, RECORD / 4]).unwrap();
+
+    let tier_backing: Vec<Tensor> = (0..3).map(|_| shared_rows(tier_extent)).collect();
+    let bank_backing: Vec<Tensor> = (0..3).map(|_| shared_rows(STRESS_BANK_RECORDS)).collect();
+    let scratch_backing: Vec<Tensor> = (0..3).map(|_| shared_rows(STRESS_EXPERTS as u64)).collect();
+    let staging = Tensor::shared(&charges, Element::i32(), &[u64::from(STRESS_STAGING) * 3 * 4]).unwrap();
+    let conveyor = Tensor::shared(&charges, Element::i32(), &[STRESS_CONVEYOR * 3 * 4]).unwrap();
+
+    let rows_of = |tensor: &Tensor, count: u64| -> Vec<Option<Tensor>> {
+        (0..count).map(|r| Some(tensor.slice_leading(r, r + 1).unwrap())).collect()
+    };
+    let view = |tensor: &Tensor, kind: u64, records: u64| {
+        let v = tensor.region(Element::i32(), &[records, RECORD / 4], kind * records * RECORD).unwrap();
+        Records::rows(&v, RECORD, records).unwrap()
+    };
+
+    let tier_tensors: Vec<TierTensor> = tier_backing
+        .iter()
+        .map(|t| {
+            let recs = Records::new(rows_of(t, u64::from(tier_total)), RECORD).unwrap();
+            TierTensor::new(recs, Element::i32(), Element::i32(), [1, RECORD / 4], RECORD).unwrap()
+        })
+        .collect();
+    let bank_views: Vec<Records> = bank_backing
+        .iter()
+        .map(|t| Records::new(rows_of(t, STRESS_BANK_RECORDS), RECORD).unwrap())
+        .collect();
+    let pools: Vec<Pool> = (0..3)
+        .map(|kind| Pool { staging: view(&staging, kind, u64::from(STRESS_STAGING)) })
+        .collect();
+    let conveyor_pools: Vec<Records> = (0..3).map(|kind| view(&conveyor, kind, STRESS_CONVEYOR)).collect();
+    let carrier = Carrier {
+        records: STRESS_CONVEYOR as usize,
+        slots: 0,
+        lending: Lending {
+            group: 0,
+            pools: conveyor_pools
+                .iter()
+                .map(|pool| LentPool { record: RECORD, offset: 0, conveyor: pool.bytes() })
+                .collect(),
+            scratch: Vec::new(),
+        },
+        pools: conveyor_pools,
+    };
+
+    let maps: Vec<StampedMap> = (0..STRESS_LAYERS)
+        .map(|_| StampedMap::new(words(STRESS_EXPERTS as u64 * constants::MAP_WORDS, 0)))
+        .collect();
+    let tier_maps: Vec<Words> = (0..STRESS_LAYERS).map(|_| words(STRESS_EXPERTS as u64, -1)).collect();
+    let scratch_tables: Vec<ExchangeTable> = (0..STRESS_LAYERS)
+        .map(|_| ExchangeTable::new(Words::aligned_cpu_tensor(&device, stress_words.scratch().words()), stress_words.scratch(), steps.pulse()).unwrap())
+        .collect();
+    let file_tables: Vec<ExchangeTable> = (0..STRESS_LAYERS)
+        .map(|_| ExchangeTable::new(Words::aligned_cpu_tensor(&device, stress_words.file().words()), stress_words.file(), steps.pulse()).unwrap())
+        .collect();
+    let layer_windows: Vec<Vec<Words>> = (0..STRESS_LAYERS)
+        .map(|_| vec![words(STRESS_EXPERTS as u64, -2)])
+        .collect();
+    let flags: Vec<Words> = (0..STRESS_PLACES).map(|_| words(STRESS_EXPERTS as u64, 0)).collect();
+    let reads: Vec<Words> = (0..STRESS_LAYERS)
+        .map(|_| words(stress_words.flight * STRESS_EXPERTS as u64, 0))
+        .collect();
+    let commits = words(STRESS_BANK_RECORDS, 0);
+
+    let stored_tensor = |kind: usize| StoredTensor {
+        parts: vec![StoredPart { file: 0, base: kind as u64 * STRESS_EXPERTS as u64 * RECORD, pitch: RECORD, bytes: RECORD }],
+        pool: kind,
+    };
+
+    let layers: Vec<Layer> = (0..STRESS_LAYERS)
+        .map(|index| {
+            let ahead = crate::planning::HINT_LEADS.min((STRESS_LAYERS - 1 - index) as u64);
+            let round_bounds = ListBounds { from: STRESS_CONVEYOR, to: STRESS_EXPERTS as u64, lent: 0 };
+            Layer {
+                group: 0,
+                experts: STRESS_EXPERTS,
+                layer_window: STRESS_EXPERTS,
+                map: maps[index].view().clone(),
+                file: file_tables[index].clone(),
+                scratch: scratch_tables[index].clone(),
+                rings: words(ahead * stress_words.ring_words(), 0),
+                hints: (0..ahead as usize).map(|lead| index + 1 + lead).collect(),
+                routing: words(stress_words.flight * stress_words.routing_words(), 0),
+                keys: words(stress_words.flight * constants::VERIFY_ROWS * STRESS_EXPERTS as u64, 0),
+                policy: words(constants::POLICY_WORDS, 0),
+                front: words(stress_words.ring_words(), 0),
+                site: None,
+                stored: (0..3).map(stored_tensor).collect(),
+                slots: None,
+                scratch_tensors: Some(scratch_backing.clone()),
+                // 4 distinct mixed-quant forms cycling every layer (like DeepSeek iq1m/iq2xxs/iq2xs).
+                scratch_form: vec![index % 4 + 1; 3],
+                landing: None,
+                rounds: (0..stress_words.rounds)
+                    .map(|_| LandingList::new(words(constants::LANDING_ENTRY(ROUND_RECORDS), 0), round_bounds))
+                    .collect(),
+                lists: ListRecords { bank: STRESS_BANK_RECORDS, tier: tier_extent },
+                tiered: words(constants::LIST_ENTRY(STRESS_EXPERTS as u64), 0),
+                seeds: words(constants::LIST_ENTRY(STRESS_EXPERTS as u64), 0),
+                windows: layer_windows[index].clone(),
+            }
+        })
+        .collect();
+
+    let placement = crate::experts::directory::Placement::Tier {
+        bank_maps: maps,
+        tier_maps: tier_maps.iter().map(|w| LandingMap::Tier(w.clone())).collect(),
+        lent: (0, 0),
+        stage_slots: vec![0],
+    };
+
+    let tripped = Arc::new(Mutex::new(None::<String>));
+    let tripped_cb = tripped.clone();
+    let watcher = Watcher::start_with_bounds(
+        WatcherParts {
+            layers,
+            group_reads: reads.iter().map(|r| PlacedLayerWords { group_reads: r.clone(), stride: STRESS_EXPERTS }).collect(),
+            groups: vec![Group {
+                commits,
+                tier: Some(tier_tensors),
+                bank: bank_views,
+                records: STRESS_BANK_RECORDS as usize,
+            }],
+            load: LoadWords { flags: flags.clone() },
+            pools,
+            extents: Extents {
+                widest: STRESS_EXPERTS,
+                windows: 1,
+                window_rounds: stress_words.rounds,
+                pass_launches: STRESS_PLACES,
+                round_records: ROUND_RECORDS as usize,
+                words: stress_words,
+                selected: 2,
+                demand: stress_words.choices as usize,
+                placer: Placer::Tier,
+                tier_copy_dma: true,
+                recording: false,
+            },
+            slots: Arc::new(std::sync::atomic::AtomicU64::new(STRESS_BANK_RECORDS / STRESS_LAYERS as u64)),
+            host_slots: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            whole: false,
+            staging: STRESS_STAGING,
+            host: crate::experts::directory::HostTier {
+                records: vec![tier_total],
+                lent: vec![lent as u32],
+                reserve: STRESS_STAGING as usize,
+                placement,
+            },
+            carrier,
+            source: ExpertSource::open(std::slice::from_ref(&file), &seismic_io::Urgent { parts: vec![RECORD], records: 1 }).unwrap(),
+            compute: crate::experts::HostCompute::start(Vec::new(), &crate::experts::ComputeThreads::unplaced(vec![vec![0, 1]])).unwrap(),
+            copier: Some(super::Copier { copies: copies.clone() }),
+            steps: steps.clone(),
+            spans: false,
+            line: None,
+            transport: transport.clone(),
+            trip: Box::new(move |report: String| {
+                *tripped_cb.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = Some(report);
+            }),
+        },
+        Box::new(|| crate::experts::exchange::Bounds {
+            lane: crate::experts::exchange::Bound {
+                limit: Duration::from_secs(3),
+                derivation: "local DeepSeek stress test".into(),
+            },
+            volumes: crate::watched::VolumeBound(None),
+        }),
+    )
+    .unwrap();
+
+    // Run 30 full 8-layer x 8-place prompt groups across all merge configurations
+    // (`merged = 1`, `4`, `8`) with randomized routing and mid-prefill HostTier growth.
+    let mut rng: u64 = 0x5eed_cafe_beef_1234;
+    let next_u64 = |state: &mut u64| -> u64 {
+        *state ^= *state << 13;
+        *state ^= *state >> 7;
+        *state ^= *state << 17;
+        *state
+    };
+
+    for iter in 0..100usize {
+        let routes = [StepRoute::Grouped; STRESS_PLACES];
+        let group_steps = begin(watcher.shared(), &routes, true).unwrap();
+        let seqs: Vec<Step> = group_steps.iter().map(|s| s.sequence()).collect();
+
+        // Pre-generate deterministic routed experts per (layer, place).
+        let mut routed = vec![vec![Vec::<usize>::new(); STRESS_PLACES]; STRESS_LAYERS];
+        for layer in 0..STRESS_LAYERS {
+            for place in 0..STRESS_PLACES {
+                let mask = (next_u64(&mut rng) % ((1u64 << STRESS_EXPERTS) - 1)) + 1;
+                for e in 0..STRESS_EXPERTS {
+                    if (mask >> e) & 1 != 0 {
+                        routed[layer][place].push(e);
+                    }
+                }
+            }
+        }
+
+        // Exact `native_target.rs::run_sets` wavefront:
+        // index = 0..=STRESS_LAYERS; `block = index.checked_sub(1)`.
+        // `merges_of(group, at)` is per-layer, matching `native_target.rs`'s `sets[at]`.
+        for index in 0..=STRESS_LAYERS {
+            let block = index.checked_sub(1);
+            let merged = block.map_or(1, |at| watcher.shared().steps.merges_of(seqs[0], at));
+            let pass_sets: Vec<std::ops::Range<usize>> = Passes::with_launches(STRESS_PLACES)
+                .sets(STRESS_PLACES, merged)
+                .collect();
+            for set in &pass_sets {
+                if let Some(at) = block {
+                    // Wait for Copies PrefillFill sync for every place in `set`.
+                    for place in set.clone() {
+                        let seq = seqs[place];
+                        let t_clone = transport.clone();
+                        let (tx, rx) = std::sync::mpsc::channel();
+                        std::thread::spawn(move || {
+                            let res = t_clone.take_prefill_sync(at, seq, 0);
+                            let _ = tx.send(res);
+                        });
+                        let _sync = match rx.recv_timeout(Duration::from_secs(3)) {
+                            Ok(Ok(sync)) => sync,
+                            Ok(Err(err)) => panic!("iter {iter} merged {merged} layer {at} place {place} sync error: {err}"),
+                            Err(_) => {
+                                let state = residency::lock(&watcher.state);
+                                let report = state.scratch.describe();
+                                panic!("DEADLOCK iter {iter} merged {merged} layer {at} place {place} (seq {seq}):\n{report}");
+                            }
+                        };
+                    }
+
+                    // Verify byte-for-byte expert weights in ScratchRing slots for every routed expert!
+                    for place in set.clone() {
+                        for &e in &routed[at][place] {
+                            let slot = layer_windows[at][0].load(e);
+                            if slot >= 0 {
+                                for kind in 0..3 {
+                                    let mut got = vec![0u8; RECORD as usize];
+                                    unsafe {
+                                        scratch_backing[kind]
+                                            .read_shared(slot as u64 * RECORD, &mut got)
+                                            .unwrap();
+                                    }
+                                    let expected = vec![(100 * kind + e) as u8; RECORD as usize];
+                                    if got != expected {
+                                        let win: Vec<i32> = (0..STRESS_EXPERTS).map(|x| layer_windows[at][0].load(x)).collect();
+                                        let desc = residency::lock(&watcher.state).scratch.describe();
+                                        panic!(
+                                            "CORRUPTION iter {iter} merged {merged} layer {at} place {place} expert {e} slot {slot} tensor {kind}: got {:?} expected {:?}\nwindow={win:?}\n{desc}",
+                                            &got[..4],
+                                            &expected[..4],
+                                        );
+                                    }
+                                }
+                            }
+                        }
+                    }
+
+                    // Simulate GPU `Pass(at, set)` completion (always releases
+                    // before the next pass set on the same layer can start).
+                    let key = PassKey { layer: at, set_start: set.start, window: 0 };
+                    {
+                        let mut state = residency::lock(&watcher.state);
+                        state.scratch.release_passes(&[key]);
+                    }
+                    watcher.shared().events().notify();
+                }
+
+                // Publish `Front(index, place)` for every place in `set` (BEFORE `Pass(block)`'s later sets!).
+                if index < STRESS_LAYERS {
+                    for place in set.clone() {
+                        for e in 0..STRESS_EXPERTS {
+                            flags[place].store(e, if routed[index][place].contains(&e) { 1 } else { 0 });
+                        }
+                        scratch_tables[index].request(seqs[place], constants::SCRATCH_ASK);
+                        watcher.shared().events().notify();
+                    }
+                }
+            }
+        }
+
+        for step in group_steps {
+            step.complete().unwrap();
+        }
+        // Wait for group to retire and clear conveyor before next iteration.
+        eventually("stress prompt group did not retire", || {
+            let state = residency::lock(&watcher.state);
+            state.scratch.conveyor.serving.is_none()
+        });
+    }
+
+    drop(watcher);
+    let _ = std::fs::remove_file(&file);
+    let report = tripped.lock().unwrap_or_else(std::sync::PoisonError::into_inner).take();
+    if let Some(report) = report {
+        panic!("watchdog tripped during DeepSeek stress test:\n{report}");
+    }
+}

@@ -1210,10 +1210,14 @@ impl Directory {
     /// lock every step begins under, `at` the first step not yet begun, the
     /// lent records only while no scratch-served group's lease is out.
     pub fn refill(&mut self, victims: Vec<Vec<(u32, Staged)>>, at: &Unbegun) -> bool {
+        self.refill_with(victims, at, false)
+    }
+
+    pub fn refill_with(&mut self, victims: Vec<Vec<(u32, Staged)>>, at: &Unbegun, immediate: bool) -> bool {
         self.host
             .iter_mut()
             .zip(victims)
-            .fold(false, |unmapped, (records, victims)| unmapped | records.refill(victims, at))
+            .fold(false, |unmapped, (records, victims)| unmapped | records.refill_with(victims, at, immediate))
     }
 
     /// Group `group`'s host tier sets `records` ready records aside for

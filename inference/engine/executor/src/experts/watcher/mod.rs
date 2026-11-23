@@ -1008,6 +1008,7 @@ impl Watcher {
                 count,
                 flags,
                 Conveyor::new(layer_pools, &experts, carrier),
+                copier.clone(),
             ),
             link: LinkMover::new(),
             asked: None,

@@ -384,7 +384,6 @@ impl<'p> StepSubmitter<'p> {
     fn fill(
         &mut self,
         ready: seismic::ReadyNativeGraphRun<'_>,
-        prefill_dma: Option<PendingPrefillDma>,
         register: impl FnOnce(&NativeGraphOutputs),
     ) -> Result<(), SubmitError> {
         self.flush()?;
@@ -395,77 +394,101 @@ impl<'p> StepSubmitter<'p> {
         let outputs = ready.queue(&mut sequence).map_err(device)?;
         register(&outputs);
         self.completions.push(sequence.submit().map_err(device)?);
-        if let Some(pending) = prefill_dma {
-            self.pending_prefill_dma.push(pending);
-        }
         Ok(())
     }
 
-    /// Producer-enqueued prefill `HostTier -> Scratch` (+ seeded `Scratch -> Bank`)
-    /// hardware DMA for `(block, set, window)`:
+    /// Wait on the host condvar for `Copies` async-DMA `PrefillFill` sync
+    /// handles covering `(block, set, window)` and attach a cross-stream
+    /// `cuStreamWaitEvent` (`follow_transfer`) before `Pass` runs on
+    /// `NativeQueue::Compute` — zero `routed_round`, zero `routed_copy`, zero
+    /// `cuEventSynchronize` drains.
     ///
-    /// - Never blocks `run_fill` or drains `Compute` with `cuEventSynchronize`.
-    /// - Flushes any queued independent `Compute` work (`Front` / `Combine`)
-    ///   so the GPU stays saturated while taking the `PrefillPlan`s that
-    ///   `Watcher` (`Scratch::fix_rounds`) published directly on the host.
-    /// - Coalesces all chunks in `set` into ONE `submit_fill_copies` batch on
-    ///   `NativeQueue::Fill` (ordered into the consuming `Pass` via
-    ///   `cuStreamWaitEvent`), or skips with ZERO device calls when no
-    ///   host-tier copies are needed.
+    /// Returns `Some((bank, layer))` when `Pass(L)` should be flushed with a
+    /// completion signal right after queueing so `ScratchRing` releases its
+    /// slots before `Combine(L)` and `Front(L+1)` finish.
     fn enqueue_prefill_dma(
         &mut self,
         block: usize,
         set: &std::ops::Range<usize>,
         window: u64,
-    ) -> Result<(), SubmitError> {
+    ) -> Result<Option<(Arc<crate::experts::ExpertBank>, usize)>, SubmitError> {
         if self.pending_prefill_dma.is_empty() {
-            return Ok(());
+            return Ok(None);
         }
         let (matching, remaining): (Vec<_>, Vec<_>) = std::mem::take(&mut self.pending_prefill_dma)
             .into_iter()
             .partition(|p| p.block == block && set.contains(&p.place) && p.window == window);
         self.pending_prefill_dma = remaining;
         if matching.is_empty() {
-            return Ok(());
+            return Ok(None);
         }
         // Flush any queued independent Compute work (`Front`/`Combine`) first
-        // so it runs on the GPU while we collect the host-published plans.
+        // so the GPU stays busy while awaiting the host-side `Copies` sync.
         self.flush()?;
         let bank = matching[0].bank.clone();
         let layer = matching[0].layer;
-        let mut plans = Vec::with_capacity(matching.len());
         for pending in matching {
-            let plan = pending
+            if let Some(sync) = pending
                 .bank
                 .transport()
-                .take_prefill_plan(pending.layer, pending.sequence, pending.window)
-                .map_err(device)?;
-            plans.push(plan);
+                .take_prefill_sync(pending.layer, pending.sequence, pending.window)
+                .map_err(device)?
+            {
+                self.follow_transfer(sync);
+            }
         }
-        if let Some(completion) = bank.submit_prefill_dma(layer, &plans).map_err(device)? {
-            self.completions.push(completion);
-        }
-        Ok(())
+        Ok(Some((bank, layer)))
+    }
+
+    /// Submit the current compute sequence containing `Pass(L)` immediately
+    /// (BEFORE `Combine(L)` and `Front(L+1)`) and register its completion with
+    /// `ExpertTransport` so `Requests::serve` releases `Pass(L)`'s
+    /// `ScratchRing` slots as soon as `Pass(L)` finishes on the GPU.
+    fn flush_tracked_pass(
+        &mut self,
+        bank: &Arc<crate::experts::ExpertBank>,
+        key: crate::experts::transport::PassKey,
+    ) -> Result<(), SubmitError> {
+        self.flush_with(|completion| bank.track_pass_completion(key, completion))
     }
 
     /// Submit what is queued, with the reads its runs make; those of the
     /// run about to be queued stay pending. A submission is a boundary of
     /// the chain's release: every pass queued is submitted.
     fn flush(&mut self) -> Result<(), SubmitError> {
+        let completions = &mut self.completions;
+        let sequence = std::mem::replace(&mut self.sequence, self.device.native_sequence(NativeQueue::Compute));
+        self.queued = 0;
+        if !sequence.is_empty() {
+            completions.push(sequence.submit().map_err(device)?);
+            self.finish_flush();
+        } else {
+            (self.queued_reads, self.queued_landed) = (0, 0);
+        }
+        Ok(())
+    }
+
+    fn flush_with(&mut self, sink: impl FnOnce(NativeGraphCompletion)) -> Result<(), SubmitError> {
         self.queued = 0;
         let sequence = std::mem::replace(&mut self.sequence, self.device.native_sequence(NativeQueue::Compute));
         if !sequence.is_empty() {
-            self.completions.push(sequence.submit().map_err(device)?);
-            self.reads.extend(self.pending_reads.drain(..self.queued_reads));
-            self.landed
-                .extend(self.pending_landed.drain(..self.queued_landed).map(SelectedRead::submitted));
-            if let Some(release) = &mut self.release {
-                release.submitted = release.queued;
-                release.awaits = release.bank.release_running(release.chain, release.submitted, release.pressure);
-            }
+            sink(sequence.submit().map_err(device)?);
+            self.finish_flush();
+        } else {
+            (self.queued_reads, self.queued_landed) = (0, 0);
+        }
+        Ok(())
+    }
+
+    fn finish_flush(&mut self) {
+        self.reads.extend(self.pending_reads.drain(..self.queued_reads));
+        self.landed
+            .extend(self.pending_landed.drain(..self.queued_landed).map(SelectedRead::submitted));
+        if let Some(release) = &mut self.release {
+            release.submitted = release.queued;
+            release.awaits = release.bank.release_running(release.chain, release.submitted, release.pressure);
         }
         (self.queued_reads, self.queued_landed) = (0, 0);
-        Ok(())
     }
 
     /// Wait on a transfer batch's completion event (`cuStreamWaitEvent` on
@@ -2325,15 +2348,15 @@ impl NativeTargetProgram {
         } else {
             None
         };
-        let (graph, bound) = self.graphs.fill(index).map_err(invalid)?;
-        let mut bindings = bound.bindings();
-        let mut prefill_dma = None;
+        // On `tier_copy_dma` (CUDA `Placer::Tier`), host-side repack + `Copies`
+        // async DMA (`PrefillFill`) into `ScratchRing` completely replaces
+        // GPU-spinning `OnceStage::Fill` (`routed_round`, `routed_scratch_grids`,
+        // `routed_copy`, `routed_seed_commit`). Only record the pending sync
+        // handle so `run_pass` emits a single `cuStreamWaitEvent` gate before
+        // `Pass(L)`.
         if let Some(bank) = &run.bank {
-            bank.bind(graph, index, run.region.place, &self.unallocating(), &mut bindings).map_err(invalid)?;
-            bank.bind_window(graph, index, window, &self.unallocating(), &mut bindings).map_err(invalid)?;
-            bank.fill_followed(index, window, followed).map_err(invalid)?;
             if let Some(layer) = bank.tier_copy_dma_layer(index).map_err(invalid)? {
-                prefill_dma = Some(PendingPrefillDma {
+                submitter.pending_prefill_dma.push(PendingPrefillDma {
                     bank: bank.bank.clone(),
                     block: index,
                     layer,
@@ -2341,14 +2364,22 @@ impl NativeTargetProgram {
                     sequence: bank.sequence,
                     window,
                 });
+                return Ok(());
             }
+        }
+        let (graph, bound) = self.graphs.fill(index).map_err(invalid)?;
+        let mut bindings = bound.bindings();
+        if let Some(bank) = &run.bank {
+            bank.bind(graph, index, run.region.place, &self.unallocating(), &mut bindings).map_err(invalid)?;
+            bank.bind_window(graph, index, window, &self.unallocating(), &mut bindings).map_err(invalid)?;
+            bank.fill_followed(index, window, followed).map_err(invalid)?;
         }
         let mut active = run.launch.graph_workspace.slot_mut().activate(&graph.plan).map_err(device)?;
         let ready = active
             .attach(bindings, graph.plan.new_outputs(&self.unallocating()).map_err(device)?)
             .map_err(device)?;
         let mut registered = Ok(());
-        submitter.fill(ready, prefill_dma, |outputs| {
+        submitter.fill(ready, |outputs| {
             registered = run.bank.as_ref().map_or(Ok(()), |bank| bank.register_fill_parks(graph, index, window, outputs));
         })?;
         registered.map_err(invalid)
@@ -2370,12 +2401,10 @@ impl NativeTargetProgram {
         reads: Option<(&crate::experts::ExpertBank, usize)>,
         submitter: &mut StepSubmitter,
     ) -> Result<(), SubmitError> {
-        // Enqueue producer-published host-tier -> VRAM scratch DMA for this
-        // `(index, set, window)` on `NativeQueue::Fill` right before `Pass` is
-        // queued on `NativeQueue::Compute`, so `Allocation::queue_order` emits
-        // `cuStreamWaitEvent(compute_stream, dma_done)` with zero
-        // `cuEventSynchronize` drains.
-        submitter.enqueue_prefill_dma(index, &set, window)?;
+        // Attach cross-stream `cuStreamWaitEvent` on the `Copies` `PrefillFill`
+        // completion signal for `(index, set, window)` before `Pass` runs on
+        // `NativeQueue::Compute` (zero `routed_round`, zero `cuEventSynchronize`).
+        let tracked_pass = submitter.enqueue_prefill_dma(index, &set, window)?;
         let launches = runs.len();
         let mut backs = runs
             .iter_mut()
@@ -2435,6 +2464,16 @@ impl NativeTargetProgram {
             .attach(bindings, graph.plan.new_outputs(&self.unallocating()).map_err(device)?)
             .map_err(device)?;
         submitter.queue(ready, |_| {})?;
+        if let Some((bank, layer)) = tracked_pass {
+            submitter.flush_tracked_pass(
+                &bank,
+                crate::experts::transport::PassKey {
+                    layer,
+                    set_start: set.start,
+                    window,
+                },
+            )?;
+        }
         Ok(())
     }
 

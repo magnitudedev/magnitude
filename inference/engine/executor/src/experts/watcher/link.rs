@@ -257,39 +257,45 @@ impl LinkMover {
         // BEFORE `stage_predicted` and exclude in-flight `Stage` batches from
         // `ask()`'s budget and `post_promote()`'s depth cap so opportunistic
         // staging can never starve permanent VRAM residency growth.
+        // Pause all promotions while a prompt group is running on
+        // `tier_copy_dma` so prefill async DMA (`TransferPriority::PrefillFill`)
+        // never contends with or deadlocks behind `Promoting` batches.
+        let pause_promote = core.extents.tier_copy_dma && core.steps.prompt_running();
         let lending = core.steps.lending();
-        if lending {
-            // Cancel any unbegun promotion batches targeting `0..lent` so a
-            // newly begun prompt group never waits on queued copies into its
-            // scratch region.
+        if lending || pause_promote {
+            // Cancel any unbegun promotion batches targeting `0..lent` (or any
+            // unbegun promotion while an async-DMA prompt runs) so a prompt
+            // group never waits on queued background promotions.
             for (group, record, batch) in core.directory.copying() {
-                if core.directory.bank_lends(group, record.index()) && copier.copies.cancel(batch) {
+                if (pause_promote || core.directory.bank_lends(group, record.index())) && copier.copies.cancel(batch) {
                     core.directory.unpromoted(group, record);
                     moved = true;
                 }
             }
         }
-        moved |= self.ask(core, shared, copier, &copy);
-        let mut queued = core.directory.queued();
-        queued.retain(|&(group, record, (layer, expert))| {
-            let kept = !(lending && core.directory.bank_lends(group, record.index()))
-                && core.directory.tier_record(layer, expert).is_some()
-                && core.directory.reuse_now().in_top(layer, expert);
-            if !kept {
-                core.directory.unpromoted(group, record);
-                moved = true;
-            }
-            kept
-        });
-        for promotion @ (group, record, _) in queued {
-            let depth = permanent_post_depth(copy.depth(bytes[group]), copier.copies.flight(), core.directory.staging_copying().len());
-            match post_promote(core, shared, copier, depth, promotion) {
-                Ok(true) => moved = true,
-                Ok(false) => break,
-                Err(error) => {
+        if !pause_promote {
+            moved |= self.ask(core, shared, copier, &copy);
+            let mut queued = core.directory.queued();
+            queued.retain(|&(group, record, (layer, expert))| {
+                let kept = !(lending && core.directory.bank_lends(group, record.index()))
+                    && core.directory.tier_record(layer, expert).is_some()
+                    && core.directory.reuse_now().in_top(layer, expert);
+                if !kept {
                     core.directory.unpromoted(group, record);
-                    shared.end_serving(format!("a promotion's copy into the bank: {error}"));
-                    return true;
+                    moved = true;
+                }
+                kept
+            });
+            for promotion @ (group, record, _) in queued {
+                let depth = permanent_post_depth(copy.depth(bytes[group]), copier.copies.flight(), core.directory.staging_copying().len());
+                match post_promote(core, shared, copier, depth, promotion) {
+                    Ok(true) => moved = true,
+                    Ok(false) => break,
+                    Err(error) => {
+                        core.directory.unpromoted(group, record);
+                        shared.end_serving(format!("a promotion's copy into the bank: {error}"));
+                        return true;
+                    }
                 }
             }
         }
@@ -540,6 +546,9 @@ impl LinkMover {
     /// Ask the ranking for permanent promotions up to remaining permanent
     /// copy-engine headroom (excluding in-flight opportunistic `Stage` copies).
     fn ask(&mut self, core: &mut Core, shared: &Shared, copier: &Copier, copy: &TierCopyCosts) -> bool {
+        if core.extents.tier_copy_dma && core.steps.prompt_running() {
+            return false;
+        }
         let max_depth = record_bytes(core)
             .into_iter()
             .filter(|&bytes| bytes > 0)

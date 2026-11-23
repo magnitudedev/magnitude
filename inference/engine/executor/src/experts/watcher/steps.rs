@@ -547,12 +547,18 @@ pub(in crate::experts) struct ParkFrom(Step);
 pub(in crate::experts) struct Unbegun {
     next: Step,
     lending: bool,
+    /// Whether every currently running step belongs to a scratch-served prompt
+    /// group (zero decode steps in flight). On `tier_copy_dma`, no GPU kernel
+    /// reads `HostTier` via `tier_map` while this holds, so unheld `Host::Kept`
+    /// victims evicted by `refill` can become `Host::Ready` immediately.
+    all_scratch: bool,
 }
 
 impl Unbegun {
     fn of(state: &State) -> Self {
         // Admission keeps the step after the last one begun representable.
-        Self { next: state.last + 1, lending: state.lending() }
+        let all_scratch = state.groups.values().all(|group| group.is_scratch() || group.ended >= group.steps);
+        Self { next: state.last + 1, lending: state.lending(), all_scratch }
     }
 
     pub(in crate::experts) fn next(&self) -> Step {
@@ -565,18 +571,24 @@ impl Unbegun {
         self.lending
     }
 
+    /// Whether every currently running step belongs to a scratch-served prompt
+    /// group (zero decode steps in flight).
+    pub(in crate::experts) fn all_scratch(&self) -> bool {
+        self.all_scratch
+    }
+
     /// The first step not yet begun at `next`, no group lending, where a
     /// test plays the steps.
     #[cfg(test)]
     pub(in crate::experts) fn at(next: Step) -> Self {
-        Self { next, lending: false }
+        Self { next, lending: false, all_scratch: false }
     }
 
     /// The first step not yet begun at `next`, a scratch-served group's
     /// lease out, where a test plays the steps.
     #[cfg(test)]
     pub(in crate::experts) fn lending_at(next: Step) -> Self {
-        Self { next, lending: true }
+        Self { next, lending: true, all_scratch: false }
     }
 }
 
@@ -1941,6 +1953,7 @@ impl ExpertStep {
             selected: 1,
             demand: 1,
             placer: crate::planning::Placer::Tier,
+            tier_copy_dma: false,
             recording: false,
         };
         let steps = Arc::new(Steps::new(flights, places, crate::experts::exchange::Pulse::new()));

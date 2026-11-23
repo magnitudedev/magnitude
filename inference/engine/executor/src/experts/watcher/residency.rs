@@ -606,9 +606,11 @@ impl Residency {
             .enumerate()
             .flat_map(|(group, records)| records.iter().map(move |&(record, _)| (group, record as usize)))
             .collect();
+        let tier_copy_dma = self.core.extents.tier_copy_dma;
         let mut unmapped = false;
         steps.unbegun(|at| {
-            unmapped = directory.refill(victims, at);
+            let immediate = tier_copy_dma && at.all_scratch();
+            unmapped = directory.refill_with(victims, at, immediate);
         });
         if unmapped {
             for (group, tier_record) in evicted_records {

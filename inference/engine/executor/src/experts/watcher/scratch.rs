@@ -51,20 +51,183 @@
 //! lists name only those.
 
 use super::core::{At, Core, Listed, Taken};
+use super::link::Copier;
 use super::prefetch::Prefetch;
 use super::telemetry::{Anticipation, GroupLayer, Mark, RequestCost};
-use super::{Shared, Step};
+use super::{Shared, Step, low_word};
 use crate::experts::{ListBounds, Words};
 use crate::experts::compute::Urgency;
 use crate::experts::conveyor::{Conveyor, ConveyorLanding, Serving, State, readiness};
+use crate::experts::copies::{BatchItem, Run, Signal};
 use crate::experts::directory::{BankRecord, Directory, HostRecord, Point};
+use crate::experts::host_records::{Claim, Taking};
 use crate::experts::landing::Converting;
 use crate::experts::source::Read;
 use crate::experts::staging::Staged;
+use crate::experts::transport::PassKey;
 use seismic_io::Want;
 use magnitude_kernels::constants;
+use std::collections::VecDeque;
 use std::sync::Arc;
 use std::time::Instant;
+
+/// Derived probability that a uniformly routed expert of a layer with
+/// `experts` experts and top-`selected` routing is chosen at least once
+/// across `tokens` prompt tokens: `1 - ((E - K) / E)^M`.
+fn prefill_hit_probability(experts: usize, selected: usize, tokens: f64) -> f64 {
+    if experts == 0 || selected == 0 || tokens <= 0.0 {
+        return 0.0;
+    }
+    if selected >= experts {
+        return 1.0;
+    }
+    let miss = (experts - selected) as f64 / experts as f64;
+    1.0 - miss.powf(tokens)
+}
+
+/// Compact FIFO ring allocator over the lender's existing `0..capacity` (`lent`)
+/// VRAM scratch slots for cross-layer pipelined prefill on `Placer::Tier`
+/// (`0 B` extra VRAM).
+///
+/// Each pass `(layer, set_start, window)` claims `count` dynamic slots from
+/// `tail` (wrapping modulo `capacity`) and writes them into the layer's
+/// indirect `WindowTable` (`core.layers[layer].windows[window]`), which
+/// `routed_pass_map` already resolves. When `Pass(L)` completes on the GPU
+/// (signaled right after `run_pass(L)`, BEFORE `Combine(L)` and `Front(L+1)`),
+/// `release_pass` frees its reservation and advances `head` so `Fill(L+1)`
+/// launches async DMA immediately in parallel with `Combine(L) + Front(L+1)`.
+#[derive(Default)]
+struct ScratchRing {
+    head: usize,
+    tail: usize,
+    used: usize,
+    capacity: usize,
+    form: Vec<usize>,
+    in_flight: VecDeque<RingLease>,
+}
+
+struct RingLease {
+    pass: PassKey,
+    count: usize,
+    released: bool,
+}
+
+impl ScratchRing {
+    /// Whether `count` slots can be allocated for `form` of `capacity` without
+    /// aliasing any currently in-flight pass.
+    fn can_alloc(&self, form: &[usize], capacity: usize, count: usize) -> bool {
+        if count == 0 {
+            return true;
+        }
+        if count > capacity {
+            return false;
+        }
+        if self.used == 0 {
+            return true;
+        }
+        self.form.as_slice() == form && self.capacity == capacity && self.used + count <= self.capacity
+    }
+
+    /// Allocate `count` dynamic scratch slots in `0..capacity` for `pass`.
+    /// Even when `count == 0`, records a zero-slot lease so
+    /// [`Self::has_in_flight_set`] stays `true` until `pass` finishes on the
+    /// GPU (preventing a later pass set's `clear_windows()` from racing with
+    /// an earlier pass reading `-2` hits from `WindowTable`).
+    /// Panics if [`Self::can_alloc`] does not hold.
+    fn alloc(&mut self, pass: PassKey, form: &[usize], capacity: usize, count: usize) -> Vec<usize> {
+        if count == 0 {
+            self.in_flight.push_back(RingLease { pass, count: 0, released: false });
+            return Vec::new();
+        }
+        assert!(
+            self.can_alloc(form, capacity, count),
+            "ScratchRing::alloc({count}) exceeds capacity {capacity} (used {}, current cap {})",
+            self.used,
+            self.capacity
+        );
+        if self.used == 0 {
+            self.head = 0;
+            self.tail = 0;
+            self.capacity = capacity;
+            self.form.clear();
+            self.form.extend_from_slice(form);
+        }
+        let start = self.tail;
+        let mut slots = Vec::with_capacity(count);
+        for offset in 0..count {
+            slots.push((start + offset) % self.capacity);
+        }
+        self.tail = (self.tail + count) % self.capacity;
+        self.used += count;
+        self.in_flight.push_back(RingLease { pass, count, released: false });
+        slots
+    }
+
+    /// Release all leases owned by `pass`, advancing `head` past any
+    /// contiguous prefix of released leases. Returns `true` if `used` dropped.
+    fn release_pass(&mut self, pass: PassKey) -> bool {
+        let mut matched = false;
+        for lease in &mut self.in_flight {
+            if lease.pass == pass && !lease.released {
+                lease.released = true;
+                matched = true;
+            }
+        }
+        if !matched {
+            return false;
+        }
+        self.drain_released()
+    }
+
+    /// Release all leases owned by `layer` (belt-and-suspenders when `advance`
+    /// proves the device is past the layer).
+    fn release_layer(&mut self, layer: usize) -> bool {
+        let mut matched = false;
+        for lease in &mut self.in_flight {
+            if lease.pass.layer == layer && !lease.released {
+                lease.released = true;
+                matched = true;
+            }
+        }
+        if !matched {
+            return false;
+        }
+        self.drain_released()
+    }
+
+    fn drain_released(&mut self) -> bool {
+        let before_used = self.used;
+        let before_len = self.in_flight.len();
+        while self.in_flight.front().is_some_and(|lease| lease.released) {
+            let lease = self.in_flight.pop_front().expect("front is Some");
+            if lease.count > 0 {
+                self.head = (self.head + lease.count) % self.capacity;
+                self.used -= lease.count;
+            }
+        }
+        if self.used == 0 {
+            self.head = 0;
+            self.tail = 0;
+        }
+        self.used < before_used || self.in_flight.len() < before_len
+    }
+
+    /// Whether any unreleased lease exists for `(layer, set_start)`.
+    fn has_in_flight_set(&self, layer: usize, set_start: usize) -> bool {
+        self.in_flight
+            .iter()
+            .any(|lease| !lease.released && lease.pass.layer == layer && lease.pass.set_start == set_start)
+    }
+
+    fn clear(&mut self) {
+        self.head = 0;
+        self.tail = 0;
+        self.used = 0;
+        self.capacity = 0;
+        self.form.clear();
+        self.in_flight.clear();
+    }
+}
 
 /// A step's request at the tier's layer, taken as it was published: the
 /// experts it routed, and of those no earlier step of the group routed
@@ -114,6 +277,9 @@ struct ColdSlot {
     reader: Step,
     stage: ColdStage,
     read: ColdRead,
+    /// Dynamic `ScratchRing` slot assigned to this expert on `tier_copy_dma`
+    /// (`None` on `Placer::Bank` / direct-mapped scratch).
+    ring_slot: Option<usize>,
 }
 
 impl ColdSlot {
@@ -187,6 +353,10 @@ impl SetSlot {
     fn is_failed(&self) -> bool {
         self.failure().is_some()
     }
+
+    fn ring_slot(&self) -> Option<usize> {
+        self.cold().and_then(|cold| cold.ring_slot)
+    }
 }
 
 /// One pass set of a tier: its chain-place range and per-expert state.
@@ -209,7 +379,15 @@ impl PassSet {
             reader,
             stage: ColdStage::Assigned,
             read: if carried { ColdRead::Active } else { ColdRead::Deferred },
+            ring_slot: None,
         });
+    }
+
+    fn set_ring_slot(&mut self, layer: usize, expert: usize, slot: usize) {
+        let SetSlot::Cold(cold) = &mut self.experts[expert] else {
+            panic!("expert {expert} of layer {layer} assigned ring slot {slot} without a cold reader");
+        };
+        cold.ring_slot = Some(slot);
     }
 
     fn claim_scratch(&mut self, layer: usize, expert: usize) {
@@ -273,6 +451,11 @@ struct Tier {
     cursor: Option<(usize, u64, usize)>,
     /// The requests taken, one per chain place in step order, until served.
     taken: usize,
+    /// Number of `(place, window)` requests that have finished serving (or
+    /// failed/unarrived) at this tier. Once `served_windows == total_windows()`,
+    /// this tier will make no further `ScratchRing` allocations, so later
+    /// layers may safely pipeline into `ScratchRing`.
+    served_windows: usize,
     places: Vec<Option<Request>>,
     seeds: Option<Vec<(usize, BankRecord)>>,
 }
@@ -340,6 +523,14 @@ fn copies_from_tier(core: &Core) -> bool {
 }
 
 impl Tier {
+    fn total_windows(&self) -> usize {
+        self.sets.last().map_or(0, |set| set.range.end) * self.windows as usize
+    }
+
+    fn all_served(&self) -> bool {
+        self.served_windows >= self.total_windows()
+    }
+
     fn set_of(&self, place: usize) -> usize {
         self.sets
             .iter()
@@ -487,8 +678,17 @@ pub(super) struct Scratch {
     /// device is not yet past: the layer served and the next, at most.
     tiers: Vec<Tier>,
     /// The host tier records the group's tier copies read, (layer, record),
-    /// held until the device is past the group.
+    /// held until the device is past the group (non-DMA path).
     held: Vec<(usize, HostRecord)>,
+    /// Per-batch host-tier holds for async-DMA `PrefillFill` batches on
+    /// `Copies`: `(copies_ticket, vec![(layer, record)])`, released as soon
+    /// as `Copies::completed(ticket)` is true so multi-layer prefills never
+    /// exhaust `HostTier` when the model exceeds host RAM.
+    prefill_held: Vec<(u64, Vec<(usize, HostRecord)>)>,
+    /// Compact FIFO ring allocator over `0..lent` for `tier_copy_dma`.
+    ring: ScratchRing,
+    /// Shared `Copies` queue handle for posting `TransferPriority::PrefillFill`.
+    copier: Option<Copier>,
     /// Demand-derived subset of `0..lent` leased for the active prompt group on
     /// `Placer::Bank` (`None` = full `0..lent` lease).
     lease_records: Option<Vec<u32>>,
@@ -516,7 +716,19 @@ impl Pending {
             Self::Served(Serve { at, place, window, arrived, stage, .. }) => {
                 let stage = match stage {
                     RequestStage::Arrived { request } => format!("arrived (cold {:?})", request.cold),
-                    RequestStage::Awaiting(opened) => format!("awaiting landings and the scratch for {:?}", opened.cold),
+                    RequestStage::Awaiting(opened) => match &opened.ring_slots {
+                        Some(entries) => {
+                            let unposted: Vec<usize> = entries.iter().filter(|&&(_, _, p)| !p).map(|&(e, _, _)| e).collect();
+                            format!(
+                                "awaiting landings and the scratch for {:?} (ring_slots {}/{} posted, unposted {:?})",
+                                opened.cold,
+                                entries.len() - unposted.len(),
+                                entries.len(),
+                                unposted,
+                            )
+                        }
+                        None => format!("awaiting landings and the scratch for {:?} (ring_slots None)", opened.cold),
+                    },
                     RequestStage::Rounds(rounds) => format!(
                         "round {} of {}, cold {:?}, tiered {:?}, waiting {:?}, failure {:?}",
                         rounds.round,
@@ -557,11 +769,22 @@ enum RequestStage {
     Rounds(Rounds),
 }
 
+/// Outcome of one non-blocking step of [`Scratch::serve_async_dma`].
+enum AsyncServe {
+    Done,
+    Waiting(bool),
+}
+
 /// A request opened ([`RequestStage::Awaiting`]).
 struct Opened {
     routed: Vec<usize>,
     hits: Vec<(usize, usize)>,
     cold: Vec<usize>,
+    /// On `tier_copy_dma`, `(expert, ring_slot, posted)` entries allocated once
+    /// `ScratchRing` capacity is reserved for this pass. Streaming partial DMA
+    /// batches as cold experts land in `HostTier` prevents pinning all `cold`
+    /// records simultaneously when `host_slots < cold.len()`.
+    ring_slots: Option<Vec<(usize, usize, bool)>>,
 }
 
 /// A request's rounds ([`RequestStage::Rounds`]): its cold experts read from the
@@ -585,12 +808,15 @@ struct Rounds {
 }
 
 impl Scratch {
-    pub(super) fn new(layers: usize, flags: Vec<Words>, conveyor: Conveyor) -> Self {
+    pub(super) fn new(layers: usize, flags: Vec<Words>, conveyor: Conveyor, copier: Option<Copier>) -> Self {
         Self {
             published: vec![0; layers],
             flags,
             tiers: Vec::new(),
             held: Vec::new(),
+            prefill_held: Vec::new(),
+            ring: ScratchRing::default(),
+            copier,
             lease_records: None,
             conveyor,
         }
@@ -643,17 +869,34 @@ impl Scratch {
                     }] += 1;
                 }
                 format!(
-                    "group {} layer {}: taken {}, open_set {}, deferred {:?}, failed {:?}, routed (none, reading, held, listed) {ways:?}",
+                    "group {} layer {}: taken {}, served {}/{}, sets {}, open_set {}, lw {}, deferred {:?}, failed {:?}, routed (none, reading, held, listed) {ways:?}",
                     tier.group,
                     tier.layer,
                     tier.taken,
+                    tier.served_windows,
+                    tier.total_windows(),
+                    tier.sets.len(),
                     tier.open_set,
+                    tier.layer_window,
                     tier.deferred_experts().collect::<Vec<_>>(),
                     tier.failed_experts().collect::<Vec<_>>(),
                 )
             })
             .collect::<Vec<_>>();
-        format!("conveyor serving {:?}; scratch tiers [{}]", self.conveyor.serving, tiers.join("; "))
+        let ring_leases: Vec<_> = self
+            .ring
+            .in_flight
+            .iter()
+            .map(|l| (l.pass.layer, l.pass.set_start, l.pass.window, l.count, l.released))
+            .collect();
+        format!(
+            "conveyor serving {:?}; ring {}/{} (leases {:?}); scratch tiers [{}]",
+            self.conveyor.serving,
+            self.ring.used,
+            self.ring.capacity,
+            ring_leases,
+            tiers.join("; ")
+        )
     }
 
     /// The highest layer a request of group `group` (its first step) was
@@ -756,6 +999,81 @@ impl Scratch {
         });
     }
 
+    /// Release `ScratchRing` slot reservations for prefill `Pass`es that just
+    /// completed on the GPU (signaled right after `run_pass(L)`, BEFORE
+    /// `Combine(L)` and `Front(L+1)`).
+    pub(super) fn release_passes(&mut self, passes: &[PassKey]) -> bool {
+        let mut released = false;
+        for &pass in passes {
+            released |= self.ring.release_pass(pass);
+        }
+        released
+    }
+
+    /// Release per-layer `HostTier` holds whose `PrefillFill` DMA batch has
+    /// completed on `Copies`, so multi-layer prefills on models larger than
+    /// host RAM never exhaust `HostTier`.
+    pub(super) fn settle_prefill_copies(&mut self, core: &mut Core, shared: &Shared) -> bool {
+        if self.prefill_held.is_empty() {
+            return false;
+        }
+        let Some(copier) = &self.copier else {
+            return false;
+        };
+        let mut released = false;
+        let mut remaining = Vec::new();
+        for (ticket, records) in std::mem::take(&mut self.prefill_held) {
+            match copier.copies.completed(ticket) {
+                Ok(false) => remaining.push((ticket, records)),
+                Ok(true) => {
+                    for (layer, record) in records {
+                        core.directory.unhold_tier(layer, record);
+                    }
+                    released = true;
+                }
+                Err(error) => {
+                    for (layer, record) in records {
+                        core.directory.unhold_tier(layer, record);
+                    }
+                    shared.end_serving(format!("a prefill scratch fill copy: {error}"));
+                    released = true;
+                }
+            }
+        }
+        self.prefill_held = remaining;
+        released
+    }
+
+    /// Whether an async-DMA (`tier_copy_dma`) scratch request at `(layer,
+    /// group, place)` can begin serving now without inverting layer order on
+    /// `ScratchRing` or overwriting an earlier pass set's `WindowTable`.
+    ///
+    /// A later layer must never claim `ScratchRing` slots while any earlier
+    /// layer in `self.tiers` still has unserved windows: the earlier layer's
+    /// remaining pass sets must run on the GPU first, so letting a later layer
+    /// occupy `ScratchRing` (especially with a different mixed-quant
+    /// `scratch_form` or partial capacity) would deadlock the earlier layer
+    /// waiting for `ScratchRing` while the later layer waits for the earlier
+    /// layer on the GPU.
+    pub(super) fn can_arrive_async(&self, layer: usize, group: Step, place: usize) -> bool {
+        if self
+            .tiers
+            .iter()
+            .any(|earlier| (earlier.group, earlier.layer) < (group, layer) && !earlier.all_served())
+        {
+            return false;
+        }
+        let Some(tier) = self.tiers.iter().find(|tier| (tier.group, tier.layer) == (group, layer)) else {
+            return true;
+        };
+        let target_set = tier.set_of(place);
+        if target_set <= tier.open_set {
+            return true;
+        }
+        let open_start = tier.sets[tier.open_set].range.start;
+        !self.ring.has_in_flight_set(layer, open_start)
+    }
+
     /// The device is at `progress`: forget the tiers of the layers the
     /// served group is past (their backs read no record any more), reset
     /// their pass window tables for resident passes, free the conveyor's
@@ -775,6 +1093,7 @@ impl Scratch {
         for tier in &self.tiers {
             if progress > steps.point(tier.group, tier.layer, serving.group.last()) {
                 core.layers[tier.layer].reset_windows();
+                self.ring.release_layer(tier.layer);
             }
         }
         // A tier the device is past holds nothing: its slots are the
@@ -811,9 +1130,37 @@ impl Scratch {
         if !self.conveyor.quiet() {
             return false;
         }
+        // Wait for any in-flight `PrefillFill` copies on `Copies` to finish
+        // reading their held host-tier records before returning the lease.
+        if !self.prefill_held.is_empty() {
+            if let Some(copier) = &self.copier {
+                let mut remaining = Vec::new();
+                for (ticket, records) in std::mem::take(&mut self.prefill_held) {
+                    match copier.copies.completed(ticket) {
+                        Ok(false) => remaining.push((ticket, records)),
+                        Ok(true) | Err(_) => {
+                            for (layer, record) in records {
+                                core.directory.unhold_tier(layer, record);
+                            }
+                        }
+                    }
+                }
+                self.prefill_held = remaining;
+                if !self.prefill_held.is_empty() {
+                    return false;
+                }
+            } else {
+                for (_, records) in self.prefill_held.drain(..) {
+                    for (layer, record) in records {
+                        core.directory.unhold_tier(layer, record);
+                    }
+                }
+            }
+        }
         for tier in self.tiers.drain(..) {
             core.layers[tier.layer].reset_windows();
         }
+        self.ring.clear();
         self.conveyor.clear();
         // The device is past every tier copy of the group.
         for (layer, record) in self.held.drain(..) {
@@ -874,7 +1221,7 @@ impl Scratch {
             Some(index) => index,
             None => {
                 let steps = self.conveyor.serving.expect("the conveyor serves the group").group.steps();
-                let sets: Vec<PassSet> = if core.extents.windows > 1 {
+                let sets: Vec<PassSet> = if core.extents.windows > 1 || core.extents.tier_copy_dma {
                     let merged = shared.steps.merges_of(group, layer);
                     crate::programs::native_target_graph::Passes::with_launches(core.extents.pass_launches)
                         .sets(steps as usize, merged)
@@ -897,6 +1244,7 @@ impl Scratch {
                     open_set: 0,
                     cursor,
                     taken: 0,
+                    served_windows: 0,
                     places: vec![None; self.flags.len()],
                     seeds: None,
                 });
@@ -1111,6 +1459,69 @@ impl Scratch {
             }
             self.submit_conveyor_batch(core, shared, index, layer, &mut batch, &mut batch_reads);
         }
+        // Pillar C: Continuous cross-layer NVMe prefetcher in host RAM.
+        // Once all active tiers' deferred NVMe reads are submitted, prefetch
+        // layer `L + 1`'s `!in_vram && !in_host_tier` experts whenever the
+        // derived hit probability `1 - ((E - K) / E)^M >= 0.8` so NVMe queue
+        // depth never drains to 0 between layers.
+        if core.extents.tier_copy_dma {
+            let total_lack: usize = self
+                .tiers
+                .iter()
+                .map(|tier| {
+                    tier.deferred_experts()
+                        .filter(|&(set_idx, expert)| !self.waits(core, tier, set_idx, expert))
+                        .count()
+                })
+                .sum();
+            if total_lack == 0 {
+                if let Some(last_tier) = self.tiers.last() {
+                    let next_layer = last_tier.layer + 1;
+                    if next_layer < core.layers.len()
+                        && !self.tiers.iter().any(|t| t.layer == next_layer)
+                    {
+                        let total_choices: u64 = last_tier
+                            .group_routes
+                            .iter()
+                            .filter_map(|r| r.map(|route| u64::from(route.count)))
+                            .sum();
+                        let selected = core.extents.selected;
+                        let tokens = if selected > 0 { total_choices as f64 / selected as f64 } else { 0.0 };
+                        let next_experts = core.layers[next_layer].experts;
+                        if prefill_hit_probability(next_experts, selected, tokens) >= 0.8 {
+                            let expert_bytes = core.layers[next_layer].expert_bytes();
+                            for expert in 0..next_experts {
+                                if self.conveyor.reads_in_flight() as u64 * expert_bytes >= knee {
+                                    break;
+                                }
+                                if core.directory.held(next_layer, expert).is_some()
+                                    || core.directory.tier_record(next_layer, expert).is_some()
+                                    || core.directory.lands(next_layer, expert)
+                                    || self.conveyor.state(next_layer, expert).is_some()
+                                {
+                                    continue;
+                                }
+                                let records = self.conveyor.free_conveyor(next_layer, |record| {
+                                    Self::admits_conveyor(&self.conveyor, core, next_layer, record)
+                                });
+                                let Some(&record) = records.first() else {
+                                    break;
+                                };
+                                let reads = core.reads_to(next_layer, expert, &self.conveyor, record);
+                                if let Ok(ticket) = core.table.source().request(reads, Want::streamed()) {
+                                    let events = shared.events().clone();
+                                    ticket.on_end(move |_, _| events.notify());
+                                    self.conveyor.take(next_layer, expert, record);
+                                    self.conveyor.reading(next_layer, expert, Arc::new(ticket), record);
+                                } else {
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
         ended
     }
 
@@ -1322,26 +1733,73 @@ impl Scratch {
                     .or_else(|| tier.group_routes[expert].map(|route| route.last))
             })
         };
+        let async_dma = core.extents.tier_copy_dma;
+        let candidates = if async_dma {
+            // On `tier_copy_dma`, EVERY conveyed NVMe read must be repacked on
+            // the host into `HostTier` (no GPU `routed_round` exists), so also
+            // retry any `State::Held` expert whose earlier host-tier claim was
+            // `Short`.
+            self.conveyor.held_without_landing()
+        } else {
+            landed
+        };
         let knee = core.table.source().knee();
-        for (layer, expert, record) in landed {
-            let knee_records = knee.div_ceil(core.layers[layer].expert_bytes()) as usize;
-            let free = self.conveyor.free_conveyor(layer, |r| Self::admits_conveyor(&self.conveyor, core, layer, r)).len();
-            if free <= knee_records {
-                continue;
+        for (layer, expert, record) in candidates {
+            if !async_dma {
+                let knee_records = knee.div_ceil(core.layers[layer].expert_bytes()) as usize;
+                let free = self.conveyor.free_conveyor(layer, |r| Self::admits_conveyor(&self.conveyor, core, layer, r)).len();
+                if free <= knee_records {
+                    continue;
+                }
             }
             let read = reader(&self.tiers, layer, expert);
-            let crate::experts::host_records::Claim::Taken(grant) = core.directory.claim_conveyed(layer, expert, read) else {
-                continue;
+            let is_demand = read.is_some();
+            let grant = match core.directory.claim_conveyed(layer, expert, read) {
+                Claim::Taken(grant) => grant,
+                Claim::Kept(_) | Claim::Landing => {
+                    if async_dma {
+                        // Already resident or landing in `HostTier`; free the
+                        // conveyor record immediately so it cannot leak.
+                        self.conveyor.release_held(layer, expert);
+                    }
+                    continue;
+                }
+                Claim::Short if async_dma && is_demand => {
+                    // Active prefill demand must always land into `HostTier`
+                    // so `PrefillFill` async DMA can deliver it to `ScratchRing`.
+                    match core.directory.claim_landing(layer, expert, 0, Taking::Out, (|_, _| (), |_, _| true)) {
+                        Claim::Taken(grant) => grant,
+                        Claim::Kept(_) | Claim::Landing => {
+                            self.conveyor.release_held(layer, expert);
+                            continue;
+                        }
+                        Claim::Short => continue,
+                    }
+                }
+                Claim::Short => {
+                    if async_dma {
+                        // Drop speculative Pillar-C lookahead read when
+                        // `HostTier` is full so it never wedges a conveyor
+                        // record ahead of active demand.
+                        self.conveyor.release_held(layer, expert);
+                    }
+                    continue;
+                }
             };
             let tier = grant.record();
             let pools = self.conveyor.pools();
             let landing = core.landing_from(grant, |pool| (&pools[pool], u64::from(record)));
             let ended = crate::experts::landing::Ended::new(shared.events());
+            let urgency = if async_dma && is_demand {
+                Urgency::waited()
+            } else {
+                Urgency::ahead(Want::undated(0.))
+            };
             // SAFETY: the read landed whole in conveyor record `record`,
             // which no read lands in until this landing ends; the tier
             // record was ready (no step reads it) when taken.
             let converting = unsafe {
-                Converting::new(landing, Urgency::ahead(Want::undated(0.)), shared.landings.clone(), ended.clone(), || {})
+                Converting::new(landing, urgency, shared.landings.clone(), ended.clone(), || {})
             };
             let cancel = converting.cancel_handle();
             shared.compute.submit(std::sync::Arc::new(converting));
@@ -1351,13 +1809,26 @@ impl Scratch {
 
     /// Learn the conveyor landings that ended: each landed tier record keeps
     /// its expert; each cancelled landing returns its tier record ready.
+    /// On `tier_copy_dma`, immediately release the conveyor record once
+    /// converted into `HostTier` so NVMe reads reuse it right away.
     /// How many ended.
     fn settle_landings(&mut self, core: &mut Core) -> usize {
         let landed = self.conveyor.landed();
+        let async_dma = core.extents.tier_copy_dma;
         for landing in &landed {
             match landing.ended.get() {
-                Some(true) => core.directory.landed(landing.layer, HostRecord(landing.tier), landing.expert, landing.read),
-                Some(false) => core.directory.unlanded(landing.layer, HostRecord(landing.tier)),
+                Some(true) => {
+                    core.directory.landed(landing.layer, HostRecord(landing.tier), landing.expert, landing.read);
+                    if async_dma {
+                        self.conveyor.release_held(landing.layer, landing.expert);
+                    }
+                }
+                Some(false) => {
+                    core.directory.unlanded(landing.layer, HostRecord(landing.tier));
+                    if async_dma {
+                        self.conveyor.release_held(landing.layer, landing.expert);
+                    }
+                }
                 None => unreachable!("conveyor::landed returns only ended landings"),
             }
         }
@@ -1653,6 +2124,7 @@ impl Scratch {
                 let lw = self.tiers[index].layer_window;
                 if let Some(request) = self.tiers[index].places[place].take() {
                     self.tiers[index].advance_cursor();
+                    self.tiers[index].served_windows += (self.tiers[index].windows - window) as usize;
                     let forfeited = (window == 0)
                         .then(|| request.hits.iter().map(|&(expert, _)| expert).collect::<Vec<_>>())
                         .unwrap_or_default()
@@ -1688,6 +2160,11 @@ impl Scratch {
             // it, which only a step that failed passes without its rounds
             // answered, so nothing waits.
             let Some(index) = self.tiers.iter().position(|tier| (tier.group, tier.layer) == (group, layer)) else {
+                if let RequestStage::Awaiting(opened) = stage {
+                    if opened.ring_slots.is_some() {
+                        self.ring.release_pass(PassKey { layer, set_start: set.start, window });
+                    }
+                }
                 return (None, true);
             };
             stage = match stage {
@@ -1695,6 +2172,20 @@ impl Scratch {
                     RequestStage::Awaiting(self.opened(at, window, arrived, request, core, shared))
                 }
                 RequestStage::Awaiting(mut opened) => {
+                    if core.extents.tier_copy_dma {
+                        match self.serve_async_dma(at, place, set_index, window, &set, arrived, index, &mut opened, core, prefetch, ledger, shared) {
+                            AsyncServe::Done => {
+                                self.tiers[index].served_windows += 1;
+                                return (None, true);
+                            }
+                            AsyncServe::Waiting(progressed) => {
+                                return (
+                                    Some(Serve { at, place, set_index, window, set, next_set_start, arrived, stage: RequestStage::Awaiting(opened) }),
+                                    moved | progressed,
+                                )
+                            }
+                        }
+                    }
                     match self.await_landings(layer, &opened.cold, core, prefetch, ledger, shared)
                         && self.claim_scratch(index, set_index, window, at.point.sequence, &mut opened, core)
                     {
@@ -1743,7 +2234,336 @@ impl Scratch {
         if window == 0 {
             self.mark_at(shared, layer, Mark::Arrived(sequence), arrived);
         }
-        Opened { routed, hits, cold }
+        Opened { routed, hits, cold, ring_slots: None }
+    }
+
+    /// Serve a prefill scratch request on `tier_copy_dma` (Pillars A + B):
+    /// 1. Ensure the prompt group's `0..lent` lease is held.
+    /// 2. Wait for every cold expert in `opened.cold` to be in `HostTier`
+    ///    (either already cached, hastened from `Prefetch`, or read via
+    ///    `Conveyor` and host-repacked by `shared.compute` `Converting`),
+    ///    holding each `HostRecord` as soon as it lands so `refill_tier` can
+    ///    never evict it mid-layer.
+    /// 3. Allocate `opened.cold.len()` dynamic slots from `ScratchRing`
+    ///    (wrapping inside existing `0..lent`, `0 B` extra VRAM).
+    /// 4. Write dynamic slots into `core.layers[layer].windows[window]`.
+    /// 5. Compute seeds on the group's last step (using dynamic ring slots).
+    /// 6. Post ONE `TransferPriority::PrefillFill` batch to `Copies`
+    ///    (`HostTier -> ScratchRing` H2D + `ScratchRing -> Bank` seed D2D +
+    ///    `Signal` for `commits`), or publish `None` sync when 0 copies are
+    ///    needed.
+    #[allow(clippy::too_many_arguments)]
+    fn serve_async_dma(
+        &mut self,
+        at: At,
+        place: usize,
+        set_index: usize,
+        window: u64,
+        set: &std::ops::Range<usize>,
+        arrived: Instant,
+        index: usize,
+        opened: &mut Opened,
+        core: &mut Core,
+        prefetch: &mut Prefetch,
+        ledger: &mut crate::experts::interest::Ledger,
+        shared: &Shared,
+    ) -> AsyncServe {
+        let point = at.point;
+        let Point { layer, sequence, .. } = point;
+        let lw = core.layers[layer].layer_window;
+        let scratch_group = self.conveyor.serving.expect("a scratch request's group is served").group;
+        let last = scratch_group.last();
+
+        let pass_key = PassKey { layer, set_start: set.start, window };
+
+        // Fail promptly if the step ended due to a device error.
+        if shared.steps.ended(sequence) {
+            if opened.ring_slots.take().is_some() {
+                self.ring.release_pass(pass_key);
+            }
+            let remaining = self.tiers[index]
+                .places[place]
+                .take()
+                .map(|request| request.cold.into_iter().filter(|&expert| expert / lw > window as usize).collect::<Vec<_>>())
+                .unwrap_or_default();
+            let forfeited = opened
+                .hits
+                .iter()
+                .map(|&(expert, _)| expert)
+                .chain(opened.cold.iter().copied())
+                .chain(remaining);
+            self.forfeit(index, set_index, place, forfeited, core);
+            shared.telemetry.served_whole(None);
+            fail(core, shared, sequence, format!("step {sequence} ended while awaiting async prefill fill at layer {layer}"));
+            return AsyncServe::Done;
+        }
+
+        let mut progressed = false;
+        // 1. Settle prefetch & conveyor reads/landings and ensure lease is held.
+        let _ = self.await_landings(layer, &opened.cold, core, prefetch, ledger, shared);
+        progressed |= self.convey(core, shared);
+        if !self.leased(core) {
+            self.lease(core);
+            if !self.leased(core) {
+                return AsyncServe::Waiting(progressed);
+            }
+        }
+
+        // Check for NVMe read failures on any cold expert.
+        if let Some(reason) = opened
+            .cold
+            .iter()
+            .find_map(|&expert| self.tiers[index].sets[set_index].experts[expert].failure().map(str::to_owned))
+        {
+            if opened.ring_slots.take().is_some() {
+                self.ring.release_pass(pass_key);
+            }
+            let remaining = self.tiers[index]
+                .places[place]
+                .take()
+                .map(|request| request.cold.into_iter().filter(|&expert| expert / lw > window as usize).collect::<Vec<_>>())
+                .unwrap_or_default();
+            let forfeited = opened
+                .hits
+                .iter()
+                .map(|&(expert, _)| expert)
+                .chain(opened.cold.iter().copied())
+                .chain(remaining);
+            self.forfeit(index, set_index, place, forfeited, core);
+            shared.telemetry.served_whole(None);
+            fail(core, shared, sequence, reason);
+            return AsyncServe::Done;
+        }
+
+        // 2. Reserve `ScratchRing` slots for `opened.cold` once, populating
+        //    `WindowTable` before streaming any H2D DMA batches.
+        if opened.ring_slots.is_none() {
+            let form = core.layers[layer].scratch_form.clone();
+            if !self.ring.can_alloc(&form, lw, opened.cold.len()) {
+                return AsyncServe::Waiting(progressed);
+            }
+            let slots = self.ring.alloc(pass_key, &form, lw, opened.cold.len());
+            for &expert in &opened.cold {
+                self.tiers[index].sets[set_index].claim_scratch(layer, expert);
+                self.tiers[index].sets[set_index].mark_tiered(layer, expert);
+            }
+            if window == 0 {
+                for &(expert, _) in &opened.hits {
+                    core.layers[layer].windows[0].store(expert, -2);
+                }
+            }
+            let mut entries = Vec::with_capacity(opened.cold.len());
+            for (&expert, slot) in opened.cold.iter().zip(slots.into_iter()) {
+                self.tiers[index].sets[set_index].set_ring_slot(layer, expert, slot);
+                core.layers[layer].windows[window as usize].store(expert, slot as i32);
+                entries.push((expert, slot, false));
+            }
+            opened.ring_slots = Some(entries);
+            progressed = true;
+        }
+
+        // 3. Stream any not-yet-posted cold experts that are ready in `HostTier`.
+        //    Posting partial `PrefillFill` DMA batches as experts arrive frees
+        //    their `HostTier` holds as soon as each batch completes, guaranteeing
+        //    deadlock-freedom even when `host_slots < opened.cold.len()`.
+        let mut need_convey = false;
+        let mut batch_ready: Vec<(usize, HostRecord, usize)> = Vec::new();
+        let all_posted = {
+            let entries = opened.ring_slots.as_mut().expect("ring_slots initialized above");
+            for &mut (expert, slot, ref mut posted) in entries.iter_mut() {
+                if *posted {
+                    continue;
+                }
+                // `PrefillFill` copies from `HostTier` via host-side `Copies`
+                // (never the GPU slab table), so any `Host::Kept` record is
+                // immediately readable regardless of `whole.from.step()`
+                // (newly grown host-tier slots joined during cold prefill have
+                // `from.step() > last`, which would make `hold_for_pass` return
+                // `None` and livelock against `Claim::Kept`).
+                if let Some(record) = core.directory.hold_tier(layer, expert) {
+                    *posted = true;
+                    batch_ready.push((expert, record, slot));
+                    progressed = true;
+                } else if !core.directory.lands(layer, expert) && self.conveyor.state(layer, expert).is_none() {
+                    // Self-heal: if an expert was evicted before we held it, mark
+                    // it deferred so `convey` reads it from NVMe immediately.
+                    if let SetSlot::Cold(cold) = &mut self.tiers[index].sets[set_index].experts[expert] {
+                        if !matches!(cold.read, ColdRead::Deferred | ColdRead::Failed(_)) {
+                            cold.read = ColdRead::Deferred;
+                            need_convey = true;
+                        }
+                    }
+                }
+            }
+            entries.iter().all(|&(_, _, posted)| posted)
+        };
+        if need_convey {
+            progressed |= self.convey(core, shared);
+        }
+        if !all_posted && batch_ready.is_empty() {
+            return AsyncServe::Waiting(progressed);
+        }
+
+        // 4. Compute seeds on the group's last step once all cold experts are posted.
+        let group = core.layers[layer].group;
+        let mut seed_copies: Vec<(usize, usize)> = Vec::new(); // (ring_slot, bank_record)
+        let mut seeded = 0u64;
+        if all_posted && sequence == last {
+            if window == 0 {
+                let tier = &self.tiers[index];
+                let tier_routed = tier
+                    .group_routes
+                    .iter()
+                    .enumerate()
+                    .filter_map(|(expert, route)| route.map(|route| (expert, route.count, route.last)))
+                    .collect::<Vec<_>>();
+                let read = tier_routed.iter().map(|&(expert, ..)| expert).collect::<Vec<_>>();
+                let set_experts = &tier.sets[set_index].experts;
+                let filled = |expert: usize| set_experts[expert].is_cold() && !set_experts[expert].is_failed();
+                let (seeds, evicted) = core.directory.seed(at.point, scratch_group, layer, &tier_routed, &read, filled);
+                for (owner, expert) in evicted {
+                    self.demote(owner, expert);
+                }
+                self.tiers[index].seeds = Some(seeds);
+            }
+            let tier = &self.tiers[index];
+            for &(expert, bank_record) in tier.seeds.as_deref().unwrap_or(&[]) {
+                if expert / lw == window as usize
+                    && tier.sets[set_index].experts[expert].has_scratch()
+                    && !tier.sets[set_index].experts[expert].is_failed()
+                {
+                    if let Some(ring_slot) = tier.sets[set_index].experts[expert].ring_slot() {
+                        seed_copies.push((ring_slot, bank_record.index()));
+                    }
+                }
+            }
+            seeded = seed_copies.len() as u64;
+        }
+
+        // 5. Build a `TransferPriority::PrefillFill` batch on `Copies`:
+        //    - Phase 1: `HostTier -> ScratchRing` H2D copies for `batch_ready`
+        //    - Phase 2 (final batch only): `ScratchRing -> Bank` D2D copies for
+        //      seeded experts + `Signal` writing `commits[bank_record] = low_word(sequence)`
+        let mut items: Vec<BatchItem> = Vec::new();
+        if !batch_ready.is_empty() || !seed_copies.is_empty() {
+            let scratch_tensors = core.layers[layer]
+                .scratch_tensors
+                .as_ref()
+                .expect("tier_copy_dma layer holds scratch_tensors");
+            let tier_tensors = core.groups[group]
+                .tier
+                .as_ref()
+                .expect("tier_copy_dma group holds host tier tensors");
+            for &(_, tier_rec, ring_slot) in &batch_ready {
+                for (t_idx, (tier_tensor, scratch_tensor)) in tier_tensors.iter().zip(scratch_tensors.iter()).enumerate() {
+                    let src = tier_tensor.records.tensor(u64::from(tier_rec.0)).clone();
+                    let dst = scratch_tensor
+                        .slice_leading(ring_slot as u64, ring_slot as u64 + 1)
+                        .unwrap_or_else(|error| panic!("layer {layer} tensor {t_idx} scratch slice {ring_slot}: {error}"));
+                    let bytes = dst.byte_len();
+                    items.push(BatchItem::Run(Run {
+                        source: src,
+                        source_offset: 0,
+                        destination: dst,
+                        destination_offset: 0,
+                        bytes,
+                    }));
+                }
+            }
+            if !seed_copies.is_empty() {
+                let commits_tensor = core.groups[group].commits.tensor().clone();
+                let seq_low = low_word(sequence);
+                for &(ring_slot, bank_record) in &seed_copies {
+                    for (t_idx, scratch_tensor) in scratch_tensors.iter().enumerate() {
+                        let src = scratch_tensor
+                            .slice_leading(ring_slot as u64, ring_slot as u64 + 1)
+                            .unwrap_or_else(|error| panic!("layer {layer} seed scratch slice {ring_slot}: {error}"));
+                        let dst = core.groups[group].bank_view(t_idx, bank_record);
+                        let bytes = src.byte_len();
+                        items.push(BatchItem::Run(Run {
+                            source: src,
+                            source_offset: 0,
+                            destination: dst,
+                            destination_offset: 0,
+                            bytes,
+                        }));
+                    }
+                    items.push(BatchItem::Signal(Signal {
+                        word: commits_tensor.clone(),
+                        index: bank_record as u64,
+                        value: seq_low,
+                    }));
+                }
+            }
+        }
+
+        let held_records: Vec<(usize, HostRecord)> = batch_ready.into_iter().map(|(_, rec, _)| (layer, rec)).collect();
+        if items.is_empty() {
+            for (l, rec) in held_records {
+                core.directory.unhold_tier(l, rec);
+            }
+            if all_posted {
+                shared.transport.publish_prefill_sync(layer, sequence, window, None);
+            }
+        } else {
+            let copier = self.copier.as_ref().expect("tier_copy_dma holds Copies handle");
+            let sync_key = all_posted.then_some((layer, sequence, window));
+            match copier.copies.post_prefill(items, sync_key) {
+                Ok(ticket) => {
+                    if !held_records.is_empty() {
+                        self.prefill_held.push((ticket, held_records));
+                    }
+                }
+                Err(error) => {
+                    for (l, rec) in held_records {
+                        core.directory.unhold_tier(l, rec);
+                    }
+                    if opened.ring_slots.take().is_some() {
+                        self.ring.release_pass(pass_key);
+                    }
+                    fail(core, shared, sequence, format!("prefill async DMA post failed: {error}"));
+                    return AsyncServe::Done;
+                }
+            }
+        }
+
+        if !all_posted {
+            return AsyncServe::Waiting(true);
+        }
+
+        // 7. Record telemetry and answer `SCRATCH_ASK` on `ScratchTable`.
+        let expert_bytes = core.layers[layer].expert_bytes();
+        let count = opened.cold.len() as u64;
+        let parked = arrived.elapsed();
+        let served = RequestCost {
+            misses: count,
+            hosted: count,
+            bytes: count * expert_bytes,
+            parked,
+            ..RequestCost::default()
+        };
+        shared.telemetry.serve(layer, sequence, served);
+        let tier = &self.tiers[index];
+        let took = GroupLayer {
+            union: tier.group_routes.iter().filter(|route| route.is_some()).count() as u64,
+            hits: opened.hits.len() as u64,
+            pulled: count,
+            seeded,
+            parked,
+            ..GroupLayer::default()
+        };
+        shared.telemetry.group(point, last, took);
+        let last_window = window + 1 == core.extents.windows;
+        shared.telemetry.served_whole(Some((point, Instant::now(), last_window)));
+        if last_window {
+            self.mark(shared, layer, Mark::Served(sequence));
+        }
+        if window == 0 {
+            let table = &core.layers[layer].scratch;
+            table.store(sequence, constants::SCRATCH_ASK, constants::SCRATCH_STAGED, 0);
+            table.answer(sequence, constants::SCRATCH_ASK, false);
+        }
+        AsyncServe::Done
     }
 
     /// Whether no cold expert of the request a read ahead lands into the
@@ -1794,7 +2614,7 @@ impl Scratch {
     /// lists (the tier list, written before it).
     fn fix_rounds(&mut self, at: At, set_index: usize, window: u64, opened: Opened, core: &mut Core, shared: &Shared) -> Rounds {
         let Point { group, layer, sequence, .. } = at.point;
-        let Opened { routed, hits, cold } = opened;
+        let Opened { routed, hits, cold, .. } = opened;
         self.convey(core, shared);
         let round_records = core.extents.round_records;
         let lw = core.layers[layer].layer_window;
@@ -2247,9 +3067,10 @@ impl Scratch {
 
 #[cfg(test)]
 mod tests {
-    use super::{Lease, compose_rounds};
+    use super::{Lease, PassKey, ScratchRing, compose_rounds, prefill_hit_probability};
     use crate::experts::directory::{Directory, HostTier, Placement};
     use super::super::steps::ScratchGroup;
+    use std::collections::HashSet;
 
     /// A slot's expert converts in a round after its borrower's, which
     /// converts the borrower out of it, the rest in the order they are
@@ -2324,5 +3145,81 @@ mod tests {
         assert!(!full.holds(1, 0, &directory));
         assert!(!full.holds(1, 2, &directory));
         assert!(!full.holds(1, 11, &directory));
+    }
+
+    /// `ScratchRing` wraps around `0..capacity` without aliasing any in-flight
+    /// pass, enforces backpressure when full, releases multi-chunk pass sets
+    /// together, handles out-of-order releases safely, and resets on form change.
+    #[test]
+    fn scratch_ring_wrap_around_release_and_non_aliasing() {
+        let mut ring = ScratchRing::default();
+        let form = [0usize, 1, 2];
+        let p0 = PassKey { layer: 0, set_start: 0, window: 0 };
+        let p1 = PassKey { layer: 1, set_start: 0, window: 0 };
+        let p2 = PassKey { layer: 2, set_start: 0, window: 0 };
+        let p3 = PassKey { layer: 3, set_start: 0, window: 0 };
+
+        // Allocate 6 and 6 out of capacity 16 -> 12 used, 4 free.
+        let s0 = ring.alloc(p0, &form, 16, 6);
+        assert_eq!(s0, vec![0, 1, 2, 3, 4, 5]);
+        let s1 = ring.alloc(p1, &form, 16, 6);
+        assert_eq!(s1, vec![6, 7, 8, 9, 10, 11]);
+        assert!(!ring.can_alloc(&form, 16, 8), "only 4 slots free");
+
+        // Release p0 -> 6..12 still occupied, 10 slots free -> allocate 8 wrapping around!
+        assert!(ring.release_pass(p0));
+        assert!(ring.can_alloc(&form, 16, 8));
+        let s2 = ring.alloc(p2, &form, 16, 8);
+        assert_eq!(s2, vec![12, 13, 14, 15, 0, 1, 2, 3]);
+
+        // Verify zero aliasing between s1 (in flight) and s2 (wrapped around).
+        let live_s1: HashSet<usize> = s1.iter().copied().collect();
+        for slot in &s2 {
+            assert!(!live_s1.contains(slot), "wrapped slot {slot} aliased in-flight pass p1");
+        }
+
+        // Out-of-order release of p2 must NOT advance head past unreleased p1.
+        assert!(!ring.release_pass(p2), "p1 still holds head, so used cannot drop yet");
+        assert!(!ring.can_alloc(&form, 16, 6), "slots remain pinned until p1 releases");
+
+        // Releasing p1 drains both p1 and already-released p2 -> ring empty.
+        assert!(ring.release_pass(p1));
+        assert!(ring.can_alloc(&form, 16, 16));
+
+        // Multi-chunk pass set sharing PassKey p3: both leases released together.
+        let s3a = ring.alloc(p3, &form, 16, 5);
+        let s3b = ring.alloc(p3, &form, 16, 7);
+        assert_eq!(s3a, vec![0, 1, 2, 3, 4]);
+        assert_eq!(s3b, vec![5, 6, 7, 8, 9, 10, 11]);
+        assert!(ring.has_in_flight_set(3, 0));
+        // Different form blocked while used > 0.
+        assert!(!ring.can_alloc(&[9, 9, 9], 16, 1));
+        assert!(ring.release_pass(p3));
+        assert!(!ring.has_in_flight_set(3, 0));
+        assert!(ring.can_alloc(&[9, 9, 9], 8, 8));
+
+        // Zero-slot pass still tracks `has_in_flight_set` without blocking form/capacity.
+        let p4 = PassKey { layer: 4, set_start: 0, window: 0 };
+        assert!(ring.alloc(p4, &form, 16, 0).is_empty());
+        assert!(ring.has_in_flight_set(4, 0));
+        assert!(ring.can_alloc(&[9, 9, 9], 8, 8));
+        assert!(ring.release_pass(p4));
+        assert!(!ring.has_in_flight_set(4, 0));
+    }
+
+    /// Derived Pillar C hit probability `1 - ((E - K) / E)^M`.
+    #[test]
+    fn pillar_c_hit_probability_gate() {
+        // DeepSeek-V4.1: E=256, K=8.
+        assert!(prefill_hit_probability(256, 8, 4096.0) > 0.999999);
+        assert!(prefill_hit_probability(256, 8, 64.0) >= 0.8);
+        assert!(prefill_hit_probability(256, 8, 16.0) < 0.8);
+        // Qwen3.8: E=512, K=10.
+        assert!(prefill_hit_probability(512, 10, 512.0) >= 0.8);
+        assert!(prefill_hit_probability(512, 10, 16.0) < 0.8);
+        // Edge cases.
+        assert_eq!(prefill_hit_probability(256, 8, 0.0), 0.0);
+        assert_eq!(prefill_hit_probability(0, 8, 100.0), 0.0);
+        assert_eq!(prefill_hit_probability(8, 8, 1.0), 1.0);
     }
 }
