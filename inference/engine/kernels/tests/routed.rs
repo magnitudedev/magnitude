@@ -8197,9 +8197,10 @@ fn streaming_a_landing_stops_once_its_slot_is_answered_or_failed() {
 /// peeks rather than weak-CAS or idempotent `add 0` spin loops.
 #[test]
 fn streaming_landing_counters_use_atomic_device_protocol() {
-    let kernels = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("kernels");
-    for entry in ["metal/routed_land.metal", "metal/routed_round.metal"] {
-        let source = std::fs::read_to_string(kernels.join(entry)).unwrap();
+    for (entry, source) in [
+        ("metal/routed_land.metal", include_str!("../kernels/metal/routed_land.metal")),
+        ("metal/routed_round.metal", include_str!("../kernels/metal/routed_round.metal")),
+    ] {
         assert!(
             source.contains("device atomic_int *counters [[buffer(SEISMIC_BUFFER_SCRATCH_COUNTERS)]]"),
             "{entry} must declare its sync counters as `device atomic_int *`"
@@ -8209,7 +8210,7 @@ fn streaming_landing_counters_use_atomic_device_protocol() {
             "{entry} must not declare atomic counters as plain `device int *`"
         );
     }
-    let metal_control = std::fs::read_to_string(kernels.join("metal/lib/streaming/control.h")).unwrap();
+    let metal_control = include_str!("../kernels/metal/lib/streaming/control.h");
     for required in [
         "#define STREAMING_ATOMIC_WORDS device atomic_int *",
         "streaming_device_fence",
@@ -8224,7 +8225,7 @@ fn streaming_landing_counters_use_atomic_device_protocol() {
         !metal_control.contains("atomic_compare_exchange_weak_explicit"),
         "metal/lib/streaming/control.h must not spin on weak CAS"
     );
-    let land = std::fs::read_to_string(kernels.join("streaming/land.hpp")).unwrap();
+    let land = include_str!("../kernels/streaming/land.hpp");
     for required in [
         "STREAMING_ATOMIC_WORDS",
         "streaming_atomic_load",

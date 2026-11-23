@@ -43,7 +43,8 @@ extern "C" __global__ void routed_select_ordered_gemv(SEISMIC_KERNEL_PARAMS) {
                            SEISMIC_RESIDUAL_STRIDE_0, SEISMIC_PTR(SEISMIC_BUFFER_NORM), eps, k,
                            projection::AllRows{}, SEISMIC_RESIDUAL_STRIDE_1, SEISMIC_NORM_STRIDE_0};
     const element::Out<element::F32> logits_out = element::out_over_scratch<element::F32>(SEISMIC_PTR(SEISMIC_BUFFER_SCRATCH_LOGITS));
-    projection::op::ordered_gemv_block<false>(
+    const unsigned ot = projection::op::ordered_tile(m, SEISMIC_DIM_E);
+    projection::op::ordered_gemv_block<false, SEISMIC_DIM_E>(
         shared_raw, router_raw, SEISMIC_RESULT_0_OUT, 0, 1, false, m, k, SEISMIC_DIM_E, blockIdx.x,
         KERNEL_W0_AT(SEISMIC_PTR(SEISMIC_BUFFER_ROUTER)), LogitStore{logits_out, SEISMIC_DIM_E, 0});
     if (blockIdx.x == 0) {
@@ -51,7 +52,7 @@ extern "C" __global__ void routed_select_ordered_gemv(SEISMIC_KERNEL_PARAMS) {
         routed::publish_ordered_norm_rows<activation::Act, NormElem>(
             norm_raw, m, smem_inv, SEISMIC_RESULT_0_OUT, SEISMIC_RESULT_0_STRIDE_0, SEISMIC_RESULT_0_STRIDE_1);
     }
-    const unsigned ordered_tiles = static_cast<unsigned>((SEISMIC_DIM_E + 31ull) / 32ull);
+    const unsigned ordered_tiles = static_cast<unsigned>((SEISMIC_DIM_E + ot - 1ull) / ot);
     __shared__ unsigned last;
     unsigned *arrivals = reinterpret_cast<unsigned *>(SEISMIC_PTR(SEISMIC_BUFFER_SCRATCH_ARRIVALS));
     if (!arrive::last(arrivals, ordered_tiles, &last))

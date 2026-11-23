@@ -473,6 +473,15 @@ const SHARED_ROW_PAIR_BYTES = 5
 # SM as registers allow, and RESIDENCY 1 or 2 states it, sharing an SM among
 # up to that many of its blocks (dense_up and dense_output ran 1, tuned over
 # 1 and 2, and restate it). Launch bounds are (256, 1) where nothing is stated.
+# An ordered segment's GEMV blocks (`ordered_gemv_block_rows`) take OTILE
+# weight rows each, an 8-lane group a row, derived from min(M, 2), the
+# ordered rows, and device.units as the largest power of two in 1..=32 at
+# most (min(M, 2) * ORDERED_ROWS) / device.units: at M = 1 this spreads the
+# ordered rows across the device's units (~1.5 waves); for M >= 2 it doubles
+# the tile so activation L2 re-reads halve while keeping ~0.75-1.0 wave of
+# blocks active across all SMs. Each lane's accumulation order is the row's
+# own whatever the tile, so OTILE changes no result bit and adds no tuning
+# parameter.
 projection dense for cuda:
     # Swap-AB GEMV serves up to 2 column blocks of 8 rows (`gemv` for 1..8,
     # `gemv16` for 9..16; `projection::GEMV_ROWS` in `projection.cuh`). Past
@@ -484,13 +493,22 @@ projection dense for cuda:
     let GEMV_ROWS = 16
     let ORDERED_ANY = min(1, sum(W, ORDERED))
     let ORDERED_ALL = sum(W, ORDERED) / WEIGHTS
-    let ORDERED_GEMV_SHARED = 256 + max(2, M) * 1024
     let GEMM_TILES = tiles(W, ceil_div(ceil_div(N, 16), 8))
     let ZSPLIT = 1 for paired
     let ZSPLIT = 1 + (SPLIT - 1) * min(1, 512 / M) for single
     let ZSPLIT = GEMM_SPLIT for segmented
     let OPERANDS = min(1, sum(W, operands(W)))
     let HALF_SM_SHARED = device.shared_bytes_per_unit / 2
+    let ORDERED_ROWS = tiles(W, ORDERED * N)
+    let ORDERED_RATIO = (min(M, 2) * ORDERED_ROWS) / device.units
+    let OTILE = 1 + min(1, ORDERED_RATIO / 2) + 2 * min(1, ORDERED_RATIO / 4) + 4 * min(1, ORDERED_RATIO / 8) + 8 * min(1, ORDERED_RATIO / 16) + 16 * min(1, ORDERED_RATIO / 32)
+    # The ordered GEMV block's dynamic shared memory: 256 bytes of row
+    # inverses, then a compile-time power-of-two chunk width (<= 1024) of
+    # F32 activations and OTILE weight rows (padded by 8 columns), capped at
+    # 25,856 bytes so segmented launches with static `GemvShared` keep 2+
+    # blocks per SM. Never less than 256 + max(2, M) * 1024 for inverses and
+    # the selecting tail's scratch.
+    let ORDERED_GEMV_SHARED = max(256 + max(2, M) * 1024, min(25856, 256 + 4 * ((M + OTILE) * 1024 + 8 * OTILE)))
     let DENSE_ALL = sum(W, min(1, dense_bytes(W))) / WEIGHTS
     let PACKED_ANY = 1 - DENSE_ALL
     let SEG_INT8_ANY = min(1, sum(W, min(1, N) * form(W, INT8))) for segmented
@@ -556,11 +574,11 @@ projection dense for cuda:
         threadgroups (M, 1, 1)
         threads_per_threadgroup (256, 1, 1)
     launch ordered_gemv when ORDERED_ALL == 1 and M <= VERIFY_ROWS:
-        threadgroups (tiles(W, ceil_div(N, 32)), 1, G)
+        threadgroups (tiles(W, ceil_div(N, OTILE)), 1, G)
         threads_per_threadgroup (256, 1, 1)
         shared_bytes (ORDERED_GEMV_SHARED)
     launch ordered_gemv for segmented when ORDERED_ANY == 1 and ORDERED_ALL == 0 and M <= VERIFY_ROWS:
-        threadgroups (tiles(W, ORDERED * ceil_div(N, 32) + (1 - ORDERED) * ceil_div(ceil_div(N, 16 * TPW), 8 / KSPLIT)), 1, G)
+        threadgroups (tiles(W, ORDERED * ceil_div(N, OTILE) + (1 - ORDERED) * ceil_div(ceil_div(N, 16 * TPW), 8 / KSPLIT)), 1, G)
         threads_per_threadgroup (256, 1, 1)
         shared_bytes (max(ORDERED_GEMV_SHARED, (1 - min(1, M - 1)) * K * SHARED_ROW_PAIR_BYTES / 2))
     launch ordered_gemm when ORDERED_ALL == 1 and M > VERIFY_ROWS:

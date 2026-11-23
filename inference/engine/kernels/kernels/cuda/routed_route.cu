@@ -41,7 +41,7 @@ extern "C" __global__ void routed_route_ordered_gemv(SEISMIC_KERNEL_PARAMS) {
     const Raw raw = MAKE_RAW;
     const element::Out<element::F32> logits_out = element::out_over_scratch<element::F32>(SEISMIC_PTR(SEISMIC_BUFFER_SCRATCH_LOGITS));
     const unsigned ordered_tiles = static_cast<unsigned>(
-        projection::op::ordered_gemv_segmented<true, SEISMIC_DIM_H>(
+        projection::op::ordered_gemv_segmented<true, SEISMIC_DIM_H, SEISMIC_DIM_E + 1>(
             reinterpret_cast<projection::u8 *>(dynamic_shared), raw, raw, nullptr, SEISMIC_RESULT_0_OUT,
             SEISMIC_RESULT_0_STRIDE_0, SEISMIC_RESULT_0_STRIDE_1, static_cast<unsigned>(SEISMIC_DIM_M),
             MAKE_SEGMENTS(logits_out), 0u));

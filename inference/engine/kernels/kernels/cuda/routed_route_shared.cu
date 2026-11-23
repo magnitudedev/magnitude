@@ -53,7 +53,7 @@ extern "C" __global__ void routed_route_shared_ordered_gemv(SEISMIC_KERNEL_PARAM
     const element::Out<element::F32> logits_out = element::out_over_scratch<element::F32>(SEISMIC_PTR(SEISMIC_BUFFER_SCRATCH_LOGITS));
     const Segments segs = MAKE_SEGMENTS(logits_out);
     const unsigned ordered_tiles = static_cast<unsigned>(
-        projection::op::ordered_gemv_segmented<true, SEISMIC_DIM_H, SEISMIC_TUNE_TPW, SEISMIC_TUNE_KSPLIT>(
+        projection::op::ordered_gemv_segmented<true, SEISMIC_DIM_H, SEISMIC_DIM_E + 1, SEISMIC_TUNE_TPW, SEISMIC_TUNE_KSPLIT>(
             reinterpret_cast<projection::u8 *>(dynamic_shared), raw, unord_pro,
             SEISMIC_PTR(SEISMIC_BUFFER_SCRATCH_STAGED), SEISMIC_RESULT_0_OUT, SEISMIC_RESULT_0_STRIDE_0,
             SEISMIC_RESULT_0_STRIDE_1, static_cast<unsigned>(SEISMIC_DIM_M), segs, 0u));

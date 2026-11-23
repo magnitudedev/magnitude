@@ -774,104 +774,229 @@ __device__ __forceinline__ void gemv_parts(const Row &row, const Rows &rows, flo
 namespace projection {
 namespace op {
 
-template <bool PUBLISH, u32 MAXM, class Pro, class WA, class Epi, class PubOut>
+// Weight rows an ordered GEMV block owns (`OTILE` in `dense.seismic`): the
+// largest power of two in 1..=32 at most `(min(M, 2) * ordered_rows) / device.units`.
+__host__ __device__ constexpr u32 ordered_tile_const(u32 m_scale, u64 ordered_rows) {
+    const u64 x = ((u64)m_scale * ordered_rows) / (u64)SEISMIC_DEVICE_UNITS;
+    if (x >= 32ull)
+        return 32u;
+    if (x >= 16ull)
+        return 16u;
+    if (x >= 8ull)
+        return 8u;
+    if (x >= 4ull)
+        return 4u;
+    if (x >= 2ull)
+        return 2u;
+    return 1u;
+}
+
+__device__ __forceinline__ u32 ordered_tile(u32 M, u64 ordered_rows) {
+    return ordered_tile_const(M <= 1u ? 1u : 2u, ordered_rows);
+}
+
+// Compile-time power-of-two chunk width in {128, 256, 512, 1024} such that
+// `256 + 4 * ((MAXM + OT) * WIDTH + 8 * OT) <= 25856` bytes (keeps dynamic
+// shared memory <= 25.2 KB so segmented launches with static `GemvShared`
+// maintain 2+ blocks/SM).
+__host__ __device__ constexpr u32 ordered_width(u32 maxm, u32 ot) {
+    constexpr u32 BUDGET = 6400u;
+    if ((maxm + ot) * 1024u + 8u * ot <= BUDGET)
+        return 1024u;
+    if ((maxm + ot) * 512u + 8u * ot <= BUDGET)
+        return 512u;
+    if ((maxm + ot) * 256u + 8u * ot <= BUDGET)
+        return 256u;
+    return 128u;
+}
+
+// One block of the ordered GEMV: `OT` weight rows (`local_tile * OT ..`), each
+// owned by an 8-lane group whose lane u accumulates columns u, u + 8, ... in
+// ascending order, combined by `ordered_combine8`. All 256 threads cooperate
+// to stage compile-time power-of-two `WIDTH`-column chunks of formed
+// activations and decoded weights (`row_packet8`) into dynamic shared memory
+// in rounds of 4, eliminating runtime divisions and overlapping global memory
+// latency while keeping each lane's accumulation order bit-identical.
+template <bool PUBLISH, u32 MAXM, u32 OT, class Pro, class WA, class Epi, class PubOut>
 __device__ __forceinline__ void ordered_gemv_block_rows(u8 *shared_raw, const Pro &pro, PubOut pub_out, u64 pub_s0,
                                                         u64 pub_s1, bool publish_rows, u32 M, u64 K, u64 N,
                                                         u64 local_tile, const WA &wa, const Epi &epi) {
+    static_assert(OT >= 1u && OT <= 32u && (OT & (OT - 1u)) == 0u, "OT must be a power of two in 1..=32");
+    constexpr u32 THREADS = 256u;
+    constexpr u32 WIDTH = ordered_width(MAXM, OT);
+    constexpr u32 WIDTH4 = WIDTH >> 2u;
+    constexpr u32 PACKETS = WIDTH >> 5u;
+    constexpr u32 PITCH = WIDTH + 8u;
+    constexpr u32 ITEMS = OT * PACKETS * 8u;
+    constexpr u32 ROUND_W = (ITEMS <= THREADS) ? 1u : ((ITEMS <= 2u * THREADS) ? 2u : 4u);
+    constexpr u32 ROUND_X = 2u;
+    require_dynamic_shared(256ull + 4ull * ((u64)(M + OT) * WIDTH + 8ull * OT));
     float *smem_inv = reinterpret_cast<float *>(shared_raw);
-    float *smem_x = reinterpret_cast<float *>(shared_raw + 256);
+    float *smem_data = reinterpret_cast<float *>(shared_raw + 256);
     const u32 tid = threadIdx.x;
     const u32 group_id = tid / 8u;
     const u32 u = tid & 7u;
-    constexpr u32 GROUPS = 32u;
-    pro.ordered_inverses(M, smem_inv, 0u, smem_x);
-    const u64 w_row = local_tile * GROUPS + group_id;
+    pro.ordered_inverses(M, smem_inv, 0u, smem_data);
+    float *smem_x = smem_data;
+    float *smem_w = smem_data + M * WIDTH;
+    const u64 tile_row = local_tile * OT;
+    const u64 w_row = tile_row + group_id;
+    const bool computes = group_id < OT && w_row < N;
     float acc[MAXM];
 #pragma unroll
     for (u32 r = 0; r < MAXM; ++r)
         acc[r] = 0.0f;
-    for (u64 k0 = 0; k0 < K; k0 += 256) {
-        const u32 chunk = (u32)min(256ull, K - k0);
-        const u32 chunk4 = chunk >> 2u;
-        const u32 tail0 = chunk4 << 2u;
-        const u32 row_step = blockDim.x >> 6u;
-        const u32 r0 = tid >> 6u;
-        const u32 c4 = tid & 63u;
-        for (u32 r = r0; r < M; r += row_step) {
-            const float inv = smem_inv[r];
-            float *dst_row = smem_x + r * 256u;
-            if (pro.can_vec4(r)) {
-                if (c4 < chunk4) {
-                    const u32 c = c4 << 2u;
+    for (u64 k0 = 0; k0 < K; k0 += WIDTH) {
+        if (k0 + WIDTH <= K) {
+            if constexpr (MAXM == 1u) {
+                if (tid < WIDTH4) {
+                    const u32 c = tid << 2u;
                     float vals[4];
-                    pro.ordered_at4(r, k0 + c, inv, vals);
-                    reinterpret_cast<float4 *>(dst_row)[c4] = make_float4(vals[0], vals[1], vals[2], vals[3]);
+                    if (pro.can_vec4(0u)) {
+                        pro.ordered_at4(0u, k0 + c, smem_inv[0], vals);
+                    } else {
+#pragma unroll
+                        for (u32 j = 0u; j < 4u; ++j)
+                            vals[j] = pro.ordered_at(0u, k0 + c + j, smem_inv[0]);
+                    }
+                    *reinterpret_cast<float4 *>(smem_x + c) = make_float4(vals[0], vals[1], vals[2], vals[3]);
                     if constexpr (PUBLISH) {
                         if (publish_rows) {
                             if (pub_s1 == 1ull) {
-                                pub_out.template put_span<4>((u64)r * pub_s0 + k0 + c, vals);
+                                pub_out.template put_span<4>(k0 + c, vals);
                             } else {
-#pragma unroll
                                 for (u32 j = 0u; j < 4u; ++j)
-                                    pub_out.put((u64)r * pub_s0 + (k0 + c + j) * pub_s1, vals[j]);
+                                    pub_out.put((k0 + c + j) * pub_s1, vals[j]);
                             }
                         }
-                    }
-                }
-                if (c4 < chunk - tail0) {
-                    const u32 c = tail0 + c4;
-                    const float val = pro.ordered_at(r, k0 + c, inv);
-                    dst_row[c] = val;
-                    if constexpr (PUBLISH) {
-                        if (publish_rows)
-                            pub_out.put((u64)r * pub_s0 + (k0 + c) * pub_s1, val);
                     }
                 }
             } else {
-                for (u32 c = c4; c < chunk; c += 64u) {
-                    const float val = pro.ordered_at(r, k0 + c, inv);
-                    dst_row[c] = val;
-                    if constexpr (PUBLISH) {
-                        if (publish_rows)
-                            pub_out.put((u64)r * pub_s0 + (k0 + c) * pub_s1, val);
-                    }
-                }
-            }
-        }
-        __syncthreads();
-        if (w_row < N) {
-            const u32 packets = (chunk + 31u) / 32u;
-            for (u32 p = 0; p < packets; ++p) {
-                float wv[4];
-                packets::row_packet8(wa, w_row, N, k0 / 32 + p, K, u, wv);
-                if (chunk == 256u) {
+                const u32 total4 = M * WIDTH4;
+                for (u32 base = 0; base < total4; base += ROUND_X * THREADS) {
+                    float vals[ROUND_X][4];
 #pragma unroll
-                    for (u32 s = 0; s < 4u; ++s) {
-                        const u32 col = 32u * p + 8u * s + u;
-#pragma unroll
-                        for (u32 r = 0; r < MAXM; ++r) {
-                            if (r < M)
-                                acc[r] = seismic_fma_rn(smem_x[r * 256u + col], wv[s], acc[r]);
+                    for (u32 b = 0; b < ROUND_X; ++b) {
+                        const u32 i = base + b * THREADS + tid;
+                        if (i < total4) {
+                            const u32 r = i / WIDTH4;
+                            const u32 c = (i & (WIDTH4 - 1u)) << 2u;
+                            if (pro.can_vec4(r)) {
+                                pro.ordered_at4(r, k0 + c, smem_inv[r], vals[b]);
+                            } else {
+                                for (u32 j = 0u; j < 4u; ++j)
+                                    vals[b][j] = pro.ordered_at(r, k0 + c + j, smem_inv[r]);
+                            }
                         }
                     }
-                } else {
 #pragma unroll
-                    for (u32 s = 0; s < 4u; ++s) {
-                        const u32 col = 32u * p + 8u * s + u;
-                        if (col < chunk) {
-#pragma unroll
-                            for (u32 r = 0; r < MAXM; ++r) {
-                                if (r < M)
-                                    acc[r] = seismic_fma_rn(smem_x[r * 256u + col], wv[s], acc[r]);
+                    for (u32 b = 0; b < ROUND_X; ++b) {
+                        const u32 i = base + b * THREADS + tid;
+                        if (i < total4) {
+                            const u32 r = i / WIDTH4;
+                            const u32 c = (i & (WIDTH4 - 1u)) << 2u;
+                            *reinterpret_cast<float4 *>(smem_x + r * WIDTH + c) =
+                                make_float4(vals[b][0], vals[b][1], vals[b][2], vals[b][3]);
+                            if constexpr (PUBLISH) {
+                                if (publish_rows) {
+                                    if (pub_s1 == 1ull) {
+                                        pub_out.template put_span<4>((u64)r * pub_s0 + k0 + c, vals[b]);
+                                    } else {
+                                        for (u32 j = 0u; j < 4u; ++j)
+                                            pub_out.put((u64)r * pub_s0 + (k0 + c + j) * pub_s1, vals[b][j]);
+                                    }
+                                }
                             }
                         }
                     }
                 }
             }
+            for (u32 base = 0; base < ITEMS; base += ROUND_W * THREADS) {
+                float wv[ROUND_W][4];
+#pragma unroll
+                for (u32 b = 0; b < ROUND_W; ++b) {
+                    const u32 i = base + b * THREADS + tid;
+                    if (i < ITEMS) {
+                        const u32 wr = (i >> 3u) / PACKETS;
+                        const u32 pkt = (i >> 3u) & (PACKETS - 1u);
+                        if (tile_row + wr < N)
+                            packets::row_packet8(wa, tile_row + wr, N, (k0 >> 5u) + pkt, K, i & 7u, wv[b]);
+                    }
+                }
+#pragma unroll
+                for (u32 b = 0; b < ROUND_W; ++b) {
+                    const u32 i = base + b * THREADS + tid;
+                    if (i < ITEMS) {
+                        const u32 wr = (i >> 3u) / PACKETS;
+                        const u32 pkt = (i >> 3u) & (PACKETS - 1u);
+                        if (tile_row + wr < N) {
+                            float *row = smem_w + wr * PITCH + (pkt << 5u) + (i & 7u);
+#pragma unroll
+                            for (u32 s = 0; s < 4u; ++s)
+                                row[8u * s] = wv[b][s];
+                        }
+                    }
+                }
+            }
+            __syncthreads();
+            if (computes) {
+                const float *w = smem_w + group_id * PITCH;
+                if constexpr (MAXM == 1u) {
+#pragma unroll 4
+                    for (u32 col = u; col < WIDTH; col += 8u)
+                        acc[0] = seismic_fma_rn(smem_x[col], w[col], acc[0]);
+                } else {
+                    for (u32 col = u; col < WIDTH; col += 8u) {
+                        const float wv = w[col];
+#pragma unroll
+                        for (u32 r = 0; r < MAXM; ++r) {
+                            if (r < M)
+                                acc[r] = seismic_fma_rn(smem_x[r * WIDTH + col], wv, acc[r]);
+                        }
+                    }
+                }
+            }
+        } else {
+            const u32 chunk = (u32)(K - k0);
+            for (u32 i = tid; i < M * chunk; i += THREADS) {
+                const u32 r = i / chunk;
+                const u32 c = i - r * chunk;
+                const float val = pro.ordered_at(r, k0 + c, smem_inv[r]);
+                smem_x[r * WIDTH + c] = val;
+                if constexpr (PUBLISH) {
+                    if (publish_rows)
+                        pub_out.put((u64)r * pub_s0 + (k0 + c) * pub_s1, val);
+                }
+            }
+            const u32 packets = (chunk + 31u) / 32u;
+            const u32 items = OT * packets * 8u;
+            for (u32 i = tid; i < items; i += THREADS) {
+                const u32 wr = (i >> 3u) / packets;
+                const u32 pkt = (i >> 3u) % packets;
+                if (tile_row + wr < N) {
+                    float wv[4];
+                    packets::row_packet8(wa, tile_row + wr, N, (k0 >> 5u) + pkt, K, i & 7u, wv);
+                    float *row = smem_w + wr * PITCH + (pkt << 5u) + (i & 7u);
+                    for (u32 s = 0; s < 4u; ++s)
+                        row[8u * s] = wv[s];
+                }
+            }
+            __syncthreads();
+            if (computes) {
+                const float *w = smem_w + group_id * PITCH;
+                for (u32 col = u; col < chunk; col += 8u) {
+                    const float wv = w[col];
+                    for (u32 r = 0; r < MAXM; ++r) {
+                        if (r < M)
+                            acc[r] = seismic_fma_rn(smem_x[r * WIDTH + col], wv, acc[r]);
+                    }
+                }
+            }
         }
-        __syncthreads();
+        if (k0 + WIDTH < K)
+            __syncthreads();
     }
-    if (w_row < N) {
+    if (computes) {
 #pragma unroll
         for (u32 r = 0; r < MAXM; ++r) {
             if (r < M) {
@@ -883,25 +1008,27 @@ __device__ __forceinline__ void ordered_gemv_block_rows(u8 *shared_raw, const Pr
     }
 }
 
-template <bool PUBLISH, class Pro, class WA, class Epi, class PubOut>
+template <bool PUBLISH, u64 ORDERED_ROWS, class Pro, class WA, class Epi, class PubOut>
 __device__ __forceinline__ void ordered_gemv_block(u8 *shared_raw, const Pro &pro, PubOut pub_out, u64 pub_s0,
-                                                   u64 pub_s1, bool publish_rows, u32 M, u64 K, u64 N, u64 local_tile,
-                                                   const WA &wa, const Epi &epi) {
+                                                   u64 pub_s1, bool publish_rows, u32 M, u64 K, u64 N,
+                                                   u64 local_tile, const WA &wa, const Epi &epi) {
+    constexpr u32 OT1 = ordered_tile_const(1u, ORDERED_ROWS);
+    constexpr u32 OT2 = ordered_tile_const(2u, ORDERED_ROWS);
     if (M <= 1u)
-        ordered_gemv_block_rows<PUBLISH, 1u>(shared_raw, pro, pub_out, pub_s0, pub_s1, publish_rows, M, K, N,
-                                             local_tile, wa, epi);
+        ordered_gemv_block_rows<PUBLISH, 1u, OT1>(shared_raw, pro, pub_out, pub_s0, pub_s1, publish_rows, M, K, N,
+                                                  local_tile, wa, epi);
     else if (M <= 2u)
-        ordered_gemv_block_rows<PUBLISH, 2u>(shared_raw, pro, pub_out, pub_s0, pub_s1, publish_rows, M, K, N,
-                                             local_tile, wa, epi);
+        ordered_gemv_block_rows<PUBLISH, 2u, OT2>(shared_raw, pro, pub_out, pub_s0, pub_s1, publish_rows, M, K, N,
+                                                  local_tile, wa, epi);
     else if (M <= 4u)
-        ordered_gemv_block_rows<PUBLISH, 4u>(shared_raw, pro, pub_out, pub_s0, pub_s1, publish_rows, M, K, N,
-                                             local_tile, wa, epi);
+        ordered_gemv_block_rows<PUBLISH, 4u, OT2>(shared_raw, pro, pub_out, pub_s0, pub_s1, publish_rows, M, K, N,
+                                                  local_tile, wa, epi);
     else if (M <= 8u)
-        ordered_gemv_block_rows<PUBLISH, 8u>(shared_raw, pro, pub_out, pub_s0, pub_s1, publish_rows, M, K, N,
-                                             local_tile, wa, epi);
+        ordered_gemv_block_rows<PUBLISH, 8u, OT2>(shared_raw, pro, pub_out, pub_s0, pub_s1, publish_rows, M, K, N,
+                                                  local_tile, wa, epi);
     else
-        ordered_gemv_block_rows<PUBLISH, 16u>(shared_raw, pro, pub_out, pub_s0, pub_s1, publish_rows, M, K, N,
-                                              local_tile, wa, epi);
+        ordered_gemv_block_rows<PUBLISH, 16u, OT2>(shared_raw, pro, pub_out, pub_s0, pub_s1, publish_rows, M, K, N,
+                                                   local_tile, wa, epi);
 }
 
 template <class WA, class Epi>
@@ -1061,10 +1188,12 @@ __device__ __forceinline__ void ordered_gemm_block(u8 *shared_raw, const u8 *row
     }
 }
 
-template <int I, bool PUBLISH, unsigned TPW, unsigned KSPLIT, class ProFn, class UnordPro, class PubOut, class Segments>
+template <int I, bool PUBLISH, u64 ORDERED_ROWS, unsigned TPW, unsigned KSPLIT, class ProFn, class UnordPro, class PubOut,
+          class Segments>
 __device__ __forceinline__ void ordered_gemv_segment_of(u8 *shared_raw, const ProFn &pro_fn, const UnordPro &unord_pro,
                                                         const u8 *staged, PubOut pub_out, u64 pub_s0, u64 pub_s1,
-                                                        bool publish_rows, u32 M, u64 K, u64 local, const Segments &s) {
+                                                        bool publish_rows, u32 M, u64 K, u64 local,
+                                                        const Segments &s) {
     constexpr int A = first_weight<Segments, I>();
     if constexpr (Segments::served(I) == 2) {
         constexpr int ORDERED_NB = (SEISMIC_CONST_VERIFY_ROWS + 7) / 8;
@@ -1085,12 +1214,13 @@ __device__ __forceinline__ void ordered_gemv_segment_of(u8 *shared_raw, const Pr
                                       M, K / 64, group, s.rows[I], weight_of<A>(s), weight_of<A + 1>(s),
                                       out_of<I>(s));
     } else {
-        ordered_gemv_block<PUBLISH>(shared_raw, pro_fn(SegmentIndex<I>{}), pub_out, pub_s0, pub_s1, publish_rows, M, K,
-                                    s.rows[I], local, weight_of<A>(s), out_of<I>(s));
+        ordered_gemv_block<PUBLISH, ORDERED_ROWS>(shared_raw, pro_fn(SegmentIndex<I>{}), pub_out, pub_s0, pub_s1,
+                                                  publish_rows, M, K, s.rows[I], local, weight_of<A>(s), out_of<I>(s));
     }
 }
 
-template <int I, bool PUBLISH, unsigned TPW, unsigned KSPLIT, class ProFn, class UnordPro, class PubOut, class Segments>
+template <int I, bool PUBLISH, u64 ORDERED_ROWS, unsigned TPW, unsigned KSPLIT, class ProFn, class UnordPro, class PubOut,
+          class Segments>
 __device__ __forceinline__ void ordered_gemv_segmented_dispatch(u8 *shared_raw, const ProFn &pro_fn,
                                                                 const UnordPro &unord_pro, const u8 *staged,
                                                                 PubOut pub_out, u64 pub_s0, u64 pub_s1, bool pub,
@@ -1099,17 +1229,17 @@ __device__ __forceinline__ void ordered_gemv_segmented_dispatch(u8 *shared_raw, 
     if constexpr (I < Segments::COUNT) {
         if (segment == I) {
             if constexpr (!Segments::empty(I))
-                ordered_gemv_segment_of<I, PUBLISH, TPW, KSPLIT>(shared_raw, pro_fn, unord_pro, staged, pub_out,
-                                                                 pub_s0, pub_s1, pub, M, K, local, s);
+                ordered_gemv_segment_of<I, PUBLISH, ORDERED_ROWS, TPW, KSPLIT>(
+                    shared_raw, pro_fn, unord_pro, staged, pub_out, pub_s0, pub_s1, pub, M, K, local, s);
             return;
         }
-        ordered_gemv_segmented_dispatch<I + 1, PUBLISH, TPW, KSPLIT>(shared_raw, pro_fn, unord_pro, staged, pub_out,
-                                                                     pub_s0, pub_s1, pub, M, K, local, segment, s);
+        ordered_gemv_segmented_dispatch<I + 1, PUBLISH, ORDERED_ROWS, TPW, KSPLIT>(
+            shared_raw, pro_fn, unord_pro, staged, pub_out, pub_s0, pub_s1, pub, M, K, local, segment, s);
     }
 }
 
-template <bool PUBLISH, u64 K, unsigned TPW = 1, unsigned KSPLIT = 1, class ProFn, class UnordPro, class PubOut,
-          class Segments>
+template <bool PUBLISH, u64 K, u64 ORDERED_ROWS, unsigned TPW = 1, unsigned KSPLIT = 1, class ProFn, class UnordPro,
+          class PubOut, class Segments>
 __device__ __forceinline__ u64 ordered_gemv_segmented_each(u8 *shared_raw, const ProFn &pro_fn,
                                                            const UnordPro &unord_pro, const u8 *staged, PubOut pub_out,
                                                            u64 pub_s0, u64 pub_s1, u32 M, const Segments &s,
@@ -1120,11 +1250,12 @@ __device__ __forceinline__ u64 ordered_gemv_segmented_each(u8 *shared_raw, const
                              SEISMIC_SEGMENT_ORDERED_2 != 0, SEISMIC_SEGMENT_ORDERED_3 != 0,
                              SEISMIC_SEGMENT_ORDERED_4 != 0, SEISMIC_SEGMENT_ORDERED_5 != 0,
                              SEISMIC_SEGMENT_ORDERED_6 != 0, SEISMIC_SEGMENT_ORDERED_7 != 0};
+    const u32 ot = ordered_tile(M, ORDERED_ROWS);
     u64 tiles[Segments::COUNT];
     u64 ordered_tiles = 0;
 #pragma unroll
     for (int i = 0; i < Segments::COUNT; ++i) {
-        const u64 per = seg_ord[i] ? 32ull : UNORD_PER;
+        const u64 per = seg_ord[i] ? (u64)ot : UNORD_PER;
         tiles[i] = (s.rows[i] + per - 1ull) / per;
         if (seg_ord[i])
             ordered_tiles += tiles[i];
@@ -1132,13 +1263,13 @@ __device__ __forceinline__ u64 ordered_gemv_segmented_each(u8 *shared_raw, const
     u64 local = blockIdx.x;
     const int segment = locate_segment(local, tiles);
     if constexpr (Segments::ZEROES) if ((zero_mask & (1u << segment)) != 0u) {
-        const u32 per = seg_ord[segment] ? 32u : static_cast<u32>(UNORD_PER);
+        const u32 per = seg_ord[segment] ? ot : static_cast<u32>(UNORD_PER);
         zero_segment(s, segment, M, 0, M, local * per, per, threadIdx.x, blockDim.x);
         return ordered_tiles;
     }
     const bool pub = blockIdx.x == 0;
-    ordered_gemv_segmented_dispatch<0, PUBLISH, TPW, KSPLIT>(shared_raw, pro_fn, unord_pro, staged, pub_out, pub_s0,
-                                                             pub_s1, pub, M, K, local, segment, s);
+    ordered_gemv_segmented_dispatch<0, PUBLISH, ORDERED_ROWS, TPW, KSPLIT>(
+        shared_raw, pro_fn, unord_pro, staged, pub_out, pub_s0, pub_s1, pub, M, K, local, segment, s);
     return ordered_tiles;
 }
 
@@ -1147,13 +1278,14 @@ template <class Pro> struct SamePro {
     template <class Tag> __device__ __forceinline__ const Pro &operator()(Tag) const { return pro; }
 };
 
-template <bool PUBLISH, u64 K, unsigned TPW = 1, unsigned KSPLIT = 1, class Pro, class UnordPro, class PubOut,
-          class Segments>
+template <bool PUBLISH, u64 K, u64 ORDERED_ROWS, unsigned TPW = 1, unsigned KSPLIT = 1, class Pro, class UnordPro,
+          class PubOut, class Segments>
 __device__ __forceinline__ u64 ordered_gemv_segmented(u8 *shared_raw, const Pro &pro, const UnordPro &unord_pro,
                                                       const u8 *staged, PubOut pub_out, u64 pub_s0, u64 pub_s1, u32 M,
                                                       const Segments &s, unsigned zero_mask) {
-    return ordered_gemv_segmented_each<PUBLISH, K, TPW, KSPLIT>(shared_raw, SamePro<Pro>{pro}, unord_pro,
-                                                                staged, pub_out, pub_s0, pub_s1, M, s, zero_mask);
+    return ordered_gemv_segmented_each<PUBLISH, K, ORDERED_ROWS, TPW, KSPLIT>(shared_raw, SamePro<Pro>{pro}, unord_pro,
+                                                                              staged, pub_out, pub_s0, pub_s1, M, s,
+                                                                              zero_mask);
 }
 
 template <int I, class Segments>

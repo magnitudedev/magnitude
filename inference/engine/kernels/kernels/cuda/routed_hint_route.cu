@@ -43,7 +43,7 @@ extern "C" __global__ void routed_hint_route_ordered_gemv(SEISMIC_KERNEL_PARAMS)
                         {LogitStore{logits0, SEISMIC_DIM_EN, 0}, LogitStore{logits1, SEISMIC_DIM_EN, 0}}};
     const unsigned zero_mask = SEISMIC_DIM_AHEAD < 2 ? 2u : 0u;
     const unsigned ordered_tiles = static_cast<unsigned>(
-        projection::op::ordered_gemv_segmented_each<false, SEISMIC_DIM_H>(
+        projection::op::ordered_gemv_segmented_each<false, SEISMIC_DIM_H, 2 * SEISMIC_DIM_EN>(
             reinterpret_cast<projection::u8 *>(dynamic_shared), HintPro{raw0, raw1}, raw0, nullptr,
             element::Out<activation::Act>(nullptr), 0, 1, m, segs, zero_mask));
     __shared__ unsigned last;

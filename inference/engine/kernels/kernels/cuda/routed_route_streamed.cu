@@ -58,7 +58,7 @@ extern "C" __global__ void routed_route_streamed_ordered_gemv(SEISMIC_KERNEL_PAR
     const element::Out<element::F32> logits_out = element::out_over_scratch<element::F32>(SEISMIC_PTR(SEISMIC_BUFFER_SCRATCH_LOGITS));
     const Segments segs = MAKE_SEGMENTS(logits_out);
     const unsigned ordered_tiles = static_cast<unsigned>(
-        projection::op::ordered_gemv_segmented<true, SEISMIC_DIM_H, SEISMIC_TUNE_TPW, SEISMIC_TUNE_KSPLIT>(
+        projection::op::ordered_gemv_segmented<true, SEISMIC_DIM_H, SEISMIC_DIM_E + 1, SEISMIC_TUNE_TPW, SEISMIC_TUNE_KSPLIT>(
             reinterpret_cast<projection::u8 *>(dynamic_shared), raw, unord_pro,
             SEISMIC_PTR(SEISMIC_BUFFER_SCRATCH_STAGED), SEISMIC_RESULT_0_OUT, SEISMIC_RESULT_0_STRIDE_0,
             SEISMIC_RESULT_0_STRIDE_1, static_cast<unsigned>(SEISMIC_DIM_M), segs, 0u));
@@ -81,25 +81,56 @@ extern "C" __global__ void routed_route_streamed_ordered_gemv(SEISMIC_KERNEL_PAR
     const ResolvePorts bank =
         ROUTED_RESOLVE_PORTS(SEISMIC_OUT_SCORES.stored(), SEISMIC_SCORES_STRIDE_0, SEISMIC_SCORES_STRIDE_1);
     routed_resolve(bank, false, words, seismic_words_value);
-    if (SEISMIC_DIM_SF > 0) {
+    if (SEISMIC_DIM_SF > 0 && SEISMIC_PARAM_SITED != 0) {
         __syncthreads();
         if (SEISMIC_PARAM_SITED == 2 || bank.land_grid[0] == 0) {
             const unsigned choices = static_cast<unsigned>(SEISMIC_DIM_M) * static_cast<unsigned>(SEISMIC_DIM_K);
-            if (streaming_site_any(bank.sources, SEISMIC_SOURCES_STRIDE_0, SEISMIC_SOURCES_STRIDE_1,
-                    SEISMIC_SOURCES_STRIDE_2, choices)) {
+            __shared__ unsigned any_sited;
+            if (threadIdx.x == 0)
+                any_sited = 0u;
+            __syncthreads();
+            bool local_sited = false;
+            for (unsigned c = threadIdx.x; c < choices; c += blockDim.x) {
+                if (streaming_site_choice(bank.sources, SEISMIC_SOURCES_STRIDE_0, SEISMIC_SOURCES_STRIDE_1,
+                        SEISMIC_SOURCES_STRIDE_2, c))
+                    local_sited = true;
+            }
+            if (__any_sync(0xffffffffu, local_sited) && (threadIdx.x & 31u) == 0u)
+                atomicOr(&any_sited, 1u);
+            __syncthreads();
+            if (any_sited != 0u) {
                 const u64 q = streaming_step(bank.step, SEISMIC_STEP_STRIDE_0);
                 const u64 slot = q % (u64)SEISMIC_DIM_SF;
                 using A = ELEMENT_OF(SEISMIC_ELEMENT_A);
                 const typename A::storage *norm =
                     reinterpret_cast<const typename A::storage *>(SEISMIC_RESULT_0_OUT.stored());
                 const element::Out<element::F32> rows = SEISMIC_OUT_SITE_ROWS;
-                const u64 count = SEISMIC_DIM_M * SEISMIC_DIM_H;
-                for (u64 i = threadIdx.x; i < count; i += blockDim.x) {
-                    const u64 m = i / SEISMIC_DIM_H, n = i % SEISMIC_DIM_H;
-                    rows.put_system(slot * SEISMIC_SITE_ROWS_STRIDE_0 + m * SEISMIC_SITE_ROWS_STRIDE_1
-                                        + n * SEISMIC_SITE_ROWS_STRIDE_2,
-                                    A::load(__ldcg(norm + m * SEISMIC_RESULT_0_STRIDE_0
-                                                   + n * SEISMIC_RESULT_0_STRIDE_1)));
+                float *site_base = reinterpret_cast<float *>(const_cast<element::u8 *>(rows.stored(slot * SEISMIC_SITE_ROWS_STRIDE_0)));
+                if (SEISMIC_SITE_ROWS_STRIDE_2 == 1ull && SEISMIC_RESULT_0_STRIDE_1 == 1ull
+                    && (SEISMIC_DIM_H & 3ull) == 0ull && (SEISMIC_SITE_ROWS_STRIDE_1 & 3ull) == 0ull
+                    && (reinterpret_cast<u64>(site_base) & 15ull) == 0ull) {
+                    const u64 h4 = SEISMIC_DIM_H >> 2ull;
+                    const u64 count4 = SEISMIC_DIM_M * h4;
+                    for (u64 i = threadIdx.x; i < count4; i += blockDim.x) {
+                        const u64 m = i / h4, n4 = (i % h4) << 2ull;
+                        const typename A::storage *src = norm + m * SEISMIC_RESULT_0_STRIDE_0 + n4;
+                        const float v0 = A::load(__ldcg(src + 0));
+                        const float v1 = A::load(__ldcg(src + 1));
+                        const float v2 = A::load(__ldcg(src + 2));
+                        const float v3 = A::load(__ldcg(src + 3));
+                        float *dst = site_base + m * SEISMIC_SITE_ROWS_STRIDE_1 + n4;
+                        asm volatile("st.relaxed.sys.global.v4.f32 [%0], {%1, %2, %3, %4};"
+                                     :: "l"(dst), "f"(v0), "f"(v1), "f"(v2), "f"(v3) : "memory");
+                    }
+                } else {
+                    const u64 count = SEISMIC_DIM_M * SEISMIC_DIM_H;
+                    for (u64 i = threadIdx.x; i < count; i += blockDim.x) {
+                        const u64 m = i / SEISMIC_DIM_H, n = i % SEISMIC_DIM_H;
+                        rows.put_system(slot * SEISMIC_SITE_ROWS_STRIDE_0 + m * SEISMIC_SITE_ROWS_STRIDE_1
+                                            + n * SEISMIC_SITE_ROWS_STRIDE_2,
+                                        A::load(__ldcg(norm + m * SEISMIC_RESULT_0_STRIDE_0
+                                                       + n * SEISMIC_RESULT_0_STRIDE_1)));
+                    }
                 }
                 streaming_publish_barrier();
                 if (threadIdx.x == 0) {
