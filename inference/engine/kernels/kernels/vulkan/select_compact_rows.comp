@@ -1,0 +1,166 @@
+// select_compact_rows: fused single-launch shortlist selection + softmax
+// confidence directly over `[M, S]` compact scores and canonical `token_rows`.
+// One 64-thread workgroup per row with shared-memory tree reduction
+// (independent of subgroup size).
+#include <seismic/element.glsl>
+
+#define COMPACT_NO_TOKEN 0xffffffffu
+#define COMPACT_INF uintBitsToFloat(0x7f800000u)
+
+bool compact_better(float score, uint token, float best_score, uint best_token) {
+    return token != COMPACT_NO_TOKEN
+        && (best_token == COMPACT_NO_TOKEN || score > best_score || (score == best_score && token < best_token));
+}
+
+float compact_gumbel_score(float value, uint token, uint k0, uint k1, uint c1, uint c2, uint c3) {
+    uint c0 = token;
+    [[unroll]] for (int round = 0; round < 10; ++round) {
+        uint hi0, lo0, hi1, lo1;
+        umulExtended(3528531795u, c0, hi0, lo0);
+        umulExtended(3449720151u, c2, hi1, lo1);
+        const uint next0 = hi1 ^ c1 ^ k0;
+        const uint next2 = hi0 ^ c3 ^ k1;
+        c0 = next0;
+        c1 = lo1;
+        c2 = next2;
+        c3 = lo0;
+        k0 += 2654435769u;
+        k1 += 3144134277u;
+    }
+    const float draw_uniform = (float(c0 >> 9) + 0.5) * 0.00000011920928955078125;
+    return value - log(-log(draw_uniform));
+}
+
+void compact_sm_add(float x, inout float local_max, inout float local_sum) {
+    if (x > local_max) {
+        local_sum = (local_sum != 0.0 ? local_sum * exp(local_max - x) : 0.0) + 1.0;
+        local_max = x;
+    } else if (x != -COMPACT_INF) {
+        local_sum += exp(x - local_max);
+    }
+}
+
+void compact_sm_merge(float other_max, float other_sum, inout float local_max, inout float local_sum) {
+    if (other_sum == 0.0)
+        return;
+    if (local_sum == 0.0) {
+        local_max = other_max;
+        local_sum = other_sum;
+        return;
+    }
+    if (other_max > local_max) {
+        local_sum = local_sum * exp(local_max - other_max) + other_sum;
+        local_max = other_max;
+    } else {
+        local_sum += other_sum * exp(other_max - local_max);
+    }
+}
+
+// Shared layout (1536 bytes = 384 words):
+//   [0..64)    score (f32)
+//   [64..128)  logit (f32)
+//   [128..192) token (u32)
+//   [192..256) bad (u32)
+//   [256..320) sm_max (f32)
+//   [320..384) sm_sum (f32)
+void select_compact_rows() {
+    const uint64_t scores = SEISMIC_PTR(SEISMIC_BUFFER_SCORES);
+    const uint64_t token_rows = SEISMIC_PTR(SEISMIC_BUFFER_TOKEN_ROWS);
+    const uint64_t mask = SEISMIC_PTR(SEISMIC_BUFFER_MASK);
+    const uint64_t draws = SEISMIC_PTR(SEISMIC_BUFFER_DRAWS);
+    const uint64_t result = SEISMIC_PTR(SEISMIC_BUFFER_RESULT);
+    const Out confidence = SEISMIC_OUT_CONFIDENCE;
+
+    const uint64_t row = uint64_t(gl_WorkGroupID.x);
+    const uint tid = SEISMIC_THREAD;
+    const uint64_t W = SEISMIC_DIM_W;
+    const uint64_t S = SEISMIC_DIM_S;
+
+    const uint64_t score_row = scores + row * SEISMIC_SCORES_STRIDE_0 * 4ul;
+    const uint64_t tok_row = token_rows + row * SEISMIC_TOKEN_ROWS_STRIDE_0 * 4ul;
+    const uint64_t bits = mask + row * SEISMIC_MASK_STRIDE_0 * 4ul;
+    const uint64_t draw = draws + row * SEISMIC_DRAWS_STRIDE_0 * 4ul;
+
+    const bool masked =
+        element_i32_index(SEISMIC_PTR(SEISMIC_BUFFER_CONSTRAINED), row * SEISMIC_CONSTRAINED_STRIDE_0) != 0;
+    const bool noisy = element_u32_at(draw) == 1u;
+    const uint64_t draw_step = SEISMIC_DRAWS_STRIDE_1 * 4ul;
+    const uint k0 = noisy ? element_u32_at(draw + draw_step) : 0u;
+    const uint k1 = noisy ? element_u32_at(draw + 2ul * draw_step) : 0u;
+    const uint c1 = noisy ? element_u32_at(draw + 3ul * draw_step) : 0u;
+    const uint c2 = noisy ? element_u32_at(draw + 4ul * draw_step) : 0u;
+    const uint c3 = noisy ? element_u32_at(draw + 5ul * draw_step) : 0u;
+
+    float best_score = -COMPACT_INF;
+    float best_logit = -COMPACT_INF;
+    uint best_token = COMPACT_NO_TOKEN;
+    uint bad = 0u;
+    float sm_max = -COMPACT_INF;
+    float sm_sum = 0.0;
+
+    for (uint64_t col = uint64_t(tid); col < S; col += 64ul) {
+        const int raw_token = element_i32_at(tok_row + col * SEISMIC_TOKEN_ROWS_STRIDE_1 * 4ul);
+        if (raw_token < 0 || (uint64_t(raw_token) >> 5u) >= W)
+            continue;
+        const uint token = uint(raw_token);
+        const float value = element_f32_at(score_row + col * SEISMIC_SCORES_STRIDE_1 * 4ul);
+        bad |= (isnan(value) || value == COMPACT_INF) ? 1u : 0u;
+        compact_sm_add(value, sm_max, sm_sum);
+        if (!(value > -COMPACT_INF && value < COMPACT_INF))
+            continue;
+        if (masked && ((element_u32_at(bits + uint64_t(token >> 5u) * SEISMIC_MASK_STRIDE_1 * 4ul) >> (token & 31u)) & 1u) == 0u)
+            continue;
+        const float candidate = noisy ? compact_gumbel_score(value, token, k0, k1, c1, c2, c3) : value;
+        if (compact_better(candidate, token, best_score, best_token)) {
+            best_score = candidate;
+            best_logit = value;
+            best_token = token;
+        }
+    }
+
+    seismic_shared_f32[tid] = best_score;
+    seismic_shared_f32[64u + tid] = best_logit;
+    seismic_shared_u32[128u + tid] = best_token;
+    seismic_shared_u32[192u + tid] = bad;
+    seismic_shared_f32[256u + tid] = sm_max;
+    seismic_shared_f32[320u + tid] = sm_sum;
+    barrier();
+
+    for (uint stride = 32u; stride > 0u; stride >>= 1u) {
+        if (tid < stride) {
+            const float other_score = seismic_shared_f32[tid + stride];
+            const float other_logit = seismic_shared_f32[64u + tid + stride];
+            const uint other_token = seismic_shared_u32[128u + tid + stride];
+            const uint other_bad = seismic_shared_u32[192u + tid + stride];
+            if (compact_better(other_score, other_token, best_score, best_token)) {
+                best_score = other_score;
+                best_logit = other_logit;
+                best_token = other_token;
+            }
+            bad |= other_bad;
+            compact_sm_merge(
+                seismic_shared_f32[256u + tid + stride],
+                seismic_shared_f32[320u + tid + stride],
+                sm_max,
+                sm_sum);
+            seismic_shared_f32[tid] = best_score;
+            seismic_shared_f32[64u + tid] = best_logit;
+            seismic_shared_u32[128u + tid] = best_token;
+            seismic_shared_u32[192u + tid] = bad;
+            seismic_shared_f32[256u + tid] = sm_max;
+            seismic_shared_f32[320u + tid] = sm_sum;
+        }
+        barrier();
+    }
+
+    if (tid == 0u) {
+        const int status = bad != 0u ? 2 : (best_token == COMPACT_NO_TOKEN ? 1 : 0);
+        const uint64_t out = result + row * SEISMIC_RESULT_STRIDE_0 * 4ul;
+        element_i32_put(out, status == 0 ? int(best_token) : -1);
+        element_i32_put(out + SEISMIC_RESULT_STRIDE_1 * 4ul, status);
+        out_put(
+            confidence,
+            row * SEISMIC_CONFIDENCE_STRIDE_0,
+            status == 0 && sm_sum != 0.0 ? seismic_div_rn(exp(best_logit - sm_max), sm_sum) : 0.0);
+    }
+}

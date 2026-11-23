@@ -82,7 +82,8 @@ use magnitude_kernels::constants::{
 };
 use magnitude_kernels::{
     attention_project, draft_rows, draft_top_k, feature_copy, guess_chain, place_logits_rows,
-    readout_features_rows, readout_project_rows, sample_rows, shape_rows, shortlist_token_rows,
+    readout_features_rows, readout_project_rows, sample_rows, select_compact_rows, shape_rows,
+    shortlist_token_rows,
     token_confidence,
 };
 use magnitude_state::LayerRef;
@@ -330,6 +331,7 @@ struct ShortlistEntries<'a, G: GraphDraft + 'a> {
     coarse: G::Ranged<'a, readout_project_rows::Entry>,
     selection: G::Binding<'a, draft_top_k::Entry>,
     rows: G::Binding<'a, shortlist_token_rows::Entry>,
+    compact_select: G::Binding<'a, select_compact_rows::Entry>,
     placement: G::Binding<'a, place_logits_rows::Entry>,
 }
 
@@ -374,6 +376,7 @@ impl<'a> HeadGraphEntries<'a, NativeGraph> {
                 coarse: &shortlist.coarse,
                 selection: &shortlist.selection,
                 rows: &shortlist.rows,
+                compact_select: &shortlist.compact_select,
                 placement: &shortlist.placement,
             }),
             shape: &head.shape,
@@ -481,6 +484,7 @@ impl CheckedHeadEntries {
                 coarse: G::bind_ranged(coarse),
                 selection: G::bind(&self.selection),
                 rows: G::bind(&self.selection),
+                compact_select: G::bind(&self.selection),
                 placement: G::bind(&self.selection),
             }),
             shape: G::bind(&self.selection),
@@ -1139,7 +1143,10 @@ fn head_graph_draft<'a, G: GraphDraft + 'a>(
         .transpose()?;
     // A drafting graph's selections' confidences, beside them step-major;
     // a pass's selection `s` was drawn from its logits row `s`. A front
-    // graph's selections feed its chain alone.
+    // graph's selections feed its chain alone. Unshaped shortlist passes
+    // compute confidence directly in `select_compact_rows` and do not read
+    // the identity `rows` port (`token_confidence`).
+    let needs_confidence_rows = topology.passes.shaped || shortlist_projection.is_none();
     let selecting = match (steps, front) {
         (0, _) => Selecting::<G>::Causal,
         (_, false) => Selecting::Proposals {
@@ -1156,7 +1163,9 @@ fn head_graph_draft<'a, G: GraphDraft + 'a>(
                 )?
                 .tensor()
                 .clone(),
-            rows: GraphConstant::row_identity(&mut graph, slots.clone(), None)?,
+            rows: needs_confidence_rows
+                .then(|| GraphConstant::row_identity(&mut graph, slots.clone(), None))
+                .transpose()?,
         },
         (_, true) => Selecting::Chain(entries.chain.ok_or_else(|| "a front head graph on a load that does not front".to_owned())?),
     };
@@ -1220,7 +1229,7 @@ fn head_graph_draft<'a, G: GraphDraft + 'a>(
         Selecting::Causal => SelectedPorts::Causal,
         Selecting::Proposals { confidence, rows, .. } => {
             graph.export(&confidence)?;
-            constants.push(rows);
+            constants.extend(rows);
             SelectedPorts::Proposals { confidence }
         }
         // A front graph's chain, from the target step's token rows and
@@ -1484,16 +1493,22 @@ fn head_pass<'a, G: GraphDraft + 'a>(
         .map_or(out_rows.tensor(), |rows| rows.port().tensor())
         .clone();
     let chained_features = if topology.residual_chain {
-        graph
-            .enqueue(
-                entries.gather,
-                &[("M", rows.clone()), ("O", slots.clone()), ("D", context.conditioning_width.clone())],
-                feature_rows::WorkflowArgs {
-                    fused: (&advanced).into(),
-                    out_rows: (&pass_rows).into(),
-                },
-            )?
-            .value
+        // Chained passes already have `rows == slots` with identity row order
+        // and `advanced` in F32 (the residual-chain conditioning element).
+        if pass > 0 {
+            advanced.clone()
+        } else {
+            graph
+                .enqueue(
+                    entries.gather,
+                    &[("M", rows.clone()), ("O", slots.clone()), ("D", context.conditioning_width.clone())],
+                    feature_rows::WorkflowArgs {
+                        fused: (&advanced).into(),
+                        out_rows: (&pass_rows).into(),
+                    },
+                )?
+                .value
+        }
     } else {
         features.clone()
     };
@@ -1871,6 +1886,63 @@ fn pass_selection<'a, G: GraphDraft + 'a>(
             constants,
         )?
         .logits;
+        if !context.topology.passes.shaped {
+            let inputs = readout::selection_inputs(graph, entries.sample, slots, vocabulary)?;
+            let mut result = selections
+                .tensor()
+                .slice_leading(slots * pass, slots * (pass + 1));
+            let select_dims = [
+                ("M", slots.clone()),
+                ("W", (vocabulary + 31u64) / 32u64),
+                ("S", k),
+            ];
+            match context.selecting {
+                Selecting::Proposals { confidence, .. } => {
+                    let mut confidence =
+                        confidence.slice_leading(slots * pass, slots * (pass + 1));
+                    graph.enqueue(
+                        shortlist_entries.compact_select,
+                        &select_dims,
+                        select_compact_rows::WorkflowArgs {
+                            scores: (&compact).into(),
+                            token_rows: (&token_rows).into(),
+                            mask: inputs.mask.tensor().into(),
+                            constrained: inputs.constrained.tensor().into(),
+                            draws: inputs.draws.tensor().into(),
+                            result: (&mut result).into(),
+                            confidence: (&mut confidence).into(),
+                        },
+                    )?;
+                }
+                Selecting::Chain(_) | Selecting::Causal => {
+                    let mut confidence = graph.local_for(
+                        shortlist_entries.compact_select,
+                        "confidence",
+                        &select_dims,
+                    )?;
+                    graph.enqueue(
+                        shortlist_entries.compact_select,
+                        &select_dims,
+                        select_compact_rows::WorkflowArgs {
+                            scores: (&compact).into(),
+                            token_rows: (&token_rows).into(),
+                            mask: inputs.mask.tensor().into(),
+                            constrained: inputs.constrained.tensor().into(),
+                            draws: inputs.draws.tensor().into(),
+                            result: (&mut result).into(),
+                            confidence: confidence.tensor_mut().into(),
+                        },
+                    )?;
+                }
+            }
+            return Ok(Some(SelectionPorts {
+                shaping: None,
+                constrained: inputs.constrained,
+                mask: inputs.mask,
+                draws: inputs.draws,
+                temperature: inputs.temperature,
+            }));
+        }
         let placement_dims = [
             ("M", slots.clone()),
             ("V", vocabulary.clone()),
@@ -1955,7 +2027,10 @@ fn pass_selection<'a, G: GraphDraft + 'a>(
                 vocabulary,
                 &mut logits,
                 view.as_ref(),
-                rows.port().tensor(),
+                rows.as_ref()
+                    .ok_or_else(|| "confidence rows absent for full-vocab selection".to_owned())?
+                    .port()
+                    .tensor(),
                 slots,
                 shaped,
                 inputs,
@@ -1985,7 +2060,7 @@ enum Selecting<'a, G: GraphDraft + 'a> {
     Proposals {
         entry: G::Binding<'a, token_confidence::Entry>,
         confidence: WorkflowTensor,
-        rows: GraphConstant,
+        rows: Option<GraphConstant>,
     },
     Chain(G::Binding<'a, guess_chain::Entry>),
 }

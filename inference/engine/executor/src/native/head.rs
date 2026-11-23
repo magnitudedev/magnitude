@@ -2,7 +2,8 @@ use super::{AttentionKernels, DenseKernels, GeneralRoutedKernels, ProjectionKern
 use crate::HeadBinding;
 use magnitude_kernels::{
     attention_project, draft_rows, draft_top_k, guess_chain, place_logits_rows,
-    readout_features_rows, readout_project_rows, sample_rows, shape_rows, shortlist_token_rows,
+    readout_features_rows, readout_project_rows, sample_rows, select_compact_rows, shape_rows,
+    shortlist_token_rows,
 };
 use seismic::NativeKernel;
 use std::collections::HashMap;
@@ -11,13 +12,17 @@ use std::collections::HashMap;
 /// `coarse` projects features onto the narrow 2-bit table (`I = 0`),
 /// `selection` (`draft_top_k`) picks the top-K candidates, `rows`
 /// (`shortlist_token_rows`) extracts canonical token IDs for gathered exact
-/// refinement (`logits` with `I = 1, S = K`), and `placement`
-/// (`place_logits_rows`) scatters the exact logits back into `[O, V]`.
+/// refinement (`logits` with `I = 1, S = K`), `compact_select`
+/// (`select_compact_rows`) selects the winning token and confidence directly
+/// from the compact shortlist on unshaped passes, and `placement`
+/// (`place_logits_rows`) scatters the exact logits back into `[O, V]` when
+/// shaping is required.
 #[derive(Clone, Debug)]
 pub(crate) struct ShortlistReadoutKernels {
     pub coarse: super::RangedKernels<readout_project_rows::Entry>,
     pub selection: NativeKernel<draft_top_k::Entry>,
     pub rows: NativeKernel<shortlist_token_rows::Entry>,
+    pub compact_select: NativeKernel<select_compact_rows::Entry>,
     pub placement: NativeKernel<place_logits_rows::Entry>,
 }
 

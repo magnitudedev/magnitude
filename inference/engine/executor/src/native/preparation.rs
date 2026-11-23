@@ -62,7 +62,7 @@ use magnitude_kernels::{
     ngram_inject, ngram_rows, pool_rows, rows_topk, unit_reads,
     packing_bound,
     per_layer_inputs, place_logits_rows, post_norm_residual, repack_weight, repeat_rows,
-    selection_notice, shortlist_token_rows, guess_chain, stored_rows, stream_collapse, stream_join, stream_mix_sinkhorn, tap_rows,
+    select_compact_rows, selection_notice, shortlist_token_rows, guess_chain, stored_rows, stream_collapse, stream_join, stream_mix_sinkhorn, tap_rows,
     token_confidence, widen_rows,
 };
 use seismic::KernelRequest;
@@ -3476,16 +3476,22 @@ impl<'a> Preparation<'a> {
                     })?;
                     let selection = fixed!(self.spec, draft_top_k, "head shortlist");
                     let rows = fixed!(self.spec, shortlist_token_rows, "head shortlist");
+                    let compact_select = fixed!(self.spec, select_compact_rows, "head shortlist");
                     let placement = fixed!(self.spec, place_logits_rows, "head shortlist");
-                    match (coarse, selection, rows, placement) {
-                        (Some(coarse), Some(selection), Some(rows), Some(placement)) => {
-                            Some(super::ShortlistReadoutKernels {
-                                coarse,
-                                selection,
-                                rows,
-                                placement,
-                            })
-                        }
+                    match (coarse, selection, rows, compact_select, placement) {
+                        (
+                            Some(coarse),
+                            Some(selection),
+                            Some(rows),
+                            Some(compact_select),
+                            Some(placement),
+                        ) => Some(super::ShortlistReadoutKernels {
+                            coarse,
+                            selection,
+                            rows,
+                            compact_select,
+                            placement,
+                        }),
                         _ => None,
                     }
                 }

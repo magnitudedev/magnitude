@@ -669,6 +669,7 @@ fn contract_node_shape_presence_matches_native_implementation_all_entries() {
         cluster_token_rows,
         shortlist_token_rows,
         place_logits_rows,
+        select_compact_rows,
         corrector_features,
         corrector_rows,
         corrector_nodes,

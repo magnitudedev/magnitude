@@ -93,3 +93,112 @@ native place_logits_rows for cpu from "cpu/place_logits_rows.rs":
     launch place_logits_rows:
         threadgroups (M, 1, 1)
         threads_per_threadgroup (1, 1, 1)
+
+# Select a token and its softmax confidence directly from a row's compact
+# `S`-element shortlist (`scores`, `token_rows`), avoiding scattering into a
+# `[M, V]` logits tensor. Equivalent to `place_logits_rows` followed by
+# `sample_rows` and `token_confidence` over the placed logits: invalid tokens
+# (`< 0` or `>= W * 32`, where `W` is the constraint mask word count) are
+# ignored as `-inf`; valid tokens apply the canonical token's constraint `mask`
+# bit, Philox4x32-10 Gumbel draw (counter = token), and tie-break to the lowest
+# canonical token. Status: 0 success, 1 empty, 2 nonfinite score (`NaN` or
+# `+inf`). Confidence is the winning token's softmax probability over the
+# compact scores (0 when status != 0).
+fn select_compact_rows[M, W, S](scores: &tensor[M, S] f32, token_rows: &tensor[M, S] i32,
+    mask: &tensor[M, W] u32, constrained: &tensor[M] i32,
+    draws: &tensor[M, 6] u32, result: &mut tensor[M, 2] i32,
+    confidence: &mut tensor[M] f32):
+    for row in 0..M:
+        let mut best_score = -inf
+        let mut best_logit = -inf
+        let mut best_token = i32(-1)
+        let mut bad = i32(0)
+        let mut max_logit = -inf
+        for col in 0..S:
+            let token = token_rows[row, col]
+            if token >= 0 and token / 32 < i32(W):
+                let value = scores[row, col]
+                if value != value or value == inf:
+                    bad = 1
+                if value > max_logit:
+                    max_logit = value
+                let admitted = constrained[row] == 0 or ((mask[row, token / 32] >> u32(token % 32)) & 1) != 0
+                if admitted and value > -inf and value < inf:
+                    let mut candidate = value
+                    if draws[row, 0] == 1:
+                        let mut c0 = u32(token)
+                        let mut c1 = draws[row, 3]
+                        let mut c2 = draws[row, 4]
+                        let mut c3 = draws[row, 5]
+                        let mut k0 = draws[row, 1]
+                        let mut k1 = draws[row, 2]
+                        for round in 0..10:
+                            let a0 = u32(3528531795)
+                            let a1 = u32(3449720151)
+                            let p00 = (a0 & 65535) * (c0 & 65535)
+                            let p01 = (a0 >> 16) * (c0 & 65535)
+                            let p02 = (a0 & 65535) * (c0 >> 16)
+                            let p03 = (a0 >> 16) * (c0 >> 16)
+                            let middle0 = (p00 >> 16) + (p01 & 65535) + (p02 & 65535)
+                            let hi0 = p03 + (p01 >> 16) + (p02 >> 16) + (middle0 >> 16)
+                            let lo0 = (middle0 << 16) | (p00 & 65535)
+                            let p10 = (a1 & 65535) * (c2 & 65535)
+                            let p11 = (a1 >> 16) * (c2 & 65535)
+                            let p12 = (a1 & 65535) * (c2 >> 16)
+                            let p13 = (a1 >> 16) * (c2 >> 16)
+                            let middle1 = (p10 >> 16) + (p11 & 65535) + (p12 & 65535)
+                            let hi1 = p13 + (p11 >> 16) + (p12 >> 16) + (middle1 >> 16)
+                            let lo1 = (middle1 << 16) | (p10 & 65535)
+                            let next0 = hi1 ^ c1 ^ k0
+                            let next2 = hi0 ^ c3 ^ k1
+                            c0 = next0
+                            c1 = lo1
+                            c2 = next2
+                            c3 = lo0
+                            k0 = k0 + u32(2654435769)
+                            k1 = k1 + u32(3144134277)
+                        let uniform = (f32(c0 >> 9) + 0.5) * 0.00000011920928955078125
+                        candidate = value - log(-log(uniform))
+                    if best_token < 0 or candidate > best_score or (candidate == best_score and token < best_token):
+                        best_score = candidate
+                        best_logit = value
+                        best_token = token
+        let mut status = i32(0)
+        if best_token < 0:
+            status = 1
+        if bad != 0:
+            status = 2
+        if status == 0:
+            result[row, 0] = best_token
+            result[row, 1] = 0
+            let mut total = f32(0.0)
+            for col in 0..S:
+                let token = token_rows[row, col]
+                if token >= 0 and token / 32 < i32(W):
+                    total = total + exp(scores[row, col] - max_logit)
+            if total != 0.0:
+                confidence[row] = exp(best_logit - max_logit) / total
+            else:
+                confidence[row] = 0.0
+        else:
+            result[row, 0] = i32(-1)
+            result[row, 1] = status
+            confidence[row] = 0.0
+
+native select_compact_rows for metal from "metal/select_compact_rows.metal":
+    launch select_compact_rows:
+        threadgroups (M, 1, 1)
+        threads_per_threadgroup (64, 1, 1)
+native select_compact_rows for cuda from "cuda/select_compact_rows.cu":
+    launch select_compact_rows:
+        threadgroups (M, 1, 1)
+        threads_per_threadgroup (64, 1, 1)
+native select_compact_rows for vulkan from "vulkan/select_compact_rows.comp":
+    launch select_compact_rows:
+        threadgroups (M, 1, 1)
+        threads_per_threadgroup (64, 1, 1)
+        shared_bytes (1536)
+native select_compact_rows for cpu from "cpu/select_compact_rows.rs":
+    launch select_compact_rows:
+        threadgroups (M, 1, 1)
+        threads_per_threadgroup (1, 1, 1)
