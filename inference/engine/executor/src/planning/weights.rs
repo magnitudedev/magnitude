@@ -2672,6 +2672,12 @@ impl ModelLoadPlan {
         target_weights.extend(per_layer_weights);
         target_weights.extend(decoder_weights);
         target_weights.extend(exit_weights);
+        // Chained drafting (MTP / target-reading MTP) embeds each pass's
+        // device-selected token on the next pass inside one device graph.
+        // Holding the embedding table whole avoids a host timeline round trip
+        // (`landed_read`) between every pair of consecutive draft steps.
+        let read_whole_embeddings =
+            selection.head && method.draft_form() == Some(crate::DraftForm::Chained);
         target_weights.push((target_role(WeightKind::Output), &decoder.exit.output));
         push_weights(
             &mut target,
@@ -2680,6 +2686,7 @@ impl ModelLoadPlan {
             target_weights,
             target_form,
             reads,
+            read_whole_embeddings,
         )?;
 
         // The executed definition carries at most one drafter.
@@ -2709,7 +2716,15 @@ impl ModelLoadPlan {
                         tensors: &TensorIndex<'_>,
                         component: ArtifactComponent,
                         weights: Vec<(WeightRole, &WeightDescriptor)>| {
-            push_weights(plans, tensors, component, weights, target_form, reads)
+            push_weights(
+                plans,
+                tensors,
+                component,
+                weights,
+                target_form,
+                reads,
+                read_whole_embeddings,
+            )
         };
         let head = match (selection.head, &definition.head, &definition.draft, draft) {
             (false, ..) => None,
@@ -2738,6 +2753,7 @@ impl ModelLoadPlan {
                     component,
                     operators::head_weights(head).map_err(|error| error.to_string())?,
                 )?;
+                narrow_head_routed_experts(&mut plans, target_form, layout)?;
                 if let Some(shortlist) =
                     plan_head_shortlist(definition, head, &target, target_form, layout)?
                 {
@@ -2772,6 +2788,7 @@ impl ModelLoadPlan {
                     component,
                     operators::draft::draft_weights(separate).map_err(|error| error.to_string())?,
                 )?;
+                narrow_head_routed_experts(&mut plans, target_form, layout)?;
                 Some(HeadWeightsPlan {
                     weights: plans,
                     own_history: false,
@@ -3543,7 +3560,9 @@ fn gathered_table(kind: WeightKind) -> bool {
 
 /// Plan the weights of one component's roles. A gathered table whose stored
 /// tensor no other of these roles reads is planned streamed
-/// (`push_gathered_table`); a tied output projection reads the whole table.
+/// (`push_gathered_table`), unless `read_whole_embeddings` keeps embedding
+/// tables whole for zero-round-trip chained drafting or a tied output
+/// projection reads the whole table.
 fn push_weights(
     out: &mut Vec<WeightPlan>,
     inventory: &TensorIndex<'_>,
@@ -3551,13 +3570,15 @@ fn push_weights(
     weights: Vec<(WeightRole, &WeightDescriptor)>,
     form: ResidentForm,
     reads: TableReads,
+    read_whole_embeddings: bool,
 ) -> Result<(), String> {
     out.reserve(weights.len());
     for (role, descriptor) in &weights {
         if gathered_table(role.kind) {
-            let read_whole = weights
-                .iter()
-                .any(|(other, stored)| other != role && stored.name == descriptor.name);
+            let read_whole = (role.kind == WeightKind::Embedding && read_whole_embeddings)
+                || weights
+                    .iter()
+                    .any(|(other, stored)| other != role && stored.name == descriptor.name);
             push_gathered_table(
                 out, inventory, component, *role, descriptor, form, read_whole, reads,
             )?;
@@ -4061,6 +4082,57 @@ fn weight_scale(
 /// The resident dense element of a role (`operators::resident_dtype`).
 pub(super) fn resident_dtype(role: WeightRole, activation: DType) -> DType {
     operators::resident_dtype(role.kind, activation)
+}
+
+/// Requantize oversized routed expert tensors in a draft head or separate
+/// drafter (`ExpertGate`, `ExpertUp`, `ExpertDown` stored wider than
+/// `gguf_q4_0`, such as `q8_0` or `f16`/`bf16`) to `gguf_q4_0` on import.
+/// Because draft tokens are strictly verified proposals (`precision.md` §3),
+/// narrowing draft routed layers to 4-bit per-32 symmetric quantization
+/// preserves acceptance parity while reclaiming DRAM for the target expert
+/// bank and accelerating draft passes.
+fn narrow_head_routed_experts(
+    plans: &mut [WeightPlan],
+    form: ResidentForm,
+    layout: Layout,
+) -> Result<(), String> {
+    let q4 = crate::shortlist::q4_0_upload_element();
+    let Some(resident) = resident_storage(q4, ScaledActivations::Rounded, form.activation, layout) else {
+        return Ok(());
+    };
+    for weight in plans.iter_mut() {
+        let is_routed = matches!(
+            weight.role.kind,
+            WeightKind::ExpertGate | WeightKind::ExpertUp | WeightKind::ExpertDown
+        );
+        if !is_routed
+            || !weight.descriptor.transforms.is_empty()
+            || weight.scale.is_some()
+            || weight.upload != weight.source
+            || weight.holding != Holding::Whole
+            || !crate::shortlist::benefits_from_draft_q4_0(weight.source, &weight.shape)
+        {
+            continue;
+        }
+        let mut descriptor = WeightDescriptor {
+            transforms: vec![ImportTransform::DraftQ4_0],
+            ..weight.descriptor.clone()
+        };
+        let shape =
+            crate::import_transforms::admit_transforms(&descriptor, &weight.shape, weight.source)?;
+        descriptor.shape = shape.clone();
+        let source_bytes = representation_bytes(q4, &shape)?;
+        let resident_bytes = representation_bytes(resident, &shape)?;
+        let bound = packing_bound(resident, &shape);
+        weight.upload = q4;
+        weight.resident = resident;
+        weight.shape = shape;
+        weight.descriptor = descriptor;
+        weight.source_bytes = source_bytes;
+        weight.resident_bytes = resident_bytes;
+        weight.bound = bound;
+    }
+    Ok(())
 }
 
 /// Plan a narrow 2-bit coarse shortlist copy of the target's `Output`
@@ -5911,4 +5983,168 @@ mod scale_grid_tests {
         std::fs::remove_file(&path).unwrap();
     }
 }
+
+#[cfg(test)]
+mod draft_path_floor_tests {
+    use super::*;
+    use magnitude_family_contracts::SublayerIndex;
+
+    /// Chained MTP drafting holds untied large-vocabulary embeddings whole so
+    /// chained draft passes never incur mid-graph `landed_read` host round
+    /// trips, while plain decode keeps large embeddings streamed.
+    #[test]
+    fn chained_mtp_holds_embedding_whole_while_plain_streams_it() {
+        let mut definition = crate::planning::fixtures::with_mtp_head(
+            crate::planning::fixtures::fixture_definition(),
+        );
+        let vocab = STREAMED_TABLE_ROWS * 2;
+        let hidden = definition.decoder.hidden;
+        definition.decoder.vocabulary = vocab;
+        definition.decoder.entry.embedding.shape = vec![vocab, hidden];
+        definition.decoder.exit.output.shape = vec![vocab, hidden];
+        let manifest = crate::planning::fixtures::fixture_manifest(&definition);
+        let selection = crate::ComponentSelection {
+            head: true,
+            vision: false,
+        };
+        let mtp = crate::PlannedMethod::Mtp {
+            greedy_proposals: 7,
+            sampled_proposals: 7,
+            widths: crate::DraftWidths::Adaptive,
+        };
+        for layout in [Layout::Rows32, Layout::Mma16, Layout::Rows16] {
+            let mtp_load = ModelLoadPlan::derive(
+                &manifest,
+                &definition,
+                selection,
+                layout,
+                mtp,
+                crate::planning::fixtures::LIMITS,
+            )
+            .unwrap();
+            let mtp_embedding = mtp_load
+                .weights()
+                .find(|w| {
+                    w.role
+                        == WeightRole {
+                            scope: WeightScope::Target,
+                            kind: WeightKind::Embedding,
+                        }
+                })
+                .expect("target embedding planned");
+            assert_eq!(
+                mtp_embedding.holding,
+                Holding::Whole,
+                "chained MTP must hold embedding whole on {layout:?}"
+            );
+            assert!(
+                mtp_embedding.streamed().is_none(),
+                "chained MTP embedding must not be streamed on {layout:?}"
+            );
+
+            // Narrow q2g64 DraftOutput shortlist must be planned on every backend layout.
+            let draft_output = mtp_load
+                .weights()
+                .find(|w| {
+                    w.role
+                        == WeightRole {
+                            scope: WeightScope::HeadBlock(0),
+                            kind: WeightKind::DraftOutput,
+                        }
+                })
+                .expect("DraftOutput shortlist planned");
+            assert!(draft_output.descriptor.is_shortlist());
+            assert_eq!(draft_output.resident.representation(), "q2g64");
+            assert_eq!(draft_output.resident.layout(), layout);
+
+            // Plain decode keeps large untied embeddings streamed.
+            let plain_load = ModelLoadPlan::derive(
+                &manifest,
+                &definition,
+                crate::ComponentSelection {
+                    head: false,
+                    vision: false,
+                },
+                layout,
+                crate::PlannedMethod::Plain,
+                crate::planning::fixtures::LIMITS,
+            )
+            .unwrap();
+            let plain_embedding = plain_load
+                .weights()
+                .find(|w| {
+                    w.role
+                        == WeightRole {
+                            scope: WeightScope::Target,
+                            kind: WeightKind::Embedding,
+                        }
+                })
+                .expect("plain target embedding planned");
+            assert!(
+                plain_embedding.streamed().is_some(),
+                "plain decode keeps large untied embedding streamed on {layout:?}"
+            );
+        }
+    }
+
+    /// `narrow_head_routed_experts` requantizes oversized (`q8_0`) draft routed
+    /// experts to `gguf_q4_0` across every backend layout and leaves already
+    /// narrow (`q4_0`) experts untouched.
+    #[test]
+    fn narrow_head_routed_experts_narrows_wide_and_keeps_narrow_across_layouts() {
+        let shape = vec![4u64, 64, 128];
+        let q8 = source_element(Encoding::Q8_0, 128).unwrap();
+        let q4 = crate::shortlist::q4_0_upload_element();
+        for layout in [Layout::Rows32, Layout::Mma16, Layout::Rows16] {
+            let form = ResidentForm {
+                activation: DType::BF16,
+                layout,
+            };
+            let q8_res = resident_storage(q8, ScaledActivations::Rounded, DType::BF16, layout).unwrap();
+            let q4_res = resident_storage(q4, ScaledActivations::Rounded, DType::BF16, layout).unwrap();
+            let make_plan = |kind, source, resident: Element| WeightPlan {
+                role: WeightRole {
+                    scope: WeightScope::HeadSublayer(SublayerIndex {
+                        block: 0,
+                        sublayer: 1,
+                    }),
+                    kind,
+                },
+                component: ArtifactComponent {
+                    kind: ArtifactComponentKind::Target,
+                    identity: ArtifactIdentity([0; 32]),
+                },
+                source,
+                upload: source,
+                resident,
+                shape: shape.clone(),
+                descriptor: WeightDescriptor {
+                    name: format!("{kind:?}.weight"),
+                    shape: shape.clone(),
+                    transforms: Vec::new(),
+                },
+                source_bytes: representation_bytes(source, &shape).unwrap(),
+                resident_bytes: representation_bytes(resident, &shape).unwrap(),
+                scale: None,
+                bound: packing_bound(resident, &shape),
+                holding: Holding::Whole,
+            };
+            let mut plans = vec![
+                make_plan(WeightKind::ExpertGate, q8, q8_res),
+                make_plan(WeightKind::ExpertUp, q4, q4_res),
+                make_plan(WeightKind::ExpertDown, q8, q8_res),
+            ];
+            narrow_head_routed_experts(&mut plans, form, layout).unwrap();
+            assert!(plans[0].descriptor.is_draft_q4_0());
+            assert_eq!(plans[0].upload, q4);
+            assert_eq!(plans[0].resident, q4_res);
+            assert!(!plans[1].descriptor.is_draft_q4_0());
+            assert_eq!(plans[1].upload, q4);
+            assert!(plans[2].descriptor.is_draft_q4_0());
+            assert_eq!(plans[2].upload, q4);
+            assert_eq!(plans[2].resident, q4_res);
+        }
+    }
+}
+
 

@@ -148,6 +148,12 @@ impl WeightDescriptor {
         matches!(self.transforms[..], [ImportTransform::Shortlist])
     }
 
+    /// Whether the descriptor requantizes a draft-head weight to `gguf_q4_0`
+    /// on import (`ImportTransform::DraftQ4_0`), as its sole transform.
+    pub fn is_draft_q4_0(&self) -> bool {
+        matches!(self.transforms[..], [ImportTransform::DraftQ4_0])
+    }
+
     /// The logical shape `transforms` make of a stored tensor of `stored`
     /// shape.
     pub fn transformed_shape(&self, stored: &[u64]) -> Result<Vec<u64>, DefinitionError> {
@@ -318,6 +324,15 @@ impl WeightDescriptor {
                         )));
                     }
                 }
+                ImportTransform::DraftQ4_0 => {
+                    let cols = shape.last().copied().unwrap_or(0);
+                    if !(shape.len() == 2 || shape.len() == 3) || !cols.is_multiple_of(32) {
+                        return Err(DefinitionError::new(format!(
+                            "{:?} is not a 2D/3D weight of whole 32-value groups",
+                            self.name
+                        )));
+                    }
+                }
             }
         }
         Ok(shape)
@@ -403,6 +418,10 @@ pub enum ImportTransform {
     /// draft-head shortlist candidate generation (exact refinement still
     /// reads the target's full-precision `Output`).
     Shortlist,
+    /// Requantize an oversized draft-head weight (e.g., `q8_0` routed experts
+    /// in an MTP head) to `gguf_q4_0` on import: verified proposals spend zero
+    /// target fidelity while reclaiming DRAM and speeding up draft passes.
+    DraftQ4_0,
 }
 
 impl ImportTransform {
@@ -636,7 +655,7 @@ impl std::hash::Hash for ImportTransform {
                 plane.hash(state);
                 depth.hash(state);
             }
-            Self::Shortlist => {}
+            Self::Shortlist | Self::DraftQ4_0 => {}
         }
     }
 }

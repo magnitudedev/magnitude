@@ -1282,7 +1282,17 @@ impl PreparedTargetGraphs {
             };
             let tap = match (positions.any(), tap_width, &handles.taps) {
                 (false, ..) => None,
-                (true, Some(width), Some(taps)) => Some((width, TapEntry { entry: &taps.tap, positions })),
+                (true, Some(width), Some(taps)) => Some((
+                    width,
+                    TapEntry {
+                        entry: &taps.tap,
+                        collapse: plan
+                            .taps()
+                            .and_then(|taps| taps.streams)
+                            .zip(taps.collapse.as_ref()),
+                        positions,
+                    },
+                )),
                 _ => return Err("a tapped block has no tap entry".to_owned()),
             };
             // A pass merges its own rows (`Passes::lengths`); a back combines

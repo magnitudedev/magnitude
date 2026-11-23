@@ -1420,6 +1420,18 @@ impl ResidencyStore {
                 )
                 .ok_or_else(|| invalid("unsupported shortlist resident representation"))?,
             )
+        } else if descriptor.is_draft_q4_0() {
+            let q4 = crate::shortlist::q4_0_upload_element();
+            (
+                q4,
+                crate::planning::resident_storage(
+                    q4,
+                    magnitude_family_contracts::ScaledActivations::Rounded,
+                    target,
+                    layout,
+                )
+                .ok_or_else(|| invalid("unsupported draft q4_0 resident representation"))?,
+            )
         } else {
             match stored {
                 Stored::Dense { .. } => (actual_source, Element::dense(target)),

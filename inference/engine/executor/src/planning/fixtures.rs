@@ -295,6 +295,7 @@ pub(crate) fn separate_draft_fixture(owns_output: bool) -> (ModelDefinition, Pac
         output: owns_output
             .then(|| WeightDescriptor::stored("draft_output", &[vocabulary, hidden])),
         embedding_scale: 1.0,
+        residual: ResidualForm::Single,
         blocks: definition.decoder.blocks.clone(),
         block_attention: vec![BlockAttention::Bidirectional],
         output_norm: norm("draft_output_norm"),

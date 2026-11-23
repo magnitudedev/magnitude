@@ -1045,6 +1045,7 @@ pub(crate) mod tests {
                 embedding: DraftEmbedding::Target,
                 output: None,
                 embedding_scale: 1.0,
+                residual: magnitude_family_contracts::ResidualForm::Single,
                 blocks: vec![block("d")],
                 block_attention: vec![BlockAttention::Bidirectional],
                 output_norm: rms("don"),

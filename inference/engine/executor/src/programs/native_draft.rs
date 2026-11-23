@@ -29,7 +29,26 @@
 
 use super::{DeviceSubmission, HeadOutput, HeadProgram, HeadSelected, HeadSelections};
 use crate::device_table::SelectedRead;
-use crate::operators::{self, InputForm, Join, Mixer, SublayerInput};
+use crate::operators::{
+    self,
+    block::{
+        CheckedFeedForwardEntries, FeedForwardEntries, FeedForwardNumbers, FeedForwardTopology,
+    },
+    routed::{
+        fused_graph as routed_graph,
+        graph::{general_routed, split as general_split, RoutedSum},
+        streamed::LayerBank,
+        GeneralRoutedShape,
+    },
+    streams::{
+        graph::{
+            collapse as stream_collapse_op, join as stream_join_op, sinkhorn_site,
+            widen as stream_widen, SinkhornEntries,
+        },
+        ResidualCarry, SinkhornExit, SinkhornTopology, StreamsGeometry, StreamsMixing,
+    },
+    InputForm, Join, Mixer, SublayerInput,
+};
 use crate::{
     completion::CompletionWaiter,
     native::{AttestedDraft, AttestedLanding},
@@ -38,7 +57,7 @@ use crate::{
         AttentionGraphEntries, AttentionHistoryEntries, AttentionWeights, CheckedAttentionEntries, ProjectedRows,
     },
     operators::attention::split::{split, AttentionBlock, AttentionSite, AttentionTopology},
-    operators::dense_ffn::graph::{self as dense_graph, CheckedDenseEntries, DenseGraphEntries, DenseNumbers},
+    operators::dense_ffn::graph::{self as dense_graph, DenseGraphEntries},
     programs::{
         graph::facts::{constant, constant_reals, FactIndex, FactSink, Facts, Numbers, RealIndex, TableIndex},
         graph::readout::{self, shapes, write_selection_rows, SelectionPorts},
@@ -70,7 +89,7 @@ use magnitude_family_contracts::{
 use magnitude_kernels::{
     corrector_attention, corrector_factors, corrector_features, corrector_nodes, corrector_path,
     corrector_rows, dense_output, draft_convolve_input, draft_convolve_residual, draft_gated_rows, draft_path_step,
-    draft_top_k, embedding_rows, project_rows, readout_features_rows, sample_rows, shape_rows,
+    draft_top_k, embedding_rows, project_rows, readout_features_rows, repeat_rows, sample_rows, shape_rows,
     token_confidence, widen_rows,
 };
 use magnitude_state::LayerRef;
@@ -301,6 +320,7 @@ impl<'d> DraftGeometry<'d> {
 /// The draft's entries in the graph's binding form.
 pub(crate) struct DraftGraphEntries<'a, G: GraphDraft + 'a> {
     pub layers: Vec<DraftLayerEntries<'a, G>>,
+    pub streams: Option<DraftStreamsEntries<'a, G>>,
     pub embedding: G::Binding<'a, embedding_rows::Entry>,
     /// The landing entries of the block's token table, when it has landing
     /// slots.
@@ -398,7 +418,14 @@ pub(crate) struct ConvolvedLayerEntries<'a, G: GraphDraft + 'a> {
 pub(crate) struct DraftLayerEntries<'a, G: GraphDraft + 'a> {
     pub attention: AttentionGraphEntries<'a, G>,
     pub injection: AttentionGraphEntries<'a, G>,
-    pub dense: DenseGraphEntries<'a, G>,
+    pub feed_forward: FeedForwardEntries<'a, G>,
+}
+
+/// Sinkhorn hyper-connection stream entries for a multi-stream draft backbone.
+#[derive(Clone, Copy)]
+pub(crate) struct DraftStreamsEntries<'a, G: GraphDraft + 'a> {
+    pub repeat: G::Binding<'a, repeat_rows::Entry>,
+    pub sinkhorn: SinkhornEntries<'a, G>,
 }
 
 pub(crate) struct MarkovEntries<'a, G: GraphDraft + 'a> {
@@ -473,9 +500,17 @@ impl<'a> DraftGraphEntries<'a, NativeGraph> {
                 .map(|block| DraftLayerEntries {
                     attention: (&block.attention).into(),
                     injection: (&block.injection).into(),
-                    dense: (&block.dense).into(),
+                    feed_forward: (&block.feed_forward).into(),
                 })
                 .collect(),
+            streams: draft.streams.as_ref().map(|streams| DraftStreamsEntries {
+                repeat: &streams.repeat,
+                sinkhorn: SinkhornEntries {
+                    site: &streams.sinkhorn.site,
+                    collapse: &streams.sinkhorn.collapse,
+                    join: &streams.sinkhorn.join,
+                },
+            }),
             embedding: &draft.embedding,
             head: readout::ProjectionEntries::prepared(&draft.head),
             shape: &draft.shape,
@@ -514,7 +549,8 @@ impl<'a> DraftGraphEntries<'a, NativeGraph> {
 /// ([`DraftModelTopology`]).
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 struct CheckedDraftEntries {
-    layers: Vec<(CheckedAttentionEntries, CheckedAttentionEntries, CheckedDenseEntries)>,
+    layers: Vec<(CheckedAttentionEntries, CheckedAttentionEntries, CheckedFeedForwardEntries)>,
+    streams: bool,
     embedding: Assignments<2>,
     landing: Option<CheckedLandingEntries>,
     head: readout::CheckedProjectionEntries,
@@ -817,10 +853,11 @@ impl CheckedDraftEntries {
                     Ok((
                         CheckedAttentionEntries::new(block.attention, backend, false)?,
                         CheckedAttentionEntries::new(block.injection, backend, false)?,
-                        CheckedDenseEntries::new(block.feed_forward),
+                        CheckedFeedForwardEntries::new(block.feed_forward, backend)?,
                     ))
                 })
                 .collect::<Result<_, String>>()?,
+            streams: plan.streams().is_some(),
             embedding: [("EW", plan.embedding().table), ("A", activation)],
             head: readout::CheckedProjectionEntries::new(plan.projection(), plan.output_norm(), activation, false),
             selection: [],
@@ -835,14 +872,22 @@ impl CheckedDraftEntries {
             layers: self
                 .layers
                 .iter()
-                .map(|(attention, injection, dense)| {
+                .map(|(attention, injection, feed_forward)| {
                     Ok(DraftLayerEntries {
                         attention: attention.entries()?,
                         injection: injection.entries()?,
-                        dense: dense.entries(),
+                        feed_forward: feed_forward.entries(),
                     })
                 })
                 .collect::<Result<Vec<_>, String>>()?,
+            streams: self.streams.then(|| DraftStreamsEntries {
+                repeat: G::bind(&self.selection[..]),
+                sinkhorn: SinkhornEntries {
+                    site: G::bind(&self.selection[..]),
+                    collapse: G::bind(&self.selection[..]),
+                    join: G::bind(&self.selection[..]),
+                },
+            }),
             embedding: G::bind(&self.embedding[..]),
             landing: self.landing.as_ref().map(CheckedLandingEntries::entries::<G>),
             head: self.head.entries(),
@@ -864,8 +909,10 @@ struct DraftModelNumbers<D> {
     hidden: D,
     /// The decoder's vocabulary: the readout's rows and the codebooks'.
     vocabulary: D,
-    /// Per draft layer, its dense feed-forward's widths.
-    dense: Vec<DenseNumbers<D>>,
+    /// Per draft layer, its feed-forward's numbers (dense or routed).
+    feed_forward: Vec<FeedForwardNumbers<D>>,
+    /// Sinkhorn hyper-connection stream geometry, when the draft uses them.
+    streams: Option<StreamsGeometry<D, D>>,
     /// A convolved backbone's taps and coefficient group width.
     convolution: Option<[D; 2]>,
     method: MethodNumbers<D>,
@@ -900,7 +947,12 @@ impl<D> Numbers<D> for DraftModelNumbers<D> {
         DraftModelNumbers {
             hidden: f(self.hidden),
             vocabulary: f(self.vocabulary),
-            dense: self.dense.into_iter().map(|dense| dense.map(&mut *f)).collect(),
+            feed_forward: self
+                .feed_forward
+                .into_iter()
+                .map(|ffn| ffn.map(&mut *f))
+                .collect(),
+            streams: self.streams.map(|streams| streams.map(&mut *f)),
             convolution: self.convolution.map(|pair| pair.map(&mut *f)),
             method: match self.method {
                 MethodNumbers::DFlash => MethodNumbers::DFlash,
@@ -1108,8 +1160,11 @@ struct DraftModelTopology {
     /// The block's mask rows (`DraftDefinition::max_proposals`), which its
     /// constants and views are sized by.
     mask_rows: u64,
-    /// Each layer's dense feed-forward expansion.
-    expansions: Vec<operators::routed::ExpansionForm>,
+    /// Each layer's feed-forward topology (dense or resident routed MoE).
+    feed_forward: Vec<FeedForwardTopology<RealIndex>>,
+    /// Sinkhorn hyper-connection mixing epsilons and exit collapse, when
+    /// the draft backbone uses them.
+    streams: Option<(SinkhornTopology<RealIndex>, SinkhornExit)>,
     /// The draft's element assignments.
     entries: CheckedDraftEntries,
     token_scope: WeightScope,
@@ -1181,22 +1236,90 @@ impl<'d> DraftSplit<'d> {
         }
         let skippable = skippable_layers(draft)?;
         let mut facts = FactSink::new();
-        let (mut expansions, mut attentions, mut denses) = (Vec::new(), Vec::new(), Vec::new());
+        let (mut feed_forward_topologies, mut attentions, mut feed_forward_numbers) =
+            (Vec::new(), Vec::new(), Vec::new());
         for index in 0..draft.blocks.len() {
             let paired = operators::draft::draft_block(draft, index).map_err(|error| error.to_string())?;
             let Mixer::Attention(attention) = paired.mixer else {
                 return Err("draft layers attend".into());
             };
-            let Some(operators::FeedForward::Dense(dense)) = paired.feed_forward.map(|sublayer| sublayer.op) else {
-                return Err("draft layers have a dense feed-forward".into());
-            };
             let shape =
                 operators::attention::shape(decoder.hidden, attention, None).map_err(|error| error.to_string())?;
-            let (expansion, widths) = dense_graph::split(load, draft_sublayer(index, 1)?, &dense.up)?;
-            expansions.push(expansion);
+            let scope = draft_sublayer(index, 1)?;
+            let ffn_sublayer = paired
+                .feed_forward
+                .ok_or("draft layers have a feed-forward")?;
+            let (ffn_topology, ffn_numbers) = match ffn_sublayer.op {
+                operators::FeedForward::Dense(dense) => {
+                    let (expansion, widths) = dense_graph::split(load, scope, &dense.up)?;
+                    (
+                        FeedForwardTopology::Dense {
+                            expansion,
+                            post_norm: None,
+                        },
+                        FeedForwardNumbers::Dense(widths),
+                    )
+                }
+                operators::FeedForward::Routed(shape) => {
+                    let (topology, numbers) = routed_graph::split(
+                        load,
+                        scope,
+                        routed_graph::RoutedSource::Operator {
+                            routed: shape,
+                            hidden: decoder.hidden,
+                        },
+                        &LayerBank::<NativeGraph>::Held,
+                    )?;
+                    (
+                        FeedForwardTopology::Routed(topology),
+                        FeedForwardNumbers::Routed(numbers),
+                    )
+                }
+                operators::FeedForward::GeneralRouted(operator) => {
+                    let shape = GeneralRoutedShape::of(decoder.hidden, operator)
+                        .map_err(|error| error.to_string())?;
+                    let (topology, numbers) =
+                        general_split(load, scope, &shape, &LayerBank::<NativeGraph>::Held)?;
+                    (
+                        FeedForwardTopology::GeneralRouted(topology),
+                        FeedForwardNumbers::GeneralRouted(numbers),
+                    )
+                }
+                operators::FeedForward::Parallel(_) => {
+                    return Err("draft layers run no parallel feed-forward form".into());
+                }
+            };
+            feed_forward_topologies.push(facts.index_reals(ffn_topology));
             attentions.push((attention, shape, skippable[index]));
-            denses.push(widths);
+            feed_forward_numbers.push(ffn_numbers);
         }
+        let (streams_numbers, streams_topology) =
+            match StreamsGeometry::from_residual(decoder.hidden, &draft.residual)
+                .map_err(|error| error.to_string())?
+            {
+                None => (None, None),
+                Some(geometry) => {
+                    let StreamsMixing::Sinkhorn { input, numerics } = geometry.mixing else {
+                        return Err("draft layers admit Sinkhorn hyper-connections only".into());
+                    };
+                    let exit = match input {
+                        magnitude_family_contracts::SinkhornInput::PreviousSite => {
+                            SinkhornExit::LastPre
+                        }
+                        magnitude_family_contracts::SinkhornInput::OwnSite => SinkhornExit::Mean,
+                    };
+                    let numbers = StreamsGeometry {
+                        hidden: geometry.hidden,
+                        streams: geometry.streams,
+                        mixing: StreamsMixing::Sinkhorn {
+                            input,
+                            numerics: u64::from(numerics.iterations),
+                        },
+                    };
+                    let topology = facts.index_reals(numerics.topology());
+                    (Some(numbers), Some((topology, exit)))
+                }
+            };
         let mut real = |value: f64| facts.real(value);
         let method = match &draft.method {
             DraftMethod::DFlash => MethodNumbers::DFlash,
@@ -1226,7 +1349,8 @@ impl<'d> DraftSplit<'d> {
         let numbers = DraftModelNumbers {
             hidden: decoder.hidden,
             vocabulary: decoder.vocabulary,
-            dense: denses,
+            feed_forward: feed_forward_numbers,
+            streams: streams_numbers,
             convolution: draft.convolutions.as_ref().map(|convolutions| [convolutions.kernel, convolutions.group]),
             method,
             weights: GraphWeights::of(load, draft_reads),
@@ -1235,7 +1359,8 @@ impl<'d> DraftSplit<'d> {
             backend,
             activation: activation(decoder.activation_dtype),
             mask_rows: draft.max_proposals(),
-            expansions,
+            feed_forward: feed_forward_topologies,
+            streams: streams_topology,
             entries: CheckedDraftEntries::new(plan, backend, CheckedLandingEntries::of(load, token_table(draft))?)?,
             token_scope: token_table(draft).scope,
             projection: readout::HeadPlans::of(
@@ -1798,8 +1923,8 @@ fn draft_graph<'a, G: GraphDraft + 'a>(
     let class = draft_class.topology;
     let passes = &draft_class.passes;
     let planned = &numbers.weights;
-    let layer_count = model.expansions.len();
-    if [entries.layers.len(), passes.len(), numbers.dense.len()]
+    let layer_count = model.feed_forward.len();
+    if [entries.layers.len(), passes.len(), numbers.feed_forward.len()]
         .iter()
         .any(|&count| count != layer_count)
     {
@@ -2188,7 +2313,7 @@ impl<'r, 'a, G: GraphDraft + 'a> BlockPass<'r, 'a, G> {
             ("F", direct.shape[1].clone()),
         ];
         let tokens = graph.input_for(entries.embedding, "tokens", &embedding_dims)?;
-        let mut residual = graph
+        let embedded = graph
             .enqueue(
                 entries.embedding,
                 &embedding_dims,
@@ -2202,6 +2327,27 @@ impl<'r, 'a, G: GraphDraft + 'a> BlockPass<'r, 'a, G> {
                 },
             )?
             .r1;
+        let streams = match (&entries.streams, &numbers.streams, self.model.streams) {
+            (Some(entries), Some(geometry), Some((topology, exit))) => Some((
+                entries,
+                geometry.clone(),
+                self.reals.arguments(topology),
+                exit,
+            )),
+            (None, None, None) => None,
+            _ => return Err("draft streams entries and topology disagree".into()),
+        };
+        let mut carry = match &streams {
+            Some((stream_entries, geometry, _, _)) => stream_widen(
+                graph,
+                stream_entries.repeat,
+                geometry.clone(),
+                &embedded,
+                Dim::from(rows),
+                constants,
+            )?,
+            None => ResidualCarry::rows(embedded),
+        };
         let mut layers = Vec::with_capacity(drafting.len());
         // A convolved backbone's unfused layers read their normed rows through
         // the identity row map of the block rows.
@@ -2223,8 +2369,10 @@ impl<'r, 'a, G: GraphDraft + 'a> BlockPass<'r, 'a, G> {
             };
             let (topology, block) = (&drafting.block.topology, &drafting.block.numbers);
             if let Some((stages, kernel, group, rows_map)) = &convolved {
-                let ports;
-                (residual, ports) = convolved_layer(
+                let FeedForwardNumbers::Dense(dense_numbers) = &numbers.feed_forward[index] else {
+                    return Err("convolved draft layers require a dense feed-forward".into());
+                };
+                let (next, ports) = convolved_layer(
                     graph,
                     ConvolvedLayer {
                         entries: &stages.layers[index],
@@ -2242,17 +2390,37 @@ impl<'r, 'a, G: GraphDraft + 'a> BlockPass<'r, 'a, G> {
                         kernel,
                         group,
                         hidden,
-                        intermediate: &numbers.dense[index].features,
+                        intermediate: &dense_numbers.features,
                     },
                     planned,
                     weights,
                     constants,
-                    &residual,
+                    &carry.rows,
                 )?;
+                carry = ResidualCarry::rows(next);
                 layers.push(ports);
                 continue;
             }
-            let input_norm = weight(graph, planned, draft_sublayer(index, 0)?, WeightKind::InputNorm, weights)?;
+            let attn_scope = draft_sublayer(index, 0)?;
+            let input_norm = weight(graph, planned, attn_scope, WeightKind::InputNorm, weights)?;
+            let (attn_input, attn_pre, attn_join) = match &streams {
+                Some((stream_entries, geometry, mixing, _)) => {
+                    let site = sinkhorn_site(
+                        graph,
+                        stream_entries.sinkhorn.site,
+                        planned,
+                        attn_scope,
+                        geometry.clone(),
+                        *mixing,
+                        &carry,
+                        Dim::from(rows),
+                        weights,
+                        constants,
+                    )?;
+                    (site.input, site.pre, Join::streams(geometry, site.join, None))
+                }
+                None => (carry.rows.clone(), None, Join::single(None)),
+            };
             let (mixed, state, controls) = attention_graph::attention(
                 graph,
                 layer.attention,
@@ -2260,28 +2428,219 @@ impl<'r, 'a, G: GraphDraft + 'a> BlockPass<'r, 'a, G> {
                 block,
                 &injection_weights.for_block(input_norm),
                 constants,
-                SublayerInput::single(&residual),
-                &residual,
-                &Join::single(None),
+                SublayerInput::single(&attn_input),
+                &carry.rows,
+                &attn_join,
             )?;
             layers.push(LayerPorts { controls, planes: state.planes });
-            residual = dense_graph::dense(
-                graph,
-                DenseGraphEntries { expand: layer.dense.expand, output: layer.dense.output },
-                self.model.expansions[index],
-                &numbers.dense[index],
-                planned,
-                draft_sublayer(index, 1)?,
-                weights,
-                constants,
-                &mixed,
-                &mixed,
-                &Dim::from(rows),
-                None,
-                epsilon,
-                None,
-            )?;
+            carry = ResidualCarry { rows: mixed, pre: attn_pre };
+
+            let ffn_scope = draft_sublayer(index, 1)?;
+            let ffn_topology = self.reals.arguments(self.model.feed_forward[index].clone());
+            let ffn_numbers = &numbers.feed_forward[index];
+            match (&layer.feed_forward, ffn_topology, ffn_numbers) {
+                (
+                    FeedForwardEntries::Dense(dense_entries),
+                    FeedForwardTopology::Dense { expansion, .. },
+                    FeedForwardNumbers::Dense(dense_numbers),
+                ) => match &streams {
+                    Some((stream_entries, geometry, mixing, _)) => {
+                        let site = sinkhorn_site(
+                            graph,
+                            stream_entries.sinkhorn.site,
+                            planned,
+                            ffn_scope,
+                            geometry.clone(),
+                            *mixing,
+                            &carry,
+                            Dim::from(rows),
+                            weights,
+                            constants,
+                        )?;
+                        let zeros = GraphConstant::row_zeros(
+                            graph,
+                            Element::f32(),
+                            Dim::from(rows),
+                            &dense_numbers.hidden,
+                            None,
+                        )?;
+                        let branch = dense_graph::dense(
+                            graph,
+                            DenseGraphEntries {
+                                expand: dense_entries.expand,
+                                output: dense_entries.output,
+                            },
+                            expansion,
+                            dense_numbers,
+                            planned,
+                            ffn_scope,
+                            weights,
+                            constants,
+                            &site.input,
+                            zeros.port().tensor(),
+                            &Dim::from(rows),
+                            None,
+                            epsilon,
+                            None,
+                        )?;
+                        constants.push(zeros);
+                        let joined = stream_join_op(
+                            graph,
+                            stream_entries.sinkhorn.join,
+                            geometry.clone(),
+                            &carry.rows,
+                            &branch,
+                            &site.join,
+                            Dim::from(rows),
+                        )?;
+                        carry = ResidualCarry { rows: joined, pre: site.pre };
+                    }
+                    None => {
+                        let next = dense_graph::dense(
+                            graph,
+                            DenseGraphEntries {
+                                expand: dense_entries.expand,
+                                output: dense_entries.output,
+                            },
+                            expansion,
+                            dense_numbers,
+                            planned,
+                            ffn_scope,
+                            weights,
+                            constants,
+                            &carry.rows,
+                            &carry.rows,
+                            &Dim::from(rows),
+                            None,
+                            epsilon,
+                            None,
+                        )?;
+                        carry = ResidualCarry::rows(next);
+                    }
+                },
+                (
+                    FeedForwardEntries::Routed(routed_entries),
+                    FeedForwardTopology::Routed(routed_topology),
+                    FeedForwardNumbers::Routed(routed_numbers),
+                ) => {
+                    let (ffn_input, ffn_pre, ffn_join) = match &streams {
+                        Some((stream_entries, geometry, mixing, _)) => {
+                            let site = sinkhorn_site(
+                                graph,
+                                stream_entries.sinkhorn.site,
+                                planned,
+                                ffn_scope,
+                                geometry.clone(),
+                                *mixing,
+                                &carry,
+                                Dim::from(rows),
+                                weights,
+                                constants,
+                            )?;
+                            (site.input, site.pre, Join::streams(geometry, site.join, None))
+                        }
+                        None => (carry.rows.clone(), None, Join::single(None)),
+                    };
+                    let (next, _) = routed_graph::routed(
+                        graph,
+                        *routed_entries,
+                        LayerBank::Held,
+                        &routed_topology,
+                        routed_numbers,
+                        planned,
+                        ffn_scope,
+                        weights,
+                        constants,
+                        SublayerInput::single(&ffn_input),
+                        &carry.rows,
+                        &ffn_join,
+                        &Dim::from(rows),
+                        epsilon,
+                        None,
+                        None,
+                    )?;
+                    carry = ResidualCarry { rows: next, pre: ffn_pre };
+                }
+                (
+                    FeedForwardEntries::GeneralRouted(routed_entries),
+                    FeedForwardTopology::GeneralRouted(routed_topology),
+                    FeedForwardNumbers::GeneralRouted(routed_numbers),
+                ) => match &streams {
+                    Some((stream_entries, geometry, mixing, _)) => {
+                        let site = sinkhorn_site(
+                            graph,
+                            stream_entries.sinkhorn.site,
+                            planned,
+                            ffn_scope,
+                            geometry.clone(),
+                            *mixing,
+                            &carry,
+                            Dim::from(rows),
+                            weights,
+                            constants,
+                        )?;
+                        let (branch, _) = general_routed(
+                            graph,
+                            *routed_entries,
+                            LayerBank::Held,
+                            &routed_topology,
+                            routed_numbers,
+                            planned,
+                            ffn_scope,
+                            weights,
+                            constants,
+                            &site.input,
+                            RoutedSum::Branch,
+                            &Dim::from(rows),
+                            epsilon,
+                            None,
+                        )?;
+                        let joined = stream_join_op(
+                            graph,
+                            stream_entries.sinkhorn.join,
+                            geometry.clone(),
+                            &carry.rows,
+                            &branch,
+                            &site.join,
+                            Dim::from(rows),
+                        )?;
+                        carry = ResidualCarry { rows: joined, pre: site.pre };
+                    }
+                    None => {
+                        let (next, _) = general_routed(
+                            graph,
+                            *routed_entries,
+                            LayerBank::Held,
+                            &routed_topology,
+                            routed_numbers,
+                            planned,
+                            ffn_scope,
+                            weights,
+                            constants,
+                            &carry.rows,
+                            RoutedSum::Residual,
+                            &Dim::from(rows),
+                            epsilon,
+                            None,
+                        )?;
+                        carry = ResidualCarry::rows(next);
+                    }
+                },
+                _ => return Err("draft feed-forward topology and kernel entries disagree".into()),
+            }
         }
+        let residual = match &streams {
+            Some((stream_entries, geometry, _, exit)) => stream_collapse_op(
+                graph,
+                stream_entries.sinkhorn.collapse,
+                geometry.clone(),
+                &carry,
+                *exit,
+                Dim::from(rows),
+                constants,
+            )?,
+            None => carry.rows,
+        };
         Ok((tokens, residual, layers))
     }
 
@@ -4762,10 +5121,454 @@ mod composition_tests {
         assert_composition_matches_unrolled(&definition, &manifest, 7);
     }
 
+    fn deepseek41_dspark_fixture(
+        layers: usize,
+    ) -> (ModelDefinition, magnitude_artifacts::PackageManifest) {
+        use magnitude_artifacts::gguf::{Encoding, TensorDescriptor};
+        use magnitude_artifacts::{
+            ArtifactIdentity, ComponentFile, ComponentManifest, PackageIdentity, PackageManifest,
+            TokenId,
+        };
+        use magnitude_family_contracts::{
+            ActivationDType, ActivationFunction, Attention, AttentionGate, Block, BlockAttention,
+            BlockElement, BlockLayout, BlockRounding, BlockScale, ConfidenceHead, Decoder,
+            DraftDefinition, DraftEmbedding, DraftMethod, EmbeddingScale, EntryForm, ExitForm,
+            ExitNorm, ExitSite, ExpertSelection, FamilyId, FeedForwardUp, GluLimit, HeadNorm,
+            HistoryRows, HistorySource, HyperConnectionExit, HyperConnectionInput,
+            HyperConnectionMixing, HyperConnectionWeights, HyperConnections, InputNorm,
+            InputSemantics, MarkovHead, MediaRowAttention, Operator, OutputForm, OutputProjection,
+            OutputRotary, ProjectedRows, QueryKeys, QueryProjection, ResidualForm, RmsNorm, Rotary,
+            RotaryLayout, RotaryPair, RotaryPairing, RotaryPlacement, RouteNormalization,
+            RoutedFfn, Router,
+            RouterInput, RowProducer, RowRounding, ScoreFunction, SharedExpert, SharedExpertGate,
+            SinkhornInput, SinkhornSite, Sublayer, SublayerIndex, TapPoint, TokenDomain,
+            ValueNorm, ValueSource, WeightDescriptor,
+        };
+
+        let hidden = 256u64;
+        let vocab = 256u64;
+        let heads = 4u64;
+        let width = 256u64;
+        let q_rank = 256u64;
+        let groups = 2u64;
+        let o_rank = 128u64;
+        let streams = 4u64;
+        let mixes = (2 + streams) * streams;
+        let experts = 4u64;
+        let selected = 2u64;
+        let inter = 256u64;
+        let markov_rank = 256u64;
+        let cols = (heads * width) / groups;
+        let ranks = groups * o_rank;
+        let eps = 1e-6f64;
+
+        let rms = |name: String, dim: u64| RmsNorm {
+            weight: WeightDescriptor::stored(name, &[dim]),
+            epsilon: eps,
+        };
+        let rotary = Rotary::Table {
+            pairs: vec![
+                RotaryPair {
+                    frequency: 1.0,
+                    amplitude: 1.0,
+                };
+                16
+            ],
+            layout: RotaryLayout {
+                pairs: RotaryPairing::Adjacent,
+                placement: RotaryPlacement::Trailing,
+            },
+            divisors: None,
+            output: OutputRotary::Inverse,
+        };
+        let window_rounding = RowRounding::Block(BlockRounding {
+            element: BlockElement::E4M3,
+            block: 32,
+            scale: BlockScale::Ue8m0,
+            amax_floor: 1e-4,
+        });
+        let make_block = |prefix: &str, media_bias: bool| -> Block {
+            let site = |kind: &str, norm_name: &str| {
+                InputNorm::HyperConnectionMix(HyperConnectionInput {
+                    site: HyperConnectionWeights::Sinkhorn(SinkhornSite {
+                        function: WeightDescriptor::stored(
+                            format!("{prefix}hc_{kind}_fn.weight"),
+                            &[mixes, streams * hidden],
+                        ),
+                        base: WeightDescriptor::stored(
+                            format!("{prefix}hc_{kind}_base.weight"),
+                            &[mixes],
+                        ),
+                        scale: WeightDescriptor::stored(
+                            format!("{prefix}hc_{kind}_scale.weight"),
+                            &[3],
+                        ),
+                    }),
+                    norm: Some(rms(format!("{prefix}{norm_name}.weight"), hidden)),
+                })
+            };
+            let attention = Attention {
+                heads,
+                kv_heads: 1,
+                width,
+                query: QueryProjection::LowRank {
+                    down: WeightDescriptor::stored(
+                        format!("{prefix}attn_q_a.weight"),
+                        &[q_rank, hidden],
+                    ),
+                    norm: rms(format!("{prefix}attn_q_a_norm.weight"), q_rank),
+                    up: WeightDescriptor::stored(
+                        format!("{prefix}attn_q_b.weight"),
+                        &[heads * width, q_rank],
+                    ),
+                },
+                query_keys: QueryKeys::Direct,
+                gate: AttentionGate::None,
+                query_norm: HeadNorm::None,
+                history: vec![HistorySource::visible(HistoryRows::Own(
+                    RowProducer::Projected(ProjectedRows {
+                        key: WeightDescriptor::stored(
+                            format!("{prefix}attn_kv.weight"),
+                            &[width, hidden],
+                        ),
+                        value: ValueSource::StoredKey,
+                        key_norm: HeadNorm::Rms(rms(format!("{prefix}attn_kv_a_norm.weight"), width)),
+                        value_norm: ValueNorm::None,
+                        domain: TokenDomain::Window { tokens: 128 },
+                        rounding: window_rounding,
+                    }),
+                ))],
+                rotary: rotary.clone(),
+                scale: (width as f64).powf(-0.5),
+                media_rows: MediaRowAttention::Causal,
+                sinks: Some(WeightDescriptor::stored(
+                    format!("{prefix}attn_sinks.weight"),
+                    &[heads],
+                )),
+                output: OutputProjection::GroupedLowRank {
+                    groups,
+                    rank: o_rank,
+                    a: WeightDescriptor::stored(
+                        format!("{prefix}attn_output_a.weight"),
+                        &[ranks, cols],
+                    ),
+                    b: WeightDescriptor::stored(
+                        format!("{prefix}attn_output_b.weight"),
+                        &[hidden, ranks],
+                    ),
+                },
+            };
+            let limit = Some(GluLimit::new(7.0).unwrap());
+            let routed = RoutedFfn {
+                experts,
+                selected,
+                intermediate: inter,
+                router: Router {
+                    weight: WeightDescriptor::stored(
+                        format!("{prefix}ffn_gate_inp.weight"),
+                        &[experts, hidden],
+                    ),
+                    input: RouterInput::Operator,
+                    score: ScoreFunction::SqrtSoftplus,
+                    selection: ExpertSelection::TopK {
+                        bias: Some(WeightDescriptor::stored(
+                            format!("{prefix}exp_probs_b.bias"),
+                            &[experts],
+                        )),
+                    },
+                    media_bias: media_bias.then(|| {
+                        WeightDescriptor::stored(
+                            format!("{prefix}exp_probs_b_vl.bias"),
+                            &[experts],
+                        )
+                    }),
+                    normalization: RouteNormalization::SumPlusEpsilon(1e-20),
+                    scale: 1.0,
+                },
+                expert_up: FeedForwardUp::Gated {
+                    activation: ActivationFunction::Silu,
+                    limit,
+                    gate: WeightDescriptor::stored(
+                        format!("{prefix}ffn_gate_exps.weight"),
+                        &[experts, inter, hidden],
+                    ),
+                    up: WeightDescriptor::stored(
+                        format!("{prefix}ffn_up_exps.weight"),
+                        &[experts, inter, hidden],
+                    ),
+                },
+                expert_down: WeightDescriptor::stored(
+                    format!("{prefix}ffn_down_exps.weight"),
+                    &[experts, hidden, inter],
+                ),
+                expert_scale: None,
+                latent: None,
+                shared: Some(SharedExpert {
+                    intermediate: inter,
+                    up: FeedForwardUp::Gated {
+                        activation: ActivationFunction::Silu,
+                        limit,
+                        gate: WeightDescriptor::stored(
+                            format!("{prefix}ffn_gate_shexp.weight"),
+                            &[inter, hidden],
+                        ),
+                        up: WeightDescriptor::stored(
+                            format!("{prefix}ffn_up_shexp.weight"),
+                            &[inter, hidden],
+                        ),
+                    },
+                    down: WeightDescriptor::stored(
+                        format!("{prefix}ffn_down_shexp.weight"),
+                        &[hidden, inter],
+                    ),
+                    gate: SharedExpertGate::None,
+                }),
+            };
+            Block {
+                sublayers: vec![
+                    Sublayer {
+                        input: site("attn", "attn_norm"),
+                        op: Operator::Attention(Box::new(attention)),
+                        output: OutputForm::Scatter,
+                    },
+                    Sublayer {
+                        input: site("ffn", "ffn_norm"),
+                        op: Operator::RoutedFfn(Box::new(routed)),
+                        output: OutputForm::Scatter,
+                    },
+                ],
+            }
+        };
+
+        let residual = ResidualForm::HyperConnections(HyperConnections {
+            streams,
+            mixing: HyperConnectionMixing::Sinkhorn {
+                iterations: 20,
+                epsilon: eps,
+                norm_epsilon: eps,
+                input: SinkhornInput::PreviousSite,
+            },
+        });
+        let target_blocks = (0..2)
+            .map(|i| make_block(&format!("blk.{i}."), true))
+            .collect();
+        let draft_blocks = (0..layers)
+            .map(|i| make_block(&format!("dspark.blk.{i}."), false))
+            .collect();
+        let definition = ModelDefinition {
+            family: FamilyId("deepseek41".into()),
+            artifact_identity: PackageIdentity {
+                target: ArtifactIdentity([41; 32]),
+                projector: None,
+            },
+            inputs: InputSemantics { coordinate_axes: 1 },
+            decoder: Decoder {
+                activation_dtype: ActivationDType::BF16,
+                hidden,
+                vocabulary: vocab,
+                context_limit: 4096,
+                residual: residual.clone(),
+                entry: EntryForm {
+                    embedding: WeightDescriptor::stored("token_embd.weight", &[vocab, hidden]),
+                    scale: EmbeddingScale::Unit,
+                    norm: None,
+                    per_layer: None,
+                },
+                blocks: target_blocks,
+                exit: ExitForm {
+                    norm: ExitNorm::HyperConnectionHead(HyperConnectionExit {
+                        site: ExitSite::PreviousSite,
+                        norm: Some(rms("output_norm.weight".into(), hidden)),
+                    }),
+                    output: WeightDescriptor::stored("output.weight", &[vocab, hidden]),
+                    softcap: None,
+                },
+            },
+            head: None,
+            vision: None,
+            draft: Some(DraftDefinition {
+                method: DraftMethod::DSpark {
+                    markov: MarkovHead {
+                        rank: markov_rank,
+                        embedding: WeightDescriptor::stored(
+                            "markov_w1.weight",
+                            &[vocab, markov_rank],
+                        ),
+                        projection: WeightDescriptor::stored(
+                            "markov_w2.weight",
+                            &[vocab, markov_rank],
+                        ),
+                    },
+                    confidence: ConfidenceHead {
+                        weight: WeightDescriptor::stored(
+                            "conf_proj.weight",
+                            &[1, hidden + markov_rank],
+                        ),
+                        bias: None,
+                    },
+                },
+                taps: vec![TapPoint::Sublayer(SublayerIndex {
+                    block: 1,
+                    sublayer: 0,
+                })],
+                fusion: WeightDescriptor::stored("fc.weight", &[hidden, hidden]),
+                fusion_norm: rms("enc.output_norm.weight".into(), hidden),
+                embedding: DraftEmbedding::Target,
+                output: None,
+                embedding_scale: 1.0,
+                residual,
+                blocks: draft_blocks,
+                block_attention: vec![BlockAttention::Bidirectional; layers],
+                convolutions: None,
+                output_norm: rms("draft_output_norm.weight".into(), hidden),
+                logit_softcap: None,
+                block_size: 6,
+                mask_token: TokenId(42),
+                layout: BlockLayout::AnchorFirst,
+            }),
+        };
+        definition.validate().unwrap();
+        crate::operators::draft::admit(&definition).unwrap();
+
+        let make_manifest = |weights: Vec<(WeightRole, &WeightDescriptor)>,
+                             path: &str,
+                             id: u8|
+         -> ComponentManifest {
+            let mut offset = 0u64;
+            let tensors = weights
+                .into_iter()
+                .map(|(_, d)| {
+                    let encoding = if d.name.contains("_exps.") {
+                        Encoding::Mxfp4
+                    } else if d.name.contains("hc_")
+                        || d.name.contains("norm")
+                        || d.name.contains("sinks")
+                        || d.name.contains("gate_inp")
+                        || d.name.contains("probs_b")
+                    {
+                        Encoding::F32
+                    } else {
+                        Encoding::BF16
+                    };
+                    let elems: u64 = d.shape.iter().product();
+                    let nbytes = match encoding {
+                        Encoding::F32 => elems * 4,
+                        Encoding::BF16 => elems * 2,
+                        Encoding::Mxfp4 => (elems / 32) * 17,
+                        _ => unreachable!(),
+                    };
+                    let tensor = TensorDescriptor {
+                        name: d.name.clone(),
+                        shape: d.shape.clone(),
+                        encoding,
+                        offset,
+                        nbytes,
+                    };
+                    offset += nbytes;
+                    tensor
+                })
+                .collect();
+            ComponentManifest {
+                files: vec![ComponentFile {
+                    path: path.into(),
+                    size: offset,
+                }],
+                identity: ArtifactIdentity([id; 32]),
+                tensors,
+            }
+        };
+
+        let mut target_weights = vec![
+            (
+                WeightRole {
+                    scope: WeightScope::Target,
+                    kind: WeightKind::Embedding,
+                },
+                &definition.decoder.entry.embedding,
+            ),
+            (
+                WeightRole {
+                    scope: WeightScope::Target,
+                    kind: WeightKind::Output,
+                },
+                &definition.decoder.exit.output,
+            ),
+        ];
+        target_weights.extend(crate::operators::exit_weights(&definition.decoder));
+        target_weights.extend(crate::operators::decoder_weights(&definition.decoder));
+        let draft = definition.draft.as_ref().unwrap();
+        let draft_weights: Vec<_> = crate::operators::draft::fusion_weights(draft)
+            .into_iter()
+            .chain(crate::operators::draft::draft_weights(draft).unwrap())
+            .collect();
+        let manifest = PackageManifest {
+            identity: definition.artifact_identity.clone(),
+            target: make_manifest(target_weights, "deepseek41-target.gguf", 41),
+            projector: None,
+            draft: Some(make_manifest(draft_weights, "deepseek41-dspark.gguf", 42)),
+        };
+        (definition, manifest)
+    }
+
     #[test]
     fn dflash2_family_composition_matches_unrolled_bit_for_bit() {
         let (definition, manifest) = multi_layer_dflash2_fixture(5);
         assert_composition_matches_unrolled(&definition, &manifest, 15);
+    }
+
+    #[test]
+    fn deepseek41_dspark_family_composition_matches_unrolled_bit_for_bit() {
+        let (definition, manifest) = deepseek41_dspark_fixture(3);
+        let (load, state, classes) = setup_draft_fixture(&definition, &manifest, 6);
+        let plan = load
+            .program_plan(&definition, magnitude_state::KvCodec::Dense)
+            .unwrap();
+        assert_eq!(plan.target().taps().unwrap().streams, Some(4));
+        let draft_plan = plan.draft().unwrap();
+        let streams = draft_plan.streams().expect("DSpark draft has Sinkhorn streams");
+        assert_eq!(streams.streams, 4);
+        assert!(draft_plan
+            .blocks()
+            .iter()
+            .all(|b| matches!(b.feed_forward, crate::FeedForwardProgramSlot::GeneralRouted(_))));
+
+        // Certify tapped 4-stream Sinkhorn target graphs (exercising `tap_streams`
+        // with `stream_collapse` P=0) and DSpark draft graphs on both CPU and CUDA.
+        let limits = ResourceLimits {
+            max_launch_rows: 256,
+            max_launch_slots: 16,
+            max_selected_rows: 16,
+            max_drafting_slots: 16,
+            exported_logits_rows: 0,
+            max_images_per_request: 1,
+            max_image_cells: 0,
+            lookahead: false,
+            chain_capacity: std::num::NonZeroUsize::MIN,
+            conversations: std::num::NonZeroUsize::MIN,
+        };
+        for backend in [
+            BackendName::Cpu,
+            BackendName::Cuda,
+            BackendName::Metal,
+            BackendName::Vulkan,
+        ] {
+            crate::programs::native_target_graph::checked_target_family(
+                backend,
+                &load,
+                &definition.decoder,
+                &state,
+                plan.target(),
+                limits,
+                crate::PassLaunches::whole_chain(limits),
+            )
+            .unwrap_or_else(|e| panic!("tapped 4-stream target failed on {backend:?}: {e}"));
+            let geometry = DraftGeometry::new(&definition, state.head_state().unwrap()).unwrap();
+            let split = DraftSplit::of(backend, &load, draft_plan, &geometry).unwrap();
+            DraftFamilyComposition::evaluate(&split, &classes)
+                .unwrap_or_else(|e| panic!("DSpark draft failed on {backend:?}: {e}"));
+        }
+
+        assert_composition_matches_unrolled(&definition, &manifest, 6);
     }
 
 }

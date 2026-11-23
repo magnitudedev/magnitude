@@ -25,6 +25,7 @@ use magnitude_artifacts::{
     TokenId, UnsupportedReason,
 };
 use magnitude_family_common::{
+    binders,
     rotary::{self, Yarn, YarnAmplitude},
     HeaderError, Metadata, Tensors,
 };
@@ -32,12 +33,12 @@ use magnitude_family_contracts::{
     checked_product, ActivationFunction, Affine, Attention, AttentionGate, Block, BlockAttention,
     BlockConvolutions, BlockLayout, CandidateCorrector, CandidateSelector, CenteredNorm,
     ConfidenceHead, CorrectorLayer, DefinitionError, DenseFfn, DraftDefinition, DraftEmbedding,
-    DraftMethod, DynamicConvolution, FamilyError, FeedForwardUp, HeadNorm, HistoryRows,
-    HistorySource, InputNorm, LayerConvolutions, MarkovHead, ProjectedRows,
-    RowProducer, RowRounding, TokenDomain,
-    MediaRowAttention, ModelDefinition, Operator, OutputForm, OutputProjection, OutputRotary,
-    QueryKeys, QueryProjection, RmsNorm, Rotary, RotaryLayout, Sublayer, TapPoint,
-    ValueNorm, ValueSource, WeightDescriptor, CORRECTOR_FEATURES,
+    DraftMethod, DynamicConvolution, FamilyError, FeedForwardUp, GluLimit, HeadNorm, HistoryRows,
+    HistorySource, HyperConnectionMixing, HyperConnections, InputNorm, LayerConvolutions,
+    MarkovHead, MediaRowAttention, ModelDefinition, Operator, OutputForm, OutputProjection,
+    OutputRotary, ProjectedRows, QueryKeys, QueryProjection, ResidualForm, RmsNorm, Rotary,
+    RotaryLayout, RouteNormalization, RowProducer, RowRounding, ScoreFunction, SinkhornInput,
+    Sublayer, TapPoint, TokenDomain, ValueNorm, ValueSource, WeightDescriptor, CORRECTOR_FEATURES,
 };
 use std::{error, fmt};
 
@@ -313,14 +314,7 @@ pub fn inspect(
             decoder.hidden
         )));
     }
-    if !matches!(
-        decoder.residual,
-        magnitude_family_contracts::ResidualForm::Single
-    ) {
-        return Err(Error::Target(
-            "draft models require a single-stream target residual".into(),
-        ));
-    }
+    let single_pass_mhc = m.optional_flag("hyper_connection.single_pass")? == Some(true);
     m.invariant_count(
         "attention.value_length",
         width,
@@ -352,11 +346,6 @@ pub fn inspect(
         return Err(Error::Geometry("draft taps no target layer".into()));
     }
 
-    let (domains, block_attention): (Vec<_>, Vec<_>) =
-        layer_attention(&m, block_count, context_length)?.into_iter().unzip();
-    let rotary = rotary_table(&m, width)?;
-    let query_rows = product(&[heads, width])?;
-    let key_rows = product(&[kv_heads, width])?;
     let rms = |weight: WeightDescriptor| RmsNorm { weight, epsilon };
 
     // Projections and tables carry their NVFP4 second-level scale (`X.scale`
@@ -378,68 +367,90 @@ pub fn inspect(
     } else {
         None
     };
-    let blocks = domains
-        .into_iter()
-        .enumerate()
-        .map(|(index, domain)| {
-            let role = |role: &str| format!("blk.{index}.{role}.weight");
-            let sinks = role("attn_sinks");
-            let sinks = if binder.contains(&sinks) {
-                Some(binder.bind(&sinks, &[heads])?)
-            } else {
-                None
-            };
-            let mut weight = |name: &str, shape: &[u64]| binder.bind(&role(name), shape);
-            let attention = Attention {
-                heads,
-                kv_heads,
-                width,
-                query: QueryProjection::Full(weight("attn_q", &[query_rows, hidden])?),
-                query_keys: QueryKeys::Direct,
-                gate: AttentionGate::None,
-                query_norm: HeadNorm::Rms(rms(weight("attn_q_norm", &[width])?)),
-                history: vec![HistorySource::visible(HistoryRows::Own(
-                    RowProducer::Projected(ProjectedRows {
-                        key: weight("attn_k", &[key_rows, hidden])?,
-                        value: ValueSource::Projected(weight("attn_v", &[key_rows, hidden])?),
-                        key_norm: HeadNorm::Rms(rms(weight("attn_k_norm", &[width])?)),
-                        value_norm: ValueNorm::None,
-                        domain,
-                        rounding: RowRounding::None,
-                    }),
-                ))],
-                rotary: rotary.clone(),
-                scale: 1.0 / (width as f64).sqrt(),
-                media_rows: MediaRowAttention::Causal,
-                sinks,
-                output: OutputProjection::Full(weight("attn_output", &[hidden, query_rows])?),
-            };
-            let feed_forward = DenseFfn {
-                intermediate,
-                up: FeedForwardUp::Gated {
-                    activation: ActivationFunction::Silu,
-                    limit: None,
-                    gate: weight("ffn_gate", &[intermediate, hidden])?,
-                    up: weight("ffn_up", &[intermediate, hidden])?,
-                },
-                down: weight("ffn_down", &[hidden, intermediate])?,
-            };
-            Ok(Block {
-                sublayers: vec![
-                    Sublayer {
-                        input: InputNorm::Rms(rms(weight("attn_norm", &[hidden])?)),
-                        op: Operator::Attention(Box::new(attention)),
-                        output: OutputForm::Residual,
+
+    let (residual, blocks, block_attention) = if single_pass_mhc {
+        deepseek41_dspark_blocks(
+            &m,
+            &mut binder,
+            block_count,
+            hidden,
+            heads,
+            kv_heads,
+            width,
+            epsilon,
+        )?
+    } else {
+        let (domains, block_attention): (Vec<_>, Vec<_>) =
+            layer_attention(&m, block_count, context_length, false)?
+                .into_iter()
+                .unzip();
+        let rotary = rotary_table(&m, width)?;
+        let query_rows = product(&[heads, width])?;
+        let key_rows = product(&[kv_heads, width])?;
+        let blocks = domains
+            .into_iter()
+            .enumerate()
+            .map(|(index, domain)| {
+                let role = |role: &str| format!("blk.{index}.{role}.weight");
+                let sinks = role("attn_sinks");
+                let sinks = if binder.contains(&sinks) {
+                    Some(binder.bind(&sinks, &[heads])?)
+                } else {
+                    None
+                };
+                let mut weight = |name: &str, shape: &[u64]| binder.bind(&role(name), shape);
+                let attention = Attention {
+                    heads,
+                    kv_heads,
+                    width,
+                    query: QueryProjection::Full(weight("attn_q", &[query_rows, hidden])?),
+                    query_keys: QueryKeys::Direct,
+                    gate: AttentionGate::None,
+                    query_norm: HeadNorm::Rms(rms(weight("attn_q_norm", &[width])?)),
+                    history: vec![HistorySource::visible(HistoryRows::Own(
+                        RowProducer::Projected(ProjectedRows {
+                            key: weight("attn_k", &[key_rows, hidden])?,
+                            value: ValueSource::Projected(weight("attn_v", &[key_rows, hidden])?),
+                            key_norm: HeadNorm::Rms(rms(weight("attn_k_norm", &[width])?)),
+                            value_norm: ValueNorm::None,
+                            domain,
+                            rounding: RowRounding::None,
+                        }),
+                    ))],
+                    rotary: rotary.clone(),
+                    scale: 1.0 / (width as f64).sqrt(),
+                    media_rows: MediaRowAttention::Causal,
+                    sinks,
+                    output: OutputProjection::Full(weight("attn_output", &[hidden, query_rows])?),
+                };
+                let feed_forward = DenseFfn {
+                    intermediate,
+                    up: FeedForwardUp::Gated {
+                        activation: ActivationFunction::Silu,
+                        limit: None,
+                        gate: weight("ffn_gate", &[intermediate, hidden])?,
+                        up: weight("ffn_up", &[intermediate, hidden])?,
                     },
-                    Sublayer {
-                        input: InputNorm::Rms(rms(weight("ffn_norm", &[hidden])?)),
-                        op: Operator::DenseFfn(Box::new(feed_forward)),
-                        output: OutputForm::Residual,
-                    },
-                ],
+                    down: weight("ffn_down", &[hidden, intermediate])?,
+                };
+                Ok(Block {
+                    sublayers: vec![
+                        Sublayer {
+                            input: InputNorm::Rms(rms(weight("attn_norm", &[hidden])?)),
+                            op: Operator::Attention(Box::new(attention)),
+                            output: OutputForm::Residual,
+                        },
+                        Sublayer {
+                            input: InputNorm::Rms(rms(weight("ffn_norm", &[hidden])?)),
+                            op: Operator::DenseFfn(Box::new(feed_forward)),
+                            output: OutputForm::Residual,
+                        },
+                    ],
+                })
             })
-        })
-        .collect::<Result<Vec<_>, Error>>()?;
+            .collect::<Result<Vec<_>, Error>>()?;
+        (ResidualForm::Single, blocks, block_attention)
+    };
 
     let convolutions = block_convolutions(&m, &mut binder, hidden, block_count)?;
     let dspark = binder.contains("markov_w1.weight");
@@ -512,9 +523,27 @@ pub fn inspect(
                 "a DSpark draft without its confidence head is not admitted".into(),
             ));
         }
-        let confidence = ConfidenceHead {
-            weight: binder.bind("conf_proj.weight", &[hidden + rank])?,
-            bias: binder.bind("conf_proj.bias", &[1])?,
+        let conf_weight_shape = directory
+            .tensor("conf_proj.weight")
+            .map(|tensor| tensor.shape.as_slice());
+        let confidence = if conf_weight_shape == Some(&[1, hidden + rank]) {
+            ConfidenceHead {
+                weight: binder.bind("conf_proj.weight", &[1, hidden + rank])?,
+                bias: if binder.contains("conf_proj.bias") {
+                    Some(binder.bind("conf_proj.bias", &[1])?)
+                } else {
+                    None
+                },
+            }
+        } else {
+            ConfidenceHead {
+                weight: binder.bind("conf_proj.weight", &[hidden + rank])?,
+                bias: if binder.contains("conf_proj.bias") {
+                    Some(binder.bind("conf_proj.bias", &[1])?)
+                } else {
+                    None
+                },
+            }
         };
         DraftMethod::DSpark { markov, confidence }
     } else {
@@ -541,6 +570,7 @@ pub fn inspect(
         embedding,
         output,
         embedding_scale: m.optional_positive_number("embedding_scale")?.unwrap_or(1.0),
+        residual,
         blocks,
         block_attention,
         convolutions,
@@ -762,6 +792,182 @@ fn candidate_corrector(
     })
 }
 
+/// DeepSeek V4.1 DSpark blocks (`dflash.hyper_connection.single_pass = true`):
+/// 4-stream single-pass Sinkhorn mHC, window-only MLA attention (trailing
+/// adjacent rotary with inverse output rotation), and sqrt-softplus MoE with a
+/// shared expert and SwiGLU clamps. Shares its operator binders with
+/// `deepseek41`.
+#[allow(clippy::too_many_arguments)]
+fn deepseek41_dspark_blocks(
+    m: &Metadata<'_>,
+    binder: &mut Tensors<'_>,
+    block_count: u64,
+    hidden: u64,
+    heads: u64,
+    kv_heads: u64,
+    width: u64,
+    epsilon: f64,
+) -> Result<(ResidualForm, Vec<Block>, Vec<BlockAttention>), Error> {
+    if kv_heads != 1 {
+        return Err(Error::Geometry(format!(
+            "DeepSeek V4.1 DSpark requires attention.head_count_kv = 1, got {kv_heads}"
+        )));
+    }
+    m.invariant_count(
+        "expert_gating_func",
+        binders::SQRT_SOFTPLUS,
+        "4 (sqrt-softplus)",
+    )?;
+    let ratios = m.counts("attention.compress_ratios")?;
+    if ratios.len() as u64 != block_count || ratios.iter().any(|ratio| *ratio != 0) {
+        return Err(Error::Geometry(format!(
+            "DeepSeek V4.1 DSpark requires {block_count} zero compress_ratios, got {ratios:?}"
+        )));
+    }
+    let streams = m.integer("hyper_connection.count")?;
+    let sinkhorn_iterations = m.integer("hyper_connection.sinkhorn_iterations")?;
+    let hc_epsilon = m.positive_number("hyper_connection.epsilon")?;
+    let residual = ResidualForm::HyperConnections(HyperConnections {
+        streams,
+        mixing: HyperConnectionMixing::Sinkhorn {
+            iterations: sinkhorn_iterations,
+            epsilon: hc_epsilon,
+            norm_epsilon: epsilon,
+            input: SinkhornInput::PreviousSite,
+        },
+    });
+    let window = m.integer("attention.sliding_window")?;
+    let block_attention = match m.value("attention.causal") {
+        // DeepSeek V4.1 DSpark's block rows attend the full block bidirectionally
+        // (`get_dspark_topk_idxs`), and the converter omits `dflash.attention.causal`.
+        None => vec![BlockAttention::Bidirectional; block_count as usize],
+        Some(Value::Scalar(Scalar::Bool(causal))) => vec![
+            if *causal {
+                BlockAttention::Causal
+            } else {
+                BlockAttention::Bidirectional
+            };
+            block_count as usize
+        ],
+        Some(Value::Array(_)) => m
+            .flags("attention.causal", block_count)?
+            .into_iter()
+            .map(|causal| {
+                if causal {
+                    BlockAttention::Causal
+                } else {
+                    BlockAttention::Bidirectional
+                }
+            })
+            .collect(),
+        Some(_) => {
+            return Err(Error::Metadata {
+                key: m.key("attention.causal"),
+                expected: "a BOOL or ARRAY<BOOL> with one entry per layer",
+            })
+        }
+    };
+    let rotated = m.integer("rope.dimension_count")?;
+    let base = m.positive_number("rope.freq_base")?;
+    let rotary = rotary::laid_out(
+        rotated,
+        width,
+        base,
+        binders::DEEPSEEK41_ROTARY_LAYOUT,
+        OutputRotary::Inverse,
+    )?;
+    let attention_form = binders::MlaWindowForm {
+        hidden,
+        heads,
+        width,
+        query_rank: m.integer("attention.q_lora_rank")?,
+        window,
+        groups: m.integer("attention.output_group_count")?,
+        output_rank: m.integer("attention.output_lora_rank")?,
+        epsilon,
+    };
+    let experts = m.integer("expert_count")?;
+    let selected = m.integer("expert_used_count")?;
+    let intermediate = m.integer("expert_feed_forward_length")?;
+    let shared = match m.default_count("expert_shared_count", 0)? {
+        0 => None,
+        count => Some(product(&[count, intermediate])?),
+    };
+    let normalization = match m.flag("expert_weights_norm")? && selected > 1 {
+        true => RouteNormalization::SumPlusEpsilon(binders::ROUTE_EPSILON),
+        false => RouteNormalization::None,
+    };
+    let scale = m.positive_number("expert_weights_scale")?;
+    let clamp = |key: &str| -> Result<Vec<Option<GluLimit>>, Error> {
+        m.uniform_or_layer_numbers(key, block_count)?
+            .into_iter()
+            .map(|limit| match limit == 0.0 {
+                true => Ok(None),
+                false => binders::glu_limit(m, key, limit)
+                    .map(Some)
+                    .map_err(|error| Error::Geometry(error.to_string())),
+            })
+            .collect()
+    };
+    let clamps: Vec<(Option<GluLimit>, Option<GluLimit>)> = clamp("swiglu_clamp_exp")?
+        .into_iter()
+        .zip(clamp("swiglu_clamp_shexp")?)
+        .collect();
+    let mut blocks = Vec::with_capacity(block_count as usize);
+    for layer in 0..block_count {
+        let prefix = format!("blk.{layer}.");
+        let mut bind = |name: &str, shape: &[u64]| -> Result<WeightDescriptor, FamilyError> {
+            binder
+                .bind(&format!("{prefix}{name}"), shape)
+                .map_err(FamilyError::from)
+        };
+        let attention = binders::mla_window_attention(&mut bind, &attention_form, rotary.clone(), None)
+            .map_err(|error| Error::Geometry(error.to_string()))?;
+        let (routed_limit, shared_limit) = clamps[layer as usize];
+        let routed = binders::routed(
+            &mut bind,
+            binders::RoutedForm {
+                experts,
+                selected,
+                intermediate,
+                hidden,
+                shared,
+                score: ScoreFunction::SqrtSoftplus,
+                media_bias: false,
+                normalization,
+                scale,
+                routed_limit,
+                shared_limit,
+            },
+        )
+        .map_err(|error| Error::Geometry(error.to_string()))?;
+        let attn_sublayer = binders::sinkhorn_sited(
+            &mut bind,
+            streams,
+            hidden,
+            epsilon,
+            "attn",
+            "attn_norm",
+            Operator::Attention(Box::new(attention)),
+        )
+        .map_err(|error| Error::Geometry(error.to_string()))?;
+        let ffn_sublayer = binders::sinkhorn_sited(
+            &mut bind,
+            streams,
+            hidden,
+            epsilon,
+            "ffn",
+            "ffn_norm",
+            Operator::RoutedFfn(Box::new(routed)),
+        )
+        .map_err(|error| Error::Geometry(error.to_string()))?;
+        blocks.push(Block {
+            sublayers: vec![attn_sublayer, ffn_sublayer],
+        });
+    }
+    Ok((residual, blocks, block_attention))
+}
+
 /// History windows and block causality are independent checkpoint properties.
 /// Causality must be explicit: one BOOL broadcasts, ARRAY<BOOL> names each layer.
 /// A sliding layer reads its declared window; a full layer reads at most the
@@ -771,9 +977,11 @@ fn layer_attention(
     m: &Metadata<'_>,
     block_count: u64,
     context_length: u64,
+    default_bidirectional: bool,
 ) -> Result<Vec<(TokenDomain, BlockAttention)>, Error> {
     let window = m.optional_integer("attention.sliding_window")?;
     let causal = match m.value("attention.causal") {
+        None if default_bidirectional => vec![false; block_count as usize],
         None => return Err(Error::MissingCausality),
         Some(Value::Scalar(Scalar::Bool(causal))) => vec![*causal; block_count as usize],
         Some(Value::Array(_)) => m.flags("attention.causal", block_count)?,

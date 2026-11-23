@@ -173,6 +173,14 @@ pub(crate) fn admit_transforms(
                     ));
                 }
             }
+            ImportTransform::DraftQ4_0 => {
+                if !descriptor.is_draft_q4_0() || !crate::shortlist::admits_draft_q4_0(source, stored) {
+                    return Err(format!(
+                        "{:?}: a draft q4_0 weight must be its descriptor's only transform on a decodable 32-aligned 2D/3D tensor",
+                        descriptor.name
+                    ));
+                }
+            }
             _ => {}
         }
         // The shape after this transform: its prefix's, which also checks
@@ -329,9 +337,9 @@ pub(crate) fn apply(
                     descriptor.name
                 ));
             }
-            ImportTransform::Shortlist => {
+            ImportTransform::Shortlist | ImportTransform::DraftQ4_0 => {
                 return Err(format!(
-                    "{:?}: a shortlist projection is quantized by `upload_bytes`",
+                    "{:?}: a quantized draft weight is quantized by `upload_bytes`",
                     descriptor.name
                 ));
             }
@@ -409,6 +417,9 @@ pub(crate) fn upload_bytes(
     }
     if plan.descriptor.is_shortlist() {
         return crate::shortlist::quantize(plan.source, shape, &bytes);
+    }
+    if plan.descriptor.is_draft_q4_0() {
+        return crate::shortlist::quantize_q4_0(plan.source, shape, &bytes);
     }
     let grid = stored
         .grid()

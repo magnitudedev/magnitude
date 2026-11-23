@@ -301,7 +301,7 @@ fn lfm2_dspark_samples_from_the_anchor_with_markov_and_confidence() {
         assert_eq!(markov.projection.shape, [128000, 256]);
         assert_eq!(confidence.weight.shape, [2048 + 256]);
         assert!(confidence.weight.transforms.is_empty());
-        assert_eq!(confidence.bias.shape, [1]);
+        assert_eq!(confidence.bias.as_ref().unwrap().shape, [1]);
         let Operator::Attention(attention) = &definition.blocks[0].sublayers[0].op else {
             unreachable!()
         };

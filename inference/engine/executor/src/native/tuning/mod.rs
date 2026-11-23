@@ -2307,6 +2307,14 @@ impl ModelInputs<'_> {
                     .ok_or("head tuning scope has no block")?;
                 (Some(block), index, &head.residual)
             }
+            WeightScope::DraftSublayer(index) => {
+                let draft = self
+                    .definition
+                    .draft
+                    .as_ref()
+                    .ok_or("draft tuning scope without a draft definition")?;
+                (draft.blocks.get(index.block as usize), index, &draft.residual)
+            }
             _ => return Ok(None),
         };
         block

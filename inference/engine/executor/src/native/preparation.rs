@@ -1333,6 +1333,17 @@ impl<'a> Preparation<'a> {
             bindings,
             tap_rows::Elements { A: activation }
         );
+        let collapse = match taps.streams {
+            None => Some(None),
+            Some(streams) => self
+                .spec
+                .fixed(
+                    &format!("H={} S={streams} P=0", self.hidden),
+                    &[("H", self.hidden), ("S", streams), ("P", 0)],
+                    stream_collapse::native_entry(),
+                )?
+                .map(Some),
+        };
         let fusion = self.projection(ProjectRowsTuning {
             weight: taps.fusion,
             activation,
@@ -1347,9 +1358,12 @@ impl<'a> Preparation<'a> {
             bindings,
             feature_rows::Elements { A: activation }
         );
-        if let (Some(tap), Some(fusion), Some(features)) = (tap, fusion, features) {
+        if let (Some(tap), Some(collapse), Some(fusion), Some(features)) =
+            (tap, collapse, fusion, features)
+        {
             self.target.taps = Some(TapKernels {
                 tap,
+                collapse,
                 fusion,
                 features,
             });
@@ -3667,15 +3681,34 @@ impl<'a> Preparation<'a> {
                 ]
             },
         ));
-        let dense_layers = BindingLayers::of(
+        let dense_layers = BindingLayers::of(draft_plan.blocks().iter().enumerate().filter_map(
+            |(index, b)| match b.feed_forward {
+                FeedForwardProgramSlot::Dense(binding) => Some((binding, draft_scope(index, 1))),
+                _ => None,
+            },
+        ));
+        let routed_layers = BindingLayers::of(draft_plan.blocks().iter().enumerate().filter_map(
+            |(index, b)| match b.feed_forward {
+                FeedForwardProgramSlot::Routed(binding) => Some((binding, draft_scope(index, 1))),
+                _ => None,
+            },
+        ));
+        let general_routed_layers = BindingLayers::of(
             draft_plan
                 .blocks()
                 .iter()
                 .enumerate()
-                .map(|(index, b)| (b.feed_forward, draft_scope(index, 1))),
+                .filter_map(|(index, b)| match b.feed_forward {
+                    FeedForwardProgramSlot::GeneralRouted(binding) => {
+                        Some((binding, draft_scope(index, 1)))
+                    }
+                    _ => None,
+                }),
         );
         let mut registered_attention = HashSet::new();
         let mut registered_dense = HashSet::new();
+        let mut registered_routed = HashSet::new();
+        let mut registered_general_routed = HashSet::new();
         for b in draft_plan.blocks() {
             for attention in [b.attention, b.injection] {
                 if !registered_attention.insert(attention)
@@ -3689,15 +3722,52 @@ impl<'a> Preparation<'a> {
                     self.draft_kernels().attention.insert(attention, kernels);
                 }
             }
-            if registered_dense.insert(b.feed_forward)
-                && !self.draft_kernels().dense.contains_key(&b.feed_forward)
-            {
-                if let Some(kernels) =
-                    self.dense(b.feed_forward, dense_layers.scopes(b.feed_forward))?
-                {
-                    self.draft_kernels().dense.insert(b.feed_forward, kernels);
+            match b.feed_forward {
+                FeedForwardProgramSlot::Dense(dense) => {
+                    if registered_dense.insert(dense)
+                        && !self.draft_kernels().dense.contains_key(&dense)
+                    {
+                        if let Some(kernels) = self.dense(dense, dense_layers.scopes(dense))? {
+                            self.draft_kernels().dense.insert(dense, kernels);
+                        }
+                    }
+                }
+                FeedForwardProgramSlot::Routed(routed) => {
+                    if registered_routed.insert(routed)
+                        && !self.draft_kernels().routed.contains_key(&routed)
+                    {
+                        if let Some(kernels) =
+                            self.routed(routed, routed_layers.scopes(routed))?
+                        {
+                            self.draft_kernels().routed.insert(routed, kernels);
+                        }
+                    }
+                }
+                FeedForwardProgramSlot::GeneralRouted(routed) => {
+                    if registered_general_routed.insert(routed)
+                        && !self.draft_kernels().general_routed.contains_key(&routed)
+                    {
+                        if let Some(kernels) = self
+                            .general_routed(routed, general_routed_layers.scopes(routed))?
+                        {
+                            self.draft_kernels().general_routed.insert(routed, kernels);
+                        }
+                    }
+                }
+                FeedForwardProgramSlot::Parallel(_) => {
+                    return Err(CatalogFailure::Preparation {
+                        entry: "draft_feed_forward",
+                        bindings: format!("{:?}", b.feed_forward),
+                        outcome: "draft layers run no parallel feed-forward form".into(),
+                    });
                 }
             }
+        }
+        if let Some(binding) = draft_plan.streams() {
+            let mut streams = std::mem::take(&mut self.draft_kernels().streams);
+            let result = self.streams(&mut streams, &[], &[binding]);
+            self.draft_kernels().streams = streams;
+            result?;
         }
         let b = draft_plan.embedding();
         let embedding = self.spec.fixed(

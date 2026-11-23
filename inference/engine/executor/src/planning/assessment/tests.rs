@@ -977,6 +977,7 @@ fn a_separate_draft_reads_the_projection_as_it_is_stored() {
             output: owns_output
                 .then(|| WeightDescriptor::stored("draft_output", &[vocabulary, hidden])),
             embedding_scale: 1.0,
+            residual: magnitude_family_contracts::ResidualForm::Single,
             blocks: definition.decoder.blocks.clone(),
             block_attention: vec![BlockAttention::Bidirectional],
             output_norm: norm("draft_output_norm"),

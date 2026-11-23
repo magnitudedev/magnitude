@@ -672,9 +672,6 @@ impl<'a> BlockGraphInputs<'a> {
             output_scales,
         }
         .split(bank, slot.per_layer(), slot.ngram())?;
-        if numbers.streams.is_some() && tap.is_some() {
-            return Err("a draft taps residual streams".into());
-        }
         let last = block_index + 1 == geometry.blocks.len();
         let exit = match (&numbers.streams, &geometry.exit.norm) {
             (None, _) => None,
@@ -947,7 +944,11 @@ fn block_graph<'a, G: GraphDraft + 'a>(
         RunStage::Combine => (hidden, BlockState::default()),
         RunStage::Whole | RunStage::Resident | RunStage::Front => {
             if let Some(taps) = taps.as_mut().filter(|taps| taps.positions.entry) {
-                taps.ports.entry = Some(taps.tap(graph, &hidden.rows)?);
+                taps.ports.entry = Some(if streams.is_some() && !shape.first {
+                    taps.tap_streams(graph, &hidden.rows, constants)?
+                } else {
+                    taps.tap(graph, &hidden.rows)?
+                });
             }
             // Block 0 widens the embedded rows into the streams.
             let hidden = match (streams, streams_entries) {
@@ -975,7 +976,11 @@ fn block_graph<'a, G: GraphDraft + 'a>(
                 if shape.sublayers.feed_forward.is_none() {
                     return Err("a draft taps the feed-forward of a lone mixer block".into());
                 }
-                taps.ports.middle = Some(taps.tap(graph, &mixed.rows)?);
+                taps.ports.middle = Some(if streams.is_some() {
+                    taps.tap_streams(graph, &mixed.rows, constants)?
+                } else {
+                    taps.tap(graph, &mixed.rows)?
+                });
             }
             (mixed, state_ports)
         }
@@ -1070,7 +1075,11 @@ fn block_graph<'a, G: GraphDraft + 'a>(
         _ => return Err("the decoder's exit disagrees with its streams' mixing".into()),
     };
     if let Some(taps) = taps.as_mut().filter(|taps| taps.positions.output) {
-        taps.ports.output = Some(taps.tap(graph, &output.rows)?);
+        taps.ports.output = Some(if streams.is_some() && shape.exit.is_none() {
+            taps.tap_streams(graph, &output.rows, constants)?
+        } else {
+            taps.tap(graph, &output.rows)?
+        });
     }
     let span = begun.map(|begun| (begun, graph.span_mark()));
     Ok(BlockGraphParts {
@@ -1147,7 +1156,15 @@ fn checked_block_graph<G: ElementBoundDraft + 'static>(
     let parts = block_graph(
         &mut graph,
         BlockEntries {
-            tap: shape.tap.map(|positions| TapEntry { entry: G::bind(&tap_elements[..]), positions }),
+            tap: shape.tap.map(|positions| TapEntry {
+                entry: G::bind(&tap_elements[..]),
+                collapse: numbers
+                    .sublayers
+                    .streams
+                    .as_ref()
+                    .map(|streams| (streams.streams, G::bind(&[][..]))),
+                positions,
+            }),
             mixer: entries.mixer.entries()?,
             feed_forward: FeedForwardGraph {
                 entries: entries.feed_forward.as_ref().map(block::CheckedFeedForwardEntries::entries::<G>),

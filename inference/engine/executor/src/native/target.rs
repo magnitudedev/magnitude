@@ -410,6 +410,9 @@ pub struct PerLayerKernels {
 #[derive(Clone, Debug)]
 pub struct TapKernels {
     pub tap: NativeKernel<tap_rows::Entry>,
+    /// Collapses multi-stream hyper-connection rows to their mean (`P = 0`)
+    /// before `tap_rows`, when tapping a hyper-connection target.
+    pub collapse: Option<NativeKernel<magnitude_kernels::stream_collapse::Entry>>,
     pub fusion: RangedKernels<project_rows::Entry>,
     pub features: NativeKernel<feature_rows::Entry>,
 }

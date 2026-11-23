@@ -2389,6 +2389,7 @@ dependencies = [
  "magnitude-artifacts",
  "magnitude-family-common",
  "magnitude-family-contracts",
+ "magnitude-family-deepseek41",
  "magnitude-family-lfm2",
  "magnitude-family-llama",
  "magnitude-family-muse-glimmer",

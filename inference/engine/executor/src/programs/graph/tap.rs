@@ -8,7 +8,8 @@
 //! blocks tapped at the same positions share a plan.
 
 use super::{GraphError, draft::GraphDraft};
-use magnitude_kernels::tap_rows;
+use crate::programs::native_constants::GraphConstant;
+use magnitude_kernels::{stream_collapse, tap_rows};
 use seismic::{Dim, Element, NativePort, WorkflowTensor};
 
 /// Where a block's graph taps its residual stream.
@@ -31,6 +32,8 @@ impl TapPositions {
 /// A tapped graph's entry and the positions the block taps.
 pub(crate) struct TapEntry<'a, G: GraphDraft + 'a> {
     pub entry: G::Binding<'a, tap_rows::Entry>,
+    /// Mean-collapse (`P = 0`) for tapping multi-stream hyper-connection rows.
+    pub collapse: Option<(u64, G::Binding<'a, stream_collapse::Entry>)>,
     pub positions: TapPositions,
 }
 
@@ -47,6 +50,7 @@ pub(crate) struct TapPorts {
 /// The draft input rows of a tapped graph, before any position is tapped.
 pub(crate) struct Taps<'a, G: GraphDraft + 'a> {
     entry: G::Binding<'a, tap_rows::Entry>,
+    collapse: Option<(u64, G::Binding<'a, stream_collapse::Entry>)>,
     /// `T`: the taps the draft input rows hold.
     taps: Dim,
     hidden_width: Dim,
@@ -67,6 +71,7 @@ impl<'a, G: GraphDraft + 'a> Taps<'a, G> {
     ) -> Result<Self, GraphError> {
         Ok(Self {
             entry: tap.entry,
+            collapse: tap.collapse,
             taps: width.checked_div(hidden_width).ok_or("draft input rows of no hidden width")?,
             hidden_width: hidden_width.clone(),
             rows: rows.clone(),
@@ -103,5 +108,37 @@ impl<'a, G: GraphDraft + 'a> Taps<'a, G> {
             },
         )?;
         Ok(index)
+    }
+
+    /// Collapse multi-stream `[M, S * D]` hyper-connection rows into their
+    /// unweighted stream mean (`stream_collapse` with `P = 0`) and tap the
+    /// resulting `[M, D]` rows.
+    pub fn tap_streams(
+        &mut self,
+        graph: &mut G,
+        hidden: &WorkflowTensor,
+        constants: &mut Vec<GraphConstant>,
+    ) -> Result<NativePort, GraphError> {
+        let (streams, collapse_entry) = self
+            .collapse
+            .ok_or("tapping multi-stream target rows without a stream_collapse entry")?;
+        let s = Dim::from(streams);
+        let pre = GraphConstant::absent_rows(graph, self.rows.clone(), Some("M"), constants)?;
+        let mean = graph
+            .enqueue(
+                collapse_entry,
+                &[
+                    ("M", &self.rows),
+                    ("H", &self.hidden_width),
+                    ("S", &s),
+                    ("P", &Dim::from(0u64)),
+                ],
+                stream_collapse::WorkflowArgs {
+                    hidden: (&hidden.reshape(&[&self.rows, &s, &self.hidden_width])).into(),
+                    pre: (&pre).into(),
+                },
+            )?
+            .value;
+        self.tap(graph, &mean)
     }
 }

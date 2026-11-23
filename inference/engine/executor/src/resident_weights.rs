@@ -104,6 +104,11 @@ impl ResidentRoles {
             {
                 continue;
             }
+            let narrowed = residency
+                .planned(role)
+                .filter(|plan| plan.descriptor.is_draft_q4_0())
+                .map(|plan| plan.descriptor.clone());
+            let descriptor = narrowed.as_ref().unwrap_or(descriptor);
             let weight = residency.import_gguf(
                 charges,
                 artifact,

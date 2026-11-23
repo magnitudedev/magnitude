@@ -14,10 +14,10 @@ use crate::error::PlanError;
 use crate::operators::routed::GeneralRoutedBinding;
 use crate::operators::short_conv::ShortConvBinding;
 use crate::operators::state_space::StateSpaceBinding;
-use crate::operators::streams::{BlockStreams, SinkhornExit};
+use crate::operators::streams::{BlockStreams, SinkhornBinding, SinkhornExit};
 use crate::operators::vision::{VisionGeometry, VisionKernel, VisionProgram, VisionProjection};
 use crate::operators::{
-    self, CausalHeadBlock, attention_slot, dense_slot, feed_forward_slot, mixer_slot, paired_block,
+    self, CausalHeadBlock, attention_slot, feed_forward_slot, mixer_slot, paired_block,
 };
 use magnitude_family_contracts::{
     AffinePart, CandidateCorrector, CorrectorSite, CorrectorWeight, DraftDefinition,
@@ -199,6 +199,9 @@ pub struct TapProgramPlan {
     /// The extent of the fusion projection's accumulator-scale port.
     pub fusion_scale: u64,
     pub activation: Element,
+    /// Stream count when tapping a multi-stream hyper-connection target
+    /// (`stream_collapse` with `P = 0` computes the per-row stream mean).
+    pub streams: Option<u64>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -270,12 +273,12 @@ impl TargetProgramPlan {
 
 /// One draft layer: its attention over the fresh block, the same attention
 /// injecting context K/V (its input norm the draft's fusion norm), and its
-/// dense feed-forward.
+/// feed-forward (dense or resident routed MoE).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct DraftBlockBinding {
     pub attention: AttentionBinding,
     pub injection: AttentionBinding,
-    pub feed_forward: DenseBinding,
+    pub feed_forward: FeedForwardProgramSlot,
 }
 
 /// DSpark's Markov table (an embedding) and its projection onto the
@@ -384,12 +387,18 @@ pub struct DraftProgramPlan {
     corrector: Option<CorrectorBinding>,
     /// The draft's fusion norm, which the corrector's anchor state reads.
     fusion_norm: Element,
+    /// Sinkhorn hyper-connection streams, when the draft backbone uses them.
+    streams: Option<SinkhornBinding>,
     /// The draft's (and its target's) hidden width.
     hidden: u64,
     activation: Element,
 }
 
 impl DraftProgramPlan {
+    pub fn streams(&self) -> Option<SinkhornBinding> {
+        self.streams
+    }
+
     pub fn hidden(&self) -> u64 {
         self.hidden
     }
@@ -929,11 +938,16 @@ pub(super) fn derive_program_plan(
     let taps = separate
         .map(|draft| {
             let fusion = planned_scalable(target, WeightScope::Draft, WeightKind::DraftFusion)?;
+            let streams = match &decoder.residual {
+                magnitude_family_contracts::ResidualForm::Single => None,
+                magnitude_family_contracts::ResidualForm::HyperConnections(hc) => Some(hc.streams),
+            };
             Ok::<_, PlanError>(TapProgramPlan {
                 points: draft.taps.clone(),
                 fusion: fusion.element,
                 fusion_scale: fusion.scale,
                 activation: active_element,
+                streams,
             })
         })
         .transpose()?;
@@ -1207,22 +1221,54 @@ fn draft_program_plan(
             KvCodec::Dense,
             None,
         )?;
-        let dense = dense_slot(
+        let feed_forward_slot = feed_forward_slot(
             &paired
                 .feed_forward
                 .ok_or(PlanError::Unsupported("draft layer without feed-forward"))?,
-            |kind| lookup(weights, feed_forward, kind),
-            |kind| planned_scalable(weights, feed_forward, kind),
+            hidden,
+            feed_forward,
+            |scope, kind| lookup(weights, scope, kind),
+            |scope, kind| planned_scalable(weights, scope, kind),
             activation,
         )?;
         blocks.push(DraftBlockBinding {
             attention,
             injection: attention.as_key_value_only(fusion_norm),
-            feed_forward: dense,
+            feed_forward: feed_forward_slot,
         });
     }
+    let streams = operators::streams::StreamsGeometry::from_residual(hidden, &draft.residual)?
+        .map(|geometry| {
+            let (input, mixing) = match geometry.mixing {
+                operators::streams::StreamsMixing::Sinkhorn { input, numerics } => {
+                    (input, numerics)
+                }
+                operators::streams::StreamsMixing::LowRank { .. } => {
+                    return Err(PlanError::Unsupported(
+                        "draft layers admit Sinkhorn hyper-connections only",
+                    ));
+                }
+            };
+            let exit = match input {
+                magnitude_family_contracts::SinkhornInput::PreviousSite => {
+                    operators::streams::SinkhornExit::LastPre
+                }
+                magnitude_family_contracts::SinkhornInput::OwnSite => {
+                    operators::streams::SinkhornExit::Mean
+                }
+            };
+            Ok(SinkhornBinding {
+                hidden: geometry.hidden,
+                streams: geometry.streams,
+                input,
+                mixing,
+                exit,
+            })
+        })
+        .transpose()?;
     Ok(DraftProgramPlan {
         blocks,
+        streams,
         embedding: EmbeddingBinding {
             table: match &draft.embedding {
                 DraftEmbedding::Target => {

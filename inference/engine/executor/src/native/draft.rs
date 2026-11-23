@@ -1,13 +1,16 @@
-use super::{AttentionKernels, DenseKernels, RangedKernels};
-use crate::{AttentionBinding, DenseBinding, ScalableWeight};
+use super::{
+    AttentionKernels, AttestedFeedForward, DenseKernels, GeneralRoutedKernels, RangedKernels,
+    RoutedKernels, SinkhornKernels, StreamsEntryKernels,
+};
+use crate::{AttentionBinding, DenseBinding, GeneralRoutedBinding, RoutedBinding, ScalableWeight};
 use magnitude_family_contracts::{
     AffinePart, CorrectorSite, CorrectorWeight, SublayerIndex, WeightKind, WeightScope,
 };
 use magnitude_kernels::{
     corrector_attention, corrector_factors, corrector_features, corrector_nodes, corrector_path,
     corrector_rows, dense_output, draft_convolve_input, draft_convolve_residual, draft_gated_rows,
-    draft_path_step, draft_top_k, embedding_rows, project_rows, readout_features_rows, sample_rows,
-    shape_rows, widen_rows,
+    draft_path_step, draft_top_k, embedding_rows, project_rows, readout_features_rows, repeat_rows,
+    sample_rows, shape_rows, widen_rows,
 };
 use seismic::{Element, NativeKernel};
 use std::collections::HashMap;
@@ -21,6 +24,9 @@ pub struct DraftKernels {
     /// attention with the fusion norm as its input norm).
     pub(super) attention: HashMap<AttentionBinding, AttentionKernels>,
     pub(super) dense: HashMap<DenseBinding, DenseKernels>,
+    pub(super) routed: HashMap<RoutedBinding, RoutedKernels>,
+    pub(super) general_routed: HashMap<GeneralRoutedBinding, GeneralRoutedKernels>,
+    pub(super) streams: StreamsEntryKernels,
     /// Embeds the block's tokens (raw rows), and a corrector's candidates.
     pub(super) embedding: Option<NativeKernel<embedding_rows::Entry>>,
     /// The output norm and the target's vocabulary projection of the
@@ -96,7 +102,14 @@ pub struct CorrectorKernels {
 pub struct DraftBlockKernels {
     pub attention: AttentionKernels,
     pub injection: AttentionKernels,
-    pub dense: DenseKernels,
+    pub feed_forward: AttestedFeedForward,
+}
+
+/// Sinkhorn hyper-connection stream entries for a multi-stream draft backbone.
+#[derive(Clone, Debug)]
+pub struct AttestedDraftStreams {
+    pub repeat: NativeKernel<repeat_rows::Entry>,
+    pub sinkhorn: SinkhornKernels,
 }
 
 /// DSpark's chain: the Markov memory of the previous token, its projection

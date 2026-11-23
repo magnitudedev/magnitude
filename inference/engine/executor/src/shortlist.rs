@@ -31,10 +31,52 @@ pub(crate) const GROUP: u64 = 64;
 /// Bytes per `gguf_q2_0` (`q2g64`) block: 2-byte f16 scale + 16 bytes of 2-bit codes.
 const Q2_0_BLOCK_BYTES: usize = 18;
 
+/// Values per `gguf_q4_0` (`q4g32s`) block.
+pub(crate) const Q4_0_GROUP: u64 = 32;
+
+/// Bytes per `gguf_q4_0` (`q4g32s`) block: 2-byte f16 scale + 16 bytes of 4-bit codes.
+const Q4_0_BLOCK_BYTES: usize = 18;
+
 /// The GGUF upload element of a shortlist projection (`gguf_q2_0`, repacked
 /// into `q2g64@rows16` / `q2g64@mma16` / `q2g64` by the standard importer).
 pub(crate) fn upload_element() -> Element {
     Element::named("gguf_q2_0").expect("gguf_q2_0 is registered")
+}
+
+/// The GGUF upload element of a narrowed draft-head weight (`gguf_q4_0`,
+/// repacked into `q4g32s@rows32` / `q4g32s@mma16` / `q4g32s@rows16` by the
+/// standard importer).
+pub(crate) fn q4_0_upload_element() -> Element {
+    Element::named("gguf_q4_0").expect("gguf_q4_0 is registered")
+}
+
+/// Whether a 2D `[rows, columns]` or 3D `[experts, rows, columns]` tensor
+/// stored as `source` admits `gguf_q4_0` draft requantization.
+pub(crate) fn admits_draft_q4_0(source: Element, shape: &[u64]) -> bool {
+    if !(shape.len() == 2 || shape.len() == 3) || shape.contains(&0) {
+        return false;
+    }
+    let columns = *shape.last().expect("2D/3D shape");
+    if !columns.is_multiple_of(Q4_0_GROUP) {
+        return false;
+    }
+    source.dtype().is_some() || crate::planning::value_packets(source).is_some()
+}
+
+/// Whether a draft-head weight stored as `source` with `shape` benefits from
+/// `gguf_q4_0` import requantization (strictly wider than `gguf_q4_0` by at
+/// least 1.5x, e.g. `q8_0`, `f16`, `bf16`, `f32`).
+pub(crate) fn benefits_from_draft_q4_0(source: Element, shape: &[u64]) -> bool {
+    if !admits_draft_q4_0(source, shape) {
+        return false;
+    }
+    let Ok(source_bytes) = source.canonical_byte_len(shape) else {
+        return false;
+    };
+    let Ok(q4_bytes) = q4_0_upload_element().canonical_byte_len(shape) else {
+        return false;
+    };
+    source_bytes.saturating_mul(2) >= q4_bytes.saturating_mul(3)
 }
 
 /// Whether a `[rows, columns]` matrix stored as `source` admits shortlist
@@ -83,22 +125,50 @@ pub(crate) fn quantize(source: Element, shape: &[u64], bytes: &[u8]) -> Result<V
             source.name()
         ));
     }
-    let rows = usize::try_from(shape[0]).map_err(|_| "shortlist rows exceed usize")?;
-    let columns = usize::try_from(shape[1]).map_err(|_| "shortlist columns exceed usize")?;
+    quantize_rows(source, shape, bytes, GROUP as usize, Q2_0_BLOCK_BYTES, quantize_row_q2_0)
+}
+
+/// Quantize a 2D `[rows, columns]` or 3D `[experts, rows, columns]` tensor
+/// stored as `source` into `gguf_q4_0` bytes, parallelized across rows.
+pub(crate) fn quantize_q4_0(source: Element, shape: &[u64], bytes: &[u8]) -> Result<Vec<u8>, String> {
+    if !admits_draft_q4_0(source, shape) {
+        return Err(format!(
+            "draft q4_0 quantization does not admit {} of shape {shape:?}",
+            source.name()
+        ));
+    }
+    quantize_rows(source, shape, bytes, Q4_0_GROUP as usize, Q4_0_BLOCK_BYTES, quantize_row_q4_0)
+}
+
+fn quantize_rows(
+    source: Element,
+    shape: &[u64],
+    bytes: &[u8],
+    group: usize,
+    block_bytes: usize,
+    encode_row: fn(&[f32], &mut [u8]),
+) -> Result<Vec<u8>, String> {
+    let columns = usize::try_from(*shape.last().expect("2D/3D shape"))
+        .map_err(|_| "quantize columns exceed usize")?;
+    let rows_u64 = shape[..shape.len() - 1]
+        .iter()
+        .try_fold(1u64, |acc, &dim| acc.checked_mul(dim))
+        .ok_or("quantize rows overflow u64")?;
+    let rows = usize::try_from(rows_u64).map_err(|_| "quantize rows exceed usize")?;
     let expected_src = usize::try_from(
         source
             .canonical_byte_len(shape)
             .map_err(|error| error.to_string())?,
     )
-    .map_err(|_| "shortlist source byte length exceeds usize")?;
+    .map_err(|_| "quantize source byte length exceeds usize")?;
     if bytes.len() != expected_src {
         return Err(format!(
-            "shortlist source byte length {} differs from expected {expected_src}",
+            "quantize source byte length {} differs from expected {expected_src}",
             bytes.len()
         ));
     }
     let src_row_bytes = expected_src / rows;
-    let dst_row_bytes = (columns / GROUP as usize) * Q2_0_BLOCK_BYTES;
+    let dst_row_bytes = (columns / group) * block_bytes;
     let mut out = vec![0u8; rows * dst_row_bytes];
 
     let threads = std::thread::available_parallelism()
@@ -126,7 +196,7 @@ pub(crate) fn quantize(source: Element, shape: &[u64], bytes: &[u8]) -> Result<V
             let chunk_rows = dst_chunk.len() / dst_row_bytes;
             let src_chunk = &bytes[start_row * src_row_bytes..(start_row + chunk_rows) * src_row_bytes];
             handles.push(
-                seismic::threads::spawn_scoped(scope, "shortlist-quantize", move || -> Result<(), String> {
+                seismic::threads::spawn_scoped(scope, "draft-quantize", move || -> Result<(), String> {
                     let mut row_f32 = vec![0.0f32; columns];
                     for r in 0..chunk_rows {
                         let src_row = &src_chunk[r * src_row_bytes..(r + 1) * src_row_bytes];
@@ -148,22 +218,62 @@ pub(crate) fn quantize(source: Element, shape: &[u64], bytes: &[u8]) -> Result<V
                                 *dst = src as f32;
                             }
                         }
-                        quantize_row_q2_0(&row_f32, dst_row);
+                        encode_row(&row_f32, dst_row);
                     }
                     Ok(())
                 })
-                .map_err(|error| format!("shortlist quantization worker spawn failed: {error}"))?,
+                .map_err(|error| format!("draft quantization worker spawn failed: {error}"))?,
             );
         }
         for handle in handles {
             handle
                 .join()
-                .map_err(|_| "shortlist quantization worker panicked".to_string())??;
+                .map_err(|_| "draft quantization worker panicked".to_string())??;
         }
         Ok(())
     })?;
 
     Ok(out)
+}
+
+/// Quantize one row of F32 values (multiple of 32) into `gguf_q4_0` blocks.
+fn quantize_row_q4_0(row: &[f32], out: &mut [u8]) {
+    for (block_vals, block_out) in row
+        .chunks_exact(Q4_0_GROUP as usize)
+        .zip(out.chunks_exact_mut(Q4_0_BLOCK_BYTES))
+    {
+        let vals: &[f32; 32] = block_vals.try_into().expect("32 values");
+        let dst: &mut [u8; 18] = block_out.try_into().expect("18 bytes");
+        quantize_block_q4_0(vals, dst);
+    }
+}
+
+/// Quantize 32 F32 values into one `gguf_q4_0` block (`d (f16) | qs[16]`,
+/// value `p` = `(q - 8) * d`, low nibble = `p < 16`, high nibble = `p >= 16`).
+fn quantize_block_q4_0(values: &[f32; 32], out: &mut [u8; 18]) {
+    let mut amax = 0.0f32;
+    let mut signed_max = 0.0f32;
+    for &v in values {
+        let a = v.abs();
+        if a > amax {
+            amax = a;
+            signed_max = v;
+        }
+    }
+    if amax == 0.0 || !amax.is_finite() {
+        *out = [0u8; 18];
+        return;
+    }
+    let d = signed_max / -8.0;
+    let d_bits = seismic::f16_bits(d);
+    let d_f16 = seismic::exact_f64(DType::F16, u32::from(d_bits)) as f32;
+    let inv = if d_f16 != 0.0 { 1.0 / d_f16 } else { 0.0 };
+    out[0..2].copy_from_slice(&d_bits.to_le_bytes());
+    for j in 0..16 {
+        let lo = (values[j] * inv + 8.5).floor().clamp(0.0, 15.0) as u8;
+        let hi = (values[j + 16] * inv + 8.5).floor().clamp(0.0, 15.0) as u8;
+        out[2 + j] = lo | (hi << 4);
+    }
 }
 
 /// Quantize one row of F32 values (multiple of 64) into `gguf_q2_0` blocks.
@@ -465,6 +575,39 @@ mod tests {
             let nb: f32 = b.iter().map(|x| x * x).sum::<f32>().sqrt();
             let cos = dot / (na * nb);
             assert!(cos > 0.90, "row {r} cosine similarity too low: {cos}");
+        }
+    }
+
+    /// `quantize_q4_0` produces valid `gguf_q4_0` blocks on 3D routed expert
+    /// stacks with >0.995 cosine similarity to the original F32 rows.
+    #[test]
+    fn quantize_q4_0_preserves_direction_on_3d_routed_stack() {
+        let (experts, rows, cols) = (4usize, 6usize, 128usize);
+        let shape = [experts as u64, rows as u64, cols as u64];
+        let mut state = 0xfeed_faceu32;
+        let orig: Vec<f32> = (0..experts * rows * cols)
+            .map(|_| {
+                let u = (next_u32(&mut state) as f32) / (u32::MAX as f32);
+                (u - 0.5) * 2.0
+            })
+            .collect();
+        let src_bytes: Vec<u8> = orig.iter().flat_map(|v| v.to_le_bytes()).collect();
+        let q4_bytes = quantize_q4_0(Element::f32(), &shape, &src_bytes).unwrap();
+        let decoded_bytes =
+            crate::import_transforms::dequantize(q4_0_upload_element(), &shape, &q4_bytes)
+                .unwrap();
+        let decoded: Vec<f32> = decoded_bytes
+            .chunks_exact(4)
+            .map(|c| f32::from_le_bytes(c.try_into().unwrap()))
+            .collect();
+        for r in 0..experts * rows {
+            let a = &orig[r * cols..(r + 1) * cols];
+            let b = &decoded[r * cols..(r + 1) * cols];
+            let dot: f32 = a.iter().zip(b).map(|(x, y)| x * y).sum();
+            let na: f32 = a.iter().map(|x| x * x).sum::<f32>().sqrt();
+            let nb: f32 = b.iter().map(|x| x * x).sum::<f32>().sqrt();
+            let cos = dot / (na * nb);
+            assert!(cos > 0.995, "row {r} q4_0 cosine similarity too low: {cos}");
         }
     }
 }

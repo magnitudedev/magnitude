@@ -10,8 +10,9 @@ use super::{FeedForward, Mixer, PairedBlock, paired_block, role, sublayer_weight
 use crate::error::PlanError;
 use magnitude_family_contracts::{
     AffinePart, AttentionGate, Block, CorrectorSite, CorrectorWeight, DraftDefinition,
-    DraftEmbedding, DraftMethod, HeadHistory, ModelDefinition, OutputForm, ProjectedRows,
-    SublayerIndex, TapPoint, ValueSource, WeightDescriptor, WeightKind, WeightRole, WeightScope,
+    DraftEmbedding, DraftMethod, HeadHistory, HyperConnectionMixing, ModelDefinition, OutputForm,
+    ProjectedRows, ResidualForm, SublayerIndex, TapPoint, ValueSource, WeightDescriptor,
+    WeightKind, WeightRole, WeightScope,
 };
 
 /// The draft weights a target step reads: the fusion projection and the
@@ -157,6 +158,22 @@ pub(crate) fn admit(definition: &ModelDefinition) -> Result<(), PlanError> {
             }
         }
     }
+    let expected_output = match &draft.residual {
+        ResidualForm::Single => OutputForm::Residual,
+        ResidualForm::HyperConnections(form) => match form.mixing {
+            HyperConnectionMixing::Sinkhorn { .. } => OutputForm::Scatter,
+            HyperConnectionMixing::LowRankGated { .. } => {
+                return Err(PlanError::Unsupported(
+                    "draft layers admit Sinkhorn hyper-connections only",
+                ));
+            }
+        },
+    };
+    if !matches!(draft.residual, ResidualForm::Single) && draft.convolutions.is_some() {
+        return Err(PlanError::Unsupported(
+            "convolved draft layers require a single residual stream",
+        ));
+    }
     let epsilon = draft.output_norm.epsilon;
     if draft.fusion_norm.epsilon != epsilon {
         return Err(PlanError::Unsupported(
@@ -171,12 +188,19 @@ pub(crate) fn admit(definition: &ModelDefinition) -> Result<(), PlanError> {
                 "draft layer other than attention and feed-forward",
             ));
         };
-        if !matches!(feed_forward.op, FeedForward::Dense(_))
-            || [paired.mixer_output, feed_forward.output]
-                .iter()
-                .any(|output| **output != OutputForm::Residual)
+        if !matches!(
+            feed_forward.op,
+            FeedForward::Dense(_) | FeedForward::Routed(_) | FeedForward::GeneralRouted(_)
+        ) || [paired.mixer_output, feed_forward.output]
+            .iter()
+            .any(|output| **output != expected_output)
         {
             return Err(PlanError::Unsupported("draft layer form"));
+        }
+        if draft.convolutions.is_some() && !matches!(feed_forward.op, FeedForward::Dense(_)) {
+            return Err(PlanError::Unsupported(
+                "a convolved draft layer requires a dense feed-forward",
+            ));
         }
         // A convolved backbone runs its layers unfused: plain query, key and
         // value projections of the convolved rows.

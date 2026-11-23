@@ -213,7 +213,7 @@ pub(crate) enum AttestedMixer {
     ShortConv(ShortConvKernels),
 }
 
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub(crate) enum AttestedFeedForward {
     Dense(DenseKernels),
     Routed(RoutedKernels),
@@ -287,6 +287,7 @@ pub(crate) struct AttestedSharedHead {
 #[derive(Clone)]
 pub(crate) struct AttestedDraft {
     pub blocks: Vec<DraftBlockKernels>,
+    pub streams: Option<super::draft::AttestedDraftStreams>,
     pub embedding: NativeKernel<embedding_rows::Entry>,
     pub head: ProjectionKernels,
     /// Token selection over the readout vocabulary.
@@ -1314,17 +1315,65 @@ impl AttestedPrograms {
                     .blocks()
                     .iter()
                     .map(|block| {
+                        let feed_forward = match block.feed_forward {
+                            FeedForwardProgramSlot::Dense(binding) => AttestedFeedForward::Dense(
+                                handles.dense.get(&binding).cloned().ok_or_else(|| {
+                                    missing("draft_dense_stages", binding)
+                                })?,
+                            ),
+                            FeedForwardProgramSlot::Routed(binding) => AttestedFeedForward::Routed(
+                                handles.routed.get(&binding).cloned().ok_or_else(|| {
+                                    missing("draft_routed_stages", binding)
+                                })?,
+                            ),
+                            FeedForwardProgramSlot::GeneralRouted(binding) => {
+                                AttestedFeedForward::GeneralRouted(
+                                    handles
+                                        .general_routed
+                                        .get(&binding)
+                                        .cloned()
+                                        .ok_or_else(|| {
+                                            missing("draft_general_routed_stages", binding)
+                                        })?,
+                                )
+                            }
+                            FeedForwardProgramSlot::Parallel(binding) => {
+                                return Err(CatalogFailure::Preparation {
+                                    entry: "draft_feed_forward",
+                                    bindings: format!("{binding:?}"),
+                                    outcome: "draft layers run no parallel feed-forward form"
+                                        .into(),
+                                });
+                            }
+                        };
                         Ok(DraftBlockKernels {
                             attention: attention(block.attention)?,
                             injection: attention(block.injection)?,
-                            dense: handles.dense.get(&block.feed_forward).cloned().ok_or_else(
-                                || missing("draft_dense_stages", block.feed_forward),
-                            )?,
+                            feed_forward,
                         })
                     })
                     .collect::<Result<Vec<_>, CatalogFailure>>()?;
+                let streams = draft_plan
+                    .streams()
+                    .map(|binding| {
+                        Ok::<_, CatalogFailure>(super::draft::AttestedDraftStreams {
+                            repeat: handles
+                                .streams
+                                .repeat
+                                .clone()
+                                .ok_or_else(|| missing("repeat_rows", binding))?,
+                            sinkhorn: handles
+                                .streams
+                                .sinkhorn
+                                .get(&binding)
+                                .cloned()
+                                .ok_or_else(|| missing("draft_sinkhorn_stages", binding))?,
+                        })
+                    })
+                    .transpose()?;
                 Some(AttestedDrafter::Draft(Box::new(AttestedDraft {
                     blocks,
+                    streams,
                     embedding: handles
                         .embedding
                         .clone()

@@ -120,6 +120,13 @@ pub(crate) struct RoutedGraphEntries<'a, G: GraphDraft + 'a> {
     pub combine: G::Ranged<'a, routed_combine::Entry>,
 }
 
+impl<'a, G: GraphDraft + 'a> Copy for RoutedGraphEntries<'a, G> {}
+impl<'a, G: GraphDraft + 'a> Clone for RoutedGraphEntries<'a, G> {
+    fn clone(&self) -> Self {
+        *self
+    }
+}
+
 /// The decode rows' routing and expansion entries of a [`DecodeForm`].
 pub(crate) enum RoutedDecodeEntries<'a, G: GraphDraft + 'a> {
     Expand(G::Ranged<'a, routed_expand::Entry>),

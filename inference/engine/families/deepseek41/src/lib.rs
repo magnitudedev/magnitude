@@ -70,16 +70,15 @@ use magnitude_family_common::{
     Metadata, Tensors,
 };
 use magnitude_family_contracts::{
-    checked_product, grouped_output_columns, ActivationDType, Attention, AttentionGate, Block,
+    checked_product, ActivationDType, Attention, Block,
     BlockElement, BlockRounding, BlockScale, Candidates, Decoder, EmbeddingScale, HeadWeights, HistoryReads,
     Indexer, IndexerInput, IndexerKeys, IndexerQuery, Pool, PoolNorm, PooledRows, Selection, SublayerIndex, EntryForm, ExitForm, ExitNorm, ExitSite, FamilyError, FamilyId, GluLimit, HeadNorm, HistoryRows, HistorySource,
     HyperConnectionExit, HyperConnectionMixing, SinkhornInput,
-    HyperConnections, ImportTransform, InputNorm, InputSemantics, MediaRowAttention,
-    ProjectedRows, RowProducer, RowRounding, TokenDomain,
-    ModelDefinition, NGramGate, NGramHash, NGramInput, NGramMedia, Operator, OutputForm, OutputProjection, OutputRotary, QueryKeys, QueryProjection, ResidualForm, RmsNorm,
-    Rotary, RotaryLayout, RotaryPairing, RotaryPlacement, RouteNormalization, RoutedFfn, ScoreFunction, Sublayer,
-    ValueNorm,
-    ValueSource, WeightDescriptor,
+    HyperConnections, ImportTransform, InputNorm, InputSemantics,
+    RowProducer, RowRounding,
+    ModelDefinition, NGramGate, NGramHash, NGramInput, NGramMedia, Operator, OutputForm, OutputRotary, ResidualForm, RmsNorm,
+    Rotary, RotaryLayout, RouteNormalization, RoutedFfn, ScoreFunction, Sublayer,
+    WeightDescriptor,
 };
 
 pub const FAMILY_ID: &str = "deepseek41";
@@ -88,15 +87,6 @@ pub const FAMILY_ID: &str = "deepseek41";
 /// (`kernel.py`'s `act_quant` and `fp4_act_quant`; the reference's
 /// `WINDOW`, `COMPRESSED` and `INDEX`), each with the model's own amax
 /// floor.
-/// - A window row, after norm and rotary (each held in BF16, as
-///   `Attention._window_kv` holds them): E4M3 per 32 values, a power-of-two
-///   scale, floor `1e-4`.
-const WINDOW_ROUNDING: RowRounding = RowRounding::Block(BlockRounding {
-    element: BlockElement::E4M3,
-    block: 32,
-    scale: BlockScale::Ue8m0,
-    amax_floor: 1e-4,
-});
 /// - A compressed row: E2M1 per 16 values, an E4M3 scale, floor `6·2⁻⁹`.
 const COMPRESSED_ROUNDING: RowRounding = RowRounding::Block(BlockRounding {
     element: BlockElement::E2M1,
@@ -114,17 +104,9 @@ const INDEX_ROUNDING: RowRounding = RowRounding::Block(BlockRounding {
     amax_floor: 6.0 * f32::MIN_POSITIVE as f64,
 });
 
-/// llama.cpp's `expert_gating_func` for sqrt-softplus scores
-/// (`LLAMA_EXPERT_GATING_FUNC_TYPE_SQRT_SOFTPLUS`), the one V4.1 routes by.
-const SQRT_SOFTPLUS: u64 = 4;
-
-
 /// Where V4.1's rotary pairs sit: adjacent pairs `(2p, 2p + 1)` over a
 /// head's trailing dimensions, from `head_dim - rope_dim` on.
-pub const ROTARY_LAYOUT: RotaryLayout = RotaryLayout {
-    pairs: RotaryPairing::Adjacent,
-    placement: RotaryPlacement::Trailing,
-};
+pub const ROTARY_LAYOUT: RotaryLayout = binders::DEEPSEEK41_ROTARY_LAYOUT;
 
 pub fn recognize(directory: &Directory) -> Result<(), FamilyError> {
     match directory
@@ -447,7 +429,7 @@ impl Geometry {
         // One key head, which is also the value head.
         m.invariant_count("attention.head_count_kv", 1, "1 (one key/value head)")?;
         m.invariant_count("attention.value_length", width, "equal to attention.key_length")?;
-        m.invariant_count("expert_gating_func", SQRT_SOFTPLUS, "4 (sqrt-softplus)")?;
+        m.invariant_count("expert_gating_func", binders::SQRT_SOFTPLUS, "4 (sqrt-softplus)")?;
         m.invariant_count("hash_layer_count", 0, "0 (V4.1 hashes no layer)")?;
         let clamp = |key: &str| -> Result<Vec<Option<GluLimit>>, FamilyError> {
             m.uniform_or_layer_numbers(key, layers)?
@@ -631,52 +613,22 @@ impl Geometry {
         rotary: Rotary,
         compression: Compression,
     ) -> Result<Attention, FamilyError> {
-        let (heads, width, hidden) = (self.heads, self.width, self.hidden);
-        let rows = product(&[heads, width])?;
-        let columns = grouped_output_columns(rows, self.groups)
-            .map_err(|error| FamilyError::invalid(format!("{FAMILY_ID}: {error}")))?;
-        let ranks = product(&[self.groups, self.output_rank])?;
-        Ok(Attention {
-            heads,
-            kv_heads: 1,
-            width,
-            query: QueryProjection::LowRank {
-                down: weight("attn_q_a.weight", &[self.query_rank, hidden])?,
-                norm: self.rms(weight("attn_q_a_norm.weight", &[self.query_rank])?),
-                up: weight("attn_q_b.weight", &[rows, self.query_rank])?,
-            },
-            query_keys: QueryKeys::Direct,
-            gate: AttentionGate::None,
-            query_norm: HeadNorm::None,
-            history: vec![HistorySource::visible(HistoryRows::Own(RowProducer::Projected(
-                ProjectedRows {
-                    key: weight("attn_kv.weight", &[width, hidden])?,
-                    value: ValueSource::StoredKey,
-                    key_norm: HeadNorm::Rms(
-                        self.rms(weight("attn_kv_a_norm.weight", &[width])?),
-                    ),
-                    value_norm: ValueNorm::None,
-                    domain: TokenDomain::Window {
-                        tokens: self.window,
-                    },
-                    rounding: WINDOW_ROUNDING,
-                },
-            )))]
-            .into_iter()
-            .chain(self.compressed(weight, compression)?)
-            .collect(),
-            rotary,
-            // The softmax scale is `head_dim ** -0.5`.
-            scale: (width as f64).powf(-0.5),
-            media_rows: MediaRowAttention::Causal,
-            sinks: Some(weight("attn_sinks.weight", &[heads])?),
-            output: OutputProjection::GroupedLowRank {
+        let compressed = self.compressed(weight, compression)?;
+        binders::mla_window_attention(
+            weight,
+            &binders::MlaWindowForm {
+                hidden: self.hidden,
+                heads: self.heads,
+                width: self.width,
+                query_rank: self.query_rank,
+                window: self.window,
                 groups: self.groups,
-                rank: self.output_rank,
-                a: weight("attn_output_a.weight", &[ranks, columns])?,
-                b: weight("attn_output_b.weight", &[hidden, ranks])?,
+                output_rank: self.output_rank,
+                epsilon: self.epsilon,
             },
-        })
+            rotary,
+            compressed,
+        )
     }
 
     fn routed(&self, weight: &mut Weight, layer: u64) -> Result<RoutedFfn, FamilyError> {

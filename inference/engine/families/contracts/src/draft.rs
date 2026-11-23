@@ -14,9 +14,9 @@
 
 use crate::decoder::{self, Context};
 use crate::{
-    Block, Decoder, DefinitionError, HistoryRows, Operator, ResidualForm, RmsNorm, SublayerIndex,
-    TokenId, WeightDescriptor, WeightKind, WeightRole, WeightScope, checked_product,
-    expect_shape,
+    Block, Decoder, DefinitionError, HistoryRows, HyperConnectionMixing, Operator, ResidualForm,
+    RmsNorm, SublayerIndex, TokenId, WeightDescriptor, WeightKind, WeightRole, WeightScope,
+    checked_product, expect_shape,
 };
 use serde::{Deserialize, Serialize};
 use std::fmt;
@@ -78,10 +78,10 @@ pub struct MarkovHead {
 /// where `hidden_i` is the slot's output-normed row.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct ConfidenceHead {
-    /// `[hidden + rank]`.
+    /// `[hidden + rank]` or `[1, hidden + rank]`.
     pub weight: WeightDescriptor,
-    /// `[1]`.
-    pub bias: WeightDescriptor,
+    /// `[1]`; absent when the confidence projection has no bias.
+    pub bias: Option<WeightDescriptor>,
 }
 
 /// One grouped dynamic causal convolution of a convolved draft backbone
@@ -570,6 +570,9 @@ pub struct DraftDefinition {
     pub output: Option<WeightDescriptor>,
     /// Explicit draft input scale, independent of the target's input transform.
     pub embedding_scale: f64,
+    /// The draft backbone's residual form (single stream, or Sinkhorn
+    /// hyper-connection streams as in DeepSeek V4.1 DSpark).
+    pub residual: ResidualForm,
     /// Draft layers over the target's width. Their attention reads the
     /// injected context and the fresh block.
     pub blocks: Vec<Block>,
@@ -663,10 +666,37 @@ impl DraftDefinition {
                 }
             }
         }
-        if !matches!(decoder.residual, ResidualForm::Single) {
-            return Err(DefinitionError::new(
-                "draft models require a single-stream target residual",
-            ));
+        match &self.residual {
+            ResidualForm::Single => {}
+            ResidualForm::HyperConnections(form) => {
+                if form.streams == 0 {
+                    return Err(DefinitionError::new(
+                        "draft hyper-connections require at least one stream",
+                    ));
+                }
+                match form.mixing {
+                    HyperConnectionMixing::Sinkhorn {
+                        epsilon,
+                        norm_epsilon,
+                        ..
+                    } => {
+                        if !epsilon.is_finite()
+                            || epsilon <= 0.0
+                            || !norm_epsilon.is_finite()
+                            || norm_epsilon <= 0.0
+                        {
+                            return Err(DefinitionError::new(
+                                "draft Sinkhorn hyper-connections require positive finite epsilons",
+                            ));
+                        }
+                    }
+                    HyperConnectionMixing::LowRankGated { .. } => {
+                        return Err(DefinitionError::new(
+                            "draft hyper-connections admit Sinkhorn mixing only",
+                        ));
+                    }
+                }
+            }
         }
         let fused = checked_product(&[self.taps.len() as u64, hidden])?;
         expect_shape(&self.fusion, &[hidden, fused], "draft fusion projection")?;
@@ -691,7 +721,7 @@ impl DraftDefinition {
                 hidden,
                 vocabulary: decoder.vocabulary,
                 coordinate_axes,
-                residual: &ResidualForm::Single,
+                residual: &self.residual,
                 per_layer: None,
                 shared_sources: None,
             },
@@ -725,8 +755,12 @@ impl DraftDefinition {
                 let joined = hidden
                     .checked_add(markov.rank)
                     .ok_or_else(|| DefinitionError::new("draft confidence width overflows"))?;
-                expect_shape(&confidence.weight, &[joined], "draft confidence weight")?;
-                expect_shape(&confidence.bias, &[1], "draft confidence bias")?;
+                if confidence.weight.shape != [joined] && confidence.weight.shape != [1, joined] {
+                    return Err(DefinitionError::new("draft confidence weight shape"));
+                }
+                if let Some(bias) = &confidence.bias {
+                    expect_shape(bias, &[1], "draft confidence bias")?;
+                }
             }
             DraftMethod::DFlash2 { selector } => {
                 if self.layout != BlockLayout::MaskSlots {
