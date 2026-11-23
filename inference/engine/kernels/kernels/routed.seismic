@@ -469,6 +469,7 @@ projection routed for metal:
 # its expert's weights.
 projection routed for cuda:
     let DECODE_GROUPS = ceil_div(ceil_div(ceil_div(most(W, N), 16), TPW), 4 / KSPLIT) for choice | summed
+    let GATHER_GROUPS = ceil_div(ceil_div(ceil_div(most(W, N), 16), GATHER_TPW), 4 / KSPLIT) for choice | summed
     let TILE = BM for grouped
     let STAGES = 3 - BM / 128 for grouped
     let COEF_BYTES = 4096 - 2048 * (BM / 128) for grouped
@@ -476,6 +477,7 @@ projection routed for cuda:
     let TILE_BLOCKS = STACKED * B + (1 - STACKED) for grouped
     let PRODUCT_ROWS = STACKED * B * T + (1 - STACKED) * M for grouped
     params (TPW in [1, 2] default 1 for choice | summed, arithmetic KSPLIT in [1, 2, 4] default least where (KSPLIT == 1 and most(W, WIDTH) / (64 * 2) < 8) or (KSPLIT == 2 and (most(W, WIDTH) / (64 * 4) < 8 or ceil_div(ceil_div(most(W, N), 16), 4 / 2) * (K + SHARED) >= 2 * device.units)) or KSPLIT == 4 for choice | summed,
+        GATHER_TPW in [1, 2] default greatest where GATHER_TPW == 1 or ceil_div(ceil_div(ceil_div(most(W, N), 16), GATHER_TPW), 4 / KSPLIT) * (2 * K + SHARED) >= 2 * device.units for choice | summed,
         form GATHERED in [0, 1] default 1 for choice,
         arithmetic INT8 in [0, 1] default greatest where INT8 == 0 or (STACKED == 1 and each(W, form(W, INT8) == 1)) reference 0 for grouped,
         arithmetic OPERAND in [0, 1] default 0 for grouped,
@@ -509,8 +511,8 @@ projection routed for cuda:
         threads_per_threadgroup (128, 1, 1)
         shared_bytes (most(W, WIDTH) * SHARED_ROW_PAIR_BYTES / 2)
     launch gathered for choice when GATHERED == 1 and M >= 2 and M <= VERIFY_ROWS and PER_ROW == 0:
-        reads (TPW, KSPLIT)
-        threadgroups (DECODE_GROUPS, M * K + SHARED, 1)
+        reads (GATHER_TPW, KSPLIT)
+        threadgroups (GATHER_GROUPS, M * K + SHARED, 1)
         threads_per_threadgroup (128, 1, 1)
     launch stage for summed when (SHARED == 1 or M > 1) and any(W, operands(W) == 1):
         staging
@@ -522,9 +524,9 @@ projection routed for cuda:
         threads_per_threadgroup (128, 1, 1)
         shared_bytes (most(W, WIDTH) * SHARED_ROW_PAIR_BYTES / 2)
     launch gathered for summed when M > 1:
-        reads (TPW, KSPLIT)
+        reads (GATHER_TPW, KSPLIT)
         alike (summed)
-        threadgroups (DECODE_GROUPS, M * (K + SHARED), 1)
+        threadgroups (GATHER_GROUPS, M * K + SHARED, 1)
         threads_per_threadgroup (128, 1, 1)
     launch grids for grouped when STACKED == 1:
         reads (BM)

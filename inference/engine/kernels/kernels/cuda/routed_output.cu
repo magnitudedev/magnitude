@@ -90,6 +90,6 @@ __global__ void routed_output_summed(SEISMIC_KERNEL_PARAMS) { ROUTED_OUTPUT_SUMM
 #endif
 
 #ifdef SEISMIC_FORMING_ROUTED_OUTPUT_GATHERED
-template <int TPW, int KSPLIT>
-__global__ void routed_output_gathered(SEISMIC_KERNEL_PARAMS) { ROUTED_OUTPUT_GATHERED_BODY(TPW, KSPLIT) }
+template <int KSPLIT, int GATHER_TPW>
+__global__ void routed_output_gathered(SEISMIC_KERNEL_PARAMS) { ROUTED_OUTPUT_GATHERED_BODY(GATHER_TPW, KSPLIT) }
 #endif

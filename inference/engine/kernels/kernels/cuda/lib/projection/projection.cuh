@@ -432,13 +432,15 @@ template <class W> constexpr int bias_group = W::BIAS ? W::GROUP : 0;
 // an F32 accumulate runs at half rate (RTX 3090: dense_output H = F = 8192,
 // q4k at M = 1, tuned KSPLIT 74.4 -> 62.7 us).
 template <int NB, int GROUP>
-__device__ __forceinline__ void gemv_sums(const u32 (&b)[NB][4][2], GroupSums<NB, GROUP> &sums) {
+__device__ __forceinline__ void gemv_sums(const u32 (&b)[NB][4][2], GroupSums<NB, GROUP> &sums, u32 M = 8u * NB) {
     if constexpr (GROUP != 0) {
         constexpr int STEPS = GROUP / 16;
         static_assert(STEPS == 1 || STEPS == 2 || STEPS == 4, "groups of 16, 32 or 64 codes");
         const u32 t = threadIdx.x % 4;
 #pragma unroll
-        for (int nb = 0; nb < NB; ++nb)
+        for (int nb = 0; nb < NB; ++nb) {
+            if (nb > 0 && 8u * (u32)nb >= M)
+                continue;
 #pragma unroll
             for (int h = 0; h < 64 / GROUP; ++h) {
                 float own = 0.0f;
@@ -453,6 +455,7 @@ __device__ __forceinline__ void gemv_sums(const u32 (&b)[NB][4][2], GroupSums<NB
                 sums.group[nb][h][0] = __uint_as_float(seismic_shfl_idx_u32(__float_as_uint(own), 8 * t));
                 sums.group[nb][h][1] = __uint_as_float(seismic_shfl_idx_u32(__float_as_uint(own), 8 * t + 4));
             }
+        }
     }
 }
 
@@ -647,7 +650,7 @@ __device__ __forceinline__ void row_sums(const float *area, u64 kblock, GroupSum
 template <int NB, class Src, class W, class Sums>
 __device__ __forceinline__ void gemv_accumulate(float (&acc)[NB][4], const typename W::Raw &raw, const W &w,
                                                 const typename W::Block &block, int q, const u32 (&b)[NB][4][2],
-                                                const Sums &sums) {
+                                                const Sums &sums, u32 M = 8u * NB) {
     static_assert(Sums::GROUP == bias_group<W> || !W::BIAS, "a biased weight folds its groups' operand sums");
     Coefficients<W::GROUPS> c;
     w.coefficients(block, q, c);
@@ -656,21 +659,29 @@ __device__ __forceinline__ void gemv_accumulate(float (&acc)[NB][4], const typen
     for (int group = 0; group < W::GROUPS; ++group) {
         float p[NB][4];
 #pragma unroll
-        for (int nb = 0; nb < NB; ++nb)
+        for (int nb = 0; nb < NB; ++nb) {
+            if (nb > 0 && 8u * (u32)nb >= M)
+                continue;
 #pragma unroll
             for (int e = 0; e < 4; ++e)
                 p[nb][e] = 0.0f;
+        }
 #pragma unroll
         for (int j = 0; j < STEPS; ++j) {
             u32 a[4];
             w.template decode<Op, Src>(raw, group * STEPS + j, a);
 #pragma unroll
-            for (int nb = 0; nb < NB; ++nb)
+            for (int nb = 0; nb < NB; ++nb) {
+                if (nb > 0 && 8u * (u32)nb >= M)
+                    continue;
                 Op::mma(p[nb], a, b[nb][group * STEPS + j]);
+            }
         }
         // p[nb]: (row g, col 2t), (row g, col 2t+1), (row g+8, col 2t), (row g+8, col 2t+1).
 #pragma unroll
         for (int nb = 0; nb < NB; ++nb) {
+            if (nb > 0 && 8u * (u32)nb >= M)
+                continue;
 #pragma unroll
             for (int e = 0; e < 4; ++e)
                 acc[nb][e] = seismic_fma_rn(c.scale[e / 2][group], p[nb][e], acc[nb][e]);
@@ -1130,6 +1141,8 @@ __device__ __forceinline__ void gemv_mma_group(const Ready &ready, u32 M, u64 kb
             u32 b[NB][4][2];
 #pragma unroll
             for (int nb = 0; nb < NB; ++nb) {
+                if (nb > 0 && 8u * (u32)nb >= M)
+                    continue;
                 const u32 m = 8 * nb + g;
                 const bool feeds = ROW || m < M;
 #pragma unroll
@@ -1148,8 +1161,8 @@ __device__ __forceinline__ void gemv_mma_group(const Ready &ready, u32 M, u64 kb
                 row_sums(pro.area(0), kblock, sums);
                 row_sums(pro.area(1), kblock, sums_b);
             } else {
-                gemv_sums(b, sums);
-                gemv_sums(b, sums_b);
+                gemv_sums(b, sums, M);
+                gemv_sums(b, sums_b, M);
             }
 #pragma unroll
             for (int i = 0; i < TPW; ++i)
@@ -1157,13 +1170,13 @@ __device__ __forceinline__ void gemv_mma_group(const Ready &ready, u32 M, u64 kb
                     if constexpr (STAGED)
                         gemv_accumulate<NB, Src>(acc[0][i], ra_tile[i], wa,
                                                  wa.staged_block(staging + i * staged_tile, kblocks, sb, lane), q,
-                                                 b, sums);
+                                                 b, sums, M);
                     else
-                        gemv_accumulate<NB, Src>(acc[0][i], ra_tile[i], wa, ba[i], q, b, sums);
+                        gemv_accumulate<NB, Src>(acc[0][i], ra_tile[i], wa, ba[i], q, b, sums, M);
                     if constexpr (PAIR && OWN_B)
-                        gemv_accumulate<NB, Src>(acc[1][i], rb_tile[i], wb, bb[i], q, b, sums_b);
+                        gemv_accumulate<NB, Src>(acc[1][i], rb_tile[i], wb, bb[i], q, b, sums_b, M);
                     else if constexpr (PAIR)
-                        gemv_accumulate<NB, Src>(acc[1][i], rb_tile[i], wb, bb[i], q, b, sums);
+                        gemv_accumulate<NB, Src>(acc[1][i], rb_tile[i], wb, bb[i], q, b, sums, M);
                 }
         }
     };
@@ -1248,10 +1261,13 @@ __device__ __forceinline__ void gemv_entries_kblock(float (&acc)[NB][4], const W
         const int entry = W::gemv_entry(group, t);
         float d[NB][4];
 #pragma unroll
-        for (int nb = 0; nb < NB; ++nb)
+        for (int nb = 0; nb < NB; ++nb) {
+            if (nb > 0 && 8u * (u32)nb >= M)
+                continue;
 #pragma unroll
             for (int e = 0; e < 4; ++e)
                 d[nb][e] = 0.0f;
+        }
         if constexpr (W::GROUP_STEPS == 2) {
             u32 rg[4], rg8[4];
             W::template entry_all_pairs<Op, Src>(raw, 0, group, t, rg);
@@ -1261,6 +1277,8 @@ __device__ __forceinline__ void gemv_entries_kblock(float (&acc)[NB][4], const W
             const u32 a1[4] = {rg[2], rg8[2], rg[3], rg8[3]};
 #pragma unroll
             for (int nb = 0; nb < NB; ++nb) {
+                if (nb > 0 && 8u * (u32)nb >= M)
+                    continue;
                 const u32 m = 8 * nb + g;
                 const uint4 x = is_shared_row<Pro> || m < M ? pro.octet(factors, m, k) : make_uint4(0u, 0u, 0u, 0u);
                 const u32 b0[2] = {x.x, x.y};
@@ -1278,6 +1296,8 @@ __device__ __forceinline__ void gemv_entries_kblock(float (&acc)[NB][4], const W
                 const u64 k = kblock * 64 + 8 * entry + 4 * h;
 #pragma unroll
                 for (int nb = 0; nb < NB; ++nb) {
+                    if (nb > 0 && 8u * (u32)nb >= M)
+                        continue;
                     const u32 m = 8 * nb + g;
                     const bool feeds = is_shared_row<Pro> || m < M;
                     const u32 b[2] = {feeds ? pro.pair(factors, m, k) : 0u, feeds ? pro.pair(factors, m, k + 2) : 0u};
@@ -1286,10 +1306,13 @@ __device__ __forceinline__ void gemv_entries_kblock(float (&acc)[NB][4], const W
             }
         }
 #pragma unroll
-        for (int nb = 0; nb < NB; ++nb)
+        for (int nb = 0; nb < NB; ++nb) {
+            if (nb > 0 && 8u * (u32)nb >= M)
+                continue;
 #pragma unroll
             for (int e = 0; e < 4; ++e)
                 acc[nb][e] = seismic_fma_rn(c.scale[e / 2][group], d[nb][e], acc[nb][e]);
+        }
     }
 }
 
@@ -1448,6 +1471,8 @@ __device__ __forceinline__ void gemv_records_group(const Ready &ready, u32 M, u6
                 float d[NB][4];
 #pragma unroll
                 for (int nb = 0; nb < NB; ++nb) {
+                    if (nb > 0 && 8u * (u32)nb >= M)
+                        continue;
 #pragma unroll
                     for (int e = 0; e < 4; ++e)
                         d[nb][e] = 0.0f;
@@ -1460,10 +1485,13 @@ __device__ __forceinline__ void gemv_records_group(const Ready &ready, u32 M, u6
                     Op::mma(d[nb], a1, b1);
                 }
 #pragma unroll
-                for (int nb = 0; nb < NB; ++nb)
+                for (int nb = 0; nb < NB; ++nb) {
+                    if (nb > 0 && 8u * (u32)nb >= M)
+                        continue;
 #pragma unroll
                     for (int e = 0; e < 4; ++e)
                         sum[nb][e] = seismic_fma_rn(scale(e / 2, 2 * q + group), d[nb][e], sum[nb][e]);
+                }
             }
         }
     };

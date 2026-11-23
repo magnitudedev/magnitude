@@ -51,6 +51,15 @@ struct GatheredPublishEpi {
     }
 };
 
+struct SharedPublishEpi {
+    element::Out<activation::Act> published;
+    projection::u64 s0;
+    projection::u64 s2;
+    __device__ __forceinline__ void operator()(unsigned m, projection::u64 n, float value, float) const {
+        published.put(m * s0 + n * s2, value);
+    }
+};
+
 #define ROUTED_OUTPUT_STAGE_BODY                                                                                   \
     seismic_dependency_start();                                                                                    \
     const projection::u64 K = SEISMIC_DIM_K, b = blockIdx.x;                                                       \
@@ -120,13 +129,14 @@ struct GatheredPublishEpi {
     __shared__ projection::GemvShared<Shape, routed::GatheredRows, 0, Points> shared;                              \
     __shared__ routed::Gathered table;                                                                             \
     const projection::u64 H = SEISMIC_DIM_H, K = SEISMIC_DIM_K, M = SEISMIC_DIM_M;                                 \
-    const projection::u64 m = blockIdx.y / (K + 1), slot = blockIdx.y % (K + 1);                                   \
+    const projection::u64 choices = M * K;                                                                         \
     const projection::u64 group = Shape::tile_group();                                                             \
     const projection::u64 s2 = ROUTED_PUBLISHED_S2;                                                                \
     const element::Out<activation::Act> published = ROUTED_PUBLISHED_OUT;                                          \
-    if (slot < K) {                                                                                                \
+    if (blockIdx.y < choices) {                                                                                    \
+        const projection::u64 m = blockIdx.y / K, slot = blockIdx.y % K;                                           \
         const int *routes = reinterpret_cast<const int *>(SEISMIC_PTR(SEISMIC_BUFFER_ROUTES));                     \
-        const unsigned choice = (unsigned)(m * K + slot);                                                          \
+        const unsigned choice = (unsigned)blockIdx.y;                                                              \
         const auto record = [&](unsigned c) {                                                                      \
             const int ex = routed::route(routes, SEISMIC_ROUTES_STRIDE_0, SEISMIC_ROUTES_STRIDE_1, (unsigned)K, c); \
             return routed::ChoiceKey{ex, DOWN_SOURCE(c / (unsigned)K, c % (unsigned)K, ex).code, true};            \
@@ -150,20 +160,13 @@ struct GatheredPublishEpi {
         } else {                                                                                                   \
             seismic_dependency_start();                                                                            \
         }                                                                                                          \
-    } else if (m == 0) {                                                                                           \
-        for (unsigned r = threadIdx.x; r < (unsigned)M; r += blockDim.x) {                                         \
-            table.rows[r] = r * SHARED_STRIDE_0;                                                                   \
-            table.products[r] = r * (ROUTED_PUBLISHED_S0) + K * (ROUTED_PUBLISHED_S1);                             \
-        }                                                                                                          \
-        __syncthreads();                                                                                           \
+    } else {                                                                                                       \
         projection::stage_points(SharedReaders{});                                                                 \
-        const GatheredPublishEpi epi{published, table.products, s2};                                               \
-        const routed::GatheredRows rows{SHARED_ROWS, table.rows};                                                  \
-        projection::gemv_segment_ready<Shape>(shared, projection::after_dependency(rows), (unsigned)M,             \
+        const SharedPublishEpi epi{published.offset(K * (ROUTED_PUBLISHED_S1)), ROUTED_PUBLISHED_S0, s2};          \
+        const Pro pro{SHARED_ROWS, SHARED_STRIDE_0, projection::AllRows{}};                                        \
+        projection::gemv_segment_ready<Shape>(shared, projection::after_dependency(pro), (unsigned)M,              \
                                               SEISMIC_DIM_S / 64, group, H,                                        \
                                               KERNEL_W1_AT(SEISMIC_PTR(SEISMIC_BUFFER_SHARED_DOWN)),               \
                                               projection::NoWeight{}, epi);                                        \
-    } else {                                                                                                       \
-        seismic_dependency_start();                                                                                \
     }                                                                                                              \
     ROUTED_OUTPUT_GATHERED_ARRIVED(gridDim.y, blockIdx.x, blockIdx.x * CHANNELS, CHANNELS)

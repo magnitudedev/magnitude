@@ -109,9 +109,9 @@ __global__ void routed_expand_choice(SEISMIC_KERNEL_PARAMS) {
 #endif
 
 #ifdef SEISMIC_FORMING_ROUTED_EXPAND_GATHERED
-template <int TPW, int KSPLIT>
+template <int KSPLIT, int GATHER_TPW>
 __global__ void routed_expand_gathered(SEISMIC_KERNEL_PARAMS) {
-    using Shape = routed::DecodeGatheredShape<TPW, KSPLIT>;
+    using Shape = routed::DecodeGatheredShape<GATHER_TPW, KSPLIT>;
     using RoutedReaders = routed::DecodeReaders<packets::W0, packets::W1>;
     using SharedReaders = routed::DecodeReaders<packets::W2, packets::W3>;
     using Points = typename projection::PointsOf<typename routed::DecodeUnion<RoutedReaders, SharedReaders>::type>::type;

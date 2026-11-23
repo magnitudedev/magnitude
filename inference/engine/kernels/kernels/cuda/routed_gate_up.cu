@@ -46,7 +46,7 @@ __global__ void routed_gate_up_stage(SEISMIC_KERNEL_PARAMS) {
 #endif
 
 #ifdef SEISMIC_FORMING_ROUTED_GATE_UP_GATHERED
-template <int TPW, int KSPLIT>
+template <int KSPLIT, int GATHER_TPW>
 __global__ void routed_gate_up_gathered(SEISMIC_KERNEL_PARAMS) {
     ROUTED_GATE_UP_GATHERED_BODY
 }

@@ -90,6 +90,6 @@ __global__ void routed_down_summed(SEISMIC_KERNEL_PARAMS) { ROUTED_DOWN_SUMMED_B
 #endif
 
 #ifdef SEISMIC_FORMING_ROUTED_DOWN_GATHERED
-template <int TPW, int KSPLIT>
-__global__ void routed_down_gathered(SEISMIC_KERNEL_PARAMS) { ROUTED_DOWN_GATHERED_BODY(TPW, KSPLIT) }
+template <int KSPLIT, int GATHER_TPW>
+__global__ void routed_down_gathered(SEISMIC_KERNEL_PARAMS) { ROUTED_DOWN_GATHERED_BODY(GATHER_TPW, KSPLIT) }
 #endif
