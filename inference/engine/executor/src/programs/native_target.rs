@@ -1754,7 +1754,7 @@ impl NativeTargetProgram {
             }
             _ => None,
         };
-        let (mut submitter, queued) = steps.scoped(
+        let (submitter, queued) = steps.scoped(
             StepSubmitter::new(&self.device, release),
             |steps, submitter| self.queue_runs(steps, spare, &sets, serving.as_ref(), submitter),
         );
@@ -1774,7 +1774,7 @@ impl NativeTargetProgram {
     /// block it runs.
     fn queue_runs<'b>(
         &self,
-        steps: Branded<'b, &'b mut (ValidatedTargetLaunch, Option<(Arc<crate::experts::ExpertBank>, crate::experts::ExpertStep)>)>,
+        steps: Branded<'b, &'b mut (ValidatedTargetLaunch, Banked)>,
         spare: &mut TargetGraphOutputLease,
         sets: &[usize],
         serving: Option<&crate::experts::ChainServing>,
