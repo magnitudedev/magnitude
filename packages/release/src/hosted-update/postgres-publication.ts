@@ -5,6 +5,17 @@ import { isNewerVersion, releaseChannelOf } from "../client-update/release-chann
 import { PublishedUpdate, verifyUpdateManifest } from "./manifest"
 import { ReleasePublicationBatch, ReleasePublicationFailed, ReleasePublicationStore } from "./publication"
 
+/**
+ * A database failure as the database reported it: its SQLSTATE or socket code, and for a
+ * query its message, which names the relation or constraint. A connection's message can
+ * name the host, and release logs are public, so it is left out.
+ */
+const databaseFailed = (error: unknown, kind: "connection" | "query") => {
+  const { code, message } = (typeof error === "object" && error !== null ? error : {}) as { code?: unknown, message?: unknown }
+  const reason = [code, kind === "query" ? message : undefined].filter((part): part is string => typeof part === "string").join(": ")
+  return new ReleasePublicationFailed(reason === "" ? { stage: "database" } : { stage: "database", reason })
+}
+
 const DistributionNamespace = Schema.Literal("magnitude_distribution", "magnitude_distribution_acceptance")
 
 /** The publisher has separate credentials; request runtimes cannot mutate releases or channels. */
@@ -18,13 +29,13 @@ export const postgresReleasePublicationStore = (pool: Pool, namespace: typeof Di
     const first = manifests[0]!, channel = releaseChannelOf(first.version)
     if (channel === "unknown") return yield* new ReleasePublicationFailed({ stage: "batch" })
     yield* Effect.acquireUseRelease(
-      Effect.tryPromise({ try: () => pool.connect(), catch: () => new ReleasePublicationFailed({ stage: "database" }) }).pipe(
+      Effect.tryPromise({ try: () => pool.connect(), catch: error => databaseFailed(error, "connection") }).pipe(
         Effect.map(client => ({ client, discard: false }))),
       connection => {
         const { client } = connection
         const query = (sql: string, values: readonly unknown[] = []) => Effect.tryPromise({
           try: () => client.query(sql.replaceAll("magnitude_distribution.", `${namespace}.`), [...values]),
-          catch: () => new ReleasePublicationFailed({ stage: "database" }),
+          catch: error => databaseFailed(error, "query"),
         })
         return Effect.gen(function* () {
           yield* query("BEGIN")
