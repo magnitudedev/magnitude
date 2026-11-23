@@ -338,3 +338,102 @@ fn pinned_host_budget_clamping_and_per_slot_guard_agree_on_64g_linux_container()
     assert!(clamped * HOST_SLOT <= est.live_pinned_headroom(&post_floor));
     assert!((clamped + 1) * HOST_SLOT > est.live_pinned_headroom(&post_floor));
 }
+
+/// Reproduces F-047 on `cliqa-r3-cuda` (30.97 GiB physical RAM, 0 swap,
+/// 2.49 GiB CMA, `qwen3.8-flash-next:gguf:q2` with 337 planned host slots at
+/// 67.33 MB/slot = 22.69 GB): once Linux discovery excludes CMA and reserves
+/// the swapless host floor (`2.58 GiB`), both `clamped_host_slots` and per-slot
+/// `live_pinned_headroom` bound the host tier strictly below 337 slots and stop
+/// before non-CMA RAM is exhausted.
+#[test]
+fn tight_ram_swapless_cma_host_clamps_and_guards_host_tier_below_oom() {
+    use crate::memory::ledger::{Ledgers, LoadShape, PoolClass};
+    use crate::memory::supply::Reading;
+    use std::num::NonZeroU64;
+    use std::sync::Arc;
+    use std::time::{Duration, Instant};
+
+    const MIB: u64 = 1 << 20;
+    const TOTAL: u64 = 33_258_901_504; // 30.97 GiB
+    const RECLAIM_BAND: u64 = 30_547_968; // 29.13 MiB zone (high - low)
+    const HOST_SLOT: u64 = 67_326_669; // 22,689,087,488 / 337
+    const POOL_BLOCK: u64 = 64 * MIB;
+    const PLANNED_SLOTS: u64 = 337;
+    const LANDING_FLOOR: u64 = 197_132_288;
+    const RESERVE: u64 = RECLAIM_BAND + POOL_BLOCK;
+
+    let scope = Ledgers::new();
+    let ledger = scope.ledger(seismic::StoreIdentity::HostRam, Arc::new(LoadShape { stores: Vec::new() }));
+    let _pool = ledger.pool_block(PoolClass::Records, NonZeroU64::new(POOL_BLOCK).unwrap());
+
+    // Post-warmup on cliqa-r3-cuda AFTER excluding 2.49 GiB CMA and reserving
+    // 2.58 GiB swapless host floor (instead of the old 24.96 GB raw supply):
+    // immediate non-CMA supply above swapless floor is ~19.68 GB (~18.33 GiB).
+    let t0 = Instant::now();
+    let post_warmup = seismic::HostSample {
+        at: t0,
+        page_bytes: 4096,
+        total: TOTAL,
+        supply: seismic::Supply {
+            free_beyond_target: -2_000_000_000, // non-CMA free below 2.58 GiB swapless floor
+            clean_cache: 21_680_000_000,        // non-CMA clean file cache
+            cold_reclaimable: 0,
+        },
+        reclaim_band: RECLAIM_BAND,
+        counted: seismic::Counted { at: t0, lag: Duration::ZERO },
+        cold: seismic::ColdPages { machine: 0, own: None },
+        own_reclaimed: None,
+        wired: None,
+        harm: None,
+        pressure: Some(seismic::PressureLevel::Normal),
+        lag: seismic::Lag { release: Duration::ZERO, growth: Duration::ZERO },
+    };
+    ledger.read(ledger.sampled(t0), Reading::host(&post_warmup));
+    let landing = ledger
+        .change(|keeping| {
+            ledger.claim_at(
+                &keeping.claims(),
+                None,
+                crate::memory::ledger::CommittedKind::Load,
+                LANDING_FLOOR,
+            )
+        })
+        .expect("landing fits");
+    ledger
+        .change(|_| {
+            let entry = landing.entry();
+            entry.take(&entry.change(), LANDING_FLOOR, seismic::memory::Wiring::Pageable)
+        })
+        .expect("landing allocates");
+
+    let est = ledger.estimate();
+    let host_charge = |slots: u64| LANDING_FLOOR + slots * HOST_SLOT;
+    let host_shape = BankShape::new(POOL_BLOCK, 0, PLANNED_SLOTS, PLANNED_SLOTS);
+    let clamped = target_slots(est.pinned_import_room(), &host_shape, &host_charge);
+
+    assert!(
+        clamped < PLANNED_SLOTS,
+        "30.97 GiB swapless CMA host must clamp below all 337 planned slots (got {clamped})"
+    );
+    assert!(
+        clamped >= 250,
+        "clamped host tier should still utilize available non-CMA RAM (~280-290 slots, got {clamped})"
+    );
+    assert!(
+        clamped * HOST_SLOT + RESERVE <= (21_680_000_000 - 2_000_000_000),
+        "clamped host tier must leave swapless floor + pinned_reserve intact"
+    );
+
+    // Once per-slot backing drains clean_cache down to the swapless floor,
+    // live_pinned_headroom drops to 0 and halts growth before OOM.
+    let near_floor = seismic::HostSample {
+        at: t0 + Duration::from_secs(10),
+        supply: seismic::Supply {
+            free_beyond_target: -2_500_000_000,
+            clean_cache: 2_500_000_000 + RESERVE - 1,
+            cold_reclaimable: 0,
+        },
+        ..post_warmup
+    };
+    assert_eq!(est.live_pinned_headroom(&near_floor), 0);
+}

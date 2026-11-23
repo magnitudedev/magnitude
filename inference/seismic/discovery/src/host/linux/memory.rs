@@ -61,7 +61,35 @@ pub(crate) fn sample(sys: &impl Sys) -> HostSample {
             .unwrap_or(0)
             .saturating_sub(field("Shmem:").unwrap_or(0)),
     );
-    let (floor, host_reclaim_band) = reclaim_watermarks(sys, total, page);
+    let (zone_floor, host_reclaim_band, zone_cma_total, zone_cma_free) =
+        reclaim_watermarks_and_cma(sys, total, page);
+    // Linux includes `MIGRATE_CMA` pages (`CmaFree:` / `nr_free_cma`) in
+    // `MemFree`, yet `mm/page_alloc.c:__zone_watermark_ok` excludes them from
+    // unmovable kernel allocations (`GFP_KERNEL`, vmalloc, slab, page tables)
+    // and long-term DMA-pinned user pages (`FOLL_LONGTERM` / `pin_user_pages`
+    // / CUDA `cuMemHostAlloc` migrates pages out of CMA before pinning).
+    // Clean file-cache pages residing inside CMA likewise evict into `CmaFree`
+    // rather than freeing non-CMA RAM; excluding `cma_free` from `free` and
+    // `cma_used = cma_total - cma_free` from `clean_cache` keeps non-CMA
+    // immediate supply exact and invariant as file cache moves into or out of
+    // CMA. Some kernels (e.g. Linux 7.0 AWS) report `CmaTotal: 0 kB` while
+    // `/proc/zoneinfo` still holds multi-GiB per-zone `cma`, so take the max.
+    let cma_free = field("CmaFree:").unwrap_or(zone_cma_free);
+    let cma_total = zone_cma_total
+        .max(field("CmaTotal:").unwrap_or(0))
+        .max(cma_free);
+    let cma_used = cma_total.saturating_sub(cma_free);
+    let free = free.saturating_sub(cma_free);
+    let clean_cache = clean_cache.saturating_sub(cma_used);
+    // When host swap is explicitly disabled (`SwapTotal: 0 kB`), kswapd has no
+    // anonymous escape valve once clean file cache drains: reserve the same
+    // swapless OOM-safety floor as a swapless cgroup (`min(total / 12, 4 GiB)`).
+    let swap_disabled = field("SwapTotal:") == Some(0);
+    let floor = if swap_disabled {
+        zone_floor.max(limits::oom_floor(total, true))
+    } else {
+        zone_floor
+    };
     let free_beyond_target = beyond(free, floor);
     let immediate = u64::try_from(free_beyond_target.max(0))
         .unwrap_or(0)
@@ -105,7 +133,7 @@ pub(crate) fn sample(sys: &impl Sys) -> HostSample {
             kind: ProcessLimitKind::AllowedNodes { nodes },
             limit_bytes,
             ..
-        }) => nodes_watermarks(sys, nodes, *limit_bytes).1,
+        }) => nodes_info(sys, nodes, *limit_bytes).1,
         _ => host_reclaim_band,
     };
     // The counters show every event their folds had passed as the reading
@@ -194,42 +222,38 @@ fn stat_interval(sys: &impl Sys) -> Duration {
     .0
 }
 
-/// The kernel's reclaim watermarks `(low, high − low)`, in bytes: kswapd wakes
-/// once free pages fall below `low` (subtracted from `free_beyond_target`) and
-/// reclaims back up to `high`, so `high − low` is the active reclaim band above
-/// `low`. Read from `/proc/zoneinfo` in pages of `page` bytes; where missing or
-/// zero, the kernel's own formula from `total` ([`watermark_formula`]).
-fn reclaim_watermarks(sys: &impl Sys, total: u64, page: u64) -> (u64, u64) {
+/// The kernel's reclaim watermarks `(low, high − low)` and CMA pool counts
+/// `(cma_total, cma_free)`, in bytes: kswapd wakes once free pages fall below
+/// `low` (subtracted from `free_beyond_target`) and reclaims back up to
+/// `high`, so `high − low` is the active reclaim band above `low`. Read from
+/// `/proc/zoneinfo` in pages of `page` bytes; where missing or zero, the
+/// kernel's own formula from `total` ([`watermark_formula`]) with zero CMA.
+fn reclaim_watermarks_and_cma(sys: &impl Sys, total: u64, page: u64) -> (u64, u64, u64, u64) {
     resolve(
         &[((), &|| {
             let zoneinfo = sys.text(Path::new("/proc/zoneinfo"))?;
-            let (low, band) = zones_watermarks(&zoneinfo, |_| true);
-            (low > 0).then(|| (low * page, band * page))
+            let (low, band, cma_total, cma_free) = zones_info(&zoneinfo, |_| true);
+            (low > 0).then(|| (low * page, band * page, cma_total * page, cma_free * page))
         })],
         (),
-        || watermark_formula(sys, total),
+        || {
+            let (low, band) = watermark_formula(sys, total);
+            (low, band, 0, 0)
+        },
     )
     .0
 }
 
-/// The floor the kernel keeps free on the memory nodes `nodes`, of
-/// `nodes_total` bytes: the low watermarks of their zones
-/// (`/proc/zoneinfo`'s `Node <N>, zone <name>` sections); where those are
-/// missing, the nodes' share of the host's ([`watermark_formula`]), each
-/// node's zones set in proportion to its managed pages.
-pub(super) fn nodes_floor(sys: &impl Sys, nodes: &[usize], nodes_total: u64) -> u64 {
-    nodes_watermarks(sys, nodes, nodes_total).0
-}
-
-/// The `(low, high − low)` watermarks on the memory nodes `nodes`, of
-/// `nodes_total` bytes.
-fn nodes_watermarks(sys: &impl Sys, nodes: &[usize], nodes_total: u64) -> (u64, u64) {
+/// The `(low, high − low, cma_total, cma_free)` figures on the memory nodes
+/// `nodes`, of `nodes_total` bytes, from `/proc/zoneinfo` (or the scaled
+/// kernel watermark formula with zero CMA where `/proc/zoneinfo` is missing).
+pub(super) fn nodes_info(sys: &impl Sys, nodes: &[usize], nodes_total: u64) -> (u64, u64, u64, u64) {
     let page = sys.page();
     resolve(
         &[((), &|| {
             let zoneinfo = sys.text(Path::new("/proc/zoneinfo"))?;
-            let (low, band) = zones_watermarks(&zoneinfo, |node| nodes.contains(&node));
-            (low > 0).then(|| (low * page, band * page))
+            let (low, band, cma_total, cma_free) = zones_info(&zoneinfo, |node| nodes.contains(&node));
+            (low > 0).then(|| (low * page, band * page, cma_total * page, cma_free * page))
         })],
         (),
         || {
@@ -241,7 +265,7 @@ fn nodes_watermarks(sys: &impl Sys, nodes: &[usize], nodes_total: u64) -> (u64, 
                     panic!("invariant violated: node reclaim watermark share {share} exceeds u64")
                 })
             };
-            (scale(low), scale(band))
+            (scale(low), scale(band), 0, 0)
         },
     )
     .0
@@ -296,15 +320,17 @@ fn watermark_formula(sys: &impl Sys, total: u64) -> (u64, u64) {
     (min_free.saturating_add(distance), distance)
 }
 
-/// The `(low, high − low)` watermarks summed over every zone of a
-/// `/proc/zoneinfo` text on a node `keep` keeps, in pages.
+/// The `(low, high − low, cma_total, cma_free)` counts summed over every zone
+/// of a `/proc/zoneinfo` text on a node `keep` keeps, in pages.
 ///
 /// # Panics
-/// Where a node header or a `low`/`high` line does not parse.
-fn zones_watermarks(zoneinfo: &str, keep: impl Fn(usize) -> bool) -> (u64, u64) {
+/// Where a node header or a `low`/`high`/`cma`/`nr_free_cma` line does not parse.
+fn zones_info(zoneinfo: &str, keep: impl Fn(usize) -> bool) -> (u64, u64, u64, u64) {
     let mut kept = false;
     let mut total_low = 0u64;
     let mut total_band = 0u64;
+    let mut total_cma = 0u64;
+    let mut total_cma_free = 0u64;
     let mut zone_low: Option<u64> = None;
     let mut zone_high: Option<u64> = None;
     let flush = |low: &mut Option<u64>, high: &mut Option<u64>, total_low: &mut u64, total_band: &mut u64| {
@@ -333,26 +359,22 @@ fn zones_watermarks(zoneinfo: &str, keep: impl Fn(usize) -> bool) -> (u64, u64) 
             continue;
         }
         let mut fields = line.split_whitespace();
+        let parse_val = |fields: &mut std::str::SplitWhitespace<'_>| {
+            fields
+                .next()
+                .and_then(|value| value.parse::<u64>().ok())
+                .unwrap_or_else(|| panic!("invariant violated: /proc/zoneinfo reads {line:?}"))
+        };
         match fields.next() {
-            Some("low") => {
-                let value = fields
-                    .next()
-                    .and_then(|value| value.parse::<u64>().ok())
-                    .unwrap_or_else(|| panic!("invariant violated: /proc/zoneinfo reads {line:?}"));
-                zone_low = Some(value);
-            }
-            Some("high") => {
-                let value = fields
-                    .next()
-                    .and_then(|value| value.parse::<u64>().ok())
-                    .unwrap_or_else(|| panic!("invariant violated: /proc/zoneinfo reads {line:?}"));
-                zone_high = Some(value);
-            }
+            Some("low") => zone_low = Some(parse_val(&mut fields)),
+            Some("high") => zone_high = Some(parse_val(&mut fields)),
+            Some("cma") => total_cma = total_cma.saturating_add(parse_val(&mut fields)),
+            Some("nr_free_cma") => total_cma_free = total_cma_free.saturating_add(parse_val(&mut fields)),
             _ => {}
         }
     }
     flush(&mut zone_low, &mut zone_high, &mut total_low, &mut total_band);
-    (total_low, total_band)
+    (total_low, total_band, total_cma, total_cma_free)
 }
 
 /// The pressure level: the higher of the machine's PSI

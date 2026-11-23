@@ -774,3 +774,139 @@ fn swapless_v2_cgroup_reserves_swapless_floor_and_never_masks_host_immediate_exh
         "total pageable balance stays bounded by the cgroup (4 GiB)"
     );
 }
+
+/// Reproduces F-047 on `cliqa-r3-cuda` (30.97 GiB bare-metal/VM Linux 7.0 AWS,
+/// `SwapTotal: 0 kB`, no cgroup limit, 2.49 GiB CMA in `/proc/zoneinfo` while
+/// `/proc/meminfo` reports `CmaTotal: 0 kB` and `CmaFree: ~2.3 GiB`):
+/// 1. `CmaFree` is excluded from `MemFree` (Linux `__zone_watermark_ok` excludes
+///    `NR_FREE_CMA_PAGES` from `GFP_KERNEL` and `pin_user_pages(FOLL_LONGTERM)`),
+///    and `cma_used = zoneinfo_cma - CmaFree` is excluded from `clean_cache` so
+///    immediate non-CMA supply is invariant as file cache moves into/out of CMA.
+/// 2. Explicit `SwapTotal: 0 kB` reserves the same `min(total / 12, 4 GiB)`
+///    swapless OOM-safety floor as a swapless cgroup, while hosts with swap
+///    enabled (`SwapTotal > 0`) keep the kernel zone `low` watermark.
+#[test]
+fn linux_cma_and_swapless_host_floor_prevent_pinned_oom() {
+    const TOTAL_KIB: u64 = 32_479_396; // 30.97 GiB (cliqa-r3-cuda)
+    const TOTAL: u64 = TOTAL_KIB * 1024;
+    const DMA32_CMA: u64 = 40_448;
+    const NORMAL_CMA: u64 = 613_376;
+    const TOTAL_CMA: u64 = (DMA32_CMA + NORMAL_CMA) * 4096; // 2.494 GiB
+    const SWAPLESS_FLOOR: u64 = TOTAL / 12; // 2.581 GiB (< 4 GiB cap)
+
+    let zoneinfo = format!(
+        "Node 0, zone    DMA32\n\
+                 low      2352\n\
+                 high     3072\n\
+                 cma      {DMA32_CMA}\n\
+               nr_free_cma  40448\n\
+         Node 0, zone   Normal\n\
+                 low      34789\n\
+                 high     41524\n\
+                 cma      {NORMAL_CMA}\n\
+               nr_free_cma  556030\n"
+    );
+
+    let machine = Machine::new("cliqa-r3-cma-swapless");
+    machine.file("/proc/zoneinfo", &zoneinfo);
+
+    // Case 1: At post-load with 22.5 GiB clean file cache (2.0 GiB sitting in CMA,
+    // CmaFree = 0.5 GiB) vs after clean cache evicts out of CMA into CmaFree.
+    let cma_free_a = 512 * 1024u64; // 512 MiB in KiB
+    let mem_free_a = 900 * 1024u64; // 900 MiB in KiB
+    let file_cache_a = 22 * 1024 * 1024u64; // 22 GiB in KiB
+    machine.file(
+        "/proc/meminfo",
+        &format!(
+            "MemTotal: {TOTAL_KIB} kB\n\
+             MemFree: {mem_free_a} kB\n\
+             Active(file): 1048576 kB\n\
+             Inactive(file): {} kB\n\
+             Dirty: 0 kB\n\
+             Writeback: 0 kB\n\
+             SwapTotal: 0 kB\n\
+             SwapFree: 0 kB\n\
+             CmaTotal: 0 kB\n\
+             CmaFree: {cma_free_a} kB\n",
+            file_cache_a - 1048576,
+        ),
+    );
+    let at_load = sample(&*machine);
+    let imm_a = at_load.supply.free_beyond_target + at_load.supply.clean_cache as i64;
+    let expected_imm_a = (mem_free_a * 1024 + file_cache_a * 1024 - TOTAL_CMA) as i64 - SWAPLESS_FLOOR as i64;
+    assert_eq!(imm_a, expected_imm_a, "immediate supply must exclude total CMA and swapless floor");
+    assert_eq!(at_load.reclaim_band, (720 + 6735) * 4096, "reclaim_band remains zone high - low");
+
+    // Evicting 1.5 GiB of file cache out of CMA raises CmaFree and MemFree by 1.5 GiB
+    // while lowering clean_cache by 1.5 GiB: immediate non-CMA supply is strictly invariant!
+    let shift_kib = 1536 * 1024u64;
+    machine.file(
+        "/proc/meminfo",
+        &format!(
+            "MemTotal: {TOTAL_KIB} kB\n\
+             MemFree: {} kB\n\
+             Active(file): 1048576 kB\n\
+             Inactive(file): {} kB\n\
+             Dirty: 0 kB\n\
+             Writeback: 0 kB\n\
+             SwapTotal: 0 kB\n\
+             SwapFree: 0 kB\n\
+             CmaTotal: 0 kB\n\
+             CmaFree: {} kB\n",
+            mem_free_a + shift_kib,
+            file_cache_a - 1048576 - shift_kib,
+            cma_free_a + shift_kib,
+        ),
+    );
+    let after_shift = sample(&*machine);
+    let imm_b = after_shift.supply.free_beyond_target + after_shift.supply.clean_cache as i64;
+    assert_eq!(imm_b, imm_a, "moving clean file cache out of CMA into CmaFree must not move non-CMA supply");
+
+    // Case 2: Exact dmesg state at OOM-kill on cliqa-r3-cuda (MemFree 2.49 GiB,
+    // CmaFree 2.29 GiB, file cache 3.8 MiB, SwapTotal 0): immediate supply MUST
+    // be deeply negative so host_guard stops long before non-CMA exhaustion.
+    machine.file(
+        "/proc/meminfo",
+        &format!(
+            "MemTotal: {TOTAL_KIB} kB\n\
+             MemFree: 2615840 kB\n\
+             Active(file): 1124 kB\n\
+             Inactive(file): 2740 kB\n\
+             Dirty: 0 kB\n\
+             Writeback: 0 kB\n\
+             SwapTotal: 0 kB\n\
+             SwapFree: 0 kB\n\
+             CmaTotal: 0 kB\n\
+             CmaFree: 2399972 kB\n"
+        ),
+    );
+    let at_oom = sample(&*machine);
+    assert!(
+        at_oom.supply.free_beyond_target < -2 * GB as i64,
+        "at dmesg OOM state free_beyond_target must be deeply negative, got {}",
+        at_oom.supply.free_beyond_target
+    );
+    assert_eq!(at_oom.supply.total(), 0, "at dmesg OOM state supply must be 0");
+
+    // Case 3: With swap enabled (`SwapTotal > 0`) and no CMA, host floor stays
+    // at zoneinfo `low` (zero regression on swap-backed Linux hosts).
+    machine.file(
+        "/proc/zoneinfo",
+        "Node 0, zone Normal\n        low 34789\n        high 41524\n",
+    );
+    machine.file(
+        "/proc/meminfo",
+        &format!(
+            "MemTotal: {TOTAL_KIB} kB\n\
+             MemFree: 10485760 kB\n\
+             SwapTotal: 8388608 kB\n\
+             SwapFree: 8388608 kB\n"
+        ),
+    );
+    let with_swap = sample(&*machine);
+    assert_eq!(
+        with_swap.supply.free_beyond_target,
+        (10 * GB - 34_789 * 4096) as i64,
+        "swap-backed Linux hosts keep the kernel zone low watermark"
+    );
+}

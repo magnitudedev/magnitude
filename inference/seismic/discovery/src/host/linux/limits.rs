@@ -160,18 +160,20 @@ impl Cgroups {
     }
 }
 
-/// OOM-safety reserve below a Linux cgroup memory limit (`memory.max` /
-/// `memory.high` / `hierarchical_memory_limit`): unlike host RAM (which has
-/// zone `low` watermarks and kswapd), a cgroup limit has no kernel watermark
-/// and OOM-kills immediately on overrun.
+/// OOM-safety reserve below a Linux memory ceiling (a cgroup's `memory.max` /
+/// `memory.high` / `hierarchical_memory_limit`, or a swapless host's
+/// `MemTotal` when `SwapTotal == 0`): unlike a swap-backed host where kswapd
+/// can page out anonymous spikes, a cgroup limit or a swapless host has no
+/// anonymous escape valve and OOM-kills immediately on overrun.
 ///
-/// Reserves `min(limit / 12, 2 GiB)` when the cgroup can spill anonymous
+/// Reserves `min(limit / 12, 2 GiB)` when a cgroup can spill anonymous
 /// bursts to swap, and `min(limit / 12, 4 GiB)` when swap is explicitly
-/// disabled (`memory.swap.max == 0` in cgroup v2 or `memsw == limit` in
-/// cgroup v1), where uncharged serving/driver RSS and mapped executable
-/// fault-ins cannot page out and otherwise thrash `file_mapped` until
-/// OOM-kill. Reserves `0` on tiny synthetic limits (`< 64 MiB`).
-pub(super) fn cgroup_floor(limit_bytes: u64, swap_disabled: bool) -> u64 {
+/// disabled (`memory.swap.max == 0` in cgroup v2, `memsw == limit` in cgroup
+/// v1, or `SwapTotal == 0` on the host), where uncharged serving/driver RSS,
+/// kernel PTE/slab allocations, and mapped executable fault-ins cannot page
+/// out and otherwise thrash `file_mapped` until OOM-kill. Reserves `0` on
+/// tiny synthetic limits (`< 64 MiB`).
+pub(super) fn oom_floor(limit_bytes: u64, swap_disabled: bool) -> u64 {
     const MIB: u64 = 1 << 20;
     const GIB: u64 = 1 << 30;
     if limit_bytes < 64 * MIB {
@@ -230,7 +232,7 @@ fn v1_limit(sys: &impl Sys, mount: &CgroupMount) -> Option<Limit> {
             cgroup: mount.name(setter),
         },
         limit_bytes,
-        used_bytes: raw_used.saturating_add(cgroup_floor(limit_bytes, swap_disabled)),
+        used_bytes: raw_used.saturating_add(oom_floor(limit_bytes, swap_disabled)),
         reclaimable_bytes,
     })
 }
@@ -276,7 +278,7 @@ fn v2_limit(sys: &impl Sys, directory: &Path, cgroup: String) -> Option<Limit> {
     Some(Limit {
         kind: ProcessLimitKind::CgroupV2 { cgroup },
         limit_bytes,
-        used_bytes: raw_used.saturating_add(cgroup_floor(limit_bytes, swap_disabled)),
+        used_bytes: raw_used.saturating_add(oom_floor(limit_bytes, swap_disabled)),
         reclaimable_bytes,
     })
 }
@@ -370,7 +372,20 @@ fn allowed_nodes(sys: &impl Sys, status: &str) -> Option<Limit> {
                 .saturating_sub(kib_field(&meminfo, "Shmem:").unwrap_or(0)),
         );
     }
-    let floor = super::memory::nodes_floor(sys, &nodes, total);
+    let (zone_floor, _, cma_total, cma_free) = super::memory::nodes_info(sys, &nodes, total);
+    let cma_total = cma_total.max(cma_free);
+    let cma_used = cma_total.saturating_sub(cma_free);
+    let free = free.saturating_sub(cma_free);
+    let cache = cache.saturating_sub(cma_used);
+    let swap_disabled = sys
+        .text(Path::new("/proc/meminfo"))
+        .and_then(|meminfo| kib_field(&meminfo, "SwapTotal:"))
+        == Some(0);
+    let floor = if swap_disabled {
+        zone_floor.max(oom_floor(total, true))
+    } else {
+        zone_floor
+    };
     Some(Limit {
         kind: ProcessLimitKind::AllowedNodes { nodes },
         limit_bytes: total,
