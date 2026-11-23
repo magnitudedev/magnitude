@@ -152,6 +152,7 @@ const inspected = (commands: Effect.Effect.Success<typeof CustomModelCommands>, 
 const harness = (options: {
   readonly config?: ReturnType<typeof customModelsConfig>
   readonly inspect?: ReturnType<typeof inspection>
+  readonly searchFailure?: unknown
   readonly inspectFailure?: unknown
   readonly progress?: readonly ReturnType<typeof progressOf>[]
   readonly progressFailure?: unknown
@@ -178,7 +179,8 @@ const harness = (options: {
   const downloadList = Effect.runSync(SubscriptionRef.make<readonly ModelDownload[]>(options.downloads ?? []))
   const sourceModels = (options.customModels ?? [nativeCustomModel()]).map(customSource)
   const candidates: IcnCandidatesService = {
-    search: () => Effect.succeed({
+    search: () => options.searchFailure === undefined
+      ? Effect.succeed({
       results: [{
         repository: "HauhauCS/Qwen3.6-35B-A3B-Uncensored-HauhauCS-Aggressive",
         architecture: Option.some("qwen35moe"),
@@ -206,7 +208,8 @@ const harness = (options: {
         developer: Option.none(),
         base: Option.none(),
       }],
-    }) as never,
+    }) as never
+      : Effect.fail(options.searchFailure as never),
     check: ({ repository }) => Effect.succeed(repository === "unsloth/DeepSeek-V4-Flash-GGUF"
       ? {
           _tag: "Model",
@@ -353,6 +356,33 @@ describe("finding models", () => {
       base: Option.some({ repository: "Qwen/Qwen3.6-35B-A3B", relation: "Finetune" }),
     })
     expect(result.results[1]).toMatchObject({ displayName: "DeepSeek V4 Flash", developer: Option.none(), gated: true, base: Option.none() })
+  })
+
+  it("maps raw upstream/network Hugging Face search errors to a clean user-facing message", async () => {
+    const { run } = harness({
+      searchFailure: {
+        _tag: "GeneratedClientRemoteError",
+        status: 500,
+        body: { error: { type: "server_error", code: "inventory_error", message: "reqwest::Error { kind: Request, url: https://huggingface.co/api/models, source: dns error }" } },
+      },
+    })
+    const result = await run((commands) => commands.searchHuggingFace({ query: "qwen", limit: Option.none(), cursor: Option.none() }).pipe(Effect.either))
+    expect(result._tag === "Left" && result.left).toMatchObject({
+      _tag: "ModelSourceUnavailable",
+      reason: "SourceUnreachable",
+      message: "Hugging Face search failed. Check your connection and try again.",
+      retryable: true,
+    })
+
+    const unreachableService = harness({
+      searchFailure: { _tag: "GeneratedClientTransportError", message: "ECONNREFUSED" },
+    })
+    const serviceResult = await unreachableService.run((commands) => commands.searchHuggingFace({ query: "qwen", limit: Option.none(), cursor: Option.none() }).pipe(Effect.either))
+    expect(serviceResult._tag === "Left" && serviceResult.left).toMatchObject({
+      _tag: "ModelSourceUnavailable",
+      reason: "ServiceUnreachable",
+      message: "Magnitude couldn't reach its inference service. Try again in a moment.",
+    })
   })
 
   it("checks a listed repository: its variant and recommended version, an unsupported architecture's reason, or no model", async () => {

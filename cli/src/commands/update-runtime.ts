@@ -1,9 +1,13 @@
-import { Effect, Option, Schema } from "effect"
+import { Data, Effect, Option, Schema } from "effect"
 import { ApplicationUpdateAction, type ApplicationUpdateState } from "@magnitudedev/sdk/desktop-host"
 import { formatStorageSize } from "@magnitudedev/client-common"
 import { isStandaloneInstallation, updateApplication } from "../server/application"
-import { runCommand } from "./output"
+import { commandEffect } from "./output"
 import { containerUpdateNotice } from "@magnitudedev/daemon-management/application-update"
+
+export class UpdateCommandFailed extends Data.TaggedError("UpdateCommandFailed")<{
+  readonly message: string
+}> {}
 
 const failedPhrase = { verify: "could not be verified", install: "failed to install", authorization: "was not authorized to install", startup: "failed to start" } as const
 
@@ -55,16 +59,54 @@ export const awaitUpdateCheck = <A extends { readonly state: ApplicationUpdateSt
     Effect.repeat({ until: result => result.state.check._tag !== "Checking" }),
     Effect.timeout("2 minutes"), Effect.catchTag("TimeoutException", () => Effect.succeed(started)))
 
-export const runUpdate = (input: string) => runCommand({
+/** Returns the failure message when an update action finishes in a failed check or transfer state. */
+export const updateFailureMessage = (
+  action: ApplicationUpdateAction,
+  state: ApplicationUpdateState,
+  owner: "Desktop" | "Headless" | "None" = "Desktop",
+  standalone = false,
+): Option.Option<string> => {
+  if (action === "check" && state.check._tag === "Failed") {
+    return Option.some(state.check.message)
+  }
+  if (action === "check" || action === "download" || action === "install") {
+    if (state.transfer._tag === "Failed") {
+      return Option.some(state.transfer.message)
+    }
+    if (action === "install" && state.transfer._tag === "InstallationFailed") {
+      return Option.some(renderApplicationUpdate(state, owner, standalone).trimEnd())
+    }
+  }
+  return Option.none()
+}
+
+export const updateCommand = (
+  input: string,
+  dependencies: {
+    readonly isStandalone: Effect.Effect<boolean>
+    readonly runAction: (action: ApplicationUpdateAction) => Effect.Effect<{ readonly state: ApplicationUpdateState; readonly owner: "Desktop" | "Headless" | "None" }, unknown>
+  } = {
+    isStandalone: isStandaloneInstallation,
+    runAction: updateApplication,
+  },
+) => commandEffect({
   effect: Schema.decodeUnknown(ApplicationUpdateAction)(input).pipe(Effect.flatMap(action =>
     Effect.all({
-      standalone: isStandaloneInstallation,
-      result: updateApplication(action).pipe(
-        Effect.flatMap(result => action === "check" ? awaitUpdateCheck(result, updateApplication("status")) : Effect.succeed(result)),
+      standalone: dependencies.isStandalone,
+      result: dependencies.runAction(action).pipe(
+        Effect.flatMap(result => action === "check" ? awaitUpdateCheck(result, dependencies.runAction("status")) : Effect.succeed(result)),
       ),
-    }).pipe(Effect.map(({ standalone, result }) => ({ action, standalone, ...result }))))),
+    }).pipe(Effect.flatMap(({ standalone, result }) => Option.match(
+      updateFailureMessage(action, result.state, result.owner, standalone),
+      {
+        onNone: () => Effect.succeed({ action, standalone, ...result }),
+        onSome: (message) => Effect.fail(new UpdateCommandFailed({ message })),
+      },
+    ))))),
   render: ({ action, standalone, state, owner }) => action === "install" ? owner === "None" ? "The Magnitude update was installed.\n"
     : owner === "Headless" ? renderIdleInstallation(state, standalone)
     : "Magnitude is stopping its model and service to install the update and restart.\n"
     : action === "discard" ? "The prepared update was discarded.\n" : renderApplicationUpdate(state, owner, standalone),
 })
+
+export const runUpdate = (input: string) => Effect.runPromise(updateCommand(input))

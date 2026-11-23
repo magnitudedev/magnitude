@@ -28,6 +28,9 @@ export const describeLocalHardware = (
       details: [
         `${hardware.platform === "MacOS" ? "macOS" : hardware.platform} · ${hardware.architecture === "Arm64" ? "ARM64" : "x86-64"} · CPU inference on ${count(hardware.cpuPoolCores, "core")}, ${count(hardware.logicalCpus, "logical CPU")}`,
         `${formatMemoryCapacity(hardware.totalSystemMemoryBytes)} ${roles.unifiedMemory ? "unified" : "system"} memory${unifiedGpu === undefined ? "" : ` · ${formatLocalInferenceBackend(unifiedGpu.backend)} GPU acceleration · in use`}`,
+        ...(hardware.gpuUnusedReason !== undefined && !roles.devices.some(({ role }) => role._tag === "InUse")
+          ? [`GPU unavailable: ${hardware.gpuUnusedReason}`]
+          : []),
       ],
     },
     accelerators: roles.devices.slice(unifiedGpu === undefined ? 0 : 1).map(({ accelerator, role, dedicatedMemoryBytes }) => ({

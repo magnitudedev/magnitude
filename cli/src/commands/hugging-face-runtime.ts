@@ -26,6 +26,7 @@ import {
   HuggingFaceRepositoryIdSchema,
   LocalModelSyncOutcomeSchema,
   Models,
+  ModelSourceUnavailable,
   ModelVersionNotRunnable,
   type CandidateInspection,
   type CandidateVersion,
@@ -186,6 +187,8 @@ const checkedResult = (client: CliModelsClient, result: HuggingFaceSearchResult)
     }]),
   )
 
+const HUGGING_FACE_SEARCH_FAILED_MESSAGE = "Hugging Face search failed. Check your connection and try again."
+
 /** A page of search results, each checked, `QUICK_SEARCH_CHECKS` at a time: the page prints when every check is done. */
 export const readSearch = (
   client: CliModelsClient,
@@ -193,7 +196,16 @@ export const readSearch = (
   limit: Option.Option<number>,
   cursor: Option.Option<string>,
 ) => Effect.all({
-  page: client.models.searchHuggingFaceModels({ query, limit, cursor }),
+  page: client.models.searchHuggingFaceModels({ query, limit, cursor }).pipe(
+    Effect.catchIf(
+      (error): error is ModelSourceUnavailable => error instanceof ModelSourceUnavailable && error.reason !== "ServiceUnreachable",
+      (error) => Effect.fail(new ModelSourceUnavailable({
+        reason: error.reason,
+        message: HUGGING_FACE_SEARCH_FAILED_MESSAGE,
+        retryable: error.retryable,
+      })),
+    ),
+  ),
   hardware: readHardware(client),
 }).pipe(Effect.flatMap(({ page, hardware }) => Effect.forEach(page.results, (result) => checkedResult(client, result), { concurrency: QUICK_SEARCH_CHECKS }).pipe(
   Effect.map((checked): SearchView => ({

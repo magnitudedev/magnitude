@@ -1,7 +1,7 @@
 import { Effect, Option } from "effect"
-import { describe, expect, it } from "vitest"
+import { describe, expect, it, vi } from "vitest"
 import { ApplicationUpdateState } from "@magnitudedev/sdk/desktop-host"
-import { awaitUpdateCheck, renderApplicationUpdate, renderIdleInstallation } from "./update-runtime"
+import { awaitUpdateCheck, renderApplicationUpdate, renderIdleInstallation, updateCommand, updateFailureMessage } from "./update-runtime"
 const state = (transfer: ApplicationUpdateState["transfer"], check: ApplicationUpdateState["check"] = { _tag: "Succeeded", at: 1 }) => ApplicationUpdateState.make({ transfer, check, preference: { _tag: "Known", autoDownload: false } })
 describe("headless application update output", () => {
   it("gives owner-specific installation instructions without suggesting a live server restart", () => {
@@ -59,5 +59,50 @@ describe("headless application update output", () => {
     const finished = await Effect.runPromise(awaitUpdateCheck({ state: state({ _tag: "Idle" }, { _tag: "Checking" }) }, status))
     expect(renderApplicationUpdate(finished.state)).toBe("Magnitude is up to date.\n")
     expect(polls).toBe(2)
+  })
+  it("exits non-zero and writes to stderr when `update check` ends in a failed check or transfer", async () => {
+    expect(updateFailureMessage("check", state({ _tag: "Idle" }, { _tag: "Failed", message: "Network unavailable" })))
+      .toEqual(Option.some("Network unavailable"))
+    expect(updateFailureMessage("check", state({ _tag: "Failed", message: "Download failed" })))
+      .toEqual(Option.some("Download failed"))
+    expect(updateFailureMessage("status", state({ _tag: "Idle" }, { _tag: "Failed", message: "Network unavailable" })))
+      .toEqual(Option.none())
+
+    const stdoutChunks: string[] = []
+    const stderrChunks: string[] = []
+    const stdoutSpy = vi.spyOn(process.stdout, "write").mockImplementation((chunk) => { stdoutChunks.push(String(chunk)); return true })
+    const stderrSpy = vi.spyOn(process.stderr, "write").mockImplementation((chunk) => { stderrChunks.push(String(chunk)); return true })
+    const previousExitCode = process.exitCode
+    try {
+      process.exitCode = 0
+      await Effect.runPromise(updateCommand("check", {
+        isStandalone: Effect.succeed(false),
+        runAction: () => Effect.succeed({
+          state: state({ _tag: "Idle" }, { _tag: "Failed", message: "Update server unreachable" }),
+          owner: "Headless",
+        }),
+      }))
+      expect(process.exitCode).toBe(1)
+      expect(stderrChunks.join("")).toBe("Update server unreachable\n")
+      expect(stdoutChunks.join("")).toBe("")
+
+      stdoutChunks.length = 0
+      stderrChunks.length = 0
+      process.exitCode = 0
+      await Effect.runPromise(updateCommand("check", {
+        isStandalone: Effect.succeed(false),
+        runAction: () => Effect.succeed({
+          state: state({ _tag: "Idle" }, { _tag: "Succeeded", at: 1 }),
+          owner: "Headless",
+        }),
+      }))
+      expect(process.exitCode).toBe(0)
+      expect(stdoutChunks.join("")).toBe("Magnitude is up to date.\n")
+      expect(stderrChunks.join("")).toBe("")
+    } finally {
+      process.exitCode = previousExitCode
+      stdoutSpy.mockRestore()
+      stderrSpy.mockRestore()
+    }
   })
 })
