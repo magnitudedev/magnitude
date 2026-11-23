@@ -4,7 +4,10 @@ import { createRequire } from "node:module"
 export class MacUpdateAdmissionFailed extends Schema.TaggedError<MacUpdateAdmissionFailed>()("MacUpdateAdmissionFailed", {}) {
   override get message() { return "The application installation could not be locked safely." }
 }
+export const MAC_UPDATE_LEASE_UNOWNED_CODE = "MAC_UPDATE_LEASE_UNOWNED"
+export type MacInstallationLeaseStatus = "Leased" | "ReadOnly"
 export interface MacInstallationLease {
+  readonly readOnly?: boolean
   readonly validate: Effect.Effect<void, MacUpdateAdmissionFailed>
 }
 export const MAC_UPDATE_LEASE_DESCRIPTOR = "MAGNITUDE_MAC_UPDATE_LEASE_FD"
@@ -19,6 +22,8 @@ export interface MacUpdateAdmission {
 }
 export const MacUpdateAdmission = Context.GenericTag<MacUpdateAdmission>("@magnitudedev/daemon-management/MacUpdateAdmission")
 const attempt = <A>(run: () => A) => Effect.try({ try: run, catch: () => new MacUpdateAdmissionFailed() })
+const isUnownedBundleError = (error: unknown): boolean =>
+  typeof error === "object" && error !== null && (error as { readonly code?: unknown }).code === MAC_UPDATE_LEASE_UNOWNED_CODE
 
 /** Scope retains installation admission independently of per-user application ownership. */
 export const nativeMacUpdateAdmission = (addonPath: string) => Layer.effect(MacUpdateAdmission, Effect.gen(function* () {
@@ -32,8 +37,14 @@ export const nativeMacUpdateAdmission = (addonPath: string) => Layer.effect(MacU
     readonly validateMacUpdateLease: (lease: object) => void
   })
   const acquire = (bundle: string, exclusive: boolean) => Effect.acquireRelease(
-    attempt(() => Option.fromNullable(native.acquireMacUpdateLease(bundle, exclusive))),
-    lease => Effect.sync(() => { if (Option.isSome(lease)) native.releaseMacUpdateLease(lease.value) }))
+    Effect.try({
+      try: (): { readonly _tag: "Leased"; readonly lease: object } | { readonly _tag: "Busy" } | { readonly _tag: "ReadOnly" } => {
+        const lease = native.acquireMacUpdateLease(bundle, exclusive)
+        return lease === null ? { _tag: "Busy" } : { _tag: "Leased", lease }
+      },
+      catch: error => !exclusive && isUnownedBundleError(error) ? "ReadOnly" as const : new MacUpdateAdmissionFailed(),
+    }).pipe(Effect.catchIf((error): error is "ReadOnly" => error === "ReadOnly", () => Effect.succeed({ _tag: "ReadOnly" as const }))),
+    acquired => Effect.sync(() => { if (acquired._tag === "Leased") native.releaseMacUpdateLease(acquired.lease) }))
   const validate = (lease: object) => attempt(() => native.validateMacUpdateLease(lease))
   const exclusiveLease = (lease: object, bundle: string): MacExclusiveInstallationLease => ({
     bundle,
@@ -47,17 +58,25 @@ export const nativeMacUpdateAdmission = (addonPath: string) => Layer.effect(MacU
     }),
   })
   return MacUpdateAdmission.of({
-    shared: bundle => acquire(bundle, false).pipe(Effect.map(Option.map(lease => ({ validate: validate(lease) })))),
-    exclusive: bundle => acquire(bundle, true).pipe(Effect.map(Option.map(lease => exclusiveLease(lease, bundle)))),
+    shared: bundle => acquire(bundle, false).pipe(Effect.map(acquired => {
+      switch (acquired._tag) {
+        case "Busy": return Option.none()
+        case "ReadOnly": return Option.some({ readOnly: true, validate: Effect.void })
+        case "Leased": return Option.some({ readOnly: false, validate: validate(acquired.lease) })
+      }
+    })),
+    exclusive: bundle => acquire(bundle, true).pipe(Effect.map(acquired =>
+      acquired._tag === "Leased" ? Option.some(exclusiveLease(acquired.lease, bundle)) : Option.none())),
     adopt: (bundle, descriptor) => Effect.acquireRelease(attempt(() => native.adoptMacUpdateLease(bundle, descriptor)),
       lease => Effect.sync(() => native.releaseMacUpdateLease(lease))).pipe(Effect.map(lease => exclusiveLease(lease, bundle))),
   })
 }))
 
 /** Retained by each installed application owner until its service tree has retired. */
-export const acquireMacApplicationInstallationLease = (bundle: string) => Effect.gen(function* () {
+export const acquireMacApplicationInstallationLease = (bundle: string): Effect.Effect<MacInstallationLeaseStatus, MacUpdateAdmissionFailed, MacUpdateAdmission | Scope.Scope> => Effect.gen(function* () {
   const admission = yield* MacUpdateAdmission
   const lease = yield* admission.shared(bundle)
   if (Option.isNone(lease)) return yield* new MacUpdateAdmissionFailed()
   yield* lease.value.validate
+  return lease.value.readOnly ? "ReadOnly" : "Leased"
 })

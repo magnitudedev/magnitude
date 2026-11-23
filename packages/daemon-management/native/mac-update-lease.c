@@ -92,7 +92,16 @@ static napi_value acquire_internal(napi_env env, napi_callback_info info, int ad
 open_lock:
   lease->fd = adopting ? fcntl(inherited, F_DUPFD_CLOEXEC, 3)
     : openat(lease->parent, lease->name, O_RDONLY | O_NOFOLLOW | O_NONBLOCK | O_CLOEXEC);
-  if (!adopting && lease->fd < 0 && errno == ENOENT && app.st_uid == geteuid()) {
+  if (!adopting && lease->fd < 0 && errno == ENOENT) {
+    if (app.st_uid != geteuid()) {
+      if (!exclusive) {
+        release(lease); free(lease);
+        napi_throw_error(env, "MAC_UPDATE_LEASE_UNOWNED",
+          "The macOS installation bundle is owned by another user and has no installation lock.");
+        return NULL;
+      }
+      goto failed;
+    }
     lease->fd = openat(lease->parent, lease->name, O_RDWR | O_CREAT | O_EXCL | O_NOFOLLOW | O_CLOEXEC, 0644);
     if (lease->fd >= 0) {
       if (fchmod(lease->fd, 0644) || fsync(lease->fd) || fsync(lease->parent)) goto failed;

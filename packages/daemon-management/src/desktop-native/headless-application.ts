@@ -81,18 +81,22 @@ export const runHeadlessApplication = (options: {
   if (yield* Deferred.isDone(stop)) return yield* Deferred.await(stop)
   if (options.prepareStartup) yield* Effect.raceFirst(options.prepareStartup, Deferred.await(stop))
   if (yield* Deferred.isDone(stop)) return yield* Deferred.await(stop)
+  let macInstallationReadOnly = false
   if (options.runtime._tag === "Installed" && options.runtime.layout === "Desktop") {
     if (process.platform === "linux") yield* acquireLinuxInstallationLease(addon)
     if (process.platform === "darwin") {
       const bundle = dirname(dirname(options.runtime.resourcesDirectory))
       const active = yield* Effect.flatMap(MacApplicationInstallation, installation => installation.isInstalling(bundle)).pipe(Effect.provide(NativeMacApplicationInstallation))
       if (active) return yield* new HeadlessApplicationFailed({ message: "A Magnitude update is being installed. Run `magnitude serve` when it finishes." })
-      yield* acquireMacApplicationInstallationLease(bundle).pipe(Effect.provide(nativeMacUpdateAdmission(addon)))
+      const leaseStatus = yield* acquireMacApplicationInstallationLease(bundle).pipe(Effect.provide(nativeMacUpdateAdmission(addon)))
+      macInstallationReadOnly = leaseStatus === "ReadOnly"
     }
   }
   if (yield* Deferred.isDone(stop)) return yield* Deferred.await(stop)
   const serviceState = yield* Ref.make<Option.Option<OwnedServiceState>>(Option.none())
-  const updates = yield* (options.initializeUpdates ?? Effect.succeed(unavailableApplicationUpdate("NotInThisBuild", "Application updates require an installed Magnitude application."))).pipe(
+  const updates = yield* (macInstallationReadOnly
+    ? Effect.succeed(unavailableApplicationUpdate("NotInThisBuild", "Application updates must be installed by the user who owns this Magnitude installation."))
+    : (options.initializeUpdates ?? Effect.succeed(unavailableApplicationUpdate("NotInThisBuild", "Application updates require an installed Magnitude application.")))).pipe(
     Effect.provideService(UpdateHardwareSource, { current: Ref.get(serviceState).pipe(Effect.map(Option.flatMap(updateHardwareFromService))) }))
   if (yield* Deferred.isDone(stop)) return yield* Deferred.await(stop)
   // Update checks start once the service is ready, so a new version reports `applied` only after it starts.

@@ -160,4 +160,32 @@ describe.skipIf(!os || !arch)("CLI-only installation script", () => {
     expect(result.stderr).toContain("curl -fsSL https://magnitude.dev/install.sh | sh -s -- --desktop")
     expect(result.events).toEqual([])
   })
+
+  it("refuses prerelease offers on stable, and admits -alpha.* prereleases with --channel alpha or MAGNITUDE_CHANNEL=alpha", async () => {
+    const alpha = await release("0.1.6-alpha.1")
+    const refusedStable = run(alpha)
+    expect(refusedStable.status).not.toBe(0)
+    expect(refusedStable.stderr).toContain("Release does not match the selected channel")
+    expect(existsSync(cli())).toBe(false)
+
+    const viaFlag = run(alpha, ["--channel", "alpha"])
+    expect(viaFlag.status, viaFlag.stderr).toBe(0)
+    expect(viaFlag.events.filter(line => line.startsWith("download"))[0]).toBe(
+      `download https://magnitude.dev/api/installer?os=${os}&arch=${arch}&package=cli-only&channel=alpha&offer=1`,
+    )
+    expect(readlinkSync(join(cli(), "current"))).toBe("0.1.6-alpha.1")
+
+    const alpha2 = await release("0.1.6-alpha.2")
+    const viaEnv = run(alpha2, [], { MAGNITUDE_CHANNEL: "alpha" })
+    expect(viaEnv.status, viaEnv.stderr).toBe(0)
+    expect(readlinkSync(join(cli(), "current"))).toBe("0.1.6-alpha.2")
+
+    const refusedBetaOnAlpha = run(await release("0.1.6-beta.1"), ["--channel=alpha"])
+    expect(refusedBetaOnAlpha.status).not.toBe(0)
+    expect(refusedBetaOnAlpha.stderr).toContain("Release does not match the selected channel")
+
+    const refusedUnknownChannel = run(alpha, ["--channel", "nightly"])
+    expect(refusedUnknownChannel.status).not.toBe(0)
+    expect(refusedUnknownChannel.stderr).toContain("does not accept channel: nightly")
+  })
 })
