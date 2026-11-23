@@ -38,5 +38,12 @@
     "@magnitudedev/vcs": "0.0.1",
     "@magnitudedev/version": "0.0.1"
   },
-  "changesets": []
+  "changesets": [
+    "cli-only-install",
+    "engine-gpu-performance",
+    "expert-streaming",
+    "memory-stability-fixes",
+    "models-onboarding-overhaul",
+    "new-models-and-formats"
+  ]
 }

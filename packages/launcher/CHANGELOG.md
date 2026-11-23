@@ -1,5 +1,49 @@
 # @magnitudedev/cli
 
+## 0.3.0-alpha.0
+
+### Minor Changes
+
+- [`cb058cf`](https://github.com/magnitudedev/magnitude/commit/cb058cf6990c118a46d7a18f788520ab453c0cce) Thanks [@anerli](https://github.com/anerli)! - Stream mixture-of-experts (MoE) models that are larger than your GPU memory or system RAM. Magnitude now keeps hot routed experts resident in the fastest available tier and streams the rest across GPU memory, host RAM, and disk as tokens are generated.
+
+  - Models that previously wouldn't fit in VRAM or unified memory can now load and run by caching active experts in GPU/RAM and reading colder experts from host RAM or SSD on demand.
+  - Streaming adapts automatically while serving, balancing expert cache residency, prompt processing, and KV cache room based on measured hardware and decode timings.
+  - The app's Status card, Models page, and CLI show how a model is placed across GPU memory, host RAM, and SSD, including live expert residency while running.
+
+### Patch Changes
+
+- [`cb058cf`](https://github.com/magnitudedev/magnitude/commit/cb058cf6990c118a46d7a18f788520ab453c0cce) Thanks [@thrgreenwald](https://github.com/thrgreenwald)! - Standalone CLI-only installation and smoother headless serving.
+
+  - Added a CLI-only install path for running Magnitude without the desktop app, with `magnitude app open` opening the browser UI (or printing its URL when running headless or over SSH) and `magnitude update install` handling self-updates.
+  - Improved handoff between `magnitude serve` and the desktop app: installing or starting the desktop app cleanly yields an active `magnitude serve`, waiting `serve` instances stay alive through updates, and `magnitude serve` restores previously loaded models when taking back over.
+  - Removed the `magnitude://` protocol handler and its OS registrations across all platforms.
+
+- [`cb058cf`](https://github.com/magnitudedev/magnitude/commit/cb058cf6990c118a46d7a18f788520ab453c0cce) Thanks [@anerli](https://github.com/anerli)! - Faster inference and kernel tuning across Metal, CUDA, Vulkan, and CPU.
+
+  - Added resident launches on Metal and hardware-derived kernel defaults across Metal, CUDA, and Vulkan, preventing register spills and reducing tuning overhead.
+  - Unified projection operators across all backends and unified speculative decoding round pricing across model assessment and live draft control.
+  - Broad kernel speedups across CUDA, Metal, and Vulkan for MLA attention, recurrent chunk scans, vision, readout, routed expert gather/combine, sampling, and draft/corrector passes.
+
+- [`cb058cf`](https://github.com/magnitudedev/magnitude/commit/cb058cf6990c118a46d7a18f788520ab453c0cce) Thanks [@anerli](https://github.com/anerli)! - Memory accounting, stability, and platform fixes.
+
+  - Improved memory accounting and headroom across platforms: reclaimable macOS file cache and Metal wired ceilings, CUDA discrete VRAM headroom, Vulkan `VK_EXT_memory_budget` caps and command-buffer recycling, and Linux CMA exclusion and transparent huge-page compaction stall fixes.
+  - Fixed a Windows WDDM circular deadlock during slab growth on CUDA and fixed unwakeable memory waits under fragmented state pools.
+  - Fixed Windows installer/uninstaller cleanup of pre-existing Magnitude CLI `PATH` entries, added retry/cleanup for transient macOS `hdiutil` busy errors, handled missing `systemctl` on Linux, and added a light rim to the macOS Dock icon.
+  - Auto-completed onboarding on upgrade when existing models or chats are present, fixed starting new chats on the currently loaded model without swapping it out, and fixed surfacing deprecated/retired catalog models and rejected load errors.
+
+- [`cb058cf`](https://github.com/magnitudedev/magnitude/commit/cb058cf6990c118a46d7a18f788520ab453c0cce) Thanks [@thrgreenwald](https://github.com/thrgreenwald)! - Overhauled onboarding, model browsing, and the `magnitude models` CLI.
+
+  - Added a first-run onboarding flow with live hardware benchmark progress, and replaced the old Discover and Catalog pages with the new **Models** page and **Explore** modal.
+  - Paged Hugging Face search in both Explore and the CLI now groups results by repository, lets you inspect every quant, and lets you choose or change a model's speculative drafter at download time or from Your Models.
+  - Updated memory displays across the app and CLI to show hardware-capacity units, placement bars (GPU, RAM, and SSD), and available disk space, and added the ability to hide and re-show models discovered from other apps.
+  - Replaced `magnitude catalog` commands with `magnitude models` (`models show`, `models pull`, and `models status`), accepting Hugging Face model IDs directly before download.
+
+- [`cb058cf`](https://github.com/magnitudedev/magnitude/commit/cb058cf6990c118a46d7a18f788520ab453c0cce) Thanks [@anerli](https://github.com/anerli)! - New models, native weight formats, and a refreshed recommended catalog.
+
+  - Added support for **DeepSeek V4.1 Flash** (including its tokenizer, tool calling, and attention/engram architecture), **GLM-5.3 Flash** (with vision and multi-token prediction across all backends), and **Nemotron 3.5 Bolt E4B**.
+  - Added native in-place **FP8** (`F8_E4M3` / `mxfp8g32`) and **GGUF `Q2_0`** weight support across all backends.
+  - Refreshed the recommended catalog around tested quantization ladders and Epoch Capabilities Index scores (% of frontier), deprecating models superseded by newer ones (Gemma 4 26B-A4B, Gemma 4 31B, Gemma 4 E4B, Liquid LFM2.5 24B-A2B, and Qwen3.5 9B) while continuing to surface and serve already-installed deprecated models.
+
 ## 0.2.17
 
 ### Patch Changes
