@@ -261,6 +261,46 @@ impl Drop for BackingSlot<'_> {
 }
 
 impl Shared {
+    /// What a starting watcher's steps and serving share (`Watcher::start`),
+    /// built in a frame of its own: it is the largest of the start's parts.
+    fn new(
+        steps: Arc<Steps>,
+        time: crate::experts::horizon::Time,
+        telemetry: Telemetry,
+        told: std::sync::mpsc::Sender<crate::experts::interest::Told>,
+        compute: crate::experts::Compute,
+        parks: Arc<Parks>,
+        transport: Arc<crate::experts::transport::ExpertTransport>,
+    ) -> Arc<Self> {
+        Arc::new(Self {
+            steps,
+            time,
+            pending_verify: Mutex::new(None),
+            telemetry,
+            told,
+            resizing: ResizeHandoff::new(),
+            traffic_held: Default::default(),
+            traffic_quiet: Default::default(),
+            backing: Default::default(),
+            joins: Joins::new(),
+            life: Life::new(),
+            compute,
+            sites_served: std::sync::atomic::AtomicBool::new(true),
+            parks,
+            landings: Default::default(),
+            priced: Mutex::new(None),
+            promoted: Default::default(),
+            copy: Mutex::new(None),
+            lend: Mutex::default(),
+            covers: Default::default(),
+            passes: Mutex::new(None),
+            prices: Mutex::new(None),
+            settled: Default::default(),
+            transport,
+            policy: Mutex::default(),
+        })
+    }
+
     /// Tell the interest ledger `told`, and wake the service that drains
     /// it. Once residency is gone nothing drains it, and what is told is
     /// dropped.
@@ -946,33 +986,7 @@ impl Watcher {
         // The ledger's queue: told from any thread, drained by `Prefetch`.
         let (told, inbox) = std::sync::mpsc::channel();
         let time = core.directory.time().clone();
-        let shared = Arc::new(Shared {
-            steps,
-            time: time.clone(),
-            pending_verify: Mutex::new(None),
-            telemetry,
-            told,
-            resizing: ResizeHandoff::new(),
-            traffic_held: Default::default(),
-            traffic_quiet: Default::default(),
-            backing: Default::default(),
-            joins: Joins::new(),
-            life: Life::new(),
-            compute: compute.handle(),
-            sites_served: std::sync::atomic::AtomicBool::new(true),
-            parks,
-            landings: Default::default(),
-            priced: Mutex::new(None),
-            promoted: Default::default(),
-            copy: Mutex::new(None),
-            lend: Mutex::default(),
-            covers: Default::default(),
-            passes: Mutex::new(None),
-            prices: Mutex::new(None),
-            settled: Default::default(),
-            transport,
-            policy: Mutex::default(),
-        });
+        let shared = Shared::new(steps, time.clone(), telemetry, told, compute.handle(), parks, transport);
         crate::settle::owe_shared(Arc::downgrade(&shared));
         // The transfer queue the promotions queue on, whose completions its
         // watch announces.
