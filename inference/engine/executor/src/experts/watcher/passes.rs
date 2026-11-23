@@ -582,15 +582,21 @@ mod tests {
     /// read's seconds; the stall of the plain passes' misses; the latest
     /// pass says which runs; the stand rates their owner's, unjudged none.
     /// Rolling two epochs with new passes drops old global sums, while an
+    fn depths(values: &[f64]) -> [f64; DEPTHS] {
+        let mut out = [0.; DEPTHS];
+        out[..values.len()].copy_from_slice(values);
+        out
+    }
+
     /// unrun depth keeps its last measured compute.
     #[test]
     fn the_regime_is_measured_over_the_window_by_kind() {
         let (mut passes, time) = passes();
         let stands = unjudged(time.clone());
         assert_eq!(passes.measured(48, [[None; DEPTHS]; 2], &stands), None);
-        passes.timed(Pass { missed: 100., reads: 100., unused: [[2., 0., 0., 0., 0., 0., 0., 0.], [0.; DEPTHS]], ..plain(0.13, 0.1, 100.) });
+        passes.timed(Pass { missed: 100., reads: 100., unused: [depths(&[2.]), [0.; DEPTHS]], ..plain(0.13, 0.1, 100.) });
         let deep = Pass { rows: 3, depth: 2, seconds: 0.1, parked: 0.06, misses: 60., missed: 80., reads: 80., drive: 0.08, ..Pass::default() };
-        passes.timed(Pass { unused: [[2., 6., 4., 0., 0., 0., 0., 0.], [0.; DEPTHS]], ..deep });
+        passes.timed(Pass { unused: [depths(&[2., 6., 4.]), [0.; DEPTHS]], ..deep });
         let measured = passes.measured(48, [[Some(magnitude_cost_model::Needed::Executed(90.)); DEPTHS]; 2], &stands).expect("passes timed");
         let compute = |depth: usize| measured.terms[depth].map(|terms| terms.compute);
         assert_eq!((measured.layers, measured.depth, measured.needed[0][0], measured.stand, measured.accepts), (48, 2, Some(magnitude_cost_model::Needed::Executed(90.)), None, [None; FRONT_DEPTHS]));
@@ -625,12 +631,12 @@ mod tests {
     #[test]
     fn front_and_verify_compute_are_keyed_by_form_and_depth() {
         let (mut passes, time) = passes();
-        let front = Pass { rows: 2, depth: 1, seconds: 0.05, parked: 0.01, misses: 10., missed: 10., reads: 10., drive: 0.01, unused: [[0., 4., 0., 0., 0., 0., 0., 0.], [0.; DEPTHS]], ..Pass::default() };
+        let front = Pass { rows: 2, depth: 1, seconds: 0.05, parked: 0.01, misses: 10., missed: 10., reads: 10., drive: 0.01, unused: [depths(&[0., 4.]), [0.; DEPTHS]], ..Pass::default() };
         passes.timed(front);
         // Depth 2 only has a front pass: verify extrapolates from front.
         passes.timed(Pass { rows: 3, depth: 2, seconds: 0.06, parked: 0.01, ..front });
         // Depth 1 has both front (compute = 0.04) and verify (compute = 0.06).
-        passes.timed(Pass { verifies: true, seconds: 0.07, unused: [[0.; DEPTHS], [0., 2., 0., 0., 0., 0., 0., 0.]], ..front });
+        passes.timed(Pass { verifies: true, seconds: 0.07, unused: [[0.; DEPTHS], depths(&[0., 2.])], ..front });
         let measured = passes.measured(48, [[Some(magnitude_cost_model::Needed::Executed(10.)); DEPTHS]; 2], &unjudged(time)).expect("passes timed");
         assert!(measured.verifying, "{measured:?}");
         assert!((measured.terms[1].unwrap().compute - 0.04).abs() < 1e-12, "front depth 1 compute alone: {measured:?}");
@@ -661,7 +667,7 @@ mod tests {
             link: 0.015,   // 1.5 ms / read
             cpu: 0.005,    // 0.5 ms / read
             memory: 0.010, // 1.0 ms / read
-            unused: [[2., 4., 0., 0., 0., 0., 0., 0.], [0.; DEPTHS]],
+            unused: [depths(&[2., 4.]), [0.; DEPTHS]],
             ..Pass::default()
         });
         let measured = passes
@@ -687,9 +693,9 @@ mod tests {
         let (mut passes, time) = passes();
         let base = Pass { rows: 2, depth: 1, seconds: 0.05, parked: 0.01, misses: 10., missed: 10., reads: 10., drive: 0.01, ..Pass::default() };
         // 1 front pass + 9 verify passes, each with 2 unused exact-row hints in `unused[0][0]`.
-        passes.timed(Pass { verifies: false, unused: [[2., 0., 0., 0., 0., 0., 0., 0.], [0.; DEPTHS]], ..base });
+        passes.timed(Pass { verifies: false, unused: [depths(&[2.]), [0.; DEPTHS]], ..base });
         for _ in 0..9 {
-            passes.timed(Pass { verifies: true, unused: [[2., 0., 0., 0., 0., 0., 0., 0.], [0.; DEPTHS]], ..base });
+            passes.timed(Pass { verifies: true, unused: [depths(&[2.]), [0.; DEPTHS]], ..base });
         }
         let measured = passes.measured(48, [[Some(magnitude_cost_model::Needed::Executed(10.)); DEPTHS]; 2], &unjudged(time)).expect("passes timed");
         let wasted = &measured.paths.as_ref().expect("a miss counted")[0].wasted;

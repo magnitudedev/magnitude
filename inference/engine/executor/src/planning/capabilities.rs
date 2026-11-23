@@ -76,6 +76,32 @@ impl PlannedMethod {
         }
     }
 
+    /// Cap any drafting proposals and fixed widths so a verification pass
+    /// (anchor + proposals) never exceeds `decode_rows` rows.
+    pub(crate) fn capped_to_decode_rows(self, decode_rows: u64) -> Self {
+        let max_proposals = decode_rows.saturating_sub(1).min(u64::from(u8::MAX)) as u8;
+        let cap_widths = |widths: DraftWidths| match widths {
+            DraftWidths::Adaptive => DraftWidths::Adaptive,
+            DraftWidths::Fixed(w) => DraftWidths::Fixed(w.min(max_proposals)),
+        };
+        match self {
+            Self::Plain => Self::Plain,
+            Self::Mtp {
+                greedy_proposals,
+                sampled_proposals,
+                widths,
+            } => Self::Mtp {
+                greedy_proposals: greedy_proposals.min(max_proposals),
+                sampled_proposals: sampled_proposals.min(max_proposals),
+                widths: cap_widths(widths),
+            },
+            Self::DFlash { proposals, widths } => Self::DFlash {
+                proposals: proposals.min(max_proposals),
+                widths: cap_widths(widths),
+            },
+        }
+    }
+
     /// The widest draft a round of this method generates: the adaptive
     /// controller's widest, its proposals, or a fixed budget's width; 0
     /// without drafting.

@@ -89,7 +89,7 @@ constexpr bool NVFP4 = projection::OperandRecipe<packets::W0_OPERANDS_NVFP4, pac
                          blockIdx.x, SEISMIC_DIM_H, SEISMIC_PTR(SEISMIC_BUFFER_SCRATCH_OPERANDS));
 
 #define ROUTED_GATE_UP_GATHERED_BODY                                                                            \
-    using Shape = routed::DecodeShape<TPW, KSPLIT>;                                                             \
+    using Shape = routed::DecodeGatheredShape<TPW, KSPLIT>;                                                     \
     using Readers = routed::DecodeReaders<packets::W0, packets::W1>;                                            \
     __shared__ projection::GemvShared<Shape, Raw, 0, routed::DecodePoints<packets::W0, packets::W1>> shared;    \
     __shared__ routed::Gathered table;                                                                          \

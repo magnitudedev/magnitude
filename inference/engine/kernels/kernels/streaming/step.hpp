@@ -11,17 +11,17 @@
 STREAMING_FN void streaming_step_words(STREAMING_DEVICE_WORDS step, u64 step0, STREAMING_DEVICE_READ sequence,
     u64 sequence0, STREAMING_DEVICE_READ guesses, u64 guesses0, u64 guesses1, u32 rows) {
     const int front = streaming_device_load(STREAMING_AT(sequence, SEISMIC_CONST_STEP_FRONT * sequence0));
-    int kinds = 0;
+    u32 kinds = 0u;
     for (u32 row = 1; row < rows; ++row) {
         if (((u32(front) >> row) & 1u) == 0u)
             continue;
         const int kind = streaming_device_load(STREAMING_AT(guesses, u64(row - 1) * guesses0 + guesses1));
-        kinds |= kind << SEISMIC_CONST_STEP_GUESS_SHIFT(row);
+        kinds |= u32(kind) << SEISMIC_CONST_STEP_GUESS_SHIFT(row);
     }
     streaming_device_store(STREAMING_AT(step, SEISMIC_CONST_STEP_LOW * step0),
         streaming_device_load(STREAMING_AT(sequence, SEISMIC_CONST_STEP_LOW * sequence0)));
     streaming_device_store(STREAMING_AT(step, SEISMIC_CONST_STEP_HIGH * step0),
         streaming_device_load(STREAMING_AT(sequence, SEISMIC_CONST_STEP_HIGH * sequence0)));
     streaming_device_store(STREAMING_AT(step, SEISMIC_CONST_STEP_FRONT * step0), front);
-    streaming_device_store(STREAMING_AT(step, SEISMIC_CONST_STEP_GUESSES * step0), kinds);
+    streaming_device_store(STREAMING_AT(step, SEISMIC_CONST_STEP_GUESSES * step0), int(kinds));
 }

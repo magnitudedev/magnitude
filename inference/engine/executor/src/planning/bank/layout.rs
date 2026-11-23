@@ -1074,7 +1074,7 @@ impl ExpertBankPlan {
     /// `BankAllocation` sizing as [`Self::layout`].
     pub fn places_storage_demand(&self, places: u64) -> Result<ClaimDemand, String> {
         let words = RegionWords {
-            choices: self.choices(),
+            choices: self.table_choices(),
             rounds: self.rounds(),
             flight: self.flights.steps(places),
             sites: self.flights.steps(1),

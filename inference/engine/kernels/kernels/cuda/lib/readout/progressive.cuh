@@ -28,7 +28,7 @@
 #define PROGRESSIVE_COARSE_SCALE (1u << PROGRESSIVE_HALF_BITS)
 #define PROGRESSIVE_COARSE_BIAS (0.5f * float(PROGRESSIVE_COARSE_SCALE - 1u) - float(PROGRESSIVE_OFFSET))
 
-#define PROGRESSIVE_ROWS unsigned(SEISMIC_CONST_VERIFY_ROWS)
+#define PROGRESSIVE_ROWS PROJECTION_PLANES_ROWS
 #define PROGRESSIVE_MARGIN 3.814697265625e-06f
 // The largest Gumbel noise the sampler draws: -log(-log u) at the largest
 // uniform u = 1 - 2^-24, about 16.64.

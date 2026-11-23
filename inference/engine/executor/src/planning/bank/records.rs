@@ -52,18 +52,18 @@ pub fn routed_experts(definition: &ModelDefinition) -> Result<u64, PlanError> {
 }
 
 /// The choices of the decode form's widest launch of a model whose rows
-/// each select `selected` experts, `VERIFY_ROWS · K`: the most a decode
-/// request names at a layer.
-pub(crate) fn decode_choices(selected: u64) -> u64 {
-    VERIFY_ROWS * selected
+/// each select `selected` experts across `decode_rows` rows (`decode_rows · K`):
+/// the most a decode request names at a layer.
+pub(crate) fn decode_choices(selected: u64, decode_rows: u64) -> u64 {
+    decode_rows.clamp(1, VERIFY_ROWS) * selected
 }
 
 /// The decode set of a model whose rows each select `selected` of at most
-/// `widest` experts a layer: the most distinct experts a decode request
-/// reads at a layer, its choices ([`decode_choices`]) where the layer has
-/// that many, else every expert of the layer.
-pub(crate) fn decode_set(selected: u64, widest: u64) -> u64 {
-    decode_choices(selected).min(widest)
+/// `widest` experts a layer across `decode_rows` rows: the most distinct
+/// experts a decode request reads at a layer, its choices ([`decode_choices`])
+/// where the layer has that many, else every expert of the layer.
+pub(crate) fn decode_set(selected: u64, widest: u64, decode_rows: u64) -> u64 {
+    decode_choices(selected, decode_rows).min(widest)
 }
 
 /// A routed tensor of an expert record, in the order the fill converts them

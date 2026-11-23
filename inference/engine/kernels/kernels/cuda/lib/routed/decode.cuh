@@ -11,7 +11,10 @@ namespace routed {
 // hardware admits; the others adopt the bound where it is measured to pay.
 constexpr int DECODE_WARPS = 4;
 constexpr int DECODE_THREADS = DECODE_WARPS * 32;
-template <int TPW, int KSPLIT> using DecodeShape = projection::GemvShape<DECODE_WARPS, TPW, KSPLIT, 1>;
+constexpr int DECODE_BATCHES = (SEISMIC_CONST_VERIFY_ROWS + 7) / 8;
+static_assert(DECODE_BATCHES * 8 >= SEISMIC_CONST_VERIFY_ROWS, "DecodeGatheredShape must cover VERIFY_ROWS");
+template <int TPW, int KSPLIT, int NB = 1> using DecodeShape = projection::GemvShape<DECODE_WARPS, TPW, KSPLIT, NB>;
+template <int TPW, int KSPLIT> using DecodeGatheredShape = DecodeShape<TPW, KSPLIT, DECODE_BATCHES>;
 
 // The grid-point readers and points source of a routed decode GEMV over
 // weights WA (and optional paired WB). Multi-branch kernels combine their

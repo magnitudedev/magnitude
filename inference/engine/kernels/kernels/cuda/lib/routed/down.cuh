@@ -90,7 +90,7 @@ struct ChoiceProjectedEpi {
 #endif
 
 #define ROUTED_DOWN_GATHERED_BODY(TPW, KSPLIT)                                                                     \
-    using Shape = routed::DecodeShape<TPW, KSPLIT>;                                                                \
+    using Shape = routed::DecodeGatheredShape<TPW, KSPLIT>;                                                        \
     using Readers = routed::DecodeReaders<packets::W0>;                                                            \
     constexpr projection::u64 CHANNELS = Shape::GROUPS * TPW * 16;                                                 \
     __shared__ projection::GemvShared<Shape, Raw, 0, routed::DecodePoints<packets::W0>> shared;                    \

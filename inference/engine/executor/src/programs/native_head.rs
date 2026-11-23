@@ -277,7 +277,7 @@ pub(crate) fn head_graph_classes(
             .iter()
             .filter(|rows| **rows >= slots && **rows <= entry_bound)
         {
-            for steps in 1..=proposals as u64 {
+            for steps in 1..=(proposals as u64) {
                 for &selection in &selecting {
                     classes.push(transaction(entry_rows, slots, steps, selection, false, false));
                     if slots == 1 {

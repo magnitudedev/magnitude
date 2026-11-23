@@ -613,7 +613,7 @@ impl ExpertBankPlan {
             tier: self.host_extent(group),
             placer: self.placer(),
             words: RegionWords {
-                choices: self.choices(),
+                choices: self.table_choices(),
                 rounds: self.rounds(),
                 flight: self.flights.steps(self.places),
                 sites: self.flights.steps(1),
@@ -676,6 +676,15 @@ impl ExpertBankPlan {
     /// tier's landing reserve ([`Self::landing_records`]).
     pub fn choices(&self) -> u64 {
         self.structure().choices()
+    }
+
+    /// Choice capacity of the bank's per-step metadata tables (`FileTable`,
+    /// `ScratchTable`, `SiteTable`, `HintRing`): always sized for `VERIFY_ROWS`
+    /// so every sealed decode graph class `M <= VERIFY_ROWS` fits the kernel
+    /// domain even when weight-record reserves step down `decode_rows` to fit
+    /// tight memory budgets.
+    pub(super) fn table_choices(&self) -> u64 {
+        records::decode_choices(self.selected(), magnitude_kernels::constants::VERIFY_ROWS)
     }
 
     /// The layer `layer`'s route predicts at lead `lead`, where that lead
@@ -885,7 +894,7 @@ impl ExpertBankPlan {
     /// hints (`l + 1`, `l + 2`), and remains equal to `K` when
     /// `widest <= K` (including `widest == 1`).
     pub fn demand_records(&self) -> u64 {
-        decode_set(self.selected(), self.widest().get())
+        decode_set(self.selected(), self.widest().get(), self.decode_rows())
     }
 
     /// The stored bytes of the least move its model store's path makes: an
@@ -1242,8 +1251,9 @@ impl ExpertBankPlan {
     #[cfg(test)]
     pub(crate) fn with_layers(self, layers: BankLayers) -> Self {
         let window_slots = self.window_slots().min(layers.widest().get());
+        let decode_rows = self.decode_rows();
         let (selected, host, groups, _) = self.structured.into_parts();
-        let structured = conveyor::Structured::new(selected, host, groups, layers, Some(window_slots))
+        let structured = conveyor::Structured::new(selected, host, groups, layers, Some(window_slots), decode_rows)
             .expect("the layers keep the bank's lending");
         let blocks = size_pool_blocks(structured.granules(), self.allocations)
             .expect("the layers size valid bank blocks");
@@ -1280,7 +1290,7 @@ impl ExpertBankPlan {
     fn least_records_with_reserve(&self, group: usize, reserve: u64) -> u64 {
         let decode = match self.placer() {
             Placer::Tier => 0,
-            Placer::Bank => decode_set(self.selected(), self.widest_member(group)) + reserve,
+            Placer::Bank => decode_set(self.selected(), self.widest_member(group), self.decode_rows()) + reserve,
         };
         let prompt = if group != self.lender_group() {
             0

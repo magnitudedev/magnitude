@@ -955,7 +955,7 @@ inline void unordered_from_ordered_maxm_run(thread const RawIn &raw, thread cons
                 return;
             }
         }
-        constexpr uint min_shared_bytes = (MAXM == 1u) ? 1024u : ((MAXM == 2u) ? 1536u : ((MAXM == 4u) ? 2560u : 4608u));
+        constexpr uint min_shared_bytes = (MAXM == 1u) ? 1024u : ((MAXM == 2u) ? 1536u : ((MAXM == 4u) ? 2560u : ((MAXM == 8u) ? 4608u : 8704u)));
         const uint avail_bytes = metal::max(min_shared_bytes,
             metal::min(((k + 31u) >> 5u) * MAXM, mixed_gemv_stage_packet_rows) * 64u);
         threadgroup float *smem = reinterpret_cast<threadgroup float *>(shared);
@@ -967,7 +967,7 @@ inline void unordered_from_ordered_maxm_run(thread const RawIn &raw, thread cons
         gemv_body<W0, W1, PAIRED, ROWS, MAXM, LANES, false, false, mixed_gemv_stage_packet_rows>(
             input, out, w0, w1, m, n, k, tile, shared, SIMDGROUPS, sg, lane);
     } else {
-        constexpr uint min_shared_bytes = (MAXM == 1u) ? 1024u : ((MAXM == 2u) ? 1536u : ((MAXM == 4u) ? 2560u : 4608u));
+        constexpr uint min_shared_bytes = (MAXM == 1u) ? 1024u : ((MAXM == 2u) ? 1536u : ((MAXM == 4u) ? 2560u : ((MAXM == 8u) ? 4608u : 8704u)));
         const uint avail_bytes = metal::max(min_shared_bytes,
             metal::min(((k + 31u) >> 5u) * MAXM, mixed_gemv_stage_packet_rows) * 64u);
         threadgroup float *smem = reinterpret_cast<threadgroup float *>(shared);
@@ -1027,7 +1027,7 @@ inline void unordered_from_ordered_maxm_run(thread const RawIn &raw, thread cons
     do { constexpr uint MAXM = 1; __VA_ARGS__; } while (0)
 #define PROJECTION_FOR_PAIR_ROWS(rows, ...)                                     \
     do { constexpr uint MAXM = 2; __VA_ARGS__; } while (0)
-static_assert(SEISMIC_CONST_VERIFY_ROWS <= 8, "the GEMV bodies serve at most 8 rows");
+static_assert(SEISMIC_CONST_PROJECTION_GEMV_MAX_M <= 8, "the GEMV bodies serve at most 8 rows");
 #define PROJECTION_FOR_SEVERAL_ROWS(rows, ...)                                  \
     do { constexpr uint MAXM = (MATRIX_FROM <= 5 ? 4 : 8); __VA_ARGS__; } while (0)
 

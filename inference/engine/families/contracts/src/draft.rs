@@ -611,7 +611,8 @@ impl DraftDefinition {
         if matches!(self.method, DraftMethod::LiLiCorr { .. }) {
             return self.block_size;
         }
-        (self.proposal_row(proposals.max(1) - 1) + 1).clamp(2, self.block_size)
+        let rows = (self.proposal_row(proposals.max(1) - 1) + 1).max(2);
+        rows.min(self.block_size)
     }
 
     /// The block row whose output drafts proposal `proposal` (the token at

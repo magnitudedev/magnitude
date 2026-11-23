@@ -1993,6 +1993,10 @@ pub struct ModelLoadPlan {
     /// through records them (`ExpertBankPlan::recording`), whatever bank a
     /// plan builds of it.
     pub(super) recorded_routes: bool,
+    /// The widest decode step (rows) the load's expert bank sizes its decode
+    /// demand and staging reserves for (`1..=VERIFY_ROWS`), avoiding VRAM/UMA
+    /// over-reservation on plain decode or narrower drafting windows.
+    pub(super) decode_rows: u64,
     /// O(1) role lookup over `target`, `head`, and `vision` in `weights()`
     /// order; rebuilt whenever those vectors change shape or roles.
     role_index: FxHashMap<WeightRole, WeightSlot>,
@@ -2023,6 +2027,7 @@ impl ModelLoadPlan {
             bank: Some(bank),
             record_ports: None,
             recorded_routes: false,
+            decode_rows: magnitude_kernels::constants::VERIFY_ROWS,
             role_index: FxHashMap::default(),
             bank_table_index: FxHashMap::default(),
         };
@@ -2490,6 +2495,7 @@ impl ModelLoadPlan {
             bank: None,
             record_ports: None,
             recorded_routes: false,
+            decode_rows: magnitude_kernels::constants::VERIFY_ROWS,
             role_index: fx_map(),
             bank_table_index: fx_map(),
         };
@@ -2925,6 +2931,7 @@ impl ModelLoadPlan {
             bank: None,
             record_ports: None,
             recorded_routes: false,
+            decode_rows: magnitude_kernels::constants::VERIFY_ROWS,
             role_index,
             bank_table_index: fx_map(),
         };
@@ -2939,6 +2946,13 @@ impl ModelLoadPlan {
             record_ports: Some(backend),
             ..self
         }
+    }
+
+    /// Size any expert bank built from this load for at most `decode_rows`
+    /// rows per decode step (`1..=VERIFY_ROWS`).
+    pub(crate) fn with_decode_rows(mut self, decode_rows: u64) -> Self {
+        self.decode_rows = decode_rows.clamp(1, magnitude_kernels::constants::VERIFY_ROWS);
+        self
     }
 
     /// Every byte `weight`, one of this load's, holds: its allocations

@@ -125,7 +125,7 @@ impl ModelLoadPlan {
         // A conveyor or a scratch without a layout, or a pool without a
         // granule, is refused here, so every sizing past this may rely on
         // them (`ExpertBankPlan::prompt_records`, `ExpertBankPlan::granule`).
-        let structured = conveyor::Structured::new(selected, host, groups, layers, window_slots)
+        let structured = conveyor::Structured::new(selected, host, groups, layers, window_slots, self.decode_rows)
             .map_err(PlanError::InvalidDefinition)?;
         // Every stored table whose slots the host fills in place, held in
         // granules of the bank's largest records pool: only where the host

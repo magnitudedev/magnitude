@@ -85,7 +85,7 @@ __global__ void routed_up_stage(SEISMIC_KERNEL_PARAMS) {
 #ifdef SEISMIC_FORMING_ROUTED_UP_GATHERED
 template <int TPW, int KSPLIT>
 __global__ void routed_up_gathered(SEISMIC_KERNEL_PARAMS) {
-    using Shape = routed::DecodeShape<TPW, KSPLIT>;
+    using Shape = routed::DecodeGatheredShape<TPW, KSPLIT>;
     using Readers = routed::DecodeReaders<packets::W0>;
     __shared__ projection::GemvShared<Shape, Raw, 0, routed::DecodePoints<packets::W0>> shared;
     __shared__ routed::Gathered table;

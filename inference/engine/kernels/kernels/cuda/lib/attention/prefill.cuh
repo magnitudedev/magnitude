@@ -1021,7 +1021,7 @@ __device__ __forceinline__ void attend(const Inputs &in, const History &history,
             } single;
         };
     };
-    constexpr int PLAN_INTS = PICKS ? 144 : 80;
+    constexpr int PLAN_INTS = PICKS ? 256 : 144;
     static_assert(sizeof(PositionPlan) <= PLAN_INTS * 4, "PositionPlan fits the declared 16-byte slots");
 
     int *table = reinterpret_cast<int *>(shared + REGION);  // [last + 1][4], or PositionPlan for POSITIONS

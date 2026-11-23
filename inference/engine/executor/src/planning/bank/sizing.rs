@@ -138,7 +138,7 @@ impl ExpertBankPlan {
     /// `group`'s layers: `R` of [`Self::decode_records`], the decode set
     /// ([`decode_set`]) of the group's widest member.
     fn request_records(&self, group: usize) -> u64 {
-        decode_set(self.selected(), self.widest_member(group))
+        decode_set(self.selected(), self.widest_member(group), self.decode_rows())
     }
 
     /// The most host slots a host tier holds: the widest layer's experts, a

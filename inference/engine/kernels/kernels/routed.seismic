@@ -165,6 +165,7 @@ projection routed for metal:
         arithmetic form DOWN_PACK in [0, 1] default greatest where DOWN_PACK == 0 or (device.tensor_ops == 0 and DOWN_TALL == 1 and DOWN_INT8 == 0 and each(W, FIRST == 1 or (WIDTH % 128 == 0 and WIDTH < 1048576 and N % 64 == 0 and form(W, PACK) == 1))) reference 0 for grouped)
     where K + SHARED <= device.max_group_threads / device.subgroup_width for summed
     where ROWS * ceil_div(SUMMED_PACKETS - (1 - min(1, LANES / 16) + (min(1, LANES / 16) - LANES / 32) * SUMMED_STAGES_16) * (SUMMED_PACKETS - SUMMED_STAGE), LANES) <= 8 for summed
+    where GATHERED == 0 or LANES <= 16 for summed
     where (SHARED == 1 or 2 * ceil_div(SUMMED_PACKETS - SUMMED_STAGES_16 * (SUMMED_PACKETS - SUMMED_STAGE), 16) <= 8) for summed
     where (TALL == 0 or ((WIDTH % 64 == 0 or INT8 == 1) and (STACKED == 0 or T % 32 == 0))) for grouped
     where (TALL == 0 or WIDTH % 128 == 0 or TALL_K == 64) for grouped
@@ -2582,7 +2583,7 @@ fn routed_route_streamed[M, H, PT, NM, E, K, S, ES, FW, FLIGHT, RING, P, GM, TM]
     return (normalized, coefficient, shared_product)
 
 # Gate-ahead hints (`hint`) for the next one or two streamed fused layers
-# (`AHEAD` in 1..=HINT_LEADS), guarded by `next_policy[POLICY_RESOLVED]`.
+# (`AHEAD` in 1..=HINT_LEADS), guarded by `next_policy[POLICY_WHOLE]`.
 fn routed_hint_route[M, H, PT, NM, K, AHEAD, RING, EN](residual: &tensor[M, PT * H] f32,
     activation: &host tensor[0, K] A,
     next_norm: &tensor[NM] NW, next_router: &tensor[EN, H] RW,
@@ -2594,7 +2595,7 @@ fn routed_hint_route[M, H, PT, NM, K, AHEAD, RING, EN](residual: &tensor[M, PT *
     let mut predicted_logits = tensor[M, EN] f32
     let mut after = tensor[M, H] A
     let mut after_logits = tensor[M, EN] f32
-    if next_policy[POLICY_RESOLVED] == 0:
+    if next_policy[POLICY_WHOLE] == 0:
         hint[K = K](residual, next_norm, next_router, eps, step, predicted,
             predicted_logits, rings[0, :])
         for lead in 1..AHEAD:
@@ -2625,7 +2626,7 @@ fn routed_select_streamed[M, H, E, K, ES, FW, FLIGHT, RING, P, GM, TM](residual:
     return normalized
 
 # Gate-ahead hints (`hint_selected`) for the next one or two streamed general
-# layers (`AHEAD` in 1..=HINT_LEADS), guarded by `next_policy[POLICY_RESOLVED]`.
+# layers (`AHEAD` in 1..=HINT_LEADS), guarded by `next_policy[POLICY_WHOLE]`.
 fn routed_hint_select[M, H, K, AHEAD, RING, EN](residual: &tensor[M, H] f32,
     activation: &host tensor[0, K] A,
     next_router_norm: &tensor[H] RNW, next_router: &tensor[EN, H] RW, next_bias: &tensor[EN] f32,
@@ -2645,7 +2646,7 @@ fn routed_hint_select[M, H, K, AHEAD, RING, EN](residual: &tensor[M, H] f32,
     for row in 0..M:
         for choice in 0..K:
             after_routes[row, choice] = -1
-    if next_policy[POLICY_RESOLVED] == 0:
+    if next_policy[POLICY_WHOLE] == 0:
         hint_selected(residual, next_router_norm, next_router, next_bias, score, epsilon, step,
             predicted, predicted_logits, predicted_routes, rings[0, :])
         for lead in 1..AHEAD:
@@ -2934,15 +2935,15 @@ fn routed_step[T](step: &mut tensor[STEP_WORDS] i32, sequence: &tensor[STEP_WORD
     guesses: &tensor[T, 2] i32)
     where T >= 0 and T <= 32:
     let front = sequence[STEP_FRONT]
-    let mut kinds = i32(0)
+    let mut kinds = u32(0)
     if T >= 1:
         for row in 1..T:
-            if ((front >> i32(row)) & 1) != 0:
-                kinds = kinds | (guesses[row - 1, 1] << i32(STEP_GUESS_SHIFT(row)))
+            if ((u32(front) >> u32(row)) & u32(1)) != u32(0):
+                kinds = kinds | (u32(guesses[row - 1, 1]) << u32(STEP_GUESS_SHIFT(row)))
     step[STEP_LOW] = sequence[STEP_LOW]
     step[STEP_HIGH] = sequence[STEP_HIGH]
     step[STEP_FRONT] = front
-    step[STEP_GUESSES] = kinds
+    step[STEP_GUESSES] = i32(kinds)
 
 
 # The first word of lane `lane` in its slot's row of a layer's scratch

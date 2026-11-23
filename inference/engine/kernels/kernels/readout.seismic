@@ -85,8 +85,8 @@ native readout_head_rows for metal from "metal/readout_head_rows.metal":
     static (V, D, PT, NM, WS)
     where WS <= 1
     project dense single (weight)
-    scratch normalized bytes (O * D * 2) when O > VERIFY_ROWS or O >= MATRIX_FROM
-    launch readout_head_rows_stage before batch when O > VERIFY_ROWS or O >= MATRIX_FROM:
+    scratch normalized bytes (O * D * 2) when O > PROJECTION_GEMV_MAX_M or O >= MATRIX_FROM
+    launch readout_head_rows_stage before batch when O > PROJECTION_GEMV_MAX_M or O >= MATRIX_FROM:
         staging
         threadgroups (O, 1, 1)
         threads_per_threadgroup (256, 1, 1)
@@ -160,8 +160,8 @@ native readout_selected_rows for metal from "metal/readout_selected_rows.metal":
     static (V, D, PT, NM)
     project dense single (weight) gathered selected
     restate single_gemv
-    scratch normalized bytes (O * D * 2) when O > VERIFY_ROWS
-    launch readout_selected_rows_stage before batch when O > VERIFY_ROWS:
+    scratch normalized bytes (O * D * 2) when O > PROJECTION_GEMV_MAX_M
+    launch readout_selected_rows_stage before batch when O > PROJECTION_GEMV_MAX_M:
         staging
         threadgroups (O, 1, 1)
         threads_per_threadgroup (256, 1, 1)

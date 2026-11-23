@@ -150,7 +150,7 @@ fn bank_of(groups: &[usize], slots: u64, experts: impl Fn(usize) -> u64, form: R
         })
         .collect();
     let layers = BankLayers::new(layers).unwrap();
-    let structured = conveyor::Structured::new(8, HostTier::Linked, groups, layers, None).unwrap();
+    let structured = conveyor::Structured::new(8, HostTier::Linked, groups, layers, None, VERIFY_ROWS).unwrap();
     let allocations = seismic::NativeAllocations::EXACT;
     let blocks = size_pool_blocks(structured.granules(), allocations).unwrap();
     ExpertBankPlan {
@@ -190,9 +190,10 @@ fn restructured(
     plan: ExpertBankPlan,
     change: impl FnOnce(&mut HostTier, &mut Vec<BankGroup>),
 ) -> ExpertBankPlan {
+    let decode_rows = plan.decode_rows();
     let (selected, mut host, mut groups, layers) = plan.structured.into_parts();
     change(&mut host, &mut groups);
-    let structured = conveyor::Structured::new(selected, host, groups, layers, None).unwrap();
+    let structured = conveyor::Structured::new(selected, host, groups, layers, None, decode_rows).unwrap();
     let blocks = size_pool_blocks(structured.granules(), plan.allocations).unwrap();
     ExpertBankPlan { structured, blocks, ..plan }
 }
@@ -200,8 +201,9 @@ fn restructured(
 /// `plan` with its scratch bounded to `window_slots` experts of a layer,
 /// and its structure's lending derived again; or why it cannot be.
 fn windowed(plan: &ExpertBankPlan, window_slots: u64) -> Result<ExpertBankPlan, String> {
+    let decode_rows = plan.decode_rows();
     let (selected, host, groups, layers) = plan.structured.clone().into_parts();
-    let structured = conveyor::Structured::new(selected, host, groups, layers, Some(window_slots))?;
+    let structured = conveyor::Structured::new(selected, host, groups, layers, Some(window_slots), decode_rows)?;
     Ok(ExpertBankPlan { structured, ..plan.clone() })
 }
 
@@ -620,8 +622,9 @@ fn the_demand_reserve_holds_the_widest_decode_set() {
 fn demand_records_sizes_for_single_and_multi_row_decode() {
     let with_shape = |selected: u64, widest: u64, host: HostTier| {
         let mut plan = bank_of(&[2], 1, |_| widest, RecordForm::Gated);
+        let decode_rows = plan.decode_rows();
         let (_, _, groups, layers) = plan.structured.into_parts();
-        plan.structured = conveyor::Structured::new(selected, host, groups, layers, None).unwrap();
+        plan.structured = conveyor::Structured::new(selected, host, groups, layers, None, decode_rows).unwrap();
         plan
     };
     for host in [HostTier::Unified(Parking::InKernels), HostTier::Linked] {
@@ -1446,6 +1449,7 @@ fn layers_with_different_shared_down_quants_get_distinct_routed_kinds_in_census(
         plan.groups().to_vec(),
         BankLayers::new(layers).unwrap(),
         None,
+        plan.decode_rows(),
     )
     .unwrap();
 

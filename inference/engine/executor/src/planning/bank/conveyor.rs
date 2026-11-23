@@ -142,6 +142,8 @@ pub(super) struct Structured {
     layers: BankLayers,
     /// `W`: scratch window slots (`round_records <= W <= widest`).
     window_slots: u64,
+    /// Widest decode step (`1..=VERIFY_ROWS`) this bank sizes decode reserves for.
+    decode_rows: u64,
     lending: Lending,
     /// Deduplicated distinct record-slab granules across groups (1 for uniform
     /// models), in order of first appearance.
@@ -165,10 +167,12 @@ impl Structured {
         groups: Vec<BankGroup>,
         layers: BankLayers,
         window_slots: Option<u64>,
+        decode_rows: u64,
     ) -> Result<Self, String> {
         let widest = layers.widest().get();
         let window_slots = window_slots.unwrap_or(widest);
-        let structure = BankStructure { groups: &groups, layers: &layers, selected, host, window_slots };
+        let decode_rows = decode_rows.clamp(1, magnitude_kernels::constants::VERIFY_ROWS);
+        let structure = BankStructure { groups: &groups, layers: &layers, selected, host, window_slots, decode_rows };
         let round = structure.round_records();
         if window_slots < round || window_slots > widest {
             return Err(format!("scratch window slots {window_slots} must lie in {round}..={widest}"));
@@ -193,7 +197,7 @@ impl Structured {
             .max_by_key(|&(_, &g)| g)
             .expect("a bank holds a group")
             .0;
-        Ok(Self { selected, host, groups, layers, window_slots, lending, granules, group_pool, table_pool })
+        Ok(Self { selected, host, groups, layers, window_slots, decode_rows, lending, granules, group_pool, table_pool })
     }
 
     /// [`ExpertBankPlan::granules`].
@@ -238,6 +242,7 @@ pub(super) struct BankStructure<'a> {
     pub(super) selected: u64,
     pub(super) host: HostTier,
     pub(super) window_slots: u64,
+    pub(super) decode_rows: u64,
 }
 
 impl ExpertBankPlan {
@@ -250,12 +255,18 @@ impl ExpertBankPlan {
             selected: structured.selected,
             host: structured.host,
             window_slots: structured.window_slots,
+            decode_rows: structured.decode_rows,
         }
     }
 
     /// `K`: the experts a row selects.
     pub fn selected(&self) -> u64 {
         self.structured.selected
+    }
+
+    /// The widest decode step (rows) this bank sizes its decode reserves for.
+    pub fn decode_rows(&self) -> u64 {
+        self.structured.decode_rows
     }
 
     /// The deduplicated distinct record-slab granules across the bank's groups
@@ -390,12 +401,12 @@ impl BankStructure<'_> {
 
     /// [`ExpertBankPlan::choices`].
     pub(super) fn choices(self) -> u64 {
-        decode_choices(self.selected)
+        decode_choices(self.selected, self.decode_rows)
     }
 
     /// [`ExpertBankPlan::round_records`].
     pub(super) fn round_records(self) -> u64 {
-        decode_set(self.selected, self.widest()).div_ceil(2)
+        decode_set(self.selected, self.widest(), self.decode_rows).div_ceil(2)
     }
 
     /// [`ExpertBankPlan::form`].

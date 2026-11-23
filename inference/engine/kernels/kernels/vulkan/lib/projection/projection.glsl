@@ -569,10 +569,10 @@ void projection_gemv_x8(const int act, const bool f32, uint at, uint chunk, out 
 // that run (its compile time grows with the unrolled body).
 #define PROJECTION_GEMV_MAX_R 4
 #define PROJECTION_GEMV_MAX_M 8
-#ifndef SEISMIC_CONST_VERIFY_ROWS
-#error "projection.glsl needs SEISMIC_CONST_VERIFY_ROWS"
+#ifndef SEISMIC_CONST_PROJECTION_GEMV_MAX_M
+#error "projection.glsl needs SEISMIC_CONST_PROJECTION_GEMV_MAX_M"
 #endif
-#if SEISMIC_CONST_VERIFY_ROWS > PROJECTION_GEMV_MAX_M
+#if SEISMIC_CONST_PROJECTION_GEMV_MAX_M > PROJECTION_GEMV_MAX_M
 #error "the GEMV classes serve at most PROJECTION_GEMV_MAX_M rows"
 #endif
 #define PROJECTION_GEMV_SUMS (PROJECTION_GEMV_MAX_R * PROJECTION_GEMV_MAX_M)
@@ -1105,8 +1105,8 @@ void projection_ordered_gemv(const int kind, const bool publish, const uint maxm
     projection_ordered_inverses(in_, m, 0u, 1u, 0u, true, 64u);
     const uint w_row = local_tile * groups + sg * 4u + q;
     const uint hw_first_row = local_tile * groups + 4u * SEISMIC_HARDWARE_SUBGROUP;
-    float acc[8];
-    [[unroll]] for (uint r = 0u; r < 8u; ++r)
+    float acc[SEISMIC_CONST_VERIFY_ROWS];
+    [[unroll]] for (uint r = 0u; r < uint(SEISMIC_CONST_VERIFY_ROWS); ++r)
         acc[r] = 0.0;
     for (uint k0 = 0u; k0 < k; k0 += 256u) {
         const uint chunk = min(256u, k - k0);

@@ -1618,7 +1618,7 @@ impl CpuForm {
             function: crate::operators::routed::FUSED_ACTIVATION,
             limit: None,
             flight: crate::planning::FlightDepth::PIPELINED.steps(1),
-            widest: CHOICES,
+            widest: CHOICES * magnitude_kernels::constants::VERIFY_ROWS,
         }))
     }
 

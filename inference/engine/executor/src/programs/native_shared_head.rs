@@ -109,7 +109,7 @@ pub(crate) fn shared_head_graph_classes(
     }
     let mut classes = Vec::new();
     for slots in slot_classes {
-        for steps in 1..=proposals as u64 {
+        for steps in 1..=(proposals as u64) {
             for shaped in [false, true] {
                 classes.push(SharedHeadGraphClass {
                     slots: slots as u64,

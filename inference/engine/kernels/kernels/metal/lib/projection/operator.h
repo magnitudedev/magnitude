@@ -1352,7 +1352,10 @@ inline void ordered_gemv_run(thread const In &in, thread const Out &out, thread 
         const uint max_blocks = metal::max(1u, metal::min(total_blocks, 63u / m));
         const uint row_cols = max_blocks * 64u;
         threadgroup uint4 *x_packed = reinterpret_cast<threadgroup uint4 *>(shared + 64);
-        float acc[8] = {0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f};
+        float acc[SEISMIC_CONST_VERIFY_ROWS];
+        PROJECTION_UNROLL
+        for (uint r = 0u; r < uint(SEISMIC_CONST_VERIFY_ROWS); ++r)
+            acc[r] = 0.0f;
         for (uint k0 = 0u; k0 < k; k0 += row_cols) {
             threadgroup_barrier(mem_flags::mem_threadgroup);
             const uint chunk = metal::min(row_cols, k - k0);
@@ -1361,7 +1364,7 @@ inline void ordered_gemv_run(thread const In &in, thread const Out &out, thread 
                 const uint idx = base + tid;
                 const uint blk = idx >> 3u;
                 const uint xr = (blk < m * chunk_blocks) ? (blk / chunk_blocks) : 0u;
-                const float x_inv = simd_shuffle(inv_lane, ushort(xr & 7u));
+                const float x_inv = simd_shuffle(inv_lane, ushort(xr & 15u));
                 if (blk < m * chunk_blocks) {
                     const uint xb = blk - xr * chunk_blocks;
                     const uint xs = xb * 64u + 8u * u;
@@ -1406,7 +1409,7 @@ inline void ordered_gemv_run(thread const In &in, thread const Out &out, thread 
                     ordered_transpose8(wt, u);
                     if (sub + 64u <= chunk) {
                         PROJECTION_UNROLL
-                        for (uint r = 0u; r < 8u; ++r) {
+                        for (uint r = 0u; r < uint(SEISMIC_CONST_VERIFY_ROWS); ++r) {
                             if (r < m) {
                                 float4 xe, xo;
                                 A::split8(x_packed[(r * chunk_blocks + xb) * 8u + u], xe, xo);
@@ -1422,7 +1425,7 @@ inline void ordered_gemv_run(thread const In &in, thread const Out &out, thread 
                         }
                     } else {
                         PROJECTION_UNROLL
-                        for (uint r = 0u; r < 8u; ++r) {
+                        for (uint r = 0u; r < uint(SEISMIC_CONST_VERIFY_ROWS); ++r) {
                             if (r < m) {
                                 float4 xe, xo;
                                 A::split8(x_packed[(r * chunk_blocks + xb) * 8u + u], xe, xo);
@@ -1575,7 +1578,7 @@ inline void ordered_gemv_maxm_run(thread const In &in, thread const Out &out, th
             }
         }
     }
-    constexpr uint min_shared_bytes = (MAXM == 1u) ? 1024u : ((MAXM == 2u) ? 1536u : ((MAXM == 4u) ? 2560u : 4608u));
+    constexpr uint min_shared_bytes = (MAXM == 1u) ? 1024u : ((MAXM == 2u) ? 1536u : ((MAXM == 4u) ? 2560u : ((MAXM == 8u) ? 4608u : 8704u)));
     const uint packets = (k + 31u) >> 5u;
     const uint avail_bytes = metal::max(min_shared_bytes, metal::min(packets * MAXM, 256u) * 64u);
     threadgroup float *smem_inv = reinterpret_cast<threadgroup float *>(shared);
@@ -1618,7 +1621,7 @@ inline void ordered_gemv_maxm_run(thread const In &in, thread const Out &out, th
                 const uint idx = base + tid;
                 const uint blk = idx >> 3u;
                 const uint xr = (blk < m * chunk_blocks) ? (blk / chunk_blocks) : 0u;
-                const float x_inv = simd_shuffle(inv_lane, ushort(xr & 7u));
+                const float x_inv = simd_shuffle(inv_lane, ushort(xr & 15u));
                 if (blk < m * chunk_blocks) {
                     const uint xb = blk - xr * chunk_blocks;
                     const uint xs = xb * 64u + 8u * u;

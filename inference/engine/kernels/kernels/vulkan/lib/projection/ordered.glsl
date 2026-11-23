@@ -24,7 +24,7 @@
 void projection_single_ordered_gemv() {
     packets_stage_tables();
     const uint g = PROJECTION_GROUP(gl_WorkGroupID.z);
-    projection_ordered_gemv(PACKETS_W0, PROJECTION_ORDERED_PUBLISH, 8u, projected_input(g), projected_output(g),
+    projection_ordered_gemv(PACKETS_W0, PROJECTION_ORDERED_PUBLISH, uint(SEISMIC_CONST_VERIFY_ROWS), projected_input(g), projected_output(g),
         projected_weight(g), PROJECTION_ORDERED_PUB_OUT, PROJECTION_ORDERED_PUB_S0, PROJECTION_ORDERED_PUB_S1,
         gl_WorkGroupID.x == 0u, PROJECTION_M, PROJECTION_N, PROJECTION_K, gl_WorkGroupID.x);
     if (gl_WorkGroupID.x == 0u) {
@@ -55,7 +55,7 @@ void projection_single_ordered_gemm() {
                 projection_zero_tile(PROJECTION_OUTPUT##s, m, uint(PROJECTION_N##s), 0u, m,             \
                     tile * ord_per, ord_per);                                                           \
             else                                                                                        \
-                projection_ordered_gemv(PROJECTION_KIND##s, PROJECTION_ORDERED_PUBLISH, 8u,             \
+                projection_ordered_gemv(PROJECTION_KIND##s, PROJECTION_ORDERED_PUBLISH, uint(SEISMIC_CONST_VERIFY_ROWS), \
                     PROJECTION_SEGMENT_INPUT(s), PROJECTION_OUTPUT##s, PROJECTION_WEIGHT##s,            \
                     PROJECTION_ORDERED_PUB_OUT, PROJECTION_ORDERED_PUB_S0, PROJECTION_ORDERED_PUB_S1,   \
                     gl_WorkGroupID.x == 0u, m, uint(PROJECTION_N##s), PROJECTION_K, tile);              \
@@ -82,16 +82,28 @@ void projection_segmented_ordered_gemv_all() {
                 projection_zero_tile(PROJECTION_OUTPUT##s, m, uint(PROJECTION_N##s), 0u, m,             \
                     tile * per_s, per_s);                                                               \
             } else if (SEISMIC_SEGMENT_ORDERED_##s != 0) {                                              \
-                projection_ordered_gemv(PROJECTION_KIND##s, PROJECTION_ORDERED_PUBLISH, maxm,           \
+                projection_ordered_gemv(PROJECTION_KIND##s, PROJECTION_ORDERED_PUBLISH,                 \
+                    maxm == 8u ? uint(SEISMIC_CONST_VERIFY_ROWS) : maxm,                                \
                     PROJECTION_SEGMENT_INPUT(s), PROJECTION_OUTPUT##s, PROJECTION_WEIGHT##s,            \
                     PROJECTION_ORDERED_PUB_OUT, PROJECTION_ORDERED_PUB_S0, PROJECTION_ORDERED_PUB_S1,   \
                     gl_WorkGroupID.x == 0u, m, uint(PROJECTION_N##s), PROJECTION_K, tile);              \
             } else {                                                                                    \
-                projection_gemv(PROJECTION_KIND##s, PROJECTION_PARTNER_KIND##s, PROJECTION_PAIRED##s,   \
-                    rows, lanes, maxm, SEISMIC_TUNE_STAGE == 1, SEISMIC_TUNE_DECODE == 1,               \
-                    PROJECTION_NORM,                                                                    \
-                    PROJECTION_SEGMENT_INPUT(s), PROJECTION_OUTPUT##s, PROJECTION_WEIGHT##s,            \
-                    PROJECTION_PARTNER##s, m, uint(PROJECTION_N##s), PROJECTION_K, tile);               \
+                for (uint row_base = 0u; row_base < m; row_base += maxm) {                              \
+                    const uint slice_m = min(maxm, m - row_base);                                       \
+                    projection_prologue seg_in = PROJECTION_SEGMENT_INPUT(s);                           \
+                    projection_epilogue seg_out = PROJECTION_OUTPUT##s;                                 \
+                    if (row_base != 0u) {                                                               \
+                        seg_in.x = stored_offset(seg_in.x, uint64_t(row_base) * seg_in.x0);             \
+                        seg_out.y = out_offset(seg_out.y, uint64_t(row_base) * seg_out.y0);             \
+                        seg_out.y_f32 = out_offset(seg_out.y_f32, uint64_t(row_base) * seg_out.y0);     \
+                    }                                                                                   \
+                    projection_gemv(PROJECTION_KIND##s, PROJECTION_PARTNER_KIND##s, PROJECTION_PAIRED##s, \
+                        rows, lanes, maxm, SEISMIC_TUNE_STAGE == 1, SEISMIC_TUNE_DECODE == 1,           \
+                        PROJECTION_NORM, seg_in, seg_out, PROJECTION_WEIGHT##s,                         \
+                        PROJECTION_PARTNER##s, slice_m, uint(PROJECTION_N##s), PROJECTION_K, tile);     \
+                    if (row_base + maxm < m)                                                            \
+                        barrier();                                                                      \
+                }                                                                                       \
             }                                                                                           \
             if (gl_WorkGroupID.x == 0u) { PROJECTION_ORDERED_FIRST_TILE() }                             \
             return;                                                                                     \

@@ -60,9 +60,9 @@ fn dense_expand[M, O, H, F, GS, US, GB, UB, LB](residual: &tensor[M, H] f32, nor
 native dense_expand for metal from "metal/dense_expand.metal":
     static (H, F, GS, US, GB, UB, LB)
     where GS <= 1 and US <= 1
-    scratch normalized bytes ((O + TALL * (ceil_div(O, 64) * 64 - O)) * H * 2) when O > VERIFY_ROWS or O >= MATRIX_FROM
+    scratch normalized bytes ((O + TALL * (ceil_div(O, 64) * 64 - O)) * H * 2) when O > PROJECTION_GEMV_MAX_M or O >= MATRIX_FROM
     project dense paired (gate_weight, up_weight)
-    launch dense_expand_normalize before gemv when (O > VERIFY_ROWS or O >= MATRIX_FROM) and (O <= 64 or TALL == 0 or INT8 == 1 or PACK == 1):
+    launch dense_expand_normalize before gemv when (O > PROJECTION_GEMV_MAX_M or O >= MATRIX_FROM) and (O <= 64 or TALL == 0 or INT8 == 1 or PACK == 1):
         staging
         threadgroups (O, 1, 1)
         threads_per_threadgroup (256, 1, 1)
@@ -117,8 +117,8 @@ native dense_output for metal from "metal/dense_output.metal":
     static (H, F, DS, DB)
     where DS <= 1
     project dense single (down_weight)
-    scratch staged bytes (O * F * 2) when (O > VERIFY_ROWS or O >= MATRIX_FROM) and operands(DW) == 1
-    launch dense_output_stage before batch when (O > VERIFY_ROWS or O >= MATRIX_FROM) and operands(DW) == 1:
+    scratch staged bytes (O * F * 2) when (O > PROJECTION_GEMV_MAX_M or O >= MATRIX_FROM) and operands(DW) == 1
+    launch dense_output_stage before batch when (O > PROJECTION_GEMV_MAX_M or O >= MATRIX_FROM) and operands(DW) == 1:
         staging
         threadgroups (O, 1, 1)
         threads_per_threadgroup (256, 1, 1)
@@ -175,8 +175,8 @@ native dense_up for metal from "metal/dense_up.metal":
     where US <= 1
     project dense single (up_weight)
     restate single_gemv
-    scratch normalized bytes (O * H * 2) when O > VERIFY_ROWS or O >= MATRIX_FROM
-    launch dense_up_normalize before batch when O > VERIFY_ROWS or O >= MATRIX_FROM:
+    scratch normalized bytes (O * H * 2) when O > PROJECTION_GEMV_MAX_M or O >= MATRIX_FROM
+    launch dense_up_normalize before batch when O > PROJECTION_GEMV_MAX_M or O >= MATRIX_FROM:
         staging
         threadgroups (O, 1, 1)
         threads_per_threadgroup (256, 1, 1)

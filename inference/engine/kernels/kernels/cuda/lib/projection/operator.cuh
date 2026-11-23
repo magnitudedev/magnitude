@@ -866,9 +866,12 @@ __device__ __forceinline__ void ordered_gemv_block(u8 *shared_raw, const Pro &pr
     else if (M <= 4u)
         ordered_gemv_block_rows<PUBLISH, 4u>(shared_raw, pro, pub_out, pub_s0, pub_s1, publish_rows, M, K, N,
                                              local_tile, wa, epi);
-    else
+    else if (M <= 8u)
         ordered_gemv_block_rows<PUBLISH, 8u>(shared_raw, pro, pub_out, pub_s0, pub_s1, publish_rows, M, K, N,
                                              local_tile, wa, epi);
+    else
+        ordered_gemv_block_rows<PUBLISH, 16u>(shared_raw, pro, pub_out, pub_s0, pub_s1, publish_rows, M, K, N,
+                                              local_tile, wa, epi);
 }
 
 template <class WA, class Epi>
@@ -1014,12 +1017,19 @@ __device__ __forceinline__ void ordered_gemv_segment_of(u8 *shared_raw, const Pr
                                                         bool publish_rows, u32 M, u64 K, u64 local, const Segments &s) {
     constexpr int A = first_weight<Segments, I>();
     if constexpr (Segments::served(I) == 2) {
-        using Shape = GemvShape<8, TPW, KSPLIT, 1>;
+        constexpr int ORDERED_NB = (SEISMIC_CONST_VERIFY_ROWS + 7) / 8;
+        static_assert(ORDERED_NB * 8 >= SEISMIC_CONST_VERIFY_ROWS, "ordered_gemv_segment_of must cover VERIFY_ROWS");
+        using Shape = GemvShape<8, TPW, KSPLIT, ORDERED_NB>;
+        using Shape1 = GemvShape<8, TPW, KSPLIT, 1>;
+        using Shared1 = GemvShared<Shape1, typename GemvSource<UnordPro>::type, 0>;
         __shared__ GemvShared<Shape, typename GemvSource<UnordPro>::type, 0> gemv_shared;
+        static_assert(sizeof(Shared1) <= sizeof(gemv_shared) && alignof(Shared1) <= alignof(decltype(gemv_shared)),
+                      "Shape1 GemvShared fits inside Shape GemvShared");
         const u64 group = local * Shape::GROUPS + Shape::group();
         if (M == 1)
-            gemv_segment_ready<Shape>(gemv_shared, [&] { return shared_row(unord_pro, K); }, 1u, K / 64, group,
-                                      s.rows[I], weight_of<A>(s), weight_of<A + 1>(s), out_of<I>(s));
+            gemv_segment_ready<Shape1>(*reinterpret_cast<Shared1 *>(&gemv_shared),
+                                       [&] { return shared_row(unord_pro, K); }, 1u, K / 64, group,
+                                       s.rows[I], weight_of<A>(s), weight_of<A + 1>(s), out_of<I>(s));
         else
             gemv_segment_ready<Shape>(gemv_shared, [&] { return GemvSource<UnordPro>::make(unord_pro, K, staged); },
                                       M, K / 64, group, s.rows[I], weight_of<A>(s), weight_of<A + 1>(s),
