@@ -137,10 +137,10 @@ use std::time::Instant;
 /// (`magnitude-artifacts`' `tests/read_depth`).
 pub(crate) const LEAST_READ: u64 = 128 * 1024;
 
-/// The widest window a volume's probe holds in flight: twice the widest
-/// any measured device needed to reach its rate (an RTX 3090 host's 128 KiB
-/// reads, 16 MiB).
-pub(crate) const WIDEST_WINDOW: u64 = 32 * 1024 * 1024;
+/// The widest window a volume's probe holds in flight: 64 MiB so fast Gen5
+/// NVMe drives probe 12–16+ ranges (~64 MiB) for large 8.66 MiB MoE experts
+/// instead of capping at 10 ranges (28.9 MiB).
+pub(crate) const WIDEST_WINDOW: u64 = 64 * 1024 * 1024;
 
 /// The depth, in ranges, to which a range line is probed at every depth
 /// ([`Urgent::depths`]): past every knee measured on a drive whose rate
@@ -209,7 +209,7 @@ impl Urgent {
 
     /// The least read size holding its widest range whole: its reads ahead
     /// are each one piece of it, as its range line read them.
-    fn whole_range(&self) -> u64 {
+    pub(crate) fn whole_range(&self) -> u64 {
         *self.reads().last().expect("a request reads at least one size")
     }
 
@@ -738,5 +738,18 @@ mod tests {
         assert_eq!(urgent.depths(), vec![1]);
         let line = vec![Curve::range_point(&urgent, 1, 1e9, 0.0, 0.1)];
         assert_eq!(range_knee(&line), urgent.span());
+    }
+
+    /// `WIDEST_WINDOW` is 64 MiB so large 8.66 MiB MoE experts (e.g. DeepSeek
+    /// ~2.89 MiB per gate/up/down tensor) probe past 10 ranges up to 64 MiB.
+    #[test]
+    fn widest_window_is_64_mib_and_probes_deep_for_large_experts() {
+        assert_eq!(WIDEST_WINDOW, 64 * 1024 * 1024);
+        let deepseek = Urgent { parts: vec![3_026_944; 3], records: 8 };
+        let depths = deepseek.depths();
+        assert!(
+            depths.last().copied().unwrap_or(0) >= 16,
+            "expected >= 16 probed ranges for ~8.66 MiB expert, got {depths:?}"
+        );
     }
 }

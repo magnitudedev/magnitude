@@ -164,7 +164,19 @@ impl SourceFile {
                         let file = reopen(file, false)?;
                         // A concurrent read may have fallen back first:
                         // either file reads the same bytes.
-                        fallback.get_or_init(|| file)
+                        let mut initialized = false;
+                        let cached = fallback.get_or_init(|| {
+                            initialized = true;
+                            file
+                        });
+                        if initialized {
+                            tracing::warn!(
+                                path = %self.path.display(),
+                                error = %error,
+                                "direct I/O refused on read; falling back to cached reads with page eviction"
+                            );
+                        }
+                        cached
                     }
                     result => return result,
                 },

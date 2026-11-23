@@ -161,10 +161,17 @@ pub(crate) fn volume_key(file: &File) -> Result<Volume, Error> {
 /// refuses direct I/O (tmpfs, some overlays), `file` itself, read through
 /// the cache.
 #[cfg(any(target_os = "linux", windows))]
-pub(crate) fn uncached(file: &File) -> Result<Through, Error> {
+pub(crate) fn uncached(file: &File, path: &Path) -> Result<Through, Error> {
     match reopen(file, true) {
         Ok(direct) => Ok(Through::direct(direct)),
-        Err(error) if refuses_direct(&error) => Ok(Through::Dropped(file.try_clone()?)),
+        Err(error) if refuses_direct(&error) => {
+            tracing::warn!(
+                path = %path.display(),
+                error = %error,
+                "direct I/O refused on open; falling back to cached reads with page eviction"
+            );
+            Ok(Through::Dropped(file.try_clone()?))
+        }
         Err(error) => Err(error.into()),
     }
 }
@@ -173,16 +180,27 @@ pub(crate) fn uncached(file: &File) -> Result<Through, Error> {
 /// neither names any more (replaced or removed under its source) is read
 /// through the cache, each read's pages dropped.
 #[cfg(target_os = "macos")]
-pub(crate) fn uncached(file: &File) -> Result<Through, Error> {
+pub(crate) fn uncached(file: &File, path: &Path) -> Result<Through, Error> {
     match reopen(file, true) {
         Ok(direct) => Ok(Through::direct(direct)),
-        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(Through::Dropped(file.try_clone()?)),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            tracing::warn!(
+                path = %path.display(),
+                error = %error,
+                "could not reopen file for direct I/O; falling back to cached reads with page eviction"
+            );
+            Ok(Through::Dropped(file.try_clone()?))
+        }
         Err(error) => Err(error.into()),
     }
 }
 
 #[cfg(not(any(target_os = "linux", target_os = "macos", windows)))]
-pub(crate) fn uncached(file: &File) -> Result<Through, Error> {
+pub(crate) fn uncached(file: &File, path: &Path) -> Result<Through, Error> {
+    tracing::warn!(
+        path = %path.display(),
+        "direct I/O unsupported on this platform; falling back to cached reads with page eviction"
+    );
     Ok(Through::Dropped(file.try_clone()?))
 }
 

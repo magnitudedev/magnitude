@@ -172,7 +172,7 @@ impl Reader {
     fn reading(source: &OpenFile, policy: CachePolicy, urgent: Option<&Urgent>) -> Result<Self, Error> {
         let file = source.file();
         let through = match policy {
-            CachePolicy::Uncached => uncached(file)?,
+            CachePolicy::Uncached => uncached(file, source.path())?,
             CachePolicy::Cached => Through::Cache(file.try_clone()?),
         };
         let path: Arc<Path> = source.path().into();

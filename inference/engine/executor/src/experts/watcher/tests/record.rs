@@ -70,6 +70,71 @@ fn a_counted_decode_counts_its_exact_rows_alone() {
     assert_eq!(live.depth, 1001 + (steps as u32 - 1) / 2);
 }
 
+/// A short prompt dispatched on `StepRoute::Decode` with `LaunchWork::Prompt`
+/// must not advance `horizon::Clock` or mutate `History::live` / `decode_count`,
+/// leaving decode telemetry and clock progression strictly generation-only.
+#[test]
+fn short_prompt_via_decode_route_does_not_advance_clock_or_mutate_live() {
+    use crate::experts::horizon::Tokens;
+
+    let harness = harness("short-prompt-decode", EXPERTS, 2);
+    let shared = harness.watcher.shared();
+
+    let prompt = begin_as(&shared, &[(StepRoute::Decode, LaunchWork::Prompt)], false)
+        .unwrap()
+        .pop()
+        .unwrap()
+        .decoding([row(0, None), row(1, None)].into_iter(), 0)
+        .recorded(Recording);
+    harness.request_at(&prompt, 0, &[0, 1]);
+    prompt.complete().unwrap();
+
+    assert_eq!(
+        shared.time().lock().clock.through_latest(),
+        Tokens::ZERO,
+        "a LaunchWork::Prompt step on StepRoute::Decode must not advance horizon::Clock"
+    );
+    eventually("telemetry drained", || shared.telemetry.fed_all());
+    assert_eq!(
+        shared.live(),
+        None,
+        "a LaunchWork::Prompt step on StepRoute::Decode must not mutate History::live"
+    );
+
+    // A genuine generation step advances the clock by 1.0 and counts 1 decode step.
+    let gen_step = harness.begun().decoding([row(100, None)].into_iter(), 0).recorded(Recording);
+    harness.request_at(&gen_step, 0, &[2, 3]);
+    gen_step.complete().unwrap();
+
+    assert_eq!(shared.time().lock().clock.through_latest(), Tokens::new(1.0));
+    eventually("generation step ranked", || shared.telemetry.fed_all());
+    let live = shared.live().expect("generation step is counted");
+    assert_eq!((live.steps, live.rows), (1, 1.));
+
+    // A subsequent short prompt leaves both the clock and live decode counts untouched.
+    let prompt_after = begin_as(&shared, &[(StepRoute::Decode, LaunchWork::Prompt)], false)
+        .unwrap()
+        .pop()
+        .unwrap()
+        .decoding([row(0, None); 4].into_iter(), 0)
+        .recorded(Recording);
+    harness.request_at(&prompt_after, 0, &[4, 5]);
+    prompt_after.complete().unwrap();
+
+    assert_eq!(
+        shared.time().lock().clock.through_latest(),
+        Tokens::new(1.0),
+        "subsequent prompt step must not advance horizon::Clock"
+    );
+    eventually("telemetry drained after second prompt", || shared.telemetry.fed_all());
+    let live_after = shared.live().expect("generation live decode preserved");
+    assert_eq!(
+        (live_after.steps, live_after.rows),
+        (1, 1.),
+        "subsequent prompt step must not mutate live steps or rows"
+    );
+}
+
 /// With two prompt groups in flight, the watcher counts the second's first
 /// request before the owner completes the first's last step: that step's
 /// acknowledgement went with its group, so its completion counts nothing

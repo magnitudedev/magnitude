@@ -314,6 +314,12 @@ struct Device {
     most: usize,
 }
 
+/// Per-volume worker ceiling on macOS: Apple Silicon NVMe saturates well below
+/// 16 concurrent threads, whereas spawning 65–73 `QOS_CLASS_USER_INTERACTIVE`
+/// workers on 6–10 P-cores oversubscribes the scheduler and stalls decode.
+#[cfg(target_os = "macos")]
+const MACOS_MAX_WORKERS: usize = 16;
+
 impl Device {
     /// A device read by a link of `shape`, nothing yet submitted.
     fn of(shape: &crate::Shape) -> Self {
@@ -341,10 +347,14 @@ impl Device {
     /// knee in its smallest piece, and one piece more; clamped to its queue
     /// depth; and never more pieces than its claims have had queued or in
     /// flight at once, which holds steady while they read as they did.
+    /// On macOS, capped to `MACOS_MAX_WORKERS` (16) per volume.
     fn workers(&self) -> usize {
         let admitted = u128::from(self.due.div_ceil(self.smallest)) + u128::from(self.knee.div_ceil(self.smallest)) + 1;
         let admitted = admitted.min(u128::from(self.depth));
-        usize::try_from(admitted).map_or(self.most, |admitted| admitted.min(self.most))
+        let workers = usize::try_from(admitted).map_or(self.most, |admitted| admitted.min(self.most));
+        #[cfg(target_os = "macos")]
+        let workers = workers.min(MACOS_MAX_WORKERS);
+        workers
     }
 }
 
@@ -663,6 +673,19 @@ mod tests {
     const KIB: u64 = 1 << 10;
     const MIB: u64 = 1 << 20;
 
+    /// Expected per-device worker count for `decode`: 68 (`64 + 3 + 1`), capped
+    /// at `MACOS_MAX_WORKERS` (16) on macOS.
+    const DECODE_WORKERS: usize = {
+        #[cfg(target_os = "macos")]
+        {
+            super::MACOS_MAX_WORKERS
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            68
+        }
+    };
+
     /// A measured M4 Pro decode link: due 32 MiB in 512 KiB reads, a knee
     /// of 5200 KiB in 2 MiB reads (64 + 3 + 1 pieces).
     fn decode(volume: u64) -> VolumeReads {
@@ -691,20 +714,20 @@ mod tests {
         let (first, second) = (Arc::new(AtomicUsize::new(0)), Arc::new(AtomicUsize::new(0)));
         let a = pool.claim(&decode(1), first.clone());
         let b = pool.claim(&decode(1), second.clone());
-        assert_eq!(submit(&mut pool, a, &first, 1_000, 512 * KIB), 68, "the decode link in its own reads");
+        assert_eq!(submit(&mut pool, a, &first, 1_000, 512 * KIB), DECODE_WORKERS, "the decode link in its own reads");
         assert_eq!(submit(&mut pool, b, &second, 1_000, 512 * KIB), 0, "claims on one device share its workers");
         let other = Arc::new(AtomicUsize::new(0));
         let c = pool.claim(&decode(2), other.clone());
         assert_eq!(submit(&mut pool, c, &other, 3, 512 * KIB), 3, "a device with three pieces queued at once holds three");
         assert!(pool.release(c), "the second device's last claim ending shrinks the target");
-        assert_eq!(pool.target(), 68);
+        assert_eq!(pool.target(), DECODE_WORKERS);
         assert!(!pool.release(a), "a claim ending beside another on its device shrinks nothing");
         assert!(pool.release(b));
         assert_eq!(pool.target(), 0, "a device whose claims ended holds no workers");
     }
 
     /// A piece far smaller than the reads its device was measured with
-    /// grows the pool to the device's queue depth and no further (the
+    /// grows the pool to the device's worker cap and no further (the
     /// sizing by the smallest piece alone asked for 8192 + 1300 + 1
     /// workers), and a burst of submits on the device's shards starts no
     /// more workers than that target: a claim that ends while another on
@@ -720,13 +743,13 @@ mod tests {
             started += submit(&mut pool, ids[shard], &shards[shard], 1, 4 * KIB);
         }
         assert_eq!(pool.cap(), 68, "four shards on one device share its depth");
-        assert_eq!(pool.target(), 68, "4 KiB pieces hold the device's queue depth");
-        assert_eq!(started, 68, "the burst started its target's workers once");
+        assert_eq!(pool.target(), DECODE_WORKERS, "4 KiB pieces hold the device's worker cap");
+        assert_eq!(started, DECODE_WORKERS, "the burst started its target's workers once");
         assert!(!pool.release(ids[0]), "a claim ending beside its device's others shrinks nothing");
         let live = Arc::new(AtomicUsize::new(0));
         let next = pool.claim(&decode(1), live.clone());
         assert_eq!(submit(&mut pool, next, &live, 1, 4 * KIB), 0, "a new claim on the device starts none");
-        assert_eq!(pool.started, 68);
+        assert_eq!(pool.started, DECODE_WORKERS);
     }
 
     /// Buffers are kept between pieces while a reader is open, and none
@@ -760,13 +783,27 @@ mod tests {
         let (big_live, small_live) = (Arc::new(AtomicUsize::new(0)), Arc::new(AtomicUsize::new(0)));
         let big = pool.claim(&decode(1), big_live.clone());
         let small = pool.claim(&small_volume, small_live.clone());
-        assert_eq!(submit(&mut pool, big, &big_live, 100, 512 * KIB), 68);
+        assert_eq!(submit(&mut pool, big, &big_live, 100, 512 * KIB), DECODE_WORKERS);
         assert_eq!(submit(&mut pool, small, &small_live, 10, 512 * KIB), 0);
-        assert_eq!(pool.target(), 68);
+        assert_eq!(pool.target(), DECODE_WORKERS);
         assert!(pool.release(big), "dropping the deeper claim must shrink target");
         assert_eq!(pool.target(), 6, "remaining claim needs 4 due + 1 knee + 1 = 6 workers");
         assert!(pool.release(small));
         assert_eq!(pool.target(), 0);
+    }
+
+    /// On macOS, `Device::workers()` caps per-volume workers at 16 so large
+    /// queue depths never oversubscribe P-cores with interactive threads.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_device_workers_capped_at_sixteen() {
+        let mut pool = Pool::default();
+        let live = Arc::new(AtomicUsize::new(0));
+        let claim = pool.claim(&decode(1), live.clone());
+        let started = submit(&mut pool, claim, &live, 500, 256 * KIB);
+        assert!(started <= 16, "macOS per-volume workers must be <= 16, got {started}");
+        assert_eq!(started, super::MACOS_MAX_WORKERS);
+        assert_eq!(pool.target(), super::MACOS_MAX_WORKERS);
     }
 
     /// A worker's flight slot is registered before the worker begins and

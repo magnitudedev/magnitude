@@ -274,7 +274,7 @@ pub(crate) unsafe fn request(
         }
     }
     order.sort_by_key(|(_, span)| span.offset);
-    let read = volume.shape.read(want.due());
+    let read = volume.shape.read(want.standing());
     let pieces = pieces(&order, file.size, read);
     // The pool holds a worker for each piece its link may admit, up to its
     // device's queue depth, before any is queued.

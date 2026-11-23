@@ -1698,13 +1698,15 @@ impl ExpertStep {
                 panic!("a decode launch's passes are of one form: front rows {front:#b}, acceptable rows {acceptable:#b}");
             }
         };
-        let advance = match guessed {
-            GuessedRows::Acceptable(_) => crate::experts::horizon::Advance::Pending { requests: verifying_requests as u32 },
-            GuessedRows::Plain | GuessedRows::Front(_) => {
-                crate::experts::horizon::Advance::Known(crate::experts::horizon::Tokens::new(1.0))
-            }
-        };
-        self.shared.register_step(self.sequence, advance);
+        if self.work == LaunchWork::Generation {
+            let advance = match guessed {
+                GuessedRows::Acceptable(_) => crate::experts::horizon::Advance::Pending { requests: verifying_requests as u32 },
+                GuessedRows::Plain | GuessedRows::Front(_) => {
+                    crate::experts::horizon::Advance::Known(crate::experts::horizon::Tokens::new(1.0))
+                }
+            };
+            self.shared.register_step(self.sequence, advance);
+        }
         self.shared.tell(crate::experts::interest::Told::Began { step: self.sequence, launch: crate::experts::interest::Launched::Decode { rows, padding } });
         decode.launch = Some(DecodeLaunch { rows: count, placed, tokens: tokens / reading, guessed });
         self

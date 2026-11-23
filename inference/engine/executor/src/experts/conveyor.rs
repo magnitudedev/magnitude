@@ -49,6 +49,7 @@
 
 use super::source::{Outcome, Records, Ticket};
 use super::watcher::{ScratchGroup, Step};
+use std::sync::Arc;
 
 /// Where an expert is on its way into the conveyor: being read into
 /// conveyor record `record`, held whole in it, or listed for `lists`
@@ -56,7 +57,7 @@ use super::watcher::{ScratchGroup, Step};
 /// after it (a step that failed leaves its list standing, and the next step
 /// to route the expert lists it again).
 pub(super) enum State {
-    Reading { ticket: Ticket, record: u32 },
+    Reading { ticket: Arc<Ticket>, record: u32 },
     Held { record: u32 },
     Listed { record: u32, lists: u32 },
 }
@@ -431,7 +432,7 @@ impl Conveyor {
 
     /// Expert `expert` of `layer` is being read into conveyor record
     /// `record`, which it took.
-    pub fn reading(&mut self, layer: usize, expert: usize, ticket: Ticket, record: u32) {
+    pub fn reading(&mut self, layer: usize, expert: usize, ticket: Arc<Ticket>, record: u32) {
         let slot = &mut self.carried[layer][expert];
         assert!(slot.is_none(), "an expert carried twice");
         *slot = Some(State::Reading { ticket, record });
@@ -561,7 +562,6 @@ mod tests {
     use crate::experts::events::Events;
     use crate::experts::landing::Ended;
     use std::sync::atomic::{AtomicBool, Ordering};
-    use std::sync::Arc;
 
     fn test_conveyor(layer_pools: Vec<Vec<usize>>, records: usize) -> Conveyor {
         let experts = vec![4; layer_pools.len()];

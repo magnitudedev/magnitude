@@ -59,9 +59,11 @@ use crate::experts::compute::Urgency;
 use crate::experts::conveyor::{Conveyor, ConveyorLanding, Serving, State, readiness};
 use crate::experts::directory::{BankRecord, Directory, HostRecord, Point};
 use crate::experts::landing::Converting;
+use crate::experts::source::Read;
 use crate::experts::staging::Staged;
 use seismic_io::Want;
 use magnitude_kernels::constants;
+use std::sync::Arc;
 use std::time::Instant;
 
 /// A step's request at the tier's layer, taken as it was published: the
@@ -954,6 +956,46 @@ impl Scratch {
         })
     }
 
+    /// Submit a coalesced batch of conveyor reads for `layer`: one
+    /// `Reader::request` so `seismic_io::pieces` merges contiguous
+    /// `gate`/`up`/`down` slices across experts into bulk sequential reads.
+    fn submit_conveyor_batch(
+        &mut self,
+        core: &Core,
+        shared: &Shared,
+        index: usize,
+        layer: usize,
+        batch: &mut Vec<(usize, usize, u32)>,
+        batch_reads: &mut Vec<Read>,
+    ) {
+        if batch.is_empty() {
+            return;
+        }
+        let reads = std::mem::take(batch_reads);
+        // A stream's read: the group's rounds consume its conveyor
+        // at the link's rate, so it holds back no read ahead (a
+        // hint's) beside it.
+        match core.table.source().request(reads, Want::streamed()) {
+            Ok(ticket) => {
+                let ticket = Arc::new(ticket);
+                // Its end is an event: a round may await it.
+                let events = shared.events().clone();
+                ticket.on_end(move |_, _| events.notify());
+                for (set_idx, expert, record) in batch.drain(..) {
+                    self.conveyor.reading(layer, expert, ticket.clone(), record);
+                    self.tiers[index].sets[set_idx].mark_active(layer, expert);
+                    self.mark(shared, layer, Mark::Submitted);
+                }
+            }
+            Err(reason) => {
+                for (set_idx, expert, record) in batch.drain(..) {
+                    self.conveyor.untake(record);
+                    self.tiers[index].sets[set_idx].fail_read(expert, reason.clone(), shared);
+                }
+            }
+        }
+    }
+
     pub(super) fn convey(&mut self, core: &mut Core, shared: &Shared) -> bool {
         // A group past carries nothing more: what of it runs ends, and the
         // conveyor clears (`Self::clear_past`).
@@ -1000,7 +1042,22 @@ impl Scratch {
                 .collect::<Vec<_>>();
             let tier = &self.tiers[index];
             deferred.sort_by_key(|&(set_idx, expert)| tier.order(set_idx, expert));
+            let expert_bytes = core.layers[layer].expert_bytes();
+            let max_unscheduled = (16 * 1024 * 1024 / expert_bytes.max(1)).clamp(2, 8) as usize;
+            let mut batch: Vec<(usize, usize, u32)> = Vec::new();
+            let mut batch_order: Option<(usize, bool, usize, Option<Step>, Option<u32>)> = None;
+            let mut batch_reads: Vec<Read> = Vec::new();
             for (set_idx, expert) in deferred {
+                let order = self.tiers[index].order(set_idx, expert);
+                let round = order.4;
+                let same_batch = batch_order == Some(order)
+                    && (round.is_some()
+                        || (batch.len() < max_unscheduled
+                            && batch.last().is_some_and(|&(_, prev, _)| expert == prev + 1)));
+                if !batch.is_empty() && !same_batch {
+                    self.submit_conveyor_batch(core, shared, index, layer, &mut batch, &mut batch_reads);
+                    batch_order = None;
+                }
                 if self.conveyor.state(layer, expert).is_some() {
                     // An earlier pass set still owns this conveyor entry; wait
                     // for its round to release it before reading for `set_idx`.
@@ -1019,7 +1076,8 @@ impl Scratch {
                 // the drive lacks work, its reads in flight short of its
                 // link's knee: past that a read only queues, ahead of
                 // whatever the device turns out to need sooner.
-                let short_of_work = self.conveyor.reads_in_flight() as u64 * core.layers[layer].expert_bytes() < knee;
+                let in_flight = self.conveyor.reads_in_flight() + batch.len();
+                let short_of_work = in_flight as u64 * expert_bytes < knee;
                 let lent = if short_of_work { self.lendable_slot(core, index, set_idx, expert) } else { None };
                 let record = match lent {
                     Some(slot) => self.conveyor.slot_record(slot),
@@ -1046,23 +1104,12 @@ impl Scratch {
                         record
                     }
                 };
-                let reads = core.reads_to(layer, expert, &self.conveyor, record);
-                // A stream's read: the group's rounds consume its conveyor
-                // at the link's rate, so it holds back no read ahead (a
-                // hint's) beside it.
-                match core.table.source().request(reads, Want::streamed()) {
-                    Ok(ticket) => {
-                        // Its end is an event: a round may await it.
-                        let events = shared.events().clone();
-                        ticket.on_end(move |_, _| events.notify());
-                        self.conveyor.take(layer, expert, record);
-                        self.conveyor.reading(layer, expert, ticket, record);
-                        self.tiers[index].sets[set_idx].mark_active(layer, expert);
-                        self.mark(shared, layer, Mark::Submitted);
-                    }
-                    Err(reason) => self.tiers[index].sets[set_idx].fail_read(expert, reason, shared),
-                }
+                self.conveyor.take(layer, expert, record);
+                batch_reads.extend(core.reads_to(layer, expert, &self.conveyor, record));
+                batch.push((set_idx, expert, record));
+                batch_order = Some(order);
             }
+            self.submit_conveyor_batch(core, shared, index, layer, &mut batch, &mut batch_reads);
         }
         ended
     }

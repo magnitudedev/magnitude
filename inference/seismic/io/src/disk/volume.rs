@@ -2,6 +2,7 @@ use super::file::SourceFile;
 use super::platform::{evict, uncached, volume_key};
 use super::probe::{Curve, Urgent, VolumeLines, WIDEST_WINDOW};
 use super::OpenFile;
+use crate::scheduler::Standing;
 use crate::{Error, Volume};
 use std::collections::HashMap;
 use std::fs::File;
@@ -47,7 +48,7 @@ impl std::fmt::Display for Shape {
 
 impl Shape {
     /// How a volume is read before any probe of it: 1 MiB reads (avoiding
-    /// 128 KiB fragmentation on NVMe/SSD drives), a [`WIDEST_WINDOW`] (32 MiB)
+    /// 128 KiB fragmentation on NVMe/SSD drives), a [`WIDEST_WINDOW`] (64 MiB)
     /// knee so speculative read-ahead sustains `QD >= 4` for 8 MiB MoE experts
     /// (GLM-5.3, DeepSeek) on Apple Silicon and NVMe SSDs instead of capping at
     /// `QD = 1`, and a [`WIDEST_WINDOW`] due depth.
@@ -60,12 +61,17 @@ impl Shape {
     };
 
     /// Unprobed fallback shape for `urgent`: starts from [`Self::PENDING`]
-    /// (`knee = 32 MiB`) and raises `knee` (and `due`) to at least `4` full
-    /// expert spans when a single expert exceeds 8 MiB (e.g. DeepSeek 8.66 MiB)
-    /// so `QD = 4` stays full for speculative read-ahead.
+    /// (`knee = WIDEST_WINDOW`), sizes `ahead_read` and `due_read` to
+    /// `urgent.whole_range().clamp(1 << 20, 4 << 20)` so large experts are not
+    /// fragmented at 1 MiB, and raises `knee` (and `due`) to at least `4` full
+    /// expert spans when `4 * expert_bytes` exceeds [`WIDEST_WINDOW`] so
+    /// `QD = 4` stays full for speculative read-ahead.
     pub(crate) fn pending_for(urgent: Option<&Urgent>) -> Self {
         let mut shape = Self::PENDING;
         if let Some(urgent) = urgent {
+            let read = urgent.whole_range().clamp(1 << 20, 4 << 20);
+            shape.ahead_read = read;
+            shape.due_read = read;
             let expert_bytes: u64 = urgent.parts.iter().copied().sum();
             let qd4 = expert_bytes.saturating_mul(4);
             if qd4 > shape.knee {
@@ -76,9 +82,20 @@ impl Shape {
         shape
     }
 
-    /// The size a piece is cut at, due or not.
-    pub(crate) fn read(&self, due: bool) -> u64 {
-        if due { self.due_read } else { self.ahead_read }
+    /// Bulk read piece size for `Standing::Streamed` (prompt conveyor) reads:
+    /// at least 4 MiB so sequential prefill transfers are not fragmented at
+    /// decode's latency-tuned `due_read` (256 KiB–1 MiB).
+    pub fn stream_read(&self) -> u64 {
+        self.ahead_read.max(4 * 1024 * 1024)
+    }
+
+    /// The size a piece is cut at for `standing`.
+    pub(crate) fn read(&self, standing: Standing) -> u64 {
+        match standing {
+            Standing::Parked => self.due_read,
+            Standing::Streamed => self.stream_read(),
+            Standing::Ahead => self.ahead_read,
+        }
     }
 
     /// Its queue depth, in pieces: each depth in the pieces its reads are
@@ -160,7 +177,7 @@ pub fn probe_volume(source: &impl AsRef<OpenFile>, urgent: Option<&Urgent>) -> R
     // Held across the probe: no probe shares the storage with another of
     // the volume, and other volumes' readers wait on none of it.
     let mut lines = lines.lock().expect("a volume's lines");
-    let probed = Arc::new(SourceFile { path: source.path().into(), size: source.size(), through: uncached(source.file())? });
+    let probed = Arc::new(SourceFile { path: source.path().into(), size: source.size(), through: uncached(source.file(), source.path())? });
     evict(source.file(), source.size())?;
     lines.probe(key, &probed, urgent)
 }

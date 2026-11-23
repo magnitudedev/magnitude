@@ -754,10 +754,10 @@ fn a_cancelled_read_ahead_ends_with_what_it_had_in_flight_and_the_due_one_lands(
 }
 
 /// An unprobed volume falls back to `Shape::PENDING` with modern NVMe/SSD
-/// defaults: 1 MiB reads (avoiding 128 KiB fragmentation), a `WIDEST_WINDOW`
-/// (32 MiB) knee (scaling to `4 * expert_bytes` for >8 MiB experts so `QD = 4`
-/// stays full for GLM-5.3/DeepSeek speculative read-ahead), and a
-/// `WIDEST_WINDOW` due depth (`queue_depth() == 65`).
+/// defaults: 1 MiB reads (scaling to `urgent.whole_range().clamp(1 MiB, 4 MiB)`
+/// for larger experts), a `WIDEST_WINDOW` (64 MiB) knee (scaling to
+/// `4 * expert_bytes` when that exceeds `WIDEST_WINDOW`), and a `WIDEST_WINDOW`
+/// due depth (`queue_depth() == 129` at 1 MiB reads).
 #[test]
 fn unprobed_volume_uses_sane_pending_shape() {
     const MIB: u64 = 1024 * 1024;
@@ -769,13 +769,57 @@ fn unprobed_volume_uses_sane_pending_shape() {
         assert_eq!(shape.knee, WIDEST_WINDOW);
         assert_eq!(shape.due_read, MIB);
         assert_eq!(shape.ahead_read, MIB);
-        assert_eq!(shape.queue_depth(), 65);
+        assert_eq!(shape.queue_depth(), 129);
     }
-    // Large 8.66 MiB DeepSeek-like expert scales unprobed knee to 4 full experts (QD = 4).
+    // Large 8.66 MiB DeepSeek-like expert scales pending piece size to 4 MiB
+    // while fitting 4 full experts inside WIDEST_WINDOW (64 MiB).
     let deepseek = Urgent { parts: vec![3 * MIB; 3], records: 8 };
     let ds_shape = lines.shape(Some(&deepseek));
-    assert_eq!(ds_shape.knee, 36 * MIB);
-    assert_eq!(ds_shape.due, 36 * MIB);
+    assert_eq!(ds_shape.due_read, 4 * MIB);
+    assert_eq!(ds_shape.ahead_read, 4 * MIB);
+    assert_eq!(ds_shape.knee, WIDEST_WINDOW);
+    assert_eq!(ds_shape.due, WIDEST_WINDOW);
+    // Experts larger than 16 MiB scale knee/due to 4 * expert_bytes, keeping
+    // piece size clamped at 4 MiB.
+    let huge = Urgent { parts: vec![6 * MIB; 3], records: 8 };
+    let huge_shape = lines.shape(Some(&huge));
+    assert_eq!(huge_shape.due_read, 4 * MIB);
+    assert_eq!(huge_shape.ahead_read, 4 * MIB);
+    assert_eq!(huge_shape.knee, 72 * MIB);
+    assert_eq!(huge_shape.due, 72 * MIB);
+}
+
+/// `Standing::Streamed` (prompt conveyor) cuts pieces at `Shape::stream_read()`
+/// (`ahead_read.max(4 MiB)`) rather than decode's latency-tuned `due_read`
+/// (256 KiB–1 MiB), keeping sequential prefill reads bulk-sized.
+#[test]
+fn streamed_requests_use_bulk_stream_read_piece_size() {
+    const KIB: u64 = 1024;
+    const MIB: u64 = 1024 * 1024;
+    let decode_shape = Shape {
+        due: 64 * MIB,
+        knee: 16 * MIB,
+        ahead_read: MIB,
+        due_read: 256 * KIB,
+        cores: 0.5,
+    };
+    assert_eq!(decode_shape.stream_read(), 4 * MIB);
+    assert_eq!(decode_shape.read(Standing::Parked), 256 * KIB);
+    assert_eq!(decode_shape.read(Standing::Ahead), MIB);
+    assert_eq!(decode_shape.read(Standing::Streamed), 4 * MIB);
+
+    // When ahead_read already exceeds 4 MiB, stream_read preserves ahead_read.
+    let wide_shape = Shape { ahead_read: 8 * MIB, ..decode_shape };
+    assert_eq!(wide_shape.stream_read(), 8 * MIB);
+    assert_eq!(wide_shape.read(Standing::Streamed), 8 * MIB);
+
+    // An 8 MiB contiguous transfer splits into 2 bulk pieces for Streamed vs
+    // 32 fragmented pieces for Parked at 256 KiB due_read.
+    let span = Span { offset: 0, length: (8 * MIB) as usize, sink: NonNull::dangling() };
+    let streamed_pieces = pieces(&[(0, span)], 8 * MIB, decode_shape.read(Standing::Streamed));
+    let parked_pieces = pieces(&[(0, span)], 8 * MIB, decode_shape.read(Standing::Parked));
+    assert_eq!(streamed_pieces.len(), 2);
+    assert_eq!(parked_pieces.len(), 32);
 }
 
 /// Due reads hold the widest window at the full rate of their line: past
@@ -890,7 +934,7 @@ fn a_requests_knee_matches_its_measured_range_line() {
     let gen5_shape = Shape::of(&gen5_points, Some(Request { urgent: &gen5_step, lone: &gen5_lone, ranges: &gen5_ranges }));
     assert_eq!(gen5_shape.knee, 12 * gen5_step.span(), "measured knee reaches within noise of 11.27 GB/s instead of linear ceil(11.27/3.8)=3");
     assert_eq!(gen5_shape.due_read, 8 * LEAST_READ, "widest lone read size within measurement error avoids 128 KiB fragmentation");
-    assert_eq!(step.depths(), vec![1, 2, 3, 4, 5, 6, 7, 8, 10, 12, 15, 18, 22, 27, 33, 41], "every depth to 8, a quarter more past it, to 32 MiB of 704 KiB ranges");
+    assert_eq!(step.depths(), vec![1, 2, 3, 4, 5, 6, 7, 8, 10, 12, 15, 18, 22, 27, 33, 41, 51, 63, 78], "every depth to 8, a quarter more past it, to 64 MiB of 704 KiB ranges");
 }
 
 /// A request reads by the curve it adopted, whatever another request of

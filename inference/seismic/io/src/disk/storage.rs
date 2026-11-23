@@ -49,7 +49,7 @@ impl StorageProbe {
         }
         let file = std::fs::File::open(&path)?;
         evict(&file, STORAGE_PROBE_BYTES)?;
-        let file = SourceFile { path: path.as_path().into(), size: STORAGE_PROBE_BYTES, through: uncached(&file)? };
+        let file = SourceFile { path: path.as_path().into(), size: STORAGE_PROBE_BYTES, through: uncached(&file, &path)? };
         Ok(Self { file, state: Mutex::new(0x9e37_79b9_7f4a_7c15) })
     }
 

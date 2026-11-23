@@ -2759,17 +2759,21 @@ impl Telemetry {
                 // were unpriced since has no row cost to place it by.
                 let (cpu, rows, path) = sited(layer);
                 let row = priced.and_then(|lines| lines[layer].host.cpu).map(|cpu| cpu.expert.row.bound().get() * 1e-9);
-                if let Some(row) = row.filter(|_| cpu > 0) {
-                    costs.sites[layer].observe(cpu, rows, path.as_secs_f64(), row);
+                if work == LaunchWork::Generation {
+                    if let Some(row) = row.filter(|_| cpu > 0) {
+                        costs.sites[layer].observe(cpu, rows, path.as_secs_f64(), row);
+                    }
                 }
                 served_within(cpu, hosted, absent[layer], layer, sequence);
                 // A sampled step's block at this layer, over what it read,
                 // where its route recorded it.
-                if let Some((blocks, read, &seconds)) =
-                    blocks.as_ref().and_then(|blocks| Some((blocks, blocks.rows[layer].as_ref()?, blocks.seconds.get(&layer)?)))
-                {
-                    let (x, seconds) = block_point(&blocks.lines[layer], read, (cpu, rows), seconds);
-                    costs.blocks[layer].observe(x, seconds);
+                if work == LaunchWork::Generation {
+                    if let Some((blocks, read, &seconds)) =
+                        blocks.as_ref().and_then(|blocks| Some((blocks, blocks.rows[layer].as_ref()?, blocks.seconds.get(&layer)?)))
+                    {
+                        let (x, seconds) = block_point(&blocks.lines[layer], read, (cpu, rows), seconds);
+                        costs.blocks[layer].observe(x, seconds);
+                    }
                 }
                 total.sited += cpu;
                 (cost.experts[layer].sited, cost.experts[layer].site_path) = (cpu, path);
@@ -2942,8 +2946,10 @@ impl Telemetry {
             }
         }
         let chose = decoded.map(|((decoded, keys), routed, _, chose, _, _, guesses, row_experts)| {
-            let clock = decoded.launch.map(|_| self.horizon.lock().clock.at(sequence));
-            feed_decode(feed, routed, decoded, keys, clock);
+            if work == LaunchWork::Generation {
+                let clock = decoded.launch.map(|_| self.horizon.lock().clock.at(sequence));
+                feed_decode(feed, routed, decoded, keys, clock);
+            }
             DecodeRouting { chose, guesses, row_experts }
         });
         // What the step cost in reads, for whoever traces steps (a step slow
