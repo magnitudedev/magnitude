@@ -295,8 +295,47 @@ prepared_state apply_request_payload(const template_state & state, const uint8_t
         lower(std::nullopt, data.at("json_schema"));
         request.json_schema = data.at("json_schema").dump();
     }
+    const bool pure_content = data.value("pure_content", false);
+    if (pure_content && (!request.tools.empty() || !request.json_schema.empty())) {
+        throw std::invalid_argument("Pure content mode cannot be combined with tools or JSON output");
+    }
     prepared_state prepared;
     prepared.parameters = common_chat_templates_apply(state.compiled.get(), request);
+    if (pure_content) {
+        if (prepared.parameters.supports_thinking &&
+            !prepared.parameters.thinking_start_tag.empty() &&
+            !prepared.parameters.thinking_end_tags.empty()) {
+            auto trim_ws = [](const std::string & s) -> std::string {
+                const size_t first = s.find_first_not_of(" \t\r\n");
+                if (first == std::string::npos) { return {}; }
+                const size_t last = s.find_last_not_of(" \t\r\n");
+                return s.substr(first, last - first + 1);
+            };
+            const std::string start = trim_ws(prepared.parameters.thinking_start_tag);
+            const std::string end   = trim_ws(prepared.parameters.thinking_end_tags.front());
+            if (!start.empty() && !end.empty()) {
+                const auto pos = prepared.parameters.generation_prompt.rfind(start);
+                if (pos != std::string::npos) {
+                    const std::string tail = prepared.parameters.generation_prompt.substr(pos + start.size());
+                    bool closed = false;
+                    for (const auto & tag : prepared.parameters.thinking_end_tags) {
+                        const std::string trimmed = trim_ws(tag);
+                        if (!trimmed.empty() && tail.find(trimmed) != std::string::npos) {
+                            closed = true;
+                            break;
+                        }
+                    }
+                    if (!closed && trim_ws(tail).empty()) {
+                        prepared.parameters.generation_prompt += end;
+                        prepared.parameters.prompt            += end;
+                    }
+                }
+            }
+        }
+        // Raw caller grammars constrain token 0 directly; parse every generated
+        // byte from token 0 as content without prepending generation_prompt.
+        prepared.parameters.parser.clear();
+    }
     // Extracted generators enforce the whole completion. Specialized handlers
     // may still provide activation metadata, which has no meaning in this mode.
     if (prepared.parameters.grammar_lazy) {

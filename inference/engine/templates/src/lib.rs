@@ -76,6 +76,11 @@ pub struct Request {
     pub template_arguments: Map<String, Value>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub json_schema: Option<Value>,
+    /// When true, the caller constrains token 0 directly (e.g. a raw GBNF
+    /// grammar): any open tag-based reasoning block left at the end of the
+    /// generation prompt is closed and output parses from token 0 as content.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub pure_content: bool,
 }
 impl Request {
     pub fn new(messages: Vec<Value>, now: i64) -> Self {
@@ -87,6 +92,7 @@ impl Request {
             parallel_tool_calls: true,
             template_arguments: Map::new(),
             json_schema: None,
+            pure_content: false,
         }
     }
 }

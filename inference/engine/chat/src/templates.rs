@@ -351,16 +351,16 @@ impl TemplateBundle {
     ) -> Result<(NativeRequest, SelectedTemplate<'a>, ResolvedReasoning, bool), Prepare> {
         let choice = &request.tool_choice;
         let intent = &request.reasoning;
-        if *intent != ReasoningIntent::ModelDefault
-            && super::reasoning::CONTROLS
-                .iter()
-                .any(|key| request.template_arguments.contains_key(*key))
-        {
+        let has_raw_reasoning = super::reasoning::CONTROLS
+            .iter()
+            .any(|key| request.template_arguments.contains_key(*key));
+        if *intent != ReasoningIntent::ModelDefault && has_raw_reasoning {
             return Err(Prepare::Invalid(
                 "reasoning selection conflicts with raw template reasoning controls".into(),
             ));
         }
-        if request.grammar.is_some()
+        let has_raw_grammar = request.grammar.is_some();
+        if has_raw_grammar
             && (request.json_schema.is_some()
                 || (!request.tools.is_empty() && *choice != ToolChoice::None))
         {
@@ -376,6 +376,7 @@ impl TemplateBundle {
             parallel_tool_calls: request.parallel_tool_calls,
             template_arguments: request.template_arguments.clone(),
             json_schema: request.json_schema.clone(),
+            pure_content: has_raw_grammar,
         };
         let mut names = HashSet::new();
         for tool in &request.tools {
@@ -469,14 +470,11 @@ impl TemplateBundle {
                 ),
             ),
         };
-        // The default renders with no reasoning arguments, so it
-        // needs no inspection; every other intent resolves against the profile.
-        let reasoning = if *intent == ReasoningIntent::ModelDefault {
-            ResolvedReasoning {
-                effort: None,
-                controls: Default::default(),
-            }
-        } else {
+        // The default renders with no reasoning arguments, so it needs no
+        // inspection — except for a caller-supplied raw GBNF grammar, which
+        // constrains token 0 directly and disables thinking whenever the
+        // template exposes a disabled mode.
+        let inspect_profile = || -> Result<Arc<super::reasoning::ReasoningProfile>, Prepare> {
             let arguments_key = serde_json::to_vec(&canonical_json(&serde_json::Value::Object(
                 request.template_arguments.clone(),
             )))
@@ -484,17 +482,39 @@ impl TemplateBundle {
             let cell = self
                 .profiles
                 .cell((selected.as_template().identity().to_owned(), arguments_key));
-            let profile = cell
-                .get_or_init(|| {
-                    super::reasoning::inspect_reasoning(
-                        selected.as_template(),
-                        source,
-                        &request.template_arguments,
-                    )
-                    .map(Arc::new)
-                })
-                .clone()?;
-            profile.resolve(intent).map_err(Prepare::Reasoning)?
+            cell.get_or_init(|| {
+                super::reasoning::inspect_reasoning(
+                    selected.as_template(),
+                    source,
+                    &request.template_arguments,
+                )
+                .map(Arc::new)
+            })
+            .clone()
+            .map_err(Prepare::Invalid)
+        };
+        let reasoning = if *intent == ReasoningIntent::ModelDefault {
+            if has_raw_grammar && !has_raw_reasoning {
+                match inspect_profile()
+                    .ok()
+                    .and_then(|profile| profile.resolve(&ReasoningIntent::Disabled).ok())
+                {
+                    Some(disabled) => disabled,
+                    None => ResolvedReasoning {
+                        effort: None,
+                        controls: Default::default(),
+                    },
+                }
+            } else {
+                ResolvedReasoning {
+                    effort: None,
+                    controls: Default::default(),
+                }
+            }
+        } else {
+            inspect_profile()?
+                .resolve(intent)
+                .map_err(Prepare::Reasoning)?
         };
         for (key, value) in &reasoning.controls {
             if request
