@@ -3258,6 +3258,11 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
     pub fn execution_path(&self) -> crate::ExecutionPath {
         self.execution.policy().path()
     }
+    /// The drafting method this domain actually prepared (may be narrower than
+    /// the requested manifest method after a tight-memory `decode_rows` step-down).
+    pub fn execution_method(&self) -> crate::PlannedMethod {
+        self.execution.policy().method()
+    }
     /// The backend of the device this domain executes on.
     pub fn execution_backend(&self) -> seismic::BackendName {
         self.execution.device().backend()

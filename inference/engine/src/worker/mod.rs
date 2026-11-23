@@ -370,7 +370,9 @@ fn load(
             LoadAttempt::Loaded(built) => *built,
             LoadAttempt::Unprepared => return Err(Stopped::Unprepared),
         };
-        let model = manifest.model.clone();
+        let model = manifest
+            .model
+            .capped_to_execution_method(built.domain.execution_method());
         let method = model
             .factory(&manifest.package.identity.to_string(), built.domain.fronts())
             .map_err(internal)?;

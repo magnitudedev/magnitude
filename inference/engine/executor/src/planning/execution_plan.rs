@@ -2,9 +2,11 @@
 
 use super::{
     ArtifactComponent, ArtifactComponentKind, AssessmentMemoryCharge, CapabilityPlan,
-    ComponentPlan, ComponentSelection, HostTier, MAX_DRAFT_PROPOSALS, MemoryBudget, ModelLoadPlan, PassLaunches, PlannedMethod,
+    ComponentPlan, ComponentSelection, HostTier, MAX_DRAFT_PROPOSALS, ModelLoadPlan, PassLaunches, PlannedMethod,
     ProgramPlan, ReadoutClassChoice, ResourceLimits, ResourcePlan, WeightPlan,
 };
+#[cfg(test)]
+use super::MemoryBudget;
 use crate::{
     ExecutionPath, UnstreamedExperts,
     assessment::{Priced, stage_timer},
