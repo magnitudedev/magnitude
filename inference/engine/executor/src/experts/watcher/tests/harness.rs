@@ -663,6 +663,7 @@ pub(super) fn lending_windowed_passes(
             recording: false,
         },
         slots: Arc::new(std::sync::atomic::AtomicU64::new(slots as u64)),
+        host_slots: Arc::new(std::sync::atomic::AtomicU64::new(0)),
         whole,
         staging: staging_records,
         host: crate::experts::directory::HostTier { records: vec![tier], lent: vec![lent as u32], reserve: staging_records as usize, placement },
@@ -675,6 +676,7 @@ pub(super) fn lending_windowed_passes(
         spans: false,
         // Its bound is its own reads' line, as a plan priced on no figures.
         line: None,
+        transport: crate::experts::transport::ExpertTransport::new_registry_only(),
         trip: Box::new(move |report: String| *tripped.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = Some(report)),
     }, Box::new(|| crate::experts::exchange::Bounds {
         // Synthetic 48-byte fixture reads complete in nanoseconds from page
@@ -1740,7 +1742,7 @@ pub(super) fn guesses(step: &ExpertStep) -> i32 {
 }
 
 pub(super) fn row(position: u64, ahead: Option<AheadOf>) -> DecodeRow {
-    DecodeRow { position, request: crate::operation::RequestId(1), ahead }
+    DecodeRow { position, request: crate::operation::RequestId(1), ahead, token: None }
 }
 
 /// The front row of a pass of one exact row: its guess.

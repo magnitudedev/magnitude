@@ -242,6 +242,7 @@ impl Shared {
     /// and wake an owner waiting for a resize's answer, which never comes;
     /// an event, so the request service turns to refusing at once.
     pub(super) fn end_serving(&self, reason: String) {
+        self.transport.end_serving(reason.clone());
         self.life.end(reason);
         self.resizing.wake();
         self.events().notify();

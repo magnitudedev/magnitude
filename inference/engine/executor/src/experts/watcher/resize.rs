@@ -413,7 +413,7 @@ impl Residency {
         if let Some(copier) = copier {
             self.link.settle(&mut self.core, &mut self.ledger, &self.shared, copier, self.prefetch.reached());
         }
-        let _ = self.prefetch.settle(&mut self.core.directory, &mut self.ledger);
+        let _ = self.prefetch.settle(&mut self.core.directory, &mut self.ledger, &self.shared);
         if self.shared.life.ended().is_some() {
             return None;
         }
@@ -508,9 +508,12 @@ impl Residency {
             Evicting::Bank => directory.records()[group],
             Evicting::Landed => directory.host(group).records() as usize,
         };
+        let transport = &self.shared.transport;
         let evictable = |group: usize, target: usize| match evicting {
             Evicting::Bank => directory
-                .evictions_filtered(group, target, last_read, running)
+                .evictions_filtered_with(group, target, last_read, running, |record| {
+                    transport.can_reuse_slot(crate::experts::transport::DestSlot { group, slot: record })
+                })
                 .into_iter()
                 .map(|record| u32::try_from(record).expect("bank records fit u32"))
                 .collect::<Vec<_>>(),
@@ -543,6 +546,9 @@ impl Residency {
                 let directory = &mut self.core.directory;
                 for (group, records) in evicted.iter().enumerate() {
                     directory.evict_host(group, records, leaves_first);
+                    for &record in records {
+                        self.shared.transport.bump_source_generation(group, record as usize);
+                    }
                 }
                 self.address_tier(views);
             }

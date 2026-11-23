@@ -32,7 +32,7 @@ use super::scratch::Scratch;
 use super::{Shared, Step};
 use magnitude_cost_model::{DomainBudget, ExpertLines, SiteLines};
 use crate::experts::directory::{MissCurve, Point};
-use crate::experts::interest::{Ledger, Told};
+use crate::experts::interest::{Launched, Ledger, Told};
 use crate::experts::yielding::Yielding;
 use magnitude_kernels::constants;
 use std::sync::mpsc::Receiver;
@@ -94,6 +94,8 @@ pub(super) struct Residency {
     /// Each layer's line words as last published ([`Self::publish_lines`]);
     /// none before the first.
     pub(super) lines: Option<Vec<Vec<(usize, i32)>>>,
+    /// Whether the one-shot initial priced `publish_lines` summary has been logged.
+    pub(super) logged_initial_lines: bool,
     /// What each layer holds, as last published ([`Self::publish_held`]).
     pub(super) published: Published,
     /// What waits on that publication, answered as residency is released
@@ -309,30 +311,83 @@ impl Residency {
             told = true;
             let completed = matches!(&event, Told::Completed { .. });
             let began = matches!(&event, Told::Began { .. });
+            let decode_began_step = match &event {
+                Told::Began { step, launch: Launched::Decode { .. } } => Some(*step),
+                _ => None,
+            };
+            let ended_step = match &event {
+                Told::Ended { step, .. } => Some(*step),
+                _ => None,
+            };
             let draft = matches!(&event, Told::DraftWindow { .. });
-            // On 100%-RAM discrete GPUs (`tier_complete()` with partial VRAM),
-            // `Use::Tier` is a Path 0 (`Link`) miss rather than a Drive hit:
-            // reclassify un-staged Host-RAM misses as `tier: false` so
-            // `HintGate` measures the true live Link miss cohort instead of 0.
-            if link_only {
-                if let Told::Completed { step, ref mut chose, .. } = event {
-                    for (layer, choices) in chose.iter_mut().enumerate() {
-                        for chosen in choices.iter_mut() {
-                            if chosen.saves && chosen.tier && !self.ledger.has_link_landed(step, layer, chosen.expert) {
-                                chosen.tier = false;
-                            }
+            let closed_request = match &event {
+                Told::Closed(request) => Some(*request),
+                _ => None,
+            };
+            // Account zero-park landed prefetch hits and on-time LinkMover
+            // `MAP_STAGE` hits against the actual routed experts of every
+            // completed step, and on 100%-RAM discrete GPUs (`link_only`)
+            // classify each choice for `Ledger::resolve`.
+            if let Told::Completed { step, ref mut chose, .. } = event {
+                let engagement = self.shared.telemetry.engagement();
+                for (layer, choices) in chose.iter_mut().enumerate() {
+                    let layer_bytes = self.core.layers[layer].expert_bytes();
+                    for chosen in choices.iter_mut() {
+                        if let Some(lp) = self.prefetch.take_landed_prefetch((layer, chosen.expert)) {
+                            engagement.record_landed_hit(lp.bytes, lp.carryover);
+                        }
+                        let link_landed = self.ledger.has_link_landed(step, layer, chosen.expert);
+                        if classify_link_stage_hit(chosen, link_landed, link_only) {
+                            engagement.record_staged_hit(layer_bytes, false);
                         }
                     }
                 }
+                self.prefetch.prune_evicted_prefetches(&self.core, &self.shared);
             }
             let learned = self.ledger.tell(event);
             if began {
+                if let Some(step) = decode_began_step {
+                    self.prefetch.decode_step_began(step, &self.shared);
+                }
                 self.prefetch.on_began();
             } else if draft {
+                self.shared.telemetry.engagement().on_draft_window(true, Instant::now());
                 self.prefetch.on_draft_window();
+            }
+            if let Some(step) = ended_step {
+                self.prefetch.step_ended(step, &self.shared);
             }
             if completed {
                 self.shared.telemetry.resolved(&learned.resolved, &learned.cohorts);
+            }
+            if let Some(request) = closed_request {
+                self.shared.telemetry.engagement().on_draft_window(false, Instant::now());
+                self.prefetch.prune_evicted_prefetches(&self.core, &self.shared);
+                let site_served = self.shared.compute.site_served();
+                let mut residency = self.shared.telemetry.residency();
+                residency.vram_held = (0..self.core.layers.len())
+                    .map(|layer| self.core.directory.held_count(layer) as u64)
+                    .sum();
+                residency.vram_capacity = self
+                    .core
+                    .directory
+                    .capacities()
+                    .into_iter()
+                    .map(|cap| cap as u64)
+                    .sum();
+                residency.vram_reserve = (0..self.core.groups.len())
+                    .map(|group| self.core.directory.reserved(group) as u64)
+                    .sum();
+                if let Some(line) = self.shared.telemetry.engagement().request_summary_line(
+                    site_served.requests,
+                    site_served.experts,
+                    residency,
+                ) {
+                    tracing::info!("expert engagement (request {}): {line}", request.0);
+                }
+                if let Some(line) = self.shared.telemetry.take_route_stats_summary(residency) {
+                    tracing::info!("route stats (request {}): {line}", request.0);
+                }
             }
         }
         let (judged, accepted) = self.ledger.take_judged();
@@ -354,7 +409,7 @@ impl Residency {
         let told = self.learn_told();
         let joined = self.join();
         let retired = self.retire();
-        let (landed, newly_landed) = self.prefetch.settle(&mut self.core.directory, &mut self.ledger);
+        let (landed, newly_landed) = self.prefetch.settle(&mut self.core.directory, &mut self.ledger, &self.shared);
         let refilled = self.refill_tier();
         // Pipeline chain-through: if Path 1 just landed an expert into Tier 1
         // that is live in `NameLedger` for an upcoming step, mark changed so
@@ -441,7 +496,11 @@ impl Residency {
         }
         self.core.retired = frontier;
         self.core.directory.drain_pending(frontier);
-        self.core.directory.drain_staging(self.prefetch.reached(), &self.core.steps);
+        self.core.directory.drain_staging_with(self.prefetch.reached(), &self.core.steps, |group, slot| {
+            self.shared
+                .transport
+                .try_release_hint_slot(crate::experts::transport::DestSlot { group, slot })
+        });
         if let Some(past) = self.shared.steps.retire_groups(frontier) {
             self.advance(past);
         }
@@ -451,7 +510,10 @@ impl Residency {
     /// Read live hint and front rings while any group is not whole in Tier 0
     /// (`!core.directory.all_groups_whole()`), unblocking foresight on
     /// 100%-RAM discrete GPUs as well as 2-tier and 3-tier workloads.
-    pub(super) fn rings(&mut self, shared: &Arc<Shared>, served: &[Step], mut freed: bool) -> bool {
+    /// Immediately drives Path 0 `LinkMover::advance` when `copier` is present
+    /// so `HINT_LEADS=2` hints dispatch PCIe DMA within microseconds instead
+    /// of waiting for `Residency::keep`'s background `TURN`.
+    pub(super) fn rings(&mut self, shared: &Arc<Shared>, served: &[Step], mut freed: bool, copier: Option<&Copier>) -> bool {
         if self.core.directory.all_groups_whole() {
             return self.learn_told();
         }
@@ -467,12 +529,20 @@ impl Residency {
         if read.any {
             self.prefetch.pass(&mut self.core, &mut self.ledger, shared, None);
         }
-        let (settled, newly_landed) = self.prefetch.settle(&mut self.core.directory, &mut self.ledger);
+        let (settled, newly_landed) = self.prefetch.settle(&mut self.core.directory, &mut self.ledger, shared);
         let chain_through = newly_landed.into_iter().any(|(layer, expert)| self.ledger.is_wanted(layer, expert));
         let refilled = self.refill_tier();
         let reads_finished = self.prefetch.take_reads_finished();
         freed |= settled || refilled || chain_through || reads_finished;
-        self.prefetch.finish_rings(&mut self.core, &mut self.ledger, shared, read, freed, served)
+        // Admit newly read rings into `self.ledger` (and drive Path 1) BEFORE
+        // `LinkMover::advance` so Path 0 sees fresh `HINT_LEADS` hints on the
+        // same tick rather than one tick late.
+        let finished = self.prefetch.finish_rings(&mut self.core, &mut self.ledger, shared, read, freed, served);
+        let link_progressed = copier.is_some_and(|copier| {
+            !self.traffic_held()
+                && self.link.advance(&mut self.core, &mut self.ledger, shared, copier, None, false, self.prefetch.reached())
+        });
+        finished || link_progressed
     }
 
     pub(super) fn advance(&mut self, progress: Point) {
@@ -486,13 +556,17 @@ impl Residency {
     /// after settling.
     fn advance_retired(&mut self, progress: Point) {
         self.prefetch.past(progress);
-        let _ = self.prefetch.settle(&mut self.core.directory, &mut self.ledger);
+        let _ = self.prefetch.settle(&mut self.core.directory, &mut self.ledger, &self.shared);
         for listed in self.core.take_past(progress) {
             listed.release(&mut self.scratch.conveyor);
         }
         // The tiers it is past place their seeds, which it is past too.
         self.scratch.advance(progress, &mut self.core);
-        self.core.directory.drain_staging(progress, &self.core.steps);
+        self.core.directory.drain_staging_with(progress, &self.core.steps, |group, slot| {
+            self.shared
+                .transport
+                .try_release_hint_slot(crate::experts::transport::DestSlot { group, slot })
+        });
         self.core.retire(progress);
     }
 
@@ -500,7 +574,7 @@ impl Residency {
     /// free the conveyor records whose converts have completed, without moving
     /// device progress backwards across steps in the set.
     pub(super) fn advance_window(&mut self) {
-        let _ = self.prefetch.settle(&mut self.core.directory, &mut self.ledger);
+        let _ = self.prefetch.settle(&mut self.core.directory, &mut self.ledger, &self.shared);
         for listed in self.core.take_converted() {
             listed.release(&mut self.scratch.conveyor);
         }
@@ -527,10 +601,20 @@ impl Residency {
         if victims.iter().all(Vec::is_empty) {
             return false;
         }
+        let evicted_records: Vec<(usize, usize)> = victims
+            .iter()
+            .enumerate()
+            .flat_map(|(group, records)| records.iter().map(move |&(record, _)| (group, record as usize)))
+            .collect();
         let mut unmapped = false;
         steps.unbegun(|at| {
             unmapped = directory.refill(victims, at);
         });
+        if unmapped {
+            for (group, tier_record) in evicted_records {
+                self.shared.transport.bump_source_generation(group, tier_record);
+            }
+        }
         // A grace for steps the device is already past frees now: no
         // frontier's move would come for it until the next step.
         unmapped | directory.retire_graces(self.prefetch.reached(), steps)
@@ -745,20 +829,32 @@ impl Residency {
             .collect::<Vec<_>>();
         // Keep `POLICY_RESOLVED` strictly as the `routed_land` / file-exchange
         // omission bit, while gating `HintGate` on `&whole` (`!all_groups_whole`)
-        // so 100%-RAM discrete GPUs keep foresight hints active for Link staging.
-        let link_line = self
-            .core
-            .directory
-            .tier_complete()
-            .then(|| self.shared.copy.lock().expect("a copy's price").as_ref().map(|c| c.transfer))
-            .flatten();
+        // so both 100%-RAM and 3-tier discrete GPUs keep foresight hints active
+        // for Link and Drive staging.
+        let copy_transfer = self.shared.copy.lock().expect("a copy's price").as_ref().map(|c| c.transfer);
+        let tier_complete = self.core.directory.tier_complete();
+        let link_line = tier_complete.then_some(copy_transfer).flatten();
+        // On 3-tier discrete GPUs (`!tier_complete` with a Host->VRAM link),
+        // `routed_hint_route` feeds BOTH Path 1 (`Drive`) and Path 0 (`Link`):
+        // a hint lead is active whenever either path admits it under its
+        // `lead * C / L` compute overlap window.
+        let secondary_link = (!tier_complete)
+            .then_some(copy_transfer)
+            .flatten()
+            .map(|line| self.shared.telemetry.link_admission(Some(line)));
         let core = &self.core;
         let ledger = &mut self.ledger;
         let layer_count = core.layers.len();
         let hints = self.shared.telemetry.hint_gates(&whole, link_line, self.shared.launch_prices().as_ref(), |target, lead, miss| {
             let bytes = core.layers[target].expert_bytes();
-            let idle = miss.layer_idle(layer_count);
-            ledger.hint_admitted(target, lead, miss.break_even(bytes, idle))
+            let idle = miss.hint_lead_idle(lead, layer_count);
+            if ledger.hint_admitted(target, lead, miss.break_even(bytes, idle)) {
+                return true;
+            }
+            secondary_link.is_some_and(|link| {
+                let link_idle = link.hint_lead_idle(lead, layer_count);
+                ledger.hint_admitted(target, lead, link.break_even(bytes, link_idle))
+            })
         });
         let layers = (0..self.core.layers.len())
             .map(|index| LayerPolicy {
@@ -808,9 +904,11 @@ impl Residency {
     /// from such a step: word by word, some of a layer's words old and
     /// some new. A decode that never idles is repriced so.
     pub(super) fn publish_lines(&mut self, copier: Option<&Copier>) {
-        let priced = self.shared.priced().map(|lines| self.shared.telemetry.refined(&lines));
+        let refined = self.shared.priced().map(|lines| self.shared.telemetry.refined_for_policy(&lines));
+        let priced = refined.as_ref().map(|(lines, _)| lines);
+        let site_observed = refined.as_ref().map(|(_, observed)| observed.as_slice());
         let copy = self.shared.copy.lock().expect("a copy's price").clone();
-        if let (Some(lines), Some(copy)) = (&priced, &copy) {
+        if let (Some(lines), Some(copy)) = (priced, &copy) {
             let beside = self.shared.telemetry.beside();
             let terms = self.shared.telemetry.terms();
             for (layer, lines) in lines.iter().enumerate() {
@@ -822,19 +920,26 @@ impl Residency {
                 self.core.directory.price_write_backs(layer, price);
             }
         }
-        // Continuous shared-domain bandwidth share (`DomainBudget`) across
-        // live PCIe DMA + live NVMe landing bytes vs Host DDR5 (`HostLines::memory`),
-        // replacing the binary `dma_active: bool` hack.
-        let dma_active = copier.is_some_and(|copier| !copier.copies.idle()) || self.core.directory.staging_in_flight();
+        // Per-layer pricing of host-tier misses and shared Host DDR5 bandwidth
+        // (`DomainBudget`). When `ExpertTransport`'s adaptive `DecodeDmaGate`
+        // keeps a layer on split `DecodeFront -> DMA -> DecodeBack`, we:
+        // 1. Price `POLICY_LINK_NS` at `min(zero_copy, dma_transfer + resident)`
+        //    so `streaming_assign` sees true hardware DMA speed.
+        // 2. Price `POLICY_CPU_NS` via `DomainBudget::concurrent_cpu_scale`
+        //    only on the unrefined solo baseline (`!site_observed`); once
+        //    `costs.site(layer)` has observed live concurrent CPU site requests,
+        //    those measurements already include real DDR5 contention beside DMA
+        //    and are passed directly without double-scaling.
+        // When `DecodeDmaGate` gates a layer onto pipelined `RunStage::Whole`,
+        // we neither override `POLICY_LINK_NS` with DMA nor charge `b_dma` for
+        // that layer, so its rare misses compare uncontested CPU vs SM zero-copy.
+        let background_dma = copier.is_some_and(|copier| !copier.copies.idle())
+            || self.core.directory.staging_in_flight();
         let landing_active = self.core.extents.placer == crate::planning::Placer::Tier && self.prefetch.landing_active();
-        let b_dma = if dma_active {
-            copy.as_ref().map_or(0.0, |c| {
-                let spb = c.transfer.seconds_per_byte();
-                if spb > 0.0 { 1.0 / spb } else { 0.0 }
-            })
-        } else {
-            0.0
-        };
+        let link_bps = copy.as_ref().map_or(0.0, |c| {
+            let spb = c.transfer.seconds_per_byte();
+            if spb > 0.0 { 1.0 / spb } else { 0.0 }
+        });
         let b_landing = if landing_active {
             self.shared.telemetry.drive_line().map_or(0.0, |d| {
                 let spb = d.seconds_per_byte();
@@ -843,31 +948,72 @@ impl Residency {
         } else {
             0.0
         };
+        let all_groups_whole = self.core.directory.all_groups_whole();
+        let mut initial_log = None;
         let words = self
             .core
             .layers
             .iter()
             .enumerate()
             .map(|(index, layer)| {
-                let cpu = priced.as_ref().and_then(|lines| {
-                    let layer_lines = &lines[index];
-                    layer_lines.host.cpu.map(|cpu| {
+                let layer_decode_dma = !all_groups_whole
+                    && self.shared.transport.is_splitting_decode(index);
+                let b_dma = if layer_decode_dma || background_dma {
+                    link_bps
+                } else {
+                    0.0
+                };
+                let observed = site_observed.is_some_and(|flags| flags.get(index).copied().unwrap_or(false));
+                let (adjusted, cpu) = price_layer_lines(
+                    priced.map(|lines| lines[index]),
+                    observed,
+                    copy.as_ref(),
+                    layer_decode_dma,
+                    b_dma,
+                    b_landing,
+                );
+                let cpu_measured = adjusted.as_ref().is_some_and(|l| l.host.cpu.is_some());
+                let site = match (&layer.site, &cpu) {
+                    (None, _) => SiteLines::Unsited,
+                    (Some(_), None) if cpu_measured => SiteLines::Unsited,
+                    (Some(_), None) => SiteLines::Pending,
+                    (Some(_), Some(cpu)) => SiteLines::Measured(cpu),
+                };
+                let policy_words = ExpertLines::policy(&crate::assessment::POLICY_LAYOUT, site, adjusted.as_ref());
+                if index == 0 && !self.logged_initial_lines {
+                    if let Some(layer_lines) = adjusted.as_ref() {
                         let b_mem = layer_lines
                             .host
                             .memory
                             .filter(|m| m.get() > 0.0)
                             .map_or(0.0, |m| layer_lines.host.record_bytes as f64 / (m.get() * 1e-9));
-                        cpu.with_domain_budget(DomainBudget::new(b_dma, b_landing, b_mem))
-                    })
-                });
-                let site = match (&layer.site, &cpu) {
-                    (None, _) => SiteLines::Unsited,
-                    (Some(_), None) => SiteLines::Pending,
-                    (Some(_), Some(cpu)) => SiteLines::Measured(cpu),
-                };
-                ExpertLines::policy(&crate::assessment::POLICY_LAYOUT, site, priced.as_ref().map(|lines| &lines[index]))
+                        let link_ns = policy_words
+                            .iter()
+                            .find_map(|&(w, v)| (w == crate::assessment::POLICY_LAYOUT.link).then_some(v))
+                            .unwrap_or(0);
+                        let cpu_ns = policy_words
+                            .iter()
+                            .find_map(|&(w, v)| (w == crate::assessment::POLICY_LAYOUT.cpu).then_some(v))
+                            .unwrap_or(0);
+                        initial_log = Some((b_mem, b_dma, b_landing, layer_decode_dma, observed, link_ns, cpu_ns));
+                    }
+                }
+                policy_words
             })
             .collect::<Vec<_>>();
+        if let Some((b_mem, b_dma, b_landing, split_dma, observed, link_ns, cpu_ns)) = initial_log {
+            self.logged_initial_lines = true;
+            tracing::info!(
+                "expert pricing (layer 0): b_mem={:.2} GB/s b_dma={:.2} GB/s b_landing={:.2} GB/s split_dma={} site_observed={} POLICY_LINK_NS={} POLICY_CPU_NS={}",
+                b_mem / 1e9,
+                b_dma / 1e9,
+                b_landing / 1e9,
+                split_dma,
+                observed,
+                link_ns,
+                cpu_ns,
+            );
+        }
         if self.lines.as_ref() == Some(&words) {
             return;
         }
@@ -926,5 +1072,255 @@ impl Residency {
             ledger: &mut self.ledger,
             shared: &self.shared,
         }
+    }
+}
+
+/// Return whether `chosen` actually hit an on-time `LinkMover` `MAP_STAGE`
+/// slot (`!chosen.saves && link_landed`) and, on 100%-RAM discrete GPUs
+/// (`link_only`), classify `chosen` for `Ledger::resolve` so on-time `MAP_STAGE`
+/// hits credit `HintGate` and calibration while late or un-staged Host-RAM
+/// misses (already DMA'd by `DecodeFront` / `land_decode_misses`) are neither
+/// double-counted as `staged_hits` nor miscounted as saved hints.
+fn classify_link_stage_hit(chosen: &mut crate::experts::interest::Chosen, link_landed: bool, link_only: bool) -> bool {
+    let staged_hit = !chosen.saves && link_landed;
+    if link_only {
+        if staged_hit {
+            chosen.saves = true;
+            chosen.tier = true;
+        } else if chosen.saves && chosen.tier {
+            chosen.tier = false;
+        }
+    }
+    staged_hit
+}
+
+/// Price one layer's GPU link line and CPU site line given whether M7 split
+/// decode DMA is active on this layer (`layer_decode_dma`), whether `host.cpu`
+/// already reflects live runtime-observed concurrent site requests
+/// (`site_observed`), and the live shared-domain bandwidths (`b_dma`,
+/// `b_landing`).
+fn price_layer_lines(
+    priced: Option<ExpertLines>,
+    site_observed: bool,
+    copy: Option<&crate::assessment::TierCopyCosts>,
+    layer_decode_dma: bool,
+    b_dma: f64,
+    b_landing: f64,
+) -> (Option<ExpertLines>, Option<magnitude_cost_model::CpuLines>) {
+    let adjusted = priced.map(|mut layer_lines| {
+        if layer_decode_dma {
+            if let Some(copy) = copy {
+                let dma_ns = copy.transfer.transfer_seconds(layer_lines.host.record_bytes as f64) * 1e9;
+                let landed_ns = dma_ns + layer_lines.gpu.resident.weights.get() as f64;
+                if landed_ns.is_finite()
+                    && landed_ns > 0.0
+                    && landed_ns < layer_lines.gpu.link.weights.get() as f64
+                {
+                    if let Ok(ns) = magnitude_cost_model::Nanoseconds::try_from(landed_ns.round() as u32) {
+                        layer_lines.gpu.link.weights = ns;
+                    }
+                }
+            }
+        }
+        layer_lines
+    });
+    let cpu = adjusted.as_ref().and_then(|layer_lines| {
+        layer_lines.host.cpu.and_then(|cpu| {
+            let b_mem = layer_lines
+                .host
+                .memory
+                .filter(|m| m.get() > 0.0)
+                .map_or(0.0, |m| layer_lines.host.record_bytes as f64 / (m.get() * 1e-9));
+            // On PCIe Gen5 where DMA dominates host memory bandwidth
+            // (`b_dma > 0.7 * b_mem`) or on small experts (`<= 2 MiB`, where
+            // Gen5 DMA is ~32 us vs ~730 us GPU-blocking `ROUTED_SITE_AWAIT`),
+            // let `DecodeDma` handle misses without stalling the GPU stream.
+            if layer_decode_dma
+                && ((b_mem > 0.0 && b_dma > 0.7 * b_mem)
+                    || (layer_lines.host.record_bytes <= 2 * 1024 * 1024 && b_dma >= 30e9))
+            {
+                return None;
+            }
+            if site_observed {
+                // Already reflects live concurrent DDR5 contention beside DMA;
+                // never apply `DomainBudget` a second time.
+                return Some(cpu);
+            }
+            Some(cpu.with_domain_budget(
+                DomainBudget::new(b_dma, b_landing, b_mem),
+                layer_lines.host.record_bytes,
+            ))
+        })
+    });
+    (adjusted, cpu)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{classify_link_stage_hit, price_layer_lines};
+    use crate::experts::horizon::Time;
+    use crate::experts::interest::{Chosen, Ledger, Stands};
+    use std::time::Instant;
+
+    #[test]
+    fn late_map_stage_does_not_double_count_staged_hits() {
+        // Case 1: `MAP_STAGE` won the race against `resolve` (`source >= 0` ->
+        // `Use::Bank`, so `saves == false, tier == false`). Must credit
+        // `staged_hits` and, on `link_only`, mark `(saves=true, tier=true)`
+        // so `Ledger::resolve` credits `HintGate` / calibration.
+        let mut on_time = Chosen { expert: 7, saves: false, tier: false };
+        assert!(classify_link_stage_hit(&mut on_time, true, true));
+        assert_eq!(on_time, Chosen { expert: 7, saves: true, tier: true });
+
+        // Case 2: `MAP_STAGE` lost the race against `resolve` (`source = -2 - t`
+        // -> `Use::Tier`, so `saves == true, tier == true`), and `DecodeFront` /
+        // `land_decode_misses` already DMA'd the expert (`req_dma_experts += 1`)
+        // before the late `LinkMover` copy settled (`link_landed == true`).
+        // Must NOT credit `staged_hits`, and on `link_only` must reclassify to
+        // `tier == false` so `Ledger::resolve` counts it as a live Link miss.
+        let mut late_stage = Chosen { expert: 8, saves: true, tier: true };
+        assert!(!classify_link_stage_hit(&mut late_stage, true, true));
+        assert_eq!(late_stage, Chosen { expert: 8, saves: true, tier: false });
+
+        // Case 3: Un-staged Host-RAM miss on `link_only`.
+        let mut unstaged = Chosen { expert: 9, saves: true, tier: true };
+        assert!(!classify_link_stage_hit(&mut unstaged, false, true));
+        assert_eq!(unstaged, Chosen { expert: 9, saves: true, tier: false });
+
+        // Case 4: Permanent VRAM hit (`link_landed == false`).
+        let mut resident = Chosen { expert: 10, saves: false, tier: false };
+        assert!(!classify_link_stage_hit(&mut resident, false, true));
+        assert_eq!(resident, Chosen { expert: 10, saves: false, tier: false });
+
+        // Case 5: 3-tier (`link_only == false`) late stage must not credit
+        // `staged_hits` and must leave Drive `tier == true` untouched.
+        let mut three_tier_late = Chosen { expert: 11, saves: true, tier: true };
+        assert!(!classify_link_stage_hit(&mut three_tier_late, true, false));
+        assert_eq!(three_tier_late, Chosen { expert: 11, saves: true, tier: true });
+    }
+
+    #[test]
+    fn has_link_landed_only_reports_link_mover_stages_not_drive_hints() {
+        let time = Time::new(&[vec![4, 8]], 16);
+        let stands = Stands::new(time.clone());
+        let mut ledger = Ledger::new(vec![0, 0], 4, time, stands);
+        let now = Instant::now();
+
+        // Only `link_landed` sets `has_link_landed`.
+        assert!(!ledger.has_link_landed(5, 0, 3));
+        ledger.link_landed(5, 0, 3, now, now);
+        assert!(ledger.has_link_landed(5, 0, 3));
+        assert!(!ledger.has_link_landed(5, 0, 4));
+    }
+
+    /// Verify per-layer `DecodeDmaGate` pricing + additive `DomainBudget`:
+    /// 1. When `layer_decode_dma == true` (split M7 DMA on PCIe Gen5 48 GB/s +
+    ///    DDR5 75 GB/s, solo CPU 40 GB/s), `POLICY_LINK_NS` is priced at
+    ///    `dma_ns + resident_ns` and `POLICY_CPU_NS` uses the additive
+    ///    concurrent DDR5 rate (`b_cpu_eff = 27 GB/s` + 12% margin), so
+    ///    `streaming_assign` routes a non-zero fraction of misses to CPU
+    ///    concurrently with DMA (instead of 0 misses under the old `1/(1-share)`
+    ///    penalty).
+    /// 2. When `layer_decode_dma == false` (`DecodeDmaGate` gated onto
+    ///    `RunStage::Whole`), `POLICY_LINK_NS` stays at SM zero-copy (~11 GB/s)
+    ///    and `POLICY_CPU_NS` stays at uncontested solo CPU (40 GB/s), routing
+    ///    misses to overlapped CPU compute.
+    #[test]
+    fn price_layer_lines_splits_concurrently_on_dma_and_stays_uncontested_on_whole() {
+        use magnitude_cost_model::{
+            CpuLines, ExpertLines, GpuLines, HostLines, Moves, Nanoseconds, PassLine, ReadLine, RowCost, RowLine,
+        };
+        let record_bytes: u64 = 3_000_000; // 3 MB expert
+        let ns = |v: u32| Nanoseconds::try_from(v).unwrap();
+        let zero_copy_ns: u32 = 270_000; // ~11.1 GB/s SM zero-copy
+        let resident_ns: u32 = 15_000; // resident VRAM compute
+        let solo_cpu_ns: u32 = 75_000; // 40 GB/s solo CPU
+        let mem_ns: u32 = 40_000; // 75 GB/s DDR5
+        let base = ExpertLines {
+            gpu: GpuLines {
+                link: PassLine { weights: ns(zero_copy_ns), row: ns(1_000) },
+                resident: PassLine { weights: ns(resident_ns), row: ns(1_000) },
+                moves: Moves::NONE,
+            },
+            host: HostLines {
+                cpu: Some(CpuLines {
+                    expert: RowLine { one: ns(solo_cpu_ns), row: RowCost::Measured(ns(1_000)) },
+                    handshake: ns(4_000),
+                }),
+                memory: Some(ns(mem_ns)),
+                landing: None,
+                record_bytes,
+            },
+        };
+        let dma_line = ReadLine::new(0.0, 1.0 / 48e9).unwrap(); // 48 GB/s PCIe Gen5
+        let copy = crate::assessment::TierCopyCosts {
+            blocks: 0,
+            whole_seconds: 0.0,
+            stall_share: 0.0,
+            transfer: dma_line,
+            back: dma_line,
+        };
+
+        // Case 1: Split M7 DMA active on unrefined solo baseline (`site_observed == false`)
+        // -> concurrent CPU + DMA pricing via `DomainBudget`.
+        let (adj_dma, cpu_dma) = price_layer_lines(Some(base), false, Some(&copy), true, 48e9, 0.0);
+        let link_dma_ns = adj_dma.unwrap().gpu.link.weights.get() as u64;
+        let cpu_dma_ns = cpu_dma.unwrap().expert.one.get() as u64;
+        // dma_ns = 3MB / 48GB/s = 62_500 ns; + 15_000 resident = 77_500 ns.
+        assert_eq!(link_dma_ns, 77_500);
+        // Additive concurrent DDR5: b_cpu_eff = 75 - 48 = 27 GB/s -> 75_000 * (40/27) * 1.12 = 124_444 ns.
+        assert_eq!(cpu_dma_ns, 124_444);
+
+        // Simulate `streaming_assign` (resolve.hpp:264-282) for 8 1-row misses + 2 hits:
+        let simulate_assign = |link_ns: u64, cpu_ns: u64, misses: usize, hits: usize| -> (usize, usize) {
+            let mut gpu = (hits as u64) * (resident_ns as u64);
+            let mut cpu = 0u64;
+            let mut served = false;
+            let (mut to_gpu, mut to_cpu) = (0, 0);
+            for _ in 0..misses {
+                let on_cpu = cpu + cpu_ns + if served { 0 } else { 4_000 };
+                let in_place = gpu + link_ns;
+                if on_cpu <= in_place {
+                    cpu = on_cpu;
+                    served = true;
+                    to_cpu += 1;
+                } else {
+                    gpu = in_place;
+                    to_gpu += 1;
+                }
+            }
+            (to_gpu, to_cpu)
+        };
+        let (gpu_dma, cpu_split) = simulate_assign(link_dma_ns, cpu_dma_ns, 8, 2);
+        assert!(
+            cpu_split >= 2 && gpu_dma >= 4,
+            "expected additive concurrent CPU+DMA split on Gen5, got gpu={gpu_dma}, cpu={cpu_split}"
+        );
+
+        // Case 2: Live runtime-observed concurrent CPU time (`site_observed == true`,
+        // from `costs.site(layer)`) already reflects real DDR5 contention beside DMA
+        // and MUST NOT be double-scaled by `DomainBudget`.
+        let mut observed_base = base;
+        observed_base.host.cpu.as_mut().unwrap().expert.one = ns(135_000);
+        let (adj_obs, cpu_obs) = price_layer_lines(Some(observed_base), true, Some(&copy), true, 48e9, 0.0);
+        assert_eq!(adj_obs.unwrap().gpu.link.weights.get() as u64, 77_500);
+        assert_eq!(
+            cpu_obs.unwrap().expert.one.get() as u64,
+            135_000,
+            "live observed concurrent CPU site time must not be double-scaled by DomainBudget"
+        );
+
+        // Case 3: Layer gated onto `RunStage::Whole` -> zero-copy link vs uncontested solo CPU.
+        let (adj_whole, cpu_whole) = price_layer_lines(Some(base), false, Some(&copy), false, 0.0, 0.0);
+        let link_whole_ns = adj_whole.unwrap().gpu.link.weights.get() as u64;
+        let cpu_whole_ns = cpu_whole.unwrap().expert.one.get() as u64;
+        assert_eq!(link_whole_ns, zero_copy_ns as u64, "Whole layer must not use DMA link price");
+        assert_eq!(cpu_whole_ns, solo_cpu_ns as u64, "Whole layer must use uncontested solo CPU price");
+        let (gpu_whole, cpu_whole_count) = simulate_assign(link_whole_ns, cpu_whole_ns, 2, 8);
+        assert_eq!(
+            (gpu_whole, cpu_whole_count),
+            (0, 2),
+            "Whole layer's rare misses should route to uncontested CPU over SM zero-copy"
+        );
     }
 }

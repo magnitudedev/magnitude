@@ -16,9 +16,10 @@ use crate::experts::horizon::Time;
 use crate::experts::interest::{Accepted, Basis, Chosen, Cohort, Judged, Resolved, Source, Spent, Stands};
 use crate::experts::reuse::{Gap, Ranking, Shadows, StepKeys};
 use crate::planning::RegionWords;
-use std::collections::BTreeMap;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::collections::{BTreeMap, VecDeque};
+use std::fmt::Write as _;
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 /// The tracing target of each completed step's reads (`complete_step`),
@@ -417,10 +418,10 @@ impl FrontSkips {
 /// of the pass reads, its rows' lookahead hints'.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct AheadUse {
-    issued: [u64; 3],
-    fell: [u64; 3],
-    cancelled: [[u64; 2]; 3],
-    used: [[u64; 2]; 3],
+    issued: [u64; Basis::ALL.len()],
+    fell: [u64; Basis::ALL.len()],
+    cancelled: [[u64; 2]; Basis::ALL.len()],
+    used: [[u64; 2]; Basis::ALL.len()],
     /// Reads ahead settled unused, by `(verify, depth)` (never counting
     /// pending reads awaiting a future step).
     unused: [[u64; DEPTHS]; 2],
@@ -478,7 +479,7 @@ impl AheadUse {
 
     fn spend(&mut self, spent: Spent) {
         match spent {
-            Spent::Fell { basis: Basis::Hint, .. } => panic!("an exact row's hint guesses nothing, so no guess of its falls"),
+            Spent::Fell { basis: Basis::Hint | Basis::Token, .. } => panic!("an exact row's hint or token route guesses nothing, so no guess of its falls"),
             Spent::Fell { basis, bytes } => self.fell[basis.index()] += bytes,
             Spent::Cancelled { basis, fell, bytes, .. } => {
                 self.cancelled[basis.index()][usize::from(fell)] += bytes;
@@ -524,7 +525,7 @@ impl AheadUse {
     /// guess that stood or fell (`_stood`, `_wrong`: a wrong guess, or a
     /// pass or request that never came), and an exact row's lookahead hint
     /// (`hints`), which guesses nothing.
-    pub fn classes(&self) -> [(&'static str, ReadUse); 5] {
+    pub fn classes(&self) -> [(&'static str, ReadUse); 6] {
         let signed = |bytes: u64| i64::try_from(bytes).expect("a load's bytes fit i64");
         let class = |basis: Basis, fell: bool| {
             let (at, of) = (basis.index(), usize::from(fell));
@@ -540,6 +541,7 @@ impl AheadUse {
             ("front_hints_stood", class(Basis::AheadHint, false)),
             ("front_hints_wrong", class(Basis::AheadHint, true)),
             ("hints", class(Basis::Hint, false)),
+            ("token", class(Basis::Token, false)),
         ]
     }
 }
@@ -700,6 +702,18 @@ impl ReadPrice {
     /// Whether the drive is the binding resource (`ReadAdmission::binds`).
     pub(super) fn binds(&self) -> bool {
         self.admission.binds()
+    }
+
+    /// Priced net expected stall gain (in miss-equivalent units) of a
+    /// carryover prefetch with hit probability `p` and `free_slack` idle
+    /// seconds (`PathAdmission::carryover_net_benefit`).
+    pub(super) fn carryover_net_benefit(&self, p: f64, bytes: u64, free_slack: f64) -> f64 {
+        self.admission.carryover_net_benefit(p, bytes, free_slack)
+    }
+
+    /// Per-step idle drive slack `(C - U * t_bw).max(0.0)`.
+    pub(super) fn slack_seconds(&self) -> f64 {
+        self.admission.slack_seconds()
     }
 
     /// Per-layer idle drive slack `((C - U * t_bw).max(0.0)) / L`.
@@ -1205,6 +1219,741 @@ impl Default for ShadowState {
     }
 }
 
+/// Contiguous active-burst wall time and drive-active interval accumulator,
+/// locked only on `0 <-> 1` active-read transitions, burst start/end, and
+/// summary snapshots. Never counts idle server time between requests.
+#[derive(Default)]
+struct DriveClock {
+    active_decode_steps: usize,
+    in_draft_window: bool,
+    burst_since: Option<Instant>,
+    burst_wall_ns: u64,
+    active_since: Option<Instant>,
+    active_ns: u64,
+}
+
+impl DriveClock {
+    fn is_burst_active(&self) -> bool {
+        self.active_decode_steps > 0 || self.in_draft_window
+    }
+
+    fn sync_burst(&mut self, now: Instant, reads_active: bool) {
+        if self.is_burst_active() {
+            if self.burst_since.is_none() {
+                self.burst_since = Some(now);
+            }
+            if reads_active && self.active_since.is_none() {
+                self.active_since = Some(now);
+            }
+        } else {
+            if let Some(since) = self.burst_since.take() {
+                self.burst_wall_ns =
+                    self.burst_wall_ns.saturating_add(now.saturating_duration_since(since).as_nanos().min(u64::MAX as u128) as u64);
+            }
+            if let Some(since) = self.active_since.take() {
+                self.active_ns =
+                    self.active_ns.saturating_add(now.saturating_duration_since(since).as_nanos().min(u64::MAX as u128) as u64);
+            }
+        }
+    }
+}
+
+/// Current bank residency reported alongside engagement lines.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(super) struct ResidencySnapshot {
+    pub(super) vram_slots: u64,
+    pub(super) host_slots: u64,
+    pub(super) total_experts: u64,
+    pub(super) vram_held: u64,
+    pub(super) vram_capacity: u64,
+    pub(super) vram_reserve: u64,
+}
+
+/// Cumulative baseline of counters at the end of the previous completed
+/// request, used to compute per-request deltas without touching hot paths.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct RequestBaseline {
+    burst_wall_ns: u64,
+    active_ns: u64,
+    bytes_hidden: u64,
+    bytes_exposed: u64,
+    staged_hits: u64,
+    landed_hits: u64,
+    carryover_hits: u64,
+    carryover_wasted: u64,
+    dma_calls: u64,
+    dma_skipped_zero_miss: u64,
+    dma_experts_landed: u64,
+    dma_bytes_landed: u64,
+    dma_overflow_experts: u64,
+    dma_host_wait_ns: u64,
+    growth_refusals: u64,
+    cpu_site_jobs: u64,
+    cpu_site_experts: u64,
+}
+
+/// Snapshot of [`DriveEngagement`] cumulative counters emitted on load
+/// settlement.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub(super) struct EngagementSnapshot {
+    pub(super) drive_busy_fraction: f64,
+    pub(super) bytes_hidden: u64,
+    pub(super) bytes_exposed: u64,
+    pub(super) staged_hits: u64,
+    pub(super) landed_hits: u64,
+    pub(super) carryover_hits: u64,
+    pub(super) carryover_wasted: u64,
+    pub(super) dma_calls: u64,
+    pub(super) dma_skipped_zero_miss: u64,
+    pub(super) dma_experts_landed: u64,
+    pub(super) dma_bytes_landed: u64,
+    pub(super) dma_overflow_experts: u64,
+    pub(super) dma_host_wait_ns: u64,
+    pub(super) growth_refusals: u64,
+    pub(super) cpu_site_jobs: u64,
+    pub(super) cpu_site_experts: u64,
+}
+
+impl EngagementSnapshot {
+    pub(super) fn has_activity(&self) -> bool {
+        self.drive_busy_fraction > 0.0
+            || self.bytes_hidden > 0
+            || self.bytes_exposed > 0
+            || self.staged_hits > 0
+            || self.landed_hits > 0
+            || self.carryover_hits > 0
+            || self.carryover_wasted > 0
+            || self.dma_calls > 0
+            || self.dma_experts_landed > 0
+            || self.dma_bytes_landed > 0
+            || self.dma_overflow_experts > 0
+            || self.dma_host_wait_ns > 0
+            || self.growth_refusals > 0
+            || self.cpu_site_jobs > 0
+            || self.cpu_site_experts > 0
+    }
+
+    pub(super) fn format_line(&self, residency: ResidencySnapshot) -> String {
+        let dma_wait_ms = self.dma_host_wait_ns as f64 / 1_000_000.0;
+        format!(
+            "drive_busy_fraction={:.3} bytes_hidden={} bytes_exposed={} staged_hits={} landed_hits={} carryover_hits={} carryover_wasted={} dma_calls={} dma_skipped_zero_miss={} dma_experts={} dma_bytes={} dma_overflow={} dma_wait_ms={:.3} growth_refusals={} cpu_site_jobs={} cpu_site_experts={} vram_slots={} host_slots={} total_experts={}",
+            self.drive_busy_fraction,
+            self.bytes_hidden,
+            self.bytes_exposed,
+            self.staged_hits,
+            self.landed_hits,
+            self.carryover_hits,
+            self.carryover_wasted,
+            self.dma_calls,
+            self.dma_skipped_zero_miss,
+            self.dma_experts_landed,
+            self.dma_bytes_landed,
+            self.dma_overflow_experts,
+            dma_wait_ms,
+            self.growth_refusals,
+            self.cpu_site_jobs,
+            self.cpu_site_experts,
+            residency.vram_slots,
+            residency.host_slots,
+            residency.total_experts,
+        )
+    }
+}
+
+/// Per-request delta of [`DriveEngagement`] counters emitted on request
+/// completion (`expert engagement (request X)`).
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub(super) struct RequestEngagementDelta {
+    pub(super) drive_busy_fraction: f64,
+    pub(super) req_bytes_hidden: u64,
+    pub(super) req_bytes_exposed: u64,
+    pub(super) req_staged_hits: u64,
+    pub(super) req_landed_hits: u64,
+    pub(super) req_carryover_hits: u64,
+    pub(super) req_carryover_wasted: u64,
+    pub(super) req_dma_calls: u64,
+    pub(super) req_dma_skipped_zero_miss: u64,
+    pub(super) req_dma_experts: u64,
+    pub(super) req_dma_bytes: u64,
+    pub(super) req_dma_overflow: u64,
+    pub(super) req_dma_wait_ns: u64,
+    pub(super) req_growth_refusals: u64,
+    pub(super) req_cpu_site_jobs: u64,
+    pub(super) req_cpu_site_experts: u64,
+}
+
+impl RequestEngagementDelta {
+    pub(super) fn has_activity(&self) -> bool {
+        self.drive_busy_fraction > 0.0
+            || self.req_bytes_hidden > 0
+            || self.req_bytes_exposed > 0
+            || self.req_staged_hits > 0
+            || self.req_landed_hits > 0
+            || self.req_carryover_hits > 0
+            || self.req_carryover_wasted > 0
+            || self.req_dma_calls > 0
+            || self.req_dma_experts > 0
+            || self.req_dma_bytes > 0
+            || self.req_dma_overflow > 0
+            || self.req_dma_wait_ns > 0
+            || self.req_growth_refusals > 0
+            || self.req_cpu_site_jobs > 0
+            || self.req_cpu_site_experts > 0
+    }
+
+    pub(super) fn format_request_line(&self, residency: ResidencySnapshot) -> String {
+        let dma_wait_ms = self.req_dma_wait_ns as f64 / 1_000_000.0;
+        format!(
+            "drive_busy_fraction={:.3} req_bytes_hidden={} req_bytes_exposed={} req_staged_hits={} req_landed_hits={} req_carryover_hits={} req_carryover_wasted={} req_dma_calls={} req_dma_skipped_zero_miss={} req_dma_experts={} req_dma_bytes={} req_dma_overflow={} req_dma_wait_ms={:.3} req_growth_refusals={} req_cpu_site_jobs={} req_cpu_site_experts={} vram_slots={} host_slots={} total_experts={} vram_held={}/{} vram_reserve={}",
+            self.drive_busy_fraction,
+            self.req_bytes_hidden,
+            self.req_bytes_exposed,
+            self.req_staged_hits,
+            self.req_landed_hits,
+            self.req_carryover_hits,
+            self.req_carryover_wasted,
+            self.req_dma_calls,
+            self.req_dma_skipped_zero_miss,
+            self.req_dma_experts,
+            self.req_dma_bytes,
+            self.req_dma_overflow,
+            dma_wait_ms,
+            self.req_growth_refusals,
+            self.req_cpu_site_jobs,
+            self.req_cpu_site_experts,
+            residency.vram_slots,
+            residency.host_slots,
+            residency.total_experts,
+            residency.vram_held,
+            residency.vram_capacity,
+            residency.vram_reserve,
+        )
+    }
+}
+
+/// Lightweight real-route engagement counters for drive prefetch, staging,
+/// M7 decode DMA, and bank growth refusals: zero hot-path overhead (relaxed
+/// atomics for all counters; mutexes only on `0 <-> 1` active-read transitions
+/// and once per completed request for delta snapshotting).
+pub(super) struct DriveEngagement {
+    active_reads: AtomicUsize,
+    clock: Mutex<DriveClock>,
+    last_request: Mutex<RequestBaseline>,
+    bytes_hidden: AtomicU64,
+    bytes_exposed: AtomicU64,
+    staged_hits: AtomicU64,
+    landed_hits: AtomicU64,
+    carryover_hits: AtomicU64,
+    carryover_wasted: AtomicU64,
+    dma_calls: AtomicU64,
+    dma_skipped_zero_miss: AtomicU64,
+    dma_experts_landed: AtomicU64,
+    dma_bytes_landed: AtomicU64,
+    dma_overflow_experts: AtomicU64,
+    dma_host_wait_ns: AtomicU64,
+    growth_refusals: AtomicU64,
+}
+
+impl Default for DriveEngagement {
+    fn default() -> Self {
+        Self {
+            active_reads: AtomicUsize::new(0),
+            clock: Mutex::new(DriveClock::default()),
+            last_request: Mutex::new(RequestBaseline::default()),
+            bytes_hidden: AtomicU64::new(0),
+            bytes_exposed: AtomicU64::new(0),
+            staged_hits: AtomicU64::new(0),
+            landed_hits: AtomicU64::new(0),
+            carryover_hits: AtomicU64::new(0),
+            carryover_wasted: AtomicU64::new(0),
+            dma_calls: AtomicU64::new(0),
+            dma_skipped_zero_miss: AtomicU64::new(0),
+            dma_experts_landed: AtomicU64::new(0),
+            dma_bytes_landed: AtomicU64::new(0),
+            dma_overflow_experts: AtomicU64::new(0),
+            dma_host_wait_ns: AtomicU64::new(0),
+            growth_refusals: AtomicU64::new(0),
+        }
+    }
+}
+
+impl DriveEngagement {
+    /// Mark a decode/verify burst step starting so `drive_busy_fraction`
+    /// accumulates pure active-burst wall time (never inter-request idle gaps).
+    pub(super) fn on_decode_began(&self, now: Instant) {
+        let mut clock = self.clock.lock().expect("drive engagement clock");
+        clock.active_decode_steps = clock.active_decode_steps.saturating_add(1);
+        clock.in_draft_window = false;
+        clock.sync_burst(now, self.active_reads.load(Ordering::Acquire) > 0);
+    }
+
+    /// Mark a decode/verify burst step ending.
+    pub(super) fn on_decode_ended(&self, now: Instant) {
+        let mut clock = self.clock.lock().expect("drive engagement clock");
+        clock.active_decode_steps = clock.active_decode_steps.saturating_sub(1);
+        clock.sync_burst(now, self.active_reads.load(Ordering::Acquire) > 0);
+    }
+
+    /// Mark an MTP draft window active or inactive (e.g. closed when a request
+    /// finishes so idle post-request time is never counted).
+    pub(super) fn on_draft_window(&self, active: bool, now: Instant) {
+        let mut clock = self.clock.lock().expect("drive engagement clock");
+        clock.in_draft_window = active;
+        clock.sync_burst(now, self.active_reads.load(Ordering::Acquire) > 0);
+    }
+
+    /// Record a drive read starting (must be paired 1:1 with [`Self::read_finished`]).
+    pub(super) fn read_started(&self) {
+        if self.active_reads.fetch_add(1, Ordering::AcqRel) == 0 {
+            let mut clock = self.clock.lock().expect("drive engagement clock");
+            if clock.burst_since.is_some() && clock.active_since.is_none() {
+                clock.active_since = Some(Instant::now());
+            }
+        }
+    }
+
+    /// Record a drive read finishing (paired 1:1 with [`Self::read_started`]).
+    pub(super) fn read_finished(&self) {
+        let prev = self.active_reads.fetch_sub(1, Ordering::AcqRel);
+        debug_assert!(prev > 0, "invariant violated: DriveEngagement::read_finished without matching read_started");
+        if prev == 1 {
+            let mut clock = self.clock.lock().expect("drive engagement clock");
+            if let Some(since) = clock.active_since.take() {
+                clock.active_ns = clock.active_ns.saturating_add(since.elapsed().as_nanos().min(u64::MAX as u128) as u64);
+            }
+        }
+    }
+
+    /// Record a demand-stalled miss (`bytes_exposed`).
+    pub(super) fn record_exposed(&self, bytes: u64) {
+        self.bytes_exposed.fetch_add(bytes, Ordering::Relaxed);
+    }
+
+    /// Record an in-flight drive prefetch hit or `LinkMover` DMA staged hit.
+    pub(super) fn record_staged_hit(&self, bytes: u64, carryover: bool) {
+        self.staged_hits.fetch_add(1, Ordering::Relaxed);
+        self.bytes_hidden.fetch_add(bytes, Ordering::Relaxed);
+        if carryover {
+            self.carryover_hits.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    /// Record a zero-park hit on a prefetched expert that landed before use.
+    pub(super) fn record_landed_hit(&self, bytes: u64, carryover: bool) {
+        self.landed_hits.fetch_add(1, Ordering::Relaxed);
+        self.bytes_hidden.fetch_add(bytes, Ordering::Relaxed);
+        if carryover {
+            self.carryover_hits.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    /// Record a carryover prefetch that read from the drive and was evicted or
+    /// failed without being used.
+    pub(super) fn record_carryover_wasted(&self) {
+        self.carryover_wasted.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Record one M7 decode DMA layer invocation (`land_decode_misses`).
+    pub(super) fn record_dma_call(
+        &self,
+        skipped_zero_miss: bool,
+        experts_landed: u64,
+        bytes_landed: u64,
+        overflow_experts: u64,
+    ) {
+        self.dma_calls.fetch_add(1, Ordering::Relaxed);
+        if skipped_zero_miss {
+            self.dma_skipped_zero_miss.fetch_add(1, Ordering::Relaxed);
+        }
+        if experts_landed > 0 {
+            self.dma_experts_landed.fetch_add(experts_landed, Ordering::Relaxed);
+        }
+        if bytes_landed > 0 {
+            self.dma_bytes_landed.fetch_add(bytes_landed, Ordering::Relaxed);
+        }
+        if overflow_experts > 0 {
+            self.dma_overflow_experts.fetch_add(overflow_experts, Ordering::Relaxed);
+        }
+    }
+
+    /// Record wall time spent waiting on `DecodeFront` + submitting M7 decode DMA.
+    pub(super) fn record_dma_host_wait(&self, elapsed: Duration) {
+        let ns = elapsed.as_nanos().min(u64::MAX as u128) as u64;
+        self.dma_host_wait_ns.fetch_add(ns, Ordering::Relaxed);
+    }
+
+    /// Record an expert bank growth refusal (`BankResized::GrowthRefused` or
+    /// partial `BankResized::Grown { refused: Some(_), .. }`).
+    pub(super) fn record_growth_refusal(&self) {
+        self.growth_refusals.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Read the current cumulative counters (clock + relaxed atomics + CPU site totals).
+    fn current_baseline(&self, cpu_site_jobs: u64, cpu_site_experts: u64) -> RequestBaseline {
+        let (burst_wall_ns, active_ns) = {
+            let clock = self.clock.lock().expect("drive engagement clock");
+            let now = Instant::now();
+            let wall_ns = clock.burst_wall_ns.saturating_add(
+                clock.burst_since.map_or(0, |since| now.saturating_duration_since(since).as_nanos().min(u64::MAX as u128) as u64),
+            );
+            let active_ns = clock.active_ns.saturating_add(
+                clock.active_since.map_or(0, |since| now.saturating_duration_since(since).as_nanos().min(u64::MAX as u128) as u64),
+            );
+            (wall_ns, active_ns)
+        };
+        RequestBaseline {
+            burst_wall_ns,
+            active_ns,
+            bytes_hidden: self.bytes_hidden.load(Ordering::Relaxed),
+            bytes_exposed: self.bytes_exposed.load(Ordering::Relaxed),
+            staged_hits: self.staged_hits.load(Ordering::Relaxed),
+            landed_hits: self.landed_hits.load(Ordering::Relaxed),
+            carryover_hits: self.carryover_hits.load(Ordering::Relaxed),
+            carryover_wasted: self.carryover_wasted.load(Ordering::Relaxed),
+            dma_calls: self.dma_calls.load(Ordering::Relaxed),
+            dma_skipped_zero_miss: self.dma_skipped_zero_miss.load(Ordering::Relaxed),
+            dma_experts_landed: self.dma_experts_landed.load(Ordering::Relaxed),
+            dma_bytes_landed: self.dma_bytes_landed.load(Ordering::Relaxed),
+            dma_overflow_experts: self.dma_overflow_experts.load(Ordering::Relaxed),
+            dma_host_wait_ns: self.dma_host_wait_ns.load(Ordering::Relaxed),
+            growth_refusals: self.growth_refusals.load(Ordering::Relaxed),
+            cpu_site_jobs,
+            cpu_site_experts,
+        }
+    }
+
+    /// Current cumulative drive busy fraction (`active_ns / burst_wall_ns`),
+    /// or `None` before any decode burst has elapsed.
+    pub(super) fn drive_busy_fraction(&self) -> Option<f64> {
+        let clock = self.clock.lock().expect("drive engagement clock");
+        let now = Instant::now();
+        let wall_ns = clock.burst_wall_ns.saturating_add(
+            clock.burst_since.map_or(0, |since| now.saturating_duration_since(since).as_nanos().min(u64::MAX as u128) as u64),
+        );
+        if wall_ns == 0 {
+            return None;
+        }
+        let active_ns = clock.active_ns.saturating_add(
+            clock.active_since.map_or(0, |since| now.saturating_duration_since(since).as_nanos().min(u64::MAX as u128) as u64),
+        );
+        Some((active_ns as f64 / wall_ns as f64).clamp(0.0, 1.0))
+    }
+
+    /// Take a consistent cumulative snapshot of all engagement counters.
+    pub(super) fn snapshot_with_site(&self, cpu_site_jobs: u64, cpu_site_experts: u64) -> EngagementSnapshot {
+        let cur = self.current_baseline(cpu_site_jobs, cpu_site_experts);
+        let drive_busy_fraction = if cur.burst_wall_ns > 0 {
+            (cur.active_ns as f64 / cur.burst_wall_ns as f64).clamp(0.0, 1.0)
+        } else {
+            0.0
+        };
+        EngagementSnapshot {
+            drive_busy_fraction,
+            bytes_hidden: cur.bytes_hidden,
+            bytes_exposed: cur.bytes_exposed,
+            staged_hits: cur.staged_hits,
+            landed_hits: cur.landed_hits,
+            carryover_hits: cur.carryover_hits,
+            carryover_wasted: cur.carryover_wasted,
+            dma_calls: cur.dma_calls,
+            dma_skipped_zero_miss: cur.dma_skipped_zero_miss,
+            dma_experts_landed: cur.dma_experts_landed,
+            dma_bytes_landed: cur.dma_bytes_landed,
+            dma_overflow_experts: cur.dma_overflow_experts,
+            dma_host_wait_ns: cur.dma_host_wait_ns,
+            growth_refusals: cur.growth_refusals,
+            cpu_site_jobs: cur.cpu_site_jobs,
+            cpu_site_experts: cur.cpu_site_experts,
+        }
+    }
+
+    /// Take a cumulative snapshot with zero CPU site jobs (for unit tests).
+    #[cfg(test)]
+    pub(super) fn snapshot(&self) -> EngagementSnapshot {
+        self.snapshot_with_site(0, 0)
+    }
+
+    /// Take the per-request delta since the previous call to [`Self::take_request_delta`]
+    /// and advance the stored request baseline.
+    pub(super) fn take_request_delta(&self, cpu_site_jobs: u64, cpu_site_experts: u64) -> RequestEngagementDelta {
+        let cur = self.current_baseline(cpu_site_jobs, cpu_site_experts);
+        let mut prev = self.last_request.lock().expect("drive engagement request baseline");
+        let wall_ns = cur.burst_wall_ns.saturating_sub(prev.burst_wall_ns);
+        let active_ns = cur.active_ns.saturating_sub(prev.active_ns);
+        let drive_busy_fraction = if wall_ns > 0 {
+            (active_ns as f64 / wall_ns as f64).clamp(0.0, 1.0)
+        } else {
+            0.0
+        };
+        let delta = RequestEngagementDelta {
+            drive_busy_fraction,
+            req_bytes_hidden: cur.bytes_hidden.saturating_sub(prev.bytes_hidden),
+            req_bytes_exposed: cur.bytes_exposed.saturating_sub(prev.bytes_exposed),
+            req_staged_hits: cur.staged_hits.saturating_sub(prev.staged_hits),
+            req_landed_hits: cur.landed_hits.saturating_sub(prev.landed_hits),
+            req_carryover_hits: cur.carryover_hits.saturating_sub(prev.carryover_hits),
+            req_carryover_wasted: cur.carryover_wasted.saturating_sub(prev.carryover_wasted),
+            req_dma_calls: cur.dma_calls.saturating_sub(prev.dma_calls),
+            req_dma_skipped_zero_miss: cur.dma_skipped_zero_miss.saturating_sub(prev.dma_skipped_zero_miss),
+            req_dma_experts: cur.dma_experts_landed.saturating_sub(prev.dma_experts_landed),
+            req_dma_bytes: cur.dma_bytes_landed.saturating_sub(prev.dma_bytes_landed),
+            req_dma_overflow: cur.dma_overflow_experts.saturating_sub(prev.dma_overflow_experts),
+            req_dma_wait_ns: cur.dma_host_wait_ns.saturating_sub(prev.dma_host_wait_ns),
+            req_growth_refusals: cur.growth_refusals.saturating_sub(prev.growth_refusals),
+            req_cpu_site_jobs: cur.cpu_site_jobs.saturating_sub(prev.cpu_site_jobs),
+            req_cpu_site_experts: cur.cpu_site_experts.saturating_sub(prev.cpu_site_experts),
+        };
+        *prev = cur;
+        delta
+    }
+
+    /// Formatted per-request delta summary line with current residency, or
+    /// `None` when no engagement activity occurred during the request.
+    pub(super) fn request_summary_line(
+        &self,
+        cpu_site_jobs: u64,
+        cpu_site_experts: u64,
+        residency: ResidencySnapshot,
+    ) -> Option<String> {
+        let delta = self.take_request_delta(cpu_site_jobs, cpu_site_experts);
+        delta.has_activity().then(|| delta.format_request_line(residency))
+    }
+
+    /// Formatted cumulative load summary line with current residency, or
+    /// `None` when no decode engagement occurred.
+    pub(super) fn summary_line_with(
+        &self,
+        cpu_site_jobs: u64,
+        cpu_site_experts: u64,
+        residency: ResidencySnapshot,
+    ) -> Option<String> {
+        let snap = self.snapshot_with_site(cpu_site_jobs, cpu_site_experts);
+        snap.has_activity().then(|| snap.format_line(residency))
+    }
+
+    #[cfg(test)]
+    pub(super) fn summary_line(&self) -> Option<String> {
+        self.summary_line_with(0, 0, ResidencySnapshot::default())
+    }
+}
+
+const ROUTE_STATS_M: [usize; 6] = [1, 2, 4, 6, 8, 12];
+const ROUTE_STATS_K: [usize; 5] = [8, 16, 32, 64, 128];
+const ROUTE_STATS_MAX_M: usize = 12;
+
+fn route_stats_enabled() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        std::env::var("MAGNITUDE_ROUTE_STATS")
+            .ok()
+            .is_some_and(|v| matches!(v.as_str(), "1" | "true" | "TRUE" | "yes" | "YES"))
+    })
+}
+
+/// Empirical floor telemetry (`MAGNITUDE_ROUTE_STATS=1`): tracks per-layer
+/// expert histograms `hist[L][E]` and sliding windows `win[L]` (cap 12) to
+/// report `R(M)`, `H_l(k)`, and uniform vs water-filling optimal hit rates on
+/// request close. Zero overhead when `MAGNITUDE_ROUTE_STATS` is unset.
+struct RouteStats {
+    hist: Vec<Vec<u64>>,
+    total_picks: Vec<u64>,
+    tokens: u64,
+    win: Vec<VecDeque<Vec<usize>>>,
+    unique_sum: [u64; ROUTE_STATS_M.len()],
+    unique_samples: [u64; ROUTE_STATS_M.len()],
+    seen: Vec<u32>,
+    stamp: u32,
+}
+
+impl RouteStats {
+    fn new(experts: &[usize]) -> Self {
+        let max_experts = experts.iter().copied().max().unwrap_or(0);
+        Self {
+            hist: experts.iter().map(|&n| vec![0u64; n]).collect(),
+            total_picks: vec![0u64; experts.len()],
+            tokens: 0,
+            win: (0..experts.len()).map(|_| VecDeque::with_capacity(ROUTE_STATS_MAX_M)).collect(),
+            unique_sum: [0; ROUTE_STATS_M.len()],
+            unique_samples: [0; ROUTE_STATS_M.len()],
+            seen: vec![0u32; max_experts],
+            stamp: 0,
+        }
+    }
+
+    fn record_token(&mut self, token_experts: Vec<Vec<usize>>) {
+        self.tokens += 1;
+        for (layer, experts) in token_experts.into_iter().enumerate() {
+            if layer >= self.hist.len() {
+                break;
+            }
+            let layer_hist = &mut self.hist[layer];
+            for &expert in &experts {
+                if let Some(slot) = layer_hist.get_mut(expert) {
+                    *slot += 1;
+                }
+            }
+            self.total_picks[layer] += experts.len() as u64;
+            let win = &mut self.win[layer];
+            win.push_front(experts);
+            win.truncate(ROUTE_STATS_MAX_M);
+
+            self.stamp = self.stamp.wrapping_add(1);
+            if self.stamp == 0 {
+                self.seen.fill(0);
+                self.stamp = 1;
+            }
+            let stamp = self.stamp;
+            let mut unique = 0u64;
+            let mut m_idx = 0usize;
+            for (depth_idx, past) in win.iter().enumerate() {
+                for &expert in past {
+                    if let Some(mark) = self.seen.get_mut(expert) {
+                        if *mark != stamp {
+                            *mark = stamp;
+                            unique += 1;
+                        }
+                    }
+                }
+                let depth = depth_idx + 1;
+                while m_idx < ROUTE_STATS_M.len() && ROUTE_STATS_M[m_idx] == depth {
+                    self.unique_sum[m_idx] += unique;
+                    self.unique_samples[m_idx] += 1;
+                    m_idx += 1;
+                }
+            }
+        }
+    }
+
+    fn record_step(&mut self, routed: &[RoutedRead], keys: Option<&StepKeys>) {
+        if let Some(keys) = keys.filter(|k| k.layers.len() == routed.len() && k.depths.len() > 1) {
+            let per_layer: Vec<_> = (0..routed.len()).map(|layer| keys.rows(layer)).collect();
+            let rows = per_layer[0].row_count();
+            for row in 0..rows {
+                let token_experts = per_layer.iter().map(|layer_rows| layer_rows.row_experts(row)).collect();
+                self.record_token(token_experts);
+            }
+        } else {
+            let token_experts = routed.iter().map(|read| read.experts.clone()).collect();
+            self.record_token(token_experts);
+        }
+    }
+
+    fn reset(&mut self) {
+        for layer in &mut self.hist {
+            layer.fill(0);
+        }
+        self.total_picks.fill(0);
+        self.tokens = 0;
+        for win in &mut self.win {
+            win.clear();
+        }
+        self.unique_sum = [0; ROUTE_STATS_M.len()];
+        self.unique_samples = [0; ROUTE_STATS_M.len()];
+    }
+
+    fn take_summary_line(&mut self, residency: ResidencySnapshot) -> Option<String> {
+        if self.tokens == 0 {
+            return None;
+        }
+        let num_layers = self.hist.len();
+        let total_all: u64 = self.total_picks.iter().sum();
+        let inv_all = if total_all > 0 { 1.0 / total_all as f64 } else { 0.0 };
+
+        let mut sorted_layers: Vec<Vec<u64>> = self
+            .hist
+            .iter()
+            .map(|counts| {
+                let mut v = counts.clone();
+                v.sort_unstable_by(|a, b| b.cmp(a));
+                v
+            })
+            .collect();
+
+        // Global sorted counts across all (layer, expert) pairs for exact water-filling.
+        let mut all_counts: Vec<u64> = self.hist.iter().flat_map(|c| c.iter().copied()).collect();
+        all_counts.sort_unstable_by(|a, b| b.cmp(a));
+
+        let vram_slots = residency.vram_slots as usize;
+        let host_slots = residency.host_slots as usize;
+        let mem_slots = vram_slots.saturating_add(host_slots);
+
+        let uniform_hit = |per_layer_k: usize| -> f64 {
+            let hits: u64 = sorted_layers
+                .iter()
+                .map(|c| c.iter().take(per_layer_k).sum::<u64>())
+                .sum();
+            hits as f64 * inv_all
+        };
+        let optimal_hit = |per_layer_k: usize| -> f64 {
+            let total_k = per_layer_k.saturating_mul(num_layers);
+            let hits: u64 = all_counts.iter().take(total_k).sum();
+            hits as f64 * inv_all
+        };
+
+        let mut out = String::with_capacity(512 + num_layers * 36);
+        let _ = write!(
+            out,
+            "{{\"tokens\":{},\"layers\":{},\"vram_slots\":{},\"host_slots\":{},\"R\":{{",
+            self.tokens, num_layers, vram_slots, host_slots
+        );
+        for (i, &m) in ROUTE_STATS_M.iter().enumerate() {
+            if i > 0 {
+                out.push(',');
+            }
+            let r_m = if self.unique_samples[i] > 0 {
+                self.unique_sum[i] as f64 / self.unique_samples[i] as f64
+            } else {
+                0.0
+            };
+            let _ = write!(out, "\"{m}\":[{:.3},{:.3}]", r_m, r_m / m as f64);
+        }
+        out.push_str("},\"H_mean\":{");
+        for (i, &k) in ROUTE_STATS_K.iter().enumerate() {
+            if i > 0 {
+                out.push(',');
+            }
+            let _ = write!(out, "\"{k}\":{:.4}", uniform_hit(k));
+        }
+        let _ = write!(
+            out,
+            "}},\"H_vram\":{{\"uniform\":{:.4},\"optimal\":{:.4}}},\"H_mem\":{{\"uniform\":{:.4},\"optimal\":{:.4}}},\"H_layers\":[",
+            uniform_hit(vram_slots),
+            optimal_hit(vram_slots),
+            uniform_hit(mem_slots),
+            optimal_hit(mem_slots),
+        );
+        for (layer, counts) in sorted_layers.iter_mut().enumerate() {
+            if layer > 0 {
+                out.push(',');
+            }
+            out.push('[');
+            let inv_layer = if self.total_picks[layer] > 0 {
+                1.0 / self.total_picks[layer] as f64
+            } else {
+                0.0
+            };
+            let mut prefix = 0u64;
+            let mut cursor = 0usize;
+            for (ki, &k) in ROUTE_STATS_K.iter().enumerate() {
+                let target = k.min(counts.len());
+                while cursor < target {
+                    prefix += counts[cursor];
+                    cursor += 1;
+                }
+                if ki > 0 {
+                    out.push(',');
+                }
+                let _ = write!(out, "{:.3}", prefix as f64 * inv_layer);
+            }
+            out.push(']');
+        }
+        out.push_str("]}");
+
+        self.reset();
+        Some(out)
+    }
+}
+
 /// What serving and steps record of the load, and the routing they read.
 pub(super) struct Telemetry {
     routing: Routing,
@@ -1227,6 +1976,9 @@ pub(super) struct Telemetry {
     /// (`Commitment::slots`, its one owner): every resize of every
     /// placer's, as it happens.
     slots: Arc<AtomicU64>,
+    /// The host slots each layer commits, as the host tier commits them
+    /// (`HostTier::commitment.slots`, its one owner); always 0 without a host tier.
+    host_slots: Arc<AtomicU64>,
     /// The ranking's stack, under a lock of its own: feeding it takes
     /// milliseconds, which no step's completion waits behind, and its
     /// readers read what each feed publishes (`Recorded::ranked`), not the
@@ -1273,6 +2025,11 @@ pub(super) struct Telemetry {
     /// layer, until the step completes or ends ([`Self::block_sampled`]);
     /// under a lock of its own, never held with another.
     sampled: Mutex<BTreeMap<(Step, usize), Sampled>>,
+    /// Real-route drive duty, hidden vs exposed bytes, and prefetch hit/waste
+    /// engagement counters.
+    engagement: DriveEngagement,
+    /// Optional empirical floor telemetry (`MAGNITUDE_ROUTE_STATS=1`).
+    route_stats: Option<Mutex<RouteStats>>,
 }
 
 /// A sampled block run: its spans and the marks at its ends.
@@ -1377,6 +2134,19 @@ impl SiteRequests {
     }
 }
 
+/// Whether the workload is GPU-bound so within-token hint launches
+/// (`routed_hint_route`) add pure GPU overhead without hiding a binding path:
+/// neither drive nor link approaches compute (`max(drive, link) < 0.5 * C`)
+/// and the measured drive busy fraction is below 0.25 (never suppressing while
+/// `drive_busy_fraction` is still `None` / warming up, or on a discrete GPU
+/// whose drive is busy).
+fn hints_suppressed_gpu_bound(terms: magnitude_cost_model::Terms, drive_busy_fraction: Option<f64>) -> bool {
+    let path = terms.drive.max(terms.link);
+    terms.compute > 0.0
+        && path < 0.5 * terms.compute
+        && drive_busy_fraction.is_some_and(|fraction| fraction < 0.25)
+}
+
 impl Telemetry {
     /// The telemetry of `layers` of `extents`, their group reads `reads`,
     /// committing the bank's `slots` slots and each group `records` records,
@@ -1387,6 +2157,7 @@ impl Telemetry {
         reads: GroupReadWords,
         extents: Extents,
         slots: Arc<AtomicU64>,
+        host_slots: Arc<AtomicU64>,
         records: Vec<usize>,
         resident: Option<Vec<u64>>,
         ranking: Ranking,
@@ -1469,6 +2240,7 @@ impl Telemetry {
                 records,
             }),
             slots,
+            host_slots,
             stack: Mutex::new(stack),
             shadows,
             shadows_needed,
@@ -1480,7 +2252,28 @@ impl Telemetry {
             even: Mutex::new(None),
             spans,
             sampled: Mutex::new(BTreeMap::new()),
+            engagement: DriveEngagement::default(),
+            route_stats: route_stats_enabled().then(|| Mutex::new(RouteStats::new(&layers.iter().map(|l| l.experts).collect::<Vec<_>>()))),
             horizon,
+        }
+    }
+
+    pub(super) fn engagement(&self) -> &DriveEngagement {
+        &self.engagement
+    }
+
+    pub(super) fn take_route_stats_summary(&self, residency: ResidencySnapshot) -> Option<String> {
+        self.route_stats
+            .as_ref()
+            .and_then(|stats| stats.lock().expect("route stats").take_summary_line(residency))
+    }
+
+    pub(super) fn residency(&self) -> ResidencySnapshot {
+        ResidencySnapshot {
+            vram_slots: self.slots.load(Ordering::Relaxed),
+            host_slots: self.host_slots.load(Ordering::Relaxed),
+            total_experts: self.routing.experts.first().copied().unwrap_or(0) as u64,
+            ..Default::default()
         }
     }
 
@@ -1589,10 +2382,35 @@ impl Telemetry {
             .collect()
     }
 
-    /// `lines` refined by the load's real work now ([`Self::with_observed`]):
-    /// what the route's policy words are written from.
+    /// `lines` refined by the load's real work now ([`Self::with_observed`]).
     pub(super) fn refined(&self, lines: &[ExpertLines]) -> Arc<[ExpertLines]> {
         self.with_observed(&mut self.lock().costs, lines)
+    }
+
+    /// `lines` refined by the load's real work now, plus per-layer whether
+    /// `host.cpu` reflects live runtime-observed concurrent CPU site requests
+    /// (`costs.site(layer).is_some()`), so `Residency::publish_lines` never
+    /// double-scales already-contended observations with `DomainBudget`.
+    pub(super) fn refined_for_policy(&self, lines: &[ExpertLines]) -> (Arc<[ExpertLines]>, Vec<bool>) {
+        let mut recorded = self.lock();
+        let share = 1. / lines.len().max(1) as f64;
+        let moves = recorded.costs.passes.moves().map(|(link, records)| (link * share, records * share));
+        let mut site_observed = Vec::with_capacity(lines.len());
+        let refined: Arc<[ExpertLines]> = lines
+            .iter()
+            .zip(&self.routing.maps)
+            .enumerate()
+            .map(|(layer, (lines, &(group, _)))| {
+                let site = recorded.costs.site(layer);
+                site_observed.push(site.is_some());
+                lines
+                    .landed_by(self.landing(&recorded.costs, group))
+                    .sited(site)
+                    .passed(recorded.costs.block(layer, lines))
+                    .moving(moves)
+            })
+            .collect();
+        (refined, site_observed)
     }
 
     /// `lines` with each layer's landing line, CPU site line, GPU lines and
@@ -1853,6 +2671,10 @@ impl Telemetry {
                     assert_eq!(first, other, "step {sequence}'s routing records disagree on its guess kinds");
                     first
                 });
+                let row_experts = records
+                    .iter()
+                    .map(|record| record.row_experts(front, selected))
+                    .collect::<Vec<_>>();
                 let records = records.into_iter().map(|record| record.exact(front, selected)).collect::<Vec<_>>();
                 if seismic_io::timeline::recording() {
                     for (layer, record) in records.iter().enumerate() {
@@ -1876,7 +2698,7 @@ impl Telemetry {
                     // first standing choice's source serves every one.
                     chose.dedup_by_key(|chosen| chosen.expert);
                 }
-                Some(((decoded, keys), self.routed(sequence, &records), Self::tiered(&records), chose, Self::absent(&records), blocks, guesses))
+                Some(((decoded, keys), self.routed(sequence, &records), Self::tiered(&records), chose, Self::absent(&records), blocks, guesses, row_experts))
             }
         };
         // The drive's line the pass's reads are timed along, read before
@@ -1902,7 +2724,7 @@ impl Telemetry {
         // Each streamed layer's misses the CPU site served and its request's
         // path time, which the pass's terms count.
         let mut sites = vec![(0u64, Duration::ZERO); layers];
-        if let Some((_, routed, tiered, chose, absent, blocks, _)) = &decoded {
+        if let Some((_, routed, tiered, chose, absent, blocks, _, _)) = &decoded {
             for (experts, read) in cost.experts.iter_mut().zip(routed) {
                 experts.routed = Some(read.clone());
             }
@@ -2026,6 +2848,9 @@ impl Telemetry {
                             Routed::default()
                         }
                     };
+                    if let Some(stats) = &self.route_stats {
+                        stats.lock().expect("route stats").record_step(&decoded.1, decoded.0.1.as_deref());
+                    }
                     // Before the drive's line is measured no read is timed:
                     // the pass's drive counts none. Use transfer time (bytes / D)
                     // rather than `line.latency_seconds()` (saturated queue wait
@@ -2116,10 +2941,10 @@ impl Telemetry {
                 costs.recent.clear();
             }
         }
-        let chose = decoded.map(|((decoded, keys), routed, _, chose, _, _, guesses)| {
+        let chose = decoded.map(|((decoded, keys), routed, _, chose, _, _, guesses, row_experts)| {
             let clock = decoded.launch.map(|_| self.horizon.lock().clock.at(sequence));
             feed_decode(feed, routed, decoded, keys, clock);
-            DecodeRouting { chose, guesses }
+            DecodeRouting { chose, guesses, row_experts }
         });
         // What the step cost in reads, for whoever traces steps (a step slow
         // of its own is read by its misses and reads).
@@ -2431,6 +3256,7 @@ impl Telemetry {
             Source::Ahead(_) | Source::Lead { row: Some(_), .. } => {
                 costs.front.reads += 1;
             }
+            Source::Token => {}
             Source::Exact => unreachable!("no read ahead is an exact request's"),
         }
     }
@@ -2522,16 +3348,29 @@ impl Telemetry {
         whole: &[bool],
         link_line: Option<magnitude_cost_model::ReadLine>,
         prices: Option<&magnitude_cost_model::LaunchPrices>,
-        admitted: impl FnMut(usize, u8, magnitude_cost_model::PathAdmission) -> bool,
+        mut admitted: impl FnMut(usize, u8, magnitude_cost_model::PathAdmission) -> bool,
     ) -> Vec<bool> {
         let drive_line = self.line();
+        let busy = self.engagement.drive_busy_fraction();
         let costs = &mut self.lock().costs;
         let miss = match link_line {
             Some(line) => costs.passes.link_admission(Some(line)),
             None => costs.passes.read_admission(drive_line),
         };
+        // When the workload is GPU-bound (neither drive nor link approaches
+        // compute, and drive busy fraction is below 0.25 on drive-backed
+        // loads), within-token hint launches (`routed_hint_route`) add pure
+        // GPU overhead without hiding a binding path; suppress hint admission
+        // so `HintGate` clears `POLICY_HINTS` cleanly while staying active on
+        // drive-bound or link-bound workloads.
+        let gpu_bound = costs
+            .passes
+            .terms()
+            .is_some_and(|(terms, _)| hints_suppressed_gpu_bound(terms, busy));
         let latest = costs.passes.latest();
-        costs.hints_gate.decide(whole, prices, miss, latest, admitted)
+        costs.hints_gate.decide(whole, prices, miss, latest, |target, lead, miss| {
+            !gpu_bound && admitted(target, lead, miss)
+        })
     }
 
     /// The drive's measured read line, if available.
@@ -3084,5 +3923,222 @@ mod served_tests {
     #[should_panic(expected = "site served 9 of step 1's 1 tier and 7 file misses")]
     fn the_site_serving_more_than_the_step_missed_panics() {
         super::served_within(9, 1, 7, 0, 1);
+    }
+
+    #[test]
+    fn drive_engagement_tracks_busy_fraction_bytes_and_hit_counters() {
+        let engagement = super::DriveEngagement::default();
+        assert!(engagement.summary_line().is_none(), "no activity before decode");
+        engagement.on_decode_began(std::time::Instant::now());
+        engagement.read_started();
+        engagement.read_started();
+        std::thread::sleep(std::time::Duration::from_millis(5));
+        engagement.read_finished();
+        engagement.read_finished();
+        engagement.on_decode_ended(std::time::Instant::now());
+        // Idle gap between requests must NOT dilute drive_busy_fraction.
+        std::thread::sleep(std::time::Duration::from_millis(10));
+        engagement.record_exposed(1_410_000);
+        engagement.record_staged_hit(1_410_000, true);
+        engagement.record_landed_hit(1_410_000, true);
+        engagement.record_landed_hit(1_410_000, false);
+        engagement.record_carryover_wasted();
+
+        let snap = engagement.snapshot();
+        assert!(snap.drive_busy_fraction > 0.70 && snap.drive_busy_fraction <= 1.0, "idle gap must not dilute busy fraction: {snap:?}");
+        assert_eq!(snap.bytes_exposed, 1_410_000);
+        assert_eq!(snap.bytes_hidden, 3 * 1_410_000);
+        assert_eq!(snap.staged_hits, 1);
+        assert_eq!(snap.landed_hits, 2);
+        assert_eq!(snap.carryover_hits, 2);
+        assert_eq!(snap.carryover_wasted, 1);
+        let line = engagement.summary_line().expect("active summary line");
+        assert!(line.contains("drive_busy_fraction="));
+        assert!(line.contains("bytes_hidden=4230000"));
+        assert!(line.contains("bytes_exposed=1410000"));
+        assert!(line.contains("staged_hits=1"));
+        assert!(line.contains("landed_hits=2"));
+        assert!(line.contains("carryover_hits=2"));
+        assert!(line.contains("carryover_wasted=1"));
+    }
+
+    #[test]
+    fn drive_engagement_request_deltas_and_dma_counters() {
+        let engagement = super::DriveEngagement::default();
+        let residency = super::ResidencySnapshot {
+            vram_slots: 63,
+            host_slots: 286,
+            total_experts: 384,
+            vram_held: 2100,
+            vram_capacity: 2200,
+            vram_reserve: 0,
+        };
+        assert!(engagement.request_summary_line(0, 0, residency).is_none());
+
+        // Request 1: drive prefetch + M7 DMA + growth refusal + CPU site jobs
+        engagement.record_exposed(2_000_000);
+        engagement.record_staged_hit(1_000_000, false);
+        engagement.record_landed_hit(1_000_000, true);
+        engagement.record_carryover_wasted();
+        engagement.record_dma_call(false, 6, 8_400_000, 2);
+        engagement.record_dma_call(true, 0, 0, 0);
+        engagement.record_dma_host_wait(std::time::Duration::from_micros(1_250));
+        engagement.record_growth_refusal();
+
+        let line1 = engagement
+            .request_summary_line(42, 126, residency)
+            .expect("request 1 delta line");
+        assert!(line1.contains("req_bytes_hidden=2000000"), "{line1}");
+        assert!(line1.contains("req_bytes_exposed=2000000"), "{line1}");
+        assert!(line1.contains("req_staged_hits=1"), "{line1}");
+        assert!(line1.contains("req_landed_hits=1"), "{line1}");
+        assert!(line1.contains("req_carryover_hits=1"), "{line1}");
+        assert!(line1.contains("req_carryover_wasted=1"), "{line1}");
+        assert!(line1.contains("req_dma_calls=2"), "{line1}");
+        assert!(line1.contains("req_dma_skipped_zero_miss=1"), "{line1}");
+        assert!(line1.contains("req_dma_experts=6"), "{line1}");
+        assert!(line1.contains("req_dma_bytes=8400000"), "{line1}");
+        assert!(line1.contains("req_dma_overflow=2"), "{line1}");
+        assert!(line1.contains("req_dma_wait_ms=1.250"), "{line1}");
+        assert!(line1.contains("req_growth_refusals=1"), "{line1}");
+        assert!(line1.contains("req_cpu_site_jobs=42"), "{line1}");
+        assert!(line1.contains("req_cpu_site_experts=126"), "{line1}");
+        assert!(line1.contains("vram_slots=63 host_slots=286 total_experts=384 vram_held=2100/2200 vram_reserve=0"), "{line1}");
+
+        // Second call with no new activity yields None (baseline advanced)
+        assert!(engagement.request_summary_line(42, 126, residency).is_none());
+
+        // Request 2: only new activity appears in delta (never cumulative from request 1)
+        engagement.record_exposed(500_000);
+        engagement.record_dma_call(false, 3, 4_200_000, 0);
+        engagement.record_dma_host_wait(std::time::Duration::from_micros(500));
+        let line2 = engagement
+            .request_summary_line(50, 150, residency)
+            .expect("request 2 delta line");
+        assert!(line2.contains("req_bytes_hidden=0"), "{line2}");
+        assert!(line2.contains("req_bytes_exposed=500000"), "{line2}");
+        assert!(line2.contains("req_staged_hits=0"), "{line2}");
+        assert!(line2.contains("req_landed_hits=0"), "{line2}");
+        assert!(line2.contains("req_dma_calls=1"), "{line2}");
+        assert!(line2.contains("req_dma_skipped_zero_miss=0"), "{line2}");
+        assert!(line2.contains("req_dma_experts=3"), "{line2}");
+        assert!(line2.contains("req_dma_bytes=4200000"), "{line2}");
+        assert!(line2.contains("req_dma_overflow=0"), "{line2}");
+        assert!(line2.contains("req_dma_wait_ms=0.500"), "{line2}");
+        assert!(line2.contains("req_growth_refusals=0"), "{line2}");
+        assert!(line2.contains("req_cpu_site_jobs=8"), "{line2}");
+        assert!(line2.contains("req_cpu_site_experts=24"), "{line2}");
+
+        // Cumulative snapshot still holds the sum of both requests
+        let total = engagement.snapshot_with_site(50, 150);
+        assert_eq!(total.bytes_exposed, 2_500_000);
+        assert_eq!(total.dma_calls, 3);
+        assert_eq!(total.dma_skipped_zero_miss, 1);
+        assert_eq!(total.dma_experts_landed, 9);
+        assert_eq!(total.dma_bytes_landed, 12_600_000);
+        assert_eq!(total.dma_overflow_experts, 2);
+        assert_eq!(total.dma_host_wait_ns, 1_750_000);
+        assert_eq!(total.growth_refusals, 1);
+        assert_eq!(total.cpu_site_jobs, 50);
+        assert_eq!(total.cpu_site_experts, 150);
+    }
+
+    #[test]
+    fn route_stats_computes_r_of_m_h_l_of_k_and_water_filling_optimality() {
+        use super::{ResidencySnapshot, RouteStats, RoutedRead};
+        // Two layers of 128 experts each.
+        // Layer 0 (skewed): always routes the exact same 2 experts [0, 1] ->
+        //   R_0(M) = 2 for all M, H_0(2) = 1.0, H_0(8) = 1.0.
+        // Layer 1 (flat): routes 2 distinct experts every step [2*t % 128, (2*t+1) % 128] ->
+        //   R_1(M) = 2*M for M <= 12, H_1(k) = min(k, 24) / 24 over 12 steps.
+        let mut stats = RouteStats::new(&[128, 128]);
+        let residency = ResidencySnapshot { vram_slots: 1, host_slots: 1, total_experts: 128, ..Default::default() };
+        assert!(stats.take_summary_line(residency).is_none(), "empty stats emits nothing");
+
+        for step in 0..12usize {
+            let routed = vec![
+                RoutedRead { sequence: step as u64 + 1, layer: 0, experts: vec![0, 1], choices: 2 },
+                RoutedRead { sequence: step as u64 + 1, layer: 1, experts: vec![step * 2, step * 2 + 1], choices: 2 },
+            ];
+            stats.record_step(&routed, None);
+        }
+        let line = stats.take_summary_line(residency).expect("12 tokens recorded");
+        // Verify single-line JSON structure and exact values:
+        // Mean R(M) across layer 0 (const 2) and layer 1 (2*M):
+        //   M=1: (2 + 2)/2 = 2.000, ratio = 2.000
+        //   M=2: (2 + 4)/2 = 3.000, ratio = 1.500
+        //   M=4: (2 + 8)/2 = 5.000, ratio = 1.250
+        //   M=6: (2 + 12)/2 = 7.000, ratio = 1.167
+        //   M=8: (2 + 16)/2 = 9.000, ratio = 1.125
+        //   M=12: (2 + 24)/2 = 13.000, ratio = 1.083
+        assert!(!line.contains('\n'), "must be single-line: {line}");
+        assert!(line.contains("\"tokens\":12,\"layers\":2,\"vram_slots\":1,\"host_slots\":1"), "{line}");
+        assert!(line.contains("\"1\":[2.000,2.000]"), "{line}");
+        assert!(line.contains("\"2\":[3.000,1.500]"), "{line}");
+        assert!(line.contains("\"4\":[5.000,1.250]"), "{line}");
+        assert!(line.contains("\"6\":[7.000,1.167]"), "{line}");
+        assert!(line.contains("\"8\":[9.000,1.125]"), "{line}");
+        assert!(line.contains("\"12\":[13.000,1.083]"), "{line}");
+        // At vram_slots = 1/layer (total 2 slots across 2 layers, 48 total picks):
+        //   Uniform (1 slot each): layer 0 gets 12 hits, layer 1 gets 1 hit -> 13/48 = 0.2708
+        //   Optimal water-filling (2 slots to layer 0): 24/48 = 0.5000!
+        assert!(
+            line.contains("\"H_vram\":{\"uniform\":0.2708,\"optimal\":0.5000}"),
+            "expected exact uniform vs optimal water-filling VRAM hit rates: {line}"
+        );
+        // At mem_slots = 2/layer (total 4 slots across 2 layers):
+        //   Uniform (2 slots each): layer 0 gets 24 hits, layer 1 gets 2 hits -> 26/48 = 0.5417
+        //   Optimal (2 slots to layer 0, 2 to layer 1): 26/48 = 0.5417
+        assert!(line.contains("\"H_mem\":{\"uniform\":0.5417,\"optimal\":0.5417}"), "{line}");
+        // Per-layer H_l(k) at k = [8, 16, 32, 64, 128]:
+        //   Layer 0: [1.000,1.000,1.000,1.000,1.000]
+        //   Layer 1 (24 distinct experts each picked once): [8/24=0.333, 16/24=0.667, 1.000, 1.000, 1.000]
+        assert!(
+            line.contains("\"H_layers\":[[1.000,1.000,1.000,1.000,1.000],[0.333,0.667,1.000,1.000,1.000]]"),
+            "{line}"
+        );
+        // Reset after dump:
+        assert!(stats.take_summary_line(residency).is_none(), "stats must reset after request dump");
+    }
+
+    #[test]
+    fn gpu_bound_hint_suppression_preserves_drive_and_link_bound_workloads() {
+        use magnitude_cost_model::Terms;
+
+        // M4 Pro Qwen3.8 87.5% resident: GPU-bound, drive_busy_fraction=0.043.
+        let gpu_bound_terms = Terms { compute: 0.030, drive: 0.0014, link: 0.0, cpu: 0.0, memory: 0.0 };
+        assert!(super::hints_suppressed_gpu_bound(gpu_bound_terms, Some(0.043)));
+        // Never suppress while drive_busy_fraction is still None (warming up).
+        assert!(!super::hints_suppressed_gpu_bound(gpu_bound_terms, None));
+
+        // Drive busy >= 0.25 keeps hints active even if mean drive term is still ramping.
+        assert!(!super::hints_suppressed_gpu_bound(gpu_bound_terms, Some(0.25)));
+        assert!(!super::hints_suppressed_gpu_bound(gpu_bound_terms, Some(0.80)));
+
+        // Drive-bound (GLM-5.3 / DeepSeek on M2 Pro / M4 Pro): hints stay active.
+        let drive_bound_terms = Terms { compute: 0.030, drive: 0.045, link: 0.0, cpu: 0.0, memory: 0.0 };
+        assert!(!super::hints_suppressed_gpu_bound(drive_bound_terms, Some(0.85)));
+        assert!(!super::hints_suppressed_gpu_bound(drive_bound_terms, Some(0.10)));
+
+        // Link-bound discrete GPU (100% RAM, drive_busy_fraction=0.0): hints stay active.
+        let link_bound_terms = Terms { compute: 0.030, drive: 0.0, link: 0.020, cpu: 0.0, memory: 0.0 };
+        assert!(!super::hints_suppressed_gpu_bound(link_bound_terms, Some(0.0)));
+
+        // Discrete GPU (terms.link > 0) with active drive (978bf6b5: RTX 5090
+        // Qwen3.8, drive_busy_fraction = 0.268) or warming up (None): hints stay active.
+        let light_link_terms = Terms { compute: 0.030, drive: 0.002, link: 0.005, cpu: 0.0, memory: 0.0 };
+        assert!(!super::hints_suppressed_gpu_bound(light_link_terms, Some(0.268)));
+        assert!(!super::hints_suppressed_gpu_bound(light_link_terms, Some(0.25)));
+        assert!(!super::hints_suppressed_gpu_bound(light_link_terms, None));
+        // Only suppress when both path < 0.5 * compute AND drive_busy_fraction < 0.25.
+        assert!(super::hints_suppressed_gpu_bound(light_link_terms, Some(0.0)));
+
+        // DriveEngagement::drive_busy_fraction returns None before decode bursts, Some after.
+        let engagement = super::DriveEngagement::default();
+        assert!(engagement.drive_busy_fraction().is_none());
+        let t0 = std::time::Instant::now();
+        engagement.on_decode_began(t0);
+        engagement.on_decode_ended(t0 + std::time::Duration::from_millis(10));
+        assert_eq!(engagement.drive_busy_fraction(), Some(0.0));
     }
 }

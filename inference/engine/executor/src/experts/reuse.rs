@@ -277,6 +277,17 @@ impl Rank {
     }
 }
 
+/// An absent expert candidate for cross-burst / idle-window foresight
+/// (`Reuse::next_step_candidates`), carrying its live-calibrated next-step
+/// probability `p_next` (`lead_probs[0]`) alongside its full-turnover `Rank`.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct NextCandidate {
+    pub layer: usize,
+    pub expert: usize,
+    pub p_next: f64,
+    pub rank: Rank,
+}
+
 /// A read the ranking has not logged yet: its step (a decode landing's, or
 /// a running prompt group's latest). Later reads order after earlier ones.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
@@ -1007,6 +1018,9 @@ impl Reuse {
                 if rank.expected <= Expected::ZERO {
                     break;
                 }
+                if rank.last().is_none() {
+                    continue;
+                }
                 if accept(layer, expert) {
                     best.push((rank, layer, expert));
                     taken += 1;
@@ -1019,6 +1033,64 @@ impl Reuse {
         if self.order.len() > 1 {
             best.sort_unstable_by(|a, b| b.0.cmp(&a.0));
             best.truncate(limit);
+        }
+        best
+    }
+
+    /// Up to `limit` absent experts ranked by their live-calibrated next-step
+    /// probability `p_next = lead_probs[0]` (derived from the most recent
+    /// burst's router scores and sequence history), tie-broken by full-turnover
+    /// `Rank` and layer index. When `layer_order` is true, the selected top
+    /// `limit` candidates are returned in earliest-deadline-first order
+    /// (`layer` ascending, then `p_next` descending).
+    pub fn next_step_candidates(
+        &self,
+        limit: usize,
+        layer_order: bool,
+        mut accept: impl FnMut(usize, usize) -> bool,
+    ) -> Vec<NextCandidate> {
+        if limit == 0 || self.order.is_empty() {
+            return Vec::new();
+        }
+        let rates = front_rates(&self.stands);
+        let epochs: Vec<u64> = {
+            let times = self.time.lock();
+            (0..self.order.len()).map(|group| times.group_epoch(group)).collect()
+        };
+        let scan_limit = limit.saturating_mul(4).max(32);
+        let mut best = Vec::with_capacity(scan_limit.min(256));
+        for (group, group_order) in self.order.iter().enumerate() {
+            let epoch = epochs[group];
+            let mut taken = 0;
+            for &(rank, layer, expert) in group_order.iter().rev() {
+                if rank.expected <= Expected::ZERO {
+                    break;
+                }
+                if rank.last().is_none() {
+                    continue;
+                }
+                if !accept(layer, expert) {
+                    continue;
+                }
+                let p_next = lead_probs(&self.layers[layer], &self.history, layer, expert, &rates, epoch)[0];
+                if p_next > 0.0 {
+                    best.push(NextCandidate { layer, expert, p_next, rank });
+                    taken += 1;
+                    if taken >= scan_limit {
+                        break;
+                    }
+                }
+            }
+        }
+        best.sort_unstable_by(|a, b| {
+            b.p_next
+                .total_cmp(&a.p_next)
+                .then_with(|| b.rank.cmp(&a.rank))
+                .then_with(|| a.layer.cmp(&b.layer))
+        });
+        best.truncate(limit);
+        if layer_order {
+            best.sort_unstable_by(|a, b| a.layer.cmp(&b.layer).then_with(|| b.p_next.total_cmp(&a.p_next)));
         }
         best
     }
@@ -1104,33 +1176,65 @@ impl Reuse {
         Rank::new(expected, self.layers[layer].last_read(expert))
     }
 
+    /// Maximum weight of the current prompt's empirical routing rate vs prior
+    /// decode history when seeding a warm bank (`calibration.has_decode()`).
+    const PROMPT_SEED_MAX_WEIGHT: f64 = 0.85;
+    /// Prior pseudo-count in tokens for Bayesian prompt-vs-decode blending:
+    /// tiny 1–2 token prompts preserve warm decode holdings while multi-token
+    /// prefills converge smoothly to `PROMPT_SEED_MAX_WEIGHT`.
+    const PROMPT_SEED_PRIOR_TOKENS: f64 = 8.0;
+
+    #[inline]
+    fn prompt_seed_weight(routed_total: f64, active: f64) -> f64 {
+        if routed_total <= 0.0 || active <= 0.0 {
+            return 0.0;
+        }
+        let prompt_tokens = routed_total / active;
+        Self::PROMPT_SEED_MAX_WEIGHT * (prompt_tokens / (prompt_tokens + Self::PROMPT_SEED_PRIOR_TOKENS))
+    }
+
+    /// Whether `layer`'s `in_top` pool reflects a *previous* request's decode
+    /// rather than the current request's prefill (true when decode steps have
+    /// run since the last `Evidence::Prompt` was logged).
+    pub(crate) fn has_stale_decode_pool(&self, layer: usize) -> bool {
+        self.layers[layer].has_stale_decode_pool()
+    }
+
     /// The ranks of a prompt group's seeds of `layer` at tier 0 for
     /// `Reader::Move` (a seed displaces), each `routed` entry `(expert, its
-    /// count in the union, the step that last routed it)` in order: ranked by
-    /// the `prompt` table with prior = its count share (`Rows::union`), at
-    /// the limit order before any decode step (design §3.7 Seeds, §4).
+    /// count in the union, the step that last routed it)` in order. During a
+    /// cold or already-prompt-logged prefill (`!has_stale_decode_pool`),
+    /// ranked by the `prompt` table with prior = its count share
+    /// (`Rows::union`); when entering a new request's prefill on a warm bank
+    /// from a previous request (`has_stale_decode_pool`), blends the current
+    /// prompt's empirical routing rate with prior decode history weighted by
+    /// prompt token count (`prompt_tokens / (prompt_tokens + 8)`, capped at
+    /// `0.85`) so multi-token prefills replace stale previous-request experts
+    /// while shared universal experts stay highest and 1-token prompts do not
+    /// thrash warm decode holdings.
     pub fn rank_union(&self, layer: usize, routed: &[(usize, u32, Step)]) -> Vec<Rank> {
         if routed.is_empty() {
             return Vec::new();
         }
         let group = self.groups[layer];
         let calibration = &self.layers[layer];
-        // Once a decode step has been logged, prompt evidence has left the
-        // ranking (§4): score candidates with the same decode `Ranker` that
-        // `store_rank` uses for kept records, never mixing `Form::Prompt`
-        // candidates against `Form::Decode` victims.
-        if calibration.has_decode() {
-            let ranker = self.ranker(group, Tier::COMPUTE, Reader::Move);
+        let (horizon, a_bar, epoch) = self.horizon_of(group, Tier::COMPUTE, Reader::Move);
+        if calibration.has_stale_decode_pool() {
+            let total: f64 = routed.iter().map(|&(_, count, _)| f64::from(count)).sum();
+            let active = calibration.active() as f64;
+            let w = Self::prompt_seed_weight(total, active);
             return routed
                 .iter()
-                .map(|&(expert, _, last)| {
-                    let expected = ranker.expected(layer, expert, None);
+                .map(|&(expert, count, last)| {
+                    let prompt_rate = if total > 0.0 { (active * f64::from(count) / total).min(1.0) } else { 0.0 };
+                    let prior_rate = calibration.history_prob(expert, &self.history, layer);
+                    let p_inf = (w * prompt_rate + (1.0 - w) * prior_rate).clamp(0.0, 1.0);
+                    let expected = expected_from([p_inf; DEPTHS], p_inf, horizon, a_bar, None);
                     let last = calibration.last_read(expert).max(Some(last));
                     Rank::new(expected, last)
                 })
                 .collect();
         }
-        let (horizon, a_bar, epoch) = self.horizon_of(group, Tier::COMPUTE, Reader::Move);
         let probs_all = calibration.prompt_probs(routed, epoch, &self.history, layer);
         routed
             .iter()
@@ -1142,6 +1246,52 @@ impl Reuse {
                 Rank::new(expected, last)
             })
             .collect()
+    }
+
+    /// Prompt-aware rank for a currently held record `(owner, expert)` during
+    /// `seed_layer`'s prefill seeding at `group_first`, on the exact same
+    /// `Expected` scale as [`Self::rank_union`]. When `owner` does not have a
+    /// stale previous-request decode pool (`!has_stale_decode_pool`), uses
+    /// `ranker.expected(owner, expert, None)` unchanged so multi-chunk prefills
+    /// never thrash earlier chunks of the same request. When `owner` holds a
+    /// stale previous-request decode pool, scores `(owner, expert)` under the
+    /// same Bayesian `w * prompt_rate + (1 - w) * prior_rate` blend.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn seed_held_rank(
+        &self,
+        ranker: Ranker<'_>,
+        seed_layer: usize,
+        routed: &[(usize, u32, Step)],
+        routed_total: f64,
+        group_first: Step,
+        owner: usize,
+        expert: usize,
+        last: Option<Step>,
+    ) -> Rank {
+        let calibration = &self.layers[owner];
+        if !calibration.has_stale_decode_pool() {
+            return Rank::new(ranker.expected(owner, expert, None), last);
+        }
+        let w = Self::prompt_seed_weight(routed_total, self.layers[seed_layer].active() as f64);
+        let prior_rate = calibration.history_prob(expert, &self.history, owner);
+        let p_inf = if owner == seed_layer {
+            let count = routed
+                .iter()
+                .find_map(|&(e, c, _)| (e == expert).then_some(c))
+                .unwrap_or(0);
+            let prompt_rate = if routed_total > 0.0 {
+                (calibration.active() as f64 * f64::from(count) / routed_total).min(1.0)
+            } else {
+                0.0
+            };
+            (w * prompt_rate + (1.0 - w) * prior_rate).clamp(0.0, 1.0)
+        } else if last.is_some_and(|step| step >= group_first) {
+            prior_rate
+        } else {
+            ((1.0 - w) * prior_rate).clamp(0.0, 1.0)
+        };
+        let expected = expected_from([p_inf; DEPTHS], p_inf, ranker.horizon, ranker.a_bar, None);
+        Rank::new(expected, last)
     }
 
     /// Memory charge of the ranking: its per-layer calibration tables, history
@@ -1599,12 +1749,110 @@ pub(super) mod tests {
         }
         log(&mut reuse, &time, read(5, &[3, 5]));
         // Expert 3 is already resident (rejected by `accept`): top 2 lacked must
-        // be the carried-over experts 5 and 1 (strictly ahead of never-seen
-        // experts' prior), in descending rank order, never returning 3.
+        // be expert 1 (used 4/5 steps) ahead of expert 5 (used 1/5 steps),
+        // both strictly ahead of never-seen experts' prior, never returning 3.
         let top = reuse.top_candidates(2, |_layer, expert| expert != 3);
         let experts: Vec<usize> = top.iter().map(|&(_, _, expert)| expert).collect();
-        assert_eq!(experts, vec![5, 1], "must return top lacked experts in descending rank order: {top:?}");
+        assert_eq!(experts, vec![1, 5], "must return top lacked experts in descending rank order: {top:?}");
         assert!(top[0].0 >= top[1].0, "must be sorted descending by Rank: {top:?}");
         assert!(top.iter().all(|&(rank, _, _)| rank.expected() > Expected::ZERO));
+    }
+
+    /// `Reuse::next_step_candidates` ranks absent experts by their calibrated
+    /// next-step probability `p_next` (`lead_probs[0]`) and optionally sorts
+    /// the top `limit` earliest-layer-first (`layer_order == true`).
+    #[test]
+    fn next_step_candidates_ranks_by_p_next_and_supports_layer_order() {
+        let time = time_for(&[4]);
+        let mut reuse = Reuse::new(&[8, 8], &[0, 0], &[4], time.clone());
+        let read_at = |sequence: Step, layer: usize, picked: &[usize]| RoutedRead {
+            sequence,
+            layer,
+            experts: picked.to_vec(),
+            choices: picked.len() as u64,
+        };
+        for step in 1..=4 {
+            log(&mut reuse, &time, read_at(step, 0, &[1, 3]));
+            reuse.read(&read_at(step, 1, &[2, 4]), None, Evidence::Decode);
+        }
+        // Without layer_order: descending by p_next.
+        let by_prob = reuse.next_step_candidates(4, false, |layer, expert| {
+            !(layer == 0 && expert == 3) && !(layer == 1 && expert == 4)
+        });
+        assert!(!by_prob.is_empty(), "must return calibrated next-step candidates");
+        assert!(by_prob.iter().all(|c| c.p_next > 0.0 && c.p_next <= 1.0));
+        assert!(by_prob.windows(2).all(|w| w[0].p_next >= w[1].p_next));
+        // With layer_order: earliest layer first (layer 0 before layer 1).
+        let by_layer = reuse.next_step_candidates(4, true, |layer, expert| {
+            !(layer == 0 && expert == 3) && !(layer == 1 && expert == 4)
+        });
+        assert_eq!(by_layer.len(), by_prob.len());
+        assert!(by_layer.windows(2).all(|w| {
+            w[0].layer < w[1].layer || (w[0].layer == w[1].layer && w[0].p_next >= w[1].p_next)
+        }));
+    }
+
+    /// Mixed-layer skew-weighted residency: a skewed stationary layer and a
+    /// uniform/flat (or bursty) layer sharing a group select per-layer
+    /// half-lives independently, and `Reuse::retop` allocates strictly more
+    /// pool slots to the skewed layer.
+    #[test]
+    fn mixed_skew_and_flat_layers_allocate_strictly_more_slots_to_skewed_layer() {
+        let time = time_for(&[8]);
+        let mut reuse = Reuse::new(&[64, 64], &[0, 0], &[8], time.clone());
+        // Short run (16 steps) where cold-start tie-breaking matters:
+        // Layer 0: skewed — experts 0..6 repeat heavily (6 hot experts, 2 per step).
+        // Layer 1: flat/uniform — distinct experts cycling across all 64 (2 per step).
+        for step in 1..=16u64 {
+            register_front(&time, step);
+            let s = step as usize;
+            let mut skewed = vec![(s * 2) % 6, (s * 2 + 1) % 6];
+            skewed.sort_unstable();
+            let mut flat = vec![(s * 2) % 64, (s * 2 + 1) % 64];
+            flat.sort_unstable();
+            reuse.read(&RoutedRead { sequence: step, layer: 0, experts: skewed, choices: 2 }, None, Evidence::Decode);
+            reuse.read(&RoutedRead { sequence: step, layer: 1, experts: flat, choices: 2 }, None, Evidence::Decode);
+            time.lock().moved(0, Tier::COMPUTE);
+        }
+        let top_skewed = (0..64).filter(|&e| reuse.in_top(0, e)).count();
+        let top_flat = (0..64).filter(|&e| reuse.in_top(1, e)).count();
+        assert_eq!(top_skewed + top_flat, 8);
+        assert!(
+            top_skewed > top_flat,
+            "skewed layer 0 must receive strictly more slots than flat layer 1: skewed={top_skewed}, flat={top_flat}"
+        );
+        assert_eq!(top_skewed, 6, "all 6 hot experts of skewed layer 0 should be in_top");
+
+        // Now test distinct per-layer half-lives in the same group:
+        // Layer 0: stationary skewed (expert 0..4 hot, plus cold tail).
+        // Layer 1: shifting bursts of 2 experts for 6 steps each (short half-life wins).
+        let time2 = time_for(&[8]);
+        let mut reuse2 = Reuse::new(&[128, 128], &[0, 0], &[8], time2.clone());
+        for step in 1..=240u64 {
+            register_front(&time2, step);
+            let s = step as usize;
+            let hot = s % 6;
+            let cold = 6 + (s % 122);
+            let mut skewed = vec![hot, cold];
+            skewed.sort_unstable();
+            let burst = ((step - 1) / 6) as usize;
+            let a = (burst * 2) % 126 + 1;
+            let b = a + 1;
+            reuse2.read(&RoutedRead { sequence: step, layer: 0, experts: skewed, choices: 2 }, None, Evidence::Decode);
+            reuse2.read(&RoutedRead { sequence: step, layer: 1, experts: vec![a, b], choices: 2 }, None, Evidence::Decode);
+            if step % 4 == 0 {
+                time2.lock().moved(0, Tier::COMPUTE);
+            }
+        }
+        assert!(
+            reuse2.history.half_life(0) > reuse2.history.half_life(1),
+            "skewed layer 0 half-life ({}) must exceed bursty layer 1 half-life ({})",
+            reuse2.history.half_life(0),
+            reuse2.history.half_life(1),
+        );
+        let top0 = (0..128).filter(|&e| reuse2.in_top(0, e)).count();
+        let top1 = (0..128).filter(|&e| reuse2.in_top(1, e)).count();
+        assert_eq!(top0 + top1, 8);
+        assert!(top0 > top1, "skewed layer 0 ({top0}) must out-allocate bursty layer 1 ({top1})");
     }
 }

@@ -347,6 +347,7 @@ impl StreamedLayers {
         hint_leads: u64,
         num_layers: u64,
         decode_rows: u64,
+        saturation_bytes: u64,
     ) -> Option<crate::PathRecords> {
         assert!(decode_rows > 0, "invariant violated: path_records decode_rows must be positive");
         let single = self.prepare(None, held, 1.0);
@@ -364,7 +365,22 @@ impl StreamedLayers {
         } else {
             hint_leads as f64 * (burst_reads / num_layers as f64)
         };
-        crate::PathRecords::of(read, bytes, queue, crate::PathRecords::release(step, single_reads))
+        let mut records = crate::PathRecords::of(read, bytes, queue, crate::PathRecords::release(step, single_reads))?;
+        // Derive multi-row verify staging concurrency directly from the
+        // volume's measured storage saturation window (`saturation_bytes`,
+        // e.g. `FULL_DEPTH * FULL_READ`) divided by `bytes`, bounded by the
+        // burst's own expected miss count so small models never over-allocate
+        // staging past a single burst's reads.
+        if decode_rows > 1 && burst_reads > 0.0 && bytes > 0 && saturation_bytes > 0 {
+            let transfer = read.transfer_seconds(bytes as f64);
+            if transfer > 0.0 {
+                let burst_misses = (burst_reads / transfer).ceil() as u64;
+                let knee_records = saturation_bytes.div_ceil(bytes).min(burst_misses);
+                records.ahead = records.ahead.max(knee_records);
+                records.reserve = records.reserve.max(records.ahead);
+            }
+        }
+        Some(records)
     }
 }
 

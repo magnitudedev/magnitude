@@ -112,6 +112,35 @@ impl DomainBudget {
         }
         ((self.dma_bytes_per_sec.max(0.0) + self.landing_bytes_per_sec.max(0.0)) / self.memory_bytes_per_sec).clamp(0.0, 0.95)
     }
+
+    /// Slowdown factor on CPU expert weight reads when running concurrently
+    /// with active DMA and NVMe landing traffic on the same shared memory
+    /// domain (e.g. Host DDR5).
+    ///
+    /// Models the additive concurrent bandwidth available to CPU compute:
+    /// `b_cpu_eff = min(b_cpu_solo, max(b_mem - (b_dma + b_landing), 0.25 * b_cpu_solo))`,
+    /// scaled by a small headroom margin (`1.12`) when concurrent traffic is
+    /// active so CPU-sited experts finish slightly before GPU `ROUTED_SITE_AWAIT`.
+    ///
+    /// Returns `1.0` when no concurrent DMA/landing traffic is active or when
+    /// `memory_bytes_per_sec` / `cpu_solo_bytes_per_sec` is unmeasured.
+    pub fn concurrent_cpu_scale(&self, cpu_solo_bytes_per_sec: f64) -> f64 {
+        const CONCURRENT_CPU_FLOOR_FRACTION: f64 = 0.25;
+        const CONCURRENT_CPU_HEADROOM_FACTOR: f64 = 1.12;
+        let other = self.dma_bytes_per_sec.max(0.0) + self.landing_bytes_per_sec.max(0.0);
+        if other <= 0.0
+            || self.memory_bytes_per_sec <= 0.0
+            || !self.memory_bytes_per_sec.is_finite()
+            || cpu_solo_bytes_per_sec <= 0.0
+            || !cpu_solo_bytes_per_sec.is_finite()
+        {
+            return 1.0;
+        }
+        let remaining = (self.memory_bytes_per_sec - other).max(0.0);
+        let floor = CONCURRENT_CPU_FLOOR_FRACTION * cpu_solo_bytes_per_sec;
+        let effective = cpu_solo_bytes_per_sec.min(remaining.max(floor));
+        (cpu_solo_bytes_per_sec / effective) * CONCURRENT_CPU_HEADROOM_FACTOR
+    }
 }
 
 /// One token's terms: each resource's busy seconds a token
@@ -226,38 +255,43 @@ mod tests {
     }
 
     #[test]
-    fn domain_budget_computes_continuous_dma_and_landing_share_clamped() {
-        // Idle: 0% load.
-        let idle = DomainBudget::new(0.0, 0.0, 60e9);
-        assert_eq!(idle.load(), 0.0);
-
-        // 48 GB/s PCIe 5 DMA + 0 NVMe on 60 GB/s DDR5 -> 80% load -> 5x CPU 1-row scaling.
-        let dma_only = DomainBudget::new(48e9, 0.0, 60e9);
-        assert!((dma_only.load() - 0.80).abs() < 1e-12);
-
-        // 48 GB/s DMA + 6 GB/s NVMe landing on 60 GB/s DDR5 -> 90% load -> 10x CPU 1-row scaling.
-        let dma_and_nvme = DomainBudget::new(48e9, 6e9, 60e9);
-        assert!((dma_and_nvme.load() - 0.90).abs() < 1e-12);
-
-        // Saturated (> 95%): clamped to 0.95 -> 20x max scaling, never infinite/NaN.
-        let saturated = DomainBudget::new(55e9, 10e9, 60e9);
-        assert_eq!(saturated.load(), 0.95);
-
-        // Unmeasured memory bandwidth: 0% load.
-        assert_eq!(DomainBudget::new(48e9, 6e9, 0.0).load(), 0.0);
-
-        // Verify CpuLines::with_domain_budget scales only `expert.one`, leaving `expert.row` and `handshake` untouched.
+    fn domain_budget_computes_additive_concurrent_cpu_scale() {
+        // 3 MB expert at 40 GB/s solo CPU -> 75_000 ns solo.
+        let record_bytes: u64 = 3_000_000;
         let cpu = crate::CpuLines {
             expert: crate::RowLine {
-                one: crate::Nanoseconds::try_from(40_000).unwrap(),
+                one: crate::Nanoseconds::try_from(75_000).unwrap(),
                 row: crate::RowCost::Measured(crate::Nanoseconds::try_from(1_000).unwrap()),
             },
             handshake: crate::Nanoseconds::try_from(4_000).unwrap(),
         };
-        assert_eq!(cpu.with_domain_budget(idle), cpu);
-        let scaled = cpu.with_domain_budget(dma_and_nvme);
-        assert_eq!(scaled.expert.one.get(), 400_000.0);
-        assert_eq!(scaled.expert.row, cpu.expert.row);
-        assert_eq!(scaled.handshake, cpu.handshake);
+
+        // Idle: 0% load -> 1.0x (uncontested solo CPU).
+        let idle = DomainBudget::new(0.0, 0.0, 75e9);
+        assert_eq!(idle.load(), 0.0);
+        assert_eq!(cpu.with_domain_budget(idle, record_bytes), cpu);
+
+        // PCIe Gen4 (24 GB/s DMA on 75 GB/s DDR5): remaining 51 GB/s >= 40 GB/s solo -> 1.12x margin only.
+        let gen4 = DomainBudget::new(24e9, 0.0, 75e9);
+        let gen4_scaled = cpu.with_domain_budget(gen4, record_bytes);
+        assert_eq!(gen4_scaled.expert.one.get(), (75_000.0 * 1.12f64).round());
+        assert_eq!(gen4_scaled.expert.row, cpu.expert.row);
+        assert_eq!(gen4_scaled.handshake, cpu.handshake);
+
+        // PCIe Gen5 (48 GB/s DMA on 75 GB/s DDR5): remaining 27 GB/s -> b_cpu_eff = 27 GB/s -> (40/27) * 1.12 = 1.659x
+        // (far better than old punitive 1/(1-48/75) = 2.78x, keeping CPU+DMA additive).
+        let gen5 = DomainBudget::new(48e9, 0.0, 75e9);
+        let expected_gen5 = (75_000.0_f64 * (40.0 / 27.0) * 1.12).round();
+        assert_eq!(cpu.with_domain_budget(gen5, record_bytes).expert.one.get(), expected_gen5);
+
+        // Saturated (> 100% of DDR5): clamped at 0.25 * b_cpu_solo floor -> 4.0 * 1.12 = 4.48x max, never infinite/NaN.
+        let saturated = DomainBudget::new(55e9, 10e9, 60e9);
+        assert_eq!(saturated.load(), 0.95);
+        assert_eq!(cpu.with_domain_budget(saturated, record_bytes).expert.one.get(), (75_000.0_f64 * 4.48).round());
+
+        // Unmeasured memory bandwidth or zero record bytes: 1.0x (no panic / div-by-zero).
+        assert_eq!(DomainBudget::new(48e9, 6e9, 0.0).load(), 0.0);
+        assert_eq!(cpu.with_domain_budget(DomainBudget::new(48e9, 6e9, 0.0), record_bytes), cpu);
+        assert_eq!(cpu.with_domain_budget(gen5, 0), cpu);
     }
 }

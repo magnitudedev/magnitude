@@ -99,12 +99,14 @@ impl AheadOf {
 }
 
 /// A decode launch's batch row: its position, the request whose pass runs
-/// it, and, an ahead row, its [`AheadOf`].
+/// it, its ahead-row descriptor, and (for host-token launches) its exact
+/// input token for live token-conditioned routing foresight (`Source::Token`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct DecodeRow {
     pub position: u64,
     pub request: RequestId,
     pub ahead: Option<AheadOf>,
+    pub token: Option<crate::operation::TokenId>,
 }
 
 /// Step `step`'s low word: what the words that tell steps apart only within
@@ -1500,6 +1502,7 @@ enum Ending {
 pub(super) struct DecodeRouting {
     pub(super) chose: Vec<Vec<crate::experts::interest::Chosen>>,
     pub(super) guesses: Option<u32>,
+    pub(super) row_experts: Vec<Vec<(u8, u16)>>,
 }
 
 /// A step whose load counts its decode (`Stack::live`).
@@ -1885,8 +1888,8 @@ impl Shared {
             self.telemetry.ended(ended);
         });
         let completed = matches!(ending, Ending::Completed(_));
-        if let Ending::Completed(Some(DecodeRouting { chose, guesses })) = ending {
-            self.tell(crate::experts::interest::Told::Completed { step: sequence, chose, guesses });
+        if let Ending::Completed(Some(DecodeRouting { chose, guesses, row_experts })) = ending {
+            self.tell(crate::experts::interest::Told::Completed { step: sequence, chose, guesses, row_experts });
         }
         // Told once the steps know it ended, so a ring of it read after this
         // is drained finds it ended (`Steps::of_low_word`).
@@ -1951,6 +1954,7 @@ impl ExpertStep {
                 super::telemetry::GroupReadWords { layers: Vec::new(), places: 1 },
                 extents,
                 Arc::new(std::sync::atomic::AtomicU64::new(0)),
+                Arc::new(std::sync::atomic::AtomicU64::new(0)),
                 Vec::new(),
                 None,
                 crate::experts::reuse::Reuse::ranking(&[], &[], &[], time),
@@ -1984,6 +1988,7 @@ impl ExpertStep {
             passes: std::sync::Mutex::new(None),
             prices: std::sync::Mutex::new(None),
             settled: Default::default(),
+            transport: crate::experts::transport::ExpertTransport::new_registry_only(),
             policy: Default::default(),
             promoted: Default::default(),
             copy: std::sync::Mutex::new(None),

@@ -278,9 +278,10 @@ pub(super) struct Calibration {
     /// Pending prompt sample (`prompt_base = Some(decode_count_at_log)`) for
     /// settling `route[Form::Prompt]` across leads `1..=DEPTHS`.
     prompt_base: Option<u64>,
-    /// Whether `prompt_sample` holds a logged prompt union (decoupled from
-    /// `prompt_base` so `history_prob` blends cleanly until `decode_count >= ⌈E / k⌉`).
-    has_prompt: bool,
+    /// Decode step count when `prompt_sample` was last logged (decoupled from
+    /// `prompt_base` so `history_prob` blends each new request's prompt union
+    /// smoothly over `⌈E / k⌉` decode steps after prefill).
+    prompt_logged_at: Option<u64>,
     prompt_sample: Vec<SampleEntry>,
     /// Single pending `far` slot (bounded, constant in τ).
     far_target: Option<u64>,
@@ -342,7 +343,7 @@ impl Calibration {
             decode_count: 0,
             pending_fell,
             prompt_base: None,
-            has_prompt: false,
+            prompt_logged_at: None,
             prompt_sample: vec![SampleEntry::default(); experts],
             far_target: None,
             far_sample: if is_shadow { Vec::new() } else { vec![SampleEntry::default(); experts] },
@@ -507,7 +508,7 @@ impl Calibration {
 
         // 4. Build history sample for §8 A1 diagnostics (and capture into far slot if idle).
         if self.history.is_some() {
-            let prompt = self.has_prompt.then_some(self.prompt_sample.as_slice());
+            let prompt = self.prompt_logged_at.map(|logged_at| (self.prompt_sample.as_slice(), logged_at));
             build_history_sample(
                 self.experts,
                 self.active,
@@ -624,16 +625,12 @@ impl Calibration {
     }
 
     /// Log a prompt union sample: counted against the next `DEPTHS` decode steps
-    /// in `route[Form::Prompt]`. Never an outcome and never enters decode history.
+    /// in `route[Form::Prompt]` and blended into `history_prob` for the next
+    /// `⌈E / k⌉` decode steps. Never an outcome and never enters decode history.
     pub(super) fn log_prompt(&mut self, step: Step, union: &Rows, history: &History, layer: usize) {
         assert_eq!(union.experts, self.experts, "prompt union experts {} != layer experts {}", union.experts, self.experts);
         self.set_active(union.choices);
-        let out_chose = if self.latest_decode_step.is_none() {
-            Some(self.latest_chose[0].as_mut_slice())
-        } else {
-            None
-        };
-        extract_rows_keys(union, None, None, &mut self.scratch_keys, out_chose);
+        extract_rows_keys(union, None, None, &mut self.scratch_keys, Some(self.latest_chose[0].as_mut_slice()));
         build_route_sample(
             self.experts,
             &self.scratch_keys,
@@ -643,25 +640,21 @@ impl Calibration {
             &mut self.prompt_sample,
         );
         self.prompt_base = Some(self.decode_count);
-        self.has_prompt = true;
-        // Before the first decode step, prompt evidence stands as latest;
-        // once a decode step is logged, prompt evidence leaves the ranking (§4).
-        if self.latest_decode_step.is_none() {
-            self.latest_rows[0].copy_from_slice(&self.prompt_sample);
-            if self.history.is_some() {
-                build_history_sample(
-                    self.experts,
-                    self.active,
-                    self.decode_count,
-                    history,
-                    layer,
-                    Some(&self.prompt_sample),
-                    &mut self.scratch_order,
-                    &mut self.latest_history,
-                );
-            }
-            self.latest_meta = Some(LatestMeta { step, form: Form::Prompt, front_depth: 0 });
+        self.prompt_logged_at = Some(self.decode_count);
+        self.latest_rows[0].copy_from_slice(&self.prompt_sample);
+        if self.history.is_some() {
+            build_history_sample(
+                self.experts,
+                self.active,
+                self.decode_count,
+                history,
+                layer,
+                Some((self.prompt_sample.as_slice(), self.decode_count)),
+                &mut self.scratch_order,
+                &mut self.latest_history,
+            );
         }
+        self.latest_meta = Some(LatestMeta { step, form: Form::Prompt, front_depth: 0 });
     }
 
     /// Record that on front step `step`, guessed row `first_fell_row` (`1 <= f <= d`)
@@ -802,10 +795,10 @@ impl Calibration {
     /// History probability `p_∞` for `expert` (past lead `DEPTHS`), in O(1):
     /// the live measured half-life's decayed rate from [`History`]. Cold start
     /// returns exact `k / E`; with a prompt union logged, blends smoothly over
-    /// the first `⌈E / k⌉` decode steps.
+    /// the next `⌈E / k⌉` decode steps.
     pub(super) fn history_prob(&self, expert: usize, history: &History, layer: usize) -> f64 {
         assert!(expert < self.experts, "expert {expert} out of range 0..{}", self.experts);
-        let prompt = self.has_prompt.then_some(self.prompt_sample.as_slice());
+        let prompt = self.prompt_logged_at.map(|logged_at| (self.prompt_sample.as_slice(), logged_at));
         history_prior(history, layer, self.decode_count, prompt, expert, self.active, self.experts)
     }
 
@@ -862,6 +855,13 @@ impl Calibration {
     #[inline]
     pub(super) fn has_decode(&self) -> bool {
         self.latest_decode_step.is_some()
+    }
+
+    /// Whether this layer's `in_top` pool reflects a *previous* request's
+    /// decode (decode steps have run since the last prompt was logged), rather
+    /// than the current request's prefill.
+    pub(super) fn has_stale_decode_pool(&self) -> bool {
+        self.decode_count > 0 && self.prompt_logged_at != Some(self.decode_count)
     }
 
     #[inline]
@@ -1253,17 +1253,17 @@ fn build_route_sample(
 /// History probability `p_∞` for `expert`:
 /// - Cold start before the first decode step (`history.rate` is `None`):
 ///   exact `k / E`.
-/// - Warmup with a prompt union logged (`decode_count < ⌈E / k⌉`):
+/// - Warmup after a logged prompt union (`decode_count - logged_at < ⌈E / k⌉`):
 ///   smooth linear blend from `prompt_prior` into `history.rate` over one
 ///   expert-space pass `⌈E / k⌉` with zero tuned constants.
-/// - Steady state (`decode_count >= ⌈E / k⌉`, or no prompt logged):
+/// - Steady state (`decode_count - logged_at >= ⌈E / k⌉`, or no prompt logged):
 ///   `history.rate(layer, expert)` directly from the live measured half-life.
 #[inline]
 fn history_prior(
     history: &History,
     layer: usize,
     decode_count: u64,
-    prompt_sample: Option<&[SampleEntry]>,
+    prompt_sample: Option<(&[SampleEntry], u64)>,
     expert: usize,
     active: usize,
     experts: usize,
@@ -1271,10 +1271,11 @@ fn history_prior(
     let Some(rate) = history.rate(layer, expert) else {
         return active as f64 / experts as f64;
     };
-    if let Some(prompt) = prompt_sample {
+    if let Some((prompt, logged_at)) = prompt_sample {
         let min_steps = experts.div_ceil(active) as u64;
-        if decode_count < min_steps {
-            let w = (min_steps - decode_count) as f64 / min_steps as f64;
+        let steps_since_prompt = decode_count.saturating_sub(logged_at);
+        if steps_since_prompt < min_steps {
+            let w = (min_steps - steps_since_prompt) as f64 / min_steps as f64;
             let p = f64::from(prompt[expert].prior);
             return ((1.0 - w) * rate + w * p).clamp(0.0, 1.0);
         }
@@ -1291,7 +1292,7 @@ fn build_history_sample(
     decode_count: u64,
     history: &History,
     layer: usize,
-    prompt_sample: Option<&[SampleEntry]>,
+    prompt_sample: Option<(&[SampleEntry], u64)>,
     order: &mut [usize],
     out: &mut [SampleEntry],
 ) {

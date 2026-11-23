@@ -282,12 +282,25 @@ fn unpanicked(outcome: &Outcome) {
 struct Inbound {
     record: Option<u32>,
     tier: u32,
+    bytes: u64,
     need: Need,
     ended: Ended,
     urgency: Arc<Urgency>,
     /// True once this inbound's drive read has finished (even if its
     /// `DeviceLanding` or host `Converting` has not yet settled).
     read_done: Arc<AtomicBool>,
+    /// True once a parked request already counted this in-flight prefetch as a
+    /// `staged_hits` hit in `Decode::serve` (prevents double-counting on land).
+    counted_hit: bool,
+}
+
+/// Metadata for a prefetched expert that landed into the tier ahead of need,
+/// held until routed (`landed_hits` / `carryover_hits`) or evicted unused
+/// (`carryover_wasted`).
+#[derive(Clone, Copy)]
+pub(super) struct LandedPrefetch {
+    pub(super) bytes: u64,
+    pub(super) carryover: bool,
 }
 
 /// Why an expert is inbound, with the read that brings it.
@@ -311,9 +324,10 @@ enum Ahead {
     Cover,
     /// Carryover prefetch from the reuse ranking (`Directory::reuse_now`),
     /// issued during an MTP `DraftWindow` (`draft == true`, cancelled if
-    /// unbegun on `Told::Began`) or within idle SSD slack between parks
-    /// (`draft == false`, capped by `ReadAdmission::prefetch_byte_budget`).
-    Carryover { draft: bool },
+    /// unbegun on `Told::Began`) or continuously across the remaining compute
+    /// window of an active verify/decode burst (`draft == false`, `target_step`
+    /// = current burst `B` for layers `l+1..L-1` or `B+1` for layers `0..=l`).
+    Carryover { draft: bool, target_step: Step },
 }
 
 impl Ahead {
@@ -347,10 +361,12 @@ impl Inbound {
 }
 
 /// A landing in flight a request waits for ([`Prefetch::reading`]): read
-/// ahead for an interest the route at its `At` published, or one no
-/// prediction made (the cover's, or another request's).
+/// ahead for an interest the route at its `At` published, a carryover
+/// prefetch from live reuse history, or one no prediction made (the cover's,
+/// or another request's).
 pub(super) enum Reading {
     Predicted(At),
+    Carryover,
     Unpredicted,
 }
 
@@ -378,6 +394,7 @@ impl Fate {
         let lead = match source {
             Source::Lead { distance, .. } => usize::from(distance) - 1,
             Source::Ahead(row) => crate::planning::HINT_LEADS as usize + usize::from(row.index),
+            Source::Token => crate::planning::HINT_LEADS as usize + crate::experts::DEPTHS,
             Source::Exact => unreachable!("no ring names an exact request"),
         };
         let packed = (free as i64) << 32 | (self as i64) << 16 | (lead as i64) << 8 | i64::from(rank);
@@ -443,6 +460,13 @@ pub(super) struct Prefetch {
     /// parks), so `Residency::rings` / `Residency::hasten` immediately drives
     /// lookahead reads into the newly freed drive window.
     reads_finished: Arc<AtomicBool>,
+    /// Prefetched experts that landed into the tier ahead of need, tracked
+    /// until routed (`landed_hits` / `carryover_hits`) or evicted unused
+    /// (`carryover_wasted`).
+    landed_prefetches: HashMap<Staged, LandedPrefetch>,
+    /// Currently active decode/verify steps for `DriveEngagement`'s
+    /// active-burst wall clock (excludes prompt steps and inter-request idle).
+    active_decode_steps: HashSet<Step>,
 }
 
 /// A layer's rings: its hint rings' rows by lead, then its front ring.
@@ -470,26 +494,33 @@ impl<'a> Priced<'a> {
 }
 
 /// Lazy Drive-path wrapper around [`magnitude_cost_model::LinkIdleBudget`] so
-/// due-only derivations never lock telemetry.
+/// due-only derivations never lock telemetry. Spans the remaining compute
+/// window of the active verify/decode burst (`remaining_layers * C / L`) plus
+/// any active `DraftWindow` so the drive stays saturated across the full burst.
 struct DriveIdleBudget {
     layers: usize,
+    remaining_layers: usize,
     queued_bytes: Vec<u64>,
     draft_idle: f64,
     budget: std::cell::Cell<Option<LinkIdleBudget>>,
 }
 
 impl DriveIdleBudget {
-    fn new(layers: usize, queued_bytes: Vec<u64>, draft_idle: f64) -> Self {
-        Self { layers, queued_bytes, draft_idle, budget: std::cell::Cell::new(None) }
+    fn new(layers: usize, remaining_layers: usize, queued_bytes: Vec<u64>, draft_idle: f64) -> Self {
+        Self { layers, remaining_layers, queued_bytes, draft_idle, budget: std::cell::Cell::new(None) }
     }
 
     fn get(&self, price: &super::telemetry::ReadPrice) -> f64 {
         if let Some(budget) = self.budget.get() {
             return budget.remaining();
         }
-        let c_layer = if self.layers == 0 { 0.0 } else { price.compute() / self.layers as f64 };
+        let c_window = if self.layers == 0 {
+            0.0
+        } else {
+            (self.remaining_layers.clamp(1, self.layers) as f64 / self.layers as f64) * price.compute()
+        };
         let queued: f64 = self.queued_bytes.iter().map(|&bytes| price.transfer_seconds(bytes)).sum();
-        let budget = LinkIdleBudget::new(c_layer, self.draft_idle, queued);
+        let budget = LinkIdleBudget::new(c_window, self.draft_idle, queued);
         let rem = budget.remaining();
         self.budget.set(Some(budget));
         rem
@@ -534,6 +565,23 @@ impl Prefetch {
             seen: vec![[0; RINGS]; layers],
             step_prefetch_bytes: 0,
             reads_finished: Arc::new(AtomicBool::new(false)),
+            landed_prefetches: HashMap::new(),
+            active_decode_steps: HashSet::new(),
+        }
+    }
+
+    /// Track a decode/verify step beginning on `DriveEngagement`'s burst clock.
+    pub(super) fn decode_step_began(&mut self, step: Step, shared: &Shared) {
+        if self.active_decode_steps.insert(step) {
+            shared.telemetry.engagement().on_decode_began(Instant::now());
+        }
+    }
+
+    /// Track a step ending: if it was an active decode/verify step, close its
+    /// burst clock span.
+    pub(super) fn step_ended(&mut self, step: Step, shared: &Shared) {
+        if self.active_decode_steps.remove(&step) {
+            shared.telemetry.engagement().on_decode_ended(Instant::now());
         }
     }
 
@@ -561,6 +609,32 @@ impl Prefetch {
         self.step_prefetch_bytes = 0;
     }
 
+    /// Consume a previously landed prefetch record when a step routes `staged`.
+    pub(super) fn take_landed_prefetch(&mut self, staged: Staged) -> Option<LandedPrefetch> {
+        self.landed_prefetches.remove(&staged)
+    }
+
+    /// Mark an in-flight prefetch as already counted as a `staged_hits` hit so
+    /// it is not double-counted when it subsequently lands.
+    pub(super) fn mark_inbound_hit(&mut self, staged: Staged) {
+        if let Some(inbound) = self.inbound.get_mut(&staged) {
+            inbound.counted_hit = true;
+        }
+    }
+
+    /// Drop any landed prefetch entries that were evicted from the tier before
+    /// being used, counting evicted carryover entries as `carryover_wasted`.
+    pub(super) fn prune_evicted_prefetches(&mut self, core: &Core, shared: &Shared) {
+        self.landed_prefetches.retain(|&(layer, expert), lp| {
+            let still_present =
+                core.directory.held(layer, expert).is_some() || core.directory.located(layer, expert) != Located::Lacked;
+            if !still_present && lp.carryover {
+                shared.telemetry.engagement().record_carryover_wasted();
+            }
+            still_present
+        });
+    }
+
     /// The low word of the last step `layer`'s front ring was read for.
     #[cfg(test)]
     pub(super) fn front_read(&self, layer: usize) -> i32 {
@@ -584,12 +658,15 @@ impl Prefetch {
             .as_ref()
             .map(|list| Arc::new(DeviceLanding::new(list.clone(), at, ended.clone(), shared.landings.clone())));
         let (serving, end, done, finished) = (shared.clone(), ended.clone(), read_done.clone(), self.reads_finished.clone());
+        let bytes = core.layers[naming.layer].expert_bytes();
+        shared.telemetry.engagement().read_started();
         match &device {
             Some(device) => {
                 let device = device.clone();
                 join.claimed(move |outcome, failed| {
                     done.store(true, Ordering::Release);
                     finished.store(true, Ordering::Release);
+                    serving.telemetry.engagement().read_finished();
                     if !read_named(&serving, naming, (&rows, &answer), &outcome, failed, &end) {
                         serving.events().notify();
                         return;
@@ -616,6 +693,7 @@ impl Prefetch {
                 join.claimed(move |outcome, failed| {
                     done.store(true, Ordering::Release);
                     finished.store(true, Ordering::Release);
+                    serving.telemetry.engagement().read_finished();
                     if !read_named(&serving, naming, (&rows, &answer), &outcome, failed, &end) {
                         serving.events().notify();
                         return;
@@ -638,7 +716,7 @@ impl Prefetch {
             }
         }
         let need = Need::Due { ticket, read: naming.sequence, device };
-        self.arrive((naming.layer, expert), Inbound { record: Some(staged), tier, need, ended, urgency, read_done });
+        self.arrive((naming.layer, expert), Inbound { record: Some(staged), tier, bytes, need, ended, urgency, read_done, counted_hit: false });
     }
 
     /// The landing of `staged` in flight a request finds, by what read it:
@@ -651,7 +729,8 @@ impl Prefetch {
         }
         Some(match inbound.need {
             Need::Ahead { ahead: Ahead::Interest { issued, .. }, .. } => Reading::Predicted(issued),
-            Need::Due { .. } | Need::Ahead { ahead: Ahead::Cover | Ahead::Carryover { .. }, .. } => Reading::Unpredicted,
+            Need::Ahead { ahead: Ahead::Carryover { .. }, .. } => Reading::Carryover,
+            Need::Due { .. } | Need::Ahead { ahead: Ahead::Cover, .. } => Reading::Unpredicted,
         })
     }
 
@@ -676,6 +755,7 @@ impl Prefetch {
         noted(match inbound.need {
             Need::Due { .. } => 0,
             Need::Ahead { ahead: Ahead::Interest { source: Source::Ahead(_), .. }, .. } => 3,
+            Need::Ahead { ahead: Ahead::Interest { source: Source::Token, .. }, .. } => 5,
             Need::Ahead { ahead: Ahead::Interest { .. }, .. } => 1,
             Need::Ahead { ahead: Ahead::Cover, .. } => 2,
             Need::Ahead { ahead: Ahead::Carryover { .. }, .. } => 4,
@@ -724,6 +804,21 @@ impl Prefetch {
         if !changed.is_empty() {
             self.derive(core, ledger, shared, Some(changed.as_slice()));
         }
+        // Cancel any unbegun in-verify carryover reads whose `(target_step, layer)`
+        // the device has already passed, freeing staging for upcoming layers.
+        for (&(layer, _), inbound) in &mut self.inbound {
+            let Need::Ahead { ticket, ahead: Ahead::Carryover { draft: false, target_step } } = &mut inbound.need else {
+                continue;
+            };
+            if *target_step == 0 || inbound.urgency.is_waited() || ticket.begun() || ticket.cancelled() {
+                continue;
+            }
+            let passed = served.is_some_and(|(sequence, at)| (*target_step, layer) <= (sequence, at))
+                || steps.ended(*target_step);
+            if passed {
+                ticket.cancel();
+            }
+        }
     }
 
     /// Track `inbound`, the one landing of `staged`.
@@ -753,7 +848,7 @@ impl Prefetch {
     /// never queue behind speculative draft-window prefetches.
     fn cancel_draft_carryover(&mut self) {
         for inbound in self.inbound.values_mut() {
-            let Need::Ahead { ticket, ahead: Ahead::Carryover { draft: true } } = &mut inbound.need else {
+            let Need::Ahead { ticket, ahead: Ahead::Carryover { draft: true, .. } } = &mut inbound.need else {
                 continue;
             };
             if !inbound.urgency.is_waited() && !ticket.begun() && !ticket.cancelled() {
@@ -806,7 +901,7 @@ impl Prefetch {
     /// Settle the landings that ended: returns `(settled, newly_landed)` where
     /// `newly_landed` lists every `(layer, expert)` that just landed into
     /// Tier 1 (used for Path 1 -> Path 0 pipeline chain-through to `LinkMover`).
-    pub(super) fn settle(&mut self, directory: &mut Directory, ledger: &mut Ledger) -> (bool, Vec<Staged>) {
+    pub(super) fn settle(&mut self, directory: &mut Directory, ledger: &mut Ledger, shared: &Shared) -> (bool, Vec<Staged>) {
         let mut freed = false;
         for inbound in self.inbound.values_mut() {
             if let Need::Due { device: Some(device), .. } = &inbound.need {
@@ -820,16 +915,28 @@ impl Prefetch {
         let mut ended = Vec::new();
         self.inbound.retain(|&staged, inbound| match inbound.ended.get() {
             Some(landed) => {
-                ended.push((inbound.record, staged, inbound.tier, inbound.read(), landed));
+                let prefetch_kind = match &inbound.need {
+                    Need::Ahead { ahead: Ahead::Interest { .. }, .. } => Some((false, false)),
+                    Need::Ahead { ticket, ahead: Ahead::Carryover { .. } } => Some((true, ticket.begun())),
+                    Need::Due { .. } | Need::Ahead { ahead: Ahead::Cover, .. } => None,
+                };
+                ended.push((inbound.record, staged, inbound.tier, inbound.read(), landed, inbound.bytes, inbound.counted_hit, prefetch_kind));
                 false
             }
             None => true,
         });
         let settled = freed || !ended.is_empty();
         let mut newly_landed = Vec::new();
-        for (record, staged, tier, read, landed) in ended {
+        for (record, staged, tier, read, landed, bytes, counted_hit, prefetch_kind) in ended {
             if landed {
                 newly_landed.push(staged);
+            }
+            if let Some((carryover, begun)) = prefetch_kind {
+                if landed && !counted_hit {
+                    self.landed_prefetches.insert(staged, LandedPrefetch { bytes, carryover });
+                } else if !landed && carryover && begun && !counted_hit {
+                    shared.telemetry.engagement().record_carryover_wasted();
+                }
             }
             self.ended(directory, ledger, record, staged, tier, read, landed);
         }
@@ -1111,6 +1218,21 @@ impl Prefetch {
             .collect()
     }
 
+    /// Current active `(step, layer)` in the running decode/verify pass,
+    /// combining `self.past`, `ledger.reached()`, and `ledger.latest_active_step()`.
+    fn active_point(&self, ledger: &Ledger) -> (Step, usize) {
+        let (reached_step, reached_layer) = ledger.reached();
+        let (step, current_layer) = if (self.past.sequence, self.past.layer) > (reached_step, reached_layer) {
+            (self.past.sequence, self.past.layer)
+        } else {
+            (reached_step, reached_layer)
+        };
+        match ledger.latest_active_step() {
+            Some(active) if active > step => (active, 0),
+            _ => (step, current_layer),
+        }
+    }
+
     /// Derive the reads of `only`'s experts, or of every expert the ledger
     /// wants (`Ledger::wanted`), and of those a told event changed
     /// (`Ledger::take_owed`): each one's read state is told the ledger,
@@ -1137,10 +1259,12 @@ impl Prefetch {
         let mut seen = HashSet::new();
         experts.retain(|&staged| seen.insert(staged));
         let draft_idle = ledger.draft_window_remaining(Instant::now());
+        let (_, current_layer) = self.active_point(ledger);
+        let remaining_layers = core.layers.len().saturating_sub(current_layer.saturating_add(1)).max(1);
         let scheduled = {
             let core: &Core = core;
             let queued_bytes = self.drive_queued_bytes(|layer| core.layers[layer].expert_bytes(), &seen);
-            let idle = DriveIdleBudget::new(core.layers.len(), queued_bytes, draft_idle);
+            let idle = DriveIdleBudget::new(core.layers.len(), remaining_layers, queued_bytes, draft_idle);
             // Each read's standing, taken before the ledger decides on it.
             let states = experts.iter().map(|&staged| (staged, self.read_state(core, staged))).collect::<HashMap<_, _>>();
             let read = |layer, expert| states[&(layer, expert)];
@@ -1230,13 +1354,17 @@ impl Prefetch {
     }
 
     fn prefetch_carryover(&mut self, core: &mut Core, ledger: &mut Ledger, shared: &Arc<Shared>) -> bool {
+        if core.steps.prompt_running() {
+            return false;
+        }
         let reserve = self.reserve(core, false);
         let room = self.staging.free().saturating_sub(reserve.0);
         if room == 0 || core.layers.is_empty() {
             return false;
         }
         let price = Priced::new(&shared.telemetry);
-        let draft_idle = ledger.draft_window_remaining(Instant::now());
+        let now = Instant::now();
+        let draft_idle = ledger.draft_window_remaining(now);
         if draft_idle > 0.0 {
             let p = price.get();
             let queued_secs: f64 = self
@@ -1245,30 +1373,31 @@ impl Prefetch {
                 .filter(|(_, inbound)| !inbound.read_done.load(Ordering::Acquire))
                 .map(|(&(layer, _), _)| p.transfer_seconds(core.layers[layer].expert_bytes()))
                 .sum();
-            let mut remaining_idle = (draft_idle - queued_secs).max(0.0);
-            if remaining_idle <= 0.0 {
+            let mut budget = LinkIdleBudget::new(0.0, draft_idle, queued_secs);
+            if budget.remaining() <= 0.0 {
                 return false;
             }
             let candidates = {
                 let reuse = core.directory.reuse_now();
-                reuse.top_candidates(room, |layer, expert| Self::candidate(core, (layer, expert)))
+                reuse.next_step_candidates(room, true, |layer, expert| Self::candidate(core, (layer, expert)))
             };
             let mut read = false;
-            for (rank, layer, expert) in candidates {
+            for cand in candidates {
                 if self.staging.free() <= reserve.0 {
                     break;
                 }
-                let bytes = core.layers[layer].expert_bytes();
+                let bytes = core.layers[cand.layer].expert_bytes();
                 let t_bw = p.transfer_seconds(bytes);
-                if !p.admits_with_idle(0.0, bytes, remaining_idle) {
-                    break;
+                let net_benefit = p.carryover_net_benefit(cand.p_next, bytes, budget.remaining());
+                if net_benefit <= 0.0 {
+                    continue;
                 }
-                let want = Want::undated(rank.expected().uses());
-                match self.read_ahead(core, shared, (layer, expert), want, Ahead::Carryover { draft: true }, None, reserve) {
+                let want = Want::undated(cand.p_next);
+                match self.read_ahead(core, shared, (cand.layer, cand.expert), want, Ahead::Carryover { draft: true, target_step: 0 }, Some((0, net_benefit)), reserve) {
                     Ok(_) => {
                         read = true;
-                        remaining_idle = (remaining_idle - t_bw).max(0.0);
-                        if t_bw > 0.0 && remaining_idle <= 0.0 {
+                        budget.consume(t_bw);
+                        if p.binds() && t_bw > 0.0 && budget.remaining() <= 0.0 {
                             break;
                         }
                     }
@@ -1279,60 +1408,86 @@ impl Prefetch {
             return read;
         }
 
-        // In-step l+1..=l+4 slack carryover: only when unparked (no active
-        // demand drive read) and within B_budget.
-        if self.inbound.values().any(|inbound| matches!(inbound.need, Need::Due { .. }) && !inbound.read_done.load(Ordering::Acquire)) {
-            return false;
-        }
-        let (reached_step, reached_layer) = ledger.reached();
-        let (step, current_layer) = if (self.past.sequence, self.past.layer) > (reached_step, reached_layer) {
-            (self.past.sequence, self.past.layer)
-        } else {
-            (reached_step, reached_layer)
-        };
-        let (step, current_layer) = match ledger.latest_active_step() {
-            Some(active) if active > step => (active, 0),
-            _ => (step, current_layer),
-        };
+        // Continuous full-burst & cross-burst in-verify carryover: keep the
+        // drive saturated across the remaining `C_verify` compute window of
+        // burst `B` (`l+1..L-1`, priority 1) and into early layers of burst
+        // `B+1` (`0..=l`, priority 2). Never bail out when a demand read is
+        // active: `seismic_io`'s priority queue serves `Want::now()` strictly
+        // ahead of `Want::undated`, so queuing behind demand eliminates the
+        // park -> idle -> wakeup gap while keeping `QD >= 16`.
+        let (step, current_layer) = self.active_point(ledger);
         if step == 0 || shared.steps.ended(step) {
             return false;
         }
         let p = price.get();
-        let budget = p.prefetch_byte_budget();
-        let mut remaining_budget = budget.saturating_sub(self.step_prefetch_bytes);
-        if remaining_budget == 0 {
-            return false;
-        }
         let layers = core.layers.len();
-        let lo = current_layer.saturating_add(1);
-        if lo >= layers {
+        let binds = p.binds();
+        let mut remaining_budget = if binds {
+            u64::MAX
+        } else {
+            let b = p.prefetch_byte_budget().saturating_sub(self.step_prefetch_bytes);
+            if b == 0 {
+                return false;
+            }
+            b
+        };
+        let remaining_layers = layers.saturating_sub(current_layer.saturating_add(1)).max(1);
+        let c_remaining = (remaining_layers as f64 / layers as f64) * p.compute();
+        let queued_secs: f64 = self
+            .inbound
+            .iter()
+            .filter(|(_, inbound)| !inbound.read_done.load(Ordering::Acquire))
+            .map(|(&(layer, _), _)| p.transfer_seconds(core.layers[layer].expert_bytes()))
+            .sum();
+        let idle_window = if binds { c_remaining } else { p.slack_seconds().max(c_remaining) };
+        let mut budget = LinkIdleBudget::new(idle_window, 0.0, queued_secs);
+        if binds && budget.remaining() <= 0.0 {
             return false;
         }
-        let hi = current_layer.saturating_add(4).min(layers - 1);
-        let candidates = {
+        let mut candidates = {
             let reuse = core.directory.reuse_now();
-            reuse.top_candidates(room, |layer, expert| layer >= lo && layer <= hi && Self::candidate(core, (layer, expert)))
+            reuse.next_step_candidates(room, false, |layer, expert| Self::candidate(core, (layer, expert)))
         };
-        let layer_idle = p.layer_idle(layers);
+        // Earliest-deadline-first across the burst boundary: remaining layers
+        // of burst B (`layer > current_layer`) first, then early layers of
+        // burst B+1 (`layer <= current_layer`), each ascending by layer,
+        // tie-broken by calibrated `p_next` descending.
+        candidates.sort_unstable_by(|a, b| {
+            let a_next_burst = a.layer <= current_layer;
+            let b_next_burst = b.layer <= current_layer;
+            a_next_burst
+                .cmp(&b_next_burst)
+                .then_with(|| a.layer.cmp(&b.layer))
+                .then_with(|| b.p_next.total_cmp(&a.p_next))
+        });
         let mut read = false;
-        for (rank, layer, expert) in candidates {
+        for cand in candidates {
             if self.staging.free() <= reserve.0 {
                 break;
             }
-            let bytes = core.layers[layer].expert_bytes();
-            if bytes > remaining_budget {
+            let bytes = core.layers[cand.layer].expert_bytes();
+            if !binds && bytes > remaining_budget {
                 continue;
             }
-            if !p.admits_with_idle(0.0, bytes, layer_idle) {
-                break;
+            let t_bw = p.transfer_seconds(bytes);
+            // During an active decode/verify pass (`draft_idle == 0.0`), wasted
+            // reads always consume drive/DDR5 bandwidth and contend with demand
+            // misses (`free_slack = 0.0`), so only candidates whose priced
+            // stall gain `p * s_demand` exceeds both `(1 - p) * t_bw` and
+            // victim eviction loss enter.
+            let net_benefit = p.carryover_net_benefit(cand.p_next, bytes, 0.0);
+            if net_benefit <= 0.0 {
+                continue;
             }
-            let want = Want::undated(rank.expected().uses());
-            match self.read_ahead(core, shared, (layer, expert), want, Ahead::Carryover { draft: false }, None, reserve) {
+            let target_step = if cand.layer > current_layer { step } else { step.saturating_add(1) };
+            let want = Want::undated(cand.p_next);
+            match self.read_ahead(core, shared, (cand.layer, cand.expert), want, Ahead::Carryover { draft: false, target_step }, Some((target_step, net_benefit)), reserve) {
                 Ok(bytes) => {
                     self.step_prefetch_bytes = self.step_prefetch_bytes.saturating_add(bytes);
                     remaining_budget = remaining_budget.saturating_sub(bytes);
+                    budget.consume(t_bw);
                     read = true;
-                    if remaining_budget == 0 {
+                    if (!binds && remaining_budget == 0) || (binds && t_bw > 0.0 && budget.remaining() <= 0.0) {
                         break;
                     }
                 }
@@ -1428,7 +1583,7 @@ impl Prefetch {
         let keep = ahead_staging.map_or(0, |ahead| core.directory.host(core.layers[target].group).reserve().saturating_sub(ahead));
         let claim = match (ahead, expected) {
             (Ahead::Interest { .. }, Some((step, p))) => core.directory.claim_ahead(target, expert, keep, ahead.taking(), step, p),
-            (Ahead::Carryover { .. }, _) => core.directory.claim_carryover(target, expert, keep, ahead.taking()),
+            (Ahead::Carryover { .. }, Some((_, net_benefit))) => core.directory.claim_carryover(target, expert, keep, ahead.taking(), net_benefit),
             _ => core.directory.claim_landing(target, expert, keep, ahead.taking(), (|_, _| (), |_, _| false)),
         };
         let Claim::Taken(grant) = claim else {
@@ -1448,6 +1603,7 @@ impl Prefetch {
                 let urgency = Urgency::ahead(want);
                 let read_done = Arc::new(AtomicBool::new(false));
                 let (end, serving, urgent, done, finished) = (ended.clone(), shared.clone(), urgency.clone(), read_done.clone(), self.reads_finished.clone());
+                shared.telemetry.engagement().read_started();
                 // A read ahead's end: read, its landing is submitted, whose
                 // end maps its tier record; failed, it fails nothing (a step
                 // waiting for it reads its expert anew).
@@ -1455,6 +1611,7 @@ impl Prefetch {
                     unpanicked(&outcome);
                     done.store(true, Ordering::Release);
                     finished.store(true, Ordering::Release);
+                    serving.telemetry.engagement().read_finished();
                     let read = failed.is_empty() && matches!(outcome, Outcome::Read);
                     seismic_io::timeline::note(seismic_io::timeline::Kind::Noted("ahead_read"), 0, (target as i64, expert as i64, read as i64));
                     if read {
@@ -1471,7 +1628,7 @@ impl Prefetch {
                     }
                     end.set(false);
                 });
-                self.arrive(staged, Inbound { record: Some(record), tier, need: Need::Ahead { ticket, ahead }, ended, urgency, read_done });
+                self.arrive(staged, Inbound { record: Some(record), tier, bytes, need: Need::Ahead { ticket, ahead }, ended, urgency, read_done, counted_hit: false });
                 Ok(bytes)
             }
             // The engine took no request: the read stages and lands nothing and
@@ -1555,39 +1712,48 @@ mod tests {
         let events = Arc::new(Events::default());
         let seen = HashSet::from([(1, 0)]);
 
-        let idle = DriveIdleBudget::new(layers, prefetch.drive_queued_bytes(|_| bytes, &seen), 0.0);
+        let idle = DriveIdleBudget::new(layers, 1, prefetch.drive_queued_bytes(|_| bytes, &seen), 0.0);
         assert!((idle.get(&price) - 1e-3).abs() < 1e-12);
         assert!(price.admits_with_idle(0.30, bytes, idle.get(&price)));
         idle.consume(&price, price.transfer_seconds(bytes));
         assert_eq!(idle.get(&price), 0.0);
         assert!(!price.admits_with_idle(0.30, bytes, idle.get(&price)));
 
+        // Across a multi-layer remaining verify window (e.g. 20 layers left),
+        // DriveIdleBudget opens `remaining_layers * c_layer`, so a single
+        // demand read on layer l-1 does not stall lookahead for later layers.
         let due_done = Arc::new(AtomicBool::new(false));
         prefetch.inbound.insert(
             (0, 0),
             Inbound {
                 record: Some(0),
                 tier: 0,
+                bytes,
                 need: Need::Due { ticket: Ticket::empty(), read: 0, device: None },
                 ended: Ended::new(&events),
                 urgency: Urgency::waited(),
                 read_done: due_done.clone(),
+                counted_hit: false,
             },
         );
         let queued = prefetch.drive_queued_bytes(|_| bytes, &seen);
         assert_eq!(queued, vec![bytes]);
-        let idle = DriveIdleBudget::new(layers, queued, 0.0);
-        assert_eq!(idle.get(&price), 0.0, "demand read on layer l-1 saturates shared drive");
-        assert!(!price.admits_with_idle(0.30, bytes, idle.get(&price)), "low-p hint rejected when drive is busy");
+        let idle = DriveIdleBudget::new(layers, 1, queued.clone(), 0.0);
+        assert_eq!(idle.get(&price), 0.0, "single-layer window saturated by demand read on layer l-1");
+        assert!(!price.admits_with_idle(0.30, bytes, idle.get(&price)), "low-p hint rejected when single-layer window is full");
         assert!(!price.admits_with_idle(0.52, bytes, idle.get(&price)), "50% hint rejected on saturated drive with no park overhead");
         assert!(price.admits_with_idle(1.0, bytes, idle.get(&price)), "certain read still admitted");
+
+        let full_burst = DriveIdleBudget::new(layers, 20, queued, 0.0);
+        assert!((full_burst.get(&price) - 19e-3).abs() < 1e-12, "remaining verify compute window stays open behind 1 demand read");
+        assert!(price.admits_with_idle(0.30, bytes, full_burst.get(&price)));
 
         // Once the demand read completes on the drive (even while its
         // DeviceLanding stays in `inbound` awaiting the next layer's park),
         // the shared drive is free and `DriveIdleBudget` opens `c_layer`.
         due_done.store(true, Ordering::Release);
         assert!(prefetch.drive_queued_bytes(|_| bytes, &seen).is_empty(), "finished demand read no longer occupies the drive");
-        let idle = DriveIdleBudget::new(layers, prefetch.drive_queued_bytes(|_| bytes, &seen), 0.0);
+        let idle = DriveIdleBudget::new(layers, 1, prefetch.drive_queued_bytes(|_| bytes, &seen), 0.0);
         assert!((idle.get(&price) - 1e-3).abs() < 1e-12, "full c_layer idle budget opens once demand read finishes");
         assert!(price.admits_with_idle(0.30, bytes, idle.get(&price)));
 
@@ -1597,10 +1763,12 @@ mod tests {
             Inbound {
                 record: Some(0),
                 tier: 0,
+                bytes,
                 need: Need::Ahead { ticket: Ticket::empty(), ahead: Ahead::Cover },
                 ended: Ended::new(&events),
                 urgency: Urgency::ahead(Want::undated(0.)),
                 read_done: Arc::new(AtomicBool::new(false)),
+                counted_hit: false,
             },
         );
         assert!(prefetch.drive_queued_bytes(|_| bytes, &seen).is_empty(), "in-pass unbegun ahead read is not pre-counted");
@@ -1609,15 +1777,17 @@ mod tests {
             Inbound {
                 record: Some(1),
                 tier: 1,
+                bytes,
                 need: Need::Ahead { ticket: Ticket::empty(), ahead: Ahead::Cover },
                 ended: Ended::new(&events),
                 urgency: Urgency::ahead(Want::undated(0.)),
                 read_done: Arc::new(AtomicBool::new(false)),
+                counted_hit: false,
             },
         );
         let queued = prefetch.drive_queued_bytes(|_| bytes, &seen);
         assert_eq!(queued, vec![bytes], "out-of-pass ahead read on layer 0 counts against shared drive");
-        assert_eq!(DriveIdleBudget::new(layers, queued, 0.0).get(&price), 0.0);
+        assert_eq!(DriveIdleBudget::new(layers, 1, queued, 0.0).get(&price), 0.0);
     }
 
     #[test]
@@ -1644,7 +1814,7 @@ mod tests {
         let rem = ledger.draft_window_remaining(Instant::now());
         assert!(rem > 0.010 && rem <= 0.019, "remaining draft window {rem}");
 
-        let idle = DriveIdleBudget::new(48, Vec::new(), rem);
+        let idle = DriveIdleBudget::new(48, 1, Vec::new(), rem);
         assert!(price.admits_with_idle(0.0, bytes, idle.get(&price)));
 
         prefetch.step_prefetch_bytes = 10_000_000;
@@ -1653,7 +1823,7 @@ mod tests {
         assert!(!ledger.in_draft_window());
         assert_eq!(ledger.draft_window_remaining(Instant::now()), 0.0);
         assert_eq!(prefetch.step_prefetch_bytes, 0);
-        let post_idle = DriveIdleBudget::new(48, vec![bytes], 0.0);
+        let post_idle = DriveIdleBudget::new(48, 1, vec![bytes], 0.0);
         assert!(!price.admits_with_idle(0.0, bytes, post_idle.get(&price)));
         let _ = events;
     }

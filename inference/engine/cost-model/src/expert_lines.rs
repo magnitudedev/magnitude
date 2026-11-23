@@ -297,16 +297,22 @@ impl CpuLines {
     }
 
     /// Scale the weight-read-dominated 1-row CPU expert cost (`expert.one`) by
-    /// `1 / (1 - budget.load())` to reflect live shared-domain bandwidth
-    /// contention (active DMA + active NVMe landing bytes vs Host DDR5),
-    /// leaving `expert.row` (additional rows amortized over already-fetched
-    /// weights) and `handshake` untouched.
-    pub fn with_domain_budget(self, budget: DomainBudget) -> Self {
-        let share = budget.load();
-        if share <= 0.0 {
+    /// `budget.concurrent_cpu_scale(b_cpu_solo)` to reflect the additive
+    /// concurrent bandwidth available to CPU compute beside active DMA and
+    /// NVMe landings on the shared memory domain (e.g. Host DDR5), leaving
+    /// `expert.row` (additional rows amortized over already-fetched weights)
+    /// and `handshake` untouched.
+    pub fn with_domain_budget(self, budget: DomainBudget, record_bytes: u64) -> Self {
+        let solo_seconds = self.expert.one.get() * 1e-9;
+        let cpu_solo_bps = if record_bytes > 0 && solo_seconds > 0.0 {
+            record_bytes as f64 / solo_seconds
+        } else {
+            0.0
+        };
+        let factor = budget.concurrent_cpu_scale(cpu_solo_bps);
+        if factor <= 1.0 {
             return self;
         }
-        let factor = 1.0 / (1.0 - share);
         let one = Nanoseconds::saturating(self.expert.one.get() * factor * 1e-9);
         Self { expert: RowLine { one, ..self.expert }, handshake: self.handshake }
     }

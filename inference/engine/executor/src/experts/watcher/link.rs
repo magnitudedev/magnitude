@@ -24,8 +24,7 @@ use super::Shared;
 use super::core::Core;
 use crate::assessment::TierCopyCosts;
 use crate::experts::copies::{BatchItem, Run, Signal, TransferPriority};
-use crate::experts::directory::{BankRecord, Directory, HostRecord, MissCurve, Point};
-use crate::experts::horizon::{Hold, Tokens};
+use crate::experts::directory::{BankRecord, HostRecord, MissCurve, Point};
 use crate::experts::interest::{Act, Admit, Class, Ledger, Read as ReadState, Scheduled};
 use crate::experts::map::stage_word;
 use crate::experts::staging::Staged;
@@ -40,92 +39,9 @@ use std::time::Instant;
 /// views are resolved on demand from `Core::groups[group].bank`
 /// (`Records::pooled`), so idle bank slabs hold no view and the pool can
 /// vacate their blocks on shrink or reclaim.
+#[derive(Clone)]
 pub(in crate::experts) struct Copier {
     pub copies: crate::experts::copies::Copies,
-}
-
-/// What a reserve is sized within ([`reserve`]): each layer's group and
-/// the most distinct experts a generation step can read there (all of the
-/// layer's experts, since `decoded` counts both decode-form passes up to
-/// `VERIFY_ROWS` rows and wider grouped generation passes such as concurrent
-/// batches or multi-sequence verification), each group's capacity
-/// (`Directory::capacity`), and the steps in flight.
-struct Sizing {
-    groups: Vec<usize>,
-    reads: Vec<usize>,
-    records: Vec<usize>,
-    flight: usize,
-}
-
-impl Sizing {
-    /// Sizing bounds for `directory`'s streamed layers and groups.
-    fn of(directory: &Directory, flight: usize) -> Self {
-        Self {
-            groups: directory.layer_groups(),
-            reads: directory.layer_experts(),
-            records: directory.capacities(),
-            flight,
-        }
-    }
-}
-
-/// A candidate reserve of a group ([`reserve`]): its records, and what it
-/// saves a step less what it costs, in misses.
-#[derive(Clone, Copy, Debug, PartialEq)]
-struct Reserve {
-    records: usize,
-    net: f64,
-}
-
-/// Each group's reserve, where what it saves exceeds what it costs most,
-/// from the decode steps' depth curve `decoded` (every decode step read
-/// since the load) and `drain`, the mean steps a decode release waited.
-fn reserve(sizing: &Sizing, decoded: &MissCurve, drain: Option<f64>) -> Vec<Vec<Reserve>> {
-    let groups = sizing.records.len();
-    let (Some(drain), true) = (drain, decoded.steps > 0) else {
-        return (0..groups).map(|_| vec![Reserve { records: 0, net: 0. }]).collect();
-    };
-    assert!(drain <= sizing.flight as f64, "a release waited {drain} steps, beyond the {} in flight", sizing.flight);
-    let steps = decoded.steps as f64;
-    (0..groups)
-        .map(|group| {
-            let members = (0..sizing.groups.len()).filter(|&layer| sizing.groups[layer] == group).collect::<Vec<_>>();
-            let whole = sizing.records[group] / members.len().max(1);
-            let left = sizing.records[group] - whole * members.len();
-            let misses = |layer: usize, slots: usize| decoded.layers[layer].at(slots).1 as f64 / steps;
-            for &layer in &members {
-                let most = sizing.reads[layer] as f64;
-                assert!(misses(layer, 0) <= most, "{} reads a step of a layer reading at most {most}", misses(layer, 0));
-            }
-            let asked = members.iter().map(|&layer| misses(layer, whole)).sum::<f64>() * drain;
-            let rate = members.iter().map(|&layer| misses(layer, 0) - misses(layer, 1)).sum::<f64>() / members.len().max(1) as f64;
-            (0..whole.max(1))
-                .map(|levels| {
-                    let records = left + levels * members.len();
-                    let cost = members.iter().map(|&layer| misses(layer, whole - levels) - misses(layer, whole)).sum::<f64>();
-                    Reserve { records, net: asked.min(records as f64) * rate - cost }
-                })
-                .collect()
-        })
-        .collect()
-}
-
-/// Of a group's reserves ([`reserve`]), the one to hold now, `current` held.
-fn decide(candidates: &[Reserve], current: usize, hold: &Hold, now: Tokens, tokens_per_step: f64) -> usize {
-    let best = candidates
-        .iter()
-        .copied()
-        .max_by(|a, b| a.net.total_cmp(&b.net).then(b.records.cmp(&a.records)))
-        .expect("a reserve's candidates");
-    let Some(candidate) = candidates.iter().find(|candidate| candidate.records == current) else {
-        return best.records;
-    };
-    let gain = (best.net - candidate.net) / tokens_per_step;
-    let moved = best.records.abs_diff(current) as f64;
-    match hold.pays(now, gain, moved) {
-        true => best.records,
-        false => current,
-    }
 }
 
 /// Admission wrapper for Link-path staging moves inside
@@ -150,11 +66,14 @@ impl Admit for LinkAdmitting<'_> {
 }
 
 /// Unified Path 0 (`RAM -> VRAM`) link mover: manages write-backs,
-/// `NameLedger`-driven opportunistic DMA staging, and `Reuse`-ranked permanent
-/// promotions on `Copies`.
+/// `Reuse`-ranked permanent promotions, and `NameLedger`-driven opportunistic
+/// DMA staging on `Copies`.
+///
+/// Permanent VRAM residency stays at full `Directory::capacity` (`reserve = 0`):
+/// `Directory::promotions()` releases victims on demand (`want_releases =
+/// short.min(budget_left)`) whenever `free == 0` without ever pre-emptively
+/// emptying held VRAM slots into an idle reserve pool.
 pub(super) struct LinkMover {
-    drained: (u64, u64),
-    holds: Vec<Hold>,
     /// Issue timestamps of in-flight opportunistic staging copies `(group, slot) -> (target_step, issued_at)`
     /// so `settle` can report landed link-staged hints to `NameLedger::link_landed`.
     stage_issued: HashMap<(usize, usize), (Step, Instant)>,
@@ -164,7 +83,7 @@ pub(super) struct LinkMover {
 
 impl LinkMover {
     pub(super) fn new() -> Self {
-        Self { drained: (0, 0), holds: Vec::new(), stage_issued: HashMap::new(), staged_total: 0 }
+        Self { stage_issued: HashMap::new(), staged_total: 0 }
     }
 
     /// Settle every completed write-back, permanent promotion, and opportunistic
@@ -211,6 +130,11 @@ impl LinkMover {
         if !completed.is_empty() {
             let link = completed.iter().map(|&(group, _)| copy.transfer.transfer_seconds(bytes[group] as f64)).sum::<f64>();
             shared.telemetry.moved(link, completed.len());
+            for &(group, record) in &completed {
+                shared
+                    .transport
+                    .try_release_hint_slot(crate::experts::transport::DestSlot { group, slot: record.index() });
+            }
             core.directory.promoted(completed, progress, &core.steps);
             moved = true;
         }
@@ -256,10 +180,19 @@ impl LinkMover {
             }
         }
 
-        // 4. Drain releases and landed staging slots whose (target_step, layer)
-        //    has been served at `progress`.
+        // 4. Drain releases, deferred demand landings, and landed staging slots
+        //    no longer pinned by any joined demand consumer in `ExpertTransport`.
         moved |= core.directory.drain(progress, &core.steps);
-        moved |= core.directory.drain_staging(progress, &core.steps);
+        moved |= core.directory.drain_demand_landings(|group, slot| {
+            shared
+                .transport
+                .can_reuse_slot(crate::experts::transport::DestSlot { group, slot })
+        });
+        moved |= core.directory.drain_staging_with(progress, &core.steps, |group, slot| {
+            shared
+                .transport
+                .try_release_hint_slot(crate::experts::transport::DestSlot { group, slot })
+        });
         moved
     }
 
@@ -290,13 +223,10 @@ impl LinkMover {
         ledger: &mut Ledger,
         shared: &Shared,
         copier: &Copier,
-        decoded: Option<&MissCurve>,
+        _decoded: Option<&MissCurve>,
         held: bool,
         progress: Point,
     ) -> bool {
-        if let Some(decoded) = decoded {
-            self.size(core, decoded);
-        }
         let Some(copy) = line(core, shared) else {
             return false;
         };
@@ -307,8 +237,11 @@ impl LinkMover {
         let bytes = record_bytes(core);
 
         // Priority 1: Write-backs (free bank records promotions/leases wait for).
+        // Depth excludes in-flight opportunistic `Stage` batches so already-
+        // queued staging copies never lock out write-backs.
         for back @ (group, record, ..) in core.directory.backs_queued() {
-            match post_back(core, copier, copy.depth(bytes[group]), back) {
+            let depth = permanent_post_depth(copy.depth(bytes[group]), copier.copies.flight(), core.directory.staging_copying().len());
+            match post_back(core, copier, depth, back) {
                 Ok(true) => moved = true,
                 Ok(false) => break,
                 Err(error) => {
@@ -319,15 +252,29 @@ impl LinkMover {
             }
         }
 
-        // Priority 2: Opportunistic staging from NameLedger + DraftWindow carryover
-        // (works on BOTH 100%-RAM and unsettled 3-tier workloads!).
-        moved |= self.stage_predicted(core, ledger, shared, copier, &copy, &bytes, progress);
-
-        // Priority 3: Permanent promotions filling remaining copy-engine depth.
+        // Priority 2: Permanent VRAM promotions (save every future token,
+        // strictly higher value than 1-step opportunistic `MAP_STAGE`). Run
+        // BEFORE `stage_predicted` and exclude in-flight `Stage` batches from
+        // `ask()`'s budget and `post_promote()`'s depth cap so opportunistic
+        // staging can never starve permanent VRAM residency growth.
+        let lending = core.steps.lending();
+        if lending {
+            // Cancel any unbegun promotion batches targeting `0..lent` so a
+            // newly begun prompt group never waits on queued copies into its
+            // scratch region.
+            for (group, record, batch) in core.directory.copying() {
+                if core.directory.bank_lends(group, record.index()) && copier.copies.cancel(batch) {
+                    core.directory.unpromoted(group, record);
+                    moved = true;
+                }
+            }
+        }
         moved |= self.ask(core, shared, copier, &copy);
         let mut queued = core.directory.queued();
         queued.retain(|&(group, record, (layer, expert))| {
-            let kept = core.directory.tier_record(layer, expert).is_some() && core.directory.reuse_now().in_top(layer, expert);
+            let kept = !(lending && core.directory.bank_lends(group, record.index()))
+                && core.directory.tier_record(layer, expert).is_some()
+                && core.directory.reuse_now().in_top(layer, expert);
             if !kept {
                 core.directory.unpromoted(group, record);
                 moved = true;
@@ -335,7 +282,8 @@ impl LinkMover {
             kept
         });
         for promotion @ (group, record, _) in queued {
-            match post_promote(core, copier, copy.depth(bytes[group]), promotion) {
+            let depth = permanent_post_depth(copy.depth(bytes[group]), copier.copies.flight(), core.directory.staging_copying().len());
+            match post_promote(core, shared, copier, depth, promotion) {
                 Ok(true) => moved = true,
                 Ok(false) => break,
                 Err(error) => {
@@ -345,6 +293,10 @@ impl LinkMover {
                 }
             }
         }
+
+        // Priority 3: Opportunistic staging from NameLedger + DraftWindow
+        // carryover (works on BOTH 100%-RAM and unsettled 3-tier workloads!).
+        moved |= self.stage_predicted(core, ledger, shared, copier, &copy, &bytes, progress);
         moved
     }
 
@@ -370,14 +322,20 @@ impl LinkMover {
             return false;
         }
         let (frontier, next_step) = core.steps.unbegun_beside_frontier(|frontier, at| (frontier, at.next()));
-        let mut moved = core.directory.drain_staging(progress, &core.steps);
+        let mut moved = core.directory.drain_staging_with(progress, &core.steps, |group, slot| {
+            shared
+                .transport
+                .try_release_hint_slot(crate::experts::transport::DestSlot { group, slot })
+        });
 
         let admission = shared.telemetry.link_admission(Some(copy.transfer));
         let layers = core.layers.len();
         let c_layer = if layers == 0 { 0.0 } else { admission.terms.compute / layers as f64 };
-        // Hints look up to `HINT_LEADS` layers ahead, so the compute overlap
-        // horizon spans `HINT_LEADS * c_layer`.
-        let c_window = (crate::planning::HINT_LEADS as f64) * c_layer;
+        // Span the remaining compute window of the active verify/decode burst
+        // (`remaining_layers * c_layer`) so Path 0 keeps the PCIe copy engine
+        // saturated across the full burst rather than only 2 layers.
+        let remaining_layers = layers.saturating_sub(progress.layer.saturating_add(1)).max(1);
+        let c_window = (remaining_layers as f64) * c_layer;
         let draft_idle = ledger.draft_window_remaining(Instant::now());
         let wanted_all = ledger.wanted();
 
@@ -473,7 +431,7 @@ impl LinkMover {
                                 continue;
                             };
                             let priority = TransferPriority::Stage { step: target_step, layer, p };
-                            match post_stage(core, copier, stage_depth, priority, group, slot, target_step, staged) {
+                            match post_stage(core, shared, copier, stage_depth, priority, group, slot, target_step, staged) {
                                 Ok(Some((tier, ticket))) => {
                                     self.stage_issued.insert((group, slot), (target_step, Instant::now()));
                                     core.directory.stage(group, slot, staged, target_step, tier, ticket, (target_step & 1) as u8);
@@ -490,18 +448,38 @@ impl LinkMover {
                 }
             }
 
-            // DraftWindow carryover on Link: while an MTP draft window is active,
-            // fill up to half of `next_step`'s parity ring with top Tier-1-only
-            // Reuse carryover experts (sorted earliest-layer-first so layer 0..
-            // warm up while keeping >= half the ring free for live within-pass
-            // `routed_hint_route` hints once `next_step` begins).
+            // Cross-burst & in-verify carryover on Link: both during MTP
+            // `DraftWindow` (`draft_idle > 0.0`, targeting `next_step`) and
+            // during active verify compute (`c_window` slack, targeting
+            // remaining layers `l+1..L-1` of the active step first and early
+            // layers `0..=l` of `next_step` second), fill up to half of each
+            // parity ring with live-calibrated Tier-1-only `Reuse` carryover
+            // experts while keeping >= half the ring free for live within-pass
+            // `routed_hint_route` / `Source::Token` hints.
             let carryover_cap = (ring_half / 2).max(1);
-            let carryover_room = carryover_cap.saturating_sub(core.directory.staged_for_step(group, next_step));
-            if draft_idle > 0.0 && carryover_room > 0 && copier.copies.flight() < stage_depth && idle.get().remaining() > 0.0 {
-                let room = stage_depth.saturating_sub(copier.copies.flight()).min(carryover_room);
-                let carryover = {
+            let active_step = ledger.latest_active_step().filter(|&s| s >= frontier && !core.steps.ended(s));
+            let in_verify = draft_idle == 0.0 && active_step.is_some();
+            let step_for_layer = |layer: usize| {
+                if in_verify && layer > progress.layer {
+                    active_step.unwrap_or(next_step)
+                } else {
+                    next_step
+                }
+            };
+            let room_for_step = |directory: &crate::experts::directory::Directory, target_step: Step| {
+                carryover_cap.saturating_sub(directory.staged_for_step(group, target_step))
+            };
+            let max_room = if in_verify {
+                let s_cur = active_step.unwrap_or(next_step);
+                room_for_step(&core.directory, s_cur).max(room_for_step(&core.directory, next_step))
+            } else {
+                room_for_step(&core.directory, next_step)
+            };
+            if (draft_idle > 0.0 || in_verify) && max_room > 0 && copier.copies.flight() < stage_depth && idle.get().remaining() > 0.0 {
+                let room = stage_depth.saturating_sub(copier.copies.flight()).min(max_room);
+                let mut carryover = {
                     let reuse = core.directory.reuse_now();
-                    reuse.top_candidates(room, |layer, expert| {
+                    reuse.next_step_candidates(room, false, |layer, expert| {
                         core.layers[layer].group == group
                             && core.directory.held(layer, expert).is_none()
                             && !core.directory.placing((layer, expert))
@@ -509,28 +487,36 @@ impl LinkMover {
                             && core.directory.staged_entry(group, (layer, expert)).is_none()
                     })
                 };
-                let mut carryover: Vec<(f64, usize, usize)> = carryover
-                    .into_iter()
-                    .map(|(rank, layer, expert)| (rank.expected().uses(), layer, expert))
-                    .collect();
-                carryover.sort_by_key(|&(_, layer, _)| layer);
-                for (uses, layer, expert) in carryover {
+                carryover.sort_unstable_by(|a, b| {
+                    let a_next = !in_verify || a.layer <= progress.layer;
+                    let b_next = !in_verify || b.layer <= progress.layer;
+                    a_next
+                        .cmp(&b_next)
+                        .then_with(|| a.layer.cmp(&b.layer))
+                        .then_with(|| b.p_next.total_cmp(&a.p_next))
+                });
+                for cand in carryover {
                     if copier.copies.flight() >= stage_depth {
                         break;
                     }
+                    let target_step = step_for_layer(cand.layer);
+                    if room_for_step(&core.directory, target_step) == 0 {
+                        continue;
+                    }
                     let mut budget = idle.get();
                     let t_bw = admission.transfer_seconds(record_bytes);
-                    if !admission.admits(0.0, record_bytes, budget.remaining()) {
-                        break;
+                    let free_slack = if draft_idle > 0.0 { budget.remaining() } else { 0.0 };
+                    if admission.carryover_net_benefit(cand.p_next, record_bytes, free_slack) <= 0.0 {
+                        continue;
                     }
-                    let Some(slot) = core.directory.free_stage_slot(group, next_step) else {
-                        break;
+                    let Some(slot) = core.directory.free_stage_slot(group, target_step) else {
+                        continue;
                     };
-                    let priority = TransferPriority::Stage { step: next_step, layer, p: uses.clamp(0.0, 1.0) };
-                    match post_stage(core, copier, stage_depth, priority, group, slot, next_step, (layer, expert)) {
+                    let priority = TransferPriority::Stage { step: target_step, layer: cand.layer, p: cand.p_next.clamp(0.0, 1.0) };
+                    match post_stage(core, shared, copier, stage_depth, priority, group, slot, target_step, (cand.layer, cand.expert)) {
                         Ok(Some((tier, ticket))) => {
-                            self.stage_issued.insert((group, slot), (next_step, Instant::now()));
-                            core.directory.stage(group, slot, (layer, expert), next_step, tier, ticket, (next_step & 1) as u8);
+                            self.stage_issued.insert((group, slot), (target_step, Instant::now()));
+                            core.directory.stage(group, slot, (cand.layer, cand.expert), target_step, tier, ticket, (target_step & 1) as u8);
                             budget.consume(t_bw);
                             idle.set(budget);
                             moved = true;
@@ -551,31 +537,8 @@ impl LinkMover {
         moved
     }
 
-    /// Size each group's promotion reserve by `decoded` ([`reserve`], [`decide`]).
-    fn size(&mut self, core: &mut Core, decoded: &MissCurve) {
-        let sizing = Sizing::of(&core.directory, core.extents.words.flight as usize);
-        let drain = (self.drained.1 > 0).then(|| self.drained.0 as f64 / self.drained.1 as f64);
-        let (now, spacing) = {
-            let times = core.directory.time().lock();
-            let now = times.clock.through_latest();
-            let spacing = (0..sizing.records.len()).map(|group| times.tokens_per_step(group)).collect::<Vec<_>>();
-            (now, spacing)
-        };
-        self.holds.resize(sizing.records.len(), Hold::started(now));
-        for (group, candidates) in reserve(&sizing, decoded, drain).into_iter().enumerate() {
-            let Some(tokens_per_step) = spacing[group] else {
-                continue;
-            };
-            let current = core.directory.reserved(group);
-            let records = decide(&candidates, current, &self.holds[group], now, tokens_per_step);
-            if records != current {
-                core.directory.reserve(group, records);
-                self.holds[group].changed(now);
-            }
-        }
-    }
-
-    /// Ask the ranking for permanent promotions up to remaining copy-engine headroom.
+    /// Ask the ranking for permanent promotions up to remaining permanent
+    /// copy-engine headroom (excluding in-flight opportunistic `Stage` copies).
     fn ask(&mut self, core: &mut Core, shared: &Shared, copier: &Copier, copy: &TierCopyCosts) -> bool {
         let max_depth = record_bytes(core)
             .into_iter()
@@ -583,34 +546,37 @@ impl LinkMover {
             .map(|bytes| copy.depth(bytes))
             .max()
             .unwrap_or(0);
-        let pending = copier.copies.flight() + core.directory.queued().len() + core.directory.backs_queued().len();
-        let budget = max_depth.saturating_sub(pending);
+        let budget = permanent_budget(
+            max_depth,
+            copier.copies.flight(),
+            core.directory.staging_copying().len(),
+            core.directory.queued().len(),
+            core.directory.backs_queued().len(),
+        );
         if budget == 0 && !core.directory.has_surrenders() {
             return false;
         }
         if !core.directory.settle_changes() {
             return false;
         }
-        let decoding = !core.steps.prompt_running();
-        let (directory, drained) = (&mut core.directory, &mut self.drained);
-        let asked = core.steps.unbegun_beside_frontier(|frontier, at| {
-            let asked = directory.promotions(at, budget);
-            if decoding {
-                let releases = asked.releases.len() as u64;
-                *drained = (drained.0 + releases * (at.next() - frontier), drained.1 + releases);
-            }
-            asked
-        });
+        let directory = &mut core.directory;
+        let asked = core.steps.unbegun_beside_frontier(|_, at| directory.promotions(at, budget));
+        for &(group, tier_record) in &asked.surrendered {
+            shared.transport.bump_source_generation(group, tier_record);
+        }
         shared.promoted.store(directory.asked(), std::sync::atomic::Ordering::Relaxed);
         !asked.promotions.is_empty() || !asked.releases.is_empty()
     }
 }
 
 /// Post one expert's opportunistic H2D staging copy runs followed by a
-/// `TransferItem::Signal` writing `MAP_STAGE` on the copy engine itself.
+/// `TransferItem::Signal` writing `MAP_STAGE` on the copy engine itself,
+/// registered with `ExpertTransport` so decode demand can join the in-flight
+/// transfer instead of issuing a duplicate PCIe copy.
 #[allow(clippy::too_many_arguments)]
 fn post_stage(
     core: &mut Core,
+    shared: &Shared,
     copier: &Copier,
     depth: usize,
     priority: TransferPriority,
@@ -623,8 +589,13 @@ fn post_stage(
     let signal_value = stage_word(target_step, slot);
     let signal_index = (expert as u64) * MAP_WORDS + MAP_STAGE;
     let signal_word = layers[layer].map.tensor().clone();
-    let posted = copier.copies.post_items_within(depth, priority, || {
+    let posted = copier.copies.post_tracked_within(depth, priority, || {
         let tier = directory.hold_tier(layer, expert).expect("a selected staging candidate's tier record is kept");
+        let transfer_id = shared.transport.register_hint(
+            crate::experts::transport::ExpertKey { group, layer, expert },
+            tier.0 as usize,
+            crate::experts::transport::DestSlot { group, slot },
+        );
         let tensors = groups[group].tier.as_ref().expect("opportunistic staging copies from its group's host tier");
         let mut items = Vec::with_capacity(tensors.len() + 1);
         for (index, tensor) in tensors.iter().enumerate() {
@@ -641,34 +612,44 @@ fn post_stage(
             index: signal_index,
             value: signal_value,
         }));
-        (items, tier)
+        (items, tier, Some(transfer_id))
     })?;
     Ok(posted)
 }
 
-/// Post a permanent promotion's copy batch at `TransferPriority::Promote`.
+/// Post a permanent promotion's copy batch at `TransferPriority::Promote`,
+/// registered with `ExpertTransport` so concurrent decode demand can join the
+/// in-flight promotion instead of issuing a duplicate PCIe copy.
 fn post_promote(
     core: &mut Core,
+    shared: &Shared,
     copier: &Copier,
     depth: usize,
     (group, record, (layer, expert)): (usize, BankRecord, Staged),
 ) -> Result<bool, String> {
     let (directory, groups) = (&mut core.directory, &core.groups);
-    let posted = copier.copies.post_within(depth, TransferPriority::Promote, || {
+    let posted = copier.copies.post_tracked_within(depth, TransferPriority::Promote, || {
         let tier = directory.hold_tier(layer, expert).expect("a queued promotion's tier record is kept");
+        let transfer_id = shared.transport.register_hint(
+            crate::experts::transport::ExpertKey { group, layer, expert },
+            tier.0 as usize,
+            crate::experts::transport::DestSlot { group, slot: record.index() },
+        );
         let tensors = groups[group].tier.as_ref().expect("a promotion copies from its group's host tier");
         let runs = tensors
             .iter()
             .enumerate()
-            .map(|(index, tensor)| Run {
-                source: tensor.records.tensor(u64::from(tier.0)).clone(),
-                source_offset: 0,
-                destination: groups[group].bank_view(index, record.index()),
-                destination_offset: 0,
-                bytes: tensor.records.bytes(),
+            .map(|(index, tensor)| {
+                BatchItem::Run(Run {
+                    source: tensor.records.tensor(u64::from(tier.0)).clone(),
+                    source_offset: 0,
+                    destination: groups[group].bank_view(index, record.index()),
+                    destination_offset: 0,
+                    bytes: tensor.records.bytes(),
+                })
             })
             .collect();
-        (runs, tier)
+        (runs, tier, Some(transfer_id))
     })?;
     let Some((tier, ticket)) = posted else {
         return Ok(false);
@@ -707,6 +688,32 @@ fn post_back(
     Ok(true)
 }
 
+/// Remaining permanent copy-engine promotion budget, excluding in-flight
+/// opportunistic `Stage` batches so `stage_predicted` never starves permanent
+/// VRAM promotions.
+fn permanent_budget(
+    max_depth: usize,
+    total_flight: usize,
+    staging_in_flight: usize,
+    queued: usize,
+    backs_queued: usize,
+) -> usize {
+    let permanent_in_flight = total_flight.saturating_sub(staging_in_flight);
+    max_depth.saturating_sub(permanent_in_flight + queued + backs_queued)
+}
+
+/// `Copies::post_within` depth cap for a permanent batch (`WriteBack` or
+/// `Promote`), excluding in-flight opportunistic `Stage` batches so already-
+/// queued staging copies never lock out permanent write-backs or promotions.
+fn permanent_post_depth(base_depth: usize, total_flight: usize, staging_in_flight: usize) -> usize {
+    let permanent_in_flight = total_flight.saturating_sub(staging_in_flight);
+    if permanent_in_flight >= base_depth {
+        base_depth
+    } else {
+        base_depth + staging_in_flight
+    }
+}
+
 /// The transfer queue's line a link move is priced and paced by.
 fn line(core: &Core, shared: &Shared) -> Option<TierCopyCosts> {
     let copy = shared.copy.lock().expect("a copy's price").clone();
@@ -724,9 +731,9 @@ fn record_bytes(core: &Core) -> Vec<u64> {
 
 #[cfg(test)]
 mod tests {
-    use super::{LinkAdmitting, MissCurve, Reserve, Sizing, decide, reserve};
-    use crate::experts::directory::{Directory, HostTier, LayerCurve, RoutedRead, Stack};
-    use crate::experts::horizon::{Hold, Time, Tokens};
+    use super::LinkAdmitting;
+    use crate::experts::directory::{Directory, HostTier, Placement};
+    use crate::experts::horizon::Time;
     use crate::experts::interest::{Act, Class, Ledger, Name, Read as ReadState, Source, Stands, When};
     use crate::experts::map::{decode_stage_word, stage_word};
     use crate::experts::watcher::At;
@@ -734,143 +741,111 @@ mod tests {
     use std::cell::Cell;
     use std::time::Instant;
 
-    fn sizing(records: usize) -> Sizing {
-        Sizing { groups: vec![0], reads: vec![8], records: vec![records], flight: 3 }
-    }
-
-    fn curve(misses: &[u64]) -> MissCurve {
-        MissCurve { steps: 100, layers: vec![LayerCurve { misses: misses.to_vec(), requests: vec![0; misses.len()], choices: 0 }] }
-    }
-
-    fn held(tokens: f64) -> (Hold, Tokens) {
-        let at = Tokens::new(tokens);
-        let mut hold = Hold::started(Tokens::ZERO);
-        hold.changed(at);
-        (hold, at)
-    }
-
+    /// Regression test for the `LinkMover::reserve()` VRAM collapse (`365a2e`):
+    /// under high-miss MTP decode, permanent VRAM residency must NEVER be
+    /// emptied into an idle reserve pool (`reserved(group) == 0`, keeping
+    /// `>= capacity - 2` slots held while on-demand promotion releases at most
+    /// `budget` victims).
     #[test]
-    fn a_reserve_is_priced_at_each_level_of_the_share() {
-        let decoded = curve(&[100, 0, 0, 0, 100, 100, 0, 0, 100]);
-        assert_eq!(reserve(&sizing(4), &decoded, None)[0], [Reserve { records: 0, net: 0. }]);
-        let candidates = &reserve(&sizing(4), &decoded, Some(2.))[0];
-        let records = candidates.iter().map(|candidate| candidate.records).collect::<Vec<_>>();
-        assert_eq!(records, [0, 1, 2, 3]);
-        let net = candidates.iter().map(|candidate| candidate.net).collect::<Vec<_>>();
-        assert_eq!(net, [0., 1., 2., 3.]);
-        let (hold, now) = held(10.);
-        assert_eq!(decide(candidates, 0, &hold, now, 1.), 3, "repays moving 3 records within the 10 tokens expected held");
-    }
+    fn link_mover_never_collapses_permanent_vram_residency() {
+        use crate::experts::directory::{HostRecord, Point, RoutedRead};
+        use crate::experts::host_records::{Claim, Refuses, Taking};
+        use crate::experts::reuse::{Evidence, Reuse};
+        use crate::experts::watcher::Steps;
 
-    #[test]
-    fn a_short_bank_missing_often_reserves_nothing() {
-        let decoded = curve(&[100, 150, 350, 0, 0, 0, 0, 0, 200]);
-        let candidates = &reserve(&sizing(2), &decoded, Some(1.))[0];
-        let unbounded = Hold::started(Tokens::ZERO);
-        assert_eq!(decide(candidates, 0, &unbounded, Tokens::ZERO, 1.), 0, "{candidates:?}");
-    }
-
-    #[test]
-    fn the_most_a_load_can_measure_leaves_every_layer_a_record() {
-        let decoded = curve(&[0, 0, 0, 0, 0, 0, 0, 0, 800]);
-        let candidates = &reserve(&sizing(4), &decoded, Some(3.))[0];
-        assert!(candidates.iter().all(|candidate| candidate.records <= 3), "{candidates:?}");
-        assert_eq!(reserve(&sizing(1), &decoded, Some(3.))[0].iter().map(|candidate| candidate.records).collect::<Vec<_>>(), [0]);
-    }
-
-    #[test]
-    fn a_reserve_changes_only_where_its_gain_repays_the_move() {
-        let candidates = [Reserve { records: 0, net: 0. }, Reserve { records: 37, net: 0.5 }];
-        let (ten, at_ten) = held(10.);
-        let (seventy_four, at_seventy_four) = held(74.);
-        let unbounded = Hold::started(Tokens::ZERO);
-        assert_eq!(decide(&candidates, 0, &ten, at_ten, 1.), 0, "5 misses saved do not repay moving 37 records");
-        assert_eq!(decide(&candidates, 0, &seventy_four, at_seventy_four, 1.), 37);
-        assert_eq!(decide(&candidates, 0, &unbounded, Tokens::ZERO, 1.), 37, "before the first change, any positive gain pays");
-        assert_eq!(decide(&candidates, 37, &unbounded, Tokens::ZERO, 1.), 37, "already the best");
-        let even = [Reserve { records: 0, net: 0. }, Reserve { records: 4, net: 0. }];
-        assert_eq!(decide(&even, 4, &unbounded, Tokens::ZERO, 1.), 4, "no gain moves nothing");
-    }
-
-    #[test]
-    #[should_panic(expected = "of a layer reading at most 8")]
-    fn a_rate_beyond_the_reads_panics() {
-        reserve(&sizing(4), &curve(&[0, 0, 0, 0, 0, 0, 0, 0, 900]), Some(1.));
-    }
-
-    #[test]
-    #[should_panic(expected = "beyond the 3 in flight")]
-    fn a_drain_beyond_the_flight_panics() {
-        reserve(&sizing(4), &curve(&[0, 0, 0, 0, 0, 0, 0, 0, 100]), Some(3.5));
-    }
-
-    /// A grouped generation pass wider than `VERIFY_ROWS` (e.g. concurrent
-    /// batched verification with `batch * verify_width > VERIFY_ROWS`, where a
-    /// 256-expert layer routes more than `VERIFY_ROWS * K = 64` distinct
-    /// experts in one step) feeds `Stack::decoded()` via `Telemetry::group_read`
-    /// and sizes the promotion reserve without panicking, up to all experts of
-    /// the layer.
-    #[test]
-    fn a_grouped_generation_step_wider_than_verify_rows_sizes_a_reserve() {
-        const EXPERTS: usize = 256;
-        const BANK_RECORDS: usize = 47;
-        const SELECTED: usize = 8;
-        let verify_cap = magnitude_kernels::constants::VERIFY_ROWS as usize * SELECTED;
-        assert!(verify_cap < EXPERTS, "test exercises layers wider than VERIFY_ROWS * K");
-
-        let directory = Directory::new(&[BANK_RECORDS], &[0], &[EXPERTS], HostTier::replay(vec![EXPERTS as u32]));
-        let sizing = Sizing::of(&directory, 3);
-        assert_eq!(sizing.reads, vec![EXPERTS], "reads bound is the layer's expert count, not VERIFY_ROWS * K");
-
-        // Two grouped generation steps reading 67 and 68 distinct experts
-        // (mean 67.5 > 64 = VERIFY_ROWS * K), matching a 16-row concurrent
-        // verify batch (`batch=4, verify_width=4`) on a 256-expert layer.
-        let mut stack = Stack::new(directory.ranking(), 1, EXPERTS);
-        stack.read(
-            &RoutedRead { sequence: 1, layer: 0, experts: (0..67).collect(), choices: 16 * SELECTED as u64 },
-            None,
-            None,
+        let capacity = 240usize; // 4 layers * 60 slots/layer
+        let layers = 4usize;
+        let experts = 288usize;
+        let mut directory = Directory::new(
+            &[capacity],
+            &vec![0; layers],
+            &vec![experts; layers],
+            HostTier {
+                records: vec![(layers * experts) as u32],
+                lent: vec![0],
+                reserve: 0,
+                placement: Placement::Replay,
+            },
         );
-        stack.read(
-            &RoutedRead { sequence: 2, layer: 0, experts: (0..68).collect(), choices: 16 * SELECTED as u64 },
-            None,
-            None,
+        (0..layers).for_each(|layer| directory.price_copies(layer, Some(0.)));
+        // Land all experts into the host tier.
+        for layer in 0..layers {
+            for expert in 0..experts {
+                let Claim::Taken(grant) = directory.claim_landing(layer, expert, 0, Taking::Out, Refuses) else {
+                    panic!("host tier has room for every expert");
+                };
+                directory.landed(layer, HostRecord(grant.record()), expert, None);
+            }
+        }
+        let steps = Steps::new(
+            crate::planning::FlightDepth::PIPELINED,
+            1,
+            crate::experts::exchange::Pulse::of(seismic::BackendName::Cpu),
         );
-        let decoded = stack.decoded();
-        assert_eq!(decoded.steps, 2);
-        assert_eq!(decoded.layers[0].at(0).1, 135);
-        assert!((decoded.layers[0].at(0).1 as f64 / decoded.steps as f64) > verify_cap as f64);
+        let ranking = directory.ranking();
+        // Seed ranking with high-miss MTP decode traffic so top experts are promoted.
+        for seq in 1..=20u64 {
+            {
+                let time = directory.time();
+                let mut times = time.lock();
+                times.register(seq, crate::experts::horizon::Advance::Known(crate::experts::horizon::Tokens::new(4.0)));
+            }
+            for layer in 0..layers {
+                let base = ((seq as usize) * 8) % experts;
+                let mut chosen: Vec<usize> = (0..60).map(|i| (base + i) % experts).collect();
+                chosen.sort_unstable();
+                let read = RoutedRead { sequence: seq, layer, choices: chosen.len() as u64, experts: chosen };
+                Reuse::of(&ranking).read(&read, None, Evidence::Decode);
+            }
+        }
+        assert_eq!(directory.reserved(0), 0);
 
-        let candidates = &reserve(&sizing, decoded, Some(1.0))[0];
-        assert_eq!(candidates.len(), BANK_RECORDS);
-        assert!(candidates.iter().all(|candidate| candidate.records < BANK_RECORDS && candidate.net.is_finite()));
+        // Fill all 240 permanent VRAM slots via promotions with `reserve == 0`.
+        let mut ticket = 1u64;
+        loop {
+            let asked = steps.unbegun(|at| directory.promotions(at, 64));
+            if asked.promotions.is_empty() {
+                break;
+            }
+            let mut completed = Vec::new();
+            for (group, record, (layer, expert)) in directory.queued() {
+                let tier = directory.hold_tier(layer, expert).expect("tier kept");
+                directory.copy(group, record, tier, ticket);
+                ticket += 1;
+                completed.push((group, record));
+            }
+            directory.promoted(completed, Point::whole(20, 0, 20), &steps);
+        }
+        let held_before: usize = (0..layers).map(|l| directory.held_count(l)).sum();
+        assert_eq!(held_before, capacity, "all {capacity} permanent VRAM slots must be held");
 
-        // Every expert of the layer read in one grouped generation step is
-        // still within the layer's expert bound.
-        let mut saturated = Stack::alone(1, EXPERTS, BANK_RECORDS);
-        saturated.read(
-            &RoutedRead { sequence: 1, layer: 0, experts: (0..EXPERTS).collect(), choices: 64 * SELECTED as u64 },
-            None,
-            None,
+        // Under continued high-miss traffic, `LinkMover` keeps `reserve == 0`
+        // and asking `promotions(at, budget=2)` releases at most `budget` (2)
+        // records on demand — NEVER collapsing permanent VRAM residency!
+        for seq in 21..=40u64 {
+            {
+                let time = directory.time();
+                let mut times = time.lock();
+                times.register(seq, crate::experts::horizon::Advance::Known(crate::experts::horizon::Tokens::new(4.0)));
+            }
+            for layer in 0..layers {
+                let base = ((seq as usize) * 16) % experts;
+                let mut chosen: Vec<usize> = (0..32).map(|i| (base + i) % experts).collect();
+                chosen.sort_unstable();
+                let read = RoutedRead { sequence: seq, layer, choices: chosen.len() as u64, experts: chosen };
+                Reuse::of(&ranking).read(&read, None, Evidence::Decode);
+            }
+        }
+        let _mover = super::LinkMover::new();
+        let asked = steps.unbegun(|at| directory.promotions(at, 2));
+        let held_after: usize = (0..layers).map(|l| directory.held_count(l)).sum();
+        assert_eq!(directory.reserved(0), 0, "LinkMover must keep promotion reserve at 0");
+        assert!(asked.releases.len() <= 2, "on-demand releases must be bounded by budget=2, got {}", asked.releases.len());
+        assert!(
+            held_after >= capacity - 2,
+            "permanent VRAM held ({held_after}) must remain >= capacity - 2 ({})",
+            capacity - 2
         );
-        let full = &reserve(&sizing, saturated.decoded(), Some(1.0))[0];
-        assert_eq!(full.len(), BANK_RECORDS);
-        assert!(full.iter().all(|candidate| candidate.records < BANK_RECORDS && candidate.net.is_finite()));
-    }
-
-    #[test]
-    #[should_panic(expected = "of a layer reading at most 256")]
-    fn a_rate_beyond_a_layers_experts_still_panics() {
-        const EXPERTS: usize = 256;
-        let directory = Directory::new(&[47], &[0], &[EXPERTS], HostTier::replay(vec![EXPERTS as u32]));
-        let sizing = Sizing::of(&directory, 3);
-        let mut misses = vec![0u64; EXPERTS + 1];
-        misses[EXPERTS] = EXPERTS as u64 + 1;
-        let impossible = MissCurve {
-            steps: 1,
-            layers: vec![LayerCurve { misses, requests: vec![0; EXPERTS + 1], choices: 0 }],
-        };
-        reserve(&sizing, &impossible, Some(1.0));
     }
 
     #[test]
@@ -935,5 +910,38 @@ mod tests {
             .collect();
         assert_eq!(issued_layers, vec![(0, 3), (1, 5), (2, 7)], "Link path orders staging layer-ascending");
         assert_eq!(idle.get().remaining(), 0.0, "idle budget consumed as moves were admitted");
+    }
+
+    /// Opportunistic `Stage` copies queued up to `ring_half >> copy.depth` must
+    /// NEVER zero out `LinkMover::ask()`'s permanent promotion budget or lock
+    /// out `post_promote()` / `post_back()` in `Copies::post_within()`.
+    #[test]
+    fn opportunistic_staging_flight_never_starves_permanent_promotions() {
+        use super::{permanent_budget, permanent_post_depth};
+
+        let base_depth = 2usize;
+        let staging_in_flight = 8usize;
+
+        // With 8 opportunistic `Stage` batches in flight and 0 permanent
+        // batches, `ask()` still gets the full `base_depth = 2` budget.
+        assert_eq!(permanent_budget(base_depth, staging_in_flight, staging_in_flight, 0, 0), 2);
+        // `post_promote()` / `post_back()` receives depth `2 + 8 = 10 > 8`,
+        // admitting up to 2 permanent batches even while 8 staging batches are
+        // queued in `Copies`.
+        assert_eq!(permanent_post_depth(base_depth, staging_in_flight, staging_in_flight), 10);
+
+        // Once 1 permanent promotion is posted (`total_flight = 9`, `staging = 8`),
+        // 1 permanent slot remains.
+        assert_eq!(permanent_budget(base_depth, 9, staging_in_flight, 0, 0), 1);
+        assert_eq!(permanent_post_depth(base_depth, 9, staging_in_flight), 10);
+
+        // Once 2 permanent promotions are posted (`total_flight = 10`, `staging = 8`),
+        // permanent budget is 0 and `permanent_post_depth` returns `base_depth = 2`
+        // (`<= total_flight`), cleanly capping permanent flight at `base_depth`.
+        assert_eq!(permanent_budget(base_depth, 10, staging_in_flight, 0, 0), 0);
+        assert_eq!(permanent_post_depth(base_depth, 10, staging_in_flight), base_depth);
+
+        // Queued promotions / write-backs still count against `ask()`'s budget.
+        assert_eq!(permanent_budget(base_depth, staging_in_flight, staging_in_flight, 1, 1), 0);
     }
 }

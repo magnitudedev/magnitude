@@ -34,7 +34,7 @@ native routed_hint_route for metal from "metal/routed_hint_route.metal":
     static (H, PT, NM, K, AHEAD, EN)
     where H % 32 == 0 and EN <= 1024 and K <= 32
     project dense segmented (next_router, after_router) rows rms ordered (next_router, after_router)
-    unless (next_policy[POLICY_RESOLVED])
+    unless (next_policy[POLICY_WHOLE])
     scratch logits bytes (2 * M * EN * 4)
     scratch arrivals bytes (4) sync
 
@@ -49,7 +49,7 @@ native routed_hint_select for metal from "metal/routed_hint_select.metal":
     static (H, K, AHEAD, EN)
     where H % 32 == 0 and EN <= 1024 and K <= EN and K <= 32
     project dense segmented (next_router, after_router) rows rms ordered (next_router, after_router)
-    unless (next_policy[POLICY_RESOLVED])
+    unless (next_policy[POLICY_WHOLE])
     scratch logits bytes (2 * M * EN * 4)
     scratch arrivals bytes (4) sync
 

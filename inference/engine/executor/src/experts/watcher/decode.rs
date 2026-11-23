@@ -54,6 +54,7 @@ pub(super) struct Serving<'a> {
 pub(super) fn fail(core: &Core, shared: &Shared, layer: usize, sequence: Step, reason: String) {
     shared.steps.fail(sequence, reason);
     core.layers[layer].file.answer(sequence, 0, true);
+    shared.events().notify();
     shared.parks.settle();
 }
 
@@ -377,7 +378,13 @@ pub(super) fn parked_reads(core: &Core, shared: &Shared, layer: usize, sequence:
 fn demand_claim(core: &mut Core, shared: &Shared, staged: Staged, demand: Demand, park: &Park) -> Option<Claim> {
     let read = parked_reads(core, shared, staged.0, park.point.sequence)?;
     core.directory.release(park, &read);
-    Some(core.directory.claim_demand(staged, demand, &read, park))
+    let claim = core.directory.claim_demand(staged, demand, &read, park);
+    if let Claim::Taken(ref grant) = claim {
+        shared
+            .transport
+            .bump_source_generation(core.layers[staged.0].group, grant.record() as usize);
+    }
+    Some(claim)
 }
 
 /// A posted read's tier record for `staged`: taken, or none while the tier
@@ -474,7 +481,7 @@ impl Decode {
     /// miss claimed, answered, landed or dropped.
     pub(super) fn resume(&mut self, serving: Serving<'_>) -> bool {
         let Serving { core, prefetch, ledger, shared } = serving;
-        let mut progressed = !(self.waiting.is_empty() && self.unclaimed.is_empty()) && prefetch.settle(&mut core.directory, ledger).0;
+        let mut progressed = !(self.waiting.is_empty() && self.unclaimed.is_empty()) && prefetch.settle(&mut core.directory, ledger, shared).0;
         let ended = |core: &Core, at: At| request_ended(core, shared, at.point.layer, at.point.sequence);
         for mut unclaimed in std::mem::take(&mut self.unclaimed) {
             let (at, layer) = (unclaimed.at, unclaimed.at.point.layer);
@@ -651,7 +658,10 @@ impl Decode {
                 lead = Some(lead.map_or(layers, |lead| lead.min(layers)));
             };
             let (plan, anticipation) = match read.as_ref().is_some_and(|read| read.reads(expert)) {
-                true => (Plan::Posted, Some(Anticipation::Demand)),
+                true => {
+                    shared.telemetry.engagement().record_exposed(record_bytes);
+                    (Plan::Posted, Some(Anticipation::Demand))
+                }
                 false => match core.directory.located(layer, expert) {
                     // Kept already: landed after the route resolved it (a
                     // read ahead's that ended and settled since), or graced
@@ -660,20 +670,36 @@ impl Decode {
                     // now, which no claim of the request's other misses takes.
                     Located::Kept(tier) | Located::Graced(tier) => {
                         core.directory.answer(layer, HostRecord(tier), point);
+                        if let Some(lp) = prefetch.take_landed_prefetch(staged) {
+                            shared.telemetry.engagement().record_landed_hit(lp.bytes, lp.carryover);
+                        }
                         (Plan::Unread(Unread::Kept(tier)), None)
                     }
                     // A landing of it is in flight, whoever's (a read ahead's,
-                    // the cover's, another request's): it waits for it,
-                    // hastened to demand ([`Prefetch::want`], below).
+                    // carryover's, the cover's, another request's): it waits
+                    // for it, hastened to demand ([`Prefetch::want`], below).
                     Located::Landing => match prefetch.reading(staged) {
                         Some(Reading::Predicted(issued)) => {
                             taken_from(issued);
+                            prefetch.mark_inbound_hit(staged);
+                            shared.telemetry.engagement().record_staged_hit(record_bytes, false);
                             (Plan::Unread(Unread::Reading), Some(Anticipation::Reading))
                         }
-                        Some(Reading::Unpredicted) | None => (Plan::Unread(Unread::Reading), Some(Anticipation::Demand)),
+                        Some(Reading::Carryover) => {
+                            prefetch.mark_inbound_hit(staged);
+                            shared.telemetry.engagement().record_staged_hit(record_bytes, true);
+                            (Plan::Unread(Unread::Reading), Some(Anticipation::Demand))
+                        }
+                        Some(Reading::Unpredicted) | None => {
+                            shared.telemetry.engagement().record_exposed(record_bytes);
+                            (Plan::Unread(Unread::Reading), Some(Anticipation::Demand))
+                        }
                     },
                     // The look read nothing of it: it waits for records.
-                    Located::Lacked => (Plan::Unread(Unread::Waits), Some(Anticipation::Demand)),
+                    Located::Lacked => {
+                        shared.telemetry.engagement().record_exposed(record_bytes);
+                        (Plan::Unread(Unread::Waits), Some(Anticipation::Demand))
+                    }
                 },
             };
             let code = match (&plan, anticipation) {

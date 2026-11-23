@@ -428,9 +428,15 @@ fn path_records_scales_ahead_for_multi_row_verify_without_inflating_reserve() {
     let compute = FormSeconds { resident: 0.032, streamed: 0.035 };
     let held = HeldSlots::bank(355);
 
-    let single = layers.path_records(read, compute, record_bytes, held, 2, num_layers as u64, 1).unwrap();
-    let verify = layers.path_records(read, compute, record_bytes, held, 2, num_layers as u64, 8).unwrap();
+    let saturation_bytes = 32 * 1024 * 1024u64;
+    let single = layers.path_records(read, compute, record_bytes, held, 2, num_layers as u64, 1, saturation_bytes).unwrap();
+    let verify = layers.path_records(read, compute, record_bytes, held, 2, num_layers as u64, 8, saturation_bytes).unwrap();
 
+    let expected_knee = saturation_bytes.div_ceil(record_bytes);
+    assert!(
+        verify.ahead >= expected_knee,
+        "multi-row verify must size ahead >= volume storage saturation knee ({expected_knee}): verify={verify:?}"
+    );
     assert!(
         verify.ahead > single.ahead,
         "multi-row verify must size more ahead staging records than M=1: verify={verify:?} single={single:?}"

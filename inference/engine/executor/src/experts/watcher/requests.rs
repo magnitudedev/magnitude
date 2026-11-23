@@ -187,6 +187,12 @@ impl Rest {
 pub(super) struct Requests {
     residency: Arc<Yielding<Residency>>,
     shared: Arc<Shared>,
+    /// Path 0 link copier handle (`Copier` is `Clone` and posts lock-free to
+    /// `Copies`'s priority queue without ever blocking on CUDA), so
+    /// `Residency::rings()` dispatches `HINT_LEADS=2` DMA staging immediately
+    /// after resolving live hints instead of waiting for `Residency::keep`'s
+    /// background `TURN`.
+    copier: Option<super::Copier>,
     /// Held by its thread through each pass, beside residency's lock: the
     /// exchange's watchdog reads it ([`Service::report`]).
     service: Arc<Mutex<Service>>,
@@ -230,7 +236,7 @@ impl Service {
 }
 
 impl Requests {
-    pub(super) fn new(residency: Arc<Yielding<Residency>>, shared: Arc<Shared>) -> Self {
+    pub(super) fn new(residency: Arc<Yielding<Residency>>, shared: Arc<Shared>, copier: Option<super::Copier>) -> Self {
         let service = {
             let held = lock(&residency);
             let layers = held.core.layers.len();
@@ -243,7 +249,7 @@ impl Requests {
                 rested: Rested::fixed(IDLE),
             }
         };
-        Self { residency, shared, service: Arc::new(Mutex::new(service)) }
+        Self { residency, shared, copier, service: Arc::new(Mutex::new(service)) }
     }
 
     /// Its state, as the exchange's watchdog reads it.
@@ -415,7 +421,7 @@ impl Requests {
         }
         assert!(posted.next().is_none(), "the look takes requests of the load's layers, in order");
         if self.shared.parks.settled() {
-            progressed |= residency.rings(&self.shared, service.look.served(), freed | progressed);
+            progressed |= residency.rings(&self.shared, service.look.served(), freed | progressed, self.copier.as_ref());
         }
         progressed
     }

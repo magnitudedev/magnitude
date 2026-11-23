@@ -457,6 +457,20 @@ impl PathAdmission {
         }
     }
 
+    /// Compute overlap window available to a lookahead hint issued `lead`
+    /// layers ahead of its target layer (`lead * C / L`, floored by
+    /// `layer_idle(layers)`). Matches the overlap window `Prefetch::derive`
+    /// and `LinkMover::stage_predicted` use when scheduling `Source::Lead`
+    /// hints, so `HintGate` does not collapse `idle` to `0.0` and disable
+    /// `POLICY_HINTS` the instant a path becomes binding.
+    pub fn hint_lead_idle(&self, lead: u8, layers: usize) -> f64 {
+        if layers == 0 {
+            return 0.0;
+        }
+        let c_lead = f64::from(lead) * (self.terms.compute / layers as f64);
+        self.layer_idle(layers).max(c_lead)
+    }
+
     /// Maximum speculative prefetch bytes per step that fit inside the idle
     /// path slack without pushing `(U + W) * t_bw` past `C`:
     /// `B_budget = (C - path_term).max(0.0) * P_peak`
@@ -518,6 +532,38 @@ impl PathAdmission {
     /// admitted given `idle` seconds of remaining idle compute / draft window.
     pub fn admits(&self, p: f64, bytes: u64, idle: f64) -> bool {
         p >= self.break_even(bytes, idle)
+    }
+
+    /// Priced net expected stall gain (in miss-equivalent units) of
+    /// speculatively prefetching `bytes` with live-calibrated hit probability
+    /// `p`, given `free_slack` seconds of genuinely idle path time (e.g. an
+    /// active MTP `DraftWindow` or non-binding compute slack):
+    /// `(p * s_demand - (1 - p) * w_net) / s_demand`.
+    ///
+    /// Returns `<= 0.0` when expected wasted path time exceeds expected stall
+    /// saved (zero magic cutoff); when positive, the move pays iff it also
+    /// exceeds any victim eviction loss `max(0, E[victim; τ] - E[candidate; τ])`.
+    pub fn carryover_net_benefit(&self, p: f64, bytes: u64, free_slack: f64) -> f64 {
+        assert!(free_slack.is_finite() && free_slack >= 0.0, "free_slack must be finite and non-negative, got {free_slack}");
+        let p = p.clamp(0.0, 1.0);
+        if p <= 0.0 {
+            return 0.0;
+        }
+        let t_bw = self.transfer_seconds(bytes);
+        // Active-step carryover (`free_slack == 0.0`) always prices expected
+        // wasted transfer time `(1 - p) * t_bw` even when another tier/link
+        // dominates `Terms::time()`, because wasted NVMe reads still consume
+        // shared drive/DDR5 bandwidth and delay concurrent demand misses.
+        // Genuine idle slack (`free_slack > 0.0`, e.g. MTP DraftWindow) offsets
+        // `t_bw` up to `free_slack`.
+        let w_net = (t_bw - t_bw.min(free_slack)).max(0.0);
+        if w_net == 0.0 {
+            return p;
+        }
+        match self.effective_stall(bytes) {
+            Some(s_demand) if s_demand > 0.0 => p - (1.0 - p) * (w_net / s_demand),
+            _ => 0.0,
+        }
     }
 
     /// Critical-path stall of `reads` demand misses fetched together at a
@@ -1093,5 +1139,37 @@ mod tests {
         assert!((budget.remaining() - 10.0e-3).abs() < 1e-12);
         budget.consume(20.0e-3);
         assert_eq!(budget.remaining(), 0.0);
+    }
+
+    #[test]
+    fn carryover_net_benefit_prices_drive_waste_without_magic_cutoff() {
+        let bytes = 8_800_000u64;
+        // Gen4/Gen5 NVMe: t_bw = 0.50 ms, demand stall = 1.00 ms -> t_bw / s_demand = 0.50,
+        // exact zero-slack break-even p* = 0.50 / (1.00 + 0.50) = 1/3.
+        let line = ReadLine::new(0.50e-3, 0.50e-3 / bytes as f64).unwrap();
+        let drive_bound = Terms { compute: 0.030, drive: 0.120, link: 0.0, cpu: 0.0, memory: 0.0 };
+        let adm = PathAdmission::drive(drive_bound, Some(line), Some(1.00e-3), None);
+        assert!(adm.binds());
+
+        // Low-p carryover (0.09, like the 10:1 waste regime) is strictly negative -> rejected.
+        assert!(adm.carryover_net_benefit(0.09, bytes, 0.0) < 0.0);
+        // Exact break-even p = 1/3 -> 0.0.
+        assert!(adm.carryover_net_benefit(1.0 / 3.0, bytes, 0.0).abs() < 1e-12);
+        // High-p carryover (0.60) -> 0.60 - 0.40 * 0.50 = +0.40 miss-equivalent benefit.
+        assert!((adm.carryover_net_benefit(0.60, bytes, 0.0) - 0.40).abs() < 1e-12);
+
+        // During genuine free slack (e.g. MTP DraftWindow >= t_bw), w_net = 0 -> net_benefit == p.
+        assert!((adm.carryover_net_benefit(0.25, bytes, 1.0e-3) - 0.25).abs() < 1e-12);
+
+        // Even on a 3-tier link-bound / compute-bound host (`!binds`),
+        // active-step carryover (`free_slack == 0.0`) still prices drive waste
+        // so low-p reads (0.09) are rejected instead of flooding NVMe/DDR5,
+        // while genuine DraftWindow slack (`free_slack >= t_bw`) sets w_net = 0.
+        let link_bound = Terms { compute: 0.050, drive: 0.015, link: 0.080, cpu: 0.0, memory: 0.0 };
+        let non_binding_adm = PathAdmission::drive(link_bound, Some(line), Some(1.00e-3), None);
+        assert!(!non_binding_adm.binds());
+        assert!(non_binding_adm.carryover_net_benefit(0.09, bytes, 0.0) < 0.0);
+        assert!((non_binding_adm.carryover_net_benefit(0.60, bytes, 0.0) - 0.40).abs() < 1e-12);
+        assert!((non_binding_adm.carryover_net_benefit(0.25, bytes, 1.0e-3) - 0.25).abs() < 1e-12);
     }
 }

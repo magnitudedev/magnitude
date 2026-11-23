@@ -686,4 +686,60 @@ mod tests {
         );
         assert_eq!(gate.rates.cohort(1, r1, e1), None, "stale cohort from 344-slot regime must be inapplicable");
     }
+
+    /// Reproduces `2a8127` (`rtx5090-128g-gen5` DeepSeek): when `terms.drive`
+    /// becomes binding (`binds() == true`), `layer_idle()` collapses to `0.0`,
+    /// which used to snap `break_even` up to `t_bw / s_demand` (~0.78) and
+    /// flip `POLICY_HINTS = 0` mid-request (17x exposed-bytes death spiral).
+    /// With `hint_lead_idle(lead, layers)`, `Source::Lead` hints see their
+    /// true `lead * C / L` compute overlap window and keep `POLICY_HINTS = 1`.
+    #[test]
+    fn drive_binding_keeps_policy_hints_on_via_lead_compute_overlap() {
+        use magnitude_cost_model::{PathAdmission, ReadLine, Terms};
+
+        let layers = 40usize;
+        let bytes = 8_800_000u64;
+        // Gen5 NVMe (11.3 GB/s -> t_bw ~0.78 ms, demand stall ~1.00 ms) on a
+        // 40-layer model with C = 30 ms (c_layer = 0.75 ms) and drive = 45 ms
+        // (binding: drive > compute).
+        let nvme = ReadLine::new(0.22e-3, 1.0 / 11.3e9).unwrap();
+        let terms = Terms { compute: 0.030, drive: 0.045, link: 0.012, cpu: 0.0, memory: 0.020 };
+        let drive_adm = PathAdmission::drive(terms, Some(nvme), Some(1.00e-3), None);
+        assert!(drive_adm.binds(), "NVMe drive binds once host-tier DMA speeds up");
+        assert_eq!(drive_adm.layer_idle(layers), 0.0, "layer_idle collapses to 0 when drive binds");
+
+        // Old bug: break_even(bytes, 0.0) ~ 0.78 rejected a 0.35-precision hint.
+        let hint_p = 0.35;
+        assert!(
+            drive_adm.break_even(bytes, 0.0) > hint_p,
+            "without lead compute overlap, break_even ({}) would reject hint_p={hint_p}",
+            drive_adm.break_even(bytes, 0.0)
+        );
+        // Fix: hint_lead_idle(1, 40) = 0.75 ms overlaps ~96% of t_bw (0.78 ms),
+        // dropping break_even to ~0.03 << hint_p.
+        let lead1_be = drive_adm.break_even(bytes, drive_adm.hint_lead_idle(1, layers));
+        assert!(lead1_be < hint_p, "lead-1 compute overlap must admit hint_p={hint_p}: break_even={lead1_be}");
+
+        let time = Time::new(&[vec![256]], 32);
+        let mut gate = HintGate::new(vec![vec![1], Vec::new()], time.clone());
+        let prices = table();
+        for step in 1..=20 {
+            time.lock().register(step, Advance::Known(Tokens::new(1.0)));
+            gate.resolved(&[Cohort {
+                step,
+                layer: 1,
+                misses: 3,
+                saved: vec![catchers(&[1]), catchers(&[1])],
+            }]);
+        }
+        let decided = gate.decide(&[false, false], Some(&prices), drive_adm, Some((1, 0.045)), |_, lead, miss| {
+            let idle = miss.hint_lead_idle(lead, layers);
+            hint_p >= miss.break_even(bytes, idle)
+        });
+        assert_eq!(
+            decided,
+            [true, false],
+            "POLICY_HINTS must stay ON for hinting layer 0 when drive binds and routed_hint_route hints clear lead compute overlap"
+        );
+    }
 }

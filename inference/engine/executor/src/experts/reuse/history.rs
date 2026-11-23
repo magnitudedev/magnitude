@@ -1,6 +1,6 @@
-//! Measured exponential-decay half-life selection (`HALF_LIVES` × per-layer
-//! Mattson stacks and per-group pools): the single owner of what decode history
-//! predicts (`p_∞` and the history tie-break order).
+//! Measured per-layer exponential-decay half-life selection (`HALF_LIVES` ×
+//! per-layer Mattson stacks): the single owner of what decode history predicts
+//! (`p_∞` and the history tie-break order).
 //!
 //! Each half-life `h` in [`HALF_LIVES`] tracks every expert's decayed read count
 //! via its equivalent step [`Score`] (`h · log2 Σ 2^(t/h)`, or last read at
@@ -10,13 +10,14 @@
 //! to the active choices `k` across all experts, and is strictly monotone in
 //! `Score` with zero rescaling and zero tuned constants.
 //!
-//! Each half-life also maintains a per-layer Mattson priority stack and a
-//! per-group pool, counting decode misses at the live capacities. The candidate
-//! `(scope, half_life)` with the fewest decode misses so far is live, and its
-//! half-life supplies `p_∞` and the history order.
+//! Each half-life also maintains a per-layer Mattson priority stack counting
+//! exponentially decayed decode misses at each layer's nominal share of its
+//! group's live capacity. Each layer independently selects the half-life with
+//! the fewest decayed misses (breaking ties toward longer half-lives so
+//! frequency skew is preserved during cold start and warmup), letting skewed
+//! layers expose high `p_∞` while flat or bursty layers select short decay.
 
 use super::super::watcher::Step;
-use std::collections::BTreeSet;
 use std::mem::size_of;
 
 /// The half-lives, in decode steps, the history selector measures reads by.
@@ -94,15 +95,8 @@ pub(super) struct HistoryRank {
     order: u64,
 }
 
-type Pooled = (HistoryRank, usize, usize);
-
-struct Pool {
-    records: usize,
-    held: BTreeSet<Pooled>,
-}
-
 /// Decode history measured at one half-life: per-layer scores, equivalent step
-/// across all decode steps, per-layer Mattson stacks, and per-group pools.
+/// across all decode steps, and per-layer Mattson stacks with decayed misses.
 struct Measure {
     half_life: f64,
     miss_decay: f64,
@@ -110,22 +104,15 @@ struct Measure {
     steps_score: Vec<Score>,
     logged: u64,
     stacks: Vec<Vec<usize>>,
-    misses: f64,
-    groups: Vec<usize>,
-    pools: Vec<Pool>,
-    pooled: Vec<Vec<bool>>,
-    pooled_misses: f64,
-    /// Pre-allocated scratch buffers (fixed capacity `max_experts`, zero per-call allocs).
-    scratch_held: Vec<usize>,
-    scratch_lacked: Vec<usize>,
+    misses: Vec<f64>,
+    /// Pre-allocated scratch buffer (fixed capacity `max_experts`, zero per-call allocs).
     scratch_entering: Vec<usize>,
 }
 
 impl Measure {
-    fn new(half_life: f64, experts: &[usize], groups: &[usize], records: &[usize]) -> Self {
+    fn new(half_life: f64, experts: &[usize]) -> Self {
         let max_experts = experts.iter().copied().max().unwrap_or(0);
-        let num_layers = experts.len().max(1) as f64;
-        let miss_decay = 0.5_f64.powf(1.0 / (MISS_HALF_LIFE_STEPS * num_layers));
+        let miss_decay = 0.5_f64.powf(1.0 / MISS_HALF_LIFE_STEPS);
         Self {
             half_life,
             miss_decay,
@@ -133,13 +120,7 @@ impl Measure {
             steps_score: vec![Score::NEVER; experts.len()],
             logged: 0,
             stacks: experts.iter().map(|&n| Vec::with_capacity(n)).collect(),
-            misses: 0.0,
-            groups: groups.to_vec(),
-            pools: records.iter().map(|&cap| Pool { records: cap, held: BTreeSet::new() }).collect(),
-            pooled: experts.iter().map(|&n| vec![false; n]).collect(),
-            pooled_misses: 0.0,
-            scratch_held: Vec::with_capacity(max_experts),
-            scratch_lacked: Vec::with_capacity(max_experts),
+            misses: vec![0.0; experts.len()],
             scratch_entering: Vec::with_capacity(max_experts),
         }
     }
@@ -148,20 +129,6 @@ impl Measure {
     fn rank(&self, layer: usize, expert: usize) -> HistoryRank {
         let Logged { score, last, order } = self.layers[layer][expert];
         HistoryRank { score, last, order }
-    }
-
-    #[inline]
-    fn pooled_rank(&self, layer: usize, expert: usize) -> Pooled {
-        (self.rank(layer, expert), layer, expert)
-    }
-
-    fn fit(&mut self, group: usize, records: usize) {
-        let pool = &mut self.pools[group];
-        pool.records = records;
-        while pool.held.len() > records {
-            let (.., layer, expert) = pool.held.pop_first().expect("a pool past its records holds one");
-            self.pooled[layer][expert] = false;
-        }
     }
 
     fn depth(&self, layer: usize, expert: usize) -> usize {
@@ -180,28 +147,14 @@ impl Measure {
     }
 
     fn read_decode(&mut self, layer: usize, step: Step, experts: &[usize], slots: usize) {
-        let group = self.groups[layer];
         let mut misses = 0u64;
-        self.scratch_held.clear();
-        self.scratch_lacked.clear();
         for &expert in experts {
             if self.depth(layer, expert) >= slots {
                 misses += 1;
             }
-            if self.pooled[layer][expert] {
-                self.scratch_held.push(expert);
-            } else {
-                self.scratch_lacked.push(expert);
-            }
         }
-        self.misses = self.misses * self.miss_decay + misses as f64;
-        self.pooled_misses = self.pooled_misses * self.miss_decay + self.scratch_lacked.len() as f64;
+        self.misses[layer] = self.misses[layer] * self.miss_decay + misses as f64;
 
-        for i in 0..self.scratch_held.len() {
-            let expert = self.scratch_held[i];
-            let place = self.pooled_rank(layer, expert);
-            self.pools[group].held.remove(&place);
-        }
         self.fill_entering(layer, experts);
         for i in 0..self.scratch_entering.len() {
             let expert = self.scratch_entering[i];
@@ -215,33 +168,10 @@ impl Measure {
             logged.score = logged.score.sum(now, self.half_life);
             logged.last = logged.last.max(Some(step));
         }
-        for i in 0..self.scratch_held.len() {
-            let expert = self.scratch_held[i];
-            let place = self.pooled_rank(layer, expert);
-            self.pools[group].held.insert(place);
-        }
         self.fill_entering(layer, experts);
         for i in 0..self.scratch_entering.len() {
             let expert = self.scratch_entering[i];
             self.promote(layer, expert);
-        }
-        for i in 0..self.scratch_entering.len() {
-            let expert = self.scratch_entering[i];
-            if !self.scratch_lacked.contains(&expert) {
-                continue;
-            }
-            let pool = &mut self.pools[group];
-            if pool.held.len() >= pool.records {
-                let Some((.., of, victim)) = pool.held.pop_first() else {
-                    continue;
-                };
-                self.pooled[of][victim] = false;
-            }
-            if pool.held.len() < pool.records {
-                let place = self.pooled_rank(layer, expert);
-                self.pools[group].held.insert(place);
-                self.pooled[layer][expert] = true;
-            }
         }
     }
 
@@ -298,16 +228,14 @@ impl Measure {
         let layers: usize = self.layers.iter().map(|l| l.capacity() * size_of::<Logged>()).sum();
         let steps = self.steps_score.capacity() * size_of::<Score>();
         let stacks: usize = self.stacks.iter().map(|s| s.capacity() * size_of::<usize>()).sum();
-        let groups = self.groups.capacity() * size_of::<usize>();
-        let pools: usize = self.pools.iter().map(|p| p.records * size_of::<Pooled>()).sum();
-        let pooled: usize = self.pooled.iter().map(|p| p.capacity() * size_of::<bool>()).sum();
-        let scratch = (self.scratch_held.capacity() + self.scratch_lacked.capacity() + self.scratch_entering.capacity()) * size_of::<usize>();
-        (size_of::<Self>() + layers + steps + stacks + groups + pools + pooled + scratch) as u64
+        let misses = self.misses.capacity() * size_of::<f64>();
+        let scratch = self.scratch_entering.capacity() * size_of::<usize>();
+        (size_of::<Self>() + layers + steps + stacks + misses + scratch) as u64
     }
 }
 
-/// Live half-life selector across [`HALF_LIVES`] × `{per-layer, group-pool}`:
-/// the single owner of what decode history predicts.
+/// Per-layer live half-life selector across [`HALF_LIVES`]: the single owner of
+/// what decode history predicts.
 pub(super) struct History {
     measures: Vec<Measure>,
     groups: Vec<usize>,
@@ -317,9 +245,8 @@ pub(super) struct History {
     /// for `h = 0` recency rates.
     decode_steps: Vec<u64>,
     harmonic: Vec<f64>,
-    /// Winning candidate in `0..2 * HALF_LIVES.len()`: `live % HALF_LIVES.len()`
-    /// is the winning half-life index (`< HALF_LIVES.len()` per-layer, `>=` pooled).
-    live: usize,
+    /// Per-layer winning half-life index in `0..HALF_LIVES.len()`.
+    live: Vec<usize>,
 }
 
 impl History {
@@ -331,12 +258,15 @@ impl History {
         }
         let slots: Vec<usize> = groups
             .iter()
-            .map(|&group| if members[group] > 0 { records[group] / members[group] } else { 0 })
+            .map(|&group| {
+                if members[group] > 0 && records[group] > 0 {
+                    records[group].div_ceil(members[group])
+                } else {
+                    0
+                }
+            })
             .collect();
-        let measures = HALF_LIVES
-            .iter()
-            .map(|&half_life| Measure::new(half_life, experts, groups, records))
-            .collect();
+        let measures = HALF_LIVES.iter().map(|&half_life| Measure::new(half_life, experts)).collect();
         Self {
             measures,
             groups: groups.to_vec(),
@@ -344,28 +274,19 @@ impl History {
             slots,
             decode_steps: vec![0; experts.len()],
             harmonic: vec![0.0; experts.len()],
-            live: 0,
+            live: vec![HALF_LIVES.len() - 1; experts.len()],
         }
     }
 
     #[inline]
-    fn live_measure(&self) -> &Measure {
-        &self.measures[self.live % HALF_LIVES.len()]
-    }
-
-    #[inline]
-    fn missed(&self, candidate: usize) -> f64 {
-        let measure = &self.measures[candidate % HALF_LIVES.len()];
-        if candidate >= HALF_LIVES.len() {
-            measure.pooled_misses
-        } else {
-            measure.misses
-        }
+    fn live_measure(&self, layer: usize) -> &Measure {
+        &self.measures[self.live[layer]]
     }
 
     /// Log a decode step's routed `experts` at `layer` and `step`: updates all
-    /// half-life stacks and pools and selects the candidate with fewest decayed
-    /// misses.
+    /// half-life stacks for `layer` and selects `layer`'s half-life with fewest
+    /// decayed misses (breaking ties toward longer half-lives so frequency skew
+    /// is preserved during cold start and warmup).
     pub(super) fn read_decode(&mut self, layer: usize, step: Step, experts: &[usize]) {
         self.decode_steps[layer] += 1;
         self.harmonic[layer] += 1.0 / self.decode_steps[layer] as f64;
@@ -373,49 +294,56 @@ impl History {
         for measure in &mut self.measures {
             measure.read_decode(layer, step, experts, slots);
         }
-        self.live = (0..2 * HALF_LIVES.len())
-            .min_by(|&a, &b| self.missed(a).total_cmp(&self.missed(b)))
+        self.live[layer] = (0..HALF_LIVES.len())
+            .min_by(|&a, &b| {
+                self.measures[a].misses[layer]
+                    .total_cmp(&self.measures[b].misses[layer])
+                    .then_with(|| b.cmp(&a))
+            })
             .expect("HALF_LIVES is non-empty");
     }
 
     /// Group `group` holds `records` records from now: updates each member
-    /// layer's nominal share and fits every half-life's group pool.
+    /// layer's nominal share.
     pub(super) fn resize(&mut self, group: usize, records: usize) {
-        let share = if self.members[group] > 0 { records / self.members[group] } else { 0 };
+        let share = if self.members[group] > 0 && records > 0 {
+            records.div_ceil(self.members[group])
+        } else {
+            0
+        };
         for (layer, &g) in self.groups.iter().enumerate() {
             if g == group {
                 self.slots[layer] = share;
             }
         }
-        for measure in &mut self.measures {
-            measure.fit(group, records);
-        }
     }
 
     /// Normalized decayed decode rate `p_∞ ∈ [0, 1]` for `(layer, expert)`
-    /// under the live half-life, or `None` before the first decode step at `layer`.
+    /// under `layer`'s live half-life, or `None` before the first decode step
+    /// at `layer`.
     #[inline]
     pub(super) fn rate(&self, layer: usize, expert: usize) -> Option<f64> {
-        self.live_measure().rate(layer, expert, self.harmonic[layer])
+        self.live_measure(layer).rate(layer, expert, self.harmonic[layer])
     }
 
-    /// History tie-break rank for `(layer, expert)` under the live half-life.
+    /// History tie-break rank for `(layer, expert)` under `layer`'s live
+    /// half-life.
     #[inline]
     pub(super) fn rank(&self, layer: usize, expert: usize) -> HistoryRank {
-        self.live_measure().rank(layer, expert)
+        self.live_measure(layer).rank(layer, expert)
     }
 
-    /// The live half-life, in steps.
+    /// `layer`'s live half-life, in steps.
     #[cfg(test)]
-    pub(super) fn half_life(&self) -> f64 {
-        self.live_measure().half_life
+    pub(super) fn half_life(&self, layer: usize) -> f64 {
+        self.live_measure(layer).half_life
     }
 
     /// Fixed memory charge in bytes (constant in run length).
     pub(super) fn bytes(&self) -> u64 {
         let measures: u64 = self.measures.iter().map(Measure::bytes).sum();
         let meta = size_of::<Self>()
-            + (self.groups.capacity() + self.members.capacity() + self.slots.capacity()) * size_of::<usize>()
+            + (self.groups.capacity() + self.members.capacity() + self.slots.capacity() + self.live.capacity()) * size_of::<usize>()
             + self.decode_steps.capacity() * size_of::<u64>()
             + self.harmonic.capacity() * size_of::<f64>();
         measures + meta as u64
@@ -428,7 +356,7 @@ mod tests {
 
     #[test]
     fn frequency_outranks_one_later_read_over_a_half_life() {
-        let mut measure = Measure::new(4., &[2], &[0], &[2]);
+        let mut measure = Measure::new(4., &[2]);
         for step in [1, 2, 3, 4] {
             measure.read_decode(0, step, &[0], 2);
         }
@@ -467,14 +395,17 @@ mod tests {
         for step in 1..=10u64 {
             history.read_decode(0, step, &[step as usize]);
         }
-        // All 10 reads are distinct -> all candidates miss identically -> live stays on h = 0.
-        assert_eq!(history.half_life(), 0.0);
+        // All 10 reads are distinct -> all candidates miss identically -> ties
+        // prefer the longest half-life so frequency skew is never erased on cold start.
+        assert_eq!(history.half_life(0), *HALF_LIVES.last().unwrap());
         let expected_h: f64 = (1..=10).map(|d| 1.0 / d as f64).sum();
         assert!((history.harmonic[0] - expected_h).abs() < 1e-12);
-        assert_eq!(history.rate(0, 0), Some(0.0), "unread expert has rate 0");
+        // Verify the h = 0 recency measure directly.
+        let recency = &history.measures[0];
+        assert_eq!(recency.rate(0, 0, expected_h), Some(0.0), "unread expert has rate 0");
         let mut prev = 0.0;
         for step in 1..=10usize {
-            let r = history.rate(0, step).unwrap();
+            let r = recency.rate(0, step, expected_h).unwrap();
             assert!(r > 0.0 && r <= 1.0, "rate {r} for step {step} out of (0, 1]");
             assert!(r > prev, "more recent step {step} ({r}) must strictly outrank older ({prev})");
             let want = 1.0 / ((1 + (10 - step)) as f64 * expected_h);
@@ -490,10 +421,10 @@ mod tests {
             let experts = if step % 3 == 0 { vec![0, step as usize] } else { vec![step as usize] };
             history.read_decode(0, step, &experts);
         }
-        assert!(history.half_life() > 0., "a half-life kept the hot expert");
+        assert!(history.half_life(0) > 0., "a half-life kept the hot expert");
         let recency = &history.measures[0];
-        let live = history.live_measure();
-        assert!(live.misses < recency.misses, "{} of {}", live.misses, recency.misses);
+        let live = history.live_measure(0);
+        assert!(live.misses[0] < recency.misses[0], "{} of {}", live.misses[0], recency.misses[0]);
         assert!(history.rate(0, 0).unwrap() > history.rate(0, 60).unwrap());
     }
 
@@ -530,7 +461,7 @@ mod tests {
             }
             step += 1;
         }
-        assert!(history.half_life() > 0., "session 1 selects a positive half-life");
+        assert!(history.half_life(0) > 0., "session 1 selects a positive half-life");
 
         // Session 2 (600 steps): shifting bursts of 2 experts for 6 steps each.
         // Pure recency (h = 0) adapts immediately on each burst change, whereas
@@ -544,9 +475,41 @@ mod tests {
             }
         }
         assert!(
-            history.half_life() <= 4.0,
+            history.half_life(0) <= 4.0,
             "session 2 should adapt to a short half-life, got {}",
-            history.half_life()
+            history.half_life(0)
+        );
+    }
+
+    /// Per-layer half-life selection lets a stationary skewed layer pick a long
+    /// half-life while a bursty/shifting layer in the same group picks a short
+    /// half-life, exposing high `p_∞` on the skewed layer without cross-layer interference.
+    #[test]
+    fn per_layer_half_life_selects_independently_for_skewed_and_bursty_layers() {
+        let mut history = History::new(&[128, 128], &[0, 0], &[4]);
+        for step in 1..=300u64 {
+            // Layer 0: stationary skewed — expert 0 every 3rd step beside cold experts.
+            let cold = 1 + ((step as usize) % 127);
+            if step % 3 == 0 {
+                history.read_decode(0, step, &[0, cold]);
+            } else {
+                history.read_decode(0, step, &[cold]);
+            }
+            // Layer 1: shifting bursts of 2 experts for 6 steps each (short half-life wins).
+            let burst = ((step - 1) / 6) as usize;
+            let a = (burst * 2) % 126 + 1;
+            let b = a + 1;
+            history.read_decode(1, step, &[a, b]);
+        }
+        assert!(
+            history.half_life(0) >= 16.0,
+            "skewed layer 0 should select a long half-life, got {}",
+            history.half_life(0)
+        );
+        assert!(
+            history.half_life(1) <= 4.0,
+            "bursty layer 1 should select a short half-life, got {}",
+            history.half_life(1)
         );
     }
 }

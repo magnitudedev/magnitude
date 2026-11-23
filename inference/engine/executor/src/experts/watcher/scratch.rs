@@ -446,6 +446,7 @@ fn compose_rounds(cold: &[usize], borrowers: &[Option<usize>], round_records: us
 /// moves forward and a failure is final, so a later serve of the step's
 /// request changes none.
 pub(super) fn fail(core: &Core, shared: &Shared, sequence: Step, reason: String) {
+    shared.transport.fail_prefill_step(sequence, reason.clone());
     shared.steps.fail(sequence, reason);
     for layer in &core.layers {
         let scratch = &layer.scratch;
@@ -1595,7 +1596,7 @@ impl Scratch {
                     RequestStage::Awaiting(self.opened(at, window, arrived, request, core, shared))
                 }
                 RequestStage::Awaiting(opened) => {
-                    match self.await_landings(layer, &opened.cold, core, prefetch, ledger) && self.claim_scratch(index, set_index, &opened.cold, core) {
+                    match self.await_landings(layer, &opened.cold, core, prefetch, ledger, shared) && self.claim_scratch(index, set_index, &opened.cold, core) {
                         true => RequestStage::Rounds(self.fix_rounds(at, set_index, window, opened, core, shared)),
                         false => {
                             return (
@@ -1657,6 +1658,7 @@ impl Scratch {
         core: &mut Core,
         prefetch: &mut Prefetch,
         ledger: &mut crate::experts::interest::Ledger,
+        shared: &Shared,
     ) -> bool {
         let landing = |scratch: &Self, core: &Core| {
             cold.iter()
@@ -1673,7 +1675,7 @@ impl Scratch {
         for &staged in &awaited {
             prefetch.hasten(staged);
         }
-        let _ = prefetch.settle(&mut core.directory, ledger);
+        let _ = prefetch.settle(&mut core.directory, ledger, shared);
         self.settle_landings(core);
         landing(self, core).is_empty()
     }
@@ -1760,6 +1762,7 @@ impl Scratch {
         // step that routed it: decided once at window 0, then copied and
         // committed per window while each window's slots hold its experts.
         let mut seeded = 0;
+        let mut seed_pairs: Vec<(i32, i32)> = Vec::new();
         if sequence == last {
             if window == 0 {
                 let tier = &self.tiers[index];
@@ -1780,7 +1783,7 @@ impl Scratch {
             }
             let first = core.directory.seeded_from(core.layers[layer].group);
             let tier = &self.tiers[index];
-            let pairs = tier
+            seed_pairs = tier
                 .seeds
                 .as_deref()
                 .unwrap_or(&[])
@@ -1796,8 +1799,8 @@ impl Scratch {
                 })
                 .collect::<Vec<_>>();
             let bounds = ListBounds { from: lw as u64, to: core.layers[layer].lists.bank - first as u64, lent: 0 };
-            core.layers[layer].seeds.publish_list(sequence, &pairs, bounds);
-            seeded = pairs.len() as u64;
+            core.layers[layer].seeds.publish_list(sequence, &seed_pairs, bounds);
+            seeded = seed_pairs.len() as u64;
         }
         // The rounds fix the device's order of the request's experts: a
         // record goes to a later round's only while every earlier one's
@@ -1807,12 +1810,23 @@ impl Scratch {
                 self.tiers[index].sets[set_index].schedule_round(layer, expert, round);
             }
         }
-        // The tier list, which the tier copy reads after round 0's answer.
+        // The tier list, which the tier copy reads after round 0's answer, and
+        // which `ExpertTransport` receives directly on the host for producer-
+        // enqueued prefill DMA (zero `cuEventSynchronize` drains).
         for &expert in &tiered {
             self.tiers[index].sets[set_index].mark_tiered(layer, expert);
         }
         let tier = ListBounds { from: core.layers[layer].lists.tier, to: lw as u64, lent: 0 };
         core.layers[layer].tiered.publish_list(sequence, &listed, tier);
+        shared.transport.publish_prefill_plan(
+            layer,
+            sequence,
+            window,
+            crate::experts::transport::PrefillPlan {
+                listed,
+                seeds: seed_pairs,
+            },
+        );
         // The window's staged count in its first round lane, which
         // `routed_scratch_grids` reads after round 0's answer, and at window 0
         // the request lane's answer.
@@ -1877,7 +1891,7 @@ impl Scratch {
             let chunk = rounds.cold.chunks(round_records).nth(round as usize).unwrap_or_default().to_vec();
             // Reads into staging that ended free their records, as the
             // rounds the device has converted free theirs (`convey`).
-            let _ = prefetch.settle(&mut core.directory, ledger);
+            let _ = prefetch.settle(&mut core.directory, ledger, shared);
             self.convey(core, shared);
             let tier = self.tiers.iter().find(|tier| (tier.group, tier.layer) == (group, layer)).expect("a served request's tier");
             if let Some(reason) = chunk.iter().find_map(|&expert| tier.sets[set_index].experts[expert].failure()) {

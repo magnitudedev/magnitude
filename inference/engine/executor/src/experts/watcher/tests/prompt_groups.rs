@@ -534,7 +534,7 @@ fn a_discrete_groups_scratch_leases_its_bank_records_and_returns_them_free() {
     eventually("the group's reads were never ranked", || shared.telemetry.fed_all());
     let evicted = shared.shrink(super::super::resize::Evicting::Bank, Candidates::one(3, vec![3]), None).unwrap().expect("the shrink evicts beside no step");
     assert!(evicted.records[0].iter().all(|&record| record >= 2), "a shrink never evicts a lent record");
-    assert_eq!(shared.costs().records, [1], "decode's capacity: the records past the lent ones");
+    assert_eq!(shared.costs().records, [3], "decode's capacity: all 3 present records (0..2 reclaimed during decode)");
     let step = harness.prompt_step();
     harness.scratch(&step, 0, &[6]);
     assert!(lent(0) && lent(1), "the next group is leased the records again");

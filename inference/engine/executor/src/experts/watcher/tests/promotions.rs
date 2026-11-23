@@ -253,3 +253,221 @@ fn the_promotions_asked_together_copy_each_as_its_own_batch() {
         assert_eq!([0, 1, 2].map(|kind| harness.banked(kind, record)), [0, 100, 200].map(|base| (base + expert) as u8));
     }
 }
+
+/// Mandatory 5-way integrated invariant test for Zero-Recopy Demand-Landing
+/// Promotion (all 6 `astra@magnitop` invariants on CPU backend):
+/// 1. Flight 1 holds victim `V` in slot 1; release at step 2 transitions slot 1
+///    to `Record::Releasing` (stamped unmap) with zero reuse before retirement.
+/// 2. After Flight 1 ends and `drain()` frees slot 1, Flight 2 lands `E` into
+///    slot 1 (`Record::DemandLanding`, unpublished in `StampedMap`) with 1 H2D.
+/// 3. Flight 3 joins slot 1 (`demand_joins == 1`, `transfers_issued == 1`).
+/// 4. Flight 2 cancels its `ConsumerLease` while Flight 3 still pins slot 1,
+///    and a concurrent `shrink` runs: shrink evicts ONLY unpinned slot 0
+///    (never pinned slot 1) and bytes for Flight 3 remain exact.
+/// 5. On completion, slot 1 is O(1)-promoted `Record::DemandLanding -> Record::Held((0, E))`
+///    with `map.held(E) == Some(1)`, `transfers_issued == 1` (zero second H2D),
+///    exact bytes, and empty `deferred_syncs` after drain.
+#[test]
+fn zero_recopy_demand_landing_five_way_invariant_test() {
+    use crate::experts::directory::{BankRecord, DemandSlotClaim, Directory, HostRecord, HostTier, Placement, Point, RoutedRead};
+    use crate::experts::host_records::{Claim, Refuses, Taking};
+    use crate::experts::map::StampedMap;
+    use crate::experts::reuse::{Evidence, Reuse};
+    use crate::experts::transport::{DestSlot, ExpertTransport};
+    use crate::experts::Words;
+    use magnitude_kernels::constants;
+    use seismic::{BackendName, Charges, Element, Tensor, Transfer, TransferItem, TransferRun};
+
+    let device = crate::test_support::open_backend(
+        &seismic::Devices::discover(&[]).expect("discover devices"),
+        BackendName::Cpu,
+    )
+    .expect("CPU device");
+    let charges = Charges::tally(&device);
+    let transfer = Transfer::new(&device).expect("CPU transfer");
+
+    const EXPERTS: usize = 8;
+    const U: usize = 0; // Unpinned expert in slot 0
+    const V: usize = 1; // Victim expert in slot 1 (held by Flight 1)
+    const E: usize = 2; // New demand-landed expert (lands into slot 1)
+
+    let bank_map_tensor = Tensor::shared(&charges, Element::i32(), &[EXPERTS as u64, constants::MAP_WORDS]).unwrap();
+    let bank_map = StampedMap::new(Words::new(bank_map_tensor, EXPERTS as u64 * constants::MAP_WORDS, 0).unwrap());
+    let map = bank_map.view().clone();
+
+    let tier_map_tensor = Tensor::shared(&charges, Element::i32(), &[EXPERTS as u64]).unwrap();
+    let tier_map = crate::experts::map::LandingMap::Tier(Words::new(tier_map_tensor, EXPERTS as u64, 0).unwrap());
+
+    let mut directory = Directory::new(
+        &[2], // 2 unified VRAM slots: slot 0 and slot 1
+        &[0], // 1 layer in group 0
+        &[EXPERTS],
+        HostTier {
+            records: vec![4],
+            lent: vec![0],
+            reserve: 0,
+            placement: Placement::Tier {
+                bank_maps: vec![bank_map],
+                tier_maps: vec![tier_map],
+                lent: (0, 0),
+                stage_slots: vec![0],
+            },
+        },
+    );
+    directory.price_copies(0, Some(0.0));
+
+    // Land U (tier_record 0), V (tier_record 1), E (tier_record 2) into host tier.
+    let mut tier_records = [0u32; 3];
+    for (idx, expert) in [U, V, E].into_iter().enumerate() {
+        let Claim::Taken(grant) = directory.claim_landing(0, expert, 0, Taking::Out, Refuses) else {
+            panic!("host tier must have room for expert {expert}");
+        };
+        let tr = grant.record();
+        tier_records[idx] = tr;
+        directory.landed(0, HostRecord(tr), expert, None);
+    }
+    let tier_e = tier_records[2] as usize;
+
+    // Physical host & bank byte buffers (64 bytes per expert) to verify exact bytes.
+    let mut host_e = Tensor::shared(&charges, Element::bool(), &[64]).unwrap();
+    host_e.write_from_host(&[0xEEu8; 64]).unwrap();
+    let mut bank_slot0 = Tensor::shared(&charges, Element::bool(), &[64]).unwrap();
+    bank_slot0.write_from_host(&[0xAAu8; 64]).unwrap();
+    let mut bank_slot1 = Tensor::shared(&charges, Element::bool(), &[64]).unwrap();
+    bank_slot1.write_from_host(&[0xBBu8; 64]).unwrap();
+
+    let steps = Steps::new(
+        crate::planning::FlightDepth::PIPELINED,
+        1,
+        crate::experts::exchange::Pulse::of(BackendName::Cpu),
+    );
+    let transport = ExpertTransport::new_registry_only();
+
+    // Seed initial permanent VRAM: slot 0 holds U, slot 1 holds V.
+    let ranking = directory.ranking();
+    {
+        let time = directory.time();
+        time.lock().register(0, crate::experts::horizon::Advance::Known(crate::experts::horizon::Tokens::new(1.0)));
+    }
+    Reuse::of(&ranking).read(&RoutedRead { sequence: 0, layer: 0, choices: 2, experts: vec![U, V] }, None, Evidence::Decode);
+    let asked = steps.unbegun(|at| directory.promotions(at, 2));
+    assert_eq!(asked.promotions.len(), 2);
+    let mut completed = Vec::new();
+    for (group, record, (layer, expert)) in directory.queued() {
+        let tier = directory.hold_tier(layer, expert).expect("tier kept");
+        directory.copy(group, record, tier, 1);
+        completed.push((group, record));
+    }
+    directory.promoted(completed, Point::whole(0, 0, 0), &steps);
+    let slot_v = directory.held(0, V).expect("V held in VRAM");
+    let slot_u = directory.held(0, U).expect("U held in VRAM");
+    assert_ne!(slot_u, slot_v);
+
+    // 1. Flight 1 (step 1) begins and reads V from slot_v.
+    let flight1 = steps.begin_group(1, None);
+    assert_eq!(map.resolve(V, flight1), Some(slot_v));
+
+    // Release V at step 2 while Flight 1 is still running -> Record::Releasing.
+    let released = steps.unbegun(|at| {
+        directory.replenish_demand_free(0, 1, at, |slot| {
+            // Protect U so V is deterministically chosen as the victim.
+            slot == slot_v && transport.can_reuse_slot(DestSlot { group: 0, slot })
+        })
+    });
+    assert_eq!(released, 1, "V must be released into Record::Releasing");
+    assert_eq!(map.resolve(V, flight1), Some(slot_v), "Flight 1 must still see V");
+    assert_eq!(map.resolve(V, flight1 + 1), None, "steps >= 2 must see V unmapped");
+
+    // Zero reuse before Flight 1 retires!
+    assert!(!directory.drain(Point::whole(flight1, 0, flight1), &steps), "slot_v must NOT drain while Flight 1 runs");
+    assert_eq!(
+        directory.claim_demand_landing(0, tier_e as u32, false, |slot| transport.can_reuse_slot(DestSlot { group: 0, slot })),
+        DemandSlotClaim::Overflow { staged: Some((0, E)) },
+        "no free slot available while Flight 1 holds Releasing slot_v"
+    );
+
+    // Flight 1 cancels/completes -> drain() frees slot_v!
+    steps.end_played(flight1);
+    assert!(directory.drain(Point::whole(flight1, 0, flight1), &steps), "slot_v must drain after Flight 1 ends");
+
+    // 2. Flight 2 (step 2) claims freed slot_v for E and issues ONE H2D copy.
+    let flight2 = steps.begin_group(1, None);
+    let claim = directory.claim_demand_landing(0, tier_e as u32, false, |slot| {
+        transport.can_reuse_slot(DestSlot { group: 0, slot })
+    });
+    assert_eq!(claim, DemandSlotClaim::Allocated { staged: Some((0, E)), slot: slot_v });
+    let dest = DestSlot { group: 0, slot: slot_v };
+    let (id, lease2) = transport.begin_demand_transfer(0, 0, E, tier_e, dest);
+    let (_, sync) = transfer
+        .copy_synced(&[TransferItem::Run(TransferRun {
+            source: &host_e,
+            source_offset: 0,
+            destination: if slot_v == 1 { &bank_slot1 } else { &bank_slot0 },
+            destination_offset: 0,
+            bytes: 64,
+        })])
+        .expect("copy_synced E");
+    transport.attach_sync(id, sync);
+    assert_eq!(transport.transfers_issued(), 1, "exactly 1 H2D transfer issued");
+    assert_eq!(map.held(E), None, "E must NOT be published in StampedMap while in flight");
+
+    // 3. Flight 3 (step 3) joins slot_v (`demand_joins == 1`, zero second H2D!).
+    let flight3 = steps.begin_group(1, None);
+    let joined = transport
+        .join_by_tier_record(0, 0, tier_e)
+        .expect("Flight 3 must join in-flight demand transfer of E");
+    assert_eq!(joined.dest, dest);
+    assert_eq!(transport.demand_joins(), 1, "expected 1 demand join");
+    assert_eq!(transport.transfers_issued(), 1, "joining must NOT issue a second H2D");
+
+    // 4. Flight 2 cancels its ConsumerLease while Flight 3 still pins slot_v,
+    //    and a concurrent shrink runs.
+    lease2.release();
+    steps.end_played(flight2);
+    assert!(!transport.can_reuse_slot(dest), "Flight 3 still pins slot_v");
+
+    let evictions = directory.evictions_filtered_with(
+        0,
+        1,
+        |_, _| None,
+        false,
+        |slot| transport.can_reuse_slot(DestSlot { group: 0, slot }),
+    );
+    assert_eq!(evictions, vec![slot_u], "shrink must evict ONLY unpinned slot_u, NEVER pinned slot_v");
+    let got_bytes = (if slot_v == 1 { &bank_slot1 } else { &bank_slot0 })
+        .read_to_host()
+        .expect("read bank slot");
+    assert_eq!(got_bytes, vec![0xEEu8; 64], "Flight 3 must observe exact original bytes of E");
+
+    // 5. Flight 3 completes -> O(1) zero-recopy promotion `DemandLanding -> Held((0, E))`!
+    transport.complete_dma(id);
+    joined.lease.release();
+    transport.drain_deferred_syncs();
+    assert_eq!(transport.deferred_syncs_len(), 0, "deferred_syncs must be empty after drain");
+
+    // Feed E's decode read so Reuse ranks E positively.
+    {
+        let time = directory.time();
+        time.lock().register(flight3, crate::experts::horizon::Advance::Known(crate::experts::horizon::Tokens::new(1.0)));
+    }
+    Reuse::of(&ranking).read(&RoutedRead { sequence: flight3, layer: 0, choices: 1, experts: vec![E] }, None, Evidence::Decode);
+
+    let promoted = directory.finish_demand_landing(
+        0,
+        slot_v,
+        Some((0, E)),
+        Point::whole(flight3, 0, flight3),
+        &steps,
+        transport.can_reuse_slot(dest),
+    );
+    steps.end_played(flight3);
+    assert!(promoted, "E must be O(1)-promoted in place with copy_hits = 0.0");
+    assert_eq!(transport.transfers_issued(), 1, "O(1) promotion must issue ZERO second H2D");
+    assert_eq!(directory.held(0, E), Some(slot_v), "slot_v must now be Record::Held((0, E))");
+    assert_eq!(map.held(E), Some(slot_v), "StampedMap must publish E at slot_v");
+    let got_after = (if slot_v == 1 { &bank_slot1 } else { &bank_slot0 })
+        .read_to_host()
+        .expect("read bank slot after promotion");
+    assert_eq!(got_after, vec![0xEEu8; 64], "promoted slot must retain exact bytes");
+    let _ = BankRecord(slot_v as u32);
+}

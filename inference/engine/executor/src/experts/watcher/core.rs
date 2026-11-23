@@ -256,6 +256,27 @@ impl RoutingRecord {
         self.choices.iter().copied()
     }
 
+    /// `(row, expert)` pairs for every non-front choice (`front`, STEP_FRONT's
+    /// bits; `selected` choices per row, in row order). Used by `NameLedger`
+    /// to learn live per-token and bigram routing patterns (`Source::Token`).
+    pub(super) fn row_experts(&self, front: u32, selected: usize) -> Vec<(u8, u16)> {
+        if selected == 0 {
+            return Vec::new();
+        }
+        self.choices
+            .iter()
+            .enumerate()
+            .filter_map(|(index, &(expert, _))| {
+                if front_choice(front, selected, index) {
+                    return None;
+                }
+                let row = u8::try_from(index / selected).ok()?;
+                let expert = u16::try_from(expert).ok()?;
+                Some((row, expert))
+            })
+            .collect()
+    }
+
     /// Its choices of rows that are not front rows (`front`, STEP_FRONT's
     /// bits; `selected` choices a row, in row order as the route writes
     /// them).
@@ -455,8 +476,9 @@ impl At {
         Self { point, position }
     }
 
-    /// A unit test's whole-step point at `(sequence, layer)`.
-    #[cfg(test)]
+    /// A whole-step point at `(sequence, layer)` with position 0 (used by
+    /// host-side cross-burst naming before a step's device order is assigned,
+    /// and by unit tests).
     pub(in crate::experts) const fn whole(sequence: super::Step, layer: usize) -> Self {
         Self { point: Point::whole(sequence, layer, sequence), position: 0 }
     }

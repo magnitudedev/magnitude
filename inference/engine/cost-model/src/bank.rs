@@ -296,9 +296,9 @@ impl BankPrices {
     /// Neither marginal is priced before the load runs, so the plan holds
     /// the mean release's records and leaves that trade to the running
     /// load.
-    pub fn paths(&self, bytes: u64, held: HeldSlots, hint_leads: u64) -> Option<PathRecords> {
+    pub fn paths(&self, bytes: u64, held: HeldSlots, hint_leads: u64, saturation_bytes: u64) -> Option<PathRecords> {
         let layers: u64 = self.routed.iter().map(|kind| kind.layers).sum();
-        self.layers.path_records(self.read, self.compute, bytes, held, hint_leads, layers, self.decode_rows)
+        self.layers.path_records(self.read, self.compute, bytes, held, hint_leads, layers, self.decode_rows, saturation_bytes)
     }
 }
 

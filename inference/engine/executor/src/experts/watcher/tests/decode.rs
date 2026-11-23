@@ -411,9 +411,9 @@ fn batched_verify_with_exact_only_request_advances_the_clock() {
     let req_b = RequestId(2);
     let verify = harness.begun().decoding(
         [
-            DecodeRow { position: 10, request: req_a, ahead: None },
-            DecodeRow { position: 11, request: req_a, ahead: Some(AheadOf::new(1, 1, 0)) },
-            DecodeRow { position: 20, request: req_b, ahead: None },
+            DecodeRow { position: 10, request: req_a, ahead: None, token: None },
+            DecodeRow { position: 11, request: req_a, ahead: Some(AheadOf::new(1, 1, 0)), token: None },
+            DecodeRow { position: 20, request: req_b, ahead: None, token: None },
         ]
         .into_iter(),
         0,
@@ -429,7 +429,7 @@ fn batched_verify_with_exact_only_request_advances_the_clock() {
     assert_eq!(shared.time().lock().clock.through_latest(), Tokens::new(2.0), "1 exact + 1 accepted");
 
     // The next decode step registers cleanly.
-    let next = harness.begun().decoding([DecodeRow { position: 12, request: req_a, ahead: None }].into_iter(), 0);
+    let next = harness.begun().decoding([DecodeRow { position: 12, request: req_a, ahead: None, token: None }].into_iter(), 0);
     assert_eq!(shared.time().lock().clock.at(next.sequence()), Tokens::new(2.0));
     harness.route_at(&next, 0, &[]);
     next.complete().unwrap();
@@ -438,8 +438,8 @@ fn batched_verify_with_exact_only_request_advances_the_clock() {
     // than be silently dropped.
     let pending = harness.begun().decoding(
         [
-            DecodeRow { position: 13, request: req_a, ahead: None },
-            DecodeRow { position: 14, request: req_a, ahead: Some(AheadOf::new(1, 1, 0)) },
+            DecodeRow { position: 13, request: req_a, ahead: None, token: None },
+            DecodeRow { position: 14, request: req_a, ahead: Some(AheadOf::new(1, 1, 0)), token: None },
         ]
         .into_iter(),
         0,

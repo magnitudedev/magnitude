@@ -228,6 +228,9 @@ pub(super) struct Shared {
     prices: Mutex<Option<magnitude_cost_model::LaunchPrices>>,
     /// Whether the load's account was given as it settled.
     settled: crate::settle::Once,
+    /// Unified copy-engine-first `ExpertTransport` shared across `LinkMover`,
+    /// `Scratch`, `Copies`, and `ExpertBank`.
+    pub(crate) transport: Arc<crate::experts::transport::ExpertTransport>,
     /// The policy words a run's encoding reads, as last written, and the
     /// write residency staged since ([`Self::stage_policy`]), written only
     /// while no step runs.
@@ -468,6 +471,15 @@ impl Shared {
         self.tell(crate::experts::interest::Told::DraftWindow { estimated_seconds });
     }
 
+    /// Drafted tokens for `request`'s upcoming burst (anchor `y_0` on head
+    /// launch, then drafted proposals `[y_1..y_k]` on head completion):
+    /// publishes token-conditioned `Source::Token` interests into `NameLedger`.
+    pub fn draft_tokens(&self, request: crate::operation::RequestId, tokens: Vec<crate::operation::TokenId>) {
+        if !tokens.is_empty() {
+            self.tell(crate::experts::interest::Told::DraftTokens { request, tokens });
+        }
+    }
+
     /// When the host reads a step's request: at a park where parks are
     /// submission boundaries, as it is written where kernels wait in place.
     pub(super) fn notice(&self) -> crate::assessment::Notice {
@@ -691,6 +703,39 @@ impl Shared {
     pub fn holdings(&self) -> (Vec<usize>, Vec<usize>) {
         self.telemetry.holdings()
     }
+
+    pub(in crate::experts) fn record_dma_call(
+        &self,
+        skipped_zero_miss: bool,
+        experts_landed: u64,
+        bytes_landed: u64,
+        overflow_experts: u64,
+    ) {
+        self.telemetry.engagement().record_dma_call(
+            skipped_zero_miss,
+            experts_landed,
+            bytes_landed,
+            overflow_experts,
+        );
+    }
+
+    pub(in crate::experts) fn record_dma_host_wait(&self, elapsed: std::time::Duration) {
+        self.telemetry.engagement().record_dma_host_wait(elapsed);
+    }
+
+    /// Wake the CPU site's noticing worker immediately when `DecodeFront`
+    /// publishes at least one CPU-sited choice (`SOURCE_SITE >= 0`).
+    pub(in crate::experts) fn wake_site_noticer(&self) {
+        self.compute.wake_noticer();
+    }
+
+    pub(in crate::experts) fn is_ended(&self) -> bool {
+        self.life.ended().is_some()
+    }
+
+    pub(in crate::experts) fn record_growth_refusal(&self) {
+        self.telemetry.engagement().record_growth_refusal();
+    }
 }
 
 /// The running watcher: serving's threads and what they share.
@@ -707,8 +752,8 @@ pub(super) struct Watcher {
     keeper: Option<JoinHandle<()>>,
     /// The exchange's watchdog over the load (`liveness::watch`).
     watchdog: Option<crate::experts::exchange::Watchdog>,
-    /// Residency's state, which a test reads to set up what serving finds.
-    #[cfg(test)]
+    /// Residency's state, shared with `ExpertBank` for zero-recopy unified
+    /// demand-landing slot allocation and O(1) completion promotion.
     state: Arc<crate::experts::yielding::Yielding<Residency>>,
 }
 
@@ -721,6 +766,7 @@ pub(super) struct WatcherParts {
     pub pools: Vec<Pool>,
     pub extents: Extents,
     pub slots: Arc<std::sync::atomic::AtomicU64>,
+    pub host_slots: Arc<std::sync::atomic::AtomicU64>,
     pub whole: bool,
     pub staging: u32,
     pub host: HostTier,
@@ -740,6 +786,9 @@ pub(super) struct WatcherParts {
     /// load's own reads measure the drive; none for a plan priced before the
     /// machine's figures were measured.
     pub line: Option<magnitude_cost_model::ReadLine>,
+    /// Unified copy-engine-first `ExpertTransport` shared with `ExpertBank`
+    /// and `Copies`.
+    pub transport: Arc<crate::experts::transport::ExpertTransport>,
 }
 
 impl Watcher {
@@ -759,7 +808,7 @@ impl Watcher {
         parts: WatcherParts,
         bounds: Option<Box<dyn Fn() -> crate::experts::exchange::Bounds + Send>>,
     ) -> Result<Self, String> {
-        let WatcherParts { layers, group_reads, groups, load, pools, extents, slots, whole, staging, host, carrier, source, compute, copier, steps, spans, trip, line } = parts;
+        let WatcherParts { layers, group_reads, groups, load, pools, extents, slots, host_slots, whole, staging, host, carrier, source, compute, copier, steps, spans, trip, line, transport } = parts;
         // The geometry every read lands by, checked once: each pool's
         // staging holds the staging records, and the conveyor lies in each
         // pool, at most a record of every expert of the widest layer.
@@ -859,6 +908,7 @@ impl Watcher {
             reads,
             extents,
             slots,
+            host_slots,
             capacities.clone(),
             resident,
             core.directory.ranking(),
@@ -920,6 +970,7 @@ impl Watcher {
             passes: Mutex::new(None),
             prices: Mutex::new(None),
             settled: Default::default(),
+            transport,
             policy: Mutex::default(),
         });
         crate::settle::owe_shared(Arc::downgrade(&shared));
@@ -949,6 +1000,7 @@ impl Watcher {
             opened: Instant::now(),
             complete: false,
             lines: None,
+            logged_initial_lines: false,
             published: residency::Published::new(count, capacities),
             owed: resize::Owed::default(),
         };
@@ -969,10 +1021,9 @@ impl Watcher {
             copies: Vec::new(),
             keeper: None,
             watchdog: None,
-            #[cfg(test)]
             state: residency.clone(),
         };
-        let requests = Requests::new(residency.clone(), shared.clone());
+        let requests = Requests::new(residency.clone(), shared.clone(), copier.clone());
         watcher.watchdog = Some({
             let held = residency::lock(&residency);
             liveness::watch(&held.core, &shared, residency.clone(), requests.service(), copies.clone(), answers, bounds, trip)?
@@ -1016,6 +1067,88 @@ impl Watcher {
     pub fn bank_lent(&self, group: usize, record: u32) -> bool {
         residency::lock(&self.state).core.directory.lent(group, record as usize)
     }
+
+    /// Claim a unified VRAM slot in `group` for an on-demand decode DMA
+    /// landing of `tier_record` (non-blocking).
+    pub(in crate::experts) fn claim_demand_slot(
+        &self,
+        group: usize,
+        tier_record: u32,
+    ) -> crate::experts::directory::DemandSlotClaim {
+        let mut held = residency::lock(&self.state);
+        let lending = held.core.steps.lending();
+        let transport = self.shared.transport.clone();
+        held.core.directory.claim_demand_landing(group, tier_record, lending, |slot| {
+            transport.can_reuse_slot(crate::experts::transport::DestSlot { group, slot })
+        })
+    }
+
+    /// Release aborted/faulted `Record::DemandLanding` slots back to `Free`.
+    pub(in crate::experts) fn abort_demand_slots(&self, slots: &[(usize, usize)]) {
+        if slots.is_empty() {
+            return;
+        }
+        let mut held = residency::lock(&self.state);
+        for &(group, slot) in slots {
+            held.core.directory.release_demand_landing(group, slot);
+        }
+    }
+
+    /// Asynchronously release lowest-ranked unpinned `Record::Held` victims
+    /// in `group` into `Record::Releasing` when `Free` headroom is scarce.
+    pub(in crate::experts) fn replenish_demand_free(&self, group: usize, want_free: usize) {
+        let mut held = residency::lock(&self.state);
+        let transport = self.shared.transport.clone();
+        let core = &mut held.core;
+        let (directory, steps) = (&mut core.directory, &core.steps);
+        let released = steps.unbegun(|at| {
+            directory.replenish_demand_free(group, want_free, at, |slot| {
+                transport.can_reuse_slot(crate::experts::transport::DestSlot { group, slot })
+            })
+        });
+        if released > 0 {
+            self.shared.events().notify();
+        }
+    }
+
+    /// Zero-recopy O(1) completion of freshly landed `DemandSlot`s: promotes
+    /// qualifying slots `DemandLanding -> Held` (with `copy_hits = 0.0`) and
+    /// publishes via `StampedMap::map_covering`, or returns unpromoted slots
+    /// to `Free` (deferring if a joined consumer still pins the slot).
+    pub(in crate::experts) fn finish_demand_landings(
+        &self,
+        layer: usize,
+        sequence: u64,
+        slots: &[crate::experts::transport::DemandSlot],
+    ) {
+        if slots.is_empty() {
+            return;
+        }
+        let mut held = residency::lock(&self.state);
+        let progress = held.core.steps.point(sequence, layer, sequence);
+        let transport = self.shared.transport.clone();
+        let mut promoted_any = false;
+        let core = &mut held.core;
+        let (directory, steps) = (&mut core.directory, &core.steps);
+        for &slot in slots {
+            let can_reuse = transport.can_reuse_slot(crate::experts::transport::DestSlot {
+                group: slot.group,
+                slot: slot.slot,
+            });
+            promoted_any |= directory.finish_demand_landing(
+                slot.group,
+                slot.slot,
+                slot.staged,
+                progress,
+                steps,
+                can_reuse,
+            );
+        }
+        if promoted_any {
+            held.publish_held();
+            held.publish_policy();
+        }
+    }
 }
 
 /// The load's account of its landings and of its starved steps, once
@@ -1027,6 +1160,15 @@ impl crate::settle::Owed for Shared {
             tracing::info!("expert {}", self.steps.interruptions());
             if let Some(a1) = self.telemetry.far_deciles_line() {
                 tracing::info!("expert {a1}");
+            }
+            let site_served = self.compute.site_served();
+            let residency = self.telemetry.residency();
+            if let Some(engagement) = self
+                .telemetry
+                .engagement()
+                .summary_line_with(site_served.requests, site_served.experts, residency)
+            {
+                tracing::info!("expert engagement: {engagement}");
             }
         }
     }

@@ -8688,9 +8688,9 @@ fn hint_rings_publish_each_leads_ranked_experts() {
     let activation = bf16_tensor(&device, &[0, k], &[]);
     let residual = hint_residual(constants::VERIFY_ROWS as usize, hu);
     let mut unresolved = policy_words(0, 0, [0; 3]);
-    unresolved[constants::POLICY_RESOLVED as usize] = 0;
+    unresolved[constants::POLICY_WHOLE as usize] = 0;
     let mut resolved = unresolved.clone();
-    resolved[constants::POLICY_RESOLVED as usize] = 1;
+    resolved[constants::POLICY_WHOLE as usize] = 1;
     // An entry's declared statics, from `given` and the single stream's.
     let statics_of = |names: &[String], given: &[(&str, u64)]| {
         let given = single_stream_statics(names, given);
