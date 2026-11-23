@@ -262,6 +262,60 @@ impl<'p> StepSubmitter<'p> {
         }
     }
 
+    /// The steps of a chain whose runs all queued (`queue_chain`): each
+    /// launch with its command sequences and expert step, the last taking
+    /// every read.
+    fn into_steps(self, runs: Chain<((ValidatedTargetLaunch, Banked), QueuedRuns)>) -> Chain<(ValidatedTargetLaunch, DeviceStep)> {
+        // Each launch takes its command sequences, from where the
+        // launch before it ended.
+        let mut completions = self.completions.into_iter();
+        let mut taken = 0;
+        let mut steps = runs.map(|((launch, banked), runs)| {
+            let step = DeviceStep {
+                readout: runs.readout,
+                commits: runs.commits,
+                completions: completions.by_ref().take(runs.sequences - taken).collect(),
+                stored_reads: Vec::new(),
+                landed_reads: Vec::new(),
+                expert_step: banked.map(|(_, step)| step),
+                decode_landings: Vec::new(),
+            };
+            taken = runs.sequences;
+            (launch, step)
+        });
+        // Every launch's reads are queued before the first ends, and
+        // a chain of several launches is one request that commits as
+        // one: its last step, which completes once every read's gate
+        // opened, takes them all.
+        let (_, last) = steps.last_mut();
+        last.stored_reads = self.reads;
+        last.landed_reads = self.landed;
+        last.decode_landings = self.decode_landings;
+        steps
+    }
+
+    /// The refusal of a chain whose runs failed to queue (`queue_chain`):
+    /// runs already submitted are observed, the rest abandoned, and each
+    /// expert step refused.
+    fn refuse(mut self, error: SubmitError, steps: Chain<(ValidatedTargetLaunch, Banked)>) -> super::ChainRefusal {
+        // The failure is reported; outcomes of runs submitted before
+        // it matter only for draining the device. Runs still queued
+        // are dropped unsubmitted, and their stored-table steps
+        // read nothing.
+        let _ = wait_all(std::mem::take(&mut self.completions));
+        self.abandon_unsubmitted();
+        // The device is past the chain's runs: each step is refused,
+        // none fed, as no run of the chain's is known to have written
+        // its records. A watcher that panicked fails the load.
+        let (chain, expert_steps) = steps.unzip();
+        let watcher = expert_steps.into_iter().flatten().map(|(_, step)| step.refuse()).filter_map(Result::err).reduce(|first, _| first);
+        let error = match watcher {
+            Some(failure) => invalid(format!("{error}; {failure}")),
+            None => error,
+        };
+        super::ChainRefusal { error, chain }
+    }
+
     /// Pin a decode layer's landed/joined VRAM slots until the next layer's
     /// `DecodeFront` or step completion proves `DecodeBack` has finished.
     fn hold_decode_landing(
@@ -669,6 +723,9 @@ struct DeviceStep {
 /// One launch of a chain once its readout is queued: its readout, its
 /// commit span, and where its command sequences end in the chain's
 /// (`StepSubmitter`). A launch's begin where the one before it ends.
+/// A launch's expert step and the bank serving it, of a streamed load.
+type Banked = Option<(Arc<crate::experts::ExpertBank>, crate::experts::ExpertStep)>;
+
 struct QueuedRuns {
     readout: Option<TargetReadoutGraphResult>,
     commits: CommitSpan,
@@ -1701,53 +1758,10 @@ impl NativeTargetProgram {
             StepSubmitter::new(&self.device, release),
             |steps, submitter| self.queue_runs(steps, spare, &sets, serving.as_ref(), submitter),
         );
+        // Each outcome is taken in a frame of its own, beside the queuing's.
         match queued {
-            Ok(runs) => {
-                // Each launch takes its command sequences, from where the
-                // launch before it ended.
-                let mut completions = submitter.completions.into_iter();
-                let mut taken = 0;
-                let mut steps = runs.map(|((launch, banked), runs)| {
-                    let step = DeviceStep {
-                        readout: runs.readout,
-                        commits: runs.commits,
-                        completions: completions.by_ref().take(runs.sequences - taken).collect(),
-                        stored_reads: Vec::new(),
-                        landed_reads: Vec::new(),
-                        expert_step: banked.map(|(_, step)| step),
-                        decode_landings: Vec::new(),
-                    };
-                    taken = runs.sequences;
-                    (launch, step)
-                });
-                // Every launch's reads are queued before the first ends, and
-                // a chain of several launches is one request that commits as
-                // one: its last step, which completes once every read's gate
-                // opened, takes them all.
-                let (_, last) = steps.last_mut();
-                last.stored_reads = submitter.reads;
-                last.landed_reads = submitter.landed;
-                last.decode_landings = submitter.decode_landings;
-                Ok(steps)
-            }
-            Err((error, steps)) => {
-                // The failure is reported; outcomes of runs submitted before
-                // it matter only for draining the device. Runs still queued
-                // are dropped unsubmitted, and their stored-table steps
-                // read nothing.
-                let _ = wait_all(std::mem::take(&mut submitter.completions));
-                submitter.abandon_unsubmitted();
-                // The device is past the chain's runs: each step is refused,
-                // none fed, as no run of the chain's is known to have written
-                // its records. A watcher that panicked fails the load.
-                let (chain, expert_steps) = steps.unzip();
-                let watcher = expert_steps.into_iter().flatten().map(|(_, step)| step.refuse()).filter_map(Result::err).reduce(|first, _| first);
-                let error = match watcher {
-                    Some(failure) => invalid(format!("{error}; {failure}")),
-                    None => error,
-                };
-                Err(super::ChainRefusal { error, chain })
-            }
+            Ok(runs) => Ok(submitter.into_steps(runs)),
+            Err((error, steps)) => Err(submitter.refuse(error, steps)),
         }
     }
 
