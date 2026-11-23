@@ -240,7 +240,11 @@ fn plan_load(manifest: &ExecutionManifest, selected: &platform::SelectedDevice, 
         draft.policy().method(),
         manifest.model.kv_codec,
         draft.policy().limits(),
-        ResourceCapacity { domain_bytes: budget.available(), tensor_operations, allocations: selected.info.limits().allocations() },
+        ResourceCapacity {
+            domain_bytes: budget.capacity().max(budget.available()),
+            tensor_operations,
+            allocations: selected.info.limits().allocations(),
+        },
     )
     .map_err(internal)?;
     Ok(LoadPlans { resident, draft, held_pass, state })
