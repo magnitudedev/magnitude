@@ -1,7 +1,6 @@
 import { Array, Context, Effect, Layer, Option, Order, Schema, Stream } from "effect"
 import {
   LocalModelFamilySchema,
-  ONBOARDING_FLOOR_TOKENS_PER_SECOND,
   RecommendationsSchema,
   TARGET_TOKENS_PER_SECOND,
   Models,
@@ -110,20 +109,17 @@ const byIntelligence = Order.mapInput(
 )
 
 /**
- * Models whose chosen rung reaches the target first, then those reaching the onboarding floor,
- * then usable ones (>= 1 tok/s), then fitting models below 1 tok/s or without a speed estimate,
- * then those with no fitting rung.
+ * Models whose chosen rung reaches the target first, then usable ones (>= 1 tok/s),
+ * then fitting models below 1 tok/s or without a speed estimate, then those with no fitting rung.
  */
 const standing = ({ model, speed }: RankedModel): number =>
   model.meetsTarget
     ? 0
-    : model.meetsOnboardingFloor
+    : Option.exists(speed, (tokensPerSecond) => tokensPerSecond >= USABLE_TOKENS_PER_SECOND)
       ? 1
-      : Option.exists(speed, (tokensPerSecond) => tokensPerSecond >= USABLE_TOKENS_PER_SECOND)
+      : Option.isSome(model.chosen)
         ? 2
-        : Option.isSome(model.chosen)
-          ? 3
-          : 4
+        : 3
 
 const recommendationOrder = Order.combine(
   Order.mapInput(Order.number, standing),
@@ -177,7 +173,6 @@ export const projectRecommendations = (inputs: RecommendationInputs): Recommenda
           chosen: Option.map(chosen, ({ model }) => model.modelId),
           rungs: Array.map(ladder, ({ model }) => model.modelId),
           meetsTarget: Option.exists(chosen, (candidate) => reaches(candidate, TARGET_TOKENS_PER_SECOND)),
-          meetsOnboardingFloor: Option.exists(chosen, (candidate) => reaches(candidate, ONBOARDING_FLOOR_TOKENS_PER_SECOND)),
         },
         speed: Option.flatMap(chosen, (candidate) => candidate.speed),
       }]
@@ -188,7 +183,7 @@ export const projectRecommendations = (inputs: RecommendationInputs): Recommenda
   const { measured, rungs, models } = ranked(freeBytes)
   const byId = new Map(catalogModels.map((model) => [model.modelId as string, model] as const))
   // The model that would lead with unlimited disk, when it is not the one leading here because its rung lacks room.
-  const leader = (ranking: readonly RecommendedModel[]) => Array.findFirst(ranking, (model) => model.meetsOnboardingFloor)
+  const leader = (ranking: readonly RecommendedModel[]) => Array.findFirst(ranking, (model) => model.meetsTarget)
   const leading = Option.map(leader(models), ({ base }) => base)
   const roomShortfall = Option.flatMap(freeBytes, (free) =>
     leader(ranked(Option.none()).models).pipe(

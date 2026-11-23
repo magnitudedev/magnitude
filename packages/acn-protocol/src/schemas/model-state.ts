@@ -2059,14 +2059,12 @@ export const LocalModelFamilySchema = Schema.Struct({
 export type LocalModelFamily = typeof LocalModelFamilySchema.Type
 
 /** The decode speed a chosen rung should reach: a long agent conversation stays responsive. */
-export const TARGET_TOKENS_PER_SECOND = 20
-/** The decode speed below which onboarding recommends no model. */
-export const ONBOARDING_FLOOR_TOKENS_PER_SECOND = 10
+export const TARGET_TOKENS_PER_SECOND = 10
 
 /**
  * A tested model recommended for this machine. `rungs` is its ladder of quants, smallest to largest; `chosen` is
  * the rung chosen for this machine, none when no rung fits or its family is coming soon. `meetsTarget`: the chosen
- * rung reaches the target decode speed; `meetsOnboardingFloor`: it reaches the onboarding floor.
+ * rung reaches the target decode speed.
  */
 export const RecommendedModelSchema = Schema.Struct({
   base: CatalogBaseIdSchema,
@@ -2076,10 +2074,9 @@ export const RecommendedModelSchema = Schema.Struct({
   chosen: Schema.optionalWith(CatalogFormModelIdSchema, { as: "Option", exact: true }),
   rungs: Schema.NonEmptyArray(CatalogFormModelIdSchema),
   meetsTarget: Schema.Boolean,
-  meetsOnboardingFloor: Schema.Boolean,
 }).pipe(Schema.filter((model) => Option.match(model.chosen, {
-  onNone: () => !model.meetsTarget && !model.meetsOnboardingFloor,
-  onSome: (chosen) => model.rungs.includes(chosen) && (!model.meetsTarget || model.meetsOnboardingFloor),
+  onNone: () => !model.meetsTarget,
+  onSome: (chosen) => model.rungs.includes(chosen),
 }), { message: () => "a recommendation's chosen rung is one of its rungs, and only a chosen rung meets a speed" }))
 export type RecommendedModel = typeof RecommendedModelSchema.Type
 

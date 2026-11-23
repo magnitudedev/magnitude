@@ -731,7 +731,6 @@ describe("RecommendedModelSchema", () => {
     chosen: "model:gguf:q4",
     rungs: ["model:gguf:q2", "model:gguf:q4"],
     meetsTarget: true,
-    meetsOnboardingFloor: true,
   }
 
   it("requires the chosen rung among the rungs, and a speed only of a chosen rung", () => {
@@ -743,7 +742,6 @@ describe("RecommendedModelSchema", () => {
     expect(() => Schema.decodeUnknownSync(RecommendedModelSchema)({
       ...unchosen,
       meetsTarget: false,
-      meetsOnboardingFloor: false,
     })).not.toThrow()
   })
 })

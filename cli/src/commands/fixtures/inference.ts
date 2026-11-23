@@ -512,7 +512,6 @@ export const recommendedModel = (model: CatalogLocalModel): RecommendedCatalogMo
       chosen: Option.some(model.modelId),
       rungs: [model.modelId],
       meetsTarget: true,
-      meetsOnboardingFloor: true,
     },
     chosen: model,
     rungs: [model],

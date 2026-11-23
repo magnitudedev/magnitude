@@ -105,15 +105,15 @@ describe("recommendations", () => {
     expect(project([measured, rung({ id: "a:gguf:q8", storageBytes: 2 * GB, fits: false })]).complete).toBe(true)
   })
 
-  it("chooses the highest rung that fits, has room and reaches 20 tok/s, listing rungs smallest first", () => {
+  it("chooses the highest rung that fits, has room and reaches 10 tok/s, listing rungs smallest first", () => {
     const { models: [model] } = project([
-      rung({ id: "big:gguf:q6", storageBytes: 30 * GB, tokensPerSecond: 15 }),
-      rung({ id: "big:gguf:q2", storageBytes: 10 * GB, tokensPerSecond: 40 }),
-      rung({ id: "big:gguf:q4", storageBytes: 20 * GB, tokensPerSecond: 25 }),
+      rung({ id: "big:gguf:q6", storageBytes: 30 * GB, tokensPerSecond: 8 }),
+      rung({ id: "big:gguf:q2", storageBytes: 10 * GB, tokensPerSecond: 25 }),
+      rung({ id: "big:gguf:q4", storageBytes: 20 * GB, tokensPerSecond: 14 }),
     ])
     expect(model?.rungs).toEqual(["big:gguf:q2", "big:gguf:q4", "big:gguf:q6"])
     expect(model?.chosen).toEqual(Option.some("big:gguf:q4"))
-    expect([model?.meetsTarget, model?.meetsOnboardingFloor]).toEqual([true, true])
+    expect(model?.meetsTarget).toBe(true)
   })
 
   it("skips a rung without room on disk unless it is already downloaded", () => {
@@ -125,10 +125,10 @@ describe("recommendations", () => {
     expect(project(ladder(true), { freeBytes: 15 * GB }).models[0]?.chosen).toEqual(Option.some("big:gguf:q4"))
   })
 
-  it("chooses no rung without room on disk, even when none reaches 20 tok/s, and none still being measured", () => {
+  it("chooses no rung without room on disk, even when none reaches 10 tok/s, and none still being measured", () => {
     const slow = [
-      rung({ id: "big:gguf:q2", storageBytes: 100 * GB, tokensPerSecond: 12 }),
-      rung({ id: "big:gguf:q4", storageBytes: 173 * GB, tokensPerSecond: 12 }),
+      rung({ id: "big:gguf:q2", storageBytes: 100 * GB, tokensPerSecond: 6 }),
+      rung({ id: "big:gguf:q4", storageBytes: 173 * GB, tokensPerSecond: 6 }),
     ]
     expect(project(slow, { freeBytes: 16 * GB }).models[0]?.chosen).toEqual(Option.none())
     const unmeasured = [rung({ id: "big:gguf:q2", storageBytes: 100 * GB }), rung({ id: "small:gguf:q4", storageBytes: 1 * GB })]
@@ -154,7 +154,7 @@ describe("recommendations", () => {
     ]
     const [model] = project(cpu).models
     expect(model?.chosen).toEqual(Option.some("lfm:gguf:q4"))
-    expect([model?.meetsTarget, model?.meetsOnboardingFloor]).toEqual([false, false])
+    expect(model?.meetsTarget).toBe(false)
   })
 
   it("names the model that would lead with more free disk, and how much more it needs", () => {
@@ -172,28 +172,28 @@ describe("recommendations", () => {
     expect(larger.roomShortfall).toEqual(Option.none())
   })
 
-  it("falls back to the highest fitting rung near the fastest when none reaches 20 tok/s", () => {
+  it("falls back to the highest fitting rung near the fastest when none reaches 10 tok/s", () => {
     const { models: [model] } = project([
-      rung({ id: "slow:gguf:q2", storageBytes: 10 * GB, tokensPerSecond: 12 }),
-      rung({ id: "slow:gguf:q4", storageBytes: 20 * GB, tokensPerSecond: 8 }),
+      rung({ id: "slow:gguf:q2", storageBytes: 10 * GB, tokensPerSecond: 7 }),
+      rung({ id: "slow:gguf:q4", storageBytes: 20 * GB, tokensPerSecond: 4 }),
       rung({ id: "slow:gguf:q6", storageBytes: 30 * GB, fits: false }),
     ])
     expect(model?.chosen).toEqual(Option.some("slow:gguf:q2"))
-    expect([model?.meetsTarget, model?.meetsOnboardingFloor]).toEqual([false, true])
+    expect(model?.meetsTarget).toBe(false)
     const { models: [alike] } = project([
-      rung({ id: "alike:gguf:q2", storageBytes: 10 * GB, tokensPerSecond: 19 }),
-      rung({ id: "alike:gguf:q4", storageBytes: 20 * GB, tokensPerSecond: 18 }),
+      rung({ id: "alike:gguf:q2", storageBytes: 10 * GB, tokensPerSecond: 9.5 }),
+      rung({ id: "alike:gguf:q4", storageBytes: 20 * GB, tokensPerSecond: 9 }),
     ])
     expect(alike?.chosen).toEqual(Option.some("alike:gguf:q4"))
     expect(alike?.meetsTarget).toBe(false)
   })
 
-  it("orders fast models by intelligence, then usable ones, then slow ones, then those that do not fit", () => {
+  it("orders target-speed models by intelligence, then usable ones, then slow ones, then those that do not fit", () => {
     const { models } = project([
       rung({ id: "fast-dim:gguf:q4", storageBytes: 1 * GB, tokensPerSecond: 50, intelligence: 20 }),
-      rung({ id: "slow-smart:gguf:q4", storageBytes: 1 * GB, tokensPerSecond: 1, intelligence: 90 }),
-      rung({ id: "usable:gguf:q4", storageBytes: 1 * GB, tokensPerSecond: 14, intelligence: 40 }),
-      rung({ id: "fast-smart:gguf:q4", storageBytes: 1 * GB, tokensPerSecond: 30, intelligence: 60 }),
+      rung({ id: "slow-smart:gguf:q4", storageBytes: 1 * GB, tokensPerSecond: 0.5, intelligence: 90 }),
+      rung({ id: "usable:gguf:q4", storageBytes: 1 * GB, tokensPerSecond: 6, intelligence: 40 }),
+      rung({ id: "fast-smart:gguf:q4", storageBytes: 1 * GB, tokensPerSecond: 14, intelligence: 60 }),
       rung({ id: "huge:gguf:q4", storageBytes: 1 * GB, fits: false, intelligence: 95 }),
     ])
     expect(models.map(({ base }) => base)).toEqual(["fast-smart", "fast-dim", "usable", "slow-smart", "huge"])
@@ -204,12 +204,12 @@ describe("recommendations", () => {
     const { models } = project([
       rung({ id: "crawling-27b:gguf:q4", storageBytes: 1 * GB, tokensPerSecond: 0.3, intelligence: 85 }),
       rung({ id: "usable-slow:gguf:q4", storageBytes: 1 * GB, tokensPerSecond: 3, intelligence: 55 }),
-      rung({ id: "usable-floor:gguf:q4", storageBytes: 1 * GB, tokensPerSecond: 12, intelligence: 40 }),
+      rung({ id: "usable-target:gguf:q4", storageBytes: 1 * GB, tokensPerSecond: 12, intelligence: 40 }),
       rung({ id: "unmeasured:gguf:q4", storageBytes: 1 * GB, speedUnavailable: true, intelligence: 70 }),
       rung({ id: "too-big:gguf:q4", storageBytes: 1 * GB, fits: false, intelligence: 95 }),
     ])
     expect(models.map(({ base }) => base)).toEqual([
-      "usable-floor",
+      "usable-target",
       "usable-slow",
       "crawling-27b",
       "unmeasured",

@@ -7,7 +7,7 @@ import type { OfferedModel } from "./expanding-model"
 const offer = (base: string, options: { chosen?: boolean; floor?: boolean; speed?: number | null; measuring?: boolean; fits?: boolean; bits?: number; name?: string }): OfferedRecommendation => {
   const key = `${base}:gguf:q4`
   return {
-    recommendation: { base, chosen: options.chosen === false ? Option.none() : Option.some(key), meetsOnboardingFloor: options.floor ?? false } as unknown as RecommendedModel,
+    recommendation: { base, chosen: options.chosen === false ? Option.none() : Option.some(key), meetsTarget: options.floor ?? false } as unknown as RecommendedModel,
     model: {
       key: base,
       recommended: options.chosen === false ? null : key,

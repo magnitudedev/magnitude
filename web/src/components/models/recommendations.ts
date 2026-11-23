@@ -27,7 +27,7 @@ export const downloadableRecommendations = (offered: readonly OfferedRecommendat
  */
 export const onboardingChoices = (offered: readonly OfferedRecommendation[]): { readonly choices: readonly OfferedRecommendation[]; readonly speedUnknown: boolean } => {
   const downloadable = downloadableRecommendations(offered)
-  const fast = downloadable.filter(entry => entry.recommendation.meetsOnboardingFloor).slice(0, 3)
+  const fast = downloadable.filter(entry => entry.recommendation.meetsTarget).slice(0, 3)
   if (fast.length > 0) return { choices: fast, speedUnknown: false }
   const recommendedQuant = (entry: OfferedRecommendation) =>
     entry.model.quants.find(candidate => candidate.key === entry.model.recommended)
@@ -62,7 +62,7 @@ export const recommendedForYourMachine = (offered: readonly OfferedRecommendatio
   const { choices, speedUnknown } = onboardingChoices(offered)
   const speed = (entry: OfferedRecommendation) => entry.model.quants.find(quant => quant.key === entry.model.recommended)?.speed ?? 0
   const fastest = choices.reduce<OfferedRecommendation | undefined>((best, entry) => best && speed(best) >= speed(entry) ? best : entry, undefined)
-  const belowFloor = choices.length > 0 && !speedUnknown && !choices.some(entry => entry.recommendation.meetsOnboardingFloor)
+  const belowFloor = choices.length > 0 && !speedUnknown && !choices.some(entry => entry.recommendation.meetsTarget)
   return choices.map((entry, index) => {
     const have = entry.model.quants.find(quant => owned.has(quant.key))
     const ownedNote = have ? (have.bits > 0 ? `You have the ${have.bits}-bit quant` : `You have ${have.name}`) : undefined

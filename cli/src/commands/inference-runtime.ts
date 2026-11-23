@@ -165,7 +165,6 @@ export const RecommendationsJsonSchema = Schema.Struct({
     base: Schema.String,
     rungs: Schema.Array(Schema.String),
     meetsTarget: Schema.Boolean,
-    meetsOnboardingFloor: Schema.Boolean,
     model: CatalogModelJsonSchema,
   })),
 })
@@ -177,7 +176,6 @@ export const recommendationsJson = jsonDocument(RecommendationsJsonSchema, (view
     base: recommendation.base,
     rungs: recommendation.rungs,
     meetsTarget: recommendation.meetsTarget,
-    meetsOnboardingFloor: recommendation.meetsOnboardingFloor,
     model: chosen,
   })),
 }))

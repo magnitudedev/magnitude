@@ -3,13 +3,13 @@
 `magnitude models recommend` lists the models Magnitude has tested, in the order it
 recommends them for this computer. Each tested model has a ladder of quants, smallest to largest,
 and each recommendation names the quant chosen for this computer: the largest one that fits in
-memory, has room on disk and is estimated to decode at 20 tokens per second or more in a long agent
+memory, has room on disk and is estimated to decode at 10 tokens per second or more in a long agent
 conversation; else the largest within 90% of the fastest that fits; and where no speed can be
 measured, the smallest that fits.
 
-Models whose chosen quant reaches 20 tokens per second come first, by intelligence; then those that
-reach 10 tokens per second; then slower ones. Each group is ordered by intelligence, and models below
-20 tok/s are marked "below 20 tok/s on this computer". `--country US` recommends only
+Models whose chosen quant reaches 10 tokens per second come first, by intelligence; then slower
+usable ones; then slower or unmeasured ones. Each group is ordered by intelligence, and models below
+10 tok/s are marked "below 10 tok/s on this computer". `--country US` recommends only
 models whose developer is from that country, choosing among them the same way. A recommendation is
 a starting point for choosing with the user, not a claim that one model is best for every workload.
 

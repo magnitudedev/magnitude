@@ -5169,7 +5169,7 @@ fn comparison_speed(served: &ServingProfile, residency: &ModelResidency) -> Opti
 
 /// The decode speed a recommended version should reach: a long agent conversation stays
 /// responsive. The catalog's recommendations hold the same target.
-const TARGET_TOKENS_PER_SECOND: f64 = 20.0;
+const TARGET_TOKENS_PER_SECOND: f64 = 10.0;
 /// The depth decode speeds are compared at: a long agent conversation.
 const COMPARISON_CONTEXT_TOKENS: u32 = 50_000;
 /// The share of the fastest version's speed within which versions decode alike, so the largest of
