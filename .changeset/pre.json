@@ -39,6 +39,7 @@
     "@magnitudedev/version": "0.0.1"
   },
   "changesets": [
+    "alpha-2-recommendations-and-vulkan",
     "alpha-qa-fixes",
     "cli-only-install",
     "engine-gpu-performance",

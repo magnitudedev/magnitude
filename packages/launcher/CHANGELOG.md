@@ -1,5 +1,11 @@
 # @magnitudedev/cli
 
+## 0.3.0-alpha.2
+
+### Patch Changes
+
+- [`373e998`](https://github.com/magnitudedev/magnitude/commit/373e998fa4953912803de494a5d75f72e170aedd) Thanks [@thrgreenwald](https://github.com/thrgreenwald)! - Lower recommendation target speed to 10 tok/s and include Vulkan routed VERIFY_ROWS=16 fix plus latest streaming performance improvements.
+
 ## 0.3.0-alpha.1
 
 ### Patch Changes
