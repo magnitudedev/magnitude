@@ -3999,7 +3999,8 @@ mod tests {
     }
 
     /// [`far_larger`]'s bank on the recorded M4 Pro as a plan of it under
-    /// `bound` holds it, with room beside its mandatory part for 20 GB.
+    /// `bound` holds it, with room beside its mandatory part for 16 GB (below
+    /// M4 Pro's ~18 GB post-reserve capacity beside mandatory).
     fn far_larger_bank(bound: impl FnOnce(u64) -> HeldBound) -> super::super::ExpertBankPlan {
         let (_, _, device) = recorded(seismic::fixtures::recorded::m4_pro(), BackendName::Metal, 0, seismic::GraphCost::None);
         let (definition, draft) = far_larger(device);
@@ -4024,7 +4025,7 @@ mod tests {
         planned.draft().load().expert_bank().unwrap().clone()
     }
 
-    const FAR_ROOM: u64 = 20_000_000_000;
+    const FAR_ROOM: u64 = 16_000_000_000;
 
     /// On a machine whose prices are not measured, a load's plan of a bank
     /// waits for them.

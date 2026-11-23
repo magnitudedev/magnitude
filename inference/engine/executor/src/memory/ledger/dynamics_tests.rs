@@ -642,7 +642,7 @@ fn wired_stays_under_the_ceiling() {
     os.wired = Some((40 * GB, 6 * GB));
     os.hot = 4 * GB;
     let mut machine = filled(os, 0);
-    let reserve = (40 * GB) / 20;
+    let reserve = (40 * GB) / 12;
     let cushion = GRANULE;
     for _ in 0..10 {
         machine.step(300);
@@ -850,7 +850,7 @@ fn wired(machine: &Machine) -> (Option<u64>, Option<u64>) {
 /// (with `wired_rise` applied to growth targets rather than baked into `grant`).
 #[test]
 fn only_wired_memory_is_the_processs_in_the_wire_count() {
-    let reserve = (40 * GB) / 20;
+    let reserve = (40 * GB) / 12;
     let mut os = Os::new();
     os.wired = Some((40 * GB, 6 * GB));
     os.hot = 4 * GB;
@@ -963,7 +963,7 @@ fn an_exact_count_leaves_no_bytes_unobserved_but_an_accounting_error() {
 /// snapshot.
 #[test]
 fn a_wire_count_short_of_the_processs_is_a_shortfall() {
-    let reserve = (40 * GB) / 20;
+    let reserve = (40 * GB) / 12;
     let mut os = Os::new();
     os.wired = Some((40 * GB, 0));
     let mut machine = Machine::load(os, 20 * GB, 0);
@@ -991,7 +991,7 @@ fn a_wire_count_short_of_the_processs_is_a_shortfall() {
 /// idle for 3 s.
 #[test]
 fn an_idle_span_past_the_residency_lapse_moves_nothing() {
-    let reserve = (40 * GB) / 20;
+    let reserve = (40 * GB) / 12;
     let mut os = Os::new();
     os.wired = Some((40 * GB, 6 * GB));
     os.hot = 4 * GB;
@@ -1002,7 +1002,11 @@ fn an_idle_span_past_the_residency_lapse_moves_nothing() {
     let before = wired(&machine);
     assert_eq!(before, (Some(6 * GB), Some(34 * GB - reserve)));
     let (bank, resizes) = (machine.bank_bytes(), machine.resizes);
-    assert_eq!(bank, 14 * GB - reserve - GRANULE, "the grant less the weights and bank block_unit cushion");
+    assert_eq!(
+        bank,
+        (14 * GB - reserve - GRANULE) / GRANULE * GRANULE,
+        "the grant less the weights and bank block_unit cushion, rounded down to whole bank granules"
+    );
     machine.step(3000);
     assert_eq!(wired(&machine), before, "across the idle span");
     machine.step(100);

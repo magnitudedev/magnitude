@@ -2978,7 +2978,7 @@ fn stable_live_status_and_live_ledger_agree_on_store_demands() {
     };
 
     let expected_metal_capacity =
-        seismic::fixtures::M4_PRO_WORKING_SET - seismic::fixtures::M4_PRO_WORKING_SET / 20;
+        seismic::fixtures::M4_PRO_WORKING_SET - seismic::fixtures::M4_PRO_WORKING_SET / 12;
     let stable = MemoryBudget::stable(&m4_pro, metal, &status).unwrap();
     let live_status = MemoryBudget::live_status(&m4_pro, metal, &status).unwrap();
     assert_eq!(stable.capacity(), expected_metal_capacity);

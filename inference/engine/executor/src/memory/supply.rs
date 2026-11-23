@@ -182,12 +182,13 @@ impl Ceiling {
     /// (`PromptScratch`, KV slabs, graph slots) cannot consume it and static
     /// assessment agrees with live load headroom.
     ///
-    /// `max(256 MiB, limit / 20)` reserves ~573 MB on a 16 GB M1 (11.45 GB
-    /// working set), ~1.34 GB on a 32 GB M2 Pro (26.80 GB working set), and
-    /// ~1.93 GB on a 48 GB M4 Pro (38.65 GB working set).
+    /// `max(512 MiB, limit / 12)` reserves ~954 MB on a 16 GB M1 (11.45 GB
+    /// working set), ~2.23 GB on a 32 GB M2 Pro (26.80 GB working set, well
+    /// past the 1.48 GB Metal 4 OOM cliff observed under 4K-token prompt
+    /// prefill), and ~3.22 GB on a 48 GB M4 Pro (38.65 GB working set).
     pub(crate) fn execution_reserve_for(limit: u64) -> u64 {
-        const MIN_RESERVE: u64 = 256 << 20;
-        (limit / 20).max(MIN_RESERVE).min(limit)
+        const MIN_RESERVE: u64 = 512 << 20;
+        (limit / 12).max(MIN_RESERVE).min(limit)
     }
 
     pub(crate) fn execution_reserve(&self) -> u64 {

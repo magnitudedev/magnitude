@@ -1768,7 +1768,7 @@ fn a_loads_claims_find_the_room_its_search_priced() {
 #[test]
 fn the_m4_pros_recorded_sample_prices_the_wired_grant() {
     const STORE: u64 = 51_539_607_552;
-    const RESERVE: u64 = seismic::fixtures::M4_PRO_WORKING_SET / 20;
+    const RESERVE: u64 = seismic::fixtures::M4_PRO_WORKING_SET / 12;
     const GRANT: u64 = 36_858_904_576 - RESERVE;
     let scope = Ledgers::new();
     let recorded = seismic::host_samples::m4_pro();
@@ -1826,7 +1826,7 @@ fn planning_room_capacity_is_structural_not_momentary_free() {
     assert_eq!(budget.available(), FREE_20G, "momentary free room at load is 20 GiB");
     assert_eq!(
         budget.capacity(),
-        WORKING_SET_48G - WORKING_SET_48G / 20,
+        WORKING_SET_48G - WORKING_SET_48G / 12,
         "structural capacity is 48 GiB working set less Metal execution reserve, not momentary 20 GiB free"
     );
 
@@ -2015,7 +2015,7 @@ fn a_settled_idle_sleep_opens_a_fresh_baseline_at_the_next_reading() {
         wired: Some(seismic::WiredFigures { limit: seismic::WiredLimit::Set(22 * GB), wire_count: 4 * GB, at: wake }),
         ..host_sample(48 * GB, 20 * GB)
     };
-    let reserve = (22 * GB) / 20;
+    let reserve = (22 * GB) / 12;
     let woken = ledger.read_after(ledger.sampled(wake), Reading::unified(&woken_sample, u64::MAX), true);
     assert_eq!(woken.guarantee(), 0, "an unmonitored sleep is not one step's supply rise");
     assert_eq!(woken.budget(), 18 * GB - reserve, "wired ceiling takes the new wired baseline less execution reserve");
@@ -2789,7 +2789,7 @@ fn graph_slots_yield_to_bank_only_when_bank_value_exceeds_rebuild_value() {
 fn live_iogpu_wire_count_does_not_attribute_own_growth_to_others_while_counted_lags() {
     const LAG_1S: Duration = Duration::from_secs(1);
     const WORKING_SET: u64 = 36 * GB;
-    const RESERVE: u64 = WORKING_SET / 20;
+    const RESERVE: u64 = WORKING_SET / 12;
     const OTHERS_WIRED: u64 = 142 << 20;
     const GROWTH: u64 = 750 << 20;
 
@@ -2835,7 +2835,7 @@ fn live_iogpu_wire_count_does_not_attribute_own_growth_to_others_while_counted_l
 }
 
 /// On Apple Silicon Metal (`HostGrant::Wired`), `Read::grant` subtracts
-/// `Ceiling::execution_reserve()` (`max(256 MiB, limit / 20)`) directly so
+/// `Ceiling::execution_reserve()` (`max(512 MiB, limit / 12)`) directly so
 /// committed claims (`PromptScratch`, KV slabs) cannot eat the execution
 /// reserve, while `bank_budget()` keeps an additional `block_unit` cushion
 /// below `grant` for elastic banks, and host-RAM-tight readings waste zero
@@ -2844,7 +2844,7 @@ fn live_iogpu_wire_count_does_not_attribute_own_growth_to_others_while_counted_l
 fn metal_wired_ceiling_reserves_command_buffer_headroom_for_elastic_bank() {
     const TOTAL_16G: u64 = 16 * GB;
     const WORKING_SET: u64 = 11_453_251_584; // 16 GB M1 recommendedMaxWorkingSetSize
-    const RESERVE_16G: u64 = WORKING_SET / 20; // ~572.7 MB (> 256 MiB floor)
+    const RESERVE_16G: u64 = WORKING_SET / 12; // ~954.4 MB (> 512 MiB floor)
     const BLOCK_512M: u64 = 512 << 20;
     const COMMITTED: u64 = 6 * GB;
 
@@ -2904,7 +2904,7 @@ fn metal_wired_ceiling_reserves_command_buffer_headroom_for_elastic_bank() {
     const TOTAL_32G: u64 = 32 * GB;
     const WORKING_SET_M2PRO: u64 = 26_800_603_136;
     const OTHERS_WIRED_M2PRO: u64 = 515_842_180;
-    const RESERVE_M2PRO: u64 = WORKING_SET_M2PRO / 20;
+    const RESERVE_M2PRO: u64 = WORKING_SET_M2PRO / 12;
     const COMMITTED_M2PRO: u64 = 7 * GB;
     let scope32 = Ledgers::new();
     let ledger32 = scope32.ledger(seismic::StoreIdentity::HostRam, shape());
@@ -2949,7 +2949,7 @@ fn metal_wired_ceiling_reserves_command_buffer_headroom_for_elastic_bank() {
 fn metal_working_set_left_reconciles_uncharged_metal_allocations() {
     const TOTAL_16G: u64 = 16 * GB;
     const WORKING_SET: u64 = 11_453_251_584;
-    const RESERVE: u64 = WORKING_SET / 20;
+    const RESERVE: u64 = WORKING_SET / 12;
     const COMMITTED: u64 = 8 * GB;
     const UNCHARGED_METAL: u64 = 400 << 20;
 
@@ -3185,7 +3185,7 @@ fn in_flight_relief_defers_backed_reclaimer_and_idle_reclaims_synchronously() {
 fn metal_execution_reserve_bank_cushion_and_wired_jitter_stability() {
     const TOTAL_32G: u64 = 32 * GB;
     const WORKING_SET: u64 = 26_800_603_136; // M2 Pro 32 GB
-    const RESERVE: u64 = WORKING_SET / 20; // ~1.34 GB
+    const RESERVE: u64 = WORKING_SET / 12; // ~2.23 GB
     const BLOCK_UNIT: u64 = 256 << 20; // 256 MiB records pool block
     const COMMITTED: u64 = 10 * GB;
     const OTHERS_WIRED: u64 = 512 << 20;
