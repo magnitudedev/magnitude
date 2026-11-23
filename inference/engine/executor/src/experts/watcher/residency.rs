@@ -973,9 +973,21 @@ impl Residency {
                     b_landing,
                 );
                 let cpu_measured = adjusted.as_ref().is_some_and(|l| l.host.cpu.is_some());
+                let suppressed_cpu;
                 let site = match (&layer.site, &cpu) {
                     (None, _) => SiteLines::Unsited,
-                    (Some(_), None) if cpu_measured => SiteLines::Unsited,
+                    (Some(_), None) if cpu_measured => {
+                        let prohibitive = magnitude_cost_model::Nanoseconds::try_from(100_000_000u32)
+                            .expect("100 ms fits Nanoseconds");
+                        suppressed_cpu = magnitude_cost_model::CpuLines {
+                            expert: magnitude_cost_model::RowLine {
+                                one: prohibitive,
+                                row: magnitude_cost_model::RowCost::Measured(prohibitive),
+                            },
+                            handshake: prohibitive,
+                        };
+                        SiteLines::Measured(&suppressed_cpu)
+                    }
                     (Some(_), None) => SiteLines::Pending,
                     (Some(_), Some(cpu)) => SiteLines::Measured(cpu),
                 };
