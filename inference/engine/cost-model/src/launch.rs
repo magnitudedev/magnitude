@@ -185,6 +185,12 @@ impl LaunchPrices {
         self.source.draft.as_ref().map(|draft| draft.method)
     }
 
+    /// Measured wall-clock cost (seconds) of one host-synchronized GPU boundary
+    /// (`Figures::step_round_trip`).
+    pub fn step_round_trip_seconds(&self) -> f64 {
+        self.source.figures.step_round_trip
+    }
+
     /// Prior wall-clock seconds of a drafter launch generating `generated`
     /// proposals for `sequences` sequences at `depth` tokens, unpipelined
     /// (`lookahead: false`). Returns `Ok(None)` when no draft census is held

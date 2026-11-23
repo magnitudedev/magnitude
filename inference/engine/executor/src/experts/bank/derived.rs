@@ -25,9 +25,6 @@ pub struct BankShape {
     /// The granule pool's block: the least resize either way, and the unit
     /// for shedding `owed` bytes.
     block_bytes: u64,
-    /// Minimum room delta for opportunistic grow/shrink hysteresis when
-    /// `owed == 0` (at least `block_bytes`).
-    deadband_bytes: u64,
     /// The slots one decode step holds at once, held as committed memory
     /// (`CommittedKind::BankFloor`), never cache.
     floor_slots: u64,
@@ -47,14 +44,7 @@ impl BankShape {
     /// Where the floor lies past the ceiling: a plan that is no bank.
     pub fn new(block_bytes: u64, floor: u64, ceiling: u64, bound: u64) -> Self {
         assert!(floor <= ceiling, "invariant violated: a bank floor of {floor} slots past its ceiling of {ceiling}");
-        Self { block_bytes, deadband_bytes: block_bytes, floor_slots: floor, saturation_slots: ceiling.min(bound).max(floor) }
-    }
-
-    /// Raise the opportunistic grow/shrink hysteresis deadband to at least
-    /// `deadband_bytes` while keeping `block_bytes` for `owed` shedding.
-    pub fn with_deadband(mut self, deadband_bytes: u64) -> Self {
-        self.deadband_bytes = deadband_bytes.max(self.block_bytes);
-        self
+        Self { block_bytes, floor_slots: floor, saturation_slots: ceiling.min(bound).max(floor) }
     }
 
     /// The granule pool's block: the least resize either way, so a target
@@ -185,33 +175,43 @@ pub fn import_target(estimate: &Estimate, beside: u64, shape: &BankShape, charge
 
 /// The slots a holding of `shape` holding `at` slots keeps given distinct
 /// hold and grow rooms (`hold_room`, `grow_room` bytes above its floor),
-/// owing claims `owed` bytes, as `charge` holds slots:
-/// - shrinkage is judged against `hold_room` (no double-subtraction of
-///   transient `guarantee`), so a spike in others' delta resizes nothing by `2x`;
+/// owing claims or shortage relief `owed` bytes, and `external_over` bytes
+/// by which the store's total holdings exceed its live budget or pressure
+/// cap (`estimate.held().saturating_sub(min(budget, cap))`), as `charge`
+/// holds slots:
+/// - when `owed == 0` and `external_over == 0`, the holding NEVER shrinks on
+///   transient OS/cache (`OtherCache`) room jitter (only structural
+///   `at > saturation_slots` shrinks);
+/// - when `external_over > 0` (e.g. a falling GPU grant or pressure cap
+///   below `held`), physical relief fires toward `fits_hold` once the deficit
+///   reaches `block_bytes`;
+/// - when `owed > 0` (in-process claims or persistent shortage relief),
+///   shedding fires immediately at exact `block_bytes` granularity, and any
+///   overlap with `external_over` is spent once (`held.min(sheds)`), never
+///   double-released;
 /// - growth is judged against `grow_room`, leaving `guarantee` headroom free
 ///   before claiming new slots.
-pub fn held_target_in(
+pub fn held_target_with_pressure(
     hold_room: u64,
     grow_room: u64,
     at: u64,
     owed: u64,
+    external_over: u64,
     shape: &BankShape,
     charge: &dyn Fn(u64) -> u64,
 ) -> u64 {
     let block = shape.block_bytes.max(1);
-    let deadband = shape.deadband_bytes.max(block);
     let floor_charge = charge(shape.floor_slots);
     let above_floor = charge(at).saturating_sub(floor_charge);
     let fits_hold = target_slots(hold_room, shape, charge);
     let fits_grow = target_slots(grow_room, shape, charge);
-    let should_shrink = at > shape.saturation_slots || (fits_hold < at && above_floor.saturating_sub(hold_room) >= deadband);
+    let pressure_shrink = external_over > 0 && fits_hold < at && above_floor.saturating_sub(hold_room) >= block;
+    let should_shrink = at > shape.saturation_slots || pressure_shrink;
     let gain = charge(fits_grow).saturating_sub(charge(at));
-    let should_grow = owed == 0
-        && !should_shrink
-        && fits_grow > at
-        && gain >= block
-        && (gain >= deadband || (fits_grow == shape.saturation_slots && grow_room.saturating_sub(above_floor) >= deadband));
-    let held = if should_shrink {
+    let should_grow = owed == 0 && external_over == 0 && !should_shrink && fits_grow > at && gain >= block;
+    let held = if at > shape.saturation_slots {
+        shape.saturation_slots.min(if pressure_shrink { fits_hold } else { shape.saturation_slots })
+    } else if pressure_shrink {
         fits_hold
     } else if should_grow {
         fits_grow
@@ -227,6 +227,19 @@ pub fn held_target_in(
     held.min(sheds)
 }
 
+/// [`held_target_with_pressure`] with `external_over = 0` (no budget/cap
+/// violation: never shrinks opportunistically when `owed == 0`).
+pub fn held_target_in(
+    hold_room: u64,
+    grow_room: u64,
+    at: u64,
+    owed: u64,
+    shape: &BankShape,
+    charge: &dyn Fn(u64) -> u64,
+) -> u64 {
+    held_target_with_pressure(hold_room, grow_room, at, owed, 0, shape, charge)
+}
+
 /// The slots a holding of `shape` holding `at` slots keeps within a single
 /// `room` bytes above its floor, owing claims `owed` bytes, as `charge` holds
 /// slots ([`held_target_in`]).
@@ -235,21 +248,33 @@ pub fn held_target(room: u64, at: u64, owed: u64, shape: &BankShape, charge: &dy
 }
 
 /// The targets of one store's bank holdings sharing its `hold_room` and
-/// `grow_room`, each with the slots it holds now and what it owes claims, in
-/// the order given: each keeps what [`held_target_in`] keeps of the room those
-/// before it leave.
-pub fn shared_targets_bounded(hold_room: u64, grow_room: u64, holdings: &[(BankShape, u64, u64, &dyn Fn(u64) -> u64)]) -> Vec<u64> {
+/// `grow_room` under `external_over` bytes of budget/cap excess, each with
+/// the slots it holds now and what it owes claims/shortage, in the order
+/// given: each keeps what [`held_target_with_pressure`] keeps of the room
+/// those before it leave.
+pub fn shared_targets_with_pressure(
+    hold_room: u64,
+    grow_room: u64,
+    external_over: u64,
+    holdings: &[(BankShape, u64, u64, &dyn Fn(u64) -> u64)],
+) -> Vec<u64> {
     let (mut left_hold, mut left_grow) = (hold_room, grow_room);
     holdings
         .iter()
         .map(|(shape, at, owed, charge)| {
-            let target = held_target_in(left_hold, left_grow, *at, *owed, shape, *charge);
+            let target = held_target_with_pressure(left_hold, left_grow, *at, *owed, external_over, shape, *charge);
             let used = charge(target) - charge(shape.floor_slots);
             left_hold = left_hold.saturating_sub(used);
             left_grow = left_grow.saturating_sub(used);
             target
         })
         .collect()
+}
+
+/// The targets of one store's bank holdings sharing its `hold_room` and
+/// `grow_room` with `external_over = 0`, delegating to [`shared_targets_with_pressure`].
+pub fn shared_targets_bounded(hold_room: u64, grow_room: u64, holdings: &[(BankShape, u64, u64, &dyn Fn(u64) -> u64)]) -> Vec<u64> {
+    shared_targets_with_pressure(hold_room, grow_room, 0, holdings)
 }
 
 /// The targets of one store's bank holdings sharing a single `room`, delegating
@@ -292,12 +317,17 @@ pub fn derive<'t>(ledgers: &DeviceLedgers, targets: &'t [HoldingTarget<'t>]) -> 
             let shapes: Vec<(BankShape, u64, u64, &dyn Fn(u64) -> u64)> =
                 members.iter().map(|target| (target.shape, target.at, target.owed, &*target.charge)).collect();
             let host_tier = members.iter().all(|target| target.tier == BankTier::Host);
-            let (hold_room, grow_room) = if host_tier {
-                (estimate.pinned_hold_room(), estimate.pinned_target())
+            let (hold_room, grow_room, limit) = if host_tier {
+                let budget = estimate.pinned_budget();
+                let limit = estimate.cap().map_or(budget, |cap| budget.min(cap));
+                (estimate.pinned_hold_room(), estimate.pinned_target(), limit)
             } else {
-                (estimate.hold_room(), estimate.target())
+                let budget = estimate.budget();
+                let limit = estimate.cap().map_or(budget, |cap| budget.min(cap));
+                (estimate.hold_room(), estimate.target(), limit)
             };
-            let slots = shared_targets_bounded(hold_room, grow_room, &shapes);
+            let external_over = estimate.held().saturating_sub(limit);
+            let slots = shared_targets_with_pressure(hold_room, grow_room, external_over, &shapes);
             members.into_iter().zip(slots).collect::<Vec<_>>()
         })
         .collect()

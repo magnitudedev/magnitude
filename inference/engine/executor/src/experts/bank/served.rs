@@ -336,7 +336,12 @@ impl ElasticBank for ServedBank {
     }
 
     fn price(&self, lines: Option<std::sync::Arc<[magnitude_cost_model::ExpertLines]>>, pass: Option<magnitude_cost_model::ExpertPass>, prices: Option<magnitude_cost_model::LaunchPrices>) {
-        self.bank.watcher.shared().price(lines, pass, prices);
+        let shared = self.bank.watcher.shared();
+        shared.price(lines, pass, prices);
+        if let (Some(copy), Some(priced)) = (shared.copy(), shared.priced()) {
+            let launch = shared.launch_prices();
+            self.bank.transport.update_decode_dma_crossover(&copy, &priced, launch.as_ref());
+        }
     }
 
     fn value(&self, value: crate::memory::ledger::Value) {
@@ -385,7 +390,12 @@ impl ElasticBank for ServedBank {
         // The grid first: a copy is priced only by the blocks the device
         // launches it with.
         self.bank.tier_copy_blocks(costs.blocks).map_err(DomainError::invariant)?;
-        self.bank.watcher.shared().price_copy(costs);
+        let shared = self.bank.watcher.shared();
+        shared.price_copy(costs);
+        if let Some(priced) = shared.priced() {
+            let launch = shared.launch_prices();
+            self.bank.transport.update_decode_dma_crossover(costs, &priced, launch.as_ref());
+        }
         Ok(())
     }
 
@@ -466,13 +476,25 @@ impl ElasticBank for ServedBank {
         let plan = &self.bank.plan;
         let counts = &self.bank.counts;
         let bank_block = plan.tier_block_bytes(BankTier::Bank);
+        let floor = counts.floor();
+        let owed_for = |holding: BankHolding, above: u64, block: u64| -> u64 {
+            let claimed = self.bank.cache.owed(holding, above);
+            let shed = self.bank.cache.shortage_shed(holding, above, claimed);
+            if claimed > 0 {
+                claimed.saturating_add(shed)
+            } else if shed >= block {
+                shed
+            } else {
+                0
+            }
+        };
         let at = self.bank.slots();
         let mut targets = vec![HoldingTarget {
             holding: BankHolding::Experts,
             tier: self.storage(BankHolding::Experts)?,
             at,
-            owed: self.bank.cache.owed(BankHolding::Experts, self.above_floor(BankHolding::Experts, at)?),
-            shape: BankShape::new(bank_block, counts.floor(), plan.ceiling, plan.ceiling),
+            owed: owed_for(BankHolding::Experts, self.above_floor(BankHolding::Experts, at)?, bank_block),
+            shape: BankShape::new(bank_block, floor, plan.ceiling, plan.ceiling),
             charge: Box::new(move |slots| counts.resident_charge(slots)),
         }];
         if let Some((host, ceiling)) = self.bank.host_tier() {
@@ -486,27 +508,23 @@ impl ElasticBank for ServedBank {
                 holding: BankHolding::Host,
                 tier: self.storage(BankHolding::Host)?,
                 at: host,
-                owed: self.bank.cache.owed(BankHolding::Host, self.above_floor(BankHolding::Host, host)?),
+                owed: owed_for(BankHolding::Host, self.above_floor(BankHolding::Host, host)?, host_block),
                 shape: BankShape::host(host_block, ceiling, bound, plan.whole_at(self.bank.slots())),
                 charge: Box::new(move |slots| counts.host_charge(slots)),
             });
         }
-        // Auxiliary tables have small granules (~4-6 MiB) compared to OS wired
-        // memory jitter (~8-20 MiB); give them a 64 MiB hysteresis deadband so
-        // jitter does not trigger synchronous resizes between prefill steps
-        // (while `owed > 0` still sheds at exact pool block granularity).
-        const TABLE_HYSTERESIS_BYTES: u64 = 64 * 1024 * 1024;
         for (index, held) in self.tables.iter().enumerate() {
             let holding = BankHolding::Table { table: index };
+            let tier = self.storage(holding)?;
             let (block, granule) = (plan.table_block(), plan.table_granule());
             let records = held.table.records();
             let ceiling = held.plan.records.get();
             targets.push(HoldingTarget {
                 holding,
-                tier: self.storage(holding)?,
+                tier,
                 at: records,
-                owed: self.bank.cache.owed(holding, self.above_floor(holding, records)?),
-                shape: BankShape::new(block.held, held.plan.floor, ceiling, ceiling).with_deadband(TABLE_HYSTERESIS_BYTES),
+                owed: owed_for(holding, self.above_floor(holding, records)?, block.held),
+                shape: BankShape::new(block.held, held.plan.floor, ceiling, ceiling),
                 charge: Box::new(move |records| {
                     crate::planning::BankTable::charge(block, granule, records).expect("invariant violated: a table's charge fits u64 at every size it holds")
                 }),

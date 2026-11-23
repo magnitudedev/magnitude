@@ -199,17 +199,6 @@ pub(crate) fn merge_set_seeded_tiered(plans: &[PrefillPlan]) -> Vec<(i32, i32)> 
         .collect()
 }
 
-/// Physics break-even threshold for splitting a decode layer into
-/// `DecodeFront -> flush_and_wait -> DMA -> DecodeBack` vs running pipelined
-/// `RunStage::Whole` (which already gets `LinkMover` `MAP_STAGE` hits and falls
-/// back to SM zero-copy for occasional misses with zero per-layer host sync).
-///
-/// Minimum EWMA host-tier miss bytes per layer call to keep split M7 decode DMA
-/// active. Any layer with host-tier misses (`>= 1` byte) stays on hardware DMA
-/// rather than falling back to slower SM zero-copy in `RunStage::Whole`; only
-/// zero-miss resident layers gate onto pipelined `RunStage::Whole` and probe
-/// periodically for working-set shifts.
-const SPLIT_DMA_MIN_BYTES: u64 = 1;
 const SPLIT_DMA_WARMUP_CALLS: u32 = 2;
 const SPLIT_DMA_COOLDOWN_STEPS: u32 = 256;
 const SPLIT_DMA_STAGGER_SLOTS: u32 = 64;
@@ -218,14 +207,106 @@ const SPLIT_DMA_STAGGER_STRIDE: u32 = 4;
 /// Row-width threshold separating narrow decode (`M = 1..3`) from wide
 /// speculative verify bursts (`M >= 4`) in [`DecodeDmaGate`]. Separate lanes
 /// ensure an `M = 1..2` warmup cooldown never strands an `M = 4..16` verify
-/// burst on ~9.5 GB/s SM zero-copy PCIe.
+/// burst on slower SM zero-copy PCIe.
 const WIDE_VERIFY_ROWS: u64 = 4;
 
-#[derive(Default)]
+/// Physically derived minimum host-tier miss bytes per layer call for
+/// splitting a decode layer into `DecodeFront -> flush_and_wait -> DMA ->
+/// DecodeBack` vs running pipelined `RunStage::Whole`.
+///
+/// Derived purely from live machine measurements with zero hardcoded constants:
+/// - `t_split_seconds = boundary_seconds + dma_latency_seconds` where
+///   `boundary_seconds` is `LaunchPrices::step_round_trip_seconds()` (the
+///   measured host-sync boundary cost) and `dma_latency_seconds` is
+///   `TierCopyCosts::transfer.latency_seconds()` (the measured H2D batch
+///   launch latency).
+/// - `inv_b_zerocopy = link_weights_seconds / record_bytes` (measured by
+///   `ExpertLines::gpu.link.weights`).
+/// - `inv_b_split = dma_seconds_per_byte + resident_weights_seconds / record_bytes`
+///   (measured by `TierCopyCosts::transfer` + `ExpertLines::gpu.resident.weights`).
+///
+/// `min_bytes = t_split_seconds / (inv_b_zerocopy - inv_b_split)`
+///
+/// Clamped safely to `u64::MAX` whenever `inv_b_split >= inv_b_zerocopy`
+/// (DMA + resident read is not faster per byte than SM zero-copy).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct SplitDmaCrossover {
+    pub min_bytes: u64,
+}
+
+impl Default for SplitDmaCrossover {
+    /// Conservative pre-measurement crossover (`1 B`): before link rates are
+    /// measured, any non-zero host-tier miss stays on hardware DMA and only
+    /// zero-miss layers gate onto pipelined `RunStage::Whole`.
+    fn default() -> Self {
+        Self { min_bytes: 1 }
+    }
+}
+
+impl SplitDmaCrossover {
+    /// Derive the miss-byte break-even crossover from measured per-byte times
+    /// (`inv_b_split_s_per_byte` for async DMA + resident read,
+    /// `inv_b_zerocopy_s_per_byte` for SM zero-copy) and measured fixed
+    /// split-boundary overhead (`t_split_seconds`).
+    pub(crate) fn derive(
+        inv_b_split_s_per_byte: f64,
+        inv_b_zerocopy_s_per_byte: f64,
+        t_split_seconds: f64,
+    ) -> Self {
+        if !inv_b_split_s_per_byte.is_finite()
+            || !inv_b_zerocopy_s_per_byte.is_finite()
+            || inv_b_split_s_per_byte <= 0.0
+            || inv_b_zerocopy_s_per_byte <= 0.0
+            || inv_b_split_s_per_byte >= inv_b_zerocopy_s_per_byte
+        {
+            return Self { min_bytes: u64::MAX };
+        }
+        let delta_s_per_byte = inv_b_zerocopy_s_per_byte - inv_b_split_s_per_byte;
+        if !delta_s_per_byte.is_finite() || delta_s_per_byte <= 0.0 {
+            return Self { min_bytes: u64::MAX };
+        }
+        let overhead_s = if t_split_seconds.is_finite() && t_split_seconds > 0.0 {
+            t_split_seconds
+        } else {
+            0.0
+        };
+        let bytes = overhead_s / delta_s_per_byte;
+        let min_bytes = if !bytes.is_finite() || bytes >= u64::MAX as f64 {
+            u64::MAX
+        } else {
+            (bytes.round() as u64).max(1)
+        };
+        Self { min_bytes }
+    }
+
+    /// Derive the crossover directly from measured [`crate::assessment::TierCopyCosts`],
+    /// per-layer [`magnitude_cost_model::ExpertLines`], and optional
+    /// [`magnitude_cost_model::LaunchPrices`].
+    pub(crate) fn from_rates(
+        copy: &crate::assessment::TierCopyCosts,
+        lines: &magnitude_cost_model::ExpertLines,
+        launch: Option<&magnitude_cost_model::LaunchPrices>,
+    ) -> Self {
+        let record_bytes = lines.host.record_bytes as f64;
+        if record_bytes <= 0.0 {
+            return Self::default();
+        }
+        let link_s = lines.gpu.link.weights.get() * 1e-9;
+        let resident_s = lines.gpu.resident.weights.get() * 1e-9;
+        let inv_b_zerocopy = link_s / record_bytes;
+        let inv_b_split = copy.transfer.seconds_per_byte() + resident_s / record_bytes;
+        let boundary_s = launch.map_or(0.0, magnitude_cost_model::LaunchPrices::step_round_trip_seconds);
+        let t_split_s = copy.transfer.latency_seconds() + boundary_s;
+        Self::derive(inv_b_split, inv_b_zerocopy, t_split_s)
+    }
+}
+
 struct GateLane {
     /// Exponential moving average of un-staged host-tier miss bytes per call
     /// (alpha = 1/4: `ewma = (ewma * 3 + sample) / 4`).
     ewma_bytes: AtomicU64,
+    /// Derived minimum miss-byte crossover for this lane (`SplitDmaCrossover`).
+    min_bytes: AtomicU64,
     /// Number of observed split-decode calls on this lane.
     calls: AtomicU32,
     /// Remaining pipelined `RunStage::Whole` steps before probing split DMA
@@ -239,8 +320,19 @@ struct GateLane {
 }
 
 impl GateLane {
-    fn new(phase_offset: u32) -> Self {
-        Self { phase_offset, ..Self::default() }
+    fn new(phase_offset: u32, min_bytes: u64) -> Self {
+        Self {
+            ewma_bytes: AtomicU64::new(0),
+            min_bytes: AtomicU64::new(min_bytes),
+            calls: AtomicU32::new(0),
+            cooldown: AtomicU32::new(0),
+            gated: AtomicBool::new(false),
+            phase_offset,
+        }
+    }
+
+    fn set_min_bytes(&self, min_bytes: u64) {
+        self.min_bytes.store(min_bytes, Ordering::Relaxed);
     }
 
     fn is_splitting(&self) -> bool {
@@ -261,6 +353,7 @@ impl GateLane {
     }
 
     fn observe(&self, miss_bytes: u64) {
+        let min_bytes = self.min_bytes.load(Ordering::Relaxed);
         let prev_calls = self.calls.fetch_add(1, Ordering::Relaxed);
         let ewma = if prev_calls == 0 {
             miss_bytes
@@ -269,7 +362,7 @@ impl GateLane {
             (old.saturating_mul(3).saturating_add(miss_bytes)) / 4
         };
         self.ewma_bytes.store(ewma, Ordering::Relaxed);
-        if prev_calls + 1 >= SPLIT_DMA_WARMUP_CALLS && ewma < SPLIT_DMA_MIN_BYTES && miss_bytes < SPLIT_DMA_MIN_BYTES {
+        if prev_calls + 1 >= SPLIT_DMA_WARMUP_CALLS && ewma < min_bytes && miss_bytes < min_bytes {
             let was_gated = self.gated.swap(true, Ordering::Relaxed);
             let cd = if was_gated {
                 SPLIT_DMA_COOLDOWN_STEPS
@@ -285,7 +378,6 @@ impl GateLane {
 }
 
 /// Lock-free per-layer row-aware adaptive gate for split M7 decode DMA.
-#[derive(Default)]
 struct DecodeDmaGate {
     narrow: GateLane,
     wide: GateLane,
@@ -293,11 +385,20 @@ struct DecodeDmaGate {
 
 impl DecodeDmaGate {
     fn for_layer(layer: usize) -> Self {
+        Self::for_layer_with_crossover(layer, SplitDmaCrossover::default())
+    }
+
+    fn for_layer_with_crossover(layer: usize, crossover: SplitDmaCrossover) -> Self {
         let phase_offset = ((layer as u32) % SPLIT_DMA_STAGGER_SLOTS) * SPLIT_DMA_STAGGER_STRIDE;
         Self {
-            narrow: GateLane::new(phase_offset),
-            wide: GateLane::new(phase_offset),
+            narrow: GateLane::new(phase_offset, crossover.min_bytes),
+            wide: GateLane::new(phase_offset, crossover.min_bytes),
         }
+    }
+
+    fn set_crossover(&self, crossover: SplitDmaCrossover) {
+        self.narrow.set_min_bytes(crossover.min_bytes);
+        self.wide.set_min_bytes(crossover.min_bytes);
     }
 
     fn lane(&self, rows: u64) -> &GateLane {
@@ -584,10 +685,42 @@ impl ExpertTransport {
         })
     }
 
+    /// Update each streamed layer's [`SplitDmaCrossover`] from live measured
+    /// link copy costs (`TierCopyCosts`), per-layer `ExpertLines`, and
+    /// optional `LaunchPrices` (`step_round_trip_seconds`).
+    pub(crate) fn update_decode_dma_crossover(
+        &self,
+        copy: &crate::assessment::TierCopyCosts,
+        lines: &[magnitude_cost_model::ExpertLines],
+        launch: Option<&magnitude_cost_model::LaunchPrices>,
+    ) {
+        let Some(dma) = &self.decode else {
+            return;
+        };
+        let mut first = None;
+        for (layer, gate) in dma.layer_gates.iter().enumerate() {
+            let Some(layer_lines) = lines.get(layer) else {
+                continue;
+            };
+            let crossover = SplitDmaCrossover::from_rates(copy, layer_lines, launch);
+            gate.set_crossover(crossover);
+            if layer == 0 {
+                first = Some(crossover);
+            }
+        }
+        if let Some(c) = first {
+            tracing::info!(
+                "derived SplitDmaCrossover (layer 0): min_bytes={} ({:.2} MiB)",
+                c.min_bytes,
+                c.min_bytes as f64 / (1024.0 * 1024.0),
+            );
+        }
+    }
+
     /// Whether on-demand decode DMA should split `layer` into
     /// `DecodeFront -> flush_and_wait -> DMA -> DecodeBack` on this step
     /// (returns `false` when the layer's adaptive miss-bytes EWMA is below
-    /// `SPLIT_DMA_MIN_BYTES`, keeping low-miss layers on pipelined `Whole`).
+    /// its derived [`SplitDmaCrossover`], keeping low-miss layers on pipelined `Whole`).
     pub(crate) fn should_split_decode(&self, _group: usize, layer: usize, rows: u64) -> bool {
         let Some(dma) = &self.decode else {
             return false;
@@ -1958,6 +2091,122 @@ mod tests {
         assert!(
             total_probes >= 48 * 2,
             "expected every layer to probe at least twice over {total_steps} steps, got {total_probes}"
+        );
+    }
+
+    /// Derived [`SplitDmaCrossover`] physics (zero hardcoded constants):
+    /// - RTX 5090 Gen5 (`48 GB/s` DMA, `24 GB/s` zero-copy, `5.1 us` DMA
+    ///   latency + measured `step_round_trip`): naturally derives `~0.95 MiB`
+    ///   at `15 us` sync (admitting DeepSeek `8.7 MiB`, blocking Qwen `0`
+    ///   misses) and `~3.8 MiB` at `75 us` sync (gating Qwen `1-2` misses =
+    ///   `1.35-2.7 MiB` onto pipelined `RunStage::Whole` while admitting
+    ///   `8 MiB` bursts).
+    /// - RTX 3090 Gen4 (`19.31 GB/s` DMA <= `22.86 GB/s` zero-copy) and any
+    ///   `inv_b_split >= inv_b_zerocopy`: safely clamps to `u64::MAX` (never
+    ///   splits).
+    #[test]
+    fn split_dma_crossover_derives_5090_narrow_and_wide_thresholds_and_clamps_slow_dma() {
+        const MIB: u64 = 1024 * 1024;
+        const KIB: u64 = 1024;
+
+        // RTX 5090 PCIe 5.0 x16: 48 GB/s DMA + 1.5 TB/s resident read vs 24 GB/s SM zero-copy.
+        let inv_zc = 1.0 / 24e9;
+        let inv_split = 1.0 / 48e9 + 1.0 / 1.5e12;
+        let fast_sync = SplitDmaCrossover::derive(inv_split, inv_zc, 5.1e-6 + 15.0e-6);
+        assert!(
+            (512 * KIB..=MIB).contains(&fast_sync.min_bytes),
+            "5090 crossover at 20.1 us split overhead should lie in 0.5-1 MiB, got {} B",
+            fast_sync.min_bytes
+        );
+        let heavy_sync = SplitDmaCrossover::derive(inv_split, inv_zc, 5.1e-6 + 75.0e-6);
+        assert!(
+            (3 * MIB..=5 * MIB).contains(&heavy_sync.min_bytes),
+            "5090 crossover at 80.1 us split overhead should lie in 3-5 MiB, got {} B",
+            heavy_sync.min_bytes
+        );
+
+        // (1) DeepSeek (8.7 MiB/layer) stays 100% on hardware DMA.
+        let deepseek_m1 = DecodeDmaGate::for_layer_with_crossover(0, fast_sync);
+        for _ in 0..8 {
+            assert!(deepseek_m1.should_split(1));
+            deepseek_m1.observe(1, 8_700_000);
+        }
+        assert!(deepseek_m1.should_split(1), "DeepSeek 8.7 MiB must stay on split DMA");
+
+        // (2) Qwen (0 misses) gates onto pipelined RunStage::Whole.
+        let qwen_m1 = DecodeDmaGate::for_layer_with_crossover(0, fast_sync);
+        for _ in 0..SPLIT_DMA_WARMUP_CALLS {
+            assert!(qwen_m1.should_split(1));
+            qwen_m1.observe(1, 0);
+        }
+        assert!(!qwen_m1.should_split(1), "Qwen 0-miss must gate onto RunStage::Whole");
+
+        // (3) Qwen M=12 1-2 misses (1.35-2.7 MiB) gates onto pipelined RunStage::Whole under 80.1 us boundary.
+        let qwen_m12 = DecodeDmaGate::for_layer_with_crossover(0, heavy_sync);
+        for i in 0..SPLIT_DMA_WARMUP_CALLS {
+            assert!(qwen_m12.should_split(12));
+            let miss_bytes = if i % 2 == 0 { 1_350_000 } else { 2_700_000 };
+            qwen_m12.observe(12, miss_bytes);
+        }
+        assert!(
+            !qwen_m12.should_split(12),
+            "Qwen M=12 1-2 misses (1.35-2.7 MiB < {} B) must gate onto pipelined RunStage::Whole",
+            heavy_sync.min_bytes
+        );
+
+        // (4) Heavy M=12 burst (8 MiB) stays on hardware DMA.
+        let heavy_m12 = DecodeDmaGate::for_layer_with_crossover(0, heavy_sync);
+        for _ in 0..8 {
+            assert!(heavy_m12.should_split(12));
+            heavy_m12.observe(12, 8 * MIB);
+        }
+        assert!(heavy_m12.should_split(12), "heavy M=12 8 MiB burst must stay on split DMA");
+
+        // (5) RTX 3090 Gen4 (`19.31 GB/s` DMA <= `22.86 GB/s` zero-copy) and degenerate rates clamp to u64::MAX.
+        for (inv_s, inv_z) in [
+            (1.0 / 19.31e9, 1.0 / 22.86e9),
+            (1.0 / 24e9, 1.0 / 24e9),
+            (0.0, 1.0 / 24e9),
+            (1.0 / 48e9, 0.0),
+            (f64::NAN, 1.0 / 24e9),
+        ] {
+            let clamped = SplitDmaCrossover::derive(inv_s, inv_z, 20e-6);
+            assert_eq!(clamped.min_bytes, u64::MAX);
+        }
+
+        // (6) `from_rates` derives cleanly from `TierCopyCosts` + `ExpertLines`.
+        let transfer = magnitude_cost_model::ReadLine::new(5.1e-6, 1.0 / 48e9).expect("valid ReadLine");
+        let copy = crate::assessment::TierCopyCosts {
+            blocks: 2,
+            whole_seconds: 1e-3,
+            stall_share: 0.0,
+            transfer,
+            back: transfer,
+        };
+        let record_bytes = 3 * MIB;
+        let link_ns = ((record_bytes as f64 / 24e9) * 1e9).round() as u32;
+        let resident_ns = ((record_bytes as f64 / 1.5e12) * 1e9).round() as u32;
+        let ns = |v: u32| magnitude_cost_model::Nanoseconds::try_from(v).unwrap();
+        let expert_lines = magnitude_cost_model::ExpertLines {
+            gpu: magnitude_cost_model::GpuLines {
+                resident: magnitude_cost_model::PassLine { weights: ns(resident_ns), row: ns(500) },
+                link: magnitude_cost_model::PassLine { weights: ns(link_ns), row: ns(500) },
+                moves: magnitude_cost_model::Moves::NONE,
+            },
+            host: magnitude_cost_model::HostLines {
+                cpu: None,
+                memory: None,
+                landing: None,
+                record_bytes,
+            },
+        };
+        let measured = SplitDmaCrossover::from_rates(&copy, &expert_lines, None);
+        let expected = SplitDmaCrossover::derive(inv_split, inv_zc, 5.1e-6);
+        assert!(
+            measured.min_bytes.abs_diff(expected.min_bytes) <= 256,
+            "from_rates {} should match derive {}",
+            measured.min_bytes,
+            expected.min_bytes
         );
     }
 

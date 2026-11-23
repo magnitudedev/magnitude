@@ -37,20 +37,23 @@ fn a_bank_sheds_what_claims_took_in_whole_blocks() {
     assert_eq!(held_target(0, 9, SLOT, &shape(), &charge), 8, "never below the floor");
 }
 
-/// The block is the one threshold both ways: a bank of 132 slots in blocks
-/// of four grows once its room holds a block more, and shrinks once it holds
-/// a block more than its room, to what the room fits.
+/// The block is the one threshold both ways under external pressure: a bank of
+/// 132 slots in blocks of four grows once its room holds a block more, and
+/// shrinks once external budget/cap pressure leaves it a block short, while
+/// holding steady when `owed == 0` and `external_over == 0`.
 #[test]
 fn the_bank_moves_by_a_block_either_way() {
     let block = BankShape::new(4 * SLOT, 8, 226, 226);
     let room = |slots: u64| (slots - 8) * SLOT;
-    let held = |room| held_target(room, 132, 0, &block, &charge);
-    assert_eq!(held(room(132)), 132);
-    assert_eq!(held(room(135) + SLOT / 2), 132, "short of a block above");
-    assert_eq!(held(room(136)), 136, "a block above");
-    assert_eq!(held(room(129) + 1), 132, "short of a block below");
-    assert_eq!(held(room(128)), 128, "a block below: to what the room fits");
-    assert_eq!(held(room(120) + SLOT / 3), 120);
+    let held_grow = |r| held_target(r, 132, 0, &block, &charge);
+    assert_eq!(held_grow(room(132)), 132);
+    assert_eq!(held_grow(room(135) + SLOT / 2), 132, "short of a block above");
+    assert_eq!(held_grow(room(136)), 136, "a block above");
+    assert_eq!(held_grow(room(128)), 132, "without owed or external pressure, holds steady");
+    let held_pressure = |r| held_target_with_pressure(r, r, 132, 0, 4 * SLOT, &block, &charge);
+    assert_eq!(held_pressure(room(129) + 1), 132, "short of a block below");
+    assert_eq!(held_pressure(room(128)), 128, "a block below under pressure: to what the room fits");
+    assert_eq!(held_pressure(room(120) + SLOT / 3), 120);
     assert_eq!(bank_move(132, 132), None);
     assert_eq!(bank_move(128, 132), Some(BankMove::Shrink { to: 128 }));
     assert_eq!(bank_move(136, 132), Some(BankMove::Grow { to: 136 }));
@@ -58,14 +61,14 @@ fn the_bank_moves_by_a_block_either_way() {
 
 /// The laptop's bank in blocks of one slot: others' jitter of a third of a
 /// slot for a reading lowers the room by less than a block, so the bank
-/// holds; its next reading holds too.
+/// holds; under real external pressure of a full block, it sheds one slot.
 #[test]
 fn a_room_moving_within_a_block_resizes_nothing() {
     let room = (132 - 8) * SLOT;
     for jitter in [SLOT / 3, SLOT - 1, 0] {
-        assert_eq!(bank_move(held_target(room - jitter, 132, 0, &shape(), &charge), 132), None, "{jitter} bytes of others' rise");
+        assert_eq!(bank_move(held_target_with_pressure(room - jitter, room - jitter, 132, 0, jitter, &shape(), &charge), 132), None, "{jitter} bytes of others' rise");
     }
-    assert_eq!(held_target(room - SLOT, 132, 0, &shape(), &charge), 131, "a whole block's");
+    assert_eq!(held_target_with_pressure(room - SLOT, room - SLOT, 132, 0, SLOT, &shape(), &charge), 131, "a whole block's external pressure");
 }
 
 /// A charge in steps (slots crossing their storage's granule, two slots a
@@ -95,7 +98,7 @@ fn the_bank_holds_at_most_its_ceiling_or_saturation() {
 }
 
 /// A bank grows all the way to its structural ceiling whenever room allows
-/// and shrinks cleanly when room tightens — never capped by a shallow
+/// and shrinks cleanly under external pressure — never capped by a shallow
 /// intermediate slot count.
 #[test]
 fn the_bank_grows_to_its_ceiling_and_shrinks_to_room() {
@@ -103,7 +106,7 @@ fn the_bank_grows_to_its_ceiling_and_shrinks_to_room() {
     let full = BankShape::new(SLOT, 8, 226, 226);
     assert_eq!(held_target(room(200), 126, 0, &full, &charge), 200, "grows into newly available room");
     assert_eq!(held_target(room(300), 126, 0, &full, &charge), 226, "grows up to ceiling");
-    assert_eq!(held_target(room(100), 200, 0, &full, &charge), 100, "shrinks to tighter room");
+    assert_eq!(held_target_with_pressure(room(100), room(100), 200, 0, 100 * SLOT, &full, &charge), 100, "shrinks to tighter room under pressure");
     assert_eq!(held_target(room(226), 100, 0, &full, &charge), 226, "regrows to ceiling after shrink");
 }
 
@@ -161,17 +164,17 @@ fn a_load_imports_what_its_first_reading_keeps() {
 /// A transient rise spike (`guarantee > 0`) lowers `grow_room` by `2x` (`budget`
 /// drop + `guarantee`) while `hold_room` drops only once (`budget` drop): a
 /// resident bank never shrinks on the transient `2x` derivative kick and holds
-/// through two-thirds-block app jitter that old symmetric `held_target` would
-/// have shrank and bounced back 10 ms later.
+/// through two-thirds-block app jitter; an actual 1-slot external drop sheds
+/// 1 slot, not 2.
 #[test]
 fn asymmetric_hold_room_stops_guarantee_derivative_kick_oscillation() {
     let base = (132 - 8) * SLOT;
     let jitter = SLOT * 2 / 3;
     let hold_room = base - jitter;
     let grow_room = base - 2 * jitter;
-    assert_eq!(held_target(grow_room, 132, 0, &shape(), &charge), 130, "symmetric target over-shrinks by 2x");
-    assert_eq!(held_target_in(hold_room, grow_room, 132, 0, &shape(), &charge), 132, "hold_room absorbs single-block jitter");
-    assert_eq!(held_target_in(base - SLOT, base - 2 * SLOT, 132, 0, &shape(), &charge), 131, "actual 1-slot drop sheds 1 slot, not 2");
+    assert_eq!(held_target_with_pressure(grow_room, grow_room, 132, 0, 2 * jitter, &shape(), &charge), 130, "symmetric target over-shrinks by 2x");
+    assert_eq!(held_target_with_pressure(hold_room, grow_room, 132, 0, jitter, &shape(), &charge), 132, "hold_room absorbs single-block jitter");
+    assert_eq!(held_target_with_pressure(base - SLOT, base - 2 * SLOT, 132, 0, SLOT, &shape(), &charge), 131, "actual 1-slot drop sheds 1 slot, not 2");
 }
 
 /// Reproduces `f92704` on a 64 GiB Linux discrete-GPU host: at import time
@@ -438,28 +441,150 @@ fn tight_ram_swapless_cma_host_clamps_and_guards_host_tier_below_oom() {
     assert_eq!(est.live_pinned_headroom(&near_floor), 0);
 }
 
+/// Decisive paired safety test (zero magic deadbands):
+/// (a) Jittering `OtherCache` (e.g. `178 <-> 746 MiB` on macOS UMA DeepSeek
+///     `Table 0`, or `±350 MiB` on `319 MiB` GLM slots) with `owed == 0` and
+///     `held <= budget` produces **zero** releases on both `Experts` and `Table`.
+/// (b) With `owed == 0`, a falling GPU wired grant / budget below `held`
+///     fires physical relief cleanly, and when an overlapping in-process claim
+///     (`owed > 0`) arrives mid-shrink, each physical release is spent once
+///     (never double-released).
 #[test]
-fn deadband_suppresses_table_jitter_while_preserving_owed_shedding_and_ceiling_growth() {
+fn other_cache_jitter_never_shrinks_while_falling_grant_relieves_without_double_shed() {
+    use crate::memory::ledger::{CacheKind, CommittedKind, DeviceGrant, DeviceLedgers, Ledgers, LoadShape, PoolClass, Sample};
+    use crate::memory::supply::Reading;
+    use std::num::NonZeroU64;
+    use std::time::{Duration, Instant};
+
     const MIB: u64 = 1024 * 1024;
-    const BLOCK: u64 = 4 * MIB;
-    const DEADBAND: u64 = 64 * MIB;
-    let charge = |records: u64| records * BLOCK;
-    let shape = BankShape::new(BLOCK, 2, 40, 40).with_deadband(DEADBAND);
-    // Holding 20 records (18 above floor = 72 MiB).
-    let at = 20;
-    let above = (at - 2) * BLOCK;
-    // ±20 MiB jitter (< 64 MiB deadband) neither shrinks nor grows.
-    assert_eq!(held_target_in(above - 20 * MIB, above - 20 * MIB, at, 0, &shape, &charge), at);
-    assert_eq!(held_target_in(above + 20 * MIB, above + 20 * MIB, at, 0, &shape, &charge), at);
-    // Deficit >= 64 MiB shrinks cleanly.
-    assert_eq!(held_target_in(above - DEADBAND, above - DEADBAND, at, 0, &shape, &charge), 4);
-    // Gain >= 64 MiB grows cleanly.
-    assert_eq!(held_target_in(above + DEADBAND, above + DEADBAND, at, 0, &shape, &charge), 36);
-    // Real claim pressure (`owed > 0`) sheds immediately at `BLOCK` granularity, never over-shedding `DEADBAND`.
-    assert_eq!(held_target_in(above, above, at, BLOCK, &shape, &charge), at - 1);
-    // Small table whose remaining capacity to ceiling is < deadband still reaches ceiling when room headroom >= deadband.
-    let small = BankShape::new(BLOCK, 2, 10, 10).with_deadband(DEADBAND);
-    assert_eq!(held_target_in(0, 100 * MIB, 2, 0, &small, &charge), 10);
-    // But near ceiling with sub-deadband headroom, it stays put rather than oscillating.
-    assert_eq!(held_target_in(28 * MIB, 36 * MIB, 9, 0, &small, &charge), 9);
+    const POOL_BLOCK: u64 = 16 * MIB;
+    const DS_SLOT: u64 = 352 * MIB;
+    const TABLE_BLOCK: u64 = 10 * MIB;
+    const TOTAL: u64 = 48 * 1024 * MIB;
+
+    let now = seismic::Lag { release: Duration::ZERO, growth: Duration::ZERO };
+    let scope = Ledgers::new();
+    let start = Instant::now();
+    let init_sample = seismic::HostSample {
+        at: start,
+        page_bytes: 16_384,
+        total: TOTAL,
+        supply: seismic::Supply { free_beyond_target: (40 * 1024 * MIB) as i64, clean_cache: 0, cold_reclaimable: 0 },
+        reclaim_band: 0,
+        counted: seismic::Counted { at: start, lag: Duration::ZERO },
+        cold: seismic::ColdPages { machine: 0, own: None },
+        own_reclaimed: None,
+        wired: None,
+        harm: None,
+        pressure: Some(seismic::PressureLevel::Normal),
+        lag: now,
+    };
+    let (ledgers, _init) = DeviceLedgers::unified_in(&scope, std::sync::Arc::new(LoadShape { stores: Vec::new() }))
+        .read_granted(&Sample::scripted(scope.changes(), init_sample), DeviceGrant::Host);
+    let ledger = ledgers.device().clone();
+    let _records_pool = ledger.pool_block(PoolClass::Records, NonZeroU64::new(POOL_BLOCK).unwrap()).blocks;
+    let _state_pool = ledger.pool_block(PoolClass::State, NonZeroU64::new(POOL_BLOCK).unwrap()).blocks;
+
+    let mut tick = 1u32;
+    let mut read_host_supply = |free_beyond_target: i64| {
+        tick += 1;
+        let t = start + Duration::from_millis(100) * tick;
+        let sample = seismic::HostSample {
+            at: t,
+            supply: seismic::Supply { free_beyond_target, clean_cache: 0, cold_reclaimable: 0 },
+            counted: seismic::Counted { at: t, lag: Duration::ZERO },
+            ..init_sample
+        };
+        ledger.read(ledger.sampled(t), Reading::host(&sample));
+    };
+
+    // Start with plenty of headroom: 40 GiB available.
+    read_host_supply((40 * 1024 * MIB) as i64);
+    let experts_at = 58u64;
+    let table_at = 23u64;
+    let experts_floor = 10u64;
+    let table_floor = 1u64;
+    let experts_above = (experts_at - experts_floor) * DS_SLOT;
+    let table_above = (table_at - table_floor) * TABLE_BLOCK;
+    let floor_bytes = experts_floor * DS_SLOT + table_floor * TABLE_BLOCK;
+
+    let floor_claim = ledger
+        .change(|keeping| ledger.claim_at(&keeping.claims(), None, CommittedKind::Load, floor_bytes))
+        .expect("floor fits");
+    ledger
+        .change(|_| {
+            let e = floor_claim.entry();
+            e.take(&e.change(), floor_bytes, seismic::memory::Wiring::Pageable)
+        })
+        .expect("floor allocates");
+    let _experts_cache = ledger.cached(CacheKind::Bank, experts_above).expect("experts fit");
+    let _table_cache = ledger.cached(CacheKind::Table, table_above).expect("table fits");
+
+    let make_targets = |owed_experts: u64, owed_table: u64| -> Vec<HoldingTarget<'static>> {
+        vec![
+            HoldingTarget {
+                holding: BankHolding::Experts,
+                tier: BankTier::Bank,
+                at: experts_at,
+                owed: owed_experts,
+                shape: BankShape::new(POOL_BLOCK, experts_floor, 128, 128),
+                charge: Box::new(|slots| slots * DS_SLOT),
+            },
+            HoldingTarget {
+                holding: BankHolding::Table { table: 0 },
+                tier: BankTier::Bank,
+                at: table_at,
+                owed: owed_table,
+                shape: BankShape::new(TABLE_BLOCK, table_floor, 23, 23),
+                charge: Box::new(|records| records * TABLE_BLOCK),
+            },
+        ]
+    };
+
+    // (a) Jitter OtherCache (`CacheKind::Prefix`) between 178 MiB and 746 MiB
+    // while `held <= budget` (`supply == 0`, zero external pressure, zero
+    // extra room to grow) and `owed == 0`: ZERO releases on Experts or Table 0.
+    for round in 0..6u32 {
+        let other_bytes = if round % 2 == 0 { 178 * MIB } else { 746 * MIB };
+        // Two readings at 2 GiB settle `guarantee == 0` so `other` is admitted,
+        // then `supply = 0` keeps `budget == in_use == held`.
+        read_host_supply((2 * 1024 * MIB) as i64);
+        read_host_supply((2 * 1024 * MIB) as i64);
+        let other = ledger.cached(CacheKind::Prefix, other_bytes).expect("other cache fits");
+        read_host_supply(0);
+        let targets = make_targets(0, 0);
+        let derived = derive(&ledgers, &targets);
+        assert_eq!(derived[0].1, experts_at, "OtherCache jitter must not shrink Experts on round {round}");
+        assert_eq!(derived[1].1, table_at, "OtherCache jitter must not shrink Table 0 on round {round}");
+        drop(other);
+    }
+
+    // (b) Falling budget/grant below `held` with `owed == 0`: physical relief MUST fire!
+    // Drop host supply by 2 GiB below `in_use` so `budget = held - 2 GiB < held`.
+    let short_by = 2 * 1024 * MIB;
+    read_host_supply(-(short_by as i64));
+    assert!(
+        ledger.estimate().held() > ledger.estimate().budget(),
+        "test setup: held ({}) must exceed budget ({})",
+        ledger.estimate().held(),
+        ledger.estimate().budget()
+    );
+    let targets_pressure = make_targets(0, 0);
+    let derived_pressure = derive(&ledgers, &targets_pressure);
+    let shrunk_experts = derived_pressure[0].1;
+    assert!(
+        shrunk_experts < experts_at,
+        "falling budget below held with owed == 0 must fire physical relief (got {shrunk_experts} vs {experts_at})"
+    );
+
+    // Now an overlapping in-process claim (`owed = 1 slot = 352 MiB`) arrives
+    // mid-shrink while the 2 GiB budget deficit is still active: the physical
+    // release is spent ONCE (`held.min(sheds)`), never subtracting 1 slot on
+    // top of the already-deeper 2 GiB pressure shrink.
+    let targets_overlap = make_targets(DS_SLOT, 0);
+    let derived_overlap = derive(&ledgers, &targets_overlap);
+    assert_eq!(
+        derived_overlap[0].1, shrunk_experts,
+        "overlapping claim smaller than active pressure shrink must not double-release"
+    );
 }

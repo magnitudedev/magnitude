@@ -414,7 +414,7 @@ impl Shared {
     }
 
     /// The load's launch prices; none before they are priced.
-    pub(super) fn launch_prices(&self) -> Option<magnitude_cost_model::LaunchPrices> {
+    pub(in crate::experts) fn launch_prices(&self) -> Option<magnitude_cost_model::LaunchPrices> {
         self.prices.lock().expect("the launch prices").clone()
     }
 
@@ -536,8 +536,13 @@ impl Shared {
 
     /// Each streamed layer's lines once priced ([`Self::price`]); none
     /// before.
-    pub(super) fn priced(&self) -> Option<Arc<[ExpertLines]>> {
+    pub(in crate::experts) fn priced(&self) -> Option<Arc<[ExpertLines]>> {
         self.priced.lock().expect("the priced lines").clone()
+    }
+
+    /// The link copy's costs once priced ([`Self::price_copy`]); none before.
+    pub(in crate::experts) fn copy(&self) -> Option<crate::assessment::TierCopyCosts> {
+        self.copy.lock().expect("a copy's price").clone()
     }
 
     /// A copy over the link costs `costs` from now on.

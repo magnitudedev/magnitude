@@ -345,6 +345,24 @@ impl BankCache {
         owes
     }
 
+    /// Bytes taken from `holding`'s cache by shortage relief beyond what is
+    /// already owed to in-process claims (`claimed_owed`).
+    pub(crate) fn shortage_shed(&self, holding: BankHolding, above: u64, claimed_owed: u64) -> u64 {
+        let held = self.held.lock().expect("bank cache");
+        let growing = self.growing.lock().expect("bank growth");
+        let cached = held
+            .iter()
+            .filter(|(of, _)| *of == holding)
+            .map(|(_, cached)| cached.bytes())
+            .sum::<u64>()
+            + growing
+                .iter()
+                .filter(|running| running.holding == holding)
+                .map(|running| running.backing.bytes())
+                .sum::<u64>();
+        above.saturating_sub(cached).saturating_sub(claimed_owed)
+    }
+
     /// [`Self::owed`], with `held` the pieces: what claims took of them
     /// since read joins what `holding` owes, which its slots past its cache
     /// bound.

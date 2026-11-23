@@ -466,13 +466,14 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
     ) -> Result<BankStep, DomainError> {
         let started = Instant::now();
         let bank = self.family.expert_bank().expect("invariant violated: a growth of a load without a bank");
-        // If the ledger derived this device-tier growth by pricing
+        // If the ledger derived this device-tier `Experts` growth by pricing
         // `CacheKind::GraphSlots` below `CacheKind::Bank`, release `IdleClass`
         // and wait for its buffers to finish dropping on the release thread
         // before calling `bank.grow` so Metal never holds both the idle graph
         // slots and the newly allocated bank blocks simultaneously against
-        // `recommendedMaxWorkingSetSize`.
-        if bank.holding_storage(holding)? == crate::planning::BankTier::Bank {
+        // `recommendedMaxWorkingSetSize`. Auxiliary `Table` holdings never
+        // evict warm `GraphSlots` (only `CacheKind::Bank` is valued against it).
+        if holding == BankHolding::Experts && bank.holding_storage(holding)? == crate::planning::BankTier::Bank {
             let est = self.resources.ledgers().device().estimate();
             let target_bytes = bank
                 .targets()?
