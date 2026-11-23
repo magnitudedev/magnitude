@@ -43,6 +43,19 @@ struct Barrier {
     uint passed;
 };
 
+// Apple7 (M1) serves relaxed `atomic_load_explicit` / `atomic_store_explicit`
+// on non-`coherent(device)` buffers from per-core non-coherent L1 caches, so a
+// spinning threadgroup never observes other cores' arrivals. Atomic RMWs
+// (`fetch_add(0)` / `exchange`) execute in the coherent SLC/L2 cache controller
+// across every Apple Silicon generation (M1 through M4).
+inline uint load_coherent(device atomic_uint *word) {
+    return atomic_fetch_add_explicit(word, 0u, memory_order_relaxed);
+}
+
+inline void store_coherent(device atomic_uint *word, uint value) {
+    atomic_exchange_explicit(word, value, memory_order_relaxed);
+}
+
 // Wait until every threadgroup has arrived here. Every thread of the
 // threadgroup calls it, after its device stores; `flag` is one threadgroup
 // word. Returns false, to every thread, once a wait over the barrier has
@@ -54,13 +67,13 @@ inline bool sync(thread Barrier &barrier, threadgroup uint *flag, uint thread_in
         atomic_thread_fence(mem_flags::mem_device, memory_order_seq_cst, thread_scope_device);
         atomic_fetch_add_explicit(&barrier.words[ARRIVALS], 1u, memory_order_relaxed);
         const uint target = barrier.groups * barrier.passed;
-        uint held = atomic_load_explicit(&barrier.words[GIVE_UP], memory_order_relaxed) == 0u ? 1u : 0u;
-        for (uint spin = 1; held != 0u && atomic_load_explicit(&barrier.words[ARRIVALS], memory_order_relaxed) < target;
+        uint held = load_coherent(&barrier.words[GIVE_UP]) == 0u ? 1u : 0u;
+        for (uint spin = 1; held != 0u && load_coherent(&barrier.words[ARRIVALS]) < target;
              ++spin) {
             if (spin % GIVE_UP_STRIDE != 0u)
                 continue;
-            if (spin >= SPINS || atomic_load_explicit(&barrier.words[GIVE_UP], memory_order_relaxed) != 0u) {
-                atomic_store_explicit(&barrier.words[GIVE_UP], 1u, memory_order_relaxed);
+            if (spin >= SPINS || load_coherent(&barrier.words[GIVE_UP]) != 0u) {
+                store_coherent(&barrier.words[GIVE_UP], 1u);
                 held = 0u;
             }
         }
@@ -79,8 +92,8 @@ inline void depart(thread const Barrier &barrier, uint thread_index) {
         atomic_thread_fence(mem_flags::mem_device, memory_order_seq_cst, thread_scope_device);
         const uint ticket = atomic_fetch_add_explicit(&barrier.words[DEPARTURES], 1u, memory_order_relaxed);
         if (ticket == barrier.groups - 1u) {
-            atomic_store_explicit(&barrier.words[ARRIVALS], 0u, memory_order_relaxed);
-            atomic_store_explicit(&barrier.words[DEPARTURES], 0u, memory_order_relaxed);
+            store_coherent(&barrier.words[ARRIVALS], 0u);
+            store_coherent(&barrier.words[DEPARTURES], 0u);
         }
     }
     threadgroup_barrier(mem_flags::mem_device | mem_flags::mem_threadgroup);
