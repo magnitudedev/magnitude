@@ -4504,7 +4504,9 @@ mod tests {
         let (topology, _, device) =
             recorded(seismic::fixtures::recorded::m4_pro(), BackendName::Metal, 0, seismic::GraphCost::None);
         let mut definition = fixture_definition();
-        definition.decoder.context_limit = 65_536;
+        // Size the 1-layer fixture's KV history well past the startup slab so
+        // full served-context allocation strictly exceeds startup demand.
+        definition.decoder.context_limit = 1_048_576;
         let manifest = fixture_manifest(&definition);
         let draft = ExecutionPlanner::prepare(
             &device,

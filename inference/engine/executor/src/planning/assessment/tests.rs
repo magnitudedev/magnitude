@@ -2879,6 +2879,8 @@ fn wddm_vulkan_stable_and_live_status_agree_on_heap_budget() {
     let exec = executor(&topo, BackendName::Vulkan);
     let path_id = exec.paths(seismic::Contract::DeviceOnly)[0];
     let mut status = unopened(&topo);
+    let host_ram = topo.host_ram().capacity().value;
+    status.sample.host = crate::memory::ledger::tests::host_sample(host_ram, host_ram);
     status.sample.grants.push((
         path_id,
         Ok(seismic::Reported::new(WDDM_BUDGET, seismic::ReportedBy::VulkanHeapBudget)),
