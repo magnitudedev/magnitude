@@ -537,17 +537,33 @@ impl LinkMover {
         moved
     }
 
-    /// Ask the ranking for permanent promotions up to remaining permanent
-    /// copy-engine headroom (excluding in-flight opportunistic `Stage` copies).
+    /// Ask the ranking for permanent promotions up to the step-pipeline budget
+    /// (excluding in-flight opportunistic `Stage` copies). Because released
+    /// victims only drain to `Free` at step boundaries, sizing the pipeline to
+    /// a bounded transfer window (`0.5 ms`, clamped to `[copy.depth, 16]`)
+    /// keeps background turnover proportional to link bandwidth while
+    /// `post_promote()` still bounds live copy-engine concurrency to
+    /// `copy.depth`.
     fn ask(&mut self, core: &mut Core, shared: &Shared, copier: &Copier, copy: &TierCopyCosts) -> bool {
-        let max_depth = record_bytes(core)
+        const PROMOTION_WINDOW_SECS: f64 = 5e-4;
+        const MAX_PROMOTION_PIPELINE: usize = 16;
+        let pipeline_depth = record_bytes(core)
             .into_iter()
             .filter(|&bytes| bytes > 0)
-            .map(|bytes| copy.depth(bytes))
+            .map(|bytes| {
+                let depth = copy.depth(bytes);
+                let record_secs = copy.transfer.transfer_seconds(bytes as f64);
+                let per_window = if record_secs > 0.0 && record_secs.is_finite() {
+                    (PROMOTION_WINDOW_SECS / record_secs).floor() as usize
+                } else {
+                    depth
+                };
+                per_window.clamp(depth, MAX_PROMOTION_PIPELINE)
+            })
             .max()
             .unwrap_or(0);
         let budget = permanent_budget(
-            max_depth,
+            pipeline_depth,
             copier.copies.flight(),
             core.directory.staging_copying().len(),
             core.directory.queued().len(),

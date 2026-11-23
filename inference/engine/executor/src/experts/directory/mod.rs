@@ -1376,24 +1376,49 @@ impl Directory {
         let mut withheld = false;
         for group in 0..self.homes.len() {
             let members = self.homes[group].iter().map(|&(_, layer)| layer).collect::<Vec<_>>();
-            let wanted = members
-                .iter()
-                .flat_map(|&layer| self.wanted[layer].iter().map(move |&expert| (layer, expert)))
-                .filter(|&(layer, expert)| self.in_tier(layer, expert))
-                .collect::<Vec<_>>();
             // Earning weighs a holding displaced for each want, and releases
             // take at most a want's each and the reserve's: all ranked and
-            // weighed by one hold of the ranking, at τ_0.
-            let (victims, priced) = {
+            // weighed by one hold of the ranking, at τ_0. When no prompt reads
+            // override the ranking, `Reuse::top_order(group)` is already sorted
+            // ascending by `Rank`, so selecting the top wants and bottom
+            // victims in O(budget) avoids recomputing `expected_for` over tens
+            // of thousands of queued experts on every turn.
+            let (victims, priced, truncated) = {
                 let reuse = Reuse::of(&self.ranking);
-                let victims = self.victims(&reuse, group, &members, wanted.len() + self.reserve[group], lending);
+                let order = reuse.top_order(group);
+                let need = budget_left.saturating_add(self.reserve[group]);
+                let want_limit = need.max(64).saturating_mul(4).min(order.len());
+                let (wanted, truncated) = if self.prompt_reads.is_empty() {
+                    let mut wanted = Vec::with_capacity(want_limit);
+                    let mut more = false;
+                    for &(_, layer, expert) in order.iter().rev() {
+                        if self.wanted[layer].contains(&expert) && self.in_tier(layer, expert) {
+                            if wanted.len() < want_limit {
+                                wanted.push((layer, expert));
+                            } else {
+                                more = true;
+                                break;
+                            }
+                        }
+                    }
+                    (wanted, more)
+                } else {
+                    let wanted = members
+                        .iter()
+                        .flat_map(|&layer| self.wanted[layer].iter().map(move |&expert| (layer, expert)))
+                        .filter(|&(layer, expert)| self.in_tier(layer, expert))
+                        .collect::<Vec<_>>();
+                    (wanted, false)
+                };
+                let victim_most = wanted.len().min(budget_left).saturating_add(self.reserve[group]);
+                let victims = self.victims(&reuse, group, &members, victim_most, lending);
                 let priced = self.earning(&reuse, group, wanted, &victims.floor, lending);
-                (victims.released, priced)
+                (victims.released, priced, truncated)
             };
-            withheld |= priced.withheld;
+            withheld |= priced.withheld || (truncated && priced.earning.len() <= budget_left);
             let wanted = priced.earning;
             let take = wanted.len().min(budget_left);
-            capped |= wanted.len() > budget_left;
+            capped |= wanted.len() > budget_left || truncated;
             // Prefer permanent records past `0..lent` first so the hottest
             // experts survive across prompt groups untouched, then fill
             // `0..lent` during decode when `!lending`.
@@ -1457,13 +1482,30 @@ impl Directory {
     /// gives up for it is the least any unwanted holding is worth within
     /// τ_0, whichever the ranking releases first.
     fn victims(&self, reuse: &Reuse, group: usize, members: &[usize], most: usize, lending: bool) -> Victims {
-        let held = members
-            .iter()
-            .filter(|&&layer| !self.is_layer_whole_published(layer))
-            .flat_map(|&layer| self.unwanted[layer].iter().map(move |&expert| (layer, expert)))
-            .map(|staged @ (layer, expert)| (staged, self.bank.held(layer, expert).expect("an unwanted expert is held")))
-            .filter(|&(_, record)| self.bank.usable_when(group, record, lending))
-            .collect::<Vec<_>>();
+        let held: Vec<(Staged, usize)> = if self.prompt_reads.is_empty() && most < usize::MAX {
+            let order = reuse.top_order(group);
+            let mut held = Vec::with_capacity(most.min(order.len()));
+            for &(_, layer, expert) in order {
+                if held.len() >= most {
+                    break;
+                }
+                if !self.is_layer_whole_published(layer) && self.unwanted[layer].contains(&expert) {
+                    let record = self.bank.held(layer, expert).expect("an unwanted expert is held");
+                    if self.bank.usable_when(group, record, lending) {
+                        held.push(((layer, expert), record));
+                    }
+                }
+            }
+            held
+        } else {
+            members
+                .iter()
+                .filter(|&&layer| !self.is_layer_whole_published(layer))
+                .flat_map(|&layer| self.unwanted[layer].iter().map(move |&expert| (layer, expert)))
+                .map(|staged @ (layer, expert)| (staged, self.bank.held(layer, expert).expect("an unwanted expert is held")))
+                .filter(|&(_, record)| self.bank.usable_when(group, record, lending))
+                .collect::<Vec<_>>()
+        };
         let ranker = reuse.ranker(group, Tier::COMPUTE, Reader::Move);
         let mut released = held.iter().map(|&((layer, expert), record)| (self.ranked(ranker, layer, expert, None), record)).collect::<Vec<_>>();
         let mut floor = held.iter().map(|&(staged, _)| self.uses(ranker, staged)).collect::<Vec<_>>();
@@ -1509,7 +1551,7 @@ impl Directory {
                 })
             })
             .collect::<Vec<_>>();
-        ranked.sort_by(|a, b| b.0.total_cmp(&a.0).then_with(|| b.1.total_cmp(&a.1)));
+        ranked.sort_by(|a, b| b.0.total_cmp(&a.0).then_with(|| b.1.total_cmp(&a.1)).then_with(|| a.2.cmp(&b.2)));
         // The records past the reserve displace nothing; a promotion into
         // the reserve is paid for by the release that refills it.
         let free = self.bank.free(group).filter(|&record| self.bank.usable_when(group, record, lending)).count();

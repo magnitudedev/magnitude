@@ -48,20 +48,29 @@ pub enum TransferItem<'a> {
 const PREDATES_STREAM_VALUES: &str =
     "the CUDA driver predates driver API 11.7 stream memory operations: no transfer signals its completion";
 
+/// Serialized enqueue and wake-arming state for [`TransferQueue`].
+struct QueueState {
+    fault: Option<String>,
+    /// Latest batch value queued on `stream`.
+    queued: u32,
+    /// Latest batch value covered by a `wake_after(&stream)` call.
+    woken: u32,
+}
+
 /// A device's copy queue and its completion word.
 pub struct TransferQueue {
     device: Device,
     stream: Arc<Stream>,
     /// Dropped only once the stream is known to write it no more.
     done: std::mem::ManuallyDrop<HostWord>,
-    /// Lock-free mirror of `fault.is_some()`, set under `fault` before waking
-    /// waiters so `wait` and `completed` never block on `fault`.
+    /// Lock-free mirror of `state.fault.is_some()`, set under `state` before
+    /// waking waiters so `wait` and `completed` never block on `state`.
     faulted: AtomicBool,
     /// Serializes `copy` enqueueing (`fault` check, `queue`, `wake_after`, and
     /// fault transition) and records why the queue can complete no batch from
     /// now after a driver call fails mid-enqueue. Never acquired on the
     /// lock-free `wait`/`completed` happy paths.
-    fault: std::sync::Mutex<Option<String>>,
+    state: std::sync::Mutex<QueueState>,
 }
 
 // The stream and word are driver objects usable from any thread with their
@@ -94,7 +103,7 @@ impl TransferQueue {
             stream: Stream::new(device.context()).map_err(submission)?,
             done: std::mem::ManuallyDrop::new(HostWord::new(device)?),
             faulted: AtomicBool::new(false),
-            fault: std::sync::Mutex::new(None),
+            state: std::sync::Mutex::new(QueueState { fault: None, queued: 0, woken: 0 }),
         })
     }
 
@@ -129,8 +138,8 @@ impl TransferQueue {
         };
         let mut faulted_now = false;
         {
-            let mut fault = self.fault.lock().expect("transfer queue lock is never poisoned");
-            if let Some(reason) = fault.as_deref() {
+            let mut state = self.state.lock().expect("transfer queue lock is never poisoned");
+            if let Some(reason) = state.fault.as_deref() {
                 return Err(ExecutionError::SubmissionFailed(format!("the transfer queue faulted: {reason}")));
             }
             let queued = self
@@ -145,23 +154,32 @@ impl TransferQueue {
                 .and_then(|()| {
                     if record_event {
                         // Stream-synced callers (`copy_event`) synchronize via
-                        // `cuStreamWaitEvent` on `event` and never sleep on
-                        // `self.done`; skip the blocking event + `cuLaunchHostFunc`.
+                        // `cuStreamWaitEvent` on `event`. Skip `cuLaunchHostFunc`
+                        // here; if a host waiter later sleeps in `wait()`, it
+                        // arms `wake_after` on demand.
                         Ok(())
                     } else {
                         self.done.wake_after(&self.stream)
                     }
                 })
                 .and_then(|()| self.stream.flush_submission().map_err(submission));
-            if let Err(error) = queued {
-                *fault = Some(error.to_string());
-                self.faulted.store(true, Ordering::Release);
-                faulted_now = true;
+            match queued {
+                Ok(()) => {
+                    state.queued = value;
+                    if !record_event {
+                        state.woken = value;
+                    }
+                }
+                Err(error) => {
+                    state.fault = Some(error.to_string());
+                    self.faulted.store(true, Ordering::Release);
+                    faulted_now = true;
+                }
             }
         }
         if faulted_now {
             // Its waiters learn the fault now ([`Self::completed`]), with
-            // `fault` already released and `faulted` published.
+            // `state` already released and `faulted` published.
             self.done.wake();
         }
         Ok(event)
@@ -170,7 +188,32 @@ impl TransferQueue {
     /// Wait at most `timeout` for batch `value` ([`Self::completed`]),
     /// sleeping until the completion word's write wakes the waiter.
     pub fn wait(&self, value: u32, timeout: std::time::Duration) -> Result<bool, ExecutionError> {
-        self.done.wait(|done| (done.wrapping_sub(value) as i32) >= 0 || self.faulted(), timeout);
+        let reached = |done: u32| (done.wrapping_sub(value) as i32) >= 0;
+        if reached(self.done.load()) || self.faulted() {
+            return self.completed(value);
+        }
+        let mut faulted_now = false;
+        {
+            let mut state = self.state.lock().expect("transfer queue lock is never poisoned");
+            if state.fault.is_none()
+                && !reached(self.done.load())
+                && (state.woken.wrapping_sub(value) as i32) < 0
+            {
+                match self.done.wake_after(&self.stream) {
+                    Ok(()) => state.woken = state.queued,
+                    Err(error) => {
+                        state.fault = Some(error.to_string());
+                        self.faulted.store(true, Ordering::Release);
+                        faulted_now = true;
+                    }
+                }
+            }
+        }
+        if faulted_now {
+            self.done.wake();
+            return self.completed(value);
+        }
+        self.done.wait(|done| reached(done) || self.faulted(), timeout);
         self.completed(value)
     }
 
@@ -263,7 +306,7 @@ impl TransferQueue {
         if !self.faulted() && reached() {
             return Ok(true);
         }
-        let fault = self.fault.lock().expect("transfer queue lock is never poisoned").clone();
+        let fault = self.state.lock().expect("transfer queue lock is never poisoned").fault.clone();
         match fault {
             Some(fault) => Err(ExecutionError::SubmissionFailed(format!("the transfer queue faulted: {fault}"))),
             // The stream drained: the word holds the last value it wrote.
