@@ -618,7 +618,7 @@ native gated_delta_chunk for cuda from "cuda/gated_delta_chunk.cu":
         threadgroups (ceil_div(M, CUDA_CHUNK_PIECE) + B, NK, 1)
         threads_per_threadgroup (256, 1, 1)
     launch gated_delta_chunk_scan:
-        params (ROWS in [32, 64, 128] default greatest where W % ROWS == 0 and 3 * (96 * W + 32 * ROWS + 1680) + ROWS / 16 * 16 * 17 * 4 <= device.shared_bytes_per_group and (2 * NV * (W / ROWS) >= device.units or ROWS == 32))
+        params (ROWS in [32, 64, 128] default greatest where W % ROWS == 0 and 3 * (96 * W + 32 * ROWS + 1680) + ROWS / 16 * 16 * 17 * 4 <= device.shared_bytes_per_group and (NV * (W / ROWS) >= device.units or ROWS == 32))
         threadgroups (W / ROWS, NV, B)
         threads_per_threadgroup (2 * ROWS, 1, 1)
         shared_bytes (3 * (96 * W + 32 * ROWS + 1680) + ROWS / 16 * 16 * 17 * 4)

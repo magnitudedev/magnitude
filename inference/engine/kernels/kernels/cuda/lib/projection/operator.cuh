@@ -924,133 +924,155 @@ template <class WA, class Epi>
 __device__ __forceinline__ void ordered_gemm_block(u8 *shared_raw, const u8 *rows, u64 row_stride, u64 col_stride,
                                                    u32 M, u64 K, u64 N, u64 tile_m, u64 tile_n, const WA &wa,
                                                    const Epi &epi) {
-    float *cols_tile = reinterpret_cast<float *>(shared_raw);
+    // 32x16x64 double-buffered F32 outer-product microkernel preserving the exact
+    // 8-lane reference reduction order (`((l0+l4)+(l2+l6))+((l1+l5)+(l3+l7))`).
+    // Transposed layout for vectorized float4 (LDS.128) loads in the inner loop:
+    //   x_buf[2][64][36] (18,432 B, stride 36 ≡ 4 mod 32 -> conflict-free across u=0..7)
+    //   w_buf[2][64][20] (10,240 B, stride 20 -> 16B aligned for float4 loads)
+    // Total: 28,672 B.
+    constexpr u32 X_STRIDE = 36u;
+    constexpr u32 W_STRIDE = 20u;
+    constexpr u32 X_STAGE = 64u * X_STRIDE;
+    constexpr u32 W_STAGE = 64u * W_STRIDE;
+    float *x_buf = reinterpret_cast<float *>(shared_raw);
+    float *w_buf = x_buf + 2u * X_STAGE;
+
     const u32 tid = threadIdx.x;
-    const u32 sg = tid / 32u;
-    const u32 lane = tid & 31u;
-    const u32 gn = lane >> 3u;
-    const u32 u = lane & 7u;
-    const u32 r_dec = tid / 8u;
-    const u32 act_lo = (u32)(tile_m * 64ull + sg * 4u);
-    const u32 act_hi = act_lo + 32u;
-    const bool has_lo = act_lo < M;
-    const bool has_hi = act_hi < M;
-    const bool has_cols = (tile_n * 32ull + 8ull * gn) < N;
-    const u32 my_row0 = act_lo + gn;
-    const u32 my_row1 = act_hi + gn;
-    const u64 w_row = tile_n * 32ull + r_dec;
-    float acc0[4][8], acc1[4][8];
-#pragma unroll
-    for (int i = 0; i < 4; ++i)
-#pragma unroll
-        for (int j = 0; j < 8; ++j) {
-            acc0[i][j] = 0.0f;
-            acc1[i][j] = 0.0f;
-        }
+    const u32 u = tid & 7u;
+    const u32 c_quad = (tid >> 3u) & 3u;
+    const u32 r_quad = tid >> 5u;
+
+    const u32 x_r = tid >> 3u;
+    const u32 x_g = tid & 7u;
+    const u64 g_xrow = tile_m * 32ull + (u64)x_r;
+
+    const u32 w_r = tid >> 4u;
+    const u32 pkt_off = (tid >> 3u) & 1u;
+    const u32 w_u = tid & 7u;
+    const u64 g_wrow = tile_n * 16ull + (u64)w_r;
+
     const u64 packets = (K + 31ull) / 32ull;
     if (packets == 0ull)
         return;
+    const u64 chunks = (packets + 1ull) / 2ull;
+
+    auto load_x = [&](u64 chunk, float (&out)[8]) {
+        const u64 k0 = chunk * 64ull;
+        if (g_xrow < M) {
+            const u64 idx = g_xrow * row_stride + k0 + 8ull * (u64)x_g;
+            if (col_stride == 1ull && k0 + 64ull <= K &&
+                ((reinterpret_cast<u64>(rows + idx * Act::bytes) & 15u) == 0u)) {
+                element::span<Act, 8, true>(rows, idx, out);
+            } else {
+#pragma unroll
+                for (u32 i = 0u; i < 8u; ++i) {
+                    const u64 col = k0 + 8ull * (u64)x_g + (u64)i;
+                    out[i] = col < K ? element::at<Act>(rows, g_xrow * row_stride + col * col_stride) : 0.0f;
+                }
+            }
+        } else {
+#pragma unroll
+            for (u32 i = 0u; i < 8u; ++i)
+                out[i] = 0.0f;
+        }
+    };
+    auto store_x = [&](u32 stage, const float (&vals)[8]) {
+        float *dst = x_buf + stage * X_STAGE + (8u * x_g) * X_STRIDE + x_r;
+#pragma unroll
+        for (u32 i = 0u; i < 8u; ++i)
+            dst[i * X_STRIDE] = vals[i];
+    };
+    auto load_w = [&](u64 chunk, float (&out)[4]) {
+        const u64 p = chunk * 2ull + (u64)pkt_off;
+        if (p < packets) {
+            packets::row_packet8(wa, g_wrow, N, p, K, w_u, out);
+        } else {
+#pragma unroll
+            for (u32 s = 0u; s < 4u; ++s)
+                out[s] = 0.0f;
+        }
+    };
+    auto store_w = [&](u32 stage, const float (&vals)[4]) {
+        float *dst = w_buf + stage * W_STAGE + (pkt_off * 32u + w_u) * W_STRIDE + w_r;
+#pragma unroll
+        for (u32 s = 0u; s < 4u; ++s)
+            dst[(8u * s) * W_STRIDE] = vals[s];
+    };
+
+    float acc[4][4];
+#pragma unroll
+    for (int i = 0; i < 4; ++i)
+#pragma unroll
+        for (int j = 0; j < 4; ++j)
+            acc[i][j] = 0.0f;
+
     {
-        float wv[4];
-        packets::row_packet8(wa, w_row, N, 0ull, K, u, wv);
-#pragma unroll
-        for (int s = 0; s < 4; ++s)
-            cols_tile[(8u * (u32)s + u) * 36u + r_dec] = wv[s];
+        float xv[8], wv[4];
+        load_x(0ull, xv);
+        load_w(0ull, wv);
+        store_x(0u, xv);
+        store_w(0u, wv);
     }
-    for (u64 p = 0; p < packets; ++p) {
-        const u64 k0 = 32ull * p;
-        float cur_x0[4] = {0.0f, 0.0f, 0.0f, 0.0f};
-        float cur_x1[4] = {0.0f, 0.0f, 0.0f, 0.0f};
-        if (has_lo) {
+    __syncthreads();
+
+    for (u64 chunk = 0ull; chunk < chunks; ++chunk) {
+        const u32 cur = static_cast<u32>(chunk & 1ull);
+        const u32 nxt = cur ^ 1u;
+        const float *cur_x = x_buf + cur * X_STAGE + u * X_STRIDE + 4u * r_quad;
+        const float *cur_w = w_buf + cur * W_STAGE + u * W_STRIDE + 4u * c_quad;
+
+        float next_x[8], next_w[4];
+        const bool has_next = (chunk + 1ull) < chunks;
+        if (has_next) {
+            load_x(chunk + 1ull, next_x);
+            load_w(chunk + 1ull, next_w);
+        }
+
+        const bool full_chunk = (chunk * 2ull + 1ull) < packets;
+        if (full_chunk) {
 #pragma unroll
-            for (int s = 0; s < 4; ++s) {
-                const u64 col = k0 + 8ull * (u64)s + u;
-                cur_x0[s] =
-                    (my_row0 < M && col < K) ? element::at<Act>(rows, (u64)my_row0 * row_stride + col * col_stride) : 0.0f;
+            for (u32 s = 0u; s < 8u; ++s) {
+                const float4 x4 = *reinterpret_cast<const float4 *>(cur_x + (8u * s) * X_STRIDE);
+                const float4 w4 = *reinterpret_cast<const float4 *>(cur_w + (8u * s) * W_STRIDE);
+                const float xv[4] = {x4.x, x4.y, x4.z, x4.w};
+                const float wv[4] = {w4.x, w4.y, w4.z, w4.w};
+#pragma unroll
+                for (u32 i = 0u; i < 4u; ++i)
+#pragma unroll
+                    for (u32 j = 0u; j < 4u; ++j)
+                        acc[i][j] = seismic_fma_rn(xv[i], wv[j], acc[i][j]);
+            }
+        } else {
+#pragma unroll
+            for (u32 s = 0u; s < 4u; ++s) {
+                const float4 x4 = *reinterpret_cast<const float4 *>(cur_x + (8u * s) * X_STRIDE);
+                const float4 w4 = *reinterpret_cast<const float4 *>(cur_w + (8u * s) * W_STRIDE);
+                const float xv[4] = {x4.x, x4.y, x4.z, x4.w};
+                const float wv[4] = {w4.x, w4.y, w4.z, w4.w};
+#pragma unroll
+                for (u32 i = 0u; i < 4u; ++i)
+#pragma unroll
+                    for (u32 j = 0u; j < 4u; ++j)
+                        acc[i][j] = seismic_fma_rn(xv[i], wv[j], acc[i][j]);
             }
         }
-        if (has_hi) {
-#pragma unroll
-            for (int s = 0; s < 4; ++s) {
-                const u64 col = k0 + 8ull * (u64)s + u;
-                cur_x1[s] =
-                    (my_row1 < M && col < K) ? element::at<Act>(rows, (u64)my_row1 * row_stride + col * col_stride) : 0.0f;
-            }
-        }
-        __syncthreads();
-        const float *cur_cols = cols_tile + (p & 1ull) * 1152ull;
-        float next_w[4] = {0.0f, 0.0f, 0.0f, 0.0f};
-        if (p + 1ull < packets)
-            packets::row_packet8(wa, w_row, N, p + 1ull, K, u, next_w);
-        if (has_lo) {
-#pragma unroll
-            for (int s = 0; s < 4; ++s) {
-                const float x0 = __shfl_sync(0xffffffffu, cur_x0[s], u);
-                const float x1 = __shfl_sync(0xffffffffu, cur_x0[s], 8u + u);
-                const float x2 = __shfl_sync(0xffffffffu, cur_x0[s], 16u + u);
-                const float x3 = __shfl_sync(0xffffffffu, cur_x0[s], 24u + u);
-                float y0 = 0.0f, y1 = 0.0f, y2 = 0.0f, y3 = 0.0f;
-                if (has_hi) {
-                    y0 = __shfl_sync(0xffffffffu, cur_x1[s], u);
-                    y1 = __shfl_sync(0xffffffffu, cur_x1[s], 8u + u);
-                    y2 = __shfl_sync(0xffffffffu, cur_x1[s], 16u + u);
-                    y3 = __shfl_sync(0xffffffffu, cur_x1[s], 24u + u);
-                }
-                if (has_cols && (k0 + 32ull <= K || k0 + 8ull * (u64)s + u < K)) {
-                    const float4 *row_f4 = reinterpret_cast<const float4 *>(cur_cols + (8u * (u32)s + u) * 36u);
-                    const float4 wc0 = row_f4[2u * gn];
-                    const float4 wc1 = row_f4[2u * gn + 1u];
-                    const float wc[8] = {wc0.x, wc0.y, wc0.z, wc0.w, wc1.x, wc1.y, wc1.z, wc1.w};
-#pragma unroll
-                    for (int j = 0; j < 8; ++j) {
-                        acc0[0][j] = seismic_fma_rn(x0, wc[j], acc0[0][j]);
-                        acc0[1][j] = seismic_fma_rn(x1, wc[j], acc0[1][j]);
-                        acc0[2][j] = seismic_fma_rn(x2, wc[j], acc0[2][j]);
-                        acc0[3][j] = seismic_fma_rn(x3, wc[j], acc0[3][j]);
-                    }
-                    if (has_hi) {
-#pragma unroll
-                        for (int j = 0; j < 8; ++j) {
-                            acc1[0][j] = seismic_fma_rn(y0, wc[j], acc1[0][j]);
-                            acc1[1][j] = seismic_fma_rn(y1, wc[j], acc1[1][j]);
-                            acc1[2][j] = seismic_fma_rn(y2, wc[j], acc1[2][j]);
-                            acc1[3][j] = seismic_fma_rn(y3, wc[j], acc1[3][j]);
-                        }
-                    }
-                }
-            }
-        }
-        if (p + 1ull < packets) {
-            float *dst = cols_tile + ((p + 1ull) & 1ull) * 1152ull;
-#pragma unroll
-            for (int s = 0; s < 4; ++s)
-                dst[(8u * (u32)s + u) * 36u + r_dec] = next_w[s];
+
+        if (has_next) {
+            store_x(nxt, next_x);
+            store_w(nxt, next_w);
+            __syncthreads();
         }
     }
-    if (has_lo && has_cols) {
+
 #pragma unroll
-        for (int i = 0; i < 4; ++i) {
-            const u32 out_r = act_lo + (u32)i;
+    for (u32 i = 0u; i < 4u; ++i) {
+        const u32 out_r = static_cast<u32>(tile_m * 32ull) + 4u * r_quad + i;
 #pragma unroll
-            for (int j = 0; j < 8; ++j) {
-                const float sum = ordered_combine8(acc0[i][j]);
-                const u64 out_c = tile_n * 32ull + 8ull * gn + (u64)j;
-                if (u == 0u && out_r < M && out_c < N)
-                    epi(out_r, out_c, sum, 0.0f);
-            }
-        }
-    }
-    if (has_hi && has_cols) {
-#pragma unroll
-        for (int i = 0; i < 4; ++i) {
-            const u32 out_r = act_hi + (u32)i;
-#pragma unroll
-            for (int j = 0; j < 8; ++j) {
-                const float sum = ordered_combine8(acc1[i][j]);
-                const u64 out_c = tile_n * 32ull + 8ull * gn + (u64)j;
-                if (u == 0u && out_r < M && out_c < N)
-                    epi(out_r, out_c, sum, 0.0f);
-            }
+        for (u32 j = 0u; j < 4u; ++j) {
+            const float sum = ordered_combine8(acc[i][j]);
+            const u64 out_c = tile_n * 16ull + 4ull * (u64)c_quad + (u64)j;
+            if (u == 0u && out_r < M && out_c < N)
+                epi(out_r, out_c, sum, 0.0f);
         }
     }
 }
@@ -1167,11 +1189,11 @@ __device__ __forceinline__ void ordered_gemm_segmented(u8 *shared_raw, const u8 
     u64 tiles[Segments::COUNT];
 #pragma unroll
     for (int i = 0; i < Segments::COUNT; ++i)
-        tiles[i] = (s.rows[i] + 31ull) / 32ull;
+        tiles[i] = (s.rows[i] + 15ull) / 16ull;
     u64 local = blockIdx.x;
     const int segment = locate_segment(local, tiles);
     if constexpr (Segments::ZEROES) if ((zero & (1u << segment)) != 0u) {
-        zero_segment(s, segment, M, blockIdx.y * 64u, 64u, local * 32ull, 32u, threadIdx.x, blockDim.x);
+        zero_segment(s, segment, M, blockIdx.y * 32u, 32u, local * 16ull, 16u, threadIdx.x, blockDim.x);
         return;
     }
     switch (segment) {

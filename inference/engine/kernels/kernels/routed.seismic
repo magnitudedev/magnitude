@@ -485,11 +485,13 @@ projection routed for cuda:
     params (TPW in [1, 2] default 1 for choice | summed, arithmetic KSPLIT in [1, 2, 4] default least where (KSPLIT == 1 and most(W, WIDTH) / (64 * 2) < 8) or (KSPLIT == 2 and (most(W, WIDTH) / (64 * 4) < 8 or ceil_div(ceil_div(most(W, N), 16), 4 / 2) * (K + SHARED) >= 2 * device.units)) or KSPLIT == 4 for choice | summed,
         GATHER_TPW in [1, 2] default greatest where GATHER_TPW == 1 or ceil_div(ceil_div(ceil_div(most(W, N), 16), GATHER_TPW), 4 / KSPLIT) * (2 * K + SHARED) >= 2 * device.units for choice | summed,
         form GATHERED in [0, 1] default 1 for choice,
-        arithmetic INT8 in [0, 1] default greatest where INT8 == 0 or (STACKED == 1 and each(W, form(W, INT8) == 1)) reference 0 for grouped,
+        arithmetic INT8 in [0, 1] default greatest where INT8 == 0 or each(W, form(W, INT8) == 1) reference 0 for grouped,
         arithmetic OPERAND in [0, 1] default 0 for grouped,
-        BM in [64, 128, 32] default 64 for grouped)
+        BM in [64, 128, 32] default least where (STACKED == 1 and BM == 64) or (STACKED == 0 and ((BM == 32 and ceil_div(WIDTH, 128) * 8 < device.units) or BM == 64)) for grouped,
+        arithmetic SPLIT in [1, 2, 4] default least where (STACKED == 1 and SPLIT == 1) or (STACKED == 0 and ((SPLIT == 1 and (WIDTH < 512 or ceil_div(N, 128) * 8 >= device.units)) or (SPLIT == 2 and (WIDTH < 2048 or ceil_div(N, 128) * 8 * 2 >= device.units)) or SPLIT == 4)) for grouped)
     where each(W, WIDTH % 64 == 0)
-    where (STACKED == 1 or BM == 64) for grouped
+    where (STACKED == 1 or BM != 128) for grouped
+    where (SPLIT == 1 or (STACKED == 0 and WIDTH >= SPLIT * 256)) for grouped
     where STAGES * (TILE * 144 + SERVED * 10240) + SERVED * COEF_BYTES <= device.shared_bytes_per_group for grouped
     where (OPERAND == 0 or INT8 == 0) for grouped
     where (INT8 == 0 or each(W, form(W, INT8) == 1)) for grouped
@@ -500,6 +502,7 @@ projection routed for cuda:
     scratch staged bytes (M * WIDTH * (2 - INT8)) when OPERAND == 1 or INT8 == 1 or any(W, FIRST == 1 and operands(W) == 1) for grouped
     scratch groups bytes (M * WIDTH / 4) when INT8 == 1 for grouped
     scratch product bytes (STACKED * B * T * N * 2 + (1 - STACKED) * M * N * 2) for grouped
+    scratch expand_partials bytes (SPLIT * 2 * M * N * 4) when STACKED == 0 and SPLIT > 1 for grouped
     scratch product_codes bytes (PRODUCT_ROWS * N) when INT8 == 1 for grouped
     scratch product_groups bytes (PRODUCT_ROWS * N / 4) when INT8 == 1 for grouped
     scratch tiles bytes (B * 8) when STACKED == 1 for grouped
@@ -544,12 +547,21 @@ projection routed for cuda:
         threadgroups (M, 1, 1)
         grid (stage_grid)
         threads_per_threadgroup (256, 1, 1)
-    launch expand for grouped:
+    launch expand for grouped when STACKED == 1:
         reads (INT8, OPERAND, BM)
         threadgroups (ceil_div(ceil_div(N, 16), 8), ROW_TILES, TILE_BLOCKS)
         grid (expand_grid)
         threads_per_threadgroup (256, 1, 1)
         shared_bytes (STAGES * (TILE * 144 + SERVED * 10240) + SERVED * COEF_BYTES)
+    launch expand for grouped when STACKED == 0:
+        reads (INT8, OPERAND, BM, SPLIT)
+        threadgroups (ceil_div(ceil_div(N, 16), 8), ROW_TILES, SPLIT)
+        threads_per_threadgroup (256, 1, 1)
+        shared_bytes (STAGES * (TILE * 144 + SERVED * 10240) + SERVED * COEF_BYTES)
+    launch expand_finalize for grouped when STACKED == 0 and SPLIT > 1:
+        reads (INT8, OPERAND, SPLIT)
+        threadgroups (ceil_div(M * N, 256), 1, 1)
+        threads_per_threadgroup (256, 1, 1)
     launch quantize for grouped when INT8 == 1 or (STACKED == 1 and any(W, FIRST == 0 and operands(W) == 1)):
         reads (INT8, OPERAND)
         threadgroups (ceil_div(PRODUCT_ROWS, 1 + 7 * INT8), 1, 1)
@@ -1148,8 +1160,8 @@ native routed_group for cuda from "cuda/routed_group.cu":
         shared_bytes (E * 4)
     launch routed_group_place:
         threadgroups (ceil_div(M * K, GROUP_CHOICES), 1, 1)
-        threads_per_threadgroup (E * (device.max_group_threads / E), 1, 1)
-        shared_bytes (GROUP_CHOICES * 2 + E * (device.max_group_threads / E) * 4 + E * 4 + 128 + 16)
+        threads_per_threadgroup (device.max_group_threads, 1, 1)
+        shared_bytes (2 * 2048 * 4 + 32 * 32 * 2 + E * 12 + 128)
 
 # Vulkan: the same two launches, without atomics; each workgroup walks its
 # chunk's choices in global memory, PARTS slices per expert.

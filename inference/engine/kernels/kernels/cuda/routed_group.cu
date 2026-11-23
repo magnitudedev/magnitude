@@ -15,24 +15,10 @@
 namespace {
 
 constexpr unsigned experts = SEISMIC_DIM_E;
-constexpr unsigned parts = SEISMIC_DEVICE_MAX_GROUP_THREADS / experts;
-constexpr unsigned threads = experts * parts;
 constexpr unsigned expert_warps = (experts + 31) / 32;
 constexpr unsigned K = SEISMIC_DIM_K;
 constexpr unsigned chunk_choices = SEISMIC_CONST_GROUP_CHOICES;
-
-// The count of `expert` among the 8 staged experts of `vector`.
-__device__ __forceinline__ unsigned matches(uint4 vector, unsigned expert) {
-    const unsigned pair = expert | (expert << 16);
-    unsigned count = 0;
-    const unsigned words[4] = {vector.x, vector.y, vector.z, vector.w};
-#pragma unroll
-    for (int i = 0; i < 4; ++i) {
-        const unsigned equal = __vcmpeq2(words[i], pair);
-        count += __popc(equal) / 16;
-    }
-    return count;
-}
+constexpr unsigned SUB_CHOICES = 2048;
 
 } // namespace
 
@@ -85,119 +71,202 @@ extern "C" __global__ void routed_group_place(SEISMIC_KERNEL_PARAMS) {
     const unsigned base = GROUP_BASE;
     const unsigned first = chunk * chunk_choices;
     const unsigned choices = min(chunk_choices, live - min(first, live));
-    const unsigned vectors = (choices + 7) / 8;
-    uint4 *staged = group_shared;
-    unsigned *slices = reinterpret_cast<unsigned *>(group_shared + chunk_choices / 8);
-    unsigned *bases = slices + threads;
-    unsigned *sums = bases + experts;
-    const unsigned thread = threadIdx.x;
-    const unsigned lane = thread % 32, warp = thread / 32;
-    const unsigned expert = thread % experts;
-    const unsigned part = thread / experts;
-    const unsigned span = (vectors + parts - 1) / parts;
-    const unsigned begin = min(part * span, vectors);
-    const unsigned end = min(begin + span, vectors);
 
-    unsigned short *halves = reinterpret_cast<unsigned short *>(staged);
-    for (unsigned flat = thread; flat < vectors * 8; flat += threads)
-        halves[flat] = flat < choices ? static_cast<unsigned short>(GROUP_ROUTE(base + first + flat))
-                                      : static_cast<unsigned short>(0xffffu);
+    // Shared memory layout (2 * 2048 * 4 + 32 * 32 * 2 + E * 12 + 128 bytes):
+    //   keys0[2048], keys1[2048], hist[32][32] u16, bases[E], sub_start[E], sub_end[E], sums[32].
+    unsigned *keys0 = reinterpret_cast<unsigned *>(group_shared);
+    unsigned *keys1 = keys0 + SUB_CHOICES;
+    unsigned short *hist = reinterpret_cast<unsigned short *>(keys1 + SUB_CHOICES);
+    unsigned *bases = reinterpret_cast<unsigned *>(hist + 32u * 32u);
+    unsigned *sub_start = bases + experts;
+    unsigned *sub_end = sub_start + experts;
+    unsigned *sums = sub_end + experts;
+
+    const unsigned thread = threadIdx.x;
+    const unsigned lane = thread & 31u;
+    const unsigned warp = thread >> 5u;
+    const unsigned warps = blockDim.x >> 5u;
+
     // Expert e's choices in every chunk and in the chunks before this one.
-    // For a single live chunk (chunks <= 1), `partials` is not needed and may
-    // not be populated; `total` is summed directly from `slices` below.
-    unsigned total = 0, before = 0;
-    if (part == 0 && chunks > 1u)
-        for (unsigned other = 0; other < chunks; ++other) {
-            const unsigned value = partials[static_cast<unsigned long long>(other) * experts + expert];
-            total += value;
-            before += other < chunk ? value : 0;
+    unsigned total = 0u, before = 0u;
+    if (chunks > 1u) {
+        if (thread < experts) {
+            for (unsigned other = 0u; other < chunks; ++other) {
+                const unsigned value = partials[static_cast<unsigned long long>(other) * experts + thread];
+                total += value;
+                before += other < chunk ? value : 0u;
+            }
         }
-    __syncthreads();
-    unsigned count = 0;
-    for (unsigned vector = begin; vector < end; ++vector)
-        count += matches(staged[vector], expert);
-    slices[expert * parts + part] = count;
-    if (chunks <= 1u) {
+    } else {
+        if (thread < experts)
+            bases[thread] = 0u;
         __syncthreads();
-        if (part == 0) {
-            for (unsigned slice = 0; slice < parts; ++slice)
-                total += slices[expert * parts + slice];
-        }
+        for (unsigned flat = thread; flat < choices; flat += blockDim.x)
+            atomicAdd(&bases[GROUP_ROUTE(base + first + flat)], 1u);
+        __syncthreads();
+        if (thread < experts)
+            total = bases[thread];
     }
 
-    // Exclusive scan of the experts' tile counts (thread e < E holds expert e;
-    // only warps < expert_warps carry part == 0 threads).
-    const unsigned tiles = (total + tile - 1) / tile;
+    // Exclusive scan of the experts' tile counts (thread e < E holds expert e).
+    const unsigned tiles = thread < experts ? (total + tile - 1u) / tile : 0u;
     unsigned inclusive = tiles;
     if (warp < expert_warps) {
 #pragma unroll
-        for (unsigned offset = 1; offset < 32; offset *= 2) {
+        for (unsigned offset = 1u; offset < 32u; offset *= 2u) {
             const unsigned value = __shfl_up_sync(0xffffffffu, inclusive, offset);
             if (lane >= offset)
                 inclusive += value;
         }
         if constexpr (expert_warps > 1) {
-            if (lane == 31 && warp < expert_warps - 1)
+            if (lane == 31u && warp < expert_warps - 1u)
                 sums[warp] = inclusive;
         }
     }
     if constexpr (expert_warps > 1) {
         __syncthreads();
-        if (warp == 0) {
-            unsigned value = lane < expert_warps - 1 ? sums[lane] : 0;
+        if (warp == 0u) {
+            unsigned value = lane < expert_warps - 1u ? sums[lane] : 0u;
 #pragma unroll
-            for (unsigned offset = 1; offset < 32; offset *= 2) {
+            for (unsigned offset = 1u; offset < 32u; offset *= 2u) {
                 const unsigned other = __shfl_up_sync(0xffffffffu, value, offset);
                 if (lane >= offset)
                     value += other;
             }
-            if (lane < expert_warps - 1)
+            if (lane < expert_warps - 1u)
                 sums[lane] = value;
         }
         __syncthreads();
     }
-    if (part == 0) {
-        const unsigned start = inclusive + (expert_warps > 1 && warp > 0 ? sums[warp - 1] : 0) - tiles;
-        bases[expert] = start * tile + before;
-        if (chunk == 0) {
-            counts[expert * SEISMIC_COUNTS_STRIDE_0] = static_cast<int>(total);
+    if (thread < experts) {
+        const unsigned start = inclusive + (expert_warps > 1 && warp > 0u ? sums[warp - 1u] : 0u) - tiles;
+        bases[thread] = start * tile + before;
+        if (chunk == 0u) {
+            counts[thread * SEISMIC_COUNTS_STRIDE_0] = static_cast<int>(total);
             for (unsigned padding = start * tile + total; padding < (start + tiles) * tile; ++padding)
                 order[static_cast<unsigned long long>(padding / tile) * SEISMIC_ORDER_STRIDE_0 +
                       static_cast<unsigned long long>(padding % tile) * SEISMIC_ORDER_STRIDE_1] = -1;
             for (unsigned block = start; block < start + tiles; ++block)
-                blocks[block * SEISMIC_BLOCKS_STRIDE_0] = static_cast<int>(expert);
-            if (expert == experts - 1)
+                blocks[block * SEISMIC_BLOCKS_STRIDE_0] = static_cast<int>(thread);
+            if (thread == experts - 1u)
                 used[0] = static_cast<int>(start + tiles);
         }
     }
     __syncthreads();
 
-    if (count == 0)
-        return;
-    unsigned position = bases[expert];
-    for (unsigned slice = 0; slice < part; ++slice)
-        position += slices[expert * parts + slice];
-    unsigned remaining = count;
-    for (unsigned vector = begin; vector < end; ++vector) {
-        const uint4 packed = staged[vector];
-        const unsigned found = matches(packed, expert);
-        if (found == 0)
-            continue;
-        const unsigned words[4] = {packed.x, packed.y, packed.z, packed.w};
+    // O(N) stable order-preserving scatter in sub-chunks of SUB_CHOICES:
+    // 2-pass 5-bit stable radix sort on (expert << 16 | local_flat) in shared
+    // memory (covers E <= 1024), then direct O(1) placement per choice.
+    for (unsigned sub_first = 0u; sub_first < choices; sub_first += SUB_CHOICES) {
+        const unsigned sub_n = min(SUB_CHOICES, choices - sub_first);
+        for (unsigned i = thread; i < sub_n; i += blockDim.x) {
+            const unsigned ex = static_cast<unsigned>(GROUP_ROUTE(base + first + sub_first + i));
+            keys0[i] = (ex << 16u) | i;
+        }
+        __syncthreads();
+
+        const unsigned per_warp = (sub_n + warps - 1u) / warps;
+        const unsigned w_lo = min(warp * per_warp, sub_n);
+        const unsigned w_hi = min(w_lo + per_warp, sub_n);
+
 #pragma unroll
-        for (unsigned i = 0; i < 8; ++i) {
-            if (((words[i / 2] >> (16 * (i % 2))) & 0xffffu) != expert)
-                continue;
-            const unsigned flat = base + first + vector * 8 + i;
+        for (unsigned pass = 0u; pass < 2u; ++pass) {
+            const unsigned shift = 16u + pass * 5u;
+            const unsigned *src = (pass == 0u) ? keys0 : keys1;
+            unsigned *dst = (pass == 0u) ? keys1 : keys0;
+
+            for (unsigned i = thread; i < 32u * 32u; i += blockDim.x)
+                hist[i] = 0u;
+            __syncthreads();
+
+            for (unsigned pos = w_lo; pos < w_hi; pos += 32u) {
+                const bool act = (pos + lane) < w_hi;
+                const unsigned bin = act ? ((src[pos + lane] >> shift) & 31u) : 32u;
+                const unsigned same = __match_any_sync(0xffffffffu, bin);
+                if (act && (same & ((1u << lane) - 1u)) == 0u)
+                    hist[bin * 32u + warp] += static_cast<unsigned short>(__popc(same));
+            }
+            __syncthreads();
+
+            // Exclusive prefix sum across 32 bins x 32 warps.
+            for (unsigned b = warp; b < 32u; b += warps) {
+                unsigned val = static_cast<unsigned>(hist[b * 32u + lane]);
+                unsigned inc = val;
+#pragma unroll
+                for (unsigned offset = 1u; offset < 32u; offset *= 2u) {
+                    const unsigned up = __shfl_up_sync(0xffffffffu, inc, offset);
+                    if (lane >= offset)
+                        inc += up;
+                }
+                hist[b * 32u + lane] = static_cast<unsigned short>(inc - val);
+                if (lane == 31u)
+                    sums[b] = inc;
+            }
+            __syncthreads();
+
+            if (warp == 0u) {
+                unsigned val = sums[lane];
+                unsigned inc = val;
+#pragma unroll
+                for (unsigned offset = 1u; offset < 32u; offset *= 2u) {
+                    const unsigned up = __shfl_up_sync(0xffffffffu, inc, offset);
+                    if (lane >= offset)
+                        inc += up;
+                }
+                sums[lane] = inc - val;
+            }
+            __syncthreads();
+
+            for (unsigned b = warp; b < 32u; b += warps)
+                hist[b * 32u + lane] = static_cast<unsigned short>(static_cast<unsigned>(hist[b * 32u + lane]) + sums[b]);
+            __syncthreads();
+
+            for (unsigned pos = w_lo; pos < w_hi; pos += 32u) {
+                const bool act = (pos + lane) < w_hi;
+                const unsigned key = act ? src[pos + lane] : 0u;
+                const unsigned bin = act ? ((key >> shift) & 31u) : 32u;
+                const unsigned same = __match_any_sync(0xffffffffu, bin);
+                const unsigned r = __popc(same & ((1u << lane) - 1u));
+                const unsigned base_off = act ? static_cast<unsigned>(hist[bin * 32u + warp]) : 0u;
+                if (act)
+                    dst[base_off + r] = key;
+                __syncwarp();
+                if (act && r == 0u)
+                    hist[bin * 32u + warp] = static_cast<unsigned short>(base_off + __popc(same));
+                __syncwarp();
+            }
+            __syncthreads();
+        }
+
+        // keys0[0..sub_n) is now stably sorted by (expert, local_flat).
+        for (unsigned i = thread; i < sub_n; i += blockDim.x) {
+            const unsigned ex = keys0[i] >> 16u;
+            if (i == 0u || (keys0[i - 1u] >> 16u) != ex)
+                sub_start[ex] = i;
+            if (i + 1u == sub_n || (keys0[i + 1u] >> 16u) != ex)
+                sub_end[ex] = i + 1u;
+        }
+        __syncthreads();
+
+        for (unsigned i = thread; i < sub_n; i += blockDim.x) {
+            const unsigned key = keys0[i];
+            const unsigned ex = key >> 16u;
+            const unsigned local_flat = key & 0xffffu;
+            const unsigned position = bases[ex] + (i - sub_start[ex]);
+            const unsigned flat = base + first + sub_first + local_flat;
             const unsigned row = flat / K;
             order[static_cast<unsigned long long>(position / tile) * SEISMIC_ORDER_STRIDE_0 +
                   static_cast<unsigned long long>(position % tile) * SEISMIC_ORDER_STRIDE_1] = static_cast<int>(row);
             inverse[static_cast<unsigned long long>(row) * SEISMIC_INVERSE_STRIDE_0 +
                     static_cast<unsigned long long>(flat % K) * SEISMIC_INVERSE_STRIDE_1] = static_cast<int>(position);
-            ++position;
         }
-        remaining -= found;
-        if (remaining == 0)
-            break;
+        __syncthreads();
+
+        for (unsigned i = thread; i < sub_n; i += blockDim.x) {
+            const unsigned ex = keys0[i] >> 16u;
+            if (i == 0u || (keys0[i - 1u] >> 16u) != ex)
+                bases[ex] += sub_end[ex] - sub_start[ex];
+        }
+        __syncthreads();
     }
 }

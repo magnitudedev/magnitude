@@ -13,7 +13,10 @@
 #define KERNEL_W2 SEISMIC_SHARED_UP
 #include "lib/projection/projection.cuh"
 
-using GShape = projection::GemmShape<64, 2, 4, 3>;
+template <unsigned BM> struct CombineShape;
+template <> struct CombineShape<32> { using type = projection::GemmShape<32, 2, 4, 3>; };
+template <> struct CombineShape<64> { using type = projection::GemmShape<64, 2, 4, 3>; };
+template <> struct CombineShape<128> { using type = projection::GemmShape<128, 2, 4, 2>; };
 using activation::Act;
 // Whether both GEMMs run on the int8 path (INT8 = 1, which the declaration
 // admits where every weight is admitted to it).
@@ -129,22 +132,50 @@ __global__ void routed_combine_stage(SEISMIC_KERNEL_PARAMS) {
 #endif
 
 #ifdef SEISMIC_FORMING_ROUTED_COMBINE_EXPAND
-template <unsigned INT8, unsigned OPERAND, unsigned BM>
+template <unsigned INT8, unsigned OPERAND, unsigned BM, unsigned SPLIT>
 __global__ void routed_combine_expand(SEISMIC_KERNEL_PARAMS) {
     constexpr bool S8 = GROUPED_S8;
     constexpr bool STAGED = S8 || OPERAND == 1;
     using Operands = typename projection::GemmOperands<OPERAND>::type;
+    using Shape = typename CombineShape<BM>::type;
     extern __shared__ uint4 dynamic_shared[];
     if (blockIdx.x >= projection::gemm_columns(SEISMIC_DIM_S))
         return;
+    if constexpr (SPLIT > 1) {
+        const projection::PartialStore<2> epi{
+            reinterpret_cast<float *>(SEISMIC_PTR(SEISMIC_BUFFER_SCRATCH_EXPAND_PARTIALS)), SEISMIC_DIM_M,
+            SEISMIC_DIM_S, 0, blockIdx.z};
+        projection::gemm_run<Shape, S8, EXPAND_ENTRIES, Operands>(
+            reinterpret_cast<projection::u8 *>(dynamic_shared),
+            STAGED ? SEISMIC_PTR(SEISMIC_BUFFER_SCRATCH_STAGED) : SEISMIC_PTR(SEISMIC_BUFFER_NORMALIZED),
+            STAGED ? SEISMIC_DIM_H : SEISMIC_NORMALIZED_STRIDE_0, SEISMIC_PTR(SEISMIC_BUFFER_SCRATCH_GROUPS),
+            (unsigned)SEISMIC_DIM_M, SEISMIC_DIM_H, blockIdx.x, SEISMIC_DIM_S,
+            KERNEL_W1_AT(SEISMIC_PTR(SEISMIC_BUFFER_SHARED_GATE)),
+            KERNEL_W2_AT(SEISMIC_PTR(SEISMIC_BUFFER_SHARED_UP)), epi, blockIdx.z, SPLIT);
+    } else {
+        const projection::Glu<typename Operands::Storage, Act> epi{
+            element::out_over_scratch<typename Operands::Storage>(SEISMIC_PTR(SEISMIC_BUFFER_SCRATCH_PRODUCT)),
+            SEISMIC_DIM_S, 0};
+        projection::gemm_run<Shape, S8, EXPAND_ENTRIES, Operands>(
+            reinterpret_cast<projection::u8 *>(dynamic_shared),
+            STAGED ? SEISMIC_PTR(SEISMIC_BUFFER_SCRATCH_STAGED) : SEISMIC_PTR(SEISMIC_BUFFER_NORMALIZED),
+            STAGED ? SEISMIC_DIM_H : SEISMIC_NORMALIZED_STRIDE_0, SEISMIC_PTR(SEISMIC_BUFFER_SCRATCH_GROUPS),
+            (unsigned)SEISMIC_DIM_M, SEISMIC_DIM_H, blockIdx.x, SEISMIC_DIM_S,
+            KERNEL_W1_AT(SEISMIC_PTR(SEISMIC_BUFFER_SHARED_GATE)),
+            KERNEL_W2_AT(SEISMIC_PTR(SEISMIC_BUFFER_SHARED_UP)), epi);
+    }
+}
+#endif
+
+#ifdef SEISMIC_FORMING_ROUTED_COMBINE_EXPAND_FINALIZE
+template <unsigned INT8, unsigned OPERAND, unsigned SPLIT>
+__global__ void routed_combine_expand_finalize(SEISMIC_KERNEL_PARAMS) {
+    using Operands = typename projection::GemmOperands<OPERAND>::type;
     const projection::Glu<typename Operands::Storage, Act> epi{
-        element::out_over_scratch<typename Operands::Storage>(SEISMIC_PTR(SEISMIC_BUFFER_SCRATCH_PRODUCT)), SEISMIC_DIM_S, 0};
-    projection::gemm_run<GShape, S8, EXPAND_ENTRIES, Operands>(reinterpret_cast<projection::u8 *>(dynamic_shared),
-                             STAGED ? SEISMIC_PTR(SEISMIC_BUFFER_SCRATCH_STAGED) : SEISMIC_PTR(SEISMIC_BUFFER_NORMALIZED),
-                             STAGED ? SEISMIC_DIM_H : SEISMIC_NORMALIZED_STRIDE_0, SEISMIC_PTR(SEISMIC_BUFFER_SCRATCH_GROUPS),
-                             (unsigned)SEISMIC_DIM_M, SEISMIC_DIM_H, blockIdx.x, SEISMIC_DIM_S,
-                             KERNEL_W1_AT(SEISMIC_PTR(SEISMIC_BUFFER_SHARED_GATE)),
-                             KERNEL_W2_AT(SEISMIC_PTR(SEISMIC_BUFFER_SHARED_UP)), epi);
+        element::out_over_scratch<typename Operands::Storage>(SEISMIC_PTR(SEISMIC_BUFFER_SCRATCH_PRODUCT)),
+        SEISMIC_DIM_S, 0};
+    projection::split_finalize<2>(reinterpret_cast<const float *>(SEISMIC_PTR(SEISMIC_BUFFER_SCRATCH_EXPAND_PARTIALS)),
+                                  SPLIT, SEISMIC_DIM_M, SEISMIC_DIM_S, epi);
 }
 #endif
 
@@ -169,6 +200,7 @@ template <unsigned INT8, unsigned OPERAND, unsigned BM>
 __global__ void routed_combine_down(SEISMIC_KERNEL_PARAMS) {
     constexpr bool S8 = GROUPED_S8;
     using Operands = typename projection::GemmOperands<OPERAND>::type;
+    using Shape = typename CombineShape<BM>::type;
     extern __shared__ uint4 dynamic_shared[];
     if (blockIdx.x >= projection::gemm_columns(SEISMIC_DIM_H))
         return;
@@ -180,7 +212,7 @@ __global__ void routed_combine_down(SEISMIC_KERNEL_PARAMS) {
                          reinterpret_cast<const float *>(SEISMIC_PTR(SEISMIC_BUFFER_SCORES)), SEISMIC_SCORES_STRIDE_0,
                          reinterpret_cast<const float *>(SEISMIC_PTR(SEISMIC_BUFFER_COEFFICIENT)),
                          reinterpret_cast<const float *>(SEISMIC_PTR(SEISMIC_BUFFER_INJECT)), SEISMIC_INJECT_STRIDE_0};
-    projection::gemm_run<GShape, S8, DOWN_ENTRIES, Operands>(reinterpret_cast<projection::u8 *>(dynamic_shared),
+    projection::gemm_run<Shape, S8, DOWN_ENTRIES, Operands>(reinterpret_cast<projection::u8 *>(dynamic_shared),
                              S8 ? SEISMIC_PTR(SEISMIC_BUFFER_SCRATCH_PRODUCT_CODES) : SEISMIC_PTR(SEISMIC_BUFFER_SCRATCH_PRODUCT),
                              SEISMIC_DIM_S, SEISMIC_PTR(SEISMIC_BUFFER_SCRATCH_PRODUCT_GROUPS),
                              (unsigned)SEISMIC_DIM_M, SEISMIC_DIM_S, blockIdx.x, SEISMIC_DIM_H,

@@ -487,7 +487,7 @@ projection dense for cuda:
     let ORDERED_GEMV_SHARED = 256 + max(2, M) * 1024
     let GEMM_TILES = tiles(W, ceil_div(ceil_div(N, 16), 8))
     let ZSPLIT = 1 for paired
-    let ZSPLIT = 1 + (SPLIT - 1) * min(1, 128 / M) for single
+    let ZSPLIT = 1 + (SPLIT - 1) * min(1, 512 / M) for single
     let ZSPLIT = GEMM_SPLIT for segmented
     let OPERANDS = min(1, sum(W, operands(W)))
     let HALF_SM_SHARED = device.shared_bytes_per_unit / 2
@@ -517,7 +517,7 @@ projection dense for cuda:
     params (arithmetic INT8 in [0, 1] default greatest where INT8 == 0 or (ORDERED_ANY == 0 and G == 1 and each(W, form(W, INT8) == 1) and agree(W, form(W, S8_ENTRIES))) reference 0 for paired | single,
         arithmetic INT8 in [0, 1] default greatest where INT8 == 0 or (ORDERED_ANY == 0 and PARTED == 0 and any(W, N > 0 and form(W, INT8) == 1) and (each(W, N == 0 or form(W, INT8) == 0 or form(W, S8_ENTRIES) == 0) or each(W, N == 0 or form(W, INT8) == 0 or form(W, S8_ENTRIES) == 1))) reference 0 for segmented,
         arithmetic OPERAND in [0, 1] default 0,
-        arithmetic SPLIT in [2, 1] default 2 for single,
+        arithmetic SPLIT in [2, 1, 4] default least where (ORDERED_ANY == 1 and SPLIT == 1) or (ORDERED_ANY == 0 and ((SPLIT == 1 and (PLANES == 1 or K < 512 or GEMM_TILES * 4 * G >= device.units)) or (SPLIT == 2 and (K < 2048 or GEMM_TILES * 4 * G * 2 >= device.units)) or SPLIT == 4)) for single,
         arithmetic GEMM_SPLIT in [1, 2, 4, 8] default least where (PARTED == 0 and GEMM_SPLIT == 1) or (PARTED == 1 and (GEMM_TILES * 2 * GEMM_SPLIT >= device.units or GEMM_SPLIT * 512 > K or GEMM_SPLIT == 8)) for segmented,
         TPW in [1, 2] default 1 for ordered,
         form STAGING in [0, 1] default 0 for single | segmented, form STAGING in [0] default 0 for paired,
@@ -526,7 +526,8 @@ projection dense for cuda:
     where (GEMM_SPLIT == 1 or (PARTED == 1 and K >= GEMM_SPLIT * 256)) for segmented
     where (ORDERED_ANY == 1 or K / P <= 256 or KSPLIT != 1)
     where (ORDERED_ANY == 0 or (INT8 == 0 and OPERAND == 0 and STAGING == 0 and KSPLIT != 8))
-    where (ORDERED_ANY == 0 or SPLIT == 2) for single
+    where (ORDERED_ANY == 0 or SPLIT == 1) for single
+    where (SPLIT == 1 or (ORDERED_ANY == 0 and PLANES == 0 and K >= SPLIT * 256)) for single
     where (ORDERED_ALL == 0 or TPW == 1) for ordered
     where (ORDERED_ALL == 0 or KSPLIT == 1)
     where (PLANES == 1 or K % 64 == 0 or (ORDERED_ALL == 1 and each(W, dense_bytes(W) > 0) and K % 32 == 0))
@@ -543,7 +544,7 @@ projection dense for cuda:
     scratch staged bytes (M * K * (2 + INT8 * SEG_MIXED_INT8)) when ORDERED_ANY == 0 and PUBLISHED == 0 for staged
     scratch staged bytes (M * K * max(1 + OPERAND, 2 * OPERANDS)) when ORDERED_ANY == 0 and ((M > 1 and OPERANDS == 1) or (M > GEMV_ROWS and (INT8 == 1 or OPERAND == 1))) for plain
     scratch groups bytes (M * K / 4) when ORDERED_ANY == 0 and INT8 == 1 and M > GEMV_ROWS and PLANES == 0
-    scratch partials bytes (SPLIT * G * M * N * 4) when ORDERED_ANY == 0 and M > GEMV_ROWS and M <= 128 and SPLIT > 1 and PLANES == 0 for single
+    scratch partials bytes (SPLIT * G * M * N * 4) when ORDERED_ANY == 0 and M > GEMV_ROWS and M <= 512 and SPLIT > 1 and PLANES == 0 for single
     scratch partials bytes (M * (P * (1 - min(1, M / (GEMV_ROWS + 1))) + GEMM_SPLIT * min(1, M / (GEMV_ROWS + 1))) * sum(W, N) * 4) when ORDERED_ANY == 0 and PARTED == 1 and (M <= GEMV_ROWS or GEMM_SPLIT > 1) for segmented
     scratch arrivals bytes (4) sync when ORDERED_ANY == 0 and M <= GEMV_ROWS and PARTED == 1 for segmented
     launch ordered_stage for rms when ORDERED_ALL == 1 and M > VERIFY_ROWS:
@@ -563,9 +564,9 @@ projection dense for cuda:
         threads_per_threadgroup (256, 1, 1)
         shared_bytes (max(ORDERED_GEMV_SHARED, (1 - min(1, M - 1)) * K * SHARED_ROW_PAIR_BYTES / 2))
     launch ordered_gemm when ORDERED_ALL == 1 and M > VERIFY_ROWS:
-        threadgroups (tiles(W, ceil_div(N, 32)), ceil_div(M, 64), G)
+        threadgroups (tiles(W, ceil_div(N, 16)), ceil_div(M, 32), G)
         threads_per_threadgroup (256, 1, 1)
-        shared_bytes (9216)
+        shared_bytes (28672)
     launch stage for rms when ORDERED_ANY == 0 and M > 1 and PLANES == 0:
         reads (INT8, OPERAND)
         staging
@@ -606,7 +607,7 @@ projection dense for cuda:
         threadgroups (tiles(W, ceil_div(ceil_div(N, 16), 8)), ceil_div(M, 128), ZSPLIT * G)
         threads_per_threadgroup (256, 1, 1)
         shared_bytes ((2 - BLOCKS) * (2 * (128 * 144 + PACKED_ANY * SERVED * 10240) + PACKED_ANY * SERVED * 2048) + (BLOCKS - 1) * BLOCKS2_LAYOUT)
-    launch finalize for single when ORDERED_ANY == 0 and M > GEMV_ROWS and M <= 128 and SPLIT > 1 and PLANES == 0:
+    launch finalize for single when ORDERED_ANY == 0 and M > GEMV_ROWS and M <= 512 and SPLIT > 1 and PLANES == 0:
         reads (SPLIT)
         threadgroups (ceil_div(M * N, 256), 1, G)
         threads_per_threadgroup (256, 1, 1)
