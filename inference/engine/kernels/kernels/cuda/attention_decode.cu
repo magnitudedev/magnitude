@@ -62,7 +62,9 @@ extern "C" __global__ void __launch_bounds__(attention::prefill::MMA_THREADS)
             SEISMIC_PARAM_SLAB_ROWS},
         attention::prefill::DecodeRows<SEISMIC_TUNE_PARTS>{
             reinterpret_cast<float *>(SEISMIC_PTR(SEISMIC_BUFFER_SCRATCH_PARTIALS)),
-            reinterpret_cast<float *>(SEISMIC_PTR(SEISMIC_BUFFER_SCRATCH_STATISTICS))},
+            reinterpret_cast<float *>(SEISMIC_PTR(SEISMIC_BUFFER_SCRATCH_STATISTICS)),
+            attention::key_rounding(SEISMIC_DIM_KR != 0, SEISMIC_PARAM_KEY_BLOCK, SEISMIC_PARAM_KEY_ELEMENT,
+                                    SEISMIC_PARAM_KEY_SCALE, SEISMIC_PARAM_KEY_AMAX_FLOOR)},
         attention::prefill::Block{static_cast<int>(blockIdx.z), static_cast<int>(blockIdx.x),
                                 static_cast<int>(blockIdx.y), SEISMIC_TUNE_PARTS});
 }
@@ -114,6 +116,9 @@ extern "C" __global__ void __launch_bounds__(WARPS * 32)
     float *warp_stats = exchange + WARPS * W; // [WARPS][H][2]
     float *own = exchange + warp * W;
 
+    const rounding::Rounding trained =
+        attention::key_rounding(SEISMIC_DIM_KR != 0, SEISMIC_PARAM_KEY_BLOCK, SEISMIC_PARAM_KEY_ELEMENT,
+                                SEISMIC_PARAM_KEY_SCALE, SEISMIC_PARAM_KEY_AMAX_FLOOR);
     const float query_scale = in.scale * attention::LOG2E;
     for (int h = warp; h < G; h += WARPS) {
         float x[DPL];
@@ -123,7 +128,7 @@ extern "C" __global__ void __launch_bounds__(WARPS * 32)
     }
     if (attention::FRESH && part == 0 && warp == WARPS - 1) {
         float k[DPL];
-        attention::prepared_key(in, row, kv, k, own, lane);
+        attention::prepared_key(in, row, kv, k, own, lane, trained);
         attention::append(in, history, row, kv, k, lane);
     }
     __syncthreads();
@@ -161,7 +166,12 @@ extern "C" __global__ void __launch_bounds__(WARPS * 32)
     // Row `within` of the cursor's slab, as stored.
     auto read_history = [&](u64 within, float (&k)[DPL], float (&v)[DPL]) {
         element::span<Act, DPL, true>(key_slab + within * key_step, lane * DPL, k);
-        element::span<Act, DPL, true>(value_slab + within * value_step, lane * DPL, v);
+        if constexpr (attention::STORED_KEY) {
+#pragma unroll
+            for (int d = 0; d < DPL; ++d) v[d] = k[d];
+        } else {
+            element::span<Act, DPL, true>(value_slab + within * value_step, lane * DPL, v);
+        }
     };
     auto read = [&](long long position, float (&k)[DPL], float (&v)[DPL]) {
         bool moved;
@@ -173,8 +183,13 @@ extern "C" __global__ void __launch_bounds__(WARPS * 32)
             }
             read_history(static_cast<unsigned>(token) - cursor.slab_lo, k, v);
         } else {
-            attention::prepared_key(in, token, kv, k, own, lane);
-            attention::fresh_value(in, token, kv, v, lane);
+            attention::prepared_key(in, token, kv, k, own, lane, trained);
+            if constexpr (attention::STORED_KEY) {
+#pragma unroll
+                for (int d = 0; d < DPL; ++d) v[d] = k[d];
+            } else {
+                attention::fresh_value(in, token, kv, v, lane);
+            }
         }
     };
     for (long long position = slice.lo; position < slice.hi; position += TOKENS) {

@@ -10,7 +10,7 @@ SEISMIC_PROGRAMMATIC_DEPENDENCY
 
 // The low-rank rows, read in place (the up weight takes no NVFP4 operands).
 using Pro = projection::Plain<ELEMENT_OF(SEISMIC_ELEMENT_A), projection::AllRows>;
-using Epi = projection::Mix<ELEMENT_OF(SEISMIC_NORM)>;
+using Epi = projection::Mix<ELEMENT_OF(SEISMIC_NORM), SEISMIC_DIM_H>;
 
 #define PROJECTION_M SEISMIC_DIM_M
 #define PROJECTION_K SEISMIC_DIM_LR

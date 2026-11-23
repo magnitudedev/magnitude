@@ -58,6 +58,12 @@ __device__ __forceinline__ void streaming_store(int *word, int value) {
     *reinterpret_cast<volatile int *>(word) = value;
 }
 
+// Relaxed non-volatile store to host-shared memory for bulk records (e.g.
+// `keys`) that the host reads only after step completion or a system release.
+__device__ __forceinline__ void streaming_store_relaxed(int *word, int value) {
+    *word = value;
+}
+
 // An acquire load of a host-shared word at system scope.
 __device__ __forceinline__ int streaming_load_acquire(const int *word) {
     int value;
@@ -65,8 +71,14 @@ __device__ __forceinline__ int streaming_load_acquire(const int *word) {
     return value;
 }
 
-// One 64-bit access of the u64 at an even word, at system scope: an acquire
-// load, and a release store.
+// One 64-bit access of the u64 at an even word, at system scope: a relaxed
+// load, an acquire load, and a release store.
+__device__ __forceinline__ unsigned long long streaming_load_u64(const int *word) {
+    unsigned long long value;
+    asm volatile("ld.relaxed.sys.global.u64 %0, [%1];" : "=l"(value) : "l"(word));
+    return value;
+}
+
 __device__ __forceinline__ unsigned long long streaming_load_u64_acquire(const int *word) {
     unsigned long long value;
     asm volatile("ld.acquire.sys.global.u64 %0, [%1];" : "=l"(value) : "l"(word) : "memory");
@@ -75,6 +87,12 @@ __device__ __forceinline__ unsigned long long streaming_load_u64_acquire(const i
 
 __device__ __forceinline__ void streaming_store_u64_release(int *word, unsigned long long value) {
     asm volatile("st.release.sys.global.u64 [%0], %1;" : : "l"(word), "l"(value) : "memory");
+}
+
+// Acquire fence at system scope: orders prior relaxed system loads before
+// subsequent accesses without draining unrelated posted stores.
+__device__ __forceinline__ void streaming_acquire_fence() {
+    asm volatile("fence.acq_rel.sys;" ::: "memory");
 }
 
 __device__ __forceinline__ int streaming_device_load(const int *word) {

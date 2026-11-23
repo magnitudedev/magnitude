@@ -79,7 +79,5 @@ extern "C" __global__ void routed_route_streamed_ordered_gemv(SEISMIC_KERNEL_PAR
     int *words = reinterpret_cast<int *>(dynamic_shared);
     const ResolvePorts bank =
         ROUTED_RESOLVE_PORTS(SEISMIC_OUT_SCORES.stored(), SEISMIC_SCORES_STRIDE_0, SEISMIC_SCORES_STRIDE_1);
-    const bool whole =
-        streaming_load(STREAMING_AT(bank.policy, SEISMIC_CONST_POLICY_WHOLE * SEISMIC_POLICY_STRIDE_0)) != 0;
-    routed_resolve(bank, whole, words, seismic_words_value);
+    routed_resolve(bank, false, words, seismic_words_value);
 }

@@ -67,6 +67,10 @@ inline void streaming_store(SYSTEM int *word, int value) {
     *word = value;
 }
 
+inline void streaming_store_relaxed(SYSTEM int *word, int value) {
+    *word = value;
+}
+
 // An acquire load of a host-shared word: the load, then a system-scope
 // fence, so every later read follows it.
 inline int streaming_load_acquire(SYSTEM const int *word) {
@@ -75,8 +79,12 @@ inline int streaming_load_acquire(SYSTEM const int *word) {
     return value;
 }
 
-// One 64-bit access of the u64 at an even word: an acquire load, and a
-// store after a system-scope fence (release).
+// One 64-bit access of the u64 at an even word: a relaxed load, an acquire
+// load, and a store after a system-scope fence (release).
+inline ulong streaming_load_u64(SYSTEM const int *word) {
+    return *reinterpret_cast<SYSTEM const ulong *>(word);
+}
+
 inline ulong streaming_load_u64_acquire(SYSTEM const int *word) {
     const ulong value = *reinterpret_cast<SYSTEM const ulong *>(word);
     streaming_system_fence();
@@ -86,6 +94,10 @@ inline ulong streaming_load_u64_acquire(SYSTEM const int *word) {
 inline void streaming_store_u64_release(SYSTEM int *word, ulong value) {
     streaming_system_fence();
     *reinterpret_cast<SYSTEM ulong *>(word) = value;
+}
+
+inline void streaming_acquire_fence() {
+    streaming_system_fence();
 }
 
 inline int streaming_device_load(device const int *word) {

@@ -11,8 +11,8 @@
 //   `STREAMING_DEVICE_READ` for device words, and `STREAMING_ATOMIC_WORDS`
 //   for device atomic counter words (a landing launch's counters,
 //   streaming/land.hpp); `STREAMING_AT(handle, index)`, the handle of word
-//   `index` past `handle`; `streaming_load(handle)` and
-//   `streaming_store(handle, v)` of a host-shared word,
+//   `index` past `handle`; `streaming_load(handle)`, `streaming_store(handle, v)`
+//   and `streaming_store_relaxed(handle, v)` of a host-shared word,
 //   `streaming_device_load` and `streaming_device_store` of a device word,
 //   `streaming_device_fence()` for device-scope memory ordering, and
 //   relaxed device-scope atomics on `STREAMING_ATOMIC_WORDS`:
@@ -31,15 +31,16 @@
 // - The entry's words where a body's `SEISMIC_*` macros read them:
 //   `STREAMING_WORDS_PARAM` and `STREAMING_WORDS_ARG`, each with its leading
 //   comma (empty where the macros read them globally).
-// - `streaming_system_fence()`; the group barriers `streaming_barrier()`
+// - `streaming_system_fence()` and `streaming_acquire_fence()`; the group barriers `streaming_barrier()`
 //   (group memory), `streaming_device_barrier()` (group and device memory)
 //   and `streaming_publish_barrier()` (after which thread 0's host-shared
 //   stores follow every thread's earlier ones).
 // - `streaming_load_acquire(word)`, an acquire load of a host-shared word
 //   (CUDA, Metal: system scope; Vulkan: device scope), and one 64-bit
-//   access of a u64 at an even word, `streaming_load_u64_acquire(word)` and
-//   `streaming_store_u64_release(word, v)` (an exchange slot's request and
-//   answer, a map entry's steps: streaming_words.seismic).
+//   access of a u64 at an even word, `streaming_load_u64(word)`,
+//   `streaming_load_u64_acquire(word)` and `streaming_store_u64_release(word, v)`
+//   (an exchange slot's request and answer, a map entry's steps:
+//   streaming_words.seismic).
 // - `streaming_copy_bytes(from, to, bytes, lane, lanes)`, a copy of `bytes`
 //   bytes from byte handle `from` to `to`, its units shared among `lanes`
 //   lanes, the caller lane `lane`.

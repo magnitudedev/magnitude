@@ -552,6 +552,7 @@ struct DecodeRows {
     static constexpr int MIN_TILES = 1;
     float *partials;
     float *statistics;
+    rounding::Rounding trained = rounding::none();
 
     // The query tile (MMA warp `warp`, rows warp, warp + WARPS, ...), and in
     // partition 0 the tile's rows appended to history.
@@ -580,7 +581,7 @@ struct DecodeRows {
                  token < min(first_token + QT, rows_total); token += WARPS * COLUMNS) {
                 if (ATTENTION_DESTINATION(in, token) < 0) continue;
                 float k[DPL];
-                prepared_key(in, token, block.kv, k, own, lane);
+                prepared_key(in, token, block.kv, k, own, lane, trained);
                 append(in, history, token, block.kv, k, lane);
             }
         }
@@ -617,8 +618,13 @@ struct DecodeRows {
             float k[DPL];
             float v[DPL];
             if (token < limit) {
-                prepared_key(in, token, kv, k, own, lane);
-                fresh_value(in, token, kv, v, lane);
+                prepared_key(in, token, kv, k, own, lane, trained);
+                if constexpr (STORED_KEY) {
+#pragma unroll
+                    for (int d = 0; d < DPL; ++d) v[d] = k[d];
+                } else {
+                    fresh_value(in, token, kv, v, lane);
+                }
                 hold(history, -1, kv, k, v, lane);
             } else {
 #pragma unroll

@@ -197,7 +197,7 @@ template <class NORM, class Rows, u64 PARTS> struct Summed {
 // `width` columns each (`group_rms`, `stream_mix_down`), one factor (the
 // stream's inverse) per stream:
 // x = round_A(t[k] * inverse[k / width] * w[k]).
-template <class NORM, class Rows, u32 STREAMS> struct GroupRms {
+template <class NORM, class Rows, u32 STREAMS, u64 WIDTH = 0> struct GroupRms {
     const float *x;
     u64 stride;
     const u8 *norm;
@@ -207,6 +207,14 @@ template <class NORM, class Rows, u32 STREAMS> struct GroupRms {
     static constexpr bool STAGED = true;
     static constexpr int FACTORS = STREAMS;
     static constexpr bool VEC4 = true;
+    __device__ __forceinline__ u64 stream_of(u64 k) const {
+        if constexpr (STREAMS == 1)
+            return 0ull;
+        else if constexpr (WIDTH != 0)
+            return k / WIDTH;
+        else
+            return k / width;
+    }
     __device__ __forceinline__ float squares(u32 m, u32 stream, u32 first, u32 step) const {
         return row_squares(x + rows(m) * stride + stream * width, width, first, step);
     }
@@ -219,7 +227,7 @@ template <class NORM, class Rows, u32 STREAMS> struct GroupRms {
         }
     }
     __device__ __forceinline__ float formed(const float *factors, u32 m, u64 k) const {
-        return x[rows(m) * stride + k] * factors[k / width] * element::at<NORM>(norm, k);
+        return x[rows(m) * stride + k] * factors[stream_of(k)] * element::at<NORM>(norm, k);
     }
     __device__ __forceinline__ float value(const float *factors, u32 m, u64 k) const {
         return Act::round(formed(factors, m, k));
@@ -233,7 +241,7 @@ template <class NORM, class Rows, u32 STREAMS> struct GroupRms {
         const float4 v = *reinterpret_cast<const float4 *>(x + rows(m) * stride + k);
         float w[4];
         element::span<NORM, 4, true>(norm, k, w);
-        const float inv = factors[k / width];
+        const float inv = factors[stream_of(k)];
         out[0] = Act::round(v.x * inv * w[0]);
         out[1] = Act::round(v.y * inv * w[1]);
         out[2] = Act::round(v.z * inv * w[2]);

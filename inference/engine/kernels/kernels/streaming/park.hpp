@@ -114,10 +114,11 @@ STREAMING_FN bool streaming_left_absent(STREAMING_DEVICE_READ step, u64 step0, S
 // is past or a record that holds its expert.
 STREAMING_FN int streaming_held(STREAMING_SYSTEM_READ row, u64 stride, u64 q) {
     const u64 until = streaming_load_u64_acquire(STREAMING_AT(row, SEISMIC_CONST_MAP_UNTIL * stride));
-    const u64 from = streaming_load_u64_acquire(STREAMING_AT(row, SEISMIC_CONST_MAP_FROM * stride));
-    if (q < from || q >= until)
+    if (q >= until)
         return -1;
-    return streaming_load_acquire(STREAMING_AT(row, SEISMIC_CONST_MAP_RECORD * stride));
+    const u64 from = streaming_load_u64(STREAMING_AT(row, SEISMIC_CONST_MAP_FROM * stride));
+    const int rec = streaming_load(STREAMING_AT(row, SEISMIC_CONST_MAP_RECORD * stride));
+    return q < from ? -1 : rec;
 }
 
 // `streaming_held` of a map in device words nothing writes while the

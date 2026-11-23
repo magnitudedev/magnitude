@@ -3255,6 +3255,13 @@ fn stored_key_cases() -> Vec<(&'static str, bool, Case)> {
                 .with_sinks(93),
         ),
         (
+            "v41 dspark bidirectional block",
+            false,
+            Case::new(V41, 256, appending(block_rows(6, 100), 120), 64, 1.0, scale, 94)
+                .with_theta(1.0e4)
+                .with_sinks(95),
+        ),
+        (
             "half-split stored-key decode",
             true,
             Case::new(qwen, 64, appending(decode_rows(5), 47), 16, 1.0, 0.1767767, 74),
@@ -3666,6 +3673,13 @@ fn small_key_rounding_cases() -> Vec<(&'static str, bool, Case)> {
             false,
             Case::new(SMALL_V41, 160, window_rows(20, 30, 8), 16, 1.0, 0.125, 73)
                 .with_sinks(83)
+                .with_key_rounding(KEY_ROUNDING),
+        ),
+        (
+            "small v41 rounded bidirectional block",
+            false,
+            Case::new(SMALL_V41, 160, appending(block_rows(6, 30), 60), 16, 1.0, 0.125, 75)
+                .with_sinks(85)
                 .with_key_rounding(KEY_ROUNDING),
         ),
     ]

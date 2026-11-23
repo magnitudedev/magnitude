@@ -85,10 +85,10 @@ STREAMING_FN STREAMING_SYSTEM_WORDS streaming_slot_of(STREAMING_SYSTEM_WORDS tab
 
 // Row `row`'s selection key of expert `expert`, as its f32 bits `key`, into
 // the step's key record `record` (its rows and experts `keys1`, `keys2`
-// words apart).
+// words apart). Relaxed store: the host reads keys only after step completion.
 STREAMING_FN void streaming_record_key(STREAMING_SYSTEM_WORDS record, u64 keys1, u64 keys2, u32 row, u32 expert,
     int key) {
-    streaming_store(STREAMING_AT(record, u64(row) * keys1 + u64(expert) * keys2), key);
+    streaming_store_relaxed(STREAMING_AT(record, u64(row) * keys1 + u64(expert) * keys2), key);
 }
 
 // Choice c's expert's first choice, in choice order.
@@ -168,33 +168,15 @@ STREAMING_FN u32 streaming_standing(u32 c, u32 choices, int front_rows, STREAMIN
     return streaming_first_choice(c, streaming_group);
 }
 
-// The group's loads for the assignment, by every thread: the policy words,
-// then each thread's choices' rows, over the exact rows alone (none for a
-// choice that does not stand: a front row's, or an exact row's after its
-// expert's first).
-STREAMING_FN void streaming_assign_loads(u32 choices, int front_rows, STREAMING_SYSTEM_READ policy, STREAMING_GROUP_PARAM, u32 tid, u32 threads) {
-    for (u32 word = tid; word < u32(SEISMIC_CONST_POLICY_WORDS); word += threads)
-        STREAMING_GROUP(STREAMING_RESOLVE_POLICY(choices, word)) =
-            streaming_load(STREAMING_AT(policy, word * SEISMIC_POLICY_STRIDE_0));
-    for (u32 c = tid; c < choices; c += threads) {
-        const u32 K = u32(SEISMIC_DIM_K);
-        const int expert = STREAMING_GROUP(STREAMING_RESOLVE_EXPERT(c));
-        int rows = 0;
-        for (u32 other = 0; other < choices; ++other)
-            rows += !streaming_front_row(front_rows, other / K) && STREAMING_GROUP(STREAMING_RESOLVE_EXPERT(other)) == expert ? 1 : 0;
-        STREAMING_GROUP(STREAMING_RESOLVE_ROWS(choices, c)) = streaming_stands(c, front_rows, streaming_group) ? rows : 0;
-    }
-}
-
-// The layer's front ring, by thread 0 once the request is out: every choice
-// of the front rows, in rank order (rank r of a row is its choice K - 1 - r,
-// as routing ranks them), each as its expert, rank, row and weight's word
-// (its magnitude's bits of `weights`, `streaming_ring_entry`; each front
-// row is its own source, so an expert two front rows chose is named by
-// both), as a seqlock (streaming/hint.hpp). The host's interest ledger
-// publishes every one as an interest of the step its token is exact in: it
-// reads the absent ones that pay, and the bank's ranking holds the ones it
-// wants until that step has logged its own read of the layer.
+// The layer's front ring, in parallel across the group once the request is out:
+// every choice of the front rows, in rank order (rank r of a row is its choice
+// K - 1 - r, as routing ranks them), each as its expert, rank, row and weight's
+// word (its magnitude's bits of `weights`, `streaming_ring_entry`; each front
+// row is its own source, so an expert two front rows chose is named by both),
+// as a seqlock (streaming/hint.hpp). The host's interest ledger publishes every
+// one as an interest of the step its token is exact in: it reads the absent
+// ones that pay, and the bank's ranking holds the ones it wants until that step
+// has logged its own read of the layer.
 #ifndef STREAMING_WEIGHTS_READ
 #define STREAMING_WEIGHTS_READ STREAMING_DEVICE_READ
 #define STREAMING_WEIGHT_WORD(weights, index) streaming_device_load(STREAMING_AT(weights, index))
@@ -202,67 +184,102 @@ STREAMING_FN void streaming_assign_loads(u32 choices, int front_rows, STREAMING_
 
 STREAMING_FN void streaming_publish_front(u32 choices, int front_rows, STREAMING_DEVICE_READ step, u64 step0,
     STREAMING_SYSTEM_WORDS ring, u64 ring0, STREAMING_WEIGHTS_READ weights, u64 weights0, u64 weights1,
-    STREAMING_GROUP_PARAM) {
+    STREAMING_GROUP_PARAM, u32 tid, u32 threads) {
     const u32 K = u32(SEISMIC_DIM_K);
     const u32 rows = choices / K;
-    streaming_ring_open(ring, ring0);
-    int count = 0;
-    for (u32 o = 0; o < choices; ++o) {
-        const u32 row = o % rows;
-        if (!streaming_front_row(front_rows, row))
-            continue;
-        const u32 choice = K - 1 - o / rows;
-        streaming_ring_entry(ring, ring0, count, STREAMING_GROUP(STREAMING_RESOLVE_EXPERT(row * K + choice)),
-            int(o / rows), int(row), STREAMING_WEIGHT_WORD(weights, u64(row) * weights0 + u64(choice) * weights1));
-        ++count;
+    if (tid == 0)
+        streaming_ring_open(ring, ring0);
+    streaming_barrier();
+    u32 front_count = 0;
+    for (u32 r = 0; r < rows; ++r)
+        if (streaming_front_row(front_rows, r))
+            ++front_count;
+    const u32 total = front_count * K;
+    if (front_count > 0) {
+        for (u32 idx = tid; idx < total; idx += threads) {
+            const u32 rank = idx / front_count;
+            const u32 target = idx % front_count;
+            u32 row = 0;
+            u32 seen = 0;
+            for (u32 r = 0; r < rows; ++r) {
+                if (streaming_front_row(front_rows, r)) {
+                    if (seen == target) {
+                        row = r;
+                        break;
+                    }
+                    ++seen;
+                }
+            }
+            const u32 choice = K - 1 - rank;
+            streaming_ring_entry(ring, ring0, int(idx), STREAMING_GROUP(STREAMING_RESOLVE_EXPERT(row * K + choice)),
+                int(rank), int(row), STREAMING_WEIGHT_WORD(weights, u64(row) * weights0 + u64(choice) * weights1));
+        }
     }
-    streaming_ring_close(ring, ring0, count, step, step0);
+    streaming_publish_barrier();
+    if (tid == 0)
+        streaming_ring_close(ring, ring0, int(total), step, step0);
 }
 
 // The assignment, by thread 0, over the group's resolved sources and rows
 // (streaming_words.seismic's): the GPU's queue from its distinct hit
 // experts' resident lines, the CPU's from zero; each distinct missed
-// expert, by rows (most first, from `most`, the step's rows), ties in
+// expert, by rows (most first, from `max_miss_rows` down to 1), ties in
 // choice order, to the CPU where it ends there no later than in place, else
 // to the GPU in place, a read in place no sooner than the link is free of
-// the step's moves (POLICY_LINK_BUSY_NS). Its site is written on its standing choice (the first
-// of the exact rows'); the snapshot gives every choice its standing one's. While POLICY_PRICED is clear it assigns
-// nothing: every miss stays the GPU's in place.
-STREAMING_FN void streaming_assign(u32 choices, u32 most, STREAMING_GROUP_PARAM) {
-    if (STREAMING_GROUP(STREAMING_RESOLVE_POLICY(choices, SEISMIC_CONST_POLICY_PRICED)) == 0)
-        return;
+// the step's moves (POLICY_LINK_BUSY_NS). Its site is written on its standing
+// choice (the first of the exact rows'); the snapshot gives every choice its
+// standing one's. Caller guards on POLICY_PRICED != 0.
+STREAMING_FN void streaming_assign(u32 choices, STREAMING_GROUP_PARAM) {
     const u64 hit = streaming_line(choices, SEISMIC_CONST_POLICY_HIT_NS, streaming_group);
     const u64 hit_row = streaming_line(choices, SEISMIC_CONST_POLICY_HIT_ROW_NS, streaming_group);
     const u64 link = streaming_line(choices, SEISMIC_CONST_POLICY_LINK_NS, streaming_group);
     const u64 link_row = streaming_line(choices, SEISMIC_CONST_POLICY_LINK_ROW_NS, streaming_group);
     const u64 busy = streaming_line(choices, SEISMIC_CONST_POLICY_LINK_BUSY_NS, streaming_group);
+    const u64 one = streaming_line(choices, SEISMIC_CONST_POLICY_CPU_NS, streaming_group);
+    const u64 each = streaming_line(choices, SEISMIC_CONST_POLICY_CPU_ROW_NS, streaming_group);
+    const u64 handshake_ns = streaming_line(choices, SEISMIC_CONST_POLICY_HANDSHAKE_NS, streaming_group);
     u64 gpu = 0;
+    u32 max_miss_rows = 0;
+    u32 min_miss_c = choices;
+    u32 max_miss_c = 0;
     for (u32 c = 0; c < choices; ++c) {
-        const u64 rows = u64(STREAMING_GROUP(STREAMING_RESOLVE_ROWS(choices, c)));
-        if (rows != 0 && STREAMING_GROUP(STREAMING_RESOLVE_SOURCE(choices, c)) >= 0)
-            gpu += max(hit, rows * hit_row);
+        const u32 rows = u32(STREAMING_GROUP(STREAMING_RESOLVE_ROWS(choices, c)));
+        if (rows == 0)
+            continue;
+        if (STREAMING_GROUP(STREAMING_RESOLVE_SOURCE(choices, c)) >= 0) {
+            gpu += max(hit, u64(rows) * hit_row);
+        } else {
+            if (rows > max_miss_rows)
+                max_miss_rows = rows;
+            if (c < min_miss_c)
+                min_miss_c = c;
+            if (c > max_miss_c)
+                max_miss_c = c;
+        }
     }
+    if (max_miss_rows == 0)
+        return;
     u64 cpu = 0;
     bool served = false;
-    for (u32 wanted = most; wanted > 0; --wanted)
-        for (u32 c = 0; c < choices; ++c) {
+    for (u32 wanted = max_miss_rows; wanted > 0; --wanted) {
+        const u64 rows = u64(wanted);
+        const u64 cpu_work = one + (rows - 1) * each;
+        const u64 link_work = max(link, rows * link_row);
+        for (u32 c = min_miss_c; c <= max_miss_c; ++c) {
             const int source = STREAMING_GROUP(STREAMING_RESOLVE_SOURCE(choices, c));
             if (source >= 0 || u32(STREAMING_GROUP(STREAMING_RESOLVE_ROWS(choices, c))) != wanted)
                 continue;
-            const u64 rows = u64(wanted);
-            const u64 one = streaming_line(choices, SEISMIC_CONST_POLICY_CPU_NS, streaming_group);
-            const u64 each = streaming_line(choices, SEISMIC_CONST_POLICY_CPU_ROW_NS, streaming_group);
-            const u64 handshake =
-                served ? u64(0) : streaming_line(choices, SEISMIC_CONST_POLICY_HANDSHAKE_NS, streaming_group);
-            const u64 on_cpu = cpu + one + (rows - 1) * each + handshake;
-            const u64 in_place = max(gpu, busy) + max(link, rows * link_row);
+            const u64 on_cpu = cpu + cpu_work + (served ? u64(0) : handshake_ns);
+            const u64 in_place = max(gpu, busy) + link_work;
             if (on_cpu <= in_place) {
                 cpu = on_cpu;
                 served = true;
                 STREAMING_GROUP(STREAMING_RESOLVE_SITE(choices, c)) = source <= -2 ? -2 - source : -2;
-            } else
+            } else {
                 gpu = in_place;
+            }
         }
+    }
 }
 
 // Choice c of `choices` is the route of `routes` at row c / K, slot c % K
@@ -287,9 +304,14 @@ STREAMING_FN void streaming_resolve(STREAMING_DEVICE_READ routes, u64 routes0, u
     STREAMING_DEVICE_WORDS land_grid, u64 land_grid0, int land_groups, STREAMING_GROUP_PARAM, u32 tid, u32 threads) {
     const u32 K = u32(SEISMIC_DIM_K);
     const int front_rows = streaming_device_load(STREAMING_AT(step, SEISMIC_CONST_STEP_FRONT * step0));
-    const int home = streaming_load(STREAMING_AT(policy, SEISMIC_CONST_POLICY_HOME * SEISMIC_POLICY_STRIDE_0));
     if (tid == 0)
         STREAMING_GROUP(0) = 0;
+    // Load the entire policy table once into group memory (one coalesced
+    // system read across the first POLICY_WORDS threads, overlapped with the
+    // route loads below).
+    for (u32 word = tid; word < u32(SEISMIC_CONST_POLICY_WORDS); word += threads)
+        STREAMING_GROUP(STREAMING_RESOLVE_POLICY(choices, word)) =
+            streaming_load(STREAMING_AT(policy, word * SEISMIC_POLICY_STRIDE_0));
 #ifdef STREAMING_ROUTES_GROUPED
     streaming_barrier();
 #else
@@ -299,13 +321,17 @@ STREAMING_FN void streaming_resolve(STREAMING_DEVICE_READ routes, u64 routes0, u
             streaming_device_load(STREAMING_AT(routes, u64(c / K) * routes0 + u64(c % K) * routes1));
     streaming_barrier();
 #endif
-    if (whole) {
-        STREAMING_SYSTEM_WORDS record = streaming_slot_of(routing, routing0, streaming_step(step, step0), flight);
+    const int home = STREAMING_GROUP(STREAMING_RESOLVE_POLICY(choices, SEISMIC_CONST_POLICY_HOME));
+    const bool is_whole = whole || STREAMING_GROUP(STREAMING_RESOLVE_POLICY(choices, SEISMIC_CONST_POLICY_WHOLE)) != 0;
+    const u64 q = streaming_step(step, step0);
+    STREAMING_SYSTEM_WORDS record = streaming_slot_of(routing, routing0, q, flight);
+    if (is_whole) {
         for (u32 c = tid; c < choices; c += threads) {
             const int expert = STREAMING_GROUP(STREAMING_RESOLVE_EXPERT(c));
             const u64 at = u64(c / K) * sources1 + u64(c % K) * sources2;
+            const bool computes = front_rows == 0 || streaming_computes(c, choices, home + expert, front_rows, streaming_group);
             streaming_device_store(STREAMING_AT(sources, SEISMIC_CONST_SOURCE_RECORD * sources0 + at),
-                streaming_computes(c, choices, home + expert, front_rows, streaming_group) ? home + expert : -1);
+                computes ? home + expert : -1);
             streaming_device_store(STREAMING_AT(sources, SEISMIC_CONST_SOURCE_SITE * sources0 + at), -1);
             streaming_store(STREAMING_AT(record, SEISMIC_CONST_ROUTING_EXPERT(c) * routing1), expert);
             streaming_store(STREAMING_AT(record, SEISMIC_CONST_ROUTING_SOURCE(width, c) * routing1), home + expert);
@@ -316,89 +342,118 @@ STREAMING_FN void streaming_resolve(STREAMING_DEVICE_READ routes, u64 routes0, u
         }
         return;
     }
-    const u64 q = streaming_step(step, step0);
-    STREAMING_SYSTEM_WORDS record = streaming_slot_of(routing, routing0, q, flight);
     // Each expert's source, read once, on its first choice: the host maps
     // and unmaps while a step runs, so two reads of an expert's words may
     // differ, and every choice of an expert takes its expert's one source.
+    // Batch all relaxed system loads (MAP_UNTIL, MAP_STAGE, tier[expert])
+    // across every unique expert owned by this thread, execute one system
+    // acquire fence, then issue the dependent MAP_FROM and MAP_RECORD loads
+    // for potential VRAM hits (q < until). STREAMING_RESOLVE_ROWS and
+    // STREAMING_RESOLVE_SITE are unused until the broadcast pass below and
+    // temporarily hold each choice's first index and (q < until) flag.
+    bool loaded = false;
     for (u32 c = tid; c < choices; c += threads) {
-        if (streaming_first_choice(c, streaming_group) != c)
+        const u32 first = streaming_first_choice(c, streaming_group);
+        STREAMING_GROUP(STREAMING_RESOLVE_ROWS(choices, c)) = int(first);
+        if (first != c)
             continue;
         const int expert = STREAMING_GROUP(STREAMING_RESOLVE_EXPERT(c));
-        int source = streaming_held(STREAMING_AT(map, u64(home + expert) * map0), map1, q);
-        if (source < 0) {
-            // Acquire: the copy engine publishes MAP_STAGE via TransferItem::Signal
-            // once every H2D copy for the expert's staged bank record has landed.
-            // If it has not landed for step q, fall through with zero spin.
-            const u32 staged = u32(streaming_load_acquire(
-                STREAMING_AT(map, u64(home + expert) * map0 + SEISMIC_CONST_MAP_STAGE * map1)));
-            const u32 slot = staged & 0xFFFFu;
-            if (slot != 0u && (staged >> 16) == u32(q & 0xFFFFu))
-                source = int(slot - 1u);
-        }
-        if (source < 0 && tiered != 0) {
-            // Acquire: the host maps a tier record with release once its
-            // bytes are whole, which the step's entries then read.
-            const int held = streaming_load_acquire(STREAMING_AT(tier, u64(expert) * tier0));
-            source = held >= 0 ? -2 - held : -1;
-        }
-        STREAMING_GROUP(STREAMING_RESOLVE_SOURCE(choices, c)) = source;
+        STREAMING_SYSTEM_READ map_row = STREAMING_AT(map, u64(home + expert) * map0);
+        const u64 until = streaming_load_u64(STREAMING_AT(map_row, SEISMIC_CONST_MAP_UNTIL * map1));
+        const u32 staged = u32(streaming_load(STREAMING_AT(map_row, SEISMIC_CONST_MAP_STAGE * map1)));
+        const int tier_held = tiered != 0 ? streaming_load(STREAMING_AT(tier, u64(expert) * tier0)) : -1;
+        loaded = true;
+        int fallback = -1;
+        const u32 slot = staged & 0xFFFFu;
+        if (slot != 0u && (staged >> 16) == u32(q & 0xFFFFu))
+            fallback = int(slot - 1u);
+        else if (tiered != 0 && tier_held >= 0)
+            fallback = -2 - tier_held;
+        STREAMING_GROUP(STREAMING_RESOLVE_SOURCE(choices, c)) = fallback;
+        STREAMING_GROUP(STREAMING_RESOLVE_SITE(choices, c)) = q < until ? 1 : 0;
+    }
+    if (loaded)
+        streaming_acquire_fence();
+    for (u32 c = tid; c < choices; c += threads) {
+        if (u32(STREAMING_GROUP(STREAMING_RESOLVE_ROWS(choices, c))) != c)
+            continue;
+        if (STREAMING_GROUP(STREAMING_RESOLVE_SITE(choices, c)) == 0)
+            continue;
+        const int expert = STREAMING_GROUP(STREAMING_RESOLVE_EXPERT(c));
+        STREAMING_SYSTEM_READ map_row = STREAMING_AT(map, u64(home + expert) * map0);
+        const u64 from = streaming_load_u64(STREAMING_AT(map_row, SEISMIC_CONST_MAP_FROM * map1));
+        const int rec = streaming_load(STREAMING_AT(map_row, SEISMIC_CONST_MAP_RECORD * map1));
+        if (q >= from && rec >= 0)
+            STREAMING_GROUP(STREAMING_RESOLVE_SOURCE(choices, c)) = rec;
     }
     streaming_barrier();
+    const bool assigns = tiered != 0 && sited != 0
+        && STREAMING_GROUP(STREAMING_RESOLVE_POLICY(choices, SEISMIC_CONST_POLICY_PRICED)) != 0;
     for (u32 c = tid; c < choices; c += threads) {
         const int expert = STREAMING_GROUP(STREAMING_RESOLVE_EXPERT(c));
-        const u32 first = streaming_first_choice(c, streaming_group);
+        const u32 first = u32(STREAMING_GROUP(STREAMING_RESOLVE_ROWS(choices, c)));
         const int source = STREAMING_GROUP(STREAMING_RESOLVE_SOURCE(choices, first));
-        if (source == -1 && streaming_computes(c, choices, source, front_rows, streaming_group))
+        if (source == -1 && (front_rows == 0 || streaming_computes(c, choices, source, front_rows, streaming_group)))
             STREAMING_GROUP(0) = 1;
         if (first != c)
             STREAMING_GROUP(STREAMING_RESOLVE_SOURCE(choices, c)) = source;
         STREAMING_GROUP(STREAMING_RESOLVE_SITE(choices, c)) = -1;
+        if (assigns) {
+            const bool stands = front_rows == 0 ? (first == c) : streaming_stands(c, front_rows, streaming_group);
+            int rows = 0;
+            if (stands) {
+                for (u32 other = c; other < choices; ++other)
+                    if ((front_rows == 0 || !streaming_front_row(front_rows, other / K))
+                        && STREAMING_GROUP(STREAMING_RESOLVE_EXPERT(other)) == expert)
+                        ++rows;
+            }
+            STREAMING_GROUP(STREAMING_RESOLVE_ROWS(choices, c)) = rows;
+        }
         streaming_store(STREAMING_AT(record, SEISMIC_CONST_ROUTING_EXPERT(c) * routing1), expert);
         streaming_store(STREAMING_AT(record, SEISMIC_CONST_ROUTING_SOURCE(width, c) * routing1), source);
     }
     if (tid == 0)
         streaming_record_head(record, routing1, choices, step, step0);
     streaming_barrier();
-    const bool assigns = tiered != 0 && sited != 0;
-    if (assigns)
-        streaming_assign_loads(choices, front_rows, policy, streaming_group, tid, threads);
-    streaming_barrier();
-    if (assigns && tid == 0)
-        streaming_assign(choices, choices / K, streaming_group);
-    streaming_barrier();
-    // The snapshot: each choice's source for the GPU and its CPU site, its
-    // expert's standing choice's (`streaming_standing`); none for a choice
-    // not computed.
+    if (assigns) {
+        if (tid == 0)
+            streaming_assign(choices, streaming_group);
+        streaming_barrier();
+    }
+    // The snapshot and (when absent choices exist) the file request entries,
+    // written in parallel across all threads before the publication barrier.
+    const int missing = STREAMING_GROUP(0);
+    STREAMING_SYSTEM_WORDS file_slot = STREAMING_AT(file, streaming_modulo(q, u64(flight)) * file0);
     for (u32 c = tid; c < choices; c += threads) {
         const u64 at = u64(c / K) * sources1 + u64(c % K) * sources2;
         const int source = STREAMING_GROUP(STREAMING_RESOLVE_SOURCE(choices, c));
-        const bool computes = streaming_computes(c, choices, source, front_rows, streaming_group);
-        const int site = computes
-            ? STREAMING_GROUP(STREAMING_RESOLVE_SITE(choices, streaming_standing(c, choices, front_rows, streaming_group)))
-            : -1;
+        const bool computes = front_rows == 0 || streaming_computes(c, choices, source, front_rows, streaming_group);
+        int site = -1;
+        if (assigns && computes) {
+            const u32 stand = front_rows == 0
+                ? streaming_first_choice(c, streaming_group)
+                : streaming_standing(c, choices, front_rows, streaming_group);
+            site = STREAMING_GROUP(STREAMING_RESOLVE_SITE(choices, stand));
+        }
         streaming_device_store(STREAMING_AT(sources, SEISMIC_CONST_SOURCE_RECORD * sources0 + at),
             computes && site == -1 ? source : -1);
         streaming_device_store(STREAMING_AT(sources, SEISMIC_CONST_SOURCE_SITE * sources0 + at), site);
-    }
-    // Every thread's stores, published before the request.
-    streaming_publish_barrier();
-    if (tid != 0)
-        return;
-    streaming_land_grid(land_grid, land_grid0, STREAMING_GROUP(0) != 0 ? land_groups : 0);
-    if (STREAMING_GROUP(0) != 0) {
-        STREAMING_SYSTEM_WORDS slot = STREAMING_AT(file, streaming_modulo(q, u64(flight)) * file0);
-        for (u32 c = 0; c < choices; ++c) {
-            const int source = STREAMING_GROUP(STREAMING_RESOLVE_SOURCE(choices, c));
-            streaming_store(STREAMING_AT(slot,
-                                (SEISMIC_CONST_FILE_ENTRY(c) + SEISMIC_CONST_FILE_CHOICE)
-                                    * file1),
-                streaming_request_choice(STREAMING_GROUP(STREAMING_RESOLVE_EXPERT(c)),
-                    source == -1 && streaming_computes(c, choices, source, front_rows, streaming_group)));
+        if (missing != 0) {
+            streaming_store(STREAMING_AT(file_slot,
+                                (SEISMIC_CONST_FILE_ENTRY(c) + SEISMIC_CONST_FILE_CHOICE) * file1),
+                streaming_request_choice(STREAMING_GROUP(STREAMING_RESOLVE_EXPERT(c)), source == -1 && computes));
         }
-        streaming_store(STREAMING_AT(slot, SEISMIC_CONST_FILE_COUNT * file1), int(choices));
-        streaming_request_slot(slot, file1, q);
+    }
+    // Every thread's stores (routing, sources, file entries), published before the request.
+    streaming_publish_barrier();
+    if (tid == 0) {
+        streaming_land_grid(land_grid, land_grid0, missing != 0 ? land_groups : 0);
+        if (missing != 0) {
+            streaming_store(STREAMING_AT(file_slot, SEISMIC_CONST_FILE_COUNT * file1), int(choices));
+            streaming_request_slot(file_slot, file1, q);
+        }
     }
     if (front_rows != 0)
-        streaming_publish_front(choices, front_rows, step, step0, front, front0, weights, weights0, weights1, streaming_group);
+        streaming_publish_front(choices, front_rows, step, step0, front, front0, weights, weights0, weights1,
+            streaming_group, tid, threads);
 }

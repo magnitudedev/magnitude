@@ -351,9 +351,9 @@ impl Mapping {
     }
 }
 
-/// GEMV mappings: the 16-bit path (INT8 0) and the INT8 path (INT8 1), each
-/// at two K splits.
-pub const GEMV_MAPPINGS: [Mapping; 4] = [
+/// GEMV mappings: the 16-bit decode path (INT8 applies only to the GEMM band,
+/// M > 16, matching `routed.seismic`), at two K splits.
+pub const GEMV_MAPPINGS: [Mapping; 2] = [
     Mapping {
         ksplit: 4,
         int8: 0,
@@ -369,22 +369,6 @@ pub const GEMV_MAPPINGS: [Mapping; 4] = [
         residency: 2,
         split: 2,
         staging: 1,
-    },
-    Mapping {
-        ksplit: 8,
-        int8: 1,
-        rotate: 2,
-        residency: 2,
-        split: 2,
-        staging: 1,
-    },
-    Mapping {
-        ksplit: 4,
-        int8: 1,
-        rotate: 2,
-        residency: 1,
-        split: 2,
-        staging: 0,
     },
 ];
 /// GEMM mappings: both operand paths (the large band ignores INT8) and every

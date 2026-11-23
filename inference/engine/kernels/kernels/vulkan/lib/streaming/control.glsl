@@ -61,19 +61,31 @@ void streaming_store(uint64_t word, int value) {
     streaming_word_t(word).v = value;
 }
 
+void streaming_store_relaxed(uint64_t word, int value) {
+    streaming_word_t(word).v = value;
+}
+
 // An acquire load of a host-shared word at device scope.
 int streaming_load_acquire(uint64_t word) {
     return atomicLoad(streaming_word_t(word).v, gl_ScopeDevice, gl_StorageSemanticsBuffer, gl_SemanticsAcquire);
 }
 
-// One 64-bit access of the u64 at an even word, at device scope: an acquire
-// load, and a release store.
+// One 64-bit access of the u64 at an even word, at device scope: a relaxed
+// load, an acquire load, and a release store.
+uint64_t streaming_load_u64(uint64_t word) {
+    return streaming_pair_t(word).v;
+}
+
 uint64_t streaming_load_u64_acquire(uint64_t word) {
     return atomicLoad(streaming_pair_t(word).v, gl_ScopeDevice, gl_StorageSemanticsBuffer, gl_SemanticsAcquire);
 }
 
 void streaming_store_u64_release(uint64_t word, uint64_t value) {
     atomicStore(streaming_pair_t(word).v, value, gl_ScopeDevice, gl_StorageSemanticsBuffer, gl_SemanticsRelease);
+}
+
+void streaming_acquire_fence() {
+    memoryBarrierBuffer();
 }
 
 int streaming_device_load(uint64_t word) {

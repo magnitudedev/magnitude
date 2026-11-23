@@ -68,9 +68,9 @@ template <int KSPLIT, int RESIDENCY, u64 N> __host__ __device__ constexpr u64 ge
 }
 
 // The launch's blocks per SM, which its launch bounds admit.
-template <int KSPLIT, int RESIDENCY, u64 N, class WA, class WB> __host__ __device__ constexpr int gemv_blocks() {
+template <int KSPLIT, int RESIDENCY, u64 N, class WA, class WB, bool S8 = false> __host__ __device__ constexpr int gemv_blocks() {
     using Shape = GemvShape<8, 1, KSPLIT, 1>;
-    return gemv_min_blocks<Shape, WA, WB, gemv_stated_grid<KSPLIT, RESIDENCY, N>(), RESIDENCY>();
+    return gemv_min_blocks<Shape, WA, WB, gemv_stated_grid<KSPLIT, RESIDENCY, N>(), RESIDENCY, S8>();
 }
 
 // The GEMV's rows once the previous launch is done: at M = 1 the block's
@@ -677,7 +677,7 @@ __device__ __forceinline__ void gemv_parts(const Row &row, const Rows &rows, flo
 // `__launch_bounds__(256, PROJECTION_GEMV_BLOCKS(KSPLIT, RESIDENCY))` itself,
 // which the checker reads).
 #define PROJECTION_GEMV_BLOCKS(KSPLIT, RESIDENCY)                                                                  \
-    (projection::op::gemv_blocks<KSPLIT, RESIDENCY, PROJECTION_N, PROJECTION_WA, PROJECTION_WB>())
+    (projection::op::gemv_blocks<KSPLIT, RESIDENCY, PROJECTION_N, PROJECTION_WA, PROJECTION_WB, false>())
 #define PROJECTION_GEMV(NB, KSPLIT, STAGING, GRID, RESIDENCY)                                                      \
     do {                                                                                                           \
         const unsigned group_ = PROJECTION_GROUP(blockIdx.z);                                                      \

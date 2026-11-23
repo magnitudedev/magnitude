@@ -295,7 +295,7 @@ struct MixInject {
 // A mix site's per-stream partials (`stream_mix_up`): column n of stream
 // n / width gated by its projection,
 // out[m, n] = sigmoid(projection) * x[m, n] * inverse[m, n / width] * w[n] / S (F32).
-template <class NORM> struct Mix {
+template <class NORM, u64 WIDTH = 0> struct Mix {
     element::Out<element::F32> out;
     u64 stride;
     const float *x;
@@ -305,11 +305,29 @@ template <class NORM> struct Mix {
     const u8 *norm;
     u64 width;
     float streams;
+    __device__ __forceinline__ u64 stream_of(u64 n) const {
+        if constexpr (WIDTH != 0)
+            return n / WIDTH;
+        else
+            return n / width;
+    }
     __device__ __forceinline__ void operator()(u32 m, u64 n, float projected, float) const {
-        const float normalized = x[m * x_stride + n] * inverse[m * inverse_stride + n / width]
+        const float normalized = x[m * x_stride + n] * inverse[m * inverse_stride + stream_of(n)]
             * element::at<NORM>(norm, n);
         const float gate = 1.0f / (1.0f + expf(-projected));
         out.put(m * stride + n, gate * normalized / streams);
+    }
+    __device__ __forceinline__ void pair(u32 m, u64 n, float p0, float p1, float, float) const {
+        const float inv = inverse[m * inverse_stride + stream_of(n)];
+        const u64 x_at = m * x_stride + n;
+        const float x0 = x[x_at];
+        const float x1 = x[x_at + 1];
+        const float n0 = element::at<NORM>(norm, n);
+        const float n1 = element::at<NORM>(norm, n + 1);
+        const float g0 = 1.0f / (1.0f + expf(-p0));
+        const float g1 = 1.0f / (1.0f + expf(-p1));
+        out.put(m * stride + n, g0 * (x0 * inv * n0) / streams);
+        out.put(m * stride + n + 1, g1 * (x1 * inv * n1) / streams);
     }
 };
 
@@ -863,16 +881,39 @@ __device__ __forceinline__ void gemv_finish(float (&acc)[2][TPW][NB][4], u32 M, 
     }
 }
 
+// Whether a weight's superblock is four independent per-k-block fetches (no
+// warp-collective superblock high plane), so a register-heavy GEMV can
+// pipeline one k-block (`Raw`) at a time instead of four (`Super`).
+template <class W> constexpr bool can_kblock_pipe =
+    Same<W, NoWeight>::value || W::DENSE || (sizeof(typename W::Super) == 4 * sizeof(typename W::Raw));
+
+// Single-k-block fetch for `KBLOCK_PIPE`, specialized for `Window` and
+// `Gathered` below.
+template <class W> struct GemvKblockFetch {
+    template <bool PERMUTED>
+    __device__ static __forceinline__ typename W::Raw fetch(const W &w, u64 tile, u64 kblock, u32 lane) {
+        if constexpr (PERMUTED)
+            return w.fetch_rows_permuted(tile * 16 + lane / 4, tile * 16 + lane / 4 + 8, kblock, lane % 4);
+        else
+            return w.fetch(tile, kblock, lane);
+    }
+};
+
 // One warp of a tile group: tiles [tile0, tile0 + TPW) of a segment with
 // `tiles` tiles and `rows` valid rows, superblock share `part` of KSPLIT, for
 // M <= 8 * NB activation rows (column block nb holds rows 8 nb .. 8 nb + 7).
 // Each iteration decodes one superblock (4 k-blocks) while the codes and
-// packed coefficients of the next are in flight in registers. `ready()`
-// returns the activation source, which reads its A operands in place
-// (`pair`); it runs once the first superblock's weight loads are issued, so
-// it may wait for the previous launch (`seismic_dependency_wait`) while they
-// are in flight. Every group makes the same calls, so every warp reaches the
-// block-collective `ready()` and the group's named barrier: a group past the
+// packed coefficients of the next are in flight in registers, unless a
+// superblock's staging exceeds the residency-2 register budget (44 regs/buffer),
+// in which case independent-k-block weights (`can_kblock_pipe`, e.g. dense
+// bf16/f32 and q8g32s) pipeline one k-block (`Raw`) at a time and
+// superblock-coupled weights (e.g. q5k/q6k) single-buffer `Stage` to avoid
+// local-memory spills. `ready()` returns the activation source, which reads
+// its A operands in place (`pair`); it runs once the first weight loads are
+// issued, so it may wait for the previous launch (`seismic_dependency_wait`)
+// while they are in flight. Every group makes the same calls, so every warp
+// reaches the block-collective `ready()` and the group's named barrier: a
+// group past the
 // segment (tile0 >= tiles) owns no superblocks, so it loads and multiplies
 // nothing and its epilogue stores nothing. `reduce` is the group's reduction
 // area, `barrier` its named barrier. With STAGING (the
@@ -923,6 +964,24 @@ __device__ __forceinline__ void gemv_mma_group(const Ready &ready, u32 M, u64 kb
         typename WA::Block ba[TPW];
         typename WB::Block bb[TPW];
     };
+    // Residency-2 budget is 128 regs/thread; reserving ~40 regs for accumulators,
+    // activations, and addresses leaves 88 regs (44 regs/buffer double-buffered).
+    static constexpr u64 DOUBLE_STAGE_LIMIT = 44 * 4;
+    static constexpr bool KBLOCK_PIPE =
+        sizeof(Stage) > DOUBLE_STAGE_LIMIT &&
+        (!S8 || (Same<SuperA, typename WA::Super>::value && Same<SuperB, typename WB::Super>::value)) &&
+        can_kblock_pipe<WA> && can_kblock_pipe<WB>;
+    static constexpr bool DOUBLE_SUPER = sizeof(Stage) <= DOUBLE_STAGE_LIMIT;
+    struct KStage {
+        typename WA::Raw ra[TPW];
+        typename WB::Raw rb[TPW];
+    };
+    struct BlockStage {
+        typename WA::Block ba[TPW];
+        typename WB::Block bb[TPW];
+    };
+    struct EmptyStage {};
+    static constexpr bool DOUBLE_KBLOCK = sizeof(KStage) <= DOUBLE_STAGE_LIMIT;
     auto load = [&](Stage &stage, u64 sb) {
 #pragma unroll
         for (int i = 0; i < TPW; ++i) {
@@ -947,19 +1006,51 @@ __device__ __forceinline__ void gemv_mma_group(const Ready &ready, u32 M, u64 kb
                 stage.bb[i] = wb.block(tile0 + i, sb, lane);
         }
     };
+    auto load_kblock = [&](KStage &ks, u64 kblock) {
+#pragma unroll
+        for (int i = 0; i < TPW; ++i) {
+            if (tile0 + i >= tiles)
+                continue;
+            ks.ra[i] = GemvKblockFetch<WA>::template fetch<PERMUTED>(wa, tile0 + i, kblock, lane);
+            if constexpr (PAIR)
+                ks.rb[i] = GemvKblockFetch<WB>::template fetch<PERMUTED>(wb, tile0 + i, kblock, lane);
+        }
+    };
+    auto load_blocks = [&](BlockStage &bs, u64 sb) {
+#pragma unroll
+        for (int i = 0; i < TPW; ++i) {
+            if (tile0 + i >= tiles)
+                continue;
+            if constexpr (!STAGED)
+                bs.ba[i] = wa.block(tile0 + i, sb, lane);
+            if constexpr (PAIR)
+                bs.bb[i] = wb.block(tile0 + i, sb, lane);
+        }
+    };
     // The staged coefficient fields of tile tile0 + i.
     const u64 staged_tile = gemv_staged_tile<WA>(kblocks);
-    // The next superblock's loads are in flight while the current one
-    // decodes; the first one's are issued before the source is ready.
-    Stage current;
+    // The next superblock's (or k-block's) loads are in flight while the
+    // current one decodes; the first loads are issued before the source is
+    // ready.
+    const u64 kblock_begin = 4 * begin;
+    const u64 kblock_end = begin < end ? (4 * end < kblocks ? 4 * end : kblocks) : kblock_begin;
+    typename element::Select<KBLOCK_PIPE, KStage, Stage>::type current;
+    typename element::Select<KBLOCK_PIPE, BlockStage, EmptyStage>::type blocks;
     if constexpr (STAGED) {
 #pragma unroll
         for (int i = 0; i < TPW; ++i)
             if (tile0 + i < tiles)
                 wa.stage(tile0 + i, kblocks, staging + i * staged_tile, part * 32 + lane, KSPLIT * 32);
     }
-    if (begin < end)
-        load(current, begin);
+    if constexpr (KBLOCK_PIPE) {
+        if (kblock_begin < kblock_end) {
+            load_kblock(current, kblock_begin);
+            load_blocks(blocks, begin);
+        }
+    } else {
+        if (begin < end)
+            load(current, begin);
+    }
     const auto pro = ready();
     static_assert(decltype(ready())::FACTORS == 0, "a GEMV reads its operands in place");
     // A one-row block forms its weights' operand sums once (block-collective:
@@ -982,109 +1073,159 @@ __device__ __forceinline__ void gemv_mma_group(const Ready &ready, u32 M, u64 kb
         seismic_cp_async_wait_all();
         barrier.sync(KSPLIT * 32);
     }
-    // A stage's k-blocks. Over int8_rule rows (`S8Rows`): each half's B
+    // One k-block's compute: over int8_rule rows (`S8Rows`), each half's B
     // fragments and groups, once for every tile, then each tile's weights'
-    // halves (`gemv_accumulate_s8`). Over 16-bit rows: each k-block's B
+    // halves (`gemv_accumulate_s8`); over 16-bit rows, each k-block's B
     // fragments and group sums, then each tile's (`gemv_accumulate`).
-    auto compute = [&](const Stage &stage, u64 sb) {
+    typedef typename element::Select<
+        S8, decltype(S8Superblock<WA>::raw(wa, *static_cast<const typename S8Superblock<WA>::type *>(nullptr), 0, 0u)),
+        typename WA::Raw>::type RawA;
+    typedef typename element::Select<
+        S8, decltype(S8Superblock<WB>::raw(wb, *static_cast<const typename S8Superblock<WB>::type *>(nullptr), 0, 0u)),
+        typename WB::Raw>::type RawB;
+    auto compute_kblock = [&](const RawA (&ra_tile)[TPW], const RawB (&rb_tile)[TPW],
+                              const typename WA::Block (&ba)[TPW], const typename WB::Block (&bb)[TPW], u64 sb, int q) {
+        const u64 kblock = 4 * sb + q;
+        if constexpr (S8) {
+            u32 b[2][NB][2];
+            float2 x[2][NB][2];
 #pragma unroll
-        for (int q = 0; q < 4; ++q) {
-            const u64 kblock = 4 * sb + q;
-            if (kblock >= kblocks)
-                break;
-            if constexpr (S8) {
-                u32 b[2][NB][2];
-                float2 x[2][NB][2];
+            for (int h = 0; h < 2; ++h) {
+                const u64 group = 2 * kblock + h;
 #pragma unroll
-                for (int h = 0; h < 2; ++h) {
-                    const u64 group = 2 * kblock + h;
+                for (int nb = 0; nb < NB; ++nb) {
+                    const u32 m = 8 * nb + g;
+                    const bool feeds = S8_ONE || m < M;
+                    b[h][nb][0] = feeds ? pro.word(m, group * 32 + 4 * t) : 0u;
+                    b[h][nb][1] = feeds ? pro.word(m, group * 32 + 16 + 4 * t) : 0u;
 #pragma unroll
-                    for (int nb = 0; nb < NB; ++nb) {
-                        const u32 m = 8 * nb + g;
-                        const bool feeds = S8_ONE || m < M;
-                        b[h][nb][0] = feeds ? pro.word(m, group * 32 + 4 * t) : 0u;
-                        b[h][nb][1] = feeds ? pro.word(m, group * 32 + 16 + 4 * t) : 0u;
-#pragma unroll
-                        for (int c = 0; c < 2; ++c) {
-                            const u32 column = 8 * nb + 2 * t + c;
-                            x[h][nb][c] = S8_ONE || column < M ? pro.group(column, group) : make_float2(0.0f, 0.0f);
-                        }
+                    for (int c = 0; c < 2; ++c) {
+                        const u32 column = 8 * nb + 2 * t + c;
+                        x[h][nb][c] = S8_ONE || column < M ? pro.group(column, group) : make_float2(0.0f, 0.0f);
                     }
                 }
+            }
+#pragma unroll
+            for (int i = 0; i < TPW; ++i) {
+                if (tile0 + i >= tiles)
+                    continue;
+                Coefficients<WA::GROUPS> ca;
+                if constexpr (STAGED)
+                    wa.coefficients(wa.staged_block(staging + i * staged_tile, kblocks, sb, lane), q, ca);
+                else
+                    wa.coefficients(ba[i], q, ca);
+#pragma unroll
+                for (int h = 0; h < 2; ++h)
+                    gemv_accumulate_s8<NB, S8_ONE, Src>(acc[0][i], ra_tile[i], wa, ca, h, b[h], x[h]);
+                if constexpr (PAIR) {
+                    Coefficients<WB::GROUPS> cb;
+                    wb.coefficients(bb[i], q, cb);
+#pragma unroll
+                    for (int h = 0; h < 2; ++h)
+                        gemv_accumulate_s8<NB, S8_ONE, Src>(acc[1][i], rb_tile[i], wb, cb, h, b[h], x[h]);
+                }
+            }
+        } else {
+            const u64 k0 = kblock * 64;
+            u32 b[NB][4][2];
+#pragma unroll
+            for (int nb = 0; nb < NB; ++nb) {
+                const u32 m = 8 * nb + g;
+                const bool feeds = ROW || m < M;
+#pragma unroll
+                for (int s = 0; s < 4; ++s) {
+                    // The B fragment's columns 2t, 2t + 1 and 2t + 8, 2t + 9 of
+                    // step s, or their permuted places (`GemvPermuted`).
+                    const u64 low = PERMUTED ? 16 * t + 4 * s : 16 * s + 2 * t;
+                    const u64 high = PERMUTED ? low + 2 : low + 8;
+                    b[nb][s][0] = feeds ? pro.pair(factors, m, k0 + low) : 0u;
+                    b[nb][s][1] = feeds ? pro.pair(factors, m, k0 + high) : 0u;
+                }
+            }
+            GroupSums<NB, SUMS_A != 0 ? SUMS_A : SUMS_B> sums;
+            GroupSums<NB, OWN_B ? SUMS_B : 0> sums_b;
+            if constexpr (ROW) {
+                row_sums(pro.area(0), kblock, sums);
+                row_sums(pro.area(1), kblock, sums_b);
+            } else {
+                gemv_sums(b, sums);
+                gemv_sums(b, sums_b);
+            }
+#pragma unroll
+            for (int i = 0; i < TPW; ++i)
+                if (tile0 + i < tiles) {
+                    if constexpr (STAGED)
+                        gemv_accumulate<NB, Src>(acc[0][i], ra_tile[i], wa,
+                                                 wa.staged_block(staging + i * staged_tile, kblocks, sb, lane), q,
+                                                 b, sums);
+                    else
+                        gemv_accumulate<NB, Src>(acc[0][i], ra_tile[i], wa, ba[i], q, b, sums);
+                    if constexpr (PAIR && OWN_B)
+                        gemv_accumulate<NB, Src>(acc[1][i], rb_tile[i], wb, bb[i], q, b, sums_b);
+                    else if constexpr (PAIR)
+                        gemv_accumulate<NB, Src>(acc[1][i], rb_tile[i], wb, bb[i], q, b, sums);
+                }
+        }
+    };
+    if constexpr (KBLOCK_PIPE) {
+        for (u64 kblock = kblock_begin; kblock < kblock_end; ++kblock) {
+            const u64 sb = kblock / 4;
+            const int q = (int)(kblock % 4);
+            if constexpr (DOUBLE_KBLOCK) {
+                KStage next;
+                if (kblock + 1 < kblock_end)
+                    load_kblock(next, kblock + 1);
+                compute_kblock(current.ra, current.rb, blocks.ba, blocks.bb, sb, q);
+                current = next;
+                if (q == 3 && sb + 1 < end)
+                    load_blocks(blocks, sb + 1);
+            } else {
+                compute_kblock(current.ra, current.rb, blocks.ba, blocks.bb, sb, q);
+                if (kblock + 1 < kblock_end) {
+                    load_kblock(current, kblock + 1);
+                    if (q == 3)
+                        load_blocks(blocks, sb + 1);
+                }
+            }
+        }
+    } else {
+        auto compute = [&](const Stage &stage, u64 sb) {
+#pragma unroll
+            for (int q = 0; q < 4; ++q) {
+                if (4 * sb + q >= kblocks)
+                    break;
+                RawA ra_tile[TPW];
+                RawB rb_tile[TPW];
 #pragma unroll
                 for (int i = 0; i < TPW; ++i) {
                     if (tile0 + i >= tiles)
                         continue;
-                    const auto ra = S8Superblock<WA>::raw(wa, stage.ra[i], q, lane);
-                    Coefficients<WA::GROUPS> ca;
-                    if constexpr (STAGED)
-                        wa.coefficients(wa.staged_block(staging + i * staged_tile, kblocks, sb, lane), q, ca);
-                    else
-                        wa.coefficients(stage.ba[i], q, ca);
-#pragma unroll
-                    for (int h = 0; h < 2; ++h)
-                        gemv_accumulate_s8<NB, S8_ONE, Src>(acc[0][i], ra, wa, ca, h, b[h], x[h]);
-                    if constexpr (PAIR) {
-                        const auto rb = S8Superblock<WB>::raw(wb, stage.rb[i], q, lane);
-                        Coefficients<WB::GROUPS> cb;
-                        wb.coefficients(stage.bb[i], q, cb);
-#pragma unroll
-                        for (int h = 0; h < 2; ++h)
-                            gemv_accumulate_s8<NB, S8_ONE, Src>(acc[1][i], rb, wb, cb, h, b[h], x[h]);
+                    if constexpr (S8) {
+                        ra_tile[i] = S8Superblock<WA>::raw(wa, stage.ra[i], q, lane);
+                        if constexpr (PAIR)
+                            rb_tile[i] = S8Superblock<WB>::raw(wb, stage.rb[i], q, lane);
+                    } else {
+                        ra_tile[i] = wa.raw(stage.ra[i], q, lane);
+                        if constexpr (PAIR)
+                            rb_tile[i] = wb.raw(stage.rb[i], q, lane);
                     }
                 }
+                compute_kblock(ra_tile, rb_tile, stage.ba, stage.bb, sb, q);
+            }
+        };
+        for (u64 sb = begin; sb < end; ++sb) {
+            if constexpr (DOUBLE_SUPER) {
+                Stage next;
+                if (sb + 1 < end)
+                    load(next, sb + 1);
+                compute(current, sb);
+                current = next;
             } else {
-                const u64 k0 = kblock * 64;
-                u32 b[NB][4][2];
-#pragma unroll
-                for (int nb = 0; nb < NB; ++nb) {
-                    const u32 m = 8 * nb + g;
-                    const bool feeds = ROW || m < M;
-#pragma unroll
-                    for (int s = 0; s < 4; ++s) {
-                        // The B fragment's columns 2t, 2t + 1 and 2t + 8, 2t + 9 of
-                        // step s, or their permuted places (`GemvPermuted`).
-                        const u64 low = PERMUTED ? 16 * t + 4 * s : 16 * s + 2 * t;
-                        const u64 high = PERMUTED ? low + 2 : low + 8;
-                        b[nb][s][0] = feeds ? pro.pair(factors, m, k0 + low) : 0u;
-                        b[nb][s][1] = feeds ? pro.pair(factors, m, k0 + high) : 0u;
-                    }
-                }
-                GroupSums<NB, SUMS_A != 0 ? SUMS_A : SUMS_B> sums;
-                GroupSums<NB, OWN_B ? SUMS_B : 0> sums_b;
-                if constexpr (ROW) {
-                    row_sums(pro.area(0), kblock, sums);
-                    row_sums(pro.area(1), kblock, sums_b);
-                } else {
-                    gemv_sums(b, sums);
-                    gemv_sums(b, sums_b);
-                }
-#pragma unroll
-                for (int i = 0; i < TPW; ++i)
-                    if (tile0 + i < tiles) {
-                        if constexpr (STAGED)
-                            gemv_accumulate<NB, Src>(acc[0][i], wa.raw(stage.ra[i], q, lane), wa,
-                                                     wa.staged_block(staging + i * staged_tile, kblocks, sb, lane), q,
-                                                     b, sums);
-                        else
-                            gemv_accumulate<NB, Src>(acc[0][i], wa.raw(stage.ra[i], q, lane), wa, stage.ba[i], q, b,
-                                                     sums);
-                        if constexpr (PAIR && OWN_B)
-                            gemv_accumulate<NB, Src>(acc[1][i], wb.raw(stage.rb[i], q, lane), wb, stage.bb[i], q, b,
-                                                     sums_b);
-                        else if constexpr (PAIR)
-                            gemv_accumulate<NB, Src>(acc[1][i], wb.raw(stage.rb[i], q, lane), wb, stage.bb[i], q, b,
-                                                     sums);
-                    }
+                compute(current, sb);
+                if (sb + 1 < end)
+                    load(current, sb + 1);
             }
         }
-    };
-    for (u64 sb = begin; sb < end; ++sb) {
-        Stage next;
-        if (sb + 1 < end)
-            load(next, sb + 1);
-        compute(current, sb);
-        current = next;
     }
     gemv_finish<TPW, KSPLIT, NB>(acc, M, tile0, tiles, rows, epi, reduce, barrier, part);
 }
@@ -1398,6 +1539,13 @@ template <class W> struct Window : W {
         return W::block(tile, first + superblock, lane);
     }
 };
+template <class W> struct GemvKblockFetch<Window<W>> {
+    template <bool PERMUTED>
+    __device__ static __forceinline__ typename W::Raw fetch(const Window<W> &w, u64 tile, u64 kblock, u32 lane) {
+        return GemvKblockFetch<W>::template fetch<PERMUTED>(static_cast<const W &>(w), tile, 4 * w.first + kblock,
+                                                            lane);
+    }
+};
 
 // A weight read at the rows a table selects (a per-row gathered entry's
 // routed `choice`, routed.seismic): its row n is the weight's row
@@ -1459,6 +1607,16 @@ template <class W> struct Gathered : W {
     }
     __device__ __forceinline__ auto record(u64 tile, u64 superblock, u32 lane) const {
         return W::record_rows(row_g(tile, lane), row_g8(tile, lane), superblock, lane % 4);
+    }
+};
+template <class W> struct GemvKblockFetch<Gathered<W>> {
+    template <bool PERMUTED>
+    __device__ static __forceinline__ typename W::Raw fetch(const Gathered<W> &w, u64 tile, u64 kblock, u32 lane) {
+        if constexpr (PERMUTED)
+            return static_cast<const W &>(w).fetch_rows_permuted(w.row_g(tile, lane), w.row_g8(tile, lane), kblock,
+                                                                 lane % 4);
+        else
+            return static_cast<const W &>(w).fetch_rows(w.row_g(tile, lane), w.row_g8(tile, lane), kblock, lane % 4);
     }
 };
 
@@ -1555,9 +1713,9 @@ template <class Shape> __device__ __forceinline__ u64 gemv_segment_groups(u64 ro
 // rather than 3 per SM 33.3 -> 28.5 us; the down that follows (128 blocks)
 // at 3 rather than 4 per SM 28.6 -> 25.4 us. A records launch that does not
 // state its grid shares its SM as registers allow.
-template <class Shape, class WA, class WB, u64 GRID, int RESIDENCY> struct GemvResidency {
+template <class Shape, class WA, class WB, u64 GRID, int RESIDENCY, bool S8 = false> struct GemvResidency {
     static constexpr bool RECORDS =
-        GemvRecords<WA>::value && (Same<WB, NoWeight>::value || GemvRecords<WB>::value);
+        !S8 && GemvRecords<WA>::value && (Same<WB, NoWeight>::value || GemvRecords<WB>::value);
     // The most blocks whose barrier ids fit an SM's 16 (barrier 0 is each
     // block's own), and the records design's four.
     static constexpr u64 MOST = 16 / (Shape::GROUPS + 1) < 4 ? 16 / (Shape::GROUPS + 1) : 4;
@@ -1572,9 +1730,9 @@ template <class Shape, class WA, class WB, u64 GRID, int RESIDENCY> struct GemvR
 };
 
 // The launch bounds' minimum blocks per SM of a GEMV kernel of that launch.
-template <class Shape, class WA, class WB, u64 GRID, int RESIDENCY>
+template <class Shape, class WA, class WB, u64 GRID, int RESIDENCY, bool S8 = false>
 __host__ __device__ constexpr int gemv_min_blocks() {
-    using R = GemvResidency<Shape, WA, WB, GRID, RESIDENCY>;
+    using R = GemvResidency<Shape, WA, WB, GRID, RESIDENCY, S8>;
     return R::value > 1 ? R::value : 1;
 }
 
@@ -1586,9 +1744,10 @@ __host__ __device__ constexpr int gemv_min_blocks() {
 template <class Shape, u64 GRID = 0, int RESIDENCY = 1, class Ready, class WA, class WB, class Epi, class Shared>
 __device__ __forceinline__ void gemv_segment_ready(Shared &shared, const Ready &ready, u32 M, u64 kblocks, u64 group,
                                                    u64 rows, const WA &wa, const WB &wb, const Epi &epi) {
+    constexpr bool S8 = IsS8Rows<decltype(ready())>::value;
     gemv_group<Shape::TPW, Shape::KSPLIT, Shape::NB, Shared::STAGED, typename Shared::points>(
         ready, M, kblocks, group * Shape::TPW, (rows + 15) / 16, rows, wa, wb, epi, shared.reduce[Shape::group()],
-        GroupBarrier<Shape::GROUPS, GemvResidency<Shape, WA, WB, GRID, RESIDENCY>::value>{Shape::group()},
+        GroupBarrier<Shape::GROUPS, GemvResidency<Shape, WA, WB, GRID, RESIDENCY, S8>::value>{Shape::group()},
         Shape::part(), reinterpret_cast<u8 *>(shared.staging[Shape::group()]));
 }
 
@@ -1748,13 +1907,61 @@ constexpr u32 SPLIT = 2;
 
 // The raw fragments of weight tile `tile`, k-block `kblock` for the lane: from
 // the stage's staged chunks, or for dense weights (nothing staged) from
-// global memory.
+// global memory. For contiguous 16-bit dense weights (W::WORDS == 1), each
+// 4-lane quad loads two coalesced 64-byte runs (four 16-byte uint4 loads per
+// lane across both row halves) and transposes them in-warp with shfl_xor,
+// replacing 16 strided 4-byte loads (50% sector utilization) with 4 full-sector
+// loads.
 template <class W>
 __device__ __forceinline__ typename W::Raw gemm_raw(const W &w, const u8 *staged_tile, u64 tile, u64 kblock, u32 lane) {
-    if constexpr (W::DENSE)
+    if constexpr (W::DENSE) {
+        if constexpr (W::WORDS == 1) {
+            if (w.col_stride == 1) {
+                const u32 g = lane / 4;
+                const u32 t = lane % 4;
+                typename W::Raw raw;
+                auto transpose4 = [t](uint4 v, u32 &r0, u32 &r1, u32 &r2, u32 &r3) {
+                    u32 a0 = v.x, a1 = v.y, a2 = v.z, a3 = v.w;
+                    const u32 b0 = seismic_shfl_xor_u32((t & 1u) ? a0 : a1, 1);
+                    const u32 b1 = seismic_shfl_xor_u32((t & 1u) ? a2 : a3, 1);
+                    if (t & 1u) {
+                        a0 = b0;
+                        a2 = b1;
+                    } else {
+                        a1 = b0;
+                        a3 = b1;
+                    }
+                    const u32 c0 = seismic_shfl_xor_u32((t & 2u) ? a0 : a2, 2);
+                    const u32 c1 = seismic_shfl_xor_u32((t & 2u) ? a1 : a3, 2);
+                    if (t & 2u) {
+                        a0 = c0;
+                        a1 = c1;
+                    } else {
+                        a2 = c0;
+                        a3 = c1;
+                    }
+                    r0 = a0;
+                    r1 = a1;
+                    r2 = a2;
+                    r3 = a3;
+                };
+#pragma unroll
+                for (int half = 0; half < 2; ++half) {
+                    const u64 row = tile * 16 + g + 8 * half;
+                    const bool valid = row < w.rows;
+                    const u8 *line = w.base + (valid ? row : 0) * w.stride * 2 + kblock * 128;
+                    const uint4 lo = valid ? seismic_ld_nc_v4(line + 16 * t) : make_uint4(0u, 0u, 0u, 0u);
+                    const uint4 hi = valid ? seismic_ld_nc_v4(line + 64 + 16 * t) : make_uint4(0u, 0u, 0u, 0u);
+                    transpose4(lo, raw.w[0][half][0], raw.w[0][half + 2][0], raw.w[1][half][0], raw.w[1][half + 2][0]);
+                    transpose4(hi, raw.w[2][half][0], raw.w[2][half + 2][0], raw.w[3][half][0], raw.w[3][half + 2][0]);
+                }
+                return raw;
+            }
+        }
         return w.fetch(tile, kblock, lane);
-    else
+    } else {
         return w.from_shared(staged_tile, lane);
+    }
 }
 
 __device__ __forceinline__ void cp_async_4_zfill(void *shared, const void *global, u32 source_bytes) {

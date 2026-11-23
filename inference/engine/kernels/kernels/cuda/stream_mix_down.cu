@@ -15,7 +15,7 @@
 
 SEISMIC_PROGRAMMATIC_DEPENDENCY
 
-using Pro = projection::GroupRms<ELEMENT_OF(SEISMIC_NORM), projection::AllRows, SEISMIC_DIM_S>;
+using Pro = projection::GroupRms<ELEMENT_OF(SEISMIC_NORM), projection::AllRows, SEISMIC_DIM_S, SEISMIC_DIM_H>;
 using Low = projection::MixLow<ELEMENT_OF(SEISMIC_ELEMENT_A)>;
 
 #define WIDTH (SEISMIC_DIM_S * SEISMIC_DIM_H)

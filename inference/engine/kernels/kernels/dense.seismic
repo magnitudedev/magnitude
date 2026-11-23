@@ -465,9 +465,10 @@ projection dense for cuda:
     # Swap-AB GEMV serves up to 2 column blocks of 8 rows (`gemv` for 1..8,
     # `gemv16` for 9..16; `projection::GEMV_ROWS` in `projection.cuh`). Past
     # GEMV_ROWS, `gemm_small` (BM = 64) and `gemm` (BM = 128) run standard-AB
-    # MMAs whose arithmetic intensity exceeds the bf16 MMA ridge point on
-    # quantized weights, so INT8 activation quantization (`s8` IMMA) applies
-    # strictly to the GEMM band (`M > GEMV_ROWS`).
+    # MMAs whose arithmetic intensity `16 * BM / bits` exceeds the bf16 MMA
+    # ridge point on quantized weights, so INT8 activation quantization (`s8`
+    # IMMA) applies strictly to the GEMM band (`M > GEMV_ROWS`), matching
+    # `routed.seismic`'s `grouped`-only INT8 rule.
     let GEMV_ROWS = 16
     let ORDERED_ANY = min(1, sum(W, ORDERED))
     let ORDERED_ALL = sum(W, ORDERED) / WEIGHTS
@@ -500,10 +501,10 @@ projection dense for cuda:
         arithmetic GEMM_SPLIT in [1, 2, 4, 8] default least where (PARTED == 0 and GEMM_SPLIT == 1) or (PARTED == 1 and (GEMM_TILES * 2 * GEMM_SPLIT >= device.units or GEMM_SPLIT * 512 > K or GEMM_SPLIT == 8)) for segmented,
         TPW in [1, 2] default 1 for ordered,
         form STAGING in [0, 1] default 0 for single | segmented, form STAGING in [0] default 0 for paired,
-        arithmetic KSPLIT in [4, 2, 8, 1] default least where (ORDERED_ALL == 1 and KSPLIT == 1) or (ORDERED_ALL == 0 and KSPLIT != 1 and (P * G * tiles(W, ceil_div(ceil_div(N, 16), 8 / KSPLIT)) >= device.units or KSPLIT == (8 - 4 * ORDERED_ANY))))
+        arithmetic KSPLIT in [4, 2, 8, 1] default least where (ORDERED_ALL == 1 and KSPLIT == 1) or (ORDERED_ALL == 0 and K / P <= 256 and KSPLIT == 1) or (ORDERED_ALL == 0 and K / P > 256 and KSPLIT != 1 and (P * G * tiles(W, ceil_div(ceil_div(N, 16), 8 / KSPLIT)) >= 3 * device.units or K / P < KSPLIT * 1024 or KSPLIT == (8 - 4 * ORDERED_ANY))))
     where dense_bytes(A) == 2
     where (GEMM_SPLIT == 1 or (PARTED == 1 and K >= GEMM_SPLIT * 256)) for segmented
-    where (ORDERED_ANY == 1 or KSPLIT != 1)
+    where (ORDERED_ANY == 1 or K / P <= 256 or KSPLIT != 1)
     where (ORDERED_ANY == 0 or (INT8 == 0 and OPERAND == 0 and STAGING == 0 and KSPLIT != 8))
     where (ORDERED_ANY == 0 or SPLIT == 2) for single
     where (ORDERED_ALL == 0 or TPW == 1) for ordered
@@ -564,7 +565,7 @@ projection dense for cuda:
         threadgroups (M, 1, 1)
         threads_per_threadgroup (256, 1, 1)
     launch gemv when ORDERED_ANY == 0 and M <= 8 and PLANES == 0:
-        params (RESIDENCY in [0, 1, 2] default greatest where RESIDENCY == 0 or (RESIDENCY == 2 and each(W, form(W, GEMV_RECORDS) == 0)) for paired | single)
+        params (RESIDENCY in [0, 1, 2] default greatest where RESIDENCY == 1 or (RESIDENCY == 2 and each(W, form(W, GEMV_RECORDS) == 0)) for paired | single)
         reads (INT8, STAGING)
         threadgroups (P * tiles(W, ceil_div(ceil_div(N, 16), 8 / KSPLIT)), 1, G)
         threads_per_threadgroup (256, 1, 1)

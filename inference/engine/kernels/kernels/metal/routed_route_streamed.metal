@@ -88,13 +88,11 @@ constant constexpr bool NVFP4_SHARED = projection::OperandRecipe<
                     ROUTED_ROW_KEYS(r));                                                    \
             }                                                                               \
             threadgroup int *words = reinterpret_cast<threadgroup int *>(shared);           \
-            const bool whole = streaming_load(STREAMING_AT(policy,                          \
-                SEISMIC_CONST_POLICY_WHOLE * SEISMIC_POLICY_STRIDE_0)) != 0;                \
             streaming_resolve(routes, SEISMIC_ROUTES_STRIDE_0, SEISMIC_ROUTES_STRIDE_1,     \
                 m * uint(SEISMIC_DIM_K),                                                    \
                 reinterpret_cast<device const int *>(scores_out.stored()),                  \
                 SEISMIC_SCORES_STRIDE_0, SEISMIC_SCORES_STRIDE_1,                           \
-                step, SEISMIC_STEP_STRIDE_0, whole,                                         \
+                step, SEISMIC_STEP_STRIDE_0, false,                                         \
                 map, SEISMIC_MAP_STRIDE_0, SEISMIC_MAP_STRIDE_1,                            \
                 tier, SEISMIC_TIER_STRIDE_0, uint(SEISMIC_DIM_TM), uint(SEISMIC_PARAM_SITED), \
                 sources, SEISMIC_SOURCES_STRIDE_0, SEISMIC_SOURCES_STRIDE_1, SEISMIC_SOURCES_STRIDE_2, \
