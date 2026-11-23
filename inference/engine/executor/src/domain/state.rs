@@ -879,24 +879,71 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
         })
     }
 
-    /// Whether the load's release thread is releasing idle graph slots: a
-    /// change under way whose end frees memory.
-    pub fn releasing_slots(&self) -> bool {
-        self.resources.releasing_slots()
+    /// Register a one-shot completion watch for an in-flight asynchronous
+    /// state-pool release, reusing any uncompleted watch already registered.
+    pub(super) fn watch_state_pool_release(&mut self, wake: crate::CompletionWake) {
+        if self
+            .state_pool_release
+            .as_ref()
+            .is_some_and(|done| !done.load(std::sync::atomic::Ordering::Acquire))
+        {
+            return;
+        }
+        let done = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        self.state_pool_release = Some(done.clone());
+        self.state_pool().wake_on_release(move || {
+            done.store(true, std::sync::atomic::Ordering::Release);
+            wake.complete();
+        });
     }
 
-    /// At a flight boundary: drain any settled owed blocks from the state
-    /// pool (so fenced granules from an earlier state shrink or rollback
-    /// vacate on the next boundary once their flight ends) and poll the idle
-    /// graph slots' release (`AllocatedResources::released_slots`).
-    pub fn advance_slot_release(&mut self) -> Option<crate::resources::SlotsReleased> {
+    /// Consume a finished asynchronous state-pool release watch, if any.
+    pub(super) fn take_finished_state_pool_release(&mut self) -> bool {
+        if self
+            .state_pool_release
+            .as_ref()
+            .is_some_and(|done| done.load(std::sync::atomic::Ordering::Acquire))
+        {
+            self.state_pool_release = None;
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Whether an asynchronous memory release is under way on this domain
+    /// (idle graph slots on the release thread, or state-pool blocks awaiting
+    /// flight fences): a change under way whose end frees memory and advances
+    /// the owner's availability epoch.
+    pub fn releasing_slots(&self) -> bool {
+        self.resources.releasing_slots() || self.state_pool_release.is_some()
+    }
+
+    /// At a flight boundary: consume any finished async state-pool release
+    /// watch and drain settled owed blocks from the state pool (so fenced
+    /// granules from an earlier state shrink or rollback vacate on the next
+    /// boundary once their flight ends). Returns `true` when a watched async
+    /// release finished or settled blocks returned synchronously, signalling
+    /// waiters on memory to retry.
+    pub fn advance_state_pool_release(&mut self) -> bool {
+        let mut completed = self.take_finished_state_pool_release();
         let changes = self.resources.ledgers().changes().clone();
         let pool = self.state_pool();
         if pool.owed() > 0 {
-            if let Err(error) = changes.change(|_| pool.return_freed(0)) {
-                tracing::error!(%error, "state pool could not drain settled owed blocks");
+            match changes.change(|_| pool.return_freed(0)) {
+                Ok(returned) if returned > 0 && !pool.releasing() => completed = true,
+                Ok(_) => {}
+                Err(error) => {
+                    tracing::error!(%error, "state pool could not drain settled owed blocks");
+                }
             }
         }
+        completed
+    }
+
+    /// At a flight boundary: poll the idle graph slots' release
+    /// (`AllocatedResources::released_slots`).
+    pub fn advance_slot_release(&mut self) -> Option<crate::resources::SlotsReleased> {
         self.resources.released_slots()
     }
 

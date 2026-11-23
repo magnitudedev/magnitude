@@ -839,6 +839,119 @@ fn spare_slabs_owed_wait_for_a_held_chain_and_release_once_it_ends() {
     assert_eq!(domain.state_slabs.spare_owed(), 0);
 }
 
+/// When `yield_state` releases granules inside a partially-occupied
+/// multi-granule state pool block that cannot empty or vacate right now
+/// (`pool.owed() > 0 && !pool.releasing()`), `release_yielded` must NOT report
+/// `Yielded::Pending`: nothing async is in flight, so reporting `Pending`
+/// strands an idle owner on an unwakeable memory wait. Instead it reports
+/// `Yielded::Released` for the freed granules (and `Yielded::Nothing` once no
+/// further cache is owed), leaving `releasing_slots()` false.
+#[test]
+fn release_yielded_does_not_return_pending_when_state_pool_owed_cannot_vacate() {
+    use crate::memory::ledger::{CacheKind, Frees, Relief};
+    let mut definition = super::fixtures::tiny_definition();
+    definition.decoder.context_limit = 2048;
+    let (mut domain, mut bindings) = super::fixtures::fixture_with_state_block_granules(
+        definition,
+        super::fixtures::limits(512, 1, false),
+        crate::platform::DeviceRequest::Backend(seismic::BackendName::Cpu),
+        16,
+    );
+    assert!(
+        domain.state_pool().block_bytes() >= domain.state_pool().granule() * 16,
+        "test requires multi-granule state pool blocks"
+    );
+    let (other, request) = (RequestId(800), RequestId(801));
+    open(&mut domain, &mut bindings, other);
+    for chunk in 0..4 {
+        let step = Operation::Forward {
+            request: other,
+            kind: WorkKind::Prefill,
+            tokens: vec![crate::TokenId(1); 512],
+            position: chunk * 512,
+            conditioning: None,
+            demand: crate::batching::Demand::NONE,
+            select: Vec::new(),
+            committed: 512,
+            prime: None,
+            front: Vec::new(),
+            chain: None,
+        };
+        let flight = submit_reserved_target(&mut domain, bindings, vec![step]);
+        let (pending, next) = finish_one(&mut domain, flight);
+        bindings = next;
+        domain
+            .reconcile(pending, PhysicalDecision { accepted_rows: 512, ahead: crate::AheadVerdict::default() })
+            .unwrap();
+    }
+    domain.close(other).unwrap();
+
+    // Open a lone live request occupying a granule inside the same block as
+    // the closed request's spare slabs so the block cannot empty or vacate.
+    domain.install_input(request, PreparedModelInput::continuation_only()).unwrap();
+    let unchained = domain.unchained(&mut bindings).expect("no chain is under way");
+    assert!(domain.open_state(unchained, request, None, 3).unwrap().is_empty());
+    let ledger = domain.resources.ledgers().device().clone();
+    let spare = ledger.estimate().cache_of(CacheKind::Spare);
+    assert!(spare > 0, "closed request's slabs must register as CacheKind::Spare");
+    let plan = ledger
+        .plan_relief(spare, Relief::CacheOnly, Frees::RequestState)
+        .expect("spare cache covers relief plan");
+    let _owed = domain.execute_relief(plan);
+    assert!(domain.state_slabs.spare_owed() > 0, "spare slabs must be owed");
+
+    let yielded = domain
+        .release_yielded(&mut bindings, crate::CompletionWake::new(|| {}))
+        .unwrap();
+    assert!(
+        domain.state_pool().owed() > 0 && !domain.state_pool().releasing(),
+        "live request pins the partially-occupied block so pool.owed()={} > 0 with releasing()={}",
+        domain.state_pool().owed(),
+        domain.state_pool().releasing(),
+    );
+    assert!(
+        matches!(yielded, super::Yielded::Released { released, returned: 0 } if released > 0),
+        "must report Yielded::Released (not Yielded::Pending) when nothing async is in flight: {yielded:?}"
+    );
+    assert!(
+        !domain.releasing_slots(),
+        "releasing_slots() must be false when no async release is in flight"
+    );
+    assert_eq!(
+        domain
+            .release_yielded(&mut bindings, crate::CompletionWake::new(|| {}))
+            .unwrap(),
+        super::Yielded::Nothing,
+        "subsequent release_yielded must return Nothing, not Pending"
+    );
+}
+
+/// Watching an async state-pool release keeps `releasing_slots()` true until
+/// `advance_state_pool_release()` consumes its completion (even when the pool
+/// transitions to idle right before `wake_on_release` runs).
+#[test]
+fn watch_state_pool_release_keeps_releasing_slots_true_until_advanced() {
+    use std::sync::{Arc, atomic::{AtomicBool, Ordering}};
+    let (mut domain, _bindings) = super::fixtures::fixture(None);
+    assert!(!domain.releasing_slots());
+    let woke = Arc::new(AtomicBool::new(false));
+    let woke_cb = Arc::clone(&woke);
+    domain.watch_state_pool_release(crate::CompletionWake::new(move || {
+        woke_cb.store(true, Ordering::Release);
+    }));
+    assert!(woke.load(Ordering::Acquire), "idle pool fires wake_on_release immediately");
+    assert!(
+        domain.releasing_slots(),
+        "releasing_slots() stays true until the owner consumes completion and advances its epoch"
+    );
+    assert!(
+        domain.advance_state_pool_release(),
+        "advance_state_pool_release() observes the finished watch"
+    );
+    assert!(!domain.releasing_slots(), "releasing_slots() clears after consumption");
+    assert!(!domain.advance_state_pool_release(), "second advance reports no new completion");
+}
+
 /// A rejected chain returns every launch: the domain restores the first's
 /// accepted state, and the launches behind it return their rows as they
 /// drop.

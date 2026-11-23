@@ -2404,8 +2404,8 @@ trait MemoryStep: MemoryHost + Sized {
     ) -> Result<bool, RequestError> {
         let [before_bank, before_host] =
             [BankTier::Bank, BankTier::Host].map(|tier| self.domain().held_bytes_of(tier));
-        let wake = self.completion();
-        let followed = self.domain().follow_cache_targets(bindings, wake).map_err(classify_domain_error)?;
+        let (wake, slot_wake) = (self.completion(), self.completion());
+        let followed = self.domain().follow_cache_targets(bindings, wake, slot_wake).map_err(classify_domain_error)?;
         let (tier, cause) = match followed {
             Followed::Grew(BankStep::Begun(tier)) => (tier, BankBegunFor::Growth),
             Followed::Shrank(BankStep::Begun(tier)) => (tier, BankBegunFor::Shrink),
@@ -2447,23 +2447,29 @@ trait MemoryStep: MemoryHost + Sized {
         Ok(yielded)
     }
 
-    /// At a flight boundary, finish the idle graph slots' release off the
-    /// submitting thread (`ExecutorDomain::advance_slot_release`), recorded
-    /// with the slots and how long the release thread took. It freed
-    /// memory, so what waited on memory may retry. Whether one finished.
+    /// At a flight boundary, finish the state pool's async release and the
+    /// idle graph slots' release off the submitting thread
+    /// (`ExecutorDomain::advance_state_pool_release`,
+    /// `ExecutorDomain::advance_slot_release`). Either freed memory, so what
+    /// waited on memory may retry. Whether one finished.
     fn advance_slot_release(&mut self) -> bool {
-        let Some(released) = self.domain().advance_slot_release() else {
-            return false;
-        };
-        tracing::info!(
-            slots = released.slots,
-            released = released.bytes,
-            release_micros = released.released.duration_since(released.began).as_micros() as u64,
-            held_after = self.domain().held_bytes(),
-            "graph slots released"
-        );
-        self.advance_epoch();
-        true
+        let pool_released = self.domain().advance_state_pool_release();
+        let slots = self.domain().advance_slot_release();
+        if let Some(released) = slots {
+            tracing::info!(
+                slots = released.slots,
+                released = released.bytes,
+                release_micros = released.released.duration_since(released.began).as_micros() as u64,
+                held_after = self.domain().held_bytes(),
+                "graph slots released"
+            );
+        }
+        if pool_released || slots.is_some() {
+            self.advance_epoch();
+            true
+        } else {
+            false
+        }
     }
 
     /// At a flight boundary, advance the expert bank's resize
@@ -5510,6 +5516,373 @@ let Ok(residency) = service.make_resident(id, &mut record, generation, bindings)
             );
         }
         service.check_no_unwakeable_wait();
+    }
+
+    /// Regression test for F-046: when a lone resident request extends its
+    /// state while its multi-granule state pool block also holds spare slabs
+    /// from an earlier turn (`pool.owed() > 0 && !pool.releasing()`), `relieve`
+    /// must NOT stop on a spurious `Yielded::Pending` (which previously parked
+    /// the lone request on an unwakeable memory wait and panicked in
+    /// `check_no_unwakeable_wait`). Instead it retries and reclaims the expert
+    /// bank's cache above floor so the group provisions cleanly.
+    #[test]
+    fn lone_request_reclaims_expert_bank_when_state_pool_owed_cannot_vacate() {
+        let backend = fixtures::bank_backends()
+            .into_iter()
+            .find(|backend| format!("{backend:?}") == "Cpu")
+            .expect("CPU backend available");
+        let mut definition = fixtures::tiny_definition();
+        definition.decoder.context_limit = 4096;
+        let vocabulary = definition.decoder.vocabulary as usize;
+        let base = fixtures::fixture_with_state_block_granules(
+            definition,
+            fixtures::limits(512, 1, false),
+            magnitude_executor::platform::DeviceRequest::Backend(backend),
+            2,
+        );
+        let (domain, bindings) = fixtures::banked_of(base, backend, 4, 4);
+        let bank_before = domain.expert_residency().unwrap().unwrap().slots;
+        assert_eq!(bank_before, 4, "expert bank starts with 4 slots above floor");
+        let limits = ServiceLimits {
+            prefill_tokens: 512,
+            decode_tokens: 16,
+            decode_share: 0.5,
+            locality_seconds: 1.0,
+            conversations: std::num::NonZeroUsize::MIN,
+        };
+        let mut owner = Owner::new(domain, bindings, limits, Arc::new(NoWakes)).unwrap();
+        let make_gen = |prompt_len: usize, max_tokens: usize| {
+            let options = Options {
+                max_tokens,
+                output_capacity: 4,
+                context_limit: 4096,
+                vocabulary,
+                stop_tokens: BTreeSet::new(),
+                suppressed_tokens: BTreeSet::new(),
+                sampling: Sampling::Greedy,
+                shaping: Shaping { temperature: 0.0, ..Default::default() },
+                seed: 0,
+                forced_quantum: 0,
+                method: MethodChoice::Plain,
+                end_of_generation: EndOfGeneration::Stop,
+                reasoning_budget: None,
+            };
+            Generation::new(vec![TokenId(1); prompt_len], InputLayout::new(prompt_len, vec![]).unwrap(), options, None).unwrap()
+        };
+
+        // Turn 1: open with a 2048-row reservation (backing slabs inside a
+        // multi-granule state pool block) and close so those slabs remain as
+        // spare granules alongside Turn 2's live slab.
+        let now = 0u64;
+        {
+            let Pipeline::Idle(bindings) = &mut owner.pipeline else { panic!("idle owner") };
+            let turn1 = RequestId::admitted();
+            owner
+                .service
+                .domain
+                .install_input(turn1, PreparedModelInput::continuation_only())
+                .unwrap();
+            let unchained = owner.service.domain.unchained(bindings).expect("unchained");
+            owner.service.domain.open_state(unchained, turn1, None, 600).unwrap();
+            owner.service.domain.close(turn1).unwrap();
+        }
+
+        // Turn 2: lone request opens with a short prompt (pinning the
+        // multi-granule block with its live granule alongside Turn 1's spare
+        // slabs), then advances its target state right up to its initial
+        // reservation boundary so the very next step must extend its
+        // reservation past the pool's spare bytes and reclaim the expert bank.
+        let (turn2, _rx2) = owner
+            .admit(make_gen(4, 3072), PreparedModelInput::continuation_only(), PrefixRetention::Transient, 4, now)
+            .unwrap();
+        let Owner { mut service, pipeline: Pipeline::Idle(mut bindings) } = owner else {
+            panic!("idle owner");
+        };
+        assert_eq!(residency(&mut service, &mut bindings, turn2), Some(true));
+        let initial_reservation = fixtures::reservation_rows(&service.domain, turn2).unwrap();
+        let mut pos = 0usize;
+        while pos < initial_reservation as usize {
+            let chunk = ((initial_reservation as usize) - pos).min(512);
+            let step = Operation::Forward {
+                request: turn2,
+                kind: magnitude_executor::WorkKind::Prefill,
+                tokens: vec![TokenId(1); chunk],
+                position: pos,
+                conditioning: None,
+                demand: magnitude_executor::batching::Demand::NONE,
+                select: Vec::new(),
+                committed: chunk,
+                prime: None,
+                front: Vec::new(),
+                chain: None,
+            };
+            let reservation = service.domain.reserve(&mut bindings, std::slice::from_ref(&step)).unwrap();
+            let magnitude_executor::ReservedResources::Target(reservation) = reservation.into_resources() else {
+                panic!("target reservation");
+            };
+            let flight = service
+                .domain
+                .submit_target(bindings, &[step], reservation)
+                .unwrap_or_else(|err| panic!("submit failed: {}", err.error()));
+            let (outcomes, next) = service.domain.finish_target(flight).unwrap();
+            bindings = next;
+            for item in outcomes {
+                service.domain.reconcile(item, PhysicalDecision::rows(chunk)).unwrap();
+            }
+            pos += chunk;
+        }
+        // Exhaust all free room while leaving the expert bank above its floor.
+        let _room = fixtures::take_non_bank_room(&service.domain);
+
+        // Provision a 512-row step extending past Turn 2's initial reservation
+        // and past the spare slabs held in block 0.
+        service.memory.reading = ReadingState::Active;
+        let Request { record, state: State::Between(generation, Stage::Ready) } =
+            service.requests.remove(&turn2).unwrap()
+        else {
+            panic!("resident turn2");
+        };
+        let operation = Operation::Forward {
+            request: turn2,
+            kind: magnitude_executor::WorkKind::Prefill,
+            tokens: vec![TokenId(1); 512],
+            position: initial_reservation as usize,
+            conditioning: None,
+            demand: magnitude_executor::batching::Demand::NONE,
+            select: Vec::new(),
+            committed: 512,
+            prime: None,
+            front: Vec::new(),
+            chain: None,
+        };
+        let mut groups: VecDeque<_> = group(&service.domain, vec![operation]).into_iter().collect();
+        let group_ = groups.pop_front().expect("one group");
+        let selection = service
+            .scheduler
+            .select(
+                &[ScheduledOperation {
+                    identity: turn2,
+                    phase: Phase::Decode,
+                    active: true,
+                    resident: true,
+                    waiting_since_ns: now,
+                    service_ns: 1,
+                    preemption_debt: 0,
+                    holds_chain: false,
+                }],
+                now,
+            )
+            .unwrap()
+            .expect("selection");
+        let mut round = Round {
+            selection,
+            started: now,
+            members: BTreeMap::from([(
+                turn2,
+                Member {
+                    record,
+                    state: Membership::Generation(generation),
+                },
+            )]),
+            groups,
+        };
+        let provisioned = service.provision(&mut bindings, &mut round, group_).unwrap();
+        assert!(
+            matches!(provisioned, Provisioned::Fits(_)),
+            "lone request must reclaim expert bank and fit rather than parking on memory"
+        );
+        service.finish_round(round).unwrap();
+        service.check_no_unwakeable_wait();
+        let extended_reservation = fixtures::reservation_rows(&service.domain, turn2).unwrap();
+        assert!(
+            extended_reservation > initial_reservation,
+            "reservation extended from {initial_reservation} to {extended_reservation}"
+        );
+        let bank_after = service.domain.expert_residency().unwrap().unwrap().slots;
+        assert!(
+            bank_after < bank_before,
+            "expert bank reclaimed synchronously ({bank_before} -> {bank_after})"
+        );
+    }
+
+    /// When a lone resident request hits a genuine unshrinkable OOM while its
+    /// multi-granule state pool block holds spare slabs (`pool.owed() > 0 &&
+    /// !pool.releasing()`), `provision` must refuse it cleanly instead of
+    /// parking it on an unwakeable memory wait that panics in
+    /// `check_no_unwakeable_wait`.
+    #[test]
+    fn lone_request_fails_cleanly_on_unshrinkable_oom_with_fragmented_state_pool() {
+        let mut definition = fixtures::tiny_definition();
+        definition.decoder.context_limit = 4096;
+        let vocabulary = definition.decoder.vocabulary as usize;
+        let backend = fixtures::bank_backends()
+            .into_iter()
+            .find(|backend| format!("{backend:?}") == "Cpu")
+            .expect("CPU backend available");
+        let (domain, bindings) = fixtures::fixture_with_state_block_granules(
+            definition,
+            fixtures::limits(512, 1, false),
+            magnitude_executor::platform::DeviceRequest::Backend(backend),
+            2,
+        );
+        let limits = ServiceLimits {
+            prefill_tokens: 512,
+            decode_tokens: 16,
+            decode_share: 0.5,
+            locality_seconds: 1.0,
+            conversations: std::num::NonZeroUsize::MIN,
+        };
+        let mut owner = Owner::new(domain, bindings, limits, Arc::new(NoWakes)).unwrap();
+        let make_gen = |prompt_len: usize, max_tokens: usize| {
+            let options = Options {
+                max_tokens,
+                output_capacity: 4,
+                context_limit: 4096,
+                vocabulary,
+                stop_tokens: BTreeSet::new(),
+                suppressed_tokens: BTreeSet::new(),
+                sampling: Sampling::Greedy,
+                shaping: Shaping { temperature: 0.0, ..Default::default() },
+                seed: 0,
+                forced_quantum: 0,
+                method: MethodChoice::Plain,
+                end_of_generation: EndOfGeneration::Stop,
+                reasoning_budget: None,
+            };
+            Generation::new(vec![TokenId(1); prompt_len], InputLayout::new(prompt_len, vec![]).unwrap(), options, None).unwrap()
+        };
+
+        // Turn 1 populates block 0 with slabs that become spare upon close.
+        let now = 0u64;
+        {
+            let Pipeline::Idle(bindings) = &mut owner.pipeline else { panic!("idle owner") };
+            let turn1 = RequestId::admitted();
+            owner
+                .service
+                .domain
+                .install_input(turn1, PreparedModelInput::continuation_only())
+                .unwrap();
+            let unchained = owner.service.domain.unchained(bindings).expect("unchained");
+            owner.service.domain.open_state(unchained, turn1, None, 600).unwrap();
+            owner.service.domain.close(turn1).unwrap();
+        }
+
+        // Turn 2 opens in block 0 (pinning it), advances to its initial
+        // reservation boundary, then all remaining memory is taken with no
+        // shrinkable bank cache left.
+        let (turn2, _rx2) = owner
+            .admit(make_gen(4, 3072), PreparedModelInput::continuation_only(), PrefixRetention::Transient, 4, now)
+            .unwrap();
+        let Owner { mut service, pipeline: Pipeline::Idle(mut bindings) } = owner else {
+            panic!("idle owner");
+        };
+        assert_eq!(residency(&mut service, &mut bindings, turn2), Some(true));
+        let initial_reservation = fixtures::reservation_rows(&service.domain, turn2).unwrap();
+        let mut pos = 0usize;
+        while pos < initial_reservation as usize {
+            let chunk = ((initial_reservation as usize) - pos).min(512);
+            let step = Operation::Forward {
+                request: turn2,
+                kind: magnitude_executor::WorkKind::Prefill,
+                tokens: vec![TokenId(1); chunk],
+                position: pos,
+                conditioning: None,
+                demand: magnitude_executor::batching::Demand::NONE,
+                select: Vec::new(),
+                committed: chunk,
+                prime: None,
+                front: Vec::new(),
+                chain: None,
+            };
+            let reservation = service.domain.reserve(&mut bindings, std::slice::from_ref(&step)).unwrap();
+            let magnitude_executor::ReservedResources::Target(reservation) = reservation.into_resources() else {
+                panic!("target reservation");
+            };
+            let flight = service
+                .domain
+                .submit_target(bindings, &[step], reservation)
+                .unwrap_or_else(|err| panic!("submit failed: {}", err.error()));
+            let (outcomes, next) = service.domain.finish_target(flight).unwrap();
+            bindings = next;
+            for item in outcomes {
+                service.domain.reconcile(item, PhysicalDecision::rows(chunk)).unwrap();
+            }
+            pos += chunk;
+        }
+        let _room = fixtures::take_non_bank_room(&service.domain);
+
+        service.memory.reading = ReadingState::Active;
+        let Request { record, state: State::Between(generation, Stage::Ready) } =
+            service.requests.remove(&turn2).unwrap()
+        else {
+            panic!("resident turn2");
+        };
+        let operation = Operation::Forward {
+            request: turn2,
+            kind: magnitude_executor::WorkKind::Prefill,
+            tokens: vec![TokenId(1); 512],
+            position: initial_reservation as usize,
+            conditioning: None,
+            demand: magnitude_executor::batching::Demand::NONE,
+            select: Vec::new(),
+            committed: 512,
+            prime: None,
+            front: Vec::new(),
+            chain: None,
+        };
+        let mut groups: VecDeque<_> = group(&service.domain, vec![operation]).into_iter().collect();
+        let group_ = groups.pop_front().expect("one group");
+        let selection = service
+            .scheduler
+            .select(
+                &[ScheduledOperation {
+                    identity: turn2,
+                    phase: Phase::Decode,
+                    active: true,
+                    resident: true,
+                    waiting_since_ns: now,
+                    service_ns: 1,
+                    preemption_debt: 0,
+                    holds_chain: false,
+                }],
+                now,
+            )
+            .unwrap()
+            .expect("selection");
+        let mut round = Round {
+            selection,
+            started: now,
+            members: BTreeMap::from([(
+                turn2,
+                Member {
+                    record,
+                    state: Membership::Generation(generation),
+                },
+            )]),
+            groups,
+        };
+        let provisioned = service.provision(&mut bindings, &mut round, group_).unwrap();
+        match provisioned {
+            Provisioned::Refused(refused_group, err) => {
+                assert!(
+                    matches!(err, RequestError::ContextExceedsMemory { .. } | RequestError::Capacity(_)),
+                    "expected clean memory refusal, got {err:?}"
+                );
+                service.refuse(&mut round, &refused_group, err);
+            }
+            Provisioned::Short(group_, wait) => {
+                service.park(&mut round, group_, wait);
+                service.finish_round(round).unwrap();
+                service.check_no_unwakeable_wait();
+                panic!("must not park a lone request on unshrinkable OOM");
+            }
+            Provisioned::Fits(_) | Provisioned::Split(..) => {
+                panic!("expected refusal on unshrinkable OOM");
+            }
+        }
+        service.finish_round(round).unwrap();
+        service.check_no_unwakeable_wait();
+        assert!(service.requests.is_empty(), "refused request retired cleanly");
     }
 }
 

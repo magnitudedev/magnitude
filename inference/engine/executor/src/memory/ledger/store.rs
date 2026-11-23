@@ -590,7 +590,32 @@ impl DeviceLedgers {
         class: PoolClass,
         granule: u64,
     ) -> Result<seismic::Pool, OpenPoolError> {
-        let sizing = seismic::BlockSizing { granule, allocations: device.native_allocations() };
+        self.open_pool_sized(reading, device, contract, class, granule, device.native_allocations())
+    }
+
+    #[cfg(any(test, feature = "fixtures"))]
+    pub fn open_pool_with_allocations(
+        &self,
+        device: &seismic::Device,
+        contract: seismic::Contract,
+        class: PoolClass,
+        granule: u64,
+        allocations: seismic::NativeAllocations,
+    ) -> Result<seismic::Pool, String> {
+        self.open_pool_sized(None, device, contract, class, granule, allocations)
+            .map_err(|error| error.to_string())
+    }
+
+    fn open_pool_sized(
+        &self,
+        reading: Option<&DeviceReading>,
+        device: &seismic::Device,
+        contract: seismic::Contract,
+        class: PoolClass,
+        granule: u64,
+        allocations: seismic::NativeAllocations,
+    ) -> Result<seismic::Pool, OpenPoolError> {
+        let sizing = seismic::BlockSizing { granule, allocations };
         let block = seismic::block_bytes(sizing)
             .map_err(|error| OpenPoolError::Internal(format!("the {contract:?} store's {class:?} pool blocks: {error:?}")))?;
         let ledger = self.of_contract(device, contract);

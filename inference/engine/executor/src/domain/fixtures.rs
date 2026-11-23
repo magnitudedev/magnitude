@@ -372,6 +372,42 @@ pub fn fixture_over(
     head: bool,
     device_request: platform::DeviceRequest,
 ) -> Fixture {
+    fixture_over_with_state_block_granules(definition, manifest, limits, method, control, head, device_request, 1)
+}
+
+/// [`fixture_of`] whose state pool packs at least `min_state_block_granules`
+/// granules into each block (reproducing GPU multi-granule pool blocks on any
+/// backend, including CPU).
+pub fn fixture_with_state_block_granules(
+    definition: ModelDefinition,
+    limits: ResourceLimits,
+    device_request: platform::DeviceRequest,
+    min_state_block_granules: u64,
+) -> Fixture {
+    let manifest = tiny_manifest(&definition);
+    fixture_over_with_state_block_granules(
+        definition,
+        manifest,
+        limits,
+        PlannedMethod::Plain,
+        None,
+        false,
+        device_request,
+        min_state_block_granules,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn fixture_over_with_state_block_granules(
+    definition: ModelDefinition,
+    manifest: PackageManifest,
+    limits: ResourceLimits,
+    method: PlannedMethod,
+    control: Option<PendingControl>,
+    head: bool,
+    device_request: platform::DeviceRequest,
+    min_state_block_granules: u64,
+) -> Fixture {
     assert!(!(head && method.drafts()), "a drafted fixture's head store is its plan's");
     let catalog = seismic::Devices::discover(&[]).expect("devices are discovered");
     let release = platform::ReleaseRate::of_machine(None);
@@ -469,9 +505,24 @@ pub fn fixture_over(
     // claim as the load's are.
     let mut recorded = crate::memory::ledger::Recorded::default();
     // The state pool as a load opens it: at the plan's state granule.
-    let pool = ledgers
-        .open_pool(&device, seismic::Contract::DeviceOnly, crate::memory::ledger::PoolClass::State, execution.resources().target_state().granule)
-        .expect("the fixture's device opens its state pool");
+    let state_granule = execution.resources().target_state().granule;
+    let pool = if min_state_block_granules > 1 {
+        let mut allocations = device.native_allocations();
+        allocations.least = allocations.least.max(state_granule * min_state_block_granules);
+        ledgers
+            .open_pool_with_allocations(
+                &device,
+                seismic::Contract::DeviceOnly,
+                crate::memory::ledger::PoolClass::State,
+                state_granule,
+                allocations,
+            )
+            .expect("the fixture's device opens its multi-granule state pool")
+    } else {
+        ledgers
+            .open_pool(&device, seismic::Contract::DeviceOnly, crate::memory::ledger::PoolClass::State, state_granule)
+            .expect("the fixture's device opens its state pool")
+    };
     let scratch = crate::memory::ClaimDemand { device: execution.resources().bytes().scratch, ..Default::default() };
     let arena = crate::memory::ledger::CommittedKind::Arena;
     let resources = fixture_charged(&device, &ledgers, &mut recorded, arena, scratch, |charges| {
@@ -690,6 +741,12 @@ pub fn drafted_on(device_request: platform::DeviceRequest) -> Fixture {
 /// [`banked`] on [`drafted_on`]'s load.
 pub fn banked_drafted(backend: seismic::BackendName, rows: u64, committed: u64) -> Fixture {
     with_bank(drafted_on(platform::DeviceRequest::Backend(backend)), backend, rows, committed)
+}
+
+/// Attach a fake elastic bank of `rows` rows (`committed` of them backed) to an
+/// existing `fixture` on `backend`.
+pub fn banked_of(fixture: Fixture, backend: seismic::BackendName, rows: u64, committed: u64) -> Fixture {
+    with_bank(fixture, backend, rows, committed)
 }
 
 /// `fixture`, its family holding a fake bank of `rows` rows, `committed`

@@ -432,14 +432,19 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
     /// derives afresh, so the owner calls it at every reading and flight
     /// boundary, and a resize deferred or running is followed again at the
     /// next.
-    pub fn follow_cache_targets(&mut self, bindings: &mut StateBindings, wake: crate::CompletionWake) -> Result<Followed, DomainError> {
+    pub fn follow_cache_targets(
+        &mut self,
+        bindings: &mut StateBindings,
+        wake: crate::CompletionWake,
+        slot_wake: crate::CompletionWake,
+    ) -> Result<Followed, DomainError> {
         let Some(bank) = self.family.expert_bank() else {
             return Ok(Followed::Holds);
         };
         match self.next_bank_move(bank)? {
             None => Ok(Followed::Holds),
             Some((holding, BankMove::Shrink { to })) => self.shrink_expert_bank_to(bindings, holding, to, wake).map(Followed::Shrank),
-            Some((holding, BankMove::Grow { to })) => self.grow_expert_bank(holding, to, wake).map(Followed::Grew),
+            Some((holding, BankMove::Grow { to })) => self.grow_expert_bank(holding, to, wake, slot_wake).map(Followed::Grew),
         }
     }
 
@@ -457,7 +462,13 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
 
     /// Begin one growth of `holding` to `to`, its derived target
     /// (`ElasticBank::grow`, which takes the growth's cache first).
-    fn grow_expert_bank(&mut self, holding: BankHolding, to: u64, wake: crate::CompletionWake) -> Result<BankStep, DomainError> {
+    fn grow_expert_bank(
+        &mut self,
+        holding: BankHolding,
+        to: u64,
+        wake: crate::CompletionWake,
+        slot_wake: crate::CompletionWake,
+    ) -> Result<BankStep, DomainError> {
         let started = Instant::now();
         let bank = self.family.expert_bank().expect("invariant violated: a growth of a load without a bank");
         // If the ledger derived this device-tier growth by pricing
@@ -483,7 +494,7 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
                             let changes = self.resources.ledgers().changes().clone();
                             changes.change(|_| self.family.release_group(quiet).map_err(DomainError::invariant))?;
                         }
-                        let _ = self.resources.release_idle_slots(self.idle_class.release(), crate::CompletionWake::new(|| {}));
+                        let _ = self.resources.release_idle_slots(self.idle_class.release(), slot_wake);
                     }
                 }
             }
@@ -669,7 +680,7 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
     /// slabs wait while a chain is under way ([`Self::chain_holder`]).
     pub fn release_yielded(&mut self, bindings: &mut StateBindings, wake: crate::CompletionWake) -> Result<Yielded, DomainError> {
         self.idle_optional();
-        let mut freed = false;
+        let mut freed = self.take_finished_state_pool_release();
         if let Some(cache) = self.head_component.take_idle_if(IdleCache::taken) {
             self.unload_component(OptionalComponent::Drafter, cache);
             freed = true;
@@ -684,15 +695,17 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
             // steps, moving no row, and the pool returns what they freed.
             let state = self.yield_state(&mut unchained)?;
             (released, returned) = (state.released, state.returned);
-            let pool = self.state_pool();
-            if pool.releasing() || pool.owed() > 0 {
-                pool.wake_on_release(move || wake.complete());
-                return Ok(Yielded::Pending);
-            }
             freed |= released + returned > 0;
         }
-        if self.state_pool().releasing() {
-            self.state_pool().wake_on_release(move || wake.complete());
+        // Only report `Yielded::Pending` for the state pool when an async
+        // block drop or fence waiter is genuinely in flight (`pool.releasing()`
+        // or an uncompleted watch). A non-zero `pool.owed()` with
+        // `!pool.releasing()` means freed granules sit in partially-occupied
+        // blocks that cannot vacate right now; nothing async is under way, so
+        // `relieve` must retry (when granules were released) or continue to
+        // remaining cache tiers rather than parking on an unwakeable wait.
+        if self.state_pool().releasing() || self.state_pool_release.is_some() {
+            self.watch_state_pool_release(wake);
             return Ok(Yielded::Pending);
         }
         if freed {
@@ -706,6 +719,9 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
             // releasing the idle graph slots on the release thread; with no
             // slot idling any more, their cache is let go at once.
             if self.idle_class.held_places().is_some() {
+                if self.quiet().is_none() && self.unchained(bindings).is_some() {
+                    self.conclude_chain()?;
+                }
                 let Some(quiet) = self.quiet() else {
                     return Ok(Yielded::Pending);
                 };
@@ -921,7 +937,9 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
         self.observe_memory();
         let bank = self.family.expert_bank().expect("a test grows a banked load");
         match self.next_bank_move(bank)? {
-            Some((holding, BankMove::Grow { to })) => self.grow_expert_bank(holding, to, wake),
+            Some((holding, BankMove::Grow { to })) => {
+                self.grow_expert_bank(holding, to, wake, crate::CompletionWake::new(|| {}))
+            }
             _ => Ok(BankStep::AtLimit),
         }
     }

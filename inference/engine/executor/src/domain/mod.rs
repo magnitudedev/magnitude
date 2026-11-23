@@ -818,6 +818,13 @@ pub struct ExecutorDomain<F: ProgramFamily = NativeFamily> {
     request_slot: crate::memory::ledger::Claim,
     /// The state slabs and the holdings over them on the device's ledger.
     state_slabs: state::StateSlabs,
+    /// Watch for an asynchronous release in the state granule pool
+    /// (`seismic::Pool::releasing()`): set to `Some(done)` whenever
+    /// [`Self::release_yielded`] returns [`Yielded::Pending`] for the state
+    /// pool, with `done` stored `true` by the pool's `wake_on_release`
+    /// callback right before it wakes the owner. Consumed at the next
+    /// [`Self::advance_state_pool_release`] or [`Self::release_yielded`].
+    state_pool_release: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
     domain: ResourceDomain,
     /// The device's memory reading, carried over from the load's startup.
     memory: RefCell<DeviceReader>,
@@ -3198,6 +3205,7 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
             boundary: None,
             request_slot,
             state_slabs: state::StateSlabs::default(),
+            state_pool_release: None,
             domain: ResourceDomain::new(id, memory.device().clone()),
             memory: RefCell::new(memory),
             target_store: Rc::clone(&target_state),

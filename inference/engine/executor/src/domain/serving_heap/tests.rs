@@ -43,13 +43,13 @@ fn the_bank_regrows_to_its_target_once_a_prompts_claim_is_freed() {
         // guarantee holds only the load's own growth.
         read(&ledger, at(1));
         read(&ledger, at(2));
-        assert_eq!(domain.follow_cache_targets(&mut bindings, wake()).unwrap(), Followed::Holds, "{backend:?}: the bank holds its full target");
+        assert_eq!(domain.follow_cache_targets(&mut bindings, wake(), wake()).unwrap(), Followed::Holds, "{backend:?}: the bank holds its full target");
         // The prompt's claim leaves the bank's cache a slot and a half of
         // room above its floor: its target falls to two slots.
         let room = ledger.estimate().target();
         let prompt = ledger.change(|keeping| ledger.claim_at(&keeping.claims(), None, crate::memory::ledger::CommittedKind::Load, room - row * 3 / 2)).expect("the prompt's claim fits");
         read(&ledger, at(3));
-        assert_eq!(domain.follow_cache_targets(&mut bindings, wake()).unwrap(), Followed::Shrank(BankStep::Begun(crate::planning::BankTier::Bank)), "{backend:?}");
+        assert_eq!(domain.follow_cache_targets(&mut bindings, wake(), wake()).unwrap(), Followed::Shrank(BankStep::Begun(crate::planning::BankTier::Bank)), "{backend:?}");
         let shrunk = loop {
             if let Some((resized, _)) = domain.advance_expert_bank(wake()).unwrap() {
                 break resized;
@@ -60,7 +60,7 @@ fn the_bank_regrows_to_its_target_once_a_prompts_claim_is_freed() {
         // the bank back to its full target.
         drop(prompt);
         read(&ledger, at(4));
-        assert_eq!(domain.follow_cache_targets(&mut bindings, wake()).unwrap(), Followed::Grew(BankStep::Begun(crate::planning::BankTier::Bank)), "{backend:?}");
+        assert_eq!(domain.follow_cache_targets(&mut bindings, wake(), wake()).unwrap(), Followed::Grew(BankStep::Begun(crate::planning::BankTier::Bank)), "{backend:?}");
         let grown = loop {
             if let Some((resized, _)) = domain.advance_expert_bank(wake()).unwrap() {
                 break resized;
@@ -68,7 +68,7 @@ fn the_bank_regrows_to_its_target_once_a_prompts_claim_is_freed() {
         };
         assert!(matches!(grown, BankResized::Grown { from: 2, to: 4, .. }), "{backend:?}: {grown:?}");
         read(&ledger, at(5));
-        assert_eq!(domain.follow_cache_targets(&mut bindings, wake()).unwrap(), Followed::Holds, "{backend:?}: the full bank again");
+        assert_eq!(domain.follow_cache_targets(&mut bindings, wake(), wake()).unwrap(), Followed::Holds, "{backend:?}: the full bank again");
     }
 }
 
@@ -98,7 +98,7 @@ fn a_claim_taking_under_a_granule_of_the_bank_sheds_a_slot_and_then_allocates() 
         let at = |reading: u32| start + Duration::from_millis(100) * reading;
         read(&ledger, at(1));
         read(&ledger, at(2));
-        assert_eq!(domain.follow_cache_targets(&mut bindings, wake()).unwrap(), Followed::Holds, "{backend:?}: the bank holds its full target");
+        assert_eq!(domain.follow_cache_targets(&mut bindings, wake(), wake()).unwrap(), Followed::Holds, "{backend:?}: the bank holds its full target");
         let estimate = ledger.estimate();
         assert_eq!(estimate.guarantee(), 0, "{backend:?}: no rise: every free byte is a claim's");
         let free = estimate.free();
@@ -111,7 +111,7 @@ fn a_claim_taking_under_a_granule_of_the_bank_sheds_a_slot_and_then_allocates() 
         assert_eq!(before - bank(), bytes, "{backend:?}: half a slot of the bank's cache, taken for the claim");
         let allocate = || ledger.change(|_| { let entry = claim.entry(); entry.take(&entry.change(), bytes, seismic::memory::Wiring::Pageable) });
         assert!(allocate().is_err(), "{backend:?}: the taken half slot is the bank's still");
-        assert_eq!(domain.follow_cache_targets(&mut bindings, wake()).unwrap(), Followed::Shrank(BankStep::Begun(crate::planning::BankTier::Bank)), "{backend:?}");
+        assert_eq!(domain.follow_cache_targets(&mut bindings, wake(), wake()).unwrap(), Followed::Shrank(BankStep::Begun(crate::planning::BankTier::Bank)), "{backend:?}");
         let shrunk = loop {
             if let Some((resized, _)) = domain.advance_expert_bank(wake()).unwrap() {
                 break resized;
@@ -136,7 +136,7 @@ fn a_shortages_yield_under_a_block_keeps_the_bank() {
         let at = |reading: u32| start + Duration::from_millis(100) * reading;
         read(&ledger, at(1));
         read(&ledger, at(2));
-        assert_eq!(domain.follow_cache_targets(&mut bindings, wake()).unwrap(), Followed::Holds, "{backend:?}: the bank holds its full target");
+        assert_eq!(domain.follow_cache_targets(&mut bindings, wake(), wake()).unwrap(), Followed::Holds, "{backend:?}: the bank holds its full target");
         // Cache worth no more than the bank's yields first; past it, half a
         // slot of the bank's.
         let bank = || ledger.estimate().cache_of(crate::memory::ledger::CacheKind::Bank);
@@ -145,7 +145,7 @@ fn a_shortages_yield_under_a_block_keeps_the_bank() {
         ledger.change(|keeping| ledger.execute(&keeping.claims(), plan));
         let fell = before - bank();
         assert!(fell > 0 && fell < row, "{backend:?}: the shortage took {fell} bytes of the bank's cache, under a block");
-        assert_eq!(domain.follow_cache_targets(&mut bindings, wake()).unwrap(), Followed::Holds, "{backend:?}: within a block, the bank keeps its slots");
+        assert_eq!(domain.follow_cache_targets(&mut bindings, wake(), wake()).unwrap(), Followed::Holds, "{backend:?}: within a block, the bank keeps its slots");
     }
 }
 
@@ -171,7 +171,7 @@ fn the_loads_own_commit_never_spends_the_guarantee() {
         // The bank follows its target beside the guarantee.
         let mut reading = 4;
         loop {
-            match domain.follow_cache_targets(&mut bindings, wake()).unwrap() {
+            match domain.follow_cache_targets(&mut bindings, wake(), wake()).unwrap() {
                 Followed::Holds => break,
                 Followed::Shrank(BankStep::Begun(_)) | Followed::Grew(BankStep::Begun(_)) => while domain.advance_expert_bank(wake()).unwrap().is_none() {},
                 other => panic!("{backend:?}: the bank follows its target at once: {other:?}"),
@@ -193,10 +193,10 @@ fn the_loads_own_commit_never_spends_the_guarantee() {
         assert!(before - bank() > 0 && before - bank() < row, "{backend:?}: the bank's cache gave the commit under a block");
         let estimate = ledger.estimate();
         assert!(estimate.free() >= estimate.guarantee(), "{backend:?}: the bank's cache gave way, the guarantee unspent");
-        assert_eq!(domain.follow_cache_targets(&mut bindings, wake()).unwrap(), Followed::Shrank(BankStep::Begun(crate::planning::BankTier::Bank)), "{backend:?}: the bank sheds what the load took of it");
+        assert_eq!(domain.follow_cache_targets(&mut bindings, wake(), wake()).unwrap(), Followed::Shrank(BankStep::Begun(crate::planning::BankTier::Bank)), "{backend:?}: the bank sheds what the load took of it");
         while domain.advance_expert_bank(wake()).unwrap().is_none() {}
         read(&ledger, at(reading));
-        assert_eq!(domain.follow_cache_targets(&mut bindings, wake()).unwrap(), Followed::Holds, "{backend:?}: and holds");
+        assert_eq!(domain.follow_cache_targets(&mut bindings, wake(), wake()).unwrap(), Followed::Holds, "{backend:?}: and holds");
         let estimate = ledger.estimate();
         assert!(estimate.free() >= estimate.guarantee(), "{backend:?}: within budget less the guarantee");
     }
@@ -293,12 +293,12 @@ fn exogenous_shrink_damps_ping_pong_until_cooldown_or_large_release() {
         read_host(&ledger, row as i64, t);
         t += Duration::from_millis(100);
         read_host(&ledger, row as i64, t);
-        assert_eq!(domain.follow_cache_targets(&mut bindings, wake()).unwrap(), Followed::Holds, "{backend:?}");
+        assert_eq!(domain.follow_cache_targets(&mut bindings, wake(), wake()).unwrap(), Followed::Holds, "{backend:?}");
 
         // Exogenous deficit (-2.5 rows) drops hold_room -> bank shrinks below 4 slots.
         t += Duration::from_millis(100);
         read_host(&ledger, -((row * 5 / 2) as i64), t);
-        assert_eq!(domain.follow_cache_targets(&mut bindings, wake()).unwrap(), Followed::Shrank(BankStep::Begun(crate::planning::BankTier::Bank)), "{backend:?}");
+        assert_eq!(domain.follow_cache_targets(&mut bindings, wake(), wake()).unwrap(), Followed::Shrank(BankStep::Begun(crate::planning::BankTier::Bank)), "{backend:?}");
         while domain.advance_expert_bank(wake()).unwrap().is_none() {}
         let shrunk_to = domain.family.expert_bank().expect("bank").slots();
         assert!(shrunk_to < 4, "{backend:?}: shrunk_to={shrunk_to}");
@@ -307,7 +307,7 @@ fn exogenous_shrink_damps_ping_pong_until_cooldown_or_large_release() {
         // still below the rebound margin): 3s cooldown suppresses ping-pong.
         t += Duration::from_millis(100);
         read_host(&ledger, (row * 2) as i64, t);
-        assert_eq!(domain.follow_cache_targets(&mut bindings, wake()).unwrap(), Followed::Holds, "{backend:?}: ping-pong suppressed during cooldown");
+        assert_eq!(domain.follow_cache_targets(&mut bindings, wake(), wake()).unwrap(), Followed::Holds, "{backend:?}: ping-pong suppressed during cooldown");
         assert_eq!(pending_move(&domain), None, "{backend:?}");
 
         // After > 3s calm availability at the same room, cooldown expires cleanly.
@@ -331,7 +331,7 @@ fn exogenous_shrink_damps_ping_pong_until_cooldown_or_large_release() {
     read_host(&ledger, row as i64, t);
     t += Duration::from_millis(100);
     read_host(&ledger, -((row * 5 / 2) as i64), t);
-    assert_eq!(domain.follow_cache_targets(&mut bindings, wake()).unwrap(), Followed::Shrank(BankStep::Begun(crate::planning::BankTier::Bank)));
+    assert_eq!(domain.follow_cache_targets(&mut bindings, wake(), wake()).unwrap(), Followed::Shrank(BankStep::Begun(crate::planning::BankTier::Bank)));
     while domain.advance_expert_bank(wake()).unwrap().is_none() {}
     t += Duration::from_millis(50);
     read_host(&ledger, (row * 6) as i64, t);
