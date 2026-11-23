@@ -2977,12 +2977,27 @@ fn stable_live_status_and_live_ledger_agree_on_store_demands() {
         cold_reclaimable: 0,
     };
 
+    let expected_metal_capacity =
+        seismic::fixtures::M4_PRO_WORKING_SET - seismic::fixtures::M4_PRO_WORKING_SET / 20;
     let stable = MemoryBudget::stable(&m4_pro, metal, &status).unwrap();
     let live_status = MemoryBudget::live_status(&m4_pro, metal, &status).unwrap();
+    assert_eq!(stable.capacity(), expected_metal_capacity);
     assert_eq!(stable.available(), stable.capacity());
     assert_eq!(live_status.capacity(), stable.capacity());
     assert_eq!(live_status.available(), LIVE_16G);
     assert!(stable.host.is_none() && live_status.host.is_none());
+
+    // When wired figures are present and host supply is abundant, `live_status`
+    // and `live_ledger` agree byte-for-byte on `working_set - wire_count - execution_reserve`.
+    let mut wired_status = status.clone();
+    wired_status.sample.host.supply.free_beyond_target = i64::try_from(44 * GIB).unwrap();
+    wired_status.sample.host.wired = Some(seismic::WiredFigures {
+        limit: seismic::WiredLimit::OsDefault,
+        wire_count: 4 * GIB,
+        at: wired_status.sample.host.at,
+    });
+    let wired_live_status = MemoryBudget::live_status(&m4_pro, metal, &wired_status).unwrap();
+    assert_eq!(wired_live_status.available(), expected_metal_capacity - 4 * GIB);
 
     let scope = Ledgers::new();
     let mut host_sample = status.sample.host.clone();
@@ -2993,7 +3008,7 @@ fn stable_live_status_and_live_ledger_agree_on_store_demands() {
     });
     let sample = Sample::scripted(scope.changes(), host_sample);
     let (ledgers, reading) = DeviceLedgers::unified_in(&scope, Arc::new(LoadShape { stores: Vec::new() }))
-        .read_granted(&sample, DeviceGrant::Wired { working_set: stable.capacity(), left: None });
+        .read_granted(&sample, DeviceGrant::Wired { working_set: seismic::fixtures::M4_PRO_WORKING_SET, left: None });
     let live_ledger = MemoryBudget::live_ledger(&m4_pro, metal, &reading, &ledgers, 0);
     assert_eq!(live_ledger.capacity(), stable.capacity());
     assert_eq!(live_ledger.available(), LIVE_16G);

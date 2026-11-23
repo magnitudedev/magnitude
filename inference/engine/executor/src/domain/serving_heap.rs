@@ -468,28 +468,31 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
         let bank = self.family.expert_bank().expect("invariant violated: a growth of a load without a bank");
         // If the ledger derived this device-tier growth by pricing
         // `CacheKind::GraphSlots` below `CacheKind::Bank`, release `IdleClass`
-        // AND begin `bank.grow` in the same step (the ledger's
-        // `PoolClass::Records` backing reclaims `CacheKind::GraphSlots`
-        // synchronously while the release thread frees the buffers), never
-        // paying the rebuild cost without growing.
-        if self.idle_class.bytes() > 0
-            && !self.resources.releasing_slots()
-            && bank.holding_storage(holding)? == crate::planning::BankTier::Bank
-        {
+        // and wait for its buffers to finish dropping on the release thread
+        // before calling `bank.grow` so Metal never holds both the idle graph
+        // slots and the newly allocated bank blocks simultaneously against
+        // `recommendedMaxWorkingSetSize`.
+        if bank.holding_storage(holding)? == crate::planning::BankTier::Bank {
             let est = self.resources.ledgers().device().estimate();
-            if est.graph_slots_yield_to_bank() {
-                let target_bytes = bank
-                    .targets()?
-                    .into_iter()
-                    .find(|t| t.holding == holding)
-                    .map_or(0, |t| (t.charge)(to).saturating_sub((t.charge)(t.at)));
-                if target_bytes > est.free().saturating_add(est.cache_of(CacheKind::Spare)) {
-                    if let Some(quiet) = self.quiet() {
-                        if self.idle_class.held_places().is_some() {
-                            let changes = self.resources.ledgers().changes().clone();
-                            changes.change(|_| self.family.release_group(quiet).map_err(DomainError::invariant))?;
-                        }
-                        let _ = self.resources.release_idle_slots(self.idle_class.release(), slot_wake);
+            let target_bytes = bank
+                .targets()?
+                .into_iter()
+                .find(|t| t.holding == holding)
+                .map_or(0, |t| (t.charge)(to).saturating_sub((t.charge)(t.at)));
+            if target_bytes > est.free().saturating_add(est.cache_of(CacheKind::Spare)) {
+                if self.resources.releasing_slots() {
+                    return Ok(BankStep::Deferred);
+                }
+                if self.idle_class.bytes() > 0 && est.graph_slots_yield_to_bank() {
+                    let Some(quiet) = self.quiet() else {
+                        return Ok(BankStep::Deferred);
+                    };
+                    if self.idle_class.held_places().is_some() {
+                        let changes = self.resources.ledgers().changes().clone();
+                        changes.change(|_| self.family.release_group(quiet).map_err(DomainError::invariant))?;
+                    }
+                    if self.resources.release_idle_slots(self.idle_class.release(), slot_wake) {
+                        return Ok(BankStep::Deferred);
                     }
                 }
             }
