@@ -510,7 +510,7 @@ projection dense for cuda:
         arithmetic GEMM_SPLIT in [1, 2, 4, 8] default least where (PARTED == 0 and GEMM_SPLIT == 1) or (PARTED == 1 and (GEMM_TILES * 2 * GEMM_SPLIT >= device.units or GEMM_SPLIT * 512 > K or GEMM_SPLIT == 8)) for segmented,
         TPW in [1, 2] default 1 for ordered,
         form STAGING in [0, 1] default 0 for single | segmented, form STAGING in [0] default 0 for paired,
-        arithmetic KSPLIT in [4, 2, 8, 1] default least where (ORDERED_ALL == 1 and KSPLIT == 1) or (ORDERED_ALL == 0 and K / P <= 256 and KSPLIT == 1) or (ORDERED_ALL == 0 and K / P > 256 and KSPLIT != 1 and (P * G * tiles(W, ceil_div(ceil_div(N, 16), 8 / KSPLIT)) >= 3 * device.units or K / P < KSPLIT * 1024 or KSPLIT == (8 - 4 * ORDERED_ANY))))
+        arithmetic KSPLIT in [4, 2, 8, 1] default least where (ORDERED_ALL == 1 and KSPLIT == 1) or (ORDERED_ALL == 0 and K / P <= 256 and KSPLIT == 1) or (ORDERED_ALL == 0 and K / P > 256 and KSPLIT != 1 and (P * G * tiles(W, ceil_div(ceil_div(N, 16), 8 / KSPLIT)) >= 3 * device.units or K / P < KSPLIT * 512 or KSPLIT == (8 - 4 * ORDERED_ANY))))
     where dense_bytes(A) == 2
     where (GEMM_SPLIT == 1 or (PARTED == 1 and K >= GEMM_SPLIT * 256)) for segmented
     where (ORDERED_ANY == 1 or K / P <= 256 or KSPLIT != 1)

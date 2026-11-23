@@ -2663,6 +2663,10 @@ impl<'a, E: Entry> NativeSearch<'a, E> {
         self.inner.terminal()
     }
 
+    pub fn terminal_best(&self) -> Result<TuningResult, TuneError> {
+        self.inner.terminal_best()
+    }
+
     /// The unit's next piece of work with its whole price; none when it
     /// has none left.
     pub fn next(&self) -> Option<Work> {

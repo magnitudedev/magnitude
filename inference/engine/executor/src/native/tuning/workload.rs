@@ -91,9 +91,14 @@ pub(crate) fn concurrency(_limits: TuningLimits) -> Vec<u64> {
     vec![1]
 }
 
-/// A metric's weight in the score: every metric counts alike.
-pub(crate) fn metric_weight(_metric: &Metric) -> f64 {
-    1.
+/// A metric's weight in the score: decode (`M <= VERIFY_ROWS`) outweighs
+/// prefill (`3:1`) so decode-critical units win discovery and search budget
+/// ahead of heavy prefill units.
+pub(crate) fn metric_weight(metric: &Metric) -> f64 {
+    match metric.phase {
+        Phase::Decode => 3.,
+        Phase::Prefill | Phase::Vision => 1.,
+    }
 }
 
 /// The load's metrics: an image's (`images`, a load that prepares a vision
@@ -168,8 +173,9 @@ mod tests {
         image_cells: 0,
     };
 
-    /// Prefill and decode at every context point to the limit; a drafted
-    /// decode metric divides its weight among the prepared widths.
+    /// Prefill and decode at every context point to the limit, with decode
+    /// weighted 3x prefill; a drafted decode metric divides its weight among
+    /// the prepared widths.
     #[test]
     fn every_metric_counts_alike_and_widths_share_theirs() {
         assert_eq!(contexts(LIMITS), [4096, 64256]);
@@ -180,11 +186,19 @@ mod tests {
         assert_eq!(contexts(short), [2048]);
         let plain = terms(LIMITS, &[], false);
         assert_eq!(plain.len(), 4);
-        assert!(
-            plain
-                .iter()
-                .all(|term| (term.weight - 1. / 4.).abs() < 1e-12)
-        );
+        assert!((plain.iter().map(|term| term.weight).sum::<f64>() - 1.).abs() < 1e-12);
+        let prefill_total: f64 = plain
+            .iter()
+            .filter(|term| term.metric.phase == Phase::Prefill)
+            .map(|term| term.weight)
+            .sum();
+        let decode_total: f64 = plain
+            .iter()
+            .filter(|term| term.metric.phase == Phase::Decode)
+            .map(|term| term.weight)
+            .sum();
+        assert!((prefill_total - 0.25).abs() < 1e-12);
+        assert!((decode_total - 0.75).abs() < 1e-12);
         let drafted = terms(LIMITS, &[1, 2, 3], false);
         assert_eq!(drafted.len(), 2 + 2 * 3);
         assert!((drafted.iter().map(|term| term.weight).sum::<f64>() - 1.).abs() < 1e-12);
@@ -193,11 +207,11 @@ mod tests {
             .filter(|term| term.metric.phase == Phase::Decode && term.metric.context == 64256)
             .map(|term| term.weight)
             .sum::<f64>();
-        assert!((decode_64k - 1. / 4.).abs() < 1e-12);
+        assert!((decode_64k - 3. / 8.).abs() < 1e-12);
     }
 
     /// A load that encodes images holds one more metric, an image of its
-    /// largest class, weighing as a text metric does, after the text terms,
+    /// largest class, weighing as a prefill metric does, after the text terms,
     /// which it leaves exactly as a load without images has them.
     #[test]
     fn an_image_is_a_metric_beside_the_text_metrics() {
@@ -213,6 +227,6 @@ mod tests {
         };
         assert_eq!(vision.metric.phase, Phase::Vision);
         assert_eq!(vision.metric.context, 256);
-        assert!((vision.weight - 1. / 4.).abs() < 1e-12);
+        assert!((vision.weight - 1. / 8.).abs() < 1e-12);
     }
 }

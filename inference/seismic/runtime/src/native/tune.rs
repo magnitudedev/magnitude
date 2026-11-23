@@ -3016,6 +3016,47 @@ impl Ledger {
         self.contender(&self.incumbent)
     }
 
+    /// Best already-measured, numerically-validated contender when optional
+    /// work stops early (e.g. budget expiry): prefers the top statistically
+    /// leading challenger (`resolved`) whose validation evidence is complete,
+    /// else the top nominally faster validated challenger (`nominal`) when
+    /// still on `default_artifact`, else the current `incumbent`.
+    fn best_for_expiry(
+        &self,
+        default_artifact: &str,
+        is_validated: impl Fn(&Contender) -> bool,
+    ) -> &Contender {
+        self.resolved
+            .iter()
+            .map(|(_, configuration)| self.contender(configuration))
+            .find(|contender| is_validated(contender))
+            .or_else(|| {
+                (self.incumbent().artifact == default_artifact)
+                    .then(|| {
+                        self.nominal
+                            .iter()
+                            .map(|(_, configuration)| self.contender(configuration))
+                            .find(|contender| is_validated(contender))
+                    })
+                    .flatten()
+            })
+            .unwrap_or_else(|| {
+                let incumbent = self.incumbent();
+                if is_validated(incumbent) {
+                    incumbent
+                } else {
+                    self.order
+                        .iter()
+                        .filter_map(|cfg| match &self.entries[cfg].outcome {
+                            EntryOutcome::Contender(c) if c.artifact == default_artifact => Some(c),
+                            _ => None,
+                        })
+                        .next()
+                        .unwrap_or(incumbent)
+                }
+            })
+    }
+
     fn kernel(&self, configuration: &Configuration) -> Option<&Arc<NativePrepared>> {
         self.kernels.get(configuration)
     }
@@ -5063,6 +5104,18 @@ impl<'m, 'a> UnitSearch<'m, 'a> {
     /// configuration reached with its measurements, and the evidence. Legal
     /// at every instant from [`UnitSearch::prepare_defaults`] on.
     pub fn terminal(&self) -> Result<TuningResult, TuneError> {
+        self.terminal_with(false)
+    }
+
+    /// Final record when optional work has stopped (including budget expiry):
+    /// promotes the best already-measured, numerically-validated faster
+    /// contender (`ledger.resolved`, or `ledger.nominal` when still on
+    /// canonical defaults) so expiry never discards a validated speedup.
+    pub fn terminal_best(&self) -> Result<TuningResult, TuneError> {
+        self.terminal_with(true)
+    }
+
+    fn terminal_with(&self, promote_best: bool) -> Result<TuningResult, TuneError> {
         let Progress::Grounded { ground, phase, .. } = &self.progress else {
             return Err(TuneError::Declaration(
                 "canonical defaults were not prepared before their record".into(),
@@ -5093,7 +5146,23 @@ impl<'m, 'a> UnitSearch<'m, 'a> {
             .map(|point| point.validation_seconds())
             .sum::<f64>();
         let ledger = &searching.ledger;
-        let incumbent = ledger.incumbent();
+        let default = &ground.kernel.artifact().0;
+        let incumbent = if promote_best {
+            ledger.best_for_expiry(default, |contender| {
+                ground.validator.validated_at(
+                    &contender.artifact,
+                    contender.specialization == self.reference,
+                    self.points.iter().map(|point| point.spec.label.as_str()),
+                )
+            })
+        } else {
+            ledger.incumbent()
+        };
+        let mut served = ledger.served.clone();
+        let chosen_cfg = Configuration::of(&incumbent.specialization);
+        if !served.contains(&chosen_cfg) {
+            served.push(chosen_cfg);
+        }
         let search = &searching.run.search;
         let method = TuningMethod::Search {
             groups: search.partition.groups.len(),
@@ -5109,7 +5178,7 @@ impl<'m, 'a> UnitSearch<'m, 'a> {
             Records {
                 points: point_records(&self.points),
                 records: ledger.records(&ground.validator),
-                served: ledger.served.clone(),
+                served,
                 observations: ground.validator.observations(),
             },
             &incumbent.specialization,
@@ -5118,7 +5187,6 @@ impl<'m, 'a> UnitSearch<'m, 'a> {
             ground.kernel.launch_programs(),
         );
         // The native default (or reference fallback) qualifies nothing.
-        let default = &ground.kernel.artifact().0;
         let promoted = incumbent.artifact != *default;
         if !promoted {
             result.disposition = fallback_disposition(self.fell_back_to_reference, default.clone());
@@ -11884,6 +11952,116 @@ mod session_golden {
         assert_eq!(
             rounds.pairings[0].evidence.verdict(0.05),
             Some(Verdict::Leads)
+        );
+    }
+
+    #[test]
+    fn best_for_expiry_promotes_faster_validated_contender_over_default() {
+        let default_spec = NativeSpecialization::new().with_param("KSPLIT", 2);
+        let nominal_spec = NativeSpecialization::new().with_param("KSPLIT", 4);
+        let resolved_spec = NativeSpecialization::new().with_param("KSPLIT", 8);
+        let default_cfg = Configuration::of(&default_spec);
+        let nominal_cfg = Configuration::of(&nominal_spec);
+        let resolved_cfg = Configuration::of(&resolved_spec);
+        let settings = SearchSettings { error_rate: 0.05 };
+        let cost = |ksplit: u64, value: f64| {
+            Cost::new(vec![(
+                LaunchKey {
+                    launches: vec![0],
+                    values: BTreeMap::from([("KSPLIT".to_owned(), ksplit)]),
+                },
+                value,
+            )])
+        };
+        let mut ledger = Ledger {
+            settings: settings.clone(),
+            kernels: BTreeMap::new(),
+            order: vec![default_cfg.clone()],
+            entries: BTreeMap::from([(
+                default_cfg.clone(),
+                Entry {
+                    formation: None,
+                    outcome: EntryOutcome::Contender(Contender {
+                        specialization: default_spec.clone(),
+                        artifact: "default_art".into(),
+                        launches: Vec::new(),
+                        points: Vec::new(),
+                        confirmed: Vec::new(),
+                        cost: cost(2, 1.0),
+                        standing: ContenderStanding::Served,
+                    }),
+                },
+            )]),
+            resolved: BTreeSet::new(),
+            nominal: BTreeSet::new(),
+            served: vec![default_cfg.clone()],
+            incumbent: default_cfg.clone(),
+            failed: 0,
+        };
+        // With only default in ledger, best_for_expiry stays on default.
+        assert_eq!(
+            ledger.best_for_expiry("default_art", |_| true).artifact,
+            "default_art"
+        );
+
+        // Record a validated contender that nominally beats default (no Verdict::Leads yet).
+        ledger.record(
+            nominal_spec,
+            None,
+            "nominal_art".into(),
+            None,
+            Vec::new(),
+            cost(4, 0.75),
+            Tally::default(),
+        );
+        assert_eq!(ledger.incumbent().artifact, "default_art");
+        assert_eq!(
+            ledger.best_for_expiry("default_art", |_| true).artifact,
+            "nominal_art",
+            "expiry must promote a faster validated nominal contender over default"
+        );
+        assert!(ledger.nominal.iter().any(|(_, c)| *c == nominal_cfg));
+
+        // Record a validated contender with a resolved statistical lead (Verdict::Leads).
+        let mut leads = Tally::default();
+        for _ in 0..leads.fewest(settings.error_rate) {
+            leads.observe(-0.4);
+        }
+        assert_eq!(leads.verdict(settings.error_rate), Some(Verdict::Leads));
+        ledger.record(
+            resolved_spec,
+            None,
+            "resolved_art".into(),
+            None,
+            Vec::new(),
+            cost(8, 0.60),
+            leads,
+        );
+        assert!(ledger.resolved.iter().any(|(_, c)| *c == resolved_cfg));
+        assert_eq!(
+            ledger.best_for_expiry("default_art", |_| true).artifact,
+            "resolved_art",
+            "expiry must prefer the top statistically resolved leader over nominal"
+        );
+        assert_eq!(
+            ledger
+                .best_for_expiry("default_art", |c| c.artifact != "resolved_art")
+                .artifact,
+            "nominal_art",
+            "expiry must skip an incompletely validated leader and promote the next validated contender"
+        );
+        assert_eq!(
+            ledger.best_for_expiry("default_art", |_| false).artifact,
+            "default_art",
+            "expiry must fall back to incumbent when no challenger has complete validation evidence"
+        );
+        // Even if incumbent itself is a non-default contender that fails validation,
+        // best_for_expiry must fall back to default_artifact rather than returning it.
+        ledger.incumbent = resolved_cfg.clone();
+        assert_eq!(
+            ledger.best_for_expiry("default_art", |_| false).artifact,
+            "default_art",
+            "expiry must fall back to default_artifact when a non-default incumbent fails validation"
         );
     }
 }

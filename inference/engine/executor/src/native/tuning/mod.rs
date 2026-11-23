@@ -993,6 +993,9 @@ pub(crate) trait EntrySearch<E: seismic::Entry> {
     fn plan(&mut self, plan: seismic::UnitPlan);
     /// The unit's complete record as it stands.
     fn terminal(&self) -> Result<TuningResult, TuneError>;
+    fn terminal_best(&self) -> Result<TuningResult, TuneError> {
+        self.terminal()
+    }
     /// The next piece of optional work, priced in full; none when the unit
     /// has none left.
     fn next(&self) -> Option<seismic::Work>;
@@ -1055,6 +1058,9 @@ impl<E: seismic::Entry> EntrySearch<E> for seismic::NativeSearch<'static, E> {
     }
     fn terminal(&self) -> Result<TuningResult, TuneError> {
         seismic::NativeSearch::terminal(self)
+    }
+    fn terminal_best(&self) -> Result<TuningResult, TuneError> {
+        seismic::NativeSearch::terminal_best(self)
     }
     fn next(&self) -> Option<seismic::Work> {
         seismic::NativeSearch::next(self)
@@ -3414,7 +3420,7 @@ impl<'a, T: EntryTuning> SearchedUnit<'a> for CaseUnit<'a, T> {
         let began_seconds = tuner.started.elapsed().as_secs_f64();
         let owed = self.owed(false);
         let result = tuner
-            .publish(&self.key, true, || self.search.terminal())
+            .publish(&self.key, true, || self.search.terminal_best())
             .map_err(|error| unit_failure(&self.key, error))?;
         self.unpublished = false;
         self.settled = Some(result);
@@ -3599,7 +3605,7 @@ impl<'a, T: EntryTuning> SearchedUnit<'a> for CaseUnit<'a, T> {
             Some(result) => result,
             None => self
                 .search
-                .terminal()
+                .terminal_best()
                 .map_err(|error| unit_failure(&self.key, error))?,
         };
         let mut tuned = searched_entry(self.key.0, self.key.1.clone(), result, tuner.budget(), Instant::now());
@@ -4507,7 +4513,10 @@ impl<'a> Tuner<'a> {
                 .objective
                 .terms
                 .iter()
-                .map(|term| term.weight)
+                .map(|term| match term.metric.phase {
+                    workload::Phase::Decode => term.weight * 8.0,
+                    workload::Phase::Prefill | workload::Phase::Vision => term.weight,
+                })
                 .collect::<Vec<_>>();
             let priors = shares(&launch_counts, &term_weights);
             if priors.iter().any(|&weight| weight > 0.) {

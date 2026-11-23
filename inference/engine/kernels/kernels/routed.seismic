@@ -473,7 +473,7 @@ projection routed for cuda:
     let ROW_TILES = STACKED * ceil_div(T, TILE) + (1 - STACKED) * ceil_div(M, TILE) for grouped
     let TILE_BLOCKS = STACKED * B + (1 - STACKED) for grouped
     let PRODUCT_ROWS = STACKED * B * T + (1 - STACKED) * M for grouped
-    params (TPW in [1, 2] default 1 for choice | summed, arithmetic KSPLIT in [1, 2, 4] default least where (KSPLIT == 1 and most(W, WIDTH) / (64 * 2) < 8) or (KSPLIT == 2 and (most(W, WIDTH) / (64 * 4) < 8 or ceil_div(ceil_div(most(W, N), 16), 4 / 2) * (K + SHARED) >= device.units)) or KSPLIT == 4 for choice | summed,
+    params (TPW in [1, 2] default 1 for choice | summed, arithmetic KSPLIT in [1, 2, 4] default least where (KSPLIT == 1 and most(W, WIDTH) / (64 * 2) < 8) or (KSPLIT == 2 and (most(W, WIDTH) / (64 * 4) < 8 or ceil_div(ceil_div(most(W, N), 16), 4 / 2) * (K + SHARED) >= 2 * device.units)) or KSPLIT == 4 for choice | summed,
         form GATHERED in [0, 1] default 1 for choice,
         arithmetic INT8 in [0, 1] default greatest where INT8 == 0 or (STACKED == 1 and each(W, form(W, INT8) == 1)) reference 0 for grouped,
         arithmetic OPERAND in [0, 1] default 0 for grouped,

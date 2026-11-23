@@ -517,6 +517,39 @@ impl Validator {
         })
     }
 
+    /// Whether `artifact` satisfies the exact `ChosenEvidence::qualified_at`
+    /// contract: zero rejected observations against `self.shared.requirement`,
+    /// and (unless `is_reference`) an admitted observation at every point label
+    /// in `required_points`.
+    pub(super) fn validated_at<'a>(
+        &self,
+        artifact: &str,
+        is_reference: bool,
+        mut required_points: impl Iterator<Item = &'a str>,
+    ) -> bool {
+        let evidence = self.shared.evidence.borrow();
+        let indices = evidence.by_artifact.get(artifact);
+        if let Some(indices) = indices {
+            if !indices
+                .iter()
+                .all(|&idx| admit(&evidence.observations[idx], &self.shared.requirement).is_ok())
+            {
+                return false;
+            }
+        }
+        if is_reference {
+            return true;
+        }
+        let Some(indices) = indices else {
+            return required_points.next().is_none();
+        };
+        required_points.all(|label| {
+            indices
+                .iter()
+                .any(|&idx| evidence.observations[idx].point == label)
+        })
+    }
+
     /// `point` ready for observation; the default executes there on first
     /// use.
     pub(super) fn point<'a>(

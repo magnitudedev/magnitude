@@ -4911,4 +4911,51 @@ mod tests {
             }
         }
     }
+
+    /// Decode units (weighted 8x higher in discovery and 3x higher in objective
+    /// share) complete discovery and enter Stage::Measure ahead of heavy
+    /// prefill units even when discovery_cutoff departs slow undiscovered units.
+    #[test]
+    fn decode_units_schedule_ahead_of_heavy_prefill_units() {
+        let clock = Fake::default();
+        let mut units = [
+            // Unit 0: heavy prefill unit (lower discovery_weight, lower share).
+            Synthetic {
+                discovery_weight: 1.,
+                points: 3,
+                ..Synthetic::new(0, &clock, 0.25, &[0.8])
+            },
+            // Units 1, 2: decode-hot units (8x discovery priority, 3x objective share).
+            Synthetic {
+                discovery_weight: 24.,
+                points: 2,
+                ..Synthetic::new(1, &clock, 0.375, &[0.8])
+            },
+            Synthetic {
+                discovery_weight: 24.,
+                points: 2,
+                ..Synthetic::new(2, &clock, 0.375, &[0.8])
+            },
+        ];
+        let (log, _) = run(&mut units, &clock, 30);
+        let stage_log = stages(&log);
+        let first_four_discoveries: Vec<usize> = stage_log
+            .iter()
+            .filter(|(_, stage)| *stage == Stage::Discovery)
+            .take(4)
+            .map(|(unit, _)| *unit)
+            .collect();
+        assert!(
+            first_four_discoveries.iter().all(|&u| u == 1 || u == 2),
+            "decode units (1, 2) must complete discovery before heavy prefill unit (0): {stage_log:?}"
+        );
+        let first_measure = stage_log
+            .iter()
+            .find(|(_, stage)| *stage == Stage::Measure)
+            .map(|(unit, _)| *unit);
+        assert!(
+            matches!(first_measure, Some(1 | 2)),
+            "a decode unit must enter Stage::Measure before heavy prefill: {stage_log:?}"
+        );
+    }
 }
