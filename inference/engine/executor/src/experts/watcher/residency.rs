@@ -30,7 +30,7 @@ use super::prefetch::Prefetch;
 use super::resize::{Asked, Owed};
 use super::scratch::Scratch;
 use super::{Shared, Step};
-use magnitude_cost_model::{DomainBudget, ExpertLines, SiteLines};
+use magnitude_cost_model::{ExpertLines, SiteLines};
 use crate::experts::directory::{MissCurve, Point};
 use crate::experts::interest::{Launched, Ledger, Told};
 use crate::experts::yielding::Yielding;
@@ -471,10 +471,10 @@ impl Residency {
 
     /// The words a run's encoding reads, only while no step runs; the
     /// lines at every turn; and the turn's change announced.
-    fn publish_turn(&mut self, turn: &mut Turn, copier: Option<&Copier>, _: Option<&MissCurve>) -> bool {
+    fn publish_turn(&mut self, turn: &mut Turn, _: Option<&Copier>, _: Option<&MissCurve>) -> bool {
         self.publish_policy();
         self.shared.write_staged();
-        self.publish_lines(copier);
+        self.publish_lines();
         if turn.changed {
             self.shared.events().notify();
         }
@@ -903,12 +903,10 @@ impl Residency {
     /// that has not routed the layer yet may, as a mapping may take effect
     /// from such a step: word by word, some of a layer's words old and
     /// some new. A decode that never idles is repriced so.
-    pub(super) fn publish_lines(&mut self, copier: Option<&Copier>) {
-        let refined = self.shared.priced().map(|lines| self.shared.telemetry.refined_for_policy(&lines));
-        let priced = refined.as_ref().map(|(lines, _)| lines);
-        let site_observed = refined.as_ref().map(|(_, observed)| observed.as_slice());
+    pub(super) fn publish_lines(&mut self) {
+        let priced = self.shared.priced().map(|lines| self.shared.telemetry.refined(&lines));
         let copy = self.shared.copy.lock().expect("a copy's price").clone();
-        if let (Some(lines), Some(copy)) = (priced, &copy) {
+        if let (Some(lines), Some(copy)) = (&priced, &copy) {
             let beside = self.shared.telemetry.beside();
             let terms = self.shared.telemetry.terms();
             for (layer, lines) in lines.iter().enumerate() {
@@ -920,34 +918,12 @@ impl Residency {
                 self.core.directory.price_write_backs(layer, price);
             }
         }
-        // Per-layer pricing of host-tier misses and shared Host DDR5 bandwidth
-        // (`DomainBudget`). When `ExpertTransport`'s adaptive `DecodeDmaGate`
-        // keeps a layer on split `DecodeFront -> DMA -> DecodeBack`, we:
-        // 1. Price `POLICY_LINK_NS` at `min(zero_copy, dma_transfer + resident)`
-        //    so `streaming_assign` sees true hardware DMA speed.
-        // 2. Price `POLICY_CPU_NS` via `DomainBudget::concurrent_cpu_scale`
-        //    only on the unrefined solo baseline (`!site_observed`); once
-        //    `costs.site(layer)` has observed live concurrent CPU site requests,
-        //    those measurements already include real DDR5 contention beside DMA
-        //    and are passed directly without double-scaling.
-        // When `DecodeDmaGate` gates a layer onto pipelined `RunStage::Whole`,
-        // we neither override `POLICY_LINK_NS` with DMA nor charge `b_dma` for
-        // that layer, so its rare misses compare uncontested CPU vs SM zero-copy.
-        let background_dma = copier.is_some_and(|copier| !copier.copies.idle())
-            || self.core.directory.staging_in_flight();
-        let landing_active = self.core.extents.placer == crate::planning::Placer::Tier && self.prefetch.landing_active();
-        let link_bps = copy.as_ref().map_or(0.0, |c| {
-            let spb = c.transfer.seconds_per_byte();
-            if spb > 0.0 { 1.0 / spb } else { 0.0 }
-        });
-        let b_landing = if landing_active {
-            self.shared.telemetry.drive_line().map_or(0.0, |d| {
-                let spb = d.seconds_per_byte();
-                if spb > 0.0 { 1.0 / spb } else { 0.0 }
-            })
-        } else {
-            0.0
-        };
+        // A layer whose misses the transport lands by DMA beside the step
+        // (`DecodeFront -> DMA -> DecodeBack`) reads them from the bank, so
+        // its link line is the copy's ([`decode_dma_lines`]). The CPU's line
+        // is the site's own: as its requests took on this load once it
+        // served one (`Telemetry::refined`), the job's before; the
+        // assignment weighs it against the GPU's at those prices alone.
         let all_groups_whole = self.core.directory.all_groups_whole();
         let mut initial_log = None;
         let words = self
@@ -956,75 +932,25 @@ impl Residency {
             .iter()
             .enumerate()
             .map(|(index, layer)| {
-                let layer_decode_dma = !all_groups_whole
-                    && self.shared.transport.is_splitting_decode(index);
-                let b_dma = if layer_decode_dma || background_dma {
-                    link_bps
-                } else {
-                    0.0
-                };
-                let observed = site_observed.is_some_and(|flags| flags.get(index).copied().unwrap_or(false));
-                let (adjusted, cpu) = price_layer_lines(
-                    priced.map(|lines| lines[index]),
-                    observed,
-                    copy.as_ref(),
-                    layer_decode_dma,
-                    b_dma,
-                    b_landing,
-                );
-                let cpu_measured = adjusted.as_ref().is_some_and(|l| l.host.cpu.is_some());
-                let suppressed_cpu;
-                let site = match (&layer.site, &cpu) {
+                let layer_decode_dma = !all_groups_whole && self.shared.transport.is_splitting_decode(index);
+                let adjusted = priced.as_ref().map(|lines| decode_dma_lines(lines[index], copy.as_ref(), layer_decode_dma));
+                let site = match (&layer.site, adjusted.as_ref().and_then(|lines| lines.host.cpu.as_ref())) {
                     (None, _) => SiteLines::Unsited,
-                    (Some(_), None) if cpu_measured => {
-                        let prohibitive = magnitude_cost_model::Nanoseconds::try_from(100_000_000u32)
-                            .expect("100 ms fits Nanoseconds");
-                        suppressed_cpu = magnitude_cost_model::CpuLines {
-                            expert: magnitude_cost_model::RowLine {
-                                one: prohibitive,
-                                row: magnitude_cost_model::RowCost::Measured(prohibitive),
-                            },
-                            handshake: prohibitive,
-                        };
-                        SiteLines::Measured(&suppressed_cpu)
-                    }
                     (Some(_), None) => SiteLines::Pending,
                     (Some(_), Some(cpu)) => SiteLines::Measured(cpu),
                 };
                 let policy_words = ExpertLines::policy(&crate::assessment::POLICY_LAYOUT, site, adjusted.as_ref());
-                if index == 0 && !self.logged_initial_lines {
-                    if let Some(layer_lines) = adjusted.as_ref() {
-                        let b_mem = layer_lines
-                            .host
-                            .memory
-                            .filter(|m| m.get() > 0.0)
-                            .map_or(0.0, |m| layer_lines.host.record_bytes as f64 / (m.get() * 1e-9));
-                        let link_ns = policy_words
-                            .iter()
-                            .find_map(|&(w, v)| (w == crate::assessment::POLICY_LAYOUT.link).then_some(v))
-                            .unwrap_or(0);
-                        let cpu_ns = policy_words
-                            .iter()
-                            .find_map(|&(w, v)| (w == crate::assessment::POLICY_LAYOUT.cpu).then_some(v))
-                            .unwrap_or(0);
-                        initial_log = Some((b_mem, b_dma, b_landing, layer_decode_dma, observed, link_ns, cpu_ns));
-                    }
+                if index == 0 && !self.logged_initial_lines && adjusted.is_some() {
+                    let word = |of: usize| policy_words.iter().find_map(|&(word, value)| (word == of).then_some(value));
+                    let layout = &crate::assessment::POLICY_LAYOUT;
+                    initial_log = Some((layer_decode_dma, word(layout.link), word(layout.cpu)));
                 }
                 policy_words
             })
             .collect::<Vec<_>>();
-        if let Some((b_mem, b_dma, b_landing, split_dma, observed, link_ns, cpu_ns)) = initial_log {
+        if let Some((split_dma, link_ns, cpu_ns)) = initial_log {
             self.logged_initial_lines = true;
-            tracing::info!(
-                "expert pricing (layer 0): b_mem={:.2} GB/s b_dma={:.2} GB/s b_landing={:.2} GB/s split_dma={} site_observed={} POLICY_LINK_NS={} POLICY_CPU_NS={}",
-                b_mem / 1e9,
-                b_dma / 1e9,
-                b_landing / 1e9,
-                split_dma,
-                observed,
-                link_ns,
-                cpu_ns,
-            );
+            tracing::info!("expert pricing (layer 0): split_dma={split_dma} POLICY_LINK_NS={link_ns:?} POLICY_CPU_NS={cpu_ns:?}");
         }
         if self.lines.as_ref() == Some(&words) {
             return;
@@ -1106,70 +1032,28 @@ fn classify_link_stage_hit(chosen: &mut crate::experts::interest::Chosen, link_l
     staged_hit
 }
 
-/// Price one layer's GPU link line and CPU site line given whether M7 split
-/// decode DMA is active on this layer (`layer_decode_dma`), whether `host.cpu`
-/// already reflects live runtime-observed concurrent site requests
-/// (`site_observed`), and the live shared-domain bandwidths (`b_dma`,
-/// `b_landing`).
-fn price_layer_lines(
-    priced: Option<ExpertLines>,
-    site_observed: bool,
-    copy: Option<&crate::assessment::TierCopyCosts>,
-    layer_decode_dma: bool,
-    b_dma: f64,
-    b_landing: f64,
-) -> (Option<ExpertLines>, Option<magnitude_cost_model::CpuLines>) {
-    let adjusted = priced.map(|mut layer_lines| {
-        if layer_decode_dma {
-            if let Some(copy) = copy {
-                let dma_ns = copy.transfer.transfer_seconds(layer_lines.host.record_bytes as f64) * 1e9;
-                let landed_ns = dma_ns + layer_lines.gpu.resident.weights.get() as f64;
-                if landed_ns.is_finite()
-                    && landed_ns > 0.0
-                    && landed_ns < layer_lines.gpu.link.weights.get() as f64
-                {
-                    if let Ok(ns) = magnitude_cost_model::Nanoseconds::try_from(landed_ns.round() as u32) {
-                        layer_lines.gpu.link.weights = ns;
-                    }
-                }
-            }
+/// Layer `lines` as the assignment prices them where the transport lands
+/// the layer's misses by DMA beside the step (`layer_decode_dma`): a miss
+/// is then read from the bank once its copy lands, so its link line is the
+/// copy's transfer plus a resident read, where that is the cheaper; else
+/// `lines` as they are.
+fn decode_dma_lines(mut lines: ExpertLines, copy: Option<&crate::assessment::TierCopyCosts>, layer_decode_dma: bool) -> ExpertLines {
+    let Some(copy) = copy.filter(|_| layer_decode_dma) else {
+        return lines;
+    };
+    let dma_ns = copy.transfer.transfer_seconds(lines.host.record_bytes as f64) * 1e9;
+    let landed_ns = dma_ns + lines.gpu.resident.weights.get() as f64;
+    if landed_ns.is_finite() && landed_ns > 0.0 && landed_ns < lines.gpu.link.weights.get() as f64 {
+        if let Ok(ns) = magnitude_cost_model::Nanoseconds::try_from(landed_ns.round() as u32) {
+            lines.gpu.link.weights = ns;
         }
-        layer_lines
-    });
-    let cpu = adjusted.as_ref().and_then(|layer_lines| {
-        layer_lines.host.cpu.and_then(|cpu| {
-            let b_mem = layer_lines
-                .host
-                .memory
-                .filter(|m| m.get() > 0.0)
-                .map_or(0.0, |m| layer_lines.host.record_bytes as f64 / (m.get() * 1e-9));
-            // On PCIe Gen5 where DMA dominates host memory bandwidth
-            // (`b_dma > 0.7 * b_mem`) or on small experts (`<= 2 MiB`, where
-            // Gen5 DMA is ~32 us vs ~730 us GPU-blocking `ROUTED_SITE_AWAIT`),
-            // let `DecodeDma` handle misses without stalling the GPU stream.
-            if layer_decode_dma
-                && ((b_mem > 0.0 && b_dma > 0.7 * b_mem)
-                    || (layer_lines.host.record_bytes <= 2 * 1024 * 1024 && b_dma >= 30e9))
-            {
-                return None;
-            }
-            if site_observed {
-                // Already reflects live concurrent DDR5 contention beside DMA;
-                // never apply `DomainBudget` a second time.
-                return Some(cpu);
-            }
-            Some(cpu.with_domain_budget(
-                DomainBudget::new(b_dma, b_landing, b_mem),
-                layer_lines.host.record_bytes,
-            ))
-        })
-    });
-    (adjusted, cpu)
+    }
+    lines
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{classify_link_stage_hit, price_layer_lines};
+    use super::{classify_link_stage_hit, decode_dma_lines};
     use crate::experts::horizon::Time;
     use crate::experts::interest::{Chosen, Ledger, Stands};
     use std::time::Instant;
@@ -1225,114 +1109,37 @@ mod tests {
         assert!(!ledger.has_link_landed(5, 0, 4));
     }
 
-    /// Verify per-layer `DecodeDmaGate` pricing + additive `DomainBudget`:
-    /// 1. When `layer_decode_dma == true` (split M7 DMA on PCIe Gen5 48 GB/s +
-    ///    DDR5 75 GB/s, solo CPU 40 GB/s), `POLICY_LINK_NS` is priced at
-    ///    `dma_ns + resident_ns` and `POLICY_CPU_NS` uses the additive
-    ///    concurrent DDR5 rate (`b_cpu_eff = 27 GB/s` + 12% margin), so
-    ///    `streaming_assign` routes a non-zero fraction of misses to CPU
-    ///    concurrently with DMA (instead of 0 misses under the old `1/(1-share)`
-    ///    penalty).
-    /// 2. When `layer_decode_dma == false` (`DecodeDmaGate` gated onto
-    ///    `RunStage::Whole`), `POLICY_LINK_NS` stays at SM zero-copy (~11 GB/s)
-    ///    and `POLICY_CPU_NS` stays at uncontested solo CPU (40 GB/s), routing
-    ///    misses to overlapped CPU compute.
+    /// A layer whose misses land by DMA reads them from the bank: its link
+    /// line is the copy's transfer plus a resident read (a 3 MB expert at
+    /// 48 GB/s, 62.5 µs, beside 15 µs resident), where that undercuts the
+    /// read in place (270 µs); a layer that reads in place, or whose read
+    /// in place is the cheaper, keeps its lines, and the CPU's line is
+    /// never touched.
     #[test]
-    fn price_layer_lines_splits_concurrently_on_dma_and_stays_uncontested_on_whole() {
-        use magnitude_cost_model::{
-            CpuLines, ExpertLines, GpuLines, HostLines, Moves, Nanoseconds, PassLine, ReadLine, RowCost, RowLine,
-        };
-        let record_bytes: u64 = 3_000_000; // 3 MB expert
+    fn a_dma_landed_layer_is_priced_at_its_copy() {
+        use magnitude_cost_model::{CpuLines, ExpertLines, GpuLines, HostLines, Moves, Nanoseconds, PassLine, ReadLine, RowCost, RowLine};
         let ns = |v: u32| Nanoseconds::try_from(v).unwrap();
-        let zero_copy_ns: u32 = 270_000; // ~11.1 GB/s SM zero-copy
-        let resident_ns: u32 = 15_000; // resident VRAM compute
-        let solo_cpu_ns: u32 = 75_000; // 40 GB/s solo CPU
-        let mem_ns: u32 = 40_000; // 75 GB/s DDR5
-        let base = ExpertLines {
+        let lines = ExpertLines {
             gpu: GpuLines {
-                link: PassLine { weights: ns(zero_copy_ns), row: ns(1_000) },
-                resident: PassLine { weights: ns(resident_ns), row: ns(1_000) },
+                link: PassLine { weights: ns(270_000), row: ns(1_000) },
+                resident: PassLine { weights: ns(15_000), row: ns(1_000) },
                 moves: Moves::NONE,
             },
             host: HostLines {
-                cpu: Some(CpuLines {
-                    expert: RowLine { one: ns(solo_cpu_ns), row: RowCost::Measured(ns(1_000)) },
-                    handshake: ns(4_000),
-                }),
-                memory: Some(ns(mem_ns)),
+                cpu: Some(CpuLines { expert: RowLine { one: ns(75_000), row: RowCost::Measured(ns(1_000)) }, handshake: ns(4_000) }),
+                memory: Some(ns(40_000)),
                 landing: None,
-                record_bytes,
+                record_bytes: 3_000_000,
             },
         };
-        let dma_line = ReadLine::new(0.0, 1.0 / 48e9).unwrap(); // 48 GB/s PCIe Gen5
-        let copy = crate::assessment::TierCopyCosts {
-            blocks: 0,
-            whole_seconds: 0.0,
-            stall_share: 0.0,
-            transfer: dma_line,
-            back: dma_line,
-        };
-
-        // Case 1: Split M7 DMA active on unrefined solo baseline (`site_observed == false`)
-        // -> concurrent CPU + DMA pricing via `DomainBudget`.
-        let (adj_dma, cpu_dma) = price_layer_lines(Some(base), false, Some(&copy), true, 48e9, 0.0);
-        let link_dma_ns = adj_dma.unwrap().gpu.link.weights.get() as u64;
-        let cpu_dma_ns = cpu_dma.unwrap().expert.one.get() as u64;
-        // dma_ns = 3MB / 48GB/s = 62_500 ns; + 15_000 resident = 77_500 ns.
-        assert_eq!(link_dma_ns, 77_500);
-        // Additive concurrent DDR5: b_cpu_eff = 75 - 48 = 27 GB/s -> 75_000 * (40/27) * 1.12 = 124_444 ns.
-        assert_eq!(cpu_dma_ns, 124_444);
-
-        // Simulate `streaming_assign` (resolve.hpp:264-282) for 8 1-row misses + 2 hits:
-        let simulate_assign = |link_ns: u64, cpu_ns: u64, misses: usize, hits: usize| -> (usize, usize) {
-            let mut gpu = (hits as u64) * (resident_ns as u64);
-            let mut cpu = 0u64;
-            let mut served = false;
-            let (mut to_gpu, mut to_cpu) = (0, 0);
-            for _ in 0..misses {
-                let on_cpu = cpu + cpu_ns + if served { 0 } else { 4_000 };
-                let in_place = gpu + link_ns;
-                if on_cpu <= in_place {
-                    cpu = on_cpu;
-                    served = true;
-                    to_cpu += 1;
-                } else {
-                    gpu = in_place;
-                    to_gpu += 1;
-                }
-            }
-            (to_gpu, to_cpu)
-        };
-        let (gpu_dma, cpu_split) = simulate_assign(link_dma_ns, cpu_dma_ns, 8, 2);
-        assert!(
-            cpu_split >= 2 && gpu_dma >= 4,
-            "expected additive concurrent CPU+DMA split on Gen5, got gpu={gpu_dma}, cpu={cpu_split}"
-        );
-
-        // Case 2: Live runtime-observed concurrent CPU time (`site_observed == true`,
-        // from `costs.site(layer)`) already reflects real DDR5 contention beside DMA
-        // and MUST NOT be double-scaled by `DomainBudget`.
-        let mut observed_base = base;
-        observed_base.host.cpu.as_mut().unwrap().expert.one = ns(135_000);
-        let (adj_obs, cpu_obs) = price_layer_lines(Some(observed_base), true, Some(&copy), true, 48e9, 0.0);
-        assert_eq!(adj_obs.unwrap().gpu.link.weights.get() as u64, 77_500);
-        assert_eq!(
-            cpu_obs.unwrap().expert.one.get() as u64,
-            135_000,
-            "live observed concurrent CPU site time must not be double-scaled by DomainBudget"
-        );
-
-        // Case 3: Layer gated onto `RunStage::Whole` -> zero-copy link vs uncontested solo CPU.
-        let (adj_whole, cpu_whole) = price_layer_lines(Some(base), false, Some(&copy), false, 0.0, 0.0);
-        let link_whole_ns = adj_whole.unwrap().gpu.link.weights.get() as u64;
-        let cpu_whole_ns = cpu_whole.unwrap().expert.one.get() as u64;
-        assert_eq!(link_whole_ns, zero_copy_ns as u64, "Whole layer must not use DMA link price");
-        assert_eq!(cpu_whole_ns, solo_cpu_ns as u64, "Whole layer must use uncontested solo CPU price");
-        let (gpu_whole, cpu_whole_count) = simulate_assign(link_whole_ns, cpu_whole_ns, 2, 8);
-        assert_eq!(
-            (gpu_whole, cpu_whole_count),
-            (0, 2),
-            "Whole layer's rare misses should route to uncontested CPU over SM zero-copy"
-        );
+        let line = ReadLine::new(0.0, 1.0 / 48e9).unwrap();
+        let copy = crate::assessment::TierCopyCosts { blocks: 0, whole_seconds: 0.0, stall_share: 0.0, transfer: line, back: line };
+        let landed = decode_dma_lines(lines, Some(&copy), true);
+        assert_eq!(landed.gpu.link.weights.get() as u64, 77_500);
+        assert_eq!(landed.host, lines.host);
+        assert_eq!(decode_dma_lines(lines, Some(&copy), false), lines);
+        assert_eq!(decode_dma_lines(lines, None, true), lines);
+        let near = ExpertLines { gpu: GpuLines { link: PassLine { weights: ns(70_000), ..lines.gpu.link }, ..lines.gpu }, ..lines };
+        assert_eq!(decode_dma_lines(near, Some(&copy), true), near);
     }
 }

@@ -2072,10 +2072,12 @@ impl Costs {
         self.landings[group].state().expect("landings' counts and clock seconds make a line").line().map(FileLine::of)
     }
 
-    /// Streamed layer `layer`'s CPU site line as its requests took
-    /// ([`SiteRequests::line`]).
-    fn site(&self, layer: usize) -> Option<[f64; 2]> {
-        self.sites[layer].line()
+    /// Streamed layer `layer`'s CPU site line as its requests took, the
+    /// job's site line of `lines` settling what they leave undetermined
+    /// ([`SiteRequests::line`]); none before a request, or without a site
+    /// line.
+    fn site(&self, layer: usize, lines: &ExpertLines) -> Option<[f64; 2]> {
+        lines.host.cpu.and_then(|cpu| self.sites[layer].line(cpu))
     }
 
     /// Streamed layer `layer`'s block line as its sampled steps took,
@@ -2124,12 +2126,19 @@ impl SiteRequests {
     }
 
     /// The `[fixed, per expert]` seconds of a request whose experts each
-    /// take one row; none before the requests tell the two apart.
-    fn line(&self) -> Option<[f64; 2]> {
-        match self.0.state().expect("site requests' experts and clock seconds make a line") {
-            seismic::measure::LineState::Pending => None,
+    /// take one row, as the requests took; none before one. The job's
+    /// lines `cpu` (its handshake the fixed term's, its expert of one row
+    /// the other's) settle only what the requests leave undetermined:
+    /// requests of one expert count alone tell the two terms' sum, which
+    /// is all such a request pays.
+    fn line(&self, cpu: magnitude_cost_model::CpuLines) -> Option<[f64; 2]> {
+        let mut line = self.0;
+        line.seed([1., 0.], cpu.handshake.get() * 1e-9);
+        line.seed([0., 1.], cpu.expert.one.get() * 1e-9);
+        match line.state().expect("site requests' experts and clock seconds make a line") {
+            seismic::measure::LineState::Pending => unreachable!("the job's handshake and expert tell both terms apart"),
+            seismic::measure::LineState::Seeded(_) => None,
             seismic::measure::LineState::Observed(terms) => Some(terms.costs()),
-            seismic::measure::LineState::Seeded(_) => unreachable!("a site's requests seed nothing"),
         }
     }
 }
@@ -2387,32 +2396,6 @@ impl Telemetry {
         self.with_observed(&mut self.lock().costs, lines)
     }
 
-    /// `lines` refined by the load's real work now, plus per-layer whether
-    /// `host.cpu` reflects live runtime-observed concurrent CPU site requests
-    /// (`costs.site(layer).is_some()`), so `Residency::publish_lines` never
-    /// double-scales already-contended observations with `DomainBudget`.
-    pub(super) fn refined_for_policy(&self, lines: &[ExpertLines]) -> (Arc<[ExpertLines]>, Vec<bool>) {
-        let mut recorded = self.lock();
-        let share = 1. / lines.len().max(1) as f64;
-        let moves = recorded.costs.passes.moves().map(|(link, records)| (link * share, records * share));
-        let mut site_observed = Vec::with_capacity(lines.len());
-        let refined: Arc<[ExpertLines]> = lines
-            .iter()
-            .zip(&self.routing.maps)
-            .enumerate()
-            .map(|(layer, (lines, &(group, _)))| {
-                let site = recorded.costs.site(layer);
-                site_observed.push(site.is_some());
-                lines
-                    .landed_by(self.landing(&recorded.costs, group))
-                    .sited(site)
-                    .passed(recorded.costs.block(layer, lines))
-                    .moving(moves)
-            })
-            .collect();
-        (refined, site_observed)
-    }
-
     /// `lines` with each layer's landing line, CPU site line, GPU lines and
     /// moves now, which the load observes beside the lines it was priced
     /// on: the landing line of the one site its bank lands at
@@ -2427,7 +2410,7 @@ impl Telemetry {
             .zip(&self.routing.maps)
             .enumerate()
             .map(|(layer, (lines, &(group, _)))| {
-                let site = costs.site(layer);
+                let site = costs.site(layer, lines);
                 lines.landed_by(self.landing(costs, group)).sited(site).passed(costs.block(layer, lines)).moving(moves)
             })
             .collect()
@@ -3379,11 +3362,6 @@ impl Telemetry {
         })
     }
 
-    /// The drive's measured read line, if available.
-    pub(super) fn drive_line(&self) -> Option<magnitude_cost_model::ReadLine> {
-        self.line()
-    }
-
     /// Link-path admission pricer (`PathKind::Link`) over the measured passes.
     pub(super) fn link_admission(&self, link_line: Option<magnitude_cost_model::ReadLine>) -> magnitude_cost_model::PathAdmission {
         self.lock().costs.passes.link_admission(link_line)
@@ -3803,17 +3781,44 @@ mod tests {
 
     /// A site's line is its requests' time less their rows past each
     /// expert's first at the row cost: requests of 5 µs and 40 µs an expert,
-    /// some experts of several rows at 2 µs a row, fit 5 and 40 alone; none
-    /// before two expert counts.
+    /// some experts of several rows at 2 µs a row, fit 5 and 40 alone,
+    /// whatever the job measured; none before a request.
     #[test]
     fn a_site_line_leaves_out_the_rows_its_row_cost_prices() {
+        let job = job_site(1e-6, 3e-6);
         let mut requests = SiteRequests::default();
+        assert_eq!(requests.line(job), None);
         requests.observe(2, 2, 85e-6, 2e-6);
-        assert_eq!(requests.line(), None);
         requests.observe(4, 8, 165e-6 + 4. * 2e-6, 2e-6);
         requests.observe(3, 5, 125e-6 + 2. * 2e-6, 2e-6);
-        let [fixed, expert] = requests.line().unwrap();
+        let [fixed, expert] = requests.line(job).unwrap();
         assert!((fixed - 5e-6).abs() < 1e-12 && (expert - 40e-6).abs() < 1e-12, "{fixed} {expert}");
+    }
+
+    /// Requests of one expert each tell only what such a request takes: the
+    /// line prices it at exactly that (370 µs), however far the job's idle
+    /// handshake and expert (4 and 40 µs) fall short of it, which settle
+    /// only how it splits between its terms.
+    #[test]
+    fn a_site_of_one_expert_requests_is_priced_at_what_they_take() {
+        let job = job_site(4e-6, 40e-6);
+        let mut requests = SiteRequests::default();
+        for seconds in [360e-6, 380e-6] {
+            requests.observe(1, 1, seconds, 1e-6);
+        }
+        let [fixed, expert] = requests.line(job).unwrap();
+        assert!((fixed + expert - 370e-6).abs() < 1e-12, "{fixed} {expert}");
+        assert!(fixed > 0. && expert > 0., "{fixed} {expert}");
+    }
+
+    /// The job's site line of a `handshake` and an `expert` of one row, in
+    /// seconds.
+    fn job_site(handshake: f64, expert: f64) -> magnitude_cost_model::CpuLines {
+        let ns = |seconds: f64| magnitude_cost_model::Nanoseconds::try_from((seconds * 1e9).round() as u32).unwrap();
+        magnitude_cost_model::CpuLines {
+            expert: magnitude_cost_model::RowLine { one: ns(expert), row: magnitude_cost_model::RowCost::Measured(ns(1e-6)) },
+            handshake: ns(handshake),
+        }
     }
 
     /// A pass's time runs from the later of its begin and the step before's

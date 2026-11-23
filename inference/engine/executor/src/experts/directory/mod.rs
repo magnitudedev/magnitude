@@ -1745,11 +1745,6 @@ impl Directory {
         self.bank.staging_copying()
     }
 
-    /// Whether any opportunistic staging DMA batch is currently in flight.
-    pub fn staging_in_flight(&self) -> bool {
-        self.bank.staging_in_flight()
-    }
-
     /// Active staging entry for `staged` in `group`, if any:
     /// `(slot, target_step, batch)`.
     pub fn staged_entry(&self, group: usize, staged: Staged) -> Option<(usize, Step, Option<u64>)> {

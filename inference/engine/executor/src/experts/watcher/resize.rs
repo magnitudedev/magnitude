@@ -463,7 +463,7 @@ impl Residency {
         self.refill_tier();
         self.publish_policy();
         self.shared.write_staged();
-        self.publish_lines(None);
+        self.publish_lines();
         self.shared.telemetry.note_resized();
         Published(())
     }

@@ -590,12 +590,6 @@ impl Prefetch {
         self.reads_finished.swap(false, Ordering::AcqRel)
     }
 
-    /// Whether any NVMe read or landing into host RAM is currently active
-    /// (used by `DomainBudget` for shared DDR5 bandwidth accounting).
-    pub(super) fn landing_active(&self) -> bool {
-        !self.inbound.is_empty()
-    }
-
     /// Called by `Residency::learn` when `Told::Began` arrives: reset per-step
     /// speculative byte accounting and cancel unbegun draft-window carryover
     /// reads so layer-0 demand never queues behind them.

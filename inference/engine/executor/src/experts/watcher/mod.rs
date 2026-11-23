@@ -1023,7 +1023,7 @@ impl Watcher {
         // No step runs yet: the open's words are written now, as every
         // later gap writes what it staged.
         shared.write_staged();
-        residency.publish_lines(None);
+        residency.publish_lines();
         let residency = Arc::new(crate::experts::yielding::Yielding::new(residency));
         // From here a thread that cannot start drops the watcher, which
         // stops and joins those that did.
