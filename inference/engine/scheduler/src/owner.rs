@@ -2354,21 +2354,27 @@ trait MemoryStep: MemoryHost + Sized {
         let (owed, after_idle) = self.memory().reading.begin_step(pressured, readings_generation);
         let read = match boundary || completed || owed || pressured {
             false => None,
-            true => match {
+            true => {
                 let evictable = self.evictable();
-                self.domain().read_memory(after_idle, &evictable).map_err(classify_domain_error)?
-            } {
-                MemoryReading::Read(read) => {
-                    self.memory().reading.on_read();
-                    Some(read)
+                let relief_boundary = if bindings.is_some() {
+                    magnitude_executor::memory::ledger::ReliefBoundary::Idle
+                } else {
+                    magnitude_executor::memory::ledger::ReliefBoundary::InFlight
+                };
+                let reading = self.domain().read_memory(after_idle, &evictable, relief_boundary).map_err(classify_domain_error)?;
+                match reading {
+                    MemoryReading::Read(read) => {
+                        self.memory().reading.on_read();
+                        Some(read)
+                    }
+                    // A change off this thread stood beside the sample: its
+                    // completion wakes the owner, whose step reads then.
+                    MemoryReading::Beside => {
+                        self.memory().reading.owe();
+                        None
+                    }
                 }
-                // A change off this thread stood beside the sample: its
-                // completion wakes the owner, whose step reads then.
-                MemoryReading::Beside => {
-                    self.memory().reading.owe();
-                    None
-                }
-            },
+            }
         };
         if let Some(bindings) = bindings {
             let sizing = [BankTier::Bank, BankTier::Host].map(|tier| self.domain().sizing_terms(tier));

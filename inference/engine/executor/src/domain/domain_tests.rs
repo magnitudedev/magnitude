@@ -816,7 +816,13 @@ fn spare_slabs_owed_wait_for_a_held_chain_and_release_once_it_ends() {
         .reconcile(pending, PhysicalDecision { accepted_rows: 1, ahead: crate::AheadVerdict::default() })
         .unwrap();
     assert_eq!((domain.queue.len(), domain.chain_holder()), (2, Some(request)));
-    let _taken = super::fixtures::take_all_cache(&domain);
+    let ledger = domain.resources.ledgers().device().clone();
+    let spare = ledger.estimate().cache_of(crate::memory::ledger::CacheKind::Spare);
+    assert!(spare > 0, "closed request's slabs must register as CacheKind::Spare");
+    let plan = ledger
+        .plan_relief(spare, crate::memory::ledger::Relief::CacheOnly, crate::memory::ledger::Frees::RequestState)
+        .expect("spare cache covers relief plan");
+    let _owed = domain.execute_relief(plan);
     assert!(domain.state_slabs.spare_owed() > 0);
 
     assert_eq!(
@@ -3244,7 +3250,11 @@ fn memory_probe_answer_emits_memory_read_trace_for_every_answered_generation() {
     tracing::subscriber::with_default(Capture(seen.clone()), || {
         let probe = domain.memory_probe();
         assert!(probe.read(None, false));
-        drop(probe.answer(&std::collections::BTreeSet::new(), Vec::new));
+        drop(probe.answer(
+            &std::collections::BTreeSet::new(),
+            crate::memory::ledger::ReliefBoundary::Idle,
+            Vec::new,
+        ));
     });
     let recorded: Vec<u64> = domain.answered.borrow().generations.iter().map(|(_, g)| *g).collect();
     assert!(!recorded.is_empty());
@@ -3300,4 +3310,133 @@ fn a_chained_pass_shares_a_launch_only_with_chained_passes_within_their_rows() {
     for launch in [vec![pass(1, false), pass(2, true)], vec![pass(1, true), pass(2, false)], chained] {
         assert!(matches!(domain.requirements(&launch), Err(DomainError::Input(_))), "{launch:?}");
     }
+}
+
+/// Regression test for owner-thread self-deadlock during in-flight memory relief:
+/// calling `ExecutorDomain::read_memory(..., ReliefBoundary::InFlight)` (as
+/// `observe_memory(None, ...)` does while a flight is active) or
+/// `MemoryProbe::running_pressure` under an external shortage MUST NOT invoke a
+/// synchronous `Reclaim::Backed` reclaimer (whose real `BankReclaimer::reclaim`
+/// blocks in `wait_traffic_quiet()` waiting for active steps to go idle).
+/// Instead, logical yields are recorded so `running_pressure` reports the
+/// bank's shed bytes and the subsequent idle boundary releases cleanly.
+#[test]
+fn in_flight_read_memory_and_running_pressure_defer_backed_reclaimer_until_idle() {
+    use crate::memory::ledger::{CacheKind, CacheReclaimer, Cached, Reclaim, ReclaimError, ReliefBoundary};
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+
+    struct GuardedReclaimer {
+        in_flight: Arc<AtomicBool>,
+        calls: Arc<AtomicUsize>,
+        piece: std::sync::Mutex<Option<Cached>>,
+    }
+
+    impl CacheReclaimer for GuardedReclaimer {
+        fn reclaim(&self, need: u64) -> Result<u64, ReclaimError> {
+            assert!(
+                !self.in_flight.load(Ordering::Acquire),
+                "Reclaim::Backed must never run during in-flight read_memory or running_pressure"
+            );
+            self.calls.fetch_add(1, Ordering::AcqRel);
+            let mut guard = self.piece.lock().unwrap();
+            let Some(cached) = guard.as_mut() else {
+                return Err(ReclaimError::AtFloor);
+            };
+            let cut = cached.bytes().min(need);
+            if cut == 0 {
+                return Err(ReclaimError::AtFloor);
+            }
+            drop(cached.split(cut, CacheKind::Bank));
+            Ok(cut)
+        }
+    }
+
+    // Start the fake bank at its floor (1 slot = 0 fake-bank cache bytes) so
+    // our `Reclaim::Backed` entry is the sole `CacheKind::Bank` entry on the
+    // device ledger.
+    let (domain, _bindings) = banked(seismic::BackendName::Cpu, 4, 1);
+    let ledger = domain.resources.ledgers().device().clone();
+    let in_flight = Arc::new(AtomicBool::new(true));
+    let calls = Arc::new(AtomicUsize::new(0));
+
+    let extra_bank_bytes = (4 * bank_row(&domain)).min(ledger.estimate().free() / 4);
+    assert!(extra_bank_bytes > 0, "device ledger must have free room for test bank cache");
+    let reclaimer = Arc::new(GuardedReclaimer {
+        in_flight: in_flight.clone(),
+        calls: calls.clone(),
+        piece: std::sync::Mutex::new(None),
+    });
+    let weak = Arc::downgrade(&reclaimer) as std::sync::Weak<dyn CacheReclaimer>;
+    let backed_piece = ledger
+        .cached_with(CacheKind::Bank, extra_bank_bytes, Reclaim::Backed(weak))
+        .expect("backed bank cache fits");
+    backed_piece.value(crate::memory::ledger::Value::NONE);
+    *reclaimer.piece.lock().unwrap() = Some(backed_piece);
+
+    let press = super::fixtures::press(&domain);
+    let bank = domain.family.expert_bank().expect("banked fixture has an expert bank");
+
+    // Helper: press other programs so `budget` drops below `committed` by
+    // `non_bank_cache + short_by` (`FloorShort`), forcing relief to shed
+    // `short_by` bytes from our `Reclaim::Backed` `CacheKind::Bank` entry.
+    let press_into_bank = |short_by: u64| {
+        let est = ledger.estimate();
+        let non_bank_cache = est.cache().saturating_sub(est.cache_of(CacheKind::Bank));
+        let headroom = est.budget().saturating_sub(est.committed());
+        let deficit = est.committed().saturating_sub(est.budget());
+        let target_over = non_bank_cache + short_by;
+        let extra = headroom + target_over.saturating_sub(deficit);
+        press.take(est.others() + extra);
+    };
+
+    // 1. In-flight `read_memory`: shortage yields our `Reclaim::Backed` piece
+    //    logically without invoking `reclaim`.
+    let shed_1 = (extra_bank_bytes / 4).max(1);
+    let piece_before_1 = reclaimer.piece.lock().unwrap().as_ref().unwrap().bytes();
+    press_into_bank(shed_1);
+    let reading = domain
+        .read_memory(false, &std::collections::BTreeSet::new(), ReliefBoundary::InFlight)
+        .expect("in-flight read_memory succeeds");
+    assert!(matches!(reading, super::MemoryReading::Read(_)));
+    assert_eq!(calls.load(Ordering::Acquire), 0, "in-flight read_memory must not call backed reclaimer");
+    let piece_after_1 = reclaimer.piece.lock().unwrap().as_ref().unwrap().bytes();
+    assert!(
+        piece_after_1 < piece_before_1,
+        "in-flight read_memory must logically yield the backed piece ({piece_before_1} -> {piece_after_1})"
+    );
+
+    // 2. `MemoryProbe::running_pressure` beside an active chain: reports shed
+    //    bytes from the backed piece without calling `reclaim`.
+    let shed_2 = (extra_bank_bytes / 4).max(1);
+    let piece_before_2 = piece_after_1;
+    press_into_bank(shed_2);
+    let probe = domain.memory_probe();
+    let running = probe.running_pressure(bank);
+    assert_eq!(calls.load(Ordering::Acquire), 0, "running_pressure must not call backed reclaimer");
+    assert!(
+        running.is_some_and(|p| p.bytes > 0),
+        "running_pressure must report bank cache yielded logically, got {running:?}"
+    );
+    let piece_after_2 = reclaimer.piece.lock().unwrap().as_ref().unwrap().bytes();
+    assert!(
+        piece_after_2 < piece_before_2,
+        "running_pressure must logically yield the backed piece ({piece_before_2} -> {piece_after_2})"
+    );
+
+    // 3. Once the flight ends (Idle boundary), `read_memory(..., ReliefBoundary::Idle)`
+    //    invokes the backed reclaimer cleanly and releases synchronously.
+    in_flight.store(false, Ordering::Release);
+    assert!(piece_after_2 > 0, "backed piece must retain bytes for idle reclaim check");
+    press_into_bank(piece_after_2.min(extra_bank_bytes / 4).max(1));
+    let idle_reading = domain
+        .read_memory(false, &std::collections::BTreeSet::new(), ReliefBoundary::Idle)
+        .expect("idle read_memory succeeds");
+    assert!(matches!(idle_reading, super::MemoryReading::Read(_)));
+    assert!(
+        calls.load(Ordering::Acquire) >= 1,
+        "idle read_memory must invoke backed reclaimer synchronously"
+    );
+
+    press.release();
+    reclaimer.piece.lock().unwrap().take();
 }

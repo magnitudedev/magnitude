@@ -142,7 +142,7 @@ fn a_shortages_yield_under_a_block_keeps_the_bank() {
         let bank = || ledger.estimate().cache_of(crate::memory::ledger::CacheKind::Bank);
         let before = bank();
         let plan = ledger.plan_relief(cheaper_than_the_bank(&ledger) + row / 2, Relief::CacheOnly, crate::memory::ledger::Frees::Room).expect("the cache covers the shortage");
-        ledger.change(|keeping| ledger.execute(&keeping.claims(), plan));
+        ledger.change(|keeping| ledger.execute(&keeping.claims(), plan, crate::memory::ledger::ReliefBoundary::Idle));
         let fell = before - bank();
         assert!(fell > 0 && fell < row, "{backend:?}: the shortage took {fell} bytes of the bank's cache, under a block");
         assert_eq!(domain.follow_cache_targets(&mut bindings, wake(), wake()).unwrap(), Followed::Holds, "{backend:?}: within a block, the bank keeps its slots");
@@ -321,7 +321,7 @@ fn an_open_unloads_a_component_an_earlier_claim_took() {
     use crate::memory::ledger::{CacheKind, Frees, Relief};
     let (directory, mut domain, mut bindings, ledger) = holding_an_idle_drafter("open-unloads-taken", false);
     let plan = ledger.plan_relief(1, Relief::CacheOnly, Frees::Room).expect("the drafter yields");
-    assert_eq!(ledger.change(|keeping| ledger.execute(&keeping.claims(), plan)).yielded, 1);
+    assert_eq!(ledger.change(|keeping| ledger.execute(&keeping.claims(), plan, crate::memory::ledger::ReliefBoundary::Idle)).yielded, 1);
     assert!(domain.head_component.idle_cache().is_some_and(super::IdleCache::taken), "relief took the drafter's cache");
     assert!(domain.open_served(&mut bindings, crate::RequestId(2), None).unwrap().is_empty(), "it opens");
     assert!(domain.head_component.idle_cache().is_none(), "the drafter is unloaded whole");

@@ -630,7 +630,7 @@ fn a_rise_shortfall_covered_by_cache_above_floor_does_not_wait_admission() {
     let plan = shortage.response.relief.expect("cache covers the rise shortfall");
     assert!(plan.preempt().is_empty());
     assert_eq!(plan.covers(), 4 * GB);
-    let owed = ledger.change(|keeping| ledger.execute(&keeping.claims(), plan));
+    let owed = ledger.change(|keeping| ledger.execute(&keeping.claims(), plan, ReliefBoundary::Idle));
     assert_eq!(owed.yielded, 4 * GB);
     assert_eq!(bank.bytes(), 4 * GB, "bank remains above floor after covering the shortfall");
 }
@@ -656,7 +656,7 @@ fn a_rise_shortfall_past_cache_drains_cache_before_waiting_admission() {
     let plan = shortage.response.relief.expect("remaining cache drains to floor");
     assert!(plan.preempt().is_empty());
     assert_eq!(plan.covers(), 8 * GB);
-    let owed = ledger.change(|keeping| ledger.execute(&keeping.claims(), plan));
+    let owed = ledger.change(|keeping| ledger.execute(&keeping.claims(), plan, ReliefBoundary::Idle));
     assert_eq!(owed.yielded, 8 * GB);
     assert_eq!(bank.bytes(), 0, "bank reached its floor");
 }
@@ -680,7 +680,7 @@ fn a_floor_shortfall_with_cache_drains_cache_before_unloading() {
     assert!(!first.response.unload, "must drain cache before unloading");
     let plan = first.response.relief.expect("remaining cache drains to floor");
     assert_eq!(plan.covers(), 4 * GB);
-    ledger.change(|keeping| ledger.execute(&keeping.claims(), plan));
+    ledger.change(|keeping| ledger.execute(&keeping.claims(), plan, ReliefBoundary::Idle));
     assert_eq!(bank.bytes(), 0);
     // Next reading past λ with cache empty: now unloads.
     read(&ledger, &mut clock, 64 * GB, 40 * GB, None);
@@ -742,7 +742,7 @@ fn a_relief_plan_covers_its_need_whole_or_takes_nothing() {
     assert_eq!(ledger.plan_relief(cached + 1, Relief::CacheOnly, crate::memory::ledger::Frees::Room), None, "cache alone cannot cover it");
     let after = ledger.estimate();
     assert_eq!((after.cache_of(CacheKind::Bank), after.cache_of(CacheKind::Prefix)), (cached - page, page), "no plan took the bank or the prefix");
-    let owed = ledger.change(|keeping| ledger.execute(&keeping.claims(), plan));
+    let owed = ledger.change(|keeping| ledger.execute(&keeping.claims(), plan, ReliefBoundary::Idle));
     assert_eq!((owed.yielded, owed.preempt), (cached, vec![RequestId(4), RequestId(3)]));
     assert_eq!((bank.bytes(), prefix.bytes()), (0, 0), "the plan carried out whole");
 }
@@ -1293,7 +1293,7 @@ fn a_claim_allocates_taken_cache_only_as_its_holder_frees_it() {
     read(&ledger, &mut clock, 64 * GB, 4 * GB, None);
     assert!(held(&ledger, 10 * GB).is_err(), "deferred cache is not admitted without physical free");
     let plan = ledger.plan_relief(6 * GB, Relief::CacheOnly, crate::memory::ledger::Frees::Room).expect("bank covers 6 GB");
-    assert_eq!(ledger.change(|keeping| ledger.execute(&keeping.claims(), plan)).yielded, 6 * GB);
+    assert_eq!(ledger.change(|keeping| ledger.execute(&keeping.claims(), plan, ReliefBoundary::Idle)).yielded, 6 * GB);
     assert_eq!((bank.bytes(), bank.releasing()), (34 * GB, 0), "the bank yields 6 GB, the pool's still");
     let held_est = ledger.estimate();
     assert_eq!((held_est.allocated(), held_est.releasing(), held_est.allocatable()), (60 * GB, 6 * GB, 4 * GB), "only the free 4 GB are allocatable");
@@ -1322,7 +1322,7 @@ fn a_shortages_yield_is_free_only_once_freed() {
     let bank = ledger.cached_with(CacheKind::Bank, 20 * GB, Reclaim::Deferred).expect("free room");
     assert_eq!(ledger.estimate().free(), 4 * GB);
     let plan = ledger.plan_relief(8 * GB, Relief::CacheOnly, crate::memory::ledger::Frees::Room).expect("the bank covers it");
-    assert_eq!(ledger.change(|keeping| ledger.execute(&keeping.claims(), plan)).yielded, 8 * GB);
+    assert_eq!(ledger.change(|keeping| ledger.execute(&keeping.claims(), plan, ReliefBoundary::Idle)).yielded, 8 * GB);
     assert_eq!((bank.bytes(), ledger.estimate().free()), (12 * GB, 4 * GB), "shed, still allocated: not free");
     assert!(ledger.cached(CacheKind::Prefix, 5 * GB).is_err());
     ledger.change(|_| pool.freed(&pool.change(), 8 * GB, Pageable));
@@ -1361,7 +1361,7 @@ fn a_dropped_bank_leaves_spare_granules_until_the_pool_frees_them() {
     read(&ledger, &mut clock, 64 * GB, 64 * GB, None);
     let bank = ledger.cached_with(CacheKind::Bank, 64 * GB, Reclaim::Deferred).expect("free room");
     let plan = ledger.plan_relief(8 * GB, Relief::CacheOnly, crate::memory::ledger::Frees::Room).expect("the bank covers 8 GB");
-    assert_eq!(ledger.change(|keeping| ledger.execute(&keeping.claims(), plan)).yielded, 8 * GB);
+    assert_eq!(ledger.change(|keeping| ledger.execute(&keeping.claims(), plan, ReliefBoundary::Idle)).yielded, 8 * GB);
     drop(bank);
     let dropped = ledger.estimate();
     assert_eq!((dropped.allocated(), dropped.releasing(), dropped.cache_of(CacheKind::Spare)), (64 * GB, 8 * GB, 56 * GB));
@@ -1607,7 +1607,7 @@ fn cache_yields_by_value_per_byte() {
     bank.value(Value::per_byte(1.0, gb));
     prefix.value(Value::recompute(0.5, 4, gb));
     let plan = ledger.plan_relief(12 * GB, Relief::CacheOnly, crate::memory::ledger::Frees::Room).expect("the cache covers it");
-    assert_eq!(ledger.change(|keeping| ledger.execute(&keeping.claims(), plan)).yielded, 12 * GB);
+    assert_eq!(ledger.change(|keeping| ledger.execute(&keeping.claims(), plan, ReliefBoundary::Idle)).yielded, 12 * GB);
     assert_eq!((spare.bytes(), bank.bytes(), prefix.bytes()), (0, 4 * GB, 8 * GB), "spare, then the bank worth less");
 }
 
@@ -1651,7 +1651,7 @@ fn a_change_keeps_cache_whole_or_not_at_all() {
     rest.value(Value::per_byte(1.0, NonZeroU64::new(59 * GB).unwrap()));
     // The binding, worth least, yields first to relief.
     let plan = ledger.plan_relief(GB / 2, Relief::CacheOnly, crate::memory::ledger::Frees::Room).expect("binding covers 0.5 GB");
-    assert_eq!(ledger.change(|keeping| ledger.execute(&keeping.claims(), plan)).yielded, GB / 2);
+    assert_eq!(ledger.change(|keeping| ledger.execute(&keeping.claims(), plan, ReliefBoundary::Idle)).yielded, GB / 2);
     let before = ledger.estimate();
     let kept = ledger.change(|keeping| keeping.keep(vec![weights, binding], CommittedKind::Component));
     let cached = kept.err().expect("the binding was taken in part");
@@ -2441,7 +2441,7 @@ fn relief_skips_at_floor_pool_and_reclaims_bank_synchronously() {
     let plan1 = ledger
         .plan_relief_excluding(1 * GB, Relief::CacheOnly, Frees::Room, &exhausted)
         .expect("first plan covers 1 GB from state pool spare");
-    let owed1 = ledger.change(|keeping| ledger.execute(&keeping.claims(), plan1));
+    let owed1 = ledger.change(|keeping| ledger.execute(&keeping.claims(), plan1, ReliefBoundary::Idle));
     assert_eq!(owed1.reclaimed, 0);
     assert_eq!(owed1.yielded, 0);
     assert!(!owed1.exhausted.is_empty());
@@ -2451,7 +2451,7 @@ fn relief_skips_at_floor_pool_and_reclaims_bank_synchronously() {
     let plan2 = ledger
         .plan_relief_excluding(1 * GB, Relief::CacheOnly, Frees::Room, &exhausted)
         .expect("second plan covers 1 GB from bank cache");
-    let owed2 = ledger.change(|keeping| ledger.execute(&keeping.claims(), plan2));
+    let owed2 = ledger.change(|keeping| ledger.execute(&keeping.claims(), plan2, ReliefBoundary::Idle));
     assert_eq!(owed2.reclaimed, 1 * GB);
     assert!(owed2.exhausted.is_empty());
 
@@ -3064,4 +3064,106 @@ fn cuda_device_cache_reserve_bounds_elastic_bank_without_reducing_resident_admis
     let pressed = ledger.estimate();
     assert_eq!(pressed.hold_room(), bank_bytes - EXTERNAL_CTX);
     assert_eq!(pressed.budget(), VRAM - EXTERNAL_CTX);
+}
+
+/// Executing a relief plan at `ReliefBoundary::InFlight` must NEVER invoke a
+/// synchronous `Reclaim::Backed` reclaimer (which would self-deadlock the
+/// owner thread waiting for active steps to go idle); instead it records a
+/// logical yield in the ledger so `release_running` or the next idle boundary
+/// releases the cache safely. At `ReliefBoundary::Idle`, the backed reclaimer
+/// is invoked synchronously as usual.
+#[test]
+fn in_flight_relief_defers_backed_reclaimer_and_idle_reclaims_synchronously() {
+    use seismic::memory::Wiring::Pageable;
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+
+    struct GuardedBankReclaimer {
+        ledger: Ledger,
+        pool: Arc<dyn seismic::memory::Entry>,
+        piece: std::sync::Mutex<Option<Cached>>,
+        in_flight: Arc<AtomicBool>,
+        calls: Arc<AtomicUsize>,
+    }
+
+    impl CacheReclaimer for GuardedBankReclaimer {
+        fn reclaim(&self, need: u64) -> Result<u64, ReclaimError> {
+            assert!(
+                !self.in_flight.load(Ordering::Acquire),
+                "Reclaim::Backed must never be invoked at ReliefBoundary::InFlight"
+            );
+            self.calls.fetch_add(1, Ordering::AcqRel);
+            let mut guard = self.piece.lock().unwrap();
+            let Some(cached) = guard.as_mut() else {
+                return Err(ReclaimError::AtFloor);
+            };
+            let cut = cached.bytes().min(need);
+            if cut == 0 {
+                return Err(ReclaimError::AtFloor);
+            }
+            let split = cached.split(cut, CacheKind::Bank);
+            self.ledger.change(|_| {
+                drop(split);
+                self.pool.freed(&self.pool.change(), cut, Pageable);
+            });
+            Ok(cut)
+        }
+    }
+
+    let (_scope, ledger, pools) = host();
+    let mut clock = Clock::new();
+    read(&ledger, &mut clock, 16 * GB, 16 * GB, None);
+    let bank_claim = ledger
+        .change(|keeping| ledger.backing(&keeping.claims(), PoolClass::Records, 4 * GB))
+        .expect("bank backing fits");
+    ledger
+        .change(|_| pools.records.take(&pools.records.change(), 4 * GB, Pageable))
+        .expect("records pool allocates");
+
+    let in_flight = Arc::new(AtomicBool::new(true));
+    let calls = Arc::new(AtomicUsize::new(0));
+    let reclaimer = Arc::new(GuardedBankReclaimer {
+        ledger: ledger.clone(),
+        pool: pools.records.clone(),
+        piece: std::sync::Mutex::new(None),
+        in_flight: in_flight.clone(),
+        calls: calls.clone(),
+    });
+    let weak = Arc::downgrade(&reclaimer) as std::sync::Weak<dyn CacheReclaimer>;
+    let bank_cache = ledger.change(|_| bank_claim.into_backed_cache(CacheKind::Bank, Reclaim::Backed(weak)));
+    *reclaimer.piece.lock().unwrap() = Some(bank_cache);
+
+    // 1. In-flight relief: records logical yield without invoking the backed reclaimer.
+    let plan_in_flight = ledger
+        .plan_relief(2 * GB, Relief::CacheOnly, Frees::Room)
+        .expect("bank cache covers 2 GB in-flight");
+    let owed = ledger.change(|keeping| ledger.execute(&keeping.claims(), plan_in_flight, ReliefBoundary::InFlight));
+    assert_eq!(calls.load(Ordering::Acquire), 0, "in-flight relief must not invoke backed reclaimer");
+    assert_eq!(owed.yielded, 2 * GB);
+    assert_eq!(owed.reclaimed, 0);
+    assert!(owed.exhausted.is_empty());
+    let after_in_flight = ledger.estimate();
+    assert_eq!(after_in_flight.cache_of(CacheKind::Bank), 2 * GB);
+    assert_eq!(after_in_flight.releasing(), 2 * GB);
+
+    // 2. Once the flight ends (Idle boundary), relief invokes the backed reclaimer cleanly
+    //    and returning the previously yielded pool blocks clears releasing back to 0.
+    in_flight.store(false, Ordering::Release);
+    let plan_idle = ledger
+        .plan_relief(1 * GB, Relief::CacheOnly, Frees::Room)
+        .expect("remaining bank cache covers 1 GB at idle");
+    let owed_idle = ledger.change(|keeping| ledger.execute(&keeping.claims(), plan_idle, ReliefBoundary::Idle));
+    assert_eq!(calls.load(Ordering::Acquire), 1, "idle relief invokes backed reclaimer synchronously");
+    assert_eq!(owed_idle.reclaimed, 1 * GB);
+    assert_eq!(owed_idle.yielded, 1 * GB);
+    assert_eq!(ledger.estimate().cache_of(CacheKind::Bank), 1 * GB);
+
+    // Return the 2 GB that yielded logically while in-flight, plus the final 1 GB on drop.
+    ledger.change(|_| {
+        pools.records.freed(&pools.records.change(), 2 * GB, Pageable);
+        let remaining = reclaimer.piece.lock().unwrap().take();
+        drop(remaining);
+        pools.records.freed(&pools.records.change(), 1 * GB, Pageable);
+    });
+    assert_eq!(ledger.estimate().releasing(), 0);
+    assert_eq!(ledger.estimate().cache_of(CacheKind::Bank), 0);
 }

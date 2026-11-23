@@ -23,6 +23,23 @@ pub enum Relief<'a> {
     CacheAndRequests(&'a BTreeSet<RequestId>),
 }
 
+/// Whether a relief plan executes at an idle boundary between flights or
+/// while a flight is active on the owner thread.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ReliefBoundary {
+    /// Between flights: no device flight holds `StateBindings` or active
+    /// steps, so synchronous [`Reclaim::Backed`] reclaimers may drain
+    /// background traffic and return memory immediately.
+    Idle,
+    /// A flight is active on the owner thread (e.g. `observe_memory(None, ...)`
+    /// or `MemoryProbe::running_pressure`): synchronous [`Reclaim::Backed`]
+    /// reclaimers must not be invoked because waiting for active steps to go
+    /// idle on the owner thread self-deadlocks. Cache yields are recorded
+    /// logically in the ledger so `release_running` or the next idle boundary
+    /// shrinks and releases safely.
+    InFlight,
+}
+
 /// Relief known to cover `need`: cache entries in rank order, then
 /// preemptible requests, just enough. No partial plan exists
 /// ([`Ledger::plan_relief`]); its one use is [`Ledger::execute`].
@@ -128,16 +145,19 @@ impl Ledger {
         self.state().plan_relief_excluding(&self.store.identity, need, allow, frees, exhausted)
     }
 
-    /// Carry out `plan` whole, in `claiming`, a change's claim phase: its
-    /// cache yields now, each holder freeing
-    /// what was taken of it by its own rule; its requests are the holder's
-    /// to preempt. The only way cache yields to anything but a claim. An
-    /// entry its holder let go since the plan was made freed its bytes
-    /// already, so the plan still covers its need.
+    /// Carry out `plan` whole, in `claiming`, a change's claim phase, at
+    /// `boundary`: at [`ReliefBoundary::Idle`], [`Reclaim::Backed`] entries
+    /// reclaim synchronously while other cache entries record logical yields;
+    /// at [`ReliefBoundary::InFlight`], every cache entry records a logical
+    /// yield without invoking blocking [`Reclaim::Backed`] reclaimers, so the
+    /// owner thread never waits for active steps while a flight is running.
+    /// Its requests are the holder's to preempt. The only way cache yields to
+    /// anything but a claim. An entry its holder let go since the plan was
+    /// made freed its bytes already, so the plan still covers its need.
     ///
     /// # Panics
     /// For a plan of another store.
-    pub fn execute(&self, claiming: &Claiming, plan: ReliefPlan) -> Owed {
+    pub fn execute(&self, claiming: &Claiming, plan: ReliefPlan, boundary: ReliefBoundary) -> Owed {
         claiming.of_scope(&self.store.changes);
         assert_eq!(plan.store, self.store.identity, "invariant violated: a relief plan executes in its own store");
         let mut yielded = 0u64;
@@ -151,15 +171,16 @@ impl Ledger {
                 if need == 0 || !matches!(entry.holding, Holding::Cache(_) | Holding::Pool(_)) {
                     continue;
                 }
-                match state.reclaim.get(&id) {
-                    Some(Reclaim::Backed(weak)) => match weak.upgrade() {
+                match (boundary, state.reclaim.get(&id)) {
+                    (ReliefBoundary::Idle, Some(Reclaim::Backed(weak))) => match weak.upgrade() {
                         Some(reclaimer) => Some((reclaimer, need)),
                         None => {
                             exhausted.push(id);
                             None
                         }
                     },
-                    Some(Reclaim::Deferred | Reclaim::Unbacked) | None => {
+                    (ReliefBoundary::InFlight, Some(Reclaim::Backed(_)))
+                    | (_, Some(Reclaim::Deferred | Reclaim::Unbacked) | None) => {
                         state.yields(id, need, false, false);
                         yielded += need;
                         None

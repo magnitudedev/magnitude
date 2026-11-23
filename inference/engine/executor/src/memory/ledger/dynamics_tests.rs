@@ -1146,7 +1146,7 @@ fn an_idle_load_with_cache_above_its_floor_admits_new_work_when_cache_meets_harm
     assert!(excess > 0);
     assert!(!shortage.response.admission_waits, "cache meets sustained thrash excess above floor");
     let plan = shortage.response.relief.expect("the bank covers the harm");
-    assert_eq!(machine.ledger.change(|keeping| machine.ledger.execute(&keeping.claims(), plan)).yielded, excess);
+    assert_eq!(machine.ledger.change(|keeping| machine.ledger.execute(&keeping.claims(), plan, ReliefBoundary::Idle)).yielded, excess);
     let admitted = machine.ledger.change(|keeping| machine.ledger.reserve(&keeping.claims(), &machine.slot, RequestId(1), 2 * super::tests::page_rows()));
     assert!(admitted.is_ok(), "the first request is admitted once cache meets the shortage: {:?}", admitted.err());
 }
@@ -1362,7 +1362,7 @@ fn non_pooled_cache_without_open_pool_reads_and_relieves_under_pressure() {
     assert!(matches!(shortage.cause, shortage::Cause::Pressure(seismic::PressureLevel::Warn)));
     let plan = shortage.response.relief.expect("cache covers pressure relief");
     assert_eq!(plan.covers(), drafter_bytes);
-    let owed = ledger.change(|keeping| ledger.execute(&keeping.claims(), plan));
+    let owed = ledger.change(|keeping| ledger.execute(&keeping.claims(), plan, ReliefBoundary::Idle));
     assert_eq!(owed.yielded, drafter_bytes);
     os.release(*now.lock().expect("the clock"), drafter_bytes, Wiring::Pageable);
 

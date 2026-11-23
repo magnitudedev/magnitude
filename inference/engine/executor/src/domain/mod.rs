@@ -1416,6 +1416,7 @@ impl<'d> MemoryProbe<'d> {
     fn answer(
         &self,
         evictable: &std::collections::BTreeSet<RequestId>,
+        boundary: crate::memory::ledger::ReliefBoundary,
         targets: impl FnOnce() -> Vec<crate::experts::derived::DerivedTarget>,
     ) -> Vec<StoreAnswer<'d>> {
         let traced = tracing::enabled!(target: MEMORY_TRACE, tracing::Level::DEBUG);
@@ -1425,11 +1426,13 @@ impl<'d> MemoryProbe<'d> {
                 // ledger: what a resize that follows its target names.
                 let generation = ledger.generation();
                 let mut shortage = ledger.shortage(evictable);
-                // Carry out every relief plan's cache yields synchronously now;
-                // any requests it names are in `evictable` and are preempted by
-                // the owner on return.
+                // Carry out every relief plan's cache yields at `boundary`:
+                // synchronously at `Idle`, or logically at `InFlight` so the
+                // owner thread never blocks on `BankReclaimer::reclaim` while
+                // a flight is active; any requests named are in `evictable`
+                // and are preempted by the owner on return.
                 let owed = match shortage.as_mut().and_then(|shortage| shortage.response.relief.take()) {
-                    Some(plan) => ledger.change(|keeping| ledger.execute(&keeping.claims(), plan)),
+                    Some(plan) => ledger.change(|keeping| ledger.execute(&keeping.claims(), plan, boundary)),
                     None => crate::memory::ledger::Owed::default(),
                 };
                 StoreAnswer { ledger, generation, shortage, owed }
@@ -1559,10 +1562,14 @@ impl<'d> MemoryProbe<'d> {
         let bank_cache = || ledger.estimate().cache_of(crate::memory::ledger::CacheKind::Bank);
         let before = bank_cache();
         // Beside a running chain the owner evicts nothing: the answer's
-        // relief preempts no request.
-        drop(self.answer(&std::collections::BTreeSet::new(), || {
-            derived_targets_for(self.ledgers, bank).unwrap_or_default()
-        }));
+        // relief preempts no request and records logical yields so
+        // `release_running` shrinks beside the chain without blocking on
+        // active steps.
+        drop(self.answer(
+            &std::collections::BTreeSet::new(),
+            crate::memory::ledger::ReliefBoundary::InFlight,
+            || derived_targets_for(self.ledgers, bank).unwrap_or_default(),
+        ));
         match before - bank_cache() {
             0 => None,
             bytes => Some(RunningPressure { bytes }),
@@ -2058,7 +2065,12 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
     /// [`MEMORY_TRACE`], of the one estimate the judgment reads, and each
     /// bank holding in the store with what it holds and its derived target
     /// (`experts::derived::derive`, as the bank follows it).
-    pub fn read_memory(&self, after_idle: bool, evictable: &std::collections::BTreeSet<RequestId>) -> Result<MemoryReading, DomainError> {
+    pub fn read_memory(
+        &self,
+        after_idle: bool,
+        evictable: &std::collections::BTreeSet<RequestId>,
+        boundary: crate::memory::ledger::ReliefBoundary,
+    ) -> Result<MemoryReading, DomainError> {
         let began = Instant::now();
         let probe = self.memory_probe();
         if !probe.read(self.family.expert_bank(), after_idle) {
@@ -2068,7 +2080,7 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
         let cost = began.elapsed();
         let generation = self.memory_generation();
         let mut target_error = None;
-        drop(probe.answer(evictable, || match self.family.expert_bank() {
+        drop(probe.answer(evictable, boundary, || match self.family.expert_bank() {
             Some(bank) => match self.derived_targets(bank) {
                 Ok(targets) => targets,
                 Err(error) => {
