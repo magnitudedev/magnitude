@@ -41,8 +41,7 @@ pub mod graph;
 mod graph_replays;
 pub(crate) mod moves;
 // The order a submission's launches need: Metal encodes them concurrently
-// by level.
-#[cfg(any(test, target_os = "macos"))]
+// by level, and CUDA records their exact buffer-hazard DAG.
 pub(crate) mod hazard;
 #[cfg(test)]
 mod handoff_tests;
@@ -408,22 +407,23 @@ pub(crate) struct LayoutGraph {
     pub(crate) plans: Vec<Arc<graph::NativeGraphPlan>>,
 }
 
-/// A family's [`LayoutGraph`]s, by layout.
+/// A family's [`LayoutGraph`]s, by plan identity (plans sharing a graph
+/// point to the same [`Arc<LayoutGraph>`]).
 pub(crate) struct LayoutForms {
     forms: std::collections::HashMap<u64, Arc<LayoutGraph>>,
 }
 
 impl LayoutForms {
-    pub(crate) fn new(forms: impl IntoIterator<Item = (u64, LayoutGraph)>) -> Self {
-        Self { forms: forms.into_iter().map(|(layout, graph)| (layout, Arc::new(graph))).collect() }
+    pub(crate) fn new(forms: impl IntoIterator<Item = (u64, Arc<LayoutGraph>)>) -> Self {
+        Self { forms: forms.into_iter().collect() }
     }
 
-    /// `layout`'s graph.
-    pub(crate) fn of(&self, layout: u64) -> Arc<LayoutGraph> {
+    /// `plan`'s graph.
+    pub(crate) fn of(&self, plan: u64) -> Arc<LayoutGraph> {
         self.forms
-            .get(&layout)
+            .get(&plan)
             .cloned()
-            .expect("a family runs only plans of layouts its graphs were made for")
+            .expect("a family runs only plans whose graphs were made for it")
     }
 }
 
@@ -3429,9 +3429,14 @@ impl DispatchList for StandaloneCalls<'_> {
         }
     }
 
-    #[cfg(any(test, target_os = "macos"))]
     fn reaches(&self, index: usize, reaches: &mut Vec<hazard::Reach>) {
+        #[cfg(any(test, target_os = "macos"))]
         self.calls[index].reaches(reaches);
+        #[cfg(not(any(test, target_os = "macos")))]
+        {
+            let _ = (index, reaches);
+            unreachable!("reaches on standalone calls are only used on Metal");
+        }
     }
 
     fn encodes(&self, index: usize, ordinal: usize) -> bool {
@@ -3486,8 +3491,7 @@ pub(crate) trait DispatchList {
     ) -> Dispatch<'s>;
     /// What call `index`'s launches reach through all its buffers, host
     /// ports included (each by its ABI ordinal), appended to `reaches`.
-    /// Metal's concurrent encoding orders by them ([`hazard`]).
-    #[cfg(any(test, target_os = "macos"))]
+    /// Metal's concurrent encoding and CUDA's graph DAG order by them ([`hazard`]).
     fn reaches(&self, index: usize, reaches: &mut Vec<hazard::Reach>);
     /// The sealed plans' runs that make up the list, in order, each with
     /// its calls: a run's segments between timeline boundaries are replayed
@@ -4919,5 +4923,69 @@ mod resident_grid_tests {
         assert_eq!(metal_resident_groups(1 << 20, 8, 1024, 64, 32_768, 24_576), 4);
         // Unstated core count (1 core) always yields at least 1 group.
         assert_eq!(metal_resident_groups(1 << 20, 1, 1024, 1024, 32_768, 32_768), 1);
+    }
+}
+
+#[cfg(test)]
+mod graph_segments_tests {
+    use super::timeline::TimelineNode;
+    use super::{graph_segments, Dispatch, DispatchList, LayoutGraph, PlanRun};
+    use crate::driver::Allocation;
+    use std::sync::Arc;
+
+    struct StubList {
+        count: usize,
+    }
+
+    impl DispatchList for StubList {
+        fn count(&self) -> usize {
+            self.count
+        }
+        fn dispatch<'s>(&'s self, _index: usize, _buffers: &mut Vec<(&'s Allocation, u64)>) -> Dispatch<'s> {
+            unreachable!("graph_segments never dispatches")
+        }
+        fn reaches(&self, _index: usize, _reaches: &mut Vec<super::hazard::Reach>) {}
+        fn runs(&self) -> Option<Vec<PlanRun>> {
+            None
+        }
+        fn encodes(&self, _index: usize, _ordinal: usize) -> bool {
+            true
+        }
+    }
+
+    #[test]
+    fn direct_fallback_splits_internal_timelines() {
+        let list = StubList { count: 4 };
+        let graph = Arc::new(LayoutGraph { form: Arc::from([]), plans: Vec::new() });
+
+        // A graphed CUDA run holding an internal Signal at boundary 2 stays unsplit
+        // because the CUDA graph itself owns the word-write node.
+        let graphed_run = PlanRun {
+            plan: 1,
+            layout: 1,
+            calls: 0..4,
+            timelines: vec![(2, TimelineNode::Signal)],
+            marks: vec![1],
+            launched: false,
+            holds_timelines: true,
+            graph: graph.clone(),
+        };
+        assert_eq!(graph_segments(&list, Some(&[graphed_run])), vec![(0..4, 4)]);
+
+        // When a run falls back to direct stream-ordered launch (e.g. due to
+        // cross-port external aliasing), `launched: true` MUST pair with
+        // `holds_timelines: false` and `marks: []` so `graph_segments` splits
+        // at internal timeline boundaries and `cuda::issue` emits every signal/wait.
+        let direct_run = PlanRun {
+            plan: 1,
+            layout: 1,
+            calls: 0..4,
+            timelines: vec![(2, TimelineNode::Signal)],
+            marks: Vec::new(),
+            launched: true,
+            holds_timelines: false,
+            graph,
+        };
+        assert_eq!(graph_segments(&list, Some(&[direct_run])), vec![(0..2, 2), (2..4, 4)]);
     }
 }

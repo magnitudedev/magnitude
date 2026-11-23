@@ -1540,10 +1540,12 @@ impl WordOperation {
 }
 
 /// DAG frontier state for [`Graph`]: tracks every current sink node (no
-/// outgoing edges yet), the last non-kernel barrier added since the last
+/// outgoing edges yet), the most recent non-kernel barrier (so every root
+/// kernel after it still waits for it), the barrier added since the last
 /// kernel node, and whether that barrier included a wait.
 struct GraphFrontier {
     frontier: Vec<Handle>,
+    barrier: Option<Handle>,
     since: Option<Handle>,
     gated: bool,
 }
@@ -1552,6 +1554,7 @@ impl GraphFrontier {
     fn new() -> Self {
         Self {
             frontier: Vec::new(),
+            barrier: None,
             since: None,
             gated: false,
         }
@@ -1564,6 +1567,7 @@ impl GraphFrontier {
     fn commit_barrier(&mut self, raw: Handle, is_wait: bool) {
         self.frontier.clear();
         self.frontier.push(raw);
+        self.barrier = Some(raw);
         self.since = Some(raw);
         self.gated |= is_wait;
     }
@@ -1571,17 +1575,24 @@ impl GraphFrontier {
     /// Compute `(programmatic, predecessors)` for a kernel node without
     /// mutating state so driver failures leave the DAG unchanged.
     fn kernel_plan(&self, edge: Edge, after: &[Handle]) -> (bool, Vec<Handle>) {
-        let mut predecessors = Vec::with_capacity(after.len() + usize::from(self.since.is_some()));
+        let mut predecessors = Vec::with_capacity(after.len() + usize::from(self.since.is_some() || self.barrier.is_some()));
         for &handle in after {
             if !predecessors.contains(&handle) {
                 predecessors.push(handle);
             }
         }
-        let programmatic = edge == Edge::Programmatic && !predecessors.is_empty() && !self.gated;
+        // Programmatic dependent launch is only safe on a single direct kernel
+        // predecessor; multi-predecessor fan-in joins wait to completion so
+        // every incoming branch finishes before the join starts.
+        let programmatic = edge == Edge::Programmatic && predecessors.len() == 1 && !self.gated;
         if !programmatic {
             if let Some(since) = self.since {
                 if !predecessors.contains(&since) {
                     predecessors.push(since);
+                }
+            } else if predecessors.is_empty() {
+                if let Some(barrier) = self.barrier {
+                    predecessors.push(barrier);
                 }
             }
         }
@@ -2677,6 +2688,25 @@ mod tests {
 
         dag.commit_barrier(e2, false);
         assert_eq!(dag.barrier_dependencies(), &[e2]);
+
+        // Multiple independent root kernels after a barrier MUST all follow the barrier.
+        let (k5, k6, k7) = (handle(8), handle(9), handle(10));
+        let (prog, preds) = dag.kernel_plan(Edge::Programmatic, &[]);
+        assert!(!prog);
+        assert_eq!(preds, vec![e2]);
+        dag.commit_kernel(k5, &preds);
+        let (prog, preds) = dag.kernel_plan(Edge::Programmatic, &[]);
+        assert!(!prog);
+        assert_eq!(preds, vec![e2]);
+        dag.commit_kernel(k6, &preds);
+        assert_eq!(dag.barrier_dependencies(), &[k5, k6]);
+
+        // A multi-predecessor fan-in join never uses programmatic edges.
+        let (prog, preds) = dag.kernel_plan(Edge::Programmatic, &[k5, k6]);
+        assert!(!prog);
+        assert_eq!(preds, vec![k5, k6]);
+        dag.commit_kernel(k7, &preds);
+        assert_eq!(dag.barrier_dependencies(), &[k7]);
     }
 
     #[test]

@@ -27,15 +27,20 @@
 //! before one it does. CUDA's graphs keep stream order. Timeline operations
 //! bound the reordering: no launch crosses one.
 
-use super::Dispatch;
+#[cfg(any(test, target_os = "macos"))]
 use super::DispatchList;
+use super::Dispatch;
+#[cfg(any(test, target_os = "macos"))]
 use crate::api::tensor::{Records, SlabReach};
+#[cfg(any(test, target_os = "macos"))]
 use crate::driver::Allocation;
+#[cfg(any(test, target_os = "macos"))]
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, HashMap};
 use std::ops::Range;
 
 /// One step of encoding a submission ([`schedule`]).
+#[cfg(any(test, target_os = "macos"))]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Scheduled {
     /// The timeline operations at a boundary (before dispatch `.0`, or after
@@ -51,6 +56,7 @@ pub(crate) enum Scheduled {
 /// between timeline operations, the launches by level, each level in
 /// submission order. Launches that do no device work (inactive, or an empty
 /// grid) are left out.
+#[cfg(any(test, target_os = "macos"))]
 pub(crate) fn schedule(list: &impl DispatchList, repetitions: usize) -> Vec<Scheduled> {
     let mut schedule = Vec::new();
     let mut order = Order::default();
@@ -96,8 +102,10 @@ pub(crate) fn schedule(list: &impl DispatchList, repetitions: usize) -> Vec<Sche
 /// schedule, and only a change in how its reaches meet derives levels
 /// again. Deriving them costs a 64k decode step up to 1.2 ms of host time
 /// on an M4 Pro, above the step's resolution.
+#[cfg(any(test, target_os = "macos"))]
 pub(crate) struct Schedule(pub(crate) Vec<Scheduled>);
 
+#[cfg(any(test, target_os = "macos"))]
 impl super::graph_replays::RecordedGraph for Schedule {
     /// One graph, of host data alone: Metal records no launch into device
     /// memory (`GraphCost::None`), so only the schedules' count is bounded.
@@ -115,6 +123,7 @@ impl super::graph_replays::RecordedGraph for Schedule {
 
 /// Reusable scratch buffers for computing [`relative_placement_with`] and
 /// [`schedule_key`] without per-step heap allocations.
+#[cfg(any(test, target_os = "macos"))]
 #[derive(Default)]
 pub(crate) struct PlacementScratch {
     first: HashMap<u64, (u64, u64)>,
@@ -131,6 +140,7 @@ pub(crate) struct PlacementScratch {
 /// of different allocations never meet, so every dependency of one is the
 /// other's ([`Order`]). A slab view's reaches name the slabs its table
 /// backs.
+#[cfg(any(test, target_os = "macos"))]
 pub(crate) fn relative_placement_with(
     scratch: &mut PlacementScratch,
     list: &impl DispatchList,
@@ -176,7 +186,7 @@ pub(crate) fn relative_placement(list: &impl DispatchList, calls: Range<usize>) 
 /// Fixed-size cache key for a Metal sealed-plan submission's schedule:
 /// its first plan id followed by a 256-bit digest of all plan ids,
 /// repetition count, and relative placement.
-#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+#[cfg(any(test, target_os = "macos"))]
 pub(crate) fn schedule_key(
     scratch: &mut PlacementScratch,
     runs: &[super::PlanRun],
@@ -205,6 +215,7 @@ pub(crate) fn schedule_key(
 
 /// Append `segment`'s launches to `schedule` level by level, each level in
 /// submission order, and empty it.
+#[cfg(any(test, target_os = "macos"))]
 fn order_segment(segment: &mut Vec<(usize, usize, usize)>, schedule: &mut Vec<Scheduled>) {
     // Stable: a level keeps submission order.
     segment.sort_by_key(|(level, ..)| *level);
@@ -232,6 +243,7 @@ pub(crate) enum Through {
     Slab,
 }
 
+#[cfg(any(test, target_os = "macos"))]
 impl SlabReach {
     /// The reaches of buffer `buffer`, bound to this slab view's bytes
     /// `[offset, offset + bytes)` through its table, whose entry 0 is at
@@ -330,6 +342,7 @@ impl SlabReach {
     }
 }
 
+#[cfg(any(test, target_os = "macos"))]
 impl Records {
     /// The reach of buffer `buffer`, bound to the table entries of records
     /// `[first, first + count)` of this view, which lie in storage of their
@@ -422,6 +435,7 @@ struct IntervalLevels {
 
 impl IntervalLevels {
     /// Maximum level among all stored intervals meeting `range`.
+    #[cfg(any(test, target_os = "macos"))]
     fn max_overlap(&self, range: &Range<u64>) -> Option<usize> {
         if range.is_empty() || self.intervals.is_empty() {
             return None;
@@ -436,6 +450,21 @@ impl IntervalLevels {
             best = Some(best.map_or(level, |b| b.max(level)));
         }
         best
+    }
+
+    /// Append every stored value whose interval meets `range` into `into`.
+    fn collect_overlap(&self, range: &Range<u64>, into: &mut Vec<usize>) {
+        if range.is_empty() || self.intervals.is_empty() {
+            return;
+        }
+        if let Some((_, &(end, value))) = self.intervals.range(..range.start).next_back() {
+            if end > range.start {
+                into.push(value);
+            }
+        }
+        for (_, &(_, value)) in self.intervals.range(range.start..range.end) {
+            into.push(value);
+        }
     }
 
     /// Remove `range` from the stored intervals, splitting any interval that
@@ -487,6 +516,7 @@ impl IntervalLevels {
 
     /// Raise every byte in `range` to at least `level` (for a read, preserving
     /// higher levels on any sub-range already read at a deeper level).
+    #[cfg(any(test, target_os = "macos"))]
     fn raise(&mut self, range: Range<u64>, level: usize) {
         if range.is_empty() {
             return;
@@ -546,6 +576,7 @@ impl IntervalLevels {
 /// a later launch can still depend on. A later read depends on the writes
 /// it meets; a later write on the reads and writes. A write supersedes every
 /// earlier read and write of its bytes.
+#[cfg(any(test, target_os = "macos"))]
 #[derive(Default)]
 struct Allocated {
     reads: IntervalLevels,
@@ -553,6 +584,7 @@ struct Allocated {
 }
 
 /// The levels of one segment's launches, in submission order ([`schedule`]).
+#[cfg(any(test, target_os = "macos"))]
 #[derive(Default)]
 pub(crate) struct Order {
     reached: HashMap<u64, Allocated>,
@@ -563,6 +595,7 @@ pub(crate) struct Order {
     floor: usize,
 }
 
+#[cfg(any(test, target_os = "macos"))]
 impl Order {
     /// Place the next launch, which reaches `accesses`: its level, one past
     /// the highest of its conflicting earlier launches' (0 with none), and
@@ -598,6 +631,239 @@ impl Order {
             }
         }
         level
+    }
+}
+
+/// Disjoint non-empty half-open byte intervals `[start, end)` mapped to the
+/// set of concurrent reader node indices since the last write to those bytes.
+#[derive(Default)]
+struct IntervalNodes {
+    intervals: BTreeMap<u64, (u64, Vec<usize>)>,
+}
+
+impl IntervalNodes {
+    /// Append every reader node index whose interval meets `range` into `into`.
+    fn collect_overlap(&self, range: &Range<u64>, into: &mut Vec<usize>) {
+        if range.is_empty() || self.intervals.is_empty() {
+            return;
+        }
+        if let Some((_, (end, nodes))) = self.intervals.range(..range.start).next_back() {
+            if *end > range.start {
+                into.extend_from_slice(nodes);
+            }
+        }
+        for (_, (_, nodes)) in self.intervals.range(range.start..range.end) {
+            into.extend_from_slice(nodes);
+        }
+    }
+
+    /// Remove `range` from the stored intervals, splitting any interval that
+    /// extends past either end.
+    fn clear(&mut self, range: &Range<u64>) {
+        if range.is_empty() || self.intervals.is_empty() {
+            return;
+        }
+        let mut suffix = None;
+        if let Some((&start, (end, nodes))) = self.intervals.range(..range.start).next_back() {
+            if *end > range.start {
+                let end = *end;
+                let nodes = nodes.clone();
+                if end > range.end {
+                    suffix = Some((range.end, end, nodes.clone()));
+                }
+                self.intervals.insert(start, (range.start, nodes));
+            }
+        }
+        let keys: Vec<u64> = self
+            .intervals
+            .range(range.start..range.end)
+            .map(|(&k, _)| k)
+            .collect();
+        for key in keys {
+            let (end, nodes) = self.intervals.remove(&key).expect("key from range");
+            if end > range.end {
+                suffix = Some((range.end, end, nodes));
+            }
+        }
+        if let Some((s, e, nodes)) = suffix {
+            self.intervals.insert(s, (e, nodes));
+        }
+    }
+
+    /// Record `node` as a concurrent reader of every byte in `range`.
+    fn add(&mut self, range: Range<u64>, node: usize) {
+        if range.is_empty() {
+            return;
+        }
+        if let Some((end, nodes)) = self.intervals.get_mut(&range.start) {
+            if *end == range.end {
+                if nodes.last() != Some(&node) && !nodes.contains(&node) {
+                    nodes.push(node);
+                }
+                return;
+            }
+        }
+        let mut overlapping = Vec::new();
+        if let Some((&start, (end, nodes))) = self.intervals.range(..range.start).next_back() {
+            if *end > range.start {
+                overlapping.push((start, *end, nodes.clone()));
+            }
+        }
+        for (&start, (end, nodes)) in self.intervals.range(range.start..range.end) {
+            overlapping.push((start, *end, nodes.clone()));
+        }
+        if overlapping.is_empty() {
+            self.intervals.insert(range.start, (range.end, vec![node]));
+            return;
+        }
+        for &(start, _, _) in &overlapping {
+            self.intervals.remove(&start);
+        }
+        let mut cursor = range.start;
+        for (start, end, mut old) in overlapping {
+            if start < range.start {
+                self.intervals.insert(start, (range.start, old.clone()));
+            }
+            let ov_start = start.max(range.start);
+            let ov_end = end.min(range.end);
+            if cursor < ov_start {
+                self.intervals.insert(cursor, (ov_start, vec![node]));
+            }
+            if end > range.end {
+                self.intervals.insert(range.end, (end, old.clone()));
+            }
+            if old.last() != Some(&node) && !old.contains(&node) {
+                old.push(node);
+            }
+            self.intervals.insert(ov_start, (ov_end, old));
+            cursor = ov_end;
+        }
+        if cursor < range.end {
+            self.intervals.insert(cursor, (range.end, vec![node]));
+        }
+    }
+}
+
+#[derive(Default)]
+struct DagAllocated {
+    reads: IntervalNodes,
+    writes: IntervalLevels,
+}
+
+/// Exact transitively-reduced buffer-hazard DAG of one segment's launches
+/// (for CUDA graphs, where `DirectGraphBuilder::launch` accepts arbitrary
+/// `after: &[usize]` predecessor edges).
+#[derive(Default)]
+pub(crate) struct DagOrder {
+    reached: HashMap<u64, DagAllocated>,
+    /// Current sink node indices in the open segment (no outgoing edges yet).
+    sinks: Vec<usize>,
+    /// Most recent `alone` (resident/barrier) node in the open segment.
+    floor: Option<usize>,
+    /// Node index of the first node placed in the open segment.
+    segment_base: usize,
+    /// Per-node transitive ancestor bitsets (indexed by `node - segment_base`).
+    ancestors: Vec<Vec<u64>>,
+}
+
+impl DagOrder {
+    /// Reset hazard state at a timeline or mark barrier before `next_node`.
+    pub(crate) fn reset(&mut self, next_node: usize) {
+        self.reached.clear();
+        self.sinks.clear();
+        self.floor = None;
+        self.segment_base = next_node;
+        self.ancestors.clear();
+    }
+
+    /// Place `node` (which must be `segment_base + placed_in_segment`), writing
+    /// its minimal transitively-reduced predecessor node indices into `after`.
+    ///
+    /// - RAW: depends on the latest writer of any overlapping byte range.
+    /// - WAR: depends on every concurrent reader since the last write.
+    /// - WAW: depends on the latest writer of any overlapping byte range.
+    /// - `alone`: depends on every current sink; clears prior reaches and
+    ///   becomes the floor for subsequent launches without data predecessors.
+    pub(crate) fn place_next(
+        &mut self,
+        node: usize,
+        accesses: &[Access],
+        alone: bool,
+        after: &mut Vec<usize>,
+    ) {
+        debug_assert_eq!(
+            node,
+            self.segment_base + self.ancestors.len(),
+            "DagOrder nodes in a segment are placed sequentially"
+        );
+        after.clear();
+        if alone {
+            after.extend_from_slice(&self.sinks);
+            after.sort_unstable();
+            self.reached.clear();
+            self.floor = Some(node);
+            self.sinks.clear();
+            self.sinks.push(node);
+        } else {
+            for access in accesses {
+                let Some(allocated) = self.reached.get(&access.allocation) else {
+                    continue;
+                };
+                allocated.writes.collect_overlap(&access.bytes, after);
+                if access.write {
+                    allocated.reads.collect_overlap(&access.bytes, after);
+                }
+            }
+            after.sort_unstable();
+            after.dedup();
+            // Transitive reduction: drop `p` if any later predecessor `q > p`
+            // already has `p` as a transitive ancestor. This keeps minimal
+            // edges and preserves single-predecessor PDL chains.
+            if after.len() > 1 {
+                let base = self.segment_base;
+                let mut reduced = Vec::with_capacity(after.len());
+                for (i, &p) in after.iter().enumerate() {
+                    let p_rel = p - base;
+                    let p_word = p_rel / 64;
+                    let p_bit = 1u64 << (p_rel % 64);
+                    let covered = after[i + 1..].iter().any(|&q| {
+                        let anc = &self.ancestors[q - base];
+                        anc.get(p_word).is_some_and(|&w| w & p_bit != 0)
+                    });
+                    if !covered {
+                        reduced.push(p);
+                    }
+                }
+                *after = reduced;
+            }
+            if after.is_empty() {
+                if let Some(floor) = self.floor {
+                    after.push(floor);
+                }
+            }
+            self.sinks.retain(|s| !after.contains(s));
+            self.sinks.push(node);
+            for access in accesses {
+                let allocated = self.reached.entry(access.allocation).or_default();
+                if access.write {
+                    allocated.reads.clear(&access.bytes);
+                    allocated.writes.set(access.bytes.clone(), node);
+                } else {
+                    allocated.reads.add(access.bytes.clone(), node);
+                }
+            }
+        }
+        let rel = node - self.segment_base;
+        let words = (rel + 64) / 64;
+        let mut anc = vec![0u64; words];
+        for &p in after.iter() {
+            let p_rel = p - self.segment_base;
+            anc[p_rel / 64] |= 1u64 << (p_rel % 64);
+            for (dst, &src) in anc.iter_mut().zip(&self.ancestors[p_rel]) {
+                *dst |= src;
+            }
+        }
+        self.ancestors.push(anc);
     }
 }
 
@@ -1195,5 +1461,157 @@ mod tests {
         reach_3.extend_logical(0, &table, 0, 0, slab_bytes, &mut out_lent_only);
         assert_eq!(out_lent_only.len(), 2);
         assert_eq!((out_lent_only[1].allocation, out_lent_only[1].offset, out_lent_only[1].bytes), (lender_id, lender_base, slab_bytes));
+    }
+
+    fn dag_edges(launches: &[(Vec<Access>, bool)]) -> Vec<Vec<usize>> {
+        let mut dag = DagOrder::default();
+        let mut after = Vec::new();
+        launches
+            .iter()
+            .enumerate()
+            .map(|(node, (accesses, alone))| {
+                dag.place_next(node, accesses, *alone, &mut after);
+                after.clone()
+            })
+            .collect()
+    }
+
+    #[test]
+    fn dag_independent_raw_war_waw_and_transitive_reduction() {
+        // Independent writes to disjoint ranges or allocations have no predecessors.
+        assert_eq!(
+            dag_edges(&[
+                (vec![write(1, 0..64)], false),
+                (vec![write(1, 64..128)], false),
+                (vec![write(2, 0..64)], false),
+            ]),
+            vec![Vec::<usize>::new(), vec![], vec![]]
+        );
+
+        // Multiple concurrent readers before a write: WAR depends on ALL readers.
+        assert_eq!(
+            dag_edges(&[
+                (vec![write(1, 0..64)], false),             // 0: write buf 1
+                (vec![read(1, 0..32), write(2, 0..32)], false), // 1: read [0..32)
+                (vec![read(1, 32..64), write(3, 0..32)], false), // 2: read [32..64)
+                (vec![read(1, 0..64), write(4, 0..64)], false), // 3: read [0..64)
+                (vec![write(1, 0..64)], false),             // 4: WAR on 1, 2, 3 (0 is transitively covered)
+            ]),
+            vec![vec![], vec![0], vec![0], vec![0], vec![1, 2, 3]]
+        );
+
+        // WAW without intervening reads depends on prior writer.
+        assert_eq!(
+            dag_edges(&[
+                (vec![write(1, 0..64)], false),
+                (vec![write(1, 32..96)], false),
+            ]),
+            vec![vec![], vec![0]]
+        );
+
+        // Transitive reduction: 0 -> 1, and 2 reads both 0's and 1's outputs ->
+        // 2 depends only on [1], preserving single-predecessor PDL!
+        assert_eq!(
+            dag_edges(&[
+                (vec![write(1, 0..64)], false),                 // 0: rmsnorm
+                (vec![read(1, 0..64), write(2, 0..32)], false), // 1: router
+                (vec![read(1, 0..64), read(2, 0..32), write(3, 0..64)], false), // 2: expand
+            ]),
+            vec![vec![], vec![0], vec![1]]
+        );
+
+        // Alone (resident) launch waits for all current sinks, and later
+        // independent launches follow it.
+        assert_eq!(
+            dag_edges(&[
+                (vec![write(1, 0..64)], false), // 0
+                (vec![write(2, 0..64)], false), // 1
+                (vec![write(3, 0..64)], true),  // 2 (alone): waits for 0 and 1
+                (vec![write(4, 0..64)], false), // 3: follows alone node 2
+                (vec![write(5, 0..64)], false), // 4: follows alone node 2
+            ]),
+            vec![vec![], vec![], vec![0, 1], vec![2], vec![2]]
+        );
+    }
+
+    #[test]
+    fn dag_reset_isolates_segments() {
+        let mut dag = DagOrder::default();
+        let mut after = Vec::new();
+        dag.place_next(0, &[write(1, 0..64)], false, &mut after);
+        assert!(after.is_empty());
+        dag.reset(1);
+        dag.place_next(1, &[read(1, 0..64)], false, &mut after);
+        assert!(after.is_empty());
+        dag.place_next(2, &[write(1, 0..64)], false, &mut after);
+        assert_eq!(after, vec![1]);
+    }
+
+    #[test]
+    fn dag_matches_naive_hazard_reachability() {
+        let mut state = 0x9e37_79b9_7f4a_7c15u64;
+        let mut next = || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state
+        };
+        for _ in 0..20 {
+            let n = 40usize;
+            let mut launches = Vec::with_capacity(n);
+            for _ in 0..n {
+                let alone = next() % 13 == 0;
+                let count = (next() % 4) as usize + 1;
+                let mut accesses = Vec::with_capacity(count);
+                for _ in 0..count {
+                    let alloc = next() % 4;
+                    let start = (next() % 8) * 16;
+                    let len = ((next() % 4) + 1) * 16;
+                    let is_write = next() % 3 == 0;
+                    accesses.push(access(alloc, start..start + len, is_write));
+                }
+                launches.push((accesses, alone));
+            }
+            let edges = dag_edges(&launches);
+            // Compute transitive reachability from DagOrder edges.
+            let mut reach = vec![vec![false; n]; n];
+            for i in 0..n {
+                for &p in &edges[i] {
+                    assert!(p < i);
+                    reach[i][p] = true;
+                    for k in 0..p {
+                        if reach[p][k] {
+                            reach[i][k] = true;
+                        }
+                    }
+                }
+            }
+            // Compute naive transitive reachability from direct conflicts + alone.
+            let mut naive = vec![vec![false; n]; n];
+            for i in 0..n {
+                let (ref acc_i, alone_i) = launches[i];
+                for j in 0..i {
+                    let (ref acc_j, alone_j) = launches[j];
+                    let conflict = alone_i
+                        || alone_j
+                        || acc_i.iter().any(|a| {
+                            acc_j.iter().any(|b| {
+                                a.allocation == b.allocation
+                                    && (a.write || b.write)
+                                    && crate::api::tensor::meet(&a.bytes, &b.bytes)
+                            })
+                        });
+                    if conflict {
+                        naive[i][j] = true;
+                        for k in 0..j {
+                            if naive[j][k] {
+                                naive[i][k] = true;
+                            }
+                        }
+                    }
+                }
+            }
+            assert_eq!(reach, naive, "DagOrder reachability diverged from naive hazard reachability");
+        }
     }
 }

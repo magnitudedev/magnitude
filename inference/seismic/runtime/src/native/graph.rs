@@ -12,7 +12,6 @@
 //! and the tensors bound to external ports; attaching checks those bindings
 //! alone, so per-run host work does not revalidate nodes.
 
-#[cfg(any(test, target_os = "macos"))]
 use super::hazard::{Reach, Through};
 use super::point::{GraphPoint, GraphTiming};
 use super::spans::{NativeSpans, Stamp};
@@ -5213,14 +5212,48 @@ impl NativeGraphPlan {
         self.graphed() && super::backend_name(&self.device.kind) == BackendName::Cuda
     }
 
+    /// Whether any written external port binds bytes overlapping any other
+    /// external port (on CUDA, such a run falls back to stream-ordered launch
+    /// because the recorded layout DAG assumes distinct external ports do not
+    /// alias).
+    fn has_cross_port_alias(&self, bindings: &NativeGraphBindings) -> bool {
+        for (written_port, &writes) in self.topology.external_writes.iter().enumerate() {
+            if !writes {
+                continue;
+            }
+            let Some(written_bound) = bindings.inputs[written_port].as_ref() else {
+                continue;
+            };
+            let written_group = written_bound.tensor.allocation().access_identity();
+            let mut written_reaching = None;
+            for (other_port, other_bound) in bindings.inputs.iter().enumerate() {
+                if other_port == written_port {
+                    continue;
+                }
+                let Some(other_bound) = other_bound.as_ref() else {
+                    continue;
+                };
+                if other_bound.tensor.allocation().access_identity() != written_group {
+                    continue;
+                }
+                let w = written_reaching.get_or_insert_with(|| Reaching::new(&written_bound.tensor));
+                let o = Reaching::new(&other_bound.tensor);
+                if w.meets(0..written_bound.tensor.byte_len(), &o, 0..other_bound.tensor.byte_len()) {
+                    return true;
+                }
+            }
+        }
+        false
+    }
+
     /// A slot's share of its device's graph budget ([`super::SlotGraphs`]):
     /// a launch of the plan's own slot is one run, of its layout's graph of
     /// the launches it makes, a family of its own.
     fn slot_hold(self: &Arc<Self>) -> Result<Arc<super::SlotGraphs>, TensorError> {
         let form: Arc<[u64]> = self.shape.structure.clone().into();
         let census = self.run_graphs(&form);
-        let layout = super::LayoutGraph { form, plans: vec![self.clone()] };
-        let layouts = super::LayoutForms::new([(self.shape.layout, layout)]);
+        let layout = Arc::new(super::LayoutGraph { form, plans: vec![self.clone()] });
+        let layouts = super::LayoutForms::new([(self.identity, layout)]);
         let graphs = LaunchGraphs::of([LaunchedGraph { graph: census, pinned_runs: 0, runs: 1 }], Vec::new())
             .expect("a plan's graph census fits u64");
         super::FamilyGraphs::new(&self.device, layouts, graphs).slot().map_err(TensorError::Execution)
@@ -5515,55 +5548,190 @@ impl NativeGraphFamily {
         {
             return Err(WorkflowError::NativeGraphSlotMismatch);
         }
-        // Its plans by layout, in order of their first.
-        let mut at = std::collections::HashMap::<u64, usize>::new();
-        let mut layouts = Vec::<super::LayoutGraph>::new();
-        for plan in plans {
-            let index = *at.entry(plan.shape.layout).or_insert_with(|| {
-                layouts.push(super::LayoutGraph { plans: Vec::new(), form: Arc::from([]) });
-                layouts.len() - 1
-            });
-            layouts[index].plans.push(plan.clone());
-        }
-        for graphs in &mut layouts {
-            let calls = graphs.plans[0].shape.structure.len();
-            assert!(
-                graphs.plans.iter().all(|plan| plan.shape.structure.len() == calls),
-                "a layout's plans make launches of the same calls"
-            );
-            // On CUDA a graph holds its run's timeline nodes, so they are
-            // part of the form one graph of the layout serves.
-            assert!(
-                super::backend_name(&first.device.kind) != BackendName::Cuda
-                    || graphs.plans.iter().all(|plan| plan.topology.timelines == graphs.plans[0].topology.timelines),
-                "a layout's plans hold the same timeline nodes"
-            );
-            graphs.form = (0..calls)
-                .map(|call| graphs.plans.iter().fold(0, |made, plan| made | plan.shape.structure[call]))
-                .collect();
-        }
         // Every plan runs in some launch, else the graphs its runs record
         // would lie outside what the family holds.
         let members = plans.iter().map(Arc::as_ptr).collect::<std::collections::HashSet<_>>();
         let launched = launches.iter().flatten().map(Arc::as_ptr).collect::<std::collections::HashSet<_>>();
         assert!(launched.is_subset(&members), "a family's launches run its plans");
         assert_eq!(launched.len(), members.len(), "every plan of a family runs in one of its launches");
-        let graph_of = |plan: &Arc<NativeGraphPlan>| plan.run_graphs(&layouts[at[&plan.shape.layout]].form);
+
+        // Group plans by layout first to compute each layout's budget limits
+        // (max pinned runs in any decode launch, max runs in any launch).
+        let mut layout_index = std::collections::HashMap::<u64, usize>::new();
+        let mut raw_layouts = Vec::<Vec<Arc<NativeGraphPlan>>>::new();
+        for plan in plans {
+            let index = *layout_index.entry(plan.shape.layout).or_insert_with(|| {
+                raw_layouts.push(Vec::new());
+                raw_layouts.len() - 1
+            });
+            raw_layouts[index].push(plan.clone());
+        }
+        let layout_count = raw_layouts.len();
+        let mut layout_pinned_limit = vec![0u64; layout_count];
+        let mut layout_runs_limit = vec![0u64; layout_count];
+        for (launch_idx, runs) in launches.iter().enumerate() {
+            let mut counts = vec![0u64; layout_count];
+            for plan in runs.iter().filter(|plan| plan.graphed()) {
+                counts[layout_index[&plan.shape.layout]] += 1;
+            }
+            for (li, count) in counts.into_iter().enumerate() {
+                layout_runs_limit[li] = layout_runs_limit[li].max(count);
+                if launch_idx < decodes {
+                    layout_pinned_limit[li] = layout_pinned_limit[li].max(count);
+                }
+            }
+        }
+
+        // Partition each layout's plans by exact `plan.shape.structure` so
+        // plans with distinct launch bitmasks do not bloat one another with
+        // disabled alternate-form nodes. Greedily merge sub-groups only when
+        // keeping them separate would exceed the layout's unsplit graph budget.
+        let mut layouts = Vec::<super::LayoutGraph>::new();
+        let mut plan_group = std::collections::HashMap::<u64, usize>::new();
+        for (li, layout_plans) in raw_layouts.into_iter().enumerate() {
+            let calls = layout_plans[0].shape.structure.len();
+            assert!(
+                layout_plans.iter().all(|plan| plan.shape.structure.len() == calls),
+                "a layout's plans make launches of the same calls"
+            );
+            // On CUDA a graph holds its run's timeline nodes, so they are
+            // part of the form one graph of the layout serves.
+            assert!(
+                super::backend_name(&first.device.kind) != BackendName::Cuda
+                    || layout_plans.iter().all(|plan| plan.topology.timelines == layout_plans[0].topology.timelines),
+                "a layout's plans hold the same timeline nodes"
+            );
+
+            struct SubGroup {
+                plans: Vec<Arc<NativeGraphPlan>>,
+                form: Vec<u64>,
+                counts: Vec<u64>,
+                pinned_runs: u64,
+                runs: u64,
+            }
+
+            let mut groups = Vec::<SubGroup>::new();
+            let mut by_structure = std::collections::HashMap::<&[u64], usize>::new();
+            for plan in &layout_plans {
+                let gi = *by_structure.entry(plan.shape.structure.as_slice()).or_insert_with(|| {
+                    groups.push(SubGroup {
+                        plans: Vec::new(),
+                        form: plan.shape.structure.clone(),
+                        counts: vec![0; launches.len()],
+                        pinned_runs: 0,
+                        runs: 0,
+                    });
+                    groups.len() - 1
+                });
+                groups[gi].plans.push(plan.clone());
+            }
+
+            if groups.len() > 1 {
+                let mut local_group = std::collections::HashMap::<u64, usize>::new();
+                for (gi, group) in groups.iter().enumerate() {
+                    for plan in &group.plans {
+                        local_group.insert(plan.identity, gi);
+                    }
+                }
+                for (launch_idx, runs) in launches.iter().enumerate() {
+                    for plan in runs.iter().filter(|plan| plan.graphed()) {
+                        if let Some(&gi) = local_group.get(&plan.identity) {
+                            groups[gi].counts[launch_idx] += 1;
+                        }
+                    }
+                }
+                for group in &mut groups {
+                    group.runs = group.counts.iter().copied().max().unwrap_or(0);
+                    group.pinned_runs = group.counts[..decodes].iter().copied().max().unwrap_or(0);
+                }
+
+                let pinned_limit = layout_pinned_limit[li];
+                let runs_limit = layout_runs_limit[li];
+                loop {
+                    let sum_pinned: u64 = groups.iter().map(|g| g.pinned_runs).sum();
+                    let sum_runs: u64 = groups.iter().map(|g| g.runs).sum();
+                    if sum_pinned <= pinned_limit && sum_runs <= runs_limit {
+                        break;
+                    }
+                    // Pick the pair whose merge most reduces the budget excess,
+                    // breaking ties by smallest dead-node bloat.
+                    let mut best: Option<(usize, usize, u64, u64)> = None;
+                    for a in 0..groups.len() {
+                        for b in (a + 1)..groups.len() {
+                            let mut merged_pinned = 0u64;
+                            let mut merged_runs = 0u64;
+                            for (idx, (&ca, &cb)) in groups[a].counts.iter().zip(&groups[b].counts).enumerate() {
+                                let c = ca + cb;
+                                merged_runs = merged_runs.max(c);
+                                if idx < decodes {
+                                    merged_pinned = merged_pinned.max(c);
+                                }
+                            }
+                            let saved_pinned = (groups[a].pinned_runs + groups[b].pinned_runs).saturating_sub(merged_pinned);
+                            let saved_runs = (groups[a].runs + groups[b].runs).saturating_sub(merged_runs);
+                            let excess_before = sum_pinned.saturating_sub(pinned_limit) + sum_runs.saturating_sub(runs_limit);
+                            let excess_after = sum_pinned.saturating_sub(saved_pinned).saturating_sub(pinned_limit)
+                                + sum_runs.saturating_sub(saved_runs).saturating_sub(runs_limit);
+                            let reduction = excess_before.saturating_sub(excess_after);
+                            if reduction == 0 {
+                                continue;
+                            }
+                            let bloat: u64 = groups[a]
+                                .form
+                                .iter()
+                                .zip(&groups[b].form)
+                                .map(|(&fa, &fb)| u64::from((fa ^ fb).count_ones()))
+                                .sum();
+                            if best.is_none_or(|(_, _, best_red, best_bloat)| {
+                                reduction > best_red || (reduction == best_red && bloat < best_bloat)
+                            }) {
+                                best = Some((a, b, reduction, bloat));
+                            }
+                        }
+                    }
+                    let (a, b, _, _) = best.expect("merging sub-groups of one layout always reduces excess");
+                    let merged = groups.swap_remove(b);
+                    let target = &mut groups[a];
+                    target.plans.extend(merged.plans);
+                    for (fa, fb) in target.form.iter_mut().zip(&merged.form) {
+                        *fa |= *fb;
+                    }
+                    for (ca, cb) in target.counts.iter_mut().zip(&merged.counts) {
+                        *ca += *cb;
+                    }
+                    target.runs = target.counts.iter().copied().max().unwrap_or(0);
+                    target.pinned_runs = target.counts[..decodes].iter().copied().max().unwrap_or(0);
+                }
+            }
+
+            for group in groups {
+                let gi = layouts.len();
+                for plan in &group.plans {
+                    plan_group.insert(plan.identity, gi);
+                }
+                layouts.push(super::LayoutGraph {
+                    plans: group.plans,
+                    form: group.form.into(),
+                });
+            }
+        }
+
+        let graph_of = |plan: &Arc<NativeGraphPlan>| plan.run_graphs(&layouts[plan_group[&plan.identity]].form);
         let launch_graphs = launches
             .iter()
             .map(|runs| runs.iter().try_fold(GraphCensus::default(), |census, plan| census.plus(graph_of(plan))))
             .collect::<Option<Vec<_>>>()
             .expect("a family's graph census fits u64");
-        // Of each layout, its largest plan's graph (every plan of a layout
+        // Of each group, its largest plan's graph (every plan of a layout
         // runs in some launch), and the most runs of it any one decode
         // launch, and any one launch, makes.
         let mut graphed = vec![LaunchedGraph { graph: GraphCensus::default(), pinned_runs: 0, runs: 0 }; layouts.len()];
         for (index, runs) in launches.iter().enumerate() {
             let mut counts = vec![0u64; layouts.len()];
             for plan in runs.iter().filter(|plan| plan.graphed()) {
-                let layout = at[&plan.shape.layout];
-                counts[layout] += 1;
-                graphed[layout].graph = graphed[layout].graph.most(plan.run_graphs(&layouts[layout].form));
+                let group = plan_group[&plan.identity];
+                counts[group] += 1;
+                graphed[group].graph = graphed[group].graph.most(plan.run_graphs(&layouts[group].form));
             }
             for (graphed, count) in graphed.iter_mut().zip(counts) {
                 graphed.runs = graphed.runs.max(count);
@@ -5584,11 +5752,14 @@ impl NativeGraphFamily {
             .iter()
             .zip(&graphed)
             .filter(|(_, graphed)| graphed.pinned_runs > 0)
-            .map(|(graphs, graphed)| (graphs.plans[0].shape.layout, graphed.pinned_runs as usize))
+            .map(|(graphs, graphed)| (graphs.plans[0].identity, graphed.pinned_runs as usize))
             .collect::<Vec<_>>();
         let graphs = LaunchGraphs::of(graphed, chained).expect("a family's graph census fits u64");
-        let count = layouts.len();
-        let layouts = super::LayoutForms::new(layouts.into_iter().map(|graph| (graph.plans[0].shape.layout, graph)));
+        let count = layout_count;
+        let layouts = super::LayoutForms::new(layouts.into_iter().flat_map(|graph| {
+            let graph = Arc::new(graph);
+            graph.plans.iter().map(|plan| (plan.identity, graph.clone())).collect::<Vec<_>>()
+        }));
         Ok(Self {
             graphs: super::FamilyGraphs::new(&first.device, layouts, graphs),
             layouts: count,
@@ -6214,6 +6385,8 @@ impl NativeGraphSlot {
             }
         }
         self.plan.check_disjoint(&bindings, false)?;
+        let cross_port_alias = super::backend_name(&self.plan.device.kind) == BackendName::Cuda
+            && self.plan.has_cross_port_alias(&bindings);
         let mut timelines = Vec::with_capacity(bindings.timelines.len());
         let mut parks = Vec::new();
         for (node, (bound, &(position, kind))) in bindings
@@ -6276,6 +6449,7 @@ impl NativeGraphSlot {
             exports,
             timelines,
             parks,
+            cross_port_alias,
         })
     }
 }
@@ -6576,6 +6750,8 @@ pub struct ReadyNativeGraphRun<'a> {
     /// kernels do not park, in node order: each takes a value when the run
     /// is queued.
     parks: Vec<PendingPark>,
+    /// Whether any written external port overlaps another external port.
+    cross_port_alias: bool,
 }
 
 /// A park or a publication a run binds to a timeline
@@ -6741,6 +6917,7 @@ impl ReadyNativeGraphRun<'_> {
             stamps,
             left_out: Vec::new(),
             hold: self.slot.hold.clone(),
+            cross_port_alias: self.cross_port_alias,
         };
         // The run's launches are decided here, once: its encoding and its
         // parks follow the same conditions.
@@ -6941,6 +7118,8 @@ struct QueuedRun {
     /// Its slot's graphs in the device's graph budget, held until the run
     /// is recorded and replayed, and the form of its layout's graph there.
     hold: Arc<super::SlotGraphs>,
+    /// Whether any written external port overlaps another external port.
+    cross_port_alias: bool,
 }
 
 /// The tensor a queued run binds to an external port.
@@ -7255,9 +7434,62 @@ impl DispatchList for PlaceholderRun<'_> {
         true
     }
 
-    /// None: a graph's launches keep stream order, whatever they reach.
-    #[cfg(any(test, target_os = "macos"))]
-    fn reaches(&self, _index: usize, _reaches: &mut Vec<Reach>) {}
+    /// Static per-region byte reaches of call `index` for CUDA DAG hazard
+    /// analysis: synthetic allocation identities (bit 63 set so they never
+    /// collide with real allocations such as scalar-result slots) distinguish
+    /// the four disjoint graph storage regions and each external port. Runs
+    /// whose bound external ports alias a written port fall back to
+    /// stream-ordered launch (`PlanRun::cross_port_alias`).
+    fn reaches(&self, index: usize, reaches: &mut Vec<Reach>) {
+        const SYNTH_WORKSPACE: u64 = (1u64 << 63) | 1;
+        const SYNTH_SYNC: u64 = (1u64 << 63) | 2;
+        const SYNTH_UPLOAD: u64 = (1u64 << 63) | 3;
+        const SYNTH_OUTPUTS: u64 = (1u64 << 63) | 4;
+        const SYNTH_EXTERNAL: u64 = (1u64 << 63) | 5;
+        let static_node = &self.plan.topology.nodes[index];
+        for (buffer, site) in static_node.sites.iter().enumerate() {
+            let idx = static_node.site_base + buffer;
+            let site_bytes = self.plan.site_bytes[idx];
+            let site_offset = self.plan.site_offsets[idx];
+            let site_records = self.plan.site_records[idx];
+            let (allocation, offset, bytes, through) = match (site.region, site_records) {
+                (Region::External(port), SiteRecords::Port(count)) => {
+                    if count == 0 {
+                        continue;
+                    }
+                    // Record size is bound per run; conservatively cover the
+                    // whole external port so all writes/reads on that port order.
+                    (SYNTH_EXTERNAL + u64::from(port), 0, u64::MAX / 2, Through::Slab)
+                }
+                (Region::Workspace, SiteRecords::Workspace { .. }) => {
+                    (SYNTH_WORKSPACE, site_offset, site_bytes, Through::Slab)
+                }
+                (Region::External(port), SiteRecords::None) => {
+                    (SYNTH_EXTERNAL + u64::from(port), site_offset, site_bytes, Through::Binding)
+                }
+                (Region::Workspace, SiteRecords::None) => {
+                    (SYNTH_WORKSPACE, site_offset, site_bytes, Through::Binding)
+                }
+                (Region::Sync, SiteRecords::None) => {
+                    (SYNTH_SYNC, site_offset, site_bytes, Through::Binding)
+                }
+                (Region::Upload, SiteRecords::None) => {
+                    (SYNTH_UPLOAD, site_offset, site_bytes, Through::Binding)
+                }
+                (Region::Outputs, SiteRecords::None) => {
+                    (SYNTH_OUTPUTS, site_offset, site_bytes, Through::Binding)
+                }
+                (region, records) => unreachable!("a {records:?} record site in {region:?}"),
+            };
+            reaches.push(Reach {
+                buffer,
+                allocation,
+                offset,
+                bytes,
+                through,
+            });
+        }
+    }
 
     fn runs(&self) -> Option<Vec<super::PlanRun>> {
         Some(vec![super::PlanRun {
@@ -7292,8 +7524,14 @@ impl DispatchList for SequenceList<'_> {
         self.runs[run].encodes(node, ordinal)
     }
 
-    #[cfg(any(test, target_os = "macos"))]
     fn reaches(&self, index: usize, reaches: &mut Vec<Reach>) {
+        #[cfg(not(any(test, target_os = "macos")))]
+        {
+            let _ = (index, reaches);
+            unreachable!("SequenceList::reaches is only used on Metal");
+        }
+        #[cfg(any(test, target_os = "macos"))]
+        {
         let (run, node) = self.nodes[index];
         let run = &self.runs[run];
         let region = |region: &Option<Arc<Allocation>>| {
@@ -7391,6 +7629,7 @@ impl DispatchList for SequenceList<'_> {
                 through: Through::Binding,
             });
         }
+        }
     }
 
     fn runs(&self) -> Option<Vec<super::PlanRun>> {
@@ -7401,15 +7640,21 @@ impl DispatchList for SequenceList<'_> {
                 .map(|run| {
                     let calls = first..first + run.plan.topology.nodes.len();
                     first = calls.end;
-                    let graph = run.hold.layout(run.plan.shape.layout);
+                    let graph = run.hold.layout(run.plan.identity);
+                    // A run with cross-port external aliasing falls back to
+                    // direct stream-ordered launch (`launched: true`) so it
+                    // must NOT hold timelines or marks inside an unsplit
+                    // segment; `graph_segments` then splits at every internal
+                    // timeline and stamp boundary so `cuda::issue` emits them.
+                    let direct = !run.plan.graphed() || run.cross_port_alias;
                     super::PlanRun {
                         plan: run.plan.identity,
                         layout: run.plan.shape.layout,
                         calls,
                         timelines: run.plan.topology.timelines.to_vec(),
-                        marks: run.plan.held_marks(),
-                        launched: !run.plan.graphed(),
-                        holds_timelines: run.plan.holds_timelines(),
+                        marks: if direct { Vec::new() } else { run.plan.held_marks() },
+                        launched: direct,
+                        holds_timelines: run.plan.holds_timelines() && !direct,
                         graph,
                     }
                 })

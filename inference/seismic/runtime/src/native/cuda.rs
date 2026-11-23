@@ -350,6 +350,10 @@ fn plan_segments<'l>(
         let work = if calls.is_empty() {
             Pending::Empty
         } else if keys.launched(&calls) {
+            assert!(
+                !keys.run(&calls).holds_timelines,
+                "a direct (launched) run must not hold timelines inside an unsplit segment"
+            );
             Pending::Direct(calls)
         } else {
             let run = keys.run(&calls);
@@ -443,7 +447,10 @@ fn bind_launches(
     let mut node = 0;
     each_launch(list, calls.clone(), encoded, |index, ordinal, launch, runs| {
         if !holds(form[index - calls.start], ordinal) {
-            assert!(launch.is_none(), "a run makes only launches its layout's graph holds");
+            assert!(
+                launch.is_none_or(|launch| launch.is_empty()),
+                "a run makes only non-empty launches its layout's graph holds"
+            );
             return Ok(());
         }
         match launch {
@@ -556,32 +563,72 @@ fn record<L: DispatchList>(
 ) -> Result<DirectGraph, ExecutionError> {
     let encoded = lists[0].encoded();
     let mut builder = DirectGraphBuilder::new(device)?;
+    let mut dag = super::hazard::DagOrder::default();
+    let mut buffers = Vec::new();
+    let mut reaches = Vec::new();
+    let mut accesses = Vec::new();
+    let mut after = Vec::new();
     let mut nodes = 0usize;
     let mut marks = marks.iter().peekable();
     let mut timelines = timelines.iter().peekable();
     for index in calls {
         while marks.next_if_eq(&&index).is_some() {
             builder.mark()?;
+            dag.reset(nodes);
         }
+        let mut parked_call = false;
         while let Some((_, node)) = timelines.next_if(|(at, _)| *at == index) {
             match node {
-                TimelineNode::Wait => builder.wait_word(placeholder, 0)?,
-                TimelineNode::Signal => builder.write_word(placeholder, 0)?,
-                TimelineNode::Park | TimelineNode::Publish => {}
+                TimelineNode::Wait => {
+                    builder.wait_word(placeholder, 0)?;
+                    dag.reset(nodes);
+                }
+                TimelineNode::Signal => {
+                    builder.write_word(placeholder, 0)?;
+                    dag.reset(nodes);
+                }
+                TimelineNode::Park => {
+                    // A parking kernel spins on a host word; isolate it in the
+                    // DAG (`alone = true`) so it never shares the GPU with
+                    // concurrent kernels.
+                    parked_call = true;
+                }
+                TimelineNode::Publish => {}
             }
         }
+        if form[index] == 0 {
+            continue;
+        }
+        accesses.clear();
+        for list in lists {
+            buffers.clear();
+            let dispatch = list.dispatch(index, &mut buffers);
+            reaches.clear();
+            list.reaches(index, &mut reaches);
+            super::hazard::dispatch_accesses(&dispatch, &reaches, &mut accesses);
+        }
         for ordinal in (0..u64::BITS as usize).filter(|&ordinal| holds(form[index], ordinal)) {
-            let previous = nodes.checked_sub(1);
+            let alone = parked_call
+                || lists.iter().any(|list| {
+                    buffers.clear();
+                    let dispatch = list.dispatch(index, &mut buffers);
+                    dispatch.launches[ordinal].is_some_and(|launch| launch.barrier.is_some())
+                });
+            dag.place_next(nodes, &accesses, alone, &mut after);
             let added = lists
                 .iter()
                 .enumerate()
                 .find_map(|(made, list)| {
                     with_launch(list, index, ordinal, |launch| {
-                        let runs = made == 0 && encoded[index][ordinal] && !launch.is_empty();
-                        builder.launch(launch, previous.as_slice(), runs)
+                        if launch.is_empty() {
+                            return None;
+                        }
+                        let runs = made == 0 && encoded[index][ordinal];
+                        Some(builder.launch(launch, &after, runs))
                     })
+                    .flatten()
                 })
-                .expect("a layout's graph holds only launches a plan of it makes");
+                .expect("a layout's graph holds only non-empty launches a plan of it makes");
             added?;
             nodes += 1;
         }
@@ -778,7 +825,7 @@ pub(super) fn launch_structure(geometry: &[Option<super::LaunchGeometry>], into:
         geometry
             .iter()
             .enumerate()
-            .filter(|(_, launch)| launch.is_some())
+            .filter(|(_, launch)| launch.is_some_and(|launch| !launch.is_empty()))
             .fold(0, |made, (ordinal, _)| made | 1 << ordinal),
     );
 }
