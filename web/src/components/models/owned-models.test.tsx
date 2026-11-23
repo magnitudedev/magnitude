@@ -67,6 +67,7 @@ describe("the user's models", () => {
   it("shows the list in the empty state's place once a model is visible, with Hidden still below", () => {
     const html = renderToStaticMarkup(<OwnedModels list={list} empty={EMPTY} hidden={[model]} unrunnable={[]} onUnhide={() => {}} />)
     expect(html).not.toContain("No models are downloaded yet.")
+    expect(html).toContain("1 downloaded model")
     expect(html).toContain("Find in your models")
     expect(html).toContain("Hidden (1)")
     expect(html).not.toContain("No models match.")
@@ -232,5 +233,54 @@ describe("the user's models", () => {
     )
     expect(pendingHtml).toContain("Loading…")
     expect(pendingHtml).not.toContain(">Load</button>")
+  })
+
+  it("shows Not supported with the engine reason instead of Doesn’t fit for unsupported downloaded models", () => {
+    const assessed = baseModel.servingState._tag === "Assessed" ? baseModel.servingState : (() => { throw new Error("expected assessed") })()
+    const unsupported: LocalModel = {
+      _tag: "Custom",
+      modelId: "hf:magnitudedev/d1-2B-GGUF/d1-2B-Q4_K_M.gguf" as never,
+      origin: { _tag: "Added", repository: "magnitudedev/d1-2B-GGUF" as never, commit: "1a75d474b9b3b91f150e391a42ef96cf134401e9" },
+      presentation: {
+        displayName: "d1 2B",
+        variantLabel: "Q4_K_M" as never,
+        sourceLabel: "Added",
+        variantOf: Option.none(),
+        developer: Option.none(),
+        license: Option.none(),
+        sourceUrls: [],
+      },
+      drafter: Option.none(),
+      drafterPending: false,
+      drafterChoice: { _tag: "Auto" },
+      recommendedDrafter: Option.none(),
+      acquisitionState: baseModel.acquisitionState as never,
+      servingState: {
+        ...assessed,
+        assessment: {
+          _tag: "Unsupported",
+          environmentId: assessed.assessment.environmentId,
+          profile: Option.none(),
+          reasons: [{ _tag: "UnrecognizedMetadata", key: "lfm3.attention.causal" }],
+          detail: 'unknown metadata ["lfm3.attention.causal"]',
+        },
+      },
+      storageBytes: 1_480_000_000,
+    }
+    const view = ownedModel(unsupported, "Unified")
+    expect(view.unsupported).toBe("Has parts Magnitude doesn't recognize (lfm3.attention.causal)")
+    const html = renderToStaticMarkup(
+      <YourModels
+        models={[view, model]}
+        action={item => modelRowAction(item, item.modelId === view.modelId ? unsupported : baseModel, noopActions)}
+        onExploreQuants={() => {}}
+        onRemove={() => {}}
+        onDrafter={() => {}}
+      />,
+    )
+    expect(html).toContain("2 downloaded models")
+    expect(html).toContain("Not supported")
+    expect(html).toContain("Has parts Magnitude doesn&#x27;t recognize (lfm3.attention.causal)")
+    expect(html).not.toContain("Doesn’t fit")
   })
 })

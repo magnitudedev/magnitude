@@ -1,6 +1,6 @@
 import { Option } from "effect"
 import { localModelResidency, type CustomLocalModel, type DrafterTarget, type LocalModel, type LocalModelAssessment, type LocalModelDeveloper, type LocalModelFamily, type ModelResidency, type ModelTransferProgress, type RecommendedModel, type SpeculativeMethod, type UnsupportedLocalModel } from "@magnitudedev/sdk"
-import { catalogModelReplacement, catalogSupportLabel, describeCatalogDeprecation, describeModelLoadFailure, fitPlacementPhrase, modelDownloadFailureMessage, modelFailureLabel, formatStorageSize, ladderBitWidths, localModelQuantName, localModelSizeBytes, quantBitWidth, type LocalModelCommandStatus, type ServingMemory } from "@magnitudedev/client-common"
+import { catalogModelReplacement, catalogSupportLabel, describeCatalogDeprecation, describeModelLoadFailure, fitPlacementPhrase, modelDownloadFailureMessage, modelFailureLabel, formatStorageSize, ladderBitWidths, localModelQuantName, localModelSizeBytes, quantBitWidth, unsupportedReasonMessages, type LocalModelCommandStatus, type ServingMemory } from "@magnitudedev/client-common"
 import { labForDeveloper } from "../model-logo"
 import { modelCommandNotice } from "../model-error"
 import type { DiscoveredModel } from "./onboarding"
@@ -178,6 +178,13 @@ const failureOf = (model: LocalModel, commandStatus?: LocalModelCommandStatus): 
     : null
 }
 
+/** Why the engine cannot run an added local model, in user-facing words. */
+const unsupportedOf = (assessment: LocalModelAssessment | null): string | null => {
+  if (assessment?._tag !== "Unsupported") return null
+  const reasons = unsupportedReasonMessages(assessment.reasons).join(". ")
+  return reasons || assessment.detail.trim() || "Magnitude can’t run this model"
+}
+
 /** A model on this computer as the Your models list shows it. */
 export const ownedModel = (
   model: LocalModel,
@@ -203,6 +210,8 @@ export const ownedModel = (
     drafterChoosable: model._tag === "Custom",
     searchText: `${model.presentation.displayName} ${quant.repository ?? ""} ${quant.name}`,
     support: supportOf(model, catalog),
+    unsupported: unsupportedOf(assessment),
+    assessmentFailure: model.servingState._tag === "Failed" ? (model.servingState.failure.message || "Couldn’t check how this model runs") : null,
     failure: failureOf(model, commandStatus),
     downloadFailure: model.acquisitionState._tag === "InstallFailed" || model.acquisitionState._tag === "UpdateFailed" ? modelDownloadFailureMessage(model.acquisitionState.failure) : null,
   }

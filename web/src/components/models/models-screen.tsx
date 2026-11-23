@@ -1,9 +1,10 @@
 import { useState, type ReactNode } from "react"
 import { Result } from "@effect-atom/atom-react"
-import { CircleNotchIcon, PlayIcon, StopIcon } from "@phosphor-icons/react"
+import { CircleNotchIcon, InfoIcon, PlayIcon, StopIcon } from "@phosphor-icons/react"
 import type { CustomFormModelId, LocalModel } from "@magnitudedev/sdk"
 import { deriveHardwareRoles, modelDownloadFailureMessage, modelFailureLabel, useLocalInferenceHardware, useLocalModelCommandStatuses, useLocalModelMutations, useLocalModels } from "@magnitudedev/client-common"
 import { Button } from "../ui/button"
+import { ActionTooltip, TooltipProvider } from "../ui/tooltip"
 import { ErrorNotice } from "../error-notice"
 import { ModelsSkeleton } from "./skeletons"
 import { cn } from "@/lib/utils"
@@ -70,6 +71,24 @@ export function modelRowAction(
     </span>
   }
   if (state._tag === "Unavailable") return <Status tone="failed" title={state.failure.message}>Files unavailable</Status>
+  if (view.unsupported !== null) {
+    return <Status>
+      Not supported
+      <ActionTooltip
+        label={view.unsupported}
+        trigger={<button type="button" aria-label={view.unsupported} className="inline-flex rounded-sm text-slate-400 hover:text-slate-600 focus-visible:outline-2 focus-visible:outline-blue-500 dark:text-slate-500 dark:hover:text-slate-300"><InfoIcon aria-hidden="true" className="size-3.5" /></button>}
+      />
+    </Status>
+  }
+  if (view.assessmentFailure !== null) {
+    return <Status tone="failed">
+      Assessment failed
+      <ActionTooltip
+        label={view.assessmentFailure}
+        trigger={<button type="button" aria-label={view.assessmentFailure} className="inline-flex rounded-sm text-red-500 hover:text-red-700 focus-visible:outline-2 focus-visible:outline-blue-500 dark:text-red-400 dark:hover:text-red-300"><InfoIcon aria-hidden="true" className="size-3.5" /></button>}
+      />
+    </Status>
+  }
   if (!view.quant.fits) return <Status busy={view.quant.measuring}>{fitLabel(view.quant)}</Status>
   if (loadPending) return <Status busy>Loading…</Status>
   if (residency?._tag === "Failed" || view.failure !== null) {
@@ -97,11 +116,11 @@ const quantSearch = (view: OwnedModel): { readonly query: string; readonly first
 export function OwnedModels({ list, empty, hidden, unrunnable, onUnhide }: {
   list: ReactNode | null; empty: ReactNode; hidden: readonly OwnedModel[]; unrunnable: readonly UnrunnableFile[]; onUnhide: (model: OwnedModel) => void
 }) {
-  return <>
+  return <TooltipProvider>
     {list ?? empty}
     <Hidden models={hidden} onUnhide={onUnhide} />
     <Unrunnable files={unrunnable} />
-  </>
+  </TooltipProvider>
 }
 
 /** Models: the user's models, or `empty` while none is visible. */

@@ -1,5 +1,5 @@
 import { Fragment, useEffect, useRef, useState, type ReactNode } from "react"
-import { ArrowRightIcon, CaretDownIcon, CaretRightIcon, CheckIcon, DotsThreeIcon, EyeIcon, EyeSlashIcon, FunnelSimpleIcon, MagnifyingGlassIcon, PlusIcon, TrashIcon } from "@phosphor-icons/react"
+import { ArrowRightIcon, CaretDownIcon, CaretRightIcon, CheckIcon, CubeIcon, DotsThreeIcon, EyeIcon, EyeSlashIcon, FunnelSimpleIcon, MagnifyingGlassIcon, PlusIcon, TrashIcon } from "@phosphor-icons/react"
 import { formatStorageSize } from "@magnitudedev/client-common"
 import { Button } from "../ui/button"
 import { Input } from "../ui/input"
@@ -26,6 +26,8 @@ export interface OwnedModel {
   readonly drafterChoosable: boolean
   readonly searchText: string
   readonly support: { readonly kind: "Deprecated" | "Disabled"; readonly label: string; readonly summary: string } | null
+  readonly unsupported: string | null
+  readonly assessmentFailure: string | null
   readonly failure: { readonly label: string; readonly summary: string; readonly detail: string | null; readonly severity: "error" | "warning" | "info" } | null
   readonly downloadFailure: string | null
 }
@@ -91,7 +93,7 @@ function FilterMenu({ filters, setFilters, labs }: { filters: ModelFilters; setF
     {open && <div className="absolute right-0 top-8 z-20 w-56 rounded-lg border border-slate-200 bg-white p-1.5 text-[13px] text-slate-800 shadow-lg dark:border-slate-750 dark:bg-slate-850 dark:text-slate-200">
       <p className="px-2 pb-1 pt-1.5 text-[11px] font-medium text-slate-500">Lab</p>
       {[null, ...labs].map(lab => <button key={lab?.name ?? "any"} type="button" onClick={() => setFilters({ ...filters, lab })} className="flex w-full items-center gap-2 rounded px-2 py-1.5 text-left hover:bg-slate-100 dark:hover:bg-slate-800">
-        {lab ? <LabLogo lab={lab} className="size-4" /> : <span className="size-4" />}{lab?.name ?? "Any lab"}{(filters.lab?.name ?? null) === (lab?.name ?? null) && <CheckIcon className="ml-auto size-3.5 text-blue-600" />}
+        {lab ? <LabLogo lab={lab} className="size-4" /> : <CubeIcon className="size-4 text-slate-400" />}{lab?.name ?? "Any lab"}{(filters.lab?.name ?? null) === (lab?.name ?? null) && <CheckIcon className="ml-auto size-3.5 text-blue-600" />}
       </button>)}
       <div className="my-1 border-t border-slate-200 dark:border-slate-750" />
       <label className="flex cursor-pointer items-center gap-2 rounded px-2 py-1.5 hover:bg-slate-100 dark:hover:bg-slate-800"><input type="checkbox" checked={filters.usOnly} onChange={event => setFilters({ ...filters, usOnly: event.target.checked })} className="accent-blue-600" />Only US developers</label>
@@ -119,7 +121,7 @@ function ModelMenu({ model, onExploreQuants, onRemove }: { model: OwnedModel; on
     <Dialog open={confirming} onOpenChange={setConfirming}>
       <DialogContent showCloseButton={false}>
         <DialogTitle className="font-heading text-base font-semibold">Delete {model.name} {model.quant.bits}-bit?</DialogTitle>
-        <p className="text-[13px] text-slate-600 dark:text-slate-400">This removes its {formatStorageSize(model.quant.sizeBytes)} of files from this computer.{model.support === null && " You can download it again later."}</p>
+        <p className="text-[13px] text-slate-600 dark:text-slate-400">This removes its {formatStorageSize(model.quant.sizeBytes)} of files from this computer.{model.support === null && model.unsupported === null && " You can download it again later."}</p>
         <div className="flex justify-end gap-2">
           <Button variant="ghost" onClick={() => setConfirming(false)}>Cancel</Button>
           <Button variant="destructive" onClick={() => { setConfirming(false); onRemove() }}><TrashIcon />Delete</Button>
@@ -150,7 +152,10 @@ function Details({ model, onDrafter }: { model: OwnedModel; onDrafter: () => voi
     ...(model.developer ? [["Developer", <span className="text-slate-700 dark:text-slate-300">{model.developer}{model.license && <span className="text-slate-500"> · {model.license}</span>}</span>] as const] : []),
   ]
   return <div className="space-y-4">
-    {model.quant.fits ? <PlacementBar quant={model.quant} /> : <p className="text-xs text-slate-500">{model.quant.measuring ? "Measuring how it runs on your machine…" : "Doesn’t fit on this computer"}</p>}
+    {model.quant.fits ? <PlacementBar quant={model.quant} />
+      : model.unsupported !== null ? <p className="text-xs text-slate-500">{model.unsupported}</p>
+      : model.assessmentFailure !== null ? <p className="text-xs text-red-600 dark:text-red-400">{model.assessmentFailure}</p>
+      : <p className="text-xs text-slate-500">{model.quant.measuring ? "Measuring how it runs on your machine…" : "Doesn’t fit on this computer"}</p>}
     <dl className="grid grid-cols-[80px_minmax(0,1fr)] items-center gap-x-4 gap-y-2 text-xs">
       {rows.map(([label, value]) => <Fragment key={label}><dt className="text-slate-500">{label}</dt><dd className="flex min-w-0 items-center">{value}</dd></Fragment>)}
     </dl>
@@ -204,9 +209,12 @@ export function YourModels({ models, action, onExploreQuants, onRemove, onDrafte
   const labs = modelLabs.filter(lab => models.some(model => model.lab?.name === lab.name))
   const shown = matchingModels(models, filters, find)
   return <section aria-label="Your models">
-    <div className="mb-2 flex items-center justify-end gap-1 text-xs text-slate-500">
-      <FindToggle value={find} onChange={setFind} placeholder="Find in your models" />
-      <FilterMenu filters={filters} setFilters={setFilters} labs={labs} />
+    <div className="mb-2 flex items-center justify-between gap-2 text-xs text-slate-500">
+      <span className="tabular-nums">{shown.length === 1 ? "1 downloaded model" : `${shown.length} downloaded models`}</span>
+      <div className="flex items-center gap-1">
+        <FindToggle value={find} onChange={setFind} placeholder="Find in your models" />
+        <FilterMenu filters={filters} setFilters={setFilters} labs={labs} />
+      </div>
     </div>
     <div className="divide-y divide-slate-200 rounded-xl border border-slate-200 bg-white dark:divide-slate-750 dark:border-slate-750 dark:bg-slate-850">
       {shown.length === 0 && <p className="px-4 py-3 text-[13px] text-slate-500">No models match.</p>}
