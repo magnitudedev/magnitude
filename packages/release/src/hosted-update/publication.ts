@@ -4,6 +4,8 @@ import { PublisherKeyId, PublishedUpdate, UpdateManifest, signUpdateManifest } f
 
 export class ReleasePublicationFailed extends Schema.TaggedError<ReleasePublicationFailed>()("ReleasePublicationFailed", {
   stage: Schema.Literal("batch", "database", "conflict"),
+  /** What the database reported (`postgresReleasePublicationStore`): never connection details. */
+  reason: Schema.optional(Schema.String),
 }) {}
 export interface ReleasePublicationStore {
   readonly promote: (envelopes: readonly PublishedUpdate[]) => Effect.Effect<void, ReleasePublicationFailed>
