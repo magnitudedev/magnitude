@@ -19,10 +19,12 @@ try {
   await page.getByRole('button', { name: 'Chat', exact: true }).waitFor()
   await page.getByRole('button', { name: 'Connections', exact: true }).click()
   await page.getByRole('heading', { name: 'Connections', exact: true }).waitFor()
-  await page.getByRole('button', { name: 'Settings', exact: true }).click()
+  await page.locator('aside').getByRole('button', { name: 'Settings', exact: true }).click()
   await page.getByRole('heading', { name: 'Settings', exact: true }).waitFor()
   await page.getByRole('button', { name: 'Usage', exact: true }).click()
   await page.getByRole('button', { name: 'Close', exact: true }).click()
+  await page.getByRole('button', { name: /^Models\b/ }).click()
+  await page.getByRole('heading', { name: 'Models', exact: true }).waitFor()
   evidence.checks.push('navigation remains clickable')
   const integrated = process.platform !== 'linux'
   assert.equal(await page.locator('[data-window-drag-region]').count() > 0, integrated)
