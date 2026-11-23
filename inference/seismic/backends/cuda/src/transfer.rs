@@ -151,7 +151,8 @@ impl TransferQueue {
                     } else {
                         self.done.wake_after(&self.stream)
                     }
-                });
+                })
+                .and_then(|()| self.stream.flush_submission().map_err(submission));
             if let Err(error) = queued {
                 *fault = Some(error.to_string());
                 self.faulted.store(true, Ordering::Release);

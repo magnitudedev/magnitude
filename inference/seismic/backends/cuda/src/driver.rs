@@ -784,10 +784,46 @@ impl Stream {
     pub fn query(&self) -> Result<bool, DriverError> {
         let _current = self.context.enter()?;
         let status = unsafe { (self.context.driver.stream_query)(self.raw) };
-        if status == NOT_READY {
-            return Ok(false);
+        match classify_query_status(status) {
+            Ok(done) => Ok(done),
+            Err(code) => self.context.driver.check(code, "stream query").map(|()| true),
         }
-        self.context.driver.check(status, "stream query").map(|()| true)
+    }
+
+    /// Flush queued user-mode commands to the Windows WDDM kernel driver.
+    ///
+    /// On Windows WDDM, asynchronous CUDA submissions (`cuGraphLaunch`,
+    /// `cuMemcpy*Async`, `cuEventRecord`, `cuLaunchHostFunc`) are batched in
+    /// user mode and may not reach the GPU until a query or synchronization
+    /// flushes the command buffer. Blocking on a host condition variable or
+    /// mapped word written by the GPU before flushing deadlocks. Calling
+    /// `cuStreamQuery` forces an immediate WDDM flush without blocking
+    /// (`CUDA_SUCCESS` and `CUDA_ERROR_NOT_READY` both succeed; real device
+    /// errors are propagated). On non-Windows platforms CUDA submits directly
+    /// to the hardware queue and this is a no-op.
+    #[inline]
+    pub(crate) fn flush_submission(&self) -> Result<(), DriverError> {
+        #[cfg(target_os = "windows")]
+        {
+            self.query().map(|_| ())
+        }
+        #[cfg(not(target_os = "windows"))]
+        {
+            Ok(())
+        }
+    }
+}
+
+/// Classify a `cuStreamQuery` / `cuEventQuery` status code: `Ok(true)` on
+/// `CUDA_SUCCESS` (0), `Ok(false)` on `CUDA_ERROR_NOT_READY`, and `Err(code)`
+/// on any real driver or device error.
+fn classify_query_status(status: ResultCode) -> Result<bool, ResultCode> {
+    if status == 0 {
+        Ok(true)
+    } else if status == NOT_READY {
+        Ok(false)
+    } else {
+        Err(status)
     }
 }
 
@@ -884,13 +920,10 @@ impl Event {
     pub fn query(&self) -> Result<bool, DriverError> {
         let _current = self.context.enter()?;
         let status = unsafe { (self.context.driver.event_query)(self.raw) };
-        if status == NOT_READY {
-            return Ok(false);
+        match classify_query_status(status) {
+            Ok(done) => Ok(done),
+            Err(code) => self.context.driver.check(code, "event query").map(|()| true),
         }
-        self.context
-            .driver
-            .check(status, "event query")
-            .map(|()| true)
     }
 
     pub fn elapsed_ns(start: &Self, end: &Self) -> Result<f64, DriverError> {
@@ -2756,5 +2789,15 @@ mod tests {
             *log.borrow(),
             vec!["create", "enqueue", "record", "sync_event", "destroy"]
         );
+    }
+
+    #[test]
+    fn classify_query_status_treats_success_and_not_ready_as_non_error_flush() {
+        assert_eq!(classify_query_status(0), Ok(true));
+        assert_eq!(classify_query_status(NOT_READY), Ok(false));
+        // Real CUDA errors (e.g. CUDA_ERROR_ILLEGAL_ADDRESS = 700,
+        // CUDA_ERROR_LAUNCH_FAILED = 719) must propagate as errors.
+        assert_eq!(classify_query_status(700), Err(700));
+        assert_eq!(classify_query_status(719), Err(719));
     }
 }
