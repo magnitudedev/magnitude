@@ -269,8 +269,9 @@ float projection_ordered_combine8(float value) {
 // Accumulate `seismic_shared_f32[scratch_off + u], +8, ... < count` in exact
 // 8-lane reference order.
 float projection_ordered_accumulate_sram8(uint scratch_off, uint count, uint u, float sum) {
-    uint c = u;
-    for (; c + 56u < count; c += 64u) {
+    uint k0 = 0u;
+    for (; k0 + 64u <= count; k0 += 64u) {
+        const uint c = k0 + u;
         const float v0 = seismic_shared_f32[scratch_off + c];
         const float v1 = seismic_shared_f32[scratch_off + c + 8u];
         const float v2 = seismic_shared_f32[scratch_off + c + 16u];
@@ -288,7 +289,7 @@ float projection_ordered_accumulate_sram8(uint scratch_off, uint count, uint u, 
         sum = seismic_fma_rn(v6, v6, sum);
         sum = seismic_fma_rn(v7, v7, sum);
     }
-    for (; c < count; c += 8u) {
+    seismic_strided_from(uint, c, k0, u, count, 8u) {
         const float v = seismic_shared_f32[scratch_off + c];
         sum = seismic_fma_rn(v, v, sum);
     }
