@@ -56,28 +56,24 @@ pub fn describe(diagnostics: &mut Vec<Diagnostic>) -> Vec<(CudaReport, Option<Pc
     for descriptor in &described {
         let (ordinal, uuid) = (descriptor.ordinal, descriptor.uuid);
         let [domain, bus, device] = descriptor.pci;
-        let memory = if descriptor.memory_is_host() {
-            CudaMemory::Host
-        } else {
-            let usable = usable_at_first_read(uuid, || {
+        let admission = descriptor.admission().map_err(|error| error.to_string());
+        let memory = cuda_memory(
+            descriptor.memory_is_host(),
+            &admission,
+            uuid,
+            || {
                 crate::open::usable_memory_report(ordinal, uuid)
                     .map_err(|error| error.to_string())
-            })
-            .map(|(bytes, warning)| {
-                if let Some(message) = warning {
-                    diagnostics.push(diagnostic(format!("device ordinal {ordinal}: {message}")));
-                }
-                bytes
-            });
-            CudaMemory::Own { usable }
-        };
+            },
+            |message| diagnostics.push(diagnostic(format!("device ordinal {ordinal}: {message}"))),
+        );
         reports.push((
             CudaReport {
                 uuid,
                 luid: descriptor.luid,
                 name: descriptor.name.clone(),
                 driver: format!("cuda driver {}", descriptor.driver_api),
-                admission: descriptor.admission().map_err(|error| error.to_string()),
+                admission,
                 total: descriptor.total_memory_bytes,
                 max_allocation: crate::max_allocation_bytes(descriptor.total_memory_bytes),
                 allocation_granularity: descriptor.allocation_granularity,
@@ -94,6 +90,31 @@ pub fn describe(diagnostics: &mut Vec<Diagnostic>) -> Vec<(CudaReport, Option<Pc
         ));
     }
     reports
+}
+
+/// How a CUDA device's memory is reported: host memory directly, or its own
+/// device memory, querying usable bytes through a CUDA context only when the
+/// device passes backend admission.
+fn cuda_memory(
+    memory_is_host: bool,
+    admission: &Result<(), String>,
+    uuid: [u8; 16],
+    read_usable: impl FnOnce() -> Result<(u64, Option<String>), String>,
+    mut on_warning: impl FnMut(String),
+) -> CudaMemory {
+    if memory_is_host {
+        return CudaMemory::Host;
+    }
+    let usable = match admission {
+        Ok(()) => usable_at_first_read(uuid, read_usable).map(|(bytes, warning)| {
+            if let Some(message) = warning {
+                on_warning(message);
+            }
+            bytes
+        }),
+        Err(reason) => Err(reason.clone()),
+    };
+    CudaMemory::Own { usable }
 }
 
 /// The memory a discrete CUDA device lets this process use, as the driver
@@ -121,7 +142,60 @@ fn usable_at_first_read(
 
 #[cfg(test)]
 mod tests {
-    use super::usable_at_first_read;
+    use super::{cuda_memory, usable_at_first_read};
+    use seismic_topology::CudaMemory;
+
+    /// An unadmitted device (for example pre-sm_80) never creates a CUDA
+    /// context during discovery.
+    #[test]
+    fn unadmitted_device_skips_usable_memory_read() {
+        let mut probed = false;
+        let reason = "compute capability 6.1 is below 8.0".to_owned();
+        let memory = cuda_memory(
+            false,
+            &Err(reason.clone()),
+            [0x5a; 16],
+            || {
+                probed = true;
+                Ok((8 << 30, None))
+            },
+            |_| panic!("unexpected warning"),
+        );
+        assert!(!probed, "unadmitted device must not create a CUDA context");
+        assert!(matches!(memory, CudaMemory::Own { usable: Err(ref err) } if err == &reason));
+    }
+
+    /// An admitted discrete device reads usable memory once and forwards
+    /// warnings; a host-memory device does not read usable memory.
+    #[test]
+    fn admitted_discrete_device_reads_usable_memory_and_host_memory_skips_it() {
+        let mut probed = false;
+        assert!(matches!(
+            cuda_memory(
+                true,
+                &Ok(()),
+                [0x5b; 16],
+                || {
+                    probed = true;
+                    Ok((8 << 30, None))
+                },
+                |_| {},
+            ),
+            CudaMemory::Host
+        ));
+        assert!(!probed);
+
+        let mut warnings = Vec::new();
+        let memory = cuda_memory(
+            false,
+            &Ok(()),
+            [0x5c; 16],
+            || Ok((12 << 30, Some("clamped".to_owned()))),
+            |warning| warnings.push(warning),
+        );
+        assert!(matches!(memory, CudaMemory::Own { usable: Ok(bytes) } if bytes == 12 << 30));
+        assert_eq!(warnings, ["clamped"]);
+    }
 
     /// The first successful read stands for the process; after a failure it
     /// is read again.
