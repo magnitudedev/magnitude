@@ -233,7 +233,9 @@ async fn run(command: Command) -> anyhow::Result<()> {
                 &device,
                 serving.selector().backend() == seismic::BackendName::Cpu,
             );
-            let measurement = measurement::start(
+            let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+            let shutdown_tx = Arc::new(shutdown_tx);
+            let (measurement, measurement_owner) = measurement::start(
                 Arc::new(ServiceMachine::new(
                     structure,
                     worker_launcher.clone(),
@@ -244,6 +246,7 @@ async fn run(command: Command) -> anyhow::Result<()> {
                 stored,
                 device.clone(),
                 host.settled(),
+                shutdown_rx.clone(),
             );
             let model_downloads = Arc::new(
                 ManagedModelDownloads::open(inventory.clone())
@@ -313,7 +316,6 @@ async fn run(command: Command) -> anyhow::Result<()> {
             if bounds == LoadBounds::default() {
                 instances.attach_assessments(assessments.clone());
             }
-            let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
             let mut state = AppState::new()
                 .with_shutdown(shutdown_rx)
                 .with_model_downloads(model_downloads)
@@ -374,7 +376,8 @@ async fn run(command: Command) -> anyhow::Result<()> {
                     .make_span_with(telemetry::http_request_span)
                     .on_response(DefaultOnResponse::new().level(tracing::Level::INFO)),
             );
-            axum::serve(listener, app)
+            let graceful_shutdown_tx = Arc::clone(&shutdown_tx);
+            let served = axum::serve(listener, app)
                 .with_graceful_shutdown(async move {
                     match parent_shutdown.as_mut() {
                         Some(receiver) => tokio::select! {
@@ -383,9 +386,12 @@ async fn run(command: Command) -> anyhow::Result<()> {
                         },
                         None => interrupt_signal().await,
                     }
-                    shutdown_tx.send_replace(true);
+                    graceful_shutdown_tx.send_replace(true);
                 })
-                .await?;
+                .await;
+            shutdown_tx.send_replace(true);
+            measurement_owner.ended().await;
+            served?;
             tracing::info!("inference service stopped");
         }
         Command::Doctor => println!("inference engine loaded successfully"),

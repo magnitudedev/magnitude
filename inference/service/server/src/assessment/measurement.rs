@@ -181,13 +181,21 @@ pub enum JobFrame {
     Finished(Result<Vec<MeasureFailure>, JobLost>),
 }
 
+/// How a retired job process exited.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct RetiredProcess {
+    /// Whether the process was terminated by an external shutdown signal (`SIGTERM` or `SIGINT`),
+    /// rather than crashing or being killed by its host.
+    pub interrupted: bool,
+}
+
 /// A started job's process.
 pub trait JobProcess: Send + 'static {
     /// Return once the process is gone. One that `reported` its outcome is given
     /// [`GRACEFUL_EXIT`](crate::residency::controller::GRACEFUL_EXIT) to exit on its own, as a
     /// reported Prepare is; any other is killed. Blocking. A process whose end the system will
     /// not show comes back with why ([`crate::residency::worker::RETIREMENT_RETRY`]).
-    fn retire(self: Box<Self>, reported: bool) -> Result<(), (Box<dyn JobProcess>, std::io::Error)>;
+    fn retire(self: Box<Self>, reported: bool) -> Result<RetiredProcess, (Box<dyn JobProcess>, std::io::Error)>;
     /// The process's recent standard error, for a lost job's report.
     fn diagnostics(&self) -> String;
     /// The process, where it is one of the system's.
@@ -319,10 +327,23 @@ impl MeasuredMachine for ServiceMachine {
     }
 }
 
+#[cfg(unix)]
+fn terminated_by_shutdown_signal(status: std::process::ExitStatus) -> bool {
+    use std::os::unix::process::ExitStatusExt as _;
+    matches!(status.signal(), Some(libc::SIGTERM | libc::SIGINT))
+}
+
+#[cfg(not(unix))]
+fn terminated_by_shutdown_signal(_status: std::process::ExitStatus) -> bool {
+    false
+}
+
 impl JobProcess for JobWorker {
-    fn retire(self: Box<Self>, reported: bool) -> Result<(), (Box<dyn JobProcess>, std::io::Error)> {
+    fn retire(self: Box<Self>, reported: bool) -> Result<RetiredProcess, (Box<dyn JobProcess>, std::io::Error)> {
         JobWorker::retire(*self, reported)
-            .map(drop)
+            .map(|status| RetiredProcess {
+                interrupted: terminated_by_shutdown_signal(status),
+            })
             .map_err(|(worker, error)| (Box::new(worker) as Box<dyn JobProcess>, error))
     }
 
@@ -335,19 +356,34 @@ impl JobProcess for JobWorker {
     }
 }
 
+/// Wait until `shutdown` signals true. A dropped sender never triggers shutdown on its own.
+async fn wait_shutdown(shutdown: &mut watch::Receiver<bool>) {
+    if shutdown.wait_for(|shutting_down| *shutting_down).await.is_err() {
+        std::future::pending::<()>().await;
+    }
+}
+
 /// Start owning the measurement job of `machine` on `device`, from `stored`, what was stored of
 /// it at start, each job starting only once `settled` holds (the assessment pool's work on the
-/// device is done, [`crate::assessment::HostDevice`]). The returned status is the job's, from
-/// [`MeasurementStatus::stored`] on.
+/// device is done, [`crate::assessment::HostDevice`]), stopping cleanly when `shutdown` signals
+/// true so any in-flight job is retired and its attempt markers released before the service exits.
+/// Returns the job's status receiver (from [`MeasurementStatus::stored`] on) and its owner handle.
 pub fn start<M: MeasuredMachine>(
     machine: Arc<M>,
     stored: M::Stored,
     device: DeviceLock,
     settled: watch::Receiver<bool>,
-) -> watch::Receiver<MeasurementStatus<M::Stored>> {
+    shutdown: watch::Receiver<bool>,
+) -> (
+    watch::Receiver<MeasurementStatus<M::Stored>>,
+    magnitude_service_utils::owner::Owner,
+) {
     let (status, receiver) = watch::channel(MeasurementStatus::stored(stored));
-    magnitude_service_utils::owner::spawn("the measurement job", run(machine, device, settled, status));
-    receiver
+    let owner = magnitude_service_utils::owner::spawn(
+        "the measurement job",
+        run(machine, device, settled, shutdown, status),
+    );
+    (receiver, owner)
 }
 
 /// What the stored records give assessment, read on the blocking pool.
@@ -379,6 +415,7 @@ async fn run<M: MeasuredMachine>(
     machine: Arc<M>,
     device: DeviceLock,
     mut settled: watch::Receiver<bool>,
+    mut shutdown: watch::Receiver<bool>,
     status: watch::Sender<MeasurementStatus<M::Stored>>,
 ) {
     // A streamed load stores its point requests while it holds the device:
@@ -387,35 +424,56 @@ async fn run<M: MeasuredMachine>(
     let mut changes = device.changes();
     let mut backoff = FIRST_RETRY;
     loop {
+        if *shutdown.borrow() {
+            return;
+        }
         // What is stored, as the jobs read it: what is published may be unavailable instead
         // (`published`).
         let mut stage = status.borrow().measurements.stage();
         // The jobs in a row that could not open the device, since one last did.
         let mut unopened: Option<Unopened> = None;
         while stage != Stage::Settled {
+            if *shutdown.borrow() {
+                return;
+            }
             // A pool that is gone has no work left on the device.
-            let _ = settled.wait_for(|settled| *settled).await;
-            let mut held = device.measurement().await;
+            tokio::select! {
+                () = wait_shutdown(&mut shutdown) => return,
+                _ = settled.wait_for(|settled| *settled) => {}
+            }
+            let mut held = tokio::select! {
+                () = wait_shutdown(&mut shutdown) => return,
+                held = device.measurement() => held,
+            };
             // Beside an idle resident model, the model's worker makes room for what the job lays out
             // first; a model that cannot leaves the job to wait for it to change. The hold's end
             // releases the room (`DeviceJob`'s drop).
             let beside = held.beside().cloned();
             if let Some(resident) = &beside {
-                match make_room(&machine, resident.as_ref(), &mut held).await {
+                match make_room(&machine, resident.as_ref(), &mut held, &mut shutdown).await {
                     Room::Made => {}
                     Room::Preempted => continue,
+                    Room::Shutdown => {
+                        drop(held);
+                        return;
+                    }
                     // The job cannot say what it lays out: it fails, as one that stored nothing.
                     Room::Unsized(error) => {
                         tracing::warn!(%error, "the measurement job's room could not be computed");
                         drop(held);
-                        retry(&status, &mut backoff, Duration::ZERO).await;
+                        if !retry(&status, &mut backoff, Duration::ZERO, &mut shutdown).await {
+                            return;
+                        }
                         continue;
                     }
                     Room::Unmade(reason) => {
                         tracing::info!(%reason, "the resident model cannot make the measurement job's room");
                         let mut preemption = held.preemption();
                         drop(held);
-                        preemption.preempted().await;
+                        tokio::select! {
+                            () = wait_shutdown(&mut shutdown) => return,
+                            () = preemption.preempted() => {}
+                        }
                         continue;
                     }
                 }
@@ -431,7 +489,7 @@ async fn run<M: MeasuredMachine>(
             }
             let started = tokio::time::Instant::now();
             let mut last_published: Option<(MeasurementProgress, tokio::time::Instant)> = None;
-            let (end, preempted) = run_job(&machine, held, |progress| {
+            let (end, released) = run_job(&machine, held, &mut shutdown, |progress| {
                 if measured {
                     return;
                 }
@@ -461,14 +519,27 @@ async fn run<M: MeasuredMachine>(
                 }
             })
             .await;
-            // A preempted job's attempts are released before what is stored is read, and before
-            // the next job starts: a counted attempt would read as its point's failure. A
-            // release that fails is retried on the failure's backoff until it succeeds, and the
-            // job's end is then taken as any other's.
-            if let Some((job, keys)) = preempted {
+            if matches!(end.outcome, JobOutcome::Shutdown) {
+                if let Some((job, keys)) = released {
+                    if let Err(error) = release_killed_attempts(&machine, job, &keys).await {
+                        tracing::error!(
+                            error = %format!("{error:#}"),
+                            "a shutdown measurement job's attempts could not be released"
+                        );
+                    }
+                }
+                return;
+            }
+            // A preempted or signal-interrupted job's attempts are released before what is stored
+            // is read, and before the next job starts: a counted attempt would read as its point's
+            // failure. A release that fails is retried on the failure's backoff until it succeeds,
+            // and the job's end is then taken as any other's.
+            if let Some((job, keys)) = released {
                 while let Err(error) = release_killed_attempts(&machine, job, &keys).await {
                     tracing::error!(error = %format!("{error:#}"), "a preempted measurement job's attempts could not be released");
-                    retry(&status, &mut backoff, Duration::ZERO).await;
+                    if !retry(&status, &mut backoff, Duration::ZERO, &mut shutdown).await {
+                        return;
+                    }
                 }
             }
             // The room was the model's again as the hold ended, and what the job stored prices its
@@ -494,8 +565,12 @@ async fn run<M: MeasuredMachine>(
                     let stored = read_stored(&machine).await;
                     stage = stored.stage();
                     status.send_replace(MeasurementStatus::stored(published(stored, unopened.as_ref())));
+                    // Give a simultaneous process-group shutdown signal a turn before starting a
+                    // replacement job.
+                    tokio::task::yield_now().await;
                     continue;
                 }
+                JobOutcome::Shutdown => unreachable!("shutdown returns immediately after releasing attempts"),
             };
             if opened {
                 unopened = None;
@@ -543,14 +618,15 @@ async fn run<M: MeasuredMachine>(
             // nothing, failed or hung otherwise fails: the next one, after the backoff, takes it.
             if stage == Stage::Settled || progressed {
                 backoff = FIRST_RETRY;
-            } else {
-                retry(&status, &mut backoff, started.elapsed()).await;
+            } else if !retry(&status, &mut backoff, started.elapsed(), &mut shutdown).await {
+                return;
             }
         }
         // The last state stands for as long as anything reads it, what is stored read again after
         // each change of the device: a load's requests leave it unsettled, and the jobs resume.
         tokio::select! {
             () = status.closed() => return,
+            () = wait_shutdown(&mut shutdown) => return,
             () = changes.changed() => {}
         }
         let measurements = read_stored(&machine).await;
@@ -561,15 +637,21 @@ async fn run<M: MeasuredMachine>(
 /// Wait out the backoff after a job that ran for `ran` failed, at least twice `ran` and at most
 /// [`LAST_RETRY`], which then doubles: reported as the state where what is stored gives
 /// assessment no costs yet, and otherwise only refining them, so the state stays `Measured`.
+/// Returns `false` if `shutdown` fires before the backoff finishes.
 async fn retry<S: StoredRecords>(
     status: &watch::Sender<MeasurementStatus<S>>,
     backoff: &mut Duration,
     ran: Duration,
-) {
+    shutdown: &mut watch::Receiver<bool>,
+) -> bool {
     let delay = (*backoff).max(ran.saturating_mul(2)).min(LAST_RETRY);
     retrying(status, delay);
-    tokio::time::sleep(delay).await;
+    tokio::select! {
+        () = wait_shutdown(shutdown) => return false,
+        () = tokio::time::sleep(delay) => {}
+    }
     *backoff = delay.saturating_mul(2).min(LAST_RETRY);
+    true
 }
 
 /// Report the job as failed, retried after `delay`, where what is stored gives assessment no
@@ -603,9 +685,13 @@ enum JobOutcome {
     /// It hung: it was silent past [`hang_silence`]. It was killed, and the attempt it was inside
     /// counts.
     Hung,
-    /// Residency wanted the device, or a request the idle model the job ran beside: the job was
-    /// killed, and its attempts released.
+    /// Residency wanted the device, a request wanted the idle model the job ran beside, or an
+    /// external shutdown signal interrupted the worker: the job was killed, and its attempts
+    /// released.
     Preempted,
+    /// The service is shutting down: the job was retired, its attempts released, and the owner
+    /// stops cleanly.
+    Shutdown,
 }
 
 /// How making a measurement job's room beside an idle resident model ended.
@@ -613,6 +699,8 @@ enum Room {
     Made,
     /// The job was preempted first.
     Preempted,
+    /// The service is shutting down.
+    Shutdown,
     /// Why the job's room could not be computed.
     Unsized(String),
     /// Why the room is not made.
@@ -637,8 +725,13 @@ impl std::fmt::Display for Unmade {
 }
 
 /// Ask `resident`'s worker to make room for what the job lays out at most
-/// ([`MeasuredMachine::room`]), unless `job` is preempted first.
-async fn make_room<M: MeasuredMachine>(machine: &Arc<M>, resident: &dyn ResidentRoom, job: &mut DeviceJob) -> Room {
+/// ([`MeasuredMachine::room`]), unless `job` is preempted or `shutdown` fires first.
+async fn make_room<M: MeasuredMachine>(
+    machine: &Arc<M>,
+    resident: &dyn ResidentRoom,
+    job: &mut DeviceJob,
+    shutdown: &mut watch::Receiver<bool>,
+) -> Room {
     let room = {
         let machine = Arc::clone(machine);
         magnitude_service_utils::blocking::run(move || machine.room()).await
@@ -655,6 +748,7 @@ async fn make_room<M: MeasuredMachine>(machine: &Arc<M>, resident: &dyn Resident
             Err(error) => Room::Unmade(Unmade::Unanswered(error)),
         },
         () = job.preempted() => Room::Preempted,
+        () = wait_shutdown(shutdown) => Room::Shutdown,
     }
 }
 
@@ -662,6 +756,7 @@ async fn make_room<M: MeasuredMachine>(machine: &Arc<M>, resident: &dyn Resident
 enum Killed {
     Hung,
     Preempted,
+    Shutdown,
 }
 
 /// Release the attempts killed job `job` reported, `keys`, on the blocking pool.
@@ -676,16 +771,28 @@ async fn release_killed_attempts<M: MeasuredMachine>(
 
 /// One job on `exclusive`, given the [`job_time`] from its device's opening, in which it begins
 /// points and each it begins runs to its end. Its frames are read until it reports its outcome,
-/// it hangs (silent past [`hang_silence`] since its start or its last frame) or residency wants
-/// the device, either of which kills it at once; its process
-/// is then proven retired, and only then the device released. A preempted job's attempts are
-/// returned, its process gone and every one it reported read, for its owner to release, so the
-/// preemption does not count against a point; a hung job's are not, as what it was inside hung.
+/// it hangs (silent past [`hang_silence`] since its start or its last frame), residency wants
+/// the device, or `shutdown` signals true, any of which kills it at once; its process
+/// is then proven retired, and only then the device released. A preempted, shutdown, or
+/// signal-interrupted job's attempts are returned, its process gone and every one it reported
+/// read, for its owner to release, so normal preemption or shutdown does not count against a
+/// point; a hung or crashed job's are not, as what it was inside hung or crashed.
 async fn run_job<M: MeasuredMachine>(
     machine: &Arc<M>,
     mut exclusive: DeviceJob,
+    shutdown: &mut watch::Receiver<bool>,
     mut on_progress: impl FnMut(MeasurementProgress),
 ) -> (JobEnd, Option<(MeasureJob, Vec<PointKey>)>) {
+    if *shutdown.borrow() {
+        return (
+            JobEnd {
+                outcome: JobOutcome::Shutdown,
+                recorded: 0,
+                opened: false,
+            },
+            None,
+        );
+    }
     let time = job_time();
     let started = {
         let machine = Arc::clone(machine);
@@ -748,6 +855,7 @@ async fn run_job<M: MeasuredMachine>(
             // Each frame ends the silence: a job is hung only once silent past its limit.
             () = tokio::time::sleep(hang_silence(opened)) => break Err(Killed::Hung),
             () = exclusive.preempted() => break Err(Killed::Preempted),
+            () = wait_shutdown(shutdown) => break Err(Killed::Shutdown),
         }
     };
     tracing::info!(
@@ -757,6 +865,7 @@ async fn run_job<M: MeasuredMachine>(
             Ok(Err(_)) => "lost",
             Err(Killed::Hung) => "hung",
             Err(Killed::Preempted) => "preempted",
+            Err(Killed::Shutdown) => "shutdown",
         },
         "measurement job ended"
     );
@@ -777,34 +886,43 @@ async fn run_job<M: MeasuredMachine>(
         exclusive.finished();
     }
     let mut retiring = (process, exclusive);
-    loop {
+    let retired_exit = loop {
         let (process, exclusive) = retiring;
         let retired = magnitude_service_utils::blocking::run(move || {
             let retired = process.retire(reported);
             match retired {
-                Ok(()) => {
+                Ok(exit) => {
                     // The device is released, and with the room its footprint's credit, only now
                     // that no reused pid can be credited: a waiting share proceeds.
                     drop(exclusive);
-                    Ok(())
+                    Ok(exit)
                 }
                 Err((process, error)) => Err((process, exclusive, error)),
             }
         })
         .await;
-        let Err((process, mut exclusive, error)) = retired else {
-            break;
-        };
-        tracing::error!(%error, "the measurement job could not be shown to have ended; it keeps the device and is tried again");
-        // Asked to exit once already: it is stopped from here on.
-        reported = false;
-        tokio::select! {
-            () = tokio::time::sleep(RETIREMENT_RETRY) => {}
-            () = exclusive.preempted() => {}
+        match retired {
+            Ok(exit) => break exit,
+            Err((process, mut exclusive, error)) => {
+                tracing::error!(%error, "the measurement job could not be shown to have ended; it keeps the device and is tried again");
+                // Asked to exit once already: it is stopped from here on.
+                reported = false;
+                tokio::select! {
+                    () = tokio::time::sleep(RETIREMENT_RETRY) => {}
+                    () = exclusive.preempted() => {}
+                }
+                retiring = (process, exclusive);
+            }
         }
-        retiring = (process, exclusive);
-    }
+    };
     let killed = match outcome {
+        // The worker lost its stream while the service is shutting down (for example a Unix
+        // process-group `SIGTERM` that terminated the child before or concurrently with the
+        // parent's signal task): treat as shutdown and release its attempts.
+        Ok(Err(_)) if *shutdown.borrow() => Killed::Shutdown,
+        // The worker was terminated by an external shutdown signal (`SIGTERM` or `SIGINT`) before
+        // the parent observed shutdown: treat as preempted so its attempts are released.
+        Ok(Err(_)) if retired_exit.interrupted => Killed::Preempted,
         Ok(outcome) => return (JobEnd { outcome: JobOutcome::Ended(outcome), recorded, opened }, None),
         Err(killed) => killed,
     };
@@ -821,11 +939,12 @@ async fn run_job<M: MeasuredMachine>(
             JobFrame::Progress(_) | JobFrame::Finished(_) => {}
         }
     }
-    // A preempted job says nothing of its points: their attempts are released. A hung one hung
-    // in the point it was inside, whose attempt stays counted, as one that ended the job.
+    // A preempted or shutdown job says nothing of its points: their attempts are released. A hung
+    // one hung in the point it was inside, whose attempt stays counted, as one that ended the job.
     let (outcome, released) = match killed {
         Killed::Hung => (JobOutcome::Hung, false),
         Killed::Preempted => (JobOutcome::Preempted, true),
+        Killed::Shutdown => (JobOutcome::Shutdown, true),
     };
     (JobEnd { outcome, recorded, opened }, released.then_some((job, attempted)))
 }
@@ -995,13 +1114,16 @@ mod tests {
     /// one's ends once the process is gone.
     struct RecordedProcess {
         retired: Arc<Mutex<Option<bool>>>,
+        interrupted: bool,
         _stream: mpsc::Sender<JobFrame>,
     }
 
     impl JobProcess for RecordedProcess {
-        fn retire(self: Box<Self>, reported: bool) -> Result<(), (Box<dyn JobProcess>, std::io::Error)> {
+        fn retire(self: Box<Self>, reported: bool) -> Result<RetiredProcess, (Box<dyn JobProcess>, std::io::Error)> {
             *self.retired.lock().unwrap() = Some(reported);
-            Ok(())
+            Ok(RetiredProcess {
+                interrupted: self.interrupted,
+            })
         }
 
         fn diagnostics(&self) -> String {
@@ -1030,7 +1152,11 @@ mod tests {
             StartedJob {
                 job: MeasureJob(7),
                 frames: receiver,
-                process: Box::new(RecordedProcess { retired: Arc::clone(&retired), _stream: sender }),
+                process: Box::new(RecordedProcess {
+                    retired: Arc::clone(&retired),
+                    interrupted: false,
+                    _stream: sender,
+                }),
             },
             retired,
             more,
@@ -1071,17 +1197,22 @@ mod tests {
     }
 
     impl JobProcess for RefusingProcess {
-        fn retire(self: Box<Self>, reported: bool) -> Result<(), (Box<dyn JobProcess>, std::io::Error)> {
+        fn retire(self: Box<Self>, reported: bool) -> Result<RetiredProcess, (Box<dyn JobProcess>, std::io::Error)> {
             *self.retired.lock().unwrap() = Some(reported);
             match self.refusals.fetch_update(Ordering::SeqCst, Ordering::SeqCst, |left| left.checked_sub(1)) {
                 Ok(_) => Err((self, std::io::Error::other("the system will not show the process gone"))),
-                Err(_) => Ok(()),
+                Err(_) => Ok(RetiredProcess::default()),
             }
         }
 
         fn diagnostics(&self) -> String {
             String::new()
         }
+    }
+
+    /// A service that does not shut down during the test.
+    fn unstopped() -> watch::Receiver<bool> {
+        watch::channel(false).1
     }
 
     /// A job whose end the system will not show keeps the device and is tried again every
@@ -1098,7 +1229,7 @@ mod tests {
         let machine = ScriptedMachine::new(vec![running], vec![COMPLETE]);
         let device = DeviceLock::default();
         let begun = tokio::time::Instant::now();
-        let mut status = start(machine.clone(), PENDING, device.clone(), settled());
+        let mut status = start(machine.clone(), PENDING, device.clone(), settled(), unstopped()).0;
         let ended = status
             .wait_for(|status| matches!(status.state, MeasurementState::Measured | MeasurementState::Failed { .. }))
             .await
@@ -1120,7 +1251,7 @@ mod tests {
     async fn a_job_is_killed_only_once_it_falls_silent() {
         let (running, retired, frames) = job(Vec::new());
         let machine = ScriptedMachine::new(vec![running], Vec::new());
-        let mut status = start(machine.clone(), PENDING, DeviceLock::default(), settled());
+        let mut status = start(machine.clone(), PENDING, DeviceLock::default(), settled(), unstopped()).0;
         status
             .wait_for(|status| matches!(status.state, MeasurementState::Measuring { .. }))
             .await
@@ -1160,7 +1291,7 @@ mod tests {
         let machine = ScriptedMachine::new(vec![preempted, finishing], vec![PENDING, COMPLETE]);
         machine.refusals.store(2, Ordering::SeqCst);
         let device = DeviceLock::default();
-        let mut status = start(machine.clone(), PENDING, device.clone(), settled());
+        let mut status = start(machine.clone(), PENDING, device.clone(), settled(), unstopped()).0;
         status
             .wait_for(|status| matches!(status.state, MeasurementState::Measuring { .. }))
             .await
@@ -1187,7 +1318,7 @@ mod tests {
         let (finishing, _, _finished) = job(vec![JobFrame::Finished(Ok(Vec::new()))]);
         let machine = ScriptedMachine::new(vec![hung, finishing], vec![REFINING, COMPLETE]);
         let began = tokio::time::Instant::now();
-        let mut status = start(machine.clone(), PENDING, DeviceLock::default(), settled());
+        let mut status = start(machine.clone(), PENDING, DeviceLock::default(), settled(), unstopped()).0;
         let refining = status.wait_for(|status| status.measurements == REFINING).await.unwrap().clone();
         assert_eq!(refining.state, MeasurementState::Measured, "what it stored stands");
         status.wait_for(|status| status.measurements == COMPLETE).await.unwrap();
@@ -1206,7 +1337,7 @@ mod tests {
         let (silent, _, _open) = job(Vec::new());
         let (finishing, _, _finished) = job(vec![JobFrame::Finished(Ok(Vec::new()))]);
         let machine = ScriptedMachine::new(vec![silent, finishing], vec![PENDING, COMPLETE]);
-        let mut status = start(machine.clone(), PENDING, DeviceLock::default(), settled());
+        let mut status = start(machine.clone(), PENDING, DeviceLock::default(), settled(), unstopped()).0;
         status
             .wait_for(|status| matches!(status.state, MeasurementState::Failed { .. }))
             .await
@@ -1234,7 +1365,7 @@ mod tests {
         };
         let (reported, retired, _open) = job(vec![JobFrame::Finished(Ok(vec![failure]))]);
         let machine = ScriptedMachine::new(vec![reported], vec![COMPLETE]);
-        let mut status = start(machine, PENDING, DeviceLock::default(), settled());
+        let mut status = start(machine, PENDING, DeviceLock::default(), settled(), unstopped()).0;
         let measured = status
             .wait_for(|status| status.state == MeasurementState::Measured)
             .await
@@ -1255,7 +1386,7 @@ mod tests {
         let machine = ScriptedMachine::new(vec![reported], vec![COMPLETE]);
         let device = DeviceLock::default();
         let resident = device.try_share().unwrap();
-        let mut status = start(machine.clone(), PENDING, device, settled());
+        let mut status = start(machine.clone(), PENDING, device, settled(), unstopped()).0;
         tokio::time::sleep(FIRST_RETRY * 3).await;
         settle().await;
         assert_eq!(machine.started.load(Ordering::SeqCst), 0);
@@ -1286,7 +1417,7 @@ mod tests {
         let device = DeviceLock::default();
         let _resident = device.try_share().unwrap();
         device.resident_idle(Some(room(&machine, RoomAnswer::Made)));
-        let mut status = start(machine.clone(), PENDING, device.clone(), settled());
+        let mut status = start(machine.clone(), PENDING, device.clone(), settled(), unstopped()).0;
         status
             .wait_for(|status| status.state == MeasurementState::Measured)
             .await
@@ -1320,7 +1451,7 @@ mod tests {
         let _resident = device.try_share().unwrap();
         let idle = room(&machine, RoomAnswer::Made);
         device.resident_idle(Some(idle.clone()));
-        let mut status = start(machine.clone(), PENDING, device.clone(), settled());
+        let mut status = start(machine.clone(), PENDING, device.clone(), settled(), unstopped()).0;
         status
             .wait_for(|status| matches!(status.state, MeasurementState::Measuring { .. }))
             .await
@@ -1364,7 +1495,7 @@ mod tests {
         let device = DeviceLock::default();
         let resident = device.try_share().unwrap();
         device.resident_idle(Some(room(&machine, RoomAnswer::Refused(RoomRefusal::Short { bytes: SCRATCH }))));
-        let mut status = start(machine.clone(), PENDING, device.clone(), settled());
+        let mut status = start(machine.clone(), PENDING, device.clone(), settled(), unstopped()).0;
         tokio::time::sleep(FIRST_RETRY * 3).await;
         settle().await;
         assert_eq!(machine.started.load(Ordering::SeqCst), 0);
@@ -1391,7 +1522,7 @@ mod tests {
         let (reported, _, _open) = job(vec![JobFrame::Finished(Ok(Vec::new()))]);
         let machine = ScriptedMachine::new(vec![reported], vec![COMPLETE]);
         let (settling, settled) = watch::channel(false);
-        let mut status = start(machine.clone(), PENDING, DeviceLock::default(), settled);
+        let mut status = start(machine.clone(), PENDING, DeviceLock::default(), settled, unstopped()).0;
         tokio::time::sleep(FIRST_RETRY * 3).await;
         settle().await;
         assert_eq!(machine.started.load(Ordering::SeqCst), 0);
@@ -1430,7 +1561,7 @@ mod tests {
         let (finishing, _, _finished) = job(vec![JobFrame::Finished(Ok(Vec::new()))]);
         let machine = ScriptedMachine::new(vec![running, finishing], vec![PENDING, COMPLETE]);
         let device = DeviceLock::default();
-        let mut status = start(machine.clone(), PENDING, device.clone(), settled());
+        let mut status = start(machine.clone(), PENDING, device.clone(), settled(), unstopped()).0;
         status
             .wait_for(|status| matches!(status.state, MeasurementState::Measuring { .. }))
             .await
@@ -1477,7 +1608,7 @@ mod tests {
             JobFrame::Finished(Ok(Vec::new())),
         ]);
         let machine = ScriptedMachine::new(vec![failing, refining], vec![REFINING, COMPLETE]);
-        let status = start(machine.clone(), REFINING, DeviceLock::default(), settled());
+        let status = start(machine.clone(), REFINING, DeviceLock::default(), settled(), unstopped()).0;
         assert_eq!(status.borrow().state, MeasurementState::Measured);
         let mut seen = status.clone();
         let states = tokio::spawn(async move {
@@ -1530,7 +1661,7 @@ mod tests {
         let record = Record::Measured(seismic::measure::Timing { median: 1e-3, interval: None, samples: 1 });
         let (slow, retired, frames) = unopened(Vec::new());
         let machine = ScriptedMachine::new(vec![slow], vec![COMPLETE]);
-        let status = start(machine.clone(), PENDING, DeviceLock::default(), settled());
+        let status = start(machine.clone(), PENDING, DeviceLock::default(), settled(), unstopped()).0;
         let states = states_until(&status, COMPLETE);
         tokio::time::sleep(OPENING_LIMIT - Duration::from_secs(1)).await;
         let frames = frames.upgrade().expect("the job is still opening");
@@ -1555,7 +1686,7 @@ mod tests {
         let (jobs, _streams): (Vec<_>, Vec<_>) = hung.into_iter().map(|(job, _, stream)| (job, stream)).unzip();
         let machine = ScriptedMachine::new(jobs, vec![PENDING]);
         let began = tokio::time::Instant::now();
-        let mut status = start(machine.clone(), PENDING, DeviceLock::default(), settled());
+        let mut status = start(machine.clone(), PENDING, DeviceLock::default(), settled(), unstopped()).0;
         let ended = status.wait_for(|status| status.measurements == UNAVAILABLE).await.unwrap().clone();
         assert_eq!(ended.state, MeasurementState::Measured, "onboarding counts every model measured");
         assert!(began.elapsed() >= OPENING_LIMIT * UNOPENED_JOBS, "each opening was given its limit");
@@ -1573,7 +1704,7 @@ mod tests {
         let record = Record::Measured(seismic::measure::Timing { median: 1e-3, interval: None, samples: 1 });
         let (third, _, _c) = job(vec![JobFrame::Recorded(key("probe"), record), JobFrame::Finished(Ok(Vec::new()))]);
         let machine = ScriptedMachine::new(vec![first, second, third], vec![PENDING, PENDING, COMPLETE]);
-        let mut status = start(machine.clone(), PENDING, DeviceLock::default(), settled());
+        let mut status = start(machine.clone(), PENDING, DeviceLock::default(), settled(), unstopped()).0;
         let states = states_until(&status, COMPLETE);
         status.wait_for(|status| matches!(status.state, MeasurementState::Failed { .. })).await.unwrap();
         let unavailable = status.wait_for(|status| status.measurements == UNAVAILABLE).await.unwrap().clone();
@@ -1600,7 +1731,7 @@ mod tests {
         let (third, _, _c) = job(vec![JobFrame::Recorded(key("probe"), record), JobFrame::Finished(Ok(Vec::new()))]);
         let machine = ScriptedMachine::new(vec![first, second, third], vec![PENDING, PENDING, COMPLETE]);
         let began = tokio::time::Instant::now();
-        let status = start(machine.clone(), PENDING, DeviceLock::default(), settled());
+        let status = start(machine.clone(), PENDING, DeviceLock::default(), settled(), unstopped()).0;
         let states = states_until(&status, COMPLETE).await.unwrap();
         assert!(states.iter().all(|status| status.measurements != UNAVAILABLE), "{:?}", states.iter().map(|status| status.measurements).collect::<Vec<_>>());
         assert!(states.iter().any(|status| matches!(status.state, MeasurementState::Failed { .. })), "each busy job shows failed");
@@ -1614,7 +1745,7 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn a_start_with_everything_stored_runs_no_job() {
         let machine = ScriptedMachine::new(Vec::new(), Vec::new());
-        let status = start(machine.clone(), COMPLETE, DeviceLock::default(), settled());
+        let status = start(machine.clone(), COMPLETE, DeviceLock::default(), settled(), unstopped()).0;
         settle().await;
         assert_eq!(status.borrow().state, MeasurementState::Measured);
         assert_eq!(machine.started.load(Ordering::SeqCst), 0);
@@ -1626,7 +1757,7 @@ mod tests {
     async fn progress_frames_publish_phase_and_completion() {
         let (running, _, frames) = job(Vec::new());
         let machine = ScriptedMachine::new(vec![running], vec![COMPLETE]);
-        let mut status = start(machine.clone(), PENDING, DeviceLock::default(), settled());
+        let mut status = start(machine.clone(), PENDING, DeviceLock::default(), settled(), unstopped()).0;
         status
             .wait_for(|status| matches!(status.state, MeasurementState::Measuring { .. }))
             .await
@@ -1678,5 +1809,160 @@ mod tests {
             .wait_for(|status| status.state == MeasurementState::Measured)
             .await
             .unwrap();
+    }
+
+    /// A clean service shutdown while a measurement job is mid-point retires the worker, releases
+    /// every reported attempt marker so the shutdown cannot poison the point, and exits the owner
+    /// cleanly without starting another job.
+    #[tokio::test(start_paused = true)]
+    async fn a_clean_shutdown_retires_the_job_and_releases_its_attempts() {
+        let (running_job, retired, _open) = job(vec![JobFrame::Attempting(key("converted"))]);
+        let machine = ScriptedMachine::new(vec![running_job], vec![PENDING]);
+        let device = DeviceLock::default();
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+        let (mut status, owner) = start(machine.clone(), PENDING, device.clone(), settled(), shutdown_rx);
+        status
+            .wait_for(|status| matches!(status.state, MeasurementState::Measuring { .. }))
+            .await
+            .unwrap();
+        assert_eq!(given(&machine, 1), [job_time()]);
+        settle().await;
+        shutdown_tx.send_replace(true);
+        owner.ended().await;
+        assert_eq!(retirement(&retired), Some(false), "the job is stopped on shutdown");
+        assert_eq!(
+            *machine.released.lock().unwrap(),
+            [(MeasureJob(7), vec![key("converted")])],
+            "every attempt in progress is released on clean shutdown"
+        );
+        assert_eq!(machine.started.load(Ordering::SeqCst), 1);
+        assert!(device.try_job().is_some(), "the device is released once retired");
+    }
+
+    /// Repeated clean service shutdowns while measuring the same point release every job's
+    /// attempt and never leave an uncredited failure behind.
+    #[tokio::test(start_paused = true)]
+    async fn repeated_clean_shutdowns_release_every_restart_attempt() {
+        for restart in 1..=3_u64 {
+            let (sender, receiver) = mpsc::channel(8);
+            assert!(sender.try_send(JobFrame::Opened).is_ok());
+            assert!(sender.try_send(JobFrame::Attempting(key("converted"))).is_ok());
+            let retired = Arc::new(Mutex::new(None));
+            let running_job = StartedJob {
+                job: MeasureJob(restart),
+                frames: receiver,
+                process: Box::new(RecordedProcess {
+                    retired: Arc::clone(&retired),
+                    interrupted: false,
+                    _stream: sender,
+                }),
+            };
+            let machine = ScriptedMachine::new(vec![running_job], vec![PENDING]);
+            let (shutdown_tx, shutdown_rx) = watch::channel(false);
+            let (mut status, owner) = start(
+                machine.clone(),
+                PENDING,
+                DeviceLock::default(),
+                settled(),
+                shutdown_rx,
+            );
+            status
+                .wait_for(|status| matches!(status.state, MeasurementState::Measuring { .. }))
+                .await
+                .unwrap();
+            assert_eq!(given(&machine, 1), [job_time()]);
+            settle().await;
+            shutdown_tx.send_replace(true);
+            owner.ended().await;
+            assert_eq!(retirement(&retired), Some(false));
+            assert_eq!(
+                *machine.released.lock().unwrap(),
+                [(MeasureJob(restart), vec![key("converted")])],
+                "restart {restart} must release its in-flight attempt"
+            );
+        }
+    }
+
+    /// On Unix process-group shutdown (`SIGTERM` to `-pgid`), the child worker may die and close
+    /// its stream before the parent's signal task flips `shutdown`. When retirement observes an
+    /// external shutdown signal (`RetiredProcess::interrupted`), its attempts are still released.
+    #[tokio::test(start_paused = true)]
+    async fn a_worker_terminated_by_shutdown_signal_releases_its_attempts() {
+        let (sender, receiver) = mpsc::channel(8);
+        assert!(sender.try_send(JobFrame::Opened).is_ok());
+        assert!(sender.try_send(JobFrame::Attempting(key("converted"))).is_ok());
+        assert!(
+            sender
+                .try_send(JobFrame::Finished(Err(JobLost(
+                    "the job's reader ended".into()
+                ))))
+                .is_ok()
+        );
+        let retired = Arc::new(Mutex::new(None));
+        let signaled = StartedJob {
+            job: MeasureJob(11),
+            frames: receiver,
+            process: Box::new(RecordedProcess {
+                retired: Arc::clone(&retired),
+                interrupted: true,
+                _stream: sender,
+            }),
+        };
+        let machine = ScriptedMachine::new(vec![signaled], vec![COMPLETE]);
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+        let (mut status, owner) = start(
+            machine.clone(),
+            PENDING,
+            DeviceLock::default(),
+            settled(),
+            shutdown_rx,
+        );
+        status
+            .wait_for(|status| status.measurements == COMPLETE)
+            .await
+            .unwrap();
+        assert_eq!(
+            *machine.released.lock().unwrap(),
+            [(MeasureJob(11), vec![key("converted")])],
+            "an externally signal-terminated worker releases its attempts"
+        );
+        shutdown_tx.send_replace(true);
+        owner.ended().await;
+    }
+
+    /// A genuine worker crash (stream lost without shutdown or external shutdown signal) does NOT
+    /// release its attempts, so repeated crashes still mark the point unobtainable. Signalling
+    /// shutdown during the subsequent retry backoff exits immediately.
+    #[tokio::test(start_paused = true)]
+    async fn a_worker_crash_keeps_its_attempt_counted() {
+        let (crashed, retired, _open) = job(vec![
+            JobFrame::Attempting(key("converted")),
+            JobFrame::Finished(Err(JobLost("worker crashed with SIGSEGV".into()))),
+        ]);
+        let machine = ScriptedMachine::new(vec![crashed], vec![PENDING]);
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+        let (mut status, owner) = start(
+            machine.clone(),
+            PENDING,
+            DeviceLock::default(),
+            settled(),
+            shutdown_rx,
+        );
+        status
+            .wait_for(|status| matches!(status.state, MeasurementState::Failed { .. }))
+            .await
+            .unwrap();
+        assert_eq!(retirement(&retired), Some(false));
+        assert!(
+            machine.released.lock().unwrap().is_empty(),
+            "a crashed worker's attempt must stay counted"
+        );
+        let shutting_down = tokio::time::Instant::now();
+        shutdown_tx.send_replace(true);
+        owner.ended().await;
+        assert!(
+            shutting_down.elapsed() < FIRST_RETRY,
+            "shutdown exits the retry backoff immediately"
+        );
     }
 }

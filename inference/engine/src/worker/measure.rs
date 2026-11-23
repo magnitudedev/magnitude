@@ -115,7 +115,8 @@ pub struct MeasureRequest {
     /// selects.
     pub executor: seismic::ExecutorSelector,
     /// This job, as its attempt markers name it, so the attempt of a job
-    /// its host preempts is released rather than counted ([`release_killed`]).
+    /// its host preempts or shuts down is released rather than counted
+    /// ([`release_killed`]).
     pub job: MeasureJob,
     /// The time the job has to begin points in from its device's opening
     /// ([`job_time`]), however many are requested (`requests::JobDeadlines`).
@@ -290,7 +291,7 @@ impl AttemptMarkers {
     }
 
     /// Undo `job`'s attempt of `key`, where it is the attempt counted last:
-    /// its host preempted the job, which says nothing of the point.
+    /// its host preempted or shut down the job, which says nothing of the point.
     fn release(&self, key: &impl Serialize, job: MeasureJob) -> Result<(), StoreError> {
         self.change(key, |record| {
             (record.job == Some(job)).then(|| AttemptRecord {
@@ -308,7 +309,7 @@ impl AttemptMarkers {
 }
 
 /// Release `job`'s attempt of `key` in the kernel cache at `kernels`: its
-/// host preempted the job while timing it (for a load), which says nothing
+/// host preempted or shut down the job while timing it, which says nothing
 /// of the point, so it is attempted again uncounted. Only `job`'s own attempt is
 /// undone; a key it never marked is left as it is.
 pub fn release_killed(
@@ -982,6 +983,38 @@ mod tests {
         markers.release(&key, MeasureJob(3)).unwrap();
         assert_eq!(markers.record(&key).unwrap().ended_jobs, 1);
         assert_eq!(markers.unobtainable(&key).unwrap(), None);
+    }
+
+    /// Repeated clean shutdowns across process restarts release each active
+    /// attempt and never poison a point as unobtainable, while two genuine
+    /// unreleased crashes still bound retries at `ENDED_JOBS`.
+    #[test]
+    fn repeated_released_shutdowns_never_poison_while_genuine_crashes_still_bound() {
+        let kernels = tempfile::tempdir().unwrap();
+        let key = PointKey {
+            subject: seismic::PointSubject::executor(&seismic::Identity {
+                physical: seismic::PhysicalIdentity::Uuid([9; 16]),
+                backend: seismic::BackendName::Metal,
+                driver: "27.2.1".into(),
+            }),
+            kernels: Vec::new(),
+            configuration: Default::default(),
+            point: [("converted".to_owned(), 64)].into(),
+        };
+        for job_id in 1..=5 {
+            let markers = AttemptMarkers::new(kernels.path());
+            markers.attempting(&key, MeasureJob(job_id)).unwrap();
+            release_killed(kernels.path(), MeasureJob(job_id), &key).unwrap();
+            assert_eq!(markers.record(&key).unwrap().ended_jobs, 0);
+            assert_eq!(markers.unobtainable(&key).unwrap(), None);
+        }
+        // Two genuine worker crashes (never released) still mark the point unobtainable.
+        let markers = AttemptMarkers::new(kernels.path());
+        markers.attempting(&key, MeasureJob(10)).unwrap();
+        assert_eq!(markers.unobtainable(&key).unwrap(), None);
+        markers.attempting(&key, MeasureJob(11)).unwrap();
+        let reason = markers.unobtainable(&key).unwrap();
+        assert!(reason.is_some_and(|reason| reason.contains("ended 2 measurement jobs")));
     }
 
     /// In-process jobs on the host's CPU executor, their records and their
