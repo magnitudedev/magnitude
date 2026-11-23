@@ -218,8 +218,16 @@ __host__ __device__ constexpr int declared_served(int segment) {
     return segment == 0   ? SEISMIC_SEGMENT_WEIGHTS_0
            : segment == 1 ? SEISMIC_SEGMENT_WEIGHTS_1
            : segment == 2 ? SEISMIC_SEGMENT_WEIGHTS_2
-                          : SEISMIC_SEGMENT_WEIGHTS_3;
+           : segment == 3 ? SEISMIC_SEGMENT_WEIGHTS_3
+           : segment == 4 ? SEISMIC_SEGMENT_WEIGHTS_4
+           : segment == 5 ? SEISMIC_SEGMENT_WEIGHTS_5
+           : segment == 6 ? SEISMIC_SEGMENT_WEIGHTS_6
+                          : SEISMIC_SEGMENT_WEIGHTS_7;
 }
+
+template <int I> struct SegmentIndex {
+    static constexpr int value = I;
+};
 
 // The segments of a projection: one epilogue each (`Os`), serving the weights
 // of `Ws` in segment order as the declaration groups them (`declared_served`),
@@ -230,7 +238,9 @@ template <int ZEROES_, class... Ws, class... Os, int EMPTY_>
 struct SegmentSet<ZEROES_, Types<Ws...>, Types<Os...>, EMPTY_> {
     enum { COUNT = sizeof...(Os), ZEROES = ZEROES_ };
     static_assert(COUNT == SEISMIC_PROJECTION_SEGMENTS, "a segment set has an epilogue for each declared segment");
-    static_assert(sizeof...(Ws) == declared_served(0) + declared_served(1) + declared_served(2) + declared_served(3),
+    static_assert(sizeof...(Ws) == declared_served(0) + declared_served(1) + declared_served(2) + declared_served(3) +
+                                       declared_served(4) + declared_served(5) + declared_served(6) +
+                                       declared_served(7),
                   "a segment set holds the weights its declared segments serve");
     using Weights = Types<Ws...>;
     __host__ __device__ static constexpr int served(int segment) { return declared_served(segment); }
@@ -301,6 +311,20 @@ __device__ __forceinline__ void gemv_segment_of(Shared &shared, const Ready &x, 
         gemv_segment_ready<Shape>(shared, x, M, kblocks, group, s.rows[I], weight_of<A>(s), NoWeight{}, out_of<I>(s));
 }
 
+template <int I, class Shape, class Ready, class Segments, class Shared>
+__device__ __forceinline__ bool gemv_segmented_dispatch(Shared &shared, const Ready &x, u32 M, u64 kblocks, u64 group,
+                                                        int segment, const Segments &s) {
+    if constexpr (I < Segments::COUNT) {
+        if (segment == I) {
+            if constexpr (!Segments::empty(I))
+                gemv_segment_of<I, Shape>(shared, x, M, kblocks, group, s);
+            return true;
+        }
+        return gemv_segmented_dispatch<I + 1, Shape>(shared, x, M, kblocks, group, segment, s);
+    }
+    return false;
+}
+
 // The segmented GEMV's warp over its source `x` (block-collective at M = 1),
 // a group past the last segment included, which has no rows.
 template <class Shape, class Ready, class Segments, class Shared>
@@ -319,26 +343,8 @@ __device__ __forceinline__ void gemv_segmented_from(Shared &shared, const Ready 
                                   out_of<LAST>(s));
         return;
     }
-    switch (segment) {
-    case 0:
-        if constexpr (!Segments::empty(0))
-            gemv_segment_of<0, Shape>(shared, x, M, kblocks, group, s);
-        break;
-    case 1:
-        if constexpr (Segments::COUNT > 1 && !Segments::empty(1))
-            gemv_segment_of<1, Shape>(shared, x, M, kblocks, group, s);
-        break;
-    case 2:
-        if constexpr (Segments::COUNT > 2 && !Segments::empty(2))
-            gemv_segment_of<2, Shape>(shared, x, M, kblocks, group, s);
-        break;
-    case 3:
-        if constexpr (Segments::COUNT > 3 && !Segments::empty(3))
-            gemv_segment_of<3, Shape>(shared, x, M, kblocks, group, s);
-        break;
-    default:
+    if (!gemv_segmented_dispatch<0, Shape>(shared, x, M, kblocks, group, segment, s)) {
         gemv_segment_ready<Shape>(shared, x, M, kblocks, 0, 0, weight_of<LAST_WEIGHT>(s), NoWeight{}, out_of<LAST>(s));
-        break;
     }
 }
 
@@ -414,6 +420,21 @@ __device__ __forceinline__ void gemm_segment_of(u8 *shared, const u8 *rows, cons
                                                    NoWeight{}, out_of<I>(s));
 }
 
+template <int I, class Shape, bool S8, bool ENTRIES, class Operands, class Flags, class Segments>
+__device__ __forceinline__ void gemm_segmented_dispatch(u8 *shared, const u8 *rows, const u8 *s8_rows,
+                                                        const void *groups, u32 M, u64 K, u64 column, int segment,
+                                                        const Segments &s) {
+    if constexpr (I < Segments::COUNT) {
+        if (segment == I) {
+            if constexpr (!Segments::empty(I))
+                gemm_segment_of<I, Shape, S8, ENTRIES, Operands, Flags>(shared, rows, s8_rows, groups, M, K, column, s);
+            return;
+        }
+        gemm_segmented_dispatch<I + 1, Shape, S8, ENTRIES, Operands, Flags>(shared, rows, s8_rows, groups, M, K, column,
+                                                                            segment, s);
+    }
+}
+
 // The segmented GEMM of one row band over the staged rows: block column
 // `gemm_column` of the segments in order.
 template <class Shape, bool S8, bool ENTRIES, class Operands, class Flags = AllInt8Flags, class Segments>
@@ -432,24 +453,8 @@ __device__ __forceinline__ void gemm_segmented(u8 *shared, const u8 *rows, const
                      Shape::THREADS);
         return;
     }
-    switch (segment) {
-    case 0:
-        if constexpr (!Segments::empty(0))
-            gemm_segment_of<0, Shape, S8, ENTRIES, Operands, Flags>(shared, rows, s8_src, groups, M, K, column, s);
-        break;
-    case 1:
-        if constexpr (Segments::COUNT > 1 && !Segments::empty(1))
-            gemm_segment_of<1, Shape, S8, ENTRIES, Operands, Flags>(shared, rows, s8_src, groups, M, K, column, s);
-        break;
-    case 2:
-        if constexpr (Segments::COUNT > 2 && !Segments::empty(2))
-            gemm_segment_of<2, Shape, S8, ENTRIES, Operands, Flags>(shared, rows, s8_src, groups, M, K, column, s);
-        break;
-    case 3:
-        if constexpr (Segments::COUNT > 3 && !Segments::empty(3))
-            gemm_segment_of<3, Shape, S8, ENTRIES, Operands, Flags>(shared, rows, s8_src, groups, M, K, column, s);
-        break;
-    }
+    gemm_segmented_dispatch<0, Shape, S8, ENTRIES, Operands, Flags>(shared, rows, s8_src, groups, M, K, column, segment,
+                                                                    s);
 }
 
 // One unpaired segment's split-K GEMM block into `partials` at `offset` among
@@ -463,6 +468,23 @@ __device__ __forceinline__ void gemm_segment_split_of(u8 *shared, const u8 *rows
     gemm_run<Shape, S8, ENTRIES, Operands>(shared, rows, K, groups, M, K, column, s.rows[I], weight_of<A>(s),
                                            NoWeight{}, PartialStore<1>{partials, M, total_cols, offset, part}, part,
                                            parts);
+}
+
+template <int I, class Shape, bool S8, bool ENTRIES, class Operands, class Segments>
+__device__ __forceinline__ void gemm_segmented_split_dispatch(u8 *shared, const u8 *rows, const void *groups, u32 M,
+                                                              u64 K, u64 column, int segment, const Segments &s,
+                                                              float *partials, u64 total_cols, const u64 *offsets,
+                                                              u64 part, u64 parts) {
+    if constexpr (I < Segments::COUNT) {
+        if (segment == I) {
+            if constexpr (!Segments::empty(I))
+                gemm_segment_split_of<I, Shape, S8, ENTRIES, Operands>(shared, rows, groups, M, K, column, s, partials,
+                                                                       total_cols, offsets[I], part, parts);
+            return;
+        }
+        gemm_segmented_split_dispatch<I + 1, Shape, S8, ENTRIES, Operands>(
+            shared, rows, groups, M, K, column, segment, s, partials, total_cols, offsets, part, parts);
+    }
 }
 
 // The segmented GEMM with optional split-K (`parts > 1`): when `parts == 1`,
@@ -488,27 +510,21 @@ __device__ __forceinline__ void gemm_segmented_split(u8 *shared, const u8 *rows,
         total_cols += s.rows[i];
     }
     const int segment = locate_segment(column, columns);
-    switch (segment) {
-    case 0:
-        if constexpr (!Segments::empty(0))
-            gemm_segment_split_of<0, Shape, S8, ENTRIES, Operands>(shared, rows, groups, M, K, column, s, partials,
-                                                                   total_cols, offsets[0], part, parts);
-        break;
-    case 1:
-        if constexpr (Segments::COUNT > 1 && !Segments::empty(1))
-            gemm_segment_split_of<1, Shape, S8, ENTRIES, Operands>(shared, rows, groups, M, K, column, s, partials,
-                                                                   total_cols, offsets[1], part, parts);
-        break;
-    case 2:
-        if constexpr (Segments::COUNT > 2 && !Segments::empty(2))
-            gemm_segment_split_of<2, Shape, S8, ENTRIES, Operands>(shared, rows, groups, M, K, column, s, partials,
-                                                                   total_cols, offsets[2], part, parts);
-        break;
-    case 3:
-        if constexpr (Segments::COUNT > 3 && !Segments::empty(3))
-            gemm_segment_split_of<3, Shape, S8, ENTRIES, Operands>(shared, rows, groups, M, K, column, s, partials,
-                                                                   total_cols, offsets[3], part, parts);
-        break;
+    gemm_segmented_split_dispatch<0, Shape, S8, ENTRIES, Operands>(shared, rows, groups, M, K, column, segment, s,
+                                                                   partials, total_cols, offsets, part, parts);
+}
+
+template <int I, class Segments>
+__device__ __forceinline__ void finalize_segmented_col(const Segments &s, unsigned m, u64 col, u64 offset, float value) {
+    if constexpr (I < Segments::COUNT) {
+        if constexpr (!Segments::empty(I)) {
+            if (col < offset + s.rows[I]) {
+                out_of<I>(s)(m, col - offset, value, 0.0f);
+                return;
+            }
+            offset += s.rows[I];
+        }
+        finalize_segmented_col<I + 1>(s, m, col, offset, value);
     }
 }
 
@@ -522,34 +538,7 @@ __device__ __forceinline__ void finalize_segmented(const float *partials, u64 pa
     for (int i = 0; i < Segments::COUNT; ++i)
         total_cols += s.rows[i];
     split_finalize<1>(partials, parts, M, total_cols, [&](unsigned m, unsigned long long col, float value, float) {
-        u64 offset = 0;
-        if constexpr (!Segments::empty(0)) {
-            if (col < s.rows[0]) {
-                out_of<0>(s)(m, col, value, 0.0f);
-                return;
-            }
-            offset += s.rows[0];
-        }
-        if constexpr (Segments::COUNT > 1 && !Segments::empty(1)) {
-            if (col < offset + s.rows[1]) {
-                out_of<1>(s)(m, col - offset, value, 0.0f);
-                return;
-            }
-            offset += s.rows[1];
-        }
-        if constexpr (Segments::COUNT > 2 && !Segments::empty(2)) {
-            if (col < offset + s.rows[2]) {
-                out_of<2>(s)(m, col - offset, value, 0.0f);
-                return;
-            }
-            offset += s.rows[2];
-        }
-        if constexpr (Segments::COUNT > 3 && !Segments::empty(3)) {
-            if (col < offset + s.rows[3]) {
-                out_of<3>(s)(m, col - offset, value, 0.0f);
-                return;
-            }
-        }
+        finalize_segmented_col<0>(s, m, col, 0, value);
     });
 }
 
@@ -599,6 +588,34 @@ __device__ __forceinline__ void store_part_sum(const Segments &s, unsigned m, u6
     out_of<I>(s)(m, n, sum, 0.0f);
 }
 
+template <int I, class Shape, class Row, class Rows, class Segments, class Shared>
+__device__ __forceinline__ void gemv_parts_dispatch(Shared &shared, const Row &x, const Rows &xs, u32 M, u64 kblocks,
+                                                    u64 group, u64 window, int segment, float *partials, u64 part_row,
+                                                    u64 part_base, const u64 *firsts, const Segments &s) {
+    if constexpr (I < Segments::COUNT) {
+        if (segment == I) {
+            if constexpr (!Segments::empty(I))
+                gemv_part_of<I, Shape>(shared, x, xs, M, kblocks, group, window,
+                                       PartPartial{partials, part_row, part_base + firsts[I]}, s);
+            return;
+        }
+        gemv_parts_dispatch<I + 1, Shape>(shared, x, xs, M, kblocks, group, window, segment, partials, part_row,
+                                          part_base, firsts, s);
+    }
+}
+
+template <int I, class Segments>
+__device__ __forceinline__ void store_part_sum_dispatch(const Segments &s, int segment, unsigned m, u64 n, float sum) {
+    if constexpr (I < Segments::COUNT) {
+        if (segment == I) {
+            if constexpr (!Segments::empty(I))
+                store_part_sum<I>(s, m, n, sum);
+            return;
+        }
+        store_part_sum_dispatch<I + 1>(s, segment, m, n, sum);
+    }
+}
+
 // The parts GEMV over NB column blocks of 8 rows. `row(part, first)` is part
 // `part`'s one row as a GEMV ready callback giving its `shared_row` (`first`:
 // the part's first block, which publishes what the part's prologue
@@ -628,25 +645,8 @@ __device__ __forceinline__ void gemv_parts(const Row &row, const Rows &rows, flo
     const auto x = row(part, first);
     const auto xs = rows(part);
     const u64 window = part * (kblocks / 4);
-    const auto partial = [&](int i) { return PartPartial{partials, PARTS * outputs, part * outputs + firsts[i]}; };
-    switch (segment) {
-    case 0:
-        if constexpr (!Segments::empty(0))
-            gemv_part_of<0, Shape>(shared, x, xs, M, kblocks, group, window, partial(0), s);
-        break;
-    case 1:
-        if constexpr (Segments::COUNT > 1 && !Segments::empty(1))
-            gemv_part_of<1, Shape>(shared, x, xs, M, kblocks, group, window, partial(1), s);
-        break;
-    case 2:
-        if constexpr (Segments::COUNT > 2 && !Segments::empty(2))
-            gemv_part_of<2, Shape>(shared, x, xs, M, kblocks, group, window, partial(2), s);
-        break;
-    case 3:
-        if constexpr (Segments::COUNT > 3 && !Segments::empty(3))
-            gemv_part_of<3, Shape>(shared, x, xs, M, kblocks, group, window, partial(3), s);
-        break;
-    }
+    gemv_parts_dispatch<0, Shape>(shared, x, xs, M, kblocks, group, window, segment, partials, PARTS * outputs,
+                                  part * outputs, firsts, s);
     __shared__ unsigned last;
     if (!arrive::last(arrivals, gridDim.x, &last))
         return;
@@ -656,23 +656,7 @@ __device__ __forceinline__ void gemv_parts(const Row &row, const Rows &rows, flo
         float sum = 0.0f;
         for (unsigned p = 0; p < PARTS; ++p)
             sum += __ldcg(partials + (m * PARTS + p) * outputs + n);
-        switch (locate_segment(n, extents)) {
-        case 0:
-            store_part_sum<0>(s, m, n, sum);
-            break;
-        case 1:
-            if constexpr (Segments::COUNT > 1)
-                store_part_sum<1>(s, m, n, sum);
-            break;
-        case 2:
-            if constexpr (Segments::COUNT > 2)
-                store_part_sum<2>(s, m, n, sum);
-            break;
-        case 3:
-            if constexpr (Segments::COUNT > 3)
-                store_part_sum<3>(s, m, n, sum);
-            break;
-        }
+        store_part_sum_dispatch<0>(s, locate_segment(n, extents), m, n, sum);
     }
 }
 #endif
@@ -1077,8 +1061,6 @@ __device__ __forceinline__ void ordered_gemm_block(u8 *shared_raw, const u8 *row
     }
 }
 
-template <int I> struct SegmentIndex { static constexpr int value = I; };
-
 template <int I, bool PUBLISH, unsigned TPW, unsigned KSPLIT, class ProFn, class UnordPro, class PubOut, class Segments>
 __device__ __forceinline__ void ordered_gemv_segment_of(u8 *shared_raw, const ProFn &pro_fn, const UnordPro &unord_pro,
                                                         const u8 *staged, PubOut pub_out, u64 pub_s0, u64 pub_s1,
@@ -1108,6 +1090,24 @@ __device__ __forceinline__ void ordered_gemv_segment_of(u8 *shared_raw, const Pr
     }
 }
 
+template <int I, bool PUBLISH, unsigned TPW, unsigned KSPLIT, class ProFn, class UnordPro, class PubOut, class Segments>
+__device__ __forceinline__ void ordered_gemv_segmented_dispatch(u8 *shared_raw, const ProFn &pro_fn,
+                                                                const UnordPro &unord_pro, const u8 *staged,
+                                                                PubOut pub_out, u64 pub_s0, u64 pub_s1, bool pub,
+                                                                u32 M, u64 K, u64 local, int segment,
+                                                                const Segments &s) {
+    if constexpr (I < Segments::COUNT) {
+        if (segment == I) {
+            if constexpr (!Segments::empty(I))
+                ordered_gemv_segment_of<I, PUBLISH, TPW, KSPLIT>(shared_raw, pro_fn, unord_pro, staged, pub_out,
+                                                                 pub_s0, pub_s1, pub, M, K, local, s);
+            return;
+        }
+        ordered_gemv_segmented_dispatch<I + 1, PUBLISH, TPW, KSPLIT>(shared_raw, pro_fn, unord_pro, staged, pub_out,
+                                                                     pub_s0, pub_s1, pub, M, K, local, segment, s);
+    }
+}
+
 template <bool PUBLISH, u64 K, unsigned TPW = 1, unsigned KSPLIT = 1, class ProFn, class UnordPro, class PubOut,
           class Segments>
 __device__ __forceinline__ u64 ordered_gemv_segmented_each(u8 *shared_raw, const ProFn &pro_fn,
@@ -1116,8 +1116,10 @@ __device__ __forceinline__ u64 ordered_gemv_segmented_each(u8 *shared_raw, const
                                                            unsigned zero_mask) {
     seismic_dependency_start();
     constexpr u64 UNORD_PER = (8ull / KSPLIT) * (16ull * TPW);
-    const bool seg_ord[4] = {SEISMIC_SEGMENT_ORDERED_0 != 0, SEISMIC_SEGMENT_ORDERED_1 != 0,
-                             SEISMIC_SEGMENT_ORDERED_2 != 0, SEISMIC_SEGMENT_ORDERED_3 != 0};
+    const bool seg_ord[8] = {SEISMIC_SEGMENT_ORDERED_0 != 0, SEISMIC_SEGMENT_ORDERED_1 != 0,
+                             SEISMIC_SEGMENT_ORDERED_2 != 0, SEISMIC_SEGMENT_ORDERED_3 != 0,
+                             SEISMIC_SEGMENT_ORDERED_4 != 0, SEISMIC_SEGMENT_ORDERED_5 != 0,
+                             SEISMIC_SEGMENT_ORDERED_6 != 0, SEISMIC_SEGMENT_ORDERED_7 != 0};
     u64 tiles[Segments::COUNT];
     u64 ordered_tiles = 0;
 #pragma unroll
@@ -1135,28 +1137,8 @@ __device__ __forceinline__ u64 ordered_gemv_segmented_each(u8 *shared_raw, const
         return ordered_tiles;
     }
     const bool pub = blockIdx.x == 0;
-    switch (segment) {
-    case 0:
-        if constexpr (!Segments::empty(0))
-            ordered_gemv_segment_of<0, PUBLISH, TPW, KSPLIT>(shared_raw, pro_fn, unord_pro, staged, pub_out, pub_s0,
-                                                             pub_s1, pub, M, K, local, s);
-        break;
-    case 1:
-        if constexpr (Segments::COUNT > 1 && !Segments::empty(1))
-            ordered_gemv_segment_of<1, PUBLISH, TPW, KSPLIT>(shared_raw, pro_fn, unord_pro, staged, pub_out, pub_s0,
-                                                             pub_s1, pub, M, K, local, s);
-        break;
-    case 2:
-        if constexpr (Segments::COUNT > 2 && !Segments::empty(2))
-            ordered_gemv_segment_of<2, PUBLISH, TPW, KSPLIT>(shared_raw, pro_fn, unord_pro, staged, pub_out, pub_s0,
-                                                             pub_s1, pub, M, K, local, s);
-        break;
-    case 3:
-        if constexpr (Segments::COUNT > 3 && !Segments::empty(3))
-            ordered_gemv_segment_of<3, PUBLISH, TPW, KSPLIT>(shared_raw, pro_fn, unord_pro, staged, pub_out, pub_s0,
-                                                             pub_s1, pub, M, K, local, s);
-        break;
-    }
+    ordered_gemv_segmented_dispatch<0, PUBLISH, TPW, KSPLIT>(shared_raw, pro_fn, unord_pro, staged, pub_out, pub_s0,
+                                                             pub_s1, pub, M, K, local, segment, s);
     return ordered_tiles;
 }
 
@@ -1182,6 +1164,20 @@ __device__ __forceinline__ void ordered_gemm_segment_of(u8 *shared_raw, const u8
                        out_of<I>(s));
 }
 
+template <int I, class Segments>
+__device__ __forceinline__ void ordered_gemm_segmented_dispatch(u8 *shared_raw, const u8 *rows, u64 row_stride,
+                                                                u64 col_stride, u32 M, u64 K, u64 local, int segment,
+                                                                const Segments &s) {
+    if constexpr (I < Segments::COUNT) {
+        if (segment == I) {
+            if constexpr (!Segments::empty(I))
+                ordered_gemm_segment_of<I>(shared_raw, rows, row_stride, col_stride, M, K, local, s);
+            return;
+        }
+        ordered_gemm_segmented_dispatch<I + 1>(shared_raw, rows, row_stride, col_stride, M, K, local, segment, s);
+    }
+}
+
 template <class Segments>
 __device__ __forceinline__ void ordered_gemm_segmented(u8 *shared_raw, const u8 *rows, u64 row_stride, u64 col_stride,
                                                        u32 M, u64 K, const Segments &s, unsigned zero) {
@@ -1196,24 +1192,7 @@ __device__ __forceinline__ void ordered_gemm_segmented(u8 *shared_raw, const u8 
         zero_segment(s, segment, M, blockIdx.y * 32u, 32u, local * 16ull, 16u, threadIdx.x, blockDim.x);
         return;
     }
-    switch (segment) {
-    case 0:
-        if constexpr (!Segments::empty(0))
-            ordered_gemm_segment_of<0>(shared_raw, rows, row_stride, col_stride, M, K, local, s);
-        break;
-    case 1:
-        if constexpr (Segments::COUNT > 1 && !Segments::empty(1))
-            ordered_gemm_segment_of<1>(shared_raw, rows, row_stride, col_stride, M, K, local, s);
-        break;
-    case 2:
-        if constexpr (Segments::COUNT > 2 && !Segments::empty(2))
-            ordered_gemm_segment_of<2>(shared_raw, rows, row_stride, col_stride, M, K, local, s);
-        break;
-    case 3:
-        if constexpr (Segments::COUNT > 3 && !Segments::empty(3))
-            ordered_gemm_segment_of<3>(shared_raw, rows, row_stride, col_stride, M, K, local, s);
-        break;
-    }
+    ordered_gemm_segmented_dispatch<0>(shared_raw, rows, row_stride, col_stride, M, K, local, segment, s);
 }
 
 } // namespace op

@@ -497,6 +497,26 @@
 #elif SEISMIC_SEGMENT_WEIGHTS_3 != 2 && defined(PROJECTION_PARTNER_3)
 #error "segment 3 serves one weight: its kernel names no partner"
 #endif
+#if SEISMIC_SEGMENT_WEIGHTS_4 == 2 && !defined(PROJECTION_PARTNER_4)
+#error "segment 4 serves a pair: its kernel names the partner (PROJECTION_PARTNER_4)"
+#elif SEISMIC_SEGMENT_WEIGHTS_4 != 2 && defined(PROJECTION_PARTNER_4)
+#error "segment 4 serves one weight: its kernel names no partner"
+#endif
+#if SEISMIC_SEGMENT_WEIGHTS_5 == 2 && !defined(PROJECTION_PARTNER_5)
+#error "segment 5 serves a pair: its kernel names the partner (PROJECTION_PARTNER_5)"
+#elif SEISMIC_SEGMENT_WEIGHTS_5 != 2 && defined(PROJECTION_PARTNER_5)
+#error "segment 5 serves one weight: its kernel names no partner"
+#endif
+#if SEISMIC_SEGMENT_WEIGHTS_6 == 2 && !defined(PROJECTION_PARTNER_6)
+#error "segment 6 serves a pair: its kernel names the partner (PROJECTION_PARTNER_6)"
+#elif SEISMIC_SEGMENT_WEIGHTS_6 != 2 && defined(PROJECTION_PARTNER_6)
+#error "segment 6 serves one weight: its kernel names no partner"
+#endif
+#if SEISMIC_SEGMENT_WEIGHTS_7 == 2 && !defined(PROJECTION_PARTNER_7)
+#error "segment 7 serves a pair: its kernel names the partner (PROJECTION_PARTNER_7)"
+#elif SEISMIC_SEGMENT_WEIGHTS_7 != 2 && defined(PROJECTION_PARTNER_7)
+#error "segment 7 serves one weight: its kernel names no partner"
+#endif
 #endif
 #ifndef PROJECTION_PACKET_0
 #define PROJECTION_PACKET_0 packets::W0
@@ -533,6 +553,42 @@
 #endif
 #ifndef PROJECTION_PARTNER_PACKET_3
 #define PROJECTION_PARTNER_PACKET_3 PROJECTION_PACKET_3
+#endif
+#ifndef PROJECTION_PACKET_4
+#define PROJECTION_PACKET_4 packets::W4
+#endif
+#ifndef PROJECTION_PARTNER_4
+#define PROJECTION_PARTNER_4 w4
+#endif
+#ifndef PROJECTION_PARTNER_PACKET_4
+#define PROJECTION_PARTNER_PACKET_4 PROJECTION_PACKET_4
+#endif
+#ifndef PROJECTION_PACKET_5
+#define PROJECTION_PACKET_5 packets::W5
+#endif
+#ifndef PROJECTION_PARTNER_5
+#define PROJECTION_PARTNER_5 w5
+#endif
+#ifndef PROJECTION_PARTNER_PACKET_5
+#define PROJECTION_PARTNER_PACKET_5 PROJECTION_PACKET_5
+#endif
+#ifndef PROJECTION_PACKET_6
+#define PROJECTION_PACKET_6 packets::W6
+#endif
+#ifndef PROJECTION_PARTNER_6
+#define PROJECTION_PARTNER_6 w6
+#endif
+#ifndef PROJECTION_PARTNER_PACKET_6
+#define PROJECTION_PARTNER_PACKET_6 PROJECTION_PACKET_6
+#endif
+#ifndef PROJECTION_PACKET_7
+#define PROJECTION_PACKET_7 packets::W7
+#endif
+#ifndef PROJECTION_PARTNER_7
+#define PROJECTION_PARTNER_7 w7
+#endif
+#ifndef PROJECTION_PARTNER_PACKET_7
+#define PROJECTION_PARTNER_PACKET_7 PROJECTION_PACKET_7
 #endif
 #define PROJECTION_PACKET(s) PROJECTION_PACKET_##s
 #define PROJECTION_PAIRED(s) (SEISMIC_SEGMENT_WEIGHTS_##s == 2)
@@ -629,6 +685,10 @@ inline void segment_tall(thread const In &in, thread const Out &out, thread cons
 #define PROJECTION_EACH_2(X, ...) PROJECTION_EACH_1(X, __VA_ARGS__) X(1, __VA_ARGS__)
 #define PROJECTION_EACH_3(X, ...) PROJECTION_EACH_2(X, __VA_ARGS__) X(2, __VA_ARGS__)
 #define PROJECTION_EACH_4(X, ...) PROJECTION_EACH_3(X, __VA_ARGS__) X(3, __VA_ARGS__)
+#define PROJECTION_EACH_5(X, ...) PROJECTION_EACH_4(X, __VA_ARGS__) X(4, __VA_ARGS__)
+#define PROJECTION_EACH_6(X, ...) PROJECTION_EACH_5(X, __VA_ARGS__) X(5, __VA_ARGS__)
+#define PROJECTION_EACH_7(X, ...) PROJECTION_EACH_6(X, __VA_ARGS__) X(6, __VA_ARGS__)
+#define PROJECTION_EACH_8(X, ...) PROJECTION_EACH_7(X, __VA_ARGS__) X(7, __VA_ARGS__)
 #define PROJECTION_EACH_OF(COUNT, X, ...) PROJECTION_EACH_##COUNT(X, __VA_ARGS__)
 #define PROJECTION_EACH_EXPANDED(COUNT, X, ...) PROJECTION_EACH_OF(COUNT, X, __VA_ARGS__)
 #define PROJECTION_EACH_SEGMENT(X, ...) PROJECTION_EACH_EXPANDED(SEISMIC_PROJECTION_SEGMENTS, X, __VA_ARGS__)
@@ -638,6 +698,10 @@ inline void segment_tall(thread const In &in, thread const Out &out, thread cons
 #define PROJECTION_FIRST_1 uint(PROJECTION_N0)
 #define PROJECTION_FIRST_2 uint(PROJECTION_N0 + PROJECTION_N1)
 #define PROJECTION_FIRST_3 uint(PROJECTION_N0 + PROJECTION_N1 + PROJECTION_N2)
+#define PROJECTION_FIRST_4 uint(PROJECTION_N0 + PROJECTION_N1 + PROJECTION_N2 + PROJECTION_N3)
+#define PROJECTION_FIRST_5 uint(PROJECTION_N0 + PROJECTION_N1 + PROJECTION_N2 + PROJECTION_N3 + PROJECTION_N4)
+#define PROJECTION_FIRST_6 uint(PROJECTION_N0 + PROJECTION_N1 + PROJECTION_N2 + PROJECTION_N3 + PROJECTION_N4 + PROJECTION_N5)
+#define PROJECTION_FIRST_7 uint(PROJECTION_N0 + PROJECTION_N1 + PROJECTION_N2 + PROJECTION_N3 + PROJECTION_N4 + PROJECTION_N5 + PROJECTION_N6)
 
 // `segment`, the segment of threadgroup TILE of a launch whose threadgroups
 // each take PER columns of their segment, and `local`, the threadgroup
@@ -789,6 +853,10 @@ inline void segment_tall(thread const In &in, thread const Out &out, thread cons
 #define PROJECTION_PACKING_2 PROJECTION_PACKING_1 PROJECTION_PACKING_ROWS(1)
 #define PROJECTION_PACKING_3 PROJECTION_PACKING_2 PROJECTION_PACKING_ROWS(2)
 #define PROJECTION_PACKING_4 PROJECTION_PACKING_3 PROJECTION_PACKING_ROWS(3)
+#define PROJECTION_PACKING_5 PROJECTION_PACKING_4 PROJECTION_PACKING_ROWS(4)
+#define PROJECTION_PACKING_6 PROJECTION_PACKING_5 PROJECTION_PACKING_ROWS(5)
+#define PROJECTION_PACKING_7 PROJECTION_PACKING_6 PROJECTION_PACKING_ROWS(6)
+#define PROJECTION_PACKING_8 PROJECTION_PACKING_7 PROJECTION_PACKING_ROWS(7)
 #define PROJECTION_PACKING_OF_COUNT(COUNT) PROJECTION_PACKING_##COUNT
 #define PROJECTION_PACKING_EXPANDED(COUNT) PROJECTION_PACKING_OF_COUNT(COUNT)
 // The segmented operand classes coded for WIDTH residue bits where present;

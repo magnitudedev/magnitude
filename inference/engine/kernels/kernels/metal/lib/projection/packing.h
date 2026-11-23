@@ -567,7 +567,8 @@ struct packing_shared {
 // segments so every `N % 32 == 0` packable segment of a segmented projection
 // runs `gemm_packed_segment` with no `unpacked` fallback.
 template <uint WIDTH, typename A, uint RA, typename B = A, uint RB = 0, typename C = A, uint RC = 0,
-    typename D = A, uint RD = 0>
+    typename D = A, uint RD = 0, typename E = A, uint RE = 0, typename F = A, uint RF = 0,
+    typename G = A, uint RG = 0, typename H = A, uint RH = 0>
 struct packing_classes {
     static_assert(WIDTH == 1 || WIDTH == 2, "an operand's residue is one or two bits");
     template <uint FOLDS, uint RESIDUE, bool SUMS>
@@ -576,15 +577,29 @@ struct packing_classes {
         static constant constexpr bool s1 = RB != 0 && packing_serves<B, FOLDS, RESIDUE, SUMS>::value;
         static constant constexpr bool s2 = RC != 0 && packing_serves<C, FOLDS, RESIDUE, SUMS>::value;
         static constant constexpr bool s3 = RD != 0 && packing_serves<D, FOLDS, RESIDUE, SUMS>::value;
-        static constant constexpr bool active = s0 || s1 || s2 || s3;
-        static constant constexpr uint mask = (s0 ? 1u : 0u) | (s1 ? 2u : 0u) | (s2 ? 4u : 0u) | (s3 ? 8u : 0u);
+        static constant constexpr bool s4 = RE != 0 && packing_serves<E, FOLDS, RESIDUE, SUMS>::value;
+        static constant constexpr bool s5 = RF != 0 && packing_serves<F, FOLDS, RESIDUE, SUMS>::value;
+        static constant constexpr bool s6 = RG != 0 && packing_serves<G, FOLDS, RESIDUE, SUMS>::value;
+        static constant constexpr bool s7 = RH != 0 && packing_serves<H, FOLDS, RESIDUE, SUMS>::value;
+        static constant constexpr bool active = s0 || s1 || s2 || s3 || s4 || s5 || s6 || s7;
+        static constant constexpr uint mask =
+            (s0 ? 1u : 0u) | (s1 ? 2u : 0u) | (s2 ? 4u : 0u) | (s3 ? 8u : 0u)
+            | (s4 ? 16u : 0u) | (s5 ? 32u : 0u) | (s6 ? 64u : 0u) | (s7 ? 128u : 0u);
         static constant constexpr uint c0 = s0 ? packing_codes<A>::centre : 0u;
         static constant constexpr uint c1 = s1 ? packing_codes<B>::centre : 0u;
         static constant constexpr uint c2 = s2 ? packing_codes<C>::centre : 0u;
         static constant constexpr uint c3 = s3 ? packing_codes<D>::centre : 0u;
+        static constant constexpr uint c4 = s4 ? packing_codes<E>::centre : 0u;
+        static constant constexpr uint c5 = s5 ? packing_codes<F>::centre : 0u;
+        static constant constexpr uint c6 = s6 ? packing_codes<G>::centre : 0u;
+        static constant constexpr uint c7 = s7 ? packing_codes<H>::centre : 0u;
         static constant constexpr uint c01 = c0 > c1 ? c0 : c1;
         static constant constexpr uint c23 = c2 > c3 ? c2 : c3;
-        static constant constexpr uint centre = c01 > c23 ? c01 : c23;
+        static constant constexpr uint c45 = c4 > c5 ? c4 : c5;
+        static constant constexpr uint c67 = c6 > c7 ? c6 : c7;
+        static constant constexpr uint c03 = c01 > c23 ? c01 : c23;
+        static constant constexpr uint c47 = c45 > c67 ? c45 : c67;
+        static constant constexpr uint centre = c03 > c47 ? c03 : c47;
         static constant constexpr uint folds = FOLDS;
         static constant constexpr uint residue = RESIDUE;
         static constant constexpr bool sums = SUMS;
@@ -603,7 +618,11 @@ struct packing_classes {
         (packing_codes<A>::available && packing_codes<A>::sums)
         || (packing_codes<B>::available && packing_codes<B>::sums)
         || (packing_codes<C>::available && packing_codes<C>::sums)
-        || (packing_codes<D>::available && packing_codes<D>::sums);
+        || (packing_codes<D>::available && packing_codes<D>::sums)
+        || (packing_codes<E>::available && packing_codes<E>::sums)
+        || (packing_codes<F>::available && packing_codes<F>::sums)
+        || (packing_codes<G>::available && packing_codes<G>::sums)
+        || (packing_codes<H>::available && packing_codes<H>::sums);
     template <typename W>
     struct of {
         static constant constexpr bool served = packing_codes<W>::available;

@@ -3451,3 +3451,107 @@ namespace packets { typedef PACKETS_DECODER(KERNEL_W3) W3; }
 #endif
 namespace packets { constexpr bool W3_OPERANDS_NVFP4 = ELEMENT_HAS(KERNEL_W3, _OPERANDS_NVFP4); }
 #endif
+
+#if defined(KERNEL_W4)
+#if ELEMENT_HAS(KERNEL_W4, _KIND_DENSE)
+namespace packets { typedef detail::Dense<ELEMENT_OF(KERNEL_W4)> W4; }
+#define KERNEL_W4_AT(pointer) PACKETS_MAKE_DENSE(KERNEL_W4, pointer)
+#elif !ELEMENT_HAS(KERNEL_W4, _LAYOUT_MMA16)
+#error "KERNEL_W4 must be dense or bound in the mma16 layout"
+#else
+namespace packets { typedef PACKETS_DECODER(KERNEL_W4) W4; }
+#if ELEMENT_HAS(KERNEL_W4, _PLANE_RECORDS)
+#define KERNEL_W4_AT(pointer) PACKETS_MAKE_RECORDS(packets::W4, KERNEL_W4, pointer)
+#else
+#define KERNEL_W4_AT(pointer) PACKETS_MAKE(packets::W4, KERNEL_W4, pointer)
+#endif
+#endif
+#if ELEMENT_HAS(KERNEL_W4, _KIND_DENSE)
+#define KERNEL_W4_MATRIX(pointer, index) PACKETS_DENSE_MATRIX(KERNEL_W4, pointer, index)
+#define KERNEL_W4_MATRIX_BYTES ELEMENT_MATRIX_BYTES(KERNEL_W4)
+#define KERNEL_W4_ROW_BYTES PACKETS_DENSE_ROW_BYTES(KERNEL_W4)
+#else
+#define KERNEL_W4_MATRIX(pointer, index) KERNEL_W4_AT(PACKETS_PACKED_MATRIX(KERNEL_W4, pointer, index))
+#define KERNEL_W4_MATRIX_BYTES ELEMENT_MATRIX_BYTES(KERNEL_W4)
+#define KERNEL_W4_ROW_BYTES PACKETS_PACKED_ROW_BYTES(KERNEL_W4)
+#endif
+namespace packets { constexpr bool W4_OPERANDS_NVFP4 = ELEMENT_HAS(KERNEL_W4, _OPERANDS_NVFP4); }
+#endif
+
+#if defined(KERNEL_W5)
+#if ELEMENT_HAS(KERNEL_W5, _KIND_DENSE)
+namespace packets { typedef detail::Dense<ELEMENT_OF(KERNEL_W5)> W5; }
+#define KERNEL_W5_AT(pointer) PACKETS_MAKE_DENSE(KERNEL_W5, pointer)
+#elif !ELEMENT_HAS(KERNEL_W5, _LAYOUT_MMA16)
+#error "KERNEL_W5 must be dense or bound in the mma16 layout"
+#else
+namespace packets { typedef PACKETS_DECODER(KERNEL_W5) W5; }
+#if ELEMENT_HAS(KERNEL_W5, _PLANE_RECORDS)
+#define KERNEL_W5_AT(pointer) PACKETS_MAKE_RECORDS(packets::W5, KERNEL_W5, pointer)
+#else
+#define KERNEL_W5_AT(pointer) PACKETS_MAKE(packets::W5, KERNEL_W5, pointer)
+#endif
+#endif
+#if ELEMENT_HAS(KERNEL_W5, _KIND_DENSE)
+#define KERNEL_W5_MATRIX(pointer, index) PACKETS_DENSE_MATRIX(KERNEL_W5, pointer, index)
+#define KERNEL_W5_MATRIX_BYTES ELEMENT_MATRIX_BYTES(KERNEL_W5)
+#define KERNEL_W5_ROW_BYTES PACKETS_DENSE_ROW_BYTES(KERNEL_W5)
+#else
+#define KERNEL_W5_MATRIX(pointer, index) KERNEL_W5_AT(PACKETS_PACKED_MATRIX(KERNEL_W5, pointer, index))
+#define KERNEL_W5_MATRIX_BYTES ELEMENT_MATRIX_BYTES(KERNEL_W5)
+#define KERNEL_W5_ROW_BYTES PACKETS_PACKED_ROW_BYTES(KERNEL_W5)
+#endif
+namespace packets { constexpr bool W5_OPERANDS_NVFP4 = ELEMENT_HAS(KERNEL_W5, _OPERANDS_NVFP4); }
+#endif
+
+#if defined(KERNEL_W6)
+#if ELEMENT_HAS(KERNEL_W6, _KIND_DENSE)
+namespace packets { typedef detail::Dense<ELEMENT_OF(KERNEL_W6)> W6; }
+#define KERNEL_W6_AT(pointer) PACKETS_MAKE_DENSE(KERNEL_W6, pointer)
+#elif !ELEMENT_HAS(KERNEL_W6, _LAYOUT_MMA16)
+#error "KERNEL_W6 must be dense or bound in the mma16 layout"
+#else
+namespace packets { typedef PACKETS_DECODER(KERNEL_W6) W6; }
+#if ELEMENT_HAS(KERNEL_W6, _PLANE_RECORDS)
+#define KERNEL_W6_AT(pointer) PACKETS_MAKE_RECORDS(packets::W6, KERNEL_W6, pointer)
+#else
+#define KERNEL_W6_AT(pointer) PACKETS_MAKE(packets::W6, KERNEL_W6, pointer)
+#endif
+#endif
+#if ELEMENT_HAS(KERNEL_W6, _KIND_DENSE)
+#define KERNEL_W6_MATRIX(pointer, index) PACKETS_DENSE_MATRIX(KERNEL_W6, pointer, index)
+#define KERNEL_W6_MATRIX_BYTES ELEMENT_MATRIX_BYTES(KERNEL_W6)
+#define KERNEL_W6_ROW_BYTES PACKETS_DENSE_ROW_BYTES(KERNEL_W6)
+#else
+#define KERNEL_W6_MATRIX(pointer, index) KERNEL_W6_AT(PACKETS_PACKED_MATRIX(KERNEL_W6, pointer, index))
+#define KERNEL_W6_MATRIX_BYTES ELEMENT_MATRIX_BYTES(KERNEL_W6)
+#define KERNEL_W6_ROW_BYTES PACKETS_PACKED_ROW_BYTES(KERNEL_W6)
+#endif
+namespace packets { constexpr bool W6_OPERANDS_NVFP4 = ELEMENT_HAS(KERNEL_W6, _OPERANDS_NVFP4); }
+#endif
+
+#if defined(KERNEL_W7)
+#if ELEMENT_HAS(KERNEL_W7, _KIND_DENSE)
+namespace packets { typedef detail::Dense<ELEMENT_OF(KERNEL_W7)> W7; }
+#define KERNEL_W7_AT(pointer) PACKETS_MAKE_DENSE(KERNEL_W7, pointer)
+#elif !ELEMENT_HAS(KERNEL_W7, _LAYOUT_MMA16)
+#error "KERNEL_W7 must be dense or bound in the mma16 layout"
+#else
+namespace packets { typedef PACKETS_DECODER(KERNEL_W7) W7; }
+#if ELEMENT_HAS(KERNEL_W7, _PLANE_RECORDS)
+#define KERNEL_W7_AT(pointer) PACKETS_MAKE_RECORDS(packets::W7, KERNEL_W7, pointer)
+#else
+#define KERNEL_W7_AT(pointer) PACKETS_MAKE(packets::W7, KERNEL_W7, pointer)
+#endif
+#endif
+#if ELEMENT_HAS(KERNEL_W7, _KIND_DENSE)
+#define KERNEL_W7_MATRIX(pointer, index) PACKETS_DENSE_MATRIX(KERNEL_W7, pointer, index)
+#define KERNEL_W7_MATRIX_BYTES ELEMENT_MATRIX_BYTES(KERNEL_W7)
+#define KERNEL_W7_ROW_BYTES PACKETS_DENSE_ROW_BYTES(KERNEL_W7)
+#else
+#define KERNEL_W7_MATRIX(pointer, index) KERNEL_W7_AT(PACKETS_PACKED_MATRIX(KERNEL_W7, pointer, index))
+#define KERNEL_W7_MATRIX_BYTES ELEMENT_MATRIX_BYTES(KERNEL_W7)
+#define KERNEL_W7_ROW_BYTES PACKETS_PACKED_ROW_BYTES(KERNEL_W7)
+#endif
+namespace packets { constexpr bool W7_OPERANDS_NVFP4 = ELEMENT_HAS(KERNEL_W7, _OPERANDS_NVFP4); }
+#endif

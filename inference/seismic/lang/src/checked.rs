@@ -1039,7 +1039,7 @@ pub enum SignatureType {
 
 /// The most segments a `segmented` projection has
 /// ([`NativeImplementation::segments`]).
-pub const PROJECTION_SEGMENTS: usize = 4;
+pub const PROJECTION_SEGMENTS: usize = 8;
 
 /// One direct top-level native implementation attached to a checked entry.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
