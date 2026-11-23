@@ -1411,11 +1411,15 @@ fn measure(
         // submissions without host-vs-device timestamp filtering.
         let _ = decode_step(engine, mode, sequences, make, Some(&trace))?;
         let mut attributed = Vec::new();
+        let mut completed_steps = 0usize;
         for _ in 0..time.attribution_steps {
             let step = decode_step(engine, mode, sequences, make, Some(&trace))?;
-            attributed.extend(step.submissions);
+            if !step.submissions.is_empty() {
+                completed_steps += 1;
+                attributed.extend(step.submissions);
+            }
         }
-        attribution(&attributed, time.attribution_steps)
+        attribution(&attributed, completed_steps)
     };
     // The window's steps' times, each from the completion before it.
     let mut intervals = summaries[1..]

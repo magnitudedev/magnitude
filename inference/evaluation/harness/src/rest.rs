@@ -189,9 +189,12 @@ impl BankRest {
 /// The rows past its history a timed decode of `warm` warm steps, windows
 /// of `steps` and `attribution` attributed steps after its window advances
 /// at most, its discarded attempts too ([`steady_window`]): what its load's
-/// context holds beyond the history.
+/// context holds beyond the history. Includes the leading attribution drain
+/// step (when `attribution > 0`) and one lookahead successor past the last
+/// step so lookahead attribution never hits the context ceiling on its final
+/// step.
 pub fn decode_context_rows(warm: usize, steps: usize, attribution: usize) -> usize {
-    warm + steps + attribution + 1
+    warm + steps + attribution + 1 + usize::from(attribution > 0)
 }
 
 /// A decode's one window the bank rests across, the decode never deeper

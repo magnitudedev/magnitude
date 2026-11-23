@@ -21,7 +21,7 @@ from pathlib import Path
 import httpx
 from magnitude_fixtures import TemplateFile
 
-from . import record, report
+from . import attribution, record, report
 from .adapters import ADAPTERS
 from .adapters.base import command as subprocess_command
 from .client import Observation, measure
@@ -400,8 +400,11 @@ async def run(
     if host.is_file():
         summary["host"] = json.loads(host.read_text())
     store.complete(summary, report.markdown(summary))
+    has_magnitude = any(target.engine == "magnitude" for target in targets)
     write_result(store, started_at, build, acquisition, artifacts, entries, records, options,
-                 any(target.engine == "magnitude" for target in targets), command)
+                 has_magnitude, command)
+    if has_magnitude:
+        attribution.write(store.path)
     return summary
 
 

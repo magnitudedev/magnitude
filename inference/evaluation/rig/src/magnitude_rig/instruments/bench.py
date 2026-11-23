@@ -94,6 +94,18 @@ def _tuning_alert(directory) -> list[str]:
     return report.tuning_health_alert(health) if health else []
 
 
+def _attribution_summary(directory) -> list[str]:
+    from magnitude_bench import attribution
+
+    measure_log = directory.parent / "logs" / "job-measure.log"
+    log_path = measure_log if measure_log.is_file() else None
+    data = attribution.extract(directory, measure_log=log_path)
+    if not data["requests"] and not data["internal_requests"]:
+        return []
+    attribution.write(directory, measure_log=log_path)
+    return attribution.format_summary(data)
+
+
 def answer(arguments, results: dict[str, JobResult]) -> Answer:
     priced = results.get("measure")  # only when our engine serves
     if priced is not None and priced.code != 0:
@@ -110,6 +122,7 @@ def answer(arguments, results: dict[str, JobResult]) -> Answer:
         shown.append(f"… {len(lines) - REPORT_LINES} more lines in {report}")
     if len(lines) > REPORT_LINES or "## Tuning health" not in text:
         shown.extend(_tuning_alert(result.directory))
+    shown.extend(_attribution_summary(result.directory))
     return Answer(tuple(shown), True)
 
 
