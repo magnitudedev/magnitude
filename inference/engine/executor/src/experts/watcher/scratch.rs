@@ -300,6 +300,21 @@ impl<'a> Lease<'a> {
         group == self.lender && (directory.lent_claimed(group, HostRecord(record)) || self.names(record, directory.host_lent(group)))
     }
 
+    /// What a check of host record `record` of group `group` against the
+    /// lease read: the groups, the lender's lent records, whether the record
+    /// is claimed and named, and the lease's extent.
+    fn describe(self, directory: &Directory, group: usize, record: u32) -> String {
+        let lent = directory.host_lent(self.lender);
+        let extent = self.records.map_or_else(|| format!("full 0..{lent}"), |subset| format!("{} of {lent}", subset.len()));
+        format!(
+            "group {group}, lender {}, group lent {}, claimed {}, named {}, lease {extent}",
+            self.lender,
+            directory.host_lent(group),
+            directory.lent_claimed(group, HostRecord(record)),
+            self.names(record, lent),
+        )
+    }
+
     /// Whether the lease names lender record `record` of its `lent`.
     fn names(self, record: u32, lent: u32) -> bool {
         match self.records {
@@ -325,10 +340,24 @@ fn hit(core: &Core, layer: usize, expert: usize, step: Step, lease: Lease<'_>) -
             let record = core.layers[layer].map.resolve(expert, step)?;
             let group = core.layers[layer].group;
             let idx = u32::try_from(record).expect("record fits u32");
-            assert!(
-                !lease.holds(&core.directory, group, idx),
-                "step {step} resolves expert {expert} of layer {layer} in leased lent record {record}"
-            );
+            if lease.holds(&core.directory, group, idx) {
+                panic!(
+                    "step {step} resolves expert {expert} of layer {layer} in leased lent record {record} ({})",
+                    lease.describe(&core.directory, group, idx)
+                );
+            }
+            // The check before groups were told apart failed here: another
+            // group's record whose index the lender's lease names. Told once,
+            // so a run shows which layers lie outside the lender.
+            if group != lease.lender && lease.records.is_some_and(|subset| subset.binary_search(&idx).is_ok()) {
+                static TOLD: std::sync::Once = std::sync::Once::new();
+                TOLD.call_once(|| {
+                    tracing::warn!(
+                        "step {step} hits expert {expert} of layer {layer} in its own record {record}, an index the lender's lease names ({})",
+                        lease.describe(&core.directory, group, idx)
+                    );
+                });
+            }
             Some(record)
         }
     }
