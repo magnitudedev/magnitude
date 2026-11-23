@@ -14,7 +14,7 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
 use magnitude_engine::worker::{
-    AcquiredDevice, Preparation as WorkerPreparation, PricedError, PricedFailure, run_priced,
+    Preparation as WorkerPreparation, PricedError, PricedFailure, run_priced,
 };
 use magnitude_engine::worker::protocol::LoadProgress;
 use magnitude_service_contracts::models::{
@@ -329,7 +329,7 @@ async fn prepare(
                 request_prices(&environment.catalog, &resolved.configuration),
             )
         },
-        |_| std::future::ready(Ok(AcquiredDevice::immediate(()))),
+        || std::future::ready(Ok(())),
         |()| {},
         job,
         |previewed, &(), mut job| {

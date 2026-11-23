@@ -86,7 +86,7 @@ impl ExecutionManifest {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::worker::{run_priced, AcquiredDevice, PricedError, PricedFailure};
+    use crate::worker::{run_priced, PricedError, PricedFailure};
     use magnitude_executor::{fixtures, platform::{DeviceRequest, ReleaseRate}, ExecutionPath};
     use std::cell::Cell;
 
@@ -137,7 +137,7 @@ mod tests {
                 });
                 std::future::ready(result)
             },
-            |_| std::future::ready(Ok(AcquiredDevice::immediate(()))),
+            || std::future::ready(Ok(())),
             |()| {},
             (),
             |_, &(), ()| std::future::ready(Ok::<_, PricedFailure<String, (), ()>>(())),
@@ -167,7 +167,7 @@ mod tests {
                 }))
             },
             || std::future::ready(Err("the job measured nothing")),
-            |_| std::future::ready(Ok(AcquiredDevice::immediate(()))),
+            || std::future::ready(Ok(())),
             |()| {},
             (),
             |_, &(), ()| std::future::ready(Ok::<_, PricedFailure<&str, (), ()>>(())),
@@ -176,7 +176,7 @@ mod tests {
         let unsupported = now(run_priced(
             || std::future::ready(Err::<(), _>(PreviewError::Internal { reason: "no plan".into() })),
             || std::future::ready(Err::<(), &str>("never asked")),
-            |_| std::future::ready(Ok(AcquiredDevice::immediate(()))),
+            || std::future::ready(Ok(())),
             |()| {},
             (),
             |_, &(), ()| std::future::ready(Ok::<_, PricedFailure<&str, (), ()>>(())),

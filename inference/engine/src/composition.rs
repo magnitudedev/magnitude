@@ -12,7 +12,7 @@ use crate::worker::{
     connect_worker, load_prepared,
     measure::{InProcessJobs, JobsStopped},
     prepare, protocol::LoadProgress, run_priced, run_worker, start_worker_process,
-    transport::channel_pair, AcquiredDevice, EngineClient, Preparation, PricedError,
+    transport::channel_pair, EngineClient, Preparation, PricedError,
     PricedFailure, WorkerConnection,
 };
 use magnitude_executor::UnpreparedUnits;
@@ -250,7 +250,7 @@ pub fn in_process_priced<T>(
                 }
             })())
         },
-        |&()| std::future::ready(Ok(AcquiredDevice::immediate(()))),
+        || std::future::ready(Ok(())),
         |()| {},
         (),
         |&(), &(), ()| std::future::ready(run().map_err(|error| PricedFailure::Load(error, (), ()))),

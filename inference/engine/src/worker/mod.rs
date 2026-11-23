@@ -27,8 +27,8 @@ pub use client::{
 };
 pub use preparation::{
     load_prepared, observe_worker_process, prepare, run_priced, start_worker_process,
-    AcquiredDevice, ChildTransport, Preparation, PricedError, PricedFailure, WorkerEnd,
-    WorkerProcess, WorkerReport,
+    ChildTransport, Preparation, PricedError, PricedFailure, WorkerEnd, WorkerProcess,
+    WorkerReport,
 };
 
 use crate::census::AllocationCensus;

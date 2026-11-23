@@ -95,24 +95,6 @@ pub enum Preparation {
     Incomplete(LoadError),
 }
 
-/// A device hold returned by [`run_priced`]'s `acquire_device` capability.
-pub struct AcquiredDevice<D> {
-    pub device: D,
-    /// Whether acquiring the device waited for another holder to release it,
-    /// which can change the room a plan settles into and therefore requires
-    /// re-previewing before running.
-    pub waited: bool,
-}
-
-impl<D> AcquiredDevice<D> {
-    pub fn immediate(device: D) -> Self {
-        Self {
-            device,
-            waited: false,
-        }
-    }
-}
-
 /// Failure of the `run` capability inside [`run_priced`].
 pub enum PricedFailure<H, C, S = ()> {
     /// A load or Prepare worker failed with [`LoadError`], carrying caller
@@ -139,24 +121,24 @@ pub enum PricedError<H, C> {
 /// Run a priced operation (`load_prepared` or `prepare`) as the single owner
 /// of price settling and device-hold release/re-acquire.
 ///
-/// 1. Preview while holding nothing of the device; while preview reports
-///    [`PreviewError::PricesPending`], compare its typed pending set against
-///    the previous attempt's: if unchanged, propagate the pending error
-///    immediately; otherwise call `settle` and preview again.
-/// 2. Acquire the device via `acquire_device`. If acquiring waited for
-///    another holder, preview again; if that preview reports
-///    [`PreviewError::PricesPending`], release the device via
-///    `release_device`, record its pending set, settle, and return to step 1
-///    (never settling while holding the device).
+/// 1. Acquire the device via `acquire_device` first so any background holder
+///    (measurement or optimization) is preempted and retired before live
+///    memory is observed.
+/// 2. Preview while holding the device. If preview reports
+///    [`PreviewError::PricesPending`], release the device via `release_device`
+///    first (never settling while holding the device), compare its typed
+///    pending set against the previous attempt's: if unchanged, propagate the
+///    pending error immediately; otherwise call `settle` and return to step 1.
+///    If preview reports any other error, release the device and propagate it.
 /// 3. Run the operation with the preview, held device, and caller state `S`.
 ///    If it reports [`LoadError::PricesPending`], release the device via
 ///    `release_device` and return to step 1 with the returned state `S`; if
-///    step 1 finds nothing pending (settling made no progress), propagate the
-///    pending error immediately.
+///    step 2 finds nothing pending (settling made no progress), release the
+///    device and propagate the pending error immediately.
 pub async fn run_priced<P, D, S, T, H, C, PF, SF, AF, RF>(
     mut preview: impl FnMut() -> PF,
     mut settle: impl FnMut() -> SF,
-    mut acquire_device: impl FnMut(&P) -> AF,
+    mut acquire_device: impl FnMut() -> AF,
     mut release_device: impl FnMut(D),
     mut state: S,
     mut run: impl FnMut(&P, &D, S) -> RF,
@@ -164,20 +146,22 @@ pub async fn run_priced<P, D, S, T, H, C, PF, SF, AF, RF>(
 where
     PF: Future<Output = Result<P, PreviewError>>,
     SF: Future<Output = Result<(), H>>,
-    AF: Future<Output = Result<AcquiredDevice<D>, H>>,
+    AF: Future<Output = Result<D, H>>,
     RF: Future<Output = Result<T, PricedFailure<H, C, S>>>,
 {
     let mut pending_load: Option<(LoadError, C)> = None;
     let mut previous_pending: Option<crate::error::PendingPrices> = None;
     loop {
         let mut settled = false;
-        let previewed = loop {
+        let (previewed, device) = loop {
+            let device = acquire_device().await.map_err(PricedError::Host)?;
             match preview().await {
                 Ok(value) => {
                     previous_pending = None;
-                    break value;
+                    break (value, device);
                 }
                 Err(PreviewError::PricesPending { reason, pending }) => {
+                    release_device(device);
                     if previous_pending.as_ref() == Some(&pending) {
                         return Err(PricedError::Preview(PreviewError::PricesPending {
                             reason,
@@ -189,39 +173,22 @@ where
                     settle().await.map_err(PricedError::Host)?;
                     settled = true;
                 }
-                Err(error) => return Err(PricedError::Preview(error)),
+                Err(error) => {
+                    release_device(device);
+                    return Err(PricedError::Preview(error));
+                }
             }
         };
         if let Some((error, context)) = pending_load.take() {
             if !settled {
+                release_device(device);
                 return Err(PricedError::Load(error, context));
             }
         }
-        let acquired = acquire_device(&previewed)
-            .await
-            .map_err(PricedError::Host)?;
-        let previewed = if acquired.waited {
-            match preview().await {
-                Ok(value) => value,
-                Err(PreviewError::PricesPending { reason, pending }) => {
-                    tracing::info!(%reason, "the load waits for the machine's standing figures");
-                    release_device(acquired.device);
-                    previous_pending = Some(pending);
-                    settle().await.map_err(PricedError::Host)?;
-                    continue;
-                }
-                Err(error) => {
-                    release_device(acquired.device);
-                    return Err(PricedError::Preview(error));
-                }
-            }
-        } else {
-            previewed
-        };
-        match run(&previewed, &acquired.device, state).await {
-            Ok(value) => return Ok((value, previewed, acquired.device)),
+        match run(&previewed, &device, state).await {
+            Ok(value) => return Ok((value, previewed, device)),
             Err(PricedFailure::Load(error @ LoadError::PricesPending { .. }, context, returned)) => {
-                release_device(acquired.device);
+                release_device(device);
                 state = returned;
                 pending_load = Some((error, context));
             }
@@ -711,12 +678,13 @@ mod tests {
         assert_eq!(*events.borrow(), ["load reported unprepared"]);
     }
 
-    /// `run_priced` owns preview settling, re-previewing after waiting for
-    /// the device (releasing the device before settling to avoid deadlocking),
-    /// retrying `LoadError::PricesPending`, and propagating when settling
-    /// makes no progress.
+    /// `run_priced` acquires the device before previewing (preempting any
+    /// background job holding VRAM before live memory is observed), releases
+    /// the device before settling to avoid deadlocking, retries
+    /// `LoadError::PricesPending`, releases on preview failure, and terminates
+    /// when settling makes no progress.
     #[test]
-    fn run_priced_releases_device_before_settling_and_terminates_without_progress() {
+    fn run_priced_acquires_before_preview_releases_before_settling_and_terminates_without_progress() {
         let events = RefCell::new(Vec::new());
         let device_held = Cell::new(false);
         let pending_a = crate::error::PendingPrices::new(magnitude_executor::assessment::Outstanding {
@@ -731,16 +699,15 @@ mod tests {
         .unwrap();
         let mut previews = std::collections::VecDeque::from([
             Err(PreviewError::PricesPending { reason: "cold".into(), pending: pending_a.clone() }),
+            Err(PreviewError::PricesPending { reason: "more".into(), pending: pending_b.clone() }),
             Ok("plan-1"),
-            Err(PreviewError::PricesPending { reason: "changed after wait".into(), pending: pending_b.clone() }),
-            Ok("plan-2"),
             Err(PreviewError::PricesPending { reason: "invalidated".into(), pending: pending_a.clone() }),
-            Ok("plan-3"),
+            Ok("plan-2"),
         ]);
-        let mut waited_seq = std::collections::VecDeque::from([true, false, false]);
         let run_pending = Cell::new(true);
         let (loaded, preview, device) = crate::preview::now(run_priced(
             || {
+                assert!(device_held.get(), "preview must run while holding the device");
                 let next = previews.pop_front().expect("preview");
                 events.borrow_mut().push(if next.is_ok() { "preview ok" } else { "preview pending" });
                 std::future::ready(next)
@@ -750,11 +717,10 @@ mod tests {
                 events.borrow_mut().push("settle");
                 std::future::ready(Ok::<(), &'static str>(()))
             },
-            |&_plan| {
+            || {
                 assert!(!device_held.replace(true), "acquire while already held");
-                let waited = waited_seq.pop_front().expect("acquire");
-                events.borrow_mut().push(if waited { "acquire waited" } else { "acquire" });
-                std::future::ready(Ok(AcquiredDevice { device: "share", waited }))
+                events.borrow_mut().push("acquire");
+                std::future::ready(Ok("share"))
             },
             |share| {
                 assert_eq!(share, "share");
@@ -766,7 +732,7 @@ mod tests {
                 assert_eq!((share, token), ("share", "state-token"));
                 assert!(device_held.get(), "run requires held device");
                 if run_pending.replace(false) {
-                    assert_eq!(plan, "plan-2");
+                    assert_eq!(plan, "plan-1");
                     events.borrow_mut().push("run pending");
                     return std::future::ready(Err(PricedFailure::Load(
                         LoadError::PricesPending {
@@ -777,46 +743,108 @@ mod tests {
                         token,
                     )));
                 }
-                assert_eq!(plan, "plan-3");
+                assert_eq!(plan, "plan-2");
                 events.borrow_mut().push("run ok");
                 std::future::ready(Ok("loaded"))
             },
         ))
         .unwrap();
-        assert_eq!((loaded, preview, device), ("loaded", "plan-3", "share"));
+        assert_eq!((loaded, preview, device), ("loaded", "plan-2", "share"));
         assert_eq!(
             *events.borrow(),
             [
-                "preview pending",
-                "settle",
-                "preview ok",
-                "acquire waited",
+                "acquire",
                 "preview pending",
                 "release",
                 "settle",
-                "preview ok",
                 "acquire",
+                "preview pending",
+                "release",
+                "settle",
+                "acquire",
+                "preview ok",
                 "run pending",
                 "release",
-                "preview pending",
-                "settle",
-                "preview ok",
                 "acquire",
+                "preview pending",
+                "release",
+                "settle",
+                "acquire",
+                "preview ok",
                 "run ok",
             ]
         );
 
+        // A background holder occupying memory is preempted by `acquire_device`
+        // before `preview` observes live memory, preventing a spurious
+        // `InsufficientMemory` error.
+        let background_job_running = Cell::new(true);
+        let outcome = crate::preview::now(run_priced(
+            || {
+                if background_job_running.get() {
+                    std::future::ready(Err(PreviewError::InsufficientMemory(
+                        crate::error::InsufficientMemory {
+                            required: 10 << 30,
+                            available: 2 << 30,
+                        },
+                    )))
+                } else {
+                    std::future::ready(Ok("plan-after-preempt"))
+                }
+            },
+            || std::future::ready(Ok::<(), &'static str>(())),
+            || {
+                background_job_running.set(false);
+                std::future::ready(Ok("share"))
+            },
+            |_share| {},
+            (),
+            |&plan, &_share, ()| std::future::ready(Ok::<_, PricedFailure<&str, (), ()>>(plan)),
+        ));
+        assert_eq!(outcome.unwrap(), ("plan-after-preempt", "plan-after-preempt", "share"));
+
+        // Non-pending preview failure releases the held device before returning.
+        let held_on_err = Cell::new(false);
+        let outcome = crate::preview::now(run_priced(
+            || {
+                std::future::ready(Err::<&str, _>(PreviewError::InsufficientMemory(
+                    crate::error::InsufficientMemory {
+                        required: 10 << 30,
+                        available: 2 << 30,
+                    },
+                )))
+            },
+            || std::future::ready(Ok::<(), &'static str>(())),
+            || {
+                assert!(!held_on_err.replace(true));
+                std::future::ready(Ok("share"))
+            },
+            |_share| assert!(held_on_err.replace(false)),
+            (),
+            |&_plan, &_share, ()| std::future::ready(Ok::<_, PricedFailure<&str, (), ()>>(())),
+        ));
+        assert!(!held_on_err.get(), "device must be released on preview failure");
+        assert!(matches!(
+            outcome,
+            Err(PricedError::Preview(PreviewError::InsufficientMemory(_)))
+        ));
+
         // Termination by construction (worker pending, preview not pending):
-        // settle does not run and the worker's PricesPending propagates.
+        // settle does not run, the device is released, and the worker's
+        // PricesPending propagates.
         let settled = Cell::new(false);
+        let held_no_progress = Cell::new(false);
         let outcome = crate::preview::now(run_priced(
             || std::future::ready(Ok("plan")),
             || {
                 settled.set(true);
                 std::future::ready(Ok::<(), &'static str>(()))
             },
-            |&_plan| std::future::ready(Ok(AcquiredDevice::immediate("share"))),
-            |_share| {},
+            || {
+                assert!(!held_no_progress.replace(true));
+                std::future::ready(Ok("share"))
+            },
+            |_share| assert!(held_no_progress.replace(false)),
             (),
             |&_plan, &_share, ()| {
                 std::future::ready(Err::<(), _>(PricedFailure::Load(
@@ -830,15 +858,17 @@ mod tests {
             },
         ));
         assert!(!settled.get());
+        assert!(!held_no_progress.get(), "device must be released when terminating without progress");
         assert!(matches!(
             outcome,
             Err(PricedError::Load(LoadError::PricesPending { .. }, "worker-2"))
         ));
 
         // Termination by construction (preview pending unchanged after settle):
-        // settles once, observes the same pending set, and propagates
-        // PreviewError::PricesPending instead of looping forever.
+        // settles once, observes the same pending set, releases the device, and
+        // propagates PreviewError::PricesPending instead of looping forever.
         let settles = Cell::new(0);
+        let held_unchanged = Cell::new(false);
         let outcome = crate::preview::now(run_priced(
             || {
                 std::future::ready(Err::<&str, _>(PreviewError::PricesPending {
@@ -847,15 +877,20 @@ mod tests {
                 }))
             },
             || {
+                assert!(!held_unchanged.get());
                 settles.set(settles.get() + 1);
                 std::future::ready(Ok::<(), &'static str>(()))
             },
-            |&_plan| std::future::ready(Ok(AcquiredDevice::immediate("share"))),
-            |_share| {},
+            || {
+                assert!(!held_unchanged.replace(true));
+                std::future::ready(Ok("share"))
+            },
+            |_share| assert!(held_unchanged.replace(false)),
             (),
             |&_plan, &_share, ()| std::future::ready(Ok::<_, PricedFailure<&str, (), ()>>(())),
         ));
         assert_eq!(settles.get(), 1);
+        assert!(!held_unchanged.get());
         assert!(matches!(
             outcome,
             Err(PricedError::Preview(PreviewError::PricesPending { .. }))
