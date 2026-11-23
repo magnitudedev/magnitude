@@ -1,0 +1,77 @@
+name: Recover Docker tags
+
+# A release whose publication stopped after its image was built and smoke-tested leaves that
+# image's digests as the release run's artifacts, untagged. This carries them into a run of its
+# own and tags them exactly as the release would have (docker-tags.yml), building nothing.
+on:
+  workflow_dispatch:
+    inputs:
+      run_id:
+        description: Release run whose smoke-tested image digests to tag
+        required: true
+        type: string
+      version:
+        description: Exact public GitHub release version the image is
+        required: true
+        type: string
+
+concurrency:
+  group: magnitude-production-release
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  digests:
+    runs-on: blacksmith-4vcpu-ubuntu-2404
+    permissions:
+      actions: read
+      contents: read
+    outputs:
+      ref: ${{ steps.release.outputs.commit }}
+    steps:
+      - name: Resolve the public release's source commit
+        id: release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ inputs.version }}
+          RUN_ID: ${{ inputs.run_id }}
+        run: |
+          tag="@magnitudedev/cli@${VERSION}"
+          release="$(gh api "repos/$GITHUB_REPOSITORY/releases/tags/$(jq -rn --arg tag "$tag" '$tag|@uri')")"
+          test "$(jq -r '.draft' <<< "$release")" = false
+          commit="$(gh api "repos/$GITHUB_REPOSITORY/commits/$(jq -rn --arg tag "$tag" '$tag|@uri')" --jq .sha)"
+          [[ "$commit" =~ ^[a-f0-9]{40}$ ]]
+          run="$(gh api "repos/$GITHUB_REPOSITORY/actions/runs/$RUN_ID")"
+          test "$(jq -r '.path' <<< "$run")" = .github/workflows/release.yml
+          test "$(jq -r '.head_sha' <<< "$run")" = "$commit"
+          echo "commit=$commit" >> "$GITHUB_OUTPUT"
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: docker-digest-*
+          path: ${{ runner.temp }}/digests
+          run-id: ${{ inputs.run_id }}
+          github-token: ${{ github.token }}
+      - uses: actions/upload-artifact@v4
+        with:
+          name: docker-digest-amd64
+          path: ${{ runner.temp }}/digests/docker-digest-amd64/*
+          if-no-files-found: error
+          retention-days: 1
+      - uses: actions/upload-artifact@v4
+        with:
+          name: docker-digest-arm64
+          path: ${{ runner.temp }}/digests/docker-digest-arm64/*
+          if-no-files-found: error
+          retention-days: 1
+  tags:
+    needs: digests
+    uses: ./.github/workflows/docker-tags.yml
+    with:
+      version: ${{ inputs.version }}
+      ref: ${{ needs.digests.outputs.ref }}
+      repository: magnitudedev/magnitude
+      channel_tag: true
+    secrets:
+      DOCKERHUB_TOKEN: ${{ secrets.DOCKERHUB_TOKEN }}
