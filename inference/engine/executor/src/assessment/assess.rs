@@ -257,8 +257,8 @@ impl ExpertShares {
     /// its slots, so computing it again cannot fail.
     pub fn of(bank: &crate::planning::ExpertBankPlan) -> Self {
         Self::new(
-            bank.floor(),
-            bank.slots,
+            bank.target_slots(bank.floor()),
+            bank.target_slots(bank.slots),
             bank.widest(),
             match bank.host() {
                 crate::planning::HostTier::Linked if bank.host_slots > 0 => {
@@ -653,7 +653,7 @@ impl BankSlotModel {
 
         let qual_peak = AttestedPrograms::qualification_peak_model(load)?;
         let mut bank_template = bank.clone();
-        bank_template.ceiling = bank_template.widest().get();
+        bank_template.ceiling = bank_template.max_slots();
         Ok(Self {
             bank_template,
             base_weight_demand,
@@ -688,18 +688,18 @@ impl BankSlotModel {
         paths: crate::planning::BankPaths,
     ) -> Result<crate::planning::ExpertBankPlan, String> {
         let mut bank = self.bank_template.clone();
-        let widest = bank.widest().get();
+        let max_slots = bank.max_slots();
         bank.paths = paths;
         bank.places = places;
-        if slots < bank.floor() || slots > widest {
+        if slots < bank.floor() || slots > max_slots {
             return Err(
                 "an expert bank holds from its floor to its ceiling, at most every expert of each layer"
                     .to_owned(),
             );
         }
         bank.slots = slots;
-        bank.ceiling = widest;
-        bank.resident = slots == widest;
+        bank.ceiling = max_slots;
+        bank.resident = bank.whole_at(slots);
         Ok(bank)
     }
 
@@ -1351,7 +1351,6 @@ impl<'a> BankPathPricer<'a> {
                 self.compute,
                 self.least_move_bytes,
                 held,
-                crate::planning::HINT_LEADS,
                 self.num_layers,
                 self.decode_rows,
                 saturation_bytes,
@@ -1384,14 +1383,14 @@ fn size_bank_with_host_tier(
         .clone();
     bank.places = places;
     bank.paths = paths;
-    if slots < bank.floor() || slots > bank.widest().get() {
+    if slots < bank.floor() || slots > bank.max_slots() {
         return Err(AssessmentError::Plan(
             "an expert bank holds from its floor to its ceiling, at most every expert of each layer".into(),
         ));
     }
     bank.slots = slots;
     bank.ceiling = slots;
-    bank.resident = slots == bank.widest().get();
+    bank.resident = bank.whole_at(slots);
     bank.pass = PassLaunches::FLOOR;
     if draft.device().host_tier() != Some(HostTier::Linked) {
         return Ok(Ok(bank));
@@ -1457,7 +1456,7 @@ fn settle_bank_rung(
         .expect("a bank form holds an expert bank");
     let holds = |fit: &crate::AssessmentFit| matches!(fit.verdict, AssessmentFitVerdict::Fits);
     let mut paths = match path_pricer {
-        Some(pricer) => pricer.paths_at(ceiling_slots)?,
+        Some(pricer) => pricer.paths_at(bank_plan.target_slots(ceiling_slots))?,
         None => bank_plan.paths,
     };
     let mut seen = Vec::new();
@@ -1502,7 +1501,7 @@ fn settle_bank_rung(
         }
         let (slots, (charge, fit)) = (lo, best);
         let next = match path_pricer {
-            Some(pricer) => pricer.paths_at(slots)?,
+            Some(pricer) => pricer.paths_at(bank_plan.target_slots(slots))?,
             None => paths,
         };
         if next == paths {

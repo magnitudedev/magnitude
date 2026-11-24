@@ -296,9 +296,9 @@ impl BankPrices {
     /// Neither marginal is priced before the load runs, so the plan holds
     /// the mean release's records and leaves that trade to the running
     /// load.
-    pub fn paths(&self, bytes: u64, held: HeldSlots, hint_leads: u64, saturation_bytes: u64) -> Option<PathRecords> {
+    pub fn paths(&self, bytes: u64, held: HeldSlots, saturation_bytes: u64) -> Option<PathRecords> {
         let layers: u64 = self.routed.iter().map(|kind| kind.layers).sum();
-        self.layers.path_records(self.read, self.compute, bytes, held, hint_leads, layers, self.decode_rows, saturation_bytes)
+        self.layers.path_records(self.read, self.compute, bytes, held, layers, self.decode_rows, saturation_bytes)
     }
 }
 
@@ -354,6 +354,25 @@ impl PathRecords {
     /// releases each victim as its move is issued.
     pub fn release(step: f64, reads: f64) -> f64 {
         (step - reads).max(0.) / 2.
+    }
+
+    /// Effective transfer-seconds of peak simultaneous unreleased victims
+    /// across a decode step of `step` seconds whose reads take `reads` seconds.
+    ///
+    /// Issuing `N = reads / transfer` moves at the path's full rate during
+    /// `[0, reads]` while victims release at `x·step` reaches its peak at
+    /// `t = reads`, when all `N` moves are issued and `reads / step` of layers
+    /// have already passed: `V_max = N · (1 − reads / step)`. Multiplied by
+    /// `transfer` for [`Self::of`], this is `reads · (step − reads).max(0) / step`:
+    /// zero when `reads == 0` (no moves, no victims) or `reads >= step`
+    /// (drive-bound), equal to `release(step, reads)` at `reads == step / 2`,
+    /// and strictly bounded by `reads` so high hit rates never inflate
+    /// `reserve` past the step's actual miss count.
+    pub fn release_load(step: f64, reads: f64) -> f64 {
+        if step <= 0. || reads <= 0. {
+            return 0.;
+        }
+        reads * (step - reads).max(0.) / step
     }
 }
 

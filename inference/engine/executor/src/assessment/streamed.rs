@@ -8,7 +8,7 @@ use super::cost::{host_lines, BankLines, HostLinesError};
 use super::executor_costs::ExecutorCosts;
 use super::priced::Priced;
 use super::requests::{Outstanding, PendingPrices};
-use super::streaming_costs::{ConvertCosts, ConvertForm, CpuCosts, CpuForm, MemoryCosts, StorageCosts};
+use super::streaming_costs::{ConvertCosts, ConvertForm, CpuCosts, CpuForm, MemoryCosts, StorageCosts, TierCopyCosts};
 use crate::planning::ExpertBankPlan;
 use magnitude_cost_model::{CpuLines, ExpertPass, HostLines, LandingLine, ReadLine, RecordLine, StreamedLayers};
 use seismic::measure::{InvalidLine, Record, RecordStore, StoreError};
@@ -29,6 +29,10 @@ pub struct StreamedFigures {
     pub memory: Option<f64>,
     pub site: Option<(CpuForm, CpuLines)>,
     pub convert: f64,
+    /// Measured H2D DMA transfer line (`TierCopyCosts::transfer`) when already
+    /// recorded on a discrete device; `None` on unified memory or before first
+    /// `TierCopy` measurement.
+    pub transfer: Option<ReadLine>,
 }
 
 impl StreamedFigures {
@@ -62,9 +66,14 @@ impl StreamedFigures {
             Ok(None) => Priced::Unavailable(format!("{:?} streams nothing", executor.backend())),
             Ok(Some(form)) => ConvertCosts::priced(topology, executor, form, &reading).derive(|costs| form.stored_byte_seconds(costs.record_seconds)),
         };
+        let transfer = if topology.shared_ranges_lie_in_device_memory(executor) {
+            None
+        } else {
+            TierCopyCosts::stored(topology, executor, &reading).ok().map(|costs| costs.transfer)
+        };
         let figures = match (read, memory, site, convert) {
             (Priced::Measured(read), Priced::Measured(memory), Priced::Measured(site), Priced::Measured(convert)) => {
-                Priced::Measured(Self { read, memory, site, convert })
+                Priced::Measured(Self { read, memory, site, convert, transfer })
             }
             (read, memory, site, convert) => {
                 let mut standing = Vec::new();

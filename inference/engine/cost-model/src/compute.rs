@@ -56,24 +56,6 @@ pub(crate) fn routed_seconds(census: &Census, kind: RoutedKind, pricing: &Pricin
     Ok(pricing.figures.composition.clone()? * calls)
 }
 
-/// Streamed layer `layer`'s hint launch in a launch of `rows` rows of
-/// `sequences` sequences, priced at `pricing` at no context, composed, with
-/// none of the launch's own terms beside it: none where the layer hints
-/// none.
-///
-/// # Panics
-/// Where a hint launch reads history: it reads none at any depth.
-pub(crate) fn hint_seconds(census: &Census, layer: usize, pricing: &Pricing<'_>, sequences: u64, rows: u64) -> Result<Option<f64>, PriceError> {
-    let Some(kind) = census.hint(layer) else {
-        return Ok(None);
-    };
-    let rates = &pricing.figures.rates;
-    let work = &census.kinds()[kind].work;
-    assert!(work.history.is_none(), "invariant violated: streamed layer {layer}'s hint launch reads history");
-    let seconds = call(census, kind, rates, sequences, rows, 0, work.experts.as_ref().map(|experts| ExpertRead::independent(experts, rows)))?.total();
-    Ok(Some(pricing.figures.composition.clone()? * seconds))
-}
-
 /// A call of `census`'s kind `kind` in a launch of `rows` rows of
 /// `sequences` sequences at `depth`, priced at `rates`: within the decode
 /// row classes in its decode form, its routed experts read as `read` says
@@ -204,6 +186,6 @@ impl ExpertPass {
         let (bytes, flops) = self.of(self.kind(layer));
         let row = self.rates.compute(flops, 1.);
         let line = |storage| PassLine::of(self.rates.weights_in(storage, bytes, 1.), row);
-        matches!(self.host, HostReads::Read).then(|| Ok(GpuLines { link: line(Storage::Host)?, resident: line(Storage::Device)?, moves: Moves::NONE }))
+        matches!(self.host, HostReads::Read).then(|| Ok(GpuLines { link: line(Storage::Host)?, resident: line(Storage::Device)?, moves: Moves::NONE, baseline_dma: None, contended_link: None }))
     }
 }

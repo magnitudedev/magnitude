@@ -113,11 +113,11 @@ impl LiveDecode {
     /// whole, from its first read: no weight is set between it and the
     /// model. A step of several rows missing at all with a row's share `q`
     /// misses with `1 − (1 − q)^rows`, so its requests count at `q`.
-    fn shares(&self, layer: usize, slots: usize, model: Shares) -> Shares {
+    fn shares(&self, layer: usize, slots: usize, model: impl FnOnce() -> Shares) -> Shares {
         let reads = &self.layers[layer];
         let all = reads.misses[0];
         if all == 0 || self.steps == 0 || !self.rows.is_finite() || self.rows <= 0. {
-            return model;
+            return model();
         }
         let at = slots.min(reads.misses.len() - 1);
         let missing = (reads.requests[at] as f64 / self.steps as f64).min(1.);
@@ -159,6 +159,7 @@ pub struct FormSeconds {
 /// A streamed plan's layers as the estimate prices them, in decoder order,
 /// as runs of consecutive layers alike: each run's `E`, its generic model,
 /// its lines and its layers, and the plan's `k`.
+#[derive(Clone)]
 pub struct StreamedLayers {
     runs: Vec<StreamedRun>,
     /// Each layer's lines, in decoder order.
@@ -168,6 +169,7 @@ pub struct StreamedLayers {
 
 /// Consecutive streamed layers of one kind: `experts` each, priced by one
 /// line, `layers` of them.
+#[derive(Clone)]
 struct StreamedRun {
     experts: u64,
     model: MissModel,
@@ -261,7 +263,7 @@ impl StreamedLayers {
                 Some(live) => {
                     for at in layer..layer + run.layers {
                         let routed = live.routed(at).unwrap_or_else(|| run.model.routed(rows));
-                        fill_layer_period(&|slots| live.shares(at, slots, model(slots)), routed, self.choices, held, rows, period, 1, &mut flat, width, col);
+                        fill_layer_period(&|slots| live.shares(at, slots, || model(slots)), routed, self.choices, held, rows, period, 1, &mut flat, width, col);
                         col += 1;
                     }
                 }
@@ -327,32 +329,35 @@ impl StreamedLayers {
     }
 
     /// The free path records needed for moves of `bytes` stored bytes along
-    /// `read`, the bank holding `held` with `hint_leads` lookahead layers
-    /// across `num_layers` routed layers, decode compute time `compute` (at
-    /// one row), and decode/verify passes of up to `decode_rows` rows.
-    /// Single owner shared by [`crate::BankPrices::paths`] and assessment's
-    /// path pricer.
+    /// `read`, the bank holding `held` across `num_layers` routed layers,
+    /// decode compute time `compute` (at one row), and decode/verify passes of
+    /// up to `decode_rows` rows. Single owner shared by
+    /// [`crate::BankPrices::paths`] and assessment's path pricer.
     ///
-    /// `ahead` staging records are sized for the demand queue across
-    /// `hint_leads` layers at `decode_rows` rows so multi-row verify bursts
-    /// do not starve read-ahead staging, while `reserve` covers both `ahead`
-    /// and the single-row decode step's victim release wait without wasting
-    /// bank slots.
+    /// `ahead` staging records are sized for a single layer's demand queue at
+    /// `decode_rows` rows (floored by the volume's storage saturation knee) so
+    /// multi-row verify bursts do not starve read-ahead staging, while
+    /// `reserve` covers both `ahead` and the single-row decode step's victim
+    /// release wait without wasting bank slots.
     pub fn path_records(
         &self,
         read: ReadLine,
         compute: FormSeconds,
         bytes: u64,
         held: HeldSlots,
-        hint_leads: u64,
         num_layers: u64,
         decode_rows: u64,
         saturation_bytes: u64,
     ) -> Option<crate::PathRecords> {
         assert!(decode_rows > 0, "invariant violated: path_records decode_rows must be positive");
         let single = self.prepare(None, held, 1.0);
-        let step = single.step_seconds(read, compute).total_seconds;
         let single_reads = single.step_seconds(read, FormSeconds { resident: 0., streamed: 0. }).total_seconds;
+        // Overlapped decode step duration (`max(C, reads)`): a drive-bound step
+        // (`single_reads >= compute.streamed`) is filled by its reads and
+        // releases each victim as its move is issued (`release_load == 0`).
+        // Using un-overlapped `ReadAhead::NONE` (`C + reads`) falsely made
+        // `step - single_reads == C` even when 100% drive-bound!
+        let overlapped_step = compute.streamed.max(single_reads);
         let burst_reads = if decode_rows == 1 {
             single_reads
         } else {
@@ -363,9 +368,9 @@ impl StreamedLayers {
         let queue = if num_layers == 0 {
             0.0
         } else {
-            hint_leads as f64 * (burst_reads / num_layers as f64)
+            burst_reads / num_layers as f64
         };
-        let mut records = crate::PathRecords::of(read, bytes, queue, crate::PathRecords::release(step, single_reads))?;
+        let mut records = crate::PathRecords::of(read, bytes, queue, crate::PathRecords::release_load(overlapped_step, single_reads))?;
         // Derive multi-row verify staging concurrency directly from the
         // volume's measured storage saturation window (`saturation_bytes`,
         // e.g. `FULL_DEPTH * FULL_READ`) divided by `bytes`, bounded by the
@@ -403,7 +408,7 @@ impl StreamedPeriod<'_> {
         }
         let compute_seconds = compute.streamed;
         let step = step_inputs(compute_seconds, read, ReadAhead::NONE, &self.layers.lines)
-            .run(self.patterns.iter().map(|(runs, count)| (runs.as_slice(), *count)));
+            .run_unique_no_ahead(self.patterns.iter().map(|(runs, count)| (runs.as_slice(), *count)));
         StreamedStep { compute_seconds, exposed_seconds: step.total - compute_seconds, total_seconds: step.total }
     }
 }
@@ -617,12 +622,12 @@ mod tests {
         assert_eq!(LayerReads::of_depths(&[0, 0, 0, 0, 3], &[0, 0, 0, 0, 3]).saturation(), None);
         let live = LiveDecode { layers: vec![reads], steps: 1, rows: 1., depth: 100 };
         let model = Shares { misses: 0.5, requests: 1. };
-        let measured = |slots| live.shares(0, slots, model);
+        let measured = |slots| live.shares(0, slots, || model);
         assert_eq!(measured(2), Shares { misses: 0.25, requests: 1. }, "a read of 4 at or past 2 slots: the first read");
         assert_eq!(measured(0), Shares { misses: 1., requests: 1. });
         assert_eq!(measured(4).misses, 0.25, "past its deepest read, its first read");
         let none = LiveDecode { layers: vec![LayerReads::of_depths(&[0; 5], &[0; 5])], steps: 1, rows: 1., depth: 100 };
-        assert_eq!(none.shares(0, 2, model), model, "a layer that read nothing is the model's");
+        assert_eq!(none.shares(0, 2, || model), model, "a layer that read nothing is the model's");
         assert_eq!((live.routed(0), none.routed(0)), (Some(4.), None), "its 4 reads in its one step");
     }
 
@@ -696,12 +701,12 @@ mod tests {
         let model = Shares { misses: 0.5, requests: 0.75 };
 
         let zero_steps = LiveDecode { layers: vec![reads.clone()], steps: 0, rows: 1., depth: 100 };
-        assert_eq!(zero_steps.shares(0, 1, model), model);
+        assert_eq!(zero_steps.shares(0, 1, || model), model);
         assert_eq!(zero_steps.routed(0), None);
 
         for bad_rows in [0., -1., f64::NAN, f64::INFINITY] {
             let bad = LiveDecode { layers: vec![reads.clone()], steps: 1, rows: bad_rows, depth: 100 };
-            assert_eq!(bad.shares(0, 1, model), model);
+            assert_eq!(bad.shares(0, 1, || model), model);
         }
     }
 
@@ -723,7 +728,7 @@ mod tests {
                 landing: Some(LandingLine::Device(RecordLine::new(0., 5e-5).unwrap())),
                 record_bytes,
             },
-            gpu: GpuLines { link: zero, resident: zero, moves: Moves::NONE },
+            gpu: GpuLines { link: zero, resident: zero, moves: Moves::NONE, baseline_dma: None, contended_link: None },
         };
         let m4_max_ssd = ReadLine::new(3e-4, 1. / 5.5e9).unwrap();
 
@@ -753,5 +758,106 @@ mod tests {
         let tps_q6 = tps(&q6, 154, FormSeconds { resident: 0.019, streamed: 0.021 });
         assert!(tps_q6 < tps_nvfp4 && tps_nvfp4 < tps_70, "q6={tps_q6:.2}, nvfp4={tps_nvfp4:.2}, iq3={tps_70:.2}");
         assert!(tps_nvfp4 > 8. && tps_q6 > 5., "nvfp4={tps_nvfp4:.2}, q6={tps_q6:.2}");
+    }
+
+    /// `serve_decode_uniform` matches `serve_decode` bit-for-bit for both
+    /// CPU-enabled and CPU-suppressed `ExpertLines` across `(tier, file, ready, rows)`.
+    #[test]
+    fn serve_decode_uniform_matches_serve_decode() {
+        use crate::expert_lines::{CpuLines, GpuLines, HostLines, Miss, Moves, Nanoseconds, PassLine, RowCost, RowLine};
+        let ns = |v: u32| Nanoseconds::try_from(v).unwrap();
+        let pass = |w: u32, r: u32| PassLine { weights: ns(w), row: ns(r) };
+        let with_cpu = ExpertLines {
+            host: HostLines {
+                cpu: Some(CpuLines {
+                    handshake: ns(50_000),
+                    expert: RowLine { one: ns(200_000), row: RowCost::Measured(ns(10_000)) },
+                }),
+                memory: Some(ns(60_000)),
+                joint_memory: Some(ns(90_000)),
+                landing: None,
+                record_bytes: 1_000_000,
+            },
+            gpu: GpuLines {
+                link: pass(150_000, 5_000),
+                resident: pass(20_000, 1_000),
+                moves: Moves { link: ns(80_000), records: 1.0 },
+                baseline_dma: None,
+                contended_link: Some(ns(220_000)),
+            },
+        };
+        let without_cpu = ExpertLines {
+            host: HostLines { cpu: None, ..with_cpu.host },
+            ..with_cpu
+        };
+        for lines in [&with_cpu, &without_cpu] {
+            for hit_ns in [0.0, 50_000.0, 500_000.0] {
+                for tier in [0u64, 1, 3, 8] {
+                    for file in [0u64, 1, 2, 6] {
+                        for ready in [0.0, 0.0002, 0.0015] {
+                            for rows in [1.0, 4.0] {
+                                let misses = (0..tier)
+                                    .map(|_| ((), Miss { rows, ready_seconds: 0.0 }))
+                                    .chain((0..file).map(|_| ((), Miss { rows, ready_seconds: ready })));
+                                let reference = lines.serve_decode(hit_ns, misses, |(), _| {});
+                                let fast = lines.serve_decode_uniform(hit_ns, tier, file, rows, ready);
+                                assert!(
+                                    (fast.gpu_ns - reference.gpu_ns).abs() <= 1e-6,
+                                    "gpu_ns mismatch: {} vs {}",
+                                    fast.gpu_ns,
+                                    reference.gpu_ns
+                                );
+                                assert!(
+                                    (fast.cpu_ns - reference.cpu_ns).abs() <= 1e-6,
+                                    "cpu_ns mismatch: {} vs {}",
+                                    fast.cpu_ns,
+                                    reference.cpu_ns
+                                );
+                                assert_eq!(fast.served_cpu, reference.served_cpu);
+                                assert_eq!(fast.link_count, reference.link_count);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// `DecodePrice::step` on a wide MoE (`48` layers, `512` experts, `k = 8`,
+    /// `LiveDecode` populated per layer) stays fast (no eager `MissModel`
+    /// `powf` calls, no per-layer heap allocation, no duplicate `HashMap`).
+    #[test]
+    fn live_decode_step_stays_fast_at_wide_moe() {
+        let experts = 512usize;
+        let num_layers = 48usize;
+        let lines = ExpertLines::reference(4_000_000);
+        let streamed = StreamedLayers::new(vec![experts as u64; num_layers], 8, std::sync::Arc::from(vec![lines; num_layers]));
+        let layers = (0..num_layers)
+            .map(|layer| {
+                let mut misses = vec![0u64; experts + 1];
+                let mut requests = vec![0u64; experts + 1];
+                for depth in 0..experts {
+                    if (depth + layer) % 3 == 0 {
+                        misses[depth] = 2;
+                        requests[depth] = 1;
+                    }
+                }
+                misses[experts] = 10;
+                requests[experts] = 5;
+                LayerReads::of_depths(&misses, &requests)
+            })
+            .collect();
+        let live = LiveDecode { layers, steps: 200, rows: 4.0, depth: 2048 };
+        let compute = FormSeconds { resident: 0.015, streamed: 0.018 };
+        let price = DecodePrice::new(streamed, live, READ, compute);
+        let held = HeldSlots { slots: 137, host: 282 };
+        let floor = HeldSlots { slots: 10, host: 282 };
+        let t0 = std::time::Instant::now();
+        let at_held = price.step(held).total_seconds;
+        let at_floor = price.step(floor).total_seconds;
+        let elapsed = t0.elapsed();
+        assert!(at_floor >= at_held && at_held > 0.0);
+        // Generous upper bound that holds even in unoptimized debug builds.
+        assert!(elapsed.as_millis() < 200, "DecodePrice::step pair took {elapsed:?}");
     }
 }

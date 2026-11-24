@@ -328,7 +328,7 @@ mod front_pass {
         let regime = |routes: &FrontRoutes, plain: f64, deepest: f64, unused: f64| {
             let wasted = (0..8).map(|depth| Some(if depth == 0 { 0. } else { unused * 1e-3 })).collect();
             let needed = crate::NeededByForm::both((0..8).map(|k| crate::Needed::Executed(plain - (plain - deepest) * k as f64 / 7.)).collect());
-            Regime { resident: passes(routes), needed, stand: Some(0.997), accepts: vec![None; 7], stall: None, overhead: None, paths: vec![PathTerm { seconds: 1e-3, wasted: crate::Waste { front: wasted, verify: vec![None; 8] } }], routes: crate::VerifyRoutes::default() }
+            Regime { resident: passes(routes), verify_resident: Vec::new(), needed, stand: Some(0.997), accepts: vec![None; 7], stall: None, front_stall: Vec::new(), verify_stall: Vec::new(), overhead: None, paths: vec![PathTerm { seconds: 1e-3, wasted: crate::Waste { front: wasted, verify: vec![None; 8] } }], routes: crate::VerifyRoutes::default() }
         };
         assert_eq!(regime(&code, 245.3, 214.6, 16.).depth(), 0);
         assert_eq!(regime(&code, 245.3, 214.6, 1.6).depth(), 7);
@@ -429,8 +429,8 @@ fn path_records_scales_ahead_for_multi_row_verify_without_inflating_reserve() {
     let held = HeldSlots::bank(355);
 
     let saturation_bytes = 32 * 1024 * 1024u64;
-    let single = layers.path_records(read, compute, record_bytes, held, 2, num_layers as u64, 1, saturation_bytes).unwrap();
-    let verify = layers.path_records(read, compute, record_bytes, held, 2, num_layers as u64, 8, saturation_bytes).unwrap();
+    let single = layers.path_records(read, compute, record_bytes, held, num_layers as u64, 1, saturation_bytes).unwrap();
+    let verify = layers.path_records(read, compute, record_bytes, held, num_layers as u64, 8, saturation_bytes).unwrap();
 
     let expected_knee = saturation_bytes.div_ceil(record_bytes);
     assert!(
@@ -449,5 +449,47 @@ fn path_records_scales_ahead_for_multi_row_verify_without_inflating_reserve() {
         verify.reserve,
         single.reserve.max(verify.ahead),
         "reserve should not inflate beyond max(single-row release, verify.ahead): verify={verify:?} single={single:?}"
+    );
+}
+
+/// `PathRecords::release_load` scales victim release wait by the step's actual
+/// move rate (`reads / step`) so high-hit-rate / compute-dominated steps never
+/// inflate `reserve` past the step's actual miss count (e.g. M5 Pro DS4 at
+/// `slots = 66` does not demand `reserve = 41` for a handful of misses).
+#[test]
+fn release_load_bounds_reserve_by_actual_step_misses() {
+    assert_eq!(PathRecords::release_load(0.1, 0.0), 0.0);
+    assert_eq!(PathRecords::release_load(0.1, 0.1), 0.0);
+    assert_eq!(PathRecords::release_load(0.1, 0.12), 0.0);
+    assert!((PathRecords::release_load(0.1, 0.05) - 0.025).abs() < 1e-15);
+    assert!((PathRecords::release_load(0.065, 0.005) - (0.005 * 0.060 / 0.065)).abs() < 1e-15);
+
+    // M5 Pro DS4-like regime: 40 layers, 384 experts, K=8, slots=66,
+    // high compute (60 ms) and fast SSD (~4.5 GB/s, ~3.4 MB record -> 0.75 ms).
+    // With the old full-rate `release = (step - reads)/2`, reserve blew up to
+    // ~41 records; with `release_load`, reserve stays bounded by actual misses.
+    let read = ReadLine::new(2e-4, 1. / 4.5e9).unwrap();
+    let record_bytes = 3_400_000u64;
+    let lines = ExpertLines::reference(record_bytes);
+    let num_layers = 40usize;
+    let layers = StreamedLayers::new(
+        vec![384u64; num_layers],
+        8,
+        std::sync::Arc::from(vec![lines; num_layers]),
+    );
+    let compute = FormSeconds { resident: 0.060, streamed: 0.065 };
+    let held = HeldSlots::bank(66);
+    let saturation_bytes = 32 * 1024 * 1024u64;
+    let single = layers.path_records(read, compute, record_bytes, held, num_layers as u64, 1, saturation_bytes).unwrap();
+    let verify = layers.path_records(read, compute, record_bytes, held, num_layers as u64, 4, saturation_bytes).unwrap();
+    // Old formula on compute=65ms, transfer=0.75ms gave reserve >= 40;
+    // release_load keeps single.reserve strictly bounded by actual step misses.
+    assert!(
+        single.reserve < 25,
+        "M5 Pro DS4-like single-row reserve must not inflate to ~41: single={single:?}"
+    );
+    assert!(
+        verify.reserve == single.reserve.max(verify.ahead),
+        "verify reserve must stay max(single.reserve, verify.ahead): verify={verify:?} single={single:?}"
     );
 }

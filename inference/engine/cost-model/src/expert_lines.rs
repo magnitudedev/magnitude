@@ -305,6 +305,38 @@ pub struct GpuLines {
     pub link: PassLine,
     pub resident: PassLine,
     pub moves: Moves,
+    /// Load-time pure PCIe DMA transfer time (`link.weights - resident.weights`),
+    /// frozen before runtime [`ExpertLines::passed`] observations mutate
+    /// `link.weights`. `None` before `passed()` has been applied (or in legacy
+    /// serialized records), in which case `link.weights - resident.weights` is
+    /// the load-time baseline.
+    #[serde(default)]
+    pub baseline_dma: Option<Nanoseconds>,
+    /// Contended link weight-read time per expert when CPU-site runs
+    /// concurrently with PCIe H2D DMA on the shared `HostRam` bus (measured
+    /// from `TierCopyCosts::concurrent_dma_byte_seconds`). `None` when
+    /// unmeasured or uncontended (unified memory), in which case contended
+    /// link time equals uncontended `link.weights`.
+    #[serde(default)]
+    pub contended_link: Option<Nanoseconds>,
+}
+
+impl GpuLines {
+    /// Load-time pure PCIe DMA transfer time (`link.weights - resident.weights`),
+    /// immune to runtime [`ExpertLines::passed`] inflation of `link.weights`.
+    pub fn dma_ns(&self) -> f64 {
+        self.baseline_dma.map_or_else(
+            || (self.link.weights.get() - self.resident.weights.get()).max(0.),
+            Nanoseconds::get,
+        )
+    }
+
+    /// Contended link line when CPU-site runs concurrently with PCIe DMA:
+    /// `weights` is at least `self.link.weights`, keeping `self.link.row`.
+    pub fn contended_link_line(&self) -> PassLine {
+        let weights = self.contended_link.map_or(self.link.weights, |contended| contended.max(self.link.weights));
+        PassLine { weights, row: self.link.row }
+    }
 }
 
 /// The moves (promotions: host tier records copied into the GPU's memory)
@@ -409,6 +441,7 @@ pub struct PolicyLayout {
     pub cpu_row: usize,
     pub handshake: usize,
     pub link: usize,
+    pub link_contended: usize,
     pub link_row: usize,
     pub link_busy: usize,
     pub hit: usize,
@@ -562,8 +595,26 @@ impl ExpertLines {
         let Some([_, hit, link, _]) = observed else {
             return self;
         };
+        // Freeze the load-time pure DMA baseline before overwriting `link.weights`
+        // so runtime contention inflation of `link.weights` cannot shrink `t_spare`
+        // in `effective_cpu_for` and trigger a positive-feedback spiral.
+        let baseline_dma = self.gpu.baseline_dma.or_else(|| {
+            let t_link_ns = self.gpu.link.weights.get();
+            (t_link_ns > 0.).then(|| {
+                let dma_ns = (t_link_ns - self.gpu.resident.weights.get()).max(0.);
+                Nanoseconds::saturating(dma_ns * 1e-9)
+            })
+        });
         let refined = |line: PassLine, seconds: f64| PassLine { weights: Nanoseconds::saturating(seconds), ..line };
-        Self { gpu: GpuLines { link: refined(self.gpu.link, link), resident: refined(self.gpu.resident, hit), ..self.gpu }, ..self }
+        Self {
+            gpu: GpuLines {
+                link: refined(self.gpu.link, link),
+                resident: refined(self.gpu.resident, hit),
+                baseline_dma,
+                ..self.gpu
+            },
+            ..self
+        }
     }
 
     /// The lines with the link's moves as the load measures them
@@ -611,17 +662,22 @@ impl ExpertLines {
     /// - `B_joint = b / t_joint` is the aggregate `HostRam` read throughput
     ///   under concurrent `DMA ∥ CPU` traffic (measured, or conservatively
     ///   bounded by `B_mem = b / host.memory` when unprobed).
-    /// - `B_dma = b / (gpu.link.weights - gpu.resident.weights)` is the
-    ///   uncontended PCIe DMA throughput on `HostRam` (excluding GPU resident
-    ///   compute time `gpu.resident.weights`, which does not touch `HostRam`).
-    /// - The spare `HostRam` headroom available to CPU-site alongside saturated
-    ///   link traffic is `B_spare = B_joint - B_dma`.
-    /// - When `B_spare <= 0` (`t_joint >= t_dma`), offloading to CPU-site adds
-    ///   zero net throughput and degrades wall time, so `Site::Cpu` is
-    ///   suppressed (`None`).
-    /// - Otherwise, the marginal shared-bus cost of a CPU expert is
-    ///   `t_spare = (t_joint * t_dma) / (t_dma - t_joint)`, and the CPU's
-    ///   effective per-expert cost is `max(cpu.expert.one, t_spare)`.
+    /// - `B_dma = b / t_dma` uses the load-time baseline pure PCIe DMA time
+    ///   ([`GpuLines::dma_ns`], frozen before runtime [`Self::passed`] updates
+    ///   mutate `gpu.link.weights`), preventing runtime contention from
+    ///   shrinking the shared-bus cost in a positive-feedback loop.
+    /// - When `t_joint >= t_dma` (`B_joint <= B_dma`), PCIe DMA alone saturates
+    ///   the shared `HostRam` bus leaving zero net throughput gain from
+    ///   concurrent CPU-site, so `Site::Cpu` is suppressed (`None`).
+    /// - When `gpu.contended_link` is measured, the DMA slowdown under
+    ///   contention is priced directly on the GPU link side via
+    ///   [`GpuLines::contended_link_line`], so the CPU's contended bus time
+    ///   follows exact bandwidth conservation
+    ///   `1 / t_cpu_bus = 1 / t_joint - 1 / t_dma_contended` (`b / B_cpu_contended`),
+    ///   avoiding double-counting DMA slowdown on both sides.
+    /// - When `gpu.contended_link` is unmeasured (`None`), falls back to the
+    ///   spare-headroom bound `t_spare = (t_joint * t_dma) / (t_dma - t_joint)`
+    ///   (suppressed when `t_spare` exceeds `t_dma + cpu.one + handshake`).
     ///
     /// On unified memory (`host.memory == None`), there is no separate `Link`
     /// sharing `HostRam` with the CPU, so `cpu` is returned unchanged.
@@ -630,22 +686,43 @@ impl ExpertLines {
             return Some(cpu);
         };
         let t_joint_ns = t_joint.get();
-        let t_link_ns = self.gpu.link.weights.get();
-        if t_joint_ns <= 0. || t_link_ns <= 0. {
+        if t_joint_ns <= 0. || (self.gpu.baseline_dma.is_none() && self.gpu.link.weights.get() <= 0.) {
             return Some(cpu);
         }
-        let t_dma_ns = (t_link_ns - self.gpu.resident.weights.get()).max(0.);
+        let t_dma_ns = self.gpu.dma_ns();
+        // Zero net HostRam throughput gain alongside saturated PCIe DMA (`B_joint <= B_dma`).
         if t_joint_ns >= t_dma_ns {
             return None;
         }
+        // Narrow spare-headroom guard against load-time uncontended DMA: if the
+        // marginal shared-bus cost `t_spare` exceeds the serial sum
+        // `t_dma + cpu.one + handshake`, overlapping on HostRam never pays.
         let t_spare_ns = (t_joint_ns * t_dma_ns) / (t_dma_ns - t_joint_ns);
-        // If the marginal shared-bus cost `t_spare` of overlapping CPU-site
-        // with PCIe DMA exceeds the serial sum `t_dma + cpu.one + handshake`,
-        // overlapping on HostRam is strictly worse than Link-only -> suppress.
         if t_spare_ns > t_dma_ns + cpu.expert.one.get() + cpu.handshake.get() {
             return None;
         }
-        let effective_one = Nanoseconds::saturating(cpu.expert.one.get().max(t_spare_ns) * 1e-9);
+        let t_dma_eff_ns = match self.gpu.contended_link {
+            Some(contended) => (contended.get() - self.gpu.resident.weights.get()).max(t_dma_ns),
+            None => t_dma_ns,
+        };
+        if t_joint_ns >= t_dma_eff_ns {
+            return None;
+        }
+        let t_cpu_bus_ns = (t_joint_ns * t_dma_eff_ns) / (t_dma_eff_ns - t_joint_ns);
+        let effective_one_ns = cpu.expert.one.get().max(t_cpu_bus_ns);
+        // Exact aggregate-throughput gate when contended DMA is measured:
+        // offloading any C in 1..=N can beat uncontended GPU-only only if
+        // `1 / t_link_contended + 1 / t_cpu_eff > 1 / t_link_uncontended`.
+        if let Some(contended) = self.gpu.contended_link {
+            let t_link_u_ns = t_dma_ns + self.gpu.resident.weights.get();
+            let t_link_c_ns = contended.get().max(t_link_u_ns);
+            if t_link_u_ns > 0. && t_link_c_ns > 0. && effective_one_ns > 0. {
+                if (1. / t_link_c_ns) + (1. / effective_one_ns) <= (1. / t_link_u_ns) {
+                    return None;
+                }
+            }
+        }
+        let effective_one = Nanoseconds::saturating(effective_one_ns * 1e-9);
         Some(CpuLines {
             expert: RowLine { one: effective_one, ..cpu.expert },
             handshake: cpu.handshake,
@@ -657,9 +734,17 @@ impl ExpertLines {
         self.host.cpu.and_then(|cpu| self.effective_cpu_for(cpu))
     }
 
-    /// Assign each decode miss in `misses` (already ordered most-rows-first) to
+    /// Assign each decode miss in `misses` (already ordered fewest-rows-first) to
     /// the CPU or the GPU in place, starting the GPU queue at `hit_ns` and
     /// notifying `on_site(tag, site)` for each assigned miss.
+    ///
+    /// Evaluates GPU-only uncontended (`C = 0`, `gpu.link`) against offloading
+    /// the first `C` of `N` misses to CPU (`cpu_lines` + handshake) while the
+    /// remaining `N - C` run on GPU at the contended link rate
+    /// (`gpu.contended_link_line()`). Offloads to CPU only when the joint
+    /// makespan `max(T_gpu(N - C), T_cpu(C))` is strictly less than uncontended
+    /// GPU-only completion time `T_gpu_only(N)`, selecting the `C` minimizing
+    /// makespan (ties to smaller `C`).
     ///
     /// Single owner of the decode-miss tie-breaking, handshake, shared-bus
     /// contention and link-busy rules shared by [`Self::serve`],
@@ -671,35 +756,131 @@ impl ExpertLines {
         mut on_site: impl FnMut(T, Site),
     ) -> DecodeSchedule {
         let link_busy = self.gpu.moves.link.get();
-        let cpu_lines = self.effective_cpu();
-        let (mut gpu_ns, mut cpu_ns) = (hit_ns, 0f64);
-        let mut served_cpu = false;
-        let mut link_count = 0u64;
-        for (tag, miss) in misses {
+        let Some(lines) = self.effective_cpu() else {
+            let mut gpu_uncontended = hit_ns;
+            let mut total = 0u64;
+            for (tag, miss) in misses {
+                let ready_ns = miss.ready_seconds * 1e9;
+                gpu_uncontended = gpu_uncontended.max(ready_ns).max(link_busy) + self.gpu.link.nanoseconds(miss.rows);
+                on_site(tag, Site::Link);
+                total += 1;
+            }
+            return DecodeSchedule {
+                gpu_ns: gpu_uncontended,
+                cpu_ns: 0f64,
+                served_cpu: false,
+                link_count: total,
+            };
+        };
+        let items: Vec<(T, Miss)> = misses.into_iter().collect();
+        let mut gpu_uncontended = hit_ns;
+        for (_, miss) in &items {
             let ready_ns = miss.ready_seconds * 1e9;
-            let on_cpu = cpu_lines.map(|lines| {
-                let handshake = if served_cpu { 0. } else { lines.handshake.get() };
-                cpu_ns.max(ready_ns) + lines.expert.nanoseconds(miss.rows) + handshake
-            });
-            let in_place = gpu_ns.max(ready_ns).max(link_busy) + self.gpu.link.nanoseconds(miss.rows);
-            match on_cpu {
-                Some(end) if end <= in_place => {
-                    cpu_ns = end;
-                    served_cpu = true;
-                    on_site(tag, Site::Cpu);
+            gpu_uncontended = gpu_uncontended.max(ready_ns).max(link_busy) + self.gpu.link.nanoseconds(miss.rows);
+        }
+        let (mut best_c, mut best_t, mut best_gpu, mut best_cpu) = (0usize, gpu_uncontended, gpu_uncontended, 0f64);
+        if !items.is_empty() {
+            let contended_link = self.gpu.contended_link_line();
+            let mut cpu_ns = 0f64;
+            for c in 1..=items.len() {
+                let miss = items[c - 1].1;
+                let ready_ns = miss.ready_seconds * 1e9;
+                let handshake = if c == 1 { lines.handshake.get() } else { 0. };
+                cpu_ns = cpu_ns.max(ready_ns) + lines.expert.nanoseconds(miss.rows) + handshake;
+                let mut gpu_c = hit_ns;
+                for (_, rem) in &items[c..] {
+                    let rem_ready = rem.ready_seconds * 1e9;
+                    gpu_c = gpu_c.max(rem_ready).max(link_busy) + contended_link.nanoseconds(rem.rows);
                 }
-                _ => {
-                    gpu_ns = in_place;
-                    link_count += 1;
-                    on_site(tag, Site::Link);
+                let makespan = gpu_c.max(cpu_ns);
+                if makespan < best_t {
+                    best_t = makespan;
+                    best_c = c;
+                    best_gpu = gpu_c;
+                    best_cpu = cpu_ns;
                 }
             }
         }
-        DecodeSchedule { gpu_ns, cpu_ns, served_cpu, link_count }
+        let total = items.len();
+        for (index, (tag, _)) in items.into_iter().enumerate() {
+            let site = if index < best_c { Site::Cpu } else { Site::Link };
+            on_site(tag, site);
+        }
+        DecodeSchedule {
+            gpu_ns: best_gpu,
+            cpu_ns: best_cpu,
+            served_cpu: best_c > 0,
+            link_count: (total - best_c) as u64,
+        }
+    }
+
+    /// Allocation-free specialization of [`Self::serve_decode`] for `tier`
+    /// host-tier misses (ready at `0.0`) followed by `file` file misses (ready
+    /// at `file_ready_seconds`), all with `rows` rows: O(1) when the CPU site
+    /// is absent or suppressed, and O(`tier + file`) otherwise.
+    pub(crate) fn serve_decode_uniform(
+        &self,
+        hit_ns: f64,
+        tier: u64,
+        file: u64,
+        rows: f64,
+        file_ready_seconds: f64,
+    ) -> DecodeSchedule {
+        let total = tier + file;
+        if total == 0 {
+            return DecodeSchedule { gpu_ns: hit_ns, cpu_ns: 0f64, served_cpu: false, link_count: 0 };
+        }
+        let link_busy = self.gpu.moves.link.get();
+        let file_ready_ns = file_ready_seconds * 1e9;
+        let gpu_finish = |t_rem: u64, f_rem: u64, link_ns: f64| {
+            let mut gpu = hit_ns;
+            if t_rem > 0 {
+                gpu = gpu.max(link_busy) + t_rem as f64 * link_ns;
+            }
+            if f_rem > 0 {
+                gpu = gpu.max(file_ready_ns).max(link_busy) + f_rem as f64 * link_ns;
+            }
+            gpu
+        };
+        let gpu_uncontended = gpu_finish(tier, file, self.gpu.link.nanoseconds(rows));
+        let Some(lines) = self.effective_cpu() else {
+            return DecodeSchedule {
+                gpu_ns: gpu_uncontended,
+                cpu_ns: 0f64,
+                served_cpu: false,
+                link_count: total,
+            };
+        };
+        let contended_link_ns = self.gpu.contended_link_line().nanoseconds(rows);
+        let expert_ns = lines.expert.nanoseconds(rows);
+        let handshake_ns = lines.handshake.get();
+        let (mut best_c, mut best_t, mut best_gpu, mut best_cpu) = (0u64, gpu_uncontended, gpu_uncontended, 0f64);
+        let mut cpu_ns = 0f64;
+        for c in 1..=total {
+            let ready_ns = if c <= tier { 0.0 } else { file_ready_ns };
+            let handshake = if c == 1 { handshake_ns } else { 0. };
+            cpu_ns = cpu_ns.max(ready_ns) + expert_ns + handshake;
+            let t_rem = tier.saturating_sub(c);
+            let f_rem = (total - c) - t_rem;
+            let gpu_c = gpu_finish(t_rem, f_rem, contended_link_ns);
+            let makespan = gpu_c.max(cpu_ns);
+            if makespan < best_t {
+                best_t = makespan;
+                best_c = c;
+                best_gpu = gpu_c;
+                best_cpu = cpu_ns;
+            }
+        }
+        DecodeSchedule {
+            gpu_ns: best_gpu,
+            cpu_ns: best_cpu,
+            served_cpu: best_c > 0,
+            link_count: total - best_c,
+        }
     }
 
     /// The layer's distinct missed experts served in `pass` beside its GPU
-    /// `hits` (each expert at its resident line): each, the most rows first
+    /// `hits` (each expert at its resident line): each, the fewest rows first
     /// (ties in their order), at the site of the pass it ends soonest on,
     /// the CPU's queue from the router (its first paying the handshake) and
     /// the GPU's from its hits, a read in place no sooner than the link is
@@ -709,23 +890,25 @@ impl ExpertLines {
     /// link's own (a decode step's moves are no group pass's).
     pub fn serve(&self, pass: Pass, hits: &[Hits], misses: &[Miss]) -> ServedMisses {
         let hit = hits.iter().map(|hits| hits.experts * self.gpu.resident.nanoseconds(hits.rows)).sum::<f64>();
-        let mut order = (0..misses.len()).collect::<Vec<_>>();
-        order.sort_by(|&a, &b| misses[b].rows.total_cmp(&misses[a].rows));
         if pass == Pass::Group {
             // The fill moves each expert once it is whole in host memory,
-            // over the link from a host tier (none without one: unified
-            // memory's pass reads the bank's records in place), then the
-            // pass computes the hits and the moved experts.
+            // earliest-ready first, over the link from a host tier (none
+            // without one: unified memory's pass reads the bank's records in
+            // place), then the pass computes the hits and the moved experts.
             let move_ns = match self.host.memory {
                 Some(_) => self.gpu.link.weights.get(),
                 None => 0.,
             };
-            let moves = order.iter().fold(0f64, |moves, &index| moves.max(misses[index].ready_seconds * 1e9) + move_ns);
+            let mut ready: Vec<f64> = misses.iter().map(|miss| miss.ready_seconds * 1e9).collect();
+            ready.sort_by(f64::total_cmp);
+            let moves = ready.into_iter().fold(0f64, |moves, ready_ns| moves.max(ready_ns) + move_ns);
             let moved = misses.iter().map(|miss| self.gpu.resident.nanoseconds(miss.rows)).sum::<f64>();
             let exposed = Exposed { gpu_seconds: (moves + moved) * 1e-9, ..Exposed::default() };
             let end_seconds = (moves + hit + moved) * 1e-9;
             return ServedMisses { sites: vec![Site::Copy; misses.len()], end_seconds, exposed, moved_compute_seconds: moved * 1e-9 };
         }
+        let mut order = (0..misses.len()).collect::<Vec<_>>();
+        order.sort_by(|&a, &b| misses[a].rows.total_cmp(&misses[b].rows));
         let mut sites = vec![Site::Link; misses.len()];
         let DecodeSchedule { gpu_ns: gpu, cpu_ns: cpu, served_cpu: served, .. } =
             self.serve_decode(hit, order.into_iter().map(|index| (index, misses[index])), |index, site| sites[index] = site);
@@ -795,6 +978,7 @@ impl ExpertLines {
         if let Some(lines) = lines {
             words.extend([
                 (layout.link, lines.gpu.link.weights),
+                (layout.link_contended, lines.gpu.contended_link_line().weights),
                 (layout.link_row, lines.gpu.link.row),
                 (layout.link_busy, lines.gpu.moves.link),
                 (layout.hit, lines.gpu.resident.weights),
@@ -846,6 +1030,8 @@ impl ExpertLines {
                 link: PassLine { weights: rate(86_000), row: ns(100) },
                 resident: PassLine { weights: rate(5_000), row: ns(100) },
                 moves: Moves::NONE,
+                baseline_dma: None,
+                contended_link: None,
             },
         }
     }
@@ -930,6 +1116,38 @@ mod tests {
         let shown = lines.serve(Pass::Decode, &hits(8.), &misses(1, 1.));
         assert_eq!(shown.exposed.cpu_seconds, 0.);
         assert!((shown.exposed.handshake_seconds - 4e-6).abs() < 1e-12, "{shown:?}");
+    }
+
+    /// Fewest-rows-first assigns cheap 1-row misses to CPU while multi-row
+    /// misses stay on GPU where extra rows are free over the link.
+    #[test]
+    fn fewest_rows_first_assigns_one_row_misses_to_cpu_before_multi_row() {
+        let ns = |v: u32| Nanoseconds::try_from(v).unwrap();
+        let lines = ExpertLines {
+            host: HostLines {
+                cpu: Some(CpuLines {
+                    expert: RowLine { one: ns(60_000), row: RowCost::Measured(ns(40_000)) },
+                    handshake: ns(0),
+                }),
+                memory: None,
+                joint_memory: None,
+                landing: None,
+                record_bytes: 1,
+            },
+            gpu: GpuLines {
+                link: PassLine { weights: ns(100_000), row: ns(100) },
+                resident: PassLine { weights: ns(5_000), row: ns(100) },
+                moves: Moves::NONE,
+                baseline_dma: None,
+                contended_link: None,
+            },
+        };
+        let served = lines.serve(
+            Pass::Decode,
+            &[],
+            &[Miss { rows: 2., ready_seconds: 0. }, Miss { rows: 1., ready_seconds: 0. }],
+        );
+        assert_eq!(served.sites, [Site::Link, Site::Cpu], "{served:?}");
     }
 
     /// Wide experts (a prompt's) go to the GPU, the CPU's line rising with
@@ -1024,7 +1242,7 @@ mod tests {
     fn the_policy_words_are_the_measured_lines() {
         let lines = uncontended_lines();
         // A layout of its own: each word at an offset no other takes.
-        let layout = PolicyLayout { words: 10, cpu: 0, cpu_row: 1, handshake: 2, link: 3, link_row: 4, link_busy: 8, hit: 5, hit_row: 6, priced: 7 };
+        let layout = PolicyLayout { words: 11, cpu: 0, cpu_row: 1, handshake: 2, link: 3, link_contended: 9, link_row: 4, link_busy: 8, hit: 5, hit_row: 6, priced: 7 };
         let words = |site, priced| ExpertLines::policy(&layout, site, priced).into_iter().collect::<std::collections::BTreeMap<_, _>>();
         let word = |offset: usize| offset;
         let sited = SiteLines::Measured(lines.host.cpu.as_ref().unwrap());
@@ -1137,6 +1355,8 @@ mod tests {
                 link: PassLine { weights: ns(ns_of_gbs(b_link_gbs).0 + 5_000), row: ns(100) },
                 resident: PassLine { weights: ns(5_000), row: ns(100) },
                 moves: Moves::NONE,
+                baseline_dma: None,
+                contended_link: None,
             },
         }
     }
@@ -1147,7 +1367,7 @@ mod tests {
     ///    and under the analytical upper bound (`B_joint = B_mem = 47.8 GB/s`).
     #[test]
     fn gen5_dual_channel_ddr5_suppresses_cpu_site() {
-        let layout = PolicyLayout { words: 10, cpu: 0, cpu_row: 1, handshake: 2, link: 3, link_row: 4, link_busy: 8, hit: 5, hit_row: 6, priced: 7 };
+        let layout = PolicyLayout { words: 11, cpu: 0, cpu_row: 1, handshake: 2, link: 3, link_contended: 9, link_row: 4, link_busy: 8, hit: 5, hit_row: 6, priced: 7 };
         let words = |lines: &ExpertLines| {
             ExpertLines::policy(&layout, SiteLines::Measured(lines.host.cpu.as_ref().unwrap()), Some(lines))
                 .into_iter()
@@ -1259,5 +1479,272 @@ mod tests {
         // eb8096 Gen4 3090: B_dma = 19.31 GB/s, B_joint = 36.90 GB/s -> CPU-site stays enabled!
         let gen4_3090 = topology_lines(19.31, Some(47.8), Some(36.90), 261_000);
         assert!(gen4_3090.effective_cpu().is_some(), "Gen4 3090 (B_joint 36.9 >> B_dma 19.31) must keep CPU-site enabled");
+    }
+
+    /// 7. Runtime `passed()` updates inflating `gpu.link.weights` must never
+    ///    shrink `effective_cpu_for`'s effective per-expert time or flip a
+    ///    suppressed CPU site to enabled (positive-feedback loop guard).
+    #[test]
+    fn passed_never_shrinks_effective_cpu_or_enables_suppressed_site() {
+        let ns = |v: u32| Nanoseconds::try_from(v).unwrap();
+        let make_host = |t_dma_ns: u32, t_joint_ns: u32, cpu_ns: u32| ExpertLines {
+            host: HostLines {
+                cpu: Some(CpuLines {
+                    expert: RowLine { one: ns(cpu_ns), row: RowCost::Measured(ns(1_000)) },
+                    handshake: ns(4_000),
+                }),
+                memory: Some(ns(t_joint_ns)),
+                joint_memory: Some(ns(t_joint_ns)),
+                landing: None,
+                record_bytes: 3_000_000,
+            },
+            gpu: GpuLines {
+                link: PassLine { weights: ns(t_dma_ns + 5_000), row: ns(100) },
+                resident: PassLine { weights: ns(5_000), row: ns(100) },
+                moves: Moves::NONE,
+                baseline_dma: None,
+                contended_link: None,
+            },
+        };
+
+        // High-headroom host (`t_joint / t_dma = 50 / 100 = 0.50`, `t_spare = 100 µs`):
+        // inflating `gpu.link.weights` via `passed()` must keep `effective_cpu_for`
+        // pinned to the load-time `t_spare = 100 µs`, even across repeated updates.
+        let high = make_host(100_000, 50_000, 40_000);
+        let cpu = high.host.cpu.unwrap();
+        let before = high.effective_cpu_for(cpu).expect("50% headroom enables CPU-site");
+        assert_eq!(before.expert.one, ns(100_000));
+
+        let contended_once = high.passed(Some([10e-6, 5e-6, 220e-6, 50e-6]));
+        let after_once = contended_once.effective_cpu_for(cpu).expect("still enabled");
+        assert_eq!(after_once.expert.one, before.expert.one, "passed() must not shrink t_spare");
+
+        let contended_twice = contended_once.passed(Some([10e-6, 5e-6, 400e-6, 50e-6]));
+        let after_twice = contended_twice.effective_cpu_for(cpu).expect("still enabled");
+        assert_eq!(after_twice.expert.one, before.expert.one, "repeated passed() must preserve load-time baseline_dma");
+
+        // Narrow-headroom DDR4 host (`t_joint / t_dma = 44 / 50 = 0.88`):
+        // suppressed at load time, and must stay suppressed even when `passed()`
+        // inflates `gpu.link.weights` from 55 µs to 115 µs (which would otherwise
+        // make `t_joint / t_dma_inflated = 44 / 110 = 0.40` and flip CPU-site on).
+        let ddr4 = make_host(50_000, 44_000, 40_000);
+        let ddr4_cpu = ddr4.host.cpu.unwrap();
+        assert_eq!(ddr4.effective_cpu_for(ddr4_cpu), None, "0.88 ratio must suppress CPU-site at load time");
+        let ddr4_passed = ddr4.passed(Some([10e-6, 5e-6, 115e-6, 50e-6]));
+        assert_eq!(
+            ddr4_passed.effective_cpu_for(ddr4_cpu),
+            None,
+            "passed() inflating gpu.link.weights must never flip a suppressed CPU site to enabled"
+        );
+    }
+
+    /// 8. A DDR4 host with `t_joint / t_dma = 0.88` (`<20%` spare headroom)
+    ///    suppresses `Site::Cpu`, while a high-headroom host (`t_joint / t_dma = 0.50`)
+    ///    keeps `Site::Cpu` enabled with stable load-time `t_spare`.
+    #[test]
+    fn ddr4_narrow_headroom_suppresses_cpu_site_while_high_headroom_keeps_it_enabled() {
+        let ns = |v: u32| Nanoseconds::try_from(v).unwrap();
+        let layout = PolicyLayout { words: 11, cpu: 0, cpu_row: 1, handshake: 2, link: 3, link_contended: 9, link_row: 4, link_busy: 8, hit: 5, hit_row: 6, priced: 7 };
+        let make = |t_dma_ns: u32, t_joint_ns: u32| ExpertLines {
+            host: HostLines {
+                cpu: Some(CpuLines {
+                    expert: RowLine { one: ns(40_000), row: RowCost::Measured(ns(1_000)) },
+                    handshake: ns(4_000),
+                }),
+                memory: Some(ns(t_joint_ns)),
+                joint_memory: Some(ns(t_joint_ns)),
+                landing: None,
+                record_bytes: 3_000_000,
+            },
+            gpu: GpuLines {
+                link: PassLine { weights: ns(t_dma_ns + 5_000), row: ns(100) },
+                resident: PassLine { weights: ns(5_000), row: ns(100) },
+                moves: Moves::NONE,
+                baseline_dma: None,
+                contended_link: None,
+            },
+        };
+
+        // DDR4 host: `t_joint / t_dma = 44 / 50 = 0.88` -> suppressed (`None`).
+        let ddr4 = make(50_000, 44_000);
+        assert_eq!(ddr4.effective_cpu(), None);
+        let served = ddr4.serve(Pass::Decode, &hits(2.), &misses(8, 1.));
+        assert_eq!(served.at(Site::Cpu), 0, "{served:?}");
+        assert_eq!(served.at(Site::Link), 8, "{served:?}");
+        let pol: std::collections::BTreeMap<_, _> =
+            ExpertLines::policy(&layout, SiteLines::Measured(ddr4.host.cpu.as_ref().unwrap()), Some(&ddr4)).into_iter().collect();
+        assert_eq!(pol[&layout.priced], 0);
+
+        // Exact zero-spare-bandwidth boundary (`t_joint == t_dma`) -> suppressed (`None`).
+        let boundary = make(50_000, 50_000);
+        assert_eq!(boundary.effective_cpu(), None);
+
+        // High-headroom host: `t_joint / t_dma = 50 / 100 = 0.50` -> enabled with `t_spare = 100 µs`.
+        let high = make(100_000, 50_000);
+        let eff = high.effective_cpu().expect("50% headroom must keep CPU-site enabled");
+        assert_eq!(eff.expert.one, ns(100_000));
+        let high_served = high.serve(Pass::Decode, &hits(2.), &misses(8, 1.));
+        assert!(high_served.at(Site::Cpu) > 0, "high-headroom host should assign misses to CPU: {high_served:?}");
+    }
+
+    /// 9. Contended DMA rate physics: offloading C of N experts to CPU-site
+    ///    is chosen iff `max((N - C) * t_dma_contended, fixed + C * t_cpu) < N * t_dma_uncontended`.
+    ///    Covers C=0 (contention makes every split slower), C>0 (strictly faster),
+    ///    C=N (all misses on CPU -> 0 GPU DMA so no DMA contention), exact tie
+    ///    (stays at C=0), and zero contention (`t_dma_contended == t_dma_uncontended`).
+    #[test]
+    fn contended_dma_rate_governs_cpu_offload_split() {
+        let ns = |v: u32| Nanoseconds::try_from(v).unwrap();
+        let make = |link_ns: u32, contended_ns: u32, cpu_ns: u32, handshake_ns: u32| ExpertLines {
+            host: HostLines {
+                cpu: Some(CpuLines {
+                    expert: RowLine { one: ns(cpu_ns), row: RowCost::Measured(ns(0)) },
+                    handshake: ns(handshake_ns),
+                }),
+                memory: None,
+                joint_memory: None,
+                landing: None,
+                record_bytes: 3_000_000,
+            },
+            gpu: GpuLines {
+                link: PassLine { weights: ns(link_ns), row: ns(0) },
+                resident: PassLine { weights: ns(0), row: ns(0) },
+                moves: Moves::NONE,
+                baseline_dma: None,
+                contended_link: Some(ns(contended_ns)),
+            },
+        };
+
+        // Case A (3060-32g / DDR4 contention): uncontended 100 µs, contended 180 µs,
+        // CPU 180 µs, handshake 20 µs, N = 3.
+        // GPU-only = 300 µs; C=1: max(360, 200)=360; C=2: max(180, 380)=380; C=3: 560.
+        // Every split is slower -> C = 0!
+        let slow_split = make(100_000, 180_000, 180_000, 20_000);
+        let served = slow_split.serve(Pass::Decode, &[], &misses(3, 1.));
+        assert_eq!((served.at(Site::Cpu), served.at(Site::Link)), (0, 3), "{served:?}");
+        assert!((served.end_seconds - 300e-6).abs() < 1e-12, "{served:?}");
+
+        // Case B (exact tie): uncontended 100 µs, contended 160 µs, CPU 250 µs,
+        // handshake 50 µs, N = 8.
+        // GPU-only = 800 µs; C=3: max(5*160=800, 50+750=800) = 800 µs (tie, not strictly faster).
+        // Must stay at C = 0!
+        let exact_tie = make(100_000, 160_000, 250_000, 50_000);
+        let served = exact_tie.serve(Pass::Decode, &[], &misses(8, 1.));
+        assert_eq!((served.at(Site::Cpu), served.at(Site::Link)), (0, 8), "{served:?}");
+        assert!((served.end_seconds - 800e-6).abs() < 1e-12, "{served:?}");
+
+        // Case C (strictly faster split under contention): uncontended 100 µs,
+        // contended 120 µs, CPU 150 µs, handshake 10 µs, N = 8.
+        // GPU-only = 800 µs; C=3: max(5*120=600, 10+450=460)=600; C=4: max(480, 610)=610.
+        // Optimal split is C = 3 (600 µs < 800 µs).
+        let fast_split = make(100_000, 120_000, 150_000, 10_000);
+        let served = fast_split.serve(Pass::Decode, &[], &misses(8, 1.));
+        assert_eq!((served.at(Site::Cpu), served.at(Site::Link)), (3, 5), "{served:?}");
+        assert!((served.end_seconds - 600e-6).abs() < 1e-12, "{served:?}");
+
+        // Case D (C = N: all misses on CPU -> 0 GPU misses -> no DMA contention):
+        // uncontended 100 µs, contended 500 µs, CPU 40 µs, handshake 10 µs, N = 1.
+        // GPU-only = 100 µs; C=1: gpu=0, cpu=50 µs < 100 µs -> C = 1!
+        let all_cpu = make(100_000, 500_000, 40_000, 10_000);
+        let served = all_cpu.serve(Pass::Decode, &[], &misses(1, 1.));
+        assert_eq!((served.at(Site::Cpu), served.at(Site::Link)), (1, 0), "{served:?}");
+        assert!((served.end_seconds - 50e-6).abs() < 1e-12, "{served:?}");
+
+        // Case E (zero contention: contended == uncontended): matches uncontended schedule.
+        let zero_cont = make(100_000, 100_000, 150_000, 10_000);
+        let no_field = ExpertLines { gpu: GpuLines { contended_link: None, ..zero_cont.gpu }, ..zero_cont };
+        assert_eq!(zero_cont.serve(Pass::Decode, &[], &misses(8, 1.)), no_field.serve(Pass::Decode, &[], &misses(8, 1.)));
+    }
+
+    /// 10. Bandwidth conservation when `contended_link` and `joint_memory` are both
+    ///     measured: `1 / t_dma_contended + 1 / t_cpu_bus = 1 / t_joint` (no double-counting).
+    #[test]
+    fn effective_cpu_with_contended_link_conserves_joint_bandwidth() {
+        let ns = |v: u32| Nanoseconds::try_from(v).unwrap();
+        // B_dma_uncontended = 20 GB/s (150 µs), B_dma_contended = 14 GB/s (214.286 µs),
+        // B_cpu_contended = 18 GB/s (166.667 µs) -> B_joint = 32 GB/s (93.75 µs).
+        const RECORD: f64 = 3_000_000.0;
+        let t_dma = (RECORD / 20e9 * 1e9).round() as u32;
+        let t_dma_cont = (RECORD / 14e9 * 1e9).round() as u32;
+        let t_joint = (RECORD / 32e9 * 1e9).round() as u32;
+        let resident = 5_000u32;
+        let lines = ExpertLines {
+            host: HostLines {
+                cpu: Some(CpuLines {
+                    expert: RowLine { one: ns(120_000), row: RowCost::Measured(ns(1_000)) },
+                    handshake: ns(4_000),
+                }),
+                memory: Some(ns(60_000)),
+                joint_memory: Some(ns(t_joint)),
+                landing: None,
+                record_bytes: RECORD as u64,
+            },
+            gpu: GpuLines {
+                link: PassLine { weights: ns(t_dma + resident), row: ns(100) },
+                resident: PassLine { weights: ns(resident), row: ns(100) },
+                moves: Moves::NONE,
+                baseline_dma: Some(ns(t_dma)),
+                contended_link: Some(ns(t_dma_cont + resident)),
+            },
+        };
+        let eff = lines.effective_cpu().expect("B_joint=32 > B_dma=20 keeps CPU enabled");
+        let expected_cpu_bus = RECORD / 18e9 * 1e9;
+        assert!(
+            (eff.expert.one.get() - expected_cpu_bus).abs() < 200.,
+            "expected t_cpu_bus ≈ {expected_cpu_bus} ns (18 GB/s), got {}",
+            eff.expert.one.get()
+        );
+    }
+
+    /// 11. Backward compatibility: legacy `GpuLines` JSON without `contended_link`
+    ///     deserializes cleanly with `contended_link: None`.
+    #[test]
+    fn gpu_lines_deserializes_without_contended_link() {
+        let legacy = r#"{"link":{"weights":86000,"row":100},"resident":{"weights":5000,"row":100},"moves":{"link":0,"records":0.0}}"#;
+        let gpu: GpuLines = serde_json::from_str(legacy).expect("legacy GpuLines JSON must deserialize");
+        assert_eq!(gpu.contended_link, None);
+        assert_eq!(gpu.contended_link_line(), gpu.link);
+    }
+
+    /// 12. Regression for RTX 5090 Gen5 (`97c186`): when `contended_link` is
+    ///     measured (`link = 30.7 µs`, `contended_link = 61.0 µs`, `cpu = 89.5 µs`),
+    ///     CPU-site MUST be suppressed (`None`, 0 CPU jobs even with link-busy moves
+    ///     and N = 1..2 misses) both when `t_joint >= baseline_dma` and when
+    ///     `1 / t_link_contended + 1 / t_cpu <= 1 / t_link_uncontended`.
+    #[test]
+    fn rtx5090_gen5_with_contended_link_suppresses_cpu_site() {
+        let ns = |v: u32| Nanoseconds::try_from(v).unwrap();
+        let make = |t_joint_ns: u32| ExpertLines {
+            host: HostLines {
+                cpu: Some(CpuLines {
+                    expert: RowLine { one: ns(89_543), row: RowCost::Measured(ns(1_000)) },
+                    handshake: ns(4_000),
+                }),
+                memory: Some(ns(t_joint_ns)),
+                joint_memory: Some(ns(t_joint_ns)),
+                landing: None,
+                record_bytes: 1_350_000,
+            },
+            gpu: GpuLines {
+                link: PassLine { weights: ns(30_734), row: ns(100) },
+                resident: PassLine { weights: ns(2_700), row: ns(100) },
+                moves: Moves { link: ns(200_000), records: 1. },
+                baseline_dma: Some(ns(28_034)),
+                contended_link: Some(ns(60_973)),
+            },
+        };
+
+        // Case 1: `t_joint >= baseline_dma` (B_joint <= B_dma_uncontended) with contended_link set.
+        let saturated = make(29_000);
+        assert_eq!(saturated.effective_cpu(), None);
+        assert_eq!(saturated.passed(Some([10e-6, 2.7e-6, 120e-6, 90e-6])).effective_cpu(), None);
+        assert_eq!(saturated.serve(Pass::Decode, &hits(2.), &misses(2, 1.)).at(Site::Cpu), 0);
+
+        // Case 2: `t_joint < baseline_dma` slightly (7% headroom), but contended DMA
+        // doubles to 61.0 µs so `1/60.97 + 1/89.54 = 0.0276 <= 1/30.73 = 0.0325` -> None.
+        let narrow = make(26_000);
+        assert_eq!(narrow.effective_cpu(), None);
+        assert_eq!(narrow.serve(Pass::Decode, &hits(2.), &misses(1, 1.)).at(Site::Cpu), 0);
+        assert_eq!(narrow.serve(Pass::Decode, &hits(2.), &misses(2, 1.)).at(Site::Cpu), 0);
     }
 }

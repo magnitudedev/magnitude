@@ -352,7 +352,13 @@ pub(super) fn recorded_substrate(
     definition: &magnitude_family_contracts::ModelDefinition,
     backend: BackendName,
 ) -> Result<crate::planning::BankSubstrate, PlanError> {
-    let substrate = crate::planning::bank_substrate(backend, recorded_allocations(backend), recorded_host_tier(backend), definition)?;
+    let substrate = crate::planning::bank_substrate(
+        backend,
+        recorded_allocations(backend),
+        recorded_host_tier(backend),
+        backend.fills_beside_compute(),
+        definition,
+    )?;
     crate::planning::routed_experts(definition)?;
     Ok(substrate)
 }
@@ -1313,7 +1319,7 @@ fn every_served_head_outlines_its_graphs_from_traces(backend: BackendName) {
             panic!("{line}: a selected causal head plans no head program or state");
         };
         let geometry = head_state.head_geometry().unwrap_or_else(|error| panic!("{line}: {error}"));
-        let classes = head_graph_classes(LIMITS, geometry, HEAD_METHOD.draft_rows(), load.fronts())
+        let classes = head_graph_classes(LIMITS, geometry, HEAD_METHOD.draft_rows(), load.fronts(), head_program.has_bank())
         .unwrap_or_else(|error| panic!("{line}: its head classes: {error}"));
         let binding = head_program.blocks()[0];
         let outlined = tally.outline(head_traces_recorded, || {

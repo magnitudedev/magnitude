@@ -1040,7 +1040,7 @@ fn a_streamed_fit_is_priced_on_the_bank_it_was_held_in() {
     };
     let whole_weights = whole.draft().load().clone().unbanked().weight_bytes().unwrap();
     let mut setup = room(whole_weights - 4_000_000_000);
-    let figures = StreamedFigures { read: ReadLine::new(1e-4, 1. / 3e9).unwrap(), memory: None, site: None, convert: 1. / 100e9 };
+    let figures = StreamedFigures { read: ReadLine::new(1e-4, 1. / 3e9).unwrap(), memory: None, site: None, convert: 1. / 100e9, transfer: None };
     setup.measurements = Measurements::Measured { costs: Arc::new(synthetic::costs()), records: Arc::default(), pending: false, streamed: Priced::Measured(figures) };
     let assessed = finish_model_assessment(&prepared, &setup, &[], PROFILE_SEQUENCES).unwrap_or_else(|error| panic!("operational failure: {error}"));
     let ModelAssessment::Assessed { execution: ModelExecution::Fits { residency: ModelResidency::Streamed { performance, floor_performance, .. }, .. }, .. } = assessed else {

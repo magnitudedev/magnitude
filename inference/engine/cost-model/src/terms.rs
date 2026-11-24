@@ -123,6 +123,14 @@ impl Terms {
         self.compute.max(self.paths())
     }
 
+    /// Duration of the non-drive portions of the pass (`compute`, `link`,
+    /// `cpu`, `memory`) that run concurrently with `PathKind::Drive` I/O.
+    /// Equals `self.compute` on unified memory where `link`, `cpu` and
+    /// `memory` are zero, and includes RAM -> VRAM DMA on discrete hosts.
+    pub fn non_drive_time(&self) -> f64 {
+        self.compute.max(self.link).max(self.cpu).max(self.memory)
+    }
+
     /// `self + sign · terms`, term by term.
     pub fn add(&mut self, terms: &Self, sign: f64) {
         self.compute += sign * terms.compute;
@@ -165,7 +173,7 @@ mod tests {
         const CODE: [f64; 8] = [0.0334, 0.0356, 0.0375, 0.0396, 0.0419, 0.0445, 0.0475, 0.0508];
         let depth = |terms: Terms| {
             let paths = terms.each_path().map(|seconds| crate::PathTerm { seconds, wasted: crate::Waste { front: vec![None; 8], verify: vec![None; 8] } }).to_vec();
-            crate::Regime { resident: CODE.to_vec(), needed: crate::NeededByForm::both((0..8).map(|k| crate::Needed::Executed(1. - k as f64 / 40.)).collect()), stand: None, accepts: vec![None; 7], stall: None, overhead: None, paths, routes: crate::VerifyRoutes::default() }.depth()
+            crate::Regime { resident: CODE.to_vec(), verify_resident: Vec::new(), needed: crate::NeededByForm::both((0..8).map(|k| crate::Needed::Executed(1. - k as f64 / 40.)).collect()), stand: None, accepts: vec![None; 7], stall: None, front_stall: Vec::new(), verify_stall: Vec::new(), overhead: None, paths, routes: crate::VerifyRoutes::default() }.depth()
         };
         assert_eq!((depth(unified), depth(resident)), (7, 0), "unified: the drive, else the GPU");
         assert_eq!((depth(fits), depth(short)), (3, 7), "discrete: the link, else the drive");

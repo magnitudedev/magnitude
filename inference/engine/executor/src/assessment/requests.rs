@@ -404,7 +404,14 @@ struct Stored {
 }
 
 impl seismic::measure::Stored for Stored {
-    const SCHEMA: &'static str = concat!("point-request.", env!("MAGNITUDE_EXECUTOR_BUILD"));
+    const SCHEMA: &'static str = "";
+
+    fn schema() -> &'static str {
+        static SCHEMA: std::sync::LazyLock<String> = std::sync::LazyLock::new(|| {
+            format!("point-request.{}", crate::executor_build())
+        });
+        SCHEMA.as_str()
+    }
 }
 
 /// The most bytes a stored request is written as: an executor's identity

@@ -80,13 +80,11 @@ pub struct RoutedCall {
 }
 
 /// A call of a streamed layer that the layer's gates price apart from the
-/// launch: one computing its routed picks ([`RoutedCall`]), or its hint
-/// launch (the routers of the layers it hints read ahead of their routes),
-/// of the layer, in decoder order among the streamed layers.
+/// launch: one computing its routed picks ([`RoutedCall`]), in decoder order
+/// among the streamed layers.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum LayerCall {
     Routed(RoutedCall),
-    Hint(usize),
 }
 
 /// What one launch's calls read and compute: its distinct kinds, each with
@@ -95,8 +93,7 @@ pub enum LayerCall {
 /// where the backend's parks are submission boundaries), each a submit and
 /// a wait beside device time. Every kind counts its launches at the same
 /// decode row classes. Each routed kind of its streamed layers maps to the
-/// kinds of a layer's routed calls, in call order (`routed`), and each
-/// streamed layer that hints to the kind of its hint launch (`hints`).
+/// kinds of a layer's routed calls, in call order (`routed`).
 #[derive(Clone, Debug, PartialEq)]
 pub struct Census {
     kinds: Vec<Kind>,
@@ -104,7 +101,6 @@ pub struct Census {
     boundaries: u64,
     decode_rows: u64,
     routed: BTreeMap<RoutedKind, Vec<usize>>,
-    hints: BTreeMap<usize, usize>,
 }
 
 impl Census {
@@ -114,13 +110,11 @@ impl Census {
     /// `decode_rows` decode row classes: equal calls are one kind.
     ///
     /// # Panics
-    /// Where a call counts its launches at other decode row classes, two
-    /// layers of one routed kind make other routed calls, or a layer makes
-    /// two hint launches.
+    /// Where a call counts its launches at other decode row classes or two
+    /// layers of one routed kind make other routed calls.
     pub fn new(calls: impl IntoIterator<Item = (Kind, Option<LayerCall>)>, boundaries: u64, decode_rows: u64) -> Self {
         let (mut kinds, mut multiplicity) = (Vec::<Kind>::new(), Vec::<u64>::new());
         let mut layers = BTreeMap::<usize, (RoutedKind, Vec<usize>)>::new();
-        let mut hints = BTreeMap::<usize, usize>::new();
         for (call, of) in calls {
             assert_eq!(call.launches.decode_rows(), decode_rows, "invariant violated: a launch's calls count their launches at one set of decode rows");
             let kind = match kinds.iter().position(|kind| *kind == call) {
@@ -138,9 +132,6 @@ impl Census {
                     assert_eq!(*of, routed, "invariant violated: streamed layer {layer}'s routed calls are of one kind");
                     calls.push(kind);
                 }
-                Some(LayerCall::Hint(layer)) => {
-                    assert!(hints.insert(layer, kind).is_none(), "invariant violated: streamed layer {layer} makes one hint launch");
-                }
                 None => {}
             }
         }
@@ -149,13 +140,7 @@ impl Census {
             let known = routed.entry(kind).or_insert_with(|| calls.clone());
             assert_eq!(*known, calls, "invariant violated: streamed layer {layer} of {kind:?} makes other routed calls than its kind's");
         }
-        Self { kinds, multiplicity, boundaries, decode_rows, routed, hints }
-    }
-
-    /// The kind of streamed layer `layer`'s hint launch, none where it
-    /// hints no layer.
-    pub(crate) fn hint(&self, layer: usize) -> Option<usize> {
-        self.hints.get(&layer).copied()
+        Self { kinds, multiplicity, boundaries, decode_rows, routed }
     }
 
     /// The kinds of the routed calls of a streamed layer of `kind`, in call

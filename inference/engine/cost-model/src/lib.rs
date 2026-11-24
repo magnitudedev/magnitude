@@ -51,7 +51,7 @@ pub use expert_lines::{
 };
 pub use launch::{FrontRoutes, LaunchPrices, TargetCensus};
 pub use lines::{FileLine, ReadLine, RecordLine};
-pub use regime::{Form, LinkIdleBudget, Needed, NeededByForm, PathAdmission, PathTerm, ReadAdmission, Regime, VerifyRoutes, Waste};
+pub use regime::{Form, LinkIdleBudget, Needed, NeededByForm, PathAdmission, PathTerm, ReadAdmission, Regime, VerifyOverhead, VerifyRoutes, VramWorkingSet, Waste};
 pub use speculative::{
     expected_tokens, prior_expected_tokens, sigma_prior, DraftCensus, DraftMethod, DraftWidthCensus, SpeculativePrice, SpeculativeRate,
 };

@@ -42,7 +42,9 @@
 //! read bytes, wrong hints' among them; nor the link's, `K_s` the step's
 //! reads in place and its moves on it.
 
-use crate::expert_lines::{ExpertLines, Miss};
+#[cfg(test)]
+use crate::expert_lines::Miss;
+use crate::expert_lines::ExpertLines;
 use crate::lines::ReadLine;
 use std::collections::HashMap;
 
@@ -181,10 +183,7 @@ impl StepInputs<'_> {
         let hits_experts = (load.routed - total_misses as f64).max(0.);
         let hit_ns = hits_experts * lines.gpu.resident.nanoseconds(load.rows);
         // `load.tier` misses ready at 0.0, followed by `load.file` misses ready at `ready`.
-        let misses = (0..load.tier)
-            .map(|_| ((), Miss { rows: load.rows, ready_seconds: 0.0 }))
-            .chain((0..load.file).map(|_| ((), Miss { rows: load.rows, ready_seconds: ready })));
-        let schedule = lines.serve_decode(hit_ns, misses, |(), _| {});
+        let schedule = lines.serve_decode_uniform(hit_ns, load.tier, load.file, load.rows, ready);
         let end_seconds = schedule.gpu_ns.max(schedule.cpu_ns) * 1e-9;
         // Host memory bounds the CPU, the link and the moves together:
         // every miss and every moved record leaves it at `t_ram` (or the
@@ -196,7 +195,12 @@ impl StepInputs<'_> {
         };
         let leave = (total_misses as f64 + lines.gpu.moves.records) * bus_ns * 1e-9;
         let hit = hit_ns * 1e-9;
-        let in_place = schedule.link_count as f64 * lines.gpu.link.nanoseconds(load.rows);
+        let link_line = if schedule.served_cpu && schedule.link_count > 0 {
+            lines.gpu.contended_link_line()
+        } else {
+            lines.gpu.link
+        };
+        let in_place = schedule.link_count as f64 * link_line.nanoseconds(load.rows);
         ((end_seconds.max(leave) - hit).max(0.), (in_place + lines.gpu.moves.link.get()) * 1e-9)
     }
 
@@ -435,6 +439,15 @@ impl StepInputs<'_> {
         (self.advance(end, self.head, busy), served_sum, bytes, link_sum)
     }
 
+    /// Fast path of [`Self::run`] for callers whose steps are already
+    /// deduplicated with [`ReadAhead::NONE`] and zero recall (such as
+    /// [`crate::StreamedPeriod`]): avoids rebuilding a second `HashMap` over
+    /// already-unique patterns.
+    pub(crate) fn run_unique_no_ahead<'s>(&self, steps: impl IntoIterator<Item = (&'s [LayerRun], usize)>) -> StepTime {
+        debug_assert_eq!(self.ahead, ReadAhead::NONE);
+        self.mean(steps.into_iter().map(|(runs, count)| (self.step_no_ahead(runs), count)))
+    }
+
     /// A run of `steps`, each its runs of layers run its count of times in a
     /// row: `T`, the slowest of its schedule's, the drive's sustained rate's
     /// and the link's means.
@@ -587,7 +600,7 @@ mod tests {
     /// of nothing.
     fn unified() -> ExpertLines {
         let none = PassLine { weights: Nanoseconds::try_from(0).unwrap(), row: Nanoseconds::try_from(0).unwrap() };
-        ExpertLines { host: HostLines { cpu: None, memory: None, joint_memory: None, landing: None, record_bytes: 2_000_000 }, gpu: GpuLines { link: none, resident: none, moves: Moves::NONE } }
+        ExpertLines { host: HostLines { cpu: None, memory: None, joint_memory: None, landing: None, record_bytes: 2_000_000 }, gpu: GpuLines { link: none, resident: none, moves: Moves::NONE, baseline_dma: None, contended_link: None } }
     }
 
     fn landed_host() -> FileLine {

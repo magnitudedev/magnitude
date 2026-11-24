@@ -611,6 +611,13 @@ pub struct TierCopyCosts {
     /// probe has been recorded (in which case callers fall back conservatively
     /// to `MemoryCosts::byte_seconds`).
     pub concurrent_host_byte_seconds: Option<f64>,
+    /// Measured contended H2D DMA seconds-per-byte (`1 / B_dma_contended`)
+    /// when CPU host-RAM reads (`Sweeps`) run concurrently on the shared
+    /// `HostRam` bus (`TierCopyPoint::ConcurrentDma`).
+    ///
+    /// `None` when the executor does not share a `HostRam` bus with the host
+    /// CPU or before the concurrent probe has been recorded.
+    pub concurrent_dma_byte_seconds: Option<f64>,
 }
 
 /// Which way a transfer-queue batch copies.
@@ -903,7 +910,7 @@ impl TierCopyCosts {
             ReadLine::new((lone - bytes as f64 * byte_seconds).max(0.), byte_seconds).map_err(TierCopyError::Transfer)
         };
         let (transfer, back) = (line(Direction::In)?, line(Direction::Out)?);
-        let concurrent_host_byte_seconds = if topology.shares_host_ram_bus(executor) {
+        let (concurrent_host_byte_seconds, concurrent_dma_byte_seconds) = if topology.shares_host_ram_bus(executor) {
             let readers = MemoryCosts::readers(topology);
             let span = MemoryCosts::span(topology);
             let dma = median(Self::concurrent_dma_key(&identity, readers, span), TierCopyPoint::ConcurrentDma)?;
@@ -911,14 +918,14 @@ impl TierCopyCosts {
             let b_dma = (records * bytes) as f64 / dma;
             let b_cpu = span as f64 / cpu;
             let b_joint = b_dma + b_cpu;
-            if !b_joint.is_finite() || b_joint <= 0. {
+            if !b_joint.is_finite() || b_joint <= 0. || !b_dma.is_finite() || b_dma <= 0. {
                 return Err(TierCopyError::ConcurrentHostRead { dma, cpu });
             }
-            Some(1. / b_joint)
+            (Some(1. / b_joint), Some(1. / b_dma))
         } else {
-            None
+            (None, None)
         };
-        Ok(Self { blocks, whole_seconds: whole, stall_share, transfer, back, concurrent_host_byte_seconds })
+        Ok(Self { blocks, whole_seconds: whole, stall_share, transfer, back, concurrent_host_byte_seconds, concurrent_dma_byte_seconds })
     }
 
     /// [`Self::stored`] in its [`Priced`] state, owning the mapping from an
@@ -2236,7 +2243,7 @@ mod tests {
     /// transfer hides less than its latency more.
     #[test]
     fn the_transfer_queues_depth_covers_its_latency() {
-        let costs = |latency: f64| TierCopyCosts { blocks: 2, whole_seconds: 1e-3, stall_share: 0., transfer: ReadLine::new(latency, 1. / 12e9).unwrap(), back: ReadLine::new(latency, 1. / 12e9).unwrap(), concurrent_host_byte_seconds: None };
+        let costs = |latency: f64| TierCopyCosts { blocks: 2, whole_seconds: 1e-3, stall_share: 0., transfer: ReadLine::new(latency, 1. / 12e9).unwrap(), back: ReadLine::new(latency, 1. / 12e9).unwrap(), concurrent_host_byte_seconds: None, concurrent_dma_byte_seconds: None };
         assert_eq!(costs(90e-6).depth(3_000_000), 2);
         assert_eq!(costs(0.).depth(3_000_000), 2, "always keeps at least one queued behind the running transfer");
         assert_eq!(costs(300e-6).depth(3_000_000), 3);

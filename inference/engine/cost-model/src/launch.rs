@@ -13,7 +13,7 @@
 //! A load's prices are one immutable snapshot: cloning shares it.
 
 use crate::census::{Census, RoutedKind};
-use crate::compute::{hint_seconds, launch_terms, read_terms, routed_seconds};
+use crate::compute::{launch_terms, read_terms, routed_seconds};
 use crate::speculative::{DraftCensus, DraftMethod, SpeculativePrice};
 use crate::streamed::FormSeconds;
 use seismic_measure::pricing::{expert_union, ExpertRead, Experts, Figures, LaunchSeconds, PriceError, Pricing};
@@ -283,22 +283,6 @@ impl LaunchPrices {
         };
         let sequences = self.sequences(rows)?;
         routed_seconds(streamed, kind, &Pricing { figures, lookahead: *lookahead }, sequences.into(), rows.into(), picks.into())
-    }
-
-    /// The seconds of streamed layer `layer`'s hint launch in a launch of
-    /// `rows` rows as it runs ([`Self::sequences`]): the hint gate's one
-    /// price of running a layer's hints, at no context, as a hint reads
-    /// none. None where the layer hints none.
-    ///
-    /// # Panics
-    /// Where the load banks no experts.
-    pub fn hint(&self, layer: usize, rows: u32) -> Result<Option<f64>, PriceError> {
-        let Source { target, figures, lookahead, .. } = &*self.source;
-        let TargetCensus::Banked { streamed, .. } = target else {
-            panic!("invariant violated: a load holding its experts whole has no streamed layer's hints");
-        };
-        let sequences = self.sequences(rows)?;
-        hint_seconds(streamed, layer, &Pricing { figures, lookahead: *lookahead }, sequences.into(), rows.into())
     }
 
     /// A front pass of `requests` requests' exact rows, `fronted` of them

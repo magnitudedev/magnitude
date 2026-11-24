@@ -323,7 +323,6 @@ fn call_from_sized(
     let layer = block
         .and_then(|ctx| ctx.streamed_layer)
         .and_then(|(layer, kind)| match sized.entry {
-            "routed_hint_route" | "routed_hint_select" => Some(LayerCall::Hint(layer)),
             "routed_gate_up_part"
             | "routed_up"
             | "routed_output"

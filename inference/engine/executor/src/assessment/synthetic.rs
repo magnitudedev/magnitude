@@ -139,6 +139,7 @@ pub fn streamed_figures() -> super::StreamedFigures {
         memory: Some(1.0 / 50e9),
         site: None,
         convert: 1.0 / 100e9,
+        transfer: None,
     }
 }
 
