@@ -306,7 +306,12 @@ impl ExpertBankPlan {
 
     /// What its device gives it ([`BankSubstrate`]).
     pub fn substrate(&self) -> super::BankSubstrate {
-        super::BankSubstrate { backend: self.backend, allocations: self.allocations, host: self.structured.host }
+        super::BankSubstrate {
+            backend: self.backend,
+            allocations: self.allocations,
+            host: self.structured.host,
+            has_side_queue: self.has_side_queue,
+        }
     }
 
     /// How the host tier is held on the device (`platform::host_tier`): a

@@ -81,6 +81,13 @@ impl NativeGraphPool {
             workspace: Rc::new(RefCell::new(Vec::new())),
             output: Rc::new(RefCell::new(Vec::new())),
         };
+        // Cap decode-capable flights at the floor's activations: extra slots
+        // grown later for prompt-group chains (`grow_class`) serve prefill
+        // chains only and never run decode or pin further copies of decode
+        // graphs.
+        pool.family
+            .cap_decode_flights(floor.activations)
+            .map_err(super::AllocationError::Tensor)?;
         pool.grow(charges, floor)?;
         // Record each floor flight's decode graphs at load time while memory
         // serves them so no decode step records a graph (including a bank
@@ -104,14 +111,16 @@ impl NativeGraphPool {
 
     /// What the activations up to `slots`' count beyond those allocated
     /// add to the device's graph budget: the family's hold at the larger
-    /// count beyond its hold at those allocated, each a launch in flight
-    /// (`seismic::LaunchGraphs::held`), which grows as they are allocated
-    /// ([`Self::grow`]).
+    /// count beyond its hold at those allocated, with decode-capable flights
+    /// capped at `self.floor.activations` (`seismic::LaunchGraphs::held_with_decode`).
     pub(crate) fn hold_graphs(&self, slots: GraphSlots) -> Option<seismic::GraphCensus> {
         let graphs = self.family.graphs();
+        let decode = u64::try_from(self.floor.activations).ok()?;
         let held = u64::try_from(self.allocated.activations).ok()?;
         let grown = u64::try_from(slots.activations.max(self.allocated.activations)).ok()?;
-        graphs.held(grown)?.minus(graphs.held(held)?)
+        graphs
+            .held_with_decode(grown, decode.min(grown))?
+            .minus(graphs.held_with_decode(held, decode.min(held))?)
     }
 
     /// Allocate activations and output slots up to `slots`' counts, held

@@ -26,8 +26,10 @@ pub(crate) fn layer_homes(layers: impl IntoIterator<Item = (usize, u64)>) -> Vec
 }
 
 /// Every routed layer of `definition`, in decoder order followed by any
-/// routed draft layers: a routed sublayer, a parallel block's routed branch,
-/// or a separate draft's routed sublayer, and the scope of its weights.
+/// routed causal head or separate draft layers: a routed sublayer, a
+/// parallel block's routed branch, an embedded causal head's routed
+/// sublayer, or a separate draft's routed sublayer, and the scope of its
+/// weights.
 pub(super) fn routed_layers(
     definition: &ModelDefinition,
 ) -> impl Iterator<Item = (magnitude_family_contracts::SublayerIndex, WeightScope, &RoutedFfn)> {
@@ -39,6 +41,28 @@ pub(super) fn routed_layers(
         }),
         _ => None,
     });
+    let head = definition
+        .head
+        .iter()
+        .filter(|head| matches!(head.history, magnitude_family_contracts::HeadHistory::Own))
+        .flat_map(|head| {
+            head.blocks
+                .iter()
+                .flat_map(|head_block| head_block.blocks.iter())
+                .enumerate()
+                .flat_map(|(block, value)| {
+                    value.sublayers.iter().enumerate().filter_map(move |(sublayer, layer)| match &layer.op {
+                        Operator::RoutedFfn(routed) => {
+                            let index = magnitude_family_contracts::SublayerIndex {
+                                block: block as u32,
+                                sublayer: sublayer as u32,
+                            };
+                            Some((index, WeightScope::HeadSublayer(index), &**routed))
+                        }
+                        _ => None,
+                    })
+                })
+        });
     let draft = definition.draft.iter().flat_map(|draft| {
         draft.blocks.iter().enumerate().flat_map(|(block, value)| {
             value.sublayers.iter().enumerate().filter_map(move |(sublayer, layer)| match &layer.op {
@@ -53,7 +77,7 @@ pub(super) fn routed_layers(
             })
         })
     });
-    target.chain(draft)
+    target.chain(head).chain(draft)
 }
 
 /// The most slots a bank of `definition`'s routed layers takes: the widest

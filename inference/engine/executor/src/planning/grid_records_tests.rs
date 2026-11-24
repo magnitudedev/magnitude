@@ -182,7 +182,19 @@ fn fp8_experts_under_tile_grids_stream_records_of_their_stored_parts() {
             let slots = routed_experts(&definition).unwrap();
             let banked = resident
                 .clone()
-                .with_expert_bank(&definition, slots, None, 1, FlightDepth::PIPELINED, super::bank::BankSubstrate { backend, allocations: seismic::NativeAllocations::EXACT, host })
+                .with_expert_bank(
+                    &definition,
+                    slots,
+                    None,
+                    1,
+                    FlightDepth::PIPELINED,
+                    super::bank::BankSubstrate {
+                        backend,
+                        allocations: seismic::NativeAllocations::EXACT,
+                        host,
+                        has_side_queue: backend.fills_beside_compute(),
+                    },
+                )
                 .unwrap_or_else(|error| panic!("{case}: {error:?}"));
             let bank = banked.bank.as_ref().expect("a banked plan holds its bank");
             let [group] = bank.groups() else {

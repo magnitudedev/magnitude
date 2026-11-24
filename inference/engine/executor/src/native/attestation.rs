@@ -254,6 +254,7 @@ pub(crate) struct AttestedHeadBlock {
     pub attention: AttentionKernels,
     pub priming_project: super::RangedKernels<attention_project::Entry>,
     pub feed_forward: AttestedFeedForward,
+    pub bank: Option<Box<super::ExpertBankKernels>>,
     pub features: NativeKernel<readout_features_rows::Entry>,
     pub logits: ProjectionKernels,
     pub shortlist: Option<super::ShortlistReadoutKernels>,
@@ -522,7 +523,7 @@ impl AttestedPrograms {
                     .map_err(|error| error.to_string())?,
                 )))
             }
-            (Some(AttestedDrafter::Head(handles)), Some(DrafterProgramPlan::Head(_))) => {
+            (Some(AttestedDrafter::Head(handles)), Some(DrafterProgramPlan::Head(head_plan))) => {
                 match head_state {
                     Some(state) => {
                         let head = definition
@@ -541,6 +542,7 @@ impl AttestedPrograms {
                             state.head_geometry()?,
                             proposals,
                             load.fronts(),
+                            head_plan.has_bank(),
                         )?;
                         let landing = self.landing(load, TARGET_TABLE)?;
                         Some(crate::PreparedDrafterGraphs::Head(Rc::new(
@@ -699,6 +701,15 @@ impl AttestedPrograms {
                             .map(|bank| bank.site.clone())
                             .ok_or_else(|| format!("{scope:?} has no bank entries")),
                         _ => Err(format!("{scope:?} has no draft program")),
+                    },
+                    WeightScope::HeadSublayer(_) => match &self.drafter {
+                        Some(AttestedDrafter::Head(head)) => head
+                            .blocks
+                            .get(index.block as usize)
+                            .and_then(|block| block.bank.as_ref())
+                            .map(|bank| bank.site.clone())
+                            .ok_or_else(|| format!("{scope:?} has no bank entries")),
+                        _ => Err(format!("{scope:?} has no head program")),
                     },
                     _ => self
                         .target
@@ -1200,7 +1211,7 @@ impl AttestedPrograms {
                 Some(PreparedDrafter::Head(handles)),
             ) => {
                 let mut blocks = Vec::with_capacity(head_plan.blocks().len());
-                for &binding in head_plan.blocks() {
+                for (head_index, &binding) in head_plan.blocks().iter().enumerate() {
                     let logits = handles
                         .logits
                         .get(&binding)
@@ -1273,6 +1284,17 @@ impl AttestedPrograms {
                                 });
                             }
                         },
+                        bank: head_plan
+                            .bank(head_index)
+                            .map(|key| {
+                                handles
+                                    .banks
+                                    .get(&key)
+                                    .cloned()
+                                    .map(Box::new)
+                                    .ok_or_else(|| missing("head_bank", key))
+                            })
+                            .transpose()?,
                         features: slot(&handles.features, binding, "readout_features_rows")?,
                         logits,
                         shortlist: binding
@@ -1782,11 +1804,12 @@ impl AttestedPrograms {
                         return Err(missing("head", "native single-block topology"));
                     }
                     let graphs = graphs
-                        .bind_weights(charges, &resident)
+                        .bind_weights(charges, &resident, bank.as_deref())
                         .map_err(|error| missing("head", error))?;
                     crate::programs::native_head::NativeHeadProgram::new(
                         definition.decoder.clone(),
                         graphs,
+                        bank,
                         seismic::Charges::none(&charges.device()),
                     )
                     .map(NativeDrafterProgram::Head)

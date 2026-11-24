@@ -2372,14 +2372,11 @@ impl PreparedVisionGraphs {
             )
             .map_err(graph_error)?;
             let plan = graph.seal().map_err(device)?;
-            let class_graphs = seismic::LaunchGraphs::of(
-                [seismic::LaunchedGraph {
-                    graph: class_storage.recorded,
-                    pinned_runs: 0,
-                    runs: 1,
-                }],
-                Vec::new(),
-            )
+            let class_graphs = seismic::LaunchGraphs::of_serial([seismic::LaunchedGraph {
+                graph: class_storage.recorded,
+                pinned_runs: 0,
+                runs: 1,
+            }])
             .ok_or_else(|| invalid("vision graph census overflows"))?;
             let outputs = super::graph::serial_family(
                 "vision output",

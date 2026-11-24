@@ -133,7 +133,7 @@ pub(crate) enum AttentionHistoryEntries<'a, G: GraphDraft + 'a> {
     AffineK8V4 {
         codec: CodecSpec,
         append: G::Binding<'a, attention_append_k8v4::Entry>,
-        decode: G::Binding<'a, attention_decode_k8v4::Entry>,
+        decode: G::Ranged<'a, attention_decode_k8v4::Entry>,
         prefill: G::Binding<'a, attention_prefill_k8v4::Entry>,
         /// The prefill of a class that lists its launch's history row tiles
         /// (`StateResourcePlan::lists_history_tiles`).
@@ -584,7 +584,7 @@ impl CheckedAttentionEntries {
             HistoryEncoding::Affine => AttentionHistoryEntries::AffineK8V4 {
                 codec: self.history,
                 append: G::bind(&self.mix[..]),
-                decode: G::bind(&self.mix[..]),
+                decode: G::bind_ranged(&self.mix[..]),
                 prefill: G::bind(&self.mix[..]),
                 prefill_listed: self.lists.then(|| G::bind(&self.mix[..])),
             },
@@ -2119,7 +2119,7 @@ pub(crate) fn mix<'a, G: GraphDraft + 'a>(
             &prefill_dimensions(&dimensions, &words, &block_keys),
         ),
         AttentionHistoryEntries::AffineK8V4 { decode, .. } => {
-            graph.control_for(topology.controls, *decode, name, &dimensions)
+            graph.control_for(topology.controls, G::pick(*decode, rows), name, &dimensions)
         }
     };
     // A class the prefill entry attends is a prefill class here, decode
@@ -2588,7 +2588,7 @@ pub(crate) fn mix<'a, G: GraphDraft + 'a>(
                 block_slots: (&block_slots).into())
         }
         AttentionHistoryEntries::AffineK8V4 { decode: kernel, .. } if decode => mix!(
-            kernel,
+            &G::pick(*kernel, rows),
             attention_decode_k8v4,
             history_key_codes,
             history_key_coefficients,

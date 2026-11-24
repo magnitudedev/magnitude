@@ -1,9 +1,9 @@
-use super::{BankGroup, BankLayer, BankLayers, BankPaths, BankSites, BankSubstrate, BankTable, ExpertBankPlan, HintWeight, NonEmpty, RecordForm, routed_experts};
+use super::{BankGroup, BankLayer, BankLayers, BankPaths, BankSites, BankSubstrate, BankTable, ExpertBankPlan, NonEmpty, RecordForm, routed_experts};
 use super::conveyor;
 use super::records::{record_tensor, routed_layers};
 use super::table::stored_table_heads;
 use crate::error::{PlanError, UnstreamedExperts};
-use crate::operators::routed::{hint_kinds, is_fused};
+use crate::operators::routed::is_fused;
 use crate::planning::ModelLoadPlan;
 use crate::planning::resources::FlightDepth;
 use crate::planning::weights::Holding;
@@ -20,8 +20,27 @@ impl ModelLoadPlan {
         flights: FlightDepth,
         substrate: BankSubstrate,
     ) -> Result<u64, PlanError> {
-        let whole = self.clone().with_expert_bank(definition, routed_experts(definition)?, None, places, flights, substrate)?;
+        let whole = self.clone().with_whole_expert_bank(definition, None, places, flights, substrate)?;
         Ok(whole.bank.as_ref().expect("a banked plan holds its bank").floor())
+    }
+
+    /// The plan with every routed layer of the target's experts held whole in
+    /// an expert bank (`slots = ceiling = bank.max_slots()`).
+    pub fn with_whole_expert_bank(
+        self,
+        definition: &ModelDefinition,
+        window_slots: Option<u64>,
+        places: u64,
+        flights: FlightDepth,
+        substrate: BankSubstrate,
+    ) -> Result<Self, PlanError> {
+        let experts = routed_experts(definition)?;
+        let load = self.with_expert_bank(definition, experts, window_slots, places, flights, substrate)?;
+        let max_slots = load.bank.as_ref().expect("a banked plan holds its bank").max_slots();
+        if max_slots == experts {
+            return Ok(load);
+        }
+        load.with_bank_slots(max_slots, max_slots)
     }
 
     /// The plan with every routed layer of the target's experts held in an
@@ -51,7 +70,7 @@ impl ModelLoadPlan {
         flights: FlightDepth,
         substrate: BankSubstrate,
     ) -> Result<Self, PlanError> {
-        let BankSubstrate { backend, allocations, host } = substrate;
+        let BankSubstrate { backend, allocations, host, has_side_queue } = substrate;
         if self.bank.is_some() {
             return Err(PlanError::Topology("the load plan already streams its experts"));
         }
@@ -66,7 +85,11 @@ impl ModelLoadPlan {
         let mut target_shape = None;
         let mut max_selected = 0u64;
         for (index, scope, routed) in routed_layers(definition) {
-            let is_draft = matches!(scope, magnitude_family_contracts::WeightScope::DraftSublayer(_));
+            let is_draft = matches!(
+                scope,
+                magnitude_family_contracts::WeightScope::DraftSublayer(_)
+                    | magnitude_family_contracts::WeightScope::HeadSublayer(_)
+            );
             if is_draft && self.head.is_none() {
                 continue;
             }
@@ -89,13 +112,6 @@ impl ModelLoadPlan {
                     self.target_weight(role)
                 }
             };
-            let hinted = hint_kinds(routed)
-                .into_iter()
-                .map(|kind| HintWeight {
-                    kind,
-                    element: planned(kind).map(|plan| plan.resident),
-                })
-                .collect::<Vec<_>>();
             if !is_draft {
                 let router = &routed.router;
                 let selection = (
@@ -103,7 +119,6 @@ impl ModelLoadPlan {
                     router.score,
                     matches!(router.selection, ExpertSelection::TopK { bias: Some(_) }),
                     matches!(router.input, RouterInput::Residual(_)),
-                    hinted.clone(),
                 );
                 if *order.get_or_insert_with(|| selection.clone()) != selection {
                     return Err(PlanError::Unstreamed(UnstreamedExperts::SelectionOrder(index)));
@@ -114,7 +129,16 @@ impl ModelLoadPlan {
                     .cloned()
                     .ok_or(PlanError::Topology("a routed layer lacks an expert stack"))
             })?;
-            let record = resident.as_ref().try_map(|_, plan| record_tensor(plan, routed.experts))?;
+            // A draft or embedded head layer whose expert stacks were
+            // transformed on import (e.g. `narrow_head_routed_experts` ->
+            // `ImportTransform::DraftQ4_0`, where `upload != source`) cannot be
+            // streamed directly as raw stored records; leave it `Holding::Whole`
+            // instead of refusing the entire model's expert bank.
+            let record = match resident.as_ref().try_map(|_, plan| record_tensor(plan, routed.experts)) {
+                Ok(record) => record,
+                Err(PlanError::Unstreamed(_)) if is_draft => continue,
+                Err(error) => return Err(error),
+            };
             let group = match groups.iter().position(|group| {
                 group.record == record && layers[group.layers[0]].is_draft() == is_draft
             }) {
@@ -140,7 +164,6 @@ impl ModelLoadPlan {
                 experts: routed.experts,
                 selected: routed.selected,
                 resident,
-                hinted,
                 shared_down,
             });
         }
@@ -172,11 +195,16 @@ impl ModelLoadPlan {
                 continue;
             };
             *weight = table.plan(table_granule).map_err(PlanError::ResourcePlanning)?;
-            tables.push(table);
+            if let Some(existing) = tables.iter_mut().find(|existing: &&mut BankTable| existing.shares_storage_with(&table)) {
+                existing.merge_shared(&table);
+            } else {
+                tables.push(table);
+            }
         }
         let bank = ExpertBankPlan {
             structured,
             backend,
+            has_side_queue,
             allocations,
             blocks,
             slots,
@@ -196,6 +224,7 @@ impl ModelLoadPlan {
             sites: BankSites::Unadmitted,
             paths: BankPaths::Unpriced,
             recording: self.recorded_routes,
+            decode_hits_min_bytes: 0,
         };
         for layer in bank.layers() {
             let records = bank.records(layer.group);
@@ -215,11 +244,12 @@ impl ModelLoadPlan {
         self.with_front_stagings().with_bank_slots(slots, slots)
     }
 
-    /// Mutable access to a banked weight's plan: in `head` for draft routed
-    /// layers, in `target` for target routed layers.
+    /// Mutable access to a banked weight's plan: in `head` for draft and head
+    /// routed layers, in `target` for target routed layers.
     fn bank_weight_mut(&mut self, role: WeightRole) -> Option<&mut crate::planning::weights::WeightPlan> {
         match role.scope {
-            magnitude_family_contracts::WeightScope::DraftSublayer(_) => self.head_weight_mut(role),
+            magnitude_family_contracts::WeightScope::DraftSublayer(_)
+            | magnitude_family_contracts::WeightScope::HeadSublayer(_) => self.head_weight_mut(role),
             _ => self.target_weight_mut(role),
         }
     }
@@ -232,7 +262,7 @@ impl ModelLoadPlan {
     /// program plan included, is of the bank's structure alone.
     pub fn with_bank_slots(mut self, slots: u64, ceiling: u64) -> Result<Self, PlanError> {
         let mut bank = self.bank.take().ok_or(PlanError::Topology("a plan without a bank has no slots"))?;
-        if slots < bank.floor() || slots > ceiling || ceiling > bank.widest().get() {
+        if slots < bank.floor() || slots > ceiling || ceiling > bank.max_slots() {
             return Err(PlanError::Topology(
                 "an expert bank holds from its floor to its ceiling, at most every expert of each layer",
             ));
@@ -294,6 +324,13 @@ impl ModelLoadPlan {
         self.with_front_stagings().with_bank_slots(slots, ceiling)
     }
 
+    pub(crate) fn with_decode_hits_min_bytes(mut self, min_bytes: u64) -> Self {
+        if let Some(bank) = self.bank.as_mut() {
+            bank.decode_hits_min_bytes = min_bytes;
+        }
+        self
+    }
+
     /// The plan with its experts banked as `bank` holds them, at its path,
     /// slots, ceiling, host slots, launches and residency, its scratch
     /// `window_slots` experts of a layer at once: the bank
@@ -306,7 +343,8 @@ impl ModelLoadPlan {
             .with_bank_paths(bank.paths)?
             .with_bank_slots(bank.slots, bank.ceiling)?;
         let built = load.bank.as_mut().expect("the load was just banked");
-        (built.host_slots, built.pass, built.resident) = (bank.host_slots, bank.pass, bank.resident);
+        (built.host_slots, built.pass, built.resident, built.decode_hits_min_bytes) =
+            (bank.host_slots, bank.pass, bank.resident, bank.decode_hits_min_bytes);
         Ok(load)
     }
 
@@ -325,8 +363,12 @@ impl ModelLoadPlan {
             }
         }
         for table in &bank.tables {
-            if let Some(weight) = self.target_weight_mut(table.role) {
-                *weight = table.fixed.clone();
+            for role in table.roles() {
+                if let Some(weight) = self.target_weight_mut(role) {
+                    let mut fixed = table.fixed.clone();
+                    fixed.role = role;
+                    *weight = fixed;
+                }
             }
         }
         self.with_front_stagings()

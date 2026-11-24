@@ -260,48 +260,36 @@ pub struct SelectSpec {
 }
 
 /// A decode pass's rows over one sequence: one exact row, the pending
-/// token, which always commits, then its rows ahead in position order, each
-/// a guess of the token after the row before it. A pass's rows ahead are
-/// either acceptable rows, whose acceptance may extend the commit (a
+/// token, which always commits, then optional acceptable rows (a
 /// verification's proposals, each checked against the selection of the row
-/// before it), or front rows, which only run ahead and are never accepted
-/// (a front pass's, which name their tokens' routes early): front row `d`
-/// runs on the `d`-th guess of the sequence's chain, the token `d` positions
-/// past the pending one, and is exact `d` passes later where every guess up
-/// to it stands. Each row sees the K/V and recurrent state of every earlier
-/// row of the pass.
+/// before it), then optional trailing front rows, which only run ahead and
+/// are never accepted (naming their tokens' routes early for the next pass).
+/// Each row sees the K/V and recurrent state of every earlier row of the pass.
 ///
 /// | pass | rows | exact, acceptable, front |
 /// |---|---|---|
-/// | plain decode | `Exact { acceptable: [] }` | 1, 0, 0 |
-/// | verification of `k` proposals | `Exact { acceptable }` | 1, k, 0 |
-/// | front pass of depth `k` | `Front(rows)` ([`FrontRows`]) | 1, 0, k |
-///
-/// A pass of no exact row, or of front rows behind acceptable rows, has no
-/// representation: no pass runs one.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub enum Rows {
-    /// The exact row, then `acceptable` proposals (none of a plain decode).
-    Exact { acceptable: Vec<TokenId> },
-    /// The exact row, then its front rows ([`FrontRows`]), at most the
-    /// decode form's rows past the exact row.
-    Front(FrontRows),
+/// | plain decode | `Rows::plain()` | 1, 0, 0 |
+/// | verification of `k` proposals | `Rows::verify(acceptable)` | 1, k, 0 |
+/// | front pass of depth `f` | `Rows::front(guesses, idle)` | 1, 0, f |
+/// | hybrid verify + front | `Rows::verify_with_front(acceptable, front)` | 1, k, f |
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Rows {
+    acceptable: Vec<TokenId>,
+    front: FrontRows,
 }
 
-/// A front pass's front rows ([`Rows::Front`]): a front row on each guess
-/// of the sequence's chain ([`Guess`]), which the head launch behind the
-/// pass before made, then `idle` front rows of no guess, which run on the
-/// pending token: a pass granted deeper than the chain reaches
-/// ([`crate::FrontGrant::Exactly`]) has them. At least one row: a pass of
-/// none is [`Rows::Exact`] ([`Rows::front`]).
-#[derive(Clone, Debug, PartialEq, Eq)]
+/// Trailing front rows of a decode or verify pass: a front row on each guess
+/// ([`Guess`]), then `idle` front rows of no guess, which run on the pending
+/// token (used by a queued pass granted deeper than the chain reaches,
+/// [`crate::FrontGrant::Exactly`]). May be empty.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct FrontRows {
     guesses: Vec<Guess>,
     idle: usize,
 }
 
 impl FrontRows {
-    /// Its rows, guessed and idle: at least one.
+    /// Its rows, guessed and idle.
     pub fn rows(&self) -> usize {
         self.guesses.len() + self.idle
     }
@@ -368,69 +356,115 @@ pub struct Guess {
 }
 
 impl Rows {
-    /// The pass of a front row on each of `guesses`, then `idle` front rows
-    /// of no guess: one exact row where that is no row.
-    pub fn front(guesses: Vec<Guess>, idle: usize) -> Self {
-        match guesses.len() + idle {
-            0 => Self::Exact { acceptable: Vec::new() },
-            _ => Self::Front(FrontRows { guesses, idle }),
+    /// Plain single-row decode: one exact row, no acceptable or front rows.
+    pub fn plain() -> Self {
+        Self::default()
+    }
+
+    /// Construct a pass from `acceptable` verify proposals (`K`), guessed front
+    /// rows (`guesses`), and `idle` front rows.
+    pub fn pass(acceptable: Vec<TokenId>, guesses: Vec<Guess>, idle: usize) -> Self {
+        Self {
+            acceptable,
+            front: FrontRows { guesses, idle },
         }
+    }
+
+    /// A verify pass of `acceptable` proposals behind the exact row, with no
+    /// trailing front rows (plain decode when `acceptable` is empty).
+    pub fn verify(acceptable: Vec<TokenId>) -> Self {
+        Self {
+            acceptable,
+            front: FrontRows::default(),
+        }
+    }
+
+    /// A hybrid verify pass of `acceptable` proposals followed by trailing
+    /// `front_guesses` front rows (which run ahead and are never accepted).
+    pub fn verify_with_front(acceptable: Vec<TokenId>, front_guesses: Vec<Guess>) -> Self {
+        Self {
+            acceptable,
+            front: FrontRows {
+                guesses: front_guesses,
+                idle: 0,
+            },
+        }
+    }
+
+    /// The pass of a front row on each of `guesses`, then `idle` front rows
+    /// of no guess: plain decode where both are empty.
+    pub fn front(guesses: Vec<Guess>, idle: usize) -> Self {
+        Self {
+            acceptable: Vec::new(),
+            front: FrontRows { guesses, idle },
+        }
+    }
+
+    /// Shorten rows to fit within `max_rows` (at least 1), shrinking trailing
+    /// front rows (`idle`, then `front.guesses`) first before ever reducing
+    /// `acceptable`.
+    pub fn fit_budget(mut self, max_rows: usize) -> Self {
+        let max_ahead = max_rows.saturating_sub(1);
+        let mut over = (self.acceptable.len() + self.front.rows()).saturating_sub(max_ahead);
+        if over > 0 {
+            let drop_idle = over.min(self.front.idle);
+            self.front.idle -= drop_idle;
+            over -= drop_idle;
+        }
+        if over > 0 {
+            let drop_front = over.min(self.front.guesses.len());
+            self.front
+                .guesses
+                .truncate(self.front.guesses.len() - drop_front);
+            over -= drop_front;
+        }
+        if over > 0 {
+            let drop_acc = over.min(self.acceptable.len());
+            self.acceptable.truncate(self.acceptable.len() - drop_acc);
+        }
+        self
     }
 
     /// The proposals whose acceptance may extend the commit.
     pub fn acceptable(&self) -> &[TokenId] {
-        match self {
-            Self::Exact { acceptable } => acceptable.as_slice(),
-            Self::Front(_) => &[],
-        }
+        self.acceptable.as_slice()
     }
 
     /// The rows that are never accepted: its front rows, guessed and idle.
     pub fn front_rows(&self) -> usize {
-        match self {
-            Self::Exact { .. } => 0,
-            Self::Front(front) => front.rows(),
-        }
+        self.front.rows()
     }
 
     /// Its rows: the exact row, its acceptable rows, its front rows.
     pub fn row_count(&self) -> usize {
-        1 + self.acceptable().len() + self.front_rows()
+        1 + self.acceptable.len() + self.front.rows()
     }
 
     /// Its rows' tokens from the sequence's `pending` token, in row order:
-    /// the exact row's, then each row ahead's guess, then the pending token
-    /// again for each idle front row.
+    /// the exact row's, then each acceptable row's token, then each front
+    /// row's guess, then the pending token again for each idle front row.
     pub fn tokens(&self, pending: TokenId) -> Vec<TokenId> {
-        match self {
-            Self::Exact { acceptable } => std::iter::once(pending).chain(acceptable.iter().copied()).collect(),
-            Self::Front(front) => std::iter::once(pending)
-                .chain(front.guesses.iter().map(|guess| guess.token))
-                .chain(std::iter::repeat_n(pending, front.idle))
-                .collect(),
-        }
+        std::iter::once(pending)
+            .chain(self.acceptable.iter().copied())
+            .chain(self.front.guesses.iter().map(|guess| guess.token))
+            .chain(std::iter::repeat_n(pending, self.front.idle))
+            .collect()
     }
 
     /// Its guessed front rows' guesses, by depth: none of a pass of no
     /// front row, and never an idle row's.
     pub fn guesses(&self) -> &[Guess] {
-        match self {
-            Self::Exact { .. } => &[],
-            Self::Front(front) => &front.guesses,
-        }
+        &self.front.guesses
     }
 
     /// Each front row's kind as the host builds it, by depth: a guessed
     /// row's predictor, then each idle row's none.
     pub fn front_kinds(&self) -> Vec<FrontKind> {
-        let idle = match self {
-            Self::Exact { .. } => 0,
-            Self::Front(front) => front.idle,
-        };
-        self.guesses()
+        self.front
+            .guesses
             .iter()
             .map(|guess| FrontKind::Host(guess.kind))
-            .chain(std::iter::repeat_n(FrontKind::Idle, idle))
+            .chain(std::iter::repeat_n(FrontKind::Idle, self.front.idle))
             .collect()
     }
 }
@@ -489,10 +523,12 @@ impl AheadVerdict {
     /// order. Panics where fewer rows selected than may be accepted.
     pub fn new(rows: &Rows, samples: &[TokenId]) -> Self {
         // Its idle front rows guessed nothing: no verdict judges them.
-        let guesses = match rows {
-            Rows::Exact { acceptable } => acceptable.clone(),
-            Rows::Front(front) => front.guesses.iter().map(|guess| guess.token).collect(),
-        };
+        let guesses: Vec<TokenId> = rows
+            .acceptable()
+            .iter()
+            .copied()
+            .chain(rows.guesses().iter().map(|guess| guess.token))
+            .collect();
         let acceptable = rows.acceptable().len();
         assert!(acceptable < samples.len(), "{acceptable} acceptable rows checked against {} selections", samples.len());
         // Each selection is a truth while the guesses before it stood.
@@ -926,7 +962,12 @@ impl Operation {
                     });
                 }
                 if !front.is_empty() {
-                    if chain.is_none() || tokens.len() > crate::CHAINED_ROWS {
+                    let allowed = match kind {
+                        WorkKind::Decode => chain.is_some(),
+                        WorkKind::Verify => chain.is_none(),
+                        WorkKind::Prefill | WorkKind::Replay => false,
+                    };
+                    if !allowed || tokens.len() > crate::CHAINED_ROWS {
                         return Err(OperationError::FrontRows);
                     }
                     for front in front {

@@ -348,7 +348,17 @@ impl SealedBlockGraph {
         let mut constants = Vec::new();
         let mut banks = Vec::new();
         let mut parks = Vec::new();
-        let bank = layer_bank(stage, handle.bank.as_ref().map(BankGraphEntries::from), &mut banks, &mut parks);
+        let decode_hits_allowed = inputs.bank_splits_decode_hits();
+        let bank = layer_bank(
+            stage,
+            handle.bank.as_ref().map(|bank| {
+                let mut entries = BankGraphEntries::for_backend(bank, device.backend());
+                entries.masked_down_project &= decode_hits_allowed;
+                entries
+            }),
+            &mut banks,
+            &mut parks,
+        );
         let (shape, numbers) = inputs
             .constant_split(slot, &bank, tap.as_ref().map(|(width, tap)| (*width, tap.positions)), forms)
             .map_err(text)?;
@@ -377,9 +387,9 @@ impl SealedBlockGraph {
             &mut constants,
         )
         .map_err(text)?;
-        // A graph sealed once stores what it computes; a run's exports its
-        // carry.
-        if let Stage::Run(_) = stage {
+        // A graph sealed once (or DecodeHits, which writes only crossing ports)
+        // stores what it computes; other runs export their carry.
+        if matches!(stage, Stage::Run(run) if run != RunStage::DecodeHits) {
             graph.export(&parts.output.rows).map_err(|error| error.to_string())?;
             if let Some(pre) = &parts.output.pre {
                 graph.export(pre).map_err(|error| error.to_string())?;
@@ -704,6 +714,25 @@ impl<'a> BlockGraphInputs<'a> {
             },
             _ => BlockCarries::default(),
         };
+        let decode_hits_shared = match &sublayers.feed_forward {
+            Some((_, crate::operators::block::FeedForwardTopology::GeneralRouted(t))) => t.form.shared.is_some(),
+            Some((_, crate::operators::block::FeedForwardTopology::Parallel(t))) => t.routed.form.shared.is_some(),
+            _ => false,
+        };
+        let decode_back_skips_hidden = matches!(stage, Stage::Run(RunStage::DecodeBack))
+            && bank.can_split_decode_hits()
+            && matches!(
+                &sublayers.feed_forward,
+                Some((
+                    None | Some(crate::operators::block::ReadTopology::Norm),
+                    crate::operators::block::FeedForwardTopology::GeneralRouted(t),
+                )) if t.form.shared.is_some()
+            );
+        let input = match stage {
+            Stage::Run(RunStage::DecodeHits) if !decode_hits_shared => None,
+            Stage::Run(RunStage::DecodeBack) if decode_back_skips_hidden => None,
+            _ => stage_input(geometry, block_index, stage)?,
+        };
         Ok((
             BlockShape {
                 stage,
@@ -719,11 +748,30 @@ impl<'a> BlockGraphInputs<'a> {
             BlockNumbers {
                 capacity,
                 tap: tap.map(|(width, _)| width),
-                input: stage_input(geometry, block_index, stage)?,
+                input,
                 split: split.map(|(_, layer)| layer),
                 sublayers: numbers,
             },
         ))
+    }
+
+    /// Whether this block's streamed bank layer is sited and has enough
+    /// expected miss-DMA work to justify 3-stage `DecodeHits` splitting
+    /// (`ExpertBankPlan::splits_decode_hits`). Single-owner gate shared by
+    /// `seal`, `certify`, `probe_axes`, and `classes.rs`.
+    fn bank_splits_decode_hits(&self) -> bool {
+        let Some(bank) = self.load.expert_bank() else {
+            return false;
+        };
+        let Some(layer) = bank.layers().iter().position(|layer| {
+            matches!(
+                layer.scope,
+                magnitude_family_contracts::WeightScope::TargetSublayer(s) if s.block == self.block_index as u32
+            )
+        }) else {
+            return false;
+        };
+        bank.sited(layer) && bank.splits_decode_hits(layer)
     }
 
     /// The block graph's split (`split`) as a graph is built from it at the
@@ -800,7 +848,7 @@ pub(super) fn stage_input(geometry: &Decoder, block_index: usize, stage: Stage) 
         Stage::Run(RunStage::Whole | RunStage::Resident | RunStage::Front | RunStage::DecodeFront) => {
             Some(carry(block_index > 0))
         }
-        Stage::Run(RunStage::Combine | RunStage::DecodeBack) => Some(carry(true)),
+        Stage::Run(RunStage::Combine | RunStage::DecodeHits | RunStage::DecodeBack) => Some(carry(true)),
         Stage::Once(_) => None,
     })
 }
@@ -929,11 +977,11 @@ fn block_graph<'a, G: GraphDraft + 'a>(
     // its merge set's pass, as this graph's ports.
     let split_layer = shape.split.as_ref().zip(numbers.split.as_ref());
     let mut split = SplitPorts::of(graph, stage, split_layer, rows, &numbers.capacity)?;
-    let hidden_ports = hidden.ok_or("a block graph of no input rows")?;
-    let hidden = ResidualCarry {
-        rows: hidden_ports.rows.tensor().clone(),
-        pre: hidden_ports.pre.map(|pre| pre.tensor().clone()),
-    };
+    let hidden_ports = hidden;
+    let hidden = hidden_ports.as_ref().map(|ports| ResidualCarry {
+        rows: ports.rows.tensor().clone(),
+        pre: ports.pre.map(|pre| pre.tensor().clone()),
+    });
     let carries = shape.carries;
     // A carry's operand is of the block's input or output rows alone: none
     // of residual streams, nor of an output a later sublayer or the exit
@@ -950,10 +998,12 @@ fn block_graph<'a, G: GraphDraft + 'a>(
         return Err("a block reads a carried operand of residual streams".into());
     }
     let mut operand_in = None;
-    // A back reads the carry its front's mixer left.
+    // A back (or DecodeHits) reads the carry its front's mixer left, if needed.
     let (mixed, mut state_ports) = match stage {
-        RunStage::Combine | RunStage::DecodeBack => (hidden, BlockState::default()),
+        RunStage::Combine | RunStage::DecodeHits | RunStage::DecodeBack => (hidden, BlockState::default()),
         RunStage::Whole | RunStage::Resident | RunStage::Front | RunStage::DecodeFront => {
+            let hidden_ports = hidden_ports.ok_or("a block graph of no input rows")?;
+            let hidden = hidden.expect("hidden ports imply hidden carry");
             if let Some(taps) = taps.as_mut().filter(|taps| taps.positions.entry) {
                 taps.ports.entry = Some(if streams.is_some() && !shape.first {
                     taps.tap_streams(graph, &hidden.rows, constants)?
@@ -993,7 +1043,7 @@ fn block_graph<'a, G: GraphDraft + 'a>(
                     taps.tap(graph, &mixed.rows)?
                 });
             }
-            (mixed, state_ports)
+            (Some(mixed), state_ports)
         }
     };
     // The output forms the next block's operand under that block's input
@@ -1024,9 +1074,9 @@ fn block_graph<'a, G: GraphDraft + 'a>(
     )?;
     let operand = operand.map(|(_, ports, _)| ports);
     let ports = StagePorts::Run(split.map(SplitBuild::into_ports));
-    // A front ends with its request (or route + land for DecodeFront): its
-    // output is the residual it mixed.
-    if matches!(stage, RunStage::Front | RunStage::DecodeFront) {
+    // A front (or DecodeHits) ends before post-FFN sublayers: its output is
+    // the residual carry it mixed / read.
+    if matches!(stage, RunStage::Front | RunStage::DecodeFront | RunStage::DecodeHits) {
         return Ok(BlockGraphParts {
             residual: None,
             output,
@@ -1126,6 +1176,7 @@ impl CheckedBlockEntries {
         state: &StateResourcePlan,
         backend: BackendName,
         slot: TargetBlockProgramSlot,
+        decode_hits_allowed: bool,
     ) -> Result<Self, GraphError> {
         Ok(Self {
             mixer: block::CheckedMixerEntries::new(slot.mixer(), backend, slot_lists(state, backend, slot))?,
@@ -1133,7 +1184,16 @@ impl CheckedBlockEntries {
                 .feed_forward()
                 .map(|slot| block::CheckedFeedForwardEntries::new(slot, backend))
                 .transpose()?,
-            bank: slot.bank().map(|(feed_forward, bank)| CheckedBankEntries::new(feed_forward, bank, backend)).transpose()?,
+            bank: slot
+                .bank()
+                .map(|(feed_forward, bank)| {
+                    CheckedBankEntries::new(feed_forward, bank, backend)
+                        .map(|mut checked| {
+                            checked.set_masked_down_project(decode_hits_allowed);
+                            checked
+                        })
+                })
+                .transpose()?,
             per_layer: slot.per_layer().map(CheckedPerLayerEntries::new).transpose()?,
             ngram: slot.ngram().map(CheckedNGramEntries::new),
             streams: slot.block_streams().map(CheckedStreamsEntries::new),
@@ -1193,7 +1253,7 @@ fn checked_block_graph<G: ElementBoundDraft + 'static>(
         &mut weights,
         &mut constants,
     )?;
-    if let Stage::Run(_) = shape.stage {
+    if matches!(shape.stage, Stage::Run(run) if run != RunStage::DecodeHits) {
         GraphDraft::export(&mut graph, &parts.output.rows)?;
         if let Some(pre) = &parts.output.pre {
             GraphDraft::export(&mut graph, pre)?;
@@ -1220,7 +1280,7 @@ pub(super) fn probe_block_axes(
     max_segments: u64,
     listed: bool,
 ) -> Result<super::classes::ClassAxes, GraphError> {
-    let entries = CheckedBlockEntries::new(base_inputs.state, backend, slot)?;
+    let entries = CheckedBlockEntries::new(base_inputs.state, backend, slot, base_inputs.bank_splits_decode_hits())?;
     let planned = base_inputs.weights()?;
     let probe = |inputs: &BlockGraphInputs<'_>| -> Result<u64, GraphError> {
         let (mut banks, mut parks) = (Vec::new(), Vec::new());
@@ -1278,7 +1338,7 @@ pub(super) fn certify_block_group<L: Certified>(
     base_inputs: &BlockGraphInputs<'_>,
     classes: &[StagedClass],
 ) -> Result<(L, Vec<(u64, Vec<GraphConstant>)>, HostHeap), GraphError> {
-    let entries = CheckedBlockEntries::new(base_inputs.state, backend, slot)?;
+    let entries = CheckedBlockEntries::new(base_inputs.state, backend, slot, base_inputs.bank_splits_decode_hits())?;
     let planned = base_inputs.weights()?;
     let (layout, aux) = L::certify_group(backend, classes, |draft, staged| {
         let ((rows, segments, slots, listed, scored), stage) = staged;
@@ -1318,12 +1378,318 @@ pub(super) fn checked_block_graph_draft(
     tap: Option<(u64, TapPositions)>,
     inputs: BlockGraphInputs<'_>,
 ) -> Result<(NativeGraphMetadata, Vec<GraphConstant>, HostHeap), GraphError> {
-    let entries = CheckedBlockEntries::new(inputs.state, graph.backend(), slot)?;
+    let entries = CheckedBlockEntries::new(inputs.state, graph.backend(), slot, inputs.bank_splits_decode_hits())?;
     let (mut banks, mut parks) = (Vec::new(), Vec::new());
     let bank = layer_bank(inputs.stage, entries.bank.as_ref().map(CheckedBankEntries::entries::<NativeGraphMetadata>), &mut banks, &mut parks);
     let (shape, numbers) = inputs.constant_split(slot, &bank, tap, |_| Ok(()))?;
     let planned = inputs.weights()?;
     checked_block_graph(graph, &entries, &shape, &numbers, &planned)
+}
+
+#[cfg(test)]
+struct PortAuditDraft {
+    inner: NativeGraphMetadata,
+    declared: std::collections::BTreeSet<u32>,
+}
+
+#[cfg(test)]
+impl PortAuditDraft {
+    fn new(backend: BackendName) -> Self {
+        Self { inner: NativeGraphMetadata::new(backend), declared: std::collections::BTreeSet::new() }
+    }
+}
+
+#[cfg(test)]
+impl GraphDraft for PortAuditDraft {
+    type Plan = NativeGraphStorageBytes;
+    type Binding<'a, E: seismic::EntryContract + 'a> = &'a [(&'a str, Element)];
+    type Ranged<'a, E: seismic::EntryContract + 'a> = &'a [(&'a str, Element)];
+    type Forms = ();
+
+    fn pick<'a, E: seismic::EntryContract + 'a>(ranged: Self::Ranged<'a, E>, _rows: &Dim) -> Self::Binding<'a, E> {
+        ranged
+    }
+    fn first<'a, E: seismic::EntryContract + 'a>(ranged: Self::Ranged<'a, E>) -> Self::Binding<'a, E> {
+        ranged
+    }
+    fn port<D: Clone>(&mut self, element: Element, extents: &[D]) -> Result<NativePort, GraphError>
+    where
+        Dim: From<D>,
+    {
+        let port = GraphDraft::port(&mut self.inner, element, extents)?;
+        self.declared.insert(port.ordinal());
+        Ok(port)
+    }
+    fn local_for<'a, E: seismic::EntryContract + 'a>(
+        &mut self,
+        entry: Self::Binding<'a, E>,
+        parameter: &str,
+        dimensions: &[(&str, impl Clone + Into<Dim>)],
+    ) -> Result<NativePort, GraphError> {
+        GraphDraft::local_for::<E>(&mut self.inner, entry, parameter, dimensions)
+    }
+    fn input_for<'a, E: seismic::EntryContract + 'a>(
+        &mut self,
+        entry: Self::Binding<'a, E>,
+        parameter: &str,
+        dimensions: &[(&str, impl Clone + Into<Dim>)],
+    ) -> Result<NativePort, GraphError> {
+        let port = GraphDraft::input_for::<E>(&mut self.inner, entry, parameter, dimensions)?;
+        self.declared.insert(port.ordinal());
+        Ok(port)
+    }
+    fn port_for<'a, E: seismic::EntryContract + 'a>(
+        &mut self,
+        entry: Self::Binding<'a, E>,
+        parameter: &str,
+        dimensions: &[(&str, impl Clone + Into<Dim>)],
+    ) -> Result<NativePort, GraphError> {
+        let port = GraphDraft::port_for::<E>(&mut self.inner, entry, parameter, dimensions)?;
+        self.declared.insert(port.ordinal());
+        Ok(port)
+    }
+    fn enqueue<'a, E: seismic::EntryContract + 'a>(
+        &mut self,
+        entry: Self::Binding<'a, E>,
+        dimensions: &[(&str, impl Clone + Into<Dim>)],
+        args: E::WorkflowArgs<'_>,
+    ) -> Result<E::WorkflowResults, GraphError> {
+        GraphDraft::enqueue::<E>(&mut self.inner, entry, dimensions, args)
+    }
+    fn enqueue_under<'a, E: seismic::EntryContract + 'a>(
+        &mut self,
+        entry: Self::Binding<'a, E>,
+        dimensions: &[(&str, impl Clone + Into<Dim>)],
+        args: E::WorkflowArgs<'_>,
+        port: &NativePort,
+        index: u64,
+        encoded: seismic::LaunchEncoding,
+    ) -> Result<E::WorkflowResults, GraphError> {
+        GraphDraft::enqueue_under::<E>(&mut self.inner, entry, dimensions, args, port, index, encoded)
+    }
+    fn export(&mut self, result: &WorkflowTensor) -> Result<(), GraphError> {
+        GraphDraft::export(&mut self.inner, result)
+    }
+    fn share(&mut self, other: &WorkflowTensor, primary: &WorkflowTensor) -> Result<(), GraphError> {
+        GraphDraft::share(&mut self.inner, other, primary)
+    }
+    fn store(&mut self, result: &WorkflowTensor, port: &NativePort) -> Result<(), GraphError> {
+        GraphDraft::store(&mut self.inner, result, port)
+    }
+    fn operand_carry(&mut self, rows: u64, width: &Dim, activation: Element) -> Result<OperandCarry, GraphError> {
+        let carry = GraphDraft::operand_carry(&mut self.inner, rows, width, activation)?;
+        self.declared.insert(carry.rows.ordinal());
+        self.declared.insert(carry.quantized.ordinal());
+        Ok(carry)
+    }
+    fn carry_out(&mut self, result: &WorkflowTensor, carry: &OperandCarry, (): ()) -> Result<(), GraphError> {
+        GraphDraft::carry_out(&mut self.inner, result, carry, ())
+    }
+    fn carry_in(
+        &mut self,
+        hidden: &NativePort,
+        carry: &OperandCarry,
+        (): (),
+        norm: &NativePort,
+        epsilon: f32,
+    ) -> Result<(), GraphError> {
+        GraphDraft::carry_in(&mut self.inner, hidden, carry, (), norm, epsilon)
+    }
+    fn timeline<N: seismic::timeline::TimelineNodeKind>(&mut self, node: N) -> NativeTimelinePort<N::Role> {
+        GraphDraft::timeline(&mut self.inner, node)
+    }
+    fn span_mark(&mut self) -> usize {
+        GraphDraft::span_mark(&mut self.inner)
+    }
+    fn seal(self) -> Result<Self::Plan, GraphError> {
+        GraphDraft::seal(self.inner)
+    }
+}
+
+#[cfg(test)]
+impl ElementBoundDraft for PortAuditDraft {
+    fn bind<'a, E: seismic::EntryContract + 'a>(elements: &'a [(&'a str, Element)]) -> Self::Binding<'a, E> {
+        elements
+    }
+    fn bind_ranged<'a, E: seismic::EntryContract + 'a>(elements: &'a [(&'a str, Element)]) -> Self::Ranged<'a, E> {
+        elements
+    }
+}
+
+/// Build the block graph for `inputs` and verify that EVERY external/input port
+/// declared on the graph is retained in the runtime binding tables.
+#[cfg(test)]
+pub(super) fn checked_block_graph_audit_ports(
+    backend: BackendName,
+    slot: TargetBlockProgramSlot,
+    tap: Option<(u64, TapPositions)>,
+    inputs: BlockGraphInputs<'_>,
+) -> Result<NativeGraphMetadata, String> {
+    let entries = CheckedBlockEntries::new(inputs.state, backend, slot, inputs.bank_splits_decode_hits()).map_err(|e| e.to_string())?;
+    let mut graph = PortAuditDraft::new(backend);
+    let (mut weights, mut constants, mut banks, mut parks) = (Vec::new(), Vec::new(), Vec::new(), Vec::new());
+    let bank = layer_bank(
+        inputs.stage,
+        entries.bank.as_ref().map(CheckedBankEntries::entries::<PortAuditDraft>),
+        &mut banks,
+        &mut parks,
+    );
+    let (shape, numbers) = inputs.constant_split(slot, &bank, tap, |_| Ok(())).map_err(|e| e.to_string())?;
+    let planned = inputs.weights().map_err(|e| e.to_string())?;
+    let rows = &numbers.sublayers.rows;
+    let hidden = numbers
+        .input
+        .clone()
+        .map(|carry| carry.try_map(|width| GraphDraft::port(&mut graph, Element::f32(), &[rows, &width])))
+        .transpose()
+        .map_err(|e| e.to_string())?;
+    let tap_elements = [("A", shape.activation)];
+    let parts = block_graph(
+        &mut graph,
+        BlockEntries {
+            tap: shape.tap.map(|positions| TapEntry {
+                entry: &tap_elements[..],
+                collapse: numbers
+                    .sublayers
+                    .streams
+                    .as_ref()
+                    .map(|streams| (streams.streams, &[][..])),
+                positions,
+            }),
+            mixer: entries.mixer.entries().map_err(|e| e.to_string())?,
+            feed_forward: FeedForwardGraph {
+                entries: entries.feed_forward.as_ref().map(block::CheckedFeedForwardEntries::entries::<PortAuditDraft>),
+                bank,
+            },
+            per_layer: entries.per_layer.as_ref().map(CheckedPerLayerEntries::entries::<PortAuditDraft>),
+            ngram: entries.ngram.as_ref().map(CheckedNGramEntries::entries::<PortAuditDraft>),
+            streams: entries.streams.as_ref().map(CheckedStreamsEntries::entries::<PortAuditDraft>),
+        },
+        hidden.as_ref().map(ResidualCarry::as_ref),
+        &shape,
+        &numbers,
+        &planned,
+        &mut weights,
+        &mut constants,
+    )
+    .map_err(|e| e.to_string())?;
+    let mut bound = std::collections::BTreeSet::new();
+    if let Some(h) = &hidden {
+        bound.insert(h.rows.ordinal());
+        if let Some(pre) = &h.pre {
+            bound.insert(pre.ordinal());
+        }
+    }
+    for (_, port) in &weights {
+        bound.insert(port.ordinal());
+    }
+    for (_, port) in &banks {
+        bound.insert(port.ordinal());
+    }
+    for constant in &constants {
+        bound.insert(constant.port().ordinal());
+    }
+    match &parts.ports {
+        StagePorts::Run(Some(SplitPorts::Front(c))) => {
+            for p in c.iter() {
+                bound.insert(p.ordinal());
+            }
+        }
+        StagePorts::Run(Some(SplitPorts::Back(b))) => {
+            for p in b.crossing.iter() {
+                bound.insert(p.ordinal());
+            }
+            bound.insert(b.experts.ordinal());
+            bound.insert(b.inverse.ordinal());
+        }
+        StagePorts::Run(Some(
+            SplitPorts::DecodeFront(p) | SplitPorts::DecodeHits(p) | SplitPorts::DecodeBack(p),
+        )) => {
+            for opt in [
+                &p.routes,
+                &p.weights,
+                &p.normalized,
+                &p.coefficient,
+                &p.shared_product,
+                &p.base,
+                &p.published,
+                &p.join,
+                &p.pre,
+                &p.sources,
+            ] {
+                if let Some(port) = opt {
+                    bound.insert(port.ordinal());
+                }
+            }
+        }
+        StagePorts::Run(None) => {}
+        StagePorts::Pass(p, _) => {
+            for port in p.crossing.iter() {
+                bound.insert(port.ordinal());
+            }
+            bound.insert(p.experts.ordinal());
+            bound.insert(p.inverse.ordinal());
+            bound.insert(p.rows.ordinal());
+            bound.insert(p.first.ordinal());
+        }
+    }
+    if let Some(history) = &parts.state.history {
+        for p in &history.planes {
+            bound.insert(p.ordinal());
+        }
+        bound.insert(history.coordinates.ordinal());
+        bound.insert(history.destinations.ordinal());
+        bound.insert(history.read.visible.ordinal());
+        bound.insert(history.read.fresh.ordinal());
+        if let Some(idx) = &history.indexer {
+            bound.insert(idx.planes.window_keys.ordinal());
+            bound.insert(idx.planes.window_coordinates.ordinal());
+            bound.insert(idx.planes.block_keys.ordinal());
+            bound.insert(idx.tables.window_visible.ordinal());
+        }
+        if let Some(p) = &history.picked {
+            bound.insert(p.picks.ordinal());
+            bound.insert(p.plane.ordinal());
+        }
+    }
+    if let Some(bank_state) = &parts.state.bank {
+        for p in &bank_state.components {
+            bound.insert(p.ordinal());
+        }
+        bound.insert(bank_state.controls.segments.ordinal());
+        bound.insert(bank_state.controls.stop.ordinal());
+        bound.insert(bank_state.controls.previous_bank.ordinal());
+        bound.insert(bank_state.controls.previous_tape.ordinal());
+        bound.insert(bank_state.controls.following_bank.ordinal());
+    }
+    if let Some(taps) = &parts.taps {
+        for opt in [&taps.entry, &taps.middle, &taps.output] {
+            if let Some(p) = opt {
+                bound.insert(p.ordinal());
+            }
+        }
+    }
+    if let Some(p) = &parts.per_layer {
+        bound.insert(p.ordinal());
+    }
+    if let Some(ngram) = &parts.ngram {
+        bound.insert(ngram.tokens.ordinal());
+    }
+    if let Some(step) = &parts.step_inputs {
+        bound.insert(step.sequence.ordinal());
+        if let Some(g) = &step.guesses {
+            bound.insert(g.ordinal());
+        }
+    }
+    for carry in [&parts.operand, &parts.operand_in].into_iter().flatten() {
+        bound.insert(carry.carry.rows.ordinal());
+        bound.insert(carry.carry.quantized.ordinal());
+    }
+    let unbound: Vec<u32> = graph.declared.difference(&bound).copied().collect();
+    if !unbound.is_empty() {
+        return Err(format!("declared ports never bound at runtime: {unbound:?}"));
+    }
+    Ok(graph.inner)
 }
 
 #[cfg(test)]

@@ -277,10 +277,7 @@ impl GraphWeights<u64> {
             WeightScope::Target => exit,
             _ => false,
         };
-        // Its streamed layers, and the layers their hint leads predict,
-        // whose hinted weights and policy they bind.
         let mut banks = Vec::new();
-        let mut leads = Vec::new();
         if let Some(bank) = load.expert_bank() {
             for index in 0..bank.layers().len() {
                 let scope = bank.layers()[index].scope;
@@ -292,15 +289,6 @@ impl GraphWeights<u64> {
                         .into_iter()
                         .map(|(part, element, extents)| BankPartView { scope, part, element, extents }),
                 );
-                for lead in 0..crate::planning::HINT_LEADS as usize {
-                    let next = bank.layers()[bank.lead_layer(index, lead)].scope;
-                    if !leads.contains(&next) {
-                        leads.push(next);
-                        if !own(next) {
-                            banks.push(bank_part_view(bank, next, BankPart::Policy)?);
-                        }
-                    }
-                }
             }
         }
         let carried = |role: WeightRole| {
@@ -308,7 +296,7 @@ impl GraphWeights<u64> {
                 && role.kind == WeightKind::InputNorm
                 && role.scope == WeightScope::TargetSublayer(SublayerIndex { block: block + 1, sublayer: 0 })
         };
-        Ok(Self { banks, ..Self::of(load, |role| own(role.scope) || leads.contains(&role.scope) || carried(role)) })
+        Ok(Self { banks, ..Self::of(load, |role| own(role.scope) || carried(role)) })
     }
 }
 

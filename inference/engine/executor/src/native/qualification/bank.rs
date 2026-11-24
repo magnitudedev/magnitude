@@ -18,17 +18,17 @@ use super::target::{ExpertReads, qualify_general_routed, qualify_routed};
 use super::*;
 use crate::experts::{PooledRecords, pooled_records};
 use crate::planning::{
-    BankBinding, BankedFeedForward, HINT_LEADS, RecordTensor, RecordTensors,
+    BankBinding, BankedFeedForward, RecordTensor, RecordTensors,
 };
 use magnitude_kernels::constants::{
     FILE_CHOICE, FILE_COUNT, FILE_RECORD, LANDING_DONE, LANDING_FROM, LANDING_HEAD, LANDING_TO, LIST_COUNT,
-    LIST_FROM, LIST_SEQUENCE, LIST_TO, MAP_FROM, MAP_RECORD, MAP_UNTIL, MAP_WORDS, POLICY_HOME, POLICY_PRICED,
-    POLICY_RESOLVED, POLICY_WHOLE, POLICY_WORDS, RING_COUNT, RING_SEQUENCE, ROUND_LANE, SCRATCH_ASK, SCRATCH_STAGED,
+    LIST_FROM, LIST_SEQUENCE, LIST_TO, MAP_FROM, MAP_RECORD, MAP_UNTIL, MAP_WORDS, POLICY_HOME, POLICY_LINK_NS,
+    POLICY_PRICED, POLICY_WHOLE, POLICY_WORDS, RING_COUNT, RING_SEQUENCE, ROUND_LANE, SCRATCH_ASK, SCRATCH_STAGED,
     SLOT_ANSWER, SLOT_REQUEST, SOURCE_RECORD, SOURCE_ROWS, SOURCE_SITE, STEP_HIGH, STEP_LOW, STEP_GUESSES, STEP_WORDS, GUESS_CHAINED, GUESS_HEAD,
 };
 use magnitude_kernels::{
     constants, routed_copy, routed_gate_up, routed_gate_up_part,
-    routed_hint_route, routed_hint_select, routed_land, routed_list_grid, routed_pass_map, routed_round,
+    routed_land, routed_list_grid, routed_pass_map, routed_round,
     routed_route_streamed, routed_scratch_grids, routed_scratch_request, routed_seed_commit,
     routed_select_streamed, routed_step, step_words,
 };
@@ -571,19 +571,17 @@ fn qualify_gate_up(
 }
 
 /// A streamed layer's routed form: its binding, its resident entries and its
-/// bank's decode route and ahead-of-step hint launches.
+/// bank's decode route.
 pub(super) enum Served<'a> {
     Fused {
         binding: RoutedBinding,
         kernels: &'a RoutedKernels,
         route: &'a RangedKernels<routed_route_streamed::Entry>,
-        hints: &'a [Option<NativeKernel<routed_hint_route::Entry>>; HINT_LEADS as usize],
     },
     General {
         binding: crate::GeneralRoutedBinding,
         kernels: &'a GeneralRoutedKernels,
         select: &'a NativeKernel<routed_select_streamed::Entry>,
-        hints: &'a [Option<NativeKernel<routed_hint_select::Entry>>; HINT_LEADS as usize],
     },
 }
 
@@ -597,24 +595,23 @@ impl<'a> Served<'a> {
         match (banked, route, feed_forward) {
             (
                 BankedFeedForward::Routed(binding),
-                BankRouteKernels::Fused { route, hints, .. },
+                BankRouteKernels::Fused { route, .. },
                 AttestedFeedForward::Routed(kernels),
-            ) => Ok(Self::Fused { binding, kernels, route, hints }),
+            ) => Ok(Self::Fused { binding, kernels, route }),
             (
                 BankedFeedForward::GeneralRouted(binding),
-                BankRouteKernels::General { select, hints, .. },
+                BankRouteKernels::General { select, .. },
                 AttestedFeedForward::GeneralRouted(kernels),
-            ) => Ok(Self::General { binding, kernels, select, hints }),
+            ) => Ok(Self::General { binding, kernels, select }),
             // A parallel block's routed branch is general.
             (
                 BankedFeedForward::Parallel(parallel),
-                BankRouteKernels::General { select, hints, .. },
+                BankRouteKernels::General { select, .. },
                 AttestedFeedForward::Parallel(kernels),
             ) => Ok(Self::General {
                 binding: parallel.routed,
                 kernels: &kernels.routed,
                 select,
-                hints,
             }),
             _ => Err(qualification_dynamic(
                 "routed_bank",
@@ -640,7 +637,7 @@ impl<'a> Served<'a> {
         };
         let words = |extents: &[u64], set: &[(u64, i32)], entry| shared_words(charges, extents, set, entry, label);
         let zeros = |element, extents: &[u64], entry| semantic_zeros(charges, element, extents, entry, label);
-        let (experts, next, selected) = (binding.experts, binding.next_experts, binding.selected);
+        let (experts, selected) = (binding.experts, binding.selected);
         let (ring, flight) = (binding.words.ring_words(), binding.words.flight);
         let choices = word(selected, entry, label)?;
         let routing_words = binding.words.routing_words();
@@ -658,7 +655,11 @@ impl<'a> Served<'a> {
         for whole in [0, 1] {
             let map = words(&[experts, MAP_WORDS], &unmapped(experts), entry)?;
             let tier = words(&[tier_experts], &(0..tier_experts).map(|expert| (expert, -1)).collect::<Vec<_>>(), entry)?;
-            let policy = words(&[POLICY_WORDS], &[(POLICY_WHOLE, whole), (POLICY_HOME, whole * WHOLE_HOME), (POLICY_PRICED, 1)], entry)?;
+            let policy = words(
+                &[POLICY_WORDS],
+                &[(POLICY_WHOLE, whole), (POLICY_HOME, whole * WHOLE_HOME), (POLICY_PRICED, 1), (POLICY_LINK_NS, 1)],
+                entry,
+            )?;
             let mut file = words(&binding.words.file().extents(), &[], entry)?;
             let mut sources = zeros(Element::i32(), &[SOURCE_ROWS, 1, selected], entry)?;
             let mut routing = words(&[flight, routing_words], &[], entry)?;
@@ -760,78 +761,6 @@ impl<'a> Served<'a> {
                     })
                     .collect::<Vec<_>>();
                 require_words(&sources, &sourced, entry, label)?;
-            }
-        }
-        match *self {
-            Self::Fused { binding: b, hints, .. } => {
-                let hint_entry = "routed_hint_route";
-                let h = b.hidden;
-                let norm = rows.norm(charges, b.norm, h, hint_entry, label)?;
-                let activation = zeros(b.activation, &[0, b.selected], hint_entry)?;
-                for (index, kernel) in hints.iter().enumerate() {
-                    let Some(kernel) = kernel.as_ref() else { continue };
-                    let ahead = index as u64 + 1;
-                    for next_resolved in [0, 1] {
-                        let next_policy = words(&[POLICY_WORDS], &[(POLICY_WHOLE, next_resolved)], hint_entry)?;
-                        let mut rings = words(&[ahead, ring], &[], hint_entry)?;
-                        kernel
-                            .call(charges, routed_hint_route::Args {
-                                residual: &rows.input(charges, 1, h, hint_entry, label)?,
-                                activation: &activation,
-                                next_norm: &norm,
-                                next_router: &zeros(b.router, &[next, h], hint_entry)?,
-                                after_norm: &norm,
-                                after_router: &zeros(b.router, &[next, h], hint_entry)?,
-                                eps: 1.0e-5,
-                                step,
-                                next_policy: &next_policy,
-                                rings: &mut rings,
-                            })
-                            .map_err(|error| qualification_dynamic(hint_entry, label, error))?;
-                        if next_resolved == 0 {
-                            for lead in 0..ahead {
-                                require_words(&rings, &[(lead * ring + RING_SEQUENCE, SEQUENCE)], hint_entry, label)?;
-                            }
-                        }
-                    }
-                }
-            }
-            Self::General { binding: b, hints, .. } => {
-                let hint_entry = "routed_hint_select";
-                let shape = b.shape;
-                let h = shape.hidden;
-                let router_norm = zeros(b.router_norm, &[h], hint_entry)?;
-                let activation = zeros(b.activation, &[0, shape.selected], hint_entry)?;
-                for (index, kernel) in hints.iter().enumerate() {
-                    let Some(kernel) = kernel.as_ref() else { continue };
-                    let ahead = index as u64 + 1;
-                    for next_resolved in [0, 1] {
-                        let next_policy = words(&[POLICY_WORDS], &[(POLICY_WHOLE, next_resolved)], hint_entry)?;
-                        let mut rings = words(&[ahead, ring], &[], hint_entry)?;
-                        kernel
-                            .call(charges, routed_hint_select::Args {
-                                residual: &semantic_ones(charges, Element::f32(), &[1, h], hint_entry, label)?,
-                                activation: &activation,
-                                next_router_norm: &router_norm,
-                                next_router: &zeros(b.router, &[next, h], hint_entry)?,
-                                next_bias: &zeros(Element::f32(), &[next], hint_entry)?,
-                                after_router_norm: &router_norm,
-                                after_router: &zeros(b.router, &[next, h], hint_entry)?,
-                                after_bias: &zeros(Element::f32(), &[next], hint_entry)?,
-                                score: shape.score,
-                                epsilon: 1.0e-5,
-                                step,
-                                next_policy: &next_policy,
-                                rings: &mut rings,
-                            })
-                            .map_err(|error| qualification_dynamic(hint_entry, label, error))?;
-                        if next_resolved == 0 {
-                            for lead in 0..ahead {
-                                require_words(&rings, &[(lead * ring + RING_SEQUENCE, SEQUENCE)], hint_entry, label)?;
-                            }
-                        }
-                    }
-                }
             }
         }
         Ok(())
@@ -1103,7 +1032,6 @@ mod tests {
             },
             records: 4,
             experts: EXPERTS,
-            next_experts: EXPERTS,
             selected: SELECTED,
             staging: 2,
             round_records: 2,
@@ -1124,13 +1052,6 @@ mod tests {
 
     fn route_statics<'v>(bank: BankBinding, resident: &[(&'v str, u64)]) -> Vec<(&'v str, u64)> {
         crate::native::tuning::routed::bank_statics(bank)
-            .into_iter()
-            .chain(resident.iter().copied())
-            .collect()
-    }
-
-    fn hint_statics<'v>(bank: BankBinding, ahead: u64, resident: &[(&'v str, u64)]) -> Vec<(&'v str, u64)> {
-        [("AHEAD", ahead), ("EN", bank.next_experts)]
             .into_iter()
             .chain(resident.iter().copied())
             .collect()
@@ -1310,11 +1231,7 @@ mod tests {
                     A: bf16,
                 }), &route_statics(bank, &statics)),
         );
-        let hints = std::array::from_fn(|index| {
-            let ahead = index as u64 + 1;
-            Some(prepare(&device, routed_hint_route::native_entry_with(routed_hint_route::Elements { NW: bf16, RW: bf16, A: bf16 }), &hint_statics(bank, ahead, &statics)))
-        });
-        let kernels = bank_kernels(&device, bank, BankRouteKernels::Fused { activation: bf16, route, hints });
+        let kernels = bank_kernels(&device, bank, BankRouteKernels::Fused { activation: bf16, route });
         qualify_bank(
             &seismic::Charges::tally(&device),
             BankedFeedForward::Routed(binding),
@@ -1424,11 +1341,7 @@ mod tests {
                 RW: bf16,
                 A: bf16,
             }), &route_statics(bank, &statics));
-        let hints = std::array::from_fn(|index| {
-            let ahead = index as u64 + 1;
-            Some(prepare(&device, routed_hint_select::native_entry_with(routed_hint_select::Elements { RNW: bf16, RW: bf16, A: bf16 }), &hint_statics(bank, ahead, &statics)))
-        });
-        let mut kernels = bank_kernels(&device, bank, BankRouteKernels::General { activation: bf16, select, hints });
+        let mut kernels = bank_kernels(&device, bank, BankRouteKernels::General { activation: bf16, select });
         if sited {
             let form = SiteForm {
                 activation: bf16,

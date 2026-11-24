@@ -33,7 +33,7 @@
 
 use crate::native::{BankRouteKernels, ExpertBankKernels};
 use crate::planning::{
-    BankBinding, BankPart, BankedFeedForward, ExpertBankPlan, HINT_LEADS, RecordTensors, RoutedTensor,
+    BankBinding, BankPart, BankedFeedForward, ExpertBankPlan, RecordTensors, RoutedTensor,
 };
 use crate::programs::graph::{GraphError, draft::GraphDraft};
 use crate::programs::graph::facts::Numbers;
@@ -65,14 +65,14 @@ impl<'p> GateRecords<'p> {
 }
 use crate::experts::ParkKind;
 use crate::programs::native_target_graph::{
-    BankPort, GraphPark, GraphTimeline, WeightPart, WeightPort, bank_port, relative_scope_of, weight, weight_port,
+    BankPort, GraphPark, GraphTimeline, WeightPart, WeightPort, bank_port, weight_port,
 };
 use crate::ModelLoadPlan;
 use crate::programs::native_target_graph::PlannedWeights;
 use magnitude_family_contracts::{WeightRole, WeightScope};
 use magnitude_kernels::{
     routed_copy, routed_down_project, routed_down_sited, routed_gate_up, routed_gate_up_part,
-    routed_hint_route, routed_hint_select, routed_land, routed_list_grid, routed_output_project,
+    routed_land, routed_list_grid, routed_output_project,
     routed_output_sited, routed_output_streamed, routed_pass_map, routed_round, routed_route_streamed,
     routed_scratch_grids, routed_scratch_request, routed_seed_commit, routed_select_streamed,
     routed_site_request, routed_step,
@@ -82,19 +82,16 @@ use seismic::{
     WorkflowTensorRef, WorkflowTensorView,
 };
 
-/// A streamed layer's decode route and resolve by its routed form, plus its
-/// ahead-of-step hint launches by `AHEAD` (`1..=HINT_LEADS`)
+/// A streamed layer's decode route and resolve by its routed form
 /// (`native::BankRouteKernels`).
 pub(crate) enum BankRoute<'a, G: GraphDraft + 'a> {
     Fused {
         activation: Element,
         route: G::Ranged<'a, routed_route_streamed::Entry>,
-        hints: [Option<G::Binding<'a, routed_hint_route::Entry>>; HINT_LEADS as usize],
     },
     General {
         activation: Element,
         select: G::Binding<'a, routed_select_streamed::Entry>,
-        hints: [Option<G::Binding<'a, routed_hint_select::Entry>>; HINT_LEADS as usize],
     },
 }
 
@@ -123,6 +120,10 @@ pub(crate) struct BankGraphEntries<'a, G: GraphDraft + 'a> {
     /// wait and the wait's after it (`native::ExpertBankKernels::gate_up`);
     /// none of up-only experts.
     pub gate_up: Option<G::Ranged<'a, routed_gate_up_part::Entry>>,
+    /// Whether the target backend's `routed_down_project` kernel supports
+    /// masked-write skip semantics (`mode == 1` hit-only / `mode == 2` skip
+    /// `code == -1` without overwriting `published`).
+    pub masked_down_project: bool,
 }
 
 /// A streamed layer's CPU site entries (`native::BankSite`): its request
@@ -184,19 +185,57 @@ impl<'a, G: GraphDraft + 'a> Clone for BankGraphEntries<'a, G> {
     }
 }
 
-impl<'a> From<&'a ExpertBankKernels> for BankGraphEntries<'a, NativeGraph> {
-    fn from(kernels: &'a ExpertBankKernels) -> Self {
+/// Whether `backend`'s `routed_down_project` kernel implements masked-write
+/// skip semantics (`mode == 1` hit-only / `mode == 2` skip `code == -1`
+/// without overwriting `published`). Only CUDA implements skip semantics
+/// (`cuda/lib/routed/down.cuh`); Metal (`routed_down_project.metal:23`) and
+/// Vulkan (`routed_down_project.comp:11`) unconditionally overwrite every
+/// `(m, k)` cell and must NEVER seal or execute `RunStage::DecodeHits`.
+pub(crate) fn routed_down_project_supports_masked_write(backend: seismic::BackendName) -> bool {
+    matches!(backend, seismic::BackendName::Cuda)
+}
+
+/// Whether a streamed routed layer of `routed` on `backend` (when `tier > 0`
+/// and sited) supports `RunStage::DecodeHits` splitting (`routed_gate_up_part`
+/// + general sited combine with masked-write `routed_down_project`). The single
+/// capability rule shared by `classes.rs`, `certify.rs`, and graph construction.
+pub(crate) fn decode_hits_supported(
+    routed: &magnitude_family_contracts::RoutedFfn,
+    backend: seismic::BackendName,
+) -> bool {
+    routed_down_project_supports_masked_write(backend)
+        && !super::is_fused(routed)
+        && matches!(routed.expert_up, magnitude_family_contracts::FeedForwardUp::Gated { .. })
+        && <routed_down_project::Entry as seismic::EntryContract>::contract_node_shape(backend).is_ok()
+        && <routed_down_sited::Entry as seismic::EntryContract>::contract_node_shape(backend).is_ok()
+        && <routed_site_request::Entry as seismic::EntryContract>::contract_node_shape(backend).is_ok()
+}
+
+impl<'a, G: GraphDraft + 'a> BankGraphEntries<'a, G> {
+    /// Whether this layer's entries and backend support `RunStage::DecodeHits`
+    /// splitting (`masked_down_project` + `routed_gate_up_part` +
+    /// `BankCombineEntry::General { project, sited }`).
+    pub(crate) fn can_split_decode_hits(&self) -> bool {
+        self.masked_down_project
+            && self.gate_up.is_some()
+            && matches!(
+                self.site.map(|site| site.combine),
+                Some(BankCombineEntry::General { .. })
+            )
+    }
+}
+
+impl<'a> BankGraphEntries<'a, NativeGraph> {
+    pub(crate) fn for_backend(kernels: &'a ExpertBankKernels, backend: seismic::BackendName) -> Self {
         Self {
             route: match &kernels.route {
-                BankRouteKernels::Fused { activation, route, hints } => BankRoute::Fused {
+                BankRouteKernels::Fused { activation, route } => BankRoute::Fused {
                     activation: *activation,
                     route,
-                    hints: hints.each_ref().map(Option::as_ref),
                 },
-                BankRouteKernels::General { activation, select, hints } => BankRoute::General {
+                BankRouteKernels::General { activation, select } => BankRoute::General {
                     activation: *activation,
                     select,
-                    hints: hints.each_ref().map(Option::as_ref),
                 },
             },
             land: &kernels.land,
@@ -219,6 +258,7 @@ impl<'a> From<&'a ExpertBankKernels> for BankGraphEntries<'a, NativeGraph> {
                 },
             }),
             gate_up: kernels.gate_up.as_ref(),
+            masked_down_project: routed_down_project_supports_masked_write(backend),
         }
     }
 }
@@ -228,11 +268,9 @@ impl<'a> From<&'a ExpertBankKernels> for BankGraphEntries<'a, NativeGraph> {
 enum CheckedRoute {
     Fused {
         route: [(&'static str, Element); 6],
-        hints: [(&'static str, Element); 3],
     },
     General {
         select: [(&'static str, Element); 4],
-        hints: [(&'static str, Element); 3],
     },
 }
 
@@ -254,6 +292,9 @@ pub(crate) struct CheckedBankEntries {
     site: Option<CheckedSite>,
     /// The gate/up passes', of gated experts.
     gate_up: Option<[(&'static str, Element); 3]>,
+    /// Whether the target backend's `routed_down_project` supports masked-write
+    /// skip semantics (`routed_down_project_supports_masked_write`).
+    masked_down_project: bool,
 }
 
 /// A CPU site's element assignments: its request's, and its combine's by
@@ -312,11 +353,6 @@ impl CheckedBankEntries {
                 ("RW", binding.router),
                 ("A", binding.activation),
             ],
-            hints: [
-                ("RNW", binding.router_norm),
-                ("RW", binding.router),
-                ("A", binding.activation),
-            ],
         };
         let gate_up = match slot {
             BankedFeedForward::Routed(binding) => {
@@ -337,11 +373,6 @@ impl CheckedBankEntries {
                     ("SRW", Element::f32()),
                     ("SGW", binding.shared_gate),
                     ("SUW", binding.shared_up),
-                    ("A", binding.activation),
-                ],
-                hints: [
-                    ("NW", binding.norm),
-                    ("RW", binding.router),
                     ("A", binding.activation),
                 ],
             },
@@ -382,7 +413,12 @@ impl CheckedBankEntries {
             seed: bank.record.map(|_, tensor| [("U", tensor.resident)]),
             site,
             gate_up,
+            masked_down_project: routed_down_project_supports_masked_write(backend),
         })
+    }
+
+    pub(crate) fn set_masked_down_project(&mut self, allowed: bool) {
+        self.masked_down_project &= allowed;
     }
 
     pub(crate) fn entries<G: crate::programs::graph::draft::ElementBoundDraft>(
@@ -390,15 +426,13 @@ impl CheckedBankEntries {
     ) -> BankGraphEntries<'_, G> {
         BankGraphEntries {
             route: match &self.route {
-                CheckedRoute::Fused { route, hints } => BankRoute::Fused {
-                    activation: hints[2].1,
+                CheckedRoute::Fused { route } => BankRoute::Fused {
+                    activation: route[5].1,
                     route: G::bind_ranged(&route[..]),
-                    hints: [Some(G::bind(&hints[..])); HINT_LEADS as usize],
                 },
-                CheckedRoute::General { select, hints } => BankRoute::General {
-                    activation: hints[2].1,
+                CheckedRoute::General { select } => BankRoute::General {
+                    activation: select[3].1,
                     select: G::bind(&select[..]),
-                    hints: [Some(G::bind(&hints[..])); HINT_LEADS as usize],
                 },
             },
             land: G::bind(&self.land),
@@ -429,6 +463,7 @@ impl CheckedBankEntries {
                 },
             }),
             gate_up: self.gate_up.as_ref().map(|gate_up| G::bind_ranged(&gate_up[..])),
+            masked_down_project: self.masked_down_project,
         }
     }
 }
@@ -469,6 +504,11 @@ impl<'a, G: GraphDraft + 'a> LayerBank<'_, 'a, G> {
     /// Whether the layer's experts are its bank's.
     pub(crate) fn banked(&self) -> bool {
         !matches!(self, Self::Held)
+    }
+
+    /// Whether this layer supports `RunStage::DecodeHits` splitting.
+    pub(crate) fn can_split_decode_hits(&self) -> bool {
+        matches!(self, Self::Streamed(bank) if bank.entries.can_split_decode_hits())
     }
 }
 
@@ -552,10 +592,6 @@ pub(crate) struct BankTopology {
     /// step its guesses port ([`StreamedLayer::step`]), as it gives a group
     /// the kept guesses a host-token step binds there.
     pub fronts: bool,
-    pub ahead: u64,
-    pub leads: Vec<HintLead>,
-    /// The layer whose policy words its hints bind, relative to its block.
-    pub next_policy: Option<WeightScope>,
     pub placer: crate::planning::Placer,
     /// Whether prefill copies host-tier experts into scratch via producer-
     /// enqueued hardware DMA (`ExpertBankPlan::tier_copy_dma`) rather than SM
@@ -565,20 +601,9 @@ pub(crate) struct BankTopology {
     pub stored: RecordTensors<Element>,
 }
 
-/// What a hint lead binds (`StreamedLayer::hints`): the layer's own hinted
-/// weights, an earlier lead's, or the weights of the predicted layer of
-/// `scope` it has (each hinted port's kind where that layer has the weight),
-/// named relative to the layer's block (`relative_scope_of`).
-#[derive(Clone, Debug, PartialEq, Eq, Hash)]
-pub(crate) enum HintLead {
-    Own,
-    Earlier(usize),
-    Layer { scope: WeightScope, kinds: Vec<Option<magnitude_family_contracts::WeightKind>> },
-}
-
 /// Every number a streamed layer's graph is built of
 /// (`ExpertBankPlan::binding` and the bank's layout), in the bank plan's
-/// names: `BANK`, `E`, the slot map's experts, `EN`, `K`, `T`, a round's
+/// names: `BANK`, `E`, the slot map's experts, `K`, `T`, a round's
 /// `L`, the widest layer's experts, `V`, `TR`, the scratch rounds,
 /// `FLIGHT` and `P`, its tables' slots and widths, `RING`, `GM`, the bank's
 /// choices (a decode landing list's entries), the first seeded record, and
@@ -588,7 +613,6 @@ pub(crate) struct BankNumbers<D = Dim> {
     pub records: D,
     pub experts: D,
     pub layer_experts: D,
-    pub next_experts: D,
     pub selected: D,
     pub staging: D,
     pub round_records: D,
@@ -621,7 +645,6 @@ impl<D> Numbers<D> for BankNumbers<D> {
             records: f(self.records),
             experts: f(self.experts),
             layer_experts: f(self.layer_experts),
-            next_experts: f(self.next_experts),
             selected: f(self.selected),
             staging: f(self.staging),
             round_records: f(self.round_records),
@@ -664,31 +687,15 @@ pub(crate) fn split<G: GraphDraft>(
     };
     let binding = plan.binding(index)?;
     let layer = &plan.layers()[index];
-    let leads = (0..crate::planning::HINT_LEADS as usize).map(|lead| plan.lead_layer(index, lead)).collect::<Vec<_>>();
-    let leads = leads
-        .iter()
-        .enumerate()
-        .map(|(lead, &predicted)| match leads[..lead].iter().position(|&bound| bound == predicted) {
-            _ if predicted == index => HintLead::Own,
-            Some(earlier) => HintLead::Earlier(earlier),
-            None => {
-                let predicted = &plan.layers()[predicted];
-                HintLead::Layer {
-                    scope: relative_scope_of(predicted.scope, scope),
-                    kinds: predicted.hinted.iter().map(|hint| hint.element.map(|_| hint.kind)).collect(),
-                }
-            }
-        })
-        .collect();
     let (words, file, site, scratch) =
         (binding.words, binding.words.file(), binding.words.site(), binding.words.scratch());
     let topology = BankTopology {
         sited: plan.sited(index),
         sets_step: plan.sets_step(index),
-        fronts: load.fronts(),
-        ahead: plan.ahead(index),
-        leads,
-        next_policy: plan.hints(index, 0).map(|next| relative_scope_of(plan.layers()[next].scope, scope)),
+        // Only target decode passes carry front-row guesses into `routed_step`;
+        // drafter layers (`DraftSublayer`, `HeadSublayer`) run with `front = 0`
+        // and never bind a `guesses` port.
+        fronts: load.fronts() && !layer.is_draft(),
         placer: binding.placer,
         tier_copy_dma: plan.tier_copy_dma(),
         record: binding.record.map(|_, tensor| tensor.resident),
@@ -698,7 +705,6 @@ pub(crate) fn split<G: GraphDraft>(
         records: binding.records,
         experts: binding.experts,
         layer_experts: layer.experts,
-        next_experts: binding.next_experts,
         selected: binding.selected,
         staging: binding.staging,
         round_records: binding.round_records,
@@ -859,6 +865,84 @@ impl<'p, 'a, G: GraphDraft + 'a, W: PlannedWeights + ?Sized> StreamedLayer<'p, '
             Some(ports.policy.tensor().clone()),
             constants,
         )
+    }
+
+    /// Whether this streamed layer supports `RunStage::DecodeHits` splitting
+    /// (`masked_down_project` + `routed_gate_up_part` + `BankCombineEntry::General`).
+    pub(crate) fn can_split_decode_hits(&self) -> bool {
+        self.entries.can_split_decode_hits()
+    }
+
+    /// Run `routed_gate_up_part` for a single split-decode pass (`late == 2`
+    /// VRAM hits in `DecodeHits`, or `late == 3` sourced misses in `DecodeBack`)
+    /// into a graph-local `product`.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn gate_up_part_mode<'x>(
+        &mut self,
+        graph: &mut G,
+        args: routed_gate_up::WorkflowArgs<'x>,
+        dimensions: &[(&str, Dim)],
+        rows: &Dim,
+        step: &WorkflowTensor,
+        routing: &WorkflowTensor,
+        late: i32,
+    ) -> Result<WorkflowTensor, GraphError> {
+        let entry = G::pick(
+            self.entries
+                .gate_up
+                .expect("a gated streamed layer's bank holds its gate/up passes (`bank_gate_up`)"),
+            rows,
+        );
+        let numbers = self.numbers;
+        let dimensions =
+            [dimensions, &[("FLIGHT", numbers.flight.clone()), ("P", numbers.choices.clone())]].concat();
+        let mut product = graph.local_for(entry, "product", &dimensions)?;
+        let routed_gate_up::WorkflowArgs {
+            normalized,
+            routes,
+            sources,
+            expert_gate,
+            expert_up,
+            tier_gate,
+            tier_up,
+            activation,
+            gate_scale,
+            up_scale,
+            glu_limit,
+        } = args;
+        graph.enqueue(
+            entry,
+            &dimensions,
+            routed_gate_up_part::WorkflowArgs {
+                normalized,
+                routes,
+                sources,
+                expert_gate,
+                expert_up,
+                tier_gate,
+                tier_up,
+                activation,
+                gate_scale,
+                up_scale,
+                glu_limit,
+                routing: routing.into(),
+                step: step.into(),
+                late: late.into(),
+                product: product.tensor_mut().into(),
+            },
+        )?;
+        Ok(product.tensor().clone())
+    }
+
+    /// [`Self::reads`] for `RunStage::DecodeHits`: reads only VRAM hits
+    /// (`code >= 0`) from read-only `front_sources`, so `tier` is empty (`TR = 0`).
+    pub(crate) fn reads_hits(
+        &self,
+        graph: &mut G,
+        sources: WorkflowTensorView,
+        constants: &mut Vec<GraphConstant>,
+    ) -> Result<DecodeReads, GraphError> {
+        self.reads_inner(graph, None, sources, None, constants)
     }
 
     /// [`Self::reads`] for `RunStage::DecodeBack` using its minimal
@@ -1812,70 +1896,6 @@ pub(crate) fn scratch_fill<'a, G: GraphDraft + 'a>(
     layer.fill_scratch(graph, weights, constants)
 }
 
-/// The ports of a bank-served layer's ahead-of-step hint launch
-/// (`routed_hint_route`, `routed_hint_select`), when the layer predicts ahead
-/// (`ahead` in `1..=HINT_LEADS`): `AHEAD`; per lead, the weights its hint
-/// launch reads of the layer it predicts there (`ExpertBankPlan::predicted`:
-/// the next streamed layer, then the one after it) in its own place, in the
-/// route's order (`BankLayer::hinted`); the next layer's policy words, whose
-/// POLICY_RESOLVED skips the hint writes while set; and its rings. A lead past
-/// `AHEAD` binds the next layer's weights again, which the hint launch zeros
-/// without reading, so every lead's weights are of the experts `EN` names
-/// (`ExpertBankPlan::lead_layer`).
-pub(crate) struct HintPorts<const N: usize> {
-    pub ahead: u64,
-    pub weights: [[WorkflowTensor; N]; crate::planning::HINT_LEADS as usize],
-    pub policy: WorkflowTensor,
-    pub rings: NativePort,
-}
-
-impl<'a, G: GraphDraft + 'a, W: PlannedWeights + ?Sized> StreamedLayer<'_, 'a, G, W> {
-    /// The hint ports of this layer when it predicts ahead (`ahead > 0`), or
-    /// `None` on the last streamed layer, which launches no hint entry. A
-    /// weight a predicted layer has is its own; one it lacks is this layer's
-    /// port (`own`: an absent norm, a bias's zeros), as the plan found every
-    /// streamed layer's hinted weights alike.
-    pub(crate) fn hints<const N: usize>(
-        &mut self,
-        graph: &mut G,
-        weights: &mut Vec<(WeightPort, NativePort)>,
-        own: [&WorkflowTensor; N],
-        policy: &WorkflowTensor,
-    ) -> Result<Option<HintPorts<N>>, GraphError> {
-        let topology = self.topology;
-        let ahead = topology.ahead;
-        if ahead == 0 {
-            return Ok(None);
-        }
-        let mut hinted: [[WorkflowTensor; N]; crate::planning::HINT_LEADS as usize] =
-            std::array::from_fn(|_| own.map(Clone::clone));
-        let mut policy = policy.clone();
-        for (lead, bound) in topology.leads.iter().enumerate() {
-            match bound {
-                HintLead::Own => {}
-                // A layer an earlier lead binds is bound once.
-                HintLead::Earlier(earlier) => hinted[lead] = hinted[*earlier].clone(),
-                HintLead::Layer { scope, kinds } => {
-                    for (port, kind) in hinted[lead].iter_mut().zip(kinds) {
-                        if let Some(kind) = kind {
-                            *port = weight(graph, self.planned, *scope, *kind, weights)?;
-                        }
-                    }
-                }
-            }
-        }
-        if let Some(next) = topology.next_policy {
-            policy = bank_port(graph, self.planned, next, BankPart::Policy, self.ports)?.tensor().clone();
-        }
-        Ok(Some(HintPorts {
-            ahead,
-            weights: hinted,
-            policy,
-            rings: self.part(graph, BankPart::Rings)?,
-        }))
-    }
-}
-
 /// What a run binds of a graph that sets its step word (`routed_step`): the
 /// sequence it writes, and of a decode graph the guesses its front rows run
 /// on (`routed_step`'s `guesses`, `[T, 2]` (guess, kind) rows at each front
@@ -2138,15 +2158,11 @@ impl<'p, 'a, G: GraphDraft + 'a, W: PlannedWeights + ?Sized> StreamedLayer<'p, '
     /// only when sited.
     pub(crate) fn decode_back_ports(&mut self, graph: &mut G, needs_policy: bool) -> Result<DecodeBackPorts, GraphError> {
         let sited = self.entries.site.is_some();
-        let split_sited = matches!(
-            self.entries.site.map(|site| site.combine),
-            Some(BankCombineEntry::Fused { .. } | BankCombineEntry::General { .. })
-        );
         let step = sited.then(|| self.part(graph, BankPart::Step)).transpose()?;
         let tier_records = (!self.numbers.tier.is_zero())
             .then(|| self.parts(graph, |kind| BankPart::Tier { kind }))
             .transpose()?;
-        let policy = (split_sited || needs_policy)
+        let policy = needs_policy
             .then(|| self.part(graph, BankPart::Policy))
             .transpose()?;
         let site = sited

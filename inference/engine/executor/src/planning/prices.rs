@@ -94,6 +94,63 @@ impl PlanPrices {
             bank.decode_rows(),
         )))
     }
+
+    /// Derived minimum expected per-row miss-DMA bytes for 3-stage `DecodeHits`
+    /// splitting: `overhead_s / transfer_s_per_byte`, where `overhead_s` is the
+    /// measured extra host-sync submission plus the 2 split kernel launches
+    /// (`routed_gate_up_part` + `routed_down_project`), and `transfer_s_per_byte`
+    /// is the measured H2D `transfer_copy` bandwidth (falling back to the link's
+    /// weight read line if `TierCopy` has not been recorded yet).
+    ///
+    /// Returns `u64::MAX` when measured H2D DMA + resident VRAM read is not
+    /// faster per byte than SM zero-copy over the link (consistent with
+    /// [`crate::experts::transport::SplitDmaCost`]), so 3-stage `DecodeHits`
+    /// graphs are not compiled on machines where `Whole` always wins.
+    pub(crate) fn decode_hits_min_bytes(&self, bank: &super::ExpertBankPlan) -> u64 {
+        let overhead_s = self.costs.step_round_trip_seconds.value + 2.0 * self.costs.launch();
+        if !overhead_s.is_finite() || overhead_s <= 0.0 {
+            return 0;
+        }
+        let least_bytes = bank.least_move_bytes().ok().map(|b| b as f64);
+        let layer0_gpu = crate::assessment::expert_pass(bank, &self.costs)
+            .ok()
+            .and_then(|pass| pass.lines(0)?.ok());
+        if let (Some(transfer), Some(bytes), Some(gpu)) = (self.figures.transfer.as_ref(), least_bytes, layer0_gpu) {
+            if bytes > 0.0 {
+                let link_s = gpu.link.weights.get() * 1e-9;
+                let resident_s = gpu.resident.weights.get() * 1e-9;
+                let cost = crate::experts::transport::SplitDmaCost::from_measured(
+                    transfer.seconds_per_byte() + resident_s / bytes,
+                    link_s / bytes,
+                    transfer.latency_seconds() + self.costs.step_round_trip_seconds.value,
+                    bytes as u64,
+                );
+                if !cost.can_ever_win() {
+                    return u64::MAX;
+                }
+            }
+        }
+        let transfer_s_per_byte: Option<f64> = self
+            .figures
+            .transfer
+            .as_ref()
+            .map(magnitude_cost_model::ReadLine::seconds_per_byte)
+            .or_else(|| {
+                let bytes = least_bytes?;
+                let gpu = layer0_gpu?;
+                let link_s = gpu.link.weights.get() * 1e-9;
+                (bytes > 0.0 && link_s > 0.0).then_some(link_s / bytes)
+            });
+        let Some(s_per_byte) = transfer_s_per_byte.filter(|s| s.is_finite() && *s > 0.0) else {
+            return 0;
+        };
+        let min_bytes = (overhead_s / s_per_byte).ceil();
+        if !min_bytes.is_finite() || min_bytes >= u64::MAX as f64 {
+            u64::MAX
+        } else {
+            min_bytes as u64
+        }
+    }
 }
 
 /// The prices a load's settle takes of `priced`: a bank waits for prices

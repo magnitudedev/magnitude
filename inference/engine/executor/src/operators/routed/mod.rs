@@ -404,25 +404,6 @@ pub(crate) fn is_fused(routed: &RoutedFfn) -> bool {
         })
 }
 
-/// The weights a streamed layer's decode route reads of the layer it
-/// predicts in place of its own, in its hint ports' order: the fused
-/// route's input norm and router; the general selection's router norm
-/// (its own where the router reads the residual, else the input norm),
-/// router and selection bias.
-pub(crate) fn hint_kinds(routed: &RoutedFfn) -> Vec<WeightKind> {
-    match is_fused(routed) {
-        true => vec![WeightKind::InputNorm, WeightKind::Router],
-        false => vec![
-            match routed.router.input {
-                RouterInput::Residual(_) => WeightKind::RouterInputNorm,
-                _ => WeightKind::InputNorm,
-            },
-            WeightKind::Router,
-            WeightKind::RouterSelectionBias,
-        ],
-    }
-}
-
 /// The forms the general routed entries implement: every score function
 /// with top-k selection, any normalization and finite scale, a router input
 /// norm of the sublayer's epsilon, gated or up-only experts, and an ungated

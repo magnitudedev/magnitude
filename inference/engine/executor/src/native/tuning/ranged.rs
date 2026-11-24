@@ -115,7 +115,62 @@ pub(crate) fn row_cuts(
     }
     cuts.sort_unstable();
     cuts.dedup();
+    if !cuts.is_empty() && held.len() > 1 {
+        let ranges = row_ranges(served.clone(), &cuts, &held);
+        let range_rows: Vec<Vec<u64>> = ranges
+            .iter()
+            .map(|range| {
+                held.iter()
+                    .copied()
+                    .filter(|row| range.contains(row))
+                    .collect()
+            })
+            .collect();
+        let tunable: Vec<bool> = range_rows
+            .iter()
+            .map(|rows| rows.iter().any(|&row| declared.has_tunable_choice(row)))
+            .collect();
+        let legal_differs: Vec<bool> = range_rows
+            .windows(2)
+            .map(|pair| declared.legal_configs_differ(&pair[0], &pair[1]))
+            .collect();
+        cuts = prune_untunable_cuts(&ranges, &tunable, &legal_differs);
+    }
     cuts
+}
+
+/// Retain cuts that either separate ranges whose legal configuration set
+/// differs (`legal_differs[index - 1] == true`) or separate two tunable ranges
+/// within a segment of identical legality. Within each segment bounded by
+/// legality-changing cuts, any range with at most one reachable configuration
+/// (`!tunable[i]`) is merged with an adjacent range in the same segment
+/// (forward when a later tunable range exists in the segment, else backward)
+/// so it never spawns a dead `Census`-only tuning unit.
+fn prune_untunable_cuts(
+    ranges: &[Range<u64>],
+    tunable: &[bool],
+    legal_differs: &[bool],
+) -> Vec<u64> {
+    debug_assert_eq!(ranges.len(), tunable.len());
+    debug_assert_eq!(ranges.len().saturating_sub(1), legal_differs.len());
+    let mut kept = Vec::new();
+    let mut seg_start = 0;
+    while seg_start < ranges.len() {
+        let mut seg_end = seg_start + 1;
+        while seg_end < ranges.len() && !legal_differs[seg_end - 1] {
+            seg_end += 1;
+        }
+        for index in (seg_start + 1)..seg_end {
+            if tunable[index - 1] && tunable[index..seg_end].iter().any(|&is_tunable| is_tunable) {
+                kept.push(ranges[index].start);
+            }
+        }
+        if seg_end < ranges.len() {
+            kept.push(ranges[seg_end].start);
+        }
+        seg_start = seg_end;
+    }
+    kept
 }
 
 /// Between each two neighbours of `held` (the measured rows, ascending)
@@ -166,14 +221,19 @@ fn tile_cuts(rows: Range<u64>, runs: impl Fn(u64) -> bool, tiling: impl Fn(u64) 
 }
 
 /// An implementation's declaration at a unit's statics: the values the
-/// statics admit of each entry parameter, and with them what a row count
-/// can run.
+/// statics admit of each entry and launch parameter, and with them what a row
+/// count can run and whether it has more than one reachable configuration.
 struct Declared<'a> {
     implementation: &'a NativeImplementation,
     statics: &'a NativeSpecialization,
     row_dim: &'a str,
     /// Each entry parameter's admitted values ([`admitted`]), by its name.
     admitted: BTreeMap<&'a str, Vec<u64>>,
+    /// Each launch's scoped parameters' admitted values, by launch ordinal.
+    launch_admitted: Vec<BTreeMap<&'a str, Vec<u64>>>,
+    /// Entry parameters not referenced by any launch or scratch declaration
+    /// (conservatively assumed read by kernel source directly).
+    ownerless_entry_params: Vec<&'a str>,
 }
 
 impl<'a> Declared<'a> {
@@ -186,7 +246,7 @@ impl<'a> Declared<'a> {
         if let Some(constraint) = &implementation.constraint {
             constraint.conjuncts(&mut conjuncts);
         }
-        let admitted = implementation
+        let mut admitted_map: BTreeMap<&'a str, Vec<u64>> = implementation
             .params
             .iter()
             .map(|parameter| {
@@ -196,27 +256,277 @@ impl<'a> Declared<'a> {
                 )
             })
             .collect();
+        // Propagate singleton entry parameters to a fixed point so chained
+        // `where` implications (e.g. `TALL == 0` forcing `PACK == 0`) narrow
+        // dependent domains.
+        loop {
+            let mut changed = false;
+            let singletons: BTreeMap<&'a str, u64> = admitted_map
+                .iter()
+                .filter_map(|(&name, values)| (values.len() == 1).then_some((name, values[0])))
+                .collect();
+            for parameter in &implementation.params {
+                let name = parameter.name.as_str();
+                if admitted_map[name].len() <= 1 {
+                    continue;
+                }
+                let narrowed = admitted_with_known(
+                    name,
+                    &admitted_map[name],
+                    &conjuncts,
+                    statics,
+                    &singletons,
+                );
+                if narrowed.len() < admitted_map[name].len() {
+                    admitted_map.insert(name, narrowed);
+                    changed = true;
+                }
+            }
+            if !changed {
+                break;
+            }
+        }
+        let singletons: BTreeMap<&'a str, u64> = admitted_map
+            .iter()
+            .filter_map(|(&name, values)| (values.len() == 1).then_some((name, values[0])))
+            .collect();
+        let launch_admitted = implementation
+            .launches
+            .iter()
+            .map(|launch| {
+                launch
+                    .params
+                    .iter()
+                    .map(|parameter| {
+                        (
+                            parameter.name.as_str(),
+                            admitted_with_known(
+                                &parameter.name,
+                                &parameter.values,
+                                &conjuncts,
+                                statics,
+                                &singletons,
+                            ),
+                        )
+                    })
+                    .collect()
+            })
+            .collect();
+        let ownerless_entry_params = implementation
+            .params
+            .iter()
+            .filter_map(|parameter| {
+                let name = parameter.name.as_str();
+                let owned_by_launch = implementation
+                    .launches
+                    .iter()
+                    .any(|launch| launch.parameters().iter().any(|p| p == name));
+                let owned_by_scratch = implementation.scratch.iter().any(|scratch| {
+                    let mut names = Vec::new();
+                    scratch.bytes.parameters(&mut names);
+                    if let Some(when) = &scratch.when {
+                        when.parameters(&mut names);
+                    }
+                    names.iter().any(|p| p == name)
+                });
+                (!owned_by_launch && !owned_by_scratch).then_some(name)
+            })
+            .collect();
         Self {
             implementation,
             statics,
             row_dim,
-            admitted,
+            admitted: admitted_map,
+            launch_admitted,
+            ownerless_entry_params,
         }
     }
 
     /// The values parameter `name` can take as launch `launch` reads it
     /// (none: as a scratch buffer does): the launch's own parameter of the
-    /// name, which the statics do not restrict, else the entry's.
+    /// name, else the entry's.
     fn values(&self, launch: Option<usize>, name: &str) -> Option<&[u64]> {
         launch
-            .and_then(|launch| {
-                self.implementation.launches[launch]
-                    .params
-                    .iter()
-                    .find(|parameter| parameter.name == name)
-            })
-            .map(|parameter| parameter.values.as_slice())
+            .and_then(|ordinal| self.launch_admitted[ordinal].get(name))
+            .map(Vec::as_slice)
             .or_else(|| self.admitted.get(name).map(Vec::as_slice))
+    }
+
+    /// Whether `condition` has a conjunct mentioning `param` that is not
+    /// already decided at `row` rows by `statics` and singleton entry
+    /// parameters.
+    fn condition_depends_on_param(
+        &self,
+        condition: &NativeCondition,
+        row: u64,
+        param: &str,
+    ) -> bool {
+        let mut conjuncts = Vec::new();
+        condition.conjuncts(&mut conjuncts);
+        conjuncts.into_iter().any(|conjunct| {
+            let mut names = Vec::new();
+            conjunct.parameters(&mut names);
+            if !names.iter().any(|name| name == param) {
+                return false;
+            }
+            conjunct
+                .decided(
+                    &|dimension: &str| {
+                        if dimension == self.row_dim {
+                            Some(row)
+                        } else {
+                            self.statics.static_value(dimension)
+                        }
+                    },
+                    &|name: &str| {
+                        self.admitted
+                            .get(name)
+                            .and_then(|values| (values.len() == 1).then_some(values[0]))
+                    },
+                )
+                .is_none()
+        })
+    }
+
+    /// Whether `row` rows have more than one reachable configuration: at
+    /// least one launch-scoped parameter of an active launch, or one entry
+    /// parameter that an active launch or scratch buffer depends on (or an
+    /// ownerless entry parameter), has more than one admitted value.
+    fn has_tunable_choice(&self, row: u64) -> bool {
+        let active_launches: Vec<usize> = self
+            .implementation
+            .launches
+            .iter()
+            .enumerate()
+            .filter_map(|(ordinal, launch)| {
+                self.can_hold(launch.when.as_ref(), Some(ordinal), row)
+                    .then_some(ordinal)
+            })
+            .collect();
+        if active_launches.iter().any(|&ordinal| {
+            self.launch_admitted[ordinal]
+                .values()
+                .any(|values| values.len() > 1)
+        }) {
+            return true;
+        }
+        let active_scratch: Vec<usize> = self
+            .implementation
+            .scratch
+            .iter()
+            .enumerate()
+            .filter_map(|(ordinal, scratch)| {
+                self.can_hold(scratch.when.as_ref(), None, row)
+                    .then_some(ordinal)
+            })
+            .collect();
+        for (&name, values) in &self.admitted {
+            if values.len() <= 1 {
+                continue;
+            }
+            if self.ownerless_entry_params.contains(&name) {
+                return true;
+            }
+            let affects_launch = active_launches.iter().any(|&ordinal| {
+                let launch = &self.implementation.launches[ordinal];
+                launch.dispatch_parameters().iter().any(|p| p == name)
+                    || launch.when.as_ref().is_some_and(|when| {
+                        self.condition_depends_on_param(when, row, name)
+                    })
+            });
+            if affects_launch {
+                return true;
+            }
+            let affects_scratch = active_scratch.iter().any(|&ordinal| {
+                let scratch = &self.implementation.scratch[ordinal];
+                let mut bytes_params = Vec::new();
+                scratch.bytes.parameters(&mut bytes_params);
+                bytes_params.iter().any(|p| p == name)
+                    || scratch.when.as_ref().is_some_and(|when| {
+                        self.condition_depends_on_param(when, row, name)
+                    })
+            });
+            if affects_scratch {
+                return true;
+            }
+        }
+        false
+    }
+
+    /// Whether the set of legal configurations can differ between `left_rows`
+    /// and `right_rows`: true when any launch whose `shared_bytes` or
+    /// `group_extent` reads `self.row_dim` changes activity across the
+    /// boundary, varies in evaluated resource demand, or also depends on a
+    /// non-singleton parameter (so different row counts can admit different
+    /// subsets of configurations).
+    fn legal_configs_differ(&self, left_rows: &[u64], right_rows: &[u64]) -> bool {
+        let reads_row = |expr: &NativeNatExpr| -> bool {
+            let mut dims = Vec::new();
+            expr.dimensions(&mut dims);
+            dims.iter().any(|dim| dim == self.row_dim)
+        };
+        let eval_row_expr = |expr: &NativeNatExpr, ordinal: usize, row: u64| -> Option<u64> {
+            expr.evaluate(
+                &|dim: &str| {
+                    if dim == self.row_dim {
+                        Some(row)
+                    } else {
+                        self.statics.static_value(dim)
+                    }
+                },
+                &|name: &str| {
+                    self.values(Some(ordinal), name)
+                        .and_then(|values| (values.len() == 1).then_some(values[0]))
+                },
+            )
+            .ok()
+        };
+        for (ordinal, launch) in self.implementation.launches.iter().enumerate() {
+            let row_exprs: Vec<&NativeNatExpr> = std::iter::once(&launch.shared_bytes)
+                .chain(launch.group_extent.iter())
+                .filter(|expr| reads_row(expr))
+                .collect();
+            if row_exprs.is_empty() {
+                continue;
+            }
+            let left_active = left_rows
+                .iter()
+                .any(|&row| self.can_hold(launch.when.as_ref(), Some(ordinal), row));
+            let right_active = right_rows
+                .iter()
+                .any(|&row| self.can_hold(launch.when.as_ref(), Some(ordinal), row));
+            if left_active != right_active {
+                return true;
+            }
+            if !left_active {
+                continue;
+            }
+            for expr in row_exprs {
+                let mut left_vals: Vec<Option<u64>> = left_rows
+                    .iter()
+                    .filter(|&&row| self.can_hold(launch.when.as_ref(), Some(ordinal), row))
+                    .map(|&row| eval_row_expr(expr, ordinal, row))
+                    .collect();
+                let mut right_vals: Vec<Option<u64>> = right_rows
+                    .iter()
+                    .filter(|&&row| self.can_hold(launch.when.as_ref(), Some(ordinal), row))
+                    .map(|&row| eval_row_expr(expr, ordinal, row))
+                    .collect();
+                // If any evaluation depends on a non-singleton parameter, the
+                // legal subset can differ between different row counts.
+                if left_vals.iter().any(Option::is_none) || right_vals.iter().any(Option::is_none) {
+                    return true;
+                }
+                left_vals.sort_unstable();
+                left_vals.dedup();
+                right_vals.sort_unstable();
+                right_vals.dedup();
+                if left_vals != right_vals {
+                    return true;
+                }
+            }
+        }
+        false
     }
 
     /// Whether `condition`, of launch `launch` or of a scratch buffer, can
@@ -314,6 +624,16 @@ impl<'a> Declared<'a> {
 /// Where they admit none: such statics lie outside the declaration's
 /// domain, which a unit's never do.
 fn admitted(name: &str, values: &[u64], conjuncts: &[&NativeCondition], statics: &NativeSpecialization) -> Vec<u64> {
+    admitted_with_known(name, values, conjuncts, statics, &BTreeMap::new())
+}
+
+fn admitted_with_known(
+    name: &str,
+    values: &[u64],
+    conjuncts: &[&NativeCondition],
+    statics: &NativeSpecialization,
+    known: &BTreeMap<&str, u64>,
+) -> Vec<u64> {
     let admitted = match statics.param(name) {
         Some(value) => vec![value],
         None => values
@@ -321,9 +641,16 @@ fn admitted(name: &str, values: &[u64], conjuncts: &[&NativeCondition], statics:
             .copied()
             .filter(|&value| {
                 conjuncts.iter().all(|conjunct| {
-                    conjunct.decided(&|dimension: &str| statics.static_value(dimension), &|parameter: &str| {
-                        (parameter == name).then_some(value)
-                    }) != Some(false)
+                    conjunct.decided(
+                        &|dimension: &str| statics.static_value(dimension),
+                        &|parameter: &str| {
+                            if parameter == name {
+                                Some(value)
+                            } else {
+                                known.get(parameter).copied()
+                            }
+                        },
+                    ) != Some(false)
                 })
             })
             .collect(),
@@ -990,6 +1317,199 @@ mod tests {
                 .filter(|r| ranges[1].contains(r))
                 .collect::<Vec<_>>(),
             vec![2048, 4096]
+        );
+    }
+
+    #[test]
+    fn untunable_ranges_are_not_split_into_separate_units() {
+        let ranges = vec![1..2, 2..9, 9..17, 17..65, 65..u64::MAX];
+        let same = [false; 4];
+        // A dead middle range (17..65) merges forward into 65.. -> 17..
+        assert_eq!(
+            prune_untunable_cuts(&ranges, &[true, true, true, false, true], &same),
+            vec![2, 9, 17]
+        );
+        // A dead trailing range merges backward into the last tunable range.
+        assert_eq!(
+            prune_untunable_cuts(&ranges, &[true, true, false, false, false], &same),
+            vec![2]
+        );
+        // A dead leading range merges forward into the first tunable range.
+        assert_eq!(
+            prune_untunable_cuts(&ranges, &[false, true, true, true, true], &same),
+            vec![9, 17, 65]
+        );
+        // If no range is tunable and legality never differs, all cuts collapse to a single range.
+        assert!(prune_untunable_cuts(&ranges, &[false, false, false, false, false], &same).is_empty());
+
+        // Real kernel: CUDA bf16 dense_expand with OPERAND fixed to 0 has
+        // INT8=0 forced by bf16, leaving O=17..65 with <= 1 configuration.
+        // row_cuts merges 17..65 into 65.. instead of splitting out a dead
+        // Census-only unit.
+        let bf16 = Element::bf16();
+        let expand = magnitude_kernels::dense_expand::native_entry_with(
+            magnitude_kernels::dense_expand::Elements {
+                NW: bf16,
+                GW: bf16,
+                UW: bf16,
+                A: bf16,
+            },
+        );
+        let cuda_expand = seismic::generated::native_implementation_at::<magnitude_kernels::dense_expand::Entry>(
+            seismic::BackendName::Cuda,
+            expand.elements(),
+        )
+        .unwrap()
+        .unwrap()
+        .at_device(&seismic::device::BackendFloor(seismic::BackendName::Cuda));
+        let cuda_statics = NativeSpecialization::new()
+            .with_static("H", 2048)
+            .with_static("F", 8192)
+            .with_static("GS", 0)
+            .with_static("US", 0)
+            .with_static("LB", 0)
+            .with_param("OPERAND", 0);
+        let cuts = row_cuts(&cuda_expand, &cuda_statics, "O", &EVERY_ROW, &points(512));
+        assert_eq!(cuts, vec![2, 9, 17]);
+        assert_eq!(
+            row_ranges(EVERY_ROW, &cuts, &points(512)),
+            vec![1..2, 2..9, 9..17, 17..u64::MAX]
+        );
+    }
+
+    #[test]
+    fn prune_untunable_cuts_preserves_legality_changing_boundaries() {
+        let ranges = vec![1..2, 2..9, 9..17, 17..65, 65..u64::MAX];
+        // Leading untunable range with different legal configs across boundary 2:
+        // cut at 2 must be preserved instead of merging 1..2 into 2..9.
+        assert_eq!(
+            prune_untunable_cuts(
+                &ranges,
+                &[false, true, true, true, true],
+                &[true, false, false, false],
+            ),
+            vec![2, 9, 17, 65]
+        );
+        // Middle untunable range (17..65) whose legality differs from 65..
+        // cannot merge forward across 65; it merges backward into 9..17 while
+        // preserving the legality-changing cut at 65.
+        assert_eq!(
+            prune_untunable_cuts(
+                &ranges,
+                &[true, true, true, false, true],
+                &[false, false, false, true],
+            ),
+            vec![2, 9, 65]
+        );
+        // Untunable range whose legality differs on BOTH sides stays isolated.
+        assert_eq!(
+            prune_untunable_cuts(
+                &ranges,
+                &[true, true, true, false, true],
+                &[false, false, true, true],
+            ),
+            vec![2, 9, 17, 65]
+        );
+        // Even when no range is tunable, a legality-changing cut is preserved.
+        assert_eq!(
+            prune_untunable_cuts(
+                &ranges,
+                &[false, false, false, false, false],
+                &[true, false, false, false],
+            ),
+            vec![2]
+        );
+    }
+
+    #[test]
+    fn metal_attention_decode_k8v4_defaults_to_tokens_1_for_m1() {
+        let bf16 = Element::bf16();
+        let entry = magnitude_kernels::attention_decode_k8v4::native_entry_with(
+            magnitude_kernels::attention_decode_k8v4::Elements { A: bf16 },
+        );
+        let metal_k8v4 = seismic::generated::native_implementation_at::<
+            magnitude_kernels::attention_decode_k8v4::Entry,
+        >(seismic::BackendName::Metal, entry.elements())
+        .unwrap()
+        .unwrap()
+        .at_device(&seismic::device::BackendFloor(seismic::BackendName::Metal));
+        // G = 16 (> 8), head dim 2*P + S = 128: previously defaulted to
+        // HEAD_BAND = 8 and TOKENS = 2 even for M = 1 single-token decode.
+        let statics = NativeSpecialization::new()
+            .with_static("KV", 4)
+            .with_static("G", 16)
+            .with_static("P", 64)
+            .with_static("S", 0)
+            .with_static("I", 0)
+            .with_static("U", 0)
+            .with_static("F", 1)
+            .with_static("NQ", 0)
+            .with_static("N", 0)
+            .with_static("NV", 0)
+            .with_static("KC", 32)
+            .with_static("KP", 8)
+            .with_static("VC", 16)
+            .with_static("VP", 8)
+            .with_static("SK", 0)
+            .with_static("RA", 0)
+            .with_static("RT", 0)
+            .with_static("RO", 0)
+            .with_static("VK", 0);
+        let defaults = metal_k8v4
+            .default_specialization(&statics)
+            .expect("attention_decode_k8v4 default specialization must be valid");
+        assert_eq!(
+            defaults.param("TOKENS"),
+            Some(1),
+            "M=1 decode must default to TOKENS=1, not TOKENS=2"
+        );
+        assert_eq!(
+            defaults.param("HEAD_BAND"),
+            Some(0),
+            "default HEAD_BAND must stay 0 so M=1 decode keeps TOKENS=1"
+        );
+
+        // G = 16, width = 512 (P = 256, S = 0), 32 KiB shared memory (Metal floor):
+        // SLICES = 8 requires SIMDS = 8 for MATRIX = 0. Fallback must prefer
+        // TOKENS = 1 (and HEAD_BAND = 0) ahead of SIMDS = 4 rather than
+        // falling back to HEAD_BAND = 8, TOKENS = 2.
+        let wide_statics = NativeSpecialization::new()
+            .with_static("KV", 4)
+            .with_static("G", 16)
+            .with_static("P", 256)
+            .with_static("S", 0)
+            .with_static("I", 0)
+            .with_static("U", 0)
+            .with_static("F", 1)
+            .with_static("NQ", 0)
+            .with_static("N", 0)
+            .with_static("NV", 0)
+            .with_static("KC", 128)
+            .with_static("KP", 32)
+            .with_static("VC", 64)
+            .with_static("VP", 32)
+            .with_static("SK", 0)
+            .with_static("RA", 0)
+            .with_static("RT", 0)
+            .with_static("RO", 0)
+            .with_static("VK", 0);
+        let wide_defaults = metal_k8v4
+            .default_specialization(&wide_statics)
+            .expect("wide G=16 width=512 32 KiB default specialization must be valid");
+        assert_eq!(
+            wide_defaults.param("TOKENS"),
+            Some(1),
+            "G=16 width=512 32 KiB M=1 decode must default to TOKENS=1, not TOKENS=2"
+        );
+        assert_eq!(
+            wide_defaults.param("HEAD_BAND"),
+            Some(0),
+            "G=16 width=512 32 KiB M=1 decode must keep HEAD_BAND=0"
+        );
+        assert_eq!(
+            wide_defaults.param("SIMDS"),
+            Some(8),
+            "G=16 width=512 32 KiB fallback should widen SIMDS=8 to keep TOKENS=1"
         );
     }
 }

@@ -699,7 +699,7 @@ fn shared_head_graph<'a, G: GraphDraft + 'a>(
                     bank: crate::operators::routed::streamed::LayerBank::Held,
                 },
                 None,
-                mixed,
+                Some(mixed),
                 &mut weights,
                 &mut constants,
                 None,
@@ -1583,7 +1583,7 @@ impl NativeSharedHeadProgram {
             HeadOutput {
                 selected: HeadSelected::Proposals(selections),
                 landed_reads,
-                expert_step: None,
+                expert_steps: Vec::new(),
             },
         ))
     }

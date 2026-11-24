@@ -32,7 +32,7 @@ pub use bank::{BankLayer, BankLayers};
 pub use bank::{
     BankAllocation, BankBinding, BankCounts, BankPaths, BankTable, BankLayout, BankPart, ConveyorCarrier,
     Lender,
-    HintWeight, HINT_LEADS, PlacedAllocations, RegionWords,
+    PlacedAllocations, RegionWords,
     ExpertBankPlan, RecordTensor, RecordTensors, RoutedTensor, StagingPool, StoredPart, StoredStack,
     growth_target, BankSubstrate, BankTier, HostTier, LayerSite, Parking, Placer, PoolSlab,
 };
@@ -77,7 +77,7 @@ pub use weights::{
     NGramBinding, NGramGateForm, NGramRowRule, NGramTaps, ParallelBinding, PerLayerBinding, PerLayerEntryBinding,
     ReadoutBinding,
     ReadoutClassChoice, ReadoutHead, RecurrentBinding, RecurrentForm, RoundingArgs, RoutedBinding, ScalableWeight,
-    SelectionBinding, SelectionKeysBinding, SelectionShape, SublayerTail, TableFill, TableFlights, WeightPlacement, WeightPlan, WeightScalePlan, WeightStorageIdentity,
+    SelectionBinding, SelectionKeysBinding, SelectionShape, StreamedRows, SublayerTail, TableFill, TableFlights, WeightPlacement, WeightPlan, WeightScalePlan, WeightStorageIdentity,
     held_storage, resident_element, resident_elements, resident_layout, scaled_source_element,
     rounding_args, source_element, stored_weights,
 };

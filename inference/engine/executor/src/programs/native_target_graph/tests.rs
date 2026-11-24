@@ -128,7 +128,11 @@ mod upload_region_tests {
             }
         };
         let upload = |rows: u64, stage: RunStage| match stage {
-            RunStage::Whole | RunStage::Resident | RunStage::DecodeFront | RunStage::DecodeBack => 40,
+            RunStage::Whole
+            | RunStage::Resident
+            | RunStage::DecodeFront
+            | RunStage::DecodeHits
+            | RunStage::DecodeBack => 40,
             RunStage::Front => 100 * rows,
             RunStage::Combine => 4,
         };
@@ -185,11 +189,12 @@ mod upload_region_tests {
         assert_eq!(plain.region_bytes(), 5 * 256 + 4);
     }
 
-    /// A picked Block read takes its rows' complete units and the picks
-    /// table; one whose own indexer produces a candidate pool also the pool
-    /// table, of the pool's blocks and the launch's segments a row.
+    /// A picked Block read uploads only its rows' complete units in launch
+    /// controls (its picks and candidate pool tables live in VRAM
+    /// `GroupBuffers`); a selected read's keys' Block read uploads its rows'
+    /// complete units and unit lists.
     #[test]
-    fn launch_controls_hold_a_pool_table_only_for_a_producing_read() {
+    fn launch_controls_hold_complete_units_for_picked_and_selected_reads() {
         use crate::programs::native_target_graph::classes::PickedRead;
         use super::{LaunchControl, LaunchControlLayout};
         let layout = LaunchControlLayout {
@@ -211,16 +216,14 @@ mod upload_region_tests {
                 .map(|(_, extents)| extents.clone())
         };
         assert_eq!(at(LaunchControl::Complete { read: 0 }), Some(vec![16]));
-        assert_eq!(at(LaunchControl::Picks { read: 0 }), Some(vec![16, 2]));
-        assert_eq!(at(LaunchControl::Pool { read: 0 }), Some(vec![16, 8 + 2, 2]));
-        assert_eq!(at(LaunchControl::Picks { read: 1 }), Some(vec![16, 3]));
-        assert_eq!(at(LaunchControl::Pool { read: 1 }), None);
+        assert_eq!(at(LaunchControl::Complete { read: 1 }), Some(vec![16]));
+        assert_eq!(at(LaunchControl::Units { read: 0 }), None);
+        assert_eq!(at(LaunchControl::Units { read: 1 }), None);
         // A selected read's keys' Block read takes its rows' complete units
-        // and unit lists, and no picks.
+        // and unit lists.
         assert_eq!(at(LaunchControl::Complete { read: 2 }), Some(vec![16]));
         assert_eq!(at(LaunchControl::Units { read: 2 }), Some(vec![16, 1, 2]));
-        assert_eq!(at(LaunchControl::Picks { read: 2 }), None);
-        assert!(LaunchControl::Pool { read: 0 }.per_row());
+        assert!(LaunchControl::Complete { read: 0 }.per_row());
     }
 }
 
@@ -342,7 +345,14 @@ mod shared_graph_tests {
         let selection = crate::ComponentSelection { head: false, vision: false };
         let resident = ModelLoadPlan::derive(&manifest, &definition, selection, crate::resident_layout(crate::ExecutionPath::Native, backend), crate::PlannedMethod::Plain, crate::planning::fixtures::LIMITS).unwrap();
         let host = crate::planning::HostTier::Unified(crate::planning::Parking::InKernels);
-        let substrate = crate::planning::bank_substrate(backend, seismic::NativeAllocations::EXACT, Some(host), &definition).unwrap();
+        let substrate = crate::planning::bank_substrate(
+            backend,
+            seismic::NativeAllocations::EXACT,
+            Some(host),
+            backend.fills_beside_compute(),
+            &definition,
+        )
+        .unwrap();
         let load = resident.with_expert_bank_at_floor(&definition, substrate).unwrap();
         (definition, load)
     }
@@ -1262,7 +1272,14 @@ mod resource_template_tests {
 
         // Banked load honors the same settled pass identically.
         let host = crate::planning::HostTier::Unified(crate::planning::Parking::of(backend));
-        let substrate = crate::planning::bank_substrate(backend, seismic::NativeAllocations::EXACT, Some(host), &definition).unwrap();
+        let substrate = crate::planning::bank_substrate(
+            backend,
+            seismic::NativeAllocations::EXACT,
+            Some(host),
+            backend.fills_beside_compute(),
+            &definition,
+        )
+        .unwrap();
         let floor = derived.bank_floor(&definition, chain as u64, crate::FlightDepth::PIPELINED, substrate).unwrap();
         let banked = derived.with_expert_bank(&definition, floor, None, chain as u64, crate::FlightDepth::PIPELINED, substrate).unwrap();
         let banked_state = ResourcePlanner::state_plan(&definition, &banked, PlannedMethod::Plain, KvCodec::Dense, limits, capacity).unwrap();
@@ -1408,7 +1425,14 @@ mod sinkhorn_graph_tests {
         ] {
             let layout = resident_layout(ExecutionPath::Native, backend);
             let resident = ModelLoadPlan::derive(&manifest, &definition, selection, layout, PlannedMethod::Plain, limits).unwrap();
-            let substrate = crate::planning::bank_substrate(backend, seismic::NativeAllocations::EXACT, Some(tier), &definition).unwrap();
+            let substrate = crate::planning::bank_substrate(
+                backend,
+                seismic::NativeAllocations::EXACT,
+                Some(tier),
+                backend.fills_beside_compute(),
+                &definition,
+            )
+            .unwrap();
             let load = resident.with_expert_bank_at_floor(&definition, substrate).unwrap();
             let capacity = ResourceCapacity { domain_bytes: 1 << 30, tensor_operations: crate::TensorOperations::Absent, allocations: seismic::NativeAllocations::EXACT };
             let state = ResourcePlanner::state_plan(&definition, &load, PlannedMethod::Plain, codec, limits, capacity).unwrap();
@@ -1443,6 +1467,7 @@ mod sinkhorn_graph_tests {
             backend,
             seismic::NativeAllocations::EXACT,
             Some(HostTier::Unified(Parking::InKernels)),
+            backend.fills_beside_compute(),
             &definition,
         )
         .unwrap();
@@ -1533,6 +1558,7 @@ mod sinkhorn_graph_tests {
                 backend,
                 seismic::NativeAllocations::EXACT,
                 Some(HostTier::Linked),
+                backend.fills_beside_compute(),
                 &definition,
             )
             .unwrap_or_else(|e| panic!("{label}: bank_substrate failed: {e}"));
@@ -1564,29 +1590,44 @@ mod sinkhorn_graph_tests {
             )
             .unwrap_or_else(|e| panic!("{label}: certify_target_family failed: {e}"));
             let mut saw_front = false;
+            let mut saw_hits = false;
             let mut saw_back = false;
             for block in &certified.blocks {
                 for &(_, _, _, stage, _) in block.keys() {
                     if stage == Stage::Run(RunStage::DecodeFront) {
                         saw_front = true;
                     }
+                    if stage == Stage::Run(RunStage::DecodeHits) {
+                        saw_hits = true;
+                    }
                     if stage == Stage::Run(RunStage::DecodeBack) {
                         saw_back = true;
                     }
                 }
             }
-            assert!(saw_front && saw_back, "{label}: expected both DecodeFront and DecodeBack stages to be sealed");
-            // Verify `routed_site_request` runs at the tail of `DecodeFront`
-            // for general form (fused form folds site publish inline into
-            // `routed_route_streamed` / `routed_land`) and never in `DecodeBack`.
             let sited = load.expert_bank().expect("bank").sited(0);
             let is_fused = label.contains("fused");
+            let has_shared = label.contains("shared");
             let expected_front_site = if is_fused { 0usize } else { usize::from(sited) };
+            let splits_hits = !is_fused && sited;
+            assert!(
+                saw_front && saw_back && saw_hits == splits_hits,
+                "{label}: expected DecodeFront={saw_front}, DecodeBack={saw_back}, DecodeHits={saw_hits} (want {splits_hits})"
+            );
+            // Verify `routed_site_request` runs at the tail of `DecodeFront`
+            // for general form (fused form folds site publish inline into
+            // `routed_route_streamed` / `routed_land`) and never in `DecodeHits`/`DecodeBack`,
+            // and that general sited blocks split `routed_gate_up_part` + `routed_down_project`
+            // across `DecodeHits` and `DecodeBack` with zero unbound ports.
             for (stage, expected_site_requests, expected_joins) in [
                 (RunStage::Whole, expected_front_site, 1usize),
                 (RunStage::DecodeFront, expected_front_site, 0usize),
+                (RunStage::DecodeHits, 0usize, 0usize),
                 (RunStage::DecodeBack, 0usize, 1usize),
             ] {
+                if stage == RunStage::DecodeHits && !splits_hits {
+                    continue;
+                }
                 let inputs = BlockGraphInputs::of_class(
                     &load,
                     &definition.decoder,
@@ -1596,23 +1637,182 @@ mod sinkhorn_graph_tests {
                     1,
                     BlockCarries::default(),
                 );
-                let (draft, _, _) = checked_block_graph_draft(
-                    NativeGraphMetadata::new(backend),
+                let draft = super::super::block::checked_block_graph_audit_ports(
+                    backend,
                     plan.target().blocks()[0],
                     None,
                     inputs,
                 )
-                .unwrap_or_else(|e| panic!("{label}: {stage:?} draft failed: {e}"));
+                .unwrap_or_else(|e| panic!("{label}: {stage:?} runtime port audit failed: {e}"));
                 assert_eq!(
                     draft.entry_count("routed_site_request"),
                     expected_site_requests,
                     "{label}: {stage:?} routed_site_request count mismatch"
                 );
+                if stage == RunStage::DecodeHits {
+                    assert_eq!(
+                        draft.entry_count("routed_gate_up_part"),
+                        1,
+                        "{label}: DecodeHits routed_gate_up_part count mismatch"
+                    );
+                    assert_eq!(
+                        draft.entry_count("routed_down_project"),
+                        1,
+                        "{label}: DecodeHits routed_down_project count mismatch"
+                    );
+                    assert_eq!(
+                        draft.entry_count("dense_output"),
+                        usize::from(has_shared),
+                        "{label}: DecodeHits dense_output (shared expert) count mismatch"
+                    );
+                }
+                if stage == RunStage::DecodeBack && splits_hits {
+                    assert_eq!(
+                        draft.entry_count("routed_gate_up_part"),
+                        1,
+                        "{label}: DecodeBack split_hits must run routed_gate_up_part"
+                    );
+                    assert_eq!(
+                        draft.entry_count("dense_output"),
+                        0,
+                        "{label}: DecodeBack split_hits must not re-run shared expert dense_output"
+                    );
+                    assert_eq!(
+                        draft.entry_count("routed_down_project"),
+                        1,
+                        "{label}: DecodeBack split_hits must run routed_down_project"
+                    );
+                    assert_eq!(
+                        draft.entry_count("routed_down_sited"),
+                        1,
+                        "{label}: DecodeBack split_hits must run routed_down_sited"
+                    );
+                }
                 if is_sinkhorn {
                     assert_eq!(
                         draft.entry_count("stream_join"),
                         expected_joins,
                         "{label}: {stage:?} stream_join count mismatch"
+                    );
+                }
+            }
+        }
+    }
+
+    /// Contract test (`astra` `mpppad` #1 & #4):
+    /// 1. `DecodeHits` is strictly gated on masked-write support (CUDA only);
+    ///    Metal (`routed_down_project.metal:23`), Vulkan (`routed_down_project.comp:11`),
+    ///    and CPU NEVER report `decode_hits_supported == true` and NEVER seal
+    ///    `RunStage::DecodeHits` or `DecodeBack` in split-hits mode.
+    /// 2. Attempting to build `RunStage::DecodeHits` on a non-masked-write backend
+    ///    (Metal / Vulkan) fails loudly with `Err(...)` instead of silently falling
+    ///    back to unsplit.
+    #[test]
+    fn decode_hits_gated_strictly_on_masked_write_backend_and_fails_loudly_when_unsupported() {
+        use crate::operators::routed::streamed::{
+            decode_hits_supported, routed_down_project_supports_masked_write,
+        };
+        use crate::planning::{HostTier, fixtures};
+
+        assert!(routed_down_project_supports_masked_write(BackendName::Cuda));
+        assert!(!routed_down_project_supports_masked_write(BackendName::Metal));
+        assert!(!routed_down_project_supports_masked_write(BackendName::Vulkan));
+        assert!(!routed_down_project_supports_masked_write(BackendName::Cpu));
+
+        let definition = fixtures::routed_fixture_definition(fixtures::RoutedShape {
+            layers: 2,
+            experts: 64,
+            selected: 4,
+            hidden: 512,
+            intermediate: 512,
+        });
+        let manifest = fixtures::gemma_moe_fixture_manifest(&definition);
+        let magnitude_family_contracts::Operator::RoutedFfn(routed) = &definition.decoder.blocks[0].sublayers[1].op
+        else {
+            panic!("expected RoutedFfn sublayer");
+        };
+        assert!(decode_hits_supported(routed, BackendName::Cuda));
+        assert!(!decode_hits_supported(routed, BackendName::Metal));
+        assert!(!decode_hits_supported(routed, BackendName::Vulkan));
+        assert!(!decode_hits_supported(routed, BackendName::Cpu));
+
+        // Verify `RunStage::sealed` never includes `DecodeHits` when `decode_hits == false`.
+        let unsplit_stages = RunStage::sealed(false, false, true, false, 1);
+        assert!(!unsplit_stages.contains(&RunStage::DecodeHits));
+        assert!(unsplit_stages.contains(&RunStage::DecodeFront));
+        assert!(unsplit_stages.contains(&RunStage::DecodeBack));
+
+        // Verify Metal and Vulkan NEVER seal `DecodeHits` and attempting to build
+        // `RunStage::DecodeHits` on them fails loudly with `Err(...)` instead of
+        // silently falling back to unsplit while `DecodeBack` runs.
+        let codec = KvCodec::Dense;
+        let limits = fixtures::LIMITS;
+        let selection = ComponentSelection { head: false, vision: false };
+        let capacity = ResourceCapacity {
+            domain_bytes: 1 << 30,
+            tensor_operations: crate::TensorOperations::Absent,
+            allocations: seismic::NativeAllocations::EXACT,
+        };
+        for non_cuda in [BackendName::Metal, BackendName::Vulkan] {
+            let layout = resident_layout(ExecutionPath::Native, non_cuda);
+            let resident = ModelLoadPlan::derive(&manifest, &definition, selection, layout, PlannedMethod::Plain, limits)
+                .unwrap_or_else(|e| panic!("{non_cuda:?}: derive failed: {e}"));
+            let substrate = crate::planning::bank_substrate(
+                non_cuda,
+                seismic::NativeAllocations::EXACT,
+                Some(HostTier::Linked),
+                &definition,
+            )
+            .unwrap_or_else(|e| panic!("{non_cuda:?}: bank_substrate failed: {e}"));
+            let load = resident
+                .with_expert_bank_at_floor(&definition, substrate)
+                .unwrap_or_else(|e| panic!("{non_cuda:?}: with_expert_bank_at_floor failed: {e}"));
+            let state = ResourcePlanner::state_plan(&definition, &load, PlannedMethod::Plain, codec, limits, capacity)
+                .unwrap_or_else(|e| panic!("{non_cuda:?}: state_plan failed: {e}"));
+            let plan = load
+                .program_plan(&definition, codec)
+                .unwrap_or_else(|e| panic!("{non_cuda:?}: program_plan failed: {e}"));
+            let certified = certify_target_family::<NativeGraphLayout>(
+                non_cuda,
+                &load,
+                &definition.decoder,
+                &state,
+                plan.target(),
+                limits,
+                crate::PassLaunches::whole_chain(limits),
+            )
+            .unwrap_or_else(|e| panic!("{non_cuda:?}: certify_target_family failed: {e}"));
+            for block in &certified.blocks {
+                for &(_, _, _, stage, _) in block.keys() {
+                    assert_ne!(
+                        stage,
+                        Stage::Run(RunStage::DecodeHits),
+                        "{non_cuda:?} must NEVER seal DecodeHits (lacks masked-write skip semantics)"
+                    );
+                }
+            }
+            let inputs = BlockGraphInputs::of_class(
+                &load,
+                &definition.decoder,
+                &state,
+                0,
+                ((1, 1, 1, 0, 0), Stage::Run(RunStage::DecodeHits)),
+                1,
+                BlockCarries::default(),
+            );
+            match super::super::block::checked_block_graph_audit_ports(
+                non_cuda,
+                plan.target().blocks()[0],
+                None,
+                inputs,
+            ) {
+                Ok(_) => panic!(
+                    "{non_cuda:?}: DecodeHits MUST fail loudly on backends without masked-write support"
+                ),
+                Err(err) => {
+                    assert!(
+                        err.contains("does not split hits") || err.contains("disagrees"),
+                        "{non_cuda:?}: unexpected DecodeHits error: {err}"
                     );
                 }
             }

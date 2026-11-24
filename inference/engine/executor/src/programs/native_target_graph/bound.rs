@@ -1,6 +1,6 @@
 use super::{
     block::{PassGraph, PreparedTargetBlockGraph},
-    classes::{Passes, StagedClass, block_class, once_class},
+    classes::{BindingKey, Passes, StagedClass, binding_key, block_class, once_class},
     entry::{EntryTokens, PreparedPerLayerEntryGraph, PreparedTargetEntryGraph},
     heap::{GraphCounts, block_binding_storage},
     prepared::{PreparedTargetGraphs, block_scope},
@@ -94,23 +94,57 @@ impl BankRun {
         !self.serving.layer_whole(layer) && self.bank.dma_decode_active(layer, rows)
     }
 
-    /// Contiguous `[SOURCE_ROWS, rows, K] i32` view of pinned `DecodeSources`.
-    pub(crate) fn decode_sources_view(&self, rows: u64) -> Result<seismic::Tensor, String> {
-        self.bank.decode_sources_view(rows)
+    /// Acquire a free generation-leased [`crate::experts::transport::DecodeSourceLease`]
+    /// for one decode-split flight (`DecodeFront -> DecodeHits ∥ DMA -> DecodeBack`).
+    pub(crate) fn acquire_decode_source_slot(&self) -> Result<crate::experts::transport::DecodeSourceLease, String> {
+        self.bank.acquire_decode_source_slot()
+    }
+
+    /// Contiguous `[SOURCE_ROWS, rows, K] i32` view of the leased flight's
+    /// pinned `front_sources` buffer.
+    pub(crate) fn decode_front_sources_view(
+        &self,
+        token: crate::experts::transport::DecodeSourceToken,
+        rows: u64,
+    ) -> Result<seismic::Tensor, String> {
+        self.bank.decode_front_sources_view(token, rows)
+    }
+
+    /// Contiguous `[SOURCE_ROWS, rows, K] i32` view of the leased flight's
+    /// pinned `back_sources` buffer.
+    pub(crate) fn decode_back_sources_view(
+        &self,
+        token: crate::experts::transport::DecodeSourceToken,
+        rows: u64,
+    ) -> Result<seismic::Tensor, String> {
+        self.bank.decode_back_sources_view(token, rows)
     }
 
     /// Batch-DMA unpredicted host-tier misses (`source <= -2`) for block `index`
-    /// after `DecodeFront` completes, joining any in-flight `LinkMover` hint
-    /// transfers and returning the `DecodeLanding` (`TransferSync` events +
-    /// pinning consumer leases) for `DecodeBack` (or `None` when all choices
-    /// are already resident/staged).
+    /// after `DecodeFront` completes, populate disjoint `back_sources` (masking
+    /// VRAM hits to `-1` when `split_hits` is true), pin VRAM hit records, join
+    /// any in-flight `LinkMover` hint transfers, and return the owning
+    /// [`crate::experts::transport::DecodeLanding`] for `DecodeBack`.
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn land_decode_misses(
         &self,
         index: usize,
         rows: u64,
-    ) -> Result<Option<crate::experts::transport::DecodeLanding>, String> {
+        prev_landings: Vec<crate::experts::transport::DecodeLanding>,
+        split_hits: bool,
+        source_lease: crate::experts::transport::DecodeSourceLease,
+        hits_submitted: bool,
+    ) -> Result<crate::experts::transport::DecodeLanding, String> {
         let layer = block_layer(self.bank.plan(), index)?;
-        self.bank.land_decode_misses(layer, self.sequence, rows)
+        self.bank.land_decode_misses(
+            layer,
+            self.sequence,
+            rows,
+            prev_landings,
+            split_hits,
+            source_lease,
+            hits_submitted,
+        )
     }
 
     /// If prefill copies host-tier experts into VRAM scratch via hardware DMA
@@ -339,6 +373,17 @@ pub(crate) struct GroupBuffers {
     /// other, which the next block's reads. A place's graphs run in queue
     /// order, so a carry is rewritten only after its reader.
     operands: Vec<[[seismic::Tensor; 2]; 2]>,
+    /// Shared VRAM picks tables (`[places * region_rows, max_top]`, I32),
+    /// one per non-overlapping live-interval slot.
+    picks_slots: Vec<seismic::Tensor>,
+    /// Per history read, `(slot, top)` into `picks_slots`.
+    picks_by_read: Vec<Option<(usize, u64)>>,
+    /// Shared VRAM candidate pool tables
+    /// (`[places * region_rows, max_pool_blocks + max_segments, 2]`, I32),
+    /// one per non-overlapping live-interval slot.
+    pool_slots: Vec<seismic::Tensor>,
+    /// Per history read, `(slot, pool_blocks)` into `pool_slots`.
+    pool_by_read: Vec<Option<(usize, u64)>>,
 }
 
 impl GroupBuffers {
@@ -383,6 +428,8 @@ impl GroupBuffers {
                     normalized: zeros(charges, &values.normalized)?,
                     coefficient: values.coefficient.as_ref().map(|v| zeros(charges, v)).transpose()?,
                     shared_product: values.shared_product.as_ref().map(|v| zeros(charges, v)).transpose()?,
+                    base: values.base.as_ref().map(|v| zeros(charges, v)).transpose()?,
+                    published: values.published.as_ref().map(|v| zeros(charges, v)).transpose()?,
                     join: values.join.as_ref().map(|v| zeros(charges, v)).transpose()?,
                     pre: values.pre.as_ref().map(|v| zeros(charges, v)).transpose()?,
                 })
@@ -407,6 +454,16 @@ impl GroupBuffers {
                 })
                 .collect::<Result<_, _>>()?,
         };
+        let picks_slots = extents
+            .picks
+            .iter()
+            .map(|ext| zeros(charges, ext))
+            .collect::<Result<Vec<_>, _>>()?;
+        let pool_slots = extents
+            .pool
+            .iter()
+            .map(|ext| zeros(charges, ext))
+            .collect::<Result<Vec<_>, _>>()?;
         Ok(Self {
             places,
             taps: allocate(&extents.taps)?,
@@ -418,7 +475,39 @@ impl GroupBuffers {
             decode_crossing,
             decode_blocks,
             operands,
+            picks_slots,
+            picks_by_read: extents.picks_by_read,
+            pool_slots,
+            pool_by_read: extents.pool_by_read,
         })
+    }
+
+    /// The shared VRAM picks buffer and `top` width of history read `read`.
+    pub(crate) fn picks(&self, read: usize) -> Result<(&seismic::Tensor, u64), String> {
+        let (slot, top) = self
+            .picks_by_read
+            .get(read)
+            .and_then(|entry| *entry)
+            .ok_or_else(|| format!("history read {read} has no VRAM picks table"))?;
+        let tensor = self
+            .picks_slots
+            .get(slot)
+            .ok_or_else(|| format!("history read {read} picks slot {slot} out of bounds"))?;
+        Ok((tensor, top))
+    }
+
+    /// The shared VRAM candidate pool buffer and `pool_blocks` of history read `read`.
+    pub(crate) fn pool(&self, read: usize) -> Result<(&seismic::Tensor, u64), String> {
+        let (slot, pool_blocks) = self
+            .pool_by_read
+            .get(read)
+            .and_then(|entry| *entry)
+            .ok_or_else(|| format!("history read {read} has no VRAM candidate pool table"))?;
+        let tensor = self
+            .pool_slots
+            .get(slot)
+            .ok_or_else(|| format!("history read {read} pool slot {slot} out of bounds"))?;
+        Ok((tensor, pool_blocks))
     }
 
     /// The two operand carries of place `place`'s run (`Self::operands`).
@@ -456,6 +545,8 @@ impl GroupBuffers {
         let split = self.split.iter().flat_map(|split| split.crossing.iter().chain([&split.merged.inverse]));
         let decode_crossing = self.decode_crossing.iter().flat_map(|c| c.iter());
         let operands = self.operands.iter().flatten().flatten();
+        let picks = self.picks_slots.iter();
+        let pool = self.pool_slots.iter();
         self.taps
             .iter()
             .chain(&self.per_layer_rows)
@@ -464,6 +555,8 @@ impl GroupBuffers {
             .chain(split)
             .chain(decode_crossing)
             .chain(operands)
+            .chain(picks)
+            .chain(pool)
     }
 }
 
@@ -557,17 +650,29 @@ impl BoundTargetGraphs {
     }
 }
 
-/// Block `index`'s `graphs` of one kind, each bound to the resident weights,
-/// bank parts and constants it reads statically, in their order.
-pub(super) fn bind_block_graphs<K: Copy + std::fmt::Debug, P>(
+/// Block `index`'s `graphs` of one kind, bound once per distinct `key(class)`
+/// to the resident weights, bank parts and constants it reads statically, in
+/// ascending key order with exact vector capacity. Classes sharing a binding
+/// key are verified compatible with the shared static binding.
+pub(super) fn bind_block_graphs<K: Copy + std::fmt::Debug, B: Ord + Copy + std::fmt::Debug, P>(
     graphs: &[(K, Arc<PreparedTargetBlockGraph<P>>)],
     index: usize,
     resident: &ResidentTarget,
     charges: &seismic::Charges,
     constants: &mut ConstantTensors,
-) -> Result<Vec<(K, BoundNativeGraphPlan)>, String> {
-    let mut bound = Vec::with_capacity(graphs.len());
+    key: impl Fn(K) -> B,
+) -> Result<Vec<(B, BoundNativeGraphPlan)>, String> {
+    let mut by_key: BTreeMap<B, BoundNativeGraphPlan> = BTreeMap::new();
     for (class, graph) in graphs {
+        let bkey = key(*class);
+        if let Some(existing) = by_key.get(&bkey) {
+            existing.check_compatible(&graph.plan).map_err(|error| {
+                format!(
+                    "target graph static binding compatibility class {class:?} key {bkey:?} block {index}: {error}"
+                )
+            })?;
+            continue;
+        }
         let constant_tensors = graph
             .constants
             .iter()
@@ -592,22 +697,23 @@ pub(super) fn bind_block_graphs<K: Copy + std::fmt::Debug, P>(
             }))
             .chain(constant_tensors.iter().map(|(port, tensor)| Ok((*port, tensor))))
             .collect::<Result<Vec<_>, String>>()?;
-        bound.push((
-            *class,
-            graph.plan.bind_static(charges, &fixed).map_err(|error| {
-                format!("target graph static binding class {class:?} block {index}: {error}")
-            })?,
-        ));
+        let bound_plan = graph.plan.bind_static(charges, &fixed).map_err(|error| {
+            format!("target graph static binding class {class:?} block {index}: {error}")
+        })?;
+        by_key.insert(bkey, bound_plan);
     }
+    let mut bound = Vec::with_capacity(by_key.len());
+    bound.extend(by_key);
     Ok(bound)
 }
 
-/// A block's bound graphs, as its prepared ones (`BlockGraphs`): a vector
-/// of exactly each kind, what the plan counted (`block_binding_storage`).
+/// A block's bound graphs, deduplicated by `(rows, Topology)` for run and
+/// untapped graphs and keyed by `rows` for passes: a vector of exact capacity
+/// for each kind, matching what the plan counted (`block_binding_storage`).
 pub(super) struct BlockBindings {
-    pub(super) runs: Vec<(StagedClass, BoundNativeGraphPlan)>,
+    pub(super) runs: Vec<(BindingKey, BoundNativeGraphPlan)>,
     pub(super) passes: Vec<(u64, BoundNativeGraphPlan)>,
-    pub(super) untapped: Vec<(StagedClass, BoundNativeGraphPlan)>,
+    pub(super) untapped: Vec<(BindingKey, BoundNativeGraphPlan)>,
 }
 
 /// The bound per-layer entry of a per-layer model.
@@ -774,7 +880,13 @@ impl BoundTargetGraphs {
             tapped,
         ) {
             false => self.staged(index, key),
-            true => sealed_and_bound(&self.prepared.blocks_by_class[index].untapped, &self.bound[index].untapped, index, key),
+            true => sealed_and_bound(
+                &self.prepared.blocks_by_class[index].untapped,
+                &self.bound[index].untapped,
+                index,
+                key,
+                binding_key(key),
+            ),
         }
     }
 
@@ -796,6 +908,7 @@ impl BoundTargetGraphs {
             &self.bound[index].passes,
             index,
             rows,
+            rows,
         )?;
         Ok((graph, bound, rows))
     }
@@ -811,25 +924,32 @@ impl BoundTargetGraphs {
         index: usize,
         key: StagedClass,
     ) -> Result<(&PreparedTargetBlockGraph, &BoundNativeGraphPlan), String> {
-        sealed_and_bound(&self.prepared.blocks_by_class[index].runs, &self.bound[index].runs, index, key)
+        sealed_and_bound(
+            &self.prepared.blocks_by_class[index].runs,
+            &self.bound[index].runs,
+            index,
+            key,
+            binding_key(key),
+        )
     }
 }
 
 /// Block `index`'s graph of `key` among its sealed `graphs` of one kind, and
-/// its binding among their `bound`.
-fn sealed_and_bound<'g, K: Ord + std::fmt::Debug, P>(
+/// its static binding of `bkey` among their deduplicated `bound`.
+fn sealed_and_bound<'g, K: Ord + std::fmt::Debug, B: Ord + std::fmt::Debug, P>(
     graphs: &'g [(K, Arc<PreparedTargetBlockGraph<P>>)],
-    bound: &'g [(K, BoundNativeGraphPlan)],
+    bound: &'g [(B, BoundNativeGraphPlan)],
     index: usize,
     key: K,
+    bkey: B,
 ) -> Result<(&'g PreparedTargetBlockGraph<P>, &'g BoundNativeGraphPlan), String> {
     let graph = graphs
         .binary_search_by(|(class, _)| class.cmp(&key))
         .map(|at| graphs[at].1.as_ref())
         .map_err(|_| format!("target graph {key:?} of block {index} was not sealed"))?;
     let bound = bound
-        .binary_search_by(|(class, _)| class.cmp(&key))
+        .binary_search_by(|(class, _)| class.cmp(&bkey))
         .map(|at| &bound[at].1)
-        .map_err(|_| format!("target graph {key:?} of block {index} was not bound"))?;
+        .map_err(|_| format!("target graph binding {bkey:?} of block {index} was not bound"))?;
     Ok((graph, bound))
 }

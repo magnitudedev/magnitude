@@ -19,14 +19,14 @@ use super::{
     served_row_points, served_row_points_up_to,
 };
 use crate::operators::routed::fused_graph::{TILE_ROWS, grouped_blocks};
-use crate::planning::{BankBinding, HINT_LEADS, HintWeight, RoutedBinding};
+use crate::planning::{BankBinding, RoutedBinding};
 use magnitude_family_contracts::{GluLimit, Operator, RouteNormalization, WeightKind, WeightScope};
 use magnitude_kernels::constants::{
-    MAP_RECORD, MAP_WORDS, POLICY_PRICED, POLICY_WORDS, SOURCE_ROWS, STEP_WORDS, VERIFY_ROWS,
+    MAP_RECORD, MAP_WORDS, POLICY_LINK_NS, POLICY_PRICED, POLICY_WORDS, SOURCE_ROWS, STEP_WORDS, VERIFY_ROWS,
 };
 use magnitude_kernels::{
     routed_combine, routed_expand, routed_experts, routed_gate_up, routed_gate_up_part, routed_group,
-    routed_hint_route, routed_output, routed_output_project, routed_output_streamed, routed_route,
+    routed_output, routed_output_project, routed_output_streamed, routed_route,
     routed_route_shared, routed_route_streamed,
 };
 use seismic::{BuildError, Element, Tensor};
@@ -432,71 +432,6 @@ impl EntryTuning for RoutedRouteSharedTuning {
     });
 }
 
-/// The layer each lead of a streamed layer's route binds
-/// (`ExpertBankPlan::lead_layer`), each with what the route reads of it
-/// (`BankLayer::hinted`); none for the last streamed layer, which hints
-/// nothing.
-pub(crate) fn streamed_hint<'p>(
-    inputs: &ModelInputs<'p>,
-    scope: WeightScope,
-) -> Result<Vec<(WeightScope, &'p [HintWeight])>, String> {
-    let bank = inputs
-        .load
-        .expert_bank()
-        .ok_or("a streamed layer's load holds no bank")?;
-    let (index, _) = bank
-        .layer(scope)
-        .ok_or_else(|| format!("{scope:?} is not a streamed layer"))?;
-    // Each lead's layer (`ExpertBankPlan::lead_layer`); none where the
-    // layer predicts none and binds its own.
-    Ok((0..HINT_LEADS as usize)
-        .map(|lead| bank.lead_layer(index, lead))
-        .filter(|&layer| layer != index)
-        .map(|layer| (bank.layers()[layer].scope, bank.layers()[layer].hinted.as_slice()))
-        .collect())
-}
-
-/// The hint ports of kinds `kinds` at every lead a route binds: of each
-/// lead, the layer `hinted` (`streamed_hint`) names there; of every lead,
-/// its `own` where `hinted` names none.
-pub(crate) fn lead_ports<const N: usize>(
-    inputs: &mut TuningInputs<'_, '_>,
-    hinted: &[(WeightScope, &[HintWeight])],
-    kinds: [WeightKind; N],
-    own: [&Tensor; N],
-) -> Result<[[Tensor; N]; HINT_LEADS as usize], BuildError> {
-    let mut leads = Vec::with_capacity(HINT_LEADS as usize);
-    for lead in 0..HINT_LEADS as usize {
-        let mut ports = Vec::with_capacity(N);
-        for (&kind, own) in kinds.iter().zip(own) {
-            ports.push(hint_port(inputs, hinted.get(lead).copied(), kind, own)?);
-        }
-        leads.push(<[Tensor; N]>::try_from(ports).unwrap_or_else(|_| unreachable!("N ports")));
-    }
-    Ok(<[[Tensor; N]; HINT_LEADS as usize]>::try_from(leads).unwrap_or_else(|_| unreachable!("a port set per lead")))
-}
-
-/// A hint port of the layer `hinted` predicts, of `kind`: that layer's own
-/// weight where the route reads it (`HintWeight::element`), else `own`,
-/// the hinting layer's port, as serving binds them
-/// (`operators::routed::streamed::StreamedLayer::hints`).
-pub(crate) fn hint_port(
-    inputs: &mut TuningInputs<'_, '_>,
-    hinted: Option<(WeightScope, &[HintWeight])>,
-    kind: WeightKind,
-    own: &Tensor,
-) -> Result<Tensor, BuildError> {
-    let next = hinted.filter(|(_, hints)| {
-        hints
-            .iter()
-            .any(|hint| hint.kind == kind && hint.element.is_some())
-    });
-    match next {
-        Some((scope, _)) => inputs.weight(scope, kind),
-        None => Ok(own.clone()),
-    }
-}
-
 /// The bank operands of a streamed layer's route or selection
 /// (`routed_route_streamed`, `routed_select_streamed`) at one point of
 /// `rows` rows, in the storage the bank holds each in
@@ -541,9 +476,10 @@ impl BankOperands {
         for (word, value) in magnitude_kernels::step_words(1, 0).into_iter().enumerate() {
             step.store_release(4 * word as u64, u32::from_ne_bytes(value.to_ne_bytes()))?;
         }
-        // Priced, over zero lines: a sited route's assignment runs.
+        // Priced, with link > cpu: a sited route's assignment runs and offloads to CPU.
         let policy = words(inputs, &[POLICY_WORDS])?;
         policy.store_release(4 * POLICY_PRICED, 1)?;
+        policy.store_release(4 * POLICY_LINK_NS, 1)?;
         let (flight, ring) = (bank.words.flight, bank.words.ring_words());
         Ok(Self {
             map: unmapped(inputs, &[bank.experts, MAP_WORDS], MAP_WORDS, MAP_RECORD)?,
@@ -734,127 +670,6 @@ impl EntryTuning for RoutedRouteStreamedTuning {
     }
 
     generated_entry!(routed_route_streamed, this => this.elements());
-}
-
-/// `routed_hint_route`: ahead-of-step expert hints for streamed fused layers
-/// at `ahead` (`1..=HINT_LEADS`).
-#[derive(Clone)]
-pub(crate) struct RoutedHintRouteTuning {
-    pub resident: RoutedRouteTuning,
-    pub layers: Vec<WeightScope>,
-    pub bank: BankBinding,
-    pub ahead: u64,
-}
-
-pub(crate) struct RoutedHintRouteCase {
-    residual: Tensor,
-    activation: Tensor,
-    leads: [[Tensor; 2]; HINT_LEADS as usize],
-    eps: f32,
-    step: Tensor,
-    next_policy: Tensor,
-    rings: CaseState,
-}
-
-impl EntryTuning for RoutedHintRouteTuning {
-    type Entry = routed_hint_route::Entry;
-    type Case = RoutedHintRouteCase;
-
-    fn launches(&self) -> usize {
-        self.layers.len()
-    }
-
-    fn bindings(&self) -> String {
-        self.resident.bindings()
-    }
-
-    fn statics(&self, inputs: &ModelInputs<'_>) -> Result<Vec<(&'static str, u64)>, String> {
-        let shape = self.resident.shape;
-        let (parts, norm) = inputs.input_form(&self.layers, shape.hidden)?;
-        Ok(vec![
-            ("H", shape.hidden),
-            ("PT", parts),
-            ("NM", norm),
-            ("K", shape.selected),
-            ("AHEAD", self.ahead),
-            ("EN", self.bank.next_experts),
-        ])
-    }
-
-    fn points(&self, limits: TuningLimits) -> Vec<PointShape> {
-        decode_points(limits)
-    }
-
-    fn rotation(
-        &self,
-        inputs: &mut TuningInputs<'_, '_>,
-        point: &PointShape,
-    ) -> Result<Vec<Self::Case>, BuildError> {
-        let mut over = self.resident.clone();
-        over.scopes = self.layers.clone();
-        let scopes = TuningInputs::rotation_scopes(&self.layers, point);
-        let ring = self.bank.words.ring_words();
-        over.rotation(inputs, point)?
-            .into_iter()
-            .zip(scopes)
-            .map(|(route, scope)| {
-                let hinted = streamed_hint(inputs, scope)?;
-                let leads = lead_ports(
-                    inputs,
-                    &hinted,
-                    [WeightKind::InputNorm, WeightKind::Router],
-                    [&route.norm, &route.router],
-                )?;
-                let step = words(inputs, &[STEP_WORDS])?;
-                for (word, value) in magnitude_kernels::step_words(1, 0).into_iter().enumerate() {
-                    step.store_release(4 * word as u64, u32::from_ne_bytes(value.to_ne_bytes()))?;
-                }
-                Ok(RoutedHintRouteCase {
-                    residual: route.residual,
-                    activation: inputs.scratch(self.resident.activation, &[0, self.resident.shape.selected])?,
-                    leads,
-                    eps: route.epsilon,
-                    step,
-                    next_policy: words(inputs, &[POLICY_WORDS])?,
-                    rings: written(inputs, words(inputs, &[self.ahead, ring])?)?,
-                })
-            })
-            .collect()
-    }
-
-    fn args<'a>(case: &'a mut Self::Case) -> routed_hint_route::Args<'a> {
-        let RoutedHintRouteCase {
-            residual,
-            activation,
-            leads: [[next_norm, next_router], [after_norm, after_router]],
-            eps,
-            step,
-            next_policy,
-            rings,
-        } = case;
-        routed_hint_route::Args {
-            residual,
-            activation,
-            next_norm,
-            next_router,
-            after_norm,
-            after_router,
-            eps: *eps,
-            step,
-            next_policy,
-            rings: rings.tensor_mut(),
-        }
-    }
-
-    fn state(case: &Self::Case) -> Vec<(&'static str, &CaseState)> {
-        vec![("rings", &case.rings)]
-    }
-
-    generated_entry!(routed_hint_route, this => routed_hint_route::Elements {
-        NW: this.resident.norm,
-        RW: this.resident.router,
-        A: this.resident.activation,
-    });
 }
 
 /// The static values a streamed layer's route or selection adds to its

@@ -1775,11 +1775,18 @@ pub(crate) fn allocate<U: Unit>(
         report.ending.passes += 1;
         report.ending.deciding += clock.now().saturating_sub(opened).saturating_sub(apart);
     }
-    // Every unit's record is published as it stands, whatever became of
-    // the work, while the compiles of the pieces abandoned in flight run.
-    let settling = clock.now();
-    let settled = units.iter_mut().try_for_each(|unit| unit.settle(context));
-    report.settling += clock.now().saturating_sub(settling);
+    // Every unit's record is published as it stands when the work completes
+    // normally, while the compiles of the pieces abandoned in flight run.
+    // When the work aborted with a failure, skip settling so unsearched units
+    // are never persisted into the cache as permanent defaults.
+    let settled = if outcome.is_ok() {
+        let settling = clock.now();
+        let settled = units.iter_mut().try_for_each(|unit| unit.settle(context));
+        report.settling += clock.now().saturating_sub(settling);
+        settled
+    } else {
+        Ok(())
+    };
     // Everything owed is settled: what the units still hold of their
     // inputs leaves with the optional work.
     for unit in 0..units.len() {
@@ -2181,6 +2188,8 @@ mod tests {
         /// What building the unit's inputs took, as its built quote
         /// states it while they are resident ([`Unit::built`]).
         rebuild: Duration,
+        /// Optional failure returned by `perform` to test aborted allocation.
+        fail_perform: Option<String>,
     }
 
     /// The bytes the synthetic units hold, the most they held, the ceiling
@@ -2286,6 +2295,7 @@ mod tests {
                 shared: Vec::new(),
                 later: 0,
                 rebuild: Duration::ZERO,
+                fail_perform: None,
             }
         }
 
@@ -2631,6 +2641,9 @@ mod tests {
         }
 
         fn perform(&mut self, log: &mut Log, before: Duration) -> Result<Duration, String> {
+            if let Some(error) = self.fail_perform.clone() {
+                return Err(error);
+            }
             let work = self.next().expect("a unit performs the work it named");
             log.borrow_mut()
                 .push((self.name, work.stage, self.clock.now()));
@@ -5131,5 +5144,47 @@ mod tests {
             matches!(first_measure, Some(1 | 2)),
             "a decode unit must enter Stage::Measure before heavy prefill: {stage_log:?}"
         );
+    }
+
+    /// When a piece fails during `perform`, `allocate` aborts without calling
+    /// `settle` on unsearched units (so aborted loads never poison the cache
+    /// with permanent defaults), while still releasing any resident inputs.
+    #[test]
+    fn aborted_allocation_does_not_settle_unsearched_units() {
+        let clock = Fake::default();
+        let mut units = [
+            Synthetic {
+                changed: true,
+                inputs: 1024,
+                fail_perform: Some("capacity refused".into()),
+                ..Synthetic::new(0, &clock, 0.5, &[0.8])
+            },
+            Synthetic {
+                changed: true,
+                inputs: 1024,
+                resident: true,
+                ..Synthetic::new(1, &clock, 0.5, &[0.8])
+            },
+        ];
+        MEMORY.with(|memory| {
+            let mut now = memory.get();
+            now.held = 1024;
+            memory.set(now);
+        });
+        let mut log = Log::default();
+        let mut workers = Overlapping::new(&clock, 1);
+        let (_, outcome) = allocate(
+            &mut units,
+            &mut log,
+            &clock,
+            &mut workers,
+            SECOND * 30,
+            Duration::ZERO,
+            Duration::ZERO,
+        );
+        assert_eq!(outcome, Err("capacity refused".to_string()));
+        assert_eq!(units[0].published, 0, "failing unit must not settle on abort");
+        assert_eq!(units[1].published, 0, "unsearched peer must not settle on abort");
+        assert!(!units[1].resident, "resident inputs are still released on abort");
     }
 }

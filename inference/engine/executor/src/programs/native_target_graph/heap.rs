@@ -2,7 +2,7 @@ use super::{
     block::{BlockGraphs, PassGraph, PreparedTargetBlockGraph},
     bound::BlockBindings,
     certify::CertifiedBlockGraph,
-    classes::StagedClass,
+    classes::{BindingKey, StagedClass},
     weights::{BankPort, GraphTimeline, WeightPort},
 };
 use crate::{
@@ -146,17 +146,17 @@ pub(super) fn block_graph_storage(classes: &[GraphCounts], sealed: GraphCounts) 
 }
 
 /// The host heap of the vectors that hold a target's block bindings: one of
-/// the blocks' `BlockBindings`, and each block's of its run graphs' and
-/// passes' bindings, `bindings[block]` of them. What the planner counts and
+/// the blocks' `BlockBindings`, and each block's deduplicated run, pass, and
+/// untapped bindings, `bindings[block]` of them. What the planner counts and
 /// what `BoundTargetGraphs` allocates.
 pub(super) fn block_binding_storage(bindings: &[GraphCounts]) -> Result<HostHeap, String> {
     use std::mem::size_of;
     bindings
         .iter()
         .try_fold(HostHeap::allocation(bindings.len(), size_of::<BlockBindings>()), |heap, counts| {
-            heap.plus(HostHeap::allocation(counts.runs, size_of::<(StagedClass, BoundNativeGraphPlan)>()))?
+            heap.plus(HostHeap::allocation(counts.runs, size_of::<(BindingKey, BoundNativeGraphPlan)>()))?
                 .plus(HostHeap::allocation(counts.passes, size_of::<(u64, BoundNativeGraphPlan)>()))?
-                .plus(HostHeap::allocation(counts.untapped, size_of::<(StagedClass, BoundNativeGraphPlan)>()))
+                .plus(HostHeap::allocation(counts.untapped, size_of::<(BindingKey, BoundNativeGraphPlan)>()))
         })
         .ok_or_else(|| "target binding storage overflows".to_owned())
 }

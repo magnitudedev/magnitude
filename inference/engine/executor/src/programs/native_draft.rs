@@ -509,7 +509,10 @@ impl<'a> DraftGraphEntries<'a, NativeGraph> {
                     attention: (&block.attention).into(),
                     injection: (&block.injection).into(),
                     feed_forward: (&block.feed_forward).into(),
-                    bank: block.bank.as_ref().map(BankGraphEntries::from),
+                    bank: block
+                        .bank
+                        .as_ref()
+                        .map(|bank| BankGraphEntries::for_backend(bank, seismic::BackendName::Cpu)),
                 })
                 .collect(),
             streams: draft.streams.as_ref().map(|streams| DraftStreamsEntries {
@@ -2680,7 +2683,7 @@ impl<'r, 'a, G: GraphDraft + 'a> BlockPass<'r, 'a, G> {
                             ffn_scope,
                             weights,
                             constants,
-                            &site.input,
+                            Some(&site.input),
                             RoutedSum::Branch,
                             &Dim::from(rows),
                             epsilon,
@@ -2719,7 +2722,7 @@ impl<'r, 'a, G: GraphDraft + 'a> BlockPass<'r, 'a, G> {
                             ffn_scope,
                             weights,
                             constants,
-                            &carry.rows,
+                            Some(&carry.rows),
                             RoutedSum::Residual,
                             &Dim::from(rows),
                             epsilon,
@@ -4929,7 +4932,7 @@ impl NativeDraftProgram {
             HeadOutput {
                 selected: selections.map_or(HeadSelected::Causal, HeadSelected::Proposals),
                 landed_reads: landed.into_iter().map(SelectedRead::submitted).collect(),
-                expert_step: expert_step.map(|(_, step)| step),
+                expert_steps: expert_step.into_iter().map(|(_, step)| step).collect(),
             },
         ))
     }
@@ -5877,36 +5880,33 @@ mod composition_tests {
         assert!(draft_layers.iter().all(|(_, layer)| layer.group == draft_group));
 
         // On discrete CUDA (`Placer::Tier`), once `slots` exceeds the target
-        // decode/verify working set (`draft_pin_threshold()`), draft layers pin
-        // all `layer.experts` (32/32 -> whole draft group); on tight VRAM
-        // (`slots <= threshold`), draft layers fall back to shared `slots`.
-        // Here `setup_draft_fixture(..., 6)` sets `E = 32`, `K = 6`, so at
-        // `slots = 24 <= threshold` draft stays at shared 24, and with
-        // `decode_rows = 3` (`threshold = 18`), `slots = 24 > 18` pins 32/32.
+        // decode/verify working set (`draft_pin_threshold()`), draft layers ramp
+        // smoothly 1 slot at a time to `layer.experts` (32/32 -> whole draft
+        // group) while target layers hold at `threshold`, then target resumes
+        // growing 1:1. On tight VRAM (`slots <= threshold`), both grow together.
         let threshold = bank.draft_pin_threshold().expect("discrete bank has draft pin threshold");
+        let extra = bank.draft_extra_slots();
         for (_, layer) in &draft_layers {
             assert_eq!(bank.layer_vram_slots(layer, threshold), threshold.min(layer.experts));
-            assert_eq!(bank.layer_vram_slots(layer, threshold + 1), layer.experts);
+            assert_eq!(bank.layer_vram_slots(layer, threshold + 1), (threshold + 1).min(layer.experts));
+            assert_eq!(bank.layer_vram_slots(layer, threshold + extra), layer.experts);
         }
         for (_, layer) in &target_layers {
-            assert_eq!(bank.layer_vram_slots(layer, 24), 24);
+            assert_eq!(bank.layer_vram_slots(layer, threshold), threshold.min(layer.experts));
+            assert_eq!(bank.layer_vram_slots(layer, threshold + extra), threshold.min(layer.experts));
+            assert_eq!(bank.layer_vram_slots(layer, threshold + extra + 1), (threshold + 1).min(layer.experts));
         }
-        assert_eq!(bank.records_at(draft_group, threshold + 1), 3 * 32);
+        assert_eq!(bank.records_at(draft_group, threshold + extra), 3 * 32);
         assert_eq!(bank.records_at(draft_group, 45), 3 * 32);
-        assert!(bank.whole_at(bank.widest().get()), "bank must reach whole when slots >= widest");
+        assert!(bank.whole_at(bank.max_slots()), "bank must reach whole at max_slots");
         assert!(
             bank.host_records(draft_group, 32) >= 3 * 32,
             "all 3×32 draft experts must be backed in pinned Host RAM"
         );
 
-        // First draft layer sets its own step word; target does not hint draft, draft does not hint.
-        let last_target_idx = target_layers.last().unwrap().0;
+        // First draft layer sets its own step word.
         let first_draft_idx = draft_layers[0].0;
-        assert_eq!(bank.ahead(last_target_idx), 0);
         assert!(bank.sets_step(first_draft_idx));
-        for &(idx, _) in &draft_layers {
-            assert_eq!(bank.ahead(idx), 0);
-        }
 
         // Every draft expert stack in head_weights is Holding::Banked with source_bytes = 0.
         let head_weights = banked_load.head().expect("head weights present");

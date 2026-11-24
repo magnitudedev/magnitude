@@ -44,10 +44,8 @@ pub enum BankPart {
     /// `RegionWords::scratch`).
     FileTable,
     ScratchTable,
-    /// The layer's hint rings, one per layer it predicts
-    /// (`ExpertBankPlan::ahead`), and its routing records, one for each
-    /// step in flight (`RegionWords::flight`), ring words each.
-    Rings,
+    /// The layer's routing records, one for each step in flight
+    /// (`RegionWords::flight`), ring words each.
     Routing,
     /// The layer's key records, `[FLIGHT, VERIFY_ROWS, E]` (`RegionWords::flight`):
     /// each row's selection key of every expert, as f32 bits, beside its
@@ -188,7 +186,6 @@ impl BankPart {
             | Self::Tier { .. }
             | Self::FileTable
             | Self::ScratchTable
-            | Self::Rings
             | Self::Front
             | Self::Routing
             | Self::Keys
@@ -227,7 +224,6 @@ impl BankPart {
             Self::TierMap,
             Self::FileTable,
             Self::ScratchTable,
-            Self::Rings,
             Self::Front,
             Self::Routing,
             Self::Keys,
@@ -373,6 +369,9 @@ pub struct BankSubstrate {
     pub(in crate::planning) backend: seismic::BackendName,
     pub(in crate::planning) allocations: seismic::NativeAllocations,
     pub(in crate::planning) host: HostTier,
+    /// Whether the opened/target device exposes a distinct side queue for
+    /// async transfers / fill DMA beside compute (`Executor::has_side_queue`).
+    pub(in crate::planning) has_side_queue: bool,
 }
 
 #[cfg(test)]
@@ -382,7 +381,12 @@ impl BankSubstrate {
         allocations: seismic::NativeAllocations,
         host: HostTier,
     ) -> Self {
-        Self { backend, allocations, host }
+        Self {
+            backend,
+            allocations,
+            host,
+            has_side_queue: backend.fills_beside_compute(),
+        }
     }
 }
 
@@ -574,7 +578,6 @@ pub struct LayerAllocations<T> {
     /// `ScratchTable`).
     pub file: T,
     pub scratch: T,
-    pub rings: T,
     pub routing: T,
     /// The key records (`BankPart::Keys`).
     pub keys: T,
@@ -662,13 +665,12 @@ impl<T> BankLayout<T> {
             owned.extend(records.iter().map(|(_, records)| ("group: records", records)));
             owned.extend([("group: map", map), ("group: commits", commits)]);
         }
-        for LayerAllocations { expert_scales, tier, file, scratch, rings, front, routing, keys, policy, sited, landing, land_grid, rounds, tiered, seeds, windows } in layers {
+        for LayerAllocations { expert_scales, tier, file, scratch, front, routing, keys, policy, sited, landing, land_grid, rounds, tiered, seeds, windows } in layers {
             owned.extend(expert_scales.iter().filter_map(|(_, scale)| scale.as_ref()).map(|scale| ("layer: expert scales", scale)));
             owned.extend(tier.iter().map(|tier| ("layer: tier words", tier)));
             owned.extend([
                 ("layer: file words", file),
                 ("layer: scratch words", scratch),
-                ("layer: hint rings", rings),
                 ("layer: front ring", front),
                 ("layer: routing records", routing),
                 ("layer: policy", policy),
@@ -722,7 +724,6 @@ impl<T> BankLayout<T> {
                 tier: layer.tier.as_ref().map(&mut make).transpose()?,
                 file: make(&layer.file)?,
                 scratch: make(&layer.scratch)?,
-                rings: make(&layer.rings)?,
                 routing: make(&layer.routing)?,
                 keys: make(&layer.keys)?,
                 front: make(&layer.front)?,
@@ -812,7 +813,6 @@ impl ExpertBankPlan {
             BankPart::ScratchFlags => words(self.widest().get()),
             BankPart::FileTable => Ok(Some((Element::i32(), binding()?.words.file().extents().to_vec()))),
             BankPart::ScratchTable => Ok(Some((Element::i32(), binding()?.words.scratch().extents().to_vec()))),
-            BankPart::Rings => Ok(Some((Element::i32(), vec![self.ahead(layer), binding()?.words.ring_words()]))),
             BankPart::Front => Ok(Some((Element::i32(), vec![binding()?.words.ring_words()]))),
             BankPart::Routing => {
                 let words = binding()?.words;
@@ -932,7 +932,6 @@ impl ExpertBankPlan {
                         let (element, extents) = shape(index, BankPart::ScratchTable)?;
                         BankAllocation::Protocol { element, extents }
                     },
-                    rings: words(index, BankPart::Rings)?,
                     routing: words(index, BankPart::Routing)?,
                     keys: words(index, BankPart::Keys)?,
                     front: words(index, BankPart::Front)?,
@@ -975,15 +974,11 @@ impl ExpertBankPlan {
         let staging = staging_pools
             .iter()
             .zip(pool_hints)
-            .map(|(pool, has_hints)| BankAllocation::Shared {
-                element: pool.source,
-                extents: vec![
-                    self.pool_staging_records_with_paths(has_hints, self.paths),
-                    pool.matrix[0],
-                    pool.matrix[1],
-                ],
+            .map(|(pool, has_hints)| {
+                let count = self.pool_staging_records_with_paths(has_hints, self.paths);
+                self.staging_allocation(pool, count)
             })
-            .collect();
+            .collect::<Result<Vec<_>, String>>()?;
         let host = self.tiered().then(|| {
             self.groups()
                 .iter()
@@ -1141,18 +1136,49 @@ impl ExpertBankPlan {
         let (staging_pools, pool_of) = self.staging_pools();
         let pool_hints = self.structure().pool_has_target(&pool_of, staging_pools.len());
         for (pool, has_hints) in staging_pools.iter().zip(pool_hints) {
-            let staging = BankAllocation::Shared {
-                element: pool.source,
-                extents: vec![
-                    self.pool_staging_records_with_paths(has_hints, paths),
-                    pool.matrix[0],
-                    pool.matrix[1],
-                ],
-            };
+            let staging = self.staging_allocation(pool, self.pool_staging_records_with_paths(has_hints, paths))?;
             total = total
                 .checked_plus(staging.storage_demand(self.host())?)
                 .ok_or_else(|| "bank staging storage demand overflows".to_owned())?;
         }
         Ok(total)
+    }
+
+    /// Bytes per staging record slot for `pool`: on `Placer::Tier` (discrete
+    /// GPUs where the host converts staging into `HostTier` and `routed_land`
+    /// never binds `BankPart::Staging`), includes `ALIGNED_HEADROOM + ALIGNMENT`
+    /// rounded up to `ALIGNMENT` so every staging record lands 100% zero-bounce
+    /// via `AlignedRange`; on `Placer::Bank` (unified memory where `routed_land`
+    /// binds `BankPart::Staging` directly), keeps the exact `pool.record_bytes()`.
+    pub fn staging_slot_bytes(&self, pool: &super::StagingPool) -> Result<u64, String> {
+        let base = pool.record_bytes()?;
+        if self.placer() == Placer::Tier {
+            let headroom = seismic_io::ALIGNED_HEADROOM as u64 + seismic_io::ALIGNMENT;
+            let padded = base
+                .checked_add(headroom)
+                .ok_or_else(|| "staging slot bytes overflow".to_owned())?;
+            Ok(padded.next_multiple_of(seismic_io::ALIGNMENT))
+        } else {
+            Ok(base)
+        }
+    }
+
+    /// The `BankAllocation` for `pool`'s staging buffer of `records` slots,
+    /// shared between [`Self::layout`] and [`Self::paths_layout_demand`] so
+    /// memory budgeting and allocation have a single owner.
+    fn staging_allocation(&self, pool: &super::StagingPool, records: u64) -> Result<BankAllocation, String> {
+        if self.placer() == Placer::Tier {
+            let slot_bytes = self.staging_slot_bytes(pool)?;
+            debug_assert!(slot_bytes.is_multiple_of(4));
+            Ok(BankAllocation::Shared {
+                element: Element::i32(),
+                extents: vec![records, slot_bytes / 4],
+            })
+        } else {
+            Ok(BankAllocation::Shared {
+                element: pool.source,
+                extents: vec![records, pool.matrix[0], pool.matrix[1]],
+            })
+        }
     }
 }

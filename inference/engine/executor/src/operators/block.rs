@@ -1273,7 +1273,7 @@ impl<W: PlannedWeights + ?Sized> SublayerGraph<'_, W> {
         graph: &mut G,
         feed_forward: FeedForwardGraph<'_, 'e, G>,
         streams: Option<StreamsEntries<'e, G>>,
-        carry: ResidualCarry<WorkflowTensor>,
+        carry: Option<ResidualCarry<WorkflowTensor>>,
         weights: &mut Vec<(WeightPort, NativePort)>,
         constants: &mut Vec<GraphConstant>,
         split: Option<Split<'_>>,
@@ -1282,19 +1282,21 @@ impl<W: PlannedWeights + ?Sized> SublayerGraph<'_, W> {
         let FeedForwardGraph { entries, bank } = feed_forward;
         let (planned, rows, scope) = (self.weights, &self.numbers.rows, self.scope(1));
         let epsilon = self.topology.epsilon.f32();
-        let mixed = &carry.rows;
         // A split layer's front exports the carry it read; the others carry
         // their output rows on with the site's pre.
-        let front = matches!(split, Some(Split::Front(_) | Split::DecodeFront(_)));
-        let carried = |output: WorkflowTensor, pre: Option<WorkflowTensor>| match front {
-            true => carry.clone(),
-            false => ResidualCarry { rows: output, pre },
+        let front = matches!(split, Some(Split::Front(_) | Split::DecodeFront(_) | Split::DecodeHits(_)));
+        let carried = |output: WorkflowTensor, pre: Option<WorkflowTensor>| match (front, &carry) {
+            (true, Some(carry)) => carry.clone(),
+            _ => ResidualCarry { rows: output, pre },
         };
         if operand.is_some() && !matches!(&self.topology.feed_forward, Some((_, FeedForwardTopology::Routed(_)))) {
             return Err("only a fused routed feed-forward forms the next block's operand".into());
         }
         let (read, topology, entries) = match (&self.topology.feed_forward, entries) {
-            (None, None) => return Ok((carry.clone(), None)),
+            (None, None) => {
+                let carry = carry.ok_or("a lone mixer block reads no residual carry")?;
+                return Ok((carry, None));
+            }
             (Some((read, topology)), Some(entries)) => (*read, topology, entries),
             _ => return Err("target block feed-forward and its kernel entries disagree".into()),
         };
@@ -1304,6 +1306,8 @@ impl<W: PlannedWeights + ?Sized> SublayerGraph<'_, W> {
                 Some(FeedForwardNumbers::Dense(numbers)),
                 FeedForwardEntries::Dense(entries),
             ) => {
+                let carry = carry.as_ref().ok_or("a dense feed-forward reads no residual carry")?;
+                let mixed = &carry.rows;
                 let dense = |graph: &mut G,
                              weights: &mut Vec<(WeightPort, NativePort)>,
                              constants: &mut Vec<GraphConstant>,
@@ -1322,7 +1326,7 @@ impl<W: PlannedWeights + ?Sized> SublayerGraph<'_, W> {
                             graph,
                             read,
                             streams,
-                            &carry,
+                            carry,
                             weights,
                             constants,
                             false,
@@ -1349,6 +1353,8 @@ impl<W: PlannedWeights + ?Sized> SublayerGraph<'_, W> {
                 Some(FeedForwardNumbers::Routed(numbers)),
                 FeedForwardEntries::Routed(entries),
             ) => {
+                let carry = carry.as_ref().ok_or("a fused routed feed-forward reads no residual carry")?;
+                let mixed = &carry.rows;
                 let read = read.ok_or("a routed feed-forward without its input source")?;
                 let mut split = split;
                 // A split layer's back (`Combine` / `DecodeBack`) never reads
@@ -1357,22 +1363,32 @@ impl<W: PlannedWeights + ?Sized> SublayerGraph<'_, W> {
                 // avoids running `stream_mix` twice per layer.
                 let SublayerRead { input: input_rows, form, join, pre } = match &mut split {
                     Some(Split::Combine(back, _)) => {
-                        self.crossed_read(read, &carry, back.crossing.join.as_ref(), back.crossing.pre.as_ref())?
+                        self.crossed_read(read, carry, back.crossing.join.as_ref(), back.crossing.pre.as_ref())?
                     }
                     Some(Split::DecodeBack(crossing)) => {
-                        self.crossed_read(read, &carry, crossing.join.as_ref(), crossing.pre.as_ref())?
+                        let (join_port, pre_port) = crossing.declare_stream_join_pre(graph)?;
+                        self.crossed_read(
+                            read,
+                            carry,
+                            join_port.as_deref(),
+                            pre_port.as_deref(),
+                        )?
                     }
                     Some(Split::Front(crossing)) => {
-                        let sublayer_read = self.read(graph, read, streams, 1, &carry, weights, constants)?;
+                        let sublayer_read = self.read(graph, read, streams, 1, carry, weights, constants)?;
                         store_crossed_read(graph, &sublayer_read, crossing.join.as_mut(), crossing.pre.as_mut())?;
                         sublayer_read
                     }
                     Some(Split::DecodeFront(crossing)) => {
-                        let sublayer_read = self.read(graph, read, streams, 1, &carry, weights, constants)?;
-                        store_crossed_read(graph, &sublayer_read, crossing.join.as_mut(), crossing.pre.as_mut())?;
+                        let sublayer_read = self.read(graph, read, streams, 1, carry, weights, constants)?;
+                        let (join_port, pre_port) = crossing.declare_stream_join_pre(graph)?;
+                        store_crossed_read(graph, &sublayer_read, join_port, pre_port)?;
                         sublayer_read
                     }
-                    None => self.read(graph, read, streams, 1, &carry, weights, constants)?,
+                    Some(Split::DecodeHits(_)) => {
+                        return Err("DecodeHits is not supported for fused routed feed-forward".into());
+                    }
+                    None => self.read(graph, read, streams, 1, carry, weights, constants)?,
                 };
                 let (output, sequence) = routed_graph::routed(
                     graph,
@@ -1399,10 +1415,11 @@ impl<W: PlannedWeights + ?Sized> SublayerGraph<'_, W> {
                 Some(FeedForwardNumbers::GeneralRouted(numbers)),
                 FeedForwardEntries::GeneralRouted(entries),
             ) => {
+                let is_decode_hits = matches!(split, Some(Split::DecodeHits(_)));
                 let routed = |graph: &mut G,
                               weights: &mut Vec<(WeightPort, NativePort)>,
                               constants: &mut Vec<GraphConstant>,
-                              input: &WorkflowTensor,
+                              input: Option<&WorkflowTensor>,
                               sum| {
                     general_routed(
                         graph, entries, bank, topology, numbers, planned, scope, weights, constants, input, sum, rows,
@@ -1411,21 +1428,34 @@ impl<W: PlannedWeights + ?Sized> SublayerGraph<'_, W> {
                 };
                 return match read {
                     None | Some(ReadTopology::Norm) => {
-                        let (output, sequence) = routed(graph, weights, constants, mixed, RoutedSum::Residual)?;
-                        Ok((carried(output, carry.pre.clone()), sequence))
+                        let (output, sequence) =
+                            routed(graph, weights, constants, carry.as_ref().map(|c| &c.rows), RoutedSum::Residual)?;
+                        let pre = carry.as_ref().and_then(|c| c.pre.clone());
+                        Ok((carried(output, pre), sequence))
                     }
                     // Over Sinkhorn streams the routed branch sums onto
-                    // zeros (`RoutedSum::Branch`).
-                    Some(read @ ReadTopology::Sinkhorn(_)) => self.sinkhorn_branch(
-                        graph,
-                        read,
-                        streams,
-                        &carry,
-                        weights,
-                        constants,
-                        front,
-                        |graph, weights, constants, input| routed(graph, weights, constants, input, RoutedSum::Branch),
-                    ),
+                    // zeros (`RoutedSum::Branch`). On `DecodeHits` without a
+                    // shared expert, no residual carry or `stream_mix` is read.
+                    Some(read @ ReadTopology::Sinkhorn(_)) => match &carry {
+                        None if is_decode_hits => {
+                            let (output, sequence) =
+                                routed(graph, weights, constants, None, RoutedSum::Branch)?;
+                            Ok((carried(output, None), sequence))
+                        }
+                        Some(carry) => self.sinkhorn_branch(
+                            graph,
+                            read,
+                            streams,
+                            carry,
+                            weights,
+                            constants,
+                            front,
+                            |graph, weights, constants, input| {
+                                routed(graph, weights, constants, Some(input), RoutedSum::Branch)
+                            },
+                        ),
+                        None => Err("a Sinkhorn general routed layer reads no residual carry".into()),
+                    },
                     Some(ReadTopology::Mix { .. }) => Err("a general routed feed-forward over low-rank streams".into()),
                 };
             }
@@ -1434,6 +1464,7 @@ impl<W: PlannedWeights + ?Sized> SublayerGraph<'_, W> {
                 Some(FeedForwardNumbers::Parallel(numbers)),
                 FeedForwardEntries::Parallel(entries),
             ) => {
+                let carry = carry.as_ref().ok_or("a parallel feed-forward reads no residual carry")?;
                 let (output, sequence) = parallel(
                     graph,
                     entries,
@@ -1444,7 +1475,7 @@ impl<W: PlannedWeights + ?Sized> SublayerGraph<'_, W> {
                     self.index(1),
                     weights,
                     constants,
-                    mixed,
+                    &carry.rows,
                     rows,
                     epsilon,
                     split,
@@ -1453,7 +1484,8 @@ impl<W: PlannedWeights + ?Sized> SublayerGraph<'_, W> {
             }
             _ => return Err("target block feed-forward and its kernel entries disagree".into()),
         };
-        Ok((ResidualCarry { rows: output, pre: carry.pre.clone() }, None))
+        let pre = carry.and_then(|c| c.pre);
+        Ok((ResidualCarry { rows: output, pre }, None))
     }
 
     /// A feed-forward branch behind its Sinkhorn site: `branch` runs over

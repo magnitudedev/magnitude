@@ -8,7 +8,7 @@ use super::{
     certify::{TargetFamilyCertificate, certify_target_family},
     classes::{
         BlockGraphEnumeration, BlockListings, BlockOutputScales, BlockServed, Holder, LaunchControlLayout,
-        Passes, StagedClass, block_sealed_stages, block_stages, carried_forms, chained_once_runs, class_topology, decode_launch, enumerate_block_graphs, LaunchRuns, once_class,
+        Passes, StagedClass, binding_key, block_sealed_stages, block_stages, carried_forms, chained_once_runs, class_topology, decode_launch, enumerate_block_graphs, LaunchRuns, once_class,
         slot_selection,
     },
     entry::{
@@ -353,11 +353,6 @@ pub(super) struct BlockGraphShape {
     /// Whether the block's routed layer is the load's first streamed one,
     /// which sets a bank-served launch's step.
     sets_step: bool,
-    /// The block offset back to the streamed layer whose route predicts
-    /// this block's (whose hint ring its route reads, `StreamedLayer::hinted`);
-    /// none for a block that streams none or the first streamed one. A
-    /// graph shared by blocks binds each one's predictor at the same offset.
-    hinted_by: Option<u32>,
     /// The operand carries its decode graphs declare (`block_carries`):
     /// the first block's reads none, the last block's writes none, so
     /// neither shares an interior block's plans. Each names its reader's
@@ -370,11 +365,6 @@ pub(super) struct BlockGraphShape {
     /// (sublayer, branch) of each role, its resident element, shape and
     /// accumulator-scale port extent.
     weights: Vec<((u32, Option<u32>), WeightKind, Element, WeightDims, u64)>,
-    /// The layers a streamed routed layer's route predicts (its lead): each
-    /// one's block offset from this block and the weights the route reads
-    /// of it (`BankLayer::hinted`). A graph shared by blocks binds each
-    /// one's layers at the same offsets (`block_scope`).
-    predicts: Vec<(u32, Vec<crate::planning::HintWeight>)>,
     state: BlockStateShape,
     geometry: BlockGeometryShape,
 }
@@ -419,15 +409,9 @@ impl BlockGraphShape {
         (self.tapped.entry, self.tapped.middle, self.tapped.output).hash(&mut h);
         self.residual.hash(&mut h);
         self.sets_step.hash(&mut h);
-        self.hinted_by.hash(&mut h);
         (self.carries.carry_in.is_some(), self.carries.carry_out.is_some()).hash(&mut h);
         self.banked.is_some().hash(&mut h);
         self.weights.hash(&mut h);
-        self.predicts.len().hash(&mut h);
-        for (offset, hints) in &self.predicts {
-            offset.hash(&mut h);
-            hints.len().hash(&mut h);
-        }
         self.state.history.hash(&mut h);
         self.state.bank.as_ref().map(|b| b.as_ref().map(Vec::len)).hash(&mut h);
         std::mem::discriminant(&self.geometry.mixer).hash(&mut h);
@@ -617,60 +601,6 @@ pub(super) fn block_scope(scope: WeightScope, to: usize) -> Result<WeightScope, 
             ));
         }
     })
-}
-
-/// The layers block `index`'s streamed routed layer predicts
-/// (`BlockGraphShape::predicts`); none for a block that streams none.
-fn predicted_layers_for(
-    bank: Option<&crate::ExpertBankPlan>,
-    layer: Option<usize>,
-    index: usize,
-) -> Result<Vec<(u32, Vec<crate::planning::HintWeight>)>, String> {
-    let (Some(bank), Some(layer)) = (bank, layer) else {
-        return Ok(Vec::new());
-    };
-    bank.predicted(layer)
-        .map(|predicted| {
-            let predicted = &bank.layers()[predicted];
-            let (WeightScope::TargetSublayer(SublayerIndex { block, .. })
-            | WeightScope::TargetBranch {
-                sublayer: SublayerIndex { block, .. },
-                ..
-            }) = predicted.scope
-            else {
-                return Err(format!("a streamed layer {:?} is not a target sublayer", predicted.scope));
-            };
-            let offset = (block as usize)
-                .checked_sub(index)
-                .and_then(|offset| u32::try_from(offset).ok())
-                .ok_or("a predicted layer precedes its block")?;
-            Ok((offset, predicted.hinted.clone()))
-        })
-        .collect()
-}
-
-/// [`BlockGraphShape::hinted_by`] of block `index`.
-fn hinted_by_for(
-    bank: Option<&crate::ExpertBankPlan>,
-    layer: Option<usize>,
-    index: usize,
-) -> Result<Option<u32>, String> {
-    let (Some(bank), Some(layer)) = (bank, layer) else {
-        return Ok(None);
-    };
-    if layer == 0 || bank.ahead(layer - 1) == 0 {
-        return Ok(None);
-    }
-    let (WeightScope::TargetSublayer(SublayerIndex { block, .. })
-    | WeightScope::TargetBranch { sublayer: SublayerIndex { block, .. }, .. }) = bank.layers()[layer - 1].scope
-    else {
-        return Err(format!("a streamed layer {:?} is not a target sublayer", bank.layers()[layer - 1].scope));
-    };
-    index
-        .checked_sub(block as usize)
-        .and_then(|offset| u32::try_from(offset).ok())
-        .map(Some)
-        .ok_or_else(|| "a predicting layer follows its block".into())
 }
 
 /// [`BlockGraphShape::banked`] of block `index`.
@@ -1078,9 +1008,7 @@ pub(super) fn block_graph_shapes(
             tapped: tapped[index].positions(),
             residual: residual == Some(index),
             sets_step: bank.zip(bank_layer).is_some_and(|(bank, layer)| bank.sets_step(layer)),
-            predicts: predicted_layers_for(bank, bank_layer, index)?,
             banked: banked_layer_for(bank, bank_layer)?,
-            hinted_by: hinted_by_for(bank, bank_layer, index)?,
             carries: carries[index],
         });
     }
@@ -1649,6 +1577,13 @@ impl PreparedTargetGraphs {
         block_stages(&self.served, index, rows)
     }
 
+    /// Whether block `index` over `rows` rows was sealed with `RunStage::DecodeHits`
+    /// (the single authoritative decision shared by sealing, certification, and
+    /// runtime dispatch — never inferred via fallible graph lookup).
+    pub(crate) fn splits_decode_hits(&self, index: usize, rows: u64) -> bool {
+        crate::operators::routed::fused_graph::decodes(rows) && self.served[index].decode_hits
+    }
+
     /// The stage of block `index`'s run of `rows` rows at `stage` of its
     /// stages: a whole decode block's resident form (`RunStage::Resident`)
     /// in a chain its bank began `resident`, where the block has one
@@ -1812,11 +1747,10 @@ impl PreparedTargetGraphs {
             return Err("resident target blocks disagree with the prepared graphs".into());
         }
         for (index, graphs) in self.blocks_by_class.iter().enumerate() {
-            // The block's classes ascend in its vectors, so do its bindings.
             bound.push(BlockBindings {
-                runs: bind_block_graphs(&graphs.runs, index, resident, charges, &mut constants)?,
-                passes: bind_block_graphs(&graphs.passes, index, resident, charges, &mut constants)?,
-                untapped: bind_block_graphs(&graphs.untapped, index, resident, charges, &mut constants)?,
+                runs: bind_block_graphs(&graphs.runs, index, resident, charges, &mut constants, binding_key)?,
+                passes: bind_block_graphs(&graphs.passes, index, resident, charges, &mut constants, |rows| rows)?,
+                untapped: bind_block_graphs(&graphs.untapped, index, resident, charges, &mut constants, binding_key)?,
             });
         }
         // The pass's merged experts and row table, which every group's passes

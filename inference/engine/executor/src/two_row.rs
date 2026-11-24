@@ -85,6 +85,9 @@ pub enum FrontPass {
 /// passes the host builds.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum BuiltForm {
+    /// Depth-0 plain decode: the regime chose `Form::Front(0)`, so no
+    /// request in the launch runs guessed rows or chains into the head.
+    Plain,
     Front,
     Verify,
 }
@@ -94,6 +97,7 @@ impl BuiltForm {
     /// `depth` guessed rows.
     pub fn grant(self, depth: usize) -> FrontGrant {
         match self {
+            Self::Plain => FrontGrant::Plain,
             Self::Front => FrontGrant::UpTo(depth),
             Self::Verify => FrontGrant::Verify(depth),
         }
@@ -105,6 +109,9 @@ impl BuiltForm {
 /// it claims.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum FrontGrant {
+    /// Depth-0 plain decode for the entire launch: no guessed rows and no head
+    /// chain behind the pass.
+    Plain,
     /// As many front rows as the chain holds, at most this many: a pass
     /// the host builds for its own reasons runs no idle row.
     UpTo(usize),
@@ -116,13 +123,18 @@ pub enum FrontGrant {
     /// this many: the exact row, then a row on each of the chain's first
     /// guesses, whose outputs are accepted where the guesses stand.
     Verify(usize),
+    /// A mixed `(1 + K + F)` pass: up to `verify` acceptable rows followed by
+    /// up to `front` foresight-only front tail rows from the existing chain.
+    Mixed { verify: usize, front: usize },
 }
 
 impl FrontGrant {
     /// The guessed rows it grants at most.
     pub fn depth(self) -> usize {
         match self {
+            Self::Plain => 0,
             Self::UpTo(depth) | Self::Exactly(depth) | Self::Verify(depth) => depth,
+            Self::Mixed { verify, front } => verify + front,
         }
     }
 }
@@ -147,10 +159,28 @@ impl TwoRowDecode {
         let guessed = grant.depth().min(self.next.len());
         let guesses = self.next[..guessed].to_vec();
         match grant {
+            FrontGrant::Plain => Rows::plain(),
             FrontGrant::UpTo(_) => Rows::front(guesses, 0),
             FrontGrant::Exactly(depth) => Rows::front(guesses, depth - guessed),
-            FrontGrant::Verify(_) => Rows::Exact { acceptable: guesses.into_iter().map(|guess| guess.token).collect() },
+            FrontGrant::Verify(_) => Rows::verify(guesses.into_iter().map(|guess| guess.token).collect()),
+            FrontGrant::Mixed { verify, front } => {
+                let k = verify.min(guesses.len());
+                let f = front.min(guesses.len().saturating_sub(k));
+                let acceptable = guesses[..k].iter().map(|g| g.token).collect();
+                let tail = guesses[k..k + f].to_vec();
+                Rows::pass(acceptable, tail, 0)
+            }
         }
+    }
+
+    /// The existing guess chain held by this embedded front-row decode.
+    pub fn chain(&self) -> &[Guess] {
+        &self.next
+    }
+
+    /// Length of the existing guess chain (`0` when no chain is held).
+    pub fn chain_len(&self) -> usize {
+        self.next.len()
     }
 
     /// A round of the sequence completed, guessing the chain `next`
@@ -195,7 +225,7 @@ mod tests {
     #[test]
     fn a_pass_runs_on_the_last_rounds_chain_as_deep_as_granted() {
         let mut decode = TwoRowDecode::default();
-        let exact = Rows::Exact { acceptable: Vec::new() };
+        let exact = Rows::plain();
         assert_eq!(decode.pass(FrontGrant::UpTo(3)), exact);
         assert_eq!(decode.pass(FrontGrant::UpTo(3)).tokens(TokenId(3)), [TokenId(3)]);
         assert_eq!(decode.pass(FrontGrant::Exactly(2)), Rows::front(Vec::new(), 2));

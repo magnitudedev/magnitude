@@ -13,7 +13,7 @@ use super::tuning::{
     ranged::EVERY_ROW,
     general_routed::{
         RoutedDownProjectTuning, RoutedDownTuning, RoutedExpandDecodeTuning, RoutedExpertTilesTuning, RoutedGateUpTuning,
-        RoutedGatedTilesTuning, RoutedHintSelectTuning, RoutedScatterTuning, RoutedSelectStreamedTuning,
+        RoutedGatedTilesTuning, RoutedScatterTuning, RoutedSelectStreamedTuning,
         RoutedSelectTuning, RoutedUpTilesTuning, RoutedUpTuning, routing_shape,
     },
     post_norm::ProjectRowsTuning,
@@ -28,7 +28,7 @@ use super::tuning::{
     },
     routed::{
         RoutedChoicesTuning, RoutedCombineTuning, RoutedExpandTuning, RoutedExpertsTuning,
-        RoutedGateUpPartTuning, RoutedGroupTuning, RoutedHintRouteTuning, RoutedOutputProjectTuning, RoutedOutputTuning,
+        RoutedGateUpPartTuning, RoutedGroupTuning, RoutedOutputProjectTuning, RoutedOutputTuning,
         RoutedRouteSharedTuning, RoutedRouteStreamedTuning, RoutedRouteTuning, RoutedShape, DECODE_SERVED, GROUPED_SERVED,
     },
     short_conv::{ShortConvOutputTuning, ShortConvProjectTuning},
@@ -161,25 +161,6 @@ fn ordered_layers<K: Eq>(
         }
     }
     ordered
-}
-
-/// A streamed binding's kernel of each `AHEAD` (`LEADS`: without hints,
-/// then at each count of leads) one of its layers launches, none of an
-/// `AHEAD` none does; or the first `AHEAD`'s failure; none where a launched
-/// one formed none (a count or a listing, which forms nothing at every
-/// `AHEAD`).
-fn each_hint<K>(
-    hints: [Option<Result<Option<K>, CatalogFailure>>; crate::planning::HINT_LEADS as usize],
-) -> Result<Option<[Option<K>; crate::planning::HINT_LEADS as usize]>, CatalogFailure> {
-    let hints = hints.into_iter().map(Option::transpose).collect::<Result<Vec<_>, _>>()?;
-    let formed = hints
-        .into_iter()
-        .map(|hint| match hint {
-            None => Some(None),
-            Some(kernel) => kernel.map(Some),
-        })
-        .collect::<Option<Vec<_>>>();
-    Ok(formed.map(|formed| formed.try_into().unwrap_or_else(|_| unreachable!("a kernel slot per AHEAD"))))
 }
 
 /// The scope of sublayer `sublayer` (0 the mixer, 1 the feed-forward) of
@@ -1530,11 +1511,14 @@ impl<'a> Preparation<'a> {
                     )
             }
             magnitude_state::HistoryEncoding::Affine => {
-                // One decode kernel serves every decode row, as the dense
-                // history's.
-                let decode = self
-                    .spec
-                    .tuned(&mut self.tuning, &AttentionDecodeK8V4Tuning(mix()))?;
+                // Ranged across decode rows (`1..2` vs `2..VERIFY_ROWS+1`) so
+                // multi-row verify selects `attention_decode_k8v4_partial_multi`
+                // without affecting `M = 1` decode.
+                let decode = self.spec.tuned_ranges(
+                    &mut self.tuning,
+                    DECODE_SERVED,
+                    AttentionDecodeK8V4Tuning(mix()),
+                )?;
                 // Where the entry's forms differ by it, a launch that lists
                 // the history row tiles its rows see and one that does not
                 // are two kernels with their own admissible forms.
@@ -3112,23 +3096,6 @@ impl<'a> Preparation<'a> {
             bindings: bindings.to_owned(),
             outcome,
         };
-        // The layers of each `AHEAD`: the last streamed layer, at 0, then
-        // each layer at the leads its route has (`ExpertBankPlan::ahead`). A
-        // binding need not hold every one (its layers are those of its
-        // weights' forms): an `AHEAD` none of its layers launches has no
-        // kernel.
-        let model = self.tuning.model();
-        let mut hint_layers: [Vec<WeightScope>; crate::planning::HINT_LEADS as usize] = Default::default();
-        let plan = model.load.expert_bank().ok_or_else(|| failure("routed_bank", "a streamed layer's load holds no bank".into()))?;
-        for &scope in layers {
-            let (index, _) = plan
-                .layer(scope)
-                .ok_or_else(|| failure("routed_bank", format!("{scope:?} is not a streamed layer")))?;
-            let ahead = plan.ahead(index);
-            if ahead > 0 {
-                hint_layers[ahead as usize - 1].push(scope);
-            }
-        }
         match slot {
             BankedFeedForward::Routed(b) => {
                 if layers.is_empty() {
@@ -3144,23 +3111,9 @@ impl<'a> Preparation<'a> {
                     bank,
                 };
                 let route = self.served_projection_following(DECODE_SERVED, route_case, resident.clone())?;
-                let mut ahead = 1;
-                let hints = each_hint(hint_layers.map(|layers| {
-                    let lead = ahead;
-                    ahead += 1;
-                    (!layers.is_empty()).then(|| {
-                        let case = RoutedHintRouteTuning {
-                            resident: resident.route.clone(),
-                            layers,
-                            bank,
-                            ahead: lead,
-                        };
-                        self.spec.tuned(&mut self.tuning, &case)
-                    })
-                }))?;
                 Ok((
                     [b.experts, b.selected],
-                    route.zip(hints).map(|(route, hints)| super::BankRouteKernels::Fused { activation: b.activation, route, hints }),
+                    route.map(|route| super::BankRouteKernels::Fused { activation: b.activation, route }),
                 ))
             }
             // A parallel block's routed branch is general: its selection is
@@ -3179,23 +3132,9 @@ impl<'a> Preparation<'a> {
                     bank,
                 };
                 let select = self.spec.tuned_following(&mut self.tuning, &select_case, &resident)?;
-                let mut ahead = 1;
-                let hints = each_hint(hint_layers.map(|layers| {
-                    let lead = ahead;
-                    ahead += 1;
-                    (!layers.is_empty()).then(|| {
-                        let case = RoutedHintSelectTuning {
-                            resident: resident.clone(),
-                            layers,
-                            bank,
-                            ahead: lead,
-                        };
-                        self.spec.tuned(&mut self.tuning, &case)
-                    })
-                }))?;
                 Ok((
                     [b.shape.experts, b.shape.selected],
-                    select.zip(hints).map(|(select, hints)| super::BankRouteKernels::General { activation: b.activation, select, hints }),
+                    select.map(|select| super::BankRouteKernels::General { activation: b.activation, select }),
                 ))
             }
         }
@@ -3435,6 +3374,13 @@ impl<'a> Preparation<'a> {
                     });
                 }
             };
+            let bank = match head_plan.bank(head_index) {
+                Some((slot, bank)) if !self.head_kernels().banks.contains_key(&(slot, bank)) => {
+                    self.bank(slot, bank, &feed_forward_layers.scopes(b))?
+                        .map(|kernels| ((slot, bank), kernels))
+                }
+                _ => None,
+            };
             if let Some(demand) = &self.graph_demand {
                 let mut calls = InvocationCounts::default();
                 for _ in &layers.scopes(b) {
@@ -3559,6 +3505,9 @@ impl<'a> Preparation<'a> {
                             outcome: "draft heads run no parallel feed-forward form".into(),
                         });
                     }
+                }
+                if let Some((key, bank)) = bank {
+                    head.banks.insert(key, bank);
                 }
                 head.features.insert(b, features);
                 head.logits.insert(b, logits);

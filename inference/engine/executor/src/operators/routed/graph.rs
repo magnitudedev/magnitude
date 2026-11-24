@@ -32,7 +32,7 @@ use crate::{GeneralRoutedBinding, GeneralRoutedShape, ModelLoadPlan};
 use magnitude_family_contracts::{GluLimit, WeightKind, WeightRole, WeightScope};
 use magnitude_kernels::{
     dense_expand, dense_output, dense_up, project_rows, routed_down, routed_down_project, routed_down_sited, routed_experts,
-    routed_experts_up, routed_gate_up, routed_group, routed_hint_select, routed_scatter, routed_select,
+    routed_experts_up, routed_gate_up, routed_group, routed_scatter, routed_select,
     routed_select_streamed, routed_up,
 };
 use seismic::{Dim, Element, NativeGraph, NativePort, WorkflowTensor};
@@ -491,15 +491,17 @@ fn expert_input<'a, G: GraphDraft + 'a>(
 struct SumBase {
     base: WorkflowTensor,
     onto: WorkflowTensor,
-    row_table: Option<GraphConstant>,
-    latent_zeros: Option<GraphConstant>,
+    row_table: Option<WorkflowTensor>,
+    latent: bool,
 }
 
 impl SumBase {
-    /// The base of `residual`'s rows; the shared expert reads `norm`, a
-    /// whole layer's selection's, or else its own.
+    /// Compute only the base (`residual` or zeros, plus any shared expert),
+    /// pushing every `GraphConstant` into `constants` immediately so no port
+    /// can ever be dropped unbound. Used directly by `DecodeHits` (which never
+    /// allocates `latent_zeros`) and by [`Self::of`].
     #[allow(clippy::too_many_arguments)]
-    fn of<'a, G: GraphDraft + 'a>(
+    fn of_base<'a, G: GraphDraft + 'a>(
         graph: &mut G,
         shared: Option<(ExpansionEntry<'a, G>, G::Ranged<'a, dense_output::Entry>)>,
         planned: &(impl PlannedWeights + ?Sized),
@@ -513,10 +515,16 @@ impl SumBase {
         shape: &GeneralRoutedNumbers,
         epsilon: Argument<f32>,
         norm: Option<WorkflowTensor>,
-    ) -> Result<Self, GraphError> {
-        let row_table = (form.shared.is_some() || form.latent)
-            .then(|| GraphConstant::row_identity(graph, rows, Some("M")))
-            .transpose()?;
+        need_latent_table: bool,
+    ) -> Result<(WorkflowTensor, Option<WorkflowTensor>), GraphError> {
+        let row_table = if form.shared.is_some() || need_latent_table {
+            let table = GraphConstant::row_identity(graph, rows, Some("M"))?;
+            let tensor = table.port().tensor().clone();
+            constants.push(table);
+            Some(tensor)
+        } else {
+            None
+        };
         let root = match sum {
             RoutedSum::Residual => residual.clone(),
             RoutedSum::Branch => {
@@ -533,7 +541,7 @@ impl SumBase {
                     Some(norm) => norm,
                     None => weight(graph, planned, scope, WeightKind::InputNorm, weights)?,
                 };
-                let table = row_table.as_ref().ok_or("general routed row table is absent")?.port().tensor().clone();
+                let table = row_table.as_ref().ok_or("general routed row table is absent")?.clone();
                 let dimensions =
                     [("M", rows.clone()), ("O", rows.clone()), ("H", shape.hidden.clone()), ("F", features.clone())];
                 let product = match (expansion, form.gated) {
@@ -614,15 +622,69 @@ impl SumBase {
             (None, None, None) => root,
             _ => return Err("shared expert entries disagree with its weights".into()),
         };
-        let latent_zeros = form
-            .latent
-            .then(|| GraphConstant::row_zeros(graph, Element::f32(), rows, &shape.expert_hidden, Some("M")))
-            .transpose()?;
-        let onto = match &latent_zeros {
-            Some(zeros) => zeros.port().tensor().clone(),
-            None => base.clone(),
+        Ok((base, row_table))
+    }
+
+    /// The base of `residual`'s rows; the shared expert reads `norm`, a
+    /// whole layer's selection's, or else its own.
+    #[allow(clippy::too_many_arguments)]
+    fn of<'a, G: GraphDraft + 'a>(
+        graph: &mut G,
+        shared: Option<(ExpansionEntry<'a, G>, G::Ranged<'a, dense_output::Entry>)>,
+        planned: &(impl PlannedWeights + ?Sized),
+        scope: WeightScope,
+        weights: &mut Vec<(WeightPort, NativePort)>,
+        constants: &mut Vec<GraphConstant>,
+        residual: &WorkflowTensor,
+        sum: RoutedSum,
+        rows: &Dim,
+        form: &GeneralRoutedForm,
+        shape: &GeneralRoutedNumbers,
+        epsilon: Argument<f32>,
+        norm: Option<WorkflowTensor>,
+    ) -> Result<Self, GraphError> {
+        let (base, row_table) = Self::of_base(
+            graph, shared, planned, scope, weights, constants, residual, sum, rows, form, shape, epsilon, norm,
+            form.latent,
+        )?;
+        let onto = if form.latent {
+            let zeros = GraphConstant::row_zeros(graph, Element::f32(), rows, &shape.expert_hidden, Some("M"))?;
+            let tensor = zeros.port().tensor().clone();
+            constants.push(zeros);
+            tensor
+        } else {
+            base.clone()
         };
-        Ok(Self { base, onto, row_table, latent_zeros })
+        Ok(Self { base, onto, row_table, latent: form.latent })
+    }
+
+    /// Reconstruct `SumBase` in `DecodeBack` from the `base` already computed
+    /// (including any shared expert) by `DecodeHits`.
+    fn from_crossed<G: GraphDraft>(
+        graph: &mut G,
+        constants: &mut Vec<GraphConstant>,
+        base: WorkflowTensor,
+        rows: &Dim,
+        form: &GeneralRoutedForm,
+        shape: &GeneralRoutedNumbers,
+    ) -> Result<Self, GraphError> {
+        let row_table = if form.latent {
+            let table = GraphConstant::row_identity(graph, rows, Some("M"))?;
+            let tensor = table.port().tensor().clone();
+            constants.push(table);
+            Some(tensor)
+        } else {
+            None
+        };
+        let onto = if form.latent {
+            let zeros = GraphConstant::row_zeros(graph, Element::f32(), rows, &shape.expert_hidden, Some("M"))?;
+            let tensor = zeros.port().tensor().clone();
+            constants.push(zeros);
+            tensor
+        } else {
+            base.clone()
+        };
+        Ok(Self { base, onto, row_table, latent: form.latent })
     }
 
     /// The sum's output from the experts' `routed` sum: a latent operator's
@@ -640,11 +702,11 @@ impl SumBase {
         rows: &Dim,
         shape: &GeneralRoutedNumbers,
     ) -> Result<WorkflowTensor, GraphError> {
-        let output = match (entry, self.latent_zeros) {
-            (Some(entry), Some(zeros)) => {
+        let output = match (entry, self.latent) {
+            (Some(entry), true) => {
                 let up = packed_weight(graph, planned, scope, WeightKind::LatentUp, weights, constants)?;
-                let table = self.row_table.as_ref().ok_or("general routed row table is absent")?.port().tensor().clone();
-                let output = graph
+                let table = self.row_table.as_ref().ok_or("general routed row table is absent")?.clone();
+                graph
                     .enqueue(
                         G::pick(entry, rows),
                         &[
@@ -664,14 +726,11 @@ impl SumBase {
                             down_bound: (&up.operands.bound.tensor).into(),
                         },
                     )?
-                    .value;
-                constants.push(zeros);
-                output
+                    .value
             }
-            (None, None) => routed,
+            (None, false) => routed,
             _ => return Err("latent entries disagree with its weights".into()),
         };
-        constants.extend(self.row_table);
         Ok(output)
     }
 }
@@ -830,6 +889,256 @@ fn combine<'a, G: GraphDraft + 'a>(
 /// experts, `E` = `BANK`), and the sum adds the CPU's answer. Its resident
 /// form (`LayerBank::Home`) decodes as a resident layer does, over its whole
 /// bank's home records.
+/// M7 split decode hits (`RunStage::DecodeHits`): `Shared Expert` (`base`) +
+/// `VRAM Hits` (`code >= 0` from read-only `front_sources` via
+/// `routed_gate_up_part(late=2)` + `routed_down_project(mode=1)` into
+/// `crossing.published`), overlapping with Host `land_decode_misses` + `DMA(L)`.
+#[inline(never)]
+#[allow(clippy::too_many_arguments)]
+fn decode_hits<'a, G: GraphDraft + 'a, W: PlannedWeights + ?Sized>(
+    graph: &mut G,
+    layer: &mut StreamedLayer<'_, 'a, G, W>,
+    shared: Option<(ExpansionEntry<'a, G>, G::Ranged<'a, dense_output::Entry>)>,
+    planned: &W,
+    scope: WeightScope,
+    part: WeightPart,
+    weights: &mut Vec<(WeightPort, NativePort)>,
+    constants: &mut Vec<GraphConstant>,
+    residual: Option<&WorkflowTensor>,
+    sum: RoutedSum,
+    rows: &Dim,
+    form: &GeneralRoutedForm,
+    shape: &GeneralRoutedNumbers,
+    epsilon: Argument<f32>,
+    crossing: &mut super::split::DecodeCrossingBuild,
+) -> Result<(WorkflowTensor, Option<StepInputs>), GraphError> {
+    let has_shared = shared.is_some();
+    let crossing = crossing.declare_hits(graph, has_shared)?;
+    let routes_port = crossing.routes.as_ref().expect("DecodeHits declares routes");
+    let normalized_port = crossing.normalized.as_ref().expect("DecodeHits declares normalized");
+    let sources_port = crossing.sources.as_ref().expect("DecodeHits declares sources");
+    if has_shared {
+        let residual = residual.ok_or("a DecodeHits layer with a shared expert reads no residual")?;
+        let (base, _) = SumBase::of_base(
+            graph, shared, planned, scope, weights, constants, residual, sum, rows, form, shape, epsilon, None, false,
+        )?;
+        let base_port = crossing
+            .base
+            .as_mut()
+            .ok_or("a general routed DecodeHits crosses no base")?;
+        graph.store(&base, base_port)?;
+    }
+    let stacks = ExpertStacks::of(graph, planned, scope, weights, constants, form, part)?;
+    let sources_view = sources_port
+        .tensor()
+        .slice_leading(0, magnitude_kernels::constants::SOURCE_ROWS);
+    let reads = layer.reads_hits(graph, sources_view, constants)?;
+    let experts_read = layer.numbers().records.clone();
+    let activation = scalar(&shape.activation, "an expert activation code")?;
+    let mut dimensions = shape.expert_dimensions(rows);
+    dimensions[2] = ("E", experts_read);
+    let map_dimension = reads.dimensions();
+    let (expert_gate, gate_scale) = stacks
+        .gate
+        .as_ref()
+        .ok_or("a gated DecodeHits layer lacks expert_gate")?;
+    let gate_up_dims = [
+        dimensions.as_slice(),
+        &[
+            ("GS", gate_scale.extent.clone()),
+            ("US", stacks.up_scale.extent.clone()),
+            ("LB", Dim::from(GluLimit::word(form.experts_expansion.limit))),
+        ],
+        &map_dimension,
+    ]
+    .concat();
+    let glu_limit = crate::operators::glu_limit(routes_port.tensor(), form.experts_expansion.limit);
+    let tier_gate = reads.tier.gate.as_ref().ok_or("a gated layer's reads lack its gate")?;
+    let step = layer.part(graph, BankPart::Step)?;
+    let routing = layer.part(graph, BankPart::Routing)?;
+    let product = layer.gate_up_part_mode(
+        graph,
+        routed_gate_up::WorkflowArgs {
+            normalized: normalized_port.tensor().into(),
+            routes: routes_port.tensor().into(),
+            sources: (&reads.sources).into(),
+            expert_gate: expert_gate.tensor().into(),
+            expert_up: stacks.up.tensor().into(),
+            tier_gate: tier_gate.into(),
+            tier_up: (&reads.tier.up).into(),
+            activation,
+            gate_scale: (&gate_scale.tensor).into(),
+            up_scale: (&stacks.up_scale.tensor).into(),
+            glu_limit: (&glu_limit).into(),
+        },
+        &gate_up_dims,
+        rows,
+        step.tensor(),
+        routing.tensor(),
+        2,
+    )?;
+    let Some((BankCombineEntry::General { project, .. }, _)) = layer.site_combine() else {
+        return Err("DecodeHits requires general site_combine entries".into());
+    };
+    let published_port = crossing
+        .published
+        .as_mut()
+        .ok_or("a general routed DecodeHits crosses no published")?;
+    let down_dimensions = [dimensions.as_slice(), &map_dimension].concat();
+    graph.enqueue(
+        G::pick(project, rows),
+        &down_dimensions,
+        routed_down_project::WorkflowArgs {
+            product: (&product).into(),
+            routes: routes_port.tensor().into(),
+            sources: (&reads.sources).into(),
+            expert_down: stacks.down.tensor().into(),
+            tier_down: (&reads.tier.down).into(),
+            mode: 1.into(),
+            published: published_port.tensor_mut().into(),
+        },
+    )?;
+    let published_tensor = published_port.tensor().clone();
+    Ok((published_tensor, None))
+}
+
+/// M7 split decode back (`RunStage::DecodeBack`) when `DecodeHits` already
+/// computed any `Shared Expert` (`base`) and `VRAM Hits` (`published`): runs
+/// only misses (`code != -1` from disjoint `back_sources`) via
+/// `routed_gate_up_part(late=3)` + `routed_down_project(mode=2)` +
+/// `routed_down_sited` + tail.
+#[inline(never)]
+#[allow(clippy::too_many_arguments)]
+fn decode_back_split_hits<'a, G: GraphDraft + 'a, W: PlannedWeights + ?Sized>(
+    graph: &mut G,
+    layer: &mut StreamedLayer<'_, 'a, G, W>,
+    stacks: &ExpertStacks,
+    latent_up: Option<G::Ranged<'a, dense_output::Entry>>,
+    planned: &W,
+    scope: WeightScope,
+    weights: &mut Vec<(WeightPort, NativePort)>,
+    constants: &mut Vec<GraphConstant>,
+    residual: Option<&WorkflowTensor>,
+    has_shared: bool,
+    sum: RoutedSum,
+    rows: &Dim,
+    form: &GeneralRoutedForm,
+    shape: &GeneralRoutedNumbers,
+    epsilon: Argument<f32>,
+    crossing: &mut super::split::DecodeCrossingBuild,
+) -> Result<(WorkflowTensor, Option<StepInputs>), GraphError> {
+    let crossing = crossing.declare_back(graph, true, has_shared)?;
+    let routes_port = crossing.routes.as_ref().expect("DecodeBack declares routes");
+    let weights_port = crossing.weights.as_ref().expect("DecodeBack declares weights");
+    let normalized_port = crossing.normalized.as_ref().expect("DecodeBack declares normalized");
+    let sources_port = crossing.sources.as_ref().expect("DecodeBack declares sources");
+    let base = if has_shared {
+        let base_tensor = crossing
+            .base
+            .as_ref()
+            .ok_or("a general routed DecodeBack crosses no base")?
+            .tensor()
+            .clone();
+        SumBase::from_crossed(graph, constants, base_tensor, rows, form, shape)?
+    } else {
+        let residual = residual.ok_or("a DecodeBack layer without a shared expert reads no residual")?;
+        SumBase::of(graph, None, planned, scope, weights, constants, residual, sum, rows, form, shape, epsilon, None)?
+    };
+    let ports = layer.decode_back_ports(graph, false)?;
+    let sources_view = sources_port
+        .tensor()
+        .slice_leading(0, magnitude_kernels::constants::SOURCE_ROWS);
+    let reads = layer.reads_back(graph, &ports, sources_view, constants)?;
+    let experts_read = layer.numbers().records.clone();
+    let activation = scalar(&shape.activation, "an expert activation code")?;
+    let mut dimensions = shape.expert_dimensions(rows);
+    dimensions[2] = ("E", experts_read);
+    let map_dimension = reads.dimensions();
+    let (expert_gate, gate_scale) = stacks
+        .gate
+        .as_ref()
+        .ok_or("a gated DecodeBack layer lacks expert_gate")?;
+    let gate_up_dims = [
+        dimensions.as_slice(),
+        &[
+            ("GS", gate_scale.extent.clone()),
+            ("US", stacks.up_scale.extent.clone()),
+            ("LB", Dim::from(GluLimit::word(form.experts_expansion.limit))),
+        ],
+        &map_dimension,
+    ]
+    .concat();
+    let glu_limit = crate::operators::glu_limit(routes_port.tensor(), form.experts_expansion.limit);
+    let tier_gate = reads.tier.gate.as_ref().ok_or("a gated layer's reads lack its gate")?;
+    let step = ports.step.expect("sited DecodeBackPorts binds Step");
+    let routing = layer.part(graph, BankPart::Routing)?;
+    let product = layer.gate_up_part_mode(
+        graph,
+        routed_gate_up::WorkflowArgs {
+            normalized: normalized_port.tensor().into(),
+            routes: routes_port.tensor().into(),
+            sources: (&reads.sources).into(),
+            expert_gate: expert_gate.tensor().into(),
+            expert_up: stacks.up.tensor().into(),
+            tier_gate: tier_gate.into(),
+            tier_up: (&reads.tier.up).into(),
+            activation,
+            gate_scale: (&gate_scale.tensor).into(),
+            up_scale: (&stacks.up_scale.tensor).into(),
+            glu_limit: (&glu_limit).into(),
+        },
+        &gate_up_dims,
+        rows,
+        step.tensor(),
+        routing.tensor(),
+        3,
+    )?;
+    let Some((BankCombineEntry::General { project, sited }, site_dimensions)) = layer.site_combine() else {
+        return Err("DecodeBack split_hits requires general site_combine entries".into());
+    };
+    let published_port = crossing
+        .published
+        .as_mut()
+        .ok_or("a general routed DecodeBack crosses no published")?;
+    let down_dimensions = [dimensions.as_slice(), &map_dimension].concat();
+    graph.enqueue(
+        G::pick(project, rows),
+        &down_dimensions,
+        routed_down_project::WorkflowArgs {
+            product: (&product).into(),
+            routes: routes_port.tensor().into(),
+            sources: (&reads.sources).into(),
+            expert_down: stacks.down.tensor().into(),
+            tier_down: (&reads.tier.down).into(),
+            mode: 2.into(),
+            published: published_port.tensor_mut().into(),
+        },
+    )?;
+    let mut site = ports.site.expect("sited DecodeBackPorts binds Site");
+    layer.park_site(graph);
+    let routed = graph
+        .enqueue(
+            sited,
+            &[
+                &[dimensions[0].clone(), dimensions[1].clone(), dimensions[3].clone(), dimensions[4].clone()],
+                site_dimensions.as_slice(),
+            ]
+            .concat(),
+            routed_down_sited::WorkflowArgs {
+                base: (&base.onto).into(),
+                published: published_port.tensor().into(),
+                sources: (&reads.sources).into(),
+                weights: weights_port.tensor().into(),
+                step: step.tensor().into(),
+                site: site.table.tensor_mut().into(),
+                site_output: site.output.tensor().into(),
+            },
+        )?
+        .value;
+    let output = base.finish(graph, latent_up, planned, scope, weights, constants, routed, rows, shape)?;
+    Ok((output, None))
+}
+
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn general_routed<'a, G: GraphDraft + 'a>(
     graph: &mut G,
@@ -841,7 +1150,7 @@ pub(crate) fn general_routed<'a, G: GraphDraft + 'a>(
     scope: WeightScope,
     weights: &mut Vec<(WeightPort, NativePort)>,
     constants: &mut Vec<GraphConstant>,
-    residual: &WorkflowTensor,
+    residual: Option<&WorkflowTensor>,
     sum: RoutedSum,
     rows: &Dim,
     epsilon: Argument<f32>,
@@ -854,9 +1163,10 @@ pub(crate) fn general_routed<'a, G: GraphDraft + 'a>(
     let scratch = streamed.is_some() && !decode;
     let GeneralRoutedGraphEntries { select, experts, down, group, scatter, shared, latent } = entries;
     let (latent_down, latent_up) = (latent.map(|(down, _)| down), latent.map(|(_, up)| up));
-    let decode_back = match (split, &mut streamed) {
+    let mut decode_back = match (split, &mut streamed) {
         (None, _) if !scratch => None,
         (Some(Split::Front(crossing)), layer) if !decode => {
+            let residual = residual.ok_or("a routed Front reads no residual")?;
             let selection = Selection::of(graph, planned, scope, weights, constants, form, shape)?;
             let Crossing { routes, weights: route_weights, normalized: into, .. } = crossing;
             let normalized =
@@ -873,6 +1183,7 @@ pub(crate) fn general_routed<'a, G: GraphDraft + 'a>(
         // A back after its merge set's pass: its rows' experts are the pass's,
         // at the positions its rows of the merged positions name.
         (Some(Split::Combine(back, blocks)), _) if !decode => {
+            let residual = residual.ok_or("a routed Combine reads no residual")?;
             let output = combine(
                 graph, shared, scatter, latent_up, planned, scope, weights, constants, residual, sum, &back.pass(blocks),
                 back.crossing.weights.tensor(), rows, form, shape, epsilon, None,
@@ -884,10 +1195,12 @@ pub(crate) fn general_routed<'a, G: GraphDraft + 'a>(
         // Declares ONLY ports consumed by `DecodeFront` (no `gate_scale`/`up_scale`,
         // no `Tier { kind }`, no `Site*`).
         (Some(Split::DecodeFront(crossing)), Some(layer)) if decode => {
+            let residual = residual.ok_or("a routed DecodeFront reads no residual")?;
+            let crossing = crossing.declare_front(graph)?;
             let selection = Selection::of(graph, planned, scope, weights, constants, form, shape)?;
             let dimensions = selection.dimensions(shape, rows);
             let Selection { norm, router_norm, router, bias, expert_scale } = &selection;
-            let BankRoute::General { activation, select: route, hints: hint_kernels } = layer.route() else {
+            let BankRoute::General { select: route, .. } = layer.route() else {
                 return Err("a general layer's bank holds another form's route".into());
             };
             let bank = layer.numbers();
@@ -919,8 +1232,8 @@ pub(crate) fn general_routed<'a, G: GraphDraft + 'a>(
                     router: router.into(),
                     bias: bias.into(),
                     expert_scale: (&expert_scale.tensor).into(),
-                    routes: crossing.routes.tensor_mut().into(),
-                    weights: crossing.weights.tensor_mut().into(),
+                    routes: crossing.routes.as_mut().expect("DecodeFront declares routes").tensor_mut().into(),
+                    weights: crossing.weights.as_mut().expect("DecodeFront declares weights").tensor_mut().into(),
                     epsilon,
                     score,
                     normalization: scalar(&shape.normalization, "a route's normalization code")?,
@@ -932,7 +1245,7 @@ pub(crate) fn general_routed<'a, G: GraphDraft + 'a>(
                     sited: (ports.sited()).into(),
                     step: ports.step.tensor().into(),
                     file: ports.file.tensor_mut().into(),
-                    sources: crossing.sources.tensor_mut().into(),
+                    sources: crossing.sources.as_mut().expect("DecodeFront declares sources").tensor_mut().into(),
                     routing: routing.tensor_mut().into(),
                     keys: keys.tensor_mut().into(),
                     front: front.tensor_mut().into(),
@@ -940,47 +1253,7 @@ pub(crate) fn general_routed<'a, G: GraphDraft + 'a>(
                     land_groups: layer.land_groups().into(),
                 },
             )?;
-            if let Some(mut hints) = layer.hints(
-                graph,
-                weights,
-                [router_norm, router, bias],
-                ports.policy.tensor(),
-            )? {
-                let hint = hint_kernels[hints.ahead as usize - 1]
-                    .ok_or("a streamed layer's lead was not prepared with its binding")?;
-                let empty = GraphConstant::empty_of(graph, activation, &[Dim::from(0u64), shape.selected.clone()], constants)?;
-                let hint_dims = [
-                    ("M", rows.clone()),
-                    ("H", shape.hidden.clone()),
-                    ("K", shape.selected.clone()),
-                    ("AHEAD", Dim::from(hints.ahead)),
-                    ("RING", bank.ring_words.clone()),
-                    ("EN", bank.next_experts.clone()),
-                ];
-                graph.enqueue_under(
-                    hint,
-                    &hint_dims,
-                    routed_hint_select::WorkflowArgs {
-                        residual: residual.into(),
-                        activation: (&empty).into(),
-                        next_router_norm: (&hints.weights[0][0]).into(),
-                        next_router: (&hints.weights[0][1]).into(),
-                        next_bias: (&hints.weights[0][2]).into(),
-                        after_router_norm: (&hints.weights[1][0]).into(),
-                        after_router: (&hints.weights[1][1]).into(),
-                        after_bias: (&hints.weights[1][2]).into(),
-                        score,
-                        epsilon,
-                        step: ports.step.tensor().into(),
-                        next_policy: (&hints.policy).into(),
-                        rings: hints.rings.tensor_mut().into(),
-                    },
-                    &ports.policy,
-                    magnitude_kernels::constants::POLICY_HINTS,
-                    LaunchEncoding::WhileSet,
-                )?;
-            }
-            let mut sources_tensor = crossing.sources.tensor().clone();
+            let mut sources_tensor = crossing.sources.as_ref().expect("DecodeFront declares sources").tensor().clone();
             if layer.needs_front_land() {
                 let mut gate_records = form
                     .experts_expansion
@@ -1005,26 +1278,36 @@ pub(crate) fn general_routed<'a, G: GraphDraft + 'a>(
             }
             let input =
                 expert_input(graph, latent_down, planned, scope, weights, constants, selected.value, rows, form, shape)?;
-            graph.store(&input, &mut crossing.normalized)?;
+            graph.store(&input, crossing.normalized.as_mut().expect("DecodeFront declares normalized"))?;
             // Publish CPU-sited choices at the tail of `DecodeFront` so
             // `expert-compute` overlaps 100% with host-driven `DecodeDma`.
             let sources_view = sources_tensor.slice_leading(0, magnitude_kernels::constants::SOURCE_ROWS);
             layer.site_request_front(
                 graph,
                 &mut ports,
-                crossing.routes.tensor(),
-                crossing.weights.tensor(),
+                crossing.routes.as_ref().expect("DecodeFront declares routes").tensor(),
+                crossing.weights.as_ref().expect("DecodeFront declares weights").tensor(),
                 &sources_view,
                 &input,
                 &super::streamed::DecodeShape { rows },
             )?;
             return Ok((residual.clone(), ports.inputs.take()));
         }
+        (Some(Split::DecodeHits(crossing)), Some(layer)) if decode => {
+            if !layer.can_split_decode_hits() || !matches!(experts, ExpertEntries::Gated { .. }) {
+                return Err("DecodeHits sealed for a layer that does not split hits".into());
+            }
+            return decode_hits(
+                graph, layer, shared, planned, scope, part, weights, constants, residual, sum, rows, form, shape,
+                epsilon, crossing,
+            );
+        }
         (Some(Split::DecodeBack(crossing)), Some(_)) if decode => Some(crossing),
         _ => return Err("a routed layer's graph disagrees with how its experts are served".into()),
     };
     let mut stacks = ExpertStacks::of(graph, planned, scope, weights, constants, form, part)?;
     if !decode {
+        let residual = residual.ok_or("a routed prefill layer reads no residual")?;
         let selection = Selection::of(graph, planned, scope, weights, constants, form, shape)?;
         let dimensions = selection.dimensions(shape, rows);
         let mut routes = graph.local_for(select, "routes", &dimensions)?;
@@ -1072,8 +1355,35 @@ pub(crate) fn general_routed<'a, G: GraphDraft + 'a>(
         )?;
         return Ok((output, None));
     }
+    if let Some(crossing) = decode_back.as_deref_mut() {
+        let split_hits = matches!(experts, ExpertEntries::Gated { .. })
+            && streamed.as_ref().is_some_and(|layer| layer.can_split_decode_hits());
+        if split_hits {
+            let layer = streamed.as_mut().expect("DecodeBack requires a streamed layer");
+            return decode_back_split_hits(
+                graph,
+                layer,
+                &stacks,
+                latent_up,
+                planned,
+                scope,
+                weights,
+                constants,
+                residual,
+                shared.is_some(),
+                sum,
+                rows,
+                form,
+                shape,
+                epsilon,
+                crossing,
+            );
+        }
+    }
+    let residual = residual.ok_or("a routed decode layer reads no residual")?;
     let (routes_tensor, weights_tensor, base, input, reads, experts_read, mut waiting, back_site) =
-        if let Some(crossing) = decode_back {
+        if let Some(crossing) = decode_back.as_deref_mut() {
+            let crossing = crossing.declare_back(graph, false, false)?;
             let base = SumBase::of(
                 graph, shared, planned, scope, weights, constants, residual, sum, rows, form, shape, epsilon, None,
             )?;
@@ -1081,15 +1391,17 @@ pub(crate) fn general_routed<'a, G: GraphDraft + 'a>(
             let ports = layer.decode_back_ports(graph, true)?;
             let sources_view = crossing
                 .sources
+                .as_ref()
+                .expect("DecodeBack declares sources")
                 .tensor()
                 .slice_leading(0, magnitude_kernels::constants::SOURCE_ROWS);
             let reads = layer.reads_back(graph, &ports, sources_view, constants)?;
             let experts_read = layer.numbers().records.clone();
             (
-                crossing.routes.tensor().clone(),
-                crossing.weights.tensor().clone(),
+                crossing.routes.as_ref().expect("DecodeBack declares routes").tensor().clone(),
+                crossing.weights.as_ref().expect("DecodeBack declares weights").tensor().clone(),
                 base,
-                crossing.normalized.tensor().clone(),
+                crossing.normalized.as_ref().expect("DecodeBack declares normalized").tensor().clone(),
                 reads,
                 experts_read,
                 None,
@@ -1123,7 +1435,7 @@ pub(crate) fn general_routed<'a, G: GraphDraft + 'a>(
             let (normalized, reads, experts_read, waiting) = match &mut streamed {
                 Some(layer) => {
                     let Selection { norm, router_norm, router, bias, expert_scale } = &selection;
-                    let BankRoute::General { activation, select: route, hints: hint_kernels } = layer.route() else {
+                    let BankRoute::General { select: route, .. } = layer.route() else {
                         return Err("a general layer's bank holds another form's route".into());
                     };
                     let bank = layer.numbers();
@@ -1179,47 +1491,6 @@ pub(crate) fn general_routed<'a, G: GraphDraft + 'a>(
                             land_groups: layer.land_groups().into(),
                         },
                     )?;
-                    if let Some(mut hints) = layer.hints(
-                        graph,
-                        weights,
-                        [router_norm, router, bias],
-                        ports.policy.tensor(),
-                    )? {
-                        let hint = hint_kernels[hints.ahead as usize - 1]
-                            .ok_or("a streamed layer's lead was not prepared with its binding")?;
-                        let empty = GraphConstant::empty_of(graph, activation, &[Dim::from(0u64), shape.selected.clone()], constants)?;
-                        let hint_dims = [
-                            ("M", rows.clone()),
-                            ("H", shape.hidden.clone()),
-                            ("K", shape.selected.clone()),
-                            ("AHEAD", Dim::from(hints.ahead)),
-                            ("RING", bank.ring_words.clone()),
-                            ("EN", bank.next_experts.clone()),
-                        ];
-                        // Encoded while the layer's hints pay (POLICY_HINTS).
-                        graph.enqueue_under(
-                            hint,
-                            &hint_dims,
-                            routed_hint_select::WorkflowArgs {
-                                residual: residual.into(),
-                                activation: (&empty).into(),
-                                next_router_norm: (&hints.weights[0][0]).into(),
-                                next_router: (&hints.weights[0][1]).into(),
-                                next_bias: (&hints.weights[0][2]).into(),
-                                after_router_norm: (&hints.weights[1][0]).into(),
-                                after_router: (&hints.weights[1][1]).into(),
-                                after_bias: (&hints.weights[1][2]).into(),
-                                score,
-                                epsilon,
-                                step: ports.step.tensor().into(),
-                                next_policy: (&hints.policy).into(),
-                                rings: hints.rings.tensor_mut().into(),
-                            },
-                            &ports.policy,
-                            magnitude_kernels::constants::POLICY_HINTS,
-                            LaunchEncoding::WhileSet,
-                        )?;
-                    }
                     let reads = layer.reads(graph, &ports, &locals, constants)?;
                     (selected.value, reads, bank.records.clone(), Some((layer, RoutedStep { ports, locals, routing })))
                 }
@@ -1369,22 +1640,24 @@ pub(crate) fn general_routed<'a, G: GraphDraft + 'a>(
             let resident = graph
                 .enqueue_under(G::pick(down, rows), &down_dimensions, resident_args(), &policy, whole, LaunchEncoding::WhileSet)?
                 .value;
-            let published = graph
-                .enqueue_under(
-                    G::pick(project, rows),
-                    &[dimensions.as_slice(), &map_dimension].concat(),
-                    routed_down_project::WorkflowArgs {
-                        product: (&product).into(),
-                        routes: (&routes_tensor).into(),
-                        sources: (&reads.sources).into(),
-                        expert_down: stacks.down.tensor().into(),
-                        tier_down: (&reads.tier.down).into(),
-                    },
-                    &policy,
-                    whole,
-                    LaunchEncoding::WhileClear,
-                )?
-                .value;
+            let project_entry = G::pick(project, rows);
+            let mut published = graph.local_for(project_entry, "published", &down_dimensions)?;
+            graph.enqueue_under(
+                project_entry,
+                &down_dimensions,
+                routed_down_project::WorkflowArgs {
+                    product: (&product).into(),
+                    routes: (&routes_tensor).into(),
+                    sources: (&reads.sources).into(),
+                    expert_down: stacks.down.tensor().into(),
+                    tier_down: (&reads.tier.down).into(),
+                    mode: 0.into(),
+                    published: published.tensor_mut().into(),
+                },
+                &policy,
+                whole,
+                LaunchEncoding::WhileClear,
+            )?;
             layer.park_site(graph);
             let summed = graph
                 .enqueue_under(
@@ -1396,7 +1669,7 @@ pub(crate) fn general_routed<'a, G: GraphDraft + 'a>(
                     .concat(),
                     routed_down_sited::WorkflowArgs {
                         base: (&base.onto).into(),
-                        published: (&published).into(),
+                        published: published.tensor().into(),
                         sources: (&reads.sources).into(),
                         weights: (&weights_tensor).into(),
                         step: step.tensor().into(),

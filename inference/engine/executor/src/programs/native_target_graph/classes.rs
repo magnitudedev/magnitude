@@ -97,6 +97,16 @@ pub(super) fn class_topology((class, stage): StagedClass) -> Topology {
     (RowForm::of(rows), listed > 0, scored > 0, stage, pass)
 }
 
+/// Static binding deduplication key for a block's run/untapped graphs:
+/// `(rows, Topology)`. Every `StagedClass` sharing `(block, rows, Topology)`
+/// shares the exact same `SealedTopology` (`NativePort` indices), resident
+/// weights, non-placed/non-windowed bank parts, and row-sized graph constants.
+pub(super) type BindingKey = (u64, Topology);
+
+pub(super) fn binding_key(staged: StagedClass) -> BindingKey {
+    (staged.0.0, class_topology(staged))
+}
+
 /// Whether a launch of `class` may be a decode step's: one of no more than
 /// its rows (`ResourceLimits::decode_rows`). Their
 /// layouts differ (`RowForm`, and whether a class lists or scores), so what
@@ -150,6 +160,7 @@ pub(super) struct BlockServed {
     pub(super) streams: bool,
     pub(super) resident: bool,
     pub(super) decode_split: bool,
+    pub(super) decode_hits: bool,
     pub(super) split: Option<SplitValues<Extents>>,
     pub(super) decode_crossing: Option<crate::operators::routed::split::DecodeCrossingBuffers<Extents>>,
 }
@@ -187,6 +198,15 @@ pub(super) fn block_served(
                 None
             };
             let decode_split = streams && bank_decode_dma && routed.is_some();
+            let bank_decode_hits = bank_layers[index].is_some_and(|layer| {
+                load.expert_bank()
+                    .is_some_and(|bank| bank.sited(layer) && bank.splits_decode_hits(layer))
+            });
+            let decode_hits = decode_split
+                && bank_decode_hits
+                && routed.is_some_and(|routed| {
+                    crate::operators::routed::streamed::decode_hits_supported(routed, backend)
+                });
             let decode_crossing = if decode_split {
                 routed.map(|routed| {
                     crate::operators::routed::split::DecodeCrossingBuffers::of(
@@ -202,6 +222,7 @@ pub(super) fn block_served(
                 streams,
                 resident: streams && bank_resident,
                 decode_split,
+                decode_hits,
                 split,
                 decode_crossing,
             })
@@ -217,9 +238,15 @@ pub(super) fn block_stages(served: &[BlockServed], index: usize, rows: u64) -> &
 
 /// The stages block `index`'s graphs of `rows` rows are sealed in
 /// (`RunStage::sealed`): its runs' stages, its resident form, and its M7
-/// decode split front/back where active.
+/// decode split front/hits/back where active.
 pub(super) fn block_sealed_stages(served: &[BlockServed], index: usize, rows: u64) -> &'static [RunStage] {
-    RunStage::sealed(served[index].split.is_some(), served[index].resident, served[index].decode_split, rows)
+    RunStage::sealed(
+        served[index].split.is_some(),
+        served[index].resident,
+        served[index].decode_split,
+        served[index].decode_hits,
+        rows,
+    )
 }
 
 /// Whether a launch of `rows` rows splits at block `index`
@@ -350,16 +377,6 @@ pub(crate) enum LaunchControl {
     /// 2]`, `[0, c)` of its `c` complete groups), which its indexer picks
     /// unit ordinals over (`selection::Picks::Units`).
     Units { read: usize },
-    /// A picked pooled source's Block read: the launch's picks table
-    /// (`[rows, top]`, uploaded -1), which its own layer's graph stores, a
-    /// later Reindex layer's graph stores over, and the Reuse layers' graphs
-    /// after each read (`operators::attention::pooled`).
-    Picks { read: usize },
-    /// A picked pooled source's Block read whose own indexer produces a
-    /// candidate pool: the launch's pool table (`[rows, blocks + segments,
-    /// 2]` spans, uploaded -1), which that layer's graph stores and the
-    /// restricted indexers' graphs read.
-    Pool { read: usize },
     /// The slots' `[B + 1, 2]` row segments and `[B]` recurrent words.
     Segments,
     Stop,
@@ -381,8 +398,6 @@ impl LaunchControl {
                 | Self::Destinations { .. }
                 | Self::Complete { .. }
                 | Self::Units { .. }
-                | Self::Picks { .. }
-                | Self::Pool { .. }
         )
     }
 }
@@ -554,10 +569,6 @@ impl LaunchControlLayout {
                     Some((LaunchControl::Destinations { read }, vec![rows])),
                     (picks.is_some() || units).then(|| (LaunchControl::Complete { read }, vec![rows])),
                     units.then(|| (LaunchControl::Units { read }, vec![rows, 1, 2])),
-                    picks.map(|lists| (LaunchControl::Picks { read }, vec![rows, lists.top])),
-                    picks.and_then(|lists| lists.pool_blocks).map(|blocks| {
-                        (LaunchControl::Pool { read }, vec![rows, blocks + segments, 2])
-                    }),
                 ]
                 .into_iter()
                 .flatten()

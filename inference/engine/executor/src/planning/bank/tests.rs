@@ -1,6 +1,7 @@
 use super::*;
 use super::records::record_bytes;
-use crate::error::{PlanError, UnstreamedExperts};
+use crate::error::PlanError;
+use magnitude_family_contracts::WeightKind;
 use magnitude_kernels::constants::VERIFY_ROWS;
 use crate::planning::ModelLoadPlan;
 use crate::planning::weights::{Holding, representation_bytes};
@@ -16,7 +17,12 @@ impl ModelLoadPlan {
 
 /// A CUDA device's substrate beside `host`, without KV slabs.
 pub(crate) fn cuda(host: HostTier) -> BankSubstrate {
-    BankSubstrate { backend: seismic::BackendName::Cuda, allocations: seismic::NativeAllocations::EXACT, host }
+    BankSubstrate {
+        backend: seismic::BackendName::Cuda,
+        allocations: seismic::NativeAllocations::EXACT,
+        host,
+        has_side_queue: true,
+    }
 }
 
 /// The fixture a partial bank streams through on the device
@@ -34,7 +40,12 @@ fn a_fixture_of_more_experts_admits_a_partial_bank() {
         let selection = crate::ComponentSelection { head: false, vision: false };
         let resident = crate::ModelLoadPlan::derive(&manifest, &definition, selection, crate::resident_layout(crate::ExecutionPath::Native, backend), crate::PlannedMethod::Plain, crate::planning::fixtures::LIMITS)
             .unwrap();
-        let substrate = BankSubstrate { backend, allocations: seismic::NativeAllocations::EXACT, host };
+        let substrate = BankSubstrate {
+            backend,
+            allocations: seismic::NativeAllocations::EXACT,
+            host,
+            has_side_queue: backend.fills_beside_compute(),
+        };
         let floor = resident.bank_floor(&definition, 1, FlightDepth::PIPELINED, substrate).unwrap();
         let [floor, half, whole] = [floor, 64, 128].map(|slots| {
             resident.clone().with_expert_bank(&definition, slots, None, 1, FlightDepth::PIPELINED, substrate).unwrap().weight_bytes().unwrap()
@@ -140,7 +151,6 @@ fn bank_of(groups: &[usize], slots: u64, experts: impl Fn(usize) -> u64, form: R
                     experts: experts(layers.len()),
                     selected: 8,
                     resident: form.each(|_| Ok::<_, ()>(resident())).unwrap(),
-                    hinted: Vec::new(),
                     shared_down: None,
                 });
             }
@@ -157,6 +167,7 @@ fn bank_of(groups: &[usize], slots: u64, experts: impl Fn(usize) -> u64, form: R
     ExpertBankPlan {
         structured,
         backend: seismic::BackendName::Cuda,
+        has_side_queue: true,
         allocations,
         blocks,
         slots,
@@ -538,7 +549,14 @@ fn a_host_tier_holds_each_groups_records_in_their_resident_form() {
         }
     }
     assert!(without.layout().unwrap().host.is_none());
-    assert_eq!(layout.staging, without.layout().unwrap().staging, "staging is the tier's alike");
+    // `Placer::Tier` adds alignment headroom for zero-bounce direct staging,
+    // whereas `Placer::Bank` (`without`) keeps tight `routed_land` tensor shape.
+    assert_eq!(layout.staging.len(), without.layout().unwrap().staging.len());
+    for (tier_staging, bank_staging) in layout.staging.iter().zip(without.layout().unwrap().staging.iter()) {
+        let tier_bytes = tier_staging.storage_demand(plan.host()).unwrap().checked_bytes().unwrap();
+        let bank_bytes = bank_staging.storage_demand(without.host()).unwrap().checked_bytes().unwrap();
+        assert!(tier_bytes > bank_bytes, "Placer::Tier staging ({tier_bytes}) must include alignment headroom over Placer::Bank ({bank_bytes})");
+    }
     // Charged each group's granule in its host pool's blocks past the lent
     // ones, which their lent allocation holds.
     let blocks = plan.blocks();
@@ -631,15 +649,15 @@ fn demand_records_sizes_for_single_and_multi_row_decode() {
     for host in [HostTier::Unified(Parking::InKernels), HostTier::Linked] {
         let single = with_shape(1, 1, host);
         assert_eq!(single.demand_records(), 1, "{host:?} widest == 1");
-        assert_eq!(single.staging_records() - single.demand_records(), single.hint_records(), "{host:?} widest == 1");
+        assert_eq!(single.staging_records() - single.demand_records(), single.ahead_records(), "{host:?} widest == 1");
 
         let capped = with_shape(8, 24, host);
         assert_eq!(capped.demand_records(), (VERIFY_ROWS * 8).min(24), "{host:?} widest == 24");
-        assert_eq!(capped.staging_records() - capped.demand_records(), capped.hint_records(), "{host:?} widest == 24");
+        assert_eq!(capped.staging_records() - capped.demand_records(), capped.ahead_records(), "{host:?} widest == 24");
 
         let wide = with_shape(8, 256, host);
         assert_eq!(wide.demand_records(), (VERIFY_ROWS * 8).min(256), "{host:?} widest == 256");
-        assert_eq!(wide.staging_records() - wide.demand_records(), wide.hint_records(), "{host:?} widest == 256");
+        assert_eq!(wide.staging_records() - wide.demand_records(), wide.ahead_records(), "{host:?} widest == 256");
     }
 }
 
@@ -876,6 +894,98 @@ fn a_bank_holds_its_stored_table_in_granule_records() {
     assert_eq!(BankTable::of(&fixed, 1, row - 1).unwrap(), None);
 }
 
+#[test]
+fn bank_tables_deduplicate_only_when_backing_subrange_layout_and_holding_match() {
+    use crate::planning::fixtures::{qwen4exp_fixture_definition, streamed_experts_manifest};
+    use magnitude_family_contracts::ImportTransform;
+
+    let table_rows = 1 << 20;
+    let build = |second_name: Option<&str>| {
+        let mut definition = qwen4exp_fixture_definition();
+        let mut second_ngram = definition.decoder.blocks[0].sublayers[2].clone();
+        if let Operator::NGramInput(input) = &mut definition.decoder.blocks[0].sublayers[2].op {
+            input.table.shape[0] = table_rows;
+        }
+        if let Operator::NGramInput(input) = &mut second_ngram.op {
+            input.table.shape[0] = table_rows;
+            if let Some(name) = second_name {
+                input.table.name = name.to_owned();
+            }
+        }
+        definition.decoder.blocks[1].sublayers.push(second_ngram);
+        let manifest = streamed_experts_manifest(&definition);
+        let selection = crate::ComponentSelection { head: false, vision: false };
+        let resident = ModelLoadPlan::derive(
+            &manifest,
+            &definition,
+            selection,
+            Layout::Rows32,
+            crate::PlannedMethod::Plain,
+            crate::planning::fixtures::LIMITS,
+        )
+        .unwrap();
+        let substrate = BankSubstrate {
+            allocations: seismic::NativeAllocations { least: 0, granularity: 2 << 20 },
+            ..cuda(HostTier::Unified(Parking::InKernels))
+        };
+        let banked = resident.clone().with_expert_bank_at_floor(&definition, substrate).unwrap();
+        (resident, banked)
+    };
+
+    // Identical backing, subrange, layout, and holding: two n-gram layers
+    // deduplicate into one physical BankTable with both roles tracked.
+    let (resident_shared, banked_shared) = build(None);
+    let bank = banked_shared.expert_bank().unwrap();
+    assert_eq!(bank.tables.len(), 1, "identical shared stored tables must deduplicate");
+    let table = &bank.tables[0];
+    let roles: Vec<_> = table.roles().collect();
+    assert_eq!(roles.len(), 2);
+    assert!(table.has_role(roles[0]));
+    assert!(table.has_role(roles[1]));
+    assert_eq!(
+        banked_shared.clone().unbanked().target(),
+        resident_shared.target(),
+        "unbanking must restore every role sharing a deduplicated BankTable"
+    );
+
+    // Distinct backing tensor names must NOT deduplicate.
+    let (_, banked_distinct) = build(Some("per_layer_token_embd_second.weight"));
+    assert_eq!(
+        banked_distinct.expert_bank().unwrap().tables.len(),
+        2,
+        "distinct backing tensors must not deduplicate"
+    );
+
+    // Differing subrange, resident layout, or holding must NOT match `shares_storage_with`.
+    let mut subrange_diff = table.clone();
+    subrange_diff
+        .fixed
+        .descriptor
+        .transforms
+        .push(ImportTransform::Rows(magnitude_family_contracts::RowRange {
+            start: 0,
+            rows: 1024,
+        }));
+    assert!(!table.shares_storage_with(&subrange_diff));
+
+    let mut layout_diff = table.clone();
+    layout_diff.fixed.resident = seismic::Element::f32();
+    assert!(!table.shares_storage_with(&layout_diff));
+
+    let mut shape_diff = table.clone();
+    shape_diff.fixed.shape[1] += 1;
+    assert!(!table.shares_storage_with(&shape_diff));
+
+    let mut holding_diff = table.clone();
+    if let crate::planning::weights::Holding::Streamed(streamed) = &mut holding_diff.fixed.holding {
+        streamed.directory = match streamed.directory {
+            crate::planning::DirectoryForm::Dense => crate::planning::DirectoryForm::Hashed,
+            crate::planning::DirectoryForm::Hashed => crate::planning::DirectoryForm::Dense,
+        };
+    }
+    assert!(!table.shares_storage_with(&holding_diff));
+}
+
 /// A bank's layers are at least one, each of experts, so the most any
 /// has is positive: none, or a layer of none, is no bank's.
 #[test]
@@ -976,50 +1086,6 @@ fn a_bank_plans_every_routed_layer_into_its_groups_records() {
     assert_eq!(whole.unbanked(), resident);
 }
 
-/// Each layer records what the route before it reads of it, alike in
-/// every layer; a layer whose router is held in another element than
-/// the first's is refused at planning, before any graph reads it as the
-/// route's own.
-#[test]
-fn a_route_predicts_only_layers_of_its_own_elements() {
-    use crate::planning::fixtures::{
-        qwen4exp_fixture_definition, relaid_manifest, streamed_experts_manifest,
-    };
-    use magnitude_artifacts::gguf::Encoding;
-    let definition = qwen4exp_fixture_definition();
-    let selection = crate::ComponentSelection {
-        head: false,
-        vision: false,
-    };
-    let banked = |manifest| {
-        ModelLoadPlan::derive(&manifest, &definition, selection, Layout::Rows32, crate::PlannedMethod::Plain, crate::planning::fixtures::LIMITS)
-            .unwrap()
-            .with_expert_bank_at_floor(&definition, cuda(HostTier::Linked))
-    };
-    let manifest = streamed_experts_manifest(&definition);
-    let plan = banked(manifest.clone()).unwrap();
-    let bank = plan.expert_bank().unwrap();
-    let routers = bank
-        .layers()
-        .iter()
-        .map(|layer| {
-            let router = layer.hinted.iter().find(|hint| hint.kind == WeightKind::Router);
-            router.and_then(|router| router.element).unwrap()
-        })
-        .collect::<Vec<_>>();
-    assert!(routers.len() > 1 && routers.iter().all(|router| *router == routers[0]));
-    // The second streamed layer's router stored as Q8_0 blocks.
-    let WeightScope::TargetSublayer(second) = bank.layers()[1].scope else {
-        panic!("a streamed layer is a target sublayer");
-    };
-    let router = format!("blk.{}.ffn_gate_inp", second.block);
-    let relaid = relaid_manifest(manifest, &[router], Encoding::Q8_0, 34);
-    assert!(matches!(
-        banked(relaid),
-        Err(PlanError::Unstreamed(UnstreamedExperts::SelectionOrder(index))) if index == second
-    ));
-}
-
 /// A banked load's target graphs build on Metal at every class, beside a
 /// linked tier and as the one store: the streamed decode and
 /// scratch-served forms check against the entries' contracts and
@@ -1062,7 +1128,14 @@ fn banked_target_graphs_build_on_metal() {
         crate::planning::fixtures::LIMITS,
     )
     .unwrap();
-    let substrate = crate::planning::bank_substrate(backend, seismic::NativeAllocations::EXACT, Some(host), &definition).unwrap();
+    let substrate = crate::planning::bank_substrate(
+        backend,
+        seismic::NativeAllocations::EXACT,
+        Some(host),
+        backend.fills_beside_compute(),
+        &definition,
+    )
+    .unwrap();
     let load = resident.with_expert_bank_at_floor(&definition, substrate).unwrap();
     let plan = load.program_plan(&definition, codec).unwrap();
     let state = ResourcePlanner::state_plan(
@@ -1111,10 +1184,97 @@ fn a_discrete_vulkan_conveyor_lies_in_its_host_tier() {
     let manifest = streamed_experts_manifest(&definition);
     let selection = crate::ComponentSelection { head: false, vision: false };
     let resident = ModelLoadPlan::derive(&manifest, &definition, selection, Layout::Rows32, crate::PlannedMethod::Plain, crate::planning::fixtures::LIMITS).unwrap();
-    let load = resident.with_expert_bank_at_floor(&definition, BankSubstrate { backend: seismic::BackendName::Vulkan, allocations: seismic::NativeAllocations::EXACT, host }).unwrap();
+    let load = resident
+        .with_expert_bank_at_floor(
+            &definition,
+            BankSubstrate {
+                backend: seismic::BackendName::Vulkan,
+                allocations: seismic::NativeAllocations::EXACT,
+                host,
+                has_side_queue: executor.has_side_queue(),
+            },
+        )
+        .unwrap();
     let bank = load.expert_bank().unwrap();
     assert!(matches!(bank.conveyor().carrier, ConveyorCarrier::HostTier(_)));
     assert!(bank.layout().unwrap().host.is_some());
+    assert!(
+        bank.tier_copy_dma(),
+        "discrete Vulkan with a side queue enables prefill ScratchRing tier_copy_dma"
+    );
+}
+
+/// Vulkan enables `tier_copy_dma` ONLY when the device is discrete (`HostTier::Linked`)
+/// AND exposes a distinct side queue (`has_side_queue == true`). Single-queue Vulkan
+/// devices and unified-memory Vulkan devices keep `tier_copy_dma == false`, and
+/// `decode_dma_enabled(Vulkan)` remains disabled (no blanket M7 enable).
+#[test]
+fn vulkan_tier_copy_dma_requires_side_queue_and_tiered_host_and_keeps_decode_dma_off() {
+    use crate::planning::fixtures::{qwen4exp_fixture_definition, streamed_experts_manifest};
+    let definition = qwen4exp_fixture_definition();
+    let manifest = streamed_experts_manifest(&definition);
+    let selection = crate::ComponentSelection { head: false, vision: false };
+    let resident = ModelLoadPlan::derive(
+        &manifest,
+        &definition,
+        selection,
+        Layout::Rows32,
+        crate::PlannedMethod::Plain,
+        crate::planning::fixtures::LIMITS,
+    )
+    .unwrap();
+
+    let with_side_linked = resident
+        .clone()
+        .with_expert_bank_at_floor(
+            &definition,
+            BankSubstrate {
+                backend: seismic::BackendName::Vulkan,
+                allocations: seismic::NativeAllocations::EXACT,
+                host: HostTier::Linked,
+                has_side_queue: true,
+            },
+        )
+        .unwrap();
+    assert!(with_side_linked.expert_bank().unwrap().tier_copy_dma());
+
+    let single_queue_linked = resident
+        .clone()
+        .with_expert_bank_at_floor(
+            &definition,
+            BankSubstrate {
+                backend: seismic::BackendName::Vulkan,
+                allocations: seismic::NativeAllocations::EXACT,
+                host: HostTier::Linked,
+                has_side_queue: false,
+            },
+        )
+        .unwrap();
+    assert!(
+        !single_queue_linked.expert_bank().unwrap().tier_copy_dma(),
+        "single-queue Vulkan device must not enable tier_copy_dma"
+    );
+
+    let unified_with_side = resident
+        .with_expert_bank_at_floor(
+            &definition,
+            BankSubstrate {
+                backend: seismic::BackendName::Vulkan,
+                allocations: seismic::NativeAllocations::EXACT,
+                host: HostTier::Unified(Parking::AtBoundaries),
+                has_side_queue: true,
+            },
+        )
+        .unwrap();
+    assert!(
+        !unified_with_side.expert_bank().unwrap().tier_copy_dma(),
+        "unified Vulkan device must not enable tier_copy_dma"
+    );
+
+    assert!(
+        !crate::experts::decode_dma_enabled(seismic::BackendName::Vulkan),
+        "M7 decode DMA must stay gated off on Vulkan"
+    );
 }
 
 /// The conveyor lies in the bottom records of the group of the most
@@ -1193,7 +1353,7 @@ fn a_bank_charges_every_allocation_of_its_layout() {
             let (element, extents) = plan.part_shape(index, part).unwrap();
             BankAllocation::Words { element, extents }
         };
-        assert_eq!(layer.rings, words(BankPart::Rings));
+        assert_eq!(layer.front, words(BankPart::Front));
         assert_eq!(layer.rounds.len() as u64, plan.rounds(), "a round list of every round, the layer's own");
     }
     assert_eq!(layout.staging.len(), plan.staging_pools().0.len());
@@ -1264,8 +1424,6 @@ fn layers_of_different_expert_counts_size_their_records_by_their_own() {
     assert_eq!(shape(2, BankPart::Scratch { kind: RoutedTensor::Up })[0], 304);
     assert_eq!(shape(0, BankPart::Conveyor { kind: RoutedTensor::Down })[0], plan.conveyor_records());
     assert_eq!(plan.rounds(), 496_u64.div_ceil(plan.round_records()));
-    assert_eq!(plan.binding(0).unwrap().next_experts, 496);
-    assert_eq!(plan.binding(2).unwrap().next_experts, 304, "the last layer hints nothing");
     // An up-only record's group holds no gate records.
     let layout = plan.layout().unwrap();
     assert!(layout.groups.iter().all(|group| group.records.gate.is_none()));
@@ -1687,6 +1845,8 @@ fn deepseek41_dspark_32gb_pins_draft_group_whole_and_falls_back_on_tight_vram() 
 
     // Target decode/verify working set: decode_set(6, 384, 4) = 24.
     assert_eq!(plan.draft_pin_threshold(), Some(24));
+    assert_eq!(plan.draft_extra_slots(), 128 - 24);
+    assert_eq!(plan.max_slots(), 384 + (128 - 24));
 
     // Exact DeepSeek-V4.1 + DSpark 32 GB VRAM geometry:
     //   target = 40 layers × 8.80 MB/expert = 352.0 MB/slot
@@ -1699,14 +1859,27 @@ fn deepseek41_dspark_32gb_pins_draft_group_whole_and_falls_back_on_tight_vram() 
             + plan.records_at(1, slots) * draft_expert_bytes
     };
 
+    // 0. Smooth monotonicity: every single step `s -> s + 1` adds at most 1
+    //    slot per layer (zero multi-GB step-function cliff).
+    let max_single_step = 40 * target_expert_bytes + 3 * draft_expert_bytes;
+    for s in 0..plan.max_slots() {
+        let delta = charge_bytes(s + 1) - charge_bytes(s);
+        assert!(
+            delta <= max_single_step,
+            "step {s} -> {} jumped by {delta} bytes (exceeds 1 slot/layer = {max_single_step})",
+            s + 1,
+        );
+    }
+
     // 1. 32 GB RTX 5090 budget (~21.24 GB for expert records):
     let rtx5090_budget: u64 = 52 * (40 * target_expert_bytes + 3 * draft_expert_bytes);
-    let rtx5090_slots = growth_target(0, 384, rtx5090_budget, |to| Ok::<_, ()>(charge_bytes(to)))
+    let rtx5090_slots = growth_target(0, plan.max_slots(), rtx5090_budget, |to| Ok::<_, ()>(charge_bytes(to)))
         .unwrap()
         .expect("32 GB budget fits above floor");
+    let target_per_layer = plan.target_slots(rtx5090_slots);
     assert!(
-        rtx5090_slots >= 36,
-        "target groups must retain >= 36 slots/layer on 32 GB, got {rtx5090_slots}"
+        target_per_layer >= 36,
+        "target groups must retain >= 36 slots/layer on 32 GB, got {target_per_layer}"
     );
     assert_eq!(
         plan.records_at(1, rtx5090_slots),
@@ -1720,13 +1893,13 @@ fn deepseek41_dspark_32gb_pins_draft_group_whole_and_falls_back_on_tight_vram() 
     );
     assert_eq!(
         plan.records_at(0, rtx5090_slots),
-        40 * rtx5090_slots,
-        "target group holds rtx5090_slots per layer"
+        40 * target_per_layer,
+        "target group holds target_per_layer slots per layer"
     );
 
     // 2. Tight VRAM budget (~9.0 GB): falls back to shared slots without starving target.
     let tight_budget: u64 = 9_000_000_000;
-    let tight_slots = growth_target(0, 384, tight_budget, |to| Ok::<_, ()>(charge_bytes(to)))
+    let tight_slots = growth_target(0, plan.max_slots(), tight_budget, |to| Ok::<_, ()>(charge_bytes(to)))
         .unwrap()
         .expect("tight budget fits shared slots");
     assert!(tight_slots <= 24, "tight budget should land at <= threshold, got {tight_slots}");
@@ -1734,5 +1907,178 @@ fn deepseek41_dspark_32gb_pins_draft_group_whole_and_falls_back_on_tight_vram() 
         plan.records_at(1, tight_slots),
         3 * tight_slots,
         "on tight VRAM draft group falls back to shared slots/layer"
+    );
+}
+
+/// Regression for 752567 (DS4 IQ2_XXS on 32 GB RTX 5090, decode_rows=6 ->
+/// threshold=36):
+/// 1. Reclaiming 1.25 GB from target=40, draft=128 shrinks ONLY ~1.41 GB
+///    (target 40 -> 36, draft stays 128/128 whole) instead of over-reclaiming
+///    6.71 GB across a 5.67 GB cliff.
+/// 2. Reclaiming 2.50 GB dips smoothly into draft (56.5 MB/slot) instead of
+///    dropping all 3 draft layers at once.
+/// 3. Regrowth from target=36, draft=36 with 5.45 GB free headroom immediately
+///    uses >5.3 GB (growing draft smoothly 36 -> 128 + target 36 -> 37) rather
+///    than staying stuck at 36 with 5.99 GB unused.
+#[test]
+fn deepseek41_dspark_smooth_ramp_prevents_over_reclaim_and_stuck_regrowth() {
+    let mut plan = target_and_draft_bank(40, 3, BankPaths::Unpriced);
+    let mut layers: Vec<BankLayer> = plan.layers().iter().cloned().collect();
+    for layer in &mut layers {
+        layer.selected = 6;
+        layer.experts = if layer.is_draft() { 128 } else { 384 };
+    }
+    let layers = BankLayers::new(layers).unwrap();
+    plan.structured = conveyor::Structured::new(
+        6,
+        HostTier::Linked,
+        plan.groups().to_vec(),
+        layers,
+        None,
+        6,
+    )
+    .unwrap();
+
+    // decode_set(6, 384, 6) = 36, draft extra = 128 - 36 = 92.
+    assert_eq!(plan.draft_pin_threshold(), Some(36));
+    assert_eq!(plan.draft_extra_slots(), 92);
+    assert_eq!(plan.max_slots(), 384 + 92);
+
+    let target_expert_bytes: u64 = 8_800_000;
+    let draft_expert_bytes: u64 = 18_840_000;
+    let charge_bytes = |slots: u64| -> u64 {
+        plan.records_at(0, slots) * target_expert_bytes
+            + plan.records_at(1, slots) * draft_expert_bytes
+    };
+
+    // Starting at target=40, draft=128 (bank coordinate 40 + 92 = 132).
+    let start = 40 + 92;
+    assert_eq!(plan.target_slots(start), 40);
+    assert_eq!(plan.records_at(1, start), 3 * 128);
+
+    // 1. Reclaim 1.25 GB: must shrink target 40 -> 36 (~1.41 GB), keeping draft 128/128 whole!
+    let need_125 = 1_250_000_000u64;
+    let to_125 = releasing(start, 0, need_125, |s| Ok::<_, ()>(charge_bytes(s)))
+        .unwrap()
+        .expect("reclaim succeeds");
+    let released_125 = charge_bytes(start) - charge_bytes(to_125);
+    assert!(
+        released_125 >= need_125 && released_125 < 2_000_000_000,
+        "1.25 GB reclaim must release ~1.41 GB, not 6.71 GB cliff; got {released_125}"
+    );
+    assert_eq!(plan.records_at(1, to_125), 3 * 128, "draft stays 128/128 whole");
+
+    // 2. Reclaim 2.50 GB: dips smoothly into draft at 56.5 MB/slot granularity.
+    let need_250 = 2_500_000_000u64;
+    let to_250 = releasing(start, 0, need_250, |s| Ok::<_, ()>(charge_bytes(s)))
+        .unwrap()
+        .expect("reclaim succeeds");
+    let released_250 = charge_bytes(start) - charge_bytes(to_250);
+    assert!(
+        released_250 >= need_250 && released_250 <= need_250 + 3 * draft_expert_bytes,
+        "2.50 GB reclaim must release within 1 draft slot (56.5 MB); got {released_250}"
+    );
+    assert_eq!(plan.target_slots(to_250), 36, "target holds at verify working set 36");
+
+    // 3. Regrowth from (target=36, draft=36) with 5.45 GB free headroom:
+    //    previously stuck at 36 because 36 -> 37 was a 5.67 GB cliff!
+    let at_36 = 36u64;
+    let next_pulse = charge_bytes(at_36 + 1) - charge_bytes(at_36);
+    assert_eq!(next_pulse, 3 * draft_expert_bytes, "next slot pulse is 56.5 MB, not 5.67 GB");
+    let free_headroom = 5_450_000_000u64;
+    let regrown = growth_target(at_36, plan.max_slots(), free_headroom, |to| {
+        Ok::<_, ()>(charge_bytes(to) - charge_bytes(at_36))
+    })
+    .unwrap()
+    .expect("must regrow immediately with 5.45 GB headroom");
+    assert_eq!(plan.records_at(1, regrown), 3 * 128, "draft regrows all the way to 128/128");
+    let used = charge_bytes(regrown) - charge_bytes(at_36);
+    assert!(
+        used > 5_000_000_000,
+        "must consume >5.0 GB of the 5.45 GB headroom immediately; used {used}"
+    );
+}
+
+/// An embedded causal MTP head's routed layer (`WeightScope::HeadSublayer`)
+/// streams through the expert bank when its expert stacks are raw streamable
+/// records, and is gracefully left `Holding::Whole` (without refusing the
+/// target model's expert bank) when its expert stacks were transformed on
+/// import (e.g. `ImportTransform::DraftQ4_0`, `upload != source`).
+#[test]
+fn causal_head_sublayer_banks_when_streamable_and_falls_back_when_transformed() {
+    use crate::planning::fixtures::{
+        qwen4exp_fixture_definition_of, streamed_experts_manifest, with_mtp_head,
+    };
+    let mut definition = with_mtp_head(qwen4exp_fixture_definition_of(3, 128));
+    // Give the MTP head block a routed FFN matching the target's routed block
+    // (as on Qwen3.8-Flash-Next and GLM-5.3-Flash).
+    let target_routed = definition.decoder.blocks[0].sublayers[1].clone();
+    definition.head.as_mut().unwrap().blocks[0].blocks[0].sublayers[1] = target_routed;
+
+    let manifest = streamed_experts_manifest(&definition);
+    let backend = seismic::BackendName::Cuda;
+    let layout = crate::resident_layout(crate::ExecutionPath::Native, backend);
+    let selection = crate::ComponentSelection { head: true, vision: false };
+    let resident = crate::ModelLoadPlan::derive(
+        &manifest,
+        &definition,
+        selection,
+        layout,
+        crate::PlannedMethod::Plain,
+        crate::planning::fixtures::LIMITS,
+    )
+    .unwrap();
+    let substrate = cuda(HostTier::Linked);
+
+    // 1. Streamable HeadSublayer (raw stored records): all 3 target layers + 1
+    //    HeadSublayer are banked, and HeadSublayer streams at `slots` rather
+    //    than pinning whole above `draft_pin_threshold`.
+    let banked = resident
+        .clone()
+        .with_expert_bank(&definition, 64, None, 1, FlightDepth::PIPELINED, substrate)
+        .unwrap();
+    let bank = banked.expert_bank().expect("banked plan holds its bank");
+    let head_scope = WeightScope::HeadSublayer(magnitude_family_contracts::SublayerIndex {
+        block: 0,
+        sublayer: 1,
+    });
+    assert_eq!(bank.layers().len(), 4, "3 target layers + 1 HeadSublayer");
+    let (_, head_layer) = bank.layer(head_scope).expect("HeadSublayer is banked");
+    assert!(head_layer.is_draft());
+    assert_eq!(
+        bank.layer_vram_slots(head_layer, 64),
+        64,
+        "HeadSublayer must stream at shared slots instead of pinning whole"
+    );
+
+    // 2. Transformed HeadSublayer (`ImportTransform::DraftQ4_0`, upload != source):
+    //    target layers STILL bank cleanly while HeadSublayer stays Holding::Whole.
+    let mut narrowed = resident;
+    for weight in narrowed.head.as_mut().unwrap().iter_mut() {
+        if weight.role.scope == head_scope
+            && matches!(
+                weight.role.kind,
+                WeightKind::ExpertGate | WeightKind::ExpertUp | WeightKind::ExpertDown
+            )
+        {
+            weight.descriptor.transforms.push(ImportTransform::DraftQ4_0);
+        }
+    }
+    let banked_target_only = narrowed
+        .with_expert_bank(&definition, 64, None, 1, FlightDepth::PIPELINED, substrate)
+        .expect("transformed HeadSublayer must not refuse the target expert bank");
+    let bank = banked_target_only.expert_bank().expect("target bank succeeds");
+    assert_eq!(bank.layers().len(), 3, "only the 3 target layers are banked");
+    assert!(bank.layer(head_scope).is_none(), "transformed HeadSublayer stays Holding::Whole");
+    assert!(
+        banked_target_only
+            .head
+            .as_ref()
+            .unwrap()
+            .iter()
+            .filter(|w| w.role.scope == head_scope
+                && matches!(w.role.kind, WeightKind::ExpertGate | WeightKind::ExpertUp | WeightKind::ExpertDown))
+            .all(|w| w.holding == Holding::Whole),
+        "skipped HeadSublayer expert stacks remain Holding::Whole"
     );
 }

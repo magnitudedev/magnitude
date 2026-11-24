@@ -302,6 +302,14 @@ impl ExecutionPlanDraft {
                             _ => return Err(format!("{scope:?} has no draft program")),
                         }
                     }
+                    magnitude_family_contracts::WeightScope::HeadSublayer(_) => {
+                        match self.programs.drafter() {
+                            Some(crate::DrafterProgramPlan::Head(head)) => head
+                                .bank(index.block as usize)
+                                .ok_or_else(|| format!("{scope:?} has no bank entries"))?,
+                            _ => return Err(format!("{scope:?} has no head program")),
+                        }
+                    }
                     _ => self
                         .programs
                         .target()
@@ -398,14 +406,14 @@ impl ExecutionPlanDraft {
         budget: &super::MemoryBudget,
     ) -> Result<Result<super::ExpertBankPlan, UnstreamedExperts>, PlanError> {
         let mut bank = self.bank().clone();
-        if slots < bank.floor() || slots > bank.widest().get() {
+        if slots < bank.floor() || slots > bank.max_slots() {
             return Err(PlanError::Topology(
                 "an expert bank holds from its floor to its ceiling, at most every expert of each layer",
             ));
         }
         bank.slots = slots;
         bank.ceiling = slots;
-        bank.resident = slots == bank.widest().get();
+        bank.resident = bank.whole_at(slots);
         bank.pass = PassLaunches::FLOOR;
         if self.device.host != Some(HostTier::Linked) {
             return Ok(Ok(bank));
@@ -723,9 +731,17 @@ impl ExecutionPlanDraft {
             Priced::Pending(reason) => Priced::Pending(reason.clone()),
             Priced::Unavailable(reason) => Priced::Unavailable(reason.clone()),
         })?;
-        if ceiling.whole.bank().paths == super::BankPaths::Unpriced {
+        let decode_hits_min_bytes = match prices {
+            Priced::Measured(prices) => prices.decode_hits_min_bytes(ceiling.whole.bank()),
+            _ => 0,
+        };
+        if ceiling.whole.bank().paths == super::BankPaths::Unpriced
+            || ceiling.whole.bank().decode_hits_min_bytes != decode_hits_min_bytes
+        {
             let whole = ceiling.whole.clone();
-            ceiling = match self.rebuilt_from(&whole, definition, bound, CeilingPaths::Priced(&bank_prices), Ok)? {
+            ceiling = match self.rebuilt_from(&whole, definition, bound, CeilingPaths::Priced(&bank_prices), |load| {
+                Ok(load.with_decode_hits_min_bytes(decode_hits_min_bytes))
+            })? {
                 Ok(ceiling) => ceiling,
                 Err(no) => return Ok(Err(no)),
             };
@@ -734,7 +750,10 @@ impl ExecutionPlanDraft {
         let (settled_paths, outcome, settles) = settle_bank_paths::<_, E>(initial, |paths| {
             if ceiling.whole.bank().paths != paths {
                 let whole = ceiling.whole.clone();
-                match self.rebuilt_from(&whole, definition, bound, CeilingPaths::Fixed, |load| load.with_bank_paths(paths))? {
+                match self.rebuilt_from(&whole, definition, bound, CeilingPaths::Fixed, |load| {
+                    load.with_bank_paths(paths)
+                        .map(|load| load.with_decode_hits_min_bytes(decode_hits_min_bytes))
+                })? {
                     Ok(rebuilt) => ceiling = rebuilt,
                     Err(no) => return Ok((Err(no), None)),
                 }
@@ -987,20 +1006,24 @@ impl ExecutionPlanDraft {
     }
 
     fn bank_ceiling_at(&self, decode_rows: u64, definition: &ModelDefinition, bound: HeldBound, prices: Option<&Priced<super::PlanPrices>>) -> Result<Result<BankCeiling, NoBank>, PlanError> {
-        let substrate = match bank_substrate(self.device.backend, self.device.executor.limits().allocations(), self.device.host_tier(), definition) {
+        let substrate = match bank_substrate(
+            self.device.backend,
+            self.device.executor.limits().allocations(),
+            self.device.host_tier(),
+            self.device.executor.has_side_queue(),
+            definition,
+        ) {
             Ok(substrate) => substrate,
             Err(error) => return unstreamed(error),
         };
         let places = self.prompt_places(definition);
-        let whole = match super::bank::routed_experts(definition).and_then(|experts| {
-            let load = self.load.clone().unbanked().with_decode_rows(decode_rows).with_expert_bank(
-                definition,
-                experts,
-                None,
-                places,
-                self.policy.limits.flights(),
-                substrate,
-            )?;
+        let whole = match self.load.clone().unbanked().with_decode_rows(decode_rows).with_whole_expert_bank(
+            definition,
+            None,
+            places,
+            self.policy.limits.flights(),
+            substrate,
+        ).and_then(|load| {
             let programs = load.program_plan(definition, self.policy.codec)?;
             self.with_load_and_programs(load, programs).with_chain(places)
         }) {
@@ -1438,7 +1461,8 @@ impl ExecutionPlanDraft {
             // (`IdleClass`) are reclaimable cache that yields to
             // `CacheKind::Bank` growth during decode (`serving_heap::grow_expert_bank`),
             // matching `settle_bank_at`'s `room + slack` bank sizing.
-            let slots = count(slots_within(serving_room, (points[0], *ceiling), &reserved)?)?;
+            let bank_slots = slots_within(serving_room, (points[0], *ceiling), &reserved)?;
+            let slots = count(whole.bank().target_slots(bank_slots))?;
             let held = magnitude_cost_model::HeldSlots { slots, host };
             // The smallest pass leaves the most slots.
             let most = *most.get_or_insert(held);
@@ -1744,6 +1768,7 @@ impl ExecutionPlanDraft {
             backend,
             allocations: seismic::NativeAllocations::EXACT,
             host,
+            has_side_queue: backend.fills_beside_compute(),
         }
     }
 
@@ -2858,10 +2883,10 @@ impl ExecutionPlanDraft {
 /// stored read line.
 fn bank_paths(prices: &magnitude_cost_model::BankPrices, bank: &super::ExpertBankPlan, slots: u64) -> Result<super::BankPaths, PlanError> {
     let bytes = bank.least_move_bytes().map_err(PlanError::ResourcePlanning)?;
-    let slots = usize::try_from(slots).map_err(|_| PlanError::Arithmetic("a bank's slots exceed usize"))?;
+    let slots = usize::try_from(bank.target_slots(slots)).map_err(|_| PlanError::Arithmetic("a bank's slots exceed usize"))?;
     let saturation_bytes = seismic_io::disk::FULL_DEPTH * seismic_io::disk::FULL_READ;
     let records = prices
-        .paths(bytes, magnitude_cost_model::HeldSlots::bank(slots), super::HINT_LEADS, saturation_bytes)
+        .paths(bytes, magnitude_cost_model::HeldSlots::bank(slots), saturation_bytes)
         .unwrap_or(magnitude_cost_model::PathRecords::NONE);
     Ok(super::BankPaths::Priced { line: prices.read(), records })
 }
@@ -3021,6 +3046,7 @@ pub(crate) fn bank_substrate(
     backend: BackendName,
     allocations: seismic::NativeAllocations,
     host: Option<HostTier>,
+    has_side_queue: bool,
     definition: &ModelDefinition,
 ) -> Result<super::BankSubstrate, PlanError> {
     streams_experts(backend, definition)?;
@@ -3030,7 +3056,7 @@ pub(crate) fn bank_substrate(
             reason: "its backend places no host storage beside its device's own".to_owned(),
         }));
     };
-    Ok(super::BankSubstrate { backend, allocations, host })
+    Ok(super::BankSubstrate { backend, allocations, host, has_side_queue })
 }
 
 /// Refuse a backend without every entry of the bank of each routed form
@@ -5259,8 +5285,8 @@ mod tests {
         let held = magnitude_cost_model::HeldSlots::bank(16);
         let least_move = c1.whole.bank().least_move_bytes().unwrap();
         let saturation_bytes = seismic_io::disk::FULL_DEPTH * seismic_io::disk::FULL_READ;
-        let p1 = bp1.paths(least_move, held, crate::planning::HINT_LEADS, saturation_bytes).unwrap();
-        let p16 = bp16.paths(least_move, held, crate::planning::HINT_LEADS, saturation_bytes).unwrap();
+        let p1 = bp1.paths(least_move, held, saturation_bytes).unwrap();
+        let p16 = bp16.paths(least_move, held, saturation_bytes).unwrap();
         assert!(
             p1.ahead < p16.ahead,
             "decode_rows=1 ahead ({}) must be strictly smaller than decode_rows=16 ahead ({})",

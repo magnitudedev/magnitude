@@ -4142,30 +4142,16 @@ fn a_streamed_load_searches_every_streamed_case_on_the_device() {
         // recounts a follower at its resident unit's replaced choice searches
         // it again.
         let finished = observer.0.borrow();
-        let (streamed_tuned, hint_entry, hint_tuned) = if streamed == "routed_route_streamed" {
-            (
-                seismic::generated::native_implementation::<magnitude_kernels::routed_route_streamed::Entry>(&device)
-                    .unwrap()
-                    .unwrap()
-                    .has_tuning_parameters(),
-                "routed_hint_route",
-                seismic::generated::native_implementation::<magnitude_kernels::routed_hint_route::Entry>(&device)
-                    .unwrap()
-                    .unwrap()
-                    .has_tuning_parameters(),
-            )
+        let streamed_tuned = if streamed == "routed_route_streamed" {
+            seismic::generated::native_implementation::<magnitude_kernels::routed_route_streamed::Entry>(&device)
+                .unwrap()
+                .unwrap()
+                .has_tuning_parameters()
         } else {
-            (
-                seismic::generated::native_implementation::<magnitude_kernels::routed_select_streamed::Entry>(&device)
-                    .unwrap()
-                    .unwrap()
-                    .has_tuning_parameters(),
-                "routed_hint_select",
-                seismic::generated::native_implementation::<magnitude_kernels::routed_hint_select::Entry>(&device)
-                    .unwrap()
-                    .unwrap()
-                    .has_tuning_parameters(),
-            )
+            seismic::generated::native_implementation::<magnitude_kernels::routed_select_streamed::Entry>(&device)
+                .unwrap()
+                .unwrap()
+                .has_tuning_parameters()
         };
         let route_units = finished
             .iter()
@@ -4178,17 +4164,6 @@ fn a_streamed_load_searches_every_streamed_case_on_the_device() {
             BTreeSet::new()
         };
         assert_eq!(route_units, expected_route, "{streamed}: route unit is searched: {finished:?}");
-        let leads = finished
-            .iter()
-            .filter(|(entry, ..)| *entry == hint_entry)
-            .map(|&(_, ahead, _)| ahead)
-            .collect::<BTreeSet<_>>();
-        let every = if hint_tuned {
-            (1..=crate::planning::HINT_LEADS as u64).map(Some).collect::<BTreeSet<_>>()
-        } else {
-            BTreeSet::new()
-        };
-        assert_eq!(leads, every, "{hint_entry}: every lead's unit is searched: {finished:?}");
         // Every decode unit preparation formed for the banked layers is
         // keyed as banked (distinct from resident, and invariant to the
         // exact live bank slot count so a RAM shift between Prepare and Load

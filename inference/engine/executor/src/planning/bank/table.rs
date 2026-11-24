@@ -12,6 +12,9 @@ use std::num::NonZeroU64;
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct BankTable {
     pub role: WeightRole,
+    /// Additional weight roles that share this exact physical stored table
+    /// (deduplicated when backing, subrange, layout, and holding all match).
+    pub shared_roles: Vec<WeightRole>,
     /// Its ceiling: more than its floor.
     pub records: NonZeroU64,
     pub record_rows: NonZeroU64,
@@ -26,6 +29,47 @@ pub struct BankTable {
 }
 
 impl BankTable {
+    /// Every weight role backed by this table: its primary role and any
+    /// deduplicated sibling roles.
+    pub fn roles(&self) -> impl Iterator<Item = WeightRole> + '_ {
+        std::iter::once(self.role).chain(self.shared_roles.iter().copied())
+    }
+
+    /// Whether `role` is backed by this table.
+    pub fn has_role(&self, role: WeightRole) -> bool {
+        self.role == role || self.shared_roles.contains(&role)
+    }
+
+    /// Whether `other` addresses the exact same physical stored table:
+    /// identical backing (`storage_identity`), subrange/descriptor, layout,
+    /// and holding/mutability.
+    pub fn shares_storage_with(&self, other: &Self) -> bool {
+        self.fixed.storage_identity() == other.fixed.storage_identity()
+            && self.fixed.descriptor == other.fixed.descriptor
+            && self.fixed.source == other.fixed.source
+            && self.fixed.upload == other.fixed.upload
+            && self.fixed.shape == other.fixed.shape
+            && self.fixed.scale == other.fixed.scale
+            && self.fixed.bound == other.fixed.bound
+            && self.fixed.holding == other.fixed.holding
+            && self.records == other.records
+            && self.record_rows == other.record_rows
+            && self.record_bytes == other.record_bytes
+            && self.stored_row_bytes == other.stored_row_bytes
+    }
+
+    /// Merge a deduplicated sibling table sharing this physical stored table,
+    /// keeping the maximum floor and recording its role(s).
+    pub(super) fn merge_shared(&mut self, other: &Self) {
+        debug_assert!(self.shares_storage_with(other));
+        self.floor = self.floor.max(other.floor);
+        for role in other.roles() {
+            if !self.has_role(role) {
+                self.shared_roles.push(role);
+            }
+        }
+    }
+
     /// The table of `fixed`, the stored table of an n-gram input whose
     /// steps name at most `step_rows` rows, held in records of `granule`
     /// bytes, the bank's pool's: none where a row exceeds a granule or its
@@ -54,6 +98,7 @@ impl BankTable {
         };
         Ok(Some(Self {
             role: fixed.role,
+            shared_roles: Vec::new(),
             records,
             record_rows,
             record_bytes: NonZeroU64::new(row * record_rows.get()).expect("whole rows of a granule have bytes"),

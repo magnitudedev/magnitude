@@ -1391,6 +1391,7 @@ impl AssessmentGraphResourceBounds {
             (Some(super::DrafterProgramPlan::Head(head)), Some(head_state)) => {
                 stage_timer::time_stage(|t, ns| t.native_head_ns += ns, || -> Result<_, GraphError> {
                     let binding = *head.blocks().first().ok_or("head program has no block")?;
+                    let has_bank = head.has_bank();
                     let head = definition
                         .head
                         .as_ref()
@@ -1413,6 +1414,7 @@ impl AssessmentGraphResourceBounds {
                             head_state.head_geometry()?,
                             method.draft_rows(),
                             load.fronts(),
+                            has_bank,
                         )?,
                     )?;
                     Ok(DrafterBounds {

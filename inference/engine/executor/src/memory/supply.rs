@@ -182,13 +182,14 @@ impl Ceiling {
     /// (`PromptScratch`, KV slabs, graph slots) cannot consume it and static
     /// assessment agrees with live load headroom.
     ///
-    /// `max(512 MiB, limit / 12)` reserves ~954 MB on a 16 GB M1 (11.45 GB
-    /// working set), ~2.23 GB on a 32 GB M2 Pro (26.80 GB working set, well
-    /// past the 1.48 GB Metal 4 OOM cliff observed under 4K-token prompt
-    /// prefill), and ~3.22 GB on a 48 GB M4 Pro (38.65 GB working set).
+    /// `clamp(limit / 12, 512 MiB, 2 GiB)` (bounded by `limit`) reserves
+    /// ~954 MB on a 16 GB M1 (11.45 GB working set), and caps at 2.0 GiB on
+    /// 32/48/64 GB Macs—preserving >500 MiB headroom above the 1.48 GB Metal 4
+    /// 4K-token prefill cliff while reclaiming 1.2–3.0+ GiB on 48/64 GB Macs.
     pub(crate) fn execution_reserve_for(limit: u64) -> u64 {
         const MIN_RESERVE: u64 = 512 << 20;
-        (limit / 12).max(MIN_RESERVE).min(limit)
+        const MAX_RESERVE: u64 = 2 << 30;
+        (limit / 12).clamp(MIN_RESERVE, MAX_RESERVE).min(limit)
     }
 
     pub(crate) fn execution_reserve(&self) -> u64 {
@@ -1405,5 +1406,16 @@ mod tests {
             2 * GB - scarcity_threshold(band, unit, others_step),
             "pinned_headroom preserves reclaim_band + unit + guarantee without double-counting"
         );
+    }
+
+    #[test]
+    fn execution_reserve_caps_at_two_gib_while_preserving_floor_and_limit() {
+        assert_eq!(Ceiling::execution_reserve_for(256 * MB), 256 * MB);
+        assert_eq!(Ceiling::execution_reserve_for(4 * GB), 512 * MB);
+        assert_eq!(Ceiling::execution_reserve_for(12 * GB), 1 * GB);
+        assert_eq!(Ceiling::execution_reserve_for(24 * GB), 2 * GB);
+        assert_eq!(Ceiling::execution_reserve_for(32 * GB), 2 * GB);
+        assert_eq!(Ceiling::execution_reserve_for(48 * GB), 2 * GB);
+        assert_eq!(Ceiling::execution_reserve_for(64 * GB), 2 * GB);
     }
 }

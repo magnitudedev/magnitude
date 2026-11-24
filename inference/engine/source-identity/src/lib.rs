@@ -33,8 +33,21 @@ use std::process::Command;
 /// package's. Prints a `cargo:rerun-if-changed` for every input; the compiler
 /// and the target are already part of every build script's run.
 pub fn of_closure(package: &str) -> String {
+    of_closure_excluding_paths(package, &[])
+}
+
+/// Like [`of_closure`], but omits directories matching `excluded_subpaths`
+/// (paths relative to the workspace root, using `/` separators) from both the
+/// digest and `cargo:rerun-if-changed` watches. Used by `magnitude-executor`
+/// and `magnitude-engine` to exclude GPU shader directories whose content is
+/// folded into the build identity at runtime via `magnitude_kernels_bundle::identity()`.
+pub fn of_closure_excluding_paths(package: &str, excluded_subpaths: &[&str]) -> String {
     let target = Target::of_build();
     let workspace = Workspace::read(&target);
+    let excluded_dirs: BTreeSet<PathBuf> = excluded_subpaths
+        .iter()
+        .map(|subpath| workspace.root.join(subpath))
+        .collect();
     let mut digest = Sha256::new();
     let mut files = Vec::new();
     for locked in workspace.closure(package) {
@@ -42,7 +55,7 @@ pub fn of_closure(package: &str) -> String {
             None => {
                 let directory = &workspace.members[&locked.name].directory;
                 let mut watches = Vec::new();
-                walk(directory, &mut files, &mut watches);
+                walk(directory, &excluded_dirs, &mut files, &mut watches);
                 for path in watches {
                     println!("cargo:rerun-if-changed={}", path.display());
                 }
@@ -411,10 +424,16 @@ fn entries(directory: &Path) -> (Vec<PathBuf>, Vec<PathBuf>) {
 /// Cargo sees files added to it too; otherwise its build sources one by one
 /// and its subdirectories in turn, so no nested package, development target or
 /// build output reruns the script.
-fn walk(package: &Path, files: &mut Vec<PathBuf>, watches: &mut Vec<PathBuf>) {
+fn walk(
+    package: &Path,
+    excluded_dirs: &BTreeSet<PathBuf>,
+    files: &mut Vec<PathBuf>,
+    watches: &mut Vec<PathBuf>,
+) {
     fn visit(
         package: &Path,
         directory: &Path,
+        excluded_dirs: &BTreeSet<PathBuf>,
         files: &mut Vec<PathBuf>,
         watches: &mut Vec<PathBuf>,
     ) -> bool {
@@ -428,9 +447,9 @@ fn walk(package: &Path, files: &mut Vec<PathBuf>, watches: &mut Vec<PathBuf>) {
         let mut clean = true;
         let mut child_watches = Vec::new();
         for path in directories {
-            if excluded(package, &path) {
+            if excluded(package, &path) || excluded_dirs.contains(&path) {
                 clean = false;
-            } else if !visit(package, &path, files, &mut child_watches) {
+            } else if !visit(package, &path, excluded_dirs, files, &mut child_watches) {
                 clean = false;
             }
         }
@@ -442,7 +461,7 @@ fn walk(package: &Path, files: &mut Vec<PathBuf>, watches: &mut Vec<PathBuf>) {
         }
         clean
     }
-    visit(package, package, files, watches);
+    visit(package, package, excluded_dirs, files, watches);
 }
 
 fn text(value: &Value) -> &str {
@@ -530,7 +549,7 @@ mod tests {
         }
         let mut files = Vec::new();
         let mut watches = Vec::new();
-        walk(&package, &mut files, &mut watches);
+        walk(&package, &BTreeSet::new(), &mut files, &mut watches);
         let found = files
             .iter()
             .map(|path| path.strip_prefix(&package).expect("under the package").to_owned())

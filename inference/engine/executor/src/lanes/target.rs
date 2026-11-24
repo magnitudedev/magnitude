@@ -1105,4 +1105,140 @@ mod tests {
             .is_err()
         );
     }
+
+    /// Gate #4b: Identical KV + recurrent/conv state commits for `F = 0` vs `F = 2`
+    /// across rejection at `0`, `K - 1`, and full acceptance (`1 + K`);
+    /// `commit(1 + K + 1)` is rejected; and `kept_guesses` packs front row
+    /// `r = 1 + K + f` at index `r - 1`.
+    #[test]
+    fn hybrid_verify_front_state_commit_parity_and_kept_guesses_index() {
+        let catalog = seismic::Devices::discover(&[]).unwrap();
+        let device = crate::test_support::open_backend(&catalog, BackendName::Cpu).unwrap();
+        let charges = Charges::tally(&device);
+        let domain = ResourceDomainId::new("target-hybrid-front-test").unwrap();
+        let (store, mut bindings) = test_store(&device, &charges);
+        let history_domain = store.sole_history_domain().unwrap();
+        let k = 2usize;
+
+        for accepted in [1usize, k, 1 + k] {
+            bindings
+                .provision(&[RowDemand { domain: history_domain, rows: (1 + k) + (1 + k + 2) }], 0)
+                .unwrap();
+            let s0 = store.create().unwrap();
+            let s2 = store.create().unwrap();
+            let adv0 = OwnedStateAdvance::begin_rows(s0, 1, k, 0).ok().unwrap();
+            let adv2 = OwnedStateAdvance::begin_rows(s2, 1, k, 2).ok().unwrap();
+            let res0 = adv0.commit(accepted).ok().unwrap();
+            let res2 = adv2.commit(accepted).ok().unwrap();
+            let (
+                magnitude_state::OwnedAdvanceResolution::Committed(st0),
+                magnitude_state::OwnedAdvanceResolution::Committed(st2),
+            ) = (res0, res2)
+            else {
+                panic!("expected committed state for accepted={accepted}");
+            };
+            assert_eq!(st0.position(), st2.position(), "accepted={accepted} position parity");
+            assert_eq!(st0.position(), accepted, "committed exactly {accepted} rows");
+        }
+
+        // `commit(1 + K + 1)` must be rejected when F = 2 (front rows can never commit).
+        bindings
+            .provision(&[RowDemand { domain: history_domain, rows: 1 + k + 2 }], 0)
+            .unwrap();
+        let adv = OwnedStateAdvance::begin_rows(store.create().unwrap(), 1, k, 2)
+            .ok()
+            .unwrap();
+        assert!(
+            adv.commit(1 + k + 1).is_err(),
+            "committing past 1 + K into a front row must be rejected"
+        );
+
+        // Verify `host_guesses()` packs front row `r = 1 + K + f` at index `r - 1`.
+        let implementation = selection_notice::native_implementation(&device)
+            .unwrap()
+            .unwrap();
+        let copy = selection_notice::native_for_device(
+            &device,
+            &implementation
+                .default_specialization(&NativeSpecialization::new())
+                .unwrap(),
+        )
+        .unwrap();
+        let mut graph = device.native_graph();
+        let selection = graph.port(Element::i32(), &[2, 2]).unwrap();
+        let mut notice = graph.local_for(&copy, "notice", &[("M", 2)]).unwrap();
+        graph
+            .enqueue(
+                &copy,
+                selection_notice::WorkflowArgs {
+                    selection: selection.tensor().into(),
+                    notice: notice.tensor_mut().into(),
+                },
+            )
+            .unwrap();
+        graph.export(notice.tensor()).unwrap();
+        let plan = graph.seal().unwrap();
+        let family = NativeGraphFamily::new(&[plan], 0).unwrap();
+        let leases = test_pool(&charges, &domain, &family, 2, 2);
+
+        let total_rows = 1 + k + 2; // 1 exact + 2 acceptable + 2 front = 5
+        let (slot, advance) = build_slot_and_advance(&store, &mut bindings, total_rows, 2);
+        let batch = ValidatedTargetBatch::from_slots(
+            &[slot],
+            32,
+            ClassLimits {
+                rows: 8,
+                segments: 8,
+                slots: 2,
+            },
+        )
+        .unwrap();
+        let operation = Operation::Forward {
+            request: RequestId(1),
+            kind: WorkKind::Verify,
+            tokens: vec![TokenId(10), TokenId(11), TokenId(12), TokenId(20), TokenId(21)],
+            position: 0,
+            conditioning: None,
+            demand: Demand::SELECT,
+            select: vec![dummy_select(), dummy_select(), dummy_select()],
+            committed: 1,
+            prime: None,
+            front: vec![
+                FrontRow { select: dummy_select(), kind: FrontKind::Host(GuessKind::Head) },
+                FrontRow { select: dummy_select(), kind: FrontKind::Host(GuessKind::Head) },
+            ],
+            chain: None,
+        };
+        operation.validate().expect("hybrid verify+front operation must validate");
+        let target_slot = TargetSlot {
+            request: RequestId(1),
+            advance,
+            preceding: Vec::new(),
+        };
+        let inputs = TargetLaunchInputs::new(
+            batch,
+            LaunchWork::Generation,
+            TargetTokens::Host(vec![TargetHostSlot {
+                slot: target_slot,
+                conditioning: None,
+                conditioning_slices: Vec::new(),
+                guesses: SlotGuess::of(&operation),
+            }]),
+            leases.acquire_workspace().unwrap(),
+            leases.acquire_output().unwrap(),
+            leases.acquire_workspace().unwrap(),
+            leases.acquire_output().unwrap(),
+        );
+        let validated = ValidatedTargetLaunch::new(inputs, &store, &domain, 64, 64)
+            .ok()
+            .expect("valid hybrid verify+front launch");
+        let (core, _) = validated.into_submission_parts();
+        let guesses = core.host_guesses();
+        // Rows 0, 1, 2 are exact + acceptable (indices 0, 1 have no front row before them).
+        // Front row 3 (token 20) -> index 2 (`r - 1`); front row 4 (token 21) -> index 3 (`r - 1`).
+        assert_eq!(guesses[0], [0, 0]);
+        assert_eq!(guesses[1], [0, 0]);
+        assert_eq!(guesses[2], [20, GuessKind::Head.word()]);
+        assert_eq!(guesses[3], [21, GuessKind::Head.word()]);
+    }
 }

@@ -651,7 +651,15 @@ fn mix_attention(
             [
                 (
                     "attention_decode_k8v4",
-                    mix_affine_decode(charges, decode, binding, &geometry, fixture, mixed, label)?,
+                    mix_affine_decode(
+                        charges,
+                        decode.for_rows(&seismic::Dim::from(mixed.query.extents()[0])),
+                        binding,
+                        &geometry,
+                        fixture,
+                        mixed,
+                        label,
+                    )?,
                 ),
                 (
                     "attention_prefill_k8v4",

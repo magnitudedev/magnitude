@@ -464,15 +464,28 @@ impl DraftProgramPlan {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct HeadProgramPlan {
     blocks: Vec<HeadBinding>,
+    banks: Vec<Option<(BankedFeedForward, super::BankBinding)>>,
 }
 
 impl HeadProgramPlan {
-    pub fn new(blocks: Vec<HeadBinding>) -> Self {
-        Self { blocks }
+    pub fn new(
+        blocks: Vec<HeadBinding>,
+        banks: Vec<Option<(BankedFeedForward, super::BankBinding)>>,
+    ) -> Self {
+        assert_eq!(blocks.len(), banks.len(), "head blocks and bank bindings must align");
+        Self { blocks, banks }
     }
 
     pub fn blocks(&self) -> &[HeadBinding] {
         &self.blocks
+    }
+
+    pub fn bank(&self, block: usize) -> Option<(BankedFeedForward, super::BankBinding)> {
+        self.banks.get(block).copied().flatten()
+    }
+
+    pub fn has_bank(&self) -> bool {
+        self.banks.iter().any(Option::is_some)
     }
 }
 
@@ -1001,6 +1014,7 @@ pub(super) fn derive_program_plan(
                 )),
                 operators::HeadForm::Causal => {
                     let mut slots = Vec::with_capacity(head.depth());
+                    let mut banks = Vec::with_capacity(head.depth());
                     for (index, head_block) in head.blocks.iter().enumerate() {
                         let index = u32::try_from(index)
                             .map_err(|_| PlanError::Arithmetic("head block index exceeds u32"))?;
@@ -1035,6 +1049,28 @@ pub(super) fn derive_program_plan(
                             )
                         })
                         .transpose()?;
+                        let feed_forward_slot = feed_forward_slot(
+                            &paired.feed_forward.ok_or(PlanError::Unsupported(
+                                "draft head block without feed-forward",
+                            ))?,
+                            decoder.hidden,
+                            feed_forward,
+                            |scope, kind| lookup(weights, scope, kind),
+                            |scope, kind| planned_scalable(weights, scope, kind),
+                            active_element,
+                        )?;
+                        let bank_binding = bank
+                            .and_then(|bank| {
+                                bank.layer(feed_forward).map(|(layer, _)| {
+                                    let banked = feed_forward_slot
+                                        .banked()
+                                        .ok_or(PlanError::Topology("a banked head layer is not routed"))?;
+                                    let binding = bank.binding(layer).map_err(PlanError::InvalidDefinition)?;
+                                    Ok::<_, PlanError>((banked, binding))
+                                })
+                            })
+                            .transpose()?;
+                        banks.push(bank_binding);
                         slots.push(HeadBinding {
                             streams,
                             conditioning: if head.residual_conditioning() {
@@ -1047,16 +1083,7 @@ pub(super) fn derive_program_plan(
                             hidden_norm: lookup(weights, scope, WeightKind::HeadHiddenNorm)?,
                             combine: lookup(weights, scope, WeightKind::HeadCombine)?,
                             attention,
-                            feed_forward: feed_forward_slot(
-                                &paired.feed_forward.ok_or(PlanError::Unsupported(
-                                    "draft head block without feed-forward",
-                                ))?,
-                                decoder.hidden,
-                                feed_forward,
-                                |scope, kind| lookup(weights, scope, kind),
-                                |scope, kind| planned_scalable(weights, scope, kind),
-                                active_element,
-                            )?,
+                            feed_forward: feed_forward_slot,
                             output_norm: if streams.is_some() {
                                 active_element
                             } else {
@@ -1080,7 +1107,7 @@ pub(super) fn derive_program_plan(
                             activation: active_element,
                         });
                     }
-                    Some(DrafterProgramPlan::Head(HeadProgramPlan::new(slots)))
+                    Some(DrafterProgramPlan::Head(HeadProgramPlan::new(slots, banks)))
                 }
             },
             (None, None) => {

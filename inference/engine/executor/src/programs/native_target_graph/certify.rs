@@ -2,7 +2,8 @@ use super::{
     GroupRows,
     block::{BlockGraphInputs, certify_block_group, probe_block_axes},
     classes::{
-        BlockListings, BlockServed, ClassAxes, FamilyOutline, Holder, Passes, StageAxes, Topology,
+        BlockListings, BlockServed, ClassAxes, FamilyOutline, Holder, Passes, PickedRead,
+        StageAxes, Topology,
         bank_layer_by_block, block_listings,
         block_listings_and_controls, block_routed, block_sealed_stages, block_served,
         block_stages, block_upload_regions, chained_once_runs, class_topology, decode_launch,
@@ -18,8 +19,8 @@ use super::{
 };
 #[cfg(debug_assertions)]
 use super::classes::{
-    BlockGraphEnumeration, BlockOutputScales, LaunchRuns, StagedClass, UnreadScales,
-    enumerate_block_graphs,
+    BindingKey, BlockGraphEnumeration, BlockOutputScales, LaunchRuns, StagedClass, UnreadScales,
+    binding_key, enumerate_block_graphs,
 };
 use crate::{
     ModelLoadPlan, PassLaunches, ResourceLimits, StateResourcePlan, TargetProgramPlan,
@@ -823,16 +824,26 @@ fn collect_run_tasks(
             .is_some_and(|bank| bank.placer() == crate::planning::Placer::Tier && !bank.whole());
     for (slot_idx, &(index, of_untapped, split, resident)) in entries.iter().enumerate() {
         let slot = ctx.plan.blocks()[index];
-        let decode_split = bank_decode_dma
-            && ctx.load.expert_bank().is_some_and(|bank| {
-                bank.layers().iter().any(|layer| {
-                    matches!(
-                        layer.scope,
-                        magnitude_family_contracts::WeightScope::TargetSublayer(s) if s.block == index as u32
-                    )
-                })
+        let routed = block_routed(ctx.geometry, index)?;
+        let bank_layer = ctx.load.expert_bank().and_then(|bank| {
+            bank.layers().iter().position(|layer| {
+                matches!(
+                    layer.scope,
+                    magnitude_family_contracts::WeightScope::TargetSublayer(s) if s.block == index as u32
+                )
             })
-            && block_routed(ctx.geometry, index)?.is_some();
+        });
+        let decode_split = bank_decode_dma && bank_layer.is_some() && routed.is_some();
+        let bank_decode_hits = bank_layer.is_some_and(|layer| {
+            ctx.load
+                .expert_bank()
+                .is_some_and(|bank| bank.sited(layer) && bank.splits_decode_hits(layer))
+        });
+        let decode_hits = decode_split
+            && bank_decode_hits
+            && routed.is_some_and(|routed| {
+                crate::operators::routed::streamed::decode_hits_supported(routed, ctx.outline.backend)
+            });
         let listings = if has_prefill {
             block_listings(ctx.state, ctx.outline.backend, slot, index, ctx.outline.largest_rows)?
         } else {
@@ -843,7 +854,7 @@ fn collect_run_tasks(
         for (regime_idx, regime_rows) in ctx.regimes.iter().enumerate() {
             let largest = *regime_rows.last().expect("a regime holds a row class");
             let is_decode = crate::operators::attention::graph::decodes(largest);
-            let stages = RunStage::sealed(split, resident, decode_split, largest);
+            let stages = RunStage::sealed(split, resident, decode_split, decode_hits, largest);
             let has_stage = stages.iter().any(|&stage| (stage == RunStage::Combine) == group);
             if !has_stage {
                 continue;
@@ -1777,11 +1788,14 @@ impl<L: Certified + Send + Sync> FamilyLayouts<L> {
             outline.backend,
             load,
             geometry,
+            state,
             plan,
             outline.tap_width,
             outline.largest_rows,
             carries,
-        );
+            &composition.picked,
+            outline.max_segments,
+        )?;
         let floor = group_rows.extents(&served, 1);
         let (group, pass_bytes) = (floor.bytes()?, floor.pass_bytes()?);
         resources.binding_constant_bytes = resources
@@ -1815,6 +1829,7 @@ struct TargetFamilyComposition {
     sealed: PlannedSealedGraphs,
     graphs: LaunchGraphs,
     upload_regions: Vec<u64>,
+    picked: Vec<Option<PickedRead>>,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -1951,6 +1966,7 @@ impl TargetFamilyComposition {
         let mut planned_least = planned_most.clone();
         let mut sealed_most = GraphCounts::default();
         let mut sealed_least = GraphCounts::default();
+        let mut block_classes = vec![GraphCounts::default(); block_count];
         let mut block_bindings = vec![GraphCounts::default(); block_count];
         let mut once_staged: Vec<(u16, OnceStage, u64)> = Vec::new();
 
@@ -2022,16 +2038,12 @@ impl TargetFamilyComposition {
                         let certified = lookup(block_holder, topology, index, false)?;
                         let count_usize = usize::try_from(count)
                             .map_err(|_| GraphError::from("planned graph count overflows"))?;
+                        // Static bindings are deduplicated per `(block, rows, Topology)`.
                         bound = bound
-                            .plus(
-                                certified
-                                    .layout
-                                    .bound_heap()
-                                    .times(count)
-                                    .ok_or("planned graph binding heap overflows")?,
-                            )
+                            .plus(certified.layout.bound_heap())
                             .ok_or("planned graph binding heap overflows")?;
-                        add_count(&mut block_bindings[index], run_stage, count_usize);
+                        add_count(&mut block_classes[index], run_stage, count_usize);
+                        add_count(&mut block_bindings[index], run_stage, 1);
                         if seal_own_m {
                             planned_most.seal_block_many(certified, count)?;
                             add_count(&mut sealed_most, run_stage, count_usize);
@@ -2046,15 +2058,10 @@ impl TargetFamilyComposition {
                             let uh = u_holder.expect("checked is_some");
                             let u_certified = lookup(uh, topology, index, true)?;
                             bound = bound
-                                .plus(
-                                    u_certified
-                                        .layout
-                                        .bound_heap()
-                                        .times(count)
-                                        .ok_or("planned graph binding heap overflows")?,
-                                )
+                                .plus(u_certified.layout.bound_heap())
                                 .ok_or("planned graph binding heap overflows")?;
-                            block_bindings[index].untapped += count_usize;
+                            block_classes[index].untapped += count_usize;
+                            block_bindings[index].untapped += 1;
                             if seal_u_m {
                                 planned_most.seal_block_many(u_certified, count)?;
                                 add_count(&mut sealed_most, run_stage, count_usize);
@@ -2080,6 +2087,7 @@ impl TargetFamilyComposition {
                 bound = bound
                     .plus(certified.layout.bound_heap())
                     .ok_or("planned graph binding heap overflows")?;
+                add_count(&mut block_classes[index], stage, 1);
                 add_count(&mut block_bindings[index], stage, 1);
                 if seal_own_m {
                     planned_most.seal_block_many(certified, 1)?;
@@ -2100,13 +2108,13 @@ impl TargetFamilyComposition {
         let at_most = SealedGraphsHeap {
             graphs: planned_most.graphs,
             plans: planned_most.plans,
-            storage: block_graph_storage(&block_bindings, sealed_most)?,
+            storage: block_graph_storage(&block_classes, sealed_most)?,
             owned: planned_most.owned,
         };
         let at_least = SealedGraphsHeap {
             graphs: planned_least.graphs,
             plans: planned_least.plans,
-            storage: block_graph_storage(&block_bindings, sealed_least)?,
+            storage: block_graph_storage(&block_classes, sealed_least)?,
             owned: planned_least.owned,
         };
         let sealed = PlannedSealedGraphs {
@@ -2176,6 +2184,7 @@ impl TargetFamilyComposition {
             streams: bool,
             resident: bool,
             decode_split: bool,
+            decode_hits: bool,
             is_split: bool,
             listings: &'a BlockListings,
             count: u64,
@@ -2191,6 +2200,7 @@ impl TargetFamilyComposition {
             let streams = served[index].streams;
             let resident = served[index].resident;
             let decode_split = served[index].decode_split;
+            let decode_hits = served[index].decode_hits;
             let is_split = served[index].split.is_some();
             let listings = &prefill_listings[index];
 
@@ -2202,6 +2212,7 @@ impl TargetFamilyComposition {
                     && g.streams == streams
                     && g.resident == resident
                     && g.decode_split == decode_split
+                    && g.decode_hits == decode_hits
                     && g.is_split == is_split
                     && g.listings == listings
             }) {
@@ -2228,6 +2239,7 @@ impl TargetFamilyComposition {
                     streams,
                     resident,
                     decode_split,
+                    decode_hits,
                     is_split,
                     listings,
                     count: 1,
@@ -2314,7 +2326,7 @@ impl TargetFamilyComposition {
                     if !matches {
                         continue;
                     }
-                    for &stage in RunStage::sealed(g.is_split, g.resident, g.decode_split, rows) {
+                    for &stage in RunStage::sealed(g.is_split, g.resident, g.decode_split, g.decode_hits, rows) {
                         let axes = stage_axes.of(g.first, form, stage);
                         let topo = (form, listed > 0 && axes.listed, scored && axes.segments, Stage::Run(stage), 0);
                         let id = graphed_ids[&Graphed::Block(g.first, topo)];
@@ -2408,6 +2420,7 @@ impl TargetFamilyComposition {
             sealed,
             graphs,
             upload_regions,
+            picked: controls.picked,
         })
     }
 }
@@ -2493,7 +2506,9 @@ fn verify_composition_against_enumeration<L: Certified>(
             binding(layout)?;
         }
     }
+    let mut block_classes = vec![GraphCounts::default(); outline.shapes.len()];
     let mut block_bindings = vec![GraphCounts::default(); outline.shapes.len()];
+    let mut seen_bindings: FxHashSet<(usize, BindingKey, bool)> = FxHashSet::default();
     let bound_classes = enumeration
         .sealing
         .iter()
@@ -2509,10 +2524,16 @@ fn verify_composition_against_enumeration<L: Certified>(
                 .map(|(index, class)| (index, class, true)),
         );
     for (index, class, of_untapped) in bound_classes {
-        binding(&certified_of(index, class, of_untapped)?.layout)?;
         match of_untapped {
-            true => block_bindings[index].untapped += 1,
-            false => block_bindings[index].count(class.1),
+            true => block_classes[index].untapped += 1,
+            false => block_classes[index].count(class.1),
+        }
+        if seen_bindings.insert((index, binding_key(class), of_untapped)) {
+            binding(&certified_of(index, class, of_untapped)?.layout)?;
+            match of_untapped {
+                true => block_bindings[index].untapped += 1,
+                false => block_bindings[index].count(class.1),
+            }
         }
     }
     let bound = bound
@@ -2522,7 +2543,7 @@ fn verify_composition_against_enumeration<L: Certified>(
         Ok::<_, GraphError>(SealedGraphsHeap {
             graphs: planned.graphs,
             plans: planned.plans,
-            storage: block_graph_storage(&block_bindings, sealed_blocks)?,
+            storage: block_graph_storage(&block_classes, sealed_blocks)?,
             owned: planned.owned,
         })
     };

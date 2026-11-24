@@ -349,6 +349,57 @@ impl State {
         self.repool(class);
     }
 
+    /// Exact inverse of [`Self::yields`] + [`Self::release_pooled`] for a pooled
+    /// cache entry (`CacheKind::Bank` / `CacheKind::Table`) whose physically
+    /// resident slots still back the pool: when a transient in-process claim
+    /// that logically took up to `max_bytes` from `id` has already freed its
+    /// memory (leaving free room beside `guarantee` and any `cap`), restore up
+    /// to `max_bytes` from `pool.releasing` back into `id` and `pool.allocated`
+    /// so the bank never shrinks and immediately regrows for a vanished debt.
+    ///
+    /// Preserves `self.allocated` (`pool.allocated + pool.releasing` unchanged),
+    /// `self.taken <= self.releasing`, and `held + shed + guarantee <= budget`.
+    pub(super) fn restore_pooled_claimed(&mut self, id: EntryId, max_bytes: u64, pinned: bool) -> u64 {
+        if max_bytes == 0 {
+            return 0;
+        }
+        let entry = *self.entry(id);
+        assert!(
+            matches!(entry.holding, Holding::Cache(_)) && entry.holding.pooled(),
+            "invariant violated: restore_pooled_claimed called on non-pooled holding {:?}",
+            entry.holding
+        );
+        let Some(class) = entry.holding.pool_class() else {
+            return 0;
+        };
+        let Some(pool_id) = self.pool(class).map(|pool| pool.entry) else {
+            return 0;
+        };
+        let Some(folded) = self.folded else {
+            return 0;
+        };
+        let estimate = self.estimate_at(folded.read);
+        let budget = if pinned { estimate.pinned_budget() } else { estimate.budget() };
+        let used = estimate.held().saturating_add(estimate.shed());
+        let free_room = budget.saturating_sub(used.saturating_add(estimate.guarantee()));
+        let cap_room = estimate.cap().map_or(u64::MAX, |cap| cap.saturating_sub(used));
+        let room = free_room.min(cap_room);
+        let pool_releasing = self.entry(pool_id).releasing;
+        let restorable = max_bytes.min(room).min(pool_releasing);
+        if restorable == 0 {
+            return 0;
+        }
+        self.resize(id, entry.bytes + restorable);
+        let claimed = &mut self.entry(id).claimed;
+        *claimed = claimed.saturating_sub(restorable);
+        let pool = self.entry(pool_id);
+        pool.releasing -= restorable;
+        pool.allocated += restorable;
+        self.released(restorable);
+        self.repool(class);
+        restorable
+    }
+
     /// `bytes` that were releasing are freed or let go: what claims took is
     /// freed first, as they allocate it only once freed.
     pub(super) fn released(&mut self, bytes: u64) {

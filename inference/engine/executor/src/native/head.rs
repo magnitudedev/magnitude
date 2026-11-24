@@ -39,6 +39,7 @@ pub struct HeadKernels {
     pub(super) dense: HashMap<HeadBinding, DenseKernels>,
     pub(super) routed: HashMap<HeadBinding, RoutedKernels>,
     pub(super) general_routed: HashMap<HeadBinding, GeneralRoutedKernels>,
+    pub(super) banks: HashMap<(crate::planning::BankedFeedForward, crate::BankBinding), super::ExpertBankKernels>,
     pub(super) features: HashMap<HeadBinding, NativeKernel<readout_features_rows::Entry>>,
     pub(super) logits: HashMap<HeadBinding, ProjectionKernels>,
     pub(super) shortlist: HashMap<HeadBinding, ShortlistReadoutKernels>,

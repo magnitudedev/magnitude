@@ -159,7 +159,7 @@ pub struct WeightPlan {
 }
 
 /// How a load holds a planned weight's values.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum Holding {
     /// Every value, imported at load.
     Whole,
@@ -191,7 +191,7 @@ pub struct WeightPlacement {
 }
 
 /// The rows of a streamed gathered table.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct StreamedRows {
     /// The rows of the stored table.
     pub table_rows: u64,
@@ -214,7 +214,7 @@ pub struct StreamedRows {
 
 /// The launches a streamed table's stagings serve: the lanes whose launches
 /// may name its rows, at the load's depth.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct TableFlights {
     pub flights: super::FlightDepth,
     pub lanes: usize,
@@ -240,7 +240,7 @@ impl TableFlights {
 
 /// How the readers of a streamed table find a row's slot (`gathered_row`):
 /// a device directory of `[entries, fields]` I32.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum DirectoryForm {
     /// Every table row's slot, or -1: 4 bytes per table row.
     Dense,
@@ -281,7 +281,7 @@ impl DirectoryForm {
 }
 
 /// How a streamed table's rows reach their slots.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum TableFill {
     /// In the table's resident representation, converted by the weight's
     /// import entry from staging, queued ahead of the step that names them;
@@ -2561,7 +2561,9 @@ impl ModelLoadPlan {
         if let Some(bank) = &self.bank {
             self.bank_table_index.reserve(bank.tables.len());
             for (i, table) in bank.tables.iter().enumerate() {
-                self.bank_table_index.entry(table.role).or_insert(i);
+                for role in table.roles() {
+                    self.bank_table_index.entry(role).or_insert(i);
+                }
             }
         }
     }

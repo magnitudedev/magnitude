@@ -680,7 +680,13 @@ impl NativeGraphCharge {
             self.output_bytes,
             to.output.saturating_sub(from.output),
         )?;
-        let held = |activations: usize| u64::try_from(activations).ok().and_then(|activations| self.graphs.held(activations));
+        let decode = u64::try_from(self.activations).ok();
+        let held = |activations: usize| {
+            u64::try_from(activations)
+                .ok()
+                .zip(decode)
+                .and_then(|(activations, decode)| self.graphs.held_with_decode(activations, decode.min(activations)))
+        };
         let graphs = held(to.activations.max(from.activations))
             .zip(held(from.activations))
             .and_then(|(grown, held)| grown.minus(held))
@@ -2891,6 +2897,48 @@ mod slab_plan_tests {
         )
         .unwrap();
         assert_eq!(empty.capacity.retention_entries, 0);
+    }
+
+    #[test]
+    fn chain_only_graph_growth_does_not_multiply_pinned_decode_graphs() {
+        let decode_graph = seismic::GraphCensus {
+            graphs: 1044,
+            launches: 14803,
+            arguments: 0,
+            largest: 0,
+        };
+        let chained_extra = seismic::GraphCensus {
+            graphs: 12,
+            launches: 48,
+            arguments: 0,
+            largest: 0,
+        };
+        let graphs = seismic::LaunchGraphs::of(
+            [seismic::LaunchedGraph {
+                graph: decode_graph,
+                pinned_runs: 1,
+                runs: 1,
+            }],
+            vec![chained_extra; 7],
+        )
+        .unwrap();
+        let charge = NativeGraphCharge {
+            workspace_bytes: 0,
+            sync_bytes: 0,
+            committed_bytes: 0,
+            upload_regions: vec![],
+            output_bytes: 0,
+            activations: 1,
+            output_slots: 1,
+            graphs,
+        };
+        let floor = GraphSlots { activations: 1, output: 1 };
+        let grown = GraphSlots { activations: 8, output: 9 };
+        let (bytes, added_graphs) = charge.growth(floor, grown).unwrap();
+        assert_eq!(bytes, 0);
+        // Growing from 1 floor decode flight to 8 total places adds only the
+        // chained once-stage graphs, never 7 phantom copies of pinned decode graphs.
+        assert_eq!(added_graphs, chained_extra);
     }
 }
 

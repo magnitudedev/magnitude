@@ -421,6 +421,14 @@ impl Cached {
         std::mem::take(&mut state.entry(self.id()).claimed)
     }
 
+    /// Re-admit up to `max_bytes` of previously yielded pooled cache back into
+    /// this entry when free room beside `guarantee` (and any `cap`) now covers
+    /// it — e.g. after a transient prefill allocation that logically took from
+    /// `CacheKind::Bank` has already been freed before the bank shrank.
+    pub fn restore_claimed(&self, max_bytes: u64, pinned: bool) -> u64 {
+        self.ledger().state().restore_pooled_claimed(self.id(), max_bytes, pinned)
+    }
+
     /// The store it is held in.
     pub fn store(&self) -> seismic::StoreIdentity {
         self.ledger().store()

@@ -68,7 +68,7 @@ impl From<&str> for GraphError {
 /// The `name`d family of `graphs`' plans, each launch one run of one of
 /// them, those a decode step's launch runs (`decodes`) leading: its census
 /// is within what the planner charged for it (`planned`, of the same graphs
-/// through `seismic::LaunchGraphs::of`), which an exceeding one violates.
+/// through `seismic::LaunchGraphs::of_serial`), which an exceeding one violates.
 pub(crate) fn serial_family(
     name: &str,
     graphs: impl IntoIterator<Item = (bool, seismic::NativeGraphPlan)>,

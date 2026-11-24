@@ -10,19 +10,18 @@ use super::cases::scale_extent;
 use super::routed::{
     BankOperands, ExpansionScales, GroupedTables, MERGED_PASS_FROM, ResidentGateUp, RoutedShape,
     bank_sources, bank_statics, decode_points, group, grouped_pass_points, grouped_points,
-    lead_ports, no_sources, no_tier, routes, streamed_hint, words, written,
+    no_sources, no_tier, routes,
 };
 use super::{
     CaseState, EntryTuning, ModelInputs, PointShape, TuningInputs, TuningLimits, experts_text, row_points,
 };
 use crate::GeneralRoutedBinding;
 use crate::operators::routed::fused_graph::TILE_ROWS;
-use crate::planning::{BankBinding, HINT_LEADS};
+use crate::planning::BankBinding;
 use magnitude_family_contracts::{GluLimit, WeightKind, WeightScope};
-use magnitude_kernels::constants::{POLICY_WORDS, STEP_WORDS};
 use magnitude_kernels::{
     routed_down, routed_down_project, routed_experts, routed_experts_up, routed_gate_up,
-    routed_hint_select, routed_scatter, routed_select, routed_select_streamed, routed_up,
+    routed_scatter, routed_select, routed_select_streamed, routed_up,
 };
 use seismic::{BuildError, Element, Tensor};
 
@@ -288,135 +287,6 @@ impl EntryTuning for RoutedSelectStreamedTuning {
     }
 
     generated_entry!(routed_select_streamed, this => this.elements());
-}
-
-/// `routed_hint_select`: ahead-of-step general-selection hints at `ahead`
-/// (`1..=HINT_LEADS`).
-#[derive(Clone)]
-pub(crate) struct RoutedHintSelectTuning {
-    pub resident: RoutedSelectTuning,
-    pub layers: Vec<WeightScope>,
-    pub bank: BankBinding,
-    pub ahead: u64,
-}
-
-pub(crate) struct RoutedHintSelectCase {
-    residual: Tensor,
-    activation: Tensor,
-    leads: [[Tensor; 3]; HINT_LEADS as usize],
-    score: i32,
-    epsilon: f32,
-    step: Tensor,
-    next_policy: Tensor,
-    rings: CaseState,
-}
-
-impl EntryTuning for RoutedHintSelectTuning {
-    type Entry = routed_hint_select::Entry;
-    type Case = RoutedHintSelectCase;
-
-    fn launches(&self) -> usize {
-        self.layers.len()
-    }
-
-    fn bindings(&self) -> String {
-        self.resident.bindings()
-    }
-
-    fn statics(&self, _inputs: &ModelInputs<'_>) -> Result<Vec<(&'static str, u64)>, String> {
-        let shape = self.resident.binding.shape;
-        Ok(vec![
-            ("H", shape.hidden),
-            ("K", shape.selected),
-            ("AHEAD", self.ahead),
-            ("EN", self.bank.next_experts),
-        ])
-    }
-
-    fn points(&self, limits: TuningLimits) -> Vec<PointShape> {
-        decode_points(limits)
-    }
-
-    fn rotation(
-        &self,
-        inputs: &mut TuningInputs<'_, '_>,
-        point: &PointShape,
-    ) -> Result<Vec<Self::Case>, BuildError> {
-        let mut over = self.resident.clone();
-        over.scopes = self.layers.clone();
-        let router_norm = if self.resident.binding.shape.router_norm {
-            WeightKind::RouterInputNorm
-        } else {
-            WeightKind::InputNorm
-        };
-        let scopes = TuningInputs::rotation_scopes(&self.layers, point);
-        let ring = self.bank.words.ring_words();
-        over.rotation(inputs, point)?
-            .into_iter()
-            .zip(scopes)
-            .map(|(select, scope)| {
-                let hinted = streamed_hint(inputs, scope)?;
-                let leads = lead_ports(
-                    inputs,
-                    &hinted,
-                    [router_norm, WeightKind::Router, WeightKind::RouterSelectionBias],
-                    [&select.router_norm, &select.router, &select.bias],
-                )?;
-                let step = words(inputs, &[STEP_WORDS])?;
-                for (word, value) in magnitude_kernels::step_words(1, 0).into_iter().enumerate() {
-                    step.store_release(4 * word as u64, u32::from_ne_bytes(value.to_ne_bytes()))?;
-                }
-                Ok(RoutedHintSelectCase {
-                    residual: select.residual,
-                    activation: inputs.scratch(self.resident.binding.activation, &[0, self.resident.binding.shape.selected])?,
-                    leads,
-                    score: select.shape.score,
-                    epsilon: select.epsilon,
-                    step,
-                    next_policy: words(inputs, &[POLICY_WORDS])?,
-                    rings: written(inputs, words(inputs, &[self.ahead, ring])?)?,
-                })
-            })
-            .collect()
-    }
-
-    fn args<'a>(case: &'a mut Self::Case) -> routed_hint_select::Args<'a> {
-        let RoutedHintSelectCase {
-            residual,
-            activation,
-            leads: [[next_router_norm, next_router, next_bias], [after_router_norm, after_router, after_bias]],
-            score,
-            epsilon,
-            step,
-            next_policy,
-            rings,
-        } = case;
-        routed_hint_select::Args {
-            residual,
-            activation,
-            next_router_norm,
-            next_router,
-            next_bias,
-            after_router_norm,
-            after_router,
-            after_bias,
-            score: *score,
-            epsilon: *epsilon,
-            step,
-            next_policy,
-            rings: rings.tensor_mut(),
-        }
-    }
-
-    fn state(case: &Self::Case) -> Vec<(&'static str, &CaseState)> {
-        vec![("rings", &case.rings)]
-    }
-
-    generated_entry!(routed_hint_select, this => routed_hint_select::Elements {
-        RNW: this.resident.binding.router_norm,
-        RW: this.resident.binding.router,
-        A: this.resident.binding.activation,
-    });
 }
 
 /// The decode expansion: `routed_gate_up` (gated experts) or `routed_up`.
@@ -763,9 +633,14 @@ pub(crate) struct RoutedDownProjectTuning {
     pub layers: Vec<WeightScope>,
 }
 
+pub(crate) struct RoutedDownProjectCase {
+    down: RoutedDownCase,
+    published: CaseState,
+}
+
 impl EntryTuning for RoutedDownProjectTuning {
     type Entry = routed_down_project::Entry;
-    type Case = RoutedDownCase;
+    type Case = RoutedDownProjectCase;
 
     fn launches(&self) -> usize {
         self.layers.len()
@@ -795,21 +670,34 @@ impl EntryTuning for RoutedDownProjectTuning {
         let table = routes(point.rows, routing);
         over.rotation(inputs, point)?
             .into_iter()
-            .map(|mut down| {
+            .enumerate()
+            .map(|(index, mut down)| {
                 down.sources = bank_sources(inputs, point.rows, shape.selected, &table)?;
-                Ok(down)
+                let published = inputs.activation(
+                    self.resident.binding.activation,
+                    &[point.rows, shape.selected, shape.expert_hidden],
+                    100 + index as u64,
+                )?;
+                let published = inputs.state(published, 0..point.rows)?;
+                Ok(RoutedDownProjectCase { down, published })
             })
             .collect()
     }
 
-    fn args<'a>(down: &'a mut Self::Case) -> routed_down_project::Args<'a> {
+    fn args<'a>(case: &'a mut Self::Case) -> routed_down_project::Args<'a> {
         routed_down_project::Args {
-            product: &down.product,
-            routes: &down.routes,
-            sources: &down.sources,
-            expert_down: &down.expert_down,
-            tier_down: &down.tier_down,
+            product: &case.down.product,
+            routes: &case.down.routes,
+            sources: &case.down.sources,
+            expert_down: &case.down.expert_down,
+            tier_down: &case.down.tier_down,
+            mode: 0,
+            published: case.published.tensor_mut(),
         }
+    }
+
+    fn state(case: &Self::Case) -> Vec<(&'static str, &CaseState)> {
+        vec![("published", &case.published)]
     }
 
     generated_entry!(routed_down_project, this => routed_down_project::Elements {

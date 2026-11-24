@@ -58,9 +58,10 @@ pub struct HeadOutput {
     /// The step's landed reads of table rows its device work selected
     /// (`DeviceTable::read_selected`), completed once the step completed.
     pub landed_reads: Vec<crate::device_table::SubmittedRead>,
-    /// The step of a streamed load's expert bank when the draft runs banked
-    /// MoE layers, completed once the draft step completes.
-    pub(crate) expert_step: Option<crate::experts::ExpertStep>,
+    /// The steps of a streamed load's expert bank when the drafter runs banked
+    /// MoE layers (one per pass of a chained head graph), completed once the
+    /// drafter step completes.
+    pub(crate) expert_steps: Vec<crate::experts::ExpertStep>,
 }
 
 /// What a head step's selections make.
@@ -154,7 +155,7 @@ impl HeadOutput {
                     detail,
                 })
             })?;
-        if let Some(step) = self.expert_step.take() {
+        for step in std::mem::take(&mut self.expert_steps) {
             step.complete().map_err(|failure| {
                 SubmitError::Invariant(InvariantError {
                     context: "draft expert bank step",

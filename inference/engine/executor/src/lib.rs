@@ -15,10 +15,32 @@
     )
 )]
 
+/// Combine a compile-time Rust closure build identity (`<version>+src.<hash>`)
+/// with the runtime kernel bundle identity into a single build identity string.
+pub fn combine_build_identity(rust_build: &str, kernel_identity: &str) -> String {
+    use sha2::{Digest, Sha256};
+    let version = rust_build.split_once('+').map_or(rust_build, |(v, _)| v);
+    let mut hasher = Sha256::new();
+    hasher.update(rust_build.as_bytes());
+    hasher.update([0]);
+    hasher.update(kernel_identity.as_bytes());
+    let digest = hasher.finalize();
+    let hash: String = digest.iter().take(12).map(|b| format!("{b:02x}")).collect();
+    format!("{version}+src.{hash}")
+}
+
 /// The executor build identity: the package version and a digest of the
-/// executor's dependency closure (`build.rs`). What the executor alone decides
-/// is stored under it.
-pub const EXECUTOR_BUILD: &str = env!("MAGNITUDE_EXECUTOR_BUILD");
+/// executor's Rust dependency closure combined at runtime with the checked
+/// kernel bundle identity (`magnitude_kernels::identity()`). What the executor
+/// alone decides is stored under it.
+pub static EXECUTOR_BUILD: std::sync::LazyLock<String> = std::sync::LazyLock::new(|| {
+    combine_build_identity(env!("MAGNITUDE_EXECUTOR_RUST_BUILD"), magnitude_kernels::identity())
+});
+
+/// Convenience accessor for [`EXECUTOR_BUILD`].
+pub fn executor_build() -> &'static str {
+    EXECUTOR_BUILD.as_str()
+}
 
 pub mod assessment;
 mod completion;

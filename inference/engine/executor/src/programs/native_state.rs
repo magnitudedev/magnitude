@@ -587,7 +587,7 @@ pub(crate) fn certify_copy_family<L: Certified>(
     }
     Ok((
         family.ok_or("state copy graph family has no classes")?,
-        LaunchGraphs::of(graphs, Vec::new()).ok_or("state copy graph census overflows")?,
+        LaunchGraphs::of_serial(graphs).ok_or("state copy graph census overflows")?,
         layouts.into_iter().map(Option::unwrap).collect(),
     ))
 }

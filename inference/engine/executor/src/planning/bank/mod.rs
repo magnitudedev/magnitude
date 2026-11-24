@@ -26,7 +26,7 @@ use super::resources::FlightDepth;
 use super::weights::WeightPlan;
 use crate::memory::ClaimDemand;
 use magnitude_kernels::{SlotTable, constants};
-use magnitude_family_contracts::{WeightKind, WeightRole, WeightScope};
+use magnitude_family_contracts::{WeightRole, WeightScope};
 use seismic::Element;
 use std::num::NonZeroU64;
 use table::stored_rows;
@@ -96,26 +96,12 @@ pub struct BankLayer {
     /// tensor of its record: what tuning imports to measure the entries
     /// both loads share.
     pub resident: RecordTensors<WeightPlan>,
-    /// What the route of the layer before it reads of it in place of its
-    /// own, in the route's hint ports' order (`operators::routed::
-    /// hint_kinds`): every streamed layer's are alike, kinds and elements,
-    /// as the entries read the next layer's weights as their own.
-    pub hinted: Vec<HintWeight>,
     /// For fused routed layers whose `routed_output` kernel fuses `SharedDown`
     /// with `ExpertDown`, the `SharedDown` weight's `(resident, resident_bytes,
     /// shape)` key so layers with distinct `SharedDown` quants/shapes get
     /// distinct `RoutedKind`s (`Self::routed_kinds`). `None` for non-fused
     /// layers where `SharedDown` runs in its own `dense_output` call.
     pub shared_down: Option<(Element, u64, Vec<u64>)>,
-}
-
-/// A weight a streamed layer's route reads of the layer it predicts: its
-/// kind and resident element, or `None` where the layer has none and the
-/// route reads its own port of that kind (an absent norm, zeros for a bias).
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-pub struct HintWeight {
-    pub kind: WeightKind,
-    pub element: Option<Element>,
 }
 
 /// One expert stack as its model file stores it: `experts` experts of one
@@ -162,6 +148,9 @@ pub struct ExpertBankPlan {
     structured: conveyor::Structured,
     /// The backend whose launches serve it ([`Self::substrate`]).
     backend: seismic::BackendName,
+    /// Whether the target device exposes a distinct side queue for async
+    /// transfers / fill DMA beside compute ([`Self::substrate`]).
+    has_side_queue: bool,
     /// How its device makes native allocations ([`Self::substrate`]).
     allocations: seismic::NativeAllocations,
     /// Per-distinct-granule pool blocks for the bank's records pools (and a
@@ -231,6 +220,10 @@ pub struct ExpertBankPlan {
     /// routing records (`BankPart::Keys`) whatever it traces, since
     /// placement ranks by them.
     pub recording: bool,
+    /// Derived minimum expected per-row miss-DMA bytes for 3-stage `DecodeHits`
+    /// splitting (`overhead_s / transfer_s_per_byte` from measured
+    /// `ExecutorCosts` and `TierCopyCosts::transfer`); `0` when unpriced.
+    pub decode_hits_min_bytes: u64,
 }
 
 /// A bank's model store's path as its plan priced it: its stored read line
@@ -265,10 +258,11 @@ impl BankPaths {
 }
 
 impl BankLayer {
-    /// Whether this streamed layer belongs to a separate draft model
-    /// (`WeightScope::DraftSublayer`).
+    /// Whether this streamed layer belongs to a drafter: a separate draft
+    /// model (`WeightScope::DraftSublayer`) or an embedded causal head
+    /// (`WeightScope::HeadSublayer`).
     pub fn is_draft(&self) -> bool {
-        matches!(self.scope, WeightScope::DraftSublayer(_))
+        matches!(self.scope, WeightScope::DraftSublayer(_) | WeightScope::HeadSublayer(_))
     }
 
     /// The VRAM records this layer commits at `slots`: every streamed layer
@@ -278,14 +272,15 @@ impl BankLayer {
     }
 
     /// The sublayer it routes in: a target routed sublayer, a parallel
-    /// block's routed branch, or a separate draft's routed sublayer
-    /// (`routed_layers`).
+    /// block's routed branch, an embedded head's routed sublayer, or a
+    /// separate draft's routed sublayer (`routed_layers`).
     pub fn sublayer(&self) -> magnitude_family_contracts::SublayerIndex {
         match self.scope {
             WeightScope::TargetSublayer(sublayer)
             | WeightScope::TargetBranch { sublayer, .. }
+            | WeightScope::HeadSublayer(sublayer)
             | WeightScope::DraftSublayer(sublayer) => sublayer,
-            other => panic!("{other:?} streams its experts, which only a target or draft routed layer does"),
+            other => panic!("{other:?} streams its experts, which only a target, head, or draft routed layer does"),
         }
     }
 }
@@ -367,20 +362,6 @@ impl<'a> IntoIterator for &'a BankLayers {
     }
 }
 
-/// The leads a streamed layer's route predicts at: the layers one and two
-/// ahead, each over the post-attention residual through that layer's router
-/// (the gate-ahead), each candidate priced by its lead's measured
-/// precision (`experts::interest::Ledger`). It is the hint form's maximum,
-/// not a choice, and the kernels' own (`streaming_words.seismic`): the hint
-/// kernels (`routed_hint_route`, `routed_hint_select`) bind the routers of
-/// the next and the after layer and declare `AHEAD <= HINT_LEADS`, so no
-/// launch hints further. Whether a layer's leads run is priced live, never
-/// fixed here: the hint gate
-/// (`experts::watcher::gate`) runs a layer's launch where what its leads'
-/// named misses save a pass, summed, exceeds the launch's price; a lead
-/// is not gated alone, as one launch at a fixed `AHEAD` computes them all.
-pub use magnitude_kernels::constants::HINT_LEADS;
-
 /// What a streamed routed layer's bank entries are specialized to: its
 /// group's record form and records, and the bank's word and staging
 /// extents.
@@ -391,9 +372,6 @@ pub struct BankBinding {
     pub records: u64,
     /// `E`: the layer's experts.
     pub experts: u64,
-    /// `EN`: the experts of the layer its route hints (its own, for the
-    /// last streamed layer, whose hint ports bind its own tensors).
-    pub next_experts: u64,
     /// `K`.
     pub selected: u64,
     /// `T`.
@@ -527,10 +505,11 @@ impl ExpertBankPlan {
         self.layers()
             .iter()
             .map(|layer| {
-                let source_artifact = if layer.is_draft() {
-                    draft.ok_or("a banked draft layer has no draft artifact")?
-                } else {
-                    artifact
+                let source_artifact = match layer.scope {
+                    WeightScope::DraftSublayer(_) => {
+                        draft.ok_or("a banked draft layer has no draft artifact")?
+                    }
+                    _ => artifact,
                 };
                 let record = &self.groups()[layer.group].record;
                 layer.resident.as_ref().try_map(|kind, weight| {
@@ -583,6 +562,32 @@ impl ExpertBankPlan {
             }
     }
 
+    /// Whether streamed layer `layer` has enough expected per-row miss-DMA
+    /// bytes to justify 3-stage `DecodeHits` splitting (`expected_miss_bytes >
+    /// decode_hits_min_bytes`). Single-owner decision shared by `classes.rs`,
+    /// `certify.rs`, `block.rs`, and `routed/graph.rs`.
+    pub fn splits_decode_hits(&self, layer: usize) -> bool {
+        let info = &self.layers()[layer];
+        if info.experts == 0 {
+            return false;
+        }
+        let vram = info.vram_slots(self.slots);
+        if vram >= info.experts {
+            return false;
+        }
+        let Ok(record_bytes) = self.groups()[info.group]
+            .record
+            .iter()
+            .map(|(_, tensor)| tensor.stored_bytes())
+            .sum::<Result<u64, String>>()
+        else {
+            return false;
+        };
+        let miss_fraction = (info.experts - vram) as f64 / info.experts as f64;
+        let expected_miss_bytes = info.selected as f64 * miss_fraction * record_bytes as f64;
+        expected_miss_bytes > self.decode_hits_min_bytes as f64
+    }
+
     /// The streamed layers whose CPU site their qualification refused, and
     /// why ([`LayerSite::Refused`]): each reads every miss over the link.
     pub fn refused_sites(&self) -> Vec<(usize, String)> {
@@ -616,9 +621,6 @@ impl ExpertBankPlan {
     /// The binding of streamed layer `layer`'s bank entries.
     pub fn binding(&self, layer: usize) -> Result<BankBinding, String> {
         let group = self.layers()[layer].group;
-        // Every lead binds a layer routing over the next layer's experts
-        // (`routed_route_streamed`'s EN); the last layer names its own.
-        let next = &self.layers()[self.lead_layer(layer, 0)];
         let conveyor = &self.conveyor().conveyor;
         let (staging_pools, pool_of) = self.staging_pools();
         let pool_hints = self.structure().pool_has_target(&pool_of, staging_pools.len());
@@ -627,7 +629,6 @@ impl ExpertBankPlan {
             record: self.groups()[group].record,
             records: self.records(group),
             experts: self.layers()[layer].experts,
-            next_experts: next.experts,
             selected: self.layers()[layer].selected,
             staging: self.pool_staging_records_with_paths(layer_has_hints, self.paths),
             round_records: self.round_records(),
@@ -721,22 +722,6 @@ impl ExpertBankPlan {
         records::decode_choices(self.selected(), magnitude_kernels::constants::VERIFY_ROWS)
     }
 
-    /// The layer `layer`'s route predicts at lead `lead`, where that lead
-    /// exists: the layer `lead + 1` ahead, while `lead` is below
-    /// [`HINT_LEADS`] and that layer is a streamed one routing over the next
-    /// layer's experts (one `EN` for every lead of a route). Draft layers
-    /// never hint and are never hinted by target layers. The one rule of
-    /// which leads a route has.
-    pub fn hints(&self, layer: usize, lead: usize) -> Option<usize> {
-        let target = layer + 1 + lead;
-        (lead < HINT_LEADS as usize
-            && target < self.layers().len()
-            && !self.layers()[layer].is_draft()
-            && !self.layers()[target].is_draft()
-            && self.layers()[target].experts == self.layers()[layer + 1].experts)
-            .then_some(target)
-    }
-
     /// Each streamed layer's routed kind, in decoder order: one numbering
     /// of the load's, by what makes two layers' routed calls alike in every
     /// form (their record group, their experts, whether a CPU site serves
@@ -748,37 +733,14 @@ impl ExpertBankPlan {
         }))
     }
 
-    /// The streamed layer whose hinted weights layer `layer`'s route binds
-    /// at lead `lead`: the layer it predicts there ([`Self::hints`]); past
-    /// the leads it has, which the route does not read, the next layer it
-    /// predicts again, so every lead binds weights over the experts its `EN`
-    /// names ([`Self::binding`]); the layer itself where it predicts none
-    /// (the last streamed layer). The one rule of what a lead binds.
-    pub fn lead_layer(&self, layer: usize, lead: usize) -> usize {
-        self.hints(layer, lead).or_else(|| self.hints(layer, 0)).unwrap_or(layer)
-    }
-
-    /// The streamed layer each lead of `layer`'s route predicts, by lead (the
-    /// layer one ahead, then two), each that exists ([`Self::hints`]).
-    pub fn predicted(&self, layer: usize) -> impl Iterator<Item = usize> + '_ {
-        (0..HINT_LEADS as usize).map_while(move |lead| self.hints(layer, lead))
-    }
-
-    /// The leads a streamed layer's route predicts at (`AHEAD`, its rings'
-    /// rows): those that exist ([`Self::predicted`]), up to [`HINT_LEADS`],
-    /// none for the last streamed layer.
-    pub fn ahead(&self, layer: usize) -> u64 {
-        self.predicted(layer).count() as u64
-    }
-
-    /// Records of each staging pool (`T`): the demand reserve and the hint
+    /// Records of each staging pool (`T`): the demand reserve and the ahead
     /// window. A staging record lives only from its read to its landing
     /// (on unified memory, to the device's DONE of its entry,
     /// `experts::landing`), and a request past them waits for one
     /// (`Decode::resume`), so a pool holds what a request must hold at once,
     /// and no more of a cap's bytes.
     pub fn staging_records(&self) -> u64 {
-        self.demand_records() + self.hint_records()
+        self.demand_records() + self.ahead_records()
     }
 
     /// Records of a staging pool at `paths`: pools belonging exclusively to
@@ -813,7 +775,7 @@ impl ExpertBankPlan {
     /// until the device has read it, so a request can't wait for one of its
     /// own, and its choices bound them.
     pub fn landing_records(&self) -> u64 {
-        self.choices() + self.hint_records()
+        self.choices() + self.ahead_records()
     }
 
     /// Group `group`'s host tier landing floor at `paths`: draft-only groups
@@ -874,11 +836,13 @@ impl ExpertBankPlan {
     }
 
     /// Whether prefill fills copy host-tier experts into VRAM scratch via
-    /// producer-enqueued hardware DMA (`cuMemcpyHtoDAsync` on
-    /// `NativeStream::Fill`, ordered into `NativeStream::Compute` via
-    /// `cuStreamWaitEvent`) instead of SM zero-copy `routed_copy`.
+    /// producer-enqueued hardware DMA (`cuMemcpyHtoDAsync` on CUDA,
+    /// `TransferQueue` on Vulkan `side_family`) instead of SM zero-copy
+    /// `routed_copy`. Enabled only on tiered (discrete) devices whose backend
+    /// supports fills beside compute AND whose device actually exposes a
+    /// distinct side queue (never enabled on single-queue Vulkan devices).
     pub fn tier_copy_dma(&self) -> bool {
-        self.tiered() && self.backend.fills_beside_compute()
+        self.tiered() && self.backend.fills_beside_compute() && self.has_side_queue
     }
 
     /// The slab regions of group `group`'s store, a record a slab: each
@@ -1014,7 +978,7 @@ impl ExpertBankPlan {
     /// Staging records reads ahead may hold beyond the demand reserve: the
     /// moves the path has in flight at its rate, each from its issue to its
     /// landing ([`magnitude_cost_model::PathRecords::ahead`]).
-    pub fn hint_records(&self) -> u64 {
+    pub fn ahead_records(&self) -> u64 {
         self.paths.records().ahead
     }
 
@@ -1104,7 +1068,7 @@ impl ExpertBankPlan {
     fn needed_slots(&self) -> u64 {
         let least = |slots: u64| (0..self.groups().len()).all(|group| self.records_at(group, slots) == self.least_records(group));
         // The first slots past it: a prefix's end, found by halving.
-        let (mut needed, mut past) = (0, self.widest().get() + 1);
+        let (mut needed, mut past) = (0, self.max_slots() + 1);
         while past - needed > 1 {
             let middle = needed + (past - needed) / 2;
             match least(middle) {
@@ -1123,7 +1087,7 @@ impl ExpertBankPlan {
 
     /// Minimum per-layer target VRAM working set (`decode_set(K, E, decode_rows)`
     /// across target layers) that must be satisfied before non-splitting discrete
-    /// draft layers pin all of their experts (`layer.experts`) into VRAM.
+    /// draft layers ramp above target layers toward full VRAM residency.
     ///
     /// Returns `None` on unified memory (`Placer::Bank`) or when there are no
     /// target layers.
@@ -1141,23 +1105,90 @@ impl ExpertBankPlan {
         (widest > 0).then(|| decode_set(selected, widest, self.decode_rows()))
     }
 
-    /// The VRAM records `layer` commits at `slots`:
-    /// - Target layers (and unified-memory draft layers) commit `slots.min(layer.experts)`.
-    /// - Discrete-tier draft layers (`Placer::Tier`, which run non-splitting SM
-    ///   zero-copy rather than split DMA) pin all `layer.experts` once `slots`
-    ///   exceeds [`Self::draft_pin_threshold`] so the draft group becomes whole
-    ///   in VRAM (`POLICY_WHOLE = 1`) without starving target layers below their
-    ///   decode/verify working set; on tight VRAM (`slots <= threshold`), draft
-    ///   layers fall back gracefully to shared `slots.min(layer.experts)`.
-    pub fn layer_vram_slots(&self, layer: &BankLayer, slots: u64) -> u64 {
-        if layer.is_draft()
-            && self
-                .draft_pin_threshold()
-                .is_some_and(|threshold| slots > threshold)
-        {
-            layer.experts
+    /// Extra bank slots dedicated to smoothly ramping discrete-tier separate
+    /// draft MoE layers (`WeightScope::DraftSublayer`) from
+    /// [`Self::draft_pin_threshold`] up to their full expert count (`1` slot
+    /// per step, eliminating any multi-GB step-function cliff) before target
+    /// layers grow beyond `draft_pin_threshold`. Embedded causal head layers
+    /// (`WeightScope::HeadSublayer`) share target layer width and stream at
+    /// `target_slots` rather than ramping whole. Zero when there are no
+    /// discrete-tier separate draft layers exceeding the threshold.
+    pub fn draft_extra_slots(&self) -> u64 {
+        let Some(threshold) = self.draft_pin_threshold() else {
+            return 0;
+        };
+        let widest_draft = self
+            .layers()
+            .iter()
+            .filter(|layer| matches!(layer.scope, WeightScope::DraftSublayer(_)))
+            .map(|layer| layer.experts)
+            .max()
+            .unwrap_or(0);
+        widest_draft.saturating_sub(threshold)
+    }
+
+    /// Maximum bank slot coordinate where every layer holds all of its experts
+    /// (`whole_at(max_slots()) == true`). Equals [`Self::widest`] whenever
+    /// [`Self::draft_extra_slots`] is zero.
+    pub fn max_slots(&self) -> u64 {
+        let extra = self.draft_extra_slots();
+        if extra == 0 {
+            return self.widest().get();
+        }
+        let threshold = self.draft_pin_threshold().expect("draft_extra_slots > 0 implies threshold");
+        let widest_target = self
+            .layers()
+            .iter()
+            .filter(|layer| !matches!(layer.scope, WeightScope::DraftSublayer(_)))
+            .map(|layer| layer.experts)
+            .max()
+            .unwrap_or(0);
+        widest_target.max(threshold) + extra
+    }
+
+    /// Per-layer VRAM slots committed for target (and embedded head) layers at
+    /// bank coordinate `slots`: equals `slots` whenever
+    /// [`Self::draft_extra_slots`] is zero; otherwise holds at `threshold`
+    /// during the smooth draft-ramp phase `(threshold, threshold + extra]` and
+    /// resumes growing `1:1` thereafter.
+    pub fn target_slots(&self, slots: u64) -> u64 {
+        let extra = self.draft_extra_slots();
+        if extra == 0 {
+            return slots;
+        }
+        let threshold = self.draft_pin_threshold().expect("draft_extra_slots > 0 implies threshold");
+        if slots <= threshold {
+            slots
+        } else if slots <= threshold + extra {
+            threshold
         } else {
+            slots - extra
+        }
+    }
+
+    /// The VRAM records `layer` commits at bank coordinate `slots`:
+    /// - When [`Self::draft_extra_slots`] is zero (no discrete-tier separate
+    ///   draft layers above threshold), every layer (target and embedded head)
+    ///   commits `slots.min(layer.experts)`.
+    /// - On discrete-tier banks with non-splitting separate draft layers
+    ///   (`WeightScope::DraftSublayer` on `Placer::Tier`), commits a smooth
+    ///   3-phase monotonic curve (at most +1 slot per layer per step, zero
+    ///   step-function cliff):
+    ///   1. `slots <= threshold`: target and draft grow together (`slots`).
+    ///   2. `threshold < slots <= threshold + extra`: target (and any embedded
+    ///      head) holds at `threshold` while draft ramps smoothly 1 slot at a
+    ///      time to `layer.experts` (`POLICY_WHOLE = 1`).
+    ///   3. `slots > threshold + extra`: draft stays pinned whole at
+    ///      `layer.experts` while target (and any embedded head) resumes
+    ///      growing 1 slot at a time (`slots - extra`).
+    pub fn layer_vram_slots(&self, layer: &BankLayer, slots: u64) -> u64 {
+        if self.draft_extra_slots() == 0 {
+            return layer.vram_slots(slots);
+        }
+        if matches!(layer.scope, WeightScope::DraftSublayer(_)) {
             layer.vram_slots(slots)
+        } else {
+            layer.vram_slots(self.target_slots(slots))
         }
     }
 
@@ -1165,7 +1196,7 @@ impl ExpertBankPlan {
     /// layer: the one predicate the plan's tier and the running bank's host
     /// target both decide by.
     pub fn whole_at(&self, slots: u64) -> bool {
-        slots >= self.widest().get()
+        slots >= self.max_slots()
             && self
                 .layers()
                 .iter()
@@ -1486,7 +1517,7 @@ impl ExpertBankPlan {
             (0..self.groups().len())
                 .all(|group| self.records_at_with_paths(group, slots, paths) == self.least_records_with_reserve(group, reserve))
         };
-        let (mut needed, mut past) = (0, self.widest().get() + 1);
+        let (mut needed, mut past) = (0, self.max_slots() + 1);
         while past - needed > 1 {
             let middle = needed + (past - needed) / 2;
             match least(middle) {

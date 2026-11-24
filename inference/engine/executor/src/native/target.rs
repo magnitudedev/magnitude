@@ -53,24 +53,19 @@ pub struct TargetKernels {
     pub(super) banks: HashMap<(crate::planning::BankedFeedForward, crate::BankBinding), ExpertBankKernels>,
 }
 
-/// A streamed layer's decode route and resolve by its routed form, plus its
-/// ahead-of-step hint launches by `AHEAD` (`1..=HINT_LEADS`): a lead's hint
-/// kernel where a layer of the binding launches it, none where none does.
+/// A streamed layer's decode route and resolve by its routed form.
 #[derive(Clone, Debug)]
 pub enum BankRouteKernels {
     /// The fused form's routing and shared product (`routed_route_shared`'s),
-    /// by row range, and its hint launches (`routed_hint_route`).
+    /// by row range.
     Fused {
         activation: seismic::Element,
         route: RangedKernels<magnitude_kernels::routed_route_streamed::Entry>,
-        hints: [Option<NativeKernel<magnitude_kernels::routed_hint_route::Entry>>; crate::planning::HINT_LEADS as usize],
     },
-    /// The general form's selection (`routed_select`'s), and its hint
-    /// launches (`routed_hint_select`).
+    /// The general form's selection (`routed_select`'s).
     General {
         activation: seismic::Element,
         select: NativeKernel<magnitude_kernels::routed_select_streamed::Entry>,
-        hints: [Option<NativeKernel<magnitude_kernels::routed_hint_select::Entry>>; crate::planning::HINT_LEADS as usize],
     },
 }
 
@@ -243,7 +238,7 @@ impl ExpertBankKernels {
         form: BankRouteForm,
     ) -> Result<bool, seismic::CheckedBundleError> {
         use magnitude_kernels::{
-            routed_copy, routed_gate_up_part, routed_hint_route, routed_hint_select, routed_land, routed_list_grid,
+            routed_copy, routed_gate_up_part, routed_land, routed_list_grid,
             routed_pass_map, routed_round, routed_route_streamed, routed_scratch_grids, routed_scratch_request,
             routed_seed_commit, routed_select_streamed, routed_step,
         };
@@ -251,13 +246,12 @@ impl ExpertBankKernels {
         fn declares<E: seismic::EntryContract>(backend: seismic::BackendName) -> bool {
             E::contract_node_shape(backend).is_ok()
         }
-        let (route, hint): (Declares, Declares) = match form {
-            BankRouteForm::Fused => (declares::<routed_route_streamed::Entry>, declares::<routed_hint_route::Entry>),
-            BankRouteForm::General => (declares::<routed_select_streamed::Entry>, declares::<routed_hint_select::Entry>),
+        let route: Declares = match form {
+            BankRouteForm::Fused => declares::<routed_route_streamed::Entry>,
+            BankRouteForm::General => declares::<routed_select_streamed::Entry>,
         };
-        let bank: [Declares; 12] = [
+        let bank: [Declares; 11] = [
             route,
-            hint,
             declares::<routed_land::Entry>,
             declares::<routed_gate_up_part::Entry>,
             declares::<routed_step::Entry>,
@@ -621,8 +615,10 @@ pub enum AttentionHistoryKernels {
     },
     AffineK8V4 {
         append: NativeKernel<attention_append_k8v4::Entry>,
-        /// Every decode row's attention, one row or several.
-        decode: NativeKernel<attention_decode_k8v4::Entry>,
+        /// Every decode row's attention, ranged across decode row classes so
+        /// `M = 1` and multi-row verify (`M >= 2`, shared-KV `partial_multi`)
+        /// tune independently.
+        decode: RangedKernels<attention_decode_k8v4::Entry>,
         /// The prefill of a launch that lists no history row tiles: it reads
         /// the history in place.
         prefill: NativeKernel<attention_prefill_k8v4::Entry>,

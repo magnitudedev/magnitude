@@ -25,7 +25,7 @@ use crate::programs::graph::facts::Numbers;
 use crate::programs::native_target_graph::{
     PlannedWeights, WeightPart, WeightPort, WeightScale, weight, weight_port,
 };
-use magnitude_kernels::{routed_hint_route, routed_output_project, routed_output_sited, routed_route_streamed};
+use magnitude_kernels::{routed_output_project, routed_output_sited, routed_route_streamed};
 use crate::{
     ModelLoadPlan, RoutedBinding,
     planning::BankPart,
@@ -564,8 +564,9 @@ fn decode_front<'a, G: GraphDraft + 'a, W: PlannedWeights + ?Sized>(
     residual: &WorkflowTensor,
     rows: &Dim,
     epsilon: Argument<f32>,
-    crossing: &mut super::split::DecodeCrossing<NativePort>,
+    crossing: &mut super::split::DecodeCrossingBuild,
 ) -> Result<(WorkflowTensor, Option<StepInputs>), GraphError> {
+    let crossing = crossing.declare_front(graph)?;
     let route_weights = RouteWeights::of(graph, planned, scope, weights, constants, input)?;
     let [parts, norm_extent] = input.form.dimensions(shape.hidden.clone());
     let RouteWeights { norm, router, shared_router, expert_scale } = &route_weights;
@@ -633,7 +634,7 @@ fn decode_front<'a, G: GraphDraft + 'a, W: PlannedWeights + ?Sized>(
         ("SF", sf),
         ("SR", sr),
     ];
-    let BankRoute::Fused { activation, route, hints: hint_kernels } = layer.route() else {
+    let BankRoute::Fused { route, .. } = layer.route() else {
         return Err("a fused layer's bank holds another form's route".into());
     };
     let route = G::pick(route, rows);
@@ -659,8 +660,8 @@ fn decode_front<'a, G: GraphDraft + 'a, W: PlannedWeights + ?Sized>(
             shared_router: shared_router.into(),
             shared_gate: (&shared_gate).into(),
             shared_up: (&shared_up).into(),
-            routes: crossing.routes.tensor_mut().into(),
-            scores: crossing.weights.tensor_mut().into(),
+            routes: crossing.routes.as_mut().expect("DecodeFront declares routes").tensor_mut().into(),
+            scores: crossing.weights.as_mut().expect("DecodeFront declares weights").tensor_mut().into(),
             eps: epsilon.into(),
             normalize,
             expert_scale: (&expert_scale.tensor).into(),
@@ -670,7 +671,7 @@ fn decode_front<'a, G: GraphDraft + 'a, W: PlannedWeights + ?Sized>(
             sited: sited_mode.into(),
             step: ports.step.tensor().into(),
             file: ports.file.tensor_mut().into(),
-            sources: crossing.sources.tensor_mut().into(),
+            sources: crossing.sources.as_mut().expect("DecodeFront declares sources").tensor_mut().into(),
             routing: routing.tensor_mut().into(),
             keys: keys.tensor_mut().into(),
             front: front.tensor_mut().into(),
@@ -680,41 +681,7 @@ fn decode_front<'a, G: GraphDraft + 'a, W: PlannedWeights + ?Sized>(
             site_rows: site_rows_ref,
         },
     )?;
-    if let Some(mut hints) = layer.hints(graph, weights, [norm, router], ports.policy.tensor())? {
-        let hint = hint_kernels[hints.ahead as usize - 1]
-            .ok_or("a streamed layer's lead was not prepared with its binding")?;
-        let empty = GraphConstant::empty_of(graph, activation, &[Dim::from(0u64), shape.selected.clone()], constants)?;
-        let hint_dims = [
-            ("M", rows.clone()),
-            ("H", shape.hidden.clone()),
-            parts.clone(),
-            norm_extent.clone(),
-            ("K", shape.selected.clone()),
-            ("AHEAD", Dim::from(hints.ahead)),
-            ("RING", bank.ring_words.clone()),
-            ("EN", bank.next_experts.clone()),
-        ];
-        graph.enqueue_under(
-            hint,
-            &hint_dims,
-            routed_hint_route::WorkflowArgs {
-                residual: input.rows.into(),
-                activation: (&empty).into(),
-                next_norm: (&hints.weights[0][0]).into(),
-                next_router: (&hints.weights[0][1]).into(),
-                after_norm: (&hints.weights[1][0]).into(),
-                after_router: (&hints.weights[1][1]).into(),
-                eps: epsilon.into(),
-                step: ports.step.tensor().into(),
-                next_policy: (&hints.policy).into(),
-                rings: hints.rings.tensor_mut().into(),
-            },
-            &ports.policy,
-            magnitude_kernels::constants::POLICY_HINTS,
-            LaunchEncoding::WhileSet,
-        )?;
-    }
-    let mut sources_tensor = crossing.sources.tensor().clone();
+    let mut sources_tensor = crossing.sources.as_ref().expect("DecodeFront declares sources").tensor().clone();
     if layer.needs_front_land() {
         let mut gate_records = weight_port(
             graph,
@@ -738,8 +705,8 @@ fn decode_front<'a, G: GraphDraft + 'a, W: PlannedWeights + ?Sized>(
             weights,
         )?;
         let site_choices = StepChoices {
-            routes: crossing.routes.tensor(),
-            weights: crossing.weights.tensor(),
+            routes: crossing.routes.as_ref().expect("DecodeFront declares routes").tensor(),
+            weights: crossing.weights.as_ref().expect("DecodeFront declares weights").tensor(),
             input: &routed.r0,
             rows,
         };
@@ -757,7 +724,7 @@ fn decode_front<'a, G: GraphDraft + 'a, W: PlannedWeights + ?Sized>(
             constants,
         )?;
     }
-    graph.store(&routed.r0, &mut crossing.normalized)?;
+    graph.store(&routed.r0, crossing.normalized.as_mut().expect("DecodeFront declares normalized"))?;
     let Some(into_coeff) = crossing.coefficient.as_mut() else {
         return Err("a fused decode front crosses no coefficient".into());
     };
@@ -864,6 +831,11 @@ pub(crate) fn routed<'a, G: GraphDraft + 'a>(
     if decode {
         let (routes_tensor, scores_tensor, shared_down, expert_product, shared_product, coefficient, reads, experts, sequence, sited) =
             if let Some(crossing) = decode_back {
+                let crossing = crossing.declare_back(graph, false, false)?;
+                let routes_port = crossing.routes.as_ref().expect("DecodeBack declares routes");
+                let weights_port = crossing.weights.as_ref().expect("DecodeBack declares weights");
+                let normalized_port = crossing.normalized.as_ref().expect("DecodeBack declares normalized");
+                let sources_port = crossing.sources.as_ref().expect("DecodeBack declares sources");
                 let shared_down = weight_port(
                     graph,
                     planned,
@@ -877,9 +849,12 @@ pub(crate) fn routed<'a, G: GraphDraft + 'a>(
                     return Err("M7 decode back requires SharedRoute decode entries".into());
                 };
                 let layer = streamed.as_mut().expect("DecodeBack requires a streamed layer");
-                let ports = layer.decode_back_ports(graph, false)?;
-                let sources_view = crossing
-                    .sources
+                let needs_policy = matches!(
+                    layer.site_combine(),
+                    Some((super::streamed::BankCombineEntry::Fused { .. }, _))
+                );
+                let ports = layer.decode_back_ports(graph, needs_policy)?;
+                let sources_view = sources_port
                     .tensor()
                     .slice_leading(0, magnitude_kernels::constants::SOURCE_ROWS);
                 let reads = layer.reads_back(graph, &ports, sources_view, constants)?;
@@ -899,14 +874,14 @@ pub(crate) fn routed<'a, G: GraphDraft + 'a>(
                     &reads.dimensions(),
                 ]
                 .concat();
-                let glu_limit = crate::operators::glu_limit(crossing.routes.tensor(), None);
+                let glu_limit = crate::operators::glu_limit(routes_port.tensor(), None);
                 let product = graph
                     .enqueue(
                         G::pick(gate_up, rows),
                         &dimensions,
                         choices_args(
-                            crossing.normalized.tensor(),
-                            crossing.routes.tensor(),
+                            normalized_port.tensor(),
+                            routes_port.tensor(),
                             &reads,
                             tier_gate(&reads)?,
                             [gate_records.tensor(), up_records.tensor()],
@@ -935,8 +910,8 @@ pub(crate) fn routed<'a, G: GraphDraft + 'a>(
                     )
                 });
                 (
-                    crossing.routes.tensor().clone(),
-                    crossing.weights.tensor().clone(),
+                    routes_port.tensor().clone(),
+                    weights_port.tensor().clone(),
                     shared_down,
                     product,
                     shared_product,
@@ -1141,7 +1116,7 @@ pub(crate) fn routed<'a, G: GraphDraft + 'a>(
                                 ("SF", sf),
                                 ("SR", sr),
                             ];
-                            let BankRoute::Fused { activation, route, hints: hint_kernels } = layer.route() else {
+                            let BankRoute::Fused { route, .. } = layer.route() else {
                                 return Err("a fused layer's bank holds another form's route".into());
                             };
                             let route = G::pick(route, rows);
@@ -1187,47 +1162,6 @@ pub(crate) fn routed<'a, G: GraphDraft + 'a>(
                                     site_rows: site_rows_ref,
                                 },
                             )?;
-                            if let Some(mut hints) = layer.hints(
-                                graph,
-                                weights,
-                                [norm, router],
-                                ports.policy.tensor(),
-                            )? {
-                                let hint = hint_kernels[hints.ahead as usize - 1]
-                                    .ok_or("a streamed layer's lead was not prepared with its binding")?;
-                                let empty = GraphConstant::empty_of(graph, activation, &[Dim::from(0u64), shape.selected.clone()], constants)?;
-                                let hint_dims = [
-                                    ("M", rows.clone()),
-                                    ("H", shape.hidden.clone()),
-                                    parts.clone(),
-                                    norm_extent.clone(),
-                                    ("K", shape.selected.clone()),
-                                    ("AHEAD", Dim::from(hints.ahead)),
-                                    ("RING", bank.ring_words.clone()),
-                                    ("EN", bank.next_experts.clone()),
-                                ];
-                                // Encoded while the layer's hints pay
-                                // (POLICY_HINTS).
-                                graph.enqueue_under(
-                                    hint,
-                                    &hint_dims,
-                                    routed_hint_route::WorkflowArgs {
-                                        residual: input.rows.into(),
-                                        activation: (&empty).into(),
-                                        next_norm: (&hints.weights[0][0]).into(),
-                                        next_router: (&hints.weights[0][1]).into(),
-                                        after_norm: (&hints.weights[1][0]).into(),
-                                        after_router: (&hints.weights[1][1]).into(),
-                                        eps: epsilon.into(),
-                                        step: ports.step.tensor().into(),
-                                        next_policy: (&hints.policy).into(),
-                                        rings: hints.rings.tensor_mut().into(),
-                                    },
-                                    &ports.policy,
-                                    magnitude_kernels::constants::POLICY_HINTS,
-                                    LaunchEncoding::WhileSet,
-                                )?;
-                            }
                             // The gate/up in two passes around the wait, the
                             // site request between them: the step's CPU
                             // choices of the snapshot, weighed by their scores

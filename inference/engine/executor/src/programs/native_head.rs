@@ -51,7 +51,7 @@ use crate::{
         CheckedGeneralRoutedEntries, GeneralRoutedGraphEntries, GeneralRoutedLayer, GeneralRoutedTopology,
         RoutedSum, general_routed, split as general_split,
     },
-    operators::routed::streamed::LayerBank,
+    operators::routed::streamed::{BankGraph, BankGraphEntries, CheckedBankEntries, LayerBank, StepInputs},
     programs::{
         graph::RowForm,
         graph::readout::{self, SelectionPorts, shapes},
@@ -66,8 +66,8 @@ use crate::{
         },
         native_target_graph::{
             complete, selection_scores,
-            CheckedLandingEntries, GatheredTable, GraphWeights, LandedReadPorts, LandingEntries,
-            TARGET_TABLE, WeightPort, weight,
+            BankPort, CheckedLandingEntries, GatheredTable, GraphPark, GraphTimeline, GraphWeights,
+            LandedReadPorts, LandingEntries, TARGET_TABLE, WeightPart, WeightPort, weight,
         },
     },
 };
@@ -90,7 +90,8 @@ use magnitude_state::LayerRef;
 use seismic::{
     Argument, BackendName, BoundNativeGraphPlan, Device, Dim, Element, NativeGraph,
     NativeGraphFamily, NativeGraphLayout, NativeGraphMetadata,
-    NativeGraphPlan, NativeGraphStorageBytes, NativePort, Table, Tensor, WorkflowTensor,
+    NativeGraphPlan, NativeGraphStorageBytes, NativePort, NativeQueue, NativeTimelinePort, Table,
+    Tensor, WorkflowTensor,
 };
 use std::{collections::BTreeMap, rc::Rc, sync::Arc};
 
@@ -208,6 +209,7 @@ pub(crate) fn head_graph_classes(
     history: HeadHistoryGeometry,
     proposals: usize,
     fronts: bool,
+    banked: bool,
 ) -> Result<Vec<HeadGraphClass>, String> {
     let row_classes = magnitude_batching::row_classes(limits.max_launch_rows)
         .into_iter()
@@ -263,15 +265,23 @@ pub(crate) fn head_graph_classes(
         }
     }
     // Drafting passes project the draft vocabulary per slot: their slots are
-    // bounded by the selection bound, not the launch's request slots.
+    // bounded by the selection bound, not the launch's request slots. When
+    // the head's routed FFN streams through the expert bank, drafting rows
+    // stay within the decode form (`VERIFY_ROWS`) so every drafting pass runs
+    // through the streamed decode path.
+    let draft_row_bound = if banked {
+        max_rows.min(VERIFY_ROWS)
+    } else {
+        max_rows
+    };
     for &slots in slot_classes
         .iter()
-        .filter(|slots| **slots <= limits.max_drafting_slots as u64)
+        .filter(|slots| **slots <= (limits.max_drafting_slots as u64).min(draft_row_bound))
     {
         let entry_bound = row_class(
             (slots as usize)
                 .saturating_mul(proposals + 1)
-                .min(max_rows as usize),
+                .min(draft_row_bound as usize),
         )
         .ok_or("head entry row bound has no class")? as u64;
         for &entry_rows in row_classes
@@ -316,6 +326,7 @@ struct HeadGraphEntries<'a, G: GraphDraft + 'a> {
     attention: AttentionGraphEntries<'a, G>,
     priming_project: G::Ranged<'a, attention_project::Entry>,
     feed_forward: HeadFeedForwardEntries<'a, G>,
+    bank: Option<BankGraphEntries<'a, G>>,
     features: G::Binding<'a, readout_features_rows::Entry>,
     logits: readout::ProjectionEntries<'a, G>,
     shortlist: Option<ShortlistEntries<'a, G>>,
@@ -346,6 +357,7 @@ impl<'a> HeadGraphEntries<'a, NativeGraph> {
         block: &'a AttestedHeadBlock,
         head: &'a AttestedHead,
         landing: Option<&'a AttestedLanding>,
+        backend: BackendName,
     ) -> Result<Self, String> {
         Ok(Self {
             landing: landing.map(LandingEntries::native),
@@ -370,6 +382,10 @@ impl<'a> HeadGraphEntries<'a, NativeGraph> {
                     return Err("draft head parallel feed-forward form".into());
                 }
             },
+            bank: block
+                .bank
+                .as_deref()
+                .map(|bank| BankGraphEntries::for_backend(bank, backend)),
             features: &block.features,
             logits: readout::ProjectionEntries::prepared(&block.logits),
             shortlist: block.shortlist.as_ref().map(|shortlist| ShortlistEntries {
@@ -396,6 +412,7 @@ struct CheckedHeadEntries {
     input: [(&'static str, Element); 6],
     attention: CheckedAttentionEntries,
     feed_forward: CheckedHeadFeedForwardEntries,
+    bank: Option<CheckedBankEntries>,
     features: [(&'static str, Element); 2],
     logits: readout::CheckedProjectionEntries,
     shortlist: Option<[(&'static str, Element); 2]>,
@@ -443,6 +460,9 @@ impl CheckedHeadEntries {
                     return Err("draft head parallel feed-forward form".into());
                 }
             },
+            bank: head_bank_binding(load, binding.feed_forward)?
+                .map(|(slot, bank)| CheckedBankEntries::new(slot, bank, backend))
+                .transpose()?,
             features: [("NW", binding.output_norm), ("A", binding.activation)],
             logits: readout::CheckedProjectionEntries::new(
                 binding.projection,
@@ -478,6 +498,7 @@ impl CheckedHeadEntries {
                     HeadFeedForwardEntries::GeneralRouted(entries.entries())
                 }
             },
+            bank: self.bank.as_ref().map(CheckedBankEntries::entries::<G>),
             features: G::bind(&self.features),
             logits: self.logits.entries(),
             shortlist: self.shortlist.as_ref().map(|coarse| ShortlistEntries {
@@ -508,6 +529,9 @@ struct HeadGraphParts<P> {
     passes: Vec<PassPorts>,
     constants: Vec<GraphConstant>,
     weights: Vec<(WeightPort, NativePort)>,
+    banks: Vec<(BankPort, NativePort)>,
+    parks: Vec<(usize, GraphTimeline, NativeTimelinePort<seismic::timeline::Parks>)>,
+    step_inputs: Vec<StepInputs>,
     /// The complete output head, when drafting.
     projection: Option<readout::ProjectionPorts>,
     /// Selections `[steps * slots, 2]` when selecting; otherwise the entry
@@ -556,6 +580,9 @@ impl<P> HeadGraphParts<P> {
             passes: self.passes,
             constants: self.constants,
             weights: self.weights,
+            banks: self.banks,
+            parks: self.parks,
+            step_inputs: self.step_inputs,
             projection: self.projection,
             output: self.output,
             selected: self.selected,
@@ -779,6 +806,7 @@ impl<'h> HeadSplit<'h> {
         geometry: &Decoder,
         head: CausalHeadBlock<'h>,
         feed_forward: FeedForwardProgramSlot,
+        bank: Option<&CheckedBankEntries>,
     ) -> Result<Self, GraphError> {
         let hidden = geometry.hidden;
         // A head's streams are low-rank (`operators::SINKHORN_HEAD`).
@@ -797,6 +825,15 @@ impl<'h> HeadSplit<'h> {
         let selection = operators::attention::selection_shape(attention, geometry.context_limit)
             .zip(operators::attention::admitted_selection(attention).map(|read| read.indexer.top));
         let feed_forward_scope = WeightScope::HeadSublayer(SublayerIndex { block: 0, sublayer: 1 });
+        let (mut split_banks, mut split_parks) = (Vec::new(), Vec::new());
+        let layer_bank = match bank {
+            Some(checked_bank) => LayerBank::Streamed(BankGraph {
+                entries: checked_bank.entries::<NativeGraphMetadata>(),
+                ports: &mut split_banks,
+                parks: &mut split_parks,
+            }),
+            None => LayerBank::<NativeGraphMetadata>::Held,
+        };
         let feed_forward = match feed_forward {
             FeedForwardProgramSlot::Dense(_) => {
                 let Some(crate::operators::FeedForward::Dense(dense)) =
@@ -812,7 +849,7 @@ impl<'h> HeadSplit<'h> {
                     load,
                     feed_forward_scope,
                     routed::RoutedSource::Binding(&binding),
-                    &crate::operators::routed::streamed::LayerBank::Held,
+                    &layer_bank,
                 )?;
                 (HeadFeedForward::Routed(topology), HeadFeedForwardNumbers::Routed(shape))
             }
@@ -824,8 +861,7 @@ impl<'h> HeadSplit<'h> {
                 };
                 let shape =
                     crate::GeneralRoutedShape::of(hidden, operator).map_err(|error| error.to_string())?;
-                // A head's routed layers hold their experts whole.
-                let (topology, layer) = general_split::<NativeGraphMetadata>(load, feed_forward_scope, &shape, &LayerBank::Held)?;
+                let (topology, layer) = general_split::<NativeGraphMetadata>(load, feed_forward_scope, &shape, &layer_bank)?;
                 (HeadFeedForward::GeneralRouted(topology), HeadFeedForwardNumbers::GeneralRouted(layer))
             }
             // `operators::admit` refuses a draft head's parallel form.
@@ -852,7 +888,7 @@ impl<'h> HeadSplit<'h> {
                     kind: WeightKind::DraftOutput,
                 })
                 .is_some(),
-            weights: GraphWeights::of(load, head_reads),
+            weights: GraphWeights::of_draft(load, head_reads)?,
         })
     }
 
@@ -1192,10 +1228,24 @@ fn head_graph_draft<'a, G: GraphDraft + 'a>(
         selecting: &selecting,
     };
     let mut passes = Vec::new();
+    let mut banks = Vec::new();
+    let mut parks = Vec::new();
+    let mut step_inputs = Vec::new();
     let mut entry_features = None;
     let mut previous: Option<WorkflowTensor> = None;
     for pass in 0..steps.max(1) {
-        match head_pass(&mut graph, &context, pass, previous.as_ref(), &mut table, &mut weights, &mut constants)? {
+        match head_pass(
+            &mut graph,
+            &context,
+            pass,
+            previous.as_ref(),
+            &mut table,
+            &mut weights,
+            &mut constants,
+            &mut banks,
+            &mut parks,
+            &mut step_inputs,
+        )? {
             HeadPass::Causal(ports, attended) => {
                 return Ok(HeadGraphParts {
                     plan: graph,
@@ -1206,6 +1256,9 @@ fn head_graph_draft<'a, G: GraphDraft + 'a>(
                     passes: vec![ports],
                     constants,
                     weights,
+                    banks,
+                    parks,
+                    step_inputs,
                     projection: None,
                     output: attended,
                     selected: SelectedPorts::Causal,
@@ -1285,6 +1338,9 @@ fn head_graph_draft<'a, G: GraphDraft + 'a>(
         passes,
         constants,
         weights,
+        banks,
+        parks,
+        step_inputs,
         projection,
         output,
         selected,
@@ -1295,6 +1351,25 @@ fn head_graph_draft<'a, G: GraphDraft + 'a>(
 /// attention (0) or its feed-forward (1).
 fn head_sublayer(sublayer: u32) -> WeightScope {
     WeightScope::HeadSublayer(SublayerIndex { block: 0, sublayer })
+}
+
+/// The head block's banked feed-forward form and bank binding when the load's
+/// expert bank streams `HeadSublayer(0, 1)`.
+fn head_bank_binding(
+    load: &ModelLoadPlan,
+    feed_forward: FeedForwardProgramSlot,
+) -> Result<Option<(crate::planning::BankedFeedForward, crate::BankBinding)>, String> {
+    let Some(bank) = load.expert_bank() else {
+        return Ok(None);
+    };
+    let Some((layer, _)) = bank.layer(head_sublayer(1)) else {
+        return Ok(None);
+    };
+    let banked = feed_forward
+        .banked()
+        .ok_or_else(|| "a banked head layer is not routed".to_owned())?;
+    let binding = bank.binding(layer)?;
+    Ok(Some((banked, binding)))
 }
 
 /// What every pass of a head graph reads beside the graph, its token
@@ -1344,6 +1419,7 @@ enum HeadPass {
 /// Pass `pass` of a head graph, the next after `previous`'s rows (none for
 /// the entry pass): its input, attention and, of a drafting graph,
 /// feed-forward, features and selection.
+#[allow(clippy::too_many_arguments)]
 fn head_pass<'a, G: GraphDraft + 'a>(
     graph: &mut G,
     context: &HeadPassContext<'_, 'a, G>,
@@ -1352,6 +1428,9 @@ fn head_pass<'a, G: GraphDraft + 'a>(
     table: &mut GatheredTable,
     weights: &mut Vec<(WeightPort, NativePort)>,
     constants: &mut Vec<GraphConstant>,
+    banks: &mut Vec<(BankPort, NativePort)>,
+    parks: &mut Vec<(usize, GraphTimeline, NativeTimelinePort<seismic::timeline::Parks>)>,
+    step_inputs: &mut Vec<StepInputs>,
 ) -> Result<HeadPass, GraphError> {
     let (entries, topology, numbers) = (context.entries, context.topology, context.numbers);
     let planned = &numbers.weights;
@@ -1441,6 +1520,9 @@ fn head_pass<'a, G: GraphDraft + 'a>(
         (&attended, feed_forward_site.as_ref()),
         weights,
         constants,
+        banks,
+        parks,
+        step_inputs,
     )?;
     // The entry pass reads each slot's last entry row; a chained
     // pass has one row per slot.
@@ -1676,6 +1758,7 @@ fn pass_input<'a, G: GraphDraft + 'a>(
 
 /// Pass `pass`'s feed-forward over its `rows` `attended` rows (through its
 /// mix site `site`, of low-rank streams), which adds to its residual.
+#[allow(clippy::too_many_arguments)]
 fn head_feed_forward<'a, G: GraphDraft + 'a>(
     graph: &mut G,
     context: &HeadPassContext<'_, 'a, G>,
@@ -1683,11 +1766,23 @@ fn head_feed_forward<'a, G: GraphDraft + 'a>(
     (attended, site): (&WorkflowTensor, Option<&MixSite>),
     weights: &mut Vec<(WeightPort, NativePort)>,
     constants: &mut Vec<GraphConstant>,
+    banks: &mut Vec<(BankPort, NativePort)>,
+    parks: &mut Vec<(usize, GraphTimeline, NativeTimelinePort<seismic::timeline::Parks>)>,
+    step_inputs: &mut Vec<StepInputs>,
 ) -> Result<WorkflowTensor, GraphError> {
     let (topology, numbers) = (context.topology, context.numbers);
     let (planned, feed_forward_scope) = (&numbers.weights, head_sublayer(1));
     let (form, epsilon) = (context.form, context.epsilon);
-    Ok(match (&context.entries.feed_forward, &topology.feed_forward, &numbers.feed_forward) {
+    let mut pass_parks = Vec::new();
+    let layer_bank = match context.entries.bank {
+        Some(entries) => LayerBank::Streamed(BankGraph {
+            entries,
+            ports: banks,
+            parks: &mut pass_parks,
+        }),
+        None => LayerBank::Held,
+    };
+    let output = match (&context.entries.feed_forward, &topology.feed_forward, &numbers.feed_forward) {
         (
             HeadFeedForwardEntries::Dense(entries),
             HeadFeedForward::Dense(expansion),
@@ -1726,10 +1821,7 @@ fn head_feed_forward<'a, G: GraphDraft + 'a>(
                 width: Dim::from(numbers.streams.as_ref().map_or(0, |streams| streams.streams)),
                 class: (pass == 0).then_some("head_entry_rows"),
             };
-            // A head's routed layers hold their experts whole: a
-            // streamed one is refused (`routed`: its bank entries
-            // disagree with its plan).
-            let (output, _) = routed::routed(
+            let (output, step) = routed::routed(
                 graph,
                 RoutedGraphEntries {
                     route: entries.route,
@@ -1740,7 +1832,7 @@ fn head_feed_forward<'a, G: GraphDraft + 'a>(
                     experts: entries.experts,
                     combine: entries.combine,
                 },
-                crate::operators::routed::streamed::LayerBank::Held,
+                layer_bank,
                 routed_topology,
                 shape,
                 planned,
@@ -1758,6 +1850,9 @@ fn head_feed_forward<'a, G: GraphDraft + 'a>(
                 None,
                 None,
             )?;
+            if let Some(inputs) = step {
+                step_inputs.push(inputs);
+            }
             output
         }
         (
@@ -1766,31 +1861,35 @@ fn head_feed_forward<'a, G: GraphDraft + 'a>(
             HeadFeedForwardNumbers::GeneralRouted(layer),
         ) => {
             // The body's general routed lowering over the head's single
-            // residual (`operators::admit` refuses low-rank streams),
-            // its experts held whole.
+            // residual (`operators::admit` refuses low-rank streams).
             if site.is_some() {
                 return Err("a general routed draft head over low-rank streams".into());
             }
-            let (output, _) = general_routed(
+            let (output, step) = general_routed(
                 graph,
                 *entries,
-                LayerBank::Held,
+                layer_bank,
                 general_topology,
                 layer,
                 planned,
                 feed_forward_scope,
                 weights,
                 constants,
-                attended,
+                Some(attended),
                 RoutedSum::Residual,
                 rows,
                 epsilon,
                 None,
             )?;
+            if let Some(inputs) = step {
+                step_inputs.push(inputs);
+            }
             output
         }
         _ => return Err("head feed-forward entries and plan disagree".into()),
-    })
+    };
+    parks.extend(pass_parks.into_iter().map(|(node, port)| (pass as usize, node, port)));
+    Ok(output)
 }
 
 /// Pass `pass`'s selection of a selecting graph, from the logits of its
@@ -2201,7 +2300,7 @@ impl HeadFamilyComposition {
         GraphError,
     > {
         let entries = CheckedHeadEntries::new(binding, backend, load)?;
-        let split = HeadSplit::of(load, geometry, head, binding.feed_forward)?;
+        let split = HeadSplit::of(load, geometry, head, binding.feed_forward, entries.bank.as_ref())?;
         let groups = partition_head_groups(classes, &split)?;
         crate::assessment::stage_timer::record_stage(|t| {
             t.native_head_groups += groups.len() as u64;
@@ -2281,7 +2380,7 @@ pub(crate) fn certify_head_family<L: Certified>(
     classes: &[HeadGraphClass],
 ) -> Result<(CheckedGraphResources, BTreeMap<HeadGraphClass, L>), GraphError> {
     let entries = CheckedHeadEntries::new(binding, backend, load)?;
-    let split = HeadSplit::of(load, geometry, head, binding.feed_forward)?;
+    let split = HeadSplit::of(load, geometry, head, binding.feed_forward, entries.bank.as_ref())?;
     let groups = partition_head_groups(classes, &split)?;
     crate::assessment::stage_timer::record_stage(|t| t.native_head_groups += groups.len() as u64);
     let mut family = CheckedGraphFamilyResources::new();
@@ -2313,7 +2412,7 @@ pub(crate) fn verify_head_family_certificates(
 ) -> Result<(), GraphError> {
     let (_, layouts) = certify_head_family::<NativeGraphLayout>(backend, load, geometry, head, binding, classes)?;
     let checked = CheckedHeadEntries::new(binding, backend, load)?;
-    let split = HeadSplit::of(load, geometry, head, binding.feed_forward)?;
+    let split = HeadSplit::of(load, geometry, head, binding.feed_forward, checked.bank.as_ref())?;
     for &class in classes {
         let (form, numbers) = split.class(class)?;
         let exact = head_graph_draft(
@@ -2371,7 +2470,12 @@ impl PreparedHeadGraphs {
             &classes,
         )
         .map_err(|error| invalid(error.to_string()))?;
-        let split = HeadSplit::of(load, geometry, head, binding.feed_forward)
+        let checked_bank = head_bank_binding(load, binding.feed_forward)
+            .map_err(invalid)?
+            .map(|(slot, bank)| CheckedBankEntries::new(slot, bank, target_device.backend()))
+            .transpose()
+            .map_err(invalid)?;
+        let split = HeadSplit::of(load, geometry, head, binding.feed_forward, checked_bank.as_ref())
             .map_err(|error| invalid(error.to_string()))?;
         let mut prepared = BTreeMap::new();
         for class in classes {
@@ -2413,7 +2517,7 @@ impl PreparedHeadGraphs {
         let (form, numbers) = split.class(class).map_err(|error| invalid(error.to_string()))?;
         head_graph_topology(
             target_device.native_graph_with_layout(layout),
-            HeadGraphEntries::prepared(block, kernels, landing).map_err(invalid)?,
+            HeadGraphEntries::prepared(block, kernels, landing, target_device.backend()).map_err(invalid)?,
             &constant_reals(form).tables(Table::from),
             &constant(numbers),
         )
@@ -2440,6 +2544,7 @@ impl PreparedHeadGraphs {
         self: &Rc<Self>,
         charges: &seismic::Charges,
         resident: &ResidentHead,
+        bank: Option<&crate::experts::ExpertBank>,
     ) -> Result<BoundHeadGraphs, SubmitError> {
         let mut uploaded = ConstantTensors::new(charges);
         let absent_scale =
@@ -2470,9 +2575,39 @@ impl PreparedHeadGraphs {
                 .weights
                 .iter()
                 .map(|(weight, port)| {
-                    let resident = resident_head_weight(resident, weight.role)?;
-                    Ok((port, weight.part.of(resident).map_err(invalid)?))
+                    let tensor = match (bank, weight.part) {
+                        (Some(bank), WeightPart::Values) if bank.holds(weight.role) => {
+                            bank.records(weight.role).map_err(invalid)?
+                        }
+                        (Some(bank), WeightPart::Home) if bank.holds(weight.role) => {
+                            bank.home(weight.role).map_err(invalid)?
+                        }
+                        (Some(bank), WeightPart::Scale) if bank.holds(weight.role) => {
+                            bank.expert_scale(weight.role).map_err(invalid)?
+                        }
+                        (_, part) => {
+                            let resident = resident_head_weight(resident, weight.role)?;
+                            part.of(resident).map_err(invalid)?
+                        }
+                    };
+                    Ok((port, tensor))
                 })
+                .chain(
+                    graph
+                        .banks
+                        .iter()
+                        .filter(|(bank_port, _)| {
+                            !bank_port.part.placed() && !bank_port.part.windowed()
+                        })
+                        .map(|(bank_port, port)| {
+                            let bank = bank.ok_or_else(|| {
+                                invalid(format!(
+                                    "head bank port {bank_port:?} of a load without an expert bank"
+                                ))
+                            })?;
+                            Ok((port, bank.part(bank_port.scope, bank_port.part).map_err(invalid)?))
+                        }),
+                )
                 .chain(constants.iter().map(|(port, tensor)| Ok((*port, tensor))))
                 .chain(match &graph.projection {
                     None => Vec::new(),
@@ -2671,6 +2806,7 @@ impl PassControls {
 pub struct NativeHeadProgram {
     geometry: Decoder,
     graphs: BoundHeadGraphs,
+    bank: Option<Arc<crate::experts::ExpertBank>>,
     /// What a step binds its tensors through: charges that allocate
     /// nothing, as every storage a step binds is a load's, which formed any
     /// record table it needs (`seismic::NativeGraphBindings::set`).
@@ -2685,11 +2821,17 @@ impl NativeHeadProgram {
 
     /// `unallocating`: charges of its device that allocate nothing
     /// (`seismic::Charges::none`).
-    pub(crate) fn new(geometry: Decoder, graphs: BoundHeadGraphs, unallocating: seismic::Charges) -> Result<Self, SubmitError> {
+    pub(crate) fn new(
+        geometry: Decoder,
+        graphs: BoundHeadGraphs,
+        bank: Option<Arc<crate::experts::ExpertBank>>,
+        unallocating: seismic::Charges,
+    ) -> Result<Self, SubmitError> {
         let waiter = CompletionWaiter::spawn().map_err(device)?;
         Ok(Self {
             geometry,
             graphs,
+            bank,
             unallocating,
             waiter,
         })
@@ -2974,12 +3116,119 @@ impl NativeHeadProgram {
                 readout::write_selection(pass, &mut active, selection, slots, words)?;
             }
         }
-        let active_output = output
+        let expert_steps = if !graph.banks.is_empty() || !graph.parks.is_empty() {
+            let bank = self
+                .bank
+                .as_ref()
+                .ok_or_else(|| invalid("banked head graph without an expert bank"))?;
+            if graph.passes.is_empty() {
+                return Err(invalid("banked head graph has no passes"));
+            }
+            let mut passes = crate::programs::Chain::one(0usize);
+            for pass in 1..graph.passes.len() {
+                passes.push(pass);
+            }
+            let (steps, _, _) = bank
+                .begin(
+                    passes,
+                    |_| crate::experts::StepRoute::DraftDecode,
+                    |_| crate::operation::LaunchWork::Generation,
+                )
+                .map_err(|(error, _)| invalid(error))?;
+            let ((_, first), rest) = steps.split_first();
+            let mut steps = Vec::with_capacity(1 + rest.len());
+            steps.push(first);
+            steps.extend(rest.into_iter().map(|(_, step)| step));
+            let bind_result: Result<(), SubmitError> = (|| {
+                for (inputs, step) in graph.step_inputs.iter().zip(&steps) {
+                    debug_assert!(
+                        inputs.guesses.is_none(),
+                        "banked head graphs never bind target front guesses"
+                    );
+                    let bytes: Vec<u8> = magnitude_kernels::step_words(step.sequence(), 0)
+                        .iter()
+                        .flat_map(|word| word.to_le_bytes())
+                        .collect();
+                    active.write_input(&inputs.sequence, &bytes).map_err(device)?;
+                }
+                for (bank_port, port) in graph.banks.iter().filter(|(b, _)| b.part.placed()) {
+                    let words = bank
+                        .placed(bank_port.scope, bank_port.part, 0)
+                        .map_err(invalid)?;
+                    bindings.set(&self.unallocating, port, &words).map_err(device)?;
+                }
+                for &(_, _, port) in &graph.parks {
+                    bindings
+                        .set_park(port, bank.parks().timeline())
+                        .map_err(device)?;
+                }
+                Ok(())
+            })();
+            if let Err(error) = bind_result {
+                for step in steps {
+                    let _ = step.refuse();
+                }
+                return Err(error);
+            }
+            Some((Arc::clone(bank), steps))
+        } else {
+            None
+        };
+        let active_output = match output
             .activate(&graph.plan)
-            .map_err(SubmitError::Invariant)?;
-        let (active_output, completion) = active_output
-            .run(|outputs| active.attach(bindings, outputs).and_then(|ready| ready.submit()))
-            .map_err(device)?;
+            .map_err(SubmitError::Invariant)
+        {
+            Ok(active_output) => active_output,
+            Err(error) => {
+                if let Some((_, steps)) = expert_steps {
+                    for step in steps {
+                        let _ = step.refuse();
+                    }
+                }
+                return Err(error);
+            }
+        };
+        let step_refs = expert_steps.as_ref().map(|(bank, steps)| {
+            (
+                Arc::clone(bank),
+                steps.iter().map(crate::experts::ExpertStep::sequence).collect::<Vec<_>>(),
+            )
+        });
+        let mut registered = Ok(());
+        let (active_output, completion) = match active_output.run(|outputs| {
+            let ready = active.attach(bindings, outputs)?;
+            if let Some((bank, sequences)) = &step_refs {
+                let mut seq = self
+                    .unallocating
+                    .device()
+                    .native_sequence(NativeQueue::Compute);
+                let graph_outputs = ready.queue(&mut seq)?;
+                registered = register_head_parks(bank, sequences, &graph.parks, &graph_outputs);
+                let completion = seq.submit()?;
+                Ok((graph_outputs, completion))
+            } else {
+                ready.submit()
+            }
+        }) {
+            Ok(result) => result,
+            Err(error) => {
+                if let Some((_, steps)) = expert_steps {
+                    for step in steps {
+                        let _ = step.refuse();
+                    }
+                }
+                return Err(device(error));
+            }
+        };
+        if let Err(error) = registered {
+            let _ = completion.wait();
+            if let Some((_, steps)) = expert_steps {
+                for step in steps {
+                    let _ = step.refuse();
+                }
+            }
+            return Err(invalid(error));
+        }
         let landed_reads = landed.into_iter().map(SelectedRead::submitted).collect();
         let owner = active_output.publish();
         let exported = |tensor: &WorkflowTensor, what: &str| {
@@ -2999,8 +3248,45 @@ impl NativeHeadProgram {
                 next_guesses: exported(&chain.next_guesses, "chain's next guesses")?,
             }),
         };
-        Ok((completion, HeadOutput { selected, landed_reads, expert_step: None }))
+        Ok((
+            completion,
+            HeadOutput {
+                selected,
+                landed_reads,
+                expert_steps: expert_steps.map_or_else(Vec::new, |(_, steps)| steps),
+            },
+        ))
     }
+}
+
+fn register_head_parks(
+    bank: &crate::experts::ExpertBank,
+    sequences: &[u64],
+    parks: &[(usize, GraphTimeline, NativeTimelinePort<seismic::timeline::Parks>)],
+    outputs: &seismic::NativeGraphOutputs,
+) -> Result<(), String> {
+    for &(pass, node, port) in parks {
+        let Some(value) = outputs.park(port) else {
+            continue;
+        };
+        let &sequence = sequences
+            .get(pass)
+            .ok_or_else(|| format!("head park pass {pass} exceeds {} step sequences", sequences.len()))?;
+        match node {
+            GraphTimeline::Park(GraphPark { scope, kind }) => {
+                let site = crate::experts::ParkSite {
+                    layer: bank.streamed_layer(scope)?,
+                    kind,
+                };
+                bank.parks().register(value, sequence, site);
+            }
+            GraphTimeline::Publish(scope) => {
+                bank.parks()
+                    .publish(value, bank.streamed_layer(scope)?, sequence);
+            }
+        }
+    }
+    Ok(())
 }
 
 /// A front launch's chain words (`guess_chain`): per entry row of its
@@ -3134,7 +3420,7 @@ mod composition_tests {
         let head_block = CausalHeadBlock::of(&head, &head.blocks[0]).unwrap();
         let geometry = state.head_state().unwrap().head_geometry().unwrap();
         let classes =
-            head_graph_classes(limits, geometry, method.draft_rows(), load.fronts()).unwrap();
+            head_graph_classes(limits, geometry, method.draft_rows(), load.fronts(), false).unwrap();
         assert!(classes
             .iter()
             .any(|c| c.steps() == 4 && HeadPasses::of(c.launch).shaped));
@@ -3275,6 +3561,117 @@ mod composition_tests {
             assert!(
                 classes.contains(&device_draft),
                 "expected device-conditioned drafting class {device_draft:?} to be sealed"
+            );
+        }
+    }
+
+    /// Regression for `f81c51` (GLM-5.3-Flash with `load.fronts() == true`):
+    /// a banked `HeadSublayer` graph must never declare a target front-row
+    /// `guesses` port in `routed_step`, so every port in a banked `Front` or
+    /// `Transaction` head graph is bound at submission.
+    #[test]
+    fn banked_head_with_fronts_omits_target_guesses_port() {
+        use crate::planning::fixtures::{
+            qwen4exp_fixture_definition_of, streamed_experts_manifest, with_mtp_head,
+        };
+        let mut definition = with_mtp_head(qwen4exp_fixture_definition_of(3, 128));
+        let target_routed = definition.decoder.blocks[0].sublayers[1].clone();
+        definition.head.as_mut().unwrap().blocks[0].blocks[0].sublayers[1] = target_routed;
+
+        let manifest = streamed_experts_manifest(&definition);
+        let backend = BackendName::Cuda;
+        let layout = crate::resident_layout(crate::ExecutionPath::Native, backend);
+        let method = crate::PlannedMethod::Mtp {
+            proposals: std::num::NonZeroU8::new(2).unwrap(),
+        };
+        let substrate = crate::planning::bank::BankSubstrate {
+            backend,
+            allocations: seismic::NativeAllocations::EXACT,
+            host: crate::planning::bank::HostTier::Linked,
+            has_side_queue: true,
+        };
+        let load = ModelLoadPlan::derive(
+            &manifest,
+            &definition,
+            crate::ComponentSelection { head: true, vision: false },
+            layout,
+            method,
+            crate::planning::fixtures::LIMITS,
+        )
+        .unwrap()
+        .with_expert_bank(
+            &definition,
+            64,
+            None,
+            1,
+            crate::planning::FlightDepth::PIPELINED,
+            substrate,
+        )
+        .unwrap();
+        assert!(load.fronts(), "MTP load enables fronts");
+
+        let plan = load
+            .program_plan(&definition, crate::KvCodec::Dense)
+            .unwrap();
+        let head_plan = plan.head().unwrap();
+        assert!(head_plan.has_bank(), "HeadSublayer is banked");
+        let binding = head_plan.blocks()[0];
+        let head = definition.head.as_ref().unwrap();
+        let head_block = CausalHeadBlock::of(head, &head.blocks[0]).unwrap();
+        let state = crate::StateResourcePlan::derive(
+            &definition,
+            &load,
+            crate::KvCodec::Dense,
+            crate::planning::fixtures::LIMITS,
+        )
+        .unwrap();
+        let geometry = state.head_state().unwrap().head_geometry().unwrap();
+        let checked = CheckedHeadEntries::new(binding, backend, &load).unwrap();
+        let split = HeadSplit::of(
+            &load,
+            &definition.decoder,
+            head_block,
+            binding.feed_forward,
+            checked.bank.as_ref(),
+        )
+        .unwrap();
+
+        for class in [
+            HeadGraphClass {
+                entry_rows: 1,
+                history: geometry,
+                launch: HeadLaunchClass::Front {
+                    shaped: false,
+                    scored: false,
+                    prefix: true,
+                },
+            },
+            HeadGraphClass {
+                entry_rows: 2,
+                history: geometry,
+                launch: HeadLaunchClass::Transaction {
+                    slots: 1,
+                    steps: 2,
+                    shaped: false,
+                    scored: false,
+                    device: true,
+                    prefix: false,
+                },
+            },
+        ] {
+            let (form, numbers) = split.class(class).unwrap();
+            let parts = head_graph_draft(
+                NativeGraphMetadata::new(backend),
+                checked.entries().unwrap(),
+                &constant_reals(form).tables(Table::from),
+                &constant(numbers),
+            )
+            .unwrap();
+            assert!(!parts.banks.is_empty(), "{class:?}: banked head must declare bank ports");
+            assert_eq!(parts.step_inputs.len(), parts.passes.len());
+            assert!(
+                parts.step_inputs.iter().all(|inputs| inputs.guesses.is_none()),
+                "{class:?}: banked head must not declare target front guesses port"
             );
         }
     }
