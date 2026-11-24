@@ -220,7 +220,7 @@ impl Look {
         seismic_io::timeline::note_at(noticed, seismic_io::timeline::Kind::Noted("notice"), sequence, (layer as i64, absent.len() as i64, count as i64));
         // Each absent expert lacked, its word claimed, into a staging
         // record: those taken beyond the claims go back.
-        let mut free = self.staging.take_up_to(absent.len());
+        let mut free = self.staging.take_up_to_within(absent.len(), self.table.staging_limit(layer));
         let mut claimed = Vec::new();
         for &expert in &absent {
             if free.is_empty() {
@@ -552,7 +552,7 @@ impl Decode {
                     shared.landings.waits.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 }
             };
-            let Some(record) = prefetch.staging.take_beyond(0) else {
+            let Some(record) = prefetch.staging.take_beyond_within(0, core.table.staging_limit(layer)) else {
                 short(&mut waiting);
                 break;
             };

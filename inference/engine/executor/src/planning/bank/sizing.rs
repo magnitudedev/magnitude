@@ -64,7 +64,7 @@ impl ExpertBankPlan {
     /// than its slots; the global slots are not raised for it, so no other
     /// group is charged its bound.
     pub fn records_at(&self, group: usize, slots: u64) -> u64 {
-        let held = self.member_layers(group).map(|layer| layer.vram_slots(slots)).sum::<u64>();
+        let held = self.member_layers(group).map(|layer| self.layer_vram_slots(layer, slots)).sum::<u64>();
         let landing = match self.placer() {
             Placer::Tier => 0,
             Placer::Bank => self.tier_reserve(),
@@ -179,7 +179,7 @@ impl ExpertBankPlan {
                 .member_experts(group)
                 .map(|experts| Self::layer_slots(host_slots, experts))
                 .sum::<u64>()
-                .max(self.landing_records())
+                .max(self.group_landing_records(group))
                 + self.host_lent(group))
             .min(self.host_extent(group)),
             false => 0,

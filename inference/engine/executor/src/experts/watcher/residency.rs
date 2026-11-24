@@ -1109,6 +1109,12 @@ fn classify_link_stage_hit(chosen: &mut crate::experts::interest::Chosen, link_l
 ///   (`layer_decode_dma`), a miss is read from the bank once its copy lands,
 ///   so its link line is the copy's transfer plus a resident read where that
 ///   is cheaper than reading in place.
+/// - On non-splitting discrete-tier layers (`!layer_decode_dma`, e.g. draft
+///   layers), shared `HostRam` bus contention is still governed by the
+///   hardware PCIe DMA link: when DMA-priced contention suppresses CPU-site
+///   (`effective_cpu().is_none()`), clear `lines.host.cpu` so CPU-site is
+///   suppressed on all discrete-tier layers rather than falling back to
+///   contended CPU-site against slower SM zero-copy.
 fn decode_dma_lines(mut lines: ExpertLines, copy: Option<&crate::assessment::TierCopyCosts>, layer_decode_dma: bool) -> ExpertLines {
     let Some(copy) = copy else {
         return lines;
@@ -1120,15 +1126,19 @@ fn decode_dma_lines(mut lines: ExpertLines, copy: Option<&crate::assessment::Tie
             lines.host.joint_memory = Some(joint_ns.max(mem));
         }
     }
-    if !layer_decode_dma {
-        return lines;
-    }
+    let mut dma_priced = lines;
     let dma_ns = copy.transfer.transfer_seconds(lines.host.record_bytes as f64) * 1e9;
-    let landed_ns = dma_ns + lines.gpu.resident.weights.get() as f64;
-    if landed_ns.is_finite() && landed_ns > 0.0 && landed_ns < lines.gpu.link.weights.get() as f64 {
+    let landed_ns = dma_ns + lines.gpu.resident.weights.get();
+    if landed_ns.is_finite() && landed_ns > 0.0 && landed_ns < lines.gpu.link.weights.get() {
         if let Ok(ns) = magnitude_cost_model::Nanoseconds::try_from(landed_ns.round() as u32) {
-            lines.gpu.link.weights = ns;
+            dma_priced.gpu.link.weights = ns;
         }
+    }
+    if layer_decode_dma {
+        return dma_priced;
+    }
+    if dma_priced.effective_cpu().is_none() {
+        lines.host.cpu = None;
     }
     lines
 }
@@ -1255,5 +1265,93 @@ mod tests {
         assert_eq!(adjusted.effective_cpu(), None, "Gen5 + 2-ch DDR5 (B_joint=42 GB/s < B_link=43.6 GB/s) must suppress CPU-site");
         let in_place_adjusted = decode_dma_lines(gen5_lines, Some(&gen5_copy), false);
         assert_eq!(in_place_adjusted.host.joint_memory, adjusted.host.joint_memory);
+        assert_eq!(
+            in_place_adjusted.effective_cpu(),
+            None,
+            "Gen5 bus contention must also suppress CPU-site on non-splitting (draft) layers"
+        );
+    }
+
+    #[test]
+    fn gen5_effective_cpu_none_suppresses_cpu_site_on_both_split_target_and_non_split_draft_layers() {
+        use magnitude_cost_model::{
+            CpuLines, ExpertLines, GpuLines, Hits, HostLines, Miss, Moves, Nanoseconds, Pass, PassLine, ReadLine, RowCost, RowLine, Site, SiteLines,
+        };
+        let ns = |v: u32| Nanoseconds::try_from(v).unwrap();
+        // Gen5 2-ch DDR5: B_dma = 43.6 GB/s, B_joint = 42.0 GB/s, B_mem = 47.8 GB/s.
+        let gen5_transfer = ReadLine::new(0.0, 1.0 / 43.6e9).unwrap();
+        let gen5_copy = crate::assessment::TierCopyCosts {
+            blocks: 0,
+            whole_seconds: 0.0,
+            stall_share: 0.0,
+            transfer: gen5_transfer,
+            back: gen5_transfer,
+            concurrent_host_byte_seconds: Some(1.0 / 42.0e9),
+        };
+        // DSpark draft layer: 18.84 MB/expert MXFP4, SM zero-copy link ~1.7 ms, resident ~40 µs.
+        let dspark_bytes = 18_840_000u64;
+        let draft_lines = ExpertLines {
+            gpu: GpuLines {
+                link: PassLine { weights: ns(1_700_000), row: ns(1_000) },
+                resident: PassLine { weights: ns(40_000), row: ns(1_000) },
+                moves: Moves::NONE,
+            },
+            host: HostLines {
+                cpu: Some(CpuLines {
+                    expert: RowLine { one: ns(450_000), row: RowCost::Measured(ns(2_000)) },
+                    handshake: ns(10_000),
+                }),
+                memory: Some(Nanoseconds::of(dspark_bytes as f64 / 47.8e9).unwrap()),
+                joint_memory: None,
+                landing: None,
+                record_bytes: dspark_bytes,
+            },
+        };
+        let misses = vec![Miss { rows: 1., ready_seconds: 0. }; 8];
+        let hits = [Hits { experts: 2., rows: 1. }];
+
+        for layer_decode_dma in [true, false] {
+            let adjusted = decode_dma_lines(draft_lines, Some(&gen5_copy), layer_decode_dma);
+            assert_eq!(
+                adjusted.effective_cpu(),
+                None,
+                "layer_decode_dma={layer_decode_dma}: Gen5 must suppress CPU-site"
+            );
+            let served = adjusted.serve(Pass::Decode, &hits, &misses);
+            let cpu_assigned = served.sites.iter().filter(|&&s| s == Site::Cpu).count();
+            assert_eq!(
+                cpu_assigned,
+                0,
+                "layer_decode_dma={layer_decode_dma}: cpu_site must be 0"
+            );
+            let site = match adjusted.host.cpu.as_ref() {
+                Some(cpu) => SiteLines::Measured(cpu),
+                None => SiteLines::Pending,
+            };
+            let policy: std::collections::BTreeMap<_, _> =
+                ExpertLines::policy(&crate::assessment::POLICY_LAYOUT, site, Some(&adjusted)).into_iter().collect();
+            assert_eq!(
+                policy[&crate::assessment::POLICY_LAYOUT.priced], 0,
+                "layer_decode_dma={layer_decode_dma}: POLICY_PRICED must be 0 when CPU-site is suppressed"
+            );
+        }
+
+        // Gen4 3090 (B_dma = 19.3 GB/s, B_joint = 36.9 GB/s): ample HostRam headroom keeps CPU-site enabled.
+        let gen4_transfer = ReadLine::new(0.0, 1.0 / 19.3e9).unwrap();
+        let gen4_copy = crate::assessment::TierCopyCosts {
+            blocks: 0,
+            whole_seconds: 0.0,
+            stall_share: 0.0,
+            transfer: gen4_transfer,
+            back: gen4_transfer,
+            concurrent_host_byte_seconds: Some(1.0 / 36.9e9),
+        };
+        for layer_decode_dma in [true, false] {
+            let adjusted = decode_dma_lines(draft_lines, Some(&gen4_copy), layer_decode_dma);
+            assert!(
+                adjusted.effective_cpu().is_some(),
+                "layer_decode_dma={layer_decode_dma}: Gen4 3090 must keep CPU-site enabled"
+            );
+        }
     }
 }

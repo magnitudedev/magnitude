@@ -2086,6 +2086,7 @@ fn draft_conditioning<'a, G: GraphDraft + 'a>(
                 .key_value_dimensions(&first_pass.topology.form, first_pass.numbers.rows.clone())
                 .as_slice(),
             first_weights.project_dimensions(true).as_slice(),
+            &[("IQ", Dim::from(0)), ("IK", Dim::from(0))],
             &InputForm::SINGLE.dimensions(first_pass.numbers.widths.hidden.clone()),
         ]
         .concat(),
@@ -5831,7 +5832,7 @@ mod composition_tests {
     }
 
     #[test]
-    fn deepseek41_dspark_banked_streams_draft_experts_with_capped_vram_slots_and_full_host_tier() {
+    fn deepseek41_dspark_banked_streams_draft_experts_with_per_layer_vram_slots_and_full_host_tier() {
         let (definition, manifest) = deepseek41_dspark_fixture_with_experts(3, 32);
         let (resident_load, state, _) = setup_draft_fixture(&definition, &manifest, 6);
         let resident_head_bytes = resident_load.weight_demands().unwrap()[1].device;
@@ -5875,18 +5876,24 @@ mod composition_tests {
         assert_ne!(target_group, draft_group);
         assert!(draft_layers.iter().all(|(_, layer)| layer.group == draft_group));
 
-        // Draft VRAM slots are capped at DRAFT_MAX_SLOTS (16), never stealing
-        // full bank.slots (24) from target layers, while Host RAM holds all 32 experts/layer.
+        // On discrete CUDA (`Placer::Tier`), once `slots` exceeds the target
+        // decode/verify working set (`draft_pin_threshold()`), draft layers pin
+        // all `layer.experts` (32/32 -> whole draft group); on tight VRAM
+        // (`slots <= threshold`), draft layers fall back to shared `slots`.
+        // Here `setup_draft_fixture(..., 6)` sets `E = 32`, `K = 6`, so at
+        // `slots = 24 <= threshold` draft stays at shared 24, and with
+        // `decode_rows = 3` (`threshold = 18`), `slots = 24 > 18` pins 32/32.
+        let threshold = bank.draft_pin_threshold().expect("discrete bank has draft pin threshold");
         for (_, layer) in &draft_layers {
-            assert_eq!(layer.vram_slots(24), crate::planning::DRAFT_MAX_SLOTS);
+            assert_eq!(bank.layer_vram_slots(layer, threshold), threshold.min(layer.experts));
+            assert_eq!(bank.layer_vram_slots(layer, threshold + 1), layer.experts);
         }
         for (_, layer) in &target_layers {
-            assert_eq!(layer.vram_slots(24), 24);
+            assert_eq!(bank.layer_vram_slots(layer, 24), 24);
         }
-        assert_eq!(
-            bank.records_at(draft_group, 24),
-            3 * crate::planning::DRAFT_MAX_SLOTS
-        );
+        assert_eq!(bank.records_at(draft_group, threshold + 1), 3 * 32);
+        assert_eq!(bank.records_at(draft_group, 45), 3 * 32);
+        assert!(bank.whole_at(bank.widest().get()), "bank must reach whole when slots >= widest");
         assert!(
             bank.host_records(draft_group, 32) >= 3 * 32,
             "all 3×32 draft experts must be backed in pinned Host RAM"

@@ -1313,6 +1313,7 @@ impl<'a> BankPathPricer<'a> {
         context_limit: u64,
         prepared: &PreparedExecutionAssessment,
         context: &'a PricedBankContext,
+        decode_rows: u64,
     ) -> Result<Self, AssessmentError> {
         let limits = prepared.draft().policy().limits();
         let prior = crate::planning::prior(context_limit, limits)?;
@@ -1330,7 +1331,7 @@ impl<'a> BankPathPricer<'a> {
             compute,
             num_layers: context.num_layers,
             least_move_bytes: context.least_move_bytes,
-            decode_rows: crate::planning::decode_rows(limits),
+            decode_rows,
         })
     }
 
@@ -1627,10 +1628,16 @@ pub fn assess_execution_fit_with_priced_bank(
     )
     .max(1);
     let path_pricer = match (forms.bank(), priced_bank) {
-        (Some(_), Some(context)) => Some(BankPathPricer::from_context(
+        (Some(bank), Some(context)) => Some(BankPathPricer::from_context(
             context_limit,
             prepared,
             context,
+            bank.form
+                .draft
+                .load()
+                .expert_bank()
+                .expect("a bank form holds an expert bank")
+                .decode_rows(),
         )?),
         _ => None,
     };

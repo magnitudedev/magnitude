@@ -909,16 +909,25 @@ impl ExecutionPlanDraft {
     /// whole-context prompt (`with_chain`): a group's places are granted
     /// when it opens.
     /// The widest decode step (rows) this draft's expert bank needs decode
-    /// reserves for: `1..=VERIFY_ROWS`, derived from the active drafting width
-    /// and launch slot limit so plain decode or narrower drafters never pay a
-    /// `VERIFY_ROWS = 16` residency tax.
+    /// reserves for: `1..=VERIFY_ROWS`, derived from actual decode concurrency
+    /// (`conversations` bounded by `max_selected_rows` and `max_launch_slots`)
+    /// and the active drafting width so plain decode or narrower drafters never
+    /// pay a `VERIFY_ROWS = 16` residency tax.
     fn bank_decode_rows(&self) -> u64 {
+        let decode_slots = self
+            .policy
+            .limits
+            .conversations
+            .get()
+            .min(self.policy.limits.max_selected_rows)
+            .min(self.policy.limits.max_launch_slots) as u64;
         let rows = if self.policy.method.drafts() {
-            (self.policy.limits.max_drafting_slots as u64)
+            decode_slots
+                .min(self.policy.limits.max_drafting_slots as u64)
                 .saturating_mul(self.policy.method.draft_rows() as u64 + 1)
-                .max(self.policy.limits.max_launch_slots as u64)
+                .max(decode_slots)
         } else {
-            self.policy.limits.max_launch_slots as u64
+            decode_slots
         };
         rows.clamp(1, magnitude_kernels::constants::VERIFY_ROWS)
     }
@@ -4846,6 +4855,8 @@ mod tests {
             intermediate: 512,
         });
         let manifest = gemma_moe_fixture_manifest(&definition);
+        let mut limits = LIMITS;
+        limits.conversations = NonZeroUsize::new(16).unwrap();
         let draft = ExecutionPlanner::prepare(
             &device,
             &manifest,
@@ -4854,7 +4865,7 @@ mod tests {
             ExecutionPath::Native,
             PlannedMethod::Plain,
             KvCodec::Dense,
-            LIMITS,
+            limits,
         )
         .unwrap();
         assert_eq!(draft.bank_decode_rows(), 16);
@@ -4964,6 +4975,8 @@ mod tests {
             recorded(seismic::fixtures::recorded::m4_pro(), BackendName::Metal, 0, seismic::GraphCost::None);
         let definition = fixture_definition();
         let manifest = fixture_manifest(&definition);
+        let mut limits = LIMITS;
+        limits.conversations = NonZeroUsize::new(16).unwrap();
         let draft = ExecutionPlanner::prepare(
             &device,
             &manifest,
@@ -4972,7 +4985,7 @@ mod tests {
             ExecutionPath::Native,
             PlannedMethod::Plain,
             KvCodec::Dense,
-            LIMITS,
+            limits,
         )
         .unwrap();
         assert_eq!(draft.bank_decode_rows(), 16);
@@ -5113,6 +5126,117 @@ mod tests {
             tight_held.pass < pass16,
             "tight room ({tight_bytes} bytes) must step down below pass=16, got {:?}",
             tight_held.pass,
+        );
+    }
+
+    /// `bank_decode_rows()` is bounded by actual decode concurrency
+    /// (`conversations`, `max_selected_rows`, `max_drafting_slots`,
+    /// `draft_rows`), never inflated to `VERIFY_ROWS = 16` by prefill
+    /// `max_launch_slots = 512`.
+    #[test]
+    fn bank_decode_rows_uses_actual_decode_concurrency_not_prefill_launch_slots() {
+        use crate::planning::fixtures::{LIMITS, RoutedShape, gemma_moe_fixture_manifest, routed_fixture_definition};
+
+        let (_, _, device) = recorded(seismic::fixtures::recorded::m4_pro(), BackendName::Metal, 0, seismic::GraphCost::None);
+        let definition = routed_fixture_definition(RoutedShape {
+            layers: 4,
+            experts: 64,
+            selected: 4,
+            hidden: 1024,
+            intermediate: 512,
+        });
+        let manifest = gemma_moe_fixture_manifest(&definition);
+        let mut limits = LIMITS;
+        limits.max_launch_slots = 512;
+        limits.max_launch_rows = 512;
+        assert_eq!(limits.conversations.get(), 1);
+
+        let mut draft = ExecutionPlanner::prepare(
+            &device,
+            &manifest,
+            &definition,
+            ComponentSelection { head: false, vision: false },
+            ExecutionPath::Native,
+            PlannedMethod::Plain,
+            KvCodec::Dense,
+            limits,
+        )
+        .unwrap();
+        assert_eq!(draft.bank_decode_rows(), 1, "conversations=1 plain decode must size bank for 1 row, not VERIFY_ROWS");
+
+        draft.policy.method = PlannedMethod::DFlash {
+            proposals: 3,
+            widths: crate::planning::DraftWidths::Adaptive,
+        };
+        assert_eq!(draft.bank_decode_rows(), 4, "conversations=1 proposals=3 must size bank for 4 rows, not VERIFY_ROWS");
+
+        draft.policy.limits.conversations = NonZeroUsize::new(4).unwrap();
+        draft.policy.method = PlannedMethod::Plain;
+        assert_eq!(draft.bank_decode_rows(), 4, "conversations=4 plain decode must size bank for 4 rows");
+
+        draft.policy.method = PlannedMethod::DFlash {
+            proposals: 3,
+            widths: crate::planning::DraftWidths::Adaptive,
+        };
+        assert_eq!(draft.bank_decode_rows(), 16, "conversations=4 proposals=3 reaches VERIFY_ROWS=16");
+    }
+
+    /// `PlanPrices::of_bank` passes `bank.decode_rows()` as the single source
+    /// of truth so `BankPrices::paths` prices `ahead` for actual decode width
+    /// rather than `VERIFY_ROWS = 16`.
+    #[test]
+    fn plan_prices_of_bank_uses_bank_decode_rows() {
+        use crate::planning::fixtures::{LIMITS, RoutedShape, gemma_moe_fixture_manifest, routed_fixture_definition};
+
+        let (_, _, device) = recorded(seismic::fixtures::recorded::m4_pro(), BackendName::Metal, 0, seismic::GraphCost::None);
+        let definition = routed_fixture_definition(RoutedShape {
+            layers: 16,
+            experts: 128,
+            selected: 6,
+            hidden: 2048,
+            intermediate: 1024,
+        });
+        let manifest = gemma_moe_fixture_manifest(&definition);
+        let draft = ExecutionPlanner::prepare(
+            &device,
+            &manifest,
+            &definition,
+            ComponentSelection { head: false, vision: false },
+            ExecutionPath::Native,
+            PlannedMethod::Plain,
+            KvCodec::Dense,
+            LIMITS,
+        )
+        .unwrap();
+        let capacity = super::MemoryBudget::of_stable(draft.device()).unwrap().capacity();
+        let bound = HeldBound::of(None, capacity);
+        let prices = synthetic();
+        let Priced::Measured(plan_prices) = &prices else {
+            panic!("synthetic prices must be measured");
+        };
+
+        let c1 = draft.bank_ceiling_at(1, &definition, bound, Some(&prices)).unwrap().unwrap();
+        let c16 = draft.bank_ceiling_at(16, &definition, bound, Some(&prices)).unwrap().unwrap();
+        assert_eq!(c1.whole.bank().decode_rows(), 1);
+        assert_eq!(c16.whole.bank().decode_rows(), 16);
+
+        let Priced::Measured(bp1) = plan_prices.of_bank(&c1.whole, &definition).unwrap() else {
+            panic!("bank prices for decode_rows=1 must be measured");
+        };
+        let Priced::Measured(bp16) = plan_prices.of_bank(&c16.whole, &definition).unwrap() else {
+            panic!("bank prices for decode_rows=16 must be measured");
+        };
+
+        let held = magnitude_cost_model::HeldSlots::bank(16);
+        let least_move = c1.whole.bank().least_move_bytes().unwrap();
+        let saturation_bytes = seismic_io::disk::FULL_DEPTH * seismic_io::disk::FULL_READ;
+        let p1 = bp1.paths(least_move, held, crate::planning::HINT_LEADS, saturation_bytes).unwrap();
+        let p16 = bp16.paths(least_move, held, crate::planning::HINT_LEADS, saturation_bytes).unwrap();
+        assert!(
+            p1.ahead < p16.ahead,
+            "decode_rows=1 ahead ({}) must be strictly smaller than decode_rows=16 ahead ({})",
+            p1.ahead,
+            p16.ahead,
         );
     }
 }

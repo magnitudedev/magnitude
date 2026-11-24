@@ -114,7 +114,9 @@ pub(super) fn encode(
         DirectBatch::new(device, stream)
     }
     .map_err(|error| EncodeFailure::uncommitted(CallError::Execution(error)))?;
-    // Nothing is issued yet: a failed wait abandons no work.
+    // Nothing is issued yet: a failed wait abandons no work, and `DirectBatch`
+    // defers its `start` event until `issue` begins so upstream cross-stream
+    // and DMA transfer waits are excluded from `device_seconds()`.
     follow_fences(&mut batch, work.after)
         .map_err(|error| EncodeFailure::uncommitted(CallError::Execution(error)))?;
     for sync in work.after_transfers {

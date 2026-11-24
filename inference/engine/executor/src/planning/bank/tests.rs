@@ -1529,3 +1529,210 @@ fn unified_mixed_quant_target_weight_demand_never_underflows_floor() {
     }
     assert!(exercised_lent_regime, "test must exercise slots > floor while lender group is still at its lent floor");
 }
+
+/// Build a linked bank with `target_layers` target layers (group 0, smaller
+/// Q4_K records) and `draft_layers` draft-only layers (group 1, larger BF16
+/// records) so draft-only staging pools and groups are distinct from target.
+fn target_and_draft_bank(target_layers: usize, draft_layers: usize, paths: BankPaths) -> ExpertBankPlan {
+    let mut plan = beside(bank(&[target_layers, draft_layers], 64), HostTier::Linked);
+    let mut groups = plan.groups().to_vec();
+    let mut layers = plan.layers().to_vec();
+    // Make group 1 (draft) strictly larger per record (q6k vs q4k) so any
+    // draft leak into target conveyor or host_lent is immediately visible.
+    let big = tensor("gguf_q6_k", "q6k");
+    groups[1].record = RecordTensors { gate: Some(big), up: big, down: big };
+    for &layer_idx in groups[1].layers.iter() {
+        layers[layer_idx].scope = WeightScope::DraftSublayer(magnitude_family_contracts::SublayerIndex {
+            block: layer_idx as u32,
+            sublayer: 0,
+        });
+    }
+    let structured = conveyor::Structured::new(
+        plan.selected(),
+        HostTier::Linked,
+        groups,
+        BankLayers::new(layers).unwrap(),
+        None,
+        plan.decode_rows(),
+    )
+    .unwrap();
+    plan.blocks = size_pool_blocks(structured.granules(), plan.allocations).unwrap();
+    plan.structured = structured;
+    plan.paths = paths;
+    plan
+}
+
+/// `conveyor_alone()` covers draft pools too (since DSpark runs conditioning
+/// prefill on the prompt using the prefill conveyor) and scales `conveyor_records`
+/// proportionally with `decode_rows`.
+#[test]
+fn conveyor_alone_includes_draft_pools_and_scales_with_decode_rows() {
+    let wide = target_and_draft_bank(10, 3, BankPaths::Unpriced);
+    let mut narrow = wide.clone();
+    narrow.structured = conveyor::Structured::new(
+        wide.selected(),
+        HostTier::Linked,
+        wide.groups().to_vec(),
+        wide.layers().clone(),
+        None,
+        4,
+    )
+    .unwrap();
+    assert_eq!(wide.conveyor().conveyor.offsets, vec![0; wide.staging_pools().0.len()]);
+    assert_eq!(narrow.conveyor().conveyor.offsets, vec![0; narrow.staging_pools().0.len()]);
+    assert!(
+        narrow.conveyor_records() < wide.conveyor_records(),
+        "narrow decode_rows=4 conveyor_records ({}) must shrink below decode_rows=16 ({})",
+        narrow.conveyor_records(),
+        wide.conveyor_records(),
+    );
+    assert!(
+        narrow.host_lent(0) < wide.host_lent(0),
+        "narrow decode_rows=4 host_lent ({}) must shrink below decode_rows=16 ({})",
+        narrow.host_lent(0),
+        wide.host_lent(0),
+    );
+}
+
+/// Draft-only staging pools omit `hint_records()` from their staging extent
+/// (`demand_records` only), draft groups omit `hint_records()` from their
+/// `host_records` floor (`choices` only), and `storage_demand_at` / `landing`
+/// accounting stays exact.
+#[test]
+fn draft_only_staging_pools_and_host_records_omit_hint_records() {
+    let paths = BankPaths::Priced {
+        line: LINE,
+        records: magnitude_cost_model::PathRecords { ahead: 103, reserve: 16 },
+    };
+    let plan = target_and_draft_bank(10, 3, paths);
+    let layout = plan.layout().unwrap();
+    let has_hints = plan.staging_pool_has_hints();
+    assert!(has_hints.iter().any(|&h| h) && has_hints.iter().any(|&h| !h));
+
+    for (alloc, &pool_has_hints) in layout.staging.iter().zip(&has_hints) {
+        let BankAllocation::Shared { extents, .. } = alloc else {
+            panic!("staging allocation must be Shared");
+        };
+        let expected = if pool_has_hints {
+            plan.demand_records() + 103
+        } else {
+            plan.demand_records()
+        };
+        assert_eq!(extents[0], expected, "pool has_hints={pool_has_hints} staging extent mismatch");
+    }
+
+    assert!(plan.group_has_hints(0));
+    assert!(!plan.group_has_hints(1));
+    assert_eq!(
+        plan.host_records(0, 0),
+        (plan.choices() + 103 + plan.host_lent(0)).min(plan.host_extent(0)),
+        "target group host_records floor includes hint_records",
+    );
+    assert_eq!(
+        plan.host_records(1, 0),
+        (plan.choices() + plan.host_lent(1)).min(plan.host_extent(1)),
+        "draft-only group host_records floor omits hint_records",
+    );
+    for group in 0..plan.groups().len() {
+        assert_eq!(
+            plan.host_records(group, 0),
+            plan.host_records_with_paths(group, 0, paths),
+            "host_records_with_paths must match host_records for group {group}",
+        );
+    }
+
+    // storage_demand_at must match storage_demand bit-for-bit without underflow.
+    assert_eq!(
+        plan.storage_demand_at(plan.slots, plan.places, paths).unwrap(),
+        plan.storage_demand().unwrap(),
+    );
+
+    // landing() bytes must never exceed host_charge(0) so ledger::carve never panics.
+    let need = plan.landing().unwrap().expect("linked bank has landing rows");
+    let crate::memory::ledger::Need::LandingRows { rows, slot_bytes, .. } = need else {
+        panic!("expected LandingRows");
+    };
+    assert!(
+        rows * slot_bytes <= plan.host_charge(0).unwrap(),
+        "landing bytes ({}) must not exceed host_charge(0) ({})",
+        rows * slot_bytes,
+        plan.host_charge(0).unwrap(),
+    );
+}
+
+/// On discrete GPUs (`Placer::Tier`), non-splitting draft layers pin all of
+/// their experts (`128/128`, `whole == true`) once `slots` exceeds the target
+/// decode/verify working set (`draft_pin_threshold()`), and fall back
+/// gracefully to shared `slots` on tight VRAM.
+#[test]
+fn deepseek41_dspark_32gb_pins_draft_group_whole_and_falls_back_on_tight_vram() {
+    // Build a discrete-tier bank with 40 target layers (E=384, K=6) + 3 DSpark
+    // draft layers (E=128, K=6) at decode_rows=4 (proposals=3).
+    let mut plan = target_and_draft_bank(40, 3, BankPaths::Unpriced);
+    let mut layers: Vec<BankLayer> = plan.layers().iter().cloned().collect();
+    for layer in &mut layers {
+        layer.selected = 6;
+        layer.experts = if layer.is_draft() { 128 } else { 384 };
+    }
+    let layers = BankLayers::new(layers).unwrap();
+    plan.structured = conveyor::Structured::new(
+        6,
+        HostTier::Linked,
+        plan.groups().to_vec(),
+        layers,
+        None,
+        4,
+    )
+    .unwrap();
+
+    // Target decode/verify working set: decode_set(6, 384, 4) = 24.
+    assert_eq!(plan.draft_pin_threshold(), Some(24));
+
+    // Exact DeepSeek-V4.1 + DSpark 32 GB VRAM geometry:
+    //   target = 40 layers × 8.80 MB/expert = 352.0 MB/slot
+    //   draft  =  3 layers × 18.84 MB/expert = 56.52 MB/slot (128/128 = 7,235 MB)
+    //   bank VRAM budget at 097ce3's 52-slot baseline = 52 × 408.52 MB = 21,243 MB
+    let target_expert_bytes: u64 = 8_800_000;
+    let draft_expert_bytes: u64 = 18_840_000;
+    let charge_bytes = |slots: u64| -> u64 {
+        plan.records_at(0, slots) * target_expert_bytes
+            + plan.records_at(1, slots) * draft_expert_bytes
+    };
+
+    // 1. 32 GB RTX 5090 budget (~21.24 GB for expert records):
+    let rtx5090_budget: u64 = 52 * (40 * target_expert_bytes + 3 * draft_expert_bytes);
+    let rtx5090_slots = growth_target(0, 384, rtx5090_budget, |to| Ok::<_, ()>(charge_bytes(to)))
+        .unwrap()
+        .expect("32 GB budget fits above floor");
+    assert!(
+        rtx5090_slots >= 36,
+        "target groups must retain >= 36 slots/layer on 32 GB, got {rtx5090_slots}"
+    );
+    assert_eq!(
+        plan.records_at(1, rtx5090_slots),
+        3 * 128,
+        "DSpark draft group must pin 128/128 (384 total) on 32 GB"
+    );
+    assert_eq!(
+        plan.records_at(1, rtx5090_slots),
+        plan.group_experts(1),
+        "DSpark draft group must be whole (records == group_experts)"
+    );
+    assert_eq!(
+        plan.records_at(0, rtx5090_slots),
+        40 * rtx5090_slots,
+        "target group holds rtx5090_slots per layer"
+    );
+
+    // 2. Tight VRAM budget (~9.0 GB): falls back to shared slots without starving target.
+    let tight_budget: u64 = 9_000_000_000;
+    let tight_slots = growth_target(0, 384, tight_budget, |to| Ok::<_, ()>(charge_bytes(to)))
+        .unwrap()
+        .expect("tight budget fits shared slots");
+    assert!(tight_slots <= 24, "tight budget should land at <= threshold, got {tight_slots}");
+    assert_eq!(
+        plan.records_at(1, tight_slots),
+        3 * tight_slots,
+        "on tight VRAM draft group falls back to shared slots/layer"
+    );
+}

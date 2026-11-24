@@ -454,6 +454,17 @@ impl ReadTable {
         &self.staging[pool]
     }
 
+    /// The exclusive upper bound on staging record indices valid for every
+    /// pool `layer` reads into.
+    pub(super) fn staging_limit(&self, layer: usize) -> u32 {
+        self.stored[layer]
+            .iter()
+            .map(|stored| self.staging[stored.pool].count())
+            .min()
+            .and_then(|count| u32::try_from(count).ok())
+            .unwrap_or(0)
+    }
+
     /// The reads that bring expert `expert` of `layer` into staging record
     /// `record` of each of its pools.
     pub(super) fn reads(&self, layer: usize, expert: usize, record: u32) -> Vec<Read> {

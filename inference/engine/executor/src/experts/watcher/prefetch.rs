@@ -1584,7 +1584,7 @@ impl Prefetch {
         (staging, ahead_staging): (usize, Option<usize>),
     ) -> Result<u64, Short> {
         let (target, expert) = staged;
-        let Some(record) = self.staging.take_beyond(staging) else {
+        let Some(record) = self.staging.take_beyond_within(staging, core.table.staging_limit(target)) else {
             return Err(Short::Staging);
         };
         // Beyond what its group's reserve (`HostRecords::reserve`) holds

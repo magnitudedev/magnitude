@@ -591,6 +591,7 @@ fn watch(
     // one after another (a conveyor's in the lender's lent records), which
     // reads land in in place.
     let (staging_pools, _) = plan.staging_pools();
+    let pool_hints = plan.staging_pool_has_hints();
     let pool_records = |pool: &StagingPool, name: &str, tensor: &Tensor, records| {
         Records::rows(tensor, pool.record_bytes()?, records)
             .map_err(|error| format!("the {} {name}: {error}", pool.source.name()))
@@ -598,7 +599,11 @@ fn watch(
     let pools = staging_pools
         .iter()
         .zip(&layout.staging)
-        .map(|(pool, tensor)| Ok(Pool { staging: pool_records(pool, "staging", tensor, plan.staging_records())? }))
+        .zip(pool_hints)
+        .map(|((pool, tensor), has_hints)| {
+            let count = plan.pool_staging_records_with_paths(has_hints, plan.paths);
+            Ok(Pool { staging: pool_records(pool, "staging", tensor, count)? })
+        })
         .collect::<Result<Vec<_>, String>>()?;
     // What carries the conveyor's experts: the records its lender lends it,
     // each pool's conveyor where it lies in them, which reads land in in
@@ -1025,13 +1030,14 @@ mod tests {
 
     #[test]
     fn deepseek_8_target_plus_1_draft_group_keeps_over_90_pct_permanent_vram_and_protects_draft() {
-        // 8 target groups (40 layers × 45 slots = 1,800) + 1 DSpark draft group
-        // (3 layers × 16 slots = 48) -> total 1,848 slots, K = 6, decode_rows = 4..=16.
+        // 8 target groups (40 layers × 41 slots = 1,640) + 1 DSpark draft group
+        // (3 layers × 41 slots = 123, full per-layer share without DRAFT_MAX_SLOTS cap)
+        // -> total 1,763 slots, K = 6, decode_rows = 4..=16.
         let target_layers = [20usize, 4, 4, 4, 2, 2, 2, 2];
         let lookahead_layers = crate::planning::HINT_LEADS as usize + 1;
         for decode_rows in [4usize, 6, 16] {
-            let mut present: Vec<usize> = target_layers.iter().map(|&n| n * 45).collect();
-            present.push(48); // group 8: DSpark draft group (3 layers × 16 slots)
+            let mut present: Vec<usize> = target_layers.iter().map(|&n| n * 41).collect();
+            present.push(3 * 41); // group 8: DSpark draft group (3 layers × 41 slots = 123)
             let mut stage_slots = Vec::with_capacity(9);
             for (group, &layers) in target_layers.iter().enumerate() {
                 let start = if group == 0 { 480 } else { 0 };
@@ -1054,7 +1060,7 @@ mod tests {
             let sum_stage: usize = stage_slots.iter().sum();
             let sum_capacity: usize = present.iter().zip(&stage_slots).map(|(p, s)| p - s).sum();
             assert_eq!(stage_slots[8], 0, "draft group 8 must have stage_slots == 0");
-            assert_eq!(present[8] - stage_slots[8], present[8], "draft group 8 must keep 100% permanent capacity");
+            assert_eq!(present[8] - stage_slots[8], 3 * 41, "draft group 8 must keep full per-layer permanent capacity (41/layer = 123)");
             assert!(
                 (sum_stage as f64) <= 0.05 * (total as f64),
                 "decode_rows={decode_rows}: sum(stage_slots)={sum_stage} must be <= 5% of total={total}"

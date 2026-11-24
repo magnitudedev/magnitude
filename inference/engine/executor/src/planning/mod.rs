@@ -14,7 +14,7 @@ pub(crate) use imports::ImportPlan;
 mod programs;
 mod prices;
 pub use prices::{PlanForms, PlanPrices, PlanSteps};
-pub(crate) use prices::{decode_rows, prior};
+pub(crate) use prices::prior;
 mod prompt_room;
 pub(crate) use prompt_room::pass_ladder;
 mod resources;
@@ -28,7 +28,7 @@ pub use assessment::{
 pub(crate) use assessment::{deferred_bank_bytes, deferred_bank_bytes_of_bank, fit_depth};
 pub(crate) use resources::{DomainRows, HeadHistoryGeometry};
 #[cfg(test)]
-pub use bank::{BankLayer, BankLayers, DRAFT_MAX_SLOTS};
+pub use bank::{BankLayer, BankLayers};
 pub use bank::{
     BankAllocation, BankBinding, BankCounts, BankPaths, BankTable, BankLayout, BankPart, ConveyorCarrier,
     Lender,

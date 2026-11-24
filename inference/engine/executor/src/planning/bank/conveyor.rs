@@ -545,6 +545,21 @@ impl BankStructure<'_> {
         Ok(ConveyorLayout { records, offsets, bytes })
     }
 
+    /// For each staging pool, whether at least one non-draft (target) layer
+    /// reads into it. Draft-only pools (`false`) never receive cross-layer
+    /// hints.
+    pub(super) fn pool_has_target(self, pool_of: &[RecordTensors<usize>], pool_count: usize) -> Vec<bool> {
+        let mut has_target = vec![false; pool_count];
+        for (layer, of) in self.layers.iter().zip(pool_of) {
+            if !layer.is_draft() {
+                for (_, &pool) in of.iter() {
+                    has_target[pool] = true;
+                }
+            }
+        }
+        has_target
+    }
+
     /// The staging pools, and each layer's pool of each routed tensor: one
     /// per stored form, each with its conveyor.
     pub(super) fn staging_pools(self) -> (Vec<StagingPool>, Vec<RecordTensors<usize>>) {

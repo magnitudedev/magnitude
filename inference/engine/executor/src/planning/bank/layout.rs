@@ -970,13 +970,18 @@ impl ExpertBankPlan {
             grids: device(0, BankPart::ScratchGrids)?,
             window: (0..self.windows()).map(|_| device(0, BankPart::Window)).collect::<Result<Vec<_>, String>>()?,
         };
-        let staging = self
-            .staging_pools()
-            .0
+        let (staging_pools, pool_of) = self.staging_pools();
+        let pool_hints = self.structure().pool_has_target(&pool_of, staging_pools.len());
+        let staging = staging_pools
             .iter()
-            .map(|pool| BankAllocation::Shared {
+            .zip(pool_hints)
+            .map(|(pool, has_hints)| BankAllocation::Shared {
                 element: pool.source,
-                extents: vec![self.staging_records(), pool.matrix[0], pool.matrix[1]],
+                extents: vec![
+                    self.pool_staging_records_with_paths(has_hints, self.paths),
+                    pool.matrix[0],
+                    pool.matrix[1],
+                ],
             })
             .collect();
         let host = self.tiered().then(|| {
@@ -1133,11 +1138,16 @@ impl ExpertBankPlan {
                 .checked_plus(commits.storage_demand(self.host())?)
                 .ok_or_else(|| "bank paths storage demand overflows".to_owned())?;
         }
-        let staging_records = self.demand_records() + paths.records().ahead;
-        for pool in &self.staging_pools().0 {
+        let (staging_pools, pool_of) = self.staging_pools();
+        let pool_hints = self.structure().pool_has_target(&pool_of, staging_pools.len());
+        for (pool, has_hints) in staging_pools.iter().zip(pool_hints) {
             let staging = BankAllocation::Shared {
                 element: pool.source,
-                extents: vec![staging_records, pool.matrix[0], pool.matrix[1]],
+                extents: vec![
+                    self.pool_staging_records_with_paths(has_hints, paths),
+                    pool.matrix[0],
+                    pool.matrix[1],
+                ],
             };
             total = total
                 .checked_plus(staging.storage_demand(self.host())?)

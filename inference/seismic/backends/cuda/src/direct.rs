@@ -987,6 +987,11 @@ pub struct DirectBatch {
     device: Device,
     stream: Arc<driver::Stream>,
     start: Event,
+    /// Whether `start` has been recorded on `stream`. Deferred until the first
+    /// work-issuing call (or `end()` for an empty batch) so leading `follow` /
+    /// `follow_event` waits (`cuStreamWaitEvent`) are excluded from
+    /// `DirectSubmission::device_seconds()`.
+    started: bool,
     /// For a timed batch, per `launch` call, the event recorded just before
     /// the launch (absent for an empty launch).
     marks: Option<Vec<Option<Event>>>,
@@ -997,14 +1002,26 @@ impl DirectBatch {
     pub fn new(device: &Device, stream: crate::NativeStream) -> Result<Self, ExecutionError> {
         let stream = device.native_stream(stream).clone();
         let start = Event::new(device.context()).map_err(submission)?;
-        start.record(&stream).map_err(submission)?;
         Ok(Self {
             fence: BatchFence::idle(),
             device: device.clone(),
             stream,
             start,
+            started: false,
             marks: None,
         })
+    }
+
+    /// Record `self.start` on `self.stream` immediately before the batch's
+    /// first work-issuing call, so upstream `follow` / `follow_event` waits
+    /// precede `start` and are not billed into `device_seconds()`.
+    fn ensure_started(&mut self) -> Result<(), ExecutionError> {
+        if !self.started {
+            self.start.record(&self.stream).map_err(submission)?;
+            self.fence.arm(&self.stream);
+            self.started = true;
+        }
+        Ok(())
     }
 
     /// A measurement batch that records an event before every launch, so
@@ -1052,6 +1069,7 @@ impl DirectBatch {
             return Ok(());
         }
         let mut formed = FormedLaunch::form(&self.device, launch, true)?;
+        self.ensure_started()?;
         if let Some(marks) = &mut self.marks {
             let mark = Event::new(self.device.context()).map_err(submission)?;
             mark.record(&self.stream).map_err(submission)?;
@@ -1091,6 +1109,7 @@ impl DirectBatch {
         }
         let count = usize::try_from(bytes)
             .map_err(|_| ExecutionError::SubmissionFailed("a device copy exceeds the host's address space".into()))?;
+        self.ensure_started()?;
         let context = self.device.context();
         let _current = context.enter().map_err(submission)?;
         // SAFETY: both ranges lie in live device allocations of this
@@ -1117,6 +1136,7 @@ impl DirectBatch {
         }
         let count = usize::try_from(bytes)
             .map_err(|_| ExecutionError::SubmissionFailed("a host upload exceeds the host's address space".into()))?;
+        self.ensure_started()?;
         let context = self.device.context();
         let _current = context.enter().map_err(submission)?;
         // SAFETY: caller upholds live pinned host `source` and device
@@ -1136,6 +1156,7 @@ impl DirectBatch {
         if destination % 8 != 0 {
             return Err(ExecutionError::SubmissionFailed("a device word is not 8-byte aligned".into()));
         }
+        self.ensure_started()?;
         let context = self.device.context();
         let _current = context.enter().map_err(submission)?;
         for (offset, half) in [(0, value as u32), (4, (value >> 32) as u32)] {
@@ -1150,6 +1171,7 @@ impl DirectBatch {
     /// Stamp mark `mark` of `stamps` once the stream's preceding work
     /// completes ([`Stamps`]).
     pub fn stamp(&mut self, stamps: &Stamps, mark: usize) -> Result<(), ExecutionError> {
+        self.ensure_started()?;
         stamps.events[mark].record(&self.stream).map_err(submission)?;
         self.fence.arm(&self.stream);
         Ok(())
@@ -1181,6 +1203,7 @@ impl DirectBatch {
         flags: u32,
         operation: impl FnOnce(&crate::enqueue::Enqueue, Handle, u64, u32, std::ffi::c_uint) -> Option<std::ffi::c_int>,
     ) -> Result<(), ExecutionError> {
+        self.ensure_started()?;
         let context = self.device.context();
         let _current = context.enter().map_err(submission)?;
         let status = operation(context.enqueue(), self.stream.raw(), word.mapped.device, value, flags)
@@ -1206,6 +1229,7 @@ impl DirectBatch {
             self.marks.is_none(),
             "DirectBatch::replay precondition: a timed batch times each launch"
         );
+        self.ensure_started()?;
         graph.exec.launch(&self.stream).map_err(submission)?;
         self.fence.arm(&self.stream);
         graph.launched.record(&self.stream).map_err(submission)?;
@@ -1242,9 +1266,13 @@ impl DirectBatch {
             device,
             stream,
             start,
+            started,
             marks,
         } = self;
         let end = Event::new(device.context()).and_then(|end| {
+            if !started {
+                start.record(&stream)?;
+            }
             end.record(&stream)?;
             stream.flush_submission()?;
             Ok(end)

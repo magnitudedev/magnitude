@@ -867,12 +867,28 @@ impl Watcher {
         if conveyors.len() != pools.len() {
             return Err(format!("{} staging pools and conveyors of another count", pools.len()));
         }
-        for (pool, conveyor) in pools.iter().zip(conveyors) {
-            if pool.staging.count() != u64::from(staging) || conveyor.count() != carrier.records as u64 {
+        let mut pool_has_target = vec![false; pools.len()];
+        for layer in &layers {
+            if !layer.draft {
+                for stored in layer.stored.iter() {
+                    if let Some(flag) = pool_has_target.get_mut(stored.pool) {
+                        *flag = true;
+                    }
+                }
+            }
+        }
+        for ((pool, conveyor), &has_target) in pools.iter().zip(conveyors).zip(&pool_has_target) {
+            let valid_staging = if has_target {
+                pool.staging.count() == u64::from(staging)
+            } else {
+                pool.staging.count() == u64::from(staging) || pool.staging.count() == extents.demand as u64
+            };
+            if !valid_staging || conveyor.count() != carrier.records as u64 {
                 return Err(format!(
-                    "a staging pool of {} records and a conveyor of {}, not {staging} and {}",
+                    "a staging pool of {} records and a conveyor of {}, not {staging} (or demand {}) and {}",
                     pool.staging.count(),
                     conveyor.count(),
+                    extents.demand,
                     carrier.records
                 ));
             }
