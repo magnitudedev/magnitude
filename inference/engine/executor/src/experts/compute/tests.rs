@@ -190,8 +190,8 @@ impl Job for Counted {
     fn want(&self) -> Want {
         self.urgency.get()
     }
-    fn waited(&self) -> bool {
-        self.urgency.is_waited()
+    fn priority_key(&self) -> u64 {
+        self.urgency.key()
     }
 }
 
@@ -275,4 +275,46 @@ fn the_most_urgent_job_runs_first_in_submission_order() {
     // The due jobs by deadline (the hastened one due last), then those not
     // due in submission order.
     assert_eq!(ends, [3, 0, 2, 4, 1]);
+}
+
+/// A `due` job preempts a large backlog of `ahead` jobs immediately in O(1)
+/// without waiting for or scanning the `ahead` queue.
+#[test]
+fn due_job_preempts_ahead_backlog_in_o1() {
+    struct Gate(Arc<std::sync::Barrier>);
+    impl Job for Gate {
+        fn pieces(&self) -> usize {
+            1
+        }
+        fn piece(&self, _: usize) {
+            self.0.wait();
+        }
+        fn end(&self) {}
+        fn want(&self) -> Want {
+            Want::now()
+        }
+    }
+    let compute = HostCompute::start(Vec::new(), &ComputeThreads::placeable(1)).unwrap();
+    let handle = compute.handle();
+    let gate = Arc::new(std::sync::Barrier::new(2));
+    handle.submit(Arc::new(Gate(gate.clone())));
+    until(|| handle.inner.jobs.lock().unwrap().is_empty());
+
+    let order = Arc::new(AtomicUsize::new(0));
+    let ahead_jobs: Vec<_> = (0..256)
+        .map(|i| Counted::ordered(1, Some(Want::undated(i as f64)), order.clone()))
+        .collect();
+    for job in &ahead_jobs {
+        handle.submit(job.clone());
+    }
+    assert_eq!(handle.ahead_queued(), 256);
+
+    let demand = Counted::ordered(2, None, order.clone());
+    handle.submit(demand.clone());
+
+    gate.wait();
+    until(|| demand.ended.load(Ordering::Acquire) == 1);
+    assert_eq!(demand.ended_at.load(Ordering::Acquire), 0, "due job must complete ahead of all 256 ahead jobs");
+    until(|| ahead_jobs.iter().all(|job| job.ended.load(Ordering::Acquire) == 1));
+    assert_eq!(handle.ahead_queued(), 0);
 }

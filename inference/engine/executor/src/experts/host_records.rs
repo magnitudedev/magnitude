@@ -1426,7 +1426,7 @@ impl HostRecords {
             if at.lending() && record < self.lent {
                 continue;
             }
-            if immediate {
+            if immediate && matches!(self.records[record as usize], Host::Kept(_)) {
                 self.unkeep(record);
                 if let Some(map) = &self.maps[chosen.0] {
                     map.store_unbegun(chosen.1, None, Some(at));
@@ -1743,6 +1743,12 @@ impl HostRecords {
     /// The device is past every point before `progress`: every outstanding
     /// answer of a request before it is consumed, kept, and so is every
     /// answer a landing ends with later ([`Self::answering`]).
+    /// The latest device point these records know the device has reached or
+    /// passed (`Self::release`, `Self::progress`), if any.
+    pub fn progress(&self) -> Option<Point> {
+        self.progress
+    }
+
     fn passed(&mut self, progress: Point) {
         self.progress = Some(self.progress.map_or(progress, |known| known.max(progress)));
         for record in self.answering.clone() {

@@ -571,3 +571,95 @@ fn host_reads_of_a_site_slot_canonicalize_nans() {
         }
     }
 }
+
+/// Tiled q8 (`Weights::tile_q8`) and whole-group inline quantization
+/// (`no_k_split`) produce bit-for-bit identical outputs to single-row (`M = 1`)
+/// execution across `Q2_0`, `Q2_K`, `IQ2_XXS`, `IQ1_M`, and `Q4_0` at
+/// `M = 1, 2, 4, 8, 12` for both `no_k_split` and K-split worker counts.
+#[test]
+fn tiled_formats_multi_row_matches_single_row_bit_for_bit() {
+    let device = cpu();
+    let charges = seismic::Charges::tally(&device);
+    let tier = seismic::cpu::Tier::detected().unwrap();
+    let (h, f, max_rows) = (512usize, 256usize, 12usize);
+    let x = (0..max_rows * h).map(|index| ((index * 53 % 211) as f32 / 211.0 - 0.5) * 2.0).collect::<Vec<_>>();
+    let formats = [
+        ("q2g64@mma16", "gguf_q2_0"),
+        ("q2k@mma16", "gguf_q2_k"),
+        ("iq2xxs@mma16", "gguf_iq2_xxs"),
+        ("iq1m@mma16", "gguf_iq1_m"),
+        ("q4g32s@mma16", "gguf_q4_0"),
+    ];
+    let build = |name: &str, source: &str, rows: usize, columns: usize, seed: u32| {
+        let resident = seismic::Element::named(name).unwrap_or_else(|| panic!("{name}"));
+        let source = seismic::Element::named(source).unwrap_or_else(|| panic!("{source}"));
+        assert!(resident.cpu_operand(tier).is_some(), "the CPU reads {name}");
+        let record = [1, rows as u64, columns as u64];
+        let stored_bytes = source.canonical_byte_len(&record).unwrap() as usize;
+        let tensor = Tensor::shared(&charges, resident, &[2, rows as u64, columns as u64]).unwrap();
+        let records = Records::rows(&tensor, tensor.byte_len() / 2, 2).unwrap();
+        for index in 0..2u32 {
+            let bytes = (0..stored_bytes)
+                .map(|at| ((at as u32).wrapping_mul(2_654_435_761).wrapping_add(seed + index) >> 24) as u8)
+                .collect();
+            let stored = resident.finite_source(source, &record, bytes).unwrap();
+            let converted = resident.repack_host(source, &record, &stored).unwrap();
+            // SAFETY: no work uses the records.
+            unsafe { records.tensor(u64::from(index)).write_shared(0, &converted).unwrap() };
+        }
+        SiteRecords::new(records, rows, columns, resident).unwrap()
+    };
+    for (name, source) in formats {
+        // Reference single-row outputs (`M = 1`, `workers = 1`) for each row `0..max_rows`.
+        let ref_tensors = SiteTensors {
+            gate: Some(build(name, source, f, h, 11)),
+            up: build(name, source, f, h, 22),
+            down: build(name, source, h, f, 33),
+        };
+        let ref_layer = SiteLayer::owned(&charges, ref_tensors, SiteScales { gate: None, up: None }, packed_shape(max_rows, 2, 2, h, f)).unwrap();
+        let ref_compute = HostCompute::start(vec![ref_layer], &threads(1)).unwrap();
+        let ref_handle = ref_compute.handle();
+        let ref_flight = ref_handle.flight().unwrap();
+        let ref_layer = &ref_handle.layers()[0];
+        let mut alone_bits = Vec::with_capacity(max_rows);
+        for row in 0..max_rows {
+            let step = 1 + row as u64;
+            let slot = step as usize % 2;
+            let weight = 0.25 + 0.05 * row as f32;
+            ref_layer.request(step, &[(row, 1, weight, 1)], &x);
+            assert_eq!(answer(ref_layer, slot, step), step);
+            let out = ref_layer.output(slot);
+            alone_bits.push(out[row * h..(row + 1) * h].iter().map(|v| v.to_bits()).collect::<Vec<_>>());
+        }
+        drop(ref_flight);
+        drop(ref_compute);
+
+        // Compare against `M = 1, 2, 4, 8, 12` across `workers = 2` (`no_k_split`: 8 groups >= 4)
+        // and `workers = 5` (K-split: 8 groups < 10).
+        for workers in [2usize, 5] {
+            let tensors = SiteTensors {
+                gate: Some(build(name, source, f, h, 11)),
+                up: build(name, source, f, h, 22),
+                down: build(name, source, h, f, 33),
+            };
+            let layer = SiteLayer::owned(&charges, tensors, SiteScales { gate: None, up: None }, packed_shape(max_rows, 2, 2, h, f)).unwrap();
+            let compute = HostCompute::start(vec![layer], &threads(workers)).unwrap();
+            let handle = compute.handle();
+            let flight = handle.flight().unwrap();
+            let layer = &handle.layers()[0];
+            for (idx, m) in [1usize, 2, 4, 8, 12].into_iter().enumerate() {
+                let step = 1 + idx as u64;
+                let slot = step as usize % 2;
+                let entries = (0..m).map(|row| (row, 1, 0.25 + 0.05 * row as f32, 1)).collect::<Vec<_>>();
+                layer.request(step, &entries, &x);
+                assert_eq!(answer(layer, slot, step), step);
+                let out = layer.output(slot);
+                for row in 0..m {
+                    let got: Vec<u32> = out[row * h..(row + 1) * h].iter().map(|v| v.to_bits()).collect();
+                    assert_eq!(got, alone_bits[row], "{name}, workers={workers}, M={m}, row={row}");
+                }
+            }
+            drop(flight);
+        }
+    }
+}

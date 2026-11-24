@@ -148,6 +148,67 @@ impl Q8Tile {
             std::ptr::addr_of_mut!((*tile).d[row]).write(block.d);
         }
     }
+
+    /// Quantizes `values` (at most [`Q8_GROUP`] values, padded with zeros) into
+    /// sub-block `group` (`0..Q8_GROUPS`) of row `row` of `tile`, writing only
+    /// that sub-block's bytes of that row: other rows and other sub-blocks of
+    /// the same row may be written at the same time.
+    ///
+    /// # Safety
+    /// `tile` is valid for writes, `row < TILE_ROWS`, `group < Q8_GROUPS`, and
+    /// nothing else writes sub-block `group` of row `row` of `tile`.
+    #[inline(always)]
+    pub unsafe fn quantize_group_into(tile: *mut Q8Tile, row: usize, group: usize, values: &[f32]) {
+        let (codes, sums, d) = quantize_subblock(values);
+        unsafe {
+            for (s, chunk) in codes.chunks_exact(8).enumerate() {
+                std::ptr::addr_of_mut!((*tile).codes[4 * group + s][row])
+                    .cast::<i8>()
+                    .copy_from_nonoverlapping(chunk.as_ptr(), 8);
+            }
+            std::ptr::addr_of_mut!((*tile).sums[row][2 * group]).write(sums[0]);
+            std::ptr::addr_of_mut!((*tile).sums[row][2 * group + 1]).write(sums[1]);
+            std::ptr::addr_of_mut!((*tile).d[row][group]).write(d);
+        }
+    }
+}
+
+impl Q8Block {
+    /// Quantizes `values` (at most [`Q8_GROUP`] values, padded with zeros) into
+    /// sub-block `group` (`0..Q8_GROUPS`) of `block`, writing only that
+    /// sub-block's bytes: other sub-blocks of the same block may be written at
+    /// the same time.
+    ///
+    /// # Safety
+    /// `block` is valid for writes, `group < Q8_GROUPS`, and nothing else
+    /// writes sub-block `group` of `block`.
+    #[inline(always)]
+    pub unsafe fn quantize_group_into(block: *mut Q8Block, group: usize, values: &[f32]) {
+        let (codes, sums, d) = quantize_subblock(values);
+        unsafe {
+            std::ptr::addr_of_mut!((*block).codes[group * Q8_GROUP])
+                .cast::<i8>()
+                .copy_from_nonoverlapping(codes.as_ptr(), Q8_GROUP);
+            std::ptr::addr_of_mut!((*block).sums[2 * group]).write(sums[0]);
+            std::ptr::addr_of_mut!((*block).sums[2 * group + 1]).write(sums[1]);
+            std::ptr::addr_of_mut!((*block).d[group]).write(d);
+        }
+    }
+}
+
+/// Quantizes `values` (at most [`Q8_GROUP`] values, padded with zeros) into one
+/// sub-block's codes, half-sums, and scale, matching [`quantize`] bit for bit.
+#[inline(always)]
+fn quantize_subblock(values: &[f32]) -> ([i8; Q8_GROUP], [i16; 2], f32) {
+    debug_assert!(values.len() <= Q8_GROUP);
+    let mut codes = [0i8; Q8_GROUP];
+    let d = if values.is_empty() {
+        0.0
+    } else {
+        quantize_group::<F32Grid>(values, &mut codes[..values.len()])
+    };
+    let sums = [sum_16(&codes[..16]), sum_16(&codes[16..32])];
+    (codes, sums, d)
 }
 
 /// Tiles of `m` activation rows of `blocks` blocks each: `[row group][block]`.

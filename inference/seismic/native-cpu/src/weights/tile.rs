@@ -517,6 +517,40 @@ pub(super) unsafe fn tile<C: Codes, K: Coefficients, const STORAGE: usize, V: Ve
             rows[r] = rows[0];
         }
         for b in 0..blocks {
+            #[cfg(target_arch = "x86_64")]
+            {
+                use std::arch::x86_64::{_MM_HINT_T0, _mm_prefetch};
+                if b + 1 < blocks {
+                    let next_g = (b + 1) * (Q8_BLOCK / STORAGE);
+                    if tiled {
+                        let next = At::group(&rows[0], next_g);
+                        next.prefetch_codes();
+                        let scales = next.plane(RowPlaneRole::Scales);
+                        if !scales.is_null() {
+                            unsafe { _mm_prefetch::<_MM_HINT_T0>(scales.cast()) };
+                        }
+                    } else {
+                        for row in &rows[..live] {
+                            let next = At::group(row, next_g);
+                            next.prefetch_codes();
+                            let scales = next.plane(RowPlaneRole::Scales);
+                            if !scales.is_null() {
+                                unsafe { _mm_prefetch::<_MM_HINT_T0>(scales.cast()) };
+                            }
+                        }
+                    }
+                } else if group + 8 < n {
+                    let next_live = (n - (group + 8)).min(8);
+                    let next_rows = geometry.rows::<8>(first.wrapping_add((group + 8) * geometry.stride));
+                    if tiled {
+                        At::group(&next_rows[0], 0).prefetch_codes();
+                    } else {
+                        for row in &next_rows[..next_live] {
+                            At::group(row, 0).prefetch_codes();
+                        }
+                    }
+                }
+            }
             let packets = block_packets(b, k).len();
             unsafe { K::tile_side::<STORAGE, V>(&rows, b, packets, tiled, &mut side) };
             #[cfg(target_arch = "x86_64")]

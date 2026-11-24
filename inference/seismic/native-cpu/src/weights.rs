@@ -920,6 +920,22 @@ impl<'a> At<'a> {
         CodeBytes::Lanes(self.lanes_and_high()[role])
     }
 
+    /// Software-prefetch the codes cache line(s) for this packet on x86_64.
+    #[cfg(target_arch = "x86_64")]
+    #[inline(always)]
+    pub(super) fn prefetch_codes(self) {
+        use std::arch::x86_64::{_MM_HINT_T0, _mm_prefetch};
+        unsafe {
+            match self.code(RowPlaneRole::Codes) {
+                CodeBytes::Packet(ptr) | CodeBytes::Panel(ptr) => _mm_prefetch::<_MM_HINT_T0>(ptr.cast()),
+                CodeBytes::Lanes(lanes) => {
+                    _mm_prefetch::<_MM_HINT_T0>(lanes.pairs[0].cast());
+                    _mm_prefetch::<_MM_HINT_T0>(lanes.pairs[1].cast());
+                }
+            }
+        }
+    }
+
     /// The first byte of grid entry `e` (of four) of this packet, entries of
     /// `bytes` bytes: one after another in a grids plane, a `records`
     /// tile's at `record_entry`.
@@ -1328,13 +1344,13 @@ pub trait Codes: Copy + Send + Sync + 'static {
     /// entries are none.
     const PANEL: Option<PanelCodes> = None;
 
-    /// Where an `mma16` tile's codes are 4-bit lanes (with a high plane of
-    /// `HIGH` bits a code, at most 2) whose joined raw code `r` is the value
-    /// `r + offset`: `(HIGH, offset)`, which a 16-row tile's quantized dot
-    /// reads with no unpermuting (`Hier::dot_tile16`). None for any other
-    /// codes.
+    /// Where an `mma16` tile's codes are 2-bit or 4-bit lanes (with a high
+    /// plane of `HIGH` bits a code, at most 2) whose joined raw code `r` is
+    /// the value `r + offset`: `(LOW, HIGH, offset)`, which a 16-row tile's
+    /// quantized dot reads with no unpermuting (`Hier::dot_tile16`). None for
+    /// any other codes.
     #[cfg(target_arch = "x86_64")]
-    const NIBBLE_LANES: Option<(u32, i32)> = None;
+    const NIBBLE_LANES: Option<(u32, u32, i32)> = None;
 
     /// The values of packet `at`, in element order.
     ///
@@ -1692,14 +1708,18 @@ impl<const LOW: u32, const HIGH: u32, I, const LEAST: i32, const GREATEST: i32>
     #[cfg(target_arch = "x86_64")]
     #[inline(always)]
     unsafe fn raw_x86_pair(at: At) -> [std::arch::x86_64::__m256i; 2] {
-        if !at.in_lanes() || LOW != 4 {
+        if !at.in_lanes() || (LOW != 4 && LOW != 2) {
             return unsafe { [Self::raw_x86(at), Self::raw_x86(at.packet(at.packet + 1))] };
         }
         let [low, high] = at.lanes_and_high();
+        let codes = if LOW == 4 {
+            unsafe { packed_x86::block_nibbles(low) }
+        } else {
+            unsafe { packed_x86::block_two_bits(low) }
+        };
         match HIGH {
-            0 => unsafe { packed_x86::block_nibbles(low) },
+            0 => codes,
             _ => unsafe {
-                let codes = packed_x86::block_nibbles(low);
                 [
                     packed_x86::with_high::<LOW>(codes[0], Lanes { half: 0, ..high }, HIGH),
                     packed_x86::with_high::<LOW>(codes[1], Lanes { half: 1, ..high }, HIGH),
@@ -1743,11 +1763,15 @@ impl<const LOW: u32, const HIGH: u32, I, const LEAST: i32, const GREATEST: i32>
     #[cfg(target_arch = "x86_64")]
     #[inline(always)]
     unsafe fn raw_x86_partners(g: At, partner: At) -> [[std::arch::x86_64::__m256i; 2]; 2] {
-        if !g.in_lanes() || LOW != 4 {
+        if !g.in_lanes() || (LOW != 4 && LOW != 2) {
             return unsafe { [Self::raw_x86_pair(g), Self::raw_x86_pair(partner)] };
         }
         let [low, high] = g.lanes_and_high();
-        let codes = unsafe { packed_x86::block_partners(low) };
+        let codes = if LOW == 4 {
+            unsafe { packed_x86::block_partners(low) }
+        } else {
+            unsafe { packed_x86::block_two_bits_partners(low) }
+        };
         match HIGH {
             0 => codes,
             _ => {
@@ -1780,8 +1804,8 @@ impl<const LOW: u32, const HIGH: u32, I: ByteValues<LOW, HIGH>, const LEAST: i32
     const GREATEST: i32 = Self::DOMAIN.1;
     const PANEL: Option<PanelCodes> = Some(PanelCodes { low: LOW, high: HIGH, values: I::VALUES });
     #[cfg(target_arch = "x86_64")]
-    const NIBBLE_LANES: Option<(u32, i32)> = match I::VALUES {
-        CodeValues::Affine { double: false, offset } if LOW == 4 && HIGH <= 2 => Some((HIGH, offset as i32)),
+    const NIBBLE_LANES: Option<(u32, u32, i32)> = match I::VALUES {
+        CodeValues::Affine { double: false, offset } if (LOW == 4 || LOW == 2) && HIGH <= 2 => Some((LOW, HIGH, offset as i32)),
         _ => None,
     };
 
@@ -2010,23 +2034,42 @@ impl<
     /// signs (`GridSigns::lanes4`) and its delta bit.
     #[inline(always)]
     unsafe fn parts(at: At) -> ([u64; 4], u32, u32) {
+        const {
+            let len = match Self::POINTS {
+                tables::GridPoints::Lanes8(table) => table.len(),
+                tables::GridPoints::Lanes4(table) => table.len(),
+            };
+            assert!(len >= (1usize << INDEX_BITS), "grid table covers all index bits");
+        }
         let mask = (1u32 << INDEX_BITS) - 1;
         let entries = unsafe { grid_entries::<BYTES, HIGH>(at) };
         let (mut points, mut signs, mut deltas) = ([0u64; 4], 0u32, 0u32);
-        for (e, entry) in entries.into_iter().enumerate() {
-            // The point and the entry's bits past its indices.
-            let (point, rest) = match Self::POINTS {
-                tables::GridPoints::Lanes8(points) => (points[(entry & mask) as usize], entry >> INDEX_BITS),
-                tables::GridPoints::Lanes4(points) => (
-                    u64::from(points[(entry & mask) as usize])
-                        | (u64::from(points[((entry >> INDEX_BITS) & mask) as usize]) << 32),
-                    entry >> (2 * INDEX_BITS),
-                ),
-            };
-            points[e] = point;
-            signs |= (rest & Self::SIGN_MASK) << (8 * e);
-            if D::BITS > 0 {
-                deltas |= ((rest >> Self::SIGN_BITS) & 1) << (8 * e);
+        match Self::POINTS {
+            tables::GridPoints::Lanes8(table) => {
+                let base = table.as_ptr();
+                for (e, entry) in entries.into_iter().enumerate() {
+                    // SAFETY: `(entry & mask) < (1 << INDEX_BITS) <= table.len()` (asserted above).
+                    points[e] = unsafe { *base.add((entry & mask) as usize) };
+                    let rest = entry >> INDEX_BITS;
+                    signs |= (rest & Self::SIGN_MASK) << (8 * e);
+                    if D::BITS > 0 {
+                        deltas |= ((rest >> Self::SIGN_BITS) & 1) << (8 * e);
+                    }
+                }
+            }
+            tables::GridPoints::Lanes4(table) => {
+                let base = table.as_ptr();
+                for (e, entry) in entries.into_iter().enumerate() {
+                    // SAFETY: both masked indices are `< (1 << INDEX_BITS) <= table.len()` (asserted above).
+                    let lo = unsafe { *base.add((entry & mask) as usize) };
+                    let hi = unsafe { *base.add(((entry >> INDEX_BITS) & mask) as usize) };
+                    points[e] = u64::from(lo) | (u64::from(hi) << 32);
+                    let rest = entry >> (2 * INDEX_BITS);
+                    signs |= (rest & Self::SIGN_MASK) << (8 * e);
+                    if D::BITS > 0 {
+                        deltas |= ((rest >> Self::SIGN_BITS) & 1) << (8 * e);
+                    }
+                }
             }
         }
         (points, Self::SIGNED.lanes4(signs), deltas)
@@ -2042,32 +2085,61 @@ impl<
 unsafe fn grid_entries<const BYTES: usize, const HIGH: u32>(at: At) -> [u32; 4] {
     const {
         assert!(
-            BYTES <= 3 && HIGH <= 8 && HIGH % 2 == 0,
+            BYTES >= 1 && BYTES <= 3 && HIGH <= 8 && HIGH.is_multiple_of(2),
             "an entry's whole bytes fit a word with its further bits, a packet's further bits whole bytes"
         )
     };
-    // The entries' whole bytes, entry `e`'s from byte `BYTES e`: a grids
-    // plane's one after another, a records tile's each where it lies.
-    let mut low = [0u8; 16];
-    if at.row.record.is_none() {
-        unsafe { std::ptr::copy_nonoverlapping(at.entry(0, BYTES), low.as_mut_ptr(), 4 * BYTES) };
+    let mut entries = if at.row.record.is_none() {
+        let ptr = at.entry(0, BYTES);
+        match BYTES {
+            1 => {
+                let w = unsafe { ptr.cast::<u32>().read_unaligned() }.to_le();
+                [w & 0xff, (w >> 8) & 0xff, (w >> 16) & 0xff, w >> 24]
+            }
+            2 => {
+                let w = unsafe { ptr.cast::<u64>().read_unaligned() }.to_le();
+                [
+                    (w & 0xffff) as u32,
+                    ((w >> 16) & 0xffff) as u32,
+                    ((w >> 32) & 0xffff) as u32,
+                    (w >> 48) as u32,
+                ]
+            }
+            _ => {
+                let lo = unsafe { ptr.cast::<u64>().read_unaligned() }.to_le();
+                let hi = unsafe { ptr.add(8).cast::<u32>().read_unaligned() }.to_le();
+                [
+                    (lo & 0xff_ffff) as u32,
+                    ((lo >> 24) & 0xff_ffff) as u32,
+                    ((lo >> 48) as u32) | ((hi & 0xff) << 16),
+                    hi >> 8,
+                ]
+            }
+        }
     } else {
-        for e in 0..4 {
-            unsafe { std::ptr::copy_nonoverlapping(at.entry(e, BYTES), low.as_mut_ptr().add(BYTES * e), BYTES) };
+        std::array::from_fn(|e| {
+            let p = at.entry(e, BYTES);
+            match BYTES {
+                1 => u32::from(unsafe { *p }),
+                2 => u32::from(unsafe { p.cast::<u16>().read_unaligned() }.to_le()),
+                _ => u32::from(unsafe { p.cast::<u16>().read_unaligned() }.to_le()) | (u32::from(unsafe { *p.add(2) }) << 16),
+            }
+        })
+    };
+    if HIGH > 0 {
+        let hp = packet_bytes(at, RowPlaneRole::High);
+        let high = match HIGH {
+            2 => u32::from(unsafe { *hp }),
+            4 => u32::from(unsafe { hp.cast::<u16>().read_unaligned() }.to_le()),
+            6 => u32::from(unsafe { hp.cast::<u16>().read_unaligned() }.to_le()) | (u32::from(unsafe { *hp.add(2) }) << 16),
+            _ => unsafe { hp.cast::<u32>().read_unaligned() }.to_le(),
+        };
+        let high_mask = (1u32 << HIGH) - 1;
+        for (e, entry) in entries.iter_mut().enumerate() {
+            *entry |= ((high >> (HIGH as usize * e)) & high_mask) << (8 * BYTES);
         }
     }
-    let low = u128::from_le_bytes(low);
-    let mut high = [0u8; 4];
-    if HIGH > 0 {
-        unsafe {
-            std::ptr::copy_nonoverlapping(packet_bytes(at, RowPlaneRole::High), high.as_mut_ptr(), HIGH as usize / 2)
-        };
-    }
-    let high = u32::from_le_bytes(high);
-    let (low_mask, high_mask) = ((1u64 << (8 * BYTES)) - 1, (1u32 << HIGH) - 1);
-    std::array::from_fn(|e| {
-        ((low >> (8 * BYTES * e)) as u64 & low_mask) as u32 | (((high >> (HIGH as usize * e)) & high_mask) << (8 * BYTES))
-    })
+    entries
 }
 
 /// The eight values one grid entry gives: `point`'s bytes (byte `j` lane
@@ -2525,7 +2597,7 @@ unsafe fn permuted_activations(x: *const i8) -> [std::arch::x86_64::__m256i; 2] 
 /// `2j + 1`).
 #[cfg(target_arch = "x86_64")]
 #[inline(always)]
-unsafe fn high_bits(bytes: *const u8, high: u32) -> [std::arch::x86_64::__m256i; 2] {
+unsafe fn high_bits(bytes: *const u8, low: u32, high: u32) -> [std::arch::x86_64::__m256i; 2] {
     use std::arch::x86_64::*;
     unsafe {
         match high {
@@ -2543,11 +2615,12 @@ unsafe fn high_bits(bytes: *const u8, high: u32) -> [std::arch::x86_64::__m256i;
                 let lanes = _mm256_set1_epi64x(std::ptr::read_unaligned(bytes.cast::<i64>()));
                 let spread = _mm256_shuffle_epi8(lanes, _mm256_loadu_si256(SPREAD.as_ptr().cast()));
                 // Byte j of a step: bits 2j (row g) and 2j + 1 (row g + 8).
+                let bit = _mm256_set1_epi8(1i8 << low);
                 let mut rows = [_mm256_setzero_si256(); 2];
                 for (upper, first) in [1i32, 2].into_iter().enumerate() {
                     let bits = _mm256_set1_epi32(first | first << 10 | first << 20 | first << 30);
                     let set = _mm256_cmpeq_epi8(_mm256_and_si256(spread, bits), bits);
-                    rows[upper] = _mm256_and_si256(set, _mm256_set1_epi8(0x10));
+                    rows[upper] = _mm256_and_si256(set, bit);
                 }
                 rows
             }
@@ -2581,7 +2654,11 @@ unsafe fn high_bits(bytes: *const u8, high: u32) -> [std::arch::x86_64::__m256i;
                 let two = _mm256_set1_epi8(0x03);
                 let first = _mm256_and_si256(nibbles, two);
                 let second = _mm256_and_si256(_mm256_srli_epi16::<2>(nibbles), two);
-                [_mm256_slli_epi16::<4>(first), _mm256_slli_epi16::<4>(second)]
+                if low == 4 {
+                    [_mm256_slli_epi16::<4>(first), _mm256_slli_epi16::<4>(second)]
+                } else {
+                    [_mm256_slli_epi16::<2>(first), _mm256_slli_epi16::<2>(second)]
+                }
             }
             _ => unreachable!("a high plane of at most 2 bits"),
         }
@@ -3669,12 +3746,27 @@ impl<F: Scale, const EXPONENT: i32, const CODE_EXPONENT: i32, L: Locals, const G
                 use std::arch::x86_64::*;
                 // The pair products take one 16-bit scale code per half.
                 let shift = const { packed_x86::row_shift::<C>() };
+                // Prefetch the next storage group's codes and scales (a hint, never a fault).
+                for row in rows {
+                    let next = At::group(row, b + 1);
+                    next.prefetch_codes();
+                    let scales = next.plane(RowPlaneRole::Scales);
+                    if !scales.is_null() {
+                        _mm_prefetch::<_MM_HINT_T0>(scales.cast());
+                    }
+                }
                 // A k-block's two packets read together (`Codes::x86_pair`;
                 // the group's packets are whole k-blocks), of both rows of a
                 // pair at once: each packet as its unsigned operand and,
                 // without a shift, the signs its activations take.
-                for pair in packets_of(packets.div_ceil(2)) {
+                let pairs_count = packets.div_ceil(2);
+                for pair in packets_of(pairs_count) {
                     let first = 2 * pair;
+                    if pair + 1 < pairs_count {
+                        for group in groups {
+                            group.packet(first + 2).prefetch_codes();
+                        }
+                    }
                     let mut weights = [[[_mm256_setzero_si256(); 2]; 2]; N];
                     if N == 1 && C::MAGNITUDES {
                         weights[0] = C::x86_signed_pair(groups[0].packet(first));
@@ -3771,7 +3863,7 @@ impl<F: Scale, const EXPONENT: i32, const CODE_EXPONENT: i32, L: Locals, const G
         groups: &[std::arch::x86_64::__m256i; 2],
     ) -> [f32; 16] {
         use std::arch::x86_64::*;
-        let (high, offset) = C::NIBBLE_LANES.expect("nibble lanes");
+        let (low_bits, high, offset) = C::NIBBLE_LANES.expect("nibble lanes");
         let blocks = packets / 2;
         let mma16 = row.mma16.as_ref().expect("an mma16 tile");
         let first = (mma16.first_packet + b * mma16.group_packets) / 2;
@@ -3811,11 +3903,19 @@ impl<F: Scale, const EXPONENT: i32, const CODE_EXPONENT: i32, L: Locals, const G
                         for (pair, products) in products.iter_mut().enumerate() {
                             let g = 2 * pairs + pair;
                             // Lanes `4g + 2 half` and the next.
-                            let bytes = _mm256_loadu_si256(low[block][g].add(2 * half * low_plane.unit).cast());
-                            let mut first = _mm256_and_si256(bytes, nibble);
-                            let mut second = _mm256_and_si256(_mm256_srli_epi16::<4>(bytes), nibble);
+                            let (mut first, mut second) = if low_bits == 4 {
+                                let bytes = _mm256_loadu_si256(low[block][g].add(2 * half * low_plane.unit).cast());
+                                (_mm256_and_si256(bytes, nibble), _mm256_and_si256(_mm256_srli_epi16::<4>(bytes), nibble))
+                            } else {
+                                let packed = _mm_loadu_si128(low[block][g].add(2 * half * low_plane.unit).cast());
+                                let lo_nib = _mm_and_si128(packed, _mm_set1_epi8(0x0f));
+                                let hi_nib = _mm_and_si128(_mm_srli_epi16::<4>(packed), _mm_set1_epi8(0x0f));
+                                let unpacked = _mm256_set_m128i(_mm_unpackhi_epi8(lo_nib, hi_nib), _mm_unpacklo_epi8(lo_nib, hi_nib));
+                                let two = _mm256_set1_epi8(0x03);
+                                (_mm256_and_si256(unpacked, two), _mm256_and_si256(_mm256_srli_epi16::<2>(unpacked), two))
+                            };
                             if high > 0 {
-                                let [first_high, second_high] = high_bits(highs[block][g].add(2 * half * high_plane.unit), high);
+                                let [first_high, second_high] = high_bits(highs[block][g].add(2 * half * high_plane.unit), low_bits, high);
                                 first = _mm256_or_si256(first, first_high);
                                 second = _mm256_or_si256(second, second_high);
                             }
@@ -5567,6 +5667,68 @@ mod packed_x86 {
             [
                 [nibbles_of(first, false), nibbles_of(second, false)],
                 [nibbles_of(first, true), nibbles_of(second, true)],
+            ]
+        }
+    }
+
+    /// Both packets of an `mma16` 2-bit k-block of a row pair, each shuffled
+    /// into element-order bytes (each byte holding both rows `g` and `g + 8`,
+    /// at bits 0..2 / 2..4 for even slot pairs and bits 4..6 / 6..8 for odd):
+    /// two 128-bit loads for all four lanes instead of eight scalar loads.
+    #[inline(always)]
+    unsafe fn block_two_bits_bytes(lanes: Lanes) -> [__m256i; 2] {
+        unsafe {
+            // `first` = [t0_p0, t0_p1, t1_p0, t1_p1]; `second` = [t2_p0, t2_p1, t3_p0, t3_p1].
+            let first = _mm_castsi128_ps(_mm_loadu_si128(lanes.pairs[0].cast()));
+            let second = _mm_castsi128_ps(_mm_loadu_si128(lanes.pairs[1].cast()));
+            let p0 = _mm_castps_si128(_mm_shuffle_ps::<0x88>(first, second));
+            let p1 = _mm_castps_si128(_mm_shuffle_ps::<0xDD>(first, second));
+            let order = constant(&TWO_BITS);
+            [
+                _mm256_shuffle_epi8(_mm256_broadcastsi128_si256(p0), order),
+                _mm256_shuffle_epi8(_mm256_broadcastsi128_si256(p1), order),
+            ]
+        }
+    }
+
+    /// One row's 2-bit codes of a packet's shuffled bytes (`block_two_bits_bytes`):
+    /// row `g` (`UPPER == false`) or row `g + 8` (`UPPER == true`).
+    #[inline(always)]
+    unsafe fn two_bits_of<const UPPER: bool>(bytes: __m256i) -> __m256i {
+        unsafe {
+            let (low, high) = if UPPER {
+                (_mm256_srli_epi16::<2>(bytes), _mm256_srli_epi16::<6>(bytes))
+            } else {
+                (bytes, _mm256_srli_epi16::<4>(bytes))
+            };
+            let picked = _mm256_blendv_epi8(low, high, constant(&TWO_BIT_HIGH));
+            _mm256_and_si256(picked, _mm256_set1_epi8(3))
+        }
+    }
+
+    /// The row's 2-bit codes of both packets of an `mma16` k-block, each in
+    /// element order.
+    #[inline(always)]
+    pub(super) unsafe fn block_two_bits(lanes: Lanes) -> [__m256i; 2] {
+        unsafe {
+            let [first, second] = block_two_bits_bytes(lanes);
+            if lanes.upper {
+                [two_bits_of::<true>(first), two_bits_of::<true>(second)]
+            } else {
+                [two_bits_of::<false>(first), two_bits_of::<false>(second)]
+            }
+        }
+    }
+
+    /// [`block_two_bits`] of both rows of the pair (`g`, then `g + 8`), the
+    /// k-block's bytes read once.
+    #[inline(always)]
+    pub(super) unsafe fn block_two_bits_partners(lanes: Lanes) -> [[__m256i; 2]; 2] {
+        unsafe {
+            let [first, second] = block_two_bits_bytes(lanes);
+            [
+                [two_bits_of::<false>(first), two_bits_of::<false>(second)],
+                [two_bits_of::<true>(first), two_bits_of::<true>(second)],
             ]
         }
     }

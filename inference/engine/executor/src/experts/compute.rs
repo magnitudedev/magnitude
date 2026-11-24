@@ -38,95 +38,207 @@
 
 use super::site::{WorkerTurn, Site, SiteLayer};
 use super::source::Records;
-use seismic_io::Want;
+use seismic_io::{Deadline, Want};
 use std::collections::VecDeque;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::sync::{Arc, Condvar, Mutex};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use std::sync::{Arc, Condvar, Mutex, OnceLock};
 use std::thread::JoinHandle;
+use std::time::{Duration, Instant};
 
 /// Host work cut into pieces: each piece runs once, on any worker, in any
 /// order and concurrently with the others; then [`Self::end`] runs once,
 /// on the worker that completed the last piece. A worker takes its next
-/// piece from the most urgent job ([`Self::want`], read as it takes one,
-/// by `Want`'s order), in submission order among the equally urgent: the
-/// read engine's order, so a step's miss converts ahead of a hint's.
+/// piece from the most urgent job ([`Self::priority_key`], read lock-free as
+/// it takes one, matching `Want`'s order), in submission order among the
+/// equally urgent: the read engine's order, so a step's miss converts ahead
+/// of a hint's.
 pub(in crate::experts) trait Job: Send + Sync {
     fn pieces(&self) -> usize;
     fn piece(&self, index: usize);
     fn end(&self);
     fn want(&self) -> Want;
-    /// Whether a live decode step is actively waiting on this job; waited jobs
-    /// strictly preempt every non-waited job at the next piece boundary.
-    fn waited(&self) -> bool {
-        false
+    fn priority_key(&self) -> u64 {
+        Urgency::key_of(self.want(), false)
     }
 }
 
-struct UrgencyState {
-    want: Want,
-    waited: bool,
-    hastened_at: Option<std::time::Instant>,
+/// Process-wide monotonic epoch for packing `Instant` deadlines into `u64`.
+fn epoch() -> Instant {
+    static EPOCH: OnceLock<Instant> = OnceLock::new();
+    *EPOCH.get_or_init(Instant::now)
 }
+
+/// Monotonic counter bumped whenever an `ahead` `Urgency` is hastened to
+/// `due`, so `HostCompute::piece` only scans `ahead` for promoted jobs when
+/// a hasten actually occurred (0 overhead on the common `O(1)` `due` path).
+static HASTEN_EPOCH: AtomicU64 = AtomicU64::new(0);
+
+const CLASS_SHIFT: u32 = 62;
+const CLASS_DUE: u64 = 0 << CLASS_SHIFT;
+const CLASS_EXPECTED: u64 = 1 << CLASS_SHIFT;
+const CLASS_UNDATED: u64 = 2 << CLASS_SHIFT;
+const NOT_WAITED_BIT: u64 = 1 << 61;
+const PAYLOAD_MASK: u64 = (1u64 << 61) - 1;
+const EXPECTED_STEP_MAX: u64 = (1u64 << 37) - 1;
+const EXPECTED_VAL_MASK: u64 = (1u64 << 24) - 1;
 
 /// A job's want, which only grows more urgent, and whether a step waits
 /// on it: shared by its submitter, who may hasten it while it waits (a
 /// hint's landing, once a request names its expert), and the job.
-pub(in crate::experts) struct Urgency(Mutex<UrgencyState>);
+///
+/// Packed lock-free into an [`AtomicU64`] ordered identically to [`Want`]
+/// (smaller key = more urgent):
+/// - bits 63..62: class (`0` = Due, `1` = Expected, `2` = Undated)
+/// - bit 61: `0` when waited, `1` when ahead/unwaited
+/// - bits 60..0: deadline/step + inverted value
+pub(in crate::experts) struct Urgency {
+    key: AtomicU64,
+    /// Monotonic nanos since `epoch()` + 1 when first hastened from non-waited
+    /// to waited; `0` if never hastened.
+    hastened_nanos: AtomicU64,
+}
 
 impl Urgency {
+    /// Pack a `Want` and `waited` flag into its lock-free ordering key.
+    pub(in crate::experts) fn key_of(want: Want, waited: bool) -> u64 {
+        let not_waited = if waited { 0 } else { NOT_WAITED_BIT };
+        match want.deadline() {
+            Deadline::Parked(at) => {
+                let nanos = at.saturating_duration_since(epoch()).as_nanos() as u64;
+                CLASS_DUE | not_waited | ((nanos << 1) & PAYLOAD_MASK)
+            }
+            Deadline::Streamed(at) => {
+                let nanos = at.saturating_duration_since(epoch()).as_nanos() as u64;
+                CLASS_DUE | not_waited | (((nanos << 1) | 1) & PAYLOAD_MASK)
+            }
+            Deadline::Expected(step) => {
+                let step = step.min(EXPECTED_STEP_MAX);
+                let inv_val = (!(want.value().to_bits() >> 40)) & EXPECTED_VAL_MASK;
+                CLASS_EXPECTED | not_waited | (step << 24) | inv_val
+            }
+            Deadline::None => {
+                let inv_val = (!(want.value().to_bits() >> 3)) & PAYLOAD_MASK;
+                CLASS_UNDATED | not_waited | inv_val
+            }
+        }
+    }
+
+    /// Whether a packed priority key is in the `Due` class.
+    #[inline]
+    pub(in crate::experts) fn is_due_key(key: u64) -> bool {
+        (key >> CLASS_SHIFT) == 0
+    }
+
     /// A step's own: due now, waited on.
     pub(in crate::experts) fn waited() -> Arc<Self> {
-        Arc::new(Self(Mutex::new(UrgencyState { want: Want::now(), waited: true, hastened_at: None })))
+        Arc::new(Self {
+            key: AtomicU64::new(Self::key_of(Want::now(), true)),
+            hastened_nanos: AtomicU64::new(0),
+        })
     }
 
     /// A prompt conveyor's bulk landing: streamed priority, not waited on by
     /// a parked decode step so live decode demand strictly preempts it and
     /// `LandingAccount` does not bill prefill conversions to `demand`.
     pub(in crate::experts) fn streamed() -> Arc<Self> {
-        Arc::new(Self(Mutex::new(UrgencyState { want: Want::streamed(), waited: false, hastened_at: None })))
+        Arc::new(Self {
+            key: AtomicU64::new(Self::key_of(Want::streamed(), false)),
+            hastened_nanos: AtomicU64::new(0),
+        })
     }
 
     /// Ahead of any step's wait, wanted as `want`.
     pub(in crate::experts) fn ahead(want: Want) -> Arc<Self> {
-        Arc::new(Self(Mutex::new(UrgencyState { want, waited: false, hastened_at: None })))
+        Arc::new(Self {
+            key: AtomicU64::new(Self::key_of(want, false)),
+            hastened_nanos: AtomicU64::new(0),
+        })
+    }
+
+    /// Lock-free packed priority key (smaller = more urgent).
+    #[inline]
+    pub(in crate::experts) fn key(&self) -> u64 {
+        self.key.load(Ordering::Acquire)
     }
 
     pub(in crate::experts) fn get(&self) -> Want {
-        self.0.lock().expect("a job's urgency").want
+        let bits = self.key.load(Ordering::Acquire);
+        let payload = bits & PAYLOAD_MASK;
+        match bits & (0b11 << CLASS_SHIFT) {
+            CLASS_DUE => {
+                let nanos = payload >> 1;
+                let at = epoch() + Duration::from_nanos(nanos);
+                let deadline = if (payload & 1) == 0 { Deadline::Parked(at) } else { Deadline::Streamed(at) };
+                Want::new(deadline, 0.)
+            }
+            CLASS_EXPECTED => {
+                let step = payload >> 24;
+                let inv_val = payload & EXPECTED_VAL_MASK;
+                let value = f64::from_bits(((!inv_val) & EXPECTED_VAL_MASK) << 40);
+                Want::expected(step, value)
+            }
+            _ => {
+                let value = f64::from_bits(((!payload) & PAYLOAD_MASK) << 3);
+                Want::undated(value)
+            }
+        }
     }
 
     /// Whether a step waits on it.
+    #[inline]
     pub(in crate::experts) fn is_waited(&self) -> bool {
-        self.0.lock().expect("a job's urgency").waited
+        (self.key.load(Ordering::Acquire) & NOT_WAITED_BIT) == 0
     }
 
-    /// Whether a step waits on it, and when it was hastened from a hint (if
-    /// ever) so `LandingAccount` does not bill prior hint queue wait to
-    /// `demand.queued`.
-    pub(in crate::experts) fn waited_since(&self) -> (bool, Option<std::time::Instant>) {
-        let state = self.0.lock().expect("a job's urgency");
-        (state.waited, state.hastened_at)
+    /// Whether a step waits on it, and when it was hastened from an ahead
+    /// landing (if ever) so `LandingAccount` does not bill prior ahead queue
+    /// wait to `demand.queued`.
+    pub(in crate::experts) fn waited_since(&self) -> (bool, Option<Instant>) {
+        let waited = self.is_waited();
+        let nanos = self.hastened_nanos.load(Ordering::Acquire);
+        let hastened_at = (nanos != 0).then(|| epoch() + Duration::from_nanos(nanos - 1));
+        (waited, hastened_at)
     }
 
     /// Its read is repriced as `want` (the ledger's aggregate): a job no step
     /// waits on follows its read's want, up or down; one a step waits on
     /// stays due.
     pub(in crate::experts) fn set(&self, want: Want) {
-        let mut state = self.0.lock().expect("a job's urgency");
-        if !state.waited {
-            state.want = want;
+        let next = Self::key_of(want, false);
+        let mut cur = self.key.load(Ordering::Acquire);
+        loop {
+            if (cur & NOT_WAITED_BIT) == 0 {
+                return;
+            }
+            match self.key.compare_exchange_weak(cur, next, Ordering::AcqRel, Ordering::Acquire) {
+                Ok(_) => {
+                    if Self::is_due_key(next) && !Self::is_due_key(cur) {
+                        HASTEN_EPOCH.fetch_add(1, Ordering::Release);
+                    }
+                    return;
+                }
+                Err(actual) => cur = actual,
+            }
         }
     }
 
     /// A step waits on it from now: due, if not due before. Records the
-    /// hasten timestamp on the first transition to waited so prior hint wait
+    /// hasten timestamp on the first transition to waited so prior ahead wait
     /// is not mis-billed to `demand.queued`.
     pub(in crate::experts) fn hasten(&self) {
-        let mut state = self.0.lock().expect("a job's urgency");
-        state.want = state.want.min(Want::now());
-        if !state.waited {
-            state.waited = true;
-            state.hastened_at = Some(std::time::Instant::now());
+        let key = Self::key_of(Want::now(), true);
+        let prev = self.key.fetch_min(key, Ordering::AcqRel);
+        if (prev & NOT_WAITED_BIT) != 0 {
+            let nanos = Instant::now().saturating_duration_since(epoch()).as_nanos() as u64;
+            let _ = self.hastened_nanos.compare_exchange(
+                0,
+                nanos.saturating_add(1),
+                Ordering::Release,
+                Ordering::Relaxed,
+            );
+        }
+        if !Self::is_due_key(prev) {
+            HASTEN_EPOCH.fetch_add(1, Ordering::Release);
         }
     }
 }
@@ -337,13 +449,53 @@ struct Running {
     done: AtomicUsize,
 }
 
+/// Priority-bucketed job queues: `due` jobs are popped in O(1) without
+/// scanning `ahead` background jobs.
+#[derive(Default)]
+struct JobQueues {
+    due: VecDeque<Arc<Running>>,
+    ahead: VecDeque<Arc<Running>>,
+    seen_hasten: u64,
+}
+
+impl JobQueues {
+    fn clear(&mut self) {
+        self.due.clear();
+        self.ahead.clear();
+    }
+
+    fn push_due(&mut self, running: Arc<Running>, key: u64) {
+        // Common case: deadlines are monotonically non-decreasing, so O(1) push_back.
+        if self.due.back().is_none_or(|back| back.job.priority_key() <= key) {
+            self.due.push_back(running);
+        } else {
+            let pos = self.due.iter().position(|j| j.job.priority_key() > key).unwrap_or(self.due.len());
+            self.due.insert(pos, running);
+        }
+    }
+
+    #[cfg(test)]
+    fn is_empty(&self) -> bool {
+        self.due.is_empty() && self.ahead.is_empty()
+    }
+
+    #[cfg(test)]
+    fn iter(&self) -> impl Iterator<Item = &Arc<Running>> {
+        self.due.iter().chain(self.ahead.iter())
+    }
+}
+
 /// What the workers share.
 struct Inner {
     site: Site,
-    jobs: Mutex<VecDeque<Arc<Running>>>,
-    /// The jobs queued, read before taking `jobs`' lock, so spinning
-    /// workers poll no lock while nothing is queued.
+    workers: usize,
+    jobs: Mutex<JobQueues>,
+    /// The jobs queued across `due` and `ahead`, read before taking `jobs`'
+    /// lock, so spinning workers poll no lock while nothing is queued.
     queued: AtomicUsize,
+    /// Background (`ahead`) jobs currently queued, used to bound opportunistic
+    /// background submissions (`land_conveyed`) so they never backlog demand.
+    ahead_queued: AtomicUsize,
     /// The flights with site work issued ([`Flight`]).
     flights: AtomicUsize,
     /// What a parked worker waits on: a job submitted, a flight issued, the
@@ -389,8 +541,14 @@ impl HostCompute {
         let count = threads.count();
         let inner = Arc::new(Inner {
             site: Site::new(layers, threads)?,
-            jobs: Mutex::new(VecDeque::new()),
+            workers: count,
+            jobs: Mutex::new(JobQueues {
+                due: VecDeque::new(),
+                ahead: VecDeque::new(),
+                seen_hasten: HASTEN_EPOCH.load(Ordering::Acquire),
+            }),
             queued: AtomicUsize::new(0),
+            ahead_queued: AtomicUsize::new(0),
             flights: AtomicUsize::new(0),
             rest: Mutex::new(()),
             wake: Condvar::new(),
@@ -469,6 +627,7 @@ impl Drop for HostCompute {
         }
         self.inner.jobs.lock().expect("compute jobs").clear();
         self.inner.queued.store(0, Ordering::Release);
+        self.inner.ahead_queued.store(0, Ordering::Release);
         // The placement drops after this, the workers joined: the process's
         // threads go back on every CPU.
     }
@@ -512,9 +671,31 @@ impl Compute {
         if self.inner.stop.load(Ordering::Acquire) {
             return;
         }
-        self.inner.jobs.lock().expect("compute jobs").push_back(running);
+        {
+            let mut jobs = self.inner.jobs.lock().expect("compute jobs");
+            // Capture priority_key under the queue lock so a concurrent
+            // hasten() cannot bump HASTEN_EPOCH before a stale key is pushed
+            // into `jobs.ahead`.
+            let key = running.job.priority_key();
+            if Urgency::is_due_key(key) {
+                jobs.push_due(running, key);
+            } else {
+                jobs.ahead.push_back(running);
+                self.inner.ahead_queued.fetch_add(1, Ordering::AcqRel);
+            }
+        }
         self.inner.queued.fetch_add(1, Ordering::AcqRel);
         self.inner.wake.notify_all();
+    }
+
+    /// Background (`ahead`) jobs currently queued on the executor.
+    pub(in crate::experts) fn ahead_queued(&self) -> usize {
+        self.inner.ahead_queued.load(Ordering::Acquire)
+    }
+
+    /// Worker thread count of this executor.
+    pub(in crate::experts) fn workers(&self) -> usize {
+        self.inner.workers
     }
 
     /// Each group's tier records `views` address from now (a shrink's,
@@ -699,23 +880,77 @@ fn work(inner: &Inner, worker: usize) {
 }
 
 /// Run one piece of the most urgent job with a piece left (the first
-/// submitted among the equally urgent, [`Job::priority`]), its end after
-/// its last. True when it ran one.
+/// submitted among the equally urgent), its end after its last. `due` jobs
+/// pop in O(1) without scanning `ahead` jobs. True when it ran one.
 fn piece(inner: &Inner) -> bool {
     if inner.queued.load(Ordering::Acquire) == 0 {
         return false;
     }
-    let (running, index) = {
+    let taken = {
         let mut jobs = inner.jobs.lock().expect("compute jobs");
-        // Pieces are taken only under the lock: a job whose every piece is
-        // taken leaves the queue.
-        let queued = jobs.len();
-        jobs.retain(|job| job.next.load(Ordering::Acquire) < job.pieces);
-        inner.queued.fetch_sub(queued - jobs.len(), Ordering::AcqRel);
-        let Some(urgent) = jobs.iter().min_by_key(|job| (!job.job.waited(), job.job.want())).cloned() else { return false };
-        let index = urgent.next.fetch_add(1, Ordering::AcqRel);
-        (urgent, index)
+        let hasten = HASTEN_EPOCH.load(Ordering::Acquire);
+        if hasten != jobs.seen_hasten {
+            jobs.seen_hasten = hasten;
+            let mut i = 0;
+            while i < jobs.ahead.len() {
+                let key = jobs.ahead[i].job.priority_key();
+                if Urgency::is_due_key(key) {
+                    let promoted = jobs.ahead.remove(i).expect("index in bounds");
+                    inner.ahead_queued.fetch_sub(1, Ordering::AcqRel);
+                    jobs.push_due(promoted, key);
+                } else {
+                    i += 1;
+                }
+            }
+        }
+        let mut pick: Option<(Arc<Running>, usize)> = None;
+        // O(1) pop from `due` queue.
+        while let Some(front) = jobs.due.front() {
+            let index = front.next.fetch_add(1, Ordering::AcqRel);
+            if index < front.pieces {
+                let running = front.clone();
+                if index + 1 == front.pieces {
+                    jobs.due.pop_front();
+                    inner.queued.fetch_sub(1, Ordering::AcqRel);
+                }
+                pick = Some((running, index));
+                break;
+            }
+            jobs.due.pop_front();
+            inner.queued.fetch_sub(1, Ordering::AcqRel);
+        }
+        // Only when `due` is empty, select the most urgent `ahead` job via
+        // lock-free atomic priority keys.
+        if pick.is_none() {
+            let mut best: Option<(usize, u64)> = None;
+            let mut i = 0;
+            while i < jobs.ahead.len() {
+                if jobs.ahead[i].next.load(Ordering::Acquire) >= jobs.ahead[i].pieces {
+                    jobs.ahead.remove(i);
+                    inner.ahead_queued.fetch_sub(1, Ordering::AcqRel);
+                    inner.queued.fetch_sub(1, Ordering::AcqRel);
+                    continue;
+                }
+                let key = jobs.ahead[i].job.priority_key();
+                if best.is_none_or(|(_, best_key)| key < best_key) {
+                    best = Some((i, key));
+                }
+                i += 1;
+            }
+            if let Some((idx, _)) = best {
+                let running = jobs.ahead[idx].clone();
+                let index = running.next.fetch_add(1, Ordering::AcqRel);
+                if index + 1 >= running.pieces {
+                    jobs.ahead.remove(idx);
+                    inner.ahead_queued.fetch_sub(1, Ordering::AcqRel);
+                    inner.queued.fetch_sub(1, Ordering::AcqRel);
+                }
+                pick = Some((running, index));
+            }
+        }
+        pick
     };
+    let Some((running, index)) = taken else { return false };
     work_piece(&running, index);
     true
 }

@@ -69,7 +69,7 @@ use magnitude_family_contracts::GluLimit;
 use magnitude_kernels::constants;
 use magnitude_kernels::cpu_library::cpu::lib::core::functions;
 use magnitude_kernels::cpu_library::cpu::lib::projection::projection;
-use seismic::cpu::quant::{self, Q8Block};
+use seismic::cpu::quant::{self, Q8Block, Q8Tile};
 use seismic::cpu::{F32, Weights};
 use std::cell::UnsafeCell;
 use std::collections::{BTreeMap, BTreeSet};
@@ -503,6 +503,8 @@ impl SiteLayer {
                     down: tensors.down.weights(record),
                     at: 0,
                     rows: 1,
+                    x_tiles_at: None,
+                    down_tiles_at: None,
                 }),
             }
         }
@@ -514,13 +516,16 @@ impl SiteLayer {
             expert.rows = 0;
         }
         work.entry_rows.resize(named, (0, 0.0));
+        work.entry_experts.resize(named, 0);
         for &Requested { row, record, weight, expert } in &work.requested {
-            let entry = work
+            let (index, entry) = work
                 .experts
                 .iter_mut()
-                .find(|named| (named.record, named.expert) == (record, expert))
+                .enumerate()
+                .find(|(_, named)| (named.record, named.expert) == (record, expert))
                 .expect("expert added in first pass");
             work.entry_rows[entry.at + entry.rows] = (row, weight);
+            work.entry_experts[entry.at + entry.rows] = index;
             entry.rows += 1;
         }
         work.ensure_buffers();
@@ -715,6 +720,12 @@ struct Expert {
     at: usize,
     /// How many rows of the request name it.
     rows: usize,
+    /// Starting index in [`Work::x_tiles`] when `rows > 1` and gate/up take
+    /// tiled q8 activations (`Weights::tiled`), else `None`.
+    x_tiles_at: Option<usize>,
+    /// Starting index in [`Work::q_tiles`] when `rows > 1` and down takes
+    /// tiled q8 activations (`Weights::tiled`), else `None`.
+    down_tiles_at: Option<usize>,
 }
 
 /// A request's stages, in order (module docs): gather, expand, join, then
@@ -978,12 +989,16 @@ struct Work {
     /// Every expert's `(row, routing_weight)` entries laid out contiguously
     /// (`Expert::at..Expert::at + Expert::rows`).
     entry_rows: Vec<(usize, f32)>,
+    /// Expert index in `experts` owning each entry in `entry_rows`.
+    entry_experts: Vec<usize>,
     /// Every expert's rows' activations `[rows, H]`, expert after expert
     /// (`Expert::at`), each gathered from the input by its gather unit, and
     /// their q8 blocks (`[rows, blocks(H)]`), as a projection of several
     /// rows reads them (`projection::project_arithmetic`).
     x: Vec<UnsafeCell<f32>>,
     x8: Vec<UnsafeCell<Q8Block>>,
+    /// Tiled q8 activations for experts with `Expert::x_tiles_at.is_some()`.
+    x_tiles: Vec<UnsafeCell<Q8Tile>>,
     /// Every expert's rows' products `[rows, F]`, expert after expert
     /// (`Expert::at`): each whole tile's written by its expand unit, each
     /// split tile's by the join unit of its block.
@@ -993,8 +1008,14 @@ struct Work {
     /// sums, which the join joins.
     partials: Vec<UnsafeCell<Partial>>,
     /// Every expert's rows' products quantized (`[rows, blocks(F)]`), each
-    /// block of an expert's rows by its join unit.
+    /// block of an expert's rows by its join unit (or inline in expand when
+    /// `no_k_split` is set).
     quantized: Vec<UnsafeCell<Q8Block>>,
+    /// Tiled quantized products for experts with `Expert::down_tiles_at.is_some()`.
+    q_tiles: Vec<UnsafeCell<Q8Tile>>,
+    /// Whether `expand` assigns whole `Q8_GROUP`s across `(expert, group)`
+    /// without K-splitting, activating and quantizing inline and skipping `JOIN`.
+    no_k_split: bool,
     /// Reusable per-worker scratch buffers for the `expand` and `project`
     /// stages (each worker index is claimed by at most one thread per stage,
     /// and stages never overlap).
@@ -1071,11 +1092,15 @@ impl Work {
             requested: Vec::new(),
             experts: Vec::new(),
             entry_rows: Vec::new(),
+            entry_experts: Vec::new(),
             x: Vec::new(),
             x8: Vec::new(),
+            x_tiles: Vec::new(),
             products: Vec::new(),
             partials: Vec::new(),
             quantized: Vec::new(),
+            q_tiles: Vec::new(),
+            no_k_split: false,
             scratch: (0..workers).map(|_| UnsafeCell::default()).collect(),
             workers,
             shape,
@@ -1087,28 +1112,119 @@ impl Work {
     fn ensure_buffers(&mut self) {
         let rows = self.entry_rows.len();
         let shape = self.shape;
+        let hidden_blocks = quant::blocks(shape.hidden);
+        let feat_blocks = quant::blocks(shape.features);
+        let total_groups = self.experts.len() * shape.features.div_ceil(quant::Q8_GROUP);
+        self.no_k_split = total_groups >= 2 * self.workers;
+
         let x_len = rows * shape.hidden;
         if self.x.len() < x_len {
             self.x.resize_with(x_len, || UnsafeCell::new(0.0));
         }
-        let x8_len = rows * quant::blocks(shape.hidden);
-        if self.x8.len() < x8_len {
-            self.x8.resize_with(x8_len, || UnsafeCell::new(Q8Block::ZERO));
+        if !self.no_k_split {
+            let partials_len = self.experts.len() * self.workers * 2;
+            if self.partials.len() < partials_len {
+                self.partials.resize_with(partials_len, UnsafeCell::default);
+            }
+            for partial in &mut self.partials[..partials_len] {
+                partial.get_mut().tile = None;
+            }
         }
-        let products_len = rows * shape.features;
-        if self.products.len() < products_len {
-            self.products.resize_with(products_len, || UnsafeCell::new(0.0));
+
+        let mut x_tiles_len = 0usize;
+        let mut q_tiles_len = 0usize;
+        let mut need_x8 = false;
+        let mut need_quantized = false;
+        let mut need_products = !self.no_k_split;
+        for expert in &mut self.experts {
+            if expert.rows > 1 && expert.up.tiled() && expert.gate.as_ref().is_none_or(|g| g.tiled()) {
+                expert.x_tiles_at = Some(x_tiles_len);
+                x_tiles_len += quant::tiles(expert.rows, hidden_blocks);
+                if !self.no_k_split {
+                    need_x8 = true;
+                }
+            } else {
+                expert.x_tiles_at = None;
+                need_x8 = true;
+            }
+            if expert.rows > 1 && expert.down.tiled() {
+                expert.down_tiles_at = Some(q_tiles_len);
+                q_tiles_len += quant::tiles(expert.rows, feat_blocks);
+            } else {
+                expert.down_tiles_at = None;
+                need_products = true;
+                if expert.down.quantized() {
+                    need_quantized = true;
+                }
+            }
         }
-        let partials_len = self.experts.len() * self.workers * 2;
-        if self.partials.len() < partials_len {
-            self.partials.resize_with(partials_len, UnsafeCell::default);
+        if need_products {
+            let products_len = rows * shape.features;
+            if self.products.len() < products_len {
+                self.products.resize_with(products_len, || UnsafeCell::new(0.0));
+            }
         }
-        for partial in &mut self.partials[..partials_len] {
-            partial.get_mut().tile = None;
+        if need_x8 {
+            let x8_len = rows * hidden_blocks;
+            if self.x8.len() < x8_len {
+                self.x8.resize_with(x8_len, || UnsafeCell::new(Q8Block::ZERO));
+            }
+        } else if self.x8.capacity() > 0 {
+            self.x8 = Vec::new();
         }
-        let quantized_len = rows * quant::blocks(shape.features);
-        if self.quantized.len() < quantized_len {
-            self.quantized.resize_with(quantized_len, || UnsafeCell::new(Q8Block::ZERO));
+        if need_quantized {
+            let quantized_len = rows * feat_blocks;
+            if self.quantized.len() < quantized_len {
+                self.quantized.resize_with(quantized_len, || UnsafeCell::new(Q8Block::ZERO));
+            }
+        } else if self.quantized.capacity() > 0 {
+            self.quantized = Vec::new();
+        }
+        if x_tiles_len > 0 {
+            if self.x_tiles.len() < x_tiles_len {
+                self.x_tiles.resize_with(x_tiles_len, || UnsafeCell::new(Q8Tile::ZERO));
+            }
+        } else if self.x_tiles.capacity() > 0 {
+            self.x_tiles = Vec::new();
+        }
+        if q_tiles_len > 0 {
+            if self.q_tiles.len() < q_tiles_len {
+                self.q_tiles.resize_with(q_tiles_len, || UnsafeCell::new(Q8Tile::ZERO));
+            }
+        } else if self.q_tiles.capacity() > 0 {
+            self.q_tiles = Vec::new();
+        }
+        // Zero any partial last row-group in `x_tiles` and `q_tiles` so unused
+        // lanes past `expert.rows` are zero, and zero the final partial block
+        // when `no_k_split` writes sub-blocks directly and `features` is not a
+        // multiple of `Q8_BLOCK`.
+        let partial_feat_block = self.no_k_split && !shape.features.is_multiple_of(quant::Q8_BLOCK) && feat_blocks > 0;
+        for expert in &self.experts {
+            let tail_rows = !expert.rows.is_multiple_of(quant::TILE_ROWS);
+            if let Some(at) = expert.x_tiles_at.filter(|_| tail_rows) {
+                let last_group = (expert.rows / quant::TILE_ROWS) * hidden_blocks;
+                for tile in &mut self.x_tiles[at + last_group..at + last_group + hidden_blocks] {
+                    *tile.get_mut() = Q8Tile::ZERO;
+                }
+            }
+            if let Some(at) = expert.down_tiles_at {
+                let groups = expert.rows.div_ceil(quant::TILE_ROWS);
+                if tail_rows {
+                    let last_group = (expert.rows / quant::TILE_ROWS) * feat_blocks;
+                    for tile in &mut self.q_tiles[at + last_group..at + last_group + feat_blocks] {
+                        *tile.get_mut() = Q8Tile::ZERO;
+                    }
+                }
+                if partial_feat_block {
+                    for grp in 0..groups {
+                        *self.q_tiles[at + grp * feat_blocks + feat_blocks - 1].get_mut() = Q8Tile::ZERO;
+                    }
+                }
+            } else if partial_feat_block && expert.down.quantized() {
+                for row in 0..expert.rows {
+                    *self.quantized[(expert.at + row) * feat_blocks + feat_blocks - 1].get_mut() = Q8Block::ZERO;
+                }
+            }
         }
     }
 
@@ -1119,9 +1235,11 @@ impl Work {
     }
 
     /// Each stage's units: an expert's row of gather, a share a worker of
-    /// expand and project, a q8 block of an expert's products of join.
+    /// expand and project, a q8 block of an expert's products of join (or 0
+    /// when `no_k_split` quantizes inline in expand).
     fn units(&self) -> [usize; STAGES] {
-        [self.entry_rows.len(), self.workers, self.experts.len() * quant::blocks(self.shape.features), self.workers]
+        let join_units = if self.no_k_split { 0 } else { self.experts.len() * quant::blocks(self.shape.features) };
+        [self.entry_rows.len(), self.workers, join_units, self.workers]
     }
 
     /// Run unit `unit` of stage `stage`, claimed, writing the output at
@@ -1151,19 +1269,53 @@ impl Work {
         // SAFETY: the input's rows are the device's, whole for the step.
         let input = unsafe { std::slice::from_raw_parts(self.input.add(row * hidden), hidden) };
         // SAFETY: this row's activations are this unit's alone.
-        let (x, x8) = unsafe { (writable(&self.x[named * hidden..][..hidden]), writable(&self.x8[named * blocks..][..blocks])) };
+        let x = unsafe { writable(&self.x[named * hidden..][..hidden]) };
         x.copy_from_slice(input);
-        quant::quantize(x, x8);
+        let expert = &self.experts[self.entry_experts[named]];
+        if let Some(tiles_at) = expert.x_tiles_at {
+            let local = named - expert.at;
+            let group = local / quant::TILE_ROWS;
+            let lane = local % quant::TILE_ROWS;
+            let base = self.x_tiles[tiles_at + group * blocks..].as_ptr();
+            if self.no_k_split {
+                for b in 0..blocks {
+                    let start = b * quant::Q8_BLOCK;
+                    let end = (start + quant::Q8_BLOCK).min(hidden);
+                    let mut block = Q8Block::ZERO;
+                    quant::quantize(&x[start..end], std::slice::from_mut(&mut block));
+                    // SAFETY: `(expert, local)` is unique to this gather unit, so
+                    // row `lane` of each tile in `group` is written by this unit alone.
+                    unsafe { Q8Tile::place(UnsafeCell::raw_get(base.add(b)), lane, &block) };
+                }
+            } else {
+                // SAFETY: this row's linear q8 blocks are this unit's alone.
+                let x8 = unsafe { writable(&self.x8[named * blocks..][..blocks]) };
+                quant::quantize(x, x8);
+                for (b, block) in x8.iter().enumerate() {
+                    // SAFETY: `(expert, local)` is unique to this gather unit, so
+                    // row `lane` of each tile in `group` is written by this unit alone.
+                    unsafe { Q8Tile::place(UnsafeCell::raw_get(base.add(b)), lane, block) };
+                }
+            }
+        } else {
+            // SAFETY: this row's linear q8 blocks are this unit's alone.
+            let x8 = unsafe { writable(&self.x8[named * blocks..][..blocks]) };
+            quant::quantize(x, x8);
+        }
     }
 
-    /// Stage two, share `worker`'s units of every expert ([`expands`]): its
-    /// whole tiles' gate/up of all the expert's rows and their activation in
-    /// one call each, f32, and the partial sums of a tile it computes part
-    /// of.
+    /// Stage two, share `worker`'s units of every expert: either whole
+    /// `Q8_GROUP`s across `(expert, group)` with inline activation and
+    /// quantization (`no_k_split`, skipping `JOIN`), or K-split units per
+    /// expert ([`expands`]) when `total_groups < 2 * workers`.
     ///
     /// # Safety
     /// The gather stage is finished.
     unsafe fn expand(&self, worker: usize) {
+        if self.no_k_split {
+            unsafe { self.expand_whole_groups(worker) };
+            return;
+        }
         let (features, hidden) = (self.shape.features, self.shape.hidden);
         let blocks = quant::blocks(hidden);
         // SAFETY: unit `worker` of EXPAND is claimed by this thread alone.
@@ -1187,12 +1339,23 @@ impl Work {
                 let range = from * TILE..(to_excl * TILE).min(features);
                 let width = range.len();
                 let len = count * width;
-                if let Some(weights) = &expert.gate {
-                    scratch.a.resize(len, 0.0);
-                    projection::project_arithmetic(weights, range.start, values, Some(q8), &mut scratch.a[..len]);
+                if let Some(tiles_at) = expert.x_tiles_at {
+                    // SAFETY: no gather write is in flight (the caller's contract).
+                    let x_tiles = unsafe { self::values(&self.x_tiles[tiles_at..tiles_at + quant::tiles(count, blocks)]) };
+                    if let Some(weights) = &expert.gate {
+                        scratch.a.resize(len, 0.0);
+                        weights.tile_q8(range.start, x_tiles, count, &mut scratch.a[..len]);
+                    }
+                    scratch.b.resize(len, 0.0);
+                    expert.up.tile_q8(range.start, x_tiles, count, &mut scratch.b[..len]);
+                } else {
+                    if let Some(weights) = &expert.gate {
+                        scratch.a.resize(len, 0.0);
+                        projection::project_arithmetic(weights, range.start, values, Some(q8), &mut scratch.a[..len]);
+                    }
+                    scratch.b.resize(len, 0.0);
+                    projection::project_arithmetic(&expert.up, range.start, values, Some(q8), &mut scratch.b[..len]);
                 }
-                scratch.b.resize(len, 0.0);
-                projection::project_arithmetic(&expert.up, range.start, values, Some(q8), &mut scratch.b[..len]);
                 for (row, up) in scratch.b[..len].chunks_exact(width).enumerate() {
                     // SAFETY: these whole tiles of the expert's rows are this
                     // worker's alone.
@@ -1232,6 +1395,109 @@ impl Work {
                 partial.up.resize(partial_len, 0.0);
                 let (_, window) = expert.up.columns(columns);
                 projection::project_arithmetic(&window, rows.start, &scratch.values, Some(&scratch.q8), &mut partial.up[..partial_len]);
+            }
+        }
+    }
+
+    /// Whole-group expand path (`self.no_k_split`): assigns contiguous runs of
+    /// `(expert, Q8_GROUP)` to each worker, projects gate/up over full K,
+    /// activates, and quantizes directly into `q_tiles` / `quantized` (or
+    /// writes `products` for unquantized down weights), eliminating `partials`
+    /// and the `JOIN` barrier.
+    ///
+    /// # Safety
+    /// The gather stage is finished.
+    unsafe fn expand_whole_groups(&self, worker: usize) {
+        let (features, hidden) = (self.shape.features, self.shape.hidden);
+        let hidden_blocks = quant::blocks(hidden);
+        let feat_blocks = quant::blocks(features);
+        let groups_per_expert = features.div_ceil(quant::Q8_GROUP);
+        let total_groups = self.experts.len() * groups_per_expert;
+        let units = share(worker, self.workers, total_groups);
+        if units.is_empty() {
+            return;
+        }
+        // SAFETY: unit `worker` of EXPAND is claimed by this thread alone.
+        let scratch = unsafe { &mut *self.scratch[worker].get() };
+        let first_expert = units.start / groups_per_expert;
+        let last_expert = (units.end - 1) / groups_per_expert;
+        for index in first_expert..=last_expert {
+            let expert = &self.experts[index];
+            let base = index * groups_per_expert;
+            let g_start = units.start.max(base) - base;
+            let g_end = units.end.min(base + groups_per_expert) - base;
+            let range = g_start * quant::Q8_GROUP..(g_end * quant::Q8_GROUP).min(features);
+            let width = range.len();
+            let count = expert.rows;
+            let len = count * width;
+            let named = expert.at..expert.at + count;
+            if let Some(tiles_at) = expert.x_tiles_at {
+                // SAFETY: no gather write is in flight (the caller's contract).
+                let x_tiles = unsafe { values(&self.x_tiles[tiles_at..tiles_at + quant::tiles(count, hidden_blocks)]) };
+                if let Some(weights) = &expert.gate {
+                    scratch.a.resize(len, 0.0);
+                    weights.tile_q8(range.start, x_tiles, count, &mut scratch.a[..len]);
+                }
+                scratch.b.resize(len, 0.0);
+                expert.up.tile_q8(range.start, x_tiles, count, &mut scratch.b[..len]);
+            } else {
+                // SAFETY: no gather write is in flight (the caller's contract).
+                let (values, q8) = unsafe {
+                    (
+                        values(&self.x[named.start * hidden..named.end * hidden]),
+                        values(&self.x8[named.start * hidden_blocks..named.end * hidden_blocks]),
+                    )
+                };
+                if let Some(weights) = &expert.gate {
+                    scratch.a.resize(len, 0.0);
+                    projection::project_arithmetic(weights, range.start, values, Some(q8), &mut scratch.a[..len]);
+                }
+                scratch.b.resize(len, 0.0);
+                projection::project_arithmetic(&expert.up, range.start, values, Some(q8), &mut scratch.b[..len]);
+            }
+            let down_quantized = expert.down.quantized();
+            let (_, up_scale) = expert.scales;
+            for row in 0..count {
+                let slice = row * width..(row + 1) * width;
+                let activated: &[f32] = if expert.gate.is_some() {
+                    let gate = &mut scratch.a[slice.clone()];
+                    let up = &scratch.b[slice];
+                    self.activate(expert, gate, up);
+                    gate
+                } else {
+                    let up = &mut scratch.b[slice];
+                    for value in up.iter_mut() {
+                        *value = functions::activate(self.shape.function, up_scale * *value);
+                    }
+                    up
+                };
+                if !down_quantized {
+                    // SAFETY: these feature groups of the expert's rows are this worker's alone.
+                    let out = unsafe { writable(&self.products[(expert.at + row) * features + range.start..][..width]) };
+                    out.copy_from_slice(activated);
+                } else if let Some(tiles_at) = expert.down_tiles_at {
+                    let group_row = row / quant::TILE_ROWS;
+                    let lane = row % quant::TILE_ROWS;
+                    let base_tiles = self.q_tiles[tiles_at + group_row * feat_blocks..].as_ptr();
+                    for (idx, g) in (g_start..g_end).enumerate() {
+                        let sub = &activated[idx * quant::Q8_GROUP..((idx + 1) * quant::Q8_GROUP).min(width)];
+                        let block_idx = g / quant::Q8_GROUPS;
+                        let sub_g = g % quant::Q8_GROUPS;
+                        // SAFETY: `(expert, g)` is unique to this worker, so sub-block `sub_g`
+                        // of `row` in tile `block_idx` is written by this worker alone.
+                        unsafe { Q8Tile::quantize_group_into(UnsafeCell::raw_get(base_tiles.add(block_idx)), lane, sub_g, sub) };
+                    }
+                } else {
+                    let base_blocks = self.quantized[(expert.at + row) * feat_blocks..].as_ptr();
+                    for (idx, g) in (g_start..g_end).enumerate() {
+                        let sub = &activated[idx * quant::Q8_GROUP..((idx + 1) * quant::Q8_GROUP).min(width)];
+                        let block_idx = g / quant::Q8_GROUPS;
+                        let sub_g = g % quant::Q8_GROUPS;
+                        // SAFETY: `(expert, g)` is unique to this worker, so sub-block `sub_g`
+                        // of `block_idx` is written by this worker alone.
+                        unsafe { Q8Block::quantize_group_into(UnsafeCell::raw_get(base_blocks.add(block_idx)), sub_g, sub) };
+                    }
+                }
             }
         }
     }
@@ -1278,14 +1544,9 @@ impl Work {
         }
         for row in 0..expert.rows {
             let at = expert.at + row;
-            // SAFETY: the block's split tiles and quantized block of each of
-            // the expert's rows are this unit's alone.
-            let (products, quantized) = unsafe {
-                (
-                    writable(&self.products[at * features + range.start..at * features + range.end]),
-                    writable(&self.quantized[at * quant::blocks(features) + block..][..1]),
-                )
-            };
+            // SAFETY: the block's split tiles of each of the expert's rows are
+            // this unit's alone.
+            let products = unsafe { writable(&self.products[at * features + range.start..at * features + range.end]) };
             if any_partial {
                 for (offset, tile) in tiles.clone().enumerate() {
                     if !has_partial[offset] {
@@ -1315,7 +1576,20 @@ impl Work {
                     self.activate(expert, out, &up[..width]);
                 }
             }
-            quant::quantize(products, quantized);
+            if let Some(tiles_at) = expert.down_tiles_at {
+                let mut q = Q8Block::ZERO;
+                quant::quantize(products, std::slice::from_mut(&mut q));
+                let feat_blocks = quant::blocks(features);
+                let group_row = row / quant::TILE_ROWS;
+                let lane = row % quant::TILE_ROWS;
+                let tile_ptr = UnsafeCell::raw_get(self.q_tiles[tiles_at + group_row * feat_blocks + block..].as_ptr());
+                // SAFETY: `(index, block)` is unique to this join unit.
+                unsafe { Q8Tile::place(tile_ptr, lane, &q) };
+            } else if expert.down.quantized() {
+                // SAFETY: the quantized block of this expert row is this unit's alone.
+                let quantized = unsafe { writable(&self.quantized[at * quant::blocks(features) + block..][..1]) };
+                quant::quantize(products, quantized);
+            }
         }
     }
 
@@ -1342,15 +1616,20 @@ impl Work {
         let blocks = quant::blocks(features);
         for expert in &self.experts {
             let named = expert.at..expert.at + expert.rows;
-            // SAFETY: no join write is in flight (the caller's contract).
-            let (products, quantized) = unsafe {
-                (
-                    values(&self.products[named.start * features..named.end * features]),
-                    values(&self.quantized[named.start * blocks..named.end * blocks]),
-                )
-            };
             let dots = &mut scratch.b[..named.len() * width];
-            projection::project_arithmetic(&expert.down, channels.start, products, Some(quantized), dots);
+            if let Some(tiles_at) = expert.down_tiles_at {
+                // SAFETY: no expand/join write is in flight (the caller's contract).
+                let q_tiles = unsafe { values(&self.q_tiles[tiles_at..tiles_at + quant::tiles(expert.rows, blocks)]) };
+                expert.down.tile_q8(channels.start, q_tiles, expert.rows, dots);
+            } else {
+                // SAFETY: no expand/join write is in flight (the caller's contract).
+                let products = unsafe { values(&self.products[named.start * features..named.end * features]) };
+                let quantized = expert.down.quantized().then(|| {
+                    // SAFETY: no expand/join write is in flight (the caller's contract).
+                    unsafe { values(&self.quantized[named.start * blocks..named.end * blocks]) }
+                });
+                projection::project_arithmetic(&expert.down, channels.start, products, quantized, dots);
+            }
             for (&(row, weight), dots) in self.entry_rows[named].iter().zip(dots.chunks_exact(width)) {
                 for (sum, dot) in scratch.a[row * width..(row + 1) * width].iter_mut().zip(dots) {
                     *sum += weight * dot;
@@ -1731,13 +2010,22 @@ impl Site {
             return Some(WorkerTurn::Waiting);
         }
         // Every worker that sees the stage finished may advance it; only one
-        // whose read finds it not yet advanced writes the word.
+        // whose read finds it not yet advanced writes the word. Skip any
+        // subsequent empty stages (e.g. `JOIN` when `no_k_split` is set) so
+        // no extra barrier round-trip is taken.
         let at = progress(issue, stage);
+        let mut next = stage + 1;
+        while next < STAGES && cell.units[next].load(Ordering::Relaxed) == 0 {
+            next += 1;
+        }
         if cell.progress.load(Ordering::Relaxed) == at
-            && cell.progress.compare_exchange(at, progress(issue, stage + 1), Ordering::AcqRel, Ordering::Relaxed).is_ok()
+            && cell.progress.compare_exchange(at, progress(issue, next), Ordering::AcqRel, Ordering::Relaxed).is_ok()
         {
-            self.mark(cell, STAGE_ENDS + stage);
-            if stage + 1 == STAGES {
+            let now = self.began.elapsed().as_nanos() as u64;
+            for finished in stage..next {
+                cell.marks[STAGE_ENDS + finished].store(now, Ordering::Relaxed);
+            }
+            if next == STAGES {
                 self.publish(cell);
             }
         }
