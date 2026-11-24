@@ -76,7 +76,15 @@ export const latestResponse = (messages: ReadonlyArray<ChatMessage>): Option.Opt
 export const runningResponse = (messages: ReadonlyArray<ChatMessage>): Option.Option<ChatAssistantMessage> =>
   Option.filter(latestResponse(messages), (response) => Option.isNone(response.end))
 
-export const ModelLoadingStage = Schema.Literal("queued", "preparing", "optimizing", "loading_weights", "finalizing")
+export const ModelLoadingStage = Schema.Literal(
+  "queued",
+  "preparing",
+  "compiling",
+  "optimizing",
+  "initializing",
+  "loading_weights",
+  "finalizing",
+)
 export type ModelLoadingStage = typeof ModelLoadingStage.Type
 
 export const ResponsePhase = Schema.Union(

@@ -452,7 +452,11 @@ fn the_mandatory_phase_forms_the_untuned_entries_the_count_met() {
     let tuner = tuner.census(untuned).unwrap();
     assert!(matches!(
         recorder.0.borrow().as_slice(),
-        [TuningEvent::Untuned { programs: 2, .. }]
+        [
+            TuningEvent::Compiling { completed: 0, total: 2 },
+            TuningEvent::Compiling { completed: 2, total: 2 },
+            TuningEvent::Untuned { programs: 2, .. },
+        ]
     ));
     assert!(tuner.search().unwrap().conclude().is_empty());
 }
@@ -2096,17 +2100,32 @@ fn the_tuner_drives_a_registered_case_and_reports_progress() {
     let events = recorder.0.borrow();
     // Progress counts milliseconds of the tuning time from the count.
     let total = STANDARD_TUNING_BUDGET.as_millis() as usize;
-    // The mandatory phase is attributed first: forming and publishing.
+    // Compiling reports the mandatory baseline wave before Mandatory/Progress/Started.
     assert!(matches!(
         &events[0],
+        TuningEvent::Compiling {
+            completed: 0,
+            total: 1,
+        }
+    ));
+    assert!(matches!(
+        &events[1],
+        TuningEvent::Compiling {
+            completed: 1,
+            total: 1,
+        }
+    ));
+    // The mandatory phase is attributed next: forming and publishing.
+    assert!(matches!(
+        &events[2],
         TuningEvent::Mandatory {
             entry: "dense_output",
             ..
         }
     ));
-    assert!(matches!(events[1], TuningEvent::Progress { total: all, .. } if all == total));
+    assert!(matches!(events[3], TuningEvent::Progress { total: all, .. } if all == total));
     assert!(matches!(
-        &events[3],
+        &events[5],
         TuningEvent::Started {
             entry: "dense_output",
             points: 7,
@@ -4171,8 +4190,10 @@ fn a_streamed_load_searches_every_streamed_case_on_the_device() {
         };
         assert_eq!(leads, every, "{hint_entry}: every lead's unit is searched: {finished:?}");
         // Every decode unit preparation formed for the banked layers is
-        // keyed at the bank's slots: units at two slot tables are two
-        // records. Both forms read the gate and up stacks, and the down.
+        // keyed as banked (distinct from resident, and invariant to the
+        // exact live bank slot count so a RAM shift between Prepare and Load
+        // or across loads does not invalidate the record). Both forms read
+        // the gate and up stacks, and the down.
         let (ups, downs) = (
             ["routed_expand", "routed_gate_up", "routed_up"],
             ["routed_output", "routed_output_project", "routed_down", "routed_down_project"],
@@ -4187,13 +4208,48 @@ fn a_streamed_load_searches_every_streamed_case_on_the_device() {
                 "{streamed}: a decode unit of {kinds:?} is searched: {finished:?}"
             );
         }
-        // Each is keyed by its row range after the slots (`ranged::Ranged`).
-        let at_slots = format!(",S={slots}");
+        // Each is keyed by its row range after the banked marker (`ranged::Ranged`).
         for (entry, _, bindings) in &decode {
             let unit = bindings.rsplit_once(",M=").map_or(bindings.as_str(), |(unit, _)| unit);
-            assert!(unit.ends_with(&at_slots), "{streamed}: {entry} is keyed at the bank's slots: {bindings}");
+            assert!(unit.ends_with(",S=bank"), "{streamed}: {entry} is keyed as banked: {bindings}");
         }
     }
+}
+
+#[test]
+fn experts_text_separates_banked_from_resident_without_keying_exact_slot_count() {
+    assert_eq!(super::experts_text(136, 512), ",S=bank");
+    assert_eq!(super::experts_text(287, 512), ",S=bank");
+    assert_eq!(super::experts_text(136, 512), super::experts_text(287, 512));
+    assert_eq!(super::experts_text(512, 512), "");
+    assert_eq!(super::experts_text(512, 256), "");
+
+    // Tuning key check: two banked loads with different live bank slot counts (136 vs 287)
+    // hash to the identical tuning cache key, while a fully resident load (512 of 512) stays
+    // keyed apart.
+    let device = crate::test_support::open_backend(&seismic::Devices::discover(&[]).unwrap(), BackendName::Cpu)
+        .unwrap();
+    let shapes = row_points(LIMITS);
+    let key_for = |slots: u64| {
+        let bindings = format!(
+            "EGW=q2g64@rows32,EUW=q2g64@rows32,A=bf16{}",
+            super::experts_text(slots, 512)
+        );
+        tuning_key_material(
+            &device,
+            "routed_gate_up",
+            &bindings,
+            &NativeSpecialization::new(),
+            "same-implementation",
+            Some(DType::BF16),
+            &shapes,
+        )
+    };
+    let key_136 = key_for(136);
+    let key_287 = key_for(287);
+    let key_512 = key_for(512);
+    assert_eq!(key_136, key_287, "banked loads with different live slot counts share one cache key");
+    assert_ne!(key_136, key_512, "banked and resident loads remain distinct cache keys");
 }
 
 /// A compressed layer's attention cases read the picks' rows from a plane

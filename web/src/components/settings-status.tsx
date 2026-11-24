@@ -19,7 +19,9 @@ import { serviceIndicator } from "./service-indicator"
 const loadLabels: Record<ModelLoadStage, string> = {
   queued: "Waiting for memory",
   preparing: "Preparing model",
+  compiling: "Compiling kernels",
   optimizing: "Optimizing model",
+  initializing: "Loading kernels",
   loading_weights: "Loading weights",
   finalizing: "Finalizing model",
 }

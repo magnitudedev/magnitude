@@ -574,7 +574,12 @@ export const CatalogOptimizationProgress = S.Struct({
 export type CatalogOptimizationProgress = S.Schema.Type<typeof CatalogOptimizationProgress>
 export type CatalogOptimizationProgressEncoded = S.Schema.Encoded<typeof CatalogOptimizationProgress>
 
-export const CatalogOptimizationStage = S.Union(S.Literal("waiting"), S.Literal("preparing"), S.Literal("tuning"))
+export const CatalogOptimizationStage = S.Union(
+  S.Literal("waiting"),
+  S.Literal("preparing"),
+  S.Literal("compiling"),
+  S.Literal("tuning"),
+)
 export type CatalogOptimizationStage = S.Schema.Type<typeof CatalogOptimizationStage>
 export type CatalogOptimizationStageEncoded = S.Schema.Encoded<typeof CatalogOptimizationStage>
 
@@ -2827,6 +2832,14 @@ export type ModelInstancesSnapshotEncoded = S.Schema.Encoded<typeof ModelInstanc
 export const ModelLoadDetails = S.Union(
   S.extend(
     S.Struct({
+      compiled_programs: S.Number.pipe(S.int(), S.greaterThanOrEqualTo(0)),
+      kind: S.Literal("compiling"),
+      total_programs: S.Number.pipe(S.int(), S.greaterThanOrEqualTo(0)),
+    }),
+    S.Record({ key: S.String, value: JsonValue }),
+  ),
+  S.extend(
+    S.Struct({
       budget_ms: S.Number.pipe(S.int(), S.greaterThanOrEqualTo(0)),
       elapsed_ms: S.Number.pipe(S.int(), S.greaterThanOrEqualTo(0)),
       formed_programs: S.Number.pipe(S.int(), S.greaterThanOrEqualTo(0)),
@@ -2869,7 +2882,9 @@ export type ModelLoadPlanEncoded = S.Schema.Encoded<typeof ModelLoadPlan>
 export const ModelLoadStage = S.Union(
   S.Literal("queued"),
   S.Literal("preparing"),
+  S.Literal("compiling"),
   S.Literal("optimizing"),
+  S.Literal("initializing"),
   S.Literal("loading_weights"),
   S.Literal("finalizing"),
 )

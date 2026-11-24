@@ -22,8 +22,10 @@ const phases = {
   starting: "Starting request",
   model_queued: "Waiting for model",
   preparing_model: "Preparing model",
+  compiling: "Compiling kernels",
   queued: "Waiting for inference",
   optimizing: "Optimizing model",
+  initializing: "Loading kernels",
   loading: "Loading model",
   finalizing: "Finalizing model",
   preparing: "Preparing prompt",
@@ -34,9 +36,11 @@ const OPTIMIZING_BUDGET_MS = 60_000
 const substatuses = {
   starting: "Connecting to inference",
   model_queued: "Awaiting model availability",
-  preparing_model: "Preparing inference runtime",
+  preparing_model: "Planning device execution",
+  compiling: "Building kernels for this device (one-time)",
   queued: "Awaiting execution",
   optimizing: "Testing kernel variants (one-time, up to 1 min)",
+  initializing: "Preparing execution graph",
   loading: "Importing weights",
   finalizing: "Preparing model for inference",
   preparing: "Preparing conversation",
@@ -47,7 +51,9 @@ type Activity = keyof typeof phases
 const stages = {
   queued: "model_queued",
   preparing: "preparing_model",
+  compiling: "compiling",
   optimizing: "optimizing",
+  initializing: "initializing",
   loading_weights: "loading",
   finalizing: "finalizing",
 } as const
@@ -113,7 +119,10 @@ export function ChatActivityStatus({
   const measures: string[] = []
   let progress: number | undefined
   let progressText: string | undefined
-  if (activity === "optimizing" && load?.kind === "tuning") {
+  if (activity === "compiling" && load?.kind === "compiling") {
+    progress = percent(load.compiled_programs, load.total_programs)
+    if (progress !== undefined) progressText = count(load.compiled_programs) + " / " + count(load.total_programs)
+  } else if (activity === "optimizing" && load?.kind === "tuning") {
     measures.push(count(load.measured_configurations) + " tested")
   } else if (activity === "loading" && load?.kind === "weights") {
     progress = percent(load.completed_bytes, load.total_bytes)

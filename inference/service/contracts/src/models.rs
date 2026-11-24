@@ -1653,6 +1653,7 @@ mod schema {
     pub enum CatalogOptimizationStage {
         Waiting,
         Preparing,
+        Compiling,
         Tuning,
     }
 
@@ -2171,10 +2172,14 @@ mod schema {
     pub enum ModelLoadStage {
         /// Waiting for memory admission.
         Queued,
-        /// Resolving, planning, opening the device and preparing programs.
+        /// Resolving, planning and opening the device.
         Preparing,
+        /// Compiling baseline kernels for the device; only a cold load enters it.
+        Compiling,
         /// Tuning kernels for the device; only a load that tunes enters it.
         Optimizing,
+        /// Loading/qualifying compiled programs and planning execution graphs.
+        Initializing,
         LoadingWeights,
         /// State allocation, warm-up and readiness verification.
         Finalizing,

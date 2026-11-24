@@ -53,7 +53,9 @@ export const formatModelLoadStage = (stage: ModelLoadStage): string => {
   switch (stage) {
     case "queued": return "Waiting"
     case "preparing": return "Preparing"
+    case "compiling": return "Compiling"
     case "optimizing": return "Optimizing"
+    case "initializing": return "Initializing"
     case "loading_weights": return "Loading"
     case "finalizing": return "Finalizing"
   }
@@ -71,7 +73,9 @@ export const describeModelLoadStage = (
   switch (stage) {
     case "queued": return "Waiting for memory…"
     case "preparing": return "Preparing…"
+    case "compiling": return "Compiling kernels…"
     case "optimizing": return describeOptimizing(Option.map(plannedAllocation, (plan) => plan.device), hardware)
+    case "initializing": return "Loading kernels…"
     case "loading_weights": return "Loading weights…"
     case "finalizing": return "Finalizing…"
   }
@@ -90,9 +94,9 @@ const describeOptimizing = (
   },
 )
 
-/** Tuning's share done, or none while preparation is still counting the work. */
+/** Compiling or tuning's share done, or none while preparation is still counting the work. */
 export const modelOptimizationFraction = (progress: ModelOptimizationProgress): Option.Option<number> =>
-  progress.stage === "tuning" && progress.total > 0
+  (progress.stage === "compiling" || progress.stage === "tuning") && progress.total > 0
     ? Option.some(Math.min(1, progress.completed / progress.total))
     : Option.none()
 
@@ -102,6 +106,8 @@ export const describeModelOptimization = (
   hardware: Option.Option<LocalInferenceHardware>,
 ): string => progress.stage === "preparing"
   ? "Preparing to optimize…"
+  : progress.stage === "compiling"
+  ? "Compiling kernels…"
   : describeOptimizing(progress.device, hardware)
 
 /** Post-download optimization that has not finished and waits for the device a loaded model holds. */
@@ -118,17 +124,20 @@ export const modelResidencyActive = (residency: ModelResidency): boolean =>
   residency._tag === "Requested" || residency._tag === "Loading" || residency._tag === "Ready" || residency._tag === "Stopping"
 
 /** Post-download optimization where space is short (the CLI). */
-export const formatModelOptimization = (progress: ModelOptimizationProgress): string => Option.match(
-  modelOptimizationFraction(progress),
-  {
-    onNone: () => "Optimizing",
-    onSome: (fraction) => `Optimizing ${formatModelLoadPercentage(fraction)}`,
-  },
-)
+export const formatModelOptimization = (progress: ModelOptimizationProgress): string => {
+  const label = progress.stage === "compiling" ? "Compiling" : "Optimizing"
+  return Option.match(
+    modelOptimizationFraction(progress),
+    {
+      onNone: () => label,
+      onSome: (fraction) => `${label} ${formatModelLoadPercentage(fraction)}`,
+    },
+  )
+}
 
 /** Whether a stage's fraction measures its work; the others have no progress of their own. */
 export const isMeasuredModelLoadStage = (stage: ModelLoadStage): boolean =>
-  stage === "optimizing" || stage === "loading_weights"
+  stage === "compiling" || stage === "optimizing" || stage === "loading_weights"
 
 /** Whole percent done; the tolerance keeps an exact share such as 232 / 400 from reading one low. */
 export const formatModelLoadPercentage = (fraction: number): string =>

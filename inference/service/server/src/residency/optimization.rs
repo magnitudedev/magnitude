@@ -475,10 +475,15 @@ impl OptimizationProgression {
     fn advance(&mut self, progress: LoadProgress) -> Option<CatalogOptimizationProgress> {
         let (stage, completed, total) = match progress {
             LoadProgress::Preparing => (CatalogOptimizationStage::Preparing, 0, 0),
+            LoadProgress::Compiling { completed, total } => {
+                (CatalogOptimizationStage::Compiling, completed.min(total), total)
+            }
             LoadProgress::Tuning { completed, total, .. } => {
                 (CatalogOptimizationStage::Tuning, completed.min(total), total)
             }
-            LoadProgress::ImportingWeights { .. } | LoadProgress::Finalizing => return None,
+            LoadProgress::Initializing
+            | LoadProgress::ImportingWeights { .. }
+            | LoadProgress::Finalizing => return None,
         };
         let step = completed
             .saturating_mul(REPORT_STEPS)
@@ -658,6 +663,14 @@ mod tests {
         let preparing = progression.advance(LoadProgress::Preparing).unwrap();
         assert_eq!(preparing.stage, CatalogOptimizationStage::Preparing);
         assert!(progression.advance(LoadProgress::Preparing).is_none());
+        let compiling = progression
+            .advance(LoadProgress::Compiling {
+                completed: 12,
+                total: 40,
+            })
+            .unwrap();
+        assert_eq!(compiling.stage, CatalogOptimizationStage::Compiling);
+        assert_eq!((compiling.completed, compiling.total), (12, 40));
         let reported = (0..=10_000)
             .filter_map(|completed| {
                 progression.advance(LoadProgress::Tuning {
@@ -672,6 +685,7 @@ mod tests {
         assert_eq!(reported.len(), REPORT_STEPS as usize + 1);
         let last = reported.last().unwrap();
         assert_eq!((last.completed, last.total), (10_000, 10_000));
+        assert!(progression.advance(LoadProgress::Initializing).is_none());
         assert!(
             progression
                 .advance(LoadProgress::ImportingWeights {

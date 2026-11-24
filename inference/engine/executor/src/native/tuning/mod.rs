@@ -1262,6 +1262,9 @@ pub(crate) trait EntryTuning: Clone + 'static {
 /// Progress of tuning at load, for readiness reporting.
 #[derive(Clone, Debug, PartialEq)]
 pub enum TuningEvent {
+    /// Mandatory baseline kernel compilation progress during the census phase
+    /// (canonical defaults and untuned entries) before optional search starts.
+    Compiling { completed: usize, total: usize },
     /// Milliseconds of tuning time spent so far, of the tuning budget.
     /// Reported when the search walk begins and after each unit it
     /// searches; nothing is reported when every unit is stored.
@@ -4329,9 +4332,23 @@ impl<'a> Tuner<'a> {
         // is the most seen over at least as many compiles as it starts.
         // What a wave freed is returned before the next reads its room, so
         // that room is what its compiles left held, as measured.
-        let mut grounded = Vec::with_capacity(groundings.len());
+        let total_groundings = groundings.len();
+        if total_groundings > 0 {
+            self.context.observer.event(&TuningEvent::Compiling {
+                completed: 0,
+                total: total_groundings,
+            });
+        }
+        let mut grounded = Vec::with_capacity(total_groundings);
         if self.room.is_none() {
-            grounded.extend(workers.each(&groundings, ground));
+            let chunk_size = (workers.width() + 1).max(4);
+            for chunk in groundings.chunks(chunk_size) {
+                grounded.extend(workers.each(chunk, ground));
+                self.context.observer.event(&TuningEvent::Compiling {
+                    completed: grounded.len(),
+                    total: total_groundings,
+                });
+            }
         }
         while grounded.len() < groundings.len() {
             let observed = grounded.len();
@@ -4360,6 +4377,10 @@ impl<'a> Tuner<'a> {
                 self.memory.price_compiles(held);
             }
             self.memory.return_freed_pages();
+            self.context.observer.event(&TuningEvent::Compiling {
+                completed: grounded.len(),
+                total: total_groundings,
+            });
         }
         // What the optional work is admitted against is what is held, as
         // measured, and what the mandatory phase left is stated.

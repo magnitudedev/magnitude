@@ -520,6 +520,7 @@ fn prepare(
         kernel_cache,
         numerical_profile,
     } = plan_on_device(catalog, manifest, package, progress.as_ref())?;
+    progress(LoadProgress::Initializing);
     let preparing = Instant::now();
     let workers = Arc::new(seismic::Workers::of_the_host());
     opened.device().staff(Some(workers.clone()));
@@ -2496,6 +2497,12 @@ impl TuningObserver for TuningReport {
             trace.event(event);
         }
         match event {
+            TuningEvent::Compiling { completed, total } => {
+                (self.progress)(LoadProgress::Compiling {
+                    completed: *completed as u64,
+                    total: *total as u64,
+                });
+            }
             // Only a search that finds a unit without a record reports
             // progress; a load never does.
             TuningEvent::Progress { completed, total } => {

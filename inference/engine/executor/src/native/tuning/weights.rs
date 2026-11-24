@@ -176,13 +176,15 @@ pub(crate) fn decode_experts(
 }
 
 /// What a decode unit's bindings add for the `read` experts of a layer's
-/// `layer` its launches read ([`decode_experts`]): a record is of the
-/// launch measured, so a unit at the bank's slots is not one at every
-/// expert. Nothing where the load holds the stack whole, whose units keep
-/// their bindings.
+/// `layer` its launches read ([`decode_experts`]): a record for a banked
+/// layer is distinct from one where the load holds every expert resident,
+/// without keying on the exact slot count (which shifts whenever live host
+/// memory changes between Prepare and Load or across loads, while the
+/// compiled kernel itself does not specialize on slot count). Nothing where
+/// the load holds the stack whole, whose units keep their bindings.
 pub(crate) fn experts_text(read: u64, layer: u64) -> String {
     match read < layer {
-        true => format!(",S={read}"),
+        true => ",S=bank".to_owned(),
         false => String::new(),
     }
 }

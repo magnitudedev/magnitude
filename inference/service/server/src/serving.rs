@@ -82,7 +82,9 @@ fn protocol_stage(stage: ModelLoadStage) -> ProtocolLoadStage {
     match stage {
         ModelLoadStage::Queued => ProtocolLoadStage::Queued,
         ModelLoadStage::Preparing => ProtocolLoadStage::Preparing,
+        ModelLoadStage::Compiling => ProtocolLoadStage::Compiling,
         ModelLoadStage::Optimizing => ProtocolLoadStage::Optimizing,
+        ModelLoadStage::Initializing => ProtocolLoadStage::Initializing,
         ModelLoadStage::LoadingWeights => ProtocolLoadStage::LoadingWeights,
         ModelLoadStage::Finalizing => ProtocolLoadStage::Finalizing,
     }
@@ -164,7 +166,9 @@ mod tests {
         for stage in [
             ModelLoadStage::Queued,
             ModelLoadStage::Preparing,
+            ModelLoadStage::Compiling,
             ModelLoadStage::Optimizing,
+            ModelLoadStage::Initializing,
             ModelLoadStage::LoadingWeights,
             ModelLoadStage::Finalizing,
         ] {

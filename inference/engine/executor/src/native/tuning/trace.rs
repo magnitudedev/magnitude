@@ -218,7 +218,7 @@ impl TuningTrace {
                 "total_ms": total,
             }),
             // Ephemeral UI activity; completed pieces remain the trace's evidence.
-            TuningEvent::WorkStarted { .. } => return,
+            TuningEvent::Compiling { .. } | TuningEvent::WorkStarted { .. } => return,
             // A survey's progress; its record is the survey's evidence.
             TuningEvent::Surveyed { .. } => return,
             TuningEvent::Started {

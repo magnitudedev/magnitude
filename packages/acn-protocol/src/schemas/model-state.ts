@@ -636,7 +636,9 @@ export type ModelReleaseReason = typeof ModelReleaseReasonSchema.Type
 export const ModelLoadStageSchema = Schema.Literal(
   "queued",
   "preparing",
+  "compiling",
   "optimizing",
+  "initializing",
   "loading_weights",
   "finalizing",
 )
@@ -675,9 +677,9 @@ export const ModelTransferProgressSchema = Schema.Struct({
   { message: () => "model transfer progress cannot exceed its declared total" }))
 export type ModelTransferProgress = typeof ModelTransferProgressSchema.Type
 
-/** Kernel tuning after a download, in tuning work units; `preparing` counts them (0 of 0). */
+/** Kernel compilation and tuning after a download; `preparing` counts units (0 of 0). */
 export const ModelOptimizationProgressSchema = Schema.Struct({
-  stage: Schema.Literal("preparing", "tuning"),
+  stage: Schema.Literal("preparing", "compiling", "tuning"),
   completed: NonNegativeSafeInteger,
   total: NonNegativeSafeInteger,
   device: Schema.optionalWith(ModelLoadDeviceSchema, { as: "Option", exact: true }),

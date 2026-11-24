@@ -22,10 +22,14 @@ use tokio::sync::mpsc;
 pub enum ModelLoadStage {
     /// Waiting for memory admission.
     Queued,
-    /// Resolving, planning, opening the device and preparing programs.
+    /// Resolving, planning and opening the device.
     Preparing,
+    /// Compiling baseline kernels for the device; only a cold load enters it.
+    Compiling,
     /// Tuning kernels for the device; only a load that tunes enters it.
     Optimizing,
+    /// Loading/qualifying compiled programs and planning execution graphs.
+    Initializing,
     LoadingWeights,
     /// State allocation, warm-up and readiness verification.
     Finalizing,
@@ -52,6 +56,10 @@ pub struct KernelTuningWork {
 #[derive(Debug, Clone, PartialEq, Serialize, ToSchema)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum ModelLoadDetails {
+    Compiling {
+        compiled_programs: u64,
+        total_programs: u64,
+    },
     Tuning {
         elapsed_ms: u64,
         budget_ms: u64,

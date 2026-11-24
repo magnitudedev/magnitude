@@ -699,8 +699,11 @@ fn load_failure<S: StoredRecords>(
     ModelOperationFailure::new(code, message, retryable)
 }
 
-/// The share of a load's fraction that a Prepare worker's tuning fills when the load needed
-/// one; the Load worker's weight import fills the rest, or all of a load that needed none.
+/// The share of a load's fraction that cold kernel compilation fills before tuning search.
+const COMPILING_SHARE: f32 = 0.25;
+/// The share of a load's fraction that a Prepare worker's compiling + tuning fills when the
+/// load needed one; the Load worker's weight import fills the rest, or all of a load that
+/// needed none.
 const TUNING_SHARE: f32 = 0.5;
 /// The least fraction a stage reports again after, so a load publishes a bounded number of
 /// snapshots however many weights it imports.
@@ -711,6 +714,7 @@ const REPORT_STEP: f32 = 0.005;
 /// work. Monotonic.
 #[derive(Default)]
 struct LoadProgression {
+    compiled: bool,
     tuned: bool,
     reported: Option<(ModelLoadStage, f32)>,
     details: Option<ModelLoadDetails>,
@@ -723,10 +727,30 @@ impl LoadProgression {
         let previous = self.reported.map_or(0.0, |(_, fraction)| fraction);
         let mut details = None;
         let (stage, fraction) = match progress {
-            // The second Load worker prepares again after the Prepare worker tuned: the load
-            // does not return to `preparing`.
-            LoadProgress::Preparing if self.tuned => return None,
+            // The second Load worker starts after the Prepare worker finished compiling/tuning:
+            // transition immediately into `initializing` rather than staying on `optimizing` or
+            // returning to `preparing`.
+            LoadProgress::Preparing if self.tuned || self.compiled => {
+                (ModelLoadStage::Initializing, previous)
+            }
+            // If an earlier probe already moved past `preparing` before triggering Prepare,
+            // do not bounce backward to `preparing`.
+            LoadProgress::Preparing
+                if self
+                    .reported
+                    .is_some_and(|(reported, _)| reported != ModelLoadStage::Preparing) =>
+            {
+                return None;
+            }
             LoadProgress::Preparing => (ModelLoadStage::Preparing, 0.0),
+            LoadProgress::Compiling { completed, total } => {
+                self.compiled = true;
+                details = Some(ModelLoadDetails::Compiling {
+                    compiled_programs: completed,
+                    total_programs: total,
+                });
+                (ModelLoadStage::Compiling, COMPILING_SHARE * ratio(completed, total))
+            }
             LoadProgress::Tuning { completed, total, work, measured_configurations, formed_programs } => {
                 self.tuned = true;
                 details = Some(ModelLoadDetails::Tuning {
@@ -745,14 +769,19 @@ impl LoadProgression {
                     measured_configurations,
                     formed_programs,
                 });
-                (ModelLoadStage::Optimizing, TUNING_SHARE * ratio(completed, total))
+                let start = if self.compiled { COMPILING_SHARE } else { 0.0 };
+                (
+                    ModelLoadStage::Optimizing,
+                    start + (TUNING_SHARE - start) * ratio(completed, total),
+                )
             }
+            LoadProgress::Initializing => (ModelLoadStage::Initializing, previous),
             LoadProgress::ImportingWeights {
                 completed_bytes,
                 total_bytes,
             } => {
                 details = Some(ModelLoadDetails::Weights { completed_bytes, total_bytes });
-                let start = if self.tuned { TUNING_SHARE } else { 0.0 };
+                let start = if self.tuned || self.compiled { TUNING_SHARE } else { 0.0 };
                 (
                     ModelLoadStage::LoadingWeights,
                     start + (1.0 - start) * ratio(completed_bytes, total_bytes),
@@ -763,6 +792,10 @@ impl LoadProgression {
         let fraction = fraction.max(previous);
         // Do not throttle away a selected operation or a fresh count snapshot.
         let changed_work = match (&self.details, &details) {
+            (
+                Some(ModelLoadDetails::Compiling { compiled_programs: ac, total_programs: at }),
+                Some(ModelLoadDetails::Compiling { compiled_programs: bc, total_programs: bt }),
+            ) => ac != bc || at != bt,
             (Some(ModelLoadDetails::Tuning { work: a, measured_configurations: am, formed_programs: ap, .. }),
              Some(ModelLoadDetails::Tuning { work: b, measured_configurations: bm, formed_programs: bp, .. })) =>
                 a != b || am != bm || ap != bp,
@@ -1807,35 +1840,90 @@ mod tests {
         );
     }
 
-    /// A first load is three workers in turn. The Prepare worker's tuning fills the first
-    /// half; the second Load worker's own preparation does not take the load back to
-    /// `preparing`.
+    /// A first load is three workers in turn. The Prepare worker's compiling and tuning fill the
+    /// first half; the second Load worker's own preparation advances cleanly into `initializing`
+    /// rather than staying on `optimizing` or returning to `preparing`.
     #[test]
     fn the_load_worker_continues_where_the_prepare_worker_ended() {
         let mut progression = LoadProgression::default();
         // The Load worker that ends unprepared, then the Prepare worker.
         progression.advance(LoadProgress::Preparing);
         progression.advance(LoadProgress::Preparing);
-        progression.advance(LoadProgress::Tuning {
-            completed: 100,
-            total: 100,
-            work: None,
-            measured_configurations: 0,
-            formed_programs: 0,
-        });
-        // The Load worker.
-        assert_eq!(progression.advance(LoadProgress::Preparing), None);
+        assert_eq!(
+            progression.advance(LoadProgress::Compiling { completed: 0, total: 100 }),
+            Some((
+                ModelLoadStage::Compiling,
+                0.0,
+                Some(ModelLoadDetails::Compiling {
+                    compiled_programs: 0,
+                    total_programs: 100,
+                }),
+            ))
+        );
+        assert_eq!(
+            progression.advance(LoadProgress::Compiling { completed: 100, total: 100 }),
+            Some((
+                ModelLoadStage::Compiling,
+                0.25,
+                Some(ModelLoadDetails::Compiling {
+                    compiled_programs: 100,
+                    total_programs: 100,
+                }),
+            ))
+        );
+        assert_eq!(
+            progression
+                .advance(LoadProgress::Tuning {
+                    completed: 100,
+                    total: 100,
+                    work: None,
+                    measured_configurations: 12,
+                    formed_programs: 24,
+                })
+                .map(|(stage, fraction, _)| (stage, fraction)),
+            Some((ModelLoadStage::Optimizing, 0.5))
+        );
+        // The second Load worker's Preparing immediately transitions to Initializing; its
+        // subsequent explicit Initializing does not duplicate the report.
+        assert_eq!(
+            progression.advance(LoadProgress::Preparing),
+            Some((ModelLoadStage::Initializing, 0.5, None))
+        );
+        assert_eq!(progression.advance(LoadProgress::Initializing), None);
         assert_eq!(
             progression.advance(weights(500, 1000)).map(|(stage, fraction, _)| (stage, fraction)),
             Some((ModelLoadStage::LoadingWeights, 0.75))
         );
-        // No tuning was reported: the load fills with weights.
+        // No tuning was reported (warm load): Preparing -> Initializing -> LoadingWeights -> Finalizing.
         let mut progression = LoadProgression::default();
-        progression.advance(LoadProgress::Preparing);
+        assert_eq!(
+            progression.advance(LoadProgress::Preparing),
+            Some((ModelLoadStage::Preparing, 0.0, None))
+        );
         assert_eq!(progression.advance(LoadProgress::Preparing), None);
+        assert_eq!(
+            progression.advance(LoadProgress::Initializing),
+            Some((ModelLoadStage::Initializing, 0.0, None))
+        );
         assert_eq!(
             progression.advance(weights(500, 1000)).map(|(stage, fraction, _)| (stage, fraction)),
             Some((ModelLoadStage::LoadingWeights, 0.5))
+        );
+        // Surprise cache miss during warm probe: Preparing -> Initializing -> Prepare worker's
+        // Preparing is ignored (no backward bounce) -> Compiling -> Optimizing -> Initializing.
+        let mut progression = LoadProgression::default();
+        assert_eq!(
+            progression.advance(LoadProgress::Preparing),
+            Some((ModelLoadStage::Preparing, 0.0, None))
+        );
+        assert_eq!(
+            progression.advance(LoadProgress::Initializing),
+            Some((ModelLoadStage::Initializing, 0.0, None))
+        );
+        assert_eq!(progression.advance(LoadProgress::Preparing), None);
+        assert_eq!(
+            progression.advance(LoadProgress::Compiling { completed: 50, total: 100 }).map(|(s, f, _)| (s, f)),
+            Some((ModelLoadStage::Compiling, 0.125))
         );
     }
 

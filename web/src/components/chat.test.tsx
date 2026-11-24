@@ -155,7 +155,9 @@ describe("Chat presentation", () => {
     ["preparing", live({ type: "preparing" }), "Preparing prompt"],
     ["model queued", live({ type: "model_loading", stage: "queued" }), "Waiting for model"],
     ["model preparing", live({ type: "model_loading", stage: "preparing" }), "Preparing model"],
+    ["compiling", live({ type: "model_loading", stage: "compiling" }), "Compiling kernels"],
     ["optimizing", live({ type: "model_loading", stage: "optimizing" }), "Optimizing model"],
+    ["initializing", live({ type: "model_loading", stage: "initializing" }), "Loading kernels"],
     ["loading weights", live({ type: "model_loading", stage: "loading_weights" }), "Loading model"],
     ["finalizing", live({ type: "model_loading", stage: "finalizing" }), "Finalizing model"],
     ["prefill", live({ type: "prefill" }), "Processing prompt"],
@@ -183,6 +185,23 @@ describe("Chat presentation", () => {
     const answering = running({ content: [{ type: "text", text: "Hi", time: { started: 200, ended: 300 } }] })
     expect(renderToStaticMarkup(<ChatActivityStatus response={answering} live={generating} now={1100} />)).toBe("")
     expect(renderToStaticMarkup(<ChatActivityStatus response={running()} live={generating} now={1100} />)).toBe("")
+  })
+  it("renders compiled kernel count and compact percentage while compiling", () => {
+    const html = renderToStaticMarkup(
+      <ChatActivityStatus
+        response={running()}
+        live={live(
+          { type: "model_loading", stage: "compiling" },
+          { type: "model_loading", details: { kind: "compiling", compiled_programs: 142, total_programs: 315 } }
+        )}
+        now={1100}
+      />
+    )
+    expect(html).toContain('aria-label="Compiling kernels"')
+    expect(html).toContain("Building kernels for this device (one-time)")
+    expect(html).toContain('aria-valuenow="45"')
+    expect(html).toContain("142 / 315")
+    expect(html).toContain("00:01")
   })
   it("renders the tested kernel count while optimizing, without tuning internals", () => {
     const html = renderToStaticMarkup(

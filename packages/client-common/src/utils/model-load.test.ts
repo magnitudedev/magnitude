@@ -19,15 +19,19 @@ const hardware = Option.some({
 } as unknown as LocalInferenceHardware)
 
 describe("model optimization wording", () => {
-  it("names the accelerator while tuning and has no share while preparing", () => {
+  it("names the accelerator while tuning, reports compiling progress, and has no share while preparing", () => {
     const preparing: ModelOptimizationProgress = { stage: "preparing", completed: 0, total: 0, device: Option.some(device) }
+    const compiling: ModelOptimizationProgress = { stage: "compiling", completed: 140, total: 315, device: Option.some(device) }
     const tuning: ModelOptimizationProgress = { stage: "tuning", completed: 42, total: 100, device: Option.some(device) }
 
     expect(describeModelOptimization(preparing, hardware)).toBe("Preparing to optimize…")
+    expect(describeModelOptimization(compiling, hardware)).toBe("Compiling kernels…")
     expect(describeModelOptimization(tuning, hardware)).toBe("Optimizing for Apple M3 Max…")
     expect(describeModelOptimization(tuning, Option.none())).toBe("Optimizing…")
     expect(modelOptimizationFraction(preparing)).toEqual(Option.none())
+    expect(modelOptimizationFraction(compiling)).toEqual(Option.some(140 / 315))
     expect(formatModelOptimization(preparing)).toBe("Optimizing")
+    expect(formatModelOptimization(compiling)).toBe("Compiling 44%")
     expect(formatModelOptimization(tuning)).toBe("Optimizing 42%")
     expect(formatModelOptimization({ ...tuning, completed: 232, total: 400 })).toBe("Optimizing 58%")
   })

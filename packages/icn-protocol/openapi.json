@@ -3866,6 +3866,7 @@
         "enum": [
           "waiting",
           "preparing",
+          "compiling",
           "tuning"
         ]
       },
@@ -9440,6 +9441,32 @@
           {
             "type": "object",
             "required": [
+              "compiled_programs",
+              "total_programs",
+              "kind"
+            ],
+            "properties": {
+              "compiled_programs": {
+                "type": "integer",
+                "format": "int64",
+                "minimum": 0
+              },
+              "total_programs": {
+                "type": "integer",
+                "format": "int64",
+                "minimum": 0
+              },
+              "kind": {
+                "type": "string",
+                "enum": [
+                  "compiling"
+                ]
+              }
+            }
+          },
+          {
+            "type": "object",
+            "required": [
               "elapsed_ms",
               "budget_ms",
               "measured_configurations",
@@ -9556,7 +9583,9 @@
         "enum": [
           "queued",
           "preparing",
+          "compiling",
           "optimizing",
+          "initializing",
           "loading_weights",
           "finalizing"
         ]
