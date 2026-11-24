@@ -6,15 +6,25 @@
 
 namespace routed {
 
-// The decode GEMV kernels' block: DECODE_WARPS warps (the declarations' 128 threads). A kernel declares it as its
-// launch bound (`routed_up` does) so the compiler allocates registers for that block, not for the largest one the
-// hardware admits; the others adopt the bound where it is measured to pay.
+// The decode GEMV kernels' block: DECODE_WARPS warps (the declarations' 128 threads).
+// Records weights (`GemvRecords`, e.g. iq2xxs) and NB=1 entry-order weights (`GemvEntries`,
+// e.g. iq1m/iq2xs) need multi-block SM residency (`16 / DECODE_WARPS` = 4 blocks/SM,
+// <=128 regs/thread) to hide memory latency; NB>1 entry-order and MMA/hier weights spill
+// if capped below their natural register count.
 constexpr int DECODE_WARPS = 4;
 constexpr int DECODE_THREADS = DECODE_WARPS * 32;
+template <int NB, class... W> __host__ __device__ constexpr int decode_min_blocks() {
+    constexpr bool HIGH_OCCUPANCY = ((projection::GemvRecords<W>::value
+                                      || (NB == 1 && projection::GemvEntries<W>::value)
+                                      || projection::Same<W, projection::NoWeight>::value)
+                                     && ...);
+    return HIGH_OCCUPANCY ? (16 / DECODE_WARPS) : 1;
+}
 constexpr int DECODE_BATCHES = (SEISMIC_CONST_VERIFY_ROWS + 7) / 8;
 static_assert(DECODE_BATCHES * 8 >= SEISMIC_CONST_VERIFY_ROWS, "DecodeGatheredShape must cover VERIFY_ROWS");
 template <int TPW, int KSPLIT, int NB = 1> using DecodeShape = projection::GemvShape<DECODE_WARPS, TPW, KSPLIT, NB>;
-template <int TPW, int KSPLIT> using DecodeGatheredShape = DecodeShape<TPW, KSPLIT, DECODE_BATCHES>;
+template <int TPW, int KSPLIT, int NB = DECODE_BATCHES>
+using DecodeGatheredShape = DecodeShape<TPW, KSPLIT, NB>;
 
 // The grid-point readers and points source of a routed decode GEMV over
 // weights WA (and optional paired WB). Multi-branch kernels combine their

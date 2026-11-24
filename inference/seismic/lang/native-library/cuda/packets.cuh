@@ -2300,26 +2300,30 @@ template <class G> struct GridPlanes {
         __device__ static __forceinline__ int gemv_half(int step, u32 t) {
             return GROUP_STEPS == 2 ? step : (int)(t % 2);
         }
-        // Whether a lane takes its entries from its rows' k-block words
-        // (`Raw`): entries of a width dividing a word, each in one word the
-        // lane selects in registers. An entry of another width spans two
-        // words, and selecting them by the lane's entry index places a
-        // k-block's words in local memory, so the lane loads its own entries
-        // alone (`LaneEntries`).
-        __host__ __device__ static constexpr bool word_entries() { return 32 % (8 * G::entries::BYTES) == 0; }
-        // A quad's raw 24-byte k-block chunks for rows g and g + 8 (lane t < 3
-        // loads bytes 8*t..8*t+7 bypassing L1, plus high bits where present).
+        // A quad's cooperative raw k-block chunks for rows g and g + 8, loaded
+        // with L1 bypass (`_na`) so streaming weights do not evict activations:
+        // - BYTES == 1 (8B low): lanes 0..1 load low[0..1] in `u32 v[2]`.
+        // - BYTES == 2 (16B low): lanes 0..3 load low[0..3] in `u32 v[2]`.
+        // - BYTES == 3 (24B low): lanes 0..2 load 8B chunks in `uint2 v[2]`.
+        // When high bits are present, lanes 0..1 load rows g and g+8's high
+        // words into `u32 high` (single non-divergent plane load).
         // Shuffling happens at decode (`entry_of`) so double-buffered loads
         // overlap compute without load-to-shuffle stalls.
-        template <bool HAS_HIGH, class = void> struct LaneEntriesOf {
+        template <int BYTES, bool HAS_HIGH, class = void> struct QuadEntriesOf {
+            u32 v[2];
+        };
+        template <int BYTES, class Dummy> struct QuadEntriesOf<BYTES, true, Dummy> {
+            u32 v[2];
+            u32 high;
+        };
+        template <class Dummy> struct QuadEntriesOf<3, false, Dummy> {
             uint2 v[2];
         };
-        template <class Dummy> struct LaneEntriesOf<true, Dummy> {
+        template <class Dummy> struct QuadEntriesOf<3, true, Dummy> {
             uint2 v[2];
-            u32 high[2];
+            u32 high;
         };
-        typedef LaneEntriesOf<G::high_bits() != 0> LaneEntries;
-        typedef typename Select<word_entries(), Raw, LaneEntries>::type EntryRaw;
+        typedef QuadEntriesOf<G::entries::BYTES, G::high_bits() != 0> EntryRaw;
         // The k-block's entries lane `lane` reads in entry order.
         template <class W>
         __device__ static __forceinline__ EntryRaw fetch_entries(const W &w, u64 tile, u64 kblock, u32 lane) {
@@ -2328,35 +2332,53 @@ template <class G> struct GridPlanes {
         // The same with rows a and b as the lane's rows g and g + 8.
         template <class W>
         __device__ static __forceinline__ EntryRaw fetch_entries_rows(const W &w, u64 a, u64 b, u64 kblock, u32 t) {
-            if constexpr (word_entries()) {
-                return GridPlanes::fetch_rows(w, a, b, kblock, t);
-            } else {
-                static_assert(G::entries::BYTES == 3 && KBLOCK_BYTES == 24, "non-word grid entries are 3 bytes");
-                LaneEntries raw;
+            constexpr int BYTES = G::entries::BYTES;
+            static_assert(BYTES == 1 || BYTES == 2 || BYTES == 3, "grid entries are 1, 2, or 3 bytes");
+            EntryRaw raw;
 #pragma unroll
-                for (int r = 0; r < 2; ++r) {
-                    const u64 tile = (r == 0 ? a : b) / 16;
-                    const u32 row = (u32)((r == 0 ? a : b) % 16);
-                    // A row's 24-byte k-block is three 8-byte chunks loaded
-                    // across lanes t = 0..2 of the quad, bypassing L1.
-                    const u8 *entries = w.low.chunk(w.base, w.stride, tile, (kblock * 16 + row) * KBLOCK_BYTES);
+            for (int r = 0; r < 2; ++r) {
+                const u64 tile = (r == 0 ? a : b) / 16;
+                const u32 row = (u32)((r == 0 ? a : b) % 16);
+                const u8 *entries = w.low.chunk(w.base, w.stride, tile, (kblock * 16 + row) * KBLOCK_BYTES);
+                if constexpr (BYTES == 1) {
+                    raw.v[r] = t < 2 ? seismic_ld_nc_na_u32(entries + 4 * t) : 0u;
+                } else if constexpr (BYTES == 2) {
+                    raw.v[r] = seismic_ld_nc_na_u32(entries + 4 * t);
+                } else {
                     raw.v[r] = t < 3 ? seismic_ld_nc_na_v2(entries + 8 * t) : make_uint2(0u, 0u);
-                    if constexpr (G::high_bits() != 0)
-                        raw.high[r] = high_word(w, tile, kblock, row);
                 }
-                return raw;
             }
+            if constexpr (G::high_bits() != 0) {
+                if (t < 2) {
+                    const u64 row_idx = t == 0 ? a : b;
+                    const u64 tile = row_idx / 16;
+                    const u32 row = (u32)(row_idx % 16);
+                    if constexpr (high_bytes() == 4)
+                        raw.high = seismic_ld_nc_na_u32(
+                            w.high.chunk(w.base, w.stride, tile, (kblock * 16 + row) * high_bytes()));
+                    else
+                        raw.high = high_word(w, tile, kblock, row);
+                } else {
+                    raw.high = 0u;
+                }
+            }
+            return raw;
         }
         // Entry of coefficient group `group` for row g (`row` 0) or g + 8 (1)
-        // of lane t's k-block entries (warp-collective for non-word entries).
+        // of lane t's k-block entries (quad-collective).
         __device__ static __forceinline__ u32 entry_of(const EntryRaw &raw, int row, int group, u32 t) {
-            if constexpr (word_entries()) {
-                return G::entry(row ? raw.g8 : raw.g, gemv_entry(group, t));
+            constexpr int BYTES = G::entries::BYTES;
+            const u32 quad = (threadIdx.x % 32) & ~3u;
+            const u32 e = (u32)gemv_entry(group, t);
+            u32 entry;
+            if constexpr (BYTES == 1) {
+                const u32 low_word = seismic_shfl_idx_u32(raw.v[row], quad + e / 4);
+                entry = (low_word >> (8 * (e % 4))) & 0xFFu;
+            } else if constexpr (BYTES == 2) {
+                const u32 word = seismic_shfl_idx_u32(raw.v[row], quad + e / 2);
+                entry = (word >> (16 * (e % 2))) & 0xFFFFu;
             } else {
-                constexpr u32 BYTES = (u32)G::entries::BYTES;
-                const u32 quad = (threadIdx.x % 32) & ~3u;
-                const u32 e = (u32)gemv_entry(group, t);
-                const u32 first = BYTES * e, last = first + BYTES - 1;
+                const u32 first = 3u * e, last = first + 2u;
                 const u32 w0 = first / 4, w1 = last / 4;
                 // Since BYTES == 3, w1 - w0 is 0 or 1, so {w0, w1} contains at
                 // most one even word (in v.x) and at most one odd word (in v.y).
@@ -2367,11 +2389,13 @@ template <class G> struct GridPlanes {
                 const u32 odd_val = seismic_shfl_idx_u32(v.y, quad + odd_w / 2);
                 const u32 lo = (w0 & 1u) ? odd_val : even_val;
                 const u32 hi = (w0 & 1u) ? even_val : odd_val;
-                u32 entry = __funnelshift_r(lo, hi, 8 * (first % 4)) & 0xFFFFFFu;
-                if constexpr (G::high_bits() != 0)
-                    entry |= ((raw.high[row] >> (G::high_bits() * e)) & ((1u << G::high_bits()) - 1u)) << (8 * BYTES);
-                return entry;
+                entry = __funnelshift_r(lo, hi, 8 * (first % 4)) & 0xFFFFFFu;
             }
+            if constexpr (G::high_bits() != 0) {
+                const u32 hw = seismic_shfl_idx_u32(raw.high, quad + (u32)row);
+                entry |= ((hw >> (G::high_bits() * e)) & ((1u << G::high_bits()) - 1u)) << (8 * BYTES);
+            }
+            return entry;
         }
         // The A pairs of values (4 h, 4 h + 1) and (4 h + 2, 4 h + 3) of
         // coefficient group `group`'s entry of row g (`row` 0) or g + 8 (1)
@@ -2609,8 +2633,8 @@ template <class G, class K> struct Records {
         return scales;
     }
     // Each point's eight magnitude codes (`grids::magnitudes`: a magnitude
-    // shifted right by `SHIFT`), value i at nibble i. The GEMV's KSPLIT warps of a tile group form a copy in
-    // shared memory.
+    // shifted right by `SHIFT`), value i at nibble i. The GEMV block's threads
+    // form one copy in shared memory.
     struct Table {
         u32 points[Pts::MASK + 1];
     };

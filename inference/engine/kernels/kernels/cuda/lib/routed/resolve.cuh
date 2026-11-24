@@ -67,3 +67,35 @@ __device__ __forceinline__ void routed_resolve(const ResolvePorts &bank, bool wh
         streaming_record_key(keys_record, SEISMIC_KEYS_STRIDE_1, SEISMIC_KEYS_STRIDE_2,                     \
             static_cast<unsigned>(r), e, __float_as_int(key));                                              \
     }
+
+// Writes M rows of E selection keys from `logits` (row stride `logits_stride`)
+// into the step's key record using coalesced 128-bit loads and non-volatile
+// 128-bit stores across all threads of the block when aligned, falling back to
+// scalar `streaming_record_key` otherwise.
+__device__ __forceinline__ void routed_write_keys_rows(int *keys_record, unsigned long long keys1,
+                                                       unsigned long long keys2, const float *logits,
+                                                       unsigned long long logits_stride, unsigned M, unsigned E) {
+    if (keys2 == 1ull && (E & 3u) == 0u && (keys1 & 3ull) == 0ull && (logits_stride & 3ull) == 0ull &&
+        (reinterpret_cast<unsigned long long>(keys_record) & 15ull) == 0ull &&
+        (reinterpret_cast<unsigned long long>(logits) & 15ull) == 0ull) {
+        const unsigned e4 = E >> 2u;
+        const unsigned total4 = M * e4;
+        const unsigned long long k1_4 = keys1 >> 2ull;
+        const unsigned long long l_4 = logits_stride >> 2ull;
+        const uint4 *src4 = reinterpret_cast<const uint4 *>(logits);
+        uint4 *dst4 = reinterpret_cast<uint4 *>(keys_record);
+        for (unsigned idx = threadIdx.x; idx < total4; idx += blockDim.x) {
+            const unsigned row = idx / e4;
+            const unsigned col = idx % e4;
+            dst4[row * k1_4 + col] = src4[row * l_4 + col];
+        }
+    } else {
+        const unsigned total = M * E;
+        for (unsigned idx = threadIdx.x; idx < total; idx += blockDim.x) {
+            const unsigned row = idx / E;
+            const unsigned e = idx % E;
+            streaming_record_key(keys_record, keys1, keys2, row, e,
+                                 __float_as_int(logits[row * logits_stride + e]));
+        }
+    }
+}

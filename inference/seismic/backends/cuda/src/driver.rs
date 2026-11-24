@@ -878,6 +878,14 @@ impl Event {
         Self::with_flags(context, EVENT_DISABLE_TIMING)
     }
 
+    /// A completion event with blocking synchronization and timing disabled
+    /// ([`EVENT_BLOCKING_SYNC`] | [`EVENT_DISABLE_TIMING`]): zero GPU timestamp
+    /// overhead on record, blocking `cuEventSynchronize` for long waits, and
+    /// non-blocking `cuEventQuery` for low-latency polling.
+    pub(crate) fn blocking_sync_only(context: &Arc<Context>) -> Result<Self, DriverError> {
+        Self::with_flags(context, EVENT_BLOCKING_SYNC | EVENT_DISABLE_TIMING)
+    }
+
     fn with_flags(context: &Arc<Context>, flags: c_uint) -> Result<Self, DriverError> {
         let _current = context.enter()?;
         let mut raw = std::ptr::null_mut();

@@ -33,6 +33,8 @@ using Segments = projection::op::SegmentSet<0, projection::op::Types<packets::W0
             SEISMIC_DIM_H, projection::AllRows{}, SEISMIC_RESIDUAL_STRIDE_1, SEISMIC_NORM_STRIDE_0            \
     }
 
+constexpr unsigned long long LOGITS_STRIDE = (SEISMIC_DIM_E + 4ull) & ~3ull;
+
 #define MAKE_SEGMENTS(logits_out)                                                                             \
     Segments {                                                                                                \
         {SEISMIC_DIM_E, 1, SEISMIC_DIM_S},                                                                    \
@@ -40,8 +42,8 @@ using Segments = projection::op::SegmentSet<0, projection::op::Types<packets::W0
              KERNEL_W1_AT(SEISMIC_PTR(SEISMIC_BUFFER_SHARED_ROUTER)),                                        \
              KERNEL_W2_AT(SEISMIC_PTR(SEISMIC_BUFFER_SHARED_GATE)),                                          \
              KERNEL_W3_AT(SEISMIC_PTR(SEISMIC_BUFFER_SHARED_UP))},                                            \
-        {LogitStore{logits_out, SEISMIC_DIM_E + 1, 0},                                                        \
-         LogitStore{logits_out, SEISMIC_DIM_E + 1, SEISMIC_DIM_E},                                            \
+        {LogitStore{logits_out, LOGITS_STRIDE, 0},                                                            \
+         LogitStore{logits_out, LOGITS_STRIDE, SEISMIC_DIM_E},                                                \
          SharedEpi{SEISMIC_RESULT_2_OUT, SEISMIC_RESULT_2_STRIDE_0}}                                          \
     }
 
@@ -68,14 +70,16 @@ extern "C" __global__ void routed_route_streamed_ordered_gemv(SEISMIC_KERNEL_PAR
     unsigned *arrivals = reinterpret_cast<unsigned *>(SEISMIC_PTR(SEISMIC_BUFFER_SCRATCH_ARRIVALS));
     if (!arrive::last(arrivals, ordered_tiles, &last))
         return;
-    const float *logits = reinterpret_cast<const float *>(SEISMIC_PTR(SEISMIC_BUFFER_SCRATCH_LOGITS));
+    float *logits = reinterpret_cast<float *>(SEISMIC_PTR(SEISMIC_BUFFER_SCRATCH_LOGITS));
     const route::Selection sel = ROUTE_SELECTION;
     const unsigned lane = threadIdx.x % 32, warp = threadIdx.x / 32, warps = blockDim.x / 32;
-    ROUTED_KEYS_RECORD;
+    // Stage each row's ranked keys in place in device scratch `logits[row, 0..E)`
+    // (dead once `rank_row` loads it) so zero pinned-host PCIe writes sit in
+    // the write buffer when `routed_resolve` executes `fence.acq_rel.sys`.
     for (unsigned row = warp; row < static_cast<unsigned>(SEISMIC_DIM_M); row += warps) {
-        const float *row_logits = logits + static_cast<unsigned long long>(row) * (SEISMIC_DIM_E + 1);
+        float *row_logits = logits + static_cast<unsigned long long>(row) * LOGITS_STRIDE;
         route::select_row([&](unsigned long long e) { return __ldcg(row_logits + e); }, sel, row, lane,
-                          seismic_words_value, ROUTED_ROW_KEYS(row));
+                          seismic_words_value, [&](unsigned e, float key) { row_logits[e] = key; });
     }
     int *words = reinterpret_cast<int *>(dynamic_shared);
     const ResolvePorts bank =
@@ -102,36 +106,11 @@ extern "C" __global__ void routed_route_streamed_ordered_gemv(SEISMIC_KERNEL_PAR
                 const u64 q = streaming_step(bank.step, SEISMIC_STEP_STRIDE_0);
                 const u64 slot = q % (u64)SEISMIC_DIM_SF;
                 using A = ELEMENT_OF(SEISMIC_ELEMENT_A);
-                const typename A::storage *norm =
-                    reinterpret_cast<const typename A::storage *>(SEISMIC_RESULT_0_OUT.stored());
-                const element::Out<element::F32> rows = SEISMIC_OUT_SITE_ROWS;
-                float *site_base = reinterpret_cast<float *>(const_cast<element::u8 *>(rows.stored(slot * SEISMIC_SITE_ROWS_STRIDE_0)));
-                if (SEISMIC_SITE_ROWS_STRIDE_2 == 1ull && SEISMIC_RESULT_0_STRIDE_1 == 1ull
-                    && (SEISMIC_DIM_H & 3ull) == 0ull && (SEISMIC_SITE_ROWS_STRIDE_1 & 3ull) == 0ull
-                    && (reinterpret_cast<u64>(site_base) & 15ull) == 0ull) {
-                    const u64 h4 = SEISMIC_DIM_H >> 2ull;
-                    const u64 count4 = SEISMIC_DIM_M * h4;
-                    for (u64 i = threadIdx.x; i < count4; i += blockDim.x) {
-                        const u64 m = i / h4, n4 = (i % h4) << 2ull;
-                        const typename A::storage *src = norm + m * SEISMIC_RESULT_0_STRIDE_0 + n4;
-                        const float v0 = A::load(__ldcg(src + 0));
-                        const float v1 = A::load(__ldcg(src + 1));
-                        const float v2 = A::load(__ldcg(src + 2));
-                        const float v3 = A::load(__ldcg(src + 3));
-                        float *dst = site_base + m * SEISMIC_SITE_ROWS_STRIDE_1 + n4;
-                        asm volatile("st.relaxed.sys.global.v4.f32 [%0], {%1, %2, %3, %4};"
-                                     :: "l"(dst), "f"(v0), "f"(v1), "f"(v2), "f"(v3) : "memory");
-                    }
-                } else {
-                    const u64 count = SEISMIC_DIM_M * SEISMIC_DIM_H;
-                    for (u64 i = threadIdx.x; i < count; i += blockDim.x) {
-                        const u64 m = i / SEISMIC_DIM_H, n = i % SEISMIC_DIM_H;
-                        rows.put_system(slot * SEISMIC_SITE_ROWS_STRIDE_0 + m * SEISMIC_SITE_ROWS_STRIDE_1
-                                            + n * SEISMIC_SITE_ROWS_STRIDE_2,
-                                        A::load(__ldcg(norm + m * SEISMIC_RESULT_0_STRIDE_0
-                                                       + n * SEISMIC_RESULT_0_STRIDE_1)));
-                    }
-                }
+                streaming::copy_site_rows<A>(
+                    reinterpret_cast<const typename A::storage *>(SEISMIC_RESULT_0_OUT.stored()),
+                    SEISMIC_RESULT_0_STRIDE_0, SEISMIC_RESULT_0_STRIDE_1, SEISMIC_OUT_SITE_ROWS,
+                    slot * SEISMIC_SITE_ROWS_STRIDE_0, SEISMIC_SITE_ROWS_STRIDE_1, SEISMIC_SITE_ROWS_STRIDE_2,
+                    SEISMIC_DIM_M, SEISMIC_DIM_H);
                 streaming_publish_barrier();
                 if (threadIdx.x == 0) {
                     streaming_system_fence();
@@ -144,4 +123,8 @@ extern "C" __global__ void routed_route_streamed_ordered_gemv(SEISMIC_KERNEL_PAR
             }
         }
     }
+    __syncthreads();
+    ROUTED_KEYS_RECORD;
+    routed_write_keys_rows(keys_record, SEISMIC_KEYS_STRIDE_1, SEISMIC_KEYS_STRIDE_2, logits, LOGITS_STRIDE,
+                           static_cast<unsigned>(SEISMIC_DIM_M), static_cast<unsigned>(SEISMIC_DIM_E));
 }

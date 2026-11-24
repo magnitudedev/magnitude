@@ -34,7 +34,8 @@ using Epi = projection::Activated<ELEMENT_OF(SEISMIC_ELEMENT_A)>;
 
 #ifdef SEISMIC_FORMING_ROUTED_UP_CHOICE
 template <int TPW, int KSPLIT>
-__launch_bounds__(routed::DECODE_THREADS) __global__ void routed_up_choice(SEISMIC_KERNEL_PARAMS) {
+__launch_bounds__(routed::DECODE_THREADS, routed::decode_min_blocks<1, packets::W0>())
+__global__ void routed_up_choice(SEISMIC_KERNEL_PARAMS) {
     using Shape = routed::DecodeShape<TPW, KSPLIT>;
     using Readers = routed::DecodeReaders<packets::W0>;
     __shared__ projection::GemvShared<Shape, projection::SharedRow, 0, routed::DecodePoints<packets::W0>> shared;
@@ -82,43 +83,54 @@ __global__ void routed_up_stage(SEISMIC_KERNEL_PARAMS) {
 }
 #endif
 
+#define ROUTED_UP_GATHERED_BODY(NB)                                                                        \
+    using Shape = routed::DecodeGatheredShape<GATHER_TPW, KSPLIT, NB>;                                     \
+    using Readers = routed::DecodeReaders<packets::W0>;                                                    \
+    __shared__ projection::GemvShared<Shape, Raw, 0, routed::DecodePoints<packets::W0>> shared;            \
+    __shared__ routed::Gathered table;                                                                     \
+    const int *routes = reinterpret_cast<const int *>(SEISMIC_PTR(SEISMIC_BUFFER_ROUTES));                 \
+    const unsigned choice = blockIdx.y, slots = (unsigned)SEISMIC_DIM_K;                                   \
+    const auto record = [&](unsigned c) {                                                                  \
+        const int ex = routed::route(routes, SEISMIC_ROUTES_STRIDE_0, SEISMIC_ROUTES_STRIDE_1, slots, c);  \
+        return routed::ChoiceKey{ex, UP_SOURCE(c / slots, c % slots, ex).code, true};                      \
+    };                                                                                                     \
+    if (!routed::gather(table, record, routes, SEISMIC_ROUTES_STRIDE_0, SEISMIC_ROUTES_STRIDE_1,           \
+                        (unsigned)SEISMIC_DIM_M, slots, choice, GATHERED_STRIDE, SEISMIC_RESULT_0_STRIDE_0, \
+                        SEISMIC_RESULT_0_STRIDE_1))                                                        \
+        return;                                                                                            \
+    const projection::u64 expert = (projection::u64)table.expert;                                          \
+    const slab::Matrix weights = UP_WEIGHTS(choice / slots, choice % slots, (int)expert);                  \
+    if (weights.stack == nullptr) {                                                                        \
+        for (unsigned r = 0; r < table.count; ++r)                                                         \
+            routed::zero_block_rows<Shape>(SEISMIC_DIM_F, [&](projection::u64 n) {                         \
+                SEISMIC_RESULT_0_OUT.put(table.products[r] + n, 0.0f);                                     \
+            });                                                                                            \
+        return;                                                                                            \
+    }                                                                                                      \
+    projection::stage_points(Readers{});                                                                   \
+    const projection::u64 group = Shape::tile_group();                                                     \
+    const auto epi = projection::scaling<(SEISMIC_DIM_US != 0)>::wrap(                                     \
+        routed::ChoiceRows<Epi>{Epi{SEISMIC_RESULT_0_OUT, 0, (int)SEISMIC_PARAM_ACTIVATION},               \
+                                table.products},                                                           \
+        projection::scale_factor(SEISMIC_PTR(SEISMIC_BUFFER_UP_SCALE), SEISMIC_DIM_US,                     \
+                                 SEISMIC_UP_SCALE_STRIDE_0, expert),                                       \
+        1.0f);                                                                                             \
+    projection::gemv_segment<Shape>(shared, routed::GatheredRows{GATHERED_ROWS, table.rows}, table.count,  \
+                                    SEISMIC_DIM_H / 64, group, SEISMIC_DIM_F,                              \
+                                    PACKETS_MATRIX(KERNEL_W0, weights), projection::NoWeight{}, epi);
+
 #ifdef SEISMIC_FORMING_ROUTED_UP_GATHERED
 template <int KSPLIT, int GATHER_TPW>
+__launch_bounds__(routed::DECODE_THREADS, routed::decode_min_blocks<1, packets::W0>())
 __global__ void routed_up_gathered(SEISMIC_KERNEL_PARAMS) {
-    using Shape = routed::DecodeGatheredShape<GATHER_TPW, KSPLIT>;
-    using Readers = routed::DecodeReaders<packets::W0>;
-    __shared__ projection::GemvShared<Shape, Raw, 0, routed::DecodePoints<packets::W0>> shared;
-    __shared__ routed::Gathered table;
-    const int *routes = reinterpret_cast<const int *>(SEISMIC_PTR(SEISMIC_BUFFER_ROUTES));
-    const unsigned choice = blockIdx.y, slots = (unsigned)SEISMIC_DIM_K;
-    const auto record = [&](unsigned c) {
-        const int ex = routed::route(routes, SEISMIC_ROUTES_STRIDE_0, SEISMIC_ROUTES_STRIDE_1, slots, c);
-        return routed::ChoiceKey{ex, UP_SOURCE(c / slots, c % slots, ex).code, true};
-    };
-    if (!routed::gather(table, record, routes, SEISMIC_ROUTES_STRIDE_0, SEISMIC_ROUTES_STRIDE_1,
-                        (unsigned)SEISMIC_DIM_M, slots, choice, GATHERED_STRIDE, SEISMIC_RESULT_0_STRIDE_0,
-                        SEISMIC_RESULT_0_STRIDE_1))
-        return;
-    const projection::u64 expert = (projection::u64)table.expert;
-    const slab::Matrix weights = UP_WEIGHTS(choice / slots, choice % slots, (int)expert);
-    // A choice with no record has a zero product.
-    if (weights.stack == nullptr) {
-        for (unsigned r = 0; r < table.count; ++r)
-            routed::zero_block_rows<Shape>(SEISMIC_DIM_F, [&](projection::u64 n) {
-                SEISMIC_RESULT_0_OUT.put(table.products[r] + n, 0.0f);
-            });
-        return;
-    }
-    projection::stage_points(Readers{});
-    const projection::u64 group = Shape::tile_group();
-    const auto epi = projection::scaling<(SEISMIC_DIM_US != 0)>::wrap(
-        routed::ChoiceRows<Epi>{Epi{SEISMIC_RESULT_0_OUT, 0, (int)SEISMIC_PARAM_ACTIVATION},
-                                table.products},
-        projection::scale_factor(SEISMIC_PTR(SEISMIC_BUFFER_UP_SCALE), SEISMIC_DIM_US, SEISMIC_UP_SCALE_STRIDE_0,
-                                 expert),
-        1.0f);
-    projection::gemv_segment<Shape>(shared, routed::GatheredRows{GATHERED_ROWS, table.rows}, table.count,
-                                    SEISMIC_DIM_H / 64, group, SEISMIC_DIM_F,
-                                    PACKETS_MATRIX(KERNEL_W0, weights), projection::NoWeight{}, epi);
+    ROUTED_UP_GATHERED_BODY(1)
+}
+#endif
+
+#ifdef SEISMIC_FORMING_ROUTED_UP_GATHERED16
+template <int KSPLIT, int GATHER_TPW>
+__launch_bounds__(routed::DECODE_THREADS, routed::decode_min_blocks<routed::DECODE_BATCHES, packets::W0>())
+__global__ void routed_up_gathered16(SEISMIC_KERNEL_PARAMS) {
+    ROUTED_UP_GATHERED_BODY(routed::DECODE_BATCHES)
 }
 #endif

@@ -76,6 +76,7 @@ __global__ void routed_expand_stage(SEISMIC_KERNEL_PARAMS) {
 
 #ifdef SEISMIC_FORMING_ROUTED_EXPAND_CHOICE
 template <int TPW, int KSPLIT>
+__launch_bounds__(routed::DECODE_THREADS, routed::decode_min_blocks<1, packets::W0, packets::W1, packets::W2, packets::W3>())
 __global__ void routed_expand_choice(SEISMIC_KERNEL_PARAMS) {
     using Shape = routed::DecodeShape<TPW, KSPLIT>;
     using RoutedReaders = routed::DecodeReaders<packets::W0, packets::W1>;
@@ -108,43 +109,51 @@ __global__ void routed_expand_choice(SEISMIC_KERNEL_PARAMS) {
 }
 #endif
 
+#define ROUTED_EXPAND_GATHERED_BODY(NB)                                                                        \
+    using Shape = routed::DecodeGatheredShape<GATHER_TPW, KSPLIT, NB>;                                         \
+    using RoutedReaders = routed::DecodeReaders<packets::W0, packets::W1>;                                     \
+    using SharedReaders = routed::DecodeReaders<packets::W2, packets::W3>;                                     \
+    using Points = typename projection::PointsOf<typename routed::DecodeUnion<RoutedReaders, SharedReaders>::type>::type; \
+    __shared__ projection::GemvShared<Shape, Pro, 0, Points> shared;                                           \
+    const int *routes = reinterpret_cast<const int *>(SEISMIC_PTR(SEISMIC_BUFFER_ROUTES));                     \
+    const projection::u64 group = Shape::tile_group();                                                         \
+    const projection::u64 choices = SEISMIC_DIM_M * SEISMIC_DIM_K;                                             \
+    if (blockIdx.y < choices) {                                                                                \
+        seismic_dependency_start();                                                                            \
+        __shared__ routed::Gathered table;                                                                     \
+        const unsigned slots = (unsigned)SEISMIC_DIM_K;                                                        \
+        const auto record = [&](unsigned c) {                                                                  \
+            const int ex = routed::route(routes, SEISMIC_ROUTES_STRIDE_0, SEISMIC_ROUTES_STRIDE_1, slots, c);  \
+            return routed::ChoiceKey{ex, ex, true};                                                            \
+        };                                                                                                     \
+        if (!routed::gather(table, record, routes, SEISMIC_ROUTES_STRIDE_0, SEISMIC_ROUTES_STRIDE_1,           \
+                            (unsigned)SEISMIC_DIM_M, slots, blockIdx.y,                                        \
+                            STRIDE_OF(ROUTED_NVFP4), SEISMIC_RESULT_0_STRIDE_0, SEISMIC_RESULT_0_STRIDE_1))    \
+            return;                                                                                            \
+        projection::stage_points(RoutedReaders{});                                                             \
+        const projection::u64 expert = (projection::u64)table.expert;                                          \
+        projection::gemv_segment<Shape>(                                                                       \
+            shared, routed::GatheredRows{ROWS_OF(ROUTED_NVFP4), table.rows}, table.count, SEISMIC_DIM_H / 64,  \
+            group, SEISMIC_DIM_F,                                                                              \
+            PACKETS_RECORD(KERNEL_W0, slab::region(SEISMIC_PTR(SEISMIC_BUFFER_EXPERT_GATE), expert)),          \
+            PACKETS_RECORD(KERNEL_W1, slab::region(SEISMIC_PTR(SEISMIC_BUFFER_EXPERT_UP), expert)),            \
+            EXPERT_SCALED((routed::ChoiceRows<Epi>{Epi{SEISMIC_RESULT_0_OUT, 0}, table.products}), expert));   \
+        return;                                                                                                \
+    }                                                                                                          \
+    SHARED_EXPERT(Shape, shared, group);
+
 #ifdef SEISMIC_FORMING_ROUTED_EXPAND_GATHERED
 template <int KSPLIT, int GATHER_TPW>
+__launch_bounds__(routed::DECODE_THREADS, routed::decode_min_blocks<1, packets::W0, packets::W1, packets::W2, packets::W3>())
 __global__ void routed_expand_gathered(SEISMIC_KERNEL_PARAMS) {
-    using Shape = routed::DecodeGatheredShape<GATHER_TPW, KSPLIT>;
-    using RoutedReaders = routed::DecodeReaders<packets::W0, packets::W1>;
-    using SharedReaders = routed::DecodeReaders<packets::W2, packets::W3>;
-    using Points = typename projection::PointsOf<typename routed::DecodeUnion<RoutedReaders, SharedReaders>::type>::type;
-    __shared__ projection::GemvShared<Shape, Pro, 0, Points> shared;
-    const int *routes = reinterpret_cast<const int *>(SEISMIC_PTR(SEISMIC_BUFFER_ROUTES));
-    const projection::u64 group = Shape::tile_group();
-    const projection::u64 choices = SEISMIC_DIM_M * SEISMIC_DIM_K;
+    ROUTED_EXPAND_GATHERED_BODY(1)
+}
+#endif
 
-    // A choice's expert comes from the launch before, so its blocks wait
-    // first; the shared expert's issue their first weight loads before.
-    if (blockIdx.y < choices) {
-        seismic_dependency_start();
-        __shared__ routed::Gathered table;
-        const unsigned slots = (unsigned)SEISMIC_DIM_K;
-        const auto record = [&](unsigned c) {
-            const int ex = routed::route(routes, SEISMIC_ROUTES_STRIDE_0, SEISMIC_ROUTES_STRIDE_1, slots, c);
-            return routed::ChoiceKey{ex, ex, true};
-        };
-        if (!routed::gather(table, record, routes, SEISMIC_ROUTES_STRIDE_0, SEISMIC_ROUTES_STRIDE_1,
-                            (unsigned)SEISMIC_DIM_M, slots, blockIdx.y,
-                            STRIDE_OF(ROUTED_NVFP4), SEISMIC_RESULT_0_STRIDE_0, SEISMIC_RESULT_0_STRIDE_1))
-            return;
-        projection::stage_points(RoutedReaders{});
-        const projection::u64 expert = (projection::u64)table.expert;
-        projection::gemv_segment<Shape>(
-            shared, routed::GatheredRows{ROWS_OF(ROUTED_NVFP4), table.rows}, table.count, SEISMIC_DIM_H / 64, group,
-            SEISMIC_DIM_F, PACKETS_RECORD(KERNEL_W0, slab::region(SEISMIC_PTR(SEISMIC_BUFFER_EXPERT_GATE), expert)),
-            PACKETS_RECORD(KERNEL_W1, slab::region(SEISMIC_PTR(SEISMIC_BUFFER_EXPERT_UP), expert)),
-            EXPERT_SCALED((routed::ChoiceRows<Epi>{Epi{SEISMIC_RESULT_0_OUT, 0}, table.products}),
-                          expert));
-        return;
-    }
-
-    SHARED_EXPERT(Shape, shared, group);
+#ifdef SEISMIC_FORMING_ROUTED_EXPAND_GATHERED16
+template <int KSPLIT, int GATHER_TPW>
+__launch_bounds__(routed::DECODE_THREADS, routed::decode_min_blocks<routed::DECODE_BATCHES, packets::W0, packets::W1, packets::W2, packets::W3>())
+__global__ void routed_expand_gathered16(SEISMIC_KERNEL_PARAMS) {
+    ROUTED_EXPAND_GATHERED_BODY(routed::DECODE_BATCHES)
 }
 #endif

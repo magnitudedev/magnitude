@@ -1318,11 +1318,11 @@ __device__ __forceinline__ void gemv_entries_kblock(float (&acc)[NB][4], const W
 
 // One warp of a tile group of an entry-order weight (and its pair, when WB is
 // one): tiles [tile0, tile0 + TPW) over superblock share `part` of KSPLIT.
-// Each pass loads one superblock per tile and stream whole (rows g and g + 8
-// of its k-blocks, and their coefficient words, every load in flight at
-// once) and then decodes it; the next pass's loads follow the decode (on GB10
-// a lane with more superblocks in flight, prefetched or batched, measured
-// slower). The first superblock's loads are issued before `ready()`.
+// Double-buffers one k-block of entries at a time across `q = 0..3`, while
+// holding one superblock of coefficient blocks (`ba`/`bb`) and reloading the
+// next superblock's blocks after `q == 3` so coefficients never stay live
+// across block loads and weight staging stays within the occupancy budget.
+// The first k-block and superblock loads are issued before `ready()`.
 template <int TPW, int KSPLIT, int NB, class Src, class Ready, class WA, class WB, class Epi, class Barrier>
 __device__ __forceinline__ void gemv_entries_group(const Ready &ready, u32 M, u64 kblocks, u64 tile0, u64 tiles,
                                                    u64 rows, const WA &wa, const WB &wb, const Epi &epi,
@@ -1342,55 +1342,67 @@ __device__ __forceinline__ void gemv_entries_group(const Ready &ready, u32 M, u6
     const u64 superblocks = (kblocks + 3) / 4;
     const u64 begin = superblocks * part / KSPLIT;
     const u64 end = tile0 < tiles ? superblocks * (part + 1) / KSPLIT : begin;
-    struct Stage {
-        typename WA::EntryRaw ra[TPW][4];
-        typename WB::EntryRaw rb[TPW][4];
-        typename WA::Block ba[TPW];
-        typename WB::Block bb[TPW];
+    struct EntriesStage {
+        typename WA::EntryRaw ra[TPW];
+        typename WB::EntryRaw rb[TPW];
     };
-    auto load = [&](Stage &stage, u64 sb) {
+    auto load_entries = [&](EntriesStage &stage, u64 kblock) {
 #pragma unroll
         for (int i = 0; i < TPW; ++i)
             if (tile0 + i < tiles) {
-#pragma unroll
-                for (int q = 0; q < 4; ++q)
-                    if (4 * sb + q < kblocks) {
-                        stage.ra[i][q] = WA::fetch_entries(wa, tile0 + i, 4 * sb + q, lane);
-                        if constexpr (PAIR)
-                            stage.rb[i][q] = WB::fetch_entries(wb, tile0 + i, 4 * sb + q, lane);
-                    }
-                stage.ba[i] = wa.block(tile0 + i, sb, lane);
+                stage.ra[i] = WA::fetch_entries(wa, tile0 + i, kblock, lane);
                 if constexpr (PAIR)
-                    stage.bb[i] = wb.block(tile0 + i, sb, lane);
+                    stage.rb[i] = WB::fetch_entries(wb, tile0 + i, kblock, lane);
             }
     };
-    Stage current;
-    if (begin < end)
-        load(current, begin);
+    typename WA::Block ba[TPW];
+    typename WB::Block bb[TPW];
+    auto load_blocks = [&](u64 sb) {
+#pragma unroll
+        for (int i = 0; i < TPW; ++i)
+            if (tile0 + i < tiles) {
+                ba[i] = wa.block(tile0 + i, sb, lane);
+                if constexpr (PAIR)
+                    bb[i] = wb.block(tile0 + i, sb, lane);
+            }
+    };
+    EntriesStage current;
+    if (begin < end) {
+        if (4 * begin < kblocks)
+            load_entries(current, 4 * begin);
+        load_blocks(begin);
+    }
     const auto pro = ready();
     static_assert(decltype(ready())::FACTORS == 0, "a GEMV reads its operands in place");
     for (u64 sb = begin; sb < end; ++sb) {
-        Stage next;
-        if (sb + 1 < end)
-            load(next, sb + 1);
 #pragma unroll
         for (int q = 0; q < 4; ++q) {
             const u64 kblock = 4 * sb + q;
+            if (kblock >= kblocks)
+                break;
+            const u64 next_kblock = kblock + 1;
+            const bool has_next = next_kblock < kblocks && (q < 3 || sb + 1 < end);
+            EntriesStage next;
+            if (has_next)
+                load_entries(next, next_kblock);
 #pragma unroll
             for (int i = 0; i < TPW; ++i) {
-                if (kblock >= kblocks || tile0 + i >= tiles)
+                if (tile0 + i >= tiles)
                     continue;
                 Coefficients<WA::GROUPS> ca;
-                wa.coefficients(current.ba[i], q, ca);
-                gemv_entries_kblock<NB, Src>(acc[0][i], wa, current.ra[i][q], ca, pro, M, kblock);
+                wa.coefficients(ba[i], q, ca);
+                gemv_entries_kblock<NB, Src>(acc[0][i], wa, current.ra[i], ca, pro, M, kblock);
                 if constexpr (PAIR) {
                     Coefficients<WB::GROUPS> cb;
-                    wb.coefficients(current.bb[i], q, cb);
-                    gemv_entries_kblock<NB, Src>(acc[1][i], wb, current.rb[i][q], cb, pro, M, kblock);
+                    wb.coefficients(bb[i], q, cb);
+                    gemv_entries_kblock<NB, Src>(acc[1][i], wb, current.rb[i], cb, pro, M, kblock);
                 }
             }
+            if (q == 3 && sb + 1 < end)
+                load_blocks(sb + 1);
+            if (has_next)
+                current = next;
         }
-        current = next;
     }
     gemv_finish<TPW, KSPLIT, NB>(acc, M, tile0, tiles, rows, epi, reduce, barrier, part);
 }
@@ -1399,14 +1411,15 @@ __device__ __forceinline__ void gemv_entries_group(const Ready &ready, u32 M, u6
 // pair of the same representation, or none): tiles [tile0, tile0 + TPW)
 // over superblock share `part` of KSPLIT. A superblock of a tile is one
 // record whose bytes the lanes load 16 at a time, contiguous over the warp;
-// the next superblock's records are in flight while the current one decodes.
+// one next record is kept in flight while the current record decodes (at most
+// two `Record`s live regardless of TPW and PAIR).
 // As in `gemv_entries_kblock`, the k of a step is permuted within its scale
 // group so that lane t's four A values of a row are half of its entry
 // 4 group + t, and its B values are x at the same places: one 16-byte read
 // of x covers a group's two steps. Each group's MMA sum takes its scale once
-// per row, so a row's bits do not depend on M. The group's warps form the
-// representation's decode table (`W::Table`) in shared memory while the first
-// records load, and synchronize on the group's barrier.
+// per row, so a row's bits do not depend on M. All threads in the block form
+// one shared copy of the representation's decode table (`W::Table`) while the
+// first record loads, synchronized once across the block.
 template <int TPW, int KSPLIT, int NB, class Ready, class WA, class WB, class Epi, class Barrier>
 __device__ __forceinline__ void gemv_records_group(const Ready &ready, u32 M, u64 kblocks, u64 tile0, u64 tiles,
                                                    u64 rows, const WA &wa, const WB &wb, const Epi &epi,
@@ -1414,7 +1427,7 @@ __device__ __forceinline__ void gemv_records_group(const Ready &ready, u32 M, u6
     constexpr bool PAIR = !Same<WB, NoWeight>::value;
     static_assert(!PAIR || Same<WA, WB>::value, "paired records weights share one representation");
     __shared__ typename WA::Table tables[Barrier::GROUPS];
-    typename WA::Table &table = tables[barrier.group];
+    typename WA::Table &table = tables[Barrier::GROUPS == 1 ? 0 : barrier.group];
     const u32 lane = threadIdx.x % 32;
     const u32 g = lane / 4, t = lane % 4;
     const float *factors = nullptr;
@@ -1431,28 +1444,21 @@ __device__ __forceinline__ void gemv_records_group(const Ready &ready, u32 M, u6
     const u64 superblocks = (kblocks + 3) / 4;
     const u64 begin = superblocks * part / KSPLIT;
     const u64 end = tile0 < tiles ? superblocks * (part + 1) / KSPLIT : begin;
-    struct Stage {
-        typename WA::Record ra[TPW];
-        typename WA::Record rb[TPW];
-    };
-    auto load = [&](Stage &stage, u64 sb) {
-#pragma unroll
-        for (int i = 0; i < TPW; ++i)
-            if (tile0 + i < tiles) {
-                stage.ra[i] = wa.record(tile0 + i, sb, lane);
-                if constexpr (PAIR)
-                    stage.rb[i] = wb.record(tile0 + i, sb, lane);
-            }
-    };
-    Stage stage;
-    if (tile0 < tiles) {
-        if (begin < end)
-            load(stage, begin);
+    typename WA::Record cur;
+    if (begin < end)
+        cur = wa.record(tile0, begin, lane);
+    if constexpr (Barrier::GROUPS == 1) {
+        WA::form_table(table, threadIdx.x, blockDim.x);
+    } else {
         WA::form_table(table, part * 32 + lane, KSPLIT * 32);
     }
     const auto pro = ready();
     static_assert(decltype(ready())::FACTORS == 0, "a GEMV reads its operands in place");
-    barrier.sync(KSPLIT * 32);
+    if constexpr (Barrier::GROUPS == 1) {
+        __syncthreads();
+    } else {
+        barrier.sync(KSPLIT * 32);
+    }
     // One record of one tile and stream into its accumulators.
     auto accumulate = [&](float (&sum)[NB][4], const typename WA::Record &record, u64 sb) {
         const typename WA::Scales scale = WA::scales(record, t);
@@ -1468,44 +1474,52 @@ __device__ __forceinline__ void gemv_records_group(const Ready &ready, u32 M, u6
                 WA::template operands<Op>(table, record.w[2 * q] >> (16 * group), rg);
                 WA::template operands<Op>(table, record.w[2 * q + 1] >> (16 * group), rg8);
                 const u64 k = kblock * 64 + 8 * (4 * group + t);
-                float d[NB][4];
+                const float s0 = scale(0, 2 * q + group);
+                const float s1 = scale(1, 2 * q + group);
+                const u32 a0[4] = {rg[0], rg8[0], rg[1], rg8[1]};
+                const u32 a1[4] = {rg[2], rg8[2], rg[3], rg8[3]};
 #pragma unroll
                 for (int nb = 0; nb < NB; ++nb) {
                     if (nb > 0 && 8u * (u32)nb >= M)
                         continue;
-#pragma unroll
-                    for (int e = 0; e < 4; ++e)
-                        d[nb][e] = 0.0f;
+                    float d[4] = {0.0f, 0.0f, 0.0f, 0.0f};
                     const u32 m = 8 * nb + g;
                     const uint4 x = is_shared_row<decltype(ready())> || m < M ? pro.octet(factors, m, k)
                                                                           : make_uint4(0u, 0u, 0u, 0u);
-                    const u32 a0[4] = {rg[0], rg8[0], rg[1], rg8[1]}, b0[2] = {x.x, x.y};
-                    const u32 a1[4] = {rg[2], rg8[2], rg[3], rg8[3]}, b1[2] = {x.z, x.w};
-                    Op::mma(d[nb], a0, b0);
-                    Op::mma(d[nb], a1, b1);
-                }
-#pragma unroll
-                for (int nb = 0; nb < NB; ++nb) {
-                    if (nb > 0 && 8u * (u32)nb >= M)
-                        continue;
-#pragma unroll
-                    for (int e = 0; e < 4; ++e)
-                        sum[nb][e] = seismic_fma_rn(scale(e / 2, 2 * q + group), d[nb][e], sum[nb][e]);
+                    const u32 b0[2] = {x.x, x.y}, b1[2] = {x.z, x.w};
+                    Op::mma(d, a0, b0);
+                    Op::mma(d, a1, b1);
+                    sum[nb][0] = seismic_fma_rn(s0, d[0], sum[nb][0]);
+                    sum[nb][1] = seismic_fma_rn(s0, d[1], sum[nb][1]);
+                    sum[nb][2] = seismic_fma_rn(s1, d[2], sum[nb][2]);
+                    sum[nb][3] = seismic_fma_rn(s1, d[3], sum[nb][3]);
                 }
             }
         }
     };
     for (u64 sb = begin; sb < end; ++sb) {
-        const Stage current = stage;
-        if (sb + 1 < end)
-            load(stage, sb + 1);
 #pragma unroll
-        for (int i = 0; i < TPW; ++i)
-            if (tile0 + i < tiles) {
-                accumulate(acc[0][i], current.ra[i], sb);
-                if constexpr (PAIR)
-                    accumulate(acc[1][i], current.rb[i], sb);
+        for (int i = 0; i < TPW; ++i) {
+            if (tile0 + i >= tiles)
+                break;
+            if constexpr (PAIR) {
+                const typename WA::Record next_b = wb.record(tile0 + i, sb, lane);
+                accumulate(acc[0][i], cur, sb);
+                if (i + 1 < TPW && tile0 + i + 1 < tiles)
+                    cur = wa.record(tile0 + i + 1, sb, lane);
+                else if (sb + 1 < end)
+                    cur = wa.record(tile0, sb + 1, lane);
+                accumulate(acc[1][i], next_b, sb);
+            } else {
+                typename WA::Record next_a;
+                if (i + 1 < TPW && tile0 + i + 1 < tiles)
+                    next_a = wa.record(tile0 + i + 1, sb, lane);
+                else if (sb + 1 < end)
+                    next_a = wa.record(tile0, sb + 1, lane);
+                accumulate(acc[0][i], cur, sb);
+                cur = next_a;
             }
+        }
     }
     gemv_finish<TPW, KSPLIT, NB>(acc, M, tile0, tiles, rows, epi, reduce, barrier, part);
 }

@@ -110,8 +110,10 @@ pub(super) fn encode(
     };
     let mut batch = if work.timed.is_some() {
         DirectBatch::timed(device, stream)
-    } else {
+    } else if work.observed {
         DirectBatch::new(device, stream)
+    } else {
+        DirectBatch::unobserved(device, stream)
     }
     .map_err(|error| EncodeFailure::uncommitted(CallError::Execution(error)))?;
     // Nothing is issued yet: a failed wait abandons no work, and `DirectBatch`
@@ -120,11 +122,27 @@ pub(super) fn encode(
     follow_fences(&mut batch, work.after)
         .map_err(|error| EncodeFailure::uncommitted(CallError::Execution(error)))?;
     for sync in work.after_transfers {
-        if let Some(event) = sync.cuda_event() {
-            batch
-                .follow_event(event)
-                .map_err(|error| EncodeFailure::uncommitted(CallError::Execution(error)))?;
+        if sync.id().device_id != work.device_id {
+            return Err(EncodeFailure::uncommitted(CallError::Execution(
+                ExecutionError::SubmissionFailed(format!(
+                    "transfer sync {:?} belongs to device {}, not CUDA device {}",
+                    sync.id(),
+                    sync.id().device_id,
+                    work.device_id,
+                )),
+            )));
         }
+        let Some(event) = sync.cuda_event() else {
+            return Err(EncodeFailure::uncommitted(CallError::Execution(
+                ExecutionError::SubmissionFailed(format!(
+                    "transfer sync {:?} is not backed by a CUDA event",
+                    sync.id(),
+                )),
+            )));
+        };
+        batch
+            .follow_event(event)
+            .map_err(|error| EncodeFailure::uncommitted(CallError::Execution(error)))?;
     }
     match issue(&mut batch, device, replays, budget, work) {
         Ok(()) => batch
@@ -160,7 +178,7 @@ pub(super) fn encode_moves(
     address: impl Fn(&Arc<Allocation>, u64) -> u64,
 ) -> Result<Committed, ExecutionError> {
     use super::moves::MoveStep;
-    let mut batch = DirectBatch::new(device, NativeStream::Compute)?;
+    let mut batch = DirectBatch::unobserved(device, NativeStream::Compute)?;
     follow_fences(&mut batch, after)?;
     for (index, step) in steps.iter().enumerate() {
         let issued = match *step {
@@ -229,7 +247,7 @@ pub(super) fn encode_fill_copies(
             }
         }
     }
-    let mut batch = DirectBatch::new(device, NativeStream::Fill)
+    let mut batch = DirectBatch::unobserved(device, NativeStream::Fill)
         .map_err(|error| EncodeFailure::uncommitted(CallError::Execution(error)))?;
     follow_fences(&mut batch, after)
         .map_err(|error| EncodeFailure::uncommitted(CallError::Execution(error)))?;
@@ -301,7 +319,7 @@ fn issue(
                 for segment in &segments {
                     match &segment.work {
                         SegmentWork::Empty => {}
-                        SegmentWork::Direct(calls) => launch(batch, list, calls.clone(), &encoded)?,
+                        SegmentWork::Direct(calls) => launch_direct_segment(batch, list, calls.clone(), &encoded)?,
                         SegmentWork::Graphed(graph) => replay_segment(batch, device, replays, list, &keys, &encoded, graph)?,
                     }
                     stamps(batch, list.stamps(segment.boundary))?;
@@ -367,9 +385,11 @@ fn plan_segments<'l>(
         };
         pending.push((work, boundary));
     }
-    // A run that finds no graph of its shape it may take records its
-    // layout's, once the device's queued work has drained.
-    let taken = replays.record(
+    // A run whose layout has no graph yet (or needs more graphs than exist for
+    // this submission) records it once queued work has drained; when all
+    // existing graphs of a layout are merely in flight on the GPU, fall back
+    // to direct stream-ordered launch without calling `device.drain()`.
+    let taken = replays.record_or_direct(
         &shaped_graphs,
         budget,
         retained,
@@ -390,8 +410,11 @@ fn plan_segments<'l>(
                 Pending::Graphed { calls, words } => {
                     let (shaped, identity) = resolved
                         .next()
-                        .expect("one recorded graph per graphed segment");
-                    SegmentWork::Graphed(GraphedSegment { calls, words, shaped, identity })
+                        .expect("one resolved entry per graphed segment");
+                    match identity {
+                        Some(identity) => SegmentWork::Graphed(GraphedSegment { calls, words, shaped, identity }),
+                        None => SegmentWork::Direct(calls),
+                    }
                 }
             };
             Segment { work, boundary }
@@ -506,6 +529,27 @@ fn held_operations<'l>(list: &'l impl DispatchList, keys: &ReplayKeys<'_>, calls
         .flat_map(|boundary| list.timelines(boundary))
         .map(cuda_timeline_word)
         .collect()
+}
+
+/// Launch the calls `calls` of `list` directly on `batch`'s stream, emitting
+/// any internal stamps and timelines that were held inside an unsplit graphed
+/// segment when it falls back to direct launch.
+fn launch_direct_segment(
+    batch: &mut DirectBatch,
+    list: &impl DispatchList,
+    calls: Range<usize>,
+    encoded: &[Vec<bool>],
+) -> Result<(), CallError> {
+    let mut start = calls.start;
+    for boundary in calls.start + 1..calls.end {
+        if !list.stamps(boundary).is_empty() || !list.timelines(boundary).is_empty() {
+            launch(batch, list, start..boundary, encoded)?;
+            stamps(batch, list.stamps(boundary))?;
+            timelines(batch, list.timelines(boundary))?;
+            start = boundary;
+        }
+    }
+    launch(batch, list, start..calls.end, encoded)
 }
 
 /// Launch the calls `calls` of `list` on `batch`'s stream one by one, each

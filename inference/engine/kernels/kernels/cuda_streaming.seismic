@@ -96,27 +96,11 @@ native routed_select_streamed for cuda from "cuda/routed_select_streamed.cu":
     scratch logits bytes (M * E * 4)
     scratch arrivals bytes (4) sync
 
-native routed_hint_select for cuda from "cuda/routed_hint_select.cu":
-    static (H, K, AHEAD, EN)
-    where H % 32 == 0 and EN <= 1024 and K <= EN and K <= 32
-    project dense segmented (next_router, after_router) rows rms ordered (next_router, after_router)
-    unless (next_policy[POLICY_WHOLE])
-    scratch logits bytes (2 * M * EN * 4)
-    scratch arrivals bytes (4) sync
-
 native routed_route_streamed for cuda from "cuda/routed_route_streamed.cu":
     static (H, PT, NM, E, K, S, ES, TM)
     where H % 64 == 0 and E <= 1024 and K <= 32
     project dense segmented (router, shared_router, (shared_gate, shared_up)) rows rms publishes (result 0) ordered (router, shared_router)
-    scratch logits bytes (M * (E + 1) * 4)
-    scratch arrivals bytes (4) sync
-
-native routed_hint_route for cuda from "cuda/routed_hint_route.cu":
-    static (H, PT, NM, K, AHEAD, EN)
-    where H % 32 == 0 and EN <= 1024 and K <= 32
-    project dense segmented (next_router, after_router) rows rms ordered (next_router, after_router)
-    unless (next_policy[POLICY_WHOLE])
-    scratch logits bytes (2 * M * EN * 4)
+    scratch logits bytes (M * ceil_div(E + 1, 4) * 16)
     scratch arrivals bytes (4) sync
 
 # One block reads the list's count, then commits after a system-scope fence.
@@ -171,4 +155,4 @@ native routed_output_streamed for cuda from "cuda/routed_output_streamed.cu":
     records (expert_down, tier_down)
     project routed summed (expert_down) shared (shared_down)
     scratch published bytes (M * (K + 1) * H * 2)
-    scratch arrivals bytes (ceil_div(H, 16) * 4) sync
+    scratch arrivals bytes (M * ceil_div(H, 16) * 4) sync

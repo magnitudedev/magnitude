@@ -230,6 +230,42 @@ __device__ __forceinline__ void copy_rows(const unsigned char *from, unsigned lo
         copy_rows_as<unsigned char>(from, from_stride, to, to_stride, rows, bytes, thread, threads);
 }
 
+// Widens `M` rows of `H` elements of activation type `A` into the step's
+// mapped host `site_rows` slot using coalesced 16-byte system-relaxed stores
+// when aligned, falling back to scalar `put_system` otherwise. Caller issues
+// `streaming_publish_barrier()` and `streaming_system_fence()` after.
+template <class A>
+__device__ __forceinline__ void copy_site_rows(const typename A::storage *norm, unsigned long long norm_stride0,
+                                               unsigned long long norm_stride1, const element::Out<element::F32> &rows,
+                                               unsigned long long slot_offset, unsigned long long site_stride1,
+                                               unsigned long long site_stride2, unsigned long long M,
+                                               unsigned long long H) {
+    float *site_base = reinterpret_cast<float *>(const_cast<element::u8 *>(rows.stored(slot_offset)));
+    if (site_stride2 == 1ull && norm_stride1 == 1ull && (H & 3ull) == 0ull && (site_stride1 & 3ull) == 0ull &&
+        (reinterpret_cast<unsigned long long>(site_base) & 15ull) == 0ull) {
+        const unsigned long long h4 = H >> 2ull;
+        const unsigned long long count4 = M * h4;
+        for (unsigned long long i = threadIdx.x; i < count4; i += blockDim.x) {
+            const unsigned long long m = i / h4, n4 = (i % h4) << 2ull;
+            const typename A::storage *src = norm + m * norm_stride0 + n4;
+            const float v0 = A::load(__ldcg(src + 0));
+            const float v1 = A::load(__ldcg(src + 1));
+            const float v2 = A::load(__ldcg(src + 2));
+            const float v3 = A::load(__ldcg(src + 3));
+            float *dst = site_base + m * site_stride1 + n4;
+            asm volatile("st.relaxed.sys.global.v4.f32 [%0], {%1, %2, %3, %4};"
+                         :: "l"(dst), "f"(v0), "f"(v1), "f"(v2), "f"(v3) : "memory");
+        }
+    } else {
+        const unsigned long long count = M * H;
+        for (unsigned long long i = threadIdx.x; i < count; i += blockDim.x) {
+            const unsigned long long m = i / H, n = i % H;
+            rows.put_system(slot_offset + m * site_stride1 + n * site_stride2,
+                            A::load(__ldcg(norm + m * norm_stride0 + n * norm_stride1)));
+        }
+    }
+}
+
 } // namespace streaming
 
 // One row of `bytes` bytes (streaming/contract.hpp).

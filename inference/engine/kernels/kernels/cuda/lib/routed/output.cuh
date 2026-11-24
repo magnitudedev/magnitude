@@ -119,8 +119,8 @@ struct SharedPublishEpi {
     }                                                                                                              \
     ROUTED_OUTPUT_ARRIVED(m, static_cast<unsigned>(K) + 1u, m * gridDim.x + blockIdx.x, blockIdx.x * CHANNELS, CHANNELS)
 
-#define ROUTED_OUTPUT_GATHERED_BODY(TPW, KSPLIT)                                                                   \
-    using Shape = routed::DecodeGatheredShape<TPW, KSPLIT>;                                                        \
+#define ROUTED_OUTPUT_GATHERED_BODY(TPW, KSPLIT, NB)                                                               \
+    using Shape = routed::DecodeGatheredShape<TPW, KSPLIT, NB>;                                                    \
     using ExpertReaders = routed::DecodeReaders<packets::W0>;                                                      \
     using SharedReaders = routed::DecodeReaders<packets::W1>;                                                      \
     using Points = typename projection::PointsOf<                                                                  \

@@ -5453,6 +5453,67 @@ impl BoundNativeGraphPlan {
         self.fixed.clone()
     }
 
+    /// Create a fresh `NativeGraphBindings` for `plan`, pre-populated with
+    /// this binding's statically bound ports.
+    ///
+    /// # Panics
+    /// Where `plan` does not share the same [`SealedTopology`] as the plan
+    /// this binding was created for (`NativeGraphPlan::shares_topology`).
+    pub fn bindings_for(&self, plan: &Arc<NativeGraphPlan>) -> NativeGraphBindings {
+        assert!(
+            self.fixed.plan.shares_topology(plan),
+            "BoundNativeGraphPlan::bindings_for requires a plan sharing the same SealedTopology"
+        );
+        NativeGraphBindings {
+            plan: plan.clone(),
+            inputs: self.fixed.inputs.clone(),
+            fixed: self.fixed.fixed.clone(),
+            timelines: self.fixed.timelines.clone(),
+        }
+    }
+
+    /// Verify that this static binding can be reused for `plan` via
+    /// [`Self::bindings_for`]: both plans must share the same
+    /// [`SealedTopology`], and every statically bound port must satisfy
+    /// `plan`'s port uses, record requirements, and binding checks.
+    pub fn check_compatible(&self, plan: &Arc<NativeGraphPlan>) -> Result<(), CallError> {
+        if !self.fixed.plan.shares_topology(plan) {
+            return Err(CallError::Workflow(WorkflowError::NativeGraphSlotMismatch));
+        }
+        for (ordinal, &is_fixed) in self.fixed.fixed.iter().enumerate() {
+            if !is_fixed {
+                continue;
+            }
+            let bound = self.fixed.inputs[ordinal]
+                .as_ref()
+                .expect("a fixed port is bound");
+            let uses = &plan.port_uses[ordinal];
+            if uses.grid && bound.tensor.is_slab_view() {
+                return Err(CallError::Workflow(WorkflowError::NativePortSlabGrid {
+                    port: ordinal,
+                }));
+            }
+            if uses.slab && !bound.tensor.binds_slab_port() {
+                return Err(CallError::Workflow(WorkflowError::PlainSlabBinding {
+                    parameter: format!("port {ordinal}"),
+                }));
+            }
+            if uses.plain && bound.tensor.is_slab_view() && bound.tensor.byte_len() > 0 {
+                return Err(CallError::Workflow(WorkflowError::SlabPlainBinding {
+                    parameter: format!("port {ordinal}"),
+                }));
+            }
+            if uses.records && bound.records.is_none() {
+                return Err(CallError::Workflow(WorkflowError::NativePortMismatch {
+                    port: ordinal,
+                }));
+            }
+            plan.check_binding(ordinal, &bound.tensor)
+                .map_err(CallError::Workflow)?;
+        }
+        Ok(())
+    }
+
     /// The host heap this binding holds, at its vectors' capacities. The
     /// plan it binds is shared and is its sealer's.
     pub fn host_heap(&self) -> HostHeap {
@@ -5513,7 +5574,7 @@ impl NativeGraphFamily {
     /// launch in flight ([`Self::record_decode`]).
     pub fn new(plans: &[Arc<NativeGraphPlan>], decodes: usize) -> Result<Self, WorkflowError> {
         let launches = plans.iter().map(|plan| vec![plan.clone()]).collect::<Vec<_>>();
-        Self::with_launches(plans, &launches, decodes, &[])
+        Self::build(plans, &launches, decodes, &[], true)
     }
 
     /// A family of `plans` whose launches each make the runs of one of
@@ -5535,6 +5596,16 @@ impl NativeGraphFamily {
         launches: &[Vec<Arc<NativeGraphPlan>>],
         decodes: usize,
         chains: &[Vec<(Arc<NativeGraphPlan>, u64)>],
+    ) -> Result<Self, WorkflowError> {
+        Self::build(plans, launches, decodes, chains, false)
+    }
+
+    fn build(
+        plans: &[Arc<NativeGraphPlan>],
+        launches: &[Vec<Arc<NativeGraphPlan>>],
+        decodes: usize,
+        chains: &[Vec<(Arc<NativeGraphPlan>, u64)>],
+        serial: bool,
     ) -> Result<Self, WorkflowError> {
         let first = plans.first().ok_or(WorkflowError::Empty)?;
         assert!(decodes <= launches.len(), "a family's decode launches are among its launches");
@@ -5754,7 +5825,12 @@ impl NativeGraphFamily {
             .filter(|(_, graphed)| graphed.pinned_runs > 0)
             .map(|(graphs, graphed)| (graphs.plans[0].identity, graphed.pinned_runs as usize))
             .collect::<Vec<_>>();
-        let graphs = LaunchGraphs::of(graphed, chained).expect("a family's graph census fits u64");
+        let graphs = if serial {
+            LaunchGraphs::of_serial(graphed)
+        } else {
+            LaunchGraphs::of(graphed, chained)
+        }
+        .expect("a family's graph census fits u64");
         let count = layout_count;
         let layouts = super::LayoutForms::new(layouts.into_iter().flat_map(|graph| {
             let graph = Arc::new(graph);
@@ -5886,6 +5962,15 @@ impl NativeGraphFamily {
                 .map_err(TensorError::Execution)?;
         }
         Ok(())
+    }
+
+    /// Cap how many live slots of this family are decode-capable (floor)
+    /// flights that pin decode graphs; slots beyond `flights` serve prefill
+    /// chains only and never run decode (`LaunchGraphs::held_with_decode`).
+    pub fn cap_decode_flights(&self, flights: usize) -> Result<(), TensorError> {
+        self.graphs
+            .cap_decode_flights(flights as u64)
+            .map_err(TensorError::Execution)
     }
 
     /// What its graphs are made of ([`GraphFamilyCensus`]).
@@ -7007,9 +7092,13 @@ impl NativeGraphSequence {
     }
 
     /// Wait on a transfer batch's completion event (`cuStreamWaitEvent` on
-    /// CUDA) before running any work queued in this sequence.
-    pub fn follow_transfer(&mut self, sync: super::transfer::TransferSync) {
+    /// CUDA, timeline semaphore wait on Vulkan) before running any work queued
+    /// in this sequence. Rejects foreign-device or unsupported handles loudly.
+    pub fn follow_transfer(&mut self, sync: super::transfer::TransferSync) -> Result<(), CallError> {
+        sync.validate_for_device(&self.device)
+            .map_err(CallError::Execution)?;
         self.after_transfers.push(sync);
+        Ok(())
     }
 
     pub fn is_empty(&self) -> bool {

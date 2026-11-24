@@ -22,10 +22,22 @@ __global__ void routed_output_streamed_stage(SEISMIC_KERNEL_PARAMS) { ROUTED_OUT
 
 #ifdef SEISMIC_FORMING_ROUTED_OUTPUT_STREAMED_SUMMED
 template <int TPW, int KSPLIT>
+__launch_bounds__(routed::DECODE_THREADS, routed::decode_min_blocks<1, packets::W0, packets::W1>())
 __global__ void routed_output_streamed_summed(SEISMIC_KERNEL_PARAMS) { ROUTED_OUTPUT_SUMMED_BODY(TPW, KSPLIT) }
 #endif
 
 #ifdef SEISMIC_FORMING_ROUTED_OUTPUT_STREAMED_GATHERED
 template <int KSPLIT, int GATHER_TPW>
-__global__ void routed_output_streamed_gathered(SEISMIC_KERNEL_PARAMS) { ROUTED_OUTPUT_GATHERED_BODY(GATHER_TPW, KSPLIT) }
+__launch_bounds__(routed::DECODE_THREADS, routed::decode_min_blocks<1, packets::W0, packets::W1>())
+__global__ void routed_output_streamed_gathered(SEISMIC_KERNEL_PARAMS) {
+    ROUTED_OUTPUT_GATHERED_BODY(GATHER_TPW, KSPLIT, 1)
+}
+#endif
+
+#ifdef SEISMIC_FORMING_ROUTED_OUTPUT_STREAMED_GATHERED16
+template <int KSPLIT, int GATHER_TPW>
+__launch_bounds__(routed::DECODE_THREADS, routed::decode_min_blocks<routed::DECODE_BATCHES, packets::W0, packets::W1>())
+__global__ void routed_output_streamed_gathered16(SEISMIC_KERNEL_PARAMS) {
+    ROUTED_OUTPUT_GATHERED_BODY(GATHER_TPW, KSPLIT, routed::DECODE_BATCHES)
+}
 #endif

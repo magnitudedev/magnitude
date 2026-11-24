@@ -115,6 +115,7 @@ template <class NORM, class Rows> struct Rms {
     static constexpr bool STAGED = true;
     static constexpr int FACTORS = 1;
     static constexpr bool VEC4 = true;
+    static constexpr bool SINGLE_PASS_RMS = true;
     __device__ __forceinline__ float squares(u32 m, u32 first, u32 step) const {
         return row_squares(x + rows(m) * stride, width, first, step);
     }
@@ -135,15 +136,17 @@ template <class NORM, class Rows> struct Rms {
         return (reinterpret_cast<u64>(row) & 15ull) == 0ull &&
                (reinterpret_cast<u64>(norm) & (4 * NORM::bytes - 1)) == 0ull;
     }
-    __device__ __forceinline__ void value4(const float *factors, u32 m, u64 k, float (&out)[4]) const {
-        const float4 v = *reinterpret_cast<const float4 *>(x + rows(m) * stride + k);
+    __device__ __forceinline__ void value4_from_cached(float inv, float4 v, u64 k, float (&out)[4]) const {
         float w[4];
         element::span<NORM, 4, true>(norm, k, w);
-        const float inv = factors[0];
         out[0] = Act::round(v.x * inv * w[0]);
         out[1] = Act::round(v.y * inv * w[1]);
         out[2] = Act::round(v.z * inv * w[2]);
         out[3] = Act::round(v.w * inv * w[3]);
+    }
+    __device__ __forceinline__ void value4(const float *factors, u32 m, u64 k, float (&out)[4]) const {
+        const float4 v = *reinterpret_cast<const float4 *>(x + rows(m) * stride + k);
+        value4_from_cached(factors[0], v, k, out);
     }
 };
 
@@ -207,6 +210,7 @@ template <class NORM, class Rows, u32 STREAMS, u64 WIDTH = 0> struct GroupRms {
     static constexpr bool STAGED = true;
     static constexpr int FACTORS = STREAMS;
     static constexpr bool VEC4 = true;
+    static constexpr bool SINGLE_PASS_RMS = (STREAMS == 1);
     __device__ __forceinline__ u64 stream_of(u64 k) const {
         if constexpr (STREAMS == 1)
             return 0ull;
@@ -237,15 +241,17 @@ template <class NORM, class Rows, u32 STREAMS, u64 WIDTH = 0> struct GroupRms {
         return (width & 3ull) == 0ull && (reinterpret_cast<u64>(row) & 15ull) == 0ull &&
                (reinterpret_cast<u64>(norm) & (4 * NORM::bytes - 1)) == 0ull;
     }
-    __device__ __forceinline__ void value4(const float *factors, u32 m, u64 k, float (&out)[4]) const {
-        const float4 v = *reinterpret_cast<const float4 *>(x + rows(m) * stride + k);
+    __device__ __forceinline__ void value4_from_cached(float inv, float4 v, u64 k, float (&out)[4]) const {
         float w[4];
         element::span<NORM, 4, true>(norm, k, w);
-        const float inv = factors[stream_of(k)];
         out[0] = Act::round(v.x * inv * w[0]);
         out[1] = Act::round(v.y * inv * w[1]);
         out[2] = Act::round(v.z * inv * w[2]);
         out[3] = Act::round(v.w * inv * w[3]);
+    }
+    __device__ __forceinline__ void value4(const float *factors, u32 m, u64 k, float (&out)[4]) const {
+        const float4 v = *reinterpret_cast<const float4 *>(x + rows(m) * stride + k);
+        value4_from_cached(factors[stream_of(k)], v, k, out);
     }
 };
 
@@ -265,6 +271,13 @@ template <class Pro, class = void> struct has_vec4 {
 };
 template <class Pro> struct has_vec4<Pro, decltype(void(Pro::VEC4))> {
     static constexpr bool value = Pro::VEC4;
+};
+
+template <class Pro, class = void> struct has_single_pass_rms {
+    static constexpr bool value = false;
+};
+template <class Pro> struct has_single_pass_rms<Pro, decltype(void(Pro::SINGLE_PASS_RMS))> {
+    static constexpr bool value = Pro::SINGLE_PASS_RMS;
 };
 
 template <class Pro> __device__ __forceinline__ bool pro_can_vec4(const Pro &pro, u32 m) {
@@ -433,12 +446,50 @@ __device__ __forceinline__ void form_row(const Pro &pro, u32 m, u64 K, u8 *out,
     static_assert(Storage::bytes == 2, "projection physical operands are 16-bit");
     __shared__ float factors[Pro::FACTORS > 0 ? Pro::FACTORS : 1];
     __shared__ float scratch[32];
+    const element::Out<Storage> dst = element::out_over_scratch<Storage>(out);
+    const u64 row_base = (u64)m * K;
+    if constexpr (has_single_pass_rms<Pro>::value && !nvfp4_rows<Pro>::value) {
+        constexpr unsigned REG_VECS = 4u;
+        const u64 step4 = (u64)blockDim.x * 4ull;
+        if ((K & 3ull) == 0ull && K == pro.width && K <= (u64)REG_VECS * step4 && pro.can_vec4(m)) {
+            float4 cached[REG_VECS];
+            float total = 0.0f;
+            const float *row_ptr = pro.x + pro.rows(m) * pro.stride;
+#pragma unroll
+            for (unsigned i = 0; i < REG_VECS; ++i) {
+                const u64 k = (u64)threadIdx.x * 4ull + (u64)i * step4;
+                if (k < K) {
+                    const float4 v = *reinterpret_cast<const float4 *>(row_ptr + k);
+                    cached[i] = v;
+                    total = seismic_fma_rn(v.x, v.x, total);
+                    total = seismic_fma_rn(v.y, v.y, total);
+                    total = seismic_fma_rn(v.z, v.z, total);
+                    total = seismic_fma_rn(v.w, v.w, total);
+                }
+            }
+            const float sum = reduce::group_sum(total, scratch);
+            if (threadIdx.x == 0)
+                factors[0] = rsqrtf(sum / (float)pro.width + pro.eps);
+            __syncthreads();
+            const float inv = factors[0];
+            if (published != nullptr && threadIdx.x == 0)
+                published->put(0, inv);
+#pragma unroll
+            for (unsigned i = 0; i < REG_VECS; ++i) {
+                const u64 k = (u64)threadIdx.x * 4ull + (u64)i * step4;
+                if (k < K) {
+                    float vals[4];
+                    pro.value4_from_cached(inv, cached[i], k, vals);
+                    dst.template put_span<4>(row_base + k, vals);
+                }
+            }
+            return;
+        }
+    }
     pro.prepare_row(factors, m, scratch);
     __syncthreads();
     if (published != nullptr && threadIdx.x < (unsigned)Pro::FACTORS)
         published->put(threadIdx.x * step, factors[threadIdx.x]);
-    const element::Out<Storage> dst = element::out_over_scratch<Storage>(out);
-    const u64 row_base = (u64)m * K;
     if constexpr (nvfp4_rows<Pro>::value) {
         const float g = nvfp4_stage::row_global(pro, factors, m, K, scratch);
         for (u64 block = threadIdx.x; block < K / 16; block += blockDim.x) {

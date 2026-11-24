@@ -986,11 +986,13 @@ pub struct DirectBatch {
     fence: BatchFence,
     device: Device,
     stream: Arc<driver::Stream>,
-    start: Event,
-    /// Whether `start` has been recorded on `stream`. Deferred until the first
-    /// work-issuing call (or `end()` for an empty batch) so leading `follow` /
-    /// `follow_event` waits (`cuStreamWaitEvent`) are excluded from
-    /// `DirectSubmission::device_seconds()`.
+    /// Start event recorded before the batch's work when timing is observed;
+    /// `None` for unobserved production batches.
+    start: Option<Event>,
+    /// Whether `start` has been recorded on `stream` (always `true` when
+    /// `start` is `None`). Deferred until the first work-issuing call (or
+    /// `end()` for an empty batch) so leading `follow` / `follow_event` waits
+    /// (`cuStreamWaitEvent`) are excluded from `DirectSubmission::device_seconds()`.
     started: bool,
     /// For a timed batch, per `launch` call, the event recorded just before
     /// the launch (absent for an empty launch).
@@ -998,16 +1000,34 @@ pub struct DirectBatch {
 }
 
 impl DirectBatch {
-    /// A batch on native stream `stream`.
+    /// An observed batch on native stream `stream`: records timed `start` and
+    /// `end` events so `device_seconds` and `device_interval` can be read.
     pub fn new(device: &Device, stream: crate::NativeStream) -> Result<Self, ExecutionError> {
         let stream = device.native_stream(stream).clone();
-        let start = Event::new(device.context()).map_err(submission)?;
+        let start = device
+            .event_pool()
+            .acquire_timed(device.context())
+            .map_err(submission)?;
         Ok(Self {
             fence: BatchFence::idle(),
             device: device.clone(),
             stream,
-            start,
+            start: Some(start),
             started: false,
+            marks: None,
+        })
+    }
+
+    /// An unobserved production batch on native stream `stream`: omits the
+    /// `start` event and uses a pooled `CU_EVENT_DISABLE_TIMING` `end` event.
+    pub fn unobserved(device: &Device, stream: crate::NativeStream) -> Result<Self, ExecutionError> {
+        let stream = device.native_stream(stream).clone();
+        Ok(Self {
+            fence: BatchFence::idle(),
+            device: device.clone(),
+            stream,
+            start: None,
+            started: true,
             marks: None,
         })
     }
@@ -1017,8 +1037,10 @@ impl DirectBatch {
     /// precede `start` and are not billed into `device_seconds()`.
     fn ensure_started(&mut self) -> Result<(), ExecutionError> {
         if !self.started {
-            self.start.record(&self.stream).map_err(submission)?;
-            self.fence.arm(&self.stream);
+            if let Some(ref start) = self.start {
+                start.record(&self.stream).map_err(submission)?;
+                self.fence.arm(&self.stream);
+            }
             self.started = true;
         }
         Ok(())
@@ -1037,7 +1059,7 @@ impl DirectBatch {
     /// another of the device's streams, has completed (`cuStreamWaitEvent`
     /// on its end event): device work, waiting for no host.
     pub fn follow(&mut self, other: &DirectSubmission) -> Result<(), ExecutionError> {
-        self.follow_event(&other.end)
+        self.follow_event(other.end())
     }
 
     /// The batch's following work waits until `event`, recorded on another
@@ -1071,7 +1093,11 @@ impl DirectBatch {
         let mut formed = FormedLaunch::form(&self.device, launch, true)?;
         self.ensure_started()?;
         if let Some(marks) = &mut self.marks {
-            let mark = Event::new(self.device.context()).map_err(submission)?;
+            let mark = self
+                .device
+                .event_pool()
+                .acquire_timed(self.device.context())
+                .map_err(submission)?;
             mark.record(&self.stream).map_err(submission)?;
             marks.push(Some(mark));
         }
@@ -1269,9 +1295,18 @@ impl DirectBatch {
             started,
             marks,
         } = self;
-        let end = Event::new(device.context()).and_then(|end| {
+        let end_timed = start.is_some();
+        let pool = device.event_pool().clone();
+        let end = if end_timed {
+            pool.acquire_timed(device.context())
+        } else {
+            pool.acquire_sync(device.context())
+        }
+        .and_then(|end| {
             if !started {
-                start.record(&stream)?;
+                if let Some(ref start) = start {
+                    start.record(&stream)?;
+                }
             }
             end.record(&stream)?;
             stream.flush_submission()?;
@@ -1281,8 +1316,10 @@ impl DirectBatch {
             Ok(end) => {
                 fence.disarm();
                 Ok(DirectSubmission {
+                    pool,
                     start,
-                    end,
+                    end: Some(end),
+                    end_timed,
                     marks,
                     complete: std::sync::atomic::AtomicBool::new(false),
                 })
@@ -1337,8 +1374,11 @@ impl TimelineAnchor {
 
 /// Issued direct launches, observed through their completion event.
 pub struct DirectSubmission {
-    start: Event,
-    end: Event,
+    pool: Arc<crate::executor::EventPool>,
+    start: Option<Event>,
+    /// Always `Some` until `Drop` recycles it into `pool`.
+    end: Option<Event>,
+    end_timed: bool,
     marks: Option<Vec<Option<Event>>>,
     /// The work was seen complete, which it stays: no later look asks the
     /// driver, whose event calls serialize with every other thread's.
@@ -1351,6 +1391,12 @@ unsafe impl Send for DirectSubmission {}
 unsafe impl Sync for DirectSubmission {}
 
 impl DirectSubmission {
+    fn end(&self) -> &Event {
+        self.end
+            .as_ref()
+            .expect("DirectSubmission end event is present until drop")
+    }
+
     /// Whether the work completed, without waiting: `Ok(false)` while it
     /// runs, and its fault where it ended without completing (the context
     /// faulted, which runs none of it any more).
@@ -1359,7 +1405,7 @@ impl DirectSubmission {
         if self.complete.load(Relaxed) {
             return Ok(true);
         }
-        let complete = self.end.query().map_err(submission)?;
+        let complete = self.end().query().map_err(submission)?;
         self.complete.store(complete, Relaxed);
         Ok(complete)
     }
@@ -1368,7 +1414,7 @@ impl DirectSubmission {
     /// ended without completing.
     pub fn finish(&self) -> Result<(), ExecutionError> {
         if !self.complete.load(std::sync::atomic::Ordering::Relaxed) {
-            self.end.synchronize().map_err(submission)?;
+            self.end().synchronize().map_err(submission)?;
             self.complete.store(true, std::sync::atomic::Ordering::Relaxed);
         }
         Ok(())
@@ -1376,14 +1422,20 @@ impl DirectSubmission {
 
     /// Device execution time between the batch's start and end events.
     pub fn device_seconds(&self) -> Result<f64, ExecutionError> {
-        Event::elapsed_ns(&self.start, &self.end)
+        let start = self.start.as_ref().ok_or_else(|| {
+            ExecutionError::SubmissionFailed("submission was not observed for device timing".into())
+        })?;
+        Event::elapsed_ns(start, self.end())
             .map(|nanoseconds| nanoseconds / 1e9)
             .map_err(submission)
     }
 
     /// The completed batch's device interval on the anchor's host clock.
     pub fn device_interval(&self, anchor: &TimelineAnchor) -> Result<(f64, f64), ExecutionError> {
-        Ok((anchor.place(&self.start)?, anchor.place(&self.end)?))
+        let start = self.start.as_ref().ok_or_else(|| {
+            ExecutionError::SubmissionFailed("submission was not observed for device timing".into())
+        })?;
+        Ok((anchor.place(start)?, anchor.place(self.end())?))
     }
 
     /// For a timed batch, each `launch` call's device interval on the
@@ -1407,7 +1459,7 @@ impl DirectSubmission {
                 .iter()
                 .flatten()
                 .next()
-                .unwrap_or(&self.end);
+                .unwrap_or_else(|| self.end());
             intervals.push(Some((anchor.place(mark)?, anchor.place(end)?)));
         }
         Ok(Some(intervals))
@@ -1416,8 +1468,27 @@ impl DirectSubmission {
 
 impl Drop for DirectSubmission {
     fn drop(&mut self) {
-        if !self.complete.load(Ordering::Relaxed) {
-            let _ = self.end.synchronize();
+        let completed = if self.complete.load(Ordering::Relaxed) {
+            true
+        } else {
+            self.end.as_ref().is_some_and(|end| end.synchronize().is_ok())
+        };
+        if completed {
+            if let Some(end) = self.end.take() {
+                if self.end_timed {
+                    self.pool.release_timed(end);
+                } else {
+                    self.pool.release_sync(end);
+                }
+            }
+            if let Some(start) = self.start.take() {
+                self.pool.release_timed(start);
+            }
+            if let Some(marks) = self.marks.take() {
+                for mark in marks.into_iter().flatten() {
+                    self.pool.release_timed(mark);
+                }
+            }
         }
     }
 }

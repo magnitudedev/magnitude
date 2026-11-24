@@ -50,16 +50,11 @@ __device__ void routed_land_block(SEISMIC_KERNEL_PARAMS) {
                     SEISMIC_SOURCES_STRIDE_2, choices)) {
                 const u64 slot = q % (u64)SEISMIC_DIM_SF;
                 using A = ELEMENT_OF(SEISMIC_ELEMENT_A);
-                const typename A::storage *norm =
-                    reinterpret_cast<const typename A::storage *>(SEISMIC_PTR(SEISMIC_BUFFER_NORMALIZED));
-                const element::Out<element::F32> rows = SEISMIC_OUT_SITE_ROWS;
-                const u64 count = SEISMIC_DIM_M * SEISMIC_DIM_H;
-                for (u64 i = threadIdx.x; i < count; i += blockDim.x) {
-                    const u64 m = i / SEISMIC_DIM_H, n = i % SEISMIC_DIM_H;
-                    rows.put_system(slot * SEISMIC_SITE_ROWS_STRIDE_0 + m * SEISMIC_SITE_ROWS_STRIDE_1
-                                        + n * SEISMIC_SITE_ROWS_STRIDE_2,
-                                    A::load(norm[m * SEISMIC_NORMALIZED_STRIDE_0 + n * SEISMIC_NORMALIZED_STRIDE_1]));
-                }
+                streaming::copy_site_rows<A>(
+                    reinterpret_cast<const typename A::storage *>(SEISMIC_PTR(SEISMIC_BUFFER_NORMALIZED)),
+                    SEISMIC_NORMALIZED_STRIDE_0, SEISMIC_NORMALIZED_STRIDE_1, SEISMIC_OUT_SITE_ROWS,
+                    slot * SEISMIC_SITE_ROWS_STRIDE_0, SEISMIC_SITE_ROWS_STRIDE_1, SEISMIC_SITE_ROWS_STRIDE_2,
+                    SEISMIC_DIM_M, SEISMIC_DIM_H);
                 streaming_publish_barrier();
                 if (threadIdx.x == 0) {
                     streaming_system_fence();

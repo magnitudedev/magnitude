@@ -418,6 +418,93 @@ impl<G: RecordedGraph> Replays<G> {
         Ok(taken)
     }
 
+    /// Like [`Self::record`], except when every unmatched run's shape already
+    /// has at least one untaken recorded graph currently in flight, skip
+    /// `prepare` and recording and return `None` for those busy runs so the
+    /// caller can launch them directly without draining the device. Runs whose
+    /// shape has no graph yet (or needs more graphs than exist for distinct
+    /// runs within this submission) still call `prepare` and record normally.
+    pub(crate) fn record_or_direct(
+        &self,
+        graphs: &[Shaped],
+        budget: GraphCensus,
+        retained: &Arc<dyn Any + Send + Sync>,
+        prepare: impl FnOnce() -> Result<(), CallError>,
+        mut record: impl FnMut(usize) -> Result<G, CallError>,
+    ) -> Result<Vec<Option<u64>>, CallError> {
+        let mut entries = self.entries();
+        let taken: Vec<Option<u64>> = match Self::choose(&mut entries, graphs)? {
+            Chosen::Complete(taken) => taken.into_iter().map(Some).collect(),
+            Chosen::Incomplete(partial) => {
+                if !Self::needs_recording(&entries, graphs, &partial) {
+                    partial
+                } else {
+                    drop(entries);
+                    prepare()?;
+                    entries = self.entries();
+                    match Self::choose(&mut entries, graphs)? {
+                        Chosen::Complete(taken) => taken.into_iter().map(Some).collect(),
+                        Chosen::Incomplete(mut partial) => {
+                            let mut resolved = Vec::with_capacity(graphs.len());
+                            for index in 0..graphs.len() {
+                                let identity = match partial[index] {
+                                    Some(identity) => identity,
+                                    None => {
+                                        let Shaped { key, bound } = &graphs[index];
+                                        let graph = record(index)?;
+                                        let binding = if G::recorded_bound() {
+                                            GraphBinding::Bound(bound.clone())
+                                        } else {
+                                            GraphBinding::Unbound
+                                        };
+                                        let identity = self.keep(&mut entries, key, graph, binding, retained);
+                                        for later in index + 1..graphs.len() {
+                                            if partial[later].is_none()
+                                                && graphs[later].key == *key
+                                                && (G::updates_in_flight() || graphs[later].bound == *bound)
+                                            {
+                                                partial[later] = Some(identity);
+                                            }
+                                        }
+                                        identity
+                                    }
+                                };
+                                resolved.push(Some(identity));
+                            }
+                            resolved
+                        }
+                    }
+                }
+            }
+        };
+        let ids: Vec<u64> = taken.iter().flatten().copied().collect();
+        Self::fit(&mut entries, &ids, budget);
+        Ok(taken)
+    }
+
+    /// Whether any unmatched run in `partial` genuinely requires recording a
+    /// new graph (either its shape has no graph yet, or every existing graph
+    /// of its shape is already taken by another run of this submission) rather
+    /// than merely waiting on an untaken in-flight graph.
+    fn needs_recording(entries: &ReplayEntries<G>, graphs: &[Shaped], partial: &[Option<u64>]) -> bool {
+        for (index, slot) in partial.iter().enumerate() {
+            if slot.is_some() {
+                continue;
+            }
+            let Some(replay) = entries.graphs.get(graphs[index].key.as_slice()) else {
+                return true;
+            };
+            let has_untaken_in_flight = replay
+                .graphs
+                .iter()
+                .any(|instance| !partial.contains(&Some(instance.identity)));
+            if !has_untaken_in_flight {
+                return true;
+            }
+        }
+        false
+    }
+
     /// Single-lock lookup and use for an unbound, host-only graph (a Metal
     /// schedule): zero allocations on cache hit, does not retain plan objects
     /// or pollute `by_plan`, and derives outside the lock on a miss.
@@ -1046,5 +1133,88 @@ mod tests {
         assert_eq!(replays.entries.lock().unwrap().graphs.len(), 4);
         replays.clear_unheld(|| true);
         assert_eq!(replays.entries.lock().unwrap().graphs.len(), 0);
+    }
+
+    /// When a layout already has a graph in flight, `record_or_direct` skips
+    /// `prepare` (no `device.drain()`) and returns `None` for direct launch;
+    /// when a layout has no graph yet (or a submission needs more distinct
+    /// instances than exist), it calls `prepare` and records normally.
+    #[test]
+    fn record_or_direct_skips_prepare_when_existing_graphs_are_in_flight() {
+        let replays = Replays::<Graph<false>>::default();
+        let budget = GraphCensus { graphs: 4, launches: 16, arguments: 256, largest: 16 };
+        let prepared = std::cell::Cell::new(0);
+        let in_flight = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let flag = in_flight.clone();
+
+        // Cold start: shape 0 has no graph yet -> calls prepare and records 1 graph.
+        let first = replays
+            .record_or_direct(
+                &[shaped(0, 1)],
+                budget,
+                &retained(),
+                || {
+                    prepared.set(prepared.get() + 1);
+                    Ok(())
+                },
+                |_| {
+                    let mut g = graph(4);
+                    g.1 = vec![1];
+                    g.2 = flag.clone();
+                    Ok(g)
+                },
+            )
+            .unwrap();
+        assert_eq!(prepared.get(), 1);
+        assert_eq!(first.len(), 1);
+        assert!(first[0].is_some());
+        assert_eq!(replays.counts().recorded, 1);
+
+        // Warm prefill: shape 0's graph is in flight (`idle == false`), different
+        // binding arrives -> skips prepare (0 drains!), returns None for direct launch.
+        let busy = replays
+            .record_or_direct(
+                &[shaped(0, 2)],
+                budget,
+                &retained(),
+                || panic!("must not call prepare when an existing graph is merely in flight"),
+                |_| panic!("must not record a new graph when falling back to direct launch"),
+            )
+            .unwrap();
+        assert_eq!(busy, vec![None]);
+        assert_eq!(prepared.get(), 1);
+        assert_eq!(replays.counts().recorded, 1);
+
+        // Once the graph becomes idle, a new binding reuses it without prepare.
+        in_flight.store(true, std::sync::atomic::Ordering::Relaxed);
+        let reused = replays
+            .record_or_direct(
+                &[shaped(0, 3)],
+                budget,
+                &retained(),
+                || panic!("must not call prepare when an idle graph is available"),
+                |_| panic!("must not record when an idle graph is available"),
+            )
+            .unwrap();
+        assert_eq!(reused, first);
+        assert_eq!(prepared.get(), 1);
+
+        // A single submission needing 2 distinct instances of shape 0 when only 1
+        // exists genuinely needs a 2nd graph -> calls prepare and records it.
+        let chain = replays
+            .record_or_direct(
+                &[shaped(0, 10), shaped(0, 11)],
+                budget,
+                &retained(),
+                || {
+                    prepared.set(prepared.get() + 1);
+                    Ok(())
+                },
+                |_| Ok(graph(4)),
+            )
+            .unwrap();
+        assert_eq!(prepared.get(), 2);
+        assert!(chain[0].is_some() && chain[1].is_some() && chain[0] != chain[1]);
+        assert_eq!(replays.counts().recorded, 2);
     }
 }

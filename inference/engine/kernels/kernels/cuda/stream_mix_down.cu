@@ -15,16 +15,9 @@
 
 SEISMIC_PROGRAMMATIC_DEPENDENCY
 
-using Pro = projection::GroupRms<ELEMENT_OF(SEISMIC_NORM), projection::AllRows, SEISMIC_DIM_S, SEISMIC_DIM_H>;
 using Low = projection::MixLow<ELEMENT_OF(SEISMIC_ELEMENT_A)>;
 
 #define WIDTH (SEISMIC_DIM_S * SEISMIC_DIM_H)
-#define PROLOGUE                                                                                          \
-    Pro {                                                                                                 \
-        reinterpret_cast<const float *>(SEISMIC_PTR(SEISMIC_BUFFER_HIDDEN)), SEISMIC_HIDDEN_STRIDE_0,      \
-            SEISMIC_PTR(SEISMIC_BUFFER_NORM), __uint_as_float((unsigned)SEISMIC_PARAM_EPSILON),            \
-            SEISMIC_DIM_H, projection::AllRows{}                                                          \
-    }
 #define STAGED_ROWS SEISMIC_PTR(SEISMIC_BUFFER_SCRATCH_STAGED)
 #define INVERSE SEISMIC_RESULT_2_OUT
 
@@ -95,14 +88,24 @@ __device__ __forceinline__ void mix_gemm(const projection::u8 *staged, float *pa
         gridDim.z, 0u);
 }
 
-// Past one row: one block per row stages its normalized streams and
-// publishes their inverses.
+// Past one row: one block per (row, stream) stages its normalized stream and
+// publishes its inverse.
 #ifdef SEISMIC_FORMING_STREAM_MIX_DOWN_STAGE
 template <unsigned INT8, unsigned OPERAND>
 __global__ void stream_mix_down_stage(SEISMIC_KERNEL_PARAMS) {
     seismic_dependency_start();
-    const element::Out<element::F32> inverse = INVERSE.offset((unsigned long long)blockIdx.x * SEISMIC_RESULT_2_STRIDE_0);
-    projection::form_row(PROLOGUE, blockIdx.x, WIDTH, STAGED_ROWS, &inverse, 1);
+    const unsigned m = blockIdx.x / static_cast<unsigned>(SEISMIC_DIM_S);
+    const unsigned s = blockIdx.x % static_cast<unsigned>(SEISMIC_DIM_S);
+    const unsigned long long offset = static_cast<unsigned long long>(s) * SEISMIC_DIM_H;
+    Stream pro = STREAM;
+    pro.x += static_cast<unsigned long long>(m) * SEISMIC_HIDDEN_STRIDE_0 + offset;
+    pro.norm += offset * Norm::bytes;
+    const element::Out<element::F32> inverse =
+        INVERSE.offset(static_cast<unsigned long long>(m) * SEISMIC_RESULT_2_STRIDE_0 +
+                       static_cast<unsigned long long>(s) * SEISMIC_RESULT_2_STRIDE_1);
+    projection::form_row(pro, 0u, SEISMIC_DIM_H,
+                         STAGED_ROWS + (static_cast<unsigned long long>(m) * WIDTH + offset) * activation::Act::bytes,
+                         &inverse, 1);
 }
 #endif
 

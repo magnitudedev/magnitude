@@ -33,6 +33,7 @@
 
 #ifdef SEISMIC_FORMING_ROUTED_GATE_UP_CHOICE
 template <int TPW, int KSPLIT>
+__launch_bounds__(routed::DECODE_THREADS, routed::decode_min_blocks<1, packets::W0, packets::W1>())
 __global__ void routed_gate_up_choice(SEISMIC_KERNEL_PARAMS) {
     ROUTED_GATE_UP_CHOICE_BODY
 }
@@ -47,7 +48,16 @@ __global__ void routed_gate_up_stage(SEISMIC_KERNEL_PARAMS) {
 
 #ifdef SEISMIC_FORMING_ROUTED_GATE_UP_GATHERED
 template <int KSPLIT, int GATHER_TPW>
+__launch_bounds__(routed::DECODE_THREADS, routed::decode_min_blocks<1, packets::W0, packets::W1>())
 __global__ void routed_gate_up_gathered(SEISMIC_KERNEL_PARAMS) {
-    ROUTED_GATE_UP_GATHERED_BODY
+    ROUTED_GATE_UP_GATHERED_BODY(1)
+}
+#endif
+
+#ifdef SEISMIC_FORMING_ROUTED_GATE_UP_GATHERED16
+template <int KSPLIT, int GATHER_TPW>
+__launch_bounds__(routed::DECODE_THREADS, routed::decode_min_blocks<routed::DECODE_BATCHES, packets::W0, packets::W1>())
+__global__ void routed_gate_up_gathered16(SEISMIC_KERNEL_PARAMS) {
+    ROUTED_GATE_UP_GATHERED_BODY(routed::DECODE_BATCHES)
 }
 #endif

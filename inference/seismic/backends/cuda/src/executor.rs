@@ -3,7 +3,7 @@
 use crate::blocks::Blocks;
 use crate::buffer::Buffer;
 use crate::command::{CompiledKernel, LaunchFrame};
-use crate::driver::{Context, Driver, DriverError, HostMapped, PinnedUpload, Stream};
+use crate::driver::{Context, Driver, DriverError, Event, HostMapped, PinnedUpload, Stream};
 use crate::{Cuda, CudaLaunchMode};
 use seismic_compiler::errors::{ExecutionError, RefusalReading, TargetError};
 use seismic_compiler::executable::{
@@ -16,7 +16,60 @@ use seismic_ir::schedule::{AnyScalarSlot, FillValue};
 use seismic_lang::expr::compiled::InvocationValues;
 use seismic_memory::entry::{Entry, Store};
 use std::ffi::c_void;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
+
+/// Per-device pool of completed CUDA [`Event`] handles, eliminating per-submission
+/// `cuEventCreate`/`cuEventDestroy` driver calls on the hot decode path.
+///
+/// Only events whose recorded stream work has already completed (or events that
+/// were never recorded) may be returned to this pool.
+pub(crate) struct EventPool {
+    /// Timed events (`CU_EVENT_BLOCKING_SYNC`) for observed/timed batches.
+    timed: Mutex<Vec<Event>>,
+    /// Sync-only events (`CU_EVENT_BLOCKING_SYNC | CU_EVENT_DISABLE_TIMING`)
+    /// for unobserved production batches.
+    sync: Mutex<Vec<Event>>,
+}
+
+/// Upper bound on idle pooled events per kind so a burst never hoards handles.
+const MAX_POOLED_EVENTS: usize = 256;
+
+impl EventPool {
+    pub(crate) fn new() -> Self {
+        Self {
+            timed: Mutex::new(Vec::new()),
+            sync: Mutex::new(Vec::new()),
+        }
+    }
+
+    pub(crate) fn acquire_timed(&self, context: &Arc<Context>) -> Result<Event, DriverError> {
+        if let Some(event) = self.timed.lock().expect("CUDA timed event pool lock").pop() {
+            return Ok(event);
+        }
+        Event::new(context)
+    }
+
+    pub(crate) fn acquire_sync(&self, context: &Arc<Context>) -> Result<Event, DriverError> {
+        if let Some(event) = self.sync.lock().expect("CUDA sync event pool lock").pop() {
+            return Ok(event);
+        }
+        Event::blocking_sync_only(context)
+    }
+
+    pub(crate) fn release_timed(&self, event: Event) {
+        let mut pool = self.timed.lock().expect("CUDA timed event pool lock");
+        if pool.len() < MAX_POOLED_EVENTS {
+            pool.push(event);
+        }
+    }
+
+    pub(crate) fn release_sync(&self, event: Event) {
+        let mut pool = self.sync.lock().expect("CUDA sync event pool lock");
+        if pool.len() < MAX_POOLED_EVENTS {
+            pool.push(event);
+        }
+    }
+}
 
 /// A native stream of the device: the one its native work runs on.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -48,6 +101,7 @@ pub struct Device {
     fill: Arc<Stream>,
     blocks: Arc<Blocks>,
     graphs: Arc<crate::graph_cost::GraphPool>,
+    events: Arc<EventPool>,
     /// The word a graph's word nodes name as it is recorded, before a
     /// replay binds its run's own ([`Self::placeholder_word`]).
     placeholder: Arc<crate::direct::HostWord>,
@@ -107,6 +161,7 @@ impl Device {
         }
         let placeholder = Arc::new(crate::direct::HostWord::on(&context, &stores.host.own()).map_err(unavailable)?);
         let graphs = Arc::new(crate::graph_cost::GraphPool::new(stores.device.own(), context.clone()));
+        let events = Arc::new(EventPool::new());
         let launch_limits = crate::profile::DeviceLaunchLimits::query(&context.driver, context.ordinal())?;
         context.charge_own_to(stores.device.own());
         Ok(Self {
@@ -116,9 +171,14 @@ impl Device {
             fill,
             blocks,
             graphs,
+            events,
             placeholder,
             launch_limits,
         })
+    }
+
+    pub(crate) fn event_pool(&self) -> &Arc<EventPool> {
+        &self.events
     }
 
     /// Whether the process's footprint holds this device's allocations
