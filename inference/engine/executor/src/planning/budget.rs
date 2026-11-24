@@ -77,6 +77,12 @@ pub struct MemoryBudget {
     /// Separate host RAM store on split (discrete GPU) topologies; `None` on
     /// unified memory.
     pub host: Option<StoreBudget>,
+    /// Physical host RAM budget on unified Metal where `device` is bounded by
+    /// the wired GPU working-set ceiling (`HostGrant::Wired`). Enforces
+    /// `device + host <= unified_host_ram` beside `device <= self.device` so
+    /// unwired Rust host heap (`host_bytes`) is charged against host RAM
+    /// supply rather than Metal's wired ceiling.
+    pub unified_host_ram: Option<StoreBudget>,
 }
 
 impl MemoryBudget {
@@ -167,7 +173,16 @@ impl MemoryBudget {
                 available: h.pinned_room(),
             })
         };
-        Self { device, host }
+        let unified_host_ram = (unified_host && at.device.wired_limit().is_some()).then(|| {
+            let host_available = at.device.host_room().saturating_add(held);
+            StoreBudget {
+                store: Some(host_ram),
+                role: DomainRole::Allocation,
+                capacity: at.device.host_capacity().max(host_available),
+                available: host_available,
+            }
+        });
+        Self { device, host, unified_host_ram }
     }
 
     /// Synthetic budget with fixed device (and optional host) bytes, for unit
@@ -186,7 +201,37 @@ impl MemoryBudget {
                 capacity: bytes,
                 available: bytes,
             }),
+            unified_host_ram: None,
         }
+    }
+
+    /// Attach a physical host RAM budget for unified Metal tests where the
+    /// wired GPU ceiling (`self.device`) lies below host RAM supply.
+    pub fn with_unified_host_ram(mut self, bytes: u64) -> Self {
+        self.unified_host_ram = Some(StoreBudget {
+            store: self.device.store,
+            role: DomainRole::Allocation,
+            capacity: bytes,
+            available: bytes,
+        });
+        self
+    }
+
+    /// Credit the worker process's already-resident untracked host footprint
+    /// (`phys_footprint - ledger_allocated`) back onto `unified_host_ram.available`
+    /// (clamped to `capacity`). At live load (`device opened`), OS `supply`
+    /// already excludes the worker's own resident host memory, while
+    /// `AssessmentMemoryCharge::host_bytes()` accounts for the worker's total
+    /// host memory rather than only its post-open delta. Never alters the
+    /// Metal wired ceiling (`self.device`).
+    pub fn credit_own_host_footprint(mut self, own_untracked: u64) -> Self {
+        if let Some(ram) = self.unified_host_ram.as_mut() {
+            ram.available = ram
+                .available
+                .saturating_add(own_untracked)
+                .min(ram.capacity);
+        }
+        self
     }
 
     /// Structural capacity of the device allocation store.
@@ -269,7 +314,24 @@ impl MemoryBudget {
                 available: host_available,
             })
         };
-        Ok(Self { device, host })
+        let unified_host_ram = if unified_host && executor.backend() == seismic::BackendName::Metal {
+            let host_fit = fit
+                .store(host_ram)
+                .map_err(|error| PlanError::ResourcePlanning(error.to_string()))?;
+            let host_available = match mode {
+                FitMode::Stable => host_fit.capacity_bytes,
+                FitMode::Live => host_fit.headroom_bytes,
+            };
+            Some(StoreBudget {
+                store: Some(host_ram),
+                role: DomainRole::Allocation,
+                capacity: host_fit.capacity_bytes,
+                available: host_available,
+            })
+        } else {
+            None
+        };
+        Ok(Self { device, host, unified_host_ram })
     }
 
     /// Full per-store fit of `charge` against this budget via the single
@@ -301,9 +363,21 @@ impl MemoryBudget {
         };
         let host_ram = topology.host_ram().id();
         let domains = match demands {
-            StoreDemands::Unified { total } => {
+            StoreDemands::Unified { device, host } => {
                 let store = self.device.store.unwrap_or(host_ram);
-                vec![domain_fit(self.device, store, total)?]
+                let total = device.saturating_add(host);
+                match self.unified_host_ram {
+                    Some(ram) => {
+                        let wired_margin = i128::from(self.device.available) - i128::from(device);
+                        let ram_margin = i128::from(ram.available) - i128::from(total);
+                        if wired_margin <= ram_margin {
+                            vec![domain_fit(self.device, store, device)?]
+                        } else {
+                            vec![domain_fit(ram, store, total)?]
+                        }
+                    }
+                    None => vec![domain_fit(self.device, store, total)?],
+                }
             }
             StoreDemands::Split { device, host } => {
                 let device_store = match self.device.store {
@@ -350,11 +424,20 @@ impl MemoryBudget {
         draft: &ExecutionPlanDraft,
         mandatory: &AssessmentMemoryCharge,
     ) -> Result<u64, PlanError> {
-        let needed = mandatory
+        let demands = mandatory
             .store_demands(draft.device().topology(), draft.device().executor())
-            .map_err(PlanError::ResourcePlanning)?
-            .allocation_bytes();
-        Ok(self.device.available.saturating_sub(needed))
+            .map_err(PlanError::ResourcePlanning)?;
+        Ok(match demands {
+            StoreDemands::Unified { device, host } => match self.unified_host_ram {
+                Some(ram) => self
+                    .device
+                    .available
+                    .saturating_sub(device)
+                    .min(ram.available.saturating_sub(device.saturating_add(host))),
+                None => self.device.available.saturating_sub(device.saturating_add(host)),
+            },
+            StoreDemands::Split { device, .. } => self.device.available.saturating_sub(device),
+        })
     }
 
     /// Whether live available headroom is strictly below structural capacity
@@ -362,6 +445,7 @@ impl MemoryBudget {
     pub fn live_below_capacity(&self) -> bool {
         self.device.available < self.device.capacity
             || self.host.is_some_and(|h| h.available < h.capacity)
+            || self.unified_host_ram.is_some_and(|h| h.available < h.capacity)
     }
 
     /// Whether `charge`'s full served-context workload fits every store's
@@ -375,7 +459,13 @@ impl MemoryBudget {
             .store_demands(draft.device().topology(), draft.device().executor())
             .map_err(PlanError::ResourcePlanning)?;
         Ok(match demands {
-            StoreDemands::Unified { total } => total <= self.device.capacity,
+            StoreDemands::Unified { device, host } => match self.unified_host_ram {
+                Some(ram) => {
+                    device <= self.device.capacity
+                        && device.saturating_add(host) <= ram.capacity
+                }
+                None => device.saturating_add(host) <= self.device.capacity,
+            },
             StoreDemands::Split { device, host } => {
                 device <= self.device.capacity && self.host.is_none_or(|h| host <= h.capacity)
             }
@@ -411,15 +501,45 @@ impl MemoryBudget {
     fn fit_demands(&self, demands: StoreDemands) -> WholeFit {
         let device_avail = self.device.available;
         match demands {
-            StoreDemands::Unified { total } => {
-                let short = NonZeroU64::new(total.saturating_sub(device_avail));
-                WholeFit {
-                    available: device_avail,
-                    needed: total,
-                    short,
-                    limiting: short.map(|_| DomainRole::Allocation),
-                    limiting_required: total,
-                    limiting_available: device_avail,
+            StoreDemands::Unified { device, host } => {
+                let total = device.saturating_add(host);
+                match self.unified_host_ram {
+                    Some(ram) => {
+                        let wired_short = device.saturating_sub(device_avail);
+                        let ram_short = total.saturating_sub(ram.available);
+                        if wired_short >= ram_short {
+                            let short = NonZeroU64::new(wired_short);
+                            WholeFit {
+                                available: device_avail,
+                                needed: device,
+                                short,
+                                limiting: short.map(|_| DomainRole::Allocation),
+                                limiting_required: device,
+                                limiting_available: device_avail,
+                            }
+                        } else {
+                            let short = NonZeroU64::new(ram_short);
+                            WholeFit {
+                                available: ram.available,
+                                needed: total,
+                                short,
+                                limiting: short.map(|_| DomainRole::Allocation),
+                                limiting_required: total,
+                                limiting_available: ram.available,
+                            }
+                        }
+                    }
+                    None => {
+                        let short = NonZeroU64::new(total.saturating_sub(device_avail));
+                        WholeFit {
+                            available: device_avail,
+                            needed: total,
+                            short,
+                            limiting: short.map(|_| DomainRole::Allocation),
+                            limiting_required: total,
+                            limiting_available: device_avail,
+                        }
+                    }
                 }
             }
             StoreDemands::Split { device, host } => {

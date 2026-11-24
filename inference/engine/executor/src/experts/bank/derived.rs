@@ -317,14 +317,20 @@ pub fn derive<'t>(ledgers: &DeviceLedgers, targets: &'t [HoldingTarget<'t>]) -> 
             let shapes: Vec<(BankShape, u64, u64, &dyn Fn(u64) -> u64)> =
                 members.iter().map(|target| (target.shape, target.at, target.owed, &*target.charge)).collect();
             let host_tier = members.iter().all(|target| target.tier == BankTier::Host);
+            let max_pulse = members
+                .iter()
+                .filter(|target| target.at < target.shape.saturation_slots())
+                .map(|target| (target.charge)(target.at + 1).saturating_sub((target.charge)(target.at)))
+                .max()
+                .unwrap_or(0);
             let (hold_room, grow_room, limit) = if host_tier {
                 let budget = estimate.pinned_budget();
                 let limit = estimate.cap().map_or(budget, |cap| budget.min(cap));
-                (estimate.pinned_hold_room(), estimate.pinned_target(), limit)
+                (estimate.pinned_hold_room(), estimate.pinned_grow_room(max_pulse), limit)
             } else {
                 let budget = estimate.budget();
                 let limit = estimate.cap().map_or(budget, |cap| budget.min(cap));
-                (estimate.hold_room(), estimate.target(), limit)
+                (estimate.hold_room(), estimate.grow_room(max_pulse), limit)
             };
             let external_over = estimate.held().saturating_sub(limit);
             let slots = shared_targets_with_pressure(hold_room, grow_room, external_over, &shapes);

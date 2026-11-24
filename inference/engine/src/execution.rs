@@ -216,13 +216,17 @@ fn plan_load(manifest: &ExecutionManifest, selected: &platform::SelectedDevice, 
         }
     };
     let tensor_operations = magnitude_executor::TensorOperations::of(selected.info.forms_tensor_operations());
+    let own_untracked = seismic::ProcessMemory::footprint_now()
+        .unwrap_or(0)
+        .saturating_sub(device.reading.room_after(&device.ledgers).device.allocated());
     let budget = MemoryBudget::live_ledger(
         &selected.reading.topology,
         &selected.info,
         &device.reading,
         &device.ledgers,
         0,
-    );
+    )
+    .credit_own_host_footprint(own_untracked);
     let resident = crate::planning::plan_resident(manifest, selected).map_err(planned)?;
     let (charged, _) = crate::planning::plan_banked::<magnitude_executor::AssessmentMemoryCharge>(
         manifest,
@@ -555,13 +559,17 @@ fn prepare(
     // Qualification ran, its fixtures freed; the programs' storage stays.
     drop(qualification_claim);
     startup.recorded.record(programs_claim);
+    let own_untracked = seismic::ProcessMemory::footprint_now()
+        .unwrap_or(0)
+        .saturating_sub(startup.reading.room_after(&startup.ledgers).device.allocated());
     let budget = MemoryBudget::live_ledger(
         draft.device().topology(),
         draft.device().executor(),
         &startup.reading,
         &startup.ledgers,
         AttestedPrograms::DEVICE_BYTES,
-    );
+    )
+    .credit_own_host_footprint(own_untracked);
     let draft = draft
         .finalize_readout(&manifest.definition, programs.readout_choices(), &budget)
         .and_then(|draft| draft.finalize_sites(|bank| programs.sited_layers(bank)))
@@ -1028,7 +1036,7 @@ fn import_target(
         } else {
             residency.load_target(charges, &manifest.definition, package, &host_tables, observer)
         }
-        .map_err(|error| import_refused(error, &device, &startup.ledgers))
+        .map_err(|error| import_refused(&error, &device, &startup.ledgers))
     })?;
     residency.release_upload();
     if let Some(floor_demand) = floor_demand {
@@ -1046,7 +1054,7 @@ fn import_target(
                     package,
                     &mut target,
                 )
-                .map_err(|error| import_refused(error, &device, &startup.ledgers))
+                .map_err(|error| import_refused(&error, &device, &startup.ledgers))
         })?;
         startup.recorded.record(bank_growth);
     }
@@ -1136,6 +1144,66 @@ fn assemble_domain(
         .then(|| ComponentLoader::head(residency, definition.clone(), package.clone()))
         .transpose()
         .map_err(|error| internal(error.to_string()))?;
+    // On whole-resident loads (`target.bank.is_none()`), there is no bank that
+    // could grow into `request_slot`. Pre-import the head weights while
+    // `request_slot` and `drafter_reserve` are temporarily released so the
+    // transient `head_upload_peak_bytes` staging buffer (~472 MB on Qwen3.8+MTP)
+    // never coexists with `request_slot` (~472 MB) on unified Metal `HostRam`,
+    // then immediately re-claim `request_slot` before constructing the domain.
+    let (drafter_reserve, request_slot) = match (execution_plan.load().expert_bank().is_none(), head_loader.as_ref()) {
+        (true, Some(loader)) => {
+            let slot_bytes = request_slot.bytes();
+            startup.ledgers.changes().change(|_| {
+                drop(drafter_reserve);
+                drop(request_slot);
+            });
+            let head_weights = execution_plan.resources().bytes().head_weights;
+            let head_peak = execution_plan.load().head_upload_peak_bytes();
+            let import_result = startup.ledgers.changes().change(|keeping| {
+                let claiming = &keeping.claims();
+                let weights = startup
+                    .ledgers
+                    .claim_at(
+                        claiming,
+                        &startup.reading,
+                        startup.reader.device(),
+                        CommittedKind::Component,
+                        ClaimDemand { device: head_weights, ..ClaimDemand::default() },
+                    )
+                    .map_err(|short| refused("the drafter head weights", short))?;
+                let upload = startup
+                    .ledgers
+                    .claim_at(
+                        claiming,
+                        &startup.reading,
+                        startup.reader.device(),
+                        CommittedKind::Upload,
+                        ClaimDemand { device: head_peak, staged: head_peak, ..ClaimDemand::default() },
+                    )
+                    .map_err(|short| refused("the drafter head upload", short))?;
+                loader
+                    .import(weights, upload)
+                    .map(|_| ())
+                    .map_err(|error| import_refused(&error, &device, &startup.ledgers))
+            });
+            import_result?;
+            let reclaimed_slot = startup
+                .ledgers
+                .changes()
+                .change(|keeping| {
+                    let demand = ClaimDemand { device: slot_bytes, ..ClaimDemand::default() };
+                    startup.ledgers.claim_request_slot_at(
+                        &keeping.claims(),
+                        &startup.reading,
+                        startup.reader.device(),
+                        demand,
+                    )
+                })
+                .map_err(|short| refused("one request's opening", short))?;
+            (None, reclaimed_slot)
+        }
+        _ => (drafter_reserve, request_slot),
+    };
     let vision_loader = definition
         .vision
         .as_ref()
@@ -1171,13 +1239,20 @@ fn assemble_domain(
     report_load_phase("state and domain allocation", &mut phase_started);
     report_load_memory("domain allocated", &device);
     // Release the pre-claimed drafter and recorded-graph reserves into the
-    // ledger right before `warm_up` so `bind_component(Head)` and recorded
-    // graph instantiation claim/use those bytes cleanly.
+    // ledger right before binding the head and warming up. Binding the head
+    // here (Phase B1b, after `release_upload()` and before serving grows KV
+    // state) guarantees `head_upload_peak_bytes` never coexists with
+    // `target_upload_peak_bytes` or serving `state_slab_bytes`.
     if let Some(reserve) = drafter_reserve {
         startup.ledgers.changes().change(|_| drop(reserve));
     }
     if let Some(reserve) = recorded_graphs_reserve {
         startup.ledgers.changes().change(|_| drop(reserve));
+    }
+    if head_enabled {
+        domain
+            .bind_head()
+            .map_err(|error| domain_refused(error, &startup.ledgers))?;
     }
     // What the load is doing from its pricing and warm-up until it serves, in
     // the process's report on demand (`magnitude_executor::diagnostics`).
@@ -2209,10 +2284,11 @@ fn domain_refused(error: magnitude_executor::DomainError, ledgers: &DeviceLedger
 /// The target import's failure: an allocation its store had no room for
 /// is that store's [`Short`], refused as a startup allocation is
 /// ([`refused`]); anything else is internal.
-fn import_refused(error: magnitude_executor::ResidencyError, device: &seismic::Device, ledgers: &DeviceLedgers) -> LoadError {
+fn import_refused(error: &magnitude_executor::ResidencyError, device: &seismic::Device, ledgers: &DeviceLedgers) -> LoadError {
     use magnitude_executor::{ResidencyError, WeightImportError};
     match error {
         ResidencyError::Import(WeightImportError::Refused { contract, required, available }) => {
+            let (contract, required, available) = (*contract, *required, *available);
             // The ledger's own figures at the refusal: what Seismic's bound
             // lacked of the allocation, against what the ledger holds.
             let ledger = ledgers.of_contract(device, contract);
@@ -2662,7 +2738,7 @@ mod tests {
             required: 929_955_840,
             available: 60_887_171,
         });
-        match import_refused(short, &device, &ledgers) {
+        match import_refused(&short, &device, &ledgers) {
             LoadError::InsufficientMemory { store, memory, .. } => {
                 assert_eq!(store, ledgers.device().store());
                 assert_eq!((memory.required, memory.available), (929_955_840, 60_887_171));

@@ -2756,6 +2756,13 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
         Ok(())
     }
 
+    /// Import and bind the drafter head during startup (Phase B1b, after
+    /// target import has released its upload window and before serving grows
+    /// KV history). Idempotent once bound.
+    pub fn bind_head(&mut self) -> Result<(), DomainError> {
+        self.bind_component(ReservationLane::Head)
+    }
+
     /// Import and bind the optional component `lane` needs when it is
     /// unbound, each allocation under its claim (`Self::claim_growth`), in
     /// one change that keeps nothing: the import's resident weights held by
@@ -2854,9 +2861,9 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
             None => {
                 use crate::memory::{ClaimDemand, ledger::CommittedKind};
                 let weights = self.claim_growth(claiming, CommittedKind::Component, ClaimDemand { device: resident, ..Default::default() })?;
-                let _upload = self.claim_growth(claiming, CommittedKind::Upload, ClaimDemand { device: peak, staged: peak, ..Default::default() })?;
+                let upload = self.claim_growth(claiming, CommittedKind::Upload, ClaimDemand { device: peak, staged: peak, ..Default::default() })?;
                 loader
-                    .import(weights)
+                    .import(weights, upload)
                     .map(|imported| (imported, true))
                     .map_err(|error| self.import_error(&error))
             }

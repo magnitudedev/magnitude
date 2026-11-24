@@ -1695,9 +1695,12 @@ fn header_terms_include_exact_selected_weights_history_and_bounds() {
         load.target_upload_peak_bytes()
     );
     assert_eq!(
-        header.component_upload_bytes,
+        header.head_upload_peak_bytes,
         load.head_upload_peak_bytes()
-            .max(load.vision_upload_peak_bytes())
+    );
+    assert_eq!(
+        header.component_upload_bytes,
+        load.vision_upload_peak_bytes()
     );
     let state = crate::ResourcePlanner::state_plan(
         &definition,
@@ -1820,6 +1823,7 @@ fn fixture_charge(allocation_bytes: u64, staging_bytes: u64) -> AssessmentMemory
             recorded_graph_upload_bytes: 0,
             qualification_peak_bytes: 0,
             target_upload_peak_bytes: staging_bytes,
+            head_upload_peak_bytes: 0,
             component_upload_bytes: 0,
             sealed_graph_host_bytes: SealedGraphHostBytes {
                 at_most: 0,
@@ -1864,8 +1868,9 @@ fn workload_charge_composes_exact_terms_and_upper_bounds() {
         recorded_graph_upload_bytes: 0,
         // Disjoint Phase A qualification peak (does not stack on Phase B).
         qualification_peak_bytes: 80,
-        // Target-only upload peak during Phase B1.
+        // Target-only upload peak during Phase B1a.
         target_upload_peak_bytes: 60,
+        head_upload_peak_bytes: 0,
         component_upload_bytes: 0,
         sealed_graph_host_bytes: SealedGraphHostBytes {
             at_most: 0,
@@ -1939,6 +1944,7 @@ fn qualification_phase_is_disjoint_from_weights_and_prepared_on_unified_and_spli
         // device), so it must add ZERO bytes on top of weights + prepared.
         qualification_peak_bytes: 4 * GIB,
         target_upload_peak_bytes: 256 << 20,
+        head_upload_peak_bytes: 0,
         component_upload_bytes: 0,
         sealed_graph_host_bytes: SealedGraphHostBytes {
             at_most: 0,
@@ -2038,8 +2044,9 @@ fn target_startup_upload_excludes_lazy_head_upload_peak() {
     );
     let header = AssessmentHeaderBounds::derive(&load).unwrap();
     assert_eq!(header.target_upload_peak_bytes, target_peak);
-    assert_eq!(header.component_upload_bytes, head_peak);
-    assert!(header.target_upload_peak_bytes < header.component_upload_bytes);
+    assert_eq!(header.head_upload_peak_bytes, head_peak);
+    assert_eq!(header.component_upload_bytes, 0);
+    assert!(header.target_upload_peak_bytes < header.head_upload_peak_bytes);
 }
 
 #[test]
@@ -2057,6 +2064,7 @@ fn transient_target_upload_does_not_steal_streamed_bank_slots_past_floor() {
         // 1 GiB target upload > 400 MiB serving state, so without Fix #3
         // loading_phase would steal 624 MiB from bank slots past floor.
         target_upload_peak_bytes: 1 * GIB,
+        head_upload_peak_bytes: 0,
         component_upload_bytes: 0,
         sealed_graph_host_bytes: SealedGraphHostBytes {
             at_most: 0,
@@ -2468,9 +2476,14 @@ fn staging_is_charged_to_host_ram_once() {
         let host_ram = topology.host_ram().id();
         let staging = assess(&topology, executor, &status, staged);
         assert_eq!(staging.verdict, AssessmentFitVerdict::Fits);
+        let expected_required = if backend == BackendName::Metal {
+            allocation
+        } else {
+            allocation + tables
+        };
         assert_eq!(
             domain(&staging, host_ram).required_bytes,
-            allocation + tables,
+            expected_required,
             "{backend:?} on {}",
             executor.name()
         );
@@ -2486,38 +2499,50 @@ fn staging_is_charged_to_host_ram_once() {
     assert_eq!(domain(&staging, host_ram).required_bytes, tables + staged);
 }
 
-/// On unified memory (Metal), `StoreDemands::Unified` charges `allocation_bytes + host_bytes()`
-/// together against the single device allocation store budget (`MemoryBudget::stable`).
+/// On unified Apple Silicon Metal (`HostGrant::Wired`), wired allocations are
+/// bounded by `MemoryBudget::stable` (`wired_limit - execution_reserve`) while
+/// `allocation_bytes + host_bytes()` is bounded by physical host RAM.
 #[test]
 fn host_demand_shares_the_unified_metal_budget() {
     let m4_pro = recorded::m4_pro();
     let status = unopened(&m4_pro);
     let metal = executor(&m4_pro, BackendName::Metal);
     let host_ram = m4_pro.host_ram().id();
-    let fit = Fit::new(&m4_pro, &status);
-    let room = fit.placement(metal, seismic::Contract::DeviceOnly).unwrap().stable_bytes;
-    let assess = |device| {
+    let wired_room = crate::MemoryBudget::stable(&m4_pro, metal, &status)
+        .unwrap()
+        .capacity();
+    let ram_capacity = m4_pro.host_ram().capacity().value;
+    let assess = |device, host_tables| {
         AssessmentMemoryCharge {
-            host_table_bytes: GIB,
+            host_table_bytes: host_tables,
             ..fixture_charge(device, 0)
         }
         .assess_fit(&m4_pro, metal, &status)
         .unwrap()
     };
-    let full = assess(room - GIB);
+    let full = assess(wired_room, GIB);
     assert_eq!(full.verdict, AssessmentFitVerdict::Fits);
     assert_eq!(
         domain(&full, host_ram),
         DomainFit {
             role: DomainRole::Allocation,
             domain: host_ram,
-            capacity_bytes: room,
-            required_bytes: room,
+            capacity_bytes: wired_room,
+            required_bytes: wired_room,
             remaining_bytes: 0,
         }
     );
     assert_eq!(
-        assess(room - GIB + 1).verdict,
+        assess(wired_room + 1, GIB).verdict,
+        AssessmentFitVerdict::DoesNotFit {
+            limiting: host_ram,
+            deficit_bytes: NonZeroU64::MIN,
+        }
+    );
+    // Unwired host tables still cannot push total process memory past host RAM.
+    let overflow_host = ram_capacity - wired_room + 1;
+    assert_eq!(
+        assess(wired_room, overflow_host).verdict,
         AssessmentFitVerdict::DoesNotFit {
             limiting: host_ram,
             deficit_bytes: NonZeroU64::MIN,
@@ -2884,13 +2909,19 @@ fn unified_store_demands_and_stable_room_agree_with_assess_fit() {
         ..fixture_charge(4 * GIB, staged)
     };
     let demands = charge.store_demands(&m4_pro, metal).unwrap();
-    let expected_total = charge.allocation_bytes + charge.host_bytes().unwrap();
-    assert_eq!(demands, crate::StoreDemands::Unified { total: expected_total });
-    // `assess_fit` must charge the exact same total in the unified allocation domain
-    // without double-counting `staging_bytes`.
+    let expected_host = charge.host_bytes().unwrap();
+    assert_eq!(
+        demands,
+        crate::StoreDemands::Unified {
+            device: charge.allocation_bytes,
+            host: expected_host,
+        }
+    );
+    // `assess_fit` charges wired device allocations against Metal's wired
+    // ceiling (without double-counting `staging_bytes` or unwired host heap).
     let fit = charge.assess_fit(&m4_pro, metal, &status).unwrap();
     let alloc_domain = domain(&fit, host_ram);
-    assert_eq!(alloc_domain.required_bytes, expected_total);
+    assert_eq!(alloc_domain.required_bytes, charge.allocation_bytes);
     // `MemoryBudget::stable` must match `assess_fit`'s remaining allocation bytes.
     let budget = crate::MemoryBudget::stable(&m4_pro, metal, &status).unwrap();
     let fit_remaining = u64::try_from(alloc_domain.remaining_bytes.max(0)).unwrap();
@@ -3017,9 +3048,10 @@ fn stable_live_status_and_live_ledger_agree_on_store_demands() {
         host_table_bytes: GIB,
         ..fixture_charge(19 * GIB, 256 << 20)
     };
-    let crate::StoreDemands::Unified { total } = charge.store_demands(&m4_pro, metal).unwrap() else {
+    let crate::StoreDemands::Unified { device, host } = charge.store_demands(&m4_pro, metal).unwrap() else {
         panic!("M4 Pro Metal is unified");
     };
+    let total = device + host;
     assert_eq!(total, 20 * GIB);
 
     let stable_fit = stable.fit(&m4_pro, metal, &charge).unwrap();
@@ -3036,7 +3068,7 @@ fn stable_live_status_and_live_ledger_agree_on_store_demands() {
     assert_eq!(live_ledger_fit.verdict, live_status_fit.verdict);
     assert_eq!(live_ledger_fit.domains[0].required_bytes, total);
     assert_eq!(live_status_fit.domains[0].required_bytes, total);
-    assert_eq!(stable_fit.domains[0].required_bytes, total);
+    assert_eq!(stable_fit.domains[0].required_bytes, device);
 
     let held_budget = MemoryBudget::live_ledger(&m4_pro, metal, &reading, &ledgers, 4 * GIB);
     assert_eq!(held_budget.available(), 20 * GIB);
@@ -3131,4 +3163,203 @@ fn wddm_vulkan_stable_and_live_status_agree_on_heap_budget() {
     let fit_charge = fixture_charge(FITTING_16K, 256 << 20);
     assert_eq!(stable.fit(&topo, exec, &fit_charge).unwrap().verdict, AssessmentFitVerdict::Fits);
     assert_eq!(live.fit(&topo, exec, &fit_charge).unwrap().verdict, AssessmentFitVerdict::Fits);
+}
+
+/// Drafter head weights are bound during startup (Phase B1b, after target
+/// import releases `target_upload_peak_bytes` and before serving grows KV
+/// history), so `head_upload_peak_bytes` never stacks on top of
+/// `state_slab_bytes` in Phase B2; lazy `vision` (`component_upload_bytes`)
+/// still does.
+#[test]
+fn head_upload_peak_runs_in_startup_phase_b1b_not_serving_phase_b2() {
+    let weight_demand = ClaimDemand {
+        device: 40_420_000_000,
+        ..ClaimDemand::default()
+    };
+    let bounds = AssessmentMemoryBounds {
+        graph_bytes: 775_000_000 - AttestedPrograms::DEVICE_BYTES,
+        recorded_graph_bytes: 0,
+        recorded_graph_upload_bytes: 0,
+        qualification_peak_bytes: 1_000_000_000,
+        target_upload_peak_bytes: 437_000_000,
+        head_upload_peak_bytes: 472_000_000,
+        component_upload_bytes: 0,
+        sealed_graph_host_bytes: SealedGraphHostBytes {
+            at_most: 0,
+            at_least: 0,
+        },
+        bound_graph_host_bytes: 0,
+        drafter_graph_host_bytes: 0,
+        host_process: NO_HOST_PROCESS,
+        device_process: NO_DEVICE_PROCESS,
+    };
+    let state_slab = 900_000_000;
+    let startup_state = 20_000_000;
+    let charge = AssessmentMemoryCharge::compose(
+        weight_demand.checked_bytes().unwrap(),
+        weight_demand,
+        bounds,
+        state_slab,
+        startup_state,
+        0,
+        0,
+        crate::PassLaunches::FLOOR,
+    )
+    .unwrap();
+    // Phase B1a = 40.42 + 0.775 + 0.02 + 0.437 = 41.652 GB
+    // Phase B1b = 40.42 + 0.775 + 0.02 + 0.472 = 41.687 GB
+    // Phase B2  = 40.42 + 0.775 + 0.900        = 42.095 GB
+    // head_upload_peak (0.472 GB) does NOT stack on state_slab (0.900 GB).
+    assert_eq!(charge.allocation_bytes, 40_420_000_000 + 775_000_000 + 900_000_000);
+    assert_eq!(charge.staging_bytes, 472_000_000);
+
+    // When head_upload_peak exceeds state_slab - startup_state, Phase B1b
+    // sets allocation_bytes so head import is still bounded with zero OOM risk.
+    let huge_head = AssessmentMemoryCharge::compose(
+        weight_demand.checked_bytes().unwrap(),
+        weight_demand,
+        AssessmentMemoryBounds {
+            head_upload_peak_bytes: 1_200_000_000,
+            ..bounds
+        },
+        state_slab,
+        startup_state,
+        0,
+        0,
+        crate::PassLaunches::FLOOR,
+    )
+    .unwrap();
+    assert_eq!(
+        huge_head.allocation_bytes,
+        40_420_000_000 + 775_000_000 + startup_state + 1_200_000_000
+    );
+
+    // Lazy vision (`component_upload_bytes`) still stacks on serving state.
+    let with_vision = AssessmentMemoryCharge::compose(
+        weight_demand.checked_bytes().unwrap(),
+        weight_demand,
+        AssessmentMemoryBounds {
+            component_upload_bytes: 300_000_000,
+            ..bounds
+        },
+        state_slab,
+        startup_state,
+        0,
+        0,
+        crate::PassLaunches::FLOOR,
+    )
+    .unwrap();
+    assert_eq!(
+        with_vision.allocation_bytes,
+        40_420_000_000 + 775_000_000 + state_slab + 300_000_000
+    );
+}
+
+/// On unified Apple Silicon Metal (`HostGrant::Wired`), wired GPU allocations
+/// (`allocation_bytes`) are bounded by the wired ceiling (`iogpu.wired_limit_mb
+/// - execution_reserve`), while total process memory (`allocation_bytes +
+/// host_bytes`) is bounded by physical host RAM supply. Unwired Rust host heap
+/// is never charged against Metal's wired ceiling, and tight host RAM supply
+/// still refuses the load cleanly.
+#[test]
+fn unified_metal_wired_ceiling_separates_device_from_unwired_host_bytes() {
+    use crate::MemoryBudget;
+
+    let metal_topo = recorded::m4_pro();
+    let metal_exec = executor(&metal_topo, BackendName::Metal);
+
+    let weight_demand = ClaimDemand {
+        device: 40_090_000_000,
+        shared: 330_000_000,
+        ..ClaimDemand::default()
+    };
+    let bounds = AssessmentMemoryBounds {
+        graph_bytes: 775_000_000 - AttestedPrograms::DEVICE_BYTES,
+        recorded_graph_bytes: 0,
+        recorded_graph_upload_bytes: 0,
+        qualification_peak_bytes: 1_000_000_000,
+        target_upload_peak_bytes: 437_000_000,
+        head_upload_peak_bytes: 472_000_000,
+        component_upload_bytes: 0,
+        sealed_graph_host_bytes: SealedGraphHostBytes {
+            at_most: 200_000_000,
+            at_least: 200_000_000,
+        },
+        bound_graph_host_bytes: 100_000_000,
+        drafter_graph_host_bytes: 30_000_000,
+        host_process: HostProcessBytes {
+            runtime: 80_000_000,
+            vocabulary: 150_000_000,
+            programs: 970_000_000,
+            vision: 0,
+            kernels: 178,
+        },
+        device_process: NO_DEVICE_PROCESS,
+    };
+    let charge = AssessmentMemoryCharge::compose(
+        weight_demand.checked_bytes().unwrap(),
+        weight_demand,
+        bounds,
+        900_000_000,
+        20_000_000,
+        0,
+        0,
+        crate::PassLaunches::FLOOR,
+    )
+    .unwrap();
+    assert_eq!(
+        charge.store_demands(&metal_topo, metal_exec).unwrap(),
+        StoreDemands::Unified {
+            device: 42_095_000_000,
+            host: 1_530_000_000,
+        }
+    );
+
+    // M5 Pro (48 GiB RAM, 44 GiB wired -> 43.01 GB wired room, 46 GB host RAM
+    // supply): 42.095 GB wired <= 43.01 GB AND 43.625 GB total <= 46 GB -> Fits!
+    let m5_pro = MemoryBudget::fixed(43_010_000_000, None).with_unified_host_ram(46_000_000_000);
+    assert_eq!(
+        m5_pro.fit(&metal_topo, metal_exec, &charge).unwrap().verdict,
+        AssessmentFitVerdict::Fits
+    );
+
+    // Tight host RAM supply (43.20 GB < 43.625 GB total) still refuses with
+    // exact deficit (425 MB) even though wired (42.095 GB <= 43.01 GB) fits.
+    let tight_ram = MemoryBudget::fixed(43_010_000_000, None).with_unified_host_ram(43_200_000_000);
+    assert_eq!(
+        tight_ram.fit(&metal_topo, metal_exec, &charge).unwrap().verdict,
+        AssessmentFitVerdict::DoesNotFit {
+            limiting: metal_topo.host_ram().id(),
+            deficit_bytes: NonZeroU64::new(425_000_000).unwrap(),
+        }
+    );
+
+    // Exact m5-pro-01 `9f266c` live `device opened` reading: 43.009 GB wired,
+    // 43.440 GB OS host supply, 496.5 MB own untracked worker footprint already
+    // subtracted from OS supply (clamped to 48 GiB RAM capacity). Without
+    // crediting own footprint it is 190 MB short; with the credit it fits.
+    let mut m5_live = MemoryBudget::fixed(43_009_578_325, None).with_unified_host_ram(43_440_291_840);
+    m5_live.unified_host_ram.as_mut().unwrap().capacity = 51_539_607_552;
+    assert!(matches!(
+        m5_live.fit(&metal_topo, metal_exec, &charge).unwrap().verdict,
+        AssessmentFitVerdict::DoesNotFit { .. }
+    ));
+    let m5_live_credited = m5_live.credit_own_host_footprint(496_453_216);
+    assert_eq!(
+        m5_live_credited.fit(&metal_topo, metal_exec, &charge).unwrap().verdict,
+        AssessmentFitVerdict::Fits
+    );
+    // Crediting own host footprint never alters the Metal wired ceiling.
+    assert_eq!(m5_live_credited.available(), 43_009_578_325);
+
+    // M4 Pro (42 GiB wired -> 41.15 GB wired room, 46 GB host RAM supply):
+    // 42.095 GB wired > 41.15 GB -> DoesNotFit by exact 0.945 GB (not faked).
+    let m4_pro = MemoryBudget::fixed(41_150_000_000, None).with_unified_host_ram(46_000_000_000);
+    assert_eq!(
+        m4_pro.fit(&metal_topo, metal_exec, &charge).unwrap().verdict,
+        AssessmentFitVerdict::DoesNotFit {
+            limiting: metal_topo.host_ram().id(),
+            deficit_bytes: NonZeroU64::new(945_000_000).unwrap(),
+        }
+    );
 }

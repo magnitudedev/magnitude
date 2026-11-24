@@ -2358,13 +2358,40 @@ impl ModelLoadPlan {
         Ok(ClaimDemand { device: upload, staged: upload, ..ClaimDemand::default() })
     }
 
-    /// Peak upload allocation while importing a lazy optional component.
+    /// Peak upload allocation while importing the drafter head at startup
+    /// (excluding weights whose physical storage is already imported with the
+    /// target, which `load_head` reuses without allocating an upload buffer).
     pub fn head_upload_peak_bytes(&self) -> u64 {
-        super::ImportPlan::new(self.head().into_iter().flatten()).peak_bytes()
+        let target_storage: FxHashSet<_> = self
+            .target
+            .iter()
+            .map(WeightPlan::storage_identity)
+            .collect();
+        super::ImportPlan::new(
+            self.head()
+                .into_iter()
+                .flatten()
+                .filter(|weight| !target_storage.contains(&weight.storage_identity())),
+        )
+        .peak_bytes()
     }
 
+    /// Peak upload allocation while importing the lazy vision encoder
+    /// (excluding weights whose physical storage is already imported with the
+    /// target).
     pub fn vision_upload_peak_bytes(&self) -> u64 {
-        super::ImportPlan::new(self.vision.iter().flatten()).peak_bytes()
+        let target_storage: FxHashSet<_> = self
+            .target
+            .iter()
+            .map(WeightPlan::storage_identity)
+            .collect();
+        super::ImportPlan::new(
+            self.vision
+                .iter()
+                .flatten()
+                .filter(|weight| !target_storage.contains(&weight.storage_identity())),
+        )
+        .peak_bytes()
     }
 }
 

@@ -588,3 +588,162 @@ fn other_cache_jitter_never_shrinks_while_falling_grant_relieves_without_double_
         "overlapping claim smaller than active pressure shrink must not double-release"
     );
 }
+
+/// Regression test for macOS UMA `guarantee` `81 <-> 82` ping-pong (`26d147` on
+/// `m5-pro-01` GLM-5.3, 48 GB unified memory):
+/// - Bank at `81` slots (`319 MB` per slot, `8 MB` pool block), `supply = 372 MB`,
+///   `guarantee = 0` -> grows `81 -> 82` (`+319 MB`, leaving `53 MB` supply).
+/// - `126 ms` later: `others` pulses `+190 MB`, `supply` dips to `-13.8 MB`
+///   (`budget < held`, `external_over = 13.8 MB > 0`, `guarantee = 190 MB`) ->
+///   shrinks `82 -> 81` (`-319 MB`).
+/// - `1.2 s` later and across repeated `guarantee: 0 <-> 190 MB` toggles with
+///   `supply` returning to `385 MB`: `grow_room()` preserves `peak_guarantee`
+///   (`190 MB`), so `385 - 190 = 195 MB < 319 MB` -> **zero** resizes after
+///   settling.
+/// - Once genuine supply rises to `550 MB` (`>= 319 + 190 MB`), growth `81 -> 82`
+///   succeeds and survives the next `190 MB` pulse without shrinking.
+/// - OOM safety remains 100% intact for `owed > 0` and genuine `external_over > 0`.
+#[test]
+fn uma_guarantee_pulse_never_oscillates_bank_slots() {
+    use crate::memory::ledger::{CacheKind, CommittedKind, DeviceGrant, DeviceLedgers, Ledgers, LoadShape, PoolClass, Sample};
+    use crate::memory::supply::Reading;
+    use std::num::NonZeroU64;
+    use std::time::{Duration, Instant};
+
+    const MB: u64 = 1_000_000;
+    const TOTAL: u64 = 48_000 * MB;
+    const WORKING_SET: u64 = 46_000 * MB;
+    const SLOT_BYTES: u64 = 319 * MB;
+    const POOL_BLOCK: u64 = 8 * MB;
+    const FLOOR_SLOTS: u64 = 8;
+    const CEILING_SLOTS: u64 = 128;
+    const PULSE: u64 = 190 * MB;
+
+    let lag = seismic::Lag { release: Duration::ZERO, growth: Duration::ZERO };
+    let scope = Ledgers::new();
+    let start = Instant::now();
+    let sample_at = |at: Instant, free_beyond_target: i64, own_wired: u64| seismic::HostSample {
+        at,
+        page_bytes: 16_384,
+        total: TOTAL,
+        supply: seismic::Supply { free_beyond_target, clean_cache: 0, cold_reclaimable: 0 },
+        reclaim_band: 0,
+        counted: seismic::Counted { at, lag: Duration::ZERO },
+        cold: seismic::ColdPages { machine: 0, own: None },
+        own_reclaimed: None,
+        wired: Some(seismic::WiredFigures {
+            limit: seismic::WiredLimit::OsDefault,
+            wire_count: own_wired + 500 * MB,
+            at,
+        }),
+        harm: None,
+        pressure: Some(seismic::PressureLevel::Normal),
+        lag,
+    };
+
+    // Total held at 81 slots = 40.941 GB (17.654 GB committed + 73*319 MB bank cache).
+    // `ledger.cached()` is pageable, so `wire_count` counts `committed_bytes` + 500 MB others_wired.
+    let bank_above_81 = (81 - FLOOR_SLOTS) * SLOT_BYTES;
+    let committed_bytes = 40_941 * MB - bank_above_81;
+    let init_supply = (40_941 + 372) * MB;
+
+    let init = sample_at(start, init_supply as i64, 0);
+    let (ledgers, _) = DeviceLedgers::unified_in(&scope, std::sync::Arc::new(LoadShape { stores: Vec::new() }))
+        .read_granted(&Sample::scripted(scope.changes(), init), DeviceGrant::Wired { working_set: WORKING_SET, left: None });
+    let ledger = ledgers.device().clone();
+    let records_pool = ledger.pool_block(PoolClass::Records, NonZeroU64::new(POOL_BLOCK).unwrap()).blocks;
+
+    let base_claim = ledger
+        .change(|keeping| ledger.claim_at(&keeping.claims(), None, CommittedKind::Load, committed_bytes))
+        .expect("committed fits");
+    ledger
+        .change(|_| base_claim.entry().take(&base_claim.entry().change(), committed_bytes, seismic::memory::Wiring::Wired))
+        .expect("committed wired");
+    let mut bank_cache = Some(ledger.cached(CacheKind::Bank, bank_above_81).expect("81 slots fit"));
+    let mut at_slots = 81u64;
+    let mut t = start;
+
+    let read_supply = |t: &mut Instant, dt_ms: u64, supply_bytes: i64| {
+        *t += Duration::from_millis(dt_ms);
+        let s = sample_at(*t, supply_bytes, committed_bytes);
+        ledger.read(ledger.sampled(*t), Reading::unified(&s, WORKING_SET));
+    };
+
+    let target_for = |slots: u64, owed: u64| {
+        let targets = vec![HoldingTarget {
+            holding: BankHolding::Experts,
+            tier: BankTier::Bank,
+            at: slots,
+            owed,
+            shape: BankShape::new(POOL_BLOCK, FLOOR_SLOTS, CEILING_SLOTS, CEILING_SLOTS),
+            charge: Box::new(|s| s * SLOT_BYTES),
+        }];
+        derive(&ledgers, &targets)[0].1
+    };
+
+    // Settle two calm readings at 81 slots with supply = 372 MB, guarantee = 0.
+    read_supply(&mut t, 100, 372 * MB as i64);
+    read_supply(&mut t, 100, 372 * MB as i64);
+    assert_eq!(ledger.estimate().guarantee(), 0);
+    assert_eq!(ledger.estimate().peak_guarantee(), 0);
+
+    // 1. Initial growth 81 -> 82 (+319 MB, leaving 53 MB supply).
+    assert_eq!(target_for(at_slots, 0), 82, "initial calm 372 MB supply admits 81 -> 82");
+    let extra = ledger.cached(CacheKind::Bank, SLOT_BYTES).expect("slot 82 fits");
+    at_slots = 82;
+    read_supply(&mut t, 100, 53 * MB as i64);
+
+    // 2. 126 ms later: others pulse by +190 MB (176.2 MB -> -13.8 MB), dropping
+    //    budget below held (`external_over = 13.8 MB > 0`, `guarantee = 190 MB`).
+    read_supply(&mut t, 100, 176_200_000);
+    read_supply(&mut t, 126, -13_800_000);
+    assert_eq!(ledger.estimate().guarantee(), PULSE, "pulse sets guarantee to 190 MB");
+    assert_eq!(ledger.estimate().peak_guarantee(), PULSE);
+    assert_eq!(target_for(at_slots, 0), 81, "negative supply (-13.8 MB) must shrink 82 -> 81");
+    drop(extra);
+    ledger.change(|_| records_pool.freed(&records_pool.change(), SLOT_BYTES, seismic::memory::Wiring::Pageable));
+    at_slots = 81;
+
+    // 3. 1.2 s later and across 10 cycles of guarantee toggling 0 <-> 190 MB
+    //    (supply toggling 385 MB <-> 195 MB): ZERO oscillations after settling.
+    let mut resizes = 0u64;
+    for cycle in 0..10u32 {
+        // Down-swing: others recede -> guarantee == 0, supply == 385 MB.
+        read_supply(&mut t, 1200, 385 * MB as i64);
+        assert_eq!(ledger.estimate().guarantee(), 0, "cycle {cycle}: guarantee toggles back to 0");
+        assert_eq!(ledger.estimate().peak_guarantee(), PULSE);
+        let next = target_for(at_slots, 0);
+        if next != at_slots {
+            resizes += 1;
+        }
+        assert_eq!(next, 81, "cycle {cycle}: transient guarantee == 0 must not regrow 81 -> 82");
+
+        // Up-swing: others pulse +190 MB -> guarantee == 190 MB, supply == 195 MB.
+        read_supply(&mut t, 126, (385 - 190) * MB as i64);
+        assert_eq!(ledger.estimate().guarantee(), PULSE, "cycle {cycle}: guarantee toggles to 190 MB");
+        let next = target_for(at_slots, 0);
+        if next != at_slots {
+            resizes += 1;
+        }
+        assert_eq!(next, 81, "cycle {cycle}: 190 MB pulse at 81 slots leaves 195 MB > 0, no shrink");
+    }
+    assert_eq!(resizes, 0, "zero oscillations after settling at 81 slots");
+
+    // 4. Genuine memory freed: supply rises to 550 MB (>= 319 MB + 190 MB).
+    //    Bank grows 81 -> 82 and survives the next 190 MB pulse without shrinking.
+    read_supply(&mut t, 500, 550 * MB as i64);
+    assert_eq!(target_for(at_slots, 0), 82, "genuine 550 MB supply survives 190 MB pulse and grows 81 -> 82");
+    let _slot82 = ledger.cached(CacheKind::Bank, SLOT_BYTES).expect("slot 82 fits");
+    at_slots = 82;
+    read_supply(&mut t, 100, (550 - 319) * MB as i64);
+    read_supply(&mut t, 126, (550 - 319 - 190) * MB as i64);
+    assert_eq!(ledger.estimate().guarantee(), PULSE);
+    assert_eq!(target_for(at_slots, 0), 82, "slot 82 survives 190 MB pulse with +41 MB supply left");
+
+    // 5. OOM safety: owed > 0 sheds immediately, and genuine external_over > 0 shrinks immediately.
+    assert_eq!(target_for(at_slots, POOL_BLOCK), 81, "owed > 0 still sheds immediately");
+    read_supply(&mut t, 100, -(500 * MB as i64));
+    assert!(target_for(at_slots, 0) < 82, "genuine external_over > 0 still shrinks immediately");
+
+    drop(bank_cache.take());
+}

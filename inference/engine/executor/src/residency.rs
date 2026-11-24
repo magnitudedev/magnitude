@@ -856,13 +856,14 @@ impl ResidencyStore {
         Self::make(device, programs, execution, domain, ledgers.changes().clone(), backing, pools)
     }
 
-    /// Charge temporary import workspaces to `upload` while importing the
-    /// target's weights.
+    /// Charge temporary import workspaces to `upload` while importing weights.
     pub fn with_upload(&mut self, upload: crate::memory::ledger::Held) {
-        *self.upload.get_mut() = Some(upload);
+        let slot = self.upload.get_mut();
+        assert!(slot.is_none(), "invariant violated: an upload window is already attached");
+        *slot = Some(upload);
     }
 
-    /// Release the target import's upload window once the import ends.
+    /// Release the import's upload window once the import ends.
     pub fn release_upload(&mut self) {
         drop(self.upload.get_mut().take());
     }
@@ -1575,11 +1576,25 @@ impl ResidencyStore {
         if self.device.backend() != seismic::BackendName::Metal || weights.is_empty() {
             return Ok(());
         }
-        let ordered = OrderedImport::of(artifact, weights, activation)?;
+        let ordered: Vec<_> = OrderedImport::of(artifact, weights, activation)?
+            .into_iter()
+            .filter(|item| {
+                let key = ResidencyKey {
+                    artifact: artifact.identity(),
+                    name: item.plan.descriptor.name.clone(),
+                    transforms: item.plan.descriptor.transforms.clone(),
+                    resident: item.plan.resident,
+                };
+                self.resident.get(&key).is_none()
+            })
+            .collect();
+        if ordered.is_empty() {
+            return Ok(());
+        }
         // The same source bound drives admission and batching. Whole
-        // streamed tables and banked expert stacks never enlarge this bound:
-        // only their slots (or no upload at all) are source storage.
-        let imports = ImportPlan::new(weights.iter());
+        // streamed tables, banked expert stacks, and weights already resident
+        // from the target never enlarge this bound.
+        let imports = ImportPlan::new(ordered.iter().map(|item| &item.plan));
         let mut report = ImportReport::default();
         // Measurement only: timed Metal encoders change the device path, so
         // these numbers attribute work but are not production load timings.
@@ -2021,14 +2036,22 @@ impl<T: Clone> ComponentLoader<T> {
     }
 
     /// Import the component under `held`, the claims of the bytes its
-    /// import brings into its cache, kept until [`Self::unload`]. An attempt
-    /// made before is returned as it ended, `held` released.
-    pub fn import(&self, mut held: crate::memory::ledger::Held) -> Result<T, Rc<crate::ResidencyError>> {
+    /// import brings into its cache, kept until [`Self::unload`], and
+    /// `upload`, the transient upload window for import workspaces, released
+    /// as soon as the import ends. An attempt made before is returned as it
+    /// ended, `held` and `upload` released.
+    pub fn import(
+        &self,
+        mut held: crate::memory::ledger::Held,
+        upload: crate::memory::ledger::Held,
+    ) -> Result<T, Rc<crate::ResidencyError>> {
         assert!(!self.imported(), "invariant violated: a component is imported once until unloaded");
         // The import's allocations charge its claims as Seismic makes them,
-        // one change with the import.
+        // one change with the import; transient workspaces charge `upload`.
         let device = self.store.borrow().device().clone();
+        self.store.borrow_mut().with_upload(upload);
         let imported = held.allocate(&device, |charges| self.load(charges));
+        self.store.borrow_mut().release_upload();
         if imported.is_ok() {
             *self.claims.borrow_mut() = held.into_claims();
         }

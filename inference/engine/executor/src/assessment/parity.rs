@@ -176,7 +176,10 @@ fn main_charge(base: &AssessmentMemoryCharge, backend: BackendName) -> Assessmen
         + bounds.graph_bytes
         + bounds.recorded_graph_bytes
         + bounds.device_process.bytes().unwrap();
-    let loading = base.startup_state_bytes + bounds.target_upload_peak_bytes;
+    let loading = base.startup_state_bytes
+        + bounds
+            .target_upload_peak_bytes
+            .max(bounds.head_upload_peak_bytes);
     let serving_peak = base.state_bytes + bounds.component_upload_bytes;
     let phase_b = prepared + serving_peak.max(loading);
     let qualification = bounds.qualification_phase_bytes().unwrap();
@@ -186,7 +189,10 @@ fn main_charge(base: &AssessmentMemoryCharge, backend: BackendName) -> Assessmen
         serving_bytes: prepared + base.state_bytes,
         phase_b_allocation_bytes: phase_b,
         allocation_bytes: qualification.max(phase_b),
-        staging_bytes: bounds.target_upload_peak_bytes.max(bounds.component_upload_bytes),
+        staging_bytes: bounds
+            .target_upload_peak_bytes
+            .max(bounds.head_upload_peak_bytes)
+            .max(bounds.component_upload_bytes),
         ..base.clone()
     }
 }

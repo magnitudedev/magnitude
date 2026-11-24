@@ -543,6 +543,7 @@ pub struct StructuralCharge {
     host_table_bytes: u64,
     /// Upload windows invariant with bank slots and context.
     component_upload_bytes: u64,
+    head_upload_peak_bytes: u64,
     target_upload_peak_bytes: u64,
     /// Bank `(slots, host_slots)` for which `prepared_weight_demand`,
     /// `prepared_qualification_peak_bytes`, and `prepared_deferred_bank_bytes`
@@ -934,6 +935,7 @@ impl StructuralCharge {
             state_sizer: std::sync::Arc::clone(&self.state_sizer),
             host_table_bytes: self.host_table_bytes,
             component_upload_bytes: self.component_upload_bytes,
+            head_upload_peak_bytes: self.head_upload_peak_bytes,
             target_upload_peak_bytes: self.target_upload_peak_bytes,
             prepared_bank_slots: self.prepared_bank_slots,
             prepared_weight_demand: self.prepared_weight_demand,
@@ -1030,6 +1032,7 @@ impl StructuralCharge {
                 state_sizer,
                 host_table_bytes,
                 component_upload_bytes: header.component_upload_bytes,
+                head_upload_peak_bytes: header.head_upload_peak_bytes,
                 target_upload_peak_bytes: header.target_upload_peak_bytes,
                 prepared_bank_slots: bank_slots_key(load),
                 prepared_weight_demand,
@@ -1062,6 +1065,7 @@ impl StructuralCharge {
         let header = AssessmentHeaderBounds {
             qualification_peak_bytes,
             target_upload_peak_bytes: self.target_upload_peak_bytes,
+            head_upload_peak_bytes: self.head_upload_peak_bytes,
             component_upload_bytes: self.component_upload_bytes,
         };
         let bounds = header

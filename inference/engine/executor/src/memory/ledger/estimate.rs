@@ -17,6 +17,9 @@ pub(super) struct Read {
     /// The store's structural capacity (`Reading::capacity`): the most bytes
     /// the store could grant the process beside nothing else.
     capacity: u64,
+    /// The store's total physical bytes (`Reading::total`), without a wired
+    /// GPU ceiling subtracted.
+    total: u64,
     /// The store's supply, others' cold pages in it only once harm is
     /// judged ([`Boundary::judges`]).
     supply: i64,
@@ -53,10 +56,20 @@ pub(super) struct Read {
     others: u64,
     /// Others' rise since the reading before.
     rise: u64,
+    /// High-water single-reading `rise` observed on this store since open or
+    /// the last idle settle (`settled`): applied only to runtime growth
+    /// (`grow_room` / `pinned_grow_room`), never to `budget`, `hold_room`, or
+    /// `guarantee`, so transient `guarantee == 0` dips between OS UMA pulses do
+    /// not regrow a slot that cannot survive the next pulse.
+    peak_rise: u64,
     /// Others' wired rise since the reading before; applied only to growth
     /// targets (`import_room` / `target`), never baked into `grant` or
     /// `hold_room`, so single-sample wired jitter does not trigger shrink thrash.
     wired_rise: u64,
+    /// High-water single-reading `wired_rise` observed on this store since open
+    /// or the last idle settle (`settled`); applied only to runtime growth
+    /// (`grow_room`), never to `grant` or `hold_room`.
+    peak_wired_rise: u64,
     /// The wired ceiling's grant: the limit less others' wired bytes and
     /// `Ceiling::execution_reserve()`; none where no ceiling bounds the store.
     pub(super) grant: Option<u64>,
@@ -266,6 +279,23 @@ impl Estimate {
         self.read.capacity
     }
 
+    /// Total physical bytes of the store (`Reading::total`), without applying
+    /// a GPU wired ceiling. On unified Metal (`HostGrant::Wired`), this bounds
+    /// wired allocations plus unwired host heap (`allocation_bytes + host_bytes`).
+    pub fn host_capacity(&self) -> u64 {
+        self.read.total
+    }
+
+    /// Room in the store's own supply without the wired GPU grant ceiling:
+    /// `(in_use + supply).max(0) - committed - guarantee`.
+    pub fn host_room(&self) -> u64 {
+        let room = u64::try_from(
+            (i128::from(self.read.in_use()) + i128::from(self.read.supply)).max(0),
+        )
+        .expect("a store's bytes fit u64");
+        room.saturating_sub(self.committed.saturating_add(self.guarantee()))
+    }
+
     /// What the process may hold in the store: `min(grant, in_use +
     /// supply)`, `in_use` what the store's use holds of the process's
     /// allocated bytes as the sample shows them (those out of RAM come
@@ -298,6 +328,15 @@ impl Estimate {
     /// process's growth is credited against the grant.
     pub fn guarantee(&self) -> u64 {
         self.read.rise
+    }
+
+    /// High-water single-reading `guarantee` (`others` rise) observed on this
+    /// store since open or the last idle settle: used by runtime bank growth
+    /// ([`Self::grow_room`] / [`Self::pinned_grow_room`]) so transient
+    /// `guarantee == 0` dips between recurring OS pulses never grow a slot that
+    /// cannot survive the next pulse.
+    pub fn peak_guarantee(&self) -> u64 {
+        self.read.peak_rise
     }
 
     /// What the process holds past the budget less the guarantee: the
@@ -343,6 +382,35 @@ impl Estimate {
         }
     }
 
+    /// Room available to elastic bank growth under `rise` (host supply pulse)
+    /// and `wired_rise` (wired ceiling pulse).
+    fn room_for_growth(&self, rise: u64, wired_rise: u64) -> u64 {
+        match (self.read.ceiling, self.read.grant) {
+            (Some(_), Some(grant)) => {
+                let supply_room = u64::try_from((i128::from(self.read.in_use()) + i128::from(self.read.supply)).max(0))
+                    .expect("a store's bytes fit u64");
+                let supply_budget = supply_room
+                    .saturating_sub(self.read.cache_reserve)
+                    .saturating_sub(rise);
+                let wired_budget = grant
+                    .saturating_sub(self.read.unit)
+                    .saturating_sub(wired_rise);
+                self.room_in(supply_budget.min(wired_budget), 0)
+            }
+            _ => self.room_in(self.bank_budget(), rise),
+        }
+    }
+
+    /// Apply the paging harm / step-window growth gate to `room`: when growth
+    /// is gated (`!self.read.grows`), cap at current bank holdings.
+    fn gate_growth(&self, room: u64) -> u64 {
+        let bank = self.cache_of(CacheKind::Bank) + self.cache_of(CacheKind::Table) + self.bank_spare;
+        match self.read.grows {
+            true => room,
+            false => room.min(bank),
+        }
+    }
+
     /// The room the store leaves the bank and its records pool's spare
     /// granules before growth's harm/step gate (`Self::target`): `bank_budget`
     /// less committed memory, other caches, unreleased shed cache, and the
@@ -350,20 +418,7 @@ impl Estimate {
     /// against a wired GPU ceiling's grant), bounded by `cap`. Load import
     /// sizes what the store's room holds at open (`experts::derived::import_target`).
     pub fn import_room(&self) -> u64 {
-        match (self.read.ceiling, self.read.grant) {
-            (Some(_), Some(grant)) => {
-                let supply_room = u64::try_from((i128::from(self.read.in_use()) + i128::from(self.read.supply)).max(0))
-                    .expect("a store's bytes fit u64");
-                let supply_budget = supply_room
-                    .saturating_sub(self.read.cache_reserve)
-                    .saturating_sub(self.guarantee());
-                let wired_budget = grant
-                    .saturating_sub(self.read.unit)
-                    .saturating_sub(self.read.wired_rise);
-                self.room_in(supply_budget.min(wired_budget), 0)
-            }
-            _ => self.room_in(self.bank_budget(), self.guarantee()),
-        }
+        self.room_for_growth(self.guarantee(), self.read.wired_rise)
     }
 
     /// The room the store leaves the bank and its records pool's spare
@@ -414,12 +469,17 @@ impl Estimate {
     /// Runtime growth target for a pinned host bank: [`Self::pinned_import_room`]
     /// when growth is admissible, else capped at current bank holdings.
     pub fn pinned_target(&self) -> u64 {
-        let bank = self.cache_of(CacheKind::Bank) + self.cache_of(CacheKind::Table) + self.bank_spare;
-        let room = self.pinned_import_room();
-        match self.read.grows {
-            true => room,
-            false => room.min(bank),
-        }
+        self.gate_growth(self.pinned_import_room())
+    }
+
+    /// Runtime growth room for a pinned host bank (`experts::derived::derive`):
+    /// reserves `peak_rise` capped at `max_pulse` (at least instantaneous
+    /// `guarantee()`) so transient `guarantee == 0` dips between recurring OS
+    /// pulses do not grow into the pulse band while large exogenous releases
+    /// still regrow immediately.
+    pub fn pinned_grow_room(&self, max_pulse: u64) -> u64 {
+        let rise = self.read.rise.max(self.read.peak_rise.min(max_pulse));
+        self.gate_growth(self.room_in(self.pinned_budget(), rise))
     }
 
     /// Live pinned-host headroom for a fresh `sample` taken during background
@@ -456,12 +516,19 @@ impl Estimate {
     }
 
     pub fn target(&self) -> u64 {
-        let bank = self.cache_of(CacheKind::Bank) + self.cache_of(CacheKind::Table) + self.bank_spare;
-        let room = self.import_room();
-        match self.read.grows {
-            true => room,
-            false => room.min(bank),
-        }
+        self.gate_growth(self.import_room())
+    }
+
+    /// Runtime growth room for an elastic bank (`experts::derived::derive`):
+    /// reserves `peak_rise` and `peak_wired_rise` capped at `max_pulse` (at
+    /// least instantaneous `rise` / `wired_rise`) so transient `guarantee == 0`
+    /// dips between recurring OS UMA pulses do not grow a slot that cannot
+    /// survive the next pulse, while large exogenous releases still regrow
+    /// immediately.
+    pub fn grow_room(&self, max_pulse: u64) -> u64 {
+        let rise = self.read.rise.max(self.read.peak_rise.min(max_pulse));
+        let wired_rise = self.read.wired_rise.max(self.read.peak_wired_rise.min(max_pulse));
+        self.gate_growth(self.room_for_growth(rise, wired_rise))
     }
 }
 
@@ -719,9 +786,18 @@ impl State {
         let pinned_reserve = reading.pinned_reserve(unit);
         let cache_reserve = reading.cache_reserve();
         let (cap, grows) = (self.boundary.cap(), !paged || self.boundary.admits_growth());
+        let peak_rise = match prev_read.filter(|_| !settled) {
+            None => rise,
+            Some(before) => before.peak_rise.max(rise),
+        };
+        let peak_wired_rise = match prev_read.filter(|_| !settled) {
+            None => wired_rise,
+            Some(before) => before.peak_wired_rise.max(wired_rise),
+        };
         let read = Read {
             at,
             capacity: reading.capacity(),
+            total: reading.total(),
             supply,
             immediate_supply,
             pinned_reserve,
@@ -733,7 +809,9 @@ impl State {
             credited,
             others,
             rise,
+            peak_rise,
             wired_rise,
+            peak_wired_rise,
             grant,
             ceiling: reading.ceiling(),
             unwired,

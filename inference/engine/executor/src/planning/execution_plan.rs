@@ -620,13 +620,23 @@ impl ExecutionPlanDraft {
                 }
             }
         }
+        let mut startup_fallback: Option<Box<(Self, C, super::WholeFit)>> = None;
         for places in self.whole_chains(definition, bound)?.into_iter().flatten() {
             let resident = self.held_whole_at(definition, places)?;
             let charge = held.charge(definition, &resident)?;
             let fit = budget.fit_whole(&resident, charge.charge())?;
             figures.resident = Some(Need { fit: Some(fit), terms: NeedTerms::of(&resident, charge.charge())? });
             if fit.short.is_some() {
-                last_short = Some((fit.limiting_required, fit.limiting_available));
+                if budget.live_below_capacity() && budget.fits_capacity(&resident, charge.charge())? {
+                    let startup_fit = budget.fit_startup(&resident, charge.charge())?;
+                    if startup_fit.short.is_some() {
+                        last_short = Some((startup_fit.limiting_required, startup_fit.limiting_available));
+                    } else if startup_fallback.is_none() {
+                        startup_fallback = Some(Box::new((resident, charge, startup_fit)));
+                    }
+                } else {
+                    last_short = Some((fit.limiting_required, fit.limiting_available));
+                }
             } else {
                 match confirm(&resident, charge.charge())? {
                     Ok(found) => {
@@ -636,6 +646,19 @@ impl ExecutionPlanDraft {
                     Err(_) => {
                         last_short = Some((fit.limiting_required, fit.limiting_available));
                     }
+                }
+            }
+        }
+        if let Some(fallback) = startup_fallback {
+            let (resident, charge, fit) = *fallback;
+            figures.resident = Some(Need { fit: Some(fit), terms: NeedTerms::of(&resident, charge.charge())? });
+            match confirm(&resident, charge.charge())? {
+                Ok(found) => {
+                    figures.form = Some(WholeForm::Resident);
+                    return placed(figures, Placing::Whole { draft: resident, charge, found });
+                }
+                Err(_) => {
+                    last_short = Some((fit.limiting_required, fit.limiting_available));
                 }
             }
         }
@@ -2245,7 +2268,9 @@ struct NeedTerms {
     process: u64,
     qualification_peak: u64,
     target_upload_peak: u64,
+    head_upload_peak: u64,
     component_upload: u64,
+    host_bytes: u64,
     allocation: u64,
 }
 
@@ -2270,7 +2295,9 @@ impl NeedTerms {
             process: resource(bounds.device_process.bytes())?,
             qualification_peak: bounds.qualification_peak_bytes,
             target_upload_peak: bounds.target_upload_peak_bytes,
+            head_upload_peak: bounds.head_upload_peak_bytes,
             component_upload: bounds.component_upload_bytes,
+            host_bytes: resource(charge.host_bytes())?,
             allocation,
         })
     }
@@ -2291,7 +2318,9 @@ impl std::fmt::Display for NeedTerms {
             process,
             qualification_peak,
             target_upload_peak,
+            head_upload_peak,
             component_upload,
+            host_bytes,
             allocation,
         } = self;
         write!(
@@ -2299,7 +2328,7 @@ impl std::fmt::Display for NeedTerms {
             "weights {weights} ({weights_device} in device storage), state {state} (startup {startup_state}), \
              graph pools {graph_pools} at {chain_places} chain places, \
              recorded graphs {recorded_graphs_device} device and {recorded_graphs_upload} upload, prepared {prepared}, process {process}, \
-             qualification {qualification_peak}, target import {target_upload_peak}, component import {component_upload}, allocation {allocation}"
+             qualification {qualification_peak}, target import {target_upload_peak}, head import {head_upload_peak}, component import {component_upload}, host {host_bytes}, allocation {allocation}"
         )
     }
 }
