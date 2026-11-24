@@ -110,6 +110,7 @@ class Remote:
     backends: tuple[str, ...]  # what the host can run, probed on connect (`host_status`: now)
     ready: bool  # `mrig setup` verified the host, probed on connect (`host_status`: now)
     temperatures: bool = True  # the host exposes temperature sensors (`HostConfig.temperatures`)
+    builds: bool = True  # the host may run local cargo builds (`HostConfig.builds`)
 
     def command(self, argv: list[str], *, login: bool = False, cwd: str | None = None) -> list[str]:
         """The ssh argv running `argv` on the host (in a login shell when asked, on POSIX)."""
@@ -196,6 +197,7 @@ def connect(config: HostConfig) -> Remote:
     return Remote(
         config.alias, config.local, windows, system, machine, python, **probed,
         temperatures=config.temperatures,
+        builds=config.builds,
     )
 
 

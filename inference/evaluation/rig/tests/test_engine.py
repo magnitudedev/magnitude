@@ -225,8 +225,8 @@ def test_runs_placed_together_spread_across_equal_hosts_and_a_pin_holds(rig):
             session.run_lock.close()
 
 
-def _candidate(alias: str, *, checkouts: list, building: list, builds=(1200.0,), room_wait=0.0):
-    status = {"checkouts": checkouts, "building": building,
+def _candidate(alias: str, *, checkouts: list, building: list, builds=(1200.0,), room_wait=0.0, max_builds: int = 1):
+    status = {"checkouts": checkouts, "building": building, "max_builds": max_builds,
               "waits": {"build": 0.0, "device": 0.0, "timed": 0.0},
               "device_lock_held_elsewhere": None, "entries": [],
               "free_bytes": 13e9, "room": {"available": 24e9, "owed": 0, "ending": []}}
@@ -234,18 +234,31 @@ def _candidate(alias: str, *, checkouts: list, building: list, builds=(1200.0,),
                             {}, room_wait, builds)
 
 
-def test_a_warm_checkout_on_a_busy_host_wins_only_while_it_outweighs_the_contention():
-    """A warm build shares the CPU with each owed build for as long as it lasts itself: beside
-    two cold builds it still ends before a cold build alone, until its own seconds times three
-    pass a cold build's."""
+def test_build_slots_and_shared_checkouts_price_start_without_double_counting():
+    """Builds queue across `max_builds` slots without double-penalizing CPU sharing, and a
+    shared live build is counted once rather than as both queue wait and own work."""
     warm = {"name": "slot-0", "source": "mine", "size": 0, "warmth": agent.SAME, "shared": False}
-    idle = _candidate("idle", checkouts=[None], building=[])
-    busy = _candidate("busy", checkouts=[warm], building=[1200.0, 1200.0], builds=(60.0,))
-    assert engine._start(busy) == 180 and engine._start(idle) == 1200
-    assert min([busy, idle], key=engine._start) is busy
-    slow = _candidate("busy", checkouts=[warm], building=[1200.0, 1200.0], builds=(500.0,))
-    assert engine._start(slow) == 1500
-    assert min([slow, idle], key=engine._start) is idle
+    shared = {"name": "slot-0", "source": "mine", "size": 0, "warmth": agent.SAME, "shared": True}
+    idle = _candidate("idle", checkouts=[None], building=[], max_builds=1)
+    assert engine._start(idle) == 1200
+
+    # Single build slot (`max_builds=1`): queues behind both active builds (2400 + 60).
+    serial = _candidate("serial", checkouts=[warm], building=[1200.0, 1200.0], builds=(60.0,), max_builds=1)
+    assert engine._start(serial) == 2460
+    assert min([serial, idle], key=engine._start) is idle
+
+    # Multi-slot builder (`max_builds=4`): 2 slots free -> starts immediately (60s), beats idle cold.
+    multi = _candidate("multi", checkouts=[warm], building=[1200.0, 1200.0], builds=(60.0,), max_builds=4)
+    assert engine._start(multi) == 60
+    assert min([multi, idle], key=engine._start) is multi
+
+    # All 2 slots full (`max_builds=2`): waits for earliest slot (500s) + own (60s) = 560s.
+    full = _candidate("full", checkouts=[warm], building=[1200.0, 500.0], builds=(60.0,), max_builds=2)
+    assert engine._start(full) == 560
+
+    # Shared live build: waits only for the shared build's remaining 300s, never double-counted.
+    sharing = _candidate("sharing", checkouts=[shared], building=[300.0], builds=(300.0,), max_builds=1)
+    assert engine._start(sharing) == 300
 
 
 def test_the_start_line_shows_the_queue_and_each_run_against_its_estimate():

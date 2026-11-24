@@ -1159,8 +1159,10 @@ fn measure(
                     let grant = decode.sequences[0].grant;
                     summary["front_depth"] = json!(grant.depth());
                     summary["form"] = json!(match grant {
+                        magnitude_executor::FrontGrant::Plain => "plain",
                         magnitude_executor::FrontGrant::UpTo(_) | magnitude_executor::FrontGrant::Exactly(_) => "front",
                         magnitude_executor::FrontGrant::Verify(_) => "verify",
+                        magnitude_executor::FrontGrant::Mixed { .. } => "mixed",
                     });
                 }
                 span.1 = step.end;
@@ -1246,25 +1248,10 @@ fn measure(
                         "led": end.led - start.led,
                         "parked_ms": (end.parked - start.parked).as_secs_f64() * MS,
                         "read_ms": (end.read - start.read).as_secs_f64() * MS,
-                        // The window's decode steps by whether its hints ran.
-                        "hints_off": end.hints[0] - start.hints[0],
-                        "hints_on": end.hints[1] - start.hints[1],
                     })
                 })
                 .collect::<Vec<_>>();
-            // The window's hints.
-            let window = end.hints.since(&start.hints);
             let ahead_window = end.ahead.since(&start.ahead);
-            let hints = json!({
-                "reads": window.reads,
-                "bytes": ahead_window.hints_issued(),
-                "candidates": window.candidates,
-                "named": window.named,
-                "early": window.early,
-                "hintable": window.hintable,
-                "unhintable": window.unhintable,
-                "layer_steps": window.layer_steps,
-            });
             let front_window = end.front.since(&start.front);
             // The window's passes with front rows, their routes' reads, and
             // their guesses judged and those that stood, by kind.
@@ -1329,7 +1316,8 @@ fn measure(
                         "stand": regime.stand,
                         "accepts": regime.accepts,
                         "stall_ms": regime.stall.map(ms),
-                        "overhead_ms": regime.overhead.map(ms),
+                        "overhead_ms": regime.overhead.map(|o| ms(o.fixed)),
+                        "overhead_per_step_ms": regime.overhead.map(|o| ms(o.per_step)),
                         "paths": paths,
                     })
                 });
@@ -1386,7 +1374,6 @@ fn measure(
                     "demand": demand_reads,
                     "served": served_reads,
                     "line": end.line,
-                    "hints": hints,
                     "front": front,
                     "ahead": ahead,
                 }),
@@ -1603,28 +1590,6 @@ fn expert_step(costs: Option<magnitude_executor::ExpertCosts>, host_slots: Optio
     // with it, and the reads ahead's bytes issued, read and used since the
     // step before (the rest of those read wasted).
     let (issued, ahead) = cost.ahead.total();
-    // Each streamed layer's exact rows' hints for the step, lead by lead:
-    // the candidates named and admitted, the reads they led, used and
-    // wasted, and whether the layer's hint launch ran.
-    let hints = cost
-        .hints
-        .iter()
-        .map(|leads| {
-            leads
-                .iter()
-                .map(|lead| {
-                    json!({
-                        "published": lead.published,
-                        "admitted": lead.admitted,
-                        "read": lead.read,
-                        "used": lead.used,
-                        "wasted": lead.wasted(),
-                        "on": lead.on,
-                    })
-                })
-                .collect::<Vec<_>>()
-        })
-        .collect::<Vec<_>>();
     Ok(Some(json!({
         "sequence": sequence,
         "misses": cost.misses,
@@ -1642,7 +1607,6 @@ fn expert_step(costs: Option<magnitude_executor::ExpertCosts>, host_slots: Optio
             "used": ahead.used,
             "wasted": ahead.unused(),
         },
-        "hints": hints,
     })))
 }
 
@@ -1893,15 +1857,13 @@ fn router(attribution: &Value, entries: &[&str]) -> Result<Value, String> {
 /// no per-entry times.
 fn routers(cell: &Value, resident: &Value) -> Value {
     use magnitude_kernels::{
-        routed_hint_route, routed_hint_select, routed_route, routed_route_shared,
+        routed_route, routed_route_shared,
         routed_route_streamed, routed_select, routed_select_streamed,
     };
     use seismic::Entry;
-    const STREAMED: [&str; 4] = [
+    const STREAMED: [&str; 2] = [
         routed_route_streamed::Entry::NAME,
-        routed_hint_route::Entry::NAME,
         routed_select_streamed::Entry::NAME,
-        routed_hint_select::Entry::NAME,
     ];
     const RESIDENT: [&str; 3] = [routed_route::Entry::NAME, routed_route_shared::Entry::NAME, routed_select::Entry::NAME];
     let of = |cell: &Value, entries: &[&str], whose: &str| match &cell["detail"]["attribution"] {

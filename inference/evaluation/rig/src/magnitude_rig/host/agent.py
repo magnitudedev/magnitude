@@ -331,7 +331,7 @@ RUNNER_LOG = "runner.log"
 # anything (nor while one waits on it), so waits across protocols form no cycle: no run holding
 # a checkout waits for the device behind a run of another protocol that, holding its own
 # checkout, waits for that one.
-PROTOCOL = 7
+PROTOCOL = 8
 # The kinds a session claims rather than requests: a checkout, while it builds there (or its jobs
 # read it), and a build output, while its jobs read it.
 CLAIMED = ("checkout:", "output:")
@@ -386,9 +386,166 @@ WARMTH = (SAME, OTHER, COLD) = (0, 1, 2)
 # checkout yet owes, and what an entry of another version, which records no price, does.
 BUILD_PRIOR_SECONDS = 1200
 # The latest builds of each build kept with its measurements.
-BUILDS_KEPT = 8
+BUILDS_KEPT = 3
 # In a checkout: the commit it last built.
 COMMIT = "commit"
+GiB = 1 << 30
+_HARDWARE: tuple[int | None, int | None] | None = None
+
+
+def _linux_cgroup_limits() -> tuple[int | None, int | None]:
+    """Return `(memory_limit_bytes, cpu_limit_cores)` from Linux cgroup v2/v1 if bounded."""
+    mem_limit: int | None = None
+    cpu_limit: float | None = None
+    try:
+        with open("/proc/self/cgroup") as stream:
+            lines = stream.read().splitlines()
+    except OSError:
+        return None, None
+    mount = "/sys/fs/cgroup"
+    for line in lines:
+        parts = line.split(":", 2)
+        if len(parts) != 3:
+            continue
+        _, controllers, path = parts
+        rel = path.lstrip("/")
+        if controllers == "":  # cgroup v2
+            cur = os.path.join(mount, rel) if rel else mount
+            while True:
+                try:
+                    with open(os.path.join(cur, "cpu.max")) as f:
+                        q, p = f.read().split()
+                        if q != "max":
+                            val = int(q) / int(p)
+                            cpu_limit = val if cpu_limit is None else min(cpu_limit, val)
+                except (OSError, ValueError, ZeroDivisionError):
+                    pass
+                try:
+                    with open(os.path.join(cur, "memory.max")) as f:
+                        raw = f.read().strip()
+                        if raw != "max":
+                            val_m = int(raw)
+                            mem_limit = val_m if mem_limit is None else min(mem_limit, val_m)
+                except (OSError, ValueError):
+                    pass
+                if os.path.abspath(cur) == os.path.abspath(mount):
+                    break
+                cur = os.path.dirname(cur)
+        else:
+            ctrl_set = set(controllers.split(","))
+            if "cpu" in ctrl_set:
+                for sub in ("cpu,cpuacct", "cpu"):
+                    root_c = os.path.join(mount, sub)
+                    if not os.path.isdir(root_c):
+                        continue
+                    cur = os.path.join(root_c, rel) if rel else root_c
+                    while True:
+                        try:
+                            with open(os.path.join(cur, "cpu.cfs_quota_us")) as fq, \
+                                 open(os.path.join(cur, "cpu.cfs_period_us")) as fp:
+                                q, p = int(fq.read().strip()), int(fp.read().strip())
+                                if q > 0 and p > 0:
+                                    val = q / p
+                                    cpu_limit = val if cpu_limit is None else min(cpu_limit, val)
+                        except (OSError, ValueError, ZeroDivisionError):
+                            pass
+                        if os.path.abspath(cur) == os.path.abspath(root_c):
+                            break
+                        cur = os.path.dirname(cur)
+            if "memory" in ctrl_set:
+                root_m = os.path.join(mount, "memory")
+                if os.path.isdir(root_m):
+                    cur = os.path.join(root_m, rel) if rel else root_m
+                    while True:
+                        try:
+                            with open(os.path.join(cur, "memory.limit_in_bytes")) as fm:
+                                val_m = int(fm.read().strip())
+                                if 0 < val_m < (1 << 60):
+                                    mem_limit = val_m if mem_limit is None else min(mem_limit, val_m)
+                        except (OSError, ValueError):
+                            pass
+                        if os.path.abspath(cur) == os.path.abspath(root_m):
+                            break
+                        cur = os.path.dirname(cur)
+    return mem_limit, (max(1, int(cpu_limit)) if cpu_limit is not None else None)
+
+
+def _host_hardware() -> tuple[int | None, int | None]:
+    """Probe `(memory_bytes, cpu_cores_physical)` on the local host using stdlib only,
+    respecting Linux CPU affinity (`os.sched_getaffinity`) and cgroup CPU/RAM limits."""
+    global _HARDWARE
+    if _HARDWARE is not None:
+        return _HARDWARE
+    mem_bytes: int | None = None
+    phys_cores: int | None = None
+    try:
+        if sys.platform == "darwin":
+            mem_bytes = int(subprocess.check_output(["sysctl", "-n", "hw.memsize"], text=True, timeout=5).strip())
+            phys_cores = int(subprocess.check_output(["sysctl", "-n", "hw.physicalcpu"], text=True, timeout=5).strip())
+        elif sys.platform.startswith("linux"):
+            with open("/proc/meminfo") as stream:
+                for line in stream:
+                    if line.startswith("MemTotal:"):
+                        mem_bytes = int(line.split()[1]) * 1024
+                        break
+            allowed_cpus = None
+            if hasattr(os, "sched_getaffinity"):
+                try:
+                    allowed_cpus = os.sched_getaffinity(0)
+                except OSError:
+                    allowed_cpus = None
+            cores = set()
+            for topo in glob.glob("/sys/devices/system/cpu/cpu[0-9]*/topology"):
+                cpu_dir = os.path.basename(os.path.dirname(topo))
+                if allowed_cpus is not None and cpu_dir.startswith("cpu"):
+                    try:
+                        if int(cpu_dir[3:]) not in allowed_cpus:
+                            continue
+                    except ValueError:
+                        continue
+                try:
+                    with open(os.path.join(topo, "physical_package_id")) as f1, \
+                         open(os.path.join(topo, "core_id")) as f2:
+                        cores.add((f1.read().strip(), f2.read().strip()))
+                except OSError:
+                    pass
+            if cores:
+                phys_cores = len(cores)
+            elif allowed_cpus is not None and len(allowed_cpus) > 0:
+                phys_cores = len(allowed_cpus)
+            else:
+                phys_cores = os.cpu_count()
+            cg_mem, cg_cpu = _linux_cgroup_limits()
+            if cg_mem is not None:
+                mem_bytes = min(mem_bytes, cg_mem) if mem_bytes is not None else cg_mem
+            if cg_cpu is not None:
+                phys_cores = min(phys_cores, cg_cpu) if phys_cores is not None else cg_cpu
+        else:
+            phys_cores = os.cpu_count()
+    except Exception:
+        if phys_cores is None:
+            phys_cores = os.cpu_count()
+    _HARDWARE = (mem_bytes, phys_cores)
+    return _HARDWARE
+
+
+def max_builds(memory_bytes: int | None, cpu_cores_physical: int | None, *, builds: bool = True) -> int:
+    """Hardware-derived concurrent build admission cap:
+    `min(max(1, (ram - 16GiB) // 24GiB), max(1, phys_cores // 16))`, or 0 when `builds` is False."""
+    if not builds:
+        return 0
+    if memory_bytes is None or cpu_cores_physical is None:
+        return 1
+    ram_slots = max(1, int((memory_bytes - 16 * GiB) // (24 * GiB)))
+    cpu_slots = max(1, int(cpu_cores_physical) // 16)
+    return min(ram_slots, cpu_slots)
+
+
+def cargo_build_jobs(cpu_cores_physical: int | None, limit: int) -> int:
+    """Per-build `CARGO_BUILD_JOBS` cap: `max(1, phys_cores // max_builds)`."""
+    if cpu_cores_physical is None or limit <= 0:
+        return 1
+    return max(1, int(cpu_cores_physical) // limit)
 
 
 def conflicts(a: str, b: str) -> bool:
@@ -449,11 +606,14 @@ def _now() -> str:
 class Rig:
     """The host's rig directory: entries and the guard serializing every change to them."""
 
-    def __init__(self, root: str):
+    def __init__(self, root: str, *, max_builds_limit: int | None = None, cpu_cores_physical: int | None = None):
         self.root = root
         self.directory = os.path.join(root, "rig")
         self.entries = os.path.join(self.directory, "entries")
         os.makedirs(self.entries, exist_ok=True)
+        mem_bytes, probed_cores = _host_hardware()
+        self.cpu_cores_physical = probed_cores if cpu_cores_physical is None else cpu_cores_physical
+        self.max_builds = max_builds(mem_bytes, self.cpu_cores_physical) if max_builds_limit is None else max_builds_limit
 
     def guarded(self, action):
         guard = FileLock(os.path.join(self.directory, "guard.lock"))
@@ -766,12 +926,23 @@ class Session:
 
         def judge():
             mine = os.path.basename(self.entries[kind][0])
+            live = self.rig.live()
             # A run of another protocol that came after this one waits on it.
-            blockers = [entry for entry in self.rig.live()
+            blockers = [entry for entry in live
                         if entry["run"] != self.info["run"] and entry.get("protocol") == PROTOCOL
                         and conflicts(entry["kind"], kind) and comes_before(entry, mine)]
             if blockers:
                 return blockers
+            if kind == "build":
+                limit = self.rig.max_builds
+                if limit <= 0:
+                    return [{"kind": "build", "who": "host disables builds (max_builds=0)",
+                             "run": None, "state": "held"}]
+                ahead_builds = [entry for entry in live
+                                if entry["run"] != self.info["run"] and entry.get("protocol") == PROTOCOL
+                                and entry["kind"] == "build" and comes_before(entry, mine)]
+                if len(ahead_builds) >= limit:
+                    return ahead_builds
             if kind in DEVICE_KINDS and self.device is None:
                 device = FileLock(os.path.join(self.rig.root, "lock"))
                 if not device.try_acquire():
@@ -891,12 +1062,25 @@ class Session:
             return found
 
         removed += ["%s/%s" % (OUTPUTS, key) for key in self.rig.guarded(outputs)]
+        max_checkouts = self.rig.max_builds + 1
+
+        def evict_one():
+            live = self.rig.live()
+            current = _directories(base)
+            # Re-evaluate both total bytes and checkout count under the guard so concurrent
+            # reclaimers cannot race and discard warm checkouts past `max_checkouts`.
+            total_bytes = sum(
+                sizes[name] if name in sizes else _held_bytes(os.path.join(base, name))
+                for name in current
+            )
+            if total_bytes <= budget and len(current) <= max_checkouts:
+                return None
+            return _move_least_recent(root, live, trash, checkouts_only=True)
+
         while True:
             for name in _directories(trash):  # moved aside, by this reclaim or one that did not finish
                 _remove_tree(os.path.join(trash, name))
-            if sum(sizes.values()) <= budget:
-                break
-            moved = self.rig.guarded(lambda: _move_least_recent(root, self.rig.live(), trash, checkouts_only=True))
+            moved = self.rig.guarded(evict_one)
             if moved is None:
                 break
             _, name, aside = moved
@@ -1209,10 +1393,24 @@ def present_units(target: str) -> set:
             for name in os.listdir(os.path.join(target, *relative.split("/"))) if (found := HASHED.search(name))}
 
 
+def _incremental_directories(target: str) -> list:
+    """Each profile's `incremental` directory (`<profile>/incremental` and `<triple>/<profile>/incremental`)."""
+    found = []
+    for first in _directories(target):
+        for second in _directories(os.path.join(target, first)):
+            if second == "incremental":
+                found.append(os.path.join(target, first, second))
+                continue
+            inc = os.path.join(target, first, second, "incremental")
+            if os.path.isdir(inc):
+                found.append(inc)
+    return found
+
+
 def trim(target: str, kept: dict) -> dict:
     """Remove from `target` every hashed entry of a unit directory that no build of `kept`
-    (`_references`) references, never its incremental directories (see the module
-    documentation): the bytes and the entries removed."""
+    (`_references`) references, plus any stale `incremental/` directories (builds run with
+    `CARGO_INCREMENTAL=0`): the bytes and the entries removed."""
     units = {unit for build in kept.values() for unit in build["units"]}
     freed = entries = 0
     for relative in _unit_directories(target):
@@ -1225,6 +1423,10 @@ def trim(target: str, kept: dict) -> dict:
             freed += checkout_bytes(path) if os.path.isdir(path) and not os.path.islink(path) else os.lstat(path).st_size
             entries += 1
             _clear(path)
+    for directory in _incremental_directories(target):
+        freed += checkout_bytes(directory)
+        entries += 1
+        _clear(directory)
     return {"bytes": freed, "entries": entries}
 
 
@@ -1774,6 +1976,11 @@ class Runner:
             return
         request = dict(op, argv=argv, cwd=self._fill(op["cwd"]),
                        env={k: self._fill(v) for k, v in op.get("env", {}).items()})
+        request["env"].setdefault("CARGO_INCREMENTAL", "0")
+        request["env"].setdefault(
+            "CARGO_BUILD_JOBS",
+            str(cargo_build_jobs(self.rig.cpu_cores_physical, self.rig.max_builds)),
+        )
         if "install" in op and op["install"] in self.shared:
             self.events.note("skipped `%s`: checkout %s holds this tree" % (" ".join(argv)[:160], self.checkouts[op["install"]]))
             return
@@ -2307,6 +2514,7 @@ def report(root: str, sides: list, ahead_of: str | None = None, env: dict | None
         "measured": {build: _measured(rig.directory, build) for _, _, build in sides},
         "largest": largest(rig.directory),
         "slowest": seconds,
+        "max_builds": rig.max_builds,
     }
     return found
 

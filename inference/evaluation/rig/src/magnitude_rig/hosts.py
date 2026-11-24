@@ -32,6 +32,7 @@ class HostConfig:
     env: tuple[tuple[str, str], ...] = ()  # applied to every step on the host; `~` allowed
     local: bool = False  # this machine, reached without ssh
     temperatures: bool = True  # the host exposes temperature sensors the gate must read
+    builds: bool = True  # the host may run local cargo builds (`"builds": false` disables)
 
 
 @dataclass(frozen=True)
@@ -54,6 +55,7 @@ class Hosts:
                 tuple(entry.get("env", {}).items()),
                 entry.get("local", alias == LOCAL),
                 entry.get("temperatures", True),
+                entry.get("builds", True),
             )
             for alias, entry in data.get("hosts", {}).items()
         }

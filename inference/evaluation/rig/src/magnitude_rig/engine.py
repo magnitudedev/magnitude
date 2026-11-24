@@ -103,7 +103,8 @@ from .sources import Source
 # latest report, and every wait on it.
 TRANSCRIPT, CODE, REPORT, WAITS = "mrig.out", "mrig.code", "report.txt", "waits.jsonl"
 CATALOG_TOOL = "{target}/release/magnitude-service-catalog-tool"
-COMPILER = "RUSTC_WORKSPACE_WRAPPER"  # cargo runs rustc for workspace crates through it
+COMPILER = "RUSTC_WORKSPACE_WRAPPER"  # cargo keys workspace units by this path
+OUTER_COMPILER = "RUSTC_WRAPPER"  # cargo also routes registry crates through the same shim for sccache
 GATE = GateSettings()
 MAKE = "import os, sys; [os.makedirs(p, exist_ok=True) for p in sys.argv[1:]]"
 WRITE = "import os, sys; p = sys.argv[1]; os.makedirs(os.path.dirname(p), exist_ok=True); open(p, 'w').write(sys.stdin.read())"
@@ -404,6 +405,8 @@ def _candidates(request: Request, names: tuple, run_id: str) -> tuple[list[Candi
             return None, None, False
         if not status["ready"]:
             return None, f"{config.alias}: not set up (`mrig setup {config.alias}`)", False
+        if not remote.builds and any(build_steps(work, side) for side in work.sides):
+            return None, f"{config.alias}: builds disabled (`builds: false` in hosts.json)", False
         if status["short"]:  # its steps refuse to run (`agent.short_volumes`)
             return None, f"{config.alias}: {short_reason(status['short'])}", False
         return (remote, status, work), None, False
@@ -441,9 +444,26 @@ def _start(candidate: Candidate) -> float:
     status, kind = candidate.status, candidate.work.device or "build"
     if candidate.room_wait is None or kind != "build" and status["device_lock_held_elsewhere"] is not None:
         return float("inf")
-    own = sum(candidate.builds)
+    shared_wait = max(
+        (b for b, c in zip(candidate.builds, status["checkouts"], strict=True) if c is not None and c["shared"]),
+        default=0.0,
+    )
+    own_unshared = sum(
+        b for b, c in zip(candidate.builds, status["checkouts"], strict=True) if not (c is not None and c["shared"])
+    )
     begins = max(candidate.room_wait, status["waits"]["build"])
-    built = begins + own + sum(min(owed, own) for owed in status["building"])
+    slots = status.get("max_builds", 1)
+    if own_unshared > 0 and slots <= 0:
+        return float("inf")
+    if own_unshared > 0 and status["building"]:
+        workers = [0.0] * max(1, slots)
+        for owed in status["building"]:
+            idx = workers.index(min(workers))
+            workers[idx] += owed
+        queue_wait = min(workers)
+    else:
+        queue_wait = 0.0
+    built = begins + max(shared_wait, queue_wait + own_unshared)
     return max(built, status["waits"][kind])
 
 
@@ -676,8 +696,12 @@ class Plan:
     def environment(self, step: Step, tokens: dict[str, str]) -> dict[str, str]:
         """The step's environment: cargo's target and the recording wrapper only while the side
         holds its checkout (an output is never built in)."""
-        cargo = {"CARGO_TARGET_DIR": tokens["target"], COMPILER: f"{tokens['checkout']}/{WRAPPER}"} \
-            if "checkout" in tokens else {}
+        cargo = {
+            "CARGO_TARGET_DIR": tokens["target"],
+            COMPILER: f"{tokens['checkout']}/{WRAPPER}",
+            OUTER_COMPILER: f"{tokens['checkout']}/{WRAPPER}",
+            "CARGO_INCREMENTAL": "0",
+        } if "checkout" in tokens else {}
         return {
             **cargo,
             "UV_CACHE_DIR": f"{self.remote.root}/cache/uv",

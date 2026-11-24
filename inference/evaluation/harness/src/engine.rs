@@ -386,6 +386,8 @@ pub struct Sequence {
     /// prompt's, so the head's position is its own from then on; no other
     /// prefill follows.
     chains: bool,
+    /// Target rows whose pairs the head never entered (depth-0 plain passes).
+    head_skipped: usize,
     /// The pairs its head lacks, after a verify pass: none where the head
     /// entered every pair up to its selection.
     trailing: Option<Trailing>,
@@ -415,9 +417,10 @@ impl Sequence {
         let pending = self.selected.ok_or("a two-row decode follows a selection")?;
         let rows = self.two_row.pass(self.grant);
         let (demand, chain) = match (self.chains, self.grant) {
-            (true, FrontGrant::Verify(_)) => (Demand::FEATURES, None),
+            (true, FrontGrant::Plain) => (Demand::NONE, None),
+            (true, FrontGrant::Verify(_) | FrontGrant::Mixed { .. }) => (Demand::FEATURES, None),
             (true, FrontGrant::UpTo(_) | FrontGrant::Exactly(_)) => {
-                (Demand::DEVICE_FEATURES, Some(ChainEntry { position: self.position }))
+                (Demand::DEVICE_FEATURES, Some(ChainEntry { position: self.position - self.head_skipped }))
             }
             (false, _) => (Demand::NONE, None),
         };
@@ -433,6 +436,7 @@ pub struct Checkpoint {
     selected: Option<TokenId>,
     two_row: magnitude_executor::TwoRowDecode,
     chains: bool,
+    head_skipped: usize,
     trailing: Option<Trailing>,
 }
 
@@ -533,6 +537,7 @@ impl Engine {
             two_row: Default::default(),
             grant: FrontGrant::UpTo(0),
             chains: false,
+            head_skipped: 0,
             trailing: None,
             pass: None,
         })
@@ -600,6 +605,7 @@ impl Engine {
             selected: sequence.selected,
             two_row: sequence.two_row.clone(),
             chains: sequence.chains,
+            head_skipped: sequence.head_skipped,
             trailing: sequence.trailing.clone(),
         })
     }
@@ -614,6 +620,7 @@ impl Engine {
             two_row: checkpoint.two_row.clone(),
             grant: FrontGrant::UpTo(0),
             chains: checkpoint.chains,
+            head_skipped: checkpoint.head_skipped,
             trailing: checkpoint.trailing.clone(),
             pass: None,
         })
@@ -907,33 +914,46 @@ impl Engine {
         let request = [sequence.request];
         sequence.grant = match self.domain.front_pass(&request, &request).map_err(|error| error.to_string())? {
             // A claim's requests are exactly the launch's.
-            FrontPass::Claim(claim) => FrontGrant::Exactly(claim[&sequence.request]),
+            FrontPass::Claim(claim) => {
+                if claim.values().all(|&d| d == 0) {
+                    FrontGrant::Plain
+                } else {
+                    FrontGrant::Exactly(claim[&sequence.request])
+                }
+            }
             FrontPass::Built { form, depths } => form.grant(depths.get(&sequence.request).copied().unwrap_or(0)),
         };
         if let Some(Trailing { tokens, features }) = sequence.trailing.take() {
-            // The head entered every pair before the pass's; its
-            // proposals, at most its width, are the pass's chain.
-            let entered = tokens.len();
-            let drafts = sequence.grant.depth().min(self.method.proposals());
-            let operation = Operation::Head {
-                request: sequence.request,
-                phase: HeadPhase::Generation,
-                tokens,
-                conditioning: magnitude_executor::HeadFeatures::Host(features),
-                position: sequence.position - entered,
-                proposals: (0..drafts).map(|proposal| Self::greedy(sequence.position + proposal)).collect(),
-                form: DraftForm::Chained,
-            };
-            let Outcome::Head { proposals, .. } = self.head(operation, entered)? else {
-                return Err("a head transaction returns proposals".into());
-            };
-            sequence.two_row.guessed(drafted_chain(&proposals)?);
+            if sequence.grant == FrontGrant::Plain {
+                sequence.head_skipped += tokens.len();
+            } else {
+                // The head entered every pair before the pass's; its
+                // proposals, at most its width, are the pass's chain.
+                let entered = tokens.len();
+                let drafts = sequence.grant.depth().min(self.method.proposals());
+                let operation = Operation::Head {
+                    request: sequence.request,
+                    phase: HeadPhase::Generation,
+                    tokens,
+                    conditioning: magnitude_executor::HeadFeatures::Host(features),
+                    position: sequence.position - sequence.head_skipped - entered,
+                    proposals: (0..drafts).map(|proposal| Self::greedy(sequence.position + proposal)).collect(),
+                    form: DraftForm::Chained,
+                };
+                let Outcome::Head { proposals, .. } = self.head(operation, entered)? else {
+                    return Err("a head transaction returns proposals".into());
+                };
+                sequence.two_row.guessed(drafted_chain(&proposals)?);
+            }
         }
         let round = sequence.two_row_round()?;
         let operation = round.forward().clone().into_operation(sequence.request, sequence.position, None)?;
         sequence.pass = Some(round);
         let step = self.step(vec![operation], &mut [&mut *sequence], trace);
         sequence.pass = None;
+        if step.is_ok() && sequence.chains && sequence.grant == FrontGrant::Plain {
+            sequence.head_skipped += 1;
+        }
         step.map(|(step, _)| step)
     }
 

@@ -63,10 +63,11 @@ import json
 import os
 import re
 import shlex
+import shutil
 import subprocess
 import sys
 
-UNIT_SCHEMA = "build-provenance-unit/4"
+UNIT_SCHEMA = "build-provenance-unit/5"
 WRAPPER = f"provenance/{UNIT_SCHEMA}/rustc"  # under a checkout; `.cmd` added on Windows
 SCHEMA = "build-provenance/4"
 RECORD_SUFFIX = ".provenance.json"
@@ -223,16 +224,107 @@ def path_digest(path: str):
     return tree_digest(files)
 
 
+_JOBSERVER_FDS = re.compile(r"--jobserver-(?:fds|auth)=(\d+),(\d+)")
+
+
+def _jobserver_fds() -> tuple[int, ...]:
+    """Open POSIX jobserver pipe FDs from `CARGO_MAKEFLAGS` so rustc connects to Cargo's
+    jobserver instead of spawning unbounded codegen threads."""
+    if os.name == "nt":
+        return ()
+    match = _JOBSERVER_FDS.search(os.environ.get("CARGO_MAKEFLAGS", ""))
+    if not match:
+        return ()
+    open_fds = []
+    for fd in (int(match.group(1)), int(match.group(2))):
+        try:
+            os.fstat(fd)
+            open_fds.append(fd)
+        except OSError:
+            pass
+    return tuple(open_fds)
+
+
+def _same_executable(a: str, b: str) -> bool:
+    """Whether `a` and `b` name the same executable on disk (never matching by basename
+    alone, because the rig's POSIX shim is named `rustc` just like the real compiler)."""
+    ra = shutil.which(a) if os.sep not in a and (os.altsep is None or os.altsep not in a) else a
+    rb = shutil.which(b) if os.sep not in b and (os.altsep is None or os.altsep not in b) else b
+    if not ra or not rb:
+        return os.path.abspath(a) == os.path.abspath(b)
+    try:
+        return os.path.samefile(ra, rb)
+    except OSError:
+        return os.path.realpath(ra) == os.path.realpath(rb)
+
+
+def _unwrap_workspace(argv: list) -> tuple[list, bool, bool]:
+    """Inspect Cargo's wrapper invocation and return `(exec_argv, is_workspace, can_sccache)`.
+
+    - When both `RUSTC_WRAPPER` and `RUSTC_WORKSPACE_WRAPPER` point to this shim:
+      - Workspace crates arrive as `[shim, rustc, ...]`: strip the duplicate inner shim
+        and return `(rustc_argv, True, True)`. Cargo keys workspace unit fingerprints by
+        `RUSTC_WORKSPACE_WRAPPER`, so schema bumps automatically recompile workspace crates.
+      - Non-workspace crates arrive as `[rustc, ...]`: return `(rustc_argv, False, True)`
+        so they still pass through `sccache` without writing workspace provenance records.
+    - When `RUSTC_WRAPPER` is this shim and `RUSTC_WORKSPACE_WRAPPER` is a foreign driver
+      (e.g. `clippy-driver` under `cargo clippy`):
+      - Workspace crates arrive as `[clippy-driver, rustc, ...]`: preserve the foreign driver
+        intact, record workspace provenance, and skip `sccache` (`(argv, True, False)`).
+    - When only `RUSTC_WORKSPACE_WRAPPER` (or neither, in direct unit tests) is set, every
+      invocation is treated as a workspace crate (`(argv, True, True)`).
+    """
+    outer = os.environ.get("RUSTC_WRAPPER")
+    ws_wrapper = os.environ.get("RUSTC_WORKSPACE_WRAPPER")
+    if not outer:
+        return argv, True, True
+    if ws_wrapper and len(argv) >= 2:
+        if _same_executable(argv[0], outer):
+            return argv[1:], True, True
+        if _same_executable(argv[0], ws_wrapper):
+            # Foreign workspace wrapper (e.g. clippy-driver): preserve it intact and skip sccache.
+            return argv, True, False
+    return argv, False, True
+
+
+def _sccache_command() -> str | None:
+    """Path to `sccache` when enabled and installed, else None. `MAGNITUDE_SCCACHE=0` disables it."""
+    configured = os.environ.get("MAGNITUDE_SCCACHE")
+    if configured is not None:
+        return None if configured in ("", "0", "false", "False") else configured
+    return shutil.which("sccache")
+
+
 def wrap(argv: list) -> int:
-    """Run rustc; a successful compilation leaves its record, and none survives a failed one."""
+    """Run rustc (optionally through sccache, with Cargo's jobserver FDs preserved); a
+    successful compilation of a workspace unit leaves its record, and none survives a failed one."""
+    argv, is_workspace, can_sccache = _unwrap_workspace(argv)
     unit = Unit.parse(argv[1:])
-    if unit is not None:
+    workspace = unit is not None and is_workspace
+    if workspace:
         try:
             os.remove(unit.record)
         except FileNotFoundError:
             pass
-    code = subprocess.call(argv)
-    if unit is not None and code == 0 and os.path.exists(unit.dep_info):
+    fds = _jobserver_fds()
+    sccache = _sccache_command() if (unit is not None and can_sccache) else None
+    if sccache is not None:
+        # Remove any stale dep-info before invoking sccache so an exit-2 transport error
+        # cannot be masked by a pre-existing `.d` file from an earlier build.
+        try:
+            os.remove(unit.dep_info)
+        except FileNotFoundError:
+            pass
+        try:
+            code = subprocess.call([sccache, *argv], pass_fds=fds)
+        except OSError:
+            code = subprocess.call(argv, pass_fds=fds)
+        else:
+            if code == 2 and not os.path.exists(unit.dep_info):
+                code = subprocess.call(argv, pass_fds=fds)
+    else:
+        code = subprocess.call(argv, pass_fds=fds)
+    if workspace and code == 0 and os.path.exists(unit.dep_info):
         unit.write_record()
     return code
 

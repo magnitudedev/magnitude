@@ -80,3 +80,15 @@ def test_this_machine_is_a_host_reached_without_ssh(tmp_path):
     path.write_text(json.dumps({"defaults": {"root": "r", "models": "m"},
                                 "hosts": {"mac": {"local": True}}, "pools": {"metal": ["mac", "m4"]}}))
     assert [h.local for h in Hosts.load(path).resolve("metal")] == [True, False]
+
+
+def test_builds_flag_defaults_true_and_honors_false(tmp_path):
+    path = tmp_path / "hosts.json"
+    path.write_text(json.dumps({
+        "defaults": {"root": "r", "models": "m"},
+        "hosts": {"m6-mini": {"builds": False}, "m5-pro": {}},
+    }))
+    hosts = Hosts.load(path)
+    assert hosts.host("m6-mini").builds is False
+    assert hosts.host("m5-pro").builds is True
+    assert hosts.host("unlisted").builds is True

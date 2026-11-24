@@ -276,7 +276,7 @@ fn draft_at(
     // round generation runs (`RoundState::pass`), which accepts its rows.
     let round = RoundState::pass(
         tokens[anchor],
-        Rows::Exact { acceptable: proposals.clone() },
+        Rows::verify(proposals.clone()),
         anchor + 1,
         &[],
         None,

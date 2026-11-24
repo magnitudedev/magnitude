@@ -29,11 +29,15 @@ AGENT = Path(agent.__file__)
 # Sessions: holds, judged in this process ---------------------------------------------------
 
 
-def session(root: Path, run: str, *, estimate=60.0) -> agent.Session:
-    return agent.Session(agent.Rig(str(root)), {
-        "who": "tester", "run": run, "purpose": f"purpose of {run}", "estimate": estimate,
-        "started": time.time(), "protocol": agent.PROTOCOL,
-    })
+def session(root: Path, run: str, *, estimate=60.0, max_builds_limit: int | None = None,
+            cpu_cores_physical: int | None = None) -> agent.Session:
+    return agent.Session(
+        agent.Rig(str(root), max_builds_limit=max_builds_limit, cpu_cores_physical=cpu_cores_physical),
+        {
+            "who": "tester", "run": run, "purpose": f"purpose of {run}", "estimate": estimate,
+            "started": time.time(), "protocol": agent.PROTOCOL,
+        },
+    )
 
 
 def hold(current: agent.Session, kind: str) -> None:
@@ -62,17 +66,50 @@ def status(root: Path, *sources: str) -> dict:
     return json.loads(subprocess.run(argv, capture_output=True, text=True, check=True).stdout)
 
 
-def test_builds_share_the_host_and_devices_take_turns(tmp_path):
-    first, second = session(tmp_path, "first"), session(tmp_path, "second")
+def test_builds_share_the_host_up_to_max_builds_and_devices_take_turns(tmp_path):
+    first = session(tmp_path, "first", max_builds_limit=2)
+    second = session(tmp_path, "second", max_builds_limit=2)
+    third = session(tmp_path, "third", max_builds_limit=2)
     hold(first, "build")
     hold(second, "build")
-    for current in (first, second):
-        current.release("build")
+    assert sorted(blocked(third, "build")) == ["first", "second"]
+    first.release("build")
+    assert third.blocking("build") == []
+    second.release("build")
+    third.release("build")
     hold(first, "device")
     assert blocked(second, "device") == ["first"]
     end(first)
     assert second.blocking("device") == []
     end(second)
+    end(third)
+
+
+def test_hardware_derived_max_builds_and_cargo_build_jobs():
+    GiB = agent.GiB
+    # m6-mini: builds=False -> 0
+    assert agent.max_builds(16 * GiB, 12, builds=False) == 0
+    # 5090-64g: 62 GiB RAM, 16 physical cores -> 1 build, 16 jobs
+    assert agent.max_builds(62 * GiB, 16) == 1
+    assert agent.cargo_build_jobs(16, 1) == 16
+    # rtx3090-b: 189 GiB RAM, 64 physical cores -> 4 builds, 16 jobs each
+    assert agent.max_builds(189 * GiB, 64) == 4
+    assert agent.cargo_build_jobs(64, 4) == 16
+
+
+def test_blocking_enforces_build_concurrency_cap_of_zero_and_one(tmp_path):
+    disabled = session(tmp_path, "disabled", max_builds_limit=0)
+    disabled.request("build")
+    assert len(disabled.blocking("build")) == 1
+    end(disabled)
+
+    one_a = session(tmp_path, "one-a", max_builds_limit=1)
+    one_b = session(tmp_path, "one-b", max_builds_limit=1)
+    hold(one_a, "build")
+    assert blocked(one_b, "build") == ["one-a"]
+    end(one_a)
+    assert one_b.blocking("build") == []
+    end(one_b)
 
 
 def test_a_measurement_waits_for_builds_and_new_builds_wait_behind_it(tmp_path):
@@ -227,11 +264,10 @@ def test_a_build_keeps_the_units_its_kept_builds_reference_and_trims_the_rest(tm
     assert units == {f"release/deps/{keep}", f"release/build/{keep}"}
     built = current.built("slot-0", 1.0, units)
     left = sorted(str(p.relative_to(target)) for p in target.rglob("*") if p.is_file())
-    assert left == sorted(["debug/incremental/new-1/s", "debug/incremental/old-1/s",
-                           "release/.fingerprint/foo-%s/x" % stale, f"release/build/foo-{keep}/out/x",
+    assert left == sorted(["release/.fingerprint/foo-%s/x" % stale, f"release/build/foo-{keep}/out/x",
                            f"release/deps/foo-{keep}.d", f"release/deps/foo-{keep}.provenance.json",
                            f"release/deps/libfoo-{keep}.rlib", "release/magnitude-inference"])
-    assert built["trimmed"] == {"bytes": 30, "entries": 3}
+    assert built["trimmed"] == {"bytes": 50, "entries": 4}
     assert BUILD in json.loads((checkout / agent.REFERENCES).read_text())
     end(current)
 
@@ -282,7 +318,8 @@ def test_a_checkout_that_recorded_no_build_keeps_what_it_held_as_one_more_build(
         (checkout / "target" / "release" / "deps" / name).write_text("x")
     (checkout / "target" / "debug" / "incremental" / "held-1").mkdir(parents=True)
     os.utime(checkout / "target" / "debug" / "incremental" / "held-1", (1000, 1000))
-    assert current.built("slot-0", 1.0, {f"release/deps/{mine}"})["trimmed"]["bytes"] == 0  # incremental kept too
+    assert current.built("slot-0", 1.0, {f"release/deps/{mine}"})["trimmed"] == {"bytes": 0, "entries": 1}
+    assert not (checkout / "target" / "debug" / "incremental").exists()
     kept = json.loads((checkout / agent.REFERENCES).read_text())
     assert kept[agent.UNRECORDED]["units"] == [f"release/deps/{held}"] and kept[BUILD]["units"] == [f"release/deps/{mine}"]
     end(current)
@@ -566,13 +603,27 @@ def test_after_a_build_the_rig_keeps_its_checkouts_within_its_share_of_the_volum
     (tmp_path / "runs" / "gone").mkdir(parents=True)
     total = int(11 * gb / agent.SHARE)  # a share of 11 GB; the other users leave nothing free
     monkeypatch.setattr(agent.shutil, "disk_usage", lambda path: shutil._ntuple_diskusage(total, total, 0))
-    holding, building = session(tmp_path, "holding"), session(tmp_path, "building")
+    holding = session(tmp_path, "holding", max_builds_limit=2)
+    building = session(tmp_path, "building", max_builds_limit=2)
     hold(holding, "checkout:held")
     assert building.reclaim() == {"removed": ["checkouts/oldest"], "freed_bytes": 6 * gb}  # 10 GB left
     assert building.reclaim() == {"removed": [], "freed_bytes": 0}
     assert sorted(p.name for p in (tmp_path / "checkouts").iterdir()) == ["held", "older", "recent"]
     assert (tmp_path / "runs" / "gone").is_dir()
     end(holding)
+    end(building)
+
+
+def test_reclaim_caps_checkouts_to_max_builds_plus_one(tmp_path, monkeypatch):
+    gb = 10**9
+    for idx, name in enumerate(("c0", "c1", "c2", "c3")):
+        _stale(tmp_path, name, 1 * gb, 1000 + idx)
+    # Huge volume so SHARE budget is never exceeded; only max_builds + 1 cap triggers.
+    monkeypatch.setattr(agent.shutil, "disk_usage", lambda path: shutil._ntuple_diskusage(10**14, 0, 10**14))
+    building = session(tmp_path, "building", max_builds_limit=1)
+    reclaimed = building.reclaim()
+    assert reclaimed["removed"] == ["checkouts/c0", "checkouts/c1"]
+    assert sorted(p.name for p in (tmp_path / "checkouts").iterdir()) == ["c2", "c3"]
     end(building)
 
 

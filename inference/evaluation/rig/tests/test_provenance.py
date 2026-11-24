@@ -417,3 +417,116 @@ def test_a_units_build_environment_is_what_it_read_that_neither_cargo_nor_its_sc
     unit.write_record()
     record = json.loads(Path(unit.record).read_text())
     assert record["build_env"] == {"KERNELS": "all", "MODE": "fast", "RUSTFLAGS": "-Copt-level=1"}
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX jobserver pipe FDs")
+@pytest.mark.parametrize("flag", ["--jobserver-auth", "--jobserver-fds"])
+def test_jobserver_fds_preserved_across_wrapper(flag, monkeypatch):
+    r_fd, w_fd = os.pipe()
+    try:
+        os.write(w_fd, b"t")
+        monkeypatch.setenv("CARGO_MAKEFLAGS", f"-j {flag}={r_fd},{w_fd}")
+        monkeypatch.setenv("MAGNITUDE_SCCACHE", "0")
+        probe = (
+            f"import os, sys; "
+            f"os.fstat({r_fd}); os.fstat({w_fd}); "
+            f"tok = os.read({r_fd}, 1); assert tok == b't'; os.write({w_fd}, tok)"
+        )
+        code = provenance.wrap([sys.executable, "-c", probe])
+        assert code == 0
+        assert os.read(r_fd, 1) == b"t"
+    finally:
+        os.close(r_fd)
+        os.close(w_fd)
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX executable shim")
+def test_provenance_composes_with_sccache_and_falls_back_cleanly(tmp_path, monkeypatch):
+    deps = tmp_path / "deps"
+    deps.mkdir()
+    src = tmp_path / "lib.rs"
+    src.write_text("pub fn f() {}\n")
+    out_rlib = deps / "libws-abc.rlib"
+    dep_file = deps / "ws-abc.d"
+    log = tmp_path / "sccache.log"
+
+    # Fake rustc named literally `rustc` (matching the rig shim's POSIX basename!).
+    real_dir = tmp_path / "real"
+    shim_dir = tmp_path / "shim"
+    real_dir.mkdir()
+    shim_dir.mkdir()
+    fake_rustc = real_dir / "rustc"
+    fake_rustc.write_text(
+        f"#!{sys.executable}\n"
+        f"import pathlib\n"
+        f"pathlib.Path({str(out_rlib)!r}).write_bytes(b'rlib-bytes')\n"
+        f"pathlib.Path({str(dep_file)!r}).write_text('{out_rlib}: {src}\\n')\n"
+    )
+    fake_rustc.chmod(0o755)
+    shim_rustc = shim_dir / "rustc"
+    shim_rustc.write_text("#!/bin/sh\nexit 0\n")
+    shim_rustc.chmod(0o755)
+
+    # Fake sccache: logs argv and delegates to argv[1:] (real/fake rustc).
+    fake_sccache = tmp_path / "fake_sccache"
+    fake_sccache.write_text(
+        f"#!{sys.executable}\n"
+        f"import json, pathlib, subprocess, sys\n"
+        f"pathlib.Path({str(log)!r}).write_text(json.dumps(sys.argv[1:]))\n"
+        f"sys.exit(subprocess.call(sys.argv[1:]))\n"
+    )
+    fake_sccache.chmod(0o755)
+
+    monkeypatch.setenv("MAGNITUDE_SCCACHE", str(fake_sccache))
+    monkeypatch.setenv("RUSTC_WRAPPER", str(shim_rustc))
+    monkeypatch.setenv("RUSTC_WORKSPACE_WRAPPER", str(shim_rustc))
+    monkeypatch.delenv("OUT_DIR", raising=False)
+    monkeypatch.delenv("CARGO_MANIFEST_DIR", raising=False)
+
+    # 1. Workspace unit (Cargo passes [shim/rustc, real/rustc, ...]): runs through sccache AND writes record.
+    args = [str(fake_rustc), "--crate-name", "ws", str(src), "--emit=dep-info,link",
+            "-C", "extra-filename=-abc", "--out-dir", str(deps)]
+    assert provenance.wrap([str(shim_rustc), *args]) == 0
+    assert json.loads(log.read_text()) == args
+    record_path = deps / f"ws-abc{provenance.RECORD_SUFFIX}"
+    assert record_path.exists()
+    record = json.loads(record_path.read_text())
+    assert record["schema"] == provenance.UNIT_SCHEMA == "build-provenance-unit/5"
+    assert record["crate"] == "ws"
+
+    # 2. Registry/dependency unit (`real/rustc` shares basename `rustc` with `shim/rustc`!):
+    #    must still route through sccache and write NO workspace provenance record.
+    record_path.unlink()
+    log.unlink()
+    assert provenance.wrap(args) == 0
+    assert json.loads(log.read_text()) == args
+    assert not record_path.exists()
+
+    # 3. Transparent fallback when sccache returns transport error (exit 2), even if a prior `.d` exists.
+    dep_file.write_text("stale-dep-info\n")
+    broken_sccache = tmp_path / "broken_sccache"
+    broken_sccache.write_text(f"#!{sys.executable}\nimport sys; sys.exit(2)\n")
+    broken_sccache.chmod(0o755)
+    monkeypatch.setenv("MAGNITUDE_SCCACHE", str(broken_sccache))
+    assert provenance.wrap([str(shim_rustc), *args]) == 0
+    assert record_path.exists()
+
+    # 4. Foreign workspace wrapper (`clippy-driver` under `cargo clippy`): preserved intact, skips sccache.
+    record_path.unlink()
+    clippy_log = tmp_path / "clippy.log"
+    fake_clippy = tmp_path / "clippy-driver"
+    fake_clippy.write_text(
+        f"#!{sys.executable}\n"
+        f"import json, pathlib, subprocess, sys\n"
+        f"pathlib.Path({str(clippy_log)!r}).write_text(json.dumps(sys.argv[1:]))\n"
+        f"sys.exit(subprocess.call(sys.argv[1:]))\n"
+    )
+    fake_clippy.chmod(0o755)
+    monkeypatch.setenv("RUSTC_WORKSPACE_WRAPPER", str(fake_clippy))
+    monkeypatch.setenv("MAGNITUDE_SCCACHE", str(fake_sccache))
+    if log.exists():
+        log.unlink()
+    assert provenance.wrap([str(fake_clippy), *args]) == 0
+    assert json.loads(clippy_log.read_text()) == args
+    assert not log.exists()  # sccache was NOT invoked with clippy-driver
+    assert record_path.exists()
