@@ -660,6 +660,7 @@
           "license": "mit"
         }
       ],
+      "speculativeDecoding": { "method": "mtp", "draft": { "type": "embedded" } },
       "intelligence": {
         "eci": 153.78,
         "percent": 52,

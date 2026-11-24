@@ -803,7 +803,7 @@ fn resolve_projector_path(
     source: &CatalogModelSource,
     snapshot: &HuggingFaceRepositorySnapshot,
 ) -> Result<Option<PathBuf>, InventoryError> {
-    let projector = if let Some(projector) = &source.projector {
+    if let Some(projector) = &source.projector {
         if !is_projector_path(&projector.path)
             || !snapshot
                 .gguf_files
@@ -816,7 +816,7 @@ fn resolve_projector_path(
                 projector.path.display()
             )));
         }
-        Some(projector.path.clone())
+        Ok(Some(projector.path.clone()))
     } else {
         let candidates = snapshot
             .gguf_files
@@ -825,35 +825,15 @@ fn resolve_projector_path(
             .map(|file| file.path.clone())
             .collect::<Vec<_>>();
         match candidates.as_slice() {
-            [projector] => Some(projector.clone()),
-            [] => None,
-            _ => {
-                return Err(InventoryError::Integrity(format!(
-                    "{} has {} projector candidates; declare an exact projector path",
-                    declaration.id,
-                    candidates.len()
-                )));
-            }
+            [projector] => Ok(Some(projector.clone())),
+            [] => Ok(None),
+            _ => Err(InventoryError::Integrity(format!(
+                "{} has {} projector candidates; declare an exact projector path",
+                declaration.id,
+                candidates.len()
+            ))),
         }
-    };
-    // An embedded MTP head embeds every prompt token, so it cannot enter the
-    // projector's media rows. A separately packaged assistant reads the
-    // target's history, media rows included, and keeps none of its own.
-    if projector.is_some()
-        && declaration
-            .speculative_decoding
-            .as_ref()
-            .is_some_and(|speculative| {
-                speculative.method == CatalogSpeculativeMethod::Mtp
-                    && matches!(speculative.draft, CatalogSpeculativeDraftSource::Embedded)
-            })
-    {
-        return Err(InventoryError::Integrity(format!(
-            "{} combines a projector with embedded MTP, which cannot enter projector media rows",
-            declaration.id
-        )));
     }
-    Ok(projector)
 }
 
 fn valid_parameterization(parameterization: &ModelParameterization) -> bool {
@@ -1137,18 +1117,9 @@ fn validate_runtime_catalog(catalog: &RecommendableModelCatalog) -> Result<(), I
         || model_ids.len() != catalog.models.len()
         || target_package_ids.len() != catalog.models.len()
         || catalog.models.iter().any(|model| {
-            // An embedded MTP head cannot enter the projector's media rows.
-            let (target, embedded_mtp) = match &model.configuration.bundle {
-                ServableModelBundle::Standalone { package } => (package, false),
-                ServableModelBundle::SpeculativeDecoding {
-                    target,
-                    method,
-                    draft_source,
-                } => (
-                    target,
-                    *method == SpeculativeMethod::Mtp
-                        && matches!(draft_source, SpeculativeDraftSource::Embedded),
-                ),
+            let target = match &model.configuration.bundle {
+                ServableModelBundle::Standalone { package } => package,
+                ServableModelBundle::SpeculativeDecoding { target, .. } => target,
             };
             let projector_count = target
                 .files
@@ -1159,7 +1130,6 @@ fn validate_runtime_catalog(catalog: &RecommendableModelCatalog) -> Result<(), I
                 || target.properties.maximum_context_length
                     != Some(model.configuration.profile.context_length)
                 || projector_count > 1
-                || (projector_count == 1 && embedded_mtp)
                 || servable_bundle_packages(&model.configuration.bundle).any(|package| {
                     !matches!(
                         &package.source,
@@ -2888,7 +2858,7 @@ mod tests {
     }
 
     #[test]
-    fn projector_resolution_rejects_invalid_paths_and_embedded_mtp() {
+    fn projector_resolution_rejects_invalid_paths_and_admits_embedded_mtp() {
         let source = catalog_source().expect("catalog source should be valid");
         let mut declaration = source.models[0].clone();
         let mut model_source = declaration.sources[0].clone();
@@ -2903,6 +2873,8 @@ mod tests {
                 .contains("is not a repository mmproj GGUF")
         );
 
+        // Embedded MTP stays bound beside a projector: the engine drafts text
+        // requests and generates requests with media spans without drafting.
         model_source.projector = Some(CatalogProjectorSource {
             path: PathBuf::from("mmproj-BF16.gguf"),
         });
@@ -2910,11 +2882,9 @@ mod tests {
             method: CatalogSpeculativeMethod::Mtp,
             draft: CatalogSpeculativeDraftSource::Embedded,
         });
-        let error = resolve_projector_path(&declaration, &model_source, &snapshot).unwrap_err();
-        assert!(
-            error
-                .to_string()
-                .contains("combines a projector with embedded MTP")
+        assert_eq!(
+            resolve_projector_path(&declaration, &model_source, &snapshot).unwrap(),
+            Some(PathBuf::from("mmproj-BF16.gguf"))
         );
 
         // A separately packaged assistant reads the target's history.

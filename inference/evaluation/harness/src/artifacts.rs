@@ -30,6 +30,15 @@ impl Artifacts {
             self.target_files.clone()
         }
     }
+
+    /// The separate draft GGUF path, or `None` when the catalog declares no
+    /// drafter or an embedded drafter (`drafter.path == target`).
+    pub fn separate_drafter(&self) -> Option<&Path> {
+        self.drafter
+            .as_ref()
+            .map(|drafter| drafter.path.as_path())
+            .filter(|path| *path != self.target.as_path())
+    }
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -96,6 +105,30 @@ mod tests {
                 PathBuf::from("/store/DeepSeek-V4.1-Flash-00002-of-00006.gguf"),
                 PathBuf::from("/store/DeepSeek-V4.1-Flash-Engram-IQ4_NL.gguf"),
             ]
+        );
+    }
+
+    #[test]
+    fn separate_drafter_excludes_embedded_drafter_pointing_to_target() {
+        let embedded: Artifacts = serde_json::from_value(json!({
+            "model": "glm-5.3-flash:gguf:iq2",
+            "target": "/store/glm-5.3-00001-of-00004.gguf",
+            "target_sha256": "aa",
+            "drafter": { "path": "/store/glm-5.3-00001-of-00004.gguf" },
+        }))
+        .expect("embedded drafter artifacts deserialize");
+        assert_eq!(embedded.separate_drafter(), None);
+
+        let separate: Artifacts = serde_json::from_value(json!({
+            "model": "qwen3.8-flash-next:gguf:q2",
+            "target": "/store/qwen3.8.gguf",
+            "target_sha256": "aa",
+            "drafter": { "path": "/store/mtp-qwen3.8.gguf" },
+        }))
+        .expect("separate drafter artifacts deserialize");
+        assert_eq!(
+            separate.separate_drafter(),
+            Some(Path::new("/store/mtp-qwen3.8.gguf"))
         );
     }
 }

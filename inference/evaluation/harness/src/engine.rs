@@ -85,10 +85,10 @@ pub fn configuration(
     options: &EngineOptions,
     load: &Load,
 ) -> Result<ResolvedEngineConfiguration, String> {
-    let separate = |named: bool| match (&artifacts.drafter, named) {
-        (Some(drafter), _) => Ok(Some(drafter.path.clone())),
+    let separate = |named: bool| match (artifacts.separate_drafter(), named) {
+        (Some(path), _) => Ok(Some(path.to_path_buf())),
         (None, false) => Ok(None),
-        (None, true) => Err(format!("{} declares no drafter", artifacts.model)),
+        (None, true) => Err(format!("{} declares no separate drafter", artifacts.model)),
     };
     // A separate draft is loaded where the method takes one: `Auto` takes the catalog's when it has one (else its
     // draft head), a method naming a separate draft's variant requires it, and the others take none.
