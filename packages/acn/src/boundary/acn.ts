@@ -30,7 +30,6 @@ import { ProjectInspector } from "../project-inspector";
 import { ProjectManager } from "../project-manager";
 import { ProjectStore } from "../project-store";
 import { ServerSettings } from "../server-settings";
-import { resolveOnboardingState } from "../onboarding";
 import { AcnHarnessConnections } from "../harness-connections";
 import { AcnOwner, requestOwner, watchApplicationOwner } from "../application-owner";
 import { HuggingFaceAccount } from "../hugging-face-account";
@@ -200,20 +199,7 @@ export const AcnBoundaryLive = AcnRpcGroup.toLayer(Effect.gen(function* () {
       SetNetworkAccess: change => observeRpcDefects("SetNetworkAccess", serverSettings.setNetworkAccess(change).pipe(Effect.as({}))),
       RegenerateNetworkApiKey: () => observeRpcDefects("RegenerateNetworkApiKey", serverSettings.regenerateNetworkApiKey.pipe(Effect.as({}))),
       GetServerMachine: () => observeRpcDefects("GetServerMachine", serverSettings.machine),
-      GetOnboarding: () => observeRpcDefects("GetOnboarding", resolveOnboardingState({
-        readSaved: serverSettings.onboarding,
-        markCompleted: serverSettings.completeOnboarding,
-        hasExistingChats: chats.list(0, 1).pipe(
-          Effect.map((page) => page.chats.length > 0),
-          Effect.orElseSucceed(() => false),
-        ),
-        localModels: modelCatalog.state.pipe(
-          Effect.map((catalog) => catalog._tag === "Initializing"
-            ? []
-            : catalog.models.flatMap((entry) => entry._tag === "Local" ? [entry.product] : [])),
-          Effect.orElseSucceed(() => []),
-        ),
-      })),
+      GetOnboarding: () => observeRpcDefects("GetOnboarding", serverSettings.onboarding),
       CompleteOnboarding: () => observeRpcDefects("CompleteOnboarding", serverSettings.completeOnboarding.pipe(Effect.as({}))),
 
       GetHuggingFaceAccount: () => observeRpcDefects("GetHuggingFaceAccount", huggingFace.account),
