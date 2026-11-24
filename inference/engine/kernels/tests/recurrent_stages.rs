@@ -1347,10 +1347,10 @@ fn model(case: &Case, native: Native) -> Modelled {
     let g = case.geometry;
     let (nk, nv, w, dw) = (g.key_heads, g.value_heads, g.width, g.decay_width);
     let trace = case.trace();
-    let (piece, f16) = match native {
-        Native::Chunk(BackendName::Metal) => (METAL_CHUNK_PIECE, false),
-        Native::Chunk(BackendName::Cuda) => (CUDA_CHUNK_PIECE, true),
-        _ => (0, false),
+    let (piece, f16, chunks_after) = match native {
+        Native::Chunk(BackendName::Metal) => (METAL_CHUNK_PIECE, false, true),
+        Native::Chunk(BackendName::Cuda) => (CUDA_CHUNK_PIECE, true, false),
+        _ => (0, false, false),
     };
     let single = |x: f32| if f16 { Float::F16.round(x as f64) as f32 } else { x };
     let split = |x: f32| {
@@ -1365,7 +1365,6 @@ fn model(case: &Case, native: Native) -> Modelled {
     let mut published = vec![None; g.banks];
     let mut first = 0;
     for (slot, slot_trace) in case.slots.iter().zip(&trace.slots) {
-        let chunked = if piece > 0 && slot.rows > SEQUENTIAL_ROWS && slot.stop > 0 { slot.stop } else { 0 };
         let mut bank = vec![0.0f32; nv * w * w];
         for head in 0..nv {
             let key_head = if case.grouped { head * nk / nv } else { head % nk };
@@ -1392,97 +1391,114 @@ fn model(case: &Case, native: Native) -> Modelled {
                     bank[(head * w + i) * w..][..w].copy_from_slice(s);
                 }
             }
-            // The WY pieces of the chunked rows.
-            let mut start = 0;
-            while start < chunked {
-                let n = piece.min(chunked - start);
-                let mut cumulative = vec![vec![0.0f32; dw]; n];
-                for t in 0..n {
-                    for j in 0..dw {
-                        let before = if t == 0 { 0.0 } else { cumulative[t - 1][j] };
-                        cumulative[t][j] = before + log_decay(start + t, j);
-                    }
+            // The WY pieces of the chunked rows (before `stop`, and on Metal
+            // also after `stop`).
+            let wy_segments: Vec<(usize, usize)> = if piece > 0 && slot.rows > SEQUENTIAL_ROWS {
+                let mut segs = Vec::new();
+                if slot.stop > 0 {
+                    segs.push((0, slot.stop));
                 }
-                let last = |j: usize| cumulative[n - 1][j];
-                let pair = |t: usize, s: usize, c: usize| (cumulative[t][c % dw] - cumulative[s][c % dw]).exp();
-                let mut a = vec![vec![0.0f32; n]; n];
-                let mut d = vec![vec![0.0f32; n]; n];
-                for t in 0..n {
-                    for s in 0..=t {
-                        let (mut kk, mut qk) = (0.0f32, 0.0f32);
-                        for c in 0..w {
-                            let factor = pair(t, s, c);
-                            kk = (k(start + t, c) * k(start + s, c)).mul_add(factor, kk);
-                            qk = (q(start + t, c) * k(start + s, c)).mul_add(factor, qk);
-                        }
-                        d[t][s] = single(qk);
-                        if s < t {
-                            a[t][s] = beta(start + t) * kk;
-                        }
-                    }
+                if chunks_after && slot.stop < slot.rows {
+                    segs.push((slot.stop, slot.rows));
                 }
-                // T = (I + A)^-1 by forward substitution, column by column;
-                // Tb = T diag(beta).
-                let mut inverse = vec![vec![0.0f32; n]; n];
-                for column in 0..n {
-                    for row in column..n {
-                        let mut value = if row == column { 1.0f32 } else { 0.0 };
-                        for k_index in column..row {
-                            value -= a[row][k_index] * inverse[k_index][column];
-                        }
-                        inverse[row][column] = value;
-                    }
-                }
-                let tb: Vec<Vec<f32>> = (0..n)
-                    .map(|row| (0..n).map(|column| inverse[row][column] * beta(start + column)).collect())
-                    .collect();
-                let gamma_of = |t: usize, c: usize| cumulative[t][c % dw].exp();
-                let tail_of = |t: usize, c: usize| (last(c % dw) - cumulative[t][c % dw]).exp();
-                for i in 0..w {
-                    let s = &mut states[i];
-                    let mut z = vec![0.0f32; n];
-                    let mut y = vec![0.0f32; n];
+                segs
+            } else {
+                Vec::new()
+            };
+            let mut chunked_end = 0;
+            for (seg_start, seg_end) in wy_segments {
+                let mut start = seg_start;
+                while start < seg_end {
+                    let n = piece.min(seg_end - start);
+                    let mut cumulative = vec![vec![0.0f32; dw]; n];
                     for t in 0..n {
-                        let (mut x, mut yy) = (0.0f32, 0.0f32);
-                        for c in 0..w {
-                            let scale = if dw == 1 { 1.0 } else { gamma_of(t, c) };
-                            x = (split(s[c]) * split(k(start + t, c) * scale)).mul_add(1.0, x);
-                            yy = (single(s[c]) * single(q(start + t, c) * scale)).mul_add(1.0, yy);
+                        for j in 0..dw {
+                            let before = if t == 0 { 0.0 } else { cumulative[t - 1][j] };
+                            cumulative[t][j] = before + log_decay(start + t, j);
                         }
-                        let outer = if dw == 1 { gamma_of(t, 0) } else { 1.0 };
-                        z[t] = single(prepared(start + t)[2 * nk * w + head * w + i]) - x * outer;
-                        y[t] = yy * outer;
                     }
-                    let u: Vec<f32> = (0..n)
-                        .map(|t| (0..=t).fold(0.0f32, |sum, r| split(z[r]).mul_add(single(tb[t][r]), sum)))
+                    let last = |j: usize| cumulative[n - 1][j];
+                    let pair = |t: usize, s: usize, c: usize| (cumulative[t][c % dw] - cumulative[s][c % dw]).exp();
+                    let mut a = vec![vec![0.0f32; n]; n];
+                    let mut d = vec![vec![0.0f32; n]; n];
+                    for t in 0..n {
+                        for s in 0..=t {
+                            let (mut kk, mut qk) = (0.0f32, 0.0f32);
+                            for c in 0..w {
+                                let factor = pair(t, s, c);
+                                kk = (k(start + t, c) * k(start + s, c)).mul_add(factor, kk);
+                                qk = (q(start + t, c) * k(start + s, c)).mul_add(factor, qk);
+                            }
+                            d[t][s] = single(qk);
+                            if s < t {
+                                a[t][s] = beta(start + t) * kk;
+                            }
+                        }
+                    }
+                    // T = (I + A)^-1 by forward substitution, column by column;
+                    // Tb = T diag(beta).
+                    let mut inverse = vec![vec![0.0f32; n]; n];
+                    for column in 0..n {
+                        for row in column..n {
+                            let mut value = if row == column { 1.0f32 } else { 0.0 };
+                            for k_index in column..row {
+                                value -= a[row][k_index] * inverse[k_index][column];
+                            }
+                            inverse[row][column] = value;
+                        }
+                    }
+                    let tb: Vec<Vec<f32>> = (0..n)
+                        .map(|row| (0..n).map(|column| inverse[row][column] * beta(start + column)).collect())
                         .collect();
-                    for t in 0..n {
-                        let out = (0..=t).fold(y[t], |sum, r| single(d[t][r]).mul_add(single(u[r]), sum));
-                        raw[((first + start + t) * nv + head) * w + i] = out;
-                    }
-                    for c in 0..w {
-                        let mut next = s[c] * last(c % dw).exp();
-                        for r in 0..n {
-                            let tail = tail_of(r, c);
-                            let (weight, key) = if dw == 1 {
-                                (split(u[r] * tail), split(k(start + r, c)))
-                            } else {
-                                (split(u[r]), split(k(start + r, c) * tail))
-                            };
-                            next = weight.mul_add(key, next);
+                    let gamma_of = |t: usize, c: usize| cumulative[t][c % dw].exp();
+                    let tail_of = |t: usize, c: usize| (last(c % dw) - cumulative[t][c % dw]).exp();
+                    for i in 0..w {
+                        let s = &mut states[i];
+                        let mut z = vec![0.0f32; n];
+                        let mut y = vec![0.0f32; n];
+                        for t in 0..n {
+                            let (mut x, mut yy) = (0.0f32, 0.0f32);
+                            for c in 0..w {
+                                let scale = if dw == 1 { 1.0 } else { gamma_of(t, c) };
+                                x = (split(s[c]) * split(k(start + t, c) * scale)).mul_add(1.0, x);
+                                yy = (single(s[c]) * single(q(start + t, c) * scale)).mul_add(1.0, yy);
+                            }
+                            let outer = if dw == 1 { gamma_of(t, 0) } else { 1.0 };
+                            z[t] = single(prepared(start + t)[2 * nk * w + head * w + i]) - x * outer;
+                            y[t] = yy * outer;
                         }
-                        s[c] = next;
+                        let u: Vec<f32> = (0..n)
+                            .map(|t| (0..=t).fold(0.0f32, |sum, r| split(z[r]).mul_add(single(tb[t][r]), sum)))
+                            .collect();
+                        for t in 0..n {
+                            let out = (0..=t).fold(y[t], |sum, r| single(d[t][r]).mul_add(single(u[r]), sum));
+                            raw[((first + start + t) * nv + head) * w + i] = out;
+                        }
+                        for c in 0..w {
+                            let mut next = s[c] * last(c % dw).exp();
+                            for r in 0..n {
+                                let tail = tail_of(r, c);
+                                let (weight, key) = if dw == 1 {
+                                    (split(u[r] * tail), split(k(start + r, c)))
+                                } else {
+                                    (split(u[r]), split(k(start + r, c) * tail))
+                                };
+                                next = weight.mul_add(key, next);
+                            }
+                            s[c] = next;
+                        }
                     }
+                    start += n;
                 }
-                start += n;
-            }
-            if chunked > 0 && chunked == slot.stop {
-                for (i, s) in states.iter().enumerate() {
-                    bank[(head * w + i) * w..][..w].copy_from_slice(s);
+                chunked_end = seg_end;
+                if seg_end == slot.stop {
+                    for (i, s) in states.iter().enumerate() {
+                        bank[(head * w + i) * w..][..w].copy_from_slice(s);
+                    }
                 }
             }
             // The row-sequential rows.
-            for local in chunked..slot.rows {
+            for local in chunked_end..slot.rows {
                 let factors: Vec<f32> = (0..dw).map(|j| log_decay(local, j).exp()).collect();
                 for (i, s) in states.iter_mut().enumerate() {
                     let mut remembered = 0.0f32;
@@ -2162,10 +2178,10 @@ fn chunk_short_slots_get_the_step_bits_on(device: &Device) {
     };
     let slots = vec![
         slot(4, 1, 1, 6),
-        slot(SEQUENTIAL_ROWS, 9, 2, 7),
+        slot(SEQUENTIAL_ROWS, SEQUENTIAL_ROWS / 2, 2, 7),
         slot(40, 40, 3, 8),
         slot(1, 1, 4, 9),
-        slot(7, 0, 5, 10),
+        slot(SEQUENTIAL_ROWS, 0, 5, 10),
     ];
     let case = Case::new(geometry, 70, slots, false, 31).with_bf16_activations();
     let step = case.native(device, Element::bf16(), None);
@@ -3229,6 +3245,81 @@ fn padded_empty_slots_match_unpadded_for_gated_and_kimi_delta() {
                         && actual.tape.iter().zip(&expected.tape).all(|(a, b)| a.to_bits() == b.to_bits()),
                     "{backend} {label} {mode}: padded-slot bank arenas differ"
                 );
+            }
+        }
+    }
+}
+
+/// Speculative verify (`M=10, stop=1, tape=9` and `stop=0` / `M=16`): the
+/// chunked WY path writes tape innovations `u`, keys `k`, and decays `d`
+/// directly from the WY matrix `U`, matching the host and sequential step
+/// within the analytical error bounds (and across all `ROWS` values).
+#[test]
+fn chunk_taped_verify_m10_parity() {
+    for device in devices() {
+        let backend = device.backend().as_str();
+        let geometry = Geometry {
+            key_heads: 16,
+            value_heads: 48,
+            width: 128,
+            decay_width: 1,
+            convolution: 4,
+            banks: 4,
+            tape: 9,
+        };
+        for (label, rows, slots) in [
+            ("verify m10 stop1", 10, vec![slot(10, 1, 1, 2)]),
+            ("verify m10 stop0", 10, vec![slot(10, 0, 1, 2)]),
+            ("verify m16 stop1", 16, vec![slot(16, 1, 1, 2)]),
+        ] {
+            let case = Case::new(geometry, rows, slots, false, 77).with_bf16_activations();
+            let host = case.host();
+            let step = case.native(&device, Element::bf16(), None);
+            check(
+                &format!("{backend} {label}: step"),
+                &case,
+                &step,
+                &host,
+                against_host(step_of(&device)),
+            );
+            let mut reference: Option<Outcome> = None;
+            for chunk_rows in CHUNK_ROWS {
+                let chunked = case.native(&device, Element::bf16(), Some(chunk_rows));
+                check(
+                    &format!("{backend} {label}: chunk ROWS {chunk_rows}"),
+                    &case,
+                    &chunked,
+                    &host,
+                    against_host(chunk_of(&device)),
+                );
+                check(
+                    &format!("{backend} {label}: chunk ROWS {chunk_rows} vs step"),
+                    &case,
+                    &chunked,
+                    &step,
+                    between(chunk_of(&device), step_of(&device)),
+                );
+                match &reference {
+                    Some(reference) => assert!(
+                        reference
+                            .gated
+                            .iter()
+                            .zip(&chunked.gated)
+                            .all(|(a, b)| a.to_bits() == b.to_bits())
+                            && reference
+                                .delta
+                                .iter()
+                                .zip(&chunked.delta)
+                                .all(|(a, b)| a.to_bits() == b.to_bits())
+                            && reference
+                                .tape
+                                .iter()
+                                .zip(&chunked.tape)
+                                .all(|(a, b)| a.to_bits() == b.to_bits()),
+                        "{backend} {label}: chunk ROWS {chunk_rows} changed result bits"
+                    ),
+                    None => reference = Some(chunked),
+                }
             }
         }
     }

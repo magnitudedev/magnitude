@@ -63,7 +63,7 @@
 #include "convolution.h"
 
 // The slot containing `row`, or false when the row is not chunked: outside
-// every slot, in a sequential (short) slot, or after its slot's stop row.
+// every slot or in a sequential (short) slot.
 inline bool rch_row_slot(device const int *segments, device const int *stop, device const int *previous_bank,
     device const int *previous_tape, device const int *following_bank, ulong row, thread recurrent::Slot &slot,
     constant ulong *seismic_words) {
@@ -74,7 +74,7 @@ inline bool rch_row_slot(device const int *segments, device const int *stop, dev
         if (long(row) >= first && long(row) < last) {
             slot = versions::slot_of({segments, stop, previous_bank, previous_tape, following_bank}, candidate,
                 seismic_words);
-            return last - first > RECURRENT_SEQUENTIAL_ROWS && long(row) < first + slot.stop;
+            return last - first > RECURRENT_SEQUENTIAL_ROWS;
         }
     }
     return false;
@@ -530,11 +530,22 @@ inline void rch_scan(Rule rule, RchDecays<Rule::DECAYS> decays, device const rec
     device const float *head_rows = scratch.rows + key_head * scratch.height * RCH_ROW_STRIDE;
     device const float *head_values = scratch.values + head * scratch.height * width + block_row0;
     device const float *head_gates = scratch.head_gates(head);
+    const long publish = geometry.lo + geometry.stop;
+    const long recorded = long(SEISMIC_DIM_T);
     const ulong pieces_before = recurrent::pieces_before<RCH_PIECE>(geometry);
-    for (ulong piece = 0; piece < pieces_before; ++piece) {
+    const ulong tail_rows = ulong(geometry.hi - publish);
+    const ulong pieces_after = (tail_rows + RCH_PIECE - 1) / RCH_PIECE;
+    const ulong total_pieces = pieces_before + pieces_after;
+    for (ulong piece = 0; piece < total_pieces; ++piece) {
+        const bool after_stop = piece >= pieces_before;
         long first;
         long length;
-        recurrent::piece_of<RCH_PIECE>(geometry, piece, first, length);
+        if (!after_stop) {
+            recurrent::piece_of<RCH_PIECE>(geometry, piece, first, length);
+        } else {
+            first = publish + long((piece - pieces_before) * RCH_PIECE);
+            length = metal::min(long(RCH_PIECE), geometry.hi - first);
+        }
 
         // 1. Stage the piece's q/k rows, value channels and gates.
         for (uint item = thread_index; item < RCH_PIECE * RCH_ROW_STRIDE / 4; item += RCH_THREADS) {
@@ -555,6 +566,43 @@ inline void rch_scan(Rule rule, RchDecays<Rule::DECAYS> decays, device const rec
         }
         decays.stage(gates, head_gates, scratch.height, first, length, thread_index);
         threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        // Record normalized keys and per-row decay factors in the successor's
+        // tape before `decays.products` overwrites `gates` (DECAYS > 1).
+        if (after_stop && group.x == 0) {
+            const long taped_in_piece = metal::min(length, metal::max(0L, recorded - (first - publish)));
+            if (taped_in_piece > 0) {
+                if (recurrent::records_key(head, seismic_words)) {
+                    for (uint item = thread_index; item < uint(taped_in_piece) * uint(width / 4); item += RCH_THREADS) {
+                        const uint i = item / uint(width / 4);
+                        const uint channel = 4 * (item % uint(width / 4));
+                        const element::Out<element::F32> entry =
+                            recurrent::tape_row(tape, target, first + long(i) - publish, seismic_words);
+                        const float4 k = *reinterpret_cast<threadgroup const float4 *>(
+                            keys + i * RCH_INPUT_STRIDE + channel);
+                        entry.put4(RECURRENT_TAPE_K + key_head * width + channel, k);
+                    }
+                }
+                if (DECAYS == 1) {
+                    if (thread_index < uint(taped_in_piece)) {
+                        const element::Out<element::F32> entry =
+                            recurrent::tape_row(tape, target, first + long(thread_index) - publish, seismic_words);
+                        entry.put(recurrent::tape_decay<DECAYS>(head, 0, seismic_words),
+                            metal::exp(gates[thread_index]));
+                    }
+                } else {
+                    for (uint item = thread_index; item < uint(taped_in_piece) * (DECAYS / 4); item += RCH_THREADS) {
+                        const uint i = item / (DECAYS / 4);
+                        const uint channel = 4 * (item % (DECAYS / 4));
+                        const element::Out<element::F32> entry =
+                            recurrent::tape_row(tape, target, first + long(i) - publish, seismic_words);
+                        const float4 d = metal::exp(*reinterpret_cast<threadgroup const float4 *>(
+                            gates + i * RchDecays<DECAYS>::STRIDE + channel));
+                        entry.put4(recurrent::tape_decay<DECAYS>(head, channel, seismic_words), d);
+                    }
+                }
+            }
+        }
 
         // 2. The decayed products and X, Y.
         simdgroup_float8x8 removed[2];
@@ -604,6 +652,9 @@ inline void rch_scan(Rule rule, RchDecays<Rule::DECAYS> decays, device const rec
 
         // Per half: Z = diag(beta) (V - diag(gamma) X), U = T Z,
         // O = diag(gamma) Y + D U, then U <- diag(tail) U.
+        // Before scaling by `tail`, row `r` of `U` is the sequential tape
+        // innovation `u_r = beta_r (v_r - d_r S_{r-1} k_r)`.
+        const bool update_state = (piece + 1 < total_pieces) || (!after_stop && piece + 1 == pieces_before);
         simdgroup_float8x8 update[2];
         RECURRENT_UNROLL for (uint h = 0; h < 2; ++h) {
             simdgroup_float8x8 value;
@@ -614,6 +665,16 @@ inline void rch_scan(Rule rule, RchDecays<Rule::DECAYS> decays, device const rec
                 output[h].thread_elements()[e] *= decays.gamma();
             }
             simdgroup_multiply(update[h], inverse, removed[h]);
+            if (after_stop && long(row) < length) {
+                const long tape_index = first + long(row) - publish;
+                if (tape_index < recorded) {
+                    const element::Out<element::F32> entry =
+                        recurrent::tape_row(tape, target, tape_index, seismic_words);
+                    const ulong base = RECURRENT_TAPE_U + head * width + row0 + 8 * h + column;
+                    entry.put(base, update[h].thread_elements()[0]);
+                    entry.put(base + 1, update[h].thread_elements()[1]);
+                }
+            }
             simdgroup_multiply_accumulate(output[h], attention, update[h], output[h]);
             if (long(row) < length) {
                 device recurrent::Storage *destination = mixed
@@ -622,37 +683,36 @@ inline void rch_scan(Rule rule, RchDecays<Rule::DECAYS> decays, device const rec
                     activation::Act::packed2(activation::Act::store2(
                         float2(output[h].thread_elements()[0], output[h].thread_elements()[1])));
             }
-            update[h].thread_elements()[0] *= decays.tail();
-            update[h].thread_elements()[1] *= decays.tail();
-        }
-        // S^T <- diag(f) S^T + K'^T U.
-        decays.start_update();
-        threadgroup const float *update_keys = decays.update_keys(keys);
-        RECURRENT_UNROLL for (uint c = 0; c < RCH_TILES; ++c) {
-            const float factor = decays.factor(c, row);
-            simdgroup_float8x8 key;
-            simdgroup_load(key, update_keys + 8 * c, RCH_INPUT_STRIDE, ulong2(0), true);
-            RECURRENT_UNROLL for (uint h = 0; h < 2; ++h) {
-                state[h][c].thread_elements()[0] *= factor;
-                state[h][c].thread_elements()[1] *= factor;
-                simdgroup_multiply_accumulate(state[h][c], key, update[h], state[h][c]);
+            if (update_state) {
+                update[h].thread_elements()[0] *= decays.tail();
+                update[h].thread_elements()[1] *= decays.tail();
             }
         }
-        if (piece + 1 == pieces_before) {
-            RECURRENT_UNROLL for (uint h = 0; h < 2; ++h) {
-                RECURRENT_UNROLL for (uint c = 0; c < RCH_TILES; ++c) {
-                    published.put_tile(8 * h * state_stride + 8 * c, state[h][c], state_stride, true);
+        if (update_state) {
+            // S^T <- diag(f) S^T + K'^T U.
+            decays.start_update();
+            threadgroup const float *update_keys = decays.update_keys(keys);
+            RECURRENT_UNROLL for (uint c = 0; c < RCH_TILES; ++c) {
+                const float factor = decays.factor(c, row);
+                simdgroup_float8x8 key;
+                simdgroup_load(key, update_keys + 8 * c, RCH_INPUT_STRIDE, ulong2(0), true);
+                RECURRENT_UNROLL for (uint h = 0; h < 2; ++h) {
+                    state[h][c].thread_elements()[0] *= factor;
+                    state[h][c].thread_elements()[1] *= factor;
+                    simdgroup_multiply_accumulate(state[h][c], key, update[h], state[h][c]);
                 }
             }
-        } else {
-            threadgroup_barrier(mem_flags::mem_threadgroup);
+            if (!after_stop && piece + 1 == pieces_before) {
+                RECURRENT_UNROLL for (uint h = 0; h < 2; ++h) {
+                    RECURRENT_UNROLL for (uint c = 0; c < RCH_TILES; ++c) {
+                        published.put_tile(8 * h * state_stride + 8 * c, state[h][c], state_stride, true);
+                    }
+                }
+            }
+            if (piece + 1 < total_pieces) {
+                threadgroup_barrier(mem_flags::mem_threadgroup);
+            }
         }
-    }
-    // The rows after the stop row advance row-sequentially from the published
-    // state (their innovations feed the tape).
-    if (geometry.stop < geometry.hi - geometry.lo) {
-        threadgroup_barrier(mem_flags::mem_device | mem_flags::mem_threadgroup);
-        RCH_SEQUENTIAL(geometry.lo + geometry.stop);
     }
 #undef RCH_SEQUENTIAL
 }

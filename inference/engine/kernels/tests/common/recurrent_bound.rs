@@ -106,9 +106,16 @@ impl Native {
         }
     }
 
-    /// The rows of `slot` the entry advances in pieces: those before its stop
-    /// row, in a slot of more than [`SEQUENTIAL_ROWS`] rows, where the
-    /// backend's chunk is a WY form; the others advance row by row.
+    /// Whether the entry also chunks rows after `slot.stop` (writing WY
+    /// innovations directly to the tape): Metal's `*_chunk` entries do for
+    /// slots of more than [`SEQUENTIAL_ROWS`] rows.
+    fn chunks_after(self, slot: &SlotTrace) -> bool {
+        matches!(self, Native::Chunk(BackendName::Metal)) && slot.rows > SEQUENTIAL_ROWS
+    }
+
+    /// The rows of `slot` the entry advances in pieces before its stop row:
+    /// in a slot of more than [`SEQUENTIAL_ROWS`] rows, where the backend's
+    /// chunk is a WY form; the others advance row by row.
     fn chunked(self, slot: &SlotTrace) -> usize {
         let rows = match self {
             Native::Step(_) => 0,
@@ -576,10 +583,11 @@ impl Trace {
             }
             for head in 0..nv {
                 let chunked = native.chunked(slot);
+                let after = native.chunks_after(slot);
                 let pieces = native
                     .pieces()
-                    .filter(|_| chunked > 0)
-                    .map(|form| self.pieces(&f, form, slot, chunked, head));
+                    .filter(|_| chunked > 0 || after)
+                    .map(|form| self.pieces(&f, form, slot, chunked, after, head));
                 for i in 0..w {
                     let (published, residuals) = self.advance(
                         slot,
@@ -710,18 +718,20 @@ impl Trace {
         for piece in pieces.unwrap_or(&[]) {
             let first = slot.first + chunked;
             let sigma = f64::from(self.rows[first].state[head * w + i].before);
-            let (state_local, output_local) = piece.rounding(self, first, head, i, sigma);
+            let (state_local, output_local, u_local) = piece.rounding(self, first, head, i, sigma);
             let mut propagated = e;
-            for (t, local) in output_local.iter().enumerate() {
+            for (t, (&local, &du)) in output_local.iter().zip(&u_local).enumerate() {
                 let at = first + t;
-                let (next, output, _) = self.row(at, head, i, &inputs[at], propagated, false);
+                let local_t = chunked + t;
+                let (next, output, residual) = self.row(at, head, i, &inputs[at], propagated, false);
                 propagated = next;
                 raw[(at * nv + head) * w + i] = output + local;
+                if local_t >= slot.stop && local_t - slot.stop < recorded {
+                    residuals.push(residual + du);
+                }
             }
             e = propagated + state_local;
             chunked += piece.rows;
-        }
-        if chunked > 0 {
             norm = f64::from(self.rows[slot.first + chunked - 1].state[head * w + i].after);
             if chunked == slot.stop {
                 published = Some((e, norm));
@@ -753,6 +763,7 @@ impl Trace {
         form: Pieces,
         slot: &SlotTrace,
         chunked: usize,
+        after: bool,
         head: usize,
     ) -> Vec<PieceContext> {
         let mut out = Vec::new();
@@ -768,6 +779,21 @@ impl Trace {
                 head,
             ));
             first += rows;
+        }
+        if after {
+            let mut first = slot.stop;
+            while first < slot.rows {
+                let rows = form.size.min(slot.rows - first);
+                out.push(PieceContext::new(
+                    self,
+                    f,
+                    form,
+                    slot.first + first,
+                    rows,
+                    head,
+                ));
+                first += rows;
+            }
         }
         out
     }
@@ -1025,7 +1051,7 @@ impl PieceContext {
         head: usize,
         i: usize,
         sigma: f64,
-    ) -> (f64, Vec<f64>) {
+    ) -> (f64, Vec<f64>, Vec<f64>) {
         let s = &trace.shape;
         let (nk, w) = (s.key_heads, s.width);
         let n = self.rows;
@@ -1110,7 +1136,7 @@ impl PieceContext {
         }
         let after = f64::from(trace.rows[first + n - 1].state[head * w + i].after);
         state += gamma(3 * n + 1) * magnitude + U * after;
-        (state, out)
+        (state, out, d_u)
     }
 }
 

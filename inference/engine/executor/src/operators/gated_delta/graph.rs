@@ -244,9 +244,9 @@ impl CheckedRecurrentEntries {
 
 /// Row classes at or above this size advance state with the chunked entry;
 /// smaller classes use the row-sequential step. The chunked entry advances
-/// slots of at most 16 rows row-sequentially too (with the step's bits), so a
-/// class of at most 16 rows gains nothing from it and takes the step.
-pub(crate) const CHUNKED_ROWS: u64 = 17;
+/// slots of at most `SEQUENTIAL_ROWS` rows row-sequentially too (with the
+/// step's bits), so smaller classes gain nothing from it and take the step.
+pub(crate) const CHUNKED_ROWS: u64 = 8;
 
 /// Whether a `rows`-row class advances state with the chunked entry.
 pub(crate) fn chunked(rows: &Dim) -> bool {

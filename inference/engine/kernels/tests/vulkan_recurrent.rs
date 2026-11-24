@@ -300,7 +300,7 @@ fn vulkan_chunk_short_slots_get_the_step_bits() {
     };
     let slots = vec![
         slot(4, 1, 1, 6),
-        slot(SEQUENTIAL_ROWS, 9, 2, 7),
+        slot(SEQUENTIAL_ROWS, SEQUENTIAL_ROWS / 2, 2, 7),
         slot(40, 40, 3, 8),
         slot(1, 1, 4, 9),
         slot(7, 0, 5, 10),

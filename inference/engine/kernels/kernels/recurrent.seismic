@@ -1,12 +1,13 @@
 # Chunked-form geometry, one owner for the kernels and the tests that derive
 # their bounds from it. A slot of at most SEQUENTIAL_ROWS rows advances
 # row-sequentially with the step's bits in every recurrent and state-space
-# entry (an MTP verify slot gets the bits of one-row decode); a longer slot's
-# rows before its stop row advance in the WY form over pieces of at most
-# METAL_CHUNK_PIECE rows (Metal) or CUDA_CHUNK_PIECE rows (CUDA). Vulkan has
+# entry (an MTP verify slot gets the bits of one-row decode); a longer slot
+# advances in the WY form over pieces of at most METAL_CHUNK_PIECE rows (Metal,
+# both before and after its stop row, writing tape innovations directly from U)
+# or CUDA_CHUNK_PIECE rows (CUDA, before its stop row). Vulkan has
 # no WY piece: its chunk advances every row sequentially, staging its inputs
 # in spans of rows.
-const SEQUENTIAL_ROWS = 16
+const SEQUENTIAL_ROWS = 7
 const METAL_CHUNK_PIECE = 8
 const CUDA_CHUNK_PIECE = 16
 
