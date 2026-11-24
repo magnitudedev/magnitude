@@ -72,7 +72,7 @@ void attention_decode_k8v4_partial() {
     prefill_attend(attention_affine_history(SEISMIC_PTR(SEISMIC_BUFFER_HISTORY_KEY_CODES),
         SEISMIC_OUT_HISTORY_KEY_COEFFICIENTS, SEISMIC_PTR(SEISMIC_BUFFER_HISTORY_VALUE_CODES),
         SEISMIC_OUT_HISTORY_VALUE_COEFFICIENTS),
-        prefill_scratch(0ul, 0ul, 0ul, 0ul, 0ul));
+        prefill_scratch(0ul, 0ul, 0ul, 0ul, 0ul, 0ul));
 }
 
 void attention_decode_k8v4_merge() { prefill_decode_merge(); }

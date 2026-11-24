@@ -109,6 +109,9 @@ struct prefill_scratch {
     // Each query row's factor 2^e (F32, [KV][rows][G], and the queries'
     // slack rows).
     uint64_t query_factors;
+    // Current repeat-round index (one u32), written only by prepare/advance
+    // and read-only in attend so it stays workgroup-uniform.
+    uint64_t round;
 };
 
 // The exponent e >= 0 a query row (its lanes' E columns, rounded to A) is
@@ -142,10 +145,39 @@ uint64_t prefill_padded(uint64_t rows) { return seismic_quotient(rows + PREFILL_
 // compiles wide accumulator arrays (`flash.glsl`).
 #define PREFILL_WINDOW FLASH_WINDOW
 
+#ifndef PREFILL_DECODE
+// Key tiles a partition processes per repeat round, matching the `ROUND_TILES`
+// and `ROUNDS` terms in `attention.seismic` so every single attend dispatch
+// stays safely below the 2 s GPU watchdog (Windows TDR / amdgpu).
+uint prefill_round_tiles(uint parts) {
+    const uint64_t budget = uint64_t(SEISMIC_DEVICE_UNITS) * 2097152ul;
+    const uint64_t denom = max(1ul, SEISMIC_DIM_M * uint64_t(ATTENTION_KV) * uint64_t(ATTENTION_G)
+        * uint64_t(ATTENTION_W / 32u) * uint64_t((ATTENTION_W + 255u) / 256u) * uint64_t(parts));
+    uint64_t rest = budget;
+    return max(PREFILL_MIN_TILES, seismic_narrow_divide(rest, denom));
+}
+
+uint prefill_total_rounds(uint parts, uint round_tiles) {
+    const uint64_t total_key_tiles = (SEISMIC_DIM_T + SEISMIC_DIM_M + 31ul) >> 5ul;
+    const uint64_t per_round = uint64_t(parts) * uint64_t(round_tiles);
+    uint64_t rest = total_key_tiles + per_round - 1ul;
+    return max(1u, seismic_narrow_divide(rest, per_round));
+}
+
+void prefill_advance(prefill_scratch scratch_planes) {
+    if (SEISMIC_THREAD == 0u)
+        element_u32_put(scratch_planes.round, element_u32_at(scratch_planes.round) + 1u);
+}
+#endif
+
 // ---------------------------------------------------------------------------
 // L1.
 
 void prefill_prepare(attention_history h, prefill_scratch scratch_planes) {
+#ifndef PREFILL_DECODE
+    if (gl_WorkGroupID.x == 0u && gl_WorkGroupID.y == 0u && SEISMIC_THREAD == 0u)
+        element_u32_put(scratch_planes.round, 0u);
+#endif
     const uint W = ATTENTION_W, E = ATTENTION_E, KV = ATTENTION_KV, G = ATTENTION_G;
     const uint lane = SEISMIC_LANE;
     const uint64_t rows = SEISMIC_DIM_M;
@@ -872,18 +904,30 @@ void prefill_attend(attention_history h, prefill_scratch scratch_planes) {
     const uint used = max(1u, (total_tiles + per - 1u) / per);
     if (part >= used)
         return;
+    const uint tiles_lo = part * per;
+    const uint tiles_hi = min(tiles_lo + per, total_tiles);
+    const uint round_tiles = prefill_round_tiles(parts);
+    const uint total_rounds = prefill_total_rounds(parts, round_tiles);
+    const uint round = total_rounds > 1u ? element_u32_at(scratch_planes.round) : 0u;
+    const uint64_t round_lo_64 = uint64_t(tiles_lo) + uint64_t(round) * uint64_t(round_tiles);
+    if (round > 0u && round_lo_64 >= uint64_t(tiles_hi))
+        return;
+    const uint round_lo = uint(round_lo_64);
+    const uint round_hi = (round + 1u >= total_rounds)
+        ? tiles_hi
+        : uint(min(round_lo_64 + uint64_t(round_tiles), uint64_t(tiles_hi)));
+    const bool is_first_round = (round == 0u);
+    const bool is_last_round = (round_hi >= tiles_hi);
     // By `SEISMIC_THREAD`: a store under the local index's control would mix
     // it into every later read of memory the launch writes, which the
     // subgroups combine by lane order.
-    if (part == 0u && kv_head == 0u && SEISMIC_THREAD == 0u)
+    if (is_first_round && part == 0u && kv_head == 0u && SEISMIC_THREAD == 0u)
         element_u32_put(scratch_planes.counts + uint64_t(tile) * 4ul, used);
-    const uint tiles_lo = part * per;
-    const uint tiles_hi = min(tiles_lo + per, total_tiles);
-    // The partition's walk over the spans starts on the span holding its
-    // first tile and ends past its last.
+    // The partition's walk over the spans starts on the span holding this
+    // round's first tile and ends past its last.
     const uvec2 located = PREFILL_SELECTED_PASS
         ? uvec2(0u)
-        : prefill_locate_tile(visible, fresh, tile_first, rows, spans, tiles_lo);
+        : prefill_locate_tile(visible, fresh, tile_first, rows, spans, round_lo);
 #endif
 
     // The subgroup's block: matrix rows 16 sg .. of the tile's QT x G rows;
@@ -919,6 +963,18 @@ void prefill_attend(attention_history h, prefill_scratch scratch_planes) {
     const Out gated = SEISMIC_RESULT_0_OUT;
     const uint64_t partials = SEISMIC_PTR(SEISMIC_BUFFER_SCRATCH_PARTIALS);
     const uint64_t statistics = SEISMIC_PTR(SEISMIC_BUFFER_SCRATCH_STATISTICS);
+#ifndef PREFILL_DECODE
+    // Prior rounds' softmax statistics for this lane's row, loaded once before
+    // the output-window loop so pass 0's updated statistics store never
+    // aliases pass 1's read when `windows > 1`.
+    float prev_max = -ATTENTION_INF;
+    float prev_den = 0.0;
+    if (!is_first_round && valid) {
+        const uint64_t prev_slot = (uint64_t(part) * rows + token) * heads + uint64_t(kv_head * G + lane_row % G);
+        prev_max = element_f32_at(statistics + prev_slot * 8ul);
+        prev_den = element_f32_at(statistics + prev_slot * 8ul + 4ul);
+    }
+#endif
     flash_output o;
 
     // One online-softmax pass per output window of PREFILL_WINDOW columns.
@@ -932,7 +988,7 @@ void prefill_attend(attention_history h, prefill_scratch scratch_planes) {
         uint64_t cached_index = ~0ul;
         ivec4 interval = ivec4(0);
         int row_lo = 0, row_hi = 0, row_base = 0;
-        for (uint listed = tiles_lo; PREFILL_SELECTED && listed < tiles_hi; ++listed) {
+        for (uint listed = round_lo; PREFILL_SELECTED && listed < round_hi; ++listed) {
             const uint64_t slot = PREFILL_LISTS_BUFFER + ((uint64_t(tile) * PREFILL_LIST_CAPACITY + listed) * 2ul) * 4ul;
             const uint64_t index = uint64_t(element_i32_at(slot));
             const int first = element_i32_at(slot + 4ul);
@@ -1023,15 +1079,15 @@ void prefill_attend(attention_history h, prefill_scratch scratch_planes) {
 #else
         uint tiles_before = located.y;
         for (uint64_t index = located.x;
-             index <= spans && tiles_before < tiles_hi && !PREFILL_SELECTED_PASS; ++index) {
+             index <= spans && tiles_before < round_hi && !PREFILL_SELECTED_PASS; ++index) {
             const ivec4 interval = prefill_interval(visible, fresh, tile_first, rows, spans, index);
             const uint span_tiles = prefill_span_tiles(interval);
             const uint span_first = tiles_before;
             tiles_before += span_tiles;
-            if (span_tiles == 0u || span_first + span_tiles <= tiles_lo || span_first >= tiles_hi)
+            if (span_tiles == 0u || span_first + span_tiles <= round_lo || span_first >= round_hi)
                 continue;
-            const uint own_lo = max(tiles_lo, span_first) - span_first;
-            const uint own_hi = min(tiles_hi, span_first + span_tiles) - span_first;
+            const uint own_lo = max(round_lo, span_first) - span_first;
+            const uint own_hi = min(round_hi, span_first + span_tiles) - span_first;
             const bool historical = index < spans;
             int row_lo = 0, row_hi = 0;
             if (valid)
@@ -1050,6 +1106,7 @@ void prefill_attend(attention_history h, prefill_scratch scratch_planes) {
         // Every subgroup of a used partition reaches here; the scratch is
         // free.
         barrier();
+#if SEISMIC_HAS_MATRIX
         // Unrolled, so every fragment index is a constant.
         [[unroll]] for (uint q = 0u; q < PREFILL_WINDOW / 2u; ++q) {
             if (q >= flash_window(W, PREFILL_WINDOW) / 2u)
@@ -1062,6 +1119,10 @@ void prefill_attend(attention_history h, prefill_scratch scratch_planes) {
             // The row's softmax state lives on lanes r % 16 and r % 16 + 16.
             const float row_maximum = seismic_shuffle(maximum, r % 16u);
             const float row_denominator = seismic_shuffle(denominator, r % 16u);
+#ifndef PREFILL_DECODE
+            const float row_prev_max = is_first_round ? -ATTENTION_INF : seismic_shuffle(prev_max, r % 16u);
+            const float row_prev_den = is_first_round ? 0.0 : seismic_shuffle(prev_den, r % 16u);
+#endif
             if (r < PREFILL_QT * G && out_token < rows) {
 #ifdef PREFILL_DECODE
                 const uint64_t slot = (out_token * heads + out_head) * PREFILL_PARTS + part;
@@ -1071,20 +1132,90 @@ void prefill_attend(attention_history h, prefill_scratch scratch_planes) {
                     element_f32_put(statistics + slot * 8ul + 4ul, row_denominator);
                 }
 #else
-                if (used > 1u || PREFILL_PICKS) {
-                    const uint64_t slot = (uint64_t(part) * rows + out_token) * heads + out_head;
-                    element_f32_put(partials + (slot * W + column) * 4ul, value);
+                const uint64_t slot = (uint64_t(part) * rows + out_token) * heads + out_head;
+                float out_value = value;
+                float out_max = row_maximum;
+                float out_den = row_denominator;
+                if (!is_first_round) {
+                    const float p_val = element_f32_at(partials + (slot * W + column) * 4ul);
+                    out_max = max(row_prev_max, row_maximum);
+                    const bool seen = out_max > -ATTENTION_INF;
+                    const float a = seen ? exp2(row_prev_max - out_max) : 0.0;
+                    const float b = seen ? exp2(row_maximum - out_max) : 0.0;
+                    out_den = seismic_fma_rn(row_prev_den, a, row_denominator * b);
+                    out_value = seismic_fma_rn(p_val, a, value * b);
+                }
+                if (!is_last_round || used > 1u || PREFILL_PICKS) {
+                    element_f32_put(partials + (slot * W + column) * 4ul, out_value);
                     if (column == 0u) {
-                        element_f32_put(statistics + slot * 8ul, row_maximum);
-                        element_f32_put(statistics + slot * 8ul + 4ul, row_denominator);
+                        element_f32_put(statistics + slot * 8ul, out_max);
+                        element_f32_put(statistics + slot * 8ul + 4ul, out_den);
                     }
                 } else {
                     attention_store_gated(query, ATTENTION_GATE_BUFFER, gated, out_token, out_head, column,
-                        attention_attended(value, row_maximum, row_denominator, out_head));
+                        attention_attended(out_value, out_max, out_den, out_head));
                 }
 #endif
             }
         }
+#else
+        if (valid) {
+            const uint64_t out_head = uint64_t(kv_head * G + lane_row % G);
+            const uint col_base = column0 + (lane / 16u) * (width / 2u);
+#ifdef PREFILL_DECODE
+            const uint64_t slot = (token * heads + out_head) * PREFILL_PARTS + part;
+            if (col_base == 0u) {
+                element_f32_put(statistics + slot * 8ul, maximum);
+                element_f32_put(statistics + slot * 8ul + 4ul, denominator);
+            }
+            const uint64_t partial_row = partials + (slot * W + col_base) * 4ul;
+            [[unroll]] for (uint q = 0u; q < PREFILL_WINDOW / 2u; ++q) {
+                if (q >= width / 2u)
+                    break;
+                element_f32_put(partial_row + uint64_t(q) * 4ul, o.c[q]);
+            }
+#else
+            const uint64_t slot = (uint64_t(part) * rows + token) * heads + out_head;
+            float out_max = maximum;
+            float out_den = denominator;
+            float a = 0.0;
+            float b = 1.0;
+            if (!is_first_round) {
+                out_max = max(prev_max, maximum);
+                const bool seen = out_max > -ATTENTION_INF;
+                a = seen ? exp2(prev_max - out_max) : 0.0;
+                b = seen ? exp2(maximum - out_max) : 0.0;
+                out_den = seismic_fma_rn(prev_den, a, denominator * b);
+            }
+            const uint64_t partial_row = partials + (slot * W + col_base) * 4ul;
+            if (!is_last_round || used > 1u || PREFILL_PICKS) {
+                if (col_base == 0u) {
+                    element_f32_put(statistics + slot * 8ul, out_max);
+                    element_f32_put(statistics + slot * 8ul + 4ul, out_den);
+                }
+                [[unroll]] for (uint q = 0u; q < PREFILL_WINDOW / 2u; ++q) {
+                    if (q >= width / 2u)
+                        break;
+                    const float out_value = is_first_round
+                        ? o.c[q]
+                        : seismic_fma_rn(element_f32_at(partial_row + uint64_t(q) * 4ul), a, o.c[q] * b);
+                    element_f32_put(partial_row + uint64_t(q) * 4ul, out_value);
+                }
+            } else {
+                const float inv = attention_inv_divisor(out_max, out_den, out_head);
+                [[unroll]] for (uint q = 0u; q < PREFILL_WINDOW / 2u; ++q) {
+                    if (q >= width / 2u)
+                        break;
+                    const float out_value = is_first_round
+                        ? o.c[q]
+                        : seismic_fma_rn(element_f32_at(partial_row + uint64_t(q) * 4ul), a, o.c[q] * b);
+                    attention_store_gated(query, ATTENTION_GATE_BUFFER, gated, token, out_head, col_base + q,
+                        out_value * inv);
+                }
+            }
+#endif
+        }
+#endif
     }
 }
 

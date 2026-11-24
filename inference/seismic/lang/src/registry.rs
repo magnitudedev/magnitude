@@ -217,8 +217,8 @@ impl BackendName {
     /// more than once (`repeat`): its runtime's encoder replays the block.
     pub const fn repeats_launches(self) -> bool {
         match self {
-            BackendName::Metal => true,
-            BackendName::Cpu | BackendName::Cuda | BackendName::Vulkan => false,
+            BackendName::Metal | BackendName::Vulkan => true,
+            BackendName::Cpu | BackendName::Cuda => false,
         }
     }
 

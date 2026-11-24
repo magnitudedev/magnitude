@@ -114,13 +114,17 @@ void flash_scores_add(uint64_t q, uint64_t q_stride, const uint w, uint k_base, 
 #else
     const uint lane = SEISMIC_LANE;
     const uint r = lane % 16u, h = lane / 16u;
-    for (uint d = 0u; d < w; d += 2u) {
-        const vec2 x = vec2(element_at(ELEMENT_F16, q, uint64_t(r) * q_stride + d),
-            element_at(ELEMENT_F16, q, uint64_t(r) * q_stride + d + 1u));
-        [[unroll]] for (uint j = 0u; j < 16u; ++j) {
-            const vec2 k = seismic_unpack_f16x2(seismic_shared_u32[(k_base + (16u * h + j) * pitch + d) / 2u]);
-            state.s[j] = seismic_fma_rn(x.x, k.x, state.s[j]);
-            state.s[j] = seismic_fma_rn(x.y, k.y, state.s[j]);
+    const uint64_t q_row = q + uint64_t(r) * q_stride * 2ul;
+    for (uint d = 0u; d < w; d += 8u) {
+        const uvec4 qv = element_uvec4_at(q_row + uint64_t(d) * 2ul);
+        [[unroll]] for (uint p = 0u; p < 4u; ++p) {
+            const vec2 x = seismic_unpack_f16x2(qv[p]);
+            const uint col = d + 2u * p;
+            [[unroll]] for (uint j = 0u; j < 16u; ++j) {
+                const vec2 k = seismic_unpack_f16x2(seismic_shared_u32[(k_base + (16u * h + j) * pitch + col) / 2u]);
+                state.s[j] = seismic_fma_rn(x.x, k.x, state.s[j]);
+                state.s[j] = seismic_fma_rn(x.y, k.y, state.s[j]);
+            }
         }
     }
 #endif

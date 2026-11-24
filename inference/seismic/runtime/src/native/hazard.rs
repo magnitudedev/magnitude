@@ -49,6 +49,10 @@ pub(crate) struct LevelLaunch {
     /// Whether a compute memory barrier must precede this launch (true for
     /// the first launch of every level after the first).
     pub(crate) barrier: bool,
+    /// Whether this launch begins a new watchdog-bounded repeat round and must
+    /// open a fresh Vulkan queue submission rather than coalescing with
+    /// preceding launches.
+    pub(crate) split_before: bool,
 }
 
 /// Order the encoded non-empty launches of `calls` into ASAP hazard levels,
@@ -67,18 +71,18 @@ pub(crate) fn schedule_calls(
     let mut out = Vec::new();
     let mut mark_positions = Vec::with_capacity(marks.len());
     let mut order = Order::default();
-    let mut segment: Vec<(usize, usize, usize)> = Vec::new();
+    let mut segment: Vec<(usize, usize, usize, bool)> = Vec::new();
     let mut buffers = Vec::new();
     let mut reaches = Vec::new();
     let mut accesses = Vec::new();
     let mut held = marks.iter().copied().peekable();
 
-    let flush = |segment: &mut Vec<(usize, usize, usize)>, out: &mut Vec<LevelLaunch>| {
+    let flush = |segment: &mut Vec<(usize, usize, usize, bool)>, out: &mut Vec<LevelLaunch>| {
         segment.sort_by_key(|(level, ..)| *level);
         for level in segment.chunk_by(|first, second| first.0 == second.0) {
-            for (pos, &(_, offset, ordinal)) in level.iter().enumerate() {
+            for (pos, &(_, offset, ordinal, split_before)) in level.iter().enumerate() {
                 let barrier = pos == 0 && !out.is_empty();
-                out.push(LevelLaunch { offset, ordinal, barrier });
+                out.push(LevelLaunch { offset, ordinal, barrier, split_before });
             }
         }
         segment.clear();
@@ -98,12 +102,22 @@ pub(crate) fn schedule_calls(
         list.reaches(index, &mut reaches);
         accesses.clear();
         dispatch_accesses(&dispatch, &reaches, &mut accesses);
-        for (ordinal, launch) in dispatch.launches.iter().enumerate() {
-            let Some(launch) = launch.filter(|launch| encoded[index][ordinal] && !launch.is_empty()) else {
+        let repeat_first = dispatch
+            .kernel
+            .implementation
+            .repeat
+            .as_ref()
+            .filter(|_| dispatch.rounds > 1)
+            .map(|repeat| repeat.first);
+        for ordinal in dispatch.kernel.implementation.dispatch_order(dispatch.rounds) {
+            let Some(launch) = dispatch.launches[ordinal]
+                .filter(|launch| encoded[index][ordinal] && !launch.is_empty())
+            else {
                 continue;
             };
-            let alone = launch.barrier.is_some();
-            segment.push((order.place_next(&accesses, alone), index - base, ordinal));
+            let split_before = repeat_first == Some(ordinal);
+            let alone = launch.barrier.is_some() || split_before;
+            segment.push((order.place_next(&accesses, alone), index - base, ordinal, split_before));
         }
     }
     flush(&mut segment, &mut out);
@@ -1713,11 +1727,11 @@ mod tests {
         assert_eq!(
             scheduled,
             vec![
-                LevelLaunch { offset: 0, ordinal: 0, barrier: false },
-                LevelLaunch { offset: 2, ordinal: 0, barrier: false },
-                LevelLaunch { offset: 1, ordinal: 0, barrier: true },
-                LevelLaunch { offset: 3, ordinal: 0, barrier: true },
-                LevelLaunch { offset: 4, ordinal: 0, barrier: false },
+                LevelLaunch { offset: 0, ordinal: 0, barrier: false, split_before: false },
+                LevelLaunch { offset: 2, ordinal: 0, barrier: false, split_before: false },
+                LevelLaunch { offset: 1, ordinal: 0, barrier: true, split_before: false },
+                LevelLaunch { offset: 3, ordinal: 0, barrier: true, split_before: false },
+                LevelLaunch { offset: 4, ordinal: 0, barrier: false, split_before: false },
             ]
         );
         // Non-zero segment base returns offsets relative to `calls.start`.
@@ -1726,8 +1740,8 @@ mod tests {
         assert_eq!(
             sub_scheduled,
             vec![
-                LevelLaunch { offset: 0, ordinal: 0, barrier: false },
-                LevelLaunch { offset: 1, ordinal: 0, barrier: false },
+                LevelLaunch { offset: 0, ordinal: 0, barrier: false, split_before: false },
+                LevelLaunch { offset: 1, ordinal: 0, barrier: false, split_before: false },
             ]
         );
     }

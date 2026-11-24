@@ -58,7 +58,7 @@ attention_history decode_history() {
 // factors.
 prefill_scratch decode_scratch() {
     return prefill_scratch(SEISMIC_PTR(SEISMIC_BUFFER_SCRATCH_QUERIES), SEISMIC_PTR(SEISMIC_BUFFER_SCRATCH_KEYS),
-        SEISMIC_PTR(SEISMIC_BUFFER_SCRATCH_VALUES), 0ul, SEISMIC_PTR(SEISMIC_BUFFER_SCRATCH_QUERY_FACTORS));
+        SEISMIC_PTR(SEISMIC_BUFFER_SCRATCH_VALUES), 0ul, SEISMIC_PTR(SEISMIC_BUFFER_SCRATCH_QUERY_FACTORS), 0ul);
 }
 
 void attention_decode_prepare() { prefill_prepare(decode_history(), decode_scratch()); }

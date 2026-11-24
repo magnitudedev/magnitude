@@ -66,7 +66,7 @@ attention_history prefill_history() {
 prefill_scratch prefill_scratch_planes() {
     return prefill_scratch(SEISMIC_PTR(SEISMIC_BUFFER_SCRATCH_QUERIES), SEISMIC_PTR(SEISMIC_BUFFER_SCRATCH_KEYS),
         SEISMIC_PTR(SEISMIC_BUFFER_SCRATCH_VALUES), SEISMIC_PTR(SEISMIC_BUFFER_SCRATCH_COUNTS),
-        SEISMIC_PTR(SEISMIC_BUFFER_SCRATCH_QUERY_FACTORS));
+        SEISMIC_PTR(SEISMIC_BUFFER_SCRATCH_QUERY_FACTORS), SEISMIC_PTR(SEISMIC_BUFFER_SCRATCH_ROUND));
 }
 
 prefill_picked prefill_picked_planes() {
@@ -101,6 +101,7 @@ void attention_prefill_gate() {
 
 void attention_prefill_prepare() { prefill_prepare(prefill_history(), prefill_scratch_planes()); }
 void attention_prefill_attend() { prefill_attend(prefill_history(), prefill_scratch_planes()); }
+void attention_prefill_advance() { prefill_advance(prefill_scratch_planes()); }
 void attention_prefill_picks() {
     prefill_picks(prefill_scratch_planes(), prefill_picked_planes(), SEISMIC_PTR(SEISMIC_BUFFER_SELECTED_ROWS),
         uint(SEISMIC_DIM_KS), SEISMIC_PTR(SEISMIC_BUFFER_SELECTED), uint64_t(SEISMIC_PARAM_SELECTED_SLAB_ROWS));

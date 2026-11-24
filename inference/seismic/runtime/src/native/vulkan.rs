@@ -130,6 +130,9 @@ impl super::graph_replays::RecordedGraph for Divided {
 
 struct Divided {
     launches: Vec<LaunchKind>,
+    /// Launches that begin a new watchdog-bounded repeat round and must open a
+    /// fresh queue submission rather than coalescing with earlier launches.
+    split_before: Vec<bool>,
     /// ASAP hazard-level schedule of the segment's launches (in recorded order).
     schedule: Vec<LevelLaunch>,
     /// The marks the graph holds, each the scheduled launch it precedes, in order.
@@ -151,6 +154,7 @@ struct Part {
     kinds: Vec<(LaunchKind, u32)>,
     segments: Range<usize>,
     marks: Vec<(usize, usize)>,
+    split_before: bool,
 }
 
 /// Encode `work` on the device's queue: a replay when the list is made of
@@ -231,12 +235,14 @@ pub(super) fn encode(
         let marks_in: Vec<usize> = keys.marks(&graphed[index]).collect();
         let (schedule, marks) = hazard::schedule_calls(list, graphed[index].clone(), &encoded, &marks_in);
         let mut launches = Vec::with_capacity(schedule.len());
-        each_scheduled_launch(list, graphed[index].start, &schedule, |launch, _| {
+        let split_before = schedule.iter().map(|launch| launch.split_before).collect();
+        each_scheduled_launch(list, graphed[index].start, &schedule, |launch, _, _| {
             launches.push(launch.kind());
             Ok(())
         })?;
         Ok(Divided {
             launches,
+            split_before,
             schedule,
             marks,
             parts: Vec::new(),
@@ -270,7 +276,7 @@ pub(super) fn encode(
                             let mut rebind = None;
                             if std::mem::take(&mut divided.stale) {
                                 let mut blocks = Vec::with_capacity(divided.schedule.len());
-                                each_scheduled_launch(list, calls.start, &divided.schedule, |launch, _| {
+                                each_scheduled_launch(list, calls.start, &divided.schedule, |launch, _, _| {
                                     blocks.push(launch.argument_block());
                                     Ok(())
                                 })?;
@@ -337,7 +343,7 @@ impl Divided {
         }
         let estimates = costs.estimates(&self.launches);
         let measured = estimates.iter().all(Option::is_some);
-        let mut ranges = divide(&estimates, SUBMISSION_SECONDS);
+        let mut ranges = divide(&estimates, &self.split_before, SUBMISSION_SECONDS);
         if ranges.is_empty() {
             // No launch does device work: one empty part keeps the
             // submission's ordering and completion.
@@ -357,7 +363,7 @@ impl Divided {
         let mut builder = DirectGraphBuilder::new(device).map_err(CallError::Execution)?;
         let mut index = 0usize;
         let mut segment = 0usize;
-        each_scheduled_launch(list, calls_start, &self.schedule, |launch, barrier| {
+        each_scheduled_launch(list, calls_start, &self.schedule, |launch, barrier, _| {
             while ends[segment] <= index && segment + 1 < ends.len() {
                 segment += 1;
                 builder.segment()?;
@@ -375,6 +381,7 @@ impl Divided {
             .into_iter()
             .zip(located)
             .map(|(launches, (segments, marks))| Part {
+                split_before: self.split_before.get(launches.start).copied().unwrap_or(false),
                 kinds: counted(&self.launches[launches.clone()]),
                 launches,
                 segments,
@@ -424,14 +431,16 @@ fn counted<K: Copy + Eq>(launches: &[K]) -> Vec<(K, u32)> {
     kinds
 }
 
-/// Consecutive launch ranges: a launch without an estimate alone, the rest
-/// grouped while their estimated time stays within `seconds` (a launch
-/// estimated beyond it alone).
-fn divide(estimates: &[Option<f64>], seconds: f64) -> Vec<Range<usize>> {
+/// Consecutive launch ranges: a launch without an estimate alone, a launch
+/// with `split_before` starting a fresh range, and the rest grouped while
+/// their estimated time stays within `seconds` (a launch estimated beyond it
+/// alone).
+fn divide(estimates: &[Option<f64>], split_before: &[bool], seconds: f64) -> Vec<Range<usize>> {
     let mut ranges = Vec::new();
     let mut start = 0;
     let mut sum = 0.0;
     for (index, estimate) in estimates.iter().enumerate() {
+        let split = split_before.get(index).copied().unwrap_or(false);
         match estimate {
             None => {
                 if start < index {
@@ -442,7 +451,7 @@ fn divide(estimates: &[Option<f64>], seconds: f64) -> Vec<Range<usize>> {
                 sum = 0.0;
             }
             Some(estimate) => {
-                if start < index && sum + estimate > seconds {
+                if start < index && (split || sum + estimate > seconds) {
                     ranges.push(start..index);
                     start = index;
                     sum = 0.0;
@@ -680,10 +689,11 @@ impl<'a> Queued<'a> {
         estimate: Option<f64>,
         rebind: Option<Vec<Vec<u8>>>,
     ) -> Result<(), CallError> {
-        let joins = self
-            .open
-            .as_ref()
-            .is_some_and(|(_, queued, _)| fits_submission(*queued, estimate));
+        let joins = !part.split_before
+            && self
+                .open
+                .as_ref()
+                .is_some_and(|(_, queued, _)| fits_submission(*queued, estimate));
         if !joins {
             self.commit()?;
             self.open(Some(estimate))?;
@@ -795,12 +805,13 @@ pub(crate) struct VulkanSubmission {
 }
 
 /// Queue one ungraphed launch into `batch`, splitting into a new queue
-/// submission if adding it would exceed [`SUBMISSION_SECONDS`] (or either
-/// side is unmeasured).
+/// submission if `split_before` is set or adding it would exceed
+/// [`SUBMISSION_SECONDS`] (or either side is unmeasured).
 #[allow(clippy::too_many_arguments)]
 fn queue_ungraphed_launch<T: Timing>(
     launch: &DirectLaunch<'_>,
     barrier: bool,
+    split_before: bool,
     costs: &LaunchCosts<LaunchKind>,
     batch: &mut DirectBatch<T>,
     queued: &mut Option<f64>,
@@ -812,7 +823,7 @@ fn queue_ungraphed_launch<T: Timing>(
 ) -> Result<(), ExecutionError> {
     let kind = launch.kind();
     let estimate = costs.estimate_one(kind);
-    if !kinds.is_empty() && !fits_submission(*queued, estimate) {
+    if !kinds.is_empty() && (split_before || !fits_submission(*queued, estimate)) {
         let next = new_batch()?;
         submissions.push(wrap(std::mem::replace(batch, next).commit()?));
         batch_kinds.push(std::mem::take(kinds));
@@ -863,7 +874,7 @@ fn encode_ungraphed<T: Timing>(
         for (seg_idx, (calls, boundary)) in segments.iter().enumerate() {
             if use_asap {
                 let mut first = true;
-                each_scheduled_launch(list, calls.start, &schedules[seg_idx], |launch, barrier| {
+                each_scheduled_launch(list, calls.start, &schedules[seg_idx], |launch, barrier, split_before| {
                     // The first launch of each segment/repetition must barrier
                     // against any earlier work already recorded in `batch`;
                     // `DirectBatch::launch_with_barrier` elides it when nothing
@@ -872,6 +883,7 @@ fn encode_ungraphed<T: Timing>(
                     queue_ungraphed_launch(
                         launch,
                         barrier,
+                        split_before,
                         costs,
                         &mut batch,
                         &mut queued,
@@ -883,10 +895,11 @@ fn encode_ungraphed<T: Timing>(
                     )
                 })?;
             } else {
-                each_launch(list, calls.clone(), encoded, |launch| match launch {
+                each_launch(list, calls.clone(), encoded, |launch, split_before| match launch {
                     Some(launch) => queue_ungraphed_launch(
                         launch,
                         true,
+                        split_before,
                         costs,
                         &mut batch,
                         &mut queued,
@@ -1238,16 +1251,17 @@ fn encoded_launch(
 }
 
 /// Visit every launch of `schedule` (with offsets relative to `base`) in
-/// scheduled order, passing whether a compute barrier must precede it.
+/// scheduled order, passing whether a compute barrier must precede it and
+/// whether it begins a watchdog-bounded repeat round.
 fn each_scheduled_launch(
     list: &impl DispatchList,
     base: usize,
     schedule: &[LevelLaunch],
-    mut visit: impl FnMut(&DirectLaunch<'_>, bool) -> Result<(), ExecutionError>,
+    mut visit: impl FnMut(&DirectLaunch<'_>, bool, bool) -> Result<(), ExecutionError>,
 ) -> Result<(), CallError> {
     let mut buffers = Vec::new();
     let mut typed = Vec::new();
-    for &LevelLaunch { offset, ordinal, barrier } in schedule {
+    for &LevelLaunch { offset, ordinal, barrier, split_before } in schedule {
         let index = base + offset;
         buffers.clear();
         let dispatch = list.dispatch(index, &mut buffers);
@@ -1276,7 +1290,7 @@ fn each_scheduled_launch(
             groups: launch.groups,
             grid: launch.grid.map(|buffer| typed[dispatch.kernel.argument(buffer)]),
         };
-        visit(&direct, barrier).map_err(CallError::Execution)?;
+        visit(&direct, barrier, split_before).map_err(CallError::Execution)?;
     }
     Ok(())
 }
@@ -1287,7 +1301,7 @@ fn each_launch(
     list: &impl DispatchList,
     calls: Range<usize>,
     encoded: &[Vec<bool>],
-    mut visit: impl FnMut(Option<&DirectLaunch<'_>>) -> Result<(), ExecutionError>,
+    mut visit: impl FnMut(Option<&DirectLaunch<'_>>, bool) -> Result<(), ExecutionError>,
 ) -> Result<(), CallError> {
     let mut buffers = Vec::new();
     let mut typed = Vec::new();
@@ -1307,8 +1321,15 @@ fn each_launch(
             .kernel
             .scalar_slots()
             .map(|slots| (vulkan_buffer(slots), 0));
-        for (ordinal, launch) in dispatch.launches.iter().enumerate() {
-            let launch = encoded_launch(*launch, encoded, index, ordinal).map(|launch| {
+        let repeat_first = dispatch
+            .kernel
+            .implementation
+            .repeat
+            .as_ref()
+            .filter(|_| dispatch.rounds > 1)
+            .map(|repeat| repeat.first);
+        for ordinal in dispatch.kernel.implementation.dispatch_order(dispatch.rounds) {
+            let launch = encoded_launch(dispatch.launches[ordinal], encoded, index, ordinal).map(|launch| {
                 let (module, function) = launches.launch(ordinal);
                 DirectLaunch {
                     module,
@@ -1320,7 +1341,7 @@ fn each_launch(
                     grid: launch.grid.map(|buffer| typed[dispatch.kernel.argument(buffer)]),
                 }
             });
-            visit(launch.as_ref()).map_err(CallError::Execution)?;
+            visit(launch.as_ref(), repeat_first == Some(ordinal)).map_err(CallError::Execution)?;
         }
     }
     Ok(())
@@ -1340,8 +1361,10 @@ fn bindings(list: &impl DispatchList, calls: Range<usize>, encoded: &[Vec<bool>]
         let dispatch = list.dispatch(index, &mut buffers);
         let address = |(allocation, offset): &(&Allocation, u64)| vulkan_buffer(allocation).address() + offset;
         bound.extend(buffers.iter().map(address));
-        for (ordinal, launch) in dispatch.launches.iter().enumerate() {
-            if let Some(grid) = encoded_launch(*launch, encoded, index, ordinal).and_then(|launch| launch.grid) {
+        for ordinal in dispatch.kernel.implementation.dispatch_order(dispatch.rounds) {
+            if let Some(grid) =
+                encoded_launch(dispatch.launches[ordinal], encoded, index, ordinal).and_then(|launch| launch.grid)
+            {
                 grids.push(address(&buffers[dispatch.kernel.argument(grid)]));
             }
         }
@@ -1399,26 +1422,35 @@ mod tests {
 
     #[test]
     fn unmeasured_launches_are_divided_alone() {
-        assert_eq!(divide(&[None, None, None], 0.1), vec![0..1, 1..2, 2..3]);
+        assert_eq!(divide(&[None, None, None], &[], 0.1), vec![0..1, 1..2, 2..3]);
         assert_eq!(
-            divide(&[Some(0.01), None, Some(0.01), Some(0.01)], 0.1),
+            divide(&[Some(0.01), None, Some(0.01), Some(0.01)], &[], 0.1),
             vec![0..1, 1..2, 2..4]
         );
     }
 
     #[test]
     fn measured_launches_are_grouped_within_the_budget() {
-        assert_eq!(divide(&[Some(0.001); 50], 0.1), vec![0..50]);
+        assert_eq!(divide(&[Some(0.001); 50], &[], 0.1), vec![0..50]);
         assert_eq!(
-            divide(&[Some(0.04), Some(0.04), Some(0.04), Some(0.04)], 0.1),
+            divide(&[Some(0.04), Some(0.04), Some(0.04), Some(0.04)], &[], 0.1),
             vec![0..2, 2..4]
         );
         // A launch beyond the budget stands alone.
         assert_eq!(
-            divide(&[Some(0.01), Some(0.5), Some(0.01)], 0.1),
+            divide(&[Some(0.01), Some(0.5), Some(0.01)], &[], 0.1),
             vec![0..1, 1..2, 2..3]
         );
-        assert!(divide(&[], 0.1).is_empty());
+        // A repeat-round boundary starts a fresh submission even when estimates are tiny.
+        assert_eq!(
+            divide(
+                &[Some(0.001), Some(0.001), Some(0.001), Some(0.001), Some(0.001)],
+                &[false, true, false, true, false],
+                0.1,
+            ),
+            vec![0..1, 1..3, 3..5]
+        );
+        assert!(divide(&[], &[], 0.1).is_empty());
     }
 
     #[test]

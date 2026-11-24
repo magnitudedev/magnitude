@@ -4922,7 +4922,7 @@ mod native_tests {
     }
 
     #[test]
-    fn a_repeat_block_dispatches_in_order_and_only_on_metal() {
+    fn a_repeat_block_dispatches_in_order_on_metal_and_vulkan() {
         let check = |target: &str| {
             let launch = |name: &str, indent: &str| {
                 format!(
@@ -4940,15 +4940,17 @@ mod native_tests {
                 ),
             }]))
         };
-        let module = check("metal").unwrap();
-        let native = module
-            .native_implementation(module.entries()[0].id, BackendName::Metal)
-            .unwrap();
-        assert_eq!(
-            native.dispatch_order(2).collect::<Vec<_>>(),
-            [0, 1, 2, 1, 2, 3]
-        );
-        assert_eq!(native.dispatch_order(0).collect::<Vec<_>>(), [0, 3]);
+        for (target, backend) in [("metal", BackendName::Metal), ("vulkan", BackendName::Vulkan)] {
+            let module = check(target).unwrap();
+            let native = module
+                .native_implementation(module.entries()[0].id, backend)
+                .unwrap();
+            assert_eq!(
+                native.dispatch_order(2).collect::<Vec<_>>(),
+                [0, 1, 2, 1, 2, 3]
+            );
+            assert_eq!(native.dispatch_order(0).collect::<Vec<_>>(), [0, 3]);
+        }
         let refused = format!("{:?}", check("cuda").err().unwrap());
         assert!(
             refused.contains("`repeat` is not implemented for cuda"),

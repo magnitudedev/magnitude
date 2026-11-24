@@ -1134,13 +1134,17 @@ native attention_prefill for vulkan from "vulkan/attention_prefill.comp":
         arithmetic SIMDS in [4, 8] default 4,
         arithmetic SLICES in [1, 2, 4, 8, 16, 32, 64] default least where VECTOR == 0 or (G % SLICES == 0 and ((G / SLICES) * ((2 * P + S) / 32) <= 32 or SLICES == G)))
     let VECTOR = VK * (1 - min(KS, 1)) * max(1 - min(64 % G, 1), 1 - min(G * ((2 * P + S) / 32) / 33, 1)) * (1 - min((2 * P + S) / 2048, 1))
+    let PREFILL_PARTS = max(1, ceil_div(SPLIT_GROUPS, ceil_div(M, max(1, ROWS / G)) * KV))
+    let ROUND_TILES = max(16, (device.units * 2097152) / max(1, M * KV * G * ((2 * P + S) / 32) * ceil_div(2 * P + S, 256) * PREFILL_PARTS))
+    let ROUNDS = max(1, MATRIX * ceil_div(ceil_div(T + M, 32), PREFILL_PARTS * ROUND_TILES))
     where KR <= 1 and (KS == 0 or B == 0) and NQ <= 1 and RA <= 1 and RT <= 1 and (RA == 0 or (2 * P + S) % 64 == 0 or (2 * P + S) == 32) and RO <= 1 and (RO == 0 or (P > 0 and I == 0 and U == 0)) and VK <= 1 and SK <= 1 and (I == 0 or I == (2 * P + S)) and (U == 0 or U == 1 or U == (2 * P + S)) and (I == 0 or U == 0) and F <= 1 and N <= 1 and NV <= 1 and (2 * P + S) % 32 == 0 and P % ((2 * P + S) / 32) == 0 and ((VECTOR == 0 and SLICES == 1) or (VECTOR == 1 and G % SLICES == 0 and ((G / SLICES) * ((2 * P + S) / 32) <= 32 or SLICES == G) and (SLICES == 1 or G % (SLICES / 2) != 0 or (2 * G / SLICES) * ((2 * P + S) / 32) > 32))) and (MATRIX == 1 or (VECTOR == 1 and ROWS == 64 and SPLIT_GROUPS == 256 and SIMDS * (G / SLICES) * 8 + max(SIMDS, ceil_div(G / SLICES, 2)) * (2 * P + S) * 4 <= device.shared_bytes_per_group)) and (MATRIX == 0 or (SPAN == 32 and PARTS == 16 and SIMDS == 4 and ((2 * P + S) <= 64 or (2 * P + S) % 64 == 0) and ((2 * P + S) <= 256 or (2 * P + S) % 256 == 0) and G <= ROWS and ROWS / G <= 32 and 64 * (min((2 * P + S), 256) + 8) + ROWS / 16 * 2048 <= device.shared_bytes_per_group)) and (AB == 0 or MATRIX == 0)
     scratch queries bytes ((ceil_div(M, ROWS / G) * (ROWS / G) * KV * G + ROWS) * (2 * P + S) * 2) when MATRIX == 1
     scratch keys bytes (M * KV * (2 * P + S) * 2) when MATRIX == 1
     scratch values bytes (M * KV * (2 * P + S) * 2) when MATRIX == 1
-    scratch partials bytes ((1 - MATRIX) * PARTS * M * KV * G * (2 * P + S) * 4 + MATRIX * (max(1, ceil_div(SPLIT_GROUPS, ceil_div(M, ROWS / G) * KV)) + min(1, KS)) * M * KV * G * (2 * P + S) * 4)
-    scratch statistics bytes ((1 - MATRIX) * PARTS * M * KV * G * 8 + MATRIX * (max(1, ceil_div(SPLIT_GROUPS, ceil_div(M, ROWS / G) * KV)) + min(1, KS)) * M * KV * G * 8)
+    scratch partials bytes ((1 - MATRIX) * PARTS * M * KV * G * (2 * P + S) * 4 + MATRIX * (PREFILL_PARTS + min(1, KS)) * M * KV * G * (2 * P + S) * 4)
+    scratch statistics bytes ((1 - MATRIX) * PARTS * M * KV * G * 8 + MATRIX * (PREFILL_PARTS + min(1, KS)) * M * KV * G * 8)
     scratch counts bytes (ceil_div(M, ROWS / G) * 4) when MATRIX == 1
+    scratch round bytes (4) when MATRIX == 1
     scratch query_factors bytes ((ceil_div(M, ROWS / G) * (ROWS / G) * KV * G + ROWS) * 4) when MATRIX == 1
     scratch worklist bytes (ceil_div(M, (ROWS / G)) * ((ROWS / G) * (ceil_div(32 * B * BR, 32) + R + 1) * 8 + 4) + M * (R + 1) * 4) when B > 0 and MATRIX == 1
     launch attention_prefill_vector when MATRIX == 0:
@@ -1158,10 +1162,14 @@ native attention_prefill for vulkan from "vulkan/attention_prefill.comp":
         threadgroups (ceil_div(M, ROWS / G), 1, 1)
         threads_per_threadgroup (256, 1, 1)
         shared_bytes (257 * 4)
-    launch attention_prefill_attend when MATRIX == 1:
-        threadgroups (ceil_div(M, ROWS / G), KV, max(1, ceil_div(SPLIT_GROUPS, ceil_div(M, ROWS / G) * KV)))
-        threads_per_threadgroup (ROWS * 2, 1, 1)
-        shared_bytes (64 * (min((2 * P + S), 256) + 8) + ROWS / 16 * 2048)
+    repeat (ROUNDS):
+        launch attention_prefill_attend when MATRIX == 1:
+            threadgroups (ceil_div(M, ROWS / G), KV, PREFILL_PARTS)
+            threads_per_threadgroup (ROWS * 2, 1, 1)
+            shared_bytes (64 * (min((2 * P + S), 256) + 8) + ROWS / 16 * 2048)
+        launch attention_prefill_advance when MATRIX == 1 and ROUNDS > 1:
+            threadgroups (1, 1, 1)
+            threads_per_threadgroup (64, 1, 1)
     launch attention_prefill_picks when KS > 0:
         threadgroups (M, ceil_div(KV * G, 2), 1)
         threads_per_threadgroup (64, 1, 1)
@@ -1892,13 +1900,17 @@ native attention_prefill_k8v4 for cuda from "cuda/attention_prefill_k8v4.cu":
 native attention_prefill_k8v4 for vulkan from "vulkan/attention_prefill_k8v4.comp":
     static (KV, G, P, S, I, U, F, NQ, N, NV, B, KC, KP, VC, VP, SK, RA, RT, RO, VK)
     params (arithmetic ROWS in [64, 128] default 64, arithmetic SPLIT_GROUPS in [256, 128, 512] default least where SPLIT_GROUPS / 4 >= device.units or SPLIT_GROUPS == 512)
+    let PREFILL_PARTS = max(1, ceil_div(SPLIT_GROUPS, ceil_div(M, ROWS / G) * KV))
+    let ROUND_TILES = max(16, (device.units * 2097152) / max(1, M * KV * G * ((2 * P + S) / 32) * ceil_div(2 * P + S, 256) * PREFILL_PARTS))
+    let ROUNDS = max(1, ceil_div(ceil_div(T + M, 32), PREFILL_PARTS * ROUND_TILES))
     where NQ == N and RA == 0 and RT == 0 and RO == 0 and VK == 0 and SK <= 1 and 32 * KC == AFFINE_KEY_BITS * (2 * P + S) and 32 * VC == AFFINE_VALUE_BITS * (2 * P + S) and AFFINE_GROUP * KP == 2 * (2 * P + S) and KP == VP and (I == 0 or I == 2 * P + S) and (U == 0 or U == 1 or U == 2 * P + S) and (I == 0 or U == 0) and F <= 1 and N <= 1 and NV <= 1 and (2 * P + S == 32 or 2 * P + S == 64 or 2 * P + S == 128 or 2 * P + S == 256 or 2 * P + S == 512) and P % ((2 * P + S) / 32) == 0 and G <= ROWS and ROWS / G <= 32 and 64 * (min(2 * P + S, 256) + 8) + ROWS / 16 * 2048 <= device.shared_bytes_per_group
     scratch queries bytes ((ceil_div(M, ROWS / G) * (ROWS / G) * KV * G + ROWS) * (2 * P + S) * 2)
     scratch keys bytes (M * KV * (2 * P + S) * 2)
     scratch values bytes (M * KV * (2 * P + S) * 2)
-    scratch partials bytes (max(1, ceil_div(SPLIT_GROUPS, ceil_div(M, ROWS / G) * KV)) * M * KV * G * (2 * P + S) * 4)
-    scratch statistics bytes (max(1, ceil_div(SPLIT_GROUPS, ceil_div(M, ROWS / G) * KV)) * M * KV * G * 8)
+    scratch partials bytes (PREFILL_PARTS * M * KV * G * (2 * P + S) * 4)
+    scratch statistics bytes (PREFILL_PARTS * M * KV * G * 8)
     scratch counts bytes (ceil_div(M, ROWS / G) * 4)
+    scratch round bytes (4)
     scratch query_factors bytes ((ceil_div(M, ROWS / G) * (ROWS / G) * KV * G + ROWS) * 4)
     scratch worklist bytes (ceil_div(M, (ROWS / G)) * ((ROWS / G) * (ceil_div(32 * B * BR, 32) + R + 1) * 8 + 4) + M * (R + 1) * 4) when B > 0
     launch attention_prefill_k8v4_prepare:
@@ -1908,10 +1920,14 @@ native attention_prefill_k8v4 for vulkan from "vulkan/attention_prefill_k8v4.com
         threadgroups (ceil_div(M, ROWS / G), 1, 1)
         threads_per_threadgroup (256, 1, 1)
         shared_bytes (257 * 4)
-    launch attention_prefill_k8v4_attend:
-        threadgroups (ceil_div(M, ROWS / G), KV, max(1, ceil_div(SPLIT_GROUPS, ceil_div(M, ROWS / G) * KV)))
-        threads_per_threadgroup (ROWS * 2, 1, 1)
-        shared_bytes (64 * (min(2 * P + S, 256) + 8) + ROWS / 16 * 2048)
+    repeat (ROUNDS):
+        launch attention_prefill_k8v4_attend:
+            threadgroups (ceil_div(M, ROWS / G), KV, PREFILL_PARTS)
+            threads_per_threadgroup (ROWS * 2, 1, 1)
+            shared_bytes (64 * (min(2 * P + S, 256) + 8) + ROWS / 16 * 2048)
+        launch attention_prefill_k8v4_advance when ROUNDS > 1:
+            threadgroups (1, 1, 1)
+            threads_per_threadgroup (64, 1, 1)
     launch attention_prefill_k8v4_merge when SPLIT_GROUPS > ceil_div(M, ROWS / G) * KV:
         threadgroups (ceil_div(M, ROWS / G), KV * G, 1)
         threads_per_threadgroup (2 * P + S, 1, 1)
