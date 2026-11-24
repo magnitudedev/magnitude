@@ -501,10 +501,19 @@ impl TuningLimits {
     ) -> Self {
         let max_rows = limits.max_launch_rows as u64;
         let max_tuning_rows = *TUNING_ROWS.last().expect("TUNING_ROWS is non-empty");
-        let max_pass_rows = (load.pass(limits).get() as u64)
+        let pass_cap = (load.pass(limits).get() as u64)
             .saturating_mul(max_rows)
-            .min(definition.decoder.context_limit)
-            .min(max_tuning_rows)
+            .min(max_tuning_rows);
+        // Round up to the smallest tuning row class covering the served pass
+        // (bounded by `pass_cap`) so non-power-of-two context limits (e.g.
+        // 4052 for a 3975-token prompt + decode) still include `m4096`
+        // instead of dropping back to `m2048`.
+        let served_pass = pass_cap.min(definition.decoder.context_limit).max(max_rows);
+        let max_pass_rows = TUNING_ROWS
+            .into_iter()
+            .find(|&rows| rows >= served_pass)
+            .unwrap_or(max_tuning_rows)
+            .min(pass_cap)
             .max(max_rows);
         Self {
             max_rows,

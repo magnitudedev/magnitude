@@ -1474,6 +1474,7 @@ pub struct GroundingKey {
     entry: EntryId,
     bindings: ElementBindings,
     default: NativeSpecialization,
+    reference: Option<NativeSpecialization>,
 }
 
 /// The compile of a unit's canonical program ([`UnitSearch::grounding`]).
@@ -1484,6 +1485,7 @@ pub struct Grounding<'m> {
     logical: Arc<LogicalEntry>,
     bindings: ElementBindings,
     default: NativeSpecialization,
+    reference: Option<NativeSpecialization>,
     cpu: Option<&'static CpuNativeKernels>,
     implementation: NativeImplementation,
     served: Vec<BTreeMap<String, u64>>,
@@ -1496,12 +1498,15 @@ impl Grounding<'_> {
             entry: self.entry,
             bindings: self.bindings.clone(),
             default: self.default.clone(),
+            reference: self.reference.clone(),
         }
     }
 
-    /// Form the canonical default program, to the end. Any distinct
-    /// numerical validation reference is formed lazily only if this unit
-    /// enters discovery and its served shapes exercise different work.
+    /// Form the canonical default program, and any distinct numerical
+    /// validation reference concurrently so `Stage::Discovery` never blocks
+    /// on synchronous single-threaded compilation. Reference formation
+    /// failures are deferred to discovery so mandatory canonical preparation
+    /// stays total.
     pub fn run(self) -> Grounded {
         let began = Instant::now();
         let kernel = NativePrepared::prepare_implementation(
@@ -1509,17 +1514,39 @@ impl Grounding<'_> {
             self.module,
             self.entry,
             &self.logical,
-            self.bindings,
+            self.bindings.clone(),
             self.default,
             self.cpu,
-            self.implementation,
+            self.implementation.clone(),
         )
         .map_err(|error| TuneError::DefaultUnusable(Exclusion::Formation(prepare_message(error))))
         // Serving runs the defaults wherever no other choice stands.
         .and_then(|kernel| serving(kernel, &self.served).map_err(TuneError::DefaultUnusable));
+        let elapsed = began.elapsed();
+        let reference = if kernel.is_ok() {
+            self.reference.and_then(|reference| {
+                let ref_began = Instant::now();
+                let formed = NativePrepared::prepare_implementation(
+                    self.charges.device(),
+                    self.module,
+                    self.entry,
+                    &self.logical,
+                    self.bindings,
+                    reference,
+                    self.cpu,
+                    self.implementation,
+                )
+                .ok()
+                .and_then(|ref_kernel| serving(ref_kernel, &self.served).ok());
+                formed.map(|ref_kernel| (ref_kernel, ref_began.elapsed()))
+            })
+        } else {
+            None
+        };
         Grounded {
             kernel,
-            elapsed: began.elapsed(),
+            reference,
+            elapsed,
         }
     }
 }
@@ -1528,6 +1555,7 @@ impl Grounding<'_> {
 /// to take ([`UnitSearch::grounded`]).
 pub struct Grounded {
     kernel: Result<Arc<NativePrepared>, TuneError>,
+    reference: Option<(Arc<NativePrepared>, Duration)>,
     elapsed: Duration,
 }
 
@@ -3979,6 +4007,12 @@ impl<'m, 'a> UnitSearch<'m, 'a> {
         source: &dyn PointSource<'a>,
     ) -> Result<Option<Grounding<'m>>, TuneError> {
         self.describe(source)?;
+        let distinct_reference = !same_work_on_served(
+            self.implementation.implementation(),
+            &self.default,
+            &self.reference,
+            &self.served,
+        );
         Ok(matches!(self.progress, Progress::Ungrounded { .. }).then(|| Grounding {
             charges: self.charges.clone(),
             module: self.module,
@@ -3986,6 +4020,7 @@ impl<'m, 'a> UnitSearch<'m, 'a> {
             logical: self.logical.clone(),
             bindings: self.bindings.clone(),
             default: self.default.clone(),
+            reference: distinct_reference.then(|| self.reference.clone()),
             cpu: self.cpu,
             implementation: self.implementation.implementation().clone(),
             served: self.served.clone(),
@@ -4009,6 +4044,15 @@ impl<'m, 'a> UnitSearch<'m, 'a> {
             &kernel,
             &self.charges,
         );
+        let reference = if identical_reference {
+            Some(kernel.clone())
+        } else if let Some((ref_kernel, ref_elapsed)) = grounded.reference {
+            self.time.forming_seconds += ref_elapsed.as_secs_f64();
+            validator.set_reference(&ref_kernel);
+            Some(ref_kernel)
+        } else {
+            None
+        };
         kernel
             .hand_off()
             .map_err(|error| TuneError::Handoff(error.to_string()))?;
@@ -4032,7 +4076,7 @@ impl<'m, 'a> UnitSearch<'m, 'a> {
         let slots = self.points.iter().map(|_| None).collect();
         self.progress = Progress::Grounded {
             ground: Ground {
-                reference: identical_reference.then(|| kernel.clone()),
+                reference,
                 kernel,
                 validator,
             },

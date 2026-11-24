@@ -84,23 +84,28 @@ pub(crate) fn grouped_pass_points(limits: TuningLimits) -> Vec<PointShape> {
     served_row_points_up_to(limits.max_pass_rows, |rows| GROUPED_SERVED.contains(&rows))
 }
 
-/// Distinct experts per row with the uneven expert loads and multi-row verify
-/// overlap of real routing: the expert of popularity rank r is (p r) mod E, p
-/// the first of 101, 103 and 107 that E is no multiple of (a permutation: p is
-/// prime; a bank's slot count may be a multiple of 101), with Zipf popularity
-/// 1 / (r + 1)^1.4 so an 8-row decode verify burst (`M=8, K=10, E=256..512`)
-/// shares ~45-55% of its picks (`U(8) ~ 38-42` unique experts out of 80), and
-/// each row draws its choices by popularity without replacement from a
-/// fixed-seed generator. A grouped point then holds blocks of every live-row
-/// count, from one row to full tiles, and experts with no rows.
+/// Distinct experts per row with the uneven expert loads of real routing: the
+/// expert of popularity rank r is (p r) mod E, p the first of 101, 103 and 107
+/// that E is no multiple of (a permutation: p is prime; a bank's slot count
+/// may be a multiple of 101), and each row draws its choices by popularity
+/// without replacement from a fixed-seed generator.
+///
+/// Decode verify bursts (`rows <= VERIFY_ROWS`) use Zipf popularity
+/// `1 / (r + 1)^1.4` so an 8-row burst (`M=8, K=10, E=256..512`) shares
+/// ~45-55% of its picks (`U(8) ~ 38-42` unique experts out of 80).
+/// Grouped prefill passes (`rows > VERIFY_ROWS`) span diverse tokens across
+/// load-balanced experts and use `1 / (r + 1)^0.5`: `1.4` at `M=2048`
+/// starves 86% of experts to `<= 32` rows (median 6) while keeping the top
+/// experts L2-resident, inverting `BM=64, INT8=1` vs `BM=32, INT8=0`.
 pub(crate) fn routes(rows: u64, shape: RoutedShape) -> Vec<i32> {
     let experts = shape.experts as usize;
     let stride = [101, 103, 107]
         .into_iter()
         .find(|prime| experts % prime != 0)
         .expect("an expert count is a multiple of none of 101, 103 and 107");
+    let exponent = if rows <= VERIFY_ROWS { 1.4 } else { 0.5 };
     let popularity = (0..experts)
-        .map(|rank| 1.0 / ((rank + 1) as f64).powf(1.4))
+        .map(|rank| 1.0 / ((rank + 1) as f64).powf(exponent))
         .collect::<Vec<_>>();
     let total = popularity.iter().sum::<f64>();
     let mut state = 0x9e37_79b9_7f4a_7c15_u64;

@@ -769,15 +769,14 @@ impl Unpriced {
         }
     }
 
-    /// What work of `stage` of a unit of `kind` quoted `quote` is expected
-    /// to take.
+    /// What non-compile work of `stage` of a unit of `kind` quoted `quote` is
+    /// expected to take.
     fn expected(
         &self,
         stage: Stage,
         kind: &'static str,
         quote: &Quote,
         longest: Duration,
-        compiled: Duration,
     ) -> Duration {
         match self
             .classes
@@ -787,43 +786,68 @@ impl Unpriced {
             Some(price) => quote
                 .priced
                 .saturating_add(Duration::from_secs_f64(price * quote.unpriced as f64)),
-            None => forecast(
-                quote,
-                match stage {
-                    Stage::Form => longest.max(compiled),
-                    Stage::Discovery | Stage::Measure | Stage::Promote | Stage::Confirm => longest,
-                },
-            ),
+            None => forecast(quote, longest),
         }
     }
 
-    /// What work of `stage` of a unit of `kind` quoted `quote` is admitted
-    /// at ([`seismic::Quote::fits`]): a candidate's unpriced operations at
-    /// the bound, and discovery's at the price they are ranked at.
-    ///
-    /// Discovery is every unit's first work and its only way into the
-    /// objective: a unit refused it leaves the objective with its share of
-    /// the workload. A unit prices its later points from its own earlier
-    /// ones; what it leaves unpriced, its first point and the planning
-    /// after its last, is held to what discovery has taken in this load,
-    /// not to the longest operation any unit completed, which is one
-    /// unit's input build, nor to `census`'s compile duration. Its pieces
-    /// form nothing, each runs to its cutoff ([`Unit::perform`]), and all
-    /// of them precede candidate work, whose pieces run where the budget
-    /// ends and stay held to the bound.
-    fn admitted(
+    /// Split `work`'s quote into its compile part (`work.forming`) and its
+    /// non-compile (device) part so non-compile unpriced operations (witness,
+    /// planning, coverage) are bounded by `longest` rather than `compiled`.
+    fn split_work(work: &Work) -> (Quote, Quote) {
+        let non_compile = Quote {
+            priced: work.quote.priced.saturating_sub(work.forming.priced),
+            unpriced: work.quote.unpriced.saturating_sub(work.forming.unpriced),
+        };
+        (work.forming, non_compile)
+    }
+
+    /// What `work` of a unit of `kind` is expected to take when ranked.
+    fn expected_work(
         &self,
-        stage: Stage,
+        work: &Work,
         kind: &'static str,
-        quote: &Quote,
         longest: Duration,
         compiled: Duration,
     ) -> Duration {
-        match stage {
-            Stage::Discovery => self.expected(stage, kind, quote, longest, compiled),
-            Stage::Form => forecast(quote, longest.max(compiled)),
-            Stage::Measure | Stage::Promote | Stage::Confirm => forecast(quote, longest),
-        }
+        let (forming, device) = Self::split_work(work);
+        let compile = forecast(&forming, longest.max(compiled));
+        let rest = self.expected(work.stage, kind, &device, longest);
+        compile.saturating_add(rest)
+    }
+
+    /// What `work` of a unit of `kind` is admitted at ([`seismic::Quote::fits`]):
+    /// returns `(compile, device)`. Compile unpriced operations are bounded by
+    /// `longest.max(compiled)`, while non-compile unpriced operations are
+    /// bounded by `longest` (and discovery's at what discovery has taken in
+    /// this load).
+    fn admitted_work(
+        &self,
+        work: &Work,
+        kind: &'static str,
+        longest: Duration,
+        compiled: Duration,
+    ) -> (Duration, Duration) {
+        let (forming, device) = Self::split_work(work);
+        let compile = forecast(&forming, longest.max(compiled));
+        let rest = match work.stage {
+            Stage::Discovery => self.expected(work.stage, kind, &device, longest),
+            Stage::Form | Stage::Measure | Stage::Promote | Stage::Confirm => {
+                forecast(&device, longest)
+            }
+        };
+        (compile, rest)
+    }
+
+    /// Total admitted duration of `work` (`compile + device`).
+    fn admitted(
+        &self,
+        work: &Work,
+        kind: &'static str,
+        longest: Duration,
+        compiled: Duration,
+    ) -> Duration {
+        let (compile, device) = self.admitted_work(work, kind, longest, compiled);
+        compile.saturating_add(device)
     }
 
     /// Work of `stage` of a unit of `kind` quoted `quote` took `took`, its
@@ -992,6 +1016,13 @@ pub(crate) fn allocate<U: Unit>(
     // allocator's other classes.
     let mut opened = None::<Duration>;
     let mut apart = Duration::ZERO;
+    // Worst observed ratio `actual / priced` for priced compiles >= 250 ms,
+    // and worst additive excess `actual - priced` for sub-250 ms cache hits.
+    // Separating the two prevents OS scheduling jitter on a 10 ms cache hit
+    // (e.g. 170 ms / 10 ms = 17x) from inflating multi-second compiles, while
+    // still bounding true compile overruns proportionally to their forecast.
+    let mut compile_overrun = 1.0_f64;
+    let mut compile_excess = Duration::ZERO;
     let began = clock.now();
     report.ending.began = began;
     // Cap baseline discovery to 1/3 of the optional search budget so large
@@ -1017,7 +1048,14 @@ pub(crate) fn allocate<U: Unit>(
         }
         let landed = ended.into_iter().try_for_each(|ended| {
             compiled = compiled.max(ended.2);
-            land(units, context, &mut flights, ended)
+            land(
+                units,
+                context,
+                &mut flights,
+                &mut compile_overrun,
+                &mut compile_excess,
+                ended,
+            )
         });
         if let Err(failure) = landed {
             break Err(failure);
@@ -1160,9 +1198,8 @@ pub(crate) fn allocate<U: Unit>(
                     && offers.iter().any(|(offering, work)| {
                         *offering == unit
                             && expected.admitted(
-                                work.stage,
+                                work,
                                 units[unit].kind(),
-                                &work.quote,
                                 longest,
                                 compiled,
                             ) <= remaining.saturating_sub(owed[unit])
@@ -1231,36 +1268,37 @@ pub(crate) fn allocate<U: Unit>(
         // When a new piece would be ready for the device were it started
         // now, and the device time it takes.
         let job = |unit: usize, work: &Work| {
-            let whole = expected.admitted(
-                work.stage,
-                units[unit].kind(),
-                &work.quote,
-                longest,
-                compiled,
-            );
+            let (compile, device) =
+                expected.admitted_work(work, units[unit].kind(), longest, compiled);
             if ahead(work) {
-                let compile = forecast(&work.forming, longest.max(compiled));
-                (now.saturating_add(compile), whole.saturating_sub(compile))
+                (now.saturating_add(compile), device)
             } else {
-                (now, whole)
+                (now, compile.saturating_add(device))
             }
         };
         // A compile cannot be interrupted, and abandoned at the ending it is
-        // waited for. So beside its forecast it is held to end within the
-        // budget at the most a compile has taken as far as the load has
-        // seen: the longest that has ended.
+        // waited for. Priced compiles are bounded proportionally by the worst
+        // observed compile overrun ratio (`compile_overrun`); unpriced compiles
+        // are bounded by the longest compile observed (`compiled`).
+        let compile_bound = |work: &Work| {
+            if work.forming.unpriced > 0 {
+                forecast(&work.forming, longest.max(compiled)).max(compiled)
+            } else {
+                let scaled = Duration::try_from_secs_f64(
+                    work.forming.priced.as_secs_f64() * compile_overrun,
+                )
+                .unwrap_or(Duration::MAX);
+                scaled.max(work.forming.priced.saturating_add(compile_excess))
+            }
+        };
         // The one admission rule over the whole queue: everything admitted,
         // the new piece in its place among it, and what is owed after end
-        // within the budget; and a piece's compile, at the most a compile
-        // has taken, ends within it.
+        // within the budget; and a piece's compile ends within it.
         let fits = |unit: usize, work: &Work| {
             let mut jobs = queue.clone();
             jobs.push(job(unit, work));
             device_ends(now, jobs).saturating_add(owed[unit]) <= total
-                && (!ahead(work)
-                    || now
-                        .saturating_add(forecast(&work.forming, longest.max(compiled)).max(compiled))
-                        <= total)
+                && (!ahead(work) || now.saturating_add(compile_bound(work)) <= total)
         };
         let (fitting, refused): (Vec<_>, Vec<_>) = offers
             .iter()
@@ -1303,10 +1341,9 @@ pub(crate) fn allocate<U: Unit>(
             .filter(|(unit, _)| !alone[*unit])
             .collect::<Vec<_>>();
         let priority = |(unit, work): &(usize, Work)| {
-            let price = expected.expected(
-                work.stage,
+            let price = expected.expected_work(
+                work,
                 units[*unit].kind(),
-                &work.quote,
                 longest,
                 compiled,
             );
@@ -1569,20 +1606,18 @@ pub(crate) fn allocate<U: Unit>(
             (Some((unit, work, forming)), _, _) => {
                 start(units, unit, &work);
                 workers.start(unit, forming);
-                let whole = expected.admitted(
-                    work.stage,
+                let (compile, device) = expected.admitted_work(
+                    &work,
                     units[unit].kind(),
-                    &work.quote,
                     longest,
                     compiled,
                 );
-                let compile = forecast(&work.forming, longest.max(compiled));
                 flights.push(Flight {
                     unit,
                     work,
                     began: now,
                     forming_ends: now.saturating_add(compile),
-                    device: whole.saturating_sub(compile),
+                    device,
                     formed: None,
                     compile_host,
                     unpriced,
@@ -1677,7 +1712,14 @@ pub(crate) fn allocate<U: Unit>(
                 crowded.fill(false);
                 alone.fill(false);
                 compiled = compiled.max(ended.2);
-                match land(units, context, &mut flights, ended) {
+                match land(
+                    units,
+                    context,
+                    &mut flights,
+                    &mut compile_overrun,
+                    &mut compile_excess,
+                    ended,
+                ) {
                     Ok(()) => continue,
                     Err(failure) => break Err(failure),
                 }
@@ -1808,18 +1850,34 @@ fn refuse<U: Unit>(
 
 /// `unit`'s compile ended: the unit holds what it formed, and its piece
 /// awaits the device.
+/// Minimum priced compile duration that updates the multiplicative
+/// `compile_overrun` ratio; shorter priced durations (e.g. 10 ms artifact
+/// cache hits) update the additive `compile_excess` instead so OS jitter on a
+/// cache hit does not inflate multi-second compiles.
+const COMPILE_RATIO_FLOOR: Duration = Duration::from_millis(250);
+
 fn land<U: Unit>(
     units: &mut [U],
     context: &mut U::Context,
     flights: &mut [Flight],
+    compile_overrun: &mut f64,
+    compile_excess: &mut Duration,
     (unit, formed, took): (usize, U::Formed, Duration),
 ) -> Result<(), U::Failure> {
     // The compile ended whether or not its unit can hold what it formed.
-    flights
+    let flight = flights
         .iter_mut()
         .find(|flight| flight.unit == unit)
-        .expect("a compile that ended was started")
-        .formed = Some(took);
+        .expect("a compile that ended was started");
+    flight.formed = Some(took);
+    if flight.work.forming.unpriced == 0 {
+        let priced = flight.work.forming.priced;
+        if priced >= COMPILE_RATIO_FLOOR {
+            *compile_overrun = compile_overrun.max(took.as_secs_f64() / priced.as_secs_f64());
+        } else {
+            *compile_excess = (*compile_excess).max(took.saturating_sub(priced));
+        }
+    }
     units[unit].formed(formed, took, context)
 }
 
@@ -3350,6 +3408,7 @@ mod tests {
         assert_eq!(report.overrun(), Duration::ZERO);
     }
 
+
     /// No candidate receives an objective built from incomplete baseline
     /// measurements. Unknown units share discovery effort in stable order.
     #[test]
@@ -3534,6 +3593,7 @@ mod tests {
         assert_eq!(report.overrun(), Duration::ZERO);
     }
 
+
     /// A slow NVRTC/canonical compile from mandatory `census` (`compiled`)
     /// does not seed non-compile operations (`own.pass`, `Stage::Discovery`)
     /// on pass 0: discovery still starts with only 10 s of budget even when
@@ -3570,6 +3630,7 @@ mod tests {
         assert_eq!(report.overrun(), Duration::ZERO);
     }
 
+
     /// Unpriced operations are ranked at the bound until their stage has
     /// run one, then at what that stage's took past their priced part.
     #[test]
@@ -3580,7 +3641,7 @@ mod tests {
             unpriced: 2,
         };
         assert_eq!(
-            expected.expected(Stage::Discovery, "a", &quote, SECOND * 10, Duration::ZERO),
+            expected.expected(Stage::Discovery, "a", &quote, SECOND * 10),
             SECOND / 2 + SECOND * 20
         );
         let one = Quote {
@@ -3590,25 +3651,138 @@ mod tests {
         expected.observe(Stage::Discovery, "a", &one, SECOND * 3 / 2);
         // Discovery of any kind of unit is priced alike.
         assert_eq!(
-            expected.expected(Stage::Discovery, "b", &quote, SECOND * 10, Duration::ZERO),
+            expected.expected(Stage::Discovery, "b", &quote, SECOND * 10),
             SECOND / 2 + SECOND * 2
         );
         // Another stage is still at the bound.
         assert_eq!(
-            expected.expected(Stage::Form, "a", &quote, SECOND * 10, Duration::ZERO),
+            expected.expected(Stage::Form, "a", &quote, SECOND * 10),
             SECOND / 2 + SECOND * 20
         );
         // A conversion is priced by those of its kind alone.
         expected.observe(Stage::Promote, "a", &one, SECOND * 3 / 2);
         assert_eq!(
-            expected.expected(Stage::Promote, "a", &quote, SECOND * 10, Duration::ZERO),
+            expected.expected(Stage::Promote, "a", &quote, SECOND * 10),
             SECOND / 2 + SECOND * 2
         );
         assert_eq!(
-            expected.expected(Stage::Promote, "b", &quote, SECOND * 10, Duration::ZERO),
+            expected.expected(Stage::Promote, "b", &quote, SECOND * 10),
             SECOND / 2 + SECOND * 20
         );
     }
+
+    /// Non-compile unpriced operations in `Stage::Form` (witnessing, planning)
+    /// are bounded by `longest`, not by `compiled`, when `work.forming` is
+    /// already priced. Only unpriced operations inside `work.forming` use
+    /// `compiled`.
+    #[test]
+    fn form_non_compile_unpriced_ops_are_bounded_by_longest_not_compiled() {
+        let expected = Unpriced::default();
+        let priced_compile = Work {
+            stage: Stage::Form,
+            quote: Quote {
+                priced: SECOND,
+                unpriced: 2,
+            },
+            forming: Quote {
+                priced: SECOND,
+                unpriced: 0,
+            },
+            opportunity: 1.0,
+            footprint: seismic::Footprint::default(),
+        };
+        assert_eq!(
+            expected.admitted_work(&priced_compile, "a", SECOND / 2, SECOND * 12),
+            (SECOND, SECOND),
+            "2 non-compile unpriced ops must use longest (0.5 s), not compiled (12 s)"
+        );
+        let unpriced_compile = Work {
+            stage: Stage::Form,
+            quote: Quote {
+                priced: Duration::ZERO,
+                unpriced: 3,
+            },
+            forming: Quote {
+                priced: Duration::ZERO,
+                unpriced: 1,
+            },
+            opportunity: 1.0,
+            footprint: seismic::Footprint::default(),
+        };
+        assert_eq!(
+            expected.admitted_work(&unpriced_compile, "a", SECOND / 2, SECOND * 12),
+            (SECOND * 12, SECOND),
+            "1 compile unpriced op uses compiled (12 s) while 2 non-compile ops use longest (0.5 s)"
+        );
+    }
+
+    /// A slow unrelated `census` compile (`compiled = 12 s`) does not lock out
+    /// a unit whose own compile is priced at `1 s` when `5 s` remain in the
+    /// budget; only an observed compile overrun scales priced compiles.
+    #[test]
+    fn slow_census_compile_does_not_lock_out_short_priced_compiles() {
+        let clock = Fake::default();
+        let mut units = vec![Synthetic {
+            discovery: SECOND / 5,
+            compile: SECOND,
+            measurement: SECOND / 2,
+            ..Synthetic::new(0, &clock, 1., &[0.5])
+        }];
+        let mut log = Log::default();
+        let (report, outcome) = allocate(
+            &mut units,
+            &mut log,
+            &clock,
+            &mut Overlapping::new(&clock, usize::MAX),
+            SECOND * 5,
+            Duration::ZERO,
+            SECOND * 12,
+        );
+        outcome.expect("no synthetic work fails");
+        let log = log.into_inner();
+        assert_eq!(
+            stages(&log),
+            [
+                (0, Stage::Discovery),
+                (0, Stage::Measure),
+                (0, Stage::Promote),
+            ],
+            "a 1 s priced compile must still start and promote within a 5 s budget despite a 12 s census compile"
+        );
+        assert_eq!(report.overrun(), Duration::ZERO);
+    }
+
+    /// Jitter on a sub-250 ms artifact cache hit (e.g. 10 ms priced taking
+    /// 170 ms) updates additive `compile_excess` rather than multiplicative
+    /// `compile_overrun`, so subsequent multi-second compiles are not locked
+    /// out by a 17x inflation factor.
+    #[test]
+    fn short_cache_hit_jitter_does_not_inflate_long_compiles() {
+        let clock = Fake::default();
+        let mut units = vec![
+            Synthetic {
+                discovery: Duration::from_millis(100),
+                compile: Duration::from_millis(10),
+                compile_slow: 17.0, // 170 ms actual on a 10 ms cache hit
+                measurement: Duration::from_millis(100),
+                ..Synthetic::new(0, &clock, 0.6, &[1.0])
+            },
+            Synthetic {
+                discovery: Duration::from_millis(100),
+                compile: SECOND * 2,
+                measurement: Duration::from_millis(100),
+                ..Synthetic::new(1, &clock, 0.4, &[0.5])
+            },
+        ];
+        let (log, report) = run(&mut units, &clock, 6);
+        assert!(
+            log.iter()
+                .any(|(unit, stage, _)| *unit == 1 && *stage == Stage::Measure),
+            "unit 1's 2 s compile must still fit in the remaining ~5.5 s budget after unit 0's 10 ms->170 ms cache-hit jitter: {log:?}"
+        );
+        assert_eq!(report.overrun(), Duration::ZERO);
+    }
+
 
     /// Run `units` under `ceiling` bytes and return what they held at most.
     fn bounded(

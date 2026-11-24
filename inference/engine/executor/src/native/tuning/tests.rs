@@ -3838,6 +3838,37 @@ fn routes_share_hot_experts_across_multi_row_decode() {
     );
 }
 
+/// Grouped prefill routes (`M=2048, E=512, K=10`) use moderate skew (`1 / (r + 1)^0.5`)
+/// so the median expert carries realistic tile occupancy rather than starving 86% of
+/// experts to <=32 rows (median 6 under `1.4`).
+#[test]
+fn routes_spread_load_across_grouped_prefill() {
+    let (rows, selected, experts) = (2048, 10, 512);
+    let shape = super::routed::RoutedShape {
+        hidden: 128,
+        experts,
+        selected,
+        features: 128,
+        shared: 0,
+    };
+    let table = super::routed::routes(rows, shape);
+    let mut counts = vec![0usize; experts as usize];
+    for &expert in &table {
+        counts[expert as usize] += 1;
+    }
+    counts.sort_unstable();
+    let median = counts[counts.len() / 2];
+    let max = *counts.last().unwrap();
+    assert!(
+        median >= 20,
+        "grouped prefill median rows/expert must not be starved (got median={median}, max={max})"
+    );
+    assert!(
+        max <= 600,
+        "grouped prefill hottest expert must not absorb nearly all tokens (got median={median}, max={max})"
+    );
+}
+
 /// A search of a streamed load forms and runs every streamed tuning case
 /// on the device, its all-defaults configuration included, over operands
 /// bound as a step binds them: the fused route (`routed_route_streamed`)
@@ -4418,4 +4449,39 @@ fn mandatory_census_longer_than_budget_still_searches() {
     assert_eq!(budget.overrun_seconds, 0.);
     assert!(budget.unused_seconds > 0. && budget.refused.is_empty());
     assert!((budget.used_seconds + budget.unused_seconds - budget.budget_seconds).abs() < 1e-9);
+}
+
+#[test]
+fn tuning_limits_rounds_non_power_of_two_context_up_to_covering_pass_row_class() {
+    let (mut definition, load) = fixture_load();
+    let limits = crate::ResourceLimits {
+        max_launch_rows: 512,
+        chain_capacity: std::num::NonZeroUsize::new(8).unwrap(),
+        ..crate::planning::fixtures::LIMITS
+    };
+
+    // A 4052-token context limit (e.g. 3975-token prompt + decode) with an
+    // 8-launch pass (4096 rows) must still cover `m4096` instead of flooring
+    // `grouped_pass_points` back to `m2048`.
+    definition.decoder.context_limit = 4052;
+    let tuning = TuningLimits::of(limits, &load, &definition);
+    assert_eq!(tuning.max_pass_rows, 4096);
+    assert!(
+        super::routed::grouped_pass_points(tuning)
+            .iter()
+            .any(|point| point.rows == 4096),
+        "m4096 must be present for a 4052-token context with 8x512 pass capacity"
+    );
+
+    // Exact power-of-two context limit stays at that class.
+    definition.decoder.context_limit = 2048;
+    assert_eq!(TuningLimits::of(limits, &load, &definition).max_pass_rows, 2048);
+
+    // Never exceeds pass_cap (4 * 512 = 2048) even when context_limit > 2048.
+    let four_places = crate::ResourceLimits {
+        chain_capacity: std::num::NonZeroUsize::new(4).unwrap(),
+        ..limits
+    };
+    definition.decoder.context_limit = 4052;
+    assert_eq!(TuningLimits::of(four_places, &load, &definition).max_pass_rows, 2048);
 }
