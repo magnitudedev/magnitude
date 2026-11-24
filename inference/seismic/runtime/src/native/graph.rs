@@ -7765,6 +7765,12 @@ impl NativeGraphCompletion {
     pub fn is_complete(&self) -> bool {
         self.submission.is_complete()
     }
+    /// Whether encoding failed partway through issuing this sequence (so
+    /// trailing runs were never submitted and [`Self::wait`] will wait for the
+    /// committed prefix and return that error).
+    pub fn has_issue_failure(&self) -> bool {
+        self.submission.has_issue_failure()
+    }
     /// Wait for the run and report its outcome.
     pub fn wait(self) -> Result<(), CallError> {
         self.submission.wait()

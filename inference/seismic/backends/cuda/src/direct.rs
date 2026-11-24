@@ -1272,12 +1272,18 @@ impl DirectBatch {
         self.end()
     }
 
-    /// End a batch that failed: the work it issued runs on, and the
-    /// returned submission completes behind it, or, where its end event
-    /// could not be recorded, the error ([`Self::end`]).
-    pub fn abandon(mut self) -> Result<DirectSubmission, ExecutionError> {
+    /// End a batch that failed: if any work was issued (`self.started`), it
+    /// runs on and the returned `Some(submission)` completes behind it (or
+    /// returns the fencing error via [`Self::end`]); if nothing was issued yet,
+    /// returns `Ok(None)` so the caller reports an uncommitted failure at once
+    /// instead of hiding it behind a deferred completion.
+    pub fn abandon(mut self) -> Result<Option<DirectSubmission>, ExecutionError> {
+        if !self.started {
+            self.fence.disarm();
+            return Ok(None);
+        }
         self.marks = None;
-        self.end()
+        self.end().map(Some)
     }
 
     /// The submission an end event recorded behind every issued launch
@@ -1569,7 +1575,8 @@ extern "C" __global__ void mark(unsigned int* out, Words words, unsigned int* sc
         assert!(batch.launch(&launch(0, too_many)).is_err());
         let submission = batch
             .abandon()
-            .expect("the launches issued before the failure are fenced");
+            .expect("the launches issued before the failure are fenced")
+            .expect("two launches were issued before the failure");
         submission.finish().unwrap();
         // SAFETY: the launches writing `out` have completed.
         let written = unsafe { [host.as_ptr().read_volatile(), host.as_ptr().add(1).read_volatile()] };

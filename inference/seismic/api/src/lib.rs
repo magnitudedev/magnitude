@@ -4855,6 +4855,9 @@ impl NativeGraphCompletion {
     pub fn is_complete(&self) -> bool {
         self.inner.is_complete()
     }
+    pub fn has_issue_failure(&self) -> bool {
+        self.inner.has_issue_failure()
+    }
     pub fn wait(self) -> Result<(), CallError> {
         self.inner.wait()
     }

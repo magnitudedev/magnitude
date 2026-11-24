@@ -649,6 +649,11 @@ impl<'p> StepSubmitter<'p> {
         let sequence = std::mem::replace(&mut self.sequence, self.device.native_sequence(NativeQueue::Compute));
         if !sequence.is_empty() {
             match sequence.submit() {
+                Ok(completion) if completion.has_issue_failure() => {
+                    tracked.quarantine();
+                    self.wait_completion(Some(completion))?;
+                    unreachable!("a completion with an issue failure must return Err from wait()");
+                }
                 Ok(completion) => {
                     tracked.submitted = true;
                     tracked.bank.track_pass_completion(tracked.key, completion);
@@ -672,11 +677,20 @@ impl<'p> StepSubmitter<'p> {
     /// run about to be queued stay pending. A submission is a boundary of
     /// the chain's release: every pass queued is submitted.
     fn flush(&mut self) -> Result<(), SubmitError> {
-        let completions = &mut self.completions;
         let sequence = std::mem::replace(&mut self.sequence, self.device.native_sequence(NativeQueue::Compute));
         self.queued = 0;
         if !sequence.is_empty() {
-            completions.push(sequence.submit().map_err(device)?);
+            let completion = sequence.submit().map_err(device)?;
+            if completion.has_issue_failure() {
+                // Encoding failed partway through this sequence (so trailing
+                // graphs such as `Front`'s `routed_scratch_request` were never
+                // issued). Drain the committed prefix and propagate the error
+                // immediately instead of letting later passes block forever on
+                // unissued work.
+                self.wait_completion(Some(completion))?;
+                unreachable!("a completion with an issue failure must return Err from wait()");
+            }
+            self.completions.push(completion);
             self.finish_flush();
         } else {
             (self.queued_reads, self.queued_landed) = (0, 0);

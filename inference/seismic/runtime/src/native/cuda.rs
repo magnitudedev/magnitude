@@ -152,7 +152,7 @@ pub(super) fn encode(
         Err(error) => Err(match batch.abandon() {
             Ok(fenced) => EncodeFailure {
                 error,
-                committed: Some(Committed::Cuda(fenced)),
+                committed: fenced.map(Committed::Cuda),
             },
             // The stream was waited for, or the context lets nothing more
             // run: nothing issued runs on.
@@ -260,7 +260,7 @@ pub(super) fn encode_fill_copies(
         if let Err(error) = issued {
             let error = CallError::Execution(error);
             return Err(match batch.abandon() {
-                Ok(fenced) => EncodeFailure { error, committed: Some(Committed::Cuda(fenced)) },
+                Ok(fenced) => EncodeFailure { error, committed: fenced.map(Committed::Cuda) },
                 Err(fence) => EncodeFailure::uncommitted(CallError::Unfenced { issue: Box::new(error), fence }),
             });
         }

@@ -3614,6 +3614,13 @@ impl NativeSubmission {
         }
     }
 
+    /// Whether encoding failed partway through issuing this submission, so
+    /// trailing work was never submitted and [`Self::wait`] will wait for the
+    /// committed prefix and return the issue error.
+    pub(crate) fn has_issue_failure(&self) -> bool {
+        matches!(&*self.route, RouteSubmission::Failed(_))
+    }
+
     /// Wait for completion and report the work's outcome.
     pub(crate) fn wait(&self) -> Result<(), CallError> {
         self.route.finish()?;
