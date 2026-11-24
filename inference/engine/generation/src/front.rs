@@ -48,23 +48,31 @@ struct DevicePending {
 pub(crate) struct FrontState {
     /// Head rows entered: the next entry row's position.
     position: usize,
+    /// Target rows whose pairs the head never entered (depth-0 plain passes
+    /// that skipped chaining into the head). Its history continues contiguously
+    /// at `position` from the next pair it is given.
+    skipped: usize,
     /// Where its history ends: level with the target's rows once it entered
     /// their successor, on the device behind a selecting step or on the
     /// host by a head transaction; trailing them by the pairs a verify
-    /// pass accepted, or history the device did not enter.
+    /// pass accepted, or history the device did not enter; or empty after
+    /// skipped depth-0 plain passes.
     tail: DraftTail,
     /// On-device pending pairs from a verify pass (`PassForm::Verify`), kept
     /// off the host until consumed by the next round's `Operation::Head`.
     pending_device: Option<DevicePending>,
     /// The in-flight round work, if any: a target pass started from the
-    /// level head, or a host head transaction entering pairs.
+    /// level/skipped head, or a host head transaction entering pairs.
     round: FrontRound,
 }
 
 /// The form of a pass ([`FrontState::front`]).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum PassForm {
-    /// Front rows, the head entering its selection behind it on the device.
+    /// Depth-0 plain pass: enters nothing into the head, publishes no features.
+    Plain,
+    /// Front rows (`depth >= 1`), the head entering its selection behind it on
+    /// the device.
     Front,
     /// Acceptable rows, entering nothing behind it.
     Verify,
@@ -76,9 +84,9 @@ enum PassForm {
 enum FrontRound {
     /// No pass or host head transaction is in flight.
     Idle,
-    /// A target pass started from the level head, until it is observed
+    /// A target pass started on `anchor`, until it is observed
     /// (or superseded / checkpointed after abandonment).
-    Pass(PassForm),
+    Pass { form: PassForm, anchor: TokenId },
     /// A host head transaction entering pairs, until it reconciles.
     Head(HeadTransaction),
 }
@@ -89,6 +97,7 @@ impl FrontState {
             None => {
                 return Ok(Self {
                     position: 0,
+                    skipped: 0,
                     tail: DraftTail::EMPTY,
                     pending_device: None,
                     round: FrontRound::Idle,
@@ -97,11 +106,9 @@ impl FrontState {
             Some(MethodCheckpoint::Mtp(state)) => state,
             Some(_) => return Err("another method's checkpoint cannot restore MTP state".into()),
         };
-        if state.skipped != 0 {
-            return Err("a head decoding in front passes omits no target row".into());
-        }
         Ok(Self {
             position: state.position,
+            skipped: state.skipped,
             tail: state.tail.clone(),
             pending_device: None,
             round: FrontRound::Idle,
@@ -193,7 +200,7 @@ impl MethodState for FrontState {
     ) -> Result<MethodEffects, String> {
         match self.round {
             FrontRound::Idle => {}
-            FrontRound::Pass(_) => return Err("MTP cannot prime while a pass is in flight".into()),
+            FrontRound::Pass { .. } => return Err("MTP cannot prime while a pass is in flight".into()),
             FrontRound::Head(_) => return Err("MTP already has an unresolved head transaction".into()),
         }
         let features = features.ok_or("MTP priming requires the chunk's target features")?;
@@ -275,6 +282,7 @@ impl MethodState for FrontState {
                 open: Some(OpenFeature::Host(last)),
             },
         };
+        let draft_from = draft_from.saturating_sub(self.skipped);
         match pending {
             Some(pairs) => self.enter(request, pairs, HeadPhase::Priming { draft_from }, &[]),
             None => Ok(MethodEffects::default()),
@@ -300,10 +308,38 @@ impl MethodState for FrontState {
         selects: &[SelectSpec],
     ) -> Result<FrontEntry, String> {
         match self.round {
-            // An abandoned target pass leaves Pass(_) without mutating position
+            // An abandoned target pass leaves Pass { .. } without mutating position
             // or tail; starting a new round supersedes it.
-            FrontRound::Idle | FrontRound::Pass(_) => {}
+            FrontRound::Idle | FrontRound::Pass { .. } => {}
             FrontRound::Head(_) => return Err("MTP already has an unresolved head transaction".into()),
+        }
+        // Launch-wide depth-0 plain pass: zero guesses will be consumed, so skip
+        // launching the head chain (and any pending catch-up) behind this pass.
+        // State mutations happen in `observe` so an abandoned pass stays checkpointable.
+        if matches!(grant, FrontGrant::Plain) {
+            if let Some(device) = &self.pending_device {
+                if device.tokens.last() != Some(&pending) {
+                    return Err("MTP trails a decode with no pair of its pending token to enter".into());
+                }
+            } else {
+                match &self.tail {
+                    DraftTail::Entered(token) if *token != pending => {
+                        return Err("MTP entered another successor than the pending token".into());
+                    }
+                    DraftTail::Trailing {
+                        pending: Some(pairs),
+                        open: None,
+                    } if pairs.tokens.last() != Some(&pending) => {
+                        return Err("MTP trails a decode with no pair of its pending token to enter".into());
+                    }
+                    _ => {}
+                }
+            }
+            self.round = FrontRound::Pass {
+                form: PassForm::Plain,
+                anchor: pending,
+            };
+            return Ok(FrontEntry::Plain);
         }
         if let Some(device) = self.pending_device.take() {
             if device.tokens.last() != Some(&pending) {
@@ -318,18 +354,38 @@ impl MethodState for FrontState {
         match &self.tail {
             DraftTail::Entered(token) if *token == pending => {
                 let (form, entry) = match grant {
+                    FrontGrant::Plain => unreachable!("handled above"),
                     FrontGrant::UpTo(_) | FrontGrant::Exactly(_) => (
                         PassForm::Front,
                         FrontEntry::Chain(ChainEntry {
                             position: self.position,
                         }),
                     ),
-                    FrontGrant::Verify(_) => (PassForm::Verify, FrontEntry::Verify),
+                    FrontGrant::Verify(_) | FrontGrant::Mixed { .. } => (PassForm::Verify, FrontEntry::Verify),
                 };
-                self.round = FrontRound::Pass(form);
+                self.round = FrontRound::Pass { form, anchor: pending };
                 return Ok(entry);
             }
             DraftTail::Entered(_) => return Err("MTP entered another successor than the pending token".into()),
+            // Re-entering drafting/verifying after skipped depth-0 plain passes:
+            // no pending pairs exist, so re-anchor from the next target pass.
+            DraftTail::Trailing {
+                pending: None,
+                open: None,
+            } if self.skipped > 0 => {
+                let (form, entry) = match grant {
+                    FrontGrant::Plain => unreachable!("handled above"),
+                    FrontGrant::UpTo(_) | FrontGrant::Exactly(_) => (
+                        PassForm::Front,
+                        FrontEntry::Chain(ChainEntry {
+                            position: self.position,
+                        }),
+                    ),
+                    FrontGrant::Verify(_) | FrontGrant::Mixed { .. } => (PassForm::Verify, FrontEntry::Verify),
+                };
+                self.round = FrontRound::Pass { form, anchor: pending };
+                return Ok(entry);
+            }
             DraftTail::Trailing { .. } => {}
         }
         let DraftTail::Trailing { pending: pairs, open } =
@@ -349,37 +405,52 @@ impl MethodState for FrontState {
     }
 
     fn trails(&self) -> bool {
-        self.pending_device.is_some() || matches!(self.tail, DraftTail::Trailing { .. })
+        self.pending_device.is_some()
+            || matches!(
+                self.tail,
+                DraftTail::Trailing { pending: Some(_), .. }
+                    | DraftTail::Trailing { open: Some(_), .. }
+            )
     }
 
-    /// A pass committed from the token the head entered. A front pass
-    /// committed its exact row alone, and its head launch entered the
-    /// pass's selection with the exact row's feature on the device: the
-    /// head moves one row. A verify pass committed its exact row and the
-    /// guesses that stood: each committed row's feature selected the token
-    /// after it (the next accepted input, or the pass's successor after the
-    /// last), and those pairs trail the head until the next round enters
-    /// them.
+    /// A pass committed from the token the head entered. A plain depth-0 pass
+    /// skipped head entry (`skipped` advances). A front pass committed its
+    /// exact row alone, and its head launch entered the pass's selection with
+    /// the exact row's feature on the device: the head moves one row. A verify
+    /// pass committed its exact row and the guesses that stood: each committed
+    /// row's feature selected the token after it (the next accepted input, or
+    /// the pass's successor after the last), and those pairs trail the head
+    /// until the next round enters them.
     fn observe(
         &mut self,
         _: RequestId,
         verification: Verification<'_>,
         reader: &mut dyn FeatureReader,
     ) -> Result<MethodEffects, String> {
-        let form = match self.round {
-            FrontRound::Pass(form) => form,
+        let (form, anchor) = match self.round {
+            FrontRound::Pass { form, anchor } => (form, anchor),
             FrontRound::Head(_) => return Err("MTP already has an unresolved head transaction".into()),
             FrontRound::Idle => return Err("MTP observes no pass it started".into()),
         };
         let accepted = verification.accepted;
-        match self.tail {
-            DraftTail::Entered(token)
-                if verification.inputs.first() == Some(&token)
-                    && accepted >= 1
-                    && accepted <= verification.inputs.len() => {}
-            _ => return Err("a pass commits from the token MTP entered".into()),
+        if verification.inputs.first() != Some(&anchor)
+            || accepted < 1
+            || accepted > verification.inputs.len()
+        {
+            return Err("a pass commits from the token MTP entered".into());
         }
         match form {
+            PassForm::Plain => {
+                if accepted != 1 || verification.inputs.len() != 1 {
+                    return Err("a plain pass commits its exact row alone".into());
+                }
+                let dropped_device = self.pending_device.take().map_or(0, |d| d.tokens.len());
+                let dropped_tail = std::mem::replace(&mut self.tail, DraftTail::EMPTY).rows();
+                self.skipped = self
+                    .skipped
+                    .checked_add(dropped_device + dropped_tail + 1)
+                    .ok_or("MTP skipped count exhausted")?;
+            }
             PassForm::Front => {
                 if accepted != 1 || verification.inputs.len() != 1 {
                     return Err("a front pass commits its exact row alone".into());
@@ -436,9 +507,9 @@ impl MethodState for FrontState {
     /// exported open and each restored request enters its own successor.
     fn checkpoint(&self) -> Result<MethodCheckpoint, MethodCheckpointError> {
         match self.round {
-            // An abandoned target pass leaves Pass(_) without mutating position
+            // An abandoned target pass leaves Pass { .. } without mutating position
             // or tail, so the head state is still resolved and checkpointable.
-            FrontRound::Idle | FrontRound::Pass(_) => {}
+            FrontRound::Idle | FrontRound::Pass { .. } => {}
             FrontRound::Head(_) => return Err(MethodCheckpointError::Unresolved),
         }
         let tail = if let Some(device) = &self.pending_device {
@@ -471,12 +542,13 @@ impl MethodState for FrontState {
         Ok(MethodCheckpoint::Mtp(DraftCheckpoint {
             position: self.position,
             tail,
-            skipped: 0,
+            skipped: self.skipped,
         }))
     }
 
     fn evict(&mut self) {
         self.position = 0;
+        self.skipped = 0;
         self.tail = DraftTail::EMPTY;
         self.pending_device = None;
         self.round = FrontRound::Idle;
@@ -531,6 +603,7 @@ mod tests {
         // Start entered at token 10, position 5.
         let mut state = FrontState {
             position: 5,
+            skipped: 0,
             tail: DraftTail::Entered(TokenId(10)),
             pending_device: None,
             round: FrontRound::Idle,
@@ -620,5 +693,144 @@ mod tests {
             .unwrap();
         assert_eq!(state.position, 11);
         assert!(!state.trails());
+    }
+
+    /// `FrontGrant::UpTo(0)` / `FrontGrant::Exactly(0)` skip launching the
+    /// head chain (`FrontEntry::Plain`), track `skipped` without advancing
+    /// `HeadHistory::Own` KV position, remain checkpointable across
+    /// abandonment/restore, and re-anchor contiguously at `self.position`
+    /// when transitioning back to `Front(k>=1)` or `Verify(k>=1)`.
+    #[test]
+    fn front_depth_zero_skips_head_chain_and_preserves_head_kv_continuity() {
+        let domain = ResourceDomainId::new("front-plain-test").unwrap();
+        let req = RequestId(1);
+        let mut reader = CountingReader { reads: 0, row_bytes: 4 };
+
+        // Start entered at token 10, position 5 (target_rows = 5).
+        let mut state = FrontState {
+            position: 5,
+            skipped: 0,
+            tail: DraftTail::Entered(TokenId(10)),
+            pending_device: None,
+            round: FrontRound::Idle,
+        };
+
+        // Depth-0 Plain grant returns Plain (no ChainEntry) and leaves state unmutated until observe.
+        let entry = state.front(req, TokenId(10), FrontGrant::Plain, &[]).unwrap();
+        assert_eq!(entry, FrontEntry::Plain);
+        // Abandoning before observe keeps checkpoint identical to pre-round state.
+        let MethodCheckpoint::Mtp(cp) = state.checkpoint().unwrap() else { panic!("mtp") };
+        assert_eq!((cp.position(), cp.target_rows()), (5, 5));
+
+        // Observe plain step: position stays 5, skipped becomes 1 (target_rows = 6), no features needed.
+        state
+            .observe(
+                req,
+                Verification {
+                    inputs: &[TokenId(10)],
+                    accepted: 1,
+                    next: TokenId(11),
+                    features: None,
+                },
+                &mut reader,
+            )
+            .unwrap();
+        assert_eq!((state.position, state.skipped), (5, 1));
+        assert!(!state.trails());
+        assert_eq!(state.priming_position(), Some(5));
+
+        // Second consecutive Plain step also returns Plain.
+        assert_eq!(
+            state.front(req, TokenId(11), FrontGrant::Plain, &[]).unwrap(),
+            FrontEntry::Plain
+        );
+        state
+            .observe(
+                req,
+                Verification {
+                    inputs: &[TokenId(11)],
+                    accepted: 1,
+                    next: TokenId(12),
+                    features: None,
+                },
+                &mut reader,
+            )
+            .unwrap();
+        assert_eq!((state.position, state.skipped), (5, 2));
+        let cp = state.checkpoint().unwrap();
+        let MethodCheckpoint::Mtp(draft_cp) = &cp else { panic!("mtp") };
+        assert_eq!((draft_cp.position(), draft_cp.target_rows()), (5, 7));
+
+        // Checkpoint restores cleanly with skipped preserved.
+        let mut restored = FrontState::restore(Some(&cp)).unwrap();
+        assert_eq!((restored.position, restored.skipped), (5, 2));
+
+        // Transitioning back to Front(2) re-anchors with ChainEntry at contiguous head position 5.
+        let chain_entry = restored
+            .front(req, TokenId(12), FrontGrant::UpTo(2), &[select(), select()])
+            .unwrap();
+        assert_eq!(chain_entry, FrontEntry::Chain(ChainEntry { position: 5 }));
+        restored
+            .observe(
+                req,
+                Verification {
+                    inputs: &[TokenId(12)],
+                    accepted: 1,
+                    next: TokenId(13),
+                    features: None,
+                },
+                &mut reader,
+            )
+            .unwrap();
+        assert_eq!((restored.position, restored.skipped), (6, 2));
+        let MethodCheckpoint::Mtp(after_front) = restored.checkpoint().unwrap() else { panic!("mtp") };
+        assert_eq!((after_front.position(), after_front.target_rows()), (6, 8));
+
+        // Transitioning back from Front(0) directly to Verify(3) re-anchors via Verify -> Head at contiguous position 5.
+        let verify_entry = state
+            .front(req, TokenId(12), FrontGrant::Verify(3), &[select(), select(), select()])
+            .unwrap();
+        assert_eq!(verify_entry, FrontEntry::Verify);
+        let logical = FeatureRef::logical(domain, 1, 1).unwrap();
+        state
+            .observe(
+                req,
+                Verification {
+                    inputs: &[TokenId(12)],
+                    accepted: 1,
+                    next: TokenId(13),
+                    features: Some(logical),
+                },
+                &mut reader,
+            )
+            .unwrap();
+        assert!(state.trails());
+        let FrontEntry::Pending(ops) = state
+            .front(req, TokenId(13), FrontGrant::Verify(3), &[select(), select(), select()])
+            .unwrap()
+        else {
+            panic!("expected pending head transaction after verify re-anchor");
+        };
+        let [op @ Operation::Head { tokens, position: 5, proposals, .. }] = ops.as_slice() else {
+            panic!("expected Head at contiguous position 5: {ops:?}");
+        };
+        assert_eq!(tokens, &[TokenId(13)]);
+        assert_eq!(proposals.len(), 3);
+        state
+            .reconcile(
+                op,
+                Outcome::Head {
+                    proposals: vec![
+                        Selected::Token(TokenId(14)),
+                        Selected::Token(TokenId(15)),
+                        Selected::Token(TokenId(16)),
+                    ],
+                    confidence: None,
+                },
+            )
+            .unwrap();
+        assert_eq!((state.position, state.skipped), (6, 2));
+        let MethodCheckpoint::Mtp(after_verify) = state.checkpoint().unwrap() else { panic!("mtp") };
+        assert_eq!((after_verify.position(), after_verify.target_rows()), (6, 8));
     }
 }

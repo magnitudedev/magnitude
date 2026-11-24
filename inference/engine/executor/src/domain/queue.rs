@@ -515,12 +515,30 @@ pub(super) fn continuation_of(operation: &Operation, publishes: bool, context: u
 }
 
 /// `operation`, a chained decode continuation, held to `depth` front rows
-/// (its exact row and its leading front rows).
+/// (its exact row and its leading front rows) within a chained launch.
 fn at_depth(operation: &Operation, depth: usize) -> Operation {
     let mut operation = operation.clone();
     if let Operation::Forward { tokens, front, .. } = &mut operation {
         front.truncate(depth);
         tokens.truncate(1 + front.len());
+    }
+    operation
+}
+
+/// `operation`, a decode continuation, stripped to a launch-wide depth-0 plain
+/// pass (`FrontGrant::Plain` / `FrontEntry::Plain`): zero front rows, no
+/// `chain`, and no `Demand::DEVICE_FEATURES` so `queued_front` launches no
+/// head and `claim_slots` matches the host's rebuilt plain operation.
+fn at_plain(operation: &Operation) -> Operation {
+    let mut operation = operation.clone();
+    if let Operation::Forward { tokens, front, chain, demand, .. } = &mut operation {
+        front.clear();
+        tokens.truncate(1);
+        *chain = None;
+        *demand = crate::batching::Demand::from_bits(
+            demand.bits() & !crate::batching::Demand::DEVICE_FEATURES.bits(),
+        )
+        .expect("clearing DEVICE_FEATURES preserves valid Demand bits");
     }
     operation
 }
@@ -1087,6 +1105,9 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
             None => 0,
         };
         let mut fronting = crate::two_row::fronted_requests(self.chained_rows(), requests, depth).min(reaching);
+        if depth == 0 || fronting == 0 {
+            return Ok(Some(operations.iter().map(at_plain).collect()));
+        }
         Ok(Some(operations
             .iter()
             .map(|operation| match operation.front_rows() > 0 && fronting > 0 {
@@ -1647,7 +1668,7 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
 
 #[cfg(test)]
 mod tests {
-    use super::{at_depth, batch_rows, claimed, continuation_of, continuations, continuing, fitting};
+    use super::{at_depth, at_plain, batch_rows, claimed, continuation_of, continuations, continuing, fitting};
 
     /// A queued step's state that does not fit until it provisions runs it
     /// unpipelined; any other refusal of the store is a fault.
@@ -1853,5 +1874,33 @@ mod tests {
         assert_eq!(claimed(&within, 0, &selected), Some(built), "the host's pass at depth 0 claims it");
         let deeper = pass(request, 8, 5, &[30, 31], crate::FrontKind::Host(crate::GuessKind::Chained));
         assert_ne!(claimed(&within, 0, &selected), Some(deeper), "a deeper pass would orphan it");
+    }
+
+    /// Finding #4b: when a launch-wide queued continuation drops to depth 0
+    /// (`FrontGrant::Plain` -> `FrontEntry::Plain`), `at_plain` strips `chain`
+    /// and `Demand::DEVICE_FEATURES` so the queued pass matches the host's
+    /// rebuilt plain operation instead of being orphaned on claim.
+    #[test]
+    fn front_to_plain_at_zero_depth_strips_chain_and_matches_plain_claim() {
+        let request = RequestId(3);
+        let ran = pass(request, 7, 4, &[1, 2, 3, 4], crate::FrontKind::Host(crate::GuessKind::Chained));
+        let next = continuation_of(&ran, false, 64).unwrap();
+        let plain = at_plain(&next);
+        assert_eq!((plain.front_rows(), plain.row_count(), plain.chain()), (0, 1, None));
+        let selected = selections(5, 30, &[Some(31), Some(32), None, None, None]);
+        let host_plain = Operation::Forward {
+            request,
+            kind: WorkKind::Decode,
+            tokens: vec![TokenId(30)],
+            position: 8,
+            conditioning: None,
+            demand: Demand::SELECT,
+            select: vec![spec(5)],
+            committed: 1,
+            prime: None,
+            front: Vec::new(),
+            chain: None,
+        };
+        assert_eq!(claimed(&plain, 0, &selected), Some(host_plain));
     }
 }

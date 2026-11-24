@@ -1,6 +1,6 @@
 use crate::{DraftOutlook, TimedLaunch};
 use magnitude_executor::{
-    ChainEntry, Demand, FeatureReader, FeatureRef, FeatureRows, FrontGrant, LaunchDuration, Operation, Outcome,
+    ChainEntry, Demand, FeatureReader, FeatureRef, FeatureRows, FrontGrant, Guess, LaunchDuration, Operation, Outcome,
     RequestId, SelectSpec, StreamedVerifyPrior, TokenId, WeakFeatureRef,
 };
 
@@ -178,7 +178,7 @@ impl DraftTail {
 
     /// Target rows past the head's entered ones it accounts for: each
     /// pending pair and the open feature.
-    fn rows(&self) -> usize {
+    pub(crate) fn rows(&self) -> usize {
         match self {
             Self::Trailing { pending, open } => {
                 pending.as_ref().map_or(0, |rows| rows.tokens.len()) + usize::from(open.is_some())
@@ -317,8 +317,20 @@ pub struct Verification<'a> {
 
 #[derive(Clone, Debug, PartialEq)]
 pub enum Propose {
-    Tokens(Vec<TokenId>),
+    Tokens {
+        acceptable: Vec<TokenId>,
+        front: Vec<Guess>,
+    },
     Pending(Vec<Operation>),
+}
+
+impl Propose {
+    pub fn empty() -> Self {
+        Self::Tokens {
+            acceptable: Vec::new(),
+            front: Vec::new(),
+        }
+    }
 }
 
 /// Executor work a method's state transition requires.
@@ -332,6 +344,9 @@ pub struct MethodEffects {
 /// head's history ends.
 #[derive(Clone, Debug, PartialEq)]
 pub enum FrontEntry {
+    /// Depth-0 plain pass: runs the exact row alone with no feature demand and
+    /// no head chain behind it, skipping the head for this step.
+    Plain,
     /// The head holds every pair up to the pass's pending token, and the
     /// grant is a front pass's: the pass enters its exact row's selection
     /// behind it on the device, from here.
@@ -465,6 +480,11 @@ pub trait MethodState {
     /// The drafted block this request's next target round verifies, when
     /// the method chooses how much of it to verify.
     fn outlook(&self) -> Option<DraftOutlook> {
+        None
+    }
+    /// The single-owner [`crate::DecodePassPlan`] sealed by an adaptive
+    /// drafter for the upcoming target round, if any.
+    fn pass_plan(&self) -> Option<crate::DecodePassPlan> {
         None
     }
     fn checkpoint(&self) -> Result<MethodCheckpoint, MethodCheckpointError>;

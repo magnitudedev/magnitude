@@ -971,7 +971,7 @@ impl MethodState for PrimeState {
         Ok(MethodEffects::default())
     }
     fn propose(&mut self, _: RequestId, _: &[SelectSpec]) -> Propose {
-        Propose::Tokens(Vec::new())
+        Propose::empty()
     }
     fn observe(
         &mut self,

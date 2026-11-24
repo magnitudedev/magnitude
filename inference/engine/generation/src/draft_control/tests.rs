@@ -1617,6 +1617,7 @@ fn streamed_verify_prior_avoids_blind_widest_first_probing_and_larger_clamp() {
     steep.observe_streamed(Some(StreamedVerifyPrior {
         regime_epoch: 1,
         verify_seconds: vec![0.050, 0.120, 0.200, 0.280],
+        ..Default::default()
     }));
     let mut steep_ctrl = DraftController::new(WIDEST, steep.clone());
     assert_eq!(steep_ctrl.generate(WIDEST, CONTEXT, true), 0);
@@ -1661,6 +1662,7 @@ fn streamed_verify_prior_avoids_blind_widest_first_probing_and_larger_clamp() {
     moderate.observe_streamed(Some(StreamedVerifyPrior {
         regime_epoch: 1,
         verify_seconds: vec![0.050, 0.080, 0.200, 0.320],
+        ..Default::default()
     }));
     let mut mod_ctrl = DraftController::new(WIDEST, moderate);
     assert_eq!(mod_ctrl.generate(WIDEST, CONTEXT, true), 1);
@@ -1672,6 +1674,7 @@ fn observe_streamed_invalidates_target_costs_on_regime_epoch_change_preserving_d
     let prior_e1 = StreamedVerifyPrior {
         regime_epoch: 1,
         verify_seconds: vec![0.050, 0.100],
+        ..Default::default()
     };
     load.observe_streamed(Some(prior_e1.clone()));
 
@@ -1709,6 +1712,7 @@ fn observe_streamed_invalidates_target_costs_on_regime_epoch_change_preserving_d
     load.observe_streamed(Some(StreamedVerifyPrior {
         regime_epoch: 2,
         verify_seconds: vec![0.040, 0.075],
+        ..Default::default()
     }));
     {
         let state = load.lock();
@@ -1936,6 +1940,7 @@ fn cold_start_banked_moe_without_verify_prior_does_not_pit_draft_prior_against_z
     load.observe_streamed(Some(StreamedVerifyPrior {
         regime_epoch: 1,
         verify_seconds: vec![0.050, 0.055, 0.060, 0.065, 0.070, 0.075, 0.080, 0.085],
+        ..Default::default()
     }));
     {
         let state = load.lock();
@@ -1957,6 +1962,7 @@ fn anchored_streamed_verify_prior_widens_when_measured_narrow_beats_cold_prior()
     load.observe_streamed(Some(StreamedVerifyPrior {
         regime_epoch: 1,
         verify_seconds: vec![0.070, 0.100, 0.125, 0.150, 0.175, 0.200, 0.220, 0.240],
+        ..Default::default()
     }));
     let ctx = CONTEXT.max(1).next_power_of_two();
     {
@@ -1998,6 +2004,7 @@ fn stale_slow_wide_verify_expires_on_read_past_stale_rounds() {
     load.observe_streamed(Some(StreamedVerifyPrior {
         regime_epoch: 1,
         verify_seconds: vec![0.040, 0.050, 0.060, 0.070, 0.080, 0.090, 0.100, 0.110],
+        ..Default::default()
     }));
     let ctx = CONTEXT.max(1).next_power_of_two();
     {
@@ -2035,10 +2042,12 @@ fn regime_epoch_change_with_derived_plain_prior_does_not_burn_plain_look_bursts(
     load.observe_streamed(Some(StreamedVerifyPrior {
         regime_epoch: 1,
         verify_seconds: vec![0.037, 0.055, 0.070, 0.080, 0.090, 0.100, 0.108, 0.116],
+        ..Default::default()
     }));
     load.observe_streamed(Some(StreamedVerifyPrior {
         regime_epoch: 2,
         verify_seconds: vec![0.037, 0.055, 0.070, 0.080, 0.090, 0.100, 0.108, 0.116],
+        ..Default::default()
     }));
 
     let mut ctrl = DraftController::new(7, load.clone());
@@ -2079,6 +2088,7 @@ fn streamed_moe_high_acceptance_with_noisy_verify_does_not_collapse_to_plain() {
     load.observe_streamed(Some(StreamedVerifyPrior {
         regime_epoch: 1,
         verify_seconds: vec![0.250, 0.360, 0.460, 0.550, 0.630, 0.710, 0.780, 0.850],
+        ..Default::default()
     }));
 
     let mut ctrl = DraftController::new(7, load.clone());
@@ -2143,6 +2153,7 @@ fn cold_wide_verify_expires_when_narrow_residency_warms_up() {
     load.observe_streamed(Some(StreamedVerifyPrior {
         regime_epoch: 1,
         verify_seconds: vec![0.050, 0.070, 0.085, 0.100, 0.115, 0.130, 0.145, 0.160],
+        ..Default::default()
     }));
     let ctx = CONTEXT.max(1).next_power_of_two();
     {
@@ -2168,4 +2179,606 @@ fn cold_wide_verify_expires_when_narrow_residency_warms_up() {
     // High ~90% acceptance: DraftController must widen to K = 7 (M = 8) right away.
     let g = ctrl.generate(7, CONTEXT, true);
     assert_eq!(g, 7, "stale cold verify(8) must expire when warm verify(4) drops >1.5x, widening to K = 7 (got {g})");
+}
+
+/// Reproduces `752567` (`5090-128g` DS4): cold warmup `verify(4) = 243 ms` at
+/// rounds 39..41 while warm `verify(2) = 100 ms` runs through round 57 with
+/// `prior(4)/prior(2) = 1.75` (`anchored = 175 ms < 243 ms`, only a 28% drop).
+/// Verify that:
+/// 1. At round 57 (`57 - 41 >= WARMUP_DRIFT_ROUNDS`), `verify(4)` expires to
+///    its anchored prior and widens to `K = 3` (`rows = 4`).
+/// 2. When the re-probe measures warm `178.9 ms < 243 ms`, stale cold samples
+///    are cleared so round 58 does NOT snap back to `243 ms`, proving `178.9 ms`.
+/// 3. Conversely, when a re-probe confirms `verify(4)` is still slow
+///    (`245 ms >= 243 ms`), it stays proven at `243 ms` and backs off
+///    exponentially (`reprobe_interval` doubles from 16 to 32) without thrashing.
+#[test]
+fn stale_warmup_verify_reprobes_without_magic_ratio_and_clears_cold_median() {
+    let load = Arc::new(DraftLoad::default());
+    load.observe_streamed(Some(StreamedVerifyPrior {
+        regime_epoch: 1,
+        verify_seconds: vec![0.070, 0.100, 0.140, 0.175],
+        ..Default::default()
+    }));
+    let ctx = CONTEXT.max(1).next_power_of_two();
+    {
+        let mut state = load.lock();
+        let drafts = state.draft_costs.entry((ctx, 1)).or_default();
+        drafts.insert(1, super::Durations::settled(&[(39, 0.004), (40, 0.004), (41, 0.004)]));
+        drafts.insert(3, super::Durations::settled(&[(39, 0.010), (40, 0.010), (41, 0.010)]));
+        let target = state.target_costs.entry((Some(1), ctx, 1)).or_default();
+        target
+            .verify
+            .insert(4, super::Durations::settled(&[(39, 0.243), (40, 0.243), (41, 0.243)]));
+        target
+            .verify
+            .insert(2, super::Durations::settled(&[(55, 0.100), (56, 0.100), (57, 0.100)]));
+        state.rounds = 57;
+    }
+
+    // 1 + 2: Warmup confirmed -> widens to K = 3 and stays at K = 3 across rounds 58..60.
+    let mut ctrl = DraftController::new(3, load.clone());
+    for r in 0..4 {
+        let g = ctrl.generate(3, CONTEXT, true);
+        assert_eq!(g, 3, "round {r}: must widen to K = 3 after stale warmup verify(4)");
+        ctrl.timed(TimedLaunch::Draft, settled(Duration::from_millis(10)), 1, g);
+        let block = [TokenId(1), TokenId(2), TokenId(3)];
+        ctrl.drafted(g, &block, None);
+        let v = ctrl.verify(3);
+        assert_eq!(v, 3, "round {r}: must verify 3 proposals (rows = 4), got {v}");
+        ctrl.timed(TimedLaunch::Target, settled(Duration::from_micros(178_900)), 1, v + 1);
+        ctrl.committed(&[TokenId(1), TokenId(2), TokenId(3), TokenId(4)]);
+    }
+    {
+        let state = load.lock();
+        let v4 = &state.target_costs[&(Some(1), ctx, 1)].verify[&4];
+        assert!(v4.proven(), "warm verify(4) must be proven after 3 warm samples");
+        assert!(
+            (v4.cost() - 0.1789).abs() < 1e-6,
+            "warm verify(4) median must be 178.9 ms, got {:.4} s",
+            v4.cost()
+        );
+    }
+
+    // 3: Still-slow re-probe -> stays proven at 243 ms and backs off exponentially (16 -> 32).
+    let slow_load = Arc::new(DraftLoad::default());
+    slow_load.observe_streamed(Some(StreamedVerifyPrior {
+        regime_epoch: 1,
+        verify_seconds: vec![0.070, 0.100, 0.140, 0.175],
+        ..Default::default()
+    }));
+    {
+        let mut state = slow_load.lock();
+        let drafts = state.draft_costs.entry((ctx, 1)).or_default();
+        drafts.insert(1, super::Durations::settled(&[(39, 0.004), (40, 0.004), (41, 0.004)]));
+        drafts.insert(3, super::Durations::settled(&[(39, 0.010), (40, 0.010), (41, 0.010)]));
+        let target = state.target_costs.entry((Some(1), ctx, 1)).or_default();
+        target
+            .verify
+            .insert(4, super::Durations::settled(&[(39, 0.243), (40, 0.243), (41, 0.243)]));
+        target
+            .verify
+            .insert(2, super::Durations::settled(&[(55, 0.100), (56, 0.100), (57, 0.100)]));
+        state.rounds = 57;
+    }
+    let mut slow_ctrl = DraftController::new(3, slow_load.clone());
+    let g = slow_ctrl.generate(3, CONTEXT, true);
+    assert_eq!(g, 3);
+    slow_ctrl.timed(TimedLaunch::Draft, settled(Duration::from_millis(10)), 1, g);
+    slow_ctrl.drafted(g, &[TokenId(1), TokenId(2), TokenId(3)], None);
+    let v = slow_ctrl.verify(3);
+    assert_eq!(v, 3);
+    slow_ctrl.timed(TimedLaunch::Target, settled(Duration::from_millis(245)), 1, v + 1);
+    slow_ctrl.committed(&[TokenId(1), TokenId(2), TokenId(3), TokenId(4)]);
+    {
+        let state = slow_load.lock();
+        let v4 = &state.target_costs[&(Some(1), ctx, 1)].verify[&4];
+        assert!(v4.proven(), "confirmed-slow verify(4) must remain proven");
+        assert!((v4.cost() - 0.243).abs() < 1e-6);
+        assert_eq!(v4.reprobe_interval(), super::WARMUP_DRIFT_ROUNDS * 2);
+    }
+}
+
+/// Gate #5: Zero-toggle live cost function `T(K, F)` for trailing front rows
+/// behind `K` acceptable verify rows:
+/// - Resident / GPU-bound (`verify_prior = None` or `io_seconds <= compute_seconds`):
+///   `F* == 0` automatically.
+/// - Low acceptance / high waste (`W(F) >= ΔS(F)`): `F* == 0` automatically.
+/// - High acceptance + path-bound (`io_seconds > compute_seconds`, `ΔS(F) > W(F) + ΔC + ΔT_draft`):
+///   `F* = argmin T(K, F)` picks `F* > 0` dynamically.
+#[test]
+fn front_rows_cost_function_zero_in_gpu_bound_and_positive_in_high_acceptance_path_bound() {
+    use crate::{AcceptanceProfile, DecodePassScorer, HorizonLimits, PassCostModel, PassId};
+    use magnitude_executor::RequestId;
+
+    let score_f = |costs: &PassCostModel, acceptance: &AcceptanceProfile| {
+        DecodePassScorer::seal_plan_on_widths(
+            PassId {
+                request: RequestId(1),
+                generation: 0,
+                pass: 0,
+            },
+            6,
+            0.0,
+            7,
+            std::iter::once(3),
+            acceptance,
+            HorizonLimits::UNBOUNDED,
+            costs,
+        )
+        .unwrap()
+        .front
+    };
+
+    let high_acc = AcceptanceProfile::Conditional(vec![0.98; 6]);
+    let low_acc = AcceptanceProfile::Conditional(vec![0.05; 6]);
+
+    // 1a. Unbanked / resident (no streamed prior) -> F* == 0.
+    assert_eq!(
+        score_f(&PassCostModel::unit_compute(7), &high_acc),
+        0,
+        "unbanked resident load must choose F* == 0"
+    );
+
+    // 1b. Banked but GPU-bound (io_seconds <= compute_seconds) -> F* == 0.
+    let gpu_bound = PassCostModel::from_streamed_prior(&StreamedVerifyPrior {
+        regime_epoch: 1,
+        verify_seconds: vec![0.010, 0.012, 0.014, 0.016, 0.018, 0.020, 0.022],
+        compute_seconds: vec![0.010, 0.012, 0.014, 0.016, 0.018, 0.020, 0.022],
+        io_seconds: vec![0.002, 0.003, 0.004, 0.005, 0.006, 0.007, 0.008],
+        front_stall_saved_per_row: 0.005,
+        front_waste_per_row: vec![0.002; 6],
+        ..Default::default()
+    });
+    assert_eq!(
+        score_f(&gpu_bound, &high_acc),
+        0,
+        "GPU-bound regime (I/O <= C) must choose F* == 0"
+    );
+
+    // 2. High-acceptance + path-bound (I/O >> C, saved stall > waste) -> F* > 0.
+    let path_bound = PassCostModel::from_streamed_prior(&StreamedVerifyPrior {
+        regime_epoch: 1,
+        verify_seconds: vec![0.040, 0.050, 0.060, 0.070, 0.080, 0.090, 0.100],
+        compute_seconds: vec![0.008, 0.009, 0.010, 0.011, 0.012, 0.013, 0.014],
+        io_seconds: vec![0.040, 0.050, 0.060, 0.070, 0.080, 0.090, 0.100],
+        front_stall_saved_per_row: 0.018,
+        front_waste_per_row: vec![0.004; 6],
+        ..Default::default()
+    });
+    let f_high = score_f(&path_bound, &high_acc);
+    assert!(
+        f_high > 0,
+        "high-acceptance path-bound regime must choose F* > 0 (got {f_high})"
+    );
+
+    // 3. Low acceptance on the SAME path-bound prior -> waste dominates saved stall -> F* == 0.
+    let f_low = score_f(&path_bound, &low_acc);
+    assert_eq!(
+        f_low, 0,
+        "low-acceptance path-bound regime must drop back to F* == 0 (got {f_low})"
+    );
+}
+
+/// Reproduces DS4 (`5090-128g`, telemetry `748172`) VRAM working-set thrashing:
+/// - Part A: When `rows=6` (`K=5`, `254 ms`) is measured first and `rows=4`
+///   (`K=3`) has 0 samples, a VRAM-aware `StreamedVerifyPrior` (from
+///   `vram_slots = 37`, `total_experts = 256`, `selected = 8`) prices
+///   `prior(4) / prior(6)` low enough that `DraftController` immediately picks
+///   `K = 3` (`rows = 4`) instead of staying trapped on thrashing `K = 5`.
+/// - Part B: Even if the prior ratio alone still favors `K = 5` (e.g. `u`
+///   inflated by `rows=6`'s own thrashing), `vram_knee_rows = Some(5)` triggers
+///   a below-knee probe of `K = 3` (`rows = 4`); once `rows = 4` proves its
+///   real `157 ms`, `DraftController` locks onto `K = 3` (`rows = 4`).
+/// - Part C: On Qwen3.8 (`vram_slots = 344 >> distinct(16)`, `vram_knee_rows = None`),
+///   no thrashing penalty or narrow probe occurs and wide `K = 15` is preserved.
+#[test]
+fn ds4_vram_thrashing_prefers_and_probes_rows4_over_thrashing_rows6() {
+    use magnitude_cost_model::{Needed, NeededByForm, PathTerm, Regime, VerifyOverhead, VerifyRoutes, VramWorkingSet, Waste};
+
+    // --- Part A: VRAM-aware prior alone flips unmeasured rows=4 over measured rows=6 ---
+    let ds4_vram = VramWorkingSet {
+        vram_slots: 37.0,
+        total_experts: 256.0,
+        selected: 8.0,
+    };
+    let ds4_regime = Regime {
+        resident: vec![0.020; 6],
+        verify_resident: Vec::new(),
+        needed: NeededByForm::both(vec![Needed::Shadow(40.0 * 3.0); 6]),
+        stand: Some(0.82),
+        accepts: vec![Some(0.82); 5],
+        stall: Some(2.5e-4),
+        front_stall: Vec::new(),
+        verify_stall: Vec::new(),
+        overhead: Some(VerifyOverhead::fixed(0.0)),
+        paths: vec![PathTerm {
+            seconds: 2.5e-4,
+            wasted: Waste {
+                front: vec![Some(0.0); 6],
+                verify: vec![Some(0.0); 6],
+            },
+        }],
+        routes: VerifyRoutes {
+            layers: 40,
+            fresh: vec![6.0, 5.5, 5.0, 7.0, 6.5],
+        },
+    };
+    let vram_prior = ds4_regime.verify_prior_in_vram(5, Some(ds4_vram));
+    let vram_knee = ds4_regime.vram_knee_rows(5, ds4_vram);
+    assert_eq!(vram_knee, Some(4));
+
+    let load_a = Arc::new(DraftLoad::default());
+    load_a.observe_streamed(Some(StreamedVerifyPrior {
+        regime_epoch: 1,
+        verify_seconds: vram_prior,
+        vram_knee_rows: None, // Isolate Part A: prior ratio alone without knee probe.
+        ..Default::default()
+    }));
+    let mut ctrl_a = DraftController::new(5, load_a.clone());
+    // Seed proven measurements ONLY for K=5 (rows=6, 254 ms) and draft(5)=12 ms, draft(3)=8 ms.
+    let ctx = CONTEXT.max(1).next_power_of_two();
+    {
+        let mut state = load_a.lock();
+        let entry = state.target_costs.entry((Some(1), ctx, 1)).or_default();
+        for r in 0..3 {
+            entry.verify.entry(6).or_default().record(r, 0.254, false);
+        }
+        let draft = state.draft_costs.entry((ctx, 1)).or_default();
+        for r in 0..3 {
+            draft.entry(5).or_default().record(r, 0.012, false);
+            draft.entry(3).or_default().record(r, 0.008, false);
+            draft.entry(1).or_default().record(r, 0.004, false);
+        }
+        state.rounds = 3;
+    }
+    // High acceptance (4/5 stand -> ~4.0 tok at K=5 vs ~3.2 tok at K=3).
+    for _ in 0..5 {
+        ctrl_a.drafted(5, &[TokenId(1), TokenId(2), TokenId(3), TokenId(4), TokenId(5)], None);
+        let _ = ctrl_a.verify(5);
+        ctrl_a.committed(&[TokenId(1), TokenId(2), TokenId(3), TokenId(4), TokenId(99)]);
+    }
+    let chosen_a = ctrl_a.generate(5, CONTEXT, true);
+    assert_eq!(
+        chosen_a, 3,
+        "VRAM-aware prior must select K=3 (rows=4) over thrashing measured K=5 (rows=6), got K={chosen_a}"
+    );
+
+    // --- Part B: Below-knee probe rescues K=3 (rows=4) even when prior is inflated ---
+    let load_b = Arc::new(DraftLoad::default());
+    // Flat/inflated prior where prior(4)/prior(6) = 0.72 (as in unfixed telemetry 748172).
+    load_b.observe_streamed(Some(StreamedVerifyPrior {
+        regime_epoch: 1,
+        verify_seconds: vec![0.070, 0.110, 0.145, 0.183, 0.220, 0.254],
+        vram_knee_rows: Some(5),
+        ..Default::default()
+    }));
+    let mut ctrl_b = DraftController::new(5, load_b.clone());
+    {
+        let mut state = load_b.lock();
+        let entry = state.target_costs.entry((Some(1), ctx, 1)).or_default();
+        for r in 0..3 {
+            entry.verify.entry(6).or_default().record(r, 0.254, false);
+        }
+        let draft = state.draft_costs.entry((ctx, 1)).or_default();
+        for r in 0..3 {
+            draft.entry(5).or_default().record(r, 0.012, false);
+            draft.entry(3).or_default().record(r, 0.008, false);
+            draft.entry(1).or_default().record(r, 0.004, false);
+        }
+        state.rounds = 3;
+    }
+    // Very high acceptance (all 5 tokens stand) so inflated prior(4)=183 ms would NOT beat 254 ms.
+    for _ in 0..6 {
+        ctrl_b.drafted(5, &[TokenId(1), TokenId(2), TokenId(3), TokenId(4), TokenId(5)], None);
+        let _ = ctrl_b.verify(5);
+        ctrl_b.committed(&[TokenId(1), TokenId(2), TokenId(3), TokenId(4), TokenId(5), TokenId(6)]);
+    }
+    // Below-knee probe MUST fire for K=3 (rows=4) while rows=4 is unproven.
+    for sample in 0..3u64 {
+        let g = ctrl_b.generate(5, CONTEXT, true);
+        assert_eq!(
+            g, 3,
+            "below-knee probe must measure K=3 (rows=4) on sample {sample}, got K={g}"
+        );
+        // Simulate real DS4 measurement: rows=4 takes 157 ms (fits in VRAM).
+        let mut state = load_b.lock();
+        state
+            .target_costs
+            .entry((Some(1), ctx, 1))
+            .or_default()
+            .verify
+            .entry(4)
+            .or_default()
+            .record(4 + sample, 0.157, false);
+        state.rounds = 4 + sample;
+    }
+    // Now rows=4 (157 ms) is proven (4.0 tok / 165 ms = 24.2 tok/s vs
+    // 6.0 tok / 266 ms = 22.6 tok/s): DraftController immediately locks onto K=3!
+    let steady_b = ctrl_b.generate(5, CONTEXT, true);
+    assert_eq!(
+        steady_b, 3,
+        "after proving rows=4 at 157 ms vs rows=6 at 254 ms, DraftController must stay on K=3, got K={steady_b}"
+    );
+
+    // --- Part C: Qwen3.8 (344 VRAM slots >> distinct(16)) preserves wide K=15 ---
+    let load_c = Arc::new(DraftLoad::default());
+    load_c.observe_streamed(Some(StreamedVerifyPrior {
+        regime_epoch: 1,
+        verify_seconds: (0..=15).map(|k| 0.015 + 0.002 * k as f64).collect(),
+        vram_knee_rows: None, // All widths up to K=15 fit in 344 VRAM slots.
+        ..Default::default()
+    }));
+    let mut ctrl_c = DraftController::new(15, load_c.clone());
+    {
+        let mut state = load_c.lock();
+        let entry = state.target_costs.entry((Some(1), ctx, 1)).or_default();
+        for r in 0..3 {
+            entry.verify.entry(16).or_default().record(r, 0.045, false);
+        }
+        let draft = state.draft_costs.entry((ctx, 1)).or_default();
+        for r in 0..3 {
+            draft.entry(15).or_default().record(r, 0.006, false);
+            draft.entry(7).or_default().record(r, 0.004, false);
+            draft.entry(3).or_default().record(r, 0.003, false);
+            draft.entry(1).or_default().record(r, 0.002, false);
+        }
+        state.rounds = 3;
+    }
+    let toks: Vec<TokenId> = (1..=15).map(TokenId).collect();
+    let mut committed = toks.clone();
+    committed.push(TokenId(16));
+    for _ in 0..6 {
+        ctrl_c.drafted(15, &toks, None);
+        let _ = ctrl_c.verify(15);
+        ctrl_c.committed(&committed);
+    }
+    let chosen_c = ctrl_c.generate(15, CONTEXT, true);
+    assert_eq!(
+        chosen_c, 15,
+        "Qwen3.8 with vram_slots >> distinct(16) must preserve wide K=15, got K={chosen_c}"
+    );
+}
+
+/// Reproduces live telemetry `694668` (`rtx5090-128g-gen5b` DS4 with `dspark`
+/// block drafter whose generation ladder is `{1, 5}` — `3` is NOT a generation
+/// width — and single-step `D(5) = 36 <= 37` while two-step `W_2(5) > 37`):
+/// - `Regime::vram_knee_rows` uses two-step `W_2(k) <= vram_slots`, returning
+///   `Some(4)` even when single-step `D(5) <= 37`.
+/// - `DraftController` generates `g = 5` (valid `dspark` block width, never
+///   downgrading to `g = 1`) and `verify()` probes `v = 3` (`rows = 4`) until
+///   `rows = 4` has `COST_SAMPLES` proven measurements (`143.6 ms` vs `274.6 ms`
+///   for `rows = 6`), then locks onto `(g = 5, v = 3)` (`rows = 4`, `26.5 tok/s`).
+#[test]
+fn dspark_block_drafter_probes_verified_rows4_below_two_step_vram_knee() {
+    use magnitude_cost_model::{Needed, NeededByForm, PathTerm, Regime, VerifyRoutes, VramWorkingSet, Waste};
+
+    let ds4_vram = VramWorkingSet {
+        vram_slots: 37.0,
+        total_experts: 256.0,
+        selected: 8.0,
+    };
+    let ds4_regime = Regime {
+        resident: vec![0.020; 6],
+        verify_resident: Vec::new(),
+        needed: NeededByForm::both(vec![Needed::Shadow(40.0 * 3.0); 6]),
+        stand: Some(0.85),
+        accepts: vec![Some(0.85); 5],
+        stall: Some(2.5e-4),
+        front_stall: Vec::new(),
+        verify_stall: Vec::new(),
+        overhead: None,
+        paths: vec![PathTerm {
+            seconds: 2.5e-4,
+            wasted: Waste {
+                front: vec![Some(0.0); 6],
+                verify: vec![Some(0.0); 6],
+            },
+        }],
+        routes: VerifyRoutes {
+            layers: 40,
+            // Single-step D(5) = 8 + 6 + 5.5 + 5 + 5.8 + 5.7 = 36.0 <= 37,
+            // while two-step W_2(3) = 35.75 <= 37 and W_2(5) = 53.0 > 37!
+            fresh: vec![6.0, 5.5, 5.0, 5.8, 5.7],
+        },
+    };
+    let knee_rows = ds4_regime.vram_knee_rows(5, ds4_vram);
+    assert_eq!(
+        knee_rows,
+        Some(4),
+        "two-step W_2(k) <= 37 knee must be Some(4) even when single-step D(5) = 36 <= 37"
+    );
+
+    let load = Arc::new(DraftLoad::default());
+    // Inflated prior where prior(4)/prior(6) = 0.72 so without the verify-side
+    // knee probe, high acceptance would stay trapped on rows=6 (274.6 ms).
+    load.observe_streamed(Some(StreamedVerifyPrior {
+        regime_epoch: 1,
+        verify_seconds: vec![0.075, 0.120, 0.160, 0.198, 0.236, 0.2746],
+        vram_knee_rows: knee_rows,
+        ..Default::default()
+    }));
+
+    let mut ctrl = DraftController::new(5, load.clone());
+    // `dspark` block drafter: generation widths are `{1, 5}` (`3` is NOT a generation width).
+    ctrl.ladder = vec![1, 5];
+
+    let ctx = CONTEXT.max(1).next_power_of_two();
+    {
+        let mut state = load.lock();
+        let entry = state.target_costs.entry((Some(1), ctx, 1)).or_default();
+        for r in 0..3 {
+            entry.verify.entry(6).or_default().record(r, 0.2746, false);
+        }
+        let draft = state.draft_costs.entry((ctx, 1)).or_default();
+        for r in 0..3 {
+            draft.entry(5).or_default().record(r, 0.012, false);
+            draft.entry(1).or_default().record(r, 0.004, false);
+        }
+        state.rounds = 3;
+    }
+
+    let block5 = [TokenId(1), TokenId(2), TokenId(3), TokenId(4), TokenId(5)];
+    // High acceptance (all 5 stand) so inflated prior(4)=198 ms alone would NOT beat rows=6 (274.6 ms).
+    for _ in 0..6 {
+        ctrl.drafted(5, &block5, None);
+        let _ = ctrl.verify(5);
+        ctrl.committed(&[TokenId(1), TokenId(2), TokenId(3), TokenId(4), TokenId(5), TokenId(6)]);
+    }
+
+    // For 3 probe rounds, `dspark` must generate `g = 5` (never downgrading to `g = 1`)
+    // and `verify()` must probe `v = 3` (`rows = 4`) until proven.
+    for sample in 0..3u64 {
+        let g = ctrl.generate(5, CONTEXT, true);
+        assert_eq!(
+            g, 5,
+            "dspark (ladder={{1, 5}}) must generate g=5 to supply v=3 on probe sample {sample}, got g={g}"
+        );
+        ctrl.drafted(g, &block5, None);
+        let v = ctrl.verify(5);
+        assert_eq!(
+            v, 3,
+            "verify() must probe below-knee v=3 (rows=4) on sample {sample}, got v={v}"
+        );
+        // Live 694668 measurement: rows=4 takes 143.6 ms (26.5 tok/s!).
+        let mut state = load.lock();
+        state
+            .target_costs
+            .entry((Some(1), ctx, 1))
+            .or_default()
+            .verify
+            .entry(4)
+            .or_default()
+            .record(4 + sample, 0.1436, false);
+        state.rounds = 4 + sample;
+    }
+
+    // Once rows=4 (143.6 ms) is proven, dspark locks onto (g=5, v=3) (`rows=4`, `26.5 tok/s`)!
+    let g_steady = ctrl.generate(5, CONTEXT, true);
+    assert_eq!(g_steady, 5);
+    ctrl.drafted(g_steady, &block5, None);
+    let v_steady = ctrl.verify(5);
+    assert_eq!(
+        v_steady, 3,
+        "after proving rows=4 at 143.6 ms vs rows=6 at 274.6 ms, dspark must lock onto v=3 (rows=4), got v={v_steady}"
+    );
+}
+
+/// Reproduces `b97f26` (`rtx5090-128g-gen5b` DS4, `vram_slots=38`, `total_experts=384`):
+/// when thrashing at `rows=6` (`275 ms`) inflates `p_0 ≈ 0.80`, two-step
+/// `W_2(3) > 38` pushes `vram_knee_rows` down to `Some(3)` (below `rows=4`).
+/// Even if `rows=2` (`v=1`) is already proven and `rows=4` (`v=3`) is stuck at
+/// `len = 2` (`138.7 ms`, `133.5 ms`), `knee_probe_verify` MUST step down from
+/// `v = 5` to the immediate narrower verify width `v = 3` (`rows = 4`) rather
+/// than skipping `v = 3` to `v = 1`, proving `rows = 4` on the very next round
+/// and switching to `v = 3` (`28.5+ tok/s`).
+#[test]
+fn b97f26_inflated_p0_knee_below_4_still_probes_rows4_to_proven() {
+    use magnitude_cost_model::{Needed, NeededByForm, PathTerm, Regime, VerifyRoutes, VramWorkingSet, Waste};
+
+    // Unequal draft/target bank: draft layers hold 129 slots, target layers hold 38 slots of 384 experts.
+    let target_vram = VramWorkingSet {
+        vram_slots: 38.0,
+        total_experts: 384.0,
+        selected: 8.0,
+    };
+    let regime = Regime {
+        resident: vec![0.020; 6],
+        verify_resident: Vec::new(),
+        // Inflated single-token misses u_l = 4.8 (p_0 = 4.8 / 6.0 = 0.80) from rows=6 thrashing.
+        needed: NeededByForm::both(vec![Needed::Shadow(40.0 * 4.8); 6]),
+        stand: Some(0.85),
+        accepts: vec![Some(0.85); 5],
+        stall: Some(2.5e-4),
+        front_stall: Vec::new(),
+        verify_stall: Vec::new(),
+        overhead: None,
+        paths: vec![PathTerm {
+            seconds: 2.5e-4,
+            wasted: Waste {
+                front: vec![Some(0.0); 6],
+                verify: vec![Some(0.0); 6],
+            },
+        }],
+        routes: VerifyRoutes {
+            layers: 40,
+            fresh: vec![6.0, 5.5, 5.0, 5.8, 5.7],
+        },
+    };
+    let knee_rows = regime.vram_knee_rows(5, target_vram);
+    assert_eq!(
+        knee_rows,
+        Some(3),
+        "inflated p_0=0.80 with target vram_slots=38 pushes two-step knee to Some(3)"
+    );
+
+    let load = Arc::new(DraftLoad::default());
+    load.observe_streamed(Some(StreamedVerifyPrior {
+        regime_epoch: 1,
+        verify_seconds: vec![0.075, 0.120, 0.160, 0.198, 0.236, 0.275],
+        vram_knee_rows: knee_rows,
+        ..Default::default()
+    }));
+
+    let mut ctrl = DraftController::new(5, load.clone());
+    ctrl.ladder = vec![1, 5];
+
+    let ctx = CONTEXT.max(1).next_power_of_two();
+    {
+        let mut state = load.lock();
+        let entry = state.target_costs.entry((Some(1), ctx, 1)).or_default();
+        // rows=6 (275 ms) and rows=2 (110 ms) are already proven; rows=4 is stuck at len=2!
+        for r in 0..3 {
+            entry.verify.entry(6).or_default().record(r, 0.275, false);
+            entry.verify.entry(2).or_default().record(r, 0.110, false);
+        }
+        entry.verify.entry(4).or_default().record(1, 0.1387, false);
+        entry.verify.entry(4).or_default().record(2, 0.1335, false);
+        let draft = state.draft_costs.entry((ctx, 1)).or_default();
+        for r in 0..3 {
+            draft.entry(5).or_default().record(r, 0.012, false);
+            draft.entry(1).or_default().record(r, 0.004, false);
+        }
+        state.rounds = 3;
+    }
+
+    let block5 = [TokenId(1), TokenId(2), TokenId(3), TokenId(4), TokenId(5)];
+    for _ in 0..6 {
+        ctrl.drafted(5, &block5, None);
+        let _ = ctrl.verify(5);
+        ctrl.committed(&[TokenId(1), TokenId(2), TokenId(3), TokenId(4), TokenId(5), TokenId(6)]);
+    }
+
+    // Even with knee_rows = Some(3) and rows=2 already proven, verify() MUST step down
+    // from v=5 to v=3 (rows=4) on the very next round!
+    let g = ctrl.generate(5, CONTEXT, true);
+    assert_eq!(g, 5);
+    ctrl.drafted(g, &block5, None);
+    let v = ctrl.verify(5);
+    assert_eq!(
+        v, 3,
+        "knee_probe_verify must step down from v=5 to unproven v=3 (rows=4) even when knee_rows=Some(3) and rows=2 is proven, got v={v}"
+    );
+
+    // Record the 3rd sample (136 ms) -> rows=4 is now proven and wins permanently!
+    {
+        let mut state = load.lock();
+        state
+            .target_costs
+            .entry((Some(1), ctx, 1))
+            .or_default()
+            .verify
+            .entry(4)
+            .or_default()
+            .record(4, 0.136, false);
+        state.rounds = 4;
+    }
+    let g2 = ctrl.generate(5, CONTEXT, true);
+    assert_eq!(g2, 5);
+    ctrl.drafted(g2, &block5, None);
+    let v2 = ctrl.verify(5);
+    assert_eq!(
+        v2, 3,
+        "once rows=4 reaches 3 proven samples (~136 ms), dspark must lock onto v=3 (rows=4), got v={v2}"
+    );
 }

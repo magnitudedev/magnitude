@@ -2,6 +2,7 @@
 //! generation accepts them independently after shared physical completion.
 mod acceptance;
 mod controls;
+mod decode_pass_plan;
 mod dflash;
 mod draft_budget;
 mod draft_control;
@@ -14,6 +15,12 @@ mod round;
 mod shaping;
 pub use acceptance::accept_prefix;
 pub use controls::{EndOfGeneration, ReasoningBudget};
+pub use decode_pass_plan::{
+    AcceptanceProfile, BatchPlanCandidate, BranchPrediction, ComputePricing, DecodePassPlan,
+    DecodePassScorer, DraftBudgetPlan, DrafterSpec, FrontCreditModel, HorizonLimits,
+    PassCommitment, PassCostModel, PassId, PassOutcome, PassOutcomeTracker, PassPricing,
+    PredictionJudgment, PredictionRole, RowMissPricing, SealedBatch, seal_batch_plans,
+};
 pub use dflash::DFlash;
 pub use draft_budget::{DraftBudget, DraftPolicy};
 pub use draft_control::{
@@ -38,8 +45,15 @@ pub use round::{MethodUpdate, RoundAcceptance, RoundForward, RoundState};
 pub use shaping::{selection_history, verification_selects, HISTORY_WIDTH};
 use std::{
     collections::{BTreeSet, VecDeque},
-    sync::Arc,
+    sync::{Arc, Mutex},
 };
+
+/// Live runtime pricing observed from the executor domain for this generation.
+#[derive(Default)]
+struct ObservedPricing {
+    streamed_prior: Option<StreamedVerifyPrior>,
+    launch_prices: Option<magnitude_cost_model::LaunchPrices>,
+}
 
 /// Request-local grammar state. Staging returns an independent validated successor;
 /// it cannot mutate the original state, and installing it cannot fail after commit.
@@ -263,6 +277,7 @@ struct GenerationCommit {
     accepted_position: usize,
     finish: Option<FinishReason>,
     two_row: Option<TwoRowDecode>,
+    settled_outcome: Option<PassOutcome>,
 }
 
 /// A method operation's outcome consumed against private method state.
@@ -337,6 +352,18 @@ pub struct Generation {
     /// the chunk closing its prompt enters the head as a front pass does
     /// where the head enters its chunks on the device.
     two_row: Option<TwoRowDecode>,
+    /// Monotonic request generation for [`PassId`] (incremented on eviction).
+    pass_generation: u64,
+    /// Monotonic per-request pass counter for [`PassId`].
+    next_pass_id: u64,
+    /// Single-owner single-settlement outcome tracker for decode passes.
+    pass_outcomes: PassOutcomeTracker,
+    /// Active in-flight sealed decode pass and its proposals (if any).
+    active_pass: Option<(DecodePassPlan, Vec<TokenId>)>,
+    /// Most recently settled decode pass outcome.
+    last_pass_outcome: Option<PassOutcome>,
+    /// Live runtime pricing observed from the executor domain.
+    pricing: Mutex<ObservedPricing>,
 }
 
 /// A target round in progress. It owns its generation from start until the
@@ -424,6 +451,12 @@ impl Generation {
             cached_tokens: 0,
             draft_stats: DraftStats::default(),
             two_row,
+            pass_generation: 0,
+            next_pass_id: 0,
+            pass_outcomes: PassOutcomeTracker::default(),
+            active_pass: None,
+            last_pass_outcome: None,
+            pricing: Mutex::new(ObservedPricing::default()),
         })
     }
     pub fn prompt(&self) -> &[TokenId] {
@@ -721,47 +754,146 @@ impl Generation {
             }
             RoundPlan::Propose { limit } => {
                 let pending = *self.generated.last().unwrap();
+                let remaining_after_exact = (self.options.max_tokens - self.generated.len()).saturating_sub(1);
                 if let Some(two_row) = &self.two_row {
-                    // Where the head trails the target, the round is the
-                    // head transaction drafting the chain this grant's pass
-                    // runs, at most the head's proposals deep.
-                    let drafts = self.granted(limit, allowance, grant).min(self.method_factory.proposals());
-                    let selects = self.proposal_selects(drafts)?;
-                    // The method's state moves only once the round it
-                    // starts is valid.
-                    let mut method = self.method.fork_transition();
-                    let pass = |chain: Option<ChainEntry>| {
-                        let demand = match chain {
-                            Some(_) => requirements.verify_demand.device_only_features(),
-                            None => requirements.verify_demand,
-                        };
-                        RoundState::pass(
-                            pending,
-                            self.front_rows(two_row, allowance, limit, grant),
-                            self.generated.len(),
-                            &self.generated,
-                            self.constraint.as_deref(),
-                            self.options.sampling,
-                            self.options.shaping,
-                            self.options.seed,
-                            demand,
-                            chain,
-                        )
+                    // Embedded `TwoRowDecode` supplies its existing chain via
+                    // `DrafterSpec::from_two_row` (never forcing a new drafter).
+                    let _drafter = DrafterSpec::from_two_row(two_row);
+                    let pass_id = PassId {
+                        request,
+                        generation: self.pass_generation,
+                        pass: self.next_pass_id,
                     };
-                    let next = match method.front(request, pending, grant, &selects)? {
-                        FrontEntry::Chain(chain) => NextRound::Target(pass(Some(chain))?),
-                        FrontEntry::Verify => NextRound::Target(pass(None)?),
+                    let max_drafts = self
+                        .granted(limit, allowance, grant)
+                        .min(self.method_factory.proposals());
+                    let drafts = match grant {
+                        FrontGrant::Verify(_) | FrontGrant::Mixed { .. }
+                            if self.method.trails() && max_drafts > 0 =>
+                        {
+                            let (costs, acceptance, has_real) =
+                                self.pass_cost_and_acceptance(1 + max_drafts, max_drafts);
+                            if has_real {
+                                let (max_k, max_front) = match grant {
+                                    FrontGrant::Mixed { verify, front } => {
+                                        (verify.min(max_drafts), front.min(max_drafts))
+                                    }
+                                    _ => (max_drafts, 0),
+                                };
+                                DecodePassScorer::seal_unchained_plan_on_widths(
+                                    pass_id,
+                                    max_drafts,
+                                    0.0,
+                                    1 + max_drafts,
+                                    0..=max_k,
+                                    max_front,
+                                    &acceptance,
+                                    HorizonLimits {
+                                        remaining_tokens: remaining_after_exact,
+                                        eos_at: None,
+                                    },
+                                    &costs,
+                                )
+                                .map(|plan| (plan.verify + plan.front).min(max_drafts))
+                                .unwrap_or(max_drafts)
+                            } else {
+                                max_drafts
+                            }
+                        }
+                        _ => max_drafts,
+                    };
+                    let selects = self.proposal_selects(drafts)?;
+                    let mut method = self.method.fork_transition();
+                    let entry = method.front(request, pending, grant, &selects)?;
+                    let (next, sealed_pass) = match entry {
                         FrontEntry::Pending(operations) => {
                             self.validate_method_operations(request, &operations)?;
-                            NextRound::Method(operations)
+                            (NextRound::Method(operations), None)
+                        }
+                        FrontEntry::Plain => {
+                            let (rows, sealed_pass) = self.seal_front_pass(
+                                pass_id,
+                                two_row,
+                                allowance,
+                                limit,
+                                grant,
+                                remaining_after_exact,
+                            )?;
+                            let round = RoundState::pass(
+                                pending,
+                                rows,
+                                self.generated.len(),
+                                &self.generated,
+                                self.constraint.as_deref(),
+                                self.options.sampling,
+                                self.options.shaping,
+                                self.options.seed,
+                                Demand::NONE,
+                                None,
+                            )?;
+                            (NextRound::Target(round), Some(sealed_pass))
+                        }
+                        FrontEntry::Chain(chain) => {
+                            let (rows, sealed_pass) = self.seal_front_pass(
+                                pass_id,
+                                two_row,
+                                allowance,
+                                limit,
+                                grant,
+                                remaining_after_exact,
+                            )?;
+                            let round = RoundState::pass(
+                                pending,
+                                rows,
+                                self.generated.len(),
+                                &self.generated,
+                                self.constraint.as_deref(),
+                                self.options.sampling,
+                                self.options.shaping,
+                                self.options.seed,
+                                requirements.verify_demand.device_only_features(),
+                                Some(chain),
+                            )?;
+                            (NextRound::Target(round), Some(sealed_pass))
+                        }
+                        FrontEntry::Verify => {
+                            let (rows, sealed_pass) = self.seal_front_pass(
+                                pass_id,
+                                two_row,
+                                allowance,
+                                limit,
+                                grant,
+                                remaining_after_exact,
+                            )?;
+                            let round = RoundState::pass(
+                                pending,
+                                rows,
+                                self.generated.len(),
+                                &self.generated,
+                                self.constraint.as_deref(),
+                                self.options.sampling,
+                                self.options.shaping,
+                                self.options.seed,
+                                requirements.verify_demand,
+                                None,
+                            )?;
+                            (NextRound::Target(round), Some(sealed_pass))
                         }
                     };
                     self.method = method;
+                    if let Some((plan, proposals)) = sealed_pass {
+                        self.next_pass_id = self.next_pass_id.wrapping_add(1);
+                        if let Some(settled) = self.pass_outcomes.feed(plan, proposals.clone()) {
+                            self.last_pass_outcome = Some(settled);
+                        } else {
+                            self.active_pass = Some((plan, proposals));
+                        }
+                    }
                     return Ok(next);
                 }
                 let selects = self.proposal_selects(limit)?;
-                let proposal = match self.method.propose(request, &selects) {
-                    Propose::Tokens(tokens) => tokens,
+                let (proposal, front) = match self.method.propose(request, &selects) {
+                    Propose::Tokens { acceptable, front } => (acceptable, front),
                     Propose::Pending(operations) if operations.is_empty() => {
                         return Err("method returned an empty pending operation set".into());
                     }
@@ -773,26 +905,72 @@ impl Generation {
                 if proposal.len() > limit
                     || proposal
                         .iter()
+                        .chain(front.iter().map(|guess| &guess.token))
                         .any(|token| token.0 as usize >= self.options.vocabulary)
                 {
                     return Err("method returned an invalid proposal".into());
                 }
                 // A stop token is never accepted as a draft match, so rows
                 // after it could only be rejected.
+                let proposal_stopped = proposal
+                    .iter()
+                    .any(|token| self.options.stop_tokens.contains(token));
                 let proposal = proposal
                     .iter()
                     .take_while(|token| !self.options.stop_tokens.contains(token))
                     .copied()
                     .collect::<Vec<_>>();
+                // Seal the decode pass through the single-owner `DecodePassScorer`
+                // (reusing the real `DecodePassPlan` sealed by an adaptive drafter
+                // when available, preserving measured costs, calibrated survival,
+                // and any `F > 0` foresight tail) and register it in `PassOutcomeTracker`.
+                let pass_id = PassId {
+                    request,
+                    generation: self.pass_generation,
+                    pass: self.next_pass_id,
+                };
+                self.next_pass_id = self.next_pass_id.wrapping_add(1);
+                let plan = if let Some(mut sealed) = self.method.pass_plan() {
+                    let cap = 1 + limit;
+                    let verify = sealed
+                        .verify
+                        .min(proposal.len())
+                        .min(limit)
+                        .min(remaining_after_exact);
+                    let front = if verify == 0 {
+                        0
+                    } else {
+                        sealed
+                            .front
+                            .min(proposal.len().saturating_sub(verify))
+                            .min(limit.saturating_sub(verify))
+                            .min(magnitude_executor::CHAINED_ROWS.saturating_sub(1 + verify))
+                    };
+                    sealed.pass_id = pass_id;
+                    sealed.generated = sealed.generated.max(proposal.len());
+                    sealed.verify = verify;
+                    sealed.front = front;
+                    sealed.idle_front = 0;
+                    sealed.reserved_capacity = cap;
+                    sealed
+                } else {
+                    self.seal_verify_pass(
+                        pass_id,
+                        proposal.len(),
+                        1 + limit,
+                        remaining_after_exact,
+                    )?
+                };
+                let rows = plan.build_rows(&proposal, GuessKind::Chained)?;
                 // A round that verifies nothing publishes its feature only
                 // where its method reads it.
-                let verify_demand = match proposal.is_empty() && !self.method.taps() {
+                let verify_demand = match rows.acceptable().is_empty() && !self.method.taps() {
                     true => Demand::NONE,
                     false => requirements.verify_demand,
                 };
-                RoundState::pass(
+                let round = RoundState::pass(
                     pending,
-                    Rows::Exact { acceptable: proposal },
+                    rows,
                     self.generated.len(),
                     &self.generated,
                     self.constraint.as_deref(),
@@ -801,7 +979,13 @@ impl Generation {
                     self.options.seed,
                     verify_demand,
                     None,
-                )?
+                )?;
+                if let Some(settled) = self.pass_outcomes.feed(plan, proposal.clone()) {
+                    self.last_pass_outcome = Some(settled);
+                } else {
+                    self.active_pass = Some((plan, proposal));
+                }
+                round
             }
         };
         Ok(NextRound::Target(round))
@@ -817,15 +1001,184 @@ impl Generation {
     /// (`magnitude_executor::ExecutorDomain::front_pass`): it is never
     /// reshaped.
     fn granted(&self, limit: usize, allowance: usize, grant: FrontGrant) -> usize {
+        let context_extra = allowance
+            .min(self.options.context_limit.saturating_sub(self.resident_position))
+            .saturating_sub(1);
         match grant {
-            FrontGrant::UpTo(depth) => depth.min(
-                allowance
-                    .min(self.options.context_limit.saturating_sub(self.resident_position))
-                    .saturating_sub(1),
-            ),
+            FrontGrant::Plain => 0,
+            FrontGrant::UpTo(depth) => depth.min(context_extra),
             FrontGrant::Exactly(depth) => depth,
             FrontGrant::Verify(depth) => depth.min(limit),
+            FrontGrant::Mixed { verify, front } => {
+                let k = verify.min(limit);
+                let f = front.min(context_extra.saturating_sub(k));
+                k + f
+            }
         }
+    }
+
+    /// Build the single-owner [`PassCostModel`] and empirical [`AcceptanceProfile`]
+    /// from observed runtime pricing (`StreamedVerifyPrior` / `LaunchPrices`) and
+    /// settled [`PassOutcomeTracker`] conditional acceptance counts.
+    fn pass_cost_and_acceptance(
+        &self,
+        max_rows: usize,
+        proposal_len: usize,
+    ) -> (PassCostModel, AcceptanceProfile, bool) {
+        let observed = self
+            .pricing
+            .lock()
+            .expect("generation pricing lock poisoned");
+        let (costs, has_real_pricing) = if let Some(prior) = observed.streamed_prior.as_ref() {
+            (PassCostModel::from_streamed_prior(prior), true)
+        } else if let Some(prices) = observed.launch_prices.as_ref() {
+            let depth = self.resident_position.max(1).next_power_of_two() as u32;
+            match PassCostModel::from_launch_prices(prices, max_rows, depth) {
+                Some(costs) => (costs, true),
+                None => (PassCostModel::unit_compute(max_rows), false),
+            }
+        } else {
+            (PassCostModel::unit_compute(max_rows), false)
+        };
+        let acceptance = AcceptanceProfile::from_empirical(
+            proposal_len,
+            observed
+                .streamed_prior
+                .as_ref()
+                .map(|p| p.accepts.as_slice()),
+            observed.streamed_prior.as_ref().and_then(|p| p.stand),
+            &self.pass_outcomes,
+        );
+        (costs, acceptance, has_real_pricing)
+    }
+
+    /// Seal a verify pass through the single-owner [`DecodePassScorer`],
+    /// using the real measured [`PassCostModel`] and empirical acceptance.
+    fn seal_verify_pass(
+        &self,
+        pass_id: PassId,
+        actual_generated: usize,
+        reserved_capacity: usize,
+        remaining_after_exact: usize,
+    ) -> Result<DecodePassPlan, String> {
+        let (costs, acceptance, has_real_pricing) =
+            self.pass_cost_and_acceptance(reserved_capacity, actual_generated);
+        let acceptance = if has_real_pricing {
+            acceptance
+        } else {
+            AcceptanceProfile::Conditional(vec![1.0; actual_generated])
+        };
+        DecodePassScorer::seal_unchained_plan_on_widths(
+            pass_id,
+            actual_generated,
+            0.0,
+            reserved_capacity,
+            0..=actual_generated,
+            0,
+            &acceptance,
+            HorizonLimits {
+                remaining_tokens: remaining_after_exact,
+                eos_at: None,
+            },
+            &costs,
+        )
+    }
+
+    /// Seal a `TwoRowDecode` pass through the single-owner [`DecodePassScorer`]
+    /// using the real measured [`PassCostModel`] and empirical acceptance,
+    /// preserving embedded chain semantics (never forcing a new drafter).
+    fn seal_front_pass(
+        &self,
+        pass_id: PassId,
+        two_row: &TwoRowDecode,
+        allowance: usize,
+        limit: usize,
+        grant: FrontGrant,
+        remaining_after_exact: usize,
+    ) -> Result<(Rows, (DecodePassPlan, Vec<TokenId>)), String> {
+        let raw_rows = self.front_rows(two_row, allowance, limit, grant);
+        let reserved_capacity = raw_rows.row_count();
+        match grant {
+            FrontGrant::Verify(_) | FrontGrant::Mixed { .. } => {
+                let raw_acceptable = raw_rows.acceptable();
+                let raw_guesses = raw_rows.guesses();
+                let candidate_guesses: Vec<Guess> = two_row
+                    .chain()
+                    .iter()
+                    .take(raw_acceptable.len())
+                    .copied()
+                    .chain(raw_guesses.iter().copied())
+                    .collect();
+                let proposals: Vec<TokenId> = candidate_guesses.iter().map(|g| g.token).collect();
+                let max_k = raw_acceptable.len();
+                let max_front = match grant {
+                    FrontGrant::Mixed { front, .. } => front.min(raw_guesses.len()),
+                    _ => 0,
+                };
+                let (costs, acceptance, _has_real_pricing) =
+                    self.pass_cost_and_acceptance(reserved_capacity, proposals.len());
+                let mut plan = DecodePassScorer::seal_unchained_plan_on_widths(
+                    pass_id,
+                    proposals.len(),
+                    0.0,
+                    reserved_capacity,
+                    0..=max_k,
+                    max_front,
+                    &acceptance,
+                    HorizonLimits {
+                        remaining_tokens: remaining_after_exact,
+                        eos_at: None,
+                    },
+                    &costs,
+                )?;
+                plan.generated = two_row.chain_len().max(proposals.len());
+                let acceptable = proposals[..plan.verify].to_vec();
+                let front_guesses =
+                    candidate_guesses[plan.verify..plan.verify + plan.front].to_vec();
+                let rows = Rows::pass(acceptable, front_guesses, 0);
+                Ok((rows, (plan, proposals)))
+            }
+            FrontGrant::Plain | FrontGrant::UpTo(_) | FrontGrant::Exactly(_) => {
+                let front_guesses = raw_rows.guesses();
+                let idle_front = raw_rows.front_rows().saturating_sub(front_guesses.len());
+                let proposals: Vec<TokenId> = front_guesses.iter().map(|g| g.token).collect();
+                let (costs, acceptance, _has_real_pricing) =
+                    self.pass_cost_and_acceptance(reserved_capacity, proposals.len());
+                let cum = acceptance.cumulative_survival();
+                let pricing = DecodePassScorer::score_candidate_with_idle(
+                    0.0,
+                    0,
+                    front_guesses.len(),
+                    idle_front,
+                    &cum,
+                    HorizonLimits {
+                        remaining_tokens: remaining_after_exact,
+                        eos_at: None,
+                    },
+                    &costs,
+                );
+                let plan = DecodePassPlan {
+                    pass_id,
+                    generated: two_row.chain_len().max(proposals.len()),
+                    verify: 0,
+                    front: front_guesses.len(),
+                    idle_front,
+                    reserved_capacity,
+                    pricing,
+                };
+                Ok((raw_rows, (plan, proposals)))
+            }
+        }
+    }
+
+    /// Single-owner decode pass outcome tracker for this generation.
+    pub fn pass_outcomes(&self) -> &PassOutcomeTracker {
+        &self.pass_outcomes
+    }
+
+    /// Most recently settled decode pass outcome, if any.
+    pub fn last_pass_outcome(&self) -> Option<&PassOutcome> {
+        self.last_pass_outcome.as_ref()
     }
 
     /// The rows of a pass of `two_row` where `grant`ed
@@ -836,18 +1189,52 @@ impl Generation {
     fn front_rows(&self, two_row: &TwoRowDecode, allowance: usize, limit: usize, grant: FrontGrant) -> Rows {
         let depth = self.granted(limit, allowance, grant);
         match grant {
+            FrontGrant::Plain => Rows::plain(),
             FrontGrant::UpTo(_) => two_row.pass(FrontGrant::UpTo(depth)),
             FrontGrant::Exactly(_) => two_row.pass(grant),
             FrontGrant::Verify(_) => {
-                let Rows::Exact { acceptable } = two_row.pass(FrontGrant::Verify(depth)) else {
-                    unreachable!("a verify pass's rows are exact");
+                let pass = two_row.pass(FrontGrant::Verify(depth));
+                let acceptable_stopped = pass
+                    .acceptable()
+                    .iter()
+                    .any(|token| self.options.stop_tokens.contains(token));
+                let acceptable: Vec<TokenId> = pass
+                    .acceptable()
+                    .iter()
+                    .take_while(|token| !self.options.stop_tokens.contains(token))
+                    .copied()
+                    .collect();
+                let front: Vec<Guess> = if acceptable_stopped || acceptable.is_empty() {
+                    Vec::new()
+                } else {
+                    pass.guesses()
+                        .iter()
+                        .take_while(|guess| !self.options.stop_tokens.contains(&guess.token))
+                        .copied()
+                        .collect()
                 };
-                Rows::Exact {
-                    acceptable: acceptable
-                        .into_iter()
-                        .take_while(|token| !self.options.stop_tokens.contains(token))
-                        .collect(),
-                }
+                let row_budget = allowance
+                    .min(self.options.context_limit.saturating_sub(self.resident_position))
+                    .min(magnitude_executor::CHAINED_ROWS)
+                    .max(1);
+                Rows::verify_with_front(acceptable, front).fit_budget(row_budget)
+            }
+            FrontGrant::Mixed { verify, front } => {
+                let k = verify.min(limit);
+                let f = front.min(depth.saturating_sub(k));
+                let raw = two_row.pass(FrontGrant::Mixed { verify: k, front: f });
+                let acceptable: Vec<TokenId> = raw
+                    .acceptable()
+                    .iter()
+                    .copied()
+                    .take_while(|token| !self.options.stop_tokens.contains(token))
+                    .collect();
+                let tail = if acceptable.len() == raw.acceptable().len() {
+                    raw.guesses().to_vec()
+                } else {
+                    Vec::new()
+                };
+                Rows::pass(acceptable, tail, 0)
             }
         }
     }
@@ -1162,14 +1549,24 @@ impl Generation {
     }
 
     /// Observe the streamed target verify prior for the upcoming decode
-    /// round, forwarding to this generation's method.
+    /// round, storing it for [`DecodePassScorer`] and forwarding to this
+    /// generation's method.
     pub fn observe_streamed_prior(&self, prior: Option<StreamedVerifyPrior>) {
+        self.pricing
+            .lock()
+            .expect("generation pricing lock poisoned")
+            .streamed_prior = prior.clone();
         self.method_factory.observe_streamed_prior(prior);
     }
 
     /// Observe the load's analytical [`magnitude_cost_model::LaunchPrices`]
-    /// snapshot, forwarding to this generation's method.
+    /// snapshot, storing it for [`DecodePassScorer`] and forwarding to this
+    /// generation's method.
     pub fn observe_launch_prices(&self, prices: Option<magnitude_cost_model::LaunchPrices>) {
+        self.pricing
+            .lock()
+            .expect("generation pricing lock poisoned")
+            .launch_prices = prices.clone();
         self.method_factory.observe_launch_prices(prices);
     }
 
@@ -1321,6 +1718,23 @@ impl Generation {
         if finish.is_none() && resident_position >= self.options.context_limit {
             finish = Some(FinishReason::Context);
         }
+        let settled_outcome = self
+            .active_pass
+            .as_ref()
+            .map(|(plan, proposals)| {
+                if self.finish.is_some() {
+                    Ok::<_, String>(PassOutcome::discarded(plan.pass_id, Some(plan), proposals))
+                } else {
+                    let outcome =
+                        PassOutcome::from_samples(plan, proposals, samples, &self.options.stop_tokens)?;
+                    debug_assert!(
+                        matches!(&outcome.commitment, PassCommitment::Committed(prefix) if *prefix == acceptance.emitted),
+                        "single terminal truth: PassOutcome committed prefix must match acceptance.emitted"
+                    );
+                    Ok(outcome)
+                }
+            })
+            .transpose()?;
         Ok(PreparedGenerationTransition {
             request,
             decision: acceptance.decision(),
@@ -1341,6 +1755,7 @@ impl Generation {
                 accepted_position,
                 finish,
                 two_row,
+                settled_outcome,
             },
         })
     }
@@ -1367,6 +1782,12 @@ impl Generation {
         self.accepted_position = transition.accepted_position;
         self.finish = transition.finish;
         self.two_row = transition.two_row;
+        self.active_pass = None;
+        if let Some(outcome) = transition.settled_outcome {
+            if let Some(settled) = self.pass_outcomes.record_verdict(outcome) {
+                self.last_pass_outcome = Some(settled);
+            }
+        }
         transition.effects
     }
 
@@ -1386,13 +1807,23 @@ impl Generation {
         Ok(())
     }
 
+    fn cancel_active_pass(&mut self) {
+        if let Some((plan, _)) = self.active_pass.take() {
+            if let Some(settled) = self.pass_outcomes.cancel(plan.pass_id) {
+                self.last_pass_outcome = Some(settled);
+            }
+        }
+    }
+
     /// Accepted output remains owned by the caller until drained or discarded.
     pub fn cancel(&mut self) {
+        self.cancel_active_pass();
         if self.finish.is_none() {
             self.finish = Some(FinishReason::Cancelled);
         }
     }
     pub fn fail(&mut self) {
+        self.cancel_active_pass();
         if self.finish.is_none() {
             self.finish = Some(FinishReason::Failed);
         }
@@ -1405,6 +1836,16 @@ impl Generation {
     /// Called after the execution owner releases numerical state. Logical history,
     /// grammar, queued output, and terminal decisions remain available.
     pub fn evicted(&mut self) -> Result<(), String> {
+        if let Some((plan, _)) = self.active_pass.take() {
+            let req = plan.pass_id.request;
+            if let Some(settled) = self.pass_outcomes.cancel(plan.pass_id) {
+                self.last_pass_outcome = Some(settled);
+            }
+            self.pass_generation = self.pass_generation.wrapping_add(1);
+            self.pass_outcomes.retire_before(req, self.pass_generation);
+        } else {
+            self.pass_generation = self.pass_generation.wrapping_add(1);
+        }
         // Restore at least the numerical prefix that existed before eviction,
         // preserving an earlier target if eviction occurs again mid-replay.
         // A live decode normally has one accepted successor that has not yet
@@ -1567,7 +2008,8 @@ impl StartedRound {
     /// round changes the generation only by its method's proposal, which a
     /// re-run proposes again; its sampling is seeded by position, so the
     /// round's output is the same.
-    pub fn abandon(self) -> Generation {
+    pub fn abandon(mut self) -> Generation {
+        self.generation.cancel_active_pass();
         self.generation
     }
 
@@ -1764,5 +2206,431 @@ mod method_choice_tests {
             ..reading
         };
         assert!(!method_matches_choice(MethodChoice::Mtp { proposals: 3 }, &blind));
+    }
+}
+
+#[cfg(test)]
+mod seal_front_pass_real_pricing_tests {
+    use super::*;
+    use magnitude_executor::StreamedVerifyPrior;
+
+    fn fronting_generation(proposals: usize, chain: Vec<Guess>) -> Generation {
+        let options = Options {
+            max_tokens: 64,
+            output_capacity: 64,
+            context_limit: 512,
+            vocabulary: 1024,
+            stop_tokens: BTreeSet::new(),
+            suppressed_tokens: BTreeSet::new(),
+            sampling: Sampling::Greedy,
+            shaping: Shaping {
+                temperature: 0.0,
+                ..Shaping::default()
+            },
+            seed: 0,
+            forced_quantum: 0,
+            method: MethodChoice::Mtp {
+                proposals: proposals as u8,
+            },
+            end_of_generation: EndOfGeneration::default(),
+            reasoning_budget: None,
+        };
+        let method = Arc::new(Mtp::new("glm53-test", proposals).unwrap().fronting().unwrap());
+        let mut generation = Generation::new_with_method(
+            vec![TokenId(1), TokenId(2)],
+            InputLayout::new(2, Vec::new()).unwrap(),
+            options,
+            None,
+            method,
+        )
+        .unwrap();
+        generation.resident = true;
+        generation.resident_position = 2;
+        generation.accepted_position = 3;
+        generation.generated.push(TokenId(10));
+        let mut two_row = TwoRowDecode::default();
+        two_row.guessed(chain);
+        generation.two_row = Some(two_row);
+        generation
+    }
+
+    fn make_chain(len: usize) -> Vec<Guess> {
+        (0..len)
+            .map(|i| Guess {
+                token: TokenId(20 + i as u32),
+                kind: if i + 1 == len {
+                    GuessKind::Head
+                } else {
+                    GuessKind::Chained
+                },
+            })
+            .collect()
+    }
+
+    /// Reproduces GLM-5.3 UD-IQ2_XXS + Embedded MTP (`f6ec8c` on RTX 5090):
+    /// high streamed PCIe I/O (~15-20 ms/row marginal) + ~59% empirical
+    /// acceptance MUST cap verify width tightly instead of blasting 14-16
+    /// token verify batches.
+    #[test]
+    fn high_io_and_moderate_acceptance_caps_verify_width() {
+        let chain = make_chain(15);
+        let gen = fronting_generation(15, chain);
+        // Streamed MoE prior: exact row I/O 40 ms, +18 ms/row marginal I/O,
+        // resident compute 8 ms + 1 ms/row, 59% empirical conditional acceptance.
+        let io_seconds: Vec<f64> = (0..=15).map(|k| 0.040 + 0.018 * k as f64).collect();
+        let compute_seconds: Vec<f64> = (0..=15).map(|m| 0.008 + 0.001 * m as f64).collect();
+        let verify_seconds: Vec<f64> = io_seconds
+            .iter()
+            .zip(&compute_seconds)
+            .map(|(&io, &c)| io.max(c))
+            .collect();
+        gen.observe_streamed_prior(Some(StreamedVerifyPrior {
+            regime_epoch: 1,
+            verify_seconds,
+            compute_seconds,
+            io_seconds,
+            front_stall_saved_per_row: 0.010,
+            front_waste_per_row: vec![0.015; 15],
+            verify_host_overhead_seconds: 0.002,
+            verify_host_overhead_per_step_seconds: 0.0,
+            accepts: vec![Some(0.59)],
+            stand: Some(0.59),
+            ..Default::default()
+        }));
+
+        let two_row = gen.two_row.as_ref().unwrap();
+        let (rows, (plan, _proposals)) = gen
+            .seal_front_pass(
+                PassId {
+                    request: RequestId(1),
+                    generation: 0,
+                    pass: 0,
+                },
+                two_row,
+                16,
+                15,
+                FrontGrant::Verify(15),
+                63,
+            )
+            .unwrap();
+
+        assert!(
+            plan.verify <= 3,
+            "high-I/O + 59% acceptance must cap verify width tightly (never 14-16), got K = {}, F = {}, pricing = {:?}",
+            plan.verify,
+            plan.front,
+            plan.pricing
+        );
+        assert_eq!(rows.acceptable().len(), plan.verify);
+        assert_eq!(rows.guesses().len(), plan.front);
+        assert!(
+            plan.pricing.compulsory_io_seconds >= 0.040,
+            "sealed plan must reflect real compulsory I/O, got {}",
+            plan.pricing.compulsory_io_seconds
+        );
+    }
+
+    /// High-acceptance (95%+) VRAM-resident / low-I/O (DSpark or Qwen3.8):
+    /// `seal_front_pass` must still select optimal wide verify.
+    #[test]
+    fn high_acceptance_resident_keeps_wide_verify() {
+        let chain = make_chain(7);
+        let gen = fronting_generation(7, chain);
+        // VRAM-resident: zero I/O, gentle compute slope (10 ms + 1 ms/row),
+        // 95% conditional acceptance across depths.
+        let compute_seconds: Vec<f64> = (0..=7).map(|m| 0.010 + 0.001 * m as f64).collect();
+        gen.observe_streamed_prior(Some(StreamedVerifyPrior {
+            regime_epoch: 1,
+            verify_seconds: compute_seconds.clone(),
+            compute_seconds,
+            io_seconds: vec![0.0; 8],
+            front_stall_saved_per_row: 0.0,
+            front_waste_per_row: vec![0.0; 7],
+            verify_host_overhead_seconds: 0.001,
+            verify_host_overhead_per_step_seconds: 0.0,
+            accepts: vec![Some(0.95); 7],
+            stand: Some(0.95),
+            ..Default::default()
+        }));
+
+        let two_row = gen.two_row.as_ref().unwrap();
+        let (rows, (plan, _)) = gen
+            .seal_front_pass(
+                PassId {
+                    request: RequestId(1),
+                    generation: 0,
+                    pass: 0,
+                },
+                two_row,
+                8,
+                7,
+                FrontGrant::Verify(7),
+                63,
+            )
+            .unwrap();
+
+        assert!(
+            plan.verify >= 6,
+            "95% acceptance VRAM-resident must keep wide verify (K >= 6), got K = {}, pricing = {:?}",
+            plan.verify,
+            plan.pricing
+        );
+        assert_eq!(plan.front, 0, "resident pass has zero stall so F must be 0");
+        assert_eq!(rows.acceptable().len(), plan.verify);
+    }
+
+    /// Empirical acceptance accumulated in `PassOutcomeTracker` (even when
+    /// watcher `accepts` is empty after a regime reset) caps verify width
+    /// under high I/O.
+    #[test]
+    fn tracker_empirical_acceptance_caps_verify_when_watcher_accepts_empty() {
+        let chain = make_chain(15);
+        let mut gen = fronting_generation(15, chain);
+        // Settle 10 passes with 59% (6/10) match rate at depth 1.
+        for pass in 0..10u64 {
+            let pid = PassId {
+                request: RequestId(1),
+                generation: 0,
+                pass,
+            };
+            let proposals = vec![TokenId(20)];
+            let plan = DecodePassPlan {
+                pass_id: pid,
+                generated: 1,
+                verify: 1,
+                front: 0,
+                idle_front: 0,
+                reserved_capacity: 2,
+                pricing: DecodePassScorer::score_candidate(
+                    0.0,
+                    1,
+                    0,
+                    &[1.0],
+                    HorizonLimits::UNBOUNDED,
+                    &PassCostModel::unit_compute(2),
+                ),
+            };
+            gen.pass_outcomes.feed(plan, proposals.clone());
+            let samples = if pass < 6 {
+                vec![TokenId(20), TokenId(99)]
+            } else {
+                vec![TokenId(88), TokenId(99)]
+            };
+            let outcome = PassOutcome::from_samples(&plan, &proposals, &samples, &BTreeSet::new()).unwrap();
+            gen.pass_outcomes.record_verdict(outcome);
+        }
+        assert!(
+            (gen.pass_outcomes.conditional_rate(1).unwrap() - 0.6).abs() < 1e-12
+        );
+
+        let io_seconds: Vec<f64> = (0..=15).map(|k| 0.040 + 0.018 * k as f64).collect();
+        let compute_seconds: Vec<f64> = (0..=15).map(|m| 0.008 + 0.001 * m as f64).collect();
+        gen.observe_streamed_prior(Some(StreamedVerifyPrior {
+            regime_epoch: 2,
+            verify_seconds: io_seconds.clone(),
+            compute_seconds,
+            io_seconds,
+            front_stall_saved_per_row: 0.010,
+            front_waste_per_row: vec![0.015; 15],
+            verify_host_overhead_seconds: 0.002,
+            verify_host_overhead_per_step_seconds: 0.0,
+            accepts: Vec::new(),
+            stand: None,
+            ..Default::default()
+        }));
+
+        let two_row = gen.two_row.as_ref().unwrap();
+        let (_rows, (plan, _)) = gen
+            .seal_front_pass(
+                PassId {
+                    request: RequestId(1),
+                    generation: 0,
+                    pass: 10,
+                },
+                two_row,
+                16,
+                15,
+                FrontGrant::Verify(15),
+                63,
+            )
+            .unwrap();
+
+        assert!(
+            plan.verify <= 3,
+            "tracker empirical 60% acceptance must cap verify width under high I/O, got K = {}",
+            plan.verify
+        );
+    }
+
+    /// `FrontGrant::Exactly` (queued pass claim) preserves exact queued rows
+    /// and scores with real pricing rather than dummy zero-I/O values.
+    #[test]
+    fn exact_front_grant_preserves_queued_rows_with_real_pricing() {
+        let chain = make_chain(2);
+        let gen = fronting_generation(4, chain);
+        gen.observe_streamed_prior(Some(StreamedVerifyPrior {
+            regime_epoch: 1,
+            verify_seconds: vec![0.040, 0.055, 0.070, 0.085, 0.100],
+            compute_seconds: vec![0.008, 0.009, 0.010, 0.011, 0.012],
+            io_seconds: vec![0.040, 0.055, 0.070, 0.085, 0.100],
+            front_stall_saved_per_row: 0.012,
+            front_waste_per_row: vec![0.005; 4],
+            verify_host_overhead_seconds: 0.002,
+            verify_host_overhead_per_step_seconds: 0.0,
+            accepts: vec![Some(0.75)],
+            stand: Some(0.75),
+            ..Default::default()
+        }));
+
+        let two_row = gen.two_row.as_ref().unwrap();
+        let (rows, (plan, _)) = gen
+            .seal_front_pass(
+                PassId {
+                    request: RequestId(1),
+                    generation: 0,
+                    pass: 0,
+                },
+                two_row,
+                5,
+                4,
+                FrontGrant::Exactly(4),
+                63,
+            )
+            .unwrap();
+
+        assert_eq!(plan.verify, 0);
+        assert_eq!(plan.front, 2);
+        assert_eq!(plan.idle_front, 2);
+        assert_eq!(rows.row_count(), 5);
+        assert!((plan.pricing.compulsory_io_seconds - 0.040).abs() < 1e-12);
+        assert!((plan.pricing.compute_seconds - 0.012).abs() < 1e-12);
+    }
+
+    /// Reproduces `e13e3b` (`rtx3090-64g-gen4` Qwen3.8 path-bound `TwoRowDecode`):
+    /// when `FrontGrant::Verify` runs an unchained pass (`chain == None`) under
+    /// path-bound stall + verify host overhead where `(K = 0, F = 1)` would
+    /// otherwise outscore `(K = 0, F = 0)` and `(K >= 1, F)`, `seal_front_pass`
+    /// MUST never emit `(K == 0, F > 0)` and the resulting `RoundState::pass`
+    /// MUST validate cleanly via `into_operation` without `OperationError::FrontRows`.
+    #[test]
+    fn unchained_verify_grant_never_seals_k0_with_front_rows() {
+        let chain = make_chain(4);
+        let gen = fronting_generation(4, chain);
+        // High verify host overhead + high stall saved with low front waste:
+        // unrestricted scorer would pick (K = 0, F = 1), which is illegal for
+        // `WorkKind::Decode` with `chain == None`.
+        gen.observe_streamed_prior(Some(StreamedVerifyPrior {
+            regime_epoch: 1,
+            verify_seconds: vec![0.040, 0.080, 0.120, 0.160, 0.200],
+            compute_seconds: vec![0.008, 0.009, 0.010, 0.011, 0.012],
+            io_seconds: vec![0.040, 0.080, 0.120, 0.160, 0.200],
+            front_stall_saved_per_row: 0.025,
+            front_waste_per_row: vec![0.002; 4],
+            verify_host_overhead_seconds: 0.020,
+            verify_host_overhead_per_step_seconds: 0.0,
+            accepts: vec![Some(0.60)],
+            stand: Some(0.60),
+            ..Default::default()
+        }));
+
+        let two_row = gen.two_row.as_ref().unwrap();
+        let (rows, (plan, _)) = gen
+            .seal_front_pass(
+                PassId {
+                    request: RequestId(1),
+                    generation: 0,
+                    pass: 0,
+                },
+                two_row,
+                5,
+                4,
+                FrontGrant::Verify(4),
+                63,
+            )
+            .unwrap();
+
+        assert!(
+            !(plan.verify == 0 && plan.front > 0),
+            "unchained Verify grant must never seal K == 0 with F > 0: {plan:?}"
+        );
+        let round = RoundState::pass(
+            *gen.generated.last().unwrap(),
+            rows,
+            gen.generated.len(),
+            &gen.generated,
+            None,
+            gen.options.sampling,
+            gen.options.shaping,
+            gen.options.seed,
+            Demand::FEATURES,
+            None,
+        )
+        .unwrap();
+        round
+            .forward()
+            .clone()
+            .into_operation(RequestId(1), gen.resident_position, None)
+            .expect("sealed unchained pass must pass Operation::validate without FrontRows error");
+    }
+
+    /// Reproduces `5e0635` vs `7079d0` (Qwen3.8 on 5090-64g, 88% VRAM-resident,
+    /// `FrontGrant::Verify(15)`): a verify-only grant must NOT inject `F = 1`
+    /// front rows or apply phantom `front_credit` that traps `seal_front_pass`
+    /// at `K = 6, F = 1` (`M = 8` class = 7 tok/step) when `K = 15, F = 0`
+    /// (`16` tok/step) has higher throughput.
+    #[test]
+    fn verify_only_grant_does_not_trap_wide_resident_verify_at_k6_f1() {
+        let chain = make_chain(15);
+        let gen = fronting_generation(15, chain);
+        // Power-of-two compute classes (M = 1..=8 at 15 ms, M = 9..=16 at 24 ms)
+        // with low PCIe I/O (12 ms + 1.5 ms/row) and unmeasured stall fallback
+        // (`front_stall_saved_per_row = 0.015`).
+        let compute_seconds: Vec<f64> = (1..=16)
+            .map(|rows| if rows <= 8 { 0.015 } else { 0.024 })
+            .collect();
+        let io_seconds: Vec<f64> = (0..=15).map(|k| 0.012 + 0.0015 * k as f64).collect();
+        let verify_seconds: Vec<f64> = compute_seconds
+            .iter()
+            .zip(&io_seconds)
+            .map(|(&c, &io)| c.max(io))
+            .collect();
+        gen.observe_streamed_prior(Some(StreamedVerifyPrior {
+            regime_epoch: 1,
+            verify_seconds,
+            compute_seconds,
+            io_seconds,
+            front_stall_saved_per_row: 0.015,
+            front_waste_per_row: vec![0.002; 15],
+            verify_host_overhead_seconds: 0.002,
+            verify_host_overhead_per_step_seconds: 0.0,
+            accepts: vec![Some(0.95); 15],
+            stand: Some(0.95),
+            ..Default::default()
+        }));
+
+        let two_row = gen.two_row.as_ref().unwrap();
+        let (rows, (plan, _)) = gen
+            .seal_front_pass(
+                PassId {
+                    request: RequestId(1),
+                    generation: 0,
+                    pass: 0,
+                },
+                two_row,
+                16,
+                15,
+                FrontGrant::Verify(15),
+                63,
+            )
+            .unwrap();
+
+        assert_eq!(plan.front, 0, "FrontGrant::Verify must keep F == 0, got {plan:?}");
+        assert!(
+            plan.verify >= 12,
+            "mostly VRAM-resident high-acceptance Verify(15) must widen past K=6 (got K = {})",
+            plan.verify
+        );
+        assert_eq!(rows.acceptable().len(), plan.verify);
+        assert_eq!(rows.guesses().len(), 0);
     }
 }

@@ -1005,7 +1005,9 @@ impl MethodState for DrafterState {
         let entry_bound = self.entry_bound();
         let generated = match &mut self.round {
             RoundStage::Proposed { proposal, verified } => {
-                // The verified prefix is all a round offers the target.
+                // The verified prefix is all a round may accept; trailing
+                // proposals beyond `count` run as front rows when the live
+                // cost function `DraftController::front_rows` picks `F* > 0`.
                 let count = match (&mut self.width, *verified) {
                     (_, Some(verified)) => verified,
                     (WidthPolicy::Adaptive(control), None) => control.verify(selects.len()),
@@ -1014,15 +1016,21 @@ impl MethodState for DrafterState {
                 .min(proposal.len())
                 .min(selects.len());
                 *verified = Some(count);
-                return Propose::Tokens(proposal[..count].to_vec());
+                // Speculative verify passes run on non-fronting target graphs
+                // (`load.fronts() == false`, `inputs.guesses == None`), so
+                // trailing front rows must stay empty.
+                return Propose::Tokens {
+                    acceptable: proposal[..count].to_vec(),
+                    front: Vec::new(),
+                };
             }
             RoundStage::Declined | RoundStage::Entering { .. } | RoundStage::Drafting(_) => {
-                return Propose::Tokens(Vec::new());
+                return Propose::empty();
             }
             RoundStage::ResumeDraft(generated) if generated.get() <= selects.len() => *generated,
             stage @ (RoundStage::Idle | RoundStage::ResumeDraft(_)) => {
                 if selects.is_empty() {
-                    return Propose::Tokens(Vec::new());
+                    return Propose::empty();
                 }
                 // A round drafts a prepared width that fits what the request can
                 // still produce, or nothing; only from its anchor's pair. A
@@ -1035,7 +1043,7 @@ impl MethodState for DrafterState {
                     HistoryState::OwnHistory {
                         tail: OwnHistoryTail::Open { .. },
                         ..
-                    } => return Propose::Tokens(Vec::new()),
+                    } => return Propose::empty(),
                     HistoryState::TargetReading { anchor: None, .. }
                     | HistoryState::OwnHistory {
                         tail: OwnHistoryTail::Empty | OwnHistoryTail::Unanchored(_),
@@ -1052,7 +1060,7 @@ impl MethodState for DrafterState {
                                 *stage = RoundStage::Declined;
                             }
                         }
-                        return Propose::Tokens(Vec::new());
+                        return Propose::empty();
                     }
                     HistoryState::TargetReading { anchor: Some(_), .. }
                     | HistoryState::OwnHistory {
@@ -1070,7 +1078,7 @@ impl MethodState for DrafterState {
                             NonZeroUsize::new(generated).filter(|g| g.get() <= selects.len())
                         else {
                             *stage = RoundStage::Declined;
-                            return Propose::Tokens(Vec::new());
+                            return Propose::empty();
                         };
                         generated
                     }
@@ -1115,7 +1123,7 @@ impl MethodState for DrafterState {
                 tail:
                     OwnHistoryTail::Empty | OwnHistoryTail::Unanchored(_) | OwnHistoryTail::Open { .. },
                 ..
-            } => return Propose::Tokens(Vec::new()),
+            } => return Propose::empty(),
         };
         debug_assert_eq!(
             self.round_state()
@@ -1145,7 +1153,7 @@ impl MethodState for DrafterState {
         };
         let Ok(transaction) = transaction else {
             self.round = RoundStage::Declined;
-            return Propose::Tokens(Vec::new());
+            return Propose::empty();
         };
         let operation = transaction.operation().clone();
         self.round = RoundStage::Drafting(transaction);
@@ -1411,6 +1419,13 @@ impl MethodState for DrafterState {
                 control.outlook()
             }
             _ => None,
+        }
+    }
+
+    fn pass_plan(&self) -> Option<crate::DecodePassPlan> {
+        match &self.width {
+            WidthPolicy::Adaptive(control) => control.sealed_plan(),
+            WidthPolicy::Fixed(_) => None,
         }
     }
 

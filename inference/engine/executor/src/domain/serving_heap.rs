@@ -31,7 +31,7 @@ pub struct TwoRowPricing {
     rows: usize,
     verifies: usize,
     whole: bool,
-    pub(super) overhead: Option<f64>,
+    pub(super) overhead: Option<magnitude_cost_model::VerifyOverhead>,
 }
 
 /// A decode launch's pass as the regime decides it
@@ -54,13 +54,41 @@ pub struct FrontRegime {
 /// probe wide verify widths blindly when streaming makes them expensive, and
 /// keys target verify measurements to `regime_epoch` so prior-regime
 /// measurements become inapplicable by construction.
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, Default, PartialEq)]
 pub struct StreamedVerifyPrior {
     pub regime_epoch: u64,
     /// Prior target-launch seconds for `1 + k` rows per sequence:
     /// index 0 = plain decode `regime.time(0)`,
     /// index `k >= 1` = `regime.verify_pass_time(k)`.
     pub verify_seconds: Vec<f64>,
+    /// Live resident compute seconds `C(1 + m)` for `m = 0..=max_rows`
+    /// (from `regime.resident`).
+    pub compute_seconds: Vec<f64>,
+    /// Live path I/O seconds `I/O(k, 0)` for `k = 0..=max_k`
+    /// (from `regime.verify_io_seconds(k)`).
+    pub io_seconds: Vec<f64>,
+    /// Live expected stall seconds saved per standing trailing front row
+    /// (`regime.front_stall_saved_per_row()`).
+    pub front_stall_saved_per_row: f64,
+    /// Live expected wasted path seconds per falling trailing front row at
+    /// depth `d >= 1` (`index d - 1`, from `regime.front_waste_per_row(d)`).
+    pub front_waste_per_row: Vec<f64>,
+    /// Live measured fixed host turn overhead after a verify pass in seconds
+    /// (`regime.overhead.map_or(0.0, |o| o.fixed)`).
+    pub verify_host_overhead_seconds: f64,
+    /// Live measured per-draft-step head overhead inside a verify turn in
+    /// seconds (`regime.overhead.map_or(0.0, |o| o.per_step)`).
+    pub verify_host_overhead_per_step_seconds: f64,
+    /// Live empirical per-depth conditional stand rates from the watcher
+    /// (`regime.accepts`: index `d - 1` is `P(depth d stands | depths < d stood)`).
+    pub accepts: Vec<Option<f64>>,
+    /// Live empirical stand rate of a front pass's first row (`regime.stand`).
+    pub stand: Option<f64>,
+    /// Largest per-sequence row count `1 + k` whose single-step distinct expert
+    /// working set fits in per-layer VRAM (`distinct(1 + k) <= vram_slots`);
+    /// `None` when the widest priced verify pass fits in VRAM or bank capacity
+    /// is unavailable.
+    pub vram_knee_rows: Option<usize>,
 }
 
 impl TwoRowPricing {
@@ -86,6 +114,7 @@ impl TwoRowPricing {
         let verifying = self.measured.as_ref().is_some_and(|measured| measured.verifying);
         let reach = |depth: usize| if verifying { depth } else { depth.min(running + 1) };
         let (form, depth) = match pass {
+            magnitude_cost_model::Form::Front(0) => (crate::BuiltForm::Plain, 0),
             magnitude_cost_model::Form::Front(depth) => (crate::BuiltForm::Front, reach(depth)),
             magnitude_cost_model::Form::Verify(depth) => (crate::BuiltForm::Verify, reach(depth)),
         };
@@ -119,7 +148,7 @@ impl TwoRowPricing {
         let Some(measured) = self.measured.as_ref().filter(|_| fronted > 0) else {
             return Ok(None);
         };
-        let (paths, needed, stall) = match (!self.whole).then(|| measured.paths.clone()).flatten() {
+        let (paths, needed, stall, front_stall, verify_stall) = match (!self.whole).then(|| measured.paths.clone()).flatten() {
             Some(paths) => {
                 let (Some(front), Some(verify)) = (
                     measured.needed[0].into_iter().collect::<Option<Vec<_>>>(),
@@ -127,12 +156,20 @@ impl TwoRowPricing {
                 ) else {
                     return Ok(None);
                 };
-                (paths, magnitude_cost_model::NeededByForm { front, verify }, measured.stall)
+                (
+                    paths,
+                    magnitude_cost_model::NeededByForm { front, verify },
+                    measured.stall,
+                    measured.front_stall.to_vec(),
+                    measured.verify_stall.to_vec(),
+                )
             }
             None => (
                 Vec::new(),
                 magnitude_cost_model::NeededByForm::both(vec![magnitude_cost_model::Needed::Executed(0.); crate::experts::DEPTHS]),
                 None,
+                Vec::new(),
+                Vec::new(),
             ),
         };
         let deepest = (1..crate::experts::DEPTHS)
@@ -151,26 +188,33 @@ impl TwoRowPricing {
                 .map(|form| if self.whole { form.resident } else { form.streamed })
                 .map_err(|error| DomainError::invariant(format!("the decode launch: {error}")))
         };
-        let measured_at = |depth: usize| measured.terms_for(self.whole && depth > 0, depth).map(|terms| terms.compute);
-        let resident = (0..=deepest)
-            .map(|depth| match measured_at(depth) {
-                Some(resident) => Ok(resident),
-                None => {
-                    let nearest = (0..=depth).rev().chain(depth + 1..crate::experts::DEPTHS).find(|&at| measured_at(at).is_some());
-                    let at = nearest.expect("a timed pass has a depth");
-                    let resident = measured_at(at).expect("the nearest measured depth");
-                    Ok(resident * price(depth)? / price(at.min(deepest))?)
-                }
-            })
-            .collect::<Result<Vec<_>, DomainError>>()?;
+        let build_resident = |verify: bool| -> Result<Vec<f64>, DomainError> {
+            let measured_at = |depth: usize| measured.terms_for(verify && depth > 0, depth).map(|terms| terms.compute);
+            (0..=deepest)
+                .map(|depth| match measured_at(depth) {
+                    Some(resident) => Ok(resident),
+                    None => {
+                        let nearest = (0..=depth).rev().chain(depth + 1..crate::experts::DEPTHS).find(|&at| measured_at(at).is_some());
+                        let at = nearest.expect("a timed pass has a depth");
+                        let resident = measured_at(at).expect("the nearest measured depth");
+                        Ok(resident * price(depth)? / price(at.min(deepest))?)
+                    }
+                })
+                .collect()
+        };
+        let resident = build_resident(false)?;
+        let verify_resident = build_resident(true)?;
         let accepts = measured.accepts[..self.verifies.min(measured.accepts.len())].to_vec();
         let verify_routes = magnitude_cost_model::VerifyRoutes { layers: measured.layers, fresh: routes.fresh };
         let regime = magnitude_cost_model::Regime {
             resident,
+            verify_resident,
             needed,
             stand: measured.stand,
             accepts,
             stall,
+            front_stall,
+            verify_stall,
             overhead: self.overhead,
             paths,
             routes: verify_routes,
@@ -567,9 +611,12 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
         let Some(bank) = self.family.expert_bank() else {
             return Ok(None);
         };
+        let slots = self
+            .expert_bank_plan()
+            .map_or_else(|| bank.slots(), |plan| plan.target_slots(bank.slots()));
         let count = |value: u64| usize::try_from(value).expect("invariant violated: a bank's slots exceed the host's");
-        let host = bank.residency()?.host.map_or(0, |host| host.slots);
-        Ok(Some(magnitude_cost_model::HeldSlots { slots: count(bank.slots()), host: count(host) }))
+        let host = bank.host_slots();
+        Ok(Some(magnitude_cost_model::HeldSlots { slots: count(slots), host: count(host) }))
     }
 
     /// The workload prior of the load's planned context and limits
@@ -600,16 +647,34 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
             self.family.expert_bank(),
             self.expert_bank_plan(),
         ) {
-            if let (Some(price), Some(held)) = (self.decode_price()?, self.held_slots()?) {
-                let floor = usize::try_from(plan.floor()).expect("invariant violated: a bank's slots exceed the host's");
-                let saved = if floor.min(held.slots) == held.slots {
-                    0.0
-                } else {
-                    let at_held = price.step(held).total_seconds;
-                    held_step_seconds = Some(at_held);
-                    price.step(magnitude_cost_model::HeldSlots { slots: floor, ..held }).total_seconds - at_held
-                };
-                bank.value(Value::recompute(saved.max(0.0), self.served.decode_steps, bytes));
+            if let Some(held) = self.held_slots()? {
+                let live_steps = bank.live_steps();
+                let measures_generation = self.measures_generation;
+                if let Some(cached) = self.bank_value_cache.filter(|c| {
+                    c.measures_generation == measures_generation
+                        && c.held == held
+                        && c.live_steps == live_steps
+                }) {
+                    held_step_seconds = cached.held_step_seconds;
+                    bank.value(Value::recompute(cached.saved.max(0.0), self.served.decode_steps, bytes));
+                } else if let Some(price) = self.decode_price()? {
+                    let floor = usize::try_from(plan.target_slots(plan.floor())).expect("invariant violated: a bank's slots exceed the host's");
+                    let saved = if floor.min(held.slots) == held.slots {
+                        0.0
+                    } else {
+                        let at_held = price.step(held).total_seconds;
+                        held_step_seconds = Some(at_held);
+                        price.step(magnitude_cost_model::HeldSlots { slots: floor, ..held }).total_seconds - at_held
+                    };
+                    bank.value(Value::recompute(saved.max(0.0), self.served.decode_steps, bytes));
+                    self.bank_value_cache = Some(super::BankValueCache {
+                        measures_generation,
+                        held,
+                        live_steps,
+                        held_step_seconds,
+                        saved,
+                    });
+                }
             }
         }
         self.value_idle_class();
@@ -854,7 +919,7 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
             rows: self.chained_rows(),
             verifies: self.execution.policy().method().draft_rows(),
             whole: price.whole(held),
-            overhead: self.verify_turns.mean(bank.regime_epoch(), bank.bank_epoch()),
+            overhead: self.verify_turns.overhead(bank.regime_epoch(), bank.bank_epoch()),
         }))
     }
 
@@ -877,9 +942,45 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
             return Ok(None);
         };
         let verifies = regime.accepts.len().min(regime.resident.len().saturating_sub(1));
+        let max_front = regime.resident.len().saturating_sub(1);
+        let vram = self.expert_bank_plan().and_then(|plan| {
+            let slots = bank.slots();
+            let mut count = 0usize;
+            let mut vram_slots_sum = 0u64;
+            let mut total_experts_sum = 0u64;
+            let mut selected_sum = 0u64;
+            for layer in plan.layers().iter().filter(|layer| !layer.is_draft()) {
+                count += 1;
+                vram_slots_sum += plan.layer_vram_slots(layer, slots);
+                total_experts_sum += layer.experts;
+                selected_sum += layer.selected;
+            }
+            if count == 0 {
+                return None;
+            }
+            Some(magnitude_cost_model::VramWorkingSet {
+                vram_slots: (vram_slots_sum as f64 / count as f64) / sequences as f64,
+                total_experts: total_experts_sum as f64 / count as f64,
+                selected: selected_sum as f64 / count as f64,
+            })
+        });
+        let vram_knee_rows = vram.and_then(|v| regime.vram_knee_rows(verifies, v));
         Ok(Some(StreamedVerifyPrior {
             regime_epoch: bank.regime_epoch(),
-            verify_seconds: regime.verify_prior(verifies),
+            verify_seconds: regime.verify_prior_in_vram(verifies, vram),
+            compute_seconds: regime.resident.clone(),
+            io_seconds: (0..=verifies)
+                .map(|k| regime.verify_io_seconds_in_vram(k, vram))
+                .collect(),
+            front_stall_saved_per_row: regime.front_stall_saved_per_row(),
+            front_waste_per_row: (1..=max_front)
+                .map(|depth| regime.front_waste_per_row(depth))
+                .collect(),
+            verify_host_overhead_seconds: regime.overhead.map_or(0.0, |o| o.fixed).max(0.0),
+            verify_host_overhead_per_step_seconds: regime.overhead.map_or(0.0, |o| o.per_step).max(0.0),
+            accepts: regime.accepts,
+            stand: regime.stand,
+            vram_knee_rows,
         }))
     }
 

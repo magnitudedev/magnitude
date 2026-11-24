@@ -769,6 +769,19 @@ pub enum MemoryStanding {
     Active,
 }
 
+/// Cached bank recompute valuation ([`ExecutorDomain::value_cache`]):
+/// invalidated automatically whenever `measures_generation`, `held`, or
+/// `live_steps` moves, avoiding repeated `LiveDecode` clones and `DecodePrice`
+/// evaluations on flight boundaries that changed none of them (e.g. `Head`).
+#[derive(Clone, Copy, Debug)]
+struct BankValueCache {
+    measures_generation: u64,
+    held: magnitude_cost_model::HeldSlots,
+    live_steps: u64,
+    held_step_seconds: Option<f64>,
+    saved: f64,
+}
+
 /// Snapshot of a store's ledger figures when a bank growth on that tier was
 /// refused by the allocator (`BankResized::GrowthRefused` or partial
 /// `BankResized::Grown { refused: Some(_), .. }`). Suppresses retrying growth
@@ -876,6 +889,15 @@ pub struct ExecutorDomain<F: ProgramFamily = NativeFamily> {
     /// ([`Self::measure_load`]); none before, so a warm-up's steps are not
     /// counted.
     measures: Option<LoadMeasures>,
+    /// Incremented on every [`Self::measure_load`] call so cached derivations
+    /// (`streamed_layers`, `bank_value_cache`) invalidate by construction.
+    measures_generation: u64,
+    /// Cached [`magnitude_cost_model::StreamedLayers`] built once per
+    /// [`Self::measure_load`] instead of reconstructing `MissModel` on every
+    /// flight boundary.
+    streamed_layers: Option<magnitude_cost_model::StreamedLayers>,
+    /// Memoized bank recompute valuation for [`Self::value_cache`].
+    bank_value_cache: Option<BankValueCache>,
     /// What expert bank resizes held the submitting thread.
     resize_held: ResizeHeld,
     /// A bank shrink began and its step, the next decode launch, has not
@@ -1152,6 +1174,12 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
             (Some(_), None) => panic!("invariant violated: expert measures of a load without a bank"),
         }
         tracing::info!(costs = measures.costs.as_ref().err().map_or("measured", String::as_str), "the load is priced");
+        self.streamed_layers = match (measures.experts.as_ref().and_then(|e| e.lines.measured()), self.family.expert_bank()) {
+            (Some(lines), Some(bank)) => Some(bank.streamed_layers(lines.clone())),
+            _ => None,
+        };
+        self.measures_generation += 1;
+        self.bank_value_cache = None;
         self.measures = Some(measures);
         Ok(())
     }
@@ -1231,7 +1259,10 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
         let step = |rows: u32, depth: u32| {
             prices.launch(rows, depth).map_err(|error| DomainError::invariant(format!("the decode step: {error}")))
         };
-        let layers = bank.streamed_layers(lines.clone());
+        let layers = match &self.streamed_layers {
+            Some(cached) => cached.clone(),
+            None => bank.streamed_layers(lines.clone()),
+        };
         Ok(Some(match bank.live() {
             Some(live) => {
                 let compute = step(live.rows.round() as u32, live.depth)?;
@@ -3245,6 +3276,9 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
             host_turn: None,
             verify_turns: in_flight::VerifyTurns::default(),
             measures: None,
+            measures_generation: 0,
+            streamed_layers: None,
+            bank_value_cache: None,
             resize_held: ResizeHeld::default(),
             shrink_step: false,
             growth_refused: [None; crate::planning::BankTier::COUNT],

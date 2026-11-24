@@ -162,6 +162,15 @@ pub trait ElasticBank {
     /// is priced on; none before it counted a step.
     fn live(&self) -> Option<magnitude_cost_model::LiveDecode>;
 
+    /// The number of counted decode steps reflected in [`Self::live`]: lock-free
+    /// change check so callers can skip cloning [`magnitude_cost_model::LiveDecode`]
+    /// when no new decode step has been folded in.
+    fn live_steps(&self) -> u64;
+
+    /// The host tier's committed slots now (0 without a host tier): O(1) read
+    /// avoiding a full [`Self::residency`] traversal.
+    fn host_slots(&self) -> u64;
+
     /// What the decode's passes measured, which the regime bit is decided
     /// on (`TwoRowPricing::regime`); none before a pass is timed.
     fn measured(&self) -> Option<crate::experts::Measured>;

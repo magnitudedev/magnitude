@@ -818,6 +818,12 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
         } = flight;
         let completed = submission.finish().map_err(DomainError::Device)?;
         let finished_wait = Instant::now();
+        let head_requests: Vec<RequestId> = requests.iter().map(|(request, ..)| *request).collect();
+        self.verify_turns.head_finished(
+            &head_requests,
+            steps,
+            finished_wait.saturating_duration_since(entered_submit),
+        );
         if let Some(trace) = &launch_trace {
             let submissions = trace
                 .collect()
@@ -873,7 +879,7 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
         let HeadOutput {
             selected,
             landed_reads: _,
-            expert_step: _,
+            expert_steps: _,
         } = output;
         let selections = match selected {
             HeadSelected::Causal => None,

@@ -211,13 +211,13 @@ fn a_verify_pass_times_the_host_turn_its_overhead_prices() {
     let bindings = step(&mut domain, bindings, 0, false);
     let bindings = step(&mut domain, bindings, 1, false);
     let bank = domain.family.expert_bank().unwrap();
-    assert_eq!(domain.verify_turns.mean(bank.regime_epoch(), bank.bank_epoch()), None, "no verify pass ran");
+    assert_eq!(domain.verify_turns.overhead(bank.regime_epoch(), bank.bank_epoch()), None, "no verify pass ran");
     let bindings = step(&mut domain, bindings, 2, true);
     let bank = domain.family.expert_bank().unwrap();
-    assert_eq!(domain.verify_turns.mean(bank.regime_epoch(), bank.bank_epoch()), None, "the turn is open until the next launch");
+    assert_eq!(domain.verify_turns.overhead(bank.regime_epoch(), bank.bank_epoch()), None, "the turn is open until the next launch");
     step(&mut domain, bindings, 3, false);
     let bank = domain.family.expert_bank().unwrap();
-    assert!(domain.verify_turns.mean(bank.regime_epoch(), bank.bank_epoch()).is_some(), "the next launch timed the verify pass's turn");
+    assert!(domain.verify_turns.overhead(bank.regime_epoch(), bank.bank_epoch()).is_some(), "the next launch timed the verify pass's turn");
     if let Some(pricing) = domain.two_row_pricing().unwrap() {
         assert!(pricing.overhead.is_some());
     }
@@ -1193,6 +1193,7 @@ fn a_refused_tier_copy_changes_neither_its_grid_nor_its_price() {
                 transfer: magnitude_cost_model::ReadLine::new(1e-5, 1e-10).unwrap(),
                 back: magnitude_cost_model::ReadLine::new(1e-5, 1e-10).unwrap(),
                 concurrent_host_byte_seconds: None,
+                concurrent_dma_byte_seconds: None,
             })),
             convert: crate::assessment::Priced::Measured(None),
         }),
@@ -2138,7 +2139,7 @@ fn attach_pending_priming(
         output: crate::programs::HeadOutput {
             selected: crate::programs::HeadSelected::Causal,
             landed_reads: Vec::new(),
-            expert_step: None,
+            expert_steps: Vec::new(),
         },
     });
     assert!(flight.work.priming.is_none());
@@ -3128,7 +3129,7 @@ fn a_reconciled_verdict_reaches_the_expert_bank_by_its_step() {
         front: Vec::new(),
         chain: None,
     };
-    let rows = crate::Rows::Exact { acceptable: vec![crate::TokenId(2)] };
+    let rows = crate::Rows::verify(vec![crate::TokenId(2)]);
     // Its exact row selects 3, rejecting the acceptable row: one row accepted.
     let verdict = crate::AheadVerdict::new(&rows, &[crate::TokenId(3), crate::TokenId(5)]);
     let decided = |verdict: &crate::AheadVerdict| PhysicalDecision { accepted_rows: 1, ahead: verdict.clone() };

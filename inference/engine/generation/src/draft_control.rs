@@ -29,8 +29,13 @@
 //!
 //! Requests verified in one launch share its rows ([`share_rows`]).
 
+use crate::decode_pass_plan::{
+    AcceptanceProfile, BatchPlanCandidate, ComputePricing, DecodePassPlan, DecodePassScorer,
+    DrafterSpec, FrontCreditModel, HorizonLimits, PassCostModel, PassId, RowMissPricing,
+    seal_batch_plans,
+};
 use magnitude_cost_model::LaunchPrices;
-use magnitude_executor::{draft_ladder, LaunchDuration, StreamedVerifyPrior, TokenId};
+use magnitude_executor::{draft_ladder, LaunchDuration, RequestId, StreamedVerifyPrior, TokenId};
 use std::{
     collections::BTreeMap,
     sync::{Arc, Mutex},
@@ -58,9 +63,11 @@ const MAX_COST_BUCKETS: usize = 64;
 /// and a plain decode not taken for that long is taken again, so a price
 /// left by a busier or freer machine lasts no longer.
 const STALE_ROUNDS: u64 = 100;
-/// Minimum rounds before an older streamed verify width that is >1.5x slower
-/// than what a more recent, warmed-up narrower width predicts expires on read,
-/// preventing cold-start residency timings from locking out `K = 7` (`M = 8`).
+/// Minimum rounds before an older streamed verify width whose cost exceeds
+/// what a more recent, warmed-up narrower width predicts via
+/// `StreamedVerifyPrior` is re-probed (backing off exponentially up to
+/// `STALE_ROUNDS` if the re-probe confirms the wider width is still slow),
+/// preventing cold-start residency timings from locking out wider widths.
 const WARMUP_DRIFT_ROUNDS: u64 = 16;
 /// The share of decode time spent on looks: wider and plain, each scaled
 /// down where little can be gained.
@@ -105,6 +112,10 @@ enum Switch {
 struct Durations {
     samples: [Measured; COST_SAMPLES],
     len: u8,
+    /// Consecutive stale re-probes that confirmed this width is still as slow
+    /// as its prior median; backs off the re-probe interval exponentially
+    /// (`WARMUP_DRIFT_ROUNDS << stale_probes`, capped at `STALE_ROUNDS`).
+    stale_probes: u8,
 }
 
 impl Default for Durations {
@@ -112,6 +123,7 @@ impl Default for Durations {
         Self {
             samples: [Measured { round: 0, seconds: 0.0, covering: false }; COST_SAMPLES],
             len: 0,
+            stale_probes: 0,
         }
     }
 }
@@ -149,8 +161,30 @@ impl Durations {
         self.len = write as u8;
     }
 
+    fn reprobe_interval(&self) -> u64 {
+        (WARMUP_DRIFT_ROUNDS << self.stale_probes.min(3)).min(STALE_ROUNDS)
+    }
+
     fn record(&mut self, round: u64, seconds: f64, covering: bool) {
         self.retain(|measured| round.saturating_sub(measured.round) < STALE_ROUNDS);
+        if self.len > 0 {
+            let age = round.saturating_sub(self.latest());
+            if age >= self.reprobe_interval() {
+                if seconds < self.cost() {
+                    // Warmup/speedup confirmed on re-probe: drop pre-warmup
+                    // samples so the new warm timing is not outvoted by stale
+                    // cold samples in the 3-sample median.
+                    self.len = 0;
+                    self.stale_probes = 0;
+                } else {
+                    // Re-probe confirmed this width is still slow: keep it
+                    // proven and back off the next re-probe exponentially.
+                    self.stale_probes = self.stale_probes.saturating_add(1);
+                }
+            } else if usize::from(self.len) == COST_SAMPLES {
+                self.stale_probes = 0;
+            }
+        }
         let len = usize::from(self.len);
         if len == COST_SAMPLES {
             self.samples.copy_within(1..COST_SAMPLES, 0);
@@ -187,6 +221,7 @@ impl Durations {
     /// Drop the durations measured beside a cover read, which has ended.
     fn settle(&mut self) {
         self.retain(|measured| !measured.covering);
+        self.stale_probes = 0;
     }
 
     fn measured(&self) -> bool {
@@ -739,11 +774,11 @@ impl<'a> RoundCosts<'a> {
                     return false;
                 }
                 // On streamed MoE, if residency warmed up after `d` was measured
-                // (a narrower width measured more recently implies >1.5x lower
-                // cost via `StreamedVerifyPrior` and `d` is at least
-                // `WARMUP_DRIFT_ROUNDS` old), expire `d` so wide bursts (`M=8`)
-                // are re-measured instead of staying locked out for 100 rounds.
-                if streamed && is_non_plain && self.round.saturating_sub(d.latest()) >= WARMUP_DRIFT_ROUNDS {
+                // (a narrower width measured more recently implies a lower cost
+                // via `StreamedVerifyPrior` and `d` is at least `reprobe_interval()`
+                // rounds old), expire `d` for a re-probe instead of letting cold
+                // samples lock out wider widths for `STALE_ROUNDS`.
+                if streamed && is_non_plain && self.round.saturating_sub(d.latest()) >= d.reprobe_interval() {
                     if let Some(prior) = self.verify_prior {
                         if let Some(prior_rows) = Self::prior_verify_seconds(prior, self.sequences, rows) {
                             let warmed_up = own.verify.iter().any(|(&ref_rows, ref_dur)| {
@@ -754,7 +789,7 @@ impl<'a> RoundCosts<'a> {
                                     && Self::prior_verify_seconds(prior, self.sequences, ref_rows)
                                         .filter(|&p| p > 0.0)
                                         .is_some_and(|prior_ref| {
-                                            ref_dur.cost() * (prior_rows / prior_ref) < d.cost() * 0.65
+                                            ref_dur.cost() * (prior_rows / prior_ref) < d.cost()
                                         })
                             });
                             if warmed_up {
@@ -863,6 +898,35 @@ impl<'a> RoundCosts<'a> {
         (1.0 - self.switch_weight) * cost(there) + cost(back)
     }
 
+    /// Build a [`PassCostModel`] representing this round's target verify and
+    /// switch costs for `verified in 0..=max_v` so `DraftController` and
+    /// `share_rows` score exclusively through [`DecodePassScorer`].
+    fn pass_cost_model(&self, generated: usize, max_v: usize) -> PassCostModel {
+        let switch = self
+            .switching(generated > 0)
+            .and_then(|switch| self.switch(switch))
+            .map_or(0.0, |switch| self.switch_weight * switch);
+        let by_rows = (0..=max_v)
+            .map(|v| self.verify(self.sequences * (v + 1)))
+            .collect();
+        PassCostModel {
+            compute: ComputePricing { by_rows },
+            io: RowMissPricing::ExpectedRates {
+                exact_row_misses: 0.0,
+                verify_marginal_misses: Vec::new(),
+                front_tail_misses: Vec::new(),
+                demand_seconds_per_miss: 0.0,
+                speculative_seconds_per_miss: 0.0,
+                displacement_seconds_per_miss: 0.0,
+                ddr_contention_seconds_per_miss: 0.0,
+            },
+            front_credit: FrontCreditModel::default(),
+            verify_host_overhead_seconds: switch,
+            verify_host_overhead_per_step_seconds: 0.0,
+            non_verify_host_overhead_seconds: switch,
+        }
+    }
+
     /// The price of a round's launches when both are measured here in the
     /// current regime.
     fn steady(&self, generated: usize, rows: usize) -> Option<f64> {
@@ -886,10 +950,11 @@ pub struct DraftOutlook {
 
 /// The target rows each of several requests takes in one verification
 /// launch of at most `rows`: its anchor's and those of the proposals it
-/// verifies. A launch runs as a row class, so its rows go to the proposals
-/// most often right, whichever requests drafted them, and the class is the
-/// one committing the most tokens per second. `None` when fewer than two
-/// requests share the launch: one request decides for itself.
+/// verifies. Delegates shared row-grant reservation and repricing to the
+/// single-owner [`seal_batch_plans`], evaluating each power-of-two launch row
+/// class and picking the class committing the most tokens per second.
+/// `None` when fewer than two requests share the launch: one request decides
+/// for itself.
 pub fn share_rows(outlooks: &[DraftOutlook], rows: usize) -> Option<Vec<usize>> {
     let requests = outlooks.len();
     if requests < 2 || rows < requests {
@@ -899,46 +964,69 @@ pub fn share_rows(outlooks: &[DraftOutlook], rows: usize) -> Option<Vec<usize>> 
     let state = outlooks[0].load.lock();
     let costs = RoundCosts::of(&state, context_class, requests, None);
     let drafted: f64 = outlooks.iter().map(|outlook| outlook.draft_seconds).sum();
-    // A request's proposals are no more often right the deeper they are, so
-    // taking proposals in this order takes each request's in depth order.
-    let mut proposals = outlooks
-        .iter()
-        .enumerate()
-        .flat_map(|(request, outlook)| {
-            outlook
-                .right
-                .iter()
-                .enumerate()
-                .map(move |(depth, right)| (*right, depth, request))
-        })
-        .collect::<Vec<_>>();
-    proposals.sort_by(|a, b| b.0.total_cmp(&a.0).then(a.1.cmp(&b.1)));
-    let mut best = (0, f64::NEG_INFINITY);
+    let max_proposals: usize = outlooks.iter().map(|outlook| outlook.right.len()).sum();
+
+    let mut best: Option<(Vec<usize>, f64)> = None;
     let mut class = requests.next_power_of_two();
     loop {
-        let verified = class
-            .min(rows)
-            .saturating_sub(requests)
-            .min(proposals.len());
-        let tokens = requests as f64
-            + proposals[..verified]
-                .iter()
-                .map(|(right, ..)| right)
-                .sum::<f64>();
-        let rate = tokens / (drafted + costs.verify(requests + verified)).max(1e-9);
-        if rate > best.1 {
-            best = (verified, rate);
+        let budget = class.min(rows).min(requests + max_proposals);
+        let class_verify = costs.verify(budget);
+        // Within a fixed launch row class `budget`, every request shares the
+        // same launch time `class_verify`, so `seal_batch_plans` allocates
+        // extra rows to the highest-acceptance proposals across requests
+        // without ever overbooking `budget`.
+        let candidates: Vec<BatchPlanCandidate> = outlooks
+            .iter()
+            .enumerate()
+            .map(|(idx, outlook)| BatchPlanCandidate {
+                pass_id: PassId {
+                    request: RequestId(idx as u64),
+                    generation: 0,
+                    pass: 0,
+                },
+                actual_generated: outlook.right.len(),
+                draft_seconds_paid: 0.0,
+                acceptance: AcceptanceProfile::Cumulative(outlook.right.clone()),
+                horizon: HorizonLimits::UNBOUNDED,
+                costs: PassCostModel {
+                    compute: ComputePricing {
+                        by_rows: vec![class_verify.max(1e-9); 1 + outlook.right.len()],
+                    },
+                    io: RowMissPricing::ExpectedRates {
+                        exact_row_misses: 0.0,
+                        verify_marginal_misses: Vec::new(),
+                        front_tail_misses: Vec::new(),
+                        demand_seconds_per_miss: 0.0,
+                        speculative_seconds_per_miss: 0.0,
+                        displacement_seconds_per_miss: 0.0,
+                        ddr_contention_seconds_per_miss: 0.0,
+                    },
+                    front_credit: FrontCreditModel::default(),
+                    verify_host_overhead_seconds: 0.0,
+                    verify_host_overhead_per_step_seconds: 0.0,
+                    non_verify_host_overhead_seconds: 0.0,
+                },
+                cancelled: false,
+            })
+            .collect();
+        let sealed = seal_batch_plans(&candidates, budget).ok()?;
+        let tokens: f64 = sealed
+            .plans
+            .iter()
+            .map(|plan| plan.pricing.expected_tokens)
+            .sum();
+        let used_rows = sealed.total_reserved_rows;
+        let rate = tokens / (drafted + costs.verify(budget)).max(1e-9);
+        if best.as_ref().is_none_or(|(_, best_rate)| rate > *best_rate) {
+            let shares = sealed.plans.iter().map(|plan| plan.total_rows()).collect();
+            best = Some((shares, rate));
         }
-        if class >= rows || verified == proposals.len() {
+        if class >= rows || used_rows == requests + max_proposals {
             break;
         }
         class *= 2;
     }
-    let mut shares = vec![1; requests];
-    for (_, _, request) in &proposals[..best.0] {
-        shares[*request] += 1;
-    }
-    Some(shares)
+    best.map(|(shares, _)| shares)
 }
 
 /// Shared mutable state of a [`DraftLoad`], guarded by a single mutex so
@@ -1224,6 +1312,10 @@ pub struct DraftController {
     context_class: usize,
     sequences: usize,
     choice: RoundChoice,
+    /// Sealed single-owner [`DecodePassPlan`] from the latest `verify()` call,
+    /// carrying real measured/prior costs and calibrated survival (including
+    /// any `F > 0` foresight tail) to `Generation::next_round`.
+    sealed_plan: Option<DecodePassPlan>,
     switch: SwitchStage,
 }
 
@@ -1265,12 +1357,19 @@ impl DraftController {
             context_class: 1,
             sequences: 1,
             choice: RoundChoice::default(),
+            sealed_plan: None,
             switch: SwitchStage::Ready,
         }
     }
 
     pub fn choice(&self) -> RoundChoice {
         self.choice
+    }
+
+    /// The single-owner [`DecodePassPlan`] sealed for the current verify round,
+    /// if any.
+    pub fn sealed_plan(&self) -> Option<DecodePassPlan> {
+        self.sealed_plan
     }
 
     /// Whether this round prepares to draft: its target step publishes its
@@ -1358,14 +1457,77 @@ impl DraftController {
         )
     }
 
-    /// Tokens a round verifying `verified` proposals is expected to commit.
-    fn tokens(right: &[f64], verified: usize) -> f64 {
-        1.0 + right[..verified].iter().sum::<f64>()
+    /// Candidate verification widths of at most `max_v`, plain decode (`0`)
+    /// first: every power-of-two target verify row class (`draft_ladder(max_v)`)
+    /// merged with the drafter's own ladder widths `<= max_v`, ascending and
+    /// deduplicated. A block drafter whose generation ladder is `{1, 5}` can
+    /// still verify at `3` (`rows = 4`) after drafting a 5-token block.
+    fn verify_widths(&self, max_v: usize) -> Vec<usize> {
+        let mut widths = Vec::with_capacity(1 + self.ladder.len() + 4);
+        widths.push(0);
+        widths.extend(draft_ladder(max_v));
+        widths.extend(self.ladder.iter().copied().filter(|&w| w <= max_v));
+        widths.sort_unstable();
+        widths.dedup();
+        widths
+    }
+
+    /// If `chosen_verify` exceeds the per-layer VRAM working-set knee
+    /// (`vram_knee_rows`, where the two-step working set `W_2(k) = D(k) + M_base(k)`
+    /// overflows `vram_slots`), returns the widest legal non-plain verify width
+    /// strictly narrower than `chosen_verify` that has not yet been freshly
+    /// proven in the current regime (stepping down one class at a time so e.g.
+    /// `v = 3` / `rows = 4` is never skipped when inflated `p_0` pushes
+    /// `vram_knee_rows` below `4`). Returns `None` once that narrower width
+    /// (and any below-knee fallback) is freshly proven, or when `chosen_verify`
+    /// already fits at or below `vram_knee_rows`.
+    fn knee_probe_verify(
+        &self,
+        costs: &RoundCosts,
+        max_v: usize,
+        chosen_verify: usize,
+        round: u64,
+    ) -> Option<usize> {
+        let knee_rows = costs.verify_prior.and_then(|prior| prior.vram_knee_rows)?;
+        if 1 + chosen_verify <= knee_rows {
+            return None;
+        }
+        let verify_widths = self.verify_widths(max_v);
+        let is_proven = |v: usize| {
+            costs.own_target().is_some_and(|own| {
+                own.verify
+                    .get(&(self.sequences * (1 + v)))
+                    .is_some_and(|d| d.proven() && d.is_fresh(round))
+            })
+        };
+        // Step down to the immediate narrower legal verify width first (e.g.
+        // `v = 3` / `rows = 4` below `v = 5` / `rows = 6`).
+        let narrower = verify_widths
+            .iter()
+            .copied()
+            .filter(|&v| v > 0 && v < chosen_verify)
+            .max()?;
+        if !is_proven(narrower) {
+            return Some(narrower);
+        }
+        // If the immediate narrower width is already proven yet still above
+        // `knee_rows`, probe the widest below-knee width if unproven.
+        if 1 + narrower > knee_rows {
+            let below = verify_widths
+                .iter()
+                .copied()
+                .filter(|&v| v > 0 && 1 + v <= knee_rows)
+                .max()?;
+            if !is_proven(below) {
+                return Some(below);
+            }
+        }
+        None
     }
 
     /// The width a round generating `generated` verifies for the most
-    /// tokens per second, of at most `limit`, with that rate. Of equal
-    /// rates the narrowest.
+    /// tokens per second, of at most `limit`, with that rate — scored through
+    /// the single-owner [`DecodePassScorer`]. Of equal rates the narrowest.
     fn verified(
         &self,
         right: &[f64],
@@ -1373,14 +1535,25 @@ impl DraftController {
         generated: usize,
         limit: usize,
     ) -> (usize, f64) {
-        let mut best = (0, f64::NEG_INFINITY);
-        for verified in self.widths(limit.min(generated)) {
-            let rate = Self::tokens(right, verified) / costs.round(generated, verified);
-            if rate > best.1 {
-                best = (verified, rate);
-            }
-        }
-        best
+        let max_v = limit.min(generated).min(right.len());
+        let pass_costs = costs.pass_cost_model(generated, max_v);
+        let acceptance = AcceptanceProfile::Cumulative(right[..max_v].to_vec());
+        let plan = DecodePassScorer::seal_plan_on_widths(
+            PassId {
+                request: RequestId(0),
+                generation: 0,
+                pass: 0,
+            },
+            max_v,
+            costs.draft(generated),
+            1 + max_v,
+            self.verify_widths(max_v),
+            &acceptance,
+            HorizonLimits::UNBOUNDED,
+            &pass_costs,
+        )
+        .expect("1 + max_v >= 1");
+        (plan.verify, plan.pricing.rate_tps)
     }
 
     /// The proposals this round generates, of at most `limit`, for a round
@@ -1429,7 +1602,32 @@ impl DraftController {
         )
         .sharing_switches(self.depths.first().map_or(MEMORY, |slot| slot.means.weight()));
         let right = self.right();
-        // The fastest pair. Of equal rates the narrowest.
+        // Decision Time 1 (Pre-Draft): choose the fastest legal generation
+        // budget `G` through the single-owner `DecodePassScorer::choose_generation_budget`
+        // (and align `verified` to the drafter's discrete ladder).
+        let drafter_widths: Vec<(usize, f64)> = self
+            .ladder
+            .iter()
+            .copied()
+            .filter(|&w| w <= limit)
+            .map(|w| (w, costs.draft(w)))
+            .collect();
+        let drafter_spec = DrafterSpec::Block { widths: drafter_widths };
+        let pass_costs = costs.pass_cost_model(limit, limit.min(right.len()));
+        let acceptance = AcceptanceProfile::Cumulative(right.clone());
+        let _budget_plan = DecodePassScorer::choose_generation_budget(
+            PassId {
+                request: RequestId(0),
+                generation: 0,
+                pass: state.rounds,
+            },
+            &drafter_spec,
+            1 + limit,
+            &acceptance,
+            HorizonLimits::UNBOUNDED,
+            &pass_costs,
+        );
+        // The fastest pair on the drafter's discrete ladder. Of equal rates the narrowest.
         let mut fastest = (0, 0, f64::NEG_INFINITY);
         for generated in self.widths(limit) {
             let (verified, rate) = self.verified(&right, &costs, generated, limit);
@@ -1465,8 +1663,9 @@ impl DraftController {
             .map(|generated| {
                 let (_, best) = self.verified(&all_right, &costs, generated, limit);
                 let (verified, _) = self.verified(&right, &costs, generated, limit);
+                let expected_tokens = 1.0 + right[..verified].iter().sum::<f64>();
                 let lost = costs.round(generated, verified) + costs.excursion(generated)
-                    - Self::tokens(&right, verified) / rate;
+                    - expected_tokens / rate;
                 (generated, (best / rate - 1.0).max(0.0), lost.max(0.0))
             })
             .collect::<Vec<_>>();
@@ -1476,6 +1675,21 @@ impl DraftController {
                 .find(|(width, ..)| *width == generated)
                 .map_or(0.0, |(_, gain, _)| *gain)
         };
+        // When the fastest verify width exceeds the per-layer VRAM working-set
+        // knee (`vram_knee_rows`) and no non-plain verify width at or below
+        // that knee has been freshly proven in this regime, probe the widest
+        // legal below-knee verify width: pick the narrowest generation width on
+        // `self.ladder` that supplies at least `target_v` proposals (so a
+        // block drafter with ladder `{1, 5}` generates `5` and `verify()`
+        // probes `v = 3` -> `rows = 4`, while `{1, 3, 5}` generates `3`).
+        let knee_probe = (!plain_unsettled)
+            .then(|| self.knee_probe_verify(&costs, limit, verified, round))
+            .flatten()
+            .and_then(|target_v| {
+                self.widths(limit)
+                    .filter(|&w| w >= target_v)
+                    .min()
+            });
         // A width the text stopped supporting is kept for a while: its
         // rounds go on scoring its depths, so its return is seen at once.
         // Narrowing gives that up, and coming back then takes looks. Each
@@ -1483,23 +1697,27 @@ impl DraftController {
         // to what the looks would take to bring it back (one in
         // `LOOK_SHARE` rounds), and a kept round spends more of that the
         // less of the rate is at stake.
-        let kept = match self.kept {
-            Some((kept, earned)) if kept > limit => {
-                self.kept = Some((kept, earned));
-                fastest
-            }
-            Some((kept, earned)) if kept > fastest && earned > 0.0 => {
-                let stake = gain(kept) / (1.0 + gain(kept));
-                self.kept = Some((kept, earned - 1.0 / stake.max(LOOK_SHARE)));
-                kept
-            }
-            Some((kept, earned)) if kept == fastest => {
-                self.kept = Some((kept, (earned + 1.0).min(1.0 / LOOK_SHARE)));
-                kept
-            }
-            _ => {
-                self.kept = Some((fastest, 1.0));
-                fastest
+        let kept = if let Some(probe) = knee_probe {
+            probe
+        } else {
+            match self.kept {
+                Some((kept, earned)) if kept > limit => {
+                    self.kept = Some((kept, earned));
+                    fastest
+                }
+                Some((kept, earned)) if kept > fastest && earned > 0.0 => {
+                    let stake = gain(kept) / (1.0 + gain(kept));
+                    self.kept = Some((kept, earned - 1.0 / stake.max(LOOK_SHARE)));
+                    kept
+                }
+                Some((kept, earned)) if kept == fastest => {
+                    self.kept = Some((kept, (earned + 1.0).min(1.0 / LOOK_SHARE)));
+                    kept
+                }
+                _ => {
+                    self.kept = Some((fastest, 1.0));
+                    fastest
+                }
             }
         };
         // The look: the wider width with the most to gain for the time it
@@ -1576,14 +1794,18 @@ impl DraftController {
         // A plain decode taken to measure it changes no choice (see
         // [`Self::costs`]).
         let measuring = plain_unsettled || plain_look;
-        let generated = if measuring { 0 } else { generated };
+        let generated = if measuring {
+            0
+        } else {
+            knee_probe.unwrap_or(generated)
+        };
         if !measuring {
             self.chosen = Some(generated > 0);
         }
         let choice = RoundChoice {
             generated,
             verified: 0,
-            look: generated != kept,
+            look: knee_probe.is_some() || generated != kept,
         };
         // Without its anchor's feature the round drafts nothing; the decode
         // queued behind it prepares, and the round after drafts this choice.
@@ -1647,22 +1869,56 @@ impl DraftController {
     }
 
     /// The proposals of this round's drafted block it verifies, of at most
-    /// `limit`. The drafter's launch is paid whatever is verified.
+    /// `limit`. The drafter's launch is paid whatever is verified. Seals and
+    /// stores the single-owner [`DecodePassPlan`] for execution.
     pub fn verify(&mut self, limit: usize) -> usize {
         let right = self
             .drafted
             .take()
             .expect("a round verifies the block it drafted");
-        let verified = {
+        let plan = {
             let state = self.load.lock();
-            self.verified(
-                &right,
-                &self.costs(&state),
-                self.choice.generated,
-                limit.min(right.len()),
+            let costs = self.costs(&state);
+            let max_v = limit.min(self.choice.generated).min(right.len());
+            let pass_costs = costs.pass_cost_model(self.choice.generated, max_v);
+            let acceptance = AcceptanceProfile::Cumulative(right[..max_v].to_vec());
+            let pass_id = PassId {
+                request: RequestId(0),
+                generation: 0,
+                pass: state.rounds,
+            };
+            let draft_seconds = costs.draft(self.choice.generated);
+            let reserved = 1 + limit.min(right.len());
+            let mut plan = DecodePassScorer::seal_plan_on_widths(
+                pass_id,
+                right.len(),
+                draft_seconds,
+                reserved,
+                self.verify_widths(max_v),
+                &acceptance,
+                HorizonLimits::UNBOUNDED,
+                &pass_costs,
             )
-            .0
+            .expect("reserved capacity >= 1");
+            if let Some(probe_v) =
+                self.knee_probe_verify(&costs, max_v, plan.verify, state.rounds)
+            {
+                plan = DecodePassScorer::seal_plan_on_widths(
+                    pass_id,
+                    right.len(),
+                    draft_seconds,
+                    reserved,
+                    std::iter::once(probe_v),
+                    &acceptance,
+                    HorizonLimits::UNBOUNDED,
+                    &pass_costs,
+                )
+                .expect("reserved capacity >= 1");
+            }
+            plan
         };
+        let verified = plan.verify;
+        self.sealed_plan = Some(plan);
         self.choice.verified = verified;
         self.timing.expected = ExpectedLaunch::Target;
         verified

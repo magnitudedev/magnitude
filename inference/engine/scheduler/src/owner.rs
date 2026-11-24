@@ -343,7 +343,12 @@ impl FrontRows {
                 let depth = *claim
                     .get(&id)
                     .unwrap_or_else(|| panic!("invariant violated: {id:?} builds a claim of the queued pass it is not in"));
-                (FrontGrant::Exactly(depth), 1 + depth)
+                let grant = if claim.values().all(|&d| d == 0) {
+                    FrontGrant::Plain
+                } else {
+                    FrontGrant::Exactly(depth)
+                };
+                (grant, 1 + depth)
             }
         }
     }
@@ -1463,6 +1468,10 @@ pub struct BetweenFlights {
     /// Whether a memory reading is owed and whether the worker is waking from
     /// an idle [`Reread::Settled`] period.
     reading: ReadingState,
+    /// The domain's `holdings_generation()` at the last completed memory
+    /// reading: lets a pure speculative `Head` flight boundary skip redundant
+    /// synchronous OS/driver reads when our own holdings did not change.
+    last_read_holdings: Option<u64>,
 }
 
 impl BetweenFlights {
@@ -1486,6 +1495,7 @@ impl BetweenFlights {
             measures: None,
             admission_waits: false,
             reading: ReadingState::Owed,
+            last_read_holdings: None,
         }
     }
 }
@@ -2364,7 +2374,9 @@ trait MemoryStep: MemoryHost + Sized {
                 let reading = self.domain().read_memory(after_idle, &evictable, relief_boundary).map_err(classify_domain_error)?;
                 match reading {
                     MemoryReading::Read(read) => {
+                        let holdings = self.domain().holdings_generation();
                         self.memory().reading.on_read();
+                        self.memory().last_read_holdings = Some(holdings);
                         Some(read)
                     }
                     // A change off this thread stood beside the sample: its
@@ -2951,7 +2963,7 @@ impl<F: ProgramFamily> Service<F> {
         // builds.
         let mut reserved = Vec::new();
         let mut attempted = 0;
-        if !chaining && matches!(selection.phase(), Phase::Decode) {
+        if matches!(selection.phase(), Phase::Decode) {
             let prior = self
                 .domain
                 .streamed_verify_prior(requests.len())
@@ -3617,6 +3629,7 @@ impl<F: ProgramFamily> Service<F> {
         } else if !matches!(outcomes, FlightOutcomes::Priming(_)) {
             self.pre_submit = None;
         }
+        let is_head = matches!(outcomes, FlightOutcomes::Head(_));
         let t_reconcile = self.pre_submit.is_some().then(Instant::now);
         let reconciled = match outcomes {
             FlightOutcomes::Target(pending) => self.reconcile_target(&mut round, pending, &operations),
@@ -3646,9 +3659,15 @@ impl<F: ProgramFamily> Service<F> {
             }
         };
         self.epoch.advance();
-        // The flight's boundary: memory is read once here.
+        // The flight's boundary: memory is read once here. A pure speculative
+        // `Head` flight runs between two `Target` flights without changing our
+        // own holdings; skip its redundant synchronous OS/driver probe unless
+        // our holdings moved (pressure, completed resizes, and owed readings
+        // still trigger a read inside `observe_memory`).
+        let holdings = self.domain().holdings_generation();
+        let boundary = !is_head || self.memory().last_read_holdings != Some(holdings);
         let t_step = self.pre_submit.is_some().then(Instant::now);
-        if let Err(error) = self.step(Some(&mut bindings), true) {
+        if let Err(error) = self.step(Some(&mut bindings), boundary) {
             return Err((Some(round.members), error));
         }
         if let (Some(trace), Some(t)) = (&mut self.pre_submit, t_step) {
@@ -6000,6 +6019,53 @@ let Ok(residency) = service.make_resident(id, &mut record, generation, bindings)
         service.finish_round(round).unwrap();
         service.check_no_unwakeable_wait();
         assert!(service.requests.is_empty(), "refused request retired cleanly");
+    }
+
+    /// When a pure speculative `Head` boundary runs with unchanged holdings,
+    /// `observe_memory(..., boundary = false)` skips redundant OS/driver
+    /// `read_memory()` calls and completes in well under 100 µs.
+    #[test]
+    fn head_boundary_with_unchanged_holdings_skips_redundant_read_memory_and_is_sub_100us() {
+        let definition = fixtures::tiny_definition();
+        let backend = fixtures::bank_backends()
+            .into_iter()
+            .find(|backend| format!("{backend:?}") == "Cpu")
+            .expect("CPU backend available");
+        let (domain, bindings) = fixtures::fixture_with_state_block_granules(
+            definition,
+            fixtures::limits(512, 1, false),
+            magnitude_executor::platform::DeviceRequest::Backend(backend),
+            1,
+        );
+        let owner = Owner::new(domain, bindings, limits(), Arc::new(NoWakes)).unwrap();
+        let (mut service, mut bindings) = match owner.pipeline {
+            Pipeline::Idle(bindings) => (owner.service, bindings),
+            Pipeline::InFlight(..) => panic!("fresh owner must start idle"),
+        };
+        // Initial boundary reads memory and records `last_read_holdings`.
+        let observed = service.observe(Some(&mut bindings), true).unwrap();
+        assert!(!observed.unload);
+        let readings_after_target = service.domain.readings_generation();
+        assert_eq!(service.memory.last_read_holdings, Some(service.domain.holdings_generation()));
+
+        // Pure Head boundary with unchanged holdings (`boundary = false`):
+        // skips OS/driver `read_memory()` and completes in < 100 µs.
+        let started = std::time::Instant::now();
+        for _ in 0..100 {
+            let head = service.observe(Some(&mut bindings), false).unwrap();
+            assert!(!head.unload);
+            assert_eq!(head.reread, Reread::Unread);
+        }
+        let per_call = started.elapsed() / 100;
+        assert_eq!(
+            service.domain.readings_generation(),
+            readings_after_target,
+            "unchanged-holdings Head boundary must not invoke redundant OS/driver read_memory()"
+        );
+        assert!(
+            per_call < std::time::Duration::from_micros(100),
+            "observe_memory(boundary = false) took {per_call:?} per call"
+        );
     }
 }
 

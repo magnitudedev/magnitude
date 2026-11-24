@@ -375,6 +375,8 @@ fn whole_bank_and_zero_miss_loads_price_verify_passes_and_transition_cleanly() {
         verify_terms: [None; crate::experts::DEPTHS],
         paths: None,
         stall: None,
+        front_stall: [None; crate::experts::DEPTHS - 1],
+        verify_stall: [None; crate::experts::DEPTHS - 1],
         needed: [[None; crate::experts::DEPTHS]; 2],
         stand: None,
         accepts: [None; crate::experts::DEPTHS - 1],
@@ -388,7 +390,7 @@ fn whole_bank_and_zero_miss_loads_price_verify_passes_and_transition_cleanly() {
         rows: crate::CHAINED_ROWS,
         verifies,
         whole,
-        overhead,
+        overhead: overhead.map(magnitude_cost_model::VerifyOverhead::fixed),
     };
 
     // 1. Whole bank after the first plain pass: no misses, no shadows yet ->
@@ -421,7 +423,7 @@ fn whole_bank_and_zero_miss_loads_price_verify_passes_and_transition_cleanly() {
     }
 
     // 3. Whole bank with low acceptance and turn overhead falls back to plain
-    //    decode (Front(0), empty depths).
+    //    decode (Front(0), empty depths -> BuiltForm::Plain).
     let mut low_accept = high_accept.clone();
     low_accept.accepts = [Some(0.05); crate::experts::DEPTHS - 1];
     let whole_low = pricing(low_accept, true, 4, Some(0.020));
@@ -429,14 +431,14 @@ fn whole_bank_and_zero_miss_loads_price_verify_passes_and_transition_cleanly() {
     assert_eq!(regime.pass, Form::Front(0));
     assert_eq!(
         whole_low.built(&requests, &requests).unwrap(),
-        crate::FrontPass::Built { form: crate::BuiltForm::Front, depths: std::collections::BTreeMap::new() }
+        crate::FrontPass::Built { form: crate::BuiltForm::Plain, depths: std::collections::BTreeMap::new() }
     );
 
     // 4. Whole bank with verifies == 0 produces plain decode.
     let whole_no_verify = pricing(zero_miss.clone(), true, 0, None);
     assert_eq!(
         whole_no_verify.built(&requests, &requests).unwrap(),
-        crate::FrontPass::Built { form: crate::BuiltForm::Front, depths: std::collections::BTreeMap::new() }
+        crate::FrontPass::Built { form: crate::BuiltForm::Plain, depths: std::collections::BTreeMap::new() }
     );
 
     // 5. Partial bank with zero misses over the window also prices Verify
@@ -722,5 +724,77 @@ fn release_yielded_never_returns_pending_without_active_async_release() {
         );
     } else {
         assert!(!domain.releasing_slots());
+    }
+}
+
+/// A slow `Verify(15)` turn on a banked draft head (`2 ms + 15 * 15 ms = 227 ms`)
+/// must NOT poison `TwoRowPricing` into collapsing to `Front(0)`: depth-scaled
+/// `VerifyOverhead` prices `Verify(2..=5)` at `2 ms + k * 15 ms` and chooses
+/// `BuiltForm::Verify` at `k in 2..=5`.
+#[test]
+fn two_row_pricing_scales_verify_overhead_with_depth_instead_of_collapsing_to_front0() {
+    use crate::RequestId;
+    use magnitude_cost_model::{Form, Terms, VerifyOverhead};
+    let requests = [RequestId(1)];
+    let prices = crate::domain::fixtures::load_costs(None).prices;
+    let compute = |seconds: f64| Terms { compute: seconds, drive: 0., link: 0., cpu: 0., memory: 0. };
+    let mut terms = [None; crate::experts::DEPTHS];
+    let mut verify_terms = [None; crate::experts::DEPTHS];
+    for k in 0..crate::experts::DEPTHS {
+        let secs = 0.060 + 0.005 * k as f64;
+        terms[k] = Some(compute(secs));
+        if k > 0 {
+            verify_terms[k] = Some(compute(secs));
+        }
+    }
+    let accepts_vals = [0.85, 0.80, 0.75, 0.70, 0.65, 0.50, 0.40, 0.30, 0.20, 0.10, 0.05, 0.05, 0.05, 0.05, 0.05];
+    let mut accepts = [None; crate::experts::DEPTHS - 1];
+    for (slot, &val) in accepts.iter_mut().zip(&accepts_vals) {
+        *slot = Some(val);
+    }
+    let measured = crate::experts::Measured {
+        layers: 48,
+        depth: 15.min(crate::experts::DEPTHS - 1),
+        verifying: true,
+        terms,
+        verify_terms,
+        paths: None,
+        stall: None,
+        front_stall: [None; crate::experts::DEPTHS - 1],
+        verify_stall: [None; crate::experts::DEPTHS - 1],
+        needed: [[None; crate::experts::DEPTHS]; 2],
+        stand: Some(0.85),
+        accepts,
+        fresh: [None; crate::experts::DEPTHS - 1],
+        held: None,
+    };
+    let pricing = |overhead: VerifyOverhead| super::TwoRowPricing {
+        measured: Some(measured.clone()),
+        prices: prices.clone(),
+        depth: 1,
+        rows: crate::CHAINED_ROWS,
+        verifies: crate::experts::DEPTHS - 1,
+        whole: true,
+        overhead: Some(overhead),
+    };
+
+    // Flat 227 ms scalar collapses to Front(0).
+    let flat = pricing(VerifyOverhead::fixed(0.227));
+    assert_eq!(flat.regime(1, 1).unwrap().unwrap().pass, Form::Front(0));
+
+    // Depth-scaled `2 ms + k * 15 ms` selects Verify(2..=5).
+    let scaled = pricing(VerifyOverhead { fixed: 0.002, per_step: 0.015 });
+    let front_regime = scaled.regime(1, 1).unwrap().unwrap();
+    assert!(
+        matches!(front_regime.pass, Form::Verify(k) if (2..=5).contains(&k)),
+        "expected Verify(2..=5), got {:?}",
+        front_regime.pass
+    );
+    match scaled.built(&requests, &requests).unwrap() {
+        crate::FrontPass::Built { form: crate::BuiltForm::Verify, depths } => {
+            let depth = depths.get(&RequestId(1)).copied().unwrap_or(0);
+            assert!((2..=5).contains(&depth), "expected depth in 2..=5, got {depth}");
+        }
+        other => panic!("expected BuiltForm::Verify, got {other:?}"),
     }
 }

@@ -434,7 +434,7 @@ mod tests {
 
     /// A decode, or verification of `proposal`, behind its anchor 7.
     fn round(proposal: &[u32]) -> RoundState {
-        pass(Rows::Exact { acceptable: tokens(proposal) })
+        pass(Rows::verify(tokens(proposal)))
     }
 
     #[test]
@@ -525,7 +525,7 @@ mod tests {
         held.advance(Some(&mut decode), vec![next]);
         assert_eq!(decode.pass(FrontGrant::UpTo(1)), Rows::front(vec![next], 0));
         held.advance(Some(&mut decode), Vec::new());
-        assert_eq!(decode.pass(FrontGrant::UpTo(1)), Rows::Exact { acceptable: Vec::new() });
+        assert_eq!(decode.pass(FrontGrant::UpTo(1)), Rows::plain());
         assert_eq!(held.verdict.checked(), [(TokenId(8), TokenId(8))]);
         assert_eq!((held.verdict.front(), held.verdict.truths()), (&tokens(&[8])[..], &tokens(&[8])[..]));
         assert_eq!(held.decision(), PhysicalDecision { accepted_rows: 1, ahead: AheadVerdict::new(&Rows::front(vec![guess], 0), &tokens(&[8])) });
@@ -675,5 +675,77 @@ mod tests {
             Demand::FEATURES | Demand::SELECT
         );
         assert_eq!(chunk(vec![TokenId(3)], None, WorkKind::Prefill), Demand::FEATURES);
+    }
+
+    /// Gate #2: `Rows::verify_with_front(K, F)` produces `1 + K + F` tokens,
+    /// `1 + K` selects, `F` `FrontRow`s, `WorkKind::Verify`, and validates;
+    /// when `1 + K + F > budget`, `F` shrinks first while `K` is preserved.
+    #[test]
+    fn hybrid_verify_with_front_rows_and_budget_shortening() {
+        let acceptable = tokens(&[10, 11, 12]);
+        let front = vec![
+            Guess { token: TokenId(20), kind: GuessKind::Head },
+            Guess { token: TokenId(21), kind: GuessKind::Head },
+        ];
+        let rows = Rows::verify_with_front(acceptable.clone(), front.clone());
+        assert_eq!(rows.row_count(), 1 + 3 + 2);
+        assert_eq!(rows.acceptable(), acceptable.as_slice());
+        assert_eq!(rows.front_rows(), 2);
+        assert_eq!(rows.tokens(TokenId(7)), tokens(&[7, 10, 11, 12, 20, 21]));
+
+        let hybrid = pass(rows.clone());
+        assert_eq!(hybrid.forward().kind, WorkKind::Verify);
+        assert_eq!(hybrid.forward().tokens.len(), 6);
+        assert_eq!(hybrid.forward().selects.len(), 4);
+        assert_eq!(hybrid.forward().front.len(), 2);
+        assert!(hybrid
+            .forward()
+            .clone()
+            .into_operation(RequestId(1), 10, None)
+            .is_ok());
+
+        // Budget shortening: `1 + K + F = 6 > budget` shrinks `F` first while preserving `K = 3`.
+        let fit5 = rows.clone().fit_budget(5);
+        assert_eq!(fit5.acceptable(), acceptable.as_slice());
+        assert_eq!(fit5.front_rows(), 1);
+        assert_eq!(fit5.guesses(), &front[..1]);
+
+        let fit4 = rows.fit_budget(4);
+        assert_eq!(fit4.acceptable(), acceptable.as_slice());
+        assert_eq!(fit4.front_rows(), 0);
+    }
+
+    /// Gate #4a: Identical `RoundState::reconcile` outcomes for `F = 0` vs `F = 2`
+    /// across forced rejection at `0`, `K - 1`, and full acceptance with
+    /// mismatching bonus.
+    #[test]
+    fn hybrid_verify_reconcile_boundary_parity_f0_vs_f2() {
+        let stops = BTreeSet::new();
+        let acceptable = tokens(&[10, 11, 12]);
+        let front = vec![
+            Guess { token: TokenId(20), kind: GuessKind::Head },
+            Guess { token: TokenId(21), kind: GuessKind::Head },
+        ];
+        let cases: &[(&str, &[u32], usize)] = &[
+            ("reject at 0", &[99, 11, 12, 88], 1),
+            ("reject at K-1", &[10, 11, 99, 88], 3),
+            ("full accept mismatching bonus", &[10, 11, 12, 88], 4),
+        ];
+        for &(label, sample_ids, expected_committed) in cases {
+            let samples = tokens(sample_ids);
+            let a0 = pass(Rows::verify(acceptable.clone()))
+                .reconcile(&samples, &stops)
+                .unwrap();
+            let a2 = pass(Rows::verify_with_front(acceptable.clone(), front.clone()))
+                .reconcile(&samples, &stops)
+                .unwrap();
+            assert_eq!(a0.committed_rows, expected_committed, "{label}");
+            assert_eq!(a2.committed_rows, a0.committed_rows, "{label}: committed_rows");
+            assert_eq!(a2.inputs, a0.inputs, "{label}: inputs");
+            assert_eq!(a2.emitted, a0.emitted, "{label}: emitted");
+            assert_eq!(a2.proposed, a0.proposed, "{label}: proposed");
+            assert_eq!(a2.accepted_proposals, a0.accepted_proposals, "{label}: accepted_proposals");
+            assert_eq!(a2.method_update, a0.method_update, "{label}: method_update");
+        }
     }
 }

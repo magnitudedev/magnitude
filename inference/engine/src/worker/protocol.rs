@@ -35,7 +35,13 @@ pub struct EngineBuild(pub String);
 
 impl EngineBuild {
     pub fn current() -> Self {
-        Self(env!("MAGNITUDE_ENGINE_BUILD").to_owned())
+        static BUILD: std::sync::LazyLock<String> = std::sync::LazyLock::new(|| {
+            magnitude_executor::combine_build_identity(
+                env!("MAGNITUDE_ENGINE_RUST_BUILD"),
+                magnitude_kernels_bundle::identity(),
+            )
+        });
+        Self(BUILD.clone())
     }
 }
 

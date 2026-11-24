@@ -74,7 +74,7 @@ impl MethodState for PlainState {
     }
 
     fn propose(&mut self, _: RequestId, _: &[SelectSpec]) -> Propose {
-        Propose::Tokens(Vec::new())
+        Propose::empty()
     }
 
     fn observe(
@@ -132,7 +132,7 @@ mod tests {
         };
         assert_eq!(
             state.propose(RequestId(1), &[select]),
-            Propose::Tokens(vec![])
+            Propose::empty()
         );
         assert_eq!(state.checkpoint().unwrap(), MethodCheckpoint::Plain);
         assert_eq!(state.reclaimable(), 0);

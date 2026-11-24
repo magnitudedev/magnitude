@@ -890,8 +890,7 @@ pub fn load_costs(bank: Option<&crate::ExpertBankPlan>) -> crate::LoadCosts {
     };
     let resident = Census::new(std::iter::empty(), 0, decode_rows);
     let streamed = bank.map(|bank| {
-        let hints = (0..bank.layers().len()).filter(|&layer| bank.ahead(layer) > 0).map(|layer| (Kind { work: Work::default(), launches: launches() }, Some(LayerCall::Hint(layer))));
-        Census::new(bank.routed_kinds().into_iter().enumerate().map(routed).chain(hints), 0, decode_rows)
+        Census::new(bank.routed_kinds().into_iter().enumerate().map(routed), 0, decode_rows)
     });
     let figures = seismic::measure::pricing::Figures {
         composition: Ok(1.),
@@ -1638,6 +1637,14 @@ impl ElasticBank for FakeBank {
 
     fn live(&self) -> Option<magnitude_cost_model::LiveDecode> {
         self.decode.clone()
+    }
+
+    fn live_steps(&self) -> u64 {
+        self.decode.as_ref().map_or(0, |decode| decode.steps)
+    }
+
+    fn host_slots(&self) -> u64 {
+        self.host.load(std::sync::atomic::Ordering::Acquire)
     }
 
     /// No pass is timed: nothing pairs.

@@ -107,12 +107,6 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
                         && !(head.owns_head_state() && self.head_state(request).is_some()),
                     "invariant violated: a reconciled request has another physical state owner"
                 );
-                // How the guesses of a pass that ran rows ahead in a bank's step
-                // fared, which only a bank reading experts ahead follows, told
-                // before its state is published.
-                if let (Some(bank), Some(step)) = (self.family.expert_bank(), awaited) {
-                    bank.decided(step, request, &decision.ahead);
-                }
                 // The target commits the decision's rows first: the only commit a
                 // decision decides. A refusal leaves every head advance uncommitted,
                 // returned with it. A chain's chunk is accepted whole; a failure
@@ -130,6 +124,11 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
                         Err((state, error)) => {
                             self.put_target_state(request, state);
                             self.return_head_advances(request, head);
+                            // Settle the awaited verify/front pass as discarded on
+                            // error return so the verify clock is never stranded.
+                            if let (Some(bank), Some(step)) = (self.family.expert_bank(), awaited) {
+                                bank.discarded(step, request);
+                            }
                             return Err(error.into());
                         }
                     },
@@ -141,6 +140,16 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
                         chunk,
                     } => self.join_chain(request, flight, joined, chunk),
                 };
+                // Emit the terminal outcome to the expert bank ONLY after the
+                // target state transition has resolved: decided on success,
+                // discarded on failure, so every awaited request settles once.
+                if let (Some(bank), Some(step)) = (self.family.expert_bank(), awaited) {
+                    if published.is_ok() && decision.accepted_rows > 0 {
+                        bank.decided(step, request, &decision.ahead);
+                    } else {
+                        bank.discarded(step, request);
+                    }
+                }
                 // Then the head advances commit what they always commit, whatever
                 // the decision: a prompt chunk's drafter entry its every row, and the
                 // front head launch behind a chained forward its one entry row (the

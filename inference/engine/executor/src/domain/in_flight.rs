@@ -19,6 +19,8 @@ pub(super) struct HostTurn {
 struct OpenVerifyTurn {
     since: Instant,
     owner: Duration,
+    head_duration: Duration,
+    head_steps: usize,
     begun_regime: crate::experts::RegimeEpoch,
     begun_epoch: u64,
     requests: Vec<RequestId>,
@@ -28,15 +30,17 @@ struct OpenVerifyTurn {
 /// decides the next pass's tokens, so nothing is queued behind it, and from
 /// its completion to the next target launch of one of its requests (the
 /// host reconciling it, drafting the next guesses in a head transaction and
-/// preparing that launch) the device idles on the host. The mean of the
-/// turns over the regime-scoped bank-wide turnover window
-/// (`experts::RegimeWindow<Turns>` keyed on `(regime_epoch, bank_epoch)`) is
-/// the regime's `O` (`magnitude_cost_model::Regime::overhead`). A turn the
-/// owner idled in, or another launch ended first, is no verify pass's; a turn
-/// of a load with no expert bank prices no regime and is not timed. The
-/// owner's own work in the turn (`owner_worked`) is excluded, a turn spanned
-/// by a regime or bank-epoch transition is dropped, and turns measured in a
-/// prior physical regime are inapplicable by construction.
+/// preparing that launch) the device idles on the host. Each turn separates
+/// fixed per-turn host time from the head transaction's drafting time across
+/// its `steps` chained passes over the regime-scoped bank-wide turnover window
+/// (`experts::RegimeWindow<Turns>` keyed on `(regime_epoch, bank_epoch)`),
+/// producing the regime's `O(k) = fixed + k * per_step`
+/// (`magnitude_cost_model::Regime::overhead`). A turn the owner idled in, or
+/// another launch ended first, is no verify pass's; a turn of a load with no
+/// expert bank prices no regime and is not timed. The owner's own work in the
+/// turn (`owner_worked`) is excluded, a turn spanned by a regime or bank-epoch
+/// transition is dropped, and turns measured in a prior physical regime are
+/// inapplicable by construction.
 #[derive(Debug)]
 pub(super) struct VerifyTurns {
     open: Option<OpenVerifyTurn>,
@@ -49,12 +53,15 @@ impl Default for VerifyTurns {
     }
 }
 
-/// Timed turns' seconds and how many, counted per bank-wide epoch in a
+/// Timed turns' fixed seconds, turn count, head-drafting seconds, and total
+/// head drafting steps, counted per bank-wide epoch in a
 /// [`Window`](crate::experts::Window).
 #[derive(Clone, Copy, Debug, Default)]
 pub(super) struct Turns {
-    seconds: f64,
+    fixed_seconds: f64,
     turns: u64,
+    head_seconds: f64,
+    head_steps: u64,
 }
 
 impl crate::experts::Tally for Turns {
@@ -70,6 +77,8 @@ impl VerifyTurns {
         self.open = epochs.map(|(begun_regime, begun_epoch)| OpenVerifyTurn {
             since,
             owner: Duration::ZERO,
+            head_duration: Duration::ZERO,
+            head_steps: 0,
             begun_regime: crate::experts::RegimeEpoch::new(begun_regime),
             begun_epoch,
             requests,
@@ -81,6 +90,20 @@ impl VerifyTurns {
     pub(super) fn owner_worked(&mut self, spent: Duration) {
         if let Some(turn) = &mut self.open {
             turn.owner += spent;
+        }
+    }
+
+    /// A head transaction for `requests` running `steps` drafting passes
+    /// finished after `duration` during the open verify turn: accumulate its
+    /// drafting time and step count so `launched` separates fixed host turn
+    /// time from per-step head drafting time.
+    pub(super) fn head_finished(&mut self, requests: &[RequestId], steps: usize, duration: Duration) {
+        let Some(turn) = &mut self.open else {
+            return;
+        };
+        if steps > 0 && requests.iter().any(|request| turn.requests.contains(request)) {
+            turn.head_duration += duration;
+            turn.head_steps += steps;
         }
     }
 
@@ -100,12 +123,19 @@ impl VerifyTurns {
             return;
         }
         if requests.iter().any(|request| turn.requests.contains(request)) {
-            let seconds = started
+            let total = started
                 .saturating_duration_since(turn.since)
                 .saturating_sub(turn.owner)
                 .as_secs_f64();
             let tally = self.latest.count(regime, epoch);
-            tally.seconds += seconds;
+            if turn.head_steps > 0 {
+                let head = turn.head_duration.as_secs_f64().min(total);
+                tally.fixed_seconds += (total - head).max(0.0);
+                tally.head_seconds += head;
+                tally.head_steps += turn.head_steps as u64;
+            } else {
+                tally.fixed_seconds += total;
+            }
             tally.turns += 1;
         }
     }
@@ -116,13 +146,37 @@ impl VerifyTurns {
         self.open = None;
     }
 
-    /// `O`: a turn's mean over the regime-scoped bank-wide epoch window at
-    /// `(regime, epoch)`; none before one is timed in `regime`.
-    pub(super) fn mean(&self, regime: u64, epoch: u64) -> Option<f64> {
+    /// `O(k) = fixed + k * per_step` over the regime-scoped bank-wide epoch
+    /// window at `(regime, epoch)`; none before a turn is timed in `regime`.
+    pub(super) fn overhead(&self, regime: u64, epoch: u64) -> Option<magnitude_cost_model::VerifyOverhead> {
         let (first, second) = self.latest.snapshot(crate::experts::RegimeEpoch::new(regime), epoch)?;
-        let seconds = first.seconds + second.map_or(0.0, |t| t.seconds);
+        let fixed_seconds = first.fixed_seconds + second.map_or(0.0, |t| t.fixed_seconds);
         let turns = first.turns + second.map_or(0, |t| t.turns);
-        (turns > 0).then(|| (seconds / turns as f64).max(0.))
+        if turns == 0 {
+            return None;
+        }
+        let head_seconds = first.head_seconds + second.map_or(0.0, |t| t.head_seconds);
+        let head_steps = first.head_steps + second.map_or(0, |t| t.head_steps);
+        let fixed = (fixed_seconds / turns as f64).max(0.0);
+        let per_step = if head_steps > 0 {
+            (head_seconds / head_steps as f64).max(0.0)
+        } else {
+            0.0
+        };
+        Some(magnitude_cost_model::VerifyOverhead { fixed, per_step })
+    }
+
+    /// Mean total verify turn duration (`fixed + head`) over the regime-scoped
+    /// bank-wide epoch window at `(regime, epoch)`; none before a turn is timed
+    /// in `regime`. Used to report the GPU idle window (`draft_window`) to the
+    /// expert bank.
+    pub(super) fn mean_turn(&self, regime: u64, epoch: u64) -> Option<f64> {
+        let (first, second) = self.latest.snapshot(crate::experts::RegimeEpoch::new(regime), epoch)?;
+        let total = first.fixed_seconds
+            + first.head_seconds
+            + second.map_or(0.0, |t| t.fixed_seconds + t.head_seconds);
+        let turns = first.turns + second.map_or(0, |t| t.turns);
+        (turns > 0).then(|| (total / turns as f64).max(0.))
     }
 }
 
@@ -485,27 +539,60 @@ mod tests {
         turns.begin(t0, Some((0, 0)), vec![req]);
         turns.owner_worked(Duration::from_millis(7));
         turns.launched(&[req], t0 + Duration::from_millis(10), Some((0, 0)));
-        let clean = turns.mean(0, 0).expect("clean turn recorded");
-        assert!((clean - 0.003).abs() < 1e-9, "expected 3 ms after subtracting owner work, got {clean}");
+        let clean = turns.overhead(0, 0).expect("clean turn recorded");
+        assert!((clean.fixed - 0.003).abs() < 1e-9, "expected 3 ms after subtracting owner work, got {clean:?}");
+        assert_eq!(clean.per_step, 0.0);
 
         // Epoch-spanning turn within same regime (epoch 0 -> epoch 1) with a 25 ms pause must be
         // skipped AND must not roll the window or evict the clean 3 ms turn.
         turns.begin(t0 + Duration::from_millis(20), Some((0, 0)), vec![req]);
         turns.launched(&[req], t0 + Duration::from_millis(45), Some((0, 1)));
-        let after_turnover = turns.mean(0, 1).expect("clean turn survives turnover within same regime");
+        let after_turnover = turns.overhead(0, 1).expect("clean turn survives turnover within same regime");
         assert!(
-            (after_turnover - 0.003).abs() < 1e-9,
-            "epoch-spanning turn must not contaminate or evict clean mean: {after_turnover}"
+            (after_turnover.fixed - 0.003).abs() < 1e-9,
+            "epoch-spanning turn must not contaminate or evict clean mean: {after_turnover:?}"
         );
 
         // Regime transition (regime 0 -> regime 1) makes old-regime turns inapplicable by construction.
-        assert_eq!(turns.mean(1, 1), None, "prior-regime verify turns must not outlive their regime");
+        assert_eq!(turns.overhead(1, 1), None, "prior-regime verify turns must not outlive their regime");
 
         // Owner work exceeding wall time saturates at 0 without panicking.
         turns.begin(t0 + Duration::from_millis(50), Some((0, 1)), vec![req]);
         turns.owner_worked(Duration::from_millis(10));
         turns.launched(&[req], t0 + Duration::from_millis(52), Some((0, 1)));
-        let with_zero = turns.mean(0, 1).expect("clean turn at epoch 1 recorded");
-        assert!((with_zero - 0.0015).abs() < 1e-9, "mean of 3 ms (epoch 0) and 0 ms (epoch 1): {with_zero}");
+        let with_zero = turns.overhead(0, 1).expect("clean turn at epoch 1 recorded");
+        assert!((with_zero.fixed - 0.0015).abs() < 1e-9, "mean of 3 ms (epoch 0) and 0 ms (epoch 1): {with_zero:?}");
+    }
+
+    /// A verify turn containing a 15-step head transaction separates fixed host
+    /// time from per-step head drafting time so `VerifyOverhead::at(k)` scales
+    /// linearly with `k` instead of charging 15 head steps to `Verify(2..5)`.
+    #[test]
+    fn verify_turns_separates_fixed_host_overhead_from_per_step_head_latency() {
+        let mut turns = VerifyTurns::default();
+        let req = RequestId(1);
+        let t0 = Instant::now();
+
+        // Simulate Verify(15) turn: 227 ms total = 2 ms host + 225 ms for 15 head steps (15 ms/step).
+        turns.begin(t0, Some((0, 0)), vec![req]);
+        turns.head_finished(&[req], 15, Duration::from_millis(225));
+        turns.launched(&[req], t0 + Duration::from_millis(227), Some((0, 0)));
+
+        let overhead = turns.overhead(0, 0).expect("turn recorded");
+        assert!((overhead.fixed - 0.002).abs() < 1e-9, "fixed={}", overhead.fixed);
+        assert!((overhead.per_step - 0.015).abs() < 1e-9, "per_step={}", overhead.per_step);
+        assert!((overhead.at(2) - 0.032).abs() < 1e-9, "at(2)={}", overhead.at(2));
+        assert!((overhead.at(4) - 0.062).abs() < 1e-9, "at(4)={}", overhead.at(4));
+        assert!((overhead.at(15) - 0.227).abs() < 1e-9, "at(15)={}", overhead.at(15));
+        assert!((turns.mean_turn(0, 0).unwrap() - 0.227).abs() < 1e-9);
+
+        // Next turn: Verify(3) with 3 ms host + 45 ms for 3 head steps (15 ms/step).
+        turns.begin(t0 + Duration::from_millis(300), Some((0, 0)), vec![req]);
+        turns.head_finished(&[req], 3, Duration::from_millis(45));
+        turns.launched(&[req], t0 + Duration::from_millis(348), Some((0, 0)));
+
+        let refined = turns.overhead(0, 0).expect("refined overhead");
+        assert!((refined.fixed - 0.0025).abs() < 1e-9, "fixed={}", refined.fixed);
+        assert!((refined.per_step - 0.015).abs() < 1e-9, "per_step={}", refined.per_step);
     }
 }

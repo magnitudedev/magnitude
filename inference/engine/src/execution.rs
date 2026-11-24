@@ -357,6 +357,7 @@ pub(crate) fn search(
     progress: Rc<dyn Fn(LoadProgress)>,
 ) -> Result<(), LoadError> {
     let _search = OpenChange::begin(Ledgers::process().changes());
+    let _planning = seismic::PlanningSession::begin();
     let PlannedModel {
         startup,
         // Held while the search prepares and qualifies its programs.
@@ -629,11 +630,12 @@ pub(crate) fn build(
     // leaves behind has dropped: the owner reads between its allocations,
     // each recorded as it is made, and a failed load's frees are part of it.
     let _load = OpenChange::begin(Ledgers::process().changes());
+    let planning = seismic::PlanningSession::begin();
     let prepared = match prepare(catalog, manifest, &package, unprepared, progress.clone())? {
         LoadAttempt::Loaded(prepared) => prepared,
         LoadAttempt::Unprepared => return Ok(LoadAttempt::Unprepared),
     };
-    let sealed = seal_graphs(prepared, manifest)?;
+    let sealed = seal_graphs(prepared, manifest, planning)?;
     let imported = import_target(sealed, manifest, &package, &progress)?;
     let domain = assemble_domain(imported, manifest, package, &progress)?;
     Ok(LoadAttempt::Loaded(domain))
@@ -661,7 +663,11 @@ struct SealedLoad {
 /// The load's graphs prepared, planned and sealed, and its plan admitted
 /// at the resources they need: the load's preparation off the calling
 /// thread ends here.
-fn seal_graphs(prepared: Box<PreparedPrograms>, manifest: &ExecutionManifest) -> Result<Box<SealedLoad>, LoadError> {
+fn seal_graphs(
+    prepared: Box<PreparedPrograms>,
+    manifest: &ExecutionManifest,
+    planning: seismic::PlanningSession,
+) -> Result<Box<SealedLoad>, LoadError> {
     let PreparedPrograms {
         startup,
         draft,
@@ -743,8 +749,13 @@ fn seal_graphs(prepared: Box<PreparedPrograms>, manifest: &ExecutionManifest) ->
     // further and are released. The moments on either side say what they
     // held.
     report_load_memory("graphs sealed", opened.device());
-    let released = seismic::forget_evaluated_entry_shapes();
-    tracing::info!("released {released} evaluated entry shapes");
+    let released = planning.finish();
+    let trimmed = seismic::return_freed_pages();
+    if let Some(released) = released {
+        tracing::info!("released {released} evaluated entry shapes, returned {trimmed} freed host bytes");
+    } else if trimmed > 0 {
+        tracing::info!("returned {trimmed} freed host bytes");
+    }
     report_load_phase("graph and resource planning", &mut phase_started);
     report_load_memory("graphs planned", opened.device());
     if opened.selector() != execution_plan.device().selector() {
@@ -1040,6 +1051,10 @@ fn import_target(
         .map_err(|error| import_refused(&error, &device, &startup.ledgers))
     })?;
     residency.release_upload();
+    let trimmed = seismic::return_freed_pages();
+    if trimmed > 0 {
+        tracing::info!("returned {trimmed} freed host bytes after weight import");
+    }
     if let Some(floor_demand) = floor_demand {
         let imported = startup.claim_bank_growth(execution_plan.load(), floor_demand)?;
         let (sized_plan, sized_planned, mut bank_growth) = imported.fit(execution_plan, planned)?;

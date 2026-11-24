@@ -548,7 +548,8 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
         front: FrontFlight<F::HeadSubmission>,
     ) -> Result<FinishedFront, DomainError> {
         let completed = front.submission.finish().map_err(DomainError::Device)?;
-        let (core, output) = completed.into_parts();
+        let (core, mut output) = completed.into_parts();
+        output.complete_landed_reads().map_err(DomainError::Submit)?;
         let guesses = output
             .front()
             .expect("invariant violated: a front head launch makes no chain")
@@ -1259,7 +1260,7 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
         if verified {
             let epochs = self.family.expert_bank().map(|bank| (bank.regime_epoch(), bank.bank_epoch()));
             if let Some(bank) = self.family.expert_bank() {
-                if let Some(estimated_seconds) = self.verify_turns.mean(bank.regime_epoch(), bank.bank_epoch()).filter(|&s| s > 0.0) {
+                if let Some(estimated_seconds) = self.verify_turns.mean_turn(bank.regime_epoch(), bank.bank_epoch()).filter(|&s| s > 0.0) {
                     bank.draft_window(estimated_seconds);
                 }
             }
