@@ -254,7 +254,13 @@ impl Look {
 /// that waited for records is read (`reading` -1). A read ahead the request
 /// finds is the ledger's to hasten (`Prefetch::want`).
 fn read_demand(table: &ReadTable, (layer, expert): Staged, record: u32, sequence: Step, reading: i64) -> Result<Posting, String> {
-    let posting = prefetch::post(table, table.reads(layer, expert, record), seismic_io::Want::now());
+    let posting = prefetch::post(
+        table,
+        table.reads(layer, expert, record),
+        table.tensor_count(layer),
+        seismic_io::Want::now(),
+        table.demand_alignment(layer),
+    );
     if let Ok(posting) = &posting {
         for request in posting.ticket.requests() {
             seismic_io::timeline::note(seismic_io::timeline::Kind::Noted("demand"), request, (layer as i64, sequence as i64, reading));

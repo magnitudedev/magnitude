@@ -173,11 +173,8 @@ fn decode_keeps_the_rankings_top_share(harness: &Harness) {
 /// the evicted entry is unmapped from the first step not yet begun, while a step begun before
 /// still reads it and its record keeps its bytes until that step has
 /// completed; then the copy takes the record and its expert is mapped.
-/// Then a reserve pays, as the reserve's model prices it: 6 and 7 were
-/// each read again from the top of the stack, and the second record never
-/// hit, so holding it free costs no hit and saves the drain a promotion
-/// would wait; once the decode steps reading 7 have sized it, the bank
-/// releases 6 into the reserve and holds 7 alone.
+/// Both bank records remain held (the promotion reserve stays at 0 under
+/// on-demand promotion).
 #[test]
 fn a_promotion_reuses_its_record_only_once_every_step_that_could_read_it_completed() {
     let harness = promoting("promote", 2, TIER);
@@ -222,17 +219,17 @@ fn a_promotion_reuses_its_record_only_once_every_step_that_could_read_it_complet
     eventually("7 was never promoted", || map.held(7) == Some(five));
     assert_eq!([0, 1, 2].map(|kind| harness.banked(kind, five)), [7, 107, 207]);
     assert_eq!((map.resolve(5, after), map.resolve(7, after)), (None, Some(five)));
-    // Each decode step reading 7 sizes the reserve again; past the change's
-    // hysteresis it holds the one record the model prices as paying,
-    // whichever turns the steps' ends fell in.
+    // Subsequent decode steps reading 7 keep the promotion reserve at 0 and
+    // retain both bank records (6 and 7).
     for _ in 0..4 {
         let next = harness.step();
         harness.route_at(&next, 0, &[7]);
         next.complete().unwrap();
     }
-    let reserved = || residency::lock(&harness.watcher.state).core.directory.reserved(0);
-    eventually("the reserve never took the record its model prices as paying", || reserved() == 1 && shared.holdings().0[0] == 1);
-    assert_eq!((map.held(6), map.held(7)), (None, Some(five)), "6 released into the reserve, 7 kept");
+    let reserved = residency::lock(&harness.watcher.state).core.directory.reserved(0);
+    assert_eq!(reserved, 0, "promotion reserve stays at 0");
+    assert_eq!(shared.holdings().0[0], 2, "both bank records remain held");
+    assert!(map.held(6).is_some() && map.held(7) == Some(five), "both 6 and 7 remain held in the bank");
 }
 
 /// The promotions the ranking asks together copy one batch each, in due

@@ -26,7 +26,7 @@ use crate::operation::{LaunchWork, RequestId};
 use magnitude_kernels::constants::VERIFY_ROWS;
 use crate::programs::Chain;
 use std::collections::{BTreeMap, BTreeSet};
-use std::num::{NonZeroU32, NonZeroU64, NonZeroU8};
+use std::num::{NonZeroU64, NonZeroU8};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
@@ -54,13 +54,12 @@ pub(crate) struct AheadOf {
 impl AheadOf {
     /// Ahead row `row` of a pass of `exact` exact rows and `acceptable`
     /// acceptable rows: an acceptable row where `row` is below them, else
-    /// a front row. Panics on a pass no `Rows` represents: ahead rows with
-    /// no exact row before them, or front rows behind acceptable rows.
+    /// a front row (trailing behind either an exact-only pass or a verify
+    /// pass's acceptable rows). Panics when `exact == 0`.
     pub(crate) fn new(exact: usize, acceptable: usize, row: usize) -> Self {
-        let front = row >= acceptable;
         assert!(
-            exact > 0 && (!front || acceptable == 0),
-            "a pass's ahead rows are acceptable rows behind an exact row, or front rows of a pass of none: {exact} exact, {acceptable} acceptable, ahead row {row}"
+            exact > 0,
+            "a pass's ahead rows follow at least one exact row: {exact} exact, {acceptable} acceptable, ahead row {row}"
         );
         let byte = |count: usize| u8::try_from(count).expect("a pass's ahead rows fit a byte");
         Self { row: byte(row), acceptable: byte(acceptable) }
@@ -88,12 +87,19 @@ impl AheadOf {
     }
 
     /// The passes of its request after its own at which its token is
-    /// exact: none for an acceptable row; a front row's depth (1 the first
-    /// front row's).
+    /// exact:
+    /// - `0` for an acceptable row (exact in its own pass),
+    /// - `1` for a trailing front row behind acceptable rows (exact in the
+    ///   next verify pass `pass + 1` once all acceptable rows + bonus stand),
+    /// - `row + 1` for a pure front pass (`acceptable == 0`, depth `d` exact
+    ///   `d` passes later).
     pub(crate) fn exact_in(&self) -> u8 {
-        match self.front() {
-            true => self.row - self.acceptable + 1,
-            false => 0,
+        if !self.front() {
+            0
+        } else if self.acceptable > 0 {
+            1
+        } else {
+            self.row + 1
         }
     }
 }
@@ -368,6 +374,22 @@ impl Begun {
 }
 
 impl State {
+    fn served(&self, from: Step, until: Step, layer: usize, progress: Point) -> bool {
+        let (from, until) = (from.max(self.frontier), until.min(self.last + 1));
+        if from >= until {
+            return true;
+        }
+        let first = self.groups.range(..=from).next_back().map_or(from, |(&first, _)| first);
+        self.groups.range(first..until).all(|(&group, begun)| {
+            let mut running = (group.max(from)..(group + begun.steps).min(until))
+                .rev()
+                .filter(|step| !self.ended.contains(step));
+            running
+                .next()
+                .is_none_or(|last| Point { piece: begun.pass(layer).piece, layer, sequence: last, group } < progress)
+        })
+    }
+
     /// The request at layer `layer` of step `sequence` in the device's
     /// order, of a bank of `layers` layers.
     fn at(&mut self, sequence: Step, layer: usize, layers: usize) -> At {
@@ -931,16 +953,32 @@ impl Steps {
     /// before they begin. A group's steps pass a layer in sequence order, so each group
     /// running in the range is past where its last step there not ended is.
     pub(in crate::experts) fn served(&self, from: Step, until: Step, layer: usize, progress: Point) -> bool {
+        self.lock().served(from, until, layer, progress)
+    }
+
+    /// Like [`Self::unbegun`], also exposing a [`Park`] at `(progress, layers)`
+    /// and a lock-free `is_served` predicate evaluated against the
+    /// already-locked [`State`] so callers holding `&Unbegun` can compute
+    /// per-layer exact unresolved unmap steps and check
+    /// `served(from, unmap_until, layer, progress)` without re-acquiring the
+    /// `Steps` mutex.
+    pub(in crate::experts) fn unbegun_with_served<T>(
+        &self,
+        progress: Point,
+        layers: usize,
+        write: impl FnOnce(&Unbegun, &Park, &dyn Fn(Step, Step, usize, Point) -> bool) -> T,
+    ) -> T {
         let state = self.lock();
-        let (from, until) = (from.max(state.frontier), until.min(state.last + 1));
-        if from >= until {
-            return true;
-        }
-        let first = state.groups.range(..=from).next_back().map_or(from, |(&first, _)| first);
-        state.groups.range(first..until).all(|(&group, begun)| {
-            let mut running = (group.max(from)..(group + begun.steps).min(until)).rev().filter(|step| !state.ended.contains(step));
-            running.next().is_none_or(|last| Point { piece: begun.pass(layer).piece, layer, sequence: last, group } < progress)
-        })
+        let at = Unbegun::of(&state);
+        let park = Park {
+            point: progress,
+            unresolved: (0..layers).map(|layer| ParkFrom(state.first_unresolved(progress, layer))).collect(),
+            earlier: (0..layers).map(|layer| state.unresolved_before(progress, layer)).collect(),
+        };
+        let is_served = |from: Step, until: Step, layer: usize, progress: Point| {
+            state.served(from, until, layer, progress)
+        };
+        write(&at, &park, &is_served)
     }
 
     /// Whether `step` has already passed `layer` (its pass there lies strictly
@@ -1416,6 +1454,7 @@ impl Shared {
             self.register_step(
                 first + launches.len() as u64 - 1,
                 crate::experts::horizon::Advance::Known(crate::experts::horizon::Tokens::new(1.0)),
+                &[],
             );
         }
         // Known to serving before any of its steps' requests can be.
@@ -1540,12 +1579,15 @@ enum Ending {
 }
 
 /// A completed decode step's routing (`interest::Told::Completed`): at each
-/// streamed layer the experts its exact rows chose, and its front rows'
-/// guess kinds.
+/// streamed layer the experts its exact rows chose, its front rows' guess
+/// kinds, actual physical row count dispatched (including front rows), and
+/// per-layer post-site `(gpu_host_misses, cpu_sited)` counts.
 pub(super) struct DecodeRouting {
     pub(super) chose: Vec<Vec<crate::experts::interest::Chosen>>,
     pub(super) guesses: Option<u32>,
     pub(super) row_experts: Vec<Vec<(u8, u16)>>,
+    pub(super) physical_rows: u64,
+    pub(super) layer_misses: Vec<(u64, u64)>,
 }
 
 /// A step whose load counts its decode (`Stack::live`).
@@ -1571,31 +1613,28 @@ pub(super) enum CompletedRoute {
 
 /// The guessed rows of a decode launch: none (`Plain`), front rows
 /// (`Front`, STEP_FRONT's bits: bit r where row r is a front row), or
-/// acceptable verify rows (`Acceptable`, bit r where row r is a verify row,
-/// accepted where its guess stands). A launch's passes are of one form:
-/// front rows or acceptable rows, never both (`crate::BuiltForm`).
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(super) enum GuessedRows {
-    Plain,
-    Front(NonZeroU32),
-    Acceptable(NonZeroU32),
+/// The guessed rows of a decode launch: disjoint bitmasks of acceptable
+/// verify rows (`acceptable`) and trailing front rows (`front`, `STEP_FRONT`).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(super) struct GuessedRows {
+    pub(super) acceptable: u32,
+    pub(super) front: u32,
 }
 
 impl GuessedRows {
     /// The bitmask of all guessed rows (front or acceptable), 0 if plain.
     pub(super) fn mask(self) -> u32 {
-        match self {
-            Self::Plain => 0,
-            Self::Front(bits) | Self::Acceptable(bits) => bits.get(),
-        }
+        self.acceptable | self.front
     }
 
     /// The bitmask of front rows (STEP_FRONT's bits), 0 if none.
     pub(super) fn front(self) -> u32 {
-        match self {
-            Self::Front(bits) => bits.get(),
-            Self::Plain | Self::Acceptable(_) => 0,
-        }
+        self.front
+    }
+
+    /// Whether this launch runs any acceptable verify rows.
+    pub(super) fn verifies(self) -> bool {
+        self.acceptable != 0
     }
 }
 
@@ -1638,7 +1677,7 @@ impl DecodeLaunch {
 
     /// Whether its passes are verify passes: it ran acceptable rows.
     pub(super) fn verifies(&self) -> bool {
-        matches!(self.guessed, GuessedRows::Acceptable(_))
+        self.guessed.verifies()
     }
 }
 
@@ -1735,22 +1774,15 @@ impl ExpertStep {
         // Every pass runs its exact row in its launch (`AheadOf::new`), so a
         // launch has a sequence, and a row that reads.
         assert!(sequences > 0, "a decode launch of {count} rows runs no exact row");
-        let guessed = match (NonZeroU32::new(front), NonZeroU32::new(acceptable)) {
-            (None, None) => GuessedRows::Plain,
-            (Some(front), None) => GuessedRows::Front(front),
-            (None, Some(acceptable)) => GuessedRows::Acceptable(acceptable),
-            (Some(front), Some(acceptable)) => {
-                panic!("a decode launch's passes are of one form: front rows {front:#b}, acceptable rows {acceptable:#b}");
-            }
-        };
+        debug_assert_eq!(front & acceptable, 0, "a row cannot be both front and acceptable");
+        let guessed = GuessedRows { acceptable, front };
         if self.work == LaunchWork::Generation {
-            let advance = match guessed {
-                GuessedRows::Acceptable(_) => crate::experts::horizon::Advance::Pending { requests: verifying_requests as u32 },
-                GuessedRows::Plain | GuessedRows::Front(_) => {
-                    crate::experts::horizon::Advance::Known(crate::experts::horizon::Tokens::new(1.0))
-                }
+            let advance = if guessed.verifies() {
+                crate::experts::horizon::Advance::Pending { requests: verifying_requests as u32 }
+            } else {
+                crate::experts::horizon::Advance::Known(crate::experts::horizon::Tokens::new(1.0))
             };
-            self.shared.register_step(self.sequence, advance);
+            self.shared.register_step(self.sequence, advance, &verifying[..verifying_requests]);
         }
         self.shared.tell(crate::experts::interest::Told::Began { step: self.sequence, launch: crate::experts::interest::Launched::Decode { rows, padding } });
         decode.launch = Some(DecodeLaunch { rows: count, placed, tokens: tokens / reading, guessed });
@@ -1821,6 +1853,7 @@ impl ExpertStep {
             },
         );
         if let Some(reason) = shared.life.ended() {
+            shared.cancel_verify(self.sequence);
             return Err(StepFailure::Watcher(reason));
         }
         let read = shared.steps.lock().failed.remove(&self.sequence);
@@ -1847,6 +1880,7 @@ impl ExpertStep {
         // that answer: it is interrupted, to be re-run.
         if self.expired() {
             shared.steps.interrupted.fetch_add(1, Ordering::AcqRel);
+            shared.cancel_verify(self.sequence);
             return Err(StepFailure::Interrupted(format!(
                 "a wait of step {} ended on its still pulse before its answer (the host's pulse beat late)",
                 self.sequence
@@ -1854,9 +1888,16 @@ impl ExpertStep {
         }
         match (read, site) {
             (None, None) => Ok(()),
-            (Some((rows, reason)), None) => Err(StepFailure::Read { rows, reason }),
-            (None, Some((rows, reason))) => Err(StepFailure::Site { rows, reason }),
+            (Some((rows, reason)), None) => {
+                shared.cancel_verify(self.sequence);
+                Err(StepFailure::Read { rows, reason })
+            }
+            (None, Some((rows, reason))) => {
+                shared.cancel_verify(self.sequence);
+                Err(StepFailure::Site { rows, reason })
+            }
             (Some(read), Some(site)) => {
+                shared.cancel_verify(self.sequence);
                 let (rows, reason) = both(read, site);
                 Err(StepFailure::Read { rows, reason })
             }
@@ -1885,7 +1926,11 @@ impl Drop for ExpertStep {
         if self.expired() {
             self.shared.steps.lock().tainted.insert(self.sequence);
         }
-        self.shared.end_step(self.sequence, std::mem::replace(&mut self.ending, Ending::Unrun));
+        let ending = std::mem::replace(&mut self.ending, Ending::Unrun);
+        if matches!(ending, Ending::Unrun) {
+            self.shared.cancel_verify(self.sequence);
+        }
+        self.shared.end_step(self.sequence, ending);
     }
 }
 
@@ -1936,8 +1981,15 @@ impl Shared {
             self.telemetry.ended(ended);
         });
         let completed = matches!(ending, Ending::Completed(_));
-        if let Ending::Completed(Some(DecodeRouting { chose, guesses, row_experts })) = ending {
-            self.tell(crate::experts::interest::Told::Completed { step: sequence, chose, guesses, row_experts });
+        if let Ending::Completed(Some(DecodeRouting { chose, guesses, row_experts, physical_rows, layer_misses })) = ending {
+            self.tell(crate::experts::interest::Told::Completed {
+                step: sequence,
+                chose,
+                guesses,
+                row_experts,
+                physical_rows,
+                layer_misses,
+            });
         }
         // Told once the steps know it ended, so a ring of it read after this
         // is drained finds it ended (`Steps::of_low_word`).
@@ -1998,7 +2050,7 @@ impl ExpertStep {
         Arc::new(Shared {
             steps,
             time: time.clone(),
-            pending_verify: std::sync::Mutex::new(None),
+            pending_verify: std::sync::Mutex::new(std::collections::BTreeMap::new()),
             telemetry: Telemetry::new(
                 &[],
                 super::telemetry::GroupReadWords { layers: Vec::new(), places: 1 },

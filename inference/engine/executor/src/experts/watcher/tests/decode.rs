@@ -332,14 +332,14 @@ fn a_park_readies_the_reserve_for_the_hints_behind_it() {
     // two layers' sixteen experts.
     let harness = lending("park-readies", EXPERTS, 8, 2, 8, DECODE, 8, Placer::Bank, false);
     let map = &harness.layers[0].0;
-    let (parked, behind) = (harness.step(), harness.step());
+    let (parked, behind) = (harness.step(), harness.two_row_step());
     harness.request_at(&parked, 0, &[4, 5, 6, 7]);
     assert!((4..8).all(|expert| map.resolve(expert, behind.sequence()).is_none()), "mapped before the device is past the launch");
     harness.request_at(&parked, 1, &[7]);
     assert!((4..8).all(|expert| map.held(expert).is_none()), "the refill unmapped the landed experts");
     assert!((4..8).all(|expert| map.resolve(expert, behind.sequence()).is_none()), "restamped at the park");
-    harness.hint(&behind, 0, &[5]);
-    eventually("the hint was never read", || harness.watcher.shared().costs().hints.reads == 1);
+    harness.front_at(&behind, 1, &[5]);
+    eventually("the front read was never issued", || harness.watcher.shared().costs().front.reads == 1);
     parked.complete().unwrap();
     for layer in 0..2 {
         harness.route_at(&behind, layer, &[]);
@@ -424,7 +424,7 @@ fn batched_verify_with_exact_only_request_advances_the_clock() {
 
     // Only request A awaits a verdict (`rows > committed_rows`); request B
     // (exact row only) never calls `decided` or `discarded`.
-    let pass = Rows::Exact { acceptable: vec![TokenId(7)] };
+    let pass = Rows::verify(vec![TokenId(7)]);
     shared.decided(verify_step, req_a, &AheadVerdict::new(&pass, &[TokenId(7), TokenId(8)]));
     assert_eq!(shared.time().lock().clock.through_latest(), Tokens::new(2.0), "1 exact + 1 accepted");
 

@@ -189,18 +189,36 @@ pub(super) struct ResizeHandoff {
     ask_lock: Mutex<()>,
     resize: Mutex<Resize>,
     resized: Condvar,
+    /// Lock-free flag set while `Resize::Asked` is waiting for `expert-residency`
+    /// to pick it up, so `Residency::keep` and `Telemetry::feed_while` yield
+    /// immediately to serve the resize without draining a multi-second backlog.
+    pending: std::sync::atomic::AtomicBool,
 }
 
 impl ResizeHandoff {
     pub(super) fn new() -> Self {
-        Self { ask_lock: Mutex::new(()), resize: Mutex::new(Resize::None), resized: Condvar::new() }
+        Self {
+            ask_lock: Mutex::new(()),
+            resize: Mutex::new(Resize::None),
+            resized: Condvar::new(),
+            pending: std::sync::atomic::AtomicBool::new(false),
+        }
+    }
+
+    /// Whether a resize request is currently waiting to be picked up by
+    /// `expert-residency` (lock-free).
+    pub(super) fn is_pending(&self) -> bool {
+        self.pending.load(std::sync::atomic::Ordering::Acquire)
     }
 
     /// What the owner asks of a resize, and when it asked, taken.
     pub(super) fn asked(&self) -> Option<(Ask, Instant)> {
         let mut resize = self.resize.lock().expect("watcher resize");
         match std::mem::replace(&mut *resize, Resize::None) {
-            Resize::Asked(asked, at) => Some((asked, at)),
+            Resize::Asked(asked, at) => {
+                self.pending.store(false, std::sync::atomic::Ordering::Release);
+                Some((asked, at))
+            }
             other => {
                 *resize = other;
                 None
@@ -221,6 +239,7 @@ impl ResizeHandoff {
     /// waiting.
     pub(super) fn wake(&self) {
         let _resize = self.resize.lock().expect("watcher resize");
+        self.pending.store(false, std::sync::atomic::Ordering::Release);
         self.resized.notify_all();
     }
 }
@@ -277,6 +296,7 @@ impl Shared {
             let mut resize = resizing.resize.lock().expect("watcher resize");
             assert!(matches!(*resize, Resize::None), "invariant violated: a resize is already pending in ResizeHandoff");
             *resize = Resize::Asked(ask, Instant::now());
+            resizing.pending.store(true, std::sync::atomic::Ordering::Release);
         };
         match ask.waits() {
             true => self.steps.between_flights(|| post(ask))?,

@@ -1109,11 +1109,15 @@ impl Scratch {
     /// steps in order, so the next is the tier's next place at the layer, or
     /// the first of a later group.
     pub(super) fn published(&self, core: &Core, shared: &Shared, layer: usize, layers: usize) -> Option<(usize, At)> {
+        let live = shared.steps.live();
+        let visible_end = shared.parks.scratch_visible_end(layer, core.extents.tier_copy_dma, live.end);
+        let start = live.start.max(self.published[layer] + 1);
+        if start >= visible_end {
+            return None;
+        }
         let tier = self.tiers.iter().find(|tier| tier.layer == layer);
         let scratch = &core.layers[layer].scratch;
-        let live = shared.steps.live();
-        let unpublished = live.start.max(self.published[layer] + 1)..live.end;
-        let sequence = scratch.earliest_requested(unpublished, constants::SCRATCH_ASK, |step| !shared.steps.ended(step))?;
+        let sequence = scratch.earliest_requested(start..visible_end, constants::SCRATCH_ASK, |step| !shared.steps.ended(step))?;
         let at = shared.steps.at(sequence, layer, layers);
         let place = usize::try_from(sequence - at.point.group).expect("a group's places");
         let taken = match tier {
@@ -2053,7 +2057,18 @@ impl Scratch {
         };
         let knee = core.table.source().knee();
         let total_conveyor = self.conveyor.records();
+        // Cap queued background (`ahead`) conversion jobs to `2 * workers` so
+        // prefill/ahead bursts never backlog decode demand on `HostCompute`.
+        let max_ahead = shared.compute.workers().max(1) * 2;
         for (layer, expert, record) in candidates {
+            let read = reader(&self.tiers, layer, expert);
+            let is_demand = read.is_some();
+            if !(async_dma && is_demand) && shared.compute.ahead_queued() >= max_ahead {
+                if async_dma {
+                    self.conveyor.release_held(layer, expert);
+                }
+                continue;
+            }
             if !async_dma {
                 let knee_records = knee.div_ceil(core.layers[layer].expert_bytes()) as usize;
                 let free = self.conveyor.free_conveyor(layer, |r| Self::admits_conveyor(&self.conveyor, core, layer, r)).len();
@@ -2061,8 +2076,6 @@ impl Scratch {
                     continue;
                 }
             }
-            let read = reader(&self.tiers, layer, expert);
-            let is_demand = read.is_some();
             let grant = match core.directory.claim_conveyed(layer, expert, read) {
                 Claim::Taken(grant) => grant,
                 Claim::Kept(_) | Claim::Landing => {

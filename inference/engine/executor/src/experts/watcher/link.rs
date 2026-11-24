@@ -239,7 +239,7 @@ impl LinkMover {
         let Some(copy) = line(core, shared) else {
             return moved;
         };
-        if held || shared.life.ended().is_some() {
+        if held || shared.life.ended().is_some() || shared.resizing.is_pending() {
             return moved;
         }
         let bytes = record_bytes(core);
@@ -909,7 +909,7 @@ mod tests {
         // Publish predicted hints for layers 2, 0, 1 for step 5.
         for (layer, expert) in [(2usize, 7usize), (0, 3), (1, 5)] {
             let name = Name {
-                source: Source::Lead { distance: 1, row: None },
+                source: Source::Token,
                 when: When::Step(5),
                 rank: 0,
                 from: At::whole(5, layer.saturating_sub(1)),

@@ -226,13 +226,13 @@ fn a_failed_steps_record_frees_only_once_its_read_ends() {
 fn a_failed_hint_fails_nothing() {
     // The file holds 6 experts of each tensor: expert 7's reads lie past
     // its end.
-    let harness = layered("hint-failure", 6, 12, 2, 4 + 4);
+    let harness = layered("front-failure", 6, 12, 2, 4 + 4);
     harness.demand_step(5);
-    let step = harness.step();
-    harness.hint(&step, 0, &[7]);
+    let step = harness.two_row_step();
+    harness.front_at(&step, 1, &[7]);
     harness.request_at(&step, 0, &[4]);
-    // The hint's read ends (fails) before the step moves on.
-    eventually("the hint was never read", || harness.watcher.shared().costs().hints.reads > 0);
+    // The front read ahead ends (fails) before the step moves on.
+    eventually("the front read was never issued", || harness.watcher.shared().costs().front.reads > 0);
     std::thread::sleep(Duration::from_millis(20));
     harness.request_at(&step, 1, &[3]);
     step.complete().expect("a failed hint fails nothing");

@@ -247,6 +247,10 @@ pub(crate) struct Parks {
     /// Per streamed layer and site slot, the step and value of the last
     /// publication registered of its site request.
     publications: Vec<Vec<[AtomicU64; 2]>>,
+    /// Per streamed layer, the highest step whose `Front` submission has
+    /// completed on the device under `tier_copy_dma` prefill (where
+    /// `OnceStage::Fill` is skipped and registers no park).
+    prefill_front_visible: Vec<AtomicU64>,
     /// The load's events: the device's words in place for the request
     /// service ([`Self::settled`]) is one.
     events: Arc<Events>,
@@ -280,6 +284,7 @@ impl Parks {
                     (0..slots).map(|_| [AtomicU64::new(0), AtomicU64::new(0)]).collect()
                 })
                 .collect(),
+            prefill_front_visible: (0..layers.len()).map(|_| AtomicU64::new(0)).collect(),
             layers,
             state: Mutex::new(State { pending: VecDeque::new(), announced: 0, stopped: false }),
             changed: Condvar::new(),
@@ -328,6 +333,45 @@ impl Parks {
 
     fn state(&self) -> std::sync::MutexGuard<'_, State> {
         self.state.lock().expect("parks")
+    }
+
+    /// Whether a park binds operations on the load's device (`!parks_in_kernels`).
+    pub(crate) fn kept(&self) -> bool {
+        self.kept
+    }
+
+    /// The highest step whose `Front` submission has completed on the device
+    /// for `layer` under `tier_copy_dma` prefill (`0` if none yet).
+    pub(crate) fn prefill_front_visible(&self, layer: usize) -> Step {
+        self.prefill_front_visible[layer].load(Ordering::Acquire)
+    }
+
+    /// Record that `Front` for `layer` has completed on the device through
+    /// step `through` (for `tier_copy_dma` prefill on boundary-parked
+    /// backends where `OnceStage::Fill` registers no park), and wake the
+    /// request service so `Residency::publish` can read its scratch request.
+    pub(crate) fn mark_prefill_front_visible(&self, layer: usize, through: Step) {
+        self.prefill_front_visible[layer].fetch_max(through, Ordering::Release);
+        self.events.notify();
+    }
+
+    /// Exclusive upper bound of steps whose scratch requests at `layer` are
+    /// host-visible for `Scratch::published`: unbounded (`live_end`) where
+    /// kernels wait in place (`!self.kept`), up through the last completed
+    /// `Front` submission (`Self::mark_prefill_front_visible`) under
+    /// `tier_copy_dma` where `OnceStage::Fill` registers no park, and
+    /// `live_end` only while parked (`Self::parked`) otherwise.
+    pub(super) fn scratch_visible_end(&self, layer: usize, tier_copy_dma: bool, live_end: Step) -> Step {
+        if !self.kept {
+            live_end
+        } else if tier_copy_dma {
+            let visible = self.prefill_front_visible(layer);
+            if visible == 0 { 0 } else { visible.saturating_add(1).min(live_end) }
+        } else if self.parked() {
+            live_end
+        } else {
+            0
+        }
     }
 
     /// The timeline every park of the load binds.
@@ -973,5 +1017,54 @@ mod tests {
         parks.retire(4);
         parks.retire(5);
         assert!(parks.state().pending.is_empty());
+    }
+
+    /// Under `parks.kept == true` (boundary-parked backends such as Vulkan) and
+    /// `tier_copy_dma == true`, `OnceStage::Fill` is skipped so `pending` stays
+    /// empty and `parked()` is false. `scratch_visible_end` must withhold every
+    /// layer's scratch requests until `mark_prefill_front_visible` marks that
+    /// layer's completed `Front` submission and wakes `events`, without
+    /// exposing another layer's still-in-flight `Front` or relaxing non-DMA
+    /// visibility.
+    #[test]
+    fn tier_copy_dma_prefill_front_visibility_under_kept_parks() {
+        let device = crate::test_support::open_backend(&Devices::discover(&[]).unwrap(), BackendName::Cpu).unwrap();
+        let make_layer = || ParkLayer {
+            file: slots(&device, SlotTable::file(4, 4)),
+            scratch: slots(&device, SlotTable::scratch(4, 2)),
+            site: Some(slots(&device, SlotTable::site(2, 4))),
+        };
+        let mut parks = Parks::new(
+            seismic::Timeline::new(&device).unwrap(),
+            vec![make_layer(), make_layer()],
+            Arc::default(),
+        );
+        // Simulate a boundary-parked backend (Vulkan: `!parks_in_kernels()`).
+        parks.kept = true;
+        assert!(parks.state().pending.is_empty());
+        assert!(!parks.parked(), "kept parks with empty pending queue must report not parked");
+
+        // Before Front completes: neither non-DMA nor tier_copy_dma may read in-flight scratch words.
+        assert_eq!(parks.scratch_visible_end(0, false, 10), 0);
+        assert_eq!(parks.scratch_visible_end(0, true, 10), 0);
+        assert_eq!(parks.scratch_visible_end(1, true, 10), 0);
+
+        // Front(0) completes through step 3: notifies events and exposes steps <= 3 on layer 0 only.
+        let seen = parks.events.seen();
+        parks.mark_prefill_front_visible(0, 3);
+        assert_ne!(parks.events.seen(), seen, "marking prefill front visible must wake Requests::serve");
+        assert_eq!(parks.scratch_visible_end(0, true, 10), 4);
+        assert_eq!(parks.scratch_visible_end(1, true, 10), 0, "in-flight Front(1) must stay hidden");
+        assert_eq!(parks.scratch_visible_end(0, false, 10), 0, "non-DMA still requires a reached park");
+
+        // Monotonicity and clamping to live_end.
+        parks.mark_prefill_front_visible(0, 2);
+        assert_eq!(parks.scratch_visible_end(0, true, 10), 4);
+        assert_eq!(parks.scratch_visible_end(0, true, 2), 2);
+
+        // When parks are not kept (in-kernel waiting), visibility is always unbounded.
+        parks.kept = false;
+        assert_eq!(parks.scratch_visible_end(1, false, 10), 10);
+        assert_eq!(parks.scratch_visible_end(1, true, 10), 10);
     }
 }

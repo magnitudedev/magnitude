@@ -6,7 +6,7 @@ use super::steps::Owned;
 use crate::experts::{ExchangeTable, Words};
 use crate::experts::conveyor::Conveyor;
 use crate::experts::directory::{Directory, Point};
-use crate::experts::landing::{Landing, TierTensor};
+use crate::experts::landing::{Landing, LandingTensor, TierTensor};
 use crate::experts::host_records::Grant;
 use crate::experts::map::MapView;
 use crate::experts::source::{ExpertSource, Read, Records};
@@ -41,11 +41,15 @@ impl StoredTensor {
 
     /// The reads that bring expert `expert`'s record into record `record`
     /// of `records`: one a part, each where the parts before it end.
-    pub fn reads<'a>(&'a self, expert: usize, records: &'a Records, record: u64) -> impl Iterator<Item = Read> + 'a {
+    pub fn reads<'a>(&'a self, tensor: usize, expert: usize, records: &'a Records, record: u64) -> impl Iterator<Item = Read> + 'a {
+        let single_part = self.parts.len() == 1;
         self.parts.iter().scan(0, move |within, part| {
             let at = *within;
             *within += part.bytes;
-            Some(Read::new(part.file, part.base + expert as u64 * part.pitch, part.bytes, records, record, at))
+            Some(
+                Read::new(part.file, part.base + expert as u64 * part.pitch, part.bytes, records, record, at)
+                    .for_tensor(tensor, single_part),
+            )
         })
     }
 }
@@ -74,13 +78,6 @@ pub(in crate::experts) struct Layer {
     /// (`BankPart::FileTable`, `ScratchTable`).
     pub file: ExchangeTable,
     pub scratch: ExchangeTable,
-    /// Its rings of the layers ahead's hints, a row a lead
-    /// (`RegionWords::ring_words` each), or none for the last streamed
-    /// layer.
-    pub rings: Words,
-    /// Per ring row, the layer it hints (`ExpertBankPlan::predicted`): a row
-    /// a lead its route has.
-    pub hints: Vec<usize>,
     /// Its routing records, one for each step in flight
     /// (`RegionWords::flight`), routing words each
     /// (`RegionWords::routing_words`).
@@ -432,6 +429,7 @@ pub(super) struct ReadTable {
     source: ExpertSource,
     staging: Vec<Records>,
     stored: Vec<Arc<[StoredTensor]>>,
+    demand_alignment: Vec<crate::experts::source::ReadAlignment>,
 }
 
 impl ReadTable {
@@ -441,7 +439,25 @@ impl ReadTable {
             source,
             staging: pools.into_iter().map(|pool| pool.staging).collect(),
             stored: layers.iter().map(|layer| layer.stored.clone()).collect(),
+            demand_alignment: layers
+                .iter()
+                .map(|layer| {
+                    if layer.landing.is_some() {
+                        crate::experts::source::ReadAlignment::ExactZeroLead
+                    } else {
+                        crate::experts::source::ReadAlignment::AllowAlignedLead
+                    }
+                })
+                .collect(),
         }
+    }
+
+    /// Read alignment required for demand reads of `layer`: `ExactZeroLead`
+    /// where `Placer::Bank` (`layer.landing.is_some()`) converts staging on the
+    /// device from byte offset 0, `AllowAlignedLead` where host conversion
+    /// honors `ticket.tensor_leads()`.
+    pub(super) fn demand_alignment(&self, layer: usize) -> crate::experts::source::ReadAlignment {
+        self.demand_alignment[layer]
     }
 
     /// The model's files, read through.
@@ -471,14 +487,20 @@ impl ReadTable {
         self.reads_into(layer, expert, |pool| (&self.staging[pool], u64::from(record)))
     }
 
+    /// Number of routed tensors stored for `layer` (e.g. 3 for gate/up/down).
+    pub(super) fn tensor_count(&self, layer: usize) -> usize {
+        self.stored[layer].len()
+    }
+
     /// The reads that bring expert `expert` of `layer` into record `into`
     /// names (its records and index) of each of its pools, by pool.
     pub(super) fn reads_into<'a>(&self, layer: usize, expert: usize, into: impl Fn(usize) -> (&'a Records, u64)) -> Vec<Read> {
         self.stored[layer]
             .iter()
-            .flat_map(|stored| {
+            .enumerate()
+            .flat_map(|(tensor, stored)| {
                 let (records, record) = into(stored.pool);
-                stored.reads(expert, records, record)
+                stored.reads(tensor, expert, records, record)
             })
             .collect()
     }
@@ -610,17 +632,22 @@ impl Core {
     }
 
     /// The landing `grant` allows (its expert into its tier record) from
-    /// staging record `record` of each of its pools, mapped by the grant
-    /// (`experts::landing`).
-    pub(super) fn landing(&self, grant: Grant, record: u32) -> Landing {
-        self.landing_from(grant, |pool| (self.table.staging(pool), u64::from(record)))
+    /// staging record `record` of each of its pools with per-tensor `leads`
+    /// byte offsets (from `AlignedRange` zero-bounce direct staging), mapped
+    /// by the grant (`experts::landing`).
+    pub(super) fn landing_with_leads(&self, grant: Grant, record: u32, leads: &[usize]) -> Landing {
+        self.landing_from_leads(grant, |pool| (self.table.staging(pool), u64::from(record)), |tensor| leads.get(tensor).copied().unwrap_or(0))
     }
 
     /// The landing `grant` allows (its expert into its tier record) from
     /// the record `from` names of each of its pools (its records and index:
-    /// a staging record, or a prompt group's conveyor record), mapped by
-    /// the grant (`experts::landing`).
+    /// a staging record, or a prompt group's conveyor record) at lead 0, mapped
+    /// by the grant (`experts::landing`).
     pub(super) fn landing_from<'a>(&self, grant: Grant, from: impl Fn(usize) -> (&'a Records, u64)) -> Landing {
+        self.landing_from_leads(grant, from, |_| 0)
+    }
+
+    fn landing_from_leads<'a>(&self, grant: Grant, from: impl Fn(usize) -> (&'a Records, u64), lead: impl Fn(usize) -> usize) -> Landing {
         let watched = &self.layers[grant.staged().0];
         let tensors = self.groups[watched.group].tier.as_ref().expect("a landing's group has a host tier");
         let landed = grant.record();
@@ -629,9 +656,16 @@ impl Core {
                 .stored
                 .iter()
                 .zip(tensors)
-                .map(|(stored, tensor)| {
+                .enumerate()
+                .map(|(index, (stored, tensor))| {
                     let (records, record) = from(stored.pool);
-                    (records.clone(), record, stored.bytes(), tensor.landed(landed))
+                    LandingTensor {
+                        staging: records.clone(),
+                        staged: record,
+                        lead: lead(index),
+                        bytes: stored.bytes(),
+                        tier: tensor.landed(landed),
+                    }
                 })
                 .collect(),
             grant,
@@ -650,7 +684,8 @@ impl Core {
                     .stored
                     .iter()
                     .zip(slots)
-                    .flat_map(|(stored, records)| stored.reads(expert, records, u64::from(slot)))
+                    .enumerate()
+                    .flat_map(|(tensor, (stored, records))| stored.reads(tensor, expert, records, u64::from(slot)))
                     .collect()
             }
         }

@@ -227,7 +227,7 @@ fn rows(tensor: &Tensor, count: u64) -> Vec<Option<Tensor>> {
 /// bank's one group: what promotions copy into, a record at a time.
 struct BankRows(Vec<Tensor>);
 
-type LayerWords = (MapView, ExchangeTable, ExchangeTable, Words, Words, Words, Words);
+type LayerWords = (MapView, ExchangeTable, ExchangeTable, (), Words, Words, Words);
 
 impl Drop for Harness {
     fn drop(&mut self) {
@@ -456,12 +456,11 @@ pub(super) fn lending_windowed_passes(
     let mut maps = (0..layers).map(|_| StampedMap::new(words(EXPERTS as u64 * constants::MAP_WORDS, 0))).collect::<Vec<_>>();
     let all = (0..layers)
         .map(|index| {
-            let ahead = crate::planning::HINT_LEADS.min((layers - 1 - index) as u64);
             (
                 maps[index].view().clone(),
                 cpu_slots(WORDS.file(), &steps),
                 cpu_slots(WORDS.scratch(), &steps),
-                words(ahead * WORDS.ring_words(), 0),
+                (),
                 words(WORDS.flight * WORDS.routing_words(), 0),
                 words(constants::POLICY_WORDS, 0),
                 words(WORDS.ring_words(), 0),
@@ -615,9 +614,6 @@ pub(super) fn lending_windowed_passes(
                 map: layer.0.clone(),
                 file: layer.1.clone(),
                 scratch: layer.2.clone(),
-                rings: layer.3.clone(),
-                // Each ring row hints the layer its lead is ahead.
-                hints: (0..layer.3.len() / WORDS.ring_words() as usize).map(|lead| index + 1 + lead).collect(),
                 routing: layer.4.clone(),
                 keys: layer_keys[index].clone(),
                 policy: layer.5.clone(),
@@ -701,7 +697,7 @@ pub(super) fn lending_windowed_passes(
     // Its promotions copy at a measured transfer queue's line, as a
     // discrete load's do: one record at a time, its latency none.
     let transfer = magnitude_cost_model::ReadLine::new(0., 1e-10).unwrap();
-    watcher.shared().price_copy(&crate::assessment::TierCopyCosts { blocks: 1, whole_seconds: 1e-3, stall_share: 0., transfer, back: transfer, concurrent_host_byte_seconds: None });
+    watcher.shared().price_copy(&crate::assessment::TierCopyCosts { blocks: 1, whole_seconds: 1e-3, stall_share: 0., transfer, back: transfer, concurrent_host_byte_seconds: None, concurrent_dma_byte_seconds: None });
     {
         let mut state = residency::lock(&watcher.state);
         for layer in 0..state.core.layers.len() {
@@ -1647,11 +1643,6 @@ impl Harness {
         step.complete().unwrap();
     }
 
-    /// Play layer `layer`'s ring hinting `experts` of the next in `step`.
-    pub(super) fn hint(&self, step: &ExpertStep, layer: usize, experts: &[i32]) {
-        self.hint_at(step, layer, 0, experts);
-    }
-
     /// Play `step`'s landing launch at layer `layer` ending on its still pulse,
     /// as its kernel does when the host's pulse stood still past its
     /// patience.
@@ -1668,23 +1659,6 @@ impl Harness {
     /// The watchdog's report, once it trips, taken: its test expected it.
     pub(super) fn tripped(&self) -> String {
         awaited("the exchange's watchdog tripped", || self.trip.take())
-    }
-
-    /// Play layer `layer`'s ring row of lead `lead` hinting `experts` of
-    /// the layer `lead + 1` ahead in `step`: a row each, its one choice
-    /// (rank 0) at the harness's one choice a row, each an exact row's (row
-    /// 0, the step's only row unless it decodes ahead).
-    pub(super) fn hint_at(&self, step: &ExpertStep, layer: usize, lead: usize, experts: &[i32]) {
-        let ring = &self.layers[layer].3;
-        let base = lead * WORDS.ring_words() as usize;
-        for (index, &expert) in experts.iter().enumerate() {
-            let entry = base + constants::HINT_ENTRY(index as u64) as usize;
-            ring.store(entry + constants::HINT_EXPERT as usize, expert);
-            ring.store(entry + constants::HINT_RANK as usize, 0);
-            ring.store(entry + constants::HINT_ROW as usize, 0);
-        }
-        ring.store(base + constants::RING_COUNT as usize, experts.len() as i32);
-        ring.store(base + constants::RING_SEQUENCE as usize, low_word(step.sequence()));
     }
 
     /// Play layer `layer`'s front ring naming `experts` its front row chose

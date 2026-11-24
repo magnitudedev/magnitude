@@ -265,6 +265,8 @@ pub struct Measured {
     pub verify_terms: [Option<Terms>; DEPTHS],
     pub paths: Option<Vec<magnitude_cost_model::PathTerm>>,
     pub stall: Option<f64>,
+    pub front_stall: [Option<f64>; FRONT_DEPTHS],
+    pub verify_stall: [Option<f64>; FRONT_DEPTHS],
     pub needed: [[Option<magnitude_cost_model::Needed>; DEPTHS]; 2],
     pub stand: Option<f64>,
     pub accepts: [Option<f64>; FRONT_DEPTHS],
@@ -474,6 +476,14 @@ impl Passes {
             verify_terms,
             paths,
             stall: (plain.missed > 0.).then(|| plain.parked / plain.missed),
+            front_stall: std::array::from_fn(|idx| {
+                let pass = self.depth(false, idx + 1, regime, epoch).pass;
+                (pass.missed > 0.).then(|| pass.parked / pass.missed)
+            }),
+            verify_stall: std::array::from_fn(|idx| {
+                let pass = self.depth(true, idx + 1, regime, epoch).pass;
+                (pass.missed > 0.).then(|| pass.parked / pass.missed)
+            }),
             needed,
             stand: stands.live_rate(1, Form::Front),
             accepts: std::array::from_fn(|depth| stands.live_rate(depth + 1, Form::Verify)),
@@ -649,6 +659,7 @@ mod tests {
         assert!((measured.verify_terms[1].unwrap().compute - 0.06).abs() < 1e-12, "verify depth 1 compute alone: {measured:?}");
         assert_eq!(measured.verify_terms[2], None, "no verify pass at depth 2");
         assert!((measured.terms_for(true, 2).unwrap().compute - 0.05).abs() < 1e-12, "verify extrapolates from front at unmeasured depth 2");
+        assert_eq!(measured.verify_stall[0], None, "no verify misses yet -> verify_stall[0] is None");
         let wasted = &measured.paths.as_ref().expect("a miss counted")[0].wasted;
         let (front_w, verify_w) = (wasted.front[1].expect("a front pass ran depth 1"), wasted.verify[1].expect("a verify pass ran depth 1"));
         assert!((front_w - 4. * 1e-3).abs() < 1e-15, "the front pass's four unused reads over its two passes (depth 1 and 2): {front_w}");
@@ -775,10 +786,13 @@ mod tests {
         assert_eq!(measured.stall, Some(0.), "no file-miss park stall when Host RAM holds every expert");
         let regime = magnitude_cost_model::Regime {
             resident: (0..DEPTHS).map(|k| 0.034 + 0.002 * k as f64).collect(),
+            verify_resident: Vec::new(),
             needed: magnitude_cost_model::NeededByForm::both(vec![magnitude_cost_model::Needed::Executed(40.); DEPTHS]),
             stand: Some(0.9),
             accepts: vec![None; FRONT_DEPTHS],
             stall: measured.stall,
+            front_stall: measured.front_stall.to_vec(),
+            verify_stall: measured.verify_stall.to_vec(),
             overhead: None,
             paths: measured.paths.expect("VRAM misses accounted in paths"),
             routes: magnitude_cost_model::VerifyRoutes::default(),
@@ -891,6 +905,7 @@ mod tests {
             let measured = passes.measured(42, [needed_front, needed_verify], stands).expect("passes timed");
             Regime {
                 resident: (0..DEPTHS).map(|k| 0.020 + 0.002 * k as f64).collect(),
+                verify_resident: Vec::new(),
                 needed: NeededByForm {
                     front: needed_front.into_iter().map(Option::unwrap).collect(),
                     verify: needed_verify.into_iter().map(Option::unwrap).collect(),
@@ -898,7 +913,9 @@ mod tests {
                 stand: Some(0.85),
                 accepts: measured.accepts[..5].to_vec(),
                 stall: Some(2e-3),
-                overhead: Some(0.010),
+                front_stall: measured.front_stall.to_vec(),
+            verify_stall: measured.verify_stall.to_vec(),
+                overhead: Some(magnitude_cost_model::VerifyOverhead::fixed(0.010)),
                 paths: measured.paths.expect("NVMe drive path"),
                 routes: VerifyRoutes { layers: 42, fresh: vec![5.0, 4.2, 3.7, 3.3, 3.0] },
             }
@@ -1030,11 +1047,14 @@ mod tests {
         let resident: Vec<f64> = (0..DEPTHS).map(|k| 0.031 + 0.002 * k as f64).collect();
         let regime = magnitude_cost_model::Regime {
             resident,
+            verify_resident: Vec::new(),
             needed: magnitude_cost_model::NeededByForm::both(vec![magnitude_cost_model::Needed::Shadow(80.0); DEPTHS]),
             stand: after.stand,
             accepts: after.accepts.to_vec(),
             stall: after.stall,
-            overhead: Some(0.003),
+            front_stall: after.front_stall.to_vec(),
+            verify_stall: after.verify_stall.to_vec(),
+            overhead: Some(magnitude_cost_model::VerifyOverhead::fixed(0.003)),
             paths: after.paths.unwrap(),
             routes: magnitude_cost_model::VerifyRoutes { layers: 48, fresh: vec![3.5; DEPTHS - 1] },
         };
@@ -1101,11 +1121,14 @@ mod tests {
         let resident = vec![0.032, 0.040, 0.048, 0.056, 0.062, 0.065, 0.067, 0.069];
         let regime = magnitude_cost_model::Regime {
             resident,
+            verify_resident: Vec::new(),
             needed: magnitude_cost_model::NeededByForm::both(vec![magnitude_cost_model::Needed::Shadow(u_single); DEPTHS]),
             stand: measured.stand,
             accepts: measured.accepts.to_vec(),
             stall: measured.stall,
-            overhead: Some(0.003),
+            front_stall: measured.front_stall.to_vec(),
+            verify_stall: measured.verify_stall.to_vec(),
+            overhead: Some(magnitude_cost_model::VerifyOverhead::fixed(0.003)),
             paths: measured.paths.unwrap(),
             routes: magnitude_cost_model::VerifyRoutes {
                 layers: 48,

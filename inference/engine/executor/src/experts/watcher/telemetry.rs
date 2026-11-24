@@ -5,7 +5,6 @@
 
 use crate::operation::LaunchWork;
 use super::core::{Extents, Layer, RoutingRecord};
-use super::gate::HintGate;
 use super::passes::{DEPTHS, Measured, Pass, Passes, Routed, LAGS};
 use super::steps::{CompletedRoute, CompletedStep, DecodeDomain, DecodeRouting, Decoded, EndedReads, Recording, Step, Steps};
 use crate::assessment::{GroupLayerTerms, GroupUnion, LayerStep, Notice, RequestReads, Stages};
@@ -13,7 +12,7 @@ use magnitude_cost_model::{ExpertLines, ExpertPass, FileLine, Hits, Miss, ReadLi
 use crate::experts::Words;
 use crate::experts::directory::{CountedLaunch, Point, RoutedRead, Stack};
 use crate::experts::horizon::Time;
-use crate::experts::interest::{Accepted, Basis, Chosen, Cohort, Judged, Resolved, Source, Spent, Stands};
+use crate::experts::interest::{Accepted, Basis, Chosen, Judged, Source, Spent, Stands};
 use crate::experts::reuse::{Gap, Ranking, Shadows, StepKeys};
 use crate::planning::RegionWords;
 use std::collections::{BTreeMap, VecDeque};
@@ -55,9 +54,6 @@ pub struct LayerCost {
     pub parked: Duration,
     /// From the reads' submission to their end.
     pub read: Duration,
-    /// The decode steps by whether its hint launches ran (off, on): what
-    /// the hint gate chose (`Residency::publish_policy`).
-    pub hints: [u64; 2],
 }
 
 /// What one step cost every streamed layer together, and each layer's
@@ -85,32 +81,6 @@ pub struct StepCost {
     /// those issued, and of those the drive read, those a later exact row
     /// used (the rest wasted).
     pub ahead: AheadUse,
-    /// Each streamed layer's exact rows' hints for the step, by lead
-    /// ([`LeadHints`]).
-    pub hints: Vec<[LeadHints; crate::planning::HINT_LEADS as usize]>,
-}
-
-/// What one lead of a streamed layer's hint launch did for one decode
-/// step, its exact rows' hints alone: the candidates it named for the step
-/// (experts living only in the file) and of them those whose probability
-/// reached the read-ahead break-even as they were published
-/// (`ReadPrice::admits`), the reads ahead its names led and of them those
-/// the step's route used, and whether the layer's hint launch ran (its
-/// gate in effect as the step completed).
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub struct LeadHints {
-    pub published: u64,
-    pub admitted: u64,
-    pub read: u64,
-    pub used: u64,
-    pub on: bool,
-}
-
-impl LeadHints {
-    /// The reads its names led that the route did not use.
-    pub fn wasted(&self) -> u64 {
-        self.read - self.used
-    }
 }
 
 /// One streamed layer's experts in one step, by index.
@@ -133,7 +103,6 @@ impl StepCost {
         Self {
             layers: vec![LayerStep::default(); layers],
             experts: vec![LayerExperts::default(); layers],
-            hints: vec![[LeadHints::default(); crate::planning::HINT_LEADS as usize]; layers],
             ..Self::default()
         }
     }
@@ -174,7 +143,6 @@ pub struct ExpertCosts {
     /// observed; the device's convert (its landing launch's) where the bank
     /// places, once measured.
     pub landings: Vec<Option<magnitude_cost_model::LandingLine>>,
-    pub hints: HintCost,
     /// What the front rows skipped since the load.
     pub front: FrontSkips,
     /// What the reads ahead's bytes were spent on since the load.
@@ -465,21 +433,15 @@ impl AheadUse {
         self.unused.map(|form| form.map(|unused| unused as f64))
     }
 
-    /// The bytes of the reads issued for the front rows' names: their
-    /// routes' and their lookahead hints' ([`FrontSkips::reads`]).
+    /// The bytes of the reads issued for the front rows' names
+    /// ([`FrontSkips::reads`]).
     pub fn front_issued(&self) -> u64 {
-        self.issued[Basis::Front.index()] + self.issued[Basis::AheadHint.index()]
-    }
-
-    /// The bytes of the reads issued for the exact rows' lookahead hints
-    /// ([`HintCost::reads`]).
-    pub fn hints_issued(&self) -> u64 {
-        self.issued[Basis::Hint.index()]
+        self.issued[Basis::Front.index()]
     }
 
     fn spend(&mut self, spent: Spent) {
         match spent {
-            Spent::Fell { basis: Basis::Hint | Basis::Token, .. } => panic!("an exact row's hint or token route guesses nothing, so no guess of its falls"),
+            Spent::Fell { basis: Basis::Token, .. } => panic!("a token route guesses nothing, so no guess of its falls"),
             Spent::Fell { basis, bytes } => self.fell[basis.index()] += bytes,
             Spent::Cancelled { basis, fell, bytes, .. } => {
                 self.cancelled[basis.index()][usize::from(fell)] += bytes;
@@ -521,11 +483,10 @@ impl AheadUse {
     }
 
     /// Each class's bytes read and used, named: a front row's route
-    /// (`front`), an ahead row's lookahead hint (`front_hints`), each of a
-    /// guess that stood or fell (`_stood`, `_wrong`: a wrong guess, or a
-    /// pass or request that never came), and an exact row's lookahead hint
-    /// (`hints`), which guesses nothing.
-    pub fn classes(&self) -> [(&'static str, ReadUse); 6] {
+    /// (`front`), of a guess that stood or fell (`_stood`, `_wrong`: a wrong
+    /// guess, or a pass or request that never came), and token-conditioned
+    /// routing foresight (`token`), which guesses nothing.
+    pub fn classes(&self) -> [(&'static str, ReadUse); 3] {
         let signed = |bytes: u64| i64::try_from(bytes).expect("a load's bytes fit i64");
         let class = |basis: Basis, fell: bool| {
             let (at, of) = (basis.index(), usize::from(fell));
@@ -538,56 +499,12 @@ impl AheadUse {
         [
             ("front_stood", class(Basis::Front, false)),
             ("front_wrong", class(Basis::Front, true)),
-            ("front_hints_stood", class(Basis::AheadHint, false)),
-            ("front_hints_wrong", class(Basis::AheadHint, true)),
-            ("hints", class(Basis::Hint, false)),
             ("token", class(Basis::Token, false)),
         ]
     }
 }
 
-/// The reads hints made: hint reads submitted (their bytes are
-/// [`AheadUse`]'s). And
-/// how the prediction did over completed decode steps, whether or not a
-/// hint was read:
-/// - `candidates`: hinted experts nothing held, kept, read or landed
-///   when their ring was read;
-/// - `named`: those the step's route at the hinted layer chose as a miss
-///   their hint saves ([`saves`]), of which `early` the route found landed
-///   already (a hit the hint made, so never a miss);
-/// - `hintable`: the file misses (experts the route found absent) of layers
-///   a ring hints, the misses a hint could have saved beside `early`;
-/// - `unhintable`: those of layers no ring hints (the first streamed
-///   layer's), which no prediction reaches by construction;
-/// - the layers of completed decode steps.
-#[derive(Clone, Copy, Debug, Default, PartialEq)]
-pub struct HintCost {
-    pub reads: u64,
-    pub candidates: u64,
-    pub named: u64,
-    pub early: u64,
-    pub hintable: u64,
-    pub unhintable: u64,
-    pub layer_steps: u64,
-}
-
-impl HintCost {
-    /// What was counted after `start`, a count of the same load taken
-    /// earlier.
-    pub fn since(&self, start: &Self) -> Self {
-        Self {
-            reads: self.reads - start.reads,
-            candidates: self.candidates - start.candidates,
-            named: self.named - start.named,
-            early: self.early - start.early,
-            hintable: self.hintable - start.hintable,
-            unhintable: self.unhintable - start.unhintable,
-            layer_steps: self.layer_steps - start.layer_steps,
-        }
-    }
-}
-
-/// Whether a hinted candidate the hinted route chose, by the source the
+/// Whether a chosen expert, by the source the route resolved it to (the
 /// route resolved it to (the routing record's, before any promotion), was a
 /// miss a hint of it saves: one the route found absent (the file's) or in
 /// the records misses land into, whoever landed it there, its hint read or
@@ -695,17 +612,33 @@ impl ReadPrice {
     }
 
     /// Mean resident compute seconds per decode pass (`Terms::compute`).
+    #[cfg(test)]
     pub(super) fn compute(&self) -> f64 {
         self.admission.terms.compute
     }
 
-    /// Whether the drive is the binding resource (`ReadAdmission::binds`).
+    /// Mean non-drive pass duration (`compute.max(link).max(cpu).max(memory)`)
+    /// during which `PathKind::Drive` I/O overlaps with GPU compute and
+    /// RAM -> VRAM DMA.
+    pub(super) fn non_drive_pass_seconds(&self) -> f64 {
+        self.admission.terms.non_drive_time()
+    }
+
+    /// Whether the drive (or shared `HostMemory`) is the binding resource
+    /// (`ReadAdmission::binds`).
     pub(super) fn binds(&self) -> bool {
         self.admission.binds()
     }
 
+    /// Whether the drive transport itself is the binding resource
+    /// (`PathAdmission::drive_binds`).
+    pub(super) fn drive_binds(&self) -> bool {
+        self.admission.drive_binds()
+    }
+
     /// Whether the shared `ContentionDomain::HostMemory` bus is a binding
     /// resource (`PathAdmission::host_memory_binds`).
+    #[cfg(test)]
     pub(super) fn host_memory_binds(&self) -> bool {
         self.admission.host_memory_binds()
     }
@@ -836,6 +769,21 @@ impl PassService {
     }
 }
 
+/// Mean host DDR transfer time per byte (`1 / B_joint` or `1 / B_mem`,
+/// seconds/byte) across layers with a host tier; `None` on unified memory.
+fn host_memory_secs_per_byte(lines: &[ExpertLines]) -> Option<f64> {
+    let (mut sum, mut count) = (0.0, 0usize);
+    for layer in lines {
+        if let Some(mem) = layer.host.contended_memory() {
+            if layer.host.record_bytes > 0 {
+                sum += (mem.get() * 1e-9) / layer.host.record_bytes as f64;
+                count += 1;
+            }
+        }
+    }
+    (count > 0).then(|| sum / count as f64)
+}
+
 /// What one sequence's tokens' routes show (`routed`, each streamed layer's
 /// experts, ascending; `absent`, each layer's file misses among them; `keys`,
 /// per-layer per-row choices when available on multi-row verify/front passes),
@@ -912,8 +860,7 @@ fn verify_miss_scale(routed: &Routed, depth: usize) -> f64 {
     1.0 + extra
 }
 
-/// A step still running: its accumulated cost, wall-clock wait intervals, and
-/// exact rows' hints' reads ahead.
+/// A step still running: its accumulated cost and wall-clock wait intervals.
 struct RunningStep {
     cost: StepCost,
     /// Wall-clock `[start, end]` intervals during which the step was parked
@@ -921,11 +868,6 @@ struct RunningStep {
     /// landing (`Telemetry::landed`). Taking their union clipped to the step
     /// window avoids double-counting overlapping concurrent layer reads.
     layer_wait: Vec<(Instant, Instant)>,
-    /// The step's exact rows' hints' reads ahead, as they were issued
-    /// ([`Telemetry::read_ahead`]): the layer, the expert, its lead and the
-    /// layer whose hint named it. Its completion counts them into its layers'
-    /// costs.
-    ahead: Vec<(usize, usize, u8, usize)>,
 }
 
 impl RunningStep {
@@ -933,7 +875,6 @@ impl RunningStep {
         Self {
             cost: StepCost::of(layers),
             layer_wait: Vec::new(),
-            ahead: Vec::new(),
         }
     }
 }
@@ -958,7 +899,10 @@ struct Costs {
     /// Each bank group's device convert (its landing launches'), once the job measured
     /// it ([`Telemetry::device_convert`]).
     convert: Vec<Option<magnitude_cost_model::RecordLine>>,
-    hints: HintCost,
+    /// Measured host DDR transfer time per byte (`1 / B_joint` or `1 / B_mem`,
+    /// seconds/byte) from the latest observed `ExpertLines`; `None` on unified
+    /// memory or before lines are observed.
+    host_memory_secs_per_byte: Option<f64>,
     front: FrontSkips,
     /// What the reads ahead's bytes were spent on ([`Telemetry::spent`]),
     /// and as the last step's end saw it.
@@ -983,8 +927,6 @@ struct Costs {
     /// pass's routes are lagged against ([`lagged`]). A pass of several
     /// sequences' rows, or a prompt, begins them again.
     recent: std::collections::VecDeque<Vec<Vec<usize>>>,
-    /// Whether each streamed layer's hint launch runs ([`HintGate`]).
-    hints_gate: HintGate,
     /// Each volume's counts (`Routing::volumes`) as the last step's end
     /// saw it, from none: the first step counts what each read since the
     /// process began.
@@ -1156,9 +1098,6 @@ struct Routing {
     /// (`Layer::draft`). Target decode steps write routing records only for
     /// non-draft layers, and draft decode steps only for draft layers.
     draft: Vec<bool>,
-    /// Per streamed layer, whether a ring row hints it ([`Layer::hints`]).
-    /// The first streamed layer is hinted by none.
-    hinted: Vec<bool>,
     /// The volumes its files lie on (`ExpertSource::volumes`).
     volumes: Vec<seismic_io::Volume>,
 }
@@ -1174,11 +1113,80 @@ pub(super) struct GroupReadWords {
 /// as it ends (its passes' records, `Telemetry::group_read`) and a decode
 /// step's as it completes (its routing records), fed once every step of the
 /// group and of those before it has ended, by group, layer, then sequence.
+/// A completed speculative verify step awaiting its per-request `accepted`
+/// verdict(s) (`Shared::decided` / `Shared::discarded`) before entering
+/// `Feed::pending`, so rejected draft rows past `accepted` never pollute
+/// `History` or `Calibration`.
+struct PendingVerifyFeed {
+    sequence: Step,
+    group: Step,
+    row_requests: Vec<crate::operation::RequestId>,
+    row_experts: Vec<Vec<(u8, u16)>>,
+    keys: std::sync::Arc<StepKeys>,
+    counted: Option<CountedLaunch>,
+    clock: crate::experts::horizon::Tokens,
+}
+
 struct Feed {
     /// The reads not yet fed, each with its group and what it is.
     pending: Vec<(Step, RoutedRead, Fed)>,
+    /// At most one completed verify step waiting for its verdict(s).
+    pending_verify: Option<PendingVerifyFeed>,
+    /// Verdicts accumulated for a verify step `(step, [(request, outcome)], complete)`.
+    verify_verdicts: Option<(Step, Vec<(crate::operation::RequestId, super::VerifyOutcome)>, bool)>,
     /// The last step's end.
     ended: Option<Instant>,
+}
+
+impl Feed {
+    /// If `pending_verify` and its completed `verify_verdicts` are both present
+    /// for the same step, filter out rejected draft rows (`depth > accepted`)
+    /// and move the accepted rows into `self.pending`.
+    fn flush_verify(&mut self) {
+        let ready = matches!(
+            (&self.pending_verify, &self.verify_verdicts),
+            (Some(pv), Some((step, _, true))) if pv.sequence == *step
+        );
+        if !ready {
+            return;
+        }
+        let pv = self.pending_verify.take().expect("checked ready");
+        let (_, verdicts, _) = self.verify_verdicts.take().expect("checked ready");
+        let keep: Vec<bool> = pv
+            .row_requests
+            .iter()
+            .zip(&pv.keys.depths)
+            .map(|(&req, &depth)| match verdicts.iter().find_map(|&(r, o)| (r == req).then_some(o)) {
+                Some(super::VerifyOutcome::Committed(accepted)) => u32::from(depth) <= accepted,
+                Some(super::VerifyOutcome::Discarded) => false,
+                None => depth == 0,
+            })
+            .collect();
+        let filtered_keys = std::sync::Arc::new(pv.keys.filter_rows(&keep));
+        for (layer, row_choices) in pv.row_experts.into_iter().enumerate() {
+            if row_choices.is_empty() {
+                continue;
+            }
+            let mut experts = Vec::new();
+            let mut choices = 0u64;
+            for (row, expert) in row_choices {
+                if keep.get(usize::from(row)).copied().unwrap_or(false) {
+                    experts.push(usize::from(expert));
+                    choices += 1;
+                }
+            }
+            experts.sort_unstable();
+            experts.dedup();
+            if !experts.is_empty() {
+                let read = RoutedRead { sequence: pv.sequence, layer, experts, choices };
+                self.pending.push((
+                    pv.group,
+                    read,
+                    Fed::TargetDecode { counted: pv.counted, keys: Some(filtered_keys.clone()), clock: pv.clock },
+                ));
+            }
+        }
+    }
 }
 
 /// What a read fed to the stack is: a decode step's, counted while its load
@@ -2021,14 +2029,17 @@ pub(super) struct Telemetry {
     /// The host slots each layer commits, as the host tier commits them
     /// (`HostTier::commitment.slots`, its one owner); always 0 without a host tier.
     host_slots: Arc<AtomicU64>,
+    /// Counted decode steps published in `recorded.ranked.live` (0 before any
+    /// step is counted): lock-free change check for [`Self::live_steps`].
+    live_steps: AtomicU64,
     /// The ranking's stack, under a lock of its own: feeding it takes
     /// milliseconds, which no step's completion waits behind, and its
     /// readers read what each feed publishes (`Recorded::ranked`), not the
     /// stack. Taken before `recorded`, never while holding it.
     stack: Mutex<Stack>,
     /// The ranking's shadows at every depth of foresight, lazily allocated on
-    /// `expert-residenc` once a caller asks for regime pricing (`measured`),
-    /// under a lock only `Telemetry::shadow` ever acquires.
+    /// `expert-shadows` once a caller asks for regime pricing (`measured`),
+    /// under a lock only `Telemetry::shadow_while` ever acquires.
     shadows: Mutex<Option<Shadows>>,
     /// Whether any caller has asked for regime pricing (`measured`): while
     /// false (e.g. plain decode with no fronting), shadows neither allocate
@@ -2037,6 +2048,9 @@ pub(super) struct Telemetry {
     /// Short-locked queue of executed-step observations and latest published
     /// shadow gaps, decoupling `magnitude-main` from `self.shadows`.
     shadow_state: Mutex<ShadowState>,
+    /// Wake signal for the dedicated `expert-shadows` thread, notified only
+    /// when new shadow work is produced or serving stops.
+    shadow_events: Arc<crate::experts::events::Events>,
     /// Per layer, whether it is whole: every expert held at its home, so
     /// it has no reads of a decode step (its routing record, which its
     /// route writes beside its keys, is a trace's alone)
@@ -2051,6 +2065,13 @@ pub(super) struct Telemetry {
     /// Monotonic counter incremented whenever a bank resize publishes, so a
     /// decode step whose wall time spanned a resize does not poison `Passes`.
     resize_generation: AtomicU64,
+    /// Per-volume `seismic_io::accounting::totals` snapshot taken when
+    /// `Telemetry` starts (excluding prior `ImportingWeights` I/O).
+    storage_baseline: Vec<seismic_io::Totals>,
+    /// Cumulative `seismic_io::Totals` across `LaunchWork::Generation` steps
+    /// only, keeping `Telemetry::line()` pure decode bandwidth (unpolluted by
+    /// weight import or prompt prefill).
+    decode_storage: Mutex<seismic_io::Totals>,
     /// The break-even reads ahead are admitted at in place of the measured
     /// one ([`Self::admit_at`]).
     #[cfg(test)]
@@ -2114,12 +2135,19 @@ impl Costs {
         self.landings[group].state().expect("landings' counts and clock seconds make a line").line().map(FileLine::of)
     }
 
-    /// Streamed layer `layer`'s CPU site line as its requests took, the
-    /// job's site line of `lines` settling what they leave undetermined
-    /// ([`SiteRequests::line`]); none before a request, or without a site
-    /// line.
-    fn site(&self, layer: usize, lines: &ExpertLines) -> Option<[f64; 2]> {
-        lines.host.cpu.and_then(|cpu| self.sites[layer].line(cpu))
+    /// Streamed layer `layer`'s CPU site line as its requests took in the
+    /// current regime and turnover window, the job's site line of `lines`
+    /// settling what they leave undetermined ([`SiteRequests::line`]); none
+    /// before a request, after a regime change or an unobserved turnover
+    /// epoch, or without a site line.
+    fn site(
+        &mut self,
+        layer: usize,
+        regime: crate::experts::horizon::RegimeEpoch,
+        epoch: u64,
+        lines: &ExpertLines,
+    ) -> Option<[f64; 2]> {
+        lines.host.cpu.and_then(|cpu| self.sites[layer].line(regime, epoch, cpu))
     }
 
     /// Streamed layer `layer`'s block line as its sampled steps took,
@@ -2156,25 +2184,77 @@ pub(super) struct CompletionError {
 /// experts against its path's time less its rows past each expert's first
 /// at the job's row cost, as a block's are (`block_point`): the site's line
 /// of a row an expert (`ExpertLines::sited`).
+///
+/// Keyed to `(RegimeEpoch, bank_epoch)` and rolled across bank-turnover
+/// epochs so transient warmup contention cannot permanently poison the OLS
+/// fit and lock CPU-site out: advancing `regime` clears immediately, and a
+/// full unobserved turnover epoch expires `previous` back to `None` (the
+/// load's measured job `CpuLines`).
 #[derive(Clone, Copy, Debug, Default)]
-struct SiteRequests(seismic::measure::Line<2>);
+struct SiteRequests {
+    regime: crate::experts::horizon::RegimeEpoch,
+    epoch: u64,
+    previous: seismic::measure::Line<2>,
+    current: seismic::measure::Line<2>,
+}
 
 impl SiteRequests {
+    /// Roll the window to `(regime, epoch)`. A regime advance clears both
+    /// epochs immediately; a bank-epoch advance rolls `current` into
+    /// `previous` (even when `current` is empty, so one full unobserved
+    /// turnover epoch expires a stale fit back to the load's measured lines).
+    fn roll(&mut self, regime: crate::experts::horizon::RegimeEpoch, epoch: u64) {
+        assert!(regime >= self.regime, "site requests at {:?} read at {regime:?}", self.regime);
+        assert!(epoch >= self.epoch, "site requests at epoch {} read at epoch {epoch}", self.epoch);
+        if regime > self.regime {
+            self.regime = regime;
+            self.epoch = epoch;
+            self.previous = seismic::measure::Line::new();
+            self.current = seismic::measure::Line::new();
+        } else if epoch > self.epoch {
+            self.previous = if epoch == self.epoch + 1 {
+                std::mem::take(&mut self.current)
+            } else {
+                seismic::measure::Line::new()
+            };
+            self.current = seismic::measure::Line::new();
+            self.epoch = epoch;
+        }
+    }
+
     /// A request that served `experts` experts of `rows` rows in `seconds`,
-    /// a row past an expert's first at `row` seconds.
-    fn observe(&mut self, experts: u64, rows: u64, seconds: f64, row: f64) {
+    /// a row past an expert's first at `row` seconds, at `(regime, epoch)`.
+    fn observe(
+        &mut self,
+        regime: crate::experts::horizon::RegimeEpoch,
+        epoch: u64,
+        experts: u64,
+        rows: u64,
+        seconds: f64,
+        row: f64,
+    ) {
+        self.roll(regime, epoch);
         let extra = rows.checked_sub(experts).expect("every expert a request serves names a row");
-        self.0.observe([1., experts as f64], seconds - row * extra as f64);
+        self.current.observe([1., experts as f64], seconds - row * extra as f64);
     }
 
     /// The `[fixed, per expert]` seconds of a request whose experts each
-    /// take one row, as the requests took; none before one. The job's
-    /// lines `cpu` (its handshake the fixed term's, its expert of one row
-    /// the other's) settle only what the requests leave undetermined:
-    /// requests of one expert count alone tell the two terms' sum, which
-    /// is all such a request pays.
-    fn line(&self, cpu: magnitude_cost_model::CpuLines) -> Option<[f64; 2]> {
-        let mut line = self.0;
+    /// take one row, as the requests took in the current regime and turnover
+    /// window; none before one or once expired. The job's lines `cpu` (its
+    /// handshake the fixed term's, its expert of one row the other's) settle
+    /// only what the requests leave undetermined: requests of one expert
+    /// count alone tell the two terms' sum, which is all such a request pays.
+    fn line(
+        &mut self,
+        regime: crate::experts::horizon::RegimeEpoch,
+        epoch: u64,
+        cpu: magnitude_cost_model::CpuLines,
+    ) -> Option<[f64; 2]> {
+        self.roll(regime, epoch);
+        let mut line = self.previous.joined(self.current);
+        if line.is_empty() {
+            return None;
+        }
         line.seed([1., 0.], cpu.handshake.get() * 1e-9);
         line.seed([0., 1.], cpu.expert.one.get() * 1e-9);
         match line.state().expect("site requests' experts and clock seconds make a line") {
@@ -2183,24 +2263,6 @@ impl SiteRequests {
             seismic::measure::LineState::Observed(terms) => Some(terms.costs()),
         }
     }
-}
-
-/// Whether the workload is GPU-bound so within-token hint launches
-/// (`routed_hint_route`) add pure GPU overhead without hiding a binding path:
-/// neither drive nor link approaches compute (`max(drive, link) < 0.5 * C`)
-/// and either the host tier holds every expert (`tier_complete`, zero NVMe
-/// reads) or the measured drive busy fraction is below 0.25 (never suppressing
-/// while `drive_busy_fraction` is still `None` / warming up on a drive-backed
-/// load, or when the drive is busy).
-fn hints_suppressed_gpu_bound(
-    terms: magnitude_cost_model::Terms,
-    drive_busy_fraction: Option<f64>,
-    tier_complete: bool,
-) -> bool {
-    let path = terms.drive.max(terms.link);
-    terms.compute > 0.0
-        && path < 0.5 * terms.compute
-        && (tier_complete || drive_busy_fraction.is_some_and(|fraction| fraction < 0.25))
 }
 
 impl Telemetry {
@@ -2221,7 +2283,8 @@ impl Telemetry {
         spans: bool,
     ) -> Self {
         let groups = layers.iter().map(|layer| layer.group + 1).max().unwrap_or(0);
-        let looked = vec![seismic_io::Totals::default(); volumes.len()];
+        let storage_baseline: Vec<seismic_io::Totals> = volumes.iter().map(|&volume| seismic_io::accounting::totals(volume)).collect();
+        let looked = storage_baseline.clone();
         let (horizon, stands) = crate::experts::reuse::Reuse::of(&ranking).rates();
         let shadows = Mutex::new(None);
         let shadows_needed = AtomicBool::new(false);
@@ -2241,9 +2304,6 @@ impl Telemetry {
                 experts: layers.iter().map(|layer| layer.experts).collect(),
                 placer: extents.placer,
                 draft: layers.iter().map(|layer| layer.draft).collect(),
-                hinted: (0..layers.len())
-                    .map(|target| layers.iter().any(|layer| layer.hints.contains(&target)))
-                    .collect(),
                 volumes,
             },
             recorded: Mutex::new(Recorded {
@@ -2254,7 +2314,7 @@ impl Telemetry {
                     sites: vec![SiteRequests::default(); layers.len()],
                     blocks: vec![seismic::measure::Line::new(); layers.len()],
                     convert: vec![None; groups],
-                    hints: HintCost::default(),
+                    host_memory_secs_per_byte: None,
                     front: FrontSkips::default(),
                     spent: AheadUse::default(),
                     spent_seen: AheadUse::default(),
@@ -2263,7 +2323,6 @@ impl Telemetry {
                     staged_link: (0., 0.),
                     passes: Passes::new(horizon.clone()),
                     recent: std::collections::VecDeque::new(),
-                    hints_gate: HintGate::new(layers.iter().map(|layer| layer.hints.clone()).collect(), horizon.clone()),
                     looked,
                     running: BTreeMap::new(),
                     completed: None,
@@ -2292,19 +2351,23 @@ impl Telemetry {
                     },
                     windows: extents.windows,
                 },
-                feed: Feed { pending: Vec::new(), ended: None },
+                feed: Feed { pending: Vec::new(), pending_verify: None, verify_verdicts: None, ended: None },
                 ranked: Ranked { live: stack.live() },
                 records,
             }),
             slots,
             host_slots,
+            live_steps: AtomicU64::new(0),
             stack: Mutex::new(stack),
             shadows,
             shadows_needed,
             shadow_state,
+            shadow_events: Arc::new(crate::experts::events::Events::default()),
             whole: Arc::from(layers.iter().map(|_| AtomicBool::new(false)).collect::<Vec<_>>()),
             feedable: AtomicU64::new(0),
             resize_generation: AtomicU64::new(0),
+            storage_baseline,
+            decode_storage: Mutex::new(seismic_io::Totals::default()),
             #[cfg(test)]
             even: Mutex::new(None),
             spans,
@@ -2344,6 +2407,21 @@ impl Telemetry {
 
     pub(super) fn note_resized(&self) {
         self.resize_generation.fetch_add(1, Ordering::Release);
+        if self.shadows_needed.load(Ordering::Acquire) {
+            self.shadow_events.notify();
+        }
+    }
+
+    /// Wake signal for the dedicated `expert-shadows` background thread.
+    pub(super) fn shadow_events(&self) -> &Arc<crate::experts::events::Events> {
+        &self.shadow_events
+    }
+
+    /// Hold `self.shadows` in tests to simulate a slow shadow simulation batch
+    /// and verify `expert-residency` never blocks on it.
+    #[cfg(test)]
+    pub(super) fn lock_shadows(&self) -> std::sync::MutexGuard<'_, Option<Shadows>> {
+        self.shadows.lock().expect("watcher telemetry shadows")
     }
 
     /// The drive's line now: the one line of the volumes the model's files
@@ -2355,7 +2433,16 @@ impl Telemetry {
     /// below none and its rate is a busy volume's, so that is an invariant
     /// violation.
     pub(super) fn line(&self) -> Option<ReadLine> {
-        let line = self.routing.volumes.iter().map(|&volume| seismic_io::accounting::totals(volume)).sum::<seismic_io::Totals>().line()?;
+        let decode_line = self.decode_storage.lock().expect("watcher decode storage").line();
+        let line = decode_line.or_else(|| {
+            self.routing
+                .volumes
+                .iter()
+                .zip(&self.storage_baseline)
+                .map(|(&volume, baseline)| seismic_io::accounting::totals(volume).since(baseline))
+                .sum::<seismic_io::Totals>()
+                .line()
+        })?;
         Some(ReadLine::new(line.latency, line.byte_seconds).unwrap_or_else(|error| panic!("invariant violated: the drive's line {line:?} makes no read line: {error:?}")))
     }
 
@@ -2453,12 +2540,16 @@ impl Telemetry {
     fn with_observed(&self, costs: &mut Costs, lines: &[ExpertLines]) -> Arc<[ExpertLines]> {
         let share = 1. / lines.len().max(1) as f64;
         let moves = costs.passes.moves().map(|(link, records)| (link * share, records * share));
+        let (regime, bank_epoch) = {
+            let times = self.horizon.lock();
+            (times.regime_epoch(), times.bank_epoch())
+        };
         lines
             .iter()
             .zip(&self.routing.maps)
             .enumerate()
             .map(|(layer, (lines, &(group, _)))| {
-                let site = costs.site(layer, lines);
+                let site = costs.site(layer, regime, bank_epoch, lines);
                 lines.landed_by(self.landing(costs, group)).sited(site).passed(costs.block(layer, lines)).moving(moves)
             })
             .collect()
@@ -2518,7 +2609,6 @@ impl Telemetry {
             reads: costs.reads,
             line: self.line(),
             landings: self.routing.maps.iter().map(|&(group, _)| self.landing(costs, group)).collect(),
-            hints: costs.hints,
             front: costs.front,
             ahead: costs.spent,
             completed: costs.completed.clone(),
@@ -2540,8 +2630,20 @@ impl Telemetry {
     }
 
     /// Feed the stack every read ready to feed ([`Self::fed`]).
+    #[cfg(test)]
     pub(super) fn feed(&self) {
         drop(self.fed());
+    }
+
+    /// Feed the stack ready reads cooperatively while `keep_going()` remains
+    /// true (yielding immediately when a `ResizeHandoff` arrives so bank
+    /// shrinks never wait out a large `feed_stack` batch).
+    pub(super) fn feed_while(&self, keep_going: impl Fn() -> bool) {
+        if !keep_going() {
+            return;
+        }
+        let mut stack = self.stack.lock().expect("watcher telemetry stack");
+        self.feed_stack_while(&mut stack, keep_going);
     }
 
     /// Whether the stack has been fed every read recorded so far: a test's
@@ -2570,25 +2672,77 @@ impl Telemetry {
         stack
     }
 
+    /// Record one request's verify verdict `accepted` for step `step` (with
+    /// `final_request` true once every request in the verify step has been
+    /// decided), flushing the filtered accepted rows into `Feed::pending`.
+    pub(super) fn verify_decided(
+        &self,
+        step: Step,
+        request: crate::operation::RequestId,
+        outcome: super::VerifyOutcome,
+        final_request: bool,
+    ) {
+        let feed = &mut self.lock().feed;
+        match &mut feed.verify_verdicts {
+            Some((existing_step, verdicts, complete)) if *existing_step == step => {
+                verdicts.push((request, outcome));
+                *complete |= final_request;
+            }
+            slot => {
+                *slot = Some((step, vec![(request, outcome)], final_request));
+            }
+        }
+        feed.flush_verify();
+    }
+
+    /// Clear any pending verify feed/verdicts for a failed or unsubmitted step
+    /// so `feed_stack` never stalls behind it.
+    pub(super) fn cancel_verify(&self, step: Step) {
+        let feed = &mut self.lock().feed;
+        if feed.pending_verify.as_ref().is_some_and(|pv| pv.sequence == step) {
+            feed.pending_verify = None;
+        }
+        if feed.verify_verdicts.as_ref().is_some_and(|(s, _, _)| *s == step) {
+            feed.verify_verdicts = None;
+        }
+    }
+
     /// Feed `stack` the reads of every group that has ended
     /// ([`Self::ended`]), each of whose steps has ended, in the device's
     /// order: a prompt group's union at a layer, ranked at its depths, is
     /// the layer's last group union ([`LayerFacts::union`]). Only the
     /// taking of the reads and each union's note hold `recorded`.
     fn feed_stack(&self, stack: &mut Stack) {
+        self.feed_stack_while(stack, || true);
+    }
+
+    fn feed_stack_while(&self, stack: &mut Stack, keep_going: impl Fn() -> bool) {
         let ended = self.feedable.load(Ordering::Acquire);
         let mut reads = {
             let feed = &mut self.lock().feed;
+            // Hold back any group at or past an undecided verify step so stack
+            // feeding stays strictly in step order.
+            let limit = feed.pending_verify.as_ref().map_or(ended, |pv| ended.min(pv.group));
             let (reads, pending) = std::mem::take(&mut feed.pending)
                 .into_iter()
-                .partition::<Vec<_>, _>(|(group, ..)| *group < ended);
+                .partition::<Vec<_>, _>(|(group, ..)| *group < limit);
             feed.pending = pending;
             reads
         };
         reads.retain(|(_, read, _)| !read.experts.is_empty());
         reads.sort_by_key(|(group, read, _)| (*group, read.layer, read.sequence));
+        let mut fed_any = false;
         let (mut decoded, mut unions) = (false, Vec::new());
-        for (_, read, fed) in reads {
+        let mut iter = reads.into_iter();
+        let mut deferred = Vec::new();
+        while let Some(item) = iter.next() {
+            if !keep_going() {
+                deferred.push(item);
+                deferred.extend(iter);
+                break;
+            }
+            let (_, read, fed) = item;
+            fed_any = true;
             match fed {
                 Fed::TargetDecode { counted, keys, clock } => {
                     stack.read_target_batched(&read, counted, keys.as_deref(), clock);
@@ -2606,7 +2760,18 @@ impl Telemetry {
                 }
             }
         }
+        if !deferred.is_empty() {
+            let feed = &mut self.lock().feed;
+            deferred.append(&mut feed.pending);
+            feed.pending = deferred;
+        }
+        if !fed_any {
+            return;
+        }
         stack.finish_batch();
+        if fed_any && self.shadows_needed.load(Ordering::Acquire) {
+            self.shadow_events.notify();
+        }
         // What the feed counted, in one take.
         let live = decoded.then(|| stack.live());
         let recorded = &mut *self.lock();
@@ -2614,7 +2779,9 @@ impl Telemetry {
             recorded.facts.layers[layer].union = Some(union);
         }
         if let Some(live) = live {
+            let steps = live.as_ref().map_or(0, |l| l.steps);
             recorded.ranked.live = live;
+            self.live_steps.store(steps, Ordering::Release);
         }
     }
 
@@ -2650,11 +2817,6 @@ impl Telemetry {
     pub(super) fn in_top(&self) -> impl Fn(usize, usize) -> bool {
         let ranking = self.fed().ranking();
         move |layer, expert| crate::experts::reuse::Reuse::of(&ranking).in_top(layer, expert)
-    }
-
-    #[cfg(test)]
-    pub(super) fn ahead_len(&self) -> usize {
-        self.lock().costs.running.values().filter(|step| !step.ahead.is_empty()).count()
     }
 
     /// Step `sequence` ended, completed or not: what it left uncompleted,
@@ -2702,6 +2864,19 @@ impl Telemetry {
                 }
                 let selected = self.routing.selected;
                 let records = self.records(steps, sequence, decoded.domain == DecodeDomain::DraftDecode);
+                // Actual physical row count dispatched for this step (including
+                // front rows), used to train the matching narrow/wide DMA gate lane.
+                let physical_rows = decoded
+                    .launch
+                    .map(|launch| launch.rows)
+                    .unwrap_or_else(|| {
+                        records
+                            .iter()
+                            .map(|record| if selected > 0 { record.count().div_ceil(selected) } else { 0 })
+                            .max()
+                            .unwrap_or(1)
+                    })
+                    .max(1) as u64;
                 // Its front rows' guess kinds, as every record it wrote
                 // carries them.
                 let guesses = records.iter().filter_map(RoutingRecord::guesses).reduce(|first, other| {
@@ -2735,12 +2910,9 @@ impl Telemetry {
                     // first standing choice's source serves every one.
                     chose.dedup_by_key(|chosen| chosen.expert);
                 }
-                Some(((decoded, keys), self.routed(sequence, &records), Self::tiered(&records), chose, Self::absent(&records), blocks, guesses, row_experts))
+                Some(((decoded, keys), self.routed(sequence, &records), Self::tiered(&records), chose, Self::absent(&records), blocks, guesses, row_experts, physical_rows))
             }
         };
-        // The drive's line the pass's reads are timed along, read before
-        // the costs are taken.
-        let line = self.line();
         let mut recorded = self.lock();
         let Recorded { costs, facts, feed, .. } = &mut *recorded;
         // The last request served whole is its group's last step's at the
@@ -2754,14 +2926,15 @@ impl Telemetry {
             }
         }
         let layers = costs.layers.len();
-        let RunningStep { mut cost, layer_wait, ahead } = costs
+        let RunningStep { mut cost, layer_wait } = costs
             .running
             .remove(&sequence)
             .unwrap_or_else(|| RunningStep::of(layers));
         // Each streamed layer's misses the CPU site served and its request's
         // path time, which the pass's terms count.
         let mut sites = vec![(0u64, Duration::ZERO); layers];
-        if let Some((_, routed, tiered, chose, absent, blocks, _, _)) = &decoded {
+        let mut layer_misses = vec![(0u64, 0u64); layers];
+        if let Some((_, routed, tiered, _, absent, blocks, _, _, _)) = &decoded {
             for (experts, read) in cost.experts.iter_mut().zip(routed) {
                 experts.routed = Some(read.clone());
             }
@@ -2775,6 +2948,10 @@ impl Telemetry {
             // The misses the device served from the host tier: the step's
             // tier misses (`LayerStep::hosted`), and reads the tier ranks
             // by.
+            let (regime, bank_epoch) = {
+                let times = self.horizon.lock();
+                (times.regime_epoch(), times.bank_epoch())
+            };
             for (layer, served) in tiered.iter().enumerate() {
                 let hosted = served.len() as u64;
                 let bytes = facts.layers[layer].bytes;
@@ -2798,10 +2975,11 @@ impl Telemetry {
                 let row = priced.and_then(|lines| lines[layer].host.cpu).map(|cpu| cpu.expert.row.bound().get() * 1e-9);
                 if work == LaunchWork::Generation {
                     if let Some(row) = row.filter(|_| cpu > 0) {
-                        costs.sites[layer].observe(cpu, rows, path.as_secs_f64(), row);
+                        costs.sites[layer].observe(regime, bank_epoch, cpu, rows, path.as_secs_f64(), row);
                     }
                 }
                 served_within(cpu, hosted, absent[layer], layer, sequence);
+                layer_misses[layer] = (hosted.saturating_add(absent[layer]).saturating_sub(cpu), cpu);
                 // A sampled step's block at this layer, over what it read,
                 // where its route recorded it.
                 if work == LaunchWork::Generation {
@@ -2816,39 +2994,6 @@ impl Telemetry {
                 (cost.experts[layer].sited, cost.experts[layer].site_path) = (cpu, path);
                 sites[layer] = (cpu, path);
                 cost.experts[layer].missed.extend(served.iter().copied());
-            }
-            // The reads its exact rows' hints made for each layer, which
-            // the step's record counts at the layer read and at the lead
-            // that named it: those of an expert its exact rows chose saved
-            // a read.
-            for (layer, expert, lead, hinter) in ahead {
-                let used = chose[layer].binary_search_by_key(&expert, |chosen| chosen.expert).is_ok_and(|at| chose[layer][at].saves);
-                let reads = &mut cost.layers[layer];
-                reads.hint_reads += 1;
-                reads.used += u64::from(used);
-                reads.lead += u64::from(lead);
-                let named = &mut cost.hints[hinter][usize::from(lead) - 1];
-                named.read += 1;
-                named.used += u64::from(used);
-            }
-            // The misses a hint could save, for the hints' recall (their
-            // candidates are counted as the ledger resolves them,
-            // [`Self::resolved`]).
-            let hints = &mut costs.hints;
-            // The file misses a hint could have saved, at layers a ring
-            // hints, and those no ring reaches.
-            for (layer, &absent) in absent.iter().enumerate() {
-                match self.routing.hinted[layer] {
-                    true => hints.hintable += absent,
-                    false => hints.unhintable += absent,
-                }
-            }
-            hints.layer_steps += layers as u64;
-            // Whether its hints ran.
-            for (layer, (total, leads)) in costs.layers.iter_mut().zip(&mut cost.hints).enumerate() {
-                let on = costs.hints_gate.published(layer);
-                total.hints[usize::from(on)] += 1;
-                leads.iter_mut().for_each(|lead| lead.on = on);
             }
         }
         // Every step's end, from which the next decode step's time is taken.
@@ -2876,6 +3021,13 @@ impl Telemetry {
                     cost.parked = parked_union(layer_wait, step_start, ended.1);
                 }
                 cost.storage = self.delivered(costs);
+                {
+                    let mut decode_storage = self.decode_storage.lock().expect("watcher decode storage");
+                    *decode_storage = std::iter::once(*decode_storage)
+                        .chain(cost.storage.iter().map(|&(_, span)| span))
+                        .sum();
+                }
+                let line = self.line();
                 let (used, used_bytes) = std::mem::take(&mut costs.used_ahead);
                 if let Some(launch) = decoded.as_ref().and_then(|decoded| decoded.0.0.launch) {
                     let decoded = decoded.as_ref().expect("a launch's step is decoded");
@@ -2911,6 +3063,7 @@ impl Telemetry {
                     let ahead_landings = used as f64 + cost.ahead.unused().into_iter().flatten().sum::<f64>();
                     let tiered = &decoded.2;
                     let served = priced.map(|lines| self.with_observed(costs, lines)).map(|lines| {
+                        costs.host_memory_secs_per_byte = host_memory_secs_per_byte(&lines);
                         PassService::of(&lines, &decoded.1, tiered, absent, &sites, moved, ahead_landings, staged_link.1)
                     });
                     let PassService { link, cpu, memory, served } = served.unwrap_or_default();
@@ -2971,6 +3124,7 @@ impl Telemetry {
                             depth,
                             real,
                         });
+                        self.shadow_events.notify();
                     }
                     if launch.front() != 0 {
                         costs.front.passes += 1;
@@ -2985,14 +3139,14 @@ impl Telemetry {
                 costs.recent.clear();
             }
         }
-        let chose = decoded.map(|((decoded, keys), routed, _, chose, _, _, guesses, row_experts)| {
+        let chose = decoded.map(|((decoded, keys), routed, _, chose, _, _, guesses, row_experts, physical_rows)| {
             if work == LaunchWork::Generation {
                 match decoded.domain {
                     DecodeDomain::TargetDecode => {
                         // Target decode/verify steps are registered on the
                         // target token clock; a missing stamp fails loudly.
                         let clock = self.horizon.lock().clock.at(sequence);
-                        feed_target_decode(feed, routed, decoded, keys, clock);
+                        feed_target_decode(feed, sequence, routed, &row_experts, decoded, keys, clock);
                     }
                     DecodeDomain::DraftDecode => {
                         // Banked draft steps share `Reuse` ranking/accounting
@@ -3001,7 +3155,7 @@ impl Telemetry {
                     }
                 }
             }
-            DecodeRouting { chose, guesses, row_experts }
+            DecodeRouting { chose, guesses, row_experts, physical_rows, layer_misses }
         });
         // What the step cost in reads, for whoever traces steps (a step slow
         // of its own is read by its misses and reads).
@@ -3093,6 +3247,11 @@ impl Telemetry {
     /// last feed left it ([`Ranked`]); none before it counted a step.
     pub(super) fn live(&self) -> Option<magnitude_cost_model::LiveDecode> {
         self.lock().ranked.live.clone()
+    }
+
+    /// The counted decode steps published in [`Self::live`], read lock-free.
+    pub(super) fn live_steps(&self) -> u64 {
+        self.live_steps.load(Ordering::Acquire)
     }
 
     /// Step `sequence`'s routing record at each streamed layer, by layer:
@@ -3281,7 +3440,10 @@ impl Telemetry {
         let mut recorded = self.lock();
         let costs = &mut recorded.costs;
         ReadPrice {
-            admission: costs.passes.read_admission(line),
+            admission: costs
+                .passes
+                .read_admission(line)
+                .with_host_memory_secs_per_byte(costs.host_memory_secs_per_byte),
             #[cfg(test)]
             even: *self.even.lock().expect("the admitted break-even"),
         }
@@ -3297,45 +3459,19 @@ impl Telemetry {
     }
 
     /// Count a read ahead of `bytes` of `expert` of `layer`, issued for
-    /// the interest of `source` that led its expert, wanting it at `step`,
-    /// named at layer `from`'s route: an exact row's hint's (a hint's,
-    /// `Source::Lead` of no row) counts among the hints' reads and with its
-    /// step's layer and its naming layer's lead; an ahead row's, its
-    /// route's or its hints', among the front rows' ([`FrontSkips`]); and
-    /// its bytes as issued for its source's class ([`AheadUse`]).
-    pub(super) fn read_ahead(&self, source: Source, step: Step, (layer, expert): (usize, usize), from: usize, bytes: u64) {
+    /// the interest of `source` that led its expert: an ahead row's counts
+    /// among the front rows' ([`FrontSkips`]), and its bytes as issued for its
+    /// source's class ([`AheadUse`]).
+    pub(super) fn read_ahead(&self, source: Source, _step: Step, _staged: (usize, usize), _from: usize, bytes: u64) {
         let mut recorded = self.lock();
         let costs = &mut recorded.costs;
         costs.spent.issue(source, bytes);
         match source {
-            Source::Lead { distance, row: None } => {
-                costs.hints.reads += 1;
-                if costs.completed.as_ref().is_none_or(|(completed, _)| step > *completed) {
-                    costs.running_step(step).ahead.push((layer, expert, distance, from));
-                }
-            }
-            Source::Ahead(_) | Source::Lead { row: Some(_), .. } => {
+            Source::Ahead(_) => {
                 costs.front.reads += 1;
             }
             Source::Token => {}
             Source::Exact => unreachable!("no read ahead is an exact request's"),
-        }
-    }
-
-    /// Exact rows' hints published `named` candidates to the interest
-    /// ledger, each its step, the layer whose hint named it, its lead, and
-    /// whether its probability reached the read-ahead break-even
-    /// ([`LeadHints`]).
-    pub(super) fn hints_named(&self, named: &[(Step, usize, u8, bool)]) {
-        let costs = &mut self.lock().costs;
-        let completed = costs.completed.as_ref().map(|(step, _)| *step);
-        for &(step, layer, distance, admitted) in named {
-            if completed.is_some_and(|done| step <= done) {
-                continue;
-            }
-            let lead = &mut costs.running_step(step).cost.hints[layer][usize::from(distance) - 1];
-            lead.published += 1;
-            lead.admitted += u64::from(admitted);
         }
     }
 
@@ -3397,51 +3533,9 @@ impl Telemetry {
         }
     }
 
-    /// Whether each streamed layer's hint launch runs now
-    /// (`gate::HintGate::decide`), priced by `prices` (none before the
-    /// load's prices are had), a miss's cost and a break's as the measured
-    /// passes say ([`Passes`]). `whole` says which layers are whole in Tier 0
-    /// (need no hints); when `link_line` is `Some` (e.g. 100%-RAM discrete GPU
-    /// where `tier_complete()` holds), hints are priced on `PathKind::Link`
-    /// admission rather than `PathKind::Drive`.
-    pub(super) fn hint_gates(
-        &self,
-        whole: &[bool],
-        link_line: Option<magnitude_cost_model::ReadLine>,
-        prices: Option<&magnitude_cost_model::LaunchPrices>,
-        mut admitted: impl FnMut(usize, u8, magnitude_cost_model::PathAdmission) -> bool,
-    ) -> Vec<bool> {
-        let drive_line = self.line();
-        let busy = self.engagement.drive_busy_fraction();
-        let costs = &mut self.lock().costs;
-        let miss = match link_line {
-            Some(line) => costs.passes.link_admission(Some(line)),
-            None => costs.passes.read_admission(drive_line),
-        };
-        // When the workload is GPU-bound (neither drive nor link approaches
-        // compute, and drive busy fraction is below 0.25 on drive-backed
-        // loads), within-token hint launches (`routed_hint_route`) add pure
-        // GPU overhead without hiding a binding path; suppress hint admission
-        // so `HintGate` clears `POLICY_HINTS` cleanly while staying active on
-        // drive-bound or link-bound workloads.
-        let gpu_bound = costs
-            .passes
-            .pass_terms()
-            .is_some_and(|terms| hints_suppressed_gpu_bound(terms, busy, link_line.is_some()));
-        let latest = costs.passes.latest();
-        costs.hints_gate.decide(whole, prices, miss, latest, |target, lead, miss| {
-            !gpu_bound && admitted(target, lead, miss)
-        })
-    }
-
     /// Link-path admission pricer (`PathKind::Link`) over the measured passes.
     pub(super) fn link_admission(&self, link_line: Option<magnitude_cost_model::ReadLine>) -> magnitude_cost_model::PathAdmission {
         self.lock().costs.passes.link_admission(link_line)
-    }
-
-    /// Residency's write of `hints` took effect: in effect from now.
-    pub(super) fn publish_hints(&self, hints: &[bool]) {
-        self.lock().costs.hints_gate.publish(hints);
     }
 
     /// The promotions' copies completed: `records` records whose copies
@@ -3482,6 +3576,7 @@ impl Telemetry {
     pub(super) fn measured(&self) -> Option<Measured> {
         if !self.shadows_needed.swap(true, Ordering::AcqRel) {
             crate::experts::reuse::Reuse::of(&self.ranking).enable_shadows();
+            self.shadow_events.notify();
         }
         let current_regime = self.horizon.lock().regime_epoch();
         let gaps = self.shadow_state.lock().expect("watcher telemetry shadow state").gaps;
@@ -3559,12 +3654,21 @@ impl Telemetry {
     }
 
     /// The ranking's shadows read what it logged for them
-    /// (`Shadows::read_log`) and drain any executed-step observations queued
-    /// by `magnitude-main`, publishing the updated shadow gaps snapshot into
-    /// `shadow_state` so `magnitude-main` never blocks on `self.shadows`.
-    /// No-op until a caller asks for regime pricing (`measured`).
+    /// (`Shadows::read_log_while`) and drain any executed-step observations
+    /// queued by `magnitude-main`, publishing the updated shadow gaps snapshot
+    /// into `shadow_state` so neither `magnitude-main` nor `expert-residency`
+    /// ever blocks on `self.shadows`. No-op until a caller asks for regime
+    /// pricing (`measured`).
+    #[cfg(test)]
     pub(super) fn shadow(&self) {
-        if !self.shadows_needed.load(Ordering::Acquire) {
+        self.shadow_while(|| true);
+    }
+
+    /// Cooperative version of [`Self::shadow`] for the dedicated
+    /// `expert-shadows` thread: stops between shadow steps when `keep_going()`
+    /// returns false so watcher teardown never waits on a shadow backlog.
+    pub(super) fn shadow_while(&self, keep_going: impl Fn() -> bool) {
+        if !self.shadows_needed.load(Ordering::Acquire) || !keep_going() {
             return;
         }
         let reentries = {
@@ -3581,7 +3685,10 @@ impl Telemetry {
                 return;
             }
             let shadows = guard.as_mut().expect("shadows initialized");
-            shadows.read_log(fed);
+            shadows.read_log_while(fed, &keep_going);
+            if !keep_going() {
+                return;
+            }
             let (regime, epoch, now) = {
                 let times = self.horizon.lock();
                 (times.regime_epoch(), times.bank_epoch(), times.clock.through_latest())
@@ -3597,36 +3704,6 @@ impl Telemetry {
         for reentry in reentries {
             tracing::info!("{reentry}");
         }
-    }
-
-    /// The predicted interests a completed decode step resolved
-    /// (`interest::Ledger::tell`), its exact rows having chosen `file`
-    /// experts from the file at each streamed layer: its exact rows' hints'
-    /// candidates count into the hints' record, an expert two leads named
-    /// once (one a longer lead's hint did not read is a shorter lead's
-    /// candidate again). An ahead row's names and its hints are the front
-    /// rows', which the hints never count. The hint gate counts the misses
-    /// a hint could have saved at each layer (its file misses and the
-    /// candidates a hint landed before the route) and the uses the ledger
-    /// expected of each lead's candidates (`gate::HintGate::resolved`), at
-    /// the step's `sequence`.
-    pub(super) fn resolved(&self, resolved: &[Resolved], cohorts: &[Cohort]) {
-        let mut recorded = self.lock();
-        let hints = &mut recorded.costs.hints;
-        let mut counted = std::collections::BTreeSet::new();
-        for resolved in resolved.iter().filter(|resolved| resolved.candidate) {
-            let Source::Lead { row: None, .. } = resolved.source else {
-                continue;
-            };
-            if counted.insert((resolved.layer, resolved.expert)) {
-                hints.candidates += 1;
-                hints.named += u64::from(resolved.used);
-                // Used and in a record misses land into: its hint landed
-                // before the route, a miss it saved.
-                hints.early += u64::from(resolved.early);
-            }
-        }
-        recorded.costs.hints_gate.resolved(cohorts);
     }
 
     /// Count what a scratch request at `point` of the group whose last step
@@ -3783,10 +3860,14 @@ fn served_within(cpu: u64, tiered: u64, absent: u64, layer: usize, sequence: Ste
 /// A completed target decode step's routing at every layer, `routed`, is fed
 /// with its pre-captured target token-clock stamp `clock` and its rows' keys
 /// `keys` where its launch wrote them; while its load records it, counted with
-/// its launch.
+/// its launch. Speculative verify passes hold in `feed.pending_verify` until
+/// their verdict arrives so rejected draft rows past `accepted` never enter
+/// `History` or `Calibration`.
 fn feed_target_decode(
     feed: &mut Feed,
+    sequence: Step,
     routed: Vec<RoutedRead>,
+    row_experts: &[Vec<(u8, u16)>],
     decoded: Decoded,
     keys: Option<std::sync::Arc<StepKeys>>,
     clock: crate::experts::horizon::Tokens,
@@ -3801,6 +3882,20 @@ fn feed_target_decode(
         assert!(rows > 0, "a decode launch has an exact row");
         CountedLaunch { rows, tokens: launch.tokens }
     });
+    if let (Some(launch), Some(keys)) = (launch.filter(|l| l.verifies()), keys.as_ref()) {
+        let row_requests = launch.placed().iter().map(|&(req, _)| req).collect();
+        feed.pending_verify = Some(PendingVerifyFeed {
+            sequence,
+            group,
+            row_requests,
+            row_experts: row_experts.to_vec(),
+            keys: std::sync::Arc::clone(keys),
+            counted,
+            clock,
+        });
+        feed.flush_verify();
+        return;
+    }
     feed.pending
         .extend(routed.into_iter().map(|read| (group, read, Fed::TargetDecode { counted, keys: keys.clone(), clock })));
 }
@@ -3889,12 +3984,13 @@ mod tests {
     #[test]
     fn a_site_line_leaves_out_the_rows_its_row_cost_prices() {
         let job = job_site(1e-6, 3e-6);
+        let regime = crate::experts::horizon::RegimeEpoch::ZERO;
         let mut requests = SiteRequests::default();
-        assert_eq!(requests.line(job), None);
-        requests.observe(2, 2, 85e-6, 2e-6);
-        requests.observe(4, 8, 165e-6 + 4. * 2e-6, 2e-6);
-        requests.observe(3, 5, 125e-6 + 2. * 2e-6, 2e-6);
-        let [fixed, expert] = requests.line(job).unwrap();
+        assert_eq!(requests.line(regime, 0, job), None);
+        requests.observe(regime, 0, 2, 2, 85e-6, 2e-6);
+        requests.observe(regime, 0, 4, 8, 165e-6 + 4. * 2e-6, 2e-6);
+        requests.observe(regime, 0, 3, 5, 125e-6 + 2. * 2e-6, 2e-6);
+        let [fixed, expert] = requests.line(regime, 0, job).unwrap();
         assert!((fixed - 5e-6).abs() < 1e-12 && (expert - 40e-6).abs() < 1e-12, "{fixed} {expert}");
     }
 
@@ -3905,13 +4001,51 @@ mod tests {
     #[test]
     fn a_site_of_one_expert_requests_is_priced_at_what_they_take() {
         let job = job_site(4e-6, 40e-6);
+        let regime = crate::experts::horizon::RegimeEpoch::ZERO;
         let mut requests = SiteRequests::default();
         for seconds in [360e-6, 380e-6] {
-            requests.observe(1, 1, seconds, 1e-6);
+            requests.observe(regime, 0, 1, 1, seconds, 1e-6);
         }
-        let [fixed, expert] = requests.line(job).unwrap();
+        let [fixed, expert] = requests.line(regime, 0, job).unwrap();
         assert!((fixed + expert - 370e-6).abs() < 1e-12, "{fixed} {expert}");
         assert!(fixed > 0. && expert > 0., "{fixed} {expert}");
+    }
+
+    /// Warmup contention that temporarily pushes `SiteRequests` above the
+    /// link line must never permanently lock CPU-site out: advancing either
+    /// `RegimeEpoch` (residency/tier change) or letting one full unobserved
+    /// `bank_epoch` turnover elapse expires the stale fit back to `None`
+    /// (the load's measured job `CpuLines`), allowing clean post-warmup
+    /// observations to re-establish the true CPU line.
+    #[test]
+    fn warmup_contention_cannot_permanently_lock_out_cpu_site() {
+        let job = job_site(4e-6, 40e-6);
+        let r0 = crate::experts::horizon::RegimeEpoch::ZERO;
+        let r1 = r0.next();
+
+        // Path A: regime turnover clears warmup poisoning immediately.
+        let mut by_regime = SiteRequests::default();
+        by_regime.observe(r0, 0, 1, 1, 500e-6, 1e-6);
+        let [fixed, expert] = by_regime.line(r0, 0, job).unwrap();
+        assert!((fixed + expert - 500e-6).abs() < 1e-12, "poisoned in r0: {fixed} {expert}");
+        assert_eq!(by_regime.line(r1, 0, job), None, "regime turnover must clear stale warmup fit");
+        by_regime.observe(r1, 0, 1, 1, 44e-6, 1e-6);
+        let [fixed, expert] = by_regime.line(r1, 0, job).unwrap();
+        assert!((fixed + expert - 44e-6).abs() < 1e-12, "clean fit in r1: {fixed} {expert}");
+
+        // Path B: within the same regime, an unobserved bank-epoch turnover
+        // expires the poisoned warmup sample so CPU-site is re-probed.
+        let mut by_epoch = SiteRequests::default();
+        by_epoch.observe(r0, 0, 1, 1, 500e-6, 1e-6);
+        // Epoch 1 still holds epoch 0 as `previous`.
+        assert!(by_epoch.line(r0, 1, job).is_some());
+        // No CPU requests ran in epoch 1 (locked out). Advancing to epoch 2
+        // rolls the empty epoch 1 into `previous`, expiring the stale fit.
+        assert_eq!(by_epoch.line(r0, 2, job), None, "unobserved turnover epoch must expire stale fit");
+        // Clean post-warmup observations in epoch 2 restore the fast CPU line.
+        by_epoch.observe(r0, 2, 1, 1, 44e-6, 1e-6);
+        let [fixed, expert] = by_epoch.line(r0, 2, job).unwrap();
+        assert!((fixed + expert - 44e-6).abs() < 1e-12, "clean fit in epoch 2: {fixed} {expert}");
     }
 
     /// The job's site line of a `handshake` and an `expert` of one row, in
@@ -3976,10 +4110,10 @@ mod tests {
     fn reads_ahead_are_classed_by_their_basis_and_guess() {
         let mut spent = AheadUse::default();
         let front = Source::Ahead(crate::experts::interest::Row { index: 0, front: Some(crate::GuessKind::Chained) });
-        let hint = Source::Lead { distance: 1, row: None };
+        let token = Source::Token;
         spent.issue(front, 100);
         spent.issue(front, 40);
-        spent.issue(hint, 30);
+        spent.issue(token, 30);
         let start = spent;
         spent.issue(front, 50);
         spent.spend(Spent::Fell { basis: Basis::Front, bytes: 50 });
@@ -3987,7 +4121,7 @@ mod tests {
         spent.spend(Spent::Fell { basis: Basis::Front, bytes: 40 });
         spent.spend(Spent::Unused { basis: Basis::Front, depth: 1, verify: false, fell: true, bytes: 40 });
         spent.spend(Spent::Used { basis: Basis::Front, depth: 1, verify: false, fell: false, bytes: 100 });
-        spent.spend(Spent::Used { basis: Basis::Hint, depth: 0, verify: false, fell: false, bytes: 30 });
+        spent.spend(Spent::Used { basis: Basis::Token, depth: 0, verify: false, fell: false, bytes: 30 });
         let class = |use_: &AheadUse, name: &str| use_.classes().into_iter().find(|(named, _)| *named == name).map(|(_, class)| class).unwrap();
         assert_eq!(class(&spent, "front_stood"), ReadUse { read: 100, used: 100 });
         assert_eq!(class(&spent, "front_wrong"), ReadUse { read: 40, used: 0 });
@@ -3996,7 +4130,7 @@ mod tests {
         // (never negative across a window boundary, and 0 while pending).
         assert_eq!(spent.unused()[0][..2], [0., 1.]);
         assert_eq!(spent.since(&start).unused()[0][..2], [0., 1.]);
-        assert_eq!(class(&spent, "hints"), ReadUse { read: 30, used: 30 });
+        assert_eq!(class(&spent, "token"), ReadUse { read: 30, used: 30 });
         // The window since `start`: 40 bytes issued before it fell within it.
         let window = spent.since(&start);
         assert_eq!(class(&window, "front_stood"), ReadUse { read: -40, used: 100 });
@@ -4216,49 +4350,92 @@ mod served_tests {
     }
 
     #[test]
-    fn gpu_bound_hint_suppression_preserves_drive_and_link_bound_workloads() {
-        use magnitude_cost_model::Terms;
-
-        // M4 Pro Qwen3.8 87.5% resident: GPU-bound, drive_busy_fraction=0.043.
-        let gpu_bound_terms = Terms { compute: 0.030, drive: 0.0014, link: 0.0, cpu: 0.0, memory: 0.0 };
-        assert!(super::hints_suppressed_gpu_bound(gpu_bound_terms, Some(0.043), false));
-        // Never suppress while drive_busy_fraction is still None (warming up) on drive-backed loads.
-        assert!(!super::hints_suppressed_gpu_bound(gpu_bound_terms, None, false));
-
-        // Drive busy >= 0.25 keeps hints active even if mean drive term is still ramping.
-        assert!(!super::hints_suppressed_gpu_bound(gpu_bound_terms, Some(0.25), false));
-        assert!(!super::hints_suppressed_gpu_bound(gpu_bound_terms, Some(0.80), false));
-
-        // Drive-bound (GLM-5.3 / DeepSeek on M2 Pro / M4 Pro): hints stay active.
-        let drive_bound_terms = Terms { compute: 0.030, drive: 0.045, link: 0.0, cpu: 0.0, memory: 0.0 };
-        assert!(!super::hints_suppressed_gpu_bound(drive_bound_terms, Some(0.85), false));
-        assert!(!super::hints_suppressed_gpu_bound(drive_bound_terms, Some(0.10), false));
-
-        // Link-bound discrete GPU (100% RAM, drive_busy_fraction=0.0 or None): hints stay active.
-        let link_bound_terms = Terms { compute: 0.030, drive: 0.0, link: 0.020, cpu: 0.0, memory: 0.0 };
-        assert!(!super::hints_suppressed_gpu_bound(link_bound_terms, Some(0.0), true));
-        assert!(!super::hints_suppressed_gpu_bound(link_bound_terms, None, true));
-
-        // GPU-bound 100%-RAM discrete GPU (tier_complete = true, zero drive bursts -> None):
-        // hints are suppressed because link is far below compute.
-        let light_link_terms = Terms { compute: 0.030, drive: 0.002, link: 0.005, cpu: 0.0, memory: 0.0 };
-        assert!(super::hints_suppressed_gpu_bound(light_link_terms, None, true));
-        assert!(super::hints_suppressed_gpu_bound(light_link_terms, Some(0.0), true));
-
-        // Discrete GPU (terms.link > 0) with active drive (978bf6b5: RTX 5090
-        // Qwen3.8, drive_busy_fraction = 0.268) or warming up (None): hints stay active.
-        assert!(!super::hints_suppressed_gpu_bound(light_link_terms, Some(0.268), false));
-        assert!(!super::hints_suppressed_gpu_bound(light_link_terms, Some(0.25), false));
-        assert!(!super::hints_suppressed_gpu_bound(light_link_terms, None, false));
-        // Only suppress on drive-backed loads when both path < 0.5 * compute AND drive_busy_fraction < 0.25.
-        assert!(super::hints_suppressed_gpu_bound(light_link_terms, Some(0.0), false));
-
-        // DriveEngagement::drive_busy_fraction returns None before decode bursts, Some after.
+    fn drive_busy_fraction_is_none_before_decode_bursts_and_some_after() {
         let engagement = super::DriveEngagement::default();
         assert!(engagement.drive_busy_fraction().is_none());
         let t0 = std::time::Instant::now();
         engagement.on_decode_began(t0);
         engagement.on_decode_ended(t0 + std::time::Duration::from_millis(10));
         assert_eq!(engagement.drive_busy_fraction(), Some(0.0));
+    }
+
+    /// Fix 3: `Feed::flush_verify` holds a completed speculative verify step
+    /// until its verdict arrives, strips rejected draft rows past `accepted`,
+    /// and forwards only accepted experts and filtered `StepKeys` to `Feed::pending`.
+    #[test]
+    fn pending_verify_feed_strips_rejected_draft_rows() {
+        use super::{Fed, Feed, PendingVerifyFeed, StepKeys};
+        use crate::operation::RequestId;
+        let req = RequestId(42);
+        let keys = std::sync::Arc::new(StepKeys {
+            choices: 1,
+            depths: vec![0, 1, 2, 3],
+            verifies: true,
+            positions: std::sync::Arc::from([(req.0, 10)]),
+            layers: vec![vec![
+                1.0, 0.0, 0.0, 0.0, // row 0 -> expert 0
+                0.0, 1.0, 0.0, 0.0, // row 1 -> expert 1
+                0.0, 0.0, 1.0, 0.0, // row 2 -> expert 2 (rejected)
+                0.0, 0.0, 0.0, 1.0, // row 3 -> expert 3 (rejected)
+            ]],
+        });
+        let mut feed = Feed {
+            pending: Vec::new(),
+            pending_verify: Some(PendingVerifyFeed {
+                sequence: 5,
+                group: 5,
+                row_requests: vec![req, req, req, req],
+                row_experts: vec![vec![(0, 0), (1, 1), (2, 2), (3, 3)]],
+                keys,
+                counted: None,
+                clock: None,
+            }),
+            verify_verdicts: None,
+            ended: None,
+        };
+        // Before verdict arrives: nothing flushed.
+        feed.flush_verify();
+        assert!(feed.pending.is_empty());
+        assert!(feed.pending_verify.is_some());
+
+        // Verdict arrives with accepted = 1 (rows 0 and 1 accepted, rows 2 and 3 rejected).
+        feed.verify_verdicts = Some((5, vec![(req, super::super::VerifyOutcome::Committed(1))], true));
+        feed.flush_verify();
+        assert!(feed.pending_verify.is_none());
+        assert_eq!(feed.pending.len(), 1);
+        let (group, read, fed) = &feed.pending[0];
+        assert_eq!(*group, 5);
+        assert_eq!(read.experts, vec![0, 1], "rejected experts 2 and 3 must be excluded");
+        assert_eq!(read.choices, 2);
+        let Fed::Decode { keys: Some(filtered_keys), .. } = fed else {
+            panic!("expected Fed::Decode with filtered StepKeys");
+        };
+        assert_eq!(filtered_keys.depths, vec![0, 1]);
+        assert_eq!(filtered_keys.rows(0).row_count(), 2);
+
+        // Discarded verify request drops ALL rows (including depth 0).
+        let mut discarded_feed = Feed {
+            pending: Vec::new(),
+            pending_verify: Some(PendingVerifyFeed {
+                sequence: 6,
+                group: 6,
+                row_requests: vec![req, req],
+                row_experts: vec![vec![(0, 0), (1, 1)]],
+                keys: std::sync::Arc::new(StepKeys {
+                    choices: 1,
+                    depths: vec![0, 1],
+                    verifies: true,
+                    positions: std::sync::Arc::from([(req.0, 11)]),
+                    layers: vec![vec![1.0, 0.0, 0.0, 1.0]],
+                }),
+                counted: None,
+                clock: None,
+            }),
+            verify_verdicts: Some((6, vec![(req, super::super::VerifyOutcome::Discarded)], true)),
+            ended: None,
+        };
+        discarded_feed.flush_verify();
+        assert!(discarded_feed.pending_verify.is_none());
+        assert!(discarded_feed.pending.is_empty(), "discarded verify step must not retain depth 0");
     }
 }

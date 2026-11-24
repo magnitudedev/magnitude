@@ -96,7 +96,6 @@
 
 mod core;
 mod decode;
-mod gate;
 mod link;
 mod liveness;
 mod parks;
@@ -158,6 +157,15 @@ use telemetry::Telemetry;
 /// short burst.
 pub(in crate::experts) const THREADS: usize = 2;
 
+/// Terminal verdict outcome for one verifying request in a verify step:
+/// either committed with `accepted` draft rows (`0..=K`, retaining exact row 0
+/// plus accepted draft rows) or discarded (retaining zero rows, not even depth 0).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum VerifyOutcome {
+    Committed(u32),
+    Discarded,
+}
+
 /// What steps and serving share, each part its module's.
 pub(super) struct Shared {
     /// Shared with every answer, which writes under its step's ownership of
@@ -165,11 +173,12 @@ pub(super) struct Shared {
     steps: Arc<Steps>,
     /// The load's token clock and turnovers (`Directory::time`).
     time: crate::experts::horizon::Time,
-    /// The verify decode step whose verdicts are still pending on the clock,
-    /// with `(step, total_requests, remaining_requests, accepted_rows)`: only
-    /// its verdicts (or discards, as 0 accepted) call `Times::decided`, and
-    /// the last verdict reports the step's actual emitted tokens to telemetry.
-    pending_verify: Mutex<Option<(Step, u32, u32, u64)>>,
+    /// Pending verify steps awaiting per-request verdicts, keyed by `Step`
+    /// with the exact owed `RequestId` set so a non-verifying (e.g. front-only)
+    /// request on the same step can never consume a verifying request's slot,
+    /// and each owed `(step, request)` settles once and retires the step entry
+    /// when empty.
+    pending_verify: Mutex<std::collections::BTreeMap<Step, std::collections::BTreeSet<crate::operation::RequestId>>>,
     telemetry: Telemetry,
     /// What other threads tell the interest ledger, which `Prefetch` owns
     /// on the request service's thread and drains before it reads the
@@ -275,7 +284,7 @@ impl Shared {
         Arc::new(Self {
             steps,
             time,
-            pending_verify: Mutex::new(None),
+            pending_verify: Mutex::new(std::collections::BTreeMap::new()),
             telemetry,
             told,
             resizing: ResizeHandoff::new(),
@@ -444,8 +453,10 @@ impl Shared {
             seismic_io::timeline::note(seismic_io::timeline::Kind::Noted("stood"), request.0, (verdict.stood() as i64, 0, 0));
         }
         let acceptable: Vec<bool> = checked[..verdict.acceptable().min(checked.len())].iter().map(|(guess, truth)| guess == truth).collect();
-        let accepted = acceptable.iter().take_while(|&&stood| stood).count() as u32;
-        self.decide_verify(step, accepted);
+        if verdict.acceptable() > 0 {
+            let accepted = acceptable.iter().take_while(|&&stood| stood).count() as u32;
+            self.decide_verify(step, request, VerifyOutcome::Committed(accepted));
+        }
         let verdict = crate::experts::interest::Verdict { acceptable, front: verdict.front().to_vec(), truths: verdict.truths().to_vec() };
         self.tell(crate::experts::interest::Told::Decided { step, request, verdict });
     }
@@ -454,7 +465,7 @@ impl Shared {
     /// but its outputs are no sequence's, so no verdict will judge it. The
     /// names its rows published drop, and their unbegun reads cancel.
     pub fn discarded(&self, step: Step, request: crate::operation::RequestId) {
-        self.decide_verify(step, 0);
+        self.decide_verify(step, request, VerifyOutcome::Discarded);
         self.tell(crate::experts::interest::Told::Discarded { step, request });
     }
 
@@ -464,39 +475,68 @@ impl Shared {
     }
 
     /// Register decode step `step` on the load's clock before its launch is
-    /// queued (design §3.1): `Advance::Pending` remembers its verify
-    /// request count so only its verdicts/discards call `Times::decided`.
-    pub(super) fn register_step(&self, step: Step, advance: crate::experts::horizon::Advance) {
+    /// queued (design §3.1): `Advance::Pending` remembers its explicit
+    /// verifying `RequestId`s keyed by `step` so only their verdicts/discards
+    /// call `Times::decided` and front-only judgments in a mixed launch are
+    /// ignored.
+    pub(super) fn register_step(
+        &self,
+        step: Step,
+        advance: crate::experts::horizon::Advance,
+        verifying_requests: &[crate::operation::RequestId],
+    ) {
         if let crate::experts::horizon::Advance::Pending { requests } = advance {
+            assert_eq!(
+                requests as usize,
+                verifying_requests.len(),
+                "verify step {step} pending count mismatch"
+            );
             let mut pending = self.pending_verify.lock().expect("pending verify step");
-            assert!(pending.is_none(), "verify step {step} registered while {:?} is pending", *pending);
-            *pending = Some((step, requests, requests, 0));
+            let owed: std::collections::BTreeSet<_> = verifying_requests.iter().copied().collect();
+            if !owed.is_empty() {
+                pending.insert(step, owed);
+            }
         }
         self.time.lock().register(step, advance);
     }
 
-    /// Count one request's verdict (or discard, with 0 accepted) where
-    /// `step` is the pending verify step on the clock. Panics where a
-    /// verdict for another step arrives while a verify step is pending, or
-    /// where no request remains.
-    fn decide_verify(&self, step: Step, accepted: u32) {
+    /// Cancel a pending verify step that failed or was never submitted so
+    /// neither `pending_verify`, the token clock, nor `Feed::pending_verify`
+    /// can stall subsequent steps.
+    pub(super) fn cancel_verify(&self, step: Step) {
+        let remaining = self.pending_verify.lock().expect("pending verify step").remove(&step);
+        if let Some(remaining) = remaining {
+            let mut time = self.time.lock();
+            for _ in &remaining {
+                time.decided(step, 0);
+            }
+        }
+        self.telemetry.cancel_verify(step);
+    }
+
+    /// Count one verifying request's terminal outcome (`Committed(accepted)` or
+    /// `Discarded`) where `step` is a pending verify step on the clock.
+    /// Front-only requests in a mixed launch are not in `step`'s owed set and
+    /// are ignored without consuming a verifier's vote.
+    fn decide_verify(&self, step: Step, request: crate::operation::RequestId, outcome: VerifyOutcome) {
         let mut pending = self.pending_verify.lock().expect("pending verify step");
-        let Some((pending_step, total, remaining, rows)) = *pending else {
+        let Some(owed) = pending.get_mut(&step) else {
             return;
         };
-        assert_eq!(
-            pending_step, step,
-            "verdict for step {step} arrived while verify step {pending_step} is pending"
-        );
-        assert!(remaining > 0, "verify step {step} decided with no requests remaining");
-        self.time.lock().decided(step, accepted);
-        let rows = rows + u64::from(accepted);
-        let left = remaining - 1;
-        if left > 0 {
-            *pending = Some((pending_step, total, left, rows));
-        } else {
-            *pending = None;
+        if !owed.remove(&request) {
+            return;
         }
+        let is_last = owed.is_empty();
+        if is_last {
+            pending.remove(&step);
+        }
+        drop(pending);
+        let clock_accepted = match outcome {
+            VerifyOutcome::Committed(accepted) => accepted,
+            VerifyOutcome::Discarded => 0,
+        };
+        self.time.lock().decided(step, clock_accepted);
+        self.telemetry.verify_decided(step, request, outcome, is_last);
     }
 
     /// Request `request` closed: none of its passes will come, so the
@@ -699,6 +739,11 @@ impl Shared {
         self.telemetry.live()
     }
 
+    /// The counted decode steps published in [`Self::live`], read lock-free.
+    pub fn live_steps(&self) -> u64 {
+        self.telemetry.live_steps()
+    }
+
     /// What the decode's passes measured, which the regime bit is decided
     /// on (`passes::Measured`); none before a pass is timed.
     pub fn measured(&self) -> Option<Measured> {
@@ -788,10 +833,12 @@ pub(super) struct Watcher {
     shared: Arc<Shared>,
     /// The host compute executor, stopped once serving has ended.
     compute: Option<crate::experts::HostCompute>,
-    /// The request service's thread, residency's, and the transfer queue's
-    /// issuer and watch where the load has the queue.
+    /// The request service's thread, residency's, the background shadows
+    /// thread, and the transfer queue's issuer and watch where the load has
+    /// the queue.
     requests: Option<JoinHandle<()>>,
     residency: Option<JoinHandle<()>>,
+    shadows: Option<JoinHandle<()>>,
     copies: Vec<JoinHandle<()>>,
     /// The parks' keeper, where parks are submission boundaries.
     keeper: Option<JoinHandle<()>>,
@@ -1029,13 +1076,14 @@ impl Watcher {
             core.directory.configure_decode_budget(
                 1,
                 core.extents.selected,
-                crate::planning::HINT_LEADS as usize + 1,
+                1,
             );
+            let active_rows = core.directory.decode_rows() as u64;
             for group in 0..core.groups.len() {
                 let splits = core
                     .directory
                     .group_layers(group)
-                    .any(|layer| !core.layers[layer].draft && shared.transport.is_splitting_decode(layer));
+                    .any(|layer| !core.layers[layer].draft && shared.transport.is_splitting_decode(layer, active_rows));
                 core.directory.set_group_splitting(group, splits);
             }
         }
@@ -1062,7 +1110,6 @@ impl Watcher {
             asked: None,
             opened: Instant::now(),
             complete: false,
-            hints_active: true,
             lines: None,
             logged_initial_lines: false,
             published: residency::Published::new(count, capacities),
@@ -1082,6 +1129,7 @@ impl Watcher {
             compute: Some(compute),
             requests: None,
             residency: None,
+            shadows: None,
             copies: Vec::new(),
             keeper: None,
             watchdog: None,
@@ -1103,6 +1151,11 @@ impl Watcher {
         watcher.residency = Some(
             seismic::threads::spawn("expert-residency", move || Residency::keep(residency, kept, copier))
             .map_err(|error| format!("expert residency: {error}"))?,
+        );
+        let shadowed = shared.clone();
+        watcher.shadows = Some(
+            seismic::threads::spawn("expert-shadows", move || Residency::keep_shadows(shadowed))
+            .map_err(|error| format!("expert shadows: {error}"))?,
         );
         if let Some(copies) = copies {
             let watched = shared.clone();
@@ -1132,45 +1185,151 @@ impl Watcher {
         residency::lock(&self.state).core.directory.lent(group, record as usize)
     }
 
-    /// Batched single-lock claim of unified VRAM slots in `group` for all
-    /// on-demand decode DMA misses in a layer, optionally replenishing `Free`
-    /// headroom in the same `Residency` lock acquisition (1 lock/layer instead
-    /// of `K + 1` locks/layer).
-    pub(in crate::experts) fn claim_demand_batch(
+    /// Claim unified VRAM slots in `group` for a phase's on-demand decode DMA
+    /// misses in a single `residency::lock_deferred` hold, synchronously
+    /// updating `m_active`, draining completed `Staging`/`Releasing`/deferred
+    /// demand slots, finishing previous layer(s)' completed `DemandLanding`
+    /// slots first, reclaiming already-served `Record::Held` victims if
+    /// `Free + StageIdle` are exhausted, and replenishing `Free` headroom at
+    /// the end of the same lock hold.
+    #[allow(clippy::too_many_arguments)]
+    pub(in crate::experts) fn claim_demand_slots(
         &self,
         group: usize,
+        layer: usize,
+        sequence: u64,
+        rows: u64,
         tier_records: &[u32],
-        replenish_want: usize,
+        finish: &[DemandLandingToFinish],
+        replenish_target: Option<usize>,
     ) -> Vec<crate::experts::directory::DemandSlotClaim> {
-        if tier_records.is_empty() && replenish_want == 0 {
+        if tier_records.is_empty() && finish.is_empty() && replenish_target.is_none() {
             return Vec::new();
         }
-        let mut held = residency::lock(&self.state);
+        let mut held = residency::lock_deferred(&self.state);
         let transport = self.shared.transport.clone();
         let core = &mut held.core;
         let (directory, steps) = (&mut core.directory, &core.steps);
-        let lending = steps.lending();
+        let progress = steps.point(sequence, layer, sequence);
+        directory.set_decode_rows(rows as usize);
+        // Drain expired `Staging` slots before entering `with_slot_reuse` so
+        // `try_release_hint_slot` never nests the `transport.registry` mutex.
+        directory.drain_staging_with(progress, steps, |g, slot| {
+            transport.try_release_hint_slot(crate::experts::transport::DestSlot { group: g, slot })
+        });
         let mut claims = Vec::with_capacity(tier_records.len());
-        let mut overflow = 0usize;
-        transport.with_slot_reuse(|can_reuse| {
-            for &tier_record in tier_records {
+        let mut landed_at_home = false;
+        let mut promoted_any = false;
+        let mut last_progress = None;
+        transport.with_slot_reuse(|mut can_reuse| {
+            let mut promoted_groups: Vec<usize> = Vec::new();
+            for prev in finish {
+                let (promoted, at_home, prev_progress) = finish_demand_landings_in_lock(
+                    directory,
+                    steps,
+                    prev.layer,
+                    prev.sequence,
+                    &prev.slots,
+                    &mut can_reuse,
+                );
+                if promoted {
+                    promoted_any = true;
+                    last_progress = Some(prev_progress);
+                    if let Some(first) = prev.slots.first() {
+                        if !promoted_groups.contains(&first.group) {
+                            promoted_groups.push(first.group);
+                        }
+                    }
+                }
+                landed_at_home |= at_home;
+            }
+            // Immediately reclaim any `Releasing` or deferred `DemandLanding`
+            // slots already proven past by `progress` and unpinned in transport
+            // instead of waiting for the background `expert-residency` thread.
+            directory.drain_with(progress, steps, |g, slot| {
+                can_reuse(crate::experts::transport::DestSlot { group: g, slot })
+            });
+            directory.drain_demand_landings(|g, slot| {
+                can_reuse(crate::experts::transport::DestSlot { group: g, slot })
+            });
+            let lending = steps.lending();
+            let mut claimed_count = 0usize;
+            let mut overflows: Vec<(usize, Option<(usize, usize)>)> = Vec::new();
+            for (idx, &tier_record) in tier_records.iter().enumerate() {
                 let claim = directory.claim_demand_landing(group, tier_record, lending, |slot| {
                     can_reuse(crate::experts::transport::DestSlot { group, slot })
                 });
-                if matches!(claim, crate::experts::directory::DemandSlotClaim::Overflow { .. }) {
-                    overflow += 1;
+                match claim {
+                    crate::experts::directory::DemandSlotClaim::Allocated { .. } => {
+                        claimed_count += 1;
+                    }
+                    crate::experts::directory::DemandSlotClaim::Overflow { staged } => {
+                        overflows.push((idx, staged));
+                    }
+                    crate::experts::directory::DemandSlotClaim::AlreadyHeld { .. } => {}
                 }
                 claims.push(claim);
             }
-            let want_free = replenish_want.max(overflow);
-            if want_free > 0 {
-                let _released = steps.unbegun(|at| {
+            let mut remaining_overflows = overflows.len();
+            if !overflows.is_empty() {
+                let reclaimed = steps.unbegun_with_served(progress, directory.layers(), |at, park, is_served| {
+                    directory.reclaim_served_demand_landings(
+                        group,
+                        &overflows,
+                        at,
+                        park,
+                        progress,
+                        is_served,
+                        |slot| can_reuse(crate::experts::transport::DestSlot { group, slot }),
+                    )
+                });
+                for (claim_idx, staged, slot) in reclaimed {
+                    claims[claim_idx] =
+                        crate::experts::directory::DemandSlotClaim::Allocated { staged, slot };
+                    claimed_count += 1;
+                    remaining_overflows -= 1;
+                }
+            }
+            if replenish_target.is_some()
+                || remaining_overflows > 0
+                || promoted_groups.contains(&group)
+            {
+                let want_free = replenish_target
+                    .unwrap_or(0)
+                    .max(claimed_count + remaining_overflows);
+                steps.unbegun(|at| {
                     directory.replenish_demand_free(group, want_free, at, |slot| {
                         can_reuse(crate::experts::transport::DestSlot { group, slot })
                     })
                 });
             }
+            for prev_group in promoted_groups {
+                if (replenish_target.is_some() || remaining_overflows > 0) && prev_group == group {
+                    continue;
+                }
+                steps.unbegun(|at| {
+                    directory.replenish_demand_free(prev_group, 0, at, |slot| {
+                        can_reuse(crate::experts::transport::DestSlot { group: prev_group, slot })
+                    })
+                });
+            }
         });
+        if promoted_any {
+            let surrendered = steps.unbegun(|at| directory.surrender_banked(at));
+            let freed_host = !surrendered.is_empty();
+            for (g, tier_record) in surrendered {
+                transport.bump_source_generation(g, tier_record);
+            }
+            if let Some(progress) = last_progress {
+                directory.retire_graces(progress, steps);
+            }
+            if freed_host {
+                self.shared.events().notify();
+            }
+        }
+        if landed_at_home {
+            held.publish_policy();
+        }
         claims
     }
 
@@ -1181,7 +1340,7 @@ impl Watcher {
         if slots.is_empty() {
             return;
         }
-        let mut held = residency::lock(&self.state);
+        let mut held = residency::lock_deferred(&self.state);
         let transport = self.shared.transport.clone();
         let directory = &mut held.core.directory;
         transport.with_slot_reuse(|can_reuse| {
@@ -1196,33 +1355,35 @@ impl Watcher {
     /// qualifying slots `DemandLanding -> Held` (with `copy_hits = 0.0`) and
     /// publishes via `StampedMap::map_covering`, or returns unpromoted slots
     /// to `Free` (deferring if a joined consumer still pins the slot).
+    /// When `publish` is `true` (end of step), dropping the residency lock
+    /// publishes layer-held telemetry once; mid-step calls defer publication.
     pub(in crate::experts) fn finish_demand_landings(
         &self,
         layer: usize,
         sequence: u64,
         slots: &[crate::experts::transport::DemandSlot],
+        publish: bool,
     ) {
         if slots.is_empty() {
             return;
         }
-        let mut held = residency::lock(&self.state);
-        let progress = held.core.steps.point(sequence, layer, sequence);
+        let mut held = if publish {
+            residency::lock(&self.state)
+        } else {
+            residency::lock_deferred(&self.state)
+        };
         let transport = self.shared.transport.clone();
-        let mut promoted_any = false;
         let core = &mut held.core;
         let (directory, steps) = (&mut core.directory, &core.steps);
-        transport.with_slot_reuse(|can_reuse| {
-            let batch: Vec<(usize, usize, Option<(usize, usize)>, bool)> = slots
-                .iter()
-                .map(|&slot| {
-                    let reusable = can_reuse(crate::experts::transport::DestSlot {
-                        group: slot.group,
-                        slot: slot.slot,
-                    });
-                    (slot.group, slot.slot, slot.staged, reusable)
-                })
-                .collect();
-            promoted_any = directory.finish_demand_landings_batch(&batch, progress, steps);
+        let mut promoted_any = false;
+        let mut landed_at_home = false;
+        let mut last_progress = None;
+        transport.with_slot_reuse(|mut can_reuse| {
+            let (promoted, at_home, progress) =
+                finish_demand_landings_in_lock(directory, steps, layer, sequence, slots, &mut can_reuse);
+            promoted_any = promoted;
+            landed_at_home = at_home;
+            last_progress = Some(progress);
             if promoted_any {
                 let group = slots[0].group;
                 steps.unbegun(|at| {
@@ -1238,13 +1399,163 @@ impl Watcher {
             for (group, tier_record) in surrendered {
                 transport.bump_source_generation(group, tier_record);
             }
-            directory.retire_graces(progress, steps);
-            held.publish_held();
+            if let Some(progress) = last_progress {
+                directory.retire_graces(progress, steps);
+            }
             if freed_host {
                 self.shared.events().notify();
             }
         }
+        if landed_at_home {
+            held.publish_policy();
+        }
     }
+
+    /// Finish a batch of completed demand landings in a single lock hold.
+    pub(in crate::experts) fn finish_demand_landings_batch(
+        &self,
+        finishes: &[DemandLandingToFinish],
+        publish: bool,
+    ) {
+        self.finish_demand_landings_batch_inner(finishes, publish, None);
+    }
+
+    /// Observe strictly ONE deduplicated per-layer decode demand miss count
+    /// (`misses` out of `min(E, rows * K)`, including true all-hit `0`) and
+    /// fold any unconsumed previous-layer `finishes` into the same deferred
+    /// residency lock hold.
+    pub(in crate::experts) fn finish_and_observe_decode_demand(
+        &self,
+        group: usize,
+        misses: usize,
+        rows: usize,
+        finishes: &[DemandLandingToFinish],
+    ) {
+        self.finish_demand_landings_batch_inner(finishes, false, Some((group, misses, rows)));
+    }
+
+    fn finish_demand_landings_batch_inner(
+        &self,
+        finishes: &[DemandLandingToFinish],
+        publish: bool,
+        observe_demand: Option<(usize, usize, usize)>,
+    ) {
+        let has_finishes = finishes.iter().any(|f| !f.slots.is_empty());
+        if !has_finishes && observe_demand.is_none() {
+            return;
+        }
+        let mut held = if publish {
+            residency::lock(&self.state)
+        } else {
+            residency::lock_deferred(&self.state)
+        };
+        let transport = self.shared.transport.clone();
+        let core = &mut held.core;
+        let (directory, steps) = (&mut core.directory, &core.steps);
+        let mut promoted_any = false;
+        let mut landed_at_home = false;
+        let mut last_progress = None;
+        if has_finishes {
+            transport.with_slot_reuse(|mut can_reuse| {
+                let mut promoted_groups: Vec<usize> = Vec::new();
+                for prev in finishes {
+                    let (promoted, at_home, progress) = finish_demand_landings_in_lock(
+                        directory,
+                        steps,
+                        prev.layer,
+                        prev.sequence,
+                        &prev.slots,
+                        &mut can_reuse,
+                    );
+                    if promoted {
+                        promoted_any = true;
+                        last_progress = Some(progress);
+                        if let Some(first) = prev.slots.first() {
+                            if !promoted_groups.contains(&first.group) {
+                                promoted_groups.push(first.group);
+                            }
+                        }
+                    }
+                    landed_at_home |= at_home;
+                }
+                for group in promoted_groups {
+                    steps.unbegun(|at| {
+                        directory.replenish_demand_free(group, 0, at, |slot| {
+                            can_reuse(crate::experts::transport::DestSlot { group, slot })
+                        })
+                    });
+                }
+            });
+        }
+        if let Some((group, misses, rows)) = observe_demand {
+            directory.set_decode_rows(rows);
+            directory.observe_demand_misses(group, misses, rows);
+        }
+        if promoted_any {
+            let surrendered = steps.unbegun(|at| directory.surrender_banked(at));
+            let freed_host = !surrendered.is_empty();
+            for (group, tier_record) in surrendered {
+                transport.bump_source_generation(group, tier_record);
+            }
+            if let Some(progress) = last_progress {
+                directory.retire_graces(progress, steps);
+            }
+            if freed_host {
+                self.shared.events().notify();
+            }
+        }
+        if landed_at_home {
+            held.publish_policy();
+        }
+    }
+}
+
+/// Completed decode DMA landing slots whose transport leases have already been
+/// released, ready to be settled inside `Residency`.
+pub(in crate::experts) struct DemandLandingToFinish {
+    pub layer: usize,
+    pub sequence: u64,
+    pub slots: Vec<crate::experts::transport::DemandSlot>,
+}
+
+/// Settle `slots` for `(layer, sequence)` while holding `Residency` and
+/// `transport.with_slot_reuse`. Returns `(promoted_any, landed_at_home, progress)`.
+fn finish_demand_landings_in_lock(
+    directory: &mut crate::experts::directory::Directory,
+    steps: &Steps,
+    layer: usize,
+    sequence: u64,
+    slots: &[crate::experts::transport::DemandSlot],
+    can_reuse: &mut impl FnMut(crate::experts::transport::DestSlot) -> bool,
+) -> (bool, bool, crate::experts::directory::Point) {
+    let progress = steps.point(sequence, layer, sequence);
+    if slots.is_empty() {
+        return (false, false, progress);
+    }
+    let batch: Vec<(usize, usize, Option<(usize, usize)>, bool)> = slots
+        .iter()
+        .map(|&slot| {
+            let reusable = can_reuse(crate::experts::transport::DestSlot {
+                group: slot.group,
+                slot: slot.slot,
+            });
+            (slot.group, slot.slot, slot.staged, reusable)
+        })
+        .collect();
+    let promoted_any = directory.finish_demand_landings_batch_with_reuse(
+        &batch,
+        progress,
+        steps,
+        |g, slot| can_reuse(crate::experts::transport::DestSlot { group: g, slot }),
+    );
+    let landed_at_home = promoted_any
+        && slots.iter().any(|slot| {
+            slot.staged.is_some_and(|(staged_layer, staged_expert)| {
+                slot.slot == directory.home(staged_layer) + staged_expert
+                    && directory.held(staged_layer, staged_expert) == Some(slot.slot)
+            })
+        });
+    (promoted_any, landed_at_home, progress)
 }
 
 /// The load's account of its landings and of its starved steps, once
@@ -1286,7 +1597,12 @@ impl Drop for Watcher {
         drop(self.watchdog.take());
         self.shared.life.stop();
         self.shared.events().notify();
-        for thread in [self.requests.take(), self.residency.take()].into_iter().flatten().chain(self.copies.drain(..)) {
+        self.shared.telemetry.shadow_events().notify();
+        for thread in [self.requests.take(), self.residency.take(), self.shadows.take()]
+            .into_iter()
+            .flatten()
+            .chain(self.copies.drain(..))
+        {
             thread.join().expect("a serving thread's panic ends the process");
         }
         self.shared.parks.stop();

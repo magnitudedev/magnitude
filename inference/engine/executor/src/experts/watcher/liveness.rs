@@ -246,6 +246,7 @@ impl Shared {
         self.life.end(reason);
         self.resizing.wake();
         self.events().notify();
+        self.telemetry.shadow_events().notify();
     }
 
     /// Count a read step `sequence`'s decode request at `layer` named that

@@ -295,7 +295,7 @@ impl Requests {
                     scratch_arrived = s;
                 });
                 let released_passes = apply_polled_passes(
-                    &mut held,
+                    &mut *held,
                     &self.shared,
                     &completed_passes,
                     pass_error,
@@ -359,15 +359,18 @@ impl Requests {
 
     /// Whether the device's words are polled while a step runs: where kernels
     /// wait in place, while a step runs that may emit NVMe `FILE_REQUEST`s
-    /// (`!all_resolved`), emit foresight hints (`any_hints_enabled`), or run a
-    /// scratch prompt group (`scratch_running`). Once `POLICY_RESOLVED == 1`
-    /// and `POLICY_HINTS == 0`, skip 20 us polling so `expert-requests` does
-    /// not contend on `residency::lock`.
+    /// (`!all_resolved`) or run a scratch prompt group (`scratch_running`);
+    /// and under `tier_copy_dma`, while a scratch prompt group runs or clears
+    /// so `poll_completed_passes` and `settle_prefill_copies` keep retiring
+    /// `Pass(L)` completions and `PrefillFill` DMA batches even when parks
+    /// are kept at submission boundaries.
     fn polls(&self, residency: &Residency) -> bool {
         let steps = &self.shared.steps;
-        !self.shared.parks.kept
+        (!self.shared.parks.kept
             && steps.in_flight() > 0
-            && ((!residency.all_resolved() || residency.any_hints_enabled()) || steps.scratch_running())
+            && (!residency.all_resolved() || steps.scratch_running()))
+            || (residency.core.extents.tier_copy_dma
+                && ((steps.in_flight() > 0 && steps.scratch_running()) || residency.scratch.clearing()))
     }
 
     /// One pass: the misses waiting resumed, the conveyor carried, then
@@ -435,6 +438,7 @@ impl Requests {
         freed: bool,
     ) -> bool {
         let parked = self.shared.parks.parked();
+        let tier_copy_dma = residency.core.extents.tier_copy_dma;
         let layers = residency.core.layers.len();
         let mut progressed = false;
         let mut posted = posted.into_iter().peekable();
@@ -451,7 +455,7 @@ impl Requests {
                 service.decode.serve(request, at, residency.serving());
                 progressed = true;
             }
-            if parked {
+            if parked || tier_copy_dma {
                 progressed |= residency.publish(layer);
             }
             let arrived = scratch_arrived.get_mut(layer).and_then(Option::take);
@@ -572,8 +576,9 @@ fn apply_polled_passes(
     completed_passes: &[crate::experts::transport::PassReaderEvent],
     pass_error: Option<String>,
 ) -> bool {
+    let Residency { scratch, core, .. } = residency;
     apply_polled_passes_with(
-        || residency.scratch.release_passes(completed_passes, &residency.core),
+        || scratch.release_passes(completed_passes, core),
         pass_error,
         |reason| shared.end_serving(reason),
     )

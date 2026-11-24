@@ -25,14 +25,13 @@ fn a_resize_between_flights_keeps_the_most_recent_experts() {
     assert_eq!(harness.seeded(0, &[3, 4]), [(4, 0), (3, 1)]);
     assert_eq!(harness.seeded(0, &[1, 2]), [(2, 2), (1, 3)]);
     let shared = harness.watcher.shared();
-    let steps = shared.costs().hints.layer_steps;
     let read = harness.request(&[1, 2]);
     assert!(!harness.layer.1.requested(read.sequence(), 0), "the bank serves both");
     let sequence = read.sequence();
     read.complete().unwrap();
     // Its reads rank once residency has recorded its completion and the
     // ranking's stack is fed them.
-    eventually("the read was never recorded", || shared.costs().hints.layer_steps > steps);
+    eventually("the read was never recorded", || shared.costs().completed.as_ref().is_some_and(|(s, _)| *s >= sequence));
     eventually("the read was never ranked", || shared.telemetry.fed_all());
     drop(harness.step());
     // Experts 4 and 3, least recently read, leave records 0 and 1; 2 and 1
@@ -729,5 +728,82 @@ fn device_repointed_bank_growth_waits_for_in_flight_step_before_serving() {
     // the pending records to `Record::Free` so promotions fill all 4 records.
     running.complete().unwrap();
     eventually("pending bank records promoted once running step ended", || shared.held()[0].len() == 4);
+    assert_eq!(shared.life.ended(), None);
+}
+
+/// Regression test: a slow `Telemetry::shadow_while` (`Shadows::read_log`)
+/// backlog on `expert-shadows` must never block `expert-residency` from
+/// picking up `ResizeHandoff` (`Shared::shrink`). Before decoupling shadows
+/// onto their own thread, holding `telemetry.shadows` while `shadows_needed`
+/// was true stalled `expert-residency` indefinitely (`plan_picked` freeze).
+#[test]
+fn shrink_never_waits_for_shadow_simulation() {
+    let harness = promoting("shrink-decoupled-from-shadows", 4, TIER);
+    harness.promoted(0, &[0, 1, 2, 3]);
+    let shared = harness.watcher.shared();
+
+    // Enable shadow logging just as `two_row_pricing` -> `bank.measured()` does,
+    // and hold `telemetry.shadows` to model a long `Shadows::read_log` batch.
+    let _ = shared.telemetry.measured();
+    let _busy_shadows = shared.telemetry.lock_shadows();
+
+    // Complete a decode step so `expert-residency` runs `feed()` and wakes
+    // `expert-shadows` (which blocks on `_busy_shadows`).
+    harness.request(&[0, 1]).complete().unwrap();
+    eventually("decode step fed", || shared.telemetry.fed_all());
+
+    // `Shared::shrink` must still be picked up and served immediately by
+    // `expert-residency` without waiting for `_busy_shadows` to release.
+    let evicted = shared
+        .shrink(Evicting::Bank, Candidates::one(2, vec![2]), None)
+        .unwrap()
+        .expect("shrink evicts two records while shadows are busy");
+    assert_eq!(evicted.slots, 2);
+    assert_eq!(evicted.records[0].len(), 2);
+    assert_eq!(shared.life.ended(), None);
+}
+
+/// Regression test: a pending `ResizeHandoff` (`Shared::shrink`) must preempt
+/// `Residency::learn_told` (a large `Told` inbox backlog) and any remaining
+/// jobs in `Residency::turn`, keeping `Trip::picked` sub-millisecond even when
+/// thousands of `Told` events are queued.
+#[test]
+fn shrink_preempts_pending_told_backlog_and_remaining_turn_jobs() {
+    let harness = promoting("shrink-preempts-told", 4, TIER);
+    harness.promoted(0, &[0, 1, 2, 3]);
+    let shared = harness.watcher.shared();
+
+    // Hold residency briefly while flooding `inbox` with 500 `Told::DraftWindow`
+    // events and posting a shrink on a helper thread so `resizing.is_pending()`
+    // is already true when `expert-residency` wakes for its next turn.
+    let shrink_shared = shared.clone();
+    let shrink_thread = {
+        let _hold = residency::lock(&harness.watcher.state);
+        for _ in 0..500 {
+            shared.tell(crate::experts::interest::Told::DraftWindow { estimated_seconds: 0.001 });
+        }
+        let handle = std::thread::spawn(move || {
+            shrink_shared
+                .shrink(Evicting::Bank, Candidates::one(2, vec![2]), None)
+                .unwrap()
+                .expect("shrink evicts two records")
+        });
+        // Wait until `Shared::ask` has marked `resizing.is_pending()`.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        while !shared.resizing.is_pending() {
+            assert!(std::time::Instant::now() < deadline, "shrink never posted pending flag");
+            std::thread::yield_now();
+        }
+        handle
+    };
+
+    let evicted = shrink_thread.join().expect("shrink thread");
+    assert_eq!(evicted.slots, 2);
+    assert_eq!(evicted.records[0].len(), 2);
+    assert!(
+        evicted.trip.picked < std::time::Duration::from_millis(200),
+        "shrink should preempt Told backlog immediately, picked in {:?}",
+        evicted.trip.picked
+    );
     assert_eq!(shared.life.ended(), None);
 }

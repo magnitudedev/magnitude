@@ -267,3 +267,97 @@ fn a_non_parking_pass_retires_graced_tier_records_from_its_rings() {
     harness.route_at(&step, 1, &[]);
     step.complete().unwrap();
 }
+
+/// Goal A Deletion Gate: with zero layer-hint machinery compiled, a
+/// `FrontRows`-only name published to `NameLedger`
+/// (`When::Pass { request, pass: P + 1 }`) launches a `Prefetch::read_ahead`
+/// during `Told::DraftWindow`, and `Prefetch::want` at `P + 1` adopts that
+/// exact same in-flight read once.
+#[test]
+fn front_rows_read_ahead_launches_in_draft_window_and_want_adopts_once() {
+    use crate::experts::interest::{Lineage, Name, Row, Source, Told, When};
+    use crate::experts::watcher::At;
+    use crate::{GuessKind, RequestId};
+    use std::num::NonZeroU8;
+
+    let _alone = alone();
+    let harness = layered("front-draft-window-adopt", EXPERTS, 12, 2, 4 + 4);
+    harness.demand_step(4);
+    harness.staging_free();
+    harness.tier_ready();
+
+    // Hold the drive queue so the read ahead launched during `DraftWindow`
+    // stays in flight until `P + 1` arrives and calls `Prefetch::want`.
+    let ahead = Ahead::queue("front-draft-window-queue");
+
+    // Pass P completes on request 1 (pass 1).
+    let pass_p = harness.two_row_step();
+    let pass_p_seq = pass_p.sequence();
+    harness.route_at(&pass_p, 0, &[]);
+    harness.route_at(&pass_p, 1, &[]);
+    pass_p.complete().unwrap();
+
+    // Publish a FrontRows-only name for `When::Pass { request: 1, pass: 2 }`
+    // and open `Told::DraftWindow`.
+    {
+        let mut state = residency::lock(&harness.watcher.state);
+        let name = Name {
+            source: Source::Ahead(Row { index: 0, front: Some(GuessKind::Head) }),
+            when: When::Pass { request: RequestId(1), pass: 2, estimate: pass_p_seq + 1 },
+            rank: 0,
+            from: At::whole(pass_p_seq, 0),
+            candidate: true,
+            lineage: Some(Lineage { request: RequestId(1), row: 1, guessed: NonZeroU8::MIN }),
+        };
+        state.ledger.publish(0, 5, name, Instant::now());
+    }
+    harness.watcher.shared().tell(Told::DraftWindow { estimated_seconds: 1.0 });
+
+    // `Prefetch::read_ahead` launches during `DraftWindow`.
+    eventually("front-rows read ahead never launched in DraftWindow", || {
+        harness.watcher.shared().costs().front.reads == 1
+    });
+
+    // Pass P + 1 begins and requests expert 5 at layer 0: `Prefetch::want`
+    // adopts that exact same in-flight read once without issuing a second read.
+    let pass_p1 = harness.two_row_step();
+    let before_unanticipated = harness.watcher.shared().costs().layers[0].unanticipated;
+    harness.request_at(&pass_p1, 0, &[5]);
+    let (record, verdict) = harness.answer(0, pass_p1.sequence(), 0);
+    assert_eq!(verdict, Some(Answer::Answered));
+    assert_eq!(harness.in_tier(0, 5), Some(record));
+    harness.route_at(&pass_p1, 1, &[]);
+    pass_p1.complete().unwrap();
+
+    let costs = harness.watcher.shared().costs();
+    assert_eq!(costs.front.reads, 1, "only the single DraftWindow read ahead was issued");
+    assert_eq!(costs.layers[0].reading, 1, "Prefetch::want adopted the in-flight read once");
+    assert_eq!(costs.layers[0].unanticipated, before_unanticipated, "adopted read is not an unanticipated demand read");
+    ahead.finish();
+}
+
+/// Design A mixed `(1 + K + F)` decode step: `STEP_FRONT` marks ONLY the `F`
+/// tail row(s), so `1 + K` exact+acceptable rows stay on the demand path while
+/// `F`-only misses are excluded from immediate demand routing (`exact`).
+#[test]
+fn mixed_verify_and_front_step_withholds_f_only_rows_from_demand() {
+    use crate::experts::watcher::steps::AheadOf;
+
+    let harness = layered("mixed-kf-front", EXPERTS, 12, 2, 4 + 4);
+    harness.demand_step(4);
+    harness.staging_free();
+    harness.tier_ready();
+
+    // Build a mixed 3-row decode step: row 0 = exact, row 1 = acceptable (K=1), row 2 = front (F=1).
+    let rows = [
+        row(1000, None),
+        row(1001, Some(AheadOf::new(1, 1, 0))),
+        row(1002, Some(AheadOf::new(1, 1, 1))),
+    ];
+    let step = harness.begun().decoding(rows.into_iter(), 0);
+    // Bit 0 (exact) and bit 1 (acceptable K=1) are NOT front; bit 2 (front F=1) IS front!
+    assert_eq!(step.front(), 1 << 2, "only the F tail row sets STEP_FRONT");
+    harness.route_at(&step, 0, &[]);
+    harness.route_at(&step, 1, &[]);
+    step.complete().unwrap();
+}

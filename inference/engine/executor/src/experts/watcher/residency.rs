@@ -58,14 +58,12 @@ impl PolicyWords {
     }
 }
 
-/// A streamed layer's policy words: whole, resolved, its home, and whether
-/// its hint launches run.
+/// A streamed layer's policy words: whole, resolved, and its home.
 #[derive(Clone, Copy, Debug, PartialEq)]
 struct LayerPolicy {
     whole: bool,
     resolved: bool,
     home: i32,
-    hints: bool,
 }
 
 /// Where experts live and what moves them, behind one lock
@@ -91,8 +89,6 @@ pub(super) struct Residency {
     /// (`Directory::tier_complete`), as last published.
     pub(super) opened: Instant,
     pub(super) complete: bool,
-    /// Whether any layer currently has `POLICY_HINTS == 1` as last published.
-    pub(super) hints_active: bool,
     /// Each layer's line words as last published ([`Self::publish_lines`]);
     /// none before the first.
     pub(super) lines: Option<Vec<Vec<(usize, i32)>>>,
@@ -134,7 +130,14 @@ impl Published {
 /// from the state it left, which only the refusals read
 /// (`liveness::refuse`), so a poisoned lock is never observed.
 pub(super) fn lock(residency: &Yielding<Residency>) -> Held<'_> {
-    Held::new(residency.hold(POISONED))
+    Held::new(residency.hold(POISONED), true)
+}
+
+/// [`lock`] without publishing layer-held telemetry on drop: used by hot
+/// per-layer decode demand operations so `publish_held` runs once per step
+/// (at step completion) rather than 40x per step.
+pub(super) fn lock_deferred(residency: &Yielding<Residency>) -> Held<'_> {
+    Held::new(residency.hold(POISONED), false)
 }
 
 /// [`lock`], `counted` run once the holder is counted waiting
@@ -143,33 +146,37 @@ pub(super) fn lock(residency: &Yielding<Residency>) -> Held<'_> {
 /// `decode::Look`) runs beside a job the keeper holds, never before one it
 /// starts.
 pub(super) fn lock_counted(residency: &Yielding<Residency>, counted: impl FnOnce()) -> Held<'_> {
-    Held::new(residency.hold_counted(POISONED, counted))
+    Held::new(residency.hold_counted(POISONED, counted), true)
 }
 
 /// Why residency's lock is never poisoned ([`lock`]).
 const POISONED: &str = "residency is never left by a panic";
 
 /// Residency held ([`lock`]): as it is released, what each layer holds is
-/// published under the lock, then the lock and `NoBlockingAllocationGuard` are
-/// released, any evicted/replaced `Tensor`/`Records` views are dropped outside
-/// the lock, and finally what waits on that publication (`Owed`) is answered.
+/// published under the lock (when `publish_on_drop` is set), then the lock and
+/// `NoBlockingAllocationGuard` are released, any evicted/replaced
+/// `Tensor`/`Records` views are dropped outside the lock, and finally what
+/// waits on that publication (`Owed`) is answered.
 pub(super) struct Held<'a> {
     guard: Option<MutexGuard<'a, Residency>>,
     no_alloc: Option<seismic::memory::NoBlockingAllocationGuard>,
+    publish_on_drop: bool,
 }
 
 impl<'a> Held<'a> {
-    fn new(held: MutexGuard<'a, Residency>) -> Self {
+    fn new(held: MutexGuard<'a, Residency>, publish_on_drop: bool) -> Self {
         Self {
             guard: Some(held),
             no_alloc: Some(seismic::memory::enter_no_blocking_allocation()),
+            publish_on_drop,
         }
     }
 
     /// Given first to every holder waiting for it (the keeper's, between
     /// its jobs: [`Yielding::give_way`]), released as every holder is.
     fn give_way(self, residency: &'a Yielding<Residency>) -> Self {
-        residency.give_way(self, POISONED, Self::new)
+        let publish = self.publish_on_drop;
+        residency.give_way(self, POISONED, |held| Self::new(held, publish))
     }
 }
 
@@ -194,7 +201,7 @@ impl Drop for Held<'_> {
         // and ends serving before the lock is released ([`lock`]): nothing
         // is published or answered from the state it left.
         let settle = !std::thread::panicking() && guard.shared.life.ended().is_none();
-        if settle {
+        if settle && self.publish_on_drop {
             guard.publish_held();
         }
         let mut owed = std::mem::take(&mut guard.owed);
@@ -246,16 +253,45 @@ impl Residency {
                 return;
             }
             if shared.life.ended().is_none() {
-                // The ended groups' reads, fed to the ranking before the turn
-                // ranks by it, and the decode steps' depth curve where a step
-                // was read since (which sizes the promotions' reserve),
-                // outside residency's lock so no request waits on the stack.
-                shared.telemetry.feed();
-                let decoded = copier.as_ref().and_then(|_| shared.telemetry.decoded_since(&mut decoded_steps));
+                // Prioritize pending `ResizeHandoff` requests over background
+                // telemetry feeding so bank shrinks never stall behind a
+                // `feed_stack` batch.
+                let decoded = if shared.resizing.is_pending() {
+                    None
+                } else {
+                    shared.telemetry.feed_while(|| {
+                        !shared.resizing.is_pending()
+                            && !shared.life.stopping()
+                            && shared.life.ended().is_none()
+                    });
+                    if shared.resizing.is_pending() {
+                        None
+                    } else {
+                        copier.as_ref().and_then(|_| shared.telemetry.decoded_since(&mut decoded_steps))
+                    }
+                };
                 Self::tend(&residency, copier.as_ref(), decoded.as_ref());
-                // Then the ranking's shadows read what it logged, after the
-                // turn: no request, read ahead or promotion waits on them.
-                shared.telemetry.shadow();
+            }
+            if !shared.resizing.is_pending() {
+                events.wait(seen);
+            }
+        }
+    }
+
+    /// Dedicated background thread for the ranking's true-route shadows
+    /// ([`super::telemetry::Telemetry::shadow_while`]), keeping shadow
+    /// simulation completely off `expert-residency` so `ResizeHandoff`,
+    /// `Join`s, `Retire`, `LinkMover`, and `Prefetch` never block behind a
+    /// shadow backlog.
+    pub(super) fn keep_shadows(shared: Arc<Shared>) {
+        let events = shared.telemetry.shadow_events().clone();
+        loop {
+            let seen = events.seen();
+            if shared.life.stopping() {
+                return;
+            }
+            if shared.life.ended().is_none() {
+                shared.telemetry.shadow_while(|| !shared.life.stopping() && shared.life.ended().is_none());
             }
             events.wait(seen);
         }
@@ -286,13 +322,19 @@ impl Residency {
 
     /// A turn of `jobs` ([`Self::tend`]'s, [`Self::TURN`]).
     pub(super) fn turn(residency: &Yielding<Self>, jobs: &[Job<'_>], copier: Option<&Copier>, decoded: Option<&MissCurve>) {
-        let mut held = Held::new(residency.background(POISONED));
+        let mut held = Held::new(residency.background(POISONED), true);
         let mut turn = Turn::default();
         for job in jobs {
             if !job(&mut held, &mut turn, copier, decoded) {
                 return;
             }
+            if held.shared.resizing.is_pending() {
+                return;
+            }
             held = held.give_way(residency);
+            if held.shared.resizing.is_pending() {
+                return;
+            }
         }
     }
 
@@ -309,10 +351,16 @@ impl Residency {
     pub(super) fn learn_told(&mut self) -> bool {
         let mut told = false;
         let link_only = self.core.directory.tier_complete() && !self.core.directory.all_groups_whole();
-        while let Ok(mut event) = self.inbox.try_recv() {
+        while !self.shared.resizing.is_pending() {
+            let Ok(mut event) = self.inbox.try_recv() else {
+                break;
+            };
             told = true;
             let completed = matches!(&event, Told::Completed { .. });
-            let began = matches!(&event, Told::Began { .. });
+            let began_step = match &event {
+                Told::Began { step, .. } => Some(*step),
+                _ => None,
+            };
             let decode_began = match &event {
                 Told::Began { step, launch: Launched::Decode { rows, .. } } => Some((*step, rows.len().max(1))),
                 _ => None,
@@ -330,10 +378,30 @@ impl Residency {
             // `MAP_STAGE` hits against the actual routed experts of every
             // completed step, and on 100%-RAM discrete GPUs (`link_only`)
             // classify each choice for `Ledger::resolve`.
-            if let Told::Completed { step, ref mut chose, .. } = event {
+            if let Told::Completed { step, ref mut chose, physical_rows, ref layer_misses, .. } = event {
                 let engagement = self.shared.telemetry.engagement();
                 for (layer, choices) in chose.iter_mut().enumerate() {
                     let layer_bytes = self.core.layers[layer].expert_bytes();
+                    let (gpu_host_misses, cpu_sited) =
+                        layer_misses.get(layer).copied().unwrap_or((0, 0));
+                    let census = crate::experts::transport::DecodeLayerCensus {
+                        mode: crate::experts::transport::DecodeLayerMode::Whole,
+                        rows: physical_rows,
+                        gpu_host_misses,
+                        cpu_sited,
+                        dma_landed: 0,
+                        dma_joined: 0,
+                        dma_overflow: 0,
+                        expert_bytes: layer_bytes,
+                    };
+                    if self.shared.transport.observe_decode_layer_census(step, layer, census) {
+                        let group = self.core.directory.layer_groups()[layer];
+                        self.core.directory.observe_demand_misses(
+                            group,
+                            gpu_host_misses as usize,
+                            physical_rows as usize,
+                        );
+                    }
                     for chosen in choices.iter_mut() {
                         if let Some(lp) = self.prefetch.take_landed_prefetch((layer, chosen.expert)) {
                             engagement.record_landed_hit(lp.bytes, lp.carryover);
@@ -346,13 +414,13 @@ impl Residency {
                 }
                 self.prefetch.prune_evicted_prefetches(&self.core, &self.shared);
             }
-            let learned = self.ledger.tell(event);
-            if began {
+            let _ = self.ledger.tell(event);
+            if let Some(step) = began_step {
                 if let Some((step, m_active)) = decode_began {
                     self.core.directory.set_decode_rows(m_active);
-                    self.prefetch.decode_step_began(step, &self.shared);
+                    self.prefetch.decode_step_began(step, m_active, &self.shared);
                 }
-                self.prefetch.on_began();
+                self.prefetch.on_began(step);
             } else if draft {
                 self.shared.telemetry.engagement().on_draft_window(true, Instant::now());
                 self.prefetch.on_draft_window();
@@ -360,9 +428,7 @@ impl Residency {
             if let Some(step) = ended_step {
                 self.prefetch.step_ended(step, &self.shared);
             }
-            if completed {
-                self.shared.telemetry.resolved(&learned.resolved, &learned.cohorts);
-            }
+            let _ = completed;
             if let Some(request) = closed_request {
                 self.shared.telemetry.engagement().on_draft_window(false, Instant::now());
                 self.prefetch.prune_evicted_prefetches(&self.core, &self.shared);
@@ -393,11 +459,13 @@ impl Residency {
                 }
             }
         }
-        let (judged, accepted) = self.ledger.take_judged();
-        if !judged.is_empty() || !accepted.is_empty() {
-            self.shared.telemetry.judged(&judged, &accepted);
+        if !self.shared.resizing.is_pending() {
+            let (judged, accepted) = self.ledger.take_judged();
+            if !judged.is_empty() || !accepted.is_empty() {
+                self.shared.telemetry.judged(&judged, &accepted);
+            }
+            Prefetch::spend(&mut self.ledger, &self.shared);
         }
-        Prefetch::spend(&mut self.ledger, &self.shared);
         told
     }
 
@@ -406,10 +474,23 @@ impl Residency {
             self.shared.end_serving(reason);
             return false;
         }
+        // Serve any pending resize immediately before draining `Told` events
+        // or refilling tier reserves (`Self::resize` already runs `join`,
+        // `retire`, `link.settle`, and `prefetch.settle`, and `publish_resized`
+        // runs `refill_tier`), so `plan_picked_micros` never stalls behind a
+        // `learn_told` or `telemetry.judged` backlog.
+        if let Some(asked) = self.asked.take().or_else(|| self.shared.resizing.asked().map(Asked::taken)) {
+            self.asked = self.resize(asked, copier);
+            return false;
+        }
         // Drain `Told` events (`DraftWindow`, `Began`, `Completed`) before
         // `promote` (`LinkMover::advance`) so Path 0 immediately sees fresh
         // draft windows and completed steps on the same turn.
         let told = self.learn_told();
+        if let Some(asked) = self.shared.resizing.asked().map(Asked::taken) {
+            self.asked = self.resize(asked, copier);
+            return false;
+        }
         let joined = self.join();
         let retired = self.retire();
         let (landed, newly_landed) = self.prefetch.settle(&mut self.core.directory, &mut self.ledger, &self.shared);
@@ -419,7 +500,7 @@ impl Residency {
         // `promote` (`LinkMover::advance`) immediately stages it into Tier 0.
         let chain_through = newly_landed.into_iter().any(|(layer, expert)| self.ledger.is_wanted(layer, expert));
         turn.changed = told || joined || retired || landed || refilled || chain_through;
-        if let Some(asked) = self.asked.take().or_else(|| self.shared.resizing.asked().map(Asked::taken)) {
+        if let Some(asked) = self.shared.resizing.asked().map(Asked::taken) {
             self.asked = self.resize(asked, copier);
             return false;
         }
@@ -648,13 +729,10 @@ impl Residency {
     /// Take `layer`'s scratch requests published since, in step order,
     /// reading what each needs as its records free; none while the conveyor
     /// still clears a group past (`Scratch::clearing`), whose clearing is an
-    /// event. True when it took any.
+    /// event. Host visibility is enforced per layer by
+    /// `Parks::scratch_visible_end` inside `Scratch::published`. True when it
+    /// took any.
     pub(super) fn publish(&mut self, layer: usize) -> bool {
-        // The device's requests are in place only while it is parked, where
-        // parks are submission boundaries (`Parks::parked`).
-        if !self.shared.parks.parked() {
-            return false;
-        }
         let layers = self.core.layers.len();
         let mut took = false;
         while let Some((place, at)) = self.scratch.published(&self.core, &self.shared, layer, layers) {
@@ -682,6 +760,7 @@ impl Residency {
     /// group's host tier holds alone, where they changed since last
     /// published: otherwise it counts nothing and takes no lock.
     pub(super) fn publish_held(&mut self) {
+        let first_publish = self.published.holdings.is_none();
         let holdings = self.core.directory.holdings();
         if self.published.holdings != Some(holdings) {
             let Published { held, alone, .. } = &mut self.published;
@@ -717,10 +796,12 @@ impl Residency {
                 self.opened.elapsed().as_secs_f64()
             );
         }
-        self.complete = complete;
-        self.shared.time.lock().update_residency(|state| {
-            state.tier_complete = complete;
-        });
+        if complete != self.complete || first_publish {
+            self.complete = complete;
+            self.shared.time.lock().update_residency(|state| {
+                state.tier_complete = complete;
+            });
+        }
     }
 
     /// The store misses land into: a host tier's where the device places,
@@ -852,62 +933,11 @@ impl Residency {
             .zip(&whole)
             .map(|(layer, &whole)| whole || directory.group_tier_settled(layer.group))
             .collect::<Vec<_>>();
-        // Keep `POLICY_RESOLVED` strictly as the `routed_land` / file-exchange
-        // omission bit, while gating `HintGate` on `&whole` (`!all_groups_whole`)
-        // so both 100%-RAM and 3-tier discrete GPUs keep foresight hints active
-        // for Link and Drive staging.
-        let copy_transfer = self.shared.copy.lock().expect("a copy's price").as_ref().map(|c| c.transfer);
-        let tier_complete = self.core.directory.tier_complete();
-        let link_line = tier_complete.then_some(copy_transfer).flatten();
-        // On 3-tier discrete GPUs (`!tier_complete` with a Host->VRAM link),
-        // `routed_hint_route` feeds BOTH Path 1 (`Drive`) and Path 0 (`Link`):
-        // a hint lead is active whenever either path admits it under its
-        // `lead * C / L` compute overlap window.
-        let secondary_link = (!tier_complete)
-            .then_some(copy_transfer)
-            .flatten()
-            .map(|line| self.shared.telemetry.link_admission(Some(line)));
-        let core = &self.core;
-        let ledger = &mut self.ledger;
-        let layer_count = core.layers.len();
-        // On 100%-RAM discrete GPUs (`tier_complete == true`), `routed_hint_select`
-        // only feeds Path 0 `LinkMover` staging (`MAP_STAGE`). Once decode DMA
-        // has executed at least one full step (`req_dma >= layer_count`) with
-        // zero staged hits (`req_staged == 0`), gate off `POLICY_HINTS` so the
-        // GPU skips dead `routed_hint_select` launches and `expert-requests`
-        // stops 20 us polling.
-        let (req_staged, req_dma) = self.shared.telemetry.engagement().request_staged_and_dma();
-        let link_hints_dead = tier_complete && req_dma >= (layer_count as u64).saturating_mul(4) && req_staged == 0;
-        let hints = if link_hints_dead {
-            vec![false; layer_count]
-        } else {
-            self.shared.telemetry.hint_gates(&whole, link_line, self.shared.launch_prices().as_ref(), |target, lead, miss| {
-                let bytes = core.layers[target].expert_bytes();
-                let idle = if miss.host_memory_binds() {
-                    0.0
-                } else {
-                    miss.hint_lead_idle(lead, layer_count)
-                };
-                if ledger.hint_admitted(target, lead, miss.break_even(bytes, idle)) {
-                    return true;
-                }
-                secondary_link.is_some_and(|link| {
-                    let link_idle = if link.host_memory_binds() {
-                        0.0
-                    } else {
-                        link.hint_lead_idle(lead, layer_count)
-                    };
-                    ledger.hint_admitted(target, lead, link.break_even(bytes, link_idle))
-                })
-            })
-        };
-        self.hints_active = hints.iter().any(|&h| h);
         let layers = (0..self.core.layers.len())
             .map(|index| LayerPolicy {
                 whole: whole[index],
                 resolved: resolved[index],
                 home: self.homes[index],
-                hints: hints[index],
             })
             .collect();
         let words = PolicyWords { layers, served };
@@ -922,9 +952,7 @@ impl Residency {
                     policy.store(constants::POLICY_WHOLE as usize, i32::from(layer.whole));
                     policy.store(constants::POLICY_RESOLVED as usize, i32::from(layer.resolved));
                     policy.store(constants::POLICY_HOME as usize, layer.home);
-                    policy.store(constants::POLICY_HINTS as usize, i32::from(layer.hints));
                 }
-                shared.telemetry.publish_hints(&words.layers.iter().map(|layer| layer.hints).collect::<Vec<_>>());
             })
         });
     }
@@ -971,13 +999,14 @@ impl Residency {
         // served one (`Telemetry::refined`), the job's before; the
         // assignment weighs it against the GPU's at those prices alone.
         let all_groups_whole = self.core.directory.all_groups_whole();
+        let active_rows = self.core.directory.decode_rows() as u64;
         for group in 0..self.core.groups.len() {
             let splits = !all_groups_whole
                 && self
                     .core
                     .directory
                     .group_layers(group)
-                    .any(|layer| !self.core.layers[layer].draft && self.shared.transport.is_splitting_decode(layer));
+                    .any(|layer| !self.core.layers[layer].draft && self.shared.transport.is_splitting_decode(layer, active_rows));
             self.core.directory.set_group_splitting(group, splits);
         }
         let mut initial_log = None;
@@ -987,7 +1016,7 @@ impl Residency {
             .iter()
             .enumerate()
             .map(|(index, layer)| {
-                let layer_decode_dma = !all_groups_whole && self.shared.transport.is_splitting_decode(index);
+                let layer_decode_dma = !all_groups_whole && self.shared.transport.is_splitting_decode(index, active_rows);
                 let adjusted = priced.as_ref().map(|lines| decode_dma_lines(lines[index], copy.as_ref(), layer_decode_dma));
                 let site = match (&layer.site, adjusted.as_ref().and_then(|lines| lines.host.cpu.as_ref())) {
                     (None, _) => SiteLines::Unsited,
@@ -998,14 +1027,14 @@ impl Residency {
                 if index == 0 && !self.logged_initial_lines && adjusted.is_some() {
                     let word = |of: usize| policy_words.iter().find_map(|&(word, value)| (word == of).then_some(value));
                     let layout = &crate::assessment::POLICY_LAYOUT;
-                    initial_log = Some((layer_decode_dma, word(layout.link), word(layout.cpu)));
+                    initial_log = Some((layer_decode_dma, word(layout.link), word(layout.link_contended), word(layout.cpu)));
                 }
                 policy_words
             })
             .collect::<Vec<_>>();
-        if let Some((split_dma, link_ns, cpu_ns)) = initial_log {
+        if let Some((split_dma, link_ns, link_contended_ns, cpu_ns)) = initial_log {
             self.logged_initial_lines = true;
-            tracing::info!("expert pricing (layer 0): split_dma={split_dma} POLICY_LINK_NS={link_ns:?} POLICY_CPU_NS={cpu_ns:?}");
+            tracing::info!("expert pricing (layer 0): split_dma={split_dma} POLICY_LINK_NS={link_ns:?} POLICY_LINK_CONTENDED_NS={link_contended_ns:?} POLICY_CPU_NS={cpu_ns:?}");
         }
         if self.lines.as_ref() == Some(&words) {
             return;
@@ -1054,11 +1083,6 @@ impl Residency {
     /// `FILE_REQUEST`s).
     pub(super) fn all_resolved(&self) -> bool {
         self.core.directory.all_groups_whole() || self.core.directory.tier_complete()
-    }
-
-    /// Whether any layer currently publishes `POLICY_HINTS == 1`.
-    pub(super) fn any_hints_enabled(&self) -> bool {
-        self.hints_active
     }
 
     /// Each group's host tier records `views` address from now (a shrink's,
@@ -1126,13 +1150,37 @@ fn decode_dma_lines(mut lines: ExpertLines, copy: Option<&crate::assessment::Tie
             lines.host.joint_memory = Some(joint_ns.max(mem));
         }
     }
-    let mut dma_priced = lines;
     let dma_ns = copy.transfer.transfer_seconds(lines.host.record_bytes as f64) * 1e9;
+    let contended_dma_ns = copy
+        .concurrent_dma_byte_seconds
+        .map(|bs| lines.host.record_bytes as f64 * bs * 1e9)
+        .filter(|ns| ns.is_finite() && *ns > 0.0)
+        .map(|ns| ns.max(dma_ns));
+    let mut dma_priced = lines;
     let landed_ns = dma_ns + lines.gpu.resident.weights.get();
-    if landed_ns.is_finite() && landed_ns > 0.0 && landed_ns < lines.gpu.link.weights.get() {
+    let uses_dma_link = landed_ns.is_finite() && landed_ns > 0.0 && landed_ns < lines.gpu.link.weights.get();
+    if uses_dma_link {
         if let Ok(ns) = magnitude_cost_model::Nanoseconds::try_from(landed_ns.round() as u32) {
             dma_priced.gpu.link.weights = ns;
+            if let Ok(dma) = magnitude_cost_model::Nanoseconds::try_from(dma_ns.round() as u32) {
+                dma_priced.gpu.baseline_dma = Some(match dma_priced.gpu.baseline_dma {
+                    Some(prev) => prev.min(dma),
+                    None => dma,
+                });
+            }
         }
+    }
+    if let Some(contended_dma_ns) = contended_dma_ns {
+        let contended_ns = if uses_dma_link {
+            contended_dma_ns + dma_priced.gpu.resident.weights.get()
+        } else {
+            dma_priced.gpu.link.weights.get() + (contended_dma_ns - dma_ns).max(0.0)
+        };
+        let contended_ns = contended_ns.max(dma_priced.gpu.link.weights.get());
+        dma_priced.gpu.contended_link = Some(magnitude_cost_model::Nanoseconds::saturating(contended_ns * 1e-9));
+        let in_place_contended = (lines.gpu.link.weights.get() + (contended_dma_ns - dma_ns).max(0.0))
+            .max(lines.gpu.link.weights.get());
+        lines.gpu.contended_link = Some(magnitude_cost_model::Nanoseconds::saturating(in_place_contended * 1e-9));
     }
     if layer_decode_dma {
         return dma_priced;
@@ -1216,6 +1264,8 @@ mod tests {
                 link: PassLine { weights: ns(270_000), row: ns(1_000) },
                 resident: PassLine { weights: ns(15_000), row: ns(1_000) },
                 moves: Moves::NONE,
+                baseline_dma: None,
+                contended_link: None,
             },
             host: HostLines {
                 cpu: Some(CpuLines { expert: RowLine { one: ns(75_000), row: RowCost::Measured(ns(1_000)) }, handshake: ns(4_000) }),
@@ -1226,7 +1276,7 @@ mod tests {
             },
         };
         let line = ReadLine::new(0.0, 1.0 / 48e9).unwrap();
-        let copy = crate::assessment::TierCopyCosts { blocks: 0, whole_seconds: 0.0, stall_share: 0.0, transfer: line, back: line, concurrent_host_byte_seconds: None };
+        let copy = crate::assessment::TierCopyCosts { blocks: 0, whole_seconds: 0.0, stall_share: 0.0, transfer: line, back: line, concurrent_host_byte_seconds: None, concurrent_dma_byte_seconds: None };
         let landed = decode_dma_lines(lines, Some(&copy), true);
         assert_eq!(landed.gpu.link.weights.get() as u64, 77_500);
         assert_eq!(landed.host, lines.host);
@@ -1245,12 +1295,15 @@ mod tests {
             transfer: gen5_line,
             back: gen5_line,
             concurrent_host_byte_seconds: Some(1.0 / 42.0e9),
+            concurrent_dma_byte_seconds: None,
         };
         let gen5_lines = ExpertLines {
             gpu: GpuLines {
                 link: PassLine { weights: ns(270_000), row: ns(1_000) },
                 resident: PassLine { weights: ns(2_000), row: ns(1_000) },
                 moves: Moves::NONE,
+                baseline_dma: None,
+                contended_link: None,
             },
             host: HostLines {
                 cpu: Some(CpuLines { expert: RowLine { one: ns(75_000), row: RowCost::Measured(ns(1_000)) }, handshake: ns(4_000) }),
@@ -1287,6 +1340,7 @@ mod tests {
             transfer: gen5_transfer,
             back: gen5_transfer,
             concurrent_host_byte_seconds: Some(1.0 / 42.0e9),
+            concurrent_dma_byte_seconds: None,
         };
         // DSpark draft layer: 18.84 MB/expert MXFP4, SM zero-copy link ~1.7 ms, resident ~40 µs.
         let dspark_bytes = 18_840_000u64;
@@ -1295,6 +1349,8 @@ mod tests {
                 link: PassLine { weights: ns(1_700_000), row: ns(1_000) },
                 resident: PassLine { weights: ns(40_000), row: ns(1_000) },
                 moves: Moves::NONE,
+                baseline_dma: None,
+                contended_link: None,
             },
             host: HostLines {
                 cpu: Some(CpuLines {
@@ -1345,6 +1401,7 @@ mod tests {
             transfer: gen4_transfer,
             back: gen4_transfer,
             concurrent_host_byte_seconds: Some(1.0 / 36.9e9),
+            concurrent_dma_byte_seconds: None,
         };
         for layer_decode_dma in [true, false] {
             let adjusted = decode_dma_lines(draft_lines, Some(&gen4_copy), layer_decode_dma);
@@ -1353,5 +1410,47 @@ mod tests {
                 "layer_decode_dma={layer_decode_dma}: Gen4 3090 must keep CPU-site enabled"
             );
         }
+
+        // Real DDR4 contention on Gen4 (3060-32g): uncontended DMA 20 GB/s (150 µs),
+        // contended DMA 11 GB/s (272.7 µs), aggregate B_joint = 26 GB/s (> 20 GB/s),
+        // CPU 320 µs -> decode_dma_lines wires concurrent_dma_byte_seconds into
+        // contended_link and serve() keeps all 4 misses on GPU (C = 0) because every
+        // contended split is slower than 4 * 155 µs uncontended.
+        let ddr4_transfer = ReadLine::new(0.0, 1.0 / 20.0e9).unwrap();
+        let ddr4_copy = crate::assessment::TierCopyCosts {
+            blocks: 0,
+            whole_seconds: 0.0,
+            stall_share: 0.0,
+            transfer: ddr4_transfer,
+            back: ddr4_transfer,
+            concurrent_host_byte_seconds: Some(1.0 / 26.0e9),
+            concurrent_dma_byte_seconds: Some(1.0 / 11.0e9),
+        };
+        let ddr4_lines = ExpertLines {
+            gpu: GpuLines {
+                link: PassLine { weights: ns(350_000), row: ns(100) },
+                resident: PassLine { weights: ns(5_000), row: ns(100) },
+                moves: Moves::NONE,
+                baseline_dma: None,
+                contended_link: None,
+            },
+            host: HostLines {
+                cpu: Some(CpuLines {
+                    expert: RowLine { one: ns(320_000), row: RowCost::Measured(ns(1_000)) },
+                    handshake: ns(10_000),
+                }),
+                memory: Some(Nanoseconds::of(3_000_000.0 / 30.0e9).unwrap()),
+                joint_memory: None,
+                landing: None,
+                record_bytes: 3_000_000,
+            },
+        };
+        let adjusted = decode_dma_lines(ddr4_lines, Some(&ddr4_copy), true);
+        assert_eq!(adjusted.gpu.link.weights.get() as u64, 155_000);
+        let contended_expected = (3_000_000.0_f64 / 11.0e9 * 1e9 + 5_000.0).round() as u64;
+        assert_eq!(adjusted.gpu.contended_link.unwrap().get() as u64, contended_expected);
+        let served = adjusted.serve(Pass::Decode, &[], &vec![Miss { rows: 1., ready_seconds: 0. }; 4]);
+        assert_eq!(served.sites.iter().filter(|&&s| s == Site::Cpu).count(), 0, "{served:?}");
+        assert_eq!(served.sites.iter().filter(|&&s| s == Site::Link).count(), 4, "{served:?}");
     }
 }

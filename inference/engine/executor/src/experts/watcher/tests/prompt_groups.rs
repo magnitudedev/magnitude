@@ -946,12 +946,12 @@ fn the_one_stores_rounds_read_a_cold_expert_the_store_keeps() {
     // Two layers, so a decode step's ring at layer 0 hints layer 1.
     let harness = lending("store-kept", EXPERTS, 2 * EXPERTS as u64, 2, 2 * STAGING, conveying, 2 * EXPERTS as u32, Placer::Bank, false);
     let step = harness.prompt_step();
-    // A decode step behind the group hints layer 1's kept experts.
-    let decode = harness.step();
+    // A two-row decode step behind the group names layer 1's kept experts via its front ring.
+    let decode = harness.two_row_step();
     let kept = [5, 6, 7];
-    harness.hint(&decode, 0, &[5, 6, 7]);
+    harness.front_at(&decode, 1, &[5, 6, 7]);
     let map = &harness.layers[1].0;
-    eventually("the hints never landed the experts", || kept.iter().all(|&expert| map.held(expert).is_some()));
+    eventually("the front reads never landed the experts", || kept.iter().all(|&expert| map.held(expert).is_some()));
     assert!(kept.iter().all(|&expert| map.resolve(expert, step.sequence()).is_none()), "landed past the begun step");
     harness.scratch(&step, 0, &[]);
     let rounds = harness.scratch(&step, 1, &kept);
@@ -1711,7 +1711,6 @@ fn async_dma_scratch_ring_deepseek_stress() {
 
     let layers: Vec<Layer> = (0..STRESS_LAYERS)
         .map(|index| {
-            let ahead = crate::planning::HINT_LEADS.min((STRESS_LAYERS - 1 - index) as u64);
             let round_bounds = ListBounds { from: STRESS_CONVEYOR, to: STRESS_EXPERTS as u64, lent: 0 };
             Layer {
                 group: 0,
@@ -1721,8 +1720,6 @@ fn async_dma_scratch_ring_deepseek_stress() {
                 map: maps[index].view().clone(),
                 file: file_tables[index].clone(),
                 scratch: scratch_tables[index].clone(),
-                rings: words(ahead * stress_words.ring_words(), 0),
-                hints: (0..ahead as usize).map(|lead| index + 1 + lead).collect(),
                 routing: words(stress_words.flight * stress_words.routing_words(), 0),
                 keys: words(stress_words.flight * constants::VERIFY_ROWS * STRESS_EXPERTS as u64, 0),
                 policy: words(constants::POLICY_WORDS, 0),
@@ -2102,8 +2099,6 @@ fn async_dma_delayed_layer_reader_preserves_window_table_and_held_bank_payload_a
                 map: maps[index].view().clone(),
                 file: file_tables[index].clone(),
                 scratch: scratch_tables[index].clone(),
-                rings: words(ahead * region_words.ring_words(), 0),
-                hints: (0..ahead as usize).map(|lead| index + 1 + lead).collect(),
                 routing: words(region_words.flight * region_words.routing_words(), 0),
                 keys: words(region_words.flight * constants::VERIFY_ROWS * EXP as u64, 0),
                 policy: words(constants::POLICY_WORDS, 0),
