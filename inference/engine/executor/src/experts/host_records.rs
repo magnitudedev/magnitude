@@ -1224,6 +1224,13 @@ impl HostRecords {
         self.takes_for(keep, Taking::Out)
     }
 
+    /// Whether a non-evicting ready record is available beyond the reserve and
+    /// cut-in pool (a landing takes an already-empty slot without evicting any
+    /// kept expert).
+    pub fn has_free_slot(&self) -> bool {
+        self.takes_for(self.reserve, Taking::Out)
+    }
+
     fn takes_for(&self, keep: usize, taking: Taking) -> bool {
         self.beyond(self.ready_count(taking), self.pool) && self.beyond(self.reserved_for(taking), keep + self.pool)
     }

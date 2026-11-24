@@ -1945,3 +1945,191 @@ fn promotions_and_stage_slots_skip_transport_pinned_slots() {
     assert!(transport.try_release_hint_slot(pinned_perm));
     assert!(transport.can_reuse_slot(pinned_perm));
 }
+
+/// During prefill on a non-covering 3-tier bank (`HostTier` < E), seeding an
+/// expert into a non-lent VRAM record immediately marks its host-tier copy
+/// `Kept::Banked` so subsequent `claim_conveyed` / `surrender_banked` reclaim
+/// those duplicate host slots for non-VRAM experts (`VRAM ∩ HostTier == ∅`),
+/// raising total in-memory coverage from `H` to `V + H`. A tainted seed
+/// (`!committed`) restores `Kept::Banked -> Kept::Alone` if still present.
+#[test]
+fn prefill_seed_marks_host_tier_banked_so_conveyed_reclaims_duplicates_for_disjoint_coverage() {
+    use crate::experts::host_records::Claim;
+
+    let steps = steps();
+    steps.begin_through(10);
+    // 1 group, 1 layer of 8 experts; VRAM = 2 non-lent slots, HostTier = 4 slots (non-covering).
+    let mut directory = Directory::new(&[2], &[0], &[8], HostTier::replay(vec![4]));
+    // 1. Land experts 0..4 into HostTier during prefill.
+    for expert in 0..4 {
+        let Claim::Taken(grant) = directory.claim_conveyed(0, expert, Some(1)) else {
+            panic!("free host slot for expert {expert}");
+        };
+        directory.landed(0, HostRecord(grant.record()), expert, Some(1));
+    }
+    assert_eq!(directory.alone(0), 4);
+
+    // 2. Seed top 2 experts (0, 1) into VRAM at step 1 (still Record::Placing before retire).
+    let routed = vec![(0, 10, 1), (1, 9, 1), (2, 1, 1), (3, 1, 1)];
+    let (seeds, evicted) = directory.seed(at(1, 0), ScratchGroup::at(1, 1), 0, &routed, &[], |_| true);
+    assert_eq!(seeds.len(), 2);
+    assert!(evicted.is_empty());
+    // Both seeded experts are immediately marked Kept::Banked (not Kept::Alone) even before retire!
+    assert_eq!(directory.alone(0), 2, "seeded experts must not remain Kept::Alone in HostTier");
+    // `claim_conveyed` rejects experts already placing into non-lent VRAM.
+    assert!(matches!(directory.claim_conveyed(0, 0, Some(1)), Claim::Short));
+
+    // 3. Surrender banked copies -> frees 2 HostTier slots for cold experts 4, 5!
+    let surrendered = directory.surrender_banked(&Unbegun::at(2));
+    assert_eq!(surrendered.len(), 2);
+    directory.retire_graces(at(2, 1), &steps);
+    for expert in 4..6 {
+        let Claim::Taken(grant) = directory.claim_conveyed(0, expert, Some(1)) else {
+            panic!("reclaimed host slot must accept cold expert {expert}");
+        };
+        directory.landed(0, HostRecord(grant.record()), expert, Some(1));
+    }
+
+    // 4. Retire seeds as committed -> VRAM holds {0, 1}, HostTier holds {2, 3, 4, 5}.
+    directory.retire(
+        at(2, 1),
+        |_, _| crate::experts::watcher::low_word(1),
+        |_| Ending::Ended,
+        &steps,
+    );
+    assert_eq!(directory.held_count(0), 2);
+    assert_eq!(directory.alone(0), 4);
+    for expert in 0..8 {
+        assert!(
+            !(directory.held(0, expert).is_some() && directory.in_tier(0, expert)),
+            "VRAM ∩ HostTier must be empty for expert {expert}"
+        );
+    }
+    let in_memory: usize = (0..8)
+        .filter(|&e| directory.held(0, e).is_some() || directory.in_tier(0, e))
+        .count();
+    assert_eq!(in_memory, 6, "disjoint tiers must achieve V + H = 6/8 in-memory coverage");
+
+    // 5. Tainted seed restores Kept::Banked -> Kept::Alone if not yet surrendered.
+    let mut tainted_dir = Directory::new(&[1], &[0], &[4], HostTier::replay(vec![2]));
+    let Claim::Taken(g) = tainted_dir.claim_conveyed(0, 0, Some(1)) else { panic!("host slot") };
+    tainted_dir.landed(0, HostRecord(g.record()), 0, Some(1));
+    let (seeds, _) = tainted_dir.seed(at(1, 0), ScratchGroup::at(1, 1), 0, &[(0, 5, 1)], &[], |_| true);
+    assert_eq!(seeds.len(), 1);
+    assert_eq!(tainted_dir.alone(0), 0, "marked Kept::Banked while placing");
+    tainted_dir.retire(at(2, 1), |_, _| 0, |_| Ending::Tainted, &steps);
+    assert_eq!(tainted_dir.held_count(0), 0, "tainted seed did not commit");
+    assert_eq!(tainted_dir.alone(0), 1, "tainted seed restores HostTier copy to Kept::Alone");
+}
+
+/// `replenish_demand_free` must never leak `Host::WritingBack` records when
+/// `WriteBack` pays: it releases the victim into `Record::Releasing` with its
+/// write-back queued, so `written_back` + `drain` move the victim cleanly to
+/// `HostTier` and free the VRAM slot with `VRAM ∩ HostTier == ∅`.
+#[test]
+fn replenish_demand_free_writes_back_victims_without_leaking_host_records() {
+    let steps = steps();
+    steps.begin_through(10);
+    // VRAM = 2 slots, HostTier = 3 slots (non-covering for 6 experts).
+    let mut directory = Directory::new(&[2], &[0], &[6], HostTier::replay(vec![3]));
+    directory.price_copies(0, Some(0.));
+    directory.price_write_backs(
+        0,
+        Some(WriteBack {
+            terms: magnitude_cost_model::Terms { compute: 0., drive: 4., link: 0., cpu: 0., memory: 0. },
+            drive: 1.,
+            link: 0.,
+        }),
+    );
+    // Land experts 0, 1 into HostTier and promote both into VRAM.
+    for expert in 0..2 {
+        let record = directory.land(0, expert, 0).unwrap();
+        directory.landed(0, record, expert, Some(1));
+    }
+    log(&directory, 2, 0, &[0, 1]);
+    let asked = directory.promote();
+    assert_eq!(asked.promotions.len(), 2);
+    for p in &asked.promotions {
+        directory.complete(p);
+    }
+    // Surrender both from HostTier so VRAM = {0, 1}, HostTier = {} (3 ready).
+    directory.surrender_banked(&Unbegun::at(3));
+    directory.retire_graces(at(3, 1), &steps);
+    assert_eq!(directory.held_count(0), 2);
+    assert_eq!(directory.alone(0), 0);
+    assert_eq!(directory.host(0).ready(), 3);
+
+    // Replenish 1 free VRAM slot while WriteBack pays -> must queue WriteBack, NOT leak!
+    let released = directory.replenish_demand_free(0, 1, &Unbegun::at(4), |_| true);
+    assert_eq!(released, 1);
+    let backs = directory.backs_queued();
+    assert_eq!(backs.len(), 1, "evicted hot victim must have its WriteBack queued");
+    let (group, bank_rec, (_, victim), _tier_rec) = backs[0];
+    directory.back_copy(group, bank_rec, 1);
+    directory.written_back(group, bank_rec, true);
+    directory.drain(at(4, 1), &steps);
+
+    assert_eq!(directory.held_count(0), 1);
+    assert_eq!(directory.alone(0), 1);
+    assert!(directory.in_tier(0, victim), "victim must now reside in HostTier");
+    assert!(directory.held(0, victim).is_none(), "victim must no longer be in VRAM");
+    assert_eq!(directory.host(0).ready(), 2, "zero leaked Host::WritingBack records");
+}
+
+/// On a non-covering `Placer::Tier` host tier, `claim_ahead` and
+/// `claim_carryover` must skip experts already held in non-lent VRAM so
+/// speculative NVMe prefetches never duplicate VRAM experts in `HostTier`.
+#[test]
+fn claim_ahead_and_carryover_skip_non_lent_vram_experts_on_non_covering_tier() {
+    use crate::experts::host_records::{Claim, Taking};
+
+    let steps = steps();
+    steps.begin_through(10);
+    let mut directory = Directory::new(&[2], &[0], &[6], HostTier::replay(vec![3]));
+    directory.price_copies(0, Some(0.));
+    let rec = directory.land(0, 0, 0).unwrap();
+    directory.landed(0, rec, 0, Some(1));
+    log(&directory, 2, 0, &[0]);
+    let asked = directory.promote();
+    assert_eq!(asked.promotions.len(), 1);
+    directory.complete(&asked.promotions[0]);
+    directory.surrender_banked(&Unbegun::at(3));
+    directory.retire_graces(at(3, 1), &steps);
+    assert!(directory.held(0, 0).is_some() && !directory.in_tier(0, 0));
+
+    assert!(matches!(directory.claim_ahead(0, 0, 0, Taking::Ahead, 4, 1.0), Claim::Short));
+    assert!(matches!(directory.claim_carryover(0, 0, 0, Taking::Ahead, 1.0), Claim::Short));
+    // Cold expert 1 (not in VRAM) is still admitted normally.
+    assert!(matches!(directory.claim_ahead(0, 1, 0, Taking::Ahead, 4, 1.0), Claim::Taken(_)));
+}
+
+/// `Directory::host_has_free_slot` is true iff the group's host tier has an
+/// empty ready record beyond its reserve (so `Scratch::land_conveyed` can fill
+/// unused host RAM without evicting any kept expert), becomes false once all
+/// non-reserve slots are occupied, and turns true again after surrendering a
+/// banked duplicate.
+#[test]
+fn host_has_free_slot_tracks_non_evicting_ready_headroom() {
+    use crate::experts::host_records::Claim;
+
+    let steps = steps();
+    steps.begin_through(10);
+    // HostTier = 3 total slots, reserve = 1 -> 2 non-evicting free slots.
+    let mut directory = Directory::new(&[1], &[0], &[6], HostTier::replay(vec![3]).reserving(1));
+    assert!(directory.host_has_free_slot(0), "2 non-reserve slots are ready");
+
+    let Claim::Taken(g0) = directory.claim_conveyed(0, 0, Some(1)) else { panic!("slot 0") };
+    directory.landed(0, HostRecord(g0.record()), 0, Some(1));
+    assert!(directory.host_has_free_slot(0), "1 non-reserve slot remains ready");
+
+    let Claim::Taken(g1) = directory.claim_conveyed(0, 1, Some(1)) else { panic!("slot 1") };
+    directory.landed(0, HostRecord(g1.record()), 1, Some(1));
+    assert!(!directory.host_has_free_slot(0), "only the 1 reserve slot remains; next landing would evict");
+
+    // Seed expert 0 into VRAM and surrender its duplicate HostTier slot -> free slot returns!
+    let (seeds, _) = directory.seed(at(1, 0), ScratchGroup::at(1, 1), 0, &[(0, 5, 1)], &[], |_| true);
+    assert_eq!(seeds.len(), 1);
+    assert_eq!(directory.surrender_banked(&Unbegun::at(2)).len(), 1);
+    directory.retire_graces(at(2, 1), &steps);
+    assert!(directory.host_has_free_slot(0), "surrendered duplicate restores non-evicting free slot");
+}

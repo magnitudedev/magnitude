@@ -919,6 +919,18 @@ impl Directory {
         self.tier(layer).claim((layer, expert), keep, taking, admit)
     }
 
+    /// Whether `(layer, expert)` is permanently held in or being placed into a
+    /// non-lent bank record (`!self.bank.lends(group, record)`) on `Placer::Tier`,
+    /// so a non-covering host tier must not duplicate it (`VRAM ⊥ HostTier`).
+    fn in_non_lent_bank(&self, layer: usize, expert: usize) -> bool {
+        if self.placer != crate::planning::Placer::Tier {
+            return false;
+        }
+        let group = self.bank.group(layer);
+        self.bank.held(layer, expert).is_some_and(|rec| !self.bank.lends(group, rec))
+            || self.bank.placing_non_lent((layer, expert))
+    }
+
     /// Claim a read-ahead landing of `layer`'s `expert` named for `step`
     /// with the ledger's probability `p` (design §3.7): [`Self::claim_landing`]
     /// with the candidate's rank from `Reuse::expected_with` (replacing
@@ -926,6 +938,9 @@ impl Directory {
     /// at the host records' move τ ([`outranking`]).
     pub fn claim_ahead(&mut self, layer: usize, expert: usize, keep: usize, taking: Taking, step: Step, p: f64) -> Claim {
         let (group, tier) = (self.bank.group(layer), self.host_tier());
+        if !self.host[group].covers() && self.in_non_lent_bank(layer, expert) {
+            return Claim::Short;
+        }
         let reuse = Reuse::of(&self.ranking);
         let candidate = reuse.rank_of(layer, expert, reuse.expected_with(layer, expert, tier, step, p));
         let ranker = reuse.ranker(group, tier, Reader::Move);
@@ -942,6 +957,9 @@ impl Directory {
             return Claim::Short;
         }
         let (group, tier) = (self.bank.group(layer), self.host_tier());
+        if !self.host[group].covers() && self.in_non_lent_bank(layer, expert) {
+            return Claim::Short;
+        }
         let reuse = Reuse::of(&self.ranking);
         let ranker = reuse.ranker(group, tier, Reader::Move);
         let candidate = store_rank(ranker, &self.prompt_reads)((layer, expert), None);
@@ -952,15 +970,25 @@ impl Directory {
         self.host[group].claim((layer, expert), keep, taking, admit)
     }
 
+    /// Whether `layer`'s group host tier has an empty ready record beyond its
+    /// reserve and cut-in pool (so a landing takes a free slot with zero eviction).
+    pub fn host_has_free_slot(&self, layer: usize) -> bool {
+        self.host(self.bank.group(layer)).has_free_slot()
+    }
+
     /// Claim a background host-tier landing for a cold expert read into the
     /// conveyor (`Scratch::land_conveyed`): admitted whenever the tier covers
-    /// every expert (`HostRecords::covers`); otherwise takes a free ready
-    /// record or displaces a kept record only when the expert outranks its
-    /// victim in the reuse ranking (beside `read` and pending prompt reads).
+    /// every expert (`HostRecords::covers`); otherwise skips experts already
+    /// held or placing in non-lent VRAM (`VRAM ⊥ HostTier`) and takes a free
+    /// ready record or displaces a kept record only when the expert outranks
+    /// its victim in the reuse ranking (beside `read` and pending prompt reads).
     pub fn claim_conveyed(&mut self, layer: usize, expert: usize, read: Option<Step>) -> Claim {
         let group = self.bank.group(layer);
         if self.host[group].covers() {
             return self.host[group].claim((layer, expert), 0, Taking::Out, (|_, _| (), |_, _| true));
+        }
+        if self.in_non_lent_bank(layer, expert) {
+            return Claim::Short;
         }
         let tier = self.host_tier();
         let reuse = Reuse::of(&self.ranking);
@@ -1161,9 +1189,10 @@ impl Directory {
     /// fills the record its claim took), a written write-back's among them
     /// ([`Self::written_back`]).
     pub fn landed(&mut self, layer: usize, HostRecord(record): HostRecord, expert: usize, read: Option<Step>) {
-        let kept = match self.bank.held(layer, expert) {
-            Some(_) => Kept::Banked,
-            None => Kept::Alone,
+        let kept = if self.in_non_lent_bank(layer, expert) {
+            Kept::Banked
+        } else {
+            Kept::Alone
         };
         self.tier(layer).landed(record, (layer, expert), read, kept);
         let (group, tier) = (self.bank.group(layer), self.host_tier());
@@ -1355,6 +1384,19 @@ impl Directory {
     /// the records a promotion may take cover a want
     /// ([`BankRecords::covering`]). Neither ever takes a lent record, the
     /// scratch's ([`BankRecords::usable`]).
+    /// Surrender every unheld `Kept::Banked` host-tier record across all groups
+    /// (`HostRecords::surrender_records`), returning the `(group, tier_record)`
+    /// pairs whose source generations must be bumped in `ExpertTransport`.
+    pub fn surrender_banked(&mut self, at: &Unbegun) -> Vec<(usize, usize)> {
+        let mut surrendered = Vec::new();
+        for (group, host) in self.host.iter_mut().enumerate() {
+            for (record, _) in host.surrender_records(at) {
+                surrendered.push((group, record as usize));
+            }
+        }
+        surrendered
+    }
+
     pub fn promotions(&mut self, at: &Unbegun, budget: usize) -> Wants {
         self.promotions_with(at, budget, |_, _| true)
     }
@@ -1371,12 +1413,10 @@ impl Directory {
     ) -> Wants {
         // The tier gives up what the bank holds now: its records ready for
         // other experts once no step may still read them.
-        let mut asked = Wants::default();
-        for (group, host) in self.host.iter_mut().enumerate() {
-            for (record, _) in host.surrender_records(at) {
-                asked.surrendered.push((group, record as usize));
-            }
-        }
+        let mut asked = Wants {
+            surrendered: self.surrender_banked(at),
+            ..Wants::default()
+        };
         self.settle_changes();
         // Promotion runs only for decode steps (design §3.2): before the
         // first, no τ exists. What stirred stays stirred until then.
@@ -1686,9 +1726,10 @@ impl Directory {
     pub fn written_back(&mut self, group: usize, record: BankRecord, written: bool) {
         let Back { staged: (layer, expert), tier: HostRecord(tier), .. } = self.bank.backed(group, record);
         let (grant, read) = self.backs.remove(&(group, record.index())).expect("a write-back holds its landing's grant");
-        let kept = match self.bank.held(layer, expert) {
-            Some(_) => Kept::Banked,
-            None => Kept::Alone,
+        let kept = if self.in_non_lent_bank(layer, expert) {
+            Kept::Banked
+        } else {
+            Kept::Alone
         };
         if self.tier(layer).written_back(tier, (layer, expert), read, kept, written) {
             grant.map();
@@ -2045,11 +2086,6 @@ impl Directory {
                 break;
             }
             let exit = self.exit_now(group, record, staged);
-            // Skip victims that require a write-back copy into HostTier;
-            // demand replenishment only needs fast stamped-unmap releases.
-            if exit.back().is_some() {
-                continue;
-            }
             self.bank.release(group, BankRecord(record as u32), at.into(), exit);
             self.left_bank(layer, expert, None);
             released += 1;
@@ -2632,8 +2668,14 @@ impl Directory {
             crate::planning::Placer::Tier => self.bank.retire_fills(progress, commit, ending, steps),
         };
         for (group, (layer, expert), committed) in retired {
-            if committed && self.placer == crate::planning::Placer::Tier {
-                self.host[group].banked((layer, expert));
+            if self.placer == crate::planning::Placer::Tier {
+                if committed {
+                    if self.bank.held(layer, expert).is_some_and(|rec| !self.bank.lends(group, rec)) {
+                        self.host[group].banked((layer, expert));
+                    }
+                } else {
+                    self.host[group].evicted((layer, expert), None);
+                }
             }
             self.resettle(layer, expert);
         }
@@ -2786,6 +2828,9 @@ impl Directory {
             let held = held.map(|(held, _)| held);
             let victim = self.bank.fill(point, scratch_group, (layer, expert), record, exit);
             assert_eq!(victim, held.map(|held| (held.layer, held.expert)), "a seed evicts what its record holds");
+            if self.placer == crate::planning::Placer::Tier && !self.bank.lends(group, record.index()) {
+                self.host[group].banked((layer, expert));
+            }
             self.record_eviction(&mut evicted, held.map(|Ranked { rank, layer, expert }| ((layer, expert), rank.last())));
             self.resettle(layer, expert);
             records.push(record);

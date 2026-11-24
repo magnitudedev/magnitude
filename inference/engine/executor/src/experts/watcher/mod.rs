@@ -1185,10 +1185,16 @@ impl Watcher {
             }
         });
         if promoted_any {
+            let surrendered = steps.unbegun(|at| directory.surrender_banked(at));
+            for (group, tier_record) in surrendered {
+                transport.bump_source_generation(group, tier_record);
+            }
+            directory.retire_graces(progress, steps);
             held.publish_held();
             if landed_at_home {
                 held.publish_policy();
             }
+            self.shared.events().notify();
         }
     }
 }

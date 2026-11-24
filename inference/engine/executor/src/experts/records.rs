@@ -356,6 +356,22 @@ impl BankRecords {
         self.placing.contains(&staged)
     }
 
+    /// Whether `staged` is currently being placed into a non-lent record
+    /// (`!self.lends(group, record)`) by a prompt seed or permanent promotion.
+    pub fn placing_non_lent(&self, staged: Staged) -> bool {
+        if !self.placing.contains(&staged) {
+            return false;
+        }
+        let group = self.group(staged.0);
+        self.groups[group].contents.iter().enumerate().any(|(record, content)| {
+            !self.lends(group, record)
+                && matches!(
+                    *content,
+                    Record::Filling(s, _) | Record::Promoting(s, _) if s == staged
+                )
+        })
+    }
+
     /// Group `group`'s records.
     pub fn records(&self, group: usize) -> &[Record] {
         &self.groups[group].contents

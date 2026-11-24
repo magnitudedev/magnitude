@@ -278,7 +278,7 @@ impl LinkMover {
             }
         }
         if !pause_promote {
-            moved |= self.ask(core, shared, copier, &copy);
+            moved |= self.ask(core, shared, copier, &copy, progress);
             let mut queued = core.directory.queued();
             queued.retain(|&(group, record, (layer, expert))| {
                 let kept = !(lending && core.directory.bank_lends(group, record.index()))
@@ -557,7 +557,7 @@ impl LinkMover {
 
     /// Ask the ranking for permanent promotions up to remaining permanent
     /// copy-engine headroom (excluding in-flight opportunistic `Stage` copies).
-    fn ask(&mut self, core: &mut Core, shared: &Shared, copier: &Copier, copy: &TierCopyCosts) -> bool {
+    fn ask(&mut self, core: &mut Core, shared: &Shared, copier: &Copier, copy: &TierCopyCosts, progress: Point) -> bool {
         if core.extents.tier_copy_dma && core.steps.prompt_running() {
             return false;
         }
@@ -591,8 +591,11 @@ impl LinkMover {
         for &(group, tier_record) in &asked.surrendered {
             shared.transport.bump_source_generation(group, tier_record);
         }
+        if !asked.surrendered.is_empty() {
+            directory.retire_graces(progress, &core.steps);
+        }
         shared.promoted.store(directory.asked(), std::sync::atomic::Ordering::Relaxed);
-        !asked.promotions.is_empty() || !asked.releases.is_empty()
+        !asked.promotions.is_empty() || !asked.releases.is_empty() || !asked.surrendered.is_empty()
     }
 }
 

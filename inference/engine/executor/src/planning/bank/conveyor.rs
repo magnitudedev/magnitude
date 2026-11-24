@@ -312,15 +312,16 @@ impl ExpertBankPlan {
     /// How the host tier is held on the device (`platform::host_tier`): a
     /// bank streams only beside one, so a device without one holds its
     /// experts resident or is refused (`UnstreamedExperts::Untiered`), and
-    /// every bank has a store its conveyor lies in. The tier is every miss's first store,
-    /// inclusive of the bank, in the bank's own form: each group's record
-    /// tensors again, resident as the device holds them, in the tier's own
-    /// granule pool for every expert of the group's layers
-    /// ([`Self::host_extent`]) and committed by host slots
-    /// ([`Self::host_records`]), so the host lands file misses into it and
-    /// the device reads it in place; where it lies across a link the host
-    /// also promotes from it by a pure copy on the copy engine
-    /// (`watcher::promotions`), and nothing is written back.
+    /// every bank has a store its conveyor lies in. The tier is every miss's
+    /// first store, in the bank's own form: each group's record tensors again,
+    /// resident as the device holds them, in the tier's own granule pool for
+    /// every expert of the group's layers ([`Self::host_extent`]) and committed
+    /// by host slots ([`Self::host_records`]), so the host lands file misses
+    /// into it and the device reads it in place; where it lies across a link
+    /// the host promotes from it by a pure copy on the copy engine
+    /// (`watcher::link`), surrendering non-lent copies so the tiers hold
+    /// disjoint sets (`VRAM ⊥ HostTier`) and writing evicted experts back when
+    /// that pays (`Directory::exit`).
     pub fn host(&self) -> HostTier {
         self.structured.host
     }

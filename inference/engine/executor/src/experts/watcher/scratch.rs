@@ -1714,9 +1714,11 @@ impl Scratch {
     /// expert, conveyor record), into the host tier from their conveyor
     /// records, beside a discrete device (where the device places): a
     /// prompt group's read is a background landing when free conveyor records
-    /// strictly exceed the drive's measured knee (`knee_records`) and the
-    /// tier covers all experts or the expert outranks its victim in the reuse
-    /// ranking (`Directory::claim_conveyed`). Runs at background priority
+    /// strictly exceed the drive's measured knee (`knee_records`), OR when the
+    /// conveyor itself exceeds the knee and the host tier still has empty ready
+    /// slots beyond its reserve (`Directory::host_has_free_slot`) so filling
+    /// unused RAM requires zero eviction, and the tier admits it
+    /// (`Directory::claim_conveyed`). Runs at background priority
     /// (`Urgency::ahead`) and is cancellable if the conveyor needs the record
     /// or the prompt group ends. On the one store nothing lands from the
     /// conveyor: the group's last step seeds the store from the scratch slots
@@ -1744,11 +1746,12 @@ impl Scratch {
             landed
         };
         let knee = core.table.source().knee();
+        let total_conveyor = self.conveyor.records();
         for (layer, expert, record) in candidates {
             if !async_dma {
                 let knee_records = knee.div_ceil(core.layers[layer].expert_bytes()) as usize;
                 let free = self.conveyor.free_conveyor(layer, |r| Self::admits_conveyor(&self.conveyor, core, layer, r)).len();
-                if free <= knee_records {
+                if free <= knee_records && !(total_conveyor > knee_records && core.directory.host_has_free_slot(layer)) {
                     continue;
                 }
             }
