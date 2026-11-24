@@ -235,6 +235,6 @@ export const summarizeInferenceHardware = (
     cpuModel: Option.flatMap(hardware.cpu_model, Option.fromNullable).pipe(Option.filter(model => model.trim().length > 0)),
     cpuPoolCores: hardware.cpu_pool_cores,
     logicalCpus: hardware.logical_cpus,
-    memoryBytes: hardware.host_ram.store.total_capacity_bytes,
+    memoryBytes: hardware.host_ram.store.allocation_capacity_bytes,
   } satisfies AcnHardwareSummary
 })

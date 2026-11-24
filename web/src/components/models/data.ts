@@ -268,7 +268,7 @@ export const offeredFromRecommendation = (recommendation: RecommendedModel, mode
     fineTuneOf: null,
     drafter: drafter ? { method: methodName[drafter.method._tag], sizeBytes: drafter.sizeBytes } : null,
     contextLimit: assessment?._tag === "Fits" ? assessment.profile.contextLength : null,
-    quants: ladderOf(rungs.map(model => ({ ...quantOf(model, memory), drafterBytes: model._tag === "Catalog" && !model.drafterWithheld ? drafter?.sizeBytes ?? 0 : 0, missingDiskBytes: missingDiskBytes(model, freeDiskBytes) }))),
+    quants: ladderOf(rungs.map(model => ({ ...quantOf(model, memory), drafterBytes: model._tag === "Catalog" && !model.drafterWithheld ? drafter?.sizeBytes ?? 0 : 0, drafterWithheld: model._tag === "Catalog" && model.drafterWithheld, missingDiskBytes: missingDiskBytes(model, freeDiskBytes) }))),
     recommended: Option.getOrNull(recommendation.chosen),
     checking: false,
   }

@@ -22,6 +22,7 @@ export interface QuantView {
   readonly sizeBytes: number
   readonly downloadBytes: number
   readonly drafterBytes: number
+  readonly drafterWithheld?: boolean
   readonly drafterTarget: DrafterTarget | null
   readonly fits: boolean
   readonly measuring: boolean

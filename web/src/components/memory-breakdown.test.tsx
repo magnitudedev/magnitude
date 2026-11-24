@@ -77,10 +77,25 @@ it("matches MachineCard hardware capacity units for GPU and RAM totals", () => {
   const statusHtml = renderToStaticMarkup(<MemoryFigures allocation={Option.some(splitAllocation)} hardware={Option.some(hw)} />)
   expect(machineHtml).toContain(">8.5 GB<")
   expect(machineHtml).toContain(">32 GB<")
+  expect(machineHtml).toContain("Test GPU")
   expect(statusHtml).toContain("8.5 GB total")
   expect(statusHtml).toContain("32 GB total")
   expect(statusHtml).not.toContain("9.1 GB total")
   expect(statusHtml).not.toContain("34.4 GB total")
+
+  const unnamed = renderToStaticMarkup(<MachineCard machine={{
+    name: "AMD Ryzen 9 9950X",
+    chip: "AMD Ryzen 9 9950X",
+    photo: null,
+    unifiedMemoryBytes: null,
+    gpus: [{ name: "NVIDIA GeForce RTX 5090", memoryBytes: 32 * GiB }],
+    servingGpu: 0,
+    ramBytes: 64 * GiB,
+    freeDiskBytes: 200 * GiB,
+  }} />)
+  expect(unnamed).not.toContain("AMD Ryzen 9 9950X</span>")
+  expect(unnamed).not.toContain("· AMD Ryzen 9 9950X")
+  expect(unnamed).toContain("NVIDIA GeForce RTX 5090")
 })
 
 it("renders a single compact streaming residency row for streamed models and nothing for resident models", () => {

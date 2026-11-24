@@ -134,6 +134,9 @@ it("summarizes the serving device and counts one GPU across backend views", () =
     snapshot({ physical_devices: [gpu], selected_executor: "cuda:0", access_paths: paths, cpu_pool_cores: 8, logical_cpus: 16 }), none))
   expect(summary).toMatchObject({ backend: "cuda", gpuName: Option.some("Test GPU"), gpuKind: Option.some("integrated"),
     gpuCount: 1, gpuMemoryBytes: Option.some(64), cpuPoolCores: 8, logicalCpus: 16, memoryBytes: 64 })
+  const limited = Effect.runSync(summarizeInferenceHardware(
+    snapshot({ host_ram: { ...host, store: { ...host.store, total_capacity_bytes: 512, allocation_capacity_bytes: 128 } } }), none))
+  expect(limited.memoryBytes).toBe(128)
 })
 it("names a resident model's device, and otherwise the serving device", () => {
   const discrete = { id: "physical-dgpu", kind: "gpu", executors: [{ ...executor("cuda:1", "cuda", [2]), name: "Discrete GPU" }] }

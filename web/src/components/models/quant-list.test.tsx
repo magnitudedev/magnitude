@@ -103,4 +103,44 @@ describe("visibleLadderRungs", () => {
     expect(ladderHtml).toContain("CUSTOM")
     expect(barHtml).toContain("How this model runs on your machine")
   })
+
+  it("hides the catalog drafter badge when the chosen quant withholds its drafter", () => {
+    const withheld: QuantView = {
+      key: "qwen3.5-4b:gguf:q6",
+      bits: 6,
+      publisher: "unsloth",
+      name: "UD-Q6_K_XL",
+      repository: "unsloth/Qwen3.5-4B-MTP-GGUF",
+      sizeBytes: 4_940_000_000,
+      downloadBytes: 4_940_000_000,
+      drafterBytes: 0,
+      drafterWithheld: true,
+      drafterTarget: null,
+      fits: true,
+      measuring: false,
+      speed: 11,
+      phrase: "Fits in memory",
+      placement: [{ kind: "Unified", bytes: 4_940_000_000 }],
+      servedContext: 262_144,
+      quality: null,
+      missingDiskBytes: 0,
+    }
+    const offered: OfferedModel = {
+      key: "qwen3.5-4b",
+      catalog: true,
+      name: "Qwen3.5 4B",
+      lab: undefined,
+      country: "CN",
+      fineTuneOf: null,
+      drafter: { method: "DFlash", sizeBytes: 1_100_000_000 },
+      contextLimit: 262_144,
+      quants: [withheld],
+      recommended: withheld.key,
+      checking: false,
+    }
+    const html = renderToStaticMarkup(
+      <ExpandingModel model={offered} expanded={false} onToggle={() => {}} quantChoice={null} onQuantChoice={() => {}} owned={new Set()} />,
+    )
+    expect(html).not.toContain("DFlash")
+  })
 })

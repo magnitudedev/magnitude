@@ -235,12 +235,14 @@ export function MachineStrip({ machine, formFactor }: { machine: MachineView; fo
     ...(machine.unifiedMemoryBytes === null ? [{ icon: MemoryIcon, value: formatMemoryCapacity(machine.ramBytes), label: "RAM" }] : []),
     ...(machine.freeDiskBytes !== null ? [{ icon: HardDrivesIcon, value: formatStorageSize(machine.freeDiskBytes), label: "free disk" }] : []),
   ]
+  const chipDetail = machine.chip && machine.chip !== machine.name ? machine.chip : null
+  const subtitle = several ? `${machine.gpus.length} GPUs` : chipDetail
   return <div aria-label={`Your machine: ${machine.name}`} className="mb-5 flex flex-wrap items-center gap-x-5 gap-y-1.5 text-xs text-slate-500">
     <span className="inline-flex min-w-0 items-center gap-1.5">
       <DeviceIcon aria-hidden="true" className="size-3.5 shrink-0 text-slate-400 dark:text-slate-500" />
       <span>Your machine:</span>
       <span className="truncate font-medium text-slate-700 dark:text-slate-200">{machine.name}</span>
-      {(several || machine.chip) && <span className="truncate text-slate-500">{several ? `${machine.gpus.length} GPUs` : machine.chip}</span>}
+      {subtitle && <span className="truncate text-slate-500">{subtitle}</span>}
     </span>
     {specs.map(spec => <span key={spec.label} className="inline-flex items-center gap-1.5 whitespace-nowrap tabular-nums">
       <spec.icon aria-hidden="true" className="size-3.5 shrink-0 text-slate-400 dark:text-slate-500" />
@@ -254,9 +256,11 @@ export function MachineStrip({ machine, formFactor }: { machine: MachineView; fo
 export function MachineCard({ machine }: { machine: MachineView }) {
   const gpu = machine.gpus[machine.servingGpu]
   const several = machine.gpus.length > 1
+  const chipDetail = machine.chip && machine.chip !== machine.name ? machine.chip : null
+  const subtitle = several ? `${machine.gpus.length} GPUs` : chipDetail
   const parts = [
     ...(machine.unifiedMemoryBytes !== null ? [{ icon: MemoryIcon, name: "Memory", value: formatMemoryCapacity(machine.unifiedMemoryBytes), note: null }] : []),
-    ...(machine.unifiedMemoryBytes === null && gpu ? [{ icon: GraphicsCardIcon, name: "GPU memory", value: formatMemoryCapacity(gpu.memoryBytes), note: several ? `GPU ${machine.servingGpu + 1} · ${gpu.name}` : null }] : []),
+    ...(machine.unifiedMemoryBytes === null && gpu ? [{ icon: GraphicsCardIcon, name: "GPU memory", value: formatMemoryCapacity(gpu.memoryBytes), note: several ? `GPU ${machine.servingGpu + 1} · ${gpu.name}` : gpu.name }] : []),
     ...(machine.unifiedMemoryBytes === null ? [{ icon: MemoryIcon, name: "RAM", value: formatMemoryCapacity(machine.ramBytes), note: null }] : []),
     ...(machine.freeDiskBytes !== null ? [{ icon: HardDrivesIcon, name: "Free disk", value: formatStorageSize(machine.freeDiskBytes), note: null }] : []),
   ]
@@ -264,7 +268,7 @@ export function MachineCard({ machine }: { machine: MachineView }) {
     {machine.photo && <MachinePhoto photo={machine.photo} />}
     <div className="min-w-56 flex-1">
       <h2 className="font-heading text-base font-semibold">Your machine</h2>
-      <p className="truncate text-[14px] text-slate-700 dark:text-slate-300">{machine.name}{(several || machine.chip) && <span className="text-slate-500"> · {several ? `${machine.gpus.length} GPUs` : machine.chip}</span>}</p>
+      <p className="truncate text-[14px] text-slate-700 dark:text-slate-300">{machine.name}{subtitle && <span className="text-slate-500"> · {subtitle}</span>}</p>
       {several && <p className="mt-0.5 text-xs text-slate-500">{machine.gpus.map(entry => entry.name).join(" + ")} · models run on GPU {machine.servingGpu + 1}</p>}
     </div>
     <div className={cn("grid shrink-0 items-start gap-8", parts.length >= 3 ? "grid-cols-3" : "grid-cols-2")}>
