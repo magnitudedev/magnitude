@@ -2361,3 +2361,309 @@ fn async_dma_delayed_layer_reader_preserves_window_table_and_held_bank_payload_a
         panic!("watchdog tripped during Design B delayed reader test:\n{report}");
     }
 }
+
+/// Regression test: in a multi-step `tier_copy_dma` prompt group where
+/// `stateless_tail` skips trailing steps at streamed layers (so Layer 0 only
+/// publishes and serves `place 0` out of 4 steps: `taken = 1, served = 1/4`),
+/// `Scratch::can_arrive_async(layer = 1, ...)` MUST:
+///   1. allow Layer 1 `place 0` to arrive once every *taken* place of Layer 0
+///      is served (`all_taken_served`), without deadlocking on skipped places, and
+///   2. still block Layer 1 whenever Layer 0 has a taken-but-unserved place
+///      (preserving `ScratchRing` layer-order anti-inversion).
+#[test]
+fn tier_copy_dma_stateless_tail_partial_group_does_not_deadlock_next_layer() {
+    use crate::experts::copies::Copies;
+    use crate::experts::transport::{ExpertTransport, PassKey, PassReaderEvent, ReaderId};
+
+    const LAYERS: usize = 2;
+    const EXP: usize = 6;
+    const PLACES: usize = 4;
+    const BANK_RECS: u64 = 2;
+    const TIER_RECS: u32 = 12;
+    const CONVEYOR_RECS: u64 = 4;
+    const STAGING: u32 = 4;
+    const RECORD: u64 = 16;
+    const ROUND_RECORDS: u64 = 4;
+
+    let _alone = alone();
+    let device = cpu();
+    let charges = seismic::Charges::tally(&device);
+    let words = |count: u64, initial| cpu_words(&device, count, initial);
+    let file = std::env::temp_dir().join(format!(
+        "expert-watcher-stateless-tail-partial-group-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos(),
+    ));
+    let bytes: Vec<u8> = (0..3usize)
+        .flat_map(|kind| (0..EXP).flat_map(move |expert| [(50 * kind + expert + 1) as u8; RECORD as usize]))
+        .collect();
+    std::fs::write(&file, &bytes).unwrap();
+
+    let region_words = RegionWords {
+        choices: 4,
+        rounds: 4,
+        flight: crate::FlightDepth::PIPELINED.steps(PLACES as u64),
+        sites: crate::FlightDepth::PIPELINED.steps(1),
+    };
+    let steps = Arc::new(Steps::new(
+        crate::FlightDepth::PIPELINED,
+        PLACES as u64,
+        crate::experts::exchange::Pulse::driven(),
+    ));
+    let transport = ExpertTransport::new_registry_only();
+    let copies = Copies::with_transport(
+        seismic::Transfer::new(&device).unwrap(),
+        steps.events().clone(),
+        transport.clone(),
+    );
+
+    let lent = CONVEYOR_RECS as usize;
+    let tier_total = TIER_RECS + lent as u32;
+    let shared_rows = |records: u64| Tensor::shared(&charges, Element::i32(), &[records, RECORD / 4]).unwrap();
+
+    let tier_backing: Vec<Tensor> = (0..3).map(|_| shared_rows(u64::from(tier_total))).collect();
+    let bank_backing: Vec<Tensor> = (0..3).map(|_| shared_rows(BANK_RECS)).collect();
+    let scratch_backing: Vec<Tensor> = (0..3).map(|_| shared_rows(EXP as u64)).collect();
+    let staging = Tensor::shared(&charges, Element::i32(), &[u64::from(STAGING) * 3 * 4]).unwrap();
+    let conveyor = Tensor::shared(&charges, Element::i32(), &[CONVEYOR_RECS * 3 * 4]).unwrap();
+
+    let rows_of = |tensor: &Tensor, count: u64| -> Vec<Option<Tensor>> {
+        (0..count).map(|r| Some(tensor.slice_leading(r, r + 1).unwrap())).collect()
+    };
+    let view = |tensor: &Tensor, kind: u64, records: u64| {
+        let v = tensor.region(Element::i32(), &[records, RECORD / 4], kind * records * RECORD).unwrap();
+        Records::rows(&v, RECORD, records).unwrap()
+    };
+
+    let tier_tensors: Vec<TierTensor> = tier_backing
+        .iter()
+        .map(|t| {
+            let recs = Records::new(rows_of(t, u64::from(tier_total)), RECORD).unwrap();
+            TierTensor::new(recs, Element::i32(), Element::i32(), [1, RECORD / 4], RECORD).unwrap()
+        })
+        .collect();
+    let bank_views: Vec<Records> = bank_backing
+        .iter()
+        .map(|t| Records::new(rows_of(t, BANK_RECS), RECORD).unwrap())
+        .collect();
+    let pools: Vec<Pool> = (0..3)
+        .map(|kind| Pool { staging: view(&staging, kind, u64::from(STAGING)) })
+        .collect();
+    let conveyor_pools: Vec<Records> = (0..3).map(|kind| view(&conveyor, kind, CONVEYOR_RECS)).collect();
+    let carrier = Carrier {
+        records: CONVEYOR_RECS as usize,
+        slots: 0,
+        lending: Lending {
+            group: 0,
+            pools: conveyor_pools
+                .iter()
+                .map(|pool| LentPool { record: RECORD, offset: 0, conveyor: pool.bytes() })
+                .collect(),
+            scratch: Vec::new(),
+        },
+        pools: conveyor_pools,
+    };
+
+    let maps: Vec<StampedMap> = (0..LAYERS)
+        .map(|_| StampedMap::new(words(EXP as u64 * constants::MAP_WORDS, 0)))
+        .collect();
+    let tier_maps: Vec<Words> = (0..LAYERS).map(|_| words(EXP as u64, -1)).collect();
+    let scratch_tables: Vec<ExchangeTable> = (0..LAYERS)
+        .map(|_| ExchangeTable::new(Words::aligned_cpu_tensor(&device, region_words.scratch().words()), region_words.scratch(), steps.pulse()).unwrap())
+        .collect();
+    let file_tables: Vec<ExchangeTable> = (0..LAYERS)
+        .map(|_| ExchangeTable::new(Words::aligned_cpu_tensor(&device, region_words.file().words()), region_words.file(), steps.pulse()).unwrap())
+        .collect();
+    let layer_windows: Vec<Vec<Words>> = (0..LAYERS)
+        .map(|_| vec![words(EXP as u64, -2)])
+        .collect();
+    let flags: Vec<Words> = (0..PLACES).map(|_| words(EXP as u64, 0)).collect();
+    let reads: Vec<Words> = (0..LAYERS)
+        .map(|_| words(region_words.flight * EXP as u64, 0))
+        .collect();
+    let commits = words(BANK_RECS, 0);
+
+    let stored_tensor = |kind: usize| StoredTensor {
+        parts: vec![StoredPart { file: 0, base: kind as u64 * EXP as u64 * RECORD, pitch: RECORD, bytes: RECORD }],
+        pool: kind,
+    };
+
+    let layers: Vec<Layer> = (0..LAYERS)
+        .map(|index| {
+            let round_bounds = ListBounds { from: CONVEYOR_RECS, to: EXP as u64, lent: 0 };
+            Layer {
+                group: 0,
+                draft: false,
+                experts: EXP,
+                layer_window: EXP,
+                map: maps[index].view().clone(),
+                file: file_tables[index].clone(),
+                scratch: scratch_tables[index].clone(),
+                routing: words(region_words.flight * region_words.routing_words(), 0),
+                keys: words(region_words.flight * constants::VERIFY_ROWS * EXP as u64, 0),
+                policy: words(constants::POLICY_WORDS, 0),
+                front: words(region_words.ring_words(), 0),
+                site: None,
+                stored: (0..3).map(stored_tensor).collect(),
+                slots: None,
+                scratch_tensors: Some(scratch_backing.clone()),
+                scratch_form: vec![1, 1, 1],
+                landing: None,
+                rounds: (0..region_words.rounds)
+                    .map(|_| LandingList::new(words(constants::LANDING_ENTRY(ROUND_RECORDS), 0), round_bounds))
+                    .collect(),
+                lists: ListRecords { bank: BANK_RECS, tier: u64::from(tier_total) },
+                tiered: words(constants::LIST_ENTRY(EXP as u64), 0),
+                seeds: words(constants::LIST_ENTRY(EXP as u64), 0),
+                windows: layer_windows[index].clone(),
+            }
+        })
+        .collect();
+
+    let placement = crate::experts::directory::Placement::Tier {
+        bank_maps: maps,
+        tier_maps: tier_maps.iter().map(|w| LandingMap::Tier(w.clone())).collect(),
+        lent: (0, 0),
+        stage_slots: vec![0],
+    };
+
+    let tripped = Arc::new(Mutex::new(None::<String>));
+    let tripped_cb = tripped.clone();
+    let watcher = Watcher::start_with_bounds(
+        WatcherParts {
+            layers,
+            group_reads: reads.iter().map(|r| PlacedLayerWords { group_reads: r.clone(), stride: EXP }).collect(),
+            groups: vec![Group {
+                commits: commits.clone(),
+                tier: Some(tier_tensors),
+                bank: bank_views,
+                records: BANK_RECS as usize,
+            }],
+            load: LoadWords { flags: flags.clone() },
+            pools,
+            extents: Extents {
+                widest: EXP,
+                windows: 1,
+                window_rounds: region_words.rounds,
+                pass_launches: PLACES,
+                round_records: ROUND_RECORDS as usize,
+                words: region_words,
+                selected: 2,
+                decode_rows: 1,
+                demand: region_words.choices as usize,
+                placer: Placer::Tier,
+                tier_copy_dma: true,
+                recording: false,
+            },
+            slots: Arc::new(std::sync::atomic::AtomicU64::new(1)),
+            host_slots: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            whole: false,
+            staging: STAGING,
+            host: crate::experts::directory::HostTier {
+                records: vec![tier_total],
+                lent: vec![lent as u32],
+                reserve: STAGING as usize,
+                placement,
+            },
+            carrier,
+            source: ExpertSource::open(std::slice::from_ref(&file), &seismic_io::Urgent { parts: vec![RECORD], records: 1 }).unwrap(),
+            compute: crate::experts::HostCompute::start(Vec::new(), &crate::experts::ComputeThreads::unplaced(vec![vec![0, 1]])).unwrap(),
+            copier: Some(super::Copier { copies: copies.clone() }),
+            steps: steps.clone(),
+            spans: false,
+            line: None,
+            transport: transport.clone(),
+            trip: Box::new(move |report: String| {
+                *tripped_cb.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = Some(report);
+            }),
+        },
+        Box::new(|| crate::experts::exchange::Bounds {
+            lane: crate::experts::exchange::Bound {
+                limit: Duration::from_secs(3),
+                derivation: "stateless_tail partial group test".into(),
+            },
+            volumes: crate::watched::VolumeBound(None),
+        }),
+    )
+    .unwrap();
+
+    // Start a 4-step prompt group (`sets = 2`: `0..1` and `1..4`), matching
+    // `stateless_tail` where ONLY `place 0` executes Layer 0 and Layer 1 while
+    // `places 1..4` stop earlier and never publish `SCRATCH_ASK`.
+    let group = begin(watcher.shared(), &[StepRoute::Grouped; PLACES], true).unwrap();
+    let seq0 = group[0].sequence();
+
+    // Layer 0, place 0 routes cold experts 0, 1.
+    for e in 0..EXP {
+        flags[0].store(e, if e < 2 { 1 } else { 0 });
+    }
+    scratch_tables[0].request(seq0, constants::SCRATCH_ASK);
+    watcher.shared().events().notify();
+
+    // Layer 0, place 0 completes (`taken = 1, served = 1/4`).
+    let ready0 = transport.take_prefill_sync(0, seq0, 0).expect("Layer 0 place 0 completes");
+    let key0 = PassKey { generation: ready0.generation, group: seq0, layer: 0, set_start: 0, window: 0 };
+    {
+        let mut state = residency::lock(&watcher.state);
+        assert!(
+            state.scratch.can_arrive_async(1, seq0, 0),
+            "Layer 1 must be allowed to arrive once Layer 0's taken places are all served"
+        );
+        let crate::experts::watcher::residency::Residency { scratch, core, .. } = &mut *state;
+        scratch.release_passes(
+            &[
+                PassReaderEvent::Registered { key: key0, reader: ReaderId(1) },
+                PassReaderEvent::Closed { key: key0 },
+                PassReaderEvent::Retired { key: key0, reader: ReaderId(1) },
+            ],
+            core,
+        );
+    }
+    watcher.shared().events().notify();
+
+    // Now Layer 1, place 0 publishes `SCRATCH_ASK` while Layer 0 still has
+    // `taken = 1, served = 1/4` (`places 1..4` skipped by `stateless_tail`).
+    // Previously `can_arrive_async(1, seq0, 0)` checked `!earlier.all_served()`
+    // (`1 < 4`) and deadlocked `take_prefill_sync(1, seq0, 0)` forever.
+    for e in 0..EXP {
+        flags[0].store(e, if e == 2 || e == 3 { 1 } else { 0 });
+    }
+    scratch_tables[1].request(seq0, constants::SCRATCH_ASK);
+    watcher.shared().events().notify();
+
+    let ready1 = transport
+        .take_prefill_sync(1, seq0, 0)
+        .expect("Layer 1 place 0 must not deadlock when Layer 0's taken places are all served");
+    let key1 = PassKey { generation: ready1.generation, group: seq0, layer: 1, set_start: 0, window: 0 };
+    {
+        let mut state = residency::lock(&watcher.state);
+        let crate::experts::watcher::residency::Residency { scratch, core, .. } = &mut *state;
+        scratch.release_passes(
+            &[
+                PassReaderEvent::Registered { key: key1, reader: ReaderId(2) },
+                PassReaderEvent::Closed { key: key1 },
+                PassReaderEvent::Retired { key: key1, reader: ReaderId(2) },
+            ],
+            core,
+        );
+    }
+    watcher.shared().events().notify();
+
+    for step in group {
+        step.complete().unwrap();
+    }
+    eventually("group did not retire", || {
+        let state = residency::lock(&watcher.state);
+        state.scratch.conveyor.serving.is_none()
+    });
+
+    drop(watcher);
+    let _ = std::fs::remove_file(&file);
+    let report = tripped.lock().unwrap_or_else(std::sync::PoisonError::into_inner).take();
+    if let Some(report) = report {
+        panic!("watchdog tripped during stateless_tail partial group test:\n{report}");
+    }
+}

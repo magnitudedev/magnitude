@@ -721,9 +721,10 @@ struct Tier {
     /// The requests taken, one per chain place in step order, until served.
     taken: usize,
     /// Number of `(place, window)` requests that have finished serving (or
-    /// failed/unarrived) at this tier. Once `served_windows == total_windows()`,
-    /// this tier will make no further `ScratchRing` allocations, so later
-    /// layers may safely pipeline into `ScratchRing`.
+    /// failed/unarrived) at this tier. Once `served_windows >= taken_windows()`,
+    /// every published request at this tier has been served, so later layers
+    /// may safely pipeline into `ScratchRing` even when `stateless_tail` skips
+    /// trailing steps of the prompt group at this layer.
     served_windows: usize,
     places: Vec<Option<Request>>,
     seeds: Option<Vec<(usize, BankRecord)>>,
@@ -796,8 +797,18 @@ impl Tier {
         self.sets.last().map_or(0, |set| set.range.end) * self.windows as usize
     }
 
-    fn all_served(&self) -> bool {
-        self.served_windows >= self.total_windows()
+    fn taken_windows(&self) -> usize {
+        self.taken * self.windows as usize
+    }
+
+    /// Whether every published (`taken`) place's windows at this tier have
+    /// finished serving. Using `taken_windows()` instead of `total_windows()`
+    /// prevents deadlocking later layers when `stateless_tail` skips trailing
+    /// steps of a multi-step prompt group (so those skipped places never
+    /// publish `SCRATCH_ASK` at this tier), while still blocking later layers
+    /// whenever any taken place of this tier remains unserved.
+    fn all_taken_served(&self) -> bool {
+        self.served_windows >= self.taken_windows()
     }
 
     fn set_of(&self, place: usize) -> usize {
@@ -1370,7 +1381,7 @@ impl Scratch {
         if self
             .tiers
             .iter()
-            .any(|earlier| (earlier.group, earlier.layer) < (group, layer) && !earlier.all_served())
+            .any(|earlier| (earlier.group, earlier.layer) < (group, layer) && !earlier.all_taken_served())
         {
             return false;
         }
