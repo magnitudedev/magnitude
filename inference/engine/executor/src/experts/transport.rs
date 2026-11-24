@@ -1784,6 +1784,9 @@ struct PrefillRendezvous {
     /// Generations poisoned by a refused partial/final prefill DMA batch:
     /// `publish_prefill_sync` ignores them and `take_prefill_sync` rejects them.
     poisoned_generations: HashMap<ScratchGenId, String>,
+    /// Active `take_prefill_sync` waiters `(layer, sequence, window)` for
+    /// non-blocking liveness diagnostics (`describe_prefill`).
+    waiting_sync: Vec<(usize, u64, u64)>,
     /// Fatal serving error (`Shared::end_serving`).
     ended: Option<String>,
 }
@@ -3297,11 +3300,40 @@ impl ExpertTransport {
             if let Some(reason) = &prefill.ended {
                 return Err(reason.clone());
             }
+            prefill.waiting_sync.push((layer, sequence, window));
             prefill = self
                 .prefill_ready
                 .wait(prefill)
                 .expect("transport prefill rendezvous");
+            if let Some(pos) = prefill.waiting_sync.iter().rposition(|&k| k == (layer, sequence, window)) {
+                prefill.waiting_sync.swap_remove(pos);
+            }
         }
+    }
+
+    /// Non-blocking summary of prefill rendezvous waiters, ready syncs, and
+    /// tracked GPU pass completions for `SIGUSR1` / watchdog diagnostics.
+    pub(crate) fn describe_prefill(&self) -> String {
+        let prefill = match self.prefill.try_lock() {
+            Ok(p) => {
+                let mut sync_keys: Vec<_> = p.syncs.keys().copied().collect();
+                sync_keys.sort_unstable();
+                format!(
+                    "waiting_sync {:?}, ready_syncs {:?}, failed_steps {:?}, poisoned {:?}, ended {:?}",
+                    p.waiting_sync,
+                    sync_keys,
+                    p.failed_steps.keys().copied().collect::<Vec<_>>(),
+                    p.poisoned_generations.keys().map(|g| g.0).collect::<Vec<_>>(),
+                    p.ended,
+                )
+            }
+            Err(_) => "prefill lock held".into(),
+        };
+        let passes = match self.pass_tracker.try_lock() {
+            Ok(t) => format!("pass_events {}, pass_completions {}", t.events.len(), t.completions.len()),
+            Err(_) => "pass_tracker lock held".into(),
+        };
+        format!("{prefill}; {passes}")
     }
 
     /// Register one GPU reader on `key.generation` without closing reader

@@ -136,6 +136,13 @@ pub(super) fn watch(
         },
         Witness { name: "CPU site", report: Arc::new({ let shared = shared.clone(); move || shared.compute.report() }) },
         Witness {
+            name: "transport",
+            report: Arc::new({
+                let shared = shared.clone();
+                move || shared.transport.describe_prefill()
+            }),
+        },
+        Witness {
             name: "serving",
             report: Arc::new({
                 let shared = shared.clone();

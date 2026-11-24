@@ -1139,11 +1139,12 @@ impl Residency {
             .map(|layer| (self.core.directory.held_count(layer), self.core.directory.alone(layer)))
             .collect::<Vec<_>>();
         format!(
-            "{}; promotions {}; {}; tier keeps every expert {}; retired through {}; records taken {}; resize asked {}; \
+            "{}; promotions {}; {}; {}; tier keeps every expert {}; retired through {}; records taken {}; resize asked {}; \
              per layer (bank holds, tier holds alone) {layers:?}",
             self.prefetch.describe(),
             self.core.directory.describe_promotions(),
             self.scratch.describe(),
+            self.scratch.describe_tables(&self.core),
             self.complete,
             self.core.retired,
             self.core.taken.len(),

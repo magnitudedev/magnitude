@@ -721,10 +721,9 @@ struct Tier {
     /// The requests taken, one per chain place in step order, until served.
     taken: usize,
     /// Number of `(place, window)` requests that have finished serving (or
-    /// failed/unarrived) at this tier. Once `served_windows >= taken_windows()`,
-    /// every published request at this tier has been served, so later layers
-    /// may safely pipeline into `ScratchRing` even when `stateless_tail` skips
-    /// trailing steps of the prompt group at this layer.
+    /// failed/unarrived) at this tier. Once `served_windows == total_windows()`,
+    /// this tier will make no further `ScratchRing` allocations, so later
+    /// layers may safely pipeline into `ScratchRing`.
     served_windows: usize,
     places: Vec<Option<Request>>,
     seeds: Option<Vec<(usize, BankRecord)>>,
@@ -797,18 +796,8 @@ impl Tier {
         self.sets.last().map_or(0, |set| set.range.end) * self.windows as usize
     }
 
-    fn taken_windows(&self) -> usize {
-        self.taken * self.windows as usize
-    }
-
-    /// Whether every published (`taken`) place's windows at this tier have
-    /// finished serving. Using `taken_windows()` instead of `total_windows()`
-    /// prevents deadlocking later layers when `stateless_tail` skips trailing
-    /// steps of a multi-step prompt group (so those skipped places never
-    /// publish `SCRATCH_ASK` at this tier), while still blocking later layers
-    /// whenever any taken place of this tier remains unserved.
-    fn all_taken_served(&self) -> bool {
-        self.served_windows >= self.taken_windows()
+    fn all_served(&self) -> bool {
+        self.served_windows >= self.total_windows()
     }
 
     fn set_of(&self, place: usize) -> usize {
@@ -1194,6 +1183,50 @@ impl Scratch {
         )
     }
 
+    /// Snapshot of `published[layer]`, `SCRATCH_ASK` request words for the
+    /// serving group's steps, and `POLICY_WHOLE` across active tiers (plus the
+    /// immediately preceding layer, if any) for `SIGUSR1` / watchdog reports.
+    pub(super) fn describe_tables(&self, core: &Core) -> String {
+        let Some(serving) = self.conveyor.serving else {
+            return String::from("scratch tables []");
+        };
+        let mut layers: Vec<usize> = self.tiers.iter().map(|t| t.layer).collect();
+        if let Some(&min_layer) = layers.iter().min() {
+            if min_layer > 0 {
+                layers.push(min_layer - 1);
+            }
+        }
+        layers.sort_unstable();
+        layers.dedup();
+        let first = serving.group.first();
+        let last = serving.group.last();
+        let entries: Vec<String> = layers
+            .into_iter()
+            .filter_map(|layer| {
+                let l = core.layers.get(layer)?;
+                let asks: Vec<u64> = (first..=last)
+                    .filter(|&seq| l.scratch.requested(seq, constants::SCRATCH_ASK))
+                    .collect();
+                let missing: Vec<(u64, u64)> = (first..=last)
+                    .filter(|seq| !asks.contains(seq))
+                    .map(|seq| (seq, l.scratch.request_of(seq, constants::SCRATCH_ASK)))
+                    .collect();
+                let whole = l.policy.load(constants::POLICY_WHOLE as usize);
+                Some(format!(
+                    "layer {layer}: pub={}, asks={asks:?}, missing_req={missing:?}, whole={whole}",
+                    self.published[layer]
+                ))
+            })
+            .collect();
+        let flags_nz: Vec<usize> = self
+            .flags
+            .iter()
+            .take(serving.group.steps() as usize)
+            .map(|w| (0..core.extents.widest).filter(|&e| w.load(e) > 0).count())
+            .collect();
+        format!("scratch tables [{}]; flags_nz={flags_nz:?}", entries.join("; "))
+    }
+
     /// The highest layer a request of group `group` (its first step) was
     /// taken at, whose hits are decided; none before its first. No later
     /// group may have begun: its requests would count as the group's.
@@ -1381,7 +1414,7 @@ impl Scratch {
         if self
             .tiers
             .iter()
-            .any(|earlier| (earlier.group, earlier.layer) < (group, layer) && !earlier.all_taken_served())
+            .any(|earlier| (earlier.group, earlier.layer) < (group, layer) && !earlier.all_served())
         {
             return false;
         }
