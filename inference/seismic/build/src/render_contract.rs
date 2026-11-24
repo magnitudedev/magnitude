@@ -47,24 +47,33 @@ fn row_part_variant(part: RowPart) -> &'static str {
     }
 }
 
-/// Emit `impl seismic::EntryContract for Entry` inside the current entry's
-/// generated module.
-pub(crate) fn render_contract(
-    out: &mut String,
-    module: &CheckedModule,
+fn backend_cfg(_backend: BackendName, _indent: &str, _cfg_gate: bool) -> String {
+    // Keep all backends compiled offline in `magnitude-kernels-contracts` so
+    // cross-backend offline tests (`contract_parity.rs`) pass on every host OS.
+    String::new()
+}
+
+fn entry_natives<'a>(
+    module: &'a CheckedModule,
     entry: &EntryInfo,
-) -> Result<(), BuildError> {
-    let natives: Vec<(BackendName, &NativeImplementation)> = BackendName::ALL
+) -> Vec<(BackendName, &'a NativeImplementation)> {
+    BackendName::ALL
         .into_iter()
         .filter_map(|backend| {
             module
                 .native_implementation(entry.id, backend)
                 .map(|native| (backend, native))
         })
-        .collect();
+        .collect()
+}
 
-    let schema_info = if natives.is_empty() {
-        ExtractedSchemaInfo {
+fn build_schema_info(
+    module: &CheckedModule,
+    entry: &EntryInfo,
+    natives: &[(BackendName, &NativeImplementation)],
+) -> Result<ExtractedSchemaInfo, BuildError> {
+    if natives.is_empty() {
+        Ok(ExtractedSchemaInfo {
             tensor_results: Vec::new(),
             tensor_params: Vec::new(),
             result_dims: BTreeSet::new(),
@@ -76,44 +85,112 @@ pub(crate) fn render_contract(
             result_ranks: Vec::new(),
             disjoint: Vec::new(),
             parks: false,
-        }
+        })
     } else {
-        extract_schema_info(module, entry, &natives)?
-    };
+        extract_schema_info(module, entry, natives)
+    }
+}
+
+/// Emit `impl seismic::EntryContract for Entry` and its inline `mod __contract`
+/// helpers inside the current entry's generated module.
+pub(crate) fn render_contract(
+    out: &mut String,
+    module: &CheckedModule,
+    entry: &EntryInfo,
+) -> Result<(), BuildError> {
+    let natives = entry_natives(module, entry);
+    let schema_info = build_schema_info(module, entry, &natives)?;
 
     if !natives.is_empty() {
         out.push_str("  #[allow(unused_variables, unused_parens, unreachable_code, clippy::all)]\n");
         out.push_str("  mod __contract {\n");
-        render_contract_admit_helpers(out, entry, &natives);
-        render_contract_default_params_helpers(out, entry, &natives);
-        render_contract_sizing_helpers(out, entry, &natives, &schema_info.tensor_results);
-        render_contract_sizing_bound_helpers(out, entry, &natives, &schema_info.tensor_results);
-        render_contract_scratch_configs_helpers(out, entry, &natives);
-        render_contract_sizing_at_point_helpers(out, entry, &natives, &schema_info.tensor_results);
-        render_contract_active_launches_helpers(out, entry, &natives);
-        render_contract_launch_configs_helpers(out, entry, &natives);
-        render_contract_launch_mask_helpers(out, entry, &natives);
+        render_all_helpers(out, entry, &natives, &schema_info, "pub(super)", false);
         out.push_str("  }\n");
     }
 
+    render_contract_impl(out, entry, &natives, &schema_info, "__contract", false);
+    Ok(())
+}
+
+/// Emit ONLY `pub mod __contract { pub fn ... }` for `entry`, with
+/// `#[cfg(target_os = "macos")]` on Metal helpers and `#[cfg(not(target_os = "macos"))]`
+/// on CUDA/Vulkan helpers (used by `EmitMode::Contracts`).
+pub(crate) fn render_contract_helpers_only(
+    out: &mut String,
+    module: &CheckedModule,
+    entry: &EntryInfo,
+) -> Result<(), BuildError> {
+    let natives = entry_natives(module, entry);
+    if natives.is_empty() {
+        return Ok(());
+    }
+    let schema_info = build_schema_info(module, entry, &natives)?;
+    out.push_str("  #[allow(unused_variables, unused_parens, unreachable_code, clippy::all)]\n");
+    out.push_str("  pub mod __contract {\n");
+    render_all_helpers(out, entry, &natives, &schema_info, "pub", true);
+    out.push_str("  }\n");
+    Ok(())
+}
+
+/// Emit ONLY `impl seismic::EntryContract for Entry` delegating to
+/// `{contract_prefix}::<helper>_<backend>(...)` with matching backend `#[cfg]`
+/// gating (used by `EmitMode::Facade`).
+pub(crate) fn render_contract_delegating(
+    out: &mut String,
+    module: &CheckedModule,
+    entry: &EntryInfo,
+    contract_prefix: &str,
+) -> Result<(), BuildError> {
+    let natives = entry_natives(module, entry);
+    let schema_info = build_schema_info(module, entry, &natives)?;
+    render_contract_impl(out, entry, &natives, &schema_info, contract_prefix, false);
+    Ok(())
+}
+
+fn render_all_helpers(
+    out: &mut String,
+    entry: &EntryInfo,
+    natives: &[(BackendName, &NativeImplementation)],
+    schema_info: &ExtractedSchemaInfo,
+    vis: &str,
+    cfg_gate: bool,
+) {
+    render_contract_admit_helpers(out, entry, natives, vis, cfg_gate);
+    render_contract_default_params_helpers(out, entry, natives, vis, cfg_gate);
+    render_contract_sizing_helpers(out, entry, natives, &schema_info.tensor_results, vis, cfg_gate);
+    render_contract_sizing_bound_helpers(out, entry, natives, &schema_info.tensor_results, vis, cfg_gate);
+    render_contract_scratch_configs_helpers(out, entry, natives, vis, cfg_gate);
+    render_contract_sizing_at_point_helpers(out, entry, natives, &schema_info.tensor_results, vis, cfg_gate);
+    render_contract_active_launches_helpers(out, entry, natives, vis, cfg_gate);
+    render_contract_launch_configs_helpers(out, entry, natives, vis, cfg_gate);
+    render_contract_launch_mask_helpers(out, entry, natives, vis, cfg_gate);
+}
+
+fn render_contract_impl(
+    out: &mut String,
+    entry: &EntryInfo,
+    natives: &[(BackendName, &NativeImplementation)],
+    schema_info: &ExtractedSchemaInfo,
+    prefix: &str,
+    cfg_gate: bool,
+) {
     out.push_str("  #[allow(unused_variables, unused_parens, unreachable_code, clippy::all)]\n");
     out.push_str("  impl seismic::EntryContract for Entry {\n");
 
-    render_contract_admit(out, &natives);
-    render_contract_default_params(out, &natives);
-    render_contract_sizing(out, &natives);
-    render_contract_node_shape(out, &natives, &schema_info);
-    render_contract_scratch_meta(out, &natives);
-    render_contract_param_spec(out, entry, &natives, &schema_info.tensor_params);
-    render_contract_sizing_bound(out, &natives);
-    render_contract_scratch_configs(out, &natives);
-    render_contract_sizing_at_point(out, &natives);
-    render_contract_active_launches(out, &natives);
-    render_contract_launch_configs(out, &natives);
-    render_contract_launch_mask(out, &natives);
+    render_contract_admit(out, natives, prefix, cfg_gate);
+    render_contract_default_params(out, natives, prefix, cfg_gate);
+    render_contract_sizing(out, natives, prefix, cfg_gate);
+    render_contract_node_shape(out, natives, schema_info);
+    render_contract_scratch_meta(out, natives);
+    render_contract_param_spec(out, entry, natives, &schema_info.tensor_params);
+    render_contract_sizing_bound(out, natives, prefix, cfg_gate);
+    render_contract_scratch_configs(out, natives, prefix, cfg_gate);
+    render_contract_sizing_at_point(out, natives, prefix, cfg_gate);
+    render_contract_active_launches(out, natives, prefix, cfg_gate);
+    render_contract_launch_configs(out, natives, prefix, cfg_gate);
+    render_contract_launch_mask(out, natives, prefix, cfg_gate);
 
     out.push_str("  }\n");
-    Ok(())
 }
 
 /// One tensor result leaf extracted from the entry's `CallSchema`: its element
@@ -1361,8 +1438,10 @@ fn flatten_conjuncts<'a>(cond: &'a NativeCondition, out: &mut Vec<&'a NativeCond
 fn render_backend_dispatch(
     out: &mut String,
     natives: &[(BackendName, &NativeImplementation)],
+    prefix: &str,
     helper_prefix: &str,
     call_args: &str,
+    cfg_gate: bool,
 ) {
     if natives.is_empty() {
         out.push_str("      Err(seismic::ContractError::NoImplementation(backend))\n");
@@ -1373,12 +1452,13 @@ fn render_backend_dispatch(
     for &(backend, _) in natives {
         let variant = backend_variant(backend);
         let slug = backend_slug(backend);
+        out.push_str(&backend_cfg(backend, "        ", cfg_gate));
         let _ = writeln!(
             out,
-            "        seismic::BackendName::{variant} => __contract::{helper_prefix}_{slug}({call_args}),"
+            "        seismic::BackendName::{variant} => {prefix}::{helper_prefix}_{slug}({call_args}),"
         );
     }
-    if natives.len() < BackendName::ALL.len() {
+    if cfg_gate || natives.len() < BackendName::ALL.len() {
         out.push_str("        _ => Err(seismic::ContractError::NoImplementation(backend)),\n");
     }
     out.push_str("      }\n");
@@ -1421,23 +1501,28 @@ fn emit_constraint_guard(
 fn render_contract_admit(
     out: &mut String,
     natives: &[(BackendName, &NativeImplementation)],
+    prefix: &str,
+    cfg_gate: bool,
 ) {
     out.push_str(
         "    fn contract_admit(backend: seismic::BackendName, device: Option<&dyn seismic::device::DeviceValues>, elements: &[(&str, seismic::Element)], dims: &[(&str, u64)], params: &[(&str, u64)]) -> Result<(), seismic::ContractError> {\n",
     );
-    render_backend_dispatch(out, natives, "admit", "device, elements, dims, params");
+    render_backend_dispatch(out, natives, prefix, "admit", "device, elements, dims, params", cfg_gate);
 }
 
 fn render_contract_admit_helpers(
     out: &mut String,
     entry: &EntryInfo,
     natives: &[(BackendName, &NativeImplementation)],
+    vis: &str,
+    cfg_gate: bool,
 ) {
     for &(backend, native) in natives {
         let slug = backend_slug(backend);
+        out.push_str(&backend_cfg(backend, "    ", cfg_gate));
         let _ = writeln!(
             out,
-            "    pub(super) fn admit_{slug}(__device: Option<&dyn seismic::device::DeviceValues>, elements: &[(&str, seismic::Element)], dims: &[(&str, u64)], params: &[(&str, u64)]) -> Result<(), seismic::ContractError> {{"
+            "    {vis} fn admit_{slug}(__device: Option<&dyn seismic::device::DeviceValues>, elements: &[(&str, seismic::Element)], dims: &[(&str, u64)], params: &[(&str, u64)]) -> Result<(), seismic::ContractError> {{"
         );
         out.push_str("      let _ = __device;\n");
         emit_element_binding(out, entry, "      ");
@@ -1464,23 +1549,28 @@ fn render_contract_admit_helpers(
 fn render_contract_default_params(
     out: &mut String,
     natives: &[(BackendName, &NativeImplementation)],
+    prefix: &str,
+    cfg_gate: bool,
 ) {
     out.push_str(
         "    fn contract_default_params(backend: seismic::BackendName, device: Option<&dyn seismic::device::DeviceValues>, elements: &[(&str, seismic::Element)], dims: &[(&str, u64)]) -> Result<Vec<(&'static str, u64)>, seismic::ContractError> {\n",
     );
-    render_backend_dispatch(out, natives, "default_params", "device, elements, dims");
+    render_backend_dispatch(out, natives, prefix, "default_params", "device, elements, dims", cfg_gate);
 }
 
 fn render_contract_default_params_helpers(
     out: &mut String,
     entry: &EntryInfo,
     natives: &[(BackendName, &NativeImplementation)],
+    vis: &str,
+    cfg_gate: bool,
 ) {
     for &(backend, native) in natives {
         let slug = backend_slug(backend);
+        out.push_str(&backend_cfg(backend, "    ", cfg_gate));
         let _ = writeln!(
             out,
-            "    pub(super) fn default_params_{slug}(__device: Option<&dyn seismic::device::DeviceValues>, elements: &[(&str, seismic::Element)], dims: &[(&str, u64)]) -> Result<Vec<(&'static str, u64)>, seismic::ContractError> {{"
+            "    {vis} fn default_params_{slug}(__device: Option<&dyn seismic::device::DeviceValues>, elements: &[(&str, seismic::Element)], dims: &[(&str, u64)]) -> Result<Vec<(&'static str, u64)>, seismic::ContractError> {{"
         );
         out.push_str("      let _ = __device;\n");
         emit_element_binding(out, entry, "      ");
@@ -1661,11 +1751,13 @@ fn render_contract_default_params_helpers(
 fn render_contract_sizing(
     out: &mut String,
     natives: &[(BackendName, &NativeImplementation)],
+    prefix: &str,
+    cfg_gate: bool,
 ) {
     out.push_str(
         "    fn contract_sizing(backend: seismic::BackendName, device: Option<&dyn seismic::device::DeviceValues>, elements: &[(&str, seismic::Element)], dims: &[(&str, u64)], params: &[(&str, u64)]) -> Result<seismic::EntrySizing, seismic::ContractError> {\n",
     );
-    render_backend_dispatch(out, natives, "sizing", "device, elements, dims, params");
+    render_backend_dispatch(out, natives, prefix, "sizing", "device, elements, dims, params", cfg_gate);
 }
 
 fn render_contract_sizing_helpers(
@@ -1673,12 +1765,15 @@ fn render_contract_sizing_helpers(
     entry: &EntryInfo,
     natives: &[(BackendName, &NativeImplementation)],
     tensor_results: &[LoweredTensorResult],
+    vis: &str,
+    cfg_gate: bool,
 ) {
     for &(backend, native) in natives {
         let slug = backend_slug(backend);
+        out.push_str(&backend_cfg(backend, "    ", cfg_gate));
         let _ = writeln!(
             out,
-            "    pub(super) fn sizing_{slug}(__device: Option<&dyn seismic::device::DeviceValues>, elements: &[(&str, seismic::Element)], dims: &[(&str, u64)], params: &[(&str, u64)]) -> Result<seismic::EntrySizing, seismic::ContractError> {{"
+            "    {vis} fn sizing_{slug}(__device: Option<&dyn seismic::device::DeviceValues>, elements: &[(&str, seismic::Element)], dims: &[(&str, u64)], params: &[(&str, u64)]) -> Result<seismic::EntrySizing, seismic::ContractError> {{"
         );
         out.push_str("      let _ = __device;\n");
         emit_element_binding(out, entry, "      ");
@@ -2820,11 +2915,13 @@ fn emit_scratch_outer_and_residuals(
 fn render_contract_sizing_bound(
     out: &mut String,
     natives: &[(BackendName, &NativeImplementation)],
+    prefix: &str,
+    cfg_gate: bool,
 ) {
     out.push_str(
         "    fn contract_sizing_bound(backend: seismic::BackendName, device: Option<&dyn seismic::device::DeviceValues>, elements: &[(&str, seismic::Element)], dims: &[(&str, u64)]) -> Result<seismic::EntrySizing, seismic::ContractError> {\n",
     );
-    render_backend_dispatch(out, natives, "sizing_bound", "device, elements, dims");
+    render_backend_dispatch(out, natives, prefix, "sizing_bound", "device, elements, dims", cfg_gate);
 }
 
 fn render_contract_sizing_bound_helpers(
@@ -2832,12 +2929,15 @@ fn render_contract_sizing_bound_helpers(
     entry: &EntryInfo,
     natives: &[(BackendName, &NativeImplementation)],
     tensor_results: &[LoweredTensorResult],
+    vis: &str,
+    cfg_gate: bool,
 ) {
     for &(backend, native) in natives {
         let slug = backend_slug(backend);
+        out.push_str(&backend_cfg(backend, "    ", cfg_gate));
         let _ = writeln!(
             out,
-            "    pub(super) fn sizing_bound_{slug}(__device: Option<&dyn seismic::device::DeviceValues>, elements: &[(&str, seismic::Element)], dims: &[(&str, u64)]) -> Result<seismic::EntrySizing, seismic::ContractError> {{"
+            "    {vis} fn sizing_bound_{slug}(__device: Option<&dyn seismic::device::DeviceValues>, elements: &[(&str, seismic::Element)], dims: &[(&str, u64)]) -> Result<seismic::EntrySizing, seismic::ContractError> {{"
         );
         out.push_str("      let _ = __device;\n");
         emit_element_binding(out, entry, "      ");
@@ -3296,23 +3396,28 @@ fn render_contract_sizing_bound_helpers(
 fn render_contract_scratch_configs(
     out: &mut String,
     natives: &[(BackendName, &NativeImplementation)],
+    prefix: &str,
+    cfg_gate: bool,
 ) {
     out.push_str(
         "    fn contract_scratch_configs(backend: seismic::BackendName, device: Option<&dyn seismic::device::DeviceValues>, elements: &[(&str, seismic::Element)], dims: &[(&str, u64)]) -> Result<seismic::contract::ScratchConfigs, seismic::ContractError> {\n",
     );
-    render_backend_dispatch(out, natives, "scratch_configs", "device, elements, dims");
+    render_backend_dispatch(out, natives, prefix, "scratch_configs", "device, elements, dims", cfg_gate);
 }
 
 fn render_contract_scratch_configs_helpers(
     out: &mut String,
     entry: &EntryInfo,
     natives: &[(BackendName, &NativeImplementation)],
+    vis: &str,
+    cfg_gate: bool,
 ) {
     for &(backend, native) in natives {
         let slug = backend_slug(backend);
+        out.push_str(&backend_cfg(backend, "    ", cfg_gate));
         let _ = writeln!(
             out,
-            "    pub(super) fn scratch_configs_{slug}(__device: Option<&dyn seismic::device::DeviceValues>, elements: &[(&str, seismic::Element)], dims: &[(&str, u64)]) -> Result<seismic::contract::ScratchConfigs, seismic::ContractError> {{"
+            "    {vis} fn scratch_configs_{slug}(__device: Option<&dyn seismic::device::DeviceValues>, elements: &[(&str, seismic::Element)], dims: &[(&str, u64)]) -> Result<seismic::contract::ScratchConfigs, seismic::ContractError> {{"
         );
         out.push_str("      let _ = __device;\n");
         emit_element_binding(out, entry, "      ");
@@ -3470,6 +3575,8 @@ fn render_contract_scratch_configs_helpers(
 fn render_contract_sizing_at_point(
     out: &mut String,
     natives: &[(BackendName, &NativeImplementation)],
+    prefix: &str,
+    cfg_gate: bool,
 ) {
     out.push_str(
         "    fn contract_sizing_at_point(backend: seismic::BackendName, device: Option<&dyn seismic::device::DeviceValues>, elements: &[(&str, seismic::Element)], dims: &[(&str, u64)], configs: &seismic::contract::ScratchConfigs, max_results: &mut [u64], max_scratch: &mut [u64]) -> Result<(), seismic::ContractError> {\n",
@@ -3477,8 +3584,10 @@ fn render_contract_sizing_at_point(
     render_backend_dispatch(
         out,
         natives,
+        prefix,
         "sizing_at_point",
         "device, elements, dims, configs, max_results, max_scratch",
+        cfg_gate,
     );
 }
 
@@ -3487,12 +3596,15 @@ fn render_contract_sizing_at_point_helpers(
     entry: &EntryInfo,
     natives: &[(BackendName, &NativeImplementation)],
     tensor_results: &[LoweredTensorResult],
+    vis: &str,
+    cfg_gate: bool,
 ) {
     for &(backend, native) in natives {
         let slug = backend_slug(backend);
+        out.push_str(&backend_cfg(backend, "    ", cfg_gate));
         let _ = writeln!(
             out,
-            "    pub(super) fn sizing_at_point_{slug}(__device: Option<&dyn seismic::device::DeviceValues>, elements: &[(&str, seismic::Element)], dims: &[(&str, u64)], configs: &seismic::contract::ScratchConfigs, max_results: &mut [u64], max_scratch: &mut [u64]) -> Result<(), seismic::ContractError> {{"
+            "    {vis} fn sizing_at_point_{slug}(__device: Option<&dyn seismic::device::DeviceValues>, elements: &[(&str, seismic::Element)], dims: &[(&str, u64)], configs: &seismic::contract::ScratchConfigs, max_results: &mut [u64], max_scratch: &mut [u64]) -> Result<(), seismic::ContractError> {{"
         );
         out.push_str("      let _ = __device;\n");
         emit_element_binding(out, entry, "      ");
@@ -3584,6 +3696,8 @@ fn render_contract_sizing_at_point_helpers(
 fn render_contract_active_launches(
     out: &mut String,
     natives: &[(BackendName, &NativeImplementation)],
+    prefix: &str,
+    cfg_gate: bool,
 ) {
     out.push_str(
         "    fn contract_active_launches(backend: seismic::BackendName, device: Option<&dyn seismic::device::DeviceValues>, elements: &[(&str, seismic::Element)], dims: &[(&str, u64)], params: &[(&str, u64)], words: &[(&str, u64, bool)]) -> Result<u64, seismic::ContractError> {\n",
@@ -3591,8 +3705,10 @@ fn render_contract_active_launches(
     render_backend_dispatch(
         out,
         natives,
+        prefix,
         "active_launches",
         "device, elements, dims, params, words",
+        cfg_gate,
     );
 }
 
@@ -3600,12 +3716,15 @@ fn render_contract_active_launches_helpers(
     out: &mut String,
     entry: &EntryInfo,
     natives: &[(BackendName, &NativeImplementation)],
+    vis: &str,
+    cfg_gate: bool,
 ) {
     for &(backend, native) in natives {
         let slug = backend_slug(backend);
+        out.push_str(&backend_cfg(backend, "    ", cfg_gate));
         let _ = writeln!(
             out,
-            "    pub(super) fn active_launches_{slug}(__device: Option<&dyn seismic::device::DeviceValues>, elements: &[(&str, seismic::Element)], dims: &[(&str, u64)], params: &[(&str, u64)], words: &[(&str, u64, bool)]) -> Result<u64, seismic::ContractError> {{"
+            "    {vis} fn active_launches_{slug}(__device: Option<&dyn seismic::device::DeviceValues>, elements: &[(&str, seismic::Element)], dims: &[(&str, u64)], params: &[(&str, u64)], words: &[(&str, u64, bool)]) -> Result<u64, seismic::ContractError> {{"
         );
         out.push_str("      let _ = __device;\n");
         emit_element_binding(out, entry, "      ");
@@ -3753,6 +3872,8 @@ fn render_contract_active_launches_helpers(
 fn render_contract_launch_configs(
     out: &mut String,
     natives: &[(BackendName, &NativeImplementation)],
+    prefix: &str,
+    cfg_gate: bool,
 ) {
     out.push_str(
         "    fn contract_launch_configs(backend: seismic::BackendName, device: Option<&dyn seismic::device::DeviceValues>, elements: &[(&str, seismic::Element)], dims: &[(&str, u64)]) -> Result<Vec<Vec<u64>>, seismic::ContractError> {\n",
@@ -3767,8 +3888,10 @@ fn render_contract_launch_configs(
     for &(backend, _) in natives {
         let variant = backend_variant(backend);
         if backend == BackendName::Cuda {
-            out.push_str(
-                "        seismic::BackendName::Cuda => __contract::launch_configs_cuda(device, elements, dims),\n",
+            out.push_str(&backend_cfg(backend, "        ", cfg_gate));
+            let _ = writeln!(
+                out,
+                "        seismic::BackendName::Cuda => {prefix}::launch_configs_cuda(device, elements, dims),"
             );
         } else {
             let _ = writeln!(
@@ -3777,7 +3900,7 @@ fn render_contract_launch_configs(
             );
         }
     }
-    if natives.len() < BackendName::ALL.len() {
+    if cfg_gate || natives.len() < BackendName::ALL.len() {
         out.push_str("        _ => Err(seismic::ContractError::NoImplementation(backend)),\n");
     }
     out.push_str("      }\n");
@@ -3788,13 +3911,17 @@ fn render_contract_launch_configs_helpers(
     out: &mut String,
     entry: &EntryInfo,
     natives: &[(BackendName, &NativeImplementation)],
+    vis: &str,
+    cfg_gate: bool,
 ) {
     for &(backend, native) in natives {
         if backend != BackendName::Cuda {
             continue;
         }
-        out.push_str(
-            "    pub(super) fn launch_configs_cuda(__device: Option<&dyn seismic::device::DeviceValues>, elements: &[(&str, seismic::Element)], dims: &[(&str, u64)]) -> Result<Vec<Vec<u64>>, seismic::ContractError> {\n",
+        out.push_str(&backend_cfg(backend, "    ", cfg_gate));
+        let _ = writeln!(
+            out,
+            "    {vis} fn launch_configs_cuda(__device: Option<&dyn seismic::device::DeviceValues>, elements: &[(&str, seismic::Element)], dims: &[(&str, u64)]) -> Result<Vec<Vec<u64>>, seismic::ContractError> {{"
         );
         out.push_str("      let _ = __device;\n");
         emit_element_binding(out, entry, "      ");
@@ -3953,6 +4080,8 @@ fn render_contract_launch_configs_helpers(
 fn render_contract_launch_mask(
     out: &mut String,
     natives: &[(BackendName, &NativeImplementation)],
+    prefix: &str,
+    cfg_gate: bool,
 ) {
     out.push_str(
         "    fn contract_launch_mask(backend: seismic::BackendName, device: Option<&dyn seismic::device::DeviceValues>, elements: &[(&str, seismic::Element)], dims: &[(&str, u64)], params: &[u64]) -> Result<u64, seismic::ContractError> {\n",
@@ -3968,14 +4097,16 @@ fn render_contract_launch_mask(
     for &(backend, _) in natives {
         let variant = backend_variant(backend);
         if backend == BackendName::Cuda {
-            out.push_str(
-                "        seismic::BackendName::Cuda => __contract::launch_mask_cuda(device, elements, dims, params),\n",
+            out.push_str(&backend_cfg(backend, "        ", cfg_gate));
+            let _ = writeln!(
+                out,
+                "        seismic::BackendName::Cuda => {prefix}::launch_mask_cuda(device, elements, dims, params),"
             );
         } else {
             let _ = writeln!(out, "        seismic::BackendName::{variant} => Ok(0u64),");
         }
     }
-    if natives.len() < BackendName::ALL.len() {
+    if cfg_gate || natives.len() < BackendName::ALL.len() {
         out.push_str("        _ => Err(seismic::ContractError::NoImplementation(backend)),\n");
     }
     out.push_str("      }\n");
@@ -3986,6 +4117,8 @@ fn render_contract_launch_mask_helpers(
     out: &mut String,
     entry: &EntryInfo,
     natives: &[(BackendName, &NativeImplementation)],
+    vis: &str,
+    cfg_gate: bool,
 ) {
     for &(backend, native) in natives {
         if backend != BackendName::Cuda {
@@ -3997,8 +4130,10 @@ fn render_contract_launch_mask_helpers(
             entry.name,
             native.launches.len()
         );
-        out.push_str(
-            "    pub(super) fn launch_mask_cuda(__device: Option<&dyn seismic::device::DeviceValues>, elements: &[(&str, seismic::Element)], dims: &[(&str, u64)], params: &[u64]) -> Result<u64, seismic::ContractError> {\n",
+        out.push_str(&backend_cfg(backend, "    ", cfg_gate));
+        let _ = writeln!(
+            out,
+            "    {vis} fn launch_mask_cuda(__device: Option<&dyn seismic::device::DeviceValues>, elements: &[(&str, seismic::Element)], dims: &[(&str, u64)], params: &[u64]) -> Result<u64, seismic::ContractError> {{"
         );
         out.push_str("      let _ = __device;\n");
         emit_element_binding(out, entry, "      ");

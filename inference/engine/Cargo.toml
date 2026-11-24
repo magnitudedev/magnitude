@@ -19,6 +19,7 @@ magnitude-batching = { path = "batching" }
 magnitude-family-contracts = { path = "families/contracts" }
 magnitude-cost-model = { path = "cost-model" }
 magnitude-executor = { path = "executor" }
+magnitude-kernels-bundle.workspace = true
 magnitude-family-registry = { path = "families/registry" }
 magnitude-family-qwen35 = { path = "families/qwen35" }
 magnitude-family-qwen4exp = { path = "families/qwen4exp" }

@@ -5,6 +5,9 @@ edition.workspace = true
 license.workspace = true
 
 [dependencies]
+magnitude-kernels-bundle.workspace = true
+magnitude-kernels-contracts.workspace = true
+magnitude-kernels-cpu.workspace = true
 seismic.workspace = true
 
 [build-dependencies]

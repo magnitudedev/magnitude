@@ -17,6 +17,13 @@ pub trait Stored: Serialize + DeserializeOwned {
     /// The schema's name, which names a directory: letters, digits, `-`,
     /// `.` and `+` only.
     const SCHEMA: &'static str;
+
+    /// Runtime schema name (defaults to `Self::SCHEMA`; may be overridden when
+    /// a runtime-combined build identity is used so shader edits do not
+    /// invalidate compile-time constants).
+    fn schema() -> &'static str {
+        Self::SCHEMA
+    }
 }
 
 /// One JSON file per key, named by the digest of the key's JSON, in the
@@ -58,13 +65,14 @@ impl JsonFileStore {
 
     /// The directory values of `V` lie in, under the store's.
     fn schema<V: Stored>() -> PathBuf {
+        let name = V::schema();
         assert!(
-            V::SCHEMA.bytes().all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'.' | b'+'))
-                && !V::SCHEMA.starts_with('.'),
+            name.bytes().all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'.' | b'+'))
+                && !name.starts_with('.'),
             "a stored schema names a directory: {:?}",
-            V::SCHEMA
+            name
         );
-        PathBuf::from(V::SCHEMA)
+        PathBuf::from(name)
     }
 
     /// Where `key`'s value of `V` lies, under the store's directory.

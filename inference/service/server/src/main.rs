@@ -118,6 +118,7 @@ enum Command {
 fn main() -> anyhow::Result<()> {
     // SAFETY: no other thread has started yet.
     unsafe { magnitude_service_server::isolate_hub_credentials() };
+    allocator::configure();
     magnitude_executor::main("magnitude-main", serve)
 }
 
@@ -133,7 +134,6 @@ fn serve() -> anyhow::Result<()> {
         }
         command => {
             if matches!(command, Command::Serve { .. }) {
-                allocator::configure();
                 // The service's own pools (catalog assessment, inventory scans, the engine's
                 // auxiliary pools it opens) are background work beside a serving worker.
                 seismic::threads::set_share(MachineBudget::host().share(Duty::Background).get());

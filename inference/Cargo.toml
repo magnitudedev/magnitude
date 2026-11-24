@@ -16,6 +16,9 @@ members = [
   "engine/cost-model",
   "engine/executor",
   "engine/source-identity",
+  "engine/kernels-bundle",
+  "engine/kernels-contracts",
+  "engine/kernels-cpu",
   "engine/kernels",
   "engine/line-kernels",
   "engine/state",
@@ -142,6 +145,9 @@ postcard = { version = "=1.1.3", default-features = false, features = ["use-std"
 seismic-std = { path = "seismic-std" }
 seismic-lang = { path = "seismic/lang" }
 magnitude-ggml = { path = "ggml" }
+magnitude-kernels-bundle = { path = "engine/kernels-bundle" }
+magnitude-kernels-contracts = { path = "engine/kernels-contracts" }
+magnitude-kernels-cpu = { path = "engine/kernels-cpu" }
 seismic-metal = { path = "seismic/backends/metal" }
 seismic-cpu = { path = "seismic/backends/cpu" }
 seismic-cuda = { path = "seismic/backends/cuda" }
@@ -193,13 +199,22 @@ utoipa = { version = "5.4.0", features = ["axum_extras", "preserve_order"] }
 debug = "line-tables-only"
 
 # CPU native kernels compile into the crates below; unoptimized, they are
-# unusable even in tests. The generic Seismic CPU library code is
-# instantiated in the kernel crate, so its level is the kernel crate's.
-[profile.dev.package.magnitude-kernels]
+# unusable even in tests. Only `magnitude-kernels-cpu` (29K lines of CPU SIMD
+# launchers) needs -O3 in dev; `magnitude-kernels-contracts`, `-bundle`, and
+# the thin `magnitude-kernels` facade stay at opt-level = 0 in dev.
+[profile.dev.package.magnitude-kernels-cpu]
 opt-level = 3
 
 [profile.dev.package.magnitude-line-kernels]
 opt-level = 3
+
+[profile.dev.package.seismic-lang]
+opt-level = 3
+
+# Optimize build scripts and build-dependencies (seismic-build, seismic-lang,
+# postcard, sha2) in dev so kernel bundle generation runs in ~1-2s instead of ~63s.
+[profile.dev.build-override]
+opt-level = 2
 
 [profile.dev.package.seismic-native-cpu]
 opt-level = 3

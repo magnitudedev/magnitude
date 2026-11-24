@@ -176,17 +176,16 @@ impl BackendName {
         }
     }
 
-    /// Whether the backend runs fill work (a native submission queued on the
-    /// fill queue, `NativeQueue::Fill`) on a device queue of its own beside
-    /// compute, so a fill's moves and its parks overlap compute and hold
-    /// only later fills. CUDA runs it on a second native stream. Vulkan (a
-    /// second queue with timeline semaphores) and Metal (a second command
-    /// queue with a shared event) have none yet, so their fill queue is the
-    /// compute queue; the CPU's work completes as it is submitted.
+    /// Whether the backend can run fill/transfer work beside compute on a
+    /// distinct device queue (`NativeQueue::Fill` / `TransferQueue`), so fill
+    /// DMA overlaps compute. CUDA always runs fills on a second native stream.
+    /// Vulkan runs fill/transfer DMA on its second queue (`side_family`) when
+    /// the device exposes one (`Executor::has_side_queue`); single-queue Vulkan
+    /// devices have none. Metal has none yet, and the CPU completes on submit.
     pub const fn fills_beside_compute(self) -> bool {
         match self {
-            BackendName::Cuda => true,
-            BackendName::Cpu | BackendName::Metal | BackendName::Vulkan => false,
+            BackendName::Cuda | BackendName::Vulkan => true,
+            BackendName::Cpu | BackendName::Metal => false,
         }
     }
 

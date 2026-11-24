@@ -2271,6 +2271,7 @@ dependencies = [
  "magnitude-family-registry",
  "magnitude-generation",
  "magnitude-grammar",
+ "magnitude-kernels-bundle",
  "magnitude-scheduler",
  "magnitude-service-utils",
  "magnitude-source-identity",
@@ -2573,6 +2574,9 @@ name = "magnitude-kernels"
 version = "0.1.0"
 dependencies = [
  "magnitude-ggml",
+ "magnitude-kernels-bundle",
+ "magnitude-kernels-contracts",
+ "magnitude-kernels-cpu",
  "seismic",
  "seismic-build",
  "seismic-cpu",
@@ -2580,6 +2584,30 @@ dependencies = [
  "seismic-native-cpu",
  "seismic-native-tests",
  "seismic-std",
+]
+
+[[package]]
+name = "magnitude-kernels-bundle"
+version = "0.1.0"
+dependencies = [
+ "seismic",
+ "seismic-build",
+]
+
+[[package]]
+name = "magnitude-kernels-contracts"
+version = "0.1.0"
+dependencies = [
+ "seismic",
+ "seismic-build",
+]
+
+[[package]]
+name = "magnitude-kernels-cpu"
+version = "0.1.0"
+dependencies = [
+ "seismic",
+ "seismic-build",
 ]
 
 [[package]]

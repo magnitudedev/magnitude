@@ -387,6 +387,19 @@ impl<const N: usize> Line<N> {
         self.observed.add(x, t, 1.);
     }
 
+    /// Whether no observation of real work has been recorded.
+    pub fn is_empty(&self) -> bool {
+        self.observed.weight <= 0.
+    }
+
+    /// Both lines' seeds and observations joined.
+    pub fn joined(self, other: Self) -> Self {
+        Self {
+            seeds: self.seeds.joined(other.seeds),
+            observed: self.observed.joined(other.observed),
+        }
+    }
+
     /// The line now: pending while its points do not tell every term apart;
     /// seeded, the seeds' fit, before any observation; observed after, the
     /// observations' fit with the seeds settling only the directions they

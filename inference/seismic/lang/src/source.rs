@@ -306,15 +306,30 @@ pub fn load(paths: &[PathBuf], mut prelude: SourceSet) -> Result<Loaded, LoadErr
     if files.is_empty() && prelude.files().is_empty() {
         return Err(LoadError::Invalid("no .seismic files found".into()));
     }
+    let roots = source_roots(paths)?;
     for path in &files {
+        // Store checkout-independent logical relative paths so identical trees
+        // in different directories produce byte-identical checked bundles and
+        // identical bundle/build identities. When multiple roots are given,
+        // prefix with the root index so paths across roots never collide.
+        let logical = roots
+            .iter()
+            .enumerate()
+            .find_map(|(idx, root)| {
+                let rel = path.strip_prefix(root).ok()?;
+                let rel = dunce::simplified(rel).to_string_lossy().replace('\\', "/");
+                Some(if roots.len() > 1 {
+                    format!("root{idx}/{rel}")
+                } else {
+                    rel
+                })
+            })
+            .unwrap_or_else(|| dunce::simplified(path).to_string_lossy().replace('\\', "/"));
         prelude.push(SourceFile {
-            // A source path is logical and `/`-separated, which cannot represent a Windows
-            // verbatim canonical path (`\\?\C:\...`); `C:/...` stays absolute.
-            path: dunce::simplified(path).to_string_lossy().replace('\\', "/"),
+            path: logical,
             text: std::fs::read_to_string(path)?,
         });
     }
-    let roots = source_roots(paths)?;
     let (module, assets) = check_with_assets(prelude, None, &roots)?;
     Ok(Loaded {
         module,
@@ -393,13 +408,26 @@ fn read_asset(
     roots: &[PathBuf],
 ) -> Result<ReadAsset, LoadError> {
     let declaring = Path::new(&native.declared_in);
+    let resolved_parent: PathBuf;
     let root = match base {
         Some(base) => base,
         None if declaring.is_absolute() => declaring.parent().expect("absolute source parent"),
         None => {
-            return Err(LoadError::Invalid(
-                "inline native assets require base_dir".into(),
-            ));
+            let resolved = if roots.len() > 1 {
+                native
+                    .declared_in
+                    .strip_prefix("root")
+                    .and_then(|rest| rest.split_once('/'))
+                    .and_then(|(idx, rel)| idx.parse::<usize>().ok().map(|i| (i, rel)))
+                    .and_then(|(i, rel)| roots.get(i).map(|r| r.join(rel)))
+                    .filter(|p| p.is_file())
+            } else {
+                roots.first().map(|r| r.join(declaring)).filter(|p| p.is_file())
+            };
+            resolved_parent = resolved
+                .and_then(|p| p.parent().map(Path::to_path_buf))
+                .ok_or_else(|| LoadError::Invalid("inline native assets require base_dir".into()))?;
+            &resolved_parent
         }
     };
     let path = root.join(&native.source_path).canonicalize()?;

@@ -159,6 +159,27 @@ impl LaunchGraphs {
         Some(Self { pinned, union, chained })
     }
 
+    /// What a serial family of `graphs` holds, where every launch executes
+    /// at most one graph (`NativeGraphFamily::new`): its pinned graphs, each
+    /// for its pinned runs, all resident at once for each launch in flight
+    /// (`record_decode`), so their sum; and its union, those pinned graphs
+    /// plus the single largest unpinned graph (any submission executes at
+    /// most one unpinned graph, and `Replays::release_beyond` LRU-evicts
+    /// unpinned graphs before exceeding the budget). None on overflow.
+    pub fn of_serial(graphs: impl IntoIterator<Item = LaunchedGraph>) -> Option<Self> {
+        let (mut pinned, mut max_unpinned) = (GraphCensus::default(), GraphCensus::default());
+        for LaunchedGraph { graph, pinned_runs, runs } in graphs {
+            assert!(pinned_runs <= runs, "a pinned graph is one the family's launches run");
+            assert!(runs <= 1, "a serial family's launch runs at most one graph");
+            pinned = pinned.plus(graph.times(pinned_runs)?)?;
+            if pinned_runs < runs {
+                max_unpinned = max_unpinned.most(graph);
+            }
+        }
+        let union = pinned.plus(max_unpinned)?;
+        Some(Self { pinned, union, chained: Vec::new() })
+    }
+
     /// What the family holds with `launches` launches in flight: the
     /// union, within which any one launch's graphs are whatever its class,
     /// so every submission fits; beside it each other launch's pinned
@@ -178,6 +199,15 @@ impl LaunchGraphs {
     /// replays, which then record again. None without a launch, none on
     /// overflow.
     pub fn held(&self, launches: u64) -> Option<GraphCensus> {
+        self.held_with_decode(launches, launches)
+    }
+
+    /// What the family holds with `launches` launches in flight where only
+    /// `decode_flights` (`<= launches`) are decode-capable (floor) flights
+    /// that pin `pinned`, and the remaining `launches - decode_flights` slots
+    /// serve prefill chains only and never run decode.
+    pub fn held_with_decode(&self, launches: u64, decode_flights: u64) -> Option<GraphCensus> {
+        assert!(decode_flights <= launches, "decode flights cannot exceed total launches");
         let chained = match launches {
             0 => return Some(GraphCensus::default()),
             1 => GraphCensus::default(),
@@ -187,7 +217,8 @@ impl LaunchGraphs {
                 .copied()
                 .unwrap_or_default(),
         };
-        self.pinned.times(launches - 1)?.plus(self.union)?.plus(chained)
+        let extra_decode = decode_flights.saturating_sub(1);
+        self.pinned.times(extra_decode)?.plus(self.union)?.plus(chained)
     }
 
     /// Whether every term is within `bound`'s: what it holds at any count
@@ -293,7 +324,35 @@ mod tests {
         assert_eq!(pinned.pinned, small);
         assert_eq!(pinned.held(2), Some(census(3, 16, 0, 0)));
         assert_eq!(pinned.held(3), Some(census(4, 19, 0, 0)));
+        // Extra chain-only prefill slots beyond `decode_flights = 1` do not
+        // add further copies of `pinned` decode graphs.
+        assert_eq!(pinned.held_with_decode(1, 1), pinned.held(1));
+        assert_eq!(pinned.held_with_decode(8, 1), pinned.held(1));
+        assert_eq!(pinned.held_with_decode(8, 2), pinned.held(2));
+        let chained = LaunchGraphs::of([graph(small, 1), graph(large, 0)], vec![census(1, 2, 0, 0)]).unwrap();
+        assert_eq!(chained.held_with_decode(8, 1), Some(census(3, 15, 0, 0)));
         assert!(unpinned.within(&pinned) && !pinned.within(&unpinned));
+    }
+
+    #[test]
+    fn serial_family_bounds_unpinned_graphs_by_the_single_largest() {
+        let (small, medium, large) = (census(1, 3, 16, 16), census(1, 7, 32, 24), census(1, 10, 64, 32));
+        let graph = |graph, pinned_runs| LaunchedGraph { graph, pinned_runs, runs: 1 };
+        // All unpinned: holds only the single largest graph regardless of family size.
+        let unpinned = LaunchGraphs::of_serial([graph(small, 0), graph(medium, 0), graph(large, 0)]).unwrap();
+        assert_eq!(unpinned.pinned, GraphCensus::default());
+        assert_eq!(unpinned.union, large);
+        assert_eq!(unpinned.held(1), Some(large));
+        assert_eq!(unpinned.held(3), Some(large));
+        // Mixed pinned + unpinned: all pinned graphs per flight plus the single largest unpinned.
+        let mixed = LaunchGraphs::of_serial([graph(small, 1), graph(medium, 0), graph(large, 0)]).unwrap();
+        assert_eq!(mixed.pinned, small);
+        assert_eq!(mixed.union, small.plus(large).unwrap());
+        assert_eq!(mixed.held(1), Some(small.plus(large).unwrap()));
+        assert_eq!(mixed.held(2), Some(small.times(2).unwrap().plus(large).unwrap()));
+        // Serial census is strictly within the summed union census.
+        let summed = LaunchGraphs::of([graph(small, 1), graph(medium, 0), graph(large, 0)], Vec::new()).unwrap();
+        assert!(mixed.within(&summed) && !summed.within(&mixed));
     }
 
     #[test]

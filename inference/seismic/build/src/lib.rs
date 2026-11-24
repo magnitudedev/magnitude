@@ -211,6 +211,31 @@ impl std::fmt::Display for BuildError {
 }
 impl std::error::Error for BuildError {}
 
+/// Which slice of a Seismic module's generated Rust to emit.
+#[derive(Clone, Debug, Default)]
+pub enum EmitMode {
+    /// Emit `<module>.seismicbundle` and full `<module>.rs` (default).
+    #[default]
+    Monolith,
+    /// Emit `<module>.seismicbundle` and a minimal `<module>.rs` exposing
+    /// `pub fn module()` and `pub fn identity() -> &'static str`.
+    /// Watches all `.seismic` and native assets.
+    Bundle,
+    /// Emit only `<module>.rs` with `pub mod <entry> { pub mod __contract { ... } }`,
+    /// `#[cfg]`-gated per target OS. Watches only `.seismic` files.
+    Contracts,
+    /// Emit only `<module>.rs` with `cpu_library` and `pub mod <entry> { pub mod cpu_native { ... } }`.
+    /// Watches only `.seismic` files and CPU native `.rs` sources.
+    CpuNative,
+    /// Emit only the thin façade `<module>.rs` delegating bundle, contracts, and CPU
+    /// native launchers to the split crates. Watches only `.seismic` files.
+    Facade {
+        bundle_crate: String,
+        contracts_crate: String,
+        cpu_crate: String,
+    },
+}
+
 /// One module build.
 #[derive(Debug)]
 pub struct Build {
@@ -218,6 +243,7 @@ pub struct Build {
     sources: Vec<PathBuf>,
     include_std: bool,
     out_dir: Option<PathBuf>,
+    mode: EmitMode,
 }
 
 impl Build {
@@ -228,7 +254,13 @@ impl Build {
             sources: Vec::new(),
             include_std: true,
             out_dir: None,
+            mode: EmitMode::Monolith,
         }
+    }
+    /// Select which slice of the generated module to emit.
+    pub fn mode(mut self, mode: EmitMode) -> Self {
+        self.mode = mode;
+        self
     }
     /// A `.seismic` file or a directory searched recursively.
     pub fn source(mut self, path: impl Into<PathBuf>) -> Self {
@@ -263,6 +295,9 @@ impl Build {
     }
     pub(crate) fn output_directory(&self) -> Option<&PathBuf> {
         self.out_dir.as_ref()
+    }
+    pub(crate) fn emit_mode(&self) -> &EmitMode {
+        &self.mode
     }
 }
 
@@ -327,6 +362,88 @@ mod internals {
         text: &'a str,
     }
 
+    /// Return `cargo:rerun-if-changed` paths for `mode`, ensuring GPU shader
+    /// directories (`metal`, `cuda`, `vulkan`) are NEVER covered by any
+    /// directory watch in `Contracts`, `CpuNative`, or `Facade` (Cargo's
+    /// `rerun-if-changed=<dir>` is recursive, so watching a parent directory
+    /// containing `metal/`/`cuda/`/`vulkan/` would invalidate on shader edits).
+    pub(super) fn rerun_watch_paths(
+        mode: &EmitMode,
+        sources: &[PathBuf],
+        dependencies: &[PathBuf],
+    ) -> Result<Vec<PathBuf>, BuildError> {
+        fn has_gpu_subdir(dir: &std::path::Path) -> Result<bool, BuildError> {
+            for entry in fs::read_dir(dir).map_err(BuildError::Io)? {
+                let path = entry.map_err(BuildError::Io)?.path();
+                let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
+                if path.is_dir() && matches!(name, "metal" | "cuda" | "vulkan") {
+                    return Ok(true);
+                }
+            }
+            Ok(false)
+        }
+        fn collect_non_gpu_dirs(
+            dir: &std::path::Path,
+            skip_cpu: bool,
+            out: &mut Vec<PathBuf>,
+        ) -> Result<(), BuildError> {
+            // Only watch a directory directly if it does NOT contain GPU shader
+            // subdirectories (otherwise Cargo's recursive dir watch would fire on
+            // `.metal`/`.cu`/`.comp` edits).
+            if !has_gpu_subdir(dir)? {
+                out.push(dir.to_path_buf());
+                return Ok(());
+            }
+            for entry in fs::read_dir(dir).map_err(BuildError::Io)? {
+                let path = entry.map_err(BuildError::Io)?.path();
+                let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
+                if name.starts_with('.') || !path.is_dir() {
+                    continue;
+                }
+                if matches!(name, "metal" | "cuda" | "vulkan") || (skip_cpu && name == "cpu") {
+                    continue;
+                }
+                collect_non_gpu_dirs(&path, skip_cpu, out)?;
+            }
+            Ok(())
+        }
+        let mut watches = Vec::new();
+        match mode {
+            EmitMode::Monolith | EmitMode::Bundle => {
+                watches.extend(dependencies.iter().cloned());
+                watches.extend(sources.iter().cloned());
+            }
+            EmitMode::Contracts | EmitMode::Facade { .. } => {
+                for source in sources {
+                    if source.is_dir() {
+                        let root = source.canonicalize().map_err(BuildError::Io)?;
+                        collect_non_gpu_dirs(&root, true, &mut watches)?;
+                    }
+                }
+                for path in dependencies {
+                    if path.extension().and_then(|e| e.to_str()) == Some("seismic") {
+                        watches.push(path.clone());
+                    }
+                }
+            }
+            EmitMode::CpuNative => {
+                for source in sources {
+                    if source.is_dir() {
+                        let root = source.canonicalize().map_err(BuildError::Io)?;
+                        collect_non_gpu_dirs(&root, false, &mut watches)?;
+                    }
+                }
+                for path in dependencies {
+                    let ext = path.extension().and_then(|e| e.to_str());
+                    if matches!(ext, Some("seismic" | "rs")) {
+                        watches.push(path.clone());
+                    }
+                }
+            }
+        }
+        Ok(watches)
+    }
+
     pub(super) fn run(build: Build) -> Result<Artifacts, BuildError> {
         validate_identifier(build.module())?;
         let output = match build.output_directory() {
@@ -349,20 +466,101 @@ mod internals {
             seismic_lang::source::LoadError::Invalid(e) => BuildError::Environment(e),
             seismic_lang::source::LoadError::NativeInclude(e) => BuildError::NativeInclude(e),
         })?;
-        for path in loaded.dependencies() {
-            println!("cargo:rerun-if-changed={}", path.display());
-        }
-        for path in build.sources() {
+        let mode = build.emit_mode();
+        let deps: Vec<PathBuf> = loaded.dependencies().map(std::path::Path::to_path_buf).collect();
+        for path in rerun_watch_paths(mode, build.sources(), &deps)? {
             println!("cargo:rerun-if-changed={}", path.display());
         }
         // No directory watch is needed: an include resolves from its directive
         // and the including file alone, so a new file cannot change a successful
         // build, and a missing include fails the build, which Cargo reruns.
         let checked = &loaded.module;
+        let bundle = output.join(format!("{}.seismicbundle", build.module()));
+        let bindings = output.join(format!("{}.rs", build.module()));
+
+        match mode {
+            EmitMode::Bundle => {
+                let encoded = seismic_lang::bundle::encode_checked_bundle(checked);
+                let _ = resolve_native_assets(checked, &loaded.assets, &output, true)?;
+                let mut identity_hasher = Sha256::new();
+                identity_hasher.update(&encoded);
+                let bundle_digest: [u8; 32] = identity_hasher.finalize().into();
+                let identity = hex(&bundle_digest);
+                fs::write(&bundle, &encoded).map_err(BuildError::Io)?;
+                let rendered = render_bundle_only(build.module(), &identity);
+                fs::write(&bindings, rendered.as_bytes()).map_err(BuildError::Io)?;
+                return Ok(Artifacts {
+                    bundle,
+                    bindings,
+                    identity,
+                    natives: native_coverage(checked, &loaded.assets),
+                });
+            }
+            EmitMode::Contracts => {
+                let rendered = render_contracts_only(checked)?;
+                fs::write(&bindings, rendered.as_bytes()).map_err(BuildError::Io)?;
+                return Ok(Artifacts {
+                    bundle,
+                    bindings,
+                    identity: String::new(),
+                    natives: native_coverage(checked, &loaded.assets),
+                });
+            }
+            EmitMode::CpuNative => {
+                let native_assets = resolve_native_assets(checked, &loaded.assets, &output, false)?;
+                let cpu_assets = native_assets
+                    .iter()
+                    .filter_map(|native| native.cpu.as_ref().map(|cpu| cpu.path.as_path()))
+                    .collect::<Vec<_>>();
+                let cpu_library = if cpu_assets.is_empty() {
+                    None
+                } else {
+                    let roots =
+                        seismic_lang::source::source_roots(build.sources()).map_err(
+                            |error| match error {
+                                seismic_lang::source::LoadError::Io(error) => BuildError::Io(error),
+                                other => BuildError::Environment(format!("{other:?}")),
+                            },
+                        )?;
+                    Some(cpu_library(&roots, &cpu_assets)?)
+                };
+                let rendered = render_cpu_only(checked, &native_assets, cpu_library.as_ref())?;
+                fs::write(&bindings, rendered.as_bytes()).map_err(BuildError::Io)?;
+                return Ok(Artifacts {
+                    bundle,
+                    bindings,
+                    identity: String::new(),
+                    natives: native_coverage(checked, &loaded.assets),
+                });
+            }
+            EmitMode::Facade {
+                bundle_crate,
+                contracts_crate,
+                cpu_crate,
+            } => {
+                let native_assets = resolve_native_assets(checked, &loaded.assets, &output, false)?;
+                let rendered = render_facade(
+                    checked,
+                    &native_assets,
+                    bundle_crate,
+                    contracts_crate,
+                    cpu_crate,
+                )?;
+                fs::write(&bindings, rendered.as_bytes()).map_err(BuildError::Io)?;
+                return Ok(Artifacts {
+                    bundle,
+                    bindings,
+                    identity: String::new(),
+                    natives: native_coverage(checked, &loaded.assets),
+                });
+            }
+            EmitMode::Monolith => {}
+        }
+
         // Captured Metal/CUDA/Vulkan assets carry their includes inlined, so
         // the bundle digest below covers every included file.
         let encoded = seismic_lang::bundle::encode_checked_bundle(checked);
-        let native_assets = resolve_native_assets(checked, &loaded.assets, &output)?;
+        let native_assets = resolve_native_assets(checked, &loaded.assets, &output, true)?;
         let cpu_assets = native_assets
             .iter()
             .filter_map(|native| native.cpu.as_ref().map(|cpu| cpu.path.as_path()))
@@ -389,20 +587,15 @@ mod internals {
         identity_hasher.update(&encoded);
         let bundle_digest: [u8; 32] = identity_hasher.finalize().into();
         let identity = hex(&bundle_digest);
-        let bundle = output.join(format!("{}.seismicbundle", build.module()));
-        let bindings = output.join(format!("{}.rs", build.module()));
-        fs::write(&bundle, encoded).map_err(BuildError::Io)?;
-        fs::write(
-            &bindings,
-            render(
-                checked,
-                build.module(),
-                &identity,
-                &native_assets,
-                cpu_library.as_ref(),
-            )?,
-        )
-        .map_err(BuildError::Io)?;
+        fs::write(&bundle, &encoded).map_err(BuildError::Io)?;
+        let rendered = render(
+            checked,
+            build.module(),
+            &identity,
+            &native_assets,
+            cpu_library.as_ref(),
+        )?;
+        fs::write(&bindings, rendered.as_bytes()).map_err(BuildError::Io)?;
         Ok(Artifacts {
             bundle,
             bindings,
@@ -437,6 +630,7 @@ mod internals {
         module: &'a seismic_lang::checked::CheckedModule,
         captured: &[seismic_lang::source::CapturedAsset],
         output: &std::path::Path,
+        validate_gpu: bool,
     ) -> Result<Vec<EntryNative<'a>>, BuildError> {
         use seismic_lang::registry::BackendName;
         let mut natives = Vec::new();
@@ -471,6 +665,9 @@ mod internals {
                     });
                     continue;
                 };
+                if !validate_gpu {
+                    continue;
+                }
                 let extension = match dialect {
                     SourceDialect::Metal => "metal",
                     SourceDialect::Cuda => "cu",
@@ -1629,6 +1826,103 @@ mod internals {
 
     use seismic_lang::native_name::native_macro;
 
+    fn render_bundle_only(name: &str, identity: &str) -> String {
+        let mut out = String::new();
+        out.push_str("// @generated by seismic-build (bundle); do not edit.\n");
+        out.push_str(&format!(
+            "static __BUNDLE: &[u8] = include_bytes!({:?});\n",
+            format!("{name}.seismicbundle")
+        ));
+        out.push_str("static __MODULE: seismic::generated::OnceLock<Result<seismic::generated::Module, seismic::CheckedBundleError>> = seismic::generated::OnceLock::new();\n");
+        out.push_str("/// The checked module, an opaque token for Seismic's module-wide services.\n");
+        out.push_str("pub fn module() -> Result<&'static seismic::generated::Module, seismic::CheckedBundleError> { seismic::generated::module_from_bundle(&__MODULE, __BUNDLE) }\n");
+        out.push_str("/// Hex digest of sources plus compiler semantic version.\n");
+        out.push_str(&format!("pub fn identity() -> &'static str {{ {:?} }}\n", identity));
+        out
+    }
+
+    fn render_contracts_only(
+        module: &seismic_lang::checked::CheckedModule,
+    ) -> Result<String, BuildError> {
+        let mut out = String::new();
+        out.push_str("// @generated by seismic-build (contracts); do not edit.\n");
+        for entry in module.entries() {
+            let module_name = rust_ident(&entry.name);
+            out.push_str(&format!("pub mod {module_name} {{\n"));
+            crate::render_contract::render_contract_helpers_only(&mut out, module, entry)?;
+            out.push_str("}\n");
+        }
+        Ok(out)
+    }
+
+    fn render_cpu_only(
+        module: &seismic_lang::checked::CheckedModule,
+        native_assets: &[EntryNative<'_>],
+        cpu_library: Option<&CpuLibrary>,
+    ) -> Result<String, BuildError> {
+        let mut out = String::new();
+        out.push_str("// @generated by seismic-build (cpu-native); do not edit.\n");
+        out.push_str("pub mod constants {\n");
+        for (name, value) in module.constants() {
+            out.push_str(&format!("  pub const {name}: u64 = {value};\n"));
+        }
+        for function in module.constant_functions() {
+            render_constant_function(&mut out, function);
+        }
+        out.push_str("}\n");
+        if let Some(library) = cpu_library {
+            render_cpu_library(&mut out, library);
+        }
+        for entry in module.entries() {
+            let Some(native) = native_assets.iter().find(|native| native.entry == entry.id) else {
+                continue;
+            };
+            let Some(cpu) = &native.cpu else {
+                continue;
+            };
+            let library =
+                cpu_library.expect("a build with a CPU implementation scans its CPU library");
+            let module_name = rust_ident(&entry.name);
+            out.push_str(&format!("pub mod {module_name} {{\n"));
+            render_cpu_native(&mut out, entry, cpu, library)?;
+            out.push_str("}\n");
+        }
+        Ok(out)
+    }
+
+    fn render_facade(
+        module: &seismic_lang::checked::CheckedModule,
+        native_assets: &[EntryNative<'_>],
+        bundle_crate: &str,
+        contracts_crate: &str,
+        cpu_crate: &str,
+    ) -> Result<String, BuildError> {
+        let mut out = String::new();
+        out.push_str("// @generated by seismic-build (facade); do not edit.\n");
+        out.push_str(&format!("pub use {bundle_crate}::{{identity, module}};\n"));
+        out.push_str(&format!("pub use {cpu_crate}::cpu_library;\n"));
+        out.push_str("/// The module constants (`const NAME = INTEGER`) and constant functions (`const NAME(P, ..) = EXPR`), which natives read as `SEISMIC_CONST_NAME`.\npub mod constants {\n");
+        for (name, value) in module.constants() {
+            out.push_str(&format!("  pub const {name}: u64 = {value};\n"));
+        }
+        for function in module.constant_functions() {
+            render_constant_function(&mut out, function);
+        }
+        out.push_str("}\n");
+        for entry in module.entries() {
+            let native = native_assets.iter().find(|native| native.entry == entry.id);
+            render_entry_split(
+                &mut out,
+                module,
+                entry,
+                native,
+                Some((contracts_crate, cpu_crate)),
+                None,
+            )?;
+        }
+        Ok(out)
+    }
+
     fn render(
         module: &seismic_lang::checked::CheckedModule,
         name: &str,
@@ -1661,16 +1955,17 @@ mod internals {
         }
         for entry in module.entries() {
             let native = native_assets.iter().find(|native| native.entry == entry.id);
-            render_entry(&mut out, module, entry, native, cpu_library)?;
+            render_entry_split(&mut out, module, entry, native, None, cpu_library)?;
         }
         Ok(out)
     }
 
-    fn render_entry(
+    fn render_entry_split(
         out: &mut String,
         module: &seismic_lang::checked::CheckedModule,
         entry: &EntryInfo,
         native: Option<&EntryNative<'_>>,
+        split: Option<(&str, &str)>,
         cpu_library: Option<&CpuLibrary>,
     ) -> Result<(), BuildError> {
         let module_name = rust_ident(&entry.name);
@@ -1979,11 +2274,87 @@ mod internals {
             }
             out.push_str("    ])\n  }\n");
         }
-        crate::render_contract::render_contract(out, module, entry)?;
-        if let Some(native) = native {
-            render_native(out, entry, native, cpu_library)?;
+        if let Some((contracts_crate, cpu_crate)) = split {
+            let prefix = format!("{contracts_crate}::{module_name}::__contract");
+            crate::render_contract::render_contract_delegating(out, module, entry, &prefix)?;
+            if let Some(native) = native {
+                render_native_delegating(out, entry, native, cpu_crate, &module_name)?;
+            }
+        } else {
+            crate::render_contract::render_contract(out, module, entry)?;
+            if let Some(native) = native {
+                render_native(out, entry, native, cpu_library)?;
+            }
         }
         out.push_str("}\n");
+        Ok(())
+    }
+
+    fn render_native_delegating(
+        out: &mut String,
+        entry: &EntryInfo,
+        native: &EntryNative<'_>,
+        cpu_crate: &str,
+        module_name: &str,
+    ) -> Result<(), BuildError> {
+        let elements = !entry.element_parameters.is_empty();
+        let element_list = |out: &mut String| {
+            for parameter in &entry.element_parameters {
+                out.push_str(&format!(
+                    "      ({:?}, elements.{}),\n",
+                    parameter,
+                    rust_ident(parameter)
+                ));
+            }
+        };
+        let cpu = if native.cpu.is_some() {
+            format!("Some(&{cpu_crate}::{module_name}::cpu_native::KERNELS)")
+        } else {
+            "None".to_owned()
+        };
+        if elements {
+            out.push_str("  pub fn native_for_device_with(device: &seismic::Device, elements: Elements, specialization: &seismic::NativeSpecialization) -> Result<seismic::NativeKernel<Entry>, seismic::LoadError> {\n");
+            out.push_str("    seismic::generated::prepare_native::<Entry>(device, specialization, &[\n");
+            element_list(out);
+            out.push_str(&format!("    ], {cpu})\n  }}\n"));
+            out.push_str("  /// Whether preparation on a `backend` device takes `specialization` at `elements`, decided without a device.\n");
+            out.push_str("  pub fn native_admission_with(backend: seismic::BackendName, elements: Elements, specialization: &seismic::NativeSpecialization) -> Result<seismic::NativeAdmission, seismic::CheckedBundleError> {\n");
+            out.push_str("    seismic::generated::admit_native::<Entry>(backend, specialization, &[\n");
+            element_list(out);
+            out.push_str(&format!("    ], {cpu})\n  }}\n"));
+            out.push_str("  pub fn native_entry_with(elements: Elements) -> seismic::BoundEntry<Entry> {\n");
+            out.push_str("    seismic::generated::bound_entry::<Entry>(&[\n");
+            element_list(out);
+            out.push_str(&format!("    ], {cpu})\n  }}\n"));
+            out.push_str("  pub fn native_tune_with<'a>(charges: &seismic::Charges, elements: Elements, statics: &seismic::NativeSpecialization, mut points: impl seismic::PointSource<'a, Entry>, validation: seismic::NumericalRequirement, strategy: seismic::Strategy) -> Result<seismic::TuningResult, seismic::TuneError> {\n");
+            out.push_str("    seismic::generated::tune_native::<Entry>(charges, statics, &[\n");
+            element_list(out);
+            out.push_str(&format!("    ], {cpu}, &mut points, validation, strategy)\n  }}\n"));
+            out.push_str("  pub fn native_search_with<'a>(charges: &seismic::Charges, elements: Elements, statics: &seismic::NativeSpecialization, validation: seismic::NumericalRequirement) -> Result<seismic::NativeSearch<'a, Entry>, seismic::TuneError> {\n");
+            out.push_str("    seismic::generated::search_native::<Entry>(charges, statics, &[\n");
+            element_list(out);
+            out.push_str(&format!("    ], {cpu}, validation)\n  }}\n"));
+            out.push_str("  pub fn native_digest_with(device: &seismic::Device, elements: Elements, statics: &seismic::NativeSpecialization) -> Result<String, seismic::TuneError> {\n");
+            out.push_str("    seismic::generated::digest_native::<Entry>(device, statics, &[\n");
+            element_list(out);
+            out.push_str(&format!("    ], {cpu})\n  }}\n"));
+        } else {
+            out.push_str(&format!("  pub fn native_for_device(device: &seismic::Device, specialization: &seismic::NativeSpecialization) -> Result<seismic::NativeKernel<Entry>, seismic::LoadError> {{ seismic::generated::prepare_native::<Entry>(device, specialization, &[], {cpu}) }}\n"));
+            out.push_str("  /// Whether preparation on a `backend` device takes `specialization`, decided without a device.\n");
+            out.push_str(&format!("  pub fn native_admission(backend: seismic::BackendName, specialization: &seismic::NativeSpecialization) -> Result<seismic::NativeAdmission, seismic::CheckedBundleError> {{ seismic::generated::admit_native::<Entry>(backend, specialization, &[], {cpu}) }}\n"));
+            out.push_str(&format!("  pub fn native_entry() -> seismic::BoundEntry<Entry> {{ seismic::generated::bound_entry::<Entry>(&[], {cpu}) }}\n"));
+            out.push_str(&format!("  pub fn native_tune<'a>(charges: &seismic::Charges, statics: &seismic::NativeSpecialization, mut points: impl seismic::PointSource<'a, Entry>, validation: seismic::NumericalRequirement, strategy: seismic::Strategy) -> Result<seismic::TuningResult, seismic::TuneError> {{ seismic::generated::tune_native::<Entry>(charges, statics, &[], {cpu}, &mut points, validation, strategy) }}\n"));
+            out.push_str(&format!("  pub fn native_search<'a>(charges: &seismic::Charges, statics: &seismic::NativeSpecialization, validation: seismic::NumericalRequirement) -> Result<seismic::NativeSearch<'a, Entry>, seismic::TuneError> {{ seismic::generated::search_native::<Entry>(charges, statics, &[], {cpu}, validation) }}\n"));
+            out.push_str(&format!("  pub fn native_digest(device: &seismic::Device, statics: &seismic::NativeSpecialization) -> Result<String, seismic::TuneError> {{ seismic::generated::digest_native::<Entry>(device, statics, &[], {cpu}) }}\n"));
+        }
+        if !native.tuned {
+            out.push_str("  impl seismic::Untuned for Entry {}\n");
+        }
+        out.push_str("  /// The checked native implementation for the device's backend.\n");
+        out.push_str("  pub fn native_implementation(device: &seismic::Device) -> Result<Option<seismic::OnDevice>, seismic::CheckedBundleError> { seismic::generated::native_implementation::<Entry>(device) }\n");
+        if native.cpu.is_some() {
+            out.push_str(&format!("  pub use {cpu_crate}::{module_name}::cpu_native;\n"));
+        }
         Ok(())
     }
 
@@ -2086,27 +2457,31 @@ mod internals {
             directory: &std::path::Path,
             assets: &[&std::path::Path],
             files: &mut Vec<(Vec<String>, PathBuf)>,
-        ) -> Result<(), BuildError> {
-            // A new library file changes every CPU implementation's module
-            // tree and digest.
-            println!("cargo:rerun-if-changed={}", directory.display());
+        ) -> Result<bool, BuildError> {
             let mut entries = fs::read_dir(directory)
                 .map_err(BuildError::Io)?
                 .map(|entry| entry.map(|entry| entry.path()))
                 .collect::<Result<Vec<_>, _>>()
                 .map_err(BuildError::Io)?;
             entries.sort();
+            let mut has_rs = false;
             for path in entries {
-                let hidden = path
-                    .file_name()
-                    .and_then(|name| name.to_str())
-                    .is_some_and(|name| name.starts_with('.'));
-                if hidden {
+                let name = path.file_name().and_then(|name| name.to_str()).unwrap_or("");
+                if name.starts_with('.') {
                     continue;
                 }
                 if path.is_dir() {
-                    scan(root, &path, assets, files)?;
+                    // GPU shader trees contain no CPU `.rs` library files; never
+                    // emit `rerun-if-changed` on them so GPU shader edits do not
+                    // invalidate CPU native builds.
+                    if directory == root && matches!(name, "metal" | "cuda" | "vulkan") {
+                        continue;
+                    }
+                    if scan(root, &path, assets, files)? {
+                        has_rs = true;
+                    }
                 } else if path.extension().is_some_and(|extension| extension == "rs") {
+                    has_rs = true;
                     let path = path.canonicalize().map_err(BuildError::Io)?;
                     if assets.contains(&path.as_path()) {
                         continue;
@@ -2136,7 +2511,12 @@ mod internals {
                     files.push((modules, path));
                 }
             }
-            Ok(())
+            // Watch subdirectories containing CPU library files (never the root
+            // directory itself, which also contains GPU shader subdirectories).
+            if has_rs && directory != root {
+                println!("cargo:rerun-if-changed={}", directory.display());
+            }
+            Ok(has_rs)
         }
         let mut files = Vec::new();
         for root in roots {
@@ -4817,5 +5197,107 @@ mod native_tests {
             Ok(_) => panic!("32 buffers must not build for Metal"),
         }
         fs::remove_dir_all(&root).expect("remove fixture directory");
+    }
+
+    #[test]
+    fn bundle_identity_is_checkout_path_independent_and_tracks_shader_edits() {
+        let root_a = fixture("bundle-id-a");
+        let root_b = fixture("bundle-id-b");
+        let seismic_src = "fn id_op[N](x: &tensor[N] f32) -> tensor[N] f32:\n    let mut output = tensor[N] f32\n    for i in 0..N:\n        output[i] = x[i]\n    return output\n\nnative id_op for metal from \"native/id_op.metal\":\n    launch id_op:\n        threadgroups (1, 1, 1)\n        threads_per_threadgroup (1, 1, 1)\n";
+        let metal_src = "kernel void id_op() {}\n";
+
+        for root in [&root_a, &root_b] {
+            fs::write(root.join("ops.seismic"), seismic_src).expect("Seismic fixture");
+            fs::write(root.join("native/id_op.metal"), metal_src).expect("Metal fixture");
+        }
+
+        let a = Build::new("fixture")
+            .source(&root_a)
+            .std(false)
+            .mode(EmitMode::Bundle)
+            .out_dir(root_a.join("out"))
+            .run()
+            .expect("build a");
+        let b = Build::new("fixture")
+            .source(&root_b)
+            .std(false)
+            .mode(EmitMode::Bundle)
+            .out_dir(root_b.join("out"))
+            .run()
+            .expect("build b");
+        assert_eq!(a.identity, b.identity, "identical trees in different checkouts must share bundle identity");
+        assert_eq!(
+            fs::read(&a.bundle).expect("read bundle a"),
+            fs::read(&b.bundle).expect("read bundle b"),
+            "checked bundles must be byte-identical across checkout paths"
+        );
+
+        // A 1-byte shader edit must change the bundle identity.
+        fs::write(root_b.join("native/id_op.metal"), "kernel void id_op() { }\n").expect("edit metal");
+        let b_edited = Build::new("fixture")
+            .source(&root_b)
+            .std(false)
+            .mode(EmitMode::Bundle)
+            .out_dir(root_b.join("out2"))
+            .run()
+            .expect("build b edited");
+        assert_ne!(a.identity, b_edited.identity, "shader edit must change bundle identity");
+
+        fs::remove_dir_all(&root_a).expect("remove fixture a");
+        fs::remove_dir_all(&root_b).expect("remove fixture b");
+    }
+
+    #[test]
+    fn non_bundle_watch_paths_never_cover_gpu_shader_dirs() {
+        let root = fixture("watch-isolation");
+        fs::create_dir_all(root.join("metal")).expect("metal dir");
+        fs::create_dir_all(root.join("cuda")).expect("cuda dir");
+        fs::create_dir_all(root.join("vulkan")).expect("vulkan dir");
+        fs::create_dir_all(root.join("cpu")).expect("cpu dir");
+        fs::write(root.join("ops.seismic"), "").expect("seismic");
+        fs::write(root.join("metal/op.metal"), "").expect("metal");
+        fs::write(root.join("cuda/op.cu"), "").expect("cuda");
+        fs::write(root.join("vulkan/op.comp"), "").expect("vulkan");
+        fs::write(root.join("cpu/op.rs"), "").expect("cpu");
+
+        let deps = vec![
+            root.join("ops.seismic").canonicalize().unwrap(),
+            root.join("metal/op.metal").canonicalize().unwrap(),
+            root.join("cuda/op.cu").canonicalize().unwrap(),
+            root.join("vulkan/op.comp").canonicalize().unwrap(),
+            root.join("cpu/op.rs").canonicalize().unwrap(),
+        ];
+        let gpu_dirs = [
+            root.join("metal").canonicalize().unwrap(),
+            root.join("cuda").canonicalize().unwrap(),
+            root.join("vulkan").canonicalize().unwrap(),
+        ];
+
+        for mode in [
+            EmitMode::Contracts,
+            EmitMode::CpuNative,
+            EmitMode::Facade {
+                bundle_crate: "b".into(),
+                contracts_crate: "c".into(),
+                cpu_crate: "u".into(),
+            },
+        ] {
+            let watches = internals::rerun_watch_paths(&mode, std::slice::from_ref(&root), &deps)
+                .expect("watch paths");
+            for watch in &watches {
+                if watch.is_dir() {
+                    for gpu in &gpu_dirs {
+                        assert!(
+                            !gpu.starts_with(watch),
+                            "mode {mode:?} emitted recursive dir watch {} covering GPU dir {}",
+                            watch.display(),
+                            gpu.display()
+                        );
+                    }
+                }
+            }
+            assert!(watches.contains(&deps[0]), "mode {mode:?} must watch .seismic file");
+        }
+        fs::remove_dir_all(&root).expect("remove fixture");
     }
 }
