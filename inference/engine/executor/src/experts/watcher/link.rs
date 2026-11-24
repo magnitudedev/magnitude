@@ -200,9 +200,10 @@ impl LinkMover {
         moved
     }
 
-    /// Cancel every unbegun opportunistic staging batch on `copier`, freeing
-    /// its staging slot and host-tier hold immediately (used when a resize
-    /// waits for in-flight copies to drain, matching `Prefetch::cancel_cover`).
+    /// Cancel every unbegun link transfer on `copier` and unpromote any
+    /// `Moving::Queued` promotions so a waiting resize or traffic hold never
+    /// stalls behind unsubmitted or queued speculative work (matching
+    /// `Prefetch::cancel_cover`).
     pub(super) fn cancel_unbegun(&mut self, core: &mut Core, copier: &Copier) -> bool {
         let mut cancelled = false;
         for (group, slot, batch) in core.directory.staging_copying() {
@@ -212,7 +213,45 @@ impl LinkMover {
                 cancelled = true;
             }
         }
+        for (group, record, _) in core.directory.queued() {
+            core.directory.unpromoted(group, record);
+            cancelled = true;
+        }
+        for (group, record, batch) in core.directory.copying() {
+            if copier.copies.cancel(batch) {
+                core.directory.unpromoted(group, record);
+                cancelled = true;
+            }
+        }
         cancelled
+    }
+
+    /// Post queued write-backs (`TransferPriority::WriteBack`) so releases,
+    /// prompt leases, traffic holds, and waiting resizes can never deadlock
+    /// behind unposted `Back { batch: None }` entries.
+    pub(super) fn post_backs(&mut self, core: &mut Core, shared: &Shared, copier: &Copier) -> bool {
+        let backs = core.directory.backs_queued();
+        if backs.is_empty() {
+            return false;
+        }
+        let Some(copy) = line(core, shared) else {
+            return false;
+        };
+        let bytes = record_bytes(core);
+        let mut moved = false;
+        for back @ (group, record, ..) in backs {
+            let depth = permanent_post_depth(copy.depth(bytes[group]), copier.copies.flight(), core.directory.staging_copying().len());
+            match post_back(core, copier, depth, back) {
+                Ok(true) => moved = true,
+                Ok(false) => break,
+                Err(error) => {
+                    core.directory.written_back(group, record, false);
+                    shared.end_serving(format!("a release's write-back into the host tier: {error}"));
+                    return true;
+                }
+            }
+        }
+        moved
     }
 
     /// One turn of Path 0: size promotion reserves, settle in-flight copies,
@@ -236,12 +275,17 @@ impl LinkMover {
         drive_in_flight: usize,
     ) -> bool {
         let mut moved = self.settle(core, ledger, shared, copier, progress);
+        if shared.life.ended().is_some() {
+            return moved;
+        }
+        if held || shared.resizing.is_pending() {
+            moved |= self.cancel_unbegun(core, copier);
+            moved |= self.post_backs(core, shared, copier);
+            return moved;
+        }
         let Some(copy) = line(core, shared) else {
             return moved;
         };
-        if held || shared.life.ended().is_some() || shared.resizing.is_pending() {
-            return moved;
-        }
         let bytes = record_bytes(core);
         let admission = shared.telemetry.link_admission(Some(copy.transfer));
 
@@ -249,17 +293,9 @@ impl LinkMover {
         // Depth excludes in-flight opportunistic `Stage` batches so already-
         // queued staging copies never lock out write-backs, and write-backs
         // are NEVER deferred by `defer_promote` to prevent deadlock.
-        for back @ (group, record, ..) in core.directory.backs_queued() {
-            let depth = permanent_post_depth(copy.depth(bytes[group]), copier.copies.flight(), core.directory.staging_copying().len());
-            match post_back(core, copier, depth, back) {
-                Ok(true) => moved = true,
-                Ok(false) => break,
-                Err(error) => {
-                    core.directory.written_back(group, record, false);
-                    shared.end_serving(format!("a release's write-back into the host tier: {error}"));
-                    return true;
-                }
-            }
+        moved |= self.post_backs(core, shared, copier);
+        if shared.life.ended().is_some() {
+            return true;
         }
 
         // Priority 2: Permanent VRAM promotions (save every future token,
