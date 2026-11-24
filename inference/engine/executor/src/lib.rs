@@ -172,7 +172,7 @@ pub use planning::{
     AssessmentMemoryCharge, AssessmentMemoryTerms, AttentionBinding, AttentionShape, StoreDemands, prompt_places_at,
     RoundingArgs,
     BackendPlan,
-    BankAllocation, BankBinding, BankTier, ConveyorCarrier, ExpertBankPlan, Holding, StoredPart, StoredStack,
+    BankAllocation, BankBinding, BankSubstrate, BankTier, ConveyorCarrier, ExpertBankPlan, Holding, HostTier, StoredPart, StoredStack,
     CONVERSATION_CHECKPOINTS, CPU_IMAGE_CELLS, CapabilityPlan, ComponentPlan, ComponentSelection,
     ConvolutionBinding, ConvolvedLayerBinding, CorrectorBinding, CorrectorLayerBinding,
     DenseBinding, DenseBranchBinding, DenseScales, DeviceProcessBytes, DraftBlockBinding,

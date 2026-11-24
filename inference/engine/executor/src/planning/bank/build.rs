@@ -171,6 +171,10 @@ impl ModelLoadPlan {
         let selected = max_selected;
         // A routed layer streamed has experts to stream.
         let layers = BankLayers::new(layers).ok_or(PlanError::Topology("a streamed routed layer has no experts"))?;
+        let has_banked_head = layers.iter().any(|layer| {
+            matches!(layer.scope, magnitude_family_contracts::WeightScope::HeadSublayer(_))
+        });
+        let head_steps = if has_banked_head { self.head_steps.max(1) } else { 1 };
         // A conveyor or a scratch without a layout, or a pool without a
         // granule, is refused here, so every sizing past this may rely on
         // them (`ExpertBankPlan::prompt_records`, `ExpertBankPlan::granule`).
@@ -213,6 +217,7 @@ impl ModelLoadPlan {
             host_slots: 0,
             host_cap: None,
             places,
+            head_steps,
             pass: crate::PassLaunches::new(
                 usize::try_from(places)
                     .ok()
@@ -343,8 +348,8 @@ impl ModelLoadPlan {
             .with_bank_paths(bank.paths)?
             .with_bank_slots(bank.slots, bank.ceiling)?;
         let built = load.bank.as_mut().expect("the load was just banked");
-        (built.host_slots, built.pass, built.resident, built.decode_hits_min_bytes) =
-            (bank.host_slots, bank.pass, bank.resident, bank.decode_hits_min_bytes);
+        (built.host_slots, built.pass, built.resident, built.decode_hits_min_bytes, built.head_steps) =
+            (bank.host_slots, bank.pass, bank.resident, bank.decode_hits_min_bytes, bank.head_steps);
         Ok(load)
     }
 

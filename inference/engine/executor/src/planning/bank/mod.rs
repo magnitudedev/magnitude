@@ -190,14 +190,17 @@ pub struct ExpertBankPlan {
     /// memory's budget changes.
     pub host_slots: u64,
     /// The most chain places a prompt group may take, one for every chunk of
-    /// a whole-context prompt (`ExecutionPlanDraft::prompt_places`): the
-    /// steps in flight its routing records hold (`FlightDepth::steps`, the
-    /// routed kernels' `FLIGHT`). Each place's own step word, scratch flags
-    /// and request regions and group reads (`BankPart::placed`) are held
-    /// for the places a group holds (`Self::placed`), the floor's one at the
-    /// load, so the bank's static charge is the same whichever chain the
-    /// plan admits.
+    /// a whole-context prompt (`ExecutionPlanDraft::prompt_places`). Each
+    /// place's own step word, scratch flags and request regions and group reads
+    /// (`BankPart::placed`) are held for the places a group holds
+    /// (`Self::placed`), the floor's one at the load, so the bank's static
+    /// charge is the same whichever chain the plan admits.
     pub places: u64,
+    /// The most chained passes one banked native head launch executes
+    /// (`PlannedMethod::head_steps` when the bank streams a `HeadSublayer`,
+    /// otherwise `1`): ensures the routing-record ring (`Self::flight`) fits
+    /// every head group in flight even when `places < head_steps`.
+    pub head_steps: u64,
     /// The launches one merged-expert prompt pass covers
     /// ([`crate::PassLaunches`]): what the pass buffers and the pass graphs
     /// are sized by, at most `places`. Built at every place; the plan's
@@ -641,10 +644,30 @@ impl ExpertBankPlan {
             words: RegionWords {
                 choices: self.table_choices(),
                 rounds: self.rounds(),
-                flight: self.flights.steps(self.places),
+                flight: self.flight(),
                 sites: self.flights.steps(1),
             },
         })
+    }
+
+    /// The most steps any single group submitted to this bank can contain:
+    /// either a prompt chain of up to `places` launches or a banked native
+    /// head launch of up to `head_steps` chained passes.
+    pub fn group_steps(&self) -> u64 {
+        self.places.max(self.head_steps)
+    }
+
+    /// The steps in flight (`FLIGHT`) this bank's routing records, keys, file
+    /// and scratch exchange tables hold at `places` prompt chain places:
+    /// `flights.groups()` concurrent groups of up to `places.max(head_steps)`
+    /// steps each.
+    pub fn flight_at(&self, places: u64) -> u64 {
+        self.flights.steps(places.max(self.head_steps))
+    }
+
+    /// The steps in flight (`FLIGHT`) this bank holds at its planned `places`.
+    pub fn flight(&self) -> u64 {
+        self.flight_at(self.places)
     }
 
     /// Records of group `group`'s tensors (`BANK`): its ceiling, every

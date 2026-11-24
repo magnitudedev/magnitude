@@ -176,6 +176,7 @@ fn bank_of(groups: &[usize], slots: u64, experts: impl Fn(usize) -> u64, form: R
         host_slots: 0,
         host_cap: None,
         places: 1,
+        head_steps: 1,
         pass: crate::PassLaunches::FLOOR,
         flights: FlightDepth::PIPELINED,
         tables: Vec::new(),
@@ -2083,4 +2084,131 @@ fn causal_head_sublayer_banks_when_streamable_and_falls_back_when_transformed() 
             .all(|w| w.holding == Holding::Whole),
         "skipped HeadSublayer expert stacks remain Holding::Whole"
     );
+}
+
+#[test]
+fn banked_mtp_head_sizes_routing_records_for_max_head_steps() {
+    use crate::planning::fixtures::{
+        qwen4exp_fixture_definition_of, streamed_experts_manifest, with_mtp_head,
+    };
+    use magnitude_family_contracts::{ImportTransform, WeightKind, WeightScope};
+
+    let mut definition = with_mtp_head(qwen4exp_fixture_definition_of(3, 128));
+    let target_routed = definition.decoder.blocks[0].sublayers[1].clone();
+    definition.head.as_mut().unwrap().blocks[0].blocks[0].sublayers[1] = target_routed;
+
+    let manifest = streamed_experts_manifest(&definition);
+    let backend = seismic::BackendName::Cuda;
+    let layout = crate::resident_layout(crate::ExecutionPath::Native, backend);
+    let selection = crate::ComponentSelection { head: true, vision: false };
+    let method = crate::PlannedMethod::Mtp {
+        greedy_proposals: 15,
+        sampled_proposals: 15,
+        widths: crate::DraftWidths::Adaptive,
+    };
+    let resident = crate::ModelLoadPlan::derive(
+        &manifest,
+        &definition,
+        selection,
+        layout,
+        method,
+        crate::planning::fixtures::LIMITS,
+    )
+    .unwrap();
+    let substrate = cuda(HostTier::Linked);
+
+    // Regression case: `places = 7` with `FlightDepth::PIPELINED` previously
+    // allocated `2 * 7 = 14` routing records while MTP submitted 15-step head
+    // groups (`repeat:4k` high-acceptance MTP).
+    let banked = resident
+        .clone()
+        .with_expert_bank(&definition, 64, None, 7, FlightDepth::PIPELINED, substrate)
+        .unwrap();
+    let bank = banked.expert_bank().expect("banked plan holds its bank");
+    assert_eq!(bank.places, 7);
+    assert_eq!(bank.head_steps, 15);
+    assert_eq!(bank.group_steps(), 15);
+    assert_eq!(bank.flight(), 30);
+    for layer in 0..bank.layers().len() {
+        assert_eq!(bank.binding(layer).unwrap().words.flight, 30);
+    }
+    let bank_layout = bank.layout().unwrap();
+    for layer in &bank_layout.layers {
+        let BankAllocation::Words { extents, .. } = &layer.routing else {
+            panic!("routing must be Words");
+        };
+        assert_eq!(extents[0], 30);
+        let BankAllocation::Words { extents, .. } = &layer.keys else {
+            panic!("keys must be Words");
+        };
+        assert_eq!(extents[0], 30);
+    }
+    assert_eq!(
+        bank.storage_demand_at(bank.slots, bank.places, bank.paths).unwrap(),
+        bank.storage_demand().unwrap(),
+        "storage_demand_at must match storage_demand when head_steps > places"
+    );
+
+    // Verify `Steps` built with `plan.group_steps()` accepts two concurrent
+    // 15-step `DraftDecode` head groups without exceeding routing records.
+    let shared = crate::experts::ExpertStep::unbanked(bank.flights, bank.group_steps());
+    let make_15 = || {
+        let mut chain = crate::programs::Chain::one(0usize);
+        for i in 1..15 {
+            chain.push(i);
+        }
+        chain
+    };
+    let (first, _) = shared
+        .begin(
+            make_15(),
+            |_| crate::experts::StepRoute::DraftDecode,
+            |_| crate::operation::LaunchWork::Generation,
+            || Ok(false),
+        )
+        .map_err(|(error, _)| error)
+        .expect("first 15-step head group must fit in 30 routing records");
+    let (second, _) = shared
+        .begin(
+            make_15(),
+            |_| crate::experts::StepRoute::DraftDecode,
+            |_| crate::operation::LaunchWork::Generation,
+            || Ok(false),
+        )
+        .map_err(|(error, _)| error)
+        .expect("second concurrent 15-step head group must fit in 30 routing records");
+    drop((first, second));
+
+    // When `places > head_steps`, `group_steps` follows `places`.
+    let wider = resident
+        .clone()
+        .with_expert_bank(&definition, 64, None, 20, FlightDepth::PIPELINED, substrate)
+        .unwrap();
+    let wider_bank = wider.expert_bank().unwrap();
+    assert_eq!(wider_bank.group_steps(), 20);
+    assert_eq!(wider_bank.flight(), 40);
+
+    // When `HeadSublayer` is NOT banked, `head_steps` stays 1 (no overhead).
+    let head_scope = WeightScope::HeadSublayer(magnitude_family_contracts::SublayerIndex {
+        block: 0,
+        sublayer: 1,
+    });
+    let mut unbanked_head = resident;
+    for weight in unbanked_head.head.as_mut().unwrap().weights.iter_mut() {
+        if weight.role.scope == head_scope
+            && matches!(
+                weight.role.kind,
+                WeightKind::ExpertGate | WeightKind::ExpertUp | WeightKind::ExpertDown
+            )
+        {
+            weight.descriptor.transforms.push(ImportTransform::DraftQ4_0);
+        }
+    }
+    let target_only = unbanked_head
+        .with_expert_bank(&definition, 64, None, 7, FlightDepth::PIPELINED, substrate)
+        .unwrap();
+    let target_only_bank = target_only.expert_bank().unwrap();
+    assert_eq!(target_only_bank.head_steps, 1);
+    assert_eq!(target_only_bank.group_steps(), 7);
+    assert_eq!(target_only_bank.flight(), 14);
 }

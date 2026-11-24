@@ -2020,7 +2020,7 @@ impl ExpertStep {
 
     /// A watcher's shared state of no layer, of `places` chain places flying
     /// at `flights`, on the CPU, whose kernels park.
-    fn unbanked(flights: FlightDepth, places: u64) -> Arc<Shared> {
+    pub(crate) fn unbanked(flights: FlightDepth, places: u64) -> Arc<Shared> {
         use super::{Extents, Life, ResizeHandoff, Telemetry};
         use crate::planning::RegionWords;
         let words = RegionWords {

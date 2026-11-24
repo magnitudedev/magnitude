@@ -1017,7 +1017,13 @@ impl ExecutionPlanDraft {
             Err(error) => return unstreamed(error),
         };
         let places = self.prompt_places(definition);
-        let whole = match self.load.clone().unbanked().with_decode_rows(decode_rows).with_whole_expert_bank(
+        let whole = match self
+            .load
+            .clone()
+            .unbanked()
+            .with_decode_rows(decode_rows)
+            .with_head_steps(self.policy.method.head_steps())
+            .with_whole_expert_bank(
             definition,
             None,
             places,
@@ -1125,10 +1131,11 @@ impl ExecutionPlanDraft {
         prior_host_cap: Option<u64>,
     ) -> Result<Result<BankCeiling, NoBank>, PlanError> {
         let bank = self.bank();
-        let (places, flights, substrate, paths) =
-            (bank.places, bank.flights, bank.substrate(), bank.paths);
+        let (places, head_steps, flights, substrate, paths) =
+            (bank.places, bank.head_steps, bank.flights, bank.substrate(), bank.paths);
         self.rebuilt_under(definition, bound, CeilingPaths::Fixed, prior_ceiling, prior_host_cap, |load| {
             load.unbanked()
+                .with_head_steps(head_steps)
                 .with_expert_bank(definition, experts, Some(window_slots), places, flights, substrate)?
                 .with_bank_paths(paths)
         })
@@ -1787,6 +1794,7 @@ impl ExecutionPlanDraft {
             .clone()
             .unbanked()
             .with_decode_rows(self.bank_decode_rows())
+            .with_head_steps(self.policy.method.head_steps())
             .with_expert_bank(definition, ceiling, None, 1, self.policy.limits.flights(), substrate)?
             .with_bank_slots(slots, ceiling)?;
         let bank = load.bank.as_mut().expect("the load was just banked");

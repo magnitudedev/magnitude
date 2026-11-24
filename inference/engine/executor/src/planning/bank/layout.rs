@@ -374,9 +374,8 @@ pub struct BankSubstrate {
     pub(in crate::planning) has_side_queue: bool,
 }
 
-#[cfg(test)]
 impl BankSubstrate {
-    pub(crate) fn new(
+    pub fn new(
         backend: seismic::BackendName,
         allocations: seismic::NativeAllocations,
         host: HostTier,
@@ -1087,7 +1086,7 @@ impl ExpertBankPlan {
         let words = RegionWords {
             choices: self.table_choices(),
             rounds: self.rounds(),
-            flight: self.flights.steps(places),
+            flight: self.flight_at(places),
             sites: self.flights.steps(1),
         };
         let file = BankAllocation::Words {

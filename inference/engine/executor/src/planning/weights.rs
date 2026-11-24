@@ -2080,6 +2080,11 @@ pub struct ModelLoadPlan {
     /// demand and staging reserves for (`1..=VERIFY_ROWS`), avoiding VRAM/UMA
     /// over-reservation on plain decode or narrower drafting windows.
     pub(super) decode_rows: u64,
+    /// The most chained passes one native head launch executes
+    /// ([`super::PlannedMethod::head_steps`]): sizes a banked head's routing
+    /// records so a multi-step MTP head group never exceeds the bank's flight
+    /// ring even when prompt `places` is smaller.
+    pub(super) head_steps: u64,
     /// O(1) role lookup over `target`, `head`, and `vision` in `weights()`
     /// order; rebuilt whenever those vectors change shape or roles.
     role_index: FxHashMap<WeightRole, WeightSlot>,
@@ -2111,6 +2116,7 @@ impl ModelLoadPlan {
             record_ports: None,
             recorded_routes: false,
             decode_rows: magnitude_kernels::constants::VERIFY_ROWS,
+            head_steps: 1,
             role_index: FxHashMap::default(),
             bank_table_index: FxHashMap::default(),
         };
@@ -2624,6 +2630,7 @@ impl ModelLoadPlan {
             record_ports: None,
             recorded_routes: false,
             decode_rows: magnitude_kernels::constants::VERIFY_ROWS,
+            head_steps: 1,
             role_index: fx_map(),
             bank_table_index: fx_map(),
         };
@@ -3060,6 +3067,7 @@ impl ModelLoadPlan {
             record_ports: None,
             recorded_routes: false,
             decode_rows: magnitude_kernels::constants::VERIFY_ROWS,
+            head_steps: method.head_steps(),
             role_index,
             bank_table_index: fx_map(),
         };
@@ -3080,6 +3088,13 @@ impl ModelLoadPlan {
     /// rows per decode step (`1..=VERIFY_ROWS`).
     pub(crate) fn with_decode_rows(mut self, decode_rows: u64) -> Self {
         self.decode_rows = decode_rows.clamp(1, magnitude_kernels::constants::VERIFY_ROWS);
+        self
+    }
+
+    /// Size any expert bank built from this load for at most `head_steps`
+    /// chained passes per native head launch (`>= 1`).
+    pub(crate) fn with_head_steps(mut self, head_steps: u64) -> Self {
+        self.head_steps = head_steps.max(1);
         self
     }
 

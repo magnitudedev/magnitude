@@ -76,6 +76,17 @@ impl PlannedMethod {
         }
     }
 
+    /// The most chained passes one native head launch executes: each MTP
+    /// drafting launch chains up to `draft_rows()` passes in one graph, while
+    /// causal or front launches execute one pass (and `DFlash` drafts via its
+    /// own block program, not the head).
+    pub fn head_steps(self) -> u64 {
+        match self {
+            Self::Mtp { .. } => (self.draft_rows() as u64).max(1),
+            Self::Plain | Self::DFlash { .. } => 1,
+        }
+    }
+
     /// Cap any drafting proposals and fixed widths so a verification pass
     /// (anchor + proposals) never exceeds `decode_rows` rows.
     pub(crate) fn capped_to_decode_rows(self, decode_rows: u64) -> Self {
