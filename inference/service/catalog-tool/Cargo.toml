@@ -12,7 +12,6 @@ futures-util.workspace = true
 magnitude-artifacts = { path = "../../engine/artifacts" }
 magnitude-service-contracts.workspace = true
 magnitude-service-models.workspace = true
-magnitude-executor = { path = "../../engine/executor" }
 seismic-io.workspace = true
 seismic-threads.workspace = true
 seismic-threads-tokio.workspace = true

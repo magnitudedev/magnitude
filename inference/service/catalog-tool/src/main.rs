@@ -366,9 +366,8 @@ async fn open_catalog_models(
     // A catalog build reads every header back once it has read them all, so none may be evicted to
     // make room while it runs: on a slow machine the build outlasts the eviction grace.
     config.header_cache_capacity = u64::MAX;
-    let kernels = magnitude_service_models::ModelCache::new(&config.cache_root)?.kernel_directory();
-    let volumes = Arc::new(magnitude_executor::platform::VolumeReserves::new(Some(kernels)));
-    let space = Arc::new(volumes.space(config.root.clone()));
+    let root = config.root.clone();
+    let space = Arc::new(move |_| seismic_io::volume_space(&root).map(|space| space.available));
     Ok(Arc::new(ManagedModelStore::open(config, space).await?))
 }
 

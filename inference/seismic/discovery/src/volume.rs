@@ -14,46 +14,20 @@ pub fn identify(path: &Path) -> std::io::Result<VolumeId> {
 
 /// The size of the filesystem holding `path`.
 pub(crate) fn size(path: &Path) -> std::io::Result<Reported<u64>> {
-    platform::space(path).map(|space| Reported::new(space.size, ReportedBy::FilesystemSize))
+    seismic_io::volume_space(path).map(|space| Reported::new(space.size, ReportedBy::FilesystemSize))
 }
 
 /// The space this process can still write on the filesystem holding `path`:
 /// the reading a [`crate::Sample`] takes of each volume, for a caller that
 /// needs one volume's free space without an inventory.
 pub fn volume_available(path: &Path) -> Result<Reported<u64>, ObservationError> {
-    platform::space(path)
+    seismic_io::volume_space(path)
         .map(|space| Reported::new(space.available, ReportedBy::FilesystemAvailable))
         .map_err(|error| ObservationError::Failed(format!("{}: {error}", path.display())))
 }
 
-struct Space {
-    size: u64,
-    available: u64,
-}
-
-#[cfg(all(unix, not(target_os = "macos")))]
-fn statvfs(path: &Path) -> std::io::Result<Space> {
-    use std::os::unix::ffi::OsStrExt;
-    let path = std::ffi::CString::new(path.as_os_str().as_bytes())
-        .map_err(|_| std::io::Error::from(std::io::ErrorKind::InvalidInput))?;
-    let mut status = unsafe { std::mem::zeroed::<libc::statvfs>() };
-    if unsafe { libc::statvfs(path.as_ptr(), &mut status) } != 0 {
-        return Err(std::io::Error::last_os_error());
-    }
-    let fragment = if status.f_frsize != 0 {
-        status.f_frsize as u64
-    } else {
-        status.f_bsize as u64
-    };
-    Ok(Space {
-        size: (status.f_blocks as u64).saturating_mul(fragment),
-        available: (status.f_bavail as u64).saturating_mul(fragment),
-    })
-}
-
 #[cfg(target_os = "macos")]
 mod platform {
-    use super::Space;
     use seismic_topology::VolumeId;
     use std::ffi::{CStr, CString};
     use std::os::unix::ffi::OsStrExt;
@@ -79,17 +53,6 @@ mod platform {
         Ok(VolumeId {
             device,
             uuid: volume_uuid(mount)?,
-        })
-    }
-
-    pub(super) fn space(path: &Path) -> std::io::Result<Space> {
-        // Use 64-bit `statfs` rather than `statvfs` (whose 32-bit `f_blocks`
-        // truncates volumes above 16 TiB at 4 KiB block size).
-        let status = statfs(path)?;
-        let block = u64::from(status.f_bsize);
-        Ok(Space {
-            size: status.f_blocks.saturating_mul(block),
-            available: status.f_bavail.saturating_mul(block),
         })
     }
 
@@ -142,7 +105,6 @@ mod platform {
 
 #[cfg(target_os = "linux")]
 mod platform {
-    use super::Space;
     use seismic_topology::VolumeId;
     use std::os::unix::fs::MetadataExt;
     use std::path::Path;
@@ -158,10 +120,6 @@ mod platform {
             device,
             uuid: filesystem_uuid(&block)?,
         })
-    }
-
-    pub(super) fn space(path: &Path) -> std::io::Result<Space> {
-        super::statvfs(path)
     }
 
     /// The UUID udev names the block device by (`/dev/disk/by-uuid`). None
@@ -206,13 +164,11 @@ mod platform {
 
 #[cfg(windows)]
 mod platform {
-    use super::Space;
     use seismic_topology::VolumeId;
     use std::os::windows::ffi::OsStrExt;
     use std::path::Path;
     use windows_sys::Win32::Storage::FileSystem::{
-        GetDiskFreeSpaceExW, GetVolumeInformationW, GetVolumeNameForVolumeMountPointW,
-        GetVolumePathNameW,
+        GetVolumeInformationW, GetVolumeNameForVolumeMountPointW, GetVolumePathNameW,
     };
 
     fn wide(path: &Path) -> Vec<u16> {
@@ -264,23 +220,6 @@ mod platform {
             device: u64::from(serial),
             uuid,
         })
-    }
-
-    pub(super) fn space(path: &Path) -> std::io::Result<Space> {
-        let path = wide(path);
-        let (mut available, mut size) = (0u64, 0u64);
-        if unsafe {
-            GetDiskFreeSpaceExW(
-                path.as_ptr(),
-                &mut available,
-                &mut size,
-                std::ptr::null_mut(),
-            )
-        } == 0
-        {
-            return Err(std::io::Error::last_os_error());
-        }
-        Ok(Space { size, available })
     }
 }
 
