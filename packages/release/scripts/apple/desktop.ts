@@ -152,8 +152,9 @@ export const validateDesktopDistribution = (options: { readonly image: string; r
         MAGNITUDE_TEST_EXPECT_VERSION: options.version, MAGNITUDE_TEST_EXPECT_REVISION: String(options.revision), MAGNITUDE_TEST_EXPECT_RPC_VERSION: String(options.rpcVersion),
       }),
       Command.stdout("inherit"), Command.stderr("inherit"), Command.exitCode,
-      // The packaged lifecycle covers several independent process and renderer recoveries.
-      Effect.timeout("8 minutes"),
+      // The packaged lifecycle covers several independent process and renderer recoveries
+      // and runs under Rosetta 2 on Apple Silicon runners when validating darwin-x64.
+      Effect.timeout("12 minutes"),
     )
     if (code !== 0) return yield* new AppleDistributionFailed({ message: `Desktop lifecycle acceptance exited ${code}` })
   }

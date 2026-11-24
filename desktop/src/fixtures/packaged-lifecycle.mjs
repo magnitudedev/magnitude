@@ -37,7 +37,7 @@ delete env.MAGNITUDE_SHELL_ENV_INHERITED;
 const control = (dataDirectory, intent) => new Promise((resolve, reject) => {
   const socket = createConnection(join(dataDirectory, 'state/application.sock'));
   let data = '';
-  socket.setTimeout(5000, () => socket.destroy(new Error(`Application control ${intent} timed out`)));
+  socket.setTimeout(20000, () => socket.destroy(new Error(`Application control ${intent} timed out`)));
   socket.on('error', reject);
   socket.on('connect', () => socket.write(JSON.stringify({ version: 1, intent }) + '\n'));
   socket.on('data', chunk => {
@@ -100,6 +100,7 @@ const invoke = args => new Promise((resolve, reject) => {
   child.once('exit', code => {
     clearTimeout(timeout);
     console.log(`Application contender [${args.join(' ')}] exited ${code} after ${Date.now() - started} ms`);
+    if (code !== 0 && output.trim()) console.error(`Contender [${args.join(' ')}] output:\n${output}`);
     resolve(code);
   });
 });

@@ -97,7 +97,7 @@ export const serveApplicationRequests = <E, R>(connections: Stream.Stream<Duplex
     yield* options.dispatch(request.value.intent)
   })).pipe(Effect.timeout("20 seconds"), Effect.catchAll(() => Effect.void)), { concurrency: 16 }), Stream.runDrain, Effect.forkScoped)
 
-const exchange = <Q, QI, A, AI>(path: string, requestSchema: Schema.Schema<Q, QI>, request: Q, replySchema: Schema.Schema<A, AI>, timeout = 5000) => Effect.scoped(Effect.gen(function* () {
+const exchange = <Q, QI, A, AI>(path: string, requestSchema: Schema.Schema<Q, QI>, request: Q, replySchema: Schema.Schema<A, AI>, timeout = 20000) => Effect.scoped(Effect.gen(function* () {
   if (process.platform !== "win32") yield* validateUnixControlPath(path)
   const socket = yield* Effect.acquireRelease(
     Effect.async<Socket, ApplicationControlFailed | ApplicationControlUnavailable>(resume => {
