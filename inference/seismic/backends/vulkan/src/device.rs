@@ -184,6 +184,11 @@ pub(crate) struct Retired {
     pub(crate) command: Option<RetiredCommand>,
     pub(crate) queries: Option<(vk::QueryPool, u32)>,
     pub(crate) arguments: Vec<Range>,
+    /// Owners of device-signalled semaphores waited on by this submission
+    /// (e.g. `Arc<TransferQueue>`), kept alive until `value` completes so the
+    /// waited `vk::Semaphore` is never destroyed while a submission is parked
+    /// behind a host gate or in flight on the GPU.
+    pub(crate) _wait_owners: Vec<Arc<dyn std::any::Any + Send + Sync>>,
 }
 
 pub(crate) enum RetiredCommand {
@@ -238,6 +243,7 @@ impl Drop for Primary<'_> {
             command: Some(RetiredCommand::Primary(self.command)),
             queries: None,
             arguments: Vec::new(),
+            _wait_owners: Vec::new(),
         });
     }
 }
@@ -331,7 +337,13 @@ pub(crate) struct Stamps {
 struct Held {
     command: vk::CommandBuffer,
     value: u64,
+    /// Host-signalled gate waits (`HostTimeline<Gate>`), tracked in
+    /// `queue.waiting` so no "wait before signal" piles up in the driver.
     waits: Vec<(vk::Semaphore, u64)>,
+    /// Device-signalled timeline waits (e.g. `TransferQueue` on `side_family`,
+    /// whose signal is already pending in the driver). Passed to
+    /// `vkQueueSubmit2` without triggering the host-gate hold.
+    device_waits: Vec<(vk::Semaphore, u64)>,
     signals: Vec<(vk::Semaphore, u64)>,
     handed: Handed,
 }
@@ -624,10 +636,18 @@ impl Inner {
         // that read what the host wrote before signaling it included,
         // starts before it (Vulkan spec, "Semaphore Waiting": the wait's second
         // synchronization scope is limited to the stages of its mask).
+        // A device-signalled semaphore wait (e.g. side-queue DMA) makes the
+        // producer's writes visible to compute shaders, indirect dispatch
+        // grids, and any batch transfer/rebind before those stages begin.
         let wait = held
             .waits
             .iter()
             .map(semaphore(vk::PipelineStageFlags2::COMPUTE_SHADER | vk::PipelineStageFlags2::ALL_COMMANDS))
+            .chain(held.device_waits.iter().map(semaphore(
+                vk::PipelineStageFlags2::COMPUTE_SHADER
+                    | vk::PipelineStageFlags2::DRAW_INDIRECT
+                    | vk::PipelineStageFlags2::TRANSFER,
+            )))
             .collect::<Vec<_>>();
         let commands = [vk::CommandBufferSubmitInfo::default().command_buffer(held.command)];
         let submit = vk::SubmitInfo2::default()
@@ -1288,7 +1308,7 @@ impl Device {
 
     /// Submit `command`, signalling the timeline with the next value.
     pub(crate) fn submit(&self, command: vk::CommandBuffer) -> Result<u64, ExecutionError> {
-        self.submit_with(command, &[], &[], Handed::default())
+        self.submit_with(command, &[], &[], &[], Handed::default())
     }
 
     /// Submit `command` once every host gate of `waits` (a timeline the
@@ -1318,6 +1338,7 @@ impl Device {
         &self,
         command: vk::CommandBuffer,
         waits: &[(vk::Semaphore, u64)],
+        device_waits: &[(vk::Semaphore, u64)],
         signals: &[(vk::Semaphore, u64)],
         handed: Handed,
     ) -> Result<u64, ExecutionError> {
@@ -1331,6 +1352,7 @@ impl Device {
             command,
             value,
             waits: waits.to_vec(),
+            device_waits: device_waits.to_vec(),
             signals: signals.to_vec(),
             handed,
         });
@@ -2051,8 +2073,21 @@ impl Inner {
 impl Device {
     /// Whether the second queue is open (`DeviceInfo::side_family`): what zeroes
     /// pool blocks and runs transfers beside the first's work.
-    pub(crate) fn has_side_queue(&self) -> bool {
+    pub fn has_side_queue(&self) -> bool {
         self.inner.side.is_some()
+    }
+
+    /// Live headroom for additional host-tier pool blocks on a discrete
+    /// device's non-device-local (GTT) heap, keeping command-submission
+    /// headroom free. `None` on unified devices without a separate host-tier
+    /// GTT heap.
+    pub fn host_tier_headroom(&self) -> Option<u64> {
+        self.inner.memory.host_tier_headroom()
+    }
+
+    /// The device's main compute queue timeline semaphore.
+    pub(crate) fn timeline_semaphore(&self) -> vk::Semaphore {
+        self.inner.timeline
     }
 
     /// Submit `submits` to the second queue, with no fence: their own
@@ -2423,6 +2458,7 @@ mod reconcile_tests {
             command: vk::CommandBuffer::null(),
             value,
             waits: gates,
+            device_waits: Vec::new(),
             signals: Vec::new(),
             handed: Handed::default(),
         }

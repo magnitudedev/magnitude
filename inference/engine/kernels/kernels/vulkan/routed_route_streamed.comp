@@ -80,11 +80,17 @@ void routed_route_finish(const bool whole) {
     }
     routed_resolve(whole, out_stored(SEISMIC_OUT_SCORES, 0ul), SEISMIC_SCORES_STRIDE_0, SEISMIC_SCORES_STRIDE_1);
     if (SEISMIC_DIM_SF > 0ul) {
-        barrier();
+        streaming_device_barrier();
         const uint choices = uint(SEISMIC_DIM_M) * uint(SEISMIC_DIM_K);
-        const bool has_site = (SEISMIC_PARAM_SITED == 2 || streaming_device_load(SEISMIC_PTR(SEISMIC_BUFFER_LAND_GRID)) == 0)
-            && streaming_site_any(SEISMIC_PTR(SEISMIC_BUFFER_SOURCES), SEISMIC_SOURCES_STRIDE_0,
-                SEISMIC_SOURCES_STRIDE_1, SEISMIC_SOURCES_STRIDE_2, choices);
+        if (SEISMIC_THREAD == 0u) {
+            const bool publish =
+                (SEISMIC_PARAM_SITED == 2 || streaming_device_load(SEISMIC_PTR(SEISMIC_BUFFER_LAND_GRID)) == 0)
+                && streaming_site_any(SEISMIC_PTR(SEISMIC_BUFFER_SOURCES), SEISMIC_SOURCES_STRIDE_0,
+                    SEISMIC_SOURCES_STRIDE_1, SEISMIC_SOURCES_STRIDE_2, choices);
+            seismic_shared_i32[0] = publish ? 1 : 0;
+        }
+        streaming_barrier();
+        const bool has_site = seismic_shared_i32[0] != 0;
         const uint64_t q = streaming_step(SEISMIC_PTR(SEISMIC_BUFFER_STEP), SEISMIC_STEP_STRIDE_0);
         const uint64_t slot = streaming_modulo(q, SEISMIC_DIM_SF);
         if (has_site) {

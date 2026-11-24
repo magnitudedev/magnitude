@@ -25,18 +25,6 @@ native routed_route_streamed for vulkan from "vulkan/routed_route_streamed.comp"
         threads_per_threadgroup (256, 1, 1)
         shared_bytes (4 * (1 + 4 * VERIFY_ROWS * K + POLICY_WORDS))
 
-native routed_hint_route for vulkan from "vulkan/routed_hint_route.comp":
-    static (H, PT, NM, K, AHEAD, EN)
-    where H % 32 == 0 and EN <= 1024 and K <= EN
-    project dense segmented (next_router, after_router) rows rms ordered (next_router, after_router)
-    unless (next_policy[POLICY_WHOLE])
-    scratch logits bytes (2 * M * EN * 4)
-    launch routed_hint_route_publish:
-        threadgroups (1, AHEAD, 1)
-        unless (next_policy[POLICY_WHOLE])
-        threads_per_threadgroup (256, 1, 1)
-        shared_bytes (12 * VERIFY_ROWS * K)
-
 native routed_select_streamed for vulkan from "vulkan/routed_select_streamed.comp":
     static (H, E, K, ES, TM)
     where H % 32 == 0 and E <= 1024 and K <= E
@@ -52,18 +40,6 @@ native routed_select_streamed for vulkan from "vulkan/routed_select_streamed.com
         if (policy[POLICY_WHOLE])
         threads_per_threadgroup (256, 1, 1)
         shared_bytes (4 * (1 + 4 * VERIFY_ROWS * K + POLICY_WORDS))
-
-native routed_hint_select for vulkan from "vulkan/routed_hint_select.comp":
-    static (H, K, AHEAD, EN)
-    where H % 32 == 0 and EN <= 1024 and K <= EN
-    project dense segmented (next_router, after_router) rows rms ordered (next_router, after_router)
-    unless (next_policy[POLICY_WHOLE])
-    scratch logits bytes (2 * M * EN * 4)
-    launch routed_hint_select_publish:
-        threadgroups (1, AHEAD, 1)
-        unless (next_policy[POLICY_WHOLE])
-        threads_per_threadgroup (256, 1, 1)
-        shared_bytes (12 * VERIFY_ROWS * K)
 
 native routed_step for vulkan from "vulkan/routed_step.comp":
     launch routed_step:

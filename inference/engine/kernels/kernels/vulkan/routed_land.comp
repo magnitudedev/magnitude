@@ -36,10 +36,15 @@ void routed_land() {
             SEISMIC_FILE_STRIDE_1, SEISMIC_PTR(SEISMIC_BUFFER_SOURCES), SEISMIC_SOURCES_STRIDE_0,
             SEISMIC_SOURCES_STRIDE_1, SEISMIC_SOURCES_STRIDE_2, tid, gl_WorkGroupSize.x);
         if (SEISMIC_DIM_SF > 0ul) {
-            barrier();
+            streaming_device_barrier();
             const uint choices = uint(SEISMIC_DIM_M) * uint(SEISMIC_DIM_K);
-            const bool has_site = streaming_site_any(SEISMIC_PTR(SEISMIC_BUFFER_SOURCES), SEISMIC_SOURCES_STRIDE_0,
-                SEISMIC_SOURCES_STRIDE_1, SEISMIC_SOURCES_STRIDE_2, choices);
+            if (tid == 0u)
+                seismic_shared_i32[0] = streaming_site_any(SEISMIC_PTR(SEISMIC_BUFFER_SOURCES),
+                    SEISMIC_SOURCES_STRIDE_0, SEISMIC_SOURCES_STRIDE_1, SEISMIC_SOURCES_STRIDE_2, choices)
+                    ? 1
+                    : 0;
+            streaming_barrier();
+            const bool has_site = seismic_shared_i32[0] != 0;
             const uint64_t slot = streaming_modulo(q, SEISMIC_DIM_SF);
             if (has_site) {
                 const uint64_t rows = SEISMIC_DIM_M, columns = SEISMIC_DIM_H;

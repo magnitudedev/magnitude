@@ -319,6 +319,7 @@ fn open_segment(device: &Device) -> Result<vk::CommandBuffer, ExecutionError> {
             command: Some(RetiredCommand::Secondary(command)),
             queries: None,
             arguments: Vec::new(),
+            _wait_owners: Vec::new(),
         });
         return Err(error);
     }
@@ -541,6 +542,7 @@ impl Drop for GraphInner {
                 command: Some(RetiredCommand::Secondary(command)),
                 queries: None,
                 arguments: std::mem::take(&mut arguments),
+                _wait_owners: Vec::new(),
             });
         }
     }
@@ -566,8 +568,12 @@ pub struct DirectBatch<T: Timing = Measured> {
     /// records itself as their last use.
     replayed: Vec<std::sync::Arc<GraphInner>>,
     /// Host timelines the batch's queue submission waits on before it runs,
-    /// and the ones it signals once it completes, with their values.
+    /// device-signalled timeline semaphores it waits on (e.g. `TransferQueue`
+    /// on `side_family`) together with their retained owners, and the ones it
+    /// signals once it completes.
     waits: Vec<(vk::Semaphore, u64)>,
+    device_waits: Vec<(vk::Semaphore, u64)>,
+    device_wait_owners: Vec<std::sync::Arc<dyn std::any::Any + Send + Sync>>,
     signals: Vec<(vk::Semaphore, u64)>,
     /// Set by `commit`; an uncommitted batch returns its resources on drop.
     committed: bool,
@@ -1058,6 +1064,8 @@ impl<T: Timing> DirectBatch<T> {
             launched: false,
             replayed: Vec::new(),
             waits: Vec::new(),
+            device_waits: Vec::new(),
+            device_wait_owners: Vec::new(),
             signals: Vec::new(),
             committed: false,
         };
@@ -1104,6 +1112,44 @@ impl<T: Timing> DirectBatch<T> {
             "DirectBatch::wait_timeline precondition: the batch records nothing yet"
         );
         self.waits.push((timeline.semaphore, value));
+    }
+
+    /// Wait on a device-signalled timeline semaphore (such as `TransferQueue`'s
+    /// timeline on `side_family`) before this batch's compute shaders, indirect
+    /// dispatch reads, or transfers execute (`vkQueueSubmit2` wait at
+    /// `COMPUTE_SHADER | DRAW_INDIRECT | TRANSFER`). Because the producer's
+    /// signal is already submitted on the device, this wait does not trigger
+    /// the host-gate hold. Precondition: nothing is recorded in the batch yet.
+    pub fn wait_device_semaphore(&mut self, semaphore: vk::Semaphore, value: u64) {
+        assert!(
+            !self.launched,
+            "DirectBatch::wait_device_semaphore precondition: the batch records nothing yet"
+        );
+        if let Some((_, existing)) = self.device_waits.iter_mut().find(|(sem, _)| *sem == semaphore) {
+            *existing = (*existing).max(value);
+        } else {
+            self.device_waits.push((semaphore, value));
+        }
+    }
+
+    /// [`Self::wait_device_semaphore`], also retaining `owner` (e.g.
+    /// `Arc<TransferQueue>`) until this submission retires on the GPU so the
+    /// waited `vk::Semaphore` stays alive even if the caller drops its own
+    /// handle while the batch is parked behind a host gate or in flight.
+    pub fn wait_device_semaphore_owned(
+        &mut self,
+        semaphore: vk::Semaphore,
+        value: u64,
+        owner: std::sync::Arc<dyn std::any::Any + Send + Sync>,
+    ) {
+        self.wait_device_semaphore(semaphore, value);
+        if !self
+            .device_wait_owners
+            .iter()
+            .any(|existing| std::sync::Arc::ptr_eq(existing, &owner))
+        {
+            self.device_wait_owners.push(owner);
+        }
     }
 
     /// `timeline` reaches `value` once the batch's queue submission
@@ -1250,7 +1296,14 @@ impl<T: Timing> DirectBatch<T> {
     /// the queue (`Device::submit_with`, or a probe's own).
     fn commit_by(
         mut self,
-        submit: impl FnOnce(&Device, vk::CommandBuffer, &[(vk::Semaphore, u64)], &[(vk::Semaphore, u64)], Handed) -> Result<u64, ExecutionError>,
+        submit: impl FnOnce(
+            &Device,
+            vk::CommandBuffer,
+            &[(vk::Semaphore, u64)],
+            &[(vk::Semaphore, u64)],
+            &[(vk::Semaphore, u64)],
+            Handed,
+        ) -> Result<u64, ExecutionError>,
     ) -> Result<DirectSubmission<T>, ExecutionError> {
         let device = self.device.clone();
         let recording = device.recording()?;
@@ -1275,7 +1328,7 @@ impl<T: Timing> DirectBatch<T> {
         drop(recording);
         ended?;
         let handed = Handed::default();
-        let value = submit(&self.device, self.command, &self.waits, &self.signals, handed.clone())?;
+        let value = submit(&self.device, self.command, &self.waits, &self.device_waits, &self.signals, handed.clone())?;
         for graph in &self.replayed {
             graph.last_use.fetch_max(value, Ordering::AcqRel);
         }
@@ -1289,6 +1342,7 @@ impl<T: Timing> DirectBatch<T> {
             command: Some(RetiredCommand::Primary(self.command)),
             queries: None,
             arguments: std::mem::take(&mut self.arguments.chunks),
+            _wait_owners: std::mem::take(&mut self.device_wait_owners),
         });
         Ok(DirectSubmission {
             device: self.device.clone(),
@@ -1418,6 +1472,7 @@ impl<T: Timing> Drop for DirectBatch<T> {
                 command: Some(RetiredCommand::Primary(self.command)),
                 queries: self.timing.queries(),
                 arguments: std::mem::take(&mut self.arguments.chunks),
+                _wait_owners: Vec::new(),
             });
         }
     }
@@ -1518,6 +1573,12 @@ impl<T: Timing> DirectSubmission<T> {
     pub fn finish(&self) -> Result<(), ExecutionError> {
         self.device.wait(self.value)
     }
+
+    /// The `(semaphore, value)` timeline pair this submission signals on
+    /// completion, for cross-queue device waits (`TransferQueue::copy_after`).
+    pub fn timeline_wait(&self) -> (vk::Semaphore, u64) {
+        (self.device.timeline_semaphore(), self.value)
+    }
 }
 
 impl<T: HasTimestamps> DirectSubmission<T> {
@@ -1597,6 +1658,7 @@ impl<T: Timing> Drop for DirectSubmission<T> {
                 command: None,
                 queries: Some(queries),
                 arguments: Vec::new(),
+                _wait_owners: Vec::new(),
             });
         }
     }

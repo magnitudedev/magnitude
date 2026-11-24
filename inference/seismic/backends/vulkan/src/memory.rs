@@ -79,7 +79,10 @@ pub(crate) struct Block {
     heap: u32,
     memory: vk::DeviceMemory,
     buffer: vk::Buffer,
-    address: u64,
+    /// Device address for shader-addressable blocks; `None` for staging
+    /// blocks, which are only copied by `vkCmdCopyBuffer` and do not request
+    /// `VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS`.
+    address: Option<u64>,
     /// Usable buffer extent, distinct from the allocation's required padding.
     bytes: u64,
     allocated_bytes: u64,
@@ -211,6 +214,19 @@ enum Charged {
     Staging,
 }
 
+impl Charged {
+    /// Whether blocks of this pool need a shader device address. Staging
+    /// blocks are only copied via `vkCmdCopyBuffer` and never addressed by
+    /// shaders, so omitting BDA stops drivers such as RADV from pinning all
+    /// staging BOs into their global BO list.
+    fn shader_addressable(self) -> bool {
+        match self {
+            Self::Kind => true,
+            Self::Staging => false,
+        }
+    }
+}
+
 /// One memory type a pool allocates blocks from.
 #[derive(Clone, Copy, Debug)]
 struct PoolType {
@@ -308,6 +324,9 @@ pub(crate) struct Memory {
     /// The heaps of the device's own memory, whose usage its memory budget
     /// reads.
     device_heaps: Vec<u32>,
+    /// The non-device-local heap that discrete `Contract::Shared` host-tier
+    /// pool blocks allocate from, when distinct from `device_heaps`.
+    host_tier_heap: Option<u32>,
     block_cap: u64,
     max_allocation: u64,
     /// Where heap budgets are read.
@@ -316,6 +335,11 @@ pub(crate) struct Memory {
     /// Bytes of every block on the heaps device storage is allocated from,
     /// pooled and blocks of their own alike, counted within each block's transition.
     device_blocks: AtomicU64,
+    /// Live `allocated_bytes` of every block on each Vulkan heap, indexed by
+    /// heap number. Provides lag-free accounting alongside `VK_EXT_memory_budget`
+    /// (for example when unwritten GTT blocks are not yet reflected in kernel
+    /// `heapUsage`).
+    heap_blocks: Vec<AtomicU64>,
     /// The device memory objects that exist: every block, on every heap,
     /// pooled and of its own alike, counted as its memory is allocated and
     /// uncounted as it is freed. Every `vkAllocateMemory` and
@@ -496,6 +520,17 @@ impl Memory {
             placed(seismic_topology::Contract::DeviceOnly)?,
             placed(seismic_topology::Contract::Upload)?,
         );
+        let host_tier_heap = seismic_topology::place(
+            &kinds,
+            info.device_type.memory_is_host(),
+            seismic_topology::Contract::Shared,
+        )
+        .first()
+        .map(|&kind| layout.types[kind as usize].heap)
+        .filter(|heap| {
+            !info.allocation.device_heaps.contains(heap)
+                && !layout.heaps[*heap as usize].device_local
+        });
         let _ = new_pool(layout, &[staging_kind], Charged::Staging)?;
         let (heaps, object_limit) = (heap_bytes(layout)?, info.limits.max_memory_allocations);
         let least_object = least_object(info)?;
@@ -505,6 +540,7 @@ impl Memory {
                 "the device's {heaps} heap bytes over its {object_limit} memory objects need objects of {least_object} bytes, beyond its {block_cap}-byte blocks"
             ));
         }
+        let heap_blocks = (0..layout.heaps.len()).map(|_| AtomicU64::new(0)).collect();
         Ok(Self {
             device_kinds,
             upload_kinds,
@@ -512,11 +548,13 @@ impl Memory {
             layout: layout.clone(),
             families: std::iter::once(info.queue_family).chain(info.side_family.filter(|&family| family != info.queue_family)).collect(),
             device_heaps: info.allocation.device_heaps.clone(),
+            host_tier_heap,
             block_cap,
             max_allocation: info.limits.max_allocation_bytes,
             instance,
             physical,
             device_blocks: AtomicU64::new(0),
+            heap_blocks,
             objects: AtomicU64::new(0),
             object_limit,
             least_object,
@@ -543,6 +581,7 @@ impl Memory {
     fn count(&self, block: &Block) {
         self.objects.fetch_add(1, Ordering::SeqCst);
         self.device_blocks.fetch_add(block.counted_bytes(&self.device_heaps), Ordering::SeqCst);
+        self.heap_blocks[block.heap as usize].fetch_add(block.allocated_bytes, Ordering::SeqCst);
     }
 
     /// Free `block` (no allocation is in it) and uncount it, within one
@@ -555,6 +594,7 @@ impl Memory {
         };
         let _transition = self.transition();
         self.device_blocks.fetch_sub(block.counted_bytes(&self.device_heaps), Ordering::SeqCst);
+        self.heap_blocks[block.heap as usize].fetch_sub(block.allocated_bytes, Ordering::SeqCst);
         destroy_block(device, block);
         self.objects.fetch_sub(1, Ordering::SeqCst);
         if let Some((change, charge)) = charged {
@@ -683,9 +723,8 @@ impl Memory {
     /// ([`seismic_compiler::blocks::charge_block`]), sized by its heaps'
     /// budgets as the driver reports them now. A passable type is passed over when
     /// its heap's budget cannot hold the allocation or its heap refuses the
-    /// block, and its block holds only the allocation where the heap's
-    /// budget cannot hold the larger one; the last type, with none after
-    /// it, is left to the driver.
+    /// block, and a non-dedicated block holds only the allocation where its
+    /// heap's budget cannot hold the grown slab (including on `pool.last`).
     fn create(
         &self,
         device: &ash::Device,
@@ -699,6 +738,7 @@ impl Memory {
         let change = stores.pool(pool, &pool.last).own().change();
         let budgets = crate::device::heap_budgets(&self.instance, self.physical);
         let dedicated = takes_own_block(bytes, self.block_cap);
+        let shader_addressable = pool.charged.shader_addressable();
         let charge = |candidate: &PoolType| charge_block(&change, &stores.pool(pool, candidate).own(), largest, self.block_cap, bytes, 1);
         // The least a new block of the allocation holds.
         let least = bytes.max(self.least_object);
@@ -713,16 +753,52 @@ impl Memory {
                 Err(error) if error.capacity_refusal().is_some() => continue,
                 Err(error) => return Err(error),
             };
-            if charged.bytes() > room {
-                charged.shrink(&change, charged.bytes().saturating_sub(least));
+            let trim = trim_for_room(charged.bytes(), least, room, dedicated);
+            if trim > 0 {
+                charged.shrink(&change, trim);
             }
-            match create_block(self, device, *candidate, dedicated, Holding::Charged(&change, charged)) {
+            match create_block(self, device, *candidate, dedicated, shader_addressable, Holding::Charged(&change, charged)) {
                 Ok(block) => return Ok(block),
                 Err(error) if error.capacity_refusal().is_some() => {}
                 Err(error) => return Err(error),
             }
         }
-        create_block(self, device, pool.last, dedicated, Holding::Charged(&change, charge(&pool.last)?))
+        let mut charged = charge(&pool.last)?;
+        let heap = budgets[pool.last.heap as usize];
+        let room = heap.budget.saturating_sub(heap.usage);
+        let trim = trim_for_room(charged.bytes(), least, room, dedicated);
+        if trim > 0 {
+            charged.shrink(&change, trim);
+        }
+        create_block(self, device, pool.last, dedicated, shader_addressable, Holding::Charged(&change, charged))
+    }
+
+    /// Live headroom for additional dedicated pool blocks on a discrete
+    /// device's non-device-local (GTT) heap, keeping command-submission
+    /// headroom free. `None` for device-local heaps or unified devices whose
+    /// heaps are all in `device_heaps`.
+    fn non_device_local_block_room(&self, heap: u32) -> Option<u64> {
+        let heap_index = heap as usize;
+        if self.device_heaps.contains(&heap) || self.layout.heaps[heap_index].device_local {
+            return None;
+        }
+        let budgets = crate::device::heap_budgets(&self.instance, self.physical);
+        let reported = budgets[heap_index];
+        let tracked = self.heap_blocks[heap_index].load(Ordering::SeqCst);
+        Some(non_device_local_block_room(
+            self.layout.heaps[heap_index].bytes,
+            reported.budget,
+            reported.usage,
+            tracked,
+        ))
+    }
+
+    /// Live headroom for additional host-tier pool blocks on a discrete
+    /// device's non-device-local (GTT) heap, or `None` when the device has no
+    /// separate non-device-local host-tier heap.
+    pub(crate) fn host_tier_headroom(&self) -> Option<u64> {
+        self.host_tier_heap
+            .and_then(|heap| self.non_device_local_block_room(heap))
     }
 
     /// A block of its own of `bytes` of memory type `kind`, charged exactly
@@ -736,10 +812,19 @@ impl Memory {
         entry: &Arc<dyn Entry>,
     ) -> Result<Range, ExecutionError> {
         let (bytes, pool) = self.own_block(kind, bytes)?;
+        if let Some(available) = self.non_device_local_block_room(pool.heap) {
+            let required = bytes.max(self.least_object);
+            if required > available {
+                return Err(ExecutionError::AllocationCapacity {
+                    required: required.into(),
+                    available,
+                });
+            }
+        }
         // The charge, the memory and the record of it are one change.
         let change = entry.change();
         let charge = Charge::take(&change, entry, bytes, Wiring::Pageable)?;
-        let block = create_block(self, device, pool, true, Holding::Charged(&change, charge))?;
+        let block = create_block(self, device, pool, true, true, Holding::Charged(&change, charge))?;
         Ok(Range { pool: None, block, offset: 0, bytes })
     }
 
@@ -749,7 +834,7 @@ impl Memory {
     /// ([`Held::Driver`]), freed when its range is released.
     pub(crate) fn driver_block(&self, device: &ash::Device, kind: u32, bytes: u64) -> Result<Range, ExecutionError> {
         let (bytes, pool) = self.own_block(kind, bytes)?;
-        let block = create_block(self, device, pool, true, Holding::Driver(bytes))?;
+        let block = create_block(self, device, pool, true, true, Holding::Driver(bytes))?;
         Ok(Range { pool: None, block, offset: 0, bytes })
     }
 
@@ -817,6 +902,58 @@ fn destroy_block(device: &ash::Device, block: &Block) {
     }
 }
 
+/// Maximum GTT headroom reserved for command submission, staging, upload
+/// buffers, and driver internals on a discrete device's non-device-local heap
+/// so shader-addressable pool blocks never exhaust GTT during `vkQueueSubmit2`
+/// (`radv/amdgpu: Not enough memory for command submission`).
+const NON_DEVICE_LOCAL_SUBMIT_RESERVE_MAX: u64 = 2 << 30;
+
+/// Available bytes for a new dedicated pool block on a discrete device's
+/// non-device-local (GTT) heap, keeping submission headroom free and guarding
+/// against lagging `VK_EXT_memory_budget` usage counters via `tracked_usage`.
+fn non_device_local_block_room(
+    heap_size: u64,
+    heap_budget: u64,
+    heap_usage: u64,
+    tracked_usage: u64,
+) -> u64 {
+    let effective_budget = if heap_budget > 0 {
+        heap_budget.min(heap_size)
+    } else {
+        heap_size
+    };
+    let reserve = (effective_budget / 8).min(NON_DEVICE_LOCAL_SUBMIT_RESERVE_MAX);
+    let effective_usage = heap_usage.max(tracked_usage);
+    effective_budget
+        .saturating_sub(reserve)
+        .saturating_sub(effective_usage)
+}
+
+/// Excess bytes to trim from a non-dedicated pool block charge when its heap's
+/// current headroom (`room`) cannot hold the grown slab. Dedicated blocks
+/// already match their allocation, and no block shrinks below `least`.
+fn trim_for_room(charged_bytes: u64, least: u64, room: u64, dedicated: bool) -> u64 {
+    if !dedicated && charged_bytes > room {
+        charged_bytes.saturating_sub(least)
+    } else {
+        0
+    }
+}
+
+/// Buffer usage flags for a block. Staging blocks omit
+/// `SHADER_DEVICE_ADDRESS` because they are only used by `vkCmdCopyBuffer`.
+fn block_buffer_usage(shader_addressable: bool) -> vk::BufferUsageFlags {
+    // Any buffer may hold a grid a launch wrote (`DirectLaunch::grid`).
+    let mut usage = vk::BufferUsageFlags::STORAGE_BUFFER
+        | vk::BufferUsageFlags::TRANSFER_SRC
+        | vk::BufferUsageFlags::TRANSFER_DST
+        | vk::BufferUsageFlags::INDIRECT_BUFFER;
+    if shader_addressable {
+        usage |= vk::BufferUsageFlags::SHADER_DEVICE_ADDRESS;
+    }
+    usage
+}
+
 /// A block of `charge`'s bytes on `pool`'s type, mapped persistently where
 /// the type is mappable. The memory the buffer requires beyond them (its
 /// allocation's rounding) is charged to the same entry before the memory is
@@ -826,6 +963,7 @@ fn create_block(
     device: &ash::Device,
     pool: PoolType,
     dedicated: bool,
+    shader_addressable: bool,
     mut holding: Holding<'_>,
 ) -> Result<Arc<Block>, ExecutionError> {
     // Every memory object holds at least the device's least
@@ -838,14 +976,7 @@ fn create_block(
     let families = memory_owner.families.as_slice();
     let info = vk::BufferCreateInfo::default()
         .size(bytes)
-        .usage(
-            // Any buffer may hold a grid a launch wrote (`DirectLaunch::grid`).
-            vk::BufferUsageFlags::STORAGE_BUFFER
-                | vk::BufferUsageFlags::SHADER_DEVICE_ADDRESS
-                | vk::BufferUsageFlags::TRANSFER_SRC
-                | vk::BufferUsageFlags::TRANSFER_DST
-                | vk::BufferUsageFlags::INDIRECT_BUFFER,
-        )
+        .usage(block_buffer_usage(shader_addressable))
         .sharing_mode(if families.len() > 1 { vk::SharingMode::CONCURRENT } else { vk::SharingMode::EXCLUSIVE })
         .queue_family_indices(if families.len() > 1 { families } else { &[] });
     let buffer = crate::device::memory_call(
@@ -875,10 +1006,12 @@ fn create_block(
     let _transition = memory_owner.transition();
     let mut flags =
         vk::MemoryAllocateFlagsInfo::default().flags(vk::MemoryAllocateFlags::DEVICE_ADDRESS);
-    let allocate = vk::MemoryAllocateInfo::default()
+    let mut allocate = vk::MemoryAllocateInfo::default()
         .allocation_size(allocated_bytes)
-        .memory_type_index(pool.memory_type)
-        .push_next(&mut flags);
+        .memory_type_index(pool.memory_type);
+    if shader_addressable {
+        allocate = allocate.push_next(&mut flags);
+    }
     let memory = match crate::device::memory_call(
         unsafe { device.allocate_memory(&allocate, None) },
         "vkAllocateMemory",
@@ -920,9 +1053,9 @@ fn create_block(
             return Err(error);
         }
     };
-    let address = unsafe {
+    let address = shader_addressable.then(|| unsafe {
         device.get_buffer_device_address(&vk::BufferDeviceAddressInfo::default().buffer(buffer))
-    };
+    });
     let block = Arc::new(Block {
         memory_type: pool.memory_type,
         heap: pool.heap,
@@ -953,7 +1086,10 @@ pub(crate) struct Range {
 
 impl Range {
     pub(crate) fn address(&self) -> u64 {
-        self.block.address + self.offset
+        self.block
+            .address
+            .expect("device address requested for a block without shader device address")
+            + self.offset
     }
 
     pub(crate) fn bytes(&self) -> u64 {
@@ -1127,7 +1263,7 @@ mod tests {
             heap: 0,
             memory: vk::DeviceMemory::null(),
             buffer: vk::Buffer::null(),
-            address: 0,
+            address: Some(0),
             bytes,
             allocated_bytes: bytes,
             mapped: std::ptr::null_mut(),
@@ -1255,5 +1391,71 @@ mod tests {
         let blk = block(256);
         let sub = range(&blk, 64);
         sub.check_span(u64::MAX - 8, 16);
+    }
+
+    #[test]
+    fn staging_omits_shader_device_address_while_kind_keeps_it() {
+        assert!(!Charged::Staging.shader_addressable());
+        assert!(Charged::Kind.shader_addressable());
+
+        let staging_usage = block_buffer_usage(Charged::Staging.shader_addressable());
+        assert!(!staging_usage.contains(vk::BufferUsageFlags::SHADER_DEVICE_ADDRESS));
+        assert!(staging_usage.contains(vk::BufferUsageFlags::TRANSFER_SRC));
+        assert!(staging_usage.contains(vk::BufferUsageFlags::TRANSFER_DST));
+
+        let kind_usage = block_buffer_usage(Charged::Kind.shader_addressable());
+        assert!(kind_usage.contains(vk::BufferUsageFlags::SHADER_DEVICE_ADDRESS));
+    }
+
+    #[test]
+    #[should_panic(expected = "without shader device address")]
+    fn range_address_panics_on_non_addressable_block() {
+        let mut blk = block(256);
+        Arc::get_mut(&mut blk).unwrap().address = None;
+        let sub = range(&blk, 64);
+        let _ = sub.address();
+    }
+
+    #[test]
+    fn trim_for_room_caps_non_dedicated_slab_growth_when_headroom_is_tight() {
+        const MIB: u64 = 1 << 20;
+        // Ample headroom: keep the grown 512 MiB slab.
+        assert_eq!(trim_for_room(512 * MIB, 4 * MIB, 1024 * MIB, false), 0);
+        // Tight headroom: shrink a 512 MiB slab back to `least` (4 MiB).
+        assert_eq!(trim_for_room(512 * MIB, 4 * MIB, 128 * MIB, false), 508 * MIB);
+        // Zero headroom: still never shrinks below `least`.
+        assert_eq!(trim_for_room(512 * MIB, 4 * MIB, 0, false), 508 * MIB);
+        // Dedicated block: never trimmed.
+        assert_eq!(trim_for_room(512 * MIB, 512 * MIB, 128 * MIB, true), 0);
+    }
+
+    #[test]
+    fn non_device_local_block_room_reserves_submit_headroom_and_respects_tracked_usage() {
+        const GIB: u64 = 1 << 30;
+        // 32 GiB GTT heap (64 GiB Linux amdgpu host): reserves 2 GiB for submit/staging/driver.
+        assert_eq!(
+            non_device_local_block_room(32 * GIB, 32 * GIB, 1 * GIB, 0),
+            29 * GIB
+        );
+        // Lagging kernel heapUsage (0) is overridden by exact tracked_usage.
+        assert_eq!(
+            non_device_local_block_room(32 * GIB, 32 * GIB, 0, 29 * GIB),
+            1 * GIB
+        );
+        // Once tracked_usage reaches budget - reserve, no more blocks are admitted.
+        assert_eq!(
+            non_device_local_block_room(32 * GIB, 32 * GIB, 0, 30 * GIB),
+            0
+        );
+        // Driver budget below raw heap size caps effective budget.
+        assert_eq!(
+            non_device_local_block_room(32 * GIB, 24 * GIB, 2 * GIB, 2 * GIB),
+            20 * GIB
+        );
+        // Zero reported budget falls back to heap size; small heaps cap reserve at 1/8.
+        assert_eq!(
+            non_device_local_block_room(8 * GIB, 0, 1 * GIB, 0),
+            6 * GIB
+        );
     }
 }

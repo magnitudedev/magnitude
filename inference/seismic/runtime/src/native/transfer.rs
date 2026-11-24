@@ -107,7 +107,7 @@ enum TransferKind {
     Cpu { done: AtomicU64 },
     Cuda(seismic_cuda::transfer::TransferQueue),
     #[cfg(not(target_os = "macos"))]
-    Vulkan(seismic_vulkan::transfer::TransferQueue),
+    Vulkan(Arc<seismic_vulkan::transfer::TransferQueue>),
 }
 
 /// The queue batches run on, and how their completion is observed. Shared
@@ -162,28 +162,125 @@ impl DeviceCompletion for BatchFence {
     }
 }
 
+/// Allocate a process-unique monotonic producer queue identifier for a
+/// transfer or fill-copy queue.
+pub(super) fn next_queue_id() -> u64 {
+    static NEXT_QUEUE_ID: AtomicU64 = AtomicU64::new(1);
+    NEXT_QUEUE_ID.fetch_add(1, Ordering::Relaxed)
+}
+
+/// Process-unique identity of one submitted transfer batch: scoped by opened
+/// device, producer queue instance, and monotonic batch generation/value so
+/// two batches from different queues or devices with the same numeric `u64`
+/// value are never treated as equal.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct TransferSyncId {
+    pub device_id: u64,
+    pub producer_queue_id: u64,
+    pub value: u64,
+}
+
+#[derive(Clone)]
+enum TransferSyncHandle {
+    Cpu,
+    Cuda(Option<Arc<seismic_cuda::Event>>),
+    #[cfg(not(target_os = "macos"))]
+    Vulkan(Arc<seismic_vulkan::transfer::TransferQueue>),
+}
+
 /// A device-side completion handle for a transfer batch, which a
-/// [`super::graph::NativeGraphSequence`] can wait on via cross-stream event
-/// synchronization (`cuStreamWaitEvent` on CUDA) without blocking the host or
-/// using `cuStreamWaitValue32`.
+/// [`super::graph::NativeGraphSequence`] can wait on via cross-queue device
+/// synchronization (`cuStreamWaitEvent` on CUDA, timeline semaphore wait in
+/// `vkQueueSubmit2` on Vulkan) without blocking the host.
 #[derive(Clone)]
 pub struct TransferSync {
-    cuda: Option<Arc<seismic_cuda::Event>>,
+    id: TransferSyncId,
+    handle: TransferSyncHandle,
 }
 
 impl TransferSync {
+    /// The unique `(device_id, producer_queue_id, value)` identity of this
+    /// transfer batch.
+    pub fn id(&self) -> TransferSyncId {
+        self.id
+    }
+
     /// Whether `self` and `other` are one batch's handle, so following
-    /// one follows the other.
+    /// one follows the other. Two batches from different devices, different
+    /// producer queues, or different generations are never equal.
     pub fn same_batch(&self, other: &Self) -> bool {
-        match (&self.cuda, &other.cuda) {
-            (Some(ours), Some(theirs)) => Arc::ptr_eq(ours, theirs),
-            (None, None) => true,
-            _ => false,
+        self.id == other.id
+    }
+
+    /// Validate that this transfer sync belongs to `device` and carries a
+    /// completion handle supported by `device`'s backend/queue. Rejects
+    /// foreign-device or unsupported handles loudly rather than silently
+    /// ignoring them.
+    pub(super) fn validate_for_device(&self, device: &DeviceInner) -> Result<(), ExecutionError> {
+        let expected = device.device_id();
+        if self.id.device_id != expected {
+            return Err(ExecutionError::SubmissionFailed(format!(
+                "transfer sync {:?} belongs to device {}, not device {expected}",
+                self.id, self.id.device_id,
+            )));
+        }
+        match (&device.kind, &self.handle) {
+            (OpenedKind::Cpu(_), TransferSyncHandle::Cpu) => Ok(()),
+            (OpenedKind::Cuda(_), TransferSyncHandle::Cuda(Some(_))) => Ok(()),
+            #[cfg(not(target_os = "macos"))]
+            (OpenedKind::Vulkan(_), TransferSyncHandle::Vulkan(_)) => Ok(()),
+            _ => Err(ExecutionError::SubmissionFailed(format!(
+                "transfer sync {:?} is not supported on backend {:?}",
+                self.id,
+                device.info().backend(),
+            ))),
+        }
+    }
+
+    #[cfg(all(test, not(target_os = "macos")))]
+    pub(super) fn cpu_for_test(device_id: u64, value: u64) -> Self {
+        Self {
+            id: TransferSyncId { device_id, producer_queue_id: 1, value },
+            handle: TransferSyncHandle::Cpu,
         }
     }
 
     pub(super) fn cuda_event(&self) -> Option<&seismic_cuda::Event> {
-        self.cuda.as_deref()
+        match &self.handle {
+            TransferSyncHandle::Cuda(event) => event.as_deref(),
+            _ => None,
+        }
+    }
+
+    /// On Vulkan, the `(semaphore, value, owner)` timeline wait that signals
+    /// when this batch completes (allocation-free fast path; `owner` retains
+    /// the `TransferQueue` alive inside `DirectBatch`/`Retired` until the
+    /// waiting submission retires on the GPU).
+    #[cfg(not(target_os = "macos"))]
+    pub(super) fn vulkan_wait(
+        &self,
+    ) -> Option<(seismic_vulkan::vk::Semaphore, u64, Arc<dyn std::any::Any + Send + Sync>)> {
+        match &self.handle {
+            TransferSyncHandle::Vulkan(queue) => Some((
+                queue.semaphore(),
+                self.id.value,
+                Arc::clone(queue) as Arc<dyn std::any::Any + Send + Sync>,
+            )),
+            _ => None,
+        }
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    pub(super) fn from_vulkan_queue(
+        device_id: u64,
+        producer_queue_id: u64,
+        value: u64,
+        queue: Arc<seismic_vulkan::transfer::TransferQueue>,
+    ) -> Self {
+        Self {
+            id: TransferSyncId { device_id, producer_queue_id, value },
+            handle: TransferSyncHandle::Vulkan(queue),
+        }
     }
 }
 
@@ -196,6 +293,7 @@ static NEXT_TRANSFER_QUEUE_ID: AtomicU64 = AtomicU64::new(1);
 /// One device's transfer queue.
 pub struct TransferInner {
     device: Arc<DeviceInner>,
+    producer_queue_id: u64,
     queue: Arc<Queue>,
     /// Unique producer queue ID for `DeviceQueue::Transfer(queue_id)`.
     queue_id: u64,
@@ -217,12 +315,13 @@ impl TransferInner {
             #[cfg(target_os = "macos")]
             OpenedKind::Metal(_) => return Err(TransferError::InPlace),
             #[cfg(not(target_os = "macos"))]
-            OpenedKind::Vulkan(opened) => TransferKind::Vulkan(
+            OpenedKind::Vulkan(opened) => TransferKind::Vulkan(Arc::new(
                 seismic_vulkan::transfer::TransferQueue::new(opened.service()).map_err(TransferError::Execution)?,
-            ),
+            )),
         };
         Ok(Self {
             device: device.clone(),
+            producer_queue_id: next_queue_id(),
             queue: Arc::new(Queue { kind }),
             queue_id: NEXT_TRANSFER_QUEUE_ID.fetch_add(1, Ordering::Relaxed),
             next: AtomicU64::new(1),
@@ -289,8 +388,7 @@ impl TransferInner {
         let _issuing = self.issuing.lock().expect("transfer queue lock is never poisoned");
         // A batch takes its value once queued: a refused one takes none.
         let value = self.next.load(Ordering::Relaxed);
-        let mut cuda_event = None;
-        match &self.queue.kind {
+        let handle = match &self.queue.kind {
             TransferKind::Cpu { done } => {
                 // Every item's addresses first: a batch is refused before any
                 // of it is copied.
@@ -339,6 +437,7 @@ impl TransferInner {
                     }
                 }
                 done.store(value, Ordering::Release);
+                TransferSyncHandle::Cpu
             }
             TransferKind::Cuda(queue) => {
                 type Cuda = seismic_cuda::Cuda;
@@ -366,13 +465,14 @@ impl TransferInner {
                 } else {
                     queue.copy(&items, value as u32).map(|()| None)
                 };
-                match self.handle_cuda_copy_outcome(result, value, &access) {
-                    Ok(event) => cuda_event = event,
+                let cuda_event = match self.handle_cuda_copy_outcome(result, value, &access) {
+                    Ok(event) => event,
                     Err(error) => {
                         drop(permits);
                         return Err(error);
                     }
-                }
+                };
+                TransferSyncHandle::Cuda(cuda_event)
             }
             #[cfg(not(target_os = "macos"))]
             TransferKind::Vulkan(queue) => {
@@ -395,15 +495,24 @@ impl TransferInner {
                     })
                     .collect::<Vec<_>>();
                 queue.copy(&items, value).map_err(TransferError::Execution)?;
+                TransferSyncHandle::Vulkan(Arc::clone(queue))
             }
-        }
+        };
         self.next.store(value + 1, Ordering::Relaxed);
         let fence: Arc<dyn DeviceCompletion> = Arc::new(BatchFence { queue: self.queue.clone(), value });
         for (allocation, write) in &access {
             allocation.record_device_use(DeviceQueue::Transfer(self.queue_id), fence.clone(), *write);
         }
         drop(permits);
-        Ok((value, TransferSync { cuda: cuda_event }))
+        let sync = TransferSync {
+            id: TransferSyncId {
+                device_id: self.device.device_id(),
+                producer_queue_id: self.producer_queue_id,
+                value,
+            },
+            handle,
+        };
+        Ok((value, sync))
     }
 
     /// Translate a CUDA transfer enqueue outcome:
@@ -689,5 +798,197 @@ mod tests {
         if let TransferKind::Cpu { done } = &transfer.queue.kind {
             done.store(value, Ordering::Release);
         }
+    }
+
+    /// Proof case #3: `TransferSync` identity is scoped by
+    /// `(device_id, producer_queue_id, value)`. Two batches with the same
+    /// numeric `u64` timeline value on different queues or different opened
+    /// devices are NEVER treated as equal (`same_batch == false`), even on
+    /// backends without CUDA events.
+    #[test]
+    fn transfer_sync_same_numeric_value_across_queues_and_devices_is_not_equal() {
+        let device_a = cpu();
+        let device_b = cpu();
+        assert_ne!(device_a.device_id(), device_b.device_id());
+
+        let queue_a1 = TransferInner::new(&device_a).unwrap();
+        let queue_a2 = TransferInner::new(&device_a).unwrap();
+        let queue_b1 = TransferInner::new(&device_b).unwrap();
+
+        let make_pair = |device: &Arc<DeviceInner>| {
+            let charges = crate::memory::Charges::tally(device);
+            let i32s = seismic_lang::registry::dense(seismic_lang::types::DType::I32);
+            let src = TensorInner::from_host(&charges, i32s, &[2], &[1, 2, 3, 4, 5, 6, 7, 8]).unwrap();
+            let dst = TensorInner::from_host(&charges, i32s, &[2], &[0; 8]).unwrap();
+            (src, dst)
+        };
+        let (src_a, dst_a) = make_pair(&device_a);
+        let (src_b, dst_b) = make_pair(&device_b);
+        fn run<'a>(src: &'a TensorInner, dst: &'a TensorInner) -> [TransferItem<'a>; 1] {
+            [TransferItem::Run(TransferRun {
+                source: src,
+                source_offset: 0,
+                destination: dst,
+                destination_offset: 0,
+                bytes: 4,
+            })]
+        }
+
+        let (v_a1_first, sync_a1_first) = queue_a1.copy_synced(&run(&src_a, &dst_a)).unwrap();
+        let (v_a1_second, sync_a1_second) = queue_a1.copy_synced(&run(&src_a, &dst_a)).unwrap();
+        let (v_a2_first, sync_a2_first) = queue_a2.copy_synced(&run(&src_a, &dst_a)).unwrap();
+        let (v_b1_first, sync_b1_first) = queue_b1.copy_synced(&run(&src_b, &dst_b)).unwrap();
+
+        assert_eq!(v_a1_first, 1);
+        assert_eq!(v_a2_first, 1);
+        assert_eq!(v_b1_first, 1);
+        assert_eq!(v_a1_second, 2);
+
+        // Same batch clone -> equal.
+        assert!(sync_a1_first.same_batch(&sync_a1_first.clone()));
+        // Same queue, different generation -> NOT equal.
+        assert!(!sync_a1_first.same_batch(&sync_a1_second));
+        // Different queue on same device, SAME numeric u64 value (1) -> NOT equal.
+        assert!(!sync_a1_first.same_batch(&sync_a2_first));
+        assert_ne!(sync_a1_first.id().producer_queue_id, sync_a2_first.id().producer_queue_id);
+        // Different device, SAME numeric u64 value (1) -> NOT equal.
+        assert!(!sync_a1_first.same_batch(&sync_b1_first));
+        assert_ne!(sync_a1_first.id().device_id, sync_b1_first.id().device_id);
+    }
+
+    /// Proof cases #1 & #2 at the cross-queue fence layer:
+    /// 1. Delayed fill before consumer read: while a `Fill` write is still in
+    ///    flight, a `Compute` read on that slot receives the fill fence via
+    ///    `queue_order` so it waits for producer publication.
+    /// 2. Overlapping readers prohibiting slot reuse until the final reader
+    ///    retires: while two `Compute` readers overlap on the slot, a `Fill`
+    ///    write (slot reuse) is blocked after reader 1 finishes and only
+    ///    unblocked once the final reader (reader 2) retires.
+    #[test]
+    fn delayed_fill_orders_before_consumer_and_overlapping_readers_block_slot_reuse() {
+        use crate::native::NativeQueue;
+        use std::sync::atomic::AtomicBool;
+
+        struct ControlledFence(Arc<AtomicBool>);
+        impl DeviceCompletion for ControlledFence {
+            fn completed(&self) -> Result<bool, ExecutionError> {
+                Ok(self.0.load(Ordering::Acquire))
+            }
+            fn ended(&self) -> Result<(), ExecutionError> {
+                assert!(self.0.load(Ordering::Acquire), "unexpected blocking wait in unit test");
+                Ok(())
+            }
+        }
+
+        let device = cpu();
+        let charges = crate::memory::Charges::tally(&device);
+        let i32s = seismic_lang::registry::dense(seismic_lang::types::DType::I32);
+        let slot = TensorInner::from_host(&charges, i32s, &[4], &[0; 16]).unwrap();
+        let alloc = slot.allocation();
+
+        // Proof #1: delayed fill write on NativeQueue::Fill blocks Compute read.
+        let fill_done = Arc::new(AtomicBool::new(false));
+        let fill_fence: Arc<dyn DeviceCompletion> = Arc::new(ControlledFence(Arc::clone(&fill_done)));
+        alloc.record_device_use(DeviceQueue::Native(NativeQueue::Fill), Arc::clone(&fill_fence), true);
+
+        let compute_waits = alloc.queue_order(NativeQueue::Compute, false).unwrap();
+        assert_eq!(compute_waits.len(), 1, "consumer read must wait on delayed fill producer");
+        assert!(Arc::ptr_eq(&compute_waits[0], &fill_fence));
+
+        // Once the delayed fill completes, consumer read has no pending fill fence.
+        fill_done.store(true, Ordering::Release);
+        assert!(alloc.queue_order(NativeQueue::Compute, false).unwrap().is_empty());
+
+        // Proof #2: two overlapping Compute readers prohibit Fill slot reuse
+        // until the FINAL reader retires.
+        let reader1_done = Arc::new(AtomicBool::new(false));
+        let reader2_done = Arc::new(AtomicBool::new(false));
+        let reader1: Arc<dyn DeviceCompletion> = Arc::new(ControlledFence(Arc::clone(&reader1_done)));
+        let reader2: Arc<dyn DeviceCompletion> = Arc::new(ControlledFence(Arc::clone(&reader2_done)));
+        alloc.record_device_use(DeviceQueue::Native(NativeQueue::Compute), Arc::clone(&reader1), false);
+        alloc.record_device_use(DeviceQueue::Native(NativeQueue::Compute), Arc::clone(&reader2), false);
+
+        // Both readers in flight -> Fill write must wait.
+        assert!(!alloc.queue_order(NativeQueue::Fill, true).unwrap().is_empty());
+
+        // Reader 1 completes, reader 2 still active -> Fill slot reuse STILL blocked!
+        reader1_done.store(true, Ordering::Release);
+        let remaining = alloc.queue_order(NativeQueue::Fill, true).unwrap();
+        assert_eq!(remaining.len(), 1, "slot reuse must remain blocked until final reader retires");
+        assert!(Arc::ptr_eq(&remaining[0], &reader2));
+
+        // Final reader (reader 2) retires -> slot reuse now unblocked!
+        reader2_done.store(true, Ordering::Release);
+        assert!(alloc.queue_order(NativeQueue::Fill, true).unwrap().is_empty());
+    }
+
+    /// `NativeGraphSequence::follow_transfer` and `TransferSync::validate_for_device`
+    /// must reject foreign-device and unsupported `TransferSync` handles loudly
+    /// rather than silently accepting or ignoring them.
+    #[test]
+    fn follow_transfer_rejects_foreign_device_and_unsupported_handle() {
+        use crate::native::graph::NativeGraphSequence;
+        use crate::native::NativeQueue;
+
+        let device_a = cpu();
+        let device_b = cpu();
+        assert_ne!(device_a.device_id(), device_b.device_id());
+
+        let queue_a = TransferInner::new(&device_a).unwrap();
+        let queue_b = TransferInner::new(&device_b).unwrap();
+
+        let make_pair = |device: &Arc<DeviceInner>| {
+            let charges = crate::memory::Charges::tally(device);
+            let i32s = seismic_lang::registry::dense(seismic_lang::types::DType::I32);
+            let src = TensorInner::from_host(&charges, i32s, &[2], &[1, 2, 3, 4, 5, 6, 7, 8]).unwrap();
+            let dst = TensorInner::from_host(&charges, i32s, &[2], &[0; 8]).unwrap();
+            (src, dst)
+        };
+        let (src_a, dst_a) = make_pair(&device_a);
+        let (src_b, dst_b) = make_pair(&device_b);
+        fn run<'a>(src: &'a TensorInner, dst: &'a TensorInner) -> [TransferItem<'a>; 1] {
+            [TransferItem::Run(TransferRun {
+                source: src,
+                source_offset: 0,
+                destination: dst,
+                destination_offset: 0,
+                bytes: 4,
+            })]
+        }
+        let (_, sync_a) = queue_a.copy_synced(&run(&src_a, &dst_a)).unwrap();
+        let (_, sync_b) = queue_b.copy_synced(&run(&src_b, &dst_b)).unwrap();
+
+        // Same-device, matching handle -> accepted.
+        let mut seq_a = NativeGraphSequence::new(&device_a, NativeQueue::Compute);
+        assert!(seq_a.follow_transfer(sync_a).is_ok());
+
+        // Foreign-device handle -> rejected loudly.
+        let err = seq_a
+            .follow_transfer(sync_b)
+            .expect_err("foreign-device TransferSync must be rejected");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("belongs to device"),
+            "unexpected foreign-device error: {msg}"
+        );
+
+        // Unsupported handle (e.g., CUDA handle without a recorded event on a
+        // CPU device, even with a matching device_id) -> rejected loudly.
+        let unsupported = TransferSync {
+            id: TransferSyncId {
+                device_id: device_a.device_id(),
+                producer_queue_id: 99,
+                value: 1,
+            },
+            handle: TransferSyncHandle::Cuda(None),
+        };
+        let err = seq_a
+            .follow_transfer(unsupported)
+            .expect_err("unsupported TransferSync handle must be rejected");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("is not supported on backend"),
+            "unexpected unsupported-handle error: {msg}"
+        );
     }
 }

@@ -118,6 +118,12 @@ impl TransferQueue {
         })
     }
 
+    /// The timeline semaphore signalled as each batch completes, for GPU-side
+    /// cross-queue waits (`DirectBatch::wait_device_semaphore`).
+    pub fn semaphore(&self) -> vk::Semaphore {
+        self.semaphore
+    }
+
     /// Queue `items` as one batch, which raises the timeline to `value`
     /// once every run has landed and every signal is written: the caller
     /// numbers batches, each above the last. A batch that is invalid or
@@ -125,6 +131,18 @@ impl TransferQueue {
     /// bytes no queued work reaches, and keeps the sources' bytes until
     /// then.
     pub fn copy(&self, items: &[TransferItem<'_>], value: u64) -> Result<(), ExecutionError> {
+        self.copy_after(items, value, &[])
+    }
+
+    /// [`Self::copy`], waiting on device-signalled `waits` (at `TRANSFER`)
+    /// before executing the copies (e.g. waiting for compute readers to retire
+    /// before overwriting a scratch slot).
+    pub fn copy_after(
+        &self,
+        items: &[TransferItem<'_>],
+        value: u64,
+        waits: &[(vk::Semaphore, u64)],
+    ) -> Result<(), ExecutionError> {
         let mut regions: Vec<Command> = Vec::new();
         for item in items {
             let run = match item {
@@ -211,11 +229,21 @@ impl TransferQueue {
             return Err(error);
         }
         let commands = [vk::CommandBufferSubmitInfo::default().command_buffer(command)];
+        let wait_infos: Vec<vk::SemaphoreSubmitInfo<'_>> = waits
+            .iter()
+            .map(|&(semaphore, wait_value)| {
+                vk::SemaphoreSubmitInfo::default()
+                    .semaphore(semaphore)
+                    .value(wait_value)
+                    .stage_mask(vk::PipelineStageFlags2::TRANSFER)
+            })
+            .collect();
         let signals = [vk::SemaphoreSubmitInfo::default()
             .semaphore(self.semaphore)
             .value(value)
             .stage_mask(vk::PipelineStageFlags2::ALL_COMMANDS)];
         let submit = vk::SubmitInfo2::default()
+            .wait_semaphore_infos(&wait_infos)
             .command_buffer_infos(&commands)
             .signal_semaphore_infos(&signals);
         if let Err(error) = self.device.submit_side(&[submit]) {
@@ -268,8 +296,19 @@ impl Drop for TransferQueue {
         let semaphores = [self.semaphore];
         let values = [last];
         let raw = &self.device.inner.device;
+        // Every compute submission waiting on `self.semaphore` retains an
+        // `Arc<TransferQueue>` in `Retired::wait_owners` until it retires on
+        // the GPU, so by the time `Drop` runs no compute submission can hold a
+        // pending wait on `self.semaphore` — we never block on the compute
+        // queue here (avoiding deadlock if dropped on a gate-signalling thread).
         unsafe {
-            if raw.wait_semaphores(&vk::SemaphoreWaitInfo::default().semaphores(&semaphores).values(&values), u64::MAX).is_ok() {
+            if raw
+                .wait_semaphores(
+                    &vk::SemaphoreWaitInfo::default().semaphores(&semaphores).values(&values),
+                    u64::MAX,
+                )
+                .is_ok()
+            {
                 raw.destroy_command_pool(state.pool, None);
                 raw.destroy_semaphore(self.semaphore, None);
             }
@@ -347,6 +386,91 @@ mod tests {
                 bytes >> 20,
                 bytes as f64 / started.elapsed().as_secs_f64() / 1e9
             );
+        }
+    }
+
+    /// GPU-side cross-queue timeline synchronization on devices with a side
+    /// queue:
+    /// 1. Producer publication before consumer read: `TransferQueue::copy` on
+    ///    `side_family` writes `mid`, and a compute-queue `DirectBatch`
+    ///    immediately waits on `(queue.semaphore(), 1)` via
+    ///    `wait_device_semaphore` (no host wait!) and copies `mid -> dst`.
+    /// 2. Consumer retirement before slot reuse: `TransferQueue::copy_after` on
+    ///    `side_family` waits on `compute_sub.timeline_wait()` before
+    ///    overwriting `mid` with a second pattern, leaving `dst` intact with
+    ///    the first pattern and `mid` holding the second.
+    #[test]
+    fn gpu_side_queue_semaphore_orders_producer_before_consumer_and_retires_before_reuse() {
+        for description in crate::test_devices() {
+            let device = Device::open(
+                description.info.uuid,
+                crate::unbounded_stores(&description.info),
+                &Default::default(),
+            )
+            .expect("a device meeting the floor opens");
+            if !device.has_side_queue() {
+                continue;
+            }
+            let queue = std::sync::Arc::new(TransferQueue::new(&device).expect("side queue opens transfer queue"));
+            let own = device.own();
+            let bytes = 4u64 << 20;
+            let src1 = device.allocate_upload(bytes, 256, &own).expect("src1 upload");
+            let src2 = device.allocate_upload(bytes, 256, &own).expect("src2 upload");
+            let mid = device.allocate(bytes, 256, &own).expect("mid device");
+            let dst = device.allocate(bytes, 256, &own).expect("dst device");
+            let pat1: Vec<u8> = (0..bytes).map(|i| ((i * 7 + 3) & 0xff) as u8).collect();
+            let pat2: Vec<u8> = (0..bytes).map(|i| ((i * 13 + 91) & 0xff) as u8).collect();
+            device.write(&src1, 0, &pat1).unwrap();
+            device.write(&src2, 0, &pat2).unwrap();
+
+            // 1. Producer on side_family copies src1 -> mid (timeline value 1).
+            queue
+                .copy(
+                    &[TransferItem::Run(TransferRun {
+                        source: TransferEnd(&src1, 0),
+                        destination: TransferEnd(&mid, 0),
+                        bytes,
+                    })],
+                    1,
+                )
+                .unwrap();
+
+            // 2. Consumer on compute queue waits on (queue.semaphore(), 1) on GPU
+            //    (zero host wait!) and copies mid -> dst.
+            let mut batch = crate::direct::DirectBatch::unmeasured(&device).unwrap();
+            batch.wait_device_semaphore_owned(
+                queue.semaphore(),
+                1,
+                std::sync::Arc::clone(&queue) as std::sync::Arc<dyn std::any::Any + Send + Sync>,
+            );
+            batch
+                .transfer(&[(TransferEnd(&mid, 0), TransferEnd(&dst, 0), bytes)], &[])
+                .unwrap();
+            let compute_sub = batch.commit().unwrap();
+
+            // 3. Producer reuses `mid` on side_family ONLY after compute reader
+            //    retires (`compute_sub.timeline_wait()`).
+            queue
+                .copy_after(
+                    &[TransferItem::Run(TransferRun {
+                        source: TransferEnd(&src2, 0),
+                        destination: TransferEnd(&mid, 0),
+                        bytes,
+                    })],
+                    2,
+                    &[compute_sub.timeline_wait()],
+                )
+                .unwrap();
+
+            assert!(queue.wait(2, Duration::from_secs(10)).unwrap());
+            compute_sub.finish().unwrap();
+
+            let mut got_dst = vec![0u8; bytes as usize];
+            let mut got_mid = vec![0u8; bytes as usize];
+            device.read(&dst, 0, &mut got_dst).unwrap();
+            device.read(&mid, 0, &mut got_mid).unwrap();
+            assert!(got_dst == pat1, "{}: compute read saw exact pat1 before reuse", description.info.name);
+            assert!(got_mid == pat2, "{}: mid holds pat2 after consumer retired", description.info.name);
         }
     }
 }

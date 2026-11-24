@@ -316,6 +316,7 @@ pub fn vulkan(
         },
         kinds: recorded_vulkan_kinds(layout, heaps),
         properties: None,
+        has_side_queue: true,
     }
 }
 

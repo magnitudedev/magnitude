@@ -28,6 +28,7 @@ pub mod topology;
 pub mod transfer;
 mod uniformity;
 
+pub use ash::vk;
 pub use device::{Device, DeviceHandle, HeapBudget, MemoryBudget, OpenError};
 pub use device_info::{
     Allocation, Description, DeviceInfo, DeviceType, FormationTarget, Limits, MemoryHeap,

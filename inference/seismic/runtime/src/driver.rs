@@ -1760,7 +1760,8 @@ mod physical_slot_tests {
         // Pending test fences are forgotten before the storage is released.
         for held in [&allocation, &words] {
             let mut state = held.access_group().state.lock().unwrap();
-            state.queues.iter_mut().for_each(|fences| *fences = QueueFences::default());
+            state.native.iter_mut().for_each(|fences| *fences = QueueFences::default());
+            state.transfers.clear();
         }
     }
 

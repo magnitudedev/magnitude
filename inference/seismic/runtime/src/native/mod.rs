@@ -207,6 +207,10 @@ pub(crate) struct NativeState {
     /// only).
     #[cfg(not(target_os = "macos"))]
     vulkan_replays: vulkan::VulkanReplays,
+    /// Side-queue transfer queue for `submit_fill_copies` on Vulkan devices
+    /// with `side_family`.
+    #[cfg(not(target_os = "macos"))]
+    vulkan_fill_queue: Mutex<Option<Arc<vulkan::VulkanFillQueue>>>,
     /// Schedules of sealed-plan submissions (Metal devices only).
     #[cfg(target_os = "macos")]
     metal_schedules: graph_replays::Replays<hazard::Schedule>,
@@ -431,6 +435,23 @@ impl LayoutForms {
 /// need at once ([`Self::census`]), held from its first live slot to its
 /// last. Graphs are recorded as a run first needs one, never as a slot is
 /// made (`cuda::issue`).
+struct FamilyHold {
+    /// Total live slots of the family.
+    slots: u64,
+    /// Upper bound on decode-capable (floor) slots that pin decode graphs.
+    /// Defaults to `u64::MAX` (all slots decode-capable) until capped by
+    /// [`FamilyGraphs::cap_decode_flights`].
+    decode_cap: u64,
+    /// Active graph budget hold, `None` while `slots == 0`.
+    hold: Option<GraphHold>,
+}
+
+impl FamilyHold {
+    fn decode_flights(&self) -> u64 {
+        self.slots.min(self.decode_cap)
+    }
+}
+
 pub struct FamilyGraphs {
     device: Arc<DeviceInner>,
     layouts: LayoutForms,
@@ -438,11 +459,11 @@ pub struct FamilyGraphs {
     /// beside another holds, and the union of every launch's, which any
     /// one may (`LaunchGraphs::held`).
     launches: LaunchGraphs,
-    /// Its live slots, and the hold of their census, none while no slot
-    /// lives.
-    held: Mutex<(u64, Option<GraphHold>)>,
-    /// Its live slots, as the hold counts them: no more than its census
-    /// holds, read without the hold's lock by a release of graphs
+    /// Its live slots, decode-flight cap, and the hold of their census, none
+    /// while no slot lives.
+    held: Mutex<FamilyHold>,
+    /// Its live decode-capable slots, as the hold counts them: no more than
+    /// its census holds, read without the hold's lock by a release of graphs
     /// (`graph_replays::Pinned`), which runs beneath it.
     flights: Arc<std::sync::atomic::AtomicUsize>,
 }
@@ -454,7 +475,13 @@ impl FamilyGraphs {
     }
 
     pub(crate) fn new(device: &Arc<DeviceInner>, layouts: LayoutForms, launches: LaunchGraphs) -> Arc<Self> {
-        Arc::new(Self { device: device.clone(), layouts, launches, held: Mutex::new((0, None)), flights: Arc::default() })
+        Arc::new(Self {
+            device: device.clone(),
+            layouts,
+            launches,
+            held: Mutex::new(FamilyHold { slots: 0, decode_cap: u64::MAX, hold: None }),
+            flights: Arc::default(),
+        })
     }
 
     /// What it pins for each launch in flight and the union of its
@@ -463,15 +490,40 @@ impl FamilyGraphs {
         self.launches.clone()
     }
 
-    /// Its live slots, each a launch in flight, as its hold counts them.
+    /// Its live decode-capable slots, as its hold counts them.
     pub(crate) fn flights(&self) -> &Arc<std::sync::atomic::AtomicUsize> {
         &self.flights
     }
 
-    /// What the family's graphs hold at most with `slots` live slots, each
-    /// a launch in flight ([`LaunchGraphs::held`]).
-    fn census(&self, slots: u64) -> GraphCensus {
-        self.launches.held(slots).expect("a family's graph census fits u64")
+    /// Cap how many live slots of this family are decode-capable (floor)
+    /// flights that pin decode graphs; slots beyond `cap` serve prefill chains
+    /// only and never run decode (`LaunchGraphs::held_with_decode`).
+    pub(crate) fn cap_decode_flights(&self, cap: u64) -> Result<(), ExecutionError> {
+        let mut held = self.held.lock().expect("family graph hold lock is never poisoned");
+        let decode_flights = held.slots.min(cap);
+        let census = self.census(held.slots, decode_flights);
+        let prev = self.flights.load(std::sync::atomic::Ordering::Acquire) as u64;
+        if decode_flights <= prev {
+            // Uncount before shrinking so `fit_graphs` can evict surplus pins.
+            self.flights.store(decode_flights as usize, std::sync::atomic::Ordering::Release);
+        }
+        if let Some(hold) = &mut held.hold {
+            if let Err(err) = hold.resize(census) {
+                self.flights.store(prev as usize, std::sync::atomic::Ordering::Release);
+                return Err(err);
+            }
+        }
+        held.decode_cap = cap;
+        self.flights.store(decode_flights as usize, std::sync::atomic::Ordering::Release);
+        Ok(())
+    }
+
+    /// What the family's graphs hold at most with `slots` live slots of which
+    /// `decode_flights` (`<= slots`) run decode (`LaunchGraphs::held_with_decode`).
+    fn census(&self, slots: u64, decode_flights: u64) -> GraphCensus {
+        self.launches
+            .held_with_decode(slots, decode_flights)
+            .expect("a family's graph census fits u64")
     }
 
     /// A live slot's share: the family's hold grown to one more slot's
@@ -479,14 +531,16 @@ impl FamilyGraphs {
     /// room for it.
     pub(crate) fn slot(self: &Arc<Self>) -> Result<Arc<SlotGraphs>, ExecutionError> {
         let mut held = self.held.lock().expect("family graph hold lock is never poisoned");
-        let census = self.census(held.0 + 1);
-        match &mut held.1 {
+        let next_slots = held.slots + 1;
+        let next_decode = next_slots.min(held.decode_cap);
+        let census = self.census(next_slots, next_decode);
+        match &mut held.hold {
             Some(hold) => drop(hold.resize(census)?),
-            None => held.1 = Some(GraphHold::new(&self.device, census)?),
+            None => held.hold = Some(GraphHold::new(&self.device, census)?),
         }
-        held.0 += 1;
+        held.slots = next_slots;
         // Counted once the hold covers it.
-        self.flights.store(held.0 as usize, std::sync::atomic::Ordering::Release);
+        self.flights.store(next_decode as usize, std::sync::atomic::Ordering::Release);
         Ok(Arc::new(SlotGraphs { family: self.clone() }))
     }
 }
@@ -523,15 +577,16 @@ impl SlotGraphs {
     /// the bytes the device is no longer charged.
     fn unhold(family: &FamilyGraphs) -> u64 {
         let mut held = family.held.lock().expect("family graph hold lock is never poisoned");
-        held.0 -= 1;
+        held.slots -= 1;
+        let decode_flights = held.decode_flights();
         // Uncounted before the hold shrinks and releases graphs beyond it.
-        family.flights.store(held.0 as usize, std::sync::atomic::Ordering::Release);
-        let census = family.census(held.0);
-        let hold = held.1.take().expect("a family holds its graphs while a slot lives");
-        match held.0 {
+        family.flights.store(decode_flights as usize, std::sync::atomic::Ordering::Release);
+        let census = family.census(held.slots, decode_flights);
+        let hold = held.hold.take().expect("a family holds its graphs while a slot lives");
+        match held.slots {
             0 => hold.release(),
             _ => {
-                let hold = held.1.insert(hold);
+                let hold = held.hold.insert(hold);
                 hold.resize(census).expect("a smaller census reserves nothing, so its charge is never refused")
             }
         }
@@ -3609,11 +3664,23 @@ pub enum NativeQueue {
 impl NativeQueue {
     pub(crate) const ALL: [Self; 2] = [Self::Compute, Self::Fill];
 
-    /// The queue `backend` runs this queue's work on.
-    fn on(self, backend: seismic_lang::registry::BackendName) -> Self {
+    /// The queue compute-kernel submissions run on: only CUDA has a second
+    /// compute stream (`NativeStream::Fill`); Vulkan's side queue runs DMA
+    /// transfers (`submit_fill_copies`), not compute shaders.
+    fn on_compute(self, backend: seismic_lang::registry::BackendName) -> Self {
         match self {
-            Self::Fill if backend.fills_beside_compute() => Self::Fill,
+            Self::Fill if backend == seismic_lang::registry::BackendName::Cuda => Self::Fill,
             Self::Compute | Self::Fill => Self::Compute,
+        }
+    }
+
+    /// The queue fill-copy DMA runs on: `NativeQueue::Fill` wherever the
+    /// opened device has a side/fill queue beside compute.
+    fn on_fill_copies(device: &DeviceInner) -> Self {
+        if device.fills_beside_compute() {
+            Self::Fill
+        } else {
+            Self::Compute
         }
     }
 }
@@ -3658,6 +3725,10 @@ pub(crate) fn submit_after_transfers(
         .map(|(allocation, write)| allocation.acquire_for_device(*write))
         .collect::<Vec<_>>();
     let first = list.dispatch(0, &mut Vec::new()).kernel;
+    for sync in after_transfers {
+        sync.validate_for_device(&first.public_device)
+            .map_err(CallError::Execution)?;
+    }
     // Commit and fence recording in one order: allocation fences rely on
     // being recorded in the queue's execution order.
     let _order = first
@@ -3666,7 +3737,7 @@ pub(crate) fn submit_after_transfers(
         .order
         .lock()
         .expect("native submission order lock is never poisoned");
-    let queue = queue.on(first.public_device.info().backend());
+    let queue = queue.on_compute(first.public_device.info().backend());
     // Each fence once: work touching several allocations another queue's
     // submission used waits for it once.
     let mut after: Vec<Arc<dyn DeviceCompletion>> = Vec::new();
@@ -3680,7 +3751,10 @@ pub(crate) fn submit_after_transfers(
     first.public_device.ran_work();
     let trace = first.public_device.active_trace();
     let encode_start = trace::host_seconds();
-    let labels = trace.as_ref().map(|_| launch_labels(list, repetitions));
+    let labels = trace
+        .as_deref()
+        .filter(|sink| sink.detail() == trace::TraceDetail::Launches)
+        .map(|_| launch_labels(list, repetitions));
     let timed = trace
         .as_deref()
         .filter(|sink| sink.detail() == trace::TraceDetail::Launches)
@@ -3689,6 +3763,7 @@ pub(crate) fn submit_after_transfers(
     // its caller receives it, and can answer a park it reached, before the
     // failure is reported by its outcome.
     let work = Encoding {
+        device_id: first.public_device.device_id(),
         list,
         repetitions,
         timed,
@@ -3714,8 +3789,8 @@ pub(crate) fn submit_after_transfers(
     if FAIL_AFTER_PUBLICATION.replace(false) {
         panic!("injected failure after fence publication");
     }
-    if let (Some(sink), Some(labels)) = (trace, labels) {
-        sink.record(route.clone(), labels, encode_start, trace::host_seconds());
+    if let Some(sink) = trace {
+        sink.record(route.clone(), labels.unwrap_or_default(), encode_start, trace::host_seconds());
     }
     drop(permits);
     let gates = (0..=list.count())
@@ -3723,10 +3798,15 @@ pub(crate) fn submit_after_transfers(
         .filter(|operation| operation.action == timeline::TimelineAction::Wait)
         .map(|operation| (operation.timeline.clone(), operation.value))
         .collect();
+    let barriers = if first.public_device.info().backend() == seismic_lang::registry::BackendName::Metal {
+        resident_barriers(list, access)
+    } else {
+        Vec::new()
+    };
     Ok(NativeSubmission {
         route: issued.take(),
         gates,
-        barriers: resident_barriers(list, access),
+        barriers,
         _retained: retained,
     })
 }
@@ -3790,7 +3870,7 @@ pub fn submit_fill_copies(
         .order
         .lock()
         .expect("native submission order lock is never poisoned");
-    let queue = NativeQueue::Fill.on(device.info().backend());
+    let queue = NativeQueue::on_fill_copies(device);
     let mut after: Vec<Arc<dyn DeviceCompletion>> = Vec::new();
     for (allocation, write) in &access {
         for fence in allocation.queue_order(queue, *write).map_err(CallError::Execution)? {
@@ -3835,9 +3915,13 @@ pub fn submit_fill_copies(
             "fill DMA copies are not supported on Metal".into(),
         ))),
         #[cfg(not(target_os = "macos"))]
-        OpenedKind::Vulkan(_) => Err(EncodeFailure::uncommitted(refused(
-            "fill DMA copies are not supported on Vulkan".into(),
-        ))),
+        OpenedKind::Vulkan(opened) => vulkan::encode_fill_copies(
+            opened.service(),
+            &device.native.vulkan_fill_queue,
+            device.device_id(),
+            &after,
+            runs,
+        ),
     };
     let route = Arc::new(encoded.map(RouteSubmission::Committed).or_else(EncodeFailure::completion)?);
     let route = issued.0.insert(route);
@@ -3974,6 +4058,7 @@ fn launch_labels(list: &impl DispatchList, repetitions: usize) -> Vec<trace::Tra
 /// timed unit; `observed` says whether its device time is read; `retained`
 /// keeps the formed functions alive with the submission.
 struct Encoding<'a, L> {
+    device_id: u64,
     list: &'a L,
     repetitions: usize,
     timed: Option<(&'a trace::TraceSink, usize)>,
@@ -3986,12 +4071,12 @@ struct Encoding<'a, L> {
 
 /// Encode and commit `work`.
 fn encode(first: &NativePrepared, work: &Encoding<'_, impl DispatchList>) -> Result<Committed, EncodeFailure> {
-    let Encoding { list, repetitions, timed, observed, retained: _, queue, after, after_transfers: _ } = *work;
+    let Encoding { device_id: _, list, repetitions, timed, observed, retained: _, queue, after: _, after_transfers: _ } = *work;
     #[cfg(target_os = "macos")]
     let mut buffers = Vec::new();
     assert!(
-        matches!(first.route, NativeRoute::Cuda { .. }) || (queue == NativeQueue::Compute && after.is_empty()),
-        "only a backend with a fill queue beside compute runs native work on another queue"
+        matches!(first.route, NativeRoute::Cuda { .. }) || queue == NativeQueue::Compute,
+        "only CUDA runs native compute work on the fill queue"
     );
     match &first.route {
         NativeRoute::Cpu(route) => {

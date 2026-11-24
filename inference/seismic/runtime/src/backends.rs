@@ -392,8 +392,11 @@ pub(crate) fn open(
         #[cfg(not(target_os = "macos"))]
         OpenedKind::Vulkan(opened) => seismic_lang::device::DeviceProperties::Vulkan(*opened.service().properties()),
     };
+    static NEXT_DEVICE_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+    let device_id = NEXT_DEVICE_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let test = seismic_lang::registry::TestDevice::opened(info.backend());
     Ok(Arc::new(DeviceInner {
+        device_id,
         test,
         info,
         topology,

@@ -786,6 +786,22 @@ impl Device {
     pub fn forms_tensor_operations(&self) -> bool {
         self.inner.forms_tensor_operations()
     }
+    /// Whether this opened device exposes a distinct side queue for async
+    /// transfers / fill DMA beside compute.
+    pub fn has_side_queue(&self) -> bool {
+        self.inner.has_side_queue()
+    }
+    /// Whether this opened device runs fill/transfer DMA beside compute.
+    pub fn fills_beside_compute(&self) -> bool {
+        self.inner.fills_beside_compute()
+    }
+    /// Live headroom for additional host-tier pool blocks on a discrete
+    /// device's non-device-local (GTT) heap (Vulkan), keeping
+    /// command-submission headroom free; `None` on backends without a separate
+    /// driver-bounded GTT heap.
+    pub fn host_tier_headroom(&self) -> Option<u64> {
+        self.inner.host_tier_headroom()
+    }
     /// Ensure the device's command queue can hold at least `count` uncompleted
     /// command buffers at once. On Metal, sizes or grows the idle
     /// `MTLCommandQueue` when its capacity is unset or below `count`; no-op on
@@ -2859,22 +2875,109 @@ pub struct NativeGraphMetadata {
     backend: BackendName,
     device: Option<crate::device::DeviceProperties>,
     inner: seismic_runtime::native::graph::NativeGraphMetadataDraft,
+    planning: PlanningSession,
 }
 
-/// The process's checked entries, keyed by the backend, the entry (its module
-/// and name) and its element bindings: what each binds to is a pure function
-/// of those, derived once, which every layer of a graph and every graph of
-/// every model, form and load binds again. Only successes are held, so every
-/// failure is the binding's own. A node's call at its dimensions is checked
-/// once per process too ([`checked_call`]).
+/// Checked entries for the active planning session, keyed by the backend, the
+/// entry (its module and name) and its element bindings: what each binds to is
+/// a pure function of those, derived once per active planning wave, which every
+/// layer of a graph and every graph of every model, form and load binds again.
+/// Only successes are held, so every failure is the binding's own.
 type CheckedEntries = std::collections::HashMap<EntryKey, generated::NativeGraphCheckedEntry>;
 
 type EntryKey = (BackendName, usize, &'static str, Vec<(String, Element)>);
 
-/// [`CheckedEntries`], one per process.
-fn checked_entries() -> &'static std::sync::RwLock<CheckedEntries> {
-    static CHECKED: std::sync::OnceLock<std::sync::RwLock<CheckedEntries>> = std::sync::OnceLock::new();
-    CHECKED.get_or_init(Default::default)
+/// Build-only planning caches shared across all active [`PlanningSession`]s
+/// and dropped completely when the last active session ends.
+#[derive(Default)]
+struct PlanningCaches {
+    checked_entries: std::sync::RwLock<CheckedEntries>,
+    checked_calls: std::sync::RwLock<CheckedCallsCache>,
+    scratch_walked: std::sync::RwLock<WalkedConfigsCache>,
+    launch_walked: std::sync::RwLock<WalkedConfigsCache>,
+}
+
+struct ActivePlanningState {
+    active: usize,
+    caches: Option<Arc<PlanningCaches>>,
+}
+
+static PLANNING_STATE: std::sync::Mutex<ActivePlanningState> =
+    std::sync::Mutex::new(ActivePlanningState {
+        active: 0,
+        caches: None,
+    });
+
+/// RAII scope owning the process's active graph-planning caches
+/// (`checked_entries`, `checked_calls`, `scratch_walked`, `launch_walked`) and
+/// the lifetime of evaluated entry shapes (`CompiledEntryShapes::forget_evaluated`).
+///
+/// Concurrent loads each hold their own `PlanningSession`. Finishing or
+/// dropping one session never clears caches while another session is still
+/// active; when the last active session ends, all planning caches are dropped
+/// (releasing their heap allocations) and evaluated entry shapes are forgotten.
+pub struct PlanningSession {
+    caches: Option<Arc<PlanningCaches>>,
+}
+
+impl PlanningSession {
+    /// Enter a graph-planning session, sharing the active caches with any
+    /// concurrent session or allocating fresh ones if none is active.
+    pub fn begin() -> Self {
+        let mut state = PLANNING_STATE
+            .lock()
+            .expect("planning session state poisoned");
+        state.active += 1;
+        let caches = state
+            .caches
+            .get_or_insert_with(|| Arc::new(PlanningCaches::default()))
+            .clone();
+        Self {
+            caches: Some(caches),
+        }
+    }
+
+    /// End this planning session explicitly. Returns `Some(released)` with the
+    /// number of evaluated entry shapes forgotten if this was the last active
+    /// session, or `None` if another session is still active.
+    pub fn finish(mut self) -> Option<usize> {
+        self.release()
+    }
+
+    fn caches(&self) -> &PlanningCaches {
+        self.caches
+            .as_deref()
+            .expect("live PlanningSession always holds caches")
+    }
+
+    fn release(&mut self) -> Option<usize> {
+        let own_caches = self.caches.take()?;
+        let (dropped_caches, released) = {
+            let mut state = PLANNING_STATE
+                .lock()
+                .expect("planning session state poisoned");
+            state.active = state
+                .active
+                .checked_sub(1)
+                .expect("planning session count underflow");
+            if state.active == 0 {
+                let dropped = state.caches.take();
+                let released = generated::forget_retained_entry_shapes();
+                (dropped, Some(released))
+            } else {
+                (None, None)
+            }
+        };
+        drop(dropped_caches);
+        drop(own_caches);
+        released
+    }
+}
+
+impl Drop for PlanningSession {
+    fn drop(&mut self) {
+        let _ = self.release();
+    }
 }
 
 /// A node's checked shapes and scratch, and the entry they were checked by.
@@ -2943,7 +3046,6 @@ impl fmt::Display for KernelDomainViolation {
 
 impl std::error::Error for NativeGraphMetadataError {}
 
-pub use generated::forget_evaluated_entry_shapes;
 pub use seismic_runtime::native::graph::{GraphFamilyCensus, HostHeap, NativeGraphStorageBytes};
 
 #[derive(Clone)]
@@ -3032,42 +3134,12 @@ type WalkedConfigsCache = std::collections::HashMap<
     Arc<Vec<NativeSpecialization>>,
 >;
 
-/// Process-wide graph metadata caches reclaimed together with evaluated entry
-/// shapes by [`forget_evaluated_entry_shapes`].
-static CHECKED_CALLS: std::sync::OnceLock<std::sync::RwLock<CheckedCallsCache>> =
-    std::sync::OnceLock::new();
-static SCRATCH_WALKED: std::sync::OnceLock<std::sync::RwLock<WalkedConfigsCache>> =
-    std::sync::OnceLock::new();
-static LAUNCH_WALKED: std::sync::OnceLock<std::sync::RwLock<WalkedConfigsCache>> =
-    std::sync::OnceLock::new();
-
-fn clear_graph_metadata_caches() {
-    if let Some(calls) = CHECKED_CALLS.get() {
-        calls
-            .write()
-            .expect("checked calls are never poisoned")
-            .clear();
-    }
-    if let Some(walked) = SCRATCH_WALKED.get() {
-        walked
-            .write()
-            .expect("walked configurations are never poisoned")
-            .clear();
-    }
-    if let Some(walked) = LAUNCH_WALKED.get() {
-        walked
-            .write()
-            .expect("walked launch configurations are never poisoned")
-            .clear();
-    }
-}
-
 /// What a call of `checked` (entry `entry` on `backend`) at `dimensions`
-/// checks to ([`check_node`]), refusal included, cached until
-/// [`forget_evaluated_entry_shapes`]: every layer of a graph, every recording
-/// and every trace's admission at another model's dimensions repeat the same
-/// calls.
+/// checks to ([`check_node`]), refusal included, cached for the active
+/// [`PlanningSession`] wave: every layer of a graph, every recording and every
+/// trace's admission at another model's dimensions repeat the same calls.
 fn checked_call(
+    caches: &PlanningCaches,
     checked: &generated::NativeGraphCheckedEntry,
     entry: &'static str,
     backend: BackendName,
@@ -3083,13 +3155,28 @@ fn checked_call(
         device,
         dimensions: dimensions.to_vec(),
     };
-    let calls = CHECKED_CALLS.get_or_init(Default::default);
-    if let Some(call) = calls.read().expect("checked calls are never poisoned").get(&key) {
+    if let Some(call) = caches
+        .checked_calls
+        .read()
+        .expect("checked calls are never poisoned")
+        .get(&key)
+    {
         return call.clone();
     }
-    let call =
-        check_node(checked.clone(), entry, backend, device, &borrowed(dimensions)).map(Arc::new);
-    calls.write().expect("checked calls are never poisoned").insert(key, call.clone());
+    let call = check_node(
+        caches,
+        checked.clone(),
+        entry,
+        backend,
+        device,
+        &borrowed(dimensions),
+    )
+    .map(Arc::new);
+    caches
+        .checked_calls
+        .write()
+        .expect("checked calls are never poisoned")
+        .insert(key, call.clone());
     call
 }
 
@@ -3292,6 +3379,7 @@ impl NativeGraphMetadata {
             backend,
             device: device.filter(|d| d.backend() == backend),
             inner: seismic_runtime::native::graph::NativeGraphMetadataDraft::new(backend),
+            planning: PlanningSession::begin(),
         }
     }
 
@@ -3360,13 +3448,14 @@ impl NativeGraphMetadata {
         elements: &[(&str, Element)],
     ) -> Result<generated::NativeGraphCheckedEntry, NativeGraphMetadataError> {
         let key = self.entry_key::<E>(elements)?;
-        if let Some(checked) = checked_entries().read().expect("checked entries are never poisoned").get(&key) {
+        let entries = &self.planning.caches().checked_entries;
+        if let Some(checked) = entries.read().expect("checked entries are never poisoned").get(&key) {
             return Ok(checked.clone());
         }
         let checked = generated::NativeGraphCheckedEntry::bind::<E>(self.backend, elements)
             .map_err(NativeGraphMetadataError::Bundle)?
             .map_err(NativeGraphMetadataError::Unsupported)?;
-        checked_entries().write().expect("checked entries are never poisoned").insert(key, checked.clone());
+        entries.write().expect("checked entries are never poisoned").insert(key, checked.clone());
         Ok(checked)
     }
 
@@ -3522,7 +3611,14 @@ impl NativeGraphMetadata {
         dimensions: &[(&str, u64)],
     ) -> Result<Arc<CheckedNode>, NativeGraphMetadataError> {
         let checked = self.bind_checked::<E>(elements)?;
-        checked_call(&checked, E::NAME, self.backend, self.device, &owned_dimensions(dimensions))
+        checked_call(
+            self.planning.caches(),
+            &checked,
+            E::NAME,
+            self.backend,
+            self.device,
+            &owned_dimensions(dimensions),
+        )
     }
 
     pub fn export(&mut self, result: &WorkflowTensor) -> Result<(), NativeGraphMetadataError> {
@@ -3666,11 +3762,12 @@ impl NativeGraphMetadata {
 
 /// Each scratch buffer's bound at `dimension`
 /// ([`NativeImplementation::scratch_bound`]), the declaration's admitted
-/// configurations cached until [`forget_evaluated_entry_shapes`] for each
+/// configurations cached for the active [`PlanningSession`] wave for each
 /// value of its statics ([`NativeImplementation::scratch_configurations`]):
 /// every point at statics already walked is each configuration's charges,
 /// arithmetic.
 fn scratch_bound(
+    caches: &PlanningCaches,
     implementation_key: usize,
     device: Option<crate::device::DeviceProperties>,
     bound: &seismic_lang::checked::OnDevice,
@@ -3682,7 +3779,7 @@ fn scratch_bound(
         .map(|name| dimension(name).ok_or_else(|| NativeSpecializationError::MissingStatic(name.clone()).to_string()))
         .collect::<Result<Vec<_>, _>>()?;
     let key = (implementation_key, device, statics);
-    let walked = SCRATCH_WALKED.get_or_init(Default::default);
+    let walked = &caches.scratch_walked;
     let known = walked.read().expect("walked configurations are never poisoned").get(&key).cloned();
     let configurations = match known {
         Some(configurations) => configurations,
@@ -3708,9 +3805,10 @@ fn scratch_bound(
 
 /// Active-launch bitmasks per admitted launch-guard configuration at `dimension`
 /// ([`OnDevice::launch_masks_over`]), with the declaration's
-/// admitted configurations cached until [`forget_evaluated_entry_shapes`] for
+/// admitted configurations cached for the active [`PlanningSession`] wave for
 /// each value of its statics ([`OnDevice::launch_configurations`]).
 fn launch_masks_bound(
+    caches: &PlanningCaches,
     implementation_key: usize,
     device: Option<crate::device::DeviceProperties>,
     bound: &seismic_lang::checked::OnDevice,
@@ -3722,7 +3820,7 @@ fn launch_masks_bound(
         .map(|name| dimension(name).ok_or_else(|| NativeSpecializationError::MissingStatic(name.clone()).to_string()))
         .collect::<Result<Vec<_>, _>>()?;
     let key = (implementation_key, device, statics);
-    let walked = LAUNCH_WALKED.get_or_init(Default::default);
+    let walked = &caches.launch_walked;
     let known = walked.read().expect("walked launch configurations are never poisoned").get(&key).cloned();
     let configurations = match known {
         Some(configurations) => configurations,
@@ -3750,6 +3848,7 @@ fn launch_masks_bound(
 /// checks to: its shapes, its domain (a call at statics outside it is
 /// refused) and its scratch at those dimensions.
 fn check_node(
+    caches: &PlanningCaches,
     checked: generated::NativeGraphCheckedEntry,
     entry: &'static str,
     backend: BackendName,
@@ -3809,7 +3908,7 @@ fn check_node(
             .find(|(candidate, _)| *candidate == name)
             .map(|(_, value)| *value)
     };
-    let scratch = scratch_bound(implementation_key, device, &bound, &dim_lookup)
+    let scratch = scratch_bound(caches, implementation_key, device, &bound, &dim_lookup)
         .map_err(|reason| {
             NativeGraphMetadataError::Unsupported(format!(
                 "`{}` scratch bound at {dimensions:?}: {reason}",
@@ -3821,7 +3920,7 @@ fn check_node(
         .map(|(bytes, buffer)| seismic_runtime::native::ScratchNeed::of(buffer, bytes))
         .collect();
     let cuda_launches = if backend == BackendName::Cuda {
-        let masks = launch_masks_bound(implementation_key, device, &bound, &dim_lookup)
+        let masks = launch_masks_bound(caches, implementation_key, device, &bound, &dim_lookup)
             .map_err(|reason| {
                 NativeGraphMetadataError::Unsupported(format!(
                     "`{}` launch masks at {dimensions:?}: {reason}",
@@ -4314,6 +4413,21 @@ impl BoundNativeGraphPlan {
         }
     }
 
+    /// Create a fresh `NativeGraphBindings` for `plan`, pre-populated with
+    /// this binding's statically bound ports. `plan` must share the same
+    /// topology as the plan this binding was created for.
+    pub fn bindings_for(&self, plan: &NativeGraphPlan) -> NativeGraphBindings {
+        NativeGraphBindings {
+            inner: self.inner.bindings_for(&plan.inner),
+        }
+    }
+
+    /// Verify that this static binding can be reused for `plan` via
+    /// [`Self::bindings_for`].
+    pub fn check_compatible(&self, plan: &NativeGraphPlan) -> Result<(), CallError> {
+        self.inner.check_compatible(&plan.inner)
+    }
+
     /// The host heap this binding holds, at its vectors' capacities.
     pub fn host_heap(&self) -> HostHeap {
         self.inner.host_heap()
@@ -4376,6 +4490,12 @@ impl NativeGraphFamily {
     /// included.
     pub fn records_decode_ahead(&self) -> bool {
         self.inner.records_decode_ahead()
+    }
+    /// Cap how many live slots of this family are decode-capable (floor)
+    /// flights that pin decode graphs; slots beyond `flights` serve prefill
+    /// chains only and never run decode (`LaunchGraphs::held_with_decode`).
+    pub fn cap_decode_flights(&self, flights: usize) -> Result<(), TensorError> {
+        self.inner.cap_decode_flights(flights)
     }
     /// Record, ahead of it, every graph its decode launch replays that is
     /// not kept, once the device's queued work has drained (CUDA's; other
@@ -4713,8 +4833,8 @@ impl NativeGraphSequence {
     }
     /// Wait on `sync` (`cuStreamWaitEvent` on CUDA) before running any work
     /// queued in this sequence.
-    pub fn follow_transfer(&mut self, sync: TransferSync) {
-        self.inner.follow_transfer(sync.inner);
+    pub fn follow_transfer(&mut self, sync: TransferSync) -> Result<(), CallError> {
+        self.inner.follow_transfer(sync.inner)
     }
     /// Submit every queued run without waiting; the completion reports all
     /// of them.
@@ -5040,15 +5160,10 @@ pub mod generated {
         Vec<std::sync::Weak<seismic_lang::entry::CompiledEntryShapes>>,
     > = std::sync::Mutex::new(Vec::new());
 
-    /// Forget the shapes and graph metadata caches the process's checked
-    /// entries have evaluated, and return how many evaluated entry shapes
-    /// there were. Checking a graph family evaluates each entry's shapes and
-    /// metadata at every class and keeps them, so that its classes and the
-    /// families after it do not evaluate them again; once those are built the
-    /// kept caches serve nothing until another family is checked, which
-    /// evaluates what it needs anew.
-    pub fn forget_evaluated_entry_shapes() -> usize {
-        super::clear_graph_metadata_caches();
+    /// Forget the evaluated shapes held by every live module's compiled entry
+    /// shapes, and return how many evaluated entry shapes were released.
+    /// Invoked only when the last active [`crate::PlanningSession`] ends.
+    pub(super) fn forget_retained_entry_shapes() -> usize {
         let mut retained = RETAINED_ENTRY_SHAPES
             .lock()
             .expect("retained entry shapes poisoned");
@@ -5180,6 +5295,89 @@ pub mod generated {
             assert!(Arc::ptr_eq(&first_schema, &schema));
             assert!(Arc::ptr_eq(&first_shapes, &shapes));
             assert_eq!(module.entry_contracts.lock().unwrap().len(), 1);
+        }
+
+        #[test]
+        fn planning_session_isolates_concurrent_loads_and_releases_on_last_end() {
+            static SERIAL: std::sync::Mutex<()> = std::sync::Mutex::new(());
+            let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+
+            let source = SourceSet::new(vec![SourceFile {
+                path: "session.seismic".into(),
+                text:
+                    "fn copy[N](input: &tensor[N] A) -> tensor[N] A:\n    return to_owned(input)\n"
+                        .into(),
+            }]);
+            let module = Module::new(check_source(source).unwrap());
+            let entry = module.entry_named("copy").unwrap().id();
+            let f32_binding =
+                seismic_lang::entry::ElementBindings::new().bind("A", Element::f32().id());
+            let (_, shapes) = module.entry_contract(entry, &f32_binding).unwrap();
+
+            let session_a = crate::PlanningSession::begin();
+            let session_b = crate::PlanningSession::begin();
+            assert!(Arc::ptr_eq(
+                session_a.caches.as_ref().unwrap(),
+                session_b.caches.as_ref().unwrap(),
+            ));
+
+            // Populate both a session-owned cache and an evaluated entry shape.
+            let cache_key = (0x1234usize, None, vec![64u64]);
+            session_a
+                .caches()
+                .scratch_walked
+                .write()
+                .unwrap()
+                .insert(cache_key.clone(), Arc::new(Vec::new()));
+            let _ = shapes.parameter_shape("input", &[("N", 16)]).unwrap();
+
+            // Ending session A while session B is still active must NOT wipe B's
+            // working set or forget evaluated entry shapes.
+            assert_eq!(session_a.finish(), None);
+            assert!(
+                session_b
+                    .caches()
+                    .scratch_walked
+                    .read()
+                    .unwrap()
+                    .contains_key(&cache_key),
+                "finishing one session must not clear another active session's cache"
+            );
+
+            // Ending the last active session drops the caches and forgets
+            // evaluated entry shapes.
+            let released = session_b
+                .finish()
+                .expect("last active session must release caches");
+            assert!(
+                released >= 1,
+                "expected at least 1 evaluated entry shape released, got {released}"
+            );
+            {
+                let state = crate::PLANNING_STATE.lock().unwrap();
+                assert_eq!(state.active, 0);
+                assert!(state.caches.is_none());
+            }
+
+            // A subsequent session starts with fresh, empty caches, and RAII
+            // drop (e.g. on error unwind) releases them too.
+            {
+                let session_c = crate::PlanningSession::begin();
+                assert!(session_c.caches().scratch_walked.read().unwrap().is_empty());
+                session_c
+                    .caches()
+                    .launch_walked
+                    .write()
+                    .unwrap()
+                    .insert(cache_key, Arc::new(Vec::new()));
+                let _ = shapes.parameter_shape("input", &[("N", 32)]).unwrap();
+            }
+            {
+                let state = crate::PLANNING_STATE.lock().unwrap();
+                assert_eq!(state.active, 0);
+                assert!(state.caches.is_none());
+            }
+            assert_eq!(shapes.forget_evaluated(), 0);
         }
     }
 
@@ -5660,6 +5858,7 @@ pub mod generated {
         elements: &[(&str, Element)],
         dimensions: &[(&str, u64)],
     ) -> Result<CheckedNativeGraphCall, CheckedBundleError> {
+        let _session = crate::PlanningSession::begin();
         let checked = match NativeGraphCheckedEntry::bind::<E>(backend, elements)? {
             Ok(checked) => checked,
             Err(reason) => return Ok(CheckedNativeGraphCall::Unsupported(reason)),

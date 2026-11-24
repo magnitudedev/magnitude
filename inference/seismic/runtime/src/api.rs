@@ -735,6 +735,9 @@ pub mod device {
     /// One opened executor: its immutable description, execution resources
     /// and the stores it charges.
     pub struct DeviceInner {
+        /// Process-unique monotonic identifier of this opened device, used to
+        /// scope cross-queue synchronization handles (`TransferSync`).
+        pub(crate) device_id: u64,
         /// The tests that opened the device, which its work is recorded for
         /// where the test runner asks (`seismic_lang::registry::TestDevice`).
         pub(crate) test: Option<seismic_lang::registry::TestDevice>,
@@ -786,6 +789,37 @@ pub mod device {
         }
         pub fn info(&self) -> &Executor {
             &self.info
+        }
+        /// Process-unique monotonic identifier of this opened device.
+        pub fn device_id(&self) -> u64 {
+            self.device_id
+        }
+        /// Whether this opened device exposes a distinct side queue for async
+        /// transfers / fill DMA beside compute.
+        pub fn has_side_queue(&self) -> bool {
+            match &self.kind {
+                OpenedKind::Cuda(_) => true,
+                #[cfg(not(target_os = "macos"))]
+                OpenedKind::Vulkan(opened) => opened.service().has_side_queue(),
+                OpenedKind::Cpu(_) => false,
+                #[cfg(target_os = "macos")]
+                OpenedKind::Metal(_) => false,
+            }
+        }
+        /// Whether this opened device runs fill/transfer DMA beside compute.
+        pub fn fills_beside_compute(&self) -> bool {
+            self.info.backend().fills_beside_compute() && self.has_side_queue()
+        }
+        /// Live headroom for additional host-tier pool blocks on a discrete
+        /// device's non-device-local (GTT) heap (Vulkan), keeping
+        /// command-submission headroom free; `None` on backends without a
+        /// separate driver-bounded GTT heap.
+        pub fn host_tier_headroom(&self) -> Option<u64> {
+            match &self.kind {
+                #[cfg(not(target_os = "macos"))]
+                OpenedKind::Vulkan(opened) => opened.service().host_tier_headroom(),
+                _ => None,
+            }
         }
         /// The device's properties (`seismic_lang::device`).
         pub fn properties(&self) -> &seismic_lang::device::DeviceProperties {

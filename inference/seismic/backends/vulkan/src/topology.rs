@@ -125,6 +125,7 @@ fn vulkan_report(description: &crate::Description) -> VulkanReport {
             .properties(&Default::default())
             .ok()
             .map(seismic_lang::device::DeviceProperties::Vulkan),
+        has_side_queue: device.side_family.is_some(),
     }
 }
 

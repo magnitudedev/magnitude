@@ -157,6 +157,80 @@ struct Part {
     split_before: bool,
 }
 
+/// Lazily-created side-queue transfer queue used by `submit_fill_copies` on
+/// Vulkan devices that expose a distinct `side_family`.
+pub(crate) struct VulkanFillQueue {
+    queue: Arc<seismic_vulkan::transfer::TransferQueue>,
+    producer_queue_id: u64,
+    next: std::sync::atomic::AtomicU64,
+}
+
+/// A GPU-side timeline wait together with an optional owner handle (such as
+/// `Arc<TransferQueue>`) that keeps the waited `vk::Semaphore` alive until
+/// the waiting submission retires on the GPU.
+struct DeviceWait {
+    semaphore: seismic_vulkan::vk::Semaphore,
+    value: u64,
+    owner: Option<Arc<dyn std::any::Any + Send + Sync>>,
+}
+
+/// Collect GPU-side `(semaphore, value, owner)` waits from cross-queue
+/// allocation fences (`after`) and explicit transfer handles
+/// (`after_transfers`), deduplicating to the maximum value per semaphore. Any
+/// fence that is not backed by a GPU-submitted Vulkan timeline (or is still
+/// held behind a host gate) is waited on the host so we never emit a "wait
+/// before signal".
+fn collect_device_waits(
+    device_id: u64,
+    after: &[Arc<dyn crate::completion::DeviceCompletion>],
+    after_transfers: &[super::transfer::TransferSync],
+) -> Result<Vec<DeviceWait>, ExecutionError> {
+    let mut waits: Vec<DeviceWait> = Vec::new();
+    let mut push_wait = |semaphore: seismic_vulkan::vk::Semaphore,
+                         value: u64,
+                         owner: Option<Arc<dyn std::any::Any + Send + Sync>>| {
+        if let Some(existing) = waits.iter_mut().find(|wait| wait.semaphore == semaphore) {
+            existing.value = existing.value.max(value);
+            if existing.owner.is_none() {
+                existing.owner = owner;
+            }
+        } else {
+            waits.push(DeviceWait { semaphore, value, owner });
+        }
+    };
+    for fence in after {
+        if fence.completed()? {
+            continue;
+        }
+        if let Some(route) = fence.native() {
+            if let Committed::Vulkan(submission) = route.committed() {
+                if let Some((semaphore, value, owner)) = submission.ready_timeline_wait() {
+                    push_wait(semaphore, value, owner);
+                    continue;
+                }
+            }
+        }
+        fence.ended()?;
+    }
+    for sync in after_transfers {
+        if sync.id().device_id != device_id {
+            return Err(ExecutionError::SubmissionFailed(format!(
+                "transfer sync {:?} belongs to device {}, not Vulkan device {device_id}",
+                sync.id(),
+                sync.id().device_id,
+            )));
+        }
+        let Some((semaphore, value, owner)) = sync.vulkan_wait() else {
+            return Err(ExecutionError::SubmissionFailed(format!(
+                "transfer sync {:?} is not backed by a Vulkan timeline semaphore",
+                sync.id(),
+            )));
+        };
+        push_wait(semaphore, value, Some(owner));
+    }
+    Ok(waits)
+}
+
 /// Encode `work` on the device's queue: a replay when the list is made of
 /// sealed plans and is not timed, else launch by launch, its graphs kept
 /// within `budget`. Where its device time is read (a trace, a measurement),
@@ -167,7 +241,9 @@ pub(super) fn encode(
     budget: GraphCensus,
     work: &Encoding<'_, impl DispatchList>,
 ) -> Result<Committed, EncodeFailure> {
-    let Encoding { list, repetitions, observed, retained, .. } = *work;
+    let Encoding { device_id, list, repetitions, observed, retained, after, after_transfers, .. } = *work;
+    let device_waits = collect_device_waits(device_id, after, after_transfers)
+        .map_err(|error| EncodeFailure::uncommitted(CallError::Execution(error)))?;
     let timed = work.timed.map(|(_, launches)| launches);
     // The calls between timeline boundaries form one segment, and a sealed
     // run's of them a graph. A boundary ends a queue submission: the next
@@ -185,6 +261,7 @@ pub(super) fn encode(
                 &encoded,
                 &replays.costs,
                 false,
+                &device_waits,
                 &mut submissions,
                 || DirectBatch::timed(device, launches),
                 QueueSubmission::Timed,
@@ -196,6 +273,7 @@ pub(super) fn encode(
                 &encoded,
                 &replays.costs,
                 true,
+                &device_waits,
                 &mut submissions,
                 || DirectBatch::new(device),
                 QueueSubmission::Measured,
@@ -252,7 +330,7 @@ pub(super) fn encode(
         })
     })
     .map_err(EncodeFailure::uncommitted)?;
-    let mut queued = Queued::new(device, &replays.costs, observed);
+    let mut queued = Queued::new(device, &replays.costs, observed, device_waits);
     let issued = (|| {
         for _ in 0..repetitions {
             let mut graphs = graphed.iter().zip(&shaped).zip(&taken);
@@ -594,6 +672,10 @@ struct Queued<'a> {
     open: Option<(QueueBatch, Option<f64>, Vec<(LaunchKind, u32)>)>,
     /// Gates the next batch opened waits on.
     gates: Vec<TimelineOperation>,
+    /// Device-signalled timeline semaphores the first batch opened waits on
+    /// (from `after` fill copies and `after_transfers`), retaining their
+    /// owners until the waiting submission retires.
+    device_waits: Vec<DeviceWait>,
     submissions: Issuing,
     kinds: Vec<Vec<(LaunchKind, u32)>>,
 }
@@ -604,13 +686,19 @@ struct QueuedSubmissions {
 }
 
 impl<'a> Queued<'a> {
-    fn new(device: &'a seismic_vulkan::Device, costs: &'a LaunchCosts<LaunchKind>, observed: bool) -> Self {
+    fn new(
+        device: &'a seismic_vulkan::Device,
+        costs: &'a LaunchCosts<LaunchKind>,
+        observed: bool,
+        device_waits: Vec<DeviceWait>,
+    ) -> Self {
         Self {
             device,
             costs,
             observed,
             open: None,
             gates: Vec::new(),
+            device_waits,
             submissions: Issuing::default(),
             kinds: Vec::new(),
         }
@@ -625,6 +713,9 @@ impl<'a> Queued<'a> {
         let mut batch = QueueBatch::new(self.device, measured).map_err(CallError::Execution)?;
         for gate in self.gates.drain(..) {
             batch.wait_timeline(&vulkan_timeline(&gate).gate, gate.value);
+        }
+        for wait in self.device_waits.drain(..) {
+            batch.wait_device_wait(wait);
         }
         self.open = Some((batch, Some(0.0), Vec::new()));
         Ok(())
@@ -797,11 +888,23 @@ struct Feedback {
     kinds: Vec<Vec<(LaunchKind, u32)>>,
 }
 
-/// One unit of native work as one or more queue submissions, in commit
-/// order: the last completes after every earlier one.
+/// One unit of native work on Vulkan: either one or more compute queue
+/// submissions in commit order, or a side-queue fill-copy batch on
+/// `TransferQueue`.
 pub(crate) struct VulkanSubmission {
-    submissions: Vec<QueueSubmission>,
-    feedback: Mutex<Option<Feedback>>,
+    kind: VulkanSubmissionKind,
+}
+
+enum VulkanSubmissionKind {
+    Compute {
+        submissions: Vec<QueueSubmission>,
+        feedback: Mutex<Option<Feedback>>,
+    },
+    Fill {
+        queue: Arc<seismic_vulkan::transfer::TransferQueue>,
+        value: u64,
+        sync: super::transfer::TransferSync,
+    },
 }
 
 /// Queue one ungraphed launch into `batch`, splitting into a new queue
@@ -854,11 +957,18 @@ fn encode_ungraphed<T: Timing>(
     encoded: &[Vec<bool>],
     costs: &LaunchCosts<LaunchKind>,
     use_asap: bool,
+    device_waits: &[DeviceWait],
     submissions: &mut Issuing,
     mut new_batch: impl FnMut() -> Result<DirectBatch<T>, ExecutionError>,
     wrap: impl Fn(DirectSubmission<T>) -> QueueSubmission,
 ) -> Result<Vec<Vec<(LaunchKind, u32)>>, CallError> {
     let mut batch = new_batch().map_err(CallError::Execution)?;
+    for wait in device_waits {
+        match &wait.owner {
+            Some(owner) => batch.wait_device_semaphore_owned(wait.semaphore, wait.value, Arc::clone(owner)),
+            None => batch.wait_device_semaphore(wait.semaphore, wait.value),
+        }
+    }
     let mut queued: Option<f64> = Some(0.0);
     let mut kinds: Vec<(LaunchKind, u32)> = Vec::new();
     let mut batch_kinds: Vec<Vec<(LaunchKind, u32)>> = Vec::new();
@@ -981,6 +1091,14 @@ impl QueueSubmission {
         }
     }
 
+    fn timeline_wait(&self) -> (seismic_vulkan::vk::Semaphore, u64) {
+        match self {
+            Self::Measured(submission) => submission.timeline_wait(),
+            Self::Timed(submission) => submission.timeline_wait(),
+            Self::Unmeasured(submission) => submission.timeline_wait(),
+        }
+    }
+
     fn opened(&self) -> Option<(std::time::Instant, seismic_native_target::GateOpening)> {
         match self {
             Self::Measured(submission) => submission.opened(),
@@ -1044,6 +1162,19 @@ impl QueueBatch {
         }
     }
 
+    fn wait_device_wait(&mut self, wait: DeviceWait) {
+        match (self, wait.owner) {
+            (Self::Measured(batch), Some(owner)) => {
+                batch.wait_device_semaphore_owned(wait.semaphore, wait.value, owner)
+            }
+            (Self::Unmeasured(batch), Some(owner)) => {
+                batch.wait_device_semaphore_owned(wait.semaphore, wait.value, owner)
+            }
+            (Self::Measured(batch), None) => batch.wait_device_semaphore(wait.semaphore, wait.value),
+            (Self::Unmeasured(batch), None) => batch.wait_device_semaphore(wait.semaphore, wait.value),
+        }
+    }
+
     fn signal_timeline(&mut self, timeline: &HostTimeline<Reached>, value: u64) {
         match self {
             Self::Measured(batch) => batch.signal_timeline(timeline, value),
@@ -1082,9 +1213,14 @@ impl QueueBatch {
 
 /// Encode ordered moves (`super::moves`) as one queue submission of
 /// copies and word writes (`DirectBatch::transfer`), which the queue runs
-/// after every earlier submission: refused, nothing submitted, where a step
-/// is refused or the submission fails.
-pub(super) fn encode_moves(device: &seismic_vulkan::Device, steps: &[super::moves::MoveStep<'_>]) -> Result<Committed, ExecutionError> {
+/// after every earlier submission and any fill copies in `after`: refused,
+/// nothing submitted, where a step is refused or the submission fails.
+pub(super) fn encode_moves(
+    device: &seismic_vulkan::Device,
+    device_id: u64,
+    after: &[Arc<dyn crate::completion::DeviceCompletion>],
+    steps: &[super::moves::MoveStep<'_>],
+) -> Result<Committed, ExecutionError> {
     use super::moves::MoveStep;
     use crate::backends::vulkan_transfer_end;
     let (mut copies, mut words) = (Vec::new(), Vec::new());
@@ -1096,10 +1232,126 @@ pub(super) fn encode_moves(device: &seismic_vulkan::Device, steps: &[super::move
             MoveStep::Word { destination, offset, value } => words.push((vulkan_transfer_end(destination, offset), value)),
         }
     }
+    let device_waits = collect_device_waits(device_id, after, &[])?;
     let mut batch = DirectBatch::unmeasured(device)?;
+    for wait in device_waits {
+        match wait.owner {
+            Some(owner) => batch.wait_device_semaphore_owned(wait.semaphore, wait.value, owner),
+            None => batch.wait_device_semaphore(wait.semaphore, wait.value),
+        }
+    }
     batch.transfer(&copies, &words)?;
     let submission = QueueSubmission::Unmeasured(batch.commit()?);
     Ok(Committed::Vulkan(VulkanSubmission::new(vec![submission], None)))
+}
+
+/// Encode a batch of byte copies on Vulkan: on `side_family` via
+/// `TransferQueue::copy_after` when the device exposes a side queue (waiting
+/// on compute readers in `after` at `TRANSFER` so no slot is overwritten until
+/// the final reader retires, and returning a timeline-semaphore-backed
+/// `TransferSync`), or on the compute queue via `DirectBatch::transfer` on
+/// single-queue Vulkan devices.
+pub(super) fn encode_fill_copies(
+    device: &seismic_vulkan::Device,
+    fill_queue_slot: &Mutex<Option<Arc<VulkanFillQueue>>>,
+    device_id: u64,
+    after: &[Arc<dyn crate::completion::DeviceCompletion>],
+    runs: &[super::FillCopyRun<'_>],
+) -> Result<Committed, EncodeFailure> {
+    use crate::backends::vulkan_transfer_end;
+    let device_waits = collect_device_waits(device_id, after, &[])
+        .map_err(|error| EncodeFailure::uncommitted(CallError::Execution(error)))?;
+    if !device.has_side_queue() {
+        let copies = runs
+            .iter()
+            .filter(|run| run.bytes > 0)
+            .map(|run| {
+                (
+                    vulkan_transfer_end(run.source.allocation(), run.source.byte_offset() + run.source_offset),
+                    vulkan_transfer_end(
+                        run.destination.allocation(),
+                        run.destination.byte_offset() + run.destination_offset,
+                    ),
+                    run.bytes,
+                )
+            })
+            .collect::<Vec<_>>();
+        let mut batch = DirectBatch::unmeasured(device)
+            .map_err(|error| EncodeFailure::uncommitted(CallError::Execution(error)))?;
+        for wait in device_waits {
+            match wait.owner {
+                Some(owner) => batch.wait_device_semaphore_owned(wait.semaphore, wait.value, owner),
+                None => batch.wait_device_semaphore(wait.semaphore, wait.value),
+            }
+        }
+        batch
+            .transfer(&copies, &[])
+            .map_err(|error| EncodeFailure::uncommitted(CallError::Execution(error)))?;
+        let submission = QueueSubmission::Unmeasured(
+            batch
+                .commit()
+                .map_err(|error| EncodeFailure::uncommitted(CallError::Execution(error)))?,
+        );
+        return Ok(Committed::Vulkan(VulkanSubmission::new(vec![submission], None)));
+    }
+    let fill_queue = {
+        let mut slot = fill_queue_slot
+            .lock()
+            .expect("vulkan fill queue lock is never poisoned");
+        if let Some(existing) = slot.as_ref() {
+            Arc::clone(existing)
+        } else {
+            let queue = Arc::new(
+                seismic_vulkan::transfer::TransferQueue::new(device)
+                    .map_err(|error| EncodeFailure::uncommitted(CallError::Execution(error)))?,
+            );
+            let created = Arc::new(VulkanFillQueue {
+                queue,
+                producer_queue_id: super::transfer::next_queue_id(),
+                next: std::sync::atomic::AtomicU64::new(1),
+            });
+            *slot = Some(Arc::clone(&created));
+            created
+        }
+    };
+    let items: Vec<seismic_vulkan::transfer::TransferItem<'_>> = runs
+        .iter()
+        .map(|run| {
+            seismic_vulkan::transfer::TransferItem::Run(seismic_vulkan::transfer::TransferRun {
+                source: vulkan_transfer_end(run.source.allocation(), run.source.byte_offset() + run.source_offset),
+                destination: vulkan_transfer_end(
+                    run.destination.allocation(),
+                    run.destination.byte_offset() + run.destination_offset,
+                ),
+                bytes: run.bytes,
+            })
+        })
+        .collect();
+    let raw_waits: Vec<(seismic_vulkan::vk::Semaphore, u64)> = device_waits
+        .iter()
+        .map(|wait| (wait.semaphore, wait.value))
+        .collect();
+    // Caller holds `device.native.order`, serializing value assignment and
+    // submission on `fill_queue` so timeline values are strictly increasing.
+    let value = fill_queue.next.load(std::sync::atomic::Ordering::Relaxed);
+    fill_queue
+        .queue
+        .copy_after(&items, value, &raw_waits)
+        .map_err(|error| EncodeFailure::uncommitted(CallError::Execution(error)))?;
+    fill_queue
+        .next
+        .store(value + 1, std::sync::atomic::Ordering::Relaxed);
+    let sync = super::transfer::TransferSync::from_vulkan_queue(
+        device_id,
+        fill_queue.producer_queue_id,
+        value,
+        Arc::clone(&fill_queue.queue),
+    );
+    Ok(Committed::Vulkan(VulkanSubmission::fill(
+        Arc::clone(&fill_queue.queue),
+        value,
+        sync,
+    )))
 }
 
 impl VulkanSubmission {
@@ -1109,28 +1361,71 @@ impl VulkanSubmission {
             "VulkanSubmission::new precondition: at least one queue submission"
         );
         Self {
-            submissions,
-            feedback: Mutex::new(feedback),
+            kind: VulkanSubmissionKind::Compute {
+                submissions,
+                feedback: Mutex::new(feedback),
+            },
         }
     }
 
-    fn last(&self) -> &QueueSubmission {
-        self.submissions
-            .last()
-            .expect("a Vulkan submission has a queue submission")
+    fn fill(
+        queue: Arc<seismic_vulkan::transfer::TransferQueue>,
+        value: u64,
+        sync: super::transfer::TransferSync,
+    ) -> Self {
+        Self {
+            kind: VulkanSubmissionKind::Fill { queue, value, sync },
+        }
+    }
+
+    /// The `(semaphore, value, owner)` timeline wait for this submission when
+    /// its signal is already submitted to a Vulkan queue (never parked behind
+    /// a host gate).
+    pub(crate) fn ready_timeline_wait(
+        &self,
+    ) -> Option<(
+        seismic_vulkan::vk::Semaphore,
+        u64,
+        Option<Arc<dyn std::any::Any + Send + Sync>>,
+    )> {
+        match &self.kind {
+            VulkanSubmissionKind::Compute { submissions, .. } => {
+                let last = submissions.last().expect("a Vulkan submission has a queue submission");
+                last.handed().is_some().then(|| {
+                    let (semaphore, value) = last.timeline_wait();
+                    (semaphore, value, None)
+                })
+            }
+            VulkanSubmissionKind::Fill { queue, value, .. } => Some((
+                queue.semaphore(),
+                *value,
+                Some(Arc::clone(queue) as Arc<dyn std::any::Any + Send + Sync>),
+            )),
+        }
+    }
+
+    /// The `TransferSync` handle if this submission is a side-queue fill copy.
+    #[allow(dead_code)]
+    pub(crate) fn transfer_sync(&self) -> Option<super::transfer::TransferSync> {
+        match &self.kind {
+            VulkanSubmissionKind::Compute { .. } => None,
+            VulkanSubmissionKind::Fill { sync, .. } => Some(sync.clone()),
+        }
     }
 
     /// Teach the launch costs once, after completion.
     fn observe(&self) {
-        let Some(feedback) = self
-            .feedback
+        let VulkanSubmissionKind::Compute { submissions, feedback } = &self.kind else {
+            return;
+        };
+        let Some(feedback) = feedback
             .lock()
             .expect("submission feedback lock is never poisoned")
             .take()
         else {
             return;
         };
-        for (submission, kinds) in self.submissions.iter().zip(&feedback.kinds) {
+        for (submission, kinds) in submissions.iter().zip(&feedback.kinds) {
             let seconds = match submission {
                 QueueSubmission::Measured(submission) => submission.device_seconds().ok(),
                 QueueSubmission::Timed(submission) => submission.device_seconds().ok(),
@@ -1146,34 +1441,67 @@ impl VulkanSubmission {
     /// completes after every earlier one, and a refusal or the device's
     /// loss reaches it too.
     pub(crate) fn completed(&self) -> Result<bool, ExecutionError> {
-        let complete = self.last().completed()?;
-        if complete {
-            self.observe();
+        match &self.kind {
+            VulkanSubmissionKind::Compute { submissions, .. } => {
+                let complete = submissions
+                    .last()
+                    .expect("a Vulkan submission has a queue submission")
+                    .completed()?;
+                if complete {
+                    self.observe();
+                }
+                Ok(complete)
+            }
+            VulkanSubmissionKind::Fill { queue, value, .. } => queue.reached(*value),
         }
-        Ok(complete)
     }
 
     pub(crate) fn finish(&self) -> Result<(), ExecutionError> {
-        for submission in &self.submissions {
-            submission.finish()?;
+        match &self.kind {
+            VulkanSubmissionKind::Compute { submissions, .. } => {
+                for submission in submissions {
+                    submission.finish()?;
+                }
+                self.observe();
+                Ok(())
+            }
+            VulkanSubmissionKind::Fill { queue, value, .. } => {
+                while !queue.wait(*value, std::time::Duration::from_secs(1))? {}
+                Ok(())
+            }
         }
-        self.observe();
-        Ok(())
     }
 
     pub(crate) fn device_seconds(&self) -> Result<f64, ExecutionError> {
-        self.submissions.iter().try_fold(0.0, |total, submission| {
-            Ok(total + submission.device_seconds()?)
-        })
+        match &self.kind {
+            VulkanSubmissionKind::Compute { submissions, .. } => {
+                submissions.iter().try_fold(0.0, |total, submission| {
+                    Ok(total + submission.device_seconds()?)
+                })
+            }
+            VulkanSubmissionKind::Fill { .. } => Err(ExecutionError::SubmissionFailed(
+                "a Vulkan fill copy submission has no compute timestamps".into(),
+            )),
+        }
     }
 
     pub(crate) fn device_interval(
         &self,
         anchor: &TimelineAnchor,
     ) -> Result<(f64, f64), ExecutionError> {
-        let (start, _) = self.submissions[0].device_interval(anchor)?;
-        let (_, end) = self.last().device_interval(anchor)?;
-        Ok((start, end))
+        match &self.kind {
+            VulkanSubmissionKind::Compute { submissions, .. } => {
+                let (start, _) = submissions[0].device_interval(anchor)?;
+                let (_, end) = submissions
+                    .last()
+                    .expect("a Vulkan submission has a queue submission")
+                    .device_interval(anchor)?;
+                Ok((start, end))
+            }
+            VulkanSubmissionKind::Fill { .. } => Err(ExecutionError::SubmissionFailed(
+                "a Vulkan fill copy submission has no compute timestamps".into(),
+            )),
+        }
     }
 
     /// Each queue submission's hand-off to the queue and device interval,
@@ -1183,24 +1511,29 @@ impl VulkanSubmission {
         &self,
         anchor: &TimelineAnchor,
     ) -> Result<Vec<super::trace::TracedQueueSubmission>, ExecutionError> {
-        self.submissions
-            .iter()
-            .map(|submission| {
-                let device = submission.device_interval(anchor)?;
-                let (handed, taken) = submission
-                    .handed()
-                    .expect("a completed queue submission was handed to the queue");
-                let opened = submission
-                    .opened()
-                    .map(|(at, opening)| (super::trace::host_seconds_at(at), opening));
-                Ok(super::trace::TracedQueueSubmission {
-                    handed: super::trace::host_seconds_at(handed),
-                    taken: super::trace::host_seconds_at(taken),
-                    opened,
-                    device,
+        match &self.kind {
+            VulkanSubmissionKind::Compute { submissions, .. } => submissions
+                .iter()
+                .map(|submission| {
+                    let device = submission.device_interval(anchor)?;
+                    let (handed, taken) = submission
+                        .handed()
+                        .expect("a completed queue submission was handed to the queue");
+                    let opened = submission
+                        .opened()
+                        .map(|(at, opening)| (super::trace::host_seconds_at(at), opening));
+                    Ok(super::trace::TracedQueueSubmission {
+                        handed: super::trace::host_seconds_at(handed),
+                        taken: super::trace::host_seconds_at(taken),
+                        opened,
+                        device,
+                    })
                 })
-            })
-            .collect()
+                .collect(),
+            VulkanSubmissionKind::Fill { .. } => Err(ExecutionError::SubmissionFailed(
+                "a Vulkan fill copy submission has no compute timestamps".into(),
+            )),
+        }
     }
 
     /// Per-launch intervals of a timed submission: one queue submission,
@@ -1209,14 +1542,19 @@ impl VulkanSubmission {
         &self,
         anchor: &TimelineAnchor,
     ) -> Result<Option<Vec<Option<(f64, f64)>>>, ExecutionError> {
-        let mut intervals = Vec::new();
-        for submission in &self.submissions {
-            let Some(own) = submission.launch_intervals(anchor)? else {
-                return Ok(None);
-            };
-            intervals.extend(own);
+        match &self.kind {
+            VulkanSubmissionKind::Compute { submissions, .. } => {
+                let mut intervals = Vec::new();
+                for submission in submissions {
+                    let Some(own) = submission.launch_intervals(anchor)? else {
+                        return Ok(None);
+                    };
+                    intervals.extend(own);
+                }
+                Ok(Some(intervals))
+            }
+            VulkanSubmissionKind::Fill { .. } => Ok(None),
         }
-        Ok(Some(intervals))
     }
 }
 
@@ -1489,5 +1827,20 @@ mod tests {
         assert_eq!(costs.estimate_one(1), Some(0.04));
         assert!(fits_submission(Some(0.04), costs.estimate_one(1)));
         assert!(!fits_submission(Some(0.08), costs.estimate_one(1)));
+    }
+
+    #[test]
+    fn collect_device_waits_rejects_foreign_and_non_vulkan_sync() {
+        let foreign = super::super::transfer::TransferSync::cpu_for_test(99, 1);
+        let err = collect_device_waits(42, &[], &[foreign])
+            .err()
+            .expect("foreign-device sync must be rejected");
+        assert!(err.to_string().contains("belongs to device 99"));
+
+        let non_vulkan = super::super::transfer::TransferSync::cpu_for_test(42, 1);
+        let err = collect_device_waits(42, &[], &[non_vulkan])
+            .err()
+            .expect("non-Vulkan sync must be rejected");
+        assert!(err.to_string().contains("not backed by a Vulkan timeline semaphore"));
     }
 }

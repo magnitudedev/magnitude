@@ -87,7 +87,6 @@ pub struct TracedLaunch {
     /// Nonrepeated launches have occurrence zero.
     pub occurrence: usize,
     /// Evaluated geometry; `None` when the launch condition is inactive.
-    /// Available at both submission and launch detail.
     pub geometry: Option<TracedLaunchGeometry>,
     /// Device interval; `None` without launch timing or for an empty launch.
     pub device: Option<(f64, f64)>,
@@ -102,7 +101,8 @@ pub struct TracedSubmission {
     pub committed: f64,
     /// Device execution interval.
     pub device: (f64, f64),
-    /// Launches in order. Device intervals are present at launch detail.
+    /// Launches in order, populated at [`TraceDetail::Launches`]; empty at
+    /// [`TraceDetail::Submissions`].
     pub launches: Vec<TracedLaunch>,
     /// The queue submissions the work was divided into, in order, on a
     /// backend that divides it at its timeline boundaries (Vulkan, whose

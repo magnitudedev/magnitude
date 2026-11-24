@@ -387,7 +387,6 @@ pub(super) fn observe(
     states: &[StateRegion],
     mut retain: Option<&mut ReferencePages>,
 ) -> Result<Vec<Observation>, Exclusion> {
-    let execution = |error: &dyn std::fmt::Display| Exclusion::Execution(error.to_string());
     let mut observed = Vec::new();
     for value in values {
         observed.push(match value {
@@ -395,7 +394,7 @@ pub(super) fn observe(
                 representation: tensor.representation(),
                 shape: tensor.descriptor().extents,
                 bytes: pages(
-                    &tensor.read_to_host().map_err(|e| execution(&e))?,
+                    &tensor.read_to_host().map_err(Exclusion::execution)?,
                     retain.as_deref_mut(),
                 )?,
             },
@@ -411,12 +410,12 @@ pub(super) fn observe(
             Some(written) if !written.observe_rest => {
                 let slice = tensor
                     .slice_leading(written.rows.start, written.rows.end)
-                    .map_err(|e| execution(&e))?;
+                    .map_err(Exclusion::execution)?;
                 observed.push(Observation::Tensor {
                     representation,
                     shape: slice.descriptor().extents,
                     bytes: pages(
-                        &slice.read_to_host().map_err(|e| execution(&e))?,
+                        &slice.read_to_host().map_err(Exclusion::execution)?,
                         retain.as_deref_mut(),
                     )?,
                 });
@@ -431,13 +430,13 @@ pub(super) fn observe(
             {
                 let slice = tensor
                     .slice_leading(written.rows.start, written.rows.end)
-                    .map_err(|e| execution(&e))?;
+                    .map_err(Exclusion::execution)?;
                 for (tensor, shape) in [(&slice, slice.descriptor().extents), (&**tensor, shape)] {
                     observed.push(Observation::Tensor {
                         representation,
                         shape,
                         bytes: pages(
-                            &tensor.read_to_host().map_err(|e| execution(&e))?,
+                            &tensor.read_to_host().map_err(Exclusion::execution)?,
                             retain.as_deref_mut(),
                         )?,
                     });
@@ -445,7 +444,7 @@ pub(super) fn observe(
             }
             // The whole dense tensor is read and divided at the written rows.
             Some(written) => {
-                let bytes = tensor.read_to_host().map_err(|e| execution(&e))?;
+                let bytes = tensor.read_to_host().map_err(Exclusion::execution)?;
                 let rows = shape[0];
                 let Some(row) = row_bytes(bytes.len() as u64, rows).filter(|_| written.rows.end <= rows) else {
                     return Err(Exclusion::Execution(format!(
@@ -479,7 +478,7 @@ pub(super) fn observe(
                 representation,
                 shape,
                 bytes: pages(
-                    &tensor.read_to_host().map_err(|e| execution(&e))?,
+                    &tensor.read_to_host().map_err(Exclusion::execution)?,
                     retain.as_deref_mut(),
                 )?,
             }),

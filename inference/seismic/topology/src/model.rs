@@ -421,6 +421,10 @@ pub struct Executor {
     driver: String,
     limits: Limits,
     tensor_operations: bool,
+    /// Whether this executor exposes a distinct side queue for async transfers
+    /// / fill DMA beside compute (CUDA: always true; Vulkan: true when
+    /// `DeviceInfo::side_family.is_some()`; Metal / CPU: false).
+    has_side_queue: bool,
     /// Hardware properties queried from the backend API for contract evaluation
     /// (shared memory, threadgroup size, subgroup width, compute units).
     properties: Option<seismic_lang::device::DeviceProperties>,
@@ -473,6 +477,17 @@ impl Executor {
     /// other backends, whose kernels have no such form.
     pub fn forms_tensor_operations(&self) -> bool {
         self.tensor_operations
+    }
+    /// Whether this executor exposes a distinct side queue for async transfers
+    /// / fill DMA beside compute (CUDA: always true; Vulkan: true iff
+    /// `DeviceInfo::side_family.is_some()`; Metal / CPU: false).
+    pub fn has_side_queue(&self) -> bool {
+        self.has_side_queue
+    }
+    /// Whether this executor can run fill/transfer DMA beside compute: its
+    /// backend supports it AND the device actually exposes a side queue.
+    pub fn fills_beside_compute(&self) -> bool {
+        self.backend().fills_beside_compute() && self.has_side_queue
     }
     /// Hardware properties queried from the backend API, when reported.
     pub fn properties(&self) -> Option<seismic_lang::device::DeviceProperties> {
@@ -1011,6 +1026,7 @@ impl Builder {
             driver: executor.driver,
             limits: executor.limits,
             tensor_operations: executor.tensor_operations,
+            has_side_queue: executor.has_side_queue,
             properties: executor.properties,
             placed: Default::default(),
         });
@@ -1056,6 +1072,8 @@ pub(crate) struct ExecutorReport {
     pub(crate) limits: Limits,
     /// Metal tensor operations; false for every other backend.
     pub(crate) tensor_operations: bool,
+    /// Distinct side queue for async transfers / fill DMA beside compute.
+    pub(crate) has_side_queue: bool,
     /// Hardware properties queried from the backend API, when reported.
     pub(crate) properties: Option<seismic_lang::device::DeviceProperties>,
 }

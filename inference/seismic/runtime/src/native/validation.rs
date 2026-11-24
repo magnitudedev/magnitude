@@ -167,7 +167,6 @@ impl<'a> PreparedPoint<'a> {
         }
         let started = Instant::now();
         let shared = &self.shared;
-        let execution = |error: &dyn std::fmt::Display| Exclusion::Execution(error.to_string());
         let result = (|| {
             for rotation in missing {
                 deadline.check(Duration::ZERO)?;
@@ -177,13 +176,13 @@ impl<'a> PreparedPoint<'a> {
                 // and before each candidate, so neither sees the other's
                 // state.
                 if let Some(reset) = &inputs.initialize {
-                    reset.borrow_mut()().map_err(|e| execution(&e))?;
+                    reset.borrow_mut()().map_err(Exclusion::execution)?;
                 }
                 deadline.check(Duration::ZERO)?;
                 let reference = shared.default.borrow().clone();
                 let results = reference
                     .call(&shared.charges, args.clone())
-                    .map_err(|e| execution(&e))?;
+                    .map_err(Exclusion::execution)?;
                 let expected = observe(
                     results.into_values(),
                     args,
@@ -613,5 +612,41 @@ impl Validator {
             workload: point.workload,
             copies: point.copies,
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::Exclusion;
+    use crate::api::{CallError, TensorError};
+    use seismic_compiler::errors::ExecutionError;
+
+    /// Capacity refusals during validation or observation map to
+    /// `Exclusion::Refused` (allowing eviction + retry) rather than fatal
+    /// `Exclusion::Execution`, while non-capacity errors still map to
+    /// `Exclusion::Execution`.
+    #[test]
+    fn allocation_capacity_maps_to_refused_not_execution() {
+        let capacity = || ExecutionError::AllocationCapacity {
+            required: 128u64.into(),
+            available: 64,
+        };
+        let refused = Exclusion::Refused {
+            required: 128,
+            available: 64,
+        };
+        assert_eq!(Exclusion::execution(capacity()), refused);
+        assert_eq!(
+            Exclusion::execution(CallError::Execution(capacity())),
+            refused
+        );
+        assert_eq!(
+            Exclusion::execution(TensorError::Execution(capacity())),
+            refused
+        );
+        assert!(matches!(
+            Exclusion::execution(ExecutionError::AllocationFailed("driver".into())),
+            Exclusion::Execution(_)
+        ));
     }
 }

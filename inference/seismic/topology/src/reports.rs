@@ -159,6 +159,9 @@ pub struct VulkanReport {
     pub kinds: Vec<KindReport>,
     /// Hardware properties queried from the Vulkan device, when reported.
     pub properties: Option<seismic_lang::device::DeviceProperties>,
+    /// Whether the device exposes a second queue (`side_family`) for async
+    /// transfers / fill DMA beside its compute queue.
+    pub has_side_queue: bool,
 }
 
 /// A Vulkan device's memory as the backend reports it.
@@ -428,6 +431,7 @@ pub fn build(revision: Revision, reports: &Reports) -> DeviceTopology {
                 allocations: Ok(NativeAllocations { least: 0, granularity: reports.page }),
             },
             tensor_operations: false,
+            has_side_queue: false,
             properties: reports.cpu.properties,
         });
         if reports.cpu.availability == Availability::Available {
@@ -472,6 +476,7 @@ pub fn build(revision: Revision, reports: &Reports) -> DeviceTopology {
                 allocations: Ok(NativeAllocations { least: 0, granularity: reports.page }),
             },
             tensor_operations: metal.tensor_operations,
+            has_side_queue: false,
             properties: metal.properties,
         });
         if metal.admission.is_err() {
@@ -538,6 +543,7 @@ pub fn build(revision: Revision, reports: &Reports) -> DeviceTopology {
                 allocations: Ok(NativeAllocations { least: 0, granularity: cuda.allocation_granularity }),
             },
             tensor_operations: false,
+            has_side_queue: true,
             properties: cuda.properties,
         });
         let paths = match placement {
@@ -605,6 +611,7 @@ pub fn build(revision: Revision, reports: &Reports) -> DeviceTopology {
                 allocations: vulkan.least_object.clone().map(|least| NativeAllocations { least, granularity: 1 }),
             },
             tensor_operations: false,
+            has_side_queue: vulkan.has_side_queue,
             properties: vulkan.properties,
         });
         // A device whose memory is the host's: its heaps together state one
@@ -904,6 +911,7 @@ mod tests {
                 },
             }],
             properties: None,
+            has_side_queue: false,
         });
 
         let topology = build(Revision::next(), &reports);

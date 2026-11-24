@@ -202,10 +202,7 @@ fn encode(device: &Arc<DeviceInner>, after: &[Arc<dyn DeviceCompletion>], steps:
             device.allocation_address(allocation, offset)
         }),
         #[cfg(not(target_os = "macos"))]
-        OpenedKind::Vulkan(opened) => {
-            assert!(after.is_empty(), "invariant violated: Vulkan runs native work on one queue");
-            super::vulkan::encode_moves(opened.service(), steps)
-        }
+        OpenedKind::Vulkan(opened) => super::vulkan::encode_moves(opened.service(), device.device_id(), after, steps),
         #[cfg(target_os = "macos")]
         OpenedKind::Metal(_) => unreachable!("Metal's moves run on the host"),
     }
