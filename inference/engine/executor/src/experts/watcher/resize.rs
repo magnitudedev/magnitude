@@ -431,7 +431,7 @@ impl Residency {
             // A prompt group the device is past holds its records claimed
             // until its conveyor clears (its landings from the conveyor end,
             // each an event).
-            if self.scratch.clearing() && !self.scratch.clear_past(&mut self.core) {
+            if self.scratch.clearing() && !self.scratch.clear_past(&mut self.core, &self.shared) {
                 return Some(asked);
             }
         }

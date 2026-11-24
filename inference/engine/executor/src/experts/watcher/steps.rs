@@ -1409,7 +1409,7 @@ impl Shared {
         };
         // A grouped generation group (e.g. a verification or batched decode
         // wider than the decode form) never calls `ExpertStep::decoding`, yet
-        // `Telemetry::group_read` feeds its reads as `Fed::Decode` at its last
+        // `Telemetry::group_read` feeds its reads as `Fed::TargetDecode` at its last
         // step (`first + count - 1`): register that step on the clock now,
         // before any later step can begin and register a higher sequence.
         if grouped && group_work == LaunchWork::Generation && launches.iter().all(|launch| route(launch) == StepRoute::Grouped) {
@@ -1429,8 +1429,8 @@ impl Shared {
             let step_route = route(&launch);
             let form = match step_route {
                 StepRoute::Grouped => StepForm::Grouped,
-                StepRoute::Decode | StepRoute::DraftDecode => StepForm::Decode(DecodeStep {
-                    draft: step_route == StepRoute::DraftDecode,
+                StepRoute::Decode => StepForm::Decode(DecodeStep {
+                    domain: DecodeDomain::TargetDecode,
                     launch: None,
                     recorded: None,
                     // A decode step issues a site flight, through which one of
@@ -1444,6 +1444,17 @@ impl Shared {
                         .flatten(),
                     // A decode step on its flight's stamp times its blocks by
                     // the lines it begins under, once they are priced.
+                    sampled: self.telemetry.samples(admission.next).then(|| self.priced()).flatten(),
+                }),
+                StepRoute::DraftDecode => StepForm::Decode(DecodeStep {
+                    domain: DecodeDomain::DraftDecode,
+                    launch: None,
+                    recorded: None,
+                    _flight: self
+                        .sites_served
+                        .load(std::sync::atomic::Ordering::Acquire)
+                        .then(|| self.compute.flight())
+                        .flatten(),
                     sampled: self.telemetry.samples(admission.next).then(|| self.priced()).flatten(),
                 }),
             };
@@ -1492,9 +1503,22 @@ enum StepForm {
     Decode(DecodeStep),
 }
 
+/// Typed decode domain derived at step admission from [`StepRoute`] and carried
+/// to completion and ranking.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum DecodeDomain {
+    /// Target-model decode step: registered on the target token clock and fed
+    /// to target `Shadows`.
+    TargetDecode,
+    /// Banked draft-model decode step (`StepRoute::DraftDecode`): updates
+    /// shared `Reuse` ranking and decode accounting without advancing or
+    /// consulting the target token clock or `Shadows`.
+    DraftDecode,
+}
+
 struct DecodeStep {
-    /// Whether this decode step is a separate draft model's (`StepRoute::DraftDecode`).
-    draft: bool,
+    /// Typed decode domain derived at admission (`TargetDecode` vs `DraftDecode`).
+    domain: DecodeDomain,
     /// Its decode launch's rows and context.
     launch: Option<DecodeLaunch>,
     recorded: Option<Recording>,
@@ -1622,7 +1646,7 @@ impl DecodeLaunch {
 /// group, and the lines its blocks were
 /// sampled by, where they were.
 pub(super) struct Decoded {
-    pub(super) draft: bool,
+    pub(super) domain: DecodeDomain,
     pub(super) recording: Option<Recording>,
     pub(super) launch: Option<DecodeLaunch>,
     pub(super) group: Step,
@@ -1674,6 +1698,7 @@ impl ExpertStep {
         let StepForm::Decode(decode) = &mut self.form else {
             panic!("a grouped step has no decode launch (`Self::guessing`)");
         };
+        assert_eq!(decode.domain, DecodeDomain::TargetDecode, "a draft decode step has no target decode launch");
         let count = rows.len();
         assert!(count > 0, "a decode launch runs a row");
         assert!((count + padding) as u64 <= magnitude_kernels::constants::VERIFY_ROWS, "a decode launch of {count} rows and {padding} padding");
@@ -1775,7 +1800,7 @@ impl ExpertStep {
         let route = match &mut self.form {
             StepForm::Grouped => CompletedRoute::Grouped,
             StepForm::Decode(decode) => CompletedRoute::Decode(Decoded {
-                draft: decode.draft,
+                domain: decode.domain,
                 recording: decode.recorded.take(),
                 launch: decode.launch,
                 group,

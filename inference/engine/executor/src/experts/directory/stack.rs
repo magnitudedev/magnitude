@@ -1,4 +1,4 @@
-use crate::experts::reuse::{Evidence, Ranking, Reuse, Rows, StepKeys};
+use crate::experts::reuse::{Evidence, Ranking, ReadKind, Reuse, Rows, StepKeys, TargetClock};
 use crate::experts::watcher::Step;
 
 /// One step's routing at one streamed layer, as the device read it: the
@@ -229,31 +229,31 @@ impl Stack {
     /// the first time one of its reads is (a group's steps first read in
     /// sequence order, and groups in theirs).
     pub fn read(&mut self, read: &RoutedRead, counted: Option<CountedLaunch>, keys: Option<&StepKeys>) {
-        self.read_at(read, counted, keys, None);
+        self.read_decode(read, counted, keys, ReadKind::TargetDecode(TargetClock::Lookup), false);
     }
 
-    /// [`Self::read`] with a pre-captured token clock position `clock` for
-    /// `read.sequence` (`Reuse::read_at`).
-    pub(crate) fn read_at(
+    /// Log a target decode (or grouped target verify) read with its
+    /// pre-captured target token-clock position, deferring the group-wide
+    /// `order` rebuild and `retop` until [`Self::finish_batch`].
+    pub(crate) fn read_target_batched(
         &mut self,
         read: &RoutedRead,
         counted: Option<CountedLaunch>,
         keys: Option<&StepKeys>,
-        clock: Option<crate::experts::horizon::Tokens>,
+        clock: crate::experts::horizon::Tokens,
     ) {
-        self.read_decode(read, counted, keys, clock, false);
+        self.read_decode(read, counted, keys, ReadKind::TargetDecode(TargetClock::Stamped(clock)), true);
     }
 
-    /// [`Self::read_at`], deferring the group-wide `order` rebuild and `retop`
-    /// until [`Self::finish_batch`].
-    pub(crate) fn read_at_batched(
+    /// Log a banked draft decode read (`StepRoute::DraftDecode`) through the
+    /// same ranking and decode-depth accounting path, without touching the
+    /// target token clock or target shadows.
+    pub(crate) fn read_draft_batched(
         &mut self,
         read: &RoutedRead,
-        counted: Option<CountedLaunch>,
         keys: Option<&StepKeys>,
-        clock: Option<crate::experts::horizon::Tokens>,
     ) {
-        self.read_decode(read, counted, keys, clock, true);
+        self.read_decode(read, None, keys, ReadKind::DraftDecode, true);
     }
 
     fn read_decode(
@@ -261,7 +261,7 @@ impl Stack {
         read: &RoutedRead,
         counted: Option<CountedLaunch>,
         keys: Option<&StepKeys>,
-        clock: Option<crate::experts::horizon::Tokens>,
+        kind: ReadKind,
         batched: bool,
     ) {
         let mut experts = read.experts.clone();
@@ -272,9 +272,9 @@ impl Stack {
         let depths = {
             let mut reuse = Reuse::feeding(&self.ranking);
             if batched {
-                reuse.read_layer(&normalized, rows, Evidence::Decode, clock)
+                reuse.read_layer(&normalized, rows, kind)
             } else {
-                reuse.read_at(&normalized, rows, Evidence::Decode, clock)
+                reuse.read_kind(&normalized, rows, kind)
             }
         };
         count(&mut self.decoded, &mut self.last_decoded, read, &depths);
@@ -297,11 +297,12 @@ impl Stack {
     /// [`Self::read_group`], deferring the group-wide `order` rebuild and
     /// `retop` until [`Self::finish_batch`].
     pub(crate) fn read_group_batched(&mut self, read: &RoutedRead, rows: Rows) -> Vec<usize> {
-        Reuse::feeding(&self.ranking).read_layer(read, Some(std::sync::Arc::new(rows)), Evidence::Prompt, None)
+        Reuse::feeding(&self.ranking).read_layer(read, Some(std::sync::Arc::new(rows)), ReadKind::Prompt)
     }
 
     /// Rebuild `order` and `top` once for every group dirtied by
-    /// [`Self::read_at_batched`] or [`Self::read_group_batched`].
+    /// [`Self::read_target_batched`], [`Self::read_draft_batched`], or
+    /// [`Self::read_group_batched`].
     pub(crate) fn finish_batch(&mut self) {
         Reuse::feeding(&self.ranking).finish_batch();
     }

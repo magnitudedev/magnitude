@@ -483,10 +483,12 @@ impl ScratchRing {
             .any(|gen| !gen.retired && gen.pass.layer == layer)
     }
 
-    /// Whether any non-quarantined generation is still awaiting producer
-    /// completion, copy completion, or GPU reader retirement.
-    fn has_unretired_non_quarantined(&self) -> bool {
-        self.generations.values().any(|gen| !gen.retired && !gen.quarantined)
+    /// Whether any unretired generation (including quarantined ones) still
+    /// exists. A quarantined generation never retires, so [`Scratch::clear_past`]
+    /// cannot clear past it, return lent storage, or admit a subsequent prompt
+    /// group whose `publish` asserts `!has_live_layer`.
+    fn has_unretired(&self) -> bool {
+        self.generations.values().any(|gen| !gen.retired)
     }
 
     /// Whether any generation has been quarantined due to uncertain device
@@ -1383,7 +1385,7 @@ impl Scratch {
     /// group runs ([`Self::clear_past`]).
     /// Where the group's backs lie in the device's order is read from the
     /// steps now: a group cut in before one of its layers moves them later.
-    pub(super) fn advance(&mut self, progress: Point, core: &mut Core) {
+    pub(super) fn advance(&mut self, progress: Point, core: &mut Core, shared: &Shared) {
         let Some(serving) = self.conveyor.serving.as_mut() else {
             return;
         };
@@ -1415,16 +1417,16 @@ impl Scratch {
             self.conveyor.release_past(|layer| progress > steps.point(serving.group.first(), layer, serving.group.last()));
             return;
         }
-        self.clear_past(core);
+        self.clear_past(core, shared);
     }
 
     /// The group served is past: once no read, landing, copy batch, or GPU
     /// pass reader of it runs, empty the conveyor, release the tier records
     /// its rounds held, reset non-quarantined window tables, and return the
-    /// lender's records empty (unless quarantined due to uncertain device
-    /// state). Until then nothing is done, and the next group's requests wait
-    /// ([`Self::clearing`]). Whether it cleared.
-    pub(super) fn clear_past(&mut self, core: &mut Core) -> bool {
+    /// lender's records empty (never clearing if any generation is quarantined
+    /// due to uncertain device state). Until then nothing is done, and the next
+    /// group's requests wait ([`Self::clearing`]). Whether it cleared.
+    pub(super) fn clear_past(&mut self, core: &mut Core, shared: &Shared) -> bool {
         let Some(serving) = self.conveyor.serving.filter(|serving| serving.past) else {
             return false;
         };
@@ -1443,14 +1445,13 @@ impl Scratch {
         // generations while still waiting for already-registered GPU readers
         // and in-flight `Copies` batches to retire cleanly.
         self.ring.close_group_admission(serving.group.first());
-        if let Some(copier) = &self.copier {
-            let (released_records, _, _) =
-                self.ring.settle_copies(|ticket| copier.copies.completed(ticket));
-            for (layer, record) in released_records {
-                core.directory.unhold_tier(layer, record);
-            }
-        }
-        if self.ring.has_unretired_non_quarantined() {
+        // Route copy settlement through the single error-reporting owner so a
+        // first copy fault is never discarded and always ends serving.
+        self.settle_prefill_copies(core, shared);
+        // Never clear past any unretired generation (including quarantined
+        // ones): doing so would return lent scratch storage or admit another
+        // prompt group whose `publish` asserts `!has_live_layer`.
+        if self.ring.has_unretired() {
             return false;
         }
         self.flush_pending_window_resets(core);
@@ -1465,11 +1466,8 @@ impl Scratch {
         for (layer, record) in self.held.drain(..) {
             core.directory.unhold_tier(layer, record);
         }
-        // If any generation was quarantined due to uncertain device state, do
-        // NOT return the lent scratch storage to decode residency.
-        if !self.ring.has_quarantined() {
-            core.directory.end_prompt_group(self.conveyor.lending().group);
-        }
+        debug_assert!(!self.ring.has_quarantined(), "has_unretired() blocks quarantined generations");
+        core.directory.end_prompt_group(self.conveyor.lending().group);
         self.conveyor.serving = None;
         self.lease_records = None;
         true
@@ -2295,16 +2293,23 @@ impl Scratch {
             }
         };
         let copy = tier.is_some().then_some(&mut copy_fn as &mut dyn FnMut(u32, u32));
-        shared.transport.with_slot_reuse(|can_reuse| {
-            core.directory.lease_records(
-                lender,
-                serving.group,
-                self.lease_records.as_deref(),
-                may_evict,
-                copy,
-                |group, slot| can_reuse(DestSlot { group, slot }),
-            );
-        });
+        // Host-record leasing (including any host-record memcpy via `copy`) runs
+        // completely outside `transport.registry` lock.
+        core.directory.lease_host_records(
+            lender,
+            serving.group,
+            self.lease_records.as_deref(),
+            may_evict,
+            copy,
+        );
+        // Snapshot bank slot reuse in O(lent) under a narrow `transport.registry`
+        // guard, then release the guard before exit/unmap/bank-lease work.
+        if let Some((group, records)) = core.directory.bank_lent_range() {
+            let reusable: Vec<bool> = shared.transport.with_slot_reuse(|can_reuse| {
+                (0..records).map(|slot| can_reuse(DestSlot { group, slot })).collect()
+            });
+            core.directory.lease_bank_records(lender, serving.group, &reusable);
+        }
     }
 
     /// Whether the group served holds every record the scratch lies in (on
@@ -2867,8 +2872,14 @@ impl Scratch {
             }
         } else {
             let copier = self.copier.as_ref().expect("tier_copy_dma holds Copies handle");
-            let sync_key = all_posted.then_some((layer, sequence, window, pass_key.generation));
-            match copier.copies.post_prefill(items, sync_key) {
+            let prefill_batch = crate::experts::copies::PrefillBatch {
+                layer,
+                sequence,
+                window,
+                generation: pass_key.generation,
+                publish_sync: all_posted,
+            };
+            match copier.copies.post_prefill(items, prefill_batch) {
                 Ok(ticket) => {
                     // Always track the ticket on the generation (even when
                     // `held_records` is empty, e.g. seed-only D2D batches
@@ -3818,12 +3829,56 @@ mod tests {
         assert!(ring.has_quarantined());
         assert!(ring.has_live_layer(1));
         assert_eq!(ring.used, 5, "both quarantined generations stay withheld");
-        // Closing group admission on `clear_past` must NOT un-quarantine them!
+        // Closing group admission on `clear_past` must NOT un-quarantine them,
+        // and `has_unretired()` must stay `true` so `clear_past` refuses to
+        // clear the serving group or admit another group that would trip
+        // `!has_live_layer`.
         assert!(!ring.close_group_admission(1));
-        assert!(!ring.has_unretired_non_quarantined());
+        assert!(ring.has_unretired());
         assert!(ring.has_live_layer(0));
         assert!(ring.has_live_layer(1));
         assert_eq!(ring.used, 5);
+    }
+
+    /// Regression test (`mt6zgn`): a copy fault discovered during `clear_past`
+    /// must be reported through the single error-reporting owner (never
+    /// discarded), quarantine the generation, and keep `has_unretired()` true
+    /// so `clear_past` cannot clear and admit a subsequent group whose
+    /// `publish` asserts `!has_live_layer`.
+    #[test]
+    fn scratch_ring_clear_past_copy_fault_reports_error_and_blocks_reentry() {
+        let mut ring = ScratchRing::default();
+        let form = [1usize; 2];
+        let gen = ring.begin_or_get_generation(1, 0, 0, 0);
+        let _slots = ring.alloc(gen, &form, 4, 2);
+        ring.record_copy_batch(gen.generation, 17, vec![(0, HostRecord(3))]);
+
+        // Group ends on the device: close admission, then settle copies.
+        assert!(!ring.close_group_admission(1));
+        let (released, first_error, progressed) =
+            ring.settle_copies(|ticket| {
+                assert_eq!(ticket, 17);
+                Err("dma queue fault".into())
+            });
+        assert!(released.is_empty(), "faulted copy must keep HostRecord source pins held");
+        assert_eq!(first_error.as_deref(), Some("dma queue fault"));
+        assert!(progressed);
+        assert!(ring.has_quarantined());
+        assert!(
+            ring.has_unretired(),
+            "quarantined generation must keep has_unretired() true so clear_past refuses to clear"
+        );
+        assert!(ring.has_live_layer(0));
+
+        // Subsequent polls skip the quarantined generation, so the original
+        // error from the first poll was the only opportunity to report it, and
+        // `has_unretired()` must STILL block `clear_past` from clearing.
+        let (released2, err2, progressed2) = ring.settle_copies(|_| Ok(true));
+        assert!(released2.is_empty());
+        assert!(err2.is_none());
+        assert!(!progressed2);
+        assert!(ring.has_unretired());
+        assert!(ring.has_live_layer(0));
     }
 
     /// Derived Pillar C hit probability `1 - ((E - K) / E)^M`.

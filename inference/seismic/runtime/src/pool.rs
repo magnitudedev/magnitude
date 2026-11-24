@@ -2146,7 +2146,7 @@ mod tests {
             assert!(slabs.free_slab(slot).unwrap());
         }
         let flight = Arc::new(Flight::default());
-        pool.0.absent.allocation.record_device_use(DeviceQueue::Transfer, Arc::new(InFlight(flight.clone())), false);
+        pool.0.absent.allocation.record_device_use(DeviceQueue::Transfer(0), Arc::new(InFlight(flight.clone())), false);
 
         assert_eq!(pool.return_freed(4 * granule).unwrap(), block, "the emptied block is returned");
         assert!(
@@ -2250,7 +2250,7 @@ mod tests {
         }
         // Now put work in flight and free 2 slots in block 1 (Fenced).
         let flight = Arc::new(Flight::default());
-        pool.0.absent.allocation.record_device_use(DeviceQueue::Transfer, Arc::new(InFlight(flight.clone())), false);
+        pool.0.absent.allocation.record_device_use(DeviceQueue::Transfer(0), Arc::new(InFlight(flight.clone())), false);
         for slot in [4, 5] {
             assert!(slabs.free_slab(slot).unwrap());
         }
@@ -2306,7 +2306,7 @@ mod tests {
         }
         let flight = Arc::new(Flight::default());
         let guard = CompleteOnDrop(flight.clone());
-        pool.0.absent.allocation.record_device_use(DeviceQueue::Transfer, Arc::new(InFlight(flight.clone())), false);
+        pool.0.absent.allocation.record_device_use(DeviceQueue::Transfer(0), Arc::new(InFlight(flight.clone())), false);
         for slot in 4..8 {
             assert!(slabs.free_slab(slot).unwrap());
         }
@@ -2546,7 +2546,7 @@ mod tests {
         slabs.add_slabs(8, SlabFill::Zeroed).unwrap();
 
         let flight = Arc::new(Flight::default());
-        pool.0.absent.allocation.record_device_use(DeviceQueue::Transfer, Arc::new(InFlight(flight.clone())), false);
+        pool.0.absent.allocation.record_device_use(DeviceQueue::Transfer(0), Arc::new(InFlight(flight.clone())), false);
         for slot in 4..8 {
             assert!(slabs.free_slab(slot).unwrap());
         }

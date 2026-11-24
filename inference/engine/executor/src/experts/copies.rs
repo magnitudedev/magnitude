@@ -115,12 +115,26 @@ impl TransferPriority {
     }
 }
 
+/// Metadata attached to EVERY prefill scratch-fill batch (`PrefillFill`):
+/// both intermediate streaming batches (`publish_sync = false`) and the final
+/// batch (`publish_sync = true`) carry their `(layer, sequence, window,
+/// generation)` so any intermediate refusal poisons the entire generation and
+/// prevents later partial/final batches from publishing a broken sync.
+#[derive(Clone, Copy)]
+pub(in crate::experts) struct PrefillBatch {
+    pub layer: usize,
+    pub sequence: u64,
+    pub window: u64,
+    pub generation: ScratchGenId,
+    pub publish_sync: bool,
+}
+
 struct QueuedBatch {
     ticket: u64,
     priority: TransferPriority,
     items: Vec<BatchItem>,
     stage_transfer: Option<TransferId>,
-    prefill_sync: Option<(usize, u64, u64, ScratchGenId)>,
+    prefill: Option<PrefillBatch>,
 }
 
 /// The device's transfer queue, shared by every holder of it: the batches
@@ -164,6 +178,9 @@ struct State {
     running: VecDeque<RunningBatch>,
     /// The batches the queue refused as issued, and why.
     refused: BTreeMap<u64, String>,
+    /// Prefill generations poisoned by a refused partial/final batch: no later
+    /// batch of a poisoned generation may be issued or publish a sync.
+    poisoned_generations: std::collections::HashMap<ScratchGenId, String>,
     /// Cancelled batches' items deferred to drop on the issuer thread (outside
     /// `residency` and `NoBlockingAllocationGuard`, since dropping a final
     /// `SlabHold`/`Allocation` may touch pool or driver locks).
@@ -247,13 +264,13 @@ impl Copies {
         priority: TransferPriority,
         items: Vec<BatchItem>,
         stage_transfer: Option<TransferId>,
-        prefill_sync: Option<(usize, u64, u64, ScratchGenId)>,
+        prefill: Option<PrefillBatch>,
     ) -> u64 {
         let ticket = {
             let mut state = self.state();
             state.posted += 1;
             let ticket = state.posted;
-            state.waiting.push(QueuedBatch { ticket, priority, items, stage_transfer, prefill_sync });
+            state.waiting.push(QueuedBatch { ticket, priority, items, stage_transfer, prefill });
             ticket
         };
         self.inner.events.notify();
@@ -261,22 +278,24 @@ impl Copies {
     }
 
     /// Post a prefill scratch-fill DMA batch at [`TransferPriority::PrefillFill`]
-    /// (highest priority, never capped by background promotion depth). When
-    /// `key` is `Some((layer, sequence, window, generation))`, `Copies::issue`
-    /// submits it via `copy_synced` and atomically publishes `(generation,
-    /// TransferSync)` to `ExpertTransport` so `Pass` waits on it via
-    /// `cuStreamWaitEvent` and tracks retirement against `generation`.
-    /// Intermediate streaming batches pass `None` and still execute ahead of
-    /// `Pass` in FIFO transfer stream order before releasing their `HostTier`
-    /// holds.
-    pub fn post_prefill(&self, items: Vec<BatchItem>, key: Option<(usize, u64, u64, ScratchGenId)>) -> Result<u64, String> {
+    /// (highest priority, never capped by background promotion depth). Every
+    /// partial and final batch carries its [`PrefillBatch`] (including
+    /// `generation`): when `publish_sync` is `true`, `Copies::issue` submits it
+    /// via `copy_synced` and atomically publishes `(generation, TransferSync)`
+    /// to `ExpertTransport`. Any refusal of an earlier partial batch poisons
+    /// `generation` terminally so no later batch of that generation is issued
+    /// or publishes a sync.
+    pub fn post_prefill(&self, items: Vec<BatchItem>, prefill: PrefillBatch) -> Result<u64, String> {
         {
             let state = self.state();
             if let Some(fault) = &state.fault {
                 return Err(fault.clone());
             }
+            if let Some(reason) = state.poisoned_generations.get(&prefill.generation) {
+                return Err(reason.clone());
+            }
         }
-        Ok(self.post(TransferPriority::PrefillFill, items, None, key))
+        Ok(self.post(TransferPriority::PrefillFill, items, None, Some(prefill)))
     }
 
     /// Post the batch `form` forms at `priority`, only while fewer than `depth`
@@ -460,10 +479,30 @@ impl Copies {
                 (next, cancelled)
             };
             drop(cancelled);
-            let Some(QueuedBatch { ticket, items: batch, stage_transfer, prefill_sync, .. }) = next else {
+            let Some(QueuedBatch { ticket, items: batch, stage_transfer, prefill, .. }) = next else {
                 events.wait(seen);
                 continue;
             };
+            // If an earlier partial batch for this prefill generation was
+            // refused, fail this batch terminally before touching the transfer
+            // stream or publishing any sync.
+            if let Some(prefill) = prefill {
+                let poisoned = {
+                    let state = self.state();
+                    state.poisoned_generations.get(&prefill.generation).cloned()
+                };
+                if let Some(reason) = poisoned {
+                    if let Some(transport) = &self.inner.transport {
+                        transport.poison_prefill_generation(prefill.generation, prefill.sequence, reason.clone());
+                    }
+                    let mut state = self.state();
+                    state.issuing = None;
+                    state.issued = ticket;
+                    state.refused.insert(ticket, reason);
+                    events.notify();
+                    continue;
+                }
+            }
             let items = batch
                 .iter()
                 .map(|item| match item {
@@ -481,7 +520,7 @@ impl Copies {
                     },
                 })
                 .collect::<Vec<_>>();
-            let need_sync = stage_transfer.is_some() || prefill_sync.is_some();
+            let need_sync = stage_transfer.is_some() || prefill.is_some_and(|p| p.publish_sync);
             let issued = if need_sync {
                 self.inner.transfer.copy_synced(&items).map(|(value, sync)| (value, Some(sync)))
             } else {
@@ -494,10 +533,16 @@ impl Copies {
                         transport.attach_sync(id, sync.clone());
                         transport.drain_deferred_syncs();
                     }
-                    if let (Some(transport), Some((layer, sequence, window, generation)), Some(sync)) =
-                        (&self.inner.transport, prefill_sync, sync)
+                    if let (Some(transport), Some(prefill), Some(sync)) =
+                        (&self.inner.transport, prefill.filter(|p| p.publish_sync), sync)
                     {
-                        transport.publish_prefill_sync(layer, sequence, window, generation, Some(sync));
+                        transport.publish_prefill_sync(
+                            prefill.layer,
+                            prefill.sequence,
+                            prefill.window,
+                            prefill.generation,
+                            Some(sync),
+                        );
                     }
                     let mut state = self.state();
                     state.issuing = None;
@@ -510,10 +555,15 @@ impl Copies {
                         transport.fault_transfer(id, msg.clone());
                         transport.drain_deferred_syncs();
                     }
-                    if let (Some(transport), Some((_, sequence, _, _))) = (&self.inner.transport, prefill_sync) {
-                        transport.fail_prefill_step(sequence, msg.clone());
+                    if let Some(prefill) = prefill {
+                        if let Some(transport) = &self.inner.transport {
+                            transport.poison_prefill_generation(prefill.generation, prefill.sequence, msg.clone());
+                        }
                     }
                     let mut state = self.state();
+                    if let Some(prefill) = prefill {
+                        state.poisoned_generations.entry(prefill.generation).or_insert_with(|| msg.clone());
+                    }
                     state.issuing = None;
                     state.issued = ticket;
                     state.refused.insert(ticket, msg);
@@ -590,7 +640,7 @@ mod tests {
     fn push(state: &mut State, priority: TransferPriority) -> u64 {
         state.posted += 1;
         let ticket = state.posted;
-        state.waiting.push(QueuedBatch { ticket, priority, items: Vec::new(), stage_transfer: None, prefill_sync: None });
+        state.waiting.push(QueuedBatch { ticket, priority, items: Vec::new(), stage_transfer: None, prefill: None });
         ticket
     }
 

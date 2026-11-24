@@ -52,6 +52,41 @@ pub enum Evidence {
     Prompt,
 }
 
+/// How a target decode read obtains its position on the target token
+/// [`horizon::Clock`].
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum TargetClock {
+    /// Pre-captured while the step was still live on `Clock`'s ring.
+    Stamped(horizon::Tokens),
+    /// Look up `read.sequence` via strict `Clock::at(step)` (panics if missing).
+    Lookup,
+}
+
+/// Typed domain and clock sample for a read entering [`Reuse`].
+///
+/// `TargetDecode` and `DraftDecode` share the exact same ranking, history,
+/// calibration, and pool-accounting path, while only `TargetDecode` and
+/// `Prompt` carry a target clock sample for [`shadows::Shadows`].
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum ReadKind {
+    /// Target decode or grouped target verify step on the target token clock.
+    TargetDecode(TargetClock),
+    /// Banked draft decode step (`StepRoute::DraftDecode`): updates shared
+    /// ranking/accounting without touching the target token clock or shadows.
+    DraftDecode,
+    /// Prompt-phase read (`Tokens::ZERO` on the shadow feed).
+    Prompt,
+}
+
+impl ReadKind {
+    fn evidence(self) -> Evidence {
+        match self {
+            Self::TargetDecode(_) | Self::DraftDecode => Evidence::Decode,
+            Self::Prompt => Evidence::Prompt,
+        }
+    }
+}
+
 /// A step's rows at one layer as placement reads them: each row's depth (0
 /// an exact row's, `j` a guessed row's routing the token `j` past its
 /// exact row's), whether its guessed rows are verify rows (`verifies`, a
@@ -765,15 +800,16 @@ impl Reuse {
     /// The step-cached tier-0 Move `(horizon, a_bar)` for `group` at `step`
     /// (design §3.2: a step reads τ once at its first log, so all its layers
     /// rank at one value), plus the group's epoch and, when shadows are
-    /// attached, the step's position on the token clock (`Tokens::ZERO` for
-    /// prompt reads).
-    fn step_horizon_at(&mut self, group: usize, step: Step, evidence: Evidence, clock: Option<horizon::Tokens>) -> (horizon::Horizon, f64, u64, horizon::Tokens) {
+    /// attached and `kind` belongs to the target token clock, its typed
+    /// `(Evidence, Tokens)` shadow sample (`None` for `ReadKind::DraftDecode`).
+    fn step_horizon_at(&mut self, group: usize, step: Step, kind: ReadKind) -> (horizon::Horizon, f64, u64, Option<(Evidence, horizon::Tokens)>) {
         let times = self.time.lock();
         let epoch = times.group_epoch(group);
-        let clock = match (self.shadowed.is_some(), evidence, clock) {
-            (true, Evidence::Decode, Some(at)) => at,
-            (true, Evidence::Decode, None) => times.clock.at(step),
-            _ => horizon::Tokens::ZERO,
+        let shadow_sample = match (self.shadowed.is_some(), kind) {
+            (true, ReadKind::TargetDecode(TargetClock::Stamped(at))) => Some((Evidence::Decode, at)),
+            (true, ReadKind::TargetDecode(TargetClock::Lookup)) => Some((Evidence::Decode, times.clock.at(step))),
+            (true, ReadKind::Prompt) => Some((Evidence::Prompt, horizon::Tokens::ZERO)),
+            (true, ReadKind::DraftDecode) | (false, _) => None,
         };
         let (horizon, a_bar) = match self.step_horizon[group] {
             Some((at, horizon, a_bar)) if at >= step => (horizon, a_bar),
@@ -786,7 +822,7 @@ impl Reuse {
                 (horizon, a_bar)
             }
         };
-        (horizon, a_bar, epoch, clock)
+        (horizon, a_bar, epoch, shadow_sample)
     }
 
     /// Lead `g ≥ 1` of target step `step` past `layer`'s latest logged step.
@@ -803,14 +839,17 @@ impl Reuse {
     /// keys `rows` where known, and whether it is decode or prompt evidence:
     /// returns each expert's depth in slots before the read ([`Self::depth`]).
     pub fn read(&mut self, read: &RoutedRead, rows: Option<Arc<Rows>>, evidence: Evidence) -> Vec<usize> {
-        self.read_at(read, rows, evidence, None)
+        let kind = match evidence {
+            Evidence::Decode => ReadKind::TargetDecode(TargetClock::Lookup),
+            Evidence::Prompt => ReadKind::Prompt,
+        };
+        self.read_kind(read, rows, kind)
     }
 
-    /// [`Self::read`] with a pre-captured token clock position `clock` for
-    /// `read.sequence` (captured while the step was still live on `Clock`'s
-    /// ring, so asynchronous stack feeding never races ring eviction).
-    pub(crate) fn read_at(&mut self, read: &RoutedRead, rows: Option<Arc<Rows>>, evidence: Evidence, clock: Option<horizon::Tokens>) -> Vec<usize> {
-        let depths = self.read_layer(read, rows, evidence, clock);
+    /// Log `read` under its typed [`ReadKind`] and immediately rebuild its
+    /// group's ranking order.
+    pub(crate) fn read_kind(&mut self, read: &RoutedRead, rows: Option<Arc<Rows>>, kind: ReadKind) -> Vec<usize> {
+        let depths = self.read_layer(read, rows, kind);
         self.rerank_group(self.groups[read.layer]);
         depths
     }
@@ -820,7 +859,7 @@ impl Reuse {
     /// `retop` until [`Self::finish_batch`]. If the same layer is already
     /// dirty from an earlier read in the same batch, its group is rebuilt
     /// first so `depths` reflects the prior read.
-    pub(crate) fn read_layer(&mut self, read: &RoutedRead, rows: Option<Arc<Rows>>, evidence: Evidence, clock: Option<horizon::Tokens>) -> Vec<usize> {
+    pub(crate) fn read_layer(&mut self, read: &RoutedRead, rows: Option<Arc<Rows>>, kind: ReadKind) -> Vec<usize> {
         assert!(read.experts.windows(2).all(|pair| pair[0] < pair[1]), "a read lists each expert once, ascending");
         self.reads += 1;
         let (layer, group) = (read.layer, self.groups[read.layer]);
@@ -828,13 +867,13 @@ impl Reuse {
             self.rerank_group(group);
         }
         let depths = read.experts.iter().map(|&expert| self.depth(layer, expert)).collect();
-        let (horizon, a_bar, epoch, clock) = self.step_horizon_at(group, read.sequence, evidence, clock);
+        let (horizon, a_bar, epoch, shadow_sample) = self.step_horizon_at(group, read.sequence, kind);
         let far_lead = match horizon {
             horizon::Horizon::Tokens(tau) => Some((tau.get() / a_bar).ceil().max(1.0) as usize),
             horizon::Horizon::Unbounded => None,
         };
         let choices = usize::try_from(read.choices).expect("choices fits usize");
-        match evidence {
+        match kind.evidence() {
             Evidence::Decode => {
                 if choices > 0 {
                     self.layers[layer].set_active(choices);
@@ -878,7 +917,7 @@ impl Reuse {
         self.pools.read(layer, group, &read.experts, |expert| ranks[expert]);
         self.ranks[layer] = ranks;
         self.dirty[layer] = true;
-        if let Some(shadowed) = &mut self.shadowed {
+        if let (Some(shadowed), Some((evidence, clock))) = (&mut self.shadowed, shadow_sample) {
             shadowed.push(ShadowFeed::Read { read: read.clone(), rows, evidence, clock });
         }
         depths
@@ -1854,5 +1893,63 @@ pub(super) mod tests {
         let top1 = (0..128).filter(|&e| reuse2.in_top(1, e)).count();
         assert_eq!(top0 + top1, 8);
         assert!(top0 > top1, "skewed layer 0 ({top0}) must out-allocate bursty layer 1 ({top1})");
+    }
+
+    /// `ReadKind::DraftDecode` shares the same `Reuse` ranking/history/pool
+    /// path as `TargetDecode`, but never touches `horizon::Clock` and never
+    /// pushes unclocked 0-token steps into `Shadows`.
+    #[test]
+    fn draft_decode_updates_ranking_without_corrupting_target_clock_or_shadows() {
+        let time = time_for(&[4]);
+        let mut reuse = Reuse::new(&[8], &[0], &[4], time.clone());
+        let _shadows = reuse.shadows();
+
+        // Before any target step is registered on `Clock`, draft decode reads
+        // must update ranking cleanly without panicking or feeding shadows.
+        for step in 1..=3u64 {
+            reuse.read_kind(
+                &RoutedRead { sequence: step, layer: 0, experts: vec![0, 1], choices: 2 },
+                None,
+                ReadKind::DraftDecode,
+            );
+        }
+        assert!(reuse.in_top(0, 0) && reuse.in_top(0, 1), "draft decode reads must update Reuse ranking");
+        assert_eq!(time.lock().clock.latest(), None, "draft decode reads must never advance target Clock");
+        assert!(reuse.take_shadowed().is_empty(), "draft decode reads must never enter target Shadows");
+
+        // Target decode steps with stamped clock positions feed Shadows cleanly.
+        register_front(&time, 10);
+        let t10 = time.lock().clock.at(10);
+        reuse.read_kind(
+            &RoutedRead { sequence: 10, layer: 0, experts: vec![2, 3], choices: 2 },
+            None,
+            ReadKind::TargetDecode(TargetClock::Stamped(t10)),
+        );
+        let mut fed = reuse.take_shadowed();
+        assert_eq!(fed.len(), 1, "target decode read enters Shadows");
+        match fed.pop().unwrap() {
+            ShadowFeed::Read { read, evidence, clock, .. } => {
+                assert_eq!(read.sequence, 10);
+                assert_eq!(evidence, Evidence::Decode);
+                assert_eq!(clock, t10);
+            }
+            ShadowFeed::Resize { .. } => panic!("unexpected ShadowFeed::Resize"),
+        }
+    }
+
+    /// Explicit target clock lookup (`ReadKind::TargetDecode(TargetClock::Lookup)`)
+    /// MUST fail loudly (panic) when the step is missing from `horizon::Clock`.
+    #[test]
+    #[should_panic(expected = "not on the clock's ring")]
+    fn missing_target_clock_stamp_fails_loudly() {
+        let time = time_for(&[4]);
+        let mut reuse = Reuse::new(&[8], &[0], &[4], time);
+        let _shadows = reuse.shadows();
+
+        reuse.read_kind(
+            &RoutedRead { sequence: 42, layer: 0, experts: vec![0, 1], choices: 2 },
+            None,
+            ReadKind::TargetDecode(TargetClock::Lookup),
+        );
     }
 }

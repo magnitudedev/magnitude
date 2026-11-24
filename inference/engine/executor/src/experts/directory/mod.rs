@@ -2498,20 +2498,21 @@ impl Directory {
                     }
                 }
             }
-            if can_reuse {
-                self.bank.release_demand_landing(group, record);
-            } else {
-                self.bank.defer_demand_release(group, record);
-            }
+            self.release_demand_landing(group, record, can_reuse);
         }
         promoted_any
     }
 
-    /// Release an aborted/faulted `Record::DemandLanding` slot back to
-    /// `Record::Free` (fault quarantine in `ExpertTransport` prevents reuse
-    /// until explicitly cleared).
-    pub fn release_demand_landing(&mut self, group: usize, record: usize) {
-        self.bank.release_demand_landing(group, record);
+    /// Release an unpromoted or aborted `Record::DemandLanding` slot: returns
+    /// it to `Record::Free` immediately when `can_reuse` is `true`, or defers
+    /// release via [`BankRecords::defer_demand_release`] when a joined consumer
+    /// still pins the destination slot.
+    pub fn release_demand_landing(&mut self, group: usize, record: usize, can_reuse: bool) {
+        if can_reuse {
+            self.bank.release_demand_landing(group, record);
+        } else {
+            self.bank.defer_demand_release(group, record);
+        }
     }
 
     /// Drain deferred unpromoted `Record::DemandLanding` slots once
@@ -2675,18 +2676,17 @@ impl Directory {
     }
 
     /// Grant scratch group `scratch_group` its lease of `target_records` (or
-    /// all `0..lent` when `None`) of group `lender`, withholding any lent bank
-    /// record where `can_reuse(group, record)` is `false` (e.g. still pinned by
-    /// a joined demand consumer or quarantined in `ExpertTransport`).
-    pub fn lease_records(
+    /// all `0..lent` when `None`) of group `lender`'s host records, optionally
+    /// copying kept experts out of the lent zone via `copy`. Runs outside any
+    /// transport registry lock so host-record memcpy never contends on it.
+    pub fn lease_host_records(
         &mut self,
         lender: usize,
         scratch_group: ScratchGroup,
         target_records: Option<&[u32]>,
         may_evict: bool,
         copy: Option<&mut dyn FnMut(u32, u32)>,
-        mut can_reuse: impl FnMut(usize, usize) -> bool,
-    ) -> bool {
+    ) {
         let before = self.host[lender].claimed();
         if !self.host[lender].leased_records(target_records) {
             let tier = self.host_tier();
@@ -2701,43 +2701,75 @@ impl Directory {
         if self.host[lender].claimed() != before {
             self.resize_pool(lender);
         }
+    }
+
+    /// The `(group, lent_records)` range of the bank's lent scratch slice, if
+    /// any, so callers can snapshot transport slot-reuse eligibility in
+    /// `O(lent)` under a narrow registry guard before calling
+    /// [`Self::lease_bank_records`].
+    pub fn bank_lent_range(&self) -> Option<(usize, usize)> {
+        self.bank.lent()
+    }
+
+    /// Grant scratch group `scratch_group` its lease of the bank's lent
+    /// records using a pre-snapshotted `reusable[record]` mask (`O(1)` lookup
+    /// per record, zero transport lock held during exit/unmap/eviction work).
+    pub fn lease_bank_records(
+        &mut self,
+        lender: usize,
+        scratch_group: ScratchGroup,
+        reusable: &[bool],
+    ) {
+        let Some((lent_group, records)) = self.bank.lent() else {
+            return;
+        };
+        assert_eq!(reusable.len(), records, "reusable mask length must match bank lent range");
         let bank_before = self.bank.capacity(lender);
         for (group, record) in self.bank.lent_queued() {
-            if can_reuse(group, record.index()) {
+            debug_assert_eq!(group, lent_group);
+            if reusable[record.index()] {
                 self.unpromoted(group, record);
             }
         }
-        // Snapshot `can_reuse` per lent record so `lent_held()` exit creation
-        // and `bank.lease_with()` see the exact same eligibility set.
-        let lent_reusable: Vec<(usize, usize, bool)> = self
-            .bank
-            .lent_held()
-            .into_iter()
-            .map(|(group, record, _)| (group, record, can_reuse(group, record)))
-            .collect();
         // Each decided after the exits before it took their tier records.
         let exits = self
             .bank
             .lent_held()
             .into_iter()
             .filter(|&(group, record, _)| {
-                lent_reusable
-                    .iter()
-                    .find(|&&(g, r, _)| g == group && r == record)
-                    .is_some_and(|&(_, _, ok)| ok)
+                debug_assert_eq!(group, lent_group);
+                reusable[record]
             })
             .map(|(group, record, staged)| self.exit_now(group, record, staged))
             .collect();
         for (layer, expert) in self.bank.lease_with(scratch_group, exits, |group, record| {
-            lent_reusable
-                .iter()
-                .find(|&&(g, r, _)| g == group && r == record)
-                .map_or_else(|| can_reuse(group, record), |&(_, _, ok)| ok)
+            debug_assert_eq!(group, lent_group);
+            reusable[record]
         }) {
             self.left_bank(layer, expert, None);
         }
         if self.bank.capacity(lender) != bank_before {
             self.resize_pool(lender);
+        }
+    }
+
+    /// Grant scratch group `scratch_group` its lease of `target_records` (or
+    /// all `0..lent` when `None`) of group `lender`, withholding any lent bank
+    /// record where `can_reuse(group, record)` is `false` (e.g. still pinned by
+    /// a joined demand consumer or quarantined in `ExpertTransport`).
+    pub fn lease_records(
+        &mut self,
+        lender: usize,
+        scratch_group: ScratchGroup,
+        target_records: Option<&[u32]>,
+        may_evict: bool,
+        copy: Option<&mut dyn FnMut(u32, u32)>,
+        mut can_reuse: impl FnMut(usize, usize) -> bool,
+    ) -> bool {
+        self.lease_host_records(lender, scratch_group, target_records, may_evict, copy);
+        if let Some((group, records)) = self.bank.lent() {
+            let reusable: Vec<bool> = (0..records).map(|record| can_reuse(group, record)).collect();
+            self.lease_bank_records(lender, scratch_group, &reusable);
         }
         self.leased_records(lender, target_records)
     }

@@ -49,7 +49,23 @@ pub enum TransferError {
     /// A run's or a signal's tensors are another device's, or lie outside
     /// the bytes their views reach.
     Run(String),
+    /// Refused before any item of the batch was queued on the device (e.g.
+    /// CUDA event-allocation failure, invalid item, adoption wait failure, or
+    /// queue already faulted). No stream work was issued for this batch and no
+    /// fence was installed.
+    RefusedBeforeIssue(ExecutionError),
+    /// A device/driver failure that may have occurred after earlier items of
+    /// the batch were already queued on the transfer stream.
     Execution(ExecutionError),
+}
+
+impl TransferError {
+    /// Whether this failure was definitely refused before any item of the batch
+    /// reached the device transfer queue (so no stream work was issued for this
+    /// call and no fence was installed).
+    pub fn refused_before_issue(&self) -> bool {
+        matches!(self, Self::InPlace | Self::Run(_) | Self::RefusedBeforeIssue(_))
+    }
 }
 
 impl fmt::Display for TransferError {
@@ -57,6 +73,7 @@ impl fmt::Display for TransferError {
         match self {
             Self::InPlace => formatter.write_str("the device's storage is host-addressed: the host writes it in place"),
             Self::Run(why) => write!(formatter, "a transfer run is invalid: {why}"),
+            Self::RefusedBeforeIssue(error) => write!(formatter, "a transfer was refused before issue: {error}"),
             Self::Execution(error) => write!(formatter, "a transfer failed: {error}"),
         }
     }
@@ -138,7 +155,9 @@ impl DeviceCompletion for BatchFence {
     }
 
     fn ended(&self) -> Result<(), ExecutionError> {
-        while !self.queue.wait(self.value, Duration::from_secs(1))? {}
+        while !self.queue.wait(self.value, Duration::from_secs(1))? {
+            std::thread::yield_now();
+        }
         Ok(())
     }
 }
@@ -168,10 +187,18 @@ impl TransferSync {
     }
 }
 
+/// Monotonic process-wide ID generator for independent [`TransferInner`] queues
+/// so each CUDA/Vulkan/CPU transfer stream tracks its own allocation fence slot
+/// (`DeviceQueue::Transfer(queue_id)`) and reverse-order completion on stream B
+/// can never overwrite or erase stream A's fence.
+static NEXT_TRANSFER_QUEUE_ID: AtomicU64 = AtomicU64::new(1);
+
 /// One device's transfer queue.
 pub struct TransferInner {
     device: Arc<DeviceInner>,
     queue: Arc<Queue>,
+    /// Unique producer queue ID for `DeviceQueue::Transfer(queue_id)`.
+    queue_id: u64,
     /// The value the next batch takes: batches are numbered here alone,
     /// every backend's queue signalling the value it is given.
     next: AtomicU64,
@@ -197,6 +224,7 @@ impl TransferInner {
         Ok(Self {
             device: device.clone(),
             queue: Arc::new(Queue { kind }),
+            queue_id: NEXT_TRANSFER_QUEUE_ID.fetch_add(1, Ordering::Relaxed),
             next: AtomicU64::new(1),
             issuing: Mutex::new(()),
         })
@@ -238,11 +266,11 @@ impl TransferInner {
         for item in items {
             match item {
                 TransferItem::Run(run) => {
-                    run.source.wait_adopted().map_err(TransferError::Execution)?;
-                    run.destination.wait_adopted().map_err(TransferError::Execution)?;
+                    run.source.wait_adopted().map_err(TransferError::RefusedBeforeIssue)?;
+                    run.destination.wait_adopted().map_err(TransferError::RefusedBeforeIssue)?;
                 }
                 TransferItem::Signal { word, .. } => {
-                    word.wait_adopted().map_err(TransferError::Execution)?;
+                    word.wait_adopted().map_err(TransferError::RefusedBeforeIssue)?;
                 }
             }
         }
@@ -333,10 +361,17 @@ impl TransferInner {
                     })
                     .collect::<Vec<_>>();
                 // The word holds a value's low 32 bits, compared cyclically.
-                if record_event {
-                    cuda_event = Some(queue.copy_event(&items, value as u32).map_err(TransferError::Execution)?);
+                let result = if record_event {
+                    queue.copy_event(&items, value as u32).map(Some)
                 } else {
-                    queue.copy(&items, value as u32).map_err(TransferError::Execution)?;
+                    queue.copy(&items, value as u32).map(|()| None)
+                };
+                match self.handle_cuda_copy_outcome(result, value, &access) {
+                    Ok(event) => cuda_event = event,
+                    Err(error) => {
+                        drop(permits);
+                        return Err(error);
+                    }
                 }
             }
             #[cfg(not(target_os = "macos"))]
@@ -365,10 +400,41 @@ impl TransferInner {
         self.next.store(value + 1, Ordering::Relaxed);
         let fence: Arc<dyn DeviceCompletion> = Arc::new(BatchFence { queue: self.queue.clone(), value });
         for (allocation, write) in &access {
-            allocation.record_device_use(DeviceQueue::Transfer, fence.clone(), *write);
+            allocation.record_device_use(DeviceQueue::Transfer(self.queue_id), fence.clone(), *write);
         }
         drop(permits);
         Ok((value, TransferSync { cuda: cuda_event }))
+    }
+
+    /// Translate a CUDA transfer enqueue outcome:
+    /// - `RefusedBeforeIssue`: nothing was queued on the transfer stream, so
+    ///   neither consume `value` nor install a [`BatchFence`] (otherwise
+    ///   allocation retirement would wait forever on an unsignaled value on a
+    ///   healthy idle queue).
+    /// - `PossiblyIssued`: earlier copies of the batch may already be in flight
+    ///   on the now-faulted stream, so advance `next` and record a
+    ///   [`BatchFence`] on every accessed allocation so host access and storage
+    ///   release wait for the faulted stream to drain or context loss.
+    fn handle_cuda_copy_outcome(
+        &self,
+        result: Result<Option<Arc<seismic_cuda::Event>>, seismic_cuda::transfer::CopyError>,
+        value: u64,
+        access: &[(Arc<crate::driver::Allocation>, bool)],
+    ) -> Result<Option<Arc<seismic_cuda::Event>>, TransferError> {
+        match result {
+            Ok(event) => Ok(event),
+            Err(seismic_cuda::transfer::CopyError::RefusedBeforeIssue(error)) => {
+                Err(TransferError::RefusedBeforeIssue(error))
+            }
+            Err(seismic_cuda::transfer::CopyError::PossiblyIssued(error)) => {
+                self.next.store(value + 1, Ordering::Relaxed);
+                let fence: Arc<dyn DeviceCompletion> = Arc::new(BatchFence { queue: self.queue.clone(), value });
+                for (allocation, write) in access {
+                    allocation.record_device_use(DeviceQueue::Transfer(self.queue_id), fence.clone(), *write);
+                }
+                Err(TransferError::Execution(error))
+            }
+        }
     }
 
     /// A run copies between live views of this device's tensors, each
@@ -568,5 +634,60 @@ mod tests {
             transfer.copy(&[TransferItem::Signal { word: &slab_view, offset: 0, value: 1 }]),
             Err(TransferError::Run(_))
         ));
+    }
+
+    #[test]
+    fn cuda_refused_before_issue_installs_no_unsignaled_fence() {
+        let device = cpu();
+        let transfer = TransferInner::new(&device).unwrap();
+        let charges = crate::memory::Charges::tally(&device);
+        let i32s = seismic_lang::registry::dense(seismic_lang::types::DType::I32);
+        let source = TensorInner::from_host(&charges, i32s, &[2], &[1, 2, 3, 4, 5, 6, 7, 8]).unwrap();
+        let destination = TensorInner::from_host(&charges, i32s, &[2], &[0; 8]).unwrap();
+        let access = vec![(source.allocation().clone(), false), (destination.allocation().clone(), true)];
+
+        // Pre-issue refusal (invalid item, event-alloc failure, or already-faulted queue):
+        // must NOT advance `next` and must NOT record a `BatchFence` on any allocation.
+        let value = transfer.next.load(Ordering::Relaxed);
+        let refused = transfer.handle_cuda_copy_outcome(
+            Err(seismic_cuda::transfer::CopyError::RefusedBeforeIssue(
+                ExecutionError::SubmissionFailed("event alloc failed".into()),
+            )),
+            value,
+            &access,
+        );
+        assert!(matches!(refused, Err(TransferError::RefusedBeforeIssue(_))));
+        assert!(matches!(refused, Err(ref e) if e.refused_before_issue()));
+        assert_eq!(transfer.next.load(Ordering::Relaxed), value, "RefusedBeforeIssue must not consume a batch value");
+        assert_eq!(
+            Arc::strong_count(&transfer.queue),
+            1,
+            "RefusedBeforeIssue must not install a BatchFence on allocations"
+        );
+        // Host read must return immediately without hanging on an unsignaled fence.
+        assert_eq!(destination.read_to_host().unwrap(), [0; 8]);
+
+        // Mid-batch failure (`PossiblyIssued`): must advance `next` and install a
+        // `BatchFence` on every accessed allocation so release waits for stream drain.
+        let issued = transfer.handle_cuda_copy_outcome(
+            Err(seismic_cuda::transfer::CopyError::PossiblyIssued(
+                ExecutionError::SubmissionFailed("mid-batch enqueue fault".into()),
+            )),
+            value,
+            &access,
+        );
+        assert!(matches!(issued, Err(TransferError::Execution(_))));
+        assert!(matches!(issued, Err(ref e) if !e.refused_before_issue()));
+        assert_eq!(transfer.next.load(Ordering::Relaxed), value + 1, "PossiblyIssued must advance batch value");
+        assert_eq!(
+            Arc::strong_count(&transfer.queue),
+            2,
+            "PossiblyIssued must install a BatchFence on accessed allocations"
+        );
+        // Signal the synthetic CPU queue value before scope exit so tensor drop
+        // does not wait indefinitely on the fence installed by `PossiblyIssued`.
+        if let TransferKind::Cpu { done } = &transfer.queue.kind {
+            done.store(value, Ordering::Release);
+        }
     }
 }

@@ -298,12 +298,26 @@ impl<'p> StepSubmitter<'p> {
         self.pending_landed.push(read);
     }
 
-    /// After a failure, once the submitted runs completed: retire the
-    /// stored-table reads of already-submitted runs so their failure records
-    /// are not leaked, and abandon the stored-table steps of runs never
+    /// After a failure, once `wait_all` has observed already-submitted runs
+    /// (`drained == true` iff every submitted compute run is proven complete):
+    /// retire the stored-table reads of already-submitted runs so their failure
+    /// records are not leaked, settle decode DMA landings safely by their
+    /// `ComputeUse` state, and abandon the stored-table steps of runs never
     /// submitted (whose landed reads drop unsubmitted).
-    fn abandon_unsubmitted(mut self) {
-        self.release_decode_landings();
+    fn abandon_unsubmitted(mut self, drained: bool) {
+        for (bank, landing) in std::mem::take(&mut self.decode_landings) {
+            match landing.compute_use() {
+                crate::experts::transport::ComputeUse::BackSubmitted if drained => {
+                    bank.complete_decode_landing(landing);
+                }
+                crate::experts::transport::ComputeUse::BackSubmitted => {
+                    bank.quarantine_decode_landing(landing, "compute wait failed during step refusal");
+                }
+                crate::experts::transport::ComputeUse::BeforeBack => {
+                    bank.abort_decode_landing(landing, "DecodeBack was not submitted before refusal");
+                }
+            }
+        }
         self.pending_prefill_dma.clear();
         for read in self.reads {
             read.table.retire(read.value);
@@ -353,8 +367,8 @@ impl<'p> StepSubmitter<'p> {
         // it matter only for draining the device. Runs still queued
         // are dropped unsubmitted, and their stored-table steps
         // read nothing.
-        let _ = wait_all(std::mem::take(&mut self.completions));
-        self.abandon_unsubmitted();
+        let drained = wait_all(std::mem::take(&mut self.completions)).is_ok();
+        self.abandon_unsubmitted(drained);
         // The device is past the chain's runs: each step is refused,
         // none fed, as no run of the chain's is known to have written
         // its records. A watcher that panicked fails the load.
@@ -377,10 +391,13 @@ impl<'p> StepSubmitter<'p> {
         self.decode_landings.push((bank, landing));
     }
 
-    /// Release all held decode DMA landings (must only be called once
-    /// `DecodeBack` is proven complete on the GPU or after `wait_all`).
-    fn release_decode_landings(&mut self) {
-        complete_decode_landings(std::mem::take(&mut self.decode_landings));
+    /// Mark all currently held decode DMA landings as having `DecodeBack`
+    /// submitted on the compute stream (copy completion alone is no longer
+    /// sufficient to release them).
+    fn mark_decode_landings_back_submitted(&mut self) {
+        for (_, landing) in &mut self.decode_landings {
+            landing.mark_back_submitted();
+        }
     }
 
     /// Take all held decode DMA landings, for the caller to complete
@@ -714,17 +731,11 @@ pub struct TargetOutput {
     pub stored_reads: Vec<StoredRead>,
     /// The step of a streamed load's expert bank, until it completes.
     pub(crate) expert_step: Option<crate::experts::ExpertStep>,
-    /// Final layer's M7 decode DMA landings, released once the step's GPU
-    /// completions finish.
+    /// Final layer's M7 decode DMA landings, completed once the step's GPU
+    /// completions finish in [`TargetOutput::complete`]. If dropped without
+    /// `complete()`, each landing's `Drop` hands uncertain work to
+    /// `ExpertTransport`'s retirement quarantine without blocking or panicking.
     pub(crate) decode_landings: Vec<(Arc<crate::experts::ExpertBank>, crate::experts::transport::DecodeLanding)>,
-}
-
-impl Drop for TargetOutput {
-    fn drop(&mut self) {
-        for (bank, landing) in self.decode_landings.drain(..) {
-            bank.complete_decode_landing(landing);
-        }
-    }
 }
 
 /// A target step's output once the step completed (or will never be used,
@@ -2309,7 +2320,11 @@ impl NativeTargetProgram {
                 // Submitted now, not with the next layer's `DecodeFront`:
                 // the device starts it while the host settles the previous
                 // layer's landings and queues that front.
-                submitter.flush()
+                let flushed = submitter.flush();
+                if flushed.is_ok() {
+                    submitter.mark_decode_landings_back_submitted();
+                }
+                flushed
             })();
             complete_decode_landings(finished);
             backed?;

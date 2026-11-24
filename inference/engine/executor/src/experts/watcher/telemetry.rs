@@ -7,7 +7,7 @@ use crate::operation::LaunchWork;
 use super::core::{Extents, Layer, RoutingRecord};
 use super::gate::HintGate;
 use super::passes::{DEPTHS, Measured, Pass, Passes, Routed, LAGS};
-use super::steps::{CompletedRoute, CompletedStep, DecodeRouting, Decoded, EndedReads, Recording, Step, Steps};
+use super::steps::{CompletedRoute, CompletedStep, DecodeDomain, DecodeRouting, Decoded, EndedReads, Recording, Step, Steps};
 use crate::assessment::{GroupLayerTerms, GroupUnion, LayerStep, Notice, RequestReads, Stages};
 use magnitude_cost_model::{ExpertLines, ExpertPass, FileLine, Hits, Miss, ReadLine};
 use crate::experts::Words;
@@ -1187,11 +1187,21 @@ struct Feed {
 /// merged at the layer, and the choices its rows routed to each expert read,
 /// in the read's order.
 enum Fed {
-    /// A decode read, counted with its step's launch where the step is
-    /// (`counted`), its step's selection keys where its launch wrote them
-    /// (`keys`), and its token clock position captured while the step was
-    /// still live on `Clock`'s ring (`clock`).
-    Decode { counted: Option<CountedLaunch>, keys: Option<std::sync::Arc<StepKeys>>, clock: Option<crate::experts::horizon::Tokens> },
+    /// A target decode (or grouped target verify) read, counted with its
+    /// step's launch where the step is (`counted`), its step's selection keys
+    /// where its launch wrote them (`keys`), and its target token-clock
+    /// position captured while the step was still live on `Clock`'s ring.
+    TargetDecode {
+        counted: Option<CountedLaunch>,
+        keys: Option<std::sync::Arc<StepKeys>>,
+        clock: crate::experts::horizon::Tokens,
+    },
+    /// A banked draft decode read (`StepRoute::DraftDecode`): updates shared
+    /// ranking and decode-depth accounting without a target clock stamp or
+    /// target shadow feed.
+    DraftDecode {
+        keys: Option<std::sync::Arc<StepKeys>>,
+    },
     Group { steps: usize, merged: usize, choices: Vec<u32> },
 }
 
@@ -2580,8 +2590,12 @@ impl Telemetry {
         let (mut decoded, mut unions) = (false, Vec::new());
         for (_, read, fed) in reads {
             match fed {
-                Fed::Decode { counted, keys, clock } => {
-                    stack.read_at_batched(&read, counted, keys.as_deref(), clock);
+                Fed::TargetDecode { counted, keys, clock } => {
+                    stack.read_target_batched(&read, counted, keys.as_deref(), clock);
+                    decoded = true;
+                }
+                Fed::DraftDecode { keys } => {
+                    stack.read_draft_batched(&read, keys.as_deref());
                     decoded = true;
                 }
                 Fed::Group { steps, merged, choices } => {
@@ -2680,14 +2694,14 @@ impl Telemetry {
                 // Its rows' keys, which placement ranks by and a recording
                 // load traces.
                 let keys = decoded.launch.map(|launch| std::sync::Arc::new(self.keys.read(steps, sequence, launch)));
-                if !decoded.draft {
+                if decoded.domain == DecodeDomain::TargetDecode {
                     if let Some(routes) = &self.routes {
                         let launch = decoded.launch.expect("a recording load's decode step has its launch");
                         routes.record(steps, sequence, launch, keys.as_deref().expect("a launch's keys"));
                     }
                 }
                 let selected = self.routing.selected;
-                let records = self.records(steps, sequence, decoded.draft);
+                let records = self.records(steps, sequence, decoded.domain == DecodeDomain::DraftDecode);
                 // Its front rows' guess kinds, as every record it wrote
                 // carries them.
                 let guesses = records.iter().filter_map(RoutingRecord::guesses).reduce(|first, other| {
@@ -2973,8 +2987,19 @@ impl Telemetry {
         }
         let chose = decoded.map(|((decoded, keys), routed, _, chose, _, _, guesses, row_experts)| {
             if work == LaunchWork::Generation {
-                let clock = decoded.launch.map(|_| self.horizon.lock().clock.at(sequence));
-                feed_decode(feed, routed, decoded, keys, clock);
+                match decoded.domain {
+                    DecodeDomain::TargetDecode => {
+                        // Target decode/verify steps are registered on the
+                        // target token clock; a missing stamp fails loudly.
+                        let clock = self.horizon.lock().clock.at(sequence);
+                        feed_target_decode(feed, routed, decoded, keys, clock);
+                    }
+                    DecodeDomain::DraftDecode => {
+                        // Banked draft steps share `Reuse` ranking/accounting
+                        // without touching the target token clock or shadows.
+                        feed_draft_decode(feed, routed, decoded.group, keys);
+                    }
+                }
             }
             DecodeRouting { chose, guesses, row_experts }
         });
@@ -3050,9 +3075,9 @@ impl Telemetry {
                 choices.into_iter().enumerate().filter(|&(_, count)| count > 0).unzip();
             let routed = choices.iter().map(|&count| u64::from(count)).sum();
             let read = RoutedRead { sequence: first + steps - 1, layer, experts, choices: routed };
-            let fed = match prompt {
-                true => Fed::Group { steps: steps as usize, merged, choices },
-                false => Fed::Decode { counted: None, keys: None, clock },
+            let fed = match clock {
+                None => Fed::Group { steps: steps as usize, merged, choices },
+                Some(clock) => Fed::TargetDecode { counted: None, keys: None, clock },
             };
             recorded.feed.pending.push((first, read, fed));
         }
@@ -3755,15 +3780,16 @@ fn served_within(cpu: u64, tiered: u64, absent: u64, layer: usize, sequence: Ste
     );
 }
 
-/// A completed decode step's routing at every layer, `routed`, is fed with
-/// its rows' keys `keys` where its launch wrote them; while its load
-/// records it, counted with its launch.
-fn feed_decode(
+/// A completed target decode step's routing at every layer, `routed`, is fed
+/// with its pre-captured target token-clock stamp `clock` and its rows' keys
+/// `keys` where its launch wrote them; while its load records it, counted with
+/// its launch.
+fn feed_target_decode(
     feed: &mut Feed,
     routed: Vec<RoutedRead>,
     decoded: Decoded,
     keys: Option<std::sync::Arc<StepKeys>>,
-    clock: Option<crate::experts::horizon::Tokens>,
+    clock: crate::experts::horizon::Tokens,
 ) {
     let Decoded { recording, launch, group, .. } = decoded;
     // A recorded decode step runs its launch (`ExpertStep::decoding`). Its
@@ -3775,7 +3801,21 @@ fn feed_decode(
         assert!(rows > 0, "a decode launch has an exact row");
         CountedLaunch { rows, tokens: launch.tokens }
     });
-    feed.pending.extend(routed.into_iter().map(|read| (group, read, Fed::Decode { counted, keys: keys.clone(), clock })));
+    feed.pending
+        .extend(routed.into_iter().map(|read| (group, read, Fed::TargetDecode { counted, keys: keys.clone(), clock })));
+}
+
+/// A completed banked draft decode step's routing at every layer, `routed`,
+/// enters the shared `Reuse` ranking/accounting path without a target token
+/// clock stamp or shadow feed.
+fn feed_draft_decode(
+    feed: &mut Feed,
+    routed: Vec<RoutedRead>,
+    group: Step,
+    keys: Option<std::sync::Arc<StepKeys>>,
+) {
+    feed.pending
+        .extend(routed.into_iter().map(|read| (group, read, Fed::DraftDecode { keys: keys.clone() })));
 }
 
 #[cfg(test)]

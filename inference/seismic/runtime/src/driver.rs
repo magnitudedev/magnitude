@@ -436,19 +436,11 @@ pub(crate) struct AccessGroup {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum DeviceQueue {
     Native(NativeQueue),
-    /// Host-to-device copies (`native::transfer`).
-    Transfer,
-}
-
-impl DeviceQueue {
-    const COUNT: usize = NativeQueue::ALL.len() + 1;
-
-    fn ordinal(self) -> usize {
-        match self {
-            Self::Native(queue) => queue as usize,
-            Self::Transfer => NativeQueue::ALL.len(),
-        }
-    }
+    /// Host-to-device copies (`native::transfer`), keyed by the producer
+    /// `TransferInner`'s unique queue ID so multiple independent transfer
+    /// streams (e.g. `Copies` and M7 decode demand DMA) never overwrite each
+    /// other's fences on a shared allocation.
+    Transfer(u64),
 }
 
 /// The newest submitted work of one queue that uses an allocation, until
@@ -480,24 +472,24 @@ impl QueueFences {
 /// The newest work of each queue still using an allocation: every device
 /// use ends once these have.
 #[derive(Default)]
-pub(crate) struct DeviceUses([Option<Arc<dyn DeviceCompletion>>; DeviceQueue::COUNT]);
+pub(crate) struct DeviceUses(Vec<Arc<dyn DeviceCompletion>>);
 
 impl DeviceUses {
     /// Block until every use ends, to release what they use
     /// ([`DeviceCompletion::retire`]).
     pub(crate) fn retire(&self) {
-        for fence in self.0.iter().flatten() {
+        for fence in &self.0 {
             fence.retire();
         }
     }
 
     fn is_empty(&self) -> bool {
-        self.0.iter().all(Option::is_none)
+        self.0.is_empty()
     }
 
     /// Whether every use has ended (completed or faulted). Never waits.
     pub(crate) fn ended(&self) -> bool {
-        self.0.iter().flatten().all(|fence| !matches!(fence.completed(), Ok(false)))
+        self.0.iter().all(|fence| !matches!(fence.completed(), Ok(false)))
     }
 }
 
@@ -531,8 +523,11 @@ impl Holders {
 struct AllocationAccess {
     host: Holders,
     device: Holders,
-    /// Per [`DeviceQueue`], by its ordinal.
-    queues: [QueueFences; DeviceQueue::COUNT],
+    /// Per [`NativeQueue`], by its discriminant.
+    native: [QueueFences; NativeQueue::ALL.len()],
+    /// Per independent transfer producer queue ID (`DeviceQueue::Transfer(id)`),
+    /// pruned once both `last_use` and `last_write` complete.
+    transfers: Vec<(u64, QueueFences)>,
     /// Whether the protocol of the work that uses it orders its accesses
     /// across device queues ([`Allocation::order_by_protocol`]).
     protocol: bool,
@@ -547,28 +542,51 @@ impl AllocationAccess {
     }
 
     fn queue(&mut self, queue: DeviceQueue) -> &mut QueueFences {
-        &mut self.queues[queue.ordinal()]
+        match queue {
+            DeviceQueue::Native(native) => &mut self.native[native as usize],
+            DeviceQueue::Transfer(id) => {
+                if let Some(pos) = self.transfers.iter().position(|(qid, _)| *qid == id) {
+                    &mut self.transfers[pos].1
+                } else {
+                    self.transfers.push((id, QueueFences::default()));
+                    &mut self.transfers.last_mut().expect("just pushed").1
+                }
+            }
+        }
     }
 
     fn prune(&mut self) {
-        self.queues.iter_mut().for_each(QueueFences::prune);
+        self.native.iter_mut().for_each(QueueFences::prune);
+        self.transfers.retain_mut(|(_, fences)| {
+            fences.prune();
+            fences.last_use.is_some() || fences.last_write.is_some()
+        });
     }
 
     /// A device fence host access of the given kind must wait for: a host
     /// write waits for every device use to end, a host read for device
-    /// writes to complete, of every queue.
+    /// writes to complete, of every queue (native and transfer).
     fn conflicting_device(&mut self, write: bool) -> Option<Arc<dyn DeviceCompletion>> {
         self.prune();
-        self.queues.iter().find_map(|fences| match write {
-            true => fences.last_use.clone(),
-            false => fences.last_write.clone(),
-        })
+        self.native
+            .iter()
+            .chain(self.transfers.iter().map(|(_, fences)| fences))
+            .find_map(|fences| match write {
+                true => fences.last_use.clone(),
+                false => fences.last_write.clone(),
+            })
     }
 
-    /// The newest use of each queue.
+    /// The newest use of each active queue (native and transfer).
     fn uses(&mut self) -> DeviceUses {
         self.prune();
-        DeviceUses(std::array::from_fn(|queue| self.queues[queue].last_use.clone()))
+        let uses = self
+            .native
+            .iter()
+            .chain(self.transfers.iter().map(|(_, fences)| fences))
+            .filter_map(|fences| fences.last_use.clone())
+            .collect();
+        DeviceUses(uses)
     }
 }
 
@@ -832,7 +850,7 @@ impl Allocation {
             .into_iter()
             .filter(|&other| other != queue)
             .filter_map(|other| {
-                let fences = &state.queues[DeviceQueue::Native(other).ordinal()];
+                let fences = &state.native[other as usize];
                 match write {
                     true => fences.last_use.clone(),
                     false => fences.last_write.clone(),
@@ -1657,7 +1675,7 @@ mod physical_slot_tests {
     fn transfer_beside_finished_compute(allocation: &Allocation, write: bool) -> Arc<TransferBatch> {
         allocation.record_device_use(DeviceQueue::Native(NativeQueue::Compute), Arc::new(PendingUse(Arc::new(AtomicBool::new(true)))), true);
         let batch = Arc::new(TransferBatch::default());
-        allocation.record_device_use(DeviceQueue::Transfer, Arc::new(TransferFence(batch.clone())), write);
+        allocation.record_device_use(DeviceQueue::Transfer(0), Arc::new(TransferFence(batch.clone())), write);
         batch
     }
 
@@ -1728,7 +1746,7 @@ mod physical_slot_tests {
         assert_eq!(order(NativeQueue::Compute, false), 1, "a read follows the other queue's write");
         assert_eq!(order(NativeQueue::Compute, true), 1);
         // The transfer queue's work is its caller's to order.
-        allocation.record_device_use(DeviceQueue::Transfer, pending(), true);
+        allocation.record_device_use(DeviceQueue::Transfer(0), pending(), true);
         assert_eq!(order(NativeQueue::Compute, true), 1, "no transfer fence orders native work");
         // Completed work orders nothing.
         read.0.store(true, Ordering::SeqCst);

@@ -449,7 +449,7 @@ impl Residency {
 
     /// A prompt group past cleared from the conveyor.
     fn clear(&mut self, turn: &mut Turn, _: Option<&Copier>, _: Option<&MissCurve>) -> bool {
-        turn.changed |= self.scratch.clear_past(&mut self.core);
+        turn.changed |= self.scratch.clear_past(&mut self.core, &self.shared);
         true
     }
 
@@ -584,7 +584,7 @@ impl Residency {
             listed.release(&mut self.scratch.conveyor);
         }
         // The tiers it is past place their seeds, which it is past too.
-        self.scratch.advance(progress, &mut self.core);
+        self.scratch.advance(progress, &mut self.core, &self.shared);
         self.core.directory.drain_staging_with(progress, &self.core.steps, |group, slot| {
             self.shared
                 .transport

@@ -44,6 +44,30 @@ pub enum TransferItem<'a> {
     Signal { word: &'a Buffer, offset: u64, value: u32 },
 }
 
+/// Whether a failed [`TransferQueue::copy`] / [`TransferQueue::copy_event`]
+/// was refused before any item reached the stream, or failed after queuing
+/// began (so earlier items of the batch may already be in flight on the now-
+/// faulted stream).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum CopyError {
+    /// Refused before any item was queued on the stream (invalid item,
+    /// event-allocation failure, or queue already faulted). No completion
+    /// value was consumed and no stream work was issued for this call.
+    RefusedBeforeIssue(ExecutionError),
+    /// A driver call failed after queuing began; the queue is now faulted
+    /// and earlier items of the batch may still be in flight until the stream
+    /// drains or the context is lost.
+    PossiblyIssued(ExecutionError),
+}
+
+impl CopyError {
+    pub fn into_execution(self) -> ExecutionError {
+        match self {
+            Self::RefusedBeforeIssue(error) | Self::PossiblyIssued(error) => error,
+        }
+    }
+}
+
 /// Why a driver before API 11.7 has no transfer queue.
 const PREDATES_STREAM_VALUES: &str =
     "the CUDA driver predates driver API 11.7 stream memory operations: no transfer signals its completion";
@@ -112,11 +136,12 @@ impl TransferQueue {
     /// they and every batch queued before have landed. A batch that is
     /// invalid (a run between host memory or outside its buffers, a signal
     /// outside its buffer or unaligned), or one offered to a faulted queue,
-    /// is refused before anything is queued; once queuing begins the batch
-    /// is the queue's, and a driver call that fails then faults the queue
-    /// ([`Self::completed`]). The caller keeps every run's bytes untouched
-    /// until the batch is complete.
-    pub fn copy(&self, items: &[TransferItem<'_>], value: u32) -> Result<(), ExecutionError> {
+    /// is refused before anything is queued; once queuing begins, a driver
+    /// call that fails faults the queue ([`Self::completed`]) and returns
+    /// `Err` immediately so callers never observe a successful ticket or an
+    /// unrecorded event. The caller keeps every run's bytes untouched until
+    /// the batch is complete or the faulted stream has drained.
+    pub fn copy(&self, items: &[TransferItem<'_>], value: u32) -> Result<(), CopyError> {
         self.copy_inner(items, value, false).map(|_| ())
     }
 
@@ -124,23 +149,34 @@ impl TransferQueue {
     /// transfer stream right after the batch's copies so a compute
     /// [`crate::direct::DirectBatch::follow_event`] can wait on it via
     /// `cuStreamWaitEvent` with zero host round-trip and zero `cuStreamWaitValue32`.
-    pub fn copy_event(&self, items: &[TransferItem<'_>], value: u32) -> Result<Arc<Event>, ExecutionError> {
+    pub fn copy_event(&self, items: &[TransferItem<'_>], value: u32) -> Result<Arc<Event>, CopyError> {
         self.copy_inner(items, value, true)
             .map(|event| event.expect("copy_inner with record_event=true returns an event"))
     }
 
-    fn copy_inner(&self, items: &[TransferItem<'_>], value: u32, record_event: bool) -> Result<Option<Arc<Event>>, ExecutionError> {
-        let checked = items.iter().map(Self::check).collect::<Result<Vec<_>, _>>()?;
+    fn copy_inner(&self, items: &[TransferItem<'_>], value: u32, record_event: bool) -> Result<Option<Arc<Event>>, CopyError> {
+        let checked = items
+            .iter()
+            .map(Self::check)
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(CopyError::RefusedBeforeIssue)?;
         let event = if record_event {
-            Some(Arc::new(Event::sync_only(self.device.context()).map_err(submission)?))
+            Some(Arc::new(
+                Event::sync_only(self.device.context())
+                    .map_err(submission)
+                    .map_err(CopyError::RefusedBeforeIssue)?,
+            ))
         } else {
             None
         };
         let mut faulted_now = false;
+        let mut failure = None;
         {
             let mut state = self.state.lock().expect("transfer queue lock is never poisoned");
             if let Some(reason) = state.fault.as_deref() {
-                return Err(ExecutionError::SubmissionFailed(format!("the transfer queue faulted: {reason}")));
+                return Err(CopyError::RefusedBeforeIssue(ExecutionError::SubmissionFailed(format!(
+                    "the transfer queue faulted: {reason}"
+                ))));
             }
             let queued = self
                 .queue(&checked, value)
@@ -174,6 +210,7 @@ impl TransferQueue {
                     state.fault = Some(error.to_string());
                     self.faulted.store(true, Ordering::Release);
                     faulted_now = true;
+                    failure = Some(error);
                 }
             }
         }
@@ -181,6 +218,9 @@ impl TransferQueue {
             // Its waiters learn the fault now ([`Self::completed`]), with
             // `state` already released and `faulted` published.
             self.done.wake();
+        }
+        if let Some(error) = failure {
+            return Err(CopyError::PossiblyIssued(error));
         }
         Ok(event)
     }

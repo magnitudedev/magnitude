@@ -241,15 +241,23 @@ pub(super) struct BankRecords {
     /// `LinkMover` stages Host-RAM misses even when `lent == 0` or on
     /// non-lender groups. Empty (`0..0`) on unified memory or whole banks.
     stage_rings: Vec<std::ops::Range<usize>>,
-    /// Whether a prompt group's scratch lease is currently active on `0..lent`.
-    /// While `false` (decode), `0..lent` are usable for permanent decode
-    /// residency and counted in [`Self::capacity`]; while `true` (prefill),
+    /// Active prompt group's scratch lease on `0..lent`, recording the exact
+    /// bank record indices this group actually acquired into `Record::Lent`.
+    /// While `None` (decode), `0..lent` are usable for permanent decode
+    /// residency and counted in [`Self::capacity`]; while `Some` (prefill),
     /// `0..lent` are excluded from [`Self::usable`] and [`Self::capacity`] and
-    /// held exclusively for the prompt group's scratch until [`Self::unlend`].
-    leasing: bool,
+    /// held exclusively until [`Self::unlend`] returns the exact acquired
+    /// records (never touching slots that stayed pinned in another state).
+    active_lease: Option<ActiveLease>,
     /// Bumped as any expert comes to be held or leaves: what each layer
     /// holds changed since a reader last saw it ([`Self::holdings`]).
     holdings: u64,
+}
+
+/// Exact bank records acquired by the active prompt group's scratch lease.
+struct ActiveLease {
+    group: Step,
+    records: Vec<usize>,
 }
 
 impl BankRecords {
@@ -301,7 +309,7 @@ impl BankRecords {
             changed: false,
             tier,
             stage_rings,
-            leasing: false,
+            active_lease: None,
             holdings: 0,
         }
     }
@@ -486,7 +494,7 @@ impl BankRecords {
     /// [`Self::usable`], also excluding `0..lent` when `lending` is true
     /// (a prompt group has begun under `Steps`'s lock even before `lease()`).
     pub fn usable_when(&self, group: usize, record: usize, lending: bool) -> bool {
-        (!(self.leasing || lending) || !self.lends(group, record))
+        (!(self.active_lease.is_some() || lending) || !self.lends(group, record))
             && !self.is_stage_slot(group, record)
     }
 
@@ -510,7 +518,7 @@ impl BankRecords {
     /// (`!self.leasing`), `0..lent` are reclaimed for permanent decode
     /// residency and demand-landing slots share the unified pool.
     pub fn capacity(&self, group: usize) -> usize {
-        let lent = if self.leasing { self.seeded_from(group) } else { 0 };
+        let lent = if self.active_lease.is_some() { self.seeded_from(group) } else { 0 };
         self.groups[group].present
             - lent
             - self.stage_rings[group].len()
@@ -1244,7 +1252,11 @@ impl BankRecords {
             assert!(exits.is_empty(), "exits from lent records where none is lent");
             return left;
         };
-        self.leasing = true;
+        let lease_group = scratch_group.first();
+        match &self.active_lease {
+            Some(lease) => assert_eq!(lease.group, lease_group, "a second prompt group leased before unlend"),
+            None => self.active_lease = Some(ActiveLease { group: lease_group, records: Vec::new() }),
+        }
         for record in 0..records {
             if !can_reuse(group, record) {
                 continue;
@@ -1275,7 +1287,12 @@ impl BankRecords {
                 | Record::Pending { .. } => continue,
                 other => panic!("lent record {record} leased from {other:?}"),
             }
-            self.set(group, record, Record::Lent { from: scratch_group.first() });
+            self.set(group, record, Record::Lent { from: lease_group });
+            self.active_lease
+                .as_mut()
+                .expect("active_lease initialized above")
+                .records
+                .push(record);
         }
         assert!(exits.is_empty(), "exits of experts no lent record holds: {exits:?}");
         left
@@ -1287,19 +1304,27 @@ impl BankRecords {
         self.lent().is_none_or(|(group, records)| self.groups[group].lent == records)
     }
 
-    /// The prompt group the records were leased to is past: every one is
-    /// free and returned to permanent decode residency.
+    /// The prompt group the records were leased to is past (or cancelled
+    /// while partially granted): return ONLY the exact records this group
+    /// actually acquired into `Record::Lent` back to `Record::Free`, leaving
+    /// any skipped/transport-pinned slots untouched.
     pub fn unlend(&mut self) {
-        self.leasing = false;
-        let Some((group, records)) = self.lent() else {
+        let Some(lease) = self.active_lease.take() else {
             return;
         };
-        for record in 0..records {
+        let Some((group, _)) = self.lent() else {
+            return;
+        };
+        for record in lease.records {
             match self.groups[group].contents[record] {
-                Record::Lent { .. } => self.set(group, record, Record::Free),
+                Record::Lent { from } => {
+                    assert_eq!(from, lease.group, "lent record {record} belonged to group {from}, not {}", lease.group);
+                    self.set(group, record, Record::Free);
+                }
                 other => panic!("lent record {record} returns from {other:?}"),
             }
         }
+        debug_assert_eq!(self.groups[group].lent, 0, "unlend must release every Record::Lent in group {group}");
     }
 
     /// The records of group `group` a shrink may evict now, beside running
@@ -1542,6 +1567,51 @@ mod tests {
         assert!(!bank.leased());
         assert_eq!(bank.capacity(0), 4);
         assert!(bank.usable(0, 0) && bank.usable(0, 1));
+    }
+
+    /// Regression test (`mx5stm`): cancelling a partially granted prompt group
+    /// when a lent slot was skipped by `can_reuse == false` (transport-pinned)
+    /// must NOT panic in `unlend()`, must return ONLY the exact slots this
+    /// group actually acquired, and must leave pinned `Held` / `Free` slots
+    /// untouched.
+    #[test]
+    fn unlend_cancelling_partially_granted_prompt_preserves_transport_pinned_slots() {
+        // Case 1: lent slot 0 is Held and transport-pinned (`can_reuse == false`),
+        // lent slot 1 is Free and granted (`Record::Lent`).
+        let (mut bank, view) = bank();
+        bank.hold((0, 4), 0);
+        bank.map((0, 4), 0, MapStep::EVERY);
+
+        let left = bank.lease_with(ScratchGroup::at(3, 2), Vec::new(), |_group, record| record != 0);
+        assert!(left.is_empty(), "pinned Held slot 0 must not be evicted");
+        assert!(!bank.leased(), "partial grant leaves leased() false");
+        assert_eq!(bank.records(0)[0], Record::Held((0, 4)));
+        assert_eq!(bank.records(0)[1], Record::Lent { from: 3 });
+
+        // Cancel the partially granted prompt group: unlend must return ONLY slot 1.
+        bank.unlend();
+        assert_eq!(bank.records(0)[0], Record::Held((0, 4)), "pinned Held slot 0 must remain Held");
+        assert_eq!(bank.records(0)[1], Record::Free, "acquired Lent slot 1 must return to Free");
+        assert_eq!(view.resolve(4, 3), Some(0), "pinned expert map entry must remain intact");
+        assert_eq!(bank.capacity(0), 4);
+        assert!(bank.usable(0, 0) && bank.usable(0, 1));
+
+        // Case 2: lent slot 1 is Free and transport-pinned (`can_reuse == false`),
+        // lent slot 0 is Held and granted (`Record::Lent`).
+        let left2 = bank.lease_with(
+            ScratchGroup::at(5, 2),
+            vec![Exit::to_file((0, 4))],
+            |_group, record| record != 1,
+        );
+        assert_eq!(left2, vec![(0, 4)]);
+        assert!(!bank.leased());
+        assert_eq!(bank.records(0)[0], Record::Lent { from: 5 });
+        assert_eq!(bank.records(0)[1], Record::Free);
+
+        bank.unlend();
+        assert_eq!(bank.records(0)[0], Record::Free);
+        assert_eq!(bank.records(0)[1], Record::Free);
+        assert_eq!(bank.capacity(0), 4);
     }
 
     /// The lease takes every lent record at once, a home one held unmapped for

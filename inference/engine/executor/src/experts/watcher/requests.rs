@@ -279,11 +279,10 @@ impl Requests {
             }
             // Poll completed prefill `Pass` signals outside `residency`'s lock
             // and `NoBlockingAllocationGuard` so CUDA event teardown never runs
-            // under a mutex.
+            // under a mutex. Do NOT call `end_serving` yet: apply drained
+            // lifecycle events (including `Quarantined`) under `residency`
+            // first so `ScratchRing` never drops a quarantine.
             let (completed_passes, pass_error) = self.shared.transport.poll_completed_passes();
-            if let Some(error) = pass_error {
-                self.shared.end_serving(format!("a prefill pass failed: {error}"));
-            }
             // The look runs once the service is counted waiting for
             // residency, so the keeper starts no job before its pass.
             let began = Began { ended, looked: Instant::now() };
@@ -295,22 +294,29 @@ impl Requests {
                     posted = p;
                     scratch_arrived = s;
                 });
+                let released_passes = apply_polled_passes(
+                    &mut held,
+                    &self.shared,
+                    &completed_passes,
+                    pass_error,
+                );
                 // When the pass holds residency, for the read timeline: the
                 // look's requests wait for it, their reads already running.
                 for request in &posted {
                     seismic_io::timeline::note(seismic_io::timeline::Kind::Noted("held"), request.sequence, (request.layer as i64, 0, 0));
                 }
                 let mut service = self.service.lock().expect("the request service is never left by a panic");
-                let progressed = match self.shared.life.ended() {
-                    // Serving ended: each request the look posted is given
-                    // up, its reads' staging freed as they end, and refused.
-                    Some(_) => {
-                        let held = &mut *held;
-                        let gave_up = posted.into_iter().fold(false, |gave_up, request| request.give_up(&mut held.core, &held.prefetch, &self.shared) | gave_up);
-                        liveness::refuse(&held.core, &self.shared) | gave_up
-                    }
-                    None => self.pass(&mut service, &mut held, posted, &mut scratch_arrived, &completed_passes),
-                };
+                let progressed = released_passes
+                    | match self.shared.life.ended() {
+                        // Serving ended: each request the look posted is given
+                        // up, its reads' staging freed as they end, and refused.
+                        Some(_) => {
+                            let held = &mut *held;
+                            let gave_up = posted.into_iter().fold(false, |gave_up, request| request.give_up(&mut held.core, &held.prefetch, &self.shared) | gave_up);
+                            liveness::refuse(&held.core, &self.shared) | gave_up
+                        }
+                        None => self.pass(&mut service, &mut held, posted, &mut scratch_arrived, released_passes),
+                    };
                 (progressed, self.polls(&held))
             };
             ended = Instant::now();
@@ -378,7 +384,7 @@ impl Requests {
         residency: &mut Residency,
         posted: Vec<Posted>,
         scratch_arrived: &mut [Option<Instant>],
-        completed_passes: &[crate::experts::transport::PassReaderEvent],
+        released_passes: bool,
     ) -> bool {
         // A panic of the executor's work, or the device lost under the
         // parks, ends serving, as the service's own panic does.
@@ -388,11 +394,9 @@ impl Requests {
         // A growth's slots joined since are landed into and hinted into
         // from this pass on.
         let joined = residency.join();
-        // Apply prefill `Pass` GPU reader lifecycle events (retiring a
-        // generation's `ScratchRing` slots + `WindowTable` only once its last
-        // registered GPU reader AND producer DMA batches finish), and settle
-        // `PrefillFill` DMA batches on `Copies`.
-        let released = residency.scratch.release_passes(completed_passes, &residency.core)
+        // Settle `PrefillFill` DMA batches on `Copies` (prefill `Pass` GPU
+        // reader lifecycle events were already applied in `apply_polled_passes`).
+        let released = released_passes
             | residency.scratch.settle_prefill_copies(&mut residency.core, &self.shared);
         let refilled = if residency.core.extents.tier_copy_dma && residency.core.directory.refill_short() {
             residency.refill_tier()
@@ -554,6 +558,39 @@ impl Requests {
     }
 }
 
+/// Apply drained prefill `Pass` reader lifecycle events under `residency`
+/// BEFORE ending serving on any `pass_error`.
+///
+/// Ordering matters: a failed GPU `Pass` poll emits `PassReaderEvent::Quarantined`
+/// alongside `Some(error)`. Applying the events first guarantees `ScratchRing`
+/// always quarantines the generation (even if `Registered` + `Closed` +
+/// `Quarantined` arrived together in the same poll) before `end_serving`
+/// switches the request loop to the ended-serving branch.
+fn apply_polled_passes(
+    residency: &mut Residency,
+    shared: &Shared,
+    completed_passes: &[crate::experts::transport::PassReaderEvent],
+    pass_error: Option<String>,
+) -> bool {
+    apply_polled_passes_with(
+        || residency.scratch.release_passes(completed_passes, &residency.core),
+        pass_error,
+        |reason| shared.end_serving(reason),
+    )
+}
+
+fn apply_polled_passes_with(
+    apply_events: impl FnOnce() -> bool,
+    pass_error: Option<String>,
+    end_serving: impl FnOnce(String),
+) -> bool {
+    let released = apply_events();
+    if let Some(error) = pass_error {
+        end_serving(format!("a prefill pass failed: {error}"));
+    }
+    released
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -580,5 +617,56 @@ mod tests {
         assert_eq!(rest.looked(Looked::Empty(look), None), None, "no rest where the poller waits on events");
         rest.begin(Phase::Decode);
         assert_eq!(rest.looked(Looked::Empty(look), decode), Some(Duration::ZERO), "a decode begun again counts from its start");
+    }
+
+    /// Regression test (`m8ked4`): a failed GPU `Pass` poll emits
+    /// `PassReaderEvent::Quarantined` alongside `Some(error)`. Drained pass
+    /// lifecycle events MUST be applied before `end_serving` runs so
+    /// `Quarantined` is never skipped by the ended-serving branch.
+    #[test]
+    fn failed_gpu_pass_poll_applies_quarantined_before_end_serving() {
+        use crate::experts::transport::{PassKey, PassReaderEvent, ReaderId, ScratchGenId};
+
+        let key = PassKey {
+            generation: ScratchGenId(1),
+            group: 1,
+            layer: 0,
+            set_start: 0,
+            window: 0,
+        };
+        let events = vec![
+            PassReaderEvent::Registered { key, reader: ReaderId(1) },
+            PassReaderEvent::Closed { key },
+            PassReaderEvent::Quarantined { key },
+        ];
+        let order = std::cell::RefCell::new(Vec::<&'static str>::new());
+        let saw_quarantined = std::cell::Cell::new(false);
+        let ended_reason = std::cell::RefCell::new(None::<String>);
+
+        let released = apply_polled_passes_with(
+            || {
+                assert!(ended_reason.borrow().is_none(), "lifecycle events must run before end_serving");
+                for &event in &events {
+                    if matches!(event, PassReaderEvent::Quarantined { .. }) {
+                        saw_quarantined.set(true);
+                    }
+                }
+                order.borrow_mut().push("apply_events");
+                false
+            },
+            Some("cuEventSynchronize failed".into()),
+            |reason| {
+                assert!(saw_quarantined.get(), "Quarantined must be applied before end_serving");
+                order.borrow_mut().push("end_serving");
+                *ended_reason.borrow_mut() = Some(reason);
+            },
+        );
+
+        assert!(!released);
+        assert_eq!(*order.borrow(), vec!["apply_events", "end_serving"]);
+        assert_eq!(
+            ended_reason.borrow().as_deref(),
+            Some("a prefill pass failed: cuEventSynchronize failed")
+        );
     }
 }

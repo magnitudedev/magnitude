@@ -315,6 +315,27 @@ impl ExpertBank {
         self.watcher.finish_demand_landings(layer, sequence, &demand_slots);
     }
 
+    /// Explicitly abort a decode DMA landing whose `DecodeBack` was never
+    /// submitted: waits on the copy stream outside all residency locks,
+    /// returns only proven-completed slots to `Directory`, and quarantines
+    /// uncertain/timed-out slots.
+    pub(crate) fn abort_decode_landing(&self, landing: super::transport::DecodeLanding, reason: &str) {
+        let transport = &self.transport;
+        landing.abort(
+            reason,
+            |value| transport.wait_decode_dma(value, std::time::Duration::from_secs(5)),
+            &mut |aborted| self.watcher.abort_demand_slots(aborted),
+        );
+    }
+
+    /// Quarantine a decode DMA landing whose GPU completion is unproven (e.g.
+    /// `wait_all` failed after `DecodeBack` submission) without freeing any
+    /// uncertain slots back to `Directory`.
+    pub(crate) fn quarantine_decode_landing(&self, landing: super::transport::DecodeLanding, reason: &str) {
+        landing.quarantine(reason);
+        self.transport.drain_deferred_syncs();
+    }
+
     /// Whether prefill fills copy host-tier experts into VRAM scratch via
     /// producer-enqueued hardware DMA instead of SM zero-copy `routed_copy`.
     pub fn tier_copy_dma(&self) -> bool {

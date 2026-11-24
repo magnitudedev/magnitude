@@ -99,6 +99,14 @@ impl ConsumerLease {
             self.transport.detach_consumer(self.transfer_id, self.consumer_id);
         }
     }
+
+    /// Disarm this lease without detaching its consumer pin in `Registry`.
+    /// Used when handing uncertain work to `ExpertTransport`'s retirement
+    /// quarantine so the destination slot remains permanently pinned without
+    /// creating an `Arc<ExpertTransport>` reference cycle.
+    fn disarm(mut self) {
+        self.active = false;
+    }
 }
 
 impl Drop for ConsumerLease {
@@ -149,45 +157,565 @@ impl Drop for DemandFlightGuard {
     }
 }
 
+/// Explicit lifecycle state of one batch inside an [`IssuedDemandBatch`]
+/// transaction.
+///
+/// Enforces that only proven-unissued or proven-completed batches (before
+/// `DecodeBack` submission) can return slots to `Directory`, while any
+/// `PartiallyIssued` (mid-batch failure / unknown hardware state) or
+/// timed-out/errored batch is unconditionally quarantined.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum DemandBatchState {
+    /// Own-write slots claimed from `Directory`; no hardware copy call has
+    /// started yet. Safe to abort immediately back to `Directory` without
+    /// waiting on the copy stream.
+    Unissued,
+    /// Own-write hardware copy/record call was attempted and failed (or was
+    /// interrupted mid-issue). Accepted copies may exist beyond the last
+    /// recorded timeline value; these slots MUST be quarantined and NEVER
+    /// freed early.
+    PartiallyIssued,
+    /// Own-write batch accepted by the copy stream at timeline `value`.
+    /// Ordered prefix on this producer: waiting for `value` (`Ok(true)`)
+    /// proves this batch and all earlier `Submitted` batches have finished
+    /// writing, provided `DecodeBack` has not been submitted.
+    Submitted { value: u64 },
+    /// Joined an existing in-flight or landed transfer owned by another
+    /// producer (`LinkMover` or another demand flight). Holds only reader
+    /// pins (`ConsumerLease`); never owns the destination write or slot
+    /// lifecycle.
+    JoinedExisting,
+    /// Terminal state: all leases detached or handed to retirement, and safe
+    /// slots returned.
+    Retired,
+}
+
+/// Whether `DecodeBack` compute has been submitted to read an
+/// [`IssuedDemandBatch`]'s landed/joined slots.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ComputeUse {
+    /// Only the copy stream has touched own-write slots; `DecodeBack` has not
+    /// been submitted yet.
+    BeforeBack,
+    /// `DecodeBack` has been submitted on the compute stream to read these
+    /// slots. Copy completion alone is insufficient until compute completes.
+    BackSubmitted,
+}
+
+enum DemandBatchPayload {
+    /// Own H2D write batch: owns the `DemandLanding` slots, `TransferId`s,
+    /// owner leases, and source/destination tensor backing.
+    OwnWrite {
+        slots: Vec<DemandSlot>,
+        transfer_ids: Vec<TransferId>,
+        owner_leases: Vec<ConsumerLease>,
+        backing: Vec<Tensor>,
+    },
+    /// Joined existing transfer(s): holds only reader pins (`ConsumerLease`).
+    Joined {
+        reader_leases: Vec<ConsumerLease>,
+    },
+}
+
+struct DemandBatch {
+    state: DemandBatchState,
+    payload: DemandBatchPayload,
+}
+
+/// Single-owner RAII transaction for one layer's on-demand decode DMA landing,
+/// from first slot claim through `DecodeLanding` and final retirement.
+///
+/// - Tracks explicit per-batch states (`Unissued`, `PartiallyIssued`,
+///   `Submitted`, `JoinedExisting`, `Retired`) and distinguishes own writes
+///   from joined consumers.
+/// - Retains source pins, destination backing, and reader pins until last use.
+/// - Explicit `abort(...)` runs outside residency/queue locks and only returns
+///   proven-safe slots to `Directory`.
+/// - `Drop` hands any unretired/uncertain work to `ExpertTransport`'s
+///   retirement quarantine without blocking or panicking.
+/// - Happy path transfers ownership into [`DecodeLanding`] with zero extra
+///   descriptor allocations and zero per-expert synchronization.
+pub(crate) struct IssuedDemandBatch {
+    transport: Arc<ExpertTransport>,
+    layer: usize,
+    sequence: u64,
+    compute_use: ComputeUse,
+    joined_syncs: Vec<TransferSync>,
+    latest_dma_sync: Option<TransferSync>,
+    batches: Vec<DemandBatch>,
+    _flight: Option<DemandFlightGuard>,
+}
+
+impl IssuedDemandBatch {
+    /// Start a new owning demand transaction for `(layer, sequence)`.
+    pub(crate) fn new(transport: Arc<ExpertTransport>, layer: usize, sequence: u64) -> Self {
+        let flight = DemandFlightGuard::new(Arc::clone(&transport));
+        Self {
+            transport,
+            layer,
+            sequence,
+            compute_use: ComputeUse::BeforeBack,
+            joined_syncs: Vec::new(),
+            latest_dma_sync: None,
+            batches: Vec::new(),
+            _flight: Some(flight),
+        }
+    }
+
+    /// Record a joined consumer lease (and optional cross-stream sync) for an
+    /// existing transfer owned by another producer (`JoinedExisting`).
+    pub(crate) fn record_joined(&mut self, lease: ConsumerLease, sync: Option<TransferSync>) {
+        if let Some(sync) = sync {
+            if !self.joined_syncs.iter().any(|seen| seen.same_batch(&sync)) {
+                self.joined_syncs.push(sync);
+            }
+        }
+        if let Some(DemandBatch {
+            state: DemandBatchState::JoinedExisting,
+            payload: DemandBatchPayload::Joined { reader_leases },
+        }) = self.batches.iter_mut().find(|b| b.state == DemandBatchState::JoinedExisting)
+        {
+            reader_leases.push(lease);
+        } else {
+            self.batches.push(DemandBatch {
+                state: DemandBatchState::JoinedExisting,
+                payload: DemandBatchPayload::Joined { reader_leases: vec![lease] },
+            });
+        }
+    }
+
+    /// Claim an own-write batch in state `Unissued`, before any hardware copy
+    /// call has started. Returns its batch index.
+    pub(crate) fn claim_own_batch(
+        &mut self,
+        slots: Vec<DemandSlot>,
+        transfer_ids: Vec<TransferId>,
+        owner_leases: Vec<ConsumerLease>,
+        backing: Vec<Tensor>,
+    ) -> usize {
+        let idx = self.batches.len();
+        self.batches.push(DemandBatch {
+            state: DemandBatchState::Unissued,
+            payload: DemandBatchPayload::OwnWrite {
+                slots,
+                transfer_ids,
+                owner_leases,
+                backing,
+            },
+        });
+        idx
+    }
+
+    /// Transition an `Unissued` own-write batch to `PartiallyIssued` right
+    /// before attempting the hardware copy/record call.
+    pub(crate) fn begin_issue(&mut self, idx: usize) {
+        let batch = &mut self.batches[idx];
+        assert_eq!(batch.state, DemandBatchState::Unissued, "begin_issue requires Unissued batch");
+        batch.state = DemandBatchState::PartiallyIssued;
+    }
+
+    /// Revert a `PartiallyIssued` own-write batch back to `Unissued` when
+    /// `copy_synced` returned a pre-issue refusal (`TransferError::refused_before_issue`),
+    /// proving zero copies of this batch reached the device stream so `abort`
+    /// unwinds it through pin-aware release without quarantining it.
+    pub(crate) fn mark_refused_before_issue(&mut self, idx: usize) {
+        let batch = &mut self.batches[idx];
+        assert_eq!(
+            batch.state,
+            DemandBatchState::PartiallyIssued,
+            "mark_refused_before_issue requires PartiallyIssued batch"
+        );
+        batch.state = DemandBatchState::Unissued;
+    }
+
+    /// Borrow the source/destination backing tensors of an own-write batch
+    /// (`[src0, dst0, src1, dst1, ...]`) to construct `TransferItem` runs
+    /// without cloning.
+    fn own_backing(&self, idx: usize) -> &[Tensor] {
+        match &self.batches[idx].payload {
+            DemandBatchPayload::OwnWrite { backing, .. } => backing,
+            DemandBatchPayload::Joined { .. } => unreachable!("own_backing called on Joined batch"),
+        }
+    }
+
+    /// Transition a `PartiallyIssued` own-write batch to `Submitted { value }`
+    /// after the hardware copy stream accepted all copies and recorded `sync`.
+    pub(crate) fn mark_submitted(&mut self, idx: usize, value: u64, sync: Option<TransferSync>) {
+        let batch = &mut self.batches[idx];
+        assert_eq!(batch.state, DemandBatchState::PartiallyIssued, "mark_submitted requires PartiallyIssued batch");
+        if let Some(sync) = sync {
+            if let DemandBatchPayload::OwnWrite { transfer_ids, .. } = &batch.payload {
+                for &id in transfer_ids {
+                    self.transport.attach_sync(id, sync.clone());
+                }
+            }
+            self.latest_dma_sync = Some(sync);
+        }
+        batch.state = DemandBatchState::Submitted { value };
+    }
+
+    /// Record that `DecodeBack` has been submitted on the compute stream to
+    /// read this transaction's slots. Copy completion alone is no longer
+    /// sufficient to retire or free storage.
+    pub(crate) fn mark_back_submitted(&mut self) {
+        self.compute_use = ComputeUse::BackSubmitted;
+    }
+
+    pub(crate) fn compute_use(&self) -> ComputeUse {
+        self.compute_use
+    }
+
+    /// Highest timeline value among all `Submitted` own-write batches on this
+    /// producer. Proves only an ordered prefix of `Submitted` batches; never
+    /// proves a `PartiallyIssued` batch that errored mid-issue.
+    pub(crate) fn highest_submitted(&self) -> Option<u64> {
+        self.batches
+            .iter()
+            .filter_map(|b| match b.state {
+                DemandBatchState::Submitted { value } => Some(value),
+                _ => None,
+            })
+            .max()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn batch_states(&self) -> Vec<DemandBatchState> {
+        self.batches.iter().map(|b| b.state).collect()
+    }
+
+    /// Explicitly abort this transaction outside all residency/queue locks.
+    ///
+    /// - If `DecodeBack` has already been submitted (`ComputeUse::BackSubmitted`),
+    ///   copy completion alone is insufficient: all own writes and reader pins
+    ///   are quarantined and zero slots are returned to `Directory`.
+    /// - Otherwise (`ComputeUse::BeforeBack`):
+    ///   - Waits once on [`Self::highest_submitted`] outside locks.
+    ///   - `Unissued` batches return their slots to `abort_slots` immediately.
+    ///   - `Submitted` batches return their slots ONLY if `wait_dma` returned
+    ///     `Ok(true)`; on timeout (`Ok(false)`) or `Err(_)`, they are
+    ///     quarantined with their backing/pins retained.
+    ///   - `PartiallyIssued` batches are ALWAYS quarantined with their
+    ///     backing/pins retained (never returned to `abort_slots`), even if
+    ///     earlier `Submitted` batches completed.
+    ///   - `JoinedExisting` batches release ONLY our own reader pins without
+    ///     disturbing the writer or other readers.
+    pub(crate) fn abort(
+        &mut self,
+        reason: &str,
+        wait_dma: impl FnOnce(u64) -> Result<bool, String>,
+        abort_slots: &mut impl FnMut(&[(usize, usize)]),
+    ) {
+        if self.batches.iter().all(|b| b.state == DemandBatchState::Retired) {
+            self._flight.take();
+            return;
+        }
+        if self.compute_use == ComputeUse::BackSubmitted {
+            self.quarantine(reason);
+            self.transport.drain_deferred_syncs();
+            return;
+        }
+
+        let highest = self.highest_submitted();
+        let prefix_proven = match highest {
+            Some(value) => matches!(wait_dma(value), Ok(true)),
+            None => true,
+        };
+
+        let mut slots_to_abort: Vec<(usize, usize)> = Vec::new();
+        let mut any_quarantined = false;
+
+        for batch in &mut self.batches {
+            match batch.state {
+                DemandBatchState::Retired => {}
+                DemandBatchState::Unissued => {
+                    if let DemandBatchPayload::OwnWrite {
+                        slots,
+                        transfer_ids,
+                        owner_leases,
+                        backing,
+                    } = &mut batch.payload
+                    {
+                        self.transport.cancel_unissued_dma(transfer_ids, owner_leases);
+                        slots_to_abort.extend(slots.drain(..).map(|s| (s.group, s.slot)));
+                        backing.clear();
+                    }
+                    batch.state = DemandBatchState::Retired;
+                }
+                DemandBatchState::Submitted { .. } => {
+                    if let DemandBatchPayload::OwnWrite {
+                        slots,
+                        transfer_ids,
+                        owner_leases,
+                        backing,
+                    } = &mut batch.payload
+                    {
+                        if prefix_proven {
+                            for id in transfer_ids.drain(..) {
+                                self.transport.complete_dma(id);
+                            }
+                            for lease in owner_leases.drain(..) {
+                                lease.release();
+                            }
+                            slots_to_abort.extend(slots.drain(..).map(|s| (s.group, s.slot)));
+                            backing.clear();
+                        } else {
+                            let msg = format!("{reason}; prior H2D wait did not confirm completion");
+                            self.transport.quarantine_uncertain_own(
+                                transfer_ids,
+                                owner_leases,
+                                backing,
+                                &msg,
+                            );
+                            slots.clear();
+                            any_quarantined = true;
+                        }
+                    }
+                    batch.state = DemandBatchState::Retired;
+                }
+                DemandBatchState::PartiallyIssued => {
+                    if let DemandBatchPayload::OwnWrite {
+                        slots,
+                        transfer_ids,
+                        owner_leases,
+                        backing,
+                    } = &mut batch.payload
+                    {
+                        self.transport.quarantine_uncertain_own(
+                            transfer_ids,
+                            owner_leases,
+                            backing,
+                            reason,
+                        );
+                        slots.clear();
+                        any_quarantined = true;
+                    }
+                    batch.state = DemandBatchState::Retired;
+                }
+                DemandBatchState::JoinedExisting => {
+                    if let DemandBatchPayload::Joined { reader_leases } = &mut batch.payload {
+                        for lease in reader_leases.drain(..) {
+                            lease.release();
+                        }
+                    }
+                    batch.state = DemandBatchState::Retired;
+                }
+            }
+        }
+
+        if any_quarantined {
+            let mut syncs = std::mem::take(&mut self.joined_syncs);
+            if let Some(sync) = self.latest_dma_sync.take() {
+                syncs.push(sync);
+            }
+            self.transport.defer_syncs(syncs);
+        } else {
+            self.joined_syncs.clear();
+            let _ = self.latest_dma_sync.take();
+        }
+        self._flight.take();
+        self.transport.drain_deferred_syncs();
+
+        if !slots_to_abort.is_empty() {
+            abort_slots(&slots_to_abort);
+        }
+    }
+
+    /// Hand all unretired work to `ExpertTransport`'s retirement quarantine
+    /// without blocking, waiting, or panicking. Safe to call from `Drop` or
+    /// callback threads.
+    pub(crate) fn quarantine(&mut self, reason: &str) {
+        if self.batches.iter().all(|b| b.state == DemandBatchState::Retired) {
+            self._flight.take();
+            return;
+        }
+        for batch in &mut self.batches {
+            if batch.state == DemandBatchState::Retired {
+                continue;
+            }
+            match &mut batch.payload {
+                DemandBatchPayload::OwnWrite {
+                    slots,
+                    transfer_ids,
+                    owner_leases,
+                    backing,
+                } => {
+                    self.transport.quarantine_uncertain_own(
+                        transfer_ids,
+                        owner_leases,
+                        backing,
+                        reason,
+                    );
+                    slots.clear();
+                }
+                DemandBatchPayload::Joined { reader_leases } => {
+                    match self.compute_use {
+                        ComputeUse::BeforeBack => {
+                            for lease in reader_leases.drain(..) {
+                                lease.release();
+                            }
+                        }
+                        ComputeUse::BackSubmitted => {
+                            // `DecodeBack` may still be reading these joined
+                            // slots on the GPU: retain our reader pins in
+                            // `Registry` without forming an `Arc` cycle.
+                            for lease in reader_leases.drain(..) {
+                                lease.disarm();
+                            }
+                        }
+                    }
+                }
+            }
+            batch.state = DemandBatchState::Retired;
+        }
+        let mut syncs = std::mem::take(&mut self.joined_syncs);
+        if let Some(sync) = self.latest_dma_sync.take() {
+            syncs.push(sync);
+        }
+        self.transport.defer_syncs(syncs);
+        self._flight.take();
+    }
+
+    /// Happy-path retirement once `DecodeBack` is proven complete on the GPU:
+    /// completes own transfers, releases all own and joined leases, drops
+    /// backing, drains deferred syncs outside all residency locks, and returns
+    /// `(layer, sequence, demand_slots)` for O(1) promotion or release in
+    /// `Directory`.
+    pub(crate) fn retire_completed(mut self) -> (usize, u64, Vec<DemandSlot>) {
+        let mut demand_slots = Vec::new();
+        for batch in &mut self.batches {
+            if batch.state == DemandBatchState::Retired {
+                continue;
+            }
+            match &mut batch.payload {
+                DemandBatchPayload::OwnWrite {
+                    slots,
+                    transfer_ids,
+                    owner_leases,
+                    backing,
+                } => {
+                    for id in transfer_ids.drain(..) {
+                        self.transport.complete_dma(id);
+                    }
+                    for lease in owner_leases.drain(..) {
+                        lease.release();
+                    }
+                    demand_slots.append(slots);
+                    backing.clear();
+                }
+                DemandBatchPayload::Joined { reader_leases } => {
+                    for lease in reader_leases.drain(..) {
+                        lease.release();
+                    }
+                }
+            }
+            batch.state = DemandBatchState::Retired;
+        }
+        self.joined_syncs.clear();
+        let _ = self.latest_dma_sync.take();
+        self._flight.take();
+        self.transport.drain_deferred_syncs();
+        (self.layer, self.sequence, demand_slots)
+    }
+
+    /// Transfer ownership into [`DecodeLanding`] on the happy path with zero
+    /// extra descriptor allocations and zero per-expert synchronization.
+    pub(crate) fn into_landing(mut self) -> DecodeLanding {
+        let mut syncs = std::mem::take(&mut self.joined_syncs);
+        if let Some(sync) = self.latest_dma_sync.take() {
+            syncs.push(sync);
+        }
+        DecodeLanding {
+            layer: self.layer,
+            sequence: self.sequence,
+            syncs,
+            batch: self,
+        }
+    }
+}
+
+impl Drop for IssuedDemandBatch {
+    fn drop(&mut self) {
+        if self.batches.iter().any(|b| b.state != DemandBatchState::Retired) {
+            self.quarantine("IssuedDemandBatch dropped without explicit retirement");
+        }
+    }
+}
+
 /// Outcome of [`ExpertTransport::land_decode_misses`]: all cross-stream sync
-/// events `DecodeBack` must wait on (`cuStreamWaitEvent`), all consumer
-/// leases pinning the landed/joined VRAM slots until `DecodeBack` finishes,
-/// and the freshly landed `DemandSlot`s for O(1) zero-recopy promotion.
+/// events `DecodeBack` must wait on (`cuStreamWaitEvent`), plus the single
+/// owning [`IssuedDemandBatch`] transaction holding all own writes, joined
+/// reader pins, backing tensors, and flight guard until `DecodeBack` retires.
 pub(crate) struct DecodeLanding {
     pub layer: usize,
     pub sequence: u64,
     pub syncs: Vec<TransferSync>,
-    pub leases: Vec<ConsumerLease>,
-    /// Demand transfers freshly issued on unified `DemandLanding` slots.
-    demand_ids: Vec<TransferId>,
-    /// Freshly landed unified VRAM slots to promote O(1) or release on completion.
-    pub demand_slots: Vec<DemandSlot>,
-    /// Keeps `ExpertTransport::demand_in_flight` incremented until `DecodeBack`
-    /// releases/completes this landing.
-    _flight: DemandFlightGuard,
+    batch: IssuedDemandBatch,
 }
 
 impl DecodeLanding {
+    /// Record that `DecodeBack` has been submitted on the compute stream.
+    pub(crate) fn mark_back_submitted(&mut self) {
+        self.batch.mark_back_submitted();
+    }
+
+    pub(crate) fn compute_use(&self) -> ComputeUse {
+        self.batch.compute_use()
+    }
+
     /// Release all transport consumer leases, mark freshly issued demand
     /// transfers complete, drain deferred syncs outside all residency locks,
     /// and return `(layer, sequence, demand_slots)` for O(1) promotion or
     /// release in `Directory`.
-    pub(crate) fn release_transport(self, transport: &ExpertTransport) -> (usize, u64, Vec<DemandSlot>) {
-        let Self { layer, sequence, leases, demand_ids, demand_slots, _flight, .. } = self;
-        for id in demand_ids {
-            transport.complete_dma(id);
-        }
-        for lease in leases {
-            lease.release();
-        }
-        drop(_flight);
-        transport.drain_deferred_syncs();
-        (layer, sequence, demand_slots)
+    pub(crate) fn release_transport(self, _transport: &ExpertTransport) -> (usize, u64, Vec<DemandSlot>) {
+        let Self { batch, .. } = self;
+        batch.retire_completed()
+    }
+
+    /// Explicitly abort this landing before `DecodeBack` was submitted.
+    pub(crate) fn abort(
+        mut self,
+        reason: &str,
+        wait_dma: impl FnOnce(u64) -> Result<bool, String>,
+        abort_slots: &mut impl FnMut(&[(usize, usize)]),
+    ) {
+        self.batch.joined_syncs.append(&mut self.syncs);
+        self.batch.abort(reason, wait_dma, abort_slots);
+    }
+
+    /// Quarantine this landing without freeing uncertain slots (e.g. when
+    /// `DecodeBack` compute wait failed during refusal).
+    pub(crate) fn quarantine(mut self, reason: &str) {
+        self.batch.joined_syncs.append(&mut self.syncs);
+        self.batch.quarantine(reason);
     }
 
     #[cfg(test)]
     pub(crate) fn release(self, transport: &ExpertTransport) {
         let _ = self.release_transport(transport);
+    }
+
+    #[cfg(test)]
+    fn own_transfer_count(&self) -> usize {
+        self.batch
+            .batches
+            .iter()
+            .map(|b| match &b.payload {
+                DemandBatchPayload::OwnWrite { transfer_ids, .. } => transfer_ids.len(),
+                DemandBatchPayload::Joined { .. } => 0,
+            })
+            .sum()
+    }
+
+    #[cfg(test)]
+    fn own_slot_count(&self) -> usize {
+        self.batch
+            .batches
+            .iter()
+            .map(|b| match &b.payload {
+                DemandBatchPayload::OwnWrite { slots, .. } => slots.len(),
+                DemandBatchPayload::Joined { .. } => 0,
+            })
+            .sum()
     }
 }
 
@@ -224,10 +752,10 @@ pub(crate) fn merge_set_seeded_tiered(plans: &[PrefillPlan]) -> Vec<(i32, i32)> 
         .collect()
 }
 
-const SPLIT_DMA_WARMUP_CALLS: u32 = 2;
-const SPLIT_DMA_COOLDOWN_STEPS: u32 = 256;
-const SPLIT_DMA_STAGGER_SLOTS: u32 = 64;
-const SPLIT_DMA_STAGGER_STRIDE: u32 = 4;
+const SPLIT_DMA_WARMUP_CALLS: u32 = 8;
+const SPLIT_DMA_COOLDOWN_STEPS: u32 = 16;
+const SPLIT_DMA_STAGGER_SLOTS: u32 = 16;
+const SPLIT_DMA_STAGGER_STRIDE: u32 = 1;
 
 /// Row-width threshold separating narrow decode (`M = 1..3`) from wide
 /// speculative verify bursts (`M >= 4`) in [`DecodeDmaGate`]. Separate lanes
@@ -601,6 +1129,10 @@ struct Registry {
     generations: HashMap<(usize, usize), u64>,
     /// Destination slots quarantined after a partial enqueue or transfer fault.
     quarantined: HashSet<DestSlot>,
+    /// Source/destination backing tensors retained for quarantined transfers
+    /// whose hardware completion is unproven, kept alive until `ExpertTransport`
+    /// drops at device teardown.
+    quarantined_backing: Vec<Tensor>,
     /// Replaced/retired `TransferSync` (`Arc<seismic_cuda::Event>`) handles
     /// deferred to drop OUTSIDE both `self.registry` mutex and `Residency` /
     /// `NoBlockingAllocationGuard` (dropping a final `Event` calls
@@ -739,6 +1271,9 @@ struct PrefillRendezvous {
     syncs: HashMap<(usize, u64, u64), PrefillReady>,
     /// Steps that failed before round 0 (`scratch::fail`).
     failed_steps: HashMap<u64, String>,
+    /// Generations poisoned by a refused partial/final prefill DMA batch:
+    /// `publish_prefill_sync` ignores them and `take_prefill_sync` rejects them.
+    poisoned_generations: HashMap<ScratchGenId, String>,
     /// Fatal serving error (`Shared::end_serving`).
     ended: Option<String>,
 }
@@ -1083,10 +1618,43 @@ impl ExpertTransport {
         can_cancel
     }
 
+    /// Atomically cancel unissued own-write demand transfers under ONE registry
+    /// lock: detaches and disarms the owner's leases and removes each entry
+    /// from all join/destination indexes WITHOUT transitioning through
+    /// `TransferState::Landed` (so `join_by_tier_record` can never observe an
+    /// untouched destination as `Landed` with `sync = None`).
+    pub(crate) fn cancel_unissued_dma(
+        &self,
+        transfer_ids: &mut Vec<TransferId>,
+        owner_leases: &mut Vec<ConsumerLease>,
+    ) {
+        let mut reg = self.registry.lock().expect("transport registry");
+        for lease in owner_leases.drain(..) {
+            let (id, consumer_id) = (lease.transfer_id, lease.consumer_id);
+            if let Some(entry) = reg.entries.get_mut(&id) {
+                entry.consumers.remove(&consumer_id);
+            }
+            lease.disarm();
+        }
+        for id in transfer_ids.drain(..) {
+            if let Some(entry) = reg.entries.get(&id) {
+                assert!(
+                    matches!(entry.state, TransferState::InFlight { sync: None }),
+                    "cancel_unissued_dma called on non-unissued transfer {id:?}"
+                );
+                assert!(
+                    entry.consumers.is_empty(),
+                    "unissued transfer {id:?} (sync=None, non-joinable) must have no other consumers"
+                );
+                reg.remove_entry(id);
+            }
+        }
+    }
+
     /// Mark a transfer faulted and quarantine its destination slot so neither
     /// joiners nor future allocations can observe partial/corrupt bytes.
     pub(crate) fn fault_transfer(&self, id: TransferId, _reason: String) {
-        let mut reg = self.registry.lock().expect("transport registry");
+        let mut reg = self.registry.lock().unwrap_or_else(|e| e.into_inner());
         let dest = if let Some(entry) = reg.entries.get_mut(&id) {
             entry.hint_owner_active = false;
             Some(entry.dest)
@@ -1097,6 +1665,65 @@ impl ExpertTransport {
             reg.set_entry_state(id, TransferState::Faulted);
             reg.quarantined.insert(dest);
         }
+    }
+
+    /// Quarantine an own-write batch whose hardware completion is unproven:
+    /// faults every transfer, quarantines its destination slot, disarms owner
+    /// leases (keeping consumer pins live in `Registry` without `Arc` cycles),
+    /// and retains source/destination backing tensors until `ExpertTransport`
+    /// teardown. Non-blocking and panic-free (safe to call from `Drop`).
+    fn quarantine_uncertain_own(
+        &self,
+        transfer_ids: &mut Vec<TransferId>,
+        owner_leases: &mut Vec<ConsumerLease>,
+        backing: &mut Vec<Tensor>,
+        _reason: &str,
+    ) {
+        let mut reg = self.registry.lock().unwrap_or_else(|e| e.into_inner());
+        for id in transfer_ids.drain(..) {
+            let dest = if let Some(entry) = reg.entries.get_mut(&id) {
+                entry.hint_owner_active = false;
+                Some(entry.dest)
+            } else {
+                None
+            };
+            if let Some(dest) = dest {
+                reg.set_entry_state(id, TransferState::Faulted);
+                reg.quarantined.insert(dest);
+            }
+        }
+        for lease in owner_leases.drain(..) {
+            lease.disarm();
+        }
+        reg.quarantined_backing.append(backing);
+    }
+
+    /// Defer `TransferSync` handles to be dropped later outside locks and
+    /// callback threads. Non-blocking and panic-free (safe to call from `Drop`).
+    fn defer_syncs(&self, mut syncs: Vec<TransferSync>) {
+        if syncs.is_empty() {
+            return;
+        }
+        let mut reg = self.registry.lock().unwrap_or_else(|e| e.into_inner());
+        reg.deferred_syncs.append(&mut syncs);
+    }
+
+    /// Wait on the decode transfer stream for `value` (used when explicitly
+    /// aborting a `BeforeBack` `DecodeLanding` outside all residency locks).
+    pub(crate) fn wait_decode_dma(&self, value: u64, timeout: std::time::Duration) -> Result<bool, String> {
+        let Some(dma) = &self.decode else {
+            return Err("wait_decode_dma called without decode DMA state".into());
+        };
+        dma.transfer.wait(value, timeout).map_err(|e| e.to_string())
+    }
+
+    #[cfg(test)]
+    pub(crate) fn quarantined_backing_len(&self) -> usize {
+        self.registry
+            .lock()
+            .expect("transport registry")
+            .quarantined_backing
+            .len()
     }
 
     /// Drop retired `TransferSync` (`Arc<seismic_cuda::Event>`) handles OUTSIDE
@@ -1431,29 +2058,20 @@ impl ExpertTransport {
             return Ok(None);
         }
 
-        let _flight = DemandFlightGuard::new(Arc::clone(self));
+        let mut tx = IssuedDemandBatch::new(Arc::clone(self), layer, sequence);
 
         let region_bytes = dma.bank_stores.region_bytes(group);
         let expert_bytes: u64 = region_bytes.iter().copied().sum();
 
         let mut resolved: Vec<(usize, usize)> = Vec::with_capacity(unique_a.len());
-        // Every distinct batch a joined transfer lands in: joined batches
-        // sit on several queues (staging and promotions on the link's,
-        // demand on this one) and are issued by priority, not by id, so no
-        // one of them orders the others.
-        let mut joined_syncs: Vec<TransferSync> = Vec::new();
-        let mut latest_dma_sync: Option<TransferSync> = None;
-        let mut leases: Vec<ConsumerLease> = Vec::new();
-        let mut demand_ids: Vec<TransferId> = Vec::new();
-        let mut demand_slots: Vec<DemandSlot> = Vec::new();
         let mut bytes_landed: u64 = 0;
         let mut overflow_experts: u64 = 0;
 
         // Shared helper: join existing transfers or claim unified `Record::Free`
         // slots in ONE batched `claim_batch` call (single `Residency` lock per
         // layer, optionally replenishing `Free` headroom in the same lock),
-        // then issue one batched `copy_synced_device_only` on `dma.transfer`
-        // outside all residency locks.
+        // then issue one batched `copy_synced` on `dma.transfer` outside all
+        // residency locks.
         let mut replenished = false;
         let mut issue_batch =
             |mut unique: Vec<(usize, usize)>,
@@ -1465,7 +2083,9 @@ impl ExpertTransport {
                 }
                 // Prioritize highest row-reference count in case free slots are scarce.
                 unique.sort_unstable_by(|a, b| b.1.cmp(&a.1));
-                let mut pairs: Vec<(Tensor, Tensor, u64)> =
+                let mut backing: Vec<Tensor> =
+                    Vec::with_capacity(unique.len() * region_bytes.len() * 2);
+                let mut run_bytes: Vec<u64> =
                     Vec::with_capacity(unique.len() * region_bytes.len());
                 // `(tier_record, slot, staged)`
                 let mut fresh_landed: Vec<(usize, usize, Option<(usize, usize)>)> =
@@ -1478,12 +2098,7 @@ impl ExpertTransport {
                     }
                     if let Some(joined) = self.join_by_tier_record(group, layer, tier_record) {
                         resolved.push((tier_record, joined.dest.slot));
-                        if let Some(sync) = joined.sync {
-                            if !joined_syncs.iter().any(|seen| seen.same_batch(&sync)) {
-                                joined_syncs.push(sync);
-                            }
-                        }
-                        leases.push(joined.lease);
+                        tx.record_joined(joined.lease, joined.sync);
                         continue;
                     }
                     to_claim.push(tier_record as u32);
@@ -1502,7 +2117,8 @@ impl ExpertTransport {
                             }
                             super::directory::DemandSlotClaim::Allocated { staged, slot } => {
                                 let mut complete = true;
-                                let before = pairs.len();
+                                let before_backing = backing.len();
+                                let before_runs = run_bytes.len();
                                 for (region, &bytes) in region_bytes.iter().enumerate() {
                                     if bytes == 0 {
                                         continue;
@@ -1514,12 +2130,15 @@ impl ExpertTransport {
                                         complete = false;
                                         break;
                                     };
-                                    pairs.push((src, dst, bytes));
+                                    backing.push(src);
+                                    backing.push(dst);
+                                    run_bytes.push(bytes);
                                 }
                                 if complete {
                                     fresh_landed.push((tier_record, slot, staged));
                                 } else {
-                                    pairs.truncate(before);
+                                    backing.truncate(before_backing);
+                                    run_bytes.truncate(before_runs);
                                     aborted.push((group, slot));
                                 }
                             }
@@ -1535,9 +2154,10 @@ impl ExpertTransport {
                 if fresh_landed.is_empty() {
                     return Ok(());
                 }
-                let batch_bytes: u64 = pairs.iter().map(|(_, _, bytes)| *bytes).sum();
+                let batch_bytes: u64 = run_bytes.iter().copied().sum();
                 let mut batch_ids = Vec::with_capacity(fresh_landed.len());
                 let mut batch_slots = Vec::with_capacity(fresh_landed.len());
+                let mut batch_leases = Vec::with_capacity(fresh_landed.len());
                 for &(tier_record, slot, staged) in &fresh_landed {
                     let (target_layer, target_expert) = staged.unwrap_or((layer, tier_record));
                     let (id, lease) = self.begin_demand_transfer(
@@ -1549,32 +2169,34 @@ impl ExpertTransport {
                     );
                     batch_ids.push(id);
                     batch_slots.push(DemandSlot { group, slot, staged });
-                    leases.push(lease);
+                    batch_leases.push(lease);
                 }
-                let items: Vec<TransferItem<'_>> = pairs
-                    .iter()
-                    .map(|(source, destination, bytes)| {
-                        TransferItem::Run(TransferRun {
-                            source,
-                            source_offset: 0,
-                            destination,
-                            destination_offset: 0,
-                            bytes: *bytes,
+                let batch_idx = tx.claim_own_batch(batch_slots, batch_ids, batch_leases, backing);
+                tx.begin_issue(batch_idx);
+                let result = {
+                    let tensors = tx.own_backing(batch_idx);
+                    let items: Vec<TransferItem<'_>> = run_bytes
+                        .iter()
+                        .enumerate()
+                        .map(|(i, &bytes)| {
+                            TransferItem::Run(TransferRun {
+                                source: &tensors[i * 2],
+                                source_offset: 0,
+                                destination: &tensors[i * 2 + 1],
+                                destination_offset: 0,
+                                bytes,
+                            })
                         })
-                    })
-                    .collect();
-                match dma.transfer.copy_synced(&items) {
-                    Ok((_, sync)) => {
+                        .collect();
+                    dma.transfer.copy_synced(&items)
+                };
+                match result {
+                    Ok((value, sync)) => {
                         // Wake `LinkMover` immediately so `Stage(L+1)` queues
                         // onto the transfer stream right after `DMA(L)` and
                         // overlaps with `DecodeBack(L) + DecodeFront(L+1)`.
                         dma.events.notify();
-                        for &id in &batch_ids {
-                            self.attach_sync(id, sync.clone());
-                        }
-                        latest_dma_sync = Some(sync);
-                        demand_ids.extend_from_slice(&batch_ids);
-                        demand_slots.extend_from_slice(&batch_slots);
+                        tx.mark_submitted(batch_idx, value, Some(sync));
                         for &(tier_record, slot, _) in &fresh_landed {
                             resolved.push((tier_record, slot));
                         }
@@ -1582,13 +2204,19 @@ impl ExpertTransport {
                         Ok(())
                     }
                     Err(error) => {
-                        let msg = format!("M7 decode DMA copy failed: {error}");
-                        for &id in &batch_ids {
-                            self.fault_transfer(id, msg.clone());
+                        if error.refused_before_issue() {
+                            tx.mark_refused_before_issue(batch_idx);
                         }
-                        let faulted_slots: Vec<(usize, usize)> =
-                            fresh_landed.iter().map(|&(_, slot, _)| (group, slot)).collect();
-                        abort_slots(&faulted_slots);
+                        let msg = format!("M7 decode DMA copy failed: {error}");
+                        tx.abort(
+                            &msg,
+                            |value| {
+                                dma.transfer
+                                    .wait(value, std::time::Duration::from_secs(5))
+                                    .map_err(|e| e.to_string())
+                            },
+                            &mut abort_slots,
+                        );
                         Err(msg)
                     }
                 }
@@ -1761,20 +2389,7 @@ impl ExpertTransport {
 
         record_dma(false, resolved.len() as u64, bytes_landed, overflow_experts);
 
-        let mut syncs = joined_syncs;
-        if let Some(sync) = latest_dma_sync {
-            syncs.push(sync);
-        }
-
-        Ok(Some(DecodeLanding {
-            layer,
-            sequence,
-            syncs,
-            leases,
-            demand_ids,
-            demand_slots,
-            _flight,
-        }))
+        Ok(Some(tx.into_landing()))
     }
 
     // -----------------------------------------------------------------------
@@ -1814,10 +2429,40 @@ impl ExpertTransport {
         self.prefill_ready.notify_all();
     }
 
+    /// Called by `Copies::issue` when any partial or final batch of
+    /// `generation` is refused: poisons `generation`, fails `sequence` and any
+    /// sibling sequences whose already-published syncs belonged to `generation`,
+    /// purges those syncs, and wakes waiters.
+    pub(crate) fn poison_prefill_generation(
+        &self,
+        generation: ScratchGenId,
+        sequence: u64,
+        reason: String,
+    ) {
+        let mut prefill = self.prefill.lock().expect("transport prefill rendezvous");
+        prefill.poisoned_generations.entry(generation).or_insert_with(|| reason.clone());
+        prefill.failed_steps.entry(sequence).or_insert_with(|| reason.clone());
+        let mut purged_sequences = Vec::new();
+        prefill.syncs.retain(|&(_, seq, _), ready| {
+            if ready.generation == generation {
+                purged_sequences.push(seq);
+                false
+            } else {
+                true
+            }
+        });
+        for seq in purged_sequences {
+            prefill.failed_steps.entry(seq).or_insert_with(|| reason.clone());
+        }
+        self.prefill_ready.notify_all();
+    }
+
     /// Called by `Copies::issue` (with `Some(sync)`) or `Scratch` (with `None`
     /// when a fill has 0 copies) once a prefill fill batch is submitted on
     /// `Copies`'s transfer stream. Atomically publishes the immutable
-    /// `generation` token alongside its readiness dependency (`sync`).
+    /// `generation` token alongside its readiness dependency (`sync`), unless
+    /// `generation` has already been poisoned by a refused partial batch (in
+    /// which case `sequence` is failed and waiters are woken).
     pub(crate) fn publish_prefill_sync(
         &self,
         layer: usize,
@@ -1827,13 +2472,18 @@ impl ExpertTransport {
         sync: Option<TransferSync>,
     ) {
         let mut prefill = self.prefill.lock().expect("transport prefill rendezvous");
+        if let Some(reason) = prefill.poisoned_generations.get(&generation).cloned() {
+            prefill.failed_steps.entry(sequence).or_insert(reason);
+            self.prefill_ready.notify_all();
+            return;
+        }
         prefill.syncs.insert((layer, sequence, window), PrefillReady { generation, sync });
         self.prefill_ready.notify_all();
     }
 
     /// Wait on the host condvar (zero `cuEventSynchronize`!) for `Copies` to
     /// publish the atomic [`PrefillReady`] descriptor for
-    /// `(layer, sequence, window)`.
+    /// `(layer, sequence, window)`. Rejects poisoned generations.
     pub(crate) fn take_prefill_sync(
         &self,
         layer: usize,
@@ -1843,6 +2493,9 @@ impl ExpertTransport {
         let mut prefill = self.prefill.lock().expect("transport prefill rendezvous");
         loop {
             if let Some(ready) = prefill.syncs.remove(&(layer, sequence, window)) {
+                if let Some(reason) = prefill.poisoned_generations.get(&ready.generation) {
+                    return Err(reason.clone());
+                }
                 if ready.sync.is_some() {
                     self.prefill_dma_batches.fetch_add(1, Ordering::Relaxed);
                 } else {
@@ -2378,37 +3031,63 @@ mod tests {
     }
 
     /// Staggered probes across 48 layers: after warmup, layers enter cooldown
-    /// with distinct phase offsets so no two layers exit cooldown on the exact
-    /// same step (preventing a 48-layer synchronous probe storm).
+    /// with `layer % SPLIT_DMA_STAGGER_SLOTS` phase offsets so the peak
+    /// concurrent probing cohort is bounded by `48 / SPLIT_DMA_STAGGER_SLOTS`
+    /// (preventing a 48-layer synchronous probe storm) while every layer probes
+    /// on a bounded periodic interval (`SPLIT_DMA_COOLDOWN_STEPS + 1`).
     #[test]
     fn decode_dma_gate_staggers_probes_across_48_layers() {
-        let gates: Vec<DecodeDmaGate> = (0..48).map(|l| DecodeDmaGate::for_layer(l, false)).collect();
+        const LAYERS: usize = 48;
+        let gates: Vec<DecodeDmaGate> = (0..LAYERS).map(|l| DecodeDmaGate::for_layer(l, false)).collect();
         for _ in 0..SPLIT_DMA_WARMUP_CALLS {
             for gate in &gates {
                 assert!(gate.should_split(1));
                 gate.observe(1, 0);
             }
         }
-        let total_steps = (SPLIT_DMA_COOLDOWN_STEPS as usize) * 3;
-        let mut total_probes = 0usize;
+        let expected_peak_cohort = LAYERS.div_ceil(SPLIT_DMA_STAGGER_SLOTS as usize);
+        let max_initial_delay =
+            (SPLIT_DMA_COOLDOWN_STEPS + (SPLIT_DMA_STAGGER_SLOTS - 1) * SPLIT_DMA_STAGGER_STRIDE) as usize;
+        let expected_period = (SPLIT_DMA_COOLDOWN_STEPS + 1) as usize;
+        let total_steps = max_initial_delay + expected_period * 2 + 1;
+        let mut probe_steps: Vec<Vec<usize>> = vec![Vec::new(); LAYERS];
+        let mut peak_cohort = 0usize;
         for step in 0..total_steps {
             let mut probing_this_step = 0usize;
-            for gate in &gates {
+            for (layer, gate) in gates.iter().enumerate() {
                 if gate.should_split(1) {
                     probing_this_step += 1;
-                    total_probes += 1;
+                    probe_steps[layer].push(step);
                     gate.observe(1, 0);
                 }
             }
-            assert!(
-                probing_this_step <= 1,
-                "step {step} had {probing_this_step} layers probing simultaneously (expected <= 1)"
-            );
+            peak_cohort = peak_cohort.max(probing_this_step);
         }
-        assert!(
-            total_probes >= 48 * 2,
-            "expected every layer to probe at least twice over {total_steps} steps, got {total_probes}"
+        assert_eq!(
+            peak_cohort, expected_peak_cohort,
+            "peak concurrent probing cohort across {LAYERS} layers should match {LAYERS}/{SPLIT_DMA_STAGGER_SLOTS}"
         );
+        for (layer, steps) in probe_steps.iter().enumerate() {
+            assert!(
+                steps.len() >= 3,
+                "layer {layer} probed only {} times over {total_steps} steps (expected >= 3)",
+                steps.len()
+            );
+            assert!(
+                steps[0] <= max_initial_delay,
+                "layer {layer} first probe at step {} exceeded max initial delay {max_initial_delay}",
+                steps[0]
+            );
+            for window in steps.windows(2) {
+                assert_eq!(
+                    window[1] - window[0],
+                    expected_period,
+                    "layer {layer} probe interval between steps {} and {} should equal {expected_period}",
+                    window[0],
+                    window[1]
+                );
+            }
+        }
     }
 
     /// Derived [`SplitDmaCrossover`] physics (zero hardcoded constants):
@@ -2991,8 +3670,8 @@ mod tests {
         assert!(!recorded.0, "must not be fast-path skip");
         assert_eq!(recorded.1, 3, "expected 3 landed experts across incremental Phase B");
         assert_eq!(recorded.3, 0, "expected 0 overflow experts");
-        assert_eq!(landing.demand_ids.len(), 3);
-        assert_eq!(landing.demand_slots.len(), 3);
+        assert_eq!(landing.own_transfer_count(), 3);
+        assert_eq!(landing.own_slot_count(), 3);
         assert_eq!(landing.syncs.len(), 1, "single latest FIFO transfer_done sync orders all batches");
         let s0 = sources_words.load(0);
         let s1 = sources_words.load(1);
@@ -3007,5 +3686,404 @@ mod tests {
         assert_eq!(sources_words.load(site_base + 2), -1, "straggler SOURCE_SITE == -2 promoted to GPU (-1)");
 
         landing.release(&transport);
+    }
+
+    /// Partial issue before fence record: a batch in `PartiallyIssued` (no
+    /// timeline value recorded) must be quarantined on abort and its slot MUST
+    /// NEVER be returned to `Directory`'s free pool.
+    #[test]
+    fn issued_demand_batch_partial_issue_before_fence_record_quarantines_without_freeing() {
+        let transport = ExpertTransport::new_registry_only();
+        let group = 0usize;
+        let slot_p = DestSlot { group, slot: 1 };
+        let (id_p, lease_p) = transport.begin_demand_transfer(group, 0, 1, 1, slot_p);
+
+        let mut tx = IssuedDemandBatch::new(Arc::clone(&transport), 0, 10);
+        let idx = tx.claim_own_batch(
+            vec![DemandSlot { group, slot: slot_p.slot, staged: None }],
+            vec![id_p],
+            vec![lease_p],
+            Vec::new(),
+        );
+        assert_eq!(tx.batch_states(), vec![DemandBatchState::Unissued]);
+        tx.begin_issue(idx);
+        assert_eq!(tx.batch_states(), vec![DemandBatchState::PartiallyIssued]);
+        assert_eq!(tx.highest_submitted(), None);
+
+        let mut waited = false;
+        let mut aborted: Vec<(usize, usize)> = Vec::new();
+        tx.abort(
+            "mid-batch copy error before fence record",
+            |_v| {
+                waited = true;
+                Ok(true)
+            },
+            &mut |slots| aborted.extend_from_slice(slots),
+        );
+
+        assert!(!waited, "no submitted batch to wait on");
+        assert!(aborted.is_empty(), "partially issued slot must NEVER be returned to Directory");
+        assert!(!transport.can_reuse_slot(slot_p), "partially issued slot must remain quarantined");
+        assert!(transport.is_quarantined(slot_p));
+        assert_eq!(tx.batch_states(), vec![DemandBatchState::Retired]);
+        assert!(!transport.demand_active(), "flight guard released on abort");
+    }
+
+    /// Batch A succeeds (`Submitted { value: 42 }`), Batch B fails mid-issue
+    /// (`PartiallyIssued`): `abort` waits on `42` (`Ok(true)`), retires Batch A
+    /// cleanly back to `Directory`, and quarantines Batch B without freeing it.
+    #[test]
+    fn issued_demand_batch_a_succeeds_b_fails_retires_a_and_quarantines_b() {
+        let transport = ExpertTransport::new_registry_only();
+        let group = 0usize;
+        let slot_a = DestSlot { group, slot: 3 };
+        let slot_b = DestSlot { group, slot: 4 };
+        let (id_a, lease_a) = transport.begin_demand_transfer(group, 0, 10, 10, slot_a);
+        let (id_b, lease_b) = transport.begin_demand_transfer(group, 0, 11, 11, slot_b);
+
+        let mut tx = IssuedDemandBatch::new(Arc::clone(&transport), 0, 20);
+        let idx_a = tx.claim_own_batch(
+            vec![DemandSlot { group, slot: slot_a.slot, staged: None }],
+            vec![id_a],
+            vec![lease_a],
+            Vec::new(),
+        );
+        tx.begin_issue(idx_a);
+        tx.mark_submitted(idx_a, 42, None);
+
+        let idx_b = tx.claim_own_batch(
+            vec![DemandSlot { group, slot: slot_b.slot, staged: None }],
+            vec![id_b],
+            vec![lease_b],
+            Vec::new(),
+        );
+        tx.begin_issue(idx_b);
+        assert_eq!(
+            tx.batch_states(),
+            vec![DemandBatchState::Submitted { value: 42 }, DemandBatchState::PartiallyIssued]
+        );
+
+        let mut waited_value = None;
+        let mut aborted: Vec<(usize, usize)> = Vec::new();
+        let order = std::cell::RefCell::new(Vec::<&'static str>::new());
+        tx.abort(
+            "synthetic phase B copy error",
+            |v| {
+                waited_value = Some(v);
+                order.borrow_mut().push("wait");
+                Ok(true)
+            },
+            &mut |slots| {
+                aborted.extend_from_slice(slots);
+                order.borrow_mut().push("abort");
+            },
+        );
+
+        assert_eq!(waited_value, Some(42), "must wait for highest submitted timeline value");
+        assert_eq!(*order.borrow(), vec!["wait", "abort"], "must wait before freeing A's slot");
+        assert_eq!(aborted, vec![(group, slot_a.slot)], "only proven-complete A returns to Directory; uncertain B stays quarantined");
+        assert!(transport.can_reuse_slot(slot_a), "Batch A slot must be reusable after wait");
+        assert!(!transport.can_reuse_slot(slot_b), "PartiallyIssued Batch B slot must remain quarantined");
+        assert!(transport.is_quarantined(slot_b));
+        assert_eq!(tx.batch_states(), vec![DemandBatchState::Retired, DemandBatchState::Retired]);
+    }
+
+    /// Timeout on wait followed by late DMA completion: quarantined storage is
+    /// never returned to `Directory`, never reused prematurely, and never
+    /// double-freed on repeated abort/drop.
+    #[test]
+    fn issued_demand_batch_timeout_then_late_completion_never_double_frees_or_reuses() {
+        let transport = ExpertTransport::new_registry_only();
+        let group = 0usize;
+        let slot_a = DestSlot { group, slot: 5 };
+        let slot_b = DestSlot { group, slot: 6 };
+        let (id_a, lease_a) = transport.begin_demand_transfer(group, 0, 20, 20, slot_a);
+        let (id_b, lease_b) = transport.begin_demand_transfer(group, 0, 21, 21, slot_b);
+
+        let mut tx = IssuedDemandBatch::new(Arc::clone(&transport), 0, 30);
+        let idx_a = tx.claim_own_batch(
+            vec![DemandSlot { group, slot: slot_a.slot, staged: None }],
+            vec![id_a],
+            vec![lease_a],
+            Vec::new(),
+        );
+        tx.begin_issue(idx_a);
+        tx.mark_submitted(idx_a, 99, None);
+
+        let idx_b = tx.claim_own_batch(
+            vec![DemandSlot { group, slot: slot_b.slot, staged: None }],
+            vec![id_b],
+            vec![lease_b],
+            Vec::new(),
+        );
+        tx.begin_issue(idx_b);
+
+        let mut aborted: Vec<(usize, usize)> = Vec::new();
+        tx.abort(
+            "synthetic phase B copy error",
+            |_v| Ok(false), // timeout
+            &mut |slots| aborted.extend_from_slice(slots),
+        );
+
+        assert!(aborted.is_empty(), "timeout must quarantine ALL uncertain slots");
+        assert!(!transport.can_reuse_slot(slot_a));
+        assert!(!transport.can_reuse_slot(slot_b));
+        assert!(transport.is_quarantined(slot_a));
+        assert!(transport.is_quarantined(slot_b));
+
+        // Simulate late DMA completion arriving after timeout: quarantined
+        // storage must remain quarantined and never become reusable.
+        transport.complete_dma(id_a);
+        assert!(
+            !transport.can_reuse_slot(slot_a),
+            "late completion must NEVER un-quarantine or reuse timed-out storage"
+        );
+
+        // Idempotent second abort / Drop must never double-free.
+        tx.abort("second abort", |_| Ok(true), &mut |slots| aborted.extend_from_slice(slots));
+        drop(tx);
+        assert!(aborted.is_empty(), "repeated abort/drop must never free quarantined slots");
+    }
+
+    /// Shared transfer retains another reader until that reader retires, and a
+    /// `BackSubmitted` reader dropped without completion retains its pin in
+    /// quarantine.
+    #[test]
+    fn issued_demand_batch_shared_transfer_retains_other_reader_until_retired() {
+        let transport = ExpertTransport::new_registry_only();
+        let group = 0usize;
+        let key = ExpertKey { group, layer: 0, expert: 7 };
+        let src = SourceRef { tier_record: 7, generation: 1 };
+        let slot = DestSlot { group, slot: 9 };
+        let hint_id = transport.register_in_flight_hint(key, src, slot, None);
+
+        let joined_1 = transport.join_by_key(key, src).expect("reader 1 joins");
+        let joined_2 = transport.join_by_key(key, src).expect("reader 2 joins");
+
+        let mut tx1 = IssuedDemandBatch::new(Arc::clone(&transport), 0, 40);
+        tx1.record_joined(joined_1.lease, joined_1.sync);
+        assert_eq!(tx1.batch_states(), vec![DemandBatchState::JoinedExisting]);
+
+        let mut tx2 = IssuedDemandBatch::new(Arc::clone(&transport), 0, 41);
+        tx2.record_joined(joined_2.lease, joined_2.sync);
+
+        // Reader 1 aborts before DecodeBack: detaches ONLY reader 1.
+        let mut aborted = Vec::new();
+        tx1.abort("reader 1 aborted", |_| Ok(true), &mut |slots| aborted.extend_from_slice(slots));
+        assert!(aborted.is_empty(), "joined reader never owns destination slot");
+
+        // Hint DMA finishes, but reader 2 is still active -> slot must stay pinned.
+        transport.complete_dma(hint_id);
+        assert!(!transport.try_release_hint_slot(slot), "reader 2 still pins shared slot");
+        assert!(!transport.can_reuse_slot(slot));
+
+        // Reader 2 completes normally -> slot can now retire.
+        let (_, _, own_slots) = tx2.retire_completed();
+        assert!(own_slots.is_empty());
+        assert!(transport.can_reuse_slot(slot), "slot becomes reusable once last reader retires");
+
+        // Now verify BackSubmitted reader dropped unexpectedly retains its pin.
+        let hint_id2 = transport.register_in_flight_hint(key, src, slot, None);
+        let joined_3 = transport.join_by_key(key, src).expect("reader 3 joins");
+        let mut tx3 = IssuedDemandBatch::new(Arc::clone(&transport), 0, 42);
+        tx3.record_joined(joined_3.lease, joined_3.sync);
+        tx3.mark_back_submitted();
+        drop(tx3);
+        transport.complete_dma(hint_id2);
+        assert!(
+            !transport.try_release_hint_slot(slot),
+            "BackSubmitted reader dropped without completion must retain its pin"
+        );
+        assert!(!transport.can_reuse_slot(slot));
+    }
+
+    /// Device teardown / Drop path must NEVER panic or block locks (verified
+    /// under `NoBlockingAllocationGuard`), and must hand uncertain work to
+    /// `ExpertTransport`'s retirement quarantine while releasing the flight guard.
+    #[test]
+    fn issued_demand_batch_drop_under_no_blocking_guard_never_panics_or_blocks() {
+        let transport = ExpertTransport::new_registry_only();
+        let group = 0usize;
+        let slot_u = DestSlot { group, slot: 10 };
+        let slot_s = DestSlot { group, slot: 11 };
+        let (id_u, lease_u) = transport.begin_demand_transfer(group, 0, 30, 30, slot_u);
+        let (id_s, lease_s) = transport.begin_demand_transfer(group, 0, 31, 31, slot_s);
+
+        let mut tx = IssuedDemandBatch::new(Arc::clone(&transport), 0, 50);
+        let _idx_u = tx.claim_own_batch(
+            vec![DemandSlot { group, slot: slot_u.slot, staged: None }],
+            vec![id_u],
+            vec![lease_u],
+            Vec::new(),
+        );
+        let idx_s = tx.claim_own_batch(
+            vec![DemandSlot { group, slot: slot_s.slot, staged: None }],
+            vec![id_s],
+            vec![lease_s],
+            Vec::new(),
+        );
+        tx.begin_issue(idx_s);
+        tx.mark_submitted(idx_s, 77, None);
+        tx.mark_back_submitted();
+        assert!(transport.demand_active());
+
+        {
+            // Dropping under `NoBlockingAllocationGuard` proves Drop never
+            // calls blocking waits or `drain_deferred_syncs`.
+            let _no_block = seismic::memory::enter_no_blocking_allocation();
+            drop(tx);
+        }
+
+        assert!(!transport.demand_active(), "Drop must release DemandFlightGuard");
+        assert!(!transport.can_reuse_slot(slot_u));
+        assert!(!transport.can_reuse_slot(slot_s));
+        assert!(transport.is_quarantined(slot_u));
+        assert!(transport.is_quarantined(slot_s));
+        assert_eq!(transport.quarantined_backing_len(), 0);
+    }
+
+    /// Regression test (`mx5stm`): when an owner aborts a `Submitted` demand
+    /// batch after H2D finishes (`prefix_proven == true`) while a joined
+    /// borrower still holds its `ConsumerLease` on the destination slot, the
+    /// pin-aware abort path MUST defer release (`defer_demand_release`) rather
+    /// than freeing the slot back to `Record::Free`, and release it only once
+    /// the borrower's lease drops.
+    #[test]
+    fn issued_demand_batch_owner_abort_while_borrower_still_reads_defers_slot_release() {
+        use crate::experts::records::{BankRecords, Record};
+
+        let transport = ExpertTransport::new_registry_only();
+        let mut bank = BankRecords::new(&[4], &[(0, 8)], None);
+        let group = 0usize;
+        let layer = 0usize;
+        let expert = 3usize;
+        let tier_record = 12usize;
+
+        // Owner claims a `Record::DemandLanding` slot in `BankRecords`.
+        let slot = bank
+            .claim_demand_landing(group, Some((layer, expert)), false, |s| {
+                transport.can_reuse_slot(DestSlot { group, slot: s })
+            })
+            .expect("claim demand landing slot");
+        assert!(matches!(bank.records(group)[slot], Record::DemandLanding { .. }));
+
+        let dest = DestSlot { group, slot };
+        let (id, owner_lease) = transport.begin_demand_transfer(group, layer, expert, tier_record, dest);
+        let mut owner = IssuedDemandBatch::new(Arc::clone(&transport), layer, 60);
+        let idx = owner.claim_own_batch(
+            vec![DemandSlot { group, slot, staged: Some((layer, expert)) }],
+            vec![id],
+            vec![owner_lease],
+            Vec::new(),
+        );
+        owner.begin_issue(idx);
+        transport.complete_dma(id);
+        owner.mark_submitted(idx, 99, None);
+
+        // Borrower joins the owner's destination slot and holds its `ConsumerLease`.
+        let borrower = transport
+            .join_by_tier_record(group, layer, tier_record)
+            .expect("borrower joins owner's destination slot");
+        assert_eq!(borrower.dest, dest);
+
+        // Owner aborts with H2D confirmed complete (`prefix_proven == true`),
+        // routing aborted slots through the pin-aware release path (matching
+        // `Watcher::abort_demand_slots` -> `Directory::release_demand_landing`).
+        owner.abort("owner step aborted", |_| Ok(true), &mut |slots| {
+            transport.with_slot_reuse(|can_reuse| {
+                for &(g, s) in slots {
+                    if can_reuse(DestSlot { group: g, slot: s }) {
+                        bank.release_demand_landing(g, s);
+                    } else {
+                        bank.defer_demand_release(g, s);
+                    }
+                }
+            });
+        });
+
+        // Slot MUST NOT be `Record::Free` while borrower still reads!
+        assert!(
+            matches!(bank.records(group)[slot], Record::DemandLanding { .. }),
+            "aborted owner slot with active borrower must stay DemandLanding (deferred), got {:?}",
+            bank.records(group)[slot]
+        );
+        assert!(!transport.can_reuse_slot(dest), "borrower lease still pins dest slot");
+        assert!(
+            !bank.drain_demand_landings(|g, s| transport.can_reuse_slot(DestSlot { group: g, slot: s })),
+            "drain must not free slot while borrower still reads"
+        );
+
+        // Once the borrower finishes and releases its lease, drain frees the slot.
+        borrower.lease.release();
+        assert!(transport.can_reuse_slot(dest));
+        assert!(bank.drain_demand_landings(|g, s| transport.can_reuse_slot(DestSlot { group: g, slot: s })));
+        assert_eq!(bank.records(group)[slot], Record::Free);
+    }
+
+    /// Regression test for narrow-lane DMA stranding (`87f9af`): a layer must
+    /// NOT gate on a 2-step zero-miss streak, and once gated after warmup must
+    /// re-probe within `<= 32` steps.
+    #[test]
+    fn gate_lane_does_not_gate_on_two_zero_miss_streak_and_reprobes_within_32_steps() {
+        let gate = DecodeDmaGate::for_layer(15, false); // maximum phase_offset = 15
+        for _ in 0..2 {
+            assert!(gate.should_split(1));
+            gate.observe(1, 0);
+        }
+        assert!(
+            gate.should_split(1),
+            "2 consecutive zero-miss calls must NOT gate a miss-bearing layer"
+        );
+        assert!(gate.is_splitting());
+
+        // Complete the remaining warmup calls with zero misses to trigger gating.
+        for _ in 2..SPLIT_DMA_WARMUP_CALLS {
+            assert!(gate.should_split(1));
+            gate.observe(1, 0);
+        }
+        assert!(!gate.is_splitting(), "layer should gate after {SPLIT_DMA_WARMUP_CALLS} zero-miss calls");
+
+        let mut skipped = 0u32;
+        while !gate.should_split(1) {
+            skipped += 1;
+            assert!(skipped <= 32, "gated layer must re-probe within <= 32 steps, got {skipped}");
+        }
+        assert!(
+            (SPLIT_DMA_COOLDOWN_STEPS..=31).contains(&skipped),
+            "expected cooldown in {SPLIT_DMA_COOLDOWN_STEPS}..=31, got {skipped}"
+        );
+    }
+
+    /// Acceptance check (`astra` `mb3c7r`): replaying two (or many) zero-miss
+    /// narrow calls followed by a miss-heavy wide call in the same layer must
+    /// leave the first wide decision eligible for split DMA regardless of how
+    /// many narrow calls preceded it.
+    #[test]
+    fn gate_lane_narrow_zero_miss_streak_never_suppresses_first_wide_verify_call() {
+        let gate = DecodeDmaGate::for_layer(0, false);
+        // First 2 zero-miss narrow calls.
+        for _ in 0..2 {
+            assert!(gate.should_split(1));
+            gate.observe(1, 0);
+        }
+        assert!(
+            gate.should_split(WIDE_VERIFY_ROWS),
+            "first wide call after 2 zero-miss narrow calls must remain eligible for split DMA"
+        );
+
+        // Even after gating the narrow lane completely (20 zero-miss narrow calls),
+        // the wide lane's first decision is completely unaffected.
+        for _ in 0..20 {
+            if gate.should_split(1) {
+                gate.observe(1, 0);
+            }
+        }
+        assert!(!gate.should_split(1), "narrow lane is gated");
+        assert!(
+            gate.should_split(WIDE_VERIFY_ROWS),
+            "wide lane must remain eligible for split DMA regardless of narrow-lane gating"
+        );
+        gate.observe(WIDE_VERIFY_ROWS, 9 * 1024 * 1024);
+        assert!(gate.should_split(WIDE_VERIFY_ROWS));
     }
 }

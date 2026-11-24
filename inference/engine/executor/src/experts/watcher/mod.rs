@@ -1174,15 +1174,22 @@ impl Watcher {
         claims
     }
 
-    /// Release aborted/faulted `Record::DemandLanding` slots back to `Free`.
+    /// Release aborted `Record::DemandLanding` slots: returns unpinned slots to
+    /// `Free` immediately and defers release under residency for any slot still
+    /// pinned by a joined consumer (matching normal finish).
     pub(in crate::experts) fn abort_demand_slots(&self, slots: &[(usize, usize)]) {
         if slots.is_empty() {
             return;
         }
         let mut held = residency::lock(&self.state);
-        for &(group, slot) in slots {
-            held.core.directory.release_demand_landing(group, slot);
-        }
+        let transport = self.shared.transport.clone();
+        let directory = &mut held.core.directory;
+        transport.with_slot_reuse(|can_reuse| {
+            for &(group, slot) in slots {
+                let reusable = can_reuse(crate::experts::transport::DestSlot { group, slot });
+                directory.release_demand_landing(group, slot, reusable);
+            }
+        });
     }
 
     /// Zero-recopy O(1) completion of freshly landed `DemandSlot`s: promotes
