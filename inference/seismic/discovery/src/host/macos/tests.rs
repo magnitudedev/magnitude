@@ -104,7 +104,7 @@ fn a_snapshot_pairs_with_the_paging_read_when_it_was_first_served() {
         ..unsafe { std::mem::zeroed() }
     };
     let start = Instant::now();
-    let first = paired(None, statistics(10), start, 3, 0);
+    let first = paired(None, statistics(10), start, 3, 0, None);
     assert_eq!(
         (first.counted, first.own),
         (
@@ -124,6 +124,7 @@ fn a_snapshot_pairs_with_the_paging_read_when_it_was_first_served() {
         start + Duration::from_millis(40),
         5,
         0,
+        None,
     );
     assert_eq!(
         (again.counted, again.own),
@@ -145,6 +146,7 @@ fn a_snapshot_pairs_with_the_paging_read_when_it_was_first_served() {
         start + Duration::from_millis(70),
         6,
         0,
+        None,
     );
     assert_eq!(
         (fresh.counted, fresh.own),
@@ -165,6 +167,7 @@ fn a_snapshot_pairs_with_the_paging_read_when_it_was_first_served() {
         start + Duration::from_secs(5),
         7,
         0,
+        None,
     );
     assert_eq!(
         late.counted,
@@ -198,31 +201,51 @@ fn the_file_floor_is_what_the_os_keeps_as_it_compresses() {
         file_floor,
     };
     let target = 4000;
-    assert_eq!(file_floor(None, &statistics(0, 100_000, 120_000), target), 0);
+    assert_eq!(file_floor(None, &statistics(0, 100_000, 120_000), target, None), 0);
     let rest = snapshot(statistics(10, 100_000, 120_000), 0);
     assert_eq!(
-        file_floor(Some(&rest), &statistics(5_000, 100_000, 120_000), target),
+        file_floor(Some(&rest), &statistics(5_000, 100_000, 120_000), target, None),
         0
     );
     let pressed = statistics(30_000, 4_500, 95_000);
-    assert_eq!(file_floor(Some(&rest), &pressed, target), 95_000);
+    assert_eq!(file_floor(Some(&rest), &pressed, target, None), 95_000);
+    assert_eq!(
+        file_floor(Some(&rest), &pressed, target, Some(PressureLevel::Warn)),
+        95_000,
+        "under Warn pressure, genuine compression exceeding eviction latches the floor"
+    );
+    assert_eq!(
+        file_floor(Some(&rest), &pressed, target, Some(PressureLevel::Normal)),
+        0,
+        "at PressureLevel::Normal, opportunistic background compression must not latch clean file cache"
+    );
+    // When XNU actively drains gigabytes of clean file cache during a large
+    // allocation burst (`evicted >= compressed`), clean cache is still being
+    // reclaimed and must not be latched as an un-evictable floor.
+    let pre_load = snapshot(statistics(100, 15_000, 611_000), 0);
+    let during_load = statistics(12_000, 1_000, 500_000);
+    assert_eq!(
+        file_floor(Some(&pre_load), &during_load, target, Some(PressureLevel::Warn)),
+        0,
+        "active file-cache eviction exceeding compressions must not latch file_floor"
+    );
     let kept = snapshot(pressed, 95_000);
     // Without new compressions: floor stays standing (even when free recovers
     // above 4x target after our own shrink), clamped to current external pages.
     assert_eq!(
-        file_floor(Some(&kept), &statistics(30_000, 7_000, 140_000), target),
+        file_floor(Some(&kept), &statistics(30_000, 7_000, 140_000), target, None),
         95_000
     );
     assert_eq!(
-        file_floor(Some(&kept), &statistics(30_000, 7_000, 80_000), target),
+        file_floor(Some(&kept), &statistics(30_000, 7_000, 80_000), target, None),
         80_000
     );
     assert_eq!(
-        file_floor(Some(&kept), &statistics(30_000, 60_000, 140_000), target),
+        file_floor(Some(&kept), &statistics(30_000, 60_000, 140_000), target, None),
         95_000
     );
     assert_eq!(
-        file_floor(Some(&kept), &statistics(60_000, 4_200, 88_000), target),
+        file_floor(Some(&kept), &statistics(60_000, 4_200, 88_000), target, None),
         88_000
     );
     // Bulk file-cache writes (e.g. downloading a GGUF) growing `external`
@@ -232,14 +255,14 @@ fn the_file_floor_is_what_the_os_keeps_as_it_compresses() {
     let pre_download = snapshot(statistics(100, 80_000, 90_000), 0);
     let during_download = statistics(12_000, 2_000, 640_679);
     assert_eq!(
-        file_floor(Some(&pre_download), &during_download, target),
+        file_floor(Some(&pre_download), &during_download, target, None),
         0,
         "growing file cache during download must not latch file_floor"
     );
     let post_download = snapshot(during_download, 0);
     let stray_bg_compression = statistics(12_000 + target, 2_000, 640_679);
     assert_eq!(
-        file_floor(Some(&post_download), &stray_bg_compression, target),
+        file_floor(Some(&post_download), &stray_bg_compression, target, None),
         0,
         "background compressions within free_target must not latch file_floor"
     );
@@ -247,7 +270,7 @@ fn the_file_floor_is_what_the_os_keeps_as_it_compresses() {
     let mut with_spec = statistics(60_000, 4_200, 120_000);
     with_spec.speculative_count = 40_000;
     assert_eq!(
-        file_floor(Some(&kept), &with_spec, target),
+        file_floor(Some(&kept), &with_spec, target, None),
         80_000,
         "speculative file pages are excluded from file_floor"
     );

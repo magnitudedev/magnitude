@@ -160,23 +160,25 @@ pub(super) struct Snapshot {
 }
 
 /// The non-speculative file pages the OS keeps while it compresses others'
-/// memory, as the snapshot `statistics` after `before` shows them: where the OS
-/// compressed more pages between the two than both the free margin above
-/// `free_target` and a full `free_target` refill (`free_count` excludes
-/// `speculative_count` as `vm.page_free_count` does), and non-speculative file
-/// pages did not grow across the span, it chose compressing over the remaining
-/// non-speculative file pages, so those are its floor (mapped libraries or
-/// binaries in use); otherwise the floor `before` showed, clamped to current
-/// non-speculative external file pages. Requiring `non_spec <= prev_non_spec`
-/// and a compression batch past `free_target` prevents bulk file writes (such
-/// as model downloads filling macOS's unified buffer cache and briefly dipping
-/// `free` below `free_target`) or stray background compressions from latching
-/// gigabytes of reclaimable clean file cache as an executable floor, while
-/// still holding genuine mapped-binary floors across calm `free` recovery.
+/// memory under pressure, as the snapshot `statistics` after `before` shows
+/// them: when macOS reports `PressureLevel::Normal` (no VM pressure), XNU's
+/// pageout daemon still compresses idle background anonymous pages
+/// opportunistically alongside clean file-cache eviction, so a Normal reading
+/// never latches a file floor. When under pressure (or where pressure is
+/// unreported), where the OS compressed more pages between the two than both
+/// the free margin above `free_target` and a full `free_target` refill
+/// (`free_count` excludes `speculative_count` as `vm.page_free_count` does),
+/// non-speculative file pages did not grow across the span, and compressions
+/// exceeded file-cache evictions (`compressed > evicted`, proving XNU did not
+/// simply drain clean file cache to meet the allocation burst), it chose
+/// compressing over the remaining non-speculative file pages, so those are its
+/// floor (mapped libraries or binaries in use); otherwise the floor `before`
+/// showed, clamped to current non-speculative external file pages.
 pub(super) fn file_floor(
     before: Option<&Snapshot>,
     statistics: &libc::vm_statistics64,
     free_target: u64,
+    pressure: Option<PressureLevel>,
 ) -> u64 {
     let Some(before) = before else { return 0 };
     let compressed =
@@ -185,10 +187,13 @@ pub(super) fn file_floor(
         .saturating_sub(u64::from(statistics.speculative_count));
     let prev_non_spec = u64::from(before.statistics.external_page_count)
         .saturating_sub(u64::from(before.statistics.speculative_count));
+    let evicted = prev_non_spec.saturating_sub(non_spec);
     let free = u64::from(statistics.free_count).saturating_sub(u64::from(statistics.speculative_count))
         + u64::from(statistics.purgeable_count);
-    let floor = if compressed > free.saturating_sub(free_target).max(free_target)
+    let floor = if !matches!(pressure, Some(PressureLevel::Normal))
+        && compressed > free.saturating_sub(free_target).max(free_target)
         && non_spec <= prev_non_spec
+        && compressed > evicted
     {
         non_spec
     } else {
@@ -218,7 +223,13 @@ static SERVED: std::sync::Mutex<Option<Served>> = std::sync::Mutex::new(None);
 /// sample before's is that snapshot, served again, or the machine's counts
 /// unchanged since, this process's paging among them: it keeps the instant
 /// and the paging it was first read with.
-fn snapshot(sys: &impl Sys, began: Instant, page: u64, free_target: u64) -> (Snapshot, TaskVm) {
+fn snapshot(
+    sys: &impl Sys,
+    began: Instant,
+    page: u64,
+    free_target: u64,
+    pressure: Option<PressureLevel>,
+) -> (Snapshot, TaskVm) {
     // A holder that panicked left the last snapshot whole: it is replaced
     // in one store.
     let mut served = SERVED
@@ -235,6 +246,7 @@ fn snapshot(sys: &impl Sys, began: Instant, page: u64, free_target: u64) -> (Sna
         Instant::now(),
         own_paging(&task, page),
         free_target,
+        pressure,
     );
     *served = Some(Served { snapshot, began });
     (snapshot, task)
@@ -249,6 +261,7 @@ pub(super) fn paired(
     at: Instant,
     own: u64,
     free_target: u64,
+    pressure: Option<PressureLevel>,
 ) -> Snapshot {
     match before {
         Some(Served { snapshot, .. })
@@ -274,6 +287,7 @@ pub(super) fn paired(
                 before.as_ref().map(|before| &before.snapshot),
                 &statistics,
                 free_target,
+                pressure,
             );
             Snapshot {
                 statistics,
@@ -468,7 +482,7 @@ pub(crate) fn sample(sys: &impl Sys) -> HostSample {
             file_floor,
         },
         task,
-    ) = snapshot(sys, at, page, free_target_raw);
+    ) = snapshot(sys, at, page, free_target_raw, pressure);
     // Free and volatile purgeable pages (purged at no one's cost) less the
     // free-page target, which the pageout daemon refills by compressing,
     // swapping and evicting other pages: pages taken below it are never free
