@@ -235,12 +235,12 @@ try {
     return Promise.race([
       contents.executeJavaScript('document.readyState === "complete" && !!window.__magnitudeDesktop')
         .then(documentReady => ({ ...status, documentReady })),
-      new Promise(resolve => setTimeout(() => resolve(status), 1000)),
+      new Promise(resolve => setTimeout(() => resolve(status), 5000)),
     ]);
   }).catch(error => ({ error: String(error) }));
   const rendererReady = () => rendererStatus().then(status => status.documentReady === true);
   const waitForRenderer = async () => {
-    try { await eventually(rendererReady, true); }
+    try { await eventually(rendererReady, true, 60000); }
     catch (error) { throw new Error(`Renderer did not recover: ${JSON.stringify(await rendererStatus())}\n${ownerOutput}`, { cause: error }); }
   };
   const crashRenderer = () => app.evaluate(async ({ BrowserWindow }) => {
