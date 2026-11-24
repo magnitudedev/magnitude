@@ -8,7 +8,7 @@
 # no WY piece: its chunk advances every row sequentially, staging its inputs
 # in spans of rows.
 const SEQUENTIAL_ROWS = 7
-const METAL_CHUNK_PIECE = 8
+const METAL_CHUNK_PIECE = 16
 const CUDA_CHUNK_PIECE = 16
 
 # Recurrent (gated delta net) block execution: a normed projection, and the
@@ -578,20 +578,23 @@ fn gated_delta_chunk[M, B, S, NK, NV, W, C, T](
         previous_bank, previous_tape, following_bank, window, delta, tape, norm_epsilon, epsilon, grouped,
         gate_function)
 
-# Metal: `inputs` convolves every row once into scratch, and the scan builds
-# each piece's system in threadgroup memory and stores the raw outputs to
-# `mixed`; `gate` forms each (row, head), one simdgroup whose lanes stride the
-# head's columns, then a simd sum. (CUDA: `prepare` convolves and forms the
-# systems on tensor cores, then the scan.)
+# Metal: pieces of METAL_CHUNK_PIECE rows. `prepare` (per piece and key head)
+# convolves the piece's q, k and v rows once and forms, per value head, the
+# decayed K K^T system's inverse and Q K^T; the scan (per ROWS state rows,
+# value head, slot) keeps the state in `simdgroup_float8x8` registers, widens
+# split-F16 piece operands into F32 threadgroup buffers during staging (for
+# W <= 128; half staging fallback for W > 128), and stores the raw outputs to
+# `mixed`; `gate` forms each (row, head), one simdgroup whose lanes stride
+# the head's columns, then a simd sum.
 native gated_delta_chunk for metal from "metal/gated_delta_chunk.metal":
     static (NK, NV, W, C)
-    params (ROWS in [32, 64, 128] default 32)
-    where W % 32 == 0 and W <= 256 and W % ROWS == 0
-    scratch inputs bytes (M * ((2 * NK + NV) * W + 2 * NV) * 4)
+    params (ROWS in [32, 64, 128] default greatest where W % ROWS == 0 and ROWS <= 64 and (W > 128 or 2 * 16 * (W + 8) * 4 + 16 * (ROWS + 8) * 4 + 2048 + 144 <= device.shared_bytes_per_group) and (W <= 128 or 3 * 16 * (W + 8) * 2 + 16 * (ROWS + 8) * 2 + 1024 + 144 <= device.shared_bytes_per_group))
+    where W % 32 == 0 and W <= 256 and W % ROWS == 0 and NV % NK == 0 and NV / NK <= 8 and (W > 128 or 2 * 16 * (W + 8) * 4 + 16 * (ROWS + 8) * 4 + 2048 + 144 <= device.shared_bytes_per_group) and (W <= 128 or 3 * 16 * (W + 8) * 2 + 16 * (ROWS + 8) * 2 + 1024 + 144 <= device.shared_bytes_per_group)
+    scratch pieces bytes ((ceil_div(M, METAL_CHUNK_PIECE) + B) * (NK * 96 * W + NV * (32 * W + 1168)))
     scratch mixed bytes (M * NV * W * 4)
-    launch gated_delta_chunk_inputs:
-        threadgroups (M, ceil_div(2 * NK + NV, 4), 1)
-        threads_per_threadgroup (128, 1, 1)
+    launch gated_delta_chunk_prepare:
+        threadgroups (ceil_div(M, METAL_CHUNK_PIECE) + B, NK, 1)
+        threads_per_threadgroup (256, 1, 1)
     launch gated_delta_chunk_scan:
         threadgroups (W / ROWS, NV, B)
         threads_per_threadgroup (2 * ROWS, 1, 1)
@@ -837,24 +840,19 @@ fn kimi_delta_chunk[M, B, S, NK, NV, W, C, T](
         recurrent_norm, segments, stop, previous_bank, previous_tape, following_bank, window, delta,
         tape, norm_epsilon, epsilon, decay_lower, grouped, gate_function)
 
-# Metal: `gated_delta_chunk`'s launches. The scan forms each piece's shares
-# as direct sums over their key columns, each term's exponential in place.
-# Range: within a piece every exponent is a difference G_ic - G_jc (j <= i),
-# G_ic or G_last,c - G_ic, a sum of log decays of rows of the piece, each
-# <= 0. So no exponential exceeds 1 and none overflows, whatever the decays;
-# the cumulative sums are of at most METAL_CHUNK_PIECE terms, each finite. An
-# exponential that underflows has a true value below 2^-126 and scales a
-# product of unit-norm q and k channels or a state entry, so it drops a term
-# below 2^-126 |S| absolutely: below every output's rounding at any decay.
+# Metal: `gated_delta_chunk`'s pieces of METAL_CHUNK_PIECE rows, where
+# `prepare` forms, per value head, the decayed operand rows Q o exp G,
+# K o exp G and K o exp(G_last - G) and the channels' exp(G_last), and the
+# scan stages those.
 native kimi_delta_chunk for metal from "metal/kimi_delta_chunk.metal":
     static (NK, NV, W, C)
-    params (ROWS in [32, 64, 128] default 32)
-    where W % 32 == 0 and W <= 128 and W % ROWS == 0
-    scratch inputs bytes (M * ((2 * NK + NV) * W + NV + NV * W) * 4)
+    params (ROWS in [32, 64, 128] default greatest where W % ROWS == 0 and ROWS <= 64 and 2 * 16 * (W + 8) * 4 + 16 * (ROWS + 8) * 4 + 2048 + W * 4 <= device.shared_bytes_per_group)
+    where W % 32 == 0 and W <= 128 and W % ROWS == 0 and NV % NK == 0 and NV / NK <= 8 and 2 * 16 * (W + 8) * 4 + 16 * (ROWS + 8) * 4 + 2048 + W * 4 <= device.shared_bytes_per_group
+    scratch pieces bytes ((ceil_div(M, METAL_CHUNK_PIECE) + B) * NV * (196 * W + 1024))
     scratch mixed bytes (M * NV * W * 4)
-    launch kimi_delta_chunk_inputs:
-        threadgroups (M, ceil_div(2 * NK + NV, 4), 1)
-        threads_per_threadgroup (128, 1, 1)
+    launch kimi_delta_chunk_prepare:
+        threadgroups (ceil_div(M, METAL_CHUNK_PIECE) + B, NK, 1)
+        threads_per_threadgroup (256, 1, 1)
     launch kimi_delta_chunk_scan:
         threadgroups (W / ROWS, NV, B)
         threads_per_threadgroup (2 * ROWS, 1, 1)

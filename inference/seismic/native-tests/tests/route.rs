@@ -1810,16 +1810,11 @@ fn a_graph_submission_encodes_every_node_into_one_encoder() {
                 "{:?}: one submission per run",
                 device.backend()
             );
-            assert_eq!(trace[0].launches.len(), nodes);
         }
-        // Only the per-launch form has a timed unit (encoder, pool job) per
-        // launch.
-        assert!(
-            serial_trace[0]
-                .launches
-                .iter()
-                .all(|launch| launch.device.is_none())
-        );
+        // Submission-level traces skip per-launch label collection; only
+        // launch-level traces record each launch and its timed unit.
+        assert!(serial_trace[0].launches.is_empty());
+        assert_eq!(separate_trace[0].launches.len(), nodes);
         assert!(
             separate_trace[0]
                 .launches

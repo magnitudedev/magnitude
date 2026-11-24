@@ -1348,7 +1348,7 @@ fn model(case: &Case, native: Native) -> Modelled {
     let (nk, nv, w, dw) = (g.key_heads, g.value_heads, g.width, g.decay_width);
     let trace = case.trace();
     let (piece, f16, chunks_after) = match native {
-        Native::Chunk(BackendName::Metal) => (METAL_CHUNK_PIECE, false, true),
+        Native::Chunk(BackendName::Metal) => (METAL_CHUNK_PIECE, true, false),
         Native::Chunk(BackendName::Cuda) => (CUDA_CHUNK_PIECE, true, false),
         _ => (0, false, false),
     };

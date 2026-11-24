@@ -106,11 +106,11 @@ impl Native {
         }
     }
 
-    /// Whether the entry also chunks rows after `slot.stop` (writing WY
-    /// innovations directly to the tape): Metal's `*_chunk` entries do for
-    /// slots of more than [`SEQUENTIAL_ROWS`] rows.
-    fn chunks_after(self, slot: &SlotTrace) -> bool {
-        matches!(self, Native::Chunk(BackendName::Metal)) && slot.rows > SEQUENTIAL_ROWS
+    /// Whether the entry also chunks rows after `slot.stop`: false while
+    /// Metal's hoisted PIECE=16 scan advances rows after `slot.stop`
+    /// row-sequentially.
+    fn chunks_after(self, _slot: &SlotTrace) -> bool {
+        false
     }
 
     /// The rows of `slot` the entry advances in pieces before its stop row:
@@ -135,8 +135,8 @@ impl Native {
             Native::Chunk(BackendName::Metal) | Native::Prefill(BackendName::Metal, _) => {
                 Some(Pieces {
                     size: METAL_CHUNK_PIECE,
-                    operands: Operands::F32,
-                    inverse: Inverse::Polynomial,
+                    operands: Operands::F16,
+                    inverse: Inverse::Substitution,
                 })
             }
             Native::Chunk(BackendName::Cuda) | Native::Prefill(BackendName::Cuda, _) => {

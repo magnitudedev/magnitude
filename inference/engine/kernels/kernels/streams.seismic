@@ -251,7 +251,7 @@ native stream_mix_down for metal from "metal/stream_mix_down.metal":
 
 # CUDA: the `dense` projection (segmented) in S parts, the streams. Past one
 # row `stage` stages the normalized streams and publishes the inverses, one
-# block per row. The GEMV classes split K by stream: a block serves one
+# block per row and stream. The GEMV classes split K by stream: a block serves one
 # stream over tiles of down | inject (a one-row block forms the stream's row
 # itself, and the stream's first block publishes its inverse) into F32
 # partial sums, which the last block to arrive adds in stream order through

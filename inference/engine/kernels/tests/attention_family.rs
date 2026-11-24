@@ -3564,6 +3564,41 @@ fn two_source_natives_match_reference() {
     }
 }
 
+/// Metal `attention_decode` with picks (`KS > 0`) admits `TOKENS > 1` in the
+/// matrix form (`MATRIX = 1`) and matches the host model for both mixed
+/// visible+picks rows and picks-only rows (`totals[t] == 0`), including
+/// non-multiple-of-TOKENS batch sizes (`M = 5`).
+#[test]
+fn metal_two_source_decode_multi_tokens_matches_reference() {
+    let Some(device) = devices().into_iter().find(|d| d.backend() == BackendName::Metal) else {
+        return;
+    };
+    let (_, _, mixed) = small_two_source_cases().into_iter().next().unwrap();
+    let mut picks_only = mixed.clone();
+    for row in 0..picks_only.rows {
+        for r in 0..picks_only.spans {
+            picks_only.visible[(row * picks_only.spans + r) * 2] = 0;
+            picks_only.visible[(row * picks_only.spans + r) * 2 + 1] = 0;
+        }
+        picks_only.fresh[row * 2] = 0;
+        picks_only.fresh[row * 2 + 1] = 0;
+    }
+    for (name, case) in [("mixed visible+picks", mixed), ("picks-only", picks_only)] {
+        let expected = case.expected();
+        for tokens in [2u64, 4u64] {
+            let specialization = statics(&device, case.form, case.sink_rows())
+                .with_param("MATRIX", 1)
+                .with_param("KEYS", 16)
+                .with_param("TOKENS", tokens)
+                .with_param("SIMDS", 4)
+                .with_param("PARTS", 8);
+            let actual = run(&device, true, &specialization, &case)
+                .unwrap_or_else(|error| panic!("{name} TOKENS={tokens}: {error}"));
+            check(&format!("{name} Metal MATRIX=1 TOKENS={tokens}"), &actual, &expected, &case);
+        }
+    }
+}
+
 /// The prefill entry with picks (KS > 0, Metal's shared-tile rows) equals
 /// the F32 reference at V4.1's shape: window prefill rows with 512 picks a
 /// row, and the same rows naming only their first 100 picks (the rest -1),

@@ -209,4 +209,59 @@ mod tests {
         let head = constants::GUESS_HEAD as i32;
         let _ = step_guesses([(1, chained), (1, head)]);
     }
+
+    #[test]
+    fn metal_routed_down_admissible_for_ds4_shape() {
+        let bf16 = seismic::Element::bf16();
+        let f32 = seismic::Element::f32();
+        let i32 = seismic::Element::i32();
+        let weight_formats = [
+            ("iq2xxs", seismic::Element::stored("iq2xxs", seismic::Layout::Rows16).unwrap()),
+            ("iq1m", seismic::Element::stored("iq1m", seismic::Layout::Rows16).unwrap()),
+            ("iq2xs", seismic::Element::stored("iq2xs", seismic::Layout::Rows16).unwrap()),
+            ("q4_0", seismic::Element::stored("q4g32s", seismic::Layout::Rows16).unwrap()),
+            ("bf16", bf16),
+        ];
+        let (m, h, e, k, f, xs, tr) = (1u64, 5120u64, 4u64, 3u64, 2304u64, 0u64, 0u64);
+        for (label, edw) in weight_formats {
+            let mut graph = seismic::NativeGraphMetadata::new(seismic::BackendName::Metal);
+            let base = graph.port(f32, &[m, h]).unwrap();
+            let product = graph.port(bf16, &[m, k, f]).unwrap();
+            let routes = graph.port(i32, &[m, k]).unwrap();
+            let sources = graph.port(i32, &[xs, m, k]).unwrap();
+            let weights = graph.port(f32, &[m, k]).unwrap();
+            let expert_down = graph.port(edw, &[e, h, f]).unwrap();
+            let tier_down = graph.port(edw, &[tr, h, f]).unwrap();
+            let policy = graph.port(i32, &[constants::POLICY_WORDS]).unwrap();
+            graph
+                .enqueue::<routed_down::Entry>(
+                    &[("A", bf16), ("EDW", edw), ("R", f32)],
+                    &[
+                        ("M", m),
+                        ("H", h),
+                        ("E", e),
+                        ("K", k),
+                        ("F", f),
+                        ("XS", xs),
+                        ("TR", tr),
+                    ],
+                    routed_down::WorkflowArgs {
+                        base: base.tensor().into(),
+                        product: product.tensor().into(),
+                        routes: routes.tensor().into(),
+                        sources: sources.tensor().into(),
+                        weights: weights.tensor().into(),
+                        expert_down: expert_down.tensor().into(),
+                        tier_down: tier_down.tensor().into(),
+                        policy: policy.tensor().into(),
+                    },
+                )
+                .unwrap_or_else(|error| {
+                    panic!("routed_down Metal admissibility failed for {label} at H={h}, K={k}, F={f}: {error}")
+                });
+            graph.seal().unwrap_or_else(|error| {
+                panic!("routed_down Metal graph seal failed for {label}: {error}")
+            });
+        }
+    }
 }

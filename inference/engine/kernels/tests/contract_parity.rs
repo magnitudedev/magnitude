@@ -781,16 +781,11 @@ fn contract_node_shape_presence_matches_native_implementation_all_entries() {
         slot_succeeded,
         store_pair,
         request_slot,
-        hint,
-        hint_selected,
-        publish_hints,
         resolve,
         first_of,
         assign,
         routed_route_streamed,
-        routed_hint_route,
         routed_select_streamed,
-        routed_hint_select,
         routed_site_request,
         site_publish,
         any_sited,
@@ -920,4 +915,359 @@ fn contract_node_shape_presence_matches_native_implementation_all_entries() {
         checked, catalog,
         "contract_node_shape parity test must cover every entry in magnitude_kernels"
     );
+}
+
+struct OverrideDevice {
+    backend: BackendName,
+    overrides: &'static [(&'static str, u64)],
+}
+
+impl seismic::device::DeviceValues for OverrideDevice {
+    fn value(&self, name: &str) -> u64 {
+        self.overrides
+            .iter()
+            .find(|(k, _)| *k == name)
+            .map(|(_, v)| *v)
+            .unwrap_or_else(|| seismic::device::BackendFloor(self.backend).value(name))
+    }
+
+    fn measured(&self, name: &str) -> Option<u64> {
+        seismic::device::BackendFloor(self.backend).measured(name)
+    }
+}
+
+fn param_value(params: &[(&str, u64)], name: &str) -> u64 {
+    params
+        .iter()
+        .find(|(k, _)| *k == name)
+        .map(|(_, v)| *v)
+        .unwrap_or_else(|| panic!("missing parameter `{name}` in {params:?}"))
+}
+
+#[test]
+fn canonical_default_gaps_are_closed() {
+    let bf16 = Element::bf16();
+
+    // 1. CUDA routed choice|summed: GATHER_TPW defaults to 1 even when N is wide.
+    let cuda_dev = OverrideDevice {
+        backend: BackendName::Cuda,
+        overrides: &[("units", 48)],
+    };
+    let routed_params = magnitude_kernels::routed_output::Entry::contract_default_params(
+        BackendName::Cuda,
+        Some(&cuda_dev),
+        &[("A", bf16), ("EDW", bf16), ("SDW", bf16), ("NW", bf16)],
+        &[
+            ("M", 4),
+            ("H", 7168),
+            ("SN", 1),
+            ("IN", 0),
+            ("E", 256),
+            ("K", 8),
+            ("F", 2048),
+            ("S", 2048),
+            ("XS", 0),
+            ("TR", 0),
+            ("NO", 0),
+        ],
+    )
+    .expect("CUDA routed_output defaults resolve");
+    assert_eq!(param_value(&routed_params, "GATHER_TPW"), 1);
+
+    // 2. Metal dense single: TALL defaults to 0 when G > 1 (e.g. project_rows G=64),
+    //    and stays 1 when G == 1 and K % 64 == 0.
+    let metal_m5 = OverrideDevice {
+        backend: BackendName::Metal,
+        overrides: &[
+            ("units", 20),
+            ("shared_bytes_per_group", 32768),
+            ("max_group_threads", 1024),
+            ("subgroup_width", 32),
+            ("tensor_ops", 1),
+        ],
+    };
+    let proj_g64 = magnitude_kernels::project_rows::Entry::contract_default_params(
+        BackendName::Metal,
+        Some(&metal_m5),
+        &[("A", bf16), ("W", bf16), ("Y", bf16)],
+        &[("M", 64), ("G", 64), ("K", 128), ("N", 512), ("WS", 0), ("WB", 0)],
+    )
+    .expect("Metal project_rows G=64 defaults resolve");
+    assert_eq!(param_value(&proj_g64, "TALL"), 0);
+
+    let proj_g1 = magnitude_kernels::project_rows::Entry::contract_default_params(
+        BackendName::Metal,
+        Some(&metal_m5),
+        &[("A", bf16), ("W", bf16), ("Y", bf16)],
+        &[("M", 64), ("G", 1), ("K", 128), ("N", 512), ("WS", 0), ("WB", 0)],
+    )
+    .expect("Metal project_rows G=1 defaults resolve");
+    assert_eq!(param_value(&proj_g1, "TALL"), 1);
+
+    // 3. Vulkan attention_decode_k8v4: SLICES follows register-pressure rule bounded by SIMDS=2.
+    let vulkan_v710 = OverrideDevice {
+        backend: BackendName::Vulkan,
+        overrides: &[
+            ("units", 28),
+            ("shared_bytes_per_group", 65536),
+            ("max_group_threads", 1024),
+        ],
+    };
+    let vk_g8_w256 = magnitude_kernels::attention_decode_k8v4::Entry::contract_default_params(
+        BackendName::Vulkan,
+        Some(&vulkan_v710),
+        &[("A", bf16)],
+        &[
+            ("M", 1),
+            ("T", 256),
+            ("KV", 2),
+            ("G", 8),
+            ("P", 128),
+            ("S", 0),
+            ("I", 0),
+            ("U", 0),
+            ("F", 1),
+            ("NQ", 0),
+            ("N", 0),
+            ("NV", 0),
+            ("KC", 64),
+            ("KP", 16),
+            ("VC", 32),
+            ("VP", 16),
+            ("R", 1),
+            ("SK", 0),
+            ("RA", 0),
+            ("RT", 0),
+            ("RO", 0),
+            ("VK", 0),
+        ],
+    )
+    .expect("Vulkan attention_decode_k8v4 G=8 W=256 defaults resolve");
+    assert_eq!(param_value(&vk_g8_w256, "SIMDS"), 2);
+    assert_eq!(param_value(&vk_g8_w256, "SLICES"), 2);
+
+    let vk_g4_w128 = magnitude_kernels::attention_decode_k8v4::Entry::contract_default_params(
+        BackendName::Vulkan,
+        Some(&vulkan_v710),
+        &[("A", bf16)],
+        &[
+            ("M", 1),
+            ("T", 256),
+            ("KV", 4),
+            ("G", 4),
+            ("P", 64),
+            ("S", 0),
+            ("I", 0),
+            ("U", 0),
+            ("F", 1),
+            ("NQ", 0),
+            ("N", 0),
+            ("NV", 0),
+            ("KC", 32),
+            ("KP", 8),
+            ("VC", 16),
+            ("VP", 8),
+            ("R", 1),
+            ("SK", 0),
+            ("RA", 0),
+            ("RT", 0),
+            ("RO", 0),
+            ("VK", 0),
+        ],
+    )
+    .expect("Vulkan attention_decode_k8v4 G=4 W=128 defaults resolve");
+    assert_eq!(param_value(&vk_g4_w128, "SLICES"), 1);
+
+    // 4. Metal attention_decode: MATRIX==2 scales PARTS occupancy by active threadgroup width
+    //    so KV=1, G=64, S=512, units=20 picks PARTS=16 instead of 64.
+    let metal_mla = magnitude_kernels::attention_decode::Entry::contract_default_params(
+        BackendName::Metal,
+        Some(&metal_m5),
+        &[("A", bf16)],
+        &[
+            ("M", 1),
+            ("T", 256),
+            ("KV", 1),
+            ("G", 64),
+            ("P", 0),
+            ("S", 512),
+            ("I", 0),
+            ("U", 0),
+            ("F", 1),
+            ("NQ", 0),
+            ("N", 0),
+            ("NV", 0),
+            ("R", 1),
+            ("SK", 0),
+            ("RA", 0),
+            ("RT", 0),
+            ("RO", 0),
+            ("VK", 0),
+            ("KR", 0),
+            ("AB", 0),
+            ("KS", 0),
+            ("TS", 0),
+        ],
+    )
+    .expect("Metal attention_decode MLA defaults resolve");
+    assert_eq!(param_value(&metal_mla, "MATRIX"), 2);
+    assert_eq!(param_value(&metal_mla, "PARTS"), 16);
+
+    // 5. Routed decode GATHERED defaults to 1 across CUDA and Metal, and Metal
+    //    summed keeps LANES=8 whenever SUMMED_STAGE <= 32 (falling back to 16
+    //    only when LANES=8 with ROWS=2 exceeds the 8-packet register budget).
+    let cuda_gate_up = magnitude_kernels::routed_gate_up::Entry::contract_default_params(
+        BackendName::Cuda,
+        Some(&cuda_dev),
+        &[("A", bf16), ("EGW", bf16), ("EUW", bf16)],
+        &[
+            ("M", 2),
+            ("H", 7168),
+            ("E", 256),
+            ("K", 8),
+            ("F", 2048),
+            ("GS", 0),
+            ("US", 0),
+            ("XS", 0),
+            ("TR", 0),
+            ("LB", 0),
+        ],
+    )
+    .expect("CUDA routed_gate_up defaults resolve");
+    assert_eq!(param_value(&cuda_gate_up, "GATHERED"), 1);
+    assert_eq!(param_value(&cuda_gate_up, "GATHER_TPW"), 1);
+
+    let metal_down_k8 = magnitude_kernels::routed_down::Entry::contract_default_params(
+        BackendName::Metal,
+        Some(&metal_m5),
+        &[("A", bf16), ("EDW", bf16), ("R", bf16)],
+        &[
+            ("M", 4),
+            ("H", 4096),
+            ("E", 256),
+            ("K", 8),
+            ("F", 1536),
+            ("XS", 0),
+            ("TR", 0),
+        ],
+    )
+    .expect("Metal routed_down K=8 F=1536 defaults resolve");
+    assert_eq!(param_value(&metal_down_k8, "GATHERED"), 1);
+    assert_eq!(param_value(&metal_down_k8, "LANES"), 8);
+    assert_eq!(param_value(&metal_down_k8, "ROWS"), 2);
+
+    let metal_down_k4 = magnitude_kernels::routed_down::Entry::contract_default_params(
+        BackendName::Metal,
+        Some(&metal_m5),
+        &[("A", bf16), ("EDW", bf16), ("R", bf16)],
+        &[
+            ("M", 4),
+            ("H", 4096),
+            ("E", 256),
+            ("K", 4),
+            ("F", 1536),
+            ("XS", 0),
+            ("TR", 0),
+        ],
+    )
+    .expect("Metal routed_down K=4 F=1536 defaults resolve");
+    assert_eq!(param_value(&metal_down_k4, "GATHERED"), 1);
+    assert_eq!(param_value(&metal_down_k4, "LANES"), 16);
+    assert_eq!(param_value(&metal_down_k4, "ROWS"), 2);
+
+    let metal_output = magnitude_kernels::routed_output::Entry::contract_default_params(
+        BackendName::Metal,
+        Some(&metal_m5),
+        &[("A", bf16), ("EDW", bf16), ("SDW", bf16), ("NW", bf16)],
+        &[
+            ("M", 4),
+            ("H", 4096),
+            ("SN", 1),
+            ("IN", 0),
+            ("E", 256),
+            ("K", 8),
+            ("F", 1536),
+            ("S", 1536),
+            ("XS", 0),
+            ("TR", 0),
+            ("NO", 0),
+        ],
+    )
+    .expect("Metal routed_output defaults resolve");
+    assert_eq!(param_value(&metal_output, "GATHERED"), 1);
+    assert_eq!(param_value(&metal_output, "LANES"), 8);
+    assert_eq!(param_value(&metal_output, "ROWS"), 2);
+
+    let metal_gate_up = magnitude_kernels::routed_gate_up::Entry::contract_default_params(
+        BackendName::Metal,
+        Some(&metal_m5),
+        &[("A", bf16), ("EGW", bf16), ("EUW", bf16)],
+        &[
+            ("M", 4),
+            ("H", 4096),
+            ("E", 256),
+            ("K", 8),
+            ("F", 1536),
+            ("GS", 0),
+            ("US", 0),
+            ("XS", 0),
+            ("TR", 0),
+            ("LB", 0),
+        ],
+    )
+    .expect("Metal routed_gate_up defaults resolve");
+    assert_eq!(param_value(&metal_gate_up, "GATHERED"), 1);
+    assert_eq!(param_value(&metal_gate_up, "ROWS"), 1);
+
+    let metal_m2 = OverrideDevice {
+        backend: BackendName::Metal,
+        overrides: &[
+            ("units", 19),
+            ("shared_bytes_per_group", 32768),
+            ("tensor_ops", 0),
+        ],
+    };
+    let metal_gate_up_m2 = magnitude_kernels::routed_gate_up::Entry::contract_default_params(
+        BackendName::Metal,
+        Some(&metal_m2),
+        &[("A", bf16), ("EGW", bf16), ("EUW", bf16)],
+        &[
+            ("M", 4),
+            ("H", 2560),
+            ("E", 512),
+            ("K", 10),
+            ("F", 640),
+            ("GS", 0),
+            ("US", 0),
+            ("XS", 0),
+            ("TR", 0),
+            ("LB", 0),
+        ],
+    )
+    .expect("Metal M2 routed_gate_up defaults resolve");
+    assert_eq!(param_value(&metal_gate_up_m2, "GATHERED"), 0);
+    assert_eq!(param_value(&metal_gate_up_m2, "ROWS"), 1);
+
+    let metal_output_m2 = magnitude_kernels::routed_output::Entry::contract_default_params(
+        BackendName::Metal,
+        Some(&metal_m2),
+        &[("A", bf16), ("EDW", bf16), ("SDW", bf16), ("NW", bf16)],
+        &[
+            ("M", 4),
+            ("H", 2560),
+            ("SN", 1),
+            ("IN", 0),
+            ("E", 512),
+            ("K", 10),
+            ("F", 640),
+            ("S", 640),
+            ("XS", 0),
+            ("TR", 0),
+            ("NO", 0),
+        ],
+    )
+    .expect("Metal M2 routed_output defaults resolve");
+    assert_eq!(param_value(&metal_output_m2, "GATHERED"), 1);
+    assert_eq!(param_value(&metal_output_m2, "LANES"), 8);
+    assert_eq!(param_value(&metal_output_m2, "ROWS"), 2);
 }

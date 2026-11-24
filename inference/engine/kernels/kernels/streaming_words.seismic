@@ -107,8 +107,10 @@ const MAP_WORDS = 6
 #   expert of r rows from RAM, POLICY_CPU_NS + (r − 1) POLICY_CPU_ROW_NS,
 #   and the handshake a request adds (POLICY_HANDSHAKE_NS);
 # - the GPU's: an expert of r rows read in place from the host tier,
-#   max(POLICY_LINK_NS, r POLICY_LINK_ROW_NS), and from the bank,
-#   max(POLICY_HIT_NS, r POLICY_HIT_ROW_NS);
+#   max(POLICY_LINK_NS, r POLICY_LINK_ROW_NS) when uncontended (no CPU-site
+#   work runs beside the link) and max(POLICY_LINK_CONTENDED_NS, r POLICY_LINK_ROW_NS)
+#   when CPU-site runs concurrently on the shared host-RAM bus, and from the
+#   bank, max(POLICY_HIT_NS, r POLICY_HIT_ROW_NS);
 # - the link's: what the step's moves (promotions into the bank) hold it,
 #   a layer's share (POLICY_LINK_BUSY_NS), none where nothing moves.
 # POLICY_PRICED is set once every line the assignment reads is measured;
@@ -129,15 +131,17 @@ const MAP_WORDS = 6
 # starts at its hits, the sum over the distinct hit experts of their
 # resident lines, and a read in place at no sooner than POLICY_LINK_BUSY_NS,
 # the link held by the moves before it; the CPU's at zero. The distinct
-# missed experts (those the
-# tier holds; across a link also those it lacks, which land in it first)
-# are taken by rows, most first, ties in choice order; each goes to the CPU
-# when it ends there no later than in place (its line, plus the handshake
-# for the CPU's first), else to the GPU in place: the miss goes where the
-# makespan of the GPU, the link and the CPU ends least. Until POLICY_PRICED is set
-# (every line it reads measured, a site's CPU lines among them) no miss is
-# assigned: every one is the GPU's in place, the CPU site off. Every choice
-# of an expert goes to its expert's side.
+# missed experts (those the tier holds; across a link also those it lacks,
+# which land in it first) are ordered by rows, fewest first, ties in choice
+# order. Offloading the first C of N misses to the CPU (paying the handshake
+# once when C > 0) and serving the remaining N - C on the GPU at the contended
+# link rate (POLICY_LINK_CONTENDED_NS, at least POLICY_LINK_NS; none when
+# C == N) is chosen over GPU-only uncontended (C = 0, POLICY_LINK_NS) only
+# where its joint makespan max(T_gpu(N - C), T_cpu(C)) is strictly less than
+# T_gpu_only(N), selecting the C minimizing the makespan (ties to smaller C).
+# Until POLICY_PRICED is set (every line it reads measured, a site's CPU lines
+# among them) no miss is assigned: every one is the GPU's in place, the CPU
+# site off. Every choice of an expert goes to its expert's side.
 const POLICY_WHOLE = 0
 const POLICY_HOME = 1
 const POLICY_PRICED = 2
@@ -149,8 +153,8 @@ const POLICY_LINK_ROW_NS = 7
 const POLICY_HIT_NS = 8
 const POLICY_HIT_ROW_NS = 9
 const POLICY_RESOLVED = 10
-const POLICY_HINTS = 11
-const POLICY_LINK_BUSY_NS = 12
+const POLICY_LINK_BUSY_NS = 11
+const POLICY_LINK_CONTENDED_NS = 12
 const POLICY_WORDS = 13
 
 # A routing weight as the words carry it (a ring entry's HINT_WEIGHT): its
@@ -443,15 +447,9 @@ const HINT_RANK = 1
 const HINT_ROW = 2
 const HINT_WEIGHT = 3
 
-# The first word of a hint or front ring's entry `E`: a ring of E entries
-# ends there (the host's `RegionWords::ring_words`).
+# The first word of a front ring's entry `E`: a ring of E entries ends
+# there (the host's `RegionWords::ring_words`).
 const HINT_ENTRY(E) = RING_EXPERTS + HINT_ENTRY_WORDS * E
-
-# The hint form's leads: a streamed layer's hint launch (`routed_hint_route`,
-# `routed_hint_select`) routes the next layer (`next_*`) and the after layer
-# (`after_*`), a hint ring's row each (`rings[AHEAD, RING]`, AHEAD at most
-# HINT_LEADS), so no launch hints further.
-const HINT_LEADS = 2
 
 # A layer's routing records `routing[FLIGHT, ROUTING_WORDS(P)]`, one for each
 # step in flight (the host's bound on steps begun and not ended), the one of

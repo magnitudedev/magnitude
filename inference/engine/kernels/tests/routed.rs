@@ -16,7 +16,7 @@ use seismic::BackendName;
 use magnitude_kernels::{
     SlotTable, constants, routed_combine, routed_copy, routed_down, routed_expand,
     gated_delta_project, routed_experts, routed_experts_up, routed_gate_up, routed_gate_up_part, routed_group,
-    routed_hint_route, routed_hint_select, routed_land, routed_list_grid, routed_output, routed_pass_map, routed_round,
+    routed_land, routed_list_grid, routed_output, routed_pass_map, routed_round,
     routed_route, routed_route_shared, routed_route_streamed, routed_scratch_grids, routed_scratch_request,
     routed_seed_commit, routed_select, routed_select_streamed, routed_step, routed_up,
 };
@@ -2579,8 +2579,8 @@ fn decode_specialization<E: seismic::Entry>(
         .unwrap();
     let statics = single_stream_statics(&implementation.statics, statics);
     // The per-choice decode expansion, for an entry with a gathered form
-    // the mapping does not name (`GATHERED`).
-    let forms = [("GATHERED", 0)].into_iter().filter(|(name, _)| {
+    // the mapping does not name (`GATHERED`, `MATRIX`).
+    let forms = [("GATHERED", 0), ("MATRIX", 0)].into_iter().filter(|(name, _)| {
         implementation.params.iter().any(|parameter| parameter.name == *name)
             && !mapping.iter().any(|(given, _)| given == name)
     });
@@ -2618,14 +2618,16 @@ fn decode_specialization<E: seismic::Entry>(
     // Each launch parameter `mapping` leaves unvalued at its declared
     // default: those of Metal's two-row and several-row launches, which
     // their row counts tune apart from the one-row launch `mapping` names.
-    let dimension = |name: &str| statics.iter().find(|(given, _)| *given == name).map(|(_, value)| *value);
-    let mut defaults = implementation.parameter_defaults(&dimension).unwrap().into_iter().skip(implementation.params.len());
     let mut specialization = mapped;
-    for (launch, declaration) in implementation.launches.iter().enumerate() {
-        for parameter in &declaration.params {
-            let default = defaults.next().expect("a default for every launch parameter");
-            if specialization.launch_param(launch, &parameter.name).is_none() {
-                specialization = specialization.with_launch_param(launch, parameter.name.as_str(), default);
+    if implementation.launches.iter().any(|launch| !launch.params.is_empty()) {
+        let dimension = |name: &str| statics.iter().find(|(given, _)| *given == name).map(|(_, value)| *value);
+        let mut defaults = implementation.parameter_defaults(&dimension).unwrap().into_iter().skip(implementation.params.len());
+        for (launch, declaration) in implementation.launches.iter().enumerate() {
+            for parameter in &declaration.params {
+                let default = defaults.next().expect("a default for every launch parameter");
+                if specialization.launch_param(launch, &parameter.name).is_none() {
+                    specialization = specialization.with_launch_param(launch, parameter.name.as_str(), default);
+                }
             }
         }
     }
@@ -5586,6 +5588,523 @@ fn native_35b_shared_route_keeps_every_bit() {
     native_35b_shared_route_cases(&device, &(1..=8).collect::<Vec<_>>(), &shared_route_mappings(&device), &[8, 4, 2]);
 }
 
+/// At `M = 10` (`ordered_gemv16`, exercising `gemv_batch` for the unordered
+/// shared-expert segment, 8-row gathered `routed_gate_up`, and 10-row
+/// single-pass `routed_output`), routes/scores/normalized/coefficient match
+/// bit-for-bit and shared_product + output match within BF16 tolerance.
+#[test]
+fn native_35b_shared_route_verify10_matches_reference() {
+    let Some(device) = shared_route_device() else {
+        return;
+    };
+    let charges = seismic::Charges::tally(&device);
+    let block = Qwen35b::new(&device);
+    let (h, e, k, f, s) = (
+        Qwen35b::HIDDEN as u64,
+        Qwen35b::EXPERTS as u64,
+        Qwen35b::CHOICES as u64,
+        Qwen35b::FEATURES as u64,
+        Qwen35b::SHARED as u64,
+    );
+    let rows = 10usize;
+    let m = rows as u64;
+    let bf16 = seismic::Element::bf16();
+    let (q4k, q8) = (element(&device, "q4k"), element(&device, "q8g32s"));
+    let norm = bf16_tensor(&device, &[h], &block.norm);
+    let router = bf16_tensor(&device, &[e, h], &block.router);
+    let shared_router = f32_tensor(&device, &[h], &block.shared_router);
+    let unscaled = absent(&device);
+    let residual = Qwen35b::residual(rows);
+    let routing = block.route_mappings(&device, &residual, &[8]);
+    let residual_tensor = f32_tensor(&device, &[m, h], &residual);
+    let bits = |values: &[f32]| values.iter().map(|v| v.to_bits()).collect::<Vec<_>>();
+    let expanded = declared::prepared(
+        &device,
+        &routed_expand::native_entry_with(routed_expand::Elements {
+            A: bf16,
+            EGW: q4k,
+            EUW: q4k,
+            SGW: q8,
+            SUW: q8,
+        }),
+        &decode_specialization::<routed_expand::Entry>(
+            &device,
+            &[("H", h), ("K", k), ("F", f), ("S", s)],
+            &[("SIMDGROUPS", 8), ("ROWS", 1), ("LANES", 16), ("GATHERED", 1)],
+        ),
+    )
+    .unwrap()
+    .call(&charges, routed_expand::Args {
+        normalized: &routing.normalized,
+        routes: &routing.routes,
+        expert_gate: &block.expert_gate,
+        expert_up: &block.expert_up,
+        shared_gate: &block.shared_gate,
+        shared_up: &block.shared_up,
+        gate_scale: &unscaled,
+        up_scale: &unscaled,
+    })
+    .unwrap();
+    let (expert_product, shared_product) = (read_bf16(&expanded.r0), read_bf16(&expanded.r1));
+    let mut routes = i32_tensor(&device, &[m, k], &vec![-7; rows * Qwen35b::CHOICES]);
+    let mut scores = f32_tensor(&device, &[m, k], &vec![-7.0; rows * Qwen35b::CHOICES]);
+    let shared = declared::prepared(
+        &device,
+        &routed_route_shared::native_entry_with(routed_route_shared::Elements {
+            NW: bf16,
+            RW: bf16,
+            SRW: seismic::Element::f32(),
+            A: bf16,
+            SGW: q8,
+            SUW: q8,
+        }),
+        &specialize(
+            &route_statics(&[("H", h), ("E", e), ("K", k), ("S", s)], h, 0),
+            &[("SIMDGROUPS", 8), ("ROWS", 1), ("LANES", 16)],
+        ),
+    )
+    .unwrap()
+    .call(&charges, routed_route_shared::Args {
+        residual: &residual_tensor,
+        norm: &norm,
+        router: &router,
+        shared_router: &shared_router,
+        shared_gate: &block.shared_gate,
+        shared_up: &block.shared_up,
+        routes: &mut routes,
+        scores: &mut scores,
+        eps: 1e-6,
+        normalize: 1,
+        expert_scale: &unscaled,
+    })
+    .unwrap();
+    assert_eq!(read_i32(&routes), routing.routes_values, "M=10 routes");
+    assert_eq!(bits(&read_f32(&scores)), bits(&routing.scores_values), "M=10 scores");
+    assert_eq!(bits(&read_bf16(&shared.r0)), bits(&routing.normalized_values), "M=10 normalized");
+    assert_eq!(bits(&read_f32(&shared.r1)), bits(&routing.coefficient_values), "M=10 coefficient");
+    assert_near("M=10 shared_product", &read_bf16(&shared.r2), &shared_product, 2e-2, 2e-2);
+    let choices = declared::prepared(
+        &device,
+        &routed_gate_up::native_entry_with(routed_gate_up::Elements {
+            A: bf16,
+            EGW: q4k,
+            EUW: q4k,
+        }),
+        &decode_specialization::<routed_gate_up::Entry>(
+            &device,
+            &[("H", h), ("K", k), ("F", f), ("XS", 0)],
+            &[("SIMDGROUPS", 8), ("ROWS", 2), ("LANES", 16), ("GATHERED", 1)],
+        ),
+    )
+    .unwrap()
+    .call(&charges, routed_gate_up::Args {
+        normalized: &routing.normalized,
+        routes: &routing.routes,
+        sources: &no_sources(&device, m, k),
+        expert_gate: &block.expert_gate,
+        expert_up: &block.expert_up,
+        tier_gate: &no_tier(&block.expert_gate),
+        tier_up: &no_tier(&block.expert_up),
+        activation: 0,
+        glu_limit: &no_limit(&device),
+        gate_scale: &unscaled,
+        up_scale: &unscaled,
+    })
+    .unwrap()
+    .value;
+    assert_eq!(bits(&read_bf16(&choices)), bits(&expert_product), "M=10 gate_up choices");
+    let run_output = |gathered_flag: u64| {
+        let value = declared::prepared(
+            &device,
+            &routed_output::native_entry_with(routed_output::Elements {
+                A: bf16,
+                EDW: block.expert_down.element(),
+                SDW: block.shared_down.element(),
+                NW: seismic::Element::f32(),
+            }),
+            &decode_specialization::<routed_output::Entry>(
+                &device,
+                &[("H", h), ("K", k), ("F", f), ("S", s), ("XS", 0)],
+                &[("ROWS", 2), ("LANES", 8), ("GATHERED", gathered_flag)],
+            ),
+        )
+        .unwrap()
+        .call(&charges, routed_output::Args {
+            residual: &residual_tensor,
+            inject: &no_inject(&device, m),
+            expert_product: &expanded.r0,
+            shared_product: &expanded.r1,
+            routes: &routing.routes,
+            sources: &no_sources(&device, m, k),
+            scores: &routing.scores,
+            coefficient: &routing.coefficient,
+            expert_down: &block.expert_down,
+            tier_down: &no_tier(&block.expert_down),
+            shared_down: &block.shared_down,
+            operand_norm: &unscaled,
+            operand_epsilon: 0.0,
+        })
+        .unwrap()
+        .value;
+        read_f32(&value)
+    };
+    let out_ungathered = run_output(0);
+    let out_gathered = run_output(1);
+    assert_eq!(
+        bits(&out_gathered),
+        bits(&out_ungathered),
+        "M=10 routed_output gathered vs ungathered"
+    );
+}
+
+/// Boundary check for the `ordered_gemv16` arithmetic contract: with an
+/// identical anchor row and near-tied router expert logits sensitive to
+/// FMA/reduction order, `M = 9` and `M = 16` must match `M = 1` bit-for-bit on
+/// every ordered output (`routes`, `scores`, `normalized`, `coefficient`).
+#[test]
+fn native_35b_shared_route_ordered_gemv16_matches_m1_bit_for_bit() {
+    let Some(device) = shared_route_device() else {
+        return;
+    };
+    let charges = seismic::Charges::tally(&device);
+    let block = Qwen35b::new(&device);
+    let (h, e, k, s) = (
+        Qwen35b::HIDDEN as u64,
+        Qwen35b::EXPERTS as u64,
+        Qwen35b::CHOICES as u64,
+        Qwen35b::SHARED as u64,
+    );
+    let bf16 = seismic::Element::bf16();
+    let q8 = element(&device, "q8g32s");
+    let norm = bf16_tensor(&device, &[h], &block.norm);
+    // Construct near-tied router rows so experts 0..16 have nearly cancelling
+    // dot products that depend on exact 8-lane reference FMA/reduction order.
+    let mut near_tied = block.router.clone();
+    let h_usize = Qwen35b::HIDDEN;
+    for expert in 1..16usize.min(Qwen35b::EXPERTS) {
+        let base = near_tied[..h_usize].to_vec();
+        let row = &mut near_tied[expert * h_usize..(expert + 1) * h_usize];
+        row.copy_from_slice(&base);
+        // Flip tiny alternating perturbations at distinct column lanes.
+        let col = (expert * 7) % h_usize;
+        row[col] += 1e-4 * (expert as f32);
+        row[(col + 1) % h_usize] -= 1e-4 * (expert as f32);
+    }
+    let router = bf16_tensor(&device, &[e, h], &near_tied);
+    let shared_router = f32_tensor(&device, &[h], &block.shared_router);
+    let unscaled = absent(&device);
+    let bits = |values: &[f32]| values.iter().map(|v| v.to_bits()).collect::<Vec<_>>();
+    let prepared = declared::prepared(
+        &device,
+        &routed_route_shared::native_entry_with(routed_route_shared::Elements {
+            NW: bf16,
+            RW: bf16,
+            SRW: seismic::Element::f32(),
+            A: bf16,
+            SGW: q8,
+            SUW: q8,
+        }),
+        &specialize(
+            &route_statics(&[("H", h), ("E", e), ("K", k), ("S", s)], h, 0),
+            &[("SIMDGROUPS", 8), ("ROWS", 1), ("LANES", 16)],
+        ),
+    )
+    .unwrap();
+    let run = |residual_vals: &[f32], rows: usize| {
+        let m = rows as u64;
+        let residual_tensor = f32_tensor(&device, &[m, h], residual_vals);
+        let mut routes = i32_tensor(&device, &[m, k], &vec![-7; rows * Qwen35b::CHOICES]);
+        let mut scores = f32_tensor(&device, &[m, k], &vec![-7.0; rows * Qwen35b::CHOICES]);
+        let out = prepared
+            .call(&charges, routed_route_shared::Args {
+                residual: &residual_tensor,
+                norm: &norm,
+                router: &router,
+                shared_router: &shared_router,
+                shared_gate: &block.shared_gate,
+                shared_up: &block.shared_up,
+                routes: &mut routes,
+                scores: &mut scores,
+                eps: 1e-6,
+                normalize: 1,
+                expert_scale: &unscaled,
+            })
+            .unwrap();
+        (read_i32(&routes), read_f32(&scores), read_bf16(&out.r0), read_f32(&out.r1))
+    };
+
+    let all_rows = Qwen35b::residual(16);
+    let anchor = &all_rows[..h_usize];
+    let (ref_routes, ref_scores, ref_norm, ref_coeff) = run(anchor, 1);
+
+    for rows in [9usize, 16usize] {
+        let mut batch = all_rows[..rows * h_usize].to_vec();
+        // Place the identical anchor at row 0 and at the last row (`rows - 1`).
+        batch[..h_usize].copy_from_slice(anchor);
+        batch[(rows - 1) * h_usize..rows * h_usize].copy_from_slice(anchor);
+        let (routes, scores, normalized, coeff) = run(&batch, rows);
+        let k_usize = Qwen35b::CHOICES;
+        for row_idx in [0usize, rows - 1] {
+            assert_eq!(
+                &routes[row_idx * k_usize..(row_idx + 1) * k_usize],
+                ref_routes.as_slice(),
+                "M={rows} row {row_idx} routes must match M=1 bit-for-bit"
+            );
+            assert_eq!(
+                bits(&scores[row_idx * k_usize..(row_idx + 1) * k_usize]),
+                bits(&ref_scores),
+                "M={rows} row {row_idx} scores must match M=1 bit-for-bit"
+            );
+            assert_eq!(
+                bits(&normalized[row_idx * h_usize..(row_idx + 1) * h_usize]),
+                bits(&ref_norm),
+                "M={rows} row {row_idx} normalized must match M=1 bit-for-bit"
+            );
+            assert_eq!(
+                coeff[row_idx].to_bits(),
+                ref_coeff[0].to_bits(),
+                "M={rows} row {row_idx} coefficient must match M=1 bit-for-bit"
+            );
+        }
+    }
+}
+
+/// Metal `M=10` verify crush parity: verifies `routed_route_shared` (`ordered_gemv16`
+/// `simdgroup_matrix` path), `routed_gate_up` (`GATHERED=1, MATRIX=1`), and
+/// `routed_output` (`GATHERED=1, MATRIX=1`, including `shared_down`) against
+/// their scalar (`MATRIX=0`) references on Metal.
+#[test]
+fn native_metal_verify_crush_matrix_and_ordered16_parity() {
+    let Some(device) = native_device() else {
+        return;
+    };
+    if device.backend() != seismic::BackendName::Metal {
+        return;
+    }
+    let charges = seismic::Charges::tally(&device);
+    let block = Qwen35b::new(&device);
+    let (h, e, k, f, s) = (
+        Qwen35b::HIDDEN as u64,
+        Qwen35b::EXPERTS as u64,
+        Qwen35b::CHOICES as u64,
+        Qwen35b::FEATURES as u64,
+        Qwen35b::SHARED as u64,
+    );
+    let bf16 = seismic::Element::bf16();
+    let (q4k, q8) = (element(&device, "q4k"), element(&device, "q8g32s"));
+    let norm = bf16_tensor(&device, &[h], &block.norm);
+    let router = bf16_tensor(&device, &[e, h], &block.router);
+    let shared_router = f32_tensor(&device, &[h], &block.shared_router);
+    let unscaled = absent(&device);
+
+    let rows = 10usize;
+    let m = rows as u64;
+    let residual = Qwen35b::residual(rows);
+    let routing = block.route_mappings(&device, &residual, &[8]);
+    let residual_tensor = f32_tensor(&device, &[m, h], &residual);
+
+    // 1. routed_route_shared at M=10 (ordered_gemv16 -> simdgroup_matrix) vs routed_expand scalar reference.
+    let expanded = declared::prepared(
+        &device,
+        &routed_expand::native_entry_with(routed_expand::Elements {
+            A: bf16,
+            EGW: q4k,
+            EUW: q4k,
+            SGW: q8,
+            SUW: q8,
+        }),
+        &decode_specialization::<routed_expand::Entry>(
+            &device,
+            &[("H", h), ("K", k), ("F", f), ("S", s)],
+            &[("SIMDGROUPS", 4), ("ROWS", 2), ("LANES", 16), ("GATHERED", 0), ("MATRIX", 0)],
+        ),
+    )
+    .unwrap()
+    .call(&charges, routed_expand::Args {
+        normalized: &routing.normalized,
+        routes: &routing.routes,
+        expert_gate: &block.expert_gate,
+        expert_up: &block.expert_up,
+        shared_gate: &block.shared_gate,
+        shared_up: &block.shared_up,
+        gate_scale: &unscaled,
+        up_scale: &unscaled,
+    })
+    .unwrap();
+    let (ref_expert_product, ref_shared_product) = (read_bf16(&expanded.r0), read_bf16(&expanded.r1));
+
+    let mut routes_out = i32_tensor(&device, &[m, k], &vec![-7; rows * Qwen35b::CHOICES]);
+    let mut scores_out = f32_tensor(&device, &[m, k], &vec![-7.0; rows * Qwen35b::CHOICES]);
+    let shared = declared::prepared(
+        &device,
+        &routed_route_shared::native_entry_with(routed_route_shared::Elements {
+            NW: bf16,
+            RW: bf16,
+            SRW: seismic::Element::f32(),
+            A: bf16,
+            SGW: q8,
+            SUW: q8,
+        }),
+        &specialize(
+            &route_statics(&[("H", h), ("E", e), ("K", k), ("S", s)], h, 0),
+            &[("SIMDGROUPS", 8), ("ROWS", 4), ("LANES", 16)],
+        ),
+    )
+    .unwrap()
+    .call(&charges, routed_route_shared::Args {
+        residual: &residual_tensor,
+        norm: &norm,
+        router: &router,
+        shared_router: &shared_router,
+        shared_gate: &block.shared_gate,
+        shared_up: &block.shared_up,
+        routes: &mut routes_out,
+        scores: &mut scores_out,
+        eps: 1e-6,
+        normalize: 1,
+        expert_scale: &unscaled,
+    })
+    .unwrap();
+    assert_eq!(read_i32(&routes_out), routing.routes_values, "M=10 routes");
+    let got_shared = read_bf16(&shared.r2);
+    let (max_shared_rel, max_shared_abs) = got_shared
+        .iter()
+        .zip(&ref_shared_product)
+        .fold((0.0f32, 0.0f32), |(mr, ma), (a, b)| {
+            let d = (a - b).abs();
+            (mr.max(d / b.abs().max(1.0)), ma.max(d))
+        });
+    assert!(
+        max_shared_rel <= 1e-2,
+        "M=10 ordered_gemv16 shared_product max rel {max_shared_rel} (abs {max_shared_abs})"
+    );
+
+    // 2. routed_gate_up at M=10 with GATHERED=1, MATRIX=1 vs scalar reference.
+    let gate_up_matrix = declared::prepared(
+        &device,
+        &routed_gate_up::native_entry_with(routed_gate_up::Elements {
+            A: bf16,
+            EGW: q4k,
+            EUW: q4k,
+        }),
+        &decode_specialization::<routed_gate_up::Entry>(
+            &device,
+            &[("H", h), ("K", k), ("F", f)],
+            &[("SIMDGROUPS", 8), ("ROWS", 2), ("LANES", 16), ("GATHERED", 1), ("MATRIX", 1)],
+        ),
+    )
+    .unwrap()
+    .call(&charges, routed_gate_up::Args {
+        normalized: &routing.normalized,
+        routes: &routing.routes,
+        sources: &no_sources(&device, m, k),
+        expert_gate: &block.expert_gate,
+        expert_up: &block.expert_up,
+        tier_gate: &no_tier(&block.expert_gate),
+        tier_up: &no_tier(&block.expert_up),
+        activation: 0,
+        glu_limit: &no_limit(&device),
+        gate_scale: &unscaled,
+        up_scale: &unscaled,
+    })
+    .unwrap()
+    .value;
+    let got_gate_up = read_bf16(&gate_up_matrix);
+    let (max_gate_up_rel, max_gate_up_abs) = got_gate_up
+        .iter()
+        .zip(&ref_expert_product)
+        .fold((0.0f32, 0.0f32), |(mr, ma), (a, b)| {
+            let d = (a - b).abs();
+            (mr.max(d / b.abs().max(1.0)), ma.max(d))
+        });
+    assert!(
+        max_gate_up_rel <= 2e-2,
+        "M=10 routed_gate_up MATRIX=1 max rel {max_gate_up_rel} (abs {max_gate_up_abs})"
+    );
+
+    // 3. routed_output at M=10 with GATHERED=1, MATRIX=1 vs GATHERED=1, MATRIX=0.
+    let no_inject = f32_tensor(&device, &[m, 0], &[]);
+    let no_norm = bf16_tensor(&device, &[0], &[]);
+    let out_ref = declared::prepared(
+        &device,
+        &routed_output::native_entry_with(routed_output::Elements {
+            A: bf16,
+            EDW: block.expert_down.element(),
+            SDW: block.shared_down.element(),
+            NW: bf16,
+        }),
+        &decode_specialization::<routed_output::Entry>(
+            &device,
+            &[("H", h), ("K", k), ("F", f), ("S", s), ("SN", 1), ("IN", 0)],
+            &[("ROWS", 2), ("LANES", 8), ("GATHERED", 1), ("MATRIX", 0)],
+        ),
+    )
+    .unwrap()
+    .call(&charges, routed_output::Args {
+        residual: &residual_tensor,
+        inject: &no_inject,
+        expert_product: &expanded.r0,
+        shared_product: &expanded.r1,
+        routes: &routing.routes,
+        sources: &no_sources(&device, m, k),
+        scores: &routing.scores,
+        coefficient: &routing.coefficient,
+        expert_down: &block.expert_down,
+        tier_down: &no_tier(&block.expert_down),
+        shared_down: &block.shared_down,
+        operand_norm: &no_norm,
+        operand_epsilon: 0.0,
+    })
+    .unwrap()
+    .value;
+    let out_mat = declared::prepared(
+        &device,
+        &routed_output::native_entry_with(routed_output::Elements {
+            A: bf16,
+            EDW: block.expert_down.element(),
+            SDW: block.shared_down.element(),
+            NW: bf16,
+        }),
+        &decode_specialization::<routed_output::Entry>(
+            &device,
+            &[("H", h), ("K", k), ("F", f), ("S", s), ("SN", 1), ("IN", 0)],
+            &[("ROWS", 2), ("LANES", 8), ("GATHERED", 1), ("MATRIX", 1)],
+        ),
+    )
+    .unwrap()
+    .call(&charges, routed_output::Args {
+        residual: &residual_tensor,
+        inject: &no_inject,
+        expert_product: &expanded.r0,
+        shared_product: &expanded.r1,
+        routes: &routing.routes,
+        sources: &no_sources(&device, m, k),
+        scores: &routing.scores,
+        coefficient: &routing.coefficient,
+        expert_down: &block.expert_down,
+        tier_down: &no_tier(&block.expert_down),
+        shared_down: &block.shared_down,
+        operand_norm: &no_norm,
+        operand_epsilon: 0.0,
+    })
+    .unwrap()
+    .value;
+    let (max_out_rel, max_out_abs) = read_f32(&out_mat)
+        .iter()
+        .zip(read_f32(&out_ref))
+        .fold((0.0f32, 0.0f32), |(mr, ma), (a, b)| {
+            let d = (a - b).abs();
+            (mr.max(d / b.abs().max(1.0)), ma.max(d))
+        });
+    assert!(
+        max_out_rel <= 1e-2,
+        "M=10 routed_output MATRIX=1 max rel {max_out_rel} (abs {max_out_abs})"
+    );
+    eprintln!(
+        "PASS M=10 Metal verify crush parity: ordered_gemv16 rel={max_shared_rel:.3e}, gate_up rel={max_gate_up_rel:.3e}, output rel={max_out_rel:.3e}"
+    );
+}
+
 fn native_35b_shared_route_cases(
     device: &seismic::Device,
     row_counts: &[usize],
@@ -7524,7 +8043,10 @@ fn a_fronts_step_words_wait_for_no_other_places_fill() {
         return;
     };
     let charges = seismic::Charges::tally(&device);
-    if !device.backend().fills_beside_compute() {
+    // Only CUDA runs compute-shader fills (`TierFill` / `routed_copy`) on a
+    // second compute stream beside `NativeQueue::Compute`. Vulkan's side queue
+    // is a transfer queue for DMA fills (`submit_fill_copies` / `TransferQueue`).
+    if device.backend() != seismic::BackendName::Cuda {
         return;
     }
     let fill = TierFill::new(&device, 4, 1024, 4, None);
@@ -8717,243 +9239,12 @@ fn the_landing_is_encoded_only_while_an_expert_can_be_absent() {
     }
 }
 
-/// `routed_hint_route` and `routed_hint_select` write each lead's hint ring
-/// as `publish_hints` defines it, against a host reference: the lead's
-/// router ranks each row's experts (`rank_experts`: best first, routes stored
-/// worst first), and the ring names every predicted expert once, at its
-/// first appearance in rank order (every row's best, then every row's
-/// second, ...), with its rank, its row and its weight's word (the softmax
-/// probability for the route; for the selection, the score it ranked on less
-/// its bias), after its header (the count, and the step's words the ring
-/// carries). Lead 0 reads the `next_*` router, lead 1 the `after_*` one;
-/// with the next layer's POLICY_RESOLVED set no ring is written.
-/// Words no entry writes keep their sentinel. Every M = 1 to VERIFY_ROWS
-/// (the launch's capacity), AHEAD 1 and 2, and every admissible
-/// configuration. The routers' logits are exact in every backend's
-/// arithmetic and never tie ([`hint_router`]), so experts, ranks, rows and
-/// the header compare exactly; weights, the routing's floats, compare
-/// within a relative 1e-3.
-#[test]
-fn hint_rings_publish_each_leads_ranked_experts() {
-    let Some(device) = streaming_device() else {
-        return;
-    };
-    let charges = seismic::Charges::tally(&device);
-    let (h, e, k) = (Qwen35b::HIDDEN as u64, Qwen35b::EXPERTS as u64, Qwen35b::CHOICES as u64);
-    let (hu, eu, ku) = (h as usize, e as usize, k as usize);
-    let bf16 = seismic::Element::bf16();
-    // Each lead's router (`hint_router`) and its selection bias, which
-    // favours one expert past every score.
-    let classes: [fn(usize) -> i32; 2] = [
-        |expert| match expert % 21 {
-            5 => 1,
-            9 => -1,
-            _ => 0,
-        },
-        |expert| match expert % 19 {
-            3 => 1,
-            7 => -1,
-            _ => 0,
-        },
-    ];
-    let favoured = [17usize, 40];
-    let routers = classes.map(|class| bf16_tensor(&device, &[e, h], &hint_router(eu, hu, class)));
-    let biases = favoured.map(|favoured| (0..eu).map(|expert| if expert == favoured { 8.0 } else { 0.0 }).collect::<Vec<f32>>());
-    let bias_tensors = biases.clone().map(|bias| f32_tensor(&device, &[e], &bias));
-    let norm = bf16_tensor(&device, &[h], &vec![1.0; hu]);
-    let activation = bf16_tensor(&device, &[0, k], &[]);
-    let residual = hint_residual(constants::VERIFY_ROWS as usize, hu);
-    let mut unresolved = policy_words(0, 0, [0; 3]);
-    unresolved[constants::POLICY_WHOLE as usize] = 0;
-    let mut resolved = unresolved.clone();
-    resolved[constants::POLICY_WHOLE as usize] = 1;
-    // An entry's declared statics, from `given` and the single stream's.
-    let statics_of = |names: &[String], given: &[(&str, u64)]| {
-        let given = single_stream_statics(names, given);
-        names.iter().fold(seismic::NativeSpecialization::new(), |specialization, name| {
-            let (_, value) = given
-                .iter()
-                .find(|(candidate, _)| *candidate == name.as_str())
-                .unwrap_or_else(|| panic!("the case gives no static `{name}`"));
-            specialization.with_static(name.clone(), *value)
-        })
-    };
-    // The rings of one call over `m` rows: each case's step, policy and
-    // rings, the kernel run by `call`.
-    let case = |label: &str, m: u64, ahead: u64, scored: &dyn Fn(usize, usize) -> Vec<(usize, f64)>, call: &dyn Fn(&seismic::Tensor, &seismic::Tensor, &mut seismic::Tensor)| {
-        let ring = constants::HINT_ENTRY(m * k) as usize;
-        let step = guessed_step(0b1010_1010 & ((1 << m) - 1));
-        for (policy, written) in [(&unresolved, true), (&resolved, false)] {
-            let mut rings = shared_i32(&device, &[ahead, ring as u64], &vec![HINT_SENTINEL; ahead as usize * ring]);
-            call(
-                &i32_tensor(&device, &[constants::STEP_WORDS], &step),
-                &shared_i32(&device, &[constants::POLICY_WORDS], policy),
-                &mut rings,
-            );
-            let got = read_i32(&rings);
-            for lead in 0..ahead as usize {
-                let label = format!("{label} rows {m} AHEAD {ahead} lead {lead} written {written}");
-                let ring_words = &got[lead * ring..(lead + 1) * ring];
-                match written {
-                    true => {
-                        let ranked = (0..m as usize).map(|row| scored(lead, row)).collect::<Vec<_>>();
-                        assert_hint_ring(&label, ring_words, &expected_hint_ring(&step, &ranked, ku, ring));
-                    }
-                    false => assert!(ring_words.iter().all(|&word| word == HINT_SENTINEL), "{label}: a resolved layer's ring is untouched: {ring_words:?}"),
-                }
-            }
-        }
-    };
-    let mut cases = 0usize;
-    for ahead in [1u64, 2] {
-        let entry = routed_hint_route::native_entry_with(routed_hint_route::Elements { NW: bf16, RW: bf16, A: bf16 });
-        let implementation = entry.offered(&device).unwrap().unwrap();
-        let statics = statics_of(&implementation.statics, &[("H", h), ("NM", h), ("K", k), ("AHEAD", ahead), ("EN", e)]);
-        let mut configurations = Vec::new();
-        implementation
-            .walk_admissible(&implementation.implementation().with_owned_defaults(statics), |configuration| {
-                configurations.push(configuration.clone());
-                true
-            })
-            .unwrap();
-        for configuration in configurations {
-            let kernel = entry.prepare(&device, &configuration).unwrap();
-            let label = format!("routed_hint_route {:?}", configuration.params());
-            for m in 1..=constants::VERIFY_ROWS {
-                let scored = |lead: usize, row: usize| {
-                    let logits = (0..eu).map(|expert| hint_logit(row, expert, classes[lead])).collect::<Vec<_>>();
-                    let probabilities = softmax(&logits);
-                    ranked_choices(&logits, ku).into_iter().map(|expert| (expert, probabilities[expert])).collect::<Vec<_>>()
-                };
-                case(&label, m, ahead, &scored, &|step, policy, rings| {
-                    kernel
-                        .call(&charges, routed_hint_route::Args {
-                            residual: &f32_tensor(&device, &[m, h], &residual[..m as usize * hu]),
-                            activation: &activation,
-                            next_norm: &norm,
-                            next_router: &routers[0],
-                            after_norm: &norm,
-                            after_router: &routers[1],
-                            eps: 1e-6,
-                            step,
-                            next_policy: policy,
-                            rings,
-                        })
-                        .unwrap();
-                });
-                cases += 1;
-            }
-        }
-        let entry = routed_hint_select::native_entry_with(routed_hint_select::Elements { RNW: bf16, RW: bf16, A: bf16 });
-        let implementation = entry.offered(&device).unwrap().unwrap();
-        let statics = statics_of(&implementation.statics, &[("H", h), ("K", k), ("AHEAD", ahead), ("EN", e)]);
-        let mut configurations = Vec::new();
-        implementation
-            .walk_admissible(&implementation.implementation().with_owned_defaults(statics), |configuration| {
-                configurations.push(configuration.clone());
-                true
-            })
-            .unwrap();
-        for configuration in configurations {
-            let kernel = entry.prepare(&device, &configuration).unwrap();
-            for score in 0..3 {
-                let label = format!("routed_hint_select score {score} {:?}", configuration.params());
-                for m in 1..=constants::VERIFY_ROWS {
-                    let scored = |lead: usize, row: usize| {
-                        let logits = (0..eu).map(|expert| hint_logit(row, expert, classes[lead])).collect::<Vec<_>>();
-                        let scores = selection_scores(&logits, score);
-                        let ranked = scores.iter().zip(&biases[lead]).map(|(score, &bias)| score + bias as f64).collect::<Vec<_>>();
-                        ranked_choices(&ranked, ku).into_iter().map(|expert| (expert, scores[expert])).collect::<Vec<_>>()
-                    };
-                    case(&label, m, ahead, &scored, &|step, policy, rings| {
-                        kernel
-                            .call(&charges, routed_hint_select::Args {
-                                residual: &f32_tensor(&device, &[m, h], &residual[..m as usize * hu]),
-                                activation: &activation,
-                                next_router_norm: &norm,
-                                next_router: &routers[0],
-                                next_bias: &bias_tensors[0],
-                                after_router_norm: &norm,
-                                after_router: &routers[1],
-                                after_bias: &bias_tensors[1],
-                                score: score as i32,
-                                epsilon: 1e-6,
-                                step,
-                                next_policy: policy,
-                                rings,
-                            })
-                            .unwrap();
-                    });
-                    cases += 1;
-                }
-            }
-        }
-    }
-    println!("hint rings on {:?}: {cases} cases", device.backend());
-}
-
-/// A hint ring word no launch writes, which every word past the entries
-/// keeps.
-const HINT_SENTINEL: i32 = -9;
-
-/// Row `row`'s signs of the low and high halves of the hidden width
-/// ([`hint_residual`]), taking turns over the rows: + +, - +, + -, - -.
-fn hint_signs(row: usize) -> (f32, f32) {
-    ([1.0, -1.0, 1.0, -1.0][row % 4], [1.0, 1.0, -1.0, -1.0][row % 4])
-}
-
-/// `rows` residual rows of `hidden` columns, each +1 or -1 on each half
-/// ([`hint_signs`]): every row's norm is 1, so its normalized row is its
-/// residual exactly.
-fn hint_residual(rows: usize, hidden: usize) -> Vec<f32> {
-    (0..rows)
-        .flat_map(|row| {
-            let (low, high) = hint_signs(row);
-            (0..hidden).map(move |column| if column < hidden / 2 { low } else { high })
-        })
-        .collect()
-}
-
-/// A router of `experts` (at most 256) over `hidden` columns under which a
-/// row of [`hint_residual`] has logit [`hint_logit`]: expert e weighs the low
-/// half e / (64 H) and the high half 4 class(e) / H, both exact in bf16 and
-/// summed exactly in f32 in any order.
-fn hint_router(experts: usize, hidden: usize, class: fn(usize) -> i32) -> Vec<f32> {
-    assert!(experts <= 256, "the low half's weights are exact for at most 256 experts");
-    (0..experts)
-        .flat_map(|expert| {
-            (0..hidden).map(move |column| match column < hidden / 2 {
-                true => expert as f32 / (64 * hidden) as f32,
-                false => 4.0 * class(expert) as f32 / hidden as f32,
-            })
-        })
-        .collect()
-}
-
-/// Row `row`'s logit of `expert` under [`hint_router`]: s_low e / 128 +
-/// 2 s_high class(e). Distinct across experts (128 times it is e plus a
-/// multiple of 256, up to sign), and at least 1/128 apart.
-fn hint_logit(row: usize, expert: usize, class: fn(usize) -> i32) -> f64 {
-    let (low, high) = hint_signs(row);
-    low as f64 * expert as f64 / 128.0 + 2.0 * high as f64 * class(expert) as f64
-}
-
 /// The softmax of `logits`.
 fn softmax(logits: &[f64]) -> Vec<f64> {
     let maximum = logits.iter().copied().fold(f64::NEG_INFINITY, f64::max);
     let exponentials = logits.iter().map(|logit| (logit - maximum).exp()).collect::<Vec<_>>();
     let total = exponentials.iter().sum::<f64>();
     exponentials.iter().map(|value| value / total).collect()
-}
-
-/// `select_experts`' scores of `logits` under score function `score`: 0
-/// the softmax, 1 the sigmoid, 2 sqrt(softplus).
-fn selection_scores(logits: &[f64], score: usize) -> Vec<f64> {
-    match score {
-        0 => softmax(logits),
-        1 => logits.iter().map(|logit| 1.0 / (1.0 + (-logit).exp())).collect(),
-        _ => logits.iter().map(|logit| (logit.max(0.0) + (-logit.abs()).exp().ln_1p()).sqrt()).collect(),
-    }
 }
 
 /// The `k` best experts of `values`, best first, ties to the higher expert
@@ -8963,54 +9254,6 @@ fn ranked_choices(values: &[f64], k: usize) -> Vec<usize> {
     experts.sort_by(|&a, &b| values[b].total_cmp(&values[a]).then(b.cmp(&a)));
     experts.truncate(k);
     experts
-}
-
-/// The hint ring `publish_hints` writes for `ranked` (each row's choices,
-/// best first, with their weights) under step words `step`: the header,
-/// then each expert once, at its first appearance in rank order (rank-major,
-/// then row), as (expert, rank, row, weight word); [`HINT_SENTINEL`] past
-/// them.
-fn expected_hint_ring(step: &[i32], ranked: &[Vec<(usize, f64)>], k: usize, ring: usize) -> Vec<i32> {
-    let mut words = vec![HINT_SENTINEL; ring];
-    let mut named = Vec::new();
-    for rank in 0..k {
-        for (row, choices) in ranked.iter().enumerate() {
-            let (expert, weight) = choices[rank];
-            if !named.contains(&expert) {
-                let at = constants::HINT_ENTRY(named.len() as u64) as usize;
-                words[at + constants::HINT_EXPERT as usize] = expert as i32;
-                words[at + constants::HINT_RANK as usize] = rank as i32;
-                words[at + constants::HINT_ROW as usize] = row as i32;
-                words[at + constants::HINT_WEIGHT as usize] = ((weight as f32).to_bits() & 0x7fff_ffff) as i32;
-                named.push(expert);
-            }
-        }
-    }
-    words[constants::RING_SEQUENCE as usize] = step[constants::STEP_LOW as usize];
-    words[constants::RING_COUNT as usize] = named.len() as i32;
-    words[constants::RING_GUESSES as usize] = step[constants::STEP_GUESSES as usize];
-    words
-}
-
-/// `got` against `expected` ([`expected_hint_ring`]): every word exactly
-/// but the entries' weight words, which hold a non-negative f32 within a
-/// relative 1e-3 of the reference's.
-fn assert_hint_ring(label: &str, got: &[i32], expected: &[i32]) {
-    let count = expected[constants::RING_COUNT as usize] as u64;
-    let weight_word = |index: usize| {
-        (0..count).any(|entry| index == (constants::HINT_ENTRY(entry) + constants::HINT_WEIGHT) as usize)
-    };
-    let unlike = (0..expected.len())
-        .filter(|&index| match weight_word(index) {
-            true => {
-                let (weight, reference) = (f32::from_bits(got[index] as u32), f32::from_bits(expected[index] as u32));
-                got[index] < 0 || (weight - reference).abs() > 1e-3 * reference + 1e-6
-            }
-            false => got[index] != expected[index],
-        })
-        .map(|index| format!("word {index}: {} against {}", got[index], expected[index]))
-        .collect::<Vec<_>>();
-    assert!(unlike.is_empty(), "{label}: hint ring unlike its reference:\n{}", unlike.join("\n"));
 }
 
 /// A layer's policy words: whole, home, then the assignment's lines priced
@@ -9092,9 +9335,15 @@ fn portable_assign_splits_the_misses_by_the_policy_lines() {
         words[constants::POLICY_CPU_ROW_NS as usize] = cpu_row_ns;
         words
     };
+    let with_contended = |lines: [i32; 3], contended_ns: i32, handshake_ns: i32| {
+        let mut words = policy_words(0, 0, lines);
+        words[constants::POLICY_LINK_CONTENDED_NS as usize] = contended_ns;
+        words[constants::POLICY_HANDSHAKE_NS as usize] = handshake_ns;
+        words
+    };
     // (rows, front rows, routes, records, policy, expected records,
     // expected sites)
-    let cases: [(&str, usize, i32, Vec<i32>, Vec<i32>, Vec<i32>, Vec<i32>, Vec<i32>); 7] = [
+    let cases: [(&str, usize, i32, Vec<i32>, Vec<i32>, Vec<i32>, Vec<i32>, Vec<i32>); 10] = [
         (
             "the CPU takes every miss",
             1,
@@ -9106,14 +9355,14 @@ fn portable_assign_splits_the_misses_by_the_policy_lines() {
             vec![-1, 0, 1, -2],
         ),
         (
-            "each miss to the side it ends on first: CPU, link, CPU",
+            "first C misses to CPU and remaining N - C to link minimizing makespan",
             1,
             0,
             vec![10, 11, 12, 13],
             vec![5, -2, -3, -1],
             policy_words(0, 0, [20, 30, 0]),
-            vec![5, -1, -3, -1],
-            vec![-1, 0, -1, -2],
+            vec![5, -1, -1, -1],
+            vec![-1, 0, 1, -1],
         ),
         (
             "an expert's choices share its side",
@@ -9152,8 +9401,8 @@ fn portable_assign_splits_the_misses_by_the_policy_lines() {
             vec![10, 11, 14, 15],
             vec![-2, -3, 7, 8],
             policy_words(0, 0, [60, 50, 500]),
-            vec![-2, -1, 7, 8],
-            vec![-1, 1, -1, -1],
+            vec![-1, -3, 7, 8],
+            vec![0, -1, -1, -1],
         ),
         (
             "a front row before the exact row changes nothing for it",
@@ -9164,6 +9413,44 @@ fn portable_assign_splits_the_misses_by_the_policy_lines() {
             cpu_row([10, 100, 0], 1000),
             vec![-1, -4, -1, -1],
             vec![0, -1, 0, 1],
+        ),
+        (
+            // Expert 10 has 2 rows (cpu_work = 60 + 40 = 100, link_work = 100);
+            // expert 11 has 1 row (cpu_work = 60, link_work = 100). Fewest-rows-
+            // first assigns cheap 1-row expert 11 to CPU (60 < 200) and leaves
+            // multi-row expert 10 on GPU (makespan 100 < 160).
+            "fewest-rows-first assigns 1-row misses to CPU before multi-row misses",
+            2,
+            0,
+            vec![10, 11, 10, 12],
+            vec![-2, -3, -2, 5],
+            cpu_row([60, 100, 0], 40),
+            vec![-2, -1, -2, 5],
+            vec![-1, 1, -1, -1],
+        ),
+        (
+            // Contended DMA (180 µs vs 100 µs uncontended) makes every CPU split
+            // slower than 3 * 100 = 300 µs -> C = 0 (all 3 misses stay on GPU).
+            "contended DMA suppresses CPU offload when every split is slower than uncontended GPU-only",
+            1,
+            0,
+            vec![10, 11, 12, 13],
+            vec![5, -2, -3, -4],
+            with_contended([180, 100, 0], 180, 20),
+            vec![5, -2, -3, -4],
+            vec![-1, -1, -1, -1],
+        ),
+        (
+            // Contended DMA (120 µs vs 100 µs uncontended), CPU 150 µs, handshake 10 µs:
+            // GPU-only = 300 µs; C=1: max(2*120=240, 160)=240 < 300 -> C = 1.
+            "contended DMA offloads to CPU when contended joint makespan strictly beats uncontended GPU-only",
+            1,
+            0,
+            vec![10, 11, 12, 13],
+            vec![5, -2, -3, -4],
+            with_contended([150, 100, 0], 120, 10),
+            vec![5, -1, -3, -4],
+            vec![-1, 0, -1, -1],
         ),
     ];
     for (case, m, front, routes, records, policy, expected_records, expected_sites) in cases {
@@ -11348,5 +11635,159 @@ fn metal_routed_experts_int8_partial_k_block_admitted() {
                 prepared.err()
             );
         }
+    }
+}
+
+/// Boundary test (`astra` `mpppad` #3 & #4):
+/// Splitting `routed_down_project` across `DecodeHits` (`mode=1`, VRAM hits
+/// from `front_sources`, zeroing misses) and `DecodeBack` (`mode=2`, misses
+/// from disjoint `back_sources`, preserving VRAM hits and CPU-sited zeros)
+/// followed by ONE final `routed_down_sited` join MUST be bit-exact with the
+/// unsplit `Whole` (`mode=0` + `routed_down_sited`) output across:
+/// 1. Mixed VRAM hits + landed misses + tier-fallback misses + CPU-sited choices
+/// 2. Repeated expert across multiple rows (`M = 3, K = 4`)
+/// 3. All-hit / empty-DMA (final join still executes!)
+/// 4. Partial final rows & non-4-aligned hidden width (`H = 10`, scalar tail + JOIN4)
+#[test]
+fn routed_down_project_and_sited_join_split_bit_exact_with_whole_boundary_cases() {
+    let module = crate::common::kernels();
+    let (m, h, e, k, f, tr) = (3usize, 10usize, 5usize, 4usize, 4usize, 3usize);
+    let product: Vec<f32> = (0..m * k * f).map(|i| ((i as f32) * 0.37 - 1.5).sin()).collect();
+    // Repeated experts across rows 0, 1, 2 (expert 1 and expert 2 repeated across rows).
+    let routes: Vec<i32> = vec![
+        0, 1, 2, 3, // row 0
+        1, 2, 1, 0, // row 1 (expert 1 repeated twice!)
+        2, 4, 1, 0, // row 2 (partial/final row)
+    ];
+    let weights: Vec<f32> = (0..m * k).map(|i| 0.1 + 0.07 * (i as f32)).collect();
+    let base: Vec<f32> = (0..m * h).map(|i| ((i as f32) * 0.13 + 0.25).cos()).collect();
+    let expert_down: Vec<f32> = (0..e * h * f).map(|i| ((i as f32) * 0.19 + 0.5).cos()).collect();
+    let tier_down: Vec<f32> = (0..tr * h * f).map(|i| ((i as f32) * 0.29 - 0.7).sin()).collect();
+
+    let flight = 2usize;
+    let sw = 8usize;
+    let seq = 1i32;
+    let mut step = vec![0i32; magnitude_kernels::constants::STEP_WORDS as usize];
+    step[magnitude_kernels::constants::STEP_SEQUENCE as usize] = seq;
+    let mut site = vec![0i32; flight * sw];
+    let slot = (seq as usize) % flight;
+    // Mark site slot answered with matching sequence for CPU-sited rows.
+    site[slot * sw + (magnitude_kernels::constants::SLOT_ANSWER as usize)] = 1;
+    site[slot * sw + (magnitude_kernels::constants::SLOT_SEQUENCE as usize)] = seq;
+    let verify_rows = magnitude_kernels::constants::VERIFY_ROWS as usize;
+    let mut site_output = vec![0.0f32; flight * verify_rows * h];
+    for r in 0..m {
+        for c in 0..h {
+            site_output[(slot * verify_rows + r) * h + c] = 0.05 * ((r * h + c + 1) as f32);
+        }
+    }
+
+    let run_project = |sources: &[i32], mode: i32, published: &[f32]| -> Vec<f32> {
+        let outcome = interpret(
+            module,
+            "routed_down_project",
+            &[("A", DType::F32), ("EDW", DType::F32)],
+            vec![
+                floats(&[m, k, f], &product),
+                ints(&[m, k], &routes),
+                ints(&[2, m, k], sources),
+                floats(&[e, h, f], &expert_down),
+                floats(&[tr, h, f], &tier_down),
+                Input::I32(mode),
+                floats(&[m, k, h], published),
+            ],
+        );
+        input(&outcome, 6).into_iter().map(|v| v as f32).collect()
+    };
+
+    let run_join = |published: &[f32], sources: &[i32]| -> Vec<f32> {
+        let outcome = interpret(
+            module,
+            "routed_down_sited",
+            &[("A", DType::F32), ("R", DType::F32)],
+            vec![
+                floats(&[m, h], &base),
+                floats(&[m, k, h], published),
+                ints(&[2, m, k], sources),
+                floats(&[m, k], &weights),
+                ints(&[step.len()], &step),
+                ints(&[flight, sw], &site),
+                floats(&[flight, verify_rows, h], &site_output),
+            ],
+        );
+        result(&outcome, 0).into_iter().map(|v| v as f32).collect()
+    };
+
+    // Case A: Mixed VRAM hits + landed misses (including repeated expert across rows)
+    // + tier-fallback overflow miss + CPU-sited choice on row 0 and row 2.
+    let mixed_front: Vec<i32> = vec![
+        // SOURCE_RECORD:
+        0, -2, -3, -1, // row 0: hit 0, miss tr=0, overflow tr=1, CPU-sited
+        -2, 1, -2, 0,  // row 1: miss tr=0 (repeated!), hit 1, miss tr=0, hit 0
+        1, -1, -2, 0,  // row 2: hit 1, CPU-sited, miss tr=0, hit 0
+        // SOURCE_SITE:
+        -1, -1, -1, 0,
+        -1, -1, -1, -1,
+        -1, 1, -1, -1,
+    ];
+    let mixed_back: Vec<i32> = vec![
+        // SOURCE_RECORD (VRAM hits masked to -1; tr=0 landed at slot 4; tr=1 stays overflow -3):
+        -1, 4, -3, -1,
+        4, -1, 4, -1,
+        -1, -1, 4, -1,
+        // SOURCE_SITE (preserved identically for final join):
+        -1, -1, -1, 0,
+        -1, -1, -1, -1,
+        -1, 1, -1, -1,
+    ];
+    let mixed_whole: Vec<i32> = vec![
+        // SOURCE_RECORD:
+        0, 4, -3, -1,
+        4, 1, 4, 0,
+        1, -1, 4, 0,
+        // SOURCE_SITE:
+        -1, -1, -1, 0,
+        -1, -1, -1, -1,
+        -1, 1, -1, -1,
+    ];
+
+    // Case B: All-hit / empty-DMA across all 3 rows (`back_sources` is all -1).
+    let all_hit_front: Vec<i32> = vec![
+        0, 1, 2, 3,
+        1, 2, 1, 0,
+        2, 4, 1, 0,
+        -1, -1, -1, -1,
+        -1, -1, -1, -1,
+        -1, -1, -1, -1,
+    ];
+    let all_hit_back: Vec<i32> = vec![
+        -1, -1, -1, -1,
+        -1, -1, -1, -1,
+        -1, -1, -1, -1,
+        -1, -1, -1, -1,
+        -1, -1, -1, -1,
+        -1, -1, -1, -1,
+    ];
+
+    let sentinel = vec![99.5f32; m * k * h];
+    for (label, front, back, whole) in [
+        ("mixed_hits_repeated_misses_overflow_cpu_partial_row", &mixed_front, &mixed_back, &mixed_whole),
+        ("all_hit_empty_dma", &all_hit_front, &all_hit_back, &all_hit_front),
+    ] {
+        let whole_pub = run_project(whole, 0, &sentinel);
+        let hits_pub = run_project(front, 1, &sentinel);
+        let split_pub = run_project(back, 2, &hits_pub);
+        assert_eq!(
+            split_pub.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+            whole_pub.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+            "{label}: published cells must be bit-exact between Split and Whole"
+        );
+        let whole_out = run_join(&whole_pub, whole);
+        let split_out = run_join(&split_pub, back);
+        assert_eq!(
+            split_out.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+            whole_out.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+            "{label}: final routed_down_sited join must be bit-exact between Split and Whole"
+        );
     }
 }

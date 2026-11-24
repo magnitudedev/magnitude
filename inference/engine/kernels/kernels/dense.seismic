@@ -183,21 +183,23 @@ projection dense for metal:
     let TOKENS = 128 / SERVED
     let SPLITS = 1 for paired
     let SPLITS = SPLIT for single | segmented
+    let BATCH_SPLITS = 1 for paired | single
+    let BATCH_SPLITS = 1 + PARTED * (SPLIT - 1) for segmented
     let SMALL_SPLITS = 1 for paired | segmented
     let SMALL_SPLITS = 4 for single
     let INT8 = 0 for segmented
     params (arithmetic SPLIT in [1, 2, 4] default 1 for single,
-        arithmetic SPLIT in [1, 2, 4] default greatest where (PARTED == 0 and SPLIT == 1) or (PARTED == 1 and (SPLIT == 1 or (SPLIT == 4 and DENSE_ALL == 1 and SERVED == 1 and K >= 1024))) for segmented,
+        arithmetic SPLIT in [1, 2, 4] default least where (PARTED == 0 and SPLIT == 1) or (PARTED == 1 and ((DENSE_ALL == 0 or SERVED == 0) and SPLIT == 1 or DENSE_ALL == 1 and SERVED == 1 and K >= P * SPLIT * 32 and (P * SPLIT * tiles(W, ceil_div(N, 64)) >= 4 * device.units or SPLIT == 4 or K < P * SPLIT * 64))) for segmented,
         SIMDGROUPS in [8, 16, 4, 2] default 8 for ordered, ROWS in [1, 2, 4] default 1 for ordered,
-        form TALL in [1, 0] default greatest where TALL == 0 or (ORDERED_ANY == 0 and GATHERED == 0 and PLANES == 0 and SPLITS == 1 and K % 64 == 0),
+        form TALL in [1, 0] default greatest where TALL == 0 or (ORDERED_ANY == 0 and GATHERED == 0 and PLANES == 0 and G == 1 and SPLITS == 1 and K % 64 == 0),
         arithmetic form INT8 in [0, 1] default 0 for paired | single,
         arithmetic form PACK in [0, 1] default greatest where PACK == 0 or (device.tensor_ops == 0 and ORDERED_ANY == 0 and GATHERED == 0 and PLANES == 0 and G == 1 and TALL == 1 and INT8 == 0 and K % 128 == 0 and K < 1048576 and N % (64 / WEIGHTS) == 0 and each(W, form(W, PACK) == 1 and form(W, PACK_FOLDS) == 1 and form(W, PACK_RESIDUE) == 0) and agree(W, form(W, PACK_FOLDS)) and agree(W, form(W, PACK_RESIDUE)) and agree(W, form(W, PACK_SUMS))) reference 0 for paired | single,
         arithmetic form PACK in [0, 1] default greatest where PACK == 0 or (device.tensor_ops == 0 and ORDERED_ANY == 0 and PLANES == 0 and G == 1 and TALL == 1 and K % 128 == 0 and K < 1048576 and SERVED == 1 and any(W, N > 0 and N % 32 == 0 and form(W, PACK) == 1 and form(W, PACK_FOLDS) == 1 and form(W, PACK_RESIDUE) == 0)) reference 0 for segmented,
         arithmetic form RESIDUE in [1, 2] default 1,
-        arithmetic form MATRIX_FROM in [5, 3, 9, 2, 17] default least where (ORDERED_ANY == 1 and MATRIX_FROM == 17) or (ORDERED_ANY == 0 and (MATRIX_FROM == 9 or (MATRIX_FROM == 5 and GATHERED == 0 and PLANES == 0 and G == 1 and K % 32 == 0) or (MATRIX_FROM == 3 and GATHERED == 0 and PLANES == 0 and G == 1 and K % 32 == 0 and QMATRIX == 0 and K / P > 1024 and P * tiles(W, ceil_div(N, 8 * 8)) >= 2 * device.units))) reference (9 + 8 * ORDERED_ANY),
+        arithmetic form MATRIX_FROM in [5, 3, 9, 2, 17] default least where (ORDERED_ANY == 1 and MATRIX_FROM == 17) or (ORDERED_ANY == 0 and (MATRIX_FROM == 9 or (MATRIX_FROM == 5 and GATHERED == 0 and PLANES == 0 and K % 32 == 0) or (MATRIX_FROM == 3 and GATHERED == 0 and PLANES == 0 and G == 1 and K % 32 == 0 and K / P > 1024 and P * tiles(W, ceil_div(N, 8 * 8)) >= 2 * device.units))) reference (9 + 8 * ORDERED_ANY),
         arithmetic form SMALL in [1, 0] default (1 - ORDERED_ANY),
         arithmetic LANES in [16, 32, 8] default (16 + 16 * ORDERED_ALL), arithmetic form TILED in [0, 1, 2] default 0,
-        form STAGE in [0, 1] default greatest where STAGE == 0 or (PLANES == 0 and TILED == 0 and LANES < 32 and ORDERED_ANY == 0 and (PARTED == 1 or K / P <= 1024) and ceil_div(K / P, 32) <= 128))
+        form STAGE in [0, 1] default greatest where STAGE == 0 or (PLANES == 0 and TILED == 0 and LANES < 32 and ORDERED_ANY == 0 and K / P >= 512 and (PARTED == 1 or K / P <= 1024) and ceil_div(K / P, 32) <= 128))
     where dense_bytes(A) == 2
     where (ORDERED_ANY == 0 or (TALL == 0 and PACK == 0 and RESIDUE == 1 and MATRIX_FROM == 17 and SMALL == 0 and LANES != 8 and TILED == 0))
     where (ORDERED_ANY == 1 or MATRIX_FROM <= 9)
@@ -212,7 +214,7 @@ projection dense for metal:
     where (TALL == 0 or K % 128 == 0 or TALL_K == 64)
     where (SMALL == 0 or (PLANES == 0 and PARTED == 0))
     where (SPLIT == 1 or PLANES == 0) for single
-    where (SPLIT == 1 or (PARTED == 1 and SERVED == 1 and ORDERED_ANY == 0 and PLANES == 0 and K >= SPLIT * 32)) for segmented
+    where (SPLIT == 1 or (PARTED == 1 and SERVED == 1 and ORDERED_ANY == 0 and PLANES == 0 and K >= P * SPLIT * 32)) for segmented
     where (TILE_N != 32 or (SERVED == 1 and PARTED == 1))
     where (INT8 == 0 or (GATHERED == 0 and TALL == 1 and K % 32 == 0 and N % (64 / WEIGHTS) == 0 and each(W, form(W, INT8) == 1) and agree(W, form(W, INT8_INTERLEAVED)))) for paired | single
     where (INT8 == 1 or INT8_TILE == 128) for single
@@ -222,14 +224,14 @@ projection dense for metal:
     where (PACK == 0 or (TILE_M == 64 and TILE_N == 64))
     where (PACK == 0 or (TALL_M == 128 and TALL_K == 64 and STAGERS == 2))
     where (RESIDUE == 1 or (PACK == 1 and any(W, bound(W) > 0 and form(W, PACK_RESIDUE) == 1)))
-    where (G == 1 or (INT8 == 0 and PACK == 0 and MATRIX_FROM >= 9 and each(W, operands(W) == 0)))
+    where (G == 1 or (INT8 == 0 and PACK == 0 and each(W, operands(W) == 0)))
     where ((GATHERED == 0 and PLANES == 0 and K % 32 == 0) or MATRIX_FROM >= 9)
     where (QMATRIX == 1 or BATCH_PARTS == 2)
     where (QMATRIX == 0 or BATCH_ROWS == 1) for paired | single
     where BATCH_SIMDGROUPS * 32 <= device.max_group_threads
     scratch staged bytes (M * K * 2) when ORDERED_ALL == 1 and PUBLISHED == 0 and M > VERIFY_ROWS for rms
     scratch partials bytes (SPLIT * G * M * N * 4) when ORDERED_ANY == 0 and M > 16 and (M > 64 or SMALL == 0) and SPLIT > 1 and PLANES == 0 for single
-    scratch partials bytes (M * (P * (1 - min(1, M / 17)) + SPLIT * min(1, M / 17)) * sum(W, N) * 4) when ORDERED_ANY == 0 and PARTED == 1 and (M <= 16 or (SPLIT > 1 and PLANES == 0)) for segmented
+    scratch partials bytes (M * (P * SPLIT * (1 - min(1, M / 17)) + SPLIT * min(1, M / 17)) * sum(W, N) * 4) when ORDERED_ANY == 0 and PARTED == 1 and (M <= 16 or (SPLIT > 1 and PLANES == 0)) for segmented
     scratch arrivals bytes (sum(W, N) * 4) sync when ORDERED_ANY == 0 and M <= 16 and PARTED == 1 for segmented
     scratch small_partials bytes (4 * G * M * N * 4) when ORDERED_ANY == 0 and M > 16 and M <= 64 and SMALL == 1 and PLANES == 0 for single
     scratch fragments bytes (G * ceil_div(M, 64) * 64 * K * 2) when ORDERED_ANY == 0 and M > 64 and TALL == 1 and INT8 == 0 and PACK == 0 and PLANES == 0 for single
@@ -276,10 +278,9 @@ projection dense for metal:
         threads_per_threadgroup (SIMDGROUPS * 32, 1, 1)
         shared_bytes (max(4608, MIXED_GEMV_SHARED))
     launch ordered_gemv16 for segmented when ORDERED_ANY == 1 and ORDERED_ALL == 0 and M > PROJECTION_GEMV_MAX_M and M <= VERIFY_ROWS:
-        alike (ordered_gemv1)
-        threadgroups (tiles(W, ORDERED * ceil_div(N, min(SIMDGROUPS, 8) * 4) + (1 - ORDERED) * ceil_div(N, SIMDGROUPS * ROWS * 32 / LANES)), 1, G)
-        threads_per_threadgroup (SIMDGROUPS * 32, 1, 1)
-        shared_bytes (max(8704, MIXED_GEMV_SHARED))
+        threadgroups (tiles(W, ORDERED * ceil_div(N, min(SIMDGROUPS, 4) * 4) + (1 - ORDERED) * ceil_div(N, min(SIMDGROUPS, 4) * 8)), 1, G)
+        threads_per_threadgroup (min(SIMDGROUPS, 4) * 32, 1, 1)
+        shared_bytes (max(15488, MIXED_GEMV_SHARED))
     launch ordered_gemm when ORDERED_ALL == 1 and M > VERIFY_ROWS:
         threadgroups (tiles(W, ceil_div(N, 32)), ceil_div(M, 64), G)
         threads_per_threadgroup (256, 1, 1)
@@ -292,9 +293,9 @@ projection dense for metal:
         threads_per_threadgroup (SIMDGROUPS * 32, 1, 1)
         shared_bytes (max(min(ceil_div(K / P, 32) * (min(M, 2) + 2 * min(M / 3, 1) + 4 * min(M / 5, 1)), 448 / (1 + STAGE)) * 64 * (1 + STAGE), TILED * SIMDGROUPS * (128 * SERVED)))
     launch batch when ORDERED_ANY == 0 and M <= 16 and ((M >= MATRIX_FROM and PLANES == 0) or M > PROJECTION_GEMV_MAX_M):
-        params (BATCH_SIMDGROUPS in [8, 4, 16, 32] default greatest where BATCH_SIMDGROUPS <= 8 and (BATCH_SIMDGROUPS == 4 or GATHERED == 1 or P * G * (1 - GATHERED) * tiles(W, QMATRIX * ceil_div(ceil_div(N, 8) * 2, BATCH_SIMDGROUPS) + (1 - QMATRIX) * ceil_div(N, BATCH_SIMDGROUPS * 8)) >= 2 * device.units), BATCH_ROWS in [1, 2, 4] default 1,
+        params (BATCH_SIMDGROUPS in [8, 4, 16, 32] default greatest where BATCH_SIMDGROUPS <= 8 and (BATCH_SIMDGROUPS == 4 or GATHERED == 1 or P * BATCH_SPLITS * G * (1 - GATHERED) * tiles(W, QMATRIX * ceil_div(ceil_div(N, 8) * 2, BATCH_SIMDGROUPS) + (1 - QMATRIX) * ceil_div(N, BATCH_SIMDGROUPS * 8)) >= 2 * device.units), BATCH_ROWS in [1, 2, 4] default 1,
             arithmetic BATCH_PARTS in [2, 4, 1] default 2)
-        threadgroups (P * tiles(W, QMATRIX * ceil_div(ceil_div(N, 8) * BATCH_PARTS, BATCH_SIMDGROUPS)
+        threadgroups (P * BATCH_SPLITS * tiles(W, QMATRIX * ceil_div(ceil_div(N, 8) * BATCH_PARTS, BATCH_SIMDGROUPS)
             + (1 - QMATRIX) * ceil_div(N, BATCH_SIMDGROUPS * BATCH_ROWS * 8)), 1, G)
         threads_per_threadgroup (BATCH_SIMDGROUPS * 32, 1, 1)
         shared_bytes (max(15488, QMATRIX * min((BATCH_SIMDGROUPS * 256 + ceil_div(K, 32) * 32) * ceil_div(M, 8), 28672)))
@@ -356,16 +357,19 @@ projection dense for metal:
     launch pack_coefficients for paired | single when ORDERED_ANY == 0 and M > 64 and PACK == 1 and PLANES == 0:
         threadgroups (N / 32, 1, 1)
         threads_per_threadgroup (256, 1, 1)
-    launch pack_coefficients for segmented when ORDERED_ANY == 0 and M > 64 and PACK == 1:
-        threadgroups (sum(W, N), 1, 1)
-        threads_per_threadgroup (32, 1, 1)
+    launch pack_coefficients for segmented when ORDERED_ANY == 0 and M > 64 and PACK == 1 and PLANES == 0:
+        threadgroups (tiles(W, (1 - device.tensor_ops) * (1 - min(1, N % 32)) * form(W, PACK) * (N / 32)), 1, 1)
+        threads_per_threadgroup (256, 1, 1)
     launch packed when ORDERED_ANY == 0 and M > 64 and PACK == 1 and PLANES == 0:
         params (PACK_TOKENS in [4, 2] default 4, WEIGHTS_AHEAD in [0, 1] default 0)
         reads (RESIDUE)
         threadgroups (tiles(W, ceil_div(M, TOKENS) * (N / 32)), 1, 1)
         threads_per_threadgroup (128, 1, 1)
-    launch unpacked when ORDERED_ANY == 0 and M > 64 and PACK == 1 and PLANES == 0:
+    launch unpacked for paired | single when ORDERED_ANY == 0 and M > 64 and PACK == 1 and PLANES == 0:
         threadgroups (tiles(W, ceil_div(N, 64 / SERVED)), ceil_div(M, 64), 1)
+        threads_per_threadgroup (128, 1, 1)
+    launch unpacked for segmented when ORDERED_ANY == 0 and M > 64 and PACK == 1 and PLANES == 0 and (device.tensor_ops == 1 or any(W, N > 0 and (N % 32 != 0 or form(W, PACK) == 0))):
+        threadgroups (tiles(W, (1 - (1 - device.tensor_ops) * (1 - min(1, N % 32)) * form(W, PACK)) * ceil_div(N, 64 / SERVED)), ceil_div(M, 64), 1)
         threads_per_threadgroup (128, 1, 1)
 
 # CUDA: the K1 projection library (`cuda/common/projection.cuh`). Every K1
@@ -538,7 +542,7 @@ projection dense for cuda:
         arithmetic GEMM_SPLIT in [1, 2, 4, 8] default least where (PARTED == 0 and GEMM_SPLIT == 1) or (PARTED == 1 and (GEMM_TILES * 2 * GEMM_SPLIT >= device.units or GEMM_SPLIT * 512 > K or GEMM_SPLIT == 8)) for segmented,
         TPW in [1, 2] default 1 for ordered,
         form STAGING in [0, 1] default 0 for single | segmented, form STAGING in [0] default 0 for paired,
-        arithmetic KSPLIT in [4, 2, 8, 1] default least where (ORDERED_ALL == 1 and KSPLIT == 1) or (ORDERED_ALL == 0 and K / P <= 256 and KSPLIT == 1) or (ORDERED_ALL == 0 and K / P > 256 and KSPLIT != 1 and (P * G * tiles(W, ceil_div(ceil_div(N, 16), 8 / KSPLIT)) >= 3 * device.units or K / P < KSPLIT * 512 or KSPLIT == (8 - 4 * ORDERED_ANY))))
+        arithmetic KSPLIT in [4, 2, 8, 1] default least where (ORDERED_ALL == 1 and KSPLIT == 1) or (ORDERED_ALL == 0 and K / P <= 256 and KSPLIT == 1) or (ORDERED_ALL == 0 and K / P > 256 and KSPLIT != 1 and (P * G * tiles(W, ceil_div(ceil_div(N, 16), 8 / KSPLIT)) >= 2 * device.units or K / P < KSPLIT * 512 or KSPLIT == (8 - 4 * ORDERED_ANY))))
     where dense_bytes(A) == 2
     where (GEMM_SPLIT == 1 or (PARTED == 1 and K >= GEMM_SPLIT * 256)) for segmented
     where (ORDERED_ANY == 1 or K / P <= 256 or KSPLIT != 1)
@@ -587,7 +591,7 @@ projection dense for cuda:
     launch stage for rms when ORDERED_ANY == 0 and M > 1 and PLANES == 0:
         reads (INT8, OPERAND)
         staging
-        threadgroups (M, 1, 1)
+        threadgroups (M * P, 1, 1)
         threads_per_threadgroup (256, 1, 1)
     launch stage for rms when ORDERED_ANY == 0 and PLANES == 1:
         threadgroups (M, 1, 1)

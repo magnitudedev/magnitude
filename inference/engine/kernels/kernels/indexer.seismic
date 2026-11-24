@@ -182,9 +182,9 @@ native indexer_score for metal from "metal/indexer_score.metal":
     static (H, P, S, NQ, HW, RA, RT)
     where RA <= 1 and RT <= 1 and NQ <= 1 and H <= 64 and 9 * (2 * P + S) * 4 <= device.shared_bytes_per_group and (2 * P + S) % 32 == 0 and P % ((2 * P + S) / 32) == 0 and (RA == 0 or (2 * P + S) % 64 == 0 or 2 * P + S == 32)
     launch indexer_score:
-        threadgroups (ceil_div(N, 256), M, 1)
+        threadgroups (ceil_div(N, 256), ceil_div(M, 8), 1)
         threads_per_threadgroup (256, 1, 1)
-        shared_bytes (min((H * (2 * P + S + 4) + 8 * (2 * P + S)) * 4, device.shared_bytes_per_group))
+        shared_bytes (min((min(M, 8) * H * (2 * P + S + 4) + 8 * (2 * P + S)) * 4, device.shared_bytes_per_group))
 
 # CUDA: as Metal, each head's warp rotating through the head's own shared
 # row before it holds the prepared head, then each warp cooperatively scoring

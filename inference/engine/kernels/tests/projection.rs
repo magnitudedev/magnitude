@@ -8059,3 +8059,71 @@ fn attention_project_six_segments_matches_portable_body() {
         }
     }
 }
+
+/// F32 weights and mixed BF16 weights with F16 activations must never narrow
+/// to `half` in Metal's batched GEMV (`W = 65536, x = 0.5` -> `32768`, not
+/// `+Inf`). Native BF16 x BF16 must also preserve the full BF16 exponent range.
+#[test]
+fn metal_gemv_batch_f32_and_mixed_bf16_weights_do_not_narrow_overflow() {
+    let Some(device) = devices()
+        .into_iter()
+        .find(|device| device.backend() == BackendName::Metal)
+    else {
+        return;
+    };
+    let charges = seismic::Charges::tally(&device);
+    let (rows, n, k) = (10usize, 32usize, 64usize);
+    let mut source = vec![0.0f32; rows * k];
+    for m in 0..rows {
+        source[m * k] = 0.5;
+    }
+    let mut weight_vals = vec![0.0f32; n * k];
+    for r in 0..n {
+        weight_vals[r * k] = 65536.0;
+    }
+
+    for (label, act, weight_elem) in [
+        ("f16_act_f32_weight", Act::F16, Element::f32()),
+        ("f16_act_bf16_weight", Act::F16, Element::bf16()),
+        ("bf16_act_bf16_weight", Act::Bf16, Element::bf16()),
+    ] {
+        let weight_tensor = if weight_elem == Element::f32() {
+            f32_tensor(&device, &[n, k], &weight_vals)
+        } else {
+            act_tensor(&device, Act::Bf16, &[n, k], &weight_vals)
+        };
+        let mut spec = NativeSpecialization::new()
+            .with_static("N", n as u64)
+            .with_static("K", k as u64)
+            .with_static("G", 1)
+            .with_static("WS", 0)
+            .with_static("WB", 0);
+        spec = spec.with_param("MATRIX_FROM", 5);
+        let kernel = declared::prepared(
+            &device,
+            &project_rows::native_entry_with(project_rows::Elements {
+                A: act.element(),
+                W: weight_elem,
+                Y: Element::f32(),
+            }),
+            &spec,
+        )
+        .unwrap_or_else(|e| panic!("{label}: prepare failed: {e:?}"));
+        let out = kernel
+            .call(&charges, project_rows::Args {
+                source: &act_tensor(&device, act, &[rows, k], &source),
+                weight: &weight_tensor,
+                weight_scale: &no_scale(&device),
+                weight_bound: &absent_bound(&device),
+            })
+            .unwrap_or_else(|e| panic!("{label}: call failed: {e:?}"))
+            .value;
+        let got = read_f32(&out);
+        for (i, &v) in got.iter().enumerate() {
+            assert!(
+                v.is_finite() && (v - 32768.0).abs() <= 1e-2,
+                "{label}: output[{i}] = {v}, expected finite 32768.0"
+            );
+        }
+    }
+}

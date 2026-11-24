@@ -130,13 +130,14 @@
 # `table_grid` and its tiles in `tile_grid`.
 projection routed for metal:
     let CHOICE_GROUPS = ceil_div(most(W, N), SIMDGROUPS * ROWS * 32 / LANES) for choice
+    let GATHERED_CHOICE_GROUPS = MATRIX * ceil_div(most(W, N), SIMDGROUPS * 8) + (1 - MATRIX) * CHOICE_GROUPS for choice
     let CHOICE_SHARED = min(ceil_div(WIDTH, 32) * (1 + SHARED * (min(M, 2) - 1 + 2 * min(M / 3, 1) + 4 * min(M / 5, 1))), 448) * 64 for choice
     let GATHERED_ONE_SHARED = min(ceil_div(WIDTH, 32), 448) * 64 for choice
-    let GATHERED_SHARED = min(ceil_div(WIDTH, 32) * (min(M, 2) + 2 * min(M / 3, 1)), 128) * 64 for choice
+    let GATHERED_SHARED = MATRIX * 15488 + (1 - MATRIX) * min(ceil_div(WIDTH, 32) * (min(M, 2) + 2 * min(M / 3, 1) + 4 * min(M / 5, 1)), 256) * 64 for choice
     let SUMMED_GROUPS = ceil_div(most(W, N), ROWS * 32 / LANES) for summed
     let GATHERED_SUMMED_GROUPS = ceil_div(most(W, N), 4 * ROWS * 32 / LANES) for summed
     let SUMMED_PACKETS = ceil_div(most(W, WIDTH), 32) for summed
-    let SUMMED_STAGE = min(SUMMED_PACKETS, (device.shared_bytes_per_group / 2) / ((K + SHARED) * 64)) for summed
+    let SUMMED_STAGE = min(min(SUMMED_PACKETS, 64), (device.shared_bytes_per_group / 2) / ((K + SHARED) * 64)) for summed
     let SUMMED_STAGES_16 = (1 - SHARED) * min(1, ceil_div(SUMMED_PACKETS, 16) / 3) for summed
     let ROW_TILES = STACKED * B * ceil_div(T, TILE_M) + (1 - STACKED) * ceil_div(M, TILE_M) for grouped
     let BLOCKS = STACKED * B + 1 - STACKED for grouped
@@ -154,19 +155,24 @@ projection routed for metal:
     let ORDINAL_BYTES = STACKED * ceil_div(B, 4) * 32 for grouped
     params (SIMDGROUPS in [2, 4, 8, 16] default greatest where SIMDGROUPS <= 8 + 8 * PER_ROW and SIMDGROUPS * 32 <= device.max_group_threads and (SIMDGROUPS == 2 or ceil_div(most(W, N), SIMDGROUPS * 2) * (K + SHARED) >= 2 * device.units) for choice,
         ROWS in [1, 2, 4] default 1 for choice,
-        arithmetic LANES in [16, 32] default 16 for choice, form GATHERED in [0, 1] default 1 for choice,
-        ROWS in [2, 1, 4, 8] default 2 for summed, arithmetic LANES in [8, 16, 32, 4] default greatest where LANES == 8 or (LANES == 16 and SUMMED_PACKETS > 32 and (SHARED == 0 or SUMMED_PACKETS <= 64)) reference 8 for summed,
+        arithmetic LANES in [16, 32] default 16 for choice, form GATHERED in [0, 1] default greatest where GATHERED == 0 or device.tensor_ops == 1 for choice,
+        arithmetic form MATRIX in [0, 1] default greatest where MATRIX == 0 or (GATHERED == 1 and PER_ROW == 0) reference 0 for choice,
+        ROWS in [2, 1, 4, 8] default 2 for summed, arithmetic LANES in [8, 16, 32, 4] default greatest where LANES == 8 or (LANES == 16 and SUMMED_STAGE > 32 and (SHARED == 0 or SUMMED_PACKETS <= 64)) reference 8 for summed,
         form GATHERED in [0, 1] default 1 for summed,
-        TILE_M in [32, 64, 128] default 32 for grouped, TILE_N in [128, 64] default 128 for grouped,
+        arithmetic form MATRIX in [0, 1] default greatest where MATRIX == 0 or (GATHERED == 1 and (ROWS * 32 / LANES == 8 or ROWS * 32 / LANES == 16)) reference 0 for summed,
+        TILE_M in [32, 64, 128] default 32 for grouped,
         form TALL in [0, 1] default greatest where TALL == 0 or STACKED == 0 or (device.tensor_ops == 0 and T % 32 == 0 and WIDTH % 64 == 0 and ((WIDTH % 128 == 0 and WIDTH < 1048576 and N % (64 / SERVED) == 0 and each(W, FIRST == 0 or form(W, PACK) == 1) and sum(W, FIRST * form(W, PACK_FOLDS)) == SERVED * most(W, FIRST * form(W, PACK_FOLDS)) and sum(W, FIRST * form(W, PACK_RESIDUE)) % SERVED == 0 and sum(W, FIRST * form(W, PACK_SUMS)) % SERVED == 0) or any(W, FIRST == 1 and (form(W, PACK_FOLDS) == 2 or form(W, PACK_RESIDUE) == 1)))) for grouped,
         arithmetic form INT8 in [0, 1] default 0 for grouped,
         arithmetic form PACK in [0, 1] default greatest where PACK == 0 or (device.tensor_ops == 0 and TALL == 1 and INT8 == 0 and WIDTH % 128 == 0 and WIDTH < 1048576 and N % (64 / SERVED) == 0 and each(W, FIRST == 0 or (form(W, PACK) == 1 and form(W, PACK_FOLDS) == 1 and form(W, PACK_RESIDUE) == 0)) and sum(W, FIRST * form(W, PACK_FOLDS)) == SERVED * most(W, FIRST * form(W, PACK_FOLDS)) and sum(W, FIRST * form(W, PACK_RESIDUE)) % SERVED == 0 and sum(W, FIRST * form(W, PACK_SUMS)) % SERVED == 0) reference 0 for grouped,
         form DOWN_TALL in [0, 1] default greatest where DOWN_TALL == 0 or STACKED == 0 or (device.tensor_ops == 0 and T % 32 == 0 and each(W, FIRST == 1 or WIDTH % 64 == 0) and (each(W, FIRST == 1 or (WIDTH % 128 == 0 and WIDTH < 1048576 and N % 64 == 0 and form(W, PACK) == 1)) or any(W, FIRST == 0 and (form(W, PACK_FOLDS) == 2 or form(W, PACK_RESIDUE) == 1)))) for grouped,
         arithmetic form DOWN_INT8 in [0, 1] default 0 for grouped,
-        arithmetic form DOWN_PACK in [0, 1] default greatest where DOWN_PACK == 0 or (device.tensor_ops == 0 and DOWN_TALL == 1 and DOWN_INT8 == 0 and each(W, FIRST == 1 or (WIDTH % 128 == 0 and WIDTH < 1048576 and N % 64 == 0 and form(W, PACK) == 1 and form(W, PACK_FOLDS) == 1 and form(W, PACK_RESIDUE) == 0))) reference 0 for grouped)
+        arithmetic form DOWN_PACK in [0, 1] default greatest where DOWN_PACK == 0 or (device.tensor_ops == 0 and DOWN_TALL == 1 and DOWN_INT8 == 0 and each(W, FIRST == 1 or (WIDTH % 128 == 0 and WIDTH < 1048576 and N % 64 == 0 and form(W, PACK) == 1 and form(W, PACK_FOLDS) == 1 and form(W, PACK_RESIDUE) == 0))) reference 0 for grouped,
+        TILE_N in [128, 64] default least where TILE_N == 128 or (ceil_div(most(W, N), 128) < device.units and (STACKED == 0 or TALL == 0 or DOWN_TALL == 0)) for grouped)
+    where (MATRIX == 0 or (GATHERED == 1 and PER_ROW == 0)) for choice
     where K + SHARED <= device.max_group_threads / device.subgroup_width for summed
     where ROWS * ceil_div(SUMMED_PACKETS - (1 - min(1, LANES / 16) + (min(1, LANES / 16) - LANES / 32) * SUMMED_STAGES_16) * (SUMMED_PACKETS - SUMMED_STAGE), LANES) <= 8 for summed
     where GATHERED == 0 or LANES <= 16 for summed
+    where (MATRIX == 0 or (GATHERED == 1 and (ROWS * 32 / LANES == 8 or ROWS * 32 / LANES == 16))) for summed
     where (SHARED == 1 or 2 * ceil_div(SUMMED_PACKETS - SUMMED_STAGES_16 * (SUMMED_PACKETS - SUMMED_STAGE), 16) <= 8) for summed
     where (TALL == 0 or ((WIDTH % 64 == 0 or INT8 == 1) and (STACKED == 0 or T % 32 == 0))) for grouped
     where (TALL == 0 or WIDTH % 128 == 0 or TALL_K == 64) for grouped
@@ -197,7 +203,7 @@ projection routed for metal:
     scratch table_grid bytes (12) when STACKED == 1 for grouped
     scratch tile_grid bytes (12) when STACKED == 1 for grouped
     scratch operand bytes (max(EXPANSION_OPERAND, DOWN_OPERAND)) when (STACKED == 1 or M > 64) and (TALL == 1 or DOWN_TALL == 1) for grouped
-    scratch tables bytes (ORDINAL_BYTES + USED_EXPERTS * max(EXPANSION_TABLES, DOWN_TABLES)) when (STACKED == 1 or M > 64) and (INT8 + PACK + DOWN_INT8 + DOWN_PACK > 0 or (STACKED == 1 and (TALL == 1 or DOWN_TALL == 1))) for grouped
+    scratch tables bytes (ORDINAL_BYTES + USED_EXPERTS * max(EXPANSION_TABLES, DOWN_TABLES)) when (STACKED == 1 or M > 64) and (INT8 + PACK + DOWN_INT8 + DOWN_PACK > 0 or (STACKED == 1 and (TALL == 1 or DOWN_TALL == 1 or (T == 32 and TILE_M == 64)))) for grouped
     launch choice for choice when (GATHERED == 0 or M == 1 or M > VERIFY_ROWS or PER_ROW == 1) and (RECORDS == 0 or SHARED == 1 or XS > 0):
         reads (ROWS, LANES)
         threadgroups (CHOICE_GROUPS, M * K + SHARED, 1)
@@ -210,7 +216,7 @@ projection routed for metal:
         threads_per_threadgroup (32 * SIMDGROUPS, 1, 1)
         shared_bytes (CHOICE_SHARED)
     launch gather for choice when GATHERED == 1 and M >= 2 and M <= VERIFY_ROWS and PER_ROW == 0:
-        reads (SIMDGROUPS, ROWS, LANES)
+        reads (SIMDGROUPS, ROWS, LANES, MATRIX)
         threadgroups (1, 1, 1)
         threads_per_threadgroup (32, 1, 1)
     launch gathered_one for choice when GATHERED == 1 and M >= 2 and M <= VERIFY_ROWS and PER_ROW == 0 and (RECORDS == 0 or SHARED == 1 or XS > 0):
@@ -227,15 +233,15 @@ projection routed for metal:
         threads_per_threadgroup (32 * SIMDGROUPS, 1, 1)
         shared_bytes (GATHERED_ONE_SHARED)
     launch gathered for choice when GATHERED == 1 and M >= 2 and M <= VERIFY_ROWS and PER_ROW == 0 and (RECORDS == 0 or SHARED == 1 or XS > 0):
-        reads (ROWS, LANES)
-        threadgroups (CHOICE_GROUPS, M * K + SHARED, 1)
+        reads (ROWS, LANES, MATRIX)
+        threadgroups (GATHERED_CHOICE_GROUPS, M * K + SHARED, 1)
         grid (gather_grid)
         threads_per_threadgroup (32 * SIMDGROUPS, 1, 1)
         shared_bytes (GATHERED_SHARED)
     launch gathered_resident for choice when GATHERED == 1 and M >= 2 and M <= VERIFY_ROWS and RECORDS == 1 and SHARED == 0 and XS == 0:
-        reads (ROWS, LANES)
+        reads (ROWS, LANES, MATRIX)
         records (W)
-        threadgroups (CHOICE_GROUPS, M * K + SHARED, 1)
+        threadgroups (GATHERED_CHOICE_GROUPS, M * K + SHARED, 1)
         grid (gather_grid)
         threads_per_threadgroup (32 * SIMDGROUPS, 1, 1)
         shared_bytes (GATHERED_SHARED)
@@ -286,28 +292,32 @@ projection routed for metal:
         grid (gather_one_grid)
         threads_per_threadgroup (128, 1, 1)
     launch gathered for summed when GATHERED == 1 and M >= 2 and M <= VERIFY_ROWS and XS > 0 and WHOLE == 0:
-        reads (ROWS, LANES)
+        reads (ROWS, LANES, MATRIX)
         threadgroups (GATHERED_SUMMED_GROUPS, M * K + SHARED, 1)
         grid (gather_grid)
         threads_per_threadgroup (128, 1, 1)
+        shared_bytes (max(16, MATRIX * 15488))
     launch gathered for summed when GATHERED == 1 and M >= 2 and M <= VERIFY_ROWS and XS > 0 and WHOLE == 1:
-        reads (ROWS, LANES)
+        reads (ROWS, LANES, MATRIX)
         threadgroups (GATHERED_SUMMED_GROUPS, M * K + SHARED, 1)
         grid (gather_grid)
         unless (policy[POLICY_WHOLE])
         threads_per_threadgroup (128, 1, 1)
+        shared_bytes (max(16, MATRIX * 15488))
     launch gathered_whole for summed when GATHERED == 1 and M >= 2 and M <= VERIFY_ROWS and XS > 0 and WHOLE == 1:
-        reads (ROWS, LANES)
+        reads (ROWS, LANES, MATRIX)
         threadgroups (GATHERED_SUMMED_GROUPS, M * K + SHARED, 1)
         grid (gather_grid)
         if (policy[POLICY_WHOLE])
         threads_per_threadgroup (128, 1, 1)
+        shared_bytes (max(16, MATRIX * 15488))
     launch gathered_resident for summed when GATHERED == 1 and M >= 2 and M <= VERIFY_ROWS and XS == 0:
-        reads (ROWS, LANES)
+        reads (ROWS, LANES, MATRIX)
         records (W)
         threadgroups (GATHERED_SUMMED_GROUPS, M * K + SHARED, 1)
         grid (gather_grid)
         threads_per_threadgroup (128, 1, 1)
+        shared_bytes (max(16, MATRIX * 15488))
     launch grids for grouped when STACKED == 1:
         reads (TILE_M, TILE_N, TALL, INT8, PACK, DOWN_INT8, DOWN_PACK)
         threadgroups (1, 1, 1)
@@ -482,8 +492,8 @@ projection routed for cuda:
     let ROW_TILES = STACKED * ceil_div(T, TILE) + (1 - STACKED) * ceil_div(M, TILE) for grouped
     let TILE_BLOCKS = STACKED * B + (1 - STACKED) for grouped
     let PRODUCT_ROWS = STACKED * B * T + (1 - STACKED) * M for grouped
-    params (TPW in [1, 2] default 1 for choice | summed, arithmetic KSPLIT in [1, 2, 4] default least where (KSPLIT == 1 and most(W, WIDTH) / (64 * 2) < 8) or (KSPLIT == 2 and (most(W, WIDTH) / (64 * 4) < 8 or ceil_div(ceil_div(most(W, N), 16), 4 / 2) * (K + SHARED) >= 2 * device.units)) or KSPLIT == 4 for choice | summed,
-        GATHER_TPW in [1, 2] default greatest where GATHER_TPW == 1 or ceil_div(ceil_div(ceil_div(most(W, N), 16), GATHER_TPW), 4 / KSPLIT) * (2 * K + SHARED) >= 2 * device.units for choice | summed,
+    params (TPW in [1, 2] default 1 for choice | summed, arithmetic KSPLIT in [1, 2, 4] default least where (KSPLIT == 1 and (most(W, WIDTH) / (64 * 2) < 8 or ceil_div(ceil_div(most(W, N), 16), 4) * (K + SHARED) >= 2 * device.units)) or (KSPLIT == 2 and (most(W, WIDTH) / (64 * 4) < 8 or ceil_div(ceil_div(most(W, N), 16), 4 / 2) * (K + SHARED) >= 2 * device.units)) or KSPLIT == 4 for choice | summed,
+        GATHER_TPW in [1, 2] default 1 for choice | summed,
         form GATHERED in [0, 1] default 1 for choice,
         arithmetic INT8 in [0, 1] default greatest where INT8 == 0 or each(W, form(W, INT8) == 1) reference 0 for grouped,
         arithmetic OPERAND in [0, 1] default 0 for grouped,
@@ -519,20 +529,30 @@ projection routed for cuda:
         threadgroups (DECODE_GROUPS, M * K + SHARED, 1)
         threads_per_threadgroup (128, 1, 1)
         shared_bytes (most(W, WIDTH) * SHARED_ROW_PAIR_BYTES / 2)
-    launch gathered for choice when (GATHERED == 1 or M >= 4) and M >= 2 and M <= VERIFY_ROWS and PER_ROW == 0:
+    launch gathered for choice when (GATHERED == 1 or M >= 4) and M >= 2 and M <= 8 and PER_ROW == 0:
         reads (GATHER_TPW, KSPLIT)
+        threadgroups (GATHER_GROUPS, M * K + SHARED, 1)
+        threads_per_threadgroup (128, 1, 1)
+    launch gathered16 for choice when (GATHERED == 1 or M >= 4) and M > 8 and M <= VERIFY_ROWS and PER_ROW == 0:
+        reads (GATHER_TPW, KSPLIT)
+        alike (gathered)
         threadgroups (GATHER_GROUPS, M * K + SHARED, 1)
         threads_per_threadgroup (128, 1, 1)
     launch stage for summed when (SHARED == 1 or M > 1) and any(W, operands(W) == 1):
         staging
         threadgroups (M * (K + SHARED), 1, 1)
         threads_per_threadgroup (256, 1, 1)
-    launch summed for summed when M == 1:
+    launch summed for summed when M == 1 or M > VERIFY_ROWS:
         reads (TPW, KSPLIT)
         threadgroups (DECODE_GROUPS, M * (K + SHARED), 1)
         threads_per_threadgroup (128, 1, 1)
         shared_bytes (most(W, WIDTH) * SHARED_ROW_PAIR_BYTES / 2)
-    launch gathered for summed when M > 1:
+    launch gathered for summed when M > 1 and M <= 8:
+        reads (GATHER_TPW, KSPLIT)
+        alike (summed)
+        threadgroups (GATHER_GROUPS, M * K + SHARED, 1)
+        threads_per_threadgroup (128, 1, 1)
+    launch gathered16 for summed when M > 8 and M <= VERIFY_ROWS:
         reads (GATHER_TPW, KSPLIT)
         alike (summed)
         threadgroups (GATHER_GROUPS, M * K + SHARED, 1)
@@ -1012,7 +1032,7 @@ fn decode_output_join[M, H, SN, IN, K, SF, R](residual: &tensor[M, SN * H] f32,
 # loads at once, against the product row: read straight into registers, or
 # staged once a simdgroup in threadgroup memory for its lane groups to share
 # (`routed::stage_packets`: below 16 lanes, a simdgroup's share of 16 KB,
-# 256 / SIMDGROUPS packets of 64 bytes, at most the row). LANES sets each
+# 256 / SIMDGROUPS packets of 64 bytes, capped at 64 packets, at most the row). LANES sets each
 # projection's summation order (so it is arithmetic); down to 4 lanes, a
 # short down row still keeps several loads in flight a lane. The projections
 # meet in threadgroup memory, and one thread per channel carries the
@@ -1046,7 +1066,7 @@ native routed_output for cuda from "cuda/routed_output.cu":
     records (expert_down, tier_down)
     project routed summed (expert_down) shared (shared_down)
     scratch published bytes (M * (K + 1) * H * 2)
-    scratch arrivals bytes (ceil_div(H, 16) * 4) sync
+    scratch arrivals bytes (M * ceil_div(H, 16) * 4) sync
 
 # Vulkan: project the expert choices and shared expert in parallel workgroups
 # into `projected`, the last workgroup of each channel tile to arrive
@@ -1271,7 +1291,7 @@ native routed_experts for metal from "metal/routed_experts.metal":
     static (H, F, T, GS, US, LB)
     records (expert_gate, expert_up, expert_down, records_gate, records_up, records_down)
     project routed grouped (expert_gate, expert_up) down (expert_down)
-    restate TILE_M in [32, 64] default 32
+    restate TILE_M in [32, 64] default greatest where TILE_M == 32 or (device.tensor_ops == 1 and T == 32)
 
 # CUDA: 128-row x 128-column coalesced block tiles over mma16 weights. (Metal:
 # tunable simdgroup-matrix tiles.)
@@ -1659,8 +1679,12 @@ fn routed_gate_up_part[M, H, E, K, F, GS, US, TR, LB, FLIGHT, P](normalized: &te
             let record = decode_source(sources, i32(row), i32(choice), expert)
             let absent = routing[slot, ROUTING_SOURCE(P, row * K + choice)] == -1
             let mut mine = true
-            if late != 0:
+            if late == 1:
                 mine = absent and record != -1
+            if late == 2:
+                mine = record >= 0
+            if late == 3:
+                mine = record != -1
             if mine:
                 let mut gated = tensor[1, F] A
                 gate_up_choice(gate_rows, up_rows, expert_gate, expert_up, tier_gate, tier_up, activation,
@@ -1949,7 +1973,7 @@ native routed_down for cuda from "cuda/routed_down.cu":
     records (expert_down, tier_down)
     project routed summed (expert_down)
     scratch published bytes (M * K * H * 2)
-    scratch arrivals bytes (ceil_div(H, 16) * 4) sync
+    scratch arrivals bytes (M * ceil_div(H, 16) * 4) sync
 
 # Vulkan: the choices' weighted projections in slot order, in one launch
 # (`lib/routed/down.glsl`, `down_sum.glsl`). A tier-served choice reads its
@@ -1979,7 +2003,7 @@ native routed_experts_up for metal from "metal/routed_experts_up.metal":
     static (H, F, T, US)
     records (expert_up, expert_down, records_up, records_down)
     project routed grouped (expert_up) down (expert_down)
-    restate TILE_M in [32, 64] default 32
+    restate TILE_M in [32, 64] default greatest where TILE_M == 32 or (device.tensor_ops == 1 and T == 32)
 
 native routed_experts_up for cuda from "cuda/routed_experts_up.cu":
     static (H, F, US)
@@ -2185,81 +2209,7 @@ fn request_slot[S, W](slots: &mut tensor[S, W] i32, slot: i32, lane: i32, q: u64
     store_pair(slots, slot, lane + SLOT_REQUEST, q)
 
 
-# A layer ahead's hints: layer j's choices for these rows, predicted from
-# this layer's input formed as j forms its own (`form_input` with j's norm,
-# or the sum of this layer's partials where the form has none) through j's
-# router, ranked as routing ranks them (`rank_choices`), `input` and
-# `logits` holding the prediction, published (`publish_hints`). A hint never
-# changes a bank, a slot map or an output.
-fn hint[M, H, PT, NM, E, K, RING](residual: &tensor[M, PT * H] f32, norm: &tensor[NM] NW,
-    router: &tensor[E, H] RW, eps: f32, step: &tensor[STEP_WORDS] i32,
-    input: &mut tensor[M, H] A, logits: &mut tensor[M, E] f32,
-    ring: &mut tensor[RING] i32) where NM >= 0 and ((NM == H and PT == 1) or (NM == 0 and PT >= 1)) and RING >= HINT_ENTRY(M * K):
-    let mut routes = tensor[M, K] i32
-    let mut scores = tensor[M, K] f32
-    # `rank_choices` writes every route, but a `&mut` argument is read as
-    # passed, so it is initialized first.
-    for row in 0..M:
-        for choice in 0..K:
-            routes[row, choice] = -1
-    form_input(residual, norm, input, eps)
-    let mut keys = tensor[M, E] f32
-    linear(input, router, logits)
-    rank_choices(logits, routes, scores, keys)
-    publish_hints(routes, scores, step, ring)
-
-# A general-form layer ahead's hints: layer j's choices for these rows,
-# predicted from this layer's residual through j's router input
-# (`rms_norm` with j's router norm) and router, selected as `routed_select`
-# selects (`select_experts`, with j's selection bias and score function),
-# `input`, `logits` and `routes` holding the prediction, published
-# (`publish_hints`). A hint never changes a bank, a slot map or an output.
-fn hint_selected[M, H, E, K, RING](residual: &tensor[M, H] f32, router_norm: &tensor[H] RNW,
-    router: &tensor[E, H] RW, bias: &tensor[E] f32, score: i32, eps: f32,
-    step: &tensor[STEP_WORDS] i32, input: &mut tensor[M, H] A, logits: &mut tensor[M, E] f32,
-    routes: &mut tensor[M, K] i32, ring: &mut tensor[RING] i32) where RING >= HINT_ENTRY(M * K):
-    let mut scores = tensor[M, E] f32
-    let mut keys = tensor[M, E] f32
-    rms_norm(residual, router_norm, input, eps)
-    linear(input, router, logits)
-    select_experts(logits, bias, score, routes, scores, keys)
-    # Each choice's score, as its ranking gave it.
-    let mut chosen = tensor[M, K] f32
-    for row in 0..M:
-        for choice in 0..K:
-            chosen[row, choice] = scores[row, routes[row, choice]]
-    publish_hints(routes, chosen, step, ring)
-
-# Each predicted expert of `routes` not named before written to `ring`
-# after its header (the step's sequence and the count), as the choice it was
-# first predicted as (`name_entry`, its weight the probability its ranking
-# gave it, `weights`), in rank order: every row's first
-# choice, then every row's second, and so on, so the ring is best first, the
-# order its readers read ahead in. Its readers keep only the experts the
-# layer lacks: the host's hint admission and the prefetch's takes each skip
-# one the layer holds, so the route reads no map of the layer ahead (which,
-# the group's own, its route writes).
-fn publish_hints[M, K, RING](routes: &tensor[M, K] i32, weights: &tensor[M, K] f32,
-    step: &tensor[STEP_WORDS] i32, ring: &mut tensor[RING] i32) where RING >= HINT_ENTRY(M * K):
-    let mut count = i32(0)
-    for rank in 0..K:
-        for row in 0..M:
-            let expert = routes[row, K - 1 - rank]
-            if expert >= 0:
-                let mut seen = 0
-                for earlier_rank in 0..K:
-                    for earlier_row in 0..M:
-                        if earlier_rank * M + earlier_row < rank * M + row:
-                            if routes[earlier_row, K - 1 - earlier_rank] == expert:
-                                seen = 1
-                if seen == 0:
-                    name_entry(ring, count, expert, i32(rank), i32(row), weights[row, K - 1 - rank])
-                    count = count + 1
-    ring[RING_COUNT] = count
-    ring[RING_GUESSES] = step[STEP_GUESSES]
-    ring[RING_SEQUENCE] = step[STEP_LOW]
-
-# Entry `entry` of a hint or front ring (streaming_words.seismic's ring): a
+# Entry `entry` of a front ring (streaming_words.seismic's ring): a
 # choice of the pass, its expert, its rank (0 a row's best), its row and its
 # weight's word (`weight_word`).
 fn name_entry[RING](ring: &mut tensor[RING] i32, entry: i32, expert: i32, rank: i32, row: i32, weight: f32):
@@ -2501,7 +2451,7 @@ fn stands[M, K](routes: &tensor[M, K] i32, rows_front: i32, row: i32, choice: i3
 # `resolve` wrote (a miss: SOURCE_RECORD -2 - t, or -1 for an absent expert
 # across a link). The GPU's queue starts at its distinct hit experts'
 # resident lines, the CPU's at zero; the distinct missed experts, by rows,
-# most first, ties in choice order, each go to the CPU where it ends there
+# fewest first, ties in choice order, each go to the CPU where it ends there
 # no later than in place (the CPU's first pays the handshake), else to the
 # GPU in place, a read in place no sooner than the link is free of the
 # step's moves (POLICY_LINK_BUSY_NS). It runs only once POLICY_PRICED is set; until then every
@@ -2516,39 +2466,70 @@ fn assign[M, K](routes: &tensor[M, K] i32, policy: &tensor[POLICY_WORDS] i32, ro
     sources: &mut tensor[SOURCE_ROWS, M, K] i32):
     # The lines are whole nanoseconds; the queues are u64, so no sum of
     # them wraps.
-    let mut gpu = u64(0)
+    let link = u64(policy[POLICY_LINK_NS])
+    let link_contended = max(link, u64(policy[POLICY_LINK_CONTENDED_NS]))
+    let link_row = u64(policy[POLICY_LINK_ROW_NS])
+    let busy = u64(policy[POLICY_LINK_BUSY_NS])
+    let mut hit = u64(0)
+    let mut total_uncontended = u64(0)
+    let mut total_contended = u64(0)
+    let mut total_misses = i32(0)
     for row in 0..M:
         for choice in 0..K:
-            if sources[SOURCE_RECORD, row, choice] >= 0 and stands(routes, rows_front, i32(row), i32(choice)):
+            if stands(routes, rows_front, i32(row), i32(choice)):
                 let rows = u64(exact_rows(routes, rows_front, routes[row, choice]))
-                gpu = gpu + max(u64(policy[POLICY_HIT_NS]), rows * u64(policy[POLICY_HIT_ROW_NS]))
-    let mut cpu = u64(0)
-    let mut served = i32(0)
-    for pass in 0..M:
-        let wanted = i32(M - pass)
-        for row in 0..M:
-            for choice in 0..K:
-                let source = sources[SOURCE_RECORD, row, choice]
-                let expert = routes[row, choice]
-                if source < 0 and stands(routes, rows_front, i32(row), i32(choice)) and exact_rows(routes, rows_front, expert) == wanted:
-                    let rows = u64(wanted)
-                    let mut on_cpu = cpu + u64(policy[POLICY_CPU_NS]) + (rows - u64(1)) * u64(policy[POLICY_CPU_ROW_NS])
-                    if served == 0:
-                        on_cpu = on_cpu + u64(policy[POLICY_HANDSHAKE_NS])
-                    let in_place = max(gpu, u64(policy[POLICY_LINK_BUSY_NS])) + max(u64(policy[POLICY_LINK_NS]), rows * u64(policy[POLICY_LINK_ROW_NS]))
-                    if on_cpu <= in_place:
-                        cpu = on_cpu
-                        served = 1
-                        let mut site = -2
-                        if source <= -2:
-                            site = -2 - source
-                        for other_row in 0..M:
-                            for other_choice in 0..K:
-                                if routes[other_row, other_choice] == expert:
-                                    sources[SOURCE_SITE, other_row, other_choice] = site
-                                    sources[SOURCE_RECORD, other_row, other_choice] = -1
-                    else:
-                        gpu = in_place
+                if sources[SOURCE_RECORD, row, choice] >= 0:
+                    hit = hit + max(u64(policy[POLICY_HIT_NS]), rows * u64(policy[POLICY_HIT_ROW_NS]))
+                else:
+                    total_uncontended = total_uncontended + max(link, rows * link_row)
+                    total_contended = total_contended + max(link_contended, rows * link_row)
+                    total_misses = total_misses + 1
+    if total_misses > 0:
+        let gpu_start = max(hit, busy)
+        let mut best_t = gpu_start + total_uncontended
+        let mut best_c = i32(0)
+        let mut cpu = u64(0)
+        let mut rem_contended = total_contended
+        let mut count = i32(0)
+        for pass in 0..M:
+            let wanted = i32(pass + 1)
+            for row in 0..M:
+                for choice in 0..K:
+                    let source = sources[SOURCE_RECORD, row, choice]
+                    let expert = routes[row, choice]
+                    if source < 0 and stands(routes, rows_front, i32(row), i32(choice)) and exact_rows(routes, rows_front, expert) == wanted:
+                        let rows = u64(wanted)
+                        count = count + 1
+                        cpu = cpu + u64(policy[POLICY_CPU_NS]) + (rows - u64(1)) * u64(policy[POLICY_CPU_ROW_NS])
+                        if count == 1:
+                            cpu = cpu + u64(policy[POLICY_HANDSHAKE_NS])
+                        rem_contended = rem_contended - max(link_contended, rows * link_row)
+                        let mut gpu_c = hit
+                        if count < total_misses:
+                            gpu_c = gpu_start + rem_contended
+                        let makespan = max(gpu_c, cpu)
+                        if makespan < best_t:
+                            best_t = makespan
+                            best_c = count
+        if best_c > 0:
+            let mut assigned = i32(0)
+            for pass in 0..M:
+                let wanted = i32(pass + 1)
+                for row in 0..M:
+                    for choice in 0..K:
+                        if assigned < best_c:
+                            let source = sources[SOURCE_RECORD, row, choice]
+                            let expert = routes[row, choice]
+                            if source < 0 and stands(routes, rows_front, i32(row), i32(choice)) and exact_rows(routes, rows_front, expert) == wanted:
+                                assigned = assigned + 1
+                                let mut site = -2
+                                if source <= -2:
+                                    site = -2 - source
+                                for other_row in 0..M:
+                                    for other_choice in 0..K:
+                                        if routes[other_row, other_choice] == expert:
+                                            sources[SOURCE_SITE, other_row, other_choice] = site
+                                            sources[SOURCE_RECORD, other_row, other_choice] = -1
 
 # Decode routing of a streamed layer: `routed_route_shared`'s ports, routing
 # and shared product, bit for bit, then `resolve` into the step's sources;
@@ -2598,26 +2579,6 @@ fn routed_route_streamed[M, H, PT, NM, E, K, S, ES, FW, FLIGHT, RING, P, GM, TM,
         site_publish[FLIGHT = SF, R = SR](step, routes, sources, scores, normalized, site, site_rows)
     return (normalized, coefficient, shared_product)
 
-# Gate-ahead hints (`hint`) for the next one or two streamed fused layers
-# (`AHEAD` in 1..=HINT_LEADS), guarded by `next_policy[POLICY_WHOLE]`.
-fn routed_hint_route[M, H, PT, NM, K, AHEAD, RING, EN](residual: &tensor[M, PT * H] f32,
-    activation: &host tensor[0, K] A,
-    next_norm: &tensor[NM] NW, next_router: &tensor[EN, H] RW,
-    after_norm: &tensor[NM] NW, after_router: &tensor[EN, H] RW,
-    eps: f32, step: &tensor[STEP_WORDS] i32, next_policy: &tensor[POLICY_WORDS] i32,
-    rings: &mut tensor[AHEAD, RING] i32)
-    where NM >= 0 and ((NM == H and PT == 1) or (NM == 0 and PT >= 1)) and operands(RW) == 0 and M <= VERIFY_ROWS and AHEAD >= 1 and AHEAD <= HINT_LEADS and RING >= HINT_ENTRY(M * K) and EN > 0 and K > 0 and K <= EN:
-    let mut predicted = tensor[M, H] A
-    let mut predicted_logits = tensor[M, EN] f32
-    let mut after = tensor[M, H] A
-    let mut after_logits = tensor[M, EN] f32
-    if next_policy[POLICY_WHOLE] == 0:
-        hint[K = K](residual, next_norm, next_router, eps, step, predicted,
-            predicted_logits, rings[0, :])
-        for lead in 1..AHEAD:
-            hint[K = K](residual, after_norm, after_router, eps, step, after,
-                after_logits, rings[lead, :])
-
 # Decode selection of a streamed layer of the general form: `routed_select`'s
 # ports and results, bit for bit, then `resolve` (a layer whose POLICY_WHOLE
 # word is set resolves only its hits, and reads the experts its front rows skip
@@ -2640,34 +2601,6 @@ fn routed_select_streamed[M, H, E, K, ES, FW, FLIGHT, RING, P, GM, TM](residual:
     resolve[P = P, E = E](routes, weights, ranked, map, tier, policy, sited, step, file, routing, keys, sources,
         front, land_grid, land_groups)
     return normalized
-
-# Gate-ahead hints (`hint_selected`) for the next one or two streamed general
-# layers (`AHEAD` in 1..=HINT_LEADS), guarded by `next_policy[POLICY_WHOLE]`.
-fn routed_hint_select[M, H, K, AHEAD, RING, EN](residual: &tensor[M, H] f32,
-    activation: &host tensor[0, K] A,
-    next_router_norm: &tensor[H] RNW, next_router: &tensor[EN, H] RW, next_bias: &tensor[EN] f32,
-    after_router_norm: &tensor[H] RNW, after_router: &tensor[EN, H] RW, after_bias: &tensor[EN] f32,
-    score: i32, epsilon: f32, step: &tensor[STEP_WORDS] i32, next_policy: &tensor[POLICY_WORDS] i32,
-    rings: &mut tensor[AHEAD, RING] i32)
-    where operands(RW) == 0 and M <= VERIFY_ROWS and AHEAD >= 1 and AHEAD <= HINT_LEADS and RING >= HINT_ENTRY(M * K) and EN > 0 and K > 0 and K <= EN:
-    let mut predicted = tensor[M, H] A
-    let mut predicted_logits = tensor[M, EN] f32
-    let mut predicted_routes = tensor[M, K] i32
-    for row in 0..M:
-        for choice in 0..K:
-            predicted_routes[row, choice] = -1
-    let mut after = tensor[M, H] A
-    let mut after_logits = tensor[M, EN] f32
-    let mut after_routes = tensor[M, K] i32
-    for row in 0..M:
-        for choice in 0..K:
-            after_routes[row, choice] = -1
-    if next_policy[POLICY_WHOLE] == 0:
-        hint_selected(residual, next_router_norm, next_router, next_bias, score, epsilon, step,
-            predicted, predicted_logits, predicted_routes, rings[0, :])
-        for lead in 1..AHEAD:
-            hint_selected(residual, after_router_norm, after_router, after_bias, score, epsilon, step,
-                after, after_logits, after_routes, rings[lead, :])
 
 # A streamed decode layer's site request (streaming_words.seismic's site
 # kind), after its route (or its landing, when one runs), before its
@@ -2734,13 +2667,30 @@ fn any_sited[M, K](sources: &tensor[SOURCE_ROWS, M, K] i32) -> bool:
 # (`decode_selected`). Failed: nothing is added, and the host fails the
 # rows that named the failed experts. A step with no CPU choice reads
 # neither table.
+# `mode`:
+# - 0: project every sourced choice, zeroing unsourced (`record == -1`) choices.
+# - 1 (`DecodeHits`): project only VRAM hits (`record >= 0`), zeroing all others.
+# - 2 (`DecodeBack`): project only sourced choices (`record != -1`), leaving
+#   unsourced (`record == -1`) choices untouched in `published`.
 fn routed_down_project[M, H, E, K, F, TR](product: &tensor[M, K, F] A, routes: &tensor[M, K] i32,
     sources: &tensor[SOURCE_ROWS, M, K] i32, expert_down: &tensor[E, H, F] EDW,
-    tier_down: &tensor[TR, H, F] EDW) -> tensor[M, K, H] A
+    tier_down: &tensor[TR, H, F] EDW, mode: i32, published: &mut tensor[M, K, H] A)
     where TR >= 0 and M <= VERIFY_ROWS:
-    let mut published = tensor[M, K, H] A
-    decode_down(product, routes, sources, expert_down, tier_down, published)
-    return published
+    for row in 0..M:
+        for choice in 0..K:
+            let record = decode_source(sources, i32(row), i32(choice), routes[row, choice])
+            if mode != 2 or record != -1:
+                let mut down_row = tensor[F] f32
+                operand_row(product[row, choice], operands(expert_down), down_row)
+                for column in 0..H:
+                    let mut projected = f32(0.0)
+                    if mode != 1 or record >= 0:
+                        for feature in 0..F:
+                            if record >= 0:
+                                projected = fma(down_row[feature], f32(expert_down[record, column, feature]), projected)
+                            if record <= -2:
+                                projected = fma(down_row[feature], f32(tier_down[-2 - record, column, feature]), projected)
+                    published[row, choice, column] = projected
 
 fn routed_down_sited[M, H, K, FLIGHT, SW](base: &tensor[M, H] f32,
     published: &tensor[M, K, H] A, sources: &tensor[SOURCE_ROWS, M, K] i32, weights: &tensor[M, K] f32,

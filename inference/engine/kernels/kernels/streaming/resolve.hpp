@@ -110,12 +110,15 @@ STREAMING_FN bool streaming_front_row(int front_rows, u32 row) {
     return ((u32(front_rows) >> row) & 1u) != 0u;
 }
 
-// Whether choice c, its expert of source `source` as resolved (-1 absent),
-// is computed: any choice of an exact row (a row not of `front_rows`); a
-// front row's where the step holds its expert or an exact row chooses it.
+// Whether choice c, its expert of source `source` as resolved (-1 absent,
+// <= -2 host-tier resident needing PCIe H2D, >= 0 Tier-0 resident), is
+// computed: any choice of a non-front (`1 + K`) row; a front (`F`) row's ONLY
+// where Tier 0 already holds its expert (`source >= 0`) or a non-front (`1 + K`)
+// row chooses it (distinct compulsory union of `1 + K` rows only — front-only
+// host-resident experts never trigger critical-path Phase A H2D transfers).
 STREAMING_FN bool streaming_computes(u32 c, u32 choices, int source, int front_rows, STREAMING_GROUP_PARAM) {
     const u32 K = u32(SEISMIC_DIM_K);
-    if (!streaming_front_row(front_rows, c / K) || source != -1)
+    if (!streaming_front_row(front_rows, c / K) || source >= 0)
         return true;
     const int expert = STREAMING_GROUP(STREAMING_RESOLVE_EXPERT(c));
     for (u32 other = 0; other < choices; ++other)
@@ -221,24 +224,30 @@ STREAMING_FN void streaming_publish_front(u32 choices, int front_rows, STREAMING
 }
 
 // The assignment, by thread 0, over the group's resolved sources and rows
-// (streaming_words.seismic's): the GPU's queue from its distinct hit
-// experts' resident lines, the CPU's from zero; each distinct missed
-// expert, by rows (most first, from `max_miss_rows` down to 1), ties in
-// choice order, to the CPU where it ends there no later than in place, else
-// to the GPU in place, a read in place no sooner than the link is free of
-// the step's moves (POLICY_LINK_BUSY_NS). Its site is written on its standing
-// choice (the first of the exact rows'); the snapshot gives every choice its
-// standing one's. Caller guards on POLICY_PRICED != 0.
+// (streaming_words.seismic's): compares GPU-only uncontended completion time
+// (C = 0, POLICY_LINK_NS) against offloading the first C of N distinct missed
+// experts (ordered fewest-rows-first, ties in choice order) to the CPU
+// (POLICY_CPU_NS + handshake) while the remaining N - C run on the GPU at the
+// contended link rate (max(POLICY_LINK_NS, POLICY_LINK_CONTENDED_NS)). Offloads
+// to CPU only when the joint makespan is strictly less than uncontended
+// GPU-only completion time, choosing the C minimizing makespan (ties to smaller
+// C). Its site is written on its standing choice (the first of the exact
+// rows'); the snapshot gives every choice its standing one's. Caller guards on
+// POLICY_PRICED != 0.
 STREAMING_FN void streaming_assign(u32 choices, STREAMING_GROUP_PARAM) {
-    const u64 hit = streaming_line(choices, SEISMIC_CONST_POLICY_HIT_NS, streaming_group);
+    const u64 hit_line = streaming_line(choices, SEISMIC_CONST_POLICY_HIT_NS, streaming_group);
     const u64 hit_row = streaming_line(choices, SEISMIC_CONST_POLICY_HIT_ROW_NS, streaming_group);
     const u64 link = streaming_line(choices, SEISMIC_CONST_POLICY_LINK_NS, streaming_group);
+    const u64 link_contended = max(link, streaming_line(choices, SEISMIC_CONST_POLICY_LINK_CONTENDED_NS, streaming_group));
     const u64 link_row = streaming_line(choices, SEISMIC_CONST_POLICY_LINK_ROW_NS, streaming_group);
     const u64 busy = streaming_line(choices, SEISMIC_CONST_POLICY_LINK_BUSY_NS, streaming_group);
     const u64 one = streaming_line(choices, SEISMIC_CONST_POLICY_CPU_NS, streaming_group);
     const u64 each = streaming_line(choices, SEISMIC_CONST_POLICY_CPU_ROW_NS, streaming_group);
     const u64 handshake_ns = streaming_line(choices, SEISMIC_CONST_POLICY_HANDSHAKE_NS, streaming_group);
-    u64 gpu = 0;
+    u64 hit = 0;
+    u64 total_uncontended = 0;
+    u64 total_contended = 0;
+    u32 total_misses = 0;
     u32 max_miss_rows = 0;
     u32 min_miss_c = choices;
     u32 max_miss_c = 0;
@@ -247,8 +256,11 @@ STREAMING_FN void streaming_assign(u32 choices, STREAMING_GROUP_PARAM) {
         if (rows == 0)
             continue;
         if (STREAMING_GROUP(STREAMING_RESOLVE_SOURCE(choices, c)) >= 0) {
-            gpu += max(hit, u64(rows) * hit_row);
+            hit += max(hit_line, u64(rows) * hit_row);
         } else {
+            total_uncontended += max(link, u64(rows) * link_row);
+            total_contended += max(link_contended, u64(rows) * link_row);
+            ++total_misses;
             if (rows > max_miss_rows)
                 max_miss_rows = rows;
             if (c < min_miss_c)
@@ -257,27 +269,43 @@ STREAMING_FN void streaming_assign(u32 choices, STREAMING_GROUP_PARAM) {
                 max_miss_c = c;
         }
     }
-    if (max_miss_rows == 0)
+    if (total_misses == 0)
         return;
+    const u64 gpu_start = max(hit, busy);
+    u64 best_t = gpu_start + total_uncontended;
+    u32 best_c = 0;
     u64 cpu = 0;
-    bool served = false;
-    for (u32 wanted = max_miss_rows; wanted > 0; --wanted) {
+    u64 rem_contended = total_contended;
+    u32 count = 0;
+    for (u32 wanted = 1; wanted <= max_miss_rows; ++wanted) {
         const u64 rows = u64(wanted);
         const u64 cpu_work = one + (rows - 1) * each;
-        const u64 link_work = max(link, rows * link_row);
+        const u64 link_contended_work = max(link_contended, rows * link_row);
         for (u32 c = min_miss_c; c <= max_miss_c; ++c) {
             const int source = STREAMING_GROUP(STREAMING_RESOLVE_SOURCE(choices, c));
             if (source >= 0 || u32(STREAMING_GROUP(STREAMING_RESOLVE_ROWS(choices, c))) != wanted)
                 continue;
-            const u64 on_cpu = cpu + cpu_work + (served ? u64(0) : handshake_ns);
-            const u64 in_place = max(gpu, busy) + link_work;
-            if (on_cpu <= in_place) {
-                cpu = on_cpu;
-                served = true;
-                STREAMING_GROUP(STREAMING_RESOLVE_SITE(choices, c)) = source <= -2 ? -2 - source : -2;
-            } else {
-                gpu = in_place;
+            ++count;
+            cpu += cpu_work + (count == 1 ? handshake_ns : u64(0));
+            rem_contended -= link_contended_work;
+            const u64 gpu_c = count < total_misses ? (gpu_start + rem_contended) : hit;
+            const u64 makespan = max(gpu_c, cpu);
+            if (makespan < best_t) {
+                best_t = makespan;
+                best_c = count;
             }
+        }
+    }
+    if (best_c == 0)
+        return;
+    u32 assigned = 0;
+    for (u32 wanted = 1; wanted <= max_miss_rows && assigned < best_c; ++wanted) {
+        for (u32 c = min_miss_c; c <= max_miss_c && assigned < best_c; ++c) {
+            const int source = STREAMING_GROUP(STREAMING_RESOLVE_SOURCE(choices, c));
+            if (source >= 0 || u32(STREAMING_GROUP(STREAMING_RESOLVE_ROWS(choices, c))) != wanted)
+                continue;
+            ++assigned;
+            STREAMING_GROUP(STREAMING_RESOLVE_SITE(choices, c)) = source <= -2 ? -2 - source : -2;
         }
     }
 }

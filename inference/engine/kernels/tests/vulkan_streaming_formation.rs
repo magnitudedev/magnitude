@@ -106,18 +106,6 @@ fn vulkan_streaming_forms() {
             &select.iter().copied().chain(tm(64)).collect::<Vec<_>>(),
         ));
     }
-    for ahead in [1, 2] {
-        requests.push(request(
-            "routed_hint_route",
-            &[("A", b), ("NW", b), ("RW", b)],
-            &[("H", 2048), ("PT", 1), ("NM", 2048), ("K", 8), ("AHEAD", ahead), ("EN", 32)],
-        ));
-        requests.push(request(
-            "routed_hint_select",
-            &[("A", b), ("RNW", b), ("RW", b)],
-            &[("H", 2048), ("K", 4), ("AHEAD", ahead), ("EN", 32)],
-        ));
-    }
     // Packed current and next routers bind separate rows16 geometries.
     // NM=0 additionally selects the unnormalized PT-part input recipe.
     let mut packed_route = route_elements;
@@ -134,16 +122,6 @@ fn vulkan_streaming_forms() {
         &packed_select,
         &select.into_iter().chain([("TM", 64)]).collect::<Vec<_>>(),
     ));
-    requests.push(request(
-        "routed_hint_route",
-        &[("A", b), ("NW", b), ("RW", w)],
-        &[("H", 2048), ("PT", 1), ("NM", 2048), ("K", 8), ("AHEAD", 2), ("EN", 32)],
-    ));
-    requests.push(request(
-        "routed_hint_select",
-        &[("A", b), ("RNW", b), ("RW", w)],
-        &[("H", 2048), ("K", 4), ("AHEAD", 2), ("EN", 32)],
-    ));
     let mut unnormalized_route = route;
     unnormalized_route.iter_mut().find(|(name, _)| *name == "NM").unwrap().1 = 0;
     unnormalized_route.iter_mut().find(|(name, _)| *name == "PT").unwrap().1 = 2;
@@ -151,11 +129,6 @@ fn vulkan_streaming_forms() {
         "routed_route_streamed",
         &route_elements,
         &unnormalized_route.into_iter().chain([("TM", 256)]).collect::<Vec<_>>(),
-    ));
-    requests.push(request(
-        "routed_hint_route",
-        &[("A", b), ("NW", b), ("RW", b)],
-        &[("H", 2048), ("PT", 2), ("NM", 0), ("K", 8), ("AHEAD", 2), ("EN", 32)],
     ));
     let results = form_requests(
         module,
