@@ -48,9 +48,12 @@ def workspace(directory: Path) -> Path:
 def cargo_build(source: Path, target: Path, wrapper: str | None, *extra: str) -> str:
     """Build as the agent does, which reports the build scripts the build ran to `target`
     (`provenance.build_scripts`); cargo's own output."""
-    env = {k: v for k, v in os.environ.items() if k != engine.COMPILER}
+    env = {k: v for k, v in os.environ.items() if k not in (engine.COMPILER, engine.OUTER_COMPILER)}
     if wrapper is not None:
         env[engine.COMPILER] = wrapper
+        env[engine.OUTER_COMPILER] = wrapper
+    else:
+        env[engine.OUTER_COMPILER] = ""
     built = subprocess.run(
         ["cargo", "build", "--release", "--offline", "--message-format=json", "--target-dir", str(target), *extra],
         cwd=source, env=env, capture_output=True, text=True, check=True,
@@ -217,7 +220,10 @@ def test_a_test_executable_the_build_produced_is_verified_and_refused_when_it_na
     (source / "lib/tests").mkdir()
 
     def tests() -> dict:
-        env = dict({k: v for k, v in os.environ.items() if k != engine.COMPILER}, **{engine.COMPILER: wrapper})
+        env = dict(
+            {k: v for k, v in os.environ.items() if k not in (engine.COMPILER, engine.OUTER_COMPILER)},
+            **{engine.COMPILER: wrapper, engine.OUTER_COMPILER: wrapper},
+        )
         messages = subprocess.run(
             ["cargo", "test", "--no-run", "--release", "--offline", "--message-format=json", "-p", "my-lib",
              "--test", "here", "--target-dir", str(target)],

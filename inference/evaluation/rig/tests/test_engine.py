@@ -671,13 +671,14 @@ def test_a_home_host_that_cannot_be_read_keeps_the_run_and_one_no_longer_fit_let
 def test_a_run_granted_its_build_or_on_windows_is_never_stopped_to_move(rig, monkeypatch):
     hosts, source, _ = rig
     remote = connect(hosts.host("alpha"))
-    holder = _holding(remote, "holder", "build")
     built = _holding(remote, "built", "build", released=True)
+    holder = None
     try:
         deadline = time.monotonic() + 10
         while any(e["run"] == "built" for e in host_status(remote)["entries"]):
             assert time.monotonic() < deadline
             time.sleep(0.05)
+        holder = _holding(remote, "holder", "build")
         # One holds its build, the other holds nothing now: each was granted it, so its runner
         # takes the stop to move as void and runs on.
         assert holder.stop(queued=True)["stopped"] and built.stop(queued=True)["stopped"]
@@ -699,7 +700,8 @@ def test_a_run_granted_its_build_or_on_windows_is_never_stopped_to_move(rig, mon
         building.enter("build-source")
         assert building.built and not building.queued
     finally:
-        holder.stop()
+        if holder is not None:
+            holder.stop()
         built.stop()
 
 
