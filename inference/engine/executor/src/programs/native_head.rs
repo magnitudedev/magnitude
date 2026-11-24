@@ -2999,7 +2999,7 @@ impl NativeHeadProgram {
                 next_guesses: exported(&chain.next_guesses, "chain's next guesses")?,
             }),
         };
-        Ok((completion, HeadOutput { selected, landed_reads }))
+        Ok((completion, HeadOutput { selected, landed_reads, expert_step: None }))
     }
 }
 

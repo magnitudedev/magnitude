@@ -138,6 +138,7 @@ fn bank_of(groups: &[usize], slots: u64, experts: impl Fn(usize) -> u64, form: R
                     scope: WeightScope::Target,
                     group: index,
                     experts: experts(layers.len()),
+                    selected: 8,
                     resident: form.each(|_| Ok::<_, ()>(resident())).unwrap(),
                     hinted: Vec::new(),
                     shared_down: None,

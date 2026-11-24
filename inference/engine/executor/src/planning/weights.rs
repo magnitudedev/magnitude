@@ -2565,6 +2565,22 @@ impl ModelLoadPlan {
         }
     }
 
+    /// The placed head weight of `role`.
+    pub(super) fn head_weight(&self, role: WeightRole) -> Option<&WeightPlan> {
+        match *self.role_index.get(&role)? {
+            WeightSlot::Head(index) => self.head()?.get(index),
+            WeightSlot::Target(_) | WeightSlot::Vision(_) => None,
+        }
+    }
+
+    /// Mutable access to the placed head weight of `role`.
+    pub(super) fn head_weight_mut(&mut self, role: WeightRole) -> Option<&mut WeightPlan> {
+        match *self.role_index.get(&role)? {
+            WeightSlot::Head(index) => self.head.as_mut()?.weights.get_mut(index),
+            WeightSlot::Target(_) | WeightSlot::Vision(_) => None,
+        }
+    }
+
     #[cfg(test)]
     pub(crate) fn from_vision(vision: Vec<WeightPlan>) -> Self {
         let mut load = Self {

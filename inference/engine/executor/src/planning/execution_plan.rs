@@ -291,13 +291,25 @@ impl ExecutionPlanDraft {
             .map(|layer| {
                 let scope = bank.layers()[layer].scope;
                 let index = bank.layers()[layer].sublayer();
-                let (slot, binding) = self
-                    .programs
-                    .target()
-                    .blocks()
-                    .get(index.block as usize)
-                    .and_then(|block| block.bank())
-                    .ok_or_else(|| format!("{scope:?} has no bank entries"))?;
+                let (slot, binding) = match scope {
+                    magnitude_family_contracts::WeightScope::DraftSublayer(_) => {
+                        match self.programs.drafter() {
+                            Some(crate::DrafterProgramPlan::Draft(draft)) => draft
+                                .blocks()
+                                .get(index.block as usize)
+                                .and_then(|block| block.bank())
+                                .ok_or_else(|| format!("{scope:?} has no bank entries"))?,
+                            _ => return Err(format!("{scope:?} has no draft program")),
+                        }
+                    }
+                    _ => self
+                        .programs
+                        .target()
+                        .blocks()
+                        .get(index.block as usize)
+                        .and_then(|block| block.bank())
+                        .ok_or_else(|| format!("{scope:?} has no bank entries"))?,
+                };
                 if !bank.sited(layer) || !crate::native::BankSite::served(slot, binding, self.device.backend)? {
                     return Ok(None);
                 }

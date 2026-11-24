@@ -1134,6 +1134,10 @@ struct Routing {
     placer: crate::planning::Placer,
     /// `K`: a row's choices.
     selected: usize,
+    /// Per streamed layer, whether it belongs to a separate draft model
+    /// (`Layer::draft`). Target decode steps write routing records only for
+    /// non-draft layers, and draft decode steps only for draft layers.
+    draft: Vec<bool>,
     /// Per streamed layer, whether a ring row hints it ([`Layer::hints`]).
     /// The first streamed layer is hinted by none.
     hinted: Vec<bool>,
@@ -2198,6 +2202,7 @@ impl Telemetry {
                 reads: Mutex::new(reads),
                 experts: layers.iter().map(|layer| layer.experts).collect(),
                 placer: extents.placer,
+                draft: layers.iter().map(|layer| layer.draft).collect(),
                 hinted: (0..layers.len())
                     .map(|target| layers.iter().any(|layer| layer.hints.contains(&target)))
                     .collect(),
@@ -2647,12 +2652,14 @@ impl Telemetry {
                 // Its rows' keys, which placement ranks by and a recording
                 // load traces.
                 let keys = decoded.launch.map(|launch| std::sync::Arc::new(self.keys.read(steps, sequence, launch)));
-                if let Some(routes) = &self.routes {
-                    let launch = decoded.launch.expect("a recording load's decode step has its launch");
-                    routes.record(steps, sequence, launch, keys.as_deref().expect("a launch's keys"));
+                if !decoded.draft {
+                    if let Some(routes) = &self.routes {
+                        let launch = decoded.launch.expect("a recording load's decode step has its launch");
+                        routes.record(steps, sequence, launch, keys.as_deref().expect("a launch's keys"));
+                    }
                 }
                 let selected = self.routing.selected;
-                let records = self.records(steps, sequence);
+                let records = self.records(steps, sequence, decoded.draft);
                 // Its front rows' guess kinds, as every record it wrote
                 // carries them.
                 let guesses = records.iter().filter_map(RoutingRecord::guesses).reduce(|first, other| {
@@ -3034,15 +3041,19 @@ impl Telemetry {
 
     /// Step `sequence`'s routing record at each streamed layer, by layer:
     /// each copied while the step holds them ([`RoutingRecord::copy`]),
-    /// none of a whole layer, then read.
-    fn records(&self, steps: &Steps, sequence: Step) -> Vec<RoutingRecord> {
-        let Routing { records, words, .. } = &self.routing;
+    /// none of a whole layer or a layer not belonging to this step's model
+    /// (`draft`), then read.
+    fn records(&self, steps: &Steps, sequence: Step, draft: bool) -> Vec<RoutingRecord> {
+        let Routing { records, words, draft: layer_draft, .. } = &self.routing;
         let copied = steps
             .while_owned(sequence, |owned| {
                 records
                     .iter()
                     .enumerate()
-                    .map(|(layer, record)| (!self.whole[layer].load(Ordering::Acquire)).then(|| RoutingRecord::copy(owned, record, *words)))
+                    .map(|(layer, record)| {
+                        (layer_draft[layer] == draft && !self.whole[layer].load(Ordering::Acquire))
+                            .then(|| RoutingRecord::copy(owned, record, *words))
+                    })
                     .collect::<Vec<_>>()
             })
             .expect("a completing step owns its routing records");

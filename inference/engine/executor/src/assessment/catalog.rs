@@ -793,6 +793,7 @@ fn plan_and_charge_separate_draft(
                 proposals as usize,
                 &[generated][..usize::from(generated > 0)],
                 definition.draft.as_ref().unwrap(),
+                false,
             )
             .unwrap();
             let actual: std::collections::BTreeSet<_> = classes
@@ -866,6 +867,7 @@ fn plan_and_charge_separate_draft(
                 method.draft_rows(),
                 &method.block_widths(),
                 definition.draft.as_ref().unwrap(),
+                programs.draft().unwrap().has_bank(),
             )
             .unwrap_or_else(|error| panic!("{context}: {error}"));
             crate::programs::native_draft::verify_draft_family_certificates(

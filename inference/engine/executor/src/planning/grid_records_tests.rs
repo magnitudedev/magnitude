@@ -202,7 +202,7 @@ fn fp8_experts_under_tile_grids_stream_records_of_their_stored_parts() {
             // One read per part of an expert's record: its three tensors' codes and grids.
             assert_eq!(urgent.parts.len(), 2 * RoutedTensor::ALL.len(), "{case}: a record is six reads");
 
-            let [stacks] = &bank.stored_stacks(&artifact).unwrap()[..] else {
+            let [stacks] = &bank.stored_stacks(&artifact, None).unwrap()[..] else {
                 panic!("{case}: one routed layer");
             };
             let layer = &bank.layers()[0];

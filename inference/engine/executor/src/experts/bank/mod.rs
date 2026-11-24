@@ -561,7 +561,11 @@ impl ExpertBank {
     /// of its rows starting at batch row `first`: the streamed layers there
     /// name their requests' rows within it.
     pub(crate) fn window(&self, sequence: u64, block: usize, first: u64) -> Result<(), String> {
-        let from = self.plan.layers().iter().position(|layer| layer.sublayer().block as usize >= block);
+        let from = self
+            .plan
+            .layers()
+            .iter()
+            .position(|layer| !layer.is_draft() && layer.sublayer().block as usize >= block);
         if let Some(layer) = from {
             let first = usize::try_from(first).map_err(|_| "a window's first row exceeds the host")?;
             self.watcher.shared().window(sequence, layer, first);

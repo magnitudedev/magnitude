@@ -1854,6 +1854,97 @@ fn launch_prices_supplies_draft_and_verify_priors_replaced_on_first_observation(
     assert!((live_right[1] - 0.0).abs() < 1e-12);
 }
 
+/// On cold start for a banked MoE target without a `StreamedVerifyPrior`
+/// (`verify_prior == None`), `RoundCosts::verify(1)` filters out `is_banked()`
+/// `LaunchPrices` and falls back to `0.0`. `RoundCosts::draft(g)` must match
+/// that gate so a non-zero analytical `draft(g)` prior is not pitted against
+/// `0.0` `verify(1)` (which would make `round(0, 0) = 1e-9` beat every
+/// `round(g, v)` and collapse `draft_n` to `0`).
+#[test]
+fn cold_start_banked_moe_without_verify_prior_does_not_pit_draft_prior_against_zero_verify() {
+    use magnitude_cost_model::{
+        Census, DraftCensus, DraftMethod, DraftWidthCensus, Kind, LaunchCounts,
+        LaunchPrices, TargetCensus,
+    };
+    use seismic_measure::pricing::{Bytes, Figures, Flops, Format, Rates, Storage, Work};
+
+    const BF16: Format = Format("bf16");
+    const Q4K: Format = Format("q4k");
+
+    let rates = Rates {
+        activation: BF16,
+        weights: Storage::ALL
+            .iter()
+            .flat_map(|&storage| [(storage, BF16, 300e9), (storage, Q4K, 300e9)])
+            .collect(),
+        flops: vec![(BF16, 60e12), (Q4K, 60e12)],
+        history: Vec::new(),
+        launch: 5e-6,
+        decode: None,
+    };
+    let figures = Figures {
+        rates,
+        composition: Ok(1.0),
+        step_pipelined: 50e-6,
+        step_round_trip: 200e-6,
+    };
+    let census_of = |bytes: u64| {
+        let launches = LaunchCounts::new((1..=8).map(|_| Ok(1)).collect());
+        let work = Work {
+            weights: vec![Bytes { format: Q4K, bytes }],
+            row_flops: vec![Flops { format: Q4K, flops: bytes * 2 }],
+            ..Work::default()
+        };
+        Census::new(vec![(Kind { work, launches }, None)], 0, 8)
+    };
+    let target = TargetCensus::Banked {
+        resident: census_of(9_000_000_000),
+        streamed: census_of(2_000_000_000),
+    };
+    let draft_c = census_of(900_000_000);
+    let draft = DraftCensus {
+        method: DraftMethod::Block,
+        widths: vec![
+            DraftWidthCensus { proposals: 1, rows_per_sequence: 2, census: draft_c.clone() },
+            DraftWidthCensus { proposals: 3, rows_per_sequence: 4, census: draft_c.clone() },
+            DraftWidthCensus { proposals: 7, rows_per_sequence: 8, census: draft_c },
+        ],
+        max_proposals: 7,
+    };
+    let banked_prices = LaunchPrices::with_draft(target, Some(draft), figures, true);
+    assert!(banked_prices.is_banked());
+
+    let load = Arc::new(DraftLoad::default());
+    load.observe_launch_prices(Some(banked_prices));
+    {
+        let state = load.lock();
+        let costs = RoundCosts::of(&state, 1024, 1, None);
+        assert_eq!(costs.verify(1), 0.0);
+        assert_eq!(
+            costs.draft(7),
+            0.0,
+            "banked MoE without verify_prior must not pit non-zero draft prior against 0.0 verify"
+        );
+    }
+    let mut ctrl = DraftController::new(7, load.clone());
+    assert!(
+        ctrl.generate(7, 1024, true) > 0,
+        "cold-start banked MoE without verify_prior must draft instead of collapsing to draft_n = 0"
+    );
+
+    // Once a StreamedVerifyPrior is observed, draft(g) uses the LaunchPrices prior again.
+    load.observe_streamed(Some(StreamedVerifyPrior {
+        regime_epoch: 1,
+        verify_seconds: vec![0.050, 0.055, 0.060, 0.065, 0.070, 0.075, 0.080, 0.085],
+    }));
+    {
+        let state = load.lock();
+        let costs = RoundCosts::of(&state, 1024, 1, None);
+        assert!(costs.verify(1) > 0.0);
+        assert!(costs.draft(7) > 0.0);
+    }
+}
+
 /// Reproduces `d273df` (`v710-sc` Vulkan DFlash): live `verify(4)` measured
 /// ~79 ms while a cold `StreamedVerifyPrior` predicted `verify(4) = 150 ms`
 /// and `verify(8) = 240 ms` (1.60× ratio). Anchoring the prior's ratio to

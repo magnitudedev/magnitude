@@ -28,7 +28,7 @@ pub use assessment::{
 pub(crate) use assessment::{deferred_bank_bytes, deferred_bank_bytes_of_bank, fit_depth};
 pub(crate) use resources::{DomainRows, HeadHistoryGeometry};
 #[cfg(test)]
-pub use bank::BankLayers;
+pub use bank::{BankLayer, BankLayers, DRAFT_MAX_SLOTS};
 pub use bank::{
     BankAllocation, BankBinding, BankCounts, BankPaths, BankTable, BankLayout, BankPart, ConveyorCarrier,
     Lender,

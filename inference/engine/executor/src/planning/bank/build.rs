@@ -55,7 +55,7 @@ impl ModelLoadPlan {
         if self.bank.is_some() {
             return Err(PlanError::Topology("the load plan already streams its experts"));
         }
-        let mut layers = Vec::new();
+        let mut layers: Vec<BankLayer> = Vec::new();
         let mut groups: Vec<BankGroup> = Vec::new();
         // Every streamed layer's selection order: a layer's hints rank the
         // next layer's choices by this layer's, reading the next layer's
@@ -63,13 +63,32 @@ impl ModelLoadPlan {
         // `routed_route_streamed`); and every layer's record form and
         // selected experts, which the bank's entries and words share.
         let mut order = None;
-        let mut shape = None;
+        let mut target_shape = None;
+        let mut max_selected = 0u64;
         for (index, scope, routed) in routed_layers(definition) {
+            let is_draft = matches!(scope, magnitude_family_contracts::WeightScope::DraftSublayer(_));
+            if is_draft && self.head.is_none() {
+                continue;
+            }
             let form = RecordForm::of(&routed.expert_up);
-            if *shape.get_or_insert((form, routed.selected)) != (form, routed.selected) {
+            if is_draft {
+                let Some((target_form, _)) = target_shape else {
+                    continue;
+                };
+                if form != target_form {
+                    continue;
+                }
+            } else if *target_shape.get_or_insert((form, routed.selected)) != (form, routed.selected) {
                 return Err(PlanError::Unstreamed(UnstreamedExperts::Shape(index)));
             }
-            let planned = |kind| self.target_weight(WeightRole { scope, kind });
+            let planned = |kind| {
+                let role = WeightRole { scope, kind };
+                if is_draft {
+                    self.head_weight(role)
+                } else {
+                    self.target_weight(role)
+                }
+            };
             let hinted = hint_kinds(routed)
                 .into_iter()
                 .map(|kind| HintWeight {
@@ -77,16 +96,18 @@ impl ModelLoadPlan {
                     element: planned(kind).map(|plan| plan.resident),
                 })
                 .collect::<Vec<_>>();
-            let router = &routed.router;
-            let selection = (
-                is_fused(routed),
-                router.score,
-                matches!(router.selection, ExpertSelection::TopK { bias: Some(_) }),
-                matches!(router.input, RouterInput::Residual(_)),
-                hinted.clone(),
-            );
-            if *order.get_or_insert_with(|| selection.clone()) != selection {
-                return Err(PlanError::Unstreamed(UnstreamedExperts::SelectionOrder(index)));
+            if !is_draft {
+                let router = &routed.router;
+                let selection = (
+                    is_fused(routed),
+                    router.score,
+                    matches!(router.selection, ExpertSelection::TopK { bias: Some(_) }),
+                    matches!(router.input, RouterInput::Residual(_)),
+                    hinted.clone(),
+                );
+                if *order.get_or_insert_with(|| selection.clone()) != selection {
+                    return Err(PlanError::Unstreamed(UnstreamedExperts::SelectionOrder(index)));
+                }
             }
             let resident = form.each(|tensor| {
                 planned(tensor.kind())
@@ -94,7 +115,9 @@ impl ModelLoadPlan {
                     .ok_or(PlanError::Topology("a routed layer lacks an expert stack"))
             })?;
             let record = resident.as_ref().try_map(|_, plan| record_tensor(plan, routed.experts))?;
-            let group = match groups.iter().position(|group| group.record == record) {
+            let group = match groups.iter().position(|group| {
+                group.record == record && layers[group.layers[0]].is_draft() == is_draft
+            }) {
                 Some(group) => {
                     groups[group].layers.push(layers.len());
                     group
@@ -110,16 +133,19 @@ impl ModelLoadPlan {
             let shared_down = is_fused(routed)
                 .then(|| planned(WeightKind::SharedDown).map(|plan| (plan.resident, plan.resident_bytes, plan.shape.clone())))
                 .flatten();
+            max_selected = max_selected.max(routed.selected);
             layers.push(BankLayer {
                 scope,
                 group,
                 experts: routed.experts,
+                selected: routed.selected,
                 resident,
                 hinted,
                 shared_down,
             });
         }
-        let (_, selected) = shape.ok_or(PlanError::Unstreamed(UnstreamedExperts::Unrouted))?;
+        let _ = target_shape.ok_or(PlanError::Unstreamed(UnstreamedExperts::Unrouted))?;
+        let selected = max_selected;
         // A routed layer streamed has experts to stream.
         let layers = BankLayers::new(layers).ok_or(PlanError::Topology("a streamed routed layer has no experts"))?;
         // A conveyor or a scratch without a layout, or a pool without a
@@ -174,7 +200,8 @@ impl ModelLoadPlan {
         for layer in bank.layers() {
             let records = bank.records(layer.group);
             for (kind, _) in layer.resident.iter() {
-                if let Some(weight) = self.target_weight_mut(WeightRole { scope: layer.scope, kind: kind.kind() }) {
+                let role = WeightRole { scope: layer.scope, kind: kind.kind() };
+                if let Some(weight) = self.bank_weight_mut(role) {
                     weight.shape[0] = records;
                     // The bank holds the values: empty, or every expert imported
                     // into its records (`ExpertBankPlan::whole`).
@@ -186,6 +213,15 @@ impl ModelLoadPlan {
         self.bank = Some(bank);
         self.rebuild_bank_table_index();
         self.with_front_stagings().with_bank_slots(slots, slots)
+    }
+
+    /// Mutable access to a banked weight's plan: in `head` for draft routed
+    /// layers, in `target` for target routed layers.
+    fn bank_weight_mut(&mut self, role: WeightRole) -> Option<&mut crate::planning::weights::WeightPlan> {
+        match role.scope {
+            magnitude_family_contracts::WeightScope::DraftSublayer(_) => self.head_weight_mut(role),
+            _ => self.target_weight_mut(role),
+        }
     }
 
     /// The plan with its expert bank at `slots` committed records per
@@ -203,13 +239,14 @@ impl ModelLoadPlan {
         }
         bank.slots = slots;
         bank.ceiling = ceiling;
-        bank.resident = slots == bank.widest().get();
+        bank.resident = bank.whole_at(slots);
         for (index, layer) in bank.layers().iter().enumerate() {
             let bytes = bank
                 .banked_bytes(index)
                 .map_err(PlanError::InvalidDefinition)?;
             for (kind, _) in layer.resident.iter() {
-                if let Some(weight) = self.target_weight_mut(WeightRole { scope: layer.scope, kind: kind.kind() }) {
+                let role = WeightRole { scope: layer.scope, kind: kind.kind() };
+                if let Some(weight) = self.bank_weight_mut(role) {
                     weight.resident_bytes = *bytes
                         .get(kind)
                         .ok_or(PlanError::Topology("a banked layer's stack outside its record"))?;
@@ -245,7 +282,8 @@ impl ModelLoadPlan {
         for layer in bank.layers() {
             let records = bank.records(layer.group);
             for (kind, _) in layer.resident.iter() {
-                if let Some(weight) = self.target_weight_mut(WeightRole { scope: layer.scope, kind: kind.kind() }) {
+                let role = WeightRole { scope: layer.scope, kind: kind.kind() };
+                if let Some(weight) = self.bank_weight_mut(role) {
                     weight.shape[0] = records;
                 }
             }
@@ -281,7 +319,7 @@ impl ModelLoadPlan {
         self.rebuild_bank_table_index();
         for layer in bank.layers() {
             for (_, resident) in layer.resident.iter() {
-                if let Some(weight) = self.target_weight_mut(resident.role) {
+                if let Some(weight) = self.bank_weight_mut(resident.role) {
                     *weight = resident.clone();
                 }
             }

@@ -131,7 +131,7 @@ pub fn load(load: Load) -> Result<(), String> {
     // file cache may hold.
     let package = magnitude_artifacts::Package::open_manifest(&manifest.package)
         .map_err(|error| error.to_string())?;
-    let expert_ranges = crate::engine::expert_ranges(draft.load().expert_bank(), package.target())?;
+    let expert_ranges = crate::engine::expert_ranges(draft.load().expert_bank(), &package)?;
     // The streamed load's bank: its slots at load, its floor and one slot,
     // and each holding's floor, slots at load and the stores it lies in.
     let bank = draft

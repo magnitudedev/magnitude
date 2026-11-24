@@ -873,6 +873,7 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
         let HeadOutput {
             selected,
             landed_reads: _,
+            expert_step: _,
         } = output;
         let selections = match selected {
             HeadSelected::Causal => None,

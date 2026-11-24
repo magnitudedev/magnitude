@@ -269,6 +269,9 @@ struct GroupRecord(usize);
 pub enum StepRoute {
     Grouped,
     Decode,
+    /// A separate draft model's decode step: writes routing records only for
+    /// draft bank layers (`Layer::draft`), never for target bank layers.
+    DraftDecode,
 }
 
 /// A group of grouped steps whose every step has ended, with the group
@@ -1423,9 +1426,11 @@ impl Shared {
         let mut admission = Admission { shared: self, next: first, remaining: launches.len() };
         let steps = launches.map(|launch| {
             let work = work(&launch);
-            let form = match route(&launch) {
+            let step_route = route(&launch);
+            let form = match step_route {
                 StepRoute::Grouped => StepForm::Grouped,
-                StepRoute::Decode => StepForm::Decode(DecodeStep {
+                StepRoute::Decode | StepRoute::DraftDecode => StepForm::Decode(DecodeStep {
+                    draft: step_route == StepRoute::DraftDecode,
                     launch: None,
                     recorded: None,
                     // A decode step issues a site flight, through which one of
@@ -1488,6 +1493,8 @@ enum StepForm {
 }
 
 struct DecodeStep {
+    /// Whether this decode step is a separate draft model's (`StepRoute::DraftDecode`).
+    draft: bool,
     /// Its decode launch's rows and context.
     launch: Option<DecodeLaunch>,
     recorded: Option<Recording>,
@@ -1615,6 +1622,7 @@ impl DecodeLaunch {
 /// group, and the lines its blocks were
 /// sampled by, where they were.
 pub(super) struct Decoded {
+    pub(super) draft: bool,
     pub(super) recording: Option<Recording>,
     pub(super) launch: Option<DecodeLaunch>,
     pub(super) group: Step,
@@ -1767,6 +1775,7 @@ impl ExpertStep {
         let route = match &mut self.form {
             StepForm::Grouped => CompletedRoute::Grouped,
             StepForm::Decode(decode) => CompletedRoute::Decode(Decoded {
+                draft: decode.draft,
                 recording: decode.recorded.take(),
                 launch: decode.launch,
                 group,

@@ -101,6 +101,7 @@ impl ExpertBank {
         charges: &seismic::Charges,
         plan: &ExpertBankPlan,
         artifact: &GgufArtifact,
+        draft: Option<&GgufArtifact>,
         sites: &[Option<crate::native::BankSite>],
         lines: std::sync::Arc<[crate::assessment::BankLines]>,
         cpu: &crate::assessment::StoredCpuSite,
@@ -138,7 +139,16 @@ impl ExpertBank {
                     contract => held(contract, Tensor::shared(charges, *element, extents)),
                 },
                 BankAllocation::Records { .. } => Ok((allocation.clone(), None)),
-                BankAllocation::Imported(scale) => crate::residency::import_scale(charges, artifact, scale).map(|tensor| (allocation.clone(), Some(tensor))),
+                BankAllocation::Imported(scale) => {
+                    let source = draft
+                        .filter(|d| {
+                            artifact.directory().tensor(&scale.tensor).is_none()
+                                && d.directory().tensor(&scale.tensor).is_some()
+                        })
+                        .unwrap_or(artifact);
+                    crate::residency::import_scale(charges, source, scale)
+                        .map(|tensor| (allocation.clone(), Some(tensor)))
+                }
             }
         })?;
         // Each lender's lent records, by the tier and group lending them.
@@ -318,6 +328,7 @@ impl ExpertBank {
             charges,
             plan,
             artifact,
+            draft,
             &layout,
             (&bank_stores, landed),
             &slot_maps,
@@ -400,6 +411,7 @@ fn watch(
     charges: &seismic::Charges,
     plan: &ExpertBankPlan,
     artifact: &GgufArtifact,
+    draft: Option<&GgufArtifact>,
     layout: &BankLayout<Tensor>,
     (bank, landed): (&Arc<Stores>, &Arc<Stores>),
     slot_maps: &[Tensor],
@@ -462,7 +474,7 @@ fn watch(
     let mut watched = Vec::with_capacity(layout.layers.len());
     let mut bank_maps = Vec::new();
     let mut landing_maps = Vec::new();
-    let stacks = plan.stored_stacks(artifact)?;
+    let stacks = plan.stored_stacks(artifact, draft)?;
     let scratch_forms = plan.layer_scratch_forms();
     // Where the host addresses the scratch (the one store's on unified
     // memory, beside the conveyor), its slots carry experts too.
@@ -538,6 +550,7 @@ fn watch(
             .collect::<Result<Vec<_>, String>>()?;
         watched.push(Layer {
             group,
+            draft: plan.layers()[index].is_draft(),
             experts: usize::try_from(experts).map_err(|_| "experts exceed the host")?,
             layer_window: usize::try_from(layer_window).map_err(|_| "layer window exceeds the host")?,
             map: view,

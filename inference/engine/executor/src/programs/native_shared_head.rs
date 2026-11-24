@@ -1583,6 +1583,7 @@ impl NativeSharedHeadProgram {
             HeadOutput {
                 selected: HeadSelected::Proposals(selections),
                 landed_reads,
+                expert_step: None,
             },
         ))
     }

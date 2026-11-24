@@ -240,6 +240,29 @@ impl GraphWeights<u64> {
         }
     }
 
+    /// What a draft graph may read: the weights `reads` selects plus every
+    /// bank part of any streamed draft layer (`WeightScope::DraftSublayer`).
+    pub(crate) fn of_draft(
+        load: &ModelLoadPlan,
+        reads: impl Fn(WeightRole) -> bool,
+    ) -> Result<Self, GraphError> {
+        let mut banks = Vec::new();
+        if let Some(bank) = load.expert_bank() {
+            for (index, layer) in bank.layers().iter().enumerate() {
+                if !layer.is_draft() {
+                    continue;
+                }
+                let scope = layer.scope;
+                banks.extend(
+                    bank.held_parts(index)?
+                        .into_iter()
+                        .map(|(part, element, extents)| BankPartView { scope, part, element, extents }),
+                );
+            }
+        }
+        Ok(Self { banks, ..Self::of(load, reads) })
+    }
+
     /// What a graph of target block `block` may read: its sublayers'
     /// weights, with the target's own of the exit block (`exit`), the next
     /// block's input norm of a block whose output forms that block's

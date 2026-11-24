@@ -26,6 +26,7 @@ pub struct DraftKernels {
     pub(super) dense: HashMap<DenseBinding, DenseKernels>,
     pub(super) routed: HashMap<RoutedBinding, RoutedKernels>,
     pub(super) general_routed: HashMap<GeneralRoutedBinding, GeneralRoutedKernels>,
+    pub(super) banks: HashMap<(crate::planning::BankedFeedForward, crate::BankBinding), super::ExpertBankKernels>,
     pub(super) streams: StreamsEntryKernels,
     /// Embeds the block's tokens (raw rows), and a corrector's candidates.
     pub(super) embedding: Option<NativeKernel<embedding_rows::Entry>>,
@@ -103,6 +104,7 @@ pub struct DraftBlockKernels {
     pub attention: AttentionKernels,
     pub injection: AttentionKernels,
     pub feed_forward: AttestedFeedForward,
+    pub bank: Option<super::ExpertBankKernels>,
 }
 
 /// Sinkhorn hyper-connection stream entries for a multi-stream draft backbone.

@@ -575,6 +575,7 @@ impl AttestedPrograms {
                         proposals,
                         &method.block_widths(),
                         draft,
+                        draft_plan.has_bank(),
                     )?;
                     let landing =
                         self.landing(load, crate::programs::native_draft::token_table(draft))?;
@@ -689,12 +690,24 @@ impl AttestedPrograms {
                     return Ok(None);
                 }
                 let (scope, index) = (layer.scope, layer.sublayer());
-                self.target
-                    .blocks
-                    .get(index.block as usize)
-                    .and_then(|block| block.bank.as_ref())
-                    .map(|bank| bank.site.clone())
-                    .ok_or_else(|| format!("{scope:?} has no bank entries"))
+                match scope {
+                    WeightScope::DraftSublayer(_) => match &self.drafter {
+                        Some(AttestedDrafter::Draft(draft)) => draft
+                            .blocks
+                            .get(index.block as usize)
+                            .and_then(|block| block.bank.as_ref())
+                            .map(|bank| bank.site.clone())
+                            .ok_or_else(|| format!("{scope:?} has no bank entries")),
+                        _ => Err(format!("{scope:?} has no draft program")),
+                    },
+                    _ => self
+                        .target
+                        .blocks
+                        .get(index.block as usize)
+                        .and_then(|block| block.bank.as_ref())
+                        .map(|bank| bank.site.clone())
+                        .ok_or_else(|| format!("{scope:?} has no bank entries")),
+                }
             })
             .collect()
     }
@@ -1346,10 +1359,21 @@ impl AttestedPrograms {
                                 });
                             }
                         };
+                        let bank = block
+                            .bank()
+                            .map(|key| {
+                                handles
+                                    .banks
+                                    .get(&key)
+                                    .cloned()
+                                    .ok_or_else(|| missing("draft_routed_bank_stages", key))
+                            })
+                            .transpose()?;
                         Ok(DraftBlockKernels {
                             attention: attention(block.attention)?,
                             injection: attention(block.injection)?,
                             feed_forward,
+                            bank,
                         })
                     })
                     .collect::<Result<Vec<_>, CatalogFailure>>()?;
@@ -1733,6 +1757,7 @@ impl AttestedPrograms {
         &self,
         charges: &seismic::Charges,
         resident: crate::ResidentHead,
+        bank: Option<std::sync::Arc<crate::experts::ExpertBank>>,
         definition: &magnitude_family_contracts::ModelDefinition,
     ) -> Result<crate::programs::native_drafter::NativeDrafterProgram, CatalogError> {
         use crate::programs::native_drafter::NativeDrafterProgram;
@@ -1799,11 +1824,12 @@ impl AttestedPrograms {
                         return Err(missing("draft", "resident layers"));
                     }
                     let graphs = graphs
-                        .bind_weights(charges, &resident)
+                        .bind_weights(charges, &resident, bank.as_deref())
                         .map_err(|error| missing("draft", error))?;
                     crate::programs::native_draft::NativeDraftProgram::new(
                         definition.clone(),
                         graphs,
+                        bank,
                         seismic::Charges::none(&charges.device()),
                     )
                     .map(NativeDrafterProgram::Draft)

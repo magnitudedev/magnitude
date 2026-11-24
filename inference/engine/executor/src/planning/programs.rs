@@ -272,13 +272,21 @@ impl TargetProgramPlan {
 }
 
 /// One draft layer: its attention over the fresh block, the same attention
-/// injecting context K/V (its input norm the draft's fusion norm), and its
-/// feed-forward (dense or resident routed MoE).
+/// injecting context K/V (its input norm the draft's fusion norm), its
+/// feed-forward (dense or routed MoE), and its bank binding when streamed.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct DraftBlockBinding {
     pub attention: AttentionBinding,
     pub injection: AttentionBinding,
     pub feed_forward: FeedForwardProgramSlot,
+    pub bank: Option<(BankedFeedForward, super::BankBinding)>,
+}
+
+impl DraftBlockBinding {
+    /// The feed-forward whose experts the load streams, and its bank.
+    pub fn bank(&self) -> Option<(BankedFeedForward, super::BankBinding)> {
+        self.bank
+    }
 }
 
 /// DSpark's Markov table (an embedding) and its projection onto the
@@ -395,6 +403,11 @@ pub struct DraftProgramPlan {
 }
 
 impl DraftProgramPlan {
+    /// Whether any block of this draft streams its experts through the bank.
+    pub fn has_bank(&self) -> bool {
+        self.blocks.iter().any(|block| block.bank().is_some())
+    }
+
     pub fn streams(&self) -> Option<SinkhornBinding> {
         self.streams
     }
@@ -973,6 +986,7 @@ pub(super) fn derive_program_plan(
                 weights,
                 active_element,
                 readout_choices,
+                bank,
             )?)),
             (None, Some(head)) => match operators::head_form(head, decoder)? {
                 operators::HeadForm::Shared(shared) => Some(DrafterProgramPlan::SharedHead(
@@ -1202,6 +1216,7 @@ fn draft_program_plan(
     weights: &[WeightPlan],
     activation: Element,
     readout_choices: &[super::ReadoutClassChoice],
+    bank: Option<&super::ExpertBankPlan>,
 ) -> Result<DraftProgramPlan, PlanError> {
     let lookup = |weights: &[WeightPlan], scope, kind| planned_element(weights, scope, kind);
     let fusion_norm = lookup(target, WeightScope::Draft, WeightKind::DraftFusionNorm)?;
@@ -1231,10 +1246,22 @@ fn draft_program_plan(
             |scope, kind| planned_scalable(weights, scope, kind),
             activation,
         )?;
+        let bank_binding = bank
+            .and_then(|bank| {
+                bank.layer(feed_forward).map(|(layer, _)| {
+                    let banked = feed_forward_slot
+                        .banked()
+                        .ok_or(PlanError::Topology("a banked draft layer is not routed"))?;
+                    let binding = bank.binding(layer).map_err(PlanError::InvalidDefinition)?;
+                    Ok::<_, PlanError>((banked, binding))
+                })
+            })
+            .transpose()?;
         blocks.push(DraftBlockBinding {
             attention,
             injection: attention.as_key_value_only(fusion_norm),
             feed_forward: feed_forward_slot,
+            bank: bank_binding,
         });
     }
     let streams = operators::streams::StreamsGeometry::from_residual(hidden, &draft.residual)?

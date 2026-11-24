@@ -1715,6 +1715,7 @@ fn async_dma_scratch_ring_deepseek_stress() {
             let round_bounds = ListBounds { from: STRESS_CONVEYOR, to: STRESS_EXPERTS as u64, lent: 0 };
             Layer {
                 group: 0,
+                draft: false,
                 experts: STRESS_EXPERTS,
                 layer_window: STRESS_EXPERTS,
                 map: maps[index].view().clone(),
@@ -1827,12 +1828,12 @@ fn async_dma_scratch_ring_deepseek_stress() {
 
         // Pre-generate deterministic routed experts per (layer, place).
         let mut routed = vec![vec![Vec::<usize>::new(); STRESS_PLACES]; STRESS_LAYERS];
-        for layer in 0..STRESS_LAYERS {
-            for place in 0..STRESS_PLACES {
+        for layer_routed in &mut routed {
+            for place_routed in layer_routed {
                 let mask = (next_u64(&mut rng) % ((1u64 << STRESS_EXPERTS) - 1)) + 1;
                 for e in 0..STRESS_EXPERTS {
                     if (mask >> e) & 1 != 0 {
-                        routed[layer][place].push(e);
+                        place_routed.push(e);
                     }
                 }
             }
@@ -1874,10 +1875,10 @@ fn async_dma_scratch_ring_deepseek_stress() {
                         for &e in &routed[at][place] {
                             let slot = layer_windows[at][0].load(e);
                             if slot >= 0 {
-                                for kind in 0..3 {
+                                for (kind, backing) in scratch_backing.iter().enumerate() {
                                     let mut got = vec![0u8; RECORD as usize];
                                     unsafe {
-                                        scratch_backing[kind]
+                                        backing
                                             .read_shared(slot as u64 * RECORD, &mut got)
                                             .unwrap();
                                     }

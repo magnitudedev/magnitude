@@ -486,7 +486,7 @@ impl Engine {
         )
         .map_err(|error| error.to_string())?;
         let device = domain.resources().device().clone();
-        let expert_ranges = expert_ranges(domain.expert_bank_plan(), package.target())?;
+        let expert_ranges = expert_ranges(domain.expert_bank_plan(), &package)?;
         Ok(Self {
             domain,
             bindings: Some(bindings),
@@ -1000,10 +1000,15 @@ pub type FileRange = (PathBuf, u64, u64);
 /// in order: two stacks of row ranges of one stored tensor lie in one.
 pub fn expert_ranges(
     bank: Option<&magnitude_executor::ExpertBankPlan>,
-    artifact: &magnitude_artifacts::gguf::GgufArtifact,
+    package: &magnitude_artifacts::Package,
 ) -> Result<Vec<FileRange>, String> {
     let mut ranges = std::collections::BTreeSet::new();
-    for layer in bank.map(|bank| bank.stored_stacks(artifact)).transpose()?.into_iter().flatten() {
+    for layer in bank
+        .map(|bank| bank.stored_stacks(package.target(), package.draft()))
+        .transpose()?
+        .into_iter()
+        .flatten()
+    {
         for stack in layer {
             ranges.extend(stack.file_ranges());
         }

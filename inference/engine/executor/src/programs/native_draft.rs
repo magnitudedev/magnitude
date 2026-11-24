@@ -37,7 +37,7 @@ use crate::operators::{
     routed::{
         fused_graph as routed_graph,
         graph::{general_routed, split as general_split, RoutedSum},
-        streamed::LayerBank,
+        streamed::{BankGraph, BankGraphEntries, CheckedBankEntries, LayerBank, StepInputs},
         GeneralRoutedShape,
     },
     streams::{
@@ -71,9 +71,9 @@ use crate::{
             ConstantTensors, GraphConstant,
         },
         native_target_graph::{
-            weight, weight_scale_port, CheckedLandingEntries, GatheredTable, GraphWeights, LandedReadPorts,
-            LandingEntries, PackingBound, PlannedWeights, RowDirectory, WeightOperands, WeightPort,
-            WeightView,
+            weight, weight_scale_port, BankPort, CheckedLandingEntries, GatheredTable, GraphPark,
+            GraphTimeline, GraphWeights, LandedReadPorts, LandingEntries, PackingBound,
+            PlannedWeights, RowDirectory, WeightOperands, WeightPart, WeightPort, WeightView,
         },
     },
     DeviceError, DraftProgramPlan, HeadLaunchCore, InvariantError,
@@ -93,12 +93,10 @@ use magnitude_kernels::{
     token_confidence, widen_rows,
 };
 use magnitude_state::LayerRef;
-#[cfg(test)]
-use seismic::NativeGraphMetadata;
 use seismic::{
     Argument, BackendName, BoundNativeGraphPlan, Device, Dim, Element, NativeGraph,
-    NativeGraphFamily, NativeGraphLayout, NativeGraphPlan, NativePort,
-    Table, Tensor, WorkflowTensor,
+    NativeGraphFamily, NativeGraphLayout, NativeGraphMetadata, NativeGraphPlan, NativePort,
+    NativeQueue, NativeTimelinePort, Table, Tensor, WorkflowTensor,
 };
 use std::{collections::BTreeMap, rc::Rc, sync::Arc};
 
@@ -187,12 +185,16 @@ pub(crate) fn skips_windowed_layers(draft: &DraftDefinition) -> Result<bool, Str
 /// The admitted draft classes: every entry row class injecting only, and
 /// every slot class whose blocks fit a launch drafting one of the
 /// `generated` proposal counts after entry rows up to its proposal rows. A
-/// load generating none admits no drafting class.
+/// load generating none admits no drafting class. When `banked` is true, the
+/// draft's routed MoE layers stream through the expert bank, whose unsplit
+/// decode form serves up to [`VERIFY_ROWS`](magnitude_kernels::constants::VERIFY_ROWS)
+/// block rows (`slots * block_rows <= VERIFY_ROWS`).
 pub(crate) fn draft_graph_classes(
     limits: ResourceLimits,
     proposals: usize,
     generated: &[u8],
     draft: &DraftDefinition,
+    banked: bool,
 ) -> Result<Vec<DraftGraphClass>, String> {
     let skips = skips_windowed_layers(draft)?;
     let row_classes = magnitude_batching::row_classes(limits.max_launch_rows)
@@ -205,6 +207,11 @@ pub(crate) fn draft_graph_classes(
             limits.max_launch_rows
         )
     })?;
+    let block_row_bound = if banked {
+        max_rows.min(magnitude_kernels::constants::VERIFY_ROWS)
+    } else {
+        max_rows
+    };
     // Drafting classes project the draft vocabulary per proposing row: their
     // slots are bounded by the selection bound.
     let slot_classes = magnitude_batching::row_classes(limits.max_drafting_slots)
@@ -230,7 +237,7 @@ pub(crate) fn draft_graph_classes(
     for &generated in generated {
         for &slots in slot_classes
             .iter()
-            .filter(|&&slots| slots * draft.block_rows(generated as u64) <= max_rows)
+            .filter(|&&slots| slots * draft.block_rows(generated as u64) <= block_row_bound)
         {
             let entry_bound = row_class(
                 (slots as usize)
@@ -419,6 +426,7 @@ pub(crate) struct DraftLayerEntries<'a, G: GraphDraft + 'a> {
     pub attention: AttentionGraphEntries<'a, G>,
     pub injection: AttentionGraphEntries<'a, G>,
     pub feed_forward: FeedForwardEntries<'a, G>,
+    pub bank: Option<BankGraphEntries<'a, G>>,
 }
 
 /// Sinkhorn hyper-connection stream entries for a multi-stream draft backbone.
@@ -501,6 +509,7 @@ impl<'a> DraftGraphEntries<'a, NativeGraph> {
                     attention: (&block.attention).into(),
                     injection: (&block.injection).into(),
                     feed_forward: (&block.feed_forward).into(),
+                    bank: block.bank.as_ref().map(BankGraphEntries::from),
                 })
                 .collect(),
             streams: draft.streams.as_ref().map(|streams| DraftStreamsEntries {
@@ -549,7 +558,12 @@ impl<'a> DraftGraphEntries<'a, NativeGraph> {
 /// ([`DraftModelTopology`]).
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 struct CheckedDraftEntries {
-    layers: Vec<(CheckedAttentionEntries, CheckedAttentionEntries, CheckedFeedForwardEntries)>,
+    layers: Vec<(
+        CheckedAttentionEntries,
+        CheckedAttentionEntries,
+        CheckedFeedForwardEntries,
+        Option<CheckedBankEntries>,
+    )>,
     streams: bool,
     embedding: Assignments<2>,
     landing: Option<CheckedLandingEntries>,
@@ -854,6 +868,12 @@ impl CheckedDraftEntries {
                         CheckedAttentionEntries::new(block.attention, backend, false)?,
                         CheckedAttentionEntries::new(block.injection, backend, false)?,
                         CheckedFeedForwardEntries::new(block.feed_forward, backend)?,
+                        block
+                            .bank()
+                            .map(|(feed_forward, bank)| {
+                                CheckedBankEntries::new(feed_forward, bank, backend)
+                            })
+                            .transpose()?,
                     ))
                 })
                 .collect::<Result<_, String>>()?,
@@ -872,11 +892,12 @@ impl CheckedDraftEntries {
             layers: self
                 .layers
                 .iter()
-                .map(|(attention, injection, feed_forward)| {
+                .map(|(attention, injection, feed_forward, bank)| {
                     Ok(DraftLayerEntries {
                         attention: attention.entries()?,
                         injection: injection.entries()?,
                         feed_forward: feed_forward.entries(),
+                        bank: bank.as_ref().map(CheckedBankEntries::entries::<G>),
                     })
                 })
                 .collect::<Result<Vec<_>, String>>()?,
@@ -1235,6 +1256,11 @@ impl<'d> DraftSplit<'d> {
             return Err("draft geometry disagrees with the draft's layers".into());
         }
         let skippable = skippable_layers(draft)?;
+        let checked_entries = CheckedDraftEntries::new(
+            plan,
+            backend,
+            CheckedLandingEntries::of(load, token_table(draft))?,
+        )?;
         let mut facts = FactSink::new();
         let (mut feed_forward_topologies, mut attentions, mut feed_forward_numbers) =
             (Vec::new(), Vec::new(), Vec::new());
@@ -1249,6 +1275,15 @@ impl<'d> DraftSplit<'d> {
             let ffn_sublayer = paired
                 .feed_forward
                 .ok_or("draft layers have a feed-forward")?;
+            let (mut split_banks, mut split_parks) = (Vec::new(), Vec::new());
+            let layer_bank = match checked_entries.layers[index].3.as_ref() {
+                Some(checked_bank) => LayerBank::Streamed(BankGraph {
+                    entries: checked_bank.entries::<NativeGraphMetadata>(),
+                    ports: &mut split_banks,
+                    parks: &mut split_parks,
+                }),
+                None => LayerBank::<NativeGraphMetadata>::Held,
+            };
             let (ffn_topology, ffn_numbers) = match ffn_sublayer.op {
                 operators::FeedForward::Dense(dense) => {
                     let (expansion, widths) = dense_graph::split(load, scope, &dense.up)?;
@@ -1268,7 +1303,7 @@ impl<'d> DraftSplit<'d> {
                             routed: shape,
                             hidden: decoder.hidden,
                         },
-                        &LayerBank::<NativeGraph>::Held,
+                        &layer_bank,
                     )?;
                     (
                         FeedForwardTopology::Routed(topology),
@@ -1278,8 +1313,7 @@ impl<'d> DraftSplit<'d> {
                 operators::FeedForward::GeneralRouted(operator) => {
                     let shape = GeneralRoutedShape::of(decoder.hidden, operator)
                         .map_err(|error| error.to_string())?;
-                    let (topology, numbers) =
-                        general_split(load, scope, &shape, &LayerBank::<NativeGraph>::Held)?;
+                    let (topology, numbers) = general_split(load, scope, &shape, &layer_bank)?;
                     (
                         FeedForwardTopology::GeneralRouted(topology),
                         FeedForwardNumbers::GeneralRouted(numbers),
@@ -1353,7 +1387,7 @@ impl<'d> DraftSplit<'d> {
             streams: streams_numbers,
             convolution: draft.convolutions.as_ref().map(|convolutions| [convolutions.kernel, convolutions.group]),
             method,
-            weights: GraphWeights::of(load, draft_reads),
+            weights: GraphWeights::of_draft(load, draft_reads)?,
         };
         let topology = DraftModelTopology {
             backend,
@@ -1361,7 +1395,7 @@ impl<'d> DraftSplit<'d> {
             mask_rows: draft.max_proposals(),
             feed_forward: feed_forward_topologies,
             streams: streams_topology,
-            entries: CheckedDraftEntries::new(plan, backend, CheckedLandingEntries::of(load, token_table(draft))?)?,
+            entries: checked_entries,
             token_scope: token_table(draft).scope,
             projection: readout::HeadPlans::of(
                 load,
@@ -1895,6 +1929,9 @@ struct DraftGraphParts<P> {
     block: Option<BlockPorts>,
     constants: Vec<GraphConstant>,
     weights: Vec<(WeightPort, NativePort)>,
+    banks: Vec<(BankPort, NativePort)>,
+    parks: Vec<(GraphTimeline, NativeTimelinePort<seismic::timeline::Parks>)>,
+    step_inputs: Option<StepInputs>,
     /// Selections `[proposals · slots, 2]` when drafting; otherwise the
     /// last injection's rows, exported so the graph has a result.
     output: WorkflowTensor,
@@ -1975,12 +2012,26 @@ fn draft_graph<'a, G: GraphDraft + 'a>(
             block: None,
             constants,
             weights,
+            banks: Vec::new(),
+            parks: Vec::new(),
+            step_inputs: None,
             output: injected,
         });
     };
+    let mut banks = Vec::new();
+    let mut parks = Vec::new();
+    let mut step_inputs = None;
     let pass = BlockPass::of(&entries, (model, numbers), draft_class, reals, (&fusion_norm, &conditioning_rows))?;
-    let (block, output) =
-        pass.build(&mut graph, &layer_weights, drafting, &mut weights, &mut constants)?;
+    let (block, output) = pass.build(
+        &mut graph,
+        &layer_weights,
+        drafting,
+        &mut weights,
+        &mut constants,
+        &mut banks,
+        &mut parks,
+        &mut step_inputs,
+    )?;
     Ok(DraftGraphParts {
         plan: graph,
         conditioning,
@@ -1988,6 +2039,9 @@ fn draft_graph<'a, G: GraphDraft + 'a>(
         block: Some(block),
         constants,
         weights,
+        banks,
+        parks,
+        step_inputs,
         output,
     })
 }
@@ -2253,6 +2307,7 @@ impl<'r, 'a, G: GraphDraft + 'a> BlockPass<'r, 'a, G> {
     /// The block pass over the `drafting` layers, whose attention weights
     /// are their injections' (`layer_weights`): its ports, its result
     /// (the selections), and the count of constants through its backbone.
+    #[allow(clippy::too_many_arguments)]
     fn build(
         &self,
         graph: &mut G,
@@ -2260,6 +2315,9 @@ impl<'r, 'a, G: GraphDraft + 'a> BlockPass<'r, 'a, G> {
         drafting: &[DraftingLayer<AttentionPass<Dim, AttentionTopology>>],
         weights: &mut Vec<(WeightPort, NativePort)>,
         constants: &mut Vec<GraphConstant>,
+        banks: &mut Vec<(BankPort, NativePort)>,
+        parks: &mut Vec<(GraphTimeline, NativeTimelinePort<seismic::timeline::Parks>)>,
+        step_inputs: &mut Option<StepInputs>,
     ) -> Result<(BlockPorts, WorkflowTensor), GraphError> {
         // The block's tokens are the host's (`BoundDraftGraphs::embedding`).
         let mut table =
@@ -2267,8 +2325,17 @@ impl<'r, 'a, G: GraphDraft + 'a> BlockPass<'r, 'a, G> {
         // The empty directory: every table this graph gathers, it gathers by
         // the host's rows or the rows of a table held whole (`gathered_table`).
         let direct = table.by_rows(graph, constants)?;
-        let (tokens, residual, layers) =
-            self.backbone(graph, (&table, &direct), layer_weights, drafting, weights, constants)?;
+        let (tokens, residual, layers) = self.backbone(
+            graph,
+            (&table, &direct),
+            layer_weights,
+            drafting,
+            weights,
+            constants,
+            banks,
+            parks,
+            step_inputs,
+        )?;
         let mut projected = self.project(graph, residual, weights, constants)?;
         let method = self.select(graph, (&mut table, &direct), &mut projected, weights, constants)?;
         // A selector's or corrector's proposals are chosen by path scores over
@@ -2294,6 +2361,7 @@ impl<'r, 'a, G: GraphDraft + 'a> BlockPass<'r, 'a, G> {
     /// The block's tokens embedded from `table` (through `direct`), then
     /// every layer: its tokens' input port, its last residual and each
     /// layer's ports.
+    #[allow(clippy::too_many_arguments)]
     fn backbone(
         &self,
         graph: &mut G,
@@ -2302,6 +2370,9 @@ impl<'r, 'a, G: GraphDraft + 'a> BlockPass<'r, 'a, G> {
         drafting: &[DraftingLayer<AttentionPass<Dim, AttentionTopology>>],
         weights: &mut Vec<(WeightPort, NativePort)>,
         constants: &mut Vec<GraphConstant>,
+        banks: &mut Vec<(BankPort, NativePort)>,
+        parks: &mut Vec<(GraphTimeline, NativeTimelinePort<seismic::timeline::Parks>)>,
+        step_inputs: &mut Option<StepInputs>,
     ) -> Result<(NativePort, WorkflowTensor, Vec<LayerPorts>), GraphError> {
         let (entries, numbers, planned) = (self.entries, self.numbers, &self.numbers.weights);
         let (hidden, rows, block_rows, epsilon) = (&numbers.hidden, self.rows, self.class.block_rows, self.epsilon);
@@ -2541,10 +2612,18 @@ impl<'r, 'a, G: GraphDraft + 'a> BlockPass<'r, 'a, G> {
                         }
                         None => (carry.rows.clone(), None, Join::single(None)),
                     };
-                    let (next, _) = routed_graph::routed(
+                    let layer_bank = match layer.bank {
+                        Some(entries) => LayerBank::Streamed(BankGraph {
+                            entries,
+                            ports: banks,
+                            parks,
+                        }),
+                        None => LayerBank::Held,
+                    };
+                    let (next, step) = routed_graph::routed(
                         graph,
                         *routed_entries,
-                        LayerBank::Held,
+                        layer_bank,
                         &routed_topology,
                         routed_numbers,
                         planned,
@@ -2559,6 +2638,9 @@ impl<'r, 'a, G: GraphDraft + 'a> BlockPass<'r, 'a, G> {
                         None,
                         None,
                     )?;
+                    if let Some(inputs) = step {
+                        *step_inputs = Some(inputs);
+                    }
                     carry = ResidualCarry { rows: next, pre: ffn_pre };
                 }
                 (
@@ -2579,10 +2661,18 @@ impl<'r, 'a, G: GraphDraft + 'a> BlockPass<'r, 'a, G> {
                             weights,
                             constants,
                         )?;
-                        let (branch, _) = general_routed(
+                        let layer_bank = match layer.bank {
+                            Some(entries) => LayerBank::Streamed(BankGraph {
+                                entries,
+                                ports: banks,
+                                parks,
+                            }),
+                            None => LayerBank::Held,
+                        };
+                        let (branch, step) = general_routed(
                             graph,
                             *routed_entries,
-                            LayerBank::Held,
+                            layer_bank,
                             &routed_topology,
                             routed_numbers,
                             planned,
@@ -2595,6 +2685,9 @@ impl<'r, 'a, G: GraphDraft + 'a> BlockPass<'r, 'a, G> {
                             epsilon,
                             None,
                         )?;
+                        if let Some(inputs) = step {
+                            *step_inputs = Some(inputs);
+                        }
                         let joined = stream_join_op(
                             graph,
                             stream_entries.sinkhorn.join,
@@ -2607,10 +2700,18 @@ impl<'r, 'a, G: GraphDraft + 'a> BlockPass<'r, 'a, G> {
                         carry = ResidualCarry { rows: joined, pre: site.pre };
                     }
                     None => {
-                        let (next, _) = general_routed(
+                        let layer_bank = match layer.bank {
+                            Some(entries) => LayerBank::Streamed(BankGraph {
+                                entries,
+                                ports: banks,
+                                parks,
+                            }),
+                            None => LayerBank::Held,
+                        };
+                        let (next, step) = general_routed(
                             graph,
                             *routed_entries,
-                            LayerBank::Held,
+                            layer_bank,
                             &routed_topology,
                             routed_numbers,
                             planned,
@@ -2623,6 +2724,9 @@ impl<'r, 'a, G: GraphDraft + 'a> BlockPass<'r, 'a, G> {
                             epsilon,
                             None,
                         )?;
+                        if let Some(inputs) = step {
+                            *step_inputs = Some(inputs);
+                        }
                         carry = ResidualCarry::rows(next);
                     }
                 },
@@ -4115,6 +4219,9 @@ impl PreparedDraftGraphs {
                     block: parts.block,
                     constants: parts.constants,
                     weights: parts.weights,
+                    banks: parts.banks,
+                    parks: parts.parks,
+                    step_inputs: parts.step_inputs,
                     output: parts.output,
                 },
             );
@@ -4141,6 +4248,7 @@ impl PreparedDraftGraphs {
         self: &Rc<Self>,
         charges: &seismic::Charges,
         resident: &ResidentHead,
+        bank: Option<&crate::experts::ExpertBank>,
     ) -> Result<BoundDraftGraphs, SubmitError> {
         let mut uploaded = ConstantTensors::new(charges);
         let mut bound = BTreeMap::new();
@@ -4168,9 +4276,39 @@ impl PreparedDraftGraphs {
                 .weights
                 .iter()
                 .map(|(weight, port)| {
-                    let resident = resident_draft_weight(resident, weight.role)?;
-                    Ok((port, weight.part.of(resident).map_err(invalid)?))
+                    let tensor = match (bank, weight.part) {
+                        (Some(bank), WeightPart::Values) if bank.holds(weight.role) => {
+                            bank.records(weight.role).map_err(invalid)?
+                        }
+                        (Some(bank), WeightPart::Home) if bank.holds(weight.role) => {
+                            bank.home(weight.role).map_err(invalid)?
+                        }
+                        (Some(bank), WeightPart::Scale) if bank.holds(weight.role) => {
+                            bank.expert_scale(weight.role).map_err(invalid)?
+                        }
+                        (_, part) => {
+                            let resident = resident_draft_weight(resident, weight.role)?;
+                            part.of(resident).map_err(invalid)?
+                        }
+                    };
+                    Ok((port, tensor))
                 })
+                .chain(
+                    graph
+                        .banks
+                        .iter()
+                        .filter(|(bank_port, _)| {
+                            !bank_port.part.placed() && !bank_port.part.windowed()
+                        })
+                        .map(|(bank_port, port)| {
+                            let bank = bank.ok_or_else(|| {
+                                invalid(format!(
+                                    "draft bank port {bank_port:?} of a load without an expert bank"
+                                ))
+                            })?;
+                            Ok((port, bank.part(bank_port.scope, bank_port.part).map_err(invalid)?))
+                        }),
+                )
                 .chain(constants.iter().map(|(port, tensor)| Ok((*port, tensor))))
                 .chain(leading.iter().map(|(port, tensor)| Ok((*port, tensor))))
                 .collect::<Result<Vec<_>, SubmitError>>()?;
@@ -4353,6 +4491,8 @@ pub struct NativeDraftProgram {
     /// Immutable normalized per-layer window bounds, resolved once at load.
     windows: Vec<Option<u64>>,
     graphs: BoundDraftGraphs,
+    /// The shared expert bank when draft routed MoE layers are streamed.
+    bank: Option<Arc<crate::experts::ExpertBank>>,
     /// What a step binds its tensors through: charges that allocate
     /// nothing, as every storage a step binds is a load's, which formed any
     /// record table it needs (`seismic::NativeGraphBindings::set`).
@@ -4370,6 +4510,7 @@ impl NativeDraftProgram {
     pub(crate) fn new(
         definition: ModelDefinition,
         graphs: BoundDraftGraphs,
+        bank: Option<Arc<crate::experts::ExpertBank>>,
         unallocating: seismic::Charges,
     ) -> Result<Self, SubmitError> {
         let draft = definition
@@ -4399,6 +4540,7 @@ impl NativeDraftProgram {
             definition,
             windows,
             graphs,
+            bank,
             unallocating,
             waiter,
         })
@@ -4670,12 +4812,94 @@ impl NativeDraftProgram {
             .map(|ports| ports.queue(&self.graphs.embedding, &self.unallocating, &mut bindings))
             .transpose()
             .map_err(invalid)?;
-        let active_output = output
+        let expert_step = if !graph.banks.is_empty() || !graph.parks.is_empty() {
+            let bank = self
+                .bank
+                .as_ref()
+                .ok_or_else(|| invalid("banked draft graph without an expert bank"))?;
+            let (steps, _, _) = bank
+                .begin(
+                    crate::programs::Chain::one(()),
+                    |_| crate::experts::StepRoute::DraftDecode,
+                    |_| crate::operation::LaunchWork::Generation,
+                )
+                .map_err(|(error, _)| invalid(error))?;
+            let (((), step), _) = steps.split_first();
+            let bind_result: Result<(), SubmitError> = (|| {
+                if let Some(inputs) = &graph.step_inputs {
+                    let bytes: Vec<u8> = magnitude_kernels::step_words(step.sequence(), 0)
+                        .iter()
+                        .flat_map(|word| word.to_le_bytes())
+                        .collect();
+                    active.write_input(&inputs.sequence, &bytes).map_err(device)?;
+                }
+                for (bank_port, port) in graph.banks.iter().filter(|(b, _)| b.part.placed()) {
+                    let words = bank
+                        .placed(bank_port.scope, bank_port.part, 0)
+                        .map_err(invalid)?;
+                    bindings.set(&self.unallocating, port, &words).map_err(device)?;
+                }
+                for &(_, port) in &graph.parks {
+                    bindings
+                        .set_park(port, bank.parks().timeline())
+                        .map_err(device)?;
+                }
+                Ok(())
+            })();
+            if let Err(error) = bind_result {
+                let _ = step.refuse();
+                return Err(error);
+            }
+            Some((Arc::clone(bank), step))
+        } else {
+            None
+        };
+        let active_output = match output
             .activate(&graph.plan)
-            .map_err(SubmitError::Invariant)?;
-        let (active_output, completion) = active_output
-            .run(|outputs| active.attach(bindings, outputs).and_then(|ready| ready.submit()))
-            .map_err(device)?;
+            .map_err(SubmitError::Invariant)
+        {
+            Ok(active_output) => active_output,
+            Err(error) => {
+                if let Some((_, step)) = expert_step {
+                    let _ = step.refuse();
+                }
+                return Err(error);
+            }
+        };
+        let step_ref = expert_step
+            .as_ref()
+            .map(|(bank, step)| (Arc::clone(bank), step.sequence()));
+        let mut registered = Ok(());
+        let (active_output, completion) = match active_output.run(|outputs| {
+            let ready = active.attach(bindings, outputs)?;
+            if let Some((bank, sequence)) = &step_ref {
+                let mut seq = self
+                    .unallocating
+                    .device()
+                    .native_sequence(NativeQueue::Compute);
+                let graph_outputs = ready.queue(&mut seq)?;
+                registered = register_draft_parks(bank, *sequence, &graph.parks, &graph_outputs);
+                let completion = seq.submit()?;
+                Ok((graph_outputs, completion))
+            } else {
+                ready.submit()
+            }
+        }) {
+            Ok(result) => result,
+            Err(error) => {
+                if let Some((_, step)) = expert_step {
+                    let _ = step.refuse();
+                }
+                return Err(device(error));
+            }
+        };
+        if let Err(error) = registered {
+            let _ = completion.wait();
+            if let Some((_, step)) = expert_step {
+                let _ = step.refuse();
+            }
+            return Err(invalid(error));
+        }
         let owner = active_output.publish();
         let selections = (steps > 0)
             .then(|| {
@@ -4704,9 +4928,37 @@ impl NativeDraftProgram {
             HeadOutput {
                 selected: selections.map_or(HeadSelected::Causal, HeadSelected::Proposals),
                 landed_reads: landed.into_iter().map(SelectedRead::submitted).collect(),
+                expert_step: expert_step.map(|(_, step)| step),
             },
         ))
     }
+}
+
+fn register_draft_parks(
+    bank: &crate::experts::ExpertBank,
+    sequence: u64,
+    parks: &[(GraphTimeline, NativeTimelinePort<seismic::timeline::Parks>)],
+    outputs: &seismic::NativeGraphOutputs,
+) -> Result<(), String> {
+    for &(node, port) in parks {
+        let Some(value) = outputs.park(port) else {
+            continue;
+        };
+        match node {
+            GraphTimeline::Park(GraphPark { scope, kind }) => {
+                let site = crate::experts::ParkSite {
+                    layer: bank.streamed_layer(scope)?,
+                    kind,
+                };
+                bank.parks().register(value, sequence, site);
+            }
+            GraphTimeline::Publish(scope) => {
+                bank.parks()
+                    .publish(value, bank.streamed_layer(scope)?, sequence);
+            }
+        }
+    }
+    Ok(())
 }
 
 fn write_controls(
@@ -5065,6 +5317,7 @@ mod composition_tests {
             method.draft_rows(),
             &method.block_widths(),
             definition.draft.as_ref().unwrap(),
+            false,
         )
         .unwrap();
         (load, state, classes)
@@ -5124,6 +5377,13 @@ mod composition_tests {
     fn deepseek41_dspark_fixture(
         layers: usize,
     ) -> (ModelDefinition, magnitude_artifacts::PackageManifest) {
+        deepseek41_dspark_fixture_with_experts(layers, 4)
+    }
+
+    fn deepseek41_dspark_fixture_with_experts(
+        layers: usize,
+        experts: u64,
+    ) -> (ModelDefinition, magnitude_artifacts::PackageManifest) {
         use magnitude_artifacts::gguf::{Encoding, TensorDescriptor};
         use magnitude_artifacts::{
             ArtifactIdentity, ComponentFile, ComponentManifest, PackageIdentity, PackageManifest,
@@ -5154,7 +5414,6 @@ mod composition_tests {
         let o_rank = 128u64;
         let streams = 4u64;
         let mixes = (2 + streams) * streams;
-        let experts = 4u64;
         let selected = 2u64;
         let inter = 256u64;
         let markov_rank = 256u64;
@@ -5569,6 +5828,185 @@ mod composition_tests {
         }
 
         assert_composition_matches_unrolled(&definition, &manifest, 6);
+    }
+
+    #[test]
+    fn deepseek41_dspark_banked_streams_draft_experts_with_capped_vram_slots_and_full_host_tier() {
+        let (definition, manifest) = deepseek41_dspark_fixture_with_experts(3, 32);
+        let (resident_load, state, _) = setup_draft_fixture(&definition, &manifest, 6);
+        let resident_head_bytes = resident_load.weight_demands().unwrap()[1].device;
+
+        let substrate = crate::planning::BankSubstrate::new(
+            BackendName::Cuda,
+            seismic::NativeAllocations::EXACT,
+            crate::planning::HostTier::Linked,
+        );
+        let banked_load = resident_load
+            .clone()
+            .with_expert_bank(
+                &definition,
+                24,
+                None,
+                1,
+                crate::planning::FlightDepth::SERIAL,
+                substrate,
+            )
+            .expect("streamed DeepSeek + DSpark banks both target and draft routed layers");
+
+        let bank = banked_load.expert_bank().expect("banked load has an expert bank");
+        let draft_layers: Vec<(usize, &crate::planning::BankLayer)> = bank
+            .layers()
+            .iter()
+            .enumerate()
+            .filter(|(_, layer)| layer.is_draft())
+            .collect();
+        let target_layers: Vec<(usize, &crate::planning::BankLayer)> = bank
+            .layers()
+            .iter()
+            .enumerate()
+            .filter(|(_, layer)| !layer.is_draft())
+            .collect();
+        assert_eq!(draft_layers.len(), 3, "all 3 DSpark routed MoE layers are banked");
+        assert!(!target_layers.is_empty());
+
+        // Draft layers sit in their own dedicated BankGroup (isolated VRAM LRU).
+        let target_group = target_layers[0].1.group;
+        let draft_group = draft_layers[0].1.group;
+        assert_ne!(target_group, draft_group);
+        assert!(draft_layers.iter().all(|(_, layer)| layer.group == draft_group));
+
+        // Draft VRAM slots are capped at DRAFT_MAX_SLOTS (16), never stealing
+        // full bank.slots (24) from target layers, while Host RAM holds all 32 experts/layer.
+        for (_, layer) in &draft_layers {
+            assert_eq!(layer.vram_slots(24), crate::planning::DRAFT_MAX_SLOTS);
+        }
+        for (_, layer) in &target_layers {
+            assert_eq!(layer.vram_slots(24), 24);
+        }
+        assert_eq!(
+            bank.records_at(draft_group, 24),
+            3 * crate::planning::DRAFT_MAX_SLOTS
+        );
+        assert!(
+            bank.host_records(draft_group, 32) >= 3 * 32,
+            "all 3×32 draft experts must be backed in pinned Host RAM"
+        );
+
+        // First draft layer sets its own step word; target does not hint draft, draft does not hint.
+        let last_target_idx = target_layers.last().unwrap().0;
+        let first_draft_idx = draft_layers[0].0;
+        assert_eq!(bank.ahead(last_target_idx), 0);
+        assert!(bank.sets_step(first_draft_idx));
+        for &(idx, _) in &draft_layers {
+            assert_eq!(bank.ahead(idx), 0);
+        }
+
+        // Every draft expert stack in head_weights is Holding::Banked with source_bytes = 0.
+        let head_weights = banked_load.head().expect("head weights present");
+        let banked_draft_stacks: Vec<_> = head_weights
+            .iter()
+            .filter(|w| {
+                matches!(w.role.scope, WeightScope::DraftSublayer(_))
+                    && matches!(
+                        w.role.kind,
+                        WeightKind::ExpertGate | WeightKind::ExpertUp | WeightKind::ExpertDown
+                    )
+            })
+            .collect();
+        assert_eq!(banked_draft_stacks.len(), 3 * 3);
+        for weight in &banked_draft_stacks {
+            assert!(weight.banked().is_some(), "{:?} must be Holding::Banked", weight.role);
+            assert_eq!(weight.source_bytes, 0, "{:?} must have source_bytes = 0", weight.role);
+        }
+        let banked_head_bytes = banked_load.weight_demands().unwrap()[1].device;
+        assert!(
+            banked_head_bytes < resident_head_bytes,
+            "head_weights VRAM demand must drop when DSpark experts are banked ({banked_head_bytes} vs {resident_head_bytes})"
+        );
+
+        // Program plan and draft graph certification succeed with LayerBank::Streamed.
+        let plan = banked_load
+            .program_plan(&definition, magnitude_state::KvCodec::Dense)
+            .unwrap();
+        let draft_plan = plan.draft().unwrap();
+        assert!(
+            draft_plan.blocks().iter().all(|block| block.bank().is_some()),
+            "every banked DSpark block carries a DraftBlockBinding::bank()"
+        );
+        let geometry = DraftGeometry::new(&definition, state.head_state().unwrap()).unwrap();
+        let split = DraftSplit::of(BackendName::Cuda, &banked_load, draft_plan, &geometry).unwrap();
+        let method = crate::PlannedMethod::DFlash {
+            proposals: 6,
+            widths: crate::DraftWidths::Adaptive,
+        };
+        let limits = ResourceLimits {
+            max_launch_rows: 256,
+            max_launch_slots: 16,
+            max_selected_rows: 16,
+            max_drafting_slots: 16,
+            exported_logits_rows: 0,
+            max_images_per_request: 1,
+            max_image_cells: 0,
+            lookahead: false,
+            chain_capacity: std::num::NonZeroUsize::MIN,
+            conversations: std::num::NonZeroUsize::MIN,
+        };
+        let banked_classes = draft_graph_classes(
+            limits,
+            method.draft_rows(),
+            &method.block_widths(),
+            definition.draft.as_ref().unwrap(),
+            draft_plan.has_bank(),
+        )
+        .unwrap();
+        assert!(
+            banked_classes.iter().any(|c| c.slots > 0),
+            "banked DSpark admits decode-sized drafting classes"
+        );
+        DraftFamilyComposition::evaluate(&split, &banked_classes)
+            .expect("banked DSpark draft graphs certify cleanly");
+
+        // Unbanking restores all draft expert stacks to Holding::Whole.
+        let unbanked = banked_load.unbanked();
+        assert!(unbanked.expert_bank().is_none());
+        for weight in unbanked.head().unwrap().iter().filter(|w| {
+            matches!(w.role.scope, WeightScope::DraftSublayer(_))
+                && matches!(
+                    w.role.kind,
+                    WeightKind::ExpertGate | WeightKind::ExpertUp | WeightKind::ExpertDown
+                )
+        }) {
+            assert!(weight.banked().is_none());
+            assert!(weight.source_bytes > 0);
+        }
+    }
+
+    #[test]
+    fn deepseek41_dspark_resident_keeps_draft_experts_held_in_vram() {
+        let (definition, manifest) = deepseek41_dspark_fixture_with_experts(3, 32);
+        let (load, _, _) = setup_draft_fixture(&definition, &manifest, 6);
+        assert!(load.expert_bank().is_none());
+        for weight in load.head().unwrap().iter().filter(|w| {
+            matches!(w.role.scope, WeightScope::DraftSublayer(_))
+                && matches!(
+                    w.role.kind,
+                    WeightKind::ExpertGate | WeightKind::ExpertUp | WeightKind::ExpertDown
+                )
+        }) {
+            assert!(weight.banked().is_none(), "resident load keeps draft experts Held");
+            assert!(weight.source_bytes > 0);
+        }
+        let plan = load
+            .program_plan(&definition, magnitude_state::KvCodec::Dense)
+            .unwrap();
+        assert!(
+            plan.draft()
+                .unwrap()
+                .blocks()
+                .iter()
+                .all(|block| block.bank().is_none()),
+            "resident load leaves DraftBlockBinding::bank() as None"
+        );
     }
 
 }

@@ -2137,6 +2137,7 @@ fn attach_pending_priming(
         output: crate::programs::HeadOutput {
             selected: crate::programs::HeadSelected::Causal,
             landed_reads: Vec::new(),
+            expert_step: None,
         },
     });
     assert!(flight.work.priming.is_none());

@@ -375,6 +375,17 @@ pub struct BankSubstrate {
     pub(in crate::planning) host: HostTier,
 }
 
+#[cfg(test)]
+impl BankSubstrate {
+    pub(crate) fn new(
+        backend: seismic::BackendName,
+        allocations: seismic::NativeAllocations,
+        host: HostTier,
+    ) -> Self {
+        Self { backend, allocations, host }
+    }
+}
+
 /// How a bank's misses are held on its device beside the bank, where its
 /// device storage and host RAM differ or are one.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

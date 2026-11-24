@@ -122,6 +122,8 @@ impl KeyRecords {
 pub(super) struct RouteRecorder {
     /// Each streamed layer's routing records.
     routing: Vec<Words>,
+    /// Whether each streamed layer belongs to a separate draft model.
+    draft: Vec<bool>,
     words: RegionWords,
     recorded: Mutex<RecordedRoutes>,
 }
@@ -132,6 +134,7 @@ impl RouteRecorder {
     pub(super) fn of(layers: &[Layer], words: RegionWords, selected: usize) -> Self {
         Self {
             routing: layers.iter().map(|layer| layer.routing.clone()).collect(),
+            draft: layers.iter().map(|layer| layer.draft).collect(),
             words,
             recorded: Mutex::new(RecordedRoutes { selected, ..RecordedRoutes::default() }),
         }
@@ -139,13 +142,19 @@ impl RouteRecorder {
 
     /// Record decode-form step `sequence` of `launch`, its keys `keys`
     /// ([`KeyRecords::read`]), which completes and so holds its records
-    /// until it ends: each layer's routing record, copied while it holds
-    /// them, every layer's (a whole layer's route writes its routing record
-    /// too, as every route writes its keys).
+    /// until it ends: each target layer's routing record, copied while it holds
+    /// them (a whole layer's route writes its routing record too, as every
+    /// route writes its keys).
     pub(super) fn record(&self, steps: &Steps, sequence: Step, launch: DecodeLaunch, keys: &StepKeys) {
         let rows = launch.rows;
         let copied = steps
-            .while_owned(sequence, |owned| self.routing.iter().map(|routing| RoutingRecord::copy(owned, routing, self.words)).collect::<Vec<_>>())
+            .while_owned(sequence, |owned| {
+                self.routing
+                    .iter()
+                    .enumerate()
+                    .map(|(layer, routing)| (!self.draft[layer]).then(|| RoutingRecord::copy(owned, routing, self.words)))
+                    .collect::<Vec<_>>()
+            })
             .expect("a completing step owns its routing records");
         let mut recorded = self.recorded.lock().expect("the recorded routes");
         let selected = recorded.selected;
@@ -153,6 +162,9 @@ impl RouteRecorder {
             .into_iter()
             .enumerate()
             .map(|(layer, record)| {
+                let Some(record) = record else {
+                    return Vec::new();
+                };
                 let record = RoutingRecord::read(record, self.words, layer);
                 assert!(record.count() >= rows * selected, "step {sequence}'s routing record at layer {layer} holds {} of its {rows} rows' choices", record.count());
                 record

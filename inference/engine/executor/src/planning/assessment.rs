@@ -1357,6 +1357,7 @@ impl AssessmentGraphResourceBounds {
                             method.draft_rows(),
                             &method.block_widths(),
                             draft,
+                            draft_plan.has_bank(),
                         )?,
                     )?;
                     Ok(DrafterBounds {

@@ -1197,6 +1197,7 @@ impl ResidencyStore {
         &mut self,
         charges: &seismic::Charges,
         artifact: &GgufArtifact,
+        draft: Option<&GgufArtifact>,
     ) -> Result<Option<Arc<crate::experts::ExpertBank>>, WeightImportError> {
         let Some(plan) = self.execution.load().expert_bank() else {
             return Ok(None);
@@ -1207,13 +1208,19 @@ impl ResidencyStore {
         // CPU pool's and landings' (`ExpertBank::lines`); the load's pricing
         // adds what the measurement job stored (`assessment::host_lines`).
         let lines = crate::assessment::BankLines::of_bank(plan).map_err(|error| invalid(error.to_string()))?;
-        let bank = crate::experts::ExpertBank::open(charges, plan, artifact, &sites, lines, &self.cpu_site, self.pools.clone(), (self.changes.clone(), self.host_backing.take()))?;
+        let bank = crate::experts::ExpertBank::open(charges, plan, artifact, draft, &sites, lines, &self.cpu_site, self.pools.clone(), (self.changes.clone(), self.host_backing.take()))?;
         // Each stack through the entry a resident load imports it with, from
         // a read around the file cache: no expert byte stays in it.
         if plan.whole() {
             bank.import_whole(&mut |weight, records, record_at| {
                 let entry = self.programs.import_entry(weight).map_err(|error| error.to_string())?;
-                let stored = Stored::from_gguf(artifact, &weight.descriptor).map_err(|error| error.to_string())?;
+                let source_artifact = match weight.role.scope {
+                    magnitude_family_contracts::WeightScope::DraftSublayer(_) => {
+                        draft.ok_or_else(|| "a banked draft layer has no draft artifact".to_owned())?
+                    }
+                    _ => artifact,
+                };
+                let stored = Stored::from_gguf(source_artifact, &weight.descriptor).map_err(|error| error.to_string())?;
                 let source = crate::resources::filled_import(weight, &stored, charges)
                     .map_err(|error| error.to_string())?;
                 if entry.writes_records() {
@@ -1784,7 +1791,7 @@ impl ResidencyStore {
         ledgers: &crate::memory::ledger::DeviceLedgers,
         execution: ExecutionPlan,
         bank_growth: &mut crate::memory::ledger::Held,
-        artifact: &GgufArtifact,
+        package: &magnitude_artifacts::Package,
         target: &mut crate::ResidentTarget,
     ) -> Result<(), crate::ResidencyError> {
         self.host_backing = ledgers
@@ -1795,7 +1802,7 @@ impl ResidencyStore {
             .map_err(crate::ResidencyError::Invalid)?;
         self.execution = execution;
         target.bank = self
-            .open_expert_bank(charges, artifact)
+            .open_expert_bank(charges, package.target(), package.draft())
             .map_err(crate::ResidencyError::from)?;
         Ok(())
     }

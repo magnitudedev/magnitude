@@ -398,7 +398,7 @@ pub(crate) fn import_target(
         fusion,
         per_layer,
         bank: if open_bank {
-            residency.open_expert_bank(charges, target)?
+            residency.open_expert_bank(charges, target, package.draft())?
         } else {
             None
         },

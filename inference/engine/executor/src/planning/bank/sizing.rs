@@ -64,7 +64,7 @@ impl ExpertBankPlan {
     /// than its slots; the global slots are not raised for it, so no other
     /// group is charged its bound.
     pub fn records_at(&self, group: usize, slots: u64) -> u64 {
-        let held = self.member_experts(group).map(|experts| Self::layer_slots(slots, experts)).sum::<u64>();
+        let held = self.member_layers(group).map(|layer| layer.vram_slots(slots)).sum::<u64>();
         let landing = match self.placer() {
             Placer::Tier => 0,
             Placer::Bank => self.tier_reserve(),
@@ -138,7 +138,12 @@ impl ExpertBankPlan {
     /// `group`'s layers: `R` of [`Self::decode_records`], the decode set
     /// ([`decode_set`]) of the group's widest member.
     fn request_records(&self, group: usize) -> u64 {
-        decode_set(self.selected(), self.widest_member(group), self.decode_rows())
+        let selected = self
+            .member_layers(group)
+            .map(|layer| layer.selected)
+            .max()
+            .unwrap_or_else(|| self.selected());
+        decode_set(selected, self.widest_member(group), self.decode_rows())
     }
 
     /// The most host slots a host tier holds: the widest layer's experts, a

@@ -58,6 +58,9 @@ pub struct HeadOutput {
     /// The step's landed reads of table rows its device work selected
     /// (`DeviceTable::read_selected`), completed once the step completed.
     pub landed_reads: Vec<crate::device_table::SubmittedRead>,
+    /// The step of a streamed load's expert bank when the draft runs banked
+    /// MoE layers, completed once the draft step completes.
+    pub(crate) expert_step: Option<crate::experts::ExpertStep>,
 }
 
 /// What a head step's selections make.
@@ -138,8 +141,9 @@ impl HeadOutput {
     }
 
     /// The step completed: its landed reads bring the rows they landed into
-    /// slots of their own (`SubmittedRead::complete`). Fails when one could
-    /// not land its rows: the step read other rows.
+    /// slots of their own (`SubmittedRead::complete`), and any banked draft
+    /// expert step completes. Fails when a read could not land or the bank
+    /// watcher failed.
     pub fn complete_landed_reads(&mut self) -> Result<(), SubmitError> {
         std::mem::take(&mut self.landed_reads)
             .into_iter()
@@ -149,7 +153,16 @@ impl HeadOutput {
                     context: "landed table rows",
                     detail,
                 })
-            })
+            })?;
+        if let Some(step) = self.expert_step.take() {
+            step.complete().map_err(|failure| {
+                SubmitError::Invariant(InvariantError {
+                    context: "draft expert bank step",
+                    detail: format!("{failure:?}"),
+                })
+            })?;
+        }
+        Ok(())
     }
 }
 pub type CompletedVisionWork = CompletedWork<VisionLaunchCore, GraphOutputTensor>;

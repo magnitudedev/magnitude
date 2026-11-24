@@ -1759,6 +1759,9 @@ impl NativeTargetProgram {
                                     .map(|(_, slot)| slot.request),
                             )
                         }
+                        StepRoute::DraftDecode => {
+                            unreachable!("target launches never use DraftDecode")
+                        }
                     };
                     (launch, Some((bank.clone(), step)))
                 });
@@ -1766,11 +1769,16 @@ impl NativeTargetProgram {
                 // sublayer's routed branch.
                 for (scope, size) in merges {
                     use magnitude_family_contracts::WeightScope;
-                    let (WeightScope::TargetSublayer(at) | WeightScope::TargetBranch { sublayer: at, .. }) = scope else {
-                        let error = invalid(format!("an expert bank layer of {scope:?} outside the target's blocks"));
-                        return Err(refused(error, steps.map(|(launch, _)| launch)));
-                    };
-                    sets[at.block as usize] = size;
+                    match scope {
+                        WeightScope::TargetSublayer(at) | WeightScope::TargetBranch { sublayer: at, .. } => {
+                            sets[at.block as usize] = size;
+                        }
+                        WeightScope::DraftSublayer(_) => continue,
+                        _ => {
+                            let error = invalid(format!("an expert bank layer of {scope:?} outside the target's blocks"));
+                            return Err(refused(error, steps.map(|(launch, _)| launch)));
+                        }
+                    }
                 }
                 (steps, Some(serving))
             }

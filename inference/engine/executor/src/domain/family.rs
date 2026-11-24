@@ -772,7 +772,7 @@ impl ProgramFamily for NativeFamily {
                 .cloned();
             let head = self
                 .programs
-                .bind_head(charges, resident, definition)
+                .bind_head(charges, resident, self.resident.bank.clone(), definition)
                 .map_err(|error| error.to_string())?;
             if head.constant_bytes()? != binding_constants {
                 return Err("bound head graph constants differ from the claimed charge".into());

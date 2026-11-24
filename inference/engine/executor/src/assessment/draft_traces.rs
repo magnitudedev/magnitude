@@ -95,7 +95,7 @@ fn every_served_draft_outlines_its_graphs_from_traces(backend: BackendName) {
                     let geometry = DraftGeometry::new(&definition, state.head_state().unwrap())
                         .unwrap_or_else(|error| panic!("{line}: its draft geometry: {error}"));
                     let classes =
-                        draft_graph_classes(LIMITS, method.draft_rows(), &method.block_widths(), bound)
+                        draft_graph_classes(LIMITS, method.draft_rows(), &method.block_widths(), bound, plan.has_bank())
                             .unwrap_or_else(|error| panic!("{line}: its draft classes: {error}"));
                     let traces = draft_traces_recorded();
                     let began = Instant::now();

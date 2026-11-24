@@ -83,6 +83,12 @@ pub struct BankGroup {
     pub layers: NonEmpty<usize>,
 }
 
+/// Maximum per-layer VRAM hot-slot budget for banked draft MoE layers:
+/// keeps a small hot working set (`<= 16` experts/layer) in VRAM while all
+/// draft experts live in pinned Host RAM so misses serve over PCIe, never
+/// stealing full `bank.slots` per layer from target MoE layers.
+pub const DRAFT_MAX_SLOTS: u64 = 16;
+
 /// A routed layer whose experts the bank holds.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct BankLayer {
@@ -90,6 +96,8 @@ pub struct BankLayer {
     pub group: usize,
     /// `E`: its experts, its slot map's extent and its home records' count.
     pub experts: u64,
+    /// `K`: the experts a row selects in this layer.
+    pub selected: u64,
     /// Its expert stacks as a resident load plans them, one of each routed
     /// tensor of its record: what tuning imports to measure the entries
     /// both loads share.
@@ -263,13 +271,32 @@ impl BankPaths {
 }
 
 impl BankLayer {
-    /// The target sublayer it routes in: a routed sublayer, or a parallel
-    /// block's routed branch's. Only a target routed layer streams
+    /// Whether this streamed layer belongs to a separate draft model
+    /// (`WeightScope::DraftSublayer`).
+    pub fn is_draft(&self) -> bool {
+        matches!(self.scope, WeightScope::DraftSublayer(_))
+    }
+
+    /// The VRAM records this layer commits at `slots`: capped at
+    /// [`DRAFT_MAX_SLOTS`] for draft layers so they keep a small hot working
+    /// set in VRAM without stealing slots from target layers.
+    pub fn vram_slots(&self, slots: u64) -> u64 {
+        if self.is_draft() {
+            slots.min(DRAFT_MAX_SLOTS).min(self.experts)
+        } else {
+            slots.min(self.experts)
+        }
+    }
+
+    /// The sublayer it routes in: a target routed sublayer, a parallel
+    /// block's routed branch, or a separate draft's routed sublayer
     /// (`routed_layers`).
     pub fn sublayer(&self) -> magnitude_family_contracts::SublayerIndex {
         match self.scope {
-            WeightScope::TargetSublayer(sublayer) | WeightScope::TargetBranch { sublayer, .. } => sublayer,
-            other => panic!("{other:?} streams its experts, which only a target routed layer does"),
+            WeightScope::TargetSublayer(sublayer)
+            | WeightScope::TargetBranch { sublayer, .. }
+            | WeightScope::DraftSublayer(sublayer) => sublayer,
+            other => panic!("{other:?} streams its experts, which only a target or draft routed layer does"),
         }
     }
 }
@@ -506,13 +533,19 @@ impl ExpertBankPlan {
     pub fn stored_stacks(
         &self,
         artifact: &magnitude_artifacts::gguf::GgufArtifact,
+        draft: Option<&magnitude_artifacts::gguf::GgufArtifact>,
     ) -> Result<Vec<RecordTensors<StoredStack>>, String> {
         self.layers()
             .iter()
             .map(|layer| {
+                let source_artifact = if layer.is_draft() {
+                    draft.ok_or("a banked draft layer has no draft artifact")?
+                } else {
+                    artifact
+                };
                 let record = &self.groups()[layer.group].record;
                 layer.resident.as_ref().try_map(|kind, weight| {
-                    let stored = crate::residency::Stored::from_gguf(artifact, &weight.descriptor)
+                    let stored = crate::residency::Stored::from_gguf(source_artifact, &weight.descriptor)
                         .map_err(|error| error.to_string())?;
                     let name = &weight.descriptor.name;
                     let tensor = record.get(kind).ok_or("a layer's stacks disagree with its group's record")?;
@@ -603,7 +636,7 @@ impl ExpertBankPlan {
             records: self.records(group),
             experts: self.layers()[layer].experts,
             next_experts: next.experts,
-            selected: self.selected(),
+            selected: self.layers()[layer].selected,
             staging: self.staging_records(),
             round_records: self.round_records(),
             widest: self.widest().get(),
@@ -634,9 +667,14 @@ impl ExpertBankPlan {
         records.max(self.least_records(group))
     }
 
+    /// Each member layer of group `group`, in its order.
+    pub(super) fn member_layers(&self, group: usize) -> impl Iterator<Item = &BankLayer> + '_ {
+        self.groups()[group].layers.iter().map(|&layer| &self.layers()[layer])
+    }
+
     /// The experts of each of group `group`'s layers, in its order.
     fn member_experts(&self, group: usize) -> impl Iterator<Item = u64> + '_ {
-        self.groups()[group].layers.iter().map(|&layer| self.layers()[layer].experts)
+        self.member_layers(group).map(|layer| layer.experts)
     }
 
     /// The most experts of group `group`'s member layers.
@@ -655,9 +693,13 @@ impl ExpertBankPlan {
         self.records_at(group, self.slots)
     }
 
-    /// Whether streamed layer `layer` sets its run's step word: the first.
+    /// Whether streamed layer `layer` sets its run's step word: the first
+    /// target layer (layer 0), and the first draft layer (which runs in its
+    /// own draft graph).
     pub fn sets_step(&self, layer: usize) -> bool {
         layer == 0
+            || (self.layers()[layer].is_draft()
+                && !self.layers()[..layer].iter().any(BankLayer::is_draft))
     }
 
     /// The most experts of any streamed layer: what every buffer the layers
@@ -690,12 +732,15 @@ impl ExpertBankPlan {
     /// The layer `layer`'s route predicts at lead `lead`, where that lead
     /// exists: the layer `lead + 1` ahead, while `lead` is below
     /// [`HINT_LEADS`] and that layer is a streamed one routing over the next
-    /// layer's experts (one `EN` for every lead of a route). The one rule of
+    /// layer's experts (one `EN` for every lead of a route). Draft layers
+    /// never hint and are never hinted by target layers. The one rule of
     /// which leads a route has.
     pub fn hints(&self, layer: usize, lead: usize) -> Option<usize> {
         let target = layer + 1 + lead;
         (lead < HINT_LEADS as usize
             && target < self.layers().len()
+            && !self.layers()[layer].is_draft()
+            && !self.layers()[target].is_draft()
             && self.layers()[target].experts == self.layers()[layer + 1].experts)
             .then_some(target)
     }
@@ -1020,11 +1065,15 @@ impl ExpertBankPlan {
         self.whole_at(self.slots)
     }
 
-    /// Whether a device bank of `slots` holds every expert of the widest
+    /// Whether a device bank of `slots` holds every expert of every streamed
     /// layer: the one predicate the plan's tier and the running bank's host
     /// target both decide by.
     pub fn whole_at(&self, slots: u64) -> bool {
         slots >= self.widest().get()
+            && self
+                .layers()
+                .iter()
+                .all(|layer| layer.vram_slots(slots) >= layer.experts)
     }
 
     /// The stored bytes of the experts neither the bank's slots nor its host
@@ -1038,7 +1087,7 @@ impl ExpertBankPlan {
                 .record
                 .iter()
                 .try_fold(0u64, |bytes, (_, tensor)| bytes.checked_add(tensor.stored_bytes()?).ok_or_else(overflow))?;
-            let held = Self::layer_slots(self.slots, layer.experts).max(Self::layer_slots(self.host_slots, layer.experts));
+            let held = layer.vram_slots(self.slots).max(Self::layer_slots(self.host_slots, layer.experts));
             (layer.experts - held).checked_mul(expert).and_then(|bytes| total.checked_add(bytes)).ok_or_else(overflow)
         })
     }
@@ -1053,14 +1102,14 @@ impl ExpertBankPlan {
                 .record
                 .iter()
                 .try_fold(0u64, |bytes, (_, tensor)| bytes.checked_add(tensor.stored_bytes()?).ok_or_else(overflow))?;
-            let alone = Self::layer_slots(self.host_slots, layer.experts).saturating_sub(Self::layer_slots(self.slots, layer.experts));
+            let alone = Self::layer_slots(self.host_slots, layer.experts).saturating_sub(layer.vram_slots(self.slots));
             alone.checked_mul(expert).and_then(|bytes| total.checked_add(bytes)).ok_or_else(overflow)
         })
     }
 
     /// Whether growth reaches every expert ([`Self::ceiling`]).
     pub fn reaches_whole(&self) -> bool {
-        self.ceiling == self.widest().get()
+        self.whole_at(self.ceiling)
     }
 
     /// Group `group`'s experts: every member layer's, its map's extent
@@ -1193,7 +1242,7 @@ impl ExpertBankPlan {
     /// What layer `layer`'s banked expert stack of each routed tensor
     /// charges for its records: its slots' (`ModelLoadPlan::with_expert_bank`).
     pub fn banked_bytes(&self, layer: usize) -> Result<RecordTensors<u64>, String> {
-        let slots = Self::layer_slots(self.slots, self.layers()[layer].experts);
+        let slots = self.layers()[layer].vram_slots(self.slots);
         self.groups()[self.layers()[layer].group].record.try_map(|_, tensor| {
             tensor
                 .record_bytes()?
@@ -1290,7 +1339,14 @@ impl ExpertBankPlan {
     fn least_records_with_reserve(&self, group: usize, reserve: u64) -> u64 {
         let decode = match self.placer() {
             Placer::Tier => 0,
-            Placer::Bank => decode_set(self.selected(), self.widest_member(group), self.decode_rows()) + reserve,
+            Placer::Bank => {
+                let selected = self
+                    .member_layers(group)
+                    .map(|layer| layer.selected)
+                    .max()
+                    .unwrap_or_else(|| self.selected());
+                decode_set(selected, self.widest_member(group), self.decode_rows()) + reserve
+            }
         };
         let prompt = if group != self.lender_group() {
             0
@@ -1319,7 +1375,7 @@ impl ExpertBankPlan {
     /// and `paths`.
     pub fn records_at_with_paths(&self, group: usize, slots: u64, paths: BankPaths) -> u64 {
         let reserve = paths.records().reserve;
-        let held = self.member_experts(group).map(|experts| Self::layer_slots(slots, experts)).sum::<u64>();
+        let held = self.member_layers(group).map(|layer| layer.vram_slots(slots)).sum::<u64>();
         let landing = match self.placer() {
             Placer::Tier => 0,
             Placer::Bank => reserve,

@@ -644,16 +644,20 @@ impl<'a> RoundCosts<'a> {
             return 0.0;
         }
         if self.own_draft().is_none_or(|own| !own.contains_key(&generated)) {
-            if let Some(prior) = self.launch_prices.and_then(|prices| {
-                prices
-                    .draft_seconds(
-                        self.sequences.max(1) as u32,
-                        generated.min(usize::from(u8::MAX)) as u8,
-                        self.context_class as u32,
-                    )
-                    .ok()
-                    .flatten()
-            }) {
+            if let Some(prior) = self
+                .launch_prices
+                .filter(|prices| self.verify_prior.is_some() || !prices.is_banked())
+                .and_then(|prices| {
+                    prices
+                        .draft_seconds(
+                            self.sequences.max(1) as u32,
+                            generated.min(usize::from(u8::MAX)) as u8,
+                            self.context_class as u32,
+                        )
+                        .ok()
+                        .flatten()
+                })
+            {
                 return prior;
             }
         }

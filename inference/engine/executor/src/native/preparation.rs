@@ -3739,10 +3739,18 @@ impl<'a> Preparation<'a> {
                     _ => None,
                 }),
         );
+        let bank_layers = BindingLayers::of(
+            draft_plan
+                .blocks()
+                .iter()
+                .enumerate()
+                .filter_map(|(index, b)| b.bank().map(|bank| (bank, draft_scope(index, 1)))),
+        );
         let mut registered_attention = HashSet::new();
         let mut registered_dense = HashSet::new();
         let mut registered_routed = HashSet::new();
         let mut registered_general_routed = HashSet::new();
+        let mut registered_banks = HashSet::new();
         for b in draft_plan.blocks() {
             for attention in [b.attention, b.injection] {
                 if !registered_attention.insert(attention)
@@ -3794,6 +3802,17 @@ impl<'a> Preparation<'a> {
                         bindings: format!("{:?}", b.feed_forward),
                         outcome: "draft layers run no parallel feed-forward form".into(),
                     });
+                }
+            }
+            if let Some((slot, bank)) = b.bank() {
+                if registered_banks.insert((slot, bank))
+                    && !self.draft_kernels().banks.contains_key(&(slot, bank))
+                {
+                    if let Some(kernels) =
+                        self.bank(slot, bank, &bank_layers.scopes((slot, bank)))?
+                    {
+                        self.draft_kernels().banks.insert((slot, bank), kernels);
+                    }
                 }
             }
         }

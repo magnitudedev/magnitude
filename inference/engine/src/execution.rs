@@ -1043,7 +1043,7 @@ fn import_target(
                     &startup.ledgers,
                     execution_plan.clone(),
                     &mut bank_growth,
-                    package.target(),
+                    package,
                     &mut target,
                 )
                 .map_err(|error| import_refused(error, &device, &startup.ledgers))

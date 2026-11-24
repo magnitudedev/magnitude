@@ -411,32 +411,41 @@ impl ResolvedModelPolicy {
 
 impl ModelPolicy {
     /// Optional draft admission is host policy, never a numerical model
-    /// property: when the package's separate draft is unavailable, a method
-    /// that would draft with it (a separate-draft method, or MTP on a target
-    /// without its own draft head) resolves as plain generation. Assessment
-    /// reports that drafter `Rejected` from the same binding.
+    /// property: when the package's separate draft is unavailable, `Auto` (and
+    /// `Mtp` on a target without its own draft head) resolves as plain
+    /// generation, while an explicitly requested separate-draft method
+    /// (`DFlash`, `DSpark`, `DFlash2`, `LiLiCorr`) fails instead of silently
+    /// downgrading. Assessment reports that drafter `Rejected` from the same
+    /// binding.
     pub(crate) fn resolve_admitted(
         &self,
         definition: &ModelDefinition,
         draft_unavailable: Option<&crate::host::DraftUnavailable>,
     ) -> Result<ResolvedModelPolicy, String> {
-        let drafts_with_separate = match self.method {
-            ModelMethod::Auto
-            | ModelMethod::DFlash
-            | ModelMethod::DSpark
-            | ModelMethod::DFlash2
-            | ModelMethod::LiLiCorr => true,
-            ModelMethod::Mtp => definition.head.is_none(),
-            ModelMethod::Plain => false,
-        };
-        if draft_unavailable.is_some() && drafts_with_separate {
-            return Self {
-                method: ModelMethod::Plain,
-                draft_policy: None,
-                mtp_proposals: None,
-                ..self.clone()
+        if let Some(reason) = draft_unavailable {
+            if let Some(variant) = self.method.draft_variant() {
+                return Err(format!(
+                    "{variant} draft requested, but the package's draft is unavailable: {reason}"
+                ));
             }
-            .resolve(definition);
+            let drafts_with_separate = match self.method {
+                ModelMethod::Auto => true,
+                ModelMethod::Mtp => definition.head.is_none(),
+                ModelMethod::Plain => false,
+                ModelMethod::DFlash
+                | ModelMethod::DSpark
+                | ModelMethod::DFlash2
+                | ModelMethod::LiLiCorr => unreachable!("handled by draft_variant"),
+            };
+            if drafts_with_separate {
+                return Self {
+                    method: ModelMethod::Plain,
+                    draft_policy: None,
+                    mtp_proposals: None,
+                    ..self.clone()
+                }
+                .resolve(definition);
+            }
         }
         self.resolve(definition)
     }
@@ -959,12 +968,12 @@ pub(crate) mod tests {
                 )
                 .is_err()
         );
-        let fallback = ModelPolicy {
-            method: ModelMethod::DFlash,
-            ..plain
+        let auto_fallback = ModelPolicy {
+            method: ModelMethod::Auto,
+            ..plain.clone()
         };
         assert!(
-            fallback
+            auto_fallback
                 .resolve_admitted(
                     &definition(true),
                     Some(&DraftUnavailable::Block(
@@ -975,18 +984,43 @@ pub(crate) mod tests {
                 .draft_policy
                 .is_none()
         );
+        let explicit = ModelPolicy {
+            method: ModelMethod::DFlash,
+            ..plain
+        };
+        assert!(
+            explicit
+                .resolve_admitted(
+                    &definition(true),
+                    Some(&DraftUnavailable::Block(
+                        magnitude_family_dflash::Error::MissingCausality
+                    ))
+                )
+                .is_err()
+        );
     }
 
     #[test]
-    fn unavailable_separate_draft_resolves_plain_even_with_mtp_head_and_width() {
+    fn unavailable_separate_draft_resolves_plain_for_auto_and_errors_for_explicit_methods() {
         let missing = DraftUnavailable::Block(magnitude_family_dflash::Error::MissingCausality);
         let malformed = DraftUnavailable::Block(magnitude_family_dflash::Error::Metadata {
             key: "dflash.attention.causal".into(),
             expected: "BOOL",
         });
         for reason in [&missing, &malformed] {
+            let auto_policy = ModelPolicy {
+                method: ModelMethod::Auto,
+                mtp_proposals: Some(3),
+                ..ModelPolicy::default()
+            };
+            assert_eq!(
+                auto_policy
+                    .resolve_admitted(&definition(true), Some(reason))
+                    .unwrap()
+                    .method,
+                ResolvedMethod::Plain
+            );
             for method in [
-                ModelMethod::Auto,
                 ModelMethod::DFlash,
                 ModelMethod::DSpark,
                 ModelMethod::DFlash2,
@@ -997,12 +1031,11 @@ pub(crate) mod tests {
                     mtp_proposals: Some(3),
                     ..ModelPolicy::default()
                 };
-                assert_eq!(
+                assert!(
                     policy
                         .resolve_admitted(&definition(true), Some(reason))
-                        .unwrap()
-                        .method,
-                    ResolvedMethod::Plain
+                        .is_err(),
+                    "explicit {method:?} must return Err when draft is unavailable"
                 );
             }
         }

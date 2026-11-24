@@ -25,20 +25,35 @@ pub(crate) fn layer_homes(layers: impl IntoIterator<Item = (usize, u64)>) -> Vec
         .collect()
 }
 
-/// Every routed layer of `definition`, in decoder order: a routed
-/// sublayer, or a parallel block's routed branch, and the scope of its
-/// weights.
+/// Every routed layer of `definition`, in decoder order followed by any
+/// routed draft layers: a routed sublayer, a parallel block's routed branch,
+/// or a separate draft's routed sublayer, and the scope of its weights.
 pub(super) fn routed_layers(
     definition: &ModelDefinition,
 ) -> impl Iterator<Item = (magnitude_family_contracts::SublayerIndex, WeightScope, &RoutedFfn)> {
-    definition.decoder.sublayers().filter_map(|(sublayer, layer)| match &layer.op {
+    let target = definition.decoder.sublayers().filter_map(|(sublayer, layer)| match &layer.op {
         Operator::RoutedFfn(routed) => Some((sublayer, WeightScope::TargetSublayer(sublayer), &**routed)),
         Operator::Parallel(branches) => (0u32..).zip(branches).find_map(|(branch, each)| match &each.op {
             Operator::RoutedFfn(routed) => Some((sublayer, WeightScope::TargetBranch { sublayer, branch }, &**routed)),
             _ => None,
         }),
         _ => None,
-    })
+    });
+    let draft = definition.draft.iter().flat_map(|draft| {
+        draft.blocks.iter().enumerate().flat_map(|(block, value)| {
+            value.sublayers.iter().enumerate().filter_map(move |(sublayer, layer)| match &layer.op {
+                Operator::RoutedFfn(routed) => {
+                    let index = magnitude_family_contracts::SublayerIndex {
+                        block: block as u32,
+                        sublayer: sublayer as u32,
+                    };
+                    Some((index, WeightScope::DraftSublayer(index), &**routed))
+                }
+                _ => None,
+            })
+        })
+    });
+    target.chain(draft)
 }
 
 /// The most slots a bank of `definition`'s routed layers takes: the widest

@@ -603,6 +603,7 @@ pub(super) fn lending_windowed_passes(
             .enumerate()
             .map(|(index, layer)| Layer {
                 group: 0,
+                draft: false,
                 experts: EXPERTS,
                 layer_window,
                 map: layer.0.clone(),
@@ -777,7 +778,7 @@ pub(super) fn awaited<T>(what: &str, ready: impl Fn() -> Option<T>) -> T {
 pub(super) fn begin(shared: &Arc<Shared>, routes: &[StepRoute], scratch: bool) -> Result<Vec<ExpertStep>, String> {
     let work = |route: StepRoute| match route {
         StepRoute::Grouped => LaunchWork::Prompt,
-        StepRoute::Decode => LaunchWork::Generation,
+        StepRoute::Decode | StepRoute::DraftDecode => LaunchWork::Generation,
     };
     let launches = routes.iter().map(|&route| (route, work(route))).collect::<Vec<_>>();
     begin_as(shared, &launches, scratch)

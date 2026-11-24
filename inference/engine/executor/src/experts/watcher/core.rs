@@ -53,6 +53,11 @@ impl StoredTensor {
 /// A streamed layer's words and records.
 pub(in crate::experts) struct Layer {
     pub group: usize,
+    /// Whether this streamed layer belongs to a separate draft model
+    /// (`WeightScope::DraftSublayer`): target decode steps write routing
+    /// records only for non-draft layers, and draft decode steps only for
+    /// draft layers.
+    pub draft: bool,
     /// Its experts: its map's extent.
     pub experts: usize,
     /// Its scratch window slots (`ExpertBankPlan::layer_window`).
