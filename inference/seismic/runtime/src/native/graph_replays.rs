@@ -445,31 +445,73 @@ impl<G: RecordedGraph> Replays<G> {
                     match Self::choose(&mut entries, graphs)? {
                         Chosen::Complete(taken) => taken.into_iter().map(Some).collect(),
                         Chosen::Incomplete(mut partial) => {
-                            let mut resolved = Vec::with_capacity(graphs.len());
+                            let mut resolved: Vec<Option<u64>> = Vec::with_capacity(graphs.len());
+                            let mut capacity_exhausted = false;
                             for index in 0..graphs.len() {
                                 let identity = match partial[index] {
-                                    Some(identity) => identity,
+                                    Some(identity) => Some(identity),
+                                    None if capacity_exhausted => None,
                                     None => {
                                         let Shaped { key, bound } = &graphs[index];
-                                        let graph = record(index)?;
-                                        let binding = if G::recorded_bound() {
-                                            GraphBinding::Bound(bound.clone())
-                                        } else {
-                                            GraphBinding::Unbound
-                                        };
-                                        let identity = self.keep(&mut entries, key, graph, binding, retained);
-                                        for later in index + 1..graphs.len() {
-                                            if partial[later].is_none()
-                                                && graphs[later].key == *key
-                                                && (G::updates_in_flight() || graphs[later].bound == *bound)
-                                            {
-                                                partial[later] = Some(identity);
+                                        let recorded = match record(index) {
+                                            Ok(graph) => Some(graph),
+                                            Err(ref error) if is_capacity_refusal(error) => {
+                                                // Evict all untaken, unpinned cached graphs (e.g.
+                                                // prior warmup/decode shapes) so the driver frees
+                                                // their graph granules, then retry once before
+                                                // falling back to direct stream-ordered launch.
+                                                let keep: Vec<u64> = resolved
+                                                    .iter()
+                                                    .chain(partial.iter().skip(index))
+                                                    .flatten()
+                                                    .copied()
+                                                    .collect();
+                                                let (released, _) = Self::release_beyond(
+                                                    &mut entries,
+                                                    &keep,
+                                                    GraphCensus::default(),
+                                                    GraphCensus::default(),
+                                                );
+                                                if !released.is_empty() {
+                                                    drop(released);
+                                                    match record(index) {
+                                                        Ok(graph) => Some(graph),
+                                                        Err(ref err) if is_capacity_refusal(err) => {
+                                                            capacity_exhausted = true;
+                                                            None
+                                                        }
+                                                        Err(err) => return Err(err),
+                                                    }
+                                                } else {
+                                                    capacity_exhausted = true;
+                                                    None
+                                                }
                                             }
+                                            Err(error) => return Err(error),
+                                        };
+                                        match recorded {
+                                            Some(graph) => {
+                                                let binding = if G::recorded_bound() {
+                                                    GraphBinding::Bound(bound.clone())
+                                                } else {
+                                                    GraphBinding::Unbound
+                                                };
+                                                let identity = self.keep(&mut entries, key, graph, binding, retained);
+                                                for later in index + 1..graphs.len() {
+                                                    if partial[later].is_none()
+                                                        && graphs[later].key == *key
+                                                        && (G::updates_in_flight() || graphs[later].bound == *bound)
+                                                    {
+                                                        partial[later] = Some(identity);
+                                                    }
+                                                }
+                                                Some(identity)
+                                            }
+                                            None => None,
                                         }
-                                        identity
                                     }
                                 };
-                                resolved.push(Some(identity));
+                                resolved.push(identity);
                             }
                             resolved
                         }
@@ -831,6 +873,20 @@ impl<G: RecordedGraph> Replays<G> {
         }
         (released, held)
     }
+}
+
+/// Whether `error` is a memory-capacity refusal from the driver or ledger
+/// during graph recording, which [`Replays::record_or_direct`] can recover
+/// from by evicting untaken cached graphs and/or falling back to direct
+/// stream-ordered launch.
+fn is_capacity_refusal(error: &CallError) -> bool {
+    matches!(
+        error,
+        CallError::Execution(
+            seismic_compiler::errors::ExecutionError::DeviceRefused { .. }
+                | seismic_compiler::errors::ExecutionError::AllocationCapacity { .. }
+        )
+    )
 }
 
 #[cfg(test)]
@@ -1216,5 +1272,91 @@ mod tests {
         assert_eq!(prepared.get(), 2);
         assert!(chain[0].is_some() && chain[1].is_some() && chain[0] != chain[1]);
         assert_eq!(replays.counts().recorded, 2);
+    }
+
+    #[test]
+    fn record_or_direct_evicts_and_falls_back_to_direct_on_capacity_refusal() {
+        use seismic_compiler::errors::{ExecutionError, RefusalReading};
+
+        let replays = Replays::<Graph<false>>::default();
+        let budget = GraphCensus { graphs: 8, launches: 32, arguments: 512, largest: 32 };
+        let capacity_err = || {
+            CallError::Execution(ExecutionError::DeviceRefused {
+                required: 2 * 1024 * 1024,
+                reading: RefusalReading::DeviceFree { free: 2_686_976, total: 33_711_521_792 },
+            })
+        };
+
+        // Seed shape 0 (e.g. warmup decode graph) into the cache.
+        let warmup = replays
+            .record_or_direct(&[shaped(0, 1)], budget, &retained(), || Ok(()), |_| Ok(graph(4)))
+            .unwrap();
+        assert!(warmup[0].is_some());
+        assert_eq!(replays.counts().recorded, 1);
+
+        // New shape 1 hits DeviceRefused on first attempt; `record_or_direct`
+        // evicts untaken shape 0 and retries once, succeeding on the retry.
+        let attempts = std::cell::Cell::new(0usize);
+        let recovered = replays
+            .record_or_direct(
+                &[shaped(1, 10)],
+                budget,
+                &retained(),
+                || Ok(()),
+                |_| {
+                    let n = attempts.get();
+                    attempts.set(n + 1);
+                    if n == 0 {
+                        Err(capacity_err())
+                    } else {
+                        Ok(graph(4))
+                    }
+                },
+            )
+            .unwrap();
+        assert_eq!(attempts.get(), 2, "must retry once after evicting untaken graphs");
+        assert!(recovered[0].is_some(), "retry after eviction succeeds");
+
+        // Now a 3-run submission for shape 2 hits persistent DeviceRefused even
+        // after evicting shape 1: falls back to `None` (direct launch) for all
+        // unrecorded runs without error, and short-circuits remaining runs after
+        // capacity is exhausted.
+        let oom_attempts = std::cell::Cell::new(0usize);
+        let fallback = replays
+            .record_or_direct(
+                &[shaped(2, 20), shaped(2, 21), shaped(2, 22)],
+                budget,
+                &retained(),
+                || Ok(()),
+                |_| {
+                    oom_attempts.set(oom_attempts.get() + 1);
+                    Err(capacity_err())
+                },
+            )
+            .unwrap();
+        assert_eq!(fallback, vec![None, None, None]);
+        assert_eq!(
+            oom_attempts.get(),
+            2,
+            "first run tries + evicts shape 1 + retries once, then remaining runs short-circuit to Direct"
+        );
+    }
+
+    #[test]
+    fn record_or_direct_propagates_non_capacity_errors() {
+        use seismic_compiler::errors::ExecutionError;
+
+        let replays = Replays::<Graph<false>>::default();
+        let budget = GraphCensus { graphs: 4, launches: 16, arguments: 256, largest: 16 };
+        let err = replays
+            .record_or_direct(
+                &[shaped(0, 1)],
+                budget,
+                &retained(),
+                || Ok(()),
+                |_| Err(CallError::Execution(ExecutionError::SubmissionFailed("driver fault".into()))),
+            )
+            .unwrap_err();
+        assert!(matches!(err, CallError::Execution(ExecutionError::SubmissionFailed(_))));
     }
 }
