@@ -1112,6 +1112,25 @@ impl Prefetch {
         RingsRead { named, latest, any, told }
     }
 
+    /// Admit `named` from `resolve_rings` into `ledger` and run `pass` while
+    /// traffic is held or a resize is pending/waiting, without issuing any new
+    /// speculative Drive reads.
+    pub(super) fn finish_rings_paused(
+        &mut self,
+        core: &mut Core,
+        ledger: &mut Ledger,
+        shared: &Arc<Shared>,
+        RingsRead { named, any, told, .. }: RingsRead,
+        served: &[Step],
+    ) {
+        for (target, names) in named {
+            self.admit(core, ledger, shared, target, names, served);
+        }
+        if any || told {
+            self.pass(core, ledger, shared, None);
+        }
+    }
+
     /// Admit `named` from `resolve_rings` into `ledger`, and derive Drive reads
     /// whenever rings arrived, events were told, or capacity freed.
     pub(super) fn finish_rings(

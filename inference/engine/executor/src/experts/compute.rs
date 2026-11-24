@@ -815,8 +815,12 @@ fn work(inner: &Inner, worker: usize) {
             continue;
         }
         if served == WorkerTurn::Waiting {
-            idle_spins = 0;
-            std::hint::spin_loop();
+            idle_spins = idle_spins.saturating_add(1);
+            if idle_spins <= WORKER_SPIN_LIMIT {
+                std::hint::spin_loop();
+            } else {
+                std::thread::yield_now();
+            }
             continue;
         }
         if inner.queued.load(Ordering::Acquire) > 0 {

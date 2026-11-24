@@ -179,6 +179,8 @@ enum Resize {
     /// Asked, at that instant.
     Asked(Ask, Instant),
     Answered(Answer),
+    /// Serving ended: no further asks are accepted and `pending` stays false.
+    Closed,
 }
 
 /// The resize the owner and the watcher exchange.
@@ -230,15 +232,20 @@ impl ResizeHandoff {
     /// ([`Residency::publish_resized`]) and what each layer holds ([`Owed`]).
     fn answer(&self, answer: Answer, _: Published) {
         let mut resize = self.resize.lock().expect("watcher resize");
-        *resize = Resize::Answered(answer);
+        self.pending.store(false, std::sync::atomic::Ordering::Release);
+        if !matches!(*resize, Resize::Closed) {
+            *resize = Resize::Answered(answer);
+        }
         self.resized.notify_all();
     }
 
     /// Wake an owner waiting for an answer: serving ended. Taken under the
     /// resize's lock, so an owner that found serving going on is already
-    /// waiting.
+    /// waiting. Closes the handoff so post-close asks never leave `pending`
+    /// set (which would spin `Residency::keep` at 100% CPU).
     pub(super) fn wake(&self) {
-        let _resize = self.resize.lock().expect("watcher resize");
+        let mut resize = self.resize.lock().expect("watcher resize");
+        *resize = Resize::Closed;
         self.pending.store(false, std::sync::atomic::Ordering::Release);
         self.resized.notify_all();
     }
@@ -294,6 +301,11 @@ impl Shared {
         let _ask = resizing.ask_lock.lock().expect("watcher resize caller");
         let post = |ask| {
             let mut resize = resizing.resize.lock().expect("watcher resize");
+            if matches!(*resize, Resize::Closed) || self.life.ended().is_some() {
+                *resize = Resize::Closed;
+                resizing.pending.store(false, std::sync::atomic::Ordering::Release);
+                return;
+            }
             assert!(matches!(*resize, Resize::None), "invariant violated: a resize is already pending in ResizeHandoff");
             *resize = Resize::Asked(ask, Instant::now());
             resizing.pending.store(true, std::sync::atomic::Ordering::Release);
@@ -310,7 +322,8 @@ impl Shared {
         let mut resize = resizing.resize.lock().expect("watcher resize");
         loop {
             if let Some(reason) = self.life.ended() {
-                *resize = Resize::None;
+                *resize = Resize::Closed;
+                resizing.pending.store(false, std::sync::atomic::Ordering::Release);
                 return Err(format!("the expert watcher stopped serving: {reason}"));
             }
             match std::mem::replace(&mut *resize, Resize::None) {

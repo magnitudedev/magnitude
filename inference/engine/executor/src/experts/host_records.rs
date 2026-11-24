@@ -1034,6 +1034,29 @@ impl HostRecords {
         Some(record)
     }
 
+    /// Hold the record keeping `staged` whole for a copy reading it, reviving a
+    /// non-lent [`Host::Graced`] record back into `Kept` / `Answering` (mapped
+    /// from its `whole.from`, like [`Self::answer`]) rather than forcing a
+    /// redundant NVMe read that [`Self::claim`] would answer `Claim::Kept`.
+    pub fn hold_or_revive(&mut self, staged: Staged) -> Option<u32> {
+        if let Some(record) = self.hold(staged) {
+            return Some(record);
+        }
+        let record = self.graced_record(staged)?;
+        if record < self.lent {
+            return None;
+        }
+        let Host::Graced { whole, answer, .. } = self.records[record as usize] else {
+            unreachable!("a graced record is listed graced");
+        };
+        if let Some(map) = &self.maps[whole.staged.0] {
+            map.map_from(whole.staged.1, record, whole.from);
+        }
+        let held = Whole { holds: whole.holds + 1, ..whole };
+        self.set(record, self.answering(held, answer));
+        Some(record)
+    }
+
     /// A copy that held `record` ended: once no copy holds it, the reserve
     /// may unmap it again.
     pub fn unhold(&mut self, record: u32) {
@@ -3204,5 +3227,42 @@ mod tests {
         for r in (0..12u32).filter(|r| !subset.contains(r)) {
             assert_eq!(tier.kept_record((0, r as usize)), Some(r), "expert {r} still resident after return_lease");
         }
+    }
+
+    /// `hold_or_revive` revives a non-lent `Host::Graced` record back into
+    /// `Host::Kept` (with `holds == 1` and re-mapped) so `serve_async_dma`
+    /// never livelocks re-reading an expert from NVMe while `HostRecords::claim`
+    /// answers `Claim::Kept` on the graced record; lent graced records are
+    /// never revived.
+    #[test]
+    fn hold_or_revive_reclaims_non_lent_graced_record_and_skips_lent() {
+        let steps = Arc::new(Steps::new(crate::planning::FlightDepth::SERIAL, 4, crate::experts::exchange::Pulse::new()));
+        steps.begin_through(5);
+        let (mut tier, maps) = mapped_on(steps.clone(), 4, 1, &[(0, EXPERTS)], Resolution::BeforeStamp);
+        let Maps::Stamped(views) = maps else { unreachable!() };
+        tier.lent = 1;
+        // Land expert 10 into lent record 0 and expert 11 into non-lent record 1.
+        tier.keep(0, (0, 10));
+        tier.keep(1, (0, 11));
+        // Grace both records at the next unbegun step (step 6).
+        steps.unbegun(|at| {
+            tier.refill(vec![(0, (0, 10)), (1, (0, 11))], at);
+        });
+        assert_eq!(tier.located((0, 10)), Located::Graced(0));
+        assert_eq!(tier.located((0, 11)), Located::Graced(1));
+        // Plain `hold` returns None while `claim` returns `Claim::Kept` — the
+        // exact mismatch that previously livelocked `serve_async_dma`.
+        assert_eq!(tier.hold((0, 11)), None);
+        assert!(matches!(tier.claim((0, 11), 0, Taking::Out, Refuses), Claim::Kept(1)));
+        // `hold_or_revive` revives non-lent record 1, re-maps it, and holds it.
+        assert_eq!(tier.hold_or_revive((0, 11)), Some(1));
+        assert_eq!(tier.located((0, 11)), Located::Kept(1));
+        assert_eq!(views[0].resolve(11, 6), Some(1), "revived record is re-mapped for later steps");
+        // Releasing the hold leaves it `Kept` and unheld.
+        tier.unhold(1);
+        assert_eq!(tier.kept_record((0, 11)), Some(1));
+        // Lent graced record 0 is NOT revived.
+        assert_eq!(tier.hold_or_revive((0, 10)), None);
+        assert_eq!(tier.located((0, 10)), Located::Graced(0));
     }
 }

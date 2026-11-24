@@ -365,6 +365,9 @@ impl Requests {
     /// `Pass(L)` completions and `PrefillFill` DMA batches even when parks
     /// are kept at submission boundaries.
     fn polls(&self, residency: &Residency) -> bool {
+        if self.shared.life.ended().is_some() {
+            return false;
+        }
         let steps = &self.shared.steps;
         (!self.shared.parks.kept
             && steps.in_flight() > 0

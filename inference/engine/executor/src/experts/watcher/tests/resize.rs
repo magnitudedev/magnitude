@@ -920,4 +920,34 @@ fn place_completes_with_queued_promotion_and_unposted_write_back() {
         .expect("place thread did not panic")
         .expect("Ask::Place must post queued write-backs and complete promptly");
     assert_eq!(shared.life.ended(), None);
+
+    // --- Case 3: `Residency::rings` must not restart promotions/prefetch while
+    //     `self.asked` holds a waiting `Ask::Place` (even after `resizing.is_pending()`
+    //     clears when `expert-residency` takes the ask). ---
+    {
+        let mut state = residency::lock(&harness.watcher.state);
+        let core = &mut state.core;
+        let wb = WriteBack {
+            terms: Terms { compute: 1.0, drive: 4.0, link: 1.0, cpu: 0.0, memory: 0.0 },
+            drive: 1.0,
+            link: 0.0,
+        };
+        core.directory.price_write_backs(0, Some(wb));
+        // Install an `Ask::Place` directly in `state.asked` (simulating
+        // `expert-residency` having taken it and cleared `resizing.is_pending()`),
+        // then call `state.rings(...)` with `freed = true` and a live copier.
+        let asked = super::super::resize::Asked::taken((
+            super::super::resize::Ask::Place(placed()),
+            std::time::Instant::now(),
+        ));
+        state.asked = Some(asked);
+        let before_moving = state.core.directory.moving();
+        let before_outstanding = state.prefetch.outstanding();
+        let served = vec![0; state.core.layers.len()];
+        let progressed = state.rings(&shared, &served, true, None);
+        assert!(!progressed, "rings() must not spin when paused on self.asked with nothing settling");
+        assert_eq!(state.core.directory.moving(), before_moving);
+        assert_eq!(state.prefetch.outstanding(), before_outstanding);
+        state.asked = None;
+    }
 }

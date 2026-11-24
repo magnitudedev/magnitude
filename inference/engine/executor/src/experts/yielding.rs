@@ -39,11 +39,16 @@ impl<T> Yielding<T> {
     /// job's end, so `counted` runs beside a job the background holds,
     /// never before one it starts.
     pub(crate) fn hold_counted(&self, poisoned: &str, counted: impl FnOnce()) -> MutexGuard<'_, T> {
+        struct WaiterGuard<'a>(&'a AtomicUsize);
+        impl Drop for WaiterGuard<'_> {
+            fn drop(&mut self) {
+                self.0.fetch_sub(1, Ordering::AcqRel);
+            }
+        }
         self.waiting.fetch_add(1, Ordering::AcqRel);
+        let _waiter = WaiterGuard(&self.waiting);
         counted();
-        let held = self.value.lock().expect(poisoned);
-        self.waiting.fetch_sub(1, Ordering::AcqRel);
-        held
+        self.value.lock().expect(poisoned)
     }
 
     /// The value, for the background: once no other holder waits for it.

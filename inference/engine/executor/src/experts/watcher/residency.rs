@@ -537,7 +537,8 @@ impl Residency {
     /// Drive Path 1 (`Prefetch`), cover reads, and prompt-group hastening.
     fn hasten(&mut self, turn: &mut Turn, copier: Option<&Copier>, _: Option<&MissCurve>) -> bool {
         let held = self.traffic_held();
-        if held {
+        let paused = held || self.asked.is_some() || self.shared.resizing.is_pending();
+        if paused {
             self.prefetch.cancel_cover();
         } else {
             let told = self.learn_told();
@@ -623,28 +624,37 @@ impl Residency {
         if read.any {
             self.prefetch.pass(&mut self.core, &mut self.ledger, shared, None);
         }
+        let paused = self.traffic_held() || self.asked.is_some() || shared.resizing.is_pending();
+        if paused {
+            self.prefetch.cancel_cover();
+        }
         let (settled, newly_landed) = self.prefetch.settle(&mut self.core.directory, &mut self.ledger, shared);
-        let chain_through = newly_landed.into_iter().any(|(layer, expert)| self.ledger.is_wanted(layer, expert));
+        let chain_through = !paused && newly_landed.into_iter().any(|(layer, expert)| self.ledger.is_wanted(layer, expert));
         let refilled = self.refill_tier();
         let reads_finished = self.prefetch.take_reads_finished();
         freed |= settled || refilled || chain_through || reads_finished;
-        // Admit newly read rings into `self.ledger` (and drive Path 1) BEFORE
+        // Admit newly read rings into `self.ledger` (and drive Path 1 when not
+        // paused for a traffic hold or pending/waiting resize) BEFORE
         // `LinkMover::advance` so Path 0 sees fresh `HINT_LEADS` hints on the
         // same tick rather than one tick late.
-        let finished = self.prefetch.finish_rings(&mut self.core, &mut self.ledger, shared, read, freed, served);
+        let finished = if paused {
+            self.prefetch.finish_rings_paused(&mut self.core, &mut self.ledger, shared, read, served);
+            settled || refilled || reads_finished
+        } else {
+            self.prefetch.finish_rings(&mut self.core, &mut self.ledger, shared, read, freed, served)
+        };
         let drive_in_flight = self.prefetch.in_flight();
         let link_progressed = copier.is_some_and(|copier| {
-            !self.traffic_held()
-                && self.link.advance(
-                    &mut self.core,
-                    &mut self.ledger,
-                    shared,
-                    copier,
-                    None,
-                    false,
-                    self.prefetch.reached(),
-                    drive_in_flight,
-                )
+            self.link.advance(
+                &mut self.core,
+                &mut self.ledger,
+                shared,
+                copier,
+                None,
+                paused,
+                self.prefetch.reached(),
+                drive_in_flight,
+            )
         });
         finished || link_progressed
     }

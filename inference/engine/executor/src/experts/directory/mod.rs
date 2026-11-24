@@ -1666,6 +1666,12 @@ impl Directory {
         self.tier(layer).hold((layer, expert)).map(HostRecord)
     }
 
+    /// Like [`Self::hold_tier`], additionally reviving a non-lent `Host::Graced`
+    /// record whose bytes are still whole in host RAM ([`HostRecords::hold_or_revive`]).
+    pub fn hold_tier_or_revive(&mut self, layer: usize, expert: usize) -> Option<HostRecord> {
+        self.tier(layer).hold_or_revive((layer, expert)).map(HostRecord)
+    }
+
     /// `layer`'s tier record `record`, which keeps its expert whole, answers
     /// the request at `past` from now: nothing takes it until the device is
     /// past there ([`HostRecords::answer`]).

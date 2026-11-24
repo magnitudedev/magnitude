@@ -962,6 +962,11 @@ pub(super) struct Scratch {
     /// Demand-derived subset of `0..lent` leased for the active prompt group on
     /// `Placer::Bank` (`None` = full `0..lent` lease).
     lease_records: Option<Vec<u32>>,
+    /// Per-`(group, next_layer)` bitmap of experts already attempted by Pillar C
+    /// lookahead in [`Self::convey`]: guarantees each expert is prefetched at
+    /// most once per `(group, next_layer)` even if `land_conveyed` drops it on
+    /// `Claim::Short` / `ahead_queued` backpressure or `refill_tier` evicts it.
+    pillar_c_attempted: Option<(Step, usize, Vec<bool>)>,
     pub(super) conveyor: Conveyor,
 }
 
@@ -1091,6 +1096,7 @@ impl Scratch {
             pending_window_resets: BTreeSet::new(),
             copier,
             lease_records: None,
+            pillar_c_attempted: None,
             conveyor,
         }
     }
@@ -1474,6 +1480,7 @@ impl Scratch {
         core.directory.end_prompt_group(self.conveyor.lending().group);
         self.conveyor.serving = None;
         self.lease_records = None;
+        self.pillar_c_attempted = None;
         true
     }
 
@@ -1505,6 +1512,7 @@ impl Scratch {
         assert_eq!(scratch_group.first(), group, "the conveyor serves group {group} from its first step");
         self.conveyor.serving = Some(Serving { group: scratch_group, past: false });
         self.lease_records = None;
+        self.pillar_c_attempted = None;
     }
 
     /// Take the request `at` its point from chain place `place`, as its
@@ -1798,10 +1806,27 @@ impl Scratch {
                         let selected = core.extents.selected;
                         let tokens = if selected > 0 { total_choices as f64 / selected as f64 } else { 0.0 };
                         let next_experts = core.layers[next_layer].experts;
-                        if prefill_hit_probability(next_experts, selected, tokens) >= 0.8 {
+                        let max_ahead = shared.compute.workers().max(1) * 2;
+                        if prefill_hit_probability(next_experts, selected, tokens) >= 0.8
+                            && shared.compute.ahead_queued() < max_ahead
+                        {
+                            let group_first = self.conveyor.serving.expect("conveyor serves group").group.first();
+                            let reset = !matches!(
+                                self.pillar_c_attempted,
+                                Some((g, l, ref bits)) if g == group_first && l == next_layer && bits.len() == next_experts
+                            );
+                            if reset {
+                                self.pillar_c_attempted = Some((group_first, next_layer, vec![false; next_experts]));
+                            }
+                            let attempted = &mut self.pillar_c_attempted.as_mut().expect("initialized above").2;
                             let expert_bytes = core.layers[next_layer].expert_bytes();
                             for expert in 0..next_experts {
-                                if self.conveyor.reads_in_flight() as u64 * expert_bytes >= knee {
+                                if attempted[expert] {
+                                    continue;
+                                }
+                                if self.conveyor.reads_in_flight() as u64 * expert_bytes >= knee
+                                    || shared.compute.ahead_queued() >= max_ahead
+                                {
                                     break;
                                 }
                                 if core.directory.held(next_layer, expert).is_some()
@@ -1823,6 +1848,7 @@ impl Scratch {
                                     ticket.on_end(move |_, _| events.notify());
                                     self.conveyor.take(next_layer, expert, record);
                                     self.conveyor.reading(next_layer, expert, Arc::new(ticket), record);
+                                    attempted[expert] = true;
                                 } else {
                                     break;
                                 }
@@ -2740,11 +2766,13 @@ impl Scratch {
                 // (newly grown host-tier slots joined during cold prefill have
                 // `from.step() > last`, which would make `hold_for_pass` return
                 // `None` and livelock against `Claim::Kept`).
-                if let Some(record) = core.directory.hold_tier(layer, expert) {
+                if let Some(record) = core.directory.hold_tier_or_revive(layer, expert) {
                     *posted = true;
                     batch_ready.push((expert, record, slot));
                     progressed = true;
-                } else if !core.directory.lands(layer, expert) && self.conveyor.state(layer, expert).is_none() {
+                } else if core.directory.located(layer, expert) == crate::experts::host_records::Located::Lacked
+                    && self.conveyor.state(layer, expert).is_none()
+                {
                     // Self-heal: if an expert was evicted before we held it, mark
                     // it deferred so `convey` reads it from NVMe immediately.
                     if let SetSlot::Cold(cold) = &mut self.tiers[index].sets[set_index].experts[expert] {
