@@ -359,8 +359,17 @@ native stream_mix_sinkhorn for cuda from "cuda/stream_mix_sinkhorn.cu":
     params (arithmetic SPLIT in [16, 32, 64, 128] default least where SPLIT >= device.units or SPLIT == 128)
     where S <= 8
     scratch partials bytes (M * SPLIT * (1 + (2 + S) * S) * 4)
-    launch stream_mix_sinkhorn_split when M <= VERIFY_ROWS:
-        threadgroups (SPLIT, M, 1)
+    launch stream_mix_sinkhorn_split when M == 1:
+        threadgroups (SPLIT, 1, 1)
+        threads_per_threadgroup (256, 1, 1)
+    launch stream_mix_sinkhorn_tile2 when M == 2:
+        threadgroups (SPLIT, 1, 1)
+        threads_per_threadgroup (256, 1, 1)
+    launch stream_mix_sinkhorn_tile4 when M >= 3 and M <= 4:
+        threadgroups (SPLIT, 1, 1)
+        threads_per_threadgroup (256, 1, 1)
+    launch stream_mix_sinkhorn_tile8 when M >= 5 and M <= VERIFY_ROWS:
+        threadgroups (SPLIT, ceil_div(M, 8), 1)
         threads_per_threadgroup (256, 1, 1)
     launch stream_mix_sinkhorn_tiles when M > VERIFY_ROWS:
         threadgroups (SPLIT, ceil_div(M, SINKHORN_TILE), 1)

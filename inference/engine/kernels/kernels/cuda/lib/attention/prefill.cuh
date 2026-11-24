@@ -446,12 +446,45 @@ struct Selection {
 template <bool DECODE>
 struct PrefillRows {
     static constexpr bool POSITIONS = DECODE;
-    static constexpr int MIN_TILES = 16;
+    static constexpr bool MULTI_TILE = DECODE;
+    static constexpr int MIN_TILES = DECODE ? 2 : 16;
     const u8 *queries;
     const u8 *keys;
     const u8 *values;
     element::Out<Act> gated;
     Split split;
+
+    // Load m16n8k16 fragment A directly from `queries` scratch into `qa`
+    // registers without touching `q_tile` in shared memory (preserving staged
+    // K/V tiles across multi-tile decode verify loops).
+    template <int STEPS>
+    __device__ __forceinline__ void load_qa_direct(const Inputs &in, Block block, long long first_token,
+                                                   int warp, int lane, u32 (&qa)[STEPS][4]) const {
+        [[maybe_unused]] const seismic_words_t &seismic_words_value = *in.words;
+        const long long rows_total = static_cast<long long>(SEISMIC_DIM_M);
+        const int row_block = warp % WARPS;
+        const int g = lane / 4;
+        const int t = lane % 4;
+        const int r0 = row_block * 16 + g;
+        const int r1 = r0 + 8;
+        const long long tok0 = first_token + r0 / G;
+        const long long tok1 = first_token + r1 / G;
+        const u32 *q_row0 = (r0 < QT * G && tok0 < rows_total)
+            ? reinterpret_cast<const u32 *>(queries + ((tok0 * KV * G + block.kv * G + r0 % G) * W) * 2)
+            : nullptr;
+        const u32 *q_row1 = (r1 < QT * G && tok1 < rows_total)
+            ? reinterpret_cast<const u32 *>(queries + ((tok1 * KV * G + block.kv * G + r1 % G) * W) * 2)
+            : nullptr;
+        const int col_base = SPLIT_SCORES ? (warp / WARPS) * SPAN : 0;
+#pragma unroll
+        for (int step = 0; step < STEPS; ++step) {
+            const int c0 = (col_base + 16 * step) / 2 + t;
+            qa[step][0] = q_row0 ? q_row0[c0] : 0u;
+            qa[step][1] = q_row1 ? q_row1[c0] : 0u;
+            qa[step][2] = q_row0 ? q_row0[c0 + 4] : 0u;
+            qa[step][3] = q_row1 ? q_row1[c0 + 4] : 0u;
+        }
+    }
 
     // The query tile (MMA warps): matrix row i is token first_token + i / G,
     // head kv * G + i % G; padding rows are zero.
@@ -549,10 +582,15 @@ struct PrefillRows {
 template <int PARTS>
 struct DecodeRows {
     static constexpr bool POSITIONS = true;
+    static constexpr bool MULTI_TILE = false;
     static constexpr int MIN_TILES = 1;
     float *partials;
     float *statistics;
     rounding::Rounding trained = rounding::none();
+
+    template <int STEPS>
+    __device__ __forceinline__ void load_qa_direct(const Inputs &, Block, long long, int, int,
+                                                   u32 (&)[STEPS][4]) const {}
 
     // The query tile (MMA warp `warp`, rows warp, warp + WARPS, ...), and in
     // partition 0 the tile's rows appended to history.
@@ -947,7 +985,6 @@ __device__ __forceinline__ void attend(const Inputs &in, const History &history,
                   "inline decoding takes whole 16-byte pair rows and whole rows per thread group");
     static_assert(!(PICKS && CODED), "picked rows are activation vectors");
     const int kv = block.kv;
-    const long long first_token = static_cast<long long>(block.tile) * QT;
     const long long rows_total = static_cast<long long>(SEISMIC_DIM_M);
     const int spans = static_cast<int>(SEISMIC_DIM_R);
     // The key sequence's last span: the fresh span (index `spans`), or with
@@ -956,12 +993,6 @@ __device__ __forceinline__ void attend(const Inputs &in, const History &history,
     const int last = spans + (PICKS ? 1 : 0);
     const int warp = threadIdx.x / 32;
     const int lane = threadIdx.x % 32;
-    // Picks span key `ordinal`'s selected row: its token's pick, -1 for none.
-    auto pick_row = [&](int ordinal) {
-        constexpr int LIST = PICKS ? PICK_COUNT : 1;
-        const long long token = first_token + ordinal / LIST;
-        return token < rows_total ? picked.at(token, ordinal % LIST) : -1;
-    };
 
     extern __shared__ __align__(16) u8 shared[];
     // With Q_REGISTERS the query tile is staged in the K/V stages' region and
@@ -1032,6 +1063,23 @@ __device__ __forceinline__ void attend(const Inputs &in, const History &history,
     // `stage_fresh_at`, so the split-scores exchange sits after it.
     [[maybe_unused]] float *split_exchange =
         (Rows::POSITIONS && PRODUCED) ? exchange + WARPS * COLUMNS * W : exchange;
+
+    // Multi-tile decode verify (`Rows::MULTI_TILE`): one CTA per (kv, partition)
+    // loops over all ceil(M / QT) query tiles, reusing K/V tiles already staged
+    // in shared memory whenever `units <= STAGES` and the walk matches.
+    const int num_tiles = Rows::MULTI_TILE ? static_cast<int>((rows_total + QT - 1) / QT) : 1;
+    bool cached_valid = false;
+    PositionWalk cached_walk{};
+
+    for (int tile_idx = 0; tile_idx < num_tiles; ++tile_idx) {
+    if constexpr (Rows::MULTI_TILE) block.tile = tile_idx;
+    const long long first_token = static_cast<long long>(block.tile) * QT;
+    // Picks span key `ordinal`'s selected row: its token's pick, -1 for none.
+    auto pick_row = [&](int ordinal) {
+        constexpr int LIST = PICKS ? PICK_COUNT : 1;
+        const long long token = first_token + ordinal / LIST;
+        return token < rows_total ? picked.at(token, ordinal % LIST) : -1;
+    };
 
     // Span table: union and common interval of the tile's valid tokens. Decode
     // rows (POSITIONS) place their tiles on each row's own grid instead.
@@ -1500,7 +1548,12 @@ __device__ __forceinline__ void attend(const Inputs &in, const History &history,
         active = plan->active;
         if (partition >= active) {
             rows.vacant(in, block, first_token);
-            return;
+            if constexpr (Rows::MULTI_TILE) {
+                if (tile_idx + 1 < num_tiles) __syncthreads();
+                continue;
+            } else {
+                return;
+            }
         }
         units = plan->units;
         if (units == 0) __trap();
@@ -1519,31 +1572,35 @@ __device__ __forceinline__ void attend(const Inputs &in, const History &history,
     }
     rows.partitioned(block, active);
 
-    if (warp < WARPS * COLUMNS)
-        rows.stage_queries(in, history, q_tile, exchange, block, first_token, warp, lane);
-
     // The warp's query fragments (row block warp % WARPS, every 16-column
     // step of the head), when they stay in registers (loaded after partition
     // bounds so vacant partitions skip them and setup never pins `qa`).
     u32 qa[Q_REGISTERS ? SPAN / 16 : 1][4];
-    if constexpr (Q_REGISTERS) {
-        seismic_cp_async_wait<0>();
-        __syncthreads();
-        if (warp < WARPS * COLUMNS) {
+    if constexpr (Rows::MULTI_TILE && Q_REGISTERS) {
+        if (warp < WARPS * COLUMNS)
+            rows.load_qa_direct(in, block, first_token, warp, lane, qa);
+    } else {
+        if (warp < WARPS * COLUMNS)
+            rows.stage_queries(in, history, q_tile, exchange, block, first_token, warp, lane);
+        if constexpr (Q_REGISTERS) {
+            seismic_cp_async_wait<0>();
+            __syncthreads();
+            if (warp < WARPS * COLUMNS) {
 #pragma unroll
-            for (int step = 0; step < SPAN / 16; ++step) {
-                const int row = (warp % WARPS) * 16 + (lane % 8) + 8 * ((lane / 8) % 2);
-                // With split scores, the column warp's own span.
-                const int span0 = SPLIT_SCORES ? (warp / WARPS) * SPAN / 8 : 0;
-                seismic_ldmatrix_x4(qa[step], q_tile + swizzled(row, span0 + 2 * step + lane / 16));
+                for (int step = 0; step < SPAN / 16; ++step) {
+                    const int row = (warp % WARPS) * 16 + (lane % 8) + 8 * ((lane / 8) % 2);
+                    // With split scores, the column warp's own span.
+                    const int span0 = SPLIT_SCORES ? (warp / WARPS) * SPAN / 8 : 0;
+                    seismic_ldmatrix_x4(qa[step], q_tile + swizzled(row, span0 + 2 * step + lane / 16));
+                }
             }
+            // The region is the K/V stages' from here on.
+            __syncthreads();
+        } else if constexpr (PRODUCED) {
+            // Order `DecodeRows::stage_queries`'s use of `exchange` before producer
+            // warps can touch `exchange` in `stage_fresh_at`.
+            __syncthreads();
         }
-        // The region is the K/V stages' from here on.
-        __syncthreads();
-    } else if constexpr (PRODUCED) {
-        // Order `DecodeRows::stage_queries`'s use of `exchange` before producer
-        // warps can touch `exchange` in `stage_fresh_at`.
-        __syncthreads();
     }
 
     // Tile `index` of the query tile's sequence (`reduce::span_locate` over
@@ -2128,39 +2185,76 @@ __device__ __forceinline__ void attend(const Inputs &in, const History &history,
             } else
 #endif
             {
-                // Unit i goes into stage i % STAGES, STAGES - 1 units ahead of
-                // the products; one copy group is committed per unit slot (empty
-                // past the last unit), so the wait for unit i is uniform.
-                for (int ahead = 0; ahead < STAGES - 1; ++ahead) {
-                    if (ahead < units) {
-                        issue(fetch, fetch_piece, ahead);
-                        advance(fetch, fetch_piece);
-                    }
-                    seismic_cp_async_commit();
-                }
-                for (int i = 0; i < units; ++i) {
-                    const int ahead = i + STAGES - 1;
-                    if (ahead < units) {
-                        issue(fetch, fetch_piece, ahead % STAGES);
-                        advance(fetch, fetch_piece);
-                    }
-                    seismic_cp_async_commit();
-                    seismic_cp_async_wait<STAGES - 1>();
-                    __syncthreads();
-#ifdef ATTENTION_AFFINE_HISTORY
-                    if constexpr (INLINE) {
-                        const int held = history_rows(current);
-                        if (held > 0) {
-                            Affine::decode_codes(code_tile(i % STAGES), k_tile(i % STAGES), v_tile(i % STAGES),
-                                         piece + 1 == PIECES, held, threadIdx.x, MMA_THREADS);
-                            __syncthreads();
+                bool can_cache = false;
+                bool reuse_kv = false;
+                if constexpr (Rows::MULTI_TILE && !PRODUCED && !INLINE && WINDOWS == 1 && !PICKS) {
+                    if (units > 0 && units <= STAGES && plan->walks == 1) {
+                        const PositionWalk &w = plan->walk[0];
+                        const int max_hist = min(max(w.historical - w.first, 0), KEYS * units);
+                        const bool no_straddle = (max_hist == 0) || (w.first + max_hist <= w.span0_end);
+                        can_cache = no_straddle;
+                        if (can_cache && cached_valid &&
+                            w.first == cached_walk.first &&
+                            w.end_key == cached_walk.end_key &&
+                            w.historical == cached_walk.historical &&
+                            w.fresh == cached_walk.fresh &&
+                            w.shift0 == cached_walk.shift0 &&
+                            w.span0_end == cached_walk.span0_end) {
+                            reuse_kv = true;
                         }
                     }
+                }
+                if (reuse_kv) {
+                    if constexpr (!Q_REGISTERS) {
+                        seismic_cp_async_wait<0>();
+                        __syncthreads();
+                    }
+                    for (int i = 0; i < units; ++i) {
+                        absorb_unit(current, piece, k_tile(i % STAGES), v_tile(i % STAGES));
+                        if constexpr (SPLIT_SCORES) {
+                            if (i + 1 < units) named_sync(PAIR + row_block, COLUMNS * 32);
+                        }
+                        advance(current, piece);
+                    }
+                } else {
+                    // Unit i goes into stage i % STAGES, STAGES - 1 units ahead of
+                    // the products; one copy group is committed per unit slot (empty
+                    // past the last unit), so the wait for unit i is uniform.
+                    for (int ahead = 0; ahead < STAGES - 1; ++ahead) {
+                        if (ahead < units) {
+                            issue(fetch, fetch_piece, ahead);
+                            advance(fetch, fetch_piece);
+                        }
+                        seismic_cp_async_commit();
+                    }
+                    for (int i = 0; i < units; ++i) {
+                        const int ahead = i + STAGES - 1;
+                        if (ahead < units) {
+                            issue(fetch, fetch_piece, ahead % STAGES);
+                            advance(fetch, fetch_piece);
+                        }
+                        seismic_cp_async_commit();
+                        seismic_cp_async_wait<STAGES - 1>();
+                        __syncthreads();
+#ifdef ATTENTION_AFFINE_HISTORY
+                        if constexpr (INLINE) {
+                            const int held = history_rows(current);
+                            if (held > 0) {
+                                Affine::decode_codes(code_tile(i % STAGES), k_tile(i % STAGES), v_tile(i % STAGES),
+                                             piece + 1 == PIECES, held, threadIdx.x, MMA_THREADS);
+                                __syncthreads();
+                            }
+                        }
 #endif
 
-                    absorb_unit(current, piece, k_tile(i % STAGES), v_tile(i % STAGES));
-                    __syncthreads();
-                    advance(current, piece);
+                        absorb_unit(current, piece, k_tile(i % STAGES), v_tile(i % STAGES));
+                        __syncthreads();
+                        advance(current, piece);
+                    }
+                    if constexpr (Rows::MULTI_TILE && !PRODUCED && !INLINE && WINDOWS == 1 && !PICKS) {
+                        cached_valid = can_cache;
+                        if (can_cache) cached_walk = plan->walk[0];
+                    }
                 }
             }
         }
@@ -2181,6 +2275,10 @@ __device__ __forceinline__ void attend(const Inputs &in, const History &history,
             rows.store(in, block, active, token, query_head, column0 + 8 * n0, o, half, t, maximum[half],
                        denominator[half]);
         }
+    }
+    if constexpr (Rows::MULTI_TILE) {
+        if (tile_idx + 1 < num_tiles) __syncthreads();
+    }
     }
 }
 

@@ -1055,7 +1055,7 @@ native attention_prefill for cuda from "cuda/attention_prefill.cu":
         threads_per_threadgroup (COLUMNS * WARPS * 32, 1, 1)
         shared_bytes (ATTEND_REGION + (R + 1 + min(1, KS)) * 16)
     launch attention_prefill_attend_rows when M <= VERIFY_ROWS and B == 0:
-        threadgroups (ceil_div(M, WARPS * 16 / G), KV, PARTITIONS)
+        threadgroups (1, KV, PARTITIONS)
         threads_per_threadgroup (COLUMNS * WARPS * 32, 1, 1)
         shared_bytes (ATTEND_REGION + (36 + 28 * min(1, KS)) * 16)
     launch attention_prefill_merge when PARTITIONS > 1:

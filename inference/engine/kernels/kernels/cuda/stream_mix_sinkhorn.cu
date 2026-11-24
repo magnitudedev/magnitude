@@ -184,12 +184,12 @@ __device__ __forceinline__ void reduce_slice(const float *__restrict__ hidden, c
     constexpr unsigned STRIPES = WARPS / GROUPS;
     constexpr unsigned PASS = 32u * STRIPES;
     static_assert(WARPS % GROUPS == 0 && TILE % GROUPS == 0, "a tile's rows are whole warps' rows");
-    static_assert(TILE == 1u || (STRIPES == 1u && CHUNK % PASS == 0u),
-                  "a staged tile's warps each take whole rows, a chunk whole passes");
     const unsigned h = SEISMIC_DIM_H, width = STREAMS * h, split = (unsigned)SEISMIC_TUNE_SPLIT;
     const unsigned rows = (unsigned)SEISMIC_DIM_M, row0 = blockIdx.y * TILE, span = (width + split - 1u) / split;
     const unsigned first = blockIdx.x * span, last = min(first + span, width);
     const unsigned warp = threadIdx.x / 32u, lane = threadIdx.x % 32u;
+    const unsigned stripe = warp / GROUPS;
+    const unsigned tid_pass = stripe * 32u + lane;
     const float *x[PER];
     bool live[PER];
 #pragma unroll
@@ -325,9 +325,9 @@ __device__ __forceinline__ void reduce_slice(const float *__restrict__ hidden, c
                     const unsigned head = (4u - mis) & 3u;
                     const unsigned vec_lo = min(head, len);
                     const unsigned vec_hi = vec_lo + ((len - vec_lo) & ~3u);
-                    for (unsigned d = lane; d < vec_lo; d += PASS)
+                    for (unsigned d = tid_pass; d < vec_lo; d += PASS)
                         take_scalar(d);
-                    for (unsigned d = vec_lo + lane * 4u; d < vec_hi; d += PASS * 4u) {
+                    for (unsigned d = vec_lo + tid_pass * 4u; d < vec_hi; d += PASS * 4u) {
                         float4 v[PER];
 #pragma unroll
                         for (unsigned r = 0; r < PER; ++r) {
@@ -349,10 +349,10 @@ __device__ __forceinline__ void reduce_slice(const float *__restrict__ hidden, c
                             }
                         }
                     }
-                    for (unsigned d = vec_hi + lane; d < len; d += PASS)
+                    for (unsigned d = vec_hi + tid_pass; d < len; d += PASS)
                         take_scalar(d);
                 } else {
-                    for (unsigned d = lane; d < len; d += PASS)
+                    for (unsigned d = tid_pass; d < len; d += PASS)
                         take_scalar(d);
                 }
             }
@@ -415,6 +415,9 @@ __device__ __forceinline__ void reduce_slice(const float *__restrict__ hidden, c
     }
 
 STREAM_MIX_SLICE_KERNEL(stream_mix_sinkhorn_split, 1u, 1u)
+STREAM_MIX_SLICE_KERNEL(stream_mix_sinkhorn_tile2, 2u, MIXES * CHUNK)
+STREAM_MIX_SLICE_KERNEL(stream_mix_sinkhorn_tile4, 4u, MIXES * CHUNK)
+STREAM_MIX_SLICE_KERNEL(stream_mix_sinkhorn_tile8, 8u, MIXES * CHUNK)
 STREAM_MIX_SLICE_KERNEL(stream_mix_sinkhorn_tiles, PREFILL_TILE, MIXES * CHUNK)
 
 // Block row: its SINKHORN_SPLIT partials summed in slice order, then its

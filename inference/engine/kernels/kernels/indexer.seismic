@@ -194,10 +194,14 @@ native indexer_score for metal from "metal/indexer_score.metal":
 native indexer_score for cuda from "cuda/indexer_score.cu":
     static (H, P, S, NQ, HW, RA, RT)
     where RA <= 1 and RT <= 1 and NQ <= 1 and H <= 64 and (9 * (2 * P + S) + 4) * 4 <= device.shared_bytes_per_group and (2 * P + S) % 32 == 0
-    launch indexer_score:
+    launch indexer_score when M == 1 or M > VERIFY_ROWS:
         threadgroups (ceil_div(N, 256), M, 1)
         threads_per_threadgroup (256, 1, 1)
         shared_bytes (min((H * (2 * P + S + 4) + 8 * (2 * P + S)) * 4, device.shared_bytes_per_group))
+    launch indexer_score_rows when M >= 2 and M <= VERIFY_ROWS:
+        threadgroups (ceil_div(N, 32), 1, 1)
+        threads_per_threadgroup (256, 1, 1)
+        shared_bytes (min((H * (2 * P + S + 4) + 32 * (2 * P + S) + 36) * 4, device.shared_bytes_per_group))
 
 # Vulkan: CUDA/Metal's subgroup-cooperative form, each head's subgroup rotating
 # by shuffles before storing the prepared head (padded by 4 floats per head),

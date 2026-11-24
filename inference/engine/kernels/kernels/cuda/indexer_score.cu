@@ -57,11 +57,38 @@ constexpr int HEAD_TILE = select_head_tile();
 constexpr int HEADS_PER_LANE = (H + 31) / 32;
 constexpr int LANES_PER_HEAD = SINGLE_TILE ? 1 : 32 / HEAD_TILE;
 
+// Multi-row verify path (`indexer_score_rows`, M in 2..=VERIFY_ROWS): each CTA
+// scores 32 key ordinals across all M rows, staging up to 32 keys once in
+// shared memory (or 8 per-warp keys when 32 * W + Q_STRIDE + 36 exceeds budget;
+// 36 trailing floats hold cached_at[32], cached_valid, cached_match so static
+// shared memory is 0).
+constexpr int ROW_K_BUF = (32 * W + Q_STRIDE + 36) <= SMEM_BUDGET_FLOATS ? 32 : 8;
+constexpr int ROW_META_FLOATS = ROW_K_BUF == 32 ? 36 : 0;
+constexpr int ROW_BUDGET_FLOATS = SMEM_BUDGET_FLOATS - ROW_META_FLOATS;
+constexpr bool ROW_SINGLE_TILE = (H * Q_STRIDE + ROW_K_BUF * W) <= ROW_BUDGET_FLOATS;
+
+__host__ __device__ constexpr int select_row_head_tile() {
+    if (ROW_SINGLE_TILE) return H;
+    const int max_heads = (ROW_BUDGET_FLOATS - ROW_K_BUF * W) / Q_STRIDE;
+    if (max_heads >= 32) return 32;
+    if (max_heads >= 16) return 16;
+    if (max_heads >= 8) return 8;
+    if (max_heads >= 4) return 4;
+    if (max_heads >= 2) return 2;
+    return 1;
+}
+
+constexpr int ROW_HEAD_TILE = select_row_head_tile();
+constexpr int ROW_LANES_PER_HEAD = ROW_SINGLE_TILE ? 1 : 32 / ROW_HEAD_TILE;
+
 static_assert(W % 32 == 0, "indexer head width must be a multiple of 32");
 static_assert(H >= 1 && H <= 64, "indexer head count must be in 1..=64");
 static_assert(HEAD_TILE >= 1 && (HEAD_TILE * Q_STRIDE + 8 * W) <= SMEM_BUDGET_FLOATS,
               "indexer_score tile must fit in device shared memory");
 static_assert(SINGLE_TILE || (32 % HEAD_TILE == 0), "HEAD_TILE must divide warp size");
+static_assert(ROW_HEAD_TILE >= 1 && (ROW_HEAD_TILE * Q_STRIDE + ROW_K_BUF * W + ROW_META_FLOATS) <= SMEM_BUDGET_FLOATS,
+              "indexer_score_rows tile must fit in device shared memory");
+static_assert(ROW_SINGLE_TILE || (32 % ROW_HEAD_TILE == 0), "ROW_HEAD_TILE must divide warp size");
 
 typedef ROTARY_ENTRY_LAYOUT(W) query_layout;
 
@@ -257,5 +284,242 @@ extern "C" __global__ void indexer_score(SEISMIC_KERNEL_PARAMS) {
 
         if (lane < warp_keys) my_score *= scale;
         if (ordinal < n) out.put(ordinal * out_stride, my_score);
+    }
+}
+
+extern "C" __global__ void indexer_score_rows(SEISMIC_KERNEL_PARAMS) {
+    using namespace score;
+    extern __shared__ float smem[];
+    float *prepared = smem;
+    float *k_buf = prepared + ROW_HEAD_TILE * Q_STRIDE;
+    int *cached_at = reinterpret_cast<int *>(k_buf + ROW_K_BUF * W);
+
+    const u64 m = SEISMIC_DIM_M;
+    const u64 n = SEISMIC_DIM_N;
+    const u64 r = SEISMIC_DIM_R;
+    const int warp = threadIdx.x / 32;
+    const int lane = threadIdx.x % 32;
+    const u64 base_ord = static_cast<u64>(blockIdx.x) * 32;
+    const u64 ord32 = base_ord + lane;
+    const u64 span_stride = SEISMIC_SPANS_STRIDE_1;
+    const u64 bound_stride = SEISMIC_SPANS_STRIDE_2;
+    const u64 out_stride = SEISMIC_RESULT_0_STRIDE_1;
+    const float neg_inf = -__int_as_float(0x7f800000);
+    const float epsilon = element::word_f32(SEISMIC_PARAM_EPSILON);
+    const float scale = element::word_f32(SEISMIC_PARAM_SCALE);
+    const rounding::Rounding trained =
+        rounding::of(SEISMIC_PARAM_BLOCK, SEISMIC_PARAM_ELEMENT, SEISMIC_PARAM_ROUNDING_SCALE, SEISMIC_PARAM_AMAX_FLOOR);
+    const element::u8 *query = SEISMIC_PTR(SEISMIC_BUFFER_QUERY);
+    const u32 *keys = reinterpret_cast<const u32 *>(SEISMIC_PTR(SEISMIC_BUFFER_KEYS));
+
+    if constexpr (ROW_K_BUF == 32) {
+        if (threadIdx.x == 0) cached_at[32] = 0;
+        __syncthreads();
+    }
+
+    for (u64 row = 0; row < m; ++row) {
+        const int *row_spans = reinterpret_cast<const int *>(SEISMIC_PTR(SEISMIC_BUFFER_SPANS)) + row * SEISMIC_SPANS_STRIDE_0;
+        int at = -1;
+        u64 listed = indexer::warp_span_row(row_spans, r, span_stride, bound_stride, ord32, lane, at);
+        listed = listed < n ? listed : n;
+        const element::Out<element::F32> out = SEISMIC_RESULT_0_OUT.offset(row * SEISMIC_RESULT_0_STRIDE_0);
+        if (base_ord >= listed) {
+            if (warp == 0 && ord32 < n) out.put(ord32 * out_stride, neg_inf);
+            continue;
+        }
+        const int row_keys = static_cast<int>(listed - base_ord < 32 ? listed - base_ord : 32);
+
+        if constexpr (ROW_K_BUF == 32) {
+            if (warp == 0) {
+                const int want = lane < row_keys ? at : -1;
+                const int match = cached_at[32] != 0 && (__all_sync(0xffffffffu, want == cached_at[lane]) != 0);
+                if (lane == 0) cached_at[33] = match;
+                if (!match) {
+                    cached_at[lane] = want;
+                    if (lane == 0) cached_at[32] = 1;
+                }
+            }
+            __syncthreads();
+            if (!cached_at[33]) {
+                for (int k_idx = warp; k_idx < row_keys; k_idx += 8) {
+                    const int key_row = __shfl_sync(0xffffffffu, at, k_idx);
+                    const float *k = reinterpret_cast<const float *>(
+                        slab::row(keys, static_cast<u64>(key_row), SEISMIC_PARAM_SLAB_ROWS, W * sizeof(float)));
+                    float *dst = k_buf + k_idx * W;
+#pragma unroll
+                    for (int c = lane; c < W4; c += 32)
+                        reinterpret_cast<float4 *>(dst)[c] = reinterpret_cast<const float4 *>(k)[c];
+                }
+            }
+        }
+
+        const rotary::table table = ROTARY_ENTRY_TABLE(
+            reinterpret_cast<const int *>(SEISMIC_PTR(SEISMIC_BUFFER_COORDINATES)) + row * SEISMIC_COORDINATES_STRIDE_0,
+            SEISMIC_COORDINATES_STRIDE_1);
+
+        auto prepare_head = [&](int head, float *prepared_head) {
+            float x[E];
+#pragma unroll
+            for (int i = 0; i < E; ++i)
+                x[i] = element::at<Act>(query, row * SEISMIC_QUERY_STRIDE_0 + static_cast<u64>(head) * SEISMIC_QUERY_STRIDE_1 +
+                                                   static_cast<u64>(lane * E + i) * SEISMIC_QUERY_STRIDE_2);
+            if constexpr (SEISMIC_DIM_NQ != 0) {
+                head::rms_norm(x, reinterpret_cast<const float *>(SEISMIC_PTR(SEISMIC_BUFFER_QUERY_NORM)),
+                               SEISMIC_QUERY_NORM_STRIDE_1, epsilon, lane);
+                rounding::hold_lanes<Act>(x, trained);
+            }
+            query_layout::rotate(x, table, prepared_head, lane);
+            rounding::hold_lanes<Act>(x, trained);
+            rounding::round_lanes<E>(x, trained);
+#pragma unroll
+            for (int i = 0; i < E; ++i) prepared_head[lane * E + i] = x[i];
+        };
+
+        if constexpr (ROW_SINGLE_TILE) {
+            for (int head = warp; head < H; head += 8) prepare_head(head, prepared + head * Q_STRIDE);
+            __syncthreads();
+
+            float w[HEADS_PER_LANE];
+#pragma unroll
+            for (int p = 0; p < HEADS_PER_LANE; ++p) {
+                const int head = p * 32 + lane;
+                if constexpr (SEISMIC_DIM_HW != 0) {
+                    const element::u8 *head_weights = SEISMIC_PTR(SEISMIC_BUFFER_HEAD_WEIGHTS);
+                    w[p] = head < H
+                               ? element::at<Act>(head_weights,
+                                                  row * SEISMIC_HEAD_WEIGHTS_STRIDE_0 +
+                                                      static_cast<u64>(head) * SEISMIC_HEAD_WEIGHTS_STRIDE_1)
+                               : 0.0f;
+                } else {
+                    w[p] = 1.0f;
+                }
+            }
+
+            float *k_warp = k_buf + warp * W;
+            for (int j = 0; j < 4; ++j) {
+                const int k_idx = warp * 4 + j;
+                if (k_idx >= row_keys) {
+                    if (lane == 0 && base_ord + k_idx < n) out.put((base_ord + k_idx) * out_stride, neg_inf);
+                    continue;
+                }
+                const float *k_src;
+                if constexpr (ROW_K_BUF == 32) {
+                    k_src = k_buf + k_idx * W;
+                } else {
+                    const int key_row = __shfl_sync(0xffffffffu, at, k_idx);
+                    const float *k = reinterpret_cast<const float *>(
+                        slab::row(keys, static_cast<u64>(key_row), SEISMIC_PARAM_SLAB_ROWS, W * sizeof(float)));
+#pragma unroll
+                    for (int c = lane; c < W4; c += 32)
+                        reinterpret_cast<float4 *>(k_warp)[c] = reinterpret_cast<const float4 *>(k)[c];
+                    __syncwarp();
+                    k_src = k_warp;
+                }
+
+                float dot[HEADS_PER_LANE];
+#pragma unroll
+                for (int p = 0; p < HEADS_PER_LANE; ++p) dot[p] = 0.0f;
+                for (int column = 0; column < W; column += 4) {
+                    const float4 kx = *reinterpret_cast<const float4 *>(k_src + column);
+#pragma unroll
+                    for (int p = 0; p < HEADS_PER_LANE; ++p) {
+                        const int head = p * 32 + lane;
+                        if (head < H) {
+                            const float4 q = *reinterpret_cast<const float4 *>(prepared + head * Q_STRIDE + column);
+                            float d = dot[p];
+                            d = __fmaf_rn(q.x, kx.x, d);
+                            d = __fmaf_rn(q.y, kx.y, d);
+                            d = __fmaf_rn(q.z, kx.z, d);
+                            d = __fmaf_rn(q.w, kx.w, d);
+                            dot[p] = d;
+                        }
+                    }
+                }
+                float val = 0.0f;
+#pragma unroll
+                for (int p = 0; p < HEADS_PER_LANE; ++p) {
+                    const int head = p * 32 + lane;
+                    if (head < H) val += fmaxf(dot[p], 0.0f) * w[p];
+                }
+                const float total = seismic_warp_sum_f32(val);
+                if (lane == 0) out.put((base_ord + k_idx) * out_stride, scale * total);
+                __syncwarp();
+            }
+        } else {
+            const int local_head = lane & (ROW_HEAD_TILE - 1);
+            const int sub_lane = lane / ROW_HEAD_TILE;
+            const float *prepared_local = prepared + local_head * Q_STRIDE;
+            float score_acc[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+            float *k_warp = k_buf + warp * W;
+
+            for (int h0 = 0; h0 < H; h0 += ROW_HEAD_TILE) {
+                const int tile_heads = (H - h0) < ROW_HEAD_TILE ? (H - h0) : ROW_HEAD_TILE;
+                for (int lh = warp; lh < tile_heads; lh += 8) prepare_head(h0 + lh, prepared + lh * Q_STRIDE);
+                __syncthreads();
+
+                const int head = h0 + local_head;
+                float w_local = 1.0f;
+                if constexpr (SEISMIC_DIM_HW != 0) {
+                    if (sub_lane == 0 && head < H) {
+                        const element::u8 *head_weights = SEISMIC_PTR(SEISMIC_BUFFER_HEAD_WEIGHTS);
+                        w_local = element::at<Act>(
+                            head_weights,
+                            row * SEISMIC_HEAD_WEIGHTS_STRIDE_0 + static_cast<u64>(head) * SEISMIC_HEAD_WEIGHTS_STRIDE_1);
+                    }
+                }
+
+                for (int j = 0; j < 4; ++j) {
+                    const int k_idx = warp * 4 + j;
+                    if (k_idx >= row_keys) continue;
+                    const float *k_src;
+                    if constexpr (ROW_K_BUF == 32) {
+                        k_src = k_buf + k_idx * W;
+                    } else {
+                        const int key_row = __shfl_sync(0xffffffffu, at, k_idx);
+                        const float *k = reinterpret_cast<const float *>(
+                            slab::row(keys, static_cast<u64>(key_row), SEISMIC_PARAM_SLAB_ROWS, W * sizeof(float)));
+#pragma unroll
+                        for (int c = lane; c < W4; c += 32)
+                            reinterpret_cast<float4 *>(k_warp)[c] = reinterpret_cast<const float4 *>(k)[c];
+                        __syncwarp();
+                        k_src = k_warp;
+                    }
+
+                    float dot = 0.0f;
+                    if (head < H) {
+                        for (int c4 = sub_lane; c4 < W4; c4 += ROW_LANES_PER_HEAD) {
+                            const int column = c4 * 4;
+                            const float4 kx = *reinterpret_cast<const float4 *>(k_src + column);
+                            const float4 q = *reinterpret_cast<const float4 *>(prepared_local + column);
+                            dot = __fmaf_rn(q.x, kx.x, dot);
+                            dot = __fmaf_rn(q.y, kx.y, dot);
+                            dot = __fmaf_rn(q.z, kx.z, dot);
+                            dot = __fmaf_rn(q.w, kx.w, dot);
+                        }
+                    }
+#pragma unroll
+                    for (int offset = 16; offset >= ROW_HEAD_TILE; offset >>= 1)
+                        dot += __shfl_xor_sync(0xffffffffu, dot, offset);
+
+                    const float val = (sub_lane == 0 && head < H) ? fmaxf(dot, 0.0f) * w_local : 0.0f;
+                    const float tile_sum = seismic_warp_sum_f32(val);
+                    if (lane == 0) score_acc[j] += tile_sum;
+                    __syncwarp();
+                }
+
+                if (h0 + ROW_HEAD_TILE < H) __syncthreads();
+            }
+
+            if (lane == 0) {
+                for (int j = 0; j < 4; ++j) {
+                    const int k_idx = warp * 4 + j;
+                    if (base_ord + k_idx < n) {
+                        out.put((base_ord + k_idx) * out_stride, k_idx < row_keys ? scale * score_acc[j] : neg_inf);
+                    }
+                }
+            }
+        }
+
+        if (row + 1 < m) __syncthreads();
     }
 }

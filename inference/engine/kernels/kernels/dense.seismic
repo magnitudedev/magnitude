@@ -474,14 +474,13 @@ const SHARED_ROW_PAIR_BYTES = 5
 # up to that many of its blocks (dense_up and dense_output ran 1, tuned over
 # 1 and 2, and restate it). Launch bounds are (256, 1) where nothing is stated.
 # An ordered segment's GEMV blocks (`ordered_gemv_block_rows`) take OTILE
-# weight rows each, an 8-lane group a row, derived from min(M, 2), the
-# ordered rows, and device.units as the largest power of two in 1..=32 at
-# most (min(M, 2) * ORDERED_ROWS) / device.units: at M = 1 this spreads the
-# ordered rows across the device's units (~1.5 waves); for M >= 2 it doubles
-# the tile so activation L2 re-reads halve while keeping ~0.75-1.0 wave of
-# blocks active across all SMs. Each lane's accumulation order is the row's
-# own whatever the tile, so OTILE changes no result bit and adds no tuning
-# parameter.
+# weight rows each, derived from the ordered rows and device.units as the
+# largest power of two in 1..=32 at most ORDERED_ROWS / device.units: this
+# spreads the ordered rows across all SMs (>= 1 wave when ORDERED_ROWS >=
+# device.units) at every decode and verify row count, while maximizing chunk
+# width WIDTH (fewer block barriers). Each lane's accumulation order is the
+# row's own whatever the tile, so OTILE changes no result bit and adds no
+# tuning parameter.
 projection dense for cuda:
     # Swap-AB GEMV serves up to 2 column blocks of 8 rows (`gemv` for 1..8,
     # `gemv16` for 9..16; `projection::GEMV_ROWS` in `projection.cuh`). Past
@@ -500,7 +499,7 @@ projection dense for cuda:
     let OPERANDS = min(1, sum(W, operands(W)))
     let HALF_SM_SHARED = device.shared_bytes_per_unit / 2
     let ORDERED_ROWS = tiles(W, ORDERED * N)
-    let ORDERED_RATIO = (min(M, 2) * ORDERED_ROWS) / device.units
+    let ORDERED_RATIO = ORDERED_ROWS / device.units
     let OTILE = 1 + min(1, ORDERED_RATIO / 2) + 2 * min(1, ORDERED_RATIO / 4) + 4 * min(1, ORDERED_RATIO / 8) + 8 * min(1, ORDERED_RATIO / 16) + 16 * min(1, ORDERED_RATIO / 32)
     # The ordered GEMV block's dynamic shared memory: 256 bytes of row
     # inverses, then a compile-time power-of-two chunk width (<= 1024) of
