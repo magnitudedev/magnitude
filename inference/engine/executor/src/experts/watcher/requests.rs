@@ -378,7 +378,7 @@ impl Requests {
         residency: &mut Residency,
         posted: Vec<Posted>,
         scratch_arrived: &mut [Option<Instant>],
-        completed_passes: &[crate::experts::transport::PassKey],
+        completed_passes: &[crate::experts::transport::PassReaderEvent],
     ) -> bool {
         // A panic of the executor's work, or the device lost under the
         // parks, ends serving, as the service's own panic does.
@@ -388,10 +388,11 @@ impl Requests {
         // A growth's slots joined since are landed into and hinted into
         // from this pass on.
         let joined = residency.join();
-        // Release `ScratchRing` slots for prefill passes that just finished on
-        // the GPU (before `Combine(L)` and `Front(L+1)`), and release per-layer
-        // `HostTier` holds whose `PrefillFill` DMA completed on `Copies`.
-        let released = residency.scratch.release_passes(completed_passes)
+        // Apply prefill `Pass` GPU reader lifecycle events (retiring a
+        // generation's `ScratchRing` slots + `WindowTable` only once its last
+        // registered GPU reader AND producer DMA batches finish), and settle
+        // `PrefillFill` DMA batches on `Copies`.
+        let released = residency.scratch.release_passes(completed_passes, &residency.core)
             | residency.scratch.settle_prefill_copies(&mut residency.core, &self.shared);
         let refilled = if residency.core.extents.tier_copy_dma && residency.core.directory.refill_short() {
             residency.refill_tier()

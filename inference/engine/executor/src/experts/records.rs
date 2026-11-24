@@ -1227,7 +1227,17 @@ impl BankRecords {
     /// drained); and waits for any already-in-flight `Moving::Copying`
     /// promotion to complete before granting it on a later call. Returns the
     /// experts that left the bank.
+    #[cfg(test)]
     pub fn lease(&mut self, scratch_group: ScratchGroup, exits: Vec<Exit>) -> Vec<Staged> {
+        self.lease_with(scratch_group, exits, |_, _| true)
+    }
+
+    pub fn lease_with(
+        &mut self,
+        scratch_group: ScratchGroup,
+        exits: Vec<Exit>,
+        mut can_reuse: impl FnMut(usize, usize) -> bool,
+    ) -> Vec<Staged> {
         let mut left = Vec::new();
         let mut exits = exits.into_iter().map(|exit| (exit.staged(), exit)).collect::<std::collections::HashMap<_, _>>();
         let Some((group, records)) = self.lent() else {
@@ -1236,6 +1246,9 @@ impl BankRecords {
         };
         self.leasing = true;
         for record in 0..records {
+            if !can_reuse(group, record) {
+                continue;
+            }
             match self.groups[group].contents[record] {
                 Record::Free => {}
                 Record::Held(staged) => {

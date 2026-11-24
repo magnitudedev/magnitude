@@ -23,7 +23,7 @@
 //! [`Copies::completed`] reads only what the two threads learned.
 
 use super::events::Events;
-use super::transport::{ExpertTransport, TransferId};
+use super::transport::{ExpertTransport, ScratchGenId, TransferId};
 use seismic::{Tensor, Transfer, TransferItem, TransferRun};
 use std::collections::{BTreeMap, VecDeque};
 use std::sync::{Arc, Mutex};
@@ -120,7 +120,7 @@ struct QueuedBatch {
     priority: TransferPriority,
     items: Vec<BatchItem>,
     stage_transfer: Option<TransferId>,
-    prefill_sync: Option<(usize, u64, u64)>,
+    prefill_sync: Option<(usize, u64, u64, ScratchGenId)>,
 }
 
 /// The device's transfer queue, shared by every holder of it: the batches
@@ -247,7 +247,7 @@ impl Copies {
         priority: TransferPriority,
         items: Vec<BatchItem>,
         stage_transfer: Option<TransferId>,
-        prefill_sync: Option<(usize, u64, u64)>,
+        prefill_sync: Option<(usize, u64, u64, ScratchGenId)>,
     ) -> u64 {
         let ticket = {
             let mut state = self.state();
@@ -262,12 +262,14 @@ impl Copies {
 
     /// Post a prefill scratch-fill DMA batch at [`TransferPriority::PrefillFill`]
     /// (highest priority, never capped by background promotion depth). When
-    /// `key` is `Some((layer, sequence, window))`, `Copies::issue` submits it
-    /// via `copy_synced` and publishes its `TransferSync` to `ExpertTransport`
-    /// so `Pass` waits on it via `cuStreamWaitEvent`. Intermediate streaming
-    /// batches pass `None` and still execute ahead of `Pass` in FIFO transfer
-    /// stream order before releasing their `HostTier` holds.
-    pub fn post_prefill(&self, items: Vec<BatchItem>, key: Option<(usize, u64, u64)>) -> Result<u64, String> {
+    /// `key` is `Some((layer, sequence, window, generation))`, `Copies::issue`
+    /// submits it via `copy_synced` and atomically publishes `(generation,
+    /// TransferSync)` to `ExpertTransport` so `Pass` waits on it via
+    /// `cuStreamWaitEvent` and tracks retirement against `generation`.
+    /// Intermediate streaming batches pass `None` and still execute ahead of
+    /// `Pass` in FIFO transfer stream order before releasing their `HostTier`
+    /// holds.
+    pub fn post_prefill(&self, items: Vec<BatchItem>, key: Option<(usize, u64, u64, ScratchGenId)>) -> Result<u64, String> {
         {
             let state = self.state();
             if let Some(fault) = &state.fault {
@@ -492,8 +494,10 @@ impl Copies {
                         transport.attach_sync(id, sync.clone());
                         transport.drain_deferred_syncs();
                     }
-                    if let (Some(transport), Some((layer, sequence, window)), Some(sync)) = (&self.inner.transport, prefill_sync, sync) {
-                        transport.publish_prefill_sync(layer, sequence, window, Some(sync));
+                    if let (Some(transport), Some((layer, sequence, window, generation)), Some(sync)) =
+                        (&self.inner.transport, prefill_sync, sync)
+                    {
+                        transport.publish_prefill_sync(layer, sequence, window, generation, Some(sync));
                     }
                     let mut state = self.state();
                     state.issuing = None;
@@ -506,7 +510,7 @@ impl Copies {
                         transport.fault_transfer(id, msg.clone());
                         transport.drain_deferred_syncs();
                     }
-                    if let (Some(transport), Some((_, sequence, _))) = (&self.inner.transport, prefill_sync) {
+                    if let (Some(transport), Some((_, sequence, _, _))) = (&self.inner.transport, prefill_sync) {
                         transport.fail_prefill_step(sequence, msg.clone());
                     }
                     let mut state = self.state();

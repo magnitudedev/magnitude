@@ -675,13 +675,58 @@ impl Registry {
     }
 }
 
-/// Identifies a prefill `Pass(layer, set_start, window)` whose completion
-/// releases its `ScratchRing` slot reservation on the host.
+/// Unique monotonic identifier for one generation-scoped `ScratchRing` +
+/// `WindowTable` + producer-pin reservation. Never reused across pass sets,
+/// layers, or prompt groups, so late or duplicate completions from an older
+/// generation can never release a newer generation's slots or `WindowTable`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub(crate) struct ScratchGenId(pub u64);
+
+/// Unique identifier for one registered GPU reader of a [`ScratchGenId`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub(crate) struct ReaderId(pub u64);
+
+/// Identifies a prefill `Pass(generation, group, layer, set_start, window)`
+/// whose GPU completion retires one reader on its generation-scoped
+/// `ScratchRing` + `WindowTable` reservation.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub(crate) struct PassKey {
+    pub generation: ScratchGenId,
+    pub group: u64,
     pub layer: usize,
     pub set_start: usize,
     pub window: u64,
+}
+
+/// Atomically published readiness descriptor for `(layer, sequence, window)`:
+/// the immutable generation token and optional transfer fence (`TransferSync`).
+pub(crate) struct PrefillReady {
+    pub generation: ScratchGenId,
+    pub sync: Option<TransferSync>,
+}
+
+/// Lifecycle event for GPU readers of a generation-scoped prefill reservation,
+/// delivered in FIFO order from submission threads -> `ExpertTransport` ->
+/// `Scratch`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum PassReaderEvent {
+    /// A GPU reader was registered for `key.generation` and is now in flight.
+    Registered { key: PassKey, reader: ReaderId },
+    /// The registered GPU reader retired cleanly on the device.
+    Retired { key: PassKey, reader: ReaderId },
+    /// Reader admission for `key.generation` is closed (no further readers will
+    /// register; e.g. after submitting its pass(es) or on cancel-before-submit).
+    Closed { key: PassKey },
+    /// An accepted GPU submission failed completion registration or faulted on
+    /// completion wait: quarantine the generation rather than freeing it.
+    Quarantined { key: PassKey },
+}
+
+#[derive(Default)]
+struct PassTracker {
+    next_reader: u64,
+    events: VecDeque<PassReaderEvent>,
+    completions: VecDeque<(PassKey, ReaderId, seismic::NativeGraphCompletion)>,
 }
 
 #[derive(Default)]
@@ -689,9 +734,9 @@ struct PrefillRendezvous {
     /// Plans published by `Watcher` (`Scratch::fix_rounds`) keyed by
     /// `(layer, sequence, window)`.
     plans: HashMap<(usize, u64, u64), PrefillPlan>,
-    /// Async DMA completion syncs published by `Copies::issue` (or `None` when
-    /// a fill had 0 copies) keyed by `(layer, sequence, window)`.
-    syncs: HashMap<(usize, u64, u64), Option<TransferSync>>,
+    /// Atomically published `(ScratchGenId, Option<TransferSync>)` descriptors
+    /// keyed by `(layer, sequence, window)`.
+    syncs: HashMap<(usize, u64, u64), PrefillReady>,
     /// Steps that failed before round 0 (`scratch::fail`).
     failed_steps: HashMap<u64, String>,
     /// Fatal serving error (`Shared::end_serving`).
@@ -703,10 +748,10 @@ pub(crate) struct ExpertTransport {
     registry: Mutex<Registry>,
     prefill: Mutex<PrefillRendezvous>,
     prefill_ready: Condvar,
-    /// In-flight prefill `Pass(L)` completions tracked so `Requests::serve`
-    /// releases each pass's `ScratchRing` slots immediately when `Pass(L)`
-    /// finishes on the GPU (BEFORE `Combine(L)` and `Front(L+1)`).
-    pass_completions: Mutex<VecDeque<(PassKey, seismic::NativeGraphCompletion)>>,
+    /// In-flight prefill `Pass(L)` reader registrations, admission closes,
+    /// quarantines, and GPU completions tracked so `Requests::serve` retires
+    /// each generation only after its last registered GPU reader finishes.
+    pass_tracker: Mutex<PassTracker>,
     decode: Option<DecodeDmaState>,
     /// Number of active `land_decode_misses` flights currently in flight
     /// between `DecodeFront` and `DecodeBack` release/completion.
@@ -737,7 +782,7 @@ impl ExpertTransport {
             registry: Mutex::default(),
             prefill: Mutex::default(),
             prefill_ready: Condvar::new(),
-            pass_completions: Mutex::default(),
+            pass_tracker: Mutex::default(),
             decode: None,
             demand_in_flight: AtomicUsize::new(0),
             transfers_issued: AtomicU64::new(0),
@@ -753,7 +798,7 @@ impl ExpertTransport {
             registry: Mutex::default(),
             prefill: Mutex::default(),
             prefill_ready: Condvar::new(),
-            pass_completions: Mutex::default(),
+            pass_tracker: Mutex::default(),
             decode,
             demand_in_flight: AtomicUsize::new(0),
             transfers_issued: AtomicU64::new(0),
@@ -1771,36 +1816,39 @@ impl ExpertTransport {
 
     /// Called by `Copies::issue` (with `Some(sync)`) or `Scratch` (with `None`
     /// when a fill has 0 copies) once a prefill fill batch is submitted on
-    /// `Copies`'s transfer stream. Pure in-memory insert + condvar notify.
+    /// `Copies`'s transfer stream. Atomically publishes the immutable
+    /// `generation` token alongside its readiness dependency (`sync`).
     pub(crate) fn publish_prefill_sync(
         &self,
         layer: usize,
         sequence: u64,
         window: u64,
+        generation: ScratchGenId,
         sync: Option<TransferSync>,
     ) {
         let mut prefill = self.prefill.lock().expect("transport prefill rendezvous");
-        prefill.syncs.insert((layer, sequence, window), sync);
+        prefill.syncs.insert((layer, sequence, window), PrefillReady { generation, sync });
         self.prefill_ready.notify_all();
     }
 
     /// Wait on the host condvar (zero `cuEventSynchronize`!) for `Copies` to
-    /// publish the `TransferSync` for `(layer, sequence, window)`.
+    /// publish the atomic [`PrefillReady`] descriptor for
+    /// `(layer, sequence, window)`.
     pub(crate) fn take_prefill_sync(
         &self,
         layer: usize,
         sequence: u64,
         window: u64,
-    ) -> Result<Option<TransferSync>, String> {
+    ) -> Result<PrefillReady, String> {
         let mut prefill = self.prefill.lock().expect("transport prefill rendezvous");
         loop {
-            if let Some(sync) = prefill.syncs.remove(&(layer, sequence, window)) {
-                if sync.is_some() {
+            if let Some(ready) = prefill.syncs.remove(&(layer, sequence, window)) {
+                if ready.sync.is_some() {
                     self.prefill_dma_batches.fetch_add(1, Ordering::Relaxed);
                 } else {
                     self.prefill_dma_skipped.fetch_add(1, Ordering::Relaxed);
                 }
-                return Ok(sync);
+                return Ok(ready);
             }
             if let Some(reason) = prefill.failed_steps.get(&sequence) {
                 return Err(reason.clone());
@@ -1815,49 +1863,95 @@ impl ExpertTransport {
         }
     }
 
-    /// Track an in-flight prefill `Pass` completion emitted immediately after
-    /// `run_pass(L)` (before `Combine(L)` and `Front(L+1)`).
+    /// Register one GPU reader on `key.generation` without closing reader
+    /// admission (supports multiple `Pass`es reading the same generation).
+    #[allow(dead_code)]
+    pub(crate) fn register_pass_reader(
+        &self,
+        key: PassKey,
+        completion: seismic::NativeGraphCompletion,
+    ) -> ReaderId {
+        let mut tracker = self.pass_tracker.lock().expect("transport pass tracker");
+        tracker.next_reader += 1;
+        let reader = ReaderId(tracker.next_reader);
+        tracker.events.push_back(PassReaderEvent::Registered { key, reader });
+        tracker.completions.push_back((key, reader, completion));
+        reader
+    }
+
+    /// Close reader admission for `key.generation` (e.g. zero readers on
+    /// cancel-before-submit, or after the last reader of a multi-pass
+    /// generation has been registered).
+    pub(crate) fn close_pass_readers(&self, key: PassKey) {
+        self.pass_tracker
+            .lock()
+            .expect("transport pass tracker")
+            .events
+            .push_back(PassReaderEvent::Closed { key });
+    }
+
+    /// Quarantine `key.generation` after an accepted GPU submission whose
+    /// completion registration failed or whose wait faulted.
+    pub(crate) fn quarantine_pass(&self, key: PassKey) {
+        self.pass_tracker
+            .lock()
+            .expect("transport pass tracker")
+            .events
+            .push_back(PassReaderEvent::Quarantined { key });
+    }
+
+    /// Atomically register the sole GPU `Pass` reader for `key.generation` and
+    /// close reader admission in FIFO order (BEFORE completion can retire).
     pub(crate) fn track_pass_completion(
         &self,
         key: PassKey,
         completion: seismic::NativeGraphCompletion,
-    ) {
-        self.pass_completions
-            .lock()
-            .expect("transport pass completions")
-            .push_back((key, completion));
+    ) -> ReaderId {
+        let mut tracker = self.pass_tracker.lock().expect("transport pass tracker");
+        tracker.next_reader += 1;
+        let reader = ReaderId(tracker.next_reader);
+        tracker.events.push_back(PassReaderEvent::Registered { key, reader });
+        tracker.events.push_back(PassReaderEvent::Closed { key });
+        tracker.completions.push_back((key, reader, completion));
+        reader
     }
 
-    /// Non-blocking poll of tracked prefill `Pass` completions. Pops every
-    /// completed pass under a short mutex, then calls `completion.wait()`
-    /// OUTSIDE all locks so CUDA event teardown never runs under a mutex or
-    /// `NoBlockingAllocationGuard`.
-    pub(crate) fn poll_completed_passes(&self) -> (Vec<PassKey>, Option<String>) {
+    /// Non-blocking poll of tracked prefill `Pass` reader events and GPU
+    /// completions. Drains queued FIFO lifecycle events and completed passes
+    /// under a short mutex, then calls `completion.wait()` OUTSIDE all locks so
+    /// CUDA event teardown never runs under a mutex or
+    /// `NoBlockingAllocationGuard`. On `completion.wait()` failure, emits
+    /// [`PassReaderEvent::Quarantined`] rather than retiring the generation.
+    pub(crate) fn poll_completed_passes(&self) -> (Vec<PassReaderEvent>, Option<String>) {
         seismic::memory::assert_blocking_allocation_allowed("ExpertTransport::poll_completed_passes");
-        let done = {
-            let mut queue = self
-                .pass_completions
-                .lock()
-                .expect("transport pass completions");
+        let (mut events, done) = {
+            let mut tracker = self.pass_tracker.lock().expect("transport pass tracker");
+            let events: Vec<PassReaderEvent> = tracker.events.drain(..).collect();
             let mut ready = Vec::new();
-            while queue.front().is_some_and(|(_, comp)| comp.is_complete()) {
-                if let Some(entry) = queue.pop_front() {
-                    ready.push(entry);
+            let mut remaining = VecDeque::with_capacity(tracker.completions.len());
+            while let Some((key, reader, comp)) = tracker.completions.pop_front() {
+                if comp.is_complete() {
+                    ready.push((key, reader, comp));
+                } else {
+                    remaining.push_back((key, reader, comp));
                 }
             }
-            ready
+            tracker.completions = remaining;
+            (events, ready)
         };
-        let mut keys = Vec::with_capacity(done.len());
         let mut first_error = None;
-        for (key, completion) in done {
-            if let Err(error) = completion.wait() {
-                if first_error.is_none() {
-                    first_error = Some(error.to_string());
+        for (key, reader, completion) in done {
+            match completion.wait() {
+                Ok(()) => events.push(PassReaderEvent::Retired { key, reader }),
+                Err(error) => {
+                    if first_error.is_none() {
+                        first_error = Some(error.to_string());
+                    }
+                    events.push(PassReaderEvent::Quarantined { key });
                 }
             }
-            keys.push(key);
         }
-        (keys, first_error)
+        (events, first_error)
     }
 
     /// Wait on the host condvar (zero `cuEventSynchronize`!) for `Watcher` to

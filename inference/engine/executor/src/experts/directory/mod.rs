@@ -53,6 +53,20 @@ pub use replay::{Recency, replay};
 #[cfg(any(test, feature = "expert-routing"))]
 use super::exchange;
 
+/// Policy controlling whether prefill seeding ([`Directory::seed_with`]) may
+/// evict live `Record::Held` slots or must only place into `Record::Free`
+/// slots.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SeedMode {
+    /// Only seed into `Record::Free` slots (required under async `tier_copy_dma`
+    /// where `Copies` runs on `NativeQueue::Transfer` without a `Compute ->
+    /// Transfer` barrier against other layers' in-flight `Pass` readers).
+    FreeOnly,
+    /// May also evict unpinned, non-pooled `Record::Held` victims (used by
+    /// synchronous fill/compute-queue seeding).
+    AllowEvict,
+}
+
 /// A piece of the device's order: a run of one group's streamed layers
 /// that the device runs whole, between the pieces submitted before and
 /// after it. A group begins as one piece, its own. A group cut in before
@@ -2655,12 +2669,15 @@ impl Directory {
     /// held one's expert leaving the bank. The pool shrinks by the host
     /// records claimed now ([`Self::resize_pool`]). Whether the group holds
     /// the records its scratch lies in ([`Self::leased`]).
+    #[cfg(test)]
     pub fn lease(&mut self, lender: usize, scratch_group: ScratchGroup, may_evict: bool, copy: Option<&mut dyn FnMut(u32, u32)>) -> bool {
-        self.lease_records(lender, scratch_group, None, may_evict, copy)
+        self.lease_records(lender, scratch_group, None, may_evict, copy, |_, _| true)
     }
 
     /// Grant scratch group `scratch_group` its lease of `target_records` (or
-    /// all `0..lent` when `None`) of group `lender`.
+    /// all `0..lent` when `None`) of group `lender`, withholding any lent bank
+    /// record where `can_reuse(group, record)` is `false` (e.g. still pinned by
+    /// a joined demand consumer or quarantined in `ExpertTransport`).
     pub fn lease_records(
         &mut self,
         lender: usize,
@@ -2668,6 +2685,7 @@ impl Directory {
         target_records: Option<&[u32]>,
         may_evict: bool,
         copy: Option<&mut dyn FnMut(u32, u32)>,
+        mut can_reuse: impl FnMut(usize, usize) -> bool,
     ) -> bool {
         let before = self.host[lender].claimed();
         if !self.host[lender].leased_records(target_records) {
@@ -2685,11 +2703,37 @@ impl Directory {
         }
         let bank_before = self.bank.capacity(lender);
         for (group, record) in self.bank.lent_queued() {
-            self.unpromoted(group, record);
+            if can_reuse(group, record.index()) {
+                self.unpromoted(group, record);
+            }
         }
+        // Snapshot `can_reuse` per lent record so `lent_held()` exit creation
+        // and `bank.lease_with()` see the exact same eligibility set.
+        let lent_reusable: Vec<(usize, usize, bool)> = self
+            .bank
+            .lent_held()
+            .into_iter()
+            .map(|(group, record, _)| (group, record, can_reuse(group, record)))
+            .collect();
         // Each decided after the exits before it took their tier records.
-        let exits = self.bank.lent_held().into_iter().map(|(group, record, staged)| self.exit_now(group, record, staged)).collect();
-        for (layer, expert) in self.bank.lease(scratch_group, exits) {
+        let exits = self
+            .bank
+            .lent_held()
+            .into_iter()
+            .filter(|&(group, record, _)| {
+                lent_reusable
+                    .iter()
+                    .find(|&&(g, r, _)| g == group && r == record)
+                    .is_some_and(|&(_, _, ok)| ok)
+            })
+            .map(|(group, record, staged)| self.exit_now(group, record, staged))
+            .collect();
+        for (layer, expert) in self.bank.lease_with(scratch_group, exits, |group, record| {
+            lent_reusable
+                .iter()
+                .find(|&&(g, r, _)| g == group && r == record)
+                .map_or_else(|| can_reuse(group, record), |&(_, _, ok)| ok)
+        }) {
             self.left_bank(layer, expert, None);
         }
         if self.bank.capacity(lender) != bank_before {
@@ -2784,10 +2828,28 @@ impl Directory {
     /// (`Reuse::in_top`, as a release's), placed as fills its seed copy and
     /// commit commit. The seeds with their records, and the experts evicted,
     /// (layer, expert).
+    /// Whether [`Self::seed`] may evict `Record::Held` victims or must seed
+    /// strictly into `Record::Free` slots.
+    ///
+    /// Under async `tier_copy_dma`, `Copies` issues `ScratchRing -> Bank` D2D
+    /// seed copies on `NativeQueue::Transfer` without a `Compute -> Transfer`
+    /// barrier: evicting a `Record::Held` slot belonging to another layer in
+    /// the same bank group would overwrite weights an in-flight `Compute` pass
+    /// is still reading. `FreeOnly` eliminates that hazard by construction.
     #[allow(clippy::too_many_arguments)]
-    pub fn seed(&mut self, point: Point, scratch_group: ScratchGroup, layer: usize, routed: &[(usize, u32, Step)], pinned: &[usize], filled: impl Fn(usize) -> bool) -> (Vec<(usize, BankRecord)>, Vec<(usize, usize)>) {
+    pub fn seed_with(
+        &mut self,
+        point: Point,
+        scratch_group: ScratchGroup,
+        layer: usize,
+        routed: &[(usize, u32, Step)],
+        pinned: &[usize],
+        filled: impl Fn(usize) -> bool,
+        mode: SeedMode,
+        mut can_reuse: impl FnMut(usize, usize) -> bool,
+    ) -> (Vec<(usize, BankRecord)>, Vec<(usize, usize)>) {
         if self.placer == crate::planning::Placer::Bank {
-            return self.seed_store(point, scratch_group, layer, routed, pinned, filled);
+            return self.seed_store(point, scratch_group, layer, routed, pinned, filled, mode, can_reuse);
         }
         let group = self.bank.group(layer);
         let remaining = self.remaining_layers(group, layer);
@@ -2808,6 +2870,9 @@ impl Directory {
                 .collect::<Vec<_>>();
             let pinned = pinned.iter().filter_map(|&expert| self.bank.held(layer, expert)).collect::<Vec<_>>();
             let contents = self.bank.records(group);
+            let transport_reusable: Vec<bool> = (0..contents.len())
+                .map(|record| can_reuse(group, record))
+                .collect();
             // Protect `in_top` records that belong to the *current* request's
             // prefill (`!has_stale_decode_pool(owner)`) so multi-chunk prefills
             // never thrash VRAM-only experts from earlier chunks back to SSD;
@@ -2824,7 +2889,8 @@ impl Directory {
                 .collect::<Vec<_>>();
             let backs = self.kept_by_exit(&reuse, group);
             let kept = |record: usize| {
-                pinned.contains(&record)
+                !transport_reusable[record]
+                    || pinned.contains(&record)
                     || pooled[record]
                     || backs[record]
                     || matches!(contents[record], Record::Held((layer, _)) if self.is_layer_whole_published(layer))
@@ -2837,7 +2903,7 @@ impl Directory {
                 .take(absent.len().min(free_limit))
                 .map(|record| (None, bank_record(record)))
                 .collect::<Vec<_>>();
-            if order.len() < absent.len() {
+            if mode == SeedMode::AllowEvict && order.len() < absent.len() {
                 let routed_total: f64 = routed.iter().map(|&(_, count, _)| f64::from(count)).sum();
                 let rank = seed_rank(
                     &reuse,
@@ -2887,19 +2953,38 @@ impl Directory {
         (seeded.into_iter().zip(placed.records).collect(), evicted)
     }
 
-    /// [`Self::seed`] where the host places, into the one store: seeds rank
+    #[cfg(test)]
+    #[allow(clippy::too_many_arguments)]
+    pub fn seed(
+        &mut self,
+        point: Point,
+        scratch_group: ScratchGroup,
+        layer: usize,
+        routed: &[(usize, u32, Step)],
+        pinned: &[usize],
+        filled: impl Fn(usize) -> bool,
+    ) -> (Vec<(usize, BankRecord)>, Vec<(usize, usize)>) {
+        self.seed_with(point, scratch_group, layer, routed, pinned, filled, SeedMode::AllowEvict, |_, _| true)
+    }
+
+    /// [`Self::seed_with`] where the host places, into the one store: seeds rank
     /// by the prompt table (`Reuse::rank_union`), and the store's taking
     /// order ([`HostRecords::seed_order`]) offers free records first (divided
     /// across the group's remaining layers), then kept records of any layer
-    /// in the group. However full the store, a seed that outranks a kept
-    /// expert evicts it: seeding never waits for a ready record. The ready
-    /// records the host keeps for its `reserve` are never taken. Each seed's
-    /// record is the device's seed copy's to write ([`HostRecords::seed`])
-    /// until it retires with its step ([`Self::retire`]); its expert stays
-    /// lacked meanwhile, so no step waits on it. The seeds with their
-    /// records, and the experts evicted, (layer, expert).
+    /// in the group (unless `mode == SeedMode::FreeOnly`). Records rejected by
+    /// `can_reuse(group, record)` are never taken.
     #[allow(clippy::too_many_arguments)]
-    fn seed_store(&mut self, point: Point, scratch_group: ScratchGroup, layer: usize, routed: &[(usize, u32, Step)], pinned: &[usize], filled: impl Fn(usize) -> bool) -> (Vec<(usize, BankRecord)>, Vec<(usize, usize)>) {
+    fn seed_store(
+        &mut self,
+        point: Point,
+        scratch_group: ScratchGroup,
+        layer: usize,
+        routed: &[(usize, u32, Step)],
+        pinned: &[usize],
+        filled: impl Fn(usize) -> bool,
+        mode: SeedMode,
+        mut can_reuse: impl FnMut(usize, usize) -> bool,
+    ) -> (Vec<(usize, BankRecord)>, Vec<(usize, usize)>) {
         assert_eq!(point.group, scratch_group.first(), "a seed at {point:?} of the scratch group from step {}", scratch_group.first());
         let group = self.bank.group(layer);
         let remaining = self.remaining_layers(group, layer);
@@ -2925,6 +3010,9 @@ impl Directory {
                 .collect::<Vec<_>>();
             let pinned = |(of, expert): Staged| of == layer && pinned.contains(&expert);
             let mut order = host.seed_order(rank, pinned);
+            order.retain(|&(ref held, record)| {
+                can_reuse(group, record as usize) && (mode == SeedMode::AllowEvict || held.is_none())
+            });
             let free = order.iter().take_while(|(held, _)| held.is_none()).count();
             let free_limit = free.div_ceil(remaining);
             if free_limit < free {

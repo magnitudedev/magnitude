@@ -2663,3 +2663,211 @@ fn deepseek_v41_rtx5090_8_group_all_five_invariants() {
     let undated = Want::undated(1.0);
     assert!(parked < streamed && streamed < expected && expected < undated);
 }
+
+/// Under async `tier_copy_dma` (`SeedMode::FreeOnly`), `Directory::seed_with`
+/// MUST never evict live `Record::Held` slots belonging to another layer in
+/// the same bank group — even when the bank is completely full (zero `Free`
+/// slots) and the prior layer's slots are stale from an earlier request.
+#[test]
+fn seed_with_free_only_never_evicts_held_slots_even_when_bank_is_full() {
+    use crate::experts::directory::SeedMode;
+    use crate::experts::host_records::{Claim, Taking};
+
+    let experts = 8usize;
+    let lent = 1usize;
+    let total_records = 5usize; // 0 = lent, 1..5 = 4 permanent slots shared by layers 0 and 1
+    let map_words = magnitude_kernels::constants::MAP_WORDS;
+    let host = HostTier {
+        records: vec![16],
+        lent: vec![0],
+        reserve: 0,
+        placement: Placement::Tier {
+            bank_maps: vec![
+                StampedMap::new(cpu_words(&[experts as u64, map_words], 0)),
+                StampedMap::new(cpu_words(&[experts as u64, map_words], 0)),
+            ],
+            tier_maps: vec![
+                LandingMap::Tier(cpu_words(&[experts as u64], -1)),
+                LandingMap::Tier(cpu_words(&[experts as u64], -1)),
+            ],
+            lent: (0, lent),
+            stage_slots: vec![0],
+        },
+    };
+    let mut directory = Directory::new(&[total_records], &[0, 0], &[experts, experts], host);
+    let steps = steps();
+    steps.begin_through(20);
+
+    // Fill all 4 permanent slots (1..5): 2 with Layer 0's `Record::Held`
+    // experts and 2 with Layer 1's (4.div_ceil(2) = 2 per layer -> zero `Free`
+    // slots left in the bank).
+    for layer in 0..2usize {
+        for expert in 0..2usize {
+            let Claim::Taken(grant) = directory.claim_landing(layer, expert, 0, Taking::Out, (|_, _| (), |_, _| true)) else {
+                panic!("expected host slot for ({layer}, {expert})");
+            };
+            directory.landed(layer, HostRecord(grant.record()), expert, Some(1));
+        }
+    }
+    let group1 = ScratchGroup::at(1, 1);
+    assert!(directory.lease(0, group1, false, None));
+    let routed_l0 = [(0usize, 10u32, 1u64), (1, 10, 1)];
+    let (seeds_l0, _) = directory.seed_with(
+        at(1, 0),
+        group1,
+        0,
+        &routed_l0,
+        &[],
+        |_| true,
+        SeedMode::FreeOnly,
+        |_, _| true,
+    );
+    assert_eq!(seeds_l0.len(), 2, "layer 0 fills its 2 permanent free slots");
+    let routed_l1_init = [(0usize, 10u32, 1u64), (1, 10, 1)];
+    let (seeds_l1_init, _) = directory.seed_with(
+        at(1, 1),
+        group1,
+        1,
+        &routed_l1_init,
+        &[],
+        |_| true,
+        SeedMode::FreeOnly,
+        |_, _| true,
+    );
+    assert_eq!(seeds_l1_init.len(), 2, "layer 1 fills the remaining 2 permanent free slots (bank now 100% full)");
+    // Commit all 4 seeds so they become `Record::Held` (0 Free slots remain).
+    directory.retire(
+        at(5, 0),
+        |_, _| 1,
+        |_| Ending::Ended,
+        &steps,
+    );
+    directory.end_prompt_group(0);
+    let l0_slots: Vec<(usize, usize)> = (0..2)
+        .map(|e| (e, directory.held(0, e).expect("layer 0 expert held")))
+        .collect();
+
+    // New prompt group (Request 2) at step 10: bank is completely FULL (0 Free
+    // slots). Layer 1 requests `SeedMode::FreeOnly` with high-count cold experts.
+    let group2 = ScratchGroup::at(10, 1);
+    assert!(directory.lease(0, group2, false, None));
+    let routed_l1 = [(2usize, 100u32, 10u64), (3, 100, 10), (4, 100, 10), (5, 100, 10)];
+    let (seeds_l1, evicted_l1) = directory.seed_with(
+        at(10, 1),
+        group2,
+        1,
+        &routed_l1,
+        &[],
+        |_| true,
+        SeedMode::FreeOnly,
+        |_, _| true,
+    );
+    assert!(seeds_l1.is_empty(), "FreeOnly must skip seeding on full bank (0 Free slots)");
+    assert!(evicted_l1.is_empty(), "FreeOnly must NEVER evict Layer 0's Record::Held slots");
+    for &(expert, expected_slot) in &l0_slots {
+        assert_eq!(
+            directory.held(0, expert),
+            Some(expected_slot),
+            "Layer 0 held expert {expert} at slot {expected_slot} must remain intact"
+        );
+    }
+}
+
+/// Even under `SeedMode::AllowEvict`, a `Record::Held` slot promoted by
+/// `finish_demand_landings_batch` while still pinned by an active transport
+/// consumer lease (`can_reuse == false`) MUST NEVER be selected as a seed
+/// victim or overwritten.
+#[test]
+fn seed_with_allow_evict_never_evicts_transport_pinned_held_slot() {
+    use crate::experts::directory::SeedMode;
+    use crate::experts::host_records::{Claim, Taking};
+    use crate::experts::transport::{DestSlot, ExpertTransport};
+
+    let experts = 6usize;
+    let lent = 1usize;
+    let total_records = 2usize; // 0 = lent, 1 = sole permanent slot
+    let map_words = magnitude_kernels::constants::MAP_WORDS;
+    let host = HostTier {
+        records: vec![8],
+        lent: vec![0],
+        reserve: 0,
+        placement: Placement::Tier {
+            bank_maps: vec![StampedMap::new(cpu_words(&[experts as u64, map_words], 0))],
+            tier_maps: vec![LandingMap::Tier(cpu_words(&[experts as u64], -1))],
+            lent: (0, lent),
+            stage_slots: vec![0],
+        },
+    };
+    let mut directory = Directory::new(&[total_records], &[0], &[experts], host);
+    let steps = steps();
+    steps.begin_through(20);
+
+    for expert in 0..experts {
+        let Claim::Taken(grant) = directory.claim_landing(0, expert, 0, Taking::Out, (|_, _| (), |_, _| true)) else {
+            panic!("expected host slot for expert {expert}");
+        };
+        directory.landed(0, HostRecord(grant.record()), expert, Some(1));
+    }
+
+    // Claim permanent slot 1 via DemandLanding and pin it in `ExpertTransport`
+    // with an active consumer lease (`can_reuse_slot == false`).
+    let transport = ExpertTransport::new_registry_only();
+    let DemandSlotClaim::Allocated { staged, slot } =
+        directory.claim_demand_landing(0, 0, true, |_| true)
+    else {
+        panic!("expected permanent slot 1 for demand landing");
+    };
+    assert_eq!(slot, 1);
+    let dest = DestSlot { group: 0, slot };
+    let (tid, lease) = transport.begin_demand_transfer(0, 0, 0, 0, dest);
+    transport.complete_dma(tid);
+    assert!(!transport.can_reuse_slot(dest), "consumer lease still pins slot 1");
+
+    // `finish_demand_landings_batch` promotes slot 1 to `Record::Held` while
+    // `can_reuse == false` (the consumer still holds `lease`).
+    let promoted = directory.finish_demand_landings_batch(&[(0, slot, staged, false)], at(1, 0), &steps);
+    assert!(promoted, "slot 1 promoted to Record::Held while consumer lease active");
+    assert_eq!(directory.held(0, 0), Some(slot));
+
+    // Next prefill attempts `SeedMode::AllowEvict` with a much higher-ranked
+    // expert (expert 5, count 1000). Because `can_reuse_slot(dest)` is false,
+    // slot 1 MUST NOT be evicted!
+    let group = ScratchGroup::at(10, 1);
+    assert!(directory.lease(0, group, false, None));
+    let (seeds, evicted) = transport.with_slot_reuse(|can_reuse| {
+        directory.seed_with(
+            at(10, 0),
+            group,
+            0,
+            &[(5, 1000, 10)],
+            &[],
+            |_| true,
+            SeedMode::AllowEvict,
+            |g, s| can_reuse(DestSlot { group: g, slot: s }),
+        )
+    });
+    assert!(seeds.is_empty(), "pinned Record::Held slot must NOT be taken as seed victim");
+    assert!(evicted.is_empty());
+    assert_eq!(directory.held(0, 0), Some(slot));
+
+    // Once the consumer drops its lease (`can_reuse_slot == true`),
+    // `SeedMode::AllowEvict` may safely select slot 1 as a victim.
+    drop(lease);
+    assert!(transport.can_reuse_slot(dest));
+    let (seeds_after, evicted_after) = transport.with_slot_reuse(|can_reuse| {
+        directory.seed_with(
+            at(10, 0),
+            group,
+            0,
+            &[(5, 1000, 10)],
+            &[],
+            |_| true,
+            SeedMode::AllowEvict,
+            |g, s| can_reuse(DestSlot { group: g, slot: s }),
+        )
+    });
+    assert_eq!(seeds_after.len(), 1);
+    assert_eq!(seeds_after[0].0, 5);
+    assert_eq!(seeds_after[0].1.index(), slot);
+    assert_eq!(evicted_after, vec![(0, 0)]);
+}

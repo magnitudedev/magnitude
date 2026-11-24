@@ -148,11 +148,62 @@ impl SubmissionChunks {
 /// `Pass` runs on `NativeQueue::Compute`.
 struct PendingPrefillDma {
     bank: Arc<crate::experts::ExpertBank>,
+    group: u64,
     block: usize,
     layer: usize,
     place: usize,
     sequence: u64,
     window: u64,
+}
+
+/// RAII guard for a generation-scoped prefill `Pass` reader reservation.
+///
+/// Guarantees by construction:
+/// - Early return before GPU submission (`backs.next()` empty, attach error, or
+///   subsequent place sync error) closes reader admission with 0 readers so the
+///   generation retires cleanly once the producer stops.
+/// - Normal GPU submission registers the completion and closes reader admission
+///   atomically via `ExpertBank::track_pass_completion`.
+/// - Failed submission or unwind after an accepted GPU submission quarantines
+///   the generation so uncertain GPU storage is never prematurely freed.
+struct TrackedPrefillPass {
+    bank: Arc<crate::experts::ExpertBank>,
+    key: crate::experts::transport::PassKey,
+    submitted: bool,
+    finalized: bool,
+}
+
+impl TrackedPrefillPass {
+    fn new(bank: Arc<crate::experts::ExpertBank>, key: crate::experts::transport::PassKey) -> Self {
+        Self { bank, key, submitted: false, finalized: false }
+    }
+
+    fn close_empty(&mut self) {
+        if !self.finalized {
+            self.finalized = true;
+            self.bank.transport().close_pass_readers(self.key);
+        }
+    }
+
+    fn quarantine(&mut self) {
+        if !self.finalized {
+            self.finalized = true;
+            self.bank.transport().quarantine_pass(self.key);
+        }
+    }
+}
+
+impl Drop for TrackedPrefillPass {
+    fn drop(&mut self) {
+        if self.finalized {
+            return;
+        }
+        if self.submitted {
+            self.bank.transport().quarantine_pass(self.key);
+        } else {
+            self.bank.transport().close_pass_readers(self.key);
+        }
+    }
 }
 
 struct StepSubmitter<'p> {
@@ -403,15 +454,15 @@ impl<'p> StepSubmitter<'p> {
     /// `NativeQueue::Compute` — zero `routed_round`, zero `routed_copy`, zero
     /// `cuEventSynchronize` drains.
     ///
-    /// Returns `Some((bank, layer))` when `Pass(L)` should be flushed with a
-    /// completion signal right after queueing so `ScratchRing` releases its
-    /// slots before `Combine(L)` and `Front(L+1)` finish.
+    /// Returns `Some(TrackedPrefillPass)` carrying the atomically published
+    /// generation token so `Pass(L)` registers its GPU completion against that
+    /// exact generation (or closes reader admission cleanly on 0-reader abort).
     fn enqueue_prefill_dma(
         &mut self,
         block: usize,
         set: &std::ops::Range<usize>,
         window: u64,
-    ) -> Result<Option<(Arc<crate::experts::ExpertBank>, usize)>, SubmitError> {
+    ) -> Result<Option<TrackedPrefillPass>, SubmitError> {
         if self.pending_prefill_dma.is_empty() {
             return Ok(None);
         }
@@ -426,30 +477,70 @@ impl<'p> StepSubmitter<'p> {
         // so the GPU stays busy while awaiting the host-side `Copies` sync.
         self.flush()?;
         let bank = matching[0].bank.clone();
+        let group = matching[0].group;
         let layer = matching[0].layer;
+        let mut tracked: Option<TrackedPrefillPass> = None;
         for pending in matching {
-            if let Some(sync) = pending
+            let ready = pending
                 .bank
                 .transport()
                 .take_prefill_sync(pending.layer, pending.sequence, pending.window)
-                .map_err(device)?
-            {
+                .map_err(device)?;
+            match &tracked {
+                Some(existing) => {
+                    debug_assert_eq!(
+                        existing.key.generation, ready.generation,
+                        "all places in pass set ({layer}, {:?}, {window}) share one ScratchGenId",
+                        set,
+                    );
+                }
+                None => {
+                    tracked = Some(TrackedPrefillPass::new(
+                        bank.clone(),
+                        crate::experts::transport::PassKey {
+                            generation: ready.generation,
+                            group,
+                            layer,
+                            set_start: set.start,
+                            window,
+                        },
+                    ));
+                }
+            }
+            if let Some(sync) = ready.sync {
                 self.follow_transfer(sync);
             }
         }
-        Ok(Some((bank, layer)))
+        Ok(tracked)
     }
 
     /// Submit the current compute sequence containing `Pass(L)` immediately
     /// (BEFORE `Combine(L)` and `Front(L+1)`) and register its completion with
-    /// `ExpertTransport` so `Requests::serve` releases `Pass(L)`'s
-    /// `ScratchRing` slots as soon as `Pass(L)` finishes on the GPU.
-    fn flush_tracked_pass(
-        &mut self,
-        bank: &Arc<crate::experts::ExpertBank>,
-        key: crate::experts::transport::PassKey,
-    ) -> Result<(), SubmitError> {
-        self.flush_with(|completion| bank.track_pass_completion(key, completion))
+    /// `ExpertTransport` against `tracked.key.generation` so `Requests::serve`
+    /// retires `Pass(L)`'s `ScratchRing` + `WindowTable` generation only after
+    /// the GPU pass finishes. On submission error or post-submit failure,
+    /// quarantines the generation rather than freeing uncertain GPU storage.
+    fn flush_tracked_pass(&mut self, mut tracked: TrackedPrefillPass) -> Result<(), SubmitError> {
+        self.queued = 0;
+        let sequence = std::mem::replace(&mut self.sequence, self.device.native_sequence(NativeQueue::Compute));
+        if !sequence.is_empty() {
+            match sequence.submit() {
+                Ok(completion) => {
+                    tracked.submitted = true;
+                    tracked.bank.track_pass_completion(tracked.key, completion);
+                    tracked.finalized = true;
+                    self.finish_flush();
+                }
+                Err(err) => {
+                    tracked.quarantine();
+                    return Err(device(err));
+                }
+            }
+        } else {
+            tracked.close_empty();
+            (self.queued_reads, self.queued_landed) = (0, 0);
+        }
+        Ok(())
     }
 
     /// Submit what is queued, with the reads its runs make; those of the
@@ -461,18 +552,6 @@ impl<'p> StepSubmitter<'p> {
         self.queued = 0;
         if !sequence.is_empty() {
             completions.push(sequence.submit().map_err(device)?);
-            self.finish_flush();
-        } else {
-            (self.queued_reads, self.queued_landed) = (0, 0);
-        }
-        Ok(())
-    }
-
-    fn flush_with(&mut self, sink: impl FnOnce(NativeGraphCompletion)) -> Result<(), SubmitError> {
-        self.queued = 0;
-        let sequence = std::mem::replace(&mut self.sequence, self.device.native_sequence(NativeQueue::Compute));
-        if !sequence.is_empty() {
-            sink(sequence.submit().map_err(device)?);
             self.finish_flush();
         } else {
             (self.queued_reads, self.queued_landed) = (0, 0);
@@ -2366,6 +2445,7 @@ impl NativeTargetProgram {
             if let Some(layer) = bank.tier_copy_dma_layer(index).map_err(invalid)? {
                 submitter.pending_prefill_dma.push(PendingPrefillDma {
                     bank: bank.bank.clone(),
+                    group: bank.sequence.saturating_sub(run.region.place as u64),
                     block: index,
                     layer,
                     place: run.region.place,
@@ -2472,15 +2552,8 @@ impl NativeTargetProgram {
             .attach(bindings, graph.plan.new_outputs(&self.unallocating()).map_err(device)?)
             .map_err(device)?;
         submitter.queue(ready, |_| {})?;
-        if let Some((bank, layer)) = tracked_pass {
-            submitter.flush_tracked_pass(
-                &bank,
-                crate::experts::transport::PassKey {
-                    layer,
-                    set_start: set.start,
-                    window,
-                },
-            )?;
+        if let Some(tracked) = tracked_pass {
+            submitter.flush_tracked_pass(tracked)?;
         }
         Ok(())
     }

@@ -59,15 +59,15 @@ use crate::experts::{ListBounds, Words};
 use crate::experts::compute::Urgency;
 use crate::experts::conveyor::{Conveyor, ConveyorLanding, Serving, State, readiness};
 use crate::experts::copies::{BatchItem, Run, Signal};
-use crate::experts::directory::{BankRecord, Directory, HostRecord, Point};
+use crate::experts::directory::{BankRecord, Directory, HostRecord, Point, SeedMode};
 use crate::experts::host_records::{Claim, Taking};
 use crate::experts::landing::Converting;
 use crate::experts::source::Read;
 use crate::experts::staging::Staged;
-use crate::experts::transport::PassKey;
+use crate::experts::transport::{DestSlot, PassKey, PassReaderEvent, ReaderId, ScratchGenId};
 use seismic_io::Want;
 use magnitude_kernels::constants;
-use std::collections::VecDeque;
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -87,15 +87,29 @@ fn prefill_hit_probability(experts: usize, selected: usize, tokens: f64) -> f64 
 
 /// Compact FIFO ring allocator over the lender's existing `0..capacity` (`lent`)
 /// VRAM scratch slots for cross-layer pipelined prefill on `Placer::Tier`
-/// (`0 B` extra VRAM).
+/// (`0 B` extra VRAM), governed by **generation-scoped reservations**.
 ///
-/// Each pass `(layer, set_start, window)` claims `count` dynamic slots from
-/// `tail` (wrapping modulo `capacity`) and writes them into the layer's
-/// indirect `WindowTable` (`core.layers[layer].windows[window]`), which
-/// `routed_pass_map` already resolves. When `Pass(L)` completes on the GPU
-/// (signaled right after `run_pass(L)`, BEFORE `Combine(L)` and `Front(L+1)`),
-/// `release_pass` frees its reservation and advances `head` so `Fill(L+1)`
-/// launches async DMA immediately in parallel with `Combine(L) + Front(L+1)`.
+/// Each `(group, layer, set_start, window)` allocates a unique monotonic
+/// [`ScratchGenId`] that owns:
+/// - its dynamic `ScratchRing` slot leases (including zero-slot leases when
+///   `count == 0` so `WindowTable` stays live),
+/// - its producer state (`producer_open` + in-flight `Copies` batch tickets and
+///   their pinned `HostRecord` source pins, covering both H2D fill copies and
+///   D2D seed copies that read scratch),
+/// - its GPU reader state (`readers_open` + `active_readers: HashSet<ReaderId>`).
+///
+/// A generation retires **exactly once** and **only when**:
+/// 1. It is not quarantined,
+/// 2. The producer has stopped writing (`!producer_open`) AND every posted
+///    `Copies` batch has definitely completed (`in_flight_copies.is_empty()`),
+/// 3. Reader admission is closed (`!readers_open`) AND every registered GPU
+///    reader has retired (`active_readers.is_empty()`).
+///
+/// Late/duplicate completions or `PassKey` reuse across groups/sets are
+/// guaranteed no-ops because retirement addresses unique `ScratchGenId` +
+/// `ReaderId` tokens. Queue faults, partial batch failures, or accepted GPU
+/// submission registration/wait failures **quarantine** the generation so
+/// uncertain GPU storage and source pins are never prematurely freed.
 #[derive(Default)]
 struct ScratchRing {
     head: usize,
@@ -103,18 +117,63 @@ struct ScratchRing {
     used: usize,
     capacity: usize,
     form: Vec<usize>,
+    next_generation: u64,
+    generations: BTreeMap<ScratchGenId, GenerationState>,
+    active_producer: HashMap<(Step, usize, usize, u64), ScratchGenId>,
     in_flight: VecDeque<RingLease>,
 }
 
+struct GenerationState {
+    pass: PassKey,
+    producer_open: bool,
+    published_any: bool,
+    any_copy_posted: bool,
+    in_flight_copies: Vec<(u64, Vec<(usize, HostRecord)>)>,
+    readers_open: bool,
+    active_readers: HashSet<ReaderId>,
+    quarantined: bool,
+    retired: bool,
+}
+
 struct RingLease {
+    generation: ScratchGenId,
     pass: PassKey,
     count: usize,
     released: bool,
 }
 
 impl ScratchRing {
+    /// Return the active generation for `(group, layer, set_start, window)`,
+    /// or create a new monotonic generation-scoped reservation.
+    fn begin_or_get_generation(&mut self, group: Step, layer: usize, set_start: usize, window: u64) -> PassKey {
+        if let Some(&id) = self.active_producer.get(&(group, layer, set_start, window)) {
+            if let Some(gen) = self.generations.get(&id) {
+                return gen.pass;
+            }
+        }
+        self.next_generation += 1;
+        let generation = ScratchGenId(self.next_generation);
+        let pass = PassKey { generation, group, layer, set_start, window };
+        self.generations.insert(
+            generation,
+            GenerationState {
+                pass,
+                producer_open: true,
+                published_any: false,
+                any_copy_posted: false,
+                in_flight_copies: Vec::new(),
+                readers_open: true,
+                active_readers: HashSet::new(),
+                quarantined: false,
+                retired: false,
+            },
+        );
+        self.active_producer.insert((group, layer, set_start, window), generation);
+        pass
+    }
+
     /// Whether `count` slots can be allocated for `form` of `capacity` without
-    /// aliasing any currently in-flight pass.
+    /// aliasing any currently in-flight generation.
     fn can_alloc(&self, form: &[usize], capacity: usize, count: usize) -> bool {
         if count == 0 {
             return true;
@@ -130,13 +189,25 @@ impl ScratchRing {
 
     /// Allocate `count` dynamic scratch slots in `0..capacity` for `pass`.
     /// Even when `count == 0`, records a zero-slot lease so
-    /// [`Self::has_in_flight_set`] stays `true` until `pass` finishes on the
-    /// GPU (preventing a later pass set's `clear_windows()` from racing with
+    /// [`Self::has_live_set`] and [`Self::has_live_layer`] stay `true` until
+    /// `pass.generation` retires on the GPU (preventing a later pass set's
+    /// `clear_windows()` or `advance()`'s `reset_windows()` from racing with
     /// an earlier pass reading `-2` hits from `WindowTable`).
-    /// Panics if [`Self::can_alloc`] does not hold.
+    /// Panics if [`Self::can_alloc`] does not hold or `pass.generation` is not
+    /// an active generation.
     fn alloc(&mut self, pass: PassKey, form: &[usize], capacity: usize, count: usize) -> Vec<usize> {
+        assert!(
+            self.generations.contains_key(&pass.generation),
+            "ScratchRing::alloc called for unknown or retired generation {:?}",
+            pass.generation,
+        );
         if count == 0 {
-            self.in_flight.push_back(RingLease { pass, count: 0, released: false });
+            self.in_flight.push_back(RingLease {
+                generation: pass.generation,
+                pass,
+                count: 0,
+                released: false,
+            });
             return Vec::new();
         }
         assert!(
@@ -159,40 +230,224 @@ impl ScratchRing {
         }
         self.tail = (self.tail + count) % self.capacity;
         self.used += count;
-        self.in_flight.push_back(RingLease { pass, count, released: false });
+        self.in_flight.push_back(RingLease {
+            generation: pass.generation,
+            pass,
+            count,
+            released: false,
+        });
         slots
     }
 
-    /// Release all leases owned by `pass`, advancing `head` past any
-    /// contiguous prefix of released leases. Returns `true` if `used` dropped.
-    fn release_pass(&mut self, pass: PassKey) -> bool {
-        let mut matched = false;
-        for lease in &mut self.in_flight {
-            if lease.pass == pass && !lease.released {
-                lease.released = true;
-                matched = true;
-            }
+    /// Attach an in-flight `Copies` batch ticket (and its pinned source
+    /// `HostRecord`s, which may be empty for seed-only D2D batches reading
+    /// scratch) to `generation`.
+    fn record_copy_batch(&mut self, generation: ScratchGenId, ticket: u64, held: Vec<(usize, HostRecord)>) {
+        if let Some(gen) = self.generations.get_mut(&generation) {
+            gen.any_copy_posted = true;
+            gen.in_flight_copies.push((ticket, held));
         }
-        if !matched {
-            return false;
-        }
-        self.drain_released()
     }
 
-    /// Release all leases owned by `layer` (belt-and-suspenders when `advance`
-    /// proves the device is past the layer).
-    fn release_layer(&mut self, layer: usize) -> bool {
-        let mut matched = false;
-        for lease in &mut self.in_flight {
-            if lease.pass.layer == layer && !lease.released {
-                lease.released = true;
-                matched = true;
-            }
+    fn mark_published(&mut self, generation: ScratchGenId) {
+        if let Some(gen) = self.generations.get_mut(&generation) {
+            gen.published_any = true;
         }
-        if !matched {
+    }
+
+    fn has_published(&self, generation: ScratchGenId) -> bool {
+        self.generations.get(&generation).is_some_and(|gen| gen.published_any)
+    }
+
+    fn has_posted_copies(&self, generation: ScratchGenId) -> bool {
+        self.generations.get(&generation).is_some_and(|gen| gen.any_copy_posted)
+    }
+
+    /// Mark that the producer has finished posting all places/batches for
+    /// `generation`, and retire `generation` if all retirement conditions hold.
+    fn finish_producer(&mut self, generation: ScratchGenId) -> bool {
+        let Some(gen) = self.generations.get_mut(&generation) else {
+            return false;
+        };
+        let key = (gen.pass.group, gen.pass.layer, gen.pass.set_start, gen.pass.window);
+        if self.active_producer.get(&key) == Some(&generation) {
+            self.active_producer.remove(&key);
+        }
+        gen.producer_open = false;
+        self.try_retire(generation)
+    }
+
+    /// Finish the active producer for `(group, layer, set_start, window)` if
+    /// one is still open.
+    fn finish_active_producer(&mut self, group: Step, layer: usize, set_start: usize, window: u64) -> bool {
+        if let Some(&id) = self.active_producer.get(&(group, layer, set_start, window)) {
+            self.finish_producer(id)
+        } else {
+            false
+        }
+    }
+
+    /// Register a GPU reader on `generation`. Returns `false` if reader
+    /// admission is already closed or `generation` is unknown/retired/quarantined.
+    fn register_reader(&mut self, generation: ScratchGenId, reader: ReaderId) -> bool {
+        let Some(gen) = self.generations.get_mut(&generation) else {
+            return false;
+        };
+        if !gen.readers_open || gen.quarantined || gen.retired {
             return false;
         }
-        self.drain_released()
+        gen.active_readers.insert(reader)
+    }
+
+    /// Close reader admission for `generation` BEFORE checking whether any
+    /// active readers remain, then retire `generation` if all conditions hold.
+    fn close_readers(&mut self, generation: ScratchGenId) -> bool {
+        let Some(gen) = self.generations.get_mut(&generation) else {
+            return false;
+        };
+        gen.readers_open = false;
+        self.try_retire(generation)
+    }
+
+    /// Retire one registered GPU reader on `generation`. Late or duplicate
+    /// callbacks (unknown generation or unknown reader) are guaranteed no-ops.
+    fn retire_reader(&mut self, generation: ScratchGenId, reader: ReaderId) -> bool {
+        let Some(gen) = self.generations.get_mut(&generation) else {
+            return false;
+        };
+        if !gen.active_readers.remove(&reader) {
+            return false;
+        }
+        self.try_retire(generation)
+    }
+
+    /// Quarantine `generation` so its `ScratchRing` slots, `WindowTable`, and
+    /// pinned `HostRecord` source pins are NEVER freed after uncertain device
+    /// state (queue fault, partial batch failure, or post-submit failure).
+    fn quarantine(&mut self, generation: ScratchGenId) {
+        if let Some(gen) = self.generations.get_mut(&generation) {
+            let key = (gen.pass.group, gen.pass.layer, gen.pass.set_start, gen.pass.window);
+            if self.active_producer.get(&key) == Some(&generation) {
+                self.active_producer.remove(&key);
+            }
+            gen.quarantined = true;
+            gen.producer_open = false;
+            gen.readers_open = false;
+        }
+    }
+
+    /// Apply one FIFO [`PassReaderEvent`] from `ExpertTransport`. Returns
+    /// `true` if applying the event retired a generation.
+    fn apply_reader_event(&mut self, event: PassReaderEvent) -> bool {
+        match event {
+            PassReaderEvent::Registered { key, reader } => {
+                self.register_reader(key.generation, reader);
+                false
+            }
+            PassReaderEvent::Retired { key, reader } => self.retire_reader(key.generation, reader),
+            PassReaderEvent::Closed { key } => self.close_readers(key.generation),
+            PassReaderEvent::Quarantined { key } => {
+                self.quarantine(key.generation);
+                false
+            }
+        }
+    }
+
+    /// Poll all in-flight `Copies` batches across active non-quarantined
+    /// generations. Returns `(released_host_records, first_error, progressed)`:
+    /// - `Ok(true)`: returns that batch's `HostRecord`s to be unheld and tries
+    ///   to retire the generation.
+    /// - `Ok(false)`: keeps the batch in flight.
+    /// - `Err(error)`: quarantines the generation (keeping its `HostRecord`s
+    ///   pinned and its `ScratchRing` slots withheld!) and reports `error`.
+    fn settle_copies(
+        &mut self,
+        completed: impl Fn(u64) -> Result<bool, String>,
+    ) -> (Vec<(usize, HostRecord)>, Option<String>, bool) {
+        let gen_ids: Vec<ScratchGenId> = self
+            .generations
+            .iter()
+            .filter_map(|(&id, gen)| (!gen.quarantined && !gen.in_flight_copies.is_empty()).then_some(id))
+            .collect();
+        let mut released_records = Vec::new();
+        let mut first_error = None;
+        let mut progressed = false;
+        for id in gen_ids {
+            let mut faulted = false;
+            if let Some(gen) = self.generations.get_mut(&id) {
+                let mut remaining = Vec::new();
+                for (ticket, records) in std::mem::take(&mut gen.in_flight_copies) {
+                    match completed(ticket) {
+                        Ok(false) => remaining.push((ticket, records)),
+                        Ok(true) => {
+                            released_records.extend(records);
+                            progressed = true;
+                        }
+                        Err(error) => {
+                            // Keep source pins held on uncertain device fault!
+                            remaining.push((ticket, records));
+                            if first_error.is_none() {
+                                first_error = Some(error);
+                            }
+                            faulted = true;
+                            progressed = true;
+                        }
+                    }
+                }
+                gen.in_flight_copies = remaining;
+            }
+            if faulted {
+                self.quarantine(id);
+            } else if self.try_retire(id) {
+                progressed = true;
+            }
+        }
+        (released_records, first_error, progressed)
+    }
+
+    /// Close producer and reader admission for any remaining non-quarantined
+    /// generations belonging to `group` once the entire group has ended on the
+    /// device (`clear_past`). Still waits for any already-registered GPU
+    /// readers or in-flight `Copies` batches before retiring.
+    fn close_group_admission(&mut self, group: Step) -> bool {
+        let gen_ids: Vec<ScratchGenId> = self
+            .generations
+            .iter()
+            .filter_map(|(&id, gen)| (!gen.quarantined && gen.pass.group == group).then_some(id))
+            .collect();
+        let mut retired = false;
+        for id in gen_ids {
+            retired |= self.finish_producer(id);
+            retired |= self.close_readers(id);
+        }
+        retired
+    }
+
+    /// Retire `generation` if and only if all retirement conditions hold.
+    /// Enforces **exactly one release**.
+    fn try_retire(&mut self, generation: ScratchGenId) -> bool {
+        let ready = self.generations.get(&generation).is_some_and(|gen| {
+            !gen.retired
+                && !gen.quarantined
+                && !gen.producer_open
+                && gen.in_flight_copies.is_empty()
+                && !gen.readers_open
+                && gen.active_readers.is_empty()
+        });
+        if !ready {
+            return false;
+        }
+        if let Some(gen) = self.generations.get_mut(&generation) {
+            gen.retired = true;
+        }
+        self.generations.remove(&generation);
+        for lease in &mut self.in_flight {
+            if lease.generation == generation && !lease.released {
+                lease.released = true;
+            }
+        }
+        self.drain_released();
+        true
     }
 
     fn drain_released(&mut self) -> bool {
@@ -212,20 +467,32 @@ impl ScratchRing {
         self.used < before_used || self.in_flight.len() < before_len
     }
 
-    /// Whether any unreleased lease exists for `(layer, set_start)`.
-    fn has_in_flight_set(&self, layer: usize, set_start: usize) -> bool {
-        self.in_flight
-            .iter()
-            .any(|lease| !lease.released && lease.pass.layer == layer && lease.pass.set_start == set_start)
+    /// Whether any unretired (including quarantined) generation exists for
+    /// `(layer, set_start)`.
+    fn has_live_set(&self, layer: usize, set_start: usize) -> bool {
+        self.generations
+            .values()
+            .any(|gen| !gen.retired && gen.pass.layer == layer && gen.pass.set_start == set_start)
     }
 
-    fn clear(&mut self) {
-        self.head = 0;
-        self.tail = 0;
-        self.used = 0;
-        self.capacity = 0;
-        self.form.clear();
-        self.in_flight.clear();
+    /// Whether any unretired (including quarantined) generation exists for
+    /// `layer`.
+    fn has_live_layer(&self, layer: usize) -> bool {
+        self.generations
+            .values()
+            .any(|gen| !gen.retired && gen.pass.layer == layer)
+    }
+
+    /// Whether any non-quarantined generation is still awaiting producer
+    /// completion, copy completion, or GPU reader retirement.
+    fn has_unretired_non_quarantined(&self) -> bool {
+        self.generations.values().any(|gen| !gen.retired && !gen.quarantined)
+    }
+
+    /// Whether any generation has been quarantined due to uncertain device
+    /// state.
+    fn has_quarantined(&self) -> bool {
+        self.generations.values().any(|gen| gen.quarantined)
     }
 }
 
@@ -680,13 +947,14 @@ pub(super) struct Scratch {
     /// The host tier records the group's tier copies read, (layer, record),
     /// held until the device is past the group (non-DMA path).
     held: Vec<(usize, HostRecord)>,
-    /// Per-batch host-tier holds for async-DMA `PrefillFill` batches on
-    /// `Copies`: `(copies_ticket, vec![(layer, record)])`, released as soon
-    /// as `Copies::completed(ticket)` is true so multi-layer prefills never
-    /// exhaust `HostTier` when the model exceeds host RAM.
-    prefill_held: Vec<(u64, Vec<(usize, HostRecord)>)>,
-    /// Compact FIFO ring allocator over `0..lent` for `tier_copy_dma`.
+    /// Compact FIFO ring allocator over `0..lent` for `tier_copy_dma`, owning
+    /// generation-scoped `ScratchRing` slot leases, `Copies` batch tickets,
+    /// `HostRecord` source pins, and GPU reader fences.
     ring: ScratchRing,
+    /// Layers whose tier was retired by `Scratch::advance` while a generation
+    /// for that layer still had live GPU readers; `WindowTable` is reset as
+    /// soon as `self.ring.has_live_layer(layer)` becomes `false`.
+    pending_window_resets: BTreeSet<usize>,
     /// Shared `Copies` queue handle for posting `TransferPriority::PrefillFill`.
     copier: Option<Copier>,
     /// Demand-derived subset of `0..lent` leased for the active prompt group on
@@ -780,6 +1048,9 @@ struct Opened {
     routed: Vec<usize>,
     hits: Vec<(usize, usize)>,
     cold: Vec<usize>,
+    /// On `tier_copy_dma`, the generation-scoped reservation token for this
+    /// `(group, layer, set_start, window)`.
+    pass_key: Option<PassKey>,
     /// On `tier_copy_dma`, `(expert, ring_slot, posted)` entries allocated once
     /// `ScratchRing` capacity is reserved for this pass. Streaming partial DMA
     /// batches as cold experts land in `HostTier` prevents pinning all `cold`
@@ -814,8 +1085,8 @@ impl Scratch {
             flags,
             tiers: Vec::new(),
             held: Vec::new(),
-            prefill_held: Vec::new(),
             ring: ScratchRing::default(),
+            pending_window_resets: BTreeSet::new(),
             copier,
             lease_records: None,
             conveyor,
@@ -887,14 +1158,15 @@ impl Scratch {
             .ring
             .in_flight
             .iter()
-            .map(|l| (l.pass.layer, l.pass.set_start, l.pass.window, l.count, l.released))
+            .map(|l| (l.generation.0, l.pass.layer, l.pass.set_start, l.pass.window, l.count, l.released))
             .collect();
         format!(
-            "conveyor serving {:?}; ring {}/{} (leases {:?}); scratch tiers [{}]",
+            "conveyor serving {:?}; ring {}/{} (leases {:?}, pending_resets {:?}); scratch tiers [{}]",
             self.conveyor.serving,
             self.ring.used,
             self.ring.capacity,
             ring_leases,
+            self.pending_window_resets,
             tiers.join("; ")
         )
     }
@@ -927,23 +1199,31 @@ impl Scratch {
     /// last window is taken; none while there is none, those of steps ended
     /// (read now) dropped.
     pub(super) fn unserved(&mut self, shared: &Shared, layer: usize) -> Option<(usize, u64, Step)> {
-        let tier = self.tiers.iter_mut().find(|tier| tier.layer == layer)?;
+        let index = self.tiers.iter().position(|tier| tier.layer == layer)?;
         loop {
-            let (set_index, window, place) = tier.cursor?;
-            let set = &tier.sets[set_index].range;
+            let (set_index, window, place) = self.tiers[index].cursor?;
+            let set = self.tiers[index].sets[set_index].range.clone();
             assert!(set.contains(&place), "cursor place {place} outside set {set:?}");
-            if place >= tier.taken {
+            if place >= self.tiers[index].taken {
                 return None;
             }
-            let Some(sequence) = tier.places[place].as_ref().map(|request| request.sequence) else {
-                tier.advance_cursor();
+            let Some(sequence) = self.tiers[index].places[place].as_ref().map(|request| request.sequence) else {
+                self.tiers[index].advance_cursor();
+                if place + 1 == set.end {
+                    let group = self.tiers[index].group;
+                    self.ring.finish_active_producer(group, layer, set.start, window);
+                }
                 continue;
             };
             if !shared.steps.ended(sequence) {
                 return Some((place, window, sequence));
             }
-            tier.places[place] = None;
-            tier.advance_cursor();
+            self.tiers[index].places[place] = None;
+            self.tiers[index].advance_cursor();
+            if place + 1 == set.end {
+                let group = self.tiers[index].group;
+                self.ring.finish_active_producer(group, layer, set.start, window);
+            }
         }
     }
 
@@ -960,6 +1240,13 @@ impl Scratch {
         }
         self.settle_landings(core);
         let layer = self.tiers[index].layer;
+        if core.extents.tier_copy_dma {
+            let open_start = self.tiers[index].sets[self.tiers[index].open_set].range.start;
+            assert!(
+                !self.ring.has_live_set(layer, open_start),
+                "layer {layer} open_set {open_start} WindowTable cleared while its generation is still live"
+            );
+        }
         core.layers[layer].clear_windows();
         self.tiers[index].open_set = target_set;
         self.convey(core, shared);
@@ -999,49 +1286,61 @@ impl Scratch {
         });
     }
 
-    /// Release `ScratchRing` slot reservations for prefill `Pass`es that just
-    /// completed on the GPU (signaled right after `run_pass(L)`, BEFORE
-    /// `Combine(L)` and `Front(L+1)`).
-    pub(super) fn release_passes(&mut self, passes: &[PassKey]) -> bool {
+    /// Reset any deferred `WindowTable`s whose layer's last GPU generation has
+    /// now retired (never resetting a layer that still has a live or
+    /// quarantined generation).
+    fn flush_pending_window_resets(&mut self, core: &Core) {
+        if self.pending_window_resets.is_empty() {
+            return;
+        }
+        let ready: Vec<usize> = self
+            .pending_window_resets
+            .iter()
+            .copied()
+            .filter(|&layer| !self.ring.has_live_layer(layer))
+            .collect();
+        for layer in ready {
+            self.pending_window_resets.remove(&layer);
+            core.layers[layer].reset_windows();
+        }
+    }
+
+    /// Apply FIFO prefill `Pass` GPU reader lifecycle events from
+    /// `ExpertTransport`, retiring a generation's `ScratchRing` slots and
+    /// deferred `WindowTable` reset ONLY once its producer, copy batches, and
+    /// last registered GPU reader have all retired cleanly.
+    pub(super) fn release_passes(&mut self, events: &[PassReaderEvent], core: &Core) -> bool {
         let mut released = false;
-        for &pass in passes {
-            released |= self.ring.release_pass(pass);
+        for &event in events {
+            released |= self.ring.apply_reader_event(event);
+        }
+        if released {
+            self.flush_pending_window_resets(core);
         }
         released
     }
 
-    /// Release per-layer `HostTier` holds whose `PrefillFill` DMA batch has
-    /// completed on `Copies`, so multi-layer prefills on models larger than
-    /// host RAM never exhaust `HostTier`.
+    /// Settle in-flight `PrefillFill` DMA batches on `Copies` across all live
+    /// non-quarantined generations. Unholds `HostRecord` source pins ONLY on
+    /// definite device completion (`Ok(true)`); on any queue/copy fault
+    /// (`Err`), quarantines the generation so uncertain GPU storage and source
+    /// pins are never prematurely freed.
     pub(super) fn settle_prefill_copies(&mut self, core: &mut Core, shared: &Shared) -> bool {
-        if self.prefill_held.is_empty() {
-            return false;
-        }
         let Some(copier) = &self.copier else {
             return false;
         };
-        let mut released = false;
-        let mut remaining = Vec::new();
-        for (ticket, records) in std::mem::take(&mut self.prefill_held) {
-            match copier.copies.completed(ticket) {
-                Ok(false) => remaining.push((ticket, records)),
-                Ok(true) => {
-                    for (layer, record) in records {
-                        core.directory.unhold_tier(layer, record);
-                    }
-                    released = true;
-                }
-                Err(error) => {
-                    for (layer, record) in records {
-                        core.directory.unhold_tier(layer, record);
-                    }
-                    shared.end_serving(format!("a prefill scratch fill copy: {error}"));
-                    released = true;
-                }
-            }
+        let (released_records, first_error, progressed) =
+            self.ring.settle_copies(|ticket| copier.copies.completed(ticket));
+        for (layer, record) in released_records {
+            core.directory.unhold_tier(layer, record);
         }
-        self.prefill_held = remaining;
-        released
+        if let Some(error) = first_error {
+            shared.end_serving(format!("a prefill scratch fill copy: {error}"));
+        }
+        if progressed {
+            self.flush_pending_window_resets(core);
+        }
+        progressed
     }
 
     /// Whether an async-DMA (`tier_copy_dma`) scratch request at `(layer,
@@ -1071,14 +1370,17 @@ impl Scratch {
             return true;
         }
         let open_start = tier.sets[tier.open_set].range.start;
-        !self.ring.has_in_flight_set(layer, open_start)
+        !self.ring.has_live_set(layer, open_start)
     }
 
     /// The device is at `progress`: forget the tiers of the layers the
     /// served group is past (their backs read no record any more), reset
-    /// their pass window tables for resident passes, free the conveyor's
-    /// records of those layers, and once it is past the group, clear the
-    /// conveyor as soon as nothing of the group runs ([`Self::clear_past`]).
+    /// their pass window tables for resident passes (deferring the reset on
+    /// `tier_copy_dma` until the layer's last GPU generation retires so an
+    /// in-flight `Pass(L)` never reads a reset `WindowTable` or overwritten
+    /// `ScratchRing` slot), free the conveyor's records of those layers, and
+    /// once it is past the group, clear the conveyor as soon as nothing of the
+    /// group runs ([`Self::clear_past`]).
     /// Where the group's backs lie in the device's order is read from the
     /// steps now: a group cut in before one of its layers moves them later.
     pub(super) fn advance(&mut self, progress: Point, core: &mut Core) {
@@ -1092,8 +1394,16 @@ impl Scratch {
         let serving = *serving;
         for tier in &self.tiers {
             if progress > steps.point(tier.group, tier.layer, serving.group.last()) {
-                core.layers[tier.layer].reset_windows();
-                self.ring.release_layer(tier.layer);
+                if core.extents.tier_copy_dma && self.ring.has_live_layer(tier.layer) {
+                    // Host-side arrival of layer L+1 does NOT prove Pass(L) has
+                    // retired on GPU: defer WindowTable reset until Pass(L)'s
+                    // generation-specific GPU last-reader fence retires, and
+                    // NEVER release ScratchRing slots wholesale here.
+                    self.pending_window_resets.insert(tier.layer);
+                } else {
+                    self.pending_window_resets.remove(&tier.layer);
+                    core.layers[tier.layer].reset_windows();
+                }
             }
         }
         // A tier the device is past holds nothing: its slots are the
@@ -1108,18 +1418,16 @@ impl Scratch {
         self.clear_past(core);
     }
 
-    /// The group served is past: once no read or landing of it runs (a
-    /// failed step's reads, which no round listed, the conveyor's landings
-    /// into the host tier, each an event as it ends), empty the conveyor,
-    /// release the tier records its rounds
-    /// held and return the lender's records empty. Nothing takes what
-    /// those ran for, so a failed one's outcome is no step's. Until then
-    /// nothing is done, and the next group's requests wait
+    /// The group served is past: once no read, landing, copy batch, or GPU
+    /// pass reader of it runs, empty the conveyor, release the tier records
+    /// its rounds held, reset non-quarantined window tables, and return the
+    /// lender's records empty (unless quarantined due to uncertain device
+    /// state). Until then nothing is done, and the next group's requests wait
     /// ([`Self::clearing`]). Whether it cleared.
     pub(super) fn clear_past(&mut self, core: &mut Core) -> bool {
-        if !self.conveyor.serving.is_some_and(|serving| serving.past) {
+        let Some(serving) = self.conveyor.serving.filter(|serving| serving.past) else {
             return false;
-        }
+        };
         // Cancel any in-flight background CPU repacks from conveyor records so
         // the next prompt group never stalls behind previous-group landings.
         self.conveyor.cancel_landings();
@@ -1130,43 +1438,38 @@ impl Scratch {
         if !self.conveyor.quiet() {
             return false;
         }
-        // Wait for any in-flight `PrefillFill` copies on `Copies` to finish
-        // reading their held host-tier records before returning the lease.
-        if !self.prefill_held.is_empty() {
-            if let Some(copier) = &self.copier {
-                let mut remaining = Vec::new();
-                for (ticket, records) in std::mem::take(&mut self.prefill_held) {
-                    match copier.copies.completed(ticket) {
-                        Ok(false) => remaining.push((ticket, records)),
-                        Ok(true) | Err(_) => {
-                            for (layer, record) in records {
-                                core.directory.unhold_tier(layer, record);
-                            }
-                        }
-                    }
-                }
-                self.prefill_held = remaining;
-                if !self.prefill_held.is_empty() {
-                    return false;
-                }
-            } else {
-                for (_, records) in self.prefill_held.drain(..) {
-                    for (layer, record) in records {
-                        core.directory.unhold_tier(layer, record);
-                    }
-                }
+        // The group has ended on the device, so no new GPU pass for it can be
+        // admitted; close any remaining open producer/reader admission on its
+        // generations while still waiting for already-registered GPU readers
+        // and in-flight `Copies` batches to retire cleanly.
+        self.ring.close_group_admission(serving.group.first());
+        if let Some(copier) = &self.copier {
+            let (released_records, _, _) =
+                self.ring.settle_copies(|ticket| copier.copies.completed(ticket));
+            for (layer, record) in released_records {
+                core.directory.unhold_tier(layer, record);
             }
         }
-        for tier in self.tiers.drain(..) {
-            core.layers[tier.layer].reset_windows();
+        if self.ring.has_unretired_non_quarantined() {
+            return false;
         }
-        self.ring.clear();
+        self.flush_pending_window_resets(core);
+        for tier in self.tiers.drain(..) {
+            if !self.ring.has_live_layer(tier.layer) {
+                self.pending_window_resets.remove(&tier.layer);
+                core.layers[tier.layer].reset_windows();
+            }
+        }
         self.conveyor.clear();
         // The device is past every tier copy of the group.
         for (layer, record) in self.held.drain(..) {
             core.directory.unhold_tier(layer, record);
         }
-        core.directory.end_prompt_group(self.conveyor.lending().group);
+        // If any generation was quarantined due to uncertain device state, do
+        // NOT return the lent scratch storage to decode residency.
+        if !self.ring.has_quarantined() {
+            core.directory.end_prompt_group(self.conveyor.lending().group);
+        }
         self.conveyor.serving = None;
         self.lease_records = None;
         true
@@ -1216,7 +1519,7 @@ impl Scratch {
         self.mark(shared, layer, Mark::Requested(sequence));
         // The lease is granted before any hit is taken, so no tier pins a
         // lent record.
-        self.lease(core);
+        self.lease(core, shared);
         let index = match self.tiers.iter().position(|tier| (tier.group, tier.layer) == (group, layer)) {
             Some(index) => index,
             None => {
@@ -1233,6 +1536,11 @@ impl Scratch {
                     Vec::new()
                 };
                 let cursor = sets.first().map(|first| (0, 0, first.range.start));
+                self.pending_window_resets.remove(&layer);
+                assert!(
+                    !self.ring.has_live_layer(layer),
+                    "layer {layer} WindowTable cleared for group {group} while a prior generation is still live"
+                );
                 core.layers[layer].clear_windows();
                 self.tiers.push(Tier {
                     group,
@@ -1370,7 +1678,7 @@ impl Scratch {
                 tier.fail_read(expert, reason, shared);
             }
         }
-        self.lease(core);
+        self.lease(core, shared);
         let knee = core.table.source().knee();
         for index in 0..self.tiers.len() {
             let layer = self.tiers[index].layer;
@@ -1966,7 +2274,7 @@ impl Scratch {
     /// lease unmaps is unmapped for every step of the group on, which the
     /// device runs after every step that read its record, before any read
     /// lands in it.
-    fn lease(&mut self, core: &mut Core) {
+    fn lease(&mut self, core: &mut Core, shared: &Shared) {
         let serving = self.conveyor.serving.expect("the conveyor leases for the group it serves");
         let lender = self.conveyor.lending().group;
         // Evicting a colder kept record past the lent zone is safe only before
@@ -1987,7 +2295,16 @@ impl Scratch {
             }
         };
         let copy = tier.is_some().then_some(&mut copy_fn as &mut dyn FnMut(u32, u32));
-        core.directory.lease_records(lender, serving.group, self.lease_records.as_deref(), may_evict, copy);
+        shared.transport.with_slot_reuse(|can_reuse| {
+            core.directory.lease_records(
+                lender,
+                serving.group,
+                self.lease_records.as_deref(),
+                may_evict,
+                copy,
+                |group, slot| can_reuse(DestSlot { group, slot }),
+            );
+        });
     }
 
     /// Whether the group served holds every record the scratch lies in (on
@@ -2002,7 +2319,7 @@ impl Scratch {
     /// scratch slot, slot `e % lw` of the scratch the lender lends the group,
     /// once the group holds every record it lies in: whether every one has
     /// its slot.
-    fn claim_scratch(&mut self, index: usize, set_idx: usize, window: u64, sequence: Step, opened: &mut Opened, core: &mut Core) -> bool {
+    fn claim_scratch(&mut self, index: usize, set_idx: usize, window: u64, sequence: Step, opened: &mut Opened, core: &mut Core, shared: &Shared) -> bool {
         let layer = self.tiers[index].layer;
         let lw = self.tiers[index].layer_window;
         loop {
@@ -2040,7 +2357,7 @@ impl Scratch {
                 target.sort_unstable();
                 target.dedup();
             }
-            self.lease(core);
+            self.lease(core, shared);
             // Extending a partial lease mid-group runs with `may_evict == false`:
             // if a newly leased record had no ready relocation destination, its
             // kept expert was unmapped and must be demoted from any pending hit
@@ -2067,7 +2384,7 @@ impl Scratch {
             }
         }
         if !self.leased(core) {
-            self.lease(core);
+            self.lease(core, shared);
             if !self.leased(core) {
                 return false;
             }
@@ -2124,10 +2441,15 @@ impl Scratch {
         if let Some(index) = self.tiers.iter().position(|tier| (tier.group, tier.layer) == (group, layer)) {
             if let Some((set_index, _, _)) = self.tiers[index].cursor {
                 self.advance_open_set(index, set_index, core, shared);
+                let set = self.tiers[index].sets[set_index].range.clone();
                 let lw = self.tiers[index].layer_window;
                 if let Some(request) = self.tiers[index].places[place].take() {
                     self.tiers[index].advance_cursor();
                     self.tiers[index].served_windows += (self.tiers[index].windows - window) as usize;
+                    if place + 1 == set.end {
+                        self.ring.finish_active_producer(group, layer, set.start, window);
+                        self.flush_pending_window_resets(core);
+                    }
                     let forfeited = (window == 0)
                         .then(|| request.hits.iter().map(|&(expert, _)| expert).collect::<Vec<_>>())
                         .unwrap_or_default()
@@ -2164,8 +2486,12 @@ impl Scratch {
             // answered, so nothing waits.
             let Some(index) = self.tiers.iter().position(|tier| (tier.group, tier.layer) == (group, layer)) else {
                 if let RequestStage::Awaiting(opened) = stage {
-                    if opened.ring_slots.is_some() {
-                        self.ring.release_pass(PassKey { layer, set_start: set.start, window });
+                    if let Some(pass_key) = opened.pass_key {
+                        self.ring.finish_producer(pass_key.generation);
+                        if !self.ring.has_published(pass_key.generation) {
+                            self.ring.close_readers(pass_key.generation);
+                        }
+                        self.flush_pending_window_resets(core);
                     }
                 }
                 return (None, true);
@@ -2190,7 +2516,7 @@ impl Scratch {
                         }
                     }
                     match self.await_landings(layer, &opened.cold, core, prefetch, ledger, shared)
-                        && self.claim_scratch(index, set_index, window, at.point.sequence, &mut opened, core)
+                        && self.claim_scratch(index, set_index, window, at.point.sequence, &mut opened, core, shared)
                     {
                         true => RequestStage::Rounds(self.fix_rounds(at, set_index, window, opened, core, shared)),
                         false => {
@@ -2237,7 +2563,7 @@ impl Scratch {
         if window == 0 {
             self.mark_at(shared, layer, Mark::Arrived(sequence), arrived);
         }
-        Opened { routed, hits, cold, ring_slots: None }
+        Opened { routed, hits, cold, pass_key: None, ring_slots: None }
     }
 
     /// Serve a prefill scratch request on `tier_copy_dma` (Pillars A + B):
@@ -2277,13 +2603,21 @@ impl Scratch {
         let scratch_group = self.conveyor.serving.expect("a scratch request's group is served").group;
         let last = scratch_group.last();
 
-        let pass_key = PassKey { layer, set_start: set.start, window };
+        let pass_key = opened
+            .pass_key
+            .unwrap_or_else(|| self.ring.begin_or_get_generation(point.group, layer, set.start, window));
+        opened.pass_key = Some(pass_key);
 
         // Fail promptly if the step ended due to a device error.
         if shared.steps.ended(sequence) {
-            if opened.ring_slots.take().is_some() {
-                self.ring.release_pass(pass_key);
+            opened.ring_slots = None;
+            if place + 1 == set.end {
+                self.ring.finish_producer(pass_key.generation);
             }
+            if !self.ring.has_published(pass_key.generation) {
+                self.ring.close_readers(pass_key.generation);
+            }
+            self.flush_pending_window_resets(core);
             let remaining = self.tiers[index]
                 .places[place]
                 .take()
@@ -2306,7 +2640,7 @@ impl Scratch {
         let _ = self.await_landings(layer, &opened.cold, core, prefetch, ledger, shared);
         progressed |= self.convey(core, shared);
         if !self.leased(core) {
-            self.lease(core);
+            self.lease(core, shared);
             if !self.leased(core) {
                 return AsyncServe::Waiting(progressed);
             }
@@ -2318,9 +2652,14 @@ impl Scratch {
             .iter()
             .find_map(|&expert| self.tiers[index].sets[set_index].experts[expert].failure().map(str::to_owned))
         {
-            if opened.ring_slots.take().is_some() {
-                self.ring.release_pass(pass_key);
+            opened.ring_slots = None;
+            if place + 1 == set.end {
+                self.ring.finish_producer(pass_key.generation);
             }
+            if !self.ring.has_published(pass_key.generation) {
+                self.ring.close_readers(pass_key.generation);
+            }
+            self.flush_pending_window_resets(core);
             let remaining = self.tiers[index]
                 .places[place]
                 .take()
@@ -2423,7 +2762,22 @@ impl Scratch {
                 let read = tier_routed.iter().map(|&(expert, ..)| expert).collect::<Vec<_>>();
                 let set_experts = &tier.sets[set_index].experts;
                 let filled = |expert: usize| set_experts[expert].is_cold() && !set_experts[expert].is_failed();
-                let (seeds, evicted) = core.directory.seed(at.point, scratch_group, layer, &tier_routed, &read, filled);
+                // Under async `tier_copy_dma`, `Copies` runs on `NativeQueue::Transfer`
+                // without a `Compute -> Transfer` barrier against other layers'
+                // in-flight `Pass` readers: seed strictly into `Record::Free`
+                // slots that are also unpinned/unquarantined in `ExpertTransport`.
+                let (seeds, evicted) = shared.transport.with_slot_reuse(|can_reuse| {
+                    core.directory.seed_with(
+                        at.point,
+                        scratch_group,
+                        layer,
+                        &tier_routed,
+                        &read,
+                        filled,
+                        SeedMode::FreeOnly,
+                        |g, slot| can_reuse(DestSlot { group: g, slot }),
+                    )
+                });
                 for (owner, expert) in evicted {
                     self.demote(owner, expert);
                 }
@@ -2506,23 +2860,43 @@ impl Scratch {
                 core.directory.unhold_tier(l, rec);
             }
             if all_posted {
-                shared.transport.publish_prefill_sync(layer, sequence, window, None);
+                self.ring.mark_published(pass_key.generation);
+                shared
+                    .transport
+                    .publish_prefill_sync(layer, sequence, window, pass_key.generation, None);
             }
         } else {
             let copier = self.copier.as_ref().expect("tier_copy_dma holds Copies handle");
-            let sync_key = all_posted.then_some((layer, sequence, window));
+            let sync_key = all_posted.then_some((layer, sequence, window, pass_key.generation));
             match copier.copies.post_prefill(items, sync_key) {
                 Ok(ticket) => {
-                    if !held_records.is_empty() {
-                        self.prefill_held.push((ticket, held_records));
+                    // Always track the ticket on the generation (even when
+                    // `held_records` is empty, e.g. seed-only D2D batches
+                    // reading scratch) so the generation cannot retire until
+                    // `Copies` finishes reading/writing its scratch slots.
+                    self.ring.record_copy_batch(pass_key.generation, ticket, held_records);
+                    if all_posted {
+                        self.ring.mark_published(pass_key.generation);
                     }
                 }
                 Err(error) => {
+                    // Unhold only THIS unposted batch's source pins (never
+                    // handed to `Copies`); if earlier partial batches were
+                    // already posted for this generation, quarantine it!
                     for (l, rec) in held_records {
                         core.directory.unhold_tier(l, rec);
                     }
-                    if opened.ring_slots.take().is_some() {
-                        self.ring.release_pass(pass_key);
+                    opened.ring_slots = None;
+                    if self.ring.has_posted_copies(pass_key.generation) {
+                        self.ring.quarantine(pass_key.generation);
+                    } else {
+                        if place + 1 == set.end {
+                            self.ring.finish_producer(pass_key.generation);
+                        }
+                        if !self.ring.has_published(pass_key.generation) {
+                            self.ring.close_readers(pass_key.generation);
+                        }
+                        self.flush_pending_window_resets(core);
                     }
                     fail(core, shared, sequence, format!("prefill async DMA post failed: {error}"));
                     return AsyncServe::Done;
@@ -2532,6 +2906,11 @@ impl Scratch {
 
         if !all_posted {
             return AsyncServe::Waiting(true);
+        }
+
+        if place + 1 == set.end {
+            self.ring.finish_producer(pass_key.generation);
+            self.flush_pending_window_resets(core);
         }
 
         // 7. Record telemetry and answer `SCRATCH_ASK` on `ScratchTable`.
@@ -2702,7 +3081,21 @@ impl Scratch {
                 let read = tier_routed.iter().map(|&(expert, ..)| expert).collect::<Vec<_>>();
                 let set_experts = &tier.sets[set_index].experts;
                 let filled = |expert: usize| set_experts[expert].is_cold() && !set_experts[expert].is_failed();
-                let (seeds, evicted) = core.directory.seed(at.point, scratch_group, layer, &tier_routed, &read, filled);
+                // Synchronous fill/compute-queue seeding may evict unpinned
+                // `Record::Held` victims, but must still honor live transport
+                // reader pins and quarantines (`can_reuse`).
+                let (seeds, evicted) = shared.transport.with_slot_reuse(|can_reuse| {
+                    core.directory.seed_with(
+                        at.point,
+                        scratch_group,
+                        layer,
+                        &tier_routed,
+                        &read,
+                        filled,
+                        SeedMode::AllowEvict,
+                        |g, slot| can_reuse(DestSlot { group: g, slot }),
+                    )
+                });
                 for (owner, expert) in evicted {
                     self.demote(owner, expert);
                 }
@@ -3070,7 +3463,9 @@ impl Scratch {
 
 #[cfg(test)]
 mod tests {
-    use super::{Lease, PassKey, ScratchRing, compose_rounds, prefill_hit_probability};
+    use super::{
+        HostRecord, Lease, PassReaderEvent, ReaderId, ScratchRing, compose_rounds, prefill_hit_probability,
+    };
     use crate::experts::directory::{Directory, HostTier, Placement};
     use super::super::steps::ScratchGroup;
     use std::collections::HashSet;
@@ -3134,7 +3529,7 @@ mod tests {
 
         // Claiming record 0 on lender makes `holds(0, 0)` true even under an
         // empty/partial subset that does not name 0, while group 1 remains unheld.
-        directory.lease_records(0, ScratchGroup::at(1, 1), Some(&[0]), false, None);
+        directory.lease_records(0, ScratchGroup::at(1, 1), Some(&[0]), false, None, |_, _| true);
         assert!(partial.holds(0, 0, &directory));
         assert!(empty.holds(0, 0, &directory));
         assert!(!partial.holds(1, 0, &directory));
@@ -3151,29 +3546,45 @@ mod tests {
     }
 
     /// `ScratchRing` wraps around `0..capacity` without aliasing any in-flight
-    /// pass, enforces backpressure when full, releases multi-chunk pass sets
-    /// together, handles out-of-order releases safely, and resets on form change.
+    /// generation, enforces backpressure when full, releases multi-chunk pass
+    /// sets together, handles out-of-order releases safely, and resets on form
+    /// change.
     #[test]
     fn scratch_ring_wrap_around_release_and_non_aliasing() {
         let mut ring = ScratchRing::default();
         let form = [0usize, 1, 2];
-        let p0 = PassKey { layer: 0, set_start: 0, window: 0 };
-        let p1 = PassKey { layer: 1, set_start: 0, window: 0 };
-        let p2 = PassKey { layer: 2, set_start: 0, window: 0 };
-        let p3 = PassKey { layer: 3, set_start: 0, window: 0 };
+        let p0 = ring.begin_or_get_generation(1, 0, 0, 0);
+        let p1 = ring.begin_or_get_generation(1, 1, 0, 0);
+
+        let r0 = ReaderId(10);
+        let r1 = ReaderId(11);
+        let r2 = ReaderId(12);
+        let r3 = ReaderId(13);
+        let r4 = ReaderId(14);
 
         // Allocate 6 and 6 out of capacity 16 -> 12 used, 4 free.
         let s0 = ring.alloc(p0, &form, 16, 6);
         assert_eq!(s0, vec![0, 1, 2, 3, 4, 5]);
+        ring.finish_producer(p0.generation);
+        assert!(ring.register_reader(p0.generation, r0));
+        assert!(!ring.close_readers(p0.generation));
+
         let s1 = ring.alloc(p1, &form, 16, 6);
         assert_eq!(s1, vec![6, 7, 8, 9, 10, 11]);
+        ring.finish_producer(p1.generation);
+        assert!(ring.register_reader(p1.generation, r1));
+        assert!(!ring.close_readers(p1.generation));
         assert!(!ring.can_alloc(&form, 16, 8), "only 4 slots free");
 
-        // Release p0 -> 6..12 still occupied, 10 slots free -> allocate 8 wrapping around!
-        assert!(ring.release_pass(p0));
+        // Retire p0 -> 6..12 still occupied, 10 slots free -> allocate 8 wrapping around!
+        assert!(ring.retire_reader(p0.generation, r0));
         assert!(ring.can_alloc(&form, 16, 8));
+        let p2 = ring.begin_or_get_generation(1, 2, 0, 0);
         let s2 = ring.alloc(p2, &form, 16, 8);
         assert_eq!(s2, vec![12, 13, 14, 15, 0, 1, 2, 3]);
+        ring.finish_producer(p2.generation);
+        assert!(ring.register_reader(p2.generation, r2));
+        assert!(!ring.close_readers(p2.generation));
 
         // Verify zero aliasing between s1 (in flight) and s2 (wrapped around).
         let live_s1: HashSet<usize> = s1.iter().copied().collect();
@@ -3181,33 +3592,238 @@ mod tests {
             assert!(!live_s1.contains(slot), "wrapped slot {slot} aliased in-flight pass p1");
         }
 
-        // Out-of-order release of p2 must NOT advance head past unreleased p1.
-        assert!(!ring.release_pass(p2), "p1 still holds head, so used cannot drop yet");
+        // Out-of-order retirement of p2 retires its generation, but must NOT
+        // advance `head` past unreleased p1.
+        assert!(ring.retire_reader(p2.generation, r2));
+        assert!(!ring.has_live_layer(2));
         assert!(!ring.can_alloc(&form, 16, 6), "slots remain pinned until p1 releases");
 
-        // Releasing p1 drains both p1 and already-released p2 -> ring empty.
-        assert!(ring.release_pass(p1));
+        // Retiring p1 drains both p1 and already-released p2 -> ring empty.
+        assert!(ring.retire_reader(p1.generation, r1));
         assert!(ring.can_alloc(&form, 16, 16));
 
-        // Multi-chunk pass set sharing PassKey p3: both leases released together.
+        // Multi-chunk pass set sharing one generation p3: both leases released together.
+        let p3 = ring.begin_or_get_generation(1, 3, 0, 0);
+        assert_eq!(ring.begin_or_get_generation(1, 3, 0, 0), p3, "same open pass set reuses generation");
         let s3a = ring.alloc(p3, &form, 16, 5);
         let s3b = ring.alloc(p3, &form, 16, 7);
         assert_eq!(s3a, vec![0, 1, 2, 3, 4]);
         assert_eq!(s3b, vec![5, 6, 7, 8, 9, 10, 11]);
-        assert!(ring.has_in_flight_set(3, 0));
+        assert!(ring.has_live_set(3, 0));
         // Different form blocked while used > 0.
         assert!(!ring.can_alloc(&[9, 9, 9], 16, 1));
-        assert!(ring.release_pass(p3));
-        assert!(!ring.has_in_flight_set(3, 0));
+        ring.finish_producer(p3.generation);
+        assert!(ring.register_reader(p3.generation, r3));
+        assert!(!ring.close_readers(p3.generation));
+        assert!(ring.retire_reader(p3.generation, r3));
+        assert!(!ring.has_live_set(3, 0));
         assert!(ring.can_alloc(&[9, 9, 9], 8, 8));
 
-        // Zero-slot pass still tracks `has_in_flight_set` without blocking form/capacity.
-        let p4 = PassKey { layer: 4, set_start: 0, window: 0 };
+        // Zero-slot pass still tracks `has_live_set` and `has_live_layer` without
+        // blocking form/capacity until its GPU reader retires.
+        let p4 = ring.begin_or_get_generation(1, 4, 0, 0);
         assert!(ring.alloc(p4, &form, 16, 0).is_empty());
-        assert!(ring.has_in_flight_set(4, 0));
+        ring.finish_producer(p4.generation);
+        assert!(ring.register_reader(p4.generation, r4));
+        assert!(!ring.close_readers(p4.generation));
+        assert!(ring.has_live_set(4, 0));
+        assert!(ring.has_live_layer(4));
         assert!(ring.can_alloc(&[9, 9, 9], 8, 8));
-        assert!(ring.release_pass(p4));
-        assert!(!ring.has_in_flight_set(4, 0));
+        assert!(ring.retire_reader(p4.generation, r4));
+        assert!(!ring.has_live_set(4, 0));
+        assert!(!ring.has_live_layer(4));
+    }
+
+    /// Delay prior set's reader, publish next set reusing the exact same
+    /// `(layer, set_start, window)` under a new generation, cancel/retire,
+    /// then deliver stale & duplicate completions -> verify old generation
+    /// NEVER releases the new generation's slot or `WindowTable`, and
+    /// retirement happens strictly once.
+    #[test]
+    fn scratch_ring_stale_generation_and_duplicate_callback_never_release_new_slot() {
+        let mut ring = ScratchRing::default();
+        let form = [1usize; 3];
+
+        // Generation 1 at (group=1, layer=0, set_start=0, window=0): delayed reader r1.
+        let gen1 = ring.begin_or_get_generation(1, 0, 0, 0);
+        let slots1 = ring.alloc(gen1, &form, 8, 4);
+        assert_eq!(slots1, vec![0, 1, 2, 3]);
+        ring.finish_producer(gen1.generation);
+        let r1 = ReaderId(1);
+        assert!(ring.register_reader(gen1.generation, r1));
+        assert!(!ring.close_readers(gen1.generation));
+
+        // Generation 2 at the EXACT SAME (layer=0, set_start=0, window=0) in a
+        // new group (or after cancel/reuse) gets a distinct monotonic ScratchGenId.
+        let gen2 = ring.begin_or_get_generation(2, 0, 0, 0);
+        assert_ne!(gen1.generation, gen2.generation);
+        let slots2 = ring.alloc(gen2, &form, 8, 4);
+        assert_eq!(slots2, vec![4, 5, 6, 7]);
+        ring.finish_producer(gen2.generation);
+        let r2 = ReaderId(2);
+        assert!(ring.register_reader(gen2.generation, r2));
+        assert!(!ring.close_readers(gen2.generation));
+
+        // Retire gen1 cleanly.
+        assert!(ring.apply_reader_event(PassReaderEvent::Retired { key: gen1, reader: r1 }));
+        assert_eq!(ring.used, 4, "only gen1's 4 slots freed; gen2's 4 slots stay pinned");
+        assert!(ring.has_live_set(0, 0), "gen2 still keeps (layer=0, set_start=0) live");
+        assert!(ring.has_live_layer(0), "gen2 still keeps layer 0 WindowTable live");
+
+        // Deliver a stale/duplicate completion for gen1 (both with r1 and even
+        // with r2!) -> MUST be a complete no-op and NEVER release gen2!
+        assert!(!ring.apply_reader_event(PassReaderEvent::Retired { key: gen1, reader: r1 }));
+        assert!(!ring.apply_reader_event(PassReaderEvent::Retired { key: gen1, reader: r2 }));
+        assert!(!ring.apply_reader_event(PassReaderEvent::Closed { key: gen1 }));
+        assert_eq!(ring.used, 4, "stale gen1 callbacks must never touch gen2");
+        assert!(ring.has_live_set(0, 0));
+
+        // Retire gen2 strictly once; second duplicate callback is a no-op.
+        assert!(ring.apply_reader_event(PassReaderEvent::Retired { key: gen2, reader: r2 }));
+        assert_eq!(ring.used, 0);
+        assert!(!ring.has_live_set(0, 0));
+        assert!(!ring.has_live_layer(0));
+        assert!(!ring.apply_reader_event(PassReaderEvent::Retired { key: gen2, reader: r2 }));
+    }
+
+    /// Zero readers (cancel before submit): closing reader admission before
+    /// any reader registers retires the generation cleanly ONLY once the
+    /// producer has also stopped writing and all copies completed.
+    #[test]
+    fn scratch_ring_zero_readers_cancel_before_submit_retires_once_producer_stops() {
+        let mut ring = ScratchRing::default();
+        let form = [1usize; 3];
+        let gen = ring.begin_or_get_generation(1, 0, 0, 0);
+        let _slots = ring.alloc(gen, &form, 8, 3);
+        ring.record_copy_batch(gen.generation, 42, vec![(0, HostRecord(7))]);
+
+        // Cancel before GPU submit (0 readers): closes reader admission, but
+        // producer is still open AND copy ticket 42 is still in flight.
+        assert!(!ring.apply_reader_event(PassReaderEvent::Closed { key: gen }));
+        assert!(ring.has_live_layer(0));
+        assert_eq!(ring.used, 3);
+
+        // Producer stops, but copy ticket 42 is still in flight -> still live!
+        assert!(!ring.finish_producer(gen.generation));
+        assert!(ring.has_live_layer(0));
+        assert_eq!(ring.used, 3);
+
+        // Copy ticket 42 completes -> source pin returned AND generation retires!
+        let (released, err, progressed) = ring.settle_copies(|t| Ok(t == 42));
+        assert!(err.is_none());
+        assert!(progressed);
+        assert_eq!(released, vec![(0, HostRecord(7))]);
+        assert!(!ring.has_live_layer(0));
+        assert_eq!(ring.used, 0);
+    }
+
+    /// Multiple `Pass`es reading the same generation: generation retires ONLY
+    /// once reader admission is closed AND EVERY registered reader retires;
+    /// closing admission rejects any subsequent reader registration.
+    #[test]
+    fn scratch_ring_multiple_readers_and_closed_admission_rejects_late_reader() {
+        let mut ring = ScratchRing::default();
+        let form = [1usize; 3];
+        let gen = ring.begin_or_get_generation(1, 2, 0, 0);
+        let _slots = ring.alloc(gen, &form, 8, 4);
+        ring.finish_producer(gen.generation);
+
+        let r1 = ReaderId(1);
+        let r2 = ReaderId(2);
+        let r_late = ReaderId(3);
+        assert!(ring.register_reader(gen.generation, r1));
+        assert!(ring.register_reader(gen.generation, r2));
+
+        // Even if r1 retires before admission closes, generation stays live.
+        assert!(!ring.retire_reader(gen.generation, r1));
+        assert!(ring.has_live_layer(2));
+
+        // Close reader admission BEFORE checking last reader -> late reader
+        // registration is rejected, and r2 still pins the generation.
+        assert!(!ring.close_readers(gen.generation));
+        assert!(!ring.register_reader(gen.generation, r_late), "closed admission rejects new readers");
+        assert!(ring.has_live_layer(2));
+        assert_eq!(ring.used, 4);
+
+        // Retiring last reader r2 retires the generation exactly once.
+        assert!(ring.retire_reader(gen.generation, r2));
+        assert!(!ring.has_live_layer(2));
+        assert_eq!(ring.used, 0);
+    }
+
+    /// Seed-only D2D copy batch (0 `HostRecord`s, reading scratch on `Copies`):
+    /// even if all GPU `Pass` readers have already retired, the generation MUST
+    /// stay live until the seed-copy `Copies` ticket completes.
+    #[test]
+    fn scratch_ring_seed_only_copy_batch_blocks_retirement_until_copies_complete() {
+        let mut ring = ScratchRing::default();
+        let form = [1usize; 3];
+        let gen = ring.begin_or_get_generation(1, 0, 0, 0);
+        let _slots = ring.alloc(gen, &form, 8, 2);
+        // Seed-only batch: empty HostRecord pin list, reading ScratchRing -> Bank.
+        ring.record_copy_batch(gen.generation, 99, Vec::new());
+        ring.finish_producer(gen.generation);
+
+        let r1 = ReaderId(1);
+        assert!(ring.register_reader(gen.generation, r1));
+        assert!(!ring.close_readers(gen.generation));
+        // GPU Pass reader finishes first, but seed copy ticket 99 is still in flight!
+        assert!(!ring.retire_reader(gen.generation, r1));
+        assert!(ring.has_live_layer(0));
+        assert_eq!(ring.used, 2);
+
+        // Once seed copy ticket 99 completes on Copies, generation retires!
+        let (released, err, progressed) = ring.settle_copies(|t| Ok(t == 99));
+        assert!(released.is_empty());
+        assert!(err.is_none());
+        assert!(progressed);
+        assert!(!ring.has_live_layer(0));
+        assert_eq!(ring.used, 0);
+    }
+
+    /// Queue-wide copy fault and post-submit GPU registration/wait fault BOTH
+    /// quarantine the generation so its `ScratchRing` slots, `WindowTable`, and
+    /// `HostRecord` source pins are NEVER prematurely freed.
+    #[test]
+    fn scratch_ring_queue_fault_and_registration_fault_quarantine_slots_and_pins() {
+        let mut ring = ScratchRing::default();
+        let form = [1usize; 3];
+
+        // Case 1: Queue-wide fault on an in-flight `Copies` batch.
+        let gen_copy_fault = ring.begin_or_get_generation(1, 0, 0, 0);
+        let _s0 = ring.alloc(gen_copy_fault, &form, 8, 3);
+        ring.record_copy_batch(gen_copy_fault.generation, 7, vec![(0, HostRecord(11))]);
+        ring.finish_producer(gen_copy_fault.generation);
+        let r0 = ReaderId(1);
+        assert!(ring.register_reader(gen_copy_fault.generation, r0));
+        assert!(!ring.close_readers(gen_copy_fault.generation));
+
+        let (released, err, progressed) = ring.settle_copies(|_| Err("queue fault".into()));
+        assert!(released.is_empty(), "faulted batch must NOT unhold HostRecord source pins");
+        assert!(err.is_some());
+        assert!(progressed);
+        assert!(ring.has_quarantined());
+        assert!(ring.has_live_layer(0), "quarantined layer WindowTable stays pinned");
+        assert_eq!(ring.used, 3, "quarantined ScratchRing slots stay withheld");
+        // Even if the GPU reader later reports retired, quarantine is sticky!
+        assert!(!ring.retire_reader(gen_copy_fault.generation, r0));
+        assert!(ring.has_live_layer(0));
+        assert_eq!(ring.used, 3);
+
+        // Case 2: Accepted GPU submission whose completion registration/wait fails.
+        let gen_gpu_fault = ring.begin_or_get_generation(1, 1, 0, 0);
+        let _s1 = ring.alloc(gen_gpu_fault, &form, 8, 2);
+        ring.finish_producer(gen_gpu_fault.generation);
+        assert!(!ring.apply_reader_event(PassReaderEvent::Quarantined { key: gen_gpu_fault }));
+        assert!(ring.has_quarantined());
+        assert!(ring.has_live_layer(1));
+        assert_eq!(ring.used, 5, "both quarantined generations stay withheld");
+        // Closing group admission on `clear_past` must NOT un-quarantine them!
+        assert!(!ring.close_group_admission(1));
+        assert!(!ring.has_unretired_non_quarantined());
+        assert!(ring.has_live_layer(0));
+        assert!(ring.has_live_layer(1));
+        assert_eq!(ring.used, 5);
     }
 
     /// Derived Pillar C hit probability `1 - ((E - K) / E)^M`.
