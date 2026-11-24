@@ -718,12 +718,23 @@ inline void segment_tall(thread const In &in, thread const Out &out, thread cons
     uint segment = 0u, local = (TILE);                                                                          \
     PROJECTION_EACH_SEGMENT(PROJECTION_SEGMENT_FOUND, PER)
 // The same over tiles of PER features of a single weight, a pair's tile
-// taking half (it covers both weights' features).
-#define PROJECTION_SEGMENT_FOUND_TILES(s, PER)                                                                  \
-    PROJECTION_SEGMENT_FOUND(s, (PROJECTION_PAIRED(s) ? (PER) / 2u : (PER)))
-#define PROJECTION_SEGMENT_FIND_TILES(TILE, PER)                                                                \
+// taking half (it covers both weights' features), optionally skipping segments
+// where SKIP(s) holds.
+#define PROJECTION_SEGMENT_FOUND_TILES_UNSKIPPED(s, PER, SKIP)                                                  \
+    if (segment == s##u) {                                                                                      \
+        const uint tiles = (SKIP(s)) ? 0u                                                                       \
+            : (uint(PROJECTION_N##s) + (PROJECTION_PAIRED(s) ? (PER) / 2u : (PER)) - 1u)                        \
+                / (PROJECTION_PAIRED(s) ? (PER) / 2u : (PER));                                                  \
+        if (local >= tiles) {                                                                                   \
+            local -= tiles;                                                                                     \
+            segment = s##u + 1u;                                                                                \
+        }                                                                                                       \
+    }
+#define PROJECTION_SEGMENT_FIND_TILES_UNSKIPPED(TILE, PER, SKIP)                                                \
     uint segment = 0u, local = (TILE);                                                                          \
-    PROJECTION_EACH_SEGMENT(PROJECTION_SEGMENT_FOUND_TILES, PER)
+    PROJECTION_EACH_SEGMENT(PROJECTION_SEGMENT_FOUND_TILES_UNSKIPPED, PER, SKIP)
+#define PROJECTION_SEGMENT_FIND_TILES(TILE, PER)                                                                \
+    PROJECTION_SEGMENT_FIND_TILES_UNSKIPPED(TILE, PER, PROJECTION_NONE)
 
 // A zeroed segment's threadgroup stores zeros over its rows ROW0 .. ROW0 +
 // ROWS and its PER columns, THREADS threads, and returns.
@@ -808,7 +819,7 @@ inline void segment_tall(thread const In &in, thread const Out &out, thread cons
 #define PROJECTION_SEGMENTED_TILES(TM, TN, THREADS, SKIP)                                                       \
     PROJECTION_GEMM_SHARED(shared, TM, TN);                                                                     \
     PROJECTION_OPERANDS;                                                                                        \
-    PROJECTION_SEGMENT_FIND_TILES(tile.x, TN);                                                              \
+    PROJECTION_SEGMENT_FIND_TILES_UNSKIPPED(tile.x, TN, SKIP);                                                  \
     PROJECTION_SEGMENTED_ZEROS(tile.y * (TM), TM, TN, THREADS);                                                 \
     PROJECTION_SEGMENT_CHAIN                                                                                    \
     PROJECTION_EACH_SEGMENT(PROJECTION_SEGMENT_TILES, TM, TN, SKIP)
@@ -916,19 +927,22 @@ inline void segment_tall(thread const In &in, thread const Out &out, thread cons
     PROJECTION_SEGMENTED_PACK_CLASS(classes::c_bytes, classes::slot_bytes)
 
 #define PROJECTION_SEGMENT_COEFFICIENTS(s, ...)                                                                 \
-    if (row < uint(PROJECTION_N##s)) {                                                                          \
-        if constexpr (PROJECTION_SERVED(s))                                                                     \
-            projection::packing_coefficients(w##s, PROJECTION_SEGMENT_SCRATCH_AT(s, 0u, 1u, 0u),                \
-                uint(PROJECTION_N##s), k, row, lane);                                                           \
-        return;                                                                                                 \
-    }                                                                                                           \
-    row -= uint(PROJECTION_N##s);
+    if constexpr (PROJECTION_SERVED(s)) {                                                                       \
+        constexpr uint tiles = uint(PROJECTION_N##s) / 32u;                                                     \
+        if (tile < tiles) {                                                                                     \
+            projection::packing_tile_coefficients(w##s, PROJECTION_SEGMENT_SCRATCH_AT(s, 0u, 1u, 0u),           \
+                k, tile, peaks, thread_index, sg, lane);                                                        \
+            return;                                                                                             \
+        }                                                                                                       \
+        tile -= tiles;                                                                                          \
+    }
 
-// One weight row of the segments' in turn a threadgroup.
+// One 32-row weight tile of the served segments in turn per threadgroup.
 #define PROJECTION_SEGMENTED_PACK_COEFFICIENTS                                                                  \
     PROJECTION_PACKING_ADMITTED;                                                                                \
+    threadgroup float peaks[8];                                                                                 \
     PROJECTION_OPERANDS;                                                                                        \
-    uint row = index;                                                                                           \
+    uint tile = index;                                                                                          \
     PROJECTION_EACH_SEGMENT(PROJECTION_SEGMENT_COEFFICIENTS, )
 
 #define PROJECTION_SEGMENT_PACKED(s, ...)                                                                       \
@@ -936,8 +950,8 @@ inline void segment_tall(thread const In &in, thread const Out &out, thread cons
             classes::template of<PROJECTION_PACKET(s)>::residue, PACK_TOKENS, WEIGHTS_AHEAD>(                   \
             out##s, w##s,                                                                                       \
             PROJECTION_SEGMENT_SCRATCH_AT(s, classes::template of<PROJECTION_PACKET(s)>::slot, factor_mult, padded), \
-            PROJECTION_ZEROED(s) ? 0u : m, padded, uint(PROJECTION_N##s), k, group,                             \
-            projection::packing_simdgroups, sg, lane))                                                          \
+            m, padded, uint(PROJECTION_N##s), k, group,                                                         \
+            projection::packing_simdgroups, sg, lane, PROJECTION_ZEROED(s)))                                    \
         return;
 
 #define PROJECTION_SEGMENTED_PACKED                                                                             \
@@ -999,15 +1013,15 @@ struct PartPartial {
             projection::PartPartial{sums.y, sums.row, sums.column + PROJECTION_FIRST_##s}, w##s, m,             \
             uint(PROJECTION_N##s), width, local, shared, simdgroups, sg, lane, part * (width / 32u)));
 
-#define PROJECTION_SEGMENT_PART_COMBINE(s, ...)                                                                 \
+#define PROJECTION_SEGMENT_PART_COMBINE(s, COUNT)                                                               \
     else if (segment == s##u) {                                                                                 \
         const uint column0 = local * per;                                                                       \
         const uint count = metal::min(per, uint(PROJECTION_N##s) - column0);                                    \
         for (uint item = thread_index; item < m * count; item += threads) {                                     \
             const uint row = item / count, column = column0 + item % count;                                     \
             float sum = 0.0f;                                                                                   \
-            for (uint p = 0; p < parts; ++p)                                                                    \
-                sum += partials[(ulong(row) * parts + p) * outputs + PROJECTION_FIRST_##s + column];            \
+            for (uint p = 0; p < (COUNT); ++p)                                                                  \
+                sum += partials[(ulong(row) * (COUNT) + p) * outputs + PROJECTION_FIRST_##s + column];          \
             out##s.store(row, column, sum);                                                                     \
         }                                                                                                       \
     }
@@ -1030,32 +1044,39 @@ struct PartPartial {
     if (!arrive::last(arrivals + row_tile, parts, &last, thread_index))                                         \
         return;                                                                                                 \
     PROJECTION_SEGMENT_CHAIN                                                                                    \
-    PROJECTION_EACH_SEGMENT(PROJECTION_SEGMENT_PART_COMBINE, )
+    PROJECTION_EACH_SEGMENT(PROJECTION_SEGMENT_PART_COMBINE, parts)
 
 #define PROJECTION_SEGMENT_PART_BATCH(s, ...)                                                                   \
     else if (segment == s##u)                                                                                   \
         projection::gemv_batch_runtime<PROJECTION_PACKET(s), BATCH_ROWS>(x,                                     \
             projection::PartPartial{sums.y, sums.row, sums.column + PROJECTION_FIRST_##s}, w##s, m,             \
-            uint(PROJECTION_N##s), width, local, shared, simdgroups, sg, lane, part * (width / 32u));
+            uint(PROJECTION_N##s), sub_width, local, shared, simdgroups, sg, lane,                              \
+            part * part_packets + pkt_begin, pkt_begin * 32u);
 
-#define PROJECTION_SEGMENTED_PARTS_BATCH                                                                        \
+#define PROJECTION_SEGMENTED_PARTS_BATCH(SPLIT)                                                                 \
     PROJECTION_OPERANDS;                                                                                        \
     const uint parts = uint(PROJECTION_PARTS), width = k / parts;                                               \
+    const uint split = (SPLIT), total_parts = parts * split;                                                    \
     const uint per = 8u * simdgroups * BATCH_ROWS;                                                              \
     const uint outputs = 0u PROJECTION_EACH_SEGMENT(PROJECTION_ADD_ROWS, );                                     \
     const uint tiles = 0u PROJECTION_EACH_SEGMENT(PROJECTION_ADD_TILES, per);                                   \
-    const uint part = position.x / tiles, row_tile = position.x % tiles;                                        \
-    PROJECTION_PART_INPUT(x, part, row_tile == 0u);                                                             \
-    const projection::PartPartial sums{partials, ulong(parts) * outputs, ulong(part) * outputs};                \
+    const uint global_part = position.x / tiles, row_tile = position.x % tiles;                                 \
+    const uint part = global_part / split, k_split = global_part % split;                                       \
+    const uint part_packets = width / 32u;                                                                      \
+    const uint pkt_begin = k_split * part_packets / split;                                                      \
+    const uint pkt_end = (k_split + 1u) * part_packets / split;                                                 \
+    const uint sub_width = (k_split + 1u == split) ? (width - pkt_begin * 32u) : ((pkt_end - pkt_begin) * 32u); \
+    PROJECTION_PART_INPUT(x, part, row_tile == 0u && k_split == 0u);                                            \
+    const projection::PartPartial sums{partials, ulong(total_parts) * outputs, ulong(global_part) * outputs};   \
     PROJECTION_SEGMENT_FIND(row_tile, per);                                                                     \
     PROJECTION_SEGMENT_CHAIN                                                                                    \
     PROJECTION_EACH_SEGMENT(PROJECTION_SEGMENT_PART_BATCH, )                                                    \
     threadgroup uint last;                                                                                      \
     const uint thread_index = sg * 32u + lane, threads = simdgroups * 32u;                                      \
-    if (!arrive::last(arrivals + row_tile, parts, &last, thread_index))                                         \
+    if (!arrive::last(arrivals + row_tile, total_parts, &last, thread_index))                                   \
         return;                                                                                                 \
     PROJECTION_SEGMENT_CHAIN                                                                                    \
-    PROJECTION_EACH_SEGMENT(PROJECTION_SEGMENT_PART_COMBINE, )
+    PROJECTION_EACH_SEGMENT(PROJECTION_SEGMENT_PART_COMBINE, total_parts)
 
 // Split-K GEMM and reduction for parted segmented projections (`stream_mix_down`,
 // SERVED == 1).
@@ -1586,8 +1607,8 @@ inline void ordered_gemv_run(thread const In &in, thread const Out &out, thread 
     }
 }
 
-// Row-specialized reference-order GEMV (`MAXM` in {1, 2, 4, 8}) for mixed
-// ordered/unordered segmented launches (`ordered_gemv1..8`): each of the four
+// Row-specialized reference-order GEMV (`MAXM` in {1, 2, 4, 8, 16}) for mixed
+// ordered/unordered segmented launches (`ordered_gemv1..16`): each of the four
 // 8-lane quarters of a simdgroup owns a distinct weight row (`W_PER_SG == 4`),
 // fetches and decodes its weights once per 64-column block, and reuses them
 // across all `m <= MAXM` activation rows, reading lane-strided `uint4` staged
@@ -2325,7 +2346,7 @@ inline void ordered_gemm_run(thread const In &in, thread const Out &out, thread 
                 projection::unordered_from_ordered_maxm_run<PROJECTION_PACKET(s), PROJECTION_PARTNER_PACKET(s), \
                     PROJECTION_PAIRED(s), ROWS, (MAXM), LANES, PROJECTION_SEGMENT_NVFP4(s), simdgroups>(        \
                     input_##s, out##s, w##s, PROJECTION_PARTNER(s), m, uint(PROJECTION_N##s), k, local, shared, \
-                    sg, lane);                                                                                  \
+                    ordered_inv_smem, ordered_globals_smem, sg, lane);                                          \
             }                                                                                                   \
             return;                                                                                             \
         }                                                                                                       \
@@ -2344,8 +2365,12 @@ inline void ordered_gemm_run(thread const In &in, thread const Out &out, thread 
     PROJECTION_ORDERED_EPILOGUE(ordered_tiles)
 
 #define PROJECTION_SEGMENTED_ORDERED_GEMV_MIXED(MAXM)                                                           \
-    constexpr uint ord_per = projection::ordered_mixed_rows<(MAXM), simdgroups>();                                                                   \
-    constexpr uint unord_per = simdgroups * ROWS * (32u / LANES);                                               \
+    constexpr uint ord_per = projection::ordered_mixed_rows<(MAXM), simdgroups>();                              \
+    constexpr uint unord_per = ((MAXM) > SEISMIC_CONST_PROJECTION_GEMV_MAX_M)                                   \
+        ? (simdgroups * 8u)                                                                                     \
+        : (simdgroups * ROWS * (32u / LANES));                                                                  \
+    threadgroup float ordered_inv_smem[(MAXM)];                                                                 \
+    threadgroup float ordered_globals_smem[(MAXM)];                                                             \
     PROJECTION_OPERANDS;                                                                                        \
     const uint ordered_tiles = 0u PROJECTION_EACH_SEGMENT(PROJECTION_ORDERED_ADD_TILES, ord_per);               \
     uint segment = 0u, local = position.x;                                                                      \

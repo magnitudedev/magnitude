@@ -10,8 +10,10 @@ namespace routed {
 
 // The product packets a simdgroup of the decode down projections stages at
 // once (`project_channels`), of SIMDGROUPS side by side, at LANES lanes over
-// a row of COLUMN_PACKETS: its share of 16 KB of threadgroup memory, at most
-// the row, or none. Below 16 lanes always: several lane groups share each
+// a row of COLUMN_PACKETS: its share of 16 KB of threadgroup memory, capped at
+// 64 packets (so a 16-lane chunk holds at most 4 packets per lane and ROWS=2
+// stays within the 8-packet register budget even when SIMDGROUPS <= 3), at
+// most the row, or none. Below 16 lanes always: several lane groups share each
 // packet and a lane would hold several. At 32 lanes never: one lane group
 // reads each packet once, straight into registers. At 16 lanes, where both
 // lane groups read the whole row, only where AT_16 (`routed_down`, the one
@@ -27,8 +29,9 @@ namespace routed {
 template <uint SIMDGROUPS, uint LANES, uint COLUMN_PACKETS, bool AT_16>
 constexpr uint stage_packets() {
     constexpr uint SHARE = (uint(SEISMIC_DEVICE_SHARED_BYTES_PER_GROUP) / 2u) / (SIMDGROUPS * 64u);
+    constexpr uint CAP = SHARE < 64u ? SHARE : 64u;
     constexpr bool STAGED = LANES < 16u || (AT_16 && LANES == 16u && (COLUMN_PACKETS + 15u) / 16u > 2u);
-    return !STAGED ? 0u : COLUMN_PACKETS < SHARE ? COLUMN_PACKETS : SHARE;
+    return !STAGED ? 0u : COLUMN_PACKETS < CAP ? COLUMN_PACKETS : CAP;
 }
 
 // A simdgroup's region of threadgroup memory, in floats: its stage of STAGE
@@ -252,13 +255,15 @@ inline void project_channels_step(thread const In &in, thread const typename W::
     }
 }
 
-// Threadgroup-staged activation rows for `project_channels_step`: row `m`
-// begins at `m * STRIDE_WORDS` `uint4` words (8 activation values per word).
-template <uint STRIDE_WORDS>
+// Threadgroup-staged activation rows for `project_channels_step`: rows, then
+// steps, with packets innermost (matching `projection::gemv_word`), so lanes
+// of a group owning consecutive packets read consecutive `uint4` words with
+// zero threadgroup bank conflicts.
+template <uint STAGE_PKTS>
 struct StagedRows {
     threadgroup const uint4 *staged;
     inline uint4 words8(uint m, uint col) const {
-        return staged[m * STRIDE_WORDS + (col >> 3)];
+        return staged[(m * 4u + ((col >> 3) & 3u)) * STAGE_PKTS + (col >> 5)];
     }
 };
 
@@ -309,14 +314,29 @@ inline void project_channels_slice(thread const In &in, thread const projection:
 // stays staged.
 constexpr constant uint GATHERED_SUMMED_SIMDGROUPS = 4u;
 
-template <uint LANES, bool ONE = false>
+template <uint LANES, bool ONE = false, bool MATRIX = false>
 struct GatheredSummedShared {
     static constexpr uint stage_pkts() { return LANES >= 8u ? LANES : 8u; }
-    static constexpr uint stage_rows() { return ONE ? 1u : 4u; }
-    uint4 staged[stage_rows() * 4u * stage_pkts()];
+    // Cap staged activations at 8 KB (128 packet rows) so occupancy stays high:
+    // 16 rows (all of VERIFY_ROWS in one pass) at LANES <= 8, 8 rows at LANES == 16.
+    static constexpr uint stage_rows() {
+        constexpr uint by_budget = 128u / stage_pkts();
+        return ONE ? 1u : (by_budget < SEISMIC_CONST_VERIFY_ROWS ? by_budget : SEISMIC_CONST_VERIFY_ROWS);
+    }
+    uint4 staged[MATRIX ? 1u : (stage_rows() * 4u * stage_pkts())];
     uint products[ONE ? 1u : SEISMIC_CONST_VERIFY_ROWS];
     ulong offsets[ONE ? 1u : SEISMIC_CONST_VERIFY_ROWS];
 };
+
+// Maximum rows projected per weight pass in gathered summed projections:
+// bounded by the staged activation buffer and by <= 32 accumulators per lane
+// (`acc[ROWS][MAXM]`) so wider ROWS tiles do not spill registers.
+template <uint ROWS, uint LANES>
+constexpr uint gathered_summed_chunk() {
+    constexpr uint by_shared = GatheredSummedShared<LANES, false>::stage_rows();
+    constexpr uint by_regs = ROWS <= 2u ? SEISMIC_CONST_VERIFY_ROWS : (ROWS <= 4u ? 8u : 4u);
+    return by_shared < by_regs ? by_shared : by_regs;
+}
 
 // Batched decode down projection of `m_rows` (<= MAXM) rows against one weight
 // matrix `w` in a single weight pass, with all `GATHERED_SUMMED_SIMDGROUPS`
@@ -332,7 +352,6 @@ inline void project_channels_published(thread const In &raw, thread const projec
     constexpr uint G = 32u / LANES;
     constexpr uint COLUMN_PACKETS = (COLUMNS + 31u) / 32u;
     constexpr uint STAGE_PKTS = GatheredSummedShared<LANES>::stage_pkts();
-    constexpr uint ROW_WORDS = 4u * STAGE_PKTS;
     constexpr uint THREADS = 32u * GATHERED_SUMMED_SIMDGROUPS;
     const uint P = min(COLUMN_PACKETS, (extent + 31u) / 32u);
     const uint g = lane / LANES, sub = lane % LANES;
@@ -349,7 +368,7 @@ inline void project_channels_published(thread const In &raw, thread const projec
         for (uint m = 0; m < MAXM; ++m)
             acc[r][m] = 0.0f;
     }
-    const StagedRows<ROW_WORDS> staged_in{staged};
+    const StagedRows<STAGE_PKTS> staged_in{staged};
     for (uint base = 0; base < P; base += STAGE_PKTS) {
         const uint count = min(STAGE_PKTS, P - base);
         if (base > 0u)
@@ -359,7 +378,9 @@ inline void project_channels_published(thread const In &raw, thread const projec
         for (uint idx = tid; idx < total_words; idx += THREADS) {
             const uint m = idx / words_per_row;
             const uint word = idx - m * words_per_row;
-            staged[m * ROW_WORDS + word] = in.words8(m, 32u * base + 8u * word);
+            const uint p = word >> 2;
+            const uint step = word & 3u;
+            staged[(m * 4u + step) * STAGE_PKTS + p] = in.words8(m, 32u * base + 8u * word);
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
         if (active_sg)
@@ -381,17 +402,51 @@ inline void project_channels_published(thread const In &raw, thread const projec
     }
 }
 
+// Dispatch one gathered chunk (`<= gathered_summed_chunk<ROWS, LANES>()`) to
+// the tightest power-of-two `MAXM` instantiation (`2, 4, 8, ...`).
+template <typename W, uint ROWS, uint LANES, uint COLUMNS, uint H, bool NVFP4, typename In, typename Published>
+inline void project_channels_published_chunk(thread const In &raw, thread const projection::Weights<W> &w, uint chunk,
+    threadgroup const uint *published_rows, uint first, uint rows, uint extent, threadgroup uint4 *staged,
+    Published published, uint tid, uint lane) {
+    constexpr uint MAX_CHUNK = gathered_summed_chunk<ROWS, LANES>();
+    if (chunk <= 2u) {
+        project_channels_published<W, ROWS, LANES, 2u, COLUMNS, H, NVFP4>(
+            raw, w, chunk, published_rows, first, rows, extent, staged, published, tid, lane);
+    } else if (chunk <= 4u) {
+        project_channels_published<W, ROWS, LANES, 4u, COLUMNS, H, NVFP4>(
+            raw, w, chunk, published_rows, first, rows, extent, staged, published, tid, lane);
+    } else if constexpr (MAX_CHUNK > 4u) {
+        if (chunk <= 8u) {
+            project_channels_published<W, ROWS, LANES, 8u, COLUMNS, H, NVFP4>(
+                raw, w, chunk, published_rows, first, rows, extent, staged, published, tid, lane);
+        } else if constexpr (MAX_CHUNK > 8u) {
+            project_channels_published<W, ROWS, LANES, MAX_CHUNK, COLUMNS, H, NVFP4>(
+                raw, w, chunk, published_rows, first, rows, extent, staged, published, tid, lane);
+        }
+    }
+}
+
+template <uint H, typename Published>
+struct PublishedOut {
+    Published published;
+    threadgroup const uint *products;
+    void store(uint m, uint n, float v) const {
+        if (n < H)
+            publish_channel<H>(published, products[m], n, v);
+    }
+};
+
 // Gathered routed expert down projection: all `GATHERED_SUMMED_SIMDGROUPS`
 // simdgroups cooperatively unpack compact worklist entry `entry` into `tg` and
 // project every choice of it in one weight pass over this simdgroup's channel
 // slice `[first, first + TILE)`, publishing each choice's slot directly into
 // `published`.
 template <typename W, uint ROWS, uint LANES, uint SLOTS, uint COLUMNS, uint H, bool NVFP4, bool ONE = false,
-    typename Published>
+    bool MATRIX = false, typename Published>
 inline void project_gathered_expert(device const uchar *product, ulong p0, ulong p1, ulong p2,
     device const WorkEntry &entry, device const ulong *expert_down, device const ulong *tier_down,
-    packets::Rows16 layout, uint first, uint tid, uint lane, threadgroup GatheredSummedShared<LANES, ONE> &tg,
-    Published published) {
+    packets::Rows16 layout, uint first, uint tile, uint tid, uint sg, uint lane,
+    threadgroup GatheredSummedShared<LANES, ONE, MATRIX> &tg, threadgroup uchar *shared, Published published) {
     constexpr uint TILE = (32u / LANES) * ROWS;
     const uint m_rows = ONE ? 1u : entry.count;
     const slab::Source source{entry.source};
@@ -416,15 +471,22 @@ inline void project_gathered_expert(device const uchar *product, ulong p0, ulong
         const GatheredProduct in{product, tg.offsets, p2, COLUMNS, aligned};
         project_channels_published<W, ROWS, LANES, 1u, COLUMNS, H, NVFP4>(
             in, down, 1u, tg.products, first, H, COLUMNS, tg.staged, published, tid, lane);
+    } else if constexpr (MATRIX) {
+        constexpr uint MATRIX_R = (TILE == 16u) ? 2u : 1u;
+        const GatheredProduct in{product, tg.offsets, p2, COLUMNS, aligned};
+        const auto x = lone_operands<NVFP4, SEISMIC_CONST_VERIFY_ROWS>::form(in, m_rows, COLUMNS, lane);
+        const PublishedOut<H, Published> out{published, tg.products};
+        projection::gemv_batch_runtime<W, MATRIX_R>(x, out, down, m_rows, H, COLUMNS, tile, shared,
+            GATHERED_SUMMED_SIMDGROUPS, sg, lane);
     } else {
-        for (uint base = 0u; base < m_rows; base += 4u) {
-            const uint chunk = min(4u, m_rows - base);
+        constexpr uint CHUNK = gathered_summed_chunk<ROWS, LANES>();
+        for (uint base = 0u; base < m_rows; base += CHUNK) {
+            const uint chunk = min(CHUNK, m_rows - base);
             if (base > 0u)
                 threadgroup_barrier(mem_flags::mem_threadgroup);
             const GatheredProduct in{product, tg.offsets + base, p2, COLUMNS, aligned};
-            PROJECTION_FOR_ROWS_24(chunk,
-                (project_channels_published<W, ROWS, LANES, MAXM, COLUMNS, H, NVFP4>(
-                    in, down, chunk, tg.products + base, first, H, COLUMNS, tg.staged, published, tid, lane)));
+            project_channels_published_chunk<W, ROWS, LANES, COLUMNS, H, NVFP4>(
+                in, down, chunk, tg.products + base, first, H, COLUMNS, tg.staged, published, tid, lane);
         }
     }
 }

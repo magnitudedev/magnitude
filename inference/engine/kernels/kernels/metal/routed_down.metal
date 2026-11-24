@@ -121,19 +121,19 @@ struct ArrivedProjections4 {
 // rows and split the tile's `4 * TILE` channels for unique expert `u`; the last
 // of the tile's `worklist->count` threadgroups to arrive sums the tile's
 // channels of every row.
-#define ROUTED_DOWN_GATHERED_BODY(ONE)                                                                            \
+#define ROUTED_DOWN_GATHERED_BODY(ONE, MATRIX, SHARED)                                                            \
     constexpr uint TILE = routed::down_tile<ROWS, LANES>();                                                       \
     constexpr uint SLOTS = uint(SEISMIC_DIM_K);                                                                   \
     constexpr uint SG_COUNT = routed::GATHERED_SUMMED_SIMDGROUPS;                                                 \
     constexpr uint GROUP_TILE = SG_COUNT * TILE;                                                                  \
     constexpr uint H = uint(SEISMIC_DIM_H);                                                                       \
     constexpr uint QUADS = (GROUP_TILE + 3u) / 4u;                                                                \
-    threadgroup routed::GatheredSummedShared<LANES, ONE> tg;                                                      \
+    threadgroup routed::GatheredSummedShared<LANES, ONE, MATRIX> tg;                                              \
     threadgroup uint last;                                                                                        \
     const uint first = group.x * GROUP_TILE;                                                                      \
     const element::Out<ELEMENT_OF(SEISMIC_RESULT_0)> value(value_cells);                                          \
-    routed::down_project_gathered<ROWS, LANES, ONE>(product, worklist, expert_down, tier_down, group.y, first,    \
-        tid, sg, lane, tg, published, seismic_words);                                                             \
+    routed::down_project_gathered<ROWS, LANES, ONE, MATRIX>(product, worklist, expert_down, tier_down, group.x,   \
+        group.y, first, tid, sg, lane, tg, SHARED, published, seismic_words);                                     \
     if (!arrive::last(arrivals + group.x, worklist->count, &last, tid))                                           \
         return;                                                                                                   \
     for (uint item = tid; item < uint(SEISMIC_DIM_M) * QUADS; item += 32u * SG_COUNT) {                           \
@@ -194,13 +194,13 @@ kernel void routed_down_gather(
 #ifdef SEISMIC_FORMING_ROUTED_DOWN_GATHERED_ONE
 template <uint ROWS, uint LANES>
 kernel void routed_down_gathered_one(ROUTED_DOWN_GATHERED_PORTS) {
-    ROUTED_DOWN_GATHERED_BODY(true)
+    ROUTED_DOWN_GATHERED_BODY(true, false, nullptr)
 }
 #endif
 #ifdef SEISMIC_FORMING_ROUTED_DOWN_GATHERED_ONE_WHOLE
 template <uint ROWS, uint LANES>
 kernel void routed_down_gathered_one_whole(ROUTED_DOWN_GATHERED_PORTS) {
-    ROUTED_DOWN_GATHERED_BODY(true)
+    ROUTED_DOWN_GATHERED_BODY(true, false, nullptr)
 }
 #endif
 #ifdef SEISMIC_FORMING_ROUTED_DOWN_GATHERED_ONE_RESIDENT
@@ -208,26 +208,29 @@ kernel void routed_down_gathered_one_whole(ROUTED_DOWN_GATHERED_PORTS) {
 // plain loads.
 template <uint ROWS, uint LANES>
 kernel void routed_down_gathered_one_resident(ROUTED_DOWN_GATHERED_PORTS) {
-    ROUTED_DOWN_GATHERED_BODY(true)
+    ROUTED_DOWN_GATHERED_BODY(true, false, nullptr)
 }
 #endif
 #ifdef SEISMIC_FORMING_ROUTED_DOWN_GATHERED
-template <uint ROWS, uint LANES>
-kernel void routed_down_gathered(ROUTED_DOWN_GATHERED_PORTS) {
-    ROUTED_DOWN_GATHERED_BODY(false)
+template <uint ROWS, uint LANES, uint MATRIX>
+kernel void routed_down_gathered(ROUTED_DOWN_GATHERED_PORTS,
+    threadgroup uchar *shared [[threadgroup(0)]]) {
+    ROUTED_DOWN_GATHERED_BODY(false, (MATRIX != 0), shared)
 }
 #endif
 #ifdef SEISMIC_FORMING_ROUTED_DOWN_GATHERED_WHOLE
-template <uint ROWS, uint LANES>
-kernel void routed_down_gathered_whole(ROUTED_DOWN_GATHERED_PORTS) {
-    ROUTED_DOWN_GATHERED_BODY(false)
+template <uint ROWS, uint LANES, uint MATRIX>
+kernel void routed_down_gathered_whole(ROUTED_DOWN_GATHERED_PORTS,
+    threadgroup uchar *shared [[threadgroup(0)]]) {
+    ROUTED_DOWN_GATHERED_BODY(false, (MATRIX != 0), shared)
 }
 #endif
 #ifdef SEISMIC_FORMING_ROUTED_DOWN_GATHERED_RESIDENT
 // A resident layer's (XS 0), as the whole layer's: its records read with
 // plain loads.
-template <uint ROWS, uint LANES>
-kernel void routed_down_gathered_resident(ROUTED_DOWN_GATHERED_PORTS) {
-    ROUTED_DOWN_GATHERED_BODY(false)
+template <uint ROWS, uint LANES, uint MATRIX>
+kernel void routed_down_gathered_resident(ROUTED_DOWN_GATHERED_PORTS,
+    threadgroup uchar *shared [[threadgroup(0)]]) {
+    ROUTED_DOWN_GATHERED_BODY(false, (MATRIX != 0), shared)
 }
 #endif

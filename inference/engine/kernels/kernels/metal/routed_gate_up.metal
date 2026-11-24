@@ -60,7 +60,7 @@ kernel void routed_gate_up_resident(ROUTED_GATE_UP_PORTS) {
 }
 #endif
 #ifdef SEISMIC_FORMING_ROUTED_GATE_UP_GATHER
-template <uint ROWS, uint LANES>
+template <uint ROWS, uint LANES, uint MATRIX>
 kernel void routed_gate_up_gather(
     device const int *routes [[buffer(SEISMIC_BUFFER_ROUTES)]],
     device const int *sources [[buffer(SEISMIC_BUFFER_SOURCES)]],
@@ -90,7 +90,7 @@ kernel void routed_gate_up_gathered_one_resident(
 }
 #endif
 #ifdef SEISMIC_FORMING_ROUTED_GATE_UP_GATHERED
-template <uint ROWS, uint LANES>
+template <uint ROWS, uint LANES, uint MATRIX>
 kernel void routed_gate_up_gathered(
     ROUTED_GATE_UP_PORTS,
     device const routed::Worklist *worklist [[buffer(SEISMIC_BUFFER_SCRATCH_WORKLIST)]]) {
@@ -99,7 +99,7 @@ kernel void routed_gate_up_gathered(
 #endif
 #ifdef SEISMIC_FORMING_ROUTED_GATE_UP_GATHERED_RESIDENT
 // A resident layer's (XS 0), its records read with plain loads.
-template <uint ROWS, uint LANES>
+template <uint ROWS, uint LANES, uint MATRIX>
 kernel void routed_gate_up_gathered_resident(
     ROUTED_GATE_UP_PORTS,
     device const routed::Worklist *worklist [[buffer(SEISMIC_BUFFER_SCRATCH_WORKLIST)]]) {

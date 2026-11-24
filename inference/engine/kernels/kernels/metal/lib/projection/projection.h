@@ -910,14 +910,16 @@ struct gemm_b_registers<W, COUNT, true> {
     uint4 words[COUNT][2];
 };
 
-// Whether a TM-row tile keeps coefficient runs. On simdgroup matrices a
-// staging thread carries its runs beside its fragments: a 32-row tile has no
-// registers to spare (the runs cost it 6-17% on Apple GPU family 7), nor has
-// a paired tile with a run per stream (2% on family 9), so those load every
-// packet's coefficients as before.
+// Whether a TM-row tile keeps coefficient runs. On tensor operations the
+// matrix accumulators live in the tensor register file, so every tile keeps
+// its runs (avoiding 8x redundant superblock header loads). On simdgroup
+// matrices a staging thread carries its runs beside its fragments: a 32-row
+// tile has no registers to spare (the runs cost it 6-17% on Apple GPU family
+// 7), nor has a paired tile with a run per stream (2% on family 9), so those
+// load every packet's coefficients as before.
 template <uint TM, bool PAIRED>
 constexpr bool gemm_runs() {
-    return TM >= 64 && (SEISMIC_HAS_TENSOR_OPS || !PAIRED);
+    return SEISMIC_HAS_TENSOR_OPS || (TM >= 64 && !PAIRED);
 }
 
 // Loads the step at column k0. With RUNS, `fresh` on a tile's first step
@@ -1943,8 +1945,9 @@ struct gemv_batch_rows {
 // planes once per run instead of once per packet.
 template <typename W>
 inline typename W::packet gemv_batch_load(thread const Weights<W> &w,
-    thread const typename Weights<W>::located &at, uint p, thread typename packets::Block<W>::state &run) {
-    if (p % packets::Block<W>::packets == 0u)
+    thread const typename Weights<W>::located &at, uint p, thread typename packets::Block<W>::state &run,
+    bool fresh = false) {
+    if (fresh || p % packets::Block<W>::packets == 0u)
         run = w.run(at, p);
     return w.packet(at, p, run);
 }
@@ -1984,20 +1987,57 @@ constexpr uint gemv_batch_column(uint c) {
     return QUARTERS ? 8u * ((c % 8u) / 2u) + 2u * (c / 8u) + c % 2u : c;
 }
 
-// Accumulate one packet of this lane's weight row into `acc`: the decoded
-// F32 values times the staged steps `x`.
-template <typename W, uint NB>
-inline void gemv_batch_packet(thread simdgroup_float8x8 (&acc)[NB], thread const typename W::packet &a,
-    thread const simdgroup_float8x8 (&x)[4][NB], uint pair_index) {
-    float4 even, odd;
-    if (gemv_batch_quarters<W>::value)
-        W::values(a, pair_index, even, odd);
+// Accumulate one 32-column packet of this lane's weight rows into `acc` (and
+// `acc2` when PAIRED), streaming each 8x8 activation tile `x` from threadgroup
+// staging one (step, bb) at a time so NB=2 never spills `x[4][NB]` to stack.
+template <typename W, typename U, bool PAIRED, uint R, uint NB>
+inline void gemv_batch_step(thread simdgroup_float8x8 (&acc)[R][NB],
+    thread simdgroup_float8x8 (&acc2)[PAIRED ? R : 1][PAIRED ? NB : 1],
+    thread const typename W::packet (&a)[R], thread const typename U::packet (&b)[PAIRED ? R : 1],
+    threadgroup const float *packet_staged, uint pitch, uint pair_index) {
+    float4 a_even[R], a_odd[R];
+    float4 b_even[PAIRED ? R : 1], b_odd[PAIRED ? R : 1];
+    if constexpr (gemv_batch_quarters<W>::value) {
+        for (uint r = 0; r < R; ++r)
+            W::values(a[r], pair_index, a_even[r], a_odd[r]);
+        if constexpr (PAIRED) {
+            for (uint r = 0; r < R; ++r)
+                U::values(b[r], pair_index, b_even[r], b_odd[r]);
+        }
+    }
+    simdgroup_float8x8 x[NB];
+    for (uint bb = 0; bb < NB; ++bb)
+        simdgroup_load(x[bb], packet_staged + 8u * bb * pitch, pitch, ulong2(0, 0), true);
     for (uint step = 0; step < 4; ++step) {
-        simdgroup_float8x8 weights;
-        reinterpret_cast<thread float2 &>(weights.thread_elements())
-            = gemv_batch_quarters<W>::value ? float2(even[step], odd[step]) : W::pair_values(a, step, pair_index);
-        for (uint b = 0; b < NB; ++b)
-            simdgroup_multiply_accumulate(acc[b], weights, x[step][b], acc[b]);
+        simdgroup_float8x8 wa[R];
+        simdgroup_float8x8 wb[PAIRED ? R : 1];
+        for (uint r = 0; r < R; ++r) {
+            reinterpret_cast<thread float2 &>(wa[r].thread_elements())
+                = gemv_batch_quarters<W>::value ? float2(a_even[r][step], a_odd[r][step])
+                                                : W::pair_values(a[r], step, pair_index);
+            if constexpr (PAIRED) {
+                reinterpret_cast<thread float2 &>(wb[r].thread_elements())
+                    = gemv_batch_quarters<U>::value ? float2(b_even[r][step], b_odd[r][step])
+                                                    : U::pair_values(b[r], step, pair_index);
+            }
+        }
+        simdgroup_float8x8 x_next[NB];
+        if (step + 1u < 4u) {
+            for (uint bb = 0; bb < NB; ++bb)
+                simdgroup_load(x_next[bb], packet_staged + 8u * bb * pitch + 8u * (step + 1u), pitch,
+                    ulong2(0, 0), true);
+        }
+        for (uint r = 0; r < R; ++r) {
+            for (uint bb = 0; bb < NB; ++bb) {
+                simdgroup_multiply_accumulate(acc[r][bb], wa[r], x[bb], acc[r][bb]);
+                if constexpr (PAIRED)
+                    simdgroup_multiply_accumulate(acc2[r][bb], wb[r], x[bb], acc2[r][bb]);
+            }
+        }
+        if (step + 1u < 4u) {
+            for (uint bb = 0; bb < NB; ++bb)
+                x[bb] = x_next[bb];
+        }
     }
 }
 
@@ -2011,14 +2051,17 @@ template <>
 struct gemv_batch_emit<false> {
     template <bool PAIRED, uint R, uint NB, typename Out>
     static void run(thread const Out &out, thread simdgroup_float8x8 (&acc)[R][NB],
-        thread simdgroup_float8x8 (&acc2)[R][NB], uint m_rows, uint rows, gemv_batch_rows map, ushort2 at) {
+        thread simdgroup_float8x8 (&acc2)[PAIRED ? R : 1][PAIRED ? NB : 1], uint m_rows, uint rows,
+        gemv_batch_rows map, ushort2 at) {
         for (uint r = 0; r < R; ++r) {
             uint n = map.at(r, at.y);
             if (n >= rows)
                 continue;
             for (uint bb = 0; bb < NB; ++bb) {
                 float2 c = reinterpret_cast<thread float2 &>(acc[r][bb].thread_elements());
-                float2 c2 = reinterpret_cast<thread float2 &>(acc2[r][bb].thread_elements());
+                float2 c2 = float2(0.0f);
+                if constexpr (PAIRED)
+                    c2 = reinterpret_cast<thread float2 &>(acc2[r][bb].thread_elements());
                 uint m = 8u * bb + at.x;
                 if (m < m_rows)
                     emit<PAIRED>::run(out, m, n, c.x, c2.x);
@@ -2032,7 +2075,8 @@ template <>
 struct gemv_batch_emit<true> {
     template <bool PAIRED, uint R, uint NB, typename Out>
     static void run(thread const Out &out, thread simdgroup_float8x8 (&acc)[R][NB],
-        thread simdgroup_float8x8 (&)[R][NB], uint m_rows, uint rows, gemv_batch_rows map, ushort2 at) {
+        thread simdgroup_float8x8 (&)[PAIRED ? R : 1][PAIRED ? NB : 1], uint m_rows, uint rows,
+        gemv_batch_rows map, ushort2 at) {
         static_assert(!PAIRED, "a column epilogue is plain");
         for (uint r = 0; r < R; ++r) {
             float column[8 * NB];
@@ -2061,7 +2105,7 @@ struct gemv_batch_emit<true> {
 template <typename W, typename U, bool PAIRED, uint R, uint NB, bool COLUMNS = false, typename In, typename Out>
 inline void gemv_batch_body(thread const In &in, thread const Out &out, thread const Weights<W> &w,
     thread const Weights<U> &u, uint m_rows, uint rows, uint k, uint tile, threadgroup uchar *shared,
-    uint simdgroups, uint sg, uint lane, uint first_packet = 0) {
+    uint simdgroups, uint sg, uint lane, uint first_packet = 0, uint in_col0 = 0) {
     constexpr uint chunk = gemv_batch_chunk<NB>();
     constexpr uint pitch = chunk + 4u;
     constexpr bool QUARTERS = gemv_batch_quarters<W>::value;
@@ -2084,17 +2128,18 @@ inline void gemv_batch_body(thread const In &in, thread const Out &out, thread c
         if (PAIRED)
             b_at[r] = u.locate(n);
     }
-    simdgroup_float8x8 acc[R][NB], acc2[R][NB];
+    simdgroup_float8x8 acc[R][NB], acc2[PAIRED ? R : 1][PAIRED ? NB : 1];
     for (uint r = 0; r < R; ++r) {
         for (uint b = 0; b < NB; ++b) {
             acc[r][b] = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
-            acc2[r][b] = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
+            if constexpr (PAIRED)
+                acc2[r][b] = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
         }
     }
     typename W::packet a[R], a_next[R];
-    typename U::packet b[R], b_next[R];
+    typename U::packet b[PAIRED ? R : 1], b_next[PAIRED ? R : 1];
     typename packets::Block<W>::state a_run[R];
-    typename packets::Block<U>::state b_run[R];
+    typename packets::Block<U>::state b_run[PAIRED ? R : 1];
     for (uint c0 = 0; c0 < k; c0 += chunk) {
         uint packets = (min(chunk, k - c0) + 31u) / 32u;
         // The chunk's first packets load while the threadgroup stages it; a
@@ -2102,9 +2147,9 @@ inline void gemv_batch_body(thread const In &in, thread const Out &out, thread c
         // chunk or call finishes reading the staging first.
         if (active) {
             for (uint r = 0; r < R; ++r) {
-                a[r] = gemv_batch_load(w, a_at[r], first_packet + c0 / 32u, a_run[r]);
-                if (PAIRED)
-                    b[r] = gemv_batch_load(u, b_at[r], first_packet + c0 / 32u, b_run[r]);
+                a[r] = gemv_batch_load(w, a_at[r], first_packet + c0 / 32u, a_run[r], c0 == 0u);
+                if constexpr (PAIRED)
+                    b[r] = gemv_batch_load(u, b_at[r], first_packet + c0 / 32u, b_run[r], c0 == 0u);
             }
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
@@ -2112,7 +2157,7 @@ inline void gemv_batch_body(thread const In &in, thread const Out &out, thread c
             uint m = item / (4u * packets), g = item % (4u * packets);
             float4 even = float4(0.0f), odd = float4(0.0f);
             if (m < m_rows)
-                in.load8(m, c0 + 8u * g, 0.0f, even, odd);
+                in.load8(m, in_col0 + c0 + 8u * g, 0.0f, even, odd);
             if (QUARTERS) {
                 // Step g % 4's pair j is packet columns 8 (g % 4) + 2j, + 1.
                 threadgroup float *packet = staged + m * pitch + 32u * (g / 4u);
@@ -2132,23 +2177,14 @@ inline void gemv_batch_body(thread const In &in, thread const Out &out, thread c
             if (local + 1u < packets) {
                 for (uint r = 0; r < R; ++r) {
                     a_next[r] = gemv_batch_load(w, a_at[r], first_packet + c0 / 32u + local + 1u, a_run[r]);
-                    if (PAIRED)
+                    if constexpr (PAIRED)
                         b_next[r] = gemv_batch_load(u, b_at[r], first_packet + c0 / 32u + local + 1u, b_run[r]);
                 }
             }
-            simdgroup_float8x8 x[4][NB];
-            for (uint step = 0; step < 4; ++step)
-                for (uint bb = 0; bb < NB; ++bb)
-                    simdgroup_load(x[step][bb], staged + 8u * bb * pitch + 32u * local + 8u * step, pitch,
-                        ulong2(0, 0), true);
-            for (uint r = 0; r < R; ++r) {
-                gemv_batch_packet<W, NB>(acc[r], a[r], x, pair_index);
-                if (PAIRED)
-                    gemv_batch_packet<U, NB>(acc2[r], b[r], x, pair_index);
-            }
+            gemv_batch_step<W, U, PAIRED, R, NB>(acc, acc2, a, b, staged + 32u * local, pitch, pair_index);
             for (uint r = 0; r < R; ++r) {
                 a[r] = a_next[r];
-                if (PAIRED)
+                if constexpr (PAIRED)
                     b[r] = b_next[r];
             }
         }
@@ -2156,16 +2192,282 @@ inline void gemv_batch_body(thread const In &in, thread const Out &out, thread c
     gemv_batch_emit<COLUMNS>::template run<PAIRED, R, NB>(out, acc, acc2, m_rows, rows, map, at);
 }
 
+#if SEISMIC_HAS_TENSOR_OPS
+// Admission and B-tile element type for `gemv_batch_tensor` (zero range
+// narrowing and zero mantissa truncation past 4-bit codes by construction):
+//   - Only `R == 1` (single 8-row block per simdgroup, the default
+//     `BATCH_ROWS = 1`), keeping `cooperative_tensor` accumulators as plain
+//     locals (Metal 4 forbids arrays of `cooperative_tensor`).
+//   - Dense F16 weights (both when paired) stage directly into `half`.
+//   - Dense BF16 weights and <= 4-bit quantized packets (`sizeof(P::words) <= 16`,
+//     so decoded codes fit BF16's 7-bit mantissa without precision loss) stage
+//     into `bfloat` (full F32 exponent range) under `bfloat` activations.
+//   - Dense F32, >= 5-bit quantized packets (Q5/Q6/Q8/FP8), progressive views,
+//     and mixed F16/BF16 combinations stay on F32 `gemv_batch_body`.
+template <typename W>
+struct gemv_batch_tensor_is_f16 {
+    static constant constexpr bool value = false;
+};
+template <>
+struct gemv_batch_tensor_is_f16<packets::Dense<element::F16>> {
+    static constant constexpr bool value = true;
+};
+
+template <typename W>
+struct gemv_batch_tensor_bf16_ok {
+    static constant constexpr bool value = false;
+};
+template <>
+struct gemv_batch_tensor_bf16_ok<packets::Dense<element::Bf16>> {
+    static constant constexpr bool value = true;
+};
+template <typename P, typename C, typename K, typename F>
+struct gemv_batch_tensor_bf16_ok<packets::Packet<P, C, K, F>> {
+    static constant constexpr bool value = (sizeof(typename P::words) <= 16u);
+};
+
+template <typename E, typename W, typename U, bool PAIRED, uint R>
+struct gemv_batch_tensor_traits {
+    static constant constexpr bool all_f16 =
+        gemv_batch_tensor_is_f16<W>::value && (!PAIRED || gemv_batch_tensor_is_f16<U>::value);
+    static constant constexpr bool use_bfloat =
+        metal::is_same<E, bfloat>::value
+        && gemv_batch_tensor_bf16_ok<W>::value
+        && (!PAIRED || gemv_batch_tensor_bf16_ok<U>::value);
+    static constant constexpr bool admitted = (R == 1u) && (all_f16 || use_bfloat);
+    typedef typename metal::conditional<use_bfloat, bfloat, half>::type B;
+};
+
+// Weight loader/stager for `gemv_batch_tensor`: each of the 32 lanes in a
+// simdgroup owns one quarter (8 consecutive columns) of one of the block's 8
+// weight rows (`row_local = lane / 4`, `quarter = lane % 4`). Dense 16-bit
+// weights load only their own 8 elements (one `uint4` = 16 bytes) directly;
+// <= 4-bit quantized weights load one packet through coefficient runs and
+// decode their own quarter once into `bfloat` (preserving F32 exponent range).
+template <typename W, typename B, bool DENSE16 = gemm_dense16<W>::value>
+struct gemv_batch_tensor_weight {
+    typename W::packet packet;
+
+    inline void load(thread const Weights<W> &w, thread const typename Weights<W>::located &at,
+        uint global_packet, uint, uint, uint, bool fresh, thread typename packets::Block<W>::state &run) thread {
+        packet = gemv_batch_load(w, at, global_packet, run, fresh);
+    }
+
+    inline void stage(threadgroup B *b_row, uint quarter) const thread {
+        static_assert(metal::is_same<B, bfloat>::value,
+            "quantized gemv_batch_tensor stages into bfloat to preserve F32 exponent range");
+        float4 even, odd;
+        W::values(packet, quarter, even, odd);
+        threadgroup bfloat4 *out = reinterpret_cast<threadgroup bfloat4 *>(b_row + 8u * quarter);
+        out[0] = bfloat4(bfloat(even.x), bfloat(odd.x), bfloat(even.y), bfloat(odd.y));
+        out[1] = bfloat4(bfloat(even.z), bfloat(odd.z), bfloat(even.w), bfloat(odd.w));
+    }
+};
+
+template <typename W, typename B>
+struct gemv_batch_tensor_weight<W, B, true> {
+    typedef typename gemm_dense16<W>::elem WE;
+    uint4 words;
+
+    inline void load(thread const Weights<W> &, thread const typename Weights<W>::located &at,
+        uint global_packet, uint local_col, uint k, uint quarter, bool,
+        thread typename packets::Block<W>::state &) thread {
+        const uint col = local_col + 8u * quarter;
+        if (col < k) {
+            const uint global_col = global_packet * 32u + 8u * quarter;
+            const packets::weight_bytes ptr = packets::Dense<WE>::row_values(at) + ulong(global_col) * 2u;
+            if (col + 8u <= k && packets::Dense<WE>::aligned16(at)) {
+                words = *slab::as<uint4>(ptr);
+            } else {
+                const auto s = slab::as<ushort>(ptr);
+                const ushort4 lo = ushort4(
+                    col + 0u < k ? s[0] : ushort(0),
+                    col + 1u < k ? s[1] : ushort(0),
+                    col + 2u < k ? s[2] : ushort(0),
+                    col + 3u < k ? s[3] : ushort(0));
+                const ushort4 hi = ushort4(
+                    col + 4u < k ? s[4] : ushort(0),
+                    col + 5u < k ? s[5] : ushort(0),
+                    col + 6u < k ? s[6] : ushort(0),
+                    col + 7u < k ? s[7] : ushort(0));
+                words = uint4(as_type<uint2>(lo), as_type<uint2>(hi));
+            }
+        } else {
+            words = uint4(0);
+        }
+    }
+
+    inline void stage(threadgroup B *b_row, uint quarter) const thread {
+        static_assert(metal::is_same<B, typename WE::native>::value,
+            "gemv_batch_tensor never narrows dense 16-bit weights across element types");
+        *reinterpret_cast<threadgroup uint4 *>(b_row + 8u * quarter) = words;
+    }
+};
+
+// Batched GEMV on Metal 4 tensor operations (`matmul2d` 16 x 8 x 32 per
+// simdgroup, F32 accumulator, `R = 1`): handles M = 1..16 in a single 16-row
+// tile with activations staged in native A (`half` or `bfloat`) and
+// per-simdgroup 8 x 32 weight staging in
+// `gemv_batch_tensor_traits<E, W, U, PAIRED, 1>::B`. Fits inside
+// `gemv_batch_shared_bytes` (15488 B) for any `simdgroups <= 16`.
+template <typename W, typename U, bool PAIRED, bool COLUMNS = false, typename In, typename Out>
+inline void gemv_batch_tensor(thread const In &in, thread const Out &out, thread const Weights<W> &w,
+    thread const Weights<U> &u, uint m_rows, uint rows, uint k, uint tile, threadgroup uchar *shared,
+    uint simdgroups, uint sg, uint lane, uint first_packet = 0, uint in_col0 = 0) {
+    typedef typename In::activation::native E;
+    typedef typename gemv_batch_tensor_traits<E, W, U, PAIRED, 1u>::B B;
+    constexpr uint b_pitch = 40u;
+    constexpr uint b_sg_elems = 8u * b_pitch;
+    const uint b_bytes = simdgroups * b_sg_elems * uint(sizeof(B));
+    const uint a_bytes = gemv_batch_shared_bytes - b_bytes;
+    const uint chunk = ((a_bytes / (16u * uint(sizeof(E)))) - 8u) / 32u * 32u;
+    const uint a_pitch = chunk + 8u;
+    threadgroup E *staged_a = reinterpret_cast<threadgroup E *>(shared);
+    threadgroup B *b_sg = reinterpret_cast<threadgroup B *>(shared + gemv_batch_shared_bytes - b_bytes)
+        + sg * b_sg_elems;
+
+    typedef metal::extents<int32_t, 32, 16> a_extents;
+    typedef metal::extents<int32_t, 32, 8> b_extents;
+    typedef metal::tensor<threadgroup E, a_extents, metal::tensor_inline> a_tensor;
+    typedef metal::tensor<threadgroup B, b_extents, metal::tensor_inline> b_tensor;
+    typedef mpp::tensor_ops::matmul2d<
+        mpp::tensor_ops::matmul2d_descriptor(16, 8, 32, false, true, false,
+            mpp::tensor_ops::matmul2d_descriptor::mode::multiply_accumulate),
+        metal::execution_simdgroup> operation;
+    typedef typename operation::template cooperative_tensor_destination_t<a_tensor, b_tensor, float> destination;
+
+    const uint row_local = lane / 4u, quarter = lane % 4u;
+    const uint thread_index = sg * 32u + lane;
+    gemv_batch_rows map{tile * simdgroups * 8u, sg,
+        w.tile() == 32u && simdgroups % 4u == 0u};
+
+    const bool active = map.at(0u, 0u) < rows;
+    const uint clamped_n = min(map.at(0u, row_local), rows - 1u);
+    typename Weights<W>::located a_at = w.locate(clamped_n);
+    typename Weights<U>::located b_at;
+    if constexpr (PAIRED)
+        b_at = u.locate(clamped_n);
+
+    operation op;
+    destination acc = op.template get_destination_cooperative_tensor<a_tensor, b_tensor, float>();
+    destination acc2 = op.template get_destination_cooperative_tensor<a_tensor, b_tensor, float>();
+    PROJECTION_UNROLL
+    for (uint16_t e = 0; e < acc.get_capacity(); ++e) {
+        if (acc.is_valid_element(e)) {
+            acc[e] = 0.0f;
+            if constexpr (PAIRED)
+                acc2[e] = 0.0f;
+        }
+    }
+
+    gemv_batch_tensor_weight<W, B> a, a_next;
+    gemv_batch_tensor_weight<U, B> b, b_next;
+    typename packets::Block<W>::state a_run;
+    typename packets::Block<U>::state b_run;
+    b_tensor b_tile(b_sg, b_extents(), metal::array<int32_t, 2>{1, int32_t(b_pitch)});
+
+    for (uint c0 = 0; c0 < k; c0 += chunk) {
+        const uint packets = (min(chunk, k - c0) + 31u) / 32u;
+        const uint p0 = first_packet + c0 / 32u;
+        if (active) {
+            a.load(w, a_at, p0, c0, k, quarter, c0 == 0u, a_run);
+            if constexpr (PAIRED)
+                b.load(u, b_at, p0, c0, k, quarter, c0 == 0u, b_run);
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        for (uint item = thread_index; item < 16u * 4u * packets; item += simdgroups * 32u) {
+            const uint m = item / (4u * packets), g = item % (4u * packets);
+            float4 even = float4(0.0f), odd = float4(0.0f);
+            if (m < m_rows)
+                in.load8(m, in_col0 + c0 + 8u * g, 0.0f, even, odd);
+            threadgroup vec<E, 4> *dst = reinterpret_cast<threadgroup vec<E, 4> *>(staged_a + m * a_pitch + 8u * g);
+            dst[0] = vec<E, 4>(E(even.x), E(odd.x), E(even.y), E(odd.y));
+            dst[1] = vec<E, 4>(E(even.z), E(odd.z), E(even.w), E(odd.w));
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        if (!active)
+            continue;
+        for (uint local = 0; local < packets; ++local) {
+            if (local + 1u < packets) {
+                const uint p_next = p0 + local + 1u;
+                const uint col_next = c0 + 32u * (local + 1u);
+                a_next.load(w, a_at, p_next, col_next, k, quarter, false, a_run);
+                if constexpr (PAIRED)
+                    b_next.load(u, b_at, p_next, col_next, k, quarter, false, b_run);
+            }
+            a_tensor a_tile(staged_a + 32u * local, a_extents(), metal::array<int32_t, 2>{1, int32_t(a_pitch)});
+            a.stage(b_sg + row_local * b_pitch, quarter);
+            simdgroup_barrier(mem_flags::mem_threadgroup);
+            op.run(a_tile, b_tile, acc);
+            simdgroup_barrier(mem_flags::mem_threadgroup);
+            if constexpr (PAIRED) {
+                b.stage(b_sg + row_local * b_pitch, quarter);
+                simdgroup_barrier(mem_flags::mem_threadgroup);
+                op.run(a_tile, b_tile, acc2);
+                simdgroup_barrier(mem_flags::mem_threadgroup);
+            }
+            a = a_next;
+            if constexpr (PAIRED)
+                b = b_next;
+        }
+    }
+    if (!active)
+        return;
+    if constexpr (COLUMNS) {
+        static_assert(!PAIRED, "a column epilogue is plain");
+        threadgroup float *scratch = reinterpret_cast<threadgroup float *>(b_sg);
+        PROJECTION_UNROLL
+        for (uint16_t e = 0; e < acc.get_capacity(); ++e) {
+            if (acc.is_valid_element(e)) {
+                auto idx = acc.get_multidimensional_index(e);
+                scratch[uint(idx[0]) * 16u + uint(idx[1])] = acc[e];
+            }
+        }
+        simdgroup_barrier(mem_flags::mem_threadgroup);
+        const uint n = map.at(0u, row_local);
+        if (n < rows) {
+            float column[16];
+            PROJECTION_UNROLL
+            for (uint m = 0; m < 16u; ++m)
+                column[m] = scratch[row_local * 16u + m];
+            for (uint m = quarter; m < m_rows; m += 4u)
+                out.store_column(m, n, column);
+        }
+        simdgroup_barrier(mem_flags::mem_threadgroup);
+    } else {
+        PROJECTION_UNROLL
+        for (uint16_t e = 0; e < acc.get_capacity(); ++e) {
+            if (!acc.is_valid_element(e))
+                continue;
+            auto idx = acc.get_multidimensional_index(e);
+            const uint m = uint(idx[1]);
+            const uint n = map.at(0u, uint(idx[0]));
+            if (m < m_rows && n < rows)
+                emit<PAIRED>::run(out, m, n, acc[e], PAIRED ? acc2[e] : 0.0f);
+        }
+    }
+}
+#endif
+
 template <typename W, uint R, typename In, typename Out>
 inline void gemv_batch_runtime(thread const In &in, thread const Out &out, thread const Weights<W> &w,
     uint m_rows, uint rows, uint k, uint tile, threadgroup uchar *shared, uint simdgroups,
-    uint sg, uint lane, uint first_packet = 0) {
+    uint sg, uint lane, uint first_packet = 0, uint in_col0 = 0) {
+#if SEISMIC_HAS_TENSOR_OPS
+    if constexpr (gemv_batch_tensor_traits<typename In::activation::native, W, W, false, R>::admitted) {
+        if (simdgroups <= 16u) {
+            gemv_batch_tensor<W, W, false, false>(in, out, w, w, m_rows, rows, k, tile, shared, simdgroups, sg,
+                lane, first_packet, in_col0);
+            return;
+        }
+    }
+#endif
     if (m_rows <= 8)
         gemv_batch_body<W, W, false, R, 1>(in, out, w, w, m_rows, rows, k, tile, shared, simdgroups, sg, lane,
-            first_packet);
+            first_packet, in_col0);
     else
         gemv_batch_body<W, W, false, R, 2>(in, out, w, w, m_rows, rows, k, tile, shared, simdgroups, sg, lane,
-            first_packet);
+            first_packet, in_col0);
 }
 
 // `gemv_batch_runtime` with a column epilogue (`gemv_emit<true>`).
@@ -2173,6 +2475,15 @@ template <typename W, uint R, typename In, typename Out>
 inline void gemv_batch_columns_runtime(thread const In &in, thread const Out &out, thread const Weights<W> &w,
     uint m_rows, uint rows, uint k, uint tile, threadgroup uchar *shared, uint simdgroups,
     uint sg, uint lane) {
+#if SEISMIC_HAS_TENSOR_OPS
+    if constexpr (gemv_batch_tensor_traits<typename In::activation::native, W, W, false, R>::admitted) {
+        if (simdgroups <= 16u) {
+            gemv_batch_tensor<W, W, false, true>(in, out, w, w, m_rows, rows, k, tile, shared, simdgroups, sg,
+                lane);
+            return;
+        }
+    }
+#endif
     if (m_rows <= 8)
         gemv_batch_body<W, W, false, R, 1, true>(in, out, w, w, m_rows, rows, k, tile, shared, simdgroups, sg, lane);
     else
@@ -2183,6 +2494,15 @@ template <typename G, typename U, uint R, typename In, typename Out>
 inline void gemv_batch_paired_runtime(thread const In &in, thread const Out &out, thread const Weights<G> &gate,
     thread const Weights<U> &up, uint m_rows, uint rows, uint k, uint tile, threadgroup uchar *shared,
     uint simdgroups, uint sg, uint lane) {
+#if SEISMIC_HAS_TENSOR_OPS
+    if constexpr (gemv_batch_tensor_traits<typename In::activation::native, G, U, true, R>::admitted) {
+        if (simdgroups <= 16u) {
+            gemv_batch_tensor<G, U, true, false>(in, out, gate, up, m_rows, rows, k, tile, shared, simdgroups, sg,
+                lane);
+            return;
+        }
+    }
+#endif
     if (m_rows <= 8)
         gemv_batch_body<G, U, true, R, 1>(in, out, gate, up, m_rows, rows, k, tile, shared, simdgroups, sg, lane);
     else

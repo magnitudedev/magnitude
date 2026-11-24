@@ -1329,11 +1329,27 @@ inline uint2 packing_tile_origin(uint index, uint padded) {
 // bits.
 template <typename W, uint WIDTH, uint TOKENS, uint WEIGHTS_AHEAD, typename Out>
 inline void gemm_packed_tile(thread const Out &out, thread const Weights<W> &w, thread const packing_scratch &s,
-    uint m_rows, uint m0, uint n0, uint rows, uint k, uint lane) {
+    uint m_rows, uint m0, uint n0, uint rows, uint k, uint lane, bool zeroed = false) {
     typedef packing_tile<TOKENS> tile;
     if (m0 >= m_rows || n0 >= rows)
         return;
     const ushort2 at = fragment_coordinate(lane);
+    if (zeroed) {
+        PROJECTION_UNROLL
+        for (uint i = 0; i < tile::ti; ++i) {
+            PROJECTION_UNROLL
+            for (uint t = 0; t < tile::held; ++t) {
+                const uint m = m0 + packing_gemm_lanes * (8u * i + at.x) + t;
+                if (m < m_rows) {
+                    const auto row = row_of(out, m);
+                    PROJECTION_UNROLL
+                    for (uint j = 0; j < tile::tj; ++j)
+                        row.store(n0 + 8u * j + at.y, 0.0f);
+                }
+            }
+        }
+        return;
+    }
     typename tile::sums y;
     // Weights without a packed path have no tile (their launch returns
     // before it).
@@ -1364,9 +1380,9 @@ inline void gemm_packed_tile(thread const Out &out, thread const Weights<W> &w, 
 // whose best differs by device.
 template <typename W, uint WIDTH, uint TOKENS, uint WEIGHTS_AHEAD, typename Out>
 inline void gemm_packed(thread const Out &out, thread const Weights<W> &w, thread const packing_scratch &s,
-    uint m_rows, uint padded, uint rows, uint k, uint index, uint lane) {
+    uint m_rows, uint padded, uint rows, uint k, uint index, uint lane, bool zeroed = false) {
     const uint2 origin = packing_tile_origin<TOKENS>(index, padded);
-    gemm_packed_tile<W, WIDTH, TOKENS, WEIGHTS_AHEAD>(out, w, s, m_rows, origin.x, origin.y, rows, k, lane);
+    gemm_packed_tile<W, WIDTH, TOKENS, WEIGHTS_AHEAD>(out, w, s, m_rows, origin.x, origin.y, rows, k, lane, zeroed);
 }
 
 // One segment of a segmented projection's PACK launch: the segment's `rows`
@@ -1378,7 +1394,8 @@ inline void gemm_packed(thread const Out &out, thread const Weights<W> &w, threa
 // (the staged tiles run it).
 template <typename W, bool SERVES, uint RESIDUE, uint TOKENS, uint WEIGHTS_AHEAD, typename Out>
 inline bool gemm_packed_segment(thread const Out &out, thread const Weights<W> &w, thread const packing_scratch &s,
-    uint m_rows, uint padded, uint rows, uint k, thread uint &group, uint simdgroups, uint sg, uint lane) {
+    uint m_rows, uint padded, uint rows, uint k, thread uint &group, uint simdgroups, uint sg, uint lane,
+    bool zeroed = false) {
     const uint groups = (padded / (16u * packing_gemm_lanes) * (rows / 32u) + simdgroups - 1u) / simdgroups;
     if (group >= groups) {
         group -= groups;
@@ -1386,7 +1403,7 @@ inline bool gemm_packed_segment(thread const Out &out, thread const Weights<W> &
     }
     if constexpr (SERVES)
         gemm_packed<W, (RESIDUE != 0 ? RESIDUE : 1), TOKENS, WEIGHTS_AHEAD>(out, w, s, m_rows, padded, rows,
-            k, group * simdgroups + sg, lane);
+            k, group * simdgroups + sg, lane, zeroed);
     return true;
 }
 

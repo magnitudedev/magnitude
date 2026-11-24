@@ -3,7 +3,7 @@
 #define KERNEL_A SEISMIC_ELEMENT_A
 #include "lib/recurrent/chunk.h"
 
-kernel void gated_delta_chunk_inputs(
+kernel void gated_delta_chunk_prepare(
     device const recurrent::Storage *projection [[buffer(SEISMIC_BUFFER_PROJECTION)]],
     device const float *convolution [[buffer(SEISMIC_BUFFER_CONVOLUTION)]],
     device const float *rate [[buffer(SEISMIC_BUFFER_RATE)]],
@@ -14,13 +14,16 @@ kernel void gated_delta_chunk_inputs(
     device const int *previous_tape [[buffer(SEISMIC_BUFFER_PREVIOUS_TAPE)]],
     device const int *following_bank [[buffer(SEISMIC_BUFFER_FOLLOWING_BANK)]],
     SEISMIC_OUT_WINDOW_PARAM(window),
-    device float *inputs [[buffer(SEISMIC_BUFFER_SCRATCH_INPUTS)]],
+    device uchar *pieces [[buffer(SEISMIC_BUFFER_SCRATCH_PIECES)]],
     constant ulong *seismic_words [[buffer(SEISMIC_BUFFER_WORDS)]],
     uint3 group [[threadgroup_position_in_grid]],
+    uint thread_index [[thread_index_in_threadgroup]],
     uint simdgroup [[simdgroup_index_in_threadgroup]],
     uint lane [[thread_index_in_simdgroup]]) {
-    rch_inputs(recurrent::HeadRule{projection, rate, time_bias}, projection, convolution, segments, stop,
-        previous_bank, previous_tape, following_bank, window, inputs, group, simdgroup, lane, seismic_words);
+    threadgroup rch::PrepareShared<1> sh;
+    rch_prepare(recurrent::HeadRule{projection, rate, time_bias}, projection, convolution, segments, stop,
+        previous_bank, previous_tape, following_bank, window, pieces, sh, group, thread_index, simdgroup, lane,
+        seismic_words);
 }
 
 kernel void gated_delta_chunk_scan(
@@ -36,21 +39,17 @@ kernel void gated_delta_chunk_scan(
     SEISMIC_OUT_WINDOW_PARAM(window),
     SEISMIC_OUT_DELTA_PARAM(delta),
     SEISMIC_OUT_TAPE_PARAM(tape),
-    device float *inputs [[buffer(SEISMIC_BUFFER_SCRATCH_INPUTS)]],
+    device uchar *pieces [[buffer(SEISMIC_BUFFER_SCRATCH_PIECES)]],
     device recurrent::Storage *mixed [[buffer(SEISMIC_BUFFER_SCRATCH_MIXED)]],
     constant ulong *seismic_words [[buffer(SEISMIC_BUFFER_WORDS)]],
     uint3 group [[threadgroup_position_in_grid]],
     uint thread_index [[thread_index_in_threadgroup]],
     uint simdgroup [[simdgroup_index_in_threadgroup]],
     uint lane_index [[thread_index_in_simdgroup]]) {
-    threadgroup float queries[RCH_PIECE * RCH_INPUT_STRIDE];
-    threadgroup float keys[RCH_PIECE * RCH_INPUT_STRIDE];
-    threadgroup float values[RCH_PIECE * RCH_VALUE_STRIDE];
-    threadgroup float gates[2 * RCH_PIECE];
-    threadgroup float shares[RCH_SHARES][2][RCH_PIECE * RCH_PIECE];
-    rch_scan(recurrent::HeadRule{projection, rate, time_bias}, RchDecays<1>(), projection, convolution, segments,
-        stop, previous_bank, previous_tape, following_bank, window, delta, tape, inputs, mixed, queries, keys,
-        values, gates, shares, group, thread_index, simdgroup, lane_index, seismic_words);
+    threadgroup rch::ScanShared<1> shared;
+    rch_scan(recurrent::HeadRule{projection, rate, time_bias}, projection, convolution, segments, stop,
+        previous_bank, previous_tape, following_bank, window, delta, tape, pieces, mixed, shared, group,
+        thread_index, simdgroup, lane_index, seismic_words);
 }
 
 kernel void gated_delta_chunk_gate(

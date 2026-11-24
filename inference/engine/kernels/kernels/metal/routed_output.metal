@@ -77,19 +77,19 @@
 // shared expert at `u == worklist->count`); the last of the tile's
 // `worklist->count + 1` threadgroups to arrive joins the tile's channels of
 // every row, four contiguous channels per thread with a scalar tail.
-#define ROUTED_OUTPUT_GATHERED_BODY(ONE)                                                                         \
+#define ROUTED_OUTPUT_GATHERED_BODY(ONE, MATRIX, SHARED)                                                         \
     constexpr uint TILE = routed::output_tile<ROWS, LANES>();                                                    \
     constexpr uint SLOTS = uint(SEISMIC_DIM_K) + 1;                                                              \
     constexpr uint SG_COUNT = routed::GATHERED_SUMMED_SIMDGROUPS;                                                \
     constexpr uint GROUP_TILE = SG_COUNT * TILE;                                                                 \
     constexpr uint H = uint(SEISMIC_DIM_H);                                                                      \
-    threadgroup routed::GatheredSummedShared<LANES, ONE> tg;                                                     \
+    threadgroup routed::GatheredSummedShared<LANES, ONE, MATRIX> tg;                                             \
     threadgroup uint last;                                                                                       \
     const uint first = group.x * GROUP_TILE;                                                                     \
     const element::Out<ELEMENT_OF(SEISMIC_RESULT_0)> value(value_cells);                                         \
-    routed::output_project_gathered<ROWS, LANES, ONE>(expert_product, shared_product, worklist, expert_down,     \
-        tier_down, shared_down, uint(SEISMIC_DIM_M), group.y, first, tid, sg, lane, tg, published,               \
-        seismic_words);                                                                                          \
+    routed::output_project_gathered<ROWS, LANES, ONE, MATRIX>(expert_product, shared_product, worklist,          \
+        expert_down, tier_down, shared_down, uint(SEISMIC_DIM_M), group.x, group.y, first, tid, sg, lane, tg,    \
+        SHARED, published, seismic_words);                                                                       \
     if (!arrive::last(arrivals + group.x, worklist->count + 1u, &last, tid))                                     \
         return;                                                                                                  \
     const uint rows = uint(SEISMIC_DIM_M);                                                                       \
@@ -161,26 +161,28 @@ kernel void routed_output_gather(
 #ifdef SEISMIC_FORMING_ROUTED_OUTPUT_GATHERED_ONE
 template <uint ROWS, uint LANES>
 kernel void routed_output_gathered_one(ROUTED_OUTPUT_GATHERED_PORTS) {
-    ROUTED_OUTPUT_GATHERED_BODY(true)
+    ROUTED_OUTPUT_GATHERED_BODY(true, false, nullptr)
 }
 #endif
 #ifdef SEISMIC_FORMING_ROUTED_OUTPUT_GATHERED_ONE_RESIDENT
 // A resident layer's (XS 0), its records read with plain loads.
 template <uint ROWS, uint LANES>
 kernel void routed_output_gathered_one_resident(ROUTED_OUTPUT_GATHERED_PORTS) {
-    ROUTED_OUTPUT_GATHERED_BODY(true)
+    ROUTED_OUTPUT_GATHERED_BODY(true, false, nullptr)
 }
 #endif
 #ifdef SEISMIC_FORMING_ROUTED_OUTPUT_GATHERED
-template <uint ROWS, uint LANES>
-kernel void routed_output_gathered(ROUTED_OUTPUT_GATHERED_PORTS) {
-    ROUTED_OUTPUT_GATHERED_BODY(false)
+template <uint ROWS, uint LANES, uint MATRIX>
+kernel void routed_output_gathered(ROUTED_OUTPUT_GATHERED_PORTS,
+    threadgroup uchar *shared [[threadgroup(0)]]) {
+    ROUTED_OUTPUT_GATHERED_BODY(false, (MATRIX != 0), shared)
 }
 #endif
 #ifdef SEISMIC_FORMING_ROUTED_OUTPUT_GATHERED_RESIDENT
 // A resident layer's (XS 0), its records read with plain loads.
-template <uint ROWS, uint LANES>
-kernel void routed_output_gathered_resident(ROUTED_OUTPUT_GATHERED_PORTS) {
-    ROUTED_OUTPUT_GATHERED_BODY(false)
+template <uint ROWS, uint LANES, uint MATRIX>
+kernel void routed_output_gathered_resident(ROUTED_OUTPUT_GATHERED_PORTS,
+    threadgroup uchar *shared [[threadgroup(0)]]) {
+    ROUTED_OUTPUT_GATHERED_BODY(false, (MATRIX != 0), shared)
 }
 #endif

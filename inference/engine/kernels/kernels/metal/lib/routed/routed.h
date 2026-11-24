@@ -150,8 +150,9 @@ constexpr constant uint WORKLIST_CACHE_WORDS = 2u * WORKLIST_CACHE + SEISMIC_CON
 // ints in threadgroup memory (declared in the `*_gather` kernel).
 template <typename Active>
 inline void build_worklist(device const int *routes, ulong r0, ulong r1, device const int *sources, ulong source_rows,
-    ulong src1, ulong src2, uint m_rows, uint slots, uint x_groups, uint extra_y, device Worklist *worklist,
-    device int *gather_grid, device int *gather_one_grid, threadgroup int *cache, uint lane, Active active) {
+    ulong src1, ulong src2, uint m_rows, uint slots, uint x_groups_one, uint x_groups_multi, uint extra_y,
+    device Worklist *worklist, device int *gather_grid, device int *gather_one_grid, threadgroup int *cache, uint lane,
+    Active active) {
     constexpr uint CACHE = WORKLIST_CACHE;
     threadgroup int *cached_expert = cache;
     threadgroup int *cached_source = cache + CACHE;
@@ -290,22 +291,45 @@ inline void build_worklist(device const int *routes, ulong r0, ulong r1, device 
         worklist->one_count = one_count;
         worklist->multi_count = multi_count;
         worklist->capacity = total;
-        write_grid(gather_one_grid, x_groups, one_count);
-        write_grid(gather_grid, x_groups, multi_count + extra_y);
+        write_grid(gather_one_grid, x_groups_one, one_count);
+        write_grid(gather_grid, x_groups_multi, multi_count + extra_y);
     }
+}
+
+template <typename Active>
+inline void build_worklist(device const int *routes, ulong r0, ulong r1, device const int *sources, ulong source_rows,
+    ulong src1, ulong src2, uint m_rows, uint slots, uint x_groups, uint extra_y, device Worklist *worklist,
+    device int *gather_grid, device int *gather_one_grid, threadgroup int *cache, uint lane, Active active) {
+    build_worklist(routes, r0, r1, sources, source_rows, src1, src2, m_rows, slots, x_groups, x_groups, extra_y,
+        worklist, gather_grid, gather_one_grid, cache, lane, active);
+}
+
+inline void build_worklist(device const int *routes, ulong r0, ulong r1, device const int *sources, ulong source_rows,
+    ulong src1, ulong src2, uint m_rows, uint slots, uint x_groups_one, uint x_groups_multi, uint extra_y,
+    device Worklist *worklist, device int *gather_grid, device int *gather_one_grid, threadgroup int *cache,
+    uint lane) {
+    build_worklist(routes, r0, r1, sources, source_rows, src1, src2, m_rows, slots, x_groups_one, x_groups_multi,
+        extra_y, worklist, gather_grid, gather_one_grid, cache, lane, [](uint, slab::Source) { return true; });
 }
 
 inline void build_worklist(device const int *routes, ulong r0, ulong r1, device const int *sources, ulong source_rows,
     ulong src1, ulong src2, uint m_rows, uint slots, uint x_groups, uint extra_y, device Worklist *worklist,
     device int *gather_grid, device int *gather_one_grid, threadgroup int *cache, uint lane) {
-    build_worklist(routes, r0, r1, sources, source_rows, src1, src2, m_rows, slots, x_groups, extra_y, worklist,
-        gather_grid, gather_one_grid, cache, lane, [](uint, slab::Source) { return true; });
+    build_worklist(routes, r0, r1, sources, source_rows, src1, src2, m_rows, slots, x_groups, x_groups, extra_y,
+        worklist, gather_grid, gather_one_grid, cache, lane, [](uint, slab::Source) { return true; });
+}
+
+inline void build_worklist(device const int *routes, ulong r0, ulong r1, uint m_rows, uint slots, uint x_groups_one,
+    uint x_groups_multi, uint extra_y, device Worklist *worklist, device int *gather_grid, device int *gather_one_grid,
+    threadgroup int *cache, uint lane) {
+    build_worklist(routes, r0, r1, nullptr, 0, 0, 0, m_rows, slots, x_groups_one, x_groups_multi, extra_y, worklist,
+        gather_grid, gather_one_grid, cache, lane);
 }
 
 inline void build_worklist(device const int *routes, ulong r0, ulong r1, uint m_rows, uint slots, uint x_groups,
     uint extra_y, device Worklist *worklist, device int *gather_grid, device int *gather_one_grid,
     threadgroup int *cache, uint lane) {
-    build_worklist(routes, r0, r1, nullptr, 0, 0, 0, m_rows, slots, x_groups, extra_y, worklist, gather_grid,
+    build_worklist(routes, r0, r1, nullptr, 0, 0, 0, m_rows, slots, x_groups, x_groups, extra_y, worklist, gather_grid,
         gather_one_grid, cache, lane);
 }
 

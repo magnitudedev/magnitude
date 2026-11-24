@@ -1,4 +1,4 @@
-use super::super::{Counted, WiredLimit};
+use super::super::{Counted, PressureLevel, WiredLimit};
 use super::memory::{
     compressed_saving, compressed_stored, file_floor, paired, pressure_level, swap_free,
     wired_limit, Served, Snapshot, STATISTICS_WINDOW,

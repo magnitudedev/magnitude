@@ -92,11 +92,12 @@ inline void output_project(device const uchar *expert_product, device const ucha
 // expert's rows once into `tg` and split the threadgroup's `4 * TILE` output
 // channels (`sg_first = group_first + sg * TILE`). Each slot is published
 // directly in A into `published`.
-template <uint ROWS, uint LANES, bool ONE = false, typename Published>
+template <uint ROWS, uint LANES, bool ONE = false, bool MATRIX = false, typename Published>
 inline void output_project_gathered(device const uchar *expert_product, device const uchar *shared_product,
     device const Worklist *worklist, device const ulong *expert_down, device const ulong *tier_down,
-    device const uchar *shared_down, uint m_rows, uint u, uint group_first, uint tid, uint sg, uint lane,
-    threadgroup GatheredSummedShared<LANES, ONE> &tg, Published published, constant ulong *seismic_words) {
+    device const uchar *shared_down, uint m_rows, uint tile, uint u, uint group_first, uint tid, uint sg, uint lane,
+    threadgroup GatheredSummedShared<LANES, ONE, MATRIX> &tg, threadgroup uchar *shared, Published published,
+    constant ulong *seismic_words) {
     constexpr uint K = uint(SEISMIC_DIM_K);
     constexpr uint SLOTS = K + 1u;
     constexpr uint H = uint(SEISMIC_DIM_H);
@@ -104,19 +105,19 @@ inline void output_project_gathered(device const uchar *expert_product, device c
     const uint sg_first = group_first + sg * TILE;
     if constexpr (ONE) {
         constexpr bool NVFP4 = projection::OperandRecipe<packets::W0_OPERANDS_NVFP4>::NVFP4;
-        project_gathered_expert<packets::W0, ROWS, LANES, SLOTS, uint(SEISMIC_DIM_F), H, NVFP4, true>(
+        project_gathered_expert<packets::W0, ROWS, LANES, SLOTS, uint(SEISMIC_DIM_F), H, NVFP4, true, false>(
             expert_product, SEISMIC_EXPERT_PRODUCT_STRIDE_0, SEISMIC_EXPERT_PRODUCT_STRIDE_1,
             SEISMIC_EXPERT_PRODUCT_STRIDE_2, worklist->entries[u], expert_down, tier_down,
-            KERNEL_W0_LAYOUT(SEISMIC_DIM_F), sg_first, tid, lane, tg, published);
+            KERNEL_W0_LAYOUT(SEISMIC_DIM_F), sg_first, tile, tid, sg, lane, tg, shared, published);
         return;
     } else {
         const uint multi_count = worklist->multi_count;
         if (u < multi_count) {
             constexpr bool NVFP4 = projection::OperandRecipe<packets::W0_OPERANDS_NVFP4>::NVFP4;
-            project_gathered_expert<packets::W0, ROWS, LANES, SLOTS, uint(SEISMIC_DIM_F), H, NVFP4, false>(
+            project_gathered_expert<packets::W0, ROWS, LANES, SLOTS, uint(SEISMIC_DIM_F), H, NVFP4, false, MATRIX>(
                 expert_product, SEISMIC_EXPERT_PRODUCT_STRIDE_0, SEISMIC_EXPERT_PRODUCT_STRIDE_1,
                 SEISMIC_EXPERT_PRODUCT_STRIDE_2, worklist->entries[worklist->capacity - 1u - u], expert_down,
-                tier_down, KERNEL_W0_LAYOUT(SEISMIC_DIM_F), sg_first, tid, lane, tg, published);
+                tier_down, KERNEL_W0_LAYOUT(SEISMIC_DIM_F), sg_first, tile, tid, sg, lane, tg, shared, published);
             return;
         }
         if (u == multi_count && m_rows > 0) {
@@ -125,16 +126,27 @@ inline void output_project_gathered(device const uchar *expert_product, device c
             threadgroup_barrier(mem_flags::mem_threadgroup);
             const auto down = weights<packets::W1>(shared_down, KERNEL_W1_LAYOUT(SEISMIC_DIM_S), 0, SEISMIC_DIM_S);
             constexpr bool NVFP4 = projection::OperandRecipe<packets::W1_OPERANDS_NVFP4>::NVFP4;
-            for (uint base = 0u; base < m_rows; base += 4u) {
-                const uint chunk = min(4u, m_rows - base);
-                if (base > 0u)
-                    threadgroup_barrier(mem_flags::mem_threadgroup);
-                const auto in = activation(shared_product + ulong(base) * SEISMIC_SHARED_PRODUCT_STRIDE_0 * Act::bytes,
-                    SEISMIC_SHARED_PRODUCT_STRIDE_0, SEISMIC_SHARED_PRODUCT_STRIDE_1, uint(SEISMIC_DIM_S));
-                PROJECTION_FOR_ROWS_24(chunk,
-                    (project_channels_published<packets::W1, ROWS, LANES, MAXM, uint(SEISMIC_DIM_S), H, NVFP4>(
+            if constexpr (MATRIX) {
+                constexpr uint MATRIX_R = (TILE == 16u) ? 2u : 1u;
+                const auto in = activation(shared_product, SEISMIC_SHARED_PRODUCT_STRIDE_0,
+                    SEISMIC_SHARED_PRODUCT_STRIDE_1, uint(SEISMIC_DIM_S));
+                const auto x = lone_operands<NVFP4, SEISMIC_CONST_VERIFY_ROWS>::form(in, m_rows,
+                    uint(SEISMIC_DIM_S), lane);
+                const PublishedOut<H, Published> out{published, tg.products};
+                projection::gemv_batch_runtime<packets::W1, MATRIX_R>(x, out, down, m_rows, H, uint(SEISMIC_DIM_S),
+                    tile, shared, GATHERED_SUMMED_SIMDGROUPS, sg, lane);
+            } else {
+                constexpr uint CHUNK = gathered_summed_chunk<ROWS, LANES>();
+                for (uint base = 0u; base < m_rows; base += CHUNK) {
+                    const uint chunk = min(CHUNK, m_rows - base);
+                    if (base > 0u)
+                        threadgroup_barrier(mem_flags::mem_threadgroup);
+                    const auto in = activation(shared_product + ulong(base) * SEISMIC_SHARED_PRODUCT_STRIDE_0 * Act::bytes,
+                        SEISMIC_SHARED_PRODUCT_STRIDE_0, SEISMIC_SHARED_PRODUCT_STRIDE_1, uint(SEISMIC_DIM_S));
+                    project_channels_published_chunk<packets::W1, ROWS, LANES, uint(SEISMIC_DIM_S), H, NVFP4>(
                         in, down, chunk, tg.products + base, sg_first, H, uint(SEISMIC_DIM_S), tg.staged, published,
-                        tid, lane)));
+                        tid, lane);
+                }
             }
         }
     }

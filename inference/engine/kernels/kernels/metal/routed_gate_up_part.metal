@@ -56,7 +56,7 @@ kernel void routed_gate_up_part_choice(ROUTED_GATE_UP_PART_PORTS) {
 }
 #endif
 #ifdef SEISMIC_FORMING_ROUTED_GATE_UP_PART_GATHER
-template <uint ROWS, uint LANES>
+template <uint ROWS, uint LANES, uint MATRIX>
 kernel void routed_gate_up_part_gather(
     device const int *routes [[buffer(SEISMIC_BUFFER_ROUTES)]],
     device const int *sources [[buffer(SEISMIC_BUFFER_SOURCES)]],
@@ -79,7 +79,7 @@ kernel void routed_gate_up_part_gathered_one(
 }
 #endif
 #ifdef SEISMIC_FORMING_ROUTED_GATE_UP_PART_GATHERED
-template <uint ROWS, uint LANES>
+template <uint ROWS, uint LANES, uint MATRIX>
 kernel void routed_gate_up_part_gathered(
     ROUTED_GATE_UP_PART_PORTS,
     device const routed::Worklist *worklist [[buffer(SEISMIC_BUFFER_SCRATCH_WORKLIST)]]) {

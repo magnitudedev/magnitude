@@ -367,7 +367,8 @@ kernel void attention_decode_k8v4_partial_multi(
     constexpr uint KV = SEISMIC_DIM_KV;
     constexpr uint G = SEISMIC_DIM_G;
     constexpr uint PARTS = SEISMIC_TUNE_PARTS;
-    constexpr uint MULTI_TOKENS = 8;
+    constexpr bool WIDE_BANDED = (W == 256 && G > 8);
+    constexpr uint MULTI_TOKENS = WIDE_BANDED ? 4 : 8;
     constexpr uint MULTI_SIMDS = 8;
     constexpr uint MULTI_HEAD_BAND = G > 8 ? 8 : 0;
     constexpr uint HEAD_BANDS = (G + 7) / 8;

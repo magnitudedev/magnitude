@@ -164,14 +164,23 @@ constant constexpr uint TALL_TILES = (uint(SEISMIC_DIM_T) + 63u) / 64u;
 template <uint TILE_M, uint TILE_N>
 kernel void routed_experts_grids(EXPERTS_ARGUMENTS) {
     const uint t = uint(SEISMIC_DIM_T), f = uint(SEISMIC_DIM_F), h = uint(SEISMIC_DIM_H), blocks_used = uint(used[0]);
-    routed::expert_grids(uint(rows[0]), blocks_used, t, (t + TILE_M - 1) / TILE_M, (f * 2 + TILE_N - 1) / TILE_N,
-        (h + TILE_N - 1) / TILE_N, stage_grid, expand_grid, quantize_grid, down_grid);
+    const bool coalesce_default = (SEISMIC_DIM_T == 32) && (TILE_M == 64);
+    const uint default_tiles = coalesce_default
+        ? routed::write_tall_tiles(blocks, SEISMIC_BLOCKS_STRIDE_0, blocks_used,
+              routed::tall_tiles(tables, uint(SEISMIC_DIM_B)))
+        : blocks_used * ((t + TILE_M - 1) / TILE_M);
+    routed::write_grid(stage_grid, uint(rows[0]), 1);
+    routed::write_grid(expand_grid, (f * 2 + TILE_N - 1) / TILE_N, default_tiles);
+    routed::write_grid(quantize_grid, blocks_used * t, 1);
+    routed::write_grid(down_grid, (h + TILE_N - 1) / TILE_N, default_tiles);
     if (int(SEISMIC_RUNTIME_TALL) != 0) {
         const auto form = routed::form_of(int(SEISMIC_RUNTIME_INT8), int(SEISMIC_RUNTIME_PACK));
         const bool coalesce = (SEISMIC_DIM_T == 32) && (form == routed::gemm_form::tall);
         const uint count = coalesce
-            ? routed::write_tall_tiles(blocks, SEISMIC_BLOCKS_STRIDE_0, blocks_used,
-                  routed::tall_tiles(tables, uint(SEISMIC_DIM_B)))
+            ? (coalesce_default
+                ? default_tiles
+                : routed::write_tall_tiles(blocks, SEISMIC_BLOCKS_STRIDE_0, blocks_used,
+                      routed::tall_tiles(tables, uint(SEISMIC_DIM_B))))
             : blocks_used;
         routed::form_grids(form, count, coalesce ? 64u : t, f, h, 2, expand_grid, table_grid, tile_grid);
     }
@@ -196,6 +205,21 @@ kernel void routed_experts_stage(EXPERTS_ARGUMENTS,
 template <uint TILE_M, uint TILE_N>
 kernel void routed_experts_expand(EXPERTS_ARGUMENTS, PROJECTION_TILE_ARGUMENTS) {
     PROJECTION_GEMM_SHARED(tile_memory, TILE_M, TILE_N);
+    if constexpr (SEISMIC_DIM_T == 32 && TILE_M == 64) {
+        const uint packed = routed::tall_tiles(tables, uint(SEISMIC_DIM_B))[tile.y];
+        const uint block = packed >> 1u;
+        const bool two = (packed & 1u) != 0u;
+        const uint span_rows = two ? (32u + EXPERTS_LIVE(block + 1u)) : EXPERTS_LIVE(block);
+        if (span_rows == 0u)
+            return;
+        EXPERTS_BLOCK(block);
+        EXPERTS_EXPANSION;
+        const routed::Grouped in = EXPERTS_BLOCK_ROWS(block);
+        const auto out = EXPERTS_PRODUCTS(block);
+        routed::expert_paired<packets::W0, packets::W1, TILE_M, TILE_N>(in, out, gate, up, span_rows,
+            span_rows, uint(SEISMIC_DIM_F), uint(SEISMIC_DIM_H), 0u, tile.x, tile_memory, sg, lane);
+        return;
+    }
     const uint subtiles = (uint(SEISMIC_DIM_T) + TILE_M - 1) / TILE_M;
     const uint block = tile.y / subtiles;
     EXPERTS_BLOCK(block);
@@ -441,6 +465,23 @@ kernel void routed_experts_down_grids(EXPERTS_ARGUMENTS) {
 template <uint TILE_M, uint TILE_N>
 kernel void routed_experts_down(EXPERTS_ARGUMENTS, PROJECTION_TILE_ARGUMENTS) {
     PROJECTION_GEMM_SHARED(tile_memory, TILE_M, TILE_N);
+    if constexpr (SEISMIC_DIM_T == 32 && TILE_M == 64) {
+        const uint packed = routed::tall_tiles(tables, uint(SEISMIC_DIM_B))[tile.y];
+        const uint block = packed >> 1u;
+        const bool two = (packed & 1u) != 0u;
+        const uint span_rows = two ? (32u + EXPERTS_LIVE(block + 1u)) : EXPERTS_LIVE(block);
+        if (span_rows == 0u)
+            return;
+        EXPERTS_BLOCK(block);
+        EXPERTS_DOWN;
+        const auto in = EXPERTS_BLOCK_PRODUCTS(block);
+        const routed::BlockOutput<ELEMENT_OF(SEISMIC_RESULT_0)> block_out{
+            element::Out<ELEMENT_OF(SEISMIC_RESULT_0)>(output_cells).offset(ulong(block) * SEISMIC_RESULT_0_STRIDE_0),
+            SEISMIC_RESULT_0_STRIDE_0, SEISMIC_RESULT_0_STRIDE_1, SEISMIC_RESULT_0_STRIDE_2, 32u};
+        routed::expert_plain<packets::W2, TILE_M, TILE_N>(in, block_out, down, span_rows, span_rows,
+            uint(SEISMIC_DIM_H), uint(SEISMIC_DIM_F), 0u, tile.x, tile_memory, sg, lane);
+        return;
+    }
     const uint subtiles = (uint(SEISMIC_DIM_T) + TILE_M - 1) / TILE_M;
     const uint block = tile.y / subtiles;
     EXPERTS_BLOCK(block);

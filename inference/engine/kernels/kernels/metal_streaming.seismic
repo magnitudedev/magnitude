@@ -30,27 +30,11 @@ native routed_route_streamed for metal from "metal/routed_route_streamed.metal":
     scratch logits bytes (M * (E + 1) * 4)
     scratch arrivals bytes (4) sync
 
-native routed_hint_route for metal from "metal/routed_hint_route.metal":
-    static (H, PT, NM, K, AHEAD, EN)
-    where H % 32 == 0 and EN <= 1024 and K <= 32
-    project dense segmented (next_router, after_router) rows rms ordered (next_router, after_router)
-    unless (next_policy[POLICY_WHOLE])
-    scratch logits bytes (2 * M * EN * 4)
-    scratch arrivals bytes (4) sync
-
 native routed_select_streamed for metal from "metal/routed_select_streamed.metal":
     static (H, E, K, ES, TM)
     where H % 32 == 0 and E <= 1024 and K <= E and K <= 32
     project dense single (router) rows rms ordered (router)
     scratch logits bytes (M * E * 4)
-    scratch arrivals bytes (4) sync
-
-native routed_hint_select for metal from "metal/routed_hint_select.metal":
-    static (H, K, AHEAD, EN)
-    where H % 32 == 0 and EN <= 1024 and K <= EN and K <= 32
-    project dense segmented (next_router, after_router) rows rms ordered (next_router, after_router)
-    unless (next_policy[POLICY_WHOLE])
-    scratch logits bytes (2 * M * EN * 4)
     scratch arrivals bytes (4) sync
 
 # Metal: one threadgroup; its threads widen the rows into the slot through

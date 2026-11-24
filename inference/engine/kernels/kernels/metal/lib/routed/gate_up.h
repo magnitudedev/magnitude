@@ -61,14 +61,17 @@ typedef projection::operands<NVFP4> Operands;
         SEISMIC_DIM_F, SEISMIC_DIM_H, tile, shared, simdgroups, sg, lane);
 
 // The compact worklist builder (`routed::build_worklist`): emits unique active
-// `(expert, source)` entries and the indirect grid `(CHOICE_GROUPS, count, 1)`.
+// `(expert, source)` entries and the indirect grids.
 #define ROUTED_GATE_UP_GATHER_BODY                                                                                     \
     threadgroup int cache[routed::WORKLIST_CACHE_WORDS];                                                               \
     const uint per_group = uint(SEISMIC_RUNTIME_SIMDGROUPS) * ROWS * (32u / LANES);                                    \
-    const uint x_groups = (uint(SEISMIC_DIM_F) + per_group - 1u) / per_group;                                          \
+    const uint x_groups_one = (uint(SEISMIC_DIM_F) + per_group - 1u) / per_group;                                      \
+    const uint x_groups_multi = MATRIX                                                                                 \
+        ? ((uint(SEISMIC_DIM_F) + uint(SEISMIC_RUNTIME_SIMDGROUPS) * 8u - 1u) / (uint(SEISMIC_RUNTIME_SIMDGROUPS) * 8u)) \
+        : x_groups_one;                                                                                                \
     routed::build_worklist(routes, SEISMIC_ROUTES_STRIDE_0, SEISMIC_ROUTES_STRIDE_1, sources, ROUTED_SOURCE_ROWS,      \
-        SEISMIC_SOURCES_STRIDE_1, SEISMIC_SOURCES_STRIDE_2, uint(SEISMIC_DIM_M), uint(SEISMIC_DIM_K), x_groups, 0u,    \
-        worklist, gather_grid, gather_one_grid, cache, lane,                                                           \
+        SEISMIC_SOURCES_STRIDE_1, SEISMIC_SOURCES_STRIDE_2, uint(SEISMIC_DIM_M), uint(SEISMIC_DIM_K), x_groups_one,    \
+        x_groups_multi, 0u, worklist, gather_grid, gather_one_grid, cache, lane,                                       \
         [&](uint c, slab::Source source) { return ROUTED_GATE_UP_ACTIVE(c, source); });
 
 // Singleton gathered body (`r == 1`): instantiates ONLY `MAXM = 1`, matching
@@ -107,13 +110,19 @@ typedef projection::operands<NVFP4> Operands;
         SEISMIC_DIM_H, tile, shared, simdgroups, sg, lane);
 
 // Multi-row gathered body (`r >= 2`): reads `worklist->entries[capacity - 1 - group.y]`
-// and projects all `r` rows in chunks of <= 4 with `MAXM in {2, 4}` and 8 KB staging.
+// and projects all `r` rows in one weight pass using `simdgroup_matrix` (`SEISMIC_TUNE_MATRIX`),
+// or in chunks of <= 8 with `MAXM in {2, 4, 8}` and 16 KB staging when `SEISMIC_TUNE_MATRIX == 0`.
 #define ROUTED_GATE_UP_GATHERED_BODY                                                                                   \
     typedef routed::Act A;                                                                                             \
     const element::Out<A> product(product_cells);                                                                      \
     const uint tile = group.x;                                                                                         \
-    if (ulong(tile) * simdgroups * ROWS * (32u / LANES) >= SEISMIC_DIM_F)                                              \
-        return;                                                                                                        \
+    if constexpr (MATRIX != 0) {                                                                                       \
+        if (ulong(tile) * simdgroups * 8u >= SEISMIC_DIM_F)                                                            \
+            return;                                                                                                    \
+    } else {                                                                                                           \
+        if (ulong(tile) * simdgroups * ROWS * (32u / LANES) >= SEISMIC_DIM_F)                                          \
+            return;                                                                                                    \
+    }                                                                                                                  \
     device const routed::WorkEntry &entry = worklist->entries[worklist->capacity - 1u - group.y];                      \
     const routed::Gathered chosen =                                                                                    \
         routed::unpack_work_entry(entry, ROUTED_GATE_UP_PRODUCT_STRIDE_0, ROUTED_GATE_UP_PRODUCT_STRIDE_1);            \
@@ -135,19 +144,32 @@ typedef projection::operands<NVFP4> Operands;
         ulong(chosen.expert));                                                                                         \
     const uint rows = chosen.count;                                                                                    \
     PROJECTION_OPERANDS_SHARED(globals, NVFP4);                                                                        \
-    for (uint base = 0u; base < rows; base += 4u) {                                                                    \
-        const uint chunk = min(4u, rows - base);                                                                       \
-        if (base > 0u)                                                                                                 \
-            threadgroup_barrier(mem_flags::mem_threadgroup);                                                           \
+    if constexpr (MATRIX != 0) {                                                                                       \
         const projection::Plain<A, routed::Listed> in{normalized, SEISMIC_NORMALIZED_STRIDE_0,                         \
-            SEISMIC_NORMALIZED_STRIDE_1, uint(SEISMIC_DIM_H), routed::Listed{chosen.rows + base}};                     \
+            SEISMIC_NORMALIZED_STRIDE_1, uint(SEISMIC_DIM_H), routed::Listed{chosen.rows}};                            \
         const auto out = projection::scaling<(SEISMIC_DIM_GS + SEISMIC_DIM_US != 0)>::wrap(                            \
             routed::ChoiceRows<projection::Glu<A>>{                                                                    \
                 projection::Glu<A>{product, 1, ROUTED_GATE_UP_PRODUCT_STRIDE_2, int(SEISMIC_PARAM_ACTIVATION)},        \
-                chosen.products + base},                                                                               \
+                chosen.products},                                                                                      \
             gate_sc, up_sc);                                                                                           \
-        const auto x = Operands::rows(in, chunk, uint(SEISMIC_DIM_H), globals, simdgroups, sg, lane);                  \
-        PROJECTION_FOR_ROWS_24(chunk,                                                                                  \
-            (projection::gemv_paired_runtime<packets::W0, packets::W1, ROWS, MAXM, LANES, 128u>(x, out, gate, up,      \
-                chunk, SEISMIC_DIM_F, SEISMIC_DIM_H, tile, shared, simdgroups, sg, lane)));                            \
+        const auto x = Operands::rows(in, rows, uint(SEISMIC_DIM_H), globals, simdgroups, sg, lane);                   \
+        projection::gemv_batch_paired_runtime<packets::W0, packets::W1, 1u>(x, out, gate, up, rows, SEISMIC_DIM_F,     \
+            SEISMIC_DIM_H, tile, shared, simdgroups, sg, lane);                                                        \
+    } else {                                                                                                           \
+        for (uint base = 0u; base < rows; base += 8u) {                                                                \
+            const uint chunk = min(8u, rows - base);                                                                   \
+            if (base > 0u)                                                                                             \
+                threadgroup_barrier(mem_flags::mem_threadgroup);                                                       \
+            const projection::Plain<A, routed::Listed> in{normalized, SEISMIC_NORMALIZED_STRIDE_0,                     \
+                SEISMIC_NORMALIZED_STRIDE_1, uint(SEISMIC_DIM_H), routed::Listed{chosen.rows + base}};                 \
+            const auto out = projection::scaling<(SEISMIC_DIM_GS + SEISMIC_DIM_US != 0)>::wrap(                        \
+                routed::ChoiceRows<projection::Glu<A>>{                                                                \
+                    projection::Glu<A>{product, 1, ROUTED_GATE_UP_PRODUCT_STRIDE_2, int(SEISMIC_PARAM_ACTIVATION)},    \
+                    chosen.products + base},                                                                           \
+                gate_sc, up_sc);                                                                                       \
+            const auto x = Operands::rows(in, chunk, uint(SEISMIC_DIM_H), globals, simdgroups, sg, lane);              \
+            PROJECTION_FOR_ROWS_248(chunk,                                                                             \
+                (projection::gemv_paired_runtime<packets::W0, packets::W1, ROWS, MAXM, LANES, 256u>(x, out, gate, up,  \
+                    chunk, SEISMIC_DIM_F, SEISMIC_DIM_H, tile, shared, simdgroups, sg, lane)));                        \
+        }                                                                                                              \
     }

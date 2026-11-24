@@ -880,20 +880,24 @@ struct RegPairOrderedNorm {
     }
 };
 
-template <typename RawIn, uint MAXM>
-struct RegOrderedNorm {
+template <typename RawIn>
+struct SharedOrderedNorm {
     typedef typename RawIn::activation activation;
     RawIn raw;
-    float inv[MAXM];
+    threadgroup const float *inv;
     uint width() const { return raw.width(); }
     void load8(uint m, uint k, float, thread float4 &even, thread float4 &odd) const {
         raw.load8(m, k, inv[m], even, odd);
     }
 };
-
 template <uint MAXM>
 struct RegGlobals {
     float g[MAXM];
+    float at(uint m) const { return g[m]; }
+};
+
+struct SharedGlobals {
+    threadgroup const float *g;
     float at(uint m) const { return g[m]; }
 };
 
@@ -942,11 +946,40 @@ inline void gemv_prestaged_one(thread const RawIn &raw, thread const Out &out, t
     gemv_emit<false>::template run<PAIRED, R, 1u, LANES>(out, acc, acc2, 1u, rows, first_row, sub, loaded);
 }
 
+template <typename W0, typename W1, bool PAIRED, uint NB, typename In, typename Out>
+__attribute__((noinline))
+static void unordered_gemv_batch_run(thread const In &in, thread const Out &out,
+    thread const Weights<W0> &w0, thread const Weights<W1> &w1, uint m, uint n, uint k, uint tile,
+    threadgroup uchar *shared, uint simdgroups, uint sg, uint lane) {
+    gemv_batch_body<W0, W1, PAIRED, 1u, NB>(in, out, w0, w1, m, n, k, tile, shared, simdgroups, sg, lane);
+}
+
+template <typename In>
+struct RowOffsetIn {
+    typedef typename In::activation activation;
+    In base_in;
+    uint row_offset;
+    uint width() const { return base_in.width(); }
+    void load8(uint m, uint k, float inv, thread float4 &even, thread float4 &odd) const {
+        base_in.load8(row_offset + m, k, inv, even, odd);
+    }
+};
+
+template <typename Out>
+struct RowOffsetOut {
+    Out base_out;
+    uint row_offset;
+    void store(uint m, uint n, float v) const { base_out.store(row_offset + m, n, v); }
+    void store_pair(uint m, uint n, float gate, float up) const { base_out.store_pair(row_offset + m, n, gate, up); }
+};
+
 template <typename W0, typename W1, bool PAIRED, uint ROWS, uint MAXM, uint LANES, bool NVFP4, uint SIMDGROUPS,
     typename RawIn, typename Out>
 inline void unordered_from_ordered_maxm_run(thread const RawIn &raw, thread const Out &out,
     thread const Weights<W0> &w0, thread const Weights<W1> &w1, uint m, uint n, uint k, uint tile,
-    threadgroup uchar *shared, uint sg, uint lane) {
+    threadgroup uchar *shared, threadgroup float *inv_smem, threadgroup float *globals_smem, uint sg, uint lane) {
+    static_assert(!(MAXM > 8u && gemv_recipe<W0>::value), "gemv_recipe_rows supports at most 8 rows");
+    constexpr bool USE_BATCH = (MAXM > 8u) && !gemv_recipe<W0>::value;
     if constexpr (!NVFP4 && !gemv_recipe<W0>::value) {
         if constexpr (MAXM == 1u) {
             if (m == 1u && k > 0u && (k & 31u) == 0u && (k >> 5u) <= mixed_gemv_stage_packet_rows) {
@@ -955,41 +988,61 @@ inline void unordered_from_ordered_maxm_run(thread const RawIn &raw, thread cons
                 return;
             }
         }
-        constexpr uint min_shared_bytes = (MAXM == 1u) ? 1024u : ((MAXM == 2u) ? 1536u : ((MAXM == 4u) ? 2560u : ((MAXM == 8u) ? 4608u : 8704u)));
+        constexpr uint min_shared_bytes = USE_BATCH ? gemv_batch_shared_bytes
+            : ((MAXM == 1u) ? 1024u : ((MAXM == 2u) ? 1536u : ((MAXM == 4u) ? 2560u : 4608u)));
         const uint avail_bytes = metal::max(min_shared_bytes,
             metal::min(((k + 31u) >> 5u) * MAXM, mixed_gemv_stage_packet_rows) * 64u);
         threadgroup float *smem = reinterpret_cast<threadgroup float *>(shared);
         raw.ordered_inverses_sram(m, smem, smem, avail_bytes >> 2u, sg, lane, SIMDGROUPS);
-        RegOrderedNorm<RawIn, MAXM> input{raw, {}};
-        PROJECTION_UNROLL
-        for (uint r = 0; r < MAXM; ++r)
-            input.inv[r] = (r < m) ? smem[r] : 0.0f;
-        gemv_body<W0, W1, PAIRED, ROWS, MAXM, LANES, false, false, mixed_gemv_stage_packet_rows>(
-            input, out, w0, w1, m, n, k, tile, shared, SIMDGROUPS, sg, lane);
+        if (sg == 0u && lane < MAXM)
+            inv_smem[lane] = (lane < m) ? smem[lane] : 0.0f;
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        SharedOrderedNorm<RawIn> input{raw, inv_smem};
+        if constexpr (USE_BATCH) {
+            constexpr uint NB = (MAXM <= 8u) ? 1u : 2u;
+            unordered_gemv_batch_run<W0, W1, PAIRED, NB>(
+                input, out, w0, w1, m, n, k, tile, shared, SIMDGROUPS, sg, lane);
+        } else if constexpr (MAXM == 8u && PAIRED && ROWS > 2u) {
+            for (uint base = 0u; base < m; base += 4u) {
+                const uint chunk = metal::min(4u, m - base);
+                const RowOffsetIn<SharedOrderedNorm<RawIn>> sliced_in{input, base};
+                const RowOffsetOut<Out> sliced_out{out, base};
+                gemv_body<W0, W1, PAIRED, ROWS, 4u, LANES, false, false, mixed_gemv_stage_packet_rows>(
+                    sliced_in, sliced_out, w0, w1, chunk, n, k, tile, shared, SIMDGROUPS, sg, lane);
+            }
+        } else {
+            gemv_body<W0, W1, PAIRED, ROWS, MAXM, LANES, false, false, mixed_gemv_stage_packet_rows>(
+                input, out, w0, w1, m, n, k, tile, shared, SIMDGROUPS, sg, lane);
+        }
     } else {
-        constexpr uint min_shared_bytes = (MAXM == 1u) ? 1024u : ((MAXM == 2u) ? 1536u : ((MAXM == 4u) ? 2560u : ((MAXM == 8u) ? 4608u : 8704u)));
+        constexpr uint min_shared_bytes = USE_BATCH ? gemv_batch_shared_bytes
+            : ((MAXM == 1u) ? 1024u : ((MAXM == 2u) ? 1536u : ((MAXM == 4u) ? 2560u : ((MAXM == 8u) ? 4608u : 8704u))));
         const uint avail_bytes = metal::max(min_shared_bytes,
             metal::min(((k + 31u) >> 5u) * MAXM, mixed_gemv_stage_packet_rows) * 64u);
         threadgroup float *smem = reinterpret_cast<threadgroup float *>(shared);
         raw.ordered_inverses_sram(m, smem, smem, avail_bytes >> 2u, sg, lane, SIMDGROUPS);
-        RegOrderedNorm<RawIn, MAXM> input{raw, {}};
-        PROJECTION_UNROLL
-        for (uint r = 0; r < MAXM; ++r)
-            input.inv[r] = (r < m) ? smem[r] : 0.0f;
+        if (sg == 0u && lane < MAXM)
+            inv_smem[lane] = (lane < m) ? smem[lane] : 0.0f;
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        SharedOrderedNorm<RawIn> input{raw, inv_smem};
         if constexpr (NVFP4) {
             operands<true>::rows(input, m, k, smem, SIMDGROUPS, sg, lane);
             threadgroup_barrier(mem_flags::mem_threadgroup);
-            RegGlobals<MAXM> rg = {};
-            PROJECTION_UNROLL
-            for (uint r = 0; r < MAXM; ++r)
-                rg.g[r] = (r < m) ? smem[r] : 0.0f;
-            const Nvfp4Rows<RegOrderedNorm<RawIn, MAXM>, RegGlobals<MAXM>> x{input, rg};
-            if constexpr (gemv_recipe<W0>::value)
+            if (sg == 0u && lane < MAXM)
+                globals_smem[lane] = (lane < m) ? smem[lane] : 0.0f;
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            const Nvfp4Rows<SharedOrderedNorm<RawIn>, SharedGlobals> x{input, SharedGlobals{globals_smem}};
+            if constexpr (gemv_recipe<W0>::value) {
                 gemv_recipe_rows<W0, ROWS, LANES, mixed_gemv_stage_packet_rows>(x, out, w0, m, n, k, tile, shared,
                     SIMDGROUPS, sg, lane);
-            else
+            } else if constexpr (USE_BATCH) {
+                constexpr uint NB = (MAXM <= 8u) ? 1u : 2u;
+                unordered_gemv_batch_run<W0, W1, PAIRED, NB>(
+                    x, out, w0, w1, m, n, k, tile, shared, SIMDGROUPS, sg, lane);
+            } else {
                 gemv_body<W0, W1, PAIRED, ROWS, MAXM, LANES, false, false, mixed_gemv_stage_packet_rows>(
                     x, out, w0, w1, m, n, k, tile, shared, SIMDGROUPS, sg, lane);
+            }
         } else {
             gemv_recipe_rows<W0, ROWS, LANES, mixed_gemv_stage_packet_rows>(input, out, w0, m, n, k, tile, shared,
                 SIMDGROUPS, sg, lane);
@@ -1006,13 +1059,15 @@ inline void unordered_from_ordered_maxm_run(thread const RawIn &raw, thread cons
         else { constexpr uint MAXM = 8; __VA_ARGS__; }                          \
     } while (0)
 
-// Instantiate a GEMV body for the activation-row bound MAXM in {2, 4}
+// Instantiate a GEMV body for the activation-row bound MAXM in {2, 4, 8}
 // (multi-row gathered kernels handle r == 1 in a dedicated MAXM = 1 launch
-// and chunk r > 4 by 4, eliminating both 1-row and 8-row register bloat).
-#define PROJECTION_FOR_ROWS_24(rows, ...)                                       \
+// and chunk r > 8 by 8, avoiding 1-row register bloat while covering up to
+// 8 rows in a single weight pass).
+#define PROJECTION_FOR_ROWS_248(rows, ...)                                      \
     do {                                                                        \
         if ((rows) <= 2) { constexpr uint MAXM = 2; __VA_ARGS__; }              \
-        else { constexpr uint MAXM = 4; __VA_ARGS__; }                          \
+        else if ((rows) <= 4) { constexpr uint MAXM = 4; __VA_ARGS__; }         \
+        else { constexpr uint MAXM = 8; __VA_ARGS__; }                          \
     } while (0)
 
 // The same in the launches of an entry that launches its GEMV per row count,

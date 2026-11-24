@@ -13,7 +13,7 @@
     device const int *sources [[buffer(SEISMIC_BUFFER_SOURCES)]],               \
     device const ulong *expert_down [[buffer(SEISMIC_BUFFER_EXPERT_DOWN)]],     \
     device const ulong *tier_down [[buffer(SEISMIC_BUFFER_TIER_DOWN)]],         \
-    SEISMIC_RESULT_0_PARAM(published_cells),                                    \
+    SEISMIC_OUT_PUBLISHED_PARAM(published_cells),                               \
     constant ulong *seismic_words [[buffer(SEISMIC_BUFFER_WORDS)]],             \
     uint2 group [[threadgroup_position_in_grid]],                               \
     uint tid [[thread_index_in_threadgroup]],                                   \
@@ -24,7 +24,7 @@
 template <uint ROWS, uint LANES>
 kernel void routed_down_project_summed(ROUTED_DOWN_PROJECT_PORTS) {
     constexpr uint TILE = routed::down_tile<ROWS, LANES>();
-    const element::Out<ELEMENT_OF(SEISMIC_RESULT_0)> published(published_cells);
+    const element::Out<ELEMENT_OF(SEISMIC_ELEMENT_A)> published(published_cells);
     threadgroup float projected[uint(SEISMIC_DIM_K)][routed::down_region<ROWS, LANES>()];
     const ulong m = group.y;
     const uint first = group.x * TILE;
@@ -35,8 +35,8 @@ kernel void routed_down_project_summed(ROUTED_DOWN_PROJECT_PORTS) {
     if (tid >= TILE || n >= uint(SEISMIC_DIM_H))
         return;
     for (uint k = 0; k < uint(SEISMIC_DIM_K); ++k)
-        published.put(m * SEISMIC_RESULT_0_STRIDE_0 + ulong(k) * SEISMIC_RESULT_0_STRIDE_1
-            + ulong(n) * SEISMIC_RESULT_0_STRIDE_2, projected[k][tid]);
+        published.put(m * SEISMIC_PUBLISHED_STRIDE_0 + ulong(k) * SEISMIC_PUBLISHED_STRIDE_1
+            + ulong(n) * SEISMIC_PUBLISHED_STRIDE_2, projected[k][tid]);
 }
 #endif
 
@@ -66,29 +66,30 @@ kernel void routed_down_project_gathered_one(
     device const routed::Worklist *worklist [[buffer(SEISMIC_BUFFER_SCRATCH_WORKLIST)]]) {
     constexpr uint TILE = routed::down_tile<ROWS, LANES>();
     constexpr uint SLOTS = uint(SEISMIC_DIM_K);
-    threadgroup routed::GatheredSummedShared<LANES, true> tg;
+    threadgroup routed::GatheredSummedShared<LANES, true, false> tg;
     const uint first = group.x * (routed::GATHERED_SUMMED_SIMDGROUPS * TILE);
     const routed::OutPublishedSlots<SLOTS> published{
-        element::Out<ELEMENT_OF(SEISMIC_RESULT_0)>(published_cells),
-        SEISMIC_RESULT_0_STRIDE_0, SEISMIC_RESULT_0_STRIDE_1, SEISMIC_RESULT_0_STRIDE_2};
-    routed::down_project_gathered<ROWS, LANES, true>(product, worklist, expert_down, tier_down, group.y, first, tid,
-        sg, lane, tg, published, seismic_words);
+        element::Out<ELEMENT_OF(SEISMIC_ELEMENT_A)>(published_cells),
+        SEISMIC_PUBLISHED_STRIDE_0, SEISMIC_PUBLISHED_STRIDE_1, SEISMIC_PUBLISHED_STRIDE_2};
+    routed::down_project_gathered<ROWS, LANES, true, false>(product, worklist, expert_down, tier_down, group.x,
+        group.y, first, tid, sg, lane, tg, nullptr, published, seismic_words);
 }
 #endif
 
 #ifdef SEISMIC_FORMING_ROUTED_DOWN_PROJECT_GATHERED
-template <uint ROWS, uint LANES>
+template <uint ROWS, uint LANES, uint MATRIX>
 kernel void routed_down_project_gathered(
     ROUTED_DOWN_PROJECT_PORTS,
-    device const routed::Worklist *worklist [[buffer(SEISMIC_BUFFER_SCRATCH_WORKLIST)]]) {
+    device const routed::Worklist *worklist [[buffer(SEISMIC_BUFFER_SCRATCH_WORKLIST)]],
+    threadgroup uchar *shared [[threadgroup(0)]]) {
     constexpr uint TILE = routed::down_tile<ROWS, LANES>();
     constexpr uint SLOTS = uint(SEISMIC_DIM_K);
-    threadgroup routed::GatheredSummedShared<LANES, false> tg;
+    threadgroup routed::GatheredSummedShared<LANES, false, (MATRIX != 0)> tg;
     const uint first = group.x * (routed::GATHERED_SUMMED_SIMDGROUPS * TILE);
     const routed::OutPublishedSlots<SLOTS> published{
-        element::Out<ELEMENT_OF(SEISMIC_RESULT_0)>(published_cells),
-        SEISMIC_RESULT_0_STRIDE_0, SEISMIC_RESULT_0_STRIDE_1, SEISMIC_RESULT_0_STRIDE_2};
-    routed::down_project_gathered<ROWS, LANES, false>(product, worklist, expert_down, tier_down, group.y, first, tid,
-        sg, lane, tg, published, seismic_words);
+        element::Out<ELEMENT_OF(SEISMIC_ELEMENT_A)>(published_cells),
+        SEISMIC_PUBLISHED_STRIDE_0, SEISMIC_PUBLISHED_STRIDE_1, SEISMIC_PUBLISHED_STRIDE_2};
+    routed::down_project_gathered<ROWS, LANES, false, (MATRIX != 0)>(product, worklist, expert_down, tier_down,
+        group.x, group.y, first, tid, sg, lane, tg, shared, published, seismic_words);
 }
 #endif

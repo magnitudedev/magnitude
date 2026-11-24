@@ -62,8 +62,8 @@ constant constexpr bool SHARED_NVFP4 =
         SEISMIC_DIM_H);                                                                                 \
     const uint rows = uint(SEISMIC_DIM_M);                                                              \
     PROJECTION_OPERANDS_SHARED(globals, SHARED_NVFP4);                                                  \
-    for (uint base = 0u; base < rows; base += 4u) {                                                     \
-        const uint chunk = min(4u, rows - base);                                                        \
+    for (uint base = 0u; base < rows; base += 8u) {                                                     \
+        const uint chunk = min(8u, rows - base);                                                        \
         if (base > 0u)                                                                                  \
             threadgroup_barrier(mem_flags::mem_threadgroup);                                            \
         const auto in = routed::activation(normalized + ulong(base) * SEISMIC_NORMALIZED_STRIDE_0 * A::bytes, \
@@ -73,7 +73,7 @@ constant constexpr bool SHARED_NVFP4 =
         const auto x = projection::operands<SHARED_NVFP4>::rows(in, chunk, uint(SEISMIC_DIM_H), globals, \
             simdgroups, sg, lane);                                                                      \
         FOR_ROWS(chunk,                                                                                 \
-            (projection::gemv_paired_runtime<packets::W2, packets::W3, R, MAXM, L, 128u>(x, out, gate,  \
+            (projection::gemv_paired_runtime<packets::W2, packets::W3, R, MAXM, L, 256u>(x, out, gate,  \
                 up, chunk, SEISMIC_DIM_S, SEISMIC_DIM_H, tile, shared, simdgroups, sg, lane)));         \
     }
 
@@ -113,7 +113,7 @@ kernel void routed_expand_choice(ROUTED_EXPAND_PORTS) {
 #endif
 
 #ifdef SEISMIC_FORMING_ROUTED_EXPAND_GATHER
-template <uint ROWS, uint LANES>
+template <uint ROWS, uint LANES, uint MATRIX>
 kernel void routed_expand_gather(
     device const int *routes [[buffer(SEISMIC_BUFFER_ROUTES)]],
     device routed::Worklist *worklist [[buffer(SEISMIC_BUFFER_SCRATCH_WORKLIST)]],
@@ -124,9 +124,12 @@ kernel void routed_expand_gather(
     threadgroup int cache[routed::WORKLIST_CACHE_WORDS];
     const uint max_n = uint(SEISMIC_DIM_F) > uint(SEISMIC_DIM_S) ? uint(SEISMIC_DIM_F) : uint(SEISMIC_DIM_S);
     const uint per_group = uint(SEISMIC_RUNTIME_SIMDGROUPS) * ROWS * (32u / LANES);
-    const uint x_groups = (max_n + per_group - 1u) / per_group;
+    const uint x_groups_one = (max_n + per_group - 1u) / per_group;
+    const uint x_groups_multi = MATRIX
+        ? ((max_n + uint(SEISMIC_RUNTIME_SIMDGROUPS) * 8u - 1u) / (uint(SEISMIC_RUNTIME_SIMDGROUPS) * 8u))
+        : x_groups_one;
     routed::build_worklist(routes, SEISMIC_ROUTES_STRIDE_0, SEISMIC_ROUTES_STRIDE_1, uint(SEISMIC_DIM_M),
-        uint(SEISMIC_DIM_K), x_groups, 1u, worklist, gather_grid, gather_one_grid, cache, lane);
+        uint(SEISMIC_DIM_K), x_groups_one, x_groups_multi, 1u, worklist, gather_grid, gather_one_grid, cache, lane);
 }
 #endif
 
@@ -165,7 +168,7 @@ kernel void routed_expand_gathered_one(
 #endif
 
 #ifdef SEISMIC_FORMING_ROUTED_EXPAND_GATHERED
-template <uint ROWS, uint LANES>
+template <uint ROWS, uint LANES, uint MATRIX>
 kernel void routed_expand_gathered(
     ROUTED_EXPAND_PORTS,
     device const routed::Worklist *worklist [[buffer(SEISMIC_BUFFER_SCRATCH_WORKLIST)]]) {
@@ -175,7 +178,11 @@ kernel void routed_expand_gathered(
     ROUTED_EXPAND_RESULTS;
     const uint tile = group.x;
     if (group.y < worklist->multi_count) {
-        if (ulong(tile) * simdgroups * R * (32u / L) >= SEISMIC_DIM_F) return;
+        if constexpr (MATRIX != 0) {
+            if (ulong(tile) * simdgroups * 8u >= SEISMIC_DIM_F) return;
+        } else {
+            if (ulong(tile) * simdgroups * R * (32u / L) >= SEISMIC_DIM_F) return;
+        }
         const routed::Gathered chosen = routed::unpack_work_entry(
             worklist->entries[worklist->capacity - 1u - group.y], SEISMIC_RESULT_0_STRIDE_0,
             SEISMIC_RESULT_0_STRIDE_1);
@@ -189,24 +196,54 @@ kernel void routed_expand_gathered(
             ulong(chosen.expert));
         const uint rows = chosen.count;
         PROJECTION_OPERANDS_SHARED(globals, EXPERT_NVFP4);
-        for (uint base = 0u; base < rows; base += 4u) {
-            const uint chunk = min(4u, rows - base);
-            if (base > 0u)
-                threadgroup_barrier(mem_flags::mem_threadgroup);
+        if constexpr (MATRIX != 0) {
             const projection::Plain<A, routed::Listed> in{normalized, SEISMIC_NORMALIZED_STRIDE_0,
-                SEISMIC_NORMALIZED_STRIDE_1, uint(SEISMIC_DIM_H), routed::Listed{chosen.rows + base}};
+                SEISMIC_NORMALIZED_STRIDE_1, uint(SEISMIC_DIM_H), routed::Listed{chosen.rows}};
             const auto out = projection::scaling<(SEISMIC_DIM_GS + SEISMIC_DIM_US != 0)>::wrap(
                 routed::ChoiceRows<projection::SiluMul<A>>{
-                    projection::SiluMul<A>{expert_product, 1, SEISMIC_RESULT_0_STRIDE_2}, chosen.products + base},
+                    projection::SiluMul<A>{expert_product, 1, SEISMIC_RESULT_0_STRIDE_2}, chosen.products},
                 gate_sc, up_sc);
-            const auto x = projection::operands<EXPERT_NVFP4>::rows(in, chunk, uint(SEISMIC_DIM_H), globals,
+            const auto x = projection::operands<EXPERT_NVFP4>::rows(in, rows, uint(SEISMIC_DIM_H), globals,
                 simdgroups, sg, lane);
-            PROJECTION_FOR_ROWS_24(chunk,
-                (projection::gemv_paired_runtime<packets::W0, packets::W1, R, MAXM, L, 128u>(x, out, gate, up, chunk,
-                    SEISMIC_DIM_F, SEISMIC_DIM_H, tile, shared, simdgroups, sg, lane)));
+            projection::gemv_batch_paired_runtime<packets::W0, packets::W1, 1u>(x, out, gate, up, rows,
+                SEISMIC_DIM_F, SEISMIC_DIM_H, tile, shared, simdgroups, sg, lane);
+        } else {
+            for (uint base = 0u; base < rows; base += 8u) {
+                const uint chunk = min(8u, rows - base);
+                if (base > 0u)
+                    threadgroup_barrier(mem_flags::mem_threadgroup);
+                const projection::Plain<A, routed::Listed> in{normalized, SEISMIC_NORMALIZED_STRIDE_0,
+                    SEISMIC_NORMALIZED_STRIDE_1, uint(SEISMIC_DIM_H), routed::Listed{chosen.rows + base}};
+                const auto out = projection::scaling<(SEISMIC_DIM_GS + SEISMIC_DIM_US != 0)>::wrap(
+                    routed::ChoiceRows<projection::SiluMul<A>>{
+                        projection::SiluMul<A>{expert_product, 1, SEISMIC_RESULT_0_STRIDE_2}, chosen.products + base},
+                    gate_sc, up_sc);
+                const auto x = projection::operands<EXPERT_NVFP4>::rows(in, chunk, uint(SEISMIC_DIM_H), globals,
+                    simdgroups, sg, lane);
+                PROJECTION_FOR_ROWS_248(chunk,
+                    (projection::gemv_paired_runtime<packets::W0, packets::W1, R, MAXM, L, 256u>(x, out, gate, up,
+                        chunk, SEISMIC_DIM_F, SEISMIC_DIM_H, tile, shared, simdgroups, sg, lane)));
+            }
         }
         return;
     }
-    ROUTED_EXPAND_SHARED_ROW(R, L, PROJECTION_FOR_ROWS_24)
+    if constexpr (MATRIX != 0) {
+        if (ulong(tile) * simdgroups * 8u >= SEISMIC_DIM_S) return;
+        const auto gate = routed::weights<packets::W2>(shared_gate, KERNEL_W2_LAYOUT(SEISMIC_DIM_H), 0,
+            SEISMIC_DIM_H);
+        const auto up = routed::weights<packets::W3>(shared_up, KERNEL_W3_LAYOUT(SEISMIC_DIM_H), 0,
+            SEISMIC_DIM_H);
+        const uint rows = uint(SEISMIC_DIM_M);
+        PROJECTION_OPERANDS_SHARED(globals, SHARED_NVFP4);
+        const auto in = routed::activation(normalized, SEISMIC_NORMALIZED_STRIDE_0, SEISMIC_NORMALIZED_STRIDE_1,
+            uint(SEISMIC_DIM_H));
+        const projection::SiluMul<A> out{shared_product, SEISMIC_RESULT_1_STRIDE_0, SEISMIC_RESULT_1_STRIDE_1};
+        const auto x = projection::operands<SHARED_NVFP4>::rows(in, rows, uint(SEISMIC_DIM_H), globals, simdgroups,
+            sg, lane);
+        projection::gemv_batch_paired_runtime<packets::W2, packets::W3, 1u>(x, out, gate, up, rows, SEISMIC_DIM_S,
+            SEISMIC_DIM_H, tile, shared, simdgroups, sg, lane);
+    } else {
+        ROUTED_EXPAND_SHARED_ROW(R, L, PROJECTION_FOR_ROWS_248)
+    }
 }
 #endif

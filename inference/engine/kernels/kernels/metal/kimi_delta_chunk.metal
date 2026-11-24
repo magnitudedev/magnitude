@@ -4,7 +4,7 @@
 #include "lib/recurrent/chunk.h"
 #include "lib/recurrent/kimi.h"
 
-kernel void kimi_delta_chunk_inputs(
+kernel void kimi_delta_chunk_prepare(
     device const recurrent::Storage *projection [[buffer(SEISMIC_BUFFER_PROJECTION)]],
     device const recurrent::Storage *beta [[buffer(SEISMIC_BUFFER_BETA)]],
     device const recurrent::Storage *decay [[buffer(SEISMIC_BUFFER_DECAY)]],
@@ -17,13 +17,16 @@ kernel void kimi_delta_chunk_inputs(
     device const int *previous_tape [[buffer(SEISMIC_BUFFER_PREVIOUS_TAPE)]],
     device const int *following_bank [[buffer(SEISMIC_BUFFER_FOLLOWING_BANK)]],
     SEISMIC_OUT_WINDOW_PARAM(window),
-    device float *inputs [[buffer(SEISMIC_BUFFER_SCRATCH_INPUTS)]],
+    device uchar *pieces [[buffer(SEISMIC_BUFFER_SCRATCH_PIECES)]],
     constant ulong *seismic_words [[buffer(SEISMIC_BUFFER_WORDS)]],
     uint3 group [[threadgroup_position_in_grid]],
+    uint thread_index [[thread_index_in_threadgroup]],
     uint simdgroup [[simdgroup_index_in_threadgroup]],
     uint lane [[thread_index_in_simdgroup]]) {
-    rch_inputs(kimi::channel_rule(beta, decay, rate, time_bias, seismic_words), projection, convolution, segments,
-        stop, previous_bank, previous_tape, following_bank, window, inputs, group, simdgroup, lane, seismic_words);
+    threadgroup rch::PrepareShared<SEISMIC_DIM_W> sh;
+    rch_prepare(kimi::channel_rule(beta, decay, rate, time_bias, seismic_words), projection, convolution, segments,
+        stop, previous_bank, previous_tape, following_bank, window, pieces, sh, group, thread_index, simdgroup, lane,
+        seismic_words);
 }
 
 kernel void kimi_delta_chunk_scan(
@@ -41,23 +44,17 @@ kernel void kimi_delta_chunk_scan(
     SEISMIC_OUT_WINDOW_PARAM(window),
     SEISMIC_OUT_DELTA_PARAM(delta),
     SEISMIC_OUT_TAPE_PARAM(tape),
-    device float *inputs [[buffer(SEISMIC_BUFFER_SCRATCH_INPUTS)]],
+    device uchar *pieces [[buffer(SEISMIC_BUFFER_SCRATCH_PIECES)]],
     device recurrent::Storage *mixed [[buffer(SEISMIC_BUFFER_SCRATCH_MIXED)]],
     constant ulong *seismic_words [[buffer(SEISMIC_BUFFER_WORDS)]],
     uint3 group [[threadgroup_position_in_grid]],
     uint thread_index [[thread_index_in_threadgroup]],
     uint simdgroup [[simdgroup_index_in_threadgroup]],
     uint lane_index [[thread_index_in_simdgroup]]) {
-    threadgroup float queries[RCH_PIECE * RCH_INPUT_STRIDE];
-    threadgroup float keys[RCH_PIECE * RCH_INPUT_STRIDE];
-    threadgroup float values[RCH_PIECE * RCH_VALUE_STRIDE];
-    threadgroup float gates[RCH_PIECE * RCH_INPUT_STRIDE + RCH_PIECE];
-    threadgroup float decayed[RCH_PIECE * RCH_INPUT_STRIDE];
-    threadgroup float shares[RCH_SHARES][2][RCH_PIECE * RCH_PIECE];
-    rch_scan(kimi::channel_rule(beta, decay, rate, time_bias, seismic_words), RchDecays<SEISMIC_DIM_W>{decayed},
-        projection, convolution, segments, stop, previous_bank, previous_tape, following_bank, window, delta, tape,
-        inputs, mixed, queries, keys, values, gates, shares, group, thread_index, simdgroup, lane_index,
-        seismic_words);
+    threadgroup rch::ScanShared<SEISMIC_DIM_W> shared;
+    rch_scan(kimi::channel_rule(beta, decay, rate, time_bias, seismic_words), projection, convolution, segments,
+        stop, previous_bank, previous_tape, following_bank, window, delta, tape, pieces, mixed, shared, group,
+        thread_index, simdgroup, lane_index, seismic_words);
 }
 
 kernel void kimi_delta_chunk_gate(

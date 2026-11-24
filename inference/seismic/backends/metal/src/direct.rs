@@ -8,10 +8,10 @@ use objc2::rc::Retained;
 use objc2::runtime::ProtocolObject;
 use objc2_foundation::NSRange;
 use objc2_metal::{
-    MTLCommandBuffer, MTLCommandBufferStatus, MTLCommandEncoder, MTLComputeCommandEncoder, MTLComputePassDescriptor,
-    MTLComputePipelineState, MTLCounterDontSample, MTLCounterSampleBuffer, MTLCounterSampleBufferDescriptor,
-    MTLDevice, MTLDispatchType, MTLEvent,
-    MTLResourceUsage, MTLSharedEvent, MTLSize, MTLStorageMode,
+    MTLBarrierScope, MTLCommandBuffer, MTLCommandBufferStatus, MTLCommandEncoder,
+    MTLComputeCommandEncoder, MTLComputePassDescriptor, MTLComputePipelineState,
+    MTLCounterDontSample, MTLCounterSampleBuffer, MTLCounterSampleBufferDescriptor, MTLDevice,
+    MTLDispatchType, MTLEvent, MTLResourceUsage, MTLSharedEvent, MTLSize, MTLStorageMode,
 };
 use seismic_compiler::direct_launch::{
     DirectLaunchContract, DirectLaunchRequest, LaunchGrid, ValidatedLaunch, WorkgroupContract,
@@ -541,98 +541,44 @@ impl LaunchTimestamps {
     }
 }
 
-/// The dispatch types of the compute encoders a command buffer holds so
-/// far. An indirect dispatch is encoded only in a command buffer whose
-/// encoders are all of its own encoder's type ([`Held::admits`]): the AGX
-/// driver (M4 Pro, `AGXMetalG16X`, macOS 15.7) keeps an indirect dispatch's
-/// threadgroup-optimization state in the command buffer's compute context
-/// across encoders, by dispatch type, and an indirect dispatch in an
-/// encoder of one type after an encoder of the other writes or reads
-/// address 0 (`insertIndirectTGOptKernel` in a serial encoder after a
-/// concurrent one, `executeIndirectKernelWithThreadgroupOptimization` in a
-/// concurrent one after a serial one) and kills the process. Encoders of
-/// one type throughout a command buffer, at any length or order of direct
-/// and indirect dispatches, and a new command buffer, never did
-/// (2026-11-17).
-#[derive(Clone, Copy, Default, PartialEq, Eq)]
-enum Held {
-    #[default]
-    Nothing,
-    Only(MTLDispatchType),
-    Both,
-}
-
-impl Held {
-    /// What the command buffer holds once it opens an encoder of `kind`.
-    fn with(self, kind: MTLDispatchType) -> Self {
-        match self {
-            Self::Nothing => Self::Only(kind),
-            Self::Only(held) if held == kind => self,
-            Self::Only(_) | Self::Both => Self::Both,
-        }
-    }
-
-    /// Whether an indirect dispatch may be encoded in an encoder of `kind`
-    /// of this command buffer.
-    fn admits(self, kind: MTLDispatchType) -> bool {
-        self == Self::Nothing || self == Self::Only(kind)
-    }
-}
-
-/// Encoder state shared by grouped production batches (observed or not): each
+/// Encoder state shared by grouped production batches (observed or not): every
 /// group of launches ([`DirectBatch::group`]) runs in a concurrent encoder of
-/// its own, except that consecutive groups of one launch share a serial
-/// encoder, which runs them in order. Each encoder runs after the one before
-/// ([`ordered`]). `open` is `None` after an event command or a group boundary,
-/// until the next launch opens an encoder of the `next` dispatch type. An
-/// indirect launch the current command buffer does not admit ([`Held`]) begins
-/// the next.
+/// its own, ordered after the previous one by [`ordered`]. Keeping every
+/// compute encoder in a command buffer [`MTLDispatchType::Concurrent`] avoids
+/// mixing `Serial` and `Concurrent` encoders in one command buffer: on AGX
+/// (`AGXMetalG16X`, macOS 15.7), an indirect dispatch in an encoder of one
+/// dispatch type after an encoder of the other writes or reads address 0 inside
+/// the driver and kills the process, whereas encoders of one type throughout a
+/// command buffer run any order of direct and indirect dispatches without
+/// cutting command buffers (2026-11-17). `open` is `None` after an event
+/// command or a group boundary, until the next launch opens a concurrent
+/// encoder.
 struct GroupedState {
-    open: Option<(
-        Retained<ProtocolObject<dyn MTLComputeCommandEncoder>>,
-        MTLDispatchType,
-    )>,
-    next: MTLDispatchType,
-    /// The current command buffer's encoders' types.
-    held: Held,
+    open: Option<Retained<ProtocolObject<dyn MTLComputeCommandEncoder>>>,
+    /// Whether this concurrent encoder has already issued a buffer memory
+    /// barrier before an indirect dispatch.
+    indirect_barrier: bool,
 }
 
 impl GroupedState {
     fn new() -> Self {
-        Self {
-            open: None,
-            // The first group sets it.
-            next: MTLDispatchType::Serial,
-            held: Held::Nothing,
-        }
+        Self { open: None, indirect_barrier: false }
     }
 
     fn end_open(&mut self) {
-        if let Some((encoder, _)) = self.open.take() {
+        if let Some(encoder) = self.open.take() {
             crate::pooled(|| encoder.endEncoding());
         }
+        self.indirect_barrier = false;
     }
 
-    fn group(&mut self, launches: usize) {
-        let dispatch = if launches > 1 {
-            MTLDispatchType::Concurrent
-        } else {
-            MTLDispatchType::Serial
-        };
-        if dispatch == MTLDispatchType::Serial
-            && self
-                .open
-                .as_ref()
-                .is_some_and(|(_, open)| *open == MTLDispatchType::Serial)
-        {
-            return;
-        }
-        self.next = dispatch;
+    fn group(&mut self, _launches: usize) {
         self.end_open();
     }
 
     fn encoder(
         &mut self,
+        indirect: bool,
         open: impl FnOnce(
             MTLDispatchType,
         ) -> Result<
@@ -641,11 +587,23 @@ impl GroupedState {
         >,
     ) -> Result<&ProtocolObject<dyn MTLComputeCommandEncoder>, ExecutionError> {
         if self.open.is_none() {
-            let encoder = open(self.next)?;
-            self.held = self.held.with(self.next);
-            self.open = Some((encoder, self.next));
+            let encoder = open(MTLDispatchType::Concurrent)?;
+            self.open = Some(encoder);
+            self.indirect_barrier = false;
         }
-        let (encoder, _) = self.open.as_ref().expect("grouped encoder is open");
+        let encoder = self.open.as_ref().expect("grouped encoder is open");
+        if indirect && !self.indirect_barrier {
+            // On AGX (observed on M2 Pro and M4 Max), `useResource` on the
+            // ordering buffer alone does not make prior-encoder buffer writes
+            // visible to `dispatchThreadgroupsWithIndirectBuffer` in a
+            // concurrent encoder when the kernel only uses
+            // `[[thread_position_in_grid]]` (the dispatch silently runs zero
+            // threads). One buffer barrier before the encoder's first indirect
+            // launch synchronizes all indirect launches in the group without
+            // serializing them against each other.
+            crate::pooled(|| encoder.memoryBarrierWithScope(MTLBarrierScope::Buffers));
+            self.indirect_barrier = true;
+        }
         Ok(&**encoder)
     }
 }
@@ -752,11 +710,8 @@ impl BatchMode {
         command: Retained<ProtocolObject<dyn MTLCommandBuffer>>,
     ) -> Retained<ProtocolObject<dyn MTLCommandBuffer>> {
         match self {
-            Self::Grouped(grouped) => {
-                grouped.held = Held::Nothing;
-            }
-            Self::Observed { grouped, span, recording, .. } => {
-                grouped.held = Held::Nothing;
+            Self::Grouped(_) => {}
+            Self::Observed { span, recording, .. } => {
                 let samples = span.take().map(|pair| {
                     pair.hold_until_completed(&command);
                     pair
@@ -1084,13 +1039,11 @@ impl DirectBatch {
 
     /// The next `launches` launches (those that do device work) form a
     /// group: none depends on another, and every launch encoded before them
-    /// completes before any of them starts. A group of several runs in a
-    /// concurrent encoder; a group of one joins an open serial encoder, whose
-    /// dispatches run in order, or opens one. Measured per dependent launch
-    /// against a single serial encoder: an encoder per launch costs about
-    /// 0.2 µs more at 64 KiB, a barrier in one concurrent encoder 0.5 µs
-    /// (`tests/barrier.rs`). A timed batch's launches each have an encoder
-    /// of their own already.
+    /// completes before any of them starts. Each group runs in a concurrent
+    /// compute encoder of its own, ordered after the previous one by
+    /// [`ordered`], so every encoder in a command buffer shares one dispatch
+    /// type and indirect dispatches never cut command buffers. A timed
+    /// batch's launches each have an encoder of their own already.
     pub fn group(&mut self, launches: usize) {
         if let Some(grouped) = self.mode.grouped_mut() {
             grouped.group(launches);
@@ -1176,19 +1129,8 @@ impl DirectBatch {
             self.skip();
             return Ok(());
         }
-        match &self.mode {
-            BatchMode::Timed { lease: Some(lease), .. } if lease.full() => {
-                self.cut()?;
-            }
-            // An indirect launch in a command buffer that holds an encoder of
-            // the other type than its own begins the next command buffer.
-            BatchMode::Grouped(grouped) | BatchMode::Observed { grouped, .. }
-                if launch.grid.is_some() && !grouped.held.admits(grouped.next) =>
-            {
-                self.end_open();
-                self.cut()?;
-            }
-            _ => {}
+        if matches!(&self.mode, BatchMode::Timed { lease: Some(lease), .. } if lease.full()) {
+            self.cut()?;
         }
         let command = self
             .command
@@ -1197,7 +1139,7 @@ impl DirectBatch {
         let device = &self.device;
         match &mut self.mode {
             BatchMode::Grouped(grouped) => {
-                let encoder = grouped.encoder(|dispatch| {
+                let encoder = grouped.encoder(launch.grid.is_some(), |dispatch| {
                     open_compute_encoder(
                         device,
                         command,
@@ -1207,7 +1149,7 @@ impl DirectBatch {
                 crate::pooled(|| encode_launch(encoder, launch));
             }
             BatchMode::Observed { grouped, timestamps, span, recording } => {
-                let encoder = grouped.encoder(|dispatch| {
+                let encoder = grouped.encoder(launch.grid.is_some(), |dispatch| {
                     let held_spans = recording
                         .committed
                         .iter()
@@ -1669,11 +1611,11 @@ mod tests {
             let encoder = open_compute_encoder(
                 &device,
                 command,
-                crate::device::EncoderKind::Dispatch(MTLDispatchType::Serial),
+                crate::device::EncoderKind::Dispatch(MTLDispatchType::Concurrent),
             )
             .unwrap();
             if let BatchMode::Grouped(grouped) = &mut batch.mode {
-                grouped.open = Some((encoder, MTLDispatchType::Serial));
+                grouped.open = Some(encoder);
             }
             // Drop `batch` without commit() or abandon(): must end the open
             // encoder and wait for the committed prefix (`done == 1`).
@@ -1683,5 +1625,87 @@ mod tests {
             1,
             "DirectBatch::drop must wait for already-committed command buffers"
         );
+    }
+
+    /// Alternating single-launch and multi-launch groups around indirect
+    /// dispatches keeps every compute encoder on `MTLDispatchType::Concurrent`
+    /// and never cuts a new command buffer.
+    #[test]
+    fn mixed_groups_with_indirect_dispatches_never_cut_command_buffers() {
+        use seismic_compiler::executable::DeviceService;
+        use seismic_native_target::{ProgramEntry, ProgramSource, Toolchain};
+        let Ok(handle) = crate::DeviceHandle::system_default() else {
+            return;
+        };
+        let device = MetalDevice::open(handle, crate::test_support::store()).unwrap();
+        let description =
+            crate::profile::open_device(&device, &seismic_native_target::MemoryStore::default())
+                .unwrap();
+        let toolchain = crate::toolchain::MetalToolchain::new(device.clone(), description.device_info());
+        let source = ProgramSource {
+            text: "#include <metal_stdlib>\nusing namespace metal;\n\
+                   kernel void grid(device uint* g [[buffer(0)]], uint i [[thread_position_in_grid]]) \
+                   { if (i == 0) { g[0] = 2; g[1] = 1; g[2] = 1; } }\n\
+                   kernel void noop(device uint* x [[buffer(0)]]) { (void)x; }\n"
+                .into(),
+            entries: vec![ProgramEntry::named("grid"), ProgramEntry::named("noop")],
+        };
+        let pipelines = toolchain.compile(&source).unwrap().1;
+        let entry: std::sync::Arc<dyn seismic_memory::entry::Entry> = std::sync::Arc::new(
+            seismic_memory::entry::Tally::unbounded(seismic_topology::StoreIdentity::HostRam),
+        );
+        let grid_buf = device
+            .allocate(crate::topology::SHARED_KIND, 16, 16, &entry)
+            .unwrap();
+        let scratch = device
+            .allocate(crate::topology::SHARED_KIND, 16, 16, &entry)
+            .unwrap();
+        let mut batch = DirectBatch::new(&device).unwrap();
+        let direct = |batch: &mut DirectBatch, p: usize, buf: &MetalBuffer| {
+            batch
+                .encode(&DirectLaunch {
+                    pipeline: &pipelines[p],
+                    buffers: &[(buf, 0)],
+                    words: &[],
+                    scalar_results: None,
+                    threadgroups: [1, 1, 1],
+                    grid: None,
+                    threads_per_threadgroup: [32, 1, 1],
+                    threadgroup_bytes: 0,
+                })
+                .unwrap();
+        };
+        let indirect = |batch: &mut DirectBatch| {
+            batch
+                .encode(&DirectLaunch {
+                    pipeline: &pipelines[1],
+                    buffers: &[(&scratch, 0), (&grid_buf, 0)],
+                    words: &[],
+                    scalar_results: None,
+                    threadgroups: [2, 1, 1],
+                    grid: Some((&grid_buf, 0)),
+                    threads_per_threadgroup: [32, 1, 1],
+                    threadgroup_bytes: 0,
+                })
+                .unwrap();
+        };
+        batch.group(1);
+        direct(&mut batch, 0, &grid_buf);
+        batch.group(2);
+        indirect(&mut batch);
+        direct(&mut batch, 1, &scratch);
+        batch.group(1);
+        indirect(&mut batch);
+        batch.group(2);
+        direct(&mut batch, 1, &scratch);
+        indirect(&mut batch);
+        assert!(
+            batch.committed.is_empty(),
+            "indirect dispatches across mixed groups must stay in one command buffer, cut {}",
+            batch.committed.len()
+        );
+        let submission = batch.commit();
+        assert_eq!(submission.commands.len(), 1);
+        submission.finish().unwrap();
     }
 }

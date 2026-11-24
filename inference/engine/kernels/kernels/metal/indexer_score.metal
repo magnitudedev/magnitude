@@ -46,6 +46,10 @@
 #define SCORE_Q_STRIDE (SCORE_SINGLE_TILE ? (SCORE_W + 4u) : SCORE_W)
 #define SCORE_HEADS_PER_LANE ((SCORE_H + 31u) / 32u)
 #define SCORE_LANES_PER_HEAD (32u / SCORE_TILED_HEAD_TILE)
+#define SCORE_ROW_TILE 8u
+#define SCORE_ROW_FLOATS (SCORE_H * SCORE_Q_STRIDE)
+#define SCORE_AVAIL_ROWS (SCORE_SINGLE_TILE ? ((SCORE_SMEM_FLOATS - 8u * SCORE_W) / SCORE_ROW_FLOATS) : 1u)
+#define SCORE_ROWS_PER_PASS (SCORE_AVAIL_ROWS >= SCORE_ROW_TILE ? SCORE_ROW_TILE : (SCORE_AVAIL_ROWS >= 1u ? SCORE_AVAIL_ROWS : 1u))
 
 typedef activation::Act::native Scalar;
 typedef rotary::layout<SCORE_W, SEISMIC_DIM_P, (SEISMIC_DIM_RT != 0 ? SEISMIC_DIM_S : 0), (SEISMIC_DIM_RA != 0)>
@@ -94,17 +98,144 @@ kernel void indexer_score(
     uint thread_index [[thread_index_in_threadgroup]],
     uint simd [[simdgroup_index_in_threadgroup]],
     uint lane [[thread_index_in_simdgroup]]) {
+    const ulong m = ulong(SEISMIC_DIM_M);
+    const ulong row0 = ulong(group.y) * SCORE_ROW_TILE;
+    const uint tile_rows = row0 < m ? uint(metal::min(ulong(SCORE_ROW_TILE), m - row0)) : 0u;
+    if (tile_rows == 0u)
+        return;
+
+    const ulong n = ulong(SEISMIC_DIM_N);
+    const uint r = uint(SEISMIC_DIM_R);
+    const ulong ordinal = ulong(group.x) * 256 + thread_index;
+    const ulong simd_base = ulong(group.x) * 256 + ulong(simd) * 32;
+    const float epsilon = as_type<float>(uint(SEISMIC_PARAM_EPSILON));
+    const float scale = as_type<float>(uint(SEISMIC_PARAM_SCALE));
+    const rounding::Rounding trained = rounding::of(uint(SEISMIC_PARAM_BLOCK), uint(SEISMIC_PARAM_ELEMENT),
+        uint(SEISMIC_PARAM_ROUNDING_SCALE), uint(SEISMIC_PARAM_AMAX_FLOOR));
+
+    if (SCORE_SINGLE_TILE && SCORE_ROWS_PER_PASS >= 2u && tile_rows >= 2u) {
+        for (uint r0 = 0u; r0 < tile_rows; r0 += SCORE_ROWS_PER_PASS) {
+            const uint sub_rows = metal::min(SCORE_ROWS_PER_PASS, tile_rows - r0);
+            threadgroup float *prepared = smem;
+            threadgroup float *k_buf = prepared + sub_rows * SCORE_ROW_FLOATS;
+            threadgroup float *k_simd = k_buf + simd * SCORE_W;
+
+            int at_r[SCORE_ROWS_PER_PASS];
+            uint simd_keys_r[SCORE_ROWS_PER_PASS];
+            bool row_active[SCORE_ROWS_PER_PASS];
+            uint max_simd_keys = 0u;
+            bool any_active = false;
+            for (uint rr = 0u; rr < sub_rows; ++rr) {
+                const ulong row = row0 + r0 + rr;
+                int at = -1;
+                ulong listed = indexer::simd_span_row(spans + row * r * 2, r, uint(ordinal), lane, at);
+                listed = listed < n ? listed : n;
+                at_r[rr] = at;
+                if (ulong(group.x) * 256 >= listed) {
+                    row_active[rr] = false;
+                    simd_keys_r[rr] = 0u;
+                    if (ordinal < n)
+                        element::Out<element::F32>(score_cells).offset(row * n).put(ordinal, -INFINITY);
+                } else {
+                    row_active[rr] = true;
+                    any_active = true;
+                    const uint sk = simd_base < listed ? uint(listed - simd_base < 32 ? listed - simd_base : 32) : 0u;
+                    simd_keys_r[rr] = sk;
+                    if (sk > max_simd_keys)
+                        max_simd_keys = sk;
+                    const query_layout::table table(coordinates + row * 4, rotary_components, rotary_frequencies,
+                        rotary_amplitudes, lane);
+                    for (uint head = simd; head < SCORE_H; head += 8) {
+                        prepare_query_head(query, query_norm, table, trained, epsilon, row, head, lane,
+                            prepared + rr * SCORE_ROW_FLOATS + head * SCORE_Q_STRIDE);
+                    }
+                }
+            }
+            if (!any_active)
+                continue;
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+
+            float w[SCORE_ROWS_PER_PASS][SCORE_HEADS_PER_LANE];
+            float my_score[SCORE_ROWS_PER_PASS];
+            for (uint rr = 0u; rr < sub_rows; ++rr) {
+                my_score[rr] = -INFINITY;
+                if (row_active[rr]) {
+                    const ulong row = row0 + r0 + rr;
+                    for (uint p = 0; p < SCORE_HEADS_PER_LANE; ++p) {
+                        const uint head = p * 32 + lane;
+                        w[rr][p] = (SEISMIC_DIM_HW != 0 && head < SCORE_H)
+                            ? float(head_weights[row * SCORE_H + head]) : 1.0f;
+                    }
+                }
+            }
+
+            for (uint j = 0u; j < max_simd_keys; ++j) {
+                int loaded_key = -1;
+                for (uint rr = 0u; rr < sub_rows; ++rr) {
+                    if (j >= simd_keys_r[rr])
+                        continue;
+                    const int key_row = simd_broadcast(at_r[rr], ushort(j));
+                    if (key_row != loaded_key) {
+                        if (loaded_key != -1)
+                            simdgroup_barrier(mem_flags::mem_threadgroup);
+                        device const float *k = slab::row<float>(keys, ulong(key_row), ulong(SEISMIC_PARAM_SLAB_ROWS), SCORE_W);
+                        for (uint c = lane; c < SCORE_W4; c += 32)
+                            reinterpret_cast<threadgroup float4 *>(k_simd)[c] = reinterpret_cast<device const float4 *>(k)[c];
+                        simdgroup_barrier(mem_flags::mem_threadgroup);
+                        loaded_key = key_row;
+                    }
+                    threadgroup const float *q_row = prepared + rr * SCORE_ROW_FLOATS;
+                    float dot[SCORE_HEADS_PER_LANE];
+                    for (uint p = 0; p < SCORE_HEADS_PER_LANE; ++p)
+                        dot[p] = 0.0f;
+                    for (uint column = 0; column < SCORE_W; column += 4) {
+                        const float4 kx = *reinterpret_cast<threadgroup const float4 *>(k_simd + column);
+                        for (uint p = 0; p < SCORE_HEADS_PER_LANE; ++p) {
+                            const uint head = p * 32 + lane;
+                            if (head < SCORE_H) {
+                                const float4 q = *reinterpret_cast<threadgroup const float4 *>(q_row + head * SCORE_Q_STRIDE + column);
+                                float d = dot[p];
+                                d = metal::fma(q.x, kx.x, d);
+                                d = metal::fma(q.y, kx.y, d);
+                                d = metal::fma(q.z, kx.z, d);
+                                d = metal::fma(q.w, kx.w, d);
+                                dot[p] = d;
+                            }
+                        }
+                    }
+                    float val = 0.0f;
+                    for (uint p = 0; p < SCORE_HEADS_PER_LANE; ++p) {
+                        const uint head = p * 32 + lane;
+                        if (head < SCORE_H)
+                            val += metal::max(dot[p], 0.0f) * w[rr][p];
+                    }
+                    const float total = simd_sum(val);
+                    if (lane == j)
+                        my_score[rr] = scale * total;
+                }
+                simdgroup_barrier(mem_flags::mem_threadgroup);
+            }
+
+            for (uint rr = 0u; rr < sub_rows; ++rr) {
+                if (row_active[rr] && ordinal < n)
+                    element::Out<element::F32>(score_cells).offset((row0 + r0 + rr) * n).put(ordinal, my_score[rr]);
+            }
+            if (r0 + SCORE_ROWS_PER_PASS < tile_rows)
+                threadgroup_barrier(mem_flags::mem_threadgroup);
+        }
+        return;
+    }
+
     // Threadgroup memory layout:
     //   prepared[SCORE_HEAD_TILE][SCORE_Q_STRIDE]  (padded by 4 in single-tile mode)
     //   k_buf[8][SCORE_W]                          (per-simdgroup coalesced key buffer)
     threadgroup float *prepared = smem;
     threadgroup float *k_buf = prepared + SCORE_HEAD_TILE * SCORE_Q_STRIDE;
+    threadgroup float *k_simd = k_buf + simd * SCORE_W;
 
-    const ulong row = group.y;
-    const ulong n = ulong(SEISMIC_DIM_N);
-    const uint r = uint(SEISMIC_DIM_R);
+    for (uint rr = 0u; rr < tile_rows; ++rr) {
+    const ulong row = row0 + rr;
     device const int *row_spans = spans + row * r * 2;
-    const ulong ordinal = ulong(group.x) * 256 + thread_index;
     // The row's listed rows (those of its spans, at most N scored) and each
     // lane's key-plane row.
     int at = -1;
@@ -114,19 +245,13 @@ kernel void indexer_score(
     if (ulong(group.x) * 256 >= listed) {
         if (ordinal < n)
             out.put(ordinal, -INFINITY);
-        return;
+        continue;
     }
-    const float epsilon = as_type<float>(uint(SEISMIC_PARAM_EPSILON));
-    const rounding::Rounding trained = rounding::of(uint(SEISMIC_PARAM_BLOCK), uint(SEISMIC_PARAM_ELEMENT),
-        uint(SEISMIC_PARAM_ROUNDING_SCALE), uint(SEISMIC_PARAM_AMAX_FLOOR));
     // One table rotates every head of the row.
     const query_layout::table table(coordinates + row * 4, rotary_components, rotary_frequencies,
         rotary_amplitudes, lane);
 
-    const ulong simd_base = ulong(group.x) * 256 + ulong(simd) * 32;
     const uint simd_keys = simd_base < listed ? uint(listed - simd_base < 32 ? listed - simd_base : 32) : 0u;
-    const float scale = as_type<float>(uint(SEISMIC_PARAM_SCALE));
-    threadgroup float *k_simd = k_buf + simd * SCORE_W;
     float my_score = -INFINITY;
 
     if (SCORE_SINGLE_TILE) {
@@ -240,4 +365,7 @@ kernel void indexer_score(
 
     if (ordinal < n)
         out.put(ordinal, my_score);
+    if (rr + 1u < tile_rows)
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
 }
