@@ -951,7 +951,7 @@ def test_bench_takes_its_measurement_options_and_builds_our_binaries_apart():
     assert argv[argv.index("--magnitude-device") + 1] == "vulkan"
     assert argv[argv.index("--passes") + 1] == "2" and argv.count("--engine") == 2
     assert argv[argv.index("--magnitude-binary") + 1] == "{target}/release/magnitude-engine"
-    assert argv[argv.index("--harness") + 1] == "{target}/release/magnitude-harness"
+    assert argv[argv.index("--harness") + 1] == "{target}/release/magnitude-render"
     # The product's measurer prices the run's own fresh cache, which the engine then serves from.
     assert argv[argv.index("--magnitude-cache-dir") + 1] == "{runs}/kernels"
     assert jobs["measure"].argv == ("{target}/release/magnitude-assess", "--device", "vulkan",
@@ -960,12 +960,21 @@ def test_bench_takes_its_measurement_options_and_builds_our_binaries_apart():
     (template,) = plan.files
     assert argv[argv.index("--template") + 1] == f"{{inputs}}/{template.name}"
     assert len(json.loads(template.read_text())["sessions"]) == 9
-    # The served binaries share one cargo invocation (so they unify once), separate from the
-    # harness so none of the harness's development features unify into them.
+    # The served binaries and host-only renderer share one cargo invocation with
+    # `--no-default-features` so `magnitude-executor` and `magnitude-engine` compile once
+    # without enabling any development feature of `magnitude-harness`.
     cargo = [step.argv for step in plan.builds if step.argv[0] == "cargo"]
-    assert cargo == [("cargo", "build", "--release", "-p", "magnitude-engine-cli", "-p", "magnitude-engine",
-                      "--bin", "magnitude-engine", "--bin", "magnitude-assess"),
-                     ("cargo", "build", "--release", "-p", "magnitude-harness")]
+    assert cargo == [("cargo", "build", "--release", "--no-default-features",
+                      "-p", "magnitude-engine-cli", "-p", "magnitude-engine", "-p", "magnitude-harness",
+                      "--bin", "magnitude-engine", "--bin", "magnitude-assess", "--bin", "magnitude-render")]
+    # A GGUF comparison engine without our engine builds only the lightweight renderer.
+    gguf_only = parse("bench", "--backend", "cuda", "--model", MODEL, "--purpose", "p",
+                      "--estimate", "5m", "--template", "retrieve:4k", "--engine", "llama.cpp")
+    gguf_plan = REGISTRY["bench"].plan(gguf_only, None, "alpha")
+    gguf_cargo = [step.argv for step in gguf_plan.builds if step.argv[0] == "cargo"]
+    assert gguf_cargo == [("cargo", "build", "--release", "--no-default-features",
+                           "-p", "magnitude-harness", "--bin", "magnitude-render")]
+    assert dict(gguf_plan.jobs)["bench"].argv[dict(gguf_plan.jobs)["bench"].argv.index("--harness") + 1] == "{target}/release/magnitude-render"
     # A cache the run names is priced and served as given.
     named = parse("bench", "--backend", "cuda", "--model", MODEL, "--purpose", "p",
                   "--estimate", "5m", "--template", "retrieve:4k", "--magnitude-cache-dir", "/c")

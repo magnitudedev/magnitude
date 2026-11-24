@@ -150,7 +150,8 @@ def _inspect(arguments) -> int:
 
 def _runs(arguments) -> int:
     live = state.live_runs()
-    if not live:
+    orphans = [entry for entry in state.Launched.gone() if not (Path(entry["results"]) / engine.CODE).exists()]
+    if not live and not orphans:
         print("no runs in flight on this machine")
     for run in live:
         queued, held = state.account(run, time.time())
@@ -159,6 +160,8 @@ def _runs(arguments) -> int:
             f"{run['run']}  {run['host']}  {run['phase']}{waiting}  queued {engine.duration(queued)}, "
             f"{engine.duration(held)} of {engine.duration(run['estimate'])}  \"{run['purpose']}\""
         )
+    for orphan in orphans:
+        print(f"{orphan['run']}  {orphan['host']}  orphaned (local caller gone; run `mrig stop --orphans` or `mrig stop {orphan['run']}`)")
     return 0
 
 
@@ -226,12 +229,37 @@ def _wait(arguments) -> int:
     return follow(results.name, results, run["pid"] if run else None, arguments.estimate)
 
 
+def _stop_launched(launched: dict, hosts: Hosts) -> None:
+    try:
+        remote = connect(hosts.host(launched["host"]))
+        stopped = HostRun(remote, launched["run"], launched["agent"]).stop()
+    except HostUnavailable as error:
+        failed = engine.mark_host_lost(launched["run"], launched["host"], Path(launched["results"]), str(error))
+        print(f"{launched['run']}: {failed['detail']}; marked terminal locally ({engine.HOST_LOST})")
+        return
+    print(f"stopping {launched['run']} on {launched['host']}: {stopped}")
+
+
 def _stop(arguments) -> int:
     """Stop the run through the process following it, which delivers the stop and fetches the
-    run; with none, stop its runner directly (the next command fetches it). A follower that has
-    neither begun delivering its stop nor ended `STOP_SECONDS` after it is hung: it is ended,
-    and its runner is stopped as a run whose caller is gone is. When the host cannot be reached,
-    the run is resolved locally to terminal `host_lost` and removed from active runs."""
+    run; with none, stop its runner directly (the next command fetches it). With `--orphans`,
+    stop every launched run whose local caller is gone. A follower that has neither begun
+    delivering its stop nor ended `STOP_SECONDS` after it is hung: it is ended, and its runner
+    is stopped as a run whose caller is gone is. When the host cannot be reached, the run is
+    resolved locally to terminal `host_lost` and removed from active runs."""
+    if getattr(arguments, "orphans", False):
+        if arguments.run is not None:
+            raise SystemExit("stop: pass either RUN or --orphans, not both")
+        orphans = [entry for entry in state.Launched.gone() if not (Path(entry["results"]) / engine.CODE).exists()]
+        if not orphans:
+            print("no orphaned runs on this machine")
+            return 0
+        hosts = Hosts.load()
+        for launched in orphans:
+            _stop_launched(launched, hosts)
+        return 0
+    if arguments.run is None:
+        raise SystemExit("stop: specify RUN or --orphans")
     run = state.run_state(arguments.run)
     killed_caller = False
     if run is not None:
@@ -261,14 +289,7 @@ def _stop(arguments) -> int:
         if killed_caller:
             return 0
         raise SystemExit(f"no run {arguments.run} in flight on this machine")
-    try:
-        remote = connect(Hosts.load().host(launched["host"]))
-        stopped = HostRun(remote, launched["run"], launched["agent"]).stop()
-    except HostUnavailable as error:
-        failed = engine.mark_host_lost(launched["run"], launched["host"], Path(launched["results"]), str(error))
-        print(f"{launched['run']}: {failed['detail']}; marked terminal locally ({engine.HOST_LOST})")
-        return 0
-    print(f"stopping {launched['run']} on {launched['host']}: {stopped}")
+    _stop_launched(launched, Hosts.load())
     return 0
 
 
@@ -399,8 +420,10 @@ def parser() -> argparse.ArgumentParser:
     command.add_argument("--justification", required=True,
                          help="why the run needs this long, and why the first estimate was wrong")
     command.set_defaults(handler=_wait)
-    command = commands.add_parser("stop", help="stop a run")
-    command.add_argument("run")
+    command = commands.add_parser("stop", help="stop a run, or all orphaned runs (--orphans)")
+    command.add_argument("run", nargs="?")
+    command.add_argument("--orphans", action="store_true",
+                         help="stop every launched run whose local caller is gone")
     command.set_defaults(handler=_stop)
     commands.add_parser("fetch", help="answer the ended runs whose caller is gone and fetch them whole").set_defaults(handler=_fetch)
     command = commands.add_parser("setup", help="prepare and verify hosts")

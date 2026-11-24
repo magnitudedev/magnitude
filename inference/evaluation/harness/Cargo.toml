@@ -10,15 +10,32 @@ license.workspace = true
 [[bin]]
 name = "magnitude-harness"
 path = "src/main.rs"
+required-features = ["dev-tools"]
+
+# Host-only template rendering without development engine features, built in the
+# same cargo invocation as the served engine so `mrig bench` compiles
+# `magnitude-executor` and `magnitude-engine` once.
+[[bin]]
+name = "magnitude-render"
+path = "src/bin/magnitude_render.rs"
+
+[features]
+default = ["dev-tools"]
+# The engine's development tuning tools (pins, routing replay, machine-line
+# probes and the survey), which only `magnitude-harness` enables; a served
+# engine and `magnitude-render` build without them.
+dev-tools = [
+    "magnitude-engine/tuning-survey",
+    "magnitude-engine/expert-routing",
+    "magnitude-engine/machine-line",
+]
 
 [dependencies]
 clap.workspace = true
 libc.workspace = true
 magnitude-artifacts = { path = "../../engine/artifacts" }
 magnitude-chat = { path = "../../engine/chat" }
-# The engine's development tuning tools (pins and the survey), which only the
-# harness enables; a served engine is built without them.
-magnitude-engine = { path = "../../engine", features = ["tuning-survey", "expert-routing", "machine-line"] }
+magnitude-engine = { path = "../../engine" }
 magnitude-cost-model = { path = "../../engine/cost-model" }
 magnitude-executor = { path = "../../engine/executor" }
 magnitude-family-contracts = { path = "../../engine/families/contracts" }

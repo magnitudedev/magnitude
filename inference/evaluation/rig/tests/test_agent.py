@@ -1713,3 +1713,48 @@ def test_a_volume_is_found_for_any_path_a_step_environment_names(tmp_path, monke
     monkeypatch.setattr(agent.sys, "platform", "darwin")
     monkeypatch.setattr(agent.os, "confstr", lambda name: None)
     assert agent.short_volumes(str(tmp_path), {"TMPDIR": "relative"}) == []
+
+
+def test_uv_sync_frozen_tries_offline_first_and_falls_back_online_on_cache_miss(tmp_path):
+    """`Runner.execute` fast-paths `uv sync --frozen` with `--offline`, skipping any network call
+    when cached, and falls back to online `uv sync --frozen` only when offline exits non-zero."""
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    calls_log = tmp_path / "uv-calls.txt"
+    fake_uv = bin_dir / "uv"
+    fake_uv.write_text(
+        f"#!{sys.executable}\n"
+        "import os, sys\n"
+        f"with open({str(calls_log)!r}, 'a') as f:\n"
+        "    f.write(' '.join(sys.argv[1:]) + '\\n')\n"
+        "if os.environ.get('FAIL_OFFLINE') == '1' and '--offline' in sys.argv:\n"
+        "    sys.exit(2)\n"
+        "sys.exit(0)\n"
+    )
+    fake_uv.chmod(0o755)
+    env_base = {"PATH": f"{bin_dir}:{os.environ.get('PATH', '')}"}
+
+    # Case 1: offline succeeds -> only one uv call, with --offline.
+    start(tmp_path, "uv-hit", [
+        {"op": "phase", "phase": "build"},
+        run_op(["uv", "sync", "--frozen", "--no-editable", "--project", str(tmp_path)], tmp_path, env=env_base),
+    ])
+    hit = ended(tmp_path, "uv-hit")
+    assert hit["failed"] is None
+    assert calls_log.read_text().splitlines() == [
+        f"sync --offline --frozen --no-editable --project {tmp_path}",
+    ]
+
+    # Case 2: offline misses cache -> falls back to online without --offline.
+    calls_log.unlink()
+    start(tmp_path, "uv-miss", [
+        {"op": "phase", "phase": "build"},
+        run_op(["uv", "sync", "--frozen", "--no-editable", "--project", str(tmp_path)], tmp_path,
+               env={**env_base, "FAIL_OFFLINE": "1"}),
+    ])
+    miss = ended(tmp_path, "uv-miss")
+    assert miss["failed"] is None
+    assert calls_log.read_text().splitlines() == [
+        f"sync --offline --frozen --no-editable --project {tmp_path}",
+        f"sync --frozen --no-editable --project {tmp_path}",
+    ]

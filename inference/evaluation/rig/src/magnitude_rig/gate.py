@@ -57,7 +57,7 @@ from .connection import HostError, connect
 from .hosts import Hosts
 from .instruments import Answer, JobResult, harness, kl, step
 from .instruments.device import backends, memory
-from .results import CHILD, OVERRUN, answer_fetched, follow, forward_stops, launch, perform
+from .results import CHILD, OVERRUN, answer_fetched, detach, follow, forward_stops, launch, perform
 
 KIND = "correctness"
 QUESTION = "Does this build load and step correctly on every topology?"
@@ -382,6 +382,7 @@ def followed(topology: Topology, run: str, results, child) -> tuple[int, str]:
     out = io.StringIO()
     code = follow(run, results, child.pid, None, out)
     if code != OVERRUN:
+        detach(child.pid)
         return code, out.getvalue()
     live = state.run_state(run)
     past = "its estimate" if live is None else (
@@ -389,7 +390,9 @@ def followed(topology: Topology, run: str, results, child) -> tuple[int, str]:
         f"{engine.duration(state.account(live, time.time())[1] - live['estimate'])}")
     print(f"{str(topology):<17} RUNNING past {past} · mrig logs {run} · mrig stop {run}", flush=True)
     out = io.StringIO()
-    return follow(run, results, child.pid, math.inf, out), out.getvalue()
+    code = follow(run, results, child.pid, math.inf, out)
+    detach(child.pid)
+    return code, out.getvalue()
 
 
 def run(arguments) -> int:

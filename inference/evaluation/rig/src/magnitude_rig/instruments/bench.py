@@ -13,9 +13,9 @@ runs the function the service's measurement job runs (`worker::measure::measure_
 times every executor cost point the cache has no record of. The bench's report shows the
 engine's elastic expert bank over each pass (`magnitude_bench.report.expert_banks`).
 
-Our engine and the harness are built by separate cargo invocations (`binaries`): the harness
-enables the engine's development tuning tools, which one invocation would unify into the served
-binary.
+Our engine, `magnitude-assess`, and the host-only template renderer (`magnitude-render`) are
+built together in one cargo invocation (`binaries.SERVED_BUILD`) with `--no-default-features` so
+no development feature of `magnitude-harness` is unified into the served binary.
 """
 
 import argparse
@@ -24,8 +24,8 @@ import json
 from .. import sync, templates
 from ..engine import Step
 from ..sources import checkout
-from . import Answer, Instrument, JobResult, Plan, environment, harness, held
-from .binaries import ASSESS, ENGINE, SERVED_BUILD
+from . import Answer, Instrument, JobResult, Plan, environment, held
+from .binaries import ASSESS, ENGINE, RENDER, RENDER_BUILD, SERVED_BUILD
 
 BENCH = "{venv}/bin/magnitude-bench"
 KERNELS = f"{{runs}}/{sync.RUN_KERNELS}"  # the run's own kernel cache
@@ -67,8 +67,9 @@ def plan(arguments, source, host) -> Plan:
         jobs.append(("measure", Step("measure", (
             ASSESS, "--device", arguments.magnitude_device, "--kernels", cache, "--topology"))))
     if any(engine in bench.HOST_RENDERED for engine in engines) and arguments.harness is None:
-        builds.append(harness.BUILD)
-        ours += ["--harness", harness.EXECUTABLE]
+        if "magnitude" not in engines:
+            builds.append(RENDER_BUILD)
+        ours += ["--harness", RENDER]
     jobs.append(("bench", Step("bench", (
         BENCH, "job", "--inference", "{src}",
         *(("--model", arguments.model) if arguments.model is not None else ()),

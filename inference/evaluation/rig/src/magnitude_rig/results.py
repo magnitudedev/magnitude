@@ -14,6 +14,7 @@ import os
 import signal
 import subprocess
 import sys
+import threading
 import time
 from collections.abc import Callable
 from pathlib import Path
@@ -25,6 +26,9 @@ from .instruments import Answer, JobResult
 from .instruments.cargo import failures
 
 CHILD = "MRIG_RUN"  # set in a run's own process: the run id it carries out
+CALLER_FD = "MRIG_CALLER_FD"  # read end of the caller's liveness pipe (EOF without "D" => caller died)
+_DETACH = b"D"  # sent on the liveness pipe before an intentional detach (OVERRUN or normal exit)
+_CALLER_WRITERS: dict[int, int] = {}  # child pid -> write end of its liveness pipe
 OVERRUN = 3  # the exit code of a command that returned at the estimate, the run still going
 POLL = 0.5  # seconds between looks at the run's results while following it
 REPORT_SECONDS = 45  # how long a report may take to write (it reads the device over ssh)
@@ -57,22 +61,72 @@ def perform(arguments, request: engine.Request, answer: Callable[[dict[str, JobR
         return carry_out(arguments, request, answer, os.environ[CHILD])
     run_id, results, child = launch(request.instrument, arguments.argv)
     forward_stops([child])
-    return follow(run_id, results, child.pid, None)
+    code = follow(run_id, results, child.pid, None)
+    detach(child.pid)
+    return code
 
 
 def launch(instrument: str, argv: list[str]) -> tuple[str, Path, subprocess.Popen]:
     """Start a run of `instrument` in its own detached process: the mrig command `argv` again,
-    carrying out the run its `CHILD` names (`perform`). Its id, its results and its process."""
+    carrying out the run its `CHILD` names (`perform`). Its id, its results and its process.
+
+    A liveness pipe ties the child to this caller until `detach(child.pid)` sends `_DETACH`: if
+    this caller dies unexpectedly (e.g. `SIGKILL`, `SIGHUP`, or a dropped shell), the kernel
+    closes the write end without `_DETACH` and the child stops its remote runner cleanly instead
+    of leaving an orphaned remote job holding warm checkout slots or `timed` locks."""
     run_id = engine.new_run_id(instrument)
     results = store.results() / run_id
     results.mkdir(parents=True)
-    with open(results / engine.TRANSCRIPT, "w") as transcript:
-        child = subprocess.Popen(
-            [sys.executable, "-m", "magnitude_rig.cli", *argv],
-            env={**os.environ, CHILD: run_id}, stdin=subprocess.DEVNULL, stdout=transcript,
-            stderr=subprocess.STDOUT, start_new_session=True,
-        )
+    read_fd, write_fd = os.pipe()
+    try:
+        with open(results / engine.TRANSCRIPT, "w") as transcript:
+            child = subprocess.Popen(
+                [sys.executable, "-m", "magnitude_rig.cli", *argv],
+                env={**os.environ, CHILD: run_id, CALLER_FD: str(read_fd)},
+                stdin=subprocess.DEVNULL, stdout=transcript, stderr=subprocess.STDOUT,
+                start_new_session=True, pass_fds=(read_fd,),
+            )
+    except BaseException:
+        os.close(write_fd)
+        raise
+    finally:
+        os.close(read_fd)
+    _CALLER_WRITERS[child.pid] = write_fd
     return run_id, results, child
+
+
+def detach(pid: int) -> None:
+    """Intentionally detach a launched child (on `OVERRUN`, so `mrig wait` / `mrig stop` keep
+    working, or once its answer is recorded and it is finishing background fetch)."""
+    write_fd = _CALLER_WRITERS.pop(pid, None)
+    if write_fd is None:
+        return
+    try:
+        os.write(write_fd, _DETACH)
+    except OSError:
+        pass
+    finally:
+        try:
+            os.close(write_fd)
+        except OSError:
+            pass
+
+
+def _watch_caller(fd: int) -> None:
+    """Watch the caller's liveness pipe: EOF without `_DETACH` means the caller died unexpectedly,
+    so trigger `SIGTERM` on this child to stop its remote runner and release all host holds."""
+    try:
+        os.set_inheritable(fd, False)
+        data = os.read(fd, 1)
+    except OSError:
+        data = b""
+    finally:
+        try:
+            os.close(fd)
+        except OSError:
+            pass
+    if data != _DETACH:
+        os.kill(os.getpid(), signal.SIGTERM)
 
 
 def forward_stops(children: list[subprocess.Popen]) -> None:
@@ -82,8 +136,8 @@ def forward_stops(children: list[subprocess.Popen]) -> None:
         for child in children:
             child.send_signal(signal.SIGTERM)
 
-    signal.signal(signal.SIGTERM, forward)
-    signal.signal(signal.SIGINT, forward)
+    for sig in (signal.SIGTERM, signal.SIGINT, signal.SIGHUP):
+        signal.signal(sig, forward)
 
 
 def carry_out(arguments, request: engine.Request, answer: Callable[[dict[str, JobResult]], Answer],
@@ -93,6 +147,9 @@ def carry_out(arguments, request: engine.Request, answer: Callable[[dict[str, Jo
     there is none. The code ends the command following it (`follow`); this process then fetches
     the rest of an ended run (`engine.complete`). A run lost to an error here is left to the
     next command (`engine.collect`)."""
+    caller_fd = os.environ.pop(CALLER_FD, None)
+    if caller_fd is not None:
+        threading.Thread(target=_watch_caller, args=(int(caller_fd),), daemon=True).start()
     outcome = None
     try:
         outcome = engine.execute(request, run_id, command=tuple(arguments.argv))

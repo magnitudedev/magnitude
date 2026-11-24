@@ -2001,13 +2001,15 @@ class Runner:
             output = lambda stream, text: (watch is not None and watch.saw(text), self.events.output(stream, text))
         elif not {"install", "capture", "stdout_to"} & set(op) and (found := self._units(request)) is not None:
             request, output, paths = found
-        try:
-            self.child = Child(request, output, whole="capture" in op or "stdout_to" in op)
-        except (FileNotFoundError, PermissionError) as error:
-            # The command cannot run, as a shell reports it: 127 not found, 126 not executable.
-            self.events.output("stderr", "agent: %s\n" % error)
-            code, stdout = (127 if isinstance(error, FileNotFoundError) else 126), ""
-        else:
+        def run_once(req: dict) -> tuple[int, str]:
+            nonlocal watch
+            watch = None
+            try:
+                self.child = Child(req, output, whole="capture" in op or "stdout_to" in op)
+            except (FileNotFoundError, PermissionError) as error:
+                # The command cannot run, as a shell reports it: 127 not found, 126 not executable.
+                self.events.output("stderr", "agent: %s\n" % error)
+                return (127 if isinstance(error, FileNotFoundError) else 126), ""
             if "job" in op:
                 watch = Watch(stacks, self.child.process.pid, self._held, self.session.info["estimate"], self._asked)
             while not self.child.finished.wait(POLL_SECONDS):
@@ -2017,6 +2019,18 @@ class Runner:
                     watch.check()
             code, stdout = self.child.code, "".join(self.child.stdout)
             self._check_stop()
+            return code, stdout
+
+        # Fast-path frozen `uv sync` offline against UV_CACHE_DIR, falling back to online only on
+        # a cache miss so routine builds never block on or fail from PyPI network round-trips.
+        if "job" not in op and argv[:3] == ["uv", "sync", "--frozen"] and "--offline" not in argv:
+            offline = dict(request, argv=[*argv[:2], "--offline", *argv[2:]])
+            code, stdout = run_once(offline)
+            if code not in (0, 126, 127):
+                self.events.note("uv sync --offline missed cache (exited %d); retrying online" % code)
+                code, stdout = run_once(request)
+        else:
+            code, stdout = run_once(request)
         self.events.emit("exited", code=code)
         if "job" in op:
             self.codes[op["job"]] = code

@@ -33,34 +33,28 @@
 
 #![cfg_attr(test, allow(clippy::disallowed_methods, reason = "tests start threads of their own; the code they test starts its threads through seismic-threads"))]
 
-mod artifacts;
 mod bar;
 mod development;
-mod digest;
 mod draft;
 mod engine;
 mod logits;
 mod machine;
 mod memory;
-mod record;
-mod render;
 mod rest;
 mod routes;
 mod selection;
 mod steps;
-mod template;
 mod time;
 mod tuning;
 
-use artifacts::ArtifactsFile;
 use clap::{Args, Parser, Subcommand};
 use engine::EngineOptions;
-use magnitude_engine::host::HostArtifacts;
-use magnitude_engine::options::{ModelMethod, PackageOptions, ProjectorSelection};
+use magnitude_engine::options::ModelMethod;
 use magnitude_executor::STANDARD_TUNING_BUDGET;
-use record::{Run, RunRecord};
-use render::{Rendered, Renderer, RequestOptions};
-use template::TemplateFile;
+use magnitude_harness::{
+    Inputs, RunArgs, artifacts, digest, host, render, run_render, template,
+};
+use render::Renderer;
 use serde_json::{Map, Value, json};
 use std::cell::Cell;
 use std::path::PathBuf;
@@ -269,54 +263,6 @@ fn parse_method(name: &str) -> Result<ModelMethod, String> {
 }
 
 #[derive(Args)]
-struct Common {
-    /// The catalog acquisition object of the model (JSON).
-    #[arg(long, value_name = "FILE")]
-    artifacts: PathBuf,
-    /// A template file (repeatable): its lanes, sized to its context.
-    #[arg(long = "template", value_name = "FILE", required = true)]
-    templates: Vec<PathBuf>,
-    /// Chat-completions request fields every rendered request carries, as
-    /// the serving benchmark sends them (a JSON object); by default
-    /// `{"chat_template_kwargs": {"enable_thinking": false}}`.
-    #[arg(long, value_name = "JSON")]
-    request_options: Option<String>,
-}
-
-impl Common {
-    fn request_options(&self) -> Result<RequestOptions, String> {
-        self.request_options.as_deref().map_or_else(
-            || Ok(render::standard_request_options()),
-            render::request_options,
-        )
-    }
-}
-
-/// What every subcommand that writes a run takes.
-#[derive(Args)]
-struct RunArgs {
-    #[command(flatten)]
-    common: Common,
-    /// The run directory.
-    #[arg(long, value_name = "DIR")]
-    output: PathBuf,
-    /// The build identity (`{"commit", "dirty_digest"}`) from the evaluation
-    /// remote package; the record's build is `null` without it.
-    #[arg(long, value_name = "FILE")]
-    build_identity: Option<PathBuf>,
-}
-
-/// The model's host artifacts, opened for rendering as the target serves.
-fn host(artifacts: &ArtifactsFile) -> Result<HostArtifacts, String> {
-    HostArtifacts::open(&PackageOptions {
-        target_shards: artifacts.artifacts.target_shards(),
-        projector: ProjectorSelection::Disabled,
-        draft: None,
-    })
-    .map_err(|error| error.to_string())
-}
-
-#[derive(Args)]
 struct EngineArgs {
     /// The engine's kernel cache (formed kernels and tuning results).
     #[arg(long, value_name = "DIR")]
@@ -424,86 +370,6 @@ fn start() {
     }
 }
 
-/// What every subcommand reads before it runs.
-struct Inputs {
-    run: Run,
-    build: Value,
-    artifacts: ArtifactsFile,
-    templates: Vec<TemplateFile>,
-    request_options: RequestOptions,
-}
-
-impl Inputs {
-    fn read(args: &RunArgs, tool: &'static str) -> Result<Self, String> {
-        let build = record::build(args.build_identity.as_deref())?;
-        let request_options = args.common.request_options()?;
-        let artifacts = ArtifactsFile::read(&args.common.artifacts)?;
-        let templates = TemplateFile::read_all(&args.common.templates)?;
-        let run = Run::create(args.output.clone(), tool)?;
-        Ok(Self {
-            run,
-            build,
-            artifacts,
-            templates,
-            request_options,
-        })
-    }
-
-    /// Render every template's lanes for the model's target, as it serves,
-    /// templates in order, lanes in order.
-    fn render(&self) -> Result<Vec<Rendered>, String> {
-        let host = host(&self.artifacts)?;
-        let renderer = Renderer::new(
-            &host,
-            &self.artifacts.artifacts.model,
-            &self.request_options,
-        );
-        let mut rendered = Vec::new();
-        for file in &self.templates {
-            rendered.extend(renderer.render(file)?);
-        }
-        Ok(rendered)
-    }
-
-    /// Write `rendered.jsonl` and return its digest.
-    fn write_rendered(&self, rendered: &[Rendered]) -> Result<String, String> {
-        render::write_rendered(
-            &self.run.path("rendered.jsonl"),
-            rendered,
-            &self.artifacts.artifacts.model,
-            &self.artifacts.artifacts.target_sha256,
-        )
-    }
-
-    fn finish(
-        self,
-        rendered_digest: String,
-        devices: Option<Vec<String>>,
-        measurements: Map<String, Value>,
-        traces: Map<String, Value>,
-    ) -> Result<(), String> {
-        self.run.finish(RunRecord {
-            build: self.build,
-            model: self.artifacts.artifacts.model.clone(),
-            artifacts: self.artifacts.raw,
-            templates: self
-                .templates
-                .iter()
-                .map(|file| record::Template {
-                    name: file.name.clone(),
-                    context: file.context,
-                    path: file.path.clone(),
-                    digest: file.digest.clone(),
-                })
-                .collect(),
-            rendered_digest,
-            host: record::host(devices),
-            measurements,
-            traces,
-        })
-    }
-}
-
 /// The engine options of a run whose tuning trace is in `inputs`' run
 /// directory, with the development tools installed.
 fn engine_options(
@@ -594,12 +460,7 @@ fn run(command: Command) -> Result<(), String> {
             };
             served.end_process(code)
         }
-        Command::Render { run } => {
-            let inputs = Inputs::read(&run, "harness.render")?;
-            let rendered = inputs.render()?;
-            let digest = inputs.write_rendered(&rendered)?;
-            inputs.finish(digest, None, Map::new(), Map::new())
-        }
+        Command::Render { run } => run_render(&run),
         Command::Time {
             run,
             engine,

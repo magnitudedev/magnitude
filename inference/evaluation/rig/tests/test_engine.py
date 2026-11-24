@@ -1642,3 +1642,54 @@ def test_placement_prefers_idle_warm_and_closest_ancestor_over_cold(monkeypatch)
     cold_slow = make_candidate("cold-slow", None, slowest=300.0)
     busy_warm = make_candidate("busy-warm", {"shared": False, "built": True, "same_tree": True, "commit": "head"}, slowest=10.0, busy=True)
     assert rank([cold_slow, busy_warm, cold_fast]) == ["cold-fast", "busy-warm", "cold-slow"]
+
+
+def test_hf_hub_cache_uses_host_models_hub(rig):
+    """`mrig` unifies `HF_HUB_CACHE` with `<models>/hub` (`~/.magnitude/models/hub` by default)
+    instead of a separate cache under `<root>/cache/huggingface/hub`."""
+    hosts, source, _ = rig
+    remote = connect(hosts.host("alpha"))
+    assert (Path(remote.models) / "hub").is_dir()
+    plan = engine.Plan(request(source), engine.Work((engine.Side("source", source, ()),)), remote, "run-hub", {}, (0.0,))
+    env = plan.environment(engine.Step("s", ()), plan.tokens(plan.work.sides[0], None))
+    assert env["HF_HUB_CACHE"] == f"{remote.models}/hub"
+
+
+def test_caller_liveness_pipe_stops_child_on_eof_and_allows_detach(monkeypatch):
+    """Closing the liveness pipe without `_DETACH` signals SIGTERM to the child; calling
+    `results.detach(pid)` writes `_DETACH` so the child stays alive (for `mrig wait`/`stop`)."""
+    signalled = []
+    monkeypatch.setattr(results.os, "kill", lambda pid, sig: signalled.append((pid, sig)))
+
+    r1, w1 = os.pipe()
+    os.close(w1)  # unexpected caller death: EOF without _DETACH
+    results._watch_caller(r1)
+    assert signalled == [(os.getpid(), signal.SIGTERM)]
+
+    signalled.clear()
+    r2, w2 = os.pipe()
+    results._CALLER_WRITERS[999999] = w2
+    results.detach(999999)
+    results._watch_caller(r2)
+    assert signalled == []
+
+
+def test_runs_lists_orphans_and_stop_orphans_reaps_them(rig, monkeypatch, capsys):
+    """`mrig runs` surfaces launched runs whose local caller died, and `mrig stop --orphans`
+    stops their remote runners."""
+    hosts, _, _ = rig
+    run_id = "20261124T000000Z-bench-orphan"
+    state.Launched(run_id, "alpha", ["agent"], store.results() / run_id, ("bench",)).write()
+    assert cli._runs(argparse.Namespace()) == 0
+    out = capsys.readouterr().out
+    assert run_id in out and "orphaned" in out
+
+    stopped = []
+    monkeypatch.setattr(cli.Hosts, "load", classmethod(lambda cls: hosts))
+    monkeypatch.setattr(cli, "connect", lambda host: host)
+    monkeypatch.setattr(cli, "HostRun", lambda remote, run, agent: types.SimpleNamespace(
+        stop=lambda: stopped.append(run) or {"stopped": True}
+    ))
+    assert cli._stop(argparse.Namespace(run=None, orphans=True)) == 0
+    assert stopped == [run_id]
+    assert "stopping" in capsys.readouterr().out

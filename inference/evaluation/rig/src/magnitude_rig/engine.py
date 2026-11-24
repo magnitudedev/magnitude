@@ -707,7 +707,7 @@ class Plan:
             "UV_CACHE_DIR": f"{self.remote.root}/cache/uv",
             "UV_PROJECT_ENVIRONMENT": tokens["venv"],
             "PIP_CACHE_DIR": f"{self.remote.root}/cache/pip",
-            "HF_HUB_CACHE": f"{self.remote.root}/cache/huggingface/hub",
+            "HF_HUB_CACHE": f"{self.remote.models}/hub",
             **self.remote.env,
             **{name: _fill(value, tokens) for name, value in step.env},
         }

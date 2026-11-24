@@ -44,7 +44,7 @@ models = os.path.abspath(os.path.expanduser(sys.argv[2]))
 env = {{name: os.path.expanduser(value) for name, value in json.loads(sys.argv[3]).items()}}
 source = base64.b64decode({source!r})
 package = os.path.join(root, "agent", hashlib.sha256(source).hexdigest()[:16] + ".zip")
-for directory in (os.path.dirname(package), os.path.join(root, "src"), models):  # src: steps' cwd
+for directory in (os.path.dirname(package), os.path.join(root, "src"), models, os.path.join(models, "hub")):  # src: steps' cwd
     try:
         os.makedirs(directory, exist_ok=True)
     except PermissionError:
