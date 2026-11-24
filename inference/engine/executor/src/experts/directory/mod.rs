@@ -1476,7 +1476,7 @@ impl Directory {
         // release drains or the ranking updates).
         self.bank.take_changed();
         let progressed = !asked.promotions.is_empty() || !asked.releases.is_empty();
-        self.stirred |= capped && progressed;
+        self.stirred |= capped && (progressed || budget == 0);
         self.withheld = withheld.then(|| self.reuse_now().reads());
         asked
     }
@@ -1963,11 +1963,6 @@ impl Directory {
                     break;
                 }
                 let exit = self.exit_now(group, record, staged);
-                // Skip victims that require a write-back copy into HostTier;
-                // demand replenishment only needs fast stamped-unmap releases.
-                if exit.back().is_some() {
-                    continue;
-                }
                 self.bank.release(group, BankRecord(record as u32), at.into(), exit);
                 self.left_bank(layer, expert, None);
                 released += 1;

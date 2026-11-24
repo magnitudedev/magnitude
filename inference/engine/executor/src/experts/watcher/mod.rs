@@ -991,22 +991,6 @@ impl Watcher {
         // The transfer queue the promotions queue on, whose completions its
         // watch announces.
         let copies = copier.as_ref().map(|copier| copier.copies.clone());
-        // Keep a small free-slot reserve per group on discrete-GPU tier banks
-        // so background promotions never exhaust `DecodeDMA`'s `DemandLanding`
-        // headroom (`req_dma_overflow = 0`).
-        if core.extents.placer == crate::planning::Placer::Tier {
-            let layer_groups = core.directory.layer_groups();
-            for group in 0..core.groups.len() {
-                let cap = core.directory.capacity(group);
-                if cap >= 64 {
-                    let members = layer_groups.iter().filter(|&&of| of == group).count();
-                    let reserve = 32usize.min(cap / 16).min(cap.saturating_sub(members));
-                    if reserve > 0 {
-                        core.directory.reserve(group, reserve);
-                    }
-                }
-            }
-        }
         // The ledger's rates are the ranking's (`Reuse::rates`).
         let ranking = core.directory.ranking();
         let groups = core.directory.layer_groups();
