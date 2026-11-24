@@ -1192,6 +1192,7 @@ fn a_refused_tier_copy_changes_neither_its_grid_nor_its_price() {
                 stall_share: 0.1,
                 transfer: magnitude_cost_model::ReadLine::new(1e-5, 1e-10).unwrap(),
                 back: magnitude_cost_model::ReadLine::new(1e-5, 1e-10).unwrap(),
+                concurrent_host_byte_seconds: None,
             })),
             convert: crate::assessment::Priced::Measured(None),
         }),

@@ -2248,6 +2248,7 @@ version = "0.1.0"
 dependencies = [
  "seismic-measure",
  "serde",
+ "serde_json",
 ]
 
 [[package]]

@@ -123,7 +123,7 @@ pub fn host_lines(plan: &ExpertBankPlan, bank: &[BankLines], byte_seconds: Optio
         .layers()
         .iter()
         .zip(bank)
-        .map(|(layer, bank)| HostLines { cpu: bank.cpu, memory: memory[layer.group], landing: None, record_bytes: bank.record_bytes })
+        .map(|(layer, bank)| HostLines { cpu: bank.cpu, memory: memory[layer.group], joint_memory: None, landing: None, record_bytes: bank.record_bytes })
         .collect())
 }
 
@@ -218,7 +218,7 @@ mod tests {
         // The link's in-place rate is not what a copy takes: the transfer
         // queue's is.
         let transfer = ReadLine::new(5e-6, 1e-10).unwrap();
-        let copy = super::super::TierCopyCosts { blocks: 1, whole_seconds: (records * bytes) as f64 * 3e-10, stall_share: 0.5, transfer, back: transfer };
+        let copy = super::super::TierCopyCosts { blocks: 1, whole_seconds: (records * bytes) as f64 * 3e-10, stall_share: 0.5, transfer, back: transfer, concurrent_host_byte_seconds: None };
         let saved = lines.host.cpu.unwrap().expert.nanoseconds(1.).min(lines.gpu.link.nanoseconds(1.)) - lines.gpu.resident.nanoseconds(1.);
         let link = lines.host.record_bytes as f64 * 1e-10 * 1e9;
         let memory = lines.host.memory.unwrap().get();
@@ -324,13 +324,19 @@ mod tests {
                     .collect::<Vec<_>>();
                 let ns = |low: u64, high: u64| Nanoseconds::try_from((low + draw.below(high - low)) as u32).unwrap();
                 let mut ns = ns;
+                let (memory, joint_memory) = match case % 3 {
+                    0 => (None, None),
+                    1 => (Some(ns(10_000, 160_000)), None),
+                    _ => (Some(ns(10_000, 120_000)), Some(ns(15_000, 160_000))),
+                };
                 let lines = ExpertLines {
                     host: HostLines {
                         cpu: Some(CpuLines {
                             expert: RowLine { one: ns(20_000, 90_000), row: RowCost::Measured(ns(0, 20_000)) },
                             handshake: ns(0, 10_000),
                         }),
-                        memory: None,
+                        memory,
+                        joint_memory,
                         landing: None,
                         record_bytes: 1,
                     },
@@ -344,7 +350,13 @@ mod tests {
                 for (word, value) in ExpertLines::policy(&POLICY_LAYOUT, SiteLines::Measured(lines.host.cpu.as_ref().unwrap()), Some(&lines)) {
                     policy[word] = value;
                 }
-                let sources = assign(&module, k, &routes, &records, &policy);
+                // `resolve` in `routed.seismic` calls `assign` only when `POLICY_PRICED != 0`;
+                // otherwise every miss stays on the link path (site = -1).
+                let sources = if policy[constants::POLICY_PRICED as usize] != 0 {
+                    assign(&module, k, &routes, &records, &policy)
+                } else {
+                    magnitude_kernels::source_words(&records, &vec![-1; records.len()])
+                };
                 // The host function over the same step: each distinct
                 // expert in first-choice order, its rows its choices.
                 let mut distinct = Vec::<i32>::new();

@@ -12,6 +12,9 @@ license.workspace = true
 seismic-measure.workspace = true
 serde.workspace = true
 
+[dev-dependencies]
+serde_json.workspace = true
+
 [features]
 # Test-only: the reference lines (`ExpertLines::reference`), for the tests
 # of the crates above. Never enabled by a served engine.

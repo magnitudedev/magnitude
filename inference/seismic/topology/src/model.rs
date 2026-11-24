@@ -826,6 +826,33 @@ impl DeviceTopology {
         let store = |contract| self.first_store(executor, contract);
         store(Contract::Shared).is_some() && store(Contract::Shared) == store(Contract::DeviceOnly)
     }
+    /// Whether `executor` has a host-to-device transfer path (`HostRam -> DeviceMemory`)
+    /// that shares the physical `HostRam` store with a host CPU executor's `AccessPath`
+    /// to `HostRam`.
+    ///
+    /// True for discrete GPUs whose DMA engine reads from `HostRam` concurrently with
+    /// CPU-site compute; false for unified-memory GPUs (which have no separate
+    /// `HostRam -> DeviceMemory` transfer path) and for the CPU executor itself.
+    pub fn shares_host_ram_bus(&self, executor: &Executor) -> bool {
+        let host_ram = self.host_ram().id();
+        let has_dma_from_host = self.transfer.iter().any(|path| {
+            path.by == executor.id()
+                && path.from == host_ram
+                && matches!(
+                    self.store(path.to).map(Store::kind),
+                    Some(StoreKind::DeviceMemory(_))
+                )
+        });
+        if !has_dma_from_host {
+            return false;
+        }
+        self.access.iter().any(|path| {
+            path.store == host_ram
+                && self
+                    .executor(path.executor)
+                    .is_some_and(|exec| exec.kind() == ExecutorKind::Cpu)
+        })
+    }
     pub fn transfer_path(&self, id: TransferPathId) -> Option<&TransferPath> {
         (id.revision == self.revision).then(|| &self.transfer[id.index as usize])
     }

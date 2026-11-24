@@ -402,6 +402,14 @@ fn the_rule_places_every_contract_as_the_spec_states() {
     );
     assert!(discrete.first_store(cuda, Contract::Shared) != discrete.first_store(cuda, Contract::DeviceOnly));
     assert!(!discrete.shared_ranges_lie_in_device_memory(cuda));
+    assert!(discrete.shares_host_ram_bus(cuda));
+    assert!(discrete.shares_host_ram_bus(vulkan));
+    let discrete_cpu = discrete
+        .executors()
+        .iter()
+        .find(|executor| executor.backend() == BackendName::Cpu)
+        .unwrap();
+    assert!(!discrete.shares_host_ram_bus(discrete_cpu));
 
     let reports = gb10();
     let unified = topology(&reports);
@@ -412,12 +420,14 @@ fn the_rule_places_every_contract_as_the_spec_states() {
         [vec![0], vec![1], vec![1], vec![1]]
     );
     assert!(unified.shared_ranges_lie_in_device_memory(cuda));
+    assert!(!unified.shares_host_ram_bus(cuda));
     let vulkan = executor(&unified, BackendName::Vulkan, &uuid);
     assert_eq!(
         of(&unified, vulkan),
         [vec![0], vec![2], vec![3], vec![3]]
     );
     assert!(unified.shared_ranges_lie_in_device_memory(vulkan));
+    assert!(!unified.shares_host_ram_bus(vulkan));
 
     let reports = m4_pro();
     let apple = topology(&reports);
@@ -431,6 +441,7 @@ fn the_rule_places_every_contract_as_the_spec_states() {
         [vec![0], vec![0], vec![0], vec![0]]
     );
     assert!(apple.shared_ranges_lie_in_device_memory(metal));
+    assert!(!apple.shares_host_ram_bus(metal));
 }
 
 /// A device-local mappable heap of at most `WINDOW_BYTES` counts as host

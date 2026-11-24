@@ -335,11 +335,33 @@ impl Moves {
 pub struct HostLines {
     pub cpu: Option<CpuLines>,
     pub memory: Option<Nanoseconds>,
+    /// One tier record's read time (`b / B_joint`) from the shared `HostRam`
+    /// bus under concurrent `DMA ∥ CPU` traffic, when measured by the
+    /// topology-grounded contention probe (`TierCopyCosts::concurrent_host_byte_seconds`).
+    ///
+    /// `None` on unified memory (where `memory` is also `None`) or before the
+    /// concurrent probe has been recorded, in which case shared-bus contention
+    /// falls back conservatively to `memory` (`B_joint <= B_mem`).
+    #[serde(default)]
+    pub joint_memory: Option<Nanoseconds>,
     /// What a request's file misses add past their reads' end as they land,
     /// at the one site its bank lands them ([`LandingLine`]); none before
     /// any line of that site is had.
     pub landing: Option<LandingLine>,
     pub record_bytes: u64,
+}
+
+impl HostLines {
+    /// One tier record's read time (`b / B_joint`) on the shared `HostRam` bus
+    /// under concurrent `DMA ∥ CPU` traffic: the measured `joint_memory` (at
+    /// least `memory`, since concurrent traffic cannot exceed uncontended
+    /// `HostRam` bandwidth), or `memory` as the conservative analytical
+    /// fallback when `joint_memory` is unprobed. `None` on unified memory
+    /// (`memory == None`).
+    pub fn contended_memory(&self) -> Option<Nanoseconds> {
+        let mem = self.memory?;
+        Some(self.joint_memory.map_or(mem, |joint| joint.max(mem)))
+    }
 }
 
 /// Where a layer's file misses land, by who places its bank's records, and
@@ -581,12 +603,58 @@ impl ExpertLines {
         line.seconds(count * self.host.record_bytes) + self.landed(count, record_read)
     }
 
+    /// Effective CPU lines for decode assignment, accounting for shared
+    /// `HostRam` bus contention between PCIe DMA (`Link`) and CPU-site (`Cpu`).
+    ///
+    /// When `host.contended_memory()` is `Some(t_joint)` (discrete GPU sharing
+    /// `HostRam` with the CPU):
+    /// - `B_joint = b / t_joint` is the aggregate `HostRam` read throughput
+    ///   under concurrent `DMA ∥ CPU` traffic (measured, or conservatively
+    ///   bounded by `B_mem = b / host.memory` when unprobed).
+    /// - `B_link = b / gpu.link.weights` is the uncontended link throughput.
+    /// - The spare `HostRam` headroom available to CPU-site alongside saturated
+    ///   link traffic is `B_spare = B_joint - B_link`.
+    /// - When `B_spare <= 0` (`t_joint >= t_link`), offloading to CPU-site adds
+    ///   zero net throughput and degrades wall time, so `Site::Cpu` is
+    ///   suppressed (`None`).
+    /// - Otherwise, the marginal shared-bus cost of a CPU expert is
+    ///   `t_spare = (t_joint * t_link) / (t_link - t_joint)`, and the CPU's
+    ///   effective per-expert cost is `max(cpu.expert.one, t_spare)`.
+    ///
+    /// On unified memory (`host.memory == None`), there is no separate `Link`
+    /// sharing `HostRam` with the CPU, so `cpu` is returned unchanged.
+    pub fn effective_cpu_for(&self, cpu: CpuLines) -> Option<CpuLines> {
+        let Some(t_joint) = self.host.contended_memory() else {
+            return Some(cpu);
+        };
+        let t_joint_ns = t_joint.get();
+        let t_link_ns = self.gpu.link.weights.get();
+        if t_joint_ns <= 0. || t_link_ns <= 0. {
+            return Some(cpu);
+        }
+        if t_joint_ns >= t_link_ns {
+            return None;
+        }
+        let t_spare_ns = (t_joint_ns * t_link_ns) / (t_link_ns - t_joint_ns);
+        let effective_one = Nanoseconds::saturating(cpu.expert.one.get().max(t_spare_ns) * 1e-9);
+        Some(CpuLines {
+            expert: RowLine { one: effective_one, ..cpu.expert },
+            handshake: cpu.handshake,
+        })
+    }
+
+    /// [`Self::effective_cpu_for`] applied to `self.host.cpu`.
+    pub fn effective_cpu(&self) -> Option<CpuLines> {
+        self.host.cpu.and_then(|cpu| self.effective_cpu_for(cpu))
+    }
+
     /// Assign each decode miss in `misses` (already ordered most-rows-first) to
     /// the CPU or the GPU in place, starting the GPU queue at `hit_ns` and
     /// notifying `on_site(tag, site)` for each assigned miss.
     ///
-    /// Single owner of the decode-miss tie-breaking, handshake and link-busy
-    /// rules shared by [`Self::serve`] and [`crate::step::StepInputs`].
+    /// Single owner of the decode-miss tie-breaking, handshake, shared-bus
+    /// contention and link-busy rules shared by [`Self::serve`],
+    /// [`Self::policy`] and [`crate::step::StepInputs`].
     pub(crate) fn serve_decode<T>(
         &self,
         hit_ns: f64,
@@ -594,12 +662,13 @@ impl ExpertLines {
         mut on_site: impl FnMut(T, Site),
     ) -> DecodeSchedule {
         let link_busy = self.gpu.moves.link.get();
+        let cpu_lines = self.effective_cpu();
         let (mut gpu_ns, mut cpu_ns) = (hit_ns, 0f64);
         let mut served_cpu = false;
         let mut link_count = 0u64;
         for (tag, miss) in misses {
             let ready_ns = miss.ready_seconds * 1e9;
-            let on_cpu = self.host.cpu.map(|lines| {
+            let on_cpu = cpu_lines.map(|lines| {
                 let handshake = if served_cpu { 0. } else { lines.handshake.get() };
                 cpu_ns.max(ready_ns) + lines.expert.nanoseconds(miss.rows) + handshake
             });
@@ -695,16 +764,21 @@ impl ExpertLines {
 
     /// The policy words of the layer's lines (`streaming_words.seismic`'s
     /// policy after its home), each `(word, value)` at `layout`'s offsets:
-    /// POLICY_PRICED set, and the GPU's words and a site's CPU words
-    /// written, once every line the assignment reads is measured (`lines`,
-    /// and a site's own, `site`); else POLICY_PRICED clear and no line
-    /// written, so every miss is served on the GPU's path, the CPU site off.
+    /// POLICY_PRICED set, and the GPU's words and a site's effective CPU words
+    /// ([`Self::effective_cpu_for`]) written, once every line the assignment
+    /// reads is measured (`lines`, and a site's own, `site`) and shared-bus
+    /// contention leaves spare headroom for CPU-site; else POLICY_PRICED clear
+    /// and no line written, so every miss is served on the GPU's path, the CPU
+    /// site off.
     pub fn policy(layout: &PolicyLayout, site: SiteLines<'_>, lines: Option<&Self>) -> Vec<(usize, i32)> {
         let mut words = Vec::with_capacity(layout.words);
-        let (cpu, lines) = match (site, lines) {
-            (SiteLines::Unsited, Some(lines)) => (None, Some(lines)),
-            (SiteLines::Measured(cpu), Some(lines)) => (Some(cpu), Some(lines)),
-            (SiteLines::Pending, _) | (_, None) => (None, None),
+        let (cpu, lines, priced) = match (site, lines) {
+            (SiteLines::Unsited, Some(lines)) => (None, Some(lines), true),
+            (SiteLines::Measured(cpu), Some(lines)) => match lines.effective_cpu_for(*cpu) {
+                Some(effective) => (Some(effective), Some(lines), true),
+                None => (None, None, false),
+            },
+            (SiteLines::Pending, _) | (_, None) => (None, None, false),
         };
         if let Some(cpu) = cpu {
             words.extend([(layout.cpu, cpu.expert.one), (layout.cpu_row, cpu.expert.row.bound()), (layout.handshake, cpu.handshake)]);
@@ -719,7 +793,7 @@ impl ExpertLines {
             ]);
         }
         let mut words = words.into_iter().map(|(word, line)| (word, line.word())).collect::<Vec<_>>();
-        words.push((layout.priced, i32::from(lines.is_some())));
+        words.push((layout.priced, i32::from(priced)));
         words
     }
 }
@@ -755,6 +829,7 @@ impl ExpertLines {
                     handshake: ns(4_000),
                 }),
                 memory: Some(rate(38_000)),
+                joint_memory: None,
                 landing: None,
                 record_bytes,
             },
@@ -775,6 +850,13 @@ mod tests {
         ExpertLines::reference(ExpertLines::REFERENCE_RECORD)
     }
 
+    /// Reference lines without shared `HostRam` bus contention (`memory: None`),
+    /// for testing pure two-queue makespan and handshake arithmetic.
+    fn uncontended_lines() -> ExpertLines {
+        let base = lines();
+        ExpertLines { host: HostLines { memory: None, joint_memory: None, ..base.host }, ..base }
+    }
+
     fn misses(count: usize, rows: f64) -> Vec<Miss> {
         vec![Miss { rows, ready_seconds: 0. }; count]
     }
@@ -789,7 +871,7 @@ mod tests {
     /// 131; a fourth would end the CPU at 164, so the link takes it.
     #[test]
     fn the_cpu_takes_misses_while_it_ends_no_later_than_the_link() {
-        let lines = lines();
+        let lines = uncontended_lines();
         let three = lines.serve(Pass::Decode, &hits(9.), &misses(3, 1.));
         assert_eq!(three.at(Site::Cpu), 3, "{three:?}");
         assert!((three.exposed.total() - (124e-6 - 45e-6)).abs() < 1e-12, "{three:?}");
@@ -815,7 +897,7 @@ mod tests {
     /// layer that reads nothing in place never waits for the moves.
     #[test]
     fn moves_on_the_link_send_misses_to_the_cpu() {
-        let lines = lines().moving(Some((100e-6, 0.5)));
+        let lines = uncontended_lines().moving(Some((100e-6, 0.5)));
         assert_eq!(lines.gpu.moves, Moves { link: Nanoseconds(100_000), records: 0.5 });
         let four = lines.serve(Pass::Decode, &hits(9.), &misses(4, 1.));
         assert_eq!(four.at(Site::Cpu), 4, "{four:?}");
@@ -831,7 +913,7 @@ mod tests {
     /// hits ends at 44 µs, hidden whole.
     #[test]
     fn the_hits_hide_the_cpus_work_and_its_handshake() {
-        let lines = lines();
+        let lines = uncontended_lines();
         let one = lines.serve(Pass::Decode, &hits(9.), &misses(1, 1.));
         assert_eq!(one.sites, [Site::Cpu]);
         assert_eq!(one.exposed, Exposed::default());
@@ -876,7 +958,7 @@ mod tests {
     /// A file miss waits for its read and landing before any site.
     #[test]
     fn a_file_miss_waits_for_its_landing() {
-        let lines = lines();
+        let lines = uncontended_lines();
         let line = ReadLine::new(200e-6, 1. / 6e9).unwrap();
         let ready = lines.filed(&line, 1);
         assert!((ready - (200e-6 + 1_930_000. / 6e9)).abs() < 1e-12);
@@ -931,7 +1013,7 @@ mod tests {
     /// unpriced (every miss on the GPU's path).
     #[test]
     fn the_policy_words_are_the_measured_lines() {
-        let lines = lines();
+        let lines = uncontended_lines();
         // A layout of its own: each word at an offset no other takes.
         let layout = PolicyLayout { words: 10, cpu: 0, cpu_row: 1, handshake: 2, link: 3, link_row: 4, link_busy: 8, hit: 5, hit_row: 6, priced: 7 };
         let words = |site, priced| ExpertLines::policy(&layout, site, priced).into_iter().collect::<std::collections::BTreeMap<_, _>>();
@@ -945,6 +1027,12 @@ mod tests {
         assert_eq!(both[&word(layout.link_busy)], 0, "nothing moves");
         assert_eq!(both[&word(layout.hit_row)], 100);
         assert_eq!(both[&word(layout.priced)], 1);
+        // With shared HostRam contention (`memory = 38 µs`, `link = 86 µs`),
+        // POLICY_CPU_NS reflects the spare-headroom marginal cost `68_083 ns`.
+        let contended = self::lines();
+        let contended_words = words(SiteLines::Measured(contended.host.cpu.as_ref().unwrap()), Some(&contended));
+        assert_eq!(contended_words[&word(layout.cpu)], 68_083);
+        assert_eq!(contended_words[&word(layout.priced)], 1);
         let unpriced = words(sited, None);
         assert_eq!(unpriced[&word(layout.priced)], 0);
         assert!(!unpriced.contains_key(&word(layout.link)));
@@ -1012,4 +1100,132 @@ mod tests {
         assert_eq!(lines.expert.row, RowCost::Measured(Nanoseconds(25_000)));
     }
 
+    /// Build `ExpertLines` for a 3 MB expert given link bandwidth (`b_link_gbs`),
+    /// uncontended HostRam bandwidth (`b_mem_gbs`, `None` on unified memory),
+    /// measured concurrent `DMA ∥ CPU` aggregate bandwidth (`b_joint_gbs`), and
+    /// uncontended CPU-site time (`cpu_ns`).
+    fn topology_lines(
+        b_link_gbs: f64,
+        b_mem_gbs: Option<f64>,
+        b_joint_gbs: Option<f64>,
+        cpu_ns: u32,
+    ) -> ExpertLines {
+        const RECORD: u64 = 3_000_000;
+        let ns_of_gbs = |gbs: f64| Nanoseconds::of(RECORD as f64 / (gbs * 1e9)).unwrap();
+        let ns = |v: u32| Nanoseconds::try_from(v).unwrap();
+        ExpertLines {
+            host: HostLines {
+                cpu: Some(CpuLines {
+                    expert: RowLine { one: ns(cpu_ns), row: RowCost::Measured(ns(1_000)) },
+                    handshake: ns(4_000),
+                }),
+                memory: b_mem_gbs.map(ns_of_gbs),
+                joint_memory: b_joint_gbs.map(ns_of_gbs),
+                landing: None,
+                record_bytes: RECORD,
+            },
+            gpu: GpuLines {
+                link: PassLine { weights: ns_of_gbs(b_link_gbs), row: ns(100) },
+                resident: PassLine { weights: ns(5_000), row: ns(100) },
+                moves: Moves::NONE,
+            },
+        }
+    }
+
+    /// 1. Gen5 + 2-ch DDR5 (`B_link = 43.6 GB/s`, `B_mem = 47.8 GB/s`,
+    ///    contended `B_joint <= 47.8 GB/s`): CPU-site is naturally suppressed
+    ///    (0 CPU experts assigned), both under measured contention (`B_joint <= B_link`)
+    ///    and under the analytical upper bound (`B_joint = B_mem = 47.8 GB/s`).
+    #[test]
+    fn gen5_dual_channel_ddr5_suppresses_cpu_site() {
+        let layout = PolicyLayout { words: 10, cpu: 0, cpu_row: 1, handshake: 2, link: 3, link_row: 4, link_busy: 8, hit: 5, hit_row: 6, priced: 7 };
+        let words = |lines: &ExpertLines| {
+            ExpertLines::policy(&layout, SiteLines::Measured(lines.host.cpu.as_ref().unwrap()), Some(lines))
+                .into_iter()
+                .collect::<std::collections::BTreeMap<_, _>>()
+        };
+
+        // Measured arbitration slowdown: `B_joint = 42.0 GB/s < B_link = 43.6 GB/s`.
+        let contended = topology_lines(43.6, Some(47.8), Some(42.0), 75_000);
+        assert_eq!(contended.effective_cpu(), None);
+        let served = contended.serve(Pass::Decode, &hits(2.), &misses(8, 1.));
+        assert_eq!(served.at(Site::Cpu), 0, "{served:?}");
+        assert_eq!(served.at(Site::Link), 8, "{served:?}");
+        let pol = words(&contended);
+        assert_eq!(pol[&layout.priced], 0, "POLICY_PRICED must be cleared when CPU-site has zero headroom");
+        assert!(!pol.contains_key(&layout.cpu));
+
+        // Conservative analytical fallback (unprobed `joint_memory: None`, `B_joint = B_mem = 47.8 GB/s`):
+        // spare headroom is only `4.2 GB/s` (`t_spare ≈ 714 µs`), so 8 decode misses all go to Link.
+        let analytical = topology_lines(43.6, Some(47.8), None, 75_000);
+        let served = analytical.serve(Pass::Decode, &hits(2.), &misses(8, 1.));
+        assert_eq!(served.at(Site::Cpu), 0, "{served:?}");
+        assert_eq!(served.at(Site::Link), 8, "{served:?}");
+        let pol = words(&analytical);
+        assert_eq!(pol[&layout.priced], 1);
+        assert!(pol[&layout.cpu] > 700_000, "marginal CPU cost must reflect 4.2 GB/s spare headroom: {}", pol[&layout.cpu]);
+    }
+
+    /// 2. Gen4 + 2-ch DDR5 (`B_link = 20 GB/s`, `B_mem = 47.8 GB/s`,
+    ///    contended `B_joint = 44 GB/s`): CPU-site is naturally enabled and
+    ///    receives the headroom-bounded share of misses (`B_spare = 24 GB/s` ->
+    ///    `t_spare = 125 µs`), strictly less than uncontended `75 µs`.
+    #[test]
+    fn gen4_dual_channel_ddr5_bounds_cpu_to_spare_headroom() {
+        let contended = topology_lines(20.0, Some(47.8), Some(44.0), 75_000);
+        let uncontended = topology_lines(20.0, None, None, 75_000);
+
+        let eff = contended.effective_cpu().expect("Gen4 + DDR5 has spare HostRam headroom");
+        assert!(
+            (eff.expert.one.get() - 125_000.).abs() < 200.,
+            "expected ~125 µs for 24 GB/s spare headroom, got {}",
+            eff.expert.one.get()
+        );
+
+        let served = contended.serve(Pass::Decode, &hits(3.), &misses(8, 1.));
+        let served_uncontended = uncontended.serve(Pass::Decode, &hits(3.), &misses(8, 1.));
+        assert_eq!(served.at(Site::Cpu), 4, "4 of 8 misses (~50% ≈ 24/44) should go to CPU: {served:?}");
+        assert_eq!(served.at(Site::Link), 4, "{served:?}");
+        assert!(
+            served.at(Site::Cpu) < served_uncontended.at(Site::Cpu),
+            "contended CPU share ({}) must be strictly below uncontended ({})",
+            served.at(Site::Cpu),
+            served_uncontended.at(Site::Cpu),
+        );
+    }
+
+    /// 3. Gen5 + 8-ch EPYC DDR5 (`B_link = 43.6 GB/s`, `B_mem = 300 GB/s`):
+    ///    spare headroom (`~256 GB/s`, `t_spare ≈ 11.7 µs`) far exceeds CPU-site
+    ///    rate (`75 µs`), so CPU-site runs at its full uncontended rate in parallel.
+    #[test]
+    fn gen5_eight_channel_epyc_runs_cpu_uncontended() {
+        let epyc = topology_lines(43.6, Some(300.0), Some(295.0), 75_000);
+        let uncontended = topology_lines(43.6, None, None, 75_000);
+
+        assert_eq!(epyc.effective_cpu(), epyc.host.cpu, "EPYC spare headroom must not throttle CPU-site");
+        let served = epyc.serve(Pass::Decode, &hits(2.), &misses(8, 1.));
+        let served_uncontended = uncontended.serve(Pass::Decode, &hits(2.), &misses(8, 1.));
+        assert_eq!(served.sites, served_uncontended.sites);
+        assert!(served.at(Site::Cpu) >= 3, "CPU should run in parallel with Gen5 DMA on EPYC: {served:?}");
+    }
+
+    /// 4. Unified memory (Apple Silicon / GB10): `HostLines::memory == None`
+    ///    -> `contended_memory()` is `None` and CPU pricing is completely unaffected.
+    #[test]
+    fn unified_memory_has_no_shared_link_contention() {
+        let unified = topology_lines(43.6, None, Some(40.0), 75_000);
+        assert_eq!(unified.host.contended_memory(), None);
+        assert_eq!(unified.effective_cpu(), unified.host.cpu);
+    }
+
+    /// 5. Backward compatibility: existing cached `HostLines` JSON without
+    ///    `joint_memory` deserializes cleanly with `joint_memory: None`.
+    #[test]
+    fn host_lines_deserializes_without_joint_memory_field() {
+        let legacy_json = r#"{"cpu":null,"memory":38000,"landing":null,"record_bytes":1930000}"#;
+        let host: HostLines = serde_json::from_str(legacy_json).expect("legacy HostLines JSON must deserialize");
+        assert_eq!(host.memory, Some(Nanoseconds(38_000)));
+        assert_eq!(host.joint_memory, None);
+        assert_eq!(host.contended_memory(), Some(Nanoseconds(38_000)));
+    }
 }

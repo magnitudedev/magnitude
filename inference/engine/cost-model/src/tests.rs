@@ -191,7 +191,7 @@ fn a_prompts_routed_seconds_are_main_per_layer_sum() {
 fn a_run_by_run_step_is_the_layer_by_layer_step() {
     let read = ReadLine::new(4e-4, 1. / 2e9).unwrap();
     let tiered = ExpertLines::reference(ExpertLines::REFERENCE_RECORD);
-    let unified = ExpertLines { host: HostLines { cpu: None, memory: None, landing: None, record_bytes: 2_000_000 }, ..tiered };
+    let unified = ExpertLines { host: HostLines { cpu: None, memory: None, joint_memory: None, landing: None, record_bytes: 2_000_000 }, ..tiered };
     let load = |tier, file| LayerLoad { routed: 64., rows: 1., tier, file, recall: 0. };
     let laid = [(&tiered, load(1, 2), 7), (&unified, load(0, 0), 3), (&unified, load(0, 3), 5), (&tiered, load(2, 0), 4), (&tiered, load(0, 1), 6)];
     let runs = laid.map(|(_, load, layers)| LayerRun { load, layers });

@@ -190,7 +190,7 @@ mod tests {
     /// 0.2 ms); beside a tier the host lands them, unpriced before a load observes it.
     #[test]
     fn a_file_miss_lands_through_one_records_convert_with_no_host_tier() {
-        let host = HostLines { cpu: None, memory: None, landing: None, record_bytes: 2_000_000 };
+        let host = HostLines { cpu: None, memory: None, joint_memory: None, landing: None, record_bytes: 2_000_000 };
         let line = landing(&host, 1e-10).unwrap().expect("no tier: the device lands it");
         for count in [1, 3] {
             assert!((line.seconds(count, 1.) - 2e-4).abs() < 1e-12, "{count} misses");

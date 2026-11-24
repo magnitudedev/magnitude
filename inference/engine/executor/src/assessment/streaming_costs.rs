@@ -602,6 +602,15 @@ pub struct TierCopyCosts {
     /// The transfer queue's line the other way, from device memory into
     /// host memory.
     pub back: ReadLine,
+    /// Measured aggregate `HostRam` read seconds-per-byte (`1 / B_joint`) when
+    /// H2D DMA (`Transfer::copy`) and CPU host-RAM reads (`Sweeps`) run
+    /// concurrently on the shared `HostRam` bus.
+    ///
+    /// `None` when the executor does not share a `HostRam` bus with the host
+    /// CPU (`!topology.shares_host_ram_bus(executor)`) or before the concurrent
+    /// probe has been recorded (in which case callers fall back conservatively
+    /// to `MemoryCosts::byte_seconds`).
+    pub concurrent_host_byte_seconds: Option<f64>,
 }
 
 /// Which way a transfer-queue batch copies.
@@ -677,6 +686,8 @@ pub enum TierCopyPoint {
     StallAlone,
     StallBesideCopy,
     Transfer { records: u64, direction: Direction },
+    ConcurrentDma,
+    ConcurrentCpu,
 }
 
 impl fmt::Display for TierCopyPoint {
@@ -687,6 +698,8 @@ impl fmt::Display for TierCopyPoint {
             Self::StallBesideCopy => formatter.write_str("the stall probe's work beside a transfer-queue copy"),
             Self::Transfer { records, direction: Direction::In } => write!(formatter, "a transfer-queue batch of {records} probe records into the device"),
             Self::Transfer { records, direction: Direction::Out } => write!(formatter, "a transfer-queue batch of {records} probe records out of the device"),
+            Self::ConcurrentDma => formatter.write_str("a transfer-queue batch into the device beside concurrent CPU host-RAM reads"),
+            Self::ConcurrentCpu => formatter.write_str("a host-RAM read sweep beside a concurrent transfer-queue copy"),
         }
     }
 }
@@ -705,6 +718,9 @@ pub enum TierCopyError {
     /// The transfer queue's batches make no line: the whole probe's batch
     /// took less than one record's, or a term is not finite.
     Transfer(InvalidLine),
+    /// The concurrent `DMA ∥ CPU` host-RAM contention probe produced a
+    /// non-finite or non-positive aggregate throughput.
+    ConcurrentHostRead { dma: f64, cpu: f64 },
 }
 
 impl fmt::Display for TierCopyError {
@@ -719,6 +735,10 @@ impl fmt::Display for TierCopyError {
                 "the stall probe ran faster beside a copy ({beside:e} s) than alone ({alone:e} s), beyond both intervals: a bad measurement"
             ),
             Self::Transfer(invalid) => write!(formatter, "the transfer queue's batches: {invalid}"),
+            Self::ConcurrentHostRead { dma, cpu } => write!(
+                formatter,
+                "concurrent DMA ({dma:e} s) and CPU ({cpu:e} s) host-RAM probe produced invalid aggregate bandwidth"
+            ),
         }
     }
 }
@@ -792,6 +812,55 @@ impl TierCopyCosts {
         }
     }
 
+    /// Key for an H2D transfer-queue batch timed beside concurrent CPU host-RAM
+    /// read sweeps on a shared `HostRam` bus.
+    fn concurrent_dma_key(identity: &seismic::Identity, readers: u64, span: u64) -> PointKey {
+        let (probe, bytes) = TIER_COPY_PROBE;
+        PointKey {
+            subject: seismic::PointSubject::executor(identity),
+            kernels: Vec::new(),
+            configuration: named(&[
+                ("concurrent_dma", 1),
+                ("records", probe),
+                ("bytes", bytes),
+                ("readers", readers),
+                ("span", span),
+                SCHEMA,
+            ]),
+            point: named(&[("batch", probe)]),
+        }
+    }
+
+    /// Key for a CPU host-RAM read sweep timed beside a concurrent H2D
+    /// transfer-queue copy on a shared `HostRam` bus.
+    fn concurrent_cpu_key(identity: &seismic::Identity, readers: u64, span: u64) -> PointKey {
+        let (probe, bytes) = TIER_COPY_PROBE;
+        PointKey {
+            subject: seismic::PointSubject::executor(identity),
+            kernels: Vec::new(),
+            configuration: named(&[
+                ("concurrent_cpu", 1),
+                ("records", probe),
+                ("bytes", bytes),
+                ("readers", readers),
+                ("span", span),
+                SCHEMA,
+            ]),
+            point: named(&[("bytes", span)]),
+        }
+    }
+
+    /// Effective aggregate `HostRam` read seconds-per-byte (`1 / B_joint`)
+    /// under concurrent `DMA ∥ CPU` traffic: the measured concurrent probe
+    /// value when available (clamped below at `host_memory_byte_seconds`, since
+    /// concurrent traffic cannot exceed uncontended `HostRam` bandwidth), or
+    /// the conservative analytical fallback `host_memory_byte_seconds` when not
+    /// yet probed.
+    pub fn joint_host_byte_seconds(&self, host_memory_byte_seconds: f64) -> f64 {
+        self.concurrent_host_byte_seconds
+            .map_or(host_memory_byte_seconds, |measured| measured.max(host_memory_byte_seconds))
+    }
+
     /// The costs on `executor` that `store`'s records give, measuring and
     /// forming nothing; why there are none: a load copies on a list's whole
     /// grid until the job has measured them.
@@ -834,7 +903,22 @@ impl TierCopyCosts {
             ReadLine::new((lone - bytes as f64 * byte_seconds).max(0.), byte_seconds).map_err(TierCopyError::Transfer)
         };
         let (transfer, back) = (line(Direction::In)?, line(Direction::Out)?);
-        Ok(Self { blocks, whole_seconds: whole, stall_share, transfer, back })
+        let concurrent_host_byte_seconds = if topology.shares_host_ram_bus(executor) {
+            let readers = MemoryCosts::readers(topology);
+            let span = MemoryCosts::span(topology);
+            let dma = median(Self::concurrent_dma_key(&identity, readers, span), TierCopyPoint::ConcurrentDma)?;
+            let cpu = median(Self::concurrent_cpu_key(&identity, readers, span), TierCopyPoint::ConcurrentCpu)?;
+            let b_dma = (records * bytes) as f64 / dma;
+            let b_cpu = span as f64 / cpu;
+            let b_joint = b_dma + b_cpu;
+            if !b_joint.is_finite() || b_joint <= 0. {
+                return Err(TierCopyError::ConcurrentHostRead { dma, cpu });
+            }
+            Some(1. / b_joint)
+        } else {
+            None
+        };
+        Ok(Self { blocks, whole_seconds: whole, stall_share, transfer, back, concurrent_host_byte_seconds })
     }
 
     /// [`Self::stored`] in its [`Priced`] state, owning the mapping from an
@@ -846,9 +930,12 @@ impl TierCopyCosts {
     ) -> super::Priced<Self> {
         match Self::stored(topology, executor, store) {
             Ok(costs) => super::Priced::Measured(costs),
-            Err(TierCopyError::Unrecorded { .. } | TierCopyError::FasterBeside { .. } | TierCopyError::Transfer(_)) => {
-                super::Priced::Pending(super::PendingPrices::load(super::PointRequest::TierCopy))
-            }
+            Err(
+                TierCopyError::Unrecorded { .. }
+                | TierCopyError::FasterBeside { .. }
+                | TierCopyError::Transfer(_)
+                | TierCopyError::ConcurrentHostRead { .. },
+            ) => super::Priced::Pending(super::PendingPrices::load(super::PointRequest::TierCopy)),
             Err(error) => super::Priced::Unavailable(error.to_string()),
         }
     }
@@ -974,6 +1061,46 @@ impl TierCopyCosts {
                 }
             }
         }
+        // When `executor` transfers from `HostRam` to `DeviceMemory` over a
+        // shared `HostRam` bus alongside host CPU readers, measure concurrent
+        // `DMA ∥ CPU` throughput (`ConcurrentDma` and `ConcurrentCpu`).
+        if device.topology().shares_host_ram_bus(device.info()) {
+            let remeasuring_concurrent = matches!(initial, Err(TierCopyError::ConcurrentHostRead { .. }));
+            let concurrent_store: &dyn RecordStore<PointKey> = if remeasuring_concurrent { &remeasure } else { store };
+            let readers = MemoryCosts::readers(device.topology());
+            let span = MemoryCosts::span(device.topology());
+            let dma_key = Self::concurrent_dma_key(&walks.identity(), readers, span);
+            let cpu_key = Self::concurrent_cpu_key(&walks.identity(), readers, span);
+            let need_dma = matches!(concurrent_store.load(&dma_key), Ok(None));
+            let need_cpu = matches!(concurrent_store.load(&cpu_key), Ok(None));
+            if need_dma || need_cpu {
+                let readers_usize = usize::try_from(readers)
+                    .map_err(|_| ExecutorCostsError(format!("{readers} readers exceed the host")))?;
+                let words = std::sync::Arc::new(Sweeps::written((span / 8) as usize, readers_usize));
+                let mut all_concurrent_measured = true;
+                if need_dma {
+                    let (transfer, source, destination) = (&transfer, &copied, &into);
+                    let sweeping = Sweeping::start(words.clone(), readers_usize.saturating_sub(1).max(1), concurrent_store);
+                    all_concurrent_measured &= walks.time_host_in(dma_key, &sweeping, move || {
+                        Ok(TransferBatches { transfer, source, destination, records })
+                    });
+                    sweeping.stop();
+                }
+                if need_cpu {
+                    let copying = Copying::start(&transfer, &copied, &into, concurrent_store);
+                    let words_slice = words.as_slice();
+                    all_concurrent_measured &= walks.time_host_in(cpu_key.clone(), &copying, move || {
+                        Ok(Sweeps { words: words_slice, readers: readers_usize })
+                    });
+                    copying.stop().map_err(|cause| error(&cause))?;
+                }
+                if remeasuring_concurrent && all_concurrent_measured {
+                    if let Err(error @ TierCopyError::ConcurrentHostRead { .. }) = Self::stored(device.topology(), device.info(), store) {
+                        let _ = store.store(&cpu_key, &Record::Unobtainable { reason: Reason::new(error.to_string()) });
+                    }
+                }
+            }
+        }
         Ok(())
     }
 
@@ -1048,6 +1175,65 @@ impl RecordStore<PointKey> for Copying<'_> {
 
     fn store(&self, key: &PointKey, record: &Record) -> Result<(), StoreError> {
         self.stop().map_err(|cause| StoreError(format!("the copy beside the point failed: {cause}")))?;
+        self.store.store(key, record)
+    }
+}
+
+/// Host-RAM read sweeps run continuously across background reader threads until
+/// stopped: what concurrent CPU-site traffic is to an H2D DMA transfer sharing
+/// the physical `HostRam` bus. Mirrors [`Copying`]: stops and joins all reader
+/// threads before storing the timed point's record and on drop.
+struct Sweeping<'s> {
+    stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    threads: std::sync::Mutex<Vec<std::thread::JoinHandle<()>>>,
+    store: &'s dyn RecordStore<PointKey>,
+}
+
+impl<'s> Sweeping<'s> {
+    fn start(words: std::sync::Arc<Vec<u64>>, readers: usize, store: &'s dyn RecordStore<PointKey>) -> Self {
+        let readers = readers.max(1);
+        let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let ready = std::sync::Arc::new(std::sync::Barrier::new(readers + 1));
+        let mut threads = Vec::with_capacity(readers);
+        for reader in 0..readers {
+            let (words, stopping, ready) = (words.clone(), stop.clone(), ready.clone());
+            let thread = seismic::threads::spawn("measurement-sweeping", move || {
+                let range = Sweeps::share(words.len(), readers, reader);
+                let share = &words[range];
+                ready.wait();
+                while !stopping.load(std::sync::atomic::Ordering::Relaxed) {
+                    std::hint::black_box(share.iter().fold(0u64, |sum, &word| sum.wrapping_add(word)));
+                }
+            })
+            .expect("invariant violated: the host starts a thread");
+            threads.push(thread);
+        }
+        ready.wait();
+        Self { stop, threads: std::sync::Mutex::new(threads), store }
+    }
+
+    fn stop(&self) {
+        self.stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        let threads = std::mem::take(&mut *self.threads.lock().expect("the sweeper"));
+        for thread in threads {
+            thread.join().expect("the sweeper's panic ends the process");
+        }
+    }
+}
+
+impl Drop for Sweeping<'_> {
+    fn drop(&mut self) {
+        self.stop();
+    }
+}
+
+impl RecordStore<PointKey> for Sweeping<'_> {
+    fn load(&self, key: &PointKey) -> Result<Option<Record>, StoreError> {
+        self.store.load(key)
+    }
+
+    fn store(&self, key: &PointKey, record: &Record) -> Result<(), StoreError> {
+        self.stop();
         self.store.store(key, record)
     }
 }
@@ -2050,7 +2236,7 @@ mod tests {
     /// transfer hides less than its latency more.
     #[test]
     fn the_transfer_queues_depth_covers_its_latency() {
-        let costs = |latency: f64| TierCopyCosts { blocks: 2, whole_seconds: 1e-3, stall_share: 0., transfer: ReadLine::new(latency, 1. / 12e9).unwrap(), back: ReadLine::new(latency, 1. / 12e9).unwrap() };
+        let costs = |latency: f64| TierCopyCosts { blocks: 2, whole_seconds: 1e-3, stall_share: 0., transfer: ReadLine::new(latency, 1. / 12e9).unwrap(), back: ReadLine::new(latency, 1. / 12e9).unwrap(), concurrent_host_byte_seconds: None };
         assert_eq!(costs(90e-6).depth(3_000_000), 2);
         assert_eq!(costs(0.).depth(3_000_000), 2, "always keeps at least one queued behind the running transfer");
         assert_eq!(costs(300e-6).depth(3_000_000), 3);
@@ -2509,6 +2695,110 @@ mod tests {
         assert!(matches!(RecordStore::load(&remeasure, &span_key).unwrap(), Some(Record::Unobtainable { .. })));
         assert!(matches!(MemoryCosts::priced(&topology, executor, readers, &store), super::super::Priced::Unavailable(_)));
         assert!(!super::super::PointRequest::HostMemory { readers }.outstanding(&topology, executor, &store, None));
+    }
+
+    #[test]
+    fn sweeping_drop_stops_and_joins_background_threads() {
+        let store = seismic::measure::HeldStore::default();
+        let words = std::sync::Arc::new(vec![1u64; 4096]);
+        let stop_flag = {
+            let sweeping = Sweeping::start(words, 2, &store);
+            sweeping.stop.clone()
+        };
+        assert!(stop_flag.load(std::sync::atomic::Ordering::Relaxed));
+    }
+
+    /// On a discrete GPU sharing `HostRam` with the CPU (`rtx3090`), a legacy
+    /// cache missing the concurrent `DMA ∥ CPU` probe points reports `Pending`
+    /// so only the new points are probed; once recorded, `TierCopyCosts::stored`
+    /// derives `concurrent_host_byte_seconds = 1 / (B_dma + B_cpu)` and
+    /// `joint_host_byte_seconds` clamps conservatively at `host_memory_byte_seconds`.
+    /// On unified memory (`gb10`), `shares_host_ram_bus` is false so
+    /// `concurrent_host_byte_seconds` is `None` without requiring those points.
+    #[test]
+    fn tier_copy_stored_probes_concurrent_host_bus_on_discrete_and_skips_on_unified() {
+        let populate_base = |topology: &DeviceTopology, executor: &Executor, store: &seismic::measure::HeldStore| {
+            let identity = executor_identity(topology, executor).unwrap();
+            let (backend, tensor_ops) = (executor.backend(), executor.forms_tensor_operations());
+            let (records, bytes) = TIER_COPY_PROBE;
+            let grid = magnitude_kernels::LIST_BLOCKS;
+            let put = |key: PointKey, median: f64| {
+                RecordStore::store(store, &key, &Record::Measured(Timing { median, interval: None, samples: 4 })).unwrap();
+            };
+            put(TierCopyCosts::key(&identity, backend, tensor_ops, 1).unwrap(), 4e-3);
+            put(TierCopyCosts::key(&identity, backend, tensor_ops, grid).unwrap(), 2e-3);
+            put(TierCopyCosts::stall_key(&identity, backend, tensor_ops, Beside::Alone).unwrap(), 1e-3);
+            put(TierCopyCosts::stall_key(&identity, backend, tensor_ops, Beside::Copy).unwrap(), 1.1e-3);
+            for direction in [Direction::In, Direction::Out] {
+                put(TierCopyCosts::transfer_key(&identity, 1, direction), 5e-6 + bytes as f64 / 20e9);
+                put(TierCopyCosts::transfer_key(&identity, records, direction), 5e-6 + (records * bytes) as f64 / 20e9);
+            }
+            identity
+        };
+
+        // Pick a discrete/unified topology pair whose backend can form kernel
+        // identities on this host (Metal on macOS; Vulkan/CUDA on Linux).
+        let (discrete, unified, backend) = if cfg!(target_os = "macos") {
+            (
+                seismic::fixtures::recorded::m4_pro_without_unified_memory(),
+                seismic::fixtures::recorded::m4_pro(),
+                seismic::BackendName::Metal,
+            )
+        } else {
+            (
+                seismic::fixtures::recorded::rtx3090(),
+                seismic::fixtures::recorded::gb10(),
+                seismic::BackendName::Vulkan,
+            )
+        };
+
+        // Discrete GPU: shares HostRam bus with CPU.
+        let discrete_exec = discrete.executors().iter().find(|e| e.backend() == backend).unwrap();
+        assert!(discrete.shares_host_ram_bus(discrete_exec));
+        let store = seismic::measure::HeldStore::default();
+        let identity = populate_base(&discrete, discrete_exec, &store);
+
+        // Legacy cache without concurrent probe points -> Unrecorded / Pending (re-probes cleanly).
+        assert!(matches!(
+            TierCopyCosts::stored(&discrete, discrete_exec, &store),
+            Err(TierCopyError::Unrecorded { point: TierCopyPoint::ConcurrentDma })
+        ));
+        assert!(matches!(
+            TierCopyCosts::priced(&discrete, discrete_exec, &store),
+            super::super::Priced::Pending(_)
+        ));
+
+        // Record concurrent DMA (20 GB/s) and CPU (24 GB/s) -> B_joint = 44 GB/s.
+        let (records, bytes) = TIER_COPY_PROBE;
+        let readers = MemoryCosts::readers(&discrete);
+        let span = MemoryCosts::span(&discrete);
+        RecordStore::store(
+            &store,
+            &TierCopyCosts::concurrent_dma_key(&identity, readers, span),
+            &Record::Measured(Timing { median: (records * bytes) as f64 / 20e9, interval: None, samples: 4 }),
+        )
+        .unwrap();
+        RecordStore::store(
+            &store,
+            &TierCopyCosts::concurrent_cpu_key(&identity, readers, span),
+            &Record::Measured(Timing { median: span as f64 / 24e9, interval: None, samples: 4 }),
+        )
+        .unwrap();
+
+        let costs = TierCopyCosts::stored(&discrete, discrete_exec, &store).expect("stored with concurrent points");
+        let b_joint = 1. / costs.concurrent_host_byte_seconds.expect("discrete GPU has concurrent_host_byte_seconds");
+        assert!((b_joint - 44e9).abs() / 44e9 < 1e-12, "expected 44 GB/s, got {b_joint}");
+        // Clamped conservatively at host_memory_byte_seconds:
+        assert!((costs.joint_host_byte_seconds(1. / 47.8e9) - 1. / 44e9).abs() < 1e-18);
+        assert!((costs.joint_host_byte_seconds(1. / 40.0e9) - 1. / 40.0e9).abs() < 1e-18);
+
+        // Unified memory: no shared HostRam bus -> succeeds without concurrent probe points.
+        let unified_exec = unified.executors().iter().find(|e| e.backend() == backend).unwrap();
+        assert!(!unified.shares_host_ram_bus(unified_exec));
+        let unified_store = seismic::measure::HeldStore::default();
+        populate_base(&unified, unified_exec, &unified_store);
+        let unified_costs = TierCopyCosts::stored(&unified, unified_exec, &unified_store).expect("unified GPU needs no concurrent points");
+        assert_eq!(unified_costs.concurrent_host_byte_seconds, None);
     }
 
     }

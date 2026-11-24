@@ -719,6 +719,7 @@ mod tests {
             host: HostLines {
                 cpu: None,
                 memory: None,
+                joint_memory: None,
                 landing: Some(LandingLine::Device(RecordLine::new(0., 5e-5).unwrap())),
                 record_bytes,
             },

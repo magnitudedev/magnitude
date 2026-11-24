@@ -1061,15 +1061,30 @@ fn classify_link_stage_hit(chosen: &mut crate::experts::interest::Chosen, link_l
     staged_hit
 }
 
-/// Layer `lines` as the assignment prices them where the transport lands
-/// the layer's misses by DMA beside the step (`layer_decode_dma`): a miss
-/// is then read from the bank once its copy lands, so its link line is the
-/// copy's transfer plus a resident read, where that is the cheaper; else
-/// `lines` as they are.
+/// Layer `lines` as the assignment prices them beside `copy`:
+/// - When `copy` measured concurrent `DMA ∥ CPU` host-RAM throughput
+///   (`copy.concurrent_host_byte_seconds`), record the per-record joint bus
+///   time (`lines.host.joint_memory`, clamped at `lines.host.memory`) so
+///   [`ExpertLines::policy`] and [`ExpertLines::serve`] account for shared
+///   `HostRam` contention.
+/// - Where the transport lands the layer's misses by DMA beside the step
+///   (`layer_decode_dma`), a miss is read from the bank once its copy lands,
+///   so its link line is the copy's transfer plus a resident read where that
+///   is cheaper than reading in place.
 fn decode_dma_lines(mut lines: ExpertLines, copy: Option<&crate::assessment::TierCopyCosts>, layer_decode_dma: bool) -> ExpertLines {
-    let Some(copy) = copy.filter(|_| layer_decode_dma) else {
+    let Some(copy) = copy else {
         return lines;
     };
+    if let (Some(mem), Some(joint_bs)) = (lines.host.memory, copy.concurrent_host_byte_seconds) {
+        let joint_seconds = lines.host.record_bytes as f64 * joint_bs;
+        if joint_seconds.is_finite() && joint_seconds > 0.0 {
+            let joint_ns = magnitude_cost_model::Nanoseconds::saturating(joint_seconds);
+            lines.host.joint_memory = Some(joint_ns.max(mem));
+        }
+    }
+    if !layer_decode_dma {
+        return lines;
+    }
     let dma_ns = copy.transfer.transfer_seconds(lines.host.record_bytes as f64) * 1e9;
     let landed_ns = dma_ns + lines.gpu.resident.weights.get() as f64;
     if landed_ns.is_finite() && landed_ns > 0.0 && landed_ns < lines.gpu.link.weights.get() as f64 {
@@ -1157,12 +1172,13 @@ mod tests {
             host: HostLines {
                 cpu: Some(CpuLines { expert: RowLine { one: ns(75_000), row: RowCost::Measured(ns(1_000)) }, handshake: ns(4_000) }),
                 memory: Some(ns(40_000)),
+                joint_memory: None,
                 landing: None,
                 record_bytes: 3_000_000,
             },
         };
         let line = ReadLine::new(0.0, 1.0 / 48e9).unwrap();
-        let copy = crate::assessment::TierCopyCosts { blocks: 0, whole_seconds: 0.0, stall_share: 0.0, transfer: line, back: line };
+        let copy = crate::assessment::TierCopyCosts { blocks: 0, whole_seconds: 0.0, stall_share: 0.0, transfer: line, back: line, concurrent_host_byte_seconds: None };
         let landed = decode_dma_lines(lines, Some(&copy), true);
         assert_eq!(landed.gpu.link.weights.get() as u64, 77_500);
         assert_eq!(landed.host, lines.host);
@@ -1170,5 +1186,36 @@ mod tests {
         assert_eq!(decode_dma_lines(lines, None, true), lines);
         let near = ExpertLines { gpu: GpuLines { link: PassLine { weights: ns(70_000), ..lines.gpu.link }, ..lines.gpu }, ..lines };
         assert_eq!(decode_dma_lines(near, Some(&copy), true), near);
+
+        // Measured concurrent `DMA ∥ CPU` contention populates `host.joint_memory`
+        // for both split-DMA and in-place layers and suppresses CPU when `B_joint <= B_link`.
+        let gen5_line = ReadLine::new(0.0, 1.0 / 43.6e9).unwrap();
+        let gen5_copy = crate::assessment::TierCopyCosts {
+            blocks: 0,
+            whole_seconds: 0.0,
+            stall_share: 0.0,
+            transfer: gen5_line,
+            back: gen5_line,
+            concurrent_host_byte_seconds: Some(1.0 / 42.0e9),
+        };
+        let gen5_lines = ExpertLines {
+            gpu: GpuLines {
+                link: PassLine { weights: ns(270_000), row: ns(1_000) },
+                resident: PassLine { weights: ns(2_000), row: ns(1_000) },
+                moves: Moves::NONE,
+            },
+            host: HostLines {
+                cpu: Some(CpuLines { expert: RowLine { one: ns(75_000), row: RowCost::Measured(ns(1_000)) }, handshake: ns(4_000) }),
+                memory: Some(Nanoseconds::of(3_000_000.0 / 47.8e9).unwrap()),
+                joint_memory: None,
+                landing: None,
+                record_bytes: 3_000_000,
+            },
+        };
+        let adjusted = decode_dma_lines(gen5_lines, Some(&gen5_copy), true);
+        assert_eq!(adjusted.host.joint_memory, Some(Nanoseconds::of(3_000_000.0 / 42.0e9).unwrap()));
+        assert_eq!(adjusted.effective_cpu(), None, "Gen5 + 2-ch DDR5 (B_joint=42 GB/s < B_link=43.6 GB/s) must suppress CPU-site");
+        let in_place_adjusted = decode_dma_lines(gen5_lines, Some(&gen5_copy), false);
+        assert_eq!(in_place_adjusted.host.joint_memory, adjusted.host.joint_memory);
     }
 }

@@ -1062,6 +1062,7 @@ mod tests {
         let dummy_host = magnitude_cost_model::HostLines {
             cpu: None,
             memory: Some(magnitude_cost_model::Nanoseconds::of(1.0).unwrap()),
+            joint_memory: None,
             landing: None,
             record_bytes: 1,
         };

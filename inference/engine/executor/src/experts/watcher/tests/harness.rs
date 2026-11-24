@@ -699,7 +699,7 @@ pub(super) fn lending_windowed_passes(
     // Its promotions copy at a measured transfer queue's line, as a
     // discrete load's do: one record at a time, its latency none.
     let transfer = magnitude_cost_model::ReadLine::new(0., 1e-10).unwrap();
-    watcher.shared().price_copy(&crate::assessment::TierCopyCosts { blocks: 1, whole_seconds: 1e-3, stall_share: 0., transfer, back: transfer });
+    watcher.shared().price_copy(&crate::assessment::TierCopyCosts { blocks: 1, whole_seconds: 1e-3, stall_share: 0., transfer, back: transfer, concurrent_host_byte_seconds: None });
     {
         let mut state = residency::lock(&watcher.state);
         for layer in 0..state.core.layers.len() {

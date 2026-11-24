@@ -187,8 +187,14 @@ impl StepInputs<'_> {
         let schedule = lines.serve_decode(hit_ns, misses, |(), _| {});
         let end_seconds = schedule.gpu_ns.max(schedule.cpu_ns) * 1e-9;
         // Host memory bounds the CPU, the link and the moves together:
-        // every miss and every moved record leaves it at `t_ram`.
-        let leave = (total_misses as f64 + lines.gpu.moves.records) * memory.get() * 1e-9;
+        // every miss and every moved record leaves it at `t_ram` (or the
+        // measured concurrent `t_joint` when both CPU and link read concurrently).
+        let bus_ns = if schedule.served_cpu && schedule.link_count > 0 {
+            lines.host.contended_memory().unwrap_or(memory).get()
+        } else {
+            memory.get()
+        };
+        let leave = (total_misses as f64 + lines.gpu.moves.records) * bus_ns * 1e-9;
         let hit = hit_ns * 1e-9;
         let in_place = schedule.link_count as f64 * lines.gpu.link.nanoseconds(load.rows);
         ((end_seconds.max(leave) - hit).max(0.), (in_place + lines.gpu.moves.link.get()) * 1e-9)
@@ -581,7 +587,7 @@ mod tests {
     /// of nothing.
     fn unified() -> ExpertLines {
         let none = PassLine { weights: Nanoseconds::try_from(0).unwrap(), row: Nanoseconds::try_from(0).unwrap() };
-        ExpertLines { host: HostLines { cpu: None, memory: None, landing: None, record_bytes: 2_000_000 }, gpu: GpuLines { link: none, resident: none, moves: Moves::NONE } }
+        ExpertLines { host: HostLines { cpu: None, memory: None, joint_memory: None, landing: None, record_bytes: 2_000_000 }, gpu: GpuLines { link: none, resident: none, moves: Moves::NONE } }
     }
 
     fn landed_host() -> FileLine {
