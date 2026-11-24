@@ -22,7 +22,7 @@ import time
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
-from . import ab, dashboard, engine, gate, ledger, selectors, sources, state, store
+from . import ab, dashboard, engine, gate, ledger, selectors, sources, state, store, waterfall
 from .connection import HostError, HostRun, HostUnavailable, connect, host_status, read, setup
 from .hosts import Hosts
 from .instruments import KINDS, REGISTRY, Instrument
@@ -40,7 +40,7 @@ def _epilog() -> str:
     rows.append(f"  {'ab':<11}Is B better or worse than A, by any instrument that measures? "
                 "(mrig ab INSTRUMENT --base A --candidate B ...)")
     tools = [
-        "  inspect    Who holds and waits on each host; or run a read-only command on one (no hold)",
+        "  inspect    Who holds and waits on each host; a run's floor waterfall (inspect RUN); or a read-only command on one",
         "  dashboard  A live local web page of every host: holds, queue, utilization, memory, thermals",
         "  runs       This machine's runs in flight: phase, host, time against estimate",
         "  stale      The tests a source's changes reach: never passed, or changed since, per backend and hardware",
@@ -91,13 +91,32 @@ def _run(instrument: Instrument, arguments, source: sources.Source) -> int:
 
 
 def _inspect(arguments) -> int:
-    hosts = Hosts.load()
-    command = arguments.command[1:] if arguments.command[:1] == ["--"] else arguments.command
-    if command:
+    raw = list(arguments.command)
+    if raw[:1] == ["--"]:
+        command = raw[1:]
         if not arguments.host:
             raise SystemExit("inspect -- COMMAND needs --host")
+        hosts = Hosts.load()
         remote = connect(hosts.host(arguments.host))
         code, stdout, stderr = read(remote, remote.command(command, cwd=remote.root)[-1])
+        print(stdout, end="")
+        print(stderr, end="", file=sys.stderr)
+        return code
+    if not arguments.host and (raw or arguments.waterfall):
+        tokens = [tok for tok in raw if tok != "--waterfall"]
+        if len(tokens) != 1:
+            raise SystemExit("inspect RUN [--waterfall] takes one run id or results directory")
+        target = Path(tokens[0])
+        run_dir = target if target.is_dir() else _results(tokens[0])
+        output = waterfall.render_run(run_dir)
+        if not output:
+            raise SystemExit(f"inspect: no step or draft results found in {run_dir}")
+        print(output)
+        return 0
+    hosts = Hosts.load()
+    if raw:
+        remote = connect(hosts.host(arguments.host))
+        code, stdout, stderr = read(remote, remote.command(raw, cwd=remote.root)[-1])
         print(stdout, end="")
         print(stderr, end="", file=sys.stderr)
         return code
@@ -353,8 +372,9 @@ def parser() -> argparse.ArgumentParser:
     ab.configure(commands.add_parser("ab", help="compare two builds by any measuring instrument"))
     gate.configure(commands.add_parser("gate", help=gate.QUESTION))
 
-    command = commands.add_parser("inspect", help="host holds and queues, or a read-only command")
+    command = commands.add_parser("inspect", help="host holds and queues, a run's floor waterfall, or a read-only command")
     command.add_argument("--host")
+    command.add_argument("--waterfall", action="store_true", help="print the 100%-additive floor waterfall for a run")
     command.add_argument("command", nargs=argparse.REMAINDER)
     command.set_defaults(handler=_inspect)
     dashboard.configure(commands.add_parser("dashboard", help="live web page of hosts and their queues"))

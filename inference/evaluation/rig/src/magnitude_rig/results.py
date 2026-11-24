@@ -19,7 +19,7 @@ from collections.abc import Callable
 from pathlib import Path
 from typing import TextIO
 
-from . import engine, state, store
+from . import engine, state, store, waterfall
 from .connection import HostError
 from .instruments import Answer, JobResult
 from .instruments.cargo import failures
@@ -203,5 +203,10 @@ def report_answer(arguments, answer: Answer, outcome: engine.Outcome) -> int:
     print(f"purpose: {arguments.purpose}")
     for line in answer.lines:
         print(line)
+    if getattr(arguments, "action", None) in ("step", "draft"):
+        summary = waterfall.render_run(outcome.results)
+        if summary:
+            print()
+            print(summary)
     print(f"{engine.duration(seconds)} of {against} estimate · {outcome.host} · {outcome.results}")
     return 0 if answer.ok else 2
