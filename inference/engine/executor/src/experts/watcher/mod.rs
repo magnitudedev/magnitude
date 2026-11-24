@@ -167,7 +167,7 @@ pub(super) enum VerifyOutcome {
 }
 
 /// What steps and serving share, each part its module's.
-pub(super) struct Shared {
+pub(crate) struct Shared {
     /// Shared with every answer, which writes under its step's ownership of
     /// its slot (`Steps::while_owned`).
     steps: Arc<Steps>,
