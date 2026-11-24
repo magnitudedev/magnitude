@@ -39,17 +39,22 @@ impl HeldRecord {
         self.0.base
     }
 
-    /// The first `bytes` of this record, to read.
+    /// `bytes` starting at byte `offset` of this record, to read (used when
+    /// `AlignedRange` landed the payload at a non-zero `lead` byte offset).
     ///
     /// # Safety
     ///
     /// No read lands in the record, and no device work writes it, while the
     /// slice lives.
-    pub unsafe fn as_slice(&self, bytes: u64) -> &[u8] {
-        assert!(bytes <= self.0.bytes, "{bytes} bytes of record of {}", self.0.bytes);
-        // SAFETY: the record lies within the host-shared view `self` keeps
-        // alive, and the caller excludes every writer.
-        unsafe { std::slice::from_raw_parts(self.0.base.as_ptr(), bytes as usize) }
+    pub unsafe fn as_slice_at(&self, offset: usize, bytes: u64) -> &[u8] {
+        assert!(
+            offset.checked_add(bytes as usize).is_some_and(|end| end as u64 <= self.0.bytes),
+            "{bytes} bytes at {offset} of record of {}",
+            self.0.bytes
+        );
+        // SAFETY: `[offset, offset + bytes)` lies within the host-shared view
+        // `self` keeps alive, and the caller excludes every writer.
+        unsafe { std::slice::from_raw_parts(self.0.base.as_ptr().add(offset), bytes as usize) }
     }
 }
 
@@ -235,6 +240,12 @@ pub(super) struct Read {
     into: Records,
     record: u64,
     within: u64,
+    /// Which routed tensor of the expert this read belongs to (for per-tensor
+    /// pipelined completion).
+    tensor: usize,
+    /// Whether this read is the sole part of its tensor (eligible for
+    /// zero-bounce `AlignedRange` widening when its staging slot has headroom).
+    single_part: bool,
 }
 
 impl Read {
@@ -256,7 +267,17 @@ impl Read {
             into: into.clone(),
             record,
             within,
+            tensor: 0,
+            single_part: false,
         }
+    }
+
+    /// Tag this read with its routed tensor index and whether it is that
+    /// tensor's only part (eligible for `AlignedRange` widening).
+    pub fn for_tensor(mut self, tensor: usize, single_part: bool) -> Self {
+        self.tensor = tensor;
+        self.single_part = single_part;
+        self
     }
 
     pub fn bytes(&self) -> u64 {
@@ -276,22 +297,29 @@ pub(super) enum Outcome {
     Panicked(Panic),
 }
 
-/// Reads made of the source: one read engine request per model file it
-/// reads, each holding the staging it lands in until it has ended. It owns
-/// its requests until it cancels them ([`Ticket::cancel`]); dropping it
-/// cancels what no worker has taken and waits for what one has, so no read
-/// lands in staging once its ticket is gone.
+/// One underlying read engine request inside a [`Ticket`]: its handle while
+/// owned, its end observer, its routed tensor index, and the reads it serves
+/// `(read_idx, file, offset, bytes)`.
+type TicketRequest = (Option<Handle>, Ending, usize, Vec<(usize, usize, u64, usize)>);
+
+/// Reads made of the source: one read engine request per model file (or per
+/// `(tensor, file)` for pipelined expert reads), each holding the staging it
+/// lands in until it has ended. It owns its requests until it cancels them
+/// ([`Ticket::cancel`]); dropping it cancels what no worker has taken and
+/// waits for what one has, so no read lands in staging once its ticket is gone.
 pub(super) struct Ticket {
-    /// Each file's request while the ticket owns it, its end, and the reads
-    /// it serves in their order: (the read's index among the ticket's,
-    /// file, offset, bytes).
-    requests: Vec<(Option<Handle>, Ending, Vec<(usize, usize, u64, usize)>)>,
+    requests: Vec<TicketRequest>,
+    /// Number of routed tensors represented by this ticket.
+    tensor_count: usize,
+    /// Per-tensor `lead` byte offset inside the staging record where the
+    /// tensor's payload begins (`0` unless widened via `AlignedRange`).
+    tensor_leads: Vec<usize>,
 }
 
 impl Drop for Ticket {
     fn drop(&mut self) {
         self.cancel();
-        for (_, ending, _) in &self.requests {
+        for (_, ending, ..) in &self.requests {
             ending.wait();
         }
     }
@@ -301,7 +329,23 @@ impl Ticket {
     /// An empty ticket with no requests.
     #[cfg(test)]
     pub(super) fn empty() -> Self {
-        Self { requests: Vec::new() }
+        Self { requests: Vec::new(), tensor_count: 0, tensor_leads: Vec::new() }
+    }
+
+    /// The number of routed tensors covered by this ticket.
+    pub fn tensor_count(&self) -> usize {
+        self.tensor_count
+    }
+
+    /// Byte offset inside the staging record where `tensor`'s payload begins.
+    #[cfg(test)]
+    pub fn tensor_lead(&self, tensor: usize) -> usize {
+        self.tensor_leads.get(tensor).copied().unwrap_or(0)
+    }
+
+    /// Per-tensor `lead` byte offsets for all tensors in this ticket.
+    pub fn tensor_leads(&self) -> &[usize] {
+        &self.tensor_leads
     }
 
     /// The outcome, waiting for it until `deadline`; `None` while a read
@@ -323,7 +367,7 @@ impl Ticket {
     /// The outcome of the requests as `ended` finds them, none while one
     /// runs.
     fn outcome(&self, ended: impl Fn(&Ending) -> Option<Ended>) -> Option<Outcome> {
-        let endeds = self.requests.iter().map(|(_, ending, _)| ended(ending)).collect::<Option<Vec<_>>>()?;
+        let endeds = self.requests.iter().map(|(_, ending, ..)| ended(ending)).collect::<Option<Vec<_>>>()?;
         let reads = self.requests.iter().map(|(.., reads)| reads.clone()).collect::<Vec<_>>();
         Some(outcome_of(&endeds, &reads).0)
     }
@@ -333,6 +377,91 @@ impl Ticket {
         self.requests.iter().filter_map(|(handle, ..)| handle.as_ref().map(Handle::id))
     }
 
+    /// Run `on_tensor(tensor, outcome)` as each routed tensor's requests finish
+    /// (allowing `HostCompute` to begin converting completed tensors while
+    /// sibling tensors are still reading from NVMe), and `on_all(outcome, failed)`
+    /// once every request of the ticket has ended. Attaches at most one hook
+    /// per underlying `seismic_io::Ending`.
+    pub fn on_end_with_tensors(
+        &self,
+        on_tensor: impl Fn(usize, Outcome) + Send + Sync + 'static,
+        on_all: impl FnOnce(Outcome, &[usize]) + Send + 'static,
+    ) {
+        type AllHook = Box<dyn FnOnce(Outcome, &[usize]) + Send>;
+        type TensorHook = Arc<dyn Fn(usize, Outcome) + Send + Sync>;
+        struct Ends {
+            ended: Vec<Option<Ended>>,
+            tensor_left: Vec<usize>,
+            on_all: Option<AllHook>,
+        }
+        let on_tensor: TensorHook = Arc::new(on_tensor);
+        if self.requests.is_empty() {
+            for tensor in 0..self.tensor_count {
+                on_tensor(tensor, Outcome::Read);
+            }
+            return on_all(Outcome::Read, &[]);
+        }
+        let mut tensor_left = vec![0usize; self.tensor_count];
+        for (_, _, tensor, _) in &self.requests {
+            if *tensor < tensor_left.len() {
+                tensor_left[*tensor] += 1;
+            }
+        }
+        // Any tensor with 0 requests is already complete.
+        for (tensor, &count) in tensor_left.iter().enumerate() {
+            if count == 0 {
+                on_tensor(tensor, Outcome::Read);
+            }
+        }
+        let reads = Arc::new(self.requests.iter().map(|(.., reads)| reads.clone()).collect::<Vec<_>>());
+        let tensors = Arc::new(self.requests.iter().map(|(_, _, tensor, _)| *tensor).collect::<Vec<_>>());
+        let state = Arc::new(std::sync::Mutex::new(Ends {
+            ended: vec![None; self.requests.len()],
+            tensor_left,
+            on_all: Some(Box::new(on_all)),
+        }));
+        for (index, (_, request, tensor, _)) in self.requests.iter().enumerate() {
+            let tensor = *tensor;
+            let (state, reads, tensors, on_tensor) = (state.clone(), reads.clone(), tensors.clone(), on_tensor.clone());
+            request.on_end(move |ended| {
+                let (tensor_done, all_done) = {
+                    let mut guard = state.lock().expect("a ticket's end");
+                    guard.ended[index] = Some(ended.clone());
+                    let tensor_done = if tensor < guard.tensor_left.len() {
+                        guard.tensor_left[tensor] -= 1;
+                        if guard.tensor_left[tensor] == 0 {
+                            let (t_ended, t_reads): (Vec<_>, Vec<_>) = guard
+                                .ended
+                                .iter()
+                                .zip(reads.iter())
+                                .zip(tensors.iter())
+                                .filter(|(_, &t)| t == tensor)
+                                .map(|((e, r), _)| (e.clone().expect("tensor ended"), r.clone()))
+                                .unzip();
+                            Some(outcome_of(&t_ended, &t_reads).0)
+                        } else {
+                            None
+                        }
+                    } else {
+                        None
+                    };
+                    let all_done = guard.ended.iter().cloned().collect::<Option<Vec<_>>>().map(|all| {
+                        let hook = guard.on_all.take().expect("a ticket ends once");
+                        (all, hook)
+                    });
+                    (tensor_done, all_done)
+                };
+                if let Some(outcome) = tensor_done {
+                    on_tensor(tensor, outcome);
+                }
+                if let Some((all, hook)) = all_done {
+                    let (outcome, failed) = outcome_of(&all, &reads);
+                    hook(outcome, &failed);
+                }
+            });
+        }
+    }
+
     /// Run `hook` with the outcome, and the indices of the ticket's reads
     /// that failed (every one after a panic), once every request has ended,
     /// on the thread that ends the last (a read worker, or the canceller),
@@ -340,45 +469,19 @@ impl Ticket {
     /// whatever the hook wakes finds the ticket no longer running. It must
     /// not wait for a read.
     pub fn on_end(&self, hook: impl FnOnce(Outcome, &[usize]) + Send + 'static) {
-        type Hook = Box<dyn FnOnce(Outcome, &[usize]) + Send>;
-        struct Ends {
-            ended: Vec<Option<Ended>>,
-            hook: Option<Hook>,
-        }
-        if self.requests.is_empty() {
-            return hook(Outcome::Read, &[]);
-        }
-        let reads = std::sync::Arc::new(self.requests.iter().map(|(.., reads)| reads.clone()).collect::<Vec<_>>());
-        let ending = std::sync::Arc::new(std::sync::Mutex::new(Ends {
-            ended: vec![None; self.requests.len()],
-            hook: Some(Box::new(hook)),
-        }));
-        for (index, (_, request, _)) in self.requests.iter().enumerate() {
-            let (ending, reads) = (ending.clone(), reads.clone());
-            request.on_end(move |ended| {
-                let mut ending = ending.lock().expect("a ticket's end");
-                ending.ended[index] = Some(ended.clone());
-                let Some(ended) = ending.ended.iter().cloned().collect::<Option<Vec<_>>>() else {
-                    return;
-                };
-                let hook = ending.hook.take().expect("a ticket ends once");
-                drop(ending);
-                let (outcome, failed) = outcome_of(&ended, &reads);
-                hook(outcome, &failed);
-            });
-        }
+        self.on_end_with_tensors(|_, _| {}, hook);
     }
 
     /// When a worker takes each request's first piece, each set then
     /// (`seismic_io::Ending::started`): the ticket's reads start at the
     /// earliest.
     pub fn started(&self) -> Vec<std::sync::Arc<std::sync::OnceLock<Instant>>> {
-        self.requests.iter().map(|(_, ending, _)| ending.started()).collect()
+        self.requests.iter().map(|(_, ending, ..)| ending.started()).collect()
     }
 
     /// Whether a worker has begun reading any piece of the ticket.
     pub fn begun(&self) -> bool {
-        self.requests.iter().any(|(_, ending, _)| ending.started().get().is_some())
+        self.requests.iter().any(|(_, ending, ..)| ending.started().get().is_some())
     }
 
     /// Order the reads not yet taken by `want` from now
@@ -426,6 +529,20 @@ fn outcome_of(ended: &[Ended], reads: &[Vec<(usize, usize, u64, usize)>]) -> (Ou
         }
     }
     (outcome, failed_reads)
+}
+
+/// Whether [`ExpertSource::request_per_tensor`] may widen single-part reads via
+/// `Reader::aligned_into` (producing a non-zero `lead` byte offset inside the
+/// staging record):
+/// - `ExactZeroLead`: required whenever the consumer reads directly from byte
+///   offset 0 without per-tensor `lead` offsets (unified-memory `Placer::Bank`
+///   where `DeviceLanding` / `routed_land` reads staging from offset 0).
+/// - `AllowAlignedLead`: permitted when the consumer converts from staging on
+///   the host using [`Ticket::tensor_leads`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(in crate::experts) enum ReadAlignment {
+    ExactZeroLead,
+    AllowAlignedLead,
 }
 
 /// The model's files, opened for reads that bypass the file cache.
@@ -476,13 +593,28 @@ impl ExpertSource {
         self.files.iter().map(Reader::knee).max().expect("a model has a file")
     }
 
-    /// Request `reads` of the read engine for `want`: due now for a step's
-    /// misses, at its layer's estimated start for a hint. Fails only when the
-    /// engine takes no request.
+    /// Build a `Range` for `read`, delegating to `seismic_io::Reader::aligned_into`
+    /// for a checked aligned read extent only when `alignment` is
+    /// [`ReadAlignment::AllowAlignedLead`] and `read` is a single-part tensor at
+    /// `within == 0`. Returns `(range, lead)` where `lead` is the total byte
+    /// offset from the record's base address where the requested payload begins.
+    fn build_range(&self, read: &Read, alignment: ReadAlignment) -> (Range, usize) {
+        let into: Arc<dyn seismic_io::Destination> = read.into.hold(read.record).0;
+        if alignment == ReadAlignment::AllowAlignedLead && read.single_part && read.within == 0 {
+            if let Some(aligned) = self.files[read.file].aligned_into(read.offset, read.bytes, into.clone(), 0) {
+                let lead = aligned.range.at + aligned.lead;
+                return (aligned.range, lead);
+            }
+        }
+        (Range { offset: read.offset, length: read.bytes, into, at: read.within as usize }, 0)
+    }
+
+    /// Request `reads` of the read engine for `want` (coalesced per file):
+    /// used by conveyor bulk batches (which read at byte offset 0 without
+    /// per-tensor `lead` tracking). Fails only when the engine takes no
+    /// request.
     pub fn request(&self, reads: Vec<Read>, want: Want) -> Result<Ticket, String> {
         assert!(reads.iter().all(|read| read.file < self.files.len()), "a read of a file the source has not open");
-        // Each file's ranges, each landing in the records its read holds,
-        // and the reads they serve.
         let mut by_file = (0..self.files.len()).map(|_| (Vec::new(), Vec::new())).collect::<Vec<_>>();
         for (at, read) in reads.into_iter().enumerate() {
             let (ranges, served) = &mut by_file[read.file];
@@ -495,16 +627,91 @@ impl ExpertSource {
             if ranges.is_empty() {
                 continue;
             }
-            // SAFETY: each staging record is the read's alone while its
-            // request runs: the device reads it only after the watcher
+            // SAFETY: each staging/conveyor record is the read's alone while
+            // its request runs: the device reads it only after the watcher
             // publishes it, once the request has ended, which the ticket
             // observes however it is cancelled or dropped.
-            let handle = unsafe { file.request(ranges, want) }
-                .map_err(|error| format!("expert source: {error}"))?;
+            let handle = match unsafe { file.request(ranges, want) } {
+                Ok(handle) => handle,
+                Err(error) => {
+                    cancel_and_drain(requests);
+                    return Err(format!("expert source: {error}"));
+                }
+            };
             let ending = handle.ending();
-            requests.push((Some(handle), ending, served));
+            requests.push((Some(handle), ending, 0, served));
         }
-        Ok(Ticket { requests })
+        Ok(Ticket { requests, tensor_count: 1, tensor_leads: vec![0] })
+    }
+
+    /// Request one expert's `reads` across `tensor_count` routed tensors,
+    /// submitting one read engine request per `(tensor, file)` so each tensor
+    /// (`gate`, `up`, `down`) notifies [`Ticket::on_tensor_end`] the instant
+    /// its own NVMe read lands, and widening single-part reads via
+    /// `Reader::aligned_into` when `alignment` is
+    /// [`ReadAlignment::AllowAlignedLead`].
+    pub fn request_per_tensor(
+        &self,
+        reads: Vec<Read>,
+        tensor_count: usize,
+        want: Want,
+        alignment: ReadAlignment,
+    ) -> Result<Ticket, String> {
+        assert!(reads.iter().all(|read| read.file < self.files.len()), "a read of a file the source has not open");
+        assert!(reads.iter().all(|read| read.tensor < tensor_count), "a read of a tensor outside {tensor_count}");
+        let mut by_tensor_file = (0..tensor_count)
+            .map(|_| (0..self.files.len()).map(|_| (Vec::new(), Vec::new())).collect::<Vec<_>>())
+            .collect::<Vec<_>>();
+        let mut tensor_leads = vec![0usize; tensor_count];
+        for (at, read) in reads.into_iter().enumerate() {
+            let (range, lead) = self.build_range(&read, alignment);
+            if read.within == 0 {
+                tensor_leads[read.tensor] = lead;
+            }
+            let (ranges, served) = &mut by_tensor_file[read.tensor][read.file];
+            served.push((at, read.file, read.offset, read.bytes));
+            ranges.push(range);
+        }
+        let mut requests = Vec::new();
+        for (tensor, by_file) in by_tensor_file.into_iter().enumerate() {
+            for (file, (ranges, served)) in self.files.iter().zip(by_file) {
+                if ranges.is_empty() {
+                    continue;
+                }
+                // SAFETY: each staging record is the read's alone while its
+                // request runs: no conversion or device work reads it until
+                // its tensor's read has ended, and staging is freed only after
+                // all tensors finish converting or fail.
+                let handle = match unsafe { file.request(ranges, want) } {
+                    Ok(handle) => handle,
+                    Err(error) => {
+                        cancel_and_drain(requests);
+                        return Err(format!("expert source: {error}"));
+                    }
+                };
+                let ending = handle.ending();
+                requests.push((Some(handle), ending, tensor, served));
+            }
+        }
+        Ok(Ticket { requests, tensor_count, tensor_leads })
+    }
+}
+
+/// Cancel every already-submitted read handle and wait for any piece already
+/// taken by an I/O worker to finish writing into staging before returning a
+/// submission error to the caller (which will recycle the staging record).
+fn cancel_and_drain(
+    requests: Vec<(Option<seismic_io::Handle>, seismic_io::Ending, usize, Vec<(usize, usize, u64, usize)>)>,
+) {
+    let endings: Vec<seismic_io::Ending> = requests
+        .into_iter()
+        .map(|(handle, ending, _, _)| {
+            drop(handle);
+            ending
+        })
+        .collect();
+    for ending in endings {
+        let _ = ending.wait();
     }
 }
 
@@ -580,8 +787,8 @@ mod tests {
         let deadline = Instant::now() + std::time::Duration::from_secs(30);
         assert!(matches!(landed.wait_until(deadline), Some(Outcome::Read)));
         // SAFETY: the job has ended, and no device work touches the records.
-        assert!(unsafe { records.hold(0).as_slice(RECORD) } == &bytes[RECORD as usize..], "record 0 holds the file's second half");
-        assert!(unsafe { records.hold(1).as_slice(RECORD) } == &bytes[..RECORD as usize], "record 1 holds its first half");
+        assert!(unsafe { records.hold(0).as_slice_at(0, RECORD) } == &bytes[RECORD as usize..], "record 0 holds the file's second half");
+        assert!(unsafe { records.hold(1).as_slice_at(0, RECORD) } == &bytes[..RECORD as usize], "record 1 holds its first half");
         drop(landed);
         std::fs::remove_file(path).unwrap();
     }
@@ -952,5 +1159,81 @@ mod tests {
                 eprintln!("round {round}, reads {name}: {:.2} GB/s{}", rate / 1e9, covered.unwrap_or_default());
             }
         }
+    }
+
+    /// `request_per_tensor` with `ALIGNED_HEADROOM + ALIGNMENT` staging slots
+    /// lands unaligned 32-byte GGUF offsets with 0% bounce copies and exact
+    /// payload bytes at each tensor's `lead` offset.
+    #[test]
+    fn aligned_staging_lands_straight_with_zero_bounce() {
+        let device = crate::test_support::open_backend(&seismic::Devices::discover(&[]).unwrap(), BackendName::Cpu)
+            .unwrap();
+        let path = std::env::temp_dir().join(format!("expert-source-zero-bounce-{}", std::process::id()));
+        let file_bytes: Vec<u8> = (0..256 * 1024).map(|i| ((i * 37 + 13) % 251) as u8).collect();
+        std::fs::write(&path, &file_bytes).unwrap();
+        let payload = 16 * 1024 + 96; // unaligned length, 32-byte grain
+        let source = ExpertSource::open(std::slice::from_ref(&path), &seismic_io::Urgent { parts: vec![payload as u64; 3], records: 1 }).unwrap();
+        let slot_bytes = (payload as u64 + seismic_io::ALIGNED_HEADROOM as u64 + seismic_io::ALIGNMENT)
+            .next_multiple_of(seismic_io::ALIGNMENT);
+        let staging = Tensor::shared(&seismic::Charges::tally(&device), Element::i32(), &[3, slot_bytes / 4]).unwrap();
+        let records = Records::rows(&staging, slot_bytes, 3).unwrap();
+        let offsets = [32u64, 40_992u64, 102_432u64]; // unaligned 32-byte offsets
+        let reads: Vec<Read> = offsets
+            .iter()
+            .enumerate()
+            .map(|(t, &off)| Read::new(0, off, payload as u64, &records, t as u64, 0).for_tensor(t, true))
+            .collect();
+        let volume = source.volumes()[0];
+        let before = seismic_io::accounting::totals(volume);
+        let ticket = source.request_per_tensor(reads, 3, Want::now(), ReadAlignment::AllowAlignedLead).unwrap();
+        assert!(matches!(ticket.wait(), Outcome::Read));
+        let after = seismic_io::accounting::totals(volume);
+        let direct_delta = after.direct_bytes.saturating_sub(before.direct_bytes);
+        assert!(direct_delta >= 3 * payload as u64, "expected all 3 tensors to land direct, got {direct_delta}");
+        for (t, &off) in offsets.iter().enumerate() {
+            let held = records.hold(t as u64);
+            let lead = ticket.tensor_lead(t);
+            let got = unsafe { held.as_slice_at(lead, payload as u64) };
+            assert_eq!(got, &file_bytes[off as usize..off as usize + payload], "tensor {t} payload mismatch at lead {lead}");
+        }
+        drop(ticket);
+        std::fs::remove_file(path).unwrap();
+    }
+
+    /// `ReadAlignment::ExactZeroLead` never produces a non-zero `lead` offset
+    /// even when the staging slot has `ALIGNED_HEADROOM + ALIGNMENT` extra
+    /// headroom and file offsets are unaligned, so `DeviceLanding` (`routed_land`)
+    /// always finds exact payload bytes at byte offset 0.
+    #[test]
+    fn exact_zero_lead_never_offsets_even_with_aligned_headroom() {
+        let device = crate::test_support::open_backend(&seismic::Devices::discover(&[]).unwrap(), BackendName::Cpu)
+            .unwrap();
+        let path = std::env::temp_dir().join(format!("expert-source-exact-zero-lead-{}", std::process::id()));
+        let file_bytes: Vec<u8> = (0..256 * 1024).map(|i| ((i * 53 + 7) % 251) as u8).collect();
+        std::fs::write(&path, &file_bytes).unwrap();
+        let payload = 16 * 1024 + 96; // unaligned length, 32-byte grain
+        let source = ExpertSource::open(std::slice::from_ref(&path), &seismic_io::Urgent { parts: vec![payload as u64; 3], records: 1 }).unwrap();
+        // Give the staging record ample alignment headroom so `aligned_into`
+        // would succeed with a non-zero lead if called.
+        let slot_bytes = (payload as u64 + seismic_io::ALIGNED_HEADROOM as u64 + seismic_io::ALIGNMENT)
+            .next_multiple_of(seismic_io::ALIGNMENT);
+        let staging = Tensor::shared(&seismic::Charges::tally(&device), Element::i32(), &[3, slot_bytes / 4]).unwrap();
+        let records = Records::rows(&staging, slot_bytes, 3).unwrap();
+        let offsets = [32u64, 40_992u64, 102_432u64]; // unaligned 32-byte offsets
+        let reads: Vec<Read> = offsets
+            .iter()
+            .enumerate()
+            .map(|(t, &off)| Read::new(0, off, payload as u64, &records, t as u64, 0).for_tensor(t, true))
+            .collect();
+        let ticket = source.request_per_tensor(reads, 3, Want::now(), ReadAlignment::ExactZeroLead).unwrap();
+        assert_eq!(ticket.tensor_leads(), &[0, 0, 0], "ExactZeroLead must never produce a non-zero lead");
+        assert!(matches!(ticket.wait(), Outcome::Read));
+        for (t, &off) in offsets.iter().enumerate() {
+            let held = records.hold(t as u64);
+            let got = unsafe { held.as_slice_at(0, payload as u64) };
+            assert_eq!(got, &file_bytes[off as usize..off as usize + payload], "tensor {t} payload mismatch at offset 0");
+        }
+        drop(ticket);
+        std::fs::remove_file(path).unwrap();
     }
 }

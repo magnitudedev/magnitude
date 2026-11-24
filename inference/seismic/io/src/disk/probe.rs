@@ -125,8 +125,8 @@ use super::volume::{EarlierChoice, Shape, VolumeReads};
 #[cfg(doc)]
 use super::volume::{adopt_volume, probe_volume, read_cores};
 use super::ALIGNMENT;
-use crate::scheduler::{self, request, Ended, Range, Want};
-use crate::{Buffer, Volume, Error};
+use crate::scheduler::{self, request, AlignedRange, Ended, Want};
+use crate::{Buffer, Error, Volume, ALIGNED_HEADROOM};
 use std::collections::{BTreeMap, HashMap};
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::Instant;
@@ -154,6 +154,14 @@ const TENSOR_GRAIN: u64 = 32;
 /// the passes it takes each point's median of.
 const PROBE_SECONDS: f64 = 0.03;
 const PASSES: usize = 3;
+
+/// Noise-controlled sampling bounds for [`range_line`]: keep measuring passes
+/// until the median's relative standard error drops to [`RANGE_REL_ERROR`],
+/// bounded by [`RANGE_MAX_PASSES`] passes and [`RANGE_DEPTH_CAP`] wall time
+/// per depth so startup stays fast while `range_knee` sees a low-noise curve.
+const RANGE_REL_ERROR: f64 = 0.02;
+const RANGE_MAX_PASSES: usize = 15;
+const RANGE_DEPTH_CAP: std::time::Duration = std::time::Duration::from_millis(250);
 
 /// The seconds a probe times lone records in, in rounds of one record at
 /// each read size, so drift is shared within a round: on GB10 a record
@@ -283,6 +291,14 @@ impl Point {
         Self { read, window, rate: median(&rates), spread: (most - least) / 2., cores }
     }
 
+    /// A range-line point from noise-controlled passes: median rate and cores,
+    /// with the robust median standard error (`median_error`) as `spread` so a
+    /// single jitter spike never inflates `spread` and under-sizes `range_knee`.
+    fn of_precise(read: u64, window: u64, passes: &[(f64, f64)]) -> Self {
+        let rates = passes.iter().map(|&(rate, _)| rate).collect::<Vec<_>>();
+        let cores = median(&passes.iter().map(|&(_, cores)| cores).collect::<Vec<_>>());
+        Self { read, window, rate: median(&rates), spread: median_error(&rates), cores }
+    }
 }
 
 /// A lone request's time through the engine in pieces of `read` bytes, the
@@ -596,7 +612,15 @@ fn rate(file: &SourceFile, read: u64, depth: usize) -> Result<(f64, f64), Error>
 /// does not land straight), not a read's alone.
 fn lone(key: Volume, file: &Arc<SourceFile>, urgent: &Urgent, reads: &[u64]) -> Result<Vec<Vec<f64>>, Error> {
     let parts = &urgent.parts;
-    let sink: Arc<dyn crate::Destination> = Arc::new(Buffer::new(urgent.bytes() as usize));
+    // Each part gets an ALIGNMENT-aligned slot with ALIGNED_HEADROOM so lone
+    // probes land zero-bounce via `AlignedRange`, matching direct staging
+    // instead of biasing `due_read` down to small bounced pieces.
+    let slot_bytes = |part: u64| (part as usize + ALIGNED_HEADROOM).next_multiple_of(ALIGNMENT as usize);
+    let total_sink: usize = (0..urgent.records)
+        .flat_map(|_| parts.iter())
+        .map(|&part| slot_bytes(part))
+        .sum();
+    let sink: Arc<dyn crate::Destination> = Arc::new(Buffer::new(total_sink));
     // Every piece of a request at once: its due depth holds it whole. The
     // pool's workers for them are the probe's, while it runs.
     let volumes = reads
@@ -618,14 +642,14 @@ fn lone(key: Volume, file: &Arc<SourceFile>, urgent: &Urgent, reads: &[u64]) -> 
                 .flat_map(|_| parts.iter())
                 .map(|&part| {
                     let offset = random_offset(file, &mut state, part, TENSOR_GRAIN);
-                    let range = Range { offset, length: part as usize, into: sink.clone(), at };
-                    at += part as usize;
-                    range
+                    let aligned = AlignedRange::new(offset, part as usize, file.size, sink.clone(), at);
+                    at += slot_bytes(part);
+                    aligned.range
                 })
                 .collect();
             let started = Instant::now();
-            // SAFETY: each range's bytes are its own of `sink`, which
-            // nothing else touches until the request, waited on here, ends.
+            // SAFETY: each range's bytes are its own aligned slot of `sink`,
+            // which nothing else touches until the request, waited on here, ends.
             let request = unsafe { request(file, volume, need, &outstanding, ranges, Want::now()) }?;
             match request.wait() {
                 Ended::Read { failed } => {
@@ -643,17 +667,33 @@ fn lone(key: Volume, file: &Arc<SourceFile>, urgent: &Urgent, reads: &[u64]) -> 
 
 /// `urgent`'s range line through `file` ("A volume's curve": the knee
 /// depth): at each of its depths in turn, the rate and cores of that many
-/// of its ranges kept in flight through the read engine, the median of
-/// [`PASSES`] passes, stopping early only once doubling past the best depth
-/// seen so far yields no improvement beyond noise (a real plateau, never a
-/// single noisy step on a sublinear NVMe curve).
+/// of its ranges kept in flight through the read engine, sampling until the
+/// median's relative standard error drops to [`RANGE_REL_ERROR`] (bounded by
+/// [`RANGE_MAX_PASSES`] and [`RANGE_DEPTH_CAP`]), stopping early only once
+/// doubling past the best depth seen so far yields no improvement beyond
+/// noise (a real plateau, never a single noisy step on a sublinear NVMe curve).
 fn range_line(key: Volume, file: &Arc<SourceFile>, urgent: &Urgent) -> Result<Vec<Point>, Error> {
     let mut line = Vec::<Point>::new();
     let mut best: Option<Point> = None;
     for depth in urgent.depths() {
-        let passes = (0..PASSES).map(|_| ranges_rate(key, file, urgent, depth)).collect::<Result<Vec<_>, _>>()?;
-        let point = Curve::range_point(urgent, depth, 0., 0., 0.);
-        let point = Point::of(point.read, point.window, &passes);
+        let depth_began = Instant::now();
+        let mut passes = Vec::with_capacity(RANGE_MAX_PASSES);
+        for _ in 0..PASSES {
+            passes.push(ranges_rate(key, file, urgent, depth)?);
+        }
+        let mut point = {
+            let base = Curve::range_point(urgent, depth, 0., 0., 0.);
+            Point::of_precise(base.read, base.window, &passes)
+        };
+        while passes.len() < RANGE_MAX_PASSES
+            && depth_began.elapsed() < RANGE_DEPTH_CAP
+            && point.rate > 0.
+            && point.spread / point.rate > RANGE_REL_ERROR
+        {
+            passes.push(ranges_rate(key, file, urgent, depth)?);
+            let base = Curve::range_point(urgent, depth, 0., 0., 0.);
+            point = Point::of_precise(base.read, base.window, &passes);
+        }
         let plateau = best.is_some_and(|best| {
             point.window >= 2 * best.window && point.rate <= best.rate + best.spread + point.spread
         });
@@ -671,13 +711,11 @@ fn range_line(key: Volume, file: &Arc<SourceFile>, urgent: &Urgent) -> Result<Ve
 /// The bytes a second `file` reads at, and the cores the process runs,
 /// with `depth` of `urgent`'s ranges in flight through the read engine:
 /// ranges read ahead on a link of volume `key` whose knee is that many
-/// ranges ([`Urgent::span`]), each its own request of one piece at a random
-/// offset unaligned at the 32-byte grain a model file stores tensors at,
-/// cycling its parts, from one submitter that keeps more queued than the
-/// link admits, so the link alone holds the depth as it does a decode's
-/// reads ahead, for [`PROBE_SECONDS`]. What a range pays is the engine's
-/// (its admission, wakes, and the copy of a piece that does not land
-/// straight), and nothing a reader's thread adds.
+/// ranges ([`Urgent::span`]), each its own zero-bounce [`AlignedRange`]
+/// request of one piece at a random offset unaligned at the 32-byte grain a
+/// model file stores tensors at, cycling its parts, from one submitter that
+/// keeps more queued than the link admits, so the link alone holds the depth
+/// as it does a decode's reads ahead, for [`PROBE_SECONDS`].
 fn ranges_rate(key: Volume, file: &Arc<SourceFile>, urgent: &Urgent, depth: u64) -> Result<(f64, f64), Error> {
     let parts = &urgent.parts;
     let widest = *parts.iter().max().expect("a request has a range");
@@ -689,7 +727,7 @@ fn ranges_rate(key: Volume, file: &Arc<SourceFile>, urgent: &Urgent, depth: u64)
     // Twice the depth and two more queued: the link, not the submitter,
     // holds what is in flight while the oldest is waited on.
     let queued = 2 * depth as usize + 2;
-    let mut spare = (0..queued).map(|_| Arc::new(Buffer::new(widest as usize)) as Arc<dyn crate::Destination>).collect::<Vec<_>>();
+    let mut spare = (0..queued).map(|_| Arc::new(Buffer::with_headroom(widest as usize)) as Arc<dyn crate::Destination>).collect::<Vec<_>>();
     let mut flight = std::collections::VecDeque::<(scheduler::Handle, Arc<dyn crate::Destination>, u64)>::new();
     let (mut state, mut part, mut bytes) = (0x9e37_79b9_7f4a_7c15u64 ^ depth.wrapping_mul(0xbf58_476d_1ce4_e5b9), 0, 0);
     let end = |(handle, sink, length): (scheduler::Handle, Arc<dyn crate::Destination>, u64)| -> Result<(Arc<dyn crate::Destination>, u64), Error> {
@@ -714,7 +752,8 @@ fn ranges_rate(key: Volume, file: &Arc<SourceFile>, urgent: &Urgent, depth: u64)
         part = (part + 1) % parts.len();
         let offset = random_offset(file, &mut state, length, TENSOR_GRAIN);
         let sink = spare.pop().expect("a sink for every request queued");
-        let ranges = vec![Range { offset, length: length as usize, into: sink.clone(), at: 0 }];
+        let aligned = AlignedRange::new(offset, length as usize, file.size, sink.clone(), 0);
+        let ranges = vec![aligned.range];
         // SAFETY: each sink is one queued request's alone: it is reused only
         // once that request has ended, and the request holds it until then.
         flight.push_back((unsafe { request(file, &volume, &need, &outstanding, ranges, Want::expected(0, 1.)) }?, sink, length));
@@ -751,5 +790,24 @@ mod tests {
             depths.last().copied().unwrap_or(0) >= 16,
             "expected >= 16 probed ranges for ~8.66 MiB expert, got {depths:?}"
         );
+    }
+
+    /// `Point::of_precise` uses the robust IQR-based median standard error so
+    /// a single noisy pass does not inflate `spread` and make `range_knee`
+    /// under-size NVMe queue depth.
+    #[test]
+    fn precise_range_point_ignores_single_outlier_and_finds_true_knee() {
+        let urgent = Urgent { parts: vec![3_026_944; 3], records: 8 };
+        // Depth 2 has 6.0 GB/s with one jitter outlier (4.0 GB/s); depth 8
+        // saturates at 10.0 GB/s. With `Point::of_precise`, depth 2's spread
+        // stays tight so `range_knee` picks depth 8, not depth 2.
+        let d2_passes = vec![(6.0e9, 0.2), (6.05e9, 0.2), (5.95e9, 0.2), (6.02e9, 0.2), (4.0e9, 0.2), (5.98e9, 0.2), (6.01e9, 0.2)];
+        let d8_passes = vec![(10.0e9, 0.4), (10.05e9, 0.4), (9.95e9, 0.4), (10.02e9, 0.4), (9.98e9, 0.4)];
+        let p2_base = Curve::range_point(&urgent, 2, 0., 0., 0.);
+        let p8_base = Curve::range_point(&urgent, 8, 0., 0., 0.);
+        let p2 = super::Point::of_precise(p2_base.read, p2_base.window, &d2_passes);
+        let p8 = super::Point::of_precise(p8_base.read, p8_base.window, &d8_passes);
+        assert!(p2.spread / p2.rate < 0.02, "robust spread should stay tight despite 1 outlier: {:?}", p2);
+        assert_eq!(range_knee(&[p2, p8]), p8.window);
     }
 }

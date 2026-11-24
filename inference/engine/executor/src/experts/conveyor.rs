@@ -624,12 +624,11 @@ mod tests {
         let (l0, c0, e0) = dummy_landing(&events, 0, 0, 0, 0);
         let (l1, c1, e1) = dummy_landing(&events, 1, 1, 1, 1);
         let (l2, c2, e2) = dummy_landing(&events, 2, 0, 2, 2);
+        // Occupy record 0 with an active GPU round before landing; records 1 and 2 are landing-only.
+        conveyor.take(0, 2, 0);
         conveyor.land(l0);
         conveyor.land(l1);
         conveyor.land(l2);
-
-        // Occupy record 0 with an active GPU round: records 1 and 2 are landing-only.
-        conveyor.take(0, 2, 0);
         assert_eq!(conveyor.landing_only_record(1, |_| true), Some(1));
 
         // Cancel record 1: cancels l1 only.

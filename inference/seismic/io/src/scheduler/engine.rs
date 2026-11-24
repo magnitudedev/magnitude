@@ -180,10 +180,18 @@ impl Engine {
     }
 
     /// The queue, every piece whose read returned ended in it first.
+    /// Any `Arc<Need>` returned by `Queue::ended` is dropped strictly outside
+    /// `self.queue`'s lock so `Need::drop` can never re-enter `self.queue`.
     pub(crate) fn queue(&self) -> MutexGuard<'_, Queue> {
-        let mut queue = self.queue.lock().expect("read queue");
-        self.end_returned(&mut queue);
-        queue
+        loop {
+            let mut queue = self.queue.lock().expect("read queue");
+            if self.left.load(Ordering::Acquire) == 0 {
+                return queue;
+            }
+            let needs = self.end_returned(&mut queue);
+            drop(queue);
+            drop(needs);
+        }
     }
 
     /// End `returned` now if the queue's lock is free, or leave it for the
@@ -191,8 +199,10 @@ impl Engine {
     pub(crate) fn read_returned(&self, returned: Returned) {
         match self.queue.try_lock() {
             Ok(mut queue) => {
-                self.end_returned(&mut queue);
-                self.end(&mut queue, returned);
+                let mut needs = self.end_returned(&mut queue);
+                needs.push(self.end(&mut queue, returned));
+                drop(queue);
+                drop(needs);
             }
             Err(TryLockError::WouldBlock) => {
                 let mut left = self.returned.lock().expect("returned reads");
@@ -206,24 +216,26 @@ impl Engine {
     }
 
     /// End in `queue` the pieces whose reads returned while its lock was
-    /// held, in the order they were left.
-    fn end_returned(&self, queue: &mut Queue) {
+    /// held, in the order they were left, returning their `Arc<Need>`s so the
+    /// caller drops them outside `self.queue`'s lock.
+    fn end_returned(&self, queue: &mut Queue) -> Vec<Arc<Need>> {
         if self.left.load(Ordering::Acquire) == 0 {
-            return;
+            return Vec::new();
         }
         let mut returned = self.returned.lock().expect("returned reads");
         self.left.store(0, Ordering::Relaxed);
-        for returned in returned.drain(..) {
-            self.end(queue, returned);
-        }
+        returned.drain(..).map(|returned| self.end(queue, returned)).collect()
     }
 
     /// End `returned` in `queue`: room it frees on a link with a request
-    /// queued wakes a worker to take its next piece.
-    fn end(&self, queue: &mut Queue, returned: Returned) {
-        if queue.ended(returned) {
+    /// queued wakes a worker to take its next piece. Returns `need` so the
+    /// caller drops it outside `self.queue`'s lock.
+    fn end(&self, queue: &mut Queue, returned: Returned) -> Arc<Need> {
+        let (wake, need) = queue.ended(returned);
+        if wake {
             self.work.notify_one();
         }
+        need
     }
 
     /// Wake `count` workers.
@@ -237,7 +249,13 @@ impl Engine {
     /// until reads are submitted under it ([`Need::submitted`]).
     pub(crate) fn need(&'static self, volume: &VolumeReads) -> Arc<Need> {
         let live = Arc::new(AtomicUsize::new(0));
-        let id = self.pool.lock().expect("read pool").claim(volume, live.clone());
+        let (id, generation, budget) = {
+            let mut pool = self.pool.lock().expect("read pool");
+            let id = pool.claim(volume, live.clone());
+            let (generation, budget) = pool.budget_update();
+            (id, generation, budget)
+        };
+        self.buffers.set_budget(generation, budget);
         Arc::new(Need { engine: self, id, live })
     }
 
@@ -286,6 +304,7 @@ struct Pool {
     started: usize,
     named: usize,
     claims: u64,
+    budget_gen: u64,
     needs: HashMap<u64, Claim>,
     devices: HashMap<Volume, Device>,
 }
@@ -314,11 +333,14 @@ struct Device {
     most: usize,
 }
 
-/// Per-volume worker ceiling on macOS: Apple Silicon NVMe saturates well below
-/// 16 concurrent threads, whereas spawning 65–73 `QOS_CLASS_USER_INTERACTIVE`
-/// workers on 6–10 P-cores oversubscribes the scheduler and stalls decode.
+/// Per-volume worker ceiling: Apple Silicon NVMe saturates well below 16
+/// concurrent threads, and Linux/Windows NVMe saturates well below 32
+/// concurrent threads; spawning 65–256 blocking threads oversubscribes
+/// runtime cores and stalls decode.
 #[cfg(target_os = "macos")]
-const MACOS_MAX_WORKERS: usize = 16;
+const MAX_WORKERS: usize = 16;
+#[cfg(not(target_os = "macos"))]
+const MAX_WORKERS: usize = 32;
 
 impl Device {
     /// A device read by a link of `shape`, nothing yet submitted.
@@ -347,14 +369,12 @@ impl Device {
     /// knee in its smallest piece, and one piece more; clamped to its queue
     /// depth; and never more pieces than its claims have had queued or in
     /// flight at once, which holds steady while they read as they did.
-    /// On macOS, capped to `MACOS_MAX_WORKERS` (16) per volume.
+    /// Capped per volume to `MAX_WORKERS` (16 on macOS, 32 on Linux/Windows).
     fn workers(&self) -> usize {
         let admitted = u128::from(self.due.div_ceil(self.smallest)) + u128::from(self.knee.div_ceil(self.smallest)) + 1;
         let admitted = admitted.min(u128::from(self.depth));
         let workers = usize::try_from(admitted).map_or(self.most, |admitted| admitted.min(self.most));
-        #[cfg(target_os = "macos")]
-        let workers = workers.min(MACOS_MAX_WORKERS);
-        workers
+        workers.min(MAX_WORKERS)
     }
 }
 
@@ -363,6 +383,7 @@ impl Pool {
     /// device takes the deepest of its claims' links.
     fn claim(&mut self, volume: &VolumeReads, live: Arc<AtomicUsize>) -> u64 {
         self.claims += 1;
+        self.budget_gen += 1;
         let id = self.claims;
         let claimed = Device::of(&volume.shape);
         self.devices
@@ -414,7 +435,15 @@ impl Pool {
             merged.most = sum_most.min(old_most);
             self.devices.insert(volume, merged);
         }
+        self.budget_gen += 1;
         self.target() < before
+    }
+
+    /// Monotonic generation and current retained-buffer ceiling paired under
+    /// `Engine::pool` so out-of-order `Buffers::set_budget` calls discard
+    /// stale ceilings.
+    fn budget_update(&self) -> (u64, u64) {
+        (self.budget_gen, self.buffer_budget())
     }
 
     /// The workers the devices' links can hold in flight at once
@@ -426,6 +455,15 @@ impl Pool {
     /// The devices' queue depths, summed: the most workers the pool may hold.
     fn cap(&self) -> usize {
         self.devices.values().map(|device| usize::try_from(device.depth).unwrap_or(usize::MAX)).fold(0, usize::saturating_add)
+    }
+
+    /// Total bytes in flight the active devices' links can hold (`due + knee`
+    /// summed across claimed volumes): the ceiling for retained bounce buffers.
+    fn buffer_budget(&self) -> u64 {
+        self.devices
+            .values()
+            .map(|device| device.due.saturating_add(device.knee))
+            .fold(0u64, u64::saturating_add)
     }
 
     /// The names of the workers to start for the target, counted started
@@ -486,9 +524,13 @@ impl Need {
 
 impl Drop for Need {
     fn drop(&mut self) {
-        let shrunk = {
-            self.engine.pool.lock().expect("read pool").release(self.id)
+        let (shrunk, generation, budget) = {
+            let mut pool = self.engine.pool.lock().expect("read pool");
+            let shrunk = pool.release(self.id);
+            let (generation, budget) = pool.budget_update();
+            (shrunk, generation, budget)
         };
+        self.engine.buffers.set_budget(generation, budget);
         // Taking the queue's lock first, every idle worker is waiting on
         // the condition, or will see the target as it now is.
         if shrunk {
@@ -530,11 +572,19 @@ fn work(engine: &'static Engine, slot: FlightSlot) {
                     return;
                 }
                 if engine.left.load(Ordering::Acquire) != 0 {
-                    engine.end_returned(&mut queue);
+                    let needs = engine.end_returned(&mut queue);
+                    drop(queue);
+                    drop(needs);
+                    queue = engine.queue();
                     continue;
                 }
                 queue = engine.work.wait(queue).expect("read queue");
-                engine.end_returned(&mut queue);
+                if engine.left.load(Ordering::Acquire) != 0 {
+                    let needs = engine.end_returned(&mut queue);
+                    drop(queue);
+                    drop(needs);
+                    queue = engine.queue();
+                }
             }
         };
         let piece = &taken.piece;
@@ -604,10 +654,16 @@ fn work(engine: &'static Engine, slot: FlightSlot) {
 #[derive(Default)]
 pub(crate) struct Buffers(Mutex<Kept>);
 
-/// The buffers kept, by size, and the readers open.
+/// The buffers kept, by size, the readers open, total retained bytes,
+/// checked-out worker scratch bytes, and the active volumes' `due + knee`
+/// retained-byte ceiling (`None` when unbounded in standalone unit tests).
 #[derive(Default)]
 struct Kept {
     readers: usize,
+    bytes: u64,
+    checked_out: u64,
+    budget_gen: u64,
+    budget: Option<u64>,
     sizes: HashMap<usize, Vec<Buffer>>,
 }
 
@@ -627,7 +683,12 @@ impl Drop for Reading {
         let _released = {
             let mut kept = self.0 .0.lock().expect("read buffers");
             kept.readers -= 1;
-            (kept.readers == 0).then(|| std::mem::take(&mut kept.sizes))
+            if kept.readers == 0 {
+                kept.bytes = 0;
+                Some(std::mem::take(&mut kept.sizes))
+            } else {
+                None
+            }
         };
     }
 }
@@ -640,26 +701,84 @@ impl Buffers {
         Reading(self)
     }
 
-    /// The bytes of the buffers kept.
-    fn bytes(&self) -> u64 {
-        let kept = self.0.lock().expect("read buffers");
-        kept.sizes.iter().map(|(size, buffers)| (size * buffers.len()) as u64).sum()
+    /// Update the retained-byte ceiling (derived from active volumes'
+    /// `due + knee`) and immediately release any excess buffers outside the
+    /// lock, largest size classes first. Updates with a generation at or below
+    /// the last applied generation are stale and discarded.
+    pub(crate) fn set_budget(&self, generation: u64, budget: u64) {
+        let _released = {
+            let mut guard = self.0.lock().expect("read buffers");
+            let kept = &mut *guard;
+            if generation <= kept.budget_gen {
+                return;
+            }
+            kept.budget_gen = generation;
+            kept.budget = Some(budget);
+            let mut released = Vec::new();
+            if kept.bytes > budget {
+                let mut sizes: Vec<usize> = kept.sizes.keys().copied().collect();
+                sizes.sort_unstable_by(|a, b| b.cmp(a));
+                for size in sizes {
+                    if kept.bytes <= budget {
+                        break;
+                    }
+                    if let Some(vec) = kept.sizes.get_mut(&size) {
+                        while kept.bytes > budget {
+                            let Some(buf) = vec.pop() else { break };
+                            kept.bytes = kept.bytes.saturating_sub(size as u64);
+                            released.push(buf);
+                        }
+                    }
+                    if kept.sizes.get(&size).is_some_and(Vec::is_empty) {
+                        kept.sizes.remove(&size);
+                    }
+                }
+            }
+            released
+        };
     }
 
-    /// A buffer of at least `length` bytes.
+    /// Total live bounce buffer bytes: both retained in the pool and currently
+    /// checked out by workers (`scratch` / in-flight held buffers).
+    fn bytes(&self) -> u64 {
+        let kept = self.0.lock().expect("read buffers");
+        kept.bytes.saturating_add(kept.checked_out)
+    }
+
+    /// A buffer of at least `length` bytes, accounted in `checked_out` until
+    /// returned via [`Self::give`].
     pub(crate) fn take(&self, length: usize) -> Buffer {
         let size = length.max(LEAST_READ as usize).next_power_of_two();
-        let kept = self.0.lock().expect("read buffers").sizes.get_mut(&size).and_then(Vec::pop);
+        let kept = {
+            let mut kept = self.0.lock().expect("read buffers");
+            let buf = kept.sizes.get_mut(&size).and_then(Vec::pop);
+            if buf.is_some() {
+                kept.bytes = kept.bytes.saturating_sub(size as u64);
+            }
+            kept.checked_out = kept.checked_out.saturating_add(size as u64);
+            buf
+        };
         kept.unwrap_or_else(|| Buffer::new(size))
     }
 
-    /// Keep `buffer` for a piece after, while a reader is open; a piece of
-    /// a request that outlived every reader releases its own.
-    pub(crate) fn give(&self, mut buffer: Buffer) {
-        let mut kept = self.0.lock().expect("read buffers");
-        if kept.readers > 0 {
-            kept.sizes.entry(buffer.bytes_mut().len()).or_default().push(buffer);
-        }
+    /// Return `buffer` from a worker: decrements `checked_out` and retains it
+    /// only while a reader is open and retained bytes stay within the active
+    /// `due + knee` budget; excess buffers drop outside the lock.
+    pub(crate) fn give(&self, buffer: Buffer) {
+        let size = buffer.len() as u64;
+        let dropped = {
+            let mut kept = self.0.lock().expect("read buffers");
+            kept.checked_out = kept.checked_out.saturating_sub(size);
+            let fits = kept.readers > 0 && kept.budget.is_none_or(|budget| kept.bytes.saturating_add(size) <= budget);
+            if fits {
+                kept.bytes = kept.bytes.saturating_add(size);
+                kept.sizes.entry(buffer.len()).or_default().push(buffer);
+                None
+            } else {
+                Some(buffer)
+            }
+        };
+        drop(dropped);
     }
 }
 
@@ -675,17 +794,8 @@ mod tests {
     const MIB: u64 = 1 << 20;
 
     /// Expected per-device worker count for `decode`: 68 (`64 + 3 + 1`), capped
-    /// at `MACOS_MAX_WORKERS` (16) on macOS.
-    const DECODE_WORKERS: usize = {
-        #[cfg(target_os = "macos")]
-        {
-            super::MACOS_MAX_WORKERS
-        }
-        #[cfg(not(target_os = "macos"))]
-        {
-            68
-        }
-    };
+    /// at `MAX_WORKERS` (16 on macOS, 32 on Linux/Windows).
+    const DECODE_WORKERS: usize = super::MAX_WORKERS;
 
     /// A measured M4 Pro decode link: due 32 MiB in 512 KiB reads, a knee
     /// of 5200 KiB in 2 MiB reads (64 + 3 + 1 pieces).
@@ -793,18 +903,104 @@ mod tests {
         assert_eq!(pool.target(), 0);
     }
 
-    /// On macOS, `Device::workers()` caps per-volume workers at 16 so large
-    /// queue depths never oversubscribe P-cores with interactive threads.
-    #[cfg(target_os = "macos")]
+    /// `Device::workers()` caps per-volume workers at `MAX_WORKERS` (16 on
+    /// macOS, 32 on Linux/Windows) so large queue depths never oversubscribe
+    /// runtime cores with blocking threads.
     #[test]
-    fn macos_device_workers_capped_at_sixteen() {
+    fn device_workers_capped_at_platform_max() {
         let mut pool = Pool::default();
         let live = Arc::new(AtomicUsize::new(0));
         let claim = pool.claim(&decode(1), live.clone());
         let started = submit(&mut pool, claim, &live, 500, 256 * KIB);
-        assert!(started <= 16, "macOS per-volume workers must be <= 16, got {started}");
-        assert_eq!(started, super::MACOS_MAX_WORKERS);
-        assert_eq!(pool.target(), super::MACOS_MAX_WORKERS);
+        assert!(started <= super::MAX_WORKERS, "per-volume workers must be <= {}, got {started}", super::MAX_WORKERS);
+        assert_eq!(started, super::MAX_WORKERS);
+        assert_eq!(pool.target(), super::MAX_WORKERS);
+    }
+
+    /// `Buffers` bounds retained bounce buffers to the active volumes'
+    /// `due + knee` budget and immediately drains excess buffers when the
+    /// budget shrinks (e.g. after model import completes before bank sizing).
+    #[test]
+    fn buffers_bounded_by_due_plus_knee_and_trimmed_on_shrink() {
+        let buffers: &'static Buffers = Box::leak(Box::default());
+        let _reading = buffers.reading();
+        let mut pool = Pool::default();
+        let live = Arc::new(AtomicUsize::new(0));
+        let small = VolumeReads {
+            id: Volume(1),
+            shape: Shape { due: 2 * MIB, knee: 2 * MIB, due_read: 512 * KIB, ahead_read: 2 * MIB, cores: 0.25 },
+        };
+        let claim = pool.claim(&small, live);
+        let (gen1, budget1) = pool.budget_update();
+        assert_eq!(budget1, 4 * MIB);
+        buffers.set_budget(gen1, budget1);
+
+        // Returning 5 × 1 MiB concurrent buffers retains at most 4 MiB (due + knee).
+        let bufs: Vec<_> = (0..5).map(|_| buffers.take(MIB as usize)).collect();
+        for buf in bufs {
+            buffers.give(buf);
+        }
+        assert_eq!(buffers.bytes(), 4 * MIB, "retained bytes must not exceed due + knee");
+
+        // Releasing the claim drops budget to 0 and immediately drains all kept buffers.
+        pool.release(claim);
+        let (gen2, budget2) = pool.budget_update();
+        assert_eq!(budget2, 0);
+        buffers.set_budget(gen2, budget2);
+        assert_eq!(buffers.bytes(), 0, "excess buffers must be drained when claim releases");
+    }
+
+    /// Out-of-order budget publications from concurrent claim/release
+    /// operations discard stale generations so an older larger ceiling can
+    /// never overwrite a newer smaller ceiling.
+    #[test]
+    fn stale_budget_publication_is_discarded() {
+        let buffers: &'static Buffers = Box::leak(Box::default());
+        let _reading = buffers.reading();
+        let mut pool = Pool::default();
+        let vol_a = VolumeReads {
+            id: Volume(1),
+            shape: Shape { due: 2 * MIB, knee: 2 * MIB, due_read: 512 * KIB, ahead_read: 2 * MIB, cores: 0.25 },
+        };
+        let vol_b = VolumeReads {
+            id: Volume(2),
+            shape: Shape { due: 4 * MIB, knee: 4 * MIB, due_read: 512 * KIB, ahead_read: 2 * MIB, cores: 0.25 },
+        };
+
+        let claim_a = pool.claim(&vol_a, Arc::new(AtomicUsize::new(0)));
+        let (gen_a, budget_a) = pool.budget_update();
+        assert_eq!(budget_a, 4 * MIB);
+        buffers.set_budget(gen_a, budget_a);
+
+        // Claim B raises budget to 12 MiB (gen_b), then release B drops it back
+        // to 4 MiB (gen_b_rel). Publish gen_b_rel first, then stale gen_b.
+        let claim_b = pool.claim(&vol_b, Arc::new(AtomicUsize::new(0)));
+        let (gen_b, budget_b) = pool.budget_update();
+        assert_eq!(budget_b, 12 * MIB);
+        pool.release(claim_b);
+        let (gen_b_rel, budget_b_rel) = pool.budget_update();
+        assert_eq!(budget_b_rel, 4 * MIB);
+
+        buffers.set_budget(gen_b_rel, budget_b_rel);
+        buffers.set_budget(gen_b, budget_b);
+
+        // Returning 6 × 1 MiB buffers must remain capped at 4 MiB, not 12 MiB.
+        let bufs: Vec<_> = (0..6).map(|_| buffers.take(MIB as usize)).collect();
+        for buf in bufs {
+            buffers.give(buf);
+        }
+        assert_eq!(buffers.bytes(), 4 * MIB, "stale larger budget must not overwrite newer smaller ceiling");
+
+        // Release A drops to 0; publishing stale gen_a afterwards keeps 0.
+        pool.release(claim_a);
+        let (gen_zero, budget_zero) = pool.budget_update();
+        assert_eq!(budget_zero, 0);
+        buffers.set_budget(gen_zero, budget_zero);
+        buffers.set_budget(gen_a, budget_a);
+        assert_eq!(buffers.bytes(), 0);
+        let buf = buffers.take(MIB as usize);
+        buffers.give(buf);
+        assert_eq!(buffers.bytes(), 0, "stale non-zero budget must not reopen retention after zero");
     }
 
     /// A worker's flight slot is registered before the worker begins and

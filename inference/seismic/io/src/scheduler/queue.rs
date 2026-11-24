@@ -416,7 +416,7 @@ impl Queue {
     /// `returned`'s piece ended as its read returned, counted in its link's
     /// book and its request's wait: whether the link holds a request
     /// queued, whose next piece the room it freed may admit.
-    pub(crate) fn ended(&mut self, returned: Returned) -> bool {
+    pub(crate) fn ended(&mut self, returned: Returned) -> (bool, Arc<Need>) {
         let Returned { id, volume, standing, bytes, direct, at, need } = returned;
         need.ended(1);
         let link = self.links.get_mut(&volume).expect("an ended piece was in flight");
@@ -424,7 +424,7 @@ impl Queue {
         link.flight.end(standing, bytes);
         link.book.ended(standing.due(), bytes, direct, at);
         settle(&mut self.waits, id, |wait| wait.ended(&mut link.book, at));
-        !(link.requests.is_empty() && link.streamed.is_empty())
+        (!(link.requests.is_empty() && link.streamed.is_empty()), need)
     }
 
     /// Order request `id`'s pieces not yet taken by `want`: the workers to

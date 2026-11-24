@@ -691,4 +691,63 @@ mod tests {
         assert_eq!(state.pop_next().unwrap().ticket, t_promote);
         assert!(state.pop_next().is_none());
     }
+
+    /// Proof cases #1, #2, and #4 end-to-end on `ExpertTransport` + `Copies`:
+    /// - Delayed prefill fill publishes its `TransferSync` before consumer
+    ///   `take_prefill_sync` returns.
+    /// - Overlapping consumer leases prohibit slot reuse until the FINAL reader
+    ///   retires.
+    /// - Cancellation of an unbegun hint frees its slot, whereas cancellation
+    ///   of an in-flight hint is refused and keeps the slot pinned until DMA
+    ///   completes and all readers release.
+    #[test]
+    fn delayed_fill_overlapping_readers_and_cancellation_slot_reuse_safety() {
+        use crate::experts::transport::{DestSlot, ExpertKey, ExpertTransport, SourceRef};
+
+        let transport = ExpertTransport::new_registry_only();
+
+        // 1. Delayed prefill fill before consumer read: consumer waits on
+        //    `take_prefill_sync` until the producer thread publishes.
+        let producer_transport = Arc::clone(&transport);
+        let producer = std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(15));
+            producer_transport.publish_prefill_sync(2, 10, 0, None);
+        });
+        let got = transport.take_prefill_sync(2, 10, 0).expect("delayed prefill sync");
+        assert!(got.is_none());
+        producer.join().unwrap();
+
+        // 2. Overlapping readers prohibit slot reuse until final reader retires,
+        //    and cancelling an unbegun hint vs an in-flight hint preserves slot
+        //    reuse safety.
+        let key_unbegun = ExpertKey { group: 0, layer: 1, expert: 3 };
+        let slot_unbegun = DestSlot { group: 0, slot: 1 };
+        let unbegun_id = transport.register_hint(key_unbegun, 11, slot_unbegun);
+        assert!(!transport.can_reuse_slot(slot_unbegun), "slot pinned while hint queued");
+        assert!(transport.cancel_unbegun_hint(unbegun_id), "unbegun queued hint cancels cleanly");
+        assert!(transport.can_reuse_slot(slot_unbegun), "unbegun cancelled hint frees slot safely");
+
+        let key_live = ExpertKey { group: 0, layer: 1, expert: 7 };
+        let src_live = SourceRef { tier_record: 22, generation: 2 };
+        let slot_live = DestSlot { group: 0, slot: 2 };
+        let live_id = transport.register_in_flight_hint(key_live, src_live, slot_live, None);
+        assert!(!transport.cancel_unbegun_hint(live_id), "in-flight DMA cannot be cancelled");
+        let joined1 = transport.join_by_key(key_live, src_live).expect("reader 1 joins in-flight hint");
+        let joined2 = transport.join_by_key(key_live, src_live).expect("reader 2 joins in-flight hint");
+        assert!(!transport.can_reuse_slot(slot_live), "slot pinned while DMA + 2 readers active");
+
+        // DMA finishes, but both readers still hold leases -> slot reuse prohibited.
+        transport.complete_dma(live_id);
+        assert!(!transport.try_release_hint_slot(slot_live), "hint release blocked with 2 active readers");
+        assert!(!transport.can_reuse_slot(slot_live), "slot reuse prohibited with 2 active readers");
+
+        // Reader 1 cancels/retires early -> reader 2 still active -> slot reuse STILL prohibited!
+        joined1.lease.cancel();
+        assert!(!transport.can_reuse_slot(slot_live), "slot reuse prohibited until FINAL reader retires");
+
+        // Final reader retires -> slot reuse now permitted!
+        joined2.lease.release();
+        assert!(transport.can_reuse_slot(slot_live), "slot reusable once final reader retires");
+        assert!(transport.try_release_hint_slot(slot_live), "hint slot releases cleanly once unpinned");
+    }
 }

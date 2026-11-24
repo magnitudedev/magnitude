@@ -1,6 +1,6 @@
 #[cfg(doc)]
 use crate::scheduler::Flight;
-use super::platform::{drop_pages, refuses_direct, reopen};
+use super::platform::{drop_pages, refuses_direct, refuses_direct_sink, reopen};
 use super::ALIGNMENT;
 use crate::scheduler::{Buffers, Piece};
 use crate::{Buffer, Error};
@@ -100,14 +100,28 @@ impl SourceFile {
     pub(crate) fn fetch(&self, piece: &Piece, scratch: &mut Option<Buffer>, buffers: &Buffers) -> Result<Fetched, Error> {
         let span = (piece.end - piece.start) as usize;
         if self.lands_straight(piece) {
-            if let [part] = piece.parts.as_slice() {
-                // SAFETY: the piece's one part's sink is `span` bytes the pool
-                // writes alone until the job ends (`Reader::request`).
-                let sink = unsafe { std::slice::from_raw_parts_mut(part.sink.as_ptr(), span) };
-                return self.read_block(piece.start, sink).map(|()| Fetched::Landed);
+            let direct = match piece.parts.as_slice() {
+                [part] => {
+                    // SAFETY: the piece's one part's sink is `span` bytes the pool
+                    // writes alone until the job ends (`Reader::request`).
+                    let sink = unsafe { std::slice::from_raw_parts_mut(part.sink.as_ptr(), span) };
+                    self.read_block(piece.start, sink)
+                }
+                #[cfg(unix)]
+                parts => self.read_block_vectored(piece.start, span, parts),
+                #[cfg(not(unix))]
+                _ => unreachable!("lands_straight admits multiple parts only on unix"),
+            };
+            match direct {
+                Ok(()) => return Ok(Fetched::Landed),
+                Err(Error::Io(ref error)) if refuses_direct_sink(error) => {
+                    // Direct I/O into device-mapped (`VM_IO` / `VM_PFNMAP`, e.g.
+                    // Vulkan `vkMapMemory`) sinks fails `get_user_pages` with
+                    // `EFAULT`; fall through to the worker's regular aligned host
+                    // scratch buffer while keeping `O_DIRECT` active.
+                }
+                Err(error) => return Err(error),
             }
-            #[cfg(unix)]
-            return self.read_block_vectored(piece.start, span, &piece.parts).map(|()| Fetched::Landed);
         }
         let mut buffer = match scratch.take() {
             Some(buffer) if buffer.len() >= span => buffer,

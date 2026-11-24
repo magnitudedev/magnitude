@@ -254,6 +254,13 @@ impl Reader {
         AlignedRange::new(offset, length, self.file.size, into, at)
     }
 
+    /// Checked aligned read extent into `into` at or after `at`
+    /// ([`AlignedRange::into_aligned`]): returns `None` when the destination
+    /// lacks alignment headroom or the range is empty/out-of-bounds.
+    pub fn aligned_into(&self, offset: u64, length: usize, into: Arc<dyn Destination>, at: usize) -> Option<AlignedRange> {
+        AlignedRange::into_aligned(offset, length, self.file.size, into, at)
+    }
+
     /// Read the `length` bytes from `offset` in order, as requests for
     /// `want` of half the link's knee each (at least one read), handing each
     /// chunk to `sink` with its offset in the range as it lands: three

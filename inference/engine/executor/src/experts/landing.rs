@@ -218,11 +218,15 @@ impl DeviceLanding {
         self.state.lock().expect("a device landing")
     }
 
-    /// Its read landed whole in staging record `staged`, for the bank
-    /// record `grant` takes: append its entry. Whether it did: not once the
-    /// list lists a later step, the device past this one's launch, when it
-    /// ends not landed.
-    pub fn append(&self, grant: Grant, staged: u32) -> bool {
+    /// Its read landed whole in staging record `staged` at byte offset 0
+    /// (`tensor_leads` all zero), for the bank record `grant` takes: append its
+    /// entry. Whether it did: not once the list lists a later step, the device
+    /// past this one's launch, when it ends not landed.
+    pub fn append(&self, grant: Grant, staged: u32, tensor_leads: &[usize]) -> bool {
+        assert!(
+            tensor_leads.iter().all(|&lead| lead == 0),
+            "DeviceLanding (routed_land) reads staging from byte offset 0, got non-zero tensor leads {tensor_leads:?}",
+        );
         let to = i32::try_from(grant.record()).expect("bank records fit i32");
         let from = i32::try_from(staged).expect("staging records fit i32");
         let mut state = self.state();
@@ -386,16 +390,24 @@ impl LandedRecord {
     }
 }
 
+/// One routed tensor of an expert's landing: its staging `records` and record
+/// index `staged`, the `lead` byte offset inside that staging record where the
+/// stored payload begins (`0` unless widened via `AlignedRange`), its stored
+/// `bytes`, and the destination `tier` record.
+pub(in crate::experts) struct LandingTensor {
+    pub staging: Records,
+    pub staged: u64,
+    pub lead: usize,
+    pub bytes: u64,
+    pub tier: LandedRecord,
+}
+
 /// One expert's landing, its claim's `grant` (its expert and tier record):
-/// from each routed tensor's staging record (its records, the record and
-/// its stored bytes) into the grant's tier record of the tensor (that
-/// record alone, [`TierTensor::landed`]), then
-/// mapped by the grant ([`Converting`], [`Grant::map`]), from the step its
-/// claim names: where the landing is a parked step's, the first step that
-/// has not resolved the layer, which the device cannot pass before the
-/// landing answers; else the first step not yet begun.
+/// from each routed tensor's staging record into the grant's tier record of
+/// the tensor (that record alone, [`TierTensor::landed`]), then mapped by the
+/// grant ([`Converting`] / [`PipelinedLanding`], [`Grant::map`]).
 pub(in crate::experts) struct Landing {
-    pub tensors: Vec<(Records, u64, u64, LandedRecord)>,
+    pub tensors: Vec<LandingTensor>,
     pub grant: Grant,
 }
 
@@ -545,7 +557,7 @@ impl Converting {
             .tensors
             .iter()
             .enumerate()
-            .flat_map(|(index, (_, _, bytes, tensor))| tensor.pieces(*bytes).into_iter().map(move |piece| (index, piece)))
+            .flat_map(|(index, tensor)| tensor.tier.pieces(tensor.bytes).into_iter().map(move |piece| (index, piece)))
             .collect();
         Self {
             landing,
@@ -594,15 +606,15 @@ impl super::compute::Job for Converting {
         if self.cancelled.load(std::sync::atomic::Ordering::Acquire) {
             return;
         }
-        let (tensor, piece) = self.pieces[index].clone();
-        let (staging, staged, bytes, tier) = &self.landing.tensors[tensor];
+        let (tensor_idx, piece) = self.pieces[index].clone();
+        let tensor = &self.landing.tensors[tensor_idx];
         // SAFETY: `new`'s: the stored record is whole and nothing lands in
         // it, nothing reads the tier record, and this piece alone writes
         // its range.
         let started = std::time::Instant::now();
         self.began.get_or_init(|| started);
-        let held = staging.hold(*staged);
-        unsafe { tier.convert(held.as_slice(*bytes), piece) };
+        let held = tensor.staging.hold(tensor.staged);
+        unsafe { tensor.tier.convert(held.as_slice_at(tensor.lead, tensor.bytes), piece) };
         LandingAccount::add(&self.worked, started.elapsed());
     }
 
@@ -637,8 +649,199 @@ impl super::compute::Job for Converting {
         self.urgency.get()
     }
 
-    fn waited(&self) -> bool {
-        self.urgency.is_waited()
+    fn priority_key(&self) -> u64 {
+        self.urgency.key()
+    }
+}
+
+/// Shared completion barrier for a per-tensor pipelined expert landing:
+/// each routed tensor (`gate`, `up`, `down`) is submitted to [`super::compute::Compute`]
+/// as a [`TensorConverting`] job the instant its own NVMe read finishes,
+/// overlapping conversion of completed tensors with sibling NVMe reads.
+/// The expert's tier record is mapped and `ended` is set ONLY once every
+/// tensor has either finished converting or been accounted failed/cancelled,
+/// guaranteeing staging is never freed while any worker still reads it.
+struct PipelinedState {
+    grant: std::sync::Mutex<Option<Grant>>,
+    ended: Ended,
+    then: std::sync::Mutex<Option<Box<dyn FnOnce() + Send>>>,
+    urgency: std::sync::Arc<Urgency>,
+    cancelled: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    failed: std::sync::atomic::AtomicBool,
+    remaining: std::sync::atomic::AtomicUsize,
+    account: std::sync::Arc<LandingAccount>,
+    submitted: std::sync::OnceLock<std::time::Instant>,
+    began: std::sync::OnceLock<std::time::Instant>,
+    worked: std::sync::atomic::AtomicU64,
+}
+
+impl PipelinedState {
+    fn tensor_done(&self) {
+        if self.remaining.fetch_sub(1, std::sync::atomic::Ordering::AcqRel) != 1 {
+            return;
+        }
+        let ok = !self.failed.load(std::sync::atomic::Ordering::Acquire)
+            && !self.cancelled.load(std::sync::atomic::Ordering::Acquire);
+        let grant = self.grant.lock().expect("a pipelined landing's grant").take();
+        if !ok {
+            drop(grant);
+            self.ended.set(false);
+            return;
+        }
+        let (waited, hastened_at) = self.urgency.waited_since();
+        let terms = match waited {
+            true => &self.account.demand,
+            false => &self.account.hinted,
+        };
+        if let (Some(&submitted), Some(&began)) = (self.submitted.get(), self.began.get()) {
+            let submitted = hastened_at.map_or(submitted, |at| submitted.max(at));
+            LandingAccount::add(&terms.queued, began.saturating_duration_since(submitted));
+            LandingAccount::add(&terms.converting, began.elapsed());
+        }
+        terms.worked.fetch_add(self.worked.load(std::sync::atomic::Ordering::Relaxed), std::sync::atomic::Ordering::Relaxed);
+        terms.landings.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        if let Some(grant) = grant {
+            grant.map();
+        }
+        self.ended.set(true);
+        if let Some(then) = self.then.lock().expect("a pipelined landing's end").take() {
+            then();
+        }
+    }
+}
+
+impl Drop for PipelinedState {
+    fn drop(&mut self) {
+        if self.ended.get().is_none() {
+            self.ended.set(false);
+        }
+    }
+}
+
+/// Handle coordinating per-tensor pipelined conversion of one expert's
+/// `tensor_count` routed tensors.
+#[derive(Clone)]
+pub(in crate::experts) struct PipelinedLanding {
+    state: std::sync::Arc<PipelinedState>,
+}
+
+impl PipelinedLanding {
+    pub fn new(
+        grant: Grant,
+        tensor_count: usize,
+        urgency: std::sync::Arc<Urgency>,
+        account: std::sync::Arc<LandingAccount>,
+        ended: Ended,
+        then: impl FnOnce() + Send + 'static,
+    ) -> Self {
+        let state = std::sync::Arc::new(PipelinedState {
+            grant: std::sync::Mutex::new(Some(grant)),
+            ended,
+            then: std::sync::Mutex::new(Some(Box::new(then))),
+            urgency,
+            cancelled: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            failed: std::sync::atomic::AtomicBool::new(false),
+            remaining: std::sync::atomic::AtomicUsize::new(tensor_count),
+            account,
+            submitted: std::sync::OnceLock::new(),
+            began: std::sync::OnceLock::new(),
+            worked: std::sync::atomic::AtomicU64::new(0),
+        });
+        if tensor_count == 0 {
+            if let Some(grant) = state.grant.lock().expect("a pipelined landing's grant").take() {
+                grant.map();
+            }
+            state.ended.set(true);
+            if let Some(then) = state.then.lock().expect("a pipelined landing's end").take() {
+                then();
+            }
+        }
+        Self { state }
+    }
+
+    /// Submit one completed tensor's conversion job to `compute`.
+    ///
+    /// # Safety
+    ///
+    /// `tensor`'s staging record has finished reading and will not be reused
+    /// until `ended` is set, and no device work reads or writes `tensor.tier`.
+    pub unsafe fn submit_tensor(&self, tensor: LandingTensor, compute: &super::compute::Compute) {
+        if self.state.failed.load(std::sync::atomic::Ordering::Acquire)
+            || self.state.cancelled.load(std::sync::atomic::Ordering::Acquire)
+        {
+            self.state.tensor_done();
+            return;
+        }
+        self.state.submitted.get_or_init(std::time::Instant::now);
+        let pieces = tensor.tier.pieces(tensor.bytes);
+        let job = std::sync::Arc::new(TensorConverting {
+            state: self.state.clone(),
+            tensor,
+            pieces,
+            ended: std::sync::atomic::AtomicBool::new(false),
+        });
+        compute.submit(job);
+    }
+
+    /// Record that one tensor's read failed: cancels any sibling conversions
+    /// and accounts this tensor without submitting a job.
+    pub fn fail_tensor(&self) {
+        self.state.failed.store(true, std::sync::atomic::Ordering::Release);
+        self.state.cancelled.store(true, std::sync::atomic::Ordering::Release);
+        self.state.tensor_done();
+    }
+}
+
+/// One routed tensor's conversion job submitted as soon as its NVMe read ends.
+struct TensorConverting {
+    state: std::sync::Arc<PipelinedState>,
+    tensor: LandingTensor,
+    pieces: Vec<(std::ops::Range<usize>, std::ops::Range<usize>)>,
+    ended: std::sync::atomic::AtomicBool,
+}
+
+// SAFETY: each piece reads `self.tensor.staging` and writes its own disjoint
+// range of `self.tensor.tier`.
+unsafe impl Sync for TensorConverting {}
+
+impl Drop for TensorConverting {
+    fn drop(&mut self) {
+        if !self.ended.swap(true, std::sync::atomic::Ordering::AcqRel) {
+            self.state.cancelled.store(true, std::sync::atomic::Ordering::Release);
+            self.state.tensor_done();
+        }
+    }
+}
+
+impl super::compute::Job for TensorConverting {
+    fn pieces(&self) -> usize {
+        self.pieces.len()
+    }
+
+    fn piece(&self, index: usize) {
+        if self.state.cancelled.load(std::sync::atomic::Ordering::Acquire) {
+            return;
+        }
+        let started = std::time::Instant::now();
+        self.state.began.get_or_init(|| started);
+        let held = self.tensor.staging.hold(self.tensor.staged);
+        // SAFETY: `PipelinedLanding::submit_tensor`'s contract.
+        unsafe { self.tensor.tier.convert(held.as_slice_at(self.tensor.lead, self.tensor.bytes), self.pieces[index].clone()) };
+        LandingAccount::add(&self.state.worked, started.elapsed());
+    }
+
+    fn end(&self) {
+        if !self.ended.swap(true, std::sync::atomic::Ordering::AcqRel) {
+            self.state.tensor_done();
+        }
+    }
+
+    fn want(&self) -> seismic_io::Want {
+        self.state.urgency.get()
+    }
+
+    fn priority_key(&self) -> u64 {
+        self.state.urgency.key()
     }
 }
 
@@ -738,7 +941,10 @@ mod tests {
         let ended = Ended::new(&events);
         let then_ran = Arc::new(AtomicBool::new(false));
         let then_flag = then_ran.clone();
-        let landing = Landing { tensors: vec![(staging, 0, 16, landed_record)], grant };
+        let landing = Landing {
+            tensors: vec![LandingTensor { staging, staged: 0, lead: 0, bytes: 16, tier: landed_record }],
+            grant,
+        };
         let converting = unsafe {
             Converting::new(
                 landing,
@@ -774,5 +980,141 @@ mod tests {
         assert_eq!(ended.get(), Some(true));
         assert!(then_ran, "then callback runs when uncancelled");
         assert_eq!(mapped, 0, "tier record mapped when uncancelled");
+    }
+
+    /// `PipelinedLanding` converts each tensor (`gate`, `up`, `down`) as it
+    /// arrives from NVMe at its `lead` byte offset, keeps the expert unmapped
+    /// until all 3 tensors finish converting, and leaves it unmapped if any
+    /// tensor fails after an earlier tensor already converted.
+    #[test]
+    fn pipelined_landing_converts_per_tensor_with_lead_and_exact_completion() {
+        use crate::experts::compute::{ComputeThreads, HostCompute};
+
+        let device = crate::test_support::open_backend(&seismic::Devices::discover(&[]).unwrap(), BackendName::Cpu).unwrap();
+        let charges = seismic::Charges::tally(&device);
+        let compute = HostCompute::start(Vec::new(), &ComputeThreads::placeable(2)).unwrap();
+        let handle = compute.handle();
+
+        // 3 tensors with non-zero lead offsets (simulating AlignedRange staging).
+        let leads = [32usize, 64usize, 96usize];
+        let payload = 64u64;
+        let slot_bytes = 256u64;
+        let mut staging_recs = Vec::new();
+        let mut tier_tensors = Vec::new();
+        let mut expected = Vec::new();
+        for (t, &lead) in leads.iter().enumerate() {
+            let st = Tensor::shared(&charges, Element::i32(), &[1, slot_bytes / 4]).unwrap();
+            let data: Vec<u8> = (0..payload as usize).map(|i| ((t * 53 + i + 7) % 251) as u8).collect();
+            unsafe { st.write_shared(lead as u64, &data).unwrap() };
+            staging_recs.push(Records::rows(&st, slot_bytes, 1).unwrap());
+
+            let tt = Tensor::shared(&charges, Element::i32(), &[1, payload / 4]).unwrap();
+            let tr = Records::rows(&tt, payload, 1).unwrap();
+            tier_tensors.push((tt, TierTensor::new(tr, Element::i32(), Element::i32(), [1, payload / 4], payload).unwrap()));
+            expected.push(data);
+        }
+
+        let map_words = Words::on_cpu(&device, 2, -1);
+        let mut host = HostRecords::new(
+            1,
+            1,
+            vec![(0, 2, Some(LandingMap::Tier(map_words.clone())))],
+            Resolution::AfterStore,
+            (0, 0),
+            Arc::new(InboundTable::new(&[2])),
+        );
+        let crate::experts::host_records::Claim::Taken(grant) = host.claim((0, 0), 0, Taking::Out, (|_, _| (), |_, _| true)) else {
+            panic!("claim ready tier record");
+        };
+
+        let events = Arc::new(Events::default());
+        let ended = Ended::new(&events);
+        let then_ran = Arc::new(AtomicBool::new(false));
+        let then_flag = then_ran.clone();
+        let pipelined = PipelinedLanding::new(
+            grant,
+            3,
+            Urgency::waited(),
+            Arc::new(LandingAccount::default()),
+            ended.clone(),
+            move || {
+                then_flag.store(true, Ordering::Release);
+            },
+        );
+
+        // Submit tensors 0 and 1 first: expert must NOT be mapped yet!
+        for t in 0..2 {
+            let lt = LandingTensor {
+                staging: staging_recs[t].clone(),
+                staged: 0,
+                lead: leads[t],
+                bytes: payload,
+                tier: tier_tensors[t].1.landed(0),
+            };
+            unsafe { pipelined.submit_tensor(lt, &handle) };
+        }
+        std::thread::sleep(std::time::Duration::from_millis(10));
+        assert_eq!(ended.get(), None, "must not end until 3rd tensor completes");
+        assert_eq!(map_words.load(0), -1, "must not map until 3rd tensor completes");
+        assert!(!then_ran.load(Ordering::Acquire));
+
+        // Submit tensor 2: now all 3 complete, mapping the expert with exact byte parity.
+        let lt2 = LandingTensor {
+            staging: staging_recs[2].clone(),
+            staged: 0,
+            lead: leads[2],
+            bytes: payload,
+            tier: tier_tensors[2].1.landed(0),
+        };
+        unsafe { pipelined.submit_tensor(lt2, &handle) };
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while ended.get().is_none() && std::time::Instant::now() < deadline {
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        assert_eq!(ended.get(), Some(true));
+        assert!(then_ran.load(Ordering::Acquire));
+        assert_eq!(map_words.load(0), 0);
+        for t in 0..3 {
+            let mut got = vec![0u8; payload as usize];
+            unsafe { tier_tensors[t].0.read_shared(0, &mut got).unwrap() };
+            assert_eq!(got, expected[t], "tensor {t} converted bytes must match source at lead {}", leads[t]);
+        }
+
+        // Failure case: tensor 0 converts, tensor 1 fails -> expert must NOT be mapped.
+        let map_fail = Words::on_cpu(&device, 2, -1);
+        let mut host_fail = HostRecords::new(
+            1,
+            1,
+            vec![(0, 2, Some(LandingMap::Tier(map_fail.clone())))],
+            Resolution::AfterStore,
+            (0, 0),
+            Arc::new(InboundTable::new(&[2])),
+        );
+        let crate::experts::host_records::Claim::Taken(grant_fail) = host_fail.claim((0, 0), 0, Taking::Out, (|_, _| (), |_, _| true)) else {
+            panic!("claim ready tier record");
+        };
+        let ended_fail = Ended::new(&events);
+        let pipe_fail = PipelinedLanding::new(
+            grant_fail,
+            2,
+            Urgency::waited(),
+            Arc::new(LandingAccount::default()),
+            ended_fail.clone(),
+            || panic!("then must not run on failed pipelined landing"),
+        );
+        let lt0 = LandingTensor {
+            staging: staging_recs[0].clone(),
+            staged: 0,
+            lead: leads[0],
+            bytes: payload,
+            tier: tier_tensors[0].1.landed(0),
+        };
+        unsafe { pipe_fail.submit_tensor(lt0, &handle) };
+        pipe_fail.fail_tensor();
+        while ended_fail.get().is_none() && std::time::Instant::now() < deadline {
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        assert_eq!(ended_fail.get(), Some(false));
+        assert_eq!(map_fail.load(0), -1, "failed pipelined landing must leave tier record unmapped");
     }
 }

@@ -1336,10 +1336,10 @@ fn a_link_holds_at_most_its_due_depth_in_flight() {
     assert_eq!(other, (Volume(0), 0), "2 + 2 passes the due depth; 2 + 1 would not, but waits");
     assert!(taken(&mut queue).is_none());
     assert!(urgent_state.started.get().is_some(), "its first piece was taken");
-    assert!(queue.ended(urgent_first.returned(Instant::now(), true)), "a piece was held back");
+    assert!(queue.ended(urgent_first.returned(Instant::now(), true)).0, "a piece was held back");
     assert_eq!(taken(&mut queue).map(|taken| taken.0), Some((Volume(1), 2)));
     assert_eq!(taken(&mut queue).map(|taken| taken.0), Some((Volume(1), 8)), "2 + 1 is within the due depth");
-    assert!(!queue.ended(other_piece.returned(Instant::now(), true)));
+    assert!(!queue.ended(other_piece.returned(Instant::now(), true)).0);
     // A piece wider than the depth is read alone.
     queue.push(queued_on(&VolumeReads { id: Volume(2), ..narrow }, &[(0, 5)]), Want::now());
     assert_eq!(taken(&mut queue).map(|taken| taken.0), Some((Volume(2), 0)));

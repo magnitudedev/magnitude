@@ -384,6 +384,22 @@ pub(crate) fn refuses_direct(_error: &io::Error) -> bool {
     false
 }
 
+/// Whether a direct read straight into a caller-provided sink was rejected
+/// because the sink's mapping cannot be pinned by direct I/O (such as a Vulkan
+/// `vkMapMemory` `VM_IO`/`VM_PFNMAP` region, where Linux `O_DIRECT`
+/// `get_user_pages` returns `EFAULT`). Bouncing through the worker's regular
+/// aligned host scratch buffer keeps `O_DIRECT` active while landing the bytes
+/// with a normal CPU copy.
+#[cfg(unix)]
+pub(crate) fn refuses_direct_sink(error: &io::Error) -> bool {
+    error.raw_os_error() == Some(libc::EFAULT)
+}
+
+#[cfg(not(unix))]
+pub(crate) fn refuses_direct_sink(_error: &io::Error) -> bool {
+    false
+}
+
 /// Drops the file cache's pages of `start..end`, or the error that kept
 /// them: pages left cached would be served from memory the reads were meant
 /// not to fill.
@@ -442,4 +458,17 @@ pub(crate) fn drop_pages(file: &File, start: u64, end: u64) -> io::Result<()> {
 #[cfg(not(any(target_os = "linux", target_os = "macos")))]
 pub(crate) fn drop_pages(_file: &File, _start: u64, _end: u64) -> io::Result<()> {
     Ok(())
+}
+
+#[cfg(all(test, unix))]
+mod tests {
+    use super::refuses_direct_sink;
+    use std::io;
+
+    #[test]
+    fn refuses_direct_sink_matches_only_efault() {
+        assert!(refuses_direct_sink(&io::Error::from_raw_os_error(libc::EFAULT)));
+        assert!(!refuses_direct_sink(&io::Error::from_raw_os_error(libc::EINVAL)));
+        assert!(!refuses_direct_sink(&io::Error::from_raw_os_error(libc::EIO)));
+    }
 }

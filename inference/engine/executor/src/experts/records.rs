@@ -512,6 +512,47 @@ impl BankRecords {
         free + releasing
     }
 
+    /// Number of usable non-borrowed `Record::DemandLanding` slots currently
+    /// in flight in `group`. These slots return to `Record::Free` once the
+    /// current layer's `DecodeBack` retires (unless promoted in place), so
+    /// `replenish_demand_free` counts them as existing transient supply and
+    /// never over-evicts hot `Record::Held` experts while a layer is in flight.
+    pub fn demand_landing_usable_count(&self, group: usize, lending: bool) -> usize {
+        self.groups[group]
+            .contents
+            .iter()
+            .enumerate()
+            .filter(|&(record, content)| {
+                matches!(content, Record::DemandLanding { borrowed_stage: false, .. })
+                    && self.usable_when(group, record, lending)
+            })
+            .count()
+    }
+
+    /// The `StampedMap` `FROM` step currently stored for `(layer, expert)`
+    /// (`0` when the bank has no device maps).
+    pub fn map_from(&self, layer: usize, expert: usize) -> Step {
+        self.maps().map_or(0, |maps| maps[layer].view().from(expert))
+    }
+
+    /// Immediately reclaim an already-served `Record::Held` slot in `group`
+    /// (zero D2H write-back, caller verified `steps.served(from, until, v_layer, progress)`
+    /// and `can_reuse(record)`) directly into `Record::DemandLanding { staged, borrowed_stage: false }`.
+    pub fn reclaim_held_for_demand(
+        &mut self,
+        group: usize,
+        record: usize,
+        staged: Option<Staged>,
+        until: UnmapStep,
+        exit: &Exit,
+    ) -> Staged {
+        assert!(self.usable(group, record), "reclaim_held_for_demand of unusable record {record}");
+        assert_eq!(exit.back(), None, "reclaim_held_for_demand requires zero D2H write-back");
+        let victim = self.unhold(group, record, until, exit);
+        self.set(group, record, Record::DemandLanding { staged, borrowed_stage: false });
+        victim
+    }
+
     /// Decode's capacity in group `group`: the records the bank holds
     /// storage for, less the dedicated DMA staging ring and (only while a
     /// prompt group holds its lease) the lent scratch records. During decode

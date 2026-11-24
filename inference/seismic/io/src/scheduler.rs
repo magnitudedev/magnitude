@@ -145,7 +145,7 @@ impl Want {
         Self::new(Deadline::None, value)
     }
 
-    fn new(deadline: Deadline, value: f64) -> Self {
+    pub fn new(deadline: Deadline, value: f64) -> Self {
         assert!(value.is_finite() && value >= 0., "a want's value is a probability of use, {value}");
         Self { deadline, value }
     }
@@ -253,6 +253,38 @@ impl AlignedRange {
             lead,
             payload: length,
         }
+    }
+
+    /// Checked aligned read extent into `into` starting at or after `at`:
+    /// advances `at` by `align_pad` so `(base + range.at)` is
+    /// [`crate::ALIGNMENT`]-aligned, widens `[offset, offset + length)` to
+    /// [`crate::ALIGNMENT`] boundaries clamped to `file_size` (never inventing
+    /// payload bytes past EOF), and verifies `range.at + range.length` fits
+    /// strictly inside `into`'s region (no neighbor overwrite).
+    ///
+    /// Returns `None` if `length == 0`, `[offset, offset + length)` extends
+    /// past `file_size`, or the destination lacks alignment headroom, allowing
+    /// the caller to fall back cleanly to an unaligned `Range`.
+    pub fn into_aligned(
+        offset: u64,
+        length: usize,
+        file_size: u64,
+        into: Arc<dyn Destination>,
+        at: usize,
+    ) -> Option<Self> {
+        if length == 0 || offset.checked_add(length as u64).is_none_or(|end| end > file_size) {
+            return None;
+        }
+        let (base, dest_len) = into.region();
+        let align = crate::ALIGNMENT as usize;
+        let start_addr = (base.as_ptr() as usize).checked_add(at)?;
+        let align_pad = (align - (start_addr % align)) % align;
+        let aligned_at = at.checked_add(align_pad)?;
+        let aligned = Self::new(offset, length, file_size, into, aligned_at);
+        if aligned.range.length == 0 || aligned_at.checked_add(aligned.range.length).is_none_or(|end| end > dest_len) {
+            return None;
+        }
+        Some(aligned)
     }
 
     /// The requested payload slice inside the destination's byte slice once
