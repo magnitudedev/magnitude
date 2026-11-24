@@ -8,7 +8,7 @@
 
 <h1 align="center">Magnitude</h1>
 
-<p align="center"><strong>Run open models as fast as your hardware allows</strong></p>
+<p align="center"><strong>Run powerful open models on the hardware you already own</strong></p>
 
 <p align="center">
   <a href="https://magnitude.dev/download"><img src="https://img.shields.io/badge/-Download-gray?style=flat-square&labelColor=0369a1&logo=data%3Aimage%2Fsvg%2Bxml%3Bbase64%2CPHN2ZyB4bWxucz0iaHR0cDovL3d3dy53My5vcmcvMjAwMC9zdmciIHZpZXdCb3g9IjAgMCAyNCAyNCIgZmlsbD0ibm9uZSIgc3Ryb2tlPSIjZmZmZmZmIiBzdHJva2Utd2lkdGg9IjIuMjUiIHN0cm9rZS1saW5lY2FwPSJyb3VuZCIgc3Ryb2tlLWxpbmVqb2luPSJyb3VuZCI%2BPHBhdGggZD0iTTEyIDN2MTIiLz48cGF0aCBkPSJtNyAxMCA1IDUgNS01Ii8%2BPHBhdGggZD0iTTQgMTd2MmEyIDIgMCAwIDAgMiAyaDEyYTIgMiAwIDAgMCAyLTJ2LTIiLz48L3N2Zz4%3D" alt="Download Magnitude"></a>
@@ -18,80 +18,72 @@
   <a href="https://github.com/magnitudedev/magnitude/stargazers"><img src="https://img.shields.io/github/stars/magnitudedev/magnitude" alt="GitHub Repo stars"></a>
 </p>
 
-Magnitude is an open source inference engine that tunes its kernels on your hardware to find the fastest way to run each model. It's over 2x faster than Ollama and works on Apple Silicon, NVIDIA, AMD, Intel, or just a CPU. One click connects it to the agent you already use (Pi, OpenCode, Hermes, Codex, and more).
+Magnitude is an open source inference engine that spreads models across your GPU, RAM, and SSD so they run on everyday Macs and PCs. It works on Apple Silicon, NVIDIA, AMD, Intel, or just a CPU. One click connects it to the agent you already use (Pi, OpenCode, Hermes, Codex, and more).
 
 ⭐ Help us reach more developers and grow the Magnitude community. Star this repo!
 
 ## Get started
 
-Magnitude comes with a desktop app and a CLI. Install from your terminal:
-
-macOS / Linux:
-
-```sh
-curl -fsSL https://magnitude.dev/install.sh | sh
-```
-
-Windows PowerShell:
-
-```powershell
-irm https://magnitude.dev/install.ps1 | iex
-```
-
-Or download the installer:
+Download the installer:
 
 - **macOS:** [Apple silicon](https://magnitude.dev/api/installer?os=darwin&arch=arm64&package=dmg) · [Intel](https://magnitude.dev/api/installer?os=darwin&arch=x64&package=dmg)
 - **Windows:** [x64](https://magnitude.dev/api/installer?os=windows&arch=x64&package=windows-exe)
 - **Linux x64:** [.deb](https://magnitude.dev/api/installer?os=linux&arch=x64&package=deb) · [.rpm](https://magnitude.dev/api/installer?os=linux&arch=x64&package=rpm) · [.pkg.tar.zst](https://magnitude.dev/api/installer?os=linux&arch=x64&package=pacman)
 - **Linux ARM64:** [.deb](https://magnitude.dev/api/installer?os=linux&arch=arm64&package=deb) · [.rpm](https://magnitude.dev/api/installer?os=linux&arch=arm64&package=rpm)
 
-To run Magnitude as a service other computers can use, see [Remote server](https://docs.magnitude.dev/remote-server). To run it in a container, see [Docker](https://docs.magnitude.dev/installation/docker).
+Setting up a server? Install the CLI only:
+
+```sh
+curl -fsSL https://magnitude.dev/install.sh | sh     # macOS / Linux
+irm https://magnitude.dev/install.ps1 | iex          # Windows PowerShell
+```
+
+For more info, see [CLI only](https://docs.magnitude.dev/installation/cli-only). For Docker container installs, see [Docker](https://docs.magnitude.dev/installation/docker).
 
 ## Why Magnitude?
 
-- **2x faster than Ollama:** on average across popular local models, on Mac and NVIDIA
-- **Tuned on your hardware:** kernels are tuned for each model when you download it
-- **Best drafter built in:** each model ships with the fastest speculative decoding drafter
-- **Memory that flexes:** quantized KV halves memory per agent, freed when agents stop
-- **Fast concurrent sessions:** sessions share prefix caches to prevent slowdown
-- **Works with your agent:** one click to connect Pi, OpenCode, Hermes, Codex, and more
+- **Use your whole machine:** streams experts from RAM and SSD, not just your GPU
+- **Tuned to your chip:** optimizes kernels per model, over 2x faster than Ollama
+- **Works out of the box:** configures itself for your machine, no flags or manual tuning
+- **Built for concurrent agents:** flexing KV memory and shared prefix caches
+- **Works with your agent:** one click connects Pi, OpenCode, Hermes, Codex, and more
 - **Free, private, open source:** no token costs, nothing leaves your machine, Apache 2.0
 
-## Over 2x faster than Ollama
+## How it runs on everyday hardware
 
 <picture>
-  <source media="(prefers-color-scheme: dark)" srcset="assets/benchmarks/ollama-dark.svg">
-  <img alt="Magnitude vs Ollama, average of 11 popular local models: 1.32x faster prefill and 2.19x faster decode on Mac, 1.34x faster prefill and 2.17x faster decode on NVIDIA" src="assets/benchmarks/ollama-light.svg" width="800">
+  <source media="(prefers-color-scheme: dark)" srcset="assets/benchmarks/machines-dark.svg">
+  <img alt="Decode speed of Qwen 3.8 Flash Next and DeepSeek V4.1 Flash across Mac mini M2 Pro, MacBook Pro M5 Pro, RTX 3090, and RTX 5090" src="assets/benchmarks/machines-light.svg" width="800">
 </picture>
 
 [View full benchmarks →](https://magnitude.dev/benchmarks)
 
 ## FAQ
 
-### What is Magnitude?
+### How does it run models bigger than my memory?
 
-An open source inference engine that optimizes each model for your exact hardware. It ships as a desktop app that runs open models and connects them to the agent you already use.
+Most large open models today are ultra sparse MoEs: they are split into hundreds of small parts called experts, and only ~5% activate for each token. Magnitude spreads the model into tiers (GPU VRAM holds the shared layers and most used experts, system RAM holds the next tier of frequently used experts, and your NVMe SSD holds the rest). On every token, Magnitude predicts and prefetches upcoming experts up from SSD to RAM to VRAM before the GPU needs them.
 
-### How is it faster than llama.cpp, Ollama, or LM Studio?
+### Why is it faster than other local engines?
 
-They ship one-size-fits-all kernels, because tuning each model for each chip by hand would take forever. Magnitude tunes them automatically. When you download a model, it spends up to a minute on your actual chip trying different ways to split up the math (how many GPU threads team up, how big a chunk each one takes, how far ahead to load data) and keeps the fastest combination that doesn't change the model's output. [See the full benchmarks against Ollama.](https://magnitude.dev/benchmarks)
+Other engines ship one-size-fits-all kernels, because tuning each model for each chip by hand would take forever. Magnitude tunes kernels automatically on your actual chip when you download a model, pairs each model with its best speculative decoding drafter, and predicts and prefetches streamed experts off RAM and SSD ahead of time. [See the full benchmarks against Ollama.](https://magnitude.dev/benchmarks#ollama)
 
 ### What hardware do I need?
 
-Any Apple Silicon, NVIDIA, AMD, or Intel GPU, or nothing but a CPU. There is no fixed minimum. Smaller machines run smaller models, and more memory lets you run larger ones.
+Any Apple Silicon, NVIDIA, AMD, or Intel GPU, or nothing but a CPU, on macOS, Linux, or Windows (desktop app, headless CLI, or Docker). VRAM needs to fit at least the active experts for a model; beyond that, the more experts you can cache in VRAM and RAM the faster it runs, and a faster NVMe SSD (like PCIe 5.0) speeds up anything that spills to disk. Magnitude profiles your machine and recommends the best models before you download anything.
 
-### What operating systems does it support?
+### Which models can I run?
 
-macOS, Linux, and Windows.
-
-### Which models does it support?
-
-See the full list at [magnitude.dev/models](https://magnitude.dev/models). We write optimized kernels for the most popular open-weight families, which is how we beat generalist engines.
+Any GGUF model from Hugging Face in a supported family, including fine-tunes and other people's quants. We write optimized kernels for each of the most popular open-weight families, including sparse MoE models that stream from RAM and SSD. See the families and the models we recommend at [magnitude.dev/models](https://magnitude.dev/models).
 
 ### Which agents work with it?
 
 One click connects Pi, OpenCode, Hermes, OpenClaw, Codex, Claude Code, Oh My Pi, and Cline. Anything else works through the OpenAI-compatible API.
 
-### Is it private?
+### Will streaming wear out my SSD or slow down my computer?
 
-Yes. Prompts, files, and models stay on your machine. No internet needed once a model is downloaded.
+No. Streaming model weights from your SSD is strictly read-only, so it causes zero flash wear. Magnitude also uses direct uncached reads instead of OS disk swap, and dynamically shrinks KV memory when sessions go idle so your computer stays responsive.
+
+### Is it free and private?
+
+Yes. Magnitude is 100% free and open source under Apache 2.0. Prompts, files, and models stay on your machine, with no token costs, API keys, or internet connection needed once a model is downloaded.

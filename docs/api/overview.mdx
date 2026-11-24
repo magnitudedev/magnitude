@@ -3,9 +3,9 @@ title: "Overview"
 description: "Base URLs, keys, and model IDs for the local inference API."
 ---
 
-Magnitude serves an HTTP API on port `10100` while Desktop or `magnitude serve` is running. **Connections** uses it to configure supported agents. Any other OpenAI-compatible or Anthropic-compatible client can use it directly.
+Magnitude serves an HTTP API on port `10100` while Desktop or `magnitude serve` is running. **Connections** and `magnitude connections connect` use it to configure supported agents. Any other OpenAI-compatible or Anthropic-compatible client can use it directly.
 
-To run models on another machine, see [Remote server](/remote-server).
+To run models on another machine, install the [CLI only](/installation/cli-only) there and turn on [network access](/api/network-access).
 
 ## Base URLs
 
@@ -37,6 +37,6 @@ Use the exact `id` from the response as the model name in requests. Display name
 
 ## Scope
 
-The API provides inference only: listing models and generating text. Downloading models, managing them, and the Magnitude app itself are not available over the API.
+The API provides inference only: listing models and generating text. To download and manage models, use the Magnitude app, which is served on the same port, or the CLI.
 
-Opening `http://127.0.0.1:10100` in a browser shows a short text summary of these paths.
+Opening `http://127.0.0.1:10100` in a browser opens the Magnitude app; `http://127.0.0.1:10100/inference` shows a short text summary of these paths.

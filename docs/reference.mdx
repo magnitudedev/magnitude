@@ -3,7 +3,7 @@ title: "CLI reference"
 description: "Run Magnitude, manage models, and install updates from your terminal."
 ---
 
-The Magnitude installation includes the `magnitude` CLI. In a new terminal, run:
+The desktop app includes the `magnitude` CLI, and the CLI-only install provides it alone for servers and headless use (see [CLI only](/installation/cli-only)). In a new terminal, run:
 
 ```sh
 magnitude --help
@@ -15,13 +15,13 @@ Running `magnitude` without a subcommand prints help. No npm installation is req
 
 | Command | Purpose |
 | --- | --- |
-| `magnitude app open` | Show the desktop window. |
+| `magnitude app open` | Show the desktop window, or with the CLI only, open the app in a browser. |
 | `magnitude serve` | Run the service in the foreground without opening Desktop. |
 | `magnitude status` | Check whether Magnitude is running and inspect service and model status. |
 
 Model, hardware, and connection setup commands require a running Desktop or `magnitude serve`.
-Stop a foreground server with Ctrl+C. Opening Desktop takes over from a foreground server.
-Only one Desktop or `serve` instance can run under the same user account. Fully quit Desktop or stop the existing `serve` command before starting another server. See [Remote server](/remote-server) for setup.
+Stop a foreground server with Ctrl+C. While Desktop is open it serves, and `serve` waits until Desktop quits, then resumes.
+Only one `serve` can run under the same user account. To keep `serve` running in the background, see [CLI only](/installation/cli-only#keep-it-running-in-the-background).
 
 Use **Launch at login** in Desktop Settings for login startup, and **Quit Magnitude** to stop Desktop.
 
@@ -33,7 +33,7 @@ Assessment and downloads run in the background. Use status commands to check pro
 | --- | --- |
 | `hardware` | Inspect detected hardware and memory. |
 | `models list` | List the models on this computer with their quant, size, speed, context, source and status, and assessment progress. `--all` adds models that can't run and hidden ones. |
-| `models recommend` | Show the tested models recommended for this computer, each at the quant chosen for it with its ladder of quants; a limit of 10 by default. |
+| `models recommend` | Show the models recommended for this computer, each at the quant chosen for it with its ladder of quants; a limit of 10 by default. |
 | `models search <query>` | Search Hugging Face, with each result's base model and how its recommended quant runs here. |
 | `models show <model>` | For a model ID, Hugging Face link or `owner/repo[:QUANT]`, show every quant with its size, speed, context and placement, and for the chosen quant where its bytes go and its speed at each context depth. |
 | `models pull <model>` | Download or update a model by ID, or add one from Hugging Face by link or `owner/repo[:QUANT]`. |
@@ -41,9 +41,20 @@ Assessment and downloads run in the background. Use status commands to check pro
 | `models load <model-id>` | Load a downloaded model into memory. |
 | `models stop [model-id]` | Stop a model, or the active one, without deleting it. |
 | `models rm <model-id>` | Remove a model Magnitude downloaded; a model found in another app's folder is hidden instead. |
+| `models drafter <model-id> <drafter>` | Add, change or turn off the drafter of a model that isn't recommended: `auto`, `none`, or a drafter reference. |
+| `models hide <model-id>` / `models unhide <model-id>` | Hide a model found in another app's folder, or show it again; its files are untouched. |
+| `models folders list` | List where Magnitude looks for GGUF files. `add <path>` and `remove <path>` manage your folders; `enable` and `disable` turn an automatic location (`huggingface-cache`, `lm-studio`, `llama-cpp`, `ollama`) on or off. |
 | `models families` | List the model families Magnitude runs. |
 
-Prefix each command with `magnitude`. Use `--country US` with `models recommend` to recommend only models from developers in one country, and `--limit` to show fewer.
+Prefix each command with `magnitude`. Use `--country US` with `models recommend` to recommend only models from developers in one country, and `--limit` to show fewer. `models search` takes `--limit` and `--more` for the next page. `models pull` takes `--drafter` to choose a drafter and `--force` to download a quant that needs more memory than this computer has. Every hardware and model command takes `--json` for machine-readable output.
+
+## Hugging Face
+
+| Command | Purpose |
+| --- | --- |
+| `magnitude hf login` | Sign in with a code you enter on any device, for gated models, private repositories and higher download limits. Works over SSH. |
+| `magnitude hf status` | Show which Hugging Face account Magnitude is signed in to. |
+| `magnitude hf logout` | Sign out and remove the saved sign-in. |
 
 ## Connections
 
@@ -54,7 +65,7 @@ Prefix each command with `magnitude`. Use `--country US` with `models recommend`
 | `magnitude connections sync [harness]` | Refresh one or all configured integrations. |
 | `magnitude connections remove <harness>` | Disconnect an agent. |
 
-`connections connect` accepts `--set-model <model-id>` to select a model and `--install-skill` to install or refresh its Magnitude skill. Skill installation is automatic for Pi.
+`connections connect` accepts `--set-model <model-id>` to select a model and `--install-skill` to install or refresh its Magnitude skill. Connecting from the app's **Connections** always installs the skill.
 
 Harness IDs: `pi`, `opencode`, `hermes`, `openclaw`, `codex`, `claude-code`, `oh-my-pi`, and `cline`. See [Integrations](/integrations/overview) for agent-specific instructions.
 
@@ -68,9 +79,9 @@ Harness IDs: `pi`, `opencode`, `hermes`, `openclaw`, `codex`, `claude-code`, `oh
 | `magnitude update install` | Install a prepared update; stop inference and restart Desktop if it was running. |
 | `magnitude update discard` | Remove a retained update download. |
 
-These commands update Desktop, the server, and CLI together. Checking, downloading, inspecting, or discarding an update does not open Desktop.
+These commands update Desktop and its CLI together, or the CLI-only install. Checking, downloading, inspecting, or discarding an update does not open Desktop.
 
-`update install` refuses to interrupt a running `serve` command. Stop the server first. Installation leaves a stopped server stopped; run `magnitude serve` afterward. A prepared update is also installed at the next startup unless an earlier installation attempt failed. Failed attempts require an explicit `update install` retry. Linux installation may require administrator authorization.
+A CLI-only install updates itself while `magnitude serve` runs: it downloads updates, waits until no inference request is running, then installs and restarts in place. With `autoDownloadUpdates` set to `false`, run `magnitude update install` to install one. Failed attempts require an explicit `update install` retry. Desktop installation on Linux may require administrator authorization.
 
 ## Help
 
