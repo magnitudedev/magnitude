@@ -38,9 +38,10 @@ void routed_land() {
         if (SEISMIC_DIM_SF > 0ul) {
             barrier();
             const uint choices = uint(SEISMIC_DIM_M) * uint(SEISMIC_DIM_K);
-            if (streaming_site_any(SEISMIC_PTR(SEISMIC_BUFFER_SOURCES), SEISMIC_SOURCES_STRIDE_0,
-                    SEISMIC_SOURCES_STRIDE_1, SEISMIC_SOURCES_STRIDE_2, choices)) {
-                const uint64_t slot = streaming_modulo(q, SEISMIC_DIM_SF);
+            const bool has_site = streaming_site_any(SEISMIC_PTR(SEISMIC_BUFFER_SOURCES), SEISMIC_SOURCES_STRIDE_0,
+                SEISMIC_SOURCES_STRIDE_1, SEISMIC_SOURCES_STRIDE_2, choices);
+            const uint64_t slot = streaming_modulo(q, SEISMIC_DIM_SF);
+            if (has_site) {
                 const uint64_t rows = SEISMIC_DIM_M, columns = SEISMIC_DIM_H;
                 for (seismic_walk at = seismic_walk_begin(tid, gl_WorkGroupSize.x, rows * columns,
                             u64vec3(1ul, 1ul, columns));
@@ -51,15 +52,15 @@ void routed_land() {
                         element_at(ACTIVATION_A, SEISMIC_PTR(SEISMIC_BUFFER_NORMALIZED),
                             m * SEISMIC_NORMALIZED_STRIDE_0 + n * SEISMIC_NORMALIZED_STRIDE_1));
                 }
-                streaming_publish_barrier();
-                if (tid == 0u) {
-                    streaming_system_fence();
-                    streaming_site_publish(q, SEISMIC_PTR(SEISMIC_BUFFER_ROUTES), SEISMIC_ROUTES_STRIDE_0,
-                        SEISMIC_ROUTES_STRIDE_1, SEISMIC_PTR(SEISMIC_BUFFER_WEIGHTS), SEISMIC_WEIGHTS_STRIDE_0,
-                        SEISMIC_WEIGHTS_STRIDE_1, SEISMIC_PTR(SEISMIC_BUFFER_SOURCES), SEISMIC_SOURCES_STRIDE_0,
-                        SEISMIC_SOURCES_STRIDE_1, SEISMIC_SOURCES_STRIDE_2, choices,
-                        SEISMIC_PTR(SEISMIC_BUFFER_SITE) + slot * SEISMIC_SITE_STRIDE_0 * 4ul, SEISMIC_SITE_STRIDE_1);
-                }
+            }
+            streaming_publish_barrier();
+            if (has_site && tid == 0u) {
+                streaming_system_fence();
+                streaming_site_publish(q, SEISMIC_PTR(SEISMIC_BUFFER_ROUTES), SEISMIC_ROUTES_STRIDE_0,
+                    SEISMIC_ROUTES_STRIDE_1, SEISMIC_PTR(SEISMIC_BUFFER_WEIGHTS), SEISMIC_WEIGHTS_STRIDE_0,
+                    SEISMIC_WEIGHTS_STRIDE_1, SEISMIC_PTR(SEISMIC_BUFFER_SOURCES), SEISMIC_SOURCES_STRIDE_0,
+                    SEISMIC_SOURCES_STRIDE_1, SEISMIC_SOURCES_STRIDE_2, choices,
+                    SEISMIC_PTR(SEISMIC_BUFFER_SITE) + slot * SEISMIC_SITE_STRIDE_0 * 4ul, SEISMIC_SITE_STRIDE_1);
             }
         }
     }

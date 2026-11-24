@@ -29,8 +29,13 @@ STREAMING_FN bool streaming_site_any(STREAMING_DEVICE_READ sources, u64 sources0
 // `weights`, the f32 weights' words, strides `weights0`, `weights1`), the
 // count, then the request, step `q` (`streaming_request_slot`). A step with
 // no CPU choice requests nothing: its combine waits for nothing.
+#ifndef STREAMING_WEIGHTS_READ
+#define STREAMING_WEIGHTS_READ STREAMING_DEVICE_READ
+#define STREAMING_WEIGHT_WORD(weights, index) streaming_device_load(STREAMING_AT(weights, index))
+#endif
+
 STREAMING_FN void streaming_site_publish(u64 q, STREAMING_DEVICE_READ routes, u64 routes0, u64 routes1,
-    STREAMING_DEVICE_READ weights, u64 weights0, u64 weights1, STREAMING_DEVICE_READ sources, u64 sources0,
+    STREAMING_WEIGHTS_READ weights, u64 weights0, u64 weights1, STREAMING_DEVICE_READ sources, u64 sources0,
     u64 sources1, u64 sources2, u32 choices, STREAMING_SYSTEM_WORDS slot, u64 slot1) {
     const u32 K = u32(SEISMIC_DIM_K);
     int count = 0;
@@ -45,7 +50,7 @@ STREAMING_FN void streaming_site_publish(u64 q, STREAMING_DEVICE_READ routes, u6
         streaming_store(STREAMING_AT(slot, (entry + SEISMIC_CONST_SITE_EXPERT) * slot1),
             streaming_device_load(STREAMING_AT(routes, u64(c / K) * routes0 + u64(c % K) * routes1)));
         streaming_store(STREAMING_AT(slot, (entry + SEISMIC_CONST_SITE_WEIGHT_BITS) * slot1),
-            streaming_device_load(STREAMING_AT(weights, u64(c / K) * weights0 + u64(c % K) * weights1)));
+            STREAMING_WEIGHT_WORD(weights, u64(c / K) * weights0 + u64(c % K) * weights1));
         ++count;
     }
     if (count == 0)

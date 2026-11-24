@@ -193,27 +193,33 @@ bool chunk_active() { return SEISMIC_LANE / CHUNK_LANES < CHUNK_ROWS; }
 // update).
 void chunk_load_version(recurrent_inputs in_, recurrent_slot slot, uint head, uint state_row,
     out float state[CHUNK_MAX_COLUMNS]) {
+    const bool live = chunk_active();
+    const uint part = chunk_part();
+    const uint key = recurrent_key_head(in_, head);
     [[unroll]] for (uint c = 0u; c < CHUNK_COLUMNS; ++c)
         state[c] = 0.0;
-    if (!chunk_active())
-        return;
-    const uint part = chunk_part();
-    const Out source = recurrent_state_row(in_, slot.source, head, state_row);
-    [[unroll]] for (uint c = 0u; c < CHUNK_COLUMNS; ++c)
-        state[c] = out_at(source, uint64_t(part + CHUNK_LANES * c));
-    const uint key = recurrent_key_head(in_, head);
-    for (int entry = 0; entry < slot.taped; ++entry) {
-        const Out tape = recurrent_tape_row(in_, slot.source, entry);
-        const float u = out_at(tape, uint64_t(RECURRENT_TAPE_U + head * RECURRENT_W + state_row));
-        // One decay per value head is loaded once.
-        float factor[CHUNK_MAX_COLUMNS];
+    if (live) {
+        const Out source = recurrent_state_row(in_, slot.source, head, state_row);
         [[unroll]] for (uint c = 0u; c < CHUNK_COLUMNS; ++c)
-            factor[c] = RECURRENT_DECAYS == 1u && c > 0u ? factor[0]
-                : out_at(tape, recurrent_tape_factor(head, part + CHUNK_LANES * c));
-        [[unroll]] for (uint c = 0u; c < CHUNK_COLUMNS; ++c) {
-            const uint column = part + CHUNK_LANES * c;
-            const float k = out_at(tape, uint64_t(RECURRENT_TAPE_K + key * RECURRENT_W + column));
-            state[c] = seismic_fma_rn(u, k, state[c] * factor[c]);
+            state[c] = out_at(source, uint64_t(part + CHUNK_LANES * c));
+    }
+    // Keep the tape replay loop uniform across all lanes so subsequent
+    // subgroup shuffles in `chunk_scan_rows` / `chunk_sequential_rows` do not
+    // follow a lane-varying loop.
+    for (int entry = 0; entry < slot.taped; ++entry) {
+        if (live) {
+            const Out tape = recurrent_tape_row(in_, slot.source, entry);
+            const float u = out_at(tape, uint64_t(RECURRENT_TAPE_U + head * RECURRENT_W + state_row));
+            // One decay per value head is loaded once.
+            float factor[CHUNK_MAX_COLUMNS];
+            [[unroll]] for (uint c = 0u; c < CHUNK_COLUMNS; ++c)
+                factor[c] = RECURRENT_DECAYS == 1u && c > 0u ? factor[0]
+                    : out_at(tape, recurrent_tape_factor(head, part + CHUNK_LANES * c));
+            [[unroll]] for (uint c = 0u; c < CHUNK_COLUMNS; ++c) {
+                const uint column = part + CHUNK_LANES * c;
+                const float k = out_at(tape, uint64_t(RECURRENT_TAPE_K + key * RECURRENT_W + column));
+                state[c] = seismic_fma_rn(u, k, state[c] * factor[c]);
+            }
         }
     }
 }

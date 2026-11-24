@@ -271,6 +271,18 @@ void element_detail_copy_stored(const int kind, uint64_t dst_base, uint64_t dst_
     const uint64_t vec_elems = kind == ELEMENT_F32 ? 4ul : 8ul;
     const uint64_t dst = dst_base + dst_index * elem_bytes;
     const uint64_t src = src_base + src_index * elem_bytes;
+    if (count == vec_elems) {
+        if (((dst | src) & 15ul) == 0ul) {
+            element_uvec4_put(dst, element_uvec4_at(src));
+        } else if (kind == ELEMENT_F32) {
+            [[unroll]] for (uint j = 0u; j < 4u; ++j)
+                element_u32_put(dst + uint64_t(j) * 4ul, element_u32_at(src + uint64_t(j) * 4ul));
+        } else {
+            [[unroll]] for (uint j = 0u; j < 8u; ++j)
+                element_u16_put(dst + uint64_t(j) * 2ul, element_u16_at(src + uint64_t(j) * 2ul));
+        }
+        return;
+    }
     uint64_t i = 0ul;
     if (((dst ^ src) & 15ul) == 0ul && count >= vec_elems) {
         const uint64_t head = ((16ul - (dst & 15ul)) & 15ul) >> (kind == ELEMENT_F32 ? 2ul : 1ul);
@@ -294,6 +306,12 @@ void element_detail_copy_stored(const int kind, uint64_t dst_base, uint64_t dst_
 void out_move_stored(Out to, uint64_t index, Out from, uint64_t from_index, uint64_t count) {
     if (to.seismic_kind == from.seismic_kind) {
         element_detail_copy_stored(to.seismic_kind, to.seismic_base, index, from.seismic_base, from_index, count);
+    } else if (count == 4ul) {
+        [[unroll]] for (uint j = 0u; j < 4u; ++j)
+            out_put(to, index + uint64_t(j), out_at(from, from_index + uint64_t(j)));
+    } else if (count == 8ul) {
+        [[unroll]] for (uint j = 0u; j < 8u; ++j)
+            out_put(to, index + uint64_t(j), out_at(from, from_index + uint64_t(j)));
     } else {
         for (uint64_t i = 0ul; i < count; ++i)
             out_put(to, index + i, out_at(from, from_index + i));
