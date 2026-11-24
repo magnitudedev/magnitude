@@ -663,6 +663,10 @@ pub(in crate::experts) struct Answer {
     /// The load's parks, which an answer settles (a landing launch's park
     /// opens at the slot's answer where parks are submission boundaries).
     pub parks: std::sync::Arc<super::Parks>,
+    /// The load's transport, notified per landed expert so Phase B decode DMA
+    /// streams ready host-tier records over PCIe immediately without waiting
+    /// for slower straggler NVMe reads in the same layer.
+    pub transport: std::sync::Arc<super::transport::ExpertTransport>,
 }
 
 impl Answer {
@@ -680,9 +684,12 @@ impl Answer {
             for &choice in &self.choices {
                 self.file.store(sequence, 0, constants::FILE_ENTRY(choice as u64) + constants::FILE_RECORD, source);
             }
+            let woke_decode = self.transport.publish_decode_file_ready(self.layer, sequence, &self.choices, source);
             let slot = self.pending.fetch_sub(1, std::sync::atomic::Ordering::AcqRel) == 1;
             if slot {
                 self.file.answer(sequence, 0, false);
+            }
+            if slot || woke_decode {
                 self.steps.events().notify();
             }
             seismic_io::timeline::note(seismic_io::timeline::Kind::Noted("answer"), sequence as u64, (self.layer as i64, record.is_some() as i64, slot as i64));

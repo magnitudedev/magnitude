@@ -639,6 +639,7 @@ impl Decode {
             placer,
             steps: shared.steps.clone(),
             parks: shared.parks.clone(),
+            transport: shared.transport.clone(),
         };
         let naming = Naming { layer, sequence, named: started };
         // Each absent expert's landing: the look's read, a read ahead's,

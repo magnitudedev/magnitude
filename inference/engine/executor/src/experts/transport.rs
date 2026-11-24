@@ -465,6 +465,14 @@ impl DecodeDmaGate {
     }
 }
 
+/// One ring slot of incremental Phase B landings for a layer, matching the
+/// layer's `ExchangeTable` flight ring (`sequence % slots`).
+#[derive(Clone, Default)]
+struct FileReadySlot {
+    sequence: u64,
+    ready: Vec<(usize, i32)>,
+}
+
 /// On-demand decode DMA resources owned by [`ExpertTransport`].
 pub(in crate::experts) struct DecodeDmaState {
     pub transfer: Transfer,
@@ -478,9 +486,13 @@ pub(in crate::experts) struct DecodeDmaState {
     /// awaited host-side in Phase B of `land_decode_misses` concurrently with
     /// Phase A PCIe DMA of already-in-RAM misses.
     pub files: Vec<super::ExchangeTable>,
+    /// Per-layer ring of newly landed Phase B `(choice, source)` pairs posted
+    /// by `Answer::publish` as each absent expert finishes NVMe read + host
+    /// conversion, drained incrementally by Phase B of `land_decode_misses`.
+    file_ready: Vec<Mutex<Vec<FileReadySlot>>>,
     /// Shared watcher event channel woken when `Answer::publish` / `decode::fail`
-    /// answers a file slot and notified immediately when `land_decode_misses`
-    /// sees a pending file request.
+    /// answers a file choice or slot and notified immediately when
+    /// `land_decode_misses` sees a pending file request.
     pub events: Arc<super::events::Events>,
 }
 
@@ -497,6 +509,13 @@ impl DecodeDmaState {
         files: Vec<super::ExchangeTable>,
         events: Arc<super::events::Events>,
     ) -> Self {
+        let file_ready = files
+            .iter()
+            .map(|file| {
+                let slots = usize::try_from(file.table().slots()).expect("file table slots fit usize");
+                Mutex::new(vec![FileReadySlot::default(); slots])
+            })
+            .collect();
         Self {
             transfer,
             host_stores,
@@ -510,8 +529,22 @@ impl DecodeDmaState {
                 .map(|(layer, &draft)| DecodeDmaGate::for_layer(layer, draft))
                 .collect(),
             files,
+            file_ready,
             events,
         }
+    }
+
+    fn drain_file_ready(&self, layer: usize, sequence: u64) -> Vec<(usize, i32)> {
+        let Some(layer_slots) = self.file_ready.get(layer) else {
+            return Vec::new();
+        };
+        let mut slots = layer_slots.lock().expect("decode file_ready");
+        let slot_idx = (sequence as usize) % slots.len();
+        let slot = &mut slots[slot_idx];
+        if slot.sequence != sequence || slot.ready.is_empty() {
+            return Vec::new();
+        }
+        std::mem::take(&mut slot.ready)
     }
 }
 
@@ -765,6 +798,41 @@ impl ExpertTransport {
     /// Whether M7 on-demand decode DMA is active on this transport.
     pub(crate) fn has_decode_dma(&self) -> bool {
         self.decode.is_some()
+    }
+
+    /// Record newly landed Phase B choices for `(layer, sequence)` so
+    /// `land_decode_misses` can stream their H2D copies immediately without
+    /// waiting for straggler NVMe reads in the same layer.
+    ///
+    /// Returns `true` when decode DMA is active for this non-draft layer and
+    /// the caller should wake `events` even before the final `FILE_ANSWER`.
+    pub(crate) fn publish_decode_file_ready(
+        &self,
+        layer: usize,
+        sequence: u64,
+        choices: &[usize],
+        source: i32,
+    ) -> bool {
+        let Some(dma) = &self.decode else {
+            return false;
+        };
+        if dma.layer_gates.get(layer).is_some_and(|gate| gate.draft) {
+            return false;
+        }
+        let Some(layer_slots) = dma.file_ready.get(layer) else {
+            return false;
+        };
+        let mut slots = layer_slots.lock().expect("decode file_ready");
+        let slot_idx = (sequence as usize) % slots.len();
+        let slot = &mut slots[slot_idx];
+        if slot.sequence < sequence {
+            slot.sequence = sequence;
+            slot.ready.clear();
+        }
+        if slot.sequence == sequence {
+            slot.ready.extend(choices.iter().map(|&choice| (choice, source)));
+        }
+        true
     }
 
     /// Whether any on-demand decode DMA flight (`land_decode_misses`) is
@@ -1251,14 +1319,15 @@ impl ExpertTransport {
     ///   `claim_slot` and fire ONE batched `cuMemcpyHtoDAsync` (`copy_synced`)
     ///   immediately so PCIe Gen5 DMA runs concurrently with any pending NVMe
     ///   landing + CPU conversion.
-    /// - **Phase B (overlapped with Phase A PCIe DMA):** when `DecodeFront`
-    ///   posted a file request (`file.requested(sequence, 0)`), wake `Requests`
-    ///   immediately and wait on `events` until `file.answered(sequence, 0)`
-    ///   (or serving ends), resolve each absent choice from `FILE_RECORD`
-    ///   (exact mirror of `streaming/tier_wait.hpp`, promoting any CPU-pending
-    ///   `SOURCE_SITE == -2` to GPU DMA since `routed_site_request` already
-    ///   ran in `DecodeFront`), and fire a second batched `cuMemcpyHtoDAsync`
-    ///   on the same FIFO DMA stream for the newly-landed host-tier misses.
+    /// - **Phase B (incremental, overlapped with Phase A PCIe DMA):** when
+    ///   `DecodeFront` posted a file request (`file.requested(sequence, 0)`),
+    ///   wake `Requests` immediately, drain each newly-landed expert published
+    ///   by `Answer::publish` via [`Self::publish_decode_file_ready`] and fire
+    ///   its `cuMemcpyHtoDAsync` on the same FIFO DMA stream immediately while
+    ///   slower NVMe reads in the same layer are still in flight (promoting any
+    ///   CPU-pending `SOURCE_SITE == -2` to GPU DMA since `routed_site_request`
+    ///   already ran in `DecodeFront`), then perform an authoritative final
+    ///   pass once `file.answered(sequence, 0)` (or serving ends).
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn land_decode_misses(
         self: &Arc<Self>,
@@ -1375,10 +1444,11 @@ impl ExpertTransport {
                     to_claim.push(tier_record as u32);
                 }
                 if !to_claim.is_empty() {
-                    if replenish_want > 0 {
+                    let want = if replenished { 0 } else { replenish_want };
+                    if want > 0 {
                         replenished = true;
                     }
-                    let claims = claim_batch(group, &to_claim, replenish_want);
+                    let claims = claim_batch(group, &to_claim, want);
                     for (tier_record_u32, claim) in to_claim.into_iter().zip(claims) {
                         let tier_record = tier_record_u32 as usize;
                         match claim {
@@ -1495,80 +1565,144 @@ impl ExpertTransport {
             }
         }
 
-        // Phase B: overlap host-side `FILE_ANSWER` wait with Phase A PCIe DMA,
-        // then DMA newly-landed NVMe misses on the same FIFO transfer stream.
+        // Phase B: overlap host-side `FILE_ANSWER` wait with Phase A PCIe DMA
+        // and stream newly-landed NVMe misses incrementally over PCIe as each
+        // expert finishes NVMe read + host conversion, instead of stalling all
+        // Phase B H2D copies behind the slowest straggler in the layer.
         let mut total_unique_b = 0usize;
         if file_pending {
             let file = file.expect("file_pending implies layer has a file table");
-            loop {
-                let seen = dma.events.seen();
-                if file.answered(sequence, 0) || is_serving_ended() {
-                    break;
-                }
-                dma.events.wait_at_most(seen, std::time::Duration::from_millis(5));
-            }
-            let answered = matches!(
-                file.answer_of(sequence, 0),
-                Some(super::exchange::Answer::Answered)
-            );
-            let file_count = usize::try_from(
-                file.load(sequence, 0, magnitude_kernels::constants::FILE_COUNT),
-            )
-            .unwrap_or(0)
-            .min(count);
-            let mut phase_b_choices: Vec<(usize, usize)> = Vec::new(); // (choice, tier_record)
-            let mut unique_b: Vec<(usize, usize)> = Vec::new();
-            for choice in 0..file_count {
-                let entry = magnitude_kernels::constants::FILE_ENTRY(choice as u64);
-                let expert = file.load(sequence, 0, entry + magnitude_kernels::constants::FILE_CHOICE);
-                if expert < 0 {
-                    continue;
-                }
-                let source = if answered {
-                    file.load(sequence, 0, entry + magnitude_kernels::constants::FILE_RECORD)
-                } else {
-                    -1
+            let mut handled_choices = vec![false; count];
+            let mut seen_b_tiers: Vec<usize> = Vec::new();
+            {
+                let mut apply_entries = |entries: &[(usize, i32)],
+                                         replenish_want: usize,
+                                         handled_choices: &mut [bool],
+                                         resolved: &mut Vec<(usize, usize)>|
+                 -> Result<(), String> {
+                    let mut batch_choices: Vec<(usize, usize)> = Vec::new(); // (choice, tier_record)
+                    let mut unique_batch: Vec<(usize, usize)> = Vec::new(); // (tier_record, hit_count)
+                    for &(choice, source) in entries {
+                        if choice >= count || handled_choices[choice] {
+                            continue;
+                        }
+                        handled_choices[choice] = true;
+                        if source == -1 {
+                            dma.sources_words.store(choice, -1);
+                            dma.sources_words.store(site_base + choice, -1);
+                        } else if source >= 0 {
+                            dma.sources_words.store(choice, source);
+                            if dma.sources_words.load(site_base + choice) == -2 {
+                                dma.sources_words.store(site_base + choice, -1);
+                            }
+                        } else {
+                            let tier_record = (-2i64 - i64::from(source)) as usize;
+                            if dma.sources_words.load(site_base + choice) == -2 {
+                                // `routed_site_request` already ran in `DecodeFront`
+                                // and skipped `-2`; route this newly-landed expert to
+                                // GPU DMA in Phase B instead.
+                                dma.sources_words.store(site_base + choice, -1);
+                            }
+                            // Store fallback `-2 - tier_record` first so overflow still
+                            // resolves via SM zero-copy in `DecodeBack`.
+                            dma.sources_words.store(choice, source);
+                            batch_choices.push((choice, tier_record));
+                            if !seen_b_tiers.contains(&tier_record) {
+                                seen_b_tiers.push(tier_record);
+                            }
+                            if let Some(entry) =
+                                unique_batch.iter_mut().find(|(tr, _)| *tr == tier_record)
+                            {
+                                entry.1 += 1;
+                            } else {
+                                unique_batch.push((tier_record, 1));
+                            }
+                        }
+                    }
+                    if !unique_batch.is_empty() {
+                        issue_batch(unique_batch, replenish_want, resolved)?;
+                        for &(choice, tier_record) in &batch_choices {
+                            if let Some(&(_, slot)) =
+                                resolved.iter().find(|&&(tr, _)| tr == tier_record)
+                            {
+                                dma.sources_words.store(choice, slot as i32);
+                            }
+                        }
+                    }
+                    Ok(())
                 };
-                if source == -1 {
-                    dma.sources_words.store(choice, -1);
-                    dma.sources_words.store(site_base + choice, -1);
-                } else if source >= 0 {
-                    dma.sources_words.store(choice, source);
-                    if dma.sources_words.load(site_base + choice) == -2 {
-                        dma.sources_words.store(site_base + choice, -1);
+
+                loop {
+                    let seen = dma.events.seen();
+                    let finished = file.answered(sequence, 0) || is_serving_ended();
+                    let ready = dma.drain_file_ready(layer, sequence);
+                    if !ready.is_empty() {
+                        apply_entries(
+                            &ready,
+                            if finished { target_free } else { 0 },
+                            &mut handled_choices,
+                            &mut resolved,
+                        )?;
+                    }
+                    if finished {
+                        break;
+                    }
+                    if ready.is_empty() {
+                        dma.events.wait_at_most(seen, std::time::Duration::from_millis(5));
+                    }
+                }
+
+                // Authoritative final pass once `FILE_ANSWER` lands (or serving ends):
+                // - On `Answer::Answered`, pick up any absent choice not already
+                //   dispatched incrementally (e.g. direct table answers).
+                // - On `Answer::Failed` / serving ended, clear every absent choice's
+                //   `SOURCE_RECORD` and `SOURCE_SITE` to `-1`.
+                let answered = matches!(
+                    file.answer_of(sequence, 0),
+                    Some(super::exchange::Answer::Answered)
+                );
+                let file_count = usize::try_from(
+                    file.load(sequence, 0, magnitude_kernels::constants::FILE_COUNT),
+                )
+                .unwrap_or(0)
+                .min(count);
+                if answered {
+                    let mut remaining: Vec<(usize, i32)> = Vec::new();
+                    for choice in 0..file_count {
+                        if handled_choices[choice] {
+                            continue;
+                        }
+                        let entry = magnitude_kernels::constants::FILE_ENTRY(choice as u64);
+                        let expert =
+                            file.load(sequence, 0, entry + magnitude_kernels::constants::FILE_CHOICE);
+                        if expert < 0 {
+                            continue;
+                        }
+                        let source =
+                            file.load(sequence, 0, entry + magnitude_kernels::constants::FILE_RECORD);
+                        remaining.push((choice, source));
+                    }
+                    if !remaining.is_empty() {
+                        apply_entries(&remaining, target_free, &mut handled_choices, &mut resolved)?;
                     }
                 } else {
-                    let tier_record = (-2i64 - i64::from(source)) as usize;
-                    if dma.sources_words.load(site_base + choice) == -2 {
-                        // `routed_site_request` already ran in `DecodeFront`
-                        // and skipped `-2`; route this newly-landed expert to
-                        // GPU DMA in Phase B instead.
+                    for choice in 0..file_count {
+                        let entry = magnitude_kernels::constants::FILE_ENTRY(choice as u64);
+                        let expert =
+                            file.load(sequence, 0, entry + magnitude_kernels::constants::FILE_CHOICE);
+                        if expert < 0 {
+                            continue;
+                        }
+                        dma.sources_words.store(choice, -1);
                         dma.sources_words.store(site_base + choice, -1);
                     }
-                    // Store fallback `-2 - tier_record` first so overflow still
-                    // resolves via SM zero-copy in `DecodeBack`.
-                    dma.sources_words.store(choice, source);
-                    phase_b_choices.push((choice, tier_record));
-                    if let Some(entry) = unique_b.iter_mut().find(|(tr, _)| *tr == tier_record) {
-                        entry.1 += 1;
-                    } else {
-                        unique_b.push((tier_record, 1));
-                    }
                 }
             }
-            total_unique_b = unique_b.len();
-            if !unique_b.is_empty() {
-                issue_batch(unique_b, target_free, &mut resolved)?;
-                for &(choice, tier_record) in &phase_b_choices {
-                    if let Some(&(_, slot)) = resolved.iter().find(|&&(tr, _)| tr == tier_record) {
-                        dma.sources_words.store(choice, slot as i32);
-                    }
-                }
-            }
+            total_unique_b = seen_b_tiers.len();
         }
 
         if !replenished && (overflow_experts > 0 || !resolved.is_empty()) {
-            let _ = claim_batch(group, &[], (overflow_experts as usize).max(1));
+            let _ = claim_batch(group, &[], target_free.max(overflow_experts as usize).max(1));
         }
 
         if let Some(gate) = dma.layer_gates.get(layer) {
@@ -2576,5 +2710,208 @@ mod tests {
         assert!(failed.is_none());
         assert_eq!(sources_words.load(0), -1);
         assert_eq!(sources_words.load(site_base + 0), -1);
+    }
+
+    /// Prove incremental Phase B H2D dispatch:
+    /// - Choices 0 & 1 land via `publish_decode_file_ready` + `events.notify()`
+    ///   while straggler choice 2 is still in flight (`file.answer` NOT yet set).
+    /// - The watcher thread blocks until choices 0 & 1 are ALREADY DMA-dispatched
+    ///   and patched into VRAM slots in `DecodeSources` BEFORE releasing the
+    ///   straggler and publishing `file.answer(seq, 0, false)`.
+    /// - Final `DecodeLanding` preserves exact completion sync ordering (`syncs`),
+    ///   tracks all 3 demand slots/leases, and replenishes `target_free` on the
+    ///   final batch.
+    #[test]
+    fn land_decode_misses_dispatches_phase_b_incrementally_before_straggler() {
+        use crate::experts::events::Events;
+        use crate::experts::exchange::{ExchangeTable, Pulse};
+        use magnitude_kernels::constants;
+
+        let device = crate::test_support::open_backend(
+            &seismic::Devices::discover(&[]).expect("discover devices"),
+            seismic::BackendName::Cpu,
+        )
+        .expect("CPU device");
+        let regions = [seismic::SlabRegion { element: Element::bool(), row_shape: vec![64] }];
+        let layout = seismic::SlabLayout::for_regions(1, 8, &regions).expect("slab layout");
+        let granule = layout.slab_bytes.next_multiple_of(layout.slab_alignment);
+        let scope = crate::memory::ledger::Ledgers::strict();
+        let _owner = scope.changes().own();
+        let ledger = scope.ledger(
+            seismic::StoreIdentity::HostRam,
+            Arc::new(crate::memory::ledger::LoadShape { stores: Vec::new() }),
+        );
+        ledger.read(
+            ledger.sampled(std::time::Instant::now()),
+            crate::memory::supply::Reading::device(1 << 40, 1 << 40, crate::domain::fixtures::NO_LAG),
+        );
+        let changes = scope.changes().clone();
+        let entries = ledger.pool_block(
+            crate::memory::ledger::PoolClass::Records,
+            std::num::NonZeroU64::new(granule).expect("granule"),
+        );
+        let pool_charges = entries.charges(&device, seismic::Contract::Shared);
+        let pool = seismic::Pool::open(&pool_charges, seismic::Contract::Shared, granule, granule)
+            .expect("pool");
+        let make_stores = |count: u64| {
+            let charges = Charges::tally(&device);
+            let slab = seismic::SlabTensor::in_pool(&charges, &pool, 1, count, &regions).expect("slab");
+            let stores = Arc::new(Stores::new(
+                vec![(pool.clone(), seismic::BlockSize { bytes: granule, held: granule, absent: granule })],
+                vec![0],
+                vec![(slab, 0, vec![64])],
+            ));
+            changes.change(|_| {
+                stores.claim_to(0, count).expect("claim_to");
+            });
+            stores
+        };
+        let host_stores = make_stores(8);
+        let bank_stores = make_stores(8);
+        let charges = Charges::tally(&device);
+        let k = 4usize;
+        let rows = 1u64;
+        let count = (rows as usize) * k;
+        let words_count = (constants::SOURCE_ROWS as u64) * (count as u64);
+        let sources = Tensor::words(&charges, Element::i32(), &[words_count]).expect("sources");
+        let sources_words = Words::new(sources.clone(), words_count, 0).expect("sources_words");
+
+        let file_table_desc = magnitude_kernels::SlotTable::file(4, k as u64);
+        let file_tensor = Tensor::words(&charges, Element::i32(), &[file_table_desc.words()]).expect("file");
+        let file = ExchangeTable::new(file_tensor, file_table_desc, &Pulse::of(seismic::BackendName::Cpu))
+            .expect("ExchangeTable");
+        let events = Arc::new(Events::default());
+
+        let transfer = Transfer::new(&device).expect("transfer");
+        let dma_state = DecodeDmaState::new(
+            transfer,
+            host_stores,
+            bank_stores,
+            sources,
+            sources_words.clone(),
+            k,
+            &[false],
+            vec![file.clone()],
+            events.clone(),
+        );
+        let transport = ExpertTransport::new(Some(dma_state));
+
+        // Choices 0, 1, 2: cold NVMe misses (choice 2 CPU-pending -> promoted to GPU DMA).
+        // Choice 3: resident VRAM hit (slot 0).
+        let site_base = (constants::SOURCE_SITE as usize) * count;
+        sources_words.store(0, -1);
+        sources_words.store(1, -1);
+        sources_words.store(2, -1);
+        sources_words.store(3, 0);
+        sources_words.store(site_base + 0, -1);
+        sources_words.store(site_base + 1, -1);
+        sources_words.store(site_base + 2, -2);
+        sources_words.store(site_base + 3, -1);
+
+        let seq = 1u64;
+        file.store(seq, 0, constants::FILE_COUNT, k as i32);
+        file.store(seq, 0, constants::FILE_ENTRY(0) + constants::FILE_CHOICE, 10);
+        file.store(seq, 0, constants::FILE_ENTRY(1) + constants::FILE_CHOICE, 11);
+        file.store(seq, 0, constants::FILE_ENTRY(2) + constants::FILE_CHOICE, 12);
+        file.store(seq, 0, constants::FILE_ENTRY(3) + constants::FILE_CHOICE, -1);
+        file.request(seq, 0);
+
+        let bg_transport = Arc::clone(&transport);
+        let bg_sources = sources_words.clone();
+        let bg_file = file.clone();
+        let bg_events = events.clone();
+        let watcher = std::thread::spawn(move || {
+            // Land choices 0 & 1 early (straggler choice 2 still reading on NVMe).
+            bg_file.store(seq, 0, constants::FILE_ENTRY(0) + constants::FILE_RECORD, -2 - 1);
+            assert!(bg_transport.publish_decode_file_ready(0, seq, &[0], -2 - 1));
+            bg_file.store(seq, 0, constants::FILE_ENTRY(1) + constants::FILE_RECORD, -2 - 2);
+            assert!(bg_transport.publish_decode_file_ready(0, seq, &[1], -2 - 2));
+            bg_events.notify();
+
+            // Wait until Phase B has ALREADY dispatched H2D and patched choices 0 & 1
+            // BEFORE choice 2 finishes or `file.answer` is published!
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+            while bg_sources.load(0) < 0 || bg_sources.load(1) < 0 {
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "Phase B must dispatch ready records (choices 0 & 1) BEFORE straggler completes!"
+                );
+                std::thread::yield_now();
+            }
+            assert!(!bg_file.answered(seq, 0), "file must still be unanswered while straggler lags");
+            assert_eq!(bg_sources.load(2), -1, "straggler choice 2 must still be unresolved");
+
+            // Now land straggler choice 2 and publish final `FILE_ANSWER`.
+            bg_file.store(seq, 0, constants::FILE_ENTRY(2) + constants::FILE_RECORD, -2 - 3);
+            assert!(bg_transport.publish_decode_file_ready(0, seq, &[2], -2 - 3));
+            bg_file.answer(seq, 0, false);
+            bg_events.notify();
+        });
+
+        let mut free_pool: Vec<usize> = vec![2, 3, 4, 5];
+        let mut batches: Vec<(Vec<u32>, usize)> = Vec::new();
+        let mut recorded = (false, 0u64, 0u64, 0u64);
+        let landing = transport
+            .land_decode_misses(
+                0,
+                0,
+                seq,
+                rows,
+                |_g, trs, replenish| {
+                    batches.push((trs.to_vec(), replenish));
+                    trs.iter()
+                        .map(|&tr| {
+                            if let Some(slot) = free_pool.pop() {
+                                crate::experts::directory::DemandSlotClaim::Allocated {
+                                    staged: Some((0, tr as usize)),
+                                    slot,
+                                }
+                            } else {
+                                crate::experts::directory::DemandSlotClaim::Overflow { staged: None }
+                            }
+                        })
+                        .collect()
+                },
+                |_| {},
+                || {},
+                || false,
+                |f, e, b, o| recorded = (f, e, b, o),
+            )
+            .expect("land_decode_misses")
+            .expect("some landing");
+        watcher.join().expect("watcher thread");
+
+        // At least 2 distinct Phase B claim batches: early subset before straggler
+        // (replenish == 0) + final straggler batch (replenish == target_free > 0).
+        assert!(
+            batches.len() >= 2,
+            "expected incremental Phase B batches before straggler, got {batches:?}"
+        );
+        assert_eq!(batches[0].1, 0, "intermediate Phase B batch must defer headroom replenish");
+        assert!(
+            batches.last().unwrap().1 >= k,
+            "final Phase B batch must replenish target_free"
+        );
+
+        // Final synchronization and slot patching intact for all 3 misses.
+        assert!(!recorded.0, "must not be fast-path skip");
+        assert_eq!(recorded.1, 3, "expected 3 landed experts across incremental Phase B");
+        assert_eq!(recorded.3, 0, "expected 0 overflow experts");
+        assert_eq!(landing.demand_ids.len(), 3);
+        assert_eq!(landing.demand_slots.len(), 3);
+        assert_eq!(landing.syncs.len(), 1, "single latest FIFO transfer_done sync orders all batches");
+        let s0 = sources_words.load(0);
+        let s1 = sources_words.load(1);
+        let s2 = sources_words.load(2);
+        assert!((2..6).contains(&s0), "choice 0 slot {s0} must be in 2..6");
+        assert!((2..6).contains(&s1), "choice 1 slot {s1} must be in 2..6");
+        assert!((2..6).contains(&s2), "choice 2 slot {s2} must be in 2..6");
+        assert_ne!(s0, s1);
+        assert_ne!(s0, s2);
+        assert_ne!(s1, s2);
+        assert_eq!(sources_words.load(3), 0, "VRAM hit untouched");
+        assert_eq!(sources_words.load(site_base + 2), -1, "straggler SOURCE_SITE == -2 promoted to GPU (-1)");
+
+        landing.release(&transport);
     }
 }
