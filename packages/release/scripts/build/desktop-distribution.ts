@@ -33,5 +33,6 @@ export const desktopBuildEnvironment = (host: HostId) => resolveDesktopDistribut
   Effect.map((encoded): Readonly<Record<string, string | undefined>> => ({
     ...process.env,
     [DESKTOP_DISTRIBUTION_VARIABLE]: encoded,
+    MAGNITUDE_NATIVE_ARCH: host.includes("arm64") ? "arm64" : "x64",
   })),
 )

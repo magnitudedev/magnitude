@@ -15,8 +15,11 @@ export const buildCliBinary = async (target: string, bootstrapPublisherKey?: str
   if (bootstrapPublisherKey !== undefined) await Effect.runPromise(decodePublisherPublicKey(bootstrapPublisherKey))
   const info = getTargetInfo(target)
   const nativePlatform = info.platform === "windows" ? "win32" : info.platform
-  if (nativePlatform === process.platform && info.arch === process.arch) {
-    await run([process.execPath, resolve(PROJECT_ROOT, "packages/daemon-management/scripts/build-native.ts")], { cwd: PROJECT_ROOT })
+  if (nativePlatform === process.platform && (info.arch === process.arch || nativePlatform === "darwin")) {
+    await run(
+      [process.execPath, resolve(PROJECT_ROOT, "packages/daemon-management/scripts/build-native.ts")],
+      { cwd: PROJECT_ROOT, env: { ...process.env, MAGNITUDE_NATIVE_ARCH: info.arch } },
+    )
   }
   // Cross-compilation requires an already built addon for the selected target.
   const nativeAddon = resolve(PROJECT_ROOT, `packages/daemon-management/dist/native/${nativePlatform}-${info.arch}/desktop-host.node`)

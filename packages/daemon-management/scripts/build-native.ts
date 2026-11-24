@@ -9,20 +9,30 @@ class NativeBuildFailed extends Schema.TaggedError<NativeBuildFailed>()("NativeB
   message: Schema.String,
 }) {}
 
+const TargetArch = Schema.Literal("arm64", "x64")
+
 const build = Effect.gen(function* () {
   const root = fileURLToPath(new URL("../", import.meta.url))
   const headers: string = process.env.MAGNITUDE_NODE_HEADERS ?? createRequire(import.meta.url)("node-api-headers").include_dir
   if (!headers || !existsSync(resolve(headers, "node_api.h"))) {
     return yield* new NativeBuildFailed({ message: "Set MAGNITUDE_NODE_HEADERS to a Node-API include directory containing node_api.h" })
   }
-  const output = resolve(root, "dist/native", `${process.platform}-${process.arch}`, "desktop-host.node")
+  const requestedArch = process.env.MAGNITUDE_NATIVE_ARCH ?? process.arch
+  const arch = yield* Schema.decodeUnknown(TargetArch)(requestedArch).pipe(
+    Effect.mapError(() => new NativeBuildFailed({ message: `Unsupported native target architecture: ${requestedArch}` })),
+  )
+  if (arch !== process.arch && process.platform !== "darwin") {
+    return yield* new NativeBuildFailed({ message: `Cross-compiling native addons for ${arch} on ${process.platform}-${process.arch} is only supported on macOS` })
+  }
+  const darwinArchArgs = process.platform === "darwin" ? ["-arch", arch === "arm64" ? "arm64" : "x86_64"] : []
+  const output = resolve(root, "dist/native", `${process.platform}-${arch}`, "desktop-host.node")
   yield* Effect.try({
     try: () => mkdirSync(resolve(output, ".."), { recursive: true }),
     catch: error => new NativeBuildFailed({ message: String(error) }),
   })
   if (process.platform === "win32") {
     const library = process.env.MAGNITUDE_NODE_LIBRARY
-    if (process.arch !== "x64" || !library || !existsSync(library)) {
+    if (arch !== "x64" || !library || !existsSync(library)) {
       return yield* new NativeBuildFailed({ message: "Windows x64 native build requires Visual Studio C++ tools and MAGNITUDE_NODE_LIBRARY pointing to a verified x64 node.lib" })
     }
     for (const args of [
@@ -38,6 +48,7 @@ const build = Effect.gen(function* () {
     return
   }
   const args = ["-std=c11", "-D_GNU_SOURCE", "-DNAPI_VERSION=8", "-O2", "-Wall", "-Wextra", "-Werror", "-fPIC", "-shared", "-pthread",
+    ...darwinArchArgs,
     ...(process.platform === "darwin" ? ["-undefined", "dynamic_lookup", "-mmacosx-version-min=13.0",
       "-framework", "Security", "-framework", "CoreFoundation",
       resolve(root, "native/mac-update-validation.c"), resolve(root, "native/mac-update-napi.c"),
@@ -57,6 +68,7 @@ const build = Effect.gen(function* () {
     const helper = resolve(output, "..", specification.name)
     yield* Effect.async<void, NativeBuildFailed>(resume => {
       const child = spawn(process.env.CC ?? "cc", ["-std=c11", "-D_GNU_SOURCE", "-O2", "-Wall", "-Wextra", "-Werror",
+        ...darwinArchArgs,
         ...(process.platform === "darwin" ? ["-mmacosx-version-min=13.0"] : []),
         resolve(root, "native", specification.source), ...specification.libraries, "-o", helper], { stdio: "inherit" })
       child.once("error", error => resume(Effect.fail(new NativeBuildFailed({ message: error.message }))))
