@@ -21,7 +21,9 @@ use super::super::watcher::Step;
 use std::mem::size_of;
 
 /// The half-lives, in decode steps, the history selector measures reads by.
-pub(super) const HALF_LIVES: [f64; 10] = [0., 1., 2., 4., 8., 16., 32., 64., 128., 256.];
+/// `f64::INFINITY` tracks exact un-decayed frequency (`count / steps`), preserving
+/// stationary Zipf tails over long sessions without `exp2`.
+pub(super) const HALF_LIVES: [f64; 13] = [0., 1., 2., 4., 8., 16., 32., 64., 128., 256., 512., 1024., f64::INFINITY];
 
 /// Half-life, in decode steps, of the exponentially decayed miss counts used
 /// to select the live candidate. Decaying miss counts prevents earlier
@@ -42,10 +44,11 @@ impl Score {
         Self(step as f64)
     }
 
-    /// The score of the reads of `self` and of `other` together at half-life
-    /// `half_life`: `h · log2(2^(a/h) + 2^(b/h))`, their later at `h = 0`.
+    /// The score of the reads of `self` and of `other` together at finite
+    /// half-life `half_life`: `h · log2(2^(a/h) + 2^(b/h))`, their later at `h = 0`.
     #[inline]
     pub(super) fn sum(self, other: Self, half_life: f64) -> Self {
+        debug_assert!(half_life.is_finite(), "Score::sum requires a finite half-life");
         let (low, high) = if self <= other { (self.0, other.0) } else { (other.0, self.0) };
         if half_life == 0. || low == f64::NEG_INFINITY {
             return Self(high);
@@ -146,7 +149,7 @@ impl Measure {
         });
     }
 
-    fn read_decode(&mut self, layer: usize, step: Step, experts: &[usize], slots: usize) {
+    fn read_decode(&mut self, layer: usize, token_step: u64, step: Step, experts: &[usize], slots: usize) {
         let mut misses = 0u64;
         for &expert in experts {
             if self.depth(layer, expert) >= slots {
@@ -161,12 +164,29 @@ impl Measure {
             self.logged += 1;
             self.layers[layer][expert].order = self.logged;
         }
-        let now = Score::at(step);
-        self.steps_score[layer] = self.steps_score[layer].sum(now, self.half_life);
-        for &expert in experts {
-            let logged = &mut self.layers[layer][expert];
-            logged.score = logged.score.sum(now, self.half_life);
-            logged.last = logged.last.max(Some(step));
+        if self.half_life.is_infinite() {
+            self.steps_score[layer] = if self.steps_score[layer] == Score::NEVER {
+                Score(1.0)
+            } else {
+                Score(self.steps_score[layer].0 + 1.0)
+            };
+            for &expert in experts {
+                let logged = &mut self.layers[layer][expert];
+                logged.score = if logged.score == Score::NEVER {
+                    Score(1.0)
+                } else {
+                    Score(logged.score.0 + 1.0)
+                };
+                logged.last = logged.last.max(Some(step));
+            }
+        } else {
+            let now = Score::at(token_step);
+            self.steps_score[layer] = self.steps_score[layer].sum(now, self.half_life);
+            for &expert in experts {
+                let logged = &mut self.layers[layer][expert];
+                logged.score = logged.score.sum(now, self.half_life);
+                logged.last = logged.last.max(Some(step));
+            }
         }
         self.fill_entering(layer, experts);
         for i in 0..self.scratch_entering.len() {
@@ -217,6 +237,9 @@ impl Measure {
             // the step-space analog of `S_eff(h)` that never underflows against route noise.
             let age = (steps.0 - score.0).max(0.0);
             1.0 / ((1.0 + age) * harmonic)
+        } else if self.half_life.is_infinite() {
+            // Unbounded stationary frequency: exact `count / steps`, no `exp2`.
+            score.0 / steps.0
         } else {
             ((score.0 - steps.0) / self.half_life).exp2()
         };
@@ -238,10 +261,7 @@ impl Measure {
 /// what decode history predicts.
 pub(super) struct History {
     measures: Vec<Measure>,
-    groups: Vec<usize>,
-    members: Vec<usize>,
-    slots: Vec<usize>,
-    /// Per-layer decode step count and harmonic normalizer `H(n) = Σ_{d=1..n} 1/d`
+    /// Per-layer decode token-step count and harmonic normalizer `H(n) = Σ_{d=1..n} 1/d`
     /// for `h = 0` recency rates.
     decode_steps: Vec<u64>,
     harmonic: Vec<f64>,
@@ -250,28 +270,10 @@ pub(super) struct History {
 }
 
 impl History {
-    pub(super) fn new(experts: &[usize], groups: &[usize], records: &[usize]) -> Self {
-        assert_eq!(experts.len(), groups.len(), "each layer has its group");
-        let mut members = vec![0usize; records.len()];
-        for &group in groups {
-            members[group] += 1;
-        }
-        let slots: Vec<usize> = groups
-            .iter()
-            .map(|&group| {
-                if members[group] > 0 && records[group] > 0 {
-                    records[group].div_ceil(members[group])
-                } else {
-                    0
-                }
-            })
-            .collect();
+    pub(super) fn new(experts: &[usize]) -> Self {
         let measures = HALF_LIVES.iter().map(|&half_life| Measure::new(half_life, experts)).collect();
         Self {
             measures,
-            groups: groups.to_vec(),
-            members,
-            slots,
             decode_steps: vec![0; experts.len()],
             harmonic: vec![0.0; experts.len()],
             live: vec![HALF_LIVES.len() - 1; experts.len()],
@@ -283,16 +285,17 @@ impl History {
         &self.measures[self.live[layer]]
     }
 
-    /// Log a decode step's routed `experts` at `layer` and `step`: updates all
-    /// half-life stacks for `layer` and selects `layer`'s half-life with fewest
-    /// decayed misses (breaking ties toward longer half-lives so frequency skew
-    /// is preserved during cold start and warmup).
-    pub(super) fn read_decode(&mut self, layer: usize, step: Step, experts: &[usize]) {
+    /// Log one decode token's routed `experts` at `layer` and `step` against
+    /// `layer`'s live pooled slot share `slots`: updates all half-life stacks
+    /// for `layer` and selects `layer`'s half-life with fewest decayed misses
+    /// (breaking ties toward longer half-lives so frequency skew is preserved
+    /// during cold start and warmup).
+    pub(super) fn read_decode(&mut self, layer: usize, step: Step, experts: &[usize], slots: usize) {
         self.decode_steps[layer] += 1;
-        self.harmonic[layer] += 1.0 / self.decode_steps[layer] as f64;
-        let slots = self.slots[layer];
+        let token_step = self.decode_steps[layer];
+        self.harmonic[layer] += 1.0 / token_step as f64;
         for measure in &mut self.measures {
-            measure.read_decode(layer, step, experts, slots);
+            measure.read_decode(layer, token_step, step, experts, slots);
         }
         self.live[layer] = (0..HALF_LIVES.len())
             .min_by(|&a, &b| {
@@ -301,21 +304,6 @@ impl History {
                     .then_with(|| b.cmp(&a))
             })
             .expect("HALF_LIVES is non-empty");
-    }
-
-    /// Group `group` holds `records` records from now: updates each member
-    /// layer's nominal share.
-    pub(super) fn resize(&mut self, group: usize, records: usize) {
-        let share = if self.members[group] > 0 && records > 0 {
-            records.div_ceil(self.members[group])
-        } else {
-            0
-        };
-        for (layer, &g) in self.groups.iter().enumerate() {
-            if g == group {
-                self.slots[layer] = share;
-            }
-        }
     }
 
     /// Normalized decayed decode rate `p_∞ ∈ [0, 1]` for `(layer, expert)`
@@ -339,11 +327,17 @@ impl History {
         self.live_measure(layer).half_life
     }
 
+    /// Number of accepted decode token steps logged at `layer`.
+    #[cfg(test)]
+    pub(super) fn decode_steps(&self, layer: usize) -> u64 {
+        self.decode_steps[layer]
+    }
+
     /// Fixed memory charge in bytes (constant in run length).
     pub(super) fn bytes(&self) -> u64 {
         let measures: u64 = self.measures.iter().map(Measure::bytes).sum();
         let meta = size_of::<Self>()
-            + (self.groups.capacity() + self.members.capacity() + self.slots.capacity() + self.live.capacity()) * size_of::<usize>()
+            + self.live.capacity() * size_of::<usize>()
             + self.decode_steps.capacity() * size_of::<u64>()
             + self.harmonic.capacity() * size_of::<f64>();
         measures + meta as u64
@@ -358,9 +352,9 @@ mod tests {
     fn frequency_outranks_one_later_read_over_a_half_life() {
         let mut measure = Measure::new(4., &[2]);
         for step in [1, 2, 3, 4] {
-            measure.read_decode(0, step, &[0], 2);
+            measure.read_decode(0, step, step, &[0], 2);
         }
-        measure.read_decode(0, 5, &[1], 2);
+        measure.read_decode(0, 5, 5, &[1], 2);
         assert!(measure.rank(0, 0) > measure.rank(0, 1));
         assert!(measure.rate(0, 0, 1.0).unwrap() > measure.rate(0, 1, 1.0).unwrap());
         assert!((Score::at(0).sum(Score::at(0), 4.).0 - 4.).abs() < 1e-12);
@@ -368,13 +362,13 @@ mod tests {
 
     #[test]
     fn decayed_rate_sums_to_active_and_is_monotone_in_score() {
-        let mut history = History::new(&[16], &[0], &[4]);
+        let mut history = History::new(&[16]);
         assert_eq!(history.rate(0, 0), None, "cold start before any decode step");
         for step in 1..=40u64 {
             let experts = [0, ((step as usize) % 15) + 1];
-            history.read_decode(0, step, &experts);
+            history.read_decode(0, step, &experts, 4);
         }
-        // Check on every non-zero half-life: sum of rates equals k = 2.0 exactly.
+        // Check on every non-zero half-life (including f64::INFINITY): sum of rates equals k = 2.0 exactly.
         let h = history.harmonic[0];
         for measure in &history.measures[1..] {
             let sum: f64 = (0..16).map(|e| measure.rate(0, e, h).unwrap()).sum();
@@ -391,13 +385,13 @@ mod tests {
 
     #[test]
     fn recency_harmonic_rate_is_strictly_monotone_and_in_unit_interval() {
-        let mut history = History::new(&[16], &[0], &[4]);
+        let mut history = History::new(&[16]);
         for step in 1..=10u64 {
-            history.read_decode(0, step, &[step as usize]);
+            history.read_decode(0, step, &[step as usize], 4);
         }
         // All 10 reads are distinct -> all candidates miss identically -> ties
-        // prefer the longest half-life so frequency skew is never erased on cold start.
-        assert_eq!(history.half_life(0), *HALF_LIVES.last().unwrap());
+        // prefer the longest half-life (f64::INFINITY) so frequency skew is never erased on cold start.
+        assert_eq!(history.half_life(0), f64::INFINITY);
         let expected_h: f64 = (1..=10).map(|d| 1.0 / d as f64).sum();
         assert!((history.harmonic[0] - expected_h).abs() < 1e-12);
         // Verify the h = 0 recency measure directly.
@@ -416,10 +410,10 @@ mod tests {
 
     #[test]
     fn the_half_life_selected_is_the_one_that_missed_least() {
-        let mut history = History::new(&[128], &[0], &[2]);
+        let mut history = History::new(&[128]);
         for step in 1..=60u64 {
             let experts = if step % 3 == 0 { vec![0, step as usize] } else { vec![step as usize] };
-            history.read_decode(0, step, &experts);
+            history.read_decode(0, step, &experts, 2);
         }
         assert!(history.half_life(0) > 0., "a half-life kept the hot expert");
         let recency = &history.measures[0];
@@ -430,7 +424,7 @@ mod tests {
 
     #[test]
     fn history_bytes_is_constant_in_run_length() {
-        let mut history = History::new(&[16], &[0], &[4]);
+        let mut history = History::new(&[16]);
         let initial = history.bytes();
         for step in 1..=500u64 {
             let e0 = (step as usize) % 16;
@@ -438,7 +432,7 @@ mod tests {
             let mut chosen = vec![e0, e1];
             chosen.sort_unstable();
             chosen.dedup();
-            history.read_decode(0, step, &chosen);
+            history.read_decode(0, step, &chosen, 4);
         }
         assert_eq!(history.bytes(), initial, "history memory footprint must be constant");
     }
@@ -448,16 +442,16 @@ mod tests {
     /// session shifts to a pure-recency burst workload.
     #[test]
     fn decayed_misses_adapt_across_session_regime_shifts() {
-        let mut history = History::new(&[128], &[0], &[2]);
+        let mut history = History::new(&[128]);
         // Session 1 (5,000 steps): expert 0 is hot every 3rd step beside one-off
         // cold experts — long half-life wins by a wide margin.
         let mut step = 1u64;
         for _ in 0..5_000 {
             let cold = 1 + ((step as usize) % 127);
             if step % 3 == 0 {
-                history.read_decode(0, step, &[0, cold]);
+                history.read_decode(0, step, &[0, cold], 2);
             } else {
-                history.read_decode(0, step, &[cold]);
+                history.read_decode(0, step, &[cold], 2);
             }
             step += 1;
         }
@@ -470,7 +464,7 @@ mod tests {
             let a = (burst * 2) % 126 + 1;
             let b = a + 1;
             for _ in 0..6 {
-                history.read_decode(0, step, &[a, b]);
+                history.read_decode(0, step, &[a, b], 2);
                 step += 1;
             }
         }
@@ -486,20 +480,20 @@ mod tests {
     /// half-life, exposing high `p_∞` on the skewed layer without cross-layer interference.
     #[test]
     fn per_layer_half_life_selects_independently_for_skewed_and_bursty_layers() {
-        let mut history = History::new(&[128, 128], &[0, 0], &[4]);
+        let mut history = History::new(&[128, 128]);
         for step in 1..=300u64 {
             // Layer 0: stationary skewed — expert 0 every 3rd step beside cold experts.
             let cold = 1 + ((step as usize) % 127);
             if step % 3 == 0 {
-                history.read_decode(0, step, &[0, cold]);
+                history.read_decode(0, step, &[0, cold], 2);
             } else {
-                history.read_decode(0, step, &[cold]);
+                history.read_decode(0, step, &[cold], 2);
             }
             // Layer 1: shifting bursts of 2 experts for 6 steps each (short half-life wins).
             let burst = ((step - 1) / 6) as usize;
             let a = (burst * 2) % 126 + 1;
             let b = a + 1;
-            history.read_decode(1, step, &[a, b]);
+            history.read_decode(1, step, &[a, b], 2);
         }
         assert!(
             history.half_life(0) >= 16.0,
@@ -511,5 +505,37 @@ mod tests {
             "bursty layer 1 should select a short half-life, got {}",
             history.half_life(1)
         );
+    }
+
+    /// Unbounded half-life (`f64::INFINITY`) computes exact un-decayed frequency
+    /// `count / steps` without decay over 4,000+ token sessions, preserving
+    /// stationary Zipf tails.
+    #[test]
+    fn infinite_half_life_tracks_exact_undecayed_frequency() {
+        let mut history = History::new(&[64]);
+        // 4,000 steps: expert 0 chosen every 2nd step (50%), expert 1 every 10th step (10%),
+        // expert 2 every 40th step (2.5%), plus rotating cold experts.
+        for step in 1..=4_000u64 {
+            let mut chosen = Vec::new();
+            if step % 2 == 0 {
+                chosen.push(0);
+            }
+            if step % 10 == 0 {
+                chosen.push(1);
+            }
+            if step % 40 == 0 {
+                chosen.push(2);
+            }
+            let cold = 3 + ((step as usize) % 61);
+            chosen.push(cold);
+            chosen.sort_unstable();
+            history.read_decode(0, step, &chosen, 4);
+        }
+        let inf = history.measures.last().expect("f64::INFINITY is last");
+        assert!(inf.half_life.is_infinite());
+        assert!((inf.rate(0, 0, 1.0).unwrap() - 0.5).abs() < 1e-12);
+        assert!((inf.rate(0, 1, 1.0).unwrap() - 0.1).abs() < 1e-12);
+        assert!((inf.rate(0, 2, 1.0).unwrap() - 0.025).abs() < 1e-12);
+        assert_eq!(history.half_life(0), f64::INFINITY);
     }
 }

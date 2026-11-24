@@ -747,3 +747,26 @@ fn uma_guarantee_pulse_never_oscillates_bank_slots() {
 
     drop(bank_cache.take());
 }
+
+/// `shared_targets_with_pressure` / `held_target_with_pressure` is O(log ceiling),
+/// staying well under 100 µs per call even at `ceiling = 512`.
+#[test]
+fn derive_at_ceiling_512_is_sub_100us() {
+    let shape = BankShape::new(SLOT, 8, 512, 512);
+    let host_shape = BankShape::host(SLOT, 512, 512, false);
+    let room = 256 * SLOT;
+    let holdings: [(BankShape, u64, u64, &dyn Fn(u64) -> u64); 2] = [
+        (shape, 137, 0, &charge),
+        (host_shape, 282, 0, &charge),
+    ];
+    let started = std::time::Instant::now();
+    for _ in 0..100 {
+        let targets = shared_targets_with_pressure(room, room, 0, &holdings);
+        assert_eq!(targets[0], 264);
+    }
+    let per_call = started.elapsed() / 100;
+    assert!(
+        per_call < std::time::Duration::from_micros(100),
+        "derived target evaluation at ceiling=512 took {per_call:?} per call"
+    );
+}

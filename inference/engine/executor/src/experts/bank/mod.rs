@@ -272,57 +272,151 @@ impl ExpertBank {
         self.transport.should_split_decode(group, layer, rows)
     }
 
-    /// Contiguous `[SOURCE_ROWS, rows, K] i32` view of the pinned host-mapped
-    /// `DecodeSources` buffer for `DecodeFront` and `DecodeBack`.
-    pub(crate) fn decode_sources_view(&self, rows: u64) -> Result<Tensor, String> {
-        self.transport.decode_sources_view(rows)
+    /// Acquire a free generation-leased [`super::transport::DecodeSourceLease`]
+    /// for one decode-split flight (`DecodeFront -> DecodeHits ∥ DMA -> DecodeBack`).
+    pub(crate) fn acquire_decode_source_slot(&self) -> Result<super::transport::DecodeSourceLease, String> {
+        self.transport.acquire_decode_source_slot()
     }
 
-    /// Inspect pinned `DecodeSources` written by `DecodeFront` for streamed
-    /// layer `layer` over `rows` rows, joining any in-flight or landed
-    /// `LinkMover` (`Promote`/`Stage`) or demand transfers and batch-DMAing
-    /// remaining fresh host-tier misses into unified `Record::DemandLanding`
-    /// slots via [`super::transport::ExpertTransport`].
+    /// Contiguous `[SOURCE_ROWS, rows, K] i32` view of the leased flight's
+    /// pinned host-mapped `front_sources` buffer (written by `DecodeFront`,
+    /// read-only by `DecodeHits` and host).
+    pub(crate) fn decode_front_sources_view(
+        &self,
+        token: super::transport::DecodeSourceToken,
+        rows: u64,
+    ) -> Result<Tensor, String> {
+        self.transport.decode_front_sources_view(token, rows)
+    }
+
+    /// Contiguous `[SOURCE_ROWS, rows, K] i32` view of the leased flight's
+    /// pinned host-mapped `back_sources` buffer (written by host in
+    /// `land_decode_misses`, read-only by `DecodeBack`).
+    pub(crate) fn decode_back_sources_view(
+        &self,
+        token: super::transport::DecodeSourceToken,
+        rows: u64,
+    ) -> Result<Tensor, String> {
+        self.transport.decode_back_sources_view(token, rows)
+    }
+
+    /// Inspect pinned `front_sources` written by `DecodeFront` for streamed
+    /// layer `layer` over `rows` rows, populate disjoint `back_sources`
+    /// (masking VRAM hits to `-1` when `split_hits` is true), pin resident
+    /// VRAM hit records, join any in-flight or landed `LinkMover`
+    /// (`Promote`/`Stage`) or demand transfers, and batch-DMA remaining fresh
+    /// host-tier misses into unified `Record::DemandLanding` slots via
+    /// [`super::transport::ExpertTransport`].
+    ///
+    /// Any completed `prev_landings` from earlier layer(s) of this bank have
+    /// their transport leases released outside `Residency` and their slot
+    /// settlement folded into the first demand-claim lock hold (or settled in
+    /// one deferred lock hold if this layer makes no claims).
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn land_decode_misses(
         &self,
         layer: usize,
         sequence: u64,
         rows: u64,
-    ) -> Result<Option<super::transport::DecodeLanding>, String> {
+        prev_landings: Vec<super::transport::DecodeLanding>,
+        split_hits: bool,
+        source_lease: super::transport::DecodeSourceLease,
+        hits_submitted: bool,
+    ) -> Result<super::transport::DecodeLanding, String> {
         let group = self.plan.layers()[layer].group;
         let shared = self.watcher.shared();
-        self.transport.land_decode_misses(
+        let mut prev_to_finish: Vec<super::watcher::DemandLandingToFinish> = prev_landings
+            .into_iter()
+            .filter_map(|landing| {
+                let (prev_layer, prev_sequence, slots) = landing.release_transport(&self.transport);
+                (!slots.is_empty()).then_some(super::watcher::DemandLandingToFinish {
+                    layer: prev_layer,
+                    sequence: prev_sequence,
+                    slots,
+                })
+            })
+            .collect();
+        let result = self.transport.land_decode_misses(
             group,
             layer,
             sequence,
             rows,
-            |g, tier_records, replenish_want| self.watcher.claim_demand_batch(g, tier_records, replenish_want),
+            split_hits,
+            source_lease,
+            hits_submitted,
+            |g, tier_records, replenish_target| {
+                let finishes = std::mem::take(&mut prev_to_finish);
+                self.watcher.claim_demand_slots(
+                    g,
+                    layer,
+                    sequence,
+                    rows,
+                    tier_records,
+                    &finishes,
+                    replenish_target,
+                )
+            },
             |aborted| self.watcher.abort_demand_slots(aborted),
             || shared.wake_site_noticer(),
             || shared.is_ended(),
             |fast_path, experts, bytes, overflow| {
                 shared.record_dma_call(fast_path, experts, bytes, overflow);
             },
-        )
+        );
+        match &result {
+            Ok(landing) => {
+                // Observe strictly ONE deduplicated demand sample per `(step, layer)`
+                // (including true all-hit `0`, excluding maintenance replenish calls,
+                // and aggregated across Phase A + all Phase B chunks), folding any
+                // unconsumed `prev_to_finish` into the same deferred residency lock.
+                self.watcher.finish_and_observe_decode_demand(
+                    group,
+                    landing.census.gpu_host_misses as usize,
+                    rows as usize,
+                    &prev_to_finish,
+                );
+            }
+            Err(_) => {
+                if !prev_to_finish.is_empty() {
+                    self.watcher.finish_demand_landings_batch(&prev_to_finish, false);
+                }
+            }
+        }
+        result
     }
 
     /// Complete a decode DMA landing once `DecodeBack` has finished on the GPU:
     /// releases transport leases + drains deferred syncs outside `Residency`,
     /// then performs zero-recopy O(1) promotion (`DemandLanding -> Held`) or
-    /// releases unpromoted slots back to `Free`.
+    /// releases unpromoted slots back to `Free`. Publishes layer-held telemetry
+    /// once (used at step completion / teardown).
     pub(crate) fn complete_decode_landing(&self, landing: super::transport::DecodeLanding) {
         let (layer, sequence, demand_slots) = landing.release_transport(&self.transport);
-        self.watcher.finish_demand_landings(layer, sequence, &demand_slots);
+        self.watcher.finish_demand_landings(layer, sequence, &demand_slots, true);
+    }
+
+    /// Same as [`Self::complete_decode_landing`], deferring `publish_held`
+    /// telemetry publication (used mid-step).
+    pub(crate) fn complete_decode_landing_deferred(&self, landing: super::transport::DecodeLanding) {
+        let (layer, sequence, demand_slots) = landing.release_transport(&self.transport);
+        self.watcher.finish_demand_landings(layer, sequence, &demand_slots, false);
     }
 
     /// Explicitly abort a decode DMA landing whose `DecodeBack` was never
     /// submitted: waits on the copy stream outside all residency locks,
     /// returns only proven-completed slots to `Directory`, and quarantines
-    /// uncertain/timed-out slots.
-    pub(crate) fn abort_decode_landing(&self, landing: super::transport::DecodeLanding, reason: &str) {
+    /// uncertain/timed-out slots (and `source_lease` / `hit_leases` if
+    /// `DecodeHits` was submitted and `!hits_retired`).
+    pub(crate) fn abort_decode_landing(
+        &self,
+        landing: super::transport::DecodeLanding,
+        reason: &str,
+        hits_retired: bool,
+    ) {
         let transport = &self.transport;
         landing.abort(
             reason,
+            hits_retired,
             |value| transport.wait_decode_dma(value, std::time::Duration::from_secs(5)),
             &mut |aborted| self.watcher.abort_demand_slots(aborted),
         );
@@ -766,7 +860,6 @@ impl ExpertBank {
                 .ok_or_else(|| format!("bank part {part:?} of a bank without a host tier holding it"))?,
             BankPart::FileTable => &layer.file,
             BankPart::ScratchTable => &layer.scratch,
-            BankPart::Rings => &layer.rings,
             BankPart::Routing => &layer.routing,
             BankPart::Keys => &layer.keys,
             BankPart::Front => &layer.front,

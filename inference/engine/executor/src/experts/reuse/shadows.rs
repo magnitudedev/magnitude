@@ -313,7 +313,7 @@ impl Shadows {
         let max_experts = experts.iter().copied().max().unwrap_or(0);
         Self {
             layers: experts.iter().map(|&count| Calibration::new_shadow(count, 1, 0)).collect(),
-            history: History::new(experts, groups, &pools.records),
+            history: History::new(experts),
             groups: groups.to_vec(),
             log: VecDeque::new(),
             depths: std::array::from_fn(|_| DepthShadow::with_pools(pools.clone())),
@@ -328,17 +328,27 @@ impl Shadows {
 
     /// Fixed memory charge of the shadows' calibration tables and history
     /// selector for `experts` layers (constant in run length, design §1 bar 2, §4).
-    pub(super) fn calibration_bytes(experts: &[usize], groups: &[usize], records: &[usize]) -> u64 {
+    pub(super) fn calibration_bytes(experts: &[usize]) -> u64 {
         let cal: u64 = experts.iter().map(|&count| Calibration::new_shadow(count, 1, 0).bytes()).sum();
-        cal + History::new(experts, groups, records).bytes()
+        cal + History::new(experts).bytes()
     }
 
     /// Read what the ranking logged since ([`ShadowFeed`]), in order.
     pub(crate) fn read_log(&mut self, fed: Vec<ShadowFeed>) {
+        self.read_log_while(fed, || true);
+    }
+
+    /// Read what the ranking logged since ([`ShadowFeed`]), in order, stopping
+    /// cooperatively between items or ready steps once `keep_going()` returns
+    /// false (e.g. watcher shutdown).
+    pub(crate) fn read_log_while(&mut self, fed: Vec<ShadowFeed>, keep_going: impl Fn() -> bool) {
         for item in fed {
+            if !keep_going() {
+                break;
+            }
             match item {
                 ShadowFeed::Read { read, rows, evidence, clock } => {
-                    self.log(Logged { read, rows, evidence }, clock);
+                    self.log_while(Logged { read, rows, evidence }, clock, &keep_going);
                 }
                 ShadowFeed::Resize { group, records } => self.resize(group, records),
             }
@@ -478,7 +488,6 @@ impl Shadows {
     }
 
     fn resize(&mut self, group: usize, records: usize) {
-        self.history.resize(group, records);
         for shadow in &mut self.depths {
             shadow.pools.fit(group, records);
             shadow.time.lock().resized(group, Tier::COMPUTE, records as u64);
@@ -494,8 +503,8 @@ impl Shadows {
 
     /// Log `logged` as the ranking logged it, its step at `clock`: a read of a
     /// new step completes the one before, and every ready step at the front of
-    /// the buffer is stepped.
-    fn log(&mut self, logged: Logged, clock: Tokens) {
+    /// the buffer is stepped while `keep_going()` remains true.
+    fn log_while(&mut self, logged: Logged, clock: Tokens, keep_going: &impl Fn() -> bool) {
         let sequence = logged.read.sequence;
         if self.log.back().is_none_or(|step| step.sequence != sequence) {
             assert!(
@@ -504,7 +513,7 @@ impl Shadows {
                 self.log.back().map(|step| step.sequence),
             );
             self.log.push_back(Behind { sequence, clock, reads: Vec::new() });
-            while self.ready() {
+            while self.ready() && keep_going() {
                 self.step();
             }
         }
@@ -604,7 +613,20 @@ impl Shadows {
             let group = self.groups[layer];
             let cal_epoch = self.depths[0].time.lock().group_epoch(group);
             if logged.evidence == Evidence::Decode {
-                self.history.read_decode(layer, logged.read.sequence, &logged.read.experts);
+                let cap = self.depths[0].pools.records[group];
+                let slots = if cap == 0 {
+                    0
+                } else {
+                    self.depths[0].pools.layer_held(layer).max(self.layers[layer].active()).min(cap)
+                };
+                if let Some(rows) = logged.rows.as_deref().filter(|r| r.verifies() && r.row_count() > 1) {
+                    for row in 0..rows.row_count() {
+                        let row_experts = rows.row_experts(row);
+                        self.history.read_decode(layer, logged.read.sequence, &row_experts, slots);
+                    }
+                } else {
+                    self.history.read_decode(layer, logged.read.sequence, &logged.read.experts, slots);
+                }
             }
             self.layers[layer].read_shadow(
                 logged.read.sequence,
@@ -915,9 +937,10 @@ mod tests {
         let mut cold_shadows = Shadows::new(&[8], &[0], &[4]);
         let mut warm_shadows = Shadows::new_with_pools(&[8], &[0], &warm);
 
-        // Feed the exact same 4-expert working set to both shadows.
-        feed_cycle(&mut cold_shadows, 1..=12, 4, 8);
-        feed_cycle(&mut warm_shadows, 1..=12, 4, 8);
+        // Feed the exact same 4-expert working set past `BEHIND` so shadows step.
+        let steps = BEHIND as u64 + 5;
+        feed_cycle(&mut cold_shadows, 1..=steps, 4, 8);
+        feed_cycle(&mut warm_shadows, 1..=steps, 4, 8);
 
         let cold_u = cold_shadows.misses()[0].expect("cold shadow measured");
         let warm_u = warm_shadows.misses()[0].expect("warm shadow measured");

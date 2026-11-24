@@ -852,13 +852,16 @@ impl ExpertBank {
             (stop.clone(), self.rises.clone(), self.stores.rise_gate().clone(), stores.clone(), self.tier_counts(tier));
         let counts = self.counts.clone();
         let changes = self.cache.changes().clone();
+        let device = self.device.clone();
         let done = thread.run(wake, move || {
             let slot = || shared.backing_slot(&stopping);
             // For `BankTier::Host`, check live pinned HostRam headroom through
-            // the single `Estimate::live_pinned_headroom` owner before each
+            // the single `Estimate::live_pinned_headroom` owner (and any
+            // device-side host-tier heap budget such as Vulkan GTT) before each
             // slot that requires a new OS block so pinned host allocations
             // never outrun live `HostRam` headroom, OS/container reserve,
-            // `guarantee`, or standing `cap` while the owner thread is busy.
+            // `guarantee`, standing `cap`, or driver GTT submission headroom
+            // while the owner thread is busy.
             let host_guard = |at: u64| {
                 let delta = counts.host_charge(at).saturating_sub(stores.charged());
                 if delta == 0 {
@@ -869,12 +872,16 @@ impl ExpertBank {
                     .as_ref()
                     .expect("invariant violated: host tier growth without HostRam ledger")
                     .estimate();
-                let headroom = estimate.live_pinned_headroom(&sample);
+                let host_headroom = estimate.live_pinned_headroom(&sample);
+                let device_headroom = device.host_tier_headroom();
+                let headroom = device_headroom.map_or(host_headroom, |room| host_headroom.min(room));
                 let fits = headroom >= delta;
                 if !fits {
                     tracing::warn!(
-                        "host tier growth stopped before slot {at} of {to}: live pinned HostRam headroom \
-                         ({headroom} bytes; free_beyond_target={} bytes, clean_cache={} bytes, \
+                        "host tier growth stopped before slot {at} of {to}: live pinned headroom \
+                         ({headroom} bytes; host_headroom={host_headroom} bytes, \
+                         device_host_headroom={device_headroom:?} bytes, \
+                         free_beyond_target={} bytes, clean_cache={} bytes, \
                          pinned_reserve={} bytes, guarantee={} bytes) cannot back {delta} more bytes",
                         sample.supply.free_beyond_target,
                         sample.supply.clean_cache,

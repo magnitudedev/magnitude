@@ -159,24 +159,48 @@ impl ServedBank {
         self.bank.plan.host_slots > 0 && self.bank.host_tier().is_some()
     }
 
+    /// Most host slots in `[0, limit]` that fit within the host tier's current
+    /// charged bytes plus `device_room` additional bytes on the device's
+    /// host-tier heap.
+    fn device_host_slots(&self, limit: u64, device_room: u64) -> u64 {
+        let counts = &self.bank.counts;
+        let above_floor = self
+            .bank
+            .host_charged()
+            .saturating_add(device_room)
+            .saturating_sub(counts.host_charge(0));
+        let shape = BankShape::new(self.bank.plan.tier_block_bytes(BankTier::Host), 0, limit, limit);
+        crate::experts::derived::target_slots(above_floor, &shape, &|s| counts.host_charge(s))
+    }
+
     /// Start background backing of the linked host tier after domain
     /// allocation, clamped to what the fresh post-domain `HostRam` reading
-    /// actually admits. Any slots trimmed below `plan.host_slots` are shed
+    /// and any device-side host-tier heap budget (such as Vulkan's GTT heap)
+    /// actually admit. Any slots trimmed below `plan.host_slots` are shed
     /// from `BankCache` immediately so no phantom `CacheKind::Bank` bytes
     /// remain in the ledger.
     pub(crate) fn begin_host_backing(&self, ledgers: &DeviceLedgers) -> Result<(), DomainError> {
         if !self.has_planned_host_tier() {
             return Ok(());
         }
+        let trimmed = seismic::return_freed_pages();
+        if trimmed > 0 {
+            tracing::info!("returned {trimmed} freed host bytes before host tier backing");
+        }
         let host_estimate = ledgers.host().estimate();
         let planned = self.bank.plan.host_slots;
-        let clamped = crate::experts::derived::clamped_host_slots(&host_estimate, &self.bank.plan);
+        let device_room = self.bank.device.host_tier_headroom();
+        let mut clamped = crate::experts::derived::clamped_host_slots(&host_estimate, &self.bank.plan);
+        if let Some(device_room) = device_room {
+            clamped = clamped.min(self.device_host_slots(planned, device_room));
+        }
         self.bank.cache.fit(BankHolding::Host, self.above_floor(BankHolding::Host, clamped)?);
         if clamped < planned {
             tracing::info!(
                 "host tier backing clamped from {planned} to {clamped} host slots after domain allocation \
-                 (live pinned host import room {} bytes)",
+                 (live pinned host import room {} bytes, device host-tier headroom {:?} bytes)",
                 host_estimate.pinned_import_room(),
+                device_room,
             );
         }
         if clamped > 0 {
@@ -500,10 +524,13 @@ impl ElasticBank for ServedBank {
         if let Some((host, ceiling)) = self.bank.host_tier() {
             assert!(plan.tiered(), "invariant violated: a host tier beside a plan without its pool");
             let host_block = plan.tier_block_bytes(BankTier::Host);
-            let bound = match self.bank.host_backing() {
+            let mut bound = match self.bank.host_backing() {
                 true => host,
                 false => ceiling,
             };
+            if let Some(device_room) = self.bank.device.host_tier_headroom() {
+                bound = bound.min(self.device_host_slots(ceiling, device_room).max(host));
+            }
             targets.push(HoldingTarget {
                 holding: BankHolding::Host,
                 tier: self.storage(BankHolding::Host)?,
@@ -540,6 +567,14 @@ impl ElasticBank for ServedBank {
 
     fn live(&self) -> Option<LiveDecode> {
         self.bank.watcher.shared().live()
+    }
+
+    fn live_steps(&self) -> u64 {
+        self.bank.watcher.shared().live_steps()
+    }
+
+    fn host_slots(&self) -> u64 {
+        self.bank.host_slots()
     }
 
     fn measured(&self) -> Option<crate::experts::Measured> {

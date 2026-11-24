@@ -208,22 +208,35 @@ impl BankCache {
 
     /// Remove 0-byte entries from `held`, harvesting any uncollected `claimed`
     /// bytes into `self.owed` before returning them to be dropped outside the
-    /// lock.
+    /// lock. Keeps one 0-byte anchor per holding while `self.owed` is non-zero
+    /// so [`Self::restore_owed`] can re-admit freed room even if 100% of a
+    /// holding's cache was transiently yielded.
     fn prune_empty(&self, held: &mut Vec<(BankHolding, Cached)>) -> Vec<Cached> {
         let mut pruned = Vec::new();
+        let mut anchored: Vec<BankHolding> = Vec::new();
         let mut i = 0;
         while i < held.len() {
             if held[i].1.bytes() == 0 {
-                let (holding, cached) = held.remove(i);
-                let claimed = cached.take_claimed();
-                if claimed > 0 {
+                let holding = held[i].0;
+                let claimed = held[i].1.take_claimed();
+                let owes = {
                     let mut owed = self.owed.lock().expect("bank owed");
-                    match owed.iter_mut().find(|(of, _)| *of == holding) {
-                        Some((_, owes)) => *owes += claimed,
-                        None => owed.push((holding, claimed)),
+                    if claimed > 0 {
+                        match owed.iter_mut().find(|(of, _)| *of == holding) {
+                            Some((_, owes)) => *owes += claimed,
+                            None => owed.push((holding, claimed)),
+                        }
                     }
+                    owed.iter().find(|(of, _)| *of == holding).map_or(0, |(_, owes)| *owes)
+                };
+                let has_other = held.iter().enumerate().any(|(j, (of, c))| j != i && *of == holding && c.bytes() > 0);
+                if owes > 0 && !has_other && !anchored.contains(&holding) {
+                    anchored.push(holding);
+                    i += 1;
+                } else {
+                    let (_, cached) = held.remove(i);
+                    pruned.push(cached);
                 }
-                pruned.push(cached);
             } else {
                 i += 1;
             }
@@ -338,11 +351,43 @@ impl BankCache {
         let (owes, pruned) = {
             let mut held = self.held.lock().expect("bank cache");
             let owes = self.settle_owed(&held, holding, above);
+            let owes = if owes > 0 {
+                self.restore_owed(&held, holding, owes)
+            } else {
+                0
+            };
             let pruned = self.prune_empty(&mut held);
             (owes, pruned)
         };
         self.drop_pruned(pruned);
         owes
+    }
+
+    /// Re-admit up to `owes` bytes of previously yielded pooled cache back into
+    /// `holding` when free room beside `guarantee` (and any `cap`) now covers
+    /// them, clearing stale debt from transient claims that already freed their
+    /// memory before the bank shrank.
+    fn restore_owed(&self, held: &[(BankHolding, Cached)], holding: BankHolding, owes: u64) -> u64 {
+        let pinned = holding == BankHolding::Host;
+        let restored = if let Some((_, cached)) = held.iter().find(|(of, _)| *of == holding) {
+            cached.restore_claimed(owes, pinned)
+        } else {
+            let growing = self.growing.lock().expect("bank growth");
+            match growing.iter().find(|running| running.holding == holding).map(|running| &running.backing) {
+                Some(GrowingBacking::Cached(cached)) => cached.restore_claimed(owes, pinned),
+                _ => 0,
+            }
+        };
+        if restored == 0 {
+            return owes;
+        }
+        let mut owed = self.owed.lock().expect("bank owed");
+        if let Some((_, entry)) = owed.iter_mut().find(|(of, _)| *of == holding) {
+            *entry = entry.saturating_sub(restored);
+            *entry
+        } else {
+            owes.saturating_sub(restored)
+        }
     }
 
     /// Bytes taken from `holding`'s cache by shortage relief beyond what is
@@ -715,5 +760,68 @@ mod tests {
         let cache = cache_with_reclaimers(scope.changes().clone());
         cache.open_host(4, Some(first));
         cache.open_host(4, Some(second));
+    }
+
+    /// Regression test: a transient in-process allocation (e.g. prefill scratch
+    /// or graph capture via `entry_take`) that logically yields `CacheKind::Bank`
+    /// and is then freed before `follow_cache_targets` runs must NOT trigger a
+    /// spurious bank shrink-then-immediate-regrow oscillation.
+    ///
+    /// - While the transient claim is still held (`free == 0`), `BankCache::owed`
+    ///   reports the full debt so OOM safety / shrinking stays intact.
+    /// - Once the transient claim is freed (`free` covers the debt),
+    ///   `BankCache::owed` restores the yielded bytes back into `CacheKind::Bank`
+    ///   and `PoolClass::Records`, returning `owed == 0` and `shortage_shed == 0`
+    ///   (including when 100% of the holding's cache was yielded).
+    #[test]
+    fn transient_claim_release_restores_bank_cache_without_shrink() {
+        let (scope, ledger, _pool) = ledger();
+        let cache = cache_with_reclaimers(scope.changes().clone());
+        let holding = BankHolding::Experts;
+
+        // Fill the 64 GB store: 40 GB committed floor + 20 GB bank cache + 4 GB free.
+        let floor = ledger
+            .change(|keeping| ledger.claim_at(&keeping.claims(), None, crate::memory::ledger::CommittedKind::Load, 40 * GB))
+            .expect("floor fits");
+        ledger
+            .change(|_| {
+                let entry = floor.entry();
+                entry.take(&entry.change(), 40 * GB, seismic::memory::Wiring::Pageable)
+            })
+            .expect("floor allocates");
+        let above = 20 * GB;
+        let bank_piece = ledger.cached(CacheKind::Bank, above).expect("bank fits");
+        cache.hold(holding, bank_piece);
+        let allocated_before = ledger.estimate().allocated();
+
+        // A transient 10 GB prefill claim takes 4 GB free room + 6 GB logically
+        // yielded from `CacheKind::Bank`.
+        let prefill = ledger
+            .change(|keeping| ledger.claim_at(&keeping.claims(), None, crate::memory::ledger::CommittedKind::Request(crate::operation::RequestId(1)), 10 * GB))
+            .expect("transient prefill claim takes 4 GB free + 6 GB bank cache");
+        assert_eq!(ledger.estimate().cache_of(CacheKind::Bank), 14 * GB, "6 GB logically yielded from bank");
+
+        // While the transient prefill claim is still alive (`free == 0`), `owed` MUST report 6 GB!
+        assert_eq!(cache.owed(holding, above), 6 * GB, "live claim keeps 6 GB owed for OOM safety");
+        assert_eq!(cache.shortage_shed(holding, above, 6 * GB), 0);
+
+        // Now prefill finishes and drops its transient claim: free room rebounds to 10 GB >= 6 GB.
+        drop(prefill);
+        assert_eq!(cache.owed(holding, above), 0, "freed transient claim restores stale bank debt to 0");
+        assert_eq!(cache.shortage_shed(holding, above, 0), 0, "no residual shortage_shed after restore");
+        assert_eq!(ledger.estimate().cache_of(CacheKind::Bank), above, "ledger bank cache fully restored");
+        assert_eq!(ledger.estimate().allocated(), allocated_before, "total allocated invariant preserved");
+
+        // Also verify the 100%-yielded case: a 24 GB transient claim drains all 20 GB of `CacheKind::Bank`
+        // to 0 bytes while alive, `owed` keeps a 0-byte anchor, and dropping the claim restores all 20 GB.
+        let full_prefill = ledger
+            .change(|keeping| ledger.claim_at(&keeping.claims(), None, crate::memory::ledger::CommittedKind::Request(crate::operation::RequestId(2)), 24 * GB))
+            .expect("24 GB transient claim drains all 20 GB bank cache");
+        assert_eq!(ledger.estimate().cache_of(CacheKind::Bank), 0);
+        assert_eq!(cache.owed(holding, above), above, "100%-yielded live claim reports full 20 GB owed");
+        drop(full_prefill);
+        assert_eq!(cache.owed(holding, above), 0, "100%-yielded bank cache restores completely once claim drops");
+        assert_eq!(ledger.estimate().cache_of(CacheKind::Bank), above);
+        assert_eq!(ledger.estimate().allocated(), allocated_before);
     }
 }

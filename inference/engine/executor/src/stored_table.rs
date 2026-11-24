@@ -51,7 +51,7 @@
 
 use crate::device_table::KeptRows;
 use crate::planning::DirectoryForm;
-use crate::slot_directory::SlotDirectory;
+use crate::slot_directory::{BitSet, SlotDirectory};
 use magnitude_family_contracts::WeightDescriptor;
 use seismic_io::{Reader, Ended, Range, Want};
 use seismic::cpu::repack::RowConversion;
@@ -107,30 +107,49 @@ impl Prefetched {
 /// the absence of one nor a hold is ever compared against the timeline,
 /// whose comparison (CUDA's wraps a 32-bit word) reads only values near its
 /// own.
+/// Packed per-slot retention tag (8 bytes instead of a 16-byte enum):
+/// - `0` = `FREE` (no step or prefetch keeps the slot)
+/// - `u64::MAX` = `HELD` (a prefetch holds the slot)
+/// - `1..u64::MAX` = step number whose read still uses the slot
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum Named {
-    Free,
-    Step(u64),
-    Held,
-}
+#[repr(transparent)]
+struct Named(u64);
 
 impl Named {
+    const FREE: Self = Self(0);
+    const HELD: Self = Self(u64::MAX);
+
     /// What a step names: nothing before the first step (0), which no read
-    /// awaits.
+    /// awaits (`FREE`).
     fn by(step: u64) -> Self {
-        match step {
-            0 => Self::Free,
-            step => Self::Step(step),
-        }
+        assert_ne!(step, u64::MAX, "stored table step counter exhausted u64::MAX");
+        Self(step)
+    }
+
+    #[inline]
+    fn is_held(self) -> bool {
+        self.0 == Self::HELD.0
+    }
+
+    /// Whether this slot is named by `step` (`0` and `u64::MAX` are sentinel
+    /// tags, never live steps).
+    #[inline]
+    fn is_step(self, step: u64) -> bool {
+        step != Self::FREE.0 && step != Self::HELD.0 && self.0 == step
+    }
+
+    #[inline]
+    fn step(self) -> Option<u64> {
+        (self.0 != Self::FREE.0 && self.0 != Self::HELD.0).then_some(self.0)
     }
 
     /// Whether the slot is free by `read`: no step named its row, or that
     /// step's read is done.
     fn free(self, read: &seismic::Timeline<Reached>) -> Result<bool, seismic::ExecutionError> {
-        match self {
-            Self::Free => Ok(true),
-            Self::Step(step) => read.reached(step),
-            Self::Held => Ok(false),
+        match self.0 {
+            0 => Ok(true),
+            u64::MAX => Ok(false),
+            step => read.reached(step),
         }
     }
 }
@@ -560,8 +579,8 @@ struct State {
     named: Vec<Named>,
     /// Per slot, whether a step named its row, here or when the table was
     /// last served.
-    served: Vec<bool>,
-    /// The rows prefetches hold (their slots `Named::Held`), each with the
+    served: BitSet,
+    /// The rows prefetches hold (their slots `Named::HELD`), each with the
     /// holders holding it.
     holds: HashMap<u64, Vec<u64>>,
 }
@@ -661,8 +680,8 @@ impl StoredTable {
             state: Mutex::new(State {
                 slots: slots_store,
                 directory,
-                named: vec![Named::Free; slots as usize],
-                served: vec![false; slots as usize],
+                named: vec![Named::FREE; slots as usize],
+                served: BitSet::new(slots as usize),
                 holds: HashMap::new(),
             }),
             failures: Mutex::new(BTreeMap::new()),
@@ -1039,7 +1058,7 @@ impl Shared {
         // A row outside the table fails the step that names it.
         for &row in rows.iter().filter(|row| **row < self.rows && seen.insert(**row)) {
             if let Some(slot) = state.directory.use_slot(row) {
-                state.named[slot as usize] = Named::Held;
+                state.named[slot as usize] = Named::HELD;
                 hold(&mut state.holds, row, holder);
                 continue;
             }
@@ -1060,7 +1079,7 @@ impl Shared {
             match state.directory.try_free(kept) {
                 Ok(Some((slot, _))) => {
                     // Free until its row is read in.
-                    state.named[slot] = Named::Free;
+                    state.named[slot] = Named::FREE;
                     claimed.insert(slot);
                     taken.push(slot);
                 }
@@ -1079,8 +1098,8 @@ impl Shared {
         for ((row, slot), error) in absent.iter().zip(&taken).zip(errors) {
             if error.is_none() {
                 state.directory.hold(*row, *slot, true);
-                state.served[*slot] = false;
-                state.named[*slot] = Named::Held;
+                state.served.clear(*slot);
+                state.named[*slot] = Named::HELD;
                 hold(&mut state.holds, *row, holder);
             }
         }
@@ -1100,8 +1119,8 @@ impl Shared {
             holders.retain(|held| *held != holder);
             let kept = !holders.is_empty();
             if let (false, Some(slot)) = (kept, directory.slot(*row)) {
-                if named[slot as usize] == Named::Held {
-                    named[slot as usize] = Named::Free;
+                if named[slot as usize].is_held() {
+                    named[slot as usize] = Named::FREE;
                 }
             }
             kept
@@ -1146,11 +1165,11 @@ impl Shared {
         for row in naming.keys().copied() {
             match state.directory.use_slot(row) {
                 Some(slot) => {
-                    if state.named[slot as usize] == Named::Held {
+                    if state.named[slot as usize].is_held() {
                         state.holds.remove(&row);
                     }
                     state.named[slot as usize] = Named::by(step);
-                    state.served[slot as usize] |= served;
+                    state.served.or_assign(slot as usize, served);
                 }
                 None => absent.push(row),
             }
@@ -1174,7 +1193,7 @@ impl Shared {
                 let kept = |slot: usize| {
                     Ok(claimed.contains(&slot)
                         || !held.holds(slot)
-                        || named[slot] == Named::Step(step)
+                        || named[slot].is_step(step)
                         || !named[slot].free(read)?)
                 };
                 let free = directory.try_free(kept).map_err(|error: seismic::ExecutionError| format!("the stored table's reads: {error}"))?;
@@ -1185,10 +1204,7 @@ impl Shared {
                 // holds: wait for the oldest such read.
                 let oldest = state.named
                     .iter()
-                    .filter_map(|named| match *named {
-                        Named::Step(named) if named != step => Some(named),
-                        Named::Free | Named::Step(_) | Named::Held => None,
-                    })
+                    .filter_map(|named| named.step().filter(|&n| n != step))
                     .min()
                     .ok_or("a step names more rows than the table has slots")?;
                 drop(state);
@@ -1209,7 +1225,7 @@ impl Shared {
             match error {
                 None => {
                     state.directory.hold(*row, *slot, true);
-                    state.served[*slot] = served;
+                    state.served.set_to(*slot, served);
                 }
                 Some(error) => {
                     failed.extend(naming[row].iter().copied());
@@ -1337,8 +1353,8 @@ impl Shared {
             .records()
             .map(|record| {
                 let slots = record * record_rows..(record + 1) * record_rows;
-                let held = slots.clone().filter(|slot| state.named[*slot] == Named::Held).count();
-                let served = slots.clone().filter(|slot| state.served[*slot]).count();
+                let held = slots.clone().filter(|slot| state.named[*slot].is_held()).count();
+                let served = slots.clone().filter(|slot| state.served.get(*slot)).count();
                 let rows = slots.filter(|slot| state.directory.held(*slot).is_some()).count();
                 ((held, served, rows, std::cmp::Reverse(record)), record)
             })
@@ -1348,8 +1364,8 @@ impl Shared {
         for &record in &evicted {
             for slot in record * record_rows..(record + 1) * record_rows {
                 state.directory.release(slot);
-                state.named[slot] = Named::Free;
-                state.served[slot] = false;
+                state.named[slot] = Named::FREE;
+                state.served.clear(slot);
             }
         }
         // The rows the evicted records held are no longer held.
@@ -1386,7 +1402,7 @@ impl Shared {
             return;
         };
         let mut rows = (0..state.named.len())
-            .filter(|slot| state.served[*slot])
+            .filter(|slot| state.served.get(*slot))
             .filter_map(|slot| state.directory.held(slot))
             .collect::<Vec<_>>();
         rows.sort_unstable();
@@ -2117,6 +2133,32 @@ mod tests {
             }
             std::fs::remove_file(path).unwrap();
             std::fs::remove_dir_all(kept).unwrap();
+        }
+    }
+
+    #[test]
+    fn packed_named_preserves_free_held_and_steps_in_8_bytes() {
+        assert_eq!(std::mem::size_of::<Named>(), std::mem::size_of::<u64>());
+
+        assert_eq!(Named::by(0), Named::FREE);
+        assert!(!Named::FREE.is_held());
+        assert!(!Named::FREE.is_step(0));
+        assert!(!Named::FREE.is_step(1));
+        assert_eq!(Named::FREE.step(), None);
+
+        assert!(Named::HELD.is_held());
+        assert!(!Named::HELD.is_step(0));
+        assert!(!Named::HELD.is_step(u64::MAX));
+        assert_eq!(Named::HELD.step(), None);
+
+        for step in [1u64, 2, 42, u32::MAX as u64, u64::MAX - 1] {
+            let named = Named::by(step);
+            assert_ne!(named, Named::FREE);
+            assert!(!named.is_held());
+            assert!(named.is_step(step));
+            assert!(!named.is_step(0));
+            assert!(!named.is_step(step.wrapping_sub(1)));
+            assert_eq!(named.step(), Some(step));
         }
     }
 }

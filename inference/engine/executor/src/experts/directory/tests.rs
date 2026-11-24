@@ -91,7 +91,14 @@ fn the_directory_names_map_words_at_the_plans_homes() {
     let backend = seismic::BackendName::Metal;
     let resident = crate::ModelLoadPlan::derive(&manifest, &definition, selection, crate::resident_layout(crate::ExecutionPath::Native, backend), crate::PlannedMethod::Plain, crate::planning::fixtures::LIMITS).unwrap();
     let host = crate::planning::HostTier::Unified(crate::planning::Parking::InKernels);
-    let substrate = crate::planning::bank_substrate(backend, seismic::NativeAllocations::EXACT, Some(host), &definition).unwrap();
+    let substrate = crate::planning::bank_substrate(
+        backend,
+        seismic::NativeAllocations::EXACT,
+        Some(host),
+        backend.fills_beside_compute(),
+        &definition,
+    )
+    .unwrap();
     let floor = resident.bank_floor(&definition, 1, crate::FlightDepth::PIPELINED, substrate).unwrap();
     let load = resident.with_expert_bank(&definition, floor, None, 1, crate::FlightDepth::PIPELINED, substrate).unwrap();
     let plan = load.expert_bank().unwrap();
@@ -2233,9 +2240,15 @@ fn decode_transient_budget_eliminates_dma_overflow_for_m6_k8_by_construction() {
     }
     assert!(directory.settle_changes());
     // Run promotions up to full budget: `Directory::promotions` MUST leave
-    // `demand_free_floor == 48` free slots untouched for on-demand decode DMA.
+    // `demand_free_floor == K` free slots untouched for on-demand decode DMA.
     let wants = steps.unbegun(|at| directory.promotions(at, present));
     assert!(!wants.promotions.is_empty());
+    for p in &wants.promotions {
+        let tier = directory.hold_tier(p.layer, p.expert).expect("promoted expert is in host tier");
+        directory.copy(p.group, p.record, tier, 0);
+    }
+    let completed: Vec<(usize, BankRecord)> = wants.promotions.iter().map(|p| (p.group, p.record)).collect();
+    directory.promoted(completed, at(step1, 0), &steps);
     assert!(
         directory.bank_free_count(0) >= budget.demand_floor,
         "promotions must preserve >= {} free slots, left {}",
@@ -2244,17 +2257,31 @@ fn decode_transient_budget_eliminates_dma_overflow_for_m6_k8_by_construction() {
     );
 
     // Claim M*K = 48 unheld distinct misses in layer 0 in a single verify burst:
-    // zero `DemandSlotClaim::Overflow` by construction!
+    // Free + StageIdle borrow + `reclaim_served_demand_landings` give zero overflow!
     let mut claimed = 0usize;
-    let mut overflow = 0usize;
-    for &tier_rec in tier_records.iter().skip(100).take(m_max * k) {
+    let mut overflows = Vec::new();
+    for (idx, &tier_rec) in tier_records.iter().skip(100).take(m_max * k).enumerate() {
         match directory.claim_demand_landing(0, tier_rec, false, |_| true) {
             DemandSlotClaim::Allocated { .. } | DemandSlotClaim::AlreadyHeld { .. } => claimed += 1,
-            DemandSlotClaim::Overflow { .. } => overflow += 1,
+            DemandSlotClaim::Overflow { staged } => overflows.push((idx, staged)),
         }
     }
-    assert_eq!(overflow, 0, "M=6, K=8 must have dma_overflow == 0 by construction");
-    assert_eq!(claimed, m_max * k);
+    if !overflows.is_empty() {
+        let progress = at(step1, 0);
+        let reclaimed = steps.unbegun_with_served(progress, directory.layers(), |at_unbegun, park, is_served| {
+            directory.reclaim_served_demand_landings(
+                0,
+                &overflows,
+                at_unbegun,
+                park,
+                progress,
+                is_served,
+                |_| true,
+            )
+        });
+        claimed += reclaimed.len();
+    }
+    assert_eq!(claimed, m_max * k, "M=6, K=8 must have dma_overflow == 0 with served-victim reclaim");
 }
 
 #[test]
@@ -2491,11 +2518,11 @@ fn set_decode_rows_scales_dynamically_for_8_group_deepseek() {
     assert_eq!(reserve_m4, 8 * 22);
     assert!(reserve_m4 < 200, "M=4 8-group reserve must stay ~176 (not 701!), got {reserve_m4}");
 
-    // Alternating M=1 plain step after M=4 verify keeps the monotonic high-water
-    // mark (`M=4`) so the next M=4 verify step has zero `dma_overflow`.
+    // Returning to M=1 plain decode shrinks reserve back to 8 * K = 48 instead
+    // of permanently locking to a wide verify spike.
     directory.set_decode_rows(1);
     let reserve_after_m1: usize = (0..8).map(|g| directory.reserved(g)).sum();
-    assert_eq!(reserve_after_m1, reserve_m4, "monotonic high-water mark preserves M=4 floor across M=1 plain steps");
+    assert_eq!(reserve_after_m1, 8 * k, "live set_decode_rows shrinks back to M=1 floor");
 
     // 8 target groups + 1 non-splitting DSpark draft group (16 slots/layer = 48):
     // draft group 8 keeps `demand_floor == 0` (`vram_reserve == 0`) so total
@@ -2595,6 +2622,8 @@ fn deepseek_v41_rtx5090_8_group_all_five_invariants() {
             link: PassLine { weights: ns(ns_of_gbs(b_dma_gbs).get() as u32 + resident_ns), row: ns(100) },
             resident: PassLine { weights: ns(resident_ns), row: ns(100) },
             moves: Moves::NONE,
+            baseline_dma: None,
+            contended_link: None,
         },
     };
     let gen5 = make_lines(43.57, 47.80, 43.0);
@@ -2641,8 +2670,9 @@ fn deepseek_v41_rtx5090_8_group_all_five_invariants() {
     assert!(directory.in_tier(0, 0), "evicted VRAM expert must stay resident in HostTier (0 NVMe drop)");
     assert!(directory.host(0).holds_alone((0, 0)), "Kept::Banked flipped to Kept::Alone at zero D2H cost");
 
-    // Invariant 5: Speculative Drive prefetch defers when `host_memory_binds() && demand_active()`,
-    // and strict deadline ordering `Parked(0) < Streamed(1) < Expected(2) < None(3)`.
+    // Invariant 5: `host_memory_binds()` and `transport.demand_active()` track
+    // shared HostMemory binding and live demand flight, and strict deadline
+    // ordering `Parked(0) < Streamed(1) < Expected(2) < None(3)`.
     let drive_line = ReadLine::new(0.14e-3, 1.0 / 4.6e9).unwrap();
     let drive_mem_bound = PathAdmission::drive(
         Terms { compute: 0.050, drive: 0.025, link: 0.035, cpu: 0.010, memory: 0.060 },
@@ -2870,4 +2900,679 @@ fn seed_with_allow_evict_never_evicts_transport_pinned_held_slot() {
     assert_eq!(seeds_after[0].0, 5);
     assert_eq!(seeds_after[0].1.index(), slot);
     assert_eq!(evicted_after, vec![(0, 0)]);
+}
+
+/// Fix 4: An already-served demand miss at `(S, layer 0)` must NOT receive
+/// `+1.0` `Unlogged` immunity when a later layer `(S, layer 1)` needs a demand
+/// victim — the 1-shot cold demand miss is evicted while the genuinely hot
+/// expert survives. Conversely, a strictly future unconsumed read-ahead at
+/// `(S, layer 2)` (`layer > parked_layer`) or `(S + 1, ...)` retains protection.
+#[test]
+fn already_served_demand_miss_does_not_get_unlogged_immunity_against_hot_expert() {
+    use crate::experts::horizon::{Advance, Tokens};
+    use crate::experts::host_records::{Demand, Taking};
+    use crate::experts::reuse::{Evidence, Reuse};
+
+    // 3 layers sharing 1 pooled group of 2 records (unified memory host tier).
+    let steps = std::sync::Arc::new(steps());
+    steps.begin_through(41);
+    let (mut directory, _) = one_store_on(&steps, 2, 3, 16);
+    let time = directory.time().clone();
+    let ranking = directory.ranking();
+
+    // Warm up Reuse for steps 1..=40: (layer 0, expert 0) is hot every step;
+    // (layer 0, expert 7) and (layer 2, expert 9) are never read.
+    for step in 1..=40u64 {
+        time.lock().register(step, Advance::Known(Tokens::new(1.0)));
+        let mut reuse = Reuse::of(&ranking);
+        reuse.read(&RoutedRead { sequence: step, layer: 0, experts: vec![0], choices: 1 }, None, Evidence::Decode);
+        reuse.read(&RoutedRead { sequence: step, layer: 1, experts: vec![1 + (step as usize % 10)], choices: 1 }, None, Evidence::Decode);
+        reuse.read(&RoutedRead { sequence: step, layer: 2, experts: vec![1 + (step as usize % 10)], choices: 1 }, None, Evidence::Decode);
+        if step % 2 == 0 {
+            time.lock().moved(0, crate::experts::horizon::Tier::COMPUTE);
+        }
+    }
+
+    // Step S = 41 (not yet logged into Reuse):
+    // - Record 0 holds hot expert (0, 0) from prior steps (read = None).
+    // - Record 1 holds 1-shot cold demand miss (0, 7) that just landed at (S=41, layer=0).
+    let step = 41u64;
+    let Claim::Taken(g0) = directory.claim_landing(0, 0, 0, Taking::Out, (|_, _| (), |_, _| true)) else {
+        panic!("free slot for hot (0, 0)");
+    };
+    directory.landed(0, HostRecord(g0.record()), 0, None);
+    let Claim::Taken(g1) = directory.claim_landing(0, 7, 0, Taking::Out, (|_, _| (), |_, _| true)) else {
+        panic!("free slot for cold demand miss (0, 7)");
+    };
+    directory.landed(0, HostRecord(g1.record()), 7, Some(step));
+
+    // Layer 1 in step S=41 parks and claims a demand victim.
+    let park_l1 = steps.park(at(step, 1), 3);
+    let Claim::Taken(victim) = directory.claim_demand((1, 5), Demand::Lacked, &[], &park_l1) else {
+        panic!("expected demand claim to evict a victim");
+    };
+    assert_eq!(
+        victim.record(),
+        g1.record(),
+        "already-served cold demand miss (0, 7) at (S, layer 0) must be evicted, not hot expert (0, 0)"
+    );
+    directory.landed(1, HostRecord(victim.record()), 5, Some(step));
+
+    // Now test the converse: a FUTURE unconsumed read-ahead for (S=41, layer=2)
+    // while parked at (S=41, layer=1) -> layer 2 > parked_layer 1 retains +1.0 protection.
+    let steps2 = std::sync::Arc::new(super::Steps::new(
+        crate::planning::FlightDepth::SERIAL,
+        1,
+        crate::experts::exchange::Pulse::new(),
+    ));
+    steps2.begin_through(41);
+    let (mut dir2, _) = one_store_on(&steps2, 2, 3, 16);
+    let time2 = dir2.time().clone();
+    let ranking2 = dir2.ranking();
+    for s in 1..=40u64 {
+        time2.lock().register(s, Advance::Known(Tokens::new(1.0)));
+        let mut reuse = Reuse::of(&ranking2);
+        // Expert (0, 0) chosen every 4th step (~25%) so N < 1.0 within short τ.
+        let e0 = if s % 4 == 0 { 0 } else { 1 + (s as usize % 12) };
+        reuse.read(&RoutedRead { sequence: s, layer: 0, experts: vec![e0], choices: 1 }, None, Evidence::Decode);
+        reuse.read(&RoutedRead { sequence: s, layer: 1, experts: vec![1 + (s as usize % 12)], choices: 1 }, None, Evidence::Decode);
+        reuse.read(&RoutedRead { sequence: s, layer: 2, experts: vec![1 + (s as usize % 12)], choices: 1 }, None, Evidence::Decode);
+        time2.lock().moved(0, crate::experts::horizon::Tier::COMPUTE);
+    }
+    let Claim::Taken(h0) = dir2.claim_landing(0, 0, 0, Taking::Out, (|_, _| (), |_, _| true)) else {
+        panic!("free slot for (0, 0)");
+    };
+    dir2.landed(0, HostRecord(h0.record()), 0, None);
+    let Claim::Taken(h1) = dir2.claim_landing(2, 9, 0, Taking::Out, (|_, _| (), |_, _| true)) else {
+        panic!("free slot for future read-ahead (2, 9)");
+    };
+    dir2.landed(2, HostRecord(h1.record()), 9, Some(step));
+    let park2 = steps2.park(at(step, 1), 3);
+    let Claim::Taken(evicted2) = dir2.claim_demand((1, 5), Demand::Lacked, &[], &park2) else {
+        panic!("expected demand claim");
+    };
+    assert_eq!(
+        evicted2.record(),
+        h0.record(),
+        "future unconsumed read-ahead (2, 9) at layer 2 > parked layer 1 must keep +1.0 protection"
+    );
+}
+
+/// Synthetic mixed-layer pooled replay (stationary Zipf + short-burst layers)
+/// comparing online `Recency::Reuse` against clairvoyant Belady `Recency::NextRead`.
+#[test]
+fn pooled_mixed_layer_replay_tracks_belady_closely() {
+    // 4 layers in 1 pooled bank of 12 records, 64 experts per layer, 300 steps:
+    // - Layers 0 & 1: stationary Zipf (4 hot experts each hit ~60% of the time + cold tail)
+    // - Layers 2 & 3: rapidly shifting 1-shot/short-burst traffic
+    let mut reads = Vec::with_capacity(4 * 300);
+    for step in 1..=300u64 {
+        let s = step as usize;
+        for layer in 0..2 {
+            let hot = (s + layer) % 4;
+            let e = if s % 5 != 0 { hot } else { 4 + ((s * 7 + layer * 13) % 60) };
+            reads.push(RoutedRead { sequence: step, layer, experts: vec![e], choices: 1 });
+        }
+        for layer in 2..4 {
+            let burst = ((step - 1) / 3) as usize;
+            let e = (burst * 3 + layer * 17) % 64;
+            reads.push(RoutedRead { sequence: step, layer, experts: vec![e], choices: 1 });
+        }
+    }
+    let held = vec![Vec::new(); 4];
+    let online = replay(&[12], &[0, 0, 0, 0], 64, &held, &reads, Recency::Reuse).expect("online replay");
+    let belady = replay(&[12], &[0, 0, 0, 0], 64, &held, &reads, Recency::NextRead).expect("belady replay");
+    let online_misses: u64 = online.misses.iter().sum();
+    let belady_misses: u64 = belady.misses.iter().sum();
+    let ratio = online_misses as f64 / belady_misses.max(1) as f64;
+    eprintln!("mixed-layer pooled replay: online={online_misses}, belady={belady_misses}, ratio={ratio:.3}x");
+    assert!(
+        ratio < 1.35,
+        "online ranker ({online_misses}) should be within 1.35x of Belady ({belady_misses}), got {ratio:.3}x"
+    );
+}
+
+/// `reclaim_served_demand_landings` reclaims ONLY already-served `Record::Held`
+/// victims (`steps.served(from, until, v_layer, progress) == true`), never
+/// unserved layers (`v_layer >= current_layer`), never pinned slots
+/// (`!can_reuse(slot)`), and preserves `HostTier` copies when write-back does
+/// not pay (`Kept::Banked -> Kept::Alone`).
+#[test]
+fn reclaim_served_demand_landings_evicts_only_served_unpinned_victims() {
+    use crate::experts::host_records::{Claim, Taking};
+
+    let layers = 2usize;
+    let experts = 16usize;
+    let present = 6usize; // 6 total VRAM slots, 0 free once filled
+    let map_words = magnitude_kernels::constants::MAP_WORDS;
+    let bank_maps = (0..layers)
+        .map(|_| StampedMap::new(cpu_words(&[experts as u64, map_words], 0)))
+        .collect::<Vec<_>>();
+    let tier_maps = (0..layers)
+        .map(|_| crate::experts::map::LandingMap::Tier(cpu_words(&[experts as u64], -1)))
+        .collect::<Vec<_>>();
+    let host = HostTier {
+        records: vec![(layers * experts) as u32],
+        lent: vec![0],
+        reserve: 0,
+        placement: Placement::Tier { bank_maps, tier_maps, lent: (0, 0), stage_slots: vec![0] },
+    };
+    let mut directory = Directory::new(&[present], &[0, 0], &[experts, experts], host);
+    for layer in 0..layers {
+        directory.price_copies(layer, Some(0.0));
+        // Zero write-back (discrete GPU where HostTier retains copy / NVMe holds it).
+        directory.price_write_backs(layer, None);
+        for expert in 0..experts {
+            let Claim::Taken(grant) = directory.claim_landing(layer, expert, 0, Taking::Out, (|_, _| (), |_, _| true)) else {
+                panic!("host tier has room");
+            };
+            directory.landed(layer, HostRecord(grant.record()), expert, Some(1));
+        }
+    }
+
+    let steps = steps();
+    let step0 = steps.begin_group(1, None);
+    // Log reads so layer 0 experts 0..3 and layer 1 experts 0..3 are promoted into all 6 VRAM slots.
+    log(&directory, step0, 0, &[0, 1, 2]);
+    log(&directory, step0, 1, &[0, 1, 2]);
+    assert!(directory.settle_changes());
+    let wants = steps.unbegun(|at| directory.promotions(at, present));
+    assert_eq!(wants.promotions.len(), present, "all 6 VRAM slots should be promoted");
+    for p in &wants.promotions {
+        let tier = directory.hold_tier(p.layer, p.expert).expect("promoted expert is in host tier");
+        directory.copy(p.group, p.record, tier, 0);
+    }
+    let completed: Vec<(usize, BankRecord)> = wants.promotions.iter().map(|p| (p.group, p.record)).collect();
+    directory.promoted(completed, at(step0, 0), &steps);
+    steps.end_played(step0);
+    assert_eq!(directory.bank_free_count(0), 0, "zero free slots remain");
+
+    // Begin step1 and advance to layer 1 (`progress = at(step1, 1)`):
+    // Layer 0 is already served; Layer 1 is NOT yet served.
+    let step1 = steps.begin_group(1, None);
+    let progress = at(step1, 1);
+
+    let layer0_slots: Vec<usize> = (0..3).filter_map(|e| directory.held(0, e)).collect();
+    let layer1_slots: Vec<usize> = (0..3).filter_map(|e| directory.held(1, e)).collect();
+    assert_eq!(layer0_slots.len(), 3);
+    assert_eq!(layer1_slots.len(), 3);
+
+    // Pin one layer-0 slot via `can_reuse` so only 2 of the 3 layer-0 slots are eligible.
+    let pinned_slot = layer0_slots[0];
+    let overflows = vec![(0, Some((1, 10))), (1, Some((1, 11))), (2, Some((1, 12)))];
+    let reclaimed = steps.unbegun_with_served(progress, directory.layers(), |at, park, is_served| {
+        directory.reclaim_served_demand_landings(0, &overflows, at, park, progress, is_served, |slot| slot != pinned_slot)
+    });
+
+    assert_eq!(
+        reclaimed.len(),
+        2,
+        "only the 2 unpinned served layer-0 slots may be reclaimed (never pinned slot or unserved layer 1)"
+    );
+    for &(_, _, slot) in &reclaimed {
+        assert_ne!(slot, pinned_slot, "pinned slot must never be reclaimed");
+        assert!(layer0_slots.contains(&slot), "reclaimed slot {slot} must come from served layer 0, not unserved layer 1");
+        assert!(!layer1_slots.contains(&slot), "unserved layer 1 slot {slot} must never be reclaimed");
+    }
+    // Unserved layer 1 experts remain 100% held.
+    for e in 0..3 {
+        assert!(directory.held(1, e).is_some(), "layer 1 expert {e} must remain held");
+    }
+    // Pinned layer 0 expert remains held; the 2 reclaimed slots are now DemandLanding (not Free, not Held).
+    assert_eq!(directory.bank_free_count(0), 0);
+}
+
+/// At layer 0 of a multi-layer group (where 0 earlier layers exist),
+/// `reclaim_served_demand_landings` reclaims held slots from later unsubmitted
+/// layers (`v_layer > 0`) by unmapping them at `park.unresolved(v_layer)`
+/// (`<= step1`), guaranteeing `step1` sees a miss when it reaches `v_layer`
+/// while NEVER reclaiming from the current layer (`v_layer == 0`, whose
+/// `DecodeHits` is already in flight).
+#[test]
+fn reclaim_served_demand_landings_reclaims_later_layers_at_layer_zero_and_unmaps_before_step() {
+    use crate::experts::host_records::{Claim, Taking};
+
+    let layers = 3usize;
+    let experts = 16usize;
+    let present = 9usize; // 3 held per layer, 0 free once filled
+    let map_words = magnitude_kernels::constants::MAP_WORDS;
+    let bank_maps = (0..layers)
+        .map(|_| StampedMap::new(cpu_words(&[experts as u64, map_words], 0)))
+        .collect::<Vec<_>>();
+    let tier_maps = (0..layers)
+        .map(|_| crate::experts::map::LandingMap::Tier(cpu_words(&[experts as u64], -1)))
+        .collect::<Vec<_>>();
+    let host = HostTier {
+        records: vec![(layers * experts) as u32],
+        lent: vec![0],
+        reserve: 0,
+        placement: Placement::Tier { bank_maps, tier_maps, lent: (0, 0), stage_slots: vec![0] },
+    };
+    let mut directory = Directory::new(&[present], &[0, 0, 0], &[experts, experts, experts], host);
+    for layer in 0..layers {
+        directory.price_copies(layer, Some(0.0));
+        directory.price_write_backs(layer, None);
+        for expert in 0..experts {
+            let Claim::Taken(grant) = directory.claim_landing(layer, expert, 0, Taking::Out, (|_, _| (), |_, _| true)) else {
+                panic!("host tier has room");
+            };
+            directory.landed(layer, HostRecord(grant.record()), expert, Some(1));
+        }
+    }
+
+    let steps = steps();
+    let step0 = steps.begin_group(1, None);
+    for layer in 0..layers {
+        log(&directory, step0, layer, &[0, 1, 2]);
+    }
+    assert!(directory.settle_changes());
+    let wants = steps.unbegun(|at| directory.promotions(at, present));
+    assert_eq!(wants.promotions.len(), present);
+    for p in &wants.promotions {
+        let tier = directory.hold_tier(p.layer, p.expert).expect("promoted expert is in host tier");
+        directory.copy(p.group, p.record, tier, 0);
+    }
+    let completed: Vec<(usize, BankRecord)> = wants.promotions.iter().map(|p| (p.group, p.record)).collect();
+    directory.promoted(completed, at(step0, 0), &steps);
+    steps.end_played(step0);
+    assert_eq!(directory.bank_free_count(0), 0);
+
+    // Begin step1 at layer 0 (`progress = at(step1, 0)`):
+    // Layer 0 is the CURRENT layer (must NEVER be reclaimed);
+    // Layers 1 and 2 have not yet been submitted and MUST be reclaimable with
+    // `MAP_UNTIL == step1` so `step1` misses when it reaches them.
+    let step1 = steps.begin_group(1, None);
+    let progress = at(step1, 0);
+    let layer0_slots: Vec<usize> = (0..3).filter_map(|e| directory.held(0, e)).collect();
+    assert_eq!(layer0_slots.len(), 3);
+
+    let overflows: Vec<(usize, Option<(usize, usize)>)> = (0..6).map(|i| (i, Some((0, 10 + i)))).collect();
+    let reclaimed = steps.unbegun_with_served(progress, directory.layers(), |at, park, is_served| {
+        directory.reclaim_served_demand_landings(0, &overflows, at, park, progress, is_served, |_| true)
+    });
+
+    assert_eq!(
+        reclaimed.len(),
+        6,
+        "all 6 slots from later layers (1 & 2) must be reclaimed at layer 0"
+    );
+    for &(_, _, slot) in &reclaimed {
+        assert!(!layer0_slots.contains(&slot), "current layer 0 slot {slot} must never be reclaimed");
+    }
+    // Current layer 0 experts remain 100% held and resolvable for step1.
+    for e in 0..3 {
+        assert!(directory.held(0, e).is_some(), "layer 0 expert {e} must remain held");
+        assert!(directory.resolve(0, e, step1).is_some(), "layer 0 expert {e} must remain mapped for step1");
+    }
+    // Reclaimed later-layer experts must be unmapped for step1 (`resolve == None`).
+    for layer in 1..layers {
+        for e in 0..3 {
+            assert!(directory.held(layer, e).is_none(), "later layer {layer} expert {e} was reclaimed");
+            assert!(
+                directory.resolve(layer, e, step1).is_none(),
+                "reclaimed later layer {layer} expert {e} must be unmapped before step1 so step1 never reads overwritten slot"
+            );
+        }
+    }
+}
+
+/// On a 3-tier bank where held VRAM experts have surrendered their host copies
+/// (`Located::Lacked`) and `exits.leaving(...).back.is_some()` (write-back pays),
+/// `reclaim_served_demand_landings` prefers `back.is_none()` victims first and
+/// falls back to `back.is_some()` victims rather than overflowing to SM zero-copy.
+#[test]
+fn reclaim_served_demand_landings_falls_back_to_writeback_victims_on_three_tier_bank() {
+    use crate::experts::host_records::{Claim, Taking};
+
+    let layers = 2usize;
+    let experts = 16usize;
+    let present = 4usize; // 2 held per layer, 0 free once filled
+    let map_words = magnitude_kernels::constants::MAP_WORDS;
+    let bank_maps = (0..layers)
+        .map(|_| StampedMap::new(cpu_words(&[experts as u64, map_words], 0)))
+        .collect::<Vec<_>>();
+    let tier_maps = (0..layers)
+        .map(|_| crate::experts::map::LandingMap::Tier(cpu_words(&[experts as u64], -1)))
+        .collect::<Vec<_>>();
+    let host = HostTier {
+        records: vec![8], // 3-tier bank: 4 VRAM, 8 host, 32 total experts
+        lent: vec![0],
+        reserve: 0,
+        placement: Placement::Tier { bank_maps, tier_maps, lent: (0, 0), stage_slots: vec![0] },
+    };
+    let mut directory = Directory::new(&[present], &[0, 0], &[experts, experts], host);
+    for layer in 0..layers {
+        directory.price_copies(layer, Some(1.0));
+        for expert in 0..4 {
+            let Claim::Taken(grant) = directory.claim_landing(layer, expert, 0, Taking::Out, (|_, _| (), |_, _| true)) else {
+                panic!("host tier has room");
+            };
+            directory.landed(layer, HostRecord(grant.record()), expert, Some(1));
+        }
+    }
+
+    let steps = steps();
+    let step0 = steps.begin_group(1, None);
+    log(&directory, step0, 0, &[0, 1]);
+    log(&directory, step0, 1, &[0, 1]);
+    assert!(directory.settle_changes());
+    let wants = steps.unbegun(|at| directory.promotions(at, present));
+    assert_eq!(wants.promotions.len(), present);
+    for p in &wants.promotions {
+        let tier = directory.hold_tier(p.layer, p.expert).expect("promoted expert is in host tier");
+        directory.copy(p.group, p.record, tier, 0);
+    }
+    let completed: Vec<(usize, BankRecord)> = wants.promotions.iter().map(|p| (p.group, p.record)).collect();
+    directory.promoted(completed, at(step0, 0), &steps);
+    steps.end_played(step0);
+
+    // Price write-backs so `group_write_back_pays` holds, then surrender host
+    // copies of promoted experts so they become `Located::Lacked` and
+    // `exits.leaving(...).back.is_some()` holds.
+    let terms = magnitude_cost_model::Terms { compute: 0.0, drive: 1.0, link: 0.0, cpu: 0.0, memory: 0.0 };
+    let price = Some(WriteBack { terms, drive: 1.0, link: 0.0 });
+    for layer in 0..layers {
+        directory.price_write_backs(layer, price);
+    }
+    let surrendered = steps.unbegun(|at| directory.surrender_banked(at));
+    assert!(!surrendered.is_empty(), "promoted experts must surrender host copies");
+    directory.retire_graces(past(step0), &steps);
+    assert_eq!(directory.located(0, 0), Located::Lacked);
+    assert_eq!(directory.located(0, 1), Located::Lacked);
+    for s in 1..=20 {
+        log(&directory, step0 + s, 0, &[0, 1]);
+        log(&directory, step0 + s, 1, &[0, 1]);
+    }
+    directory.time().lock().moved(0, crate::experts::horizon::Tier::COMPUTE);
+
+    // Begin step1 at layer 1: layer 0's 2 held experts are served and have
+    // `Located::Lacked` + write-back paying, yet must still be reclaimed as
+    // last-resort victims so `dma_overflow == 0`.
+    let step1 = steps.begin_group(1, None);
+    let progress = at(step1, 1);
+    let overflows = vec![(0, Some((1, 10))), (1, Some((1, 11)))];
+    let reclaimed = steps.unbegun_with_served(progress, directory.layers(), |at, park, is_served| {
+        directory.reclaim_served_demand_landings(0, &overflows, at, park, progress, is_served, |_| true)
+    });
+    assert_eq!(
+        reclaimed.len(),
+        2,
+        "must fall back to write-back victims on 3-tier bank instead of overflowing to SM zero-copy"
+    );
+}
+
+/// `replenish_demand_free` counts in-flight non-borrowed `DemandLanding` slots
+/// as part of the transient supply so claiming `Free -> DemandLanding` for a
+/// layer never over-evicts hot `Record::Held` experts into `Record::Releasing`.
+#[test]
+fn replenish_demand_free_counts_in_flight_demand_landings_without_over_evicting() {
+    use crate::experts::host_records::{Claim, Taking};
+
+    let layers = 2usize;
+    let experts = 32usize;
+    let present = 32usize;
+    let k = 6usize;
+    let map_words = magnitude_kernels::constants::MAP_WORDS;
+    let bank_maps = (0..layers)
+        .map(|_| StampedMap::new(cpu_words(&[experts as u64, map_words], 0)))
+        .collect::<Vec<_>>();
+    let tier_maps = (0..layers)
+        .map(|_| crate::experts::map::LandingMap::Tier(cpu_words(&[experts as u64], -1)))
+        .collect::<Vec<_>>();
+    let host = HostTier {
+        records: vec![(layers * experts) as u32],
+        lent: vec![0],
+        reserve: 0,
+        placement: Placement::Tier { bank_maps, tier_maps, lent: (0, 0), stage_slots: vec![0] },
+    };
+    let mut directory = Directory::new(&[present], &[0, 0], &[experts, experts], host);
+    // M=1, K=6 -> demand_floor=6, promote_headroom=6, demand_replenish_target=12.
+    directory.configure_decode_budget(1, k, 1);
+    assert_eq!(directory.demand_free_floor(0), 6);
+    assert_eq!(directory.demand_replenish_target(0), 12);
+
+    let mut tier_recs = Vec::new();
+    for layer in 0..layers {
+        directory.price_copies(layer, Some(0.0));
+        directory.price_write_backs(layer, None);
+        for expert in 0..experts {
+            let Claim::Taken(grant) = directory.claim_landing(layer, expert, 0, Taking::Out, (|_, _| (), |_, _| true)) else {
+                panic!("host tier has room");
+            };
+            directory.landed(layer, HostRecord(grant.record()), expert, Some(1));
+            if layer == 0 {
+                tier_recs.push(grant.record());
+            }
+        }
+    }
+
+    let steps = steps();
+    let step1 = steps.begin_group(1, None);
+    let hot: Vec<usize> = (0..20).collect();
+    log(&directory, step1, 0, &hot);
+    assert!(directory.settle_changes());
+    // Promotions leave `demand_replenish_target = 12` free slots untouched (20 promoted -> Held).
+    let wants = steps.unbegun(|at| directory.promotions(at, present));
+    assert_eq!(wants.promotions.len(), 20);
+    for p in &wants.promotions {
+        let tier = directory.hold_tier(p.layer, p.expert).expect("promoted expert is in host tier");
+        directory.copy(p.group, p.record, tier, 0);
+    }
+    let completed: Vec<(usize, BankRecord)> = wants.promotions.iter().map(|p| (p.group, p.record)).collect();
+    directory.promoted(completed, at(step1, 0), &steps);
+    assert_eq!(directory.bank_free_count(0), 12);
+
+    // Claim 10 of the 12 Free slots as in-flight DemandLanding (2 Free + 10 DemandLanding = 12).
+    for &tr in tier_recs.iter().skip(20).take(10) {
+        let DemandSlotClaim::Allocated { .. } = directory.claim_demand_landing(0, tr, false, |_| true) else {
+            panic!("expected Allocated from Free pool");
+        };
+    }
+    assert_eq!(directory.bank_free_count(0), 2);
+
+    // Replenishing to `want_free = 10` (clamped up to `demand_replenish_target = 12`)
+    // MUST evict 0 Held experts because 2 Free + 10 DemandLanding == 12!
+    let released_zero = steps.unbegun(|at| directory.replenish_demand_free(0, 10, at, |_| true));
+    assert_eq!(released_zero, 0, "in-flight DemandLanding slots must count toward supply (zero over-eviction)");
+
+    // Replenishing to `want_free = 15` MUST evict ONLY the 3 missing slots (15 - 12 = 3), not 13!
+    let released_three = steps.unbegun(|at| directory.replenish_demand_free(0, 15, at, |_| true));
+    assert_eq!(released_three, 3, "only the 3-slot shortfall above Free+DemandLanding should be evicted");
+}
+
+/// Live `set_decode_rows` + empirical `observe_demand_misses` sizes `demand_floor`
+/// to the current step's single-layer miss count so `M=4` verify gets enough
+/// landing slots for `0` overflow while never locking to `M_max = 16` or
+/// uniform-random `p_miss` over-reservation.
+#[test]
+fn decode_transient_budget_preserves_permanent_held_on_64_slot_bank() {
+    // 1-layer 64-slot GLM-5.3 bank at M=4 with empirical p_miss=0.35:
+    // demand_floor = ceil(32 * 0.35) = 12 -> 52/64 permanent Held (81.3%) and 0 overflow for 12 misses!
+    let glm_64 = DecodeTransientBudget::compute(4, 8, 288, 0.35, 64, 64, 1, 1, 1);
+    assert_eq!(glm_64.demand_floor, 12);
+    assert!(64 - glm_64.demand_floor >= 52, "GLM-5.3 64-slot bank must keep >= 52 Held slots");
+
+    // 1-layer 66-slot M5 Pro DS4 bank at M=4 with empirical p_miss=0.35:
+    // demand_floor = 12 -> 54/66 permanent Held (81.8%)!
+    let ds4_66 = DecodeTransientBudget::compute(4, 8, 384, 0.35, 66, 66, 1, 1, 1);
+    assert_eq!(ds4_66.demand_floor, 12);
+    assert!(66 - ds4_66.demand_floor >= 54, "DS4 66-slot bank must keep >= 54 Held slots");
+
+    // 3-group GLM-5.3 RTX 5090 (2,701 VRAM slots, K=8):
+    // 1. At M=1 with empirical p_miss ≈ 0.35: demand_floor = 8/group (24 total).
+    // 2. At M=4 with empirical p_miss ≈ 0.45 (14 misses / 32 picks): demand_floor = 14-15/group
+    //    (42-45 total, enough for 0 overflow on M=4 verify bursts, NOT 262!).
+    // 3. After a temporary M=16 spike, returning to M=4 immediately drops reserve back to ~45
+    //    instead of staying permanently locked to M=16!
+    let glm_groups = [14usize, 14, 14];
+    let glm_present = [901usize, 900, 900];
+    let mut glm_layer_groups = Vec::new();
+    let mut glm_layer_experts = Vec::new();
+    for (g, &n) in glm_groups.iter().enumerate() {
+        for _ in 0..n {
+            glm_layer_groups.push(g);
+            glm_layer_experts.push(288usize);
+        }
+    }
+    let mut glm_dir = Directory::new(&glm_present, &glm_layer_groups, &glm_layer_experts, HostTier::replay(vec![4032; 3]));
+    glm_dir.configure_decode_budget(1, 8, 1);
+    assert_eq!((0..3).map(|g| glm_dir.reserved(g)).sum::<usize>(), 24, "M=1 reserve is 3*K=24");
+
+    // Observe empirical ~43.75% miss rate (14 misses out of 32 picks at M=4) across all 3 groups.
+    glm_dir.set_decode_rows(4);
+    for g in 0..3 {
+        glm_dir.observe_demand_misses(g, 14, 4);
+    }
+    let glm_reserve_m4: usize = (0..3).map(|g| glm_dir.reserved(g)).sum();
+    assert_eq!(glm_reserve_m4, 42, "M=4 empirical 14/32 misses -> 14/group (42 total, 0 overflow, not 262!)");
+    assert!(glm_dir.demand_free_floor(0) >= 14, "M=4 floor must cover 14 simultaneous single-layer misses");
+
+    // Occasional M=16 spike raises floor transiently, then M=4 immediately recovers it!
+    glm_dir.set_decode_rows(16);
+    let glm_reserve_m16: usize = (0..3).map(|g| glm_dir.reserved(g)).sum();
+    assert!(glm_reserve_m16 > glm_reserve_m4);
+    glm_dir.set_decode_rows(4);
+    let glm_reserve_recovered: usize = (0..3).map(|g| glm_dir.reserved(g)).sum();
+    assert_eq!(glm_reserve_recovered, glm_reserve_m4, "M=4 after M=16 spike must immediately recover to 42 (never lock at M=16!)");
+
+    // 8-group DS4 RTX 5090 (1,836 VRAM slots, K=8, M=4, empirical 13/32 misses):
+    // total reserve == 8 * 13 = 104 (5.7% of 1,836, NOT 284!).
+    let ds4_groups = [20usize, 4, 4, 4, 2, 2, 2, 2];
+    let ds4_present = [918usize, 184, 184, 184, 92, 92, 92, 90];
+    let mut ds4_layer_groups = Vec::new();
+    let mut ds4_layer_experts = Vec::new();
+    for (g, &n) in ds4_groups.iter().enumerate() {
+        for _ in 0..n {
+            ds4_layer_groups.push(g);
+            ds4_layer_experts.push(384usize);
+        }
+    }
+    let mut ds4_dir = Directory::new(&ds4_present, &ds4_layer_groups, &ds4_layer_experts, HostTier::replay(vec![200; 8]));
+    ds4_dir.configure_decode_budget(1, 8, 1);
+    ds4_dir.set_decode_rows(4);
+    for g in 0..8 {
+        ds4_dir.observe_demand_misses(g, 13, 4);
+    }
+    let ds4_reserve: usize = (0..8).map(|g| ds4_dir.reserved(g)).sum();
+    assert_eq!(ds4_reserve, 104, "8-group DS4 at M=4 empirical 13/32 misses -> 104 total (not 284!)");
+}
+
+/// `finish_demand_landings_batch` promotes a high-rank demand miss by swapping
+/// out a lower-rank `Record::Held` victim even when `free_now == free_floor`
+/// (preserving `free_now >= free_floor` and `Held` count!) and when
+/// `free_now < free_floor` after a wide verify burst.
+#[test]
+fn finish_demand_landings_batch_swaps_hot_miss_with_cold_held_at_and_below_free_floor() {
+    use crate::experts::host_records::{Claim, Taking};
+
+    let layers = 2usize;
+    let experts = 64usize;
+    let present = 24usize;
+    let k = 4usize;
+    let map_words = magnitude_kernels::constants::MAP_WORDS;
+    let bank_maps = (0..layers)
+        .map(|_| crate::experts::map::StampedMap::new(cpu_words(&[experts as u64, map_words], 0)))
+        .collect::<Vec<_>>();
+    let tier_maps = (0..layers)
+        .map(|_| crate::experts::map::LandingMap::Tier(cpu_words(&[experts as u64], -1)))
+        .collect::<Vec<_>>();
+    let host = HostTier {
+        records: vec![(layers * experts) as u32],
+        lent: vec![0],
+        reserve: 0,
+        placement: Placement::Tier { bank_maps, tier_maps, lent: (0, 0), stage_slots: vec![0] },
+    };
+    let mut directory = Directory::new(&[present], &[0, 0], &[experts, experts], host);
+    directory.configure_decode_budget(1, k, 1);
+    assert_eq!(directory.demand_free_floor(0), k);
+
+    let mut tier_recs = Vec::new();
+    for layer in 0..layers {
+        directory.price_copies(layer, Some(0.0));
+        directory.price_write_backs(layer, None);
+        for expert in 0..experts {
+            let Claim::Taken(grant) = directory.claim_landing(layer, expert, 0, Taking::Out, (|_, _| (), |_, _| true)) else {
+                panic!("host tier has room");
+            };
+            directory.landed(layer, HostRecord(grant.record()), expert, Some(1));
+            if layer == 0 {
+                tier_recs.push(grant.record());
+            }
+        }
+    }
+
+    // Fill 19 Held slots (experts 0..19 on layer 0) so 5 Free slots remain (4 = free_floor + 1 to claim).
+    let steps = steps();
+    let step1 = steps.begin_group(1, None);
+    let cold: Vec<usize> = (0..19).collect();
+    log(&directory, step1, 0, &cold);
+    assert!(directory.settle_changes());
+    let wants = steps.unbegun(|at| directory.promotions(at, present));
+    assert_eq!(wants.promotions.len(), 19);
+    for p in &wants.promotions {
+        let tier = directory.hold_tier(p.layer, p.expert).expect("promoted expert is in host tier");
+        directory.copy(p.group, p.record, tier, 0);
+    }
+    let completed: Vec<(usize, BankRecord)> = wants.promotions.iter().map(|p| (p.group, p.record)).collect();
+    directory.promoted(completed, at(step1, 0), &steps);
+    assert_eq!(directory.held_count(0), 19);
+    assert_eq!(directory.bank_free_count(0), 5);
+
+    // Claim 1 Free slot for hot expert 30 -> now `free_now == 4 == free_floor`!
+    let DemandSlotClaim::Allocated { staged, slot } = directory.claim_demand_landing(0, tier_recs[30], false, |_| true) else {
+        panic!("expected Allocated from Free pool");
+    };
+    assert_eq!(staged, Some((0, 30)));
+    assert_eq!(directory.bank_free_count(0), k, "free_now == free_floor");
+
+    // Make expert 30 strictly hotter than the cold Held experts (logged across multiple steps).
+    for _ in 0..4 {
+        let s = steps.begin_group(1, None);
+        log(&directory, s, 0, &[30]);
+    }
+    assert!(directory.settle_changes());
+
+    // Finish at `free_now == free_floor`: MUST promote expert 30 by evicting a cold Held victim,
+    // preserving `free_now == free_floor` and `held_count == 19`!
+    let promoted = directory.finish_demand_landings_batch(&[(0, slot, staged, true)], at(step1, 0), &steps);
+    assert!(promoted, "hot demand miss must promote via victim swap at free_now == free_floor");
+    assert!(directory.held(0, 30).is_some(), "expert 30 must now be permanently Held");
+    assert_eq!(directory.held_count(0), 19, "Held count must stay 19 (+1 promoted, -1 evicted)");
+    assert!(
+        directory.bank_free_count(0) >= directory.demand_free_floor(0),
+        "free_now ({}) must stay >= free_floor ({})",
+        directory.bank_free_count(0),
+        directory.demand_free_floor(0)
+    );
+
+    // Now drain Free BELOW free_floor (`free_now == 2 < 4`) as in a wide verify burst!
+    let DemandSlotClaim::Allocated { staged: staged_hot2, slot: slot_hot2 } =
+        directory.claim_demand_landing(0, tier_recs[31], false, |_| true)
+    else {
+        panic!("expected Allocated");
+    };
+    let DemandSlotClaim::Allocated { staged: staged_cold2, slot: slot_cold2 } =
+        directory.claim_demand_landing(0, tier_recs[50], false, |_| true)
+    else {
+        panic!("expected Allocated");
+    };
+    assert_eq!(directory.bank_free_count(0), 2, "free_now < free_floor");
+
+    // Expert 31 is hot (logged 4x), expert 50 was never logged (coldest possible).
+    for _ in 0..4 {
+        let s = steps.begin_group(1, None);
+        log(&directory, s, 0, &[31]);
+    }
+    assert!(directory.settle_changes());
+
+    let promoted2 = directory.finish_demand_landings_batch(
+        &[(0, slot_hot2, staged_hot2, true), (0, slot_cold2, staged_cold2, true)],
+        at(step1, 0),
+        &steps,
+    );
+    assert!(promoted2, "hot miss 31 must still swap in even when free_now < free_floor");
+    assert!(directory.held(0, 31).is_some(), "expert 31 must be permanently Held");
+    assert!(directory.held(0, 50).is_none(), "unranked cold miss 50 must NOT evict a hotter Held expert");
+    assert_eq!(directory.held_count(0), 19, "Held count remains 19");
+    assert_eq!(directory.bank_free_count(0), 3, "unpromoted cold miss 50 returned its slot to Free (2 -> 3)");
 }

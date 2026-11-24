@@ -119,7 +119,7 @@ use std::ops::AddAssign;
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Instant;
 
-use super::horizon::{self, RegimeAged, RegimeEpoch, RegimeWindow, Time, Tokens, Window};
+use super::horizon::{self, RegimeAged, RegimeEpoch, Time, Tokens, Window};
 use super::watcher::{At, DecodeRow, Step};
 use crate::operation::{GuessKind, RequestId, TokenId};
 
@@ -178,9 +178,9 @@ impl Row {
     }
 }
 
-/// Who wants an expert. Sources are the pass's rows and routers, never its
-/// kind: an exact row's request, an ahead row's route, a lookahead router's
-/// hint.
+/// Who wants an expert. Sources are the pass's rows and token routing
+/// history, never its kind: an exact row's request, an ahead row's route, or
+/// token-conditioned routing foresight.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub(in crate::experts) enum Source {
     /// An exact row's own request (or a step that waits on a read in
@@ -189,10 +189,6 @@ pub(in crate::experts) enum Source {
     /// An ahead row's route, which the exact row of the pass its token is
     /// exact in routes again where every guess before it stands.
     Ahead(Row),
-    /// A lookahead router's hint `distance` layers ahead of its route, of
-    /// an exact row's choice (no row), or of an ahead row's (whose step is
-    /// that row's, as an ahead row's route is).
-    Lead { distance: u8, row: Option<Row> },
     /// Token-conditioned cross-burst routing foresight derived from the
     /// upcoming burst's exact/drafted tokens (`Told::DraftTokens` / `Told::Began`)
     /// via live per-token and bigram routing history (`TokenRoutes`).
@@ -205,7 +201,6 @@ impl Source {
         match self {
             Self::Exact | Self::Token => None,
             Self::Ahead(row) => Some(row),
-            Self::Lead { row, .. } => row,
         }
     }
 
@@ -341,15 +336,6 @@ impl Interest {
         (Look::of(self.source), self.rank)
     }
 
-    /// The lead of an exact row's hint, none of any other name: the names
-    /// the hint gate runs ([`Catchers`]).
-    fn hint(&self) -> Option<u8> {
-        match self.source {
-            Source::Lead { distance, row: None } => Some(distance),
-            _ => None,
-        }
-    }
-
     /// Whether `other` is the same producer's want: one source of one
     /// request (an ahead row's names of two requests are two wants), for one
     /// step or pass.
@@ -463,34 +449,29 @@ pub(in crate::experts) struct Resolved {
 }
 
 /// What a step's completion resolved ([`Ledger::tell`]): its predicted
-/// interests' outcomes, and at each layer its demand cohort ([`Cohort`]).
+/// interests' outcomes.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub(in crate::experts) struct Learned {
     pub resolved: Vec<Resolved>,
-    pub cohorts: Vec<Cohort>,
 }
 
 /// The kind of name a read ahead was issued for: the source of the
 /// interest that led its expert's aggregate ([`Ledger::issued`]). A front
-/// row's route (`Source::Ahead`), an ahead row's lookahead hint, or an
-/// exact row's lookahead hint; an exact request issues no read ahead.
+/// row's route (`Source::Ahead`) or token-conditioned routing foresight
+/// (`Source::Token`); an exact request issues no read ahead.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(in crate::experts) enum Basis {
     Front,
-    AheadHint,
-    Hint,
     Token,
 }
 
 impl Basis {
     /// Every basis, in [`Self::index`] order.
-    pub const ALL: [Basis; 4] = [Basis::Front, Basis::AheadHint, Basis::Hint, Basis::Token];
+    pub const ALL: [Basis; 2] = [Basis::Front, Basis::Token];
 
     pub fn of(source: Source) -> Self {
         match source {
             Source::Ahead(_) => Self::Front,
-            Source::Lead { row: Some(_), .. } => Self::AheadHint,
-            Source::Lead { row: None, .. } => Self::Hint,
             Source::Token => Self::Token,
             Source::Exact => panic!("no read ahead is an exact request's"),
         }
@@ -643,6 +624,7 @@ enum Fronted {
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct Awaiting {
     exact: u64,
+    acceptable: usize,
     decided: bool,
     fronted: Fronted,
 }
@@ -671,9 +653,18 @@ pub(in crate::experts) enum Told {
     /// experts `chose` lists (ascending), its front rows running on guesses
     /// of the kinds `guesses` holds (STEP_GUESSES, as its routing records
     /// carry it; none where every streamed layer was whole and wrote none),
-    /// and per-layer `(row, expert)` pairs (`row_experts`) for live token
-    /// routing learning (`TokenRoutes`).
-    Completed { step: Step, chose: Vec<Vec<Chosen>>, guesses: Option<u32>, row_experts: Vec<Vec<(u8, u16)>> },
+    /// per-layer `(row, expert)` pairs (`row_experts`) for live token routing
+    /// learning (`TokenRoutes`), actual physical `physical_rows` dispatched
+    /// (including front rows), and per-layer post-site `(gpu_host_misses,
+    /// cpu_sited)` counts (`layer_misses`).
+    Completed {
+        step: Step,
+        chose: Vec<Vec<Chosen>>,
+        guesses: Option<u32>,
+        row_experts: Vec<Vec<(u8, u16)>>,
+        physical_rows: u64,
+        layer_misses: Vec<(u64, u64)>,
+    },
     /// Step `step` ended, `completed` (it ran on the device, whatever its
     /// outputs) or not: sent once the steps know it ended, so no ring of it
     /// is read as live after it is drained.
@@ -752,12 +743,11 @@ impl Form {
     }
 }
 
-/// What a look saw (§3.5): its row's route, or its lookahead hint at lead
-/// ℓ ∈ 1..=HINT_LEADS layers. A route is nearer than any hint of its row.
+/// What a look saw (§3.5): its row's route, or token-conditioned routing
+/// history.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub(in crate::experts) enum Seen {
     Route,
-    Hint(u8),
     Token,
 }
 
@@ -771,37 +761,29 @@ pub(in crate::experts) struct Look {
     pub form: Form,
 }
 
-/// The hint leads a look may see: 1..=HINT_LEADS.
-pub(in crate::experts) const HINT_LEADS: usize = crate::planning::HINT_LEADS as usize;
-
-/// The looks' domain: (2 + HINT_LEADS) × DEPTHS × 2.
-pub(in crate::experts) const LOOKS: usize = (2 + HINT_LEADS) * super::DEPTHS * 2;
+/// The looks' domain: 2 × DEPTHS × 2.
+pub(in crate::experts) const LOOKS: usize = 2 * super::DEPTHS * 2;
 
 impl Look {
     /// The look `source` names by.
     pub fn of(source: Source) -> Self {
         let seen = match source {
-            Source::Lead { distance, .. } => Seen::Hint(distance),
             Source::Ahead(_) | Source::Exact => Seen::Route,
             Source::Token => Seen::Token,
         };
         Self { depth: source.depth(), seen, form: Form::of(source.verifies()) }
     }
 
-    /// Its index in 0..LOOKS. Panics where its depth or lead is outside the
-    /// domain: no row or router names past them.
+    /// Its index in 0..LOOKS. Panics where its depth is outside the domain:
+    /// no row names past it.
     fn index(self) -> usize {
         let depth = usize::from(self.depth);
         assert!(depth < super::DEPTHS, "a look of depth {depth} past the decode form's {} rows", super::DEPTHS);
         let seen = match self.seen {
             Seen::Route => 0,
-            Seen::Hint(lead) => {
-                assert!((1..=HINT_LEADS).contains(&usize::from(lead)), "a hint at lead {lead} outside 1..={HINT_LEADS}");
-                usize::from(lead)
-            }
-            Seen::Token => 1 + HINT_LEADS,
+            Seen::Token => 1,
         };
-        (depth * (2 + HINT_LEADS) + seen) * 2 + self.form as usize
+        (depth * 2 + seen) * 2 + self.form as usize
     }
 }
 
@@ -1110,206 +1092,6 @@ impl Stands {
     }
 }
 
-/// The hint leads (1..=HINT_LEADS) whose names for a saved read would have
-/// landed it in time (§3.5): name time + the landing's measured duration ≤
-/// the read's time, both measured on this landing.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub(in crate::experts) struct Catchers(u8);
-
-impl Catchers {
-    /// Lead `lead`'s name would have landed it in time. Panics where `lead`
-    /// is outside 1..=HINT_LEADS.
-    pub fn caught_by(&mut self, lead: u8) {
-        assert!((1..=HINT_LEADS).contains(&usize::from(lead)), "a hint at lead {lead} outside 1..={HINT_LEADS}");
-        self.0 |= 1 << (lead - 1);
-    }
-
-    /// The lead that alone would have landed it; none where none or several.
-    pub fn only(self) -> Option<u8> {
-        (self.0.count_ones() == 1).then(|| self.0.trailing_zeros() as u8 + 1)
-    }
-}
-
-/// The counterfactual demand cohort C_{s,l} (§3.5), formed once by step
-/// `step`'s resolution of layer `layer`: every expert the step read there
-/// that missed (`misses`), or hit a record whose landing was admitted for
-/// the step by a hint name (`saved`, each with its catchers). Membership is
-/// a fact of the step, whatever the gate ran: a hint that landed its expert
-/// in time turns a miss into a hit, and the cohort counts it still.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub(in crate::experts) struct Cohort {
-    pub step: Step,
-    pub layer: usize,
-    pub misses: u32,
-    pub saved: Vec<Catchers>,
-}
-
-impl Cohort {
-    /// Its reads: misses and saved reads.
-    pub fn size(&self) -> u32 {
-        self.misses + u32::try_from(self.saved.len()).expect("a layer's reads fit u32")
-    }
-
-    /// The saved reads only `lead` would have caught: ℓ's exclusive saving,
-    /// so no saved stall is earned twice, and the leads' savings never sum
-    /// past the cohort's.
-    pub fn exclusive(&self, lead: u8) -> u32 {
-        u32::try_from(self.saved.iter().filter(|catchers| catchers.only() == Some(lead)).count()).expect("a layer's reads fit u32")
-    }
-}
-
-/// A ratio counted over a window (§3.5): `part` over `whole` (exclusive
-/// catches over cohort size, or cohort reads over steps).
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub(in crate::experts) struct Share {
-    pub part: u64,
-    pub whole: u64,
-}
-
-impl Share {
-    fn add(&mut self, part: u64, whole: u64) {
-        self.part += part;
-        self.whole += whole;
-    }
-
-    /// The summed tallies over a window's two halves.
-    pub fn sum((previous, current): (&Share, &Share)) -> Self {
-        Self { part: previous.part + current.part, whole: previous.whole + current.whole }
-    }
-
-    /// The ratio `part / whole`. Panics where `whole == 0`.
-    pub fn rate(self) -> f64 {
-        assert!(self.whole > 0, "a non-empty Share window holds a positive denominator");
-        self.part as f64 / self.whole as f64
-    }
-
-    /// Wilson score binomial confidence interval `(lower, upper)` at `z`
-    /// standard errors for `part` successes in `whole` trials. Returns
-    /// `(0.0, 1.0)` when `whole == 0`.
-    pub fn wilson(self, z: f64) -> (f64, f64) {
-        if self.whole == 0 {
-            return (0.0, 1.0);
-        }
-        let n = self.whole as f64;
-        let p = (self.part as f64 / n).clamp(0.0, 1.0);
-        let z2 = z * z;
-        let denom = 1.0 + z2 / n;
-        let center = p + z2 / (2.0 * n);
-        let margin = z * (p * (1.0 - p) / n + z2 / (4.0 * n * n)).sqrt();
-        (((center - margin) / denom).clamp(0.0, 1.0), ((center + margin) / denom).clamp(0.0, 1.0))
-    }
-
-    /// Poisson rate confidence interval `(lower, upper)` at `z` standard
-    /// errors for `part` events over `whole` steps. Panics where `whole == 0`.
-    pub fn poisson(self, z: f64) -> (f64, f64) {
-        assert!(self.whole > 0, "a non-empty Share holds a positive denominator");
-        let m = self.part as f64;
-        let s = self.whole as f64;
-        let z2 = z * z;
-        let half = z2 / 2.0;
-        let margin = z * (m + z2 / 4.0).sqrt();
-        (((m + half - margin).max(0.0)) / s, (m + half + margin) / s)
-    }
-}
-
-impl horizon::Tally for Share {
-    fn is_empty(&self) -> bool {
-        self.whole == 0
-    }
-}
-
-/// A hint lead's exclusive-catch rate (§3.5, A10): unmeasured (reads its
-/// bound 1 until its first cohort while running), or measured with its age
-/// in tokens since it last counted.
-#[derive(Clone, Copy, Debug, PartialEq)]
-pub(in crate::experts) enum Caught {
-    Unmeasured,
-    Measured { rate: f64, age: Tokens },
-}
-
-impl Caught {
-    /// The rate used for pricing: its bound 1 while unmeasured.
-    pub fn rate(self) -> f64 {
-        match self {
-            Self::Unmeasured => 1.0,
-            Self::Measured { rate, .. } => rate,
-        }
-    }
-}
-
-/// The counterfactual demand cohort rates (§3.5, Revision 1 row 2), keyed to
-/// the physical [`RegimeEpoch`] they were measured in so a bank resize,
-/// `tier_complete`, or residency/policy change makes prior-regime frozen
-/// exclusive rates (A10) and cohorts inapplicable by construction:
-/// - `exclusive_ℓ` (`RegimeAged<Share>` on `(regime, bank_epoch)`, counted only
-///   while lead ℓ runs on a non-empty cohort; unmeasured reads 1, and freezes
-///   with its age while ℓ is off within the same regime, A10);
-/// - `cohort_l` (`RegimeWindow<Share>` on `(regime, bank_epoch)`, counted on
-///   every resolved step whether hints run or not).
-#[derive(Clone, Debug)]
-pub(in crate::experts) struct CohortRates {
-    exclusive: [RegimeAged<Share>; HINT_LEADS],
-    cohorts: Vec<RegimeWindow<Share>>,
-}
-
-impl CohortRates {
-    pub fn new(layers: usize, regime: RegimeEpoch, epoch: u64) -> Self {
-        Self {
-            exclusive: std::array::from_fn(|_| RegimeAged::new(regime, epoch)),
-            cohorts: vec![RegimeWindow::new(regime, epoch); layers],
-        }
-    }
-
-    /// Count one layer's resolved `cohort` at `(regime, epoch)` and clock
-    /// `now`. `running[lead - 1]` is whether the layer hinting
-    /// `cohort.layer` at `lead` ran its hints on this step.
-    pub fn count(&mut self, cohort: &Cohort, running: &[bool], regime: RegimeEpoch, epoch: u64, now: Tokens) {
-        assert!(running.len() <= HINT_LEADS, "running has {} entries, past HINT_LEADS ({HINT_LEADS})", running.len());
-        let size = u64::from(cohort.size());
-        self.cohorts[cohort.layer].count(regime, epoch).add(size, 1);
-        if size > 0 {
-            for (index, &ran) in running.iter().enumerate() {
-                if ran {
-                    let lead = (index + 1) as u8;
-                    let exclusive = u64::from(cohort.exclusive(lead));
-                    self.exclusive[index].count(regime, epoch, now).add(exclusive, size);
-                }
-            }
-        }
-    }
-
-    /// Lead `lead`'s (1..=HINT_LEADS) exclusive-catch tallies and age at
-    /// `(regime, epoch)` and clock `now`; none before any cohort counted in
-    /// `regime`.
-    pub fn exclusive_share(&mut self, lead: u8, regime: RegimeEpoch, epoch: u64, now: Tokens) -> Option<(Share, Tokens)> {
-        let index = usize::from(lead);
-        assert!((1..=HINT_LEADS).contains(&index), "a hint at lead {lead} outside 1..={HINT_LEADS}");
-        self.exclusive[index - 1].read(regime, epoch, now).map(|(tallies, age)| (Share::sum(tallies), age))
-    }
-
-    /// Lead `lead`'s (1..=HINT_LEADS) exclusive-catch rate and its age at
-    /// `(regime, epoch)` and clock `now`.
-    pub fn exclusive(&mut self, lead: u8, regime: RegimeEpoch, epoch: u64, now: Tokens) -> Caught {
-        match self.exclusive_share(lead, regime, epoch, now) {
-            None => Caught::Unmeasured,
-            Some((share, age)) => Caught::Measured { rate: share.rate(), age },
-        }
-    }
-
-    /// Layer `layer`'s cohort tallies `(reads, steps)` at `(regime, epoch)`;
-    /// none before any step resolves there in `regime`.
-    pub fn cohort_share(&mut self, layer: usize, regime: RegimeEpoch, epoch: u64) -> Option<Share> {
-        self.cohorts[layer].read(regime, epoch).map(Share::sum)
-    }
-
-    /// Layer `layer`'s mean cohort size a step at `(regime, epoch)`; none
-    /// before any step resolves there in `regime`.
-    #[cfg_attr(not(test), allow(dead_code))]
-    pub fn cohort(&mut self, layer: usize, regime: RegimeEpoch, epoch: u64) -> Option<f64> {
-        self.cohort_share(layer, regime, epoch).map(Share::rate)
-    }
-}
-
 #[derive(Debug, Default)]
 struct Entry {
     interests: Vec<Interest>,
@@ -1395,49 +1177,6 @@ impl Entry {
     fn leading(&self, step: Step) -> Option<&Interest> {
         self.at(step).min_by_key(|interest| interest.nearness())
     }
-
-    /// Its read for `step`, served from a record that landed for that step
-    /// (`issued`..=`landed`), as a saved read of the step's cohort ([`Cohort`]):
-    /// none where no exact row's hint named it for the step (a hint's admission
-    /// is what the cohort counts). Its catchers are the hint leads whose name,
-    /// plus the landing's measured duration, came no later than the step's
-    /// route there (the earliest its interests were seen passed); a route the
-    /// host never saw pass before the step completed times no read, and is
-    /// caught by none.
-    fn saved(&self, step: Step, issued: Instant, landed: Instant) -> Option<Catchers> {
-        let named = self.interests.iter().filter(|interest| interest.when == When::Step(step));
-        let hints = named.clone().filter_map(|interest| Some((interest.hint()?, interest.named))).collect::<Vec<_>>();
-        if hints.is_empty() {
-            return None;
-        }
-        assert!(landed >= issued, "a read ahead landed before it was issued");
-        let took = landed - issued;
-        let mut catchers = Catchers::default();
-        if let Some(read_at) = named.filter_map(|interest| interest.passed).min() {
-            for (lead, at) in hints {
-                if at + took <= read_at {
-                    catchers.caught_by(lead);
-                }
-            }
-        }
-        Some(catchers)
-    }
-
-    /// A hint read ahead that was still in flight when demand arrived
-    /// (hastened to demand): credit the earliest exact-row hint lead that
-    /// named it for `step` (the lead that started the read and provided its
-    /// overlap), so `Catchers::only()` identifies that lead for the hint gate.
-    fn hastened(&self, step: Step) -> Option<Catchers> {
-        let (lead, _) = self
-            .interests
-            .iter()
-            .filter(|interest| interest.when == When::Step(step))
-            .filter_map(|interest| Some((interest.hint()?, interest.named)))
-            .min_by_key(|&(_, at)| at)?;
-        let mut catchers = Catchers::default();
-        catchers.caught_by(lead);
-        Some(catchers)
-    }
 }
 
 /// A decode launch begun: each batch row, the padding rows its class runs
@@ -1453,16 +1192,6 @@ impl Launch {
     fn pass(&self, request: RequestId) -> u64 {
         self.passes.iter().find(|&&(of, _)| of == request).map(|&(_, pass)| pass).expect("a launch's row's request has its pass")
     }
-}
-
-/// A hint-driven landing recorded for `(step, layer, expert)`: Path 1 Drive
-/// hint reads (`link == false`) and Path 0 `LinkMover` `MAP_STAGE` copies
-/// (`link == true`).
-#[derive(Clone, Copy, Debug)]
-struct LandedHint {
-    issued: Instant,
-    landed: Instant,
-    link: bool,
 }
 
 /// Every layer's experts' interests, every predicted source's calibration,
@@ -1495,16 +1224,10 @@ pub(in crate::experts) struct Ledger {
     /// `(layer, expert)`: at most one landing per expert, so a later read of
     /// one replaces its earlier, whose landed bytes went unused.
     reads: HashMap<(usize, usize), Issued>,
-    /// Hint reads ahead that were hastened to demand (still in flight when
-    /// demand arrived, `Self::requested(..., true)`), keyed by
-    /// `(step, layer, expert)` until `Self::resolve` forms the step's cohort.
-    hastened: BTreeSet<(Step, usize, usize)>,
-    /// Hint reads ahead that landed (`Self::landed` for Path 1 Drive hints,
-    /// `Self::link_landed` for Path 0 `LinkMover` `MAP_STAGE` copies), keyed by
-    /// `(step, layer, expert)` until `Self::resolve` forms the step's cohort:
-    /// preserves the landing duration even if the expert is evicted and
-    /// re-issued before `Completed(step)` runs.
-    landed_hints: HashMap<(Step, usize, usize), LandedHint>,
+    /// Path 0 (`LinkMover`) opportunistic DMA staging copies that landed
+    /// (`Self::link_landed`), keyed by `(step, layer, expert)` until
+    /// `Self::resolve` clears the step.
+    landed_links: BTreeSet<(Step, usize, usize)>,
     /// The fates learned since last taken ([`Self::take_spent`]).
     spent: Vec<Spent>,
     /// Each open request's passes with rows ahead awaiting their verdicts,
@@ -1523,9 +1246,19 @@ pub(in crate::experts) struct Ledger {
     ranks: usize,
     /// Bounded live per-token and bigram routing table (`Source::Token`).
     token_routes: TokenRoutes,
+    /// Completed verify steps waiting for their per-request verdict before
+    /// feeding committed rows into `token_routes` (rejected/discarded rows
+    /// never train `TokenRoutes`).
+    pending_token_routes: BTreeMap<Step, PendingTokenRoutes>,
     /// Drafted/anchor tokens buffered for each request's upcoming pass
     /// (`Told::DraftTokens`), cleared once that pass begins or closes.
     pending_draft_tokens: HashMap<RequestId, Vec<TokenId>>,
+}
+
+struct PendingTokenRoutes {
+    rows: Box<[DecodeRow]>,
+    row_experts: Vec<Vec<(u8, u16)>>,
+    remaining: Vec<RequestId>,
 }
 
 /// Bounded per-layer expert hit counts for one unigram token or bigram pair.
@@ -1626,8 +1359,10 @@ impl TokenRoutes {
         self.bigrams.get_mut(&pair).expect("inserted above")
     }
 
-    /// Learn per-row routing from a completed decode/verify step.
-    fn observe(&mut self, rows: &[DecodeRow], row_experts: &[Vec<(u8, u16)>]) {
+    /// Learn per-row routing from a completed decode/verify step, including
+    /// only rows for which `include(row)` holds (so rejected draft rows and
+    /// unverified front rows never train `TokenRoutes`).
+    fn observe_where(&mut self, rows: &[DecodeRow], row_experts: &[Vec<(u8, u16)>], include: impl Fn(&DecodeRow) -> bool) {
         if self.layers == 0 || row_experts.is_empty() {
             return;
         }
@@ -1645,6 +1380,9 @@ impl TokenRoutes {
                 }
             }
             for (row_idx, row) in rows.iter().enumerate() {
+                if !include(row) {
+                    continue;
+                }
                 let Some(token) = row.token else {
                     continue;
                 };
@@ -1653,7 +1391,7 @@ impl TokenRoutes {
                 }
                 let experts = &by_row[row_idx];
                 self.unigram_mut(token)[layer].observe(experts);
-                if row_idx > 0 && rows[row_idx - 1].request == row.request {
+                if row_idx > 0 && rows[row_idx - 1].request == row.request && include(&rows[row_idx - 1]) {
                     if let Some(prev) = rows[row_idx - 1].token {
                         self.bigram_mut((prev, token))[layer].observe(experts);
                     }
@@ -1745,8 +1483,7 @@ impl Ledger {
             passes: HashMap::new(),
             owed: BTreeSet::new(),
             reads: HashMap::new(),
-            hastened: BTreeSet::new(),
-            landed_hints: HashMap::new(),
+            landed_links: BTreeSet::new(),
             spent: Vec::new(),
             awaiting: HashMap::new(),
             judged: Vec::new(),
@@ -1754,6 +1491,7 @@ impl Ledger {
             draft_window: None,
             ranks,
             token_routes: TokenRoutes::new(layers),
+            pending_token_routes: BTreeMap::new(),
             pending_draft_tokens: HashMap::new(),
         }
     }
@@ -1770,19 +1508,6 @@ impl Ledger {
         let group = self.groups[layer];
         let epoch = self.time.lock().group_epoch(group);
         self.calibration.combined(group, combination, epoch)
-    }
-
-    /// Whether any calibrated rank `r ∈ 0..K` of an exact row's lookahead hint
-    /// at `lead` targeting `target_layer` reaches `break_even`. Unmeasured
-    /// ranks read their bound `1.0` and are admitted until calibrated.
-    pub fn hint_admitted(&mut self, target_layer: usize, lead: u8, break_even: f64) -> bool {
-        let group = self.groups[target_layer];
-        let epoch = self.epoch(target_layer);
-        let look = Look::of(Source::Lead { distance: lead, row: None });
-        (0..self.calibration.ranks).any(|rank| {
-            let combination = Combination { nearest: look, rank: rank as u8, looks: 1 };
-            self.calibration.combined(group, combination, epoch) >= break_even
-        })
     }
 
     /// Remaining idle drive seconds in the active MTP head draft window at
@@ -1836,7 +1561,7 @@ impl Ledger {
         match told {
             Told::Began { step, launch: Launched::Decode { rows, padding } } => self.begin(step, rows, padding),
             Told::Began { step, launch: Launched::Grouped(requests) } => self.begin_grouped(step, &requests),
-            Told::Completed { step, chose, guesses, row_experts } => return self.complete(step, &chose, guesses, &row_experts),
+            Told::Completed { step, chose, guesses, row_experts, .. } => return self.complete(step, &chose, guesses, &row_experts),
             Told::Ended { step, completed } => self.expire(step, completed),
             Told::Decided { step, request, verdict } => self.verdict(step, request, &verdict),
             Told::Discarded { step, request } => self.discard(step, request),
@@ -1918,6 +1643,7 @@ impl Ledger {
                 let exact = rows.iter().filter(|other| other.request == row.request && other.ahead.is_none()).map(|other| other.position).max();
                 let awaiting = ahead.entry(row.request).or_insert_with(|| Awaiting {
                     exact: exact.expect("a pass's rows ahead follow its exact row"),
+                    acceptable: usize::from(of.acceptable()),
                     decided: false,
                     fronted: Fronted::Without,
                 });
@@ -2019,7 +1745,7 @@ impl Ledger {
             // A grouped pass's decision judges its proposals alone: the
             // truths it learns judge no front row (a request decoding in
             // front rows runs no grouped verification).
-            self.awaiting.entry(request).or_default().insert(step, Awaiting { exact: 0, decided: false, fronted: Fronted::Without });
+            self.awaiting.entry(request).or_default().insert(step, Awaiting { exact: 0, acceptable: 0, decided: false, fronted: Fronted::Without });
         }
     }
 
@@ -2088,7 +1814,28 @@ impl Ledger {
             self.resolve(step, layer, chose, &mut learned);
         }
         if let Some(launch) = self.launches.get(&step) {
-            self.token_routes.observe(&launch.rows, row_experts);
+            let mut verifiers: Vec<RequestId> = Vec::new();
+            for row in launch.rows.iter() {
+                if row.ahead.is_some_and(|a| !a.front()) && !verifiers.contains(&row.request) {
+                    verifiers.push(row.request);
+                }
+            }
+            // Observe exact rows of non-verifying requests immediately; defer
+            // verifying requests until `verdict()` so rejected/discarded rows
+            // never pollute `TokenRoutes`.
+            self.token_routes.observe_where(&launch.rows, row_experts, |row| {
+                row.ahead.is_none() && !verifiers.contains(&row.request)
+            });
+            if !verifiers.is_empty() {
+                self.pending_token_routes.insert(
+                    step,
+                    PendingTokenRoutes {
+                        rows: launch.rows.clone(),
+                        row_experts: row_experts.to_vec(),
+                        remaining: verifiers,
+                    },
+                );
+            }
         }
         let Some(launch) = self.launches.get(&step) else {
             return learned;
@@ -2126,8 +1873,7 @@ impl Ledger {
     fn resolve(&mut self, step: Step, layer: usize, chose: &[Chosen], learned: &mut Learned) {
         debug_assert!(chose.windows(2).all(|pair| pair[0].expert < pair[1].expert), "a layer's choices ascend, once each");
         let (group, epoch) = (self.groups[layer], self.epoch(layer));
-        let Self { layers, calibration, owed, reads, hastened, landed_hints, spent, .. } = self;
-        let mut cohort = Cohort { step, layer, misses: 0, saved: Vec::new() };
+        let Self { layers, calibration, owed, reads, landed_links, spent, .. } = self;
         for chosen in chose {
             // The chosen experts a read ahead was issued for, unspent until
             // now: used.
@@ -2135,33 +1881,8 @@ impl Ledger {
             if let Some(Issued { basis, depth, verify, bytes, fell, .. }) = read {
                 spent.push(Spent::Used { basis, depth, verify, fell, bytes });
             }
-            match (chosen.saves, chosen.tier) {
-                (false, _) => {}
-                (true, false) => {
-                    let saved = hastened
-                        .remove(&(step, layer, chosen.expert))
-                        .then(|| layers[layer].get(&chosen.expert)?.hastened(step))
-                        .flatten();
-                    match saved {
-                        Some(catchers) => cohort.saved.push(catchers),
-                        None => cohort.misses += 1,
-                    }
-                }
-                (true, true) => {
-                    let timing = landed_hints
-                        .remove(&(step, layer, chosen.expert))
-                        .map(|hint| (hint.issued, hint.landed))
-                        .or_else(|| {
-                            read.filter(|read| read.step == step && read.basis == Basis::Hint)
-                                .and_then(|read| read.landed.map(|landed| (read.issued, landed)))
-                        });
-                    let saved = timing.and_then(|(issued, landed)| layers[layer].get(&chosen.expert)?.saved(step, issued, landed));
-                    cohort.saved.extend(saved);
-                }
-            }
         }
-        hastened.retain(|&(s, l, _)| !(s <= step && l == layer));
-        landed_hints.retain(|&(s, l, _), _| !(s <= step && l == layer));
+        landed_links.retain(|&(s, l, _)| !(s <= step && l == layer));
         // Any read ahead bound to this step (or earlier) at `layer` that was
         // not chosen here is now settled unused. Reads still pending for a
         // future step (`Pass` or `Bound(target)` with `target > step`) stay live.
@@ -2179,7 +1900,6 @@ impl Ledger {
                 true
             }
         });
-        learned.cohorts.push(cohort);
         let mut emptied = Vec::new();
         for (&expert, entry) in &mut layers[layer] {
             let chosen = chose.binary_search_by_key(&expert, |chosen| chosen.expert).ok().map(|at| chose[at]);
@@ -2244,31 +1964,52 @@ impl Ledger {
     fn verdict(&mut self, step: Step, request: RequestId, verdict: &Verdict) {
         let mut awaiting = self.awaited(step, request);
         let exact = awaiting.exact;
+        let acceptable_count = verdict.acceptable.len();
         let stood = verdict.acceptable.iter().take_while(|&&stood| stood).count();
-        match &mut awaiting.fronted {
-            Fronted::Without => {
-                for (depth, &guess) in verdict.acceptable.iter().enumerate().take(stood + 1) {
-                    self.stands.count(depth + 1, Form::Verify, guess);
-                    let depth = u8::try_from(depth + 1).expect("a pass's acceptable rows fit a byte");
-                    self.accepted.push(Accepted { depth, stood: guess });
-                }
-                if stood < verdict.acceptable.len() {
-                    self.fall(request, step, stood);
-                }
-            }
-            // Of no kind: it counts into no stand, but its first guess's
-            // fall drops its names all the same.
-            Fronted::Unread => {
-                if verdict.front.first().zip(verdict.truths.first()).is_some_and(|(guess, truth)| guess != truth) {
-                    self.fall(request, step, 0);
+        if let Some(pending) = self.pending_token_routes.get_mut(&step) {
+            if let Some(pos) = pending.remaining.iter().position(|&id| id == request) {
+                pending.remaining.swap_remove(pos);
+                self.token_routes.observe_where(&pending.rows, &pending.row_experts, |row| {
+                    row.request == request
+                        && match row.ahead {
+                            None => true,
+                            Some(a) => !a.front() && usize::from(a.row()) < stood,
+                        }
+                });
+                if pending.remaining.is_empty() {
+                    self.pending_token_routes.remove(&step);
                 }
             }
-            Fronted::Running { .. } => unreachable!("an awaited pass's launch completed"),
-            Fronted::Rows(pass) => {
-                assert_eq!(verdict.front.len(), usize::from(pass.rows), "{request:?}'s verdict of step {step} judges its front rows");
-                pass.tokens = Some(verdict.front.clone());
-                awaiting.decided = true;
-                self.awaiting.get_mut(&request).expect("an awaiting request").insert(step, awaiting);
+        }
+        for (depth, &guess) in verdict.acceptable.iter().enumerate().take(stood + 1) {
+            self.stands.count(depth + 1, Form::Verify, guess);
+            let depth = u8::try_from(depth + 1).expect("a pass's acceptable rows fit a byte");
+            self.accepted.push(Accepted { depth, stood: guess });
+        }
+        if stood < acceptable_count {
+            // Early rejection: cancel rejected acceptable rows AND all trailing
+            // front rows (`lineage.guessed > stood`) and drop `Awaiting`.
+            self.fall(request, step, stood);
+            if let Fronted::Rows(pass) = awaiting.fronted {
+                self.judged.extend(pass.pending(step));
+            }
+        } else {
+            match &mut awaiting.fronted {
+                Fronted::Without => {}
+                // Of no kind: it counts into no stand, but its first guess's
+                // fall against `truths[K]` drops all trailing front rows.
+                Fronted::Unread => {
+                    if verdict.front.first().zip(verdict.truths.get(acceptable_count)).is_some_and(|(guess, truth)| guess != truth) {
+                        self.fall(request, step, acceptable_count);
+                    }
+                }
+                Fronted::Running { .. } => unreachable!("an awaited pass's launch completed"),
+                Fronted::Rows(pass) => {
+                    assert_eq!(verdict.front.len(), usize::from(pass.rows), "{request:?}'s verdict of step {step} judges its front rows");
+                    pass.tokens = Some(verdict.front.clone());
+                    awaiting.decided = true;
+                    self.awaiting.get_mut(&request).expect("an awaiting request").insert(step, awaiting);
+                }
             }
         }
         self.judge(request, step, exact, &verdict.truths);
@@ -2291,13 +2032,14 @@ impl Ledger {
         let mut fell = Vec::new();
         let mut done = Vec::new();
         for (&of, awaiting) in passes.range_mut(..=step) {
-            let Awaiting { exact: base, decided: true, fronted: Fronted::Rows(pass) } = awaiting else {
+            let Awaiting { exact: base, acceptable, decided: true, fronted: Fronted::Rows(pass) } = awaiting else {
                 continue;
             };
+            let front_base = *base + *acceptable as u64;
             let tokens = pass.tokens.as_ref().expect("a decided pass holds its front tokens");
             while pass.stood < pass.rows {
                 let depth = pass.stood + 1;
-                let position = *base + u64::from(depth);
+                let position = front_base + u64::from(depth);
                 if position > learned {
                     break;
                 }
@@ -2313,7 +2055,7 @@ impl Ledger {
                 self.stands.count(usize::from(depth), Form::Front, stood);
                 self.judged.push(Judged { step: of, row: pass.first + usize::from(depth) - 1, depth, kind, stood: Some(stood) });
                 if !stood {
-                    fell.push((of, depth - 1));
+                    fell.push((of, *acceptable + usize::from(depth - 1)));
                     pass.stood = depth;
                     self.judged.extend(pass.pending(of));
                     pass.stood = pass.rows;
@@ -2329,7 +2071,7 @@ impl Ledger {
             passes.remove(&of);
         }
         for (of, stood) in fell {
-            self.fall(request, of, usize::from(stood));
+            self.fall(request, of, stood);
         }
     }
 
@@ -2365,6 +2107,12 @@ impl Ledger {
     /// never completed. A request closed since awaits nothing: its passes
     /// and names went with it.
     fn discard(&mut self, step: Step, request: RequestId) {
+        if let Some(pending) = self.pending_token_routes.get_mut(&step) {
+            pending.remaining.retain(|&id| id != request);
+            if pending.remaining.is_empty() {
+                self.pending_token_routes.remove(&step);
+            }
+        }
         if !self.awaiting.contains_key(&request) {
             return;
         }
@@ -2380,6 +2128,10 @@ impl Ledger {
     fn close(&mut self, request: RequestId) {
         self.passes.remove(&request);
         self.pending_draft_tokens.remove(&request);
+        self.pending_token_routes.retain(|_, pending| {
+            pending.remaining.retain(|&id| id != request);
+            !pending.remaining.is_empty()
+        });
         for (step, awaiting) in self.awaiting.remove(&request).unwrap_or_default() {
             if let Fronted::Rows(pass) = awaiting.fronted {
                 self.judged.extend(pass.pending(step));
@@ -2527,34 +2279,24 @@ impl Ledger {
         }
     }
 
-    /// The read ahead of `expert` of `layer` landed at `at`: records its
-    /// landing time so its step's resolution measures its duration
-    /// ([`Entry::saved`]).
+    /// The read ahead of `expert` of `layer` landed at `at`.
     pub fn landed(&mut self, layer: usize, expert: usize, at: Instant) {
         if let Some(read) = self.reads.get_mut(&(layer, expert)) {
             read.landed = Some(at);
-            if read.basis == Basis::Hint {
-                self.landed_hints
-                    .entry((read.step, layer, expert))
-                    .or_insert(LandedHint { issued: read.issued, landed: at, link: false });
-            }
         }
     }
 
     /// Record a completed Path 0 (`LinkMover`) opportunistic DMA staging copy
-    /// for `(step, layer, expert)` so `HintGate` credits link-staged hint hits
+    /// for `(step, layer, expert)` so `residency` classifies link-staged hits
     /// without polluting Path 1 (`Drive`) `Spent` telemetry.
-    pub fn link_landed(&mut self, step: Step, layer: usize, expert: usize, issued: Instant, landed: Instant) {
-        self.landed_hints
-            .entry((step, layer, expert))
-            .and_modify(|hint| hint.link = true)
-            .or_insert(LandedHint { issued, landed, link: true });
+    pub fn link_landed(&mut self, step: Step, layer: usize, expert: usize, _issued: Instant, _landed: Instant) {
+        self.landed_links.insert((step, layer, expert));
     }
 
     /// Whether a Path 0 (`LinkMover`) opportunistic DMA staging copy landed for
     /// `(step, layer, expert)`.
     pub fn has_link_landed(&self, step: Step, layer: usize, expert: usize) -> bool {
-        self.landed_hints.get(&(step, layer, expert)).is_some_and(|hint| hint.link)
+        self.landed_links.contains(&(step, layer, expert))
     }
 
     /// The read ahead of `expert` of `layer` was cancelled before any piece
@@ -2570,12 +2312,9 @@ impl Ledger {
     /// a read ahead of it landed and was evicted unused (or failed), and
     /// the request reads it anew.
     pub fn requested(&mut self, layer: usize, expert: usize, reading: bool) {
-        if let Some(Issued { basis, depth, verify, bytes, fell, step, .. }) = self.reads.remove(&(layer, expert)) {
+        if let Some(Issued { basis, depth, verify, bytes, fell, .. }) = self.reads.remove(&(layer, expert)) {
             if reading {
                 self.spent.push(Spent::Used { basis, depth, verify, fell, bytes });
-                if basis == Basis::Hint {
-                    self.hastened.insert((step, layer, expert));
-                }
             } else {
                 self.spent.push(Spent::Unused { basis, depth, verify, fell, bytes });
             }
@@ -2756,8 +2495,6 @@ impl Ledger {
 
 #[cfg(test)]
 mod tests {
-    use std::time::Duration;
-
     use super::super::horizon::{Advance, Tier};
     use super::super::watcher::AheadOf;
     use super::*;
@@ -2786,7 +2523,7 @@ mod tests {
     const RANKS: usize = 10;
     const FRONT: Row = Row { index: 0, front: Some(GuessKind::Chained) };
     const AHEAD: Source = Source::Ahead(FRONT);
-    const LEAD: Source = Source::Lead { distance: 1, row: None };
+    const TOKEN: Source = Source::Token;
 
     fn now() -> Instant {
         Instant::now()
@@ -2804,7 +2541,7 @@ mod tests {
     fn resolve(ledger: &mut Ledger, step: Step, layer: usize, experts: &[usize]) -> Vec<Resolved> {
         let mut chose = vec![Vec::new(); layer + 1];
         chose[layer] = chosen(experts);
-        ledger.tell(Told::Completed { step, chose, guesses: Some(0), row_experts: Vec::new() }).resolved
+        ledger.tell(Told::Completed { step, chose, guesses: Some(0), row_experts: Vec::new(), physical_rows: 1, layer_misses: Vec::new() }).resolved
     }
 
     /// A step's guess kinds word of batch row `row`'s front row's guess of
@@ -3010,24 +2747,22 @@ mod tests {
     fn a_combination_key_is_its_nearest_look_rank_and_count() {
         let front_d1 = Source::Ahead(Row { index: 0, front: Some(GuessKind::Chained) });
         let front_d2 = Source::Ahead(Row { index: 1, front: Some(GuessKind::Head) });
-        let hint_d0_l1 = Source::Lead { distance: 1, row: None };
-        let hint_d0_l2 = Source::Lead { distance: 2, row: None };
+        let token_d0 = Source::Token;
         let verify_d1 = Source::Ahead(Row { index: 0, front: None });
 
-        // Exact-row hint (depth 0, Hint(1)) is nearer than depth-0 Hint(2) and depth-1 Route.
-        // Two requests naming hint_d0_l1 at ranks 4 and 2 share one look, keeping best rank 2.
+        // Depth-0 Token is nearer than depth-1 Route.
+        // Two requests naming token_d0 at ranks 4 and 2 share one look, keeping best rank 2.
         let comb = Combination::of([
             Kind { source: front_d2, rank: 0 },
             Kind { source: front_d1, rank: 1 },
-            Kind { source: hint_d0_l2, rank: 3 },
-            Kind { source: hint_d0_l1, rank: 4 },
-            Kind { source: hint_d0_l1, rank: 2 },
+            Kind { source: token_d0, rank: 4 },
+            Kind { source: token_d0, rank: 2 },
             Kind { source: verify_d1, rank: 0 },
         ])
         .expect("non-empty");
-        assert_eq!(comb.nearest, Look { depth: 0, seen: Seen::Hint(1), form: Form::Front });
+        assert_eq!(comb.nearest, Look { depth: 0, seen: Seen::Token, form: Form::Front });
         assert_eq!(comb.rank, 2, "best rank among names from the nearest look");
-        assert_eq!(comb.looks, 5, "two names from hint_d0_l1 count as one look");
+        assert_eq!(comb.looks, 4, "two names from token_d0 count as one look");
 
         // Unmeasured key reads 1 once; after counting an outcome, rolling epochs
         // never returns it to 1 (unmeasured).
@@ -3041,71 +2776,6 @@ mod tests {
         assert_eq!(cal.bytes(), initial_bytes, "table size is constant");
     }
 
-    /// A step's resolution forms one counterfactual demand cohort per layer:
-    /// misses plus tier hits landed by a hint for that step, each saved read
-    /// recording only the leads whose `name_time + landing_duration <= read_time`.
-    /// `CohortRates` credits exclusive catches only while a lead runs, freezes
-    /// with age while off, and counts cohort size on every step.
-    #[test]
-    fn a_cohort_forms_from_misses_and_hint_landings_with_exclusive_catchers() {
-        let mut ledger = ledger(1);
-        let t0 = Instant::now();
-        let lead1 = Source::Lead { distance: 1, row: None };
-        let lead2 = Source::Lead { distance: 2, row: None };
-
-        // Expert 1: named by lead 2 at t0 and lead 1 at t0 + 1ms; issued at t0, landed at t0 + 2ms (dur = 2ms);
-        // route passed at t0 + 5ms -> both lead 1 (1+2=3<=5) and lead 2 (0+2=2<=5) catch it -> neither exclusive.
-        ledger.publish(0, 1, name(lead2, 6), t0);
-        ledger.publish(0, 1, name(lead1, 6), t0 + Duration::from_millis(1));
-        let led1 = ledger.leading(0, 1).unwrap();
-        ledger.issued(0, 1, &led1, 10, t0);
-        ledger.landed(0, 1, t0 + Duration::from_millis(2));
-
-        // Expert 2: named by lead 1 at t0, lead 2 at t0 + 4ms; dur = 2ms; route passed at t0 + 5ms ->
-        // lead 1 (0+2=2<=5) catches it, lead 2 (4+2=6>5) does not -> exclusive to lead 1.
-        ledger.publish(0, 2, name(lead1, 6), t0);
-        ledger.publish(0, 2, name(lead2, 6), t0 + Duration::from_millis(4));
-        let led2 = ledger.leading(0, 2).unwrap();
-        ledger.issued(0, 2, &led2, 10, t0);
-        ledger.landed(0, 2, t0 + Duration::from_millis(2));
-
-        ledger.pass(0, t0 + Duration::from_millis(5), |interest| interest.step() == 6);
-        let chose = vec![vec![
-            Chosen { expert: 1, saves: true, tier: true },
-            Chosen { expert: 2, saves: true, tier: true },
-            Chosen { expert: 3, saves: true, tier: false }, // demand miss
-            Chosen { expert: 4, saves: false, tier: false }, // resident hit (not in cohort)
-        ]];
-        let learned = ledger.tell(Told::Completed { step: 6, chose, guesses: Some(0), row_experts: Vec::new() });
-        assert_eq!(learned.cohorts.len(), 1);
-        let cohort = &learned.cohorts[0];
-        assert_eq!(cohort.misses, 1);
-        assert_eq!(cohort.saved.len(), 2);
-        assert_eq!(cohort.size(), 3);
-        assert_eq!(cohort.exclusive(1), 1, "only expert 2 is exclusively caught by lead 1");
-        assert_eq!(cohort.exclusive(2), 0, "expert 1 was also caught by lead 1");
-
-        let r0 = RegimeEpoch::ZERO;
-        let r1 = r0.next();
-        let mut rates = CohortRates::new(1, r0, 0);
-        assert_eq!(rates.exclusive(1, r0, 0, Tokens::new(1.0)), Caught::Unmeasured);
-        rates.count(cohort, &[true, true], r0, 0, Tokens::new(1.0));
-        assert_eq!(rates.cohort(0, r0, 0), Some(3.0));
-        assert_eq!(rates.exclusive(1, r0, 0, Tokens::new(1.0)), Caught::Measured { rate: 1.0 / 3.0, age: Tokens::ZERO });
-        assert_eq!(rates.exclusive(2, r0, 0, Tokens::new(1.0)), Caught::Measured { rate: 0.0, age: Tokens::ZERO });
-
-        // Lead 1 turns off within the same regime: cohort keeps counting, lead 1 freezes with growing age.
-        let miss_only = Cohort { step: 7, layer: 0, misses: 5, saved: Vec::new() };
-        rates.count(&miss_only, &[false, true], r0, 1, Tokens::new(6.0));
-        assert_eq!(rates.cohort(0, r0, 1), Some(4.0), "(3 + 5) / 2");
-        assert_eq!(rates.exclusive(1, r0, 1, Tokens::new(6.0)), Caught::Measured { rate: 1.0 / 3.0, age: Tokens::new(5.0) });
-
-        // Advancing RegimeEpoch (e.g. bank resize or tier_complete) makes prior-regime
-        // frozen exclusive rates (A10) and cohorts inapplicable by construction.
-        assert_eq!(rates.exclusive(1, r1, 1, Tokens::new(6.0)), Caught::Unmeasured);
-        assert_eq!(rates.cohort(0, r1, 1), None);
-    }
-
     /// What a read is admitted at is the measured rate of the combination
     /// of names its admission was decided on for its step, not a
     /// composition of their precisions: the experts two sources named
@@ -3113,11 +2783,11 @@ mod tests {
     /// Unmeasured, the bound 1.
     #[test]
     fn a_combination_of_names_is_admitted_at_its_measured_rate() {
-        let mut ledger = calibrated(1, &[(AHEAD, 0.5), (LEAD, 0.5)]);
+        let mut ledger = calibrated(1, &[(AHEAD, 0.5), (TOKEN, 0.5)]);
         let t = now();
         let both = |ledger: &mut Ledger, expert, step| {
             ledger.publish(0, expert, name(AHEAD, step), t);
-            ledger.publish(0, expert, name(LEAD, step), t);
+            ledger.publish(0, expert, name(TOKEN, step), t);
             ledger.act(0, expert, Read::Absent, &PRICE);
         };
         both(&mut ledger, 1, 6);
@@ -3184,16 +2854,16 @@ mod tests {
 
     #[test]
     fn issue_is_due_for_a_certain_interest_now_expected_when_admitted_and_kept_below_the_break_even() {
-        let mut ledger = calibrated(1, &[(AHEAD, 0.8), (LEAD, 0.2)]);
+        let mut ledger = calibrated(1, &[(AHEAD, 0.8), (TOKEN, 0.2)]);
         let t = now();
         ledger.publish(0, 1, name(Source::Exact, 5), t);
         ledger.publish(0, 2, name(AHEAD, 6), t);
-        ledger.publish(0, 3, name(LEAD, 6), t);
+        ledger.publish(0, 3, name(TOKEN, 6), t);
         assert_eq!(ledger.act(0, 1, Read::Absent, &Unpriced), Act::Issue(Class::Due), "a due read is never priced");
         assert!(matches!(ledger.act(0, 2, Read::Absent, &PRICE), Act::Issue(Class::Expected { step: 6, .. })));
-        assert_eq!(ledger.act(0, 3, Read::Absent, &PRICE), Act::Keep, "a hint below the break-even claims no staging or tier slot");
-        // An early Lead hint below the break-even never shadows an admitted later-step Ahead route.
-        ledger.publish(0, 4, name(LEAD, 5), t);
+        assert_eq!(ledger.act(0, 3, Read::Absent, &PRICE), Act::Keep, "a name below the break-even claims no staging or tier slot");
+        // An early Token name below the break-even never shadows an admitted later-step Ahead route.
+        ledger.publish(0, 4, name(TOKEN, 5), t);
         ledger.publish(0, 4, name(AHEAD, 6), t);
         assert!(matches!(ledger.act(0, 4, Read::Absent, &PRICE), Act::Issue(Class::Expected { step: 6, .. })));
         // A certain interest for a step not yet reached is not yet due.
@@ -3217,9 +2887,9 @@ mod tests {
     /// read due: the request's wait is the ledger's, not a path of its own.
     #[test]
     fn an_exact_request_reprices_the_read_ahead_it_finds_due() {
-        let mut ledger = calibrated(1, &[(LEAD, 0.2)]);
+        let mut ledger = calibrated(1, &[(TOKEN, 0.2)]);
         let t = now();
-        ledger.publish(0, 1, name(LEAD, 6), t);
+        ledger.publish(0, 1, name(TOKEN, 6), t);
         assert_eq!(ledger.act(0, 1, Read::Reading { begun: false }, &PRICE), Act::Cancel);
         assert_eq!(ledger.act(0, 1, Read::Reading { begun: true }, &PRICE), Act::Keep);
         ledger.reach(6, 0);
@@ -3246,25 +2916,25 @@ mod tests {
         let mut ledger = ledger(2);
         let t = now();
         ledger.publish(0, 1, name(AHEAD, 6), t);
-        ledger.publish(0, 2, name(LEAD, 6), t);
-        ledger.publish(0, 3, Name { candidate: false, ..name(LEAD, 6) }, t);
+        ledger.publish(0, 2, name(TOKEN, 6), t);
+        ledger.publish(0, 3, Name { candidate: false, ..name(TOKEN, 6) }, t);
         ledger.publish(0, 1, name(AHEAD, 7), t);
         ledger.publish(1, 4, name(AHEAD, 6), t);
         ledger.publish(0, 1, name(Source::Exact, 6), t);
-        // The candidates' reads decided before the hints pass.
+        // The candidates' reads decided before the names pass.
         for expert in [1, 2] {
             ledger.act(0, expert, Read::Absent, &PRICE);
         }
-        ledger.pass(0, t, |interest| interest.source == LEAD);
+        ledger.pass(0, t, |interest| interest.source == TOKEN);
         let mut resolved = resolve(&mut ledger, 6, 0, &[1]);
         resolved.sort_by_key(|resolved| resolved.expert);
         assert_eq!(resolved.iter().map(|resolved| (resolved.expert, resolved.used)).collect::<Vec<_>>(), [(1, true), (2, false), (3, false)]);
         // Each decided read's names for the step counted together: expert
         // 1's exact request is certain, no combination decided; expert 2's
-        // hint, decided; expert 3's, never decided.
+        // token name, decided; expert 3's, never decided.
         let ahead_key = Combination::of([Kind { source: AHEAD, rank: 0 }]).unwrap();
-        let lead_key = Combination::of([Kind { source: LEAD, rank: 0 }]).unwrap();
-        assert_eq!((ledger.calibration.combined(0, ahead_key, 0), ledger.calibration.combined(0, lead_key, 0)), (1., 0.));
+        let token_key = Combination::of([Kind { source: TOKEN, rank: 0 }]).unwrap();
+        assert_eq!((ledger.calibration.combined(0, ahead_key, 0), ledger.calibration.combined(0, token_key, 0)), (1., 0.));
         assert_eq!(ledger.derived(0, 1).map(|derived| derived.step), Some(7));
         assert_eq!(ledger.derived(0, 2), None);
         assert_eq!(ledger.derived(1, 4).map(|derived| derived.step), Some(6), "another layer stands");
@@ -3292,18 +2962,18 @@ mod tests {
     /// at its combination's measured rate, never by its own pass.
     #[test]
     fn reads_are_scheduled_soonest_step_first_then_likeliest() {
-        const FAR: Source = Source::Lead { distance: 2, row: None };
-        let mut ledger = calibrated(2, &[(AHEAD, 0.9), (LEAD, 0.6)]);
+        const VERIFY: Source = Source::Ahead(Row { index: 0, front: None });
+        let mut ledger = calibrated(2, &[(AHEAD, 0.9), (TOKEN, 0.6)]);
         let t = now();
-        ledger.publish(0, 1, name(LEAD, 6), t);
+        ledger.publish(0, 1, name(TOKEN, 6), t);
         ledger.publish(1, 2, name(AHEAD, 8), t);
-        ledger.publish(0, 3, name(LEAD, 7), t);
-        ledger.publish(1, 4, name(LEAD, 6), t);
+        ledger.publish(0, 3, name(TOKEN, 7), t);
+        ledger.publish(1, 4, name(TOKEN, 6), t);
         ledger.publish(0, 5, name(Source::Exact, 5), t);
         ledger.publish(1, 6, front(AHEAD, 6, 1), t);
-        ledger.publish(0, 7, name(FAR, 6), t);
+        ledger.publish(0, 7, name(VERIFY, 6), t);
         ledger.publish(0, 8, name(AHEAD, 9), t);
-        assert_eq!(ledger.pass(0, t, |interest| interest.source == FAR), vec![7]);
+        assert_eq!(ledger.pass(0, t, |interest| interest.source == VERIFY), vec![7]);
         let reading = |layer, expert| match (layer, expert) {
             (0, 5) | (0, 7) | (1, 2) => Read::Reading { begun: false },
             _ => Read::Absent,
@@ -3364,7 +3034,7 @@ mod tests {
         ledger.publish(0, 1, proposal(1, 1), t);
         ledger.publish(0, 2, proposal(1, 2), t);
         ledger.publish(0, 3, proposal(2, 1), t);
-        ledger.publish(0, 4, name(LEAD, 6), t);
+        ledger.publish(0, 4, name(TOKEN, 6), t);
         awaiting(&mut ledger, 5, &[1]);
         ledger.tell(Told::Decided { step: 5, request: RequestId(1), verdict: proposed(&[true, false]) });
         assert_eq!(ledger.take_owed(), vec![(0, 2)]);
@@ -3410,7 +3080,7 @@ mod tests {
         assert!(head.front == Some(GuessKind::Head) && head != FRONT);
         assert_eq!(ledger.row(4, 1, 0), None, "a front row that ran on no guess names nothing");
         ledger.publish(0, 3, Name { when, lineage: Some(lineage), from: At::whole(4, 0), ..name(AHEAD, 0) }, t);
-        ledger.tell(Told::Completed { step: 4, chose: vec![Vec::new()], guesses: Some(chained), row_experts: Vec::new() });
+        ledger.tell(Told::Completed { step: 4, chose: vec![Vec::new()], guesses: Some(chained), row_experts: Vec::new(), physical_rows: 1, layer_misses: Vec::new() });
         ledger.tell(Told::Ended { step: 4, completed: true });
         ledger.tell(Told::Began { step: 5, launch: Launched::Decode { rows: Box::new([row(2, None)]), padding: 0 } });
         assert!(resolve(&mut ledger, 5, 0, &[]).is_empty(), "another request's launch resolves nothing of it");
@@ -3445,7 +3115,7 @@ mod tests {
                 5 => kinds(1, GuessKind::Head),
                 _ => 0,
             };
-            ledger.tell(Told::Completed { step, chose: vec![Vec::new()], guesses: Some(guesses), row_experts: Vec::new() });
+            ledger.tell(Told::Completed { step, chose: vec![Vec::new()], guesses: Some(guesses), row_experts: Vec::new(), physical_rows: 1, layer_misses: Vec::new() });
         }
         ledger.tell(Told::Decided { step: 5, request: RequestId(1), verdict: fronted(&[30], 30) });
         ledger.tell(Told::Decided { step: 4, request: RequestId(1), verdict: fronted(&[20], 21) });
@@ -3465,9 +3135,9 @@ mod tests {
         );
         assert_eq!(ledger.stands.rate(1, Form::Verify), Some(1.0));
         ledger.tell(Told::Began { step: 7, launch: decode(&[row(1, 13, None), row(1, 14, Some(front))]) });
-        ledger.tell(Told::Completed { step: 7, chose: vec![Vec::new()], guesses: Some(kinds(1, GuessKind::Chained)), row_experts: Vec::new() });
+        ledger.tell(Told::Completed { step: 7, chose: vec![Vec::new()], guesses: Some(kinds(1, GuessKind::Chained)), row_experts: Vec::new(), physical_rows: 1, layer_misses: Vec::new() });
         ledger.tell(Told::Began { step: 9, launch: decode(&[row(1, 14, None), row(1, 15, Some(front))]) });
-        ledger.tell(Told::Completed { step: 9, chose: vec![Vec::new()], guesses: Some(kinds(1, GuessKind::Head)), row_experts: Vec::new() });
+        ledger.tell(Told::Completed { step: 9, chose: vec![Vec::new()], guesses: Some(kinds(1, GuessKind::Head)), row_experts: Vec::new(), physical_rows: 1, layer_misses: Vec::new() });
         ledger.tell(Told::Decided { step: 7, request: RequestId(1), verdict: fronted(&[40], 40) });
         assert_eq!(ledger.take_judged().0, [Judged { step: 7, row: 1, depth: 1, kind: GuessKind::Chained, stood: Some(true) }]);
         ledger.tell(Told::Closed(RequestId(1)));
@@ -3487,7 +3157,7 @@ mod tests {
         for step in 4..=6 {
             ledger.tell(Told::Began { step, launch: Launched::Decode { rows: Box::new([row(step + 6, None), row(step + 7, Some(front))]), padding: 0 } });
             let kind = if step == 6 { GuessKind::Head } else { GuessKind::Chained };
-            ledger.tell(Told::Completed { step, chose: vec![Vec::new()], guesses: Some(kinds(1, kind)), row_experts: Vec::new() });
+            ledger.tell(Told::Completed { step, chose: vec![Vec::new()], guesses: Some(kinds(1, kind)), row_experts: Vec::new(), physical_rows: 1, layer_misses: Vec::new() });
         }
         // Step 5's front row names expert 2 for the pass after it.
         let lineage = Some(Lineage { request: RequestId(1), row: 1, guessed: NonZeroU8::MIN });
@@ -3531,7 +3201,7 @@ mod tests {
         let t = now();
         let row = |position, ahead| DecodeRow { position, request: RequestId(1), ahead, token: None };
         ledger.tell(Told::Began { step: 4, launch: Launched::Decode { rows: Box::new([row(10, None), row(11, Some(AheadOf::new(1, 0, 0)))]), padding: 0 } });
-        ledger.tell(Told::Completed { step: 4, chose: vec![Vec::new()], guesses: Some(0), row_experts: Vec::new() });
+        ledger.tell(Told::Completed { step: 4, chose: vec![Vec::new()], guesses: Some(0), row_experts: Vec::new(), physical_rows: 1, layer_misses: Vec::new() });
         let lineage = Lineage { request: RequestId(1), row: 1, guessed: NonZeroU8::MIN };
         ledger.publish(0, 2, Name { when: When::Step(5), lineage: Some(lineage), from: At::whole(4, 0), ..name(AHEAD, 5) }, t);
         ledger.tell(Told::Decided { step: 4, request: RequestId(1), verdict: fronted(&[11], 12) });
@@ -3581,14 +3251,14 @@ mod tests {
     /// requested again with no read in flight was evicted unused.
     #[test]
     fn a_read_aheads_bytes_are_used_cancelled_or_lost_and_fall_with_its_guess() {
-        let mut ledger = calibrated(1, &[(AHEAD, 0.8), (LEAD, 0.8)]);
+        let mut ledger = calibrated(1, &[(AHEAD, 0.8), (TOKEN, 0.8)]);
         let t = now();
         let of = |request| Name { lineage: Some(Lineage { request: RequestId(request), row: 1, guessed: NonZeroU8::MIN }), ..name(AHEAD, 6) };
         ledger.publish(0, 1, of(1), t);
         ledger.publish(0, 2, of(1), t);
-        ledger.publish(0, 3, name(LEAD, 6), t);
+        ledger.publish(0, 3, name(TOKEN, 6), t);
         ledger.publish(0, 4, of(2), t);
-        ledger.publish(0, 5, name(LEAD, 6), t);
+        ledger.publish(0, 5, name(TOKEN, 6), t);
         ledger.publish(0, 6, of(1), t);
         for (expert, bytes) in [(1, 10), (2, 20), (3, 30), (4, 40), (5, 50), (6, 60)] {
             let led = ledger.leading(0, expert).expect("a live interest");
@@ -3609,8 +3279,8 @@ mod tests {
             spent,
             [
                 Spent::Cancelled { basis: Basis::Front, depth: 1, verify: false, fell: true, bytes: 20 },
-                Spent::Used { basis: Basis::Hint, depth: 0, verify: false, fell: false, bytes: 30 },
-                Spent::Unused { basis: Basis::Hint, depth: 0, verify: false, fell: false, bytes: 50 },
+                Spent::Used { basis: Basis::Token, depth: 0, verify: false, fell: false, bytes: 30 },
+                Spent::Unused { basis: Basis::Token, depth: 0, verify: false, fell: false, bytes: 50 },
             ]
         );
         // A fallen guess's read is still used where an exact row chooses it;
@@ -3628,7 +3298,7 @@ mod tests {
         // Spent once: a later choice of a spent read's expert spends nothing.
         resolve(&mut ledger, 7, 0, &[1, 4]);
         assert!(ledger.take_spent().is_empty());
-        assert_eq!(Basis::of(Source::Lead { distance: 1, row: Some(FRONT) }), Basis::AheadHint);
+        assert_eq!(Basis::of(Source::Token), Basis::Token);
     }
 
     /// A launch of an exact row and three front rows: front row `d` (batch
@@ -3650,7 +3320,7 @@ mod tests {
         let guesses = magnitude_kernels::step_guesses([(1, GuessKind::Chained.word()), (2, GuessKind::Head.word())]) as u32;
         assert_eq!(ledger.row(4, 3, guesses), None, "an idle row names nothing");
         assert!(ledger.row(4, 2, guesses).is_some(), "a guessed row names its experts");
-        ledger.tell(Told::Completed { step: 4, chose: vec![Vec::new()], guesses: Some(guesses), row_experts: Vec::new() });
+        ledger.tell(Told::Completed { step: 4, chose: vec![Vec::new()], guesses: Some(guesses), row_experts: Vec::new(), physical_rows: 1, layer_misses: Vec::new() });
         ledger.tell(Told::Decided { step: 4, request: RequestId(1), verdict: fronted(&[11, 12], 11) });
         assert_eq!(ledger.take_judged().0, [Judged { step: 4, row: 1, depth: 1, kind: GuessKind::Chained, stood: Some(true) }]);
         ledger.tell(Told::Closed(RequestId(1)));
@@ -3712,7 +3382,7 @@ mod tests {
         for step in [4, 5] {
             ledger.tell(Told::Began { step, launch: Launched::Decode { rows: Box::new([row(step + 6, None), row(step + 7, Some(AheadOf::new(1, 0, 0)))]), padding: 0 } });
         }
-        ledger.tell(Told::Completed { step: 4, chose: vec![Vec::new()], guesses: Some(kinds(1, GuessKind::Chained)), row_experts: Vec::new() });
+        ledger.tell(Told::Completed { step: 4, chose: vec![Vec::new()], guesses: Some(kinds(1, GuessKind::Chained)), row_experts: Vec::new(), physical_rows: 1, layer_misses: Vec::new() });
         let lineage = Some(Lineage { request: RequestId(1), row: 1, guessed: NonZeroU8::MIN });
         ledger.publish(0, 1, Name { when: When::Step(5), lineage, from: At::whole(4, 0), ..name(AHEAD, 5) }, t);
         ledger.publish(0, 2, Name { when: When::Step(6), lineage, from: At::whole(5, 0), ..name(AHEAD, 6) }, t);
@@ -3731,7 +3401,7 @@ mod tests {
         let mut ledger = ledger(1);
         let t = now();
         three_deep(&mut ledger, 4, 10);
-        ledger.tell(Told::Completed { step: 4, chose: vec![Vec::new()], guesses: Some(three_kinds()), row_experts: Vec::new() });
+        ledger.tell(Told::Completed { step: 4, chose: vec![Vec::new()], guesses: Some(three_kinds()), row_experts: Vec::new(), physical_rows: 1, layer_misses: Vec::new() });
         let lineage = |guessed| Some(Lineage { request: RequestId(1), row: guessed, guessed: NonZeroU8::new(guessed as u8).unwrap() });
         for depth in 1..=3 {
             ledger.publish(0, depth, Name { when: When::Step(4 + depth as u64), lineage: lineage(depth), from: At::whole(4, 0), ..name(Source::Ahead(Row { index: depth as u8 - 1, front: Some(GuessKind::Chained) }), 5) }, t);
@@ -3744,7 +3414,7 @@ mod tests {
         // resolves the names for it.
         for (step, exact) in [(5, 11), (6, 12)] {
             ledger.tell(Told::Began { step, launch: Launched::Decode { rows: Box::new([DecodeRow { position: exact, request: RequestId(1), ahead: None, token: None }, DecodeRow { position: exact + 1, request: RequestId(1), ahead: Some(AheadOf::new(1, 0, 0)), token: None }]), padding: 0 } });
-            ledger.tell(Told::Completed { step, chose: vec![Vec::new()], guesses: Some(kinds(1, GuessKind::Chained)), row_experts: Vec::new() });
+            ledger.tell(Told::Completed { step, chose: vec![Vec::new()], guesses: Some(kinds(1, GuessKind::Chained)), row_experts: Vec::new(), physical_rows: 1, layer_misses: Vec::new() });
         }
         ledger.tell(Told::Decided { step: 5, request: RequestId(1), verdict: fronted(&[12], 12) });
         assert_eq!(
@@ -3770,11 +3440,11 @@ mod tests {
         // A row whose truth no decision learned (a pass between ran no row
         // ahead) is left unjudged as the truths pass it.
         three_deep(&mut ledger, 7, 13);
-        ledger.tell(Told::Completed { step: 7, chose: vec![Vec::new()], guesses: Some(three_kinds()), row_experts: Vec::new() });
+        ledger.tell(Told::Completed { step: 7, chose: vec![Vec::new()], guesses: Some(three_kinds()), row_experts: Vec::new(), physical_rows: 1, layer_misses: Vec::new() });
         ledger.tell(Told::Decided { step: 7, request: RequestId(1), verdict: fronted(&[14, 15, 16], 14) });
         ledger.take_judged();
         three_deep(&mut ledger, 9, 15);
-        ledger.tell(Told::Completed { step: 9, chose: vec![Vec::new()], guesses: Some(three_kinds()), row_experts: Vec::new() });
+        ledger.tell(Told::Completed { step: 9, chose: vec![Vec::new()], guesses: Some(three_kinds()), row_experts: Vec::new(), physical_rows: 1, layer_misses: Vec::new() });
         ledger.tell(Told::Decided { step: 9, request: RequestId(1), verdict: fronted(&[16, 17, 18], 16) });
         assert_eq!(
             ledger.take_judged().0,
@@ -3795,7 +3465,7 @@ mod tests {
         let mut ledger = calibrated(1, &[(Source::Ahead(Row { index: 0, front: Some(GuessKind::Chained) }), 0.9), (Source::Ahead(Row { index: 1, front: Some(GuessKind::Chained) }), 0.9)]);
         let t = now();
         three_deep(&mut ledger, 4, 10);
-        ledger.tell(Told::Completed { step: 4, chose: vec![Vec::new()], guesses: Some(three_kinds()), row_experts: Vec::new() });
+        ledger.tell(Told::Completed { step: 4, chose: vec![Vec::new()], guesses: Some(three_kinds()), row_experts: Vec::new(), physical_rows: 1, layer_misses: Vec::new() });
         for depth in 1..=2u8 {
             let Some(Origin::Ahead { row, when, lineage }) = ledger.row(4, usize::from(depth), three_kinds()) else { panic!("an ahead row") };
             ledger.publish(0, usize::from(depth), Name { source: Source::Ahead(row), when, lineage: Some(lineage), from: At::whole(4, 0), ..name(AHEAD, 0) }, t);
@@ -3815,65 +3485,6 @@ mod tests {
         let after = queued(&mut ledger);
         assert_eq!(after, [(1, Act::Cancel), (2, Act::Cancel), (3, Act::Reprice(Class::Due))], "the fallen reads leave, demand stays first among reads");
         assert_eq!(ledger.act(0, 1, Read::Reading { begun: true }, &PRICE), Act::Keep, "a begun read is never preempted");
-    }
-
-    /// Re-issuing a hint read for `(layer, expert)` on the same step after an
-    /// earlier hint read already landed (e.g., evicted and re-issued before
-    /// `Completed` runs) must not panic in `Entry::saved` and preserves the
-    /// earlier landing's catcher credit.
-    #[test]
-    fn reissuing_an_already_landed_hint_read_before_completion_does_not_panic() {
-        let mut ledger = calibrated(1, &[(LEAD, 0.8)]);
-        let t0 = now();
-        let t1 = t0 + Duration::from_millis(1);
-        let t2 = t0 + Duration::from_millis(2);
-        ledger.publish(0, 7, name(LEAD, 6), t0);
-        let led = ledger.leading(0, 7).expect("live hint interest");
-        ledger.issued(0, 7, &led, 100, t0);
-        ledger.landed(0, 7, t1);
-        ledger.pass(0, t2, |interest| interest.step() == 6);
-        // Expert 7 is evicted and re-issued for the same step (landed = None in `reads`).
-        ledger.issued(0, 7, &led, 100, t2);
-        let learned = ledger.tell(Told::Completed {
-            step: 6,
-            chose: vec![vec![Chosen { expert: 7, saves: true, tier: true }]],
-            guesses: None,
-            row_experts: Vec::new(),
-        });
-        assert_eq!(learned.cohorts.len(), 1);
-        assert_eq!(learned.cohorts[0].saved.len(), 1, "preserved landing duration credits lead 1");
-        assert_eq!(learned.cohorts[0].exclusive(1), 1);
-    }
-
-    /// B-1: `Ledger::hint_admitted` checks whether any rank `0..K` for
-    /// `(target_layer, lead)` has calibrated probability `>= break_even`.
-    #[test]
-    fn hint_admitted_reflects_calibrated_ranks_against_break_even() {
-        let time = Time::new(&[vec![64]], 8);
-        let stands = Stands::new(time.clone());
-        let mut ledger = Ledger::new(vec![0], 2, time, stands);
-        // Unmeasured ranks read their bound 1.0 -> admitted even at break_even = 0.85.
-        assert!(ledger.hint_admitted(0, 1, 0.85));
-
-        // Calibrate both ranks 0 and 1 at lead 1 to p = 0.25 (1 hit in 4).
-        let t0 = now();
-        for step in 1..=4u64 {
-            for rank in 0..2u8 {
-                let mut n = name(LEAD, step);
-                n.rank = rank;
-                ledger.publish(0, rank as usize, n, t0);
-                ledger.act(0, rank as usize, Read::Absent, &PRICE);
-            }
-            let chose = if step == 1 {
-                vec![vec![Chosen { expert: 0, saves: true, tier: false }, Chosen { expert: 1, saves: true, tier: false }]]
-            } else {
-                vec![Vec::new()]
-            };
-            ledger.tell(Told::Completed { step, chose, guesses: None, row_experts: Vec::new() });
-        }
-        assert!(!ledger.hint_admitted(0, 1, 0.80), "calibrated p = 0.25 < 0.80 must not be admitted");
-        assert!(ledger.hint_admitted(0, 1, 0.25), "calibrated p = 0.25 >= 0.25 is admitted");
-        assert!(ledger.hint_admitted(0, 1, 0.0), "p* = 0.0 admits all calibrated ranks");
     }
 
     /// Token-conditioned cross-burst foresight (`Source::Token` / `TokenRoutes`):
@@ -3903,6 +3514,13 @@ mod tests {
                 ],
                 guesses: None,
                 row_experts: vec![vec![(1, 3)], vec![(1, 5)]],
+                physical_rows: 2,
+                layer_misses: Vec::new(),
+            });
+            ledger.tell(Told::Decided {
+                step,
+                request: req,
+                verdict: Verdict { acceptable: vec![true], front: vec![], truths: vec![] },
             });
             ledger.tell(Told::Ended { step, completed: true });
         }
@@ -3927,5 +3545,134 @@ mod tests {
         assert_eq!(ledger.leading(0, 3).expect("bound interest").when, When::Step(7));
         let act = ledger.act(0, 3, Read::Absent, &PRICE);
         assert!(matches!(act, Act::Issue(Class::Expected { step: 7, .. })), "must schedule bound Source::Token read: {act:?}");
+    }
+
+    /// Gate #3: `NameLedger` hybrid verify+front lifecycle:
+    /// - Early rejection at `0` or `K - 1` cancels all trailing `F` front rows.
+    /// - Full acceptance with mismatching bonus (`truths[K] != front[0]`) cancels
+    ///   all trailing `F` front rows immediately.
+    /// - Full acceptance with matching bonus (`truths[K] == front[0]`) keeps
+    ///   front row 0 alive for `pass + 1` and binds to `When::Step` on next verify begin.
+    /// - Padding rows and other-request launches never advance request pass horizon.
+    #[test]
+    fn hybrid_verify_with_front_ledger_lifecycle() {
+        let make_ledger = || {
+            let time = Time::new(&[vec![64]], 8);
+            let stands = Stands::new(time.clone());
+            Ledger::new(vec![0], 4, time, stands)
+        };
+        let req = RequestId(1);
+        let other = RequestId(2);
+        let t = Instant::now();
+        let front_guesses_word = (GuessKind::Head.word() as u32) << (3 * 2) | (GuessKind::Head.word() as u32) << (4 * 2);
+
+        let begin_hybrid = |ledger: &mut Ledger, step: Step, exact: u64, padding: usize| {
+            let rows = Box::new([
+                DecodeRow { position: exact, request: req, ahead: None, token: Some(TokenId(1)) },
+                DecodeRow { position: exact + 1, request: req, ahead: Some(AheadOf::new(1, 2, 0)), token: Some(TokenId(10)) },
+                DecodeRow { position: exact + 2, request: req, ahead: Some(AheadOf::new(1, 2, 1)), token: Some(TokenId(11)) },
+                DecodeRow { position: exact + 3, request: req, ahead: Some(AheadOf::new(1, 2, 2)), token: Some(TokenId(20)) },
+                DecodeRow { position: exact + 4, request: req, ahead: Some(AheadOf::new(1, 2, 3)), token: Some(TokenId(21)) },
+            ]);
+            ledger.tell(Told::Began { step, launch: Launched::Decode { rows, padding } });
+            // Publish front row 0 (row 3 -> expert 30) and front row 1 (row 4 -> expert 31).
+            for (batch_row, expert) in [(3usize, 30usize), (4usize, 31usize)] {
+                let Origin::Ahead { row, when, lineage } = ledger.row(step, batch_row, front_guesses_word).expect("front row origin") else {
+                    panic!("row {batch_row} must be Origin::Ahead");
+                };
+                ledger.publish(
+                    0,
+                    expert,
+                    Name { source: Source::Ahead(row), when, lineage: Some(lineage), from: At::whole(step, 0), ..name(AHEAD, 0) },
+                    t,
+                );
+            }
+            ledger.tell(Told::Completed { step, chose: vec![vec![]], guesses: Some(front_guesses_word), row_experts: vec![vec![]], physical_rows: 1, layer_misses: Vec::new() });
+        };
+
+        // 1. Early rejection at 0 cancels both trailing front rows.
+        {
+            let mut ledger = make_ledger();
+            begin_hybrid(&mut ledger, 1, 10, 0);
+            let verdict = Verdict {
+                acceptable: vec![false, false],
+                front: vec![TokenId(20), TokenId(21)],
+                truths: vec![TokenId(99)],
+            };
+            ledger.tell(Told::Decided { step: 1, request: req, verdict });
+            assert_eq!(ledger.act(0, 30, Read::Reading { begun: false }, &PRICE), Act::Cancel);
+            assert_eq!(ledger.act(0, 31, Read::Reading { begun: false }, &PRICE), Act::Cancel);
+        }
+
+        // 2. Early rejection at K - 1 cancels both trailing front rows.
+        {
+            let mut ledger = make_ledger();
+            begin_hybrid(&mut ledger, 1, 10, 0);
+            let verdict = Verdict {
+                acceptable: vec![true, false],
+                front: vec![TokenId(20), TokenId(21)],
+                truths: vec![TokenId(10), TokenId(99)],
+            };
+            ledger.tell(Told::Decided { step: 1, request: req, verdict });
+            assert_eq!(ledger.act(0, 30, Read::Reading { begun: false }, &PRICE), Act::Cancel);
+            assert_eq!(ledger.act(0, 31, Read::Reading { begun: false }, &PRICE), Act::Cancel);
+        }
+
+        // 3. Full acceptance with mismatching bonus (truths[K] = 88 != front[0] = 20) cancels all front rows immediately.
+        {
+            let mut ledger = make_ledger();
+            begin_hybrid(&mut ledger, 1, 10, 0);
+            let verdict = Verdict {
+                acceptable: vec![true, true],
+                front: vec![TokenId(20), TokenId(21)],
+                truths: vec![TokenId(10), TokenId(11), TokenId(88)],
+            };
+            ledger.tell(Told::Decided { step: 1, request: req, verdict });
+            assert_eq!(ledger.act(0, 30, Read::Reading { begun: false }, &PRICE), Act::Cancel);
+            assert_eq!(ledger.act(0, 31, Read::Reading { begun: false }, &PRICE), Act::Cancel);
+        }
+
+        // 4. Full acceptance with matching bonus (truths[K] == front[0] == 20):
+        //    - front row 0 stays alive for pass + 1;
+        //    - padding + other-request launches do NOT advance `req`'s pass horizon;
+        //    - next verify begin for `req` binds When::Pass to When::Step(next_step).
+        {
+            let mut ledger = make_ledger();
+            begin_hybrid(&mut ledger, 1, 10, 3);
+            let verdict = Verdict {
+                acceptable: vec![true, true],
+                front: vec![TokenId(20), TokenId(21)],
+                truths: vec![TokenId(10), TokenId(11), TokenId(20)],
+            };
+            ledger.tell(Told::Decided { step: 1, request: req, verdict });
+            assert!(matches!(ledger.leading(0, 30).expect("front 0 alive").when, When::Pass { request: r, pass: 2, .. } if r == req));
+            assert!(
+                matches!(ledger.act(0, 30, Read::Reading { begun: false }, &PRICE), Act::Reprice(Class::Expected { .. })),
+                "front row 0 must stay alive for pass + 1"
+            );
+
+            // Launch for another request + padding must NOT bind or advance `req`'s pass horizon.
+            ledger.tell(Told::Began {
+                step: 2,
+                launch: Launched::Decode {
+                    rows: Box::new([DecodeRow { position: 0, request: other, ahead: None, token: None }]),
+                    padding: 3,
+                },
+            });
+            assert!(matches!(ledger.leading(0, 30).expect("still unbound").when, When::Pass { request: r, pass: 2, .. } if r == req));
+
+            // Next verify launch for `req` (step 3) binds front row 0 to When::Step(3).
+            ledger.tell(Told::Began {
+                step: 3,
+                launch: Launched::Decode {
+                    rows: Box::new([
+                        DecodeRow { position: 13, request: req, ahead: None, token: Some(TokenId(20)) },
+                        DecodeRow { position: 14, request: req, ahead: Some(AheadOf::new(1, 1, 0)), token: Some(TokenId(21)) },
+                    ]),
+                    padding: 0,
+                },
+            });
+            assert_eq!(ledger.leading(0, 30).expect("bound to step 3").when, When::Step(3));
+        }
     }
 }

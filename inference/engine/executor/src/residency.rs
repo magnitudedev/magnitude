@@ -635,12 +635,40 @@ impl StoredRows for crate::host_tables::HostTable {
     }
 }
 
+/// Cache key for [`ResidencyStore`]. Covers every physical storage parameter
+/// checked by [`crate::planning::BankTable::shares_storage_with`] (backing
+/// artifact, full descriptor including shape/transforms, source/upload/resident
+/// elements, planned shape, scale, packing bound, holding, and banked state) so
+/// distinct planned layouts never collide in the residency cache.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 struct ResidencyKey {
     artifact: magnitude_artifacts::ArtifactIdentity,
-    name: String,
-    transforms: Vec<magnitude_family_contracts::ImportTransform>,
+    descriptor: WeightDescriptor,
+    source: Element,
+    upload: Element,
     resident: Element,
+    shape: Vec<u64>,
+    scale: Option<crate::planning::WeightScalePlan>,
+    bound: u64,
+    holding: crate::Holding,
+    banked: bool,
+}
+
+impl ResidencyKey {
+    fn for_plan(plan: &WeightPlan, banked: bool) -> Self {
+        Self {
+            artifact: plan.component.identity,
+            descriptor: plan.descriptor.clone(),
+            source: plan.source,
+            upload: plan.upload,
+            resident: plan.resident,
+            shape: plan.shape.clone(),
+            scale: plan.scale.clone(),
+            bound: plan.bound,
+            holding: plan.holding,
+            banked,
+        }
+    }
 }
 
 enum ImportPreparation {
@@ -997,12 +1025,12 @@ impl ResidencyStore {
         else {
             return Ok(None);
         };
-        let key = ResidencyKey {
-            artifact: artifact.identity(),
-            name: descriptor.name.clone(),
-            transforms: descriptor.transforms.clone(),
-            resident: plan.resident,
-        };
+        let banked = self
+            .execution
+            .load()
+            .expert_bank()
+            .is_some_and(|bank| bank.tables.iter().any(|table| table.has_role(plan.role)));
+        let key = ResidencyKey::for_plan(&plan, banked);
         if let Some(weight) = self.resident.get(&key) {
             return Ok(Some(weight));
         }
@@ -1141,7 +1169,7 @@ impl ResidencyStore {
         // A table the expert bank holds is reserved, resized as the bank's
         // one owner prices it (`ExpertBankPlan::tables`).
         let bank = self.execution.load().expert_bank();
-        let banked = bank.is_some_and(|bank| bank.tables.iter().any(|table| table.role == plan.role));
+        let banked = bank.is_some_and(|bank| bank.tables.iter().any(|table| table.has_role(plan.role)));
         let slots = match banked {
             true => {
                 let bank = bank.expect("a banked table belongs to a bank");
@@ -1280,12 +1308,7 @@ impl ResidencyStore {
                 descriptor.name
             )));
         }
-        let key = ResidencyKey {
-            artifact: artifact.identity(),
-            name: descriptor.name.clone(),
-            transforms: descriptor.transforms.clone(),
-            resident: planned.resident,
-        };
+        let key = ResidencyKey::for_plan(&planned, false);
         if let Some(weight) = self.resident.get(&key) {
             return Ok(weight);
         }
@@ -1469,12 +1492,7 @@ impl ResidencyStore {
                 descriptor.name
             )));
         }
-        let key = ResidencyKey {
-            artifact: artifact.identity(),
-            name: descriptor.name.clone(),
-            transforms: descriptor.transforms.clone(),
-            resident: actual_resident,
-        };
+        let key = ResidencyKey::for_plan(&planned, false);
         if let Some(weight) = self.resident.get(&key) {
             if weight.descriptor() != descriptor {
                 return Err(invalid(
@@ -1579,12 +1597,7 @@ impl ResidencyStore {
         let ordered: Vec<_> = OrderedImport::of(artifact, weights, activation)?
             .into_iter()
             .filter(|item| {
-                let key = ResidencyKey {
-                    artifact: artifact.identity(),
-                    name: item.plan.descriptor.name.clone(),
-                    transforms: item.plan.descriptor.transforms.clone(),
-                    resident: item.plan.resident,
-                };
+                let key = ResidencyKey::for_plan(&item.plan, false);
                 self.resident.get(&key).is_none()
             })
             .collect();
@@ -2327,9 +2340,21 @@ mod tests {
         );
         let key = ResidencyKey {
             artifact: magnitude_artifacts::ArtifactIdentity([0; 32]),
-            name: descriptor.name.clone(),
-            transforms: Vec::new(),
+            descriptor: descriptor.clone(),
+            source: Element::named("iq4g32s@rows16").unwrap(),
+            upload: Element::named("iq4g32s@rows16").unwrap(),
             resident: Element::named("iq4g32s@rows16").unwrap(),
+            shape: vec![4, 1, 32],
+            scale: None,
+            bound: 0,
+            holding: crate::Holding::Streamed(crate::planning::StreamedRows {
+                table_rows: 100,
+                staging_rows: 0,
+                landing_rows: 0,
+                directory: crate::planning::DirectoryForm::Hashed,
+                fill: crate::planning::TableFill::Stored,
+            }),
+            banked: true,
         };
         let weight = ResidentWeight::stored(descriptor, table.clone());
         let imports = Imports::default();
@@ -2351,27 +2376,169 @@ mod tests {
 
     #[test]
     fn residency_keys_separate_artifact_components() {
+        let base_descriptor = WeightDescriptor {
+            name: "shared.weight".into(),
+            shape: vec![4, 32],
+            transforms: Vec::new(),
+        };
         let target = ResidencyKey {
             artifact: magnitude_artifacts::ArtifactIdentity([1; 32]),
-            name: "shared.weight".into(),
-            transforms: Vec::new(),
+            descriptor: base_descriptor.clone(),
+            source: Element::bf16(),
+            upload: Element::bf16(),
             resident: Element::bf16(),
+            shape: vec![4, 32],
+            scale: None,
+            bound: 0,
+            holding: crate::Holding::Whole,
+            banked: false,
         };
         let projector = ResidencyKey {
             artifact: magnitude_artifacts::ArtifactIdentity([2; 32]),
-            name: "shared.weight".into(),
-            transforms: Vec::new(),
-            resident: Element::bf16(),
+            ..target.clone()
         };
         assert_ne!(target, projector);
         // Two row ranges of one stored tensor are distinct resident weights.
         let first_rows = ResidencyKey {
-            transforms: vec![magnitude_family_contracts::ImportTransform::Rows(
-                magnitude_family_contracts::RowRange { start: 0, rows: 2 },
-            )],
+            descriptor: WeightDescriptor {
+                transforms: vec![magnitude_family_contracts::ImportTransform::Rows(
+                    magnitude_family_contracts::RowRange { start: 0, rows: 2 },
+                )],
+                ..base_descriptor
+            },
             ..target.clone()
         };
         assert_ne!(target, first_rows);
+    }
+
+    /// `ResidencyKey::for_plan` must be at least as fine-grained as
+    /// `BankTable::shares_storage_with`: any difference in descriptor shape,
+    /// source/upload element, planned shape (records/record_rows/width),
+    /// scale, packing bound, holding, or banked state must produce a distinct
+    /// cache key so `ResidencyStore` never returns a false cache hit.
+    #[test]
+    fn residency_key_matches_bank_table_storage_granularity() {
+        let streamed = crate::planning::StreamedRows {
+            table_rows: 1024,
+            staging_rows: 0,
+            landing_rows: 0,
+            directory: crate::planning::DirectoryForm::Hashed,
+            fill: crate::planning::TableFill::Stored,
+        };
+        let base_plan = WeightPlan {
+            role: magnitude_family_contracts::WeightRole {
+                scope: magnitude_family_contracts::WeightScope::Target,
+                kind: magnitude_family_contracts::WeightKind::ExpertDown,
+            },
+            component: crate::planning::ArtifactComponent {
+                kind: crate::planning::ArtifactComponentKind::Target,
+                identity: magnitude_artifacts::ArtifactIdentity([7; 32]),
+            },
+            source: Element::bf16(),
+            upload: Element::bf16(),
+            resident: Element::bf16(),
+            shape: vec![4, 8, 64],
+            descriptor: WeightDescriptor::stored("ngram.table", vec![1024, 64]),
+            source_bytes: 1024 * 64 * 2,
+            resident_bytes: 4 * 8 * 64 * 2,
+            scale: None,
+            bound: 0,
+            holding: crate::Holding::Streamed(streamed),
+        };
+        let base_key = ResidencyKey::for_plan(&base_plan, true);
+
+        let variants: Vec<(&str, WeightPlan, bool)> = vec![
+            (
+                "different descriptor shape",
+                WeightPlan {
+                    descriptor: WeightDescriptor::stored("ngram.table", vec![512, 64]),
+                    ..base_plan.clone()
+                },
+                true,
+            ),
+            (
+                "different source element",
+                WeightPlan { source: Element::f16(), ..base_plan.clone() },
+                true,
+            ),
+            (
+                "different upload element",
+                WeightPlan { upload: Element::f32(), ..base_plan.clone() },
+                true,
+            ),
+            (
+                "different planned shape (records/record_rows)",
+                WeightPlan { shape: vec![8, 4, 64], ..base_plan.clone() },
+                true,
+            ),
+            (
+                "different scale",
+                WeightPlan {
+                    scale: Some(crate::planning::WeightScalePlan {
+                        tensor: "ngram.scale".into(),
+                        stored: 1,
+                        extent: 1,
+                        resident_bytes: 4,
+                    }),
+                    ..base_plan.clone()
+                },
+                true,
+            ),
+            (
+                "different packing bound",
+                WeightPlan { bound: 64, ..base_plan.clone() },
+                true,
+            ),
+            (
+                "different holding (directory form)",
+                WeightPlan {
+                    holding: crate::Holding::Streamed(crate::planning::StreamedRows {
+                        directory: crate::planning::DirectoryForm::Dense,
+                        ..streamed
+                    }),
+                    ..base_plan.clone()
+                },
+                true,
+            ),
+            (
+                "different holding (whole vs streamed)",
+                WeightPlan { holding: crate::Holding::Whole, ..base_plan.clone() },
+                true,
+            ),
+            (
+                "banked vs unbanked",
+                base_plan.clone(),
+                false,
+            ),
+        ];
+
+        let device = crate::test_support::open_backend(
+            &seismic::Devices::discover(&[]).unwrap(),
+            seismic::BackendName::Cpu,
+        )
+        .unwrap();
+        let imports = Imports::default();
+        let weight = ResidentWeight {
+            descriptor: base_plan.descriptor.clone(),
+            tensor: Tensor::zeros(&seismic::Charges::tally(&device), Element::f32(), &[4]).unwrap(),
+            scale: None,
+            bound: None,
+            table: ResidentTable::Whole,
+        };
+        imports.insert(base_key.clone(), weight, Importer::Target);
+        assert!(imports.get(&base_key).is_some());
+
+        for (label, variant_plan, variant_banked) in variants {
+            let variant_key = ResidencyKey::for_plan(&variant_plan, variant_banked);
+            assert_ne!(
+                base_key, variant_key,
+                "ResidencyKey must distinguish {label}"
+            );
+            assert!(
+                imports.get(&variant_key).is_none(),
+                "ResidencyStore cache must not false-hit on {label}"
+            );
+        }
     }
 
     /// Each importer's bytes are its own imports', as imported, never what
@@ -2382,14 +2549,21 @@ mod tests {
     fn each_importers_bytes_are_its_own_imports() {
         let device = crate::test_support::open_backend(&seismic::Devices::discover(&[]).unwrap(), seismic::BackendName::Cpu).unwrap();
         let weight = |name: &str, elements: u64| {
+            let descriptor = WeightDescriptor { name: name.into(), shape: vec![elements], transforms: Vec::new() };
             let key = ResidencyKey {
                 artifact: magnitude_artifacts::ArtifactIdentity([0; 32]),
-                name: name.into(),
-                transforms: Vec::new(),
+                descriptor: descriptor.clone(),
+                source: Element::f32(),
+                upload: Element::f32(),
                 resident: Element::f32(),
+                shape: vec![elements],
+                scale: None,
+                bound: 0,
+                holding: crate::Holding::Whole,
+                banked: false,
             };
             let weight = ResidentWeight {
-                descriptor: WeightDescriptor { name: name.into(), shape: vec![elements], transforms: Vec::new() },
+                descriptor,
                 tensor: Tensor::zeros(&seismic::Charges::tally(&device), Element::f32(), &[elements]).unwrap(),
                 scale: None,
                 bound: None,

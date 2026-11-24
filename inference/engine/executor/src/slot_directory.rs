@@ -19,6 +19,68 @@ use crate::planning::DirectoryForm;
 const EMPTY: i32 = -1;
 /// A hashed directory's bucket whose row left, which a probe passes.
 const TOMBSTONE: i32 = -2;
+/// Sentinel in `SlotDirectory::tile` indicating that a slot tile holds no table tile.
+/// Valid table row indices are strictly less than `u32::MAX` (in fact `<= i32::MAX`).
+const NO_TILE: u32 = u32::MAX;
+
+/// Compact fixed-length bitset backed by `Vec<u64>` (1 bit per slot instead of 1 byte).
+pub(crate) struct BitSet {
+    words: Vec<u64>,
+    len: usize,
+}
+
+impl BitSet {
+    pub(crate) fn new(len: usize) -> Self {
+        Self {
+            words: vec![0u64; len.div_ceil(64)],
+            len,
+        }
+    }
+
+    #[inline]
+    pub(crate) fn get(&self, index: usize) -> bool {
+        assert!(index < self.len, "bitset index {index} out of bounds for len {}", self.len);
+        (self.words[index >> 6] & (1u64 << (index & 63))) != 0
+    }
+
+    #[inline]
+    pub(crate) fn set(&mut self, index: usize) {
+        assert!(index < self.len, "bitset index {index} out of bounds for len {}", self.len);
+        self.words[index >> 6] |= 1u64 << (index & 63);
+    }
+
+    #[inline]
+    pub(crate) fn clear(&mut self, index: usize) {
+        assert!(index < self.len, "bitset index {index} out of bounds for len {}", self.len);
+        self.words[index >> 6] &= !(1u64 << (index & 63));
+    }
+
+    #[inline]
+    pub(crate) fn set_to(&mut self, index: usize, value: bool) {
+        if value {
+            self.set(index);
+        } else {
+            self.clear(index);
+        }
+    }
+
+    #[inline]
+    pub(crate) fn or_assign(&mut self, index: usize, value: bool) {
+        if value {
+            self.set(index);
+        }
+    }
+
+    #[inline]
+    pub(crate) fn take(&mut self, index: usize) -> bool {
+        assert!(index < self.len, "bitset index {index} out of bounds for len {}", self.len);
+        let word = &mut self.words[index >> 6];
+        let mask = 1u64 << (index & 63);
+        let was = (*word & mask) != 0;
+        *word &= !mask;
+        was
+    }
+}
 
 /// The bucket a hashed directory of `buckets` (a power of two) probes first
 /// for `row`: murmur3's 32-bit finalizer, as `gathered_bucket`
@@ -132,11 +194,12 @@ pub(crate) struct SlotDirectory {
     /// Rows of one tile.
     tile_rows: u64,
     entries: Entries,
-    /// Per tile of slots, the first row of the table tile it holds.
-    tile: Vec<Option<u64>>,
+    /// Per tile of slots, the first row of the table tile it holds, or
+    /// `NO_TILE` (`u32::MAX`) when empty.
+    tile: Vec<u32>,
     /// Per tile of slots, whether its tile was used since the clock last
     /// passed it.
-    used: Vec<bool>,
+    used: BitSet,
     /// The tile of slots the clock looks at next. The clock turns from the
     /// last tile of slots in use toward the first, so that of slots filled in
     /// order of value, first to last, it reaches the least valuable first.
@@ -149,6 +212,10 @@ impl SlotDirectory {
     /// A directory of `rows` table rows over `slots` slots, both whole tiles
     /// of `tile_rows` rows, in `form`. A hashed directory's rows are I32.
     pub fn new(rows: u64, slots: u64, tile_rows: u64, form: DirectoryForm) -> Self {
+        assert!(
+            rows < u32::MAX as u64,
+            "SlotDirectory rows ({rows}) must fit in u32 excluding NO_TILE sentinel"
+        );
         let slot_tiles = (slots / tile_rows) as usize;
         let entries = match form {
             DirectoryForm::Dense => Entries::Dense {
@@ -166,8 +233,8 @@ impl SlotDirectory {
             rows,
             tile_rows,
             entries,
-            tile: vec![None; slot_tiles],
-            used: vec![false; slot_tiles],
+            tile: vec![NO_TILE; slot_tiles],
+            used: BitSet::new(slot_tiles),
             hand: slot_tiles.saturating_sub(1),
             active: slot_tiles,
         }
@@ -201,13 +268,14 @@ impl SlotDirectory {
     /// The slot holding `row`, whose tile is used from here on.
     pub fn use_slot(&mut self, row: u64) -> Option<u64> {
         let slot = self.slot(row)?;
-        self.used[(slot / self.tile_rows) as usize] = true;
+        self.used.set((slot / self.tile_rows) as usize);
         Some(slot)
     }
 
     /// The first row of the table tile the tile of slots `slot_tile` holds.
     pub fn held(&self, slot_tile: usize) -> Option<u64> {
-        self.tile[slot_tile]
+        let first = self.tile[slot_tile];
+        (first != NO_TILE).then_some(u64::from(first))
     }
 
     /// Every entry of the directory as the device holds it, little-endian
@@ -324,8 +392,12 @@ impl SlotDirectory {
     /// Hold no tile in the tile of slots `slot_tile`: the first row of the
     /// one it held.
     pub fn release(&mut self, slot_tile: usize) -> Option<u64> {
-        self.used[slot_tile] = false;
-        let first = self.tile[slot_tile].take()?;
+        self.used.clear(slot_tile);
+        let first = std::mem::replace(&mut self.tile[slot_tile], NO_TILE);
+        if first == NO_TILE {
+            return None;
+        }
+        let first = u64::from(first);
         for row in first..first + self.tile_rows {
             self.entries.set(row, EMPTY);
         }
@@ -336,12 +408,14 @@ impl SlotDirectory {
     /// `slot_tile`, which holds none. `used`: whether the clock passes it
     /// once before it takes it.
     pub fn hold(&mut self, first: u64, slot_tile: usize, used: bool) {
+        let first_u32 = u32::try_from(first).expect("held row fits u32");
+        assert_ne!(first_u32, NO_TILE, "held row collides with NO_TILE sentinel");
         let first_slot = slot_tile as u64 * self.tile_rows;
         for row in 0..self.tile_rows {
             self.entries.set(first + row, (first_slot + row) as i32);
         }
-        self.tile[slot_tile] = Some(first);
-        self.used[slot_tile] = used;
+        self.tile[slot_tile] = first_u32;
+        self.used.set_to(slot_tile, used);
     }
 
     /// A tile of slots to hold another tile in: the clock's next one that is
@@ -364,7 +438,7 @@ impl SlotDirectory {
         for _ in 0..2 * tiles {
             let slot_tile = self.hand;
             self.hand = (self.hand + tiles - 1) % tiles;
-            if kept(slot_tile)? || std::mem::take(&mut self.used[slot_tile]) {
+            if kept(slot_tile)? || self.used.take(slot_tile) {
                 continue;
             }
             return Ok(Some((slot_tile, self.release(slot_tile))));
@@ -523,5 +597,65 @@ mod tests {
         // At least one bucket is empty, as every probe needs.
         assert!(device.chunks_exact(2).any(|bucket| bucket[0] == EMPTY));
         assert_eq!(directory.slot(rows), None);
+    }
+
+    #[test]
+    fn bitset_round_trips_across_word_boundaries() {
+        let mut bits = BitSet::new(130);
+        for i in 0..130 {
+            assert!(!bits.get(i));
+        }
+        for &idx in &[0usize, 1, 63, 64, 65, 127, 128, 129] {
+            bits.set(idx);
+            assert!(bits.get(idx));
+        }
+        assert!(!bits.get(2));
+        assert!(!bits.get(62));
+        assert!(!bits.get(126));
+
+        bits.or_assign(62, false);
+        assert!(!bits.get(62));
+        bits.or_assign(62, true);
+        assert!(bits.get(62));
+
+        assert!(bits.take(64));
+        assert!(!bits.get(64));
+        assert!(!bits.take(64));
+
+        bits.set_to(129, false);
+        assert!(!bits.get(129));
+        bits.set_to(129, true);
+        assert!(bits.get(129));
+    }
+
+    #[test]
+    fn packed_tile_and_used_round_trip_edge_rows_and_word_boundaries() {
+        // 130 slots spanning 3 bitset words; large table with rows up to i32::MAX.
+        let rows = i32::MAX as u64;
+        let mut directory = SlotDirectory::new(rows, 130, 1, DirectoryForm::Hashed);
+        for slot in 0..130 {
+            assert_eq!(directory.held(slot), None);
+        }
+        let max_row = rows - 1;
+        directory.hold(0, 0, true);
+        directory.hold(63, 63, false);
+        directory.hold(64, 64, true);
+        directory.hold(max_row, 129, true);
+
+        assert_eq!(directory.held(0), Some(0));
+        assert_eq!(directory.held(63), Some(63));
+        assert_eq!(directory.held(64), Some(64));
+        assert_eq!(directory.held(129), Some(max_row));
+        assert_eq!(directory.slot(0), Some(0));
+        assert_eq!(directory.slot(max_row), Some(129));
+
+        // Slot 129 was marked used, so the clock passes it once and takes 128 (empty).
+        assert_eq!(directory.free(|_| false), Some((128, None)));
+        assert_eq!(directory.held(129), Some(max_row));
+
+        assert_eq!(directory.release(129), Some(max_row));
+        assert_eq!(directory.held(129), None);
+        assert_eq!(directory.release(129), None);
+        assert_eq!(directory.slot(max_row), None);
     }
 }

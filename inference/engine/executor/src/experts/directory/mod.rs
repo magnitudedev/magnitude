@@ -340,19 +340,27 @@ impl DecodeTransientBudget {
         let p_miss = p_miss.clamp(0.0, 1.0);
         let w_max = e.min(m_max.saturating_mul(k));
         let expected_misses = ((w_max as f64) * p_miss).ceil() as usize;
+        // Size `demand_floor` to one active layer's expected misses at the live
+        // decode width `m_max` using the group's empirical `p_miss` (falling
+        // back to uniform `1 - present / total` before live misses are seen).
+        // Keeping `demand_floor >= expected_misses` ensures all simultaneous
+        // misses in one active verify layer land directly into `Free` with zero
+        // overflow, while live `m_active` (non-monotonic) and empirical `p_miss`
+        // prevent compile-time `M_max = 16` or uniform-random `p_miss` from
+        // stealing permanent `Held` VRAM.
         let demand_floor = expected_misses
             .max(k.min(w_max))
             .min(cap.saturating_sub(members))
             .min(avail.saturating_sub(members));
         let promote_headroom = k.min(demand_floor);
         // Bound dedicated `MAP_STAGE` ring per group to the actual in-flight
-        // even/odd `LinkMover` staging depth (`2 * HINT_LEADS` for `M = 1`,
-        // `2 * (HINT_LEADS + 1)` for `M > 1`) so multi-group banks keep
-        // >= 90% of VRAM for permanent `Held` experts.
+        // even/odd `LinkMover` staging depth (`2 * lookahead_layers` for
+        // `M = 1`, `2 * (lookahead_layers + 1)` for `M > 1`) so multi-group
+        // banks keep >= 90% of VRAM for permanent `Held` experts.
         let stage_cap = if m_max > 1 {
-            2usize.saturating_mul(crate::planning::HINT_LEADS as usize + 1)
+            2usize.saturating_mul(lookahead_layers.saturating_add(1))
         } else {
-            2usize.saturating_mul(crate::planning::HINT_LEADS as usize)
+            2usize.saturating_mul(lookahead_layers)
         };
         let want_stage = 2usize
             .saturating_mul(lookahead_layers)
@@ -436,9 +444,15 @@ pub(super) struct Directory {
     /// DMA (`DecodeFront -> DMA -> DecodeBack`). Groups running `RunStage::Whole`
     /// (e.g. a 16-slot/layer DSpark draft group) keep `demand_floor = 0`.
     group_splits: Vec<bool>,
-    /// `(m_max, k, lookahead_layers)` configured via [`Self::configure_decode_budget`]
-    /// so [`Self::resize_pool`] keeps `decode_budget` coherent across resizes.
+    /// `(m_active, k, lookahead_layers)` configured via [`Self::configure_decode_budget`]
+    /// and updated live via [`Self::set_decode_rows`] so [`Self::resize_pool`]
+    /// keeps `decode_budget` coherent across resizes.
     decode_params: Option<(usize, usize, usize)>,
+    /// Per group, EWMA of live empirical decode miss fraction
+    /// (`misses / min(E, rows * K)`) observed in `claim_demand_slots`. Used by
+    /// [`DecodeTransientBudget::compute`] instead of uniform-random
+    /// `1 - present / total_experts` once live decode misses are observed.
+    observed_p_miss: Vec<Option<f64>>,
     /// The reads a promotion must expect beyond what it displaces to earn
     /// its copy, each layer's (`ExpertLines::copy_hits`): none where a hit
     /// saves nothing, so no promotion of the layer earns; zero, a copy
@@ -606,8 +620,9 @@ impl Exits<'_> {
             if !price.pays(ranker.expected(layer, expert, read).uses(), stay) {
                 return None;
             }
-            let admit = outranking(ranker, &directory.prompt_reads, ranker.rank(layer, expert, read));
             let host = &directory.host[group];
+            let at = host.progress().map(|p| (p.sequence, p.layer));
+            let admit = outranking(ranker, &directory.prompt_reads, at, ranker.rank(layer, expert, read));
             let displaced = *self.displaced.get_or_init(|| host.displaced(|staged, read| admit.rank(staged, read), host.reserve()));
             admitted(displaced, |kept, victim| admit.admits(kept, victim)).then(|| read.map(|read| read.step))
         })();
@@ -638,6 +653,25 @@ impl BankRecord {
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct HostRecord(pub u32);
 
+/// Whether a landing recorded for `(layer, read_step)` is still a *future*
+/// unconsumed read-ahead relative to the device's current position
+/// `at = Some((current_step, current_layer))`.
+///
+/// A demand landing at `(S, L)` is already consumed once the device is at
+/// `(S, L)` or any later layer `(S, L')` (`L' >= L`), or any later step
+/// `S' > S`. Only landings strictly ahead of the device (`read_step > current_step`
+/// or `read_step == current_step && layer > current_layer`) are unconsumed
+/// read-aheads eligible for the `+1.0` [`Unlogged`] override.
+#[inline]
+fn is_future_read(layer: usize, read_step: Step, at: Option<(Step, usize)>) -> bool {
+    match at {
+        Some((current_step, current_layer)) => {
+            read_step > current_step || (read_step == current_step && layer > current_layer)
+        }
+        None => true,
+    }
+}
+
 /// The later of `read`, a read of `staged` at a step the log may not have
 /// brought yet (a landing's), and the running prompt group's read of it
 /// ([`Directory::read_pending`]): what every taking ranks it beside.
@@ -646,11 +680,25 @@ fn beside(prompt_reads: &HashMap<Staged, Unlogged>, staged: Staged, read: Option
 }
 
 /// How the host records rank what they keep, by a lock-free `ranker`
-/// snapshotted once for the group at its tier's τ for `reader`: an expert's
-/// whole rank beside its reads ([`beside`]), so experts the reads tie rank
-/// by their last read, never by their indices.
-fn store_rank<'a>(ranker: Ranker<'a>, prompt_reads: &'a HashMap<Staged, Unlogged>) -> impl Fn(Staged, Option<Step>) -> Rank + Copy + 'a {
-    move |staged @ (layer, expert): Staged, read: Option<Step>| ranker.rank(layer, expert, beside(prompt_reads, staged, read))
+/// snapshotted once for the group at its tier's τ for `reader`, scoped at
+/// device position `at = Some((current_step, current_layer))`: only future
+/// unconsumed read-aheads (`is_future_read`) and active prompt reads receive
+/// the `+1.0` `Unlogged` override, while `last` still records `read` so
+/// recency tie-breaks are preserved without making already-served demand
+/// misses immune to eviction.
+fn store_rank<'a>(
+    ranker: Ranker<'a>,
+    prompt_reads: &'a HashMap<Staged, Unlogged>,
+    at: Option<(Step, usize)>,
+) -> impl Fn(Staged, Option<Step>) -> Rank + Copy + 'a {
+    move |staged @ (layer, expert): Staged, read: Option<Step>| {
+        let prompt = prompt_reads.get(&staged).copied();
+        let future_read = read.filter(|&step| is_future_read(layer, step, at)).map(Unlogged::at);
+        let unlogged = future_read.max(prompt);
+        let expected = ranker.expected(layer, expert, unlogged);
+        let last = ranker.last(layer, expert).max(read).max(prompt.map(|u| u.step));
+        Rank::new(expected, last)
+    }
 }
 
 /// How kept records are ranked during prompt seeding: uses the same
@@ -678,8 +726,13 @@ fn seed_rank<'a>(
 /// ([`store_rank`], `Reader::Move`), and the admission of the victim it
 /// names: a banked copy, whose unmapping costs no move (the bank serves its
 /// uses), or a kept expert the candidate outranks.
-fn outranking<'a>(ranker: Ranker<'a>, prompt_reads: &'a HashMap<Staged, Unlogged>, candidate: Rank) -> impl Admit<Key = Rank> + 'a {
-    (store_rank(ranker, prompt_reads), move |kept: Kept, victim: Rank| kept == Kept::Banked || victim < candidate)
+fn outranking<'a>(
+    ranker: Ranker<'a>,
+    prompt_reads: &'a HashMap<Staged, Unlogged>,
+    at: Option<(Step, usize)>,
+    candidate: Rank,
+) -> impl Admit<Key = Rank> + 'a {
+    (store_rank(ranker, prompt_reads, at), move |kept: Kept, victim: Rank| kept == Kept::Banked || victim < candidate)
 }
 
 /// A group's wanted experts as their copies price them
@@ -852,6 +905,7 @@ impl Directory {
             decode_budget: vec![DecodeTransientBudget::default(); records.len()],
             group_splits: vec![true; records.len()],
             decode_params: None,
+            observed_p_miss: vec![None; records.len()],
             copy_hits: vec![None; layers.len()],
             asked: 0,
             time,
@@ -960,6 +1014,65 @@ impl Directory {
         (0..self.homes.len()).map(|group| self.capacity(group)).collect()
     }
 
+    /// Single owner computing group `group`'s [`DecodeTransientBudget`] from
+    /// live `m_active`, live empirical `observed_p_miss[group]` (falling back
+    /// to uniform `1 - present / total_experts` before live misses are
+    /// observed), and currently outstanding unretired `DemandLanding` leases.
+    fn compute_group_decode_budget(
+        &self,
+        group: usize,
+        m_active: usize,
+        k: usize,
+        lookahead_layers: usize,
+    ) -> DecodeTransientBudget {
+        let stage_slots = self.bank.stage_ring_half(group) * 2;
+        let cap = self.capacity(group);
+        let members = self.homes[group].len();
+        let present = self.bank.counts()[group];
+        let lent = self.bank.seeded_from(group);
+        let avail = present.saturating_sub(lent);
+        let max_floor = cap.saturating_sub(members).min(avail.saturating_sub(members));
+        let outstanding_demand = self
+            .bank
+            .records(group)
+            .iter()
+            .filter(|record| matches!(record, crate::experts::records::Record::DemandLanding { .. }))
+            .count()
+            .min(max_floor);
+        if !self.group_splits[group] {
+            return DecodeTransientBudget {
+                demand_floor: outstanding_demand,
+                promote_headroom: 0,
+                stage_slots,
+            };
+        }
+        let e = self.homes[group]
+            .iter()
+            .map(|&(_, layer)| self.bank.experts(layer))
+            .max()
+            .unwrap_or(0);
+        let total_experts: usize = self.homes[group]
+            .iter()
+            .map(|&(_, layer)| self.bank.experts(layer))
+            .sum();
+        let uniform_p_miss = (1.0 - (present as f64 / total_experts.max(1) as f64)).clamp(0.0, 1.0);
+        let p_miss = self.observed_p_miss[group].unwrap_or(uniform_p_miss);
+        let mut budget = DecodeTransientBudget::compute(
+            m_active,
+            k,
+            e,
+            p_miss,
+            cap,
+            avail,
+            members,
+            lookahead_layers.min(members),
+            members,
+        );
+        budget.demand_floor = budget.demand_floor.max(outstanding_demand).min(max_floor);
+        budget.stage_slots = stage_slots;
+        budget
+    }
+
     /// Group `group`'s pool is its capacity as it is now ([`Self::capacity`])
     /// less the promotions' reserve, that within the most a group reserves
     /// ([`most_reserved`]): taken again as a store grows or shrinks, a
@@ -968,38 +1081,8 @@ impl Directory {
     fn resize_pool(&mut self, group: usize) {
         let capacity = self.capacity(group);
         let members = (0..self.bank.layers()).filter(|&layer| self.bank.group(layer) == group).count();
-        if let Some((m_max, k, lookahead_layers)) = self.decode_params {
-            let stage_slots = self.bank.stage_ring_half(group) * 2;
-            let budget = if !self.group_splits[group] {
-                DecodeTransientBudget { demand_floor: 0, promote_headroom: 0, stage_slots }
-            } else {
-                let e = self.homes[group]
-                    .iter()
-                    .map(|&(_, layer)| self.bank.experts(layer))
-                    .max()
-                    .unwrap_or(0);
-                let total_experts: usize = self.homes[group]
-                    .iter()
-                    .map(|&(_, layer)| self.bank.experts(layer))
-                    .sum();
-                let present = self.bank.counts()[group];
-                let lent = self.bank.seeded_from(group);
-                let avail = present.saturating_sub(lent);
-                let p_miss = (1.0 - (present as f64 / total_experts.max(1) as f64)).clamp(0.0, 1.0);
-                let mut budget = DecodeTransientBudget::compute(
-                    m_max,
-                    k,
-                    e,
-                    p_miss,
-                    capacity,
-                    avail,
-                    members,
-                    lookahead_layers.min(members),
-                    members,
-                );
-                budget.stage_slots = stage_slots;
-                budget
-            };
+        if let Some((m_active, k, lookahead_layers)) = self.decode_params {
+            let budget = self.compute_group_decode_budget(group, m_active, k, lookahead_layers);
             self.decode_budget[group] = budget;
             self.reserve[group] = budget.demand_floor;
         }
@@ -1015,47 +1098,15 @@ impl Directory {
     /// `demand_replenish_target() == demand_floor + promote_headroom`.
     pub(in crate::experts) fn configure_decode_budget(
         &mut self,
-        m_max: usize,
+        m_active: usize,
         k: usize,
         lookahead_layers: usize,
     ) {
         assert!(self.placer == crate::planning::Placer::Tier, "the one store has no tiered decode transient budget");
-        self.decode_params = Some((m_max, k, lookahead_layers));
+        self.decode_params = Some((m_active, k, lookahead_layers));
         let groups = self.homes.len();
         for group in 0..groups {
-            let stage_slots = self.bank.stage_ring_half(group) * 2;
-            let budget = if !self.group_splits[group] {
-                DecodeTransientBudget { demand_floor: 0, promote_headroom: 0, stage_slots }
-            } else {
-                let cap = self.capacity(group);
-                let members = self.homes[group].len();
-                let e = self.homes[group]
-                    .iter()
-                    .map(|&(_, layer)| self.bank.experts(layer))
-                    .max()
-                    .unwrap_or(0);
-                let total_experts: usize = self.homes[group]
-                    .iter()
-                    .map(|&(_, layer)| self.bank.experts(layer))
-                    .sum();
-                let present = self.bank.counts()[group];
-                let lent = self.bank.seeded_from(group);
-                let avail = present.saturating_sub(lent);
-                let p_miss = (1.0 - (present as f64 / total_experts.max(1) as f64)).clamp(0.0, 1.0);
-                let mut budget = DecodeTransientBudget::compute(
-                    m_max,
-                    k,
-                    e,
-                    p_miss,
-                    cap,
-                    avail,
-                    members,
-                    lookahead_layers.min(members),
-                    members,
-                );
-                budget.stage_slots = stage_slots;
-                budget
-            };
+            let budget = self.compute_group_decode_budget(group, m_active, k, lookahead_layers);
             self.decode_budget[group] = budget;
             self.reserve(group, budget.demand_floor);
         }
@@ -1075,23 +1126,66 @@ impl Directory {
             return;
         }
         self.group_splits[group] = splits;
-        if let Some((m_max, k, lookahead_layers)) = self.decode_params {
-            self.configure_decode_budget(m_max, k, lookahead_layers);
+        if let Some((m_active, k, lookahead_layers)) = self.decode_params {
+            self.configure_decode_budget(m_active, k, lookahead_layers);
         }
     }
 
-    /// Dynamically grow the active decode batch high-water mark `m_active`
-    /// (from live `Told::Began` decode launches) so `demand_floor` tracks
-    /// actual `M` (`1`, `4`, `6`, ...) instead of compile-time `VERIFY_ROWS`
-    /// and never shrinks back down on alternating `M=1` plain / `M=4` verify
-    /// steps (`dma_overflow == 0`).
+    /// Live active decode batch width `m_active` (`1` before configured).
+    pub(in crate::experts) fn decode_rows(&self) -> usize {
+        self.decode_params.map_or(1, |(m_active, _, _)| m_active.max(1))
+    }
+
+    /// Track the live current decode batch width `m_active` (from `Told::Began`
+    /// and `claim_demand_slots`) so `demand_floor` covers the current step's
+    /// single-layer verify burst (`overflow == 0`) without permanently locking
+    /// to an occasional `M_max = 16` spike.
     pub(in crate::experts) fn set_decode_rows(&mut self, m_active: usize) {
         let m_active = m_active.max(1);
         if let Some((current_m, k, lookahead_layers)) = self.decode_params {
-            if m_active > current_m {
+            if m_active != current_m {
                 self.configure_decode_budget(m_active, k, lookahead_layers);
             }
         }
+    }
+
+    /// Record one deduplicated single-layer demand miss count (`misses` out of
+    /// `min(E, rows * K)`) for `group`, updating the group's live empirical
+    /// `p_miss` EWMA and refreshing `demand_floor` without resizing unless the
+    /// integer floor changes.
+    ///
+    /// Must be called strictly once per `(step, layer)` (including true all-hit
+    /// `0`, excluding maintenance replenish calls, and aggregated across Phase A
+    /// + all Phase B chunks for that layer).
+    pub(in crate::experts) fn observe_demand_misses(&mut self, group: usize, misses: usize, rows: usize) {
+        let Some((m_active, k, lookahead_layers)) = self.decode_params else {
+            return;
+        };
+        let rows = rows.max(1);
+        let e = self.homes[group]
+            .iter()
+            .map(|&(_, layer)| self.bank.experts(layer))
+            .max()
+            .unwrap_or(0);
+        let w_active = e.min(rows.saturating_mul(k));
+        if w_active == 0 {
+            return;
+        }
+        let sample = (misses as f64 / w_active as f64).clamp(0.0, 1.0);
+        let next = match self.observed_p_miss[group] {
+            Some(prev) => prev * 0.875 + sample * 0.125,
+            None => sample,
+        };
+        self.observed_p_miss[group] = Some(next);
+        let budget = self.compute_group_decode_budget(group, m_active, k, lookahead_layers);
+        self.decode_budget[group] = budget;
+        self.reserve(group, budget.demand_floor);
+    }
+
+    /// Group `group`'s empirical miss-rate EWMA, if observed.
+    #[cfg(test)]
+    pub(in crate::experts) fn observed_p_miss(&self, group: usize) -> Option<f64> {
+        self.observed_p_miss[group]
     }
 
     /// Group `group`'s configured [`DecodeTransientBudget`].
@@ -1193,7 +1287,8 @@ impl Directory {
         let reuse = Reuse::of(&self.ranking);
         let candidate = reuse.rank_of(layer, expert, reuse.expected_with(layer, expert, tier, step, p));
         let ranker = reuse.ranker(group, tier, Reader::Move);
-        self.host[group].claim((layer, expert), keep, taking, outranking(ranker, &self.prompt_reads, candidate))
+        let at = self.host[group].progress().map(|p| (p.sequence, p.layer));
+        self.host[group].claim((layer, expert), keep, taking, outranking(ranker, &self.prompt_reads, at, candidate))
     }
 
     /// Claim a carryover prefetch landing of `layer`'s `expert` in its group's
@@ -1211,9 +1306,10 @@ impl Directory {
         }
         let reuse = Reuse::of(&self.ranking);
         let ranker = reuse.ranker(group, tier, Reader::Move);
-        let candidate = store_rank(ranker, &self.prompt_reads)((layer, expert), None);
+        let at = self.host[group].progress().map(|p| (p.sequence, p.layer));
+        let candidate = store_rank(ranker, &self.prompt_reads, at)((layer, expert), None);
         let cand_uses = candidate.expected().uses();
-        let admit = (store_rank(ranker, &self.prompt_reads), move |kept: Kept, victim: Rank| {
+        let admit = (store_rank(ranker, &self.prompt_reads, at), move |kept: Kept, victim: Rank| {
             kept == Kept::Banked || (cand_uses + net_benefit_uses) > victim.expected().uses()
         });
         self.host[group].claim((layer, expert), keep, taking, admit)
@@ -1242,8 +1338,9 @@ impl Directory {
         let tier = self.host_tier();
         let reuse = Reuse::of(&self.ranking);
         let ranker = reuse.ranker(group, tier, Reader::Move);
-        let candidate = store_rank(ranker, &self.prompt_reads)((layer, expert), read);
-        self.host[group].claim((layer, expert), 0, Taking::Out, outranking(ranker, &self.prompt_reads, candidate))
+        let at = self.host[group].progress().map(|p| (p.sequence, p.layer));
+        let candidate = store_rank(ranker, &self.prompt_reads, at)((layer, expert), read);
+        self.host[group].claim((layer, expert), 0, Taking::Out, outranking(ranker, &self.prompt_reads, at, candidate))
     }
 
     /// Where `layer`'s `expert` is in its group's host tier: lacked
@@ -1400,7 +1497,8 @@ impl Directory {
             return claim;
         }
         let reuse = Reuse::of(&self.ranking);
-        let rank = store_rank(reuse.ranker(group, self.host_tier(), Reader::Move), &self.prompt_reads);
+        let at = Some((park.point.sequence, park.point.layer));
+        let rank = store_rank(reuse.ranker(group, self.host_tier(), Reader::Move), &self.prompt_reads, at);
         self.host[group].claim_demand((layer, expert), demand, rank, read, park)
     }
 
@@ -1425,7 +1523,8 @@ impl Directory {
         let layers = self.layer_groups().iter().filter(|&&of| of == group).count().max(1);
         let depth = (needed * layers).min(self.host[group].records() as usize);
         let reuse = Reuse::of(&self.ranking);
-        let rank = store_rank(reuse.ranker(group, self.host_tier(), Reader::Move), &self.prompt_reads);
+        let at = Some((sequence, layer));
+        let rank = store_rank(reuse.ranker(group, self.host_tier(), Reader::Move), &self.prompt_reads, at);
         self.host[group].prepare_demand(rank, depth, sequence);
     }
 
@@ -1491,11 +1590,14 @@ impl Directory {
             .iter()
             .enumerate()
             .map(|(group, records)| {
-                let rank = store_rank(reuse.ranker(group, tier, Reader::Move), &self.prompt_reads);
-                // Protect unconsumed read-aheads (landed for a step Reuse has not
-                // yet logged) from immediate eviction before their step runs.
+                let at = records.progress().map(|p| (p.sequence, p.layer));
+                let rank = store_rank(reuse.ranker(group, tier, Reader::Move), &self.prompt_reads, at);
+                // Protect strictly future unconsumed read-aheads from immediate
+                // eviction before their step/layer runs; already-served demand
+                // landings at or behind `at` are not protected.
                 let protected = |staged @ (layer, _): Staged, read: Option<Step>| {
-                    let unconsumed = read.is_some_and(|step| reuse.lead_of(layer, step).is_some());
+                    let unconsumed =
+                        read.is_some_and(|step| is_future_read(layer, step, at) && reuse.lead_of(layer, step).is_some());
                     (unconsumed, rank(staged, read))
                 };
                 let file_lacked = records.lacked().saturating_sub(self.vram_lacked_in_group(group));
@@ -1785,7 +1887,7 @@ impl Directory {
                 .chain(lent_free)
                 .filter(|&record| can_reuse(group, record))
                 .collect();
-            let demand_reserve = self.demand_free_floor(group);
+            let demand_reserve = self.demand_replenish_target(group);
             let available = all_free.len().saturating_sub(demand_reserve);
             let free = all_free.into_iter().take(take.min(available)).collect::<Vec<_>>();
             let promoted = free.len();
@@ -1972,7 +2074,8 @@ impl Directory {
             let ranker = reuse.ranker(group, Tier::HOST, Reader::Move);
             let candidate = ranker.rank(staged.0, staged.1, beside(&self.prompt_reads, staged, read));
             let keep = self.host[group].reserve();
-            match self.host[group].claim_back(staged, keep, outranking(ranker, &self.prompt_reads, candidate)) {
+            let at = self.host[group].progress().map(|p| (p.sequence, p.layer));
+            match self.host[group].claim_back(staged, keep, outranking(ranker, &self.prompt_reads, at, candidate)) {
                 Some(grant) => {
                     let tier = HostRecord(grant.record());
                     self.backs.insert((group, record), (grant, read));
@@ -2258,6 +2361,145 @@ impl Directory {
         }
     }
 
+    /// Number of routed layers tracked by this directory.
+    pub fn layers(&self) -> usize {
+        self.bank.layers()
+    }
+
+    /// Immediately reclaim up to `overflows.len()` non-active `Record::Held`
+    /// slots in `group` directly into `Record::DemandLanding { staged, borrowed_stage: false }`
+    /// when `Free + StageIdle` are exhausted during a wide verify burst.
+    ///
+    /// A `Record::Held((v_layer, v_expert))` victim is eligible ONLY when ALL of:
+    /// 1. `!is_layer_whole_published(v_layer)` (never evicts whole-resident layers),
+    /// 2. `bank.usable_when(group, record, lending)` (never takes lent or stage slots),
+    /// 3. `can_reuse(record)` (zero active transport leases or quarantine),
+    /// 4. `park.frees(v_layer, from, until.step())` (no earlier cut-in group has
+    ///    `v_layer` unresolved in `[from, until)`),
+    /// 5. `is_served(from, unmap_until.step(), v_layer, progress)` where
+    ///    `unmap_until = UnmapStep::from(park.unresolved(v_layer))` (every step
+    ///    in `[from, unmap_until)` has already passed `v_layer` or ended; steps
+    ///    `>= unmap_until` have not yet resolved `v_layer` and will miss once
+    ///    unmapped at `unmap_until`). This automatically rejects the current
+    ///    layer (`v_layer == progress.layer`, whose `DecodeHits` is already
+    ///    submitted) while allowing both earlier served layers (`v_layer < layer`)
+    ///    and unsubmitted later layers (`v_layer > layer`) in the same group.
+    ///
+    /// Selects victims in 4 priority tiers to preserve hot residency and avoid
+    /// unnecessary D2H loss while driving `dma_overflow -> 0` on 3-tier banks:
+    /// 1. lowest-ranked `unwanted` with `back.is_none()`,
+    /// 2. lowest-ranked `wanted` with `back.is_none()`,
+    /// 3. lowest-ranked `unwanted` with `back.is_some()` (last-resort fallback),
+    /// 4. lowest-ranked `wanted` with `back.is_some()` (last-resort fallback).
+    pub fn reclaim_served_demand_landings(
+        &mut self,
+        group: usize,
+        overflows: &[(usize, Option<Staged>)],
+        at: &Unbegun,
+        park: &Park,
+        progress: Point,
+        is_served: impl Fn(Step, Step, usize, Point) -> bool,
+        mut can_reuse: impl FnMut(usize) -> bool,
+    ) -> Vec<(usize, Option<Staged>, usize)> {
+        if overflows.is_empty() {
+            return Vec::new();
+        }
+        let lending = at.lending();
+        let until: UnmapStep = at.into();
+        let want = overflows.len();
+        let victims: Vec<(Staged, usize, UnmapStep)> = if self.prompt_reads.is_empty() {
+            let reuse = self.reuse_now();
+            let exits = self.exits(&reuse, group);
+            // 4 priority buckets: (has_back, is_wanted) -> 0..4
+            let mut buckets: [Vec<(Staged, usize, UnmapStep)>; 4] = Default::default();
+            buckets[0].reserve(want);
+            for &(_, v_layer, v_expert) in reuse.top_order(group) {
+                if self.is_layer_whole_published(v_layer) {
+                    continue;
+                }
+                let Some(record) = self.bank.held(v_layer, v_expert) else {
+                    continue;
+                };
+                if !self.bank.usable_when(group, record, lending) || !can_reuse(record) {
+                    continue;
+                }
+                let from = self.bank.map_from(v_layer, v_expert);
+                let unmap_until = UnmapStep::from(park.unresolved(v_layer));
+                if !park.frees(v_layer, from, until.step())
+                    || !is_served(from, unmap_until.step(), v_layer, progress)
+                {
+                    continue;
+                }
+                let has_back = exits.leaving((v_layer, v_expert)).back.is_some();
+                let is_wanted = !self.unwanted[v_layer].contains(&v_expert);
+                let tier = (usize::from(has_back) << 1) | usize::from(is_wanted);
+                if buckets[tier].len() < want {
+                    buckets[tier].push(((v_layer, v_expert), record, unmap_until));
+                    if tier == 0 && buckets[0].len() >= want {
+                        break;
+                    }
+                }
+            }
+            buckets.into_iter().flatten().take(want).collect()
+        } else {
+            let members = self.homes[group].iter().map(|&(_, l)| l).collect::<Vec<_>>();
+            let reuse = self.reuse_now();
+            let exits = self.exits(&reuse, group);
+            let ranker = reuse.ranker(group, Tier::COMPUTE, Reader::Move);
+            let mut candidates: Vec<(bool, bool, _, Staged, usize, UnmapStep)> = Vec::new();
+            for &v_layer in &members {
+                if self.is_layer_whole_published(v_layer) {
+                    continue;
+                }
+                let unmap_until = UnmapStep::from(park.unresolved(v_layer));
+                for v_expert in 0..self.bank.experts(v_layer) {
+                    let Some(record) = self.bank.held(v_layer, v_expert) else {
+                        continue;
+                    };
+                    if !self.bank.usable_when(group, record, lending) || !can_reuse(record) {
+                        continue;
+                    }
+                    let from = self.bank.map_from(v_layer, v_expert);
+                    if !park.frees(v_layer, from, until.step())
+                        || !is_served(from, unmap_until.step(), v_layer, progress)
+                    {
+                        continue;
+                    }
+                    let has_back = exits.leaving((v_layer, v_expert)).back.is_some();
+                    let is_wanted = !self.unwanted[v_layer].contains(&v_expert);
+                    candidates.push((
+                        has_back,
+                        is_wanted,
+                        self.ranked(ranker, v_layer, v_expert, None),
+                        (v_layer, v_expert),
+                        record,
+                        unmap_until,
+                    ));
+                }
+            }
+            candidates.sort_unstable_by(|a, b| {
+                a.0.cmp(&b.0)
+                    .then_with(|| a.1.cmp(&b.1))
+                    .then_with(|| a.2.cmp(&b.2))
+            });
+            candidates
+                .into_iter()
+                .take(want)
+                .map(|(_, _, _, staged, record, unmap_until)| (staged, record, unmap_until))
+                .collect()
+        };
+        let mut reclaimed = Vec::with_capacity(victims.len());
+        for (&(claim_idx, staged), (victim @ (v_layer, v_expert), record, unmap_until)) in
+            overflows.iter().zip(victims)
+        {
+            let exit = Exit { staged: victim, back: None };
+            self.bank.reclaim_held_for_demand(group, record, staged, unmap_until, &exit);
+            self.left_bank(v_layer, v_expert, None);
+            reclaimed.push((claim_idx, staged, record));
+        }
+        reclaimed
+    }
+
     /// Minimum number of `Record::Free` slots kept available in `group` for
     /// immediate `claim_demand_landing` without stamped-unmap delay
     /// (`DecodeTransientBudget::demand_floor`).
@@ -2276,9 +2518,9 @@ impl Directory {
     /// Asynchronously release up to `want_free` lowest-ranked unpinned
     /// `Record::Held` victims in `group` (with `!is_layer_whole_published` and
     /// `can_reuse(slot)`) into `Record::Releasing` (stamped unmap via
-    /// `BankRecords::release`) when `Free + Releasing` usable headroom falls
-    /// below `want_free`. Non-blocking: subsequent steps find `Record::Free`
-    /// slots after `drain()`.
+    /// `BankRecords::release`) when `Free + Releasing + DemandLanding` usable
+    /// headroom falls below `want_free`. Non-blocking: subsequent layers/steps
+    /// find `Record::Free` slots as soon as `drain_with()` runs.
     pub fn replenish_demand_free(
         &mut self,
         group: usize,
@@ -2287,8 +2529,12 @@ impl Directory {
         mut can_reuse: impl FnMut(usize) -> bool,
     ) -> usize {
         let lending = at.lending();
-        let want_free = want_free.max(self.demand_replenish_target(group));
-        let short = want_free.saturating_sub(self.bank.covering_when(group, lending));
+        let members = self.homes[group].len();
+        let max_free = most_reserved(self.capacity(group), members);
+        let want_free = want_free.max(self.demand_replenish_target(group)).min(max_free);
+        let supply = self.bank.covering_when(group, lending)
+            + self.bank.demand_landing_usable_count(group, lending);
+        let short = want_free.saturating_sub(supply);
         if short == 0 {
             return 0;
         }
@@ -2409,96 +2655,208 @@ impl Directory {
         progress: Point,
         steps: &Steps,
     ) -> bool {
+        self.finish_demand_landings_batch_with_reuse(batch, progress, steps, |_, _| true)
+    }
+
+    /// Batched completion of `Record::DemandLanding` slots with per-victim
+    /// transport reuse predicate `can_reuse_victim(group, slot)`:
+    /// - When `free_now >= free_floor` and `held_total + replenish_target < cap`,
+    ///   qualifying landings promote in place (`DemandLanding -> Held`).
+    /// - When `free_now < free_floor` or `held_total + replenish_target >= cap`,
+    ///   a landing that outranks the coldest evictable `Record::Held` victim in
+    ///   its group **swaps** in place: promotes the landing and releases the
+    ///   victim (`Held -> Releasing`), leaving `Held` and `Free` unchanged
+    ///   while increasing `Free + Releasing` by 1 so hot misses are promoted on
+    ///   their very first miss even during wide verify bursts.
+    pub fn finish_demand_landings_batch_with_reuse(
+        &mut self,
+        batch: &[(usize, usize, Option<Staged>, bool)],
+        progress: Point,
+        steps: &Steps,
+        mut can_reuse_victim: impl FnMut(usize, usize) -> bool,
+    ) -> bool {
         if batch.is_empty() {
             return false;
         }
-        // Phase 1: decide promotion eligibility for all slots under a single
-        // `reuse_now()` lock acquisition.
-        let decisions: Vec<bool> = {
+        enum Decision {
+            Release,
+            PromoteOnly,
+            PromoteAndEvict { victim: Staged, victim_record: usize },
+        }
+        let lending = steps.lending();
+        // Phase 1: decide promotion / swap eligibility for all slots under a
+        // single `reuse_now()` lock acquisition.
+        let decisions: Vec<Decision> = {
             let reuse = self.reuse_now();
-            let mut free_by_group: Option<(usize, usize)> = None;
+            let mut group_state: Option<(usize, usize, usize, Vec<usize>)> = None;
             batch
                 .iter()
                 .map(|&(group, record, staged, _can_reuse)| {
                     if self.bank.is_borrowed_stage_demand(group, record) {
-                        return false;
+                        return Decision::Release;
+                    }
+                    let Some(staged @ (layer, expert)) = staged else {
+                        return Decision::Release;
+                    };
+                    if self.bank.held(layer, expert).is_some()
+                        || self.bank.placing_contains(staged)
+                    {
+                        return Decision::Release;
                     }
                     let free_floor = self.demand_free_floor(group);
                     let replenish_target = self.demand_replenish_target(group);
-                    let free_now = match free_by_group {
-                        Some((g, count)) if g == group => count,
-                        _ => {
-                            let count = self.bank.free(group).count();
-                            free_by_group = Some((group, count));
-                            count
+                    let cap = self.bank.capacity(group);
+                    if !matches!(group_state, Some((g, ..)) if g == group) {
+                        let free_now = self.bank.free(group).count();
+                        let held_total: usize = self.homes[group]
+                            .iter()
+                            .map(|&(_, l)| self.bank.held_count(l))
+                            .sum();
+                        group_state = Some((group, free_now, held_total, Vec::new()));
+                    }
+                    let (_, free_now, held_total, claimed_victims) = group_state.as_mut().unwrap();
+                    let in_top = reuse.in_top(layer, expert);
+                    let ranker = reuse.ranker(group, Tier::COMPUTE, Reader::Move);
+                    let staged_uses = self.uses(ranker, staged);
+
+                    if *free_now >= free_floor && *held_total + replenish_target < cap {
+                        if in_top || staged_uses >= 0.0 {
+                            *held_total += 1;
+                            return Decision::PromoteOnly;
                         }
-                    };
-                    if let Some(staged @ (layer, expert)) = staged {
-                        if self.bank.held(layer, expert).is_some()
-                            || self.bank.placing_contains(staged)
-                            || free_now < free_floor
-                        {
-                            false
-                        } else if reuse.in_top(layer, expert) {
-                            true
-                        } else {
-                            // With `copy_hits = 0.0` (bytes already in VRAM!), keep
-                            // the expert if its expected uses meet or exceed the
-                            // lowest-valued usable held expert in this group (or if
-                            // the group has free capacity past `replenish_target`).
-                            let ranker = reuse.ranker(group, Tier::COMPUTE, Reader::Move);
-                            let uses = self.uses(ranker, staged);
-                            let members = self.homes[group].iter().map(|&(_, l)| l).collect::<Vec<_>>();
-                            let held_total: usize = members.iter().map(|&l| self.bank.held_count(l)).sum();
-                            if held_total + replenish_target < self.bank.capacity(group) {
-                                uses >= 0.0
-                            } else if self.prompt_reads.is_empty() {
-                                let min_floor = reuse
-                                    .top_order(group)
-                                    .iter()
-                                    .find(|&&(_, l, e)| !self.is_layer_whole_published(l) && self.unwanted[l].contains(&e))
-                                    .map(|&(_, l, e)| self.uses(ranker, (l, e)));
-                                min_floor.is_some_and(|floor| uses >= floor)
-                            } else {
-                                let min_floor = members
-                                    .iter()
-                                    .filter(|&&l| !self.is_layer_whole_published(l))
-                                    .flat_map(|&l| self.unwanted[l].iter().map(move |&e| (l, e)))
-                                    .map(|s| self.uses(ranker, s))
-                                    .reduce(f64::min);
-                                min_floor.is_some_and(|floor| uses >= floor)
+                        return Decision::Release;
+                    }
+
+                    // Either `free_now < free_floor` or the group is at its
+                    // permanent `Held` target: find the coldest evictable
+                    // `Record::Held` victim in this group and swap if `staged`
+                    // outranks it (preserving `Held` and `Free` counts).
+                    let candidate_victim: Option<(Staged, usize, f64, bool)> = if self.prompt_reads.is_empty() {
+                        let mut fallback_wanted: Option<(Staged, usize, f64, bool)> = None;
+                        let mut chosen: Option<(Staged, usize, f64, bool)> = None;
+                        for &(_, v_layer, v_expert) in reuse.top_order(group) {
+                            if self.is_layer_whole_published(v_layer) {
+                                continue;
+                            }
+                            let Some(v_record) = self.bank.held(v_layer, v_expert) else {
+                                continue;
+                            };
+                            if claimed_victims.contains(&v_record)
+                                || !self.bank.usable_when(group, v_record, lending)
+                                || !can_reuse_victim(group, v_record)
+                            {
+                                continue;
+                            }
+                            let v_uses = self.uses(ranker, (v_layer, v_expert));
+                            let v_unwanted = self.unwanted[v_layer].contains(&v_expert);
+                            if v_unwanted {
+                                chosen = Some(((v_layer, v_expert), v_record, v_uses, true));
+                                break;
+                            } else if fallback_wanted.is_none() {
+                                fallback_wanted = Some(((v_layer, v_expert), v_record, v_uses, false));
                             }
                         }
+                        chosen.or(fallback_wanted)
                     } else {
-                        false
+                        let mut best_unwanted: Option<(Staged, usize, f64, bool)> = None;
+                        let mut best_wanted: Option<(Staged, usize, f64, bool)> = None;
+                        for &(_, v_layer) in &self.homes[group] {
+                            if self.is_layer_whole_published(v_layer) {
+                                continue;
+                            }
+                            for v_expert in 0..self.bank.experts(v_layer) {
+                                let Some(v_record) = self.bank.held(v_layer, v_expert) else {
+                                    continue;
+                                };
+                                if claimed_victims.contains(&v_record)
+                                    || !self.bank.usable_when(group, v_record, lending)
+                                    || !can_reuse_victim(group, v_record)
+                                {
+                                    continue;
+                                }
+                                let v_uses = self.uses(ranker, (v_layer, v_expert));
+                                let v_unwanted = self.unwanted[v_layer].contains(&v_expert);
+                                let slot = if v_unwanted { &mut best_unwanted } else { &mut best_wanted };
+                                if slot.is_none_or(|(_, _, best_u, _)| v_uses < best_u) {
+                                    *slot = Some(((v_layer, v_expert), v_record, v_uses, v_unwanted));
+                                }
+                            }
+                        }
+                        best_unwanted.or(best_wanted)
+                    };
+
+                    if let Some((victim, victim_record, victim_uses, victim_unwanted)) = candidate_victim {
+                        let beats_victim = (in_top && victim_unwanted)
+                            || staged_uses > victim_uses
+                            || (staged_uses >= victim_uses && victim_unwanted);
+                        if beats_victim {
+                            claimed_victims.push(victim_record);
+                            return Decision::PromoteAndEvict { victim, victim_record };
+                        }
+                    } else if *free_now >= free_floor && in_top {
+                        *held_total += 1;
+                        return Decision::PromoteOnly;
                     }
+                    Decision::Release
                 })
                 .collect()
         };
 
-        // Phase 2: apply promotions and releases outside `reuse_now()`.
+        // Phase 2: apply promotions, victim swaps, and releases outside `reuse_now()`.
         let mut promoted_any = false;
-        for (&(group, record, staged, can_reuse), should_promote) in batch.iter().zip(decisions) {
-            if should_promote {
-                let staged @ (layer, expert) = staged.expect("should_promote implies Some(staged)");
-                // Re-check duplicate promotion within the same batch.
-                if self.bank.held(layer, expert).is_none() && !self.bank.placing_contains(staged) {
-                    let bank = &mut self.bank;
-                    let promoted = steps.unresolved(progress, |unresolved| {
-                        bank.promote_demand_landing(group, record, staged, |l| unresolved.from(l))
-                    });
-                    if promoted {
-                        self.time.lock().moved(group, Tier::COMPUTE);
-                        if !self.bank.lends(group, record) {
-                            self.tier(layer).banked(staged);
+        for (&(group, record, staged, can_reuse), decision) in batch.iter().zip(decisions) {
+            match decision {
+                Decision::PromoteOnly => {
+                    let staged @ (layer, expert) = staged.expect("PromoteOnly implies Some(staged)");
+                    // Re-check duplicate promotion within the same batch.
+                    if self.bank.held(layer, expert).is_none() && !self.bank.placing_contains(staged) {
+                        let bank = &mut self.bank;
+                        let promoted = steps.unresolved(progress, |unresolved| {
+                            bank.promote_demand_landing(group, record, staged, |l| unresolved.from(l))
+                        });
+                        if promoted {
+                            self.time.lock().moved(group, Tier::COMPUTE);
+                            if !self.bank.lends(group, record) {
+                                self.tier(layer).banked(staged);
+                            }
+                            self.resettle(layer, expert);
+                            promoted_any = true;
+                            continue;
                         }
-                        self.resettle(layer, expert);
-                        promoted_any = true;
-                        continue;
                     }
+                    self.release_demand_landing(group, record, can_reuse);
+                }
+                Decision::PromoteAndEvict { victim, victim_record } => {
+                    let staged @ (layer, expert) = staged.expect("PromoteAndEvict implies Some(staged)");
+                    if self.bank.held(layer, expert).is_none()
+                        && !self.bank.placing_contains(staged)
+                        && self.bank.held(victim.0, victim.1) == Some(victim_record)
+                    {
+                        let bank = &mut self.bank;
+                        let promoted = steps.unresolved(progress, |unresolved| {
+                            bank.promote_demand_landing(group, record, staged, |l| unresolved.from(l))
+                        });
+                        if promoted {
+                            let exit = self.exit_now(group, victim_record, victim);
+                            steps.unbegun(|at| {
+                                self.bank.release(group, BankRecord(victim_record as u32), at.into(), exit);
+                            });
+                            self.left_bank(victim.0, victim.1, None);
+                            self.time.lock().moved(group, Tier::COMPUTE);
+                            if !self.bank.lends(group, record) {
+                                self.tier(layer).banked(staged);
+                            }
+                            self.resettle(layer, expert);
+                            promoted_any = true;
+                            continue;
+                        }
+                    }
+                    self.release_demand_landing(group, record, can_reuse);
+                }
+                Decision::Release => {
+                    self.release_demand_landing(group, record, can_reuse);
                 }
             }
-            self.release_demand_landing(group, record, can_reuse);
         }
         promoted_any
     }
@@ -2572,7 +2930,8 @@ impl Directory {
     pub fn host_evictions_filtered(&self, group: usize, target: u32, skip_protected: bool) -> Vec<u32> {
         let excess = self.host[group].records().saturating_sub(target) as usize;
         let reuse = Reuse::of(&self.ranking);
-        let rank = store_rank(reuse.ranker(group, self.host_tier(), Reader::Observe), &self.prompt_reads);
+        let at = self.host[group].progress().map(|p| (p.sequence, p.layer));
+        let rank = store_rank(reuse.ranker(group, self.host_tier(), Reader::Observe), &self.prompt_reads, at);
         let mut evicted = self.host[group].evictable_filtered(rank, skip_protected);
         evicted.truncate(excess);
         evicted
@@ -2692,7 +3051,8 @@ impl Directory {
             let tier = self.host_tier();
             if copy.is_some() && self.host[lender].capacity() > 0 {
                 let reuse = Reuse::of(&self.ranking);
-                let rank = store_rank(reuse.ranker(lender, tier, Reader::Move), &self.prompt_reads);
+                let at = self.host[lender].progress().map(|p| (p.sequence, p.layer));
+                let rank = store_rank(reuse.ranker(lender, tier, Reader::Move), &self.prompt_reads, at);
                 self.host[lender].lease_records(scratch_group, target_records, rank, may_evict, copy);
             } else {
                 self.host[lender].lease_records(scratch_group, target_records, |_, _| 0u64, false, None);

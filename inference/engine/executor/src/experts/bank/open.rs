@@ -556,8 +556,6 @@ fn watch(
             map: view,
             file: ExchangeTable::new(layer.file.clone(), plan.binding(index)?.words.file(), steps.pulse())?,
             scratch: ExchangeTable::new(layer.scratch.clone(), plan.binding(index)?.words.scratch(), steps.pulse())?,
-            rings: words(&layer.rings, 0)?,
-            hints: plan.predicted(index).collect(),
             routing: words(&layer.routing, 0)?,
             keys: words(&layer.keys, 0)?,
             front: words(&layer.front, 0)?,
@@ -592,8 +590,8 @@ fn watch(
     // reads land in in place.
     let (staging_pools, _) = plan.staging_pools();
     let pool_hints = plan.staging_pool_has_hints();
-    let pool_records = |pool: &StagingPool, name: &str, tensor: &Tensor, records| {
-        Records::rows(tensor, pool.record_bytes()?, records)
+    let pool_records = |pool: &StagingPool, name: &str, tensor: &Tensor, record_bytes: u64, records| {
+        Records::rows(tensor, record_bytes, records)
             .map_err(|error| format!("the {} {name}: {error}", pool.source.name()))
     };
     let pools = staging_pools
@@ -602,7 +600,8 @@ fn watch(
         .zip(pool_hints)
         .map(|((pool, tensor), has_hints)| {
             let count = plan.pool_staging_records_with_paths(has_hints, plan.paths);
-            Ok(Pool { staging: pool_records(pool, "staging", tensor, count)? })
+            let slot_bytes = plan.staging_slot_bytes(pool)?;
+            Ok(Pool { staging: pool_records(pool, "staging", tensor, slot_bytes, count)? })
         })
         .collect::<Result<Vec<_>, String>>()?;
     // What carries the conveyor's experts: the records its lender lends it,
@@ -668,7 +667,7 @@ fn watch(
         pools: staging_pools
             .iter()
             .zip(conveyors)
-            .map(|(pool, view)| pool_records(pool, "conveyor", &view.conveyor, conveyor.conveyor.records))
+            .map(|(pool, view)| pool_records(pool, "conveyor", &view.conveyor, pool.record_bytes()?, conveyor.conveyor.records))
             .collect::<Result<Vec<_>, String>>()?,
     };
     // The records the host lands into: a host tier's, each group's at its
@@ -707,7 +706,7 @@ fn watch(
                 // residency-lock contention.
                 let k = plan.selected() as usize;
                 let decode_rows = usize::try_from(plan.decode_rows()).map_err(|_| "decode rows exceed the host")?;
-                let lookahead_layers = crate::planning::HINT_LEADS as usize + 1;
+                let lookahead_layers = 1;
                 let mut stage_slots = Vec::with_capacity(tiers.len());
                 for group in 0..tiers.len() {
                     let is_draft_group = plan.groups()[group]
@@ -757,21 +756,34 @@ fn watch(
         let words_count = magnitude_kernels::constants::SOURCE_ROWS
             * magnitude_kernels::constants::VERIFY_ROWS
             * plan.selected();
-        let sources = Tensor::words(charges, seismic::Element::i32(), &[words_count]).map_err(|error| {
-            crate::residency::WeightImportError::of_allocation(
-                seismic::Contract::Words,
-                crate::resources::AllocationError::Tensor(error),
-            )
-        })?;
-        let sources_words = Words::new(sources.clone(), words_count, 0)?;
+        let alloc_words = || -> Result<(Tensor, Words), crate::residency::WeightImportError> {
+            let tensor = Tensor::words(charges, seismic::Element::i32(), &[words_count]).map_err(|error| {
+                crate::residency::WeightImportError::of_allocation(
+                    seismic::Contract::Words,
+                    crate::resources::AllocationError::Tensor(error),
+                )
+            })?;
+            let words = Words::new(tensor.clone(), words_count, 0)?;
+            Ok((tensor, words))
+        };
+        let mut source_slots = Vec::with_capacity(crate::experts::transport::DECODE_SOURCE_SLOTS);
+        for _ in 0..crate::experts::transport::DECODE_SOURCE_SLOTS {
+            let (front_sources, front_sources_words) = alloc_words()?;
+            let (back_sources, back_sources_words) = alloc_words()?;
+            source_slots.push(crate::experts::transport::DecodeSourceSlot {
+                front_sources,
+                front_sources_words,
+                back_sources,
+                back_sources_words,
+            });
+        }
         let file_tables: Vec<ExchangeTable> = watched.iter().map(|layer| layer.file.clone()).collect();
         let draft_layers: Vec<bool> = watched.iter().map(|layer| layer.draft).collect();
         Some(crate::experts::transport::DecodeDmaState::new(
             transfer,
             landed.clone(),
             bank.clone(),
-            sources,
-            sources_words,
+            source_slots,
             selected,
             &draft_layers,
             file_tables,
@@ -930,7 +942,7 @@ mod tests {
         k: usize,
         decode_rows: usize,
     ) -> (usize, usize, usize) {
-        let lookahead_layers = crate::planning::HINT_LEADS as usize + 1;
+        let lookahead_layers = 1;
         let present: Vec<usize> = group_layers.iter().map(|&n| n * slots_per_layer).collect();
         let mut stage_slots = Vec::with_capacity(group_layers.len());
         for (group, &layers) in group_layers.iter().enumerate() {
@@ -1034,7 +1046,7 @@ mod tests {
         // (3 layers × 41 slots = 123, full per-layer share without DRAFT_MAX_SLOTS cap)
         // -> total 1,763 slots, K = 6, decode_rows = 4..=16.
         let target_layers = [20usize, 4, 4, 4, 2, 2, 2, 2];
-        let lookahead_layers = crate::planning::HINT_LEADS as usize + 1;
+        let lookahead_layers = 1;
         for decode_rows in [4usize, 6, 16] {
             let mut present: Vec<usize> = target_layers.iter().map(|&n| n * 41).collect();
             present.push(3 * 41); // group 8: DSpark draft group (3 layers × 41 slots = 123)
