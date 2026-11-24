@@ -155,9 +155,9 @@ void select_compact_rows() {
 
     if (tid == 0u) {
         const int status = bad != 0u ? 2 : (best_token == COMPACT_NO_TOKEN ? 1 : 0);
-        const uint64_t out = result + row * SEISMIC_RESULT_STRIDE_0 * 4ul;
-        element_i32_put(out, status == 0 ? int(best_token) : -1);
-        element_i32_put(out + SEISMIC_RESULT_STRIDE_1 * 4ul, status);
+        const uint64_t result_address = result + row * SEISMIC_RESULT_STRIDE_0 * 4ul;
+        element_i32_put(result_address, status == 0 ? int(best_token) : -1);
+        element_i32_put(result_address + SEISMIC_RESULT_STRIDE_1 * 4ul, status);
         out_put(
             confidence,
             row * SEISMIC_CONFIDENCE_STRIDE_0,
