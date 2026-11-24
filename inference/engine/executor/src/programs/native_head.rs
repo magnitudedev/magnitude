@@ -3586,12 +3586,14 @@ mod composition_tests {
             sampled_proposals: 2,
             widths: crate::DraftWidths::Adaptive,
         };
-        let substrate = crate::planning::BankSubstrate {
+        let substrate = crate::planning::bank_substrate(
             backend,
-            allocations: seismic::NativeAllocations::EXACT,
-            host: crate::planning::HostTier::Linked,
-            has_side_queue: true,
-        };
+            seismic::NativeAllocations::EXACT,
+            Some(crate::planning::HostTier::Linked),
+            true,
+            &definition,
+        )
+        .unwrap();
         let load = ModelLoadPlan::derive(
             &manifest,
             &definition,
