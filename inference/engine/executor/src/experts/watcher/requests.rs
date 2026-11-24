@@ -352,13 +352,16 @@ impl Requests {
     }
 
     /// Whether the device's words are polled while a step runs: where kernels
-    /// wait in place, while a step runs that may ask anything (or publish
-    /// foresight hints/front rings while any group is not whole in Tier 0,
-    /// including 100%-RAM discrete GPUs where `POLICY_RESOLVED == 1` but
-    /// `POLICY_WHOLE == 0`, or while a prompt group runs).
+    /// wait in place, while a step runs that may emit NVMe `FILE_REQUEST`s
+    /// (`!all_resolved`), emit foresight hints (`any_hints_enabled`), or run a
+    /// scratch prompt group (`scratch_running`). Once `POLICY_RESOLVED == 1`
+    /// and `POLICY_HINTS == 0`, skip 20 us polling so `expert-requests` does
+    /// not contend on `residency::lock`.
     fn polls(&self, residency: &Residency) -> bool {
         let steps = &self.shared.steps;
-        !self.shared.parks.kept && steps.in_flight() > 0 && (!residency.all_whole() || steps.scratch_running())
+        !self.shared.parks.kept
+            && steps.in_flight() > 0
+            && ((!residency.all_resolved() || residency.any_hints_enabled()) || steps.scratch_running())
     }
 
     /// One pass: the misses waiting resumed, the conveyor carried, then

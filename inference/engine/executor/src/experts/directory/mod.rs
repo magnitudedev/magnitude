@@ -2114,78 +2114,112 @@ impl Directory {
         steps: &Steps,
         can_reuse: bool,
     ) -> bool {
-        let free_floor = self.demand_free_floor(group);
-        let replenish_target = self.demand_replenish_target(group);
-        let free_now = self.bank.free(group).count();
-        let should_promote = if let Some(staged @ (layer, expert)) = staged {
-            if self.bank.held(layer, expert).is_some()
-                || self.bank.placing_contains(staged)
-                || free_now < free_floor
-            {
-                false
-            } else {
-                let reuse = self.reuse_now();
-                let in_top = reuse.in_top(layer, expert);
-                if in_top {
-                    true
-                } else {
-                    // With `copy_hits = 0.0` (bytes already in VRAM!), keep
-                    // the expert if its expected uses meet or exceed the
-                    // lowest-valued usable held expert in this group (or if
-                    // the group has free capacity past `replenish_target`).
-                    let ranker = reuse.ranker(group, Tier::COMPUTE, Reader::Move);
-                    let uses = self.uses(ranker, staged);
-                    let members = self.homes[group].iter().map(|&(_, l)| l).collect::<Vec<_>>();
-                    let held_total: usize = members.iter().map(|&l| self.bank.held_count(l)).sum();
-                    if held_total + replenish_target < self.bank.capacity(group) {
-                        uses >= 0.0
-                    } else {
-                        let min_floor = if self.prompt_reads.is_empty() {
-                            reuse
-                                .top_order(group)
-                                .iter()
-                                .find(|&&(_, l, e)| {
-                                    !self.is_layer_whole_published(l) && self.unwanted[l].contains(&e)
-                                })
-                                .map(|&(_, l, e)| self.uses(ranker, (l, e)))
+        self.finish_demand_landings_batch(&[(group, record, staged, can_reuse)], progress, steps)
+    }
+
+    /// Batched version of [`Self::finish_demand_landing`]: captures
+    /// `self.reuse_now()` **once** for the entire batch instead of once per
+    /// slot, then promotes qualifying `DemandLanding -> Held` slots and returns
+    /// unpromoted reusable slots to `Free`.
+    pub fn finish_demand_landings_batch(
+        &mut self,
+        batch: &[(usize, usize, Option<Staged>, bool)],
+        progress: Point,
+        steps: &Steps,
+    ) -> bool {
+        if batch.is_empty() {
+            return false;
+        }
+        // Phase 1: decide promotion eligibility for all slots under a single
+        // `reuse_now()` lock acquisition.
+        let decisions: Vec<bool> = {
+            let reuse = self.reuse_now();
+            let mut free_by_group: Option<(usize, usize)> = None;
+            batch
+                .iter()
+                .map(|&(group, _record, staged, _can_reuse)| {
+                    let free_floor = self.demand_free_floor(group);
+                    let replenish_target = self.demand_replenish_target(group);
+                    let free_now = match free_by_group {
+                        Some((g, count)) if g == group => count,
+                        _ => {
+                            let count = self.bank.free(group).count();
+                            free_by_group = Some((group, count));
+                            count
+                        }
+                    };
+                    if let Some(staged @ (layer, expert)) = staged {
+                        if self.bank.held(layer, expert).is_some()
+                            || self.bank.placing_contains(staged)
+                            || free_now < free_floor
+                        {
+                            false
+                        } else if reuse.in_top(layer, expert) {
+                            true
                         } else {
-                            members
-                                .iter()
-                                .filter(|&&l| !self.is_layer_whole_published(l))
-                                .flat_map(|&l| self.unwanted[l].iter().map(move |&e| (l, e)))
-                                .map(|s| self.uses(ranker, s))
-                                .reduce(f64::min)
-                        };
-                        min_floor.is_some_and(|floor| uses >= floor)
+                            // With `copy_hits = 0.0` (bytes already in VRAM!), keep
+                            // the expert if its expected uses meet or exceed the
+                            // lowest-valued usable held expert in this group (or if
+                            // the group has free capacity past `replenish_target`).
+                            let ranker = reuse.ranker(group, Tier::COMPUTE, Reader::Move);
+                            let uses = self.uses(ranker, staged);
+                            let members = self.homes[group].iter().map(|&(_, l)| l).collect::<Vec<_>>();
+                            let held_total: usize = members.iter().map(|&l| self.bank.held_count(l)).sum();
+                            if held_total + replenish_target < self.bank.capacity(group) {
+                                uses >= 0.0
+                            } else if self.prompt_reads.is_empty() {
+                                let min_floor = reuse
+                                    .top_order(group)
+                                    .iter()
+                                    .find(|&&(_, l, e)| !self.is_layer_whole_published(l) && self.unwanted[l].contains(&e))
+                                    .map(|&(_, l, e)| self.uses(ranker, (l, e)));
+                                min_floor.is_some_and(|floor| uses >= floor)
+                            } else {
+                                let min_floor = members
+                                    .iter()
+                                    .filter(|&&l| !self.is_layer_whole_published(l))
+                                    .flat_map(|&l| self.unwanted[l].iter().map(move |&e| (l, e)))
+                                    .map(|s| self.uses(ranker, s))
+                                    .reduce(f64::min);
+                                min_floor.is_some_and(|floor| uses >= floor)
+                            }
+                        }
+                    } else {
+                        false
+                    }
+                })
+                .collect()
+        };
+
+        // Phase 2: apply promotions and releases outside `reuse_now()`.
+        let mut promoted_any = false;
+        for (&(group, record, staged, can_reuse), should_promote) in batch.iter().zip(decisions) {
+            if should_promote {
+                let staged @ (layer, expert) = staged.expect("should_promote implies Some(staged)");
+                // Re-check duplicate promotion within the same batch.
+                if self.bank.held(layer, expert).is_none() && !self.bank.placing_contains(staged) {
+                    let bank = &mut self.bank;
+                    let promoted = steps.unresolved(progress, |unresolved| {
+                        bank.promote_demand_landing(group, record, staged, |l| unresolved.from(l))
+                    });
+                    if promoted {
+                        self.time.lock().moved(group, Tier::COMPUTE);
+                        if !self.bank.lends(group, record) {
+                            self.tier(layer).banked(staged);
+                        }
+                        self.resettle(layer, expert);
+                        promoted_any = true;
+                        continue;
                     }
                 }
             }
-        } else {
-            false
-        };
-
-        if should_promote {
-            let staged @ (layer, expert) = staged.expect("should_promote implies Some(staged)");
-            let bank = &mut self.bank;
-            let promoted = steps.unresolved(progress, |unresolved| {
-                bank.promote_demand_landing(group, record, staged, |l| unresolved.from(l))
-            });
-            if promoted {
-                self.time.lock().moved(group, Tier::COMPUTE);
-                if !self.bank.lends(group, record) {
-                    self.tier(layer).banked(staged);
-                }
-                self.resettle(layer, expert);
-                return true;
+            if can_reuse {
+                self.bank.release_demand_landing(group, record);
+            } else {
+                self.bank.defer_demand_release(group, record);
             }
         }
-
-        if can_reuse {
-            self.bank.release_demand_landing(group, record);
-        } else {
-            self.bank.defer_demand_release(group, record);
-        }
-        false
+        promoted_any
     }
 
     /// Release an aborted/faulted `Record::DemandLanding` slot back to

@@ -1019,6 +1019,7 @@ impl Watcher {
             asked: None,
             opened: Instant::now(),
             complete: false,
+            hints_active: true,
             lines: None,
             logged_initial_lines: false,
             published: residency::Published::new(count, capacities),
@@ -1088,21 +1089,46 @@ impl Watcher {
         residency::lock(&self.state).core.directory.lent(group, record as usize)
     }
 
-    /// Claim a unified VRAM slot in `group` for an on-demand decode DMA
-    /// landing of `tier_record` (non-blocking).
-    pub(in crate::experts) fn claim_demand_slot(
+    /// Batched single-lock claim of unified VRAM slots in `group` for all
+    /// on-demand decode DMA misses in a layer, optionally replenishing `Free`
+    /// headroom in the same `Residency` lock acquisition (1 lock/layer instead
+    /// of `K + 1` locks/layer).
+    pub(in crate::experts) fn claim_demand_batch(
         &self,
         group: usize,
-        tier_record: u32,
-    ) -> crate::experts::directory::DemandSlotClaim {
+        tier_records: &[u32],
+        replenish_want: usize,
+    ) -> Vec<crate::experts::directory::DemandSlotClaim> {
+        if tier_records.is_empty() && replenish_want == 0 {
+            return Vec::new();
+        }
         let mut held = residency::lock(&self.state);
-        let lending = held.core.steps.lending();
         let transport = self.shared.transport.clone();
+        let core = &mut held.core;
+        let (directory, steps) = (&mut core.directory, &core.steps);
+        let lending = steps.lending();
+        let mut claims = Vec::with_capacity(tier_records.len());
+        let mut overflow = 0usize;
         transport.with_slot_reuse(|can_reuse| {
-            held.core.directory.claim_demand_landing(group, tier_record, lending, |slot| {
-                can_reuse(crate::experts::transport::DestSlot { group, slot })
-            })
-        })
+            for &tier_record in tier_records {
+                let claim = directory.claim_demand_landing(group, tier_record, lending, |slot| {
+                    can_reuse(crate::experts::transport::DestSlot { group, slot })
+                });
+                if matches!(claim, crate::experts::directory::DemandSlotClaim::Overflow { .. }) {
+                    overflow += 1;
+                }
+                claims.push(claim);
+            }
+            let want_free = replenish_want.max(overflow);
+            if want_free > 0 {
+                let _released = steps.unbegun(|at| {
+                    directory.replenish_demand_free(group, want_free, at, |slot| {
+                        can_reuse(crate::experts::transport::DestSlot { group, slot })
+                    })
+                });
+            }
+        });
+        claims
     }
 
     /// Release aborted/faulted `Record::DemandLanding` slots back to `Free`.
@@ -1114,22 +1140,6 @@ impl Watcher {
         for &(group, slot) in slots {
             held.core.directory.release_demand_landing(group, slot);
         }
-    }
-
-    /// Asynchronously release lowest-ranked unpinned `Record::Held` victims
-    /// in `group` into `Record::Releasing` when `Free` headroom is scarce.
-    pub(in crate::experts) fn replenish_demand_free(&self, group: usize, want_free: usize) {
-        let mut held = residency::lock(&self.state);
-        let transport = self.shared.transport.clone();
-        let core = &mut held.core;
-        let (directory, steps) = (&mut core.directory, &core.steps);
-        let _released = steps.unbegun(|at| {
-            transport.with_slot_reuse(|can_reuse| {
-                directory.replenish_demand_free(group, want_free, at, |slot| {
-                    can_reuse(crate::experts::transport::DestSlot { group, slot })
-                })
-            })
-        });
     }
 
     /// Zero-recopy O(1) completion of freshly landed `DemandSlot`s: promotes
@@ -1149,32 +1159,20 @@ impl Watcher {
         let progress = held.core.steps.point(sequence, layer, sequence);
         let transport = self.shared.transport.clone();
         let mut promoted_any = false;
-        let mut landed_at_home = false;
         let core = &mut held.core;
         let (directory, steps) = (&mut core.directory, &core.steps);
         transport.with_slot_reuse(|can_reuse| {
-            for &slot in slots {
-                let reusable = can_reuse(crate::experts::transport::DestSlot {
-                    group: slot.group,
-                    slot: slot.slot,
-                });
-                let promoted = directory.finish_demand_landing(
-                    slot.group,
-                    slot.slot,
-                    slot.staged,
-                    progress,
-                    steps,
-                    reusable,
-                );
-                if promoted {
-                    promoted_any = true;
-                    if let Some((staged_layer, staged_expert)) = slot.staged {
-                        if slot.slot == directory.home(staged_layer) + staged_expert {
-                            landed_at_home = true;
-                        }
-                    }
-                }
-            }
+            let batch: Vec<(usize, usize, Option<(usize, usize)>, bool)> = slots
+                .iter()
+                .map(|&slot| {
+                    let reusable = can_reuse(crate::experts::transport::DestSlot {
+                        group: slot.group,
+                        slot: slot.slot,
+                    });
+                    (slot.group, slot.slot, slot.staged, reusable)
+                })
+                .collect();
+            promoted_any = directory.finish_demand_landings_batch(&batch, progress, steps);
             if promoted_any {
                 let group = slots[0].group;
                 steps.unbegun(|at| {
@@ -1186,15 +1184,15 @@ impl Watcher {
         });
         if promoted_any {
             let surrendered = steps.unbegun(|at| directory.surrender_banked(at));
+            let freed_host = !surrendered.is_empty();
             for (group, tier_record) in surrendered {
                 transport.bump_source_generation(group, tier_record);
             }
             directory.retire_graces(progress, steps);
             held.publish_held();
-            if landed_at_home {
-                held.publish_policy();
+            if freed_host {
+                self.shared.events().notify();
             }
-            self.shared.events().notify();
         }
     }
 }

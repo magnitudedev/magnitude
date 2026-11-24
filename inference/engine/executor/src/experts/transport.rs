@@ -1204,9 +1204,8 @@ impl ExpertTransport {
         layer: usize,
         sequence: u64,
         rows: u64,
-        mut claim_slot: impl FnMut(usize, u32) -> super::directory::DemandSlotClaim,
+        mut claim_batch: impl FnMut(usize, &[u32], usize) -> Vec<super::directory::DemandSlotClaim>,
         mut abort_slots: impl FnMut(&[(usize, usize)]),
-        mut replenish_free: impl FnMut(usize, usize),
         wake_site: impl FnOnce(),
         is_serving_ended: impl Fn() -> bool,
         record_dma: impl FnOnce(bool, u64, u64, u64),
@@ -1273,10 +1272,16 @@ impl ExpertTransport {
         let mut overflow_experts: u64 = 0;
 
         // Shared helper: join existing transfers or claim unified `Record::Free`
-        // slots via `claim_slot`, then issue one batched `copy_synced` on
-        // `dma.transfer` outside all residency locks.
+        // slots in ONE batched `claim_batch` call (single `Residency` lock per
+        // layer, optionally replenishing `Free` headroom in the same lock),
+        // then issue one batched `copy_synced_device_only` on `dma.transfer`
+        // outside all residency locks.
+        let mut replenished = false;
         let mut issue_batch =
-            |mut unique: Vec<(usize, usize)>, resolved: &mut Vec<(usize, usize)>| -> Result<(), String> {
+            |mut unique: Vec<(usize, usize)>,
+             replenish_want: usize,
+             resolved: &mut Vec<(usize, usize)>|
+             -> Result<(), String> {
                 if unique.is_empty() {
                     return Ok(());
                 }
@@ -1288,6 +1293,7 @@ impl ExpertTransport {
                 let mut fresh_landed: Vec<(usize, usize, Option<(usize, usize)>)> =
                     Vec::with_capacity(unique.len());
                 let mut aborted: Vec<(usize, usize)> = Vec::new();
+                let mut to_claim: Vec<u32> = Vec::with_capacity(unique.len());
                 for (tier_record, _hits) in unique {
                     if resolved.iter().any(|&(tr, _)| tr == tier_record) {
                         continue;
@@ -1302,35 +1308,45 @@ impl ExpertTransport {
                         leases.push(joined.lease);
                         continue;
                     }
-                    match claim_slot(group, tier_record as u32) {
-                        super::directory::DemandSlotClaim::AlreadyHeld { slot, .. } => {
-                            resolved.push((tier_record, slot));
-                        }
-                        super::directory::DemandSlotClaim::Allocated { staged, slot } => {
-                            let mut complete = true;
-                            let before = pairs.len();
-                            for (region, &bytes) in region_bytes.iter().enumerate() {
-                                if bytes == 0 {
-                                    continue;
+                    to_claim.push(tier_record as u32);
+                }
+                if !to_claim.is_empty() {
+                    if replenish_want > 0 {
+                        replenished = true;
+                    }
+                    let claims = claim_batch(group, &to_claim, replenish_want);
+                    for (tier_record_u32, claim) in to_claim.into_iter().zip(claims) {
+                        let tier_record = tier_record_u32 as usize;
+                        match claim {
+                            super::directory::DemandSlotClaim::AlreadyHeld { slot, .. } => {
+                                resolved.push((tier_record, slot));
+                            }
+                            super::directory::DemandSlotClaim::Allocated { staged, slot } => {
+                                let mut complete = true;
+                                let before = pairs.len();
+                                for (region, &bytes) in region_bytes.iter().enumerate() {
+                                    if bytes == 0 {
+                                        continue;
+                                    }
+                                    let (Some(src), Some(dst)) = (
+                                        dma.host_stores.view(group, region, tier_record),
+                                        dma.bank_stores.view(group, region, slot),
+                                    ) else {
+                                        complete = false;
+                                        break;
+                                    };
+                                    pairs.push((src, dst, bytes));
                                 }
-                                let (Some(src), Some(dst)) = (
-                                    dma.host_stores.view(group, region, tier_record),
-                                    dma.bank_stores.view(group, region, slot),
-                                ) else {
-                                    complete = false;
-                                    break;
-                                };
-                                pairs.push((src, dst, bytes));
+                                if complete {
+                                    fresh_landed.push((tier_record, slot, staged));
+                                } else {
+                                    pairs.truncate(before);
+                                    aborted.push((group, slot));
+                                }
                             }
-                            if complete {
-                                fresh_landed.push((tier_record, slot, staged));
-                            } else {
-                                pairs.truncate(before);
-                                aborted.push((group, slot));
+                            super::directory::DemandSlotClaim::Overflow { .. } => {
+                                overflow_experts += 1;
                             }
-                        }
-                        super::directory::DemandSlotClaim::Overflow { .. } => {
-                            overflow_experts += 1;
                         }
                     }
                 }
@@ -1370,6 +1386,10 @@ impl ExpertTransport {
                     .collect();
                 match dma.transfer.copy_synced(&items) {
                     Ok((_, sync)) => {
+                        // Wake `LinkMover` immediately so `Stage(L+1)` queues
+                        // onto the transfer stream right after `DMA(L)` and
+                        // overlaps with `DecodeBack(L) + DecodeFront(L+1)`.
+                        dma.events.notify();
                         for &id in &batch_ids {
                             self.attach_sync(id, sync.clone());
                         }
@@ -1395,10 +1415,13 @@ impl ExpertTransport {
                 }
             };
 
+        let target_free = dma.selected.saturating_mul(if rows >= WIDE_VERIFY_ROWS { 2 } else { 1 });
+
         // Phase A: fire PCIe DMA immediately for already-in-RAM misses before
-        // waiting on any NVMe file answer.
+        // waiting on any NVMe file answer. When no file answer is pending,
+        // replenish `Free` headroom in the same single `Residency` lock.
         let total_unique_a = unique_a.len();
-        issue_batch(unique_a, &mut resolved)?;
+        issue_batch(unique_a, if file_pending { 0 } else { target_free }, &mut resolved)?;
         for (idx, &word) in raw_sources.iter().enumerate() {
             if word <= -2 {
                 let tier_record = (-2i64 - i64::from(word)) as usize;
@@ -1471,7 +1494,7 @@ impl ExpertTransport {
             }
             total_unique_b = unique_b.len();
             if !unique_b.is_empty() {
-                issue_batch(unique_b, &mut resolved)?;
+                issue_batch(unique_b, target_free, &mut resolved)?;
                 for &(choice, tier_record) in &phase_b_choices {
                     if let Some(&(_, slot)) = resolved.iter().find(|&&(tr, _)| tr == tier_record) {
                         dma.sources_words.store(choice, slot as i32);
@@ -1480,12 +1503,11 @@ impl ExpertTransport {
             }
         }
 
-        if overflow_experts > 0 || !resolved.is_empty() {
+        if !replenished && (overflow_experts > 0 || !resolved.is_empty()) {
             // Proactively maintain a small active floor of free demand slots
-            // (K for narrow decode, 2*K for wide verify bursts) so cold-miss
-            // bursts don't overflow to SM zero-copy while LinkMover::reserve == 0.
-            let target_free = dma.selected.saturating_mul(if rows >= WIDE_VERIFY_ROWS { 2 } else { 1 });
-            replenish_free(group, (overflow_experts as usize).max(target_free));
+            // (K for narrow decode, 2*K for wide verify bursts) when neither
+            // Phase A nor Phase B already replenished inside `claim_batch`.
+            let _ = claim_batch(group, &[], (overflow_experts as usize).max(target_free));
         }
 
         if let Some(gate) = dma.layer_gates.get(layer) {
@@ -2408,18 +2430,21 @@ mod tests {
                 0,
                 seq,
                 rows,
-                |_g, tr| {
-                    if let Some(slot) = free_pool.pop() {
-                        crate::experts::directory::DemandSlotClaim::Allocated {
-                            staged: Some((0, tr as usize)),
-                            slot,
-                        }
-                    } else {
-                        crate::experts::directory::DemandSlotClaim::Overflow { staged: None }
-                    }
+                |_g, trs, _replenish| {
+                    trs.iter()
+                        .map(|&tr| {
+                            if let Some(slot) = free_pool.pop() {
+                                crate::experts::directory::DemandSlotClaim::Allocated {
+                                    staged: Some((0, tr as usize)),
+                                    slot,
+                                }
+                            } else {
+                                crate::experts::directory::DemandSlotClaim::Overflow { staged: None }
+                            }
+                        })
+                        .collect()
                 },
                 |_| {},
-                |_, _| {},
                 || {},
                 || false,
                 |f, e, b, o| recorded = (f, e, b, o),
@@ -2470,9 +2495,10 @@ mod tests {
                 0,
                 seq2,
                 rows,
-                |_, _| crate::experts::directory::DemandSlotClaim::Overflow { staged: None },
+                |_, trs, _| {
+                    vec![crate::experts::directory::DemandSlotClaim::Overflow { staged: None }; trs.len()]
+                },
                 |_| {},
-                |_, _| {},
                 || {},
                 || false,
                 |_, _, _, _| {},

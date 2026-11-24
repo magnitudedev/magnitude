@@ -1586,6 +1586,16 @@ impl DriveEngagement {
         self.dma_host_wait_ns.fetch_add(ns, Ordering::Relaxed);
     }
 
+    /// Per-request delta of `(staged_hits, dma_calls)` since the last completed
+    /// request baseline, used to detect dead link-only `routed_hint_select`
+    /// (`tier_complete && req_staged_hits == 0` once decode DMA is active).
+    pub(super) fn request_staged_and_dma(&self) -> (u64, u64) {
+        let base = self.last_request.lock().expect("drive engagement baseline");
+        let staged = self.staged_hits.load(Ordering::Relaxed).saturating_sub(base.staged_hits);
+        let dma = self.dma_calls.load(Ordering::Relaxed).saturating_sub(base.dma_calls);
+        (staged, dma)
+    }
+
     /// Record an expert bank growth refusal (`BankResized::GrowthRefused` or
     /// partial `BankResized::Grown { refused: Some(_), .. }`).
     pub(super) fn record_growth_refusal(&self) {

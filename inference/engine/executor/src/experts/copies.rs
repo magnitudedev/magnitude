@@ -102,8 +102,8 @@ impl TransferPriority {
         let rank = |prio: &Self| match prio {
             Self::PrefillFill => 0u8,
             Self::WriteBack => 1,
-            Self::Promote => 2,
-            Self::Stage { .. } => 3,
+            Self::Stage { .. } => 2,
+            Self::Promote => 3,
         };
         rank(self).cmp(&rank(other)).then_with(|| match (*self, *other) {
             (
@@ -591,7 +591,7 @@ mod tests {
         ticket
     }
 
-    /// Priority ordering (`PrefillFill > WriteBack > Promote > Stage { step, layer, p }`),
+    /// Priority ordering (`PrefillFill > WriteBack > Stage { step, layer, p } > Promote`),
     /// `reprice`, and `cancel` (only unbegun queued batches; never issuing/running).
     #[test]
     fn priority_preemption_reprice_and_cancel_never_cancels_in_flight() {
@@ -607,7 +607,7 @@ mod tests {
         // PrefillFill preempts WriteBack, Promote, and all Stage batches.
         assert_eq!(state.pop_next().unwrap().ticket, t_prefill);
 
-        // WriteBack preempts Promote and all Stage batches.
+        // WriteBack preempts all Stage and Promote batches.
         let first = state.pop_next().unwrap();
         assert_eq!(first.ticket, t_wb);
         // Simulate `first` now issuing -> cancel must return None!
@@ -619,10 +619,7 @@ mod tests {
         assert!(state.cancel(t_wb).is_none(), "cannot cancel a running DMA batch");
         assert!(state.is_in_flight(t_wb));
 
-        // Promote dispatches strictly ahead of all opportunistic Stage hints.
-        assert_eq!(state.pop_next().unwrap().ticket, t_promote);
-
-        // Reprice `t_stage_late` to step 4, layer 0, p = 0.95 -> jumps ahead of `t_stage_l0`.
+        // Reprice `t_stage_late` to step 4, layer 0, p = 0.95 -> jumps ahead of `t_stage_l0` and `t_promote`.
         assert!(state.reprice(t_stage_late, TransferPriority::Stage { step: 4, layer: 0, p: 0.95 }));
         assert_eq!(state.pop_next().unwrap().ticket, t_stage_late);
         assert_eq!(state.pop_next().unwrap().ticket, t_stage_l0);
@@ -636,8 +633,9 @@ mod tests {
         assert!(state.cancel(t_stage_l1_low).is_none(), "second cancel returns None");
         assert_eq!(state.cancelled.len(), 1);
 
-        // Remaining order: `t_stage_l1_high`.
+        // Remaining order: live `t_stage_l1_high` preempts background `t_promote`.
         assert_eq!(state.pop_next().unwrap().ticket, t_stage_l1_high);
+        assert_eq!(state.pop_next().unwrap().ticket, t_promote);
         assert!(state.pop_next().is_none());
     }
 }

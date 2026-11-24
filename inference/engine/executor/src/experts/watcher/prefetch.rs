@@ -1087,12 +1087,19 @@ impl Prefetch {
         (named, latest)
     }
 
-    /// Whether `staged` is a read ahead's candidate: an expert that lives
-    /// only in the file: the bank lacks it, and its host tier keeps, graces
-    /// and lands none of it (`Directory::located`).
+    /// Whether `staged` is a read ahead's candidate: an expert absent from
+    /// VRAM that either lives only in the file (`Located::Lacked`) or, on a
+    /// 100%-RAM link-only bank (`tier_complete() && !all_groups_whole()`),
+    /// lives in `HostTier` and is eligible for Path 0 `LinkMover` staging.
     fn candidate(core: &Core, staged: Staged) -> bool {
         let (layer, expert) = staged;
-        core.directory.held(layer, expert).is_none() && core.directory.located(layer, expert) == Located::Lacked
+        if core.directory.held(layer, expert).is_some() {
+            return false;
+        }
+        if core.directory.tier_complete() && !core.directory.all_groups_whole() {
+            return true;
+        }
+        core.directory.located(layer, expert) == Located::Lacked
     }
 
     /// Publish a ring's `names` of `target` to the ledger, each a candidate

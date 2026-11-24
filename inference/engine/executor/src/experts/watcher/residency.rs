@@ -91,6 +91,8 @@ pub(super) struct Residency {
     /// (`Directory::tier_complete`), as last published.
     pub(super) opened: Instant,
     pub(super) complete: bool,
+    /// Whether any layer currently has `POLICY_HINTS == 1` as last published.
+    pub(super) hints_active: bool,
     /// Each layer's line words as last published ([`Self::publish_lines`]);
     /// none before the first.
     pub(super) lines: Option<Vec<Vec<(usize, i32)>>>,
@@ -847,17 +849,30 @@ impl Residency {
         let core = &self.core;
         let ledger = &mut self.ledger;
         let layer_count = core.layers.len();
-        let hints = self.shared.telemetry.hint_gates(&whole, link_line, self.shared.launch_prices().as_ref(), |target, lead, miss| {
-            let bytes = core.layers[target].expert_bytes();
-            let idle = miss.hint_lead_idle(lead, layer_count);
-            if ledger.hint_admitted(target, lead, miss.break_even(bytes, idle)) {
-                return true;
-            }
-            secondary_link.is_some_and(|link| {
-                let link_idle = link.hint_lead_idle(lead, layer_count);
-                ledger.hint_admitted(target, lead, link.break_even(bytes, link_idle))
+        // On 100%-RAM discrete GPUs (`tier_complete == true`), `routed_hint_select`
+        // only feeds Path 0 `LinkMover` staging (`MAP_STAGE`). Once decode DMA
+        // has executed at least one full step (`req_dma >= layer_count`) with
+        // zero staged hits (`req_staged == 0`), gate off `POLICY_HINTS` so the
+        // GPU skips dead `routed_hint_select` launches and `expert-requests`
+        // stops 20 us polling.
+        let (req_staged, req_dma) = self.shared.telemetry.engagement().request_staged_and_dma();
+        let link_hints_dead = tier_complete && req_dma >= (layer_count as u64).saturating_mul(4) && req_staged == 0;
+        let hints = if link_hints_dead {
+            vec![false; layer_count]
+        } else {
+            self.shared.telemetry.hint_gates(&whole, link_line, self.shared.launch_prices().as_ref(), |target, lead, miss| {
+                let bytes = core.layers[target].expert_bytes();
+                let idle = miss.hint_lead_idle(lead, layer_count);
+                if ledger.hint_admitted(target, lead, miss.break_even(bytes, idle)) {
+                    return true;
+                }
+                secondary_link.is_some_and(|link| {
+                    let link_idle = link.hint_lead_idle(lead, layer_count);
+                    ledger.hint_admitted(target, lead, link.break_even(bytes, link_idle))
+                })
             })
-        });
+        };
+        self.hints_active = hints.iter().any(|&h| h);
         let layers = (0..self.core.layers.len())
             .map(|index| LayerPolicy {
                 whole: whole[index],
@@ -994,6 +1009,18 @@ impl Residency {
     /// foresight rings for Link staging, true once VRAM holds every expert.
     pub(super) fn all_whole(&self) -> bool {
         self.core.directory.all_groups_whole()
+    }
+
+    /// Whether every layer is resolved (`POLICY_RESOLVED == 1`: either whole in
+    /// VRAM or 100% resident in `HostTier`, so decode never emits NVMe
+    /// `FILE_REQUEST`s).
+    pub(super) fn all_resolved(&self) -> bool {
+        self.core.directory.all_groups_whole() || self.core.directory.tier_complete()
+    }
+
+    /// Whether any layer currently publishes `POLICY_HINTS == 1`.
+    pub(super) fn any_hints_enabled(&self) -> bool {
+        self.hints_active
     }
 
     /// Each group's host tier records `views` address from now (a shrink's,

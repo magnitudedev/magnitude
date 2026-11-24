@@ -294,9 +294,8 @@ impl ExpertBank {
             layer,
             sequence,
             rows,
-            |g, tier_record| self.watcher.claim_demand_slot(g, tier_record),
+            |g, tier_records, replenish_want| self.watcher.claim_demand_batch(g, tier_records, replenish_want),
             |aborted| self.watcher.abort_demand_slots(aborted),
-            |g, want| self.watcher.replenish_demand_free(g, want),
             || shared.wake_site_noticer(),
             || shared.is_ended(),
             |fast_path, experts, bytes, overflow| {

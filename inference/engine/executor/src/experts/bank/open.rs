@@ -880,7 +880,13 @@ pub(crate) fn stage_slot_count(
     let want_stage = active_layers.saturating_mul(misses_per_layer).saturating_mul(2);
     if enable_dma {
         let transient_cap = (present / 10).max(k).min(avail.saturating_sub(1));
-        let max_stage = transient_cap.saturating_sub(k).min(transient_cap / 4) & !1;
+        let min_stage = k.saturating_mul(4).min(transient_cap);
+        let max_stage = transient_cap
+            .saturating_sub(k)
+            .min(transient_cap / 4)
+            .max(min_stage)
+            .min(transient_cap)
+            & !1;
         want_stage.min(max_stage)
     } else {
         let share_cap = (avail / 16).max(k.saturating_mul(2));

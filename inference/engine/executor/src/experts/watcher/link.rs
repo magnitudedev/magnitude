@@ -462,34 +462,20 @@ impl LinkMover {
                 }
             }
 
-            // Cross-burst & in-verify carryover on Link: both during MTP
-            // `DraftWindow` (`draft_idle > 0.0`, targeting `next_step`) and
-            // during active verify compute (`c_window` slack, targeting
-            // remaining layers `l+1..L-1` of the active step first and early
-            // layers `0..=l` of `next_step` second), fill up to half of each
-            // parity ring with live-calibrated Tier-1-only `Reuse` carryover
-            // experts while keeping >= half the ring free for live within-pass
-            // `routed_hint_route` / `Source::Token` hints.
+            // Cross-burst carryover on Link: during MTP `DraftWindow`
+            // (`draft_idle > 0.0`, targeting `next_step`), fill up to half of
+            // each parity ring with live-calibrated Tier-1-only `Reuse`
+            // carryover experts while keeping >= half the ring free for live
+            // within-pass `routed_hint_route` / `Source::Token` hints. Never
+            // consume `ring_half` slots for speculative carryover during active
+            // decode/verify (`draft_idle == 0.0`), leaving the full ring for
+            // live `HINT_LEADS` hints.
             let carryover_cap = (ring_half / 2).max(1);
-            let active_step = ledger.latest_active_step().filter(|&s| s >= frontier && !core.steps.ended(s));
-            let in_verify = draft_idle == 0.0 && active_step.is_some();
-            let step_for_layer = |layer: usize| {
-                if in_verify && layer > progress.layer {
-                    active_step.unwrap_or(next_step)
-                } else {
-                    next_step
-                }
-            };
             let room_for_step = |directory: &crate::experts::directory::Directory, target_step: Step| {
                 carryover_cap.saturating_sub(directory.staged_for_step(group, target_step))
             };
-            let max_room = if in_verify {
-                let s_cur = active_step.unwrap_or(next_step);
-                room_for_step(&core.directory, s_cur).max(room_for_step(&core.directory, next_step))
-            } else {
-                room_for_step(&core.directory, next_step)
-            };
-            if (draft_idle > 0.0 || in_verify) && max_room > 0 && copier.copies.flight() < stage_depth && idle.get().remaining() > 0.0 {
+            let max_room = room_for_step(&core.directory, next_step);
+            if draft_idle > 0.0 && max_room > 0 && copier.copies.flight() < stage_depth && idle.get().remaining() > 0.0 {
                 let room = stage_depth.saturating_sub(copier.copies.flight()).min(max_room);
                 let mut carryover = {
                     let reuse = core.directory.reuse_now();
@@ -502,24 +488,21 @@ impl LinkMover {
                     })
                 };
                 carryover.sort_unstable_by(|a, b| {
-                    let a_next = !in_verify || a.layer <= progress.layer;
-                    let b_next = !in_verify || b.layer <= progress.layer;
-                    a_next
-                        .cmp(&b_next)
-                        .then_with(|| a.layer.cmp(&b.layer))
+                    a.layer
+                        .cmp(&b.layer)
                         .then_with(|| b.p_next.total_cmp(&a.p_next))
                 });
                 for cand in carryover {
                     if copier.copies.flight() >= stage_depth {
                         break;
                     }
-                    let target_step = step_for_layer(cand.layer);
+                    let target_step = next_step;
                     if room_for_step(&core.directory, target_step) == 0 {
                         continue;
                     }
                     let mut budget = idle.get();
                     let t_bw = admission.transfer_seconds(record_bytes);
-                    let free_slack = if draft_idle > 0.0 { budget.remaining() } else { 0.0 };
+                    let free_slack = budget.remaining();
                     if admission.carryover_net_benefit(cand.p_next, record_bytes, free_slack) <= 0.0 {
                         continue;
                     }

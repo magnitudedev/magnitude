@@ -500,7 +500,12 @@ pub(super) fn lending_windowed_passes(
     // Beside a host tier, what promotions copy with: the device's transfers
     // (the CPU's, complete as queued), from each tensor's tier records into
     // its bank records.
-    let copies = crate::experts::copies::Copies::new(seismic::Transfer::new(&device).unwrap(), steps.events().clone());
+    let transport = crate::experts::transport::ExpertTransport::new_registry_only();
+    let copies = crate::experts::copies::Copies::with_transport(
+        seismic::Transfer::new(&device).unwrap(),
+        steps.events().clone(),
+        transport.clone(),
+    );
     let copier = (placer == Placer::Tier && promotes).then(|| super::Copier { copies: copies.clone() });
     let tier_tensors = host
         .views(tier)
@@ -679,7 +684,7 @@ pub(super) fn lending_windowed_passes(
         spans: false,
         // Its bound is its own reads' line, as a plan priced on no figures.
         line: None,
-        transport: crate::experts::transport::ExpertTransport::new_registry_only(),
+        transport,
         trip: Box::new(move |report: String| *tripped.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = Some(report)),
     }, Box::new(|| crate::experts::exchange::Bounds {
         // Synthetic 48-byte fixture reads complete in nanoseconds from page
