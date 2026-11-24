@@ -437,12 +437,17 @@ impl Residency {
         if self.shared.life.ended().is_some() {
             return None;
         }
-        // Whatever is asked, the cover's queued reads and unbegun opportunistic
-        // staging batches yield: a resize waits for the reads and DMA copies
-        // that are actually running, never for queued speculative work.
+        // Whatever is asked, the cover's queued reads and unbegun link work
+        // yield, and any queued write-backs are posted so a waiting resize
+        // never stalls behind unposted `Back { batch: None }` or queued
+        // promotion entries.
         self.prefetch.cancel_cover();
         if let Some(copier) = copier {
             self.link.cancel_unbegun(&mut self.core, copier);
+            self.link.post_backs(&mut self.core, &self.shared, copier);
+            if self.shared.life.ended().is_some() {
+                return None;
+            }
         }
         if asked.ask.waits() {
             if self.core.directory.moving() || self.prefetch.outstanding() {

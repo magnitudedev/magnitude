@@ -807,3 +807,117 @@ fn shrink_preempts_pending_told_backlog_and_remaining_turn_jobs() {
     );
     assert_eq!(shared.life.ended(), None);
 }
+
+/// Regression test: `Shared::place` (`Ask::Place`, `ask.waits() == true`) and
+/// `Shared::hold_traffic` / `wait_traffic_quiet` must complete promptly when
+/// `Directory` holds either a `Moving::Queued` promotion or an unposted
+/// `Back { batch: None }` write-back. Previously `LinkMover::cancel_unbegun`
+/// only cancelled staging batches, and `LinkMover::advance` short-circuited
+/// under `held` / pending `Ask::Place` without unpromoting queued promotions
+/// or posting queued write-backs, leaving `Directory::moving()` permanently
+/// true and deadlocking `Residency::resize`.
+#[test]
+fn place_completes_with_queued_promotion_and_unposted_write_back() {
+    use crate::experts::directory::WriteBack;
+    use magnitude_cost_model::Terms;
+
+    let harness = promoting("place-drains-link-queues", 4, TIER);
+    harness.promoted(0, &[0, 1, 2, 3]);
+    // Land expert 4 into the host tier so a promotion can be queued from it.
+    harness.request(&[4]).complete().unwrap();
+    eventually("expert 4 landed in host tier", || {
+        residency::lock(&harness.watcher.state).core.directory.in_tier(0, 4)
+    });
+
+    let shared = Arc::clone(harness.watcher.shared());
+    let device = cpu();
+    let words = |count: u64| cpu_words(&device, count, 0);
+    let flags = [words(EXPERTS as u64), words(EXPERTS as u64)];
+    let reads = harness
+        .layers
+        .iter()
+        .map(|_| words(crate::FlightDepth::PIPELINED.steps(PLACES) * EXPERTS as u64))
+        .collect::<Vec<_>>();
+    let placed = || PlacedWords {
+        flags: flags.to_vec(),
+        layers: reads.iter().map(|reads| PlacedLayerWords { group_reads: reads.clone(), stride: EXPERTS }).collect(),
+    };
+
+    // --- Case 1: `Moving::Queued` promotion stranded when `Ask::Place` arrives ---
+    // Evict one bank slot and rejoin it while holding residency, then queue a
+    // `Moving::Queued` promotion without posting it to `Copier`.
+    let evicted = shared
+        .shrink(Evicting::Bank, Candidates::one(3, vec![3]), None)
+        .unwrap()
+        .expect("shrink evicts one bank record");
+    let rejoined: Vec<usize> = evicted.records[0].iter().map(|&r| r as usize).collect();
+
+    let place_thread = {
+        let mut state = residency::lock(&harness.watcher.state);
+        let core = &mut state.core;
+        core.directory.grow(0, rejoined, 0);
+        let asked = core.steps.unbegun_beside_frontier(|_, at| core.directory.promotions_with(at, 1, |_, _| true));
+        assert!(
+            !asked.promotions.is_empty() && !core.directory.queued().is_empty(),
+            "expected a Moving::Queued promotion before Ask::Place"
+        );
+        assert!(core.directory.moving());
+
+        let place_shared = shared.clone();
+        let placed_words = placed();
+        let handle = std::thread::spawn(move || place_shared.place(placed_words));
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        while !shared.resizing.is_pending() {
+            assert!(std::time::Instant::now() < deadline, "Ask::Place never marked resizing pending");
+            std::thread::yield_now();
+        }
+        handle
+    };
+    place_thread
+        .join()
+        .expect("place thread did not panic")
+        .expect("Ask::Place must complete promptly with Moving::Queued promotion");
+    assert_eq!(shared.life.ended(), None);
+
+    // --- Case 2: unposted `Back { batch: None }` write-back when `Ask::Place` arrives ---
+    // Ensure all 4 bank records are populated, price write-backs so evicting a
+    // banked expert queues a `Back { batch: None }`, then send `Ask::Place`
+    // while the write-back is still unposted.
+    eventually("bank refilled to 4 records", || shared.held()[0].len() == 4);
+
+    let place_thread = {
+        let mut state = residency::lock(&harness.watcher.state);
+        let wb = WriteBack {
+            terms: Terms { compute: 1.0, drive: 4.0, link: 1.0, cpu: 0.0, memory: 0.0 },
+            drive: 1.0,
+            link: 0.0,
+        };
+        let core = &mut state.core;
+        core.directory.price_write_backs(0, Some(wb));
+        // Evict one banked record under residency lock: because write-back pays
+        // and the host tier has room, `directory.evict` releases the record
+        // into `Back { batch: None }` without submitting it to `Copier`.
+        let evicted = core.steps.unbegun_beside_frontier(|_, at| core.directory.evict(&[vec![0]], |_, _| None, |_| at.into(), at));
+        assert!(!evicted, "victim whose write-back pays holds its record until written back");
+        assert!(
+            !core.directory.backs_queued().is_empty(),
+            "expected an unposted Back {{ batch: None }} before Ask::Place"
+        );
+        assert!(core.directory.moving());
+
+        let place_shared = shared.clone();
+        let placed_words = placed();
+        let handle = std::thread::spawn(move || place_shared.place(placed_words));
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        while !shared.resizing.is_pending() {
+            assert!(std::time::Instant::now() < deadline, "Ask::Place never marked resizing pending");
+            std::thread::yield_now();
+        }
+        handle
+    };
+    place_thread
+        .join()
+        .expect("place thread did not panic")
+        .expect("Ask::Place must post queued write-backs and complete promptly");
+    assert_eq!(shared.life.ended(), None);
+}
