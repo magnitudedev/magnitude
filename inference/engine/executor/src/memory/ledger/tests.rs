@@ -3296,3 +3296,97 @@ fn metal_execution_reserve_bank_cushion_and_wired_jitter_stability() {
     );
     assert_eq!(jittered.target(), jittered.import_room());
 }
+
+/// Regression test: `Ledger::reclaim_backed` at `ReliefBoundary::InFlight`
+/// must NEVER invoke a `Reclaim::Backed` reclaimer (which could self-deadlock
+/// on `wait_traffic_quiet()` while a flight is active on the owner thread).
+#[test]
+fn reclaim_backed_at_in_flight_boundary_never_invokes_reclaimer() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    struct PanicIfCalled(Arc<AtomicUsize>);
+    impl CacheReclaimer for PanicIfCalled {
+        fn reclaim(&self, _need: u64) -> Result<u64, ReclaimError> {
+            self.0.fetch_add(1, Ordering::AcqRel);
+            panic!("Reclaim::Backed must never be invoked at ReliefBoundary::InFlight");
+        }
+    }
+
+    let (_scope, ledger, pools) = host();
+    let mut clock = Clock::new();
+    read(&ledger, &mut clock, 10 * GB, 10 * GB, None);
+    let bank_claim = ledger
+        .change(|keeping| ledger.backing(&keeping.claims(), PoolClass::Records, 4 * GB))
+        .expect("bank backing fits");
+    ledger
+        .change(|_| pools.records.take(&pools.records.change(), 4 * GB, Pageable))
+        .expect("records pool allocates");
+
+    let calls = Arc::new(AtomicUsize::new(0));
+    let reclaimer = Arc::new(PanicIfCalled(calls.clone()));
+    let weak = Arc::downgrade(&reclaimer) as std::sync::Weak<dyn CacheReclaimer>;
+    let bank_cache = ledger.change(|_| bank_claim.into_backed_cache(CacheKind::Bank, Reclaim::Backed(weak)));
+
+    assert_eq!(
+        ledger.reclaim_backed(2 * GB, ReliefBoundary::InFlight),
+        0,
+        "InFlight boundary must return 0 without invoking backed reclaimers"
+    );
+    assert_eq!(calls.load(Ordering::Acquire), 0);
+
+    ledger.change(|_| {
+        drop(bank_cache);
+        pools.records.freed(&pools.records.change(), 4 * GB, Pageable);
+    });
+}
+
+/// Regression test (monotonic progress in `reclaim_until`): a misbehaving or
+/// stalled `CacheReclaimer` that reports `Ok(freed > 0)` without actually
+/// reducing the ledger's deficit must be marked exhausted after 1 call rather
+/// than spinning `reclaim_until` unboundedly.
+#[test]
+fn reclaim_until_terminates_in_bounded_steps_when_reclaimer_makes_no_progress() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    struct StalledReclaimer(Arc<AtomicUsize>);
+    impl CacheReclaimer for StalledReclaimer {
+        fn reclaim(&self, _need: u64) -> Result<u64, ReclaimError> {
+            let n = self.0.fetch_add(1, Ordering::AcqRel) + 1;
+            assert!(n <= 2, "reclaim_until exceeded bounded step budget ({n} calls)");
+            // Pretend 1 byte was freed without updating ledger holdings or pool.
+            Ok(1)
+        }
+    }
+
+    let (_scope, ledger, pools) = host();
+    let mut clock = Clock::new();
+    read(&ledger, &mut clock, 4 * GB, 4 * GB, None);
+    let bank_claim = ledger
+        .change(|keeping| ledger.backing(&keeping.claims(), PoolClass::Records, 3 * GB))
+        .expect("bank backing fits");
+    ledger
+        .change(|_| pools.records.take(&pools.records.change(), 3 * GB, Pageable))
+        .expect("records pool allocates");
+
+    let calls = Arc::new(AtomicUsize::new(0));
+    let reclaimer = Arc::new(StalledReclaimer(calls.clone()));
+    let weak = Arc::downgrade(&reclaimer) as std::sync::Weak<dyn CacheReclaimer>;
+    let bank_cache = ledger.change(|_| bank_claim.into_backed_cache(CacheKind::Bank, Reclaim::Backed(weak)));
+
+    // Request 2 GB (exceeds remaining 1 GB free): reclaimer reports `Ok(1)`
+    // without freeing ledger/pool bytes, so `need` does not decrease and
+    // `reclaim_until` MUST mark it exhausted on the next iteration and fail
+    // fast with `Err(Short)`.
+    let result = ledger.change(|keeping| ledger.claim(&keeping.claims(), Need::RequestSlot { bytes: 2 * GB }));
+    assert!(result.is_err(), "stalled reclaimer must fail with Short rather than looping");
+    assert_eq!(
+        calls.load(Ordering::Acquire),
+        1,
+        "stalled reclaimer must be invoked at most once before monotonic-progress exhaustion"
+    );
+
+    ledger.change(|_| {
+        drop(bank_cache);
+        pools.records.freed(&pools.records.change(), 3 * GB, Pageable);
+    });
+}

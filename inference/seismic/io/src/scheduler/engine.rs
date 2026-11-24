@@ -6,7 +6,7 @@ use crate::{Buffer, Error, Totals, Volume};
 use std::collections::HashMap;
 use std::path::Path;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{Arc, Condvar, Mutex, MutexGuard, OnceLock, TryLockError};
+use std::sync::{Arc, Condvar, Mutex, MutexGuard, OnceLock};
 use std::time::Instant;
 
 /// A reader's requests made and not yet ended ([`Reader::outstanding`]).
@@ -108,22 +108,15 @@ impl Drop for FlightSlot {
     }
 }
 
-/// The process's pool: its queue, the pieces whose reads returned while
-/// another held it, the condition its workers wait on, its workers and
-/// what its readers and probes need of them ([`Pool`]), each worker's piece
-/// in flight, and the buffers pieces that do not land straight are read
-/// into.
+/// The process's pool: its queue, the condition its workers wait on, its
+/// workers and what its readers and probes need of them ([`Pool`]), each
+/// worker's piece in flight, and the buffers pieces that do not land straight
+/// are read into.
 pub(crate) struct Engine {
-    /// Held only through [`Engine::queue`], which ends `returned` first.
+    /// Single lock synchronizing queue mutations and [`Self::work`] condvar
+    /// notifications so no worker wakeup can be lost between predicate check
+    /// and wait.
     queue: Mutex<Queue>,
-    /// Pieces whose reads returned while the queue's lock was held, each
-    /// ended by the lock's next holder before it looks at the queue: a
-    /// returning read lands without waiting for the lock.
-    returned: Mutex<Vec<Returned>>,
-    /// How many `returned` holds, set under its lock, so a holder that finds
-    /// none takes no lock for them: one left as a holder looked is ended by
-    /// its worker's own next look at the queue.
-    left: AtomicUsize,
     pub(crate) work: Condvar,
     /// Taken under the queue's lock where both are held, never the other
     /// way.
@@ -170,8 +163,6 @@ impl Engine {
     pub(crate) fn new() -> Self {
         Engine {
             queue: Mutex::new(Queue::default()),
-            returned: Mutex::new(Vec::new()),
-            left: AtomicUsize::new(0),
             work: Condvar::new(),
             pool: Mutex::new(Pool::default()),
             flights: Mutex::new(Vec::new()),
@@ -179,63 +170,26 @@ impl Engine {
         }
     }
 
-    /// The queue, every piece whose read returned ended in it first.
-    /// Any `Arc<Need>` returned by `Queue::ended` is dropped strictly outside
-    /// `self.queue`'s lock so `Need::drop` can never re-enter `self.queue`.
+    /// Lock the read queue.
     pub(crate) fn queue(&self) -> MutexGuard<'_, Queue> {
-        loop {
-            let mut queue = self.queue.lock().expect("read queue");
-            if self.left.load(Ordering::Acquire) == 0 {
-                return queue;
-            }
-            let needs = self.end_returned(&mut queue);
-            drop(queue);
-            drop(needs);
-        }
+        self.queue.lock().expect("read queue")
     }
 
-    /// End `returned` now if the queue's lock is free, or leave it for the
-    /// lock's next holder to end ([`Engine::queue`]).
+    /// End `returned` under `self.queue`'s lock and notify a waiting worker
+    /// while holding the lock so no wakeup can be lost between a worker's
+    /// empty-queue check and `work.wait(queue)`. Drops the returned
+    /// `Arc<Need>` strictly outside `self.queue`'s lock so `Need::drop` can
+    /// never re-enter `self.queue`.
     pub(crate) fn read_returned(&self, returned: Returned) {
-        match self.queue.try_lock() {
-            Ok(mut queue) => {
-                let mut needs = self.end_returned(&mut queue);
-                needs.push(self.end(&mut queue, returned));
-                drop(queue);
-                drop(needs);
-            }
-            Err(TryLockError::WouldBlock) => {
-                let mut left = self.returned.lock().expect("returned reads");
-                left.push(returned);
-                self.left.store(left.len(), Ordering::Release);
-                drop(left);
+        let need = {
+            let mut queue = self.queue();
+            let (wake, need) = queue.ended(returned);
+            if wake {
                 self.work.notify_one();
             }
-            Err(TryLockError::Poisoned(_)) => panic!("read queue poisoned"),
-        }
-    }
-
-    /// End in `queue` the pieces whose reads returned while its lock was
-    /// held, in the order they were left, returning their `Arc<Need>`s so the
-    /// caller drops them outside `self.queue`'s lock.
-    fn end_returned(&self, queue: &mut Queue) -> Vec<Arc<Need>> {
-        if self.left.load(Ordering::Acquire) == 0 {
-            return Vec::new();
-        }
-        let mut returned = self.returned.lock().expect("returned reads");
-        self.left.store(0, Ordering::Relaxed);
-        returned.drain(..).map(|returned| self.end(queue, returned)).collect()
-    }
-
-    /// End `returned` in `queue`: room it frees on a link with a request
-    /// queued wakes a worker to take its next piece. Returns `need` so the
-    /// caller drops it outside `self.queue`'s lock.
-    fn end(&self, queue: &mut Queue, returned: Returned) -> Arc<Need> {
-        let (wake, need) = queue.ended(returned);
-        if wake {
-            self.work.notify_one();
-        }
-        need
+            need
+        };
+        drop(need);
     }
 
     /// Wake `count` workers.
@@ -571,20 +525,7 @@ fn work(engine: &'static Engine, slot: FlightSlot) {
                 if engine.retire() {
                     return;
                 }
-                if engine.left.load(Ordering::Acquire) != 0 {
-                    let needs = engine.end_returned(&mut queue);
-                    drop(queue);
-                    drop(needs);
-                    queue = engine.queue();
-                    continue;
-                }
                 queue = engine.work.wait(queue).expect("read queue");
-                if engine.left.load(Ordering::Acquire) != 0 {
-                    let needs = engine.end_returned(&mut queue);
-                    drop(queue);
-                    drop(needs);
-                    queue = engine.queue();
-                }
             }
         };
         let piece = &taken.piece;

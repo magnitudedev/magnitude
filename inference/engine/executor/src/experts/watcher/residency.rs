@@ -229,6 +229,60 @@ pub(super) struct Turn {
     /// learned, a promotion asked, a growth joined, a prompt group
     /// cleared): the request service looks again.
     changed: bool,
+    /// A resize ask was answered on this turn (so `Residency::keep` should run
+    /// one immediate follow-up turn without parking to drain any `Told` or
+    /// traffic work deferred behind the resize).
+    answered_resize: bool,
+}
+
+/// Outcome of a single [`Residency::turn`] pass.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(super) struct TurnOutcome {
+    pub(super) answered_resize: bool,
+}
+
+/// RAII turn guard for [`Residency::turn`]: guarantees
+/// [`Residency::publish_liveness`] runs unconditionally on every exit path
+/// (normal completion, resize early return, or `resizing.is_pending()` early
+/// return) before `Held` releases residency's lock and settles `Owed`.
+struct TurnGuard<'a, 'c> {
+    held: Option<Held<'a>>,
+    copier: Option<&'c Copier>,
+}
+
+impl<'a, 'c> TurnGuard<'a, 'c> {
+    fn new(held: Held<'a>, copier: Option<&'c Copier>) -> Self {
+        Self { held: Some(held), copier }
+    }
+
+    fn give_way(mut self, residency: &'a Yielding<Residency>) -> Self {
+        let held = self.held.take().expect("TurnGuard live").give_way(residency);
+        Self { held: Some(held), copier: self.copier }
+    }
+}
+
+impl std::ops::Deref for TurnGuard<'_, '_> {
+    type Target = Residency;
+    fn deref(&self) -> &Residency {
+        self.held.as_deref().expect("TurnGuard live")
+    }
+}
+
+impl std::ops::DerefMut for TurnGuard<'_, '_> {
+    fn deref_mut(&mut self) -> &mut Residency {
+        self.held.as_deref_mut().expect("TurnGuard live")
+    }
+}
+
+impl Drop for TurnGuard<'_, '_> {
+    fn drop(&mut self) {
+        if let Some(held) = self.held.take() {
+            if !std::thread::panicking() && held.shared.life.ended().is_none() {
+                held.publish_liveness(self.copier);
+            }
+            drop(held);
+        }
+    }
 }
 
 /// One job of a turn, given what the turn did so far: whether the turn
@@ -252,6 +306,7 @@ impl Residency {
             if shared.life.stopping() {
                 return;
             }
+            let mut answered_resize = false;
             if shared.life.ended().is_none() {
                 // Prioritize pending `ResizeHandoff` requests over background
                 // telemetry feeding so bank shrinks never stall behind a
@@ -270,9 +325,9 @@ impl Residency {
                         copier.as_ref().and_then(|_| shared.telemetry.decoded_since(&mut decoded_steps))
                     }
                 };
-                Self::tend(&residency, copier.as_ref(), decoded.as_ref());
+                answered_resize = Self::tend(&residency, copier.as_ref(), decoded.as_ref()).answered_resize;
             }
-            if !shared.resizing.is_pending() {
+            if !shared.resizing.is_pending() && !answered_resize {
                 events.wait(seen);
             }
         }
@@ -316,26 +371,30 @@ impl Residency {
     /// moved published as it gives way, [`Held`], and nothing it decided
     /// left for a later job), so a pass
     /// between two serves from it as from one between turns.
-    fn tend(residency: &Yielding<Self>, copier: Option<&Copier>, decoded: Option<&MissCurve>) {
-        Self::turn(residency, &Self::TURN, copier, decoded);
+    fn tend(residency: &Yielding<Self>, copier: Option<&Copier>, decoded: Option<&MissCurve>) -> TurnOutcome {
+        Self::turn(residency, &Self::TURN, copier, decoded)
     }
 
     /// A turn of `jobs` ([`Self::tend`]'s, [`Self::TURN`]).
-    pub(super) fn turn(residency: &Yielding<Self>, jobs: &[Job<'_>], copier: Option<&Copier>, decoded: Option<&MissCurve>) {
-        let mut held = Held::new(residency.background(POISONED), true);
+    /// Uses [`TurnGuard`] so [`Self::publish_liveness`] runs unconditionally
+    /// on every exit path, including early returns from resize or pending
+    /// resize preemption.
+    pub(super) fn turn(residency: &Yielding<Self>, jobs: &[Job<'_>], copier: Option<&Copier>, decoded: Option<&MissCurve>) -> TurnOutcome {
+        let mut guard = TurnGuard::new(Held::new(residency.background(POISONED), true), copier);
         let mut turn = Turn::default();
         for job in jobs {
-            if !job(&mut held, &mut turn, copier, decoded) {
-                return;
+            if !job(&mut guard, &mut turn, copier, decoded) {
+                break;
             }
-            if held.shared.resizing.is_pending() {
-                return;
+            if guard.shared.resizing.is_pending() {
+                break;
             }
-            held = held.give_way(residency);
-            if held.shared.resizing.is_pending() {
-                return;
+            guard = guard.give_way(residency);
+            if guard.shared.resizing.is_pending() {
+                break;
             }
         }
+        TurnOutcome { answered_resize: turn.answered_resize }
     }
 
     /// A turn's jobs, in order ([`Self::tend`]).
@@ -469,6 +528,12 @@ impl Residency {
         told
     }
 
+    fn serve_resize(&mut self, asked: Asked, turn: &mut Turn, copier: Option<&Copier>) -> bool {
+        self.asked = self.resize(asked, copier);
+        turn.answered_resize = self.asked.is_none() && self.shared.life.ended().is_none();
+        false
+    }
+
     fn learn(&mut self, turn: &mut Turn, copier: Option<&Copier>, _: Option<&MissCurve>) -> bool {
         if let Some(reason) = self.shared.fault() {
             self.shared.end_serving(reason);
@@ -480,16 +545,14 @@ impl Residency {
         // runs `refill_tier`), so `plan_picked_micros` never stalls behind a
         // `learn_told` or `telemetry.judged` backlog.
         if let Some(asked) = self.asked.take().or_else(|| self.shared.resizing.asked().map(Asked::taken)) {
-            self.asked = self.resize(asked, copier);
-            return false;
+            return self.serve_resize(asked, turn, copier);
         }
         // Drain `Told` events (`DraftWindow`, `Began`, `Completed`) before
         // `promote` (`LinkMover::advance`) so Path 0 immediately sees fresh
         // draft windows and completed steps on the same turn.
         let told = self.learn_told();
         if let Some(asked) = self.shared.resizing.asked().map(Asked::taken) {
-            self.asked = self.resize(asked, copier);
-            return false;
+            return self.serve_resize(asked, turn, copier);
         }
         let joined = self.join();
         let retired = self.retire();
@@ -501,8 +564,7 @@ impl Residency {
         let chain_through = newly_landed.into_iter().any(|(layer, expert)| self.ledger.is_wanted(layer, expert));
         turn.changed = told || joined || retired || landed || refilled || chain_through;
         if let Some(asked) = self.shared.resizing.asked().map(Asked::taken) {
-            self.asked = self.resize(asked, copier);
-            return false;
+            return self.serve_resize(asked, turn, copier);
         }
         true
     }
@@ -535,7 +597,7 @@ impl Residency {
     }
 
     /// Drive Path 1 (`Prefetch`), cover reads, and prompt-group hastening.
-    fn hasten(&mut self, turn: &mut Turn, copier: Option<&Copier>, _: Option<&MissCurve>) -> bool {
+    fn hasten(&mut self, turn: &mut Turn, _: Option<&Copier>, _: Option<&MissCurve>) -> bool {
         let held = self.traffic_held();
         let paused = held || self.asked.is_some() || self.shared.resizing.is_pending();
         if paused {
@@ -555,13 +617,21 @@ impl Residency {
                 self.prefetch.hasten(staged);
             }
         }
+        true
+    }
+
+    /// Single authority for publishing residency's liveness state (host-tier
+    /// cover reading state and idle traffic-quiet state), notifying `events`
+    /// on any state transition. Invoked unconditionally by [`TurnGuard::drop`]
+    /// on every exit of [`Self::turn`].
+    pub(super) fn publish_liveness(&self, copier: Option<&Copier>) {
         self.shared.publish_cover(self.prefetch.covering(&self.core));
+        let held = self.traffic_held();
         let copying = copier.is_some_and(|copier| !copier.copies.idle());
         let quiet = held && !copying && !self.prefetch.outstanding();
         if self.shared.traffic_quiet.swap(quiet, std::sync::atomic::Ordering::AcqRel) != quiet {
             self.shared.events().notify();
         }
-        true
     }
 
     /// The words a run's encoding reads, only while no step runs; the

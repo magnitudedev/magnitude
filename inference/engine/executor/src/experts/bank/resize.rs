@@ -1327,6 +1327,15 @@ impl ExpertBank {
             },
         };
 
+        // Synchronous bank reclaim calls `hold_traffic()` + `wait_traffic_quiet()`,
+        // which requires `steps.idle()`. If a flight is active on the owner
+        // thread, waiting for steps to go idle would self-deadlock: refuse
+        // synchronously (`AtFloor`) so the caller falls back to logical yield /
+        // idle-boundary release.
+        if !self.watcher.shared().steps_idle() {
+            return Err(ReclaimError::AtFloor);
+        }
+
         // Serialize concurrent `reclaim` calls on `tier` outside the
         // commitment lock, then mark `commitment.reclaiming = true` so no
         // domain `grow`/`shrink`/`release_running` can start on `tier` while

@@ -249,6 +249,18 @@ impl Shared {
         self.telemetry.shadow_events().notify();
     }
 
+    /// Cleanly stop the watcher on teardown: single authority that marks
+    /// `life` stopping, ends transport prefill/decode rendezvous, closes
+    /// `resizing`, and wakes every event/shadow waiter so no caller can block
+    /// after shutdown.
+    pub(super) fn stop_serving(&self) {
+        self.life.stop();
+        self.transport.end_serving("watcher stopped".into());
+        self.resizing.wake();
+        self.events().notify();
+        self.telemetry.shadow_events().notify();
+    }
+
     /// Count a read step `sequence`'s decode request at `layer` named that
     /// landed (`Telemetry::landed`).
     pub(super) fn landed(

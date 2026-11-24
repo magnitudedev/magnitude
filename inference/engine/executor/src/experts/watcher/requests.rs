@@ -269,9 +269,12 @@ impl Requests {
     /// residency's lock is released, and the state it left is never served
     /// from again.
     pub(super) fn serve(self) {
+        const BACKOFF_AFTER_EMPTY_POLLS: u32 = 16;
+        const MAX_IDLE_POLL: Duration = Duration::from_micros(200);
         let events = self.shared.events().clone();
         let residency = self.residency.clone();
         let mut ended = Instant::now();
+        let mut empty_polls: u32 = 0;
         loop {
             let seen = events.seen();
             if self.shared.life.stopping() {
@@ -321,12 +324,28 @@ impl Requests {
             };
             ended = Instant::now();
             if progressed {
+                empty_polls = 0;
                 events.notify();
                 continue;
             }
             match polls {
-                true => events.wait_at_most(seen, IDLE),
-                false => events.wait(seen),
+                true => {
+                    if events.seen() != seen {
+                        empty_polls = 0;
+                    } else {
+                        empty_polls = empty_polls.saturating_add(1);
+                    }
+                    let rest = if empty_polls <= BACKOFF_AFTER_EMPTY_POLLS {
+                        IDLE
+                    } else {
+                        MAX_IDLE_POLL
+                    };
+                    events.wait_at_most(seen, rest);
+                }
+                false => {
+                    empty_polls = 0;
+                    events.wait(seen);
+                }
             }
         }
     }

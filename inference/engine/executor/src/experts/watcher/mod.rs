@@ -820,7 +820,11 @@ impl Shared {
     }
 
     pub(in crate::experts) fn is_ended(&self) -> bool {
-        self.life.ended().is_some()
+        self.life.ended().is_some() || self.life.stopping()
+    }
+
+    pub(in crate::experts) fn steps_idle(&self) -> bool {
+        self.steps.idle()
     }
 
     pub(in crate::experts) fn record_growth_refusal(&self) {
@@ -1595,9 +1599,7 @@ impl Drop for Watcher {
         );
         // The watchdog stops first.
         drop(self.watchdog.take());
-        self.shared.life.stop();
-        self.shared.events().notify();
-        self.shared.telemetry.shadow_events().notify();
+        self.shared.stop_serving();
         for thread in [self.requests.take(), self.residency.take(), self.shadows.take()]
             .into_iter()
             .flatten()

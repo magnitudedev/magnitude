@@ -884,6 +884,12 @@ fn place_completes_with_queued_promotion_and_unposted_write_back() {
     // banked expert queues a `Back { batch: None }`, then send `Ask::Place`
     // while the write-back is still unposted.
     eventually("bank refilled to 4 records", || shared.held()[0].len() == 4);
+    // Shrink host tier by 1 record (`8 -> 7 < EXPERTS`) so `tier.covers()` is
+    // false and `surrender_banked` frees host copies of banked experts before
+    // Case 2 tests write-back eviction.
+    let _ = shared
+        .shrink(Evicting::Landed, Candidates::one((TIER - 1) as usize, vec![(TIER - 1) as usize]), None)
+        .unwrap();
 
     let place_thread = {
         let mut state = residency::lock(&harness.watcher.state);
@@ -894,10 +900,21 @@ fn place_completes_with_queued_promotion_and_unposted_write_back() {
         };
         let core = &mut state.core;
         core.directory.price_write_backs(0, Some(wb));
+        core.steps.unbegun(|at| core.directory.surrender_banked(at));
+        core.directory.retire_graces(crate::experts::directory::Point::whole(u64::MAX, 0, u64::MAX), &core.steps);
         // Evict one banked record under residency lock: because write-back pays
         // and the host tier has room, `directory.evict` releases the record
         // into `Back { batch: None }` without submitting it to `Copier`.
-        let evicted = core.steps.unbegun_beside_frontier(|_, at| core.directory.evict(&[vec![0]], |_, _| None, |_| at.into(), at));
+        let victim_slot = (0..4)
+            .find(|&slot| {
+                matches!(
+                    core.directory.bank_record(0, slot),
+                    Some(crate::experts::records::Record::Held((0, expert)))
+                        if core.directory.located(0, expert) == crate::experts::host_records::Located::Lacked
+                )
+            })
+            .expect("at least one banked record lacks a host-tier copy after surrender_banked");
+        let evicted = core.steps.unbegun_beside_frontier(|_, at| core.directory.evict(&[vec![victim_slot]], |_, _| None, |_| at.into(), at));
         assert!(!evicted, "victim whose write-back pays holds its record until written back");
         assert!(
             !core.directory.backs_queued().is_empty(),
@@ -950,4 +967,140 @@ fn place_completes_with_queued_promotion_and_unposted_write_back() {
         assert_eq!(state.prefetch.outstanding(), before_outstanding);
         state.asked = None;
     }
+}
+
+/// Regression test: `Residency::turn()` exiting early via `learn()` ->
+/// `resize()` MUST still publish both `traffic_quiet` and `cover` via
+/// `TurnGuard::drop` -> `publish_liveness()` so concurrent
+/// `wait_traffic_quiet()` and `wait_covered()` callers never deadlock.
+#[test]
+fn resize_early_return_publishes_traffic_quiet_and_cover_liveness() {
+    let harness = lending("resize-publishes-liveness", EXPERTS, 4, 1, 3, DECODE, 7, Placer::Tier, true);
+    harness.promoted(0, &[0, 1, 2, 3]);
+    let shared = Arc::clone(harness.watcher.shared());
+
+    // Force `cover().reading == true` to simulate an active cover cancelled
+    // inside `Residency::resize()` before `turn()` returns early.
+    shared.publish_cover(true);
+    assert!(shared.cover().reading);
+
+    let _hold = shared.hold_traffic();
+    assert!(!shared.traffic_quiet(), "hold_traffic resets traffic_quiet to false");
+
+    // Issue `Ask::Place` while traffic is held: `Residency::learn()` serves
+    // `resize()` and returns early from `Residency::turn()`. `TurnGuard::drop`
+    // MUST still call `publish_liveness()` so `wait_traffic_quiet()` unblocks
+    // immediately (and `wait_covered()` unblocks whenever `cover_pending()` is
+    // false).
+    let device = cpu();
+    let words = |count: u64| cpu_words(&device, count, 0);
+    let flags = [words(EXPERTS as u64), words(EXPERTS as u64)];
+    let reads = harness
+        .layers
+        .iter()
+        .map(|_| words(crate::FlightDepth::PIPELINED.steps(PLACES) * EXPERTS as u64))
+        .collect::<Vec<_>>();
+    let placed = PlacedWords {
+        flags: flags.to_vec(),
+        layers: reads.iter().map(|reads| PlacedLayerWords { group_reads: reads.clone(), stride: EXPERTS }).collect(),
+    };
+    shared.place(placed).expect("Ask::Place completes");
+
+    let quiet_shared = shared.clone();
+    let quiet_thread = std::thread::spawn(move || quiet_shared.wait_traffic_quiet());
+    quiet_thread
+        .join()
+        .expect("wait_traffic_quiet thread did not panic")
+        .expect("wait_traffic_quiet must unblock after resize early return");
+    assert!(shared.traffic_quiet());
+    // Also verify `cover().reading` was published to `false` by `TurnGuard`
+    // once `cover_pending()` is false.
+    let cover_shared = shared.clone();
+    let cover_thread = std::thread::spawn(move || cover_shared.wait_covered());
+    cover_thread
+        .join()
+        .expect("wait_covered thread did not panic")
+        .expect("wait_covered must unblock after resize early return");
+    assert!(!shared.cover().reading);
+}
+
+/// Regression test: `Ask::Place` must drain `self.releasing` even when
+/// `copier == None` AND must transition permanently quarantined releasing
+/// slots into `Record::Quarantined` (out of `self.releasing` / `moving()`) in
+/// a single turn instead of deadlocking forever.
+#[test]
+fn resize_place_drains_releasing_slots_without_copier_and_with_quarantine() {
+    use crate::experts::transport::{DestSlot, SlotReuse};
+
+    let harness = promoting("place-no-copier-quarantine", 4, TIER);
+    harness.promoted(0, &[0, 1, 2, 3]);
+    let shared = Arc::clone(harness.watcher.shared());
+    let device = cpu();
+    let words = |count: u64| cpu_words(&device, count, 0);
+    let flags = [words(EXPERTS as u64), words(EXPERTS as u64)];
+    let reads = harness
+        .layers
+        .iter()
+        .map(|_| words(crate::FlightDepth::PIPELINED.steps(PLACES) * EXPERTS as u64))
+        .collect::<Vec<_>>();
+    let placed = PlacedWords {
+        flags: flags.to_vec(),
+        layers: reads.iter().map(|reads| PlacedLayerWords { group_reads: reads.clone(), stride: EXPERTS }).collect(),
+    };
+
+    // Under residency lock, release two held bank slots (no write-back,
+    // `back: None`), quarantine slot 1 in `ExpertTransport`, then run
+    // `Residency::resize(..., copier = None)` directly to assert single-turn
+    // termination without a copier.
+    let mut state = residency::lock(&harness.watcher.state);
+    let released = {
+        let core = &mut state.core;
+        core.steps
+            .unbegun_beside_frontier(|_, at| core.directory.replenish_demand_free(0, 2, at, |_| true))
+    };
+    assert!(released >= 1, "expected at least one stamped-unmap releasing slot");
+    assert!(state.core.directory.moving(), "releasing slot marks directory moving");
+
+    // Quarantine every currently releasing slot in transport so `can_reuse_slot`
+    // is permanently false.
+    let quarantined_slots: Vec<DestSlot> = (0..4)
+        .filter(|&slot| {
+            matches!(
+                state.core.directory.bank_record(0, slot),
+                Some(crate::experts::records::Record::Releasing { .. })
+            )
+        })
+        .map(|slot| DestSlot { group: 0, slot })
+        .collect();
+    assert!(!quarantined_slots.is_empty());
+    shared.transport.quarantine_slots(&quarantined_slots);
+    for &dest in &quarantined_slots {
+        assert!(!shared.transport.can_reuse_slot(dest));
+        shared.transport.with_slot_reuse_status(|check| {
+            assert_eq!(check(dest), SlotReuse::Quarantined);
+        });
+    }
+
+    // Run `Residency::resize` with `copier == None` for `Ask::Place`: MUST
+    // drain the quarantined releasing slot(s) into `Record::Quarantined` and
+    // answer `Ask::Place` in 1 step (returning `None`, not `Some(asked)`).
+    let asked = super::super::resize::Asked::taken((
+        super::super::resize::Ask::Place(placed),
+        std::time::Instant::now(),
+    ));
+    let still_waiting = state.resize(asked, None);
+    assert!(
+        still_waiting.is_none(),
+        "Ask::Place with copier == None and quarantined releasing slots must complete in 1 step"
+    );
+    assert!(!state.core.directory.moving(), "quarantined slots must not keep directory moving");
+    for dest in quarantined_slots {
+        assert_eq!(
+            state.core.directory.bank_record(dest.group, dest.slot),
+            Some(crate::experts::records::Record::Quarantined),
+            "quarantined releasing slot must transition to Record::Quarantined (never Free)"
+        );
+    }
+    // Discard the owed answer since we invoked `resize` directly in-lock.
+    let _ = std::mem::take(&mut state.owed);
 }

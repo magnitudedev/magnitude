@@ -433,6 +433,9 @@ impl Queue {
         let Some((volume, current)) = self.wants.get_mut(&id) else {
             return 0;
         };
+        if *current == want {
+            return 0;
+        }
         let link = self.links.get_mut(volume).expect("a queued request's link");
         let request = link.map(current).remove(&(*current, id)).expect("a queued request");
         *current = want;

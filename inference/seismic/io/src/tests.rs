@@ -650,24 +650,67 @@ fn a_dropped_handles_unstarted_pieces_never_read() {
     assert!(failed.iter().all(|(_, error)| matches!(**error, Error::Cancelled)));
 }
 
-/// A read that returns while another holds the queue's lock lands without
-/// waiting for it: the piece is left, and the lock's next holder ends it at
-/// the instant its read returned, before it looks at the queue.
+/// A read returning while a worker holds `engine.queue()` and enters
+/// `engine.work.wait(queue)` must never lose its wakeup: `read_returned`
+/// synchronizes on `engine.queue()` so the freed flight slot wakes the
+/// waiting worker to take the next queued piece.
 #[test]
-fn a_read_returning_under_a_held_lock_is_ended_by_its_next_holder() {
-    let engine = Engine::new();
-    let (mut queued, _state) = queued(1);
-    queued.pieces = [Piece { start: 0, end: LEAST_READ, parts: vec![Part { range: 0, from: 0, length: LEAST_READ as usize, sink: NonNull::dangling() }] }].into();
-    engine.queue().push(queued, Want::undated(0.));
-    let taken = engine.queue().take().expect("a piece to take");
-    let returned = taken.returned(Instant::now(), true);
+fn read_returned_never_loses_condvar_wakeup_under_contention() {
+    let engine = Arc::new(Engine::new());
+    let (mut first_req, _s1) = queued(1);
+    first_req.pieces = [Piece { start: 0, end: LEAST_READ, parts: vec![Part { range: 0, from: 0, length: LEAST_READ as usize, sink: NonNull::dangling() }] }].into();
+    let (mut second_req, _s2) = queued(1);
+    second_req.pieces = [Piece { start: LEAST_READ, end: 2 * LEAST_READ, parts: vec![Part { range: 0, from: 0, length: LEAST_READ as usize, sink: NonNull::dangling() }] }].into();
+
+    // Limit knee to 1 piece so second_req waits until first_req returns.
+    let mut shape = first_req.volume.shape;
+    shape.knee = LEAST_READ;
+    shape.due = LEAST_READ;
+    let volume = crate::disk::VolumeReads { id: first_req.volume.id, shape };
+    first_req.volume = volume.clone();
+    second_req.volume = volume;
+
+    {
+        let mut q = engine.queue();
+        q.push(first_req, Want::undated(0.));
+        q.push(second_req, Want::undated(1.));
+    }
+    let taken = engine.queue().take().expect("first piece to take");
+    assert!(engine.queue().take().is_none(), "second piece blocked while first is in flight");
+
+    // Hold `engine.queue()` as a worker about to sleep on `engine.work.wait`,
+    // spawn a thread calling `read_returned`, then enter `wait`.
     let held = engine.queue();
-    engine.read_returned(returned);
-    assert_eq!(held.links[&taken.volume.id].flight.ahead, LEAST_READ, "ended while another held the lock");
-    drop(held);
-    let queue = engine.queue();
-    let link = &queue.links[&taken.volume.id];
-    assert_eq!((link.flight.ahead, link.book.requests()), (0, 1), "the next holder ended it");
+    let returned = taken.returned(Instant::now(), true);
+    let engine_bg = engine.clone();
+    let bg = std::thread::spawn(move || {
+        engine_bg.read_returned(returned);
+    });
+    // Give the background thread a moment to contend on `engine.queue()` before
+    // we release it atomically inside `work.wait`.
+    std::thread::sleep(Duration::from_millis(10));
+    let (mut q, timed_out) = engine.work.wait_timeout(held, Duration::from_secs(2)).unwrap();
+    assert!(!timed_out.timed_out(), "read_returned lost its condvar wakeup");
+    let next = q.take().expect("second piece must be ready after wakeup");
+    assert_ne!(next.piece.start, taken.piece.start, "must take the remaining queued piece");
+    let link = &q.links[&taken.volume.id];
+    assert_eq!(link.book.requests(), 1);
+    drop(q);
+    bg.join().unwrap();
+}
+
+/// Repricing a queued request to its exact current `Want` must be a no-op
+/// returning 0 wakes (avoiding spurious worker wakeups and BTreeMap churn).
+#[test]
+fn noop_reprice_returns_zero_wakes() {
+    let mut queue = Queue::default();
+    let (mut req, _state) = queued(1);
+    req.pieces = [Piece { start: 0, end: LEAST_READ, parts: vec![Part { range: 0, from: 0, length: LEAST_READ as usize, sink: NonNull::dangling() }] }].into();
+    let want = Want::undated(1.0);
+    let (id, woken) = queue.push(req, want);
+    assert!(woken > 0, "initial push should admit the piece");
+    assert_eq!(queue.reprice(id, want), 0, "no-op reprice must not wake workers");
+    assert!(queue.reprice(id, Want::undated(0.5)) > 0, "actual priority change should still return room");
 }
 
 /// A request whose handle drops before it is waited for is cancelled or

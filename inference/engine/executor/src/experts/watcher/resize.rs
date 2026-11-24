@@ -445,6 +445,8 @@ impl Residency {
         self.retire();
         if let Some(copier) = copier {
             self.link.settle(&mut self.core, &mut self.ledger, &self.shared, copier, self.prefetch.reached());
+        } else {
+            super::link::LinkMover::drain_directory(&mut self.core, &self.shared, self.prefetch.reached());
         }
         let _ = self.prefetch.settle(&mut self.core.directory, &mut self.ledger, &self.shared);
         if self.shared.life.ended().is_some() {

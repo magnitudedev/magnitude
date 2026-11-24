@@ -182,9 +182,20 @@ impl LinkMover {
         // 4. Drain releases (including stamped-unmap releases without write-back),
         //    deferred demand landings, and landed staging slots no longer pinned
         //    by any joined demand consumer in `ExpertTransport`.
-        moved |= shared.transport.with_slot_reuse(|can_reuse| {
-            core.directory.drain_with(progress, &core.steps, |group, slot| {
-                can_reuse(crate::experts::transport::DestSlot { group, slot })
+        moved |= Self::drain_directory(core, shared, progress);
+        moved
+    }
+
+    /// Single authority for draining served bank releases (classifying
+    /// quarantined slots into `Record::Quarantined` so they never wedge
+    /// `directory.moving()`), deferred demand landings, and landed staging
+    /// slots. Runs both during `LinkMover::settle` and unconditionally in
+    /// `Residency::resize` even when `copier` is `None`.
+    pub(super) fn drain_directory(core: &mut Core, shared: &Shared, progress: Point) -> bool {
+        let mut moved = false;
+        moved |= shared.transport.with_slot_reuse_status(|slot_reuse| {
+            core.directory.drain_with_status(progress, &core.steps, |group, slot| {
+                slot_reuse(crate::experts::transport::DestSlot { group, slot })
             })
         });
         moved |= core.directory.drain_demand_landings(|group, slot| {

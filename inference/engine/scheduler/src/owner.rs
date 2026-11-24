@@ -3455,7 +3455,11 @@ impl<F: ProgramFamily> Service<F> {
         // `fits` sets no ceiling.
         let held = self.held_entries(Some(&round.members));
         while matches!(current, Err(DomainError::StateCeiling { .. })) {
-            self.prefix_cache.release_unspared(&held);
+            let released = self.prefix_cache.release_unspared(&held);
+            assert!(
+                released,
+                "invariant violated: StateCeiling returned with no unspared prefix entry left to release"
+            );
             current = self.fits(bindings, round, &group_);
         }
         let Relieved { mut current, mut pending } = self.relieve(bindings, current, true, |this, bindings| Ok(this.fits(bindings, round, &group_)))?;

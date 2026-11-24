@@ -2176,6 +2176,18 @@ impl Directory {
         self.bank.drain_with(progress, steps, can_reuse)
     }
 
+    /// [`Self::drain`], classifying each served releasing record with
+    /// [`crate::experts::transport::SlotReuse`] so quarantined slots
+    /// transition to `Record::Quarantined` instead of blocking `moving()`.
+    pub fn drain_with_status(
+        &mut self,
+        progress: Point,
+        steps: &Steps,
+        slot_reuse: impl FnMut(usize, usize) -> crate::experts::transport::SlotReuse,
+    ) -> bool {
+        self.bank.drain_with_status(progress, steps, slot_reuse)
+    }
+
     /// The promotions queued, which copy now ([`BankRecords::queued`]).
     pub fn queued(&self) -> Vec<(usize, BankRecord, Staged)> {
         self.bank.queued()

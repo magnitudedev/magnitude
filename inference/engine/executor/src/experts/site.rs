@@ -2174,18 +2174,16 @@ pub(crate) fn measure(
                 layer.payload(step, &entries, &values);
                 let began = std::time::Instant::now();
                 layer.slots.request(step, 0);
-                loop {
-                    match layer.ready(slot) {
-                        ready if ready == step => break,
-                        ready if ready == step | FAILED => {
-                            return Err(format!("the site failed its measurement of {experts} experts by {rows} rows"));
-                        }
-                        _ => std::hint::spin_loop(),
-                    }
-                }
+                wait_site_ready(
+                    || layer.ready(slot),
+                    step,
+                    || handle.is_stopped(),
+                    std::time::Duration::from_secs(30),
+                    || format!("the site measurement of {experts} experts by {rows} rows"),
+                )?;
                 times.push(began.elapsed().as_secs_f64());
             }
-            Ok((discarded, times))
+            Ok::<_, String>((discarded, times))
         })
         .filter(|measured| !matches!(measured, Ok((true, _))))
         .map(|measured| {
@@ -2193,6 +2191,43 @@ pub(crate) fn measure(
             magnitude_cost_model::Sample::of(&times).ok_or_else(|| format!("a site measurement of {} samples has no resolution", times.len()))
         })
         .collect()
+}
+
+/// Wait for a site measurement slot to report `step` (ready) or `step | FAILED`,
+/// bounded by `stopped()` and `timeout` so a stopped or stalled compute pool
+/// can never wedge the caller in an unbounded spin loop.
+fn wait_site_ready(
+    mut ready: impl FnMut() -> u64,
+    step: u64,
+    mut stopped: impl FnMut() -> bool,
+    timeout: std::time::Duration,
+    context: impl FnOnce() -> String,
+) -> Result<(), String> {
+    const SPIN_BEFORE_YIELD: u32 = 1024;
+    let began = std::time::Instant::now();
+    let mut spins: u32 = 0;
+    loop {
+        match ready() {
+            value if value == step => return Ok(()),
+            value if value == step | FAILED => {
+                return Err(format!("{} failed", context()));
+            }
+            _ => {}
+        }
+        if stopped() {
+            return Err(format!("{} aborted: compute pool stopped", context()));
+        }
+        if began.elapsed() >= timeout {
+            return Err(format!("{} timed out after {:?}", context(), timeout));
+        }
+        if spins < SPIN_BEFORE_YIELD {
+            spins += 1;
+            std::hint::spin_loop();
+        } else {
+            spins = 0;
+            std::thread::yield_now();
+        }
+    }
 }
 
 #[cfg(test)]

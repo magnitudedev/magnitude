@@ -458,12 +458,38 @@ impl Copies {
         Ok(vec![issuer, watch])
     }
 
+    /// Poison any unissued waiting prefill/stage batches when the issuer stops
+    /// so no `ExpertTransport::take_prefill_sync` or stage consumer can block
+    /// indefinitely after shutdown.
+    fn drain_stopped(&self) {
+        let remaining = {
+            let mut state = self.state();
+            std::mem::take(&mut state.waiting)
+        };
+        if let Some(transport) = &self.inner.transport {
+            for batch in remaining {
+                if let Some(prefill) = batch.prefill {
+                    transport.poison_prefill_generation(
+                        prefill.generation,
+                        prefill.sequence,
+                        "copy issuer stopped".to_string(),
+                    );
+                }
+                if let Some(id) = batch.stage_transfer {
+                    transport.fault_transfer(id, "copy issuer stopped".to_string());
+                }
+            }
+            transport.drain_deferred_syncs();
+        }
+    }
+
     /// The issuer ([`Self::start`]).
     fn issue(&self, stopped: &dyn Fn() -> bool) {
         let events = &self.inner.events;
         loop {
             let seen = events.seen();
             if stopped() {
+                self.drain_stopped();
                 return;
             }
             let (next, cancelled) = {

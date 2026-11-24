@@ -663,3 +663,43 @@ fn tiled_formats_multi_row_matches_single_row_bit_for_bit() {
         }
     }
 }
+
+/// `wait_site_ready` must terminate in a single poll when `stopped()` is true
+/// and within the bounded timeout when `ready()` never reaches `step`, rather
+/// than spinning forever.
+#[test]
+fn wait_site_ready_terminates_on_stop_and_timeout() {
+    let mut polls = 0u32;
+    let err = wait_site_ready(
+        || {
+            polls += 1;
+            0
+        },
+        1,
+        || true,
+        std::time::Duration::from_secs(5),
+        || "test measurement".to_string(),
+    )
+    .unwrap_err();
+    assert_eq!(polls, 1, "stopped pool must abort on the very first poll");
+    assert!(err.contains("compute pool stopped"), "unexpected error: {err}");
+
+    let err = wait_site_ready(
+        || 0,
+        1,
+        || false,
+        std::time::Duration::from_millis(5),
+        || "test measurement".to_string(),
+    )
+    .unwrap_err();
+    assert!(err.contains("timed out"), "unexpected error: {err}");
+
+    wait_site_ready(
+        || 42,
+        42,
+        || false,
+        std::time::Duration::from_secs(1),
+        || "test measurement".to_string(),
+    )
+    .expect("matching step returns Ok immediately");
+}

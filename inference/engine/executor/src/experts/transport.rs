@@ -1680,21 +1680,41 @@ impl Registry {
         }
     }
 
-    fn can_reuse_slot(&self, dest: DestSlot) -> bool {
+    fn slot_reuse(&self, dest: DestSlot) -> SlotReuse {
         if self.quarantined.contains(&dest) {
-            return false;
+            return SlotReuse::Quarantined;
         }
         if self.hit_pins.get(&dest).is_some_and(|pins| !pins.is_empty()) {
-            return false;
+            return SlotReuse::Pinned;
         }
         let Some(&id) = self.by_dest.get(&dest) else {
-            return true;
+            return SlotReuse::Reusable;
         };
         let Some(entry) = self.entries.get(&id) else {
-            return true;
+            return SlotReuse::Reusable;
         };
-        !entry.dma_pending() && entry.consumers.is_empty() && !entry.hint_owner_active
+        if !entry.dma_pending() && entry.consumers.is_empty() && !entry.hint_owner_active {
+            SlotReuse::Reusable
+        } else {
+            SlotReuse::Pinned
+        }
     }
+
+    fn can_reuse_slot(&self, dest: DestSlot) -> bool {
+        self.slot_reuse(dest) == SlotReuse::Reusable
+    }
+}
+
+/// Whether a destination slot can be reused by `Directory` / `BankRecords`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum SlotReuse {
+    /// Zero pending DMA, zero consumers, hint owner gone, not quarantined.
+    Reusable,
+    /// Temporarily pinned by an in-flight DMA, consumer lease, or hit pin.
+    Pinned,
+    /// Permanently quarantined after an uncertain/faulted transfer: never
+    /// reusable or evictable, and never blocks `BankRecords::moving()`.
+    Quarantined,
 }
 
 /// Unique monotonic identifier for one generation-scoped `ScratchRing` +
@@ -1781,6 +1801,8 @@ pub(crate) struct ExpertTransport {
     /// Number of active `land_decode_misses` flights currently in flight
     /// between `DecodeFront` and `DecodeBack` release/completion.
     demand_in_flight: AtomicUsize,
+    /// Lock-free mirror of `prefill.ended.is_some()` set by `end_serving`.
+    ended: std::sync::atomic::AtomicBool,
     /// Diagnostic counters (lock-free).
     transfers_issued: AtomicU64,
     demand_joins: AtomicU64,
@@ -1810,6 +1832,7 @@ impl ExpertTransport {
             pass_tracker: Mutex::default(),
             decode: None,
             demand_in_flight: AtomicUsize::new(0),
+            ended: std::sync::atomic::AtomicBool::new(false),
             transfers_issued: AtomicU64::new(0),
             demand_joins: AtomicU64::new(0),
             prefill_dma_batches: AtomicU64::new(0),
@@ -1826,6 +1849,7 @@ impl ExpertTransport {
             pass_tracker: Mutex::default(),
             decode,
             demand_in_flight: AtomicUsize::new(0),
+            ended: std::sync::atomic::AtomicBool::new(false),
             transfers_issued: AtomicU64::new(0),
             demand_joins: AtomicU64::new(0),
             prefill_dma_batches: AtomicU64::new(0),
@@ -2496,6 +2520,21 @@ impl ExpertTransport {
         f(&mut check)
     }
 
+    /// Evaluate `f` with a batch [`SlotReuse`] classifier under a single
+    /// `registry` mutex acquisition so `Directory::drain_with_status` can
+    /// distinguish permanently quarantined slots from temporarily pinned ones.
+    pub(crate) fn with_slot_reuse_status<R>(&self, f: impl FnOnce(&mut dyn FnMut(DestSlot) -> SlotReuse) -> R) -> R {
+        let reg = self.registry.lock().expect("transport registry");
+        let mut check = |dest: DestSlot| reg.slot_reuse(dest);
+        f(&mut check)
+    }
+
+    /// Whether [`Self::end_serving`] has been called (fatal fault or clean
+    /// watcher stop).
+    pub(crate) fn is_ended(&self) -> bool {
+        self.ended.load(Ordering::Acquire)
+    }
+
     /// Detach a single demand consumer without cancelling pending DMA or
     /// disturbing any other consumer on the same transfer.
     fn detach_consumer(&self, id: TransferId, consumer_id: u64) {
@@ -3041,7 +3080,7 @@ impl ExpertTransport {
 
                 loop {
                     let seen = dma.events.seen();
-                    let finished = file.answered(sequence, 0) || is_serving_ended();
+                    let finished = file.answered(sequence, 0) || is_serving_ended() || self.is_ended();
                     let ready = dma.drain_file_ready(layer, sequence);
                     if !ready.is_empty() {
                         apply_entries(
@@ -3170,6 +3209,7 @@ impl ExpertTransport {
     /// Called by `Shared::end_serving` on fatal watcher/device failure so no
     /// prefill waiter can ever hang.
     pub(crate) fn end_serving(&self, reason: String) {
+        self.ended.store(true, Ordering::Release);
         let mut prefill = self.prefill.lock().expect("transport prefill rendezvous");
         if prefill.ended.is_none() {
             prefill.ended = Some(reason);
@@ -5653,5 +5693,36 @@ mod tests {
         assert!(transport.can_reuse_slot(DestSlot { group: 0, slot: 0 }));
         assert!(transport.can_reuse_slot(DestSlot { group: 0, slot: 1 }));
         assert!(transport.source_slot_free(slot2));
+    }
+
+    /// Regression test: `end_serving()` (invoked by both `Shared::end_serving`
+    /// and clean `Shared::stop_serving`) must unblock concurrent
+    /// `take_prefill_sync` and `take_prefill_plan` waiters and flip
+    /// `is_ended()` to `true` so Phase B decode DMA exits promptly.
+    #[test]
+    fn end_serving_unblocks_prefill_waiters_and_sets_is_ended() {
+        let transport = ExpertTransport::new_registry_only();
+        assert!(!transport.is_ended());
+
+        let t1 = transport.clone();
+        let sync_waiter = std::thread::spawn(move || t1.take_prefill_sync(0, 7, 0));
+        let t2 = transport.clone();
+        let plan_waiter = std::thread::spawn(move || t2.take_prefill_plan(0, 7, 0));
+
+        // Let both waiters enter `prefill_ready.wait(...)`.
+        std::thread::sleep(std::time::Duration::from_millis(10));
+        transport.end_serving("watcher stopped".to_string());
+        assert!(transport.is_ended());
+
+        let sync_err = match sync_waiter.join().unwrap() {
+            Ok(_) => panic!("take_prefill_sync must fail after end_serving"),
+            Err(err) => err,
+        };
+        let plan_err = match plan_waiter.join().unwrap() {
+            Ok(_) => panic!("take_prefill_plan must fail after end_serving"),
+            Err(err) => err,
+        };
+        assert_eq!(sync_err, "watcher stopped");
+        assert_eq!(plan_err, "watcher stopped");
     }
 }

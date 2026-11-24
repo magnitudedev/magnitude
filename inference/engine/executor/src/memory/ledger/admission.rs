@@ -2,13 +2,14 @@
 //! here: a claim short of memory, a request's growth included, is relieved
 //! only by a plan ([`super::relief`]).
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::num::NonZeroU64;
 use std::sync::{Arc, Weak};
 
 use crate::operation::RequestId;
 
 use super::estimate::Read;
+use super::relief::ReliefBoundary;
 use super::state::{EntryId, State};
 use super::view::Ledger;
 use super::vocabulary::{CacheKind, CommittedKind, Holding, PoolClass, Value};
@@ -310,12 +311,16 @@ pub(super) struct AdmitPolicy<F> {
 
 impl State {
     /// Collect eligible cache and pool candidates in rank order `(value, kind, id)`.
+    /// At [`ReliefBoundary::InFlight`], [`Reclaim::Backed`] entries are
+    /// excluded by construction so synchronous idle-only reclaimers are never
+    /// invoked on the owner thread while a flight is active.
     fn reclaim_candidates(
         &self,
         own_pool: Option<PoolClass>,
         of: &impl Fn(CacheKind) -> bool,
         need_own_pool_flush: bool,
         exhausted: &BTreeSet<EntryId>,
+        boundary: ReliefBoundary,
     ) -> Vec<Candidate> {
         let mut candidates: Vec<Candidate> = self
             .held
@@ -333,6 +338,9 @@ impl State {
                 };
                 let reclaim = match self.reclaim.get(id) {
                     Some(Reclaim::Backed(weak)) => {
+                        if boundary == ReliefBoundary::InFlight {
+                            return None;
+                        }
                         let live = (!exhausted.contains(id)).then(|| weak.upgrade()).flatten()?;
                         CandidateReclaim::Backed(live)
                     }
@@ -387,6 +395,7 @@ impl State {
         policy: &AdmitPolicy<F>,
         exhausted: &BTreeSet<EntryId>,
         reclaimed: u64,
+        boundary: ReliefBoundary,
     ) -> ReclaimStep<Result<EntryId, Short>> {
         let read = self.reading(store, policy.at);
         let estimate = self.estimate_at(read);
@@ -435,7 +444,7 @@ impl State {
         } else {
             0
         };
-        let candidates = self.reclaim_candidates(own_pool, &policy.of, need_alloc > 0, exhausted);
+        let candidates = self.reclaim_candidates(own_pool, &policy.of, need_alloc > 0, exhausted, boundary);
         let reclaimable_room: u64 = candidates.iter().map(|c| c.bytes).sum();
         let reclaimable_shed: u64 = candidates.iter().map(|c| c.releasing).sum::<u64>().min(estimate.shed());
         let max_reclaimable_held = reclaimable_room.saturating_add(reclaimable_shed);
@@ -497,28 +506,52 @@ impl Ledger {
     }
 
     /// The single reclaim loop shared by [`Self::admit_or_reclaim`],
-    /// [`Self::admit_units`], and [`Self::reclaim_and_draw`].
-    fn reclaim_until<T>(&self, mut step: impl FnMut(&mut State, &BTreeSet<EntryId>, u64) -> ReclaimStep<T>) -> T {
+    /// [`Self::reclaim_backed`], [`Self::admit_units`], and
+    /// [`Self::reclaim_and_draw`].
+    ///
+    /// Enforces two termination invariants by construction:
+    /// 1. `boundary` gates [`Reclaim::Backed`] candidate selection so
+    ///    [`ReliefBoundary::InFlight`] never invokes blocking idle-only
+    ///    reclaimers.
+    /// 2. Strict monotonic progress per `EntryId`: if invoking `reclaimer` on
+    ///    `id` fails to strictly decrease `need` on the next step for `id`,
+    ///    `id` is marked exhausted immediately so no misbehaving or stalled
+    ///    reclaimer can spin the loop unboundedly.
+    fn reclaim_until<T>(
+        &self,
+        boundary: ReliefBoundary,
+        mut step: impl FnMut(&mut State, &BTreeSet<EntryId>, u64, ReliefBoundary) -> ReclaimStep<T>,
+    ) -> T {
         let mut exhausted: BTreeSet<EntryId> = BTreeSet::new();
+        let mut last_need: BTreeMap<EntryId, u64> = BTreeMap::new();
         let mut reclaimed: u64 = 0;
         loop {
             let next = {
                 let mut state = self.state();
-                step(&mut state, &exhausted, reclaimed)
+                step(&mut state, &exhausted, reclaimed, boundary)
             };
             match next {
                 ReclaimStep::Done(done) => return done,
-                ReclaimStep::Reclaim { id, reclaimer, need } => match reclaimer.reclaim(need) {
-                    Ok(0) | Err(ReclaimError::AtFloor) => {
+                ReclaimStep::Reclaim { id, reclaimer, need } => {
+                    if boundary == ReliefBoundary::InFlight
+                        || last_need.get(&id).is_some_and(|&prev| need >= prev)
+                    {
                         exhausted.insert(id);
+                        continue;
                     }
-                    Ok(freed) => {
-                        reclaimed = reclaimed.saturating_add(freed);
+                    last_need.insert(id, need);
+                    match reclaimer.reclaim(need) {
+                        Ok(0) | Err(ReclaimError::AtFloor) => {
+                            exhausted.insert(id);
+                        }
+                        Ok(freed) => {
+                            reclaimed = reclaimed.saturating_add(freed);
+                        }
+                        Err(ReclaimError::Invariant(reason)) => {
+                            panic!("invariant violated: cache reclaim failed for entry {id} (need {need} bytes): {reason}");
+                        }
                     }
-                    Err(ReclaimError::Invariant(reason)) => {
-                        panic!("invariant violated: cache reclaim failed for entry {id} (need {need} bytes): {reason}");
-                    }
-                },
+                }
             }
         }
     }
@@ -529,23 +562,27 @@ impl Ledger {
     /// returns [`Short`] for a real shortfall below floor), then inserts the
     /// committed entry under the lock.
     pub(super) fn admit_or_reclaim<F: Fn(CacheKind) -> bool>(&self, policy: AdmitPolicy<F>) -> Result<EntryId, Short> {
-        self.reclaim_until(|state, exhausted, reclaimed| state.try_admit(&self.store.identity, &policy, exhausted, reclaimed))
+        self.reclaim_until(ReliefBoundary::Idle, |state, exhausted, reclaimed, boundary| {
+            state.try_admit(&self.store.identity, &policy, exhausted, reclaimed, boundary)
+        })
     }
 
     /// Synchronously reclaim up to `need` bytes of backed `Spare` / `Bank`
     /// cache outside the ledger mutex (e.g. when a physical device allocation
     /// hits a capacity refusal despite the ledger's last reading). Returns the
-    /// total bytes physically returned by reclaimers.
-    pub fn reclaim_backed(&self, need: u64) -> u64 {
-        if need == 0 {
+    /// total bytes physically returned by reclaimers. At
+    /// [`ReliefBoundary::InFlight`], returns `0` immediately without invoking
+    /// blocking backed reclaimers.
+    pub fn reclaim_backed(&self, need: u64, boundary: ReliefBoundary) -> u64 {
+        if need == 0 || boundary == ReliefBoundary::InFlight {
             return 0;
         }
         let yielding = |ck: CacheKind| matches!(ck, CacheKind::Spare | CacheKind::Table | CacheKind::Bank);
-        self.reclaim_until(|state, exhausted, reclaimed| {
+        self.reclaim_until(boundary, |state, exhausted, reclaimed, boundary| {
             if reclaimed >= need {
                 return ReclaimStep::Done(reclaimed);
             }
-            let candidates = state.reclaim_candidates(None, &yielding, false, exhausted);
+            let candidates = state.reclaim_candidates(None, &yielding, false, exhausted, boundary);
             if let Some((id, reclaimer)) = candidates.into_iter().find_map(|c| match c.reclaim {
                 CandidateReclaim::Backed(reclaimer) => Some((c.id, reclaimer)),
                 CandidateReclaim::Unbacked => None,
@@ -562,12 +599,12 @@ impl Ledger {
     pub(super) fn admit_units(&self, kind: CommittedKind, unit: NonZeroU64, most: u64) -> (EntryId, u64) {
         assert!(!matches!(kind, CommittedKind::Request(_)), "a request's state is reserved by its own path, never in units");
         let yielding = |ck: CacheKind| matches!(ck, CacheKind::Spare | CacheKind::GraphSlots | CacheKind::Table | CacheKind::Bank);
-        self.reclaim_until(|state, exhausted, reclaimed| {
+        self.reclaim_until(ReliefBoundary::Idle, |state, exhausted, reclaimed, boundary| {
             let read = state.reading(&self.store.identity, None);
             let estimate = state.estimate_at(read);
             let holding = Holding::Committed(kind);
             let free = state.free_for(read, holding, most).saturating_add(reclaimed).min(state.free(read, most));
-            let candidates = state.reclaim_candidates(None, &yielding, false, exhausted);
+            let candidates = state.reclaim_candidates(None, &yielding, false, exhausted, boundary);
             let reclaimable_room: u64 = candidates.iter().map(|c| c.bytes).sum();
             let reclaimable_shed: u64 = candidates.iter().map(|c| c.releasing).sum::<u64>().min(estimate.shed());
             let held_overhang = estimate.held_now().saturating_sub(estimate.budget());
@@ -613,7 +650,7 @@ impl Ledger {
     /// [`Self::reclaim_until`] iteration, so `slot` is never read across a
     /// lock drop.
     pub(super) fn reclaim_and_draw(&self, slot: EntryId, into: Option<EntryId>, kind: CommittedKind, bytes: u64) -> Result<EntryId, Short> {
-        self.reclaim_until(|state, exhausted, reclaimed| {
+        self.reclaim_until(ReliefBoundary::Idle, |state, exhausted, reclaimed, boundary| {
             let held = state.entry(slot).bytes;
             let drawn = held.min(bytes);
             let rem = bytes - drawn;
@@ -628,7 +665,7 @@ impl Ledger {
                     within_boundary: true,
                     allow_guarantee: false,
                 };
-                match state.try_admit(&self.store.identity, &policy, exhausted, reclaimed) {
+                match state.try_admit(&self.store.identity, &policy, exhausted, reclaimed, boundary) {
                     ReclaimStep::Reclaim { id, reclaimer, need } => {
                         return ReclaimStep::Reclaim { id, reclaimer, need };
                     }

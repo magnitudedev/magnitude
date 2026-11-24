@@ -764,6 +764,11 @@ impl Compute {
         self.inner.site.served()
     }
 
+    /// Whether the compute pool has been stopped.
+    pub(in crate::experts) fn is_stopped(&self) -> bool {
+        self.inner.stop.load(Ordering::Acquire)
+    }
+
     /// Whether the site has a request issued and not yet answered.
     #[cfg(test)]
     pub(crate) fn site_busy(&self) -> bool {

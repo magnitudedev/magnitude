@@ -1145,7 +1145,13 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
                         }
                         if !reclaimed_on_capacity && on_device > 0 {
                             reclaimed_on_capacity = true;
-                            if self.resources.ledgers().device().reclaim_backed(on_device) > 0 {
+                            if self
+                                .resources
+                                .ledgers()
+                                .device()
+                                .reclaim_backed(on_device, crate::memory::ledger::ReliefBoundary::Idle)
+                                > 0
+                            {
                                 continue;
                             }
                         }

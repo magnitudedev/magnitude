@@ -121,6 +121,10 @@ pub(super) enum Record {
     /// A hole: the bank holds no storage for it, so nothing is placed in it
     /// until a growth backs it again.
     Absent,
+    /// Permanently quarantined after an uncertain/faulted transport transfer:
+    /// never `Free`, never `Held`, never evictable, and never listed in
+    /// `self.releasing` (so it cannot deadlock `moving()` / `Ask::Place`).
+    Quarantined,
 }
 
 /// A release's write-back of its expert into the host tier, the reverse
@@ -804,18 +808,54 @@ impl BankRecords {
         steps: &super::watcher::Steps,
         mut can_reuse: impl FnMut(usize, usize) -> bool,
     ) -> bool {
+        self.drain_with_status(progress, steps, |group, record| {
+            if can_reuse(group, record) {
+                super::transport::SlotReuse::Reusable
+            } else {
+                super::transport::SlotReuse::Pinned
+            }
+        })
+    }
+
+    /// [`Self::drain`], classifying each served, write-back-free releasing
+    /// record with [`super::transport::SlotReuse`]:
+    /// - `Reusable` -> `Record::Free`
+    /// - `Quarantined` -> `Record::Quarantined` (removed from `self.releasing`
+    ///   so a quarantined slot can never permanently block `moving()` or
+    ///   `Ask::Place`)
+    /// - `Pinned` -> stays in `self.releasing` until unpinned.
+    pub fn drain_with_status(
+        &mut self,
+        progress: Point,
+        steps: &super::watcher::Steps,
+        mut slot_reuse: impl FnMut(usize, usize) -> super::transport::SlotReuse,
+    ) -> bool {
         let mut drained_any = self.drain_pending(steps.frontier());
-        let (drained, releasing) = std::mem::take(&mut self.releasing).into_iter().partition::<Vec<_>, _>(|&(group, record)| {
+        let mut drained_free = Vec::new();
+        let mut drained_quarantined = Vec::new();
+        let mut releasing = Vec::new();
+        for (group, record) in std::mem::take(&mut self.releasing) {
             let Record::Releasing { layer, from, until, back } = self.groups[group].contents[record] else {
                 panic!("record {record} of group {group} is listed releasing");
             };
-            back.is_none() && steps.served(from, until, layer, progress) && can_reuse(group, record)
-        });
+            if back.is_none() && steps.served(from, until, layer, progress) {
+                match slot_reuse(group, record) {
+                    super::transport::SlotReuse::Reusable => drained_free.push((group, record)),
+                    super::transport::SlotReuse::Quarantined => drained_quarantined.push((group, record)),
+                    super::transport::SlotReuse::Pinned => releasing.push((group, record)),
+                }
+            } else {
+                releasing.push((group, record));
+            }
+        }
         self.releasing = releasing;
-        for &(group, record) in &drained {
+        for &(group, record) in &drained_free {
             self.set(group, record, Record::Free);
         }
-        drained_any |= !drained.is_empty();
+        for &(group, record) in &drained_quarantined {
+            self.set(group, record, Record::Quarantined);
+        }
+        drained_any |= !drained_free.is_empty() || !drained_quarantined.is_empty();
         drained_any
     }
 
