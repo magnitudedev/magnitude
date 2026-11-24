@@ -2089,7 +2089,6 @@ fn async_dma_delayed_layer_reader_preserves_window_table_and_held_bank_payload_a
     // ScratchRing while Layer 0's GPU reader is still open!
     let layers: Vec<Layer> = (0..LAYERS)
         .map(|index| {
-            let ahead = crate::planning::HINT_LEADS.min((LAYERS - 1 - index) as u64);
             let round_bounds = ListBounds { from: CONVEYOR_RECS, to: EXP as u64, lent: 0 };
             Layer {
                 group: 0,

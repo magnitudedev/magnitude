@@ -4388,7 +4388,7 @@ mod served_tests {
                 row_experts: vec![vec![(0, 0), (1, 1), (2, 2), (3, 3)]],
                 keys,
                 counted: None,
-                clock: None,
+                clock: crate::experts::horizon::Tokens::default(),
             }),
             verify_verdicts: None,
             ended: None,
@@ -4407,8 +4407,8 @@ mod served_tests {
         assert_eq!(*group, 5);
         assert_eq!(read.experts, vec![0, 1], "rejected experts 2 and 3 must be excluded");
         assert_eq!(read.choices, 2);
-        let Fed::Decode { keys: Some(filtered_keys), .. } = fed else {
-            panic!("expected Fed::Decode with filtered StepKeys");
+        let Fed::TargetDecode { keys: Some(filtered_keys), .. } = fed else {
+            panic!("expected Fed::TargetDecode with filtered StepKeys");
         };
         assert_eq!(filtered_keys.depths, vec![0, 1]);
         assert_eq!(filtered_keys.rows(0).row_count(), 2);
@@ -4429,7 +4429,7 @@ mod served_tests {
                     layers: vec![vec![1.0, 0.0, 0.0, 1.0]],
                 }),
                 counted: None,
-                clock: None,
+                clock: crate::experts::horizon::Tokens::default(),
             }),
             verify_verdicts: Some((6, vec![(req, super::super::VerifyOutcome::Discarded)], true)),
             ended: None,

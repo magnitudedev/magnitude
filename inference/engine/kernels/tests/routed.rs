@@ -11666,14 +11666,19 @@ fn routed_down_project_and_sited_join_split_bit_exact_with_whole_boundary_cases(
 
     let flight = 2usize;
     let sw = 8usize;
-    let seq = 1i32;
+    let seq = 1u64;
     let mut step = vec![0i32; magnitude_kernels::constants::STEP_WORDS as usize];
-    step[magnitude_kernels::constants::STEP_SEQUENCE as usize] = seq;
+    step[magnitude_kernels::constants::STEP_LOW as usize] = seq as u32 as i32;
+    step[magnitude_kernels::constants::STEP_HIGH as usize] = (seq >> 32) as u32 as i32;
     let mut site = vec![0i32; flight * sw];
     let slot = (seq as usize) % flight;
-    // Mark site slot answered with matching sequence for CPU-sited rows.
-    site[slot * sw + (magnitude_kernels::constants::SLOT_ANSWER as usize)] = 1;
-    site[slot * sw + (magnitude_kernels::constants::SLOT_SEQUENCE as usize)] = seq;
+    // Mark site slot requested and answered with matching sequence for CPU-sited rows.
+    let req = slot * sw + (magnitude_kernels::constants::SLOT_REQUEST as usize);
+    let ans = slot * sw + (magnitude_kernels::constants::SLOT_ANSWER as usize);
+    site[req] = seq as u32 as i32;
+    site[req + 1] = (seq >> 32) as u32 as i32;
+    site[ans] = seq as u32 as i32;
+    site[ans + 1] = (seq >> 32) as u32 as i32;
     let verify_rows = magnitude_kernels::constants::VERIFY_ROWS as usize;
     let mut site_output = vec![0.0f32; flight * verify_rows * h];
     for r in 0..m {

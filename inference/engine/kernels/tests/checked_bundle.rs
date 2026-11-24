@@ -11,20 +11,19 @@ use std::time::Instant;
 
 mod declared;
 
-static BUNDLE: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/kernels.seismicbundle"));
-
 #[test]
 fn embedded_kernel_bundle_round_trips_byte_identically() {
+    let bundle = magnitude_kernels::bundle_bytes();
     let started = Instant::now();
-    let decoded = decode_checked_bundle(BUNDLE).expect("the embedded kernel bundle decodes");
+    let decoded = decode_checked_bundle(bundle).expect("the embedded kernel bundle decodes");
     eprintln!(
         "kernel bundle: {} bytes, {} entries, decoded in {:?}",
-        BUNDLE.len(),
+        bundle.len(),
         decoded.entries().len(),
         started.elapsed()
     );
     assert!(
-        encode_checked_bundle(&decoded) == BUNDLE,
+        encode_checked_bundle(&decoded) == bundle,
         "decode, encode is not the identity"
     );
 }
@@ -33,9 +32,10 @@ fn embedded_kernel_bundle_round_trips_byte_identically() {
 #[test]
 #[ignore]
 fn embedded_kernel_bundle_matches_its_checked_sources() {
-    let decoded = decode_checked_bundle(BUNDLE).expect("the embedded kernel bundle decodes");
+    let bundle = magnitude_kernels::bundle_bytes();
+    let decoded = decode_checked_bundle(bundle).expect("the embedded kernel bundle decodes");
     let started = Instant::now();
-    let checked = check_bundle_sources(BUNDLE).expect("the kernel bundle's sources check");
+    let checked = check_bundle_sources(bundle).expect("the kernel bundle's sources check");
     eprintln!("kernel bundle sources checked in {:?}", started.elapsed());
     assert_eq!(decoded.semantic_hash(), checked.semantic_hash());
     assert_eq!(decoded.entries().len(), checked.entries().len());
@@ -88,7 +88,8 @@ fn launches_chosen_by_rows_up_to_a_draft_verification_are_row_classes() {
     // PROJECTION_FOR_SEVERAL_ROWS, Vulkan's PROJECTION_GEMV_MAX_M): a wider
     // verification has no class there. The bodies assert the same bound.
     assert!(verify <= 8, "VERIFY_ROWS {verify} exceeds the 8 rows the verify bodies serve");
-    let module = decode_checked_bundle(BUNDLE).expect("the embedded kernel bundle decodes");
+    let module = decode_checked_bundle(magnitude_kernels::bundle_bytes())
+        .expect("the embedded kernel bundle decodes");
     let (mut classes, mut offenders) = (0, Vec::new());
     for entry in module.entries() {
         for backend in [BackendName::Metal, BackendName::Cuda, BackendName::Vulkan, BackendName::Cpu] {

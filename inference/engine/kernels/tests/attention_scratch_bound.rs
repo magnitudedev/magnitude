@@ -10,8 +10,6 @@ use seismic_lang::registry::{self, BackendName};
 use seismic_lang::types::DType;
 use std::time::{Duration, Instant};
 
-static BUNDLE: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/kernels.seismicbundle"));
-
 /// DeepSeek V4.1 Flash's window attention by the family's static names
 /// (`AttentionGeometry::mix_statics`): 64 query heads over one key/value
 /// head 512 wide (32 adjacent trailing rotary pairs, 448 other dims), one
@@ -63,7 +61,8 @@ fn v41_statics(entry: &str) -> Vec<(&'static str, u64)> {
 
 #[test]
 fn metal_attention_scratch_bounds_at_deepseek_v41_take_a_moment() {
-    let module = decode_checked_bundle(BUNDLE).expect("the embedded kernel bundle decodes");
+    let module = decode_checked_bundle(magnitude_kernels::bundle_bytes())
+        .expect("the embedded kernel bundle decodes");
     let mut admitted = Vec::new();
     let mut spent = Duration::ZERO;
     for entry in module.entries() {

@@ -702,7 +702,7 @@ mod tests {
     ///   completes and all readers release.
     #[test]
     fn delayed_fill_overlapping_readers_and_cancellation_slot_reuse_safety() {
-        use crate::experts::transport::{DestSlot, ExpertKey, ExpertTransport, SourceRef};
+        use crate::experts::transport::{DestSlot, ExpertKey, ExpertTransport, ScratchGenId, SourceRef};
 
         let transport = ExpertTransport::new_registry_only();
 
@@ -711,10 +711,11 @@ mod tests {
         let producer_transport = Arc::clone(&transport);
         let producer = std::thread::spawn(move || {
             std::thread::sleep(std::time::Duration::from_millis(15));
-            producer_transport.publish_prefill_sync(2, 10, 0, None);
+            producer_transport.publish_prefill_sync(2, 10, 0, ScratchGenId(1), None);
         });
         let got = transport.take_prefill_sync(2, 10, 0).expect("delayed prefill sync");
-        assert!(got.is_none());
+        assert_eq!(got.generation, ScratchGenId(1));
+        assert!(got.sync.is_none());
         producer.join().unwrap();
 
         // 2. Overlapping readers prohibit slot reuse until final reader retires,

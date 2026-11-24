@@ -3582,12 +3582,14 @@ mod composition_tests {
         let backend = BackendName::Cuda;
         let layout = crate::resident_layout(crate::ExecutionPath::Native, backend);
         let method = crate::PlannedMethod::Mtp {
-            proposals: std::num::NonZeroU8::new(2).unwrap(),
+            greedy_proposals: 2,
+            sampled_proposals: 2,
+            widths: crate::DraftWidths::Adaptive,
         };
-        let substrate = crate::planning::bank::BankSubstrate {
+        let substrate = crate::planning::BankSubstrate {
             backend,
             allocations: seismic::NativeAllocations::EXACT,
-            host: crate::planning::bank::HostTier::Linked,
+            host: crate::planning::HostTier::Linked,
             has_side_queue: true,
         };
         let load = ModelLoadPlan::derive(
@@ -3611,18 +3613,24 @@ mod composition_tests {
         assert!(load.fronts(), "MTP load enables fronts");
 
         let plan = load
-            .program_plan(&definition, crate::KvCodec::Dense)
+            .program_plan(&definition, magnitude_state::KvCodec::Dense)
             .unwrap();
         let head_plan = plan.head().unwrap();
         assert!(head_plan.has_bank(), "HeadSublayer is banked");
         let binding = head_plan.blocks()[0];
         let head = definition.head.as_ref().unwrap();
         let head_block = CausalHeadBlock::of(head, &head.blocks[0]).unwrap();
-        let state = crate::StateResourcePlan::derive(
+        let state = crate::ResourcePlanner::state_plan(
             &definition,
             &load,
-            crate::KvCodec::Dense,
+            method,
+            magnitude_state::KvCodec::Dense,
             crate::planning::fixtures::LIMITS,
+            crate::ResourceCapacity {
+                domain_bytes: 512 * 1024 * 1024,
+                tensor_operations: crate::TensorOperations::Absent,
+                allocations: seismic::NativeAllocations::EXACT,
+            },
         )
         .unwrap();
         let geometry = state.head_state().unwrap().head_geometry().unwrap();

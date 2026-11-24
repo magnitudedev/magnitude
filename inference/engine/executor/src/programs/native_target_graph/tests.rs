@@ -1761,6 +1761,7 @@ mod sinkhorn_graph_tests {
                 non_cuda,
                 seismic::NativeAllocations::EXACT,
                 Some(HostTier::Linked),
+                non_cuda.fills_beside_compute(),
                 &definition,
             )
             .unwrap_or_else(|e| panic!("{non_cuda:?}: bank_substrate failed: {e}"));

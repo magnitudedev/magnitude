@@ -182,6 +182,7 @@ fn bank_of(groups: &[usize], slots: u64, experts: impl Fn(usize) -> u64, form: R
         sites: BankSites::Unadmitted,
         paths: BankPaths::Priced { line: LINE, records: PATHS },
         recording: false,
+        decode_hits_min_bytes: 0,
     }
 }
 
@@ -2054,7 +2055,7 @@ fn causal_head_sublayer_banks_when_streamable_and_falls_back_when_transformed() 
     // 2. Transformed HeadSublayer (`ImportTransform::DraftQ4_0`, upload != source):
     //    target layers STILL bank cleanly while HeadSublayer stays Holding::Whole.
     let mut narrowed = resident;
-    for weight in narrowed.head.as_mut().unwrap().iter_mut() {
+    for weight in narrowed.head.as_mut().unwrap().weights.iter_mut() {
         if weight.role.scope == head_scope
             && matches!(
                 weight.role.kind,
@@ -2075,6 +2076,7 @@ fn causal_head_sublayer_banks_when_streamable_and_falls_back_when_transformed() 
             .head
             .as_ref()
             .unwrap()
+            .weights
             .iter()
             .filter(|w| w.role.scope == head_scope
                 && matches!(w.role.kind, WeightKind::ExpertGate | WeightKind::ExpertUp | WeightKind::ExpertDown))
