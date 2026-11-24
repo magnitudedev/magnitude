@@ -18,7 +18,7 @@ import {
   type Recommendations as RecommendationsState,
   type RoomShortfall,
 } from "@magnitudedev/acn-protocol"
-import type { ModelFamily as NativeModelFamily } from "@magnitudedev/icn-protocol/schemas"
+import type { CatalogQuant, ModelFamily as NativeModelFamily } from "@magnitudedev/icn-protocol/schemas"
 import { AcnChanges } from "./changes"
 import { LocalInferenceHardware } from "./local-inference-hardware"
 import { LocalModelSources, type CatalogModelSource } from "./local-model-sources"
@@ -36,8 +36,10 @@ export interface RecommendationInputs {
 
 interface Rung {
   readonly model: CatalogLocalModel
+  readonly quant: Option.Option<CatalogQuant>
   readonly measured: boolean
   readonly fits: boolean
+  readonly resident: boolean
   readonly speed: Option.Option<number>
   readonly roomOnDisk: boolean
 }
@@ -59,13 +61,19 @@ const remainingDownloadBytes = (model: CatalogLocalModel): number => {
   }
 }
 
-const rung = (model: CatalogLocalModel, freeBytes: Option.Option<number>): Rung => {
+const rung = (
+  model: CatalogLocalModel,
+  quant: Option.Option<CatalogQuant>,
+  freeBytes: Option.Option<number>,
+): Rung => {
   const serving = model.servingState
   const fits = serving._tag === "Assessed" && serving.assessment._tag === "Fits" ? serving.assessment : undefined
   return {
     model,
+    quant,
     measured: serving._tag !== "Assessing" && fits?.residency.performance._tag !== "Pending",
     fits: fits !== undefined,
+    resident: fits?.residency._tag === "Resident",
     speed: fits === undefined
       ? Option.none()
       : comparisonTokensPerSecond(fits.residency.performance, fits.served.contextLength),
@@ -79,23 +87,43 @@ const rung = (model: CatalogLocalModel, freeBytes: Option.Option<number>): Rung 
 const reaches = (rung: Rung, tokensPerSecond: number): boolean =>
   Option.exists(rung.speed, (speed) => speed >= tokensPerSecond)
 
-/** The share of the fastest rung's speed within which rungs decode alike; the inference service's recommendations hold the same share. */
-const NEAR_FASTEST = 0.9
+const isTwoBit = (name: string): boolean => /(?:^|[-_])I?Q2(?:$|[-_])/i.test(name)
+const isNativeFp4 = (name: string): boolean => /(?:^|[-_])(?:NVFP4|MXFP4)(?:$|[-_])/i.test(name)
+const isIstaRepository = (repository: string): boolean => repository.toLowerCase().startsWith("ista-daslab/")
 
 /**
- * The rung chosen for this machine, among those that fit and have room on disk: the highest that reaches the target
- * speed; else the highest within `NEAR_FASTEST` of the fastest, since a smaller rung a few percent faster is no
- * better choice; else, where no speed could be measured, the smallest. A rung still being measured is never chosen:
- * one whose measurement never ends would otherwise be offered though it may not load.
+ * Fixed quant preference tier (lower is preferred):
+ *   0: ISTA-DASLab 2-bit (e.g. IQ2_S, IQ2_XXS, Q2_0)
+ *   1: Native 4-bit (NVFP4 / MXFP4)
+ *   2: Other 2-bit (e.g. Unsloth UD-Q2_K_XL, UD-IQ2_XXS, NVIDIA IQ2_XXS)
+ *   3: Remaining quants, smallest first (e.g. Q4 on Q4–Q8 ladders)
+ */
+const rungTier = (rung: Rung): number =>
+  Option.match(rung.quant, {
+    onNone: () => 3,
+    onSome: ({ repository, name }) => {
+      if (isIstaRepository(repository) && isTwoBit(name)) return 0
+      if (isNativeFp4(name)) return 1
+      if (isTwoBit(name)) return 2
+      return 3
+    },
+  })
+
+const byTier = Order.mapInput(Order.number, rungTier)
+
+/**
+ * The rung chosen for this machine, among those that fit, have room on disk, and have finished measuring:
+ * 1. Highest-priority tier that reaches the target decode speed (>= 10 tok/s), tie-breaking smallest first.
+ * 2. Else, highest-priority tier that fits resident in memory (e.g. CPU-only or slow GPU), tie-breaking smallest first.
+ * 3. Else (only streamed rungs fit and none reaches target speed), the smallest fitting rung.
  */
 const chooseRung = (ladder: readonly Rung[]): Option.Option<Rung> => {
   const fitting = ladder.filter((candidate) => candidate.fits && candidate.roomOnDisk && candidate.measured)
   const target = fitting.filter((candidate) => reaches(candidate, TARGET_TOKENS_PER_SECOND))
-  if (target.length > 0) return Array.last(target)
-  const fastest = Math.max(0, ...fitting.flatMap((candidate) => Option.toArray(candidate.speed)))
-  return Array.last(fitting.filter((candidate) => reaches(candidate, fastest * NEAR_FASTEST))).pipe(
-    Option.orElse(() => Array.head(fitting)),
-  )
+  if (target.length > 0) return Array.head(Array.sort(target, byTier))
+  const resident = fitting.filter((candidate) => candidate.resident)
+  if (resident.length > 0) return Array.head(Array.sort(resident, byTier))
+  return Array.head(fitting)
 }
 
 interface RankedModel {
@@ -136,6 +164,8 @@ export const projectRecommendations = (inputs: RecommendationInputs): Recommenda
     family.architectures.map((architecture) => [architecture, family.status] as const)))
   const architectures = new Map(inputs.catalog.map((entry) =>
     [entry.id as string, entry.source.desired.metadata.architecture] as const))
+  const quants = new Map(inputs.catalog.map((entry) =>
+    [entry.id as string, entry.source.quant] as const))
   const comingSoon = (model: CatalogLocalModel): boolean =>
     familyStatus.get(architectures.get(model.modelId) ?? "") === "ComingSoon"
   const catalogModels = inputs.models.filter((model): model is CatalogLocalModel =>
@@ -156,7 +186,7 @@ export const projectRecommendations = (inputs: RecommendationInputs): Recommenda
     let rungs = 0
     const models = Object.entries(ladders).flatMap(([base, variants]): readonly RankedModel[] => {
       const ladder = Array.sort(variants, Order.mapInput(Order.number, (model: CatalogLocalModel) => model.storageBytes))
-        .map((model) => rung(model, freeBytes))
+        .map((model) => rung(model, Option.fromNullable(quants.get(model.modelId)), freeBytes))
       if (!Array.isNonEmptyReadonlyArray(ladder)) return []
       const first = ladder[0].model
       if (!comingSoon(first)) {

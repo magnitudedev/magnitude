@@ -739,7 +739,7 @@ fn the_published_projector_is_the_glm5v_tower_and_merger() {
         ActivationDType, CellReduction, VisionActivation, VisionNorm, VisionOperator,
         VisionResize, VisionStem, VisionUp,
     };
-    let projector = headers::projector("glm-5.3-flash:gguf:fp8");
+    let projector = headers::projector("glm-5.3-flash:gguf:nvfp4");
     let definition = Glm5NextFamily
         .inspect(&published(), Some(&projector), identity())
         .unwrap();

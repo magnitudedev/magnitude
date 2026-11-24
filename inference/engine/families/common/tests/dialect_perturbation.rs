@@ -93,7 +93,7 @@ fn deepseek41_dialect_equivalence_and_invariant_rejection() {
 
 #[test]
 fn glm5next_dialect_equivalence_and_invariant_rejection() {
-    let base = headers::target("glm-5.3-flash:gguf:fp8");
+    let base = headers::target("glm-5.3-flash:gguf:nvfp4");
     assert_dialect_equivalent(&base, inspect_target, |dir| {
         remove_metadata(dir, "glm5-next.vocab_size");
         remove_metadata(dir, "glm5-next.rope.dimension_count");
@@ -127,7 +127,7 @@ fn glm5next_dialect_equivalence_and_invariant_rejection() {
     });
 
     // Projector dialect equivalence & rejection.
-    let proj = headers::projector("glm-5.3-flash:gguf:fp8");
+    let proj = headers::projector("glm-5.3-flash:gguf:nvfp4");
     assert_dialect_equivalent(&proj, |p| inspect_with_projector(&base, p), |dir| {
         remove_metadata(dir, "clip.use_silu");
         remove_metadata(dir, "clip.vision.image_size");

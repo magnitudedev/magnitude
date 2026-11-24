@@ -17,6 +17,7 @@ interface RungFixture {
   readonly storageBytes: number
   readonly tokensPerSecond?: number
   readonly fits?: boolean
+  readonly streamed?: boolean
   readonly assessing?: boolean
   readonly installed?: boolean
   readonly tools?: boolean
@@ -24,12 +25,38 @@ interface RungFixture {
   readonly support?: "Supported" | "Disabled"
   readonly country?: string
   readonly intelligence?: number
+  readonly quantName?: string
+  readonly quantRepository?: string
 }
 
-const rung = (fixture: RungFixture): LocalModel => {
+const defaultQuant = (id: string): { readonly name: string; readonly repository: string } => {
+  const variant = id.split(":")[2] ?? ""
+  if (variant.includes("nvfp4")) return { name: "NVFP4", repository: "magnitudedev/model" }
+  if (variant.includes("mxfp4")) return { name: "MXFP4_MOE", repository: "magnitudedev/model" }
+  if (variant.includes("iq2")) return { name: "IQ2_XXS", repository: "unsloth/model" }
+  if (variant.includes("q2")) return { name: "UD-Q2_K_XL", repository: "unsloth/model" }
+  if (variant.includes("iq3")) return { name: "UD-IQ3_XXS", repository: "unsloth/model" }
+  if (variant.includes("q3")) return { name: "UD-Q3_K_XL", repository: "unsloth/model" }
+  if (variant.includes("q4")) return { name: "UD-Q4_K_XL", repository: "unsloth/model" }
+  if (variant.includes("q6")) return { name: "UD-Q6_K_XL", repository: "unsloth/model" }
+  if (variant.includes("q8")) return { name: "UD-Q8_K_XL", repository: "unsloth/model" }
+  return { name: "UD-Q4_K_XL", repository: "unsloth/model" }
+}
+
+interface FixtureModel {
+  readonly model: LocalModel
+  readonly quant: { readonly name: string; readonly repository: string }
+}
+
+const rung = (fixture: RungFixture): FixtureModel => {
   const fits = fixture.fits ?? true
   const support = fixture.support ?? "Supported"
-  return {
+  const fallbackQuant = defaultQuant(fixture.id)
+  const quant = {
+    name: fixture.quantName ?? fallbackQuant.name,
+    repository: fixture.quantRepository ?? fallbackQuant.repository,
+  }
+  const model = {
     _tag: "Catalog",
     modelId: fixture.id,
     storageBytes: fixture.storageBytes,
@@ -54,7 +81,7 @@ const rung = (fixture: RungFixture): LocalModel => {
             _tag: "Fits",
             served: { contextLength: 131_072 },
             residency: {
-              _tag: "Resident",
+              _tag: fixture.streamed ? "Streamed" : "Resident",
               performance: fixture.speedUnavailable
                 ? { _tag: "Unavailable", failure: { code: "performance_unavailable", message: "cannot be measured", retryable: false } }
                 : fixture.tokensPerSecond === undefined
@@ -71,10 +98,11 @@ const rung = (fixture: RungFixture): LocalModel => {
         }
       : { _tag: "Assessed", capabilities: { vision: false, tools: fixture.tools ?? true, structuredOutput: true, reasoning: { supported: false, efforts: [], defaultEffort: Option.none() } }, assessment: { _tag: "DoesNotFit" } },
   } as unknown as LocalModel
+  return { model, quant }
 }
 
-const source = (id: string, architecture: string): CatalogModelSource =>
-  ({ id, source: { desired: { metadata: { architecture } } } }) as unknown as CatalogModelSource
+const source = (id: string, architecture: string, quant: { readonly name: string; readonly repository: string }): CatalogModelSource =>
+  ({ id, source: { desired: { metadata: { architecture } }, quant } }) as unknown as CatalogModelSource
 
 const families: readonly LocalModelFamily[] = [
   { name: "Qwen", developer: { lab: "alibaba", name: "Alibaba", country: "CN" }, architectures: ["qwen35"], status: "Supported" },
@@ -84,10 +112,10 @@ const families: readonly LocalModelFamily[] = [
 const hardware = (freeBytes?: number): LocalInferenceHardware =>
   ({ modelStorage: Option.fromNullable(freeBytes === undefined ? undefined : { freeBytes }) }) as unknown as LocalInferenceHardware
 
-const project = (models: readonly LocalModel[], options: { freeBytes?: number; country?: string } = {}) => {
+const project = (entries: readonly FixtureModel[], options: { freeBytes?: number; country?: string } = {}) => {
   const recommendations = projectRecommendations({
-    models,
-    catalog: models.map((model) => source(model.modelId, model.modelId.startsWith("deepseek") ? "deepseek41" : "qwen35")),
+    models: entries.map(({ model }) => model),
+    catalog: entries.map(({ model, quant }) => source(model.modelId, model.modelId.startsWith("deepseek") ? "deepseek41" : "qwen35", quant)),
     families,
     hardware: hardware(options.freeBytes),
     developerCountry: Option.map(Option.fromNullable(options.country), CountryCodeSchema.make),
@@ -105,30 +133,58 @@ describe("recommendations", () => {
     expect(project([measured, rung({ id: "a:gguf:q8", storageBytes: 2 * GB, fits: false })]).complete).toBe(true)
   })
 
-  it("chooses the highest rung that fits, has room and reaches 10 tok/s, listing rungs smallest first", () => {
+  it("prefers ISTA-DASLab 2-bit over larger quants even when NVFP4 and Q6 reach 10 tok/s, listing rungs smallest first", () => {
     const { models: [model] } = project([
-      rung({ id: "big:gguf:q6", storageBytes: 30 * GB, tokensPerSecond: 8 }),
-      rung({ id: "big:gguf:q2", storageBytes: 10 * GB, tokensPerSecond: 25 }),
-      rung({ id: "big:gguf:q4", storageBytes: 20 * GB, tokensPerSecond: 14 }),
+      rung({ id: "flash:gguf:q6", storageBytes: 170 * GB, tokensPerSecond: 20, quantName: "UD-Q6_K_XL", quantRepository: "unsloth/Flash-GGUF" }),
+      rung({ id: "flash:gguf:nvfp4", storageBytes: 129 * GB, tokensPerSecond: 30, quantName: "NVFP4", quantRepository: "magnitudedev/Flash-NVFP4-GGUF" }),
+      rung({ id: "flash:gguf:iq3", storageBytes: 85 * GB, tokensPerSecond: 35, quantName: "IQ3_S", quantRepository: "ISTA-DASLab/Flash-GSQ-RCO-GGUF" }),
+      rung({ id: "flash:gguf:q2", storageBytes: 67 * GB, tokensPerSecond: 45, quantName: "Q2_0", quantRepository: "ISTA-DASLab/Flash-GSQ-RCO-GGUF" }),
     ])
-    expect(model?.rungs).toEqual(["big:gguf:q2", "big:gguf:q4", "big:gguf:q6"])
-    expect(model?.chosen).toEqual(Option.some("big:gguf:q4"))
+    expect(model?.rungs).toEqual(["flash:gguf:q2", "flash:gguf:iq3", "flash:gguf:nvfp4", "flash:gguf:q6"])
+    expect(model?.chosen).toEqual(Option.some("flash:gguf:q2"))
     expect(model?.meetsTarget).toBe(true)
+  })
+
+  it("prefers native 4-bit (NVFP4/MXFP4) when there is no ISTA 2-bit, falling back to 2-bit when NVFP4 does not fit or is too slow", () => {
+    const glm = (nvfp4: Partial<RungFixture>) => [
+      rung({ id: "glm:gguf:iq2", storageBytes: 103 * GB, tokensPerSecond: 25, quantName: "UD-IQ2_XXS", quantRepository: "unsloth/GLM-GGUF" }),
+      rung({ id: "glm:gguf:iq3", storageBytes: 122 * GB, tokensPerSecond: 20, quantName: "UD-IQ3_XXS", quantRepository: "unsloth/GLM-GGUF" }),
+      rung({ id: "glm:gguf:nvfp4", storageBytes: 187 * GB, tokensPerSecond: 18, quantName: "NVFP4", quantRepository: "magnitudedev/GLM-GGUF", ...nvfp4 }),
+    ]
+    expect(project(glm({})).models[0]?.chosen).toEqual(Option.some("glm:gguf:nvfp4"))
+    expect(project(glm({ fits: false })).models[0]?.chosen).toEqual(Option.some("glm:gguf:iq2"))
+    expect(project(glm({ streamed: true, tokensPerSecond: 2 })).models[0]?.chosen).toEqual(Option.some("glm:gguf:iq2"))
+  })
+
+  it("picks 2-bit on Unsloth-only Q2–Q6 ladders and smallest (Q4) on Q4–Q8 ladders", () => {
+    const { models: [moe] } = project([
+      rung({ id: "moe:gguf:q2", storageBytes: 14 * GB, tokensPerSecond: 40 }),
+      rung({ id: "moe:gguf:q4", storageBytes: 24 * GB, tokensPerSecond: 30 }),
+      rung({ id: "moe:gguf:q6", storageBytes: 34 * GB, tokensPerSecond: 20 }),
+    ])
+    expect(moe?.chosen).toEqual(Option.some("moe:gguf:q2"))
+
+    const { models: [dense] } = project([
+      rung({ id: "dense:gguf:q4", storageBytes: 4 * GB, tokensPerSecond: 60 }),
+      rung({ id: "dense:gguf:q6", storageBytes: 5 * GB, tokensPerSecond: 45 }),
+      rung({ id: "dense:gguf:q8", storageBytes: 7 * GB, tokensPerSecond: 35 }),
+    ])
+    expect(dense?.chosen).toEqual(Option.some("dense:gguf:q4"))
   })
 
   it("skips a rung without room on disk unless it is already downloaded", () => {
     const ladder = (installed: boolean) => [
-      rung({ id: "big:gguf:q2", storageBytes: 10 * GB, tokensPerSecond: 40 }),
-      rung({ id: "big:gguf:q4", storageBytes: 20 * GB, tokensPerSecond: 25, installed }),
+      rung({ id: "big:gguf:iq2", storageBytes: 10 * GB, tokensPerSecond: 40 }),
+      rung({ id: "big:gguf:nvfp4", storageBytes: 20 * GB, tokensPerSecond: 25, installed }),
     ]
-    expect(project(ladder(false), { freeBytes: 15 * GB }).models[0]?.chosen).toEqual(Option.some("big:gguf:q2"))
-    expect(project(ladder(true), { freeBytes: 15 * GB }).models[0]?.chosen).toEqual(Option.some("big:gguf:q4"))
+    expect(project(ladder(false), { freeBytes: 15 * GB }).models[0]?.chosen).toEqual(Option.some("big:gguf:iq2"))
+    expect(project(ladder(true), { freeBytes: 15 * GB }).models[0]?.chosen).toEqual(Option.some("big:gguf:nvfp4"))
   })
 
   it("chooses no rung without room on disk, even when none reaches 10 tok/s, and none still being measured", () => {
     const slow = [
       rung({ id: "big:gguf:q2", storageBytes: 100 * GB, tokensPerSecond: 6 }),
-      rung({ id: "big:gguf:q4", storageBytes: 173 * GB, tokensPerSecond: 6 }),
+      rung({ id: "big:gguf:nvfp4", storageBytes: 173 * GB, tokensPerSecond: 6 }),
     ]
     expect(project(slow, { freeBytes: 16 * GB }).models[0]?.chosen).toEqual(Option.none())
     const unmeasured = [rung({ id: "big:gguf:q2", storageBytes: 100 * GB }), rung({ id: "small:gguf:q4", storageBytes: 1 * GB })]
@@ -138,16 +194,16 @@ describe("recommendations", () => {
 
   it("offers the best measured rung while another stays measuring, and never the one still measuring", () => {
     const stuck = [
-      rung({ id: "qwen:gguf:q2", storageBytes: 5 * GB, tokensPerSecond: 30 }),
-      rung({ id: "qwen:gguf:q4", storageBytes: 10 * GB }),
+      rung({ id: "qwen:gguf:iq2", storageBytes: 5 * GB, tokensPerSecond: 30 }),
+      rung({ id: "qwen:gguf:nvfp4", storageBytes: 10 * GB }),
     ]
     const recommendations = project(stuck, { freeBytes: 100 * GB })
     expect(recommendations.complete).toBe(false)
-    expect(recommendations.models[0]?.chosen).toEqual(Option.some("qwen:gguf:q2"))
+    expect(recommendations.models[0]?.chosen).toEqual(Option.some("qwen:gguf:iq2"))
     expect(project([rung({ id: "lfm:gguf:q4", storageBytes: 1 * GB })]).models[0]?.chosen).toEqual(Option.none())
   })
 
-  it("offers the smallest fitting rung where no speed can be measured, such as on a CPU, without claiming a speed", () => {
+  it("offers the preferred resident rung where no speed can be measured, such as on a CPU, without claiming a speed", () => {
     const cpu = [
       rung({ id: "lfm:gguf:q4", storageBytes: 1 * GB, speedUnavailable: true }),
       rung({ id: "lfm:gguf:q8", storageBytes: 2 * GB, speedUnavailable: true }),
@@ -159,33 +215,33 @@ describe("recommendations", () => {
 
   it("names the model that would lead with more free disk, and how much more it needs", () => {
     const models = [
-      rung({ id: "big:gguf:q2", storageBytes: 100 * GB, tokensPerSecond: 30, intelligence: 90 }),
-      rung({ id: "big:gguf:q4", storageBytes: 173 * GB, tokensPerSecond: 25, intelligence: 90 }),
+      rung({ id: "big:gguf:iq2", storageBytes: 100 * GB, tokensPerSecond: 30, intelligence: 90 }),
+      rung({ id: "big:gguf:nvfp4", storageBytes: 173 * GB, tokensPerSecond: 25, intelligence: 90 }),
       rung({ id: "small:gguf:q4", storageBytes: 2 * GB, tokensPerSecond: 60, intelligence: 40 }),
     ]
     const short = project(models, { freeBytes: 16 * GB })
     expect(short.models[0]?.base).toBe("small")
-    expect(short.roomShortfall).toEqual(Option.some({ base: "big", name: "big", rung: "big:gguf:q4", missingBytes: 157 * GB }))
+    expect(short.roomShortfall).toEqual(Option.some({ base: "big", name: "big", rung: "big:gguf:nvfp4", missingBytes: 157 * GB }))
     expect(project(models, { freeBytes: 200 * GB }).roomShortfall).toEqual(Option.none())
     expect(project(models).roomShortfall).toEqual(Option.none())
-    const larger = project([rung({ id: "big:gguf:q2", storageBytes: 10 * GB, tokensPerSecond: 40 }), ...models.slice(1, 2)], { freeBytes: 16 * GB })
+    const larger = project([rung({ id: "big:gguf:iq2", storageBytes: 10 * GB, tokensPerSecond: 40 }), ...models.slice(1, 2)], { freeBytes: 16 * GB })
     expect(larger.roomShortfall).toEqual(Option.none())
   })
 
-  it("falls back to the highest fitting rung near the fastest when none reaches 10 tok/s", () => {
-    const { models: [model] } = project([
-      rung({ id: "slow:gguf:q2", storageBytes: 10 * GB, tokensPerSecond: 7 }),
-      rung({ id: "slow:gguf:q4", storageBytes: 20 * GB, tokensPerSecond: 4 }),
-      rung({ id: "slow:gguf:q6", storageBytes: 30 * GB, fits: false }),
+  it("prefers resident rungs over slower streamed rungs when none reaches 10 tok/s, and smallest when all are streamed", () => {
+    const { models: [residentVsStreamed] } = project([
+      rung({ id: "slow:gguf:iq2", storageBytes: 103 * GB, tokensPerSecond: 7 }),
+      rung({ id: "slow:gguf:nvfp4", storageBytes: 187 * GB, tokensPerSecond: 2, streamed: true }),
     ])
-    expect(model?.chosen).toEqual(Option.some("slow:gguf:q2"))
-    expect(model?.meetsTarget).toBe(false)
-    const { models: [alike] } = project([
-      rung({ id: "alike:gguf:q2", storageBytes: 10 * GB, tokensPerSecond: 9.5 }),
-      rung({ id: "alike:gguf:q4", storageBytes: 20 * GB, tokensPerSecond: 9 }),
+    expect(residentVsStreamed?.chosen).toEqual(Option.some("slow:gguf:iq2"))
+    expect(residentVsStreamed?.meetsTarget).toBe(false)
+
+    const { models: [allStreamed] } = project([
+      rung({ id: "stream:gguf:iq2", storageBytes: 103 * GB, tokensPerSecond: 5, streamed: true }),
+      rung({ id: "stream:gguf:nvfp4", storageBytes: 187 * GB, tokensPerSecond: 2, streamed: true }),
     ])
-    expect(alike?.chosen).toEqual(Option.some("alike:gguf:q4"))
-    expect(alike?.meetsTarget).toBe(false)
+    expect(allStreamed?.chosen).toEqual(Option.some("stream:gguf:iq2"))
+    expect(allStreamed?.meetsTarget).toBe(false)
   })
 
   it("orders target-speed models by intelligence, then usable ones, then slow ones, then those that do not fit", () => {
@@ -249,12 +305,12 @@ describe("recommendations", () => {
 
 describe("republishing recommendations", () => {
   const ladder = [
-    rung({ id: "big:gguf:q2", storageBytes: 10 * GB, tokensPerSecond: 40 }),
-    rung({ id: "big:gguf:q4", storageBytes: 20 * GB, tokensPerSecond: 25, country: "US" }),
+    rung({ id: "big:gguf:iq2", storageBytes: 10 * GB, tokensPerSecond: 40 }),
+    rung({ id: "big:gguf:nvfp4", storageBytes: 20 * GB, tokensPerSecond: 25, country: "US" }),
   ]
   const views = (freeBytes: number) => recommendationViews({
-    models: ladder,
-    catalog: ladder.map((model) => source(model.modelId, "qwen35")),
+    models: ladder.map(({ model }) => model),
+    catalog: ladder.map(({ model, quant }) => source(model.modelId, "qwen35", quant)),
     families,
     hardware: hardware(freeBytes),
   })
