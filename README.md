@@ -53,7 +53,7 @@ For more info, see [CLI only](https://docs.magnitude.dev/installation/cli-only).
 
 <picture>
   <source media="(prefers-color-scheme: dark)" srcset="assets/benchmarks/machines-dark.svg">
-  <img alt="Decode speed of Qwen 3.8 Flash Next and DeepSeek V4.1 Flash across Mac mini M2 Pro, Mac mini M5 Pro, RTX 3090, and RTX 5090" src="assets/benchmarks/machines-light.svg" width="800">
+  <img alt="Decode speed of Qwen 3.8 Flash Next, GLM 5.3 Flash, and DeepSeek V4.1 Flash across Mac mini M5 Pro, RTX 3090, DGX Spark, and RTX 5090" src="assets/benchmarks/machines-light.svg" width="800">
 </picture>
 
 [View full benchmarks →](https://magnitude.dev/benchmarks)
