@@ -1356,6 +1356,19 @@ impl Directory {
     /// ([`BankRecords::covering`]). Neither ever takes a lent record, the
     /// scratch's ([`BankRecords::usable`]).
     pub fn promotions(&mut self, at: &Unbegun, budget: usize) -> Wants {
+        self.promotions_with(at, budget, |_, _| true)
+    }
+
+    /// [`Self::promotions`], additionally gating candidate `Record::Free`
+    /// destination slots on `can_reuse(group, record)` so slots still pinned
+    /// by a joined demand consumer (or quarantined) in `ExpertTransport` are
+    /// never handed to a new promotion.
+    pub fn promotions_with(
+        &mut self,
+        at: &Unbegun,
+        budget: usize,
+        mut can_reuse: impl FnMut(usize, usize) -> bool,
+    ) -> Wants {
         // The tier gives up what the bank holds now: its records ready for
         // other experts once no step may still read them.
         let mut asked = Wants::default();
@@ -1434,7 +1447,10 @@ impl Directory {
                 .bank
                 .free(group)
                 .filter(|&record| !lending && self.bank.lends(group, record) && self.bank.usable_when(group, record, false));
-            let all_free: Vec<usize> = non_lent.chain(lent_free).collect();
+            let all_free: Vec<usize> = non_lent
+                .chain(lent_free)
+                .filter(|&record| can_reuse(group, record))
+                .collect();
             let demand_reserve = if self.bank.capacity(group) > 16 {
                 self.demand_free_floor(group)
             } else {
@@ -1709,6 +1725,17 @@ impl Directory {
         self.bank.drain(progress, steps)
     }
 
+    /// [`Self::drain`], gating each releasing record on `can_reuse(group, record)`
+    /// ([`BankRecords::drain_with`]).
+    pub fn drain_with(
+        &mut self,
+        progress: Point,
+        steps: &Steps,
+        can_reuse: impl FnMut(usize, usize) -> bool,
+    ) -> bool {
+        self.bank.drain_with(progress, steps, can_reuse)
+    }
+
     /// The promotions queued, which copy now ([`BankRecords::queued`]).
     pub fn queued(&self) -> Vec<(usize, BankRecord, Staged)> {
         self.bank.queued()
@@ -1735,6 +1762,17 @@ impl Directory {
     /// for `target_step` ([`BankRecords::free_stage_slot`]).
     pub fn free_stage_slot(&self, group: usize, target_step: Step) -> Option<usize> {
         self.bank.free_stage_slot(group, target_step)
+    }
+
+    /// [`Self::free_stage_slot`], skipping slots rejected by `can_reuse(slot)`
+    /// ([`BankRecords::free_stage_slot_with`]).
+    pub fn free_stage_slot_with(
+        &self,
+        group: usize,
+        target_step: Step,
+        can_reuse: impl FnMut(usize) -> bool,
+    ) -> Option<usize> {
+        self.bank.free_stage_slot_with(group, target_step, can_reuse)
     }
 
     /// Number of slots in each parity half (`even` or `odd`) of `group`'s

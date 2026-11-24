@@ -1862,3 +1862,86 @@ fn alone_excludes_lent_slot_dual_resident_experts() {
     assert_eq!(directory.alone(0), experts - 1, "Directory::alone excludes dual-resident lent-slot expert");
     assert!(directory.held_count(0) + directory.alone(0) <= experts);
 }
+
+#[test]
+fn promotions_and_stage_slots_skip_transport_pinned_slots() {
+    use crate::experts::host_records::{Claim, Taking};
+    use crate::experts::transport::{DestSlot, ExpertKey, ExpertTransport};
+
+    let experts = 6usize;
+    let lent = 1usize;
+    let stage_slots = 4usize; // 2 even + 2 odd slots at 1..5
+    let bank_slots = 7usize;  // 0 (lent), 1..5 (stage ring), 5..7 (permanent)
+    let map_words = magnitude_kernels::constants::MAP_WORDS;
+    let host = HostTier {
+        records: vec![experts as u32],
+        lent: vec![0],
+        reserve: 0,
+        placement: Placement::Tier {
+            bank_maps: vec![StampedMap::new(cpu_words(&[experts as u64, map_words], 0))],
+            tier_maps: vec![LandingMap::Tier(cpu_words(&[experts as u64], -1))],
+            lent: (0, lent),
+            stage_slots: vec![stage_slots],
+        },
+    };
+    let mut directory = Directory::new(&[bank_slots], &[0], &[experts], host);
+    let steps = steps();
+    steps.begin_through(2);
+    for expert in 0..experts {
+        let Claim::Taken(grant) = directory.claim_landing(0, expert, 0, Taking::Out, (|_, _| (), |_, _| true)) else {
+            panic!("expected host slot for expert {expert}");
+        };
+        directory.landed(0, HostRecord(grant.record()), expert, Some(1));
+    }
+
+    // 1. Register an active transport hint on stage slot 1 (first even slot) and
+    //    permanent bank slot 5. Neither allocator may hand those pinned slots out.
+    let transport = ExpertTransport::new_registry_only();
+    let pinned_stage = DestSlot { group: 0, slot: 1 };
+    let pinned_perm = DestSlot { group: 0, slot: 5 };
+    let stage_id = transport.register_hint(ExpertKey { group: 0, layer: 0, expert: 0 }, 0, pinned_stage);
+    let perm_id = transport.register_hint(ExpertKey { group: 0, layer: 0, expert: 1 }, 1, pinned_perm);
+
+    assert_eq!(
+        directory.free_stage_slot_with(0, 2, |slot| transport.can_reuse_slot(DestSlot { group: 0, slot })),
+        Some(2),
+        "free_stage_slot_with must skip transport-pinned slot 1"
+    );
+
+    // Feed decode activity so promotions are eligible.
+    let ranking = directory.ranking();
+    {
+        let time = directory.time();
+        time.lock().register(2, crate::experts::horizon::Advance::Known(crate::experts::horizon::Tokens::new(1.0)));
+    }
+    Reuse::of(&ranking).read(
+        &RoutedRead { sequence: 2, layer: 0, choices: 1, experts: vec![2] },
+        None,
+        crate::experts::reuse::Evidence::Decode,
+    );
+    directory.price_copies(0, Some(0.0));
+
+    let asked = steps.unbegun_beside_frontier(|_, at| {
+        transport.with_slot_reuse(|can_reuse| {
+            directory.promotions_with(at, 1, |group, slot| can_reuse(DestSlot { group, slot }))
+        })
+    });
+    assert_eq!(asked.promotions.len(), 1);
+    assert_ne!(
+        asked.promotions[0].record.index(),
+        pinned_perm.slot,
+        "promotions_with must skip transport-pinned permanent slot 5"
+    );
+
+    // 2. Once DMA completes and hint ownership releases, the slots become reusable.
+    transport.complete_dma(stage_id);
+    assert!(transport.try_release_hint_slot(pinned_stage));
+    assert_eq!(
+        directory.free_stage_slot_with(0, 2, |slot| transport.can_reuse_slot(DestSlot { group: 0, slot })),
+        Some(1)
+    );
+
+    transport.complete_dma(perm_id);
+    assert!(transport.try_release_hint_slot(pinned_perm));
+    assert!(transport.can_reuse_slot(pinned_perm));
+}

@@ -543,12 +543,18 @@ impl Copies {
             match self.inner.transfer.wait(value, timeout) {
                 Ok(false) => continue,
                 Ok(true) => {
+                    // Complete `ExpertTransport` DMA state BEFORE popping
+                    // `state.running` so `Copies::completed(ticket)` can never
+                    // report `Ok(true)` while the slot is still `InFlight`.
+                    let stage_transfer = self.state().running.front().and_then(|&(_, _, _, id, _)| id);
+                    if let (Some(id), Some(transport)) = (stage_transfer, &self.inner.transport) {
+                        transport.complete_dma(id);
+                    }
                     let completed = self.state().running.pop_front();
                     if let Some((_, _, items, stage_transfer, _)) = completed {
                         drop(items);
-                        if let Some(id) = stage_transfer {
+                        if stage_transfer.is_some() {
                             if let Some(transport) = &self.inner.transport {
-                                transport.complete_dma(id);
                                 transport.drain_deferred_syncs();
                             }
                         }

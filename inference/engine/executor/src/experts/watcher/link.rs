@@ -182,7 +182,11 @@ impl LinkMover {
         // 4. Drain releases (including stamped-unmap releases without write-back),
         //    deferred demand landings, and landed staging slots no longer pinned
         //    by any joined demand consumer in `ExpertTransport`.
-        moved |= core.directory.drain(progress, &core.steps);
+        moved |= shared.transport.with_slot_reuse(|can_reuse| {
+            core.directory.drain_with(progress, &core.steps, |group, slot| {
+                can_reuse(crate::experts::transport::DestSlot { group, slot })
+            })
+        });
         moved |= core.directory.drain_demand_landings(|group, slot| {
             shared
                 .transport
@@ -433,7 +437,11 @@ impl LinkMover {
                                 continue;
                             }
                             let target_step = if step < frontier || core.steps.ended(step) { next_step } else { step };
-                            let Some(slot) = core.directory.free_stage_slot(group, target_step) else {
+                            let Some(slot) = core.directory.free_stage_slot_with(group, target_step, |slot| {
+                                shared
+                                    .transport
+                                    .can_reuse_slot(crate::experts::transport::DestSlot { group, slot })
+                            }) else {
                                 continue;
                             };
                             let priority = TransferPriority::Stage { step: target_step, layer, p };
@@ -515,7 +523,11 @@ impl LinkMover {
                     if admission.carryover_net_benefit(cand.p_next, record_bytes, free_slack) <= 0.0 {
                         continue;
                     }
-                    let Some(slot) = core.directory.free_stage_slot(group, target_step) else {
+                    let Some(slot) = core.directory.free_stage_slot_with(group, target_step, |slot| {
+                        shared
+                            .transport
+                            .can_reuse_slot(crate::experts::transport::DestSlot { group, slot })
+                    }) else {
                         continue;
                     };
                     let priority = TransferPriority::Stage { step: target_step, layer: cand.layer, p: cand.p_next.clamp(0.0, 1.0) };
@@ -569,7 +581,13 @@ impl LinkMover {
             return false;
         }
         let directory = &mut core.directory;
-        let asked = core.steps.unbegun_beside_frontier(|_, at| directory.promotions(at, budget));
+        let asked = core.steps.unbegun_beside_frontier(|_, at| {
+            shared.transport.with_slot_reuse(|can_reuse| {
+                directory.promotions_with(at, budget, |group, slot| {
+                    can_reuse(crate::experts::transport::DestSlot { group, slot })
+                })
+            })
+        });
         for &(group, tier_record) in &asked.surrendered {
             shared.transport.bump_source_generation(group, tier_record);
         }

@@ -695,12 +695,24 @@ impl BankRecords {
     /// its entry was mapped for has passed its layer or ended
     /// (`Steps::served`), so no step reads it. Whether any was.
     pub fn drain(&mut self, progress: Point, steps: &super::watcher::Steps) -> bool {
+        self.drain_with(progress, steps, |_, _| true)
+    }
+
+    /// [`Self::drain`], additionally gating each releasing record on
+    /// `can_reuse(group, record)` so slots still pinned by a joined demand
+    /// consumer (or quarantined) in `ExpertTransport` do not re-enter `Free`.
+    pub fn drain_with(
+        &mut self,
+        progress: Point,
+        steps: &super::watcher::Steps,
+        mut can_reuse: impl FnMut(usize, usize) -> bool,
+    ) -> bool {
         let mut drained_any = self.drain_pending(steps.frontier());
         let (drained, releasing) = std::mem::take(&mut self.releasing).into_iter().partition::<Vec<_>, _>(|&(group, record)| {
             let Record::Releasing { layer, from, until, back } = self.groups[group].contents[record] else {
                 panic!("record {record} of group {group} is listed releasing");
             };
-            back.is_none() && steps.served(from, until, layer, progress)
+            back.is_none() && steps.served(from, until, layer, progress) && can_reuse(group, record)
         });
         self.releasing = releasing;
         for &(group, record) in &drained {
@@ -830,6 +842,18 @@ impl BankRecords {
     /// reclaimed after earlier layers of the same step (or prior steps) can be
     /// reused immediately without aliasing.
     pub fn free_stage_slot(&self, group: usize, target_step: Step) -> Option<usize> {
+        self.free_stage_slot_with(group, target_step, |_| true)
+    }
+
+    /// [`Self::free_stage_slot`], skipping any `Record::StageIdle` slot that
+    /// `can_reuse(slot)` rejects (e.g. still pinned or quarantined in
+    /// `ExpertTransport`).
+    pub fn free_stage_slot_with(
+        &self,
+        group: usize,
+        target_step: Step,
+        mut can_reuse: impl FnMut(usize) -> bool,
+    ) -> Option<usize> {
         let range = self.stage_rings.get(group)?;
         let half = range.len() / 2;
         if half == 0 {
@@ -838,7 +862,11 @@ impl BankRecords {
         let parity = (target_step & 1) as usize;
         let base = range.start + parity * half;
         let slice = &self.groups[group].contents[base..base + half];
-        slice.iter().position(|&content| content == Record::StageIdle).map(|offset| base + offset)
+        slice
+            .iter()
+            .enumerate()
+            .find(|&(offset, &content)| content == Record::StageIdle && can_reuse(base + offset))
+            .map(|(offset, _)| base + offset)
     }
 
     /// Number of active (in-flight or landed) staging slots currently held in
