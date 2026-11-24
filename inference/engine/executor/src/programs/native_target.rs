@@ -2209,8 +2209,8 @@ impl NativeTargetProgram {
             && run.bank.as_ref().is_some_and(|bank| bank.block_dma_decode(index, rows))
         {
             self.run_stage(run, index, &class, RunStage::DecodeFront, rotation, submitter)?;
-            let dma_wait_start = std::time::Instant::now();
             submitter.flush_and_wait()?;
+            let dma_wait_start = std::time::Instant::now();
             // Previous layer's `DecodeBack` preceded this `DecodeFront` on the
             // same Compute stream, so its VRAM slots are now 100% done on GPU.
             // They are settled once this layer's copy and `DecodeBack` are

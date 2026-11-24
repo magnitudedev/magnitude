@@ -996,6 +996,33 @@ impl Watcher {
         // The transfer queue the promotions queue on, whose completions its
         // watch announces.
         let copies = copier.as_ref().map(|copier| copier.copies.clone());
+        // Configure the single-owner `DecodeTransientBudget` per group on
+        // partial discrete-GPU tier banks with M7 decode DMA active, using the
+        // load's actual max decode batch (`extents.decode_rows`) so M=1
+        // non-speculative decode never pays a speculative verify residency tax
+        // and background promotions never exhaust `DecodeDMA`'s `DemandLanding`
+        // floor (`dma_overflow == 0`).
+        if core.extents.placer == crate::planning::Placer::Tier
+            && !whole
+            && shared.transport.has_decode_dma()
+        {
+            // Start at `M = 1` (`demand_floor = K`); `Residency::learn_told`
+            // dynamically scales `decode_budget` to the live `M_active` of each
+            // `Launched::Decode` step so compile-time `VERIFY_ROWS` never
+            // steals permanent VRAM across multi-group banks.
+            core.directory.configure_decode_budget(
+                1,
+                core.extents.selected,
+                crate::planning::HINT_LEADS as usize + 1,
+            );
+            for group in 0..core.groups.len() {
+                let splits = core
+                    .directory
+                    .group_layers(group)
+                    .any(|layer| !core.layers[layer].draft && shared.transport.is_splitting_decode(layer));
+                core.directory.set_group_splitting(group, splits);
+            }
+        }
         // The ledger's rates are the ranking's (`Reuse::rates`).
         let ranking = core.directory.ranking();
         let groups = core.directory.layer_groups();

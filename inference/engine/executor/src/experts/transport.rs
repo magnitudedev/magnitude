@@ -36,7 +36,7 @@ use super::bank::Stores;
 use crate::planning::{ExpertBankPlan, RecordTensors};
 use seismic::{Device, Tensor, Transfer, TransferItem, TransferRun, TransferSync};
 use std::collections::{HashMap, HashSet, VecDeque};
-use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 
 /// Identifies the logical expert payload being transferred.
@@ -129,6 +129,26 @@ pub(crate) struct DemandSlot {
     pub staged: Option<(usize, usize)>,
 }
 
+/// RAII guard tracking an active `land_decode_misses` flight in
+/// `ExpertTransport::demand_in_flight`. Increments on entry and decrements
+/// unconditionally on release or drop so `demand_active()` can never leak.
+pub(crate) struct DemandFlightGuard {
+    transport: Arc<ExpertTransport>,
+}
+
+impl DemandFlightGuard {
+    fn new(transport: Arc<ExpertTransport>) -> Self {
+        transport.demand_in_flight.fetch_add(1, Ordering::AcqRel);
+        Self { transport }
+    }
+}
+
+impl Drop for DemandFlightGuard {
+    fn drop(&mut self) {
+        self.transport.demand_in_flight.fetch_sub(1, Ordering::AcqRel);
+    }
+}
+
 /// Outcome of [`ExpertTransport::land_decode_misses`]: all cross-stream sync
 /// events `DecodeBack` must wait on (`cuStreamWaitEvent`), all consumer
 /// leases pinning the landed/joined VRAM slots until `DecodeBack` finishes,
@@ -142,6 +162,9 @@ pub(crate) struct DecodeLanding {
     demand_ids: Vec<TransferId>,
     /// Freshly landed unified VRAM slots to promote O(1) or release on completion.
     pub demand_slots: Vec<DemandSlot>,
+    /// Keeps `ExpertTransport::demand_in_flight` incremented until `DecodeBack`
+    /// releases/completes this landing.
+    _flight: DemandFlightGuard,
 }
 
 impl DecodeLanding {
@@ -150,14 +173,16 @@ impl DecodeLanding {
     /// and return `(layer, sequence, demand_slots)` for O(1) promotion or
     /// release in `Directory`.
     pub(crate) fn release_transport(self, transport: &ExpertTransport) -> (usize, u64, Vec<DemandSlot>) {
-        for id in self.demand_ids {
+        let Self { layer, sequence, leases, demand_ids, demand_slots, _flight, .. } = self;
+        for id in demand_ids {
             transport.complete_dma(id);
         }
-        for lease in self.leases {
+        for lease in leases {
             lease.release();
         }
+        drop(_flight);
         transport.drain_deferred_syncs();
-        (self.layer, self.sequence, self.demand_slots)
+        (layer, sequence, demand_slots)
     }
 
     #[cfg(test)]
@@ -379,18 +404,20 @@ impl GateLane {
 
 /// Lock-free per-layer row-aware adaptive gate for split M7 decode DMA.
 struct DecodeDmaGate {
+    draft: bool,
     narrow: GateLane,
     wide: GateLane,
 }
 
 impl DecodeDmaGate {
-    fn for_layer(layer: usize) -> Self {
-        Self::for_layer_with_crossover(layer, SplitDmaCrossover::default())
+    fn for_layer(layer: usize, draft: bool) -> Self {
+        Self::for_layer_with_crossover(layer, draft, SplitDmaCrossover::default())
     }
 
-    fn for_layer_with_crossover(layer: usize, crossover: SplitDmaCrossover) -> Self {
+    fn for_layer_with_crossover(layer: usize, draft: bool, crossover: SplitDmaCrossover) -> Self {
         let phase_offset = ((layer as u32) % SPLIT_DMA_STAGGER_SLOTS) * SPLIT_DMA_STAGGER_STRIDE;
         Self {
+            draft,
             narrow: GateLane::new(phase_offset, crossover.min_bytes),
             wide: GateLane::new(phase_offset, crossover.min_bytes),
         }
@@ -410,6 +437,9 @@ impl DecodeDmaGate {
     }
 
     fn is_splitting(&self) -> bool {
+        if self.draft {
+            return false;
+        }
         let narrow_calls = self.narrow.calls.load(Ordering::Relaxed);
         let wide_calls = self.wide.calls.load(Ordering::Relaxed);
         match (narrow_calls > 0, wide_calls > 0) {
@@ -421,10 +451,16 @@ impl DecodeDmaGate {
     }
 
     fn should_split(&self, rows: u64) -> bool {
+        if self.draft {
+            return false;
+        }
         self.lane(rows).should_split()
     }
 
     fn observe(&self, rows: u64, miss_bytes: u64) {
+        if self.draft {
+            return;
+        }
         self.lane(rows).observe(miss_bytes);
     }
 }
@@ -457,7 +493,7 @@ impl DecodeDmaState {
         sources: Tensor,
         sources_words: Words,
         selected: usize,
-        num_layers: usize,
+        draft_layers: &[bool],
         files: Vec<super::ExchangeTable>,
         events: Arc<super::events::Events>,
     ) -> Self {
@@ -468,7 +504,11 @@ impl DecodeDmaState {
             sources,
             sources_words,
             selected,
-            layer_gates: (0..num_layers).map(DecodeDmaGate::for_layer).collect(),
+            layer_gates: draft_layers
+                .iter()
+                .enumerate()
+                .map(|(layer, &draft)| DecodeDmaGate::for_layer(layer, draft))
+                .collect(),
             files,
             events,
         }
@@ -635,6 +675,9 @@ pub(crate) struct ExpertTransport {
     /// finishes on the GPU (BEFORE `Combine(L)` and `Front(L+1)`).
     pass_completions: Mutex<VecDeque<(PassKey, seismic::NativeGraphCompletion)>>,
     decode: Option<DecodeDmaState>,
+    /// Number of active `land_decode_misses` flights currently in flight
+    /// between `DecodeFront` and `DecodeBack` release/completion.
+    demand_in_flight: AtomicUsize,
     /// Diagnostic counters (lock-free).
     transfers_issued: AtomicU64,
     demand_joins: AtomicU64,
@@ -663,6 +706,7 @@ impl ExpertTransport {
             prefill_ready: Condvar::new(),
             pass_completions: Mutex::default(),
             decode: None,
+            demand_in_flight: AtomicUsize::new(0),
             transfers_issued: AtomicU64::new(0),
             demand_joins: AtomicU64::new(0),
             prefill_dma_batches: AtomicU64::new(0),
@@ -678,6 +722,7 @@ impl ExpertTransport {
             prefill_ready: Condvar::new(),
             pass_completions: Mutex::default(),
             decode,
+            demand_in_flight: AtomicUsize::new(0),
             transfers_issued: AtomicU64::new(0),
             demand_joins: AtomicU64::new(0),
             prefill_dma_batches: AtomicU64::new(0),
@@ -715,6 +760,23 @@ impl ExpertTransport {
                 c.min_bytes as f64 / (1024.0 * 1024.0),
             );
         }
+    }
+
+    /// Whether M7 on-demand decode DMA is active on this transport.
+    pub(crate) fn has_decode_dma(&self) -> bool {
+        self.decode.is_some()
+    }
+
+    /// Whether any on-demand decode DMA flight (`land_decode_misses`) is
+    /// currently active (in flight or awaiting `DecodeBack` completion).
+    pub(crate) fn demand_active(&self) -> bool {
+        self.demand_in_flight.load(Ordering::Acquire) > 0
+    }
+
+    /// Enter a scoped demand flight (used by tests to exercise `demand_active`).
+    #[cfg(test)]
+    pub(crate) fn enter_demand_flight(self: &Arc<Self>) -> DemandFlightGuard {
+        DemandFlightGuard::new(Arc::clone(self))
     }
 
     /// Whether on-demand decode DMA should split `layer` into
@@ -1255,6 +1317,8 @@ impl ExpertTransport {
             return Ok(None);
         }
 
+        let _flight = DemandFlightGuard::new(Arc::clone(self));
+
         let region_bytes = dma.bank_stores.region_bytes(group);
         let expert_bytes: u64 = region_bytes.iter().copied().sum();
 
@@ -1504,10 +1568,7 @@ impl ExpertTransport {
         }
 
         if !replenished && (overflow_experts > 0 || !resolved.is_empty()) {
-            // Proactively maintain a small active floor of free demand slots
-            // (K for narrow decode, 2*K for wide verify bursts) when neither
-            // Phase A nor Phase B already replenished inside `claim_batch`.
-            let _ = claim_batch(group, &[], (overflow_experts as usize).max(target_free));
+            let _ = claim_batch(group, &[], (overflow_experts as usize).max(1));
         }
 
         if let Some(gate) = dma.layer_gates.get(layer) {
@@ -1533,6 +1594,7 @@ impl ExpertTransport {
             leases,
             demand_ids,
             demand_slots,
+            _flight,
         }))
     }
 
@@ -2023,16 +2085,21 @@ mod tests {
     #[test]
     fn decode_dma_gate_skips_low_miss_layers_and_reengages_on_shift() {
         // High-miss regime (GLM-5.3: 64 MB/layer).
-        let high = DecodeDmaGate::for_layer(0);
+        let high = DecodeDmaGate::for_layer(0, false);
         for _ in 0..32 {
             assert!(high.should_split(1), "high-miss layer must always use split DMA");
             assert!(high.is_splitting(), "high-miss layer must report splitting");
             high.observe(1, 64 * 1024 * 1024);
         }
 
+        // Draft layers (DSpark) NEVER split decode.
+        let draft = DecodeDmaGate::for_layer(40, true);
+        assert!(!draft.is_splitting(), "draft layer must never report splitting");
+        assert!(!draft.should_split(1) && !draft.should_split(4));
+
         // Moderate-miss regime (1.4 MB/layer alternating with 0-miss calls):
         // must stay on split hardware DMA rather than falling back to SM zero-copy.
-        let moderate = DecodeDmaGate::for_layer(0);
+        let moderate = DecodeDmaGate::for_layer(0, false);
         for i in 0..SPLIT_DMA_WARMUP_CALLS {
             assert!(moderate.should_split(1), "warmup call {i} should measure split DMA");
             moderate.observe(1, if i % 3 == 0 { 1_400_000 } else { 0 });
@@ -2040,7 +2107,7 @@ mod tests {
         assert!(moderate.should_split(1), "layers with misses must stay on split DMA");
 
         // Zero-miss resident regime: gates onto pipelined `Whole` after warmup.
-        let low = DecodeDmaGate::for_layer(0);
+        let low = DecodeDmaGate::for_layer(0, false);
         for i in 0..SPLIT_DMA_WARMUP_CALLS {
             assert!(low.should_split(1), "warmup call {i} should measure split DMA");
             low.observe(1, 0);
@@ -2066,7 +2133,7 @@ mod tests {
     /// `RunStage::Whole` SM zero-copy PCIe.
     #[test]
     fn decode_dma_gate_m1_cooldown_never_strands_wide_verify_burst() {
-        let gate = DecodeDmaGate::for_layer(3);
+        let gate = DecodeDmaGate::for_layer(3, false);
         for _ in 0..SPLIT_DMA_WARMUP_CALLS {
             assert!(gate.should_split(1));
             gate.observe(1, 0);
@@ -2087,7 +2154,7 @@ mod tests {
     /// same step (preventing a 48-layer synchronous probe storm).
     #[test]
     fn decode_dma_gate_staggers_probes_across_48_layers() {
-        let gates: Vec<DecodeDmaGate> = (0..48).map(DecodeDmaGate::for_layer).collect();
+        let gates: Vec<DecodeDmaGate> = (0..48).map(|l| DecodeDmaGate::for_layer(l, false)).collect();
         for _ in 0..SPLIT_DMA_WARMUP_CALLS {
             for gate in &gates {
                 assert!(gate.should_split(1));
@@ -2148,7 +2215,7 @@ mod tests {
         );
 
         // (1) DeepSeek (8.7 MiB/layer) stays 100% on hardware DMA.
-        let deepseek_m1 = DecodeDmaGate::for_layer_with_crossover(0, fast_sync);
+        let deepseek_m1 = DecodeDmaGate::for_layer_with_crossover(0, false, fast_sync);
         for _ in 0..8 {
             assert!(deepseek_m1.should_split(1));
             deepseek_m1.observe(1, 8_700_000);
@@ -2156,7 +2223,7 @@ mod tests {
         assert!(deepseek_m1.should_split(1), "DeepSeek 8.7 MiB must stay on split DMA");
 
         // (2) Qwen (0 misses) gates onto pipelined RunStage::Whole.
-        let qwen_m1 = DecodeDmaGate::for_layer_with_crossover(0, fast_sync);
+        let qwen_m1 = DecodeDmaGate::for_layer_with_crossover(0, false, fast_sync);
         for _ in 0..SPLIT_DMA_WARMUP_CALLS {
             assert!(qwen_m1.should_split(1));
             qwen_m1.observe(1, 0);
@@ -2164,7 +2231,7 @@ mod tests {
         assert!(!qwen_m1.should_split(1), "Qwen 0-miss must gate onto RunStage::Whole");
 
         // (3) Qwen M=12 1-2 misses (1.35-2.7 MiB) gates onto pipelined RunStage::Whole under 80.1 us boundary.
-        let qwen_m12 = DecodeDmaGate::for_layer_with_crossover(0, heavy_sync);
+        let qwen_m12 = DecodeDmaGate::for_layer_with_crossover(0, false, heavy_sync);
         for i in 0..SPLIT_DMA_WARMUP_CALLS {
             assert!(qwen_m12.should_split(12));
             let miss_bytes = if i % 2 == 0 { 1_350_000 } else { 2_700_000 };
@@ -2177,7 +2244,7 @@ mod tests {
         );
 
         // (4) Heavy M=12 burst (8 MiB) stays on hardware DMA.
-        let heavy_m12 = DecodeDmaGate::for_layer_with_crossover(0, heavy_sync);
+        let heavy_m12 = DecodeDmaGate::for_layer_with_crossover(0, false, heavy_sync);
         for _ in 0..8 {
             assert!(heavy_m12.should_split(12));
             heavy_m12.observe(12, 8 * MIB);
@@ -2204,6 +2271,7 @@ mod tests {
             stall_share: 0.0,
             transfer,
             back: transfer,
+            concurrent_host_byte_seconds: None,
         };
         let record_bytes = 3 * MIB;
         let link_ns = ((record_bytes as f64 / 24e9) * 1e9).round() as u32;
@@ -2218,6 +2286,7 @@ mod tests {
             host: magnitude_cost_model::HostLines {
                 cpu: None,
                 memory: None,
+                joint_memory: None,
                 landing: None,
                 record_bytes,
             },
@@ -2373,7 +2442,7 @@ mod tests {
             sources,
             sources_words.clone(),
             k,
-            1,
+            &[false],
             vec![file.clone()],
             events.clone(),
         );

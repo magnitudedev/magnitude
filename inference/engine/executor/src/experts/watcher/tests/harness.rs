@@ -499,7 +499,8 @@ pub(super) fn lending_windowed_passes(
     };
     // Beside a host tier, what promotions copy with: the device's transfers
     // (the CPU's, complete as queued), from each tensor's tier records into
-    // its bank records.
+    // its bank records, wired to the same `ExpertTransport` so `Copies::watch`
+    // transitions registered hints to `Landed` before `LinkMover::settle`.
     let transport = crate::experts::transport::ExpertTransport::new_registry_only();
     let copies = crate::experts::copies::Copies::with_transport(
         seismic::Transfer::new(&device).unwrap(),
@@ -665,6 +666,7 @@ pub(super) fn lending_windowed_passes(
             words: WORDS,
             // One choice a row.
             selected: 1,
+            decode_rows: 1,
             demand: WORDS.choices as usize,
             placer,
             tier_copy_dma: false,

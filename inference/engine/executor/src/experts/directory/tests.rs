@@ -1960,6 +1960,14 @@ fn prefill_seed_marks_host_tier_banked_so_conveyed_reclaims_duplicates_for_disjo
     steps.begin_through(10);
     // 1 group, 1 layer of 8 experts; VRAM = 2 non-lent slots, HostTier = 4 slots (non-covering).
     let mut directory = Directory::new(&[2], &[0], &[8], HostTier::replay(vec![4]));
+    directory.price_write_backs(
+        0,
+        Some(WriteBack {
+            terms: magnitude_cost_model::Terms { compute: 0., drive: 4., link: 0., cpu: 0., memory: 0. },
+            drive: 1.,
+            link: 0.,
+        }),
+    );
     // 1. Land experts 0..4 into HostTier during prefill.
     for expert in 0..4 {
         let Claim::Taken(grant) = directory.claim_conveyed(0, expert, Some(1)) else {
@@ -2087,6 +2095,14 @@ fn claim_ahead_and_carryover_skip_non_lent_vram_experts_on_non_covering_tier() {
     steps.begin_through(10);
     let mut directory = Directory::new(&[2], &[0], &[6], HostTier::replay(vec![3]));
     directory.price_copies(0, Some(0.));
+    directory.price_write_backs(
+        0,
+        Some(WriteBack {
+            terms: magnitude_cost_model::Terms { compute: 0., drive: 4., link: 0., cpu: 0., memory: 0. },
+            drive: 1.,
+            link: 0.,
+        }),
+    );
     let rec = directory.land(0, 0, 0).unwrap();
     directory.landed(0, rec, 0, Some(1));
     log(&directory, 2, 0, &[0]);
@@ -2116,6 +2132,14 @@ fn host_has_free_slot_tracks_non_evicting_ready_headroom() {
     steps.begin_through(10);
     // HostTier = 3 total slots, reserve = 1 -> 2 non-evicting free slots.
     let mut directory = Directory::new(&[1], &[0], &[6], HostTier::replay(vec![3]).reserving(1));
+    directory.price_write_backs(
+        0,
+        Some(WriteBack {
+            terms: magnitude_cost_model::Terms { compute: 0., drive: 4., link: 0., cpu: 0., memory: 0. },
+            drive: 1.,
+            link: 0.,
+        }),
+    );
     assert!(directory.host_has_free_slot(0), "2 non-reserve slots are ready");
 
     let Claim::Taken(g0) = directory.claim_conveyed(0, 0, Some(1)) else { panic!("slot 0") };
@@ -2132,4 +2156,510 @@ fn host_has_free_slot_tracks_non_evicting_ready_headroom() {
     assert_eq!(directory.surrender_banked(&Unbegun::at(2)).len(), 1);
     directory.retire_graces(at(2, 1), &steps);
     assert!(directory.host_has_free_slot(0), "surrendered duplicate restores non-evicting free slot");
+}
+
+#[test]
+fn decode_transient_budget_eliminates_dma_overflow_for_m6_k8_by_construction() {
+    use crate::experts::host_records::{Claim, Taking};
+
+    // Group with 4 layers, 256 experts/layer, 300 bank records (280 permanent + 20 stage).
+    // Verify burst M = 6, K = 8 -> W_max = 48 distinct misses in one layer.
+    let layers = 4usize;
+    let experts = 256usize;
+    let present = 300usize;
+    let stage_slots = 20usize;
+    let m_max = 6usize;
+    let k = 8usize;
+    let map_words = magnitude_kernels::constants::MAP_WORDS;
+    let bank_maps = (0..layers)
+        .map(|_| StampedMap::new(cpu_words(&[experts as u64, map_words], 0)))
+        .collect();
+    let tier_maps = (0..layers)
+        .map(|_| LandingMap::Tier(cpu_words(&[experts as u64], -1)))
+        .collect();
+    let host = HostTier {
+        records: vec![(layers * experts) as u32],
+        lent: vec![0],
+        reserve: 0,
+        placement: Placement::Tier {
+            bank_maps,
+            tier_maps,
+            lent: (0, 0),
+            stage_slots: vec![stage_slots],
+        },
+    };
+    let mut directory = Directory::new(&[present], &vec![0; layers], &vec![experts; layers], host);
+    // Non-speculative M=1 decode reserves only K=8 slots (never 48!), preserving
+    // resident VRAM for Held experts.
+    directory.configure_decode_budget(1, k, 3);
+    assert_eq!(directory.decode_budget(0).demand_floor, k);
+    assert_eq!(directory.reserved(0), k);
+
+    // Speculative M=6 verify reserves expected unique misses `ceil(48 * p_miss)`
+    // (`34` free slots), and `StageIdle` borrow absorbs any outlier burst up to
+    // `M * K = 48` with zero `dma_overflow`.
+    directory.configure_decode_budget(m_max, k, 3);
+
+    let p_miss = 1.0 - (present as f64 / (layers * experts) as f64);
+    let expected_floor = ((m_max * k) as f64 * p_miss).ceil() as usize;
+    let budget = directory.decode_budget(0);
+    assert_eq!(budget.demand_floor, expected_floor, "demand_floor tracks expected unique misses ceil(W_max * p_miss)");
+    assert_eq!(budget.promote_headroom, k);
+    assert_eq!(directory.reserved(0), budget.demand_floor);
+    assert_eq!(directory.demand_free_floor(0), budget.demand_floor);
+    assert_eq!(directory.demand_replenish_target(0), budget.demand_floor + budget.promote_headroom);
+
+    // Land all experts into the host tier and allow zero-cost promotions.
+    let mut tier_records = Vec::with_capacity(experts);
+    for layer in 0..layers {
+        (0..experts).for_each(|expert| {
+            let Claim::Taken(grant) = directory.claim_landing(layer, expert, 0, Taking::Out, (|_, _| (), |_, _| true)) else {
+                panic!("host tier has room for every expert");
+            };
+            directory.landed(layer, HostRecord(grant.record()), expert, Some(1));
+            if layer == 0 {
+                tier_records.push(grant.record());
+            }
+        });
+        directory.price_copies(layer, Some(0.0));
+    }
+
+    // Feed decode reads so Reuse wants to fill permanent VRAM via promotions.
+    let steps = steps();
+    let step1 = steps.begin_group(1, None);
+    let hot: Vec<usize> = (0..100).collect();
+    for layer in 0..layers {
+        log(&directory, step1, layer, &hot);
+    }
+    assert!(directory.settle_changes());
+    // Run promotions up to full budget: `Directory::promotions` MUST leave
+    // `demand_free_floor == 48` free slots untouched for on-demand decode DMA.
+    let wants = steps.unbegun(|at| directory.promotions(at, present));
+    assert!(!wants.promotions.is_empty());
+    assert!(
+        directory.bank_free_count(0) >= budget.demand_floor,
+        "promotions must preserve >= {} free slots, left {}",
+        budget.demand_floor,
+        directory.bank_free_count(0)
+    );
+
+    // Claim M*K = 48 unheld distinct misses in layer 0 in a single verify burst:
+    // zero `DemandSlotClaim::Overflow` by construction!
+    let mut claimed = 0usize;
+    let mut overflow = 0usize;
+    for &tier_rec in tier_records.iter().skip(100).take(m_max * k) {
+        match directory.claim_demand_landing(0, tier_rec, false, |_| true) {
+            DemandSlotClaim::Allocated { .. } | DemandSlotClaim::AlreadyHeld { .. } => claimed += 1,
+            DemandSlotClaim::Overflow { .. } => overflow += 1,
+        }
+    }
+    assert_eq!(overflow, 0, "M=6, K=8 must have dma_overflow == 0 by construction");
+    assert_eq!(claimed, m_max * k);
+}
+
+#[test]
+fn tiny_vram_borrows_stage_idle_without_promotion_and_returns_to_stage_idle() {
+    use crate::experts::host_records::{Claim, Taking};
+    use crate::experts::reuse::Evidence;
+
+    // Tiny-VRAM group: 4 total records = 2 permanent + 2 stage_rings slots.
+    let experts = 8usize;
+    let map_words = magnitude_kernels::constants::MAP_WORDS;
+    let host = HostTier {
+        records: vec![experts as u32],
+        lent: vec![0],
+        reserve: 0,
+        placement: Placement::Tier {
+            bank_maps: vec![StampedMap::new(cpu_words(&[experts as u64, map_words], 0))],
+            tier_maps: vec![LandingMap::Tier(cpu_words(&[experts as u64], -1))],
+            lent: (0, 0),
+            stage_slots: vec![2],
+        },
+    };
+    let mut directory = Directory::new(&[4], &[0], &[experts], host);
+    let steps = steps();
+    steps.begin_through(3);
+    let mut tier_recs = Vec::new();
+    for expert in 0..experts {
+        let Claim::Taken(grant) = directory.claim_landing(0, expert, 0, Taking::Out, (|_, _| (), |_, _| true)) else {
+            panic!("host tier has room");
+        };
+        directory.landed(0, HostRecord(grant.record()), expert, Some(1));
+        tier_recs.push(grant.record());
+    }
+
+    // Fill both permanent `Free` slots with demand landings (slots 2 and 3).
+    let DemandSlotClaim::Allocated { slot: s0, .. } = directory.claim_demand_landing(0, tier_recs[0], false, |_| true) else {
+        panic!("expected free slot 0");
+    };
+    let DemandSlotClaim::Allocated { slot: s1, .. } = directory.claim_demand_landing(0, tier_recs[1], false, |_| true) else {
+        panic!("expected free slot 1");
+    };
+    assert!(s0 >= 2 && s1 >= 2, "initial claims must come from Free permanent slots");
+    assert_eq!(directory.bank_free_count(0), 0);
+
+    // Next claim with `Free` empty borrows an unpinned `StageIdle` slot (0 or 1)
+    // instead of returning `Overflow`!
+    let DemandSlotClaim::Allocated { staged, slot: borrowed } =
+        directory.claim_demand_landing(0, tier_recs[2], false, |_| true)
+    else {
+        panic!("expected tiny-VRAM borrow from StageIdle instead of Overflow");
+    };
+    assert!(borrowed < 2, "borrowed slot {borrowed} must come from stage_rings 0..2");
+
+    // Even if `Reuse` ranks the expert strongly, `finish_demand_landing` MUST
+    // NEVER promote a borrowed staging slot to `Record::Held`, and MUST return
+    // it to `Record::StageIdle` so `free_stage_slot` sees it again.
+    let ranking = directory.ranking();
+    Reuse::of(&ranking).read(
+        &RoutedRead { sequence: 1, layer: 0, choices: 4, experts: vec![2] },
+        None,
+        Evidence::Decode,
+    );
+    let promoted = directory.finish_demand_landing(0, borrowed, staged, at(1, 0), &steps, true);
+    assert!(!promoted, "borrowed StageIdle slot must NEVER be promoted to Record::Held");
+    assert_eq!(directory.held(0, 2), None, "expert 2 must not be held in permanent VRAM");
+    assert_eq!(
+        directory.free_stage_slot(0, borrowed as u64),
+        Some(borrowed),
+        "borrowed slot must be returned to Record::StageIdle"
+    );
+}
+
+/// Fix 1: When `WriteBack::pays()` is false (Link/HostMemory binds) on a
+/// non-covering `VRAM ⊥ HostTier` bank, promoting an expert to VRAM keeps its
+/// RAM copy as lowest-priority `Kept::Banked` (NOT eagerly surrendered). When
+/// VRAM later evicts that expert (`replenish_demand_free` / `left_bank`), it
+/// transitions `Kept::Banked -> Kept::Alone` in `HostTier` at zero D2H cost
+/// (zero NVMe re-read!) unless `HostTier` actually overwrote that `Kept::Banked`
+/// slot for a genuinely cold `Kept::Alone` miss.
+#[test]
+fn non_paying_write_back_keeps_banked_ram_copy_so_vram_eviction_flips_to_alone_at_zero_cost() {
+    let steps = steps();
+    steps.begin_through(10);
+    // 1 group, 1 layer of 8 experts; VRAM = 2 slots, HostTier = 3 slots (non-covering).
+    let mut directory = Directory::new(&[2], &[0], &[8], HostTier::replay(vec![3]));
+    directory.price_copies(0, Some(0.));
+    // Link/HostMemory binds -> WriteBack::pays() is always false!
+    let link_bound = WriteBack {
+        terms: magnitude_cost_model::Terms { compute: 0.050, drive: 0.025, link: 0.060, cpu: 0.010, memory: 0.060 },
+        drive: 0.005,
+        link: 0.002,
+    };
+    assert!(!link_bound.can_pay());
+    assert!(!link_bound.pays(10.0, 1.0));
+    directory.price_write_backs(0, Some(link_bound));
+
+    // Land experts 0, 1 into HostTier and promote both into VRAM.
+    for expert in 0..2 {
+        let record = directory.land(0, expert, 0).unwrap();
+        directory.landed(0, record, expert, Some(1));
+    }
+    log(&directory, 2, 0, &[0, 1]);
+    let asked = directory.promote();
+    assert_eq!(asked.promotions.len(), 2);
+    for p in &asked.promotions {
+        directory.complete(p);
+    }
+
+    // `surrender_banked` and `promotions` must NOT eagerly unmap `Kept::Banked`
+    // while `WriteBack::can_pay()` is false!
+    assert!(!directory.has_surrenders());
+    assert!(directory.surrender_banked(&Unbegun::at(3)).is_empty());
+    assert!(directory.in_tier(0, 0) && directory.in_tier(0, 1), "banked RAM copies stay resident");
+    assert_eq!(directory.alone(0), 0, "banked copies do not count as Kept::Alone");
+
+    // Evict one expert from VRAM via `replenish_demand_free`: zero D2H write-back,
+    // and the evicted expert flips `Kept::Banked -> Kept::Alone` in `HostTier`!
+    let released = directory.replenish_demand_free(0, 1, &Unbegun::at(4), |_| true);
+    assert_eq!(released, 1);
+    assert!(directory.backs_queued().is_empty(), "zero D2H write-back when Kept::Banked copy is still in RAM");
+    directory.drain(at(4, 1), &steps);
+    assert_eq!(directory.held_count(0), 1);
+    let evicted_expert = if directory.held(0, 0).is_none() { 0 } else { 1 };
+    let kept_in_vram = 1 - evicted_expert;
+    assert!(
+        directory.in_tier(0, evicted_expert),
+        "evicted VRAM expert {evicted_expert} must remain resident in HostTier (zero NVMe re-read!)"
+    );
+    assert_eq!(directory.alone(0), 1, "evicted VRAM expert flipped Kept::Banked -> Kept::Alone");
+
+    // Meanwhile, the remaining `Kept::Banked` copy (`kept_in_vram`) is still the
+    // lowest-priority eviction victim (`Kept::Banked < Kept::Alone`): landing cold
+    // experts 2, 3 into the 3-slot HostTier takes the free slot first, then evicts
+    // `Kept::Banked` (`kept_in_vram`) before ever touching `Kept::Alone` (`evicted_expert`)!
+    let r2 = directory.land(0, 2, 0).unwrap();
+    directory.landed(0, r2, 2, Some(5));
+    assert!(directory.in_tier(0, kept_in_vram), "free slot used first");
+    // HostTier is now full: {evicted_expert (Alone), 2 (Alone), kept_in_vram (Banked)}.
+    // Refilling 1 slot for a cold miss must pick `kept_in_vram` (Kept::Banked) first!
+    let mut dir_refill = Directory::new(&[1], &[0], &[6], HostTier::replay(vec![2]).reserving(1));
+    dir_refill.price_copies(0, Some(0.));
+    dir_refill.price_write_backs(0, Some(link_bound));
+    let a0 = dir_refill.land(0, 0, 0).unwrap();
+    dir_refill.landed(0, a0, 0, Some(1));
+    log(&dir_refill, 2, 0, &[0]);
+    let p = dir_refill.promote();
+    dir_refill.complete(&p.promotions[0]);
+    assert!(dir_refill.in_tier(0, 0), "0 stays Kept::Banked in HostTier");
+    // Land cold expert 1 into the remaining ready slot -> reserve (1) is now short,
+    // so refill_victims must evict `Kept::Banked` (0) instead of `Kept::Alone` (1)!
+    let a1 = dir_refill.land(0, 1, 0).unwrap();
+    dir_refill.landed(0, a1, 1, Some(3));
+    let victims = dir_refill.refill_victims(false);
+    assert_eq!(victims[0].len(), 1);
+    assert_eq!(victims[0][0].1, (0, 0), "Kept::Banked (0) must be evicted before Kept::Alone (1)");
+}
+
+/// Fix 3: `Directory::refill_short` and `refill_victims` bound the reserve by
+/// file-only lacked experts (`lacked - vram_lacked`) rather than raw
+/// `HostRecords::lacked()`, so a disjoint `VRAM + HostTier` bank covering all
+/// experts never evicts from `HostTier` to hold an unnecessary reserve.
+#[test]
+fn refill_short_bounds_by_file_only_lacked_experts_excluding_vram() {
+    let steps = steps();
+    steps.begin_through(10);
+    // 1 group, 1 layer of 5 experts; VRAM = 2 slots, HostTier = 3 slots, reserve = 2.
+    // Together VRAM (2) + HostTier (3) = 5 cover all 5 experts!
+    let mut directory = Directory::new(&[2], &[0], &[5], HostTier::replay(vec![3]).reserving(2));
+    directory.price_copies(0, Some(0.));
+    directory.price_write_backs(
+        0,
+        Some(WriteBack {
+            terms: magnitude_cost_model::Terms { compute: 0., drive: 4., link: 0., cpu: 0., memory: 0. },
+            drive: 1.,
+            link: 0.,
+        }),
+    );
+    // Promote experts 0, 1 into VRAM and surrender their HostTier copies so VRAM = {0, 1}.
+    for expert in 0..2 {
+        let rec = directory.land(0, expert, 0).unwrap();
+        directory.landed(0, rec, expert, Some(1));
+    }
+    log(&directory, 2, 0, &[0, 1]);
+    let asked = directory.promote();
+    for p in &asked.promotions {
+        directory.complete(p);
+    }
+    directory.surrender_banked(&Unbegun::at(3));
+    directory.retire_graces(at(3, 1), &steps);
+    assert_eq!(directory.held_count(0), 2);
+    assert_eq!(directory.host(0).ready(), 3);
+
+    // Land remaining experts 2, 3, 4 into HostTier -> all 5 experts are now in memory!
+    for expert in 2..5 {
+        let rec = directory.land(0, expert, 0).unwrap();
+        directory.landed(0, rec, expert, Some(4));
+    }
+    // Raw `host(0).lacked()` is 2 (experts 0 and 1 in VRAM), but file-only lacked is 0!
+    assert_eq!(directory.host(0).lacked(), 2);
+    assert!(
+        !directory.refill_short(),
+        "when VRAM + HostTier cover all experts, refill_short must be false (0 file-only lacked)"
+    );
+    assert!(directory.refill_victims(false)[0].is_empty());
+}
+
+/// Dynamic `set_decode_rows` scales `DecodeTransientBudget::demand_floor` to
+/// actual active `M` (`1` -> `4` -> `1`) using `ceil(min(E, M * K) * p_miss)`
+/// rather than compile-time `VERIFY_ROWS = 16`, preserving permanent VRAM on
+/// 8-group DeepSeek-like banks (`~176` total reserve at M=4 instead of `701`).
+#[test]
+fn set_decode_rows_scales_dynamically_for_8_group_deepseek() {
+    let group_layers = [20usize, 4, 4, 4, 2, 2, 2, 2];
+    let present: Vec<usize> = group_layers.iter().map(|&n| n * 45).collect();
+    let mut layer_groups = Vec::new();
+    let mut layer_experts = Vec::new();
+    for (g, &n) in group_layers.iter().enumerate() {
+        for _ in 0..n {
+            layer_groups.push(g);
+            layer_experts.push(384usize);
+        }
+    }
+    let host = HostTier::replay(vec![200; 8]);
+    let mut directory = Directory::new(&present, &layer_groups, &layer_experts, host);
+    let k = 6usize;
+
+    // Initial M=1: each group reserves K=6 (48 total across 8 groups).
+    directory.configure_decode_budget(1, k, 3);
+    let reserve_m1: usize = (0..8).map(|g| directory.reserved(g)).sum();
+    assert_eq!(reserve_m1, 8 * k);
+
+    // First M=4 verify step: each group scales to ceil(24 * (1 - 45/384)) = 22 (176 total, NOT 701!).
+    directory.set_decode_rows(4);
+    let reserve_m4: usize = (0..8).map(|g| directory.reserved(g)).sum();
+    assert_eq!(reserve_m4, 8 * 22);
+    assert!(reserve_m4 < 200, "M=4 8-group reserve must stay ~176 (not 701!), got {reserve_m4}");
+
+    // Alternating M=1 plain step after M=4 verify keeps the monotonic high-water
+    // mark (`M=4`) so the next M=4 verify step has zero `dma_overflow`.
+    directory.set_decode_rows(1);
+    let reserve_after_m1: usize = (0..8).map(|g| directory.reserved(g)).sum();
+    assert_eq!(reserve_after_m1, reserve_m4, "monotonic high-water mark preserves M=4 floor across M=1 plain steps");
+
+    // 8 target groups + 1 non-splitting DSpark draft group (16 slots/layer = 48):
+    // draft group 8 keeps `demand_floor == 0` (`vram_reserve == 0`) so total
+    // M=1 reserve is `8 * K = 48` (NOT `9 * K = 54`) and stays `0` at `M=4`.
+    let mut with_draft_present: Vec<usize> = present.clone();
+    with_draft_present.push(48);
+    let mut with_draft_groups = layer_groups.clone();
+    let mut with_draft_experts = layer_experts.clone();
+    for _ in 0..3 {
+        with_draft_groups.push(8);
+        with_draft_experts.push(64);
+    }
+    let mut with_draft = Directory::new(&with_draft_present, &with_draft_groups, &with_draft_experts, HostTier::replay(vec![200; 9]));
+    with_draft.configure_decode_budget(1, k, 3);
+    with_draft.set_group_splitting(8, false);
+    assert_eq!((0..9).map(|g| with_draft.reserved(g)).sum::<usize>(), 8 * k, "M=1 reserve is 8*K=48, NOT 54");
+    with_draft.set_decode_rows(4);
+    assert!(with_draft.reserved(0) > 0, "splitting target group retains M=4 demand_floor");
+    assert_eq!(with_draft.decode_budget(8).demand_floor, 0, "non-splitting draft group 8 must have demand_floor == 0");
+    assert_eq!(with_draft.reserved(8), 0, "non-splitting 16-slot/layer draft group 8 must keep vram_reserve == 0");
+}
+
+/// Real DeepSeek-V4.1 8-group geometry on RTX 5090-128g (`E=384, K=6, 8 groups,
+/// vram_usable=1258, host_slots=317/layer, B_dma_alone=43.57 GB/s,
+/// B_mem=47.80 GB/s, M=4`) asserting all 5 adversarial-audit invariants:
+/// 1. `total_vram_reserve < 200` slots across all 8 groups (`< 16%` of 1,258, NOT 701).
+/// 2. `effective_cpu_for` returns `None` on Gen5 2-ch DDR5 (0 CPU-site experts
+///    even at `M=4` with 20 misses/layer) and `Some(...)` on Gen4 3090.
+/// 3. `HostTier` per-group reserve is `ceil(71/8) = 9` (NOT `71 × 8 = 568`).
+/// 4. When `WriteBack::pays() == false`, promoting to VRAM and evicting from
+///    VRAM leaves the expert resident in `HostTier` (`Kept::Banked -> Kept::Alone`, 0 NVMe drop).
+/// 5. Speculative `Drive` prefetch defers when `host_memory_binds() && demand_active()`,
+///    and `Parked(0) < Streamed(1) < Expected(2)` strictly prioritizes decode demand.
+#[test]
+fn deepseek_v41_rtx5090_8_group_all_five_invariants() {
+    use crate::experts::bank::group_tier_reserve;
+    use crate::experts::transport::ExpertTransport;
+    use magnitude_cost_model::{
+        CpuLines, ExpertLines, GpuLines, HostLines, Moves, Nanoseconds, Pass, PassLine,
+        PathAdmission, ReadLine, RowCost, RowLine, Site, Terms,
+    };
+    use seismic_io::Want;
+
+    // 40 layers across 8 mixed-quant groups, totaling 1,258 usable VRAM slots
+    // (~31.45 slots/layer; group counts sum to 1,258) and 317 HostTier slots/layer.
+    let group_layers = [20usize, 4, 4, 4, 2, 2, 2, 2];
+    let present = [628usize, 126, 126, 126, 63, 63, 63, 63];
+    assert_eq!(present.iter().sum::<usize>(), 1_258);
+    let host_records: Vec<u32> = group_layers.iter().map(|&n| (n * 317) as u32).collect();
+    let mut layer_groups = Vec::new();
+    let mut layer_experts = Vec::new();
+    for (g, &n) in group_layers.iter().enumerate() {
+        for _ in 0..n {
+            layer_groups.push(g);
+            layer_experts.push(384usize);
+        }
+    }
+    let k = 6usize;
+
+    // Invariant 3: HostTier per-group reserve is ceil(71/8) = 9 (72 total, NOT 568!).
+    let host_reserve_per_group = group_tier_reserve(71, 8, k);
+    assert_eq!(host_reserve_per_group, 9);
+    assert_eq!(host_reserve_per_group * 8, 72);
+
+    let host = HostTier::replay(host_records).reserving(host_reserve_per_group);
+    let mut directory = Directory::new(&present, &layer_groups, &layer_experts, host);
+
+    // Invariant 1: Dynamic M=4 decode reserve across all 8 groups < 200 (< 16% of 1,258, NOT 701!).
+    directory.configure_decode_budget(1, k, 3);
+    directory.set_decode_rows(4);
+    let total_vram_reserve: usize = (0..8).map(|g| directory.reserved(g)).sum();
+    assert!(
+        total_vram_reserve < 200 && (total_vram_reserve as f64 / 1_258.0) < 0.16,
+        "expected total_vram_reserve < 200 (<16% of 1,258), got {total_vram_reserve}"
+    );
+
+    // Invariant 2: Gen5 2-ch DDR5 (`B_dma_alone = 43.57 GB/s`, `B_mem = 47.80 GB/s`,
+    // `resident = 12 µs`, `B_joint = 43.0 GB/s` <= `B_dma_alone`) suppresses CPU-site
+    // (`effective_cpu_for == None`, 0 CPU-site experts even at M=4 with 20 misses/layer),
+    // while Gen4 3090 (`B_dma_alone = 19.31 GB/s`, `B_joint = 36.90 GB/s`) keeps CPU-site enabled.
+    let record_bytes = 8_000_000u64;
+    let ns = |v: u32| Nanoseconds::try_from(v).unwrap();
+    let ns_of_gbs = |gbs: f64| Nanoseconds::of(record_bytes as f64 / (gbs * 1e9)).unwrap();
+    let resident_ns = 12_000u32;
+    let make_lines = |b_dma_gbs: f64, b_mem_gbs: f64, b_joint_gbs: f64| ExpertLines {
+        host: HostLines {
+            cpu: Some(CpuLines {
+                expert: RowLine { one: ns(180_000), row: RowCost::Measured(ns(2_000)) },
+                handshake: ns(4_000),
+            }),
+            memory: Some(ns_of_gbs(b_mem_gbs)),
+            joint_memory: Some(ns_of_gbs(b_joint_gbs)),
+            landing: None,
+            record_bytes,
+        },
+        gpu: GpuLines {
+            link: PassLine { weights: ns(ns_of_gbs(b_dma_gbs).get() as u32 + resident_ns), row: ns(100) },
+            resident: PassLine { weights: ns(resident_ns), row: ns(100) },
+            moves: Moves::NONE,
+        },
+    };
+    let gen5 = make_lines(43.57, 47.80, 43.0);
+    assert_eq!(gen5.effective_cpu(), None, "Gen5 2-ch DDR5 must suppress CPU-site");
+    let hits = [magnitude_cost_model::Hits { rows: 1.0, experts: 4.0 }];
+    let misses = vec![magnitude_cost_model::Miss { rows: 1.0, ready_seconds: 0.0 }; 20];
+    let served_gen5 = gen5.serve(Pass::Decode, &hits, &misses);
+    assert_eq!(
+        served_gen5.sites.iter().filter(|&&s| s == Site::Cpu).count(),
+        0,
+        "0 CPU-site experts even at M=4 with 20 misses/layer"
+    );
+    assert_eq!(served_gen5.sites.iter().filter(|&&s| s == Site::Link).count(), 20);
+
+    let gen4 = make_lines(19.31, 47.80, 36.90);
+    assert!(gen4.effective_cpu().is_some(), "Gen4 3090 must keep CPU-site enabled");
+
+    // Invariant 4: When `WriteBack::pays() == false` (Link/HostMemory binds),
+    // promoting an expert to VRAM and evicting it from VRAM leaves it resident
+    // in `HostTier` (`Kept::Banked -> Kept::Alone`, 0 NVMe drop, 0 D2H write-back).
+    let steps = steps();
+    steps.begin_through(10);
+    let link_bound = WriteBack {
+        terms: Terms { compute: 0.050, drive: 0.025, link: 0.060, cpu: 0.010, memory: 0.060 },
+        drive: 0.005,
+        link: 0.002,
+    };
+    assert!(!link_bound.can_pay());
+    for layer in 0..layer_groups.len() {
+        directory.price_copies(layer, Some(0.0));
+        directory.price_write_backs(layer, Some(link_bound));
+    }
+    let rec = directory.land(0, 0, 0).expect("free host slot");
+    directory.landed(0, rec, 0, Some(1));
+    log(&directory, 2, 0, &[0]);
+    let asked = directory.promote();
+    let p0 = asked.promotions.iter().find(|p| p.layer == 0 && p.expert == 0).expect("expert 0 promoted");
+    directory.complete(p0);
+    assert!(directory.surrender_banked(&Unbegun::at(3)).is_empty(), "must not eagerly surrender Kept::Banked");
+    assert!(directory.in_tier(0, 0) && directory.held(0, 0).is_some());
+    // Evict expert 0 from VRAM via shrink/eviction -> flips Kept::Banked -> Kept::Alone in HostTier!
+    directory.evicted(0, &[p0.record.index()], |_, _| Some(2));
+    assert!(directory.held(0, 0).is_none());
+    assert!(directory.in_tier(0, 0), "evicted VRAM expert must stay resident in HostTier (0 NVMe drop)");
+    assert!(directory.host(0).holds_alone((0, 0)), "Kept::Banked flipped to Kept::Alone at zero D2H cost");
+
+    // Invariant 5: Speculative Drive prefetch defers when `host_memory_binds() && demand_active()`,
+    // and strict deadline ordering `Parked(0) < Streamed(1) < Expected(2) < None(3)`.
+    let drive_line = ReadLine::new(0.14e-3, 1.0 / 4.6e9).unwrap();
+    let drive_mem_bound = PathAdmission::drive(
+        Terms { compute: 0.050, drive: 0.025, link: 0.035, cpu: 0.010, memory: 0.060 },
+        Some(drive_line),
+        Some(80e-6),
+        None,
+    );
+    assert!(drive_mem_bound.host_memory_binds());
+    let transport = ExpertTransport::new_registry_only();
+    assert!(!(drive_mem_bound.host_memory_binds() && transport.demand_active()));
+    {
+        let _guard = transport.enter_demand_flight();
+        assert!(drive_mem_bound.host_memory_binds() && transport.demand_active());
+    }
+    let streamed = Want::streamed();
+    let parked = Want::now();
+    let expected = Want::expected(1, 1.0);
+    let undated = Want::undated(1.0);
+    assert!(parked < streamed && streamed < expected && expected < undated);
 }

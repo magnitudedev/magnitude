@@ -374,6 +374,10 @@ pub(in crate::experts) struct Extents {
     pub words: RegionWords,
     /// `K`: a decode row's choices, so choice `c` is row `c / K`'s.
     pub selected: usize,
+    /// Load's actual max decode batch (`ExpertBankPlan::decode_rows`: `1` when
+    /// non-speculative single-slot, up to `VERIFY_ROWS` when speculative verify
+    /// is active).
+    pub decode_rows: usize,
     /// The staging records reads ahead leave free for demand
     /// (`ExpertBankPlan::demand_records`).
     pub demand: usize,

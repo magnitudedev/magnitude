@@ -704,6 +704,12 @@ impl ReadPrice {
         self.admission.binds()
     }
 
+    /// Whether the shared `ContentionDomain::HostMemory` bus is a binding
+    /// resource (`PathAdmission::host_memory_binds`).
+    pub(super) fn host_memory_binds(&self) -> bool {
+        self.admission.host_memory_binds()
+    }
+
     /// Priced net expected stall gain (in miss-equivalent units) of a
     /// carryover prefetch with hit probability `p` and `free_slack` idle
     /// seconds (`PathAdmission::carryover_net_benefit`).
@@ -785,8 +791,20 @@ impl PassService {
     /// The pass's service, each layer's `routed` experts, of them `tiered`
     /// served from the host tier and `absent` from the file (landed into
     /// it), `sites` the CPU site's served misses and path time, beside
-    /// `moved` (the moves' link seconds and records) of `lines`.
-    fn of(lines: &[ExpertLines], routed: &[RoutedRead], tiered: &[Vec<usize>], absent: &[u64], sites: &[(u64, Duration)], moved: (f64, f64)) -> Self {
+    /// `moved` (the moves' link seconds and records), `ahead_landings` (hidden
+    /// Drive prefetch landings into host memory), and `staged_records`
+    /// (`LinkMover` opportunistic staging records read from host memory) of `lines`.
+    #[allow(clippy::too_many_arguments)]
+    fn of(
+        lines: &[ExpertLines],
+        routed: &[RoutedRead],
+        tiered: &[Vec<usize>],
+        absent: &[u64],
+        sites: &[(u64, Duration)],
+        moved: (f64, f64),
+        ahead_landings: f64,
+        staged_records: f64,
+    ) -> Self {
         let mut service = Self { link: moved.0, ..Self::default() };
         let (mut memory, layers) = (0., lines.len() as f64);
         for (layer, lines) in lines.iter().enumerate() {
@@ -813,7 +831,7 @@ impl PassService {
             service.memory += (misses + absent[layer]) as f64 * line.get() * 1e-9;
             memory += line.get() * 1e-9 / layers;
         }
-        service.memory += moved.1 * memory;
+        service.memory += (moved.1 + ahead_landings + staged_records) * memory;
         service
     }
 }
@@ -2876,8 +2894,11 @@ impl Telemetry {
                     });
                     let moved = std::mem::take(&mut costs.moved);
                     let staged_link = std::mem::take(&mut costs.staged_link);
+                    let ahead_landings = used as f64 + cost.ahead.unused().into_iter().flatten().sum::<f64>();
                     let tiered = &decoded.2;
-                    let served = priced.map(|lines| self.with_observed(costs, lines)).map(|lines| PassService::of(&lines, &decoded.1, tiered, absent, &sites, moved));
+                    let served = priced.map(|lines| self.with_observed(costs, lines)).map(|lines| {
+                        PassService::of(&lines, &decoded.1, tiered, absent, &sites, moved, ahead_landings, staged_link.1)
+                    });
                     let PassService { link, cpu, memory, served } = served.unwrap_or_default();
                     // Its exact rows' misses of the memory the GPU computes
                     // from: its file and host tier misses, and where reads
@@ -3783,12 +3804,28 @@ mod tests {
             &[1, 0, 2],
             &[(1, Duration::from_micros(50)), (0, Duration::ZERO), (0, Duration::ZERO)],
             (0.5e-3, 4.),
+            0.,
+            0.,
         );
         let close = |actual: f64, expected: f64| assert!((actual - expected).abs() < 1e-12, "{actual} ≠ {expected}: {service:?}");
         close(service.link, 0.5e-3 + 2. * 86e-6);
         close(service.cpu, 50e-6);
         close(service.memory, (3. + 1.) * 38e-6 + 4. * 38e-6 * 2. / 3.);
         close(service.served, 84e-6 - 40e-6);
+
+        // Hidden Drive prefetch landings and LinkMover staged records also
+        // consume shared HostMemory bandwidth.
+        let with_ahead = PassService::of(
+            &[tiered, tiered, unified],
+            &[routed(0, 10), routed(1, 8), routed(2, 8)],
+            &[vec![3, 4], Vec::new(), vec![1]],
+            &[1, 0, 2],
+            &[(1, Duration::from_micros(50)), (0, Duration::ZERO), (0, Duration::ZERO)],
+            (0.5e-3, 4.),
+            3.,
+            2.,
+        );
+        close(with_ahead.memory, (3. + 1.) * 38e-6 + (4. + 3. + 2.) * 38e-6 * 2. / 3.);
     }
 
     /// A candidate the route chose is a miss a hint of it saves wherever a

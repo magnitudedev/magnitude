@@ -1774,6 +1774,7 @@ fn async_dma_scratch_ring_deepseek_stress() {
                 round_records: ROUND_RECORDS as usize,
                 words: stress_words,
                 selected: 2,
+                decode_rows: 1,
                 demand: stress_words.choices as usize,
                 placer: Placer::Tier,
                 tier_copy_dma: true,

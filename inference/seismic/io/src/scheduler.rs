@@ -61,15 +61,15 @@ impl Deadline {
         self.key().2
     }
 
-    /// What it orders by: due before expected before none, then a due
-    /// one's instant, then an expected one's step, then a parked wait
-    /// before a stream's.
-    fn key(&self) -> (u8, Option<Instant>, u64, bool) {
+    /// What it orders by: parked demand strictly before streamed prefill,
+    /// before expected read-ahead, before undated; within parked/streamed by
+    /// instant, and within expected by target step.
+    fn key(&self) -> (u8, Option<Instant>, u64) {
         match *self {
-            Self::Parked(at) => (0, Some(at), 0, false),
-            Self::Streamed(at) => (0, Some(at), 0, true),
-            Self::Expected(step) => (1, None, step, false),
-            Self::None => (2, None, 0, false),
+            Self::Parked(at) => (0, Some(at), 0),
+            Self::Streamed(at) => (1, Some(at), 0),
+            Self::Expected(step) => (2, None, step),
+            Self::None => (3, None, 0),
         }
     }
 }

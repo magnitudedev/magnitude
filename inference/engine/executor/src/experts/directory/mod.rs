@@ -278,6 +278,81 @@ pub(super) struct Wants {
     pub surrendered: Vec<(usize, usize)>,
 }
 
+/// Single owner of per-group decode transient VRAM sizing on discrete-GPU
+/// tiered banks:
+/// - `demand_floor`: minimum `Record::Free` slots reserved for on-demand decode
+///   DMA landings (`W_max = min(E, M_max * K)`, sized from the load's actual
+///   max decode batch `M_max` and bounded by `cap - members` and `avail - members`).
+/// - `promote_headroom`: extra `Free + Releasing` headroom (`K.min(demand_floor)`)
+///   so `finish_demand_landing` can promote ranked landings in place without
+///   dipping below `demand_floor`.
+/// - `stage_slots`: dedicated even/odd double-buffered DMA staging ring size
+///   (`LinkMover` opportunistic `MAP_STAGE`), bounded strictly by what fits
+///   after `demand_floor + members` without shrinking permanent capacity below
+///   `floor_slots + demand_floor` (zero arbitrary `/ 2` or `/ 8` divisors).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(in crate::experts) struct DecodeTransientBudget {
+    pub demand_floor: usize,
+    pub promote_headroom: usize,
+    pub stage_slots: usize,
+}
+
+impl DecodeTransientBudget {
+    /// Compute the per-group decode transient budget from model and group
+    /// geometry:
+    /// - `m_max`: load's actual max decode batch (`plan.decode_rows()`: `1`
+    ///   when non-speculative single-slot, up to `VERIFY_ROWS` when speculative
+    ///   verify is active),
+    /// - `k`: selected experts per token (`K`),
+    /// - `e`: experts per layer (`E`),
+    /// - `p_miss`: group VRAM miss fraction (`(1 - present / total_experts).clamp(0, 1)`),
+    /// - `cap`: decode capacity of the group,
+    /// - `avail`: records past the lent scratch slice (`present - start`),
+    /// - `members`: number of member layers in the group,
+    /// - `lookahead_layers`: active lookahead layers (`(HINT_LEADS + 1).min(members)`),
+    /// - `floor_slots`: minimum permanent resident records the group must keep.
+    #[allow(clippy::too_many_arguments)]
+    pub(in crate::experts) fn compute(
+        m_max: usize,
+        k: usize,
+        e: usize,
+        p_miss: f64,
+        cap: usize,
+        avail: usize,
+        members: usize,
+        lookahead_layers: usize,
+        floor_slots: usize,
+    ) -> Self {
+        let p_miss = p_miss.clamp(0.0, 1.0);
+        let w_max = e.min(m_max.saturating_mul(k));
+        let expected_misses = ((w_max as f64) * p_miss).ceil() as usize;
+        let demand_floor = expected_misses
+            .max(k.min(w_max))
+            .min(cap.saturating_sub(members))
+            .min(avail.saturating_sub(members));
+        let promote_headroom = k.min(demand_floor);
+        // Bound dedicated `MAP_STAGE` ring per group to the actual in-flight
+        // even/odd `LinkMover` staging depth (`2 * HINT_LEADS` for `M = 1`,
+        // `2 * (HINT_LEADS + 1)` for `M > 1`) so multi-group banks keep
+        // >= 90% of VRAM for permanent `Held` experts.
+        let stage_cap = if m_max > 1 {
+            2usize.saturating_mul(crate::planning::HINT_LEADS as usize + 1)
+        } else {
+            2usize.saturating_mul(crate::planning::HINT_LEADS as usize)
+        };
+        let want_stage = 2usize
+            .saturating_mul(lookahead_layers)
+            .saturating_mul(expected_misses)
+            .min(stage_cap);
+        let resident_floor = floor_slots.max(members);
+        let max_stage = avail
+            .saturating_sub(demand_floor.saturating_add(members))
+            .min(cap.saturating_sub(resident_floor.saturating_add(demand_floor)));
+        let stage_slots = want_stage.min(max_stage) & !1;
+        Self { demand_floor, promote_headroom, stage_slots }
+    }
+}
+
 /// Outcome of claiming a unified VRAM slot for an on-demand decode DMA landing.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(in crate::experts) enum DemandSlotClaim {
@@ -339,6 +414,17 @@ pub(super) struct Directory {
     /// so a promotion takes a record no step reads and copies at once
     /// ([`Self::reserve`]); the ranking's pools are the capacity less it.
     reserve: Vec<usize>,
+    /// Per group, the decode transient budget ([`DecodeTransientBudget`]) owned
+    /// once per group for discrete-GPU tiered banks (default zeroed when
+    /// unconfigured).
+    decode_budget: Vec<DecodeTransientBudget>,
+    /// Per group, whether any layer currently splits decode through M7 async
+    /// DMA (`DecodeFront -> DMA -> DecodeBack`). Groups running `RunStage::Whole`
+    /// (e.g. a 16-slot/layer DSpark draft group) keep `demand_floor = 0`.
+    group_splits: Vec<bool>,
+    /// `(m_max, k, lookahead_layers)` configured via [`Self::configure_decode_budget`]
+    /// so [`Self::resize_pool`] keeps `decode_budget` coherent across resizes.
+    decode_params: Option<(usize, usize, usize)>,
     /// The reads a promotion must expect beyond what it displaces to earn
     /// its copy, each layer's (`ExpertLines::copy_hits`): none where a hit
     /// saves nothing, so no promotion of the layer earns; zero, a copy
@@ -395,6 +481,20 @@ impl WriteBack {
         after.link += self.link / stay;
         after.drive = (after.drive - uses * self.drive / stay).max(0.);
         after.time() < self.terms.time()
+    }
+
+    /// Whether any positive expected reuse can make a write-back pay:
+    /// reducing `terms.drive` can shorten `terms.time()` only when the drive
+    /// is the sole binding term (strictly above every other term) and
+    /// `self.drive > 0`.
+    pub fn can_pay(&self) -> bool {
+        let t = self.terms.time();
+        self.drive > 0.
+            && self.terms.drive >= t
+            && self.terms.compute < t
+            && self.terms.link < t
+            && self.terms.cpu < t
+            && self.terms.memory < t
     }
 }
 
@@ -735,6 +835,9 @@ impl Directory {
             stirred: false,
             withheld: None,
             reserve: vec![0; records.len()],
+            decode_budget: vec![DecodeTransientBudget::default(); records.len()],
+            group_splits: vec![true; records.len()],
+            decode_params: None,
             copy_hits: vec![None; layers.len()],
             asked: 0,
             time,
@@ -851,10 +954,142 @@ impl Directory {
     fn resize_pool(&mut self, group: usize) {
         let capacity = self.capacity(group);
         let members = (0..self.bank.layers()).filter(|&layer| self.bank.group(layer) == group).count();
+        if let Some((m_max, k, lookahead_layers)) = self.decode_params {
+            let stage_slots = self.bank.stage_ring_half(group) * 2;
+            let budget = if !self.group_splits[group] {
+                DecodeTransientBudget { demand_floor: 0, promote_headroom: 0, stage_slots }
+            } else {
+                let e = self.homes[group]
+                    .iter()
+                    .map(|&(_, layer)| self.bank.experts(layer))
+                    .max()
+                    .unwrap_or(0);
+                let total_experts: usize = self.homes[group]
+                    .iter()
+                    .map(|&(_, layer)| self.bank.experts(layer))
+                    .sum();
+                let present = self.bank.counts()[group];
+                let lent = self.bank.seeded_from(group);
+                let avail = present.saturating_sub(lent);
+                let p_miss = (1.0 - (present as f64 / total_experts.max(1) as f64)).clamp(0.0, 1.0);
+                let mut budget = DecodeTransientBudget::compute(
+                    m_max,
+                    k,
+                    e,
+                    p_miss,
+                    capacity,
+                    avail,
+                    members,
+                    lookahead_layers.min(members),
+                    members,
+                );
+                budget.stage_slots = stage_slots;
+                budget
+            };
+            self.decode_budget[group] = budget;
+            self.reserve[group] = budget.demand_floor;
+        }
         self.reserve[group] = self.reserve[group].min(most_reserved(capacity, members));
         Reuse::of(&self.ranking).resize(group, capacity - self.reserve[group]);
         // The group's victims were prepared for the pool before.
         self.host[group].unprepare();
+    }
+
+    /// Configure the single-owner [`DecodeTransientBudget`] for every group on
+    /// a discrete-GPU tiered bank and wire `Directory::reserve(group, demand_floor)`
+    /// so `demand_free_floor() == demand_floor` and
+    /// `demand_replenish_target() == demand_floor + promote_headroom`.
+    pub(in crate::experts) fn configure_decode_budget(
+        &mut self,
+        m_max: usize,
+        k: usize,
+        lookahead_layers: usize,
+    ) {
+        assert!(self.placer == crate::planning::Placer::Tier, "the one store has no tiered decode transient budget");
+        self.decode_params = Some((m_max, k, lookahead_layers));
+        let groups = self.homes.len();
+        for group in 0..groups {
+            let stage_slots = self.bank.stage_ring_half(group) * 2;
+            let budget = if !self.group_splits[group] {
+                DecodeTransientBudget { demand_floor: 0, promote_headroom: 0, stage_slots }
+            } else {
+                let cap = self.capacity(group);
+                let members = self.homes[group].len();
+                let e = self.homes[group]
+                    .iter()
+                    .map(|&(_, layer)| self.bank.experts(layer))
+                    .max()
+                    .unwrap_or(0);
+                let total_experts: usize = self.homes[group]
+                    .iter()
+                    .map(|&(_, layer)| self.bank.experts(layer))
+                    .sum();
+                let present = self.bank.counts()[group];
+                let lent = self.bank.seeded_from(group);
+                let avail = present.saturating_sub(lent);
+                let p_miss = (1.0 - (present as f64 / total_experts.max(1) as f64)).clamp(0.0, 1.0);
+                let mut budget = DecodeTransientBudget::compute(
+                    m_max,
+                    k,
+                    e,
+                    p_miss,
+                    cap,
+                    avail,
+                    members,
+                    lookahead_layers.min(members),
+                    members,
+                );
+                budget.stage_slots = stage_slots;
+                budget
+            };
+            self.decode_budget[group] = budget;
+            self.reserve(group, budget.demand_floor);
+        }
+    }
+
+    /// Member layer indices belonging to `group`.
+    pub(in crate::experts) fn group_layers(&self, group: usize) -> impl Iterator<Item = usize> + '_ {
+        self.homes[group].iter().map(|&(_, layer)| layer)
+    }
+
+    /// Update whether `group` splits decode through M7 async DMA. Groups that
+    /// run `RunStage::Whole` (such as a 16-slot/layer DSpark draft group) keep
+    /// `demand_floor = 0` (`vram_reserve = 0`) even when target decode runs at
+    /// `M > 1`.
+    pub(in crate::experts) fn set_group_splitting(&mut self, group: usize, splits: bool) {
+        if self.group_splits[group] == splits {
+            return;
+        }
+        self.group_splits[group] = splits;
+        if let Some((m_max, k, lookahead_layers)) = self.decode_params {
+            self.configure_decode_budget(m_max, k, lookahead_layers);
+        }
+    }
+
+    /// Dynamically grow the active decode batch high-water mark `m_active`
+    /// (from live `Told::Began` decode launches) so `demand_floor` tracks
+    /// actual `M` (`1`, `4`, `6`, ...) instead of compile-time `VERIFY_ROWS`
+    /// and never shrinks back down on alternating `M=1` plain / `M=4` verify
+    /// steps (`dma_overflow == 0`).
+    pub(in crate::experts) fn set_decode_rows(&mut self, m_active: usize) {
+        let m_active = m_active.max(1);
+        if let Some((current_m, k, lookahead_layers)) = self.decode_params {
+            if m_active > current_m {
+                self.configure_decode_budget(m_active, k, lookahead_layers);
+            }
+        }
+    }
+
+    /// Group `group`'s configured [`DecodeTransientBudget`].
+    #[cfg(test)]
+    pub(in crate::experts) fn decode_budget(&self, group: usize) -> DecodeTransientBudget {
+        self.decode_budget[group]
+    }
+
+    /// Number of currently `Record::Free` slots in `group`.
+    #[cfg(test)]
+    pub fn bank_free_count(&self, group: usize) -> usize {
+        self.bank.free(group).count()
     }
 
     /// Group `group` keeps `records` of its records free or releasing from
@@ -1207,15 +1442,34 @@ impl Directory {
         self.tier(layer).unlanded(record);
     }
 
+    /// Count of experts in `group` currently held in the device bank (`VRAM`)
+    /// that are lacked in `HostTier` (so they cannot demand a host-tier
+    /// landing from the file).
+    fn vram_lacked_in_group(&self, group: usize) -> usize {
+        if self.placer != crate::planning::Placer::Tier {
+            return 0;
+        }
+        let host = &self.host[group];
+        self.bank
+            .records(group)
+            .iter()
+            .filter(|record| matches!(**record, Record::Held(staged) if host.located(staged) == Located::Lacked))
+            .count()
+    }
+
     /// Whether any group's host tier falls short of its reserve
-    /// ([`HostRecords::short_of`]): whether a refill may unmap anything.
+    /// ([`HostRecords::short_of_lacked`]), bounded by file-only lacked experts
+    /// outside VRAM: whether a refill may unmap anything.
     pub fn refill_short(&self) -> bool {
-        self.host.iter().any(|records| records.short_of(0))
+        self.host.iter().enumerate().any(|(group, records)| {
+            let file_lacked = records.lacked().saturating_sub(self.vram_lacked_in_group(group));
+            records.short_of_lacked(0, file_lacked)
+        })
     }
 
     /// Each group's records its reserve unmaps now
-    /// ([`HostRecords::refill_victims`]), none of the lent records while
-    /// `lending`: read from the ranking, changing nothing.
+    /// ([`HostRecords::refill_victims_for_lacked`]), none of the lent records
+    /// while `lending`: read from the ranking, changing nothing.
     pub fn refill_victims(&self, lending: bool) -> Vec<Vec<(u32, Staged)>> {
         let reuse = self.reuse_now();
         let tier = self.host_tier();
@@ -1230,7 +1484,8 @@ impl Directory {
                     let unconsumed = read.is_some_and(|step| reuse.lead_of(layer, step).is_some());
                     (unconsumed, rank(staged, read))
                 };
-                records.refill_victims(protected, lending)
+                let file_lacked = records.lacked().saturating_sub(self.vram_lacked_in_group(group));
+                records.refill_victims_for_lacked(protected, lending, file_lacked)
             })
             .collect()
     }
@@ -1344,12 +1599,31 @@ impl Directory {
         for (layer, expert, top) in changes {
             self.settle(layer, expert, top);
         }
-        self.stirred || self.bank.changed() || self.read_since_withheld() || self.host.iter().any(HostRecords::surrenders)
+        self.stirred || self.bank.changed() || self.read_since_withheld() || self.has_surrenders()
     }
 
-    /// Whether any host tier has copies to surrender (`HostRecords::surrenders`).
+    /// Whether D2H write-back can pay for at least one layer of `group`.
+    /// When false (Link/HostMemory/Compute/Cpu binds, or before write-backs
+    /// are priced), `Kept::Banked` RAM copies are NOT eagerly surrendered
+    /// during decode: they stay resident in `HostTier` as lowest-priority
+    /// eviction victims (`Kept::Banked < Kept::Alone`), so they are only
+    /// overwritten when a genuinely cold `Kept::Alone` expert needs a RAM
+    /// slot, and if VRAM evicts them first (`left_bank` -> `HostRecords::evicted`)
+    /// they flip back to `Kept::Alone` in RAM at zero D2H cost instead of
+    /// dropping to NVMe.
+    fn group_write_back_pays(&self, group: usize) -> bool {
+        self.homes[group]
+            .iter()
+            .any(|&(_, layer)| self.write_backs[layer].is_none_or(|wb| wb.can_pay()))
+    }
+
+    /// Whether any host tier has copies to eagerly surrender (`HostRecords::surrenders`
+    /// on a group where D2H write-back can pay).
     pub fn has_surrenders(&self) -> bool {
-        self.host.iter().any(HostRecords::surrenders)
+        self.host
+            .iter()
+            .enumerate()
+            .any(|(group, host)| self.group_write_back_pays(group) && host.surrenders())
     }
 
     /// Whether the ranking logged a read since promotions last withheld a
@@ -1384,13 +1658,19 @@ impl Directory {
     /// the records a promotion may take cover a want
     /// ([`BankRecords::covering`]). Neither ever takes a lent record, the
     /// scratch's ([`BankRecords::usable`]).
-    /// Surrender every unheld `Kept::Banked` host-tier record across all groups
-    /// (`HostRecords::surrender_records`), returning the `(group, tier_record)`
-    /// pairs whose source generations must be bumped in `ExpertTransport`.
+    /// Surrender unheld `Kept::Banked` host-tier records across groups where
+    /// D2H write-back can pay (`HostRecords::surrender_records`), returning
+    /// the `(group, tier_record)` pairs whose source generations must be bumped
+    /// in `ExpertTransport`. Groups where write-back cannot pay retain their
+    /// `Kept::Banked` RAM copies as lowest-priority eviction victims so VRAM
+    /// eviction flips them back to `Kept::Alone` at zero D2H cost.
     pub fn surrender_banked(&mut self, at: &Unbegun) -> Vec<(usize, usize)> {
         let mut surrendered = Vec::new();
-        for (group, host) in self.host.iter_mut().enumerate() {
-            for (record, _) in host.surrender_records(at) {
+        for group in 0..self.host.len() {
+            if !self.group_write_back_pays(group) {
+                continue;
+            }
+            for (record, _) in self.host[group].surrender_records(at) {
                 surrendered.push((group, record as usize));
             }
         }
@@ -1491,11 +1771,7 @@ impl Directory {
                 .chain(lent_free)
                 .filter(|&record| can_reuse(group, record))
                 .collect();
-            let demand_reserve = if self.bank.capacity(group) > 16 {
-                self.demand_free_floor(group)
-            } else {
-                0
-            };
+            let demand_reserve = self.demand_free_floor(group);
             let available = all_free.len().saturating_sub(demand_reserve);
             let free = all_free.into_iter().take(take.min(available)).collect::<Vec<_>>();
             let promoted = free.len();
@@ -1969,26 +2245,18 @@ impl Directory {
     }
 
     /// Minimum number of `Record::Free` slots kept available in `group` for
-    /// immediate `claim_demand_landing` without stamped-unmap delay: up to 16
-    /// slots (2 × 8 top-K choices), bounded by a quarter of group capacity.
-    fn demand_free_floor(&self, group: usize) -> usize {
-        let cap = self.bank.capacity(group);
-        if cap <= 2 {
-            0
-        } else {
-            16usize.min(cap / 4).max(1)
-        }
+    /// immediate `claim_demand_landing` without stamped-unmap delay
+    /// (`DecodeTransientBudget::demand_floor`).
+    pub(in crate::experts) fn demand_free_floor(&self, group: usize) -> usize {
+        self.decode_budget[group].demand_floor
     }
 
     /// Target `Free + Releasing` headroom maintained by
-    /// [`Self::replenish_demand_free`]: `demand_free_floor` for zero-overflow
-    /// immediate claims plus an equal per-step promotion budget so
+    /// [`Self::replenish_demand_free`]: `demand_floor + promote_headroom` so
     /// [`Self::finish_demand_landing`] can promote ranked landings in place
     /// without ever dipping below `demand_free_floor`.
-    fn demand_replenish_target(&self, group: usize) -> usize {
-        let floor = self.demand_free_floor(group);
-        let cap = self.bank.capacity(group);
-        (floor * 2).min(cap / 3).max(floor)
+    pub(in crate::experts) fn demand_replenish_target(&self, group: usize) -> usize {
+        self.decode_budget[group].demand_floor + self.decode_budget[group].promote_headroom
     }
 
     /// Asynchronously release up to `want_free` lowest-ranked unpinned
@@ -2137,7 +2405,10 @@ impl Directory {
             let mut free_by_group: Option<(usize, usize)> = None;
             batch
                 .iter()
-                .map(|&(group, _record, staged, _can_reuse)| {
+                .map(|&(group, record, staged, _can_reuse)| {
+                    if self.bank.is_borrowed_stage_demand(group, record) {
+                        return false;
+                    }
                     let free_floor = self.demand_free_floor(group);
                     let replenish_target = self.demand_replenish_target(group);
                     let free_now = match free_by_group {

@@ -440,6 +440,25 @@ impl PathAdmission {
         self.terms.binds_path(self.path)
     }
 
+    /// Whether the shared `ContentionDomain::HostMemory` (DDR5) is itself a
+    /// binding resource (`terms.time() > 0.0 && terms.memory >= terms.time()`).
+    pub fn host_memory_binds(&self) -> bool {
+        let peak = self.terms.time();
+        peak > 0.0 && self.terms.memory >= peak
+    }
+
+    /// Remaining idle overlap window across `rem_layers` of `layers` when this
+    /// path (including any shared contention domain such as HostMemory) has
+    /// genuine compute slack: `0.0` when `self.binds()` or `layers == 0`, else
+    /// `(rem_layers as f64 / layers as f64) * self.slack_seconds()`.
+    pub fn shared_idle_window(&self, rem_layers: usize, layers: usize) -> f64 {
+        if self.binds() || layers == 0 {
+            0.0
+        } else {
+            (rem_layers as f64 / layers as f64) * self.slack_seconds()
+        }
+    }
+
     /// Per-step idle path slack `(C - path_term).max(0.0)` when resident
     /// compute exceeds the path's own and shared contention terms (`0.0` when
     /// the path binds).
@@ -1171,5 +1190,50 @@ mod tests {
         assert!(non_binding_adm.carryover_net_benefit(0.09, bytes, 0.0) < 0.0);
         assert!((non_binding_adm.carryover_net_benefit(0.60, bytes, 0.0) - 0.40).abs() < 1e-12);
         assert!((non_binding_adm.carryover_net_benefit(0.25, bytes, 1.0e-3) - 0.25).abs() < 1e-12);
+    }
+
+    #[test]
+    fn host_memory_binds_zeros_shared_idle_window_and_couples_both_paths() {
+        let bytes = 8_000_000u64;
+        let pcie = ReadLine::new(20e-6, 40e-6 / bytes as f64).unwrap();
+        let nvme = ReadLine::new(200e-6, 300e-6 / bytes as f64).unwrap();
+
+        // Compute-bound (50 ms > memory 20 ms > link 15 ms): neither binds,
+        // shared_idle_window scales slack (50 - 20 = 30 ms) by rem_layers / layers.
+        let compute_bound = Terms { compute: 0.050, drive: 0.010, link: 0.015, cpu: 0.005, memory: 0.020 };
+        let link_slack = PathAdmission::link(compute_bound, Some(pcie), Some(80e-6), None);
+        assert!(!link_slack.binds());
+        assert!(!link_slack.host_memory_binds());
+        assert!((link_slack.shared_idle_window(10, 40) - 0.25 * 0.030).abs() < 1e-12);
+        assert_eq!(link_slack.shared_idle_window(10, 0), 0.0);
+
+        // HostMemory-bound (memory 60 ms >= compute 50 ms, link 35 ms, drive 25 ms):
+        // host_memory_binds() is true on BOTH paths and shared_idle_window collapses to 0.0.
+        let mem_bound = Terms { compute: 0.050, drive: 0.025, link: 0.035, cpu: 0.010, memory: 0.060 };
+        let link_mem = PathAdmission::link(mem_bound, Some(pcie), Some(80e-6), None);
+        let drive_mem = PathAdmission::drive(mem_bound, Some(nvme), Some(400e-6), None);
+        assert!(link_mem.binds());
+        assert!(link_mem.host_memory_binds());
+        assert!(drive_mem.binds());
+        assert!(drive_mem.host_memory_binds());
+        assert_eq!(link_mem.shared_idle_window(20, 40), 0.0);
+        assert_eq!(drive_mem.shared_idle_window(20, 40), 0.0);
+
+        // Link-bound (link 60 ms > memory 30 ms): link binds, host_memory_binds() is false,
+        // and link's shared_idle_window is 0.0 while drive's is positive.
+        let link_only = Terms { compute: 0.050, drive: 0.010, link: 0.060, cpu: 0.0, memory: 0.030 };
+        let link_adm = PathAdmission::link(link_only, Some(pcie), Some(80e-6), None);
+        let drive_adm = PathAdmission::drive(link_only, Some(nvme), Some(400e-6), None);
+        assert!(link_adm.binds());
+        assert!(!link_adm.host_memory_binds());
+        assert_eq!(link_adm.shared_idle_window(20, 40), 0.0);
+        assert!(!drive_adm.binds());
+        assert!(!drive_adm.host_memory_binds());
+        assert!((drive_adm.shared_idle_window(20, 40) - 0.5 * 0.020).abs() < 1e-12);
+
+        // Zero terms never bind.
+        let empty = PathAdmission::link(Terms::default(), None, None, None);
+        assert!(!empty.host_memory_binds());
+        assert_eq!(empty.shared_idle_window(10, 40), 0.0);
     }
 }

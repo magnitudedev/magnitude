@@ -615,12 +615,14 @@ impl super::compute::Job for Converting {
             self.ended.set(false);
             return;
         }
-        let terms = match self.urgency.is_waited() {
+        let (waited, hastened_at) = self.urgency.waited_since();
+        let terms = match waited {
             true => &self.account.demand,
             false => &self.account.hinted,
         };
         let began = *self.began.get().expect("a landing's end follows its pieces");
-        LandingAccount::add(&terms.queued, began - self.submitted);
+        let submitted = hastened_at.map_or(self.submitted, |at| self.submitted.max(at));
+        LandingAccount::add(&terms.queued, began.saturating_duration_since(submitted));
         LandingAccount::add(&terms.converting, began.elapsed());
         terms.worked.fetch_add(self.worked.load(std::sync::atomic::Ordering::Relaxed), std::sync::atomic::Ordering::Relaxed);
         terms.landings.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -633,6 +635,10 @@ impl super::compute::Job for Converting {
 
     fn want(&self) -> seismic_io::Want {
         self.urgency.get()
+    }
+
+    fn waited(&self) -> bool {
+        self.urgency.is_waited()
     }
 }
 

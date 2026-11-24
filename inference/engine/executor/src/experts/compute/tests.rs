@@ -190,6 +190,9 @@ impl Job for Counted {
     fn want(&self) -> Want {
         self.urgency.get()
     }
+    fn waited(&self) -> bool {
+        self.urgency.is_waited()
+    }
 }
 
 fn until(condition: impl Fn() -> bool) {

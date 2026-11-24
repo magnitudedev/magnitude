@@ -1794,7 +1794,7 @@ impl Scratch {
             let landing = core.landing_from(grant, |pool| (&pools[pool], u64::from(record)));
             let ended = crate::experts::landing::Ended::new(shared.events());
             let urgency = if async_dma && is_demand {
-                Urgency::waited()
+                Urgency::streamed()
             } else {
                 Urgency::ahead(Want::undated(0.))
             };

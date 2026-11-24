@@ -611,14 +611,16 @@ impl ExpertLines {
     /// - `B_joint = b / t_joint` is the aggregate `HostRam` read throughput
     ///   under concurrent `DMA ∥ CPU` traffic (measured, or conservatively
     ///   bounded by `B_mem = b / host.memory` when unprobed).
-    /// - `B_link = b / gpu.link.weights` is the uncontended link throughput.
+    /// - `B_dma = b / (gpu.link.weights - gpu.resident.weights)` is the
+    ///   uncontended PCIe DMA throughput on `HostRam` (excluding GPU resident
+    ///   compute time `gpu.resident.weights`, which does not touch `HostRam`).
     /// - The spare `HostRam` headroom available to CPU-site alongside saturated
-    ///   link traffic is `B_spare = B_joint - B_link`.
-    /// - When `B_spare <= 0` (`t_joint >= t_link`), offloading to CPU-site adds
+    ///   link traffic is `B_spare = B_joint - B_dma`.
+    /// - When `B_spare <= 0` (`t_joint >= t_dma`), offloading to CPU-site adds
     ///   zero net throughput and degrades wall time, so `Site::Cpu` is
     ///   suppressed (`None`).
     /// - Otherwise, the marginal shared-bus cost of a CPU expert is
-    ///   `t_spare = (t_joint * t_link) / (t_link - t_joint)`, and the CPU's
+    ///   `t_spare = (t_joint * t_dma) / (t_dma - t_joint)`, and the CPU's
     ///   effective per-expert cost is `max(cpu.expert.one, t_spare)`.
     ///
     /// On unified memory (`host.memory == None`), there is no separate `Link`
@@ -632,10 +634,17 @@ impl ExpertLines {
         if t_joint_ns <= 0. || t_link_ns <= 0. {
             return Some(cpu);
         }
-        if t_joint_ns >= t_link_ns {
+        let t_dma_ns = (t_link_ns - self.gpu.resident.weights.get()).max(0.);
+        if t_joint_ns >= t_dma_ns {
             return None;
         }
-        let t_spare_ns = (t_joint_ns * t_link_ns) / (t_link_ns - t_joint_ns);
+        let t_spare_ns = (t_joint_ns * t_dma_ns) / (t_dma_ns - t_joint_ns);
+        // If the marginal shared-bus cost `t_spare` of overlapping CPU-site
+        // with PCIe DMA exceeds the serial sum `t_dma + cpu.one + handshake`,
+        // overlapping on HostRam is strictly worse than Link-only -> suppress.
+        if t_spare_ns > t_dma_ns + cpu.expert.one.get() + cpu.handshake.get() {
+            return None;
+        }
         let effective_one = Nanoseconds::saturating(cpu.expert.one.get().max(t_spare_ns) * 1e-9);
         Some(CpuLines {
             expert: RowLine { one: effective_one, ..cpu.expert },
@@ -1027,11 +1036,11 @@ mod tests {
         assert_eq!(both[&word(layout.link_busy)], 0, "nothing moves");
         assert_eq!(both[&word(layout.hit_row)], 100);
         assert_eq!(both[&word(layout.priced)], 1);
-        // With shared HostRam contention (`memory = 38 µs`, `link = 86 µs`),
-        // POLICY_CPU_NS reflects the spare-headroom marginal cost `68_083 ns`.
+        // With shared HostRam contention (`memory = 38 µs`, `dma = 86 - 5 = 81 µs`),
+        // POLICY_CPU_NS reflects the spare-headroom marginal cost `71_581 ns`.
         let contended = self::lines();
         let contended_words = words(SiteLines::Measured(contended.host.cpu.as_ref().unwrap()), Some(&contended));
-        assert_eq!(contended_words[&word(layout.cpu)], 68_083);
+        assert_eq!(contended_words[&word(layout.cpu)], 71_581);
         assert_eq!(contended_words[&word(layout.priced)], 1);
         let unpriced = words(sited, None);
         assert_eq!(unpriced[&word(layout.priced)], 0);
@@ -1125,7 +1134,7 @@ mod tests {
                 record_bytes: RECORD,
             },
             gpu: GpuLines {
-                link: PassLine { weights: ns_of_gbs(b_link_gbs), row: ns(100) },
+                link: PassLine { weights: ns(ns_of_gbs(b_link_gbs).0 + 5_000), row: ns(100) },
                 resident: PassLine { weights: ns(5_000), row: ns(100) },
                 moves: Moves::NONE,
             },
@@ -1156,14 +1165,16 @@ mod tests {
         assert!(!pol.contains_key(&layout.cpu));
 
         // Conservative analytical fallback (unprobed `joint_memory: None`, `B_joint = B_mem = 47.8 GB/s`):
-        // spare headroom is only `4.2 GB/s` (`t_spare ≈ 714 µs`), so 8 decode misses all go to Link.
+        // spare headroom is only `4.2 GB/s` (`t_spare ≈ 714 µs > t_cpu` and `> t_dma`), so CPU-site
+        // is suppressed (`None`) and all decode misses go to Link without slowing DMA on 2-ch DDR5.
         let analytical = topology_lines(43.6, Some(47.8), None, 75_000);
+        assert_eq!(analytical.effective_cpu(), None);
         let served = analytical.serve(Pass::Decode, &hits(2.), &misses(8, 1.));
         assert_eq!(served.at(Site::Cpu), 0, "{served:?}");
         assert_eq!(served.at(Site::Link), 8, "{served:?}");
         let pol = words(&analytical);
-        assert_eq!(pol[&layout.priced], 1);
-        assert!(pol[&layout.cpu] > 700_000, "marginal CPU cost must reflect 4.2 GB/s spare headroom: {}", pol[&layout.cpu]);
+        assert_eq!(pol[&layout.priced], 0);
+        assert!(!pol.contains_key(&layout.cpu));
     }
 
     /// 2. Gen4 + 2-ch DDR5 (`B_link = 20 GB/s`, `B_mem = 47.8 GB/s`,
@@ -1184,8 +1195,8 @@ mod tests {
 
         let served = contended.serve(Pass::Decode, &hits(3.), &misses(8, 1.));
         let served_uncontended = uncontended.serve(Pass::Decode, &hits(3.), &misses(8, 1.));
-        assert_eq!(served.at(Site::Cpu), 4, "4 of 8 misses (~50% ≈ 24/44) should go to CPU: {served:?}");
-        assert_eq!(served.at(Site::Link), 4, "{served:?}");
+        assert_eq!(served.at(Site::Cpu), 5, "headroom-bounded CPU share with link = dma + resident: {served:?}");
+        assert_eq!(served.at(Site::Link), 3, "{served:?}");
         assert!(
             served.at(Site::Cpu) < served_uncontended.at(Site::Cpu),
             "contended CPU share ({}) must be strictly below uncontended ({})",
@@ -1227,5 +1238,26 @@ mod tests {
         assert_eq!(host.memory, Some(Nanoseconds(38_000)));
         assert_eq!(host.joint_memory, None);
         assert_eq!(host.contended_memory(), Some(Nanoseconds(38_000)));
+    }
+
+    /// 6. Pure DMA transfer time (`gpu.link.weights - gpu.resident.weights`) is
+    ///    used for `HostRam` bus contention: on Gen5 2-ch DDR5 (`B_dma = 43.57 GB/s`,
+    ///    `resident = 12 µs`, `link = dma + resident`), a contended `B_joint = 43.0 GB/s`
+    ///    is below `B_dma` (even though above `b / link`), so CPU-site is suppressed (`None`).
+    ///    On Gen4 3090 (`B_dma = 19.31 GB/s`, `B_joint = 36.90 GB/s`), CPU-site stays enabled.
+    #[test]
+    fn effective_cpu_compares_against_pure_dma_excluding_resident_compute() {
+        // 54d009 Gen5 2-ch DDR5: even at B_joint = B_mem = 47.83 GB/s > B_dma = 43.57 GB/s,
+        // B_spare = 4.26 GB/s (t_spare = 1,814 µs > t_cpu = 180 µs and > t_dma = 184 µs),
+        // so CPU-site must be suppressed (`None`, 0 CPU-site experts even at 20 misses/layer)!
+        let gen5_54d009 = topology_lines(43.57, Some(47.83), Some(47.83), 180_000);
+        assert_eq!(gen5_54d009.effective_cpu(), None);
+
+        let gen5 = topology_lines(43.57, Some(47.8), Some(43.0), 75_000);
+        assert_eq!(gen5.effective_cpu(), None);
+
+        // eb8096 Gen4 3090: B_dma = 19.31 GB/s, B_joint = 36.90 GB/s -> CPU-site stays enabled!
+        let gen4_3090 = topology_lines(19.31, Some(47.8), Some(36.90), 261_000);
+        assert!(gen4_3090.effective_cpu().is_some(), "Gen4 3090 (B_joint 36.9 >> B_dma 19.31) must keep CPU-site enabled");
     }
 }

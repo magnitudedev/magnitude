@@ -1960,6 +1960,7 @@ impl ExpertStep {
             round_records: 1,
             words,
             selected: 1,
+            decode_rows: 1,
             demand: 1,
             placer: crate::planning::Placer::Tier,
             tier_copy_dma: false,

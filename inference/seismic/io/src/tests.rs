@@ -1117,26 +1117,38 @@ fn a_parked_read_preempts_the_unbegun_pieces_of_a_read_ahead() {
     assert!(queue.take().is_none(), "4 parked and 4 ahead fill the knee");
 }
 
-/// A stream's due reads hold back nothing read ahead: a prompt group's
-/// conveyor keeps its link at the due depth (4 of 4 streamed) with more
-/// queued, and a fill of 2 starts beside it under the knee (8), as its
-/// bytes are not counted against it; a second fill piece waits at the knee
-/// only once the read ahead fills it.
+/// Any depth-blocked due head (streamed or parked) holds back read-ahead work:
+/// while a streamed request has another piece queued behind the due depth,
+/// `Link::next()` returns `None` instead of falling through to `Standing::Ahead`.
 #[test]
-fn a_streams_due_reads_leave_the_fill_its_knee() {
+fn a_streams_due_reads_hold_back_ahead_while_depth_blocked() {
     let link = volume(14, (4, 8), 4);
     let mut queue = Queue::default();
     queue.push(queued_on(&link, &[(0, 4), (4, 8)]), Want::streamed());
-    queue.push(queued_on(&link, &[(8, 12), (12, 16), (16, 18)]), Want::undated(0.));
+    queue.push(queued_on(&link, &[(8, 12), (12, 16)]), Want::undated(0.));
     let streamed = queue.take().expect("a streamed piece");
     assert_eq!(streamed.standing, Standing::Streamed);
-    let fill = queue.take().expect("the fill beside a stream at its due depth");
-    assert_eq!((fill.piece.start, fill.standing), (8, Standing::Ahead));
-    let more = queue.take().expect("4 + 4 is the knee");
-    assert_eq!(more.piece.start, 12);
-    assert!(queue.take().is_none(), "the due depth and the knee are full");
+    assert!(queue.take().is_none(), "depth-blocked streamed head must not fall through to Ahead");
     queue.ended(streamed.returned(Instant::now(), true));
-    assert_eq!(queue.take().map(|taken| (taken.piece.start, taken.standing)), Some((4, Standing::Streamed)), "due first");
+    let second = queue.take().expect("remaining due streamed piece");
+    assert_eq!((second.piece.start, second.standing), (4, Standing::Streamed), "due first");
+    // Once no due piece remains queued, read-ahead can start within the knee.
+    let fill = queue.take().expect("ahead starts once no due piece is queued");
+    assert_eq!((fill.piece.start, fill.standing), (8, Standing::Ahead));
+}
+
+/// Strict deadline total order: `Deadline::Parked` (class 0) strictly preempts
+/// an earlier `Deadline::Streamed` (class 1), which strictly preempts
+/// `Deadline::Expected` (class 2) and `Deadline::None` (class 3).
+#[test]
+fn parked_strictly_preempts_earlier_streamed() {
+    let earlier = Want::streamed();
+    let later_parked = Want::now();
+    let expected = Want::expected(1, 1.0);
+    let undated = Want::undated(1.0);
+    assert!(later_parked < earlier, "Parked must strictly outrank earlier Streamed");
+    assert!(earlier < expected, "Streamed must strictly outrank Expected");
+    assert!(expected < undated, "Expected must strictly outrank None");
 }
 
 /// A parked step's due read still holds back everything read ahead beside

@@ -217,9 +217,12 @@ impl LinkMover {
 
     /// One turn of Path 0: size promotion reserves, settle in-flight copies,
     /// then dispatch in strict priority order:
-    /// 1. Write-backs (`TransferPriority::WriteBack`)
-    /// 2. Predicted & `DraftWindow` opportunistic staging (`TransferPriority::Stage`)
-    /// 3. Permanent promotions (`TransferPriority::Promote`)
+    /// 1. Write-backs (`TransferPriority::WriteBack`) — never deferred so
+    ///    releases and prompt leases cannot deadlock.
+    /// 2. Permanent promotions (`TransferPriority::Promote`) — deferred when
+    ///    the Link or shared `HostMemory` domain binds beside active decode
+    ///    demand DMA or in-flight Drive reads/landings.
+    /// 3. Predicted & `DraftWindow` opportunistic staging (`TransferPriority::Stage`)
     #[allow(clippy::too_many_arguments)]
     pub(super) fn advance(
         &mut self,
@@ -230,6 +233,7 @@ impl LinkMover {
         _decoded: Option<&MissCurve>,
         held: bool,
         progress: Point,
+        drive_in_flight: usize,
     ) -> bool {
         let mut moved = self.settle(core, ledger, shared, copier, progress);
         let Some(copy) = line(core, shared) else {
@@ -239,10 +243,12 @@ impl LinkMover {
             return moved;
         }
         let bytes = record_bytes(core);
+        let admission = shared.telemetry.link_admission(Some(copy.transfer));
 
         // Priority 1: Write-backs (free bank records promotions/leases wait for).
         // Depth excludes in-flight opportunistic `Stage` batches so already-
-        // queued staging copies never lock out write-backs.
+        // queued staging copies never lock out write-backs, and write-backs
+        // are NEVER deferred by `defer_promote` to prevent deadlock.
         for back @ (group, record, ..) in core.directory.backs_queued() {
             let depth = permanent_post_depth(copy.depth(bytes[group]), copier.copies.flight(), core.directory.staging_copying().len());
             match post_back(core, copier, depth, back) {
@@ -264,6 +270,8 @@ impl LinkMover {
         // Pause all promotions while a prompt group is running on
         // `tier_copy_dma` so prefill async DMA (`TransferPriority::PrefillFill`)
         // never contends with or deadlocks behind `Promoting` batches.
+        // Also deferred when Link/HostMemory binds beside active decode demand
+        // DMA or (when HostMemory binds) in-flight Drive reads/landings.
         let pause_promote = core.extents.tier_copy_dma && core.steps.prompt_running();
         let lending = core.steps.lending();
         if lending || pause_promote {
@@ -277,7 +285,7 @@ impl LinkMover {
                 }
             }
         }
-        if !pause_promote {
+        if !pause_promote && !defer_promote(admission, shared.transport.demand_active(), drive_in_flight) {
             moved |= self.ask(core, shared, copier, &copy, progress);
             let mut queued = core.directory.queued();
             queued.retain(|&(group, record, (layer, expert))| {
@@ -306,7 +314,7 @@ impl LinkMover {
 
         // Priority 3: Opportunistic staging from NameLedger + DraftWindow
         // carryover (works on BOTH 100%-RAM and unsettled 3-tier workloads!).
-        moved |= self.stage_predicted(core, ledger, shared, copier, &copy, &bytes, progress);
+        moved |= self.stage_predicted(core, ledger, shared, copier, &copy, admission, &bytes, progress);
         moved
     }
 
@@ -325,6 +333,7 @@ impl LinkMover {
         shared: &Shared,
         copier: &Copier,
         copy: &TierCopyCosts,
+        admission: PathAdmission,
         bytes: &[u64],
         progress: Point,
     ) -> bool {
@@ -338,14 +347,11 @@ impl LinkMover {
                 .try_release_hint_slot(crate::experts::transport::DestSlot { group, slot })
         });
 
-        let admission = shared.telemetry.link_admission(Some(copy.transfer));
         let layers = core.layers.len();
-        let c_layer = if layers == 0 { 0.0 } else { admission.terms.compute / layers as f64 };
-        // Span the remaining compute window of the active verify/decode burst
-        // (`remaining_layers * c_layer`) so Path 0 keeps the PCIe copy engine
-        // saturated across the full burst rather than only 2 layers.
+        // Span the remaining shared idle compute window across the active burst
+        // (`0.0` whenever Link or shared HostMemory binds).
         let remaining_layers = layers.saturating_sub(progress.layer.saturating_add(1)).max(1);
-        let c_window = (remaining_layers as f64) * c_layer;
+        let c_window = admission.shared_idle_window(remaining_layers, layers);
         let draft_idle = ledger.draft_window_remaining(Instant::now());
         let wanted_all = ledger.wanted();
 
@@ -701,6 +707,15 @@ fn post_back(
     Ok(true)
 }
 
+/// Whether `LinkMover::advance` should defer `TransferPriority::Promote`
+/// copies so they do not contend on a binding Link or shared `HostMemory`
+/// domain with active decode demand DMA or in-flight Drive reads/landings.
+/// `TransferPriority::WriteBack` is never gated by this check so releases and
+/// prompt leases can never deadlock.
+fn defer_promote(admission: PathAdmission, demand_active: bool, drive_in_flight: usize) -> bool {
+    admission.binds() && (demand_active || (admission.host_memory_binds() && drive_in_flight > 0))
+}
+
 /// Remaining permanent copy-engine promotion budget, excluding in-flight
 /// opportunistic `Stage` batches so `stage_predicted` never starves permanent
 /// VRAM promotions.
@@ -959,5 +974,70 @@ mod tests {
 
         // Queued promotions / write-backs still count against `ask()`'s budget.
         assert_eq!(permanent_budget(base_depth, staging_in_flight, staging_in_flight, 1, 1), 0);
+    }
+
+    /// `HostMemory` full coupling: when `host_memory_binds()` is true,
+    /// `shared_idle_window` is `0.0` and `defer_promote` defers
+    /// `TransferPriority::Promote` while `demand_active()` or
+    /// `drive_in_flight > 0` (while `WriteBack` is never gated by
+    /// `defer_promote`, preventing deadlock).
+    #[test]
+    fn host_memory_binds_defers_promote_during_demand_or_drive_flight_without_blocking_writeback() {
+        use super::defer_promote;
+        use crate::experts::transport::ExpertTransport;
+
+        let bytes = 8_000_000u64;
+        let pcie = ReadLine::new(20e-6, 40e-6 / bytes as f64).unwrap();
+        let transport = ExpertTransport::new_registry_only();
+        assert!(!transport.demand_active());
+
+        // 1. HostMemory binds (memory 60 ms >= compute 50 ms, link 35 ms, drive 25 ms).
+        let mem_bound = PathAdmission::link(
+            Terms { compute: 0.050, drive: 0.025, link: 0.035, cpu: 0.010, memory: 0.060 },
+            Some(pcie),
+            Some(80e-6),
+            None,
+        );
+        assert!(mem_bound.binds());
+        assert!(mem_bound.host_memory_binds());
+        assert_eq!(mem_bound.shared_idle_window(20, 40), 0.0);
+        // Idle (no demand, no drive in flight): promotions allowed.
+        assert!(!defer_promote(mem_bound, transport.demand_active(), 0));
+        // Drive in flight while HostMemory binds -> promotions deferred.
+        assert!(defer_promote(mem_bound, transport.demand_active(), 2));
+        // Demand active while HostMemory binds -> promotions deferred, then resumes on drop.
+        {
+            let _guard = transport.enter_demand_flight();
+            assert!(transport.demand_active());
+            assert!(defer_promote(mem_bound, transport.demand_active(), 0));
+        }
+        assert!(!transport.demand_active());
+        assert!(!defer_promote(mem_bound, transport.demand_active(), 0));
+
+        // 2. Link binds alone (link 60 ms > memory 30 ms): defers on demand_active(),
+        //    but NOT on drive_in_flight alone since HostMemory does not bind.
+        let link_only = PathAdmission::link(
+            Terms { compute: 0.050, drive: 0.025, link: 0.060, cpu: 0.010, memory: 0.030 },
+            Some(pcie),
+            Some(80e-6),
+            None,
+        );
+        assert!(link_only.binds());
+        assert!(!link_only.host_memory_binds());
+        assert_eq!(link_only.shared_idle_window(20, 40), 0.0);
+        assert!(!defer_promote(link_only, false, 4), "drive flight alone does not defer when HostMemory is not binding");
+        assert!(defer_promote(link_only, true, 0), "demand_active defers promotions when Link binds");
+
+        // 3. Compute-bound (neither Link nor HostMemory binds): never defers.
+        let compute_bound = PathAdmission::link(
+            Terms { compute: 0.050, drive: 0.010, link: 0.015, cpu: 0.005, memory: 0.020 },
+            Some(pcie),
+            Some(80e-6),
+            None,
+        );
+        assert!(!compute_bound.binds());
+        assert!(!compute_bound.host_memory_binds());
+        assert!(compute_bound.shared_idle_window(20, 40) > 0.0);
+        assert!(!defer_promote(compute_bound, true, 4));
     }
 }

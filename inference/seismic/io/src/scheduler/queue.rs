@@ -249,19 +249,16 @@ impl Link {
 
     /// The request whose next piece may start now, and how it stands:
     /// the more urgent of the two maps' due heads, where the due bytes in
-    /// flight leave it room; else, where no parked piece is queued, the
+    /// flight leave it room; else, only where no due piece is queued, the
     /// head read ahead, where the parked bytes and those read ahead in
-    /// flight leave it room ([`admits`]). A due head held back at the due depth
-    /// holds back the due pieces behind it, a parked one everything read
-    /// ahead too; a streamed one holds back nothing read ahead.
+    /// flight leave it room ([`admits`]). Any due head held back at the due
+    /// depth holds back everything behind it, including read-ahead work.
     fn next(&self) -> Option<((Want, u64), Standing)> {
         let head = self.requests.first_key_value().map(|(key, request)| (*key, request, key.0.standing()));
         let streamed = self.streamed.first_key_value().map(|(key, request)| (*key, request, key.0.standing()));
         let due = [head, streamed].into_iter().flatten().filter(|(_, _, standing)| standing.due()).min_by_key(|(key, ..)| *key);
         if let Some((key, request, standing)) = due {
-            if self.admits(request, standing) {
-                return Some((key, standing));
-            }
+            return self.admits(request, standing).then_some((key, standing));
         }
         match head {
             Some((key, request, Standing::Ahead)) => self.admits(request, Standing::Ahead).then_some((key, Standing::Ahead)),
@@ -300,11 +297,6 @@ impl Link {
         };
         let request = self.requests.get(&key).or_else(|| self.streamed.get(&key)).expect("the request named");
         count(request, standing);
-        if standing == Standing::Streamed {
-            if let Some((_, ahead)) = self.requests.first_key_value().filter(|(key, _)| key.0.standing() == Standing::Ahead) {
-                count(ahead, Standing::Ahead);
-            }
-        }
         fits
     }
 }

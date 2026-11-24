@@ -5,6 +5,8 @@
 //! that serves its steps.
 
 mod open;
+#[cfg(test)]
+pub(in crate::experts) use open::group_tier_reserve;
 mod resize;
 mod served;
 pub(crate) mod derived;

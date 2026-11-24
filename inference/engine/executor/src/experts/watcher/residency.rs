@@ -313,8 +313,8 @@ impl Residency {
             told = true;
             let completed = matches!(&event, Told::Completed { .. });
             let began = matches!(&event, Told::Began { .. });
-            let decode_began_step = match &event {
-                Told::Began { step, launch: Launched::Decode { .. } } => Some(*step),
+            let decode_began = match &event {
+                Told::Began { step, launch: Launched::Decode { rows, .. } } => Some((*step, rows.len().max(1))),
                 _ => None,
             };
             let ended_step = match &event {
@@ -348,7 +348,8 @@ impl Residency {
             }
             let learned = self.ledger.tell(event);
             if began {
-                if let Some(step) = decode_began_step {
+                if let Some((step, m_active)) = decode_began {
+                    self.core.directory.set_decode_rows(m_active);
                     self.prefetch.decode_step_began(step, &self.shared);
                 }
                 self.prefetch.on_began();
@@ -429,8 +430,18 @@ impl Residency {
     /// opportunistic DMA staging, and `Reuse`-ranked permanent promotions.
     fn promote(&mut self, turn: &mut Turn, copier: Option<&Copier>, decoded: Option<&MissCurve>) -> bool {
         let held = self.traffic_held();
+        let drive_in_flight = self.prefetch.in_flight();
         let progressed = copier.is_some_and(|copier| {
-            self.link.advance(&mut self.core, &mut self.ledger, &self.shared, copier, decoded, held, self.prefetch.reached())
+            self.link.advance(
+                &mut self.core,
+                &mut self.ledger,
+                &self.shared,
+                copier,
+                decoded,
+                held,
+                self.prefetch.reached(),
+                drive_in_flight,
+            )
         });
         turn.changed |= progressed;
         true
@@ -540,9 +551,19 @@ impl Residency {
         // `LinkMover::advance` so Path 0 sees fresh `HINT_LEADS` hints on the
         // same tick rather than one tick late.
         let finished = self.prefetch.finish_rings(&mut self.core, &mut self.ledger, shared, read, freed, served);
+        let drive_in_flight = self.prefetch.in_flight();
         let link_progressed = copier.is_some_and(|copier| {
             !self.traffic_held()
-                && self.link.advance(&mut self.core, &mut self.ledger, shared, copier, None, false, self.prefetch.reached())
+                && self.link.advance(
+                    &mut self.core,
+                    &mut self.ledger,
+                    shared,
+                    copier,
+                    None,
+                    false,
+                    self.prefetch.reached(),
+                    drive_in_flight,
+                )
         });
         finished || link_progressed
     }
@@ -862,12 +883,20 @@ impl Residency {
         } else {
             self.shared.telemetry.hint_gates(&whole, link_line, self.shared.launch_prices().as_ref(), |target, lead, miss| {
                 let bytes = core.layers[target].expert_bytes();
-                let idle = miss.hint_lead_idle(lead, layer_count);
+                let idle = if miss.host_memory_binds() {
+                    0.0
+                } else {
+                    miss.hint_lead_idle(lead, layer_count)
+                };
                 if ledger.hint_admitted(target, lead, miss.break_even(bytes, idle)) {
                     return true;
                 }
                 secondary_link.is_some_and(|link| {
-                    let link_idle = link.hint_lead_idle(lead, layer_count);
+                    let link_idle = if link.host_memory_binds() {
+                        0.0
+                    } else {
+                        link.hint_lead_idle(lead, layer_count)
+                    };
                     ledger.hint_admitted(target, lead, link.break_even(bytes, link_idle))
                 })
             })
@@ -942,6 +971,15 @@ impl Residency {
         // served one (`Telemetry::refined`), the job's before; the
         // assignment weighs it against the GPU's at those prices alone.
         let all_groups_whole = self.core.directory.all_groups_whole();
+        for group in 0..self.core.groups.len() {
+            let splits = !all_groups_whole
+                && self
+                    .core
+                    .directory
+                    .group_layers(group)
+                    .any(|layer| !self.core.layers[layer].draft && self.shared.transport.is_splitting_decode(layer));
+            self.core.directory.set_group_splitting(group, splits);
+        }
         let mut initial_log = None;
         let words = self
             .core

@@ -543,21 +543,20 @@ impl Copies {
             match self.inner.transfer.wait(value, timeout) {
                 Ok(false) => continue,
                 Ok(true) => {
-                    // Complete `ExpertTransport` DMA state BEFORE popping
-                    // `state.running` so `Copies::completed(ticket)` can never
-                    // report `Ok(true)` while the slot is still `InFlight`.
+                    // Mark `Landed` in `ExpertTransport` BEFORE popping from
+                    // `running` so `Copies::completed(batch) == Ok(true)`
+                    // strictly implies `TransferState::Landed` when
+                    // `LinkMover::settle` calls `try_release_hint_slot`.
                     let stage_transfer = self.state().running.front().and_then(|&(_, _, _, id, _)| id);
                     if let (Some(id), Some(transport)) = (stage_transfer, &self.inner.transport) {
                         transport.complete_dma(id);
                     }
                     let completed = self.state().running.pop_front();
-                    if let Some((_, _, items, stage_transfer, _)) = completed {
+                    if let Some((_, _, items, _, _)) = completed {
                         drop(items);
-                        if stage_transfer.is_some() {
-                            if let Some(transport) = &self.inner.transport {
-                                transport.drain_deferred_syncs();
-                            }
-                        }
+                    }
+                    if let (Some(_), Some(transport)) = (stage_transfer, &self.inner.transport) {
+                        transport.drain_deferred_syncs();
                     }
                 }
                 Err(error) => {

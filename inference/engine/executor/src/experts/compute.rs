@@ -55,47 +55,79 @@ pub(in crate::experts) trait Job: Send + Sync {
     fn piece(&self, index: usize);
     fn end(&self);
     fn want(&self) -> Want;
+    /// Whether a live decode step is actively waiting on this job; waited jobs
+    /// strictly preempt every non-waited job at the next piece boundary.
+    fn waited(&self) -> bool {
+        false
+    }
+}
+
+struct UrgencyState {
+    want: Want,
+    waited: bool,
+    hastened_at: Option<std::time::Instant>,
 }
 
 /// A job's want, which only grows more urgent, and whether a step waits
 /// on it: shared by its submitter, who may hasten it while it waits (a
 /// hint's landing, once a request names its expert), and the job.
-pub(in crate::experts) struct Urgency(Mutex<(Want, bool)>);
+pub(in crate::experts) struct Urgency(Mutex<UrgencyState>);
 
 impl Urgency {
     /// A step's own: due now, waited on.
     pub(in crate::experts) fn waited() -> Arc<Self> {
-        Arc::new(Self(Mutex::new((Want::now(), true))))
+        Arc::new(Self(Mutex::new(UrgencyState { want: Want::now(), waited: true, hastened_at: None })))
+    }
+
+    /// A prompt conveyor's bulk landing: streamed priority, not waited on by
+    /// a parked decode step so live decode demand strictly preempts it and
+    /// `LandingAccount` does not bill prefill conversions to `demand`.
+    pub(in crate::experts) fn streamed() -> Arc<Self> {
+        Arc::new(Self(Mutex::new(UrgencyState { want: Want::streamed(), waited: false, hastened_at: None })))
     }
 
     /// Ahead of any step's wait, wanted as `want`.
     pub(in crate::experts) fn ahead(want: Want) -> Arc<Self> {
-        Arc::new(Self(Mutex::new((want, false))))
+        Arc::new(Self(Mutex::new(UrgencyState { want, waited: false, hastened_at: None })))
     }
 
     pub(in crate::experts) fn get(&self) -> Want {
-        self.0.lock().expect("a job's urgency").0
+        self.0.lock().expect("a job's urgency").want
     }
 
     /// Whether a step waits on it.
     pub(in crate::experts) fn is_waited(&self) -> bool {
-        self.0.lock().expect("a job's urgency").1
+        self.0.lock().expect("a job's urgency").waited
+    }
+
+    /// Whether a step waits on it, and when it was hastened from a hint (if
+    /// ever) so `LandingAccount` does not bill prior hint queue wait to
+    /// `demand.queued`.
+    pub(in crate::experts) fn waited_since(&self) -> (bool, Option<std::time::Instant>) {
+        let state = self.0.lock().expect("a job's urgency");
+        (state.waited, state.hastened_at)
     }
 
     /// Its read is repriced as `want` (the ledger's aggregate): a job no step
     /// waits on follows its read's want, up or down; one a step waits on
     /// stays due.
     pub(in crate::experts) fn set(&self, want: Want) {
-        let mut urgency = self.0.lock().expect("a job's urgency");
-        if !urgency.1 {
-            urgency.0 = want;
+        let mut state = self.0.lock().expect("a job's urgency");
+        if !state.waited {
+            state.want = want;
         }
     }
 
-    /// A step waits on it from now: due, if not due before.
+    /// A step waits on it from now: due, if not due before. Records the
+    /// hasten timestamp on the first transition to waited so prior hint wait
+    /// is not mis-billed to `demand.queued`.
     pub(in crate::experts) fn hasten(&self) {
-        let mut urgency = self.0.lock().expect("a job's urgency");
-        *urgency = (urgency.0.min(Want::now()), true);
+        let mut state = self.0.lock().expect("a job's urgency");
+        state.want = state.want.min(Want::now());
+        if !state.waited {
+            state.waited = true;
+            state.hastened_at = Some(std::time::Instant::now());
+        }
     }
 }
 
@@ -680,7 +712,7 @@ fn piece(inner: &Inner) -> bool {
         let queued = jobs.len();
         jobs.retain(|job| job.next.load(Ordering::Acquire) < job.pieces);
         inner.queued.fetch_sub(queued - jobs.len(), Ordering::AcqRel);
-        let Some(urgent) = jobs.iter().min_by_key(|job| job.job.want()).cloned() else { return false };
+        let Some(urgent) = jobs.iter().min_by_key(|job| (!job.job.waited(), job.job.want())).cloned() else { return false };
         let index = urgent.next.fetch_add(1, Ordering::AcqRel);
         (urgent, index)
     };

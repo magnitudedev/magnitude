@@ -514,7 +514,7 @@ impl DriveIdleBudget {
         if let Some(budget) = self.budget.get() {
             return budget.remaining();
         }
-        let c_window = if self.layers == 0 {
+        let c_window = if self.layers == 0 || price.host_memory_binds() {
             0.0
         } else {
             (self.remaining_layers.clamp(1, self.layers) as f64 / self.layers as f64) * price.compute()
@@ -871,6 +871,11 @@ impl Prefetch {
         )
     }
 
+    /// Number of drive reads or landings currently in flight (staging records held).
+    pub(super) fn in_flight(&self) -> usize {
+        self.staging.records().saturating_sub(self.staging.free())
+    }
+
     /// Whether a read or its landing is outstanding: any staging record
     /// taken. Every read into staging holds its record from before it is
     /// submitted until its landing's end is learned, or, a read given up,
@@ -878,7 +883,7 @@ impl Prefetch {
     /// residency serves it, one waiting for tier records, or one discarded.
     /// Each record's freeing is an event of the load.
     pub(super) fn outstanding(&self) -> bool {
-        self.staging.free() < self.staging.records()
+        self.in_flight() > 0
     }
 
     /// The device is at `progress`: the landings it converted before it have
@@ -1317,13 +1322,14 @@ impl Prefetch {
                     if staging_full {
                         continue;
                     }
-                    if !in_draft {
-                        let p = price.get();
-                        if !p.binds() {
-                            let budget = p.prefetch_byte_budget();
-                            if budget > 0 && self.step_prefetch_bytes.saturating_add(core.layers[layer].expert_bytes()) > budget {
-                                continue;
-                            }
+                    let p = price.get();
+                    if defer_drive_speculative(p.host_memory_binds(), shared.transport.demand_active()) {
+                        continue;
+                    }
+                    if !in_draft && !p.binds() {
+                        let budget = p.prefetch_byte_budget();
+                        if budget > 0 && self.step_prefetch_bytes.saturating_add(core.layers[layer].expert_bytes()) > budget {
+                            continue;
                         }
                     }
                     let expected = match class {
@@ -1364,6 +1370,9 @@ impl Prefetch {
             return false;
         }
         let price = Priced::new(&shared.telemetry);
+        if defer_drive_speculative(price.get().host_memory_binds(), shared.transport.demand_active()) {
+            return false;
+        }
         let now = Instant::now();
         let draft_idle = ledger.draft_window_remaining(now);
         if draft_idle > 0.0 {
@@ -1671,6 +1680,15 @@ enum Short {
     Tier,
 }
 
+/// Whether speculative `PathKind::Drive` prefetch/carryover issuance should
+/// defer so NVMe reads and host-CPU landings do not contend on a binding
+/// `ContentionDomain::HostMemory` bus beside active decode demand DMA.
+/// Live demand reads (`Need::Due`) and `Act::Reprice`/`Act::Cancel` are
+/// never gated by this check.
+fn defer_drive_speculative(host_memory_binds: bool, demand_active: bool) -> bool {
+    host_memory_binds && demand_active
+}
+
 #[cfg(test)]
 mod tests {
     use super::{Ahead, DriveIdleBudget, Inbound, Need, Prefetch};
@@ -1856,5 +1874,67 @@ mod tests {
         let budget = price.prefetch_byte_budget();
         assert!((budget as f64 - 184_000_000.0).abs() <= 1.0, "expected ~184 MB budget, got {budget}");
         assert!(price.admits_for_layers(0.10, bytes, 48));
+    }
+
+    /// Fix 2: When `ContentionDomain::HostMemory` binds, speculative Drive
+    /// hint/carryover issuance defers while `transport.demand_active()` is true
+    /// and `DriveIdleBudget` grants zero compute slack, while live demand reads
+    /// are never blocked and `Urgency::hasten()` resets the queued baseline.
+    #[test]
+    fn drive_prefetch_defers_speculative_hints_when_host_memory_binds_and_demand_active() {
+        use super::defer_drive_speculative;
+        use crate::experts::compute::Urgency;
+        use crate::experts::transport::ExpertTransport;
+        use magnitude_cost_model::{PathAdmission, Terms};
+
+        let line = ReadLine::new(0.14e-3, 1.0 / 4.6e9).expect("a line");
+        let transport = ExpertTransport::new_registry_only();
+
+        // HostMemory binds (memory 60 ms >= compute 50 ms, drive 25 ms, link 35 ms).
+        let mem_bound = ReadPrice::priced(PathAdmission::drive(
+            Terms { compute: 0.050, drive: 0.025, link: 0.035, cpu: 0.010, memory: 0.060 },
+            Some(line),
+            Some(80e-6),
+            None,
+        ));
+        assert!(mem_bound.host_memory_binds());
+        // Idle compute window is zeroed under HostMemory contention (draft idle still allowed).
+        let idle_no_draft = DriveIdleBudget::new(48, 24, vec![], 0.0);
+        assert_eq!(idle_no_draft.get(&mem_bound), 0.0);
+        let idle_with_draft = DriveIdleBudget::new(48, 24, vec![], 0.020);
+        assert!(idle_with_draft.get(&mem_bound) > 0.0);
+
+        // Idle transport -> speculative Drive allowed; active demand DMA -> deferred!
+        assert!(!defer_drive_speculative(mem_bound.host_memory_binds(), transport.demand_active()));
+        {
+            let _guard = transport.enter_demand_flight();
+            assert!(transport.demand_active());
+            assert!(defer_drive_speculative(mem_bound.host_memory_binds(), transport.demand_active()));
+        }
+        assert!(!defer_drive_speculative(mem_bound.host_memory_binds(), transport.demand_active()));
+
+        // When HostMemory does NOT bind, speculative Drive is NOT deferred by demand_active.
+        let compute_bound = ReadPrice::priced(PathAdmission::drive(
+            Terms { compute: 0.050, drive: 0.015, link: 0.015, cpu: 0.005, memory: 0.020 },
+            Some(line),
+            Some(80e-6),
+            None,
+        ));
+        assert!(!compute_bound.host_memory_binds());
+        assert!(!defer_drive_speculative(compute_bound.host_memory_binds(), true));
+
+        // Urgency::hasten() records a hasten timestamp so prior hint wait is not
+        // mis-billed to demand.queued, and Urgency::streamed() is non-waited.
+        let streamed = Urgency::streamed();
+        assert!(!streamed.is_waited());
+        assert_eq!(streamed.waited_since(), (false, None));
+
+        let hint = Urgency::ahead(Want::expected(1, 0.5));
+        assert_eq!(hint.waited_since(), (false, None));
+        let before = std::time::Instant::now();
+        hint.hasten();
+        let (waited, hastened_at) = hint.waited_since();
+        assert!(waited);
+        assert!(hastened_at.is_some_and(|t| t >= before));
     }
 }

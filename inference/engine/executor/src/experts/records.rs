@@ -89,12 +89,16 @@ pub(super) enum Record {
     /// name it by construction.
     StageIdle,
     /// Taken by an on-demand decode DMA landing (`DecodeFront -> DMA -> DecodeBack`)
-    /// from the unified group pool (`Record::Free -> DemandLanding`).
+    /// from the unified group pool (`Record::Free -> DemandLanding`) or, on
+    /// tiny-VRAM groups where `Free` is temporarily empty, borrowed from an
+    /// unpinned `Record::StageIdle` slot (`borrowed_stage: true`, returned to
+    /// `Record::StageIdle` on completion and never promoted).
     /// While in flight or pinned by joined consumers, excluded from `free()`,
     /// `evictable()`, `seed()`, `promote()`, `fill()`, and `shrink()` by
     /// construction. On completion, transitions O(1) to `Record::Held(staged)`
-    /// (zero-recopy promotion) or back to `Record::Free`.
-    DemandLanding(Option<Staged>),
+    /// (zero-recopy promotion, only when `!borrowed_stage`) or back to
+    /// `Record::Free` / `Record::StageIdle`.
+    DemandLanding { staged: Option<Staged>, borrowed_stage: bool },
     /// Taken by an opportunistic DMA staging copy of `staged` for `target_step`
     /// in parity half `parity` (`0` = even steps, `1` = odd steps). `tier` and
     /// `batch` are `Some` while the DMA batch is in flight and `None` once
@@ -518,8 +522,12 @@ impl BankRecords {
     }
 
     /// Claim a `Record::Free` usable slot in `group` for an on-demand decode
-    /// DMA landing (`Record::Free -> Record::DemandLanding(staged)`), filtered
-    /// by `can_reuse` (no active consumer leases or fault quarantine).
+    /// DMA landing (`Record::Free -> Record::DemandLanding { staged, borrowed_stage: false }`),
+    /// filtered by `can_reuse` (no active consumer leases or fault quarantine).
+    /// If `Free` is empty (e.g. tiny-VRAM groups where `cap / 2 < W_max`),
+    /// borrows an unpinned `Record::StageIdle` slot from `stage_rings[group]`
+    /// (`borrowed_stage: true`, returned to `Record::StageIdle` on completion
+    /// and never promoted) so decode DMA stays overflow-free without SM zero-copy.
     pub fn claim_demand_landing(
         &mut self,
         group: usize,
@@ -527,17 +535,36 @@ impl BankRecords {
         lending: bool,
         mut can_reuse: impl FnMut(usize) -> bool,
     ) -> Option<usize> {
-        let record = self
+        let free_slot = self
             .free(group)
-            .find(|&record| self.usable_when(group, record, lending) && can_reuse(record))?;
-        self.set(group, record, Record::DemandLanding(staged));
+            .find(|&record| self.usable_when(group, record, lending) && can_reuse(record));
+        if let Some(record) = free_slot {
+            self.set(group, record, Record::DemandLanding { staged, borrowed_stage: false });
+            return Some(record);
+        }
+        let range = self.stage_rings.get(group)?.clone();
+        let record = range.into_iter().find(|&record| {
+            self.groups[group].contents[record] == Record::StageIdle && can_reuse(record)
+        })?;
+        self.set(group, record, Record::DemandLanding { staged, borrowed_stage: true });
         Some(record)
+    }
+
+    /// Whether `record` of `group` is a `Record::DemandLanding` borrowed from
+    /// `stage_rings[group]` (`borrowed_stage: true`, must return to `StageIdle`
+    /// and never be promoted to `Record::Held`).
+    pub fn is_borrowed_stage_demand(&self, group: usize, record: usize) -> bool {
+        matches!(
+            self.groups[group].contents.get(record),
+            Some(Record::DemandLanding { borrowed_stage: true, .. })
+        )
     }
 
     /// O(1) zero-recopy promotion of a completed `Record::DemandLanding` slot
     /// directly to `Record::Held(staged)` and mapped via `StampedMap::map_covering`
     /// from `from(staged.0)`. Returns `false` (and leaves the slot for release)
-    /// if `staged` is already held or being placed elsewhere.
+    /// if `staged` is already held or being placed elsewhere. Panics if the
+    /// slot was borrowed from `stage_rings` (`borrowed_stage: true`).
     pub fn promote_demand_landing(
         &mut self,
         group: usize,
@@ -546,8 +573,8 @@ impl BankRecords {
         from: impl Fn(usize) -> super::watcher::MapFrom,
     ) -> bool {
         assert!(
-            matches!(self.groups[group].contents[record], Record::DemandLanding(_)),
-            "record {record} of group {group} is not a DemandLanding ({:?})",
+            matches!(self.groups[group].contents[record], Record::DemandLanding { borrowed_stage: false, .. }),
+            "record {record} of group {group} is not a promotable DemandLanding ({:?})",
             self.groups[group].contents[record]
         );
         assert_eq!(self.layers[staged.0].0, group, "demand landing layer {} belongs to group {}, not {group}", staged.0, self.layers[staged.0].0);
@@ -559,24 +586,28 @@ impl BankRecords {
         true
     }
 
-    /// Return a `Record::DemandLanding` slot directly to `Record::Free` once
-    /// no consumer pins it.
+    /// Return a `Record::DemandLanding` slot directly to `Record::Free` (or
+    /// `Record::StageIdle` when borrowed from `stage_rings`) once no consumer
+    /// pins it.
     pub fn release_demand_landing(&mut self, group: usize, record: usize) {
-        assert!(
-            matches!(self.groups[group].contents[record], Record::DemandLanding(_)),
-            "record {record} of group {group} is not a DemandLanding ({:?})",
-            self.groups[group].contents[record]
-        );
+        let Record::DemandLanding { borrowed_stage, .. } = self.groups[group].contents[record] else {
+            panic!(
+                "record {record} of group {group} is not a DemandLanding ({:?})",
+                self.groups[group].contents[record]
+            );
+        };
         self.draining_demand.retain(|&taken| taken != (group, record));
-        self.set(group, record, Record::Free);
+        let next = if borrowed_stage { Record::StageIdle } else { Record::Free };
+        self.set(group, record, next);
     }
 
     /// Record an unpromoted `Record::DemandLanding` slot whose joined consumers
     /// still pin it so [`Self::drain_demand_landings`] returns it to `Record::Free`
-    /// the instant the last consumer releases its lease.
+    /// (or `Record::StageIdle` when borrowed) the instant the last consumer
+    /// releases its lease.
     pub fn defer_demand_release(&mut self, group: usize, record: usize) {
         assert!(
-            matches!(self.groups[group].contents[record], Record::DemandLanding(_)),
+            matches!(self.groups[group].contents[record], Record::DemandLanding { .. }),
             "record {record} of group {group} is not a DemandLanding ({:?})",
             self.groups[group].contents[record]
         );
@@ -596,8 +627,9 @@ impl BankRecords {
             .partition(|&(group, record)| can_reuse(group, record));
         self.draining_demand = kept;
         for &(group, record) in &drained {
-            if matches!(self.groups[group].contents[record], Record::DemandLanding(_)) {
-                self.set(group, record, Record::Free);
+            if let Record::DemandLanding { borrowed_stage, .. } = self.groups[group].contents[record] {
+                let next = if borrowed_stage { Record::StageIdle } else { Record::Free };
+                self.set(group, record, next);
             }
         }
         !drained.is_empty()
@@ -1226,7 +1258,7 @@ impl BankRecords {
                 | Record::Releasing { .. }
                 | Record::Promoting(_, Moving::Copying { .. })
                 | Record::Staging { .. }
-                | Record::DemandLanding(_)
+                | Record::DemandLanding { .. }
                 | Record::Pending { .. } => continue,
                 other => panic!("lent record {record} leased from {other:?}"),
             }

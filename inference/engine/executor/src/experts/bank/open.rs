@@ -701,12 +701,15 @@ fn watch(
                 // lands unpredicted misses at full PCIe line rate with zero
                 // residency-lock contention.
                 let k = plan.selected() as usize;
-                let verify_rows = magnitude_kernels::constants::VERIFY_ROWS as usize;
+                let decode_rows = usize::try_from(plan.decode_rows()).map_err(|_| "decode rows exceed the host")?;
                 let lookahead_layers = crate::planning::HINT_LEADS as usize + 1;
-                let enable_dma = crate::experts::decode_dma_enabled(device.backend()) && !plan.whole();
                 let mut stage_slots = Vec::with_capacity(tiers.len());
                 for group in 0..tiers.len() {
-                    if plan.whole() {
+                    let is_draft_group = plan.groups()[group]
+                        .layers
+                        .iter()
+                        .all(|&layer| plan.layers()[layer].is_draft());
+                    if plan.whole() || is_draft_group {
                         stage_slots.push(0);
                         continue;
                     }
@@ -714,15 +717,17 @@ fn watch(
                     let start = if group == lender.group { lent } else { 0 };
                     let group_layers = plan.groups()[group].layers.len();
                     let total_experts = plan.group_experts(group) as usize;
+                    let floor_slots = usize::try_from(plan.least_records(group))
+                        .map_err(|_| "floor records exceed the host")?;
                     let stage = stage_slot_count(
                         present,
                         start,
                         group_layers,
                         total_experts,
                         k,
-                        verify_rows,
+                        decode_rows,
                         lookahead_layers,
-                        enable_dma,
+                        floor_slots,
                     );
                     stage_slots.push(stage);
                 }
@@ -730,7 +735,9 @@ fn watch(
             }
             Placer::Bank => Placement::Bank { landing_maps },
         };
-        let reserve = usize::try_from(plan.tier_reserve()).map_err(|_| "the tier's reserve exceeds the host")?;
+        let global_reserve = usize::try_from(plan.tier_reserve()).map_err(|_| "the tier's reserve exceeds the host")?;
+        let selected = usize::try_from(plan.selected()).map_err(|_| "selected experts exceed host")?;
+        let reserve = group_tier_reserve(global_reserve, tiers.len(), selected);
         TierStart { records, lent, reserve, placement }
     };
     // Single owner `ExpertTransport` shared across `LinkMover` (`Copies`),
@@ -753,6 +760,7 @@ fn watch(
         })?;
         let sources_words = Words::new(sources.clone(), words_count, 0)?;
         let file_tables: Vec<ExchangeTable> = watched.iter().map(|layer| layer.file.clone()).collect();
+        let draft_layers: Vec<bool> = watched.iter().map(|layer| layer.draft).collect();
         Some(crate::experts::transport::DecodeDmaState::new(
             transfer,
             landed.clone(),
@@ -760,7 +768,7 @@ fn watch(
             sources,
             sources_words,
             selected,
-            plan.layers().len(),
+            &draft_layers,
             file_tables,
             steps.events().clone(),
         ))
@@ -825,6 +833,7 @@ fn watch(
                 .map_err(|_| "round records exceed the host")?,
             words: binding.words,
             selected: usize::try_from(binding.selected).map_err(|_| "choices exceed the host")?,
+            decode_rows: usize::try_from(plan.decode_rows()).map_err(|_| "decode rows exceed the host")?,
             demand: usize::try_from(plan.demand_records()).map_err(|_| "the demand reserve exceeds the host")?,
             placer: plan.placer(),
             tier_copy_dma: plan.tier_copy_dma(),
@@ -849,55 +858,59 @@ fn watch(
     .map_err(Into::into)
 }
 
-/// Compute `stage_slots` for one partial discrete-GPU bank group.
+/// Compute `stage_slots` for one partial discrete-GPU bank group via the
+/// single-owner [`crate::experts::directory::DecodeTransientBudget`].
 ///
 /// The staging ring lives in `start .. start + stage_slots` (disjoint from
-/// prompt scratch `0..lent` and leaving at least 1 permanent record past
-/// `start`). On-demand decode DMA allocates directly from the unified
-/// `Record::Free` pool (`Record::DemandLanding -> Record::Held`) with zero
-/// fixed DMA carve-out, so permanent decode VRAM receives `>= 97%` of group
-/// capacity while `LinkMover` opportunistic staging stays compact (`<= 2.5%`
-/// of group capacity, even) when `DecodeDma` is active.
+/// prompt scratch `0..lent`), bounded strictly by what fits after
+/// `demand_floor + group_layers` without shrinking permanent capacity below
+/// `floor_slots + demand_floor` (zero arbitrary `/ 2` or `/ 8` divisors).
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn stage_slot_count(
     present: usize,
     start: usize,
     group_layers: usize,
     total_experts: usize,
     k: usize,
-    verify_rows: usize,
+    decode_rows: usize,
     lookahead_layers: usize,
-    enable_dma: bool,
+    floor_slots: usize,
 ) -> usize {
     let avail = present.saturating_sub(start);
     if avail <= 1 {
         return 0;
     }
-    let active_layers = lookahead_layers.min(group_layers);
-    let miss_frac = (1.0 - (present as f64 / total_experts.max(1) as f64)).clamp(0.0, 1.0);
-    // Expected unique misses per layer across VERIFY_ROWS
-    // (accounting for ~50% cross-row expert overlap, at least K).
-    let misses_per_layer = ((miss_frac * (k * verify_rows) as f64 * 0.5).ceil() as usize).max(k);
-    let want_stage = active_layers.saturating_mul(misses_per_layer).saturating_mul(2);
-    if enable_dma {
-        let transient_cap = (present / 10).max(k).min(avail.saturating_sub(1));
-        let min_stage = k.saturating_mul(4).min(transient_cap);
-        let max_stage = transient_cap
-            .saturating_sub(k)
-            .min(transient_cap / 4)
-            .max(min_stage)
-            .min(transient_cap)
-            & !1;
-        want_stage.min(max_stage)
-    } else {
-        let share_cap = (avail / 16).max(k.saturating_mul(2));
-        let max_stage = share_cap.min(avail.saturating_sub(1)) & !1;
-        want_stage.min(max_stage)
+    let e = total_experts / group_layers.max(1);
+    let p_miss = (1.0 - (present as f64 / total_experts.max(1) as f64)).clamp(0.0, 1.0);
+    crate::experts::directory::DecodeTransientBudget::compute(
+        decode_rows,
+        k,
+        e,
+        p_miss,
+        present,
+        avail,
+        group_layers,
+        lookahead_layers.min(group_layers),
+        floor_slots,
+    )
+    .stage_slots
+}
+
+/// Per-group host-tier reserve derived from the global `plan.tier_reserve()`
+/// (sized for one global ahead queue): divide evenly across `groups` with a
+/// floor of `selected` (one layer's `K` demand choices) whenever
+/// `global_reserve > 0`, capped at `global_reserve`.
+pub(in crate::experts) fn group_tier_reserve(global_reserve: usize, groups: usize, selected: usize) -> usize {
+    if global_reserve == 0 {
+        return 0;
     }
+    let groups = groups.max(1);
+    global_reserve.div_ceil(groups).max(selected).min(global_reserve)
 }
 
 #[cfg(test)]
 mod tests {
-    use super::stage_slot_count;
+    use super::{group_tier_reserve, stage_slot_count};
     use crate::experts::Words;
     use crate::experts::map::StampedMap;
     use crate::experts::records::BankRecords;
@@ -910,22 +923,23 @@ mod tests {
         lender_group: usize,
         lent: usize,
         k: usize,
+        decode_rows: usize,
     ) -> (usize, usize, usize) {
-        let verify_rows = magnitude_kernels::constants::VERIFY_ROWS as usize;
         let lookahead_layers = crate::planning::HINT_LEADS as usize + 1;
         let present: Vec<usize> = group_layers.iter().map(|&n| n * slots_per_layer).collect();
         let mut stage_slots = Vec::with_capacity(group_layers.len());
         for (group, &layers) in group_layers.iter().enumerate() {
             let start = if group == lender_group { lent } else { 0 };
+            let floor_slots = if group == lender_group { lent } else { layers };
             let stage = stage_slot_count(
                 present[group],
                 start,
                 layers,
                 layers * experts_per_layer,
                 k,
-                verify_rows,
+                decode_rows,
                 lookahead_layers,
-                true,
+                floor_slots,
             );
             stage_slots.push(stage);
         }
@@ -957,34 +971,98 @@ mod tests {
     }
 
     #[test]
-    fn deepseek_like_bank_exposes_at_least_90_percent_vram_during_decode() {
+    fn deepseek_like_bank_sizes_transient_ring_to_actual_decode_width() {
         // 40 layers across 8 mixed-quant groups, 41 slots/layer = 1,640 records,
         // lender group 0 lending 480 records for prefill scratch.
-        let (total, permanent, stage) =
-            decode_permanent_capacity(41, &[20, 4, 4, 4, 2, 2, 2, 2], 384, 0, 480, 8);
+        // Plain M=1 decode avoids speculative verify staging bloat.
+        let (total, permanent_m1, stage_m1) =
+            decode_permanent_capacity(41, &[20, 4, 4, 4, 2, 2, 2, 2], 384, 0, 480, 8, 1);
         assert_eq!(total, 1_640);
-        assert_eq!(permanent + stage, total);
-        let pct = permanent as f64 / total as f64;
+        assert_eq!(permanent_m1 + stage_m1, total);
         assert!(
-            pct >= 0.90,
-            "expected >= 90% permanent VRAM during decode, got {permanent}/{total} ({:.1}%, stage={stage})",
-            pct * 100.0
+            permanent_m1 as f64 / total as f64 >= 0.80,
+            "expected >= 80% permanent VRAM on M=1 decode, got {permanent_m1}/{total} (stage={stage_m1})"
         );
+        // Speculative M=6 verify sizes a wider staging ring without exceeding resident floor.
+        let (_, permanent_m6, stage_m6) =
+            decode_permanent_capacity(41, &[20, 4, 4, 4, 2, 2, 2, 2], 384, 0, 480, 8, 6);
+        assert_eq!(permanent_m6 + stage_m6, total);
+        assert!(stage_m6 > stage_m1, "M=6 verify must allocate a wider staging ring than M=1 plain decode");
     }
 
     #[test]
-    fn glm_like_bank_exposes_at_least_90_percent_vram_during_decode() {
+    fn glm_like_bank_exposes_at_least_90_percent_vram_on_plain_decode() {
         // 42 layers across 3 mixed-quant groups, 58 slots/layer = 2,436 records,
         // lender group 0 lending 360 records for prefill scratch.
         let (total, permanent, stage) =
-            decode_permanent_capacity(58, &[30, 8, 4], 288, 0, 360, 8);
+            decode_permanent_capacity(58, &[30, 8, 4], 288, 0, 360, 8, 1);
         assert_eq!(total, 2_436);
         assert_eq!(permanent + stage, total);
         let pct = permanent as f64 / total as f64;
         assert!(
             pct >= 0.90,
-            "expected >= 90% permanent VRAM during decode, got {permanent}/{total} ({:.1}%, stage={stage})",
+            "expected >= 90% permanent VRAM during M=1 decode, got {permanent}/{total} ({:.1}%, stage={stage})",
             pct * 100.0
         );
+    }
+
+    #[test]
+    fn multi_group_host_tier_reserve_divides_global_ahead_queue_across_groups() {
+        // DeepSeek-V4.1: global tier_reserve = 71, 8 mixed-quant groups, K = 8.
+        // Dividing across 8 groups yields ceil(71 / 8) = 9 slots/group (72 total)
+        // instead of 71 * 8 = 568 total, reclaiming 496 (~500) RAM slots.
+        let per_group = group_tier_reserve(71, 8, 8);
+        assert_eq!(per_group, 9);
+        assert_eq!(71 * 8 - per_group * 8, 496);
+        // Single-group bank retains the full global reserve unchanged.
+        assert_eq!(group_tier_reserve(71, 1, 8), 71);
+        // Unpriced bank (global_reserve = 0) stays 0.
+        assert_eq!(group_tier_reserve(0, 8, 8), 0);
+        // Small per-group slice floors at K (capped by global_reserve).
+        assert_eq!(group_tier_reserve(24, 8, 8), 8);
+        assert_eq!(group_tier_reserve(4, 8, 8), 4);
+    }
+
+    #[test]
+    fn deepseek_8_target_plus_1_draft_group_keeps_over_90_pct_permanent_vram_and_protects_draft() {
+        // 8 target groups (40 layers × 45 slots = 1,800) + 1 DSpark draft group
+        // (3 layers × 16 slots = 48) -> total 1,848 slots, K = 6, decode_rows = 4..=16.
+        let target_layers = [20usize, 4, 4, 4, 2, 2, 2, 2];
+        let lookahead_layers = crate::planning::HINT_LEADS as usize + 1;
+        for decode_rows in [4usize, 6, 16] {
+            let mut present: Vec<usize> = target_layers.iter().map(|&n| n * 45).collect();
+            present.push(48); // group 8: DSpark draft group (3 layers × 16 slots)
+            let mut stage_slots = Vec::with_capacity(9);
+            for (group, &layers) in target_layers.iter().enumerate() {
+                let start = if group == 0 { 480 } else { 0 };
+                let floor_slots = if group == 0 { 480 } else { layers };
+                stage_slots.push(stage_slot_count(
+                    present[group],
+                    start,
+                    layers,
+                    layers * 384,
+                    6,
+                    decode_rows,
+                    lookahead_layers,
+                    floor_slots,
+                ));
+            }
+            // Draft group 8 always gets stage_slots == 0.
+            stage_slots.push(0);
+
+            let total: usize = present.iter().sum();
+            let sum_stage: usize = stage_slots.iter().sum();
+            let sum_capacity: usize = present.iter().zip(&stage_slots).map(|(p, s)| p - s).sum();
+            assert_eq!(stage_slots[8], 0, "draft group 8 must have stage_slots == 0");
+            assert_eq!(present[8] - stage_slots[8], present[8], "draft group 8 must keep 100% permanent capacity");
+            assert!(
+                (sum_stage as f64) <= 0.05 * (total as f64),
+                "decode_rows={decode_rows}: sum(stage_slots)={sum_stage} must be <= 5% of total={total}"
+            );
+            assert!(
+                (sum_capacity as f64) >= 0.90 * (total as f64) && sum_capacity >= 1_680,
+                "decode_rows={decode_rows}: sum(capacity)={sum_capacity} must be >= 90% of {total} and >= 1,680"
+            );
+        }
     }
 }

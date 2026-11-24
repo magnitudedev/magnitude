@@ -1353,10 +1353,17 @@ impl HostRecords {
     /// this read, `Steps::lending`), each with the expert it keeps. It
     /// reads the ranking and changes nothing.
     pub fn refill_victims<K: Ord + Copy>(&self, rank: impl Rank<K>, lending: bool) -> Vec<(u32, Staged)> {
-        if !self.short_of(0) {
+        self.refill_victims_for_lacked(rank, lending, self.lacked())
+    }
+
+    /// Like [`Self::refill_victims`], bounded by `lacked` (the count of
+    /// experts absent from both VRAM and this host tier) rather than raw
+    /// `self.lacked()`.
+    pub fn refill_victims_for_lacked<K: Ord + Copy>(&self, rank: impl Rank<K>, lending: bool, lacked: usize) -> Vec<(u32, Staged)> {
+        if !self.short_of_lacked(0, lacked) {
             return Vec::new();
         }
-        let need = (self.reserve + self.pool).saturating_sub(self.reserved());
+        let need = (self.reserve + self.pool).min(lacked).saturating_sub(self.reserved());
         let mut order = (0..self.extent())
             .filter(|&record| (!lending || record >= self.lent) && self.unheld(record) && !self.layer_protected(record))
             .filter_map(|record| {
@@ -1381,7 +1388,13 @@ impl HostRecords {
     /// more, fall short of the reserve and the pool set aside beside it, or
     /// of the experts lacked where fewer.
     pub fn short_of(&self, unmapped: usize) -> bool {
-        self.reserved() + unmapped < (self.reserve + self.pool).min(self.lacked() + unmapped)
+        self.short_of_lacked(unmapped, self.lacked())
+    }
+
+    /// Like [`Self::short_of`], bounded by `lacked` (file-only experts not
+    /// held in VRAM or this host tier).
+    pub fn short_of_lacked(&self, unmapped: usize, lacked: usize) -> bool {
+        self.reserved() + unmapped < (self.reserve + self.pool).min(lacked + unmapped)
     }
 
     /// Unmap the reserve's `victims` ([`Self::refill_victims`]), under the
