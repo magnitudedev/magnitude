@@ -989,6 +989,16 @@ impl Watcher {
             .collect::<Result<Vec<_>, _>>()?;
         let LoadWords { flags } = load;
         let count = layers.len();
+        for (index, layer) in layers.iter().enumerate() {
+            if let Some(landing) = &layer.landing {
+                assert!(
+                    landing.entries() as u64 >= extents.words.choices,
+                    "layer {index} landing list holds {} entries, below file request choice capacity {}",
+                    landing.entries(),
+                    extents.words.choices,
+                );
+            }
+        }
         let mut core = Core {
             table: Arc::new(ReadTable::new(source, pools, &layers)),
             directory,

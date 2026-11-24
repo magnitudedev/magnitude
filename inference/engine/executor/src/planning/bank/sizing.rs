@@ -136,14 +136,16 @@ impl ExpertBankPlan {
 
     /// One decode request's distinct experts at most, at any of group
     /// `group`'s layers: `R` of [`Self::decode_records`], the decode set
-    /// ([`decode_set`]) of the group's widest member.
-    fn request_records(&self, group: usize) -> u64 {
+    /// ([`decode_set`]) of the group's widest member across `VERIFY_ROWS`
+    /// (every launch with `M <= VERIFY_ROWS`, including short prompts and
+    /// verification batches, runs the decode form).
+    pub(super) fn request_records(&self, group: usize) -> u64 {
         let selected = self
             .member_layers(group)
             .map(|layer| layer.selected)
             .max()
             .unwrap_or_else(|| self.selected());
-        decode_set(selected, self.widest_member(group), self.decode_rows())
+        decode_set(selected, self.widest_member(group), magnitude_kernels::constants::VERIFY_ROWS)
     }
 
     /// The most host slots a host tier holds: the widest layer's experts, a

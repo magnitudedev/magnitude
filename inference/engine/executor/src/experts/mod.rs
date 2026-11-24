@@ -67,6 +67,8 @@ mod host_records;
 #[allow(dead_code)]
 mod interest;
 mod landing;
+#[cfg(test)]
+pub(crate) use landing::LandingList;
 mod map;
 mod records;
 mod reuse;

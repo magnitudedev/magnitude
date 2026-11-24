@@ -102,7 +102,7 @@ const CONVERSION_PIECE: usize = 128 << 10;
 /// word) once it has placed the entry's every item, so its record
 /// converted from is read; the host never resets it, comparing it with the
 /// step's low word.
-pub(in crate::experts) struct LandingList {
+pub(crate) struct LandingList {
     words: super::Words,
     /// What an entry may name: its from record below `from` (or one of
     /// `lent` scratch slots), its to record below `to`.
@@ -122,6 +122,11 @@ impl LandingList {
         let entries = (words.len() as u64 - first) / stride;
         assert_eq!(constants::LANDING_ENTRY(entries), words.len() as u64, "a landing list's words hold whole entries");
         Self { words, bounds, entries: entries as usize, head: std::sync::Mutex::new((0, 0)) }
+    }
+
+    /// The most entries the list holds.
+    pub fn entries(&self) -> usize {
+        self.entries
     }
 
     /// The word `word` of entry `entry`.

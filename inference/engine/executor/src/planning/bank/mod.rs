@@ -457,6 +457,13 @@ impl RegionWords {
         constants::HINT_ENTRY(self.choices)
     }
 
+    /// A decode landing list's words (LANDING_ENTRY): its head, then an entry
+    /// for every choice a decode request may name absent (`routed_land`'s
+    /// `landing`).
+    pub fn landing_words(&self) -> u64 {
+        constants::LANDING_ENTRY(self.choices)
+    }
+
     /// A routing record's words (ROUTING_WORDS): each choice's expert and
     /// each choice's source (`routed_route_streamed`'s `routing`).
     pub fn routing_words(&self) -> u64 {
@@ -645,7 +652,7 @@ impl ExpertBankPlan {
                 choices: self.table_choices(),
                 rounds: self.rounds(),
                 flight: self.flight(),
-                sites: self.flights.steps(1),
+                sites: self.site_slots(),
             },
         })
     }
@@ -668,6 +675,14 @@ impl ExpertBankPlan {
     /// The steps in flight (`FLIGHT`) this bank holds at its planned `places`.
     pub fn flight(&self) -> u64 {
         self.flight_at(self.places)
+    }
+
+    /// The site slots (`RegionWords::sites`) this bank's CPU site tables and
+    /// `Parks::publications` hold: `flights.steps(head_steps)`, so every
+    /// chained `DraftDecode` step of every concurrent group has its own slot
+    /// without clobbering earlier steps in flight.
+    pub fn site_slots(&self) -> u64 {
+        self.flights.steps(self.head_steps)
     }
 
     /// Records of group `group`'s tensors (`BANK`): its ceiling, every
@@ -729,19 +744,13 @@ impl ExpertBankPlan {
         self.structure().form()
     }
 
-    /// The choices of the decode form's widest launch (`decode_choices`): the
-    /// most a decode request names, so the answers' extent (`P`) and the host
-    /// tier's landing reserve ([`Self::landing_records`]).
-    pub fn choices(&self) -> u64 {
-        self.structure().choices()
-    }
-
     /// Choice capacity of the bank's per-step metadata tables (`FileTable`,
-    /// `ScratchTable`, `SiteTable`, `HintRing`): always sized for `VERIFY_ROWS`
-    /// so every sealed decode graph class `M <= VERIFY_ROWS` fits the kernel
-    /// domain even when weight-record reserves step down `decode_rows` to fit
-    /// tight memory budgets.
-    pub(super) fn table_choices(&self) -> u64 {
+    /// `ScratchTable`, `SiteTable`, `HintRing`, `LandingList`) and host-tier
+    /// landing floor: always sized for `VERIFY_ROWS` so every sealed decode
+    /// graph class `M <= VERIFY_ROWS` (including short prompts and
+    /// verification batches) fits the kernel domain and cannot deadlock even
+    /// when `decode_rows` is narrower than `VERIFY_ROWS`.
+    pub fn table_choices(&self) -> u64 {
         records::decode_choices(self.selected(), magnitude_kernels::constants::VERIFY_ROWS)
     }
 
@@ -796,18 +805,19 @@ impl ExpertBankPlan {
     /// The records of a host tier's group a step holds landing at once: a
     /// request's misses and the hints'. Unlike staging, a landed record stays
     /// until the device has read it, so a request can't wait for one of its
-    /// own, and its choices bound them.
+    /// own, and `table_choices()` (`VERIFY_ROWS · K`, the widest launch that
+    /// runs the decode form) bounds them.
     pub fn landing_records(&self) -> u64 {
-        self.choices() + self.ahead_records()
+        self.table_choices() + self.ahead_records()
     }
 
     /// Group `group`'s host tier landing floor at `paths`: draft-only groups
-    /// never receive cross-layer hints and hold `choices()` only.
+    /// never receive cross-layer hints and hold `table_choices()` only.
     pub fn group_landing_records_with_paths(&self, group: usize, paths: BankPaths) -> u64 {
         if self.group_has_hints(group) {
-            self.choices() + paths.records().ahead
+            self.table_choices() + paths.records().ahead
         } else {
-            self.choices()
+            self.table_choices()
         }
     }
 
@@ -982,7 +992,18 @@ impl ExpertBankPlan {
     /// hints (`l + 1`, `l + 2`), and remains equal to `K` when
     /// `widest <= K` (including `widest == 1`).
     pub fn demand_records(&self) -> u64 {
-        decode_set(self.selected(), self.widest().get(), self.decode_rows())
+        // Under boundary-parked unified memory (`Parking::AtBoundaries`),
+        // `routed_land` does not execute until every absent expert of the step
+        // is staged and `file[slot]` is answered, so staging records cannot
+        // recycle mid-step and must hold a full `VERIFY_ROWS` decode/prompt
+        // step (`min(VERIFY_ROWS · K, widest)`). Under in-kernel parking and
+        // linked host tiers, staging records recycle as each expert converts,
+        // so `decode_rows()` suffices without deadlocking.
+        let rows = match self.host() {
+            HostTier::Unified(Parking::AtBoundaries) => magnitude_kernels::constants::VERIFY_ROWS,
+            HostTier::Unified(Parking::InKernels) | HostTier::Linked => self.decode_rows(),
+        };
+        decode_set(self.selected(), self.widest().get(), rows)
     }
 
     /// The stored bytes of the least move its model store's path makes: an
@@ -1489,14 +1510,7 @@ impl ExpertBankPlan {
     fn least_records_with_reserve(&self, group: usize, reserve: u64) -> u64 {
         let decode = match self.placer() {
             Placer::Tier => 0,
-            Placer::Bank => {
-                let selected = self
-                    .member_layers(group)
-                    .map(|layer| layer.selected)
-                    .max()
-                    .unwrap_or_else(|| self.selected());
-                decode_set(selected, self.widest_member(group), self.decode_rows()) + reserve
-            }
+            Placer::Bank => self.request_records(group) + reserve,
         };
         let prompt = if group != self.lender_group() {
             0

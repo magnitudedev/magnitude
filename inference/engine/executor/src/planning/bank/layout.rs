@@ -857,7 +857,7 @@ impl ExpertBankPlan {
                 let binding = binding()?;
                 Ok(binding.record.get(kind).map(|tensor| tensor.stored_tensor(binding.staging)).map(|(element, extents)| (element, extents.to_vec())))
             }
-            BankPart::LandingList => words(magnitude_kernels::constants::LANDING_ENTRY(self.choices())),
+            BankPart::LandingList => words(binding()?.words.landing_words()),
             BankPart::LandGrid => words(3),
             BankPart::RoundList { round } if u64::from(round) < self.window_rounds() => words(self.round_list_words()),
             BankPart::RoundList { .. } => Ok(None),
@@ -1087,7 +1087,7 @@ impl ExpertBankPlan {
             choices: self.table_choices(),
             rounds: self.rounds(),
             flight: self.flight_at(places),
-            sites: self.flights.steps(1),
+            sites: self.site_slots(),
         };
         let file = BankAllocation::Words {
             element: Element::i32(),

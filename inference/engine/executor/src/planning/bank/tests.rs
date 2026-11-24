@@ -627,7 +627,7 @@ fn the_demand_reserve_holds_the_widest_decode_set() {
     assert_eq!(beside(bank(&[37, 3], 0), HostTier::Linked).demand_records(), expected);
     let words = |(_, extents): (seismic::Element, Vec<u64>)| extents.iter().product::<u64>();
     for layer in [0, 39] {
-        assert_eq!(words(kernels.part_shape(layer, BankPart::LandingList).unwrap()), magnitude_kernels::constants::LANDING_ENTRY(kernels.choices()));
+        assert_eq!(words(kernels.part_shape(layer, BankPart::LandingList).unwrap()), kernels.binding(layer).unwrap().words.landing_words());
         for round in 0..kernels.rounds() {
             let list = kernels.part_shape(layer, BankPart::RoundList { round: round as u8 }).unwrap();
             assert_eq!(words(list), magnitude_kernels::constants::LANDING_ENTRY(kernels.round_records()));
@@ -1580,7 +1580,7 @@ fn a_banks_staging_and_reserve_are_its_priced_paths() {
     for host in [HostTier::Linked, HostTier::Unified(Parking::InKernels)] {
         let plan = priced(beside(bank(&[4], 64), host), paths);
         assert_eq!(plan.staging_records(), plan.demand_records() + 5, "{host:?}");
-        assert_eq!(plan.landing_records(), plan.choices() + 5, "{host:?}");
+        assert_eq!(plan.landing_records(), plan.table_choices() + 5, "{host:?}");
         assert_eq!(plan.tier_reserve(), 23, "{host:?}");
         let unpriced = priced(plan.clone(), BankPaths::Unpriced);
         assert_eq!((unpriced.staging_records(), unpriced.tier_reserve()), (plan.demand_records(), 0), "{host:?}");
@@ -1605,7 +1605,7 @@ fn layers_with_different_shared_down_quants_get_distinct_routed_kinds_in_census(
     layers[0].shared_down = Some((q4, 1024, vec![64, 64]));
     layers[1].shared_down = Some((q6, 1536, vec![64, 64]));
     plan.structured = conveyor::Structured::new(
-        plan.choices(),
+        plan.selected(),
         HostTier::Linked,
         plan.groups().to_vec(),
         BankLayers::new(layers).unwrap(),
@@ -1785,12 +1785,12 @@ fn draft_only_staging_pools_and_host_records_omit_hint_records() {
     assert!(!plan.group_has_hints(1));
     assert_eq!(
         plan.host_records(0, 0),
-        (plan.choices() + 103 + plan.host_lent(0)).min(plan.host_extent(0)),
+        (plan.table_choices() + 103 + plan.host_lent(0)).min(plan.host_extent(0)),
         "target group host_records floor includes hint_records",
     );
     assert_eq!(
         plan.host_records(1, 0),
-        (plan.choices() + plan.host_lent(1)).min(plan.host_extent(1)),
+        (plan.table_choices() + plan.host_lent(1)).min(plan.host_extent(1)),
         "draft-only group host_records floor omits hint_records",
     );
     for group in 0..plan.groups().len() {
@@ -2211,4 +2211,136 @@ fn banked_mtp_head_sizes_routing_records_for_max_head_steps() {
     assert_eq!(target_only_bank.head_steps, 1);
     assert_eq!(target_only_bank.group_steps(), 7);
     assert_eq!(target_only_bank.flight(), 14);
+}
+
+/// Class-wide adversarial regression for Split A (`decode_rows < VERIFY_ROWS`
+/// vs `M <= VERIFY_ROWS` short prompts / verify batches) and Split B
+/// (`RegionWords::sites` vs `head_steps`):
+/// 1. `(decode_rows = 1, Unified(InKernels))` and `(decode_rows = 1, Unified(AtBoundaries))`
+///    for both `K = 6` and `K = 10` (`E = 256`):
+///    - `BankPart::LandingList` holds `VERIFY_ROWS * K` entries (`binding.words.landing_words()`),
+///      accepting a full `M = VERIFY_ROWS` short prompt missing `min(E, VERIFY_ROWS * K)`
+///      distinct experts without overflowing `LandingList::append`.
+///    - Unified `decode_records(0)` and `least_records(0)` (and `records_at(0, floor)`)
+///      hold at least `min(E, VERIFY_ROWS * K)` records so Turn-2 `M = 16` short prompts
+///      never deadlock in `Decode::waiting` after bank shrink.
+///    - `Unified(AtBoundaries)` sizes `demand_records()` to `min(E, VERIFY_ROWS * K)` so
+///      staging cannot deadlock before `SLOT_ANSWER`, while `Unified(InKernels)` keeps
+///      `demand_records()` at `K` (since `LANDING_DONE` recycles staging mid-step).
+/// 2. `(decode_rows = 1, Linked, head_steps = 15, places = 7, sited = true, bank at floor)`:
+///    - `landing_records()` and `host_records(0, 0)` hold at least `min(E, VERIFY_ROWS * K)`
+///      records so a floor-sized host tier never deadlocks on a `M = 16` short prompt.
+///    - `RegionWords::sites == plan.site_slots() == flights.steps(15) == 30`, matching
+///      `SiteTable` and `Parks::publications` so 15 chained `DraftDecode` steps in flight
+///      never clobber earlier steps' publication slots.
+#[test]
+fn class_wide_hard_capacities_hold_for_short_prompts_and_chained_head_steps() {
+    let device = crate::test_support::open_backend(&seismic::Devices::discover(&[]).unwrap(), seismic::BackendName::Cpu)
+        .expect("cpu device");
+    let words_of = |(_, extents): (seismic::Element, Vec<u64>)| extents.iter().product::<u64>();
+
+    for selected in [6u64, 10] {
+        let max_distinct = (VERIFY_ROWS * selected).min(256);
+        let expected_landing_words = magnitude_kernels::constants::LANDING_ENTRY(VERIFY_ROWS * selected);
+        let with_selected = |plan: &ExpertBankPlan| {
+            let mut layers: Vec<BankLayer> = plan.layers().to_vec();
+            for layer in &mut layers {
+                layer.selected = selected;
+            }
+            BankLayers::new(layers).unwrap()
+        };
+
+        for host in [HostTier::Unified(Parking::InKernels), HostTier::Unified(Parking::AtBoundaries)] {
+            let mut plan = bank_of(&[2], 1, |_| 256, RecordForm::Gated);
+            let layers = with_selected(&plan);
+            let (_, _, groups, _) = plan.structured.into_parts();
+            plan.structured = conveyor::Structured::new(selected, host, groups, layers, None, 1).unwrap();
+            assert_eq!(plan.decode_rows(), 1);
+            assert_eq!(plan.table_choices(), VERIFY_ROWS * selected);
+
+            let binding = plan.binding(0).unwrap();
+            assert_eq!(binding.words.choices, VERIFY_ROWS * selected);
+            assert_eq!(binding.words.landing_words(), expected_landing_words);
+            assert_eq!(words_of(plan.part_shape(0, BankPart::LandingList).unwrap()), expected_landing_words);
+
+            // Hard floor on unified memory holds all `min(E, VERIFY_ROWS * K)` distinct
+            // experts of a Turn-2 `M = VERIFY_ROWS` short prompt even at `floor()`.
+            assert!(
+                plan.decode_records(0) >= max_distinct,
+                "{host:?} K={selected}: decode_records {} < {max_distinct}",
+                plan.decode_records(0),
+            );
+            assert!(
+                plan.least_records(0) >= max_distinct,
+                "{host:?} K={selected}: least_records {} < {max_distinct}",
+                plan.least_records(0),
+            );
+            let floor_records = plan.records_at(0, plan.floor());
+            assert!(
+                floor_records >= max_distinct,
+                "{host:?} K={selected}: floor records {floor_records} < {max_distinct}",
+            );
+
+            // Staging demand reserve: `AtBoundaries` cannot recycle staging mid-step so
+            // it must hold all `max_distinct` misses; `InKernels` recycles via DONE.
+            match host {
+                HostTier::Unified(Parking::AtBoundaries) => assert_eq!(plan.demand_records(), max_distinct),
+                HostTier::Unified(Parking::InKernels) => assert_eq!(plan.demand_records(), selected),
+                HostTier::Linked => unreachable!(),
+            }
+
+            // Append all `max_distinct` entries for one `Step` into a `LandingList`
+            // built from the planned shape (previously panicked at entry `selected`).
+            let backing = crate::experts::Words::on_cpu(&device, expected_landing_words, 0);
+            let bounds = crate::experts::ListBounds { from: binding.staging, to: floor_records, lent: 0 };
+            let list = crate::experts::LandingList::new(backing, bounds);
+            assert_eq!(list.entries() as u64, binding.words.choices);
+            for i in 0..max_distinct {
+                let from = (i % binding.staging) as i32;
+                let to = i as i32;
+                assert_eq!(list.append(1, from, to), Some(i as usize));
+            }
+            assert_eq!(list.listed(1).len(), max_distinct as usize);
+        }
+
+        // Linked discrete GPU at floor (`host_slots = 0`), `decode_rows = 1`,
+        // `head_steps = 15`, `places = 7`, `sited = true`.
+        let mut linked = bank_of(&[2], 1, |_| 256, RecordForm::Gated);
+        let layers = with_selected(&linked);
+        let (_, _, groups, _) = linked.structured.into_parts();
+        linked.structured =
+            conveyor::Structured::new(selected, HostTier::Linked, groups, layers, None, 1).unwrap();
+        linked.places = 7;
+        linked.head_steps = 15;
+        linked.flights = FlightDepth::PIPELINED;
+        linked.sites = BankSites::Admitted(vec![LayerSite::Served; linked.layers().len()]);
+        assert_eq!(linked.decode_rows(), 1);
+        assert_eq!(linked.demand_records(), selected);
+        assert!(
+            linked.landing_records() >= VERIFY_ROWS * selected,
+            "K={selected}: landing_records {} < {}",
+            linked.landing_records(),
+            VERIFY_ROWS * selected,
+        );
+        assert!(
+            linked.host_records(0, 0) >= max_distinct + linked.host_lent(0),
+            "K={selected}: host_records at floor {} < {}",
+            linked.host_records(0, 0),
+            max_distinct + linked.host_lent(0),
+        );
+
+        let binding = linked.binding(0).unwrap();
+        assert_eq!(linked.site_slots(), FlightDepth::PIPELINED.steps(15));
+        assert_eq!(binding.words.sites, 30);
+        assert_eq!(binding.words.site().slots(), 30);
+        assert_eq!(linked.part_shape(0, BankPart::SiteTable).unwrap().1[0], 30);
+        assert_eq!(linked.part_shape(0, BankPart::SiteRows).unwrap().1[0], 30);
+        assert_eq!(linked.part_shape(0, BankPart::SiteOutput).unwrap().1[0], 30);
+
+        // 15 chained `DraftDecode` steps in flight map to 15 distinct publication slots
+        // (`step % 30`) with zero clobbering.
+        let slots = binding.words.site().slots();
+        let used: std::collections::BTreeSet<u64> = (1..=15).map(|step| step % slots).collect();
+        assert_eq!(used.len(), 15, "15 chained head steps must occupy 15 distinct site/publication slots");
+    }
 }

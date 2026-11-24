@@ -633,7 +633,6 @@ pub(crate) struct BankNumbers<D = Dim> {
     pub scratch_slots: D,
     pub scratch_lanes: D,
     pub map_words: D,
-    pub bank_choices: D,
     pub seeded_from: D,
     pub matrix: RecordTensors<[D; 2]>,
 }
@@ -665,7 +664,6 @@ impl<D> Numbers<D> for BankNumbers<D> {
             scratch_slots: f(self.scratch_slots),
             scratch_lanes: f(self.scratch_lanes),
             map_words: f(self.map_words),
-            bank_choices: f(self.bank_choices),
             seeded_from: f(self.seeded_from),
             matrix: self.matrix.map(|_, [n, k]| [f(n), f(k)]),
         }
@@ -725,7 +723,6 @@ pub(crate) fn split<G: GraphDraft>(
         scratch_slots: scratch.slots(),
         scratch_lanes: scratch.lanes(),
         map_words: plan.group_experts(layer.group),
-        bank_choices: plan.choices(),
         seeded_from: plan.seeded_from(layer.group),
         matrix: binding.record.map(|_, tensor| tensor.matrix),
     };
@@ -1229,7 +1226,7 @@ impl<'p, 'a, G: GraphDraft + 'a, W: PlannedWeights + ?Sized> StreamedLayer<'p, '
             ("K", numbers.selected.clone()),
             ("FW", numbers.file_width.clone()),
             ("FLIGHT", numbers.file_slots.clone()),
-            ("L", numbers.bank_choices.clone()),
+            ("L", numbers.choices.clone()),
             ("V", from.clone()),
             ("GV", gated(&from)),
             ("S", into.clone()),

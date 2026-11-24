@@ -1,5 +1,5 @@
 use super::{BankGroup, BankLayers, ExpertBankPlan, HostTier, RecordForm, RecordTensor, RecordTensors, RoutedTensor};
-use super::records::{decode_choices, decode_set, record_bytes, record_slab};
+use super::records::{decode_set, record_bytes, record_slab};
 use seismic::Element;
 
 /// A staging pool: records of one routed tensor in one stored form, which
@@ -403,11 +403,6 @@ impl BankStructure<'_> {
     /// The most experts of any streamed layer ([`ExpertBankPlan::widest`]).
     pub(super) fn widest(self) -> u64 {
         self.layers.widest().get()
-    }
-
-    /// [`ExpertBankPlan::choices`].
-    pub(super) fn choices(self) -> u64 {
-        decode_choices(self.selected, self.decode_rows)
     }
 
     /// [`ExpertBankPlan::round_records`].
