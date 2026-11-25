@@ -3217,11 +3217,13 @@ fn reclaim_served_demand_landings_reclaims_later_layers_at_layer_zero_and_unmaps
 }
 
 /// On a 3-tier bank where held VRAM experts have surrendered their host copies
-/// (`Located::Lacked`) and `exits.leaving(...).back.is_some()` (write-back pays),
-/// `reclaim_served_demand_landings` prefers `back.is_none()` victims first and
-/// falls back to `back.is_some()` victims rather than overflowing to SM zero-copy.
+/// On a 3-tier (`!tier_complete`) bank where `Record::Held` experts have no
+/// Host-RAM copy (`Located::Lacked`), `reclaim_served_demand_landings` MUST NOT
+/// evict them with `back: None` (which would drop them straight to NVMe): excess
+/// misses overflow cleanly to SM zero-copy instead, while `Record::Held` experts
+/// that still have a Host-RAM copy (`Located::Kept(_)`) ARE reclaimed losslessly.
 #[test]
-fn reclaim_served_demand_landings_falls_back_to_writeback_victims_on_three_tier_bank() {
+fn reclaim_served_demand_landings_never_drops_vram_only_victims_on_three_tier_bank() {
     use crate::experts::host_records::{Claim, Taking};
 
     let layers = 2usize;
@@ -3241,6 +3243,7 @@ fn reclaim_served_demand_landings_falls_back_to_writeback_victims_on_three_tier_
         placement: Placement::Tier { bank_maps, tier_maps, lent: (0, 0), stage_slots: vec![0] },
     };
     let mut directory = Directory::new(&[present], &[0, 0], &[experts, experts], host);
+    assert!(!directory.tier_complete(), "3-tier bank must be !tier_complete");
     for layer in 0..layers {
         directory.price_copies(layer, Some(1.0));
         for expert in 0..4 {
@@ -3267,8 +3270,7 @@ fn reclaim_served_demand_landings_falls_back_to_writeback_victims_on_three_tier_
     steps.end_played(step0);
 
     // Price write-backs so `group_write_back_pays` holds, then surrender host
-    // copies of promoted experts so they become `Located::Lacked` and
-    // `exits.leaving(...).back.is_some()` holds.
+    // copies of promoted experts so they become `Located::Lacked` (VRAM-only).
     let terms = magnitude_cost_model::Terms { compute: 0.0, drive: 1.0, link: 0.0, cpu: 0.0, memory: 0.0 };
     let price = Some(WriteBack { terms, drive: 1.0, link: 0.0 });
     for layer in 0..layers {
@@ -3285,20 +3287,116 @@ fn reclaim_served_demand_landings_falls_back_to_writeback_victims_on_three_tier_
     }
     directory.time().lock().moved(0, crate::experts::horizon::Tier::COMPUTE);
 
-    // Begin step1 at layer 1: layer 0's 2 held experts are served and have
-    // `Located::Lacked` + write-back paying, yet must still be reclaimed as
-    // last-resort victims so `dma_overflow == 0`.
+    // Begin step1 at layer 1: layer 0's 2 held experts are served, but they are
+    // `Located::Lacked` (VRAM-only), so `reclaim_served_demand_landings` MUST NOT
+    // evict them with `back: None` — excess misses overflow cleanly to zero-copy.
     let step1 = steps.begin_group(1, None);
     let progress = at(step1, 1);
     let overflows = vec![(0, Some((1, 10))), (1, Some((1, 11)))];
     let reclaimed = steps.unbegun_with_served(progress, directory.layers(), |at, park, is_served| {
         directory.reclaim_served_demand_landings(0, &overflows, at, park, progress, is_served, |_| true)
     });
-    assert_eq!(
-        reclaimed.len(),
-        2,
-        "must fall back to write-back victims on 3-tier bank instead of overflowing to SM zero-copy"
+    assert!(
+        reclaimed.is_empty(),
+        "must never drop Located::Lacked VRAM-only experts to NVMe for transient demand landings"
     );
+    assert!(directory.held(0, 0).is_some() && directory.held(0, 1).is_some(), "VRAM-only experts stay held");
+}
+
+/// On a 3-tier (`!tier_complete`) bank:
+/// 1. `finish_demand_landings_batch` does not promote cold `!in_top` misses and
+///    never evicts `Located::Lacked` (VRAM-only) resident experts during swap.
+/// 2. `replenish_demand_free` never drops a `Located::Lacked` resident expert
+///    with `back: None` (to NVMe) when write-back cannot pay / is unpriced.
+#[test]
+fn three_tier_demand_finish_and_replenish_never_drop_resident_experts_to_nvme() {
+    use crate::experts::host_records::{Claim, Taking};
+
+    let layers = 2usize;
+    let experts = 16usize;
+    let present = 6usize; // 4 held + 2 free
+    let map_words = magnitude_kernels::constants::MAP_WORDS;
+    let bank_maps = (0..layers)
+        .map(|_| StampedMap::new(cpu_words(&[experts as u64, map_words], 0)))
+        .collect::<Vec<_>>();
+    let tier_maps = (0..layers)
+        .map(|_| crate::experts::map::LandingMap::Tier(cpu_words(&[experts as u64], -1)))
+        .collect::<Vec<_>>();
+    let host = HostTier {
+        records: vec![8], // 3-tier bank: 6 VRAM, 8 host, 32 total experts (!tier_complete)
+        lent: vec![0],
+        reserve: 0,
+        placement: Placement::Tier { bank_maps, tier_maps, lent: (0, 0), stage_slots: vec![0] },
+    };
+    let mut directory = Directory::new(&[present], &[0, 0], &[experts, experts], host);
+    assert!(!directory.tier_complete());
+    directory.configure_decode_budget(1, 2, 1);
+
+    let mut layer0_tier_recs = Vec::new();
+    for layer in 0..layers {
+        directory.price_copies(layer, Some(0.0));
+        for expert in 0..4 {
+            let Claim::Taken(grant) = directory.claim_landing(layer, expert, 0, Taking::Out, (|_, _| (), |_, _| true)) else {
+                panic!("host tier has room");
+            };
+            directory.landed(layer, HostRecord(grant.record()), expert, Some(1));
+            if layer == 0 {
+                layer0_tier_recs.push(grant.record());
+            }
+        }
+    }
+
+    // Promote 4 hot experts into VRAM and surrender their Host-RAM copies so
+    // all 4 are VRAM-only (`Located::Lacked`).
+    let steps = steps();
+    let step0 = steps.begin_group(1, None);
+    for s in 0..4 {
+        let step = if s == 0 { step0 } else { steps.begin_group(1, None) };
+        log(&directory, step, 0, &[0, 1]);
+        log(&directory, step, 1, &[0, 1]);
+        if s > 0 {
+            steps.end_played(step);
+        }
+    }
+    assert!(directory.settle_changes());
+    let wants = steps.unbegun(|at| directory.promotions(at, 4));
+    for p in &wants.promotions {
+        let tier = directory.hold_tier(p.layer, p.expert).expect("in host tier");
+        directory.copy(p.group, p.record, tier, 0);
+    }
+    let completed: Vec<(usize, BankRecord)> = wants.promotions.iter().map(|p| (p.group, p.record)).collect();
+    directory.promoted(completed, at(step0, 0), &steps);
+    steps.end_played(step0);
+
+    let surrendered = steps.unbegun(|at| directory.surrender_banked(at));
+    assert!(!surrendered.is_empty());
+    directory.retire_graces(past(step0), &steps);
+    assert_eq!(directory.located(0, 0), Located::Lacked);
+    assert_eq!(directory.located(0, 1), Located::Lacked);
+
+    // Claim a free slot for a cold host-tier expert (0, 2) that is NOT `in_top`.
+    let DemandSlotClaim::Allocated { staged, slot } =
+        directory.claim_demand_landing(0, layer0_tier_recs[2], false, |_| true)
+    else {
+        panic!("expected free slot for cold miss");
+    };
+    assert_eq!(staged, Some((0, 2)));
+    let step1 = steps.begin_group(1, None);
+    let promoted = directory.finish_demand_landings_batch(&[(0, slot, staged, true)], at(step1, 0), &steps);
+    assert!(!promoted, "cold !in_top miss must NOT promote on !tier_complete 3-tier bank");
+    assert!(directory.held(0, 2).is_none());
+    assert!(matches!(directory.located(0, 2), Located::Kept(_)), "Host-RAM copy of (0, 2) stays intact");
+    assert!(directory.held(0, 0).is_some() && directory.held(0, 1).is_some(), "VRAM-only experts untouched");
+
+    // `replenish_demand_free` with write-backs unpriced (`back: None`): MUST NOT
+    // evict `Located::Lacked` VRAM-only experts straight to NVMe!
+    let released = steps.unbegun(|at| directory.replenish_demand_free(0, 5, at, |_| true));
+    assert_eq!(
+        released, 0,
+        "replenish_demand_free must not drop Located::Lacked experts with back: None to NVMe"
+    );
+    assert!(directory.held(0, 0).is_some() && directory.held(0, 1).is_some());
+    steps.end_played(step1);
 }
 
 /// `replenish_demand_free` counts in-flight non-borrowed `DemandLanding` slots

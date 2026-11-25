@@ -2392,23 +2392,22 @@ impl Directory {
     /// 1. `!is_layer_whole_published(v_layer)` (never evicts whole-resident layers),
     /// 2. `bank.usable_when(group, record, lending)` (never takes lent or stage slots),
     /// 3. `can_reuse(record)` (zero active transport leases or quarantine),
-    /// 4. `park.frees(v_layer, from, until.step())` (no earlier cut-in group has
+    /// 4. `matches!(host[group].located((v_layer, v_expert)), Located::Kept(_))`
+    ///    (host RAM still holds a copy so evicting with `back: None` flips it back
+    ///    to `Kept::Alone` at zero D2H / NVMe cost; VRAM-only `Located::Lacked`
+    ///    experts are NEVER dropped to NVMe for a transient demand landing — excess
+    ///    misses overflow cleanly to SM zero-copy instead),
+    /// 5. `park.frees(v_layer, from, until.step())` (no earlier cut-in group has
     ///    `v_layer` unresolved in `[from, until)`),
-    /// 5. `is_served(from, unmap_until.step(), v_layer, progress)` where
+    /// 6. `is_served(from, unmap_until.step(), v_layer, progress)` where
     ///    `unmap_until = UnmapStep::from(park.unresolved(v_layer))` (every step
     ///    in `[from, unmap_until)` has already passed `v_layer` or ended; steps
     ///    `>= unmap_until` have not yet resolved `v_layer` and will miss once
-    ///    unmapped at `unmap_until`). This automatically rejects the current
-    ///    layer (`v_layer == progress.layer`, whose `DecodeHits` is already
-    ///    submitted) while allowing both earlier served layers (`v_layer < layer`)
-    ///    and unsubmitted later layers (`v_layer > layer`) in the same group.
+    ///    unmapped at `unmap_until`).
     ///
-    /// Selects victims in 4 priority tiers to preserve hot residency and avoid
-    /// unnecessary D2H loss while driving `dma_overflow -> 0` on 3-tier banks:
-    /// 1. lowest-ranked `unwanted` with `back.is_none()`,
-    /// 2. lowest-ranked `wanted` with `back.is_none()`,
-    /// 3. lowest-ranked `unwanted` with `back.is_some()` (last-resort fallback),
-    /// 4. lowest-ranked `wanted` with `back.is_some()` (last-resort fallback).
+    /// Selects eligible victims in 2 priority tiers:
+    /// 1. lowest-ranked `unwanted` with a Host-RAM copy (`Located::Kept(_)`),
+    /// 2. lowest-ranked `wanted` with a Host-RAM copy (`Located::Kept(_)`).
     pub fn reclaim_served_demand_landings(
         &mut self,
         group: usize,
@@ -2427,9 +2426,8 @@ impl Directory {
         let want = overflows.len();
         let victims: Vec<(Staged, usize, UnmapStep)> = if self.prompt_reads.is_empty() {
             let reuse = self.reuse_now();
-            let exits = self.exits(&reuse, group);
-            // 4 priority buckets: (has_back, is_wanted) -> 0..4
-            let mut buckets: [Vec<(Staged, usize, UnmapStep)>; 4] = Default::default();
+            // 2 priority buckets: unwanted (0), wanted (1)
+            let mut buckets: [Vec<(Staged, usize, UnmapStep)>; 2] = Default::default();
             buckets[0].reserve(want);
             for &(_, v_layer, v_expert) in reuse.top_order(group) {
                 if self.is_layer_whole_published(v_layer) {
@@ -2438,7 +2436,10 @@ impl Directory {
                 let Some(record) = self.bank.held(v_layer, v_expert) else {
                     continue;
                 };
-                if !self.bank.usable_when(group, record, lending) || !can_reuse(record) {
+                if !self.bank.usable_when(group, record, lending)
+                    || !can_reuse(record)
+                    || !matches!(self.host[group].located((v_layer, v_expert)), Located::Kept(_))
+                {
                     continue;
                 }
                 let from = self.bank.map_from(v_layer, v_expert);
@@ -2448,9 +2449,7 @@ impl Directory {
                 {
                     continue;
                 }
-                let has_back = exits.leaving((v_layer, v_expert)).back.is_some();
-                let is_wanted = !self.unwanted[v_layer].contains(&v_expert);
-                let tier = (usize::from(has_back) << 1) | usize::from(is_wanted);
+                let tier = usize::from(!self.unwanted[v_layer].contains(&v_expert));
                 if buckets[tier].len() < want {
                     buckets[tier].push(((v_layer, v_expert), record, unmap_until));
                     if tier == 0 && buckets[0].len() >= want {
@@ -2462,9 +2461,8 @@ impl Directory {
         } else {
             let members = self.homes[group].iter().map(|&(_, l)| l).collect::<Vec<_>>();
             let reuse = self.reuse_now();
-            let exits = self.exits(&reuse, group);
             let ranker = reuse.ranker(group, Tier::COMPUTE, Reader::Move);
-            let mut candidates: Vec<(bool, bool, _, Staged, usize, UnmapStep)> = Vec::new();
+            let mut candidates: Vec<(bool, _, Staged, usize, UnmapStep)> = Vec::new();
             for &v_layer in &members {
                 if self.is_layer_whole_published(v_layer) {
                     continue;
@@ -2474,7 +2472,10 @@ impl Directory {
                     let Some(record) = self.bank.held(v_layer, v_expert) else {
                         continue;
                     };
-                    if !self.bank.usable_when(group, record, lending) || !can_reuse(record) {
+                    if !self.bank.usable_when(group, record, lending)
+                        || !can_reuse(record)
+                        || !matches!(self.host[group].located((v_layer, v_expert)), Located::Kept(_))
+                    {
                         continue;
                     }
                     let from = self.bank.map_from(v_layer, v_expert);
@@ -2483,10 +2484,8 @@ impl Directory {
                     {
                         continue;
                     }
-                    let has_back = exits.leaving((v_layer, v_expert)).back.is_some();
                     let is_wanted = !self.unwanted[v_layer].contains(&v_expert);
                     candidates.push((
-                        has_back,
                         is_wanted,
                         self.ranked(ranker, v_layer, v_expert, None),
                         (v_layer, v_expert),
@@ -2495,15 +2494,11 @@ impl Directory {
                     ));
                 }
             }
-            candidates.sort_unstable_by(|a, b| {
-                a.0.cmp(&b.0)
-                    .then_with(|| a.1.cmp(&b.1))
-                    .then_with(|| a.2.cmp(&b.2))
-            });
+            candidates.sort_unstable_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.cmp(&b.1)));
             candidates
                 .into_iter()
                 .take(want)
-                .map(|(_, _, _, staged, record, unmap_until)| (staged, record, unmap_until))
+                .map(|(_, _, staged, record, unmap_until)| (staged, record, unmap_until))
                 .collect()
         };
         let mut reclaimed = Vec::with_capacity(victims.len());
@@ -2556,17 +2551,17 @@ impl Directory {
         if short == 0 {
             return 0;
         }
+        let tier_complete = self.host[group].complete();
         let reuse = self.reuse_now();
         let mut released = 0usize;
         if self.prompt_reads.is_empty() {
             // Fast O(short) path: `top_order(group)` is ascending by rank
-            // (lowest-ranked first). Collect up to `want_cands` unwanted
-            // usable+reusable held experts (and up to `want_cands` lowest-ranked
-            // wanted held experts as fallback if fewer than `short` unwanted
-            // exist), stopping as soon as enough unwanted victims are found.
+            // (lowest-ranked first). Prioritize victims that still have a
+            // Host-RAM copy (`Located::Kept(_)`) over VRAM-only (`!kept`)
+            // victims, and `unwanted` over `wanted`.
             let want_cands = short.saturating_add(8);
-            let mut unwanted_cands: Vec<(Staged, usize)> = Vec::with_capacity(want_cands.min(64));
-            let mut wanted_cands: Vec<(Staged, usize)> = Vec::new();
+            let mut buckets: [Vec<(Staged, usize, bool)>; 4] = Default::default();
+            buckets[0].reserve(want_cands.min(64));
             for &(_, layer, expert) in reuse.top_order(group) {
                 if self.is_layer_whole_published(layer) {
                     continue;
@@ -2577,21 +2572,28 @@ impl Directory {
                 if !self.bank.usable_when(group, record, lending) || !can_reuse(record) {
                     continue;
                 }
-                if self.unwanted[layer].contains(&expert) {
-                    unwanted_cands.push(((layer, expert), record));
-                    if unwanted_cands.len() >= want_cands {
+                let kept_in_host = tier_complete
+                    || matches!(self.host[group].located((layer, expert)), Located::Kept(_));
+                let is_wanted = !self.unwanted[layer].contains(&expert);
+                let bucket = (usize::from(!kept_in_host) << 1) | usize::from(is_wanted);
+                if buckets[bucket].len() < want_cands {
+                    buckets[bucket].push(((layer, expert), record, kept_in_host));
+                    if bucket == 0 && buckets[0].len() >= want_cands {
                         break;
                     }
-                } else if wanted_cands.len() < want_cands {
-                    wanted_cands.push(((layer, expert), record));
                 }
             }
             drop(reuse);
-            for (staged @ (layer, expert), record) in unwanted_cands.into_iter().chain(wanted_cands) {
+            for (staged @ (layer, expert), record, kept_in_host) in buckets.into_iter().flatten() {
                 if released >= short {
                     break;
                 }
                 let exit = self.exit_now(group, record, staged);
+                if !kept_in_host && exit.back().is_none() {
+                    // Never drop a VRAM-only expert straight to NVMe just to
+                    // replenish transient demand-DMA free slots.
+                    continue;
+                }
                 self.bank.release(group, BankRecord(record as u32), at.into(), exit);
                 self.left_bank(layer, expert, None);
                 released += 1;
@@ -2607,9 +2609,8 @@ impl Directory {
         let members = self.homes[group].iter().map(|&(_, layer)| layer).collect::<Vec<_>>();
         let reuse = self.reuse_now();
         let ranker = reuse.ranker(group, Tier::COMPUTE, Reader::Move);
-        // Prefer unwanted held experts first; if fewer than `short`, consider
-        // lowest-ranked held experts in non-whole layers of this group.
-        let mut candidates: Vec<(bool, _, Staged, usize)> = Vec::new();
+        // Prefer Host-RAM-backed victims first, then unwanted over wanted.
+        let mut candidates: Vec<(bool, bool, _, Staged, usize, bool)> = Vec::new();
         for &layer in &members {
             if self.is_layer_whole_published(layer) {
                 continue;
@@ -2621,17 +2622,33 @@ impl Directory {
                 if !self.bank.usable_when(group, record, lending) || !can_reuse(record) {
                     continue;
                 }
+                let kept_in_host = tier_complete
+                    || matches!(self.host[group].located((layer, expert)), Located::Kept(_));
                 let is_wanted = !self.unwanted[layer].contains(&expert);
-                candidates.push((is_wanted, self.ranked(ranker, layer, expert, None), (layer, expert), record));
+                candidates.push((
+                    !kept_in_host,
+                    is_wanted,
+                    self.ranked(ranker, layer, expert, None),
+                    (layer, expert),
+                    record,
+                    kept_in_host,
+                ));
             }
         }
         drop(reuse);
-        candidates.sort_unstable_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.cmp(&b.1)));
-        for (_, _, staged @ (layer, expert), record) in candidates {
+        candidates.sort_unstable_by(|a, b| {
+            a.0.cmp(&b.0)
+                .then_with(|| a.1.cmp(&b.1))
+                .then_with(|| a.2.cmp(&b.2))
+        });
+        for (_, _, _, staged @ (layer, expert), record, kept_in_host) in candidates {
             if released >= short {
                 break;
             }
             let exit = self.exit_now(group, record, staged);
+            if !kept_in_host && exit.back().is_none() {
+                continue;
+            }
             self.bank.release(group, BankRecord(record as u32), at.into(), exit);
             self.left_bank(layer, expert, None);
             released += 1;
@@ -2733,15 +2750,24 @@ impl Directory {
                         group_state = Some((group, free_now, held_total, Vec::new()));
                     }
                     let (_, free_now, held_total, claimed_victims) = group_state.as_mut().unwrap();
+                    let tier_complete = self.host[group].complete();
                     let in_top = reuse.in_top(layer, expert);
                     let ranker = reuse.ranker(group, Tier::COMPUTE, Reader::Move);
                     let staged_uses = self.uses(ranker, staged);
 
                     if *free_now >= free_floor && *held_total + replenish_target < cap {
-                        if in_top || staged_uses >= 0.0 {
+                        // On 3-tier (`!tier_complete`) groups, only promote
+                        // demand landings that actually belong in the VRAM pool
+                        // (`in_top`), never cold 1-hit misses that would force
+                        // subsequent evictions.
+                        if in_top || (tier_complete && staged_uses >= 0.0) {
                             *held_total += 1;
                             return Decision::PromoteOnly;
                         }
+                        return Decision::Release;
+                    }
+
+                    if !tier_complete && !in_top {
                         return Decision::Release;
                     }
 
@@ -2749,6 +2775,10 @@ impl Directory {
                     // permanent `Held` target: find the coldest evictable
                     // `Record::Held` victim in this group and swap if `staged`
                     // outranks it (preserving `Held` and `Free` counts).
+                    // On 3-tier (`!tier_complete`) groups, only swap victims
+                    // that still have a Host-RAM copy (`Located::Kept(_)`) so
+                    // transient demand landings never trigger D2H churn or drop
+                    // resident VRAM-only experts to NVMe.
                     let candidate_victim: Option<(Staged, usize, f64, bool)> = if self.prompt_reads.is_empty() {
                         let mut fallback_wanted: Option<(Staged, usize, f64, bool)> = None;
                         let mut chosen: Option<(Staged, usize, f64, bool)> = None;
@@ -2762,6 +2792,8 @@ impl Directory {
                             if claimed_victims.contains(&v_record)
                                 || !self.bank.usable_when(group, v_record, lending)
                                 || !can_reuse_victim(group, v_record)
+                                || (!tier_complete
+                                    && !matches!(self.host[group].located((v_layer, v_expert)), Located::Kept(_)))
                             {
                                 continue;
                             }
@@ -2789,6 +2821,8 @@ impl Directory {
                                 if claimed_victims.contains(&v_record)
                                     || !self.bank.usable_when(group, v_record, lending)
                                     || !can_reuse_victim(group, v_record)
+                                    || (!tier_complete
+                                        && !matches!(self.host[group].located((v_layer, v_expert)), Located::Kept(_)))
                                 {
                                     continue;
                                 }

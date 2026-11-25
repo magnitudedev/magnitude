@@ -1233,12 +1233,10 @@ impl Watcher {
         });
         let mut claims = Vec::with_capacity(tier_records.len());
         let mut landed_at_home = false;
-        let mut promoted_any = false;
-        let mut last_progress = None;
         transport.with_slot_reuse(|mut can_reuse| {
             let mut promoted_groups: Vec<usize> = Vec::new();
             for prev in finish {
-                let (promoted, at_home, prev_progress) = finish_demand_landings_in_lock(
+                let (promoted, at_home) = finish_demand_landings_in_lock(
                     directory,
                     steps,
                     prev.layer,
@@ -1247,8 +1245,6 @@ impl Watcher {
                     &mut can_reuse,
                 );
                 if promoted {
-                    promoted_any = true;
-                    last_progress = Some(prev_progress);
                     if let Some(first) = prev.slots.first() {
                         if !promoted_groups.contains(&first.group) {
                             promoted_groups.push(first.group);
@@ -1308,9 +1304,13 @@ impl Watcher {
                 || remaining_overflows > 0
                 || promoted_groups.contains(&group)
             {
-                let want_free = replenish_target
-                    .unwrap_or(0)
-                    .max(claimed_count + remaining_overflows);
+                let want_free = if directory.tier_complete() {
+                    replenish_target
+                        .unwrap_or(0)
+                        .max(claimed_count + remaining_overflows)
+                } else {
+                    0
+                };
                 steps.unbegun(|at| {
                     directory.replenish_demand_free(group, want_free, at, |slot| {
                         can_reuse(crate::experts::transport::DestSlot { group, slot })
@@ -1328,19 +1328,11 @@ impl Watcher {
                 });
             }
         });
-        if promoted_any {
-            let surrendered = steps.unbegun(|at| directory.surrender_banked(at));
-            let freed_host = !surrendered.is_empty();
-            for (g, tier_record) in surrendered {
-                transport.bump_source_generation(g, tier_record);
-            }
-            if let Some(progress) = last_progress {
-                directory.retire_graces(progress, steps);
-            }
-            if freed_host {
-                self.shared.events().notify();
-            }
-        }
+        // Do NOT call `directory.surrender_banked(at)` on the decode demand-landing
+        // hot path: on 3-tier (`!tier_complete`) hosts, eagerly destroying the
+        // Host-RAM copy of freshly landed demand experts pumps hot Host-RAM experts
+        // through VRAM and drops them to NVMe when VRAM later evicts them.
+        // `Directory::promotions_with` remains the single owner of `surrender_banked`.
         if landed_at_home {
             held.publish_policy();
         }
@@ -1389,16 +1381,12 @@ impl Watcher {
         let transport = self.shared.transport.clone();
         let core = &mut held.core;
         let (directory, steps) = (&mut core.directory, &core.steps);
-        let mut promoted_any = false;
         let mut landed_at_home = false;
-        let mut last_progress = None;
         transport.with_slot_reuse(|mut can_reuse| {
-            let (promoted, at_home, progress) =
+            let (promoted, at_home) =
                 finish_demand_landings_in_lock(directory, steps, layer, sequence, slots, &mut can_reuse);
-            promoted_any = promoted;
             landed_at_home = at_home;
-            last_progress = Some(progress);
-            if promoted_any {
+            if promoted {
                 let group = slots[0].group;
                 steps.unbegun(|at| {
                     directory.replenish_demand_free(group, 0, at, |slot| {
@@ -1407,19 +1395,6 @@ impl Watcher {
                 });
             }
         });
-        if promoted_any {
-            let surrendered = steps.unbegun(|at| directory.surrender_banked(at));
-            let freed_host = !surrendered.is_empty();
-            for (group, tier_record) in surrendered {
-                transport.bump_source_generation(group, tier_record);
-            }
-            if let Some(progress) = last_progress {
-                directory.retire_graces(progress, steps);
-            }
-            if freed_host {
-                self.shared.events().notify();
-            }
-        }
         if landed_at_home {
             held.publish_policy();
         }
@@ -1466,14 +1441,12 @@ impl Watcher {
         let transport = self.shared.transport.clone();
         let core = &mut held.core;
         let (directory, steps) = (&mut core.directory, &core.steps);
-        let mut promoted_any = false;
         let mut landed_at_home = false;
-        let mut last_progress = None;
         if has_finishes {
             transport.with_slot_reuse(|mut can_reuse| {
                 let mut promoted_groups: Vec<usize> = Vec::new();
                 for prev in finishes {
-                    let (promoted, at_home, progress) = finish_demand_landings_in_lock(
+                    let (promoted, at_home) = finish_demand_landings_in_lock(
                         directory,
                         steps,
                         prev.layer,
@@ -1482,8 +1455,6 @@ impl Watcher {
                         &mut can_reuse,
                     );
                     if promoted {
-                        promoted_any = true;
-                        last_progress = Some(progress);
                         if let Some(first) = prev.slots.first() {
                             if !promoted_groups.contains(&first.group) {
                                 promoted_groups.push(first.group);
@@ -1505,19 +1476,6 @@ impl Watcher {
             directory.set_decode_rows(rows);
             directory.observe_demand_misses(group, misses, rows);
         }
-        if promoted_any {
-            let surrendered = steps.unbegun(|at| directory.surrender_banked(at));
-            let freed_host = !surrendered.is_empty();
-            for (group, tier_record) in surrendered {
-                transport.bump_source_generation(group, tier_record);
-            }
-            if let Some(progress) = last_progress {
-                directory.retire_graces(progress, steps);
-            }
-            if freed_host {
-                self.shared.events().notify();
-            }
-        }
         if landed_at_home {
             held.publish_policy();
         }
@@ -1533,7 +1491,7 @@ pub(in crate::experts) struct DemandLandingToFinish {
 }
 
 /// Settle `slots` for `(layer, sequence)` while holding `Residency` and
-/// `transport.with_slot_reuse`. Returns `(promoted_any, landed_at_home, progress)`.
+/// `transport.with_slot_reuse`. Returns `(promoted_any, landed_at_home)`.
 fn finish_demand_landings_in_lock(
     directory: &mut crate::experts::directory::Directory,
     steps: &Steps,
@@ -1541,11 +1499,11 @@ fn finish_demand_landings_in_lock(
     sequence: u64,
     slots: &[crate::experts::transport::DemandSlot],
     can_reuse: &mut impl FnMut(crate::experts::transport::DestSlot) -> bool,
-) -> (bool, bool, crate::experts::directory::Point) {
-    let progress = steps.point(sequence, layer, sequence);
+) -> (bool, bool) {
     if slots.is_empty() {
-        return (false, false, progress);
+        return (false, false);
     }
+    let progress = steps.point(sequence, layer, sequence);
     let batch: Vec<(usize, usize, Option<(usize, usize)>, bool)> = slots
         .iter()
         .map(|&slot| {
@@ -1569,7 +1527,7 @@ fn finish_demand_landings_in_lock(
                     && directory.held(staged_layer, staged_expert) == Some(slot.slot)
             })
         });
-    (promoted_any, landed_at_home, progress)
+    (promoted_any, landed_at_home)
 }
 
 /// The load's account of its landings and of its starved steps, once

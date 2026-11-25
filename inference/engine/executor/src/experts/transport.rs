@@ -1191,12 +1191,18 @@ impl SplitDmaCost {
 
     /// Derive the incremental cost model directly from measured
     /// [`crate::assessment::TierCopyCosts`], per-layer
-    /// [`magnitude_cost_model::ExpertLines`], and optional
-    /// [`magnitude_cost_model::LaunchPrices`] (`step_round_trip_seconds`).
+    /// [`magnitude_cost_model::ExpertLines`], optional
+    /// [`magnitude_cost_model::LaunchPrices`], and streamed `layers` count.
+    ///
+    /// Entering split DMA from pipelined `RunStage::Whole` forces a host sync
+    /// (`wait_completion(router_done)`) that drains at least the preceding
+    /// layer's GPU compute (`per_layer_decode_seconds`) plus the host-GPU
+    /// boundary (`step_round_trip_seconds`) and copy launch latency.
     pub(crate) fn from_rates(
         copy: &crate::assessment::TierCopyCosts,
         lines: &magnitude_cost_model::ExpertLines,
         launch: Option<&magnitude_cost_model::LaunchPrices>,
+        layers: usize,
     ) -> Self {
         let record_bytes = lines.host.record_bytes;
         if record_bytes == 0 {
@@ -1207,7 +1213,9 @@ impl SplitDmaCost {
         let resident_s = lines.gpu.resident.weights.get() * 1e-9;
         let inv_b_zerocopy = link_s / rb;
         let inv_b_split = copy.transfer.seconds_per_byte() + resident_s / rb;
-        let boundary_s = launch.map_or(0.0, magnitude_cost_model::LaunchPrices::step_round_trip_seconds);
+        let boundary_s = launch.map_or(0.0, |l| {
+            l.step_round_trip_seconds() + l.per_layer_decode_seconds(layers)
+        });
         let t_split_s = copy.transfer.latency_seconds() + boundary_s;
         Self::from_measured(inv_b_split, inv_b_zerocopy, t_split_s, record_bytes)
     }
@@ -1872,12 +1880,13 @@ impl ExpertTransport {
         let Some(dma) = &self.decode else {
             return;
         };
+        let layers = lines.len();
         let mut first = None;
         for (layer, gate) in dma.layer_gates.iter().enumerate() {
             let Some(layer_lines) = lines.get(layer) else {
                 continue;
             };
-            let cost = SplitDmaCost::from_rates(copy, layer_lines, launch);
+            let cost = SplitDmaCost::from_rates(copy, layer_lines, launch, layers);
             gate.set_cost(cost);
             if layer == 0 {
                 first = Some(cost);
@@ -4015,7 +4024,7 @@ mod tests {
             assert!(!gate.should_split(12), "slow DMA must not split wide verify during warmup");
         }
 
-        // (6) `from_rates` derives cleanly from `TierCopyCosts` + `ExpertLines` (no per-layer decode charge).
+        // (6) `from_rates` derives cleanly from `TierCopyCosts` + `ExpertLines` (no launch prices -> 0 drain).
         let transfer = magnitude_cost_model::ReadLine::new(5.1e-6, 1.0 / 48e9).expect("valid ReadLine");
         let copy = crate::assessment::TierCopyCosts {
             blocks: 2,
@@ -4046,7 +4055,7 @@ mod tests {
                 record_bytes,
             },
         };
-        let measured = SplitDmaCost::from_rates(&copy, &expert_lines, None);
+        let measured = SplitDmaCost::from_rates(&copy, &expert_lines, None, 48);
         let expected = SplitDmaCost::from_measured(inv_split, inv_zc, 5.1e-6, record_bytes);
         assert!(
             (measured.incremental_delta_seconds(record_bytes)
@@ -4056,6 +4065,116 @@ mod tests {
             "from_rates delta {} should match expected {}",
             measured.incremental_delta_seconds(record_bytes),
             expected.incremental_delta_seconds(record_bytes)
+        );
+    }
+
+    /// `SplitDmaCost::from_rates` includes `launch.per_layer_decode_seconds(layers)`
+    /// to price the mandatory `wait_completion(router_done)` pipeline drain when
+    /// splitting a layer out of pipelined `RunStage::Whole`.
+    /// Low-miss layers (2-3 Qwen3.8 Q2_0 experts, ~2.8-4.2 MiB) stay on `Whole`
+    /// while heavy verify bursts (48 MiB) still choose hardware Split DMA.
+    #[test]
+    fn split_dma_cost_from_rates_includes_per_layer_decode_drain() {
+        const MIB: u64 = 1024 * 1024;
+        let transfer = magnitude_cost_model::ReadLine::new(5.1e-6, 1.0 / 48e9).expect("valid ReadLine");
+        let copy = crate::assessment::TierCopyCosts {
+            blocks: 2,
+            whole_seconds: 1e-3,
+            stall_share: 0.0,
+            transfer,
+            back: transfer,
+            concurrent_host_byte_seconds: None,
+            concurrent_dma_byte_seconds: None,
+        };
+        // Qwen3.8 Q2_0 record (~1.4 MiB) on RTX 5090 Gen5 (48 GB/s DMA vs 24 GB/s zero-copy).
+        let record_bytes = 1_400_000u64;
+        let link_ns = ((record_bytes as f64 / 24e9) * 1e9).round() as u32;
+        let resident_ns = ((record_bytes as f64 / 1.5e12) * 1e9).round() as u32;
+        let ns = |v: u32| magnitude_cost_model::Nanoseconds::try_from(v).unwrap();
+        let expert_lines = magnitude_cost_model::ExpertLines {
+            gpu: magnitude_cost_model::GpuLines {
+                resident: magnitude_cost_model::PassLine { weights: ns(resident_ns), row: ns(500) },
+                link: magnitude_cost_model::PassLine { weights: ns(link_ns), row: ns(500) },
+                moves: magnitude_cost_model::Moves::NONE,
+                baseline_dma: None,
+                contended_link: None,
+            },
+            host: magnitude_cost_model::HostLines {
+                cpu: None,
+                memory: None,
+                joint_memory: None,
+                landing: None,
+                record_bytes,
+            },
+        };
+
+        // Build LaunchPrices with a ~12 ms plain 1-row decode across 48 layers (~250 us/layer):
+        // 48 layers × 375 MB at 1.5 TB/s = 12.0 ms.
+        const BF16: seismic::measure::pricing::Format = seismic::measure::pricing::Format("bf16");
+        let rates = seismic::measure::pricing::Rates {
+            activation: BF16,
+            weights: seismic::measure::pricing::Storage::ALL
+                .iter()
+                .map(|&storage| (storage, BF16, 1.5e12))
+                .collect(),
+            flops: vec![(BF16, 100e12)],
+            history: Vec::new(),
+            launch: 0.0,
+            decode: None,
+        };
+        let figures = seismic::measure::pricing::Figures {
+            rates,
+            composition: Ok(1.0),
+            step_pipelined: 0.0,
+            step_round_trip: 20e-6,
+        };
+        let work = seismic::measure::pricing::Work {
+            weights: vec![seismic::measure::pricing::Bytes { format: BF16, bytes: 375_000_000 }],
+            ..seismic::measure::pricing::Work::default()
+        };
+        let layers = 48usize;
+        let counts = magnitude_cost_model::LaunchCounts::new(vec![Ok(1)]);
+        let census = magnitude_cost_model::Census::new(
+            (0..layers).map(|_| {
+                (
+                    magnitude_cost_model::Kind { work: work.clone(), launches: counts.clone() },
+                    None,
+                )
+            }),
+            0,
+            1,
+        );
+        let launch = magnitude_cost_model::LaunchPrices::new(
+            magnitude_cost_model::TargetCensus::of(census, None),
+            figures,
+            true,
+        );
+        let drain_s = launch.per_layer_decode_seconds(layers);
+        assert!(
+            drain_s > 200e-6 && drain_s < 300e-6,
+            "expected ~250 us per-layer decode drain, got {:.1} us",
+            drain_s * 1e6
+        );
+
+        let with_launch = SplitDmaCost::from_rates(&copy, &expert_lines, Some(&launch), layers);
+        let without_launch = SplitDmaCost::from_rates(&copy, &expert_lines, None, layers);
+        assert!(
+            with_launch.t_split_overhead_s > without_launch.t_split_overhead_s + 200e-6,
+            "SplitDmaCost overhead must include per_layer_decode_seconds(layers)"
+        );
+        // 2-3 Qwen3.8 misses (~2.8-4.2 MB) must stay Whole instead of paying pipeline drain.
+        assert!(
+            !with_launch.split_wins(2 * record_bytes),
+            "2 misses (2.8 MB) must stay Whole with per-layer drain priced"
+        );
+        assert!(
+            !with_launch.split_wins(3 * record_bytes),
+            "3 misses (4.2 MB) must stay Whole with per-layer drain priced"
+        );
+        // Heavy verify burst (48 MiB) still wins on 48 GB/s hardware Split DMA.
+        assert!(
+            with_launch.split_wins(48 * MIB),
+            "heavy 48 MiB burst must still choose Split DMA"
         );
     }
 

@@ -191,6 +191,22 @@ impl LaunchPrices {
         self.source.figures.step_round_trip
     }
 
+    /// Hardware-derived GPU compute duration (seconds) of one decode layer
+    /// (`plain_seconds(1, 0) / layers`), pricing the minimum in-flight pipeline
+    /// drain exposed by `wait_completion(router_done)` when splitting a layer
+    /// out of pipelined `RunStage::Whole`.
+    pub fn per_layer_decode_seconds(&self, layers: usize) -> f64 {
+        if layers == 0 {
+            return 0.0;
+        }
+        let step_s = match self.plain_seconds(1, 0) {
+            Ok(form) if form.streamed.is_finite() && form.streamed > 0.0 => form.streamed,
+            Ok(form) if form.resident.is_finite() && form.resident > 0.0 => form.resident,
+            _ => 0.0,
+        };
+        step_s / (layers as f64)
+    }
+
     /// Prior wall-clock seconds of a drafter launch generating `generated`
     /// proposals for `sequences` sequences at `depth` tokens, unpipelined
     /// (`lookahead: false`). Returns `Ok(None)` when no draft census is held
