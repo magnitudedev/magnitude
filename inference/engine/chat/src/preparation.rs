@@ -191,13 +191,39 @@ impl PreparedChat {
         request: &ChatRequest,
         selection: &TemplateSelection<'_>,
     ) -> Option<usize> {
+        self.message_boundary_at(bundle, request, selection, request.messages.len().checked_sub(1)?)
+    }
+
+    /// The prompt token position that opens the latest user message: identical
+    /// to [`Self::last_message_boundary`] when the request ends on a user turn,
+    /// and locates the pre-loop user turn during multi-step tool loops.
+    pub fn last_user_turn_boundary(
+        &self,
+        bundle: &TemplateBundle,
+        request: &ChatRequest,
+        selection: &TemplateSelection<'_>,
+    ) -> Option<usize> {
+        let index = request
+            .messages
+            .iter()
+            .rposition(|message| message.get("role").and_then(|r| r.as_str()) == Some("user"))?;
+        self.message_boundary_at(bundle, request, selection, index)
+    }
+
+    fn message_boundary_at(
+        &self,
+        bundle: &TemplateBundle,
+        request: &ChatRequest,
+        selection: &TemplateSelection<'_>,
+        index: usize,
+    ) -> Option<usize> {
         if !self.has_internal_added_token() {
             return None;
         }
         let mut probe = request.clone();
         probe
             .messages
-            .last_mut()?
+            .get_mut(index)?
             .as_object_mut()?
             .insert("content".into(), CONTENT_PROBE.into());
         let probed = bundle.render_prompt(&probe, selection).ok()?;

@@ -149,6 +149,7 @@ fn generate(
                 constraint: None,
                 retention: PrefixRetention::Retain {
                     cache_points: vec![preamble],
+                    user_branch: None,
                 },
                 output_capacity: 16,
             })

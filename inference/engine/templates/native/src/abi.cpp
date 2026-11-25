@@ -23,7 +23,7 @@ struct abi_error : std::runtime_error {
 struct template_state {
     common_chat_templates_ptr compiled;
     json special_tokens;
-    bool reads_preserve_thinking;
+    common_chat_preserve_flags preserve_flags;
 };
 // A schema keyword the prepared constraint does not enforce, for a tool's
 // arguments (named) or for the JSON output (unnamed).
@@ -287,8 +287,33 @@ prepared_state apply_request_payload(const template_state & state, const uint8_t
     // Reasoning stays on every assistant message unless the caller turns it
     // off, so a new user message appends to the previous prompt instead of
     // rewriting earlier replies, and the prefix cache reuses earlier tasks.
-    if (state.reads_preserve_thinking && !request.chat_template_kwargs.count("preserve_thinking")) {
-        request.chat_template_kwargs["preserve_thinking"] = "true";
+    // Translate the one history-preservation policy to every recognized template
+    // toggle with its native polarity, letting explicit caller kwargs win.
+    const auto & pf = state.preserve_flags;
+    if (pf.reads_preserve_thinking && !request.chat_template_kwargs.count("preserve_thinking")) {
+        bool has_historical_reasoning = false;
+        for (const auto & msg : request.messages) {
+            if (!msg.reasoning_content.empty()) {
+                has_historical_reasoning = true;
+                break;
+            }
+        }
+        const bool thinking_enabled = request.enable_thinking.value_or(true);
+        if (thinking_enabled || pf.preserve_thinking_safe_when_disabled || has_historical_reasoning) {
+            request.chat_template_kwargs["preserve_thinking"] = "true";
+        }
+    }
+    if (pf.reads_keep_past_thinking && !request.chat_template_kwargs.count("keep_past_thinking")) {
+        request.chat_template_kwargs["keep_past_thinking"] = "true";
+    }
+    if (pf.reads_clear_thinking && !request.chat_template_kwargs.count("clear_thinking")) {
+        request.chat_template_kwargs["clear_thinking"] = "false";
+    }
+    if (pf.reads_drop_thinking && !request.chat_template_kwargs.count("drop_thinking")) {
+        request.chat_template_kwargs["drop_thinking"] = "false";
+    }
+    if (pf.reads_truncate_history_thinking && !request.chat_template_kwargs.count("truncate_history_thinking")) {
+        request.chat_template_kwargs["truncate_history_thinking"] = "false";
     }
     if (data.contains("json_schema")) {
         if (!request.tools.empty()) { throw std::invalid_argument("Combining tools with JSON output is unsupported"); }
@@ -396,7 +421,7 @@ int32_t templates_template_create(const uint8_t * input, uint64_t size,
         state->compiled = common_chat_templates_init(source,
             tokens.value("bos_token", std::string()), tokens.value("eos_token", std::string()));
         state->special_tokens = std::move(tokens);
-        state->reads_preserve_thinking = common_chat_templates_reads_preserve_thinking(state->compiled.get());
+        state->preserve_flags = common_chat_templates_preserve_flags(state->compiled.get());
         *output = insert_handle(templates, std::move(state));
     });
 }

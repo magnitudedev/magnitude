@@ -454,3 +454,101 @@ fn peg_parser_save_and_grammar_match_expected_across_families() {
         }
     }
 }
+
+#[test]
+fn preserve_policy_covers_all_template_toggle_names_and_thinking_transitions() {
+    const NEMOTRON35: &str = include_str!("assets/NVIDIA-Nemotron-3.5-Lightning-30B-A3B.jinja");
+    const LFM25_THINKING: &str = include_str!("assets/LFM2.5-1.2B-Thinking.jinja");
+    const LAGUNA: &str = include_str!("assets/Laguna-S-2.1.jinja");
+
+    let render = |source: &str, messages: Vec<serde_json::Value>, args: serde_json::Value| {
+        let template = Template::new(source, &Default::default()).unwrap();
+        let mut req = Request::new(messages, 946684800);
+        req.template_arguments = args.as_object().unwrap().clone();
+        template.prepare(&req).unwrap().description().prompt.clone()
+    };
+
+    // Nemotron-3.5: defaults `truncate_history_thinking=false` (preserves reasoning), caller override wins.
+    let (n1, n2) = two_task_prompts(NEMOTRON35, json!({}));
+    assert!(n2.contains("I should search first."), "Nemotron default must preserve reasoning:\n{n2}");
+    assert!(n2.starts_with(&n1), "Nemotron default must be append-only:\n{n1:?}\n{n2:?}");
+    let (_, n2_override) = two_task_prompts(NEMOTRON35, json!({"truncate_history_thinking": true}));
+    assert!(!n2_override.contains("I should search first."), "Nemotron explicit override must win");
+
+    // LFM2.5-1.2B-Thinking: defaults `keep_past_thinking=true`, caller override wins.
+    let lfm_msgs = vec![
+        json!({"role":"user","content":"First?"}),
+        json!({"role":"assistant","content":"<think>Plan A</think>Ans A"}),
+        json!({"role":"user","content":"Second?"}),
+        json!({"role":"assistant","content":"<think>Plan B</think>Ans B"}),
+        json!({"role":"user","content":"Third?"}),
+    ];
+    let lfm_default = render(LFM25_THINKING, lfm_msgs.clone(), json!({}));
+    assert!(lfm_default.contains("Plan A"), "LFM2.5-1.2B must default keep_past_thinking=true:\n{lfm_default}");
+    let lfm_override = render(LFM25_THINKING, lfm_msgs, json!({"keep_past_thinking": false}));
+    assert!(!lfm_override.contains("Plan A"), "LFM2.5-1.2B explicit override must win");
+
+    // Laguna-S-2.1: OFF->OFF must NOT inject `preserve_thinking=true` (which would emit `<think></think>` vs `</think>`),
+    // while ON->ON and ON->OFF MUST preserve historical reasoning.
+    let u1 = vec![json!({"role":"user","content":"Hi"})];
+    let u1_off = render(LAGUNA, u1.clone(), json!({"enable_thinking": false}));
+    let u2_off_off = render(
+        LAGUNA,
+        vec![
+            json!({"role":"user","content":"Hi"}),
+            json!({"role":"assistant","content":"Hello"}),
+            json!({"role":"user","content":"Again"}),
+        ],
+        json!({"enable_thinking": false}),
+    );
+    assert!(
+        u2_off_off.starts_with(&u1_off),
+        "Laguna OFF->OFF must stay append-only:\n{u1_off:?}\n{u2_off_off:?}"
+    );
+    let u2_on_off = render(
+        LAGUNA,
+        vec![
+            json!({"role":"user","content":"Hi"}),
+            json!({"role":"assistant","content":"Hello","reasoning_content":"Think 1"}),
+            json!({"role":"user","content":"Again"}),
+        ],
+        json!({"enable_thinking": false}),
+    );
+    assert!(
+        u2_on_off.contains("<think>Think 1</think>"),
+        "Laguna ON->OFF must preserve prior turn reasoning:\n{u2_on_off}"
+    );
+
+    // Qwen3.6: OFF->OFF keeps `<think>\n\n</think>\n\n` via `preserve_thinking=true` so prefix is preserved.
+    let q1_off = render(QWEN36, u1.clone(), json!({"enable_thinking": false}));
+    let q2_off_off = render(
+        QWEN36,
+        vec![
+            json!({"role":"user","content":"Hi"}),
+            json!({"role":"assistant","content":"Hello"}),
+            json!({"role":"user","content":"Again"}),
+        ],
+        json!({"enable_thinking": false}),
+    );
+    assert!(
+        q2_off_off.starts_with(&q1_off),
+        "Qwen3.6 OFF->OFF must preserve empty think block:\n{q1_off:?}\n{q2_off_off:?}"
+    );
+
+    // Synthetic `clear_thinking` (GLM-4.7-Flash) and `drop_thinking` (DeepSeek-V4) polarity checks.
+    let clear_tmpl = "{%- set clear_thinking = clear_thinking | default(true) -%}\
+        {%- for m in messages -%}\
+        {%- if m.role == 'assistant' -%}<|assistant|>{% if not clear_thinking and m.reasoning_content %}<think>{{ m.reasoning_content }}</think>{% endif %}{{ m.content }}<|end|>\
+        {%- else -%}<|{{ m.role }}|>{{ m.content }}<|end|>{%- endif -%}\
+        {%- endfor -%}{% if add_generation_prompt %}<|assistant|><think>{% endif %}";
+    let drop_tmpl = clear_tmpl.replace("clear_thinking", "drop_thinking");
+    let two_turns = vec![
+        json!({"role":"user","content":"Q1"}),
+        json!({"role":"assistant","content":"A1","reasoning_content":"R1"}),
+        json!({"role":"user","content":"Q2"}),
+    ];
+    assert!(render(clear_tmpl, two_turns.clone(), json!({})).contains("<think>R1</think>"));
+    assert!(!render(clear_tmpl, two_turns.clone(), json!({"clear_thinking": true})).contains("<think>R1</think>"));
+    assert!(render(&drop_tmpl, two_turns.clone(), json!({})).contains("<think>R1</think>"));
+    assert!(!render(&drop_tmpl, two_turns, json!({"drop_thinking": true})).contains("<think>R1</think>"));
+}

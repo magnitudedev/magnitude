@@ -46,7 +46,31 @@ pub enum PrefixRetention {
     /// diverge (the boundary opening the last message): the request
     /// retains a state at each one, so a later request diverging there
     /// resumes from it instead of recomputing the shared prefix.
-    Retain { cache_points: Vec<usize> },
+    /// `user_branch`, when set, marks the opening boundary of the latest
+    /// user turn so multi-step tool loops keep that pre-loop fallback
+    /// checkpoint spared within the conversation checkpoint budget.
+    Retain {
+        cache_points: Vec<usize>,
+        #[serde(default)]
+        user_branch: Option<usize>,
+    },
+}
+
+/// Capability of a retained execution state to fork at or before its endpoint.
+pub trait PrefixState {
+    /// Deepest row `<= bound` at which this state can be forked.
+    /// Endpoint matches (`bound >= endpoint`) return `Some(endpoint)`.
+    /// Interior forks (`bound < endpoint`) return `Some(pos)` only when the
+    /// underlying state supports zero-copy interior truncation at `pos`, or
+    /// `None` when the state is endpoint-only (e.g. recurrent/hybrid models
+    /// or drafter-coupled states).
+    fn forkable_at(&self, bound: usize) -> Option<usize>;
+}
+
+impl PrefixState for magnitude_executor::ResumeState {
+    fn forkable_at(&self, bound: usize) -> Option<usize> {
+        magnitude_executor::ResumeState::forkable_at(self, bound)
+    }
 }
 
 /// The most entries the cache holds, and the state the memory plan charges
@@ -268,6 +292,9 @@ impl<'a> PrefixPath<'a> {
 pub enum CachePoint {
     /// A planned branch point or declared cache point inside the prompt.
     Branch,
+    /// The opening boundary of the latest user turn, spared across
+    /// multi-step tool loops within the conversation checkpoint budget.
+    UserBranch,
     /// The prompt one row before its end.
     PromptBoundary,
     /// A finished request's whole path, or a cancelled one's as far as its
@@ -366,21 +393,25 @@ impl<S> PrefixCache<S> {
             .find(|entry| entry.id == hit.id)
             .ok_or_else(|| "prefix hit is no longer cached".to_owned())
     }
+}
 
-    /// The deepest entry whose path is a prefix of `path`, retained under
-    /// the method `path` generates under (a request drafting without media
-    /// and one generating plainly beside it never share a drafter history),
-    /// whose drafter entered no successor of its rows but `path`'s own
-    /// (`MethodCheckpoint::resumes`). Entries in
-    /// submitted use are hits too: every hit forks shared claims. Only
-    /// entries below position `bound` qualify: a resumed request must still
-    /// compute the row it samples from.
+impl<S: PrefixState> PrefixCache<S> {
+    /// The deepest entry whose path shares a forkable prefix with `path`,
+    /// retained under the method `path` generates under (a request drafting
+    /// without media and one generating plainly beside it never share a
+    /// drafter history), whose drafter entered no successor of its rows but
+    /// `path`'s own (`MethodCheckpoint::resumes`). For pure causal KV models
+    /// running `Plain`, an entry deeper than the LCP may also be forked at
+    /// the deepest interior boundary `<= LCP` its state supports
+    /// (`PrefixState::forkable_at`). Entries in submitted use are hits too:
+    /// every hit forks shared claims. Only positions below `bound` qualify:
+    /// a resumed request must still compute the row it samples from.
     pub fn lookup(&mut self, path: PrefixPath, bound: usize) -> Result<Option<PrefixHit>, String> {
         self.lookups = self
             .lookups
             .checked_add(1)
             .ok_or("prefix cache lookup count exhausted")?;
-        let Some(index) = self.best(path, bound) else {
+        let Some((index, position)) = self.best(path, bound) else {
             return Ok(None);
         };
         let last_use = self.tick()?;
@@ -389,15 +420,14 @@ impl<S> PrefixCache<S> {
         entry.hits += 1;
         Ok(Some(PrefixHit {
             id: entry.id,
-            position: entry.position(),
+            position,
         }))
     }
 
     /// The position [`Self::lookup`] would resume `path` at, or zero,
     /// without counting as a use.
     pub fn deepest(&self, path: PrefixPath, bound: usize) -> usize {
-        self.best(path, bound)
-            .map_or(0, |index| self.entries[index].position())
+        self.best(path, bound).map_or(0, |(_, position)| position)
     }
 
     /// The entries a live request holds the rows of: the one it resumed
@@ -408,36 +438,69 @@ impl<S> PrefixCache<S> {
     /// from, and the deepest is where the request's own continuation (a
     /// conversation's next turn) resumes.
     pub fn held(&self, source: Option<u64>, path: PrefixPath, resident: usize) -> impl Iterator<Item = u64> {
-        let deepest = self.best(path, resident + 1).map(|index| self.entries[index].id);
+        let deepest = self.best(path, resident + 1).map(|(index, _)| self.entries[index].id);
         source.into_iter().chain(deepest)
     }
 
-    fn best(&self, path: PrefixPath, bound: usize) -> Option<usize> {
+    fn best(&self, path: PrefixPath, bound: usize) -> Option<(usize, usize)> {
+        let Some(limit) = bound.checked_sub(1) else {
+            return None;
+        };
         let mut best: Option<(usize, usize, u64)> = None;
         for (index, entry) in self.entries.iter().enumerate() {
-            let position = entry.position();
-            if position < MIN_PREFIX_HIT
-                || position >= bound
-                || !entry.method.resumes(path.method, position, path.tokens().nth(position).copied())
-                || path.shared_boundary(&entry.key) != position
-            {
+            let lcp = path.shared_boundary(&entry.key);
+            let max_pos = lcp.min(limit);
+            if max_pos < MIN_PREFIX_HIT {
                 continue;
             }
+            let entry_pos = entry.position();
+            let position = if entry_pos <= max_pos {
+                if !entry
+                    .method
+                    .resumes(path.method, entry_pos, path.tokens().nth(entry_pos).copied())
+                {
+                    continue;
+                }
+                entry_pos
+            } else {
+                // Interior LCP fork: strictly Plain target-only states whose
+                // retained KV/window history supports truncation to `max_pos`.
+                // Never clone/relabel a deeper MTP/DFlash checkpoint as Plain.
+                if path.method != MethodChoice::Plain || entry.method != MethodCheckpoint::Plain {
+                    continue;
+                }
+                let Some(fork_pos) = entry.state.forkable_at(max_pos) else {
+                    continue;
+                };
+                if fork_pos < MIN_PREFIX_HIT || fork_pos > max_pos || !path.exact_boundary(fork_pos)
+                {
+                    continue;
+                }
+                fork_pos
+            };
             if best.is_none_or(|(_, best_position, last_use)| {
                 position > best_position || (position == best_position && entry.last_use > last_use)
             }) {
                 best = Some((index, position, entry.last_use));
             }
         }
-        best.map(|(index, _, _)| index)
+        best.map(|(index, position, _)| (index, position))
     }
 
     /// Whether an entry ends exactly at `position` on `path`, without
     /// counting as a use.
     pub fn holds(&self, path: PrefixPath, position: usize) -> bool {
-        self.best(path, position + 1)
-            .is_some_and(|index| self.entries[index].position() == position)
+        self.entries.iter().any(|entry| {
+            entry.position() == position
+                && entry
+                    .method
+                    .resumes(path.method, position, path.tokens().nth(position).copied())
+                && path.shared_boundary(&entry.key) == position
+        })
     }
+}
+
+impl<S> PrefixCache<S> {
 
     /// The deepest boundary to which `path` shares any cached path, whether
     /// or not an entry ends there.
@@ -479,6 +542,9 @@ impl<S> PrefixCache<S> {
         {
             let last_use = self.tick()?;
             self.entries[existing].last_use = last_use;
+            if point == CachePoint::UserBranch && self.entries[existing].point == CachePoint::Branch {
+                self.entries[existing].point = CachePoint::UserBranch;
+            }
             return Ok(false);
         }
         let last_use = self.tick()?;
@@ -708,9 +774,10 @@ impl<S> PrefixCache<S> {
     /// The checkpoints the plan charges the most recently cached
     /// conversation: its latest finished turn, which its next turn extends;
     /// its latest prompt boundary, which a repeat of the prompt resumes from;
-    /// and the deepest branch point on the latest entry's path, where its
-    /// last turn began: a template that renders earlier replies anew once a
-    /// new user message arrives makes the next turn diverge there.
+    /// and the user-turn branch on the latest entry's path (falling back to
+    /// the deepest regular branch when no user-turn branch is marked), so
+    /// multi-step tool loops keep their pre-loop fallback checkpoint spared
+    /// within the conversation checkpoint budget.
     fn conversation_checkpoints(&self) -> Vec<u64> {
         let latest = |point: CachePoint| {
             self.entries
@@ -725,10 +792,19 @@ impl<S> PrefixCache<S> {
             self.entries
                 .iter()
                 .filter(|entry| {
-                    entry.point == CachePoint::Branch
+                    entry.point == CachePoint::UserBranch
                         && entry.key.is_prefix_of(&path.key)
                 })
                 .max_by_key(|entry| (entry.position(), entry.id))
+                .or_else(|| {
+                    self.entries
+                        .iter()
+                        .filter(|entry| {
+                            entry.point == CachePoint::Branch
+                                && entry.key.is_prefix_of(&path.key)
+                        })
+                        .max_by_key(|entry| (entry.position(), entry.id))
+                })
         });
         [terminal, boundary, branch]
             .into_iter()
@@ -786,9 +862,31 @@ mod tests {
     }
 
     /// A test state referencing abstract rows, like a resume state
-    /// referencing arena rows.
+    /// referencing arena rows. Endpoint-only by default (matching hybrid/SSM
+    /// or drafter-coupled states); tests exercising interior LCP fork wrap it
+    /// in [`ForkableRows`].
     #[derive(Debug, PartialEq, Eq)]
     struct Rows(BTreeSet<u32>);
+
+    impl PrefixState for Rows {
+        fn forkable_at(&self, _bound: usize) -> Option<usize> {
+            None
+        }
+    }
+
+    #[derive(Debug, PartialEq, Eq)]
+    struct ForkableRows {
+        rows: Rows,
+        /// Minimum row required to exist (0 for full causal KV; >0 simulates
+        /// a sliding window whose earlier rows were trimmed).
+        min_forkable: usize,
+    }
+
+    impl PrefixState for ForkableRows {
+        fn forkable_at(&self, bound: usize) -> Option<usize> {
+            (bound >= self.min_forkable && bound > 0).then_some(bound)
+        }
+    }
 
     impl Clone for Rows {
         fn clone(&self) -> Self {
@@ -1673,5 +1771,86 @@ mod tests {
         inside_indivisible.prompt[7] = TokenId(99_999);
         assert_eq!(a.path().shared_with_prompt_of(inside_indivisible.path()), 4);
         assert_eq!(cache.shared_boundary(inside_indivisible.path()), 4);
+    }
+
+    #[test]
+    fn user_branch_is_spared_across_multi_step_tool_loops() {
+        let mut cache = PrefixCache::new(PrefixCacheCapacity {
+            max_entries: 16,
+            workload_state_bytes: 0,
+        });
+        let path = tokens((0..500).collect());
+        // Turn 1 user branch at 100, tool step 1 branch at 200, tool step 2 branch at 300,
+        // prompt boundary at 400, terminal at 500.
+        assert!(cache.retain(path.path(), 100, CachePoint::UserBranch, rows(0..10), MethodCheckpoint::Plain).unwrap());
+        assert!(cache.retain(path.path(), 200, CachePoint::Branch, rows(10..20), MethodCheckpoint::Plain).unwrap());
+        assert!(cache.retain(path.path(), 300, CachePoint::Branch, rows(20..30), MethodCheckpoint::Plain).unwrap());
+        assert!(cache.retain(path.path(), 400, CachePoint::PromptBoundary, rows(30..40), MethodCheckpoint::Plain).unwrap());
+        assert!(cache.retain(path.path(), 500, CachePoint::Terminal, rows(40..50), MethodCheckpoint::Plain).unwrap());
+
+        let held = BTreeSet::new();
+        let released = cache.release_beyond_workload(&held, || 1);
+        assert_eq!(released, 2, "intermediate tool-step branches are released first");
+        assert_eq!(cache.len(), CONVERSATION_CHECKPOINTS);
+        assert!(cache.holds(path.path(), 100), "user-turn branch must stay spared across tool loop");
+        assert!(cache.holds(path.path(), 400), "prompt boundary stays spared");
+        assert!(cache.holds(path.path(), 500), "terminal stays spared");
+    }
+
+    #[test]
+    fn pure_causal_kv_supports_interior_lcp_fork_for_plain_only() {
+        let base = tokens((0..300).collect());
+        let mut diverged = tokens((0..300).collect());
+        diverged.prompt[180] = TokenId(99_999);
+
+        let mut cache: PrefixCache<ForkableRows> = PrefixCache::new(capacity(4));
+        assert!(
+            cache
+                .retain(
+                    base.path(),
+                    260,
+                    CachePoint::Terminal,
+                    ForkableRows {
+                        rows: rows(0..26),
+                        min_forkable: 0,
+                    },
+                    MethodCheckpoint::Plain,
+                )
+                .unwrap()
+        );
+
+        // Plain request diverging at 180 forks the deeper Plain KV entry at 180.
+        let hit = cache.lookup(diverged.path(), diverged.prompt.len()).unwrap();
+        assert_eq!(hit.map(PrefixHit::position), Some(180));
+
+        // MTP request must NEVER interior-fork a Plain entry or vice versa.
+        let mtp = MethodChoice::Mtp { proposals: 2 };
+        assert!(cache.lookup(diverged.under(mtp), diverged.prompt.len()).unwrap().is_none());
+
+        // An MTP entry deeper than LCP must NEVER be cloned/relabeled as Plain.
+        let mut mtp_cache: PrefixCache<ForkableRows> = PrefixCache::new(capacity(4));
+        assert!(
+            mtp_cache
+                .retain(
+                    base.path(),
+                    260,
+                    CachePoint::Terminal,
+                    ForkableRows {
+                        rows: rows(0..26),
+                        min_forkable: 0,
+                    },
+                    MethodCheckpoint::Mtp(magnitude_generation::DraftCheckpoint::trailing_at(260)),
+                )
+                .unwrap()
+        );
+        assert!(mtp_cache.lookup(diverged.path(), diverged.prompt.len()).unwrap().is_none());
+        assert!(mtp_cache.lookup(diverged.under(mtp), diverged.prompt.len()).unwrap().is_none());
+
+        // Endpoint-only deeper entry beyond LCP is a miss, falling back to an older shorter entry.
+        let mut hybrid_cache: PrefixCache<Rows> = PrefixCache::new(capacity(4));
+        assert!(hybrid_cache.retain(base.path(), 120, CachePoint::Branch, rows(0..12), MethodCheckpoint::Plain).unwrap());
+        assert!(hybrid_cache.retain(base.path(), 260, CachePoint::Terminal, rows(0..26), MethodCheckpoint::Plain).unwrap());
+        let hit = hybrid_cache.lookup(diverged.path(), diverged.prompt.len()).unwrap();
+        assert_eq!(hit.map(PrefixHit::position), Some(120));
     }
 }

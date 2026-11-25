@@ -8,8 +8,8 @@ import type { ChatAssistantMessage, ChatMessage, ResponseStarted } from "@magnit
 const field = <K extends string, A>(key: K, value: Option.Option<A>) =>
   Option.match(value, { onNone: () => ({}), onSome: (present) => ({ [key]: present }) as { readonly [P in K]: A } })
 
-const textOf = (message: ChatAssistantMessage) =>
-  message.content.flatMap((part) => (part._tag === "text" ? [part.text] : [])).join("")
+const partsOf = (message: ChatAssistantMessage, tag: "text" | "reasoning") =>
+  message.content.flatMap((part) => (part._tag === tag ? [part.text] : [])).join("")
 
 export const buildRequest = (
   history: readonly ChatMessage[],
@@ -22,11 +22,18 @@ export const buildRequest = (
     timings_per_token: true,
     messages: [
       { role: "system", content: settings.systemPrompt },
-      // Reasoning is not sent back, and a response without text is left out.
+      // Preserve reasoning_content across turns so the engine's prefix cache stays append-only.
+      // Only responses with neither text nor reasoning (e.g. failed before any output) are omitted.
       ...history.flatMap((message): readonly Native.ChatMessageRequestEncoded[] => {
         if (message._tag === "user") return [{ role: "user", content: message.text }]
-        const text = textOf(message)
-        return text.length > 0 ? [{ role: "assistant", content: text }] : []
+        const text = partsOf(message, "text")
+        const reasoning = partsOf(message, "reasoning")
+        if (text.length === 0 && reasoning.length === 0) return []
+        return [{
+          role: "assistant",
+          content: text.length > 0 ? text : null,
+          ...(reasoning.length > 0 ? { reasoning_content: reasoning } : {}),
+        }]
       }),
     ],
     ...field("reasoning_effort", started.reasoningEffort),

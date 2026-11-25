@@ -167,8 +167,13 @@ describe("Chat generation", () => {
     })])
   })
 
-  it("sends earlier text back without reasoning or empty responses, and retries in place of the latest response", async () => {
-    const replies = [[thought("Hidden"), text("First answer"), done()], [thought("Only thinking"), done()], [text("Retried"), done()]]
+  it("preserves earlier reasoning_content and reasoning-only responses, and retries in place of the latest response", async () => {
+    const replies = [
+      [thought("Hidden"), text("First answer"), done()],
+      [thought("Only thinking"), done()],
+      [text("Retried"), done()],
+      [text("Third answer"), done()],
+    ]
     let call = 0
     const f = await fixture(() => Stream.fromIterable(replies[call++]!))
     const chatId = newChat()
@@ -179,18 +184,38 @@ describe("Chat generation", () => {
       const second = payload(chatId, "Two")
       yield* service.send(second)
       yield* ended(service, chatId, second.responseId)
+      const third = payload(chatId, "Three")
+      yield* service.send(third)
+      yield* ended(service, chatId, third.responseId)
       const retry = newId()
-      yield* service.retry({ chatId, responseId: retry, replaces: second.responseId, model, reasoningEffort: Option.none(), settings })
+      yield* service.retry({ chatId, responseId: retry, replaces: third.responseId, model, reasoningEffort: Option.none(), settings })
       const messages = yield* ended(service, chatId, retry)
       expect(messages.map((message) => message._tag === "user" ? message.text : message.id))
-        .toEqual(["One", expect.any(String), "Two", retry])
+        .toEqual(["One", expect.any(String), "Two", second.responseId, "Three", retry])
       const [chat] = (yield* service.list(0, 10)).chats
-      expect(chat?.messageCount).toBe(4)
+      expect(chat?.messageCount).toBe(6)
     }))
     const conversation = f.requests.map((request) =>
-      request.messages.map((message) => [message.role, "content" in message ? message.content : undefined]))
-    expect(conversation[1]).toEqual([["system", "Be brief."], ["user", "One"], ["assistant", Option.some("First answer")], ["user", "Two"]])
-    expect(conversation[2]).toEqual(conversation[1])
+      request.messages.map((message) => [
+        message.role,
+        "content" in message ? message.content : undefined,
+        "reasoning_content" in message ? message.reasoning_content : undefined,
+      ]))
+    expect(conversation[1]).toEqual([
+      ["system", "Be brief.", undefined],
+      ["user", "One", undefined],
+      ["assistant", Option.some("First answer"), Option.some("Hidden")],
+      ["user", "Two", undefined],
+    ])
+    expect(conversation[2]).toEqual([
+      ["system", "Be brief.", undefined],
+      ["user", "One", undefined],
+      ["assistant", Option.some("First answer"), Option.some("Hidden")],
+      ["user", "Two", undefined],
+      ["assistant", Option.some(null), Option.some("Only thinking")],
+      ["user", "Three", undefined],
+    ])
+    expect(conversation[3]).toEqual(conversation[2])
   })
 
   it("records an open group once its second has passed, even when no further chunk arrives", async () => {

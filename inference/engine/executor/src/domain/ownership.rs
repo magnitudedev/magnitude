@@ -66,9 +66,23 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
     /// request holds its reservation, backed.
     pub fn open_state(
         &mut self,
-        mut unchained: Unchained<'_>,
+        unchained: Unchained<'_>,
         request: RequestId,
         from: Option<&ResumeState>,
+        rows: u64,
+    ) -> Result<Vec<Operation>, DomainError> {
+        self.open_state_at(unchained, request, from.map(|state| (state, state.position())), rows)
+    }
+
+    /// Open `request` resident, optionally forking `from` at `position`
+    /// (`position <= from.position()`). Interior positions require a pure
+    /// causal KV target state with no drafter head state
+    /// ([`ResumeState::forkable_at`]).
+    pub fn open_state_at(
+        &mut self,
+        mut unchained: Unchained<'_>,
+        request: RequestId,
+        from: Option<(&ResumeState, usize)>,
         rows: u64,
     ) -> Result<Vec<Operation>, DomainError> {
         let entry = self.requests.get(&request).expect("invariant violated: an opened request has no installed input");
@@ -77,7 +91,7 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
             "invariant violated: request {} opens already resident",
             request.0
         );
-        let resumes = from.map_or(0, ResumeState::position) as u64;
+        let resumes = from.map_or(0, |(_, position)| position) as u64;
         assert!(
             resumes <= rows,
             "invariant violated: request {} resumes at row {resumes}, past the {rows} rows it opens with",
@@ -100,7 +114,7 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
         let opened = (|| -> Result<_, DomainError> {
             self.conclude_chain()?;
             match from {
-                Some(from) => Ok(self.fork_resume_state(from)),
+                Some((state, position)) => self.fork_resume_state_at(state, position),
                 None => self.fresh_state(&mut unchained),
             }
         })();
@@ -116,10 +130,12 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
         };
         let position = target.position();
         reservation.grow(position as u64);
-        let boundary = from.and_then(|from| from.boundary.clone());
+        let boundary = from.and_then(|(state, pos)| {
+            (pos == state.position()).then(|| state.boundary.clone()).flatten()
+        });
         // A resumed sequence holds the tokens of the state it resumes.
-        let tokens = from.map_or_else(Default::default, |from| {
-            input::TokenHistory::starting(&from.tokens)
+        let tokens = from.map_or_else(Default::default, |(state, pos)| {
+            input::TokenHistory::starting(&state.tokens[..pos])
         });
         let (image_features, encodes) = {
             let entry = self.requests.get(&request).expect("request checked above");
@@ -136,7 +152,7 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
                     continue;
                 };
                 if next.start < position {
-                    if let Some(features) = from.and_then(|from| from.features.get(identity).cloned()) {
+                    if let Some(features) = from.and_then(|(state, _)| state.features.get(identity).cloned()) {
                         image_features.insert(identity.clone(), features);
                     }
                 }
@@ -219,21 +235,37 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
         Ok((target, head))
     }
 
-    fn fork_resume_state(
+    fn fork_resume_state_at(
         &self,
         from: &ResumeState,
-    ) -> (SequenceState, Option<SequenceState>) {
-        let target = from.target.fork();
+        position: usize,
+    ) -> Result<(SequenceState, Option<SequenceState>), DomainError> {
+        if position == from.position() {
+            let target = from.target.fork();
+            assert!(
+                target.belongs_to(&self.target_store) && from.head.is_some() == self.head_store.is_some(),
+                "invariant violated: a resume state differs from the domain's state arenas"
+            );
+            let head = from.head.as_ref().map(StateCheckpoint::fork);
+            assert!(
+                head.as_ref().is_none_or(|state| self.head_store.as_ref().is_some_and(|store| state.belongs_to(store))),
+                "invariant violated: a resume state's head belongs to another state arena"
+            );
+            return Ok((target, head));
+        }
         assert!(
-            target.belongs_to(&self.target_store) && from.head.is_some() == self.head_store.is_some(),
+            from.head.is_none() && self.head_store.is_none(),
+            "invariant violated: interior prefix fork is only legal for target-only states without a drafter head"
+        );
+        let target = from
+            .target
+            .fork_at(position)
+            .map_err(DomainError::invariant)?;
+        assert!(
+            target.belongs_to(&self.target_store),
             "invariant violated: a resume state differs from the domain's state arenas"
         );
-        let head = from.head.as_ref().map(StateCheckpoint::fork);
-        assert!(
-            head.as_ref().is_none_or(|state| self.head_store.as_ref().is_some_and(|store| state.belongs_to(store))),
-            "invariant violated: a resume state's head belongs to another state arena"
-        );
-        (target, head)
+        Ok((target, None))
     }
 
     /// The request's reconciled state as a resume state: both lanes and the

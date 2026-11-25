@@ -34,6 +34,10 @@ pub struct PreparedInput {
     /// [`PreparedChat::next_turn_boundary`]). Host-only sizing
     /// ([`InputBound::Declared`]) retains nothing and has none.
     pub cache_points: Vec<usize>,
+    /// The input row opening the latest user turn, when distinct or present
+    /// inside the prompt, so multi-step tool loops keep that pre-loop
+    /// fallback checkpoint spared.
+    pub user_branch: Option<usize>,
 }
 
 fn now() -> i64 {
@@ -66,36 +70,50 @@ pub fn prepare(
         crate::telemetry::span_relaxations(relaxations);
     }
     let tokens = chat.input().tokens.clone();
-    let (input, cache_points) = match bound {
+    let (input, cache_points, user_branch) = match bound {
         InputBound::Served => {
             let input = host.prepare_input(tokens, &images).map_err(input_error)?;
-            let mut cache_points = [
-                chat.last_message_boundary(host.templates(), &request, &selection),
-                chat.next_turn_boundary(host.templates(), &request, &selection),
-            ]
-            .into_iter()
-            .flatten()
-            .map(|boundary| {
+            let map_boundary = |boundary: usize| -> Result<usize, ChatError> {
                 input.prompt_position_row(boundary).ok_or_else(|| {
                     ChatError::Internal(format!(
                         "message boundary {boundary} exceeds prepared source boundaries"
                     ))
                 })
-            })
-            .collect::<Result<Vec<_>, _>>()?;
+            };
+            let last_is_user = request
+                .messages
+                .last()
+                .and_then(|m| m.get("role"))
+                .and_then(|r| r.as_str())
+                == Some("user");
+            let last_boundary = chat.last_message_boundary(host.templates(), &request, &selection);
+            let user_boundary = if last_is_user {
+                last_boundary
+            } else {
+                chat.last_user_turn_boundary(host.templates(), &request, &selection)
+            };
+            let next_boundary = chat.next_turn_boundary(host.templates(), &request, &selection);
+            let user_branch = user_boundary.map(map_boundary).transpose()?;
+            let mut cache_points = [last_boundary, user_boundary, next_boundary]
+                .into_iter()
+                .flatten()
+                .map(map_boundary)
+                .collect::<Result<Vec<_>, _>>()?;
             cache_points.sort_unstable();
             cache_points.dedup();
-            (input, cache_points)
+            (input, cache_points, user_branch)
         }
         InputBound::Declared => (
             host.prepare_count_input(tokens, &images).map_err(input_error)?,
             Vec::new(),
+            None,
         ),
     };
     Ok(PreparedInput {
         chat,
         input,
         cache_points,
+        user_branch,
     })
 }
 

@@ -152,6 +152,7 @@ fn admit(
     let retention = if prefix_cache {
         PrefixRetention::Retain {
             cache_points: Vec::new(),
+            user_branch: None,
         }
     } else {
         PrefixRetention::Transient

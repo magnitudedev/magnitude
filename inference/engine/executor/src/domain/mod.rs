@@ -754,6 +754,23 @@ impl ResumeState {
     pub fn target(&self) -> &magnitude_state::StateCheckpoint {
         &self.target
     }
+
+    /// Deepest row `<= bound` at which this state can be forked.
+    /// Endpoint matches (`bound >= self.position()`) always succeed; interior
+    /// forks (`bound < self.position()`) require a plain target-only state
+    /// (no drafter head state, no boundary feature) whose target checkpoint is
+    /// interior-forkable at `bound` (pure causal KV / retained window, no
+    /// recurrent banks).
+    pub fn forkable_at(&self, bound: usize) -> Option<usize> {
+        let end = self.position();
+        if bound >= end {
+            return Some(end);
+        }
+        if bound == 0 || self.head.is_some() || self.boundary.is_some() {
+            return None;
+        }
+        self.target.can_fork_interior_at(bound).then_some(bound)
+    }
 }
 
 /// How urgently the domain's memory state asks for timed re-reads when idle

@@ -424,15 +424,19 @@ struct PrefixParticipation {
     /// declared. Prefill stops at each so the cache can retain a state every
     /// later request diverging there resumes from.
     branches: BTreeSet<usize>,
+    /// The opening boundary of the latest user turn, when declared, so
+    /// retaining it tags the entry as [`CachePoint::UserBranch`].
+    user_branch: Option<usize>,
 }
 
 impl PrefixParticipation {
-    fn new(branches: BTreeSet<usize>) -> Self {
+    fn new(branches: BTreeSet<usize>, user_branch: Option<usize>) -> Self {
         Self {
             source: None,
             prefill_retained: false,
             terminal_retention: TerminalRetention::Pending,
             branches,
+            user_branch,
         }
     }
 }
@@ -1855,10 +1859,18 @@ impl<F: ProgramFamily> Service<F> {
                 "only a fresh generation can be admitted".into(),
             ));
         }
-        let (prefix_cache, cache_points) = match retention {
-            PrefixRetention::Transient => (false, Vec::new()),
-            PrefixRetention::Retain { cache_points } => (true, cache_points),
+        let (prefix_cache, mut cache_points, user_branch) = match retention {
+            PrefixRetention::Transient => (false, Vec::new(), None),
+            PrefixRetention::Retain {
+                cache_points,
+                user_branch,
+            } => (true, cache_points, user_branch),
         };
+        if let Some(point) = user_branch {
+            if !cache_points.contains(&point) {
+                cache_points.push(point);
+            }
+        }
         generation
             .set_prefix_reuse(prefix_cache)
             .map_err(AdmissionError::invariant("admission"))?;
@@ -1895,7 +1907,7 @@ impl<F: ProgramFamily> Service<F> {
                 Some((producer, through)) => Stage::AwaitingPrefix { producer, through },
                 None => Stage::NonResident(None),
             };
-            (Some(PrefixParticipation::new(plan.branches)), stage)
+            (Some(PrefixParticipation::new(plan.branches, user_branch)), stage)
         } else {
             (None, Stage::NonResident(None))
         };
@@ -3217,10 +3229,13 @@ impl<F: ProgramFamily> Service<F> {
                     false => None,
                 };
                 let from = match hit {
-                    Some(hit) => Some(this.prefix_cache.entry(hit).map_err(invariant("prefix cache"))?.state()),
+                    Some(hit) => Some((
+                        this.prefix_cache.entry(hit).map_err(invariant("prefix cache"))?.state(),
+                        hit.position(),
+                    )),
                     None => None,
                 };
-                Ok(this.domain.open_state(unchained, id, from, rows).map(|encodes| Some((hit, encodes))))
+                Ok(this.domain.open_state_at(unchained, id, from, rows).map(|encodes| Some((hit, encodes))))
             };
         let first = open(self, bindings).map_err(fatal)?;
         let relieved = self.relieve(bindings, first, false, open).map_err(fatal)?;
@@ -4013,6 +4028,7 @@ impl<F: ProgramFamily> Service<F> {
         let resident = generation.resident_position();
         let live = generation.finish_reason().is_none() && generation.is_resident();
         let reached = live && prefix.branches.contains(&resident);
+        let is_user_branch = prefix.user_branch == Some(resident);
         let branches = &mut self.requests.get_mut(&id).unwrap().record.prefix.as_mut().unwrap().branches;
         if live {
             branches.retain(|&branch| branch > resident);
@@ -4020,7 +4036,12 @@ impl<F: ProgramFamily> Service<F> {
             branches.clear();
         }
         if reached {
-            self.cache_prefix(id, CachePoint::Branch)?;
+            let point = if is_user_branch {
+                CachePoint::UserBranch
+            } else {
+                CachePoint::Branch
+            };
+            self.cache_prefix(id, point)?;
         }
         Ok(())
     }
@@ -4625,7 +4646,7 @@ mod timing_tests {
     #[test]
     fn only_live_work_outside_the_round_competes_with_a_queued_chunk() {
         let record = || Record {
-            prefix: Some(PrefixParticipation::new(BTreeSet::new())),
+            prefix: Some(PrefixParticipation::new(BTreeSet::new(), None)),
             ..super::front_rows_tests::record()
         };
         let request = |stage| Request {
@@ -5184,7 +5205,7 @@ let Ok(residency) = service.make_resident(id, &mut record, generation, bindings)
         };
         let capacity = PrefixCacheCapacity { max_entries: 4, workload_state_bytes: u64::MAX };
         let mut owner = Some(Owner::with_prefix_cache_capacity(domain, bindings, limits(), capacity, Arc::new(NoWakes)).unwrap());
-        let retain = PrefixRetention::Retain { cache_points: Vec::new() };
+        let retain = PrefixRetention::Retain { cache_points: Vec::new(), user_branch: None };
         let (id, mut receiver) = owner.as_mut().unwrap().admit(prompt(), PreparedModelInput::continuation_only(), retain, 4, 0).unwrap();
         let mut now = 0u64;
         let mut run = |owner: &mut Option<Owner<magnitude_executor::NativeFamily>>| {
@@ -5409,7 +5430,7 @@ let Ok(residency) = service.make_resident(id, &mut record, generation, bindings)
         };
         let generation = Generation::new(vec![TokenId(1), TokenId(2)], InputLayout::new(2, vec![]).unwrap(), options, None).unwrap();
         let (id, mut receiver) = owner
-            .admit(generation, PreparedModelInput::continuation_only(), PrefixRetention::Retain { cache_points: Vec::new() }, 4, 0)
+            .admit(generation, PreparedModelInput::continuation_only(), PrefixRetention::Retain { cache_points: Vec::new(), user_branch: None }, 4, 0)
             .unwrap();
         let Pipeline::Idle(bindings) = &mut owner.pipeline else { panic!("an idle owner") };
         let service = &mut owner.service;
@@ -5511,17 +5532,17 @@ let Ok(residency) = service.make_resident(id, &mut record, generation, bindings)
         waiter_tokens.resize(PROMPT, TokenId(3));
         let unrelated_tokens = vec![TokenId(4); PROMPT];
         let (producer, _rx_producer) = owner
-            .admit(make_gen(producer_tokens), PreparedModelInput::continuation_only(), PrefixRetention::Retain { cache_points: Vec::new() }, 4, 0)
+            .admit(make_gen(producer_tokens), PreparedModelInput::continuation_only(), PrefixRetention::Retain { cache_points: Vec::new(), user_branch: None }, 4, 0)
             .unwrap();
         let (waiter, _rx_waiter) = owner
-            .admit(make_gen(waiter_tokens), PreparedModelInput::continuation_only(), PrefixRetention::Retain { cache_points: Vec::new() }, 4, 0)
+            .admit(make_gen(waiter_tokens), PreparedModelInput::continuation_only(), PrefixRetention::Retain { cache_points: Vec::new(), user_branch: None }, 4, 0)
             .unwrap();
         assert!(matches!(
             owner.service.requests[&waiter].state,
             State::Between(_, Stage::AwaitingPrefix { producer: p, through }) if p == producer && through == THROUGH
         ));
         let (unrelated, _rx_unrelated) = owner
-            .admit(make_gen(unrelated_tokens), PreparedModelInput::continuation_only(), PrefixRetention::Retain { cache_points: vec![THROUGH] }, 4, 0)
+            .admit(make_gen(unrelated_tokens), PreparedModelInput::continuation_only(), PrefixRetention::Retain { cache_points: vec![THROUGH], user_branch: None }, 4, 0)
             .unwrap();
         assert!(owner.service.requests[&unrelated].record.prefix.as_ref().unwrap().branches.contains(&THROUGH));
         owner.cancel(producer);

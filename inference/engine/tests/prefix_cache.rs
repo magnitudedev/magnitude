@@ -210,6 +210,7 @@ fn run_with_cache_points(
                 text_input(prompt),
                 PrefixRetention::Retain {
                     cache_points: cache_points.clone(),
+                    user_branch: None,
                 },
                 max_tokens,
             )
@@ -252,7 +253,7 @@ fn an_abandoned_request_resumes_where_it_stopped() {
     let (mut host, vocabulary, tokenizer) = owner();
     let prompt = (7..10).flat_map(|seed| text(&tokenizer, seed * 10, 600)).collect::<Vec<_>>();
     let mut stream = host
-        .admit(greedy(&prompt, vocabulary, 12), text_input(&prompt), PrefixRetention::Retain { cache_points: Vec::new() }, 12)
+        .admit(greedy(&prompt, vocabulary, 12), text_input(&prompt), PrefixRetention::Retain { cache_points: Vec::new(), user_branch: None }, 12)
         .unwrap();
     let id = stream.id;
     host.step_until(&mut [&mut stream], Duration::from_secs(300), |host, _| {
@@ -271,7 +272,7 @@ fn an_abandoned_request_resumes_where_it_stopped() {
 
     let longer = text(&tokenizer, 8, 400);
     let mut stream = host
-        .admit(greedy(&longer, vocabulary, 200), text_input(&longer), PrefixRetention::Retain { cache_points: Vec::new() }, 200)
+        .admit(greedy(&longer, vocabulary, 200), text_input(&longer), PrefixRetention::Retain { cache_points: Vec::new(), user_branch: None }, 200)
         .unwrap();
     let id = stream.id;
     host.step_until(&mut [&mut stream], Duration::from_secs(300), |_, streams| streams[0].output.len() >= 40);

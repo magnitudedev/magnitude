@@ -53,13 +53,26 @@ struct common_chat_msg_content_part {
     }
 };
 
+struct common_chat_preserve_flags {
+    bool reads_preserve_thinking = false;
+    bool reads_keep_past_thinking = false;
+    bool reads_clear_thinking = false;
+    bool reads_drop_thinking = false;
+    bool reads_truncate_history_thinking = false;
+    // Whether injecting `preserve_thinking = true` when `enable_thinking = false`
+    // and no historical reasoning is present preserves the thinking-OFF prefix.
+    // False for templates like Laguna-S-2.1 where gen prompt emits `</think>`
+    // but `enable_thinking or preserve_thinking` rewrites history to `<think></think>`.
+    bool preserve_thinking_safe_when_disabled = true;
+};
+
 struct common_chat_template {
     jinja::program prog;
     std::string bos_tok;
     std::string eos_tok;
     std::string src;
     chat_template_caps caps;
-    bool reads_preserve_thinking = false;
+    common_chat_preserve_flags preserve_flags;
     std::vector<std::string> reasoning_identifiers;
     mutable std::shared_ptr<std::mutex> cached_autoparser_mutex;
     mutable std::shared_ptr<autoparser::autoparser> cached_autoparser;
@@ -78,7 +91,15 @@ struct common_chat_template {
                 continue;
             }
             if (token.value == "preserve_thinking") {
-                this->reads_preserve_thinking = true;
+                this->preserve_flags.reads_preserve_thinking = true;
+            } else if (token.value == "keep_past_thinking") {
+                this->preserve_flags.reads_keep_past_thinking = true;
+            } else if (token.value == "clear_thinking") {
+                this->preserve_flags.reads_clear_thinking = true;
+            } else if (token.value == "drop_thinking") {
+                this->preserve_flags.reads_drop_thinking = true;
+            } else if (token.value == "truncate_history_thinking") {
+                this->preserve_flags.reads_truncate_history_thinking = true;
             } else if (token.value == "enable_thinking") {
                 has_enable_thinking = true;
             } else if (token.value == "thinking") {
@@ -407,8 +428,8 @@ std::map<std::string, bool> common_chat_templates_get_caps(const common_chat_tem
 // Context variables read outside Jinja by the specialized handler matching this template.
 std::vector<std::string> common_chat_templates_handler_context_variables(const common_chat_templates * chat_templates);
 
-// Whether the template source names `preserve_thinking` as a Jinja identifier.
-bool common_chat_templates_reads_preserve_thinking(const common_chat_templates * chat_templates);
+// Reasoning-history preservation flags detected in the template source.
+common_chat_preserve_flags common_chat_templates_preserve_flags(const common_chat_templates * chat_templates);
 
 // Reasoning-control identifiers appearing as Jinja identifier tokens in the template source.
 std::vector<std::string> common_chat_templates_reasoning_identifiers(const common_chat_templates * chat_templates);

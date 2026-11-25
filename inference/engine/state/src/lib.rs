@@ -2928,6 +2928,66 @@ impl StateCheckpoint {
             expected_end,
         }
     }
+
+    /// Whether this checkpoint can be forked at an interior row `position`
+    /// (`0 < position < self.position()`): only pure causal KV / window states
+    /// with no recurrent banks or tape, where every stored domain still holds
+    /// every row a query at `position` reads.
+    pub fn can_fork_interior_at(&self, position: usize) -> bool {
+        if position == 0
+            || position >= self.snapshot.position
+            || self.snapshot.store.has_recurrent_components()
+            || self.snapshot.tape != 0
+        {
+            return false;
+        }
+        self.snapshot
+            .store
+            .domains
+            .iter()
+            .zip(&self.snapshot.domains)
+            .all(|(domain, history)| match domain.kind {
+                HistoryDomainKind::Token | HistoryDomainKind::Shared { .. } => history.start == 0,
+                HistoryDomainKind::Window { rows } => {
+                    history.start <= position.saturating_sub(rows)
+                }
+                HistoryDomainKind::Block { rate } => history.start == 0 && position % rate == 0,
+            })
+    }
+
+    /// A live sequence sharing the first `position` rows of this checkpoint.
+    /// When `position == self.position()`, this is identical to [`Self::fork`].
+    /// Interior positions require [`Self::can_fork_interior_at`].
+    pub fn fork_at(&self, position: usize) -> Result<SequenceState, String> {
+        if position == self.snapshot.position {
+            return Ok(self.fork());
+        }
+        if !self.can_fork_interior_at(position) {
+            return Err(format!(
+                "checkpoint at position {} cannot fork at interior position {position}",
+                self.snapshot.position
+            ));
+        }
+        let mut snapshot = self.snapshot.clone();
+        for (domain, history) in snapshot.store.domains.iter().zip(snapshot.domains.iter_mut()) {
+            let keep = match domain.kind {
+                HistoryDomainKind::Block { rate } => (position - history.start) / rate,
+                HistoryDomainKind::Token
+                | HistoryDomainKind::Window { .. }
+                | HistoryDomainKind::Shared { .. } => position - history.start,
+            };
+            let current = history.claims.rows();
+            if keep < current {
+                drop(history.claims.split_off(keep));
+            }
+            history.claims.set_live(true);
+        }
+        snapshot.position = position;
+        Ok(SequenceState {
+            snapshot,
+            expected_end: position,
+        })
+    }
 }
 /// Publish `count` rows, one per stored domain in `claims`, whose recurrent
 /// version is (`following`, `tape`), then release the rows each window

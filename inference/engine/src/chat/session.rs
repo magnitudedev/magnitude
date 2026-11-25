@@ -119,6 +119,7 @@ async fn run(
         chat,
         input,
         cache_points,
+        user_branch,
     } = match prepared {
         Ok(prepared) => prepared,
         Err(error) => return events.send(SessionEvent::Failed(SessionError::Chat(error))).await,
@@ -160,7 +161,10 @@ async fn run(
         options,
         constraint: chat.input().constraint.clone(),
         retention: match request.controls.prompt_cache {
-            PromptCache::Allowed => PrefixRetention::Retain { cache_points },
+            PromptCache::Allowed => PrefixRetention::Retain {
+                cache_points,
+                user_branch,
+            },
             PromptCache::Disabled => PrefixRetention::Transient,
         },
         output_capacity: limits.output_capacity,

@@ -1443,10 +1443,53 @@ std::vector<std::string> common_chat_templates_handler_context_variables(const c
     return vars;
 }
 
-bool common_chat_templates_reads_preserve_thinking(const common_chat_templates * chat_templates) {
+common_chat_preserve_flags common_chat_templates_preserve_flags(const common_chat_templates * chat_templates) {
     TEMPLATES_ASSERT(chat_templates != nullptr);
     TEMPLATES_ASSERT(chat_templates->template_default != nullptr);
-    return chat_templates->template_default->reads_preserve_thinking;
+    auto flags = chat_templates->template_default->preserve_flags;
+    if (flags.reads_preserve_thinking) {
+        // Probe whether `preserve_thinking = true` with `enable_thinking = false`
+        // preserves the thinking-OFF prefix for an assistant turn without reasoning.
+        // Templates like Laguna-S-2.1 emit `</think>` on generation prompt when
+        // `enable_thinking = false` but `<think></think>` in history when
+        // `preserve_thinking = true`, breaking prefix preservation on OFF->OFF turns.
+        try {
+            const auto & tmpl = *chat_templates->template_default;
+            auto render_pair = [&](bool preserve) -> bool {
+                auto render_msgs = [&](json messages) -> std::string {
+                    jinja::context ctx(tmpl.source());
+                    ctx.current_time = 946684800;
+                    json inp = json::object();
+                    inp["messages"] = messages_inp_normalizer(tmpl.original_caps()).normalize(messages);
+                    inp["tools"] = json::array();
+                    inp["bos_token"] = tmpl.bos_token();
+                    inp["eos_token"] = tmpl.eos_token();
+                    inp["add_generation_prompt"] = true;
+                    inp["enable_thinking"] = false;
+                    inp["preserve_thinking"] = preserve;
+                    jinja::global_from_json(ctx, inp, false);
+                    jinja::runtime runtime(ctx);
+                    auto results = runtime.execute(tmpl.prog);
+                    return jinja::runtime::gather_string_parts(results)->as_string().str();
+                };
+                const std::string s1 = render_msgs(json::array({json{{"role", "user"}, {"content", "a"}}}));
+                const std::string s2 = render_msgs(json::array({
+                    json{{"role", "user"}, {"content", "a"}},
+                    json{{"role", "assistant"}, {"content", "b"}},
+                    json{{"role", "user"}, {"content", "c"}},
+                }));
+                return s2.size() >= s1.size() && s2.compare(0, s1.size(), s1) == 0;
+            };
+            const bool true_preserves = render_pair(true);
+            const bool false_preserves = render_pair(false);
+            if (!true_preserves && false_preserves) {
+                flags.preserve_thinking_safe_when_disabled = false;
+            }
+        } catch (...) {
+            // Keep safe default if probe fails on an exotic template.
+        }
+    }
+    return flags;
 }
 
 std::vector<std::string> common_chat_templates_reasoning_identifiers(const common_chat_templates * chat_templates) {
