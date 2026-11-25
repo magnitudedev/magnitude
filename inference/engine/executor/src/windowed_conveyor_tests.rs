@@ -298,6 +298,9 @@ fn open_domain(
         request_slot,
     )
     .unwrap_or_else(|error| panic!("{backend:?}: {error}"));
+    domain
+        .begin_host_backing()
+        .unwrap_or_else(|error| panic!("{backend:?}: {error}"));
     let costs = crate::assessment::synthetic::costs();
     fn pending<T>() -> crate::assessment::Priced<T> {
         crate::assessment::Priced::Pending(crate::assessment::PendingPrices::standing(crate::assessment::PointRequest::Costs(crate::assessment::CostWalk::Required)))

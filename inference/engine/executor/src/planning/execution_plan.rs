@@ -365,24 +365,29 @@ impl ExecutionPlanDraft {
     /// landing reserve (`ExpertBankPlan::host_records` at no host slot: a
     /// request's misses and the hints' records, every staging record's
     /// landing at once), is what makes a step live: a reading that admits
-    /// not even the floor leaves the experts unstreamed, with why.
+    /// not even the floor fails with a typed `HostStaging` capacity shortfall,
+    /// never as an unsupported model.
     fn with_host_tier(
         mut self,
         charge: &AssessmentMemoryCharge,
         budget: &super::MemoryBudget,
-    ) -> Result<Result<Self, UnstreamedExperts>, PlanError> {
+    ) -> Result<Result<Self, crate::CapacityError>, PlanError> {
         if self.device.host != Some(HostTier::Linked) {
             return Ok(Ok(self));
         }
         let Some(ceiling) = self.bank().host_ceiling().filter(|&ceiling| ceiling > 0 && !self.bank().whole()) else {
             return Ok(Ok(self));
         };
+        if let Some((required, available, _)) = budget.host_shortfall(&self, charge, 0)? {
+            return Ok(Err(crate::CapacityError::new(
+                crate::ResourceKind::HostStaging,
+                required,
+                available,
+            )));
+        }
         let bank = self.bank();
         let host_charge = |slots: u64| bank.host_charge(slots).map_err(PlanError::ResourcePlanning);
         let left = |slots: u64| self.host_left(charge, budget, slots);
-        if left(0)? < 0 {
-            return Ok(Err(self.untiered_reason()));
-        }
         // The most host memory admits.
         let points = rising(0, ceiling, &host_charge)?;
         let mut most = points[0];
@@ -404,7 +409,7 @@ impl ExecutionPlanDraft {
         slots: u64,
         charge: &AssessmentMemoryCharge,
         budget: &super::MemoryBudget,
-    ) -> Result<Result<super::ExpertBankPlan, UnstreamedExperts>, PlanError> {
+    ) -> Result<Result<super::ExpertBankPlan, crate::CapacityError>, PlanError> {
         let mut bank = self.bank().clone();
         if slots < bank.floor() || slots > bank.max_slots() {
             return Err(PlanError::Topology(
@@ -421,16 +426,18 @@ impl ExecutionPlanDraft {
         let Some(ceiling) = bank.host_ceiling().filter(|&ceiling| ceiling > 0 && !bank.whole()) else {
             return Ok(Ok(bank));
         };
+        if let Some((required, available, _)) = budget.host_shortfall(self, charge, 0)? {
+            return Ok(Err(crate::CapacityError::new(
+                crate::ResourceKind::HostStaging,
+                required,
+                available,
+            )));
+        }
         let host_charge = |host_slots: u64| bank.host_charge(host_slots).map_err(PlanError::ResourcePlanning);
         let left = |host_slots: u64| -> Result<i64, PlanError> {
             let growth = bank.host_cache(host_slots).map_err(PlanError::ResourcePlanning)?;
             budget.host_left(self, charge, growth)
         };
-        if left(0)? < 0 {
-            let reserve = bank.landing_records();
-            let reason = format!("host memory admits not even the tier's landing reserve of {reserve} records a group");
-            return Ok(Err(UnstreamedExperts::Untiered { backend: self.device.backend, reason }));
-        }
         let points = rising(0, ceiling, &host_charge)?;
         let mut most = points[0];
         for &host in &points {
@@ -450,25 +457,22 @@ impl ExecutionPlanDraft {
         budget.host_left(self, charge, growth)
     }
 
-    /// Why the draft's experts cannot stream beside its linked host tier
-    /// charged `charge` (its tier at its floor): host memory admits not
-    /// even the tier's landing reserve. None where it does, or without a
-    /// linked tier. Every file miss lands in a tier record, so the floor is
-    /// what makes a step live, and a plan short of it is unstreamed, not
-    /// short of device memory.
-    fn untiered(&self, charge: &AssessmentMemoryCharge, budget: &super::MemoryBudget) -> Result<Option<UnstreamedExperts>, PlanError> {
+    /// Whether host memory fails to admit even the linked host tier's landing
+    /// reserve beside `charge` (its tier at its floor): returns a typed
+    /// `NoBank::Short` on `ResourceKind::HostStaging` rather than
+    /// `UnstreamedExperts::Untiered`, since the device supports a host tier
+    /// and is simply short of host RAM.
+    fn host_short(&self, charge: &AssessmentMemoryCharge, budget: &super::MemoryBudget) -> Result<Option<NoBank>, PlanError> {
         let tiered = self.bank().host_ceiling().is_some_and(|ceiling| ceiling > 0) && !self.bank().whole();
         if self.device.host != Some(HostTier::Linked) || !tiered {
             return Ok(None);
         }
-        Ok((self.host_left(charge, budget, 0)? < 0).then(|| self.untiered_reason()))
-    }
-
-    /// The tier's landing reserve unadmitted, as a reason.
-    fn untiered_reason(&self) -> UnstreamedExperts {
-        let reserve = self.bank().landing_records();
-        let reason = format!("host memory admits not even the tier's landing reserve of {reserve} records a group");
-        UnstreamedExperts::Untiered { backend: self.device.backend, reason }
+        Ok(budget.host_shortfall(self, charge, 0)?.map(|(required, available, deficit_bytes)| NoBank::Short {
+            resource: crate::ResourceKind::HostStaging,
+            deficit_bytes,
+            required,
+            available,
+        }))
     }
 
     /// The draft's expert bank, which a streamed plan holds.
@@ -697,21 +701,30 @@ impl ExecutionPlanDraft {
             Ok(settled) => settled,
             Err(no) => return Ok(Err(no)),
         };
-        let reason = match settled {
+        let fallback_err = match settled {
             Ok((draft, charge, found)) => match draft.with_host_tier(charge.charge(), budget)? {
                 Ok(draft) => return Ok(Ok((draft, charge, found))),
-                Err(reason) => reason,
+                Err(short) => {
+                    let deficit_bytes = NonZeroU64::new(short.lacks())
+                        .expect("invariant violated: host-tier shortfall has zero deficit");
+                    NoBank::Short {
+                        resource: short.resource,
+                        deficit_bytes,
+                        required: short.required,
+                        available: short.available,
+                    }
+                }
             },
-            Err(NoBank::Unstreamed(reason)) => reason,
+            Err(err @ NoBank::Unstreamed(_)) => err,
             Err(no) => return Ok(Err(no)),
         };
         let Some(resident) = ceiling.whole.held_whole_within(definition, bound)? else {
-            return Ok(Err(NoBank::Unstreamed(reason)));
+            return Ok(Err(fallback_err));
         };
         let charge = held.charge(definition, &resident)?;
         Ok(match confirm(&resident, charge.charge())? {
             Ok(found) => Ok((resident, charge, found)),
-            Err(_) => Err(NoBank::Unstreamed(reason)),
+            Err(_) => Err(fallback_err),
         })
     }
 
@@ -854,6 +867,7 @@ impl ExecutionPlanDraft {
                     let startup_fit = budget.fit_startup(&resident, charge.charge())?;
                     if let Some(startup_deficit) = startup_fit.short {
                         last_short = Some(NoBank::Short {
+                            resource: limiting_resource(startup_fit.limiting),
                             deficit_bytes: startup_deficit,
                             required: startup_fit.limiting_required,
                             available: startup_fit.limiting_available,
@@ -863,6 +877,7 @@ impl ExecutionPlanDraft {
                     }
                 } else {
                     last_short = Some(NoBank::Short {
+                        resource: limiting_resource(fit.limiting),
                         deficit_bytes,
                         required: fit.limiting_required,
                         available: fit.limiting_available,
@@ -876,6 +891,7 @@ impl ExecutionPlanDraft {
                     }
                     Err(deficit_bytes) => {
                         last_short = Some(NoBank::Short {
+                            resource: limiting_resource(fit.limiting),
                             deficit_bytes,
                             required: fit.limiting_required,
                             available: fit.limiting_available,
@@ -894,6 +910,7 @@ impl ExecutionPlanDraft {
                 }
                 Err(deficit_bytes) => {
                     last_short = Some(NoBank::Short {
+                        resource: limiting_resource(fit.limiting),
                         deficit_bytes,
                         required: fit.limiting_required,
                         available: fit.limiting_available,
@@ -1408,8 +1425,8 @@ impl ExecutionPlanDraft {
         let mandatory = whole.resized(points[0], *ceiling, PassLaunches::FLOOR)?;
         let structure = crate::assessment::StructuralCharge::of(definition, &mandatory).map_err(charge_error)?;
         let floor_charge = structure.charge(definition, &mandatory).map_err(charge_error)?;
-        if let Some(reason) = mandatory.untiered(&floor_charge, budget)? {
-            return Ok(Err(NoBank::Unstreamed(reason)));
+        if let Some(short) = mandatory.host_short(&floor_charge, budget)? {
+            return Ok(Err(short));
         }
         let prices = super::prices::measured(match prices {
             Priced::Measured(prices) => prices.of_bank(whole, definition)?,
@@ -1502,8 +1519,8 @@ impl ExecutionPlanDraft {
         let floor_charge = held.charge(definition, &mandatory)?.charge().clone();
         // Host memory that admits not even the tier's floor streams nothing,
         // whatever the device holds.
-        if let Some(reason) = mandatory.untiered(&floor_charge, budget)? {
-            return Ok(Err(NoBank::Unstreamed(reason)));
+        if let Some(short) = mandatory.host_short(&floor_charge, budget)? {
+            return Ok(Err(short));
         }
         let mandatory_bytes = floor_charge
             .store_demands(mandatory.device.topology(), mandatory.device.executor())
@@ -1518,6 +1535,7 @@ impl ExecutionPlanDraft {
                 budget.fit_whole(draft, charge)?
             };
             Ok(NoBank::Short {
+                resource: limiting_resource(fit.limiting),
                 deficit_bytes,
                 required: fit.limiting_required,
                 available: fit.limiting_available,
@@ -2158,8 +2176,9 @@ pub enum NoBank {
     /// bank's floor.
     Bound { bound: WeightBound, needed: u64 },
     /// The plan at the bank's floor is still `deficit_bytes` short (`required`
-    /// against live `available` device room).
+    /// against live `available` room in `resource`).
     Short {
+        resource: crate::ResourceKind,
         deficit_bytes: NonZeroU64,
         required: u64,
         available: u64,
@@ -2471,13 +2490,21 @@ fn load_confirm<'a>(
     }
 }
 
+/// Map a `WholeFit`'s limiting domain role to its [`crate::ResourceKind`].
+fn limiting_resource(limiting: Option<crate::platform::DomainRole>) -> crate::ResourceKind {
+    match limiting {
+        Some(crate::platform::DomainRole::Staging) => crate::ResourceKind::HostStaging,
+        _ => crate::ResourceKind::DeviceMemory,
+    }
+}
+
 /// A load's refusal where no plan holds its experts.
 fn refusal(no: NoBank) -> PlanError {
     match no {
         NoBank::Unstreamed(reason) => PlanError::Unstreamed(reason),
         NoBank::Bound { bound, needed } => PlanError::WeightBound { bound, needed },
-        NoBank::Short { required, available, .. } => PlanError::Resource(crate::CapacityError::new(
-            crate::ResourceKind::DeviceMemory,
+        NoBank::Short { resource, required, available, .. } => PlanError::Resource(crate::CapacityError::new(
+            resource,
             required,
             available,
         )),
@@ -2635,13 +2662,14 @@ impl<T> BankForm<T> {
 
     /// The bank at `slots` with its linked host tier as host memory beside
     /// `charge` holds it (`ExecutionPlanDraft::with_host_tier`, sized by
-    /// memory alone), or why its experts cannot stream beside it.
+    /// memory alone), or the host-memory capacity shortfall when host RAM
+    /// admits not even the landing reserve.
     pub fn with_host_tier(
         &self,
         slots: u64,
         charge: &AssessmentMemoryCharge,
         budget: &super::MemoryBudget,
-    ) -> Result<Result<ExecutionPlanDraft, UnstreamedExperts>, PlanError> {
+    ) -> Result<Result<ExecutionPlanDraft, crate::CapacityError>, PlanError> {
         self.at_slots(slots)?.with_host_tier(charge, budget)
     }
 }
@@ -4708,6 +4736,65 @@ mod tests {
             err.required,
             live_device_room,
             total_capacity,
+        );
+    }
+
+    /// When a discrete CUDA device has enough VRAM for the streamed bank floor
+    /// but host RAM cannot admit even the linked host tier's landing reserve,
+    /// planning refuses with a typed `PlanError::Resource` on
+    /// `ResourceKind::HostStaging` — never `PlanError::Unstreamed(Untiered)`,
+    /// which would misclassify a host-RAM shortage as `unsupported_model`.
+    #[test]
+    fn host_tier_landing_shortfall_reports_host_staging_capacity_not_untiered() {
+        use crate::planning::fixtures::{LIMITS, RoutedShape, gemma_moe_fixture_manifest, routed_fixture_definition};
+
+        let (_, _, device) = recorded(seismic::fixtures::recorded::rtx3090(), BackendName::Cuda, 64 << 30, RTX3090_CUDA_GRAPHS);
+        let definition = routed_fixture_definition(RoutedShape {
+            layers: 4,
+            experts: 32,
+            selected: 4,
+            hidden: 1024,
+            intermediate: 512,
+        });
+        let manifest = gemma_moe_fixture_manifest(&definition);
+        let draft = ExecutionPlanner::prepare(
+            &device,
+            &manifest,
+            &definition,
+            ComponentSelection { head: false, vision: false },
+            ExecutionPath::Native,
+            PlannedMethod::Plain,
+            KvCodec::Dense,
+            LIMITS,
+        )
+        .unwrap();
+
+        let whole_resident = draft.held_whole_at(&definition, 1).unwrap();
+        let whole_charge = AssessmentMemoryCharge::of(&definition, &whole_resident).unwrap();
+        let whole_device = whole_charge
+            .store_demands(draft.device().topology(), draft.device().executor())
+            .unwrap()
+            .allocation_bytes();
+        let live_device_room = whole_device.saturating_sub(1 << 20);
+        let live_host_room = 1_u64 << 20;
+        let budget = super::MemoryBudget::fixed(live_device_room, Some(live_host_room));
+        let Placed::Short(unplaced) = draft.placed::<AssessmentMemoryCharge>(&definition, None, &synthetic(), &budget).unwrap() else {
+            panic!("expected Placed::Short when device room is below whole-resident weights");
+        };
+        let err = match unplaced.streamed(&definition, &synthetic(), &budget) {
+            Err(PlanError::Resource(err)) => err,
+            Err(PlanError::Unstreamed(reason)) => {
+                panic!("host-RAM landing shortfall must not be misclassified as Unstreamed({reason:?})")
+            }
+            Err(other) => panic!("expected PlanError::Resource(HostStaging), got {other:?}"),
+            Ok(_) => panic!("expected refusal when live host_room is 1 MiB"),
+        };
+        assert_eq!(err.resource, crate::ResourceKind::HostStaging);
+        assert_eq!(err.available, live_host_room);
+        assert!(
+            err.required > live_host_room,
+            "required ({}) must exceed live_host_room ({live_host_room})",
+            err.required,
         );
     }
 

@@ -6,6 +6,7 @@ use crate::experts::derived::{BankShape, HoldingTarget};
 use crate::memory::ledger::{CacheReclaimer, Claim, CommittedKind, DeviceLedgers, ReclaimError, Recorded};
 use crate::CompletionWake;
 use std::time::{Duration, Instant};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, Weak};
 
 /// Synchronous [`CacheReclaimer`] for one auxiliary stored table
@@ -84,6 +85,9 @@ pub(crate) struct ServedBank {
     /// Its committed claims, held for the load: a linked tier's landing
     /// rows and each holding's floor.
     _floors: Vec<Claim>,
+    /// Whether post-startup host-tier backing ([`Self::begin_host_backing`])
+    /// has already been started; makes `begin_host_backing` idempotent.
+    host_backing_started: AtomicBool,
 }
 
 impl ServedBank {
@@ -119,6 +123,7 @@ impl ServedBank {
             tables,
             finished: Mutex::default(),
             _floors: Vec::new(),
+            host_backing_started: AtomicBool::new(false),
         };
         let mut floors = Vec::new();
         if let Some(need) = served.bank.plan.landing().map_err(DomainError::invariant)? {
@@ -180,7 +185,7 @@ impl ServedBank {
     /// from `BankCache` immediately so no phantom `CacheKind::Bank` bytes
     /// remain in the ledger.
     pub(crate) fn begin_host_backing(&self, ledgers: &DeviceLedgers) -> Result<(), DomainError> {
-        if !self.has_planned_host_tier() {
+        if !self.has_planned_host_tier() || self.host_backing_started.swap(true, Ordering::AcqRel) {
             return Ok(());
         }
         let trimmed = seismic::return_freed_pages();

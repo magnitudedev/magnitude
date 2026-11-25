@@ -342,6 +342,89 @@ fn pinned_host_budget_clamping_and_per_slot_guard_agree_on_64g_linux_container()
     assert!((clamped + 1) * HOST_SLOT > est.live_pinned_headroom(&post_floor));
 }
 
+/// Reserving `head_upload_peak_bytes` (e.g. 450 MiB on Qwen3.8 + MTP) as a
+/// committed `CommittedKind::Upload` claim on `HostRam` BEFORE sizing elastic
+/// host-tier slots (`import_host_slots` / `clamped_host_slots`) guarantees the
+/// host tier leaves that room untouched, so releasing the reserve right before
+/// `bind_head()` admits the 450 MiB drafter head upload with zero shortfall.
+#[test]
+fn head_upload_reserve_prevents_host_tier_from_starving_drafter_upload() {
+    use crate::memory::ledger::{CommittedKind, Ledgers, LoadShape, PoolClass};
+    use crate::memory::supply::Reading;
+    use std::num::NonZeroU64;
+    use std::sync::Arc;
+    use std::time::{Duration, Instant};
+
+    const MIB: u64 = 1 << 20;
+    const GIB: u64 = 1 << 30;
+    const TOTAL: u64 = 16 * GIB;
+    const RECLAIM_BAND: u64 = 64 * MIB;
+    const HOST_SLOT: u64 = 64 * MIB;
+    const HOST_FLOOR: u64 = 2 * GIB;
+    const HEAD_UPLOAD_PEAK: u64 = 450 * MIB; // 471_859_200 B on Qwen3.8 + MTP
+
+    let t0 = Instant::now();
+    let sample = seismic::HostSample {
+        at: t0,
+        page_bytes: 4096,
+        total: TOTAL,
+        supply: seismic::Supply {
+            free_beyond_target: (6 * GIB) as i64,
+            clean_cache: 0,
+            cold_reclaimable: 0,
+        },
+        reclaim_band: RECLAIM_BAND,
+        counted: seismic::Counted { at: t0, lag: Duration::ZERO },
+        cold: seismic::ColdPages::default(),
+        own_reclaimed: None,
+        wired: None,
+        harm: Some(seismic::Harm { machine: 0, own: 0 }),
+        pressure: Some(seismic::PressureLevel::Normal),
+        lag: seismic::Lag { release: Duration::ZERO, growth: Duration::ZERO },
+    };
+
+    let scope = Ledgers::new();
+    let host = scope.ledger(seismic::StoreIdentity::HostRam, Arc::new(LoadShape { stores: Vec::new() }));
+    let _pool = host.pool_block(PoolClass::Records, NonZeroU64::new(HOST_SLOT).unwrap());
+    host.read(host.sampled(t0), Reading::host(&sample));
+
+    // Commit the host tier's floor (landing reserve) and reserve `HEAD_UPLOAD_PEAK`
+    // BEFORE sizing elastic host-tier slots.
+    let _floor = host
+        .change(|keeping| host.claim_at(&keeping.claims(), None, CommittedKind::Load, HOST_FLOOR))
+        .expect("host floor fits");
+    let head_upload_reserve = host
+        .change(|keeping| host.claim_at(&keeping.claims(), None, CommittedKind::Upload, HEAD_UPLOAD_PEAK))
+        .expect("head upload reserve fits");
+
+    let host_charge = |slots: u64| HOST_FLOOR + slots * HOST_SLOT;
+    let host_shape = BankShape::new(HOST_SLOT, 0, 256, 256);
+    let room_with_reserve = host.estimate().pinned_import_room();
+    let slots_with_reserve = target_slots(room_with_reserve, &host_shape, &host_charge);
+
+    // Claim those elastic host-tier slots on HostRam.
+    let host_tier_bytes = host_charge(slots_with_reserve) - HOST_FLOOR;
+    let _host_tier = host
+        .change(|keeping| host.claim_at(&keeping.claims(), None, CommittedKind::Load, host_tier_bytes))
+        .expect("sized host tier fits beside head upload reserve");
+
+    // Release the pre-claimed reserve right before `bind_head()` and verify the
+    // 450 MiB drafter upload claim succeeds immediately.
+    host.change(|_| drop(head_upload_reserve));
+    let bind_head_upload = host
+        .change(|keeping| host.claim_at(&keeping.claims(), None, CommittedKind::Upload, HEAD_UPLOAD_PEAK))
+        .expect("bind_head upload must succeed after releasing head_upload_reserve");
+    assert_eq!(bind_head_upload.bytes(), HEAD_UPLOAD_PEAK);
+
+    // Once `bind_head()` drops its transient upload staging buffer, post-bind
+    // `begin_host_backing()` recovers the full 450 MiB for host-tier slots.
+    host.change(|_| drop(bind_head_upload));
+    assert!(
+        host.estimate().pinned_import_room() >= room_with_reserve + HEAD_UPLOAD_PEAK - host_tier_bytes,
+        "freeing transient head upload buffer returns its room to post-bind host backing",
+    );
+}
+
 /// Reproduces F-047 on `cliqa-r3-cuda` (30.97 GiB physical RAM, 0 swap,
 /// 2.49 GiB CMA, `qwen3.8-flash-next:gguf:q2` with 337 planned host slots at
 /// 67.33 MB/slot = 22.69 GB): once Linux discovery excludes CMA and reserves

@@ -573,6 +573,28 @@ impl MemoryBudget {
         }
     }
 
+    /// `(available, required)` in host RAM beside `charge`'s host store demand
+    /// plus `growth` bytes, or `None` on unified stores.
+    fn host_available_and_required(
+        &self,
+        draft: &ExecutionPlanDraft,
+        charge: &AssessmentMemoryCharge,
+        growth: u64,
+    ) -> Result<Option<(u64, u64)>, PlanError> {
+        let Some(host) = self.host else {
+            return Ok(None);
+        };
+        let host_demand = charge
+            .store_demands(draft.device().topology(), draft.device().executor())
+            .map_err(PlanError::ResourcePlanning)?
+            .host_store_bytes()
+            .expect("invariant violated: a linked host tier requires split device and host stores");
+        let required = host_demand
+            .checked_add(growth)
+            .ok_or(PlanError::Arithmetic("a load's host charge overflows"))?;
+        Ok(Some((host.available, required)))
+    }
+
     /// Host RAM left beside `charge`'s host store demand plus `growth` bytes
     /// (for sizing a linked host tier): negative where it does not fit.
     pub fn host_left(
@@ -581,19 +603,27 @@ impl MemoryBudget {
         charge: &AssessmentMemoryCharge,
         growth: u64,
     ) -> Result<i64, PlanError> {
-        let Some(host) = self.host else {
+        let Some((available, required)) = self.host_available_and_required(draft, charge, growth)? else {
             return Ok(i64::MAX);
         };
-        let host_demand = charge
-            .store_demands(draft.device().topology(), draft.device().executor())
-            .map_err(PlanError::ResourcePlanning)?
-            .host_store_bytes()
-            .expect("invariant violated: a linked host tier requires split device and host stores");
-        let demand = host_demand
-            .checked_add(growth)
-            .ok_or(PlanError::Arithmetic("a load's host charge overflows"))?;
-        i64::try_from(host.available)
-            .and_then(|room| i64::try_from(demand).map(|demand| room - demand))
+        i64::try_from(available)
+            .and_then(|room| i64::try_from(required).map(|demand| room - demand))
             .map_err(|_| PlanError::Arithmetic("a host tier's room exceeds i64"))
+    }
+
+    /// Host-RAM shortfall beside `charge`'s host store demand plus `growth`
+    /// bytes: `Some((required, available, deficit_bytes))` when `required`
+    /// exceeds `host.available`, or `None` when it fits (or on unified stores).
+    pub fn host_shortfall(
+        &self,
+        draft: &ExecutionPlanDraft,
+        charge: &AssessmentMemoryCharge,
+        growth: u64,
+    ) -> Result<Option<(u64, u64, NonZeroU64)>, PlanError> {
+        let Some((available, required)) = self.host_available_and_required(draft, charge, growth)? else {
+            return Ok(None);
+        };
+        Ok(NonZeroU64::new(required.saturating_sub(available))
+            .map(|deficit| (required, available, deficit)))
     }
 }

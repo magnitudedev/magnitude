@@ -808,6 +808,7 @@ struct ImportedTarget {
     constants_claim: Held,
     request_slot: Claim,
     drafter_reserve: Option<Held>,
+    head_upload_reserve: Option<Held>,
     recorded_graphs_reserve: Option<Held>,
     site_requests: Vec<Option<magnitude_executor::assessment::SiteRequest>>,
     head_enabled: bool,
@@ -1055,7 +1056,24 @@ fn import_target(
     if trimmed > 0 {
         tracing::info!("returned {trimmed} freed host bytes after weight import");
     }
+    let mut head_upload_reserve = None;
     if let Some(floor_demand) = floor_demand {
+        // Refresh `startup.reading` once after `release_upload()` so both
+        // `head_upload_reserve` and `claim_bank_growth` observe live post-import
+        // device and host headroom. Reserve `head_upload_peak_bytes` (Phase B1b)
+        // on both device and host staging BEFORE sizing elastic bank / host-tier
+        // slots so neither tier can starve `domain.bind_head()`.
+        startup.reading = startup.reader.settled_read(&startup.ledgers);
+        if head_enabled {
+            let head_peak = execution_plan.load().head_upload_peak_bytes();
+            if head_peak > 0 {
+                head_upload_reserve = Some(startup.claim_as(
+                    "the drafter head upload",
+                    CommittedKind::Upload,
+                    ClaimDemand { device: head_peak, staged: head_peak, ..ClaimDemand::default() },
+                )?);
+            }
+        }
         let imported = startup.claim_bank_growth(execution_plan.load(), floor_demand)?;
         let (sized_plan, sized_planned, mut bank_growth) = imported.fit(execution_plan, planned)?;
         execution_plan = sized_plan;
@@ -1114,6 +1132,7 @@ fn import_target(
         constants_claim,
         request_slot,
         drafter_reserve,
+        head_upload_reserve,
         recorded_graphs_reserve,
         site_requests,
         head_enabled,
@@ -1148,6 +1167,7 @@ fn assemble_domain(
         constants_claim,
         request_slot,
         drafter_reserve,
+        head_upload_reserve,
         recorded_graphs_reserve,
         site_requests,
         head_enabled,
@@ -1254,12 +1274,17 @@ fn assemble_domain(
     .map_err(|error| domain_refused(error, &startup.ledgers))?;
     report_load_phase("state and domain allocation", &mut phase_started);
     report_load_memory("domain allocated", &device);
-    // Release the pre-claimed drafter and recorded-graph reserves into the
-    // ledger right before binding the head and warming up. Binding the head
-    // here (Phase B1b, after `release_upload()` and before serving grows KV
-    // state) guarantees `head_upload_peak_bytes` never coexists with
-    // `target_upload_peak_bytes` or serving `state_slab_bytes`.
+    // Release the pre-claimed drafter, head-upload, and recorded-graph reserves
+    // into the ledger right before binding the head and starting background
+    // host-tier backing. Binding the head here (Phase B1b, after
+    // `release_upload()` and before host-tier backing or serving KV growth)
+    // guarantees `head_upload_peak_bytes` never coexists with
+    // `target_upload_peak_bytes`, background host-tier backing, or serving
+    // `state_slab_bytes`.
     if let Some(reserve) = drafter_reserve {
+        startup.ledgers.changes().change(|_| drop(reserve));
+    }
+    if let Some(reserve) = head_upload_reserve {
         startup.ledgers.changes().change(|_| drop(reserve));
     }
     if let Some(reserve) = recorded_graphs_reserve {
@@ -1270,6 +1295,9 @@ fn assemble_domain(
             .bind_head()
             .map_err(|error| domain_refused(error, &startup.ledgers))?;
     }
+    domain
+        .begin_host_backing()
+        .map_err(|error| domain_refused(error, &startup.ledgers))?;
     // What the load is doing from its pricing and warm-up until it serves, in
     // the process's report on demand (`magnitude_executor::diagnostics`).
     // Price the load BEFORE `warm_up` so a tiered bank's `TierCopyCosts`
@@ -2224,14 +2252,11 @@ impl Startup {
     }
 
     /// Claim the streamed expert bank's slots past its floor (and host tier
-    /// slots past 0) AFTER `upload_window` has been released and `floor_demand`
-    /// is already held on `self.ledgers`. Refreshes `self.reading` via
-    /// `settled_read` first so live device headroom (including actual CUDA /
-    /// Vulkan block-packing overhead from non-banked weight imports) is
-    /// observed before sizing the bank.
+    /// slots past 0) AFTER `upload_window` has been released, `self.reading`
+    /// has been refreshed via `settled_read`, and any `head_upload_reserve` and
+    /// `floor_demand` are already held on `self.ledgers`.
     fn claim_bank_growth(&mut self, load: &ModelLoadPlan, floor_demand: ClaimDemand) -> Result<Imported, LoadError> {
         const PURPOSE: &str = "target import";
-        self.reading = self.reader.settled_read(&self.ledgers);
         let bank = load
             .expert_bank()
             .expect("invariant violated: claim_bank_growth requires an expert bank");

@@ -790,23 +790,28 @@ mod tests {
     }
 
     /// A `PlanError::Resource` on device or host memory surfaces as typed
-    /// `InsufficientMemory` in both preview and load, never `Internal`.
+    /// `InsufficientMemory` in both preview and load, never `Internal` or `Unsupported`.
     #[test]
     fn memory_capacity_plan_error_classifies_as_insufficient_memory() {
-        let cap = PlanError::Resource(magnitude_executor::CapacityError::new(
-            magnitude_executor::ResourceKind::DeviceMemory,
-            10_000,
-            4_000,
-        ));
-        let expected = InsufficientMemory { required: 10_000, available: 4_000 };
-        assert_eq!(
-            PreviewError::from(classify_plan(cap.clone(), seismic::BackendName::Metal)),
-            PreviewError::InsufficientMemory(expected)
-        );
-        assert!(matches!(
-            LoadError::from(classify_plan(cap, seismic::BackendName::Metal)),
-            LoadError::InsufficientMemory { memory, .. } if memory == expected
-        ));
+        for (resource, backend) in [
+            (magnitude_executor::ResourceKind::DeviceMemory, seismic::BackendName::Metal),
+            (magnitude_executor::ResourceKind::HostStaging, seismic::BackendName::Cuda),
+        ] {
+            let cap = PlanError::Resource(magnitude_executor::CapacityError::new(
+                resource,
+                10_000,
+                4_000,
+            ));
+            let expected = InsufficientMemory { required: 10_000, available: 4_000 };
+            assert_eq!(
+                PreviewError::from(classify_plan(cap.clone(), backend)),
+                PreviewError::InsufficientMemory(expected)
+            );
+            assert!(matches!(
+                LoadError::from(classify_plan(cap, backend)),
+                LoadError::InsufficientMemory { memory, .. } if memory == expected
+            ));
+        }
     }
 
     /// A failed execution owner keeps its classified failure: a device loss

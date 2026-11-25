@@ -1373,7 +1373,7 @@ fn size_bank_with_host_tier(
     paths: crate::planning::BankPaths,
     charge: &AssessmentMemoryCharge,
     budget: &crate::planning::MemoryBudget,
-) -> Result<Result<crate::planning::ExpertBankPlan, crate::UnstreamedExperts>, AssessmentError> {
+) -> Result<Result<crate::planning::ExpertBankPlan, crate::CapacityError>, AssessmentError> {
     use crate::planning::{HostTier, PassLaunches};
 
     let mut bank = draft
@@ -1398,20 +1398,17 @@ fn size_bank_with_host_tier(
     let Some(ceiling) = bank.host_ceiling().filter(|&ceiling| ceiling > 0 && !bank.whole()) else {
         return Ok(Ok(bank));
     };
+    if let Some((required, available, _)) = budget.host_shortfall(draft, charge, 0)? {
+        return Ok(Err(crate::CapacityError::new(
+            crate::ResourceKind::HostStaging,
+            required,
+            available,
+        )));
+    }
     let left = |host_slots: u64| -> Result<i64, AssessmentError> {
         let growth = bank.host_cache(host_slots).map_err(AssessmentError::Memory)?;
         Ok(budget.host_left(draft, charge, growth)?)
     };
-    if left(0)? < 0 {
-        let reserve = bank.landing_records();
-        let reason = format!(
-            "host memory admits not even the tier's landing reserve of {reserve} records a group"
-        );
-        return Ok(Err(crate::UnstreamedExperts::Untiered {
-            backend: draft.device().backend(),
-            reason,
-        }));
-    }
     let most = if left(ceiling)? >= 0 {
         ceiling
     } else {
@@ -1507,10 +1504,16 @@ fn settle_bank_rung(
         if next == paths {
             match size_bank_with_host_tier(draft, slots, tier_places, paths, &charge, budget)? {
                 Ok(sized) => return Ok(Ok((sized, charge, fit))),
-                Err(reason) => {
-                    return Err(AssessmentError::Plan(format!(
-                        "the bank's floor fits, yet its experts cannot stream beside it: {reason}"
-                    )));
+                Err(short) => {
+                    let deficit_bytes = NonZeroU64::new(short.lacks())
+                        .expect("invariant violated: host shortfall has zero deficit");
+                    return Ok(Err(crate::AssessmentFit {
+                        verdict: AssessmentFitVerdict::DoesNotFit {
+                            limiting: topology.host_ram().id(),
+                            deficit_bytes,
+                        },
+                        domains: fit.domains,
+                    }));
                 }
             }
         }

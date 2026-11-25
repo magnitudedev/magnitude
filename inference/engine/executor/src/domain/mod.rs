@@ -2794,6 +2794,29 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
         self.bind_component(ReservationLane::Head)
     }
 
+    /// Take a settled post-startup `HostRam` reading (`after_idle = true`) and
+    /// begin background backing of the linked host tier, clamped to live pinned
+    /// host room.
+    ///
+    /// Called after all mandatory startup allocations (domain construction and
+    /// drafter head binding) have completed so background host-tier backing
+    /// never races with or starves them, and so the host tier can immediately
+    /// use the transient `head_upload_peak_bytes` staging room freed when
+    /// [`Self::bind_head`] finishes. Idempotent and a no-op when no host tier
+    /// is planned.
+    pub fn begin_host_backing(&self) -> Result<(), DomainError> {
+        if !self.family.has_planned_host_tier() {
+            return Ok(());
+        }
+        // Take a settled post-startup reading (`after_idle = true`) before
+        // starting host-tier backing so one-time uncharged load/driver/graph
+        // host RSS is absorbed into `others` and `pinned_budget()` without
+        // poisoning `guarantee` (`read.rise`), and the host-tier target is
+        // clamped to live host room.
+        self.memory.borrow().settled_read_after(self.resources.ledgers(), true);
+        self.family.begin_host_backing(self.resources.ledgers())
+    }
+
     /// Import and bind the optional component `lane` needs when it is
     /// unbound, each allocation under its claim (`Self::claim_growth`), in
     /// one change that keeps nothing: the import's resident weights held by
@@ -3226,15 +3249,11 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
         // thread stands beside it, they are judged by the last reading with
         // every claim since counted; the owner's first step owes a reading
         // and takes it.
-        if family.has_planned_host_tier() {
-            // Take a settled post-domain reading (`after_idle = true`) before
-            // starting host-tier backing so one-time uncharged load/driver/graph
-            // host RSS is absorbed into `others` and `pinned_budget()` without
-            // poisoning `guarantee` (`read.rise`), and the host-tier target is
-            // clamped to live host room.
-            memory.settled_read_after(resources.ledgers(), true);
-            family.begin_host_backing(resources.ledgers())?;
-        } else if memory.read_at_event_after(resources.ledgers(), true).is_none() {
+        // When a host tier is planned, `ExecutorDomain::begin_host_backing`
+        // takes the settled post-startup reading and starts background backing
+        // once all mandatory startup allocations (including `bind_head`) have
+        // completed.
+        if !family.has_planned_host_tier() && memory.read_at_event_after(resources.ledgers(), true).is_none() {
             tracing::debug!(target: MEMORY_TRACE, "the domain's opening memory read deferred: a change of ours stood beside the sample");
         }
         // The arena: the load's graph scratch and the target graphs' bound

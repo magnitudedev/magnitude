@@ -858,6 +858,9 @@ fn bind_domain(
         request_slot,
     )
     .unwrap_or_else(|error| panic!("{backend:?}: {error}"));
+    domain
+        .begin_host_backing()
+        .unwrap_or_else(|error| panic!("{backend:?}: {error}"));
     if let Machine::Still = machine {
         super::settle_ledgers(domain.domain.device(), domain.resources.ledgers(), &*reading);
     }
