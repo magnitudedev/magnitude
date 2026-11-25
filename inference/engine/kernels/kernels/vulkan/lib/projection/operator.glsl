@@ -145,21 +145,33 @@ void projection_paired_gemm() {
 #include "segments.glsl"
 
 // Segment s's GEMV workgroups: `tile` counts down through the segments'
-// tiles of `per` weight rows each.
+// tiles of `per` weight rows each. A zeroed segment's store zeros, a pair's
+// run its paired body, an unpaired one's name the segment the one GEMV body
+// takes.
 #define PROJECTION_SEGMENT_GEMV(s)                                                                      \
-    {                                                                                                   \
+    if (!done) {                                                                                        \
         const uint tiles = (uint(PROJECTION_N##s) + per - 1u) / per;                                    \
         if (tile < tiles) {                                                                             \
-            if (PROJECTION_ZEROED(s))                                                                   \
-                projection_zero_tile(PROJECTION_OUTPUT##s, m, uint(PROJECTION_N##s), 0u, m, tile * per, per); \
-            else                                                                                        \
-                projection_gemv(PROJECTION_KIND##s, PROJECTION_PARTNER_KIND##s, PROJECTION_PAIRED##s,   \
+            if (PROJECTION_ZEROED(s)) {                                                                 \
+                projection_zero_tile(PROJECTION_OUTPUT##s, m, uint(PROJECTION_N##s), 0u, m,             \
+                    tile * per, per);                                                                   \
+            } else if (PROJECTION_PAIRED##s) {                                                          \
+                projection_gemv(PROJECTION_KIND##s, PROJECTION_PARTNER_KIND##s, true,                   \
                     SEISMIC_TUNE_ROWS, SEISMIC_TUNE_LANES, maxm, SEISMIC_TUNE_STAGE == 1,               \
                     SEISMIC_TUNE_DECODE == 1, PROJECTION_NORM, x, PROJECTION_OUTPUT##s,                 \
-                    PROJECTION_WEIGHT##s, PROJECTION_PARTNER##s, m, uint(PROJECTION_N##s), PROJECTION_K, tile); \
-            return;                                                                                     \
+                    PROJECTION_WEIGHT##s, PROJECTION_PARTNER##s, m, uint(PROJECTION_N##s),              \
+                    PROJECTION_K, tile);                                                                \
+            } else {                                                                                    \
+                found = true;                                                                           \
+                kind = PROJECTION_KIND##s;                                                              \
+                w = PROJECTION_WEIGHT##s;                                                               \
+                out_ = PROJECTION_OUTPUT##s;                                                            \
+                rows = uint(PROJECTION_N##s);                                                           \
+            }                                                                                           \
+            done = true;                                                                                \
+        } else {                                                                                        \
+            tile -= tiles;                                                                              \
         }                                                                                               \
-        tile -= tiles;                                                                                  \
     }
 
 void projection_segmented_gemv(const uint maxm) {
@@ -168,34 +180,43 @@ void projection_segmented_gemv(const uint maxm) {
     const uint m = PROJECTION_M;
     uint tile = gl_WorkGroupID.x;
     const projection_prologue x = projected_input(0u);
+    bool done = false;
+    bool found = false;
+    int kind = PROJECTION_KIND0;
+    projection_weights w;
+    projection_epilogue out_;
+    uint rows = 0u;
     PROJECTION_EACH_SEGMENT(PROJECTION_SEGMENT_GEMV)
+    if (found)
+        projection_gemv(kind, kind, false, SEISMIC_TUNE_ROWS, SEISMIC_TUNE_LANES, maxm,
+            SEISMIC_TUNE_STAGE == 1, SEISMIC_TUNE_DECODE == 1, PROJECTION_NORM, x, out_, w, w,
+            m, rows, PROJECTION_K, tile);
 }
 
 // Segment s's GEMM workgroup columns: a zeroed segment's store zeros, a
 // pair's run its paired body, an unpaired one's name the segment the one
 // GEMM body takes.
 #define PROJECTION_SEGMENT_GEMM(s)                                                                      \
-    if (!found) {                                                                                       \
+    if (!done) {                                                                                        \
         const uint per = PROJECTION_PAIRED##s ? tn / 2u : tn;                                           \
         const uint tiles = (uint(PROJECTION_N##s) + per - 1u) / per;                                    \
         if (tile < tiles) {                                                                             \
             if (PROJECTION_ZEROED(s)) {                                                                 \
                 projection_zero_tile(PROJECTION_OUTPUT##s, m, uint(PROJECTION_N##s), gl_WorkGroupID.y * tm, tm, \
                     tile * per, per);                                                                   \
-                return;                                                                                 \
-            }                                                                                           \
-            if (PROJECTION_PAIRED##s) {                                                                 \
+            } else if (PROJECTION_PAIRED##s) {                                                          \
                 projection_gemm_paired(PROJECTION_KIND##s, PROJECTION_PARTNER_KIND##s, x,               \
                     PROJECTION_OUTPUT##s, PROJECTION_WEIGHT##s,                                         \
                     PROJECTION_PARTNER##s, m, uint(PROJECTION_N##s), PROJECTION_K, gl_WorkGroupID.y, tile, \
                     0xffffffffu);                                                                       \
-                return;                                                                                 \
+            } else {                                                                                    \
+                found = true;                                                                           \
+                kind = PROJECTION_KIND##s;                                                              \
+                w = PROJECTION_WEIGHT##s;                                                               \
+                out_ = PROJECTION_OUTPUT##s;                                                            \
+                rows = uint(PROJECTION_N##s);                                                           \
             }                                                                                           \
-            found = true;                                                                               \
-            kind = PROJECTION_KIND##s;                                                                  \
-            w = PROJECTION_WEIGHT##s;                                                                   \
-            out_ = PROJECTION_OUTPUT##s;                                                                \
-            rows = uint(PROJECTION_N##s);                                                               \
+            done = true;                                                                                \
         } else {                                                                                        \
             tile -= tiles;                                                                              \
         }                                                                                               \
@@ -206,14 +227,16 @@ void projection_segmented_gemm() {
     const uint tm = SEISMIC_TUNE_TILE_M, tn = SEISMIC_TUNE_TILE_N, m = PROJECTION_M;
     const projection_prologue x = projected_rows(0u);
     uint tile = gl_WorkGroupID.x;
+    bool done = false;
     bool found = false;
     int kind = PROJECTION_KIND0;
     projection_weights w;
     projection_epilogue out_;
     uint rows = 0u;
     PROJECTION_EACH_SEGMENT(PROJECTION_SEGMENT_GEMM)
-    projection_gemm(kind, x, out_, w, m, rows, PROJECTION_K,
-        gl_WorkGroupID.y, tile, 0xffffffffu);
+    if (found)
+        projection_gemm(kind, x, out_, w, m, rows, PROJECTION_K,
+            gl_WorkGroupID.y, tile, 0xffffffffu);
 }
 
 // Parts (PROJECTION_PARTS): K is PROJECTION_PARTS parts of PROJECTION_K /
@@ -236,14 +259,13 @@ void projection_segmented_gemm() {
     if (!found) {                                                                                       \
         const uint tiles = (uint(PROJECTION_N##s) + per - 1u) / per;                                    \
         if (tile < tiles) {                                                                             \
-            projection_weights w = PROJECTION_WEIGHT##s;                                                \
-            w.packet_first = part * (width / 32u);                                                      \
-            projection_gemv(PROJECTION_KIND##s, PROJECTION_KIND##s, false, SEISMIC_TUNE_ROWS,           \
-                SEISMIC_TUNE_LANES, maxm, SEISMIC_TUNE_STAGE == 1, SEISMIC_TUNE_DECODE == 1,            \
-                PROJECTION_NORM, x,                                                                     \
-                projection_store(out_over_scratch(ELEMENT_F32, PROJECTION_PARTIALS), row, 1ul, column + first), w, w,  \
-                m, uint(PROJECTION_N##s), width, tile);                                                 \
             found = true;                                                                               \
+            kind = PROJECTION_KIND##s;                                                                  \
+            w = PROJECTION_WEIGHT##s;                                                                   \
+            w.packet_first = part * (width / 32u);                                                      \
+            out_ = projection_store(out_over_scratch(ELEMENT_F32, PROJECTION_PARTIALS), row, 1ul,       \
+                column + first);                                                                        \
+            rows = uint(PROJECTION_N##s);                                                               \
         } else {                                                                                        \
             tile -= tiles;                                                                              \
             first += uint(PROJECTION_N##s);                                                             \
@@ -261,7 +283,15 @@ void projection_parts_gemv(const uint maxm) {
     const uint64_t row = uint64_t(parts) * outputs, column = uint64_t(part) * outputs;
     uint tile = local, first = 0u;
     bool found = false;
+    int kind = PROJECTION_KIND0;
+    projection_weights w;
+    projection_epilogue out_;
+    uint rows = 0u;
     PROJECTION_EACH_SEGMENT(PROJECTION_PART_GEMV)
+    if (found)
+        projection_gemv(kind, kind, false, SEISMIC_TUNE_ROWS, SEISMIC_TUNE_LANES, maxm,
+            SEISMIC_TUNE_STAGE == 1, SEISMIC_TUNE_DECODE == 1, PROJECTION_NORM, x, out_, w, w,
+            m, rows, width, tile);
     if (local == 0u)
         projected_part_first(part, x);
 }

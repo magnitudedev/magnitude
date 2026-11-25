@@ -697,7 +697,7 @@ void projection_gemv_stage(projection_prologue in_, const int norm, const uint m
 }
 
 // One packet of the R weight rows (and, paired, of the second tensor).
-void projection_gemv_load(const int wk, const int uk, const bool paired, const uint r_rows, projection_weights w,
+void projection_gemv_load_of(const int wk, const int uk, const bool paired, const uint r_rows, projection_weights w,
     projection_weights u, uint first_row, uint rows, uint p, out packets_packet a[PROJECTION_GEMV_MAX_R],
     out packets_packet b[PROJECTION_GEMV_MAX_R]) {
     [[unroll]] for (uint r = 0u; r < r_rows; ++r) {
@@ -706,6 +706,43 @@ void projection_gemv_load(const int wk, const int uk, const bool paired, const u
         if (paired)
             b[r] = projection_packet(uk, u, n, p);
     }
+}
+
+#define PROJECTION_GEMV_LOAD(KIND) \
+    else if (wk == KIND) { \
+        projection_gemv_load_of(KIND, KIND, false, r_rows, w, u, first_row, rows, p, a, b); \
+    }
+
+void projection_gemv_load(const int wk, const int uk, const bool paired, const uint r_rows, projection_weights w,
+    projection_weights u, uint first_row, uint rows, uint p, out packets_packet a[PROJECTION_GEMV_MAX_R],
+    out packets_packet b[PROJECTION_GEMV_MAX_R]) {
+    if (paired) {
+        projection_gemv_load_of(wk, uk, true, r_rows, w, u, first_row, rows, p, a, b);
+    }
+#if defined(KERNEL_W0)
+    PROJECTION_GEMV_LOAD(PACKETS_W0)
+#endif
+#if defined(KERNEL_W1) && PACKETS_W1 != PACKETS_W0
+    PROJECTION_GEMV_LOAD(PACKETS_W1)
+#endif
+#if defined(KERNEL_W2) && PACKETS_W2 != PACKETS_W0 && PACKETS_W2 != PACKETS_W1
+    PROJECTION_GEMV_LOAD(PACKETS_W2)
+#endif
+#if defined(KERNEL_W3) && PACKETS_W3 != PACKETS_W0 && PACKETS_W3 != PACKETS_W1 && PACKETS_W3 != PACKETS_W2
+    PROJECTION_GEMV_LOAD(PACKETS_W3)
+#endif
+#if defined(KERNEL_W4) && PACKETS_W4 != PACKETS_W0 && PACKETS_W4 != PACKETS_W1 && PACKETS_W4 != PACKETS_W2 && PACKETS_W4 != PACKETS_W3
+    PROJECTION_GEMV_LOAD(PACKETS_W4)
+#endif
+#if defined(KERNEL_W5) && PACKETS_W5 != PACKETS_W0 && PACKETS_W5 != PACKETS_W1 && PACKETS_W5 != PACKETS_W2 && PACKETS_W5 != PACKETS_W3 && PACKETS_W5 != PACKETS_W4
+    PROJECTION_GEMV_LOAD(PACKETS_W5)
+#endif
+#if defined(KERNEL_W6) && PACKETS_W6 != PACKETS_W0 && PACKETS_W6 != PACKETS_W1 && PACKETS_W6 != PACKETS_W2 && PACKETS_W6 != PACKETS_W3 && PACKETS_W6 != PACKETS_W4 && PACKETS_W6 != PACKETS_W5
+    PROJECTION_GEMV_LOAD(PACKETS_W6)
+#endif
+#if defined(KERNEL_W7) && PACKETS_W7 != PACKETS_W0 && PACKETS_W7 != PACKETS_W1 && PACKETS_W7 != PACKETS_W2 && PACKETS_W7 != PACKETS_W3 && PACKETS_W7 != PACKETS_W4 && PACKETS_W7 != PACKETS_W5 && PACKETS_W7 != PACKETS_W6
+    PROJECTION_GEMV_LOAD(PACKETS_W7)
+#endif
 }
 
 // The dot product of eight codes (even, odd) with eight activations, in
@@ -743,7 +780,7 @@ float projection_code_dot8(const int kind, packets_packet packet, uint step, con
 // Accumulate one loaded packet (chunk-local `local`) for every activation row
 // of the staging from uvec4 `word` (as F32 where `f32`), its codes decoded by
 // `arithmetic` where asked (`packets_codes`).
-void projection_gemv_accumulate(const int wk, const int uk, const bool paired, const uint r_rows, const uint maxm,
+void projection_gemv_accumulate_of(const int wk, const int uk, const bool paired, const uint r_rows, const uint maxm,
     const bool f32, const bool arithmetic, const int act, inout float acc[PROJECTION_GEMV_SUMS],
     inout float acc2[PROJECTION_GEMV_SUMS], packets_packet a[PROJECTION_GEMV_MAX_R],
     packets_packet b[PROJECTION_GEMV_MAX_R], uint local, uint m_rows, uint chunk, uint word) {
@@ -814,6 +851,46 @@ void projection_gemv_accumulate(const int wk, const int uk, const bool paired, c
             }
         }
     }
+#endif
+}
+
+#define PROJECTION_GEMV_ACCUMULATE(KIND) \
+    else if (wk == KIND) { \
+        projection_gemv_accumulate_of(KIND, KIND, false, r_rows, maxm, f32, arithmetic, act, acc, acc2, \
+            a, b, local, m_rows, chunk, word); \
+    }
+
+void projection_gemv_accumulate(const int wk, const int uk, const bool paired, const uint r_rows, const uint maxm,
+    const bool f32, const bool arithmetic, const int act, inout float acc[PROJECTION_GEMV_SUMS],
+    inout float acc2[PROJECTION_GEMV_SUMS], packets_packet a[PROJECTION_GEMV_MAX_R],
+    packets_packet b[PROJECTION_GEMV_MAX_R], uint local, uint m_rows, uint chunk, uint word) {
+    if (paired) {
+        projection_gemv_accumulate_of(wk, uk, true, r_rows, maxm, f32, arithmetic, act, acc, acc2,
+            a, b, local, m_rows, chunk, word);
+    }
+#if defined(KERNEL_W0)
+    PROJECTION_GEMV_ACCUMULATE(PACKETS_W0)
+#endif
+#if defined(KERNEL_W1) && PACKETS_W1 != PACKETS_W0
+    PROJECTION_GEMV_ACCUMULATE(PACKETS_W1)
+#endif
+#if defined(KERNEL_W2) && PACKETS_W2 != PACKETS_W0 && PACKETS_W2 != PACKETS_W1
+    PROJECTION_GEMV_ACCUMULATE(PACKETS_W2)
+#endif
+#if defined(KERNEL_W3) && PACKETS_W3 != PACKETS_W0 && PACKETS_W3 != PACKETS_W1 && PACKETS_W3 != PACKETS_W2
+    PROJECTION_GEMV_ACCUMULATE(PACKETS_W3)
+#endif
+#if defined(KERNEL_W4) && PACKETS_W4 != PACKETS_W0 && PACKETS_W4 != PACKETS_W1 && PACKETS_W4 != PACKETS_W2 && PACKETS_W4 != PACKETS_W3
+    PROJECTION_GEMV_ACCUMULATE(PACKETS_W4)
+#endif
+#if defined(KERNEL_W5) && PACKETS_W5 != PACKETS_W0 && PACKETS_W5 != PACKETS_W1 && PACKETS_W5 != PACKETS_W2 && PACKETS_W5 != PACKETS_W3 && PACKETS_W5 != PACKETS_W4
+    PROJECTION_GEMV_ACCUMULATE(PACKETS_W5)
+#endif
+#if defined(KERNEL_W6) && PACKETS_W6 != PACKETS_W0 && PACKETS_W6 != PACKETS_W1 && PACKETS_W6 != PACKETS_W2 && PACKETS_W6 != PACKETS_W3 && PACKETS_W6 != PACKETS_W4 && PACKETS_W6 != PACKETS_W5
+    PROJECTION_GEMV_ACCUMULATE(PACKETS_W6)
+#endif
+#if defined(KERNEL_W7) && PACKETS_W7 != PACKETS_W0 && PACKETS_W7 != PACKETS_W1 && PACKETS_W7 != PACKETS_W2 && PACKETS_W7 != PACKETS_W3 && PACKETS_W7 != PACKETS_W4 && PACKETS_W7 != PACKETS_W5 && PACKETS_W7 != PACKETS_W6
+    PROJECTION_GEMV_ACCUMULATE(PACKETS_W7)
 #endif
 }
 

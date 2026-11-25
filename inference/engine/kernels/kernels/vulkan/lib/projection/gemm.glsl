@@ -227,21 +227,20 @@ void projection_gemm_store_b_of(const int kind, const bool partner, const uint c
 // launch, see the file header): one preprocessor group per distinct kind the
 // slots bind, each a constant-kind staging.
 #define PROJECTION_GEMM_LOAD_B(KIND) \
-    if (kind == KIND) { \
+    else if (kind == KIND) { \
         projection_gemm_load_b_of(KIND, partner, w, first, count, rows, k0, k); \
-        return; \
     }
 #define PROJECTION_GEMM_STORE_B(KIND) \
-    if (kind == KIND) { \
+    else if (kind == KIND) { \
         projection_gemm_store_b_of(KIND, partner, count, tile_row0, spacing, b_word); \
-        return; \
     }
 
 void projection_gemm_load_b(int kind, const bool partner, projection_weights w, uint first, const uint count,
     uint rows, uint k0, uint k) {
 #if defined(KERNEL_W0)
-    PROJECTION_GEMM_LOAD_B(PACKETS_W0)
-#endif
+    if (kind == PACKETS_W0) {
+        projection_gemm_load_b_of(PACKETS_W0, partner, w, first, count, rows, k0, k);
+    }
 #if defined(KERNEL_W1) && PACKETS_W1 != PACKETS_W0
     PROJECTION_GEMM_LOAD_B(PACKETS_W1)
 #endif
@@ -263,13 +262,15 @@ void projection_gemm_load_b(int kind, const bool partner, projection_weights w, 
 #if defined(KERNEL_W7) && PACKETS_W7 != PACKETS_W0 && PACKETS_W7 != PACKETS_W1 && PACKETS_W7 != PACKETS_W2 && PACKETS_W7 != PACKETS_W3 && PACKETS_W7 != PACKETS_W4 && PACKETS_W7 != PACKETS_W5 && PACKETS_W7 != PACKETS_W6
     PROJECTION_GEMM_LOAD_B(PACKETS_W7)
 #endif
+#endif
 }
 
 void projection_gemm_store_b(int kind, const bool partner, const uint count, uint tile_row0, uint spacing,
     uint b_word) {
 #if defined(KERNEL_W0)
-    PROJECTION_GEMM_STORE_B(PACKETS_W0)
-#endif
+    if (kind == PACKETS_W0) {
+        projection_gemm_store_b_of(PACKETS_W0, partner, count, tile_row0, spacing, b_word);
+    }
 #if defined(KERNEL_W1) && PACKETS_W1 != PACKETS_W0
     PROJECTION_GEMM_STORE_B(PACKETS_W1)
 #endif
@@ -290,6 +291,7 @@ void projection_gemm_store_b(int kind, const bool partner, const uint count, uin
 #endif
 #if defined(KERNEL_W7) && PACKETS_W7 != PACKETS_W0 && PACKETS_W7 != PACKETS_W1 && PACKETS_W7 != PACKETS_W2 && PACKETS_W7 != PACKETS_W3 && PACKETS_W7 != PACKETS_W4 && PACKETS_W7 != PACKETS_W5 && PACKETS_W7 != PACKETS_W6
     PROJECTION_GEMM_STORE_B(PACKETS_W7)
+#endif
 #endif
 }
 
