@@ -1,0 +1,81 @@
+name: Sync install scripts
+
+# Renders install.sh and install.ps1 from the released commit and commits any changes to
+# magnitudedev/magnitude-dev-landing so https://magnitude.dev stays in lockstep with stable
+# releases. Safe to re-run: identical files are a clean no-op.
+on:
+  workflow_call:
+    inputs:
+      version:
+        required: true
+        type: string
+      ref:
+        description: Released commit whose install scripts are rendered
+        required: true
+        type: string
+      dry_run:
+        description: Render and commit locally without pushing to the landing repository
+        required: false
+        default: false
+        type: boolean
+    secrets:
+      LANDING_REPO_DEPLOY_KEY:
+        required: true
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: Commit or branch in magnitudedev/magnitude to render install scripts from
+        required: false
+        default: main
+        type: string
+      dry_run:
+        description: Render and commit locally without pushing to the landing repository
+        required: false
+        default: false
+        type: boolean
+
+permissions:
+  contents: read
+
+env:
+  BUN_VERSION: "1.4.2"
+
+jobs:
+  sync:
+    runs-on: blacksmith-4vcpu-ubuntu-2404
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref }}
+      - uses: actions/checkout@v4
+        with:
+          repository: magnitudedev/magnitude-dev-landing
+          ref: main
+          ssh-key: ${{ secrets.LANDING_REPO_DEPLOY_KEY }}
+          path: landing
+          persist-credentials: true
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: ${{ env.BUN_VERSION }}
+      - run: bun install --frozen-lockfile
+      - name: Resolve release version and commit
+        id: release
+        shell: bash
+        env:
+          INPUT_VERSION: ${{ inputs.version }}
+        run: |
+          source_commit="$(git rev-parse HEAD)"
+          version="${INPUT_VERSION:-$(jq -r '.version // empty' packages/launcher/package.json)}"
+          test -n "$version"
+          [[ "$source_commit" =~ ^[a-f0-9]{40}$ ]]
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "source_commit=$source_commit" >> "$GITHUB_OUTPUT"
+      - name: Render and sync install.sh and install.ps1
+        run: bun run packages/release/scripts/sync-installation-scripts.ts
+        env:
+          MAGNITUDE_LANDING_REPO: ${{ github.workspace }}/landing
+          MAGNITUDE_RELEASE_VERSION: ${{ steps.release.outputs.version }}
+          MAGNITUDE_SOURCE_COMMIT: ${{ steps.release.outputs.source_commit }}
+          MAGNITUDE_SYNC_DRY_RUN: ${{ inputs.dry_run }}
+          APPLE_TEAM_ID: ${{ vars.APPLE_TEAM_ID }}
+          MAGNITUDE_WINDOWS_PUBLISHER: ${{ vars.WINDOWS_SIGNING_PUBLISHER }}

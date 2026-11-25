@@ -82,7 +82,7 @@ jobs:
           bun packages/daemon-management/scripts/build-native.ts
       - name: Check full-install script generation
         working-directory: packages/release
-        run: bunx --bun vitest run scripts/build/installation-scripts.test.ts scripts/build/installation-distribution.test.ts scripts/build/installation-progress.test.ts
+        run: bunx --bun vitest run scripts/build/installation-scripts.test.ts scripts/build/installation-distribution.test.ts scripts/build/installation-progress.test.ts scripts/build/sync-installation-scripts.test.ts
       - name: Exercise sealed bundle and nested signature verification
         working-directory: packages/daemon-management
         run: >-

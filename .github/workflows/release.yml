@@ -276,6 +276,19 @@ jobs:
       channel_tag: true
     secrets:
       DOCKERHUB_TOKEN: ${{ secrets.DOCKERHUB_TOKEN }}
+  # Renders install.sh and install.ps1 from the released commit and syncs them to
+  # magnitudedev/magnitude-dev-landing on stable releases. Re-running it is safe.
+  install-scripts:
+    permissions:
+      contents: read
+    needs: [preflight, publish]
+    if: needs.preflight.outputs.action == 'release' && !contains(needs.preflight.outputs.version, '-')
+    uses: ./.github/workflows/sync-install-scripts.yml
+    with:
+      version: ${{ needs.preflight.outputs.version }}
+      ref: ${{ needs.preflight.outputs.source_commit }}
+    secrets:
+      LANDING_REPO_DEPLOY_KEY: ${{ secrets.LANDING_REPO_DEPLOY_KEY }}
   register-metadata:
     needs: preflight
     if: needs.preflight.outputs.action == 'register-metadata'
