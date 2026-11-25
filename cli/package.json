@@ -3,6 +3,7 @@
   "version": "0.0.1",
   "type": "module",
   "private": true,
+  "license": "Apache-2.0",
   "scripts": {
     "dev": "bun run ../packages/version/scripts/generate-version.ts --dev && bun run src/index.ts",
     "typecheck": "tsc --noEmit && tsc --noEmit -p tsconfig.test.json",

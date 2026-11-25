@@ -1,6 +1,7 @@
 {
   "name": "magnitude",
   "private": true,
+  "license": "Apache-2.0",
   "packageManager": "bun@1.4.2",
   "workspaces": [
     "cli",
