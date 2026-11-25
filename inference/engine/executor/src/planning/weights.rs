@@ -2222,17 +2222,21 @@ impl ModelLoadPlan {
     /// them as it runs ([`WeightPlacement`]).
     pub fn weight_placement(&self) -> Result<WeightPlacement, String> {
         let overflow = || "weight placement bytes overflow".to_owned();
-        // Each stored tensor once, however many roles or representations
-        // the load gives it (a tied embedding is a table and a head).
+        // Each stored extent once, however many roles or representations
+        // the load gives it (a tied embedding is a table and a head), and
+        // each row range of a stored tensor as its own extent: a fused
+        // tensor bound as slices (Gemma 4's gate‖up experts, each a half of
+        // `ffn_gate_up_exps`) is every slice's bytes, as the bank's records
+        // and the uploads charge them, not its first slice's alone.
         let capacity = self.target.len()
             + self.head().map_or(0, <[WeightPlan]>::len)
             + self.vision.as_ref().map_or(0, Vec::len)
             + self.host_tables.len();
-        let mut counted = fx_set_with_capacity::<(ArtifactComponent, &str)>(capacity);
+        let mut counted = fx_set_with_capacity::<(ArtifactComponent, StoredExtent<'_>)>(capacity);
         let mut stored = 0u64;
         let weights = [self.target.as_slice(), self.head().unwrap_or_default(), self.vision.as_deref().unwrap_or_default()];
         for weight in weights.into_iter().flatten() {
-            if counted.insert((weight.component, weight.descriptor.name.as_str())) {
+            if counted.insert((weight.component, StoredExtent::of(&weight.descriptor))) {
                 let bytes = match weight.holding {
                     Holding::Whole => representation_bytes(weight.source, &weight.shape)?,
                     Holding::Streamed(streamed) => representation_bytes(weight.source, &[streamed.table_rows, weight.table_width()])?,
@@ -2243,7 +2247,7 @@ impl ModelLoadPlan {
         }
         let host = self.bank.as_ref().map_or(Ok(0), super::ExpertBankPlan::host_only_bytes)?;
         for table in &self.host_tables {
-            if counted.insert((table.component, table.descriptor.name.as_str())) {
+            if counted.insert((table.component, StoredExtent::of(&table.descriptor))) {
                 let rows = table.shape[0];
                 stored = representation_bytes(table.source, &[rows, table.columns()])?.checked_add(stored).ok_or_else(overflow)?;
             }
@@ -3637,6 +3641,31 @@ pub struct PerLayerBinding {
     pub activation: Element,
     /// Always a post-norm tail.
     pub tail: SublayerTail,
+}
+
+/// The extent of a stored tensor a weight reads: the tensor's name and
+/// the row ranges it slices (`ImportTransform::Rows`), so the disjoint
+/// slices of one fused tensor are distinct extents whose bytes sum to the
+/// tensor's, and roles reading the same rows (a tied table and head) are
+/// one.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub(crate) struct StoredExtent<'a> {
+    name: &'a str,
+    rows: Vec<(u64, u64)>,
+}
+
+impl<'a> StoredExtent<'a> {
+    pub(crate) fn of(descriptor: &'a WeightDescriptor) -> Self {
+        let rows = descriptor
+            .transforms
+            .iter()
+            .filter_map(|transform| match transform {
+                ImportTransform::Rows(range) => Some((range.start, range.rows)),
+                _ => None,
+            })
+            .collect();
+        Self { name: descriptor.name.as_str(), rows }
+    }
 }
 
 /// A host-resident gathered table (model-family plan §3.7): read by row

@@ -2344,3 +2344,46 @@ fn class_wide_hard_capacities_hold_for_short_prompts_and_chained_head_steps() {
         assert_eq!(used.len(), 15, "15 chained head steps must occupy 15 distinct site/publication slots");
     }
 }
+
+/// Gemma 4 26B-A4B's experts stream through a CUDA bank beside a linked host
+/// tier, as on a 4 GB card: its weight placement's four parts sum to every
+/// byte of the tensors the load reads. Each expert's gate and up are the two
+/// row halves of one stored `ffn_gate_up_exps` tensor; the placement once
+/// counted that tensor by its first half alone, while the bank's records
+/// charge both halves, so the parts outgrew the weights ("a plan's tiers
+/// hold more than its weights") once enough experts left the device.
+#[test]
+fn gemma4_26b_streamed_weight_placement_sums_to_its_stored_tensors() {
+    use magnitude_family_contracts::ModelFamily;
+    let identity = magnitude_artifacts::PackageIdentity { target: ArtifactIdentity([7; 32]), projector: None };
+    let target = magnitude_family_common::headers::target("gemma-4-26b-a4b-it-qat:gguf:q4");
+    let definition = magnitude_family_gemma4::Gemma4Family.inspect(&target, None, identity).unwrap();
+    let manifest = magnitude_artifacts::PackageManifest {
+        identity,
+        target: magnitude_artifacts::ComponentManifest {
+            files: vec![magnitude_artifacts::ComponentFile {
+                path: "gemma-4-26b-a4b-it-qat-q4.gguf".into(),
+                size: target.tensors.iter().map(|tensor| tensor.nbytes).sum(),
+            }],
+            identity: identity.target,
+            tensors: target.tensors.clone(),
+        },
+        projector: None,
+        draft: None,
+    };
+    let backend = seismic::BackendName::Cuda;
+    let selection = crate::ComponentSelection { head: false, vision: false };
+    let resident = ModelLoadPlan::derive(&manifest, &definition, selection, crate::resident_layout(crate::ExecutionPath::Native, backend), crate::PlannedMethod::Plain, crate::planning::fixtures::LIMITS).unwrap();
+    let load = resident.with_expert_bank_at_floor(&definition, cuda(HostTier::Linked)).unwrap();
+    let read = load
+        .target
+        .iter()
+        .map(|weight| weight.descriptor.name.as_str())
+        .chain(load.host_tables.iter().map(|table| table.descriptor.name.as_str()))
+        .collect::<std::collections::BTreeSet<_>>();
+    let stored = target.tensors.iter().filter(|tensor| read.contains(tensor.name.as_str())).map(|tensor| tensor.nbytes).sum::<u64>();
+    let placement = load.weight_placement().unwrap();
+    let crate::WeightPlacement { held, host, streamed, tables } = placement;
+    assert!(streamed + host > 0, "the experts stream: {placement:?}");
+    assert_eq!(held + host + streamed + tables, stored, "{placement:?}");
+}
