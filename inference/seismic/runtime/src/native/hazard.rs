@@ -419,7 +419,7 @@ impl SlabReach {
 
     /// The reaches of the whole view, as [`Self::extend`].
     pub(crate) fn extend_whole(&self, buffer: usize, table: &Allocation, table_offset: u64, reaches: &mut Vec<Reach>) {
-        self.extend(buffer, table, table_offset, 0, self.regions.len() as u64 * self.slab_bytes, reaches);
+        self.extend(buffer, table, table_offset, 0, self.slot_count as u64 * self.slab_bytes, reaches);
     }
 }
 

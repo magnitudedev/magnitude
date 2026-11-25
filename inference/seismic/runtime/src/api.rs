@@ -1226,17 +1226,18 @@ pub mod tensor {
     }
 
     /// What a slab view's binding reaches ([`TensorInner::slab_reach`]): its
-    /// address-table entries and, by address, each slot's slab region
-    /// (allocation, byte offset, bytes), `None` a free slot's.
+    /// address-table entries and, by address, each backed slot's slab region
+    /// `(relative_slot, (allocation, byte_offset, bytes))`, sorted by relative
+    /// slot index.
     pub(crate) struct SlabReach {
         pub(crate) table_bytes: u64,
         /// The bytes of one slab's rows of the view, as its elements lie
         /// in the view: slot `s` holds the view's bytes from `s` of them.
         pub(crate) slab_bytes: u64,
-        pub(crate) regions: Vec<Option<(u64, u64, u64)>>,
-        /// Per slot, the backed slots before it, and last all of them: how
-        /// many of a run of slots are backed is one difference.
-        backed: Vec<usize>,
+        /// Number of slots in this view (`first_slot..first_slot + slot_count`).
+        pub(crate) slot_count: usize,
+        /// Backed slots in `0..slot_count`, sorted by relative slot index.
+        backed: Vec<(usize, (u64, u64, u64))>,
         /// Distinct `Allocation::access_identity()` values of any lent slab
         /// lenders in this view's store (empty when no slabs are lent).
         pub(crate) lender_groups: Box<[usize]>,
@@ -1266,22 +1267,17 @@ pub mod tensor {
         fn new(
             table_bytes: u64,
             slab_bytes: u64,
-            regions: Vec<Option<(u64, u64, u64)>>,
+            slot_count: usize,
+            backed: Vec<(usize, (u64, u64, u64))>,
             lender_groups: Box<[usize]>,
             logical_allocation: u64,
             first_slot: usize,
             lent_region: Option<(u64, u64, u64)>,
         ) -> Self {
-            let backed = std::iter::once(0)
-                .chain(regions.iter().scan(0, |backed, region| {
-                    *backed += usize::from(region.is_some());
-                    Some(*backed)
-                }))
-                .collect();
             Self {
                 table_bytes,
                 slab_bytes,
-                regions,
+                slot_count,
                 backed,
                 lender_groups,
                 logical_allocation,
@@ -1295,9 +1291,15 @@ pub mod tensor {
             slots_holding(self.slab_bytes, offset, bytes)
         }
 
+        /// Number of backed slots in this view.
+        pub(crate) fn backed_count(&self) -> usize {
+            self.backed.len()
+        }
+
         /// Whether any of `slots` is backed.
         pub(crate) fn any_backed(&self, slots: std::ops::Range<usize>) -> bool {
-            self.backed[slots.end] > self.backed[slots.start]
+            let start = self.backed.partition_point(|&(slot, _)| slot < slots.start);
+            self.backed.get(start).is_some_and(|&(slot, _)| slot < slots.end)
         }
 
         #[cfg(test)]
@@ -1308,10 +1310,17 @@ pub mod tensor {
             first_slot: usize,
             lent_region: Option<(u64, u64, u64)>,
         ) -> Self {
+            let slot_count = regions.len();
+            let backed = regions
+                .into_iter()
+                .enumerate()
+                .filter_map(|(slot, region)| region.map(|r| (slot, r)))
+                .collect();
             Self::new(
-                seismic_lang::registry::record_table_entry(regions.len() as u64),
+                seismic_lang::registry::record_table_entry(slot_count as u64),
                 slab_bytes,
-                regions,
+                slot_count,
+                backed,
                 Box::new([]),
                 logical_allocation,
                 first_slot,
@@ -1319,27 +1328,45 @@ pub mod tensor {
             )
         }
 
+        /// The bytes device work reaches in backed slot `slot` for the view's
+        /// bytes `[offset, offset + bytes)`, which it holds some of: the
+        /// slab's bytes that hold them (`Allocation::identity`, range).
+        fn region_bytes(
+            &self,
+            slot: usize,
+            (allocation, start, _): (u64, u64, u64),
+            offset: u64,
+            bytes: u64,
+        ) -> (u64, std::ops::Range<u64>) {
+            let first = slot as u64 * self.slab_bytes;
+            let from = offset.max(first) - first;
+            let to = (offset + bytes).min(first + self.slab_bytes) - first;
+            (allocation, start + from..start + to)
+        }
+
         /// The bytes device work reaches in slot `slot` for the view's bytes
         /// `[offset, offset + bytes)`, which it holds some of: the slab's
         /// bytes that hold them (`Allocation::identity`, range); none for a
         /// free slot.
         fn slot_bytes(&self, slot: usize, offset: u64, bytes: u64) -> Option<(u64, std::ops::Range<u64>)> {
-            let (allocation, start, _) = self.regions[slot]?;
-            let first = slot as u64 * self.slab_bytes;
-            let from = offset.max(first) - first;
-            let to = (offset + bytes).min(first + self.slab_bytes) - first;
-            Some((allocation, start + from..start + to))
+            let index = self.backed.binary_search_by_key(&slot, |&(s, _)| s).ok()?;
+            Some(self.region_bytes(slot, self.backed[index].1, offset, bytes))
         }
 
         /// The bytes device work reaches for the view's bytes `[offset,
-        /// offset + bytes)`: in each slot holding some, the slab's bytes
-        /// that hold them ([`Self::slot_bytes`]); a free slot's none.
+        /// offset + bytes)`: in each backed slot holding some, the slab's
+        /// bytes that hold them ([`Self::region_bytes`]); free slots emit none.
         pub(crate) fn bytes(
             &self,
             offset: u64,
             bytes: u64,
         ) -> impl Iterator<Item = (u64, std::ops::Range<u64>)> + '_ {
-            self.slots(offset, bytes).filter_map(move |slot| self.slot_bytes(slot, offset, bytes))
+            let slots = self.slots(offset, bytes);
+            let start = self.backed.partition_point(|&(slot, _)| slot < slots.start);
+            self.backed[start..]
+                .iter()
+                .take_while(move |&&(slot, _)| slot < slots.end)
+                .map(move |&(slot, region)| self.region_bytes(slot, region, offset, bytes))
         }
     }
 
@@ -1569,6 +1596,7 @@ pub mod tensor {
                     let reach = Arc::new(SlabReach::new(
                         seismic_lang::registry::record_table_entry(self.count as u64),
                         self.slab_bytes,
+                        self.count,
                         self.slots.reach(self.region, self.first, self.count, self.slab_bytes),
                         lender_groups,
                         self.slots.region_identity(self.region),
@@ -1801,7 +1829,7 @@ pub mod tensor {
             match &self.backing {
                 TensorBacking::Plain { .. } => self.byte_len,
                 TensorBacking::Slabs { view, .. } => {
-                    view.reach().regions.iter().flatten().count() as u64 * view.slab_bytes
+                    view.reach().backed_count() as u64 * view.slab_bytes
                 }
             }
         }
@@ -4152,8 +4180,8 @@ pub mod kernel {
                 reach.table_bytes,
                 seismic_lang::registry::record_table_entry(3)
             );
-            assert_eq!(reach.regions.len(), 3);
-            assert_eq!(reach.regions.iter().flatten().count(), 2);
+            assert_eq!(reach.slot_count, 3);
+            assert_eq!(reach.backed_count(), 2);
             assert_eq!(sub.occupied_bytes(), 2 * (4 * 2 * 4));
 
             let img = sub.image().unwrap();
@@ -4166,7 +4194,8 @@ pub mod kernel {
             let empty = sub.slice_leading(4, 4).unwrap();
             let empty_reach = empty.slab_reach().unwrap();
             assert_eq!(empty_reach.table_bytes, 0);
-            assert!(empty_reach.regions.is_empty());
+            assert_eq!(empty_reach.slot_count, 0);
+            assert_eq!(empty_reach.backed_count(), 0);
             assert_eq!(empty.occupied_bytes(), 0);
             let empty_copy = empty.copy_of(&crate::memory::Charges::tally(&device), &empty.image().unwrap()).unwrap();
             assert_eq!(empty_copy.extents(), &[0, 2]);
@@ -4308,7 +4337,7 @@ pub mod kernel {
             // refreshing `logical.slab_reach()`: `return_freed` must still drop the
             // idle pool block back to the store (`tally.held() == absent`).
             let logical = slabs.logical_region(0).unwrap();
-            assert_eq!(logical.slab_reach().unwrap().regions.len(), 4);
+            assert_eq!(logical.slab_reach().unwrap().slot_count, 4);
             for slot in 0..4 {
                 assert!(slabs.free_slab(slot).unwrap());
             }

@@ -1653,7 +1653,15 @@ impl ResourcePlanner {
         // (`memory::ledger::DeviceLedgers::open_state_pools_at`).
         let block = seismic::block_bytes(seismic::BlockSizing { granule, allocations: capacity_bytes.allocations })
             .map_err(|error| format!("the state pool's blocks: {error:?}"))?;
-        let recurrent_granule = recurrent_granule_parts(&target_recurrent)?;
+        let has_history = !target_history.is_empty() || !head_history.is_empty();
+        // Only open a separate recurrent pool when one recurrent bank exceeds
+        // the history pool's granule (or there is no history pool). When tiny
+        // recurrent components (e.g. n-gram conv windows) already fit inside
+        // the history granule, sharing the history pool packs many banks per
+        // slab and avoids a separate absent granule and an oversized address
+        // table.
+        let recurrent_granule = recurrent_granule_parts(&target_recurrent)?
+            .filter(|&recurrent| !has_history || recurrent > granule);
         let recurrent_block = recurrent_granule
             .map(|granule| {
                 seismic::block_bytes(seismic::BlockSizing { granule, allocations: capacity_bytes.allocations })
@@ -1709,7 +1717,15 @@ impl ResourcePlanner {
         let retention_entries = if retained_entry_bytes == 0 {
             0
         } else if recurrent_bank_bytes != 0 {
-            usize::try_from(capacity_bytes.domain_bytes / recurrent_bank_bytes)
+            // Every distinct retained entry owns its recurrent bank, its
+            // checkpoint window rows, and (when the model stores history) at
+            // least one unique terminal history row in the prefix trie.
+            let min_entry_bytes = recurrent_bank_bytes
+                .checked_add(checkpoint_history_row_bytes)
+                .and_then(|bytes| bytes.checked_add(checkpoint_window_bytes))
+                .ok_or("minimum retained entry byte count overflow")?
+                .max(1);
+            usize::try_from(capacity_bytes.domain_bytes / min_entry_bytes)
                 .unwrap_or(usize::MAX)
                 .max(1)
         } else {
@@ -1822,10 +1838,14 @@ impl ResourcePlanner {
         let startup_history_slabs = request_slot_bytes
             .checked_sub(startup_bank_slabs)
             .ok_or("request slot bytes below startup bank slabs")?;
-        let startup_total_slabs = target_state
-            .slab_charge(startup_history_slabs)?
-            .checked_add(target_state.recurrent_slab_charge(startup_bank_slabs)?)
-            .ok_or("startup state slab charge overflows")?;
+        let startup_total_slabs = if target_state.recurrent_granule.is_some() {
+            target_state
+                .slab_charge(startup_history_slabs)?
+                .checked_add(target_state.recurrent_slab_charge(startup_bank_slabs)?)
+                .ok_or("startup state slab charge overflows")?
+        } else {
+            target_state.slab_charge(request_slot_bytes)?
+        };
         let history = startup_total_slabs
             .checked_add(tables)
             .and_then(|committed| committed.checked_add(target_state.absent_bytes()))
@@ -1847,10 +1867,20 @@ impl ResourcePlanner {
             workload_history_slabs = workload_history_slabs.checked_add(slabs).ok_or("state fit charge overflows")?;
         }
         let bank_slabs = target_state.bank_slab_bytes_at_count(assessment::conversation_banks(limits)?)?;
-        let workload_state_bytes = target_state
-            .slab_charge(workload_history_slabs)?
-            .checked_add(target_state.recurrent_slab_charge(bank_slabs)?)
-            .and_then(|committed| committed.checked_add(tables))
+        let workload_slabs = if target_state.recurrent_granule.is_some() {
+            target_state
+                .slab_charge(workload_history_slabs)?
+                .checked_add(target_state.recurrent_slab_charge(bank_slabs)?)
+                .ok_or("state fit charge overflows")?
+        } else {
+            target_state.slab_charge(
+                workload_history_slabs
+                    .checked_add(bank_slabs)
+                    .ok_or("state fit charge overflows")?,
+            )?
+        };
+        let workload_state_bytes = workload_slabs
+            .checked_add(tables)
             .and_then(|committed| committed.checked_add(target_state.absent_bytes()))
             .ok_or("state fit charge overflows")?;
         let capacity = StateCapacityPlan {
@@ -2939,6 +2969,135 @@ mod slab_plan_tests {
         // Growing from 1 floor decode flight to 8 total places adds only the
         // chained once-stage graphs, never 7 phantom copies of pinned decode graphs.
         assert_eq!(added_graphs, chained_extra);
+    }
+
+    #[test]
+    fn tiny_recurrent_bank_shares_history_pool_and_bounds_address_table() {
+        // DeepSeek-V4.1-Flash-like hybrid: 40 MLA-sized KV layers (~46 KiB/row)
+        // plus 2 Engram conv-window components (2 * 8 * u32 = 64 B total) on a
+        // 128 GiB domain.
+        let history_components: Vec<ComponentDescriptor> = (0..40)
+            .map(|layer| {
+                ComponentDescriptor::new(
+                    LayerRef::Target(layer),
+                    KvCodec::Dense.spec(DType::BF16, 1, 576),
+                    1,
+                )
+                .unwrap()
+            })
+            .collect();
+        let target_history = vec![HistoryDomainLayout::Token {
+            components: history_components,
+        }];
+        let row_bytes = target_history[0].row_bytes().unwrap();
+        let target_recurrent = vec![
+            ComponentSpec { shape: vec![8], dtype: DType::U32 },
+            ComponentSpec { shape: vec![8], dtype: DType::U32 },
+        ];
+        let domain_bytes = 128u64 << 30;
+        let capacity = ResourceCapacity {
+            domain_bytes,
+            tensor_operations: TensorOperations::Absent,
+            allocations: seismic::NativeAllocations::EXACT,
+        };
+        let planned = ResourcePlanner::plan_state_from_layout(
+            target_history.clone(),
+            target_recurrent.clone(),
+            Vec::new(),
+            131_072,
+            PlannedMethod::Plain,
+            crate::planning::fixtures::LIMITS,
+            capacity,
+            None,
+        )
+        .unwrap();
+        let ts = &planned.target_state;
+        // Tiny 64 B recurrent bank fits inside the history granule, so it shares
+        // the history pool instead of opening a 512 B recurrent pool.
+        assert_eq!(ts.recurrent_granule, None);
+        assert_eq!(ts.recurrent_block, None);
+        assert!(ts.granule >= 1 << 20, "expected MiB-scale history granule, got {}", ts.granule);
+        assert!(
+            ts.bank_slab_banks().unwrap() >= 1024,
+            "expected thousands of tiny banks per shared slab, got {}",
+            ts.bank_slab_banks().unwrap()
+        );
+        // Each retained entry holds its recurrent bank plus at least one unique
+        // terminal history row, not just 64 B.
+        assert_eq!(
+            planned.capacity.retention_entries,
+            usize::try_from(domain_bytes / (64 + row_bytes)).unwrap(),
+        );
+        let bank_layout = ts.bank_slab_layout().unwrap().unwrap();
+        assert!(
+            bank_layout.address_table_bytes < 64 << 10,
+            "recurrent address table must be kilobytes, not gigabytes: {} B",
+            bank_layout.address_table_bytes,
+        );
+        // Allocates cleanly in a single shared history pool and matches the plan.
+        let device = crate::test_support::open_backend(&seismic::Devices::discover(&[]).unwrap(), BackendName::Cpu).unwrap();
+        let charges = seismic::Charges::tally(&device);
+        let history_pool = seismic::Pool::open(
+            &seismic::PoolCharges::one(&charges),
+            seismic::Contract::DeviceOnly,
+            ts.granule,
+            ts.block.bytes,
+        )
+        .unwrap();
+        let bindings = ts
+            .allocate(
+                &charges,
+                magnitude_state::StatePools {
+                    history: history_pool,
+                    recurrent: None,
+                },
+            )
+            .unwrap();
+        assert_eq!(bindings.committed_bytes(), ts.initial_committed_bytes().unwrap());
+        let (workload, startup) = ResourcePlanner::state_bytes_from_layout(
+            &target_history,
+            &target_recurrent,
+            &[],
+            131_072,
+            PlannedMethod::Plain,
+            crate::planning::fixtures::LIMITS,
+            capacity,
+            None,
+        )
+        .unwrap();
+        assert_eq!(workload, planned.capacity.workload_state_bytes);
+        assert_eq!(startup, startup_state_bytes(planned.history_bytes, planned.recurrent_banks_bytes).unwrap());
+    }
+
+    #[test]
+    fn pure_recurrent_model_keeps_separate_pool_and_bounds_retention() {
+        let bank_bytes = 16u64 << 20;
+        let target_recurrent = vec![ComponentSpec {
+            shape: vec![(bank_bytes / 4) as usize],
+            dtype: DType::F32,
+        }];
+        let domain_bytes = 128u64 << 30;
+        let planned = ResourcePlanner::plan_state_from_layout(
+            Vec::new(),
+            target_recurrent,
+            Vec::new(),
+            131_072,
+            PlannedMethod::Plain,
+            crate::planning::fixtures::LIMITS,
+            ResourceCapacity {
+                domain_bytes,
+                tensor_operations: TensorOperations::Absent,
+                allocations: seismic::NativeAllocations::EXACT,
+            },
+            None,
+        )
+        .unwrap();
+        let ts = &planned.target_state;
+        assert_eq!(ts.recurrent_granule, Some(bank_bytes));
+        assert_eq!(ts.bank_slab_banks().unwrap(), 1);
+        assert_eq!(planned.capacity.retention_entries, usize::try_from(domain_bytes / bank_bytes).unwrap());
+        let bank_layout = ts.bank_slab_layout().unwrap().unwrap();
+        assert!(bank_layout.address_table_bytes < 1 << 20);
     }
 }
 

@@ -53,7 +53,7 @@ use seismic_compiler::errors::ExecutionError;
 use seismic_lang::ids::RepresentationId;
 use seismic_memory::pool::{BlockId, Blocks, Claimed, Fence, GranuleId, GranulePool, Move};
 use seismic_topology::Contract;
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeMap, HashMap};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard, Weak};
 
@@ -1047,36 +1047,25 @@ impl Slab {
     }
 }
 
-/// The store's slot table and its ordered set of backed slot indices, kept in
-/// lockstep so `backed()` is O(backed) and `backed_count()` is O(1) instead of
-/// scanning all `capacity` slots.
+/// The store's backed slabs keyed by slot index: O(backed) memory and
+/// O(backed) ordered iteration instead of allocating or scanning all
+/// `capacity` slots.
 #[derive(Default)]
 struct Slabs {
-    slots: Vec<Option<Slab>>,
-    backed: BTreeSet<usize>,
+    slots: BTreeMap<usize, Slab>,
 }
 
 impl Slabs {
-    fn from_slots(slots: Vec<Option<Slab>>) -> Self {
-        let backed = slots
-            .iter()
-            .enumerate()
-            .filter_map(|(slot, slab)| slab.as_ref().map(|_| slot))
-            .collect();
-        Self { slots, backed }
+    fn from_map(slots: BTreeMap<usize, Slab>) -> Self {
+        Self { slots }
     }
 
     fn insert(&mut self, slot: usize, slab: Slab) {
-        self.slots[slot] = Some(slab);
-        self.backed.insert(slot);
+        self.slots.insert(slot, slab);
     }
 
     fn take(&mut self, slot: usize) -> Option<Slab> {
-        let slab = self.slots[slot].take();
-        if slab.is_some() {
-            self.backed.remove(&slot);
-        }
-        slab
+        self.slots.remove(&slot)
     }
 }
 
@@ -1300,7 +1289,7 @@ impl Slots {
     /// Whether `slot` is currently backed by a slab, without creating a view
     /// or touching any driver state.
     pub(crate) fn is_backed(&self, slot: usize) -> bool {
-        self.slabs().slots.get(slot).is_some_and(Option::is_some)
+        self.slabs().slots.contains_key(&slot)
     }
 
     /// A view of region `region` of slot `slot`'s slab as `representation`
@@ -1323,7 +1312,7 @@ impl Slots {
     ) -> Result<Option<TensorInner>, TensorError> {
         let (allocation, offset, hold) = {
             let mut slabs = self.slabs();
-            let Some(Some(slab)) = slabs.slots.get_mut(slot) else {
+            let Some(slab) = slabs.slots.get_mut(&slot) else {
                 return Ok(None);
             };
             slab.views = slab.views.wrapping_add(1);
@@ -1349,24 +1338,24 @@ impl Slots {
             .collect()
     }
 
-    /// Where region `region` of each slot in `first..first + count` lies now
-    /// (`Allocation::identity`, byte offset, `bytes`), `None` a free slot's:
-    /// what device work bound to a view of those slots reaches, without
-    /// keeping a removed slab's pool block alive inside a cached reach.
+    /// Where region `region` of each backed slot in `first..first + count` lies
+    /// now as `(slot - first, (Allocation::identity, byte offset, bytes))`,
+    /// sorted by relative slot index: what device work bound to a view of those
+    /// slots reaches, in O(backed) time and space without keeping a removed
+    /// slab's pool block alive inside a cached reach.
     pub(crate) fn reach(
         &self,
         region: usize,
         first: usize,
         count: usize,
         bytes: u64,
-    ) -> Vec<Option<(u64, u64, u64)>> {
-        self.slabs().slots[first..first + count]
-            .iter()
-            .map(|slab| {
-                slab.as_ref().map(|slab| {
-                    let (allocation, offset) = &slab.regions[region];
-                    (allocation.identity(), *offset, bytes)
-                })
+    ) -> Vec<(usize, (u64, u64, u64))> {
+        self.slabs()
+            .slots
+            .range(first..first + count)
+            .map(|(&slot, slab)| {
+                let (allocation, offset) = &slab.regions[region];
+                (slot - first, (allocation.identity(), *offset, bytes))
             })
             .collect()
     }
@@ -1397,8 +1386,8 @@ impl Slots {
             let slabs = self.slabs();
             moved
                 .iter()
-                .map(|moved| match slabs.slots.get(moved.holder.slot) {
-                    Some(Some(slab)) if slab.granule() == Some(moved.from) => {
+                .map(|moved| match slabs.slots.get(&moved.holder.slot) {
+                    Some(slab) if slab.granule() == Some(moved.from) => {
                         match Arc::strong_count(&slab.hold) > 1 {
                             true => (Adopted::Viewed, 0),
                             false => (Adopted::Moved, slab.views),
@@ -1471,8 +1460,8 @@ impl Slots {
             for (&i, (_, to)) in moving.iter().zip(blocks) {
                 let m = &moved[i];
                 let untouched = matches!(
-                    slabs.slots.get(m.holder.slot),
-                    Some(Some(slab))
+                    slabs.slots.get(&m.holder.slot),
+                    Some(slab)
                         if slab.granule() == Some(m.from)
                             && slab.views == recorded_views[i]
                             && Arc::strong_count(&slab.hold) == 1
@@ -1489,7 +1478,7 @@ impl Slots {
                         }),
                     );
                     let old_slab = std::mem::replace(
-                        slabs.slots[m.holder.slot].as_mut().expect("checked above"),
+                        slabs.slots.get_mut(&m.holder.slot).expect("checked above"),
                         new_slab,
                     );
                     previous.push((m.holder.slot, old_slab));
@@ -1532,7 +1521,7 @@ impl Slots {
                     let mut slabs = self.slots.slabs();
                     let rolled_back: Vec<Option<Slab>> = previous
                         .into_iter()
-                        .map(|(slot, old)| slabs.slots[slot].replace(old))
+                        .map(|(slot, old)| slabs.slots.insert(slot, old))
                         .collect();
                     self.slots.generation.fetch_add(1, Ordering::AcqRel);
                     rolled_back
@@ -1636,7 +1625,13 @@ impl Slots {
             lent_regions: Vec::new(),
             generation: AtomicU64::new(0),
             mutate: Mutex::new(()),
-            slabs: Mutex::new(Slabs::from_slots(slabs)),
+            slabs: Mutex::new(Slabs::from_map(
+                slabs
+                    .into_iter()
+                    .enumerate()
+                    .filter_map(|(slot, slab)| slab.map(|slab| (slot, slab)))
+                    .collect(),
+            )),
             repointed: Mutex::new(None),
             device_repoints: AtomicU64::new(0),
         }))
@@ -1710,7 +1705,7 @@ impl SlabStore {
         charges.of_device(device);
         let id = crate::driver::fresh_allocation_identity();
         let capacity = geometry.capacity;
-        let mut slabs = (0..capacity).map(|_| None).collect::<Vec<Option<Slab>>>();
+        let mut slabs = BTreeMap::new();
         let lent_slabs = match lent {
             [] => 0,
             lent if lent.len() != geometry.regions.len() => {
@@ -1747,7 +1742,7 @@ impl SlabStore {
                 let count = usize::try_from(count.unwrap_or(0)).ok().filter(|&count| (1..=capacity).contains(&count)).ok_or_else(|| {
                     refused(format!("a store lends from one slab up to its {capacity} slots"))
                 })?;
-                for (slot, slab) in slabs.iter_mut().enumerate().take(count) {
+                for slot in 0..count {
                     let regions = lent
                         .iter()
                         .zip(&geometry.regions)
@@ -1757,7 +1752,7 @@ impl SlabStore {
                             Ok::<_, TensorError>((tensor.allocation().clone(), tensor.byte_offset() + slot as u64 * bytes))
                         })
                         .collect::<Result<Vec<_>, _>>()?;
-                    *slab = Some(Slab::new(regions, Arc::new(SlabHold { store: id, slot, granule: None, adopt: None })));
+                    slabs.insert(slot, Slab::new(regions, Arc::new(SlabHold { store: id, slot, granule: None, adopt: None })));
                 }
                 count
             }
@@ -1810,7 +1805,7 @@ impl SlabStore {
         let words = seismic_lang::registry::record_table((0..slots.offsets.len()).flat_map(|region| {
             let slots = &slots;
             let slabs = &slabs;
-            (0..capacity).map(move |slot| match &slabs[slot] {
+            (0..capacity).map(move |slot| match slabs.get(&slot) {
                 Some(slab) => {
                     let (allocation, offset) = &slab.regions[region];
                     slots.device.allocation_address(allocation, *offset)
@@ -1820,7 +1815,7 @@ impl SlabStore {
         }));
         // Fresh: nothing uses it yet.
         slots.table.storage().write(0, &words)?;
-        *slots.slabs() = Slabs::from_slots(slabs);
+        *slots.slabs() = Slabs::from_map(slabs);
         shared.state().stores.insert(slots.id, Arc::downgrade(&slots));
         let aliases = (0..geometry.regions.len()).map(|_| crate::driver::fresh_allocation_identity()).collect();
         Ok(Self { slots, geometry, aliases })
@@ -1837,12 +1832,12 @@ impl SlabStore {
 
     /// The backed slots, in order.
     pub fn backed(&self) -> Vec<usize> {
-        self.slots.slabs().backed.iter().copied().collect()
+        self.slots.slabs().slots.keys().copied().collect()
     }
 
     /// The number of backed slots, without allocating.
     pub fn backed_count(&self) -> usize {
-        self.slots.slabs().backed.len()
+        self.slots.slabs().slots.len()
     }
 
     /// Whether `slot` is backed by a slab, without creating a view or
@@ -1954,12 +1949,8 @@ impl SlabStore {
         let _mutate = slots.mutate();
         let free_slots: Vec<usize> = {
             let slabs = slots.slabs();
-            slabs
-                .slots
-                .iter()
-                .enumerate()
-                .skip(start_slot)
-                .filter_map(|(slot, slab)| slab.is_none().then_some(slot))
+            (start_slot..slots.capacity)
+                .filter(|slot| !slabs.slots.contains_key(slot))
                 .take(count)
                 .collect()
         };
@@ -2081,7 +2072,7 @@ impl SlabStore {
             return Err(TensorError::SlabLayout(format!("slab {slot} is lent, never freed")));
         }
         let _mutate = slots.mutate();
-        let present = slots.slabs().slots.get(slot).is_some_and(Option::is_some);
+        let present = slots.slabs().slots.contains_key(&slot);
         if !present {
             return Ok(false);
         }
@@ -2865,7 +2856,7 @@ mod tests {
         })));
         {
             let mut guard = slabs.slots.slabs();
-            let slab = guard.slots[0].as_mut().unwrap();
+            let slab = guard.slots.get_mut(&0).unwrap();
             Arc::get_mut(&mut slab.hold).expect("unique slab hold").adopt = Some(fence);
         }
 
@@ -2966,7 +2957,7 @@ mod tests {
         })));
         {
             let mut guard = slabs.slots.slabs();
-            let slab = guard.slots[0].as_mut().unwrap();
+            let slab = guard.slots.get_mut(&0).unwrap();
             Arc::get_mut(&mut slab.hold).expect("unique slab hold").adopt = Some(fence.clone());
         }
         pool.0.state().pending_adopts.push(fence);
@@ -3020,8 +3011,8 @@ mod tests {
         let fence_err = Arc::new(AdoptFence::pending());
         {
             let mut guard = slabs.slots.slabs();
-            Arc::get_mut(&mut guard.slots[0].as_mut().unwrap().hold).expect("unique slab hold").adopt = Some(fence_ok.clone());
-            Arc::get_mut(&mut guard.slots[1].as_mut().unwrap().hold).expect("unique slab hold").adopt = Some(fence_err.clone());
+            Arc::get_mut(&mut guard.slots.get_mut(&0).unwrap().hold).expect("unique slab hold").adopt = Some(fence_ok.clone());
+            Arc::get_mut(&mut guard.slots.get_mut(&1).unwrap().hold).expect("unique slab hold").adopt = Some(fence_err.clone());
         }
 
         let (view0, view1) = {
