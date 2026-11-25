@@ -53,6 +53,10 @@ fn device(error: impl ToString) -> SubmitError {
     SubmitError::Device(DeviceError::Execution(error.to_string()))
 }
 
+fn device_call(error: seismic::CallError) -> SubmitError {
+    SubmitError::Device(DeviceError::from_call(error))
+}
+
 /// Host tokens as entry input rows: the `sample_rows` result layout
 /// (token, status), status 0.
 fn token_rows(tokens: &[i32]) -> Vec<u8> {
@@ -95,7 +99,7 @@ fn step_bytes(step: u64, front: u32) -> Vec<u8> {
 /// the caller regains the storage the runs use. The first failure is reported.
 fn wait_all(completions: Vec<NativeGraphCompletion>) -> Result<(), SubmitError> {
     completions.into_iter().fold(Ok(()), |outcome, completion| {
-        outcome.and(completion.wait().map_err(device))
+        outcome.and(completion.wait().map_err(device_call))
     })
 }
 
@@ -408,7 +412,7 @@ impl<'p> StepSubmitter<'p> {
     /// records are not leaked, settle decode DMA landings safely by their
     /// `ComputeUse` state, and abandon the stored-table steps of runs never
     /// submitted (whose landed reads drop unsubmitted).
-    fn abandon_unsubmitted(self, drained: bool) {
+    fn abandon_unsubmitted(self, drained: bool, error: &SubmitError) {
         self.decode_landings.abandon(
             drained,
             |bank, landing| bank.complete_decode_landing(landing),
@@ -417,10 +421,17 @@ impl<'p> StepSubmitter<'p> {
         );
         drop(self.pending_prefill_dma);
         for read in self.reads {
+            if !drained {
+                read.table.abort(error.to_string());
+            }
             read.table.retire(read.value);
         }
         for read in self.pending_reads {
-            let _ = read.table.abandon(read.value);
+            if drained {
+                let _ = read.table.abandon(read.value);
+            } else {
+                read.table.abort(error.to_string());
+            }
         }
     }
 
@@ -465,8 +476,8 @@ impl<'p> StepSubmitter<'p> {
         // are dropped unsubmitted, and their stored-table steps
         // read nothing.
         let remaining_drained = wait_all(std::mem::take(&mut self.completions)).is_ok();
-        let drained = !self.wait_failed && remaining_drained;
-        self.abandon_unsubmitted(drained);
+        let drained = !self.wait_failed && remaining_drained && !error.is_device_lost();
+        self.abandon_unsubmitted(drained, &error);
         // The device is past the chain's runs: each step is refused,
         // none fed, as no run of the chain's is known to have written
         // its records. A watcher that panicked fails the load.
@@ -516,8 +527,8 @@ impl<'p> StepSubmitter<'p> {
         register: impl FnOnce(&NativeGraphOutputs),
     ) -> Result<(NativeGraphOutputs, Option<seismic::NativeSpans>), SubmitError> {
         let (outputs, spans) = match sampled {
-            true => ready.queue_sampled(&mut self.sequence).map(|(outputs, spans)| (outputs, Some(spans))).map_err(device)?,
-            false => (ready.queue(&mut self.sequence).map_err(device)?, None),
+            true => ready.queue_sampled(&mut self.sequence).map(|(outputs, spans)| (outputs, Some(spans))).map_err(device_call)?,
+            false => (ready.queue(&mut self.sequence).map_err(device_call)?, None),
         };
         register(&outputs);
         (self.queued_reads, self.queued_landed) = (self.pending_reads.len(), self.pending_landed.len());
@@ -549,9 +560,9 @@ impl<'p> StepSubmitter<'p> {
             return self.queue(ready, register).map(drop);
         }
         let mut sequence = self.device.native_sequence(NativeQueue::Fill);
-        let outputs = ready.queue(&mut sequence).map_err(device)?;
+        let outputs = ready.queue(&mut sequence).map_err(device_call)?;
         register(&outputs);
-        self.completions.push(sequence.submit().map_err(device)?);
+        self.completions.push(sequence.submit().map_err(device_call)?);
         Ok(())
     }
 
@@ -680,7 +691,7 @@ impl<'p> StepSubmitter<'p> {
         let sequence = std::mem::replace(&mut self.sequence, self.device.native_sequence(NativeQueue::Compute));
         self.queued = 0;
         if !sequence.is_empty() {
-            let completion = sequence.submit().map_err(device)?;
+            let completion = sequence.submit().map_err(device_call)?;
             if completion.has_issue_failure() {
                 // Encoding failed partway through this sequence (so trailing
                 // graphs such as `Front`'s `routed_scratch_request` were never

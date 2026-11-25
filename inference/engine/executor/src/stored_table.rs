@@ -60,7 +60,7 @@ use seismic::Element;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 use std::sync::mpsc;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Condvar, Mutex};
+use std::sync::{Arc, Condvar, Mutex, OnceLock};
 use std::thread::JoinHandle;
 use std::time::Duration;
 
@@ -568,6 +568,10 @@ struct Shared {
     /// The last step the filler took, and the last whose gate it opened.
     taken: AtomicU64,
     opened: AtomicU64,
+    /// Set once the device is lost or failed to drain: every pending or future
+    /// `queue`, `abandon`, and filler wait fails immediately instead of
+    /// waiting `SLOT_WAIT` for a dead device to advance `read`.
+    aborted: OnceLock<String>,
     kept: Option<KeptRows>,
 }
 
@@ -688,6 +692,7 @@ impl StoredTable {
             waits: Mutex::new(TableWaits::default()),
             taken: AtomicU64::new(0),
             opened: AtomicU64::new(0),
+            aborted: OnceLock::new(),
             kept,
         });
         // The directory starts with every entry empty.
@@ -856,6 +861,9 @@ impl StoredTable {
     /// names: its timeline bindings. The step's gate opens once its rows
     /// are in their slots, after every step queued before it.
     pub fn queue(&self, rows: StepRows) -> Result<StoredStep, String> {
+        if let Some(reason) = self.shared.aborted.get() {
+            return Err(format!("the stored table was aborted: {reason}"));
+        }
         let mut queued = self.queued.lock().expect("stored table queue lock");
         let step = *queued + 1;
         {
@@ -874,10 +882,26 @@ impl StoredTable {
         })
     }
 
+    /// Mark the table's device as lost or undrained: every pending or future
+    /// `queue`, `abandon`, and filler wait fails immediately instead of
+    /// waiting `SLOT_WAIT` for a dead device to advance the `read` timeline.
+    pub fn abort(&self, reason: impl Into<String>) {
+        let _ = self.shared.aborted.set(reason.into());
+        // Wake any filler or waiter blocked on `self.shared.read.wait(...)`
+        // for a device that will never signal again.
+        let step = *self.queued.lock().expect("stored table queue lock");
+        if step > 0 {
+            let _ = self.shared.read.reach(step);
+        }
+    }
+
     /// Step `value` was queued but will never run: its read is done once
     /// every step before it has read. Precondition: no step queued after it
     /// has been submitted.
     pub fn abandon(&self, value: u64) -> Result<(), String> {
+        if let Some(reason) = self.shared.aborted.get() {
+            return Err(format!("the stored table was aborted: {reason}"));
+        }
         // The filler opens the gate of every step it takes; the device
         // raises the read timeline as every step up to a value has read, and
         // with none of them pending the host raises it in the device's place
@@ -885,6 +909,9 @@ impl StoredTable {
         let lost = |error: seismic::ExecutionError| format!("an abandoned stored-table step's predecessors: {error}");
         let taken = self.shared.gate.wait_signalled(value, SLOT_WAIT).map_err(lost)?
             && self.shared.read.wait(value.saturating_sub(1), SLOT_WAIT).map_err(lost)?;
+        if let Some(reason) = self.shared.aborted.get() {
+            return Err(format!("the stored table was aborted: {reason}"));
+        }
         if !taken {
             return Err("an abandoned stored-table step's predecessors did not read".into());
         }
@@ -997,6 +1024,15 @@ impl Shared {
     /// Step `step`: hold its rows, then open its gate.
     fn fill_step(&self, Job { step, rows }: Job) {
         self.taken.store(step, Ordering::SeqCst);
+        if let Some(reason) = self.aborted.get() {
+            self.failures
+                .lock()
+                .expect("stored table failures lock")
+                .insert(step, StepFailure::every(format!("the stored table was aborted: {reason}")));
+            let _ = self.gate.signal(step);
+            self.opened.store(step, Ordering::SeqCst);
+            return;
+        }
         let selected = matches!(rows, StepRows::Selected(_));
         let failure = match rows {
             StepRows::Known(rows) => Ok(rows),
@@ -1209,6 +1245,9 @@ impl Shared {
                     .ok_or("a step names more rows than the table has slots")?;
                 drop(state);
                 let waited = self.read.wait(oldest, SLOT_WAIT).map_err(|error| format!("the stored table's reads: {error}"))?;
+                if let Some(reason) = self.aborted.get() {
+                    return Err(format!("the stored table was aborted: {reason}"));
+                }
                 state = self.state.lock().expect("stored table lock");
                 if !waited {
                     return Err("no slot of the stored table came free".into());
@@ -1240,6 +1279,9 @@ impl Shared {
             if step > 1 {
                 drop(state);
                 let waited = self.read.wait(step - 1, SLOT_WAIT).map_err(|error| format!("the stored table's reads: {error}"))?;
+                if let Some(reason) = self.aborted.get() {
+                    return Err(format!("the stored table was aborted: {reason}"));
+                }
                 state = self.state.lock().expect("stored table lock");
                 if !waited {
                     return Err("the stored table's directory could not be rebuilt".into());
@@ -1954,6 +1996,32 @@ mod tests {
             assert_eq!(found(&table, row), Some(slot_row(row)));
         }
         read_done(&next);
+        drop(table);
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn abort_unblocks_filler_and_abandon_without_waiting_slot_wait() {
+        let (path, table) = table("aborted-device-lost", 4, DirectoryForm::Hashed);
+        let first = table.queue(StepRows::Known(vec![vec![1, 2, 3, 4]])).unwrap();
+        assert!(first.gate.wait_signalled(first.value, Duration::from_secs(10)).unwrap());
+        // Step 2 blocks the filler on `read.wait(1, SLOT_WAIT)` because step 1
+        // never signals `read` (simulating a dead GPU context / DeviceLost).
+        let second = table.queue(StepRows::Known(vec![vec![5]])).unwrap();
+        assert!(!second.gate.wait_signalled(second.value, Duration::from_millis(50)).unwrap());
+        let start = std::time::Instant::now();
+        table.abort("CUDA_ERROR_ILLEGAL_ADDRESS");
+        // Both the blocked filler and `abandon` return immediately rather than
+        // stalling for `SLOT_WAIT` (60s).
+        assert!(second.gate.wait_signalled(second.value, Duration::from_secs(2)).unwrap());
+        let abandoned = table.abandon(second.value);
+        assert!(abandoned.is_err(), "abandon after abort must fail immediately");
+        assert!(
+            start.elapsed() < Duration::from_secs(2),
+            "abort + abandon must not stall for SLOT_WAIT: {:?}",
+            start.elapsed()
+        );
+        assert!(table.queue(StepRows::Known(vec![vec![6]])).is_err());
         drop(table);
         std::fs::remove_file(path).unwrap();
     }

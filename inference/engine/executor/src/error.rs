@@ -10,6 +10,27 @@ pub enum DeviceError {
     Transfer(String),
 }
 
+impl DeviceError {
+    /// Classify a seismic call failure, preserving terminal device loss as
+    /// [`Self::Lost`].
+    pub fn from_call(error: seismic::CallError) -> Self {
+        fn is_lost(error: &seismic::CallError) -> bool {
+            match error {
+                seismic::CallError::Execution(seismic::ExecutionError::DeviceLost(_)) => true,
+                seismic::CallError::Unfenced { issue, fence } => {
+                    matches!(fence, seismic::ExecutionError::DeviceLost(_)) || is_lost(issue)
+                }
+                _ => false,
+            }
+        }
+        if is_lost(&error) {
+            Self::Lost(error.to_string())
+        } else {
+            Self::Execution(error.to_string())
+        }
+    }
+}
+
 impl fmt::Display for DeviceError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
@@ -261,6 +282,13 @@ impl error::Error for InvariantError {}
 pub enum SubmitError {
     Device(DeviceError),
     Invariant(InvariantError),
+}
+
+impl SubmitError {
+    /// Whether the failure is a terminal device loss (dead GPU context).
+    pub fn is_device_lost(&self) -> bool {
+        matches!(self, Self::Device(DeviceError::Lost(_)))
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
