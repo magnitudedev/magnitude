@@ -18,12 +18,16 @@ void vision_linear() {
     const uint n = uint(SEISMIC_DIM_N), k = uint(SEISMIC_DIM_K);
     const projection_prologue in_ = projection_plain(ACTIVATION_A, SEISMIC_PTR(SEISMIC_BUFFER_X), SEISMIC_X_STRIDE_0, 1ul,
         k, 0ul);
+    const bool biased = SEISMIC_DIM_NB == 1;
+    const bool has_residual = SEISMIC_DIM_NR == 1;
+    const bool has_gate = SEISMIC_DIM_NG == 1;
     const bool clamped = SEISMIC_DIM_NC == 1;
     const vision_epilogue out_ = vision_linear_epilogue(ACTIVATION_A, int(SEISMIC_PARAM_ACTIVATION),
-        SEISMIC_RESULT_0_OUT, SEISMIC_RESULT_0_STRIDE_0, SEISMIC_DIM_NB == 1,
-        SEISMIC_PTR(SEISMIC_BUFFER_BIAS), BIAS_KIND, SEISMIC_PTR(SEISMIC_BUFFER_RESIDUAL),
-        SEISMIC_RESIDUAL_STRIDE_1, SEISMIC_PTR(SEISMIC_BUFFER_GATE),
-        SEISMIC_GATE_STRIDE_1, clamped,
+        SEISMIC_RESULT_0_OUT, SEISMIC_RESULT_0_STRIDE_0, biased,
+        biased ? SEISMIC_PTR(SEISMIC_BUFFER_BIAS) : 0ul, BIAS_KIND,
+        has_residual, has_residual ? SEISMIC_PTR(SEISMIC_BUFFER_RESIDUAL) : 0ul, SEISMIC_RESIDUAL_STRIDE_1,
+        has_gate, has_gate ? SEISMIC_PTR(SEISMIC_BUFFER_GATE) : 0ul, SEISMIC_GATE_STRIDE_1,
+        clamped,
         clamped ? element_f32_at(SEISMIC_PTR(SEISMIC_BUFFER_MINIMUM)) : 0.0,
         clamped ? element_f32_at(SEISMIC_PTR(SEISMIC_BUFFER_MAXIMUM)) : 0.0);
     const projection_weights w = vision_weights(SEISMIC_PTR(SEISMIC_BUFFER_WEIGHT), PACKETS_W0_ROWS, k);

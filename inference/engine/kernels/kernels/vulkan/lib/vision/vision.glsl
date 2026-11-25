@@ -94,9 +94,11 @@ struct vision_epilogue {
     bool biased;
     uint64_t bias;
     int bias_kind;
-    uint64_t residual;      // Linear: F32 rows or 0; Stem: the F32 partial or 0
+    bool has_residual;
+    uint64_t residual;      // Linear: F32 rows; Stem: the F32 partial
     uint64_t residual0;     // their row stride, in elements
-    uint64_t gate;          // Linear: A rows or 0
+    bool has_gate;          // Linear
+    uint64_t gate;          // Linear: A rows
     uint64_t gate0;         // their row stride, in elements
     bool clamped;           // Linear
     float minimum;
@@ -108,17 +110,17 @@ struct vision_epilogue {
 };
 
 vision_epilogue vision_linear_epilogue(const int act, int activation, Out y, uint64_t y0,
-    bool biased, uint64_t bias, const int bias_kind, uint64_t residual, uint64_t residual0, uint64_t gate,
-    uint64_t gate0, bool clamped, float minimum, float maximum) {
-    return vision_epilogue(VISION_LINEAR, act, activation, y, y0, biased, bias, bias_kind, residual,
-        residual0, gate, gate0, clamped, minimum, maximum, 0ul, ELEMENT_F32, 0ul, 0ul);
+    bool biased, uint64_t bias, const int bias_kind, bool has_residual, uint64_t residual, uint64_t residual0,
+    bool has_gate, uint64_t gate, uint64_t gate0, bool clamped, float minimum, float maximum) {
+    return vision_epilogue(VISION_LINEAR, act, activation, y, y0, biased, bias, bias_kind, has_residual, residual,
+        residual0, has_gate, gate, gate0, clamped, minimum, maximum, 0ul, ELEMENT_F32, 0ul, 0ul);
 }
 
 vision_epilogue vision_stem(Out y, uint64_t y0, bool biased, uint64_t bias, const int bias_kind,
     uint64_t partial, uint64_t columns, uint64_t table, const int table_kind, uint64_t indices,
     uint64_t coefficients) {
-    return vision_epilogue(VISION_STEM, ELEMENT_F32, 0, y, y0, biased, bias, bias_kind, partial,
-        columns, 0ul, 0ul, false, 0.0, 0.0, table, table_kind, indices, coefficients);
+    return vision_epilogue(VISION_STEM, ELEMENT_F32, 0, y, y0, biased, bias, bias_kind, partial != 0ul, partial,
+        columns, false, 0ul, 0ul, false, 0.0, 0.0, table, table_kind, indices, coefficients);
 }
 
 float vision_relu_squared(float value) {
@@ -192,15 +194,15 @@ void vision_put(vision_epilogue out_, uint m, uint n, float value) {
         float published = projected;
         if (out_.activation != 0)
             published = vision_activate(out_.activation, projected);
-        else if (out_.gate != 0ul)
+        else if (out_.has_gate)
             published = projected
                 * element_at(out_.act, out_.gate, uint64_t(m) * out_.gate0 + n);
-        else if (out_.residual != 0ul)
+        else if (out_.has_residual)
             published = element_f32_at(out_.residual + (uint64_t(m) * out_.residual0 + n) * 4ul) + projected;
         out_put(out_.y, at, published);
     } else {
         float projected = value;
-        if (out_.residual != 0ul)
+        if (out_.has_residual)
             projected = element_f32_at(out_.residual + (uint64_t(m) * out_.residual0 + n) * 4ul) + value;
         if (out_.biased)
             projected = projected + element_at(out_.bias_kind, out_.bias, n);
@@ -227,15 +229,15 @@ void vision_put2(vision_epilogue out_, uint m, uint n, float first, float second
         if (out_.activation != 0) {
             published.x = vision_activate(out_.activation, projected.x);
             published.y = vision_activate(out_.activation, projected.y);
-        } else if (out_.gate != 0ul) {
+        } else if (out_.has_gate) {
             published = projected * vision_load2(out_.act, out_.gate, uint64_t(m) * out_.gate0 + n);
-        } else if (out_.residual != 0ul) {
+        } else if (out_.has_residual) {
             published = vision_load2(ELEMENT_F32, out_.residual, uint64_t(m) * out_.residual0 + n) + projected;
         }
         out_put2(out_.y, at, published.x, published.y);
     } else {
         vec2 projected = vec2(first, second);
-        if (out_.residual != 0ul)
+        if (out_.has_residual)
             projected = vision_load2(ELEMENT_F32, out_.residual, uint64_t(m) * out_.residual0 + n) + projected;
         if (out_.biased)
             projected = projected + vision_load2(out_.bias_kind, out_.bias, uint64_t(n));
@@ -496,7 +498,8 @@ void vision_prepare_head(const int act, uint64_t source, uint64_t target, bool l
 // workgroup walking the union of its rows' spans. Shared: the K/V tile
 // (FLASH_KEYS x (wp + 8) f16), then FLASH_SCRATCH_FLOATS floats per subgroup.
 void vision_attend(const int act, uint64_t operands, Out out_, uint rows, uint padded, uint heads,
-    const uint group, const uint w, const uint wp, float score_scale, uint64_t spans, uint tile, uint head) {
+    const uint group, const uint w, const uint wp, float score_scale, bool has_spans, uint64_t spans, uint tile,
+    uint head) {
     const uint lane = SEISMIC_LANE;
     const uint64_t head_bytes = uint64_t(padded) * wp * 2ul;   // bytes of one head's rows
     const uint64_t head_rows = uint64_t(head) * head_bytes;
@@ -512,7 +515,7 @@ void vision_attend(const int act, uint64_t operands, Out out_, uint rows, uint p
     // VISION_ATTEND_ROWS, rows)) is held by at least one lane, so reducing
     // the lanes' own bounds yields the tile's union with zero extra loads.
     uint row_first = 0u, row_end = rows, walk_first = 0u, walk_end = rows;
-    if (spans != 0ul) {
+    if (has_spans) {
         const uint span_row = min(block_row + lane % 16u, rows - 1u);
         const uint64_t span_addr = spans + uint64_t(span_row) * 8ul;
         if ((span_addr & 7ul) == 0ul) {
