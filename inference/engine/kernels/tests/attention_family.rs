@@ -5291,3 +5291,58 @@ fn cuda_prefill_wide_split_scores_and_shared_kv_match_reference() {
         }
     }
 }
+
+/// Regression test for CUDA `attention_prefill_attend_rows` (`M <= VERIFY_ROWS`,
+/// `B == 0`, `PARTITIONS > 1`) when trailing padding rows have empty visible and
+/// fresh spans (`active == 0`): `partition 0` must still write `counts[tile] = 0`
+/// (and zero the vacant tile's output) before skipping the tile, otherwise
+/// `attention_prefill_merge` reads uninitialized workspace memory from
+/// `counts[tile]` and faults with `CUDA_ERROR_ILLEGAL_ADDRESS` (700).
+#[test]
+fn cuda_prefill_attend_rows_vacant_padding_tiles_zero_counts_and_output() {
+    const MLA_S512: Form = Form {
+        kv: 1,
+        g: 64,
+        p: 0,
+        s: 512,
+        interleaved: false,
+        separate: 0,
+        softplus: false,
+        fresh: true,
+        query_norm: false,
+        norm: true,
+        value_norm: false,
+        rotary: Rotary::HALF_SPLIT_LEADING,
+        stored_key: true,
+    };
+    let mut rows = window_rows(6, 80, 128);
+    for _ in 0..2 {
+        rows.push(Row {
+            spans: vec![(0, 0)],
+            fresh: (0, 0),
+            destination: -1,
+            position: 0,
+        });
+    }
+    let case = Case::new(MLA_S512, 160, rows, 64, 1.0, 1.0 / (512f32).sqrt(), 79);
+    let expected = case.expected();
+    for device in devices()
+        .into_iter()
+        .filter(|device| device.backend() == BackendName::Cuda)
+    {
+        let label = "cuda prefill-rows mla s512 vacant padding tiles";
+        let spec = statics(&device, MLA_S512, 0)
+            .with_static("B", 0)
+            .with_static("KR", 0)
+            .with_static("KS", 0)
+            .with_static("AB", 1)
+            .with_param("WARPS", 4)
+            .with_param("SPLIT_GROUPS", 256)
+            .with_param("STAGES", 2)
+            .with_param("COLUMNS", 2)
+            .with_param("QREG", 1);
+        let result = run(&device, false, &spec, &case)
+            .unwrap_or_else(|error| panic!("{label}: {error}"));
+        check(label, &result, &expected, &case);
+    }
+}

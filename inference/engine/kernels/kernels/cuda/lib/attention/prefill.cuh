@@ -507,7 +507,23 @@ struct PrefillRows {
             split.counts[block.tile] = active;
     }
 
-    __device__ __forceinline__ void vacant(const Inputs &, Block, long long) const {}
+    __device__ __forceinline__ void vacant(const Inputs &in, Block block, long long first_token, int active) const {
+        if (active > 0 || block.partition != 0) return;
+        [[maybe_unused]] const seismic_words_t &seismic_words_value = *in.words;
+        const long long rows_total = static_cast<long long>(SEISMIC_DIM_M);
+        const long long stop = min(first_token + QT, rows_total);
+        const u64 elements = static_cast<u64>(stop - first_token) * G * W;
+        for (u64 i = threadIdx.x; i < elements; i += blockDim.x) {
+            const long long token = first_token + static_cast<long long>(i / (G * W));
+            const int rem = static_cast<int>(i % (G * W));
+            const int query_head = block.kv * G + rem / W;
+            const int column = rem % W;
+            gated.put(static_cast<u64>(token) * SEISMIC_RESULT_0_STRIDE_0 +
+                          static_cast<u64>(query_head) * SEISMIC_RESULT_0_STRIDE_1 +
+                          static_cast<u64>(column) * SEISMIC_RESULT_0_STRIDE_2,
+                      0.0f);
+        }
+    }
 
     // The fresh tile's rows [r0, KEYS), row r the token first + r (zero at or
     // past `limit`): the keys' piece, and with the last piece the values'
@@ -627,7 +643,7 @@ struct DecodeRows {
 
     __device__ __forceinline__ void partitioned(Block, int) const {}
 
-    __device__ __forceinline__ void vacant(const Inputs &in, Block block, long long first_token) const {
+    __device__ __forceinline__ void vacant(const Inputs &in, Block block, long long first_token, int) const {
         [[maybe_unused]] const seismic_words_t &seismic_words_value = *in.words;
         const long long rows_total = static_cast<long long>(SEISMIC_DIM_M);
         for (int i = threadIdx.x; i < QT * G; i += blockDim.x) {
@@ -1546,8 +1562,9 @@ __device__ __forceinline__ void attend(const Inputs &in, const History &history,
     int units = 0;
     if constexpr (Rows::POSITIONS) {
         active = plan->active;
+        rows.partitioned(block, active);
         if (partition >= active) {
-            rows.vacant(in, block, first_token);
+            rows.vacant(in, block, first_token, active);
             if constexpr (Rows::MULTI_TILE) {
                 if (tile_idx + 1 < num_tiles) __syncthreads();
                 continue;
@@ -1563,14 +1580,14 @@ __device__ __forceinline__ void attend(const Inputs &in, const History &history,
             : static_cast<int>(reduce::span_total(static_cast<u64>(last) + 1, span_tiles, lane));
         const int per = static_cast<int>(partition_run(total_tiles, Rows::MIN_TILES, parts));
         active = max(1, (total_tiles + per - 1) / per);
+        rows.partitioned(block, active);
         if (partition >= active) {
-            rows.vacant(in, block, first_token);
+            rows.vacant(in, block, first_token, active);
             return;
         }
         tiles_lo = partition * per;
         units = max(0, min(per, total_tiles - tiles_lo)) * PIECES;
     }
-    rows.partitioned(block, active);
 
     // The warp's query fragments (row block warp % WARPS, every 16-column
     // step of the head), when they stay in registers (loaded after partition
