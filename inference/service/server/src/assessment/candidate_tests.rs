@@ -4873,25 +4873,37 @@ async fn a_hub_files_weights_are_sampled_for_its_catalog_drafter() {
     .await;
     assert_eq!(
         catalog_drafter(&other_generation),
-        Some((
-            DrafterLineage::Fingerprint,
-            false,
-            "Untested · Trained for Qwen3.8 27B".to_owned()
-        )),
+        None,
         "{other_generation:#?}"
     );
 }
 
 /// Qwen3.6 27B has every fingerprinted dimension and the token table of Qwen3.8 27B, so it is shown
 /// as its variant, and Qwen3.8 27B's DFlash2 binds to it; but that drafter was trained on another
-/// generation's hidden states and slows it down, so a shape match never makes it automatic. Its
-/// real weights, read from the file, are not Qwen3.8 27B's either.
+/// generation's hidden states and slows it down. When its real weights are sampled and explicitly
+/// reject Qwen3.8 27B's lineage, no cross-generation catalog drafter is offered at all; when no
+/// weight sample is available, a shape-only match never makes it automatic.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_catalog_drafter_matched_by_shape_alone_is_never_automatic() {
-    let (fixture, folder) =
+    let (rejected_fixture, rejected_folder) =
         found_qwen_with_weights(QWEN36_27B_FILE, Some("Qwen3.6-27B-Q4_K_M")).await;
-    let (variant_of, candidates) =
-        found_variant_and_drafters(&fixture, folder.path(), QWEN36_27B_FILE).await;
+    let (variant_of, rejected_candidates) =
+        found_variant_and_drafters(&rejected_fixture, rejected_folder.path(), QWEN36_27B_FILE)
+            .await;
+    assert_eq!(variant_of, Some("qwen3.8-27b:gguf:q4".parse().unwrap()));
+    assert!(
+        rejected_candidates.is_empty(),
+        "explicit weight-lineage rejection must not fall back to shape-only catalog drafter: {rejected_candidates:#?}"
+    );
+
+    let (shape_only_fixture, shape_only_folder) =
+        found_qwen_with_weights(QWEN36_27B_FILE, None).await;
+    let (variant_of, candidates) = found_variant_and_drafters(
+        &shape_only_fixture,
+        shape_only_folder.path(),
+        QWEN36_27B_FILE,
+    )
+    .await;
     assert_eq!(variant_of, Some("qwen3.8-27b:gguf:q4".parse().unwrap()));
     let listed = candidates
         .iter()

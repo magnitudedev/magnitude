@@ -2642,12 +2642,15 @@ impl ManagedModelCandidates {
     /// the Hub's answers are on this computer.
     ///
     /// The fingerprint match is the catalog model of the target's shape whose target weights the
-    /// target's weights derive from (see `weight_match`), which is lineage; else the catalog
-    /// model whose fingerprint equals the target's, else the one the target is a variant of by
-    /// shape (see `ModelShape::variant_of`), so every model shown as a variant of a catalog model
-    /// is offered that model's drafter even when its converter wrote another token table (Ollama
-    /// writes unused entries as `[PAD<n>]`). The engine's verdict decides whether it binds, and a
-    /// drafter matched by shape alone is never automatic (see `known_to_work`).
+    /// target's weights derive from (see `weight_match`), which is lineage; when weight comparison
+    /// explicitly rejects a catalog model (same shape, different generation), neither exact
+    /// fingerprint nor shape-only `ModelShape::variant_of` falls back to that rejected model.
+    /// Otherwise (when no weight comparison was possible), falls back to the catalog model whose
+    /// fingerprint equals the target's, else the one the target is a variant of by shape (see
+    /// `ModelShape::variant_of`), so every model shown as a variant of a catalog model is offered
+    /// that model's drafter even when its converter wrote another token table (Ollama writes
+    /// unused entries as `[PAD<n>]`). The engine's verdict decides whether it binds, and a drafter
+    /// matched by shape alone is never automatic (see `known_to_work`).
     async fn catalog_matches(
         &self,
         target: &DrafterTarget,
@@ -2658,19 +2661,18 @@ impl ManagedModelCandidates {
         {
             return vec![(matched, DrafterLineage::Exact)];
         }
-        let weighed = match fingerprint {
+        let weight_match = match fingerprint {
             Some(fingerprint) => self.weight_match(target, fingerprint).await,
-            None => None,
+            None => WeightMatch::Unavailable,
+        };
+        let weighed = match &weight_match {
+            WeightMatch::Matched(model_id) => Some(model_id.clone()),
+            WeightMatch::Rejected(_) | WeightMatch::Unavailable => None,
         };
         let fingerprinted = match fingerprint {
-            Some(_) if weighed.is_some() => weighed.clone(),
             Some(fingerprint) => {
                 let catalog = &self.catalog_facts().await.fingerprints;
-                catalog
-                    .iter()
-                    .find(|(_, candidate)| candidate == fingerprint)
-                    .map(|(model_id, _)| model_id.clone())
-                    .or_else(|| ModelShape::of(fingerprint).variant_of(catalog))
+                resolve_fingerprint_match(fingerprint, catalog, &weight_match)
             }
             None => None,
         };
@@ -2714,7 +2716,7 @@ impl ManagedModelCandidates {
         &self,
         target: &DrafterTarget,
         fingerprint: &ModelFingerprint,
-    ) -> Option<ModelId> {
+    ) -> WeightMatch {
         let facts = self.catalog_facts().await;
         let shape = ModelShape::of(fingerprint);
         let references = facts
@@ -2724,15 +2726,12 @@ impl ManagedModelCandidates {
             .filter_map(|(model_id, _)| Some((model_id, facts.weight_samples.get(model_id)?)))
             .collect::<Vec<_>>();
         if references.is_empty() {
-            return None;
+            return WeightMatch::Unavailable;
         }
-        let sample = self.target_weight_sample(target).await?;
-        references
-            .into_iter()
-            .filter(|(_, reference)| sample.shares_lineage_with(reference))
-            .filter_map(|(model_id, reference)| Some((sample.divergence(reference)?, model_id)))
-            .min_by(|(left, _), (right, _)| left.total_cmp(right))
-            .map(|(_, model_id)| model_id.clone())
+        let Some(sample) = self.target_weight_sample(target).await else {
+            return WeightMatch::Unavailable;
+        };
+        evaluate_weight_match(&sample, &references)
     }
 
     /// The weight sample of the target's own weights: read from its file once per content (see
@@ -4322,6 +4321,75 @@ fn bound_method(verdict: &DrafterVerdict) -> Option<SpeculativeMethod> {
     match verdict {
         DrafterVerdict::Bound { method, .. } => Some(method.clone()),
         DrafterVerdict::None | DrafterVerdict::Rejected { .. } => None,
+    }
+}
+
+/// Outcome of comparing a target's early normalization weights against catalog
+/// models of the same shape.
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum WeightMatch {
+    /// Weights share lineage with this catalog model.
+    Matched(ModelId),
+    /// Weights were sampled and compared against catalog references of this
+    /// shape, and explicitly diverged beyond `LINEAGE_DIVERGENCE` from every
+    /// listed catalog model (for example a different generation of the same
+    /// architecture shape such as Qwen3.6-35B-A3B vs Qwen3.5-35B-A3B).
+    Rejected(BTreeSet<ModelId>),
+    /// No comparable weight sample was available for either the target or any
+    /// catalog model of its shape.
+    Unavailable,
+}
+
+fn evaluate_weight_match(
+    sample: &WeightSample,
+    references: &[(&ModelId, &WeightSample)],
+) -> WeightMatch {
+    let mut best: Option<(f64, &ModelId)> = None;
+    let mut rejected = BTreeSet::new();
+    for &(model_id, reference) in references {
+        let Some(divergence) = sample.divergence(reference) else {
+            continue;
+        };
+        if sample.shares_lineage_with(reference) {
+            if best.is_none_or(|(best_div, _)| divergence < best_div) {
+                best = Some((divergence, model_id));
+            }
+        } else {
+            rejected.insert(model_id.clone());
+        }
+    }
+    if let Some((_, model_id)) = best {
+        WeightMatch::Matched(model_id.clone())
+    } else if !rejected.is_empty() {
+        WeightMatch::Rejected(rejected)
+    } else {
+        WeightMatch::Unavailable
+    }
+}
+
+fn resolve_fingerprint_match(
+    fingerprint: &ModelFingerprint,
+    catalog: &[(ModelId, ModelFingerprint)],
+    weight_match: &WeightMatch,
+) -> Option<ModelId> {
+    match weight_match {
+        WeightMatch::Matched(model_id) => Some(model_id.clone()),
+        WeightMatch::Rejected(rejected) => catalog
+            .iter()
+            .find(|(model_id, candidate)| {
+                !rejected.contains(model_id) && candidate == fingerprint
+            })
+            .map(|(model_id, _)| model_id.clone())
+            .or_else(|| {
+                ModelShape::of(fingerprint)
+                    .variant_of(catalog)
+                    .filter(|model_id| !rejected.contains(model_id))
+            }),
+        WeightMatch::Unavailable => catalog
+            .iter()
+            .find(|(_, candidate)| candidate == fingerprint)
+            .map(|(model_id, _)| model_id.clone())
+            .or_else(|| ModelShape::of(fingerprint).variant_of(catalog)),
     }
 }
 
@@ -5953,6 +6021,93 @@ mod tests {
                 .read()
                 .expect("candidate enrichment results lock poisoned")
                 .is_empty()
+        );
+    }
+
+    /// Regression test (GitHub #269): when both target and catalog reference
+    /// have `WeightSample`s and `weight_match` explicitly rejects lineage
+    /// (`divergence > LINEAGE_DIVERGENCE`, e.g. Qwen3.6-35B-A3B vs
+    /// Qwen3.5-35B-A3B), `resolve_fingerprint_match` must NOT fall back to
+    /// shape-only `ModelShape::variant_of` (or an identical-shape/tokenizer
+    /// fingerprint) to offer a cross-generation drafter.
+    #[test]
+    fn explicit_weight_lineage_rejection_does_not_fall_back_to_shape_variant() {
+        let base = magnitude_service_contracts::models::CatalogBaseId::new("qwen35-35b-a3b")
+            .expect("catalog base ID");
+        let variant = magnitude_service_contracts::models::CatalogVariantId::new("gguf:q4")
+            .expect("catalog variant ID");
+        let qwen35 = ModelId::catalog(&base, &variant);
+
+        let qwen35_fp = ModelFingerprint {
+            architecture: "qwen35moe".to_owned(),
+            block_count: 40,
+            embedding_length: 2048,
+            head_count: 16,
+            head_count_kv: 2,
+            key_length: 256,
+            vocab_size: 248320,
+            expert_count: Some(256),
+            tokenizer_digest: "tok-v1".to_owned(),
+        };
+        let mut qwen36_different_tok = qwen35_fp.clone();
+        qwen36_different_tok.tokenizer_digest = "tok-v2".to_owned();
+
+        let catalog = vec![(qwen35.clone(), qwen35_fp.clone())];
+
+        let sample_from = |offset: f32, slope: f32| -> WeightSample {
+            let mut tensors = BTreeMap::new();
+            for (idx, name) in [
+                "blk.0.attn_norm.weight",
+                "blk.1.attn_norm.weight",
+                "output_norm.weight",
+            ]
+            .into_iter()
+            .enumerate()
+            {
+                let values: Vec<f32> = (0..64)
+                    .map(|i| {
+                        let x = (i as f32) * 0.1 + (idx as f32) * 0.3;
+                        x.sin() + offset * (x * slope).cos()
+                    })
+                    .collect();
+                tensors.insert(name.to_owned(), values);
+            }
+            WeightSample::decode(&serde_json::to_vec(&tensors).expect("encode tensors"))
+                .expect("decode weight sample")
+        };
+
+        let ref_sample = sample_from(0.0, 1.0);
+        let same_lineage = sample_from(0.0, 1.0);
+        // Diverges well past LINEAGE_DIVERGENCE (2.5e-4), modelling a new generation.
+        let other_generation = sample_from(0.25, 2.3);
+        assert!(!other_generation.shares_lineage_with(&ref_sample));
+        assert!(same_lineage.shares_lineage_with(&ref_sample));
+
+        let rejected = evaluate_weight_match(&other_generation, &[(&qwen35, &ref_sample)]);
+        assert_eq!(rejected, WeightMatch::Rejected(BTreeSet::from([qwen35.clone()])));
+
+        // Neither exact fingerprint nor shape-only variant_of falls back to the rejected model.
+        assert_eq!(
+            resolve_fingerprint_match(&qwen35_fp, &catalog, &rejected),
+            None
+        );
+        assert_eq!(
+            resolve_fingerprint_match(&qwen36_different_tok, &catalog, &rejected),
+            None
+        );
+
+        // When no weight comparison was possible, shape-only variant_of still matches.
+        assert_eq!(
+            resolve_fingerprint_match(&qwen36_different_tok, &catalog, &WeightMatch::Unavailable),
+            Some(qwen35.clone())
+        );
+
+        // When weights share lineage, it matches directly.
+        let matched = evaluate_weight_match(&same_lineage, &[(&qwen35, &ref_sample)]);
+        assert_eq!(matched, WeightMatch::Matched(qwen35.clone()));
+        assert_eq!(
+            resolve_fingerprint_match(&qwen36_different_tok, &catalog, &matched),
+            Some(qwen35)
         );
     }
 }
