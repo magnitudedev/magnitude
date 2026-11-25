@@ -1,6 +1,7 @@
 {
   "name": "@magnitudedev/desktop",
   "private": true,
+  "license": "Apache-2.0",
   "type": "module",
   "main": "out/main/main.js",
   "scripts": {

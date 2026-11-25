@@ -1,6 +1,7 @@
 {
   "name": "@magnitudedev/inference",
   "private": true,
+  "license": "Apache-2.0",
   "type": "module",
   "dependencies": {
     "@effect/platform": "^0.96.0",

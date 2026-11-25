@@ -2,6 +2,7 @@
   "name": "@magnitudedev/acn-dashboard",
   "version": "0.0.1",
   "private": true,
+  "license": "Apache-2.0",
   "type": "module",
   "scripts": {
     "dashboard": "concurrently \"bunx vite\" \"bun run src/server.ts\"",
