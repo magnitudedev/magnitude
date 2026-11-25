@@ -198,10 +198,8 @@ impl Sys for LiveSys {
         &self,
         relationship: LOGICAL_PROCESSOR_RELATIONSHIP,
     ) -> Option<topology::ProcessorRecords> {
-        use windows_sys::Win32::Foundation::{ERROR_INSUFFICIENT_BUFFER, ERROR_INVALID_PARAMETER};
-        use windows_sys::Win32::System::SystemInformation::{
-            GetLogicalProcessorInformationEx, RelationNumaNodeEx,
-        };
+        use windows_sys::Win32::Foundation::ERROR_INSUFFICIENT_BUFFER;
+        use windows_sys::Win32::System::SystemInformation::GetLogicalProcessorInformationEx;
         let mut length = 0u32;
         if unsafe {
             GetLogicalProcessorInformationEx(relationship, std::ptr::null_mut(), &mut length)
@@ -211,11 +209,6 @@ impl Sys for LiveSys {
         }
         let first_err = std::io::Error::last_os_error();
         if first_err.raw_os_error() != Some(ERROR_INSUFFICIENT_BUFFER as i32) {
-            if relationship == RelationNumaNodeEx
-                && first_err.raw_os_error() == Some(ERROR_INVALID_PARAMETER as i32)
-            {
-                return None;
-            }
             return read(format!("GetLogicalProcessorInformationEx({relationship})"), Err(first_err));
         }
         loop {

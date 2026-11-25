@@ -19,10 +19,13 @@ struct Machine {
     nodes: Vec<Option<u64>>,
     job: Option<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>,
     process: PROCESS_MEMORY_COUNTERS,
-    records: Option<topology::ProcessorRecords>,
+    records: Vec<(LOGICAL_PROCESSOR_RELATIONSHIP, topology::ProcessorRecords)>,
+    groups: Option<Vec<u16>>,
+    affinity: Option<usize>,
     brand: Option<String>,
     smbios: Option<Vec<u8>>,
     parallelism: NonZeroUsize,
+    build: u32,
 }
 
 impl Machine {
@@ -47,10 +50,13 @@ impl Machine {
                 WorkingSetSize: 2 * GB as usize,
                 ..Default::default()
             },
-            records: None,
+            records: Vec::new(),
+            groups: None,
+            affinity: None,
             brand: None,
             smbios: None,
             parallelism: NonZeroUsize::new(4).unwrap(),
+            build: 26100,
         }
     }
 
@@ -74,7 +80,7 @@ impl Sys for Machine {
     fn os_version(&self) -> OSVERSIONINFOW {
         OSVERSIONINFOW {
             dwMajorVersion: 10,
-            dwBuildNumber: 26100,
+            dwBuildNumber: self.build,
             ..unsafe { std::mem::zeroed() }
         }
     }
@@ -84,8 +90,11 @@ impl Sys for Machine {
     fn cpu_brand(&self) -> Option<String> {
         self.brand.clone()
     }
-    fn processor_records(&self, _relationship: LOGICAL_PROCESSOR_RELATIONSHIP) -> Option<topology::ProcessorRecords> {
-        self.records.clone()
+    fn processor_records(&self, relationship: LOGICAL_PROCESSOR_RELATIONSHIP) -> Option<topology::ProcessorRecords> {
+        self.records
+            .iter()
+            .find(|(rel, _)| *rel == relationship)
+            .map(|(_, records)| records.clone())
     }
     fn highest_node(&self) -> u16 {
         (self.nodes.len() - 1) as u16
@@ -94,10 +103,10 @@ impl Sys for Machine {
         self.nodes[usize::from(node)]
     }
     fn process_groups(&self) -> Option<Vec<u16>> {
-        None
+        self.groups.clone()
     }
     fn affinity_mask(&self) -> Option<usize> {
-        None
+        self.affinity
     }
     fn counters(&self) -> Option<Counters> {
         self.counters
@@ -297,4 +306,103 @@ fn without_the_records_the_processors_are_flat() {
         ..Machine::new()
     };
     assert_eq!(cpu_model(&named), "AMD Ryzen 9 9950X");
+}
+
+/// On Windows 10 22H2 (build 19045), which fails `RelationNumaNodeEx`, the
+/// nodes come from `RelationNumaNode` (whose records there carry
+/// `GroupCount == 0`), with the real cores and their threads.
+#[test]
+fn before_numa_node_ex_the_nodes_come_from_numa_node() {
+    use windows_sys::Win32::System::SystemInformation::{
+        GROUP_AFFINITY, NUMA_NODE_RELATIONSHIP, NUMA_NODE_RELATIONSHIP_0, PROCESSOR_RELATIONSHIP,
+        RelationNumaNode, RelationProcessorCore, SYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX,
+    };
+
+    fn pack(items: &[SYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX]) -> topology::ProcessorRecords {
+        let byte_len = std::mem::size_of_val(items);
+        let mut words = vec![0u64; byte_len.div_ceil(8)];
+        // SAFETY: `items` is a contiguous slice of `byte_len` initialized bytes and `words`
+        // holds at least `byte_len` bytes.
+        unsafe {
+            std::ptr::copy_nonoverlapping(
+                items.as_ptr().cast::<u8>(),
+                words.as_mut_ptr().cast::<u8>(),
+                byte_len,
+            );
+        }
+        topology::ProcessorRecords::new(words, byte_len)
+    }
+
+    let record_size = std::mem::size_of::<SYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX>() as u32;
+    let core_record = |mask: usize| {
+        // SAFETY: `SYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX` is a C ABI struct/union where
+        // all-zeroes is a valid bit pattern, ensuring union padding bytes are initialized.
+        let mut record: SYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX = unsafe { std::mem::zeroed() };
+        record.Relationship = RelationProcessorCore;
+        record.Size = record_size;
+        record.Anonymous.Processor = PROCESSOR_RELATIONSHIP {
+            Flags: 1,
+            EfficiencyClass: 0,
+            Reserved: [0; 20],
+            GroupCount: 1,
+            GroupMask: [GROUP_AFFINITY {
+                Mask: mask,
+                Group: 0,
+                Reserved: [0; 3],
+            }],
+        };
+        record
+    };
+    let numa_record = {
+        // SAFETY: all-zeroes initializes all union padding bytes before populating `NumaNode`.
+        let mut record: SYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX = unsafe { std::mem::zeroed() };
+        record.Relationship = RelationNumaNode;
+        record.Size = record_size;
+        record.Anonymous.NumaNode = NUMA_NODE_RELATIONSHIP {
+            NodeNumber: 0,
+            Reserved: [0; 18],
+            // Windows 10 `RelationNumaNode` sets `GroupCount = 0` with one `GroupMask`.
+            GroupCount: 0,
+            Anonymous: NUMA_NODE_RELATIONSHIP_0 {
+                GroupMask: GROUP_AFFINITY {
+                    Mask: 0b1111,
+                    Group: 0,
+                    Reserved: [0; 3],
+                },
+            },
+        };
+        record
+    };
+
+    let machine = Machine {
+        nodes: vec![Some(16 * GB)],
+        records: vec![
+            (RelationProcessorCore, pack(&[core_record(0b0011), core_record(0b1100)])),
+            (RelationNumaNode, pack(&[numa_record])),
+        ],
+        groups: Some(vec![0]),
+        affinity: Some(0b1111),
+        build: 19045,
+        ..Machine::new()
+    };
+
+    let topo = processors(&machine);
+    assert_eq!(topo.nodes().len(), 1);
+    assert_eq!(topo.nodes()[0].id, 0);
+    assert!(topo.nodes()[0].memory);
+    assert_eq!(topo.nodes()[0].cores.len(), 2);
+    assert_eq!(topo.nodes()[0].cores[0].threads, vec![0, 1]);
+    assert_eq!(topo.nodes()[0].cores[1].threads, vec![2, 3]);
+    assert_eq!(topo.allowed().iter().copied().collect::<Vec<_>>(), vec![0, 1, 2, 3]);
+}
+
+/// `RelationNumaNodeEx` only on builds that know it ([`topology::NUMA_NODE_EX_BUILD`]).
+#[test]
+fn numa_nodes_come_from_the_relationship_the_build_knows() {
+    use windows_sys::Win32::System::SystemInformation::{RelationNumaNode, RelationNumaNodeEx};
+    let on = |build| topology::numa_relationship(&Machine { build, ..Machine::new() });
+    assert_eq!(on(19045), RelationNumaNode);
+    assert_eq!(on(topology::NUMA_NODE_EX_BUILD - 1), RelationNumaNode);
+    assert_eq!(on(topology::NUMA_NODE_EX_BUILD), RelationNumaNodeEx);
+    assert_eq!(on(26100), RelationNumaNodeEx);
 }

@@ -137,8 +137,7 @@ fn group_cpus(masks: &[GROUP_AFFINITY]) -> Vec<usize> {
     cpus
 }
 
-/// Each NUMA node (`RelationNumaNodeEx`, falling back to `RelationNumaNode` on
-/// older Windows), with memory where `GetNumaAvailableMemoryNodeEx` answers
+/// Each NUMA node ([`numa_relationship`]), with memory where `GetNumaAvailableMemoryNodeEx` answers
 /// for it (static node memory presence, independent of momentary free bytes
 /// under pressure), its cores (`RelationProcessorCore`) those whose threads
 /// lie in it, each a performance core of the highest `EfficiencyClass`; the
@@ -160,6 +159,22 @@ pub(crate) fn processors(sys: &impl Sys) -> Processors {
         .unwrap_or_else(|error| panic!("invariant violated: the processors the OS reports: {error}"))
 }
 
+/// The first build that knows `RelationNumaNodeEx` (Windows Server 2022,
+/// Windows 11). Earlier builds fail the request (Windows 10 19045 with
+/// `ERROR_GEN_FAILURE`), and their `RelationNumaNode` records carry every
+/// group, since a node there never spans groups.
+pub(super) const NUMA_NODE_EX_BUILD: u32 = 20348;
+
+/// The relationship naming each NUMA node with all its groups on this
+/// build: `RelationNumaNodeEx` from [`NUMA_NODE_EX_BUILD`], `RelationNumaNode`
+/// before it.
+pub(super) fn numa_relationship(sys: &impl Sys) -> LOGICAL_PROCESSOR_RELATIONSHIP {
+    match sys.os_version().dwBuildNumber >= NUMA_NODE_EX_BUILD {
+        true => RelationNumaNodeEx,
+        false => RelationNumaNode,
+    }
+}
+
 /// The nodes and allowed CPUs the OS reports ([`processors`]), none where
 /// any of them is unanswered.
 fn reported_processors(sys: &impl Sys) -> Option<(Vec<MemoryNode>, BTreeSet<usize>)> {
@@ -169,9 +184,7 @@ fn reported_processors(sys: &impl Sys) -> Option<(Vec<MemoryNode>, BTreeSet<usiz
             cores.push((group_cpus(masks), efficiency_class));
         });
     let fastest = cores.iter().map(|(_, class)| *class).max()?;
-    let numa_records = sys
-        .processor_records(RelationNumaNodeEx)
-        .or_else(|| sys.processor_records(RelationNumaNode))?;
+    let numa_records = sys.processor_records(numa_relationship(sys))?;
     let mut nodes = Vec::new();
     numa_records.numa_nodes(|node_number, masks| {
         let cpus = group_cpus(masks);
