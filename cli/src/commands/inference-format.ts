@@ -33,10 +33,13 @@ export const describeLocalHardware = (
           : []),
       ],
     },
-    accelerators: roles.devices.slice(unifiedGpu === undefined ? 0 : 1).map(({ accelerator, role, dedicatedMemoryBytes }) => ({
+    accelerators: roles.devices.slice(unifiedGpu === undefined ? 0 : 1).map(({ accelerator, role, dedicatedMemoryBytes, placesOnHost }) => ({
       name: accelerator.name.trim() || "GPU",
       details: [
-        Option.match(dedicatedMemoryBytes, { onNone: () => "shares system memory", onSome: bytes => `${formatMemoryCapacity(bytes)} VRAM` }),
+        Option.match(dedicatedMemoryBytes, {
+          onNone: () => "shares system memory",
+          onSome: bytes => `${formatMemoryCapacity(bytes)} VRAM${placesOnHost ? " + shared system RAM" : ""}`,
+        }),
         ...(role._tag === "InUse" ? [`${formatLocalInferenceBackend(role.backend)} acceleration`, "in use"] : ["available"]),
       ].join(" · "),
     })),

@@ -1844,7 +1844,7 @@ fn planning_room_capacity_is_structural_not_momentary_free() {
     let l_scope = Ledgers::new();
     let l_sample = Sample::scripted(l_scope.changes(), linux_sample);
     let (l_ledgers, l_reading) = DeviceLedgers::unified_in(&l_scope, shape())
-        .read_granted(&l_sample, DeviceGrant::HostLimit { limit: 120 * GB });
+        .read_granted(&l_sample, DeviceGrant::HostLimit { limit: 120 * GB, dedicated: 0 });
     let l_budget = MemoryBudget::live_ledger(&gb10, cuda, &l_reading, &l_ledgers, 0);
     assert_eq!(l_budget.available(), 30 * GB, "momentary free room at load is 30 GiB");
     assert_eq!(l_budget.capacity(), 120 * GB, "structural capacity is 120 GiB CUDA limit");
@@ -1884,7 +1884,7 @@ fn linux_unified_host_prices_cuda_and_vulkan_grants_without_wired_figures() {
     let cuda_scope = Ledgers::new();
     let cuda_sample = Sample::scripted(cuda_scope.changes(), linux_gb10.clone());
     let (cuda_ledgers, cuda_reading) = DeviceLedgers::unified_in(&cuda_scope, shape())
-        .read_granted(&cuda_sample, DeviceGrant::HostLimit { limit: seismic::fixtures::GB10_CUDA_TOTAL });
+        .read_granted(&cuda_sample, DeviceGrant::HostLimit { limit: seismic::fixtures::GB10_CUDA_TOTAL, dedicated: 0 });
     assert!(Arc::ptr_eq(&cuda_ledgers.device.store, &cuda_ledgers.host.store));
     assert!(cuda_reading.host.is_none());
     assert_eq!(cuda_reading.device.wired_limit(), None);
@@ -1901,7 +1901,7 @@ fn linux_unified_host_prices_cuda_and_vulkan_grants_without_wired_figures() {
     let monitored_scope = Ledgers::new();
     let monitored_sample = Sample::scripted(monitored_scope.changes(), monitored_gb10);
     let (_, monitored_reading) = DeviceLedgers::unified_in(&monitored_scope, shape())
-        .read_granted(&monitored_sample, DeviceGrant::HostLimit { limit: seismic::fixtures::GB10_CUDA_TOTAL });
+        .read_granted(&monitored_sample, DeviceGrant::HostLimit { limit: seismic::fixtures::GB10_CUDA_TOTAL, dedicated: 0 });
     assert_eq!(monitored_reading.device.wired_limit(), None);
     assert_eq!(monitored_reading.device.budget(), 120 * GB, "monitored Linux host supply includes clean cache");
 
@@ -1910,7 +1910,7 @@ fn linux_unified_host_prices_cuda_and_vulkan_grants_without_wired_figures() {
     let vulkan_sample = Sample::scripted(vulkan_scope.changes(), linux_gb10.clone());
     let vulkan_left = seismic::fixtures::GB10_VULKAN_HEAP - 4 * GB;
     let (_, vulkan_reading) = DeviceLedgers::unified_in(&vulkan_scope, shape())
-        .read_granted(&vulkan_sample, DeviceGrant::HostBudget { capacity: seismic::fixtures::GB10_VULKAN_HEAP, left: vulkan_left });
+        .read_granted(&vulkan_sample, DeviceGrant::HostBudget { capacity: seismic::fixtures::GB10_VULKAN_HEAP, left: vulkan_left, dedicated: 0 });
     assert_eq!(vulkan_reading.device.wired_limit(), None);
     assert_eq!(vulkan_reading.device.budget(), vulkan_left, "bounded by the Vulkan heap budget left");
 

@@ -3,15 +3,18 @@
 //! recorded machines and their sources are `crate::fixtures`'.
 
 use crate::fixtures::{
-    a10_8q, assert_consistent, executor, gb10, linux_host, lunar_lake, m4_pro,
+    a10_8q, assert_consistent, executor, gb10, linux_host, lunar_lake, lunar_lake_windows, m4_pro,
     m4_pro_without_unified_memory, placement, rtx3090, rtx3090_cuda, rtx3090_granting, rtx3090_host,
     rtx3090_most_granted, rtx3090_uuid, rtx3090_volume, rtx3090_vulkan, ryzen_igpu_and_rtx4070,
-    show, strix_halo_linux, strix_halo_windows, topology, uuid, volume, A10_8Q_CUDA_USABLE, A10_8Q_VULKAN_HEAP, GB,
-    GB10_CUDA_TOTAL, GB10_UUID, GB10_VULKAN_HEAP, LUNAR_LAKE_HEAP, LUNAR_LAKE_UUID,
-    M4_PRO_REGISTRY, M4_PRO_WORKING_SET, RTX3090_CUDA_TOTAL, RTX3090_CUDA_USABLE, RTX3090_HOST,
-    RTX3090_VULKAN_DRIVER, RTX3090_VULKAN_HEAP, RTX4070_HEAP, RTX4070_UUID, RYZEN_IGPU_HEAPS,
-    RYZEN_IGPU_UUID, STRIX_HALO_LINUX_HEAPS, STRIX_HALO_LINUX_UUID, STRIX_HALO_WINDOWS_DEDICATED,
-    STRIX_HALO_WINDOWS_HEAPS, STRIX_HALO_WINDOWS_LUID, STRIX_HALO_WINDOWS_UUID,
+    show, strix_halo_linux, strix_halo_windows, topology, uuid, volume, vulkan, windows_host,
+    A10_8Q_CUDA_USABLE, A10_8Q_VULKAN_HEAP, GB, GB10_CUDA_TOTAL, GB10_UUID, GB10_VULKAN_HEAP,
+    LUNAR_LAKE_HEAP, LUNAR_LAKE_MAX_ALLOCATION, LUNAR_LAKE_UUID, LUNAR_LAKE_WINDOWS_DEDICATED,
+    LUNAR_LAKE_WINDOWS_HEAP, LUNAR_LAKE_WINDOWS_LUID, M4_PRO_REGISTRY, M4_PRO_WORKING_SET,
+    RTX3090_CUDA_TOTAL, RTX3090_CUDA_USABLE, RTX3090_HOST, RTX3090_VULKAN_DRIVER,
+    RTX3090_VULKAN_HEAP, RTX4070_HEAP, RTX4070_UUID, RYZEN_IGPU_HEAPS, RYZEN_IGPU_UUID,
+    STRIX_HALO_LINUX_HEAPS, STRIX_HALO_LINUX_UUID, STRIX_HALO_WINDOWS_DEDICATED,
+    STRIX_HALO_WINDOWS_HEAPS, STRIX_HALO_WINDOWS_LUID, STRIX_HALO_WINDOWS_OS,
+    STRIX_HALO_WINDOWS_UUID,
 };
 use crate::model::{
     Availability, CacheSize, DeviceMemory, DeviceTopology, Grant, GrantKind, PhysicalIdentity,
@@ -302,6 +305,83 @@ fn lunar_lake_is_granted_its_one_heap() {
                 GrantKind::HostBudget,
             )
         )]
+    );
+}
+
+#[test]
+fn lunar_lake_on_windows_uses_shared_system_ram_beyond_128mb_dedicated() {
+    let topology = topology(&lunar_lake_windows());
+    show("Lunar Lake, Windows (#275; Arc 140V 128 MiB dedicated + shared)", &topology);
+    assert_consistent(&topology);
+    let gpu = uuid(LUNAR_LAKE_UUID);
+    let arc = device_memory(&topology, gpu);
+    assert_eq!(
+        topology.store(store_of(&topology, &arc)).unwrap().capacity(),
+        Reported::new(LUNAR_LAKE_WINDOWS_DEDICATED, ReportedBy::DxgiDedicatedMemory)
+    );
+    let vulkan = topology.resolve(ExecutorSelector::Vulkan { uuid: gpu }).unwrap();
+    for kind in Contract::ALL {
+        assert_eq!(
+            placement(&topology, vulkan, kind),
+            [
+                (
+                    arc.clone(),
+                    grant(
+                        LUNAR_LAKE_WINDOWS_DEDICATED,
+                        ReportedBy::DxgiDedicatedMemory,
+                        GrantKind::HostBudget,
+                    )
+                ),
+                (
+                    StoreKind::HostRam,
+                    grant(
+                        LUNAR_LAKE_WINDOWS_HEAP - LUNAR_LAKE_WINDOWS_DEDICATED,
+                        ReportedBy::VulkanHeapsBeyondDedicated,
+                        GrantKind::HostBudget,
+                    )
+                ),
+            ]
+        );
+    }
+}
+
+#[test]
+fn windows_igpu_with_128mb_device_local_and_large_shared_heap_grants_both() {
+    const DEDICATED: u64 = 128 << 20;
+    const SHARED_HEAP: u64 = 16 * GB;
+    let mut reports = windows_host(32 * GB, STRIX_HALO_WINDOWS_OS);
+    reports.adapters.push(crate::reports::AdapterReport {
+        luid: LUNAR_LAKE_WINDOWS_LUID,
+        dedicated: DEDICATED,
+        local_budget: None,
+    });
+    reports.vulkan.push(vulkan(
+        uuid(LUNAR_LAKE_UUID),
+        "Intel(R) Arc(TM) 140V GPU",
+        "vulkan driver 5 version 101.6651.0",
+        true,
+        &[(DEDICATED, true), (SHARED_HEAP, false)],
+        &[&["DL", "DL|HV|HC"], &["HV|HC", "HV|HC|C"]],
+        LUNAR_LAKE_MAX_ALLOCATION,
+        Some(LUNAR_LAKE_WINDOWS_LUID),
+    ));
+    let topo = topology(&reports);
+    assert_consistent(&topo);
+    let gpu = uuid(LUNAR_LAKE_UUID);
+    let arc = device_memory(&topo, gpu);
+    let exec = topo.resolve(ExecutorSelector::Vulkan { uuid: gpu }).unwrap();
+    assert_eq!(
+        placement(&topo, exec, Contract::DeviceOnly),
+        [
+            (
+                arc,
+                grant(DEDICATED, ReportedBy::DxgiDedicatedMemory, GrantKind::HostBudget)
+            ),
+            (
+                StoreKind::HostRam,
+                grant(SHARED_HEAP, ReportedBy::VulkanHeapsBeyondDedicated, GrantKind::HostBudget)
+            ),
+        ]
     );
 }
 

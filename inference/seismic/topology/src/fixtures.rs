@@ -163,6 +163,12 @@ pub mod recorded {
         super::topology(&super::lunar_lake())
     }
 
+    /// Lunar Lake on Windows 11 (#275, Arc 140V iGPU with 128 MiB DXGI
+    /// dedicated compatibility figure and shared unified Vulkan heap).
+    pub fn lunar_lake_windows() -> DeviceTopology {
+        super::topology(&super::lunar_lake_windows())
+    }
+
     /// A Ryzen iGPU (report 39430) and an RTX 4070 (report 51857).
     pub fn ryzen_igpu_and_rtx4070() -> DeviceTopology {
         super::topology(&super::ryzen_igpu_and_rtx4070())
@@ -676,6 +682,34 @@ pub fn lunar_lake() -> Reports {
         LUNAR_LAKE_LAYOUT,
         LUNAR_LAKE_MAX_ALLOCATION,
         None,
+    ));
+    reports
+}
+
+// Lunar Lake on Windows 11 (#275): Intel Core Ultra 200V / Arc 140V iGPU.
+// DXGI reports a fixed 128 MiB compatibility `DedicatedVideoMemory`, while
+// Vulkan exposes a unified `DEVICE_LOCAL` heap backed by shared system RAM.
+pub const LUNAR_LAKE_WINDOWS_HOST: u64 = 32 * GB;
+pub const LUNAR_LAKE_WINDOWS_DEDICATED: u64 = 128 << 20;
+pub const LUNAR_LAKE_WINDOWS_LUID: [u8; 8] = [0x14, 0x0A, 0x01, 0, 0, 0, 0, 0];
+pub const LUNAR_LAKE_WINDOWS_HEAP: u64 = 19_284_472_012;
+
+pub fn lunar_lake_windows() -> Reports {
+    let mut reports = windows_host(LUNAR_LAKE_WINDOWS_HOST, STRIX_HALO_WINDOWS_OS);
+    reports.adapters.push(AdapterReport {
+        luid: LUNAR_LAKE_WINDOWS_LUID,
+        dedicated: LUNAR_LAKE_WINDOWS_DEDICATED,
+        local_budget: None,
+    });
+    reports.vulkan.push(vulkan(
+        uuid(LUNAR_LAKE_UUID),
+        "Intel(R) Arc(TM) 140V GPU (16GB)",
+        "vulkan driver 5 version 101.6651.0",
+        true,
+        &[(LUNAR_LAKE_WINDOWS_HEAP, true)],
+        LUNAR_LAKE_LAYOUT,
+        LUNAR_LAKE_MAX_ALLOCATION,
+        Some(LUNAR_LAKE_WINDOWS_LUID),
     ));
     reports
 }

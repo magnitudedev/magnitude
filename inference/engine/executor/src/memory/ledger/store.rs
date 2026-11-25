@@ -159,6 +159,12 @@ impl UnreadLedgers {
 pub struct DeviceLedgers {
     pub(super) device: Ledger,
     pub(super) host: Ledger,
+    /// Host RAM ledger when a unified device's primary placement store is a
+    /// DXGI-dedicated `DeviceMemory` store (Windows iGPUs), so `reached_stores`
+    /// contains both `DeviceMemory` and `HostRam`. Kept so `keeping()`,
+    /// `holding()`, and `Held::allocate()` can mint `HostRam` entries for
+    /// `device.charges()`.
+    pub(super) reached_host: Option<Ledger>,
 }
 
 impl DeviceLedgers {
@@ -176,7 +182,12 @@ impl DeviceLedgers {
     /// access path carries no device grant ([`seismic::GrantKind`]).
     pub fn open_in(scope: &Ledgers, device: &seismic::Device, shape: Arc<LoadShape>) -> UnreadLedgers {
         let view = |contract, shape| scope.view(placed_store(device.topology(), device.info(), contract), shape);
-        let ledgers = Self { device: view(seismic::Contract::DeviceOnly, shape.clone()), host: view(seismic::Contract::Shared, shape) };
+        let device_ledger = view(seismic::Contract::DeviceOnly, shape.clone());
+        let host_ledger = view(seismic::Contract::Shared, shape.clone());
+        let reached_host = (Arc::ptr_eq(&device_ledger.store, &host_ledger.store)
+            && device_ledger.store.identity != seismic::StoreIdentity::HostRam)
+            .then(|| scope.view(seismic::StoreIdentity::HostRam, shape));
+        let ledgers = Self { device: device_ledger, host: host_ledger, reached_host };
         if !Arc::ptr_eq(&ledgers.device.store, &ledgers.host.store) {
             let path = device
                 .info()
@@ -200,7 +211,11 @@ impl DeviceLedgers {
     /// as these are.
     pub fn shaped(&self, shape: Arc<LoadShape>) -> Self {
         let view = |ledger: &Ledger| Ledger { store: ledger.store.clone(), shape: shape.clone() };
-        Self { device: view(&self.device), host: view(&self.host) }
+        Self {
+            device: view(&self.device),
+            host: view(&self.host),
+            reached_host: self.reached_host.as_ref().map(view),
+        }
     }
 
     /// Whether the stores `device` reaches hold `demand` beside every
@@ -269,11 +284,16 @@ impl DeviceLedgers {
             ledgers.iter().all(|ledger| claims.iter().filter(|claim| Arc::ptr_eq(&claim.ledger().store, &ledger.store)).count() <= 1),
             "invariant violated: a holding of two claims in one store"
         );
-        let unclaimed = ledgers
+        let mut unclaimed: Vec<_> = ledgers
             .into_iter()
             .filter(|ledger| !claims.iter().any(|claim| Arc::ptr_eq(&claim.ledger().store, &ledger.store)))
             .map(|ledger| (ledger.clone(), kind))
             .collect();
+        if let Some(extra) = &self.reached_host {
+            if !claims.iter().any(|claim| Arc::ptr_eq(&claim.ledger().store, &extra.store)) {
+                unclaimed.push((extra.clone(), kind));
+            }
+        }
         Held { claims, unclaimed, changes: self.device.store.changes.clone() }
     }
 
@@ -316,6 +336,9 @@ impl DeviceLedgers {
             } else if !(unified && index == 1) {
                 unclaimed.push((ledger.clone(), kind));
             }
+        }
+        if let Some(extra) = &self.reached_host {
+            unclaimed.push((extra.clone(), kind));
         }
         Ok(Held { claims, unclaimed, changes: self.device.store.changes.clone() })
     }
@@ -453,62 +476,7 @@ impl DeviceLedgers {
     /// [`Self::read`], `after_idle` marking the first unpressured reading
     /// after an unmonitored idle sleep.
     pub fn read_after(&self, device: &seismic::Device, sample: &Sample, after_idle: bool) -> DeviceReading {
-        let topology = device.topology();
-        let path = device
-            .info()
-            .paths(seismic::Contract::DeviceOnly)
-            .first()
-            .and_then(|path| topology.access_path(*path))
-            .expect("an opened device places device storage");
-        let grant_from_status = || match sample.status().grant_left(path) {
-            Some(Ok(left)) => left.value,
-            Some(Err(error)) => panic!("invariant violated: {} read no grant of its own memory: {error}", device.info().selector()),
-            None => panic!("invariant violated: an opened device whose memory is its own reports no grant"),
-        };
-        let grant = match path.grant() {
-            None => DeviceGrant::Host,
-            Some(grant) => match grant.kind {
-                seismic::GrantKind::Wired => {
-                    let left = sample
-                        .status()
-                        .grant_left(path)
-                        .and_then(Result::ok)
-                        .map(|reported| reported.value);
-                    DeviceGrant::Wired { working_set: grant.bytes.value, left }
-                }
-                seismic::GrantKind::HostLimit => DeviceGrant::HostLimit { limit: grant.bytes.value },
-                seismic::GrantKind::HostBudget => {
-                    let left = sample
-                        .grant
-                        .unwrap_or_else(|| panic!("invariant violated: {} read no grant with its usage", device.info().selector()))
-                        .left
-                        .min(grant.bytes.value);
-                    DeviceGrant::HostBudget { capacity: grant.bytes.value, left }
-                }
-                seismic::GrantKind::DeviceUnopened => {
-                    let capacity = topology.store(path.store()).expect("a path's store is of its revision").capacity().value;
-                    let free = sample.grant.map_or_else(grant_from_status, |grant| grant.left);
-                    let cache_reserve = match device.backend() {
-                        seismic::BackendName::Cuda => crate::memory::supply::cuda_context_cache_reserve(capacity),
-                        _ => 0,
-                    };
-                    DeviceGrant::Own { capacity, free, cache_reserve }
-                }
-                seismic::GrantKind::DeviceOpened => {
-                    let store_capacity = topology.store(path.store()).expect("a path's store is of its revision").capacity().value;
-                    let capacity = match grant.bytes.by {
-                        seismic::ReportedBy::DxgiLocalBudget => store_capacity.min(grant.bytes.value),
-                        _ => store_capacity,
-                    };
-                    let free = grant_from_status().min(capacity);
-                    let cache_reserve = match device.backend() {
-                        seismic::BackendName::Cuda => crate::memory::supply::cuda_context_cache_reserve(capacity),
-                        _ => 0,
-                    };
-                    DeviceGrant::Own { capacity, free, cache_reserve }
-                }
-            },
-        };
+        let grant = device_grant(device.topology(), device.info(), sample);
         self.read_granted_after(sample, grant, after_idle)
     }
 
@@ -535,11 +503,17 @@ impl DeviceLedgers {
                     host: None,
                 }
             }
-            (true, DeviceGrant::HostLimit { limit }) => {
-                DeviceReading { device: self.host.read_after(at, Reading::host_limit(sample.host(), limit), after_idle), host: None }
+            (true, DeviceGrant::HostLimit { limit, dedicated }) => {
+                DeviceReading {
+                    device: self.host.read_after(at, Reading::host_limit(sample.host(), limit).with_dedicated(dedicated), after_idle),
+                    host: None,
+                }
             }
-            (true, DeviceGrant::HostBudget { capacity, left }) => {
-                DeviceReading { device: self.host.read_after(at, Reading::host_budget(sample.host(), capacity, left), after_idle), host: None }
+            (true, DeviceGrant::HostBudget { capacity, left, dedicated }) => {
+                DeviceReading {
+                    device: self.host.read_after(at, Reading::host_budget(sample.host(), capacity, left).with_dedicated(dedicated), after_idle),
+                    host: None,
+                }
             }
             (false, DeviceGrant::Own { capacity, free, cache_reserve }) => {
                 let host = self.host.read_after(at, Reading::host(sample.host()), after_idle);
@@ -565,7 +539,7 @@ impl DeviceLedgers {
     #[cfg(any(test, feature = "fixtures"))]
     pub fn unified_in(scope: &Ledgers, shape: Arc<LoadShape>) -> UnreadLedgers {
         let host = scope.view(seismic::StoreIdentity::HostRam, shape);
-        UnreadLedgers(Self { device: host.clone(), host })
+        UnreadLedgers(Self { device: host.clone(), host, reached_host: None })
     }
 
     /// The changes of the scope these ledgers are in, which a sample paired
@@ -745,7 +719,10 @@ impl DeviceLedgers {
 
     /// The ledger of `store`, where these keep one.
     pub fn keeping(&self, store: &seismic::StoreIdentity) -> Option<&Ledger> {
-        [&self.device, &self.host].into_iter().find(|ledger| ledger.store.identity == *store)
+        [Some(&self.device), Some(&self.host), self.reached_host.as_ref()]
+            .into_iter()
+            .flatten()
+            .find(|ledger| ledger.store.identity == *store)
     }
 
     /// Pre-claimed [`CommittedKind::Measurement`] room for an in-process
@@ -928,11 +905,13 @@ pub enum DeviceGrant {
     /// `MTLDevice.currentAllocatedSize` ([`Reading::unified_with_left`]).
     Wired { working_set: u64, left: Option<u64> },
     /// Unified host RAM bounded by a static device ceiling (unified CUDA's
-    /// total or usable memory on Linux or Windows).
-    HostLimit { limit: u64 },
+    /// total or usable memory on Linux or Windows), plus any OS-unmanaged
+    /// DXGI-dedicated carve-out bytes spanned by the placement.
+    HostLimit { limit: u64, dedicated: u64 },
     /// Unified host RAM bounded by a Vulkan heap budget (`left` left of
-    /// `capacity` beyond current heap usage).
-    HostBudget { capacity: u64, left: u64 },
+    /// `capacity` beyond current heap usage), plus any OS-unmanaged
+    /// DXGI-dedicated carve-out bytes spanned by the placement.
+    HostBudget { capacity: u64, left: u64, dedicated: u64 },
     /// A store of the device's own: `free` of its `capacity` that its grant
     /// leaves, read in step with what the ledger counts, plus an elastic-cache
     /// reserve kept free for external contexts (e.g. CUDA primary context
@@ -1238,6 +1217,110 @@ impl Recorded {
     }
 }
 
+/// Resolve the [`DeviceGrant`] for `executor`'s `DeviceOnly` placement at
+/// `sample`.
+///
+/// Unified devices on Windows with DXGI-reported dedicated memory (e.g. Intel
+/// Arc 140V reporting a 128 MiB compatibility carve-out, or AMD Strix Halo
+/// reporting a 96 GB BIOS carve-out) place `DeviceOnly` across two paths:
+/// `[DeviceMemory(dedicated), HostRam(total - dedicated)]`, both carrying the
+/// same unified [`seismic::GrantKind`]. Summing grants across every path in the
+/// placement gives the full unified grant capacity rather than only Path 0's
+/// dedicated carve-out, and records the OS-unmanaged `dedicated` carve-out so
+/// [`Reading::with_dedicated`] restores it alongside `GlobalMemoryStatusEx`.
+pub(crate) fn device_grant(
+    topology: &seismic::DeviceTopology,
+    executor: &seismic::Executor,
+    sample: &Sample,
+) -> DeviceGrant {
+    let path_ids = executor.paths(seismic::Contract::DeviceOnly);
+    let first = path_ids
+        .first()
+        .and_then(|path| topology.access_path(*path))
+        .expect("an opened device places device storage");
+    let grant_from_status = || match sample.status().grant_left(first) {
+        Some(Ok(left)) => left.value,
+        Some(Err(error)) => panic!("invariant violated: {} read no grant of its own memory: {error}", executor.selector()),
+        None => panic!("invariant violated: an opened device whose memory is its own reports no grant"),
+    };
+    let unified_totals = |expected: seismic::GrantKind| -> (u64, u64) {
+        let mut total = 0u64;
+        let mut dedicated = 0u64;
+        for id in path_ids {
+            let path = topology
+                .access_path(*id)
+                .expect("a placement's path belongs to its topology");
+            let grant = path
+                .grant()
+                .expect("invariant violated: a unified placement mixes granted and ungranted paths");
+            assert_eq!(
+                grant.kind, expected,
+                "invariant violated: a unified placement mixes grant kinds ({expected:?} vs {:?})",
+                grant.kind
+            );
+            total = total.saturating_add(grant.bytes.value);
+            if matches!(
+                topology.store(path.store()).expect("a path's store is of its revision").kind(),
+                seismic::StoreKind::DeviceMemory(_)
+            ) {
+                dedicated = dedicated.saturating_add(grant.bytes.value);
+            }
+        }
+        (total, dedicated)
+    };
+    match first.grant() {
+        None => DeviceGrant::Host,
+        Some(grant) => match grant.kind {
+            seismic::GrantKind::Wired => {
+                let (working_set, _) = unified_totals(seismic::GrantKind::Wired);
+                let left = path_ids
+                    .iter()
+                    .map(|id| {
+                        let path = topology.access_path(*id).expect("a placement's path belongs to its topology");
+                        sample.status().grant_left(path).and_then(Result::ok).map(|reported| reported.value)
+                    })
+                    .try_fold(0u64, |acc, left| left.map(|bytes| acc.saturating_add(bytes)));
+                DeviceGrant::Wired { working_set, left }
+            }
+            seismic::GrantKind::HostLimit => {
+                let (limit, dedicated) = unified_totals(seismic::GrantKind::HostLimit);
+                DeviceGrant::HostLimit { limit, dedicated }
+            }
+            seismic::GrantKind::HostBudget => {
+                let (capacity, dedicated) = unified_totals(seismic::GrantKind::HostBudget);
+                let left = sample
+                    .grant
+                    .unwrap_or_else(|| panic!("invariant violated: {} read no grant with its usage", executor.selector()))
+                    .left
+                    .min(capacity);
+                DeviceGrant::HostBudget { capacity, left, dedicated }
+            }
+            seismic::GrantKind::DeviceUnopened => {
+                let capacity = topology.store(first.store()).expect("a path's store is of its revision").capacity().value;
+                let free = sample.grant.map_or_else(grant_from_status, |grant| grant.left);
+                let cache_reserve = match executor.backend() {
+                    seismic::BackendName::Cuda => crate::memory::supply::cuda_context_cache_reserve(capacity),
+                    _ => 0,
+                };
+                DeviceGrant::Own { capacity, free, cache_reserve }
+            }
+            seismic::GrantKind::DeviceOpened => {
+                let store_capacity = topology.store(first.store()).expect("a path's store is of its revision").capacity().value;
+                let capacity = match grant.bytes.by {
+                    seismic::ReportedBy::DxgiLocalBudget => store_capacity.min(grant.bytes.value),
+                    _ => store_capacity,
+                };
+                let free = grant_from_status().min(capacity);
+                let cache_reserve = match executor.backend() {
+                    seismic::BackendName::Cuda => crate::memory::supply::cuda_context_cache_reserve(capacity),
+                    _ => 0,
+                };
+                DeviceGrant::Own { capacity, free, cache_reserve }
+            }
+        },
+    }
+}
+
 /// Whether `device`'s own memory and host RAM are one store: unified memory,
 /// where the device's room and host RAM share one ceiling. A discrete
 /// device's memory is apart from host RAM's. The one rule a search's room
@@ -1287,9 +1370,115 @@ pub fn own_lag(store: &seismic::StoreIdentity, host: &seismic::HostSample) -> se
 
 #[cfg(test)]
 mod tests {
-    use super::executor_shares_host;
-    use seismic::fixtures::recorded;
-    use seismic::{Availability, Contract, GrantKind};
+    use super::{device_grant, executor_shares_host, DeviceGrant, DeviceLedgers, Ledgers, LoadShape, Sample};
+    use seismic::fixtures::{
+        recorded, LUNAR_LAKE_WINDOWS_DEDICATED, LUNAR_LAKE_WINDOWS_HEAP, LUNAR_LAKE_WINDOWS_HOST,
+        STRIX_HALO_WINDOWS_DEDICATED, STRIX_HALO_WINDOWS_HEAPS, STRIX_HALO_WINDOWS_HOST,
+    };
+    use seismic::{Availability, BackendName, Contract, GrantKind};
+    use std::sync::Arc;
+    use std::time::{Duration, Instant};
+
+    fn windows_host_sample(total: u64, free: u64) -> seismic::HostSample {
+        let at = Instant::now();
+        seismic::HostSample {
+            at,
+            page_bytes: 4_096,
+            total,
+            supply: seismic::Supply {
+                free_beyond_target: i64::try_from(free).expect("bytes fit i64"),
+                clean_cache: 0,
+                cold_reclaimable: 0,
+            },
+            reclaim_band: 128 << 20,
+            counted: seismic::Counted { at, lag: Duration::ZERO },
+            cold: seismic::ColdPages::default(),
+            own_reclaimed: None,
+            wired: None,
+            harm: None,
+            pressure: None,
+            lag: seismic::Lag { release: Duration::ZERO, growth: Duration::ZERO },
+        }
+    }
+
+    /// Windows 11 Intel Arc 140V (Lunar Lake iGPU, #275): DXGI reports a 128 MiB
+    /// compatibility dedicated carve-out while Vulkan exposes a ~18 GiB unified
+    /// heap. `device_grant` must sum both placement paths (`DeviceMemory` +
+    /// `HostRam`) instead of clamping `HostBudget` to Path 0's 128 MiB.
+    #[test]
+    fn windows_lunar_lake_igpu_reads_full_shared_heap_grant_not_128mb_dedicated() {
+        let topology = recorded::lunar_lake_windows();
+        let vulkan = topology
+            .executors()
+            .iter()
+            .find(|exec| exec.backend() == BackendName::Vulkan)
+            .expect("Lunar Lake Windows Vulkan executor");
+        assert!(executor_shares_host(&topology, vulkan));
+        assert_eq!(vulkan.paths(Contract::DeviceOnly).len(), 2);
+
+        let scope = Ledgers::new();
+        let mut sample = Sample::scripted(
+            scope.changes(),
+            windows_host_sample(LUNAR_LAKE_WINDOWS_HOST, 24 * seismic::fixtures::GB),
+        );
+        let live_left = 16 * seismic::fixtures::GB;
+        sample.grant = Some(seismic::memory::Grant { left: live_left });
+
+        let grant = device_grant(&topology, vulkan, &sample);
+        match grant {
+            DeviceGrant::HostBudget { capacity, left, dedicated } => {
+                assert_eq!(capacity, LUNAR_LAKE_WINDOWS_HEAP);
+                assert_eq!(left, live_left);
+                assert_eq!(dedicated, LUNAR_LAKE_WINDOWS_DEDICATED);
+            }
+            other => panic!("expected HostBudget, got {other:?}"),
+        }
+
+        let (_, reading) = DeviceLedgers::unified_in(&scope, Arc::new(LoadShape { stores: Vec::new() }))
+            .read_granted(&sample, grant);
+        assert_eq!(reading.device.capacity(), LUNAR_LAKE_WINDOWS_HEAP);
+        assert_eq!(reading.device.budget(), live_left);
+    }
+
+    /// Windows 11 AMD Strix Halo (96 GB BIOS carve-out + 32 GB Windows RAM,
+    /// 110 GB Vulkan heaps): `device_grant` sums both paths (`96 GB + 14 GB`)
+    /// and restores the 96 GB OS-unmanaged carve-out via `with_dedicated`, so
+    /// capacity is 110 GB rather than being capped at 32 GB `WindowsTotalPhys`
+    /// or 96 GB Path 0.
+    #[test]
+    fn windows_strix_halo_reads_full_dedicated_plus_shared_grant() {
+        let topology = recorded::strix_halo_windows();
+        let vulkan = topology
+            .executors()
+            .iter()
+            .find(|exec| exec.backend() == BackendName::Vulkan)
+            .expect("Strix Halo Windows Vulkan executor");
+        assert!(executor_shares_host(&topology, vulkan));
+
+        let expected_total: u64 = STRIX_HALO_WINDOWS_HEAPS.iter().sum();
+        let scope = Ledgers::new();
+        let mut sample = Sample::scripted(
+            scope.changes(),
+            windows_host_sample(STRIX_HALO_WINDOWS_HOST, 20 * seismic::fixtures::GB),
+        );
+        let live_left = 100 * seismic::fixtures::GB;
+        sample.grant = Some(seismic::memory::Grant { left: live_left });
+
+        let grant = device_grant(&topology, vulkan, &sample);
+        match grant {
+            DeviceGrant::HostBudget { capacity, left, dedicated } => {
+                assert_eq!(capacity, expected_total);
+                assert_eq!(left, live_left);
+                assert_eq!(dedicated, STRIX_HALO_WINDOWS_DEDICATED);
+            }
+            other => panic!("expected HostBudget, got {other:?}"),
+        }
+
+        let (_, reading) = DeviceLedgers::unified_in(&scope, Arc::new(LoadShape { stores: Vec::new() }))
+            .read_granted(&sample, grant);
+        assert_eq!(reading.device.capacity(), expected_total);
+        assert_eq!(reading.device.budget(), live_left);
+    }
 
     /// Every available executor of every recorded machine whose ledgers
     /// open (it places device and shared storage: the A10-8Q's Vulkan
@@ -1309,6 +1498,7 @@ mod tests {
             recorded::strix_halo_linux(),
             recorded::strix_halo_windows(),
             recorded::lunar_lake(),
+            recorded::lunar_lake_windows(),
             recorded::ryzen_igpu_and_rtx4070(),
             recorded::a10_8q(),
         ];

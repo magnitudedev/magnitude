@@ -296,6 +296,24 @@ impl Reading {
         Self { grant: Some(HostGrant::Budget { capacity, left }), ..Self::host(sample) }
     }
 
+    /// Add `dedicated` bytes of OS-unmanaged device-dedicated memory (e.g.
+    /// Windows DXGI `DedicatedVideoMemory` on an integrated GPU whose placement
+    /// spans `[DeviceMemory(dedicated), HostRam(beyond)]`) to this unified
+    /// host reading's total and immediate free supply.
+    ///
+    /// Windows `GlobalMemoryStatusEx::ullTotalPhys` excludes BIOS-carved-out
+    /// dedicated memory (e.g. 96 GB on Strix Halo, 128 MiB on Intel Arc 140V),
+    /// while the unified Vulkan/CUDA grant spans both the dedicated carve-out
+    /// and shared system RAM.
+    pub fn with_dedicated(mut self, dedicated: u64) -> Self {
+        if dedicated > 0 {
+            self.total = self.total.saturating_add(dedicated);
+            let add = i64::try_from(dedicated).expect("dedicated memory fits i64");
+            self.supply.free_beyond_target = self.supply.free_beyond_target.saturating_add(add);
+        }
+        self
+    }
+
     /// A device store's reading: `free` of `capacity` its grant leaves
     /// (CUDA's free, Vulkan's budget less usage), its changes showing after
     /// `lag` (the device's, held by the machine's assessment).

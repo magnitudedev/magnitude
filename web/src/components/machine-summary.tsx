@@ -33,16 +33,16 @@ export function HardwareSummary({
     : MonitorIcon
   const roles = deriveHardwareRoles(value)
   const unified = roles.unifiedMemory
-  const dedicated = roles.devices.flatMap(({ accelerator, dedicatedMemoryBytes }) => Option.match(dedicatedMemoryBytes, {
+  const dedicated = roles.devices.flatMap(({ accelerator, dedicatedMemoryBytes, placesOnHost }) => Option.match(dedicatedMemoryBytes, {
     onNone: () => [],
-    onSome: bytes => [{ name: accelerator.name, bytes }],
+    onSome: bytes => [{ name: accelerator.name, bytes, placesOnHost }],
   }))
   const gpuSummary = dedicated.length > 1
     ? `${dedicated.length} GPUs · ${dedicated.every(device => device.bytes === dedicated[0]!.bytes)
       ? `${capacity(dedicated[0]!.bytes)} VRAM each`
       : `${dedicated.map(device => capacity(device.bytes)).join(" / ")} VRAM`}`
     : dedicated.length === 1
-    ? `${dedicated[0]!.name} · ${capacity(dedicated[0]!.bytes)} VRAM`
+    ? `${dedicated[0]!.name} · ${capacity(dedicated[0]!.bytes)} VRAM${dedicated[0]!.placesOnHost ? " + shared system RAM" : ""}`
     : Option.getOrElse(value.processor, () => "Processor not identified")
   const summary = dedicated.length
     ? gpuSummary
