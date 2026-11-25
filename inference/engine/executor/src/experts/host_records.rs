@@ -1870,7 +1870,7 @@ impl HostRecords {
         scratch_group: ScratchGroup,
         rank: impl Rank<K>,
         may_evict: bool,
-        copy: Option<&mut dyn FnMut(u32, u32)>,
+        copy: Option<&mut dyn FnMut(u32, u32) -> bool>,
     ) -> bool {
         self.lease_records(scratch_group, None, rank, may_evict, copy)
     }
@@ -1885,7 +1885,7 @@ impl HostRecords {
         target_records: Option<&[u32]>,
         rank: impl Rank<K>,
         may_evict: bool,
-        mut copy: Option<&mut dyn FnMut(u32, u32)>,
+        mut copy: Option<&mut dyn FnMut(u32, u32) -> bool>,
     ) -> bool {
         if self.leased_records(target_records) {
             return true;
@@ -1916,18 +1916,26 @@ impl HostRecords {
             // Process hottest first so ready slots and coldest victims go to
             // the most valuable experts, with at most one copy per expert.
             kept_in_lent.sort_unstable_by(|a, b| b.0.cmp(&a.0).then_with(|| a.1.cmp(&b.1)));
-            let mut idx = 0;
-            while idx < kept_in_lent.len() {
-                let Some(&dst) = self.ready.range(self.lent..).next() else {
-                    break;
-                };
-                let src = kept_in_lent[idx].1;
-                copy_fn(src, dst);
-                self.relocate(src, dst, scratch_group);
-                idx += 1;
+            let mut ready: Vec<u32> = self.ready.range(self.lent..).copied().collect();
+            let mut relocated = vec![false; kept_in_lent.len()];
+            let mut unplaced = Vec::new();
+            for (idx, &(hot_rank, src)) in kept_in_lent.iter().enumerate() {
+                let mut placed = false;
+                for pos in 0..ready.len() {
+                    let dst = ready[pos];
+                    if copy_fn(src, dst) {
+                        ready.remove(pos);
+                        self.relocate(src, dst, scratch_group);
+                        relocated[idx] = true;
+                        placed = true;
+                        break;
+                    }
+                }
+                if !placed {
+                    unplaced.push((idx, hot_rank, src));
+                }
             }
-            let remaining = kept_in_lent.len() - idx;
-            if remaining > 0 && may_evict {
+            if !unplaced.is_empty() && may_evict {
                 let mut victims = (self.lent..self.extent())
                     .filter_map(|dst| match self.records[dst as usize] {
                         Host::Kept(Whole { staged, kept, read, holds: 0, .. }) => {
@@ -1936,27 +1944,33 @@ impl HostRecords {
                         _ => None,
                     })
                     .collect::<Vec<_>>();
-                if remaining < victims.len() {
-                    victims.select_nth_unstable_by(remaining, |a, b| a.0.cmp(&b.0).then_with(|| a.1.cmp(&b.1)));
-                    victims.truncate(remaining);
-                }
                 victims.sort_unstable_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.cmp(&b.1)));
-                for (victim_rank, victim_staged, dst) in victims {
-                    let (hot_rank, src) = kept_in_lent[idx];
-                    if victim_rank >= hot_rank {
-                        break;
+                let mut victim_used = vec![false; victims.len()];
+                for (idx, hot_rank, src) in unplaced {
+                    for (pos, &(victim_rank, victim_staged, dst)) in victims.iter().enumerate() {
+                        if victim_rank >= hot_rank {
+                            break;
+                        }
+                        if victim_used[pos] {
+                            continue;
+                        }
+                        if copy_fn(src, dst) {
+                            victim_used[pos] = true;
+                            self.unmap_from(victim_staged, dst, Some(scratch_group.into()));
+                            self.set(dst, Host::Ready);
+                            self.relocate(src, dst, scratch_group);
+                            relocated[idx] = true;
+                            break;
+                        }
                     }
-                    self.unmap_from(victim_staged, dst, Some(scratch_group.into()));
-                    self.set(dst, Host::Ready);
-                    copy_fn(src, dst);
-                    self.relocate(src, dst, scratch_group);
-                    idx += 1;
                 }
             }
-            for &(_, record) in &kept_in_lent[idx..] {
-                let staged = self.unkeep(record);
-                self.unmap_from(staged, record, Some(scratch_group.into()));
-                self.set(record, Host::Claimed);
+            for (idx, &(_, record)) in kept_in_lent.iter().enumerate() {
+                if !relocated[idx] {
+                    let staged = self.unkeep(record);
+                    self.unmap_from(staged, record, Some(scratch_group.into()));
+                    self.set(record, Host::Claimed);
+                }
             }
         } else {
             for (_, record) in kept_in_lent {
@@ -3047,7 +3061,10 @@ mod tests {
         // Place expert 7 in lent record 0 (hot, last read at step 5).
         tier.keep(0, (0, 7));
         let mut copied = Vec::new();
-        let mut copy_fn = |src: u32, dst: u32| copied.push((src, dst));
+        let mut copy_fn = |src: u32, dst: u32| {
+            copied.push((src, dst));
+            true
+        };
         assert!(tier.lease(scratch_group, |_, _| Some(5u64), true, Some(&mut copy_fn)));
         assert_eq!(copied, vec![(0, 2)], "hot expert in lent record 0 copied to ready record 2");
         assert!(tier.is_claimed(0) && tier.is_claimed(1), "both lent records claimed");
@@ -3073,7 +3090,10 @@ mod tests {
         let group_start = steps.begin_group(2, None);
         let scratch_group = ScratchGroup::at(group_start, 2);
         let mut copied = Vec::new();
-        let mut copy_fn = |src: u32, dst: u32| copied.push((src, dst));
+        let mut copy_fn = |src: u32, dst: u32| {
+            copied.push((src, dst));
+            true
+        };
         assert!(tier.lease(scratch_group, |_, _| Some(5u64), true, Some(&mut copy_fn)));
         assert_eq!(copied, vec![(0, 2)]);
         assert!(views[0].from(7) <= earlier, "relocate must not shrink MAP_FROM past earlier steps");
@@ -3155,7 +3175,10 @@ mod tests {
             _ => 0u64,
         };
         let mut copied = Vec::new();
-        let mut copy_fn = |src: u32, dst: u32| copied.push((src, dst));
+        let mut copy_fn = |src: u32, dst: u32| {
+            copied.push((src, dst));
+            true
+        };
         assert!(tier.lease(scratch_group, rank, true, Some(&mut copy_fn)));
         // Only record 1 (expert 11, rank 100) relocates, evicting record 2 (expert 12, rank 10).
         // Record 0 (expert 10, rank 1) is colder than record 3 (rank 50), so it is evicted without copy.
@@ -3167,6 +3190,54 @@ mod tests {
         assert_eq!(views[0].resolve(11, group_start), Some(2));
         assert_eq!(views[0].resolve(12, group_start), None);
         assert_eq!(views[0].resolve(10, group_start), None);
+        assert!(tier.is_claimed(0) && tier.is_claimed(1));
+    }
+
+    /// When `copy` declines a destination (e.g. a slab with an unsettled
+    /// `AdoptFence` inside `NoBlockingAllocationGuard`), `lease()` skips that
+    /// destination without unmapping a victim, relocates into a settled
+    /// destination when available, and evicts cleanly when none is available.
+    #[test]
+    fn lease_skips_declined_destination_without_unmapping_victim() {
+        let steps = Arc::new(Steps::new(crate::planning::FlightDepth::SERIAL, 4, crate::experts::exchange::Pulse::new()));
+        steps.begin_through(20);
+        // 5 records total: bottom 2 lent (`0..2`), 3 past lent (`2..5`).
+        let (mut tier, maps) = mapped_on(steps.clone(), 5, 1, &[(0, EXPERTS)], Resolution::BeforeStamp);
+        tier.lent = 2;
+        let Maps::Stamped(views) = maps else { unreachable!() };
+        // Lent: record 0 = hot (rank 100), record 1 = warm (rank 80).
+        // Past lent: record 2 = coldest victim (rank 10, unsettled),
+        //            record 3 = next coldest victim (rank 20, settled),
+        //            record 4 = ready (unsettled).
+        tier.keep(0, (0, 10));
+        tier.keep(1, (0, 11));
+        tier.keep(2, (0, 12));
+        tier.keep(3, (0, 13));
+        let group_start = steps.begin_group(2, None);
+        let scratch_group = ScratchGroup::at(group_start, 2);
+        let rank = |staged: Staged, _: Option<Step>| match staged.1 {
+            10 => 100u64,
+            11 => 80u64,
+            12 => 10u64,
+            13 => 20u64,
+            _ => 0u64,
+        };
+        let mut copied = Vec::new();
+        let mut copy_fn = |src: u32, dst: u32| {
+            // Records 2 and 4 simulate slabs with unsettled AdoptFences.
+            if dst == 2 || dst == 4 {
+                return false;
+            }
+            copied.push((src, dst));
+            true
+        };
+        assert!(tier.lease(scratch_group, rank, true, Some(&mut copy_fn)));
+        assert_eq!(copied, vec![(0, 3)], "hot expert 10 skips unsettled ready 4 and victim 2, relocates into settled victim 3");
+        assert_eq!(tier.kept_record((0, 10)), Some(3), "expert 10 relocated to settled victim 3");
+        assert_eq!(tier.kept_record((0, 12)), Some(2), "unsettled victim 2 must NOT be unmapped when copy declines");
+        assert_eq!(views[0].resolve(12, group_start), Some(2));
+        assert_eq!(tier.kept_record((0, 13)), None, "settled victim 3 evicted to make room for expert 10");
+        assert_eq!(tier.kept_record((0, 11)), None, "expert 11 evicted cleanly when no settled destination remained");
         assert!(tier.is_claimed(0) && tier.is_claimed(1));
     }
 

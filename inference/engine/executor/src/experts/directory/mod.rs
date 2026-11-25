@@ -3048,7 +3048,7 @@ impl Directory {
     /// records claimed now ([`Self::resize_pool`]). Whether the group holds
     /// the records its scratch lies in ([`Self::leased`]).
     #[cfg(test)]
-    pub fn lease(&mut self, lender: usize, scratch_group: ScratchGroup, may_evict: bool, copy: Option<&mut dyn FnMut(u32, u32)>) -> bool {
+    pub fn lease(&mut self, lender: usize, scratch_group: ScratchGroup, may_evict: bool, copy: Option<&mut dyn FnMut(u32, u32) -> bool>) -> bool {
         self.lease_records(lender, scratch_group, None, may_evict, copy, |_, _| true)
     }
 
@@ -3062,7 +3062,7 @@ impl Directory {
         scratch_group: ScratchGroup,
         target_records: Option<&[u32]>,
         may_evict: bool,
-        copy: Option<&mut dyn FnMut(u32, u32)>,
+        copy: Option<&mut dyn FnMut(u32, u32) -> bool>,
     ) {
         let before = self.host[lender].claimed();
         if !self.host[lender].leased_records(target_records) {
@@ -3141,7 +3141,7 @@ impl Directory {
         scratch_group: ScratchGroup,
         target_records: Option<&[u32]>,
         may_evict: bool,
-        copy: Option<&mut dyn FnMut(u32, u32)>,
+        copy: Option<&mut dyn FnMut(u32, u32) -> bool>,
         mut can_reuse: impl FnMut(usize, usize) -> bool,
     ) -> bool {
         self.lease_host_records(lender, scratch_group, target_records, may_evict, copy);

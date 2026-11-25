@@ -272,6 +272,10 @@ struct PoolState {
     /// outside the pool lock once `releasing` is empty, `dropping == 0`, and
     /// `waiting` is false.
     wakers: Vec<Box<dyn FnOnce() + Send>>,
+    /// Unsettled [`AdoptFence`]s created by [`Slots::adopt`] whose async
+    /// `MoveStep::Copy` completions should be retired once their flights end
+    /// ([`Pool::return_freed_sync`] and [`Pool::await_owed`]).
+    pending_adopts: Vec<Arc<AdoptFence>>,
     #[cfg(test)]
     waiters: Vec<std::thread::JoinHandle<()>>,
 }
@@ -389,6 +393,7 @@ impl Pool {
                 dropping: 0,
                 waiting: false,
                 wakers: Vec::new(),
+                pending_adopts: Vec::new(),
                 #[cfg(test)]
                 waiters: Vec::new(),
             }),
@@ -637,7 +642,19 @@ impl Pool {
             }
         }
         self.wait_release_idle();
+        self.settle_pending_adopts();
         Ok(returned)
+    }
+
+    /// Wait on and settle any [`AdoptFence`]s queued by [`Slots::adopt`] on
+    /// this non-blocking-free thread, flipping `AdoptFence::settled` to `true`
+    /// and dropping their `DeviceCompletion`s so subsequent host reads inside
+    /// `NoBlockingAllocationGuard` take the lock-free fast path.
+    fn settle_pending_adopts(&self) {
+        let adopts = std::mem::take(&mut self.0.state().pending_adopts);
+        for fence in adopts {
+            let _ = fence.wait();
+        }
     }
 
     /// Where blocks wait on flights to return, return them as those flights
@@ -660,7 +677,7 @@ impl Pool {
             }
             let mut fences = state.granules.awaited().unwrap_or_default();
             fences.extend(state.releasing.iter().map(|(_, uses)| uses.clone()));
-            if fences.is_empty() {
+            if fences.is_empty() && state.pending_adopts.is_empty() {
                 return;
             }
             state.waiting = true;
@@ -676,11 +693,12 @@ impl Pool {
             // so `wake_on_release()` / `releasing()` never observe a gap before
             // newly emptied blocks have physically dropped.
             pool.return_empty();
+            pool.settle_pending_adopts();
             let next = {
                 let mut state = pool.0.state();
                 let mut fences = state.granules.awaited().unwrap_or_default();
                 fences.extend(state.releasing.iter().map(|(_, uses)| uses.clone()));
-                if fences.is_empty() {
+                if fences.is_empty() && state.pending_adopts.is_empty() {
                     state.waiting = false;
                     let wakers = if !state.is_releasing() {
                         std::mem::take(&mut state.wakers)
@@ -893,8 +911,12 @@ impl AdoptFence {
         drop(stale);
     }
 
+    fn is_settled(&self) -> bool {
+        self.settled.load(Ordering::Acquire)
+    }
+
     fn wait(&self) -> Result<(), ExecutionError> {
-        if self.settled.load(Ordering::Acquire) {
+        if self.is_settled() {
             return Ok(());
         }
         seismic_memory::assert_blocking_allocation_allowed("AdoptFence::wait");
@@ -965,6 +987,13 @@ impl SlabHold {
             Some(fence) => fence.wait(),
             None => Ok(()),
         }
+    }
+
+    /// Whether any pending slab-adoption copy (`Slots::adopt`) populating
+    /// this slab has settled. Lock-free and driver-free; safe inside a
+    /// no-blocking-allocation scope.
+    pub(crate) fn is_adopted(&self) -> bool {
+        self.adopt.as_ref().is_none_or(|fence| fence.is_settled())
     }
 }
 
@@ -1551,6 +1580,9 @@ impl Slots {
         // the pool's newest uses (the copy and repoint among them).
         let previous = guard.disarm();
         fence.submitted(copy_written);
+        if !fence.is_settled() {
+            pool.state().pending_adopts.push(fence);
+        }
         drop(previous);
         Ok(adopted)
     }
@@ -2844,6 +2876,7 @@ mod tests {
             assert!(slabs.is_backed(0));
             assert!(!slabs.is_backed(1));
             let view = slabs.slab_region(0, 0).unwrap().unwrap();
+            assert!(!view.is_adopted(), "unsettled adopt fence must report !is_adopted without blocking");
             assert_eq!(completed_calls.load(Ordering::Acquire), 0, "region_view must never poll completion");
             assert_eq!(ended_calls.load(Ordering::Acquire), 0, "region_view must never wait on completion");
             assert!(
@@ -2868,10 +2901,92 @@ mod tests {
         completer.join().unwrap();
         assert_eq!(ended_calls.load(Ordering::Acquire), 1);
 
-        // Once settled, `wait_adopted` takes the lock-free fast path even
-        // inside a `NoBlockingAllocationGuard` without touching the completion.
+        // Once settled, `is_adopted` is true and `wait_adopted` takes the
+        // lock-free fast path even inside a `NoBlockingAllocationGuard`
+        // without touching the completion.
         {
             let _no_alloc = seismic_memory::enter_no_blocking_allocation();
+            assert!(view.is_adopted());
+            view.wait_adopted().unwrap();
+        }
+        assert_eq!(ended_calls.load(Ordering::Acquire), 1);
+    }
+
+    /// `Pool::return_freed_sync` settles any `pending_adopts` before returning
+    /// so subsequent `is_adopted()` / `wait_adopted()` inside a
+    /// `NoBlockingAllocationGuard` succeed lock-free without touching the
+    /// completion.
+    #[test]
+    fn return_freed_sync_settles_pending_adopt_fences_for_no_blocking_scope() {
+        struct CountingCompletion {
+            flight: Arc<Flight>,
+            ended_calls: Arc<AtomicU64>,
+        }
+
+        impl DeviceCompletion for CountingCompletion {
+            fn completed(&self) -> Result<bool, ExecutionError> {
+                Ok(*self.flight.done.lock().unwrap())
+            }
+
+            fn ended(&self) -> Result<(), ExecutionError> {
+                self.ended_calls.fetch_add(1, Ordering::AcqRel);
+                let mut done = self.flight.done.lock().unwrap();
+                while !*done {
+                    done = self.flight.ended.wait(done).unwrap();
+                }
+                Ok(())
+            }
+        }
+
+        let catalog = crate::devices::Devices::discover(&[]).unwrap();
+        let id = catalog.resolve(seismic_topology::ExecutorSelector::HostCpu).unwrap();
+        let device = catalog.open(id).unwrap();
+        let charges = Charges::tally(&device);
+        let (granule, block) = (1 << 16, 1 << 18);
+        let pool = Pool::open(&PoolCharges::one(&charges), Contract::DeviceOnly, granule, block).unwrap();
+        let i32s = seismic_lang::registry::dense(seismic_lang::types::DType::I32);
+        let geometry = SlabGeometry {
+            rows_per_slab: 4,
+            logical_rows: 16,
+            capacity: 4,
+            slab_bytes: BLOCK_ALIGNMENT,
+            slab_alignment: BLOCK_ALIGNMENT,
+            regions: vec![(i32s, vec![2], 0)],
+        };
+        let slabs = SlabStore::in_pool(&charges, &pool, geometry, &[]).unwrap();
+        slabs.add_slab(SlabFill::Zeroed).unwrap();
+
+        let flight = Arc::new(Flight::default());
+        flight.complete();
+        let ended_calls = Arc::new(AtomicU64::new(0));
+        let fence = Arc::new(AdoptFence::pending());
+        fence.submitted(Some(Arc::new(CountingCompletion {
+            flight: flight.clone(),
+            ended_calls: ended_calls.clone(),
+        })));
+        {
+            let mut guard = slabs.slots.slabs();
+            let slab = guard.slots[0].as_mut().unwrap();
+            Arc::get_mut(&mut slab.hold).expect("unique slab hold").adopt = Some(fence.clone());
+        }
+        pool.0.state().pending_adopts.push(fence);
+
+        // Before `return_freed_sync`, `is_adopted` is false under the guard.
+        {
+            let _no_alloc = seismic_memory::enter_no_blocking_allocation();
+            let view = slabs.slab_region(0, 0).unwrap().unwrap();
+            assert!(!view.is_adopted());
+        }
+
+        // `return_freed_sync` settles pending adopts on its non-blocking-free thread.
+        pool.return_freed_sync(0).unwrap();
+        assert_eq!(ended_calls.load(Ordering::Acquire), 1);
+
+        // Now both `is_adopted` and `wait_adopted` succeed inside the guard.
+        {
+            let _no_alloc = seismic_memory::enter_no_blocking_allocation();
+            let view = slabs.slab_region(0, 0).unwrap().unwrap();
+            assert!(view.is_adopted());
             view.wait_adopted().unwrap();
         }
         assert_eq!(ended_calls.load(Ordering::Acquire), 1);

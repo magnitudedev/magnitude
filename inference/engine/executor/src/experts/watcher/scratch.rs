@@ -2365,17 +2365,36 @@ impl Scratch {
             self.lease_records = self.compute_lease_records(core);
         }
         let tier = core.groups[lender].tier.as_deref();
-        let mut copy_fn = |src: u32, dst: u32| {
-            if let Some(tensors) = tier {
-                for tensor in tensors {
-                    // SAFETY: `src` is an unheld kept record (read-only), `dst`
-                    // is ready (or freshly unmapped past every earlier piece,
-                    // unheld), and `src != dst`.
-                    unsafe { tensor.records.copy_record(u64::from(src), u64::from(dst)) };
-                }
+        let mut copy_fn = |src: u32, dst: u32| -> bool {
+            let Some(tensors) = tier else {
+                return false;
+            };
+            assert_ne!(src, dst, "lease relocation source and destination must differ ({src})");
+            // Non-blocking hold across all tensors first: `Scratch::lease` runs
+            // inside `residency` / `NoBlockingAllocationGuard`, where calling
+            // `AdoptFence::wait` is forbidden. If any slab still has an
+            // unsettled adoption copy, decline this relocation without copying
+            // partial tensors.
+            let mut pairs = Vec::with_capacity(tensors.len());
+            for tensor in tensors {
+                let (Some(s), Some(d)) = (
+                    tensor.records.try_hold(u64::from(src)),
+                    tensor.records.try_hold(u64::from(dst)),
+                ) else {
+                    return false;
+                };
+                pairs.push((s, d, tensor.records.bytes()));
             }
+            for (s, d, bytes) in pairs {
+                // SAFETY: `src != dst`, both views hold `bytes` settled
+                // host-accessible bytes kept alive by `s` and `d`, `src` is an
+                // unheld kept record (read-only), and `dst` is ready or an
+                // unheld victim.
+                unsafe { std::ptr::copy_nonoverlapping(s.as_ptr(), d.address().as_ptr(), bytes as usize) };
+            }
+            true
         };
-        let copy = tier.is_some().then_some(&mut copy_fn as &mut dyn FnMut(u32, u32));
+        let copy = tier.is_some().then_some(&mut copy_fn as &mut dyn FnMut(u32, u32) -> bool);
         // Host-record leasing (including any host-record memcpy via `copy`) runs
         // completely outside `transport.registry` lock.
         core.directory.lease_host_records(

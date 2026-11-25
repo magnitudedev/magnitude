@@ -88,8 +88,8 @@ struct Record {
 
 // SAFETY: `base` addresses host-shared memory that `tensor`, held beside
 // it, keeps alive; the host writes it only through the read engine's
-// requests (`ExpertSource::request`), landings and record copies
-// (`Records::copy_record`).
+// requests (`ExpertSource::request`), landings and non-blocking lease
+// relocations (`Records::try_hold`).
 unsafe impl Send for Record {}
 unsafe impl Sync for Record {}
 
@@ -175,10 +175,8 @@ impl Records {
         }
     }
 
-    /// Hold record `record`'s view for the duration of an active host read
-    /// or write, resolving on demand for pooled records.
-    pub fn hold(&self, record: u64) -> HeldRecord {
-        let held = match &self.0.backing {
+    fn resolve(&self, record: u64) -> Arc<Record> {
+        match &self.0.backing {
             Backing::Fixed(records) => usize::try_from(record)
                 .ok()
                 .and_then(|record| records.get(record))
@@ -190,11 +188,28 @@ impl Records {
                 Record::of(tensor, self.0.bytes)
                     .unwrap_or_else(|error| panic!("invariant violated: pooled record {record} is not host-addressable: {error}"))
             }
-        };
+        }
+    }
+
+    /// Hold record `record`'s view for the duration of an active host read
+    /// or write, resolving on demand for pooled records. Waits for any pending
+    /// slab-adoption copy; callers inside a no-blocking-allocation scope must
+    /// use [`Self::try_hold`].
+    pub fn hold(&self, record: u64) -> HeldRecord {
+        let held = self.resolve(record);
         if let Err(error) = held.tensor.wait_adopted() {
             panic!("record {record}'s slab copy failed before host access: {error}");
         }
         HeldRecord(held)
+    }
+
+    /// Non-blocking variant of [`Self::hold`]: resolves `record` and returns
+    /// `Some` only if any pending slab-adoption copy has already settled
+    /// (`Tensor::is_adopted`). Lock-free and driver-free; safe inside a
+    /// no-blocking-allocation scope.
+    pub fn try_hold(&self, record: u64) -> Option<HeldRecord> {
+        let held = self.resolve(record);
+        held.tensor.is_adopted().then_some(HeldRecord(held))
     }
 
     /// The view record `record` lies in: what a device copy or landing
@@ -210,22 +225,6 @@ impl Records {
                 .clone(),
             Backing::Pooled(store) => store.view(record).unwrap_or_else(|| panic!("record {record} of {} is a hole", self.count())),
         }
-    }
-
-    /// Copy record `from`'s bytes into record `to` (`from != to`).
-    ///
-    /// # Safety
-    ///
-    /// No writer writes `from`, and no reader or writer accesses `to`, while
-    /// the copy runs.
-    pub unsafe fn copy_record(&self, from: u64, to: u64) {
-        assert_ne!(from, to, "copy_record source and destination must differ ({from})");
-        let src = self.hold(from);
-        let dst = self.hold(to);
-        // SAFETY: `from != to`, both views hold `self.0.bytes` host-accessible
-        // bytes kept alive by `src` and `dst`, and the caller guarantees no
-        // concurrent write to `from` or concurrent access to `to`.
-        unsafe { std::ptr::copy_nonoverlapping(src.as_ptr(), dst.address().as_ptr(), self.0.bytes as usize) };
     }
 }
 

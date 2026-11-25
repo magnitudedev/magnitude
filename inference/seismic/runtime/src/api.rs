@@ -1779,6 +1779,16 @@ pub mod tensor {
             }
         }
 
+        /// Whether any pending slab-adoption copy (`Slots::adopt`) populating
+        /// this view's slab has settled. Lock-free and driver-free; safe inside
+        /// a no-blocking-allocation scope.
+        pub fn is_adopted(&self) -> bool {
+            match self.slab_hold() {
+                Some(hold) => hold.is_adopted(),
+                None => true,
+            }
+        }
+
         /// The bytes device work bound to this plain view's bytes `span`
         /// reaches: its own (`Self::alias_identity`, range).
         fn plain_bytes(&self, span: std::ops::Range<u64>) -> (u64, std::ops::Range<u64>) {

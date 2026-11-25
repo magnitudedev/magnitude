@@ -1947,6 +1947,13 @@ impl Tensor {
         self.inner.wait_adopted().map_err(TensorError::Execution)
     }
 
+    /// Whether any pending slab-adoption copy populating this view's slab has
+    /// settled. Lock-free and driver-free; safe inside a no-blocking-allocation
+    /// scope.
+    pub fn is_adopted(&self) -> bool {
+        self.inner.is_adopted()
+    }
+
     /// Read `into.len()` bytes at `offset` bytes into this view without
     /// waiting for device work that uses its storage. A dense floating
     /// tensor is refused ([`TensorError::FloatingSharedRead`]): its values
