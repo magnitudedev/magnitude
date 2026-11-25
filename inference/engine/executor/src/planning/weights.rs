@@ -3674,11 +3674,13 @@ impl<'a> StoredExtent<'a> {
     /// row ranges overlap. Identical extents (tied roles, the same slice
     /// twice) do not conflict: the placement counts them once.
     fn conflicts_with(&self, other: &Self) -> bool {
-        if self.name != other.name {
+        // Identical extents are one key (tied roles, the same slice twice)
+        // and must not fire the overcount assert.
+        if self == other || self.name != other.name {
             return false;
         }
         if self.rows.is_empty() || other.rows.is_empty() {
-            return !self.rows.is_empty() || !other.rows.is_empty();
+            return true;
         }
         self.rows.iter().any(|&(start, rows)| {
             let end = start.saturating_add(rows);
