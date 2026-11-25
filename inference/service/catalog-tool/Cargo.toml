@@ -10,6 +10,7 @@ clap.workspace = true
 flate2.workspace = true
 futures-util.workspace = true
 magnitude-artifacts = { path = "../../engine/artifacts" }
+magnitude-family-deepseek41 = { path = "../../engine/families/deepseek41" }
 magnitude-service-contracts.workspace = true
 magnitude-service-models.workspace = true
 seismic-io.workspace = true

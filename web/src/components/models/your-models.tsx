@@ -173,9 +173,9 @@ export function Unrunnable({ files, title = "Doesn’t run in Magnitude yet" }: 
       {open ? <CaretDownIcon className="size-3" /> : <CaretRightIcon className="size-3" />}{title} ({files.length})
     </button>
     {open && <div className="mt-2 divide-y divide-slate-200 overflow-hidden rounded-xl border border-slate-200 bg-white dark:divide-slate-750 dark:border-slate-750 dark:bg-slate-850">
-      {files.map(file => <div key={file.name} className="flex items-center justify-between gap-3 px-4 py-2.5 text-[13px]">
-        <span className="truncate text-slate-600 dark:text-slate-400">{file.name}</span>
-        <span className="shrink-0 text-xs text-slate-500">{file.reason}</span>
+      {files.map(file => <div key={file.name} className="grid gap-1 px-4 py-2.5 text-[13px] md:grid-cols-2 md:gap-x-3">
+        <span className="min-w-0 wrap-anywhere text-slate-600 dark:text-slate-400">{file.name}</span>
+        <span className="min-w-0 wrap-anywhere text-xs text-slate-500">{file.reason}</span>
       </div>)}
     </div>}
   </div>

@@ -7675,6 +7675,28 @@
           {
             "type": "object",
             "required": [
+              "layout",
+              "replacement",
+              "_tag"
+            ],
+            "properties": {
+              "layout": {
+                "type": "string"
+              },
+              "replacement": {
+                "type": "string"
+              },
+              "_tag": {
+                "type": "string",
+                "enum": [
+                  "ArtifactLayout"
+                ]
+              }
+            }
+          },
+          {
+            "type": "object",
+            "required": [
               "architecture",
               "_tag"
             ],

@@ -2662,6 +2662,7 @@ dependencies = [
  "flate2",
  "futures-util",
  "magnitude-artifacts",
+ "magnitude-family-deepseek41",
  "magnitude-service-contracts",
  "magnitude-service-models",
  "seismic-io",

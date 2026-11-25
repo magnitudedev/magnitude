@@ -1,5 +1,5 @@
 import { Command } from "@commander-js/extra-typings"
-import { Effect, Option, Stream } from "effect"
+import { Effect, Option, Schema, Stream } from "effect"
 import {
   CatalogFormModelIdSchema,
   CustomFormModelIdSchema,
@@ -8,6 +8,7 @@ import {
   LocalInferenceDeviceIdSchema,
   LocalInferenceMemoryDomainIdSchema,
   ModelVersionNotRunnable,
+  UnsupportedReasonSchema,
   CountryCodeSchema,
   LabIdSchema,
   type CustomLocalModel,
@@ -517,6 +518,29 @@ describe("candidate inspection", () => {
     expect(renderInspection({ inspection: nothingRuns, drafters: [], models: [], memory: "Device" })).toContain(
       "No version of this model runs on this computer. Some versions are too large for this machine, and Magnitude can't run the others: Uses Q2_K weights, which Magnitude doesn't support yet.",
     )
+  })
+
+  it("shows the legacy DeepSeek import guidance from its wire reason", () => {
+    const [version] = makeInspection().versions
+    const assessment = unsupportedAssessment("I64")
+    if (assessment._tag !== "Unsupported") throw new Error("expected unsupported assessment")
+    const reason = Schema.decodeUnknownSync(UnsupportedReasonSchema)({
+      _tag: "ArtifactLayout",
+      layout: "legacy DeepSeek V4.1 GSQ-RCO GGUF",
+      replacement: "the upstream six-shard GGUF format with its Engram shard",
+    })
+    const output = versionVerdict({ ...version!, assessment: Option.some({
+      ...assessment,
+      reasons: [...assessment.reasons, reason],
+      detail: "private engine diagnostic",
+    }) }, false)
+    expect(output).toContain("Use the upstream six-shard GGUF format with its Engram shard")
+    expect(output).toContain("magnitude docs custom-models")
+    expect(output).not.toContain("private engine diagnostic")
+    const found = makeUnsupportedLocalModel({ reasons: [reason], detail: "private engine diagnostic" })
+    const list = renderModelsList(statusView({ unsupported: [found], all: true }))
+    expect(list).toContain("Use the upstream six-shard GGUF format with its Engram shard")
+    expect(list).not.toContain("private engine diagnostic")
   })
 
   it("marks verdicts", () => {

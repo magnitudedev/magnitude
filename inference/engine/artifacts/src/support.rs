@@ -54,6 +54,10 @@ pub enum UnsupportedReason {
         detail: String,
     },
     TiedOutputHead,
+    ArtifactLayout {
+        layout: String,
+        replacement: String,
+    },
     DraftArchitecture {
         architecture: String,
     },
@@ -114,6 +118,7 @@ impl fmt::Display for UnsupportedReason {
             Self::Unreadable => formatter.write_str("unreadable GGUF"),
             Self::TargetMismatch { detail } => write!(formatter, "target mismatch: {detail}"),
             Self::TiedOutputHead => formatter.write_str("tied output head"),
+            Self::ArtifactLayout { layout, .. } => write!(formatter, "unsupported {layout} layout"),
             Self::DraftArchitecture { architecture } => {
                 write!(formatter, "separate drafter of architecture {architecture:?}")
             }

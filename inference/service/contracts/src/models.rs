@@ -1101,6 +1101,10 @@ mod schema {
             detail: String,
         },
         TiedOutputHead,
+        ArtifactLayout {
+            layout: String,
+            replacement: String,
+        },
         DraftArchitecture {
             architecture: String,
         },

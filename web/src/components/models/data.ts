@@ -239,7 +239,9 @@ export const unrunnableFile = (model: UnsupportedLocalModel): UnrunnableFile => 
   const architecture = model.reasons.find(reason => reason._tag === "Architecture")
   return {
     name: model.displayName,
-    reason: architecture && "architecture" in architecture ? `${architecture.architecture} architecture` : model.detail,
+    reason: architecture
+      ? `${architecture.architecture} architecture`
+      : unsupportedReasonMessages(model.reasons).join(". ") || "Magnitude can’t run this model",
   }
 }
 

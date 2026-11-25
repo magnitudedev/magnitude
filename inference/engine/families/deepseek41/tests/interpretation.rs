@@ -5,8 +5,8 @@
 //! the header's own metadata and tensor directory.
 
 use magnitude_artifacts::{
-    gguf::{self, Array, Directory, Elements, Scalar, Value},
-    ArtifactIdentity, PackageIdentity,
+    gguf::{self, Array, Directory, Elements, Encoding, Scalar, TensorDescriptor, Value},
+    ArtifactIdentity, PackageIdentity, UnsupportedReason,
 };
 use magnitude_family_common::Metadata;
 use magnitude_family_contracts::{
@@ -450,6 +450,102 @@ fn a_compressed_layer_without_a_source_is_invalid() {
         error.to_string().contains("compressed layer 0 follows no kv and index source"),
         "{error}"
     );
+}
+
+#[test]
+fn only_the_legacy_gsq_rco_layout_gets_conversion_guidance() {
+    let mut directory = header(SLICE_B);
+    assert!(inspect(&directory).is_ok());
+
+    // Start from the real upstream packed Engram header and simulate a
+    // compressed layer with neither upstream source list.
+    set(
+        &mut directory,
+        "deepseek41.block_count",
+        Value::Scalar(Scalar::Unsigned(3)),
+    );
+    set(
+        &mut directory,
+        "deepseek41.attention.compress_ratios",
+        Value::Array(Array::from(vec![0_u64, 0, 2])),
+    );
+    let invalid = inspect(&directory).unwrap_err();
+    assert_eq!(invalid.reasons, [UnsupportedReason::Unreadable]);
+    assert!(invalid
+        .detail
+        .contains("compressed layer 2 follows no kv and index source"));
+
+    let old_constants = [
+        ("engram_token_map.weight", Encoding::I32, "engram.token_map"),
+        (
+            "engram_primes.weight",
+            Encoding::I64,
+            "ple.head_vocab_sizes",
+        ),
+        ("engram_offsets.weight", Encoding::I64, "ple.head_offsets"),
+        (
+            "engram_multipliers.weight",
+            Encoding::I64,
+            "ple.layer_multipliers",
+        ),
+    ]
+    .map(|(name, encoding, key)| (name, encoding, counts(&directory, key).len() as u64));
+
+    // The old converter kept the source lists under different keys and
+    // stored its four Engram constants as integer tensors, not metadata.
+    directory.metadata.retain(|entry| {
+        !entry.name.starts_with("deepseek41.ple.") && entry.name != "deepseek41.engram.token_map"
+    });
+    for name in [
+        "deepseek41.kv_source_layer_ids",
+        "deepseek41.index_source_layer_ids",
+    ] {
+        set(&mut directory, name, Value::Array(Array::from(vec![2_u64])));
+    }
+    assert_eq!(inspect(&directory).unwrap_err(), invalid);
+    let mut offset = directory
+        .tensors
+        .iter()
+        .map(|tensor| tensor.offset + tensor.nbytes)
+        .max()
+        .unwrap();
+    for (name, encoding, elements) in old_constants {
+        offset = offset.next_multiple_of(directory.alignment);
+        let nbytes = elements * encoding.block_bytes();
+        directory.tensors.push(TensorDescriptor {
+            name: name.into(),
+            shape: vec![elements],
+            encoding,
+            offset,
+            nbytes,
+        });
+        offset += nbytes;
+    }
+    let legacy = inspect(&directory).unwrap_err();
+    assert_eq!(
+        legacy.reasons,
+        [UnsupportedReason::ArtifactLayout {
+            layout: "legacy DeepSeek V4.1 GSQ-RCO GGUF".into(),
+            replacement: "the upstream six-shard GGUF format with its Engram shard".into(),
+        }]
+    );
+    for part in [
+        "DeepSeek V4.1 legacy GSQ-RCO GGUF cannot be loaded directly",
+        "upstream-format six-shard GGUF (including its Engram shard)",
+        "import-deepseek41-legacy",
+        "magnitude docs custom-models",
+    ] {
+        assert!(legacy.detail.contains(part), "{legacy}");
+    }
+
+    // Even the old signature must not turn a mixed/incomplete conversion
+    // into a claim that it is the original layout.
+    set(
+        &mut directory,
+        "deepseek41.attention.kv_source_layers",
+        Value::Array(Array::from(Vec::<u64>::new())),
+    );
+    assert_eq!(inspect(&directory).unwrap_err(), invalid);
 }
 
 /// `deepseek41.<key>`'s nonnegative integers, of whichever integer type the

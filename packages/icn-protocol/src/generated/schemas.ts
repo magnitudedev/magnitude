@@ -2167,6 +2167,13 @@ export const KnownUnsupportedReason = S.Union(
   ),
   S.extend(S.TaggedStruct("TiedOutputHead", {}), S.Record({ key: S.String, value: JsonValue })),
   S.extend(
+    S.TaggedStruct("ArtifactLayout", {
+      layout: S.String,
+      replacement: S.String,
+    }),
+    S.Record({ key: S.String, value: JsonValue }),
+  ),
+  S.extend(
     S.TaggedStruct("DraftArchitecture", {
       architecture: S.String,
     }),
