@@ -4,8 +4,8 @@
     "title": "Magnitude Inference Control Node",
     "description": "",
     "license": {
-      "name": "UNLICENSED",
-      "identifier": "UNLICENSED"
+      "name": "Apache-2.0",
+      "identifier": "Apache-2.0"
     },
     "version": "0.1.0"
   },
