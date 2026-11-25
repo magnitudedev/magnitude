@@ -8084,6 +8084,78 @@ mod tests {
         ));
     }
 
+    /// magnitudedev/magnitude#280: pulling DeepSeek V4.1 Flash fetched its DSpark drafter first,
+    /// and once the drafter was complete the scan took it for the catalog model, since its headers
+    /// name the target's model and quantization. A drafter is never its target: not by its
+    /// architecture when the catalog does not know it, and not as the catalog model's own drafter.
+    #[tokio::test]
+    async fn a_drafter_named_as_its_target_is_never_the_catalog_model() {
+        use magnitude_service_contracts::models::{CatalogModelState, InstalledModelPackages as _};
+        let fixture = Fixture::new().await;
+        let drafter = gguf_bytes(
+            &[
+                ("general.architecture", Meta::Str("dflash")),
+                ("general.name", Meta::Str("Model")),
+                ("general.file_type", Meta::U32(7)),
+            ],
+            &["blk.0.attn_q.weight"],
+        );
+        publish_managed(
+            &fixture.store,
+            "owner/Model-GGUF",
+            &"a".repeat(40),
+            &[("Model-DSpark.gguf", drafter)],
+        );
+        fixture.apply(LocalModelsConfiguration::default()).await;
+        let packages = fixture.inventory().list_installed().await.unwrap().packages;
+        let [installed] = packages.as_slice() else {
+            panic!("the drafter alone is installed: {packages:?}");
+        };
+        let draft = installed.package.clone();
+        assert_eq!(draft.properties.intrinsic_model_id.as_deref(), Some("Model"));
+        assert!(draft.properties.intrinsic_quality_id.is_some());
+
+        // The target the catalog names: the same repository, model name and quantization, other
+        // weights and the target's architecture.
+        let mut target = draft.clone();
+        target.id = ModelPackageId("package_model_target".to_owned());
+        target.properties.architecture = "deepseek41".to_owned();
+        for file in &mut target.files {
+            file.sha256 = "f".repeat(64);
+            file.id = magnitude_service_contracts::models::ModelFileId(format!("file_{}", file.sha256));
+            file.path = PathBuf::from("Model-MXFP4.gguf");
+        }
+        let speculative = {
+            let mut definition = catalog_definition(target.clone());
+            definition.configuration.bundle = ServableModelBundle::SpeculativeDecoding {
+                target: target.clone(),
+                draft_source: SpeculativeDraftSource::Separate { draft },
+                method: SpeculativeMethod::DSpark,
+            };
+            definition
+        };
+
+        // First a catalog that does not know the drafter, so only the architecture tells it apart,
+        // then one that has it as the model's drafter.
+        let mut fixture = fixture;
+        for definition in [catalog_definition(target), speculative] {
+            fixture = fixture.restart(vec![definition]).await;
+            fixture.apply(LocalModelsConfiguration::default()).await;
+            let packages = fixture.inventory().list_installed().await.unwrap().packages;
+            assert!(
+                packages.iter().all(|entry| !matches!(
+                    entry.catalog_attribution,
+                    InstalledCatalogAttribution::Attributed { .. }
+                )),
+                "{packages:?}"
+            );
+            assert_eq!(
+                fixture.resolver.catalog_snapshot().unwrap().models[0].local_state,
+                CatalogModelState::NotInstalled
+            );
+        }
+    }
+
     /// Has not worked out how any catalog model serves without its catalog drafter.
     struct DrafterFitNotWorkedOut;
 

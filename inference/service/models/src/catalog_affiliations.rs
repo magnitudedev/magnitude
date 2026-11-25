@@ -11,6 +11,12 @@ use crate::catalog::{valid_identity_component, valid_variant_id};
 
 /// Which installed packages are which catalog models', kept in the store.
 ///
+/// A package's catalog role is exclusive: one that is a catalog model's dependency (a drafter or a
+/// projector) is never a target, so no package holds a `Target` affiliation beside a `Dependency`
+/// one. Every set of entries this forms (what the file holds, each merge, each addition) keeps the
+/// dependency and drops the target: a file an earlier release wrote with both reads repaired, and
+/// the next persist writes it so.
+///
 /// Every service process over one store holds them in memory, and each persist applies what this
 /// process changed to what the file holds then, under the file's record lock
 /// (`seismic_io::Store::lock`), and takes what that leaves: no process drops another's.
@@ -51,6 +57,7 @@ impl PendingAffiliations {
             .unwrap_or_default();
         entries.retain(|affiliation| !self.forgotten.contains(&affiliation.package_id));
         entries.extend(self.added.iter().cloned());
+        exclusive_roles(&mut entries);
         let bytes = serde_json::to_vec_pretty(&StoredCatalogAffiliations {
             affiliations: entries.iter().collect(),
         })
@@ -84,7 +91,22 @@ fn decode(bytes: &[u8]) -> BTreeSet<CatalogPackageAffiliation> {
         tracing::warn!("discarding catalog affiliation cache with an invalid shape");
         return BTreeSet::new();
     };
-    entries.iter().filter_map(decode_entry).collect()
+    let mut entries = entries.iter().filter_map(decode_entry).collect();
+    exclusive_roles(&mut entries);
+    entries
+}
+
+/// Drops every `Target` affiliation of a package that is some catalog model's dependency.
+fn exclusive_roles(entries: &mut BTreeSet<CatalogPackageAffiliation>) {
+    let dependencies = entries
+        .iter()
+        .filter(|affiliation| affiliation.role == CatalogPackageRole::Dependency)
+        .map(|affiliation| affiliation.package_id.clone())
+        .collect::<BTreeSet<_>>();
+    entries.retain(|affiliation| {
+        affiliation.role == CatalogPackageRole::Dependency
+            || !dependencies.contains(&affiliation.package_id)
+    });
 }
 
 impl CatalogAffiliations {
@@ -111,11 +133,27 @@ impl CatalogAffiliations {
         self.entries.iter()
     }
 
+    /// Whether `package_id` is a catalog model's dependency, and so never a catalog target.
+    pub(crate) fn is_dependency(&self, package_id: &ModelPackageId) -> bool {
+        self.entries.iter().any(|affiliation| {
+            affiliation.role == CatalogPackageRole::Dependency
+                && &affiliation.package_id == package_id
+        })
+    }
+
+    /// Records `affiliation`; whether it changed anything. A target affiliation of a dependency is
+    /// refused, and a dependency affiliation replaces the package's target ones.
     pub(crate) fn add(&mut self, affiliation: CatalogPackageAffiliation) -> bool {
-        if !valid_affiliation(&affiliation) || !self.entries.insert(affiliation.clone()) {
+        if !valid_affiliation(&affiliation)
+            || (affiliation.role == CatalogPackageRole::Target
+                && self.is_dependency(&affiliation.package_id))
+            || !self.entries.insert(affiliation.clone())
+        {
             return false;
         }
         self.pending.added.insert(affiliation);
+        exclusive_roles(&mut self.entries);
+        exclusive_roles(&mut self.pending.added);
         true
     }
 
@@ -147,6 +185,7 @@ impl CatalogAffiliations {
     pub(crate) fn apply_persisted(&mut self, mut entries: BTreeSet<CatalogPackageAffiliation>) {
         entries.retain(|affiliation| !self.pending.forgotten.contains(&affiliation.package_id));
         entries.extend(self.pending.added.iter().cloned());
+        exclusive_roles(&mut entries);
         self.entries = entries;
     }
 
@@ -237,6 +276,56 @@ mod tests {
             repository: "owner/repo".to_owned(),
             role: CatalogPackageRole::Target,
         }
+    }
+
+    fn dependency(package: &str) -> CatalogPackageAffiliation {
+        CatalogPackageAffiliation {
+            role: CatalogPackageRole::Dependency,
+            ..affiliation(package)
+        }
+    }
+
+    fn roles(affiliations: &CatalogAffiliations) -> Vec<(String, CatalogPackageRole)> {
+        affiliations
+            .entries()
+            .map(|entry| (entry.package_id.0.clone(), entry.role))
+            .collect()
+    }
+
+    /// magnitudedev/magnitude#280: a catalog drafter that finished downloading before its target
+    /// was labelled the target as well. Loading drops a target label a dependency also holds, and
+    /// the next persist writes the repaired file; no addition reintroduces one.
+    #[test]
+    fn a_dependency_is_never_also_a_target() {
+        let root = tempfile::tempdir().expect("temporary store");
+        fs::write(
+            path(root.path()),
+            br#"{"affiliations": [
+              {"modelId":"model","variantId":"gguf:q4","packageId":"drafter","repository":"owner/repo","role":"Dependency"},
+              {"modelId":"model","variantId":"gguf:q4","packageId":"drafter","repository":"owner/repo","role":"Target"},
+              {"modelId":"model","variantId":"gguf:q4","packageId":"target","repository":"owner/repo","role":"Target"}
+            ]}"#,
+        )
+        .expect("affiliations");
+
+        let mut affiliations = CatalogAffiliations::load(root.path());
+        let repaired = [
+            ("drafter".to_owned(), CatalogPackageRole::Dependency),
+            ("target".to_owned(), CatalogPackageRole::Target),
+        ];
+        assert_eq!(roles(&affiliations), repaired);
+        assert!(affiliations.is_dependency(&ModelPackageId("drafter".to_owned())));
+        assert!(!affiliations.add(affiliation("drafter")), "a dependency is refused as a target");
+
+        // A package recorded as a dependency stops being a target, in memory and in the file.
+        assert!(affiliations.add(dependency("target")));
+        affiliations.persist(root.path()).expect("persist");
+        let dependencies = [
+            ("drafter".to_owned(), CatalogPackageRole::Dependency),
+            ("target".to_owned(), CatalogPackageRole::Dependency),
+        ];
+        assert_eq!(roles(&affiliations), dependencies);
+        assert_eq!(roles(&CatalogAffiliations::load(root.path())), dependencies);
     }
 
     /// Two service processes over one store, each adding and forgetting packages of its own: the

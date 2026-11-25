@@ -178,6 +178,34 @@ fn intrinsic_target_identity(
     (model_ids.into_iter().next(), quality_ids.into_iter().next())
 }
 
+/// What a GGUF package intrinsically is, as its weights' headers declare it: the model they name,
+/// the architecture they are built on and the quantization they hold. The architecture belongs to
+/// it: a drafter (DFlash, DSpark, EAGLE) is published under its target's name and quantization, and
+/// only its architecture says it is not that model. Release catalog targets carry the same
+/// properties, read from their headers when the catalog is built.
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct IntrinsicIdentity<'a> {
+    model: &'a str,
+    architecture: &'a str,
+    quality: &'a str,
+}
+
+impl std::fmt::Display for IntrinsicIdentity<'_> {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(formatter, "({}, {}, {})", self.model, self.architecture, self.quality)
+    }
+}
+
+impl<'a> IntrinsicIdentity<'a> {
+    fn of(properties: &'a ModelPackageProperties) -> Option<Self> {
+        Some(Self {
+            model: properties.intrinsic_model_id.as_deref()?,
+            architecture: properties.architecture.as_str(),
+            quality: properties.intrinsic_quality_id.as_deref()?,
+        })
+    }
+}
+
 fn package_properties(
     resolved: &ResolvedModel,
     inspections: &[(ComponentRole, crate::gguf::GgufInspection)],
@@ -748,7 +776,14 @@ impl ManagedModelStore {
                 retryable: false,
             },
         };
-        if hidden {
+        // A catalog model's dependency (its drafter or projector) is never a catalog target,
+        // whatever its intrinsic identity: a drafter carries its target's name and quantization.
+        if hidden
+            || self
+                .catalog_affiliations
+                .read()
+                .is_ok_and(|affiliations| affiliations.is_dependency(&package.id))
+        {
             return InstalledCatalogAttribution::NotCatalogTarget;
         }
         let exact = self
@@ -864,17 +899,10 @@ impl ManagedModelStore {
                 "managed catalog model has no Hugging Face target repository".to_owned(),
             );
         };
-        let Some(quality) = package.properties.intrinsic_quality_id.as_deref() else {
+        let Some(identity) = IntrinsicIdentity::of(&package.properties) else {
             return retired_or_failure(
                 "catalog_target_identity_missing",
-                "managed catalog model has no intrinsic GGUF quality identity".to_owned(),
-            );
-        };
-
-        let Some(intrinsic_model_id) = package.properties.intrinsic_model_id.as_deref() else {
-            return retired_or_failure(
-                "catalog_target_identity_missing",
-                "managed catalog model has no intrinsic GGUF model identity".to_owned(),
+                "managed catalog model has no intrinsic GGUF identity".to_owned(),
             );
         };
         let intrinsic = self
@@ -882,16 +910,7 @@ impl ManagedModelStore {
             .catalog_models
             .iter()
             .filter(|catalog_model| {
-                catalog_target(catalog_model)
-                    .properties
-                    .intrinsic_model_id
-                    .as_deref()
-                    == Some(intrinsic_model_id)
-                    && catalog_target(catalog_model)
-                        .properties
-                        .intrinsic_quality_id
-                        .as_deref()
-                        == Some(quality)
+                IntrinsicIdentity::of(&catalog_target(catalog_model).properties) == Some(identity)
             })
             .collect::<Vec<_>>();
         if intrinsic.len() == 1 {
@@ -902,14 +921,14 @@ impl ManagedModelStore {
             failure(
                 "catalog_intrinsic_identity_ambiguous",
                 format!(
-                    "intrinsic GGUF identity ({intrinsic_model_id}, {quality}) identifies multiple catalog variants"
+                    "intrinsic GGUF identity {identity} identifies multiple catalog variants"
                 ),
             )
         } else {
             retired_or_failure(
                 "catalog_target_unrecognized",
                 format!(
-                    "intrinsic GGUF identity ({intrinsic_model_id}, {quality}) is not in the catalog"
+                    "intrinsic GGUF identity {identity} is not in the catalog"
                 ),
             )
         }
