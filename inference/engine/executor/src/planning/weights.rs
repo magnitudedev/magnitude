@@ -2222,17 +2222,21 @@ impl ModelLoadPlan {
     /// them as it runs ([`WeightPlacement`]).
     pub fn weight_placement(&self) -> Result<WeightPlacement, String> {
         let overflow = || "weight placement bytes overflow".to_owned();
-        // Each stored tensor once, however many roles or representations
-        // the load gives it (a tied embedding is a table and a head).
+        // Each stored extent once, however many roles or representations
+        // the load gives it (a tied embedding is a table and a head), and
+        // each row range of a stored tensor as its own extent: a fused
+        // tensor bound as slices (Gemma 4's gate‖up experts, each a half of
+        // `ffn_gate_up_exps`) is every slice's bytes, as the bank's records
+        // and the uploads charge them, not its first slice's alone.
         let capacity = self.target.len()
             + self.head().map_or(0, <[WeightPlan]>::len)
             + self.vision.as_ref().map_or(0, Vec::len)
             + self.host_tables.len();
-        let mut counted = fx_set_with_capacity::<(ArtifactComponent, &str)>(capacity);
+        let mut counted = fx_set_with_capacity::<(ArtifactComponent, StoredExtent<'_>)>(capacity);
         let mut stored = 0u64;
         let weights = [self.target.as_slice(), self.head().unwrap_or_default(), self.vision.as_deref().unwrap_or_default()];
         for weight in weights.into_iter().flatten() {
-            if counted.insert((weight.component, weight.descriptor.name.as_str())) {
+            if record_stored_extent(&mut counted, weight.component, &weight.descriptor) {
                 let bytes = match weight.holding {
                     Holding::Whole => representation_bytes(weight.source, &weight.shape)?,
                     Holding::Streamed(streamed) => representation_bytes(weight.source, &[streamed.table_rows, weight.table_width()])?,
@@ -2243,7 +2247,7 @@ impl ModelLoadPlan {
         }
         let host = self.bank.as_ref().map_or(Ok(0), super::ExpertBankPlan::host_only_bytes)?;
         for table in &self.host_tables {
-            if counted.insert((table.component, table.descriptor.name.as_str())) {
+            if record_stored_extent(&mut counted, table.component, &table.descriptor) {
                 let rows = table.shape[0];
                 stored = representation_bytes(table.source, &[rows, table.columns()])?.checked_add(stored).ok_or_else(overflow)?;
             }
@@ -3637,6 +3641,129 @@ pub struct PerLayerBinding {
     pub activation: Element,
     /// Always a post-norm tail.
     pub tail: SublayerTail,
+}
+
+/// The extent of a stored tensor a weight reads: the tensor's name and
+/// the row ranges it slices (`ImportTransform::Rows`), so the disjoint
+/// slices of one fused tensor are distinct extents whose bytes sum to the
+/// tensor's, and roles reading the same rows (a tied table and head) are
+/// one. `record_stored_extent` debug-asserts that a tensor's extents are
+/// disjoint, so a whole read beside a slice, or overlapping slices, cannot
+/// silently overcount.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub(crate) struct StoredExtent<'a> {
+    name: &'a str,
+    rows: Vec<(u64, u64)>,
+}
+
+impl<'a> StoredExtent<'a> {
+    pub(crate) fn of(descriptor: &'a WeightDescriptor) -> Self {
+        let rows = descriptor
+            .transforms
+            .iter()
+            .filter_map(|transform| match transform {
+                ImportTransform::Rows(range) => Some((range.start, range.rows)),
+                _ => None,
+            })
+            .collect();
+        Self { name: descriptor.name.as_str(), rows }
+    }
+
+    /// Whether two extents of one tensor would double-count stored bytes: a
+    /// whole-tensor read (`rows` empty) beside a slice, or two slices whose
+    /// row ranges overlap. Identical extents (tied roles, the same slice
+    /// twice) do not conflict: the placement counts them once.
+    fn conflicts_with(&self, other: &Self) -> bool {
+        // Identical extents are one key (tied roles, the same slice twice)
+        // and must not fire the overcount assert.
+        if self == other || self.name != other.name {
+            return false;
+        }
+        if self.rows.is_empty() || other.rows.is_empty() {
+            return true;
+        }
+        self.rows.iter().any(|&(start, rows)| {
+            let end = start.saturating_add(rows);
+            other.rows.iter().any(|&(other_start, other_rows)| {
+                let other_end = other_start.saturating_add(other_rows);
+                start < other_end && other_start < end
+            })
+        })
+    }
+}
+
+/// Insert `descriptor`'s stored extent into `counted`. In debug builds,
+/// assert that this tensor's recorded extents are disjoint: a whole-tensor
+/// read beside a slice, or overlapping slices, would silently overcount.
+fn record_stored_extent<'a>(
+    counted: &mut FxHashSet<(ArtifactComponent, StoredExtent<'a>)>,
+    component: ArtifactComponent,
+    descriptor: &'a WeightDescriptor,
+) -> bool {
+    let extent = StoredExtent::of(descriptor);
+    debug_assert!(
+        counted
+            .iter()
+            .all(|(seen_component, seen)| *seen_component != component || !seen.conflicts_with(&extent)),
+        "weight placement would overcount stored tensor '{}' if a whole read shares it with a slice, or if slices overlap",
+        extent.name
+    );
+    counted.insert((component, extent))
+}
+
+#[cfg(test)]
+mod stored_extent_tests {
+    use super::StoredExtent;
+
+    fn extent(name: &str, rows: Vec<(u64, u64)>) -> StoredExtent<'_> {
+        StoredExtent { name, rows }
+    }
+
+    #[test]
+    fn disjoint_halves_do_not_conflict() {
+        let gate = extent("ffn_gate_up_exps", vec![(0, 1408)]);
+        let up = extent("ffn_gate_up_exps", vec![(1408, 1408)]);
+        assert!(!gate.conflicts_with(&up));
+        assert!(!up.conflicts_with(&gate));
+    }
+
+    #[test]
+    fn adjacent_slices_do_not_conflict() {
+        let first = extent("t", vec![(0, 100)]);
+        let second = extent("t", vec![(100, 100)]);
+        assert!(!first.conflicts_with(&second));
+    }
+
+    #[test]
+    fn overlapping_slices_conflict() {
+        let first = extent("t", vec![(0, 100)]);
+        let second = extent("t", vec![(50, 100)]);
+        assert!(first.conflicts_with(&second));
+        assert!(second.conflicts_with(&first));
+    }
+
+    #[test]
+    fn a_whole_tensor_and_a_slice_conflict() {
+        let whole = extent("t", vec![]);
+        let slice = extent("t", vec![(0, 100)]);
+        assert!(whole.conflicts_with(&slice));
+        assert!(slice.conflicts_with(&whole));
+    }
+
+    #[test]
+    fn identical_extents_do_not_conflict() {
+        let slice = extent("t", vec![(0, 100)]);
+        assert!(!slice.conflicts_with(&extent("t", vec![(0, 100)])));
+        let whole = extent("t", vec![]);
+        assert!(!whole.conflicts_with(&extent("t", vec![])));
+    }
+
+    #[test]
+    fn different_names_do_not_conflict() {
+        let first = extent("a", vec![(0, 100)]);
+        let second = extent("b", vec![(0, 50)]);
+        assert!(!first.conflicts_with(&second));
+    }
 }
 
 /// A host-resident gathered table (model-family plan §3.7): read by row
