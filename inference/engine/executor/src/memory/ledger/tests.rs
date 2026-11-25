@@ -3390,3 +3390,79 @@ fn reclaim_until_terminates_in_bounded_steps_when_reclaimer_makes_no_progress() 
         pools.records.freed(&pools.records.change(), 3 * GB, Pageable);
     });
 }
+
+/// Regression test (GitHub #269, Host-tier gain-2 resize oscillator):
+/// CUDA-pinned/registered host blocks charged as `Wiring::Wired` are excluded
+/// from `pageable = visible.allocated - visible.wired`, so `nonresident` stays
+/// zero and `budget = in_use + supply` remains invariant across Host-tier
+/// grow/shrink steps — even if an OS sample reports non-zero `own_reclaimed`,
+/// and when Windows reports `own_reclaimed: None`.
+#[test]
+fn wired_host_blocks_keep_budget_invariant_under_grow_and_shrink() {
+    use seismic::memory::Wiring::Wired;
+
+    let (_scope, ledger, pools) = host();
+    let mut clock = Clock::new();
+    let total = 32 * GB;
+    let others = 12 * GB;
+    let initial_available = total - others; // 20 GB
+
+    let read_host = |available: u64, own_reclaimed: Option<seismic::OwnReclaimed>, clock: &mut Clock| {
+        let mut sample = host_sample(total, available);
+        sample.own_reclaimed = own_reclaimed;
+        sample.harm = None;
+        ledger.read(ledger.sampled(clock.next()), Reading::host(&sample))
+    };
+
+    // Baseline reading with 0 allocated: budget = 20 GB.
+    let e0 = read_host(initial_available, None, &mut clock);
+    assert_eq!(e0.budget(), 20 * GB);
+    assert_eq!(e0.nonresident(), 0);
+
+    // Grow Host tier by 8 GB of CUDA-pinned (`Wiring::Wired`) memory; OS
+    // supply drops by 8 GB (20 GB -> 12 GB).
+    let bank_claim = ledger
+        .change(|keeping| ledger.backing(&keeping.claims(), PoolClass::Records, 8 * GB))
+        .expect("8 GB host bank fits");
+    ledger
+        .change(|_| pools.records.take(&pools.records.change(), 8 * GB, Wired))
+        .expect("8 GB wired host block allocates");
+
+    // Even if an OS reports 14 GB of `own_reclaimed` (e.g. WDDM VRAM commit),
+    // `Wired` blocks have `pageable = 0`, so `nonresident == 0` and `budget`
+    // stays exactly 20 GB (never collapses to 12 GB).
+    let fake_wddm_reclaimed = Some(seismic::OwnReclaimed {
+        bytes: 14 * GB,
+        stored: 0,
+        exact: false,
+    });
+    let e_grow_with_reclaimed = read_host(initial_available - 8 * GB, fake_wddm_reclaimed, &mut clock);
+    assert_eq!(e_grow_with_reclaimed.nonresident(), 0);
+    assert_eq!(e_grow_with_reclaimed.budget(), 20 * GB);
+    assert_eq!(e_grow_with_reclaimed.others(), others);
+
+    // With Windows' `own_reclaimed: None`, `budget` stays invariant at 20 GB.
+    let e_grow_windows = read_host(initial_available - 8 * GB, None, &mut clock);
+    assert_eq!(e_grow_windows.nonresident(), 0);
+    assert_eq!(e_grow_windows.budget(), 20 * GB);
+    assert_eq!(e_grow_windows.others(), others);
+
+    // Shrink Host tier by 4 GB (8 GB -> 4 GB); OS supply rises by 4 GB (12 GB -> 16 GB).
+    ledger.change(|_| {
+        drop(bank_claim);
+        pools.records.freed(&pools.records.change(), 4 * GB, Wired);
+    });
+    let e_shrink = read_host(initial_available - 4 * GB, None, &mut clock);
+    assert_eq!(e_shrink.nonresident(), 0);
+    assert_eq!(e_shrink.budget(), 20 * GB);
+    assert_eq!(e_shrink.others(), others);
+
+    // Release remaining 4 GB; OS supply returns to 20 GB and budget stays 20 GB.
+    ledger.change(|_| {
+        pools.records.freed(&pools.records.change(), 4 * GB, Wired);
+    });
+    let e_empty = read_host(initial_available, None, &mut clock);
+    assert_eq!(e_empty.nonresident(), 0);
+    assert_eq!(e_empty.budget(), 20 * GB);
+    assert_eq!(e_empty.others(), others);
+}

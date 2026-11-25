@@ -79,7 +79,7 @@ impl RegisteredBlock {
         let whole_usize = usize::try_from(whole)
             .map_err(|_| host_allocation_error(bytes, seismic_memory::AllocationFailure::Unrepresentable))?;
         let failed = |error: DriverError| crate::executor::allocation_error(whole, || RefusalReading::Host)(error);
-        Backed::take(entry, whole, Wiring::Pageable, |_| {
+        Backed::take(entry, whole, Wiring::Wired, |_| {
             let block = HostBlock::allocate(whole, PageSize::Large).map_err(|error| host_allocation_error(whole, error))?;
             assert_eq!(block.bytes() as u64, whole, "invariant violated: a block of whole registration granules is that many bytes");
             let driver = &context.driver;

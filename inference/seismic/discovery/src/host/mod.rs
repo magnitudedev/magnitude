@@ -307,9 +307,10 @@ pub struct OwnReclaimed {
     /// - Linux: the own cgroup's `memory.stat` `zswap`.
     pub stored: u64,
     /// Whether `bytes` is the OS's exact count (macOS's `internal_compressed`
-    /// ledger) or approximate (Linux's batched swap count, Windows's upper
-    /// bound): where it is exact, a process's bytes the machine's use does
-    /// not hold beyond it can only be an accounting error.
+    /// ledger) or approximate (Linux's batched swap count; Windows reports
+    /// `None` because `PagefileUsage` includes WDDM GPU backing commit): where
+    /// it is exact, a process's bytes the machine's use does not hold beyond
+    /// it can only be an accounting error.
     pub exact: bool,
 }
 

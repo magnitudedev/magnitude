@@ -2,8 +2,7 @@
 //! NUMA node free lists, and job-object limits.
 
 use super::super::{
-    beyond, binding, resolve, ColdPages, Counted, HostSample, Lag, OwnReclaimed, PressureLevel,
-    Scope, Supply,
+    beyond, binding, resolve, ColdPages, Counted, HostSample, Lag, PressureLevel, Scope, Supply,
 };
 use super::limits::job_limits;
 use super::Sys;
@@ -123,7 +122,11 @@ pub(crate) fn sample(sys: &impl Sys) -> HostSample {
             machine: 0,
             own: None,
         },
-        own_reclaimed: own_trimmed(sys),
+        // Windows has no per-process counter that separates trimmed host RAM
+        // pages from WDDM's system-memory backing commit for `cuMemAlloc` VRAM
+        // or unfaulted private commit (`PagefileUsage - PrivateWorkingSetSize`
+        // counts both as trimmed host RAM and collapses `in_use`).
+        own_reclaimed: None,
         wired: None,
         harm: None,
         pressure: Some(pressure),
@@ -169,22 +172,4 @@ fn lists(sys: &impl Sys, counters: Option<&Counters>, available: u64) -> (u64, u
         || (0, available),
     )
     .0
-}
-
-/// This process's private pages out of its working set: its private commit
-/// less its private working set ([`HostSample::own_reclaimed`]); none
-/// before Windows 10 1809, which reports no private working set.
-fn own_trimmed(sys: &impl Sys) -> Option<OwnReclaimed> {
-    let private_working_set = sys.private_working_set()?;
-    // A copy-on-write page of a mapped image turns private in the working
-    // set with its commit charged to the image's section, so the private
-    // working set may exceed the private commit: none is then out of it.
-    // An upper bound ([`OwnReclaimed::exact`]), and a trimmed page waits in
-    // RAM on the modified or standby list, which no figure here separates:
-    // none is counted stored.
-    Some(OwnReclaimed {
-        bytes: (sys.memory_counters().PagefileUsage as u64).saturating_sub(private_working_set),
-        stored: 0,
-        exact: false,
-    })
 }

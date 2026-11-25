@@ -19,7 +19,7 @@ use windows_sys::Win32::System::JobObjects::{
 };
 use windows_sys::Win32::System::Memory::QueryMemoryResourceNotification;
 use windows_sys::Win32::System::ProcessStatus::{
-    K32GetProcessMemoryInfo, PROCESS_MEMORY_COUNTERS, PROCESS_MEMORY_COUNTERS_EX2,
+    K32GetProcessMemoryInfo, PROCESS_MEMORY_COUNTERS,
 };
 use windows_sys::Win32::System::SystemInformation::{
     GlobalMemoryStatusEx, LOGICAL_PROCESSOR_RELATIONSHIP, MEMORYSTATUSEX, OSVERSIONINFOW,
@@ -61,10 +61,6 @@ pub(crate) trait Sys {
     /// `K32GetProcessMemoryInfo` of this process: its working set and its
     /// private commit (`PagefileUsage`, the same figure as `PrivateUsage`).
     fn memory_counters(&self) -> PROCESS_MEMORY_COUNTERS;
-    /// This process's private working set (`PROCESS_MEMORY_COUNTERS_EX2`'s
-    /// `PrivateWorkingSetSize`); none before Windows 10 1809 (build 17763),
-    /// which has no such structure.
-    fn private_working_set(&self) -> Option<u64>;
     /// Whether the low-memory resource notification is signalled now.
     fn low_memory(&self) -> bool;
     /// The extended limits of the job this process runs in, its own
@@ -385,30 +381,6 @@ impl Sys for LiveSys {
                 != 0,
         );
         counters
-    }
-
-    fn private_working_set(&self) -> Option<u64> {
-        /// Windows 10 1809, the first build that knows the structure.
-        const EX2: u32 = 17763;
-        if self.os_version().dwBuildNumber < EX2 {
-            return None;
-        }
-        let mut counters = PROCESS_MEMORY_COUNTERS_EX2 {
-            cb: std::mem::size_of::<PROCESS_MEMORY_COUNTERS_EX2>() as u32,
-            ..Default::default()
-        };
-        let answered = unsafe {
-            K32GetProcessMemoryInfo(
-                GetCurrentProcess(),
-                (&mut counters as *mut PROCESS_MEMORY_COUNTERS_EX2).cast(),
-                counters.cb,
-            )
-        };
-        always(
-            "GetProcessMemoryInfo(PROCESS_MEMORY_COUNTERS_EX2)",
-            answered != 0,
-        );
-        Some(counters.PrivateWorkingSetSize as u64)
     }
 
     fn low_memory(&self) -> bool {

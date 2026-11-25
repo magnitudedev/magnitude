@@ -1939,7 +1939,7 @@ impl HostMapped {
         entry: &Arc<dyn Entry>,
         bytes: usize,
     ) -> Result<Self, seismic_compiler::errors::ExecutionError> {
-        Backed::take(entry, host_pages_of(bytes)?, Wiring::Pageable, |_| Mapped::allocate(context, bytes)).map(Self)
+        Backed::take(entry, host_pages_of(bytes)?, Wiring::Wired, |_| Mapped::allocate(context, bytes)).map(Self)
     }
 }
 
@@ -2081,7 +2081,7 @@ impl PinnedUpload {
         entry: &Arc<dyn Entry>,
         bytes: usize,
     ) -> Result<Self, seismic_compiler::errors::ExecutionError> {
-        Backed::take(entry, host_pages_of(bytes)?, Wiring::Pageable, |_| Pinned::allocate(context, bytes)).map(Self)
+        Backed::take(entry, host_pages_of(bytes)?, Wiring::Wired, |_| Pinned::allocate(context, bytes)).map(Self)
     }
 }
 

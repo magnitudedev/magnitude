@@ -105,9 +105,6 @@ impl Sys for Machine {
     fn memory_counters(&self) -> PROCESS_MEMORY_COUNTERS {
         self.process
     }
-    fn private_working_set(&self) -> Option<u64> {
-        Some(GB)
-    }
     fn low_memory(&self) -> bool {
         false
     }
@@ -166,6 +163,17 @@ fn tight_commit_signals_pressure_proactively() {
     assert_eq!(sample(&tight).pressure, Some(PressureLevel::Warn));
     tight.status.ullAvailPageFile = floor / 2;
     assert_eq!(sample(&tight).pressure, Some(PressureLevel::Critical));
+}
+
+/// Windows never misreports `PagefileUsage - PrivateWorkingSetSize` as trimmed
+/// host RAM: WDDM backs `cuMemAlloc` VRAM in `PagefileUsage`, which would
+/// otherwise report gigabytes of fake trimmed host memory.
+#[test]
+fn wddm_pagefile_commit_never_reports_fake_own_reclaimed() {
+    let mut machine = Machine::new();
+    machine.process.PagefileUsage = 16 * GB as usize;
+    machine.process.WorkingSetSize = 2 * GB as usize;
+    assert_eq!(sample(&machine).own_reclaimed, None);
 }
 
 /// Without the performance counters (an account outside Performance
