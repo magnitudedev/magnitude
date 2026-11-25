@@ -24,16 +24,15 @@ layout(buffer_reference, scalar, buffer_reference_align = 4) coherent buffer rou
 // (over `sync` scratch, zero when the launch starts and restored to zero by
 // the last arriving workgroup).
 bool routed_output_arrive_last(const uint64_t counter, const uint expected) {
-    memoryBarrierBuffer();
+    memoryBarrier(gl_ScopeDevice, gl_StorageSemanticsBuffer, gl_SemanticsAcquireRelease);
     barrier();
     if (SEISMIC_THREAD == 0u) {
-        memoryBarrierBuffer();
-        const uint ticket = atomicAdd(routed_output_arrival_u32(counter).v, 1u);
+        const uint ticket = atomicAdd(routed_output_arrival_u32(counter).v, 1u,
+            gl_ScopeDevice, gl_StorageSemanticsBuffer, gl_SemanticsAcquireRelease);
         const bool is_last = (ticket == expected - 1u);
         if (is_last) {
-            memoryBarrierBuffer();
             atomicStore(routed_output_arrival_u32(counter).v, 0u,
-                gl_ScopeDevice, gl_StorageSemanticsNone, gl_SemanticsRelaxed);
+                gl_ScopeDevice, gl_StorageSemanticsBuffer, gl_SemanticsRelease);
         }
         seismic_shared_u32[0] = is_last ? 1u : 0u;
     }
@@ -41,7 +40,7 @@ bool routed_output_arrive_last(const uint64_t counter, const uint expected) {
     barrier();
     const bool is_last = (seismic_shared_u32[0] != 0u);
     if (is_last)
-        memoryBarrierBuffer();
+        memoryBarrier(gl_ScopeDevice, gl_StorageSemanticsBuffer, gl_SemanticsAcquireRelease);
     return is_last;
 }
 

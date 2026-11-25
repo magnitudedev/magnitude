@@ -85,7 +85,7 @@ void streaming_store_u64_release(uint64_t word, uint64_t value) {
 }
 
 void streaming_acquire_fence() {
-    memoryBarrierBuffer();
+    memoryBarrier(gl_ScopeDevice, gl_StorageSemanticsBuffer, gl_SemanticsAcquireRelease);
 }
 
 int streaming_device_load(uint64_t word) {
@@ -101,28 +101,31 @@ int streaming_atomic_load(uint64_t word) {
 }
 
 void streaming_atomic_store(uint64_t word, int value) {
-    atomicStore(streaming_word_t(word).v, value, gl_ScopeDevice, gl_StorageSemanticsNone, gl_SemanticsRelaxed);
+    atomicStore(streaming_word_t(word).v, value, gl_ScopeDevice, gl_StorageSemanticsBuffer, gl_SemanticsRelease);
 }
 
 int streaming_atomic_add(uint64_t word, int value) {
-    return atomicAdd(streaming_word_t(word).v, value);
+    return atomicAdd(streaming_word_t(word).v, value, gl_ScopeDevice, gl_StorageSemanticsBuffer,
+        gl_SemanticsAcquireRelease);
 }
 
 int streaming_atomic_max(uint64_t word, int value) {
-    return atomicMax(streaming_word_t(word).v, value);
+    return atomicMax(streaming_word_t(word).v, value, gl_ScopeDevice, gl_StorageSemanticsBuffer,
+        gl_SemanticsAcquireRelease);
 }
 
 int streaming_atomic_exchange(uint64_t word, int value) {
-    return atomicExchange(streaming_word_t(word).v, value);
+    return atomicExchange(streaming_word_t(word).v, value, gl_ScopeDevice, gl_StorageSemanticsBuffer,
+        gl_SemanticsAcquireRelease);
 }
 
 void streaming_device_fence() {
-    memoryBarrierBuffer();
+    memoryBarrier(gl_ScopeDevice, gl_StorageSemanticsBuffer, gl_SemanticsAcquireRelease);
 }
 
 // Orders this invocation's accesses of host-shared words.
 void streaming_system_fence() {
-    memoryBarrierBuffer();
+    memoryBarrier(gl_ScopeDevice, gl_StorageSemanticsBuffer, gl_SemanticsAcquireRelease);
 }
 
 void streaming_barrier() {
