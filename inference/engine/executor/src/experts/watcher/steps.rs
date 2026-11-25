@@ -780,6 +780,8 @@ impl Steps {
     /// group reads record for each group, whose tables beat with `pulse`.
     pub(in crate::experts) fn new(flights: FlightDepth, places: u64, pulse: crate::experts::exchange::Pulse) -> Self {
         let flight = usize::try_from(flights.steps(places)).expect("the steps in flight fit the host");
+        // No step is in flight yet: park the pulse until a step begins.
+        pulse.set_active(false);
         Self {
             flight,
             state: Mutex::new(State {
@@ -887,6 +889,9 @@ impl Steps {
             (GroupKind::Decode, _) | (GroupKind::Grouped { .. }, false) => None,
         };
         state.running -= 1;
+        if state.running == 0 {
+            self.pulse.set_active(false);
+        }
         state.forget();
         let earliest = state
             .groups
@@ -1141,7 +1146,11 @@ impl Steps {
         };
         state.groups.insert(first, begun);
         state.last = first + count - 1;
+        let was_idle = state.running == 0;
         state.running += count as usize;
+        if was_idle && state.running > 0 {
+            self.pulse.set_active(true);
+        }
         first
     }
 
@@ -1160,6 +1169,9 @@ impl Steps {
         self.frontier.store(frontier, Ordering::Release);
         state.group(sequence).1.ended += 1;
         state.running -= 1;
+        if state.running == 0 {
+            self.pulse.set_active(false);
+        }
     }
 
     /// The steps that may hold a request now: from the frontier through
@@ -1438,7 +1450,11 @@ impl Shared {
                 state.slots[self.steps.slot(sequence)] = Some(NonZeroU64::new(sequence).expect("sequences begin at one"));
             }
             state.last = first + count - 1;
+            let was_idle = state.running == 0;
             state.running += launches.len();
+            if was_idle && state.running > 0 {
+                self.steps.pulse.set_active(true);
+            }
             Ok((first, index, merges))
         })();
         let (first, index, merges) = match begun {

@@ -105,6 +105,7 @@ fn the_watchdogs_thread_trips_with_its_report_and_stops_when_dropped() {
             vec![Watched { kind: Kind::File, layer: 3, slots }],
             Box::new(|| Park::Clear),
             ended,
+            Box::new(|| true),
             Arc::default(),
             Box::new(idle),
             Box::new(move || bounds(limit, volumes(1e-3))),
@@ -300,4 +301,54 @@ fn a_reached_unreleased_park_trips_whoever_writes_its_request() {
     assert!(report.contains("owner: the owner's state"), "{report}");
     let mut ended = watch(Vec::new(), parked(), Box::new(|step| step == 5), Box::new(idle), began);
     assert!(looks(&mut ended, began, &bounds, limit * 10).is_none(), "tripped on an ended step's park");
+}
+
+/// While no step is active (`active()` false) and no lane/park is open, the
+/// watchdog parks on the load's events without polling; once a step becomes
+/// active and raises an event, it wakes immediately and trips on an overdue
+/// lane.
+#[test]
+fn idle_watchdog_parks_until_active_without_polling() {
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    let limit = Duration::from_millis(20);
+    let events = Arc::new(Events::default());
+    let is_active = Arc::new(AtomicBool::new(false));
+    let looks_count = Arc::new(AtomicUsize::new(0));
+    let slots = slots(SlotTable::file(4, 2));
+    let (tripped, report) = mpsc::channel();
+    let watchdog = Watchdog::start(
+        vec![Watched { kind: Kind::File, layer: 0, slots: slots.clone() }],
+        Box::new(|| Park::Clear),
+        Box::new(|_| false),
+        Box::new({
+            let is_active = is_active.clone();
+            move || is_active.load(Ordering::Acquire)
+        }),
+        events.clone(),
+        Box::new({
+            let looks_count = looks_count.clone();
+            move || {
+                looks_count.fetch_add(1, Ordering::Relaxed);
+                idle()
+            }
+        }),
+        Box::new(move || bounds(limit, volumes(1e-3))),
+        Vec::new(),
+        Box::new(move |report| tripped.send(report).unwrap()),
+    )
+    .unwrap();
+
+    // `Watch::new` calls `reads()` once during initialization; while idle, no
+    // polling looks should occur.
+    std::thread::sleep(Duration::from_millis(50));
+    let after_idle = looks_count.load(Ordering::Relaxed);
+    assert!(after_idle <= 1, "idle watchdog polled {after_idle} times while inactive");
+
+    // Activating and notifying wakes the watchdog immediately.
+    slots.request(1, 0);
+    is_active.store(true, Ordering::Release);
+    events.notify();
+    let report = report.recv_timeout(Duration::from_secs(5)).expect("active watchdog did not trip");
+    assert!(report.contains("past its bound"), "{report}");
+    drop(watchdog);
 }

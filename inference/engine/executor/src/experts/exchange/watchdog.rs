@@ -135,9 +135,13 @@ impl Bounds {
     }
 }
 
+/// Whether any step may currently wait on the exchange (`Steps::in_flight() > 0`).
+pub(in crate::experts) type Active = Box<dyn Fn() -> bool + Send>;
+
 /// The running watchdog: its thread, until it drops.
 pub(in crate::experts) struct Watchdog {
     stop: Arc<(Mutex<bool>, Condvar)>,
+    events: Arc<Events>,
     thread: Option<JoinHandle<()>>,
     /// Its witnesses' registrations in the process's report on demand.
     _reports: Vec<crate::diagnostics::Registered>,
@@ -145,7 +149,8 @@ pub(in crate::experts) struct Watchdog {
 
 impl Watchdog {
     /// Watch `tables` of the load and the park it waits at (`parked`),
-    /// whose steps end as `ended` says, whose events are `events` and whose
+    /// whose steps end as `ended` says and are active as `active` says,
+    /// whose events are `events` and whose
     /// reads of the read engine are as `reads` says ([`Serving`]), each
     /// lane, park and volume with pieces in flight bounded by `bounds` (read at every
     /// look, as the load's lines are measured), reporting `witnesses` and
@@ -155,6 +160,7 @@ impl Watchdog {
         tables: Vec<Watched>,
         parked: ParkedAt,
         ended: Ended,
+        active: Active,
         events: Arc<Events>,
         reads: Box<dyn Fn() -> Reads + Send>,
         bounds: Box<dyn Fn() -> Bounds + Send>,
@@ -170,12 +176,13 @@ impl Watchdog {
             .collect();
         let stop = Arc::new((Mutex::new(false), Condvar::new()));
         let stopped = stop.clone();
+        let wake_events = events.clone();
         let thread = seismic::threads::spawn("expert-exchange-watchdog", move || {
             let watch = Watch::new(tables, parked, ended, events, reads, witnesses, Instant::now());
-            run(watch, &*bounds, trip, &stopped)
+            run(watch, &*bounds, &*active, trip, &stopped)
         })
         .map_err(|error| format!("the exchange's watchdog: {error}"))?;
-        Ok(Self { stop, thread: Some(thread), _reports: reports })
+        Ok(Self { stop, events: wake_events, thread: Some(thread), _reports: reports })
     }
 }
 
@@ -184,6 +191,7 @@ impl Drop for Watchdog {
         let (stopped, changed) = &*self.stop;
         *stopped.lock().expect("the watchdog's stop") = true;
         changed.notify_all();
+        self.events.notify();
         if let Some(thread) = self.thread.take() {
             thread.join().expect("the exchange's watchdog never panics");
         }
@@ -223,15 +231,27 @@ fn violated(tables: &[Watched], ended: &dyn Fn(u64) -> bool) -> Option<(usize, u
     })
 }
 
-/// The watchdog's thread: a look every tenth of the bound, until stopped
-/// or a lane or the park is overdue.
-fn run(mut watch: Watch, bounds: &dyn Fn() -> Bounds, trip: Trip, stop: &(Mutex<bool>, Condvar)) {
+/// The watchdog's thread: parks on the load's events while no step is active
+/// and no lane or park is open; while active, looks every tenth of the bound
+/// until stopped or a lane or the park is overdue.
+fn run(mut watch: Watch, bounds: &dyn Fn() -> Bounds, active: &dyn Fn() -> bool, trip: Trip, stop: &(Mutex<bool>, Condvar)) {
     loop {
+        if watch.is_idle() && !active() {
+            let seen = watch.events.seen();
+            if *stop.0.lock().expect("the watchdog's stop") {
+                return;
+            }
+            if !active() {
+                watch.events.wait(seen);
+                watch.reset_clock(Instant::now());
+                continue;
+            }
+        }
         let bounds = bounds();
         {
             let (stopped, changed) = stop;
             let stopped = stopped.lock().expect("the watchdog's stop");
-            let period = bounds.lane.limit / 10;
+            let period = (bounds.lane.limit / 10).max(Duration::from_millis(1));
             let (stopped, _) = changed.wait_timeout_while(stopped, period, |stopped| !*stopped).expect("the watchdog's stop");
             if *stopped {
                 return;
@@ -276,6 +296,17 @@ impl Watch {
     ) -> Self {
         let serving = Serving::new(&reads().engine);
         Self { tables, parked, ended, events, reads, witnesses, open: Vec::new(), park: None, clock: HostClock::new(at), serving }
+    }
+
+    /// Whether no lane or park is currently being tracked.
+    fn is_idle(&self) -> bool {
+        self.open.is_empty() && self.park.is_none()
+    }
+
+    /// Reset the host clock after waking from an idle park so idle time is not
+    /// credited to the next active look.
+    fn reset_clock(&mut self, at: Instant) {
+        self.clock = HostClock::new(at);
     }
 
     /// A look at `at`, a tenth of `bounds`' lane bound after the last: the

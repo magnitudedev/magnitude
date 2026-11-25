@@ -145,14 +145,16 @@ enum Beater {
 
 /// The tables a pulse beats, what beats them, its thread while a table
 /// lives and the generation it serves (each last table's drop ends one, so
-/// a thread it ends never beats a table joined after), the last beat, and
-/// when it came.
+/// a thread it ends never beats a table joined after), whether any step is
+/// active (an idle load parks its thread with zero wakeups), the last beat,
+/// and when it came.
 struct Beating {
     tables: Vec<Beaten>,
     next_id: u64,
     beater: Beater,
     thread: Option<JoinHandle<()>>,
     generation: u64,
+    active: bool,
     beat: i32,
     beaten: Instant,
     /// A test's starvation of the host ([`Pulse::starve`]).
@@ -251,12 +253,49 @@ impl Pulse {
             beater,
             thread: None,
             generation: 0,
+            active: true,
             beat: 1,
             beaten: Instant::now(),
             #[cfg(test)]
             starved: None,
         };
         Self { inner: Arc::new(Inner { beating: Mutex::new(beating), changed: Condvar::new(), late: AtomicU64::new(0) }) }
+    }
+
+    /// Whether any step may currently wait on a table of this pulse.
+    ///
+    /// While inactive (zero steps in flight), the pulse thread parks on its
+    /// condvar with zero wakeups and idle time is not counted as a late beat.
+    /// On activation, every live table is beaten immediately before the thread
+    /// wakes so newly submitted steps observe a fresh beat with zero wake
+    /// latency.
+    pub(crate) fn set_active(&self, active: bool) {
+        let mut beating = self.inner.beating.lock().expect("a pulse never panics");
+        if matches!(beating.beater, Beater::Unread) {
+            return;
+        }
+        #[cfg(test)]
+        if matches!(beating.beater, Beater::Driven) {
+            return;
+        }
+        if beating.active == active {
+            return;
+        }
+        beating.active = active;
+        if active {
+            beating.beaten = Instant::now();
+            #[cfg(test)]
+            let starved = beating.starved.is_some();
+            #[cfg(not(test))]
+            let starved = false;
+            if !starved && !beating.tables.is_empty() {
+                beating.beat = beating.beat.wrapping_add(1);
+                for table in &beating.tables {
+                    table.beat(beating.beat);
+                }
+            }
+        }
+        self.inner.changed.notify_all();
     }
 
     /// How many beats have come late ([`late`]) since the pulse was made.
@@ -322,21 +361,32 @@ impl Pulse {
     }
 }
 
-/// A pulse's thread for `generation`: a beat of every live table every
-/// PULSE_MS, under the pulse's lock, until the last table drops (which
-/// ends the generation, wakes it and joins it); a beat later than [`late`]
-/// is counted ([`Pulse::late_beats`]).
+/// A pulse's thread for `generation`: parks indefinitely while inactive (zero
+/// steps in flight), and while active beats every live table every PULSE_MS
+/// under the pulse's lock until the last table drops (which ends the
+/// generation, wakes it and joins it); a beat later than [`late`] is counted
+/// ([`Pulse::late_beats`]).
 fn beat(inner: &Inner, generation: u64) {
     let period = Duration::from_millis(constants::PULSE_MS);
     let mut beating = inner.beating.lock().expect("a pulse never panics");
     loop {
         beating = inner
             .changed
-            .wait_timeout_while(beating, period, |beating| beating.generation == generation)
+            .wait_while(beating, |beating| beating.generation == generation && !beating.active)
+            .expect("a pulse never panics");
+        if beating.generation != generation {
+            return;
+        }
+        beating = inner
+            .changed
+            .wait_timeout_while(beating, period, |beating| beating.generation == generation && beating.active)
             .expect("a pulse never panics")
             .0;
         if beating.generation != generation {
             return;
+        }
+        if !beating.active {
+            continue;
         }
         // A starved host's pulse stands still; its next beat comes late.
         #[cfg(test)]
@@ -347,5 +397,56 @@ fn beat(inner: &Inner, generation: u64) {
         let gap = now.duration_since(beating.beaten);
         beating.beaten = now;
         beating.beat_tables(gap, &inner.late);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use seismic::{BackendName, Devices, Element, Tensor};
+
+    /// An inactive pulse parks without beating or counting idle time as late;
+    /// activating it beats every live table immediately and resumes periodic
+    /// beats until deactivated again.
+    #[test]
+    fn idle_pulse_parks_without_beating_and_beats_immediately_on_activation() {
+        let device = crate::test_support::open_backend(&Devices::discover(&[]).unwrap(), BackendName::Cpu).unwrap();
+        let table = SlotTable::file(2, 1);
+        let words = Words::new(
+            Tensor::shared(&seismic::Charges::tally(&device), Element::i32(), &[table.words()]).unwrap(),
+            table.words(),
+            0,
+        )
+        .unwrap();
+        let pulse = Pulse::new();
+        pulse.set_active(false);
+        let _pulsed = pulse.join(words.clone(), table).unwrap();
+
+        let beat_word = || words.load((table.lane(0, 0) + constants::SLOT_PULSE) as usize);
+        let initial = beat_word();
+        assert_ne!(initial, 0, "joining writes an initial beat");
+
+        // Wait past `late()` while inactive: no beats advance, no late beats counted.
+        std::thread::sleep(late() + Duration::from_millis(3 * constants::PULSE_MS));
+        assert_eq!(beat_word(), initial, "idle pulse must not beat while inactive");
+        assert_eq!(pulse.late_beats(), 0, "idle time must not count as late beats");
+
+        // Activation beats immediately (zero wake latency) and resumes periodic beats.
+        pulse.set_active(true);
+        let on_activate = beat_word();
+        assert_ne!(on_activate, initial, "activation must beat immediately");
+        assert_eq!(pulse.late_beats(), 0, "reactivation after idle must not count as late");
+
+        let deadline = Instant::now() + Duration::from_millis(50 * constants::PULSE_MS);
+        while beat_word() == on_activate {
+            assert!(Instant::now() < deadline, "active pulse did not resume periodic beating");
+            std::thread::sleep(Duration::from_millis(constants::PULSE_MS));
+        }
+
+        // Deactivating parks the pulse again.
+        pulse.set_active(false);
+        let after_stop = beat_word();
+        std::thread::sleep(Duration::from_millis(5 * constants::PULSE_MS));
+        assert_eq!(beat_word(), after_stop, "deactivated pulse must stop beating");
     }
 }

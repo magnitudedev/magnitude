@@ -154,11 +154,15 @@ pub(super) fn watch(
         let steps = shared.steps.clone();
         Box::new(move |step| steps.ended(step))
     };
+    let active = {
+        let steps = shared.steps.clone();
+        Box::new(move || steps.in_flight() > 0)
+    };
     let parked = {
         let shared = shared.clone();
         Box::new(move || shared.parks.reached())
     };
-    Watchdog::start(tables, parked, ended, shared.events().clone(), reads, bounds, witnesses, trip)
+    Watchdog::start(tables, parked, ended, active, shared.events().clone(), reads, bounds, witnesses, trip)
 }
 
 /// `describe` of what `try_lock` takes, once it is free within a short
