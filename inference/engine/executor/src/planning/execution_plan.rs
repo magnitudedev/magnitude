@@ -2946,34 +2946,142 @@ fn cycle_envelope(cycle: &[super::BankPaths], current: super::BankPaths) -> supe
     }
 }
 
-/// Settle `paths` to a fixed point of `step`, or—when the discrete
-/// anti-monotone mapping enters a cycle—to the covering envelope over the
-/// cycle's states, settling once at that envelope.
-fn settle_bank_paths<T, E>(
+fn covers(paths: super::BankPaths, next: super::BankPaths) -> bool {
+    let a = paths.records();
+    let b = next.records();
+    a.ahead >= b.ahead && a.reserve >= b.reserve
+}
+
+fn with_records(base: super::BankPaths, ahead: u64, reserve: u64) -> super::BankPaths {
+    match base {
+        super::BankPaths::Priced { line, .. } => super::BankPaths::Priced {
+            line,
+            records: magnitude_cost_model::PathRecords {
+                ahead,
+                reserve: reserve.max(ahead),
+            },
+        },
+        super::BankPaths::Unpriced => super::BankPaths::Unpriced,
+    }
+}
+
+/// Settle `paths` to a fixed point of `step`.
+///
+/// Runs Picard iteration while `reserve` moves monotonically (settling the
+/// common 1–2 step case with no extra probes). On a direction reversal in
+/// `reserve` (anti-monotone negative feedback between `reserve` and settled
+/// slots), switches to a bracketed binary search over `lo..=hi` that finds
+/// either an exact fixed point or the tightest self-covering integer pair
+/// (`paths >= step(paths)`) in `O(log(hi - lo))` steps. Any remaining cycle
+/// (such as `ahead`-only oscillation at constant `reserve`) falls back to the
+/// componentwise covering envelope over the cycle.
+pub(crate) fn settle_bank_paths<T, E>(
     initial: super::BankPaths,
     mut step: impl FnMut(super::BankPaths) -> Result<(T, Option<super::BankPaths>), E>,
 ) -> Result<(super::BankPaths, T, usize), E> {
     let mut paths = initial;
     let mut seen = Vec::new();
-    loop {
+    let mut settles = 0usize;
+    let mut prev: Option<(super::BankPaths, super::BankPaths)> = None;
+    let mut best: Option<(super::BankPaths, T)> = None;
+
+    let bracket = loop {
         let (value, next) = step(paths)?;
+        settles += 1;
         let Some(next) = next else {
-            return Ok((paths, value, seen.len() + 1));
+            return Ok((paths, value, settles));
         };
         if next == paths {
-            return Ok((paths, value, seen.len() + 1));
+            return Ok((paths, value, settles));
         }
+
+        let r = paths.records().reserve;
+        let r_next = next.records().reserve;
+        if let Some((prev_p, prev_next)) = prev {
+            let prev_r = prev_p.records().reserve;
+            let prev_r_next = prev_next.records().reserve;
+            // A direction reversal in `reserve` brackets a self-covering
+            // transition: `lo` under-covers (`f(lo) > lo`) and `hi` covers
+            // `reserve` (`f(hi) <= hi`), with `lo < hi`.
+            if prev_r_next < prev_r && r_next > r {
+                // DOWN then UP: `prev_p` is `hi`, `paths` is `lo`.
+                if !best.as_ref().is_some_and(|(p, _)| *p == prev_p) {
+                    best = None;
+                }
+                let ahead = paths.records().ahead.max(next.records().ahead);
+                break (r, prev_r, ahead);
+            }
+            if prev_r_next > prev_r && r_next < r {
+                // UP then DOWN: `prev_p` is `lo`, `paths` is `hi`.
+                best = covers(paths, next).then_some((paths, value));
+                let ahead = paths.records().ahead.max(next.records().ahead);
+                break (prev_r, r, ahead);
+            }
+        }
+
         if let Some(cycle_start) = seen.iter().position(|&p| p == next) {
             let envelope = cycle_envelope(&seen[cycle_start..], paths);
             if envelope == paths {
-                return Ok((paths, value, seen.len() + 1));
+                return Ok((paths, value, settles));
             }
             let (value, _) = step(envelope)?;
-            return Ok((envelope, value, seen.len() + 2));
+            settles += 1;
+            return Ok((envelope, value, settles));
         }
+
+        best = covers(paths, next).then_some((paths, value));
+        prev = Some((paths, next));
         seen.push(paths);
         paths = next;
+    };
+
+    let (mut lo, mut hi, mut ahead) = bracket;
+    lo = lo.max(ahead.saturating_sub(1));
+    if hi <= ahead {
+        hi = ahead;
     }
+
+    while hi.saturating_sub(lo) > 1 {
+        let mid = lo + (hi - lo) / 2;
+        let probe = with_records(paths, ahead, mid);
+        let (value, next) = step(probe)?;
+        settles += 1;
+        let Some(next) = next else {
+            return Ok((probe, value, settles));
+        };
+        if next == probe {
+            return Ok((probe, value, settles));
+        }
+        let next_rec = next.records();
+        if next_rec.ahead > ahead {
+            ahead = next_rec.ahead;
+            if next_rec.reserve > probe.records().reserve {
+                lo = probe.records().reserve;
+            }
+            lo = lo.max(ahead.saturating_sub(1));
+            if hi <= ahead {
+                hi = ahead;
+                break;
+            }
+            continue;
+        }
+        if next_rec.reserve <= probe.records().reserve {
+            best = Some((probe, value));
+            hi = probe.records().reserve;
+        } else {
+            lo = probe.records().reserve;
+        }
+    }
+
+    if let Some((best_paths, best_value)) = best {
+        if best_paths.records().reserve <= hi.max(ahead) {
+            return Ok((best_paths, best_value, settles));
+        }
+    }
+    let envelope = with_records(paths, ahead, hi.max(ahead));
+    let (value, _) = step(envelope)?;
+    settles += 1;
+    Ok((envelope, value, settles))
 }
 
 /// How [`ExecutionPlanDraft::ceiling_of`] prices a bank's path records at
@@ -4545,8 +4653,8 @@ mod tests {
     }
 
     #[test]
-    fn settle_bank_paths_converges_to_covering_envelope_on_cycle() {
-        let line = magnitude_cost_model::ReadLine::new(1e-6, 1e-10).unwrap();
+    fn settle_bank_paths_converges_on_oscillations_and_cycles() {
+        let line = magnitude_cost_model::ReadLine::new(9.2222412109375e-5, 1.425463706254959e-10).unwrap();
         let priced = |ahead, reserve| {
             crate::planning::BankPaths::Priced {
                 line,
@@ -4554,51 +4662,116 @@ mod tests {
             }
         };
 
-        // 2-cycle p_high -> p_low -> p_high: closes while settled at p_low,
-        // so settles once more at envelope p_high.
+        // Exact M5 16 GB damped oscillation: naive Picard visits
+        // 46 -> 9 -> 37 -> 15 -> 34 -> 19 -> 32 -> 22 before cycling.
+        // Anti-monotone linear map matching the observed trajectory:
+        // f(r) = round(43.8 - 0.75 * r), with exact fixed point at r = 25.
+        let m5_exact = |p: crate::planning::BankPaths| {
+            let r = p.records().reserve;
+            let next_r = (43.8_f64 - 0.75 * r as f64).round().max(9.0) as u64;
+            let next_a = if r >= 35 { 9 } else if r <= 12 { 8 } else { 9 };
+            Ok::<_, PlanError>((p.records(), Some(priced(next_a, next_r))))
+        };
+        let (settled, value, count) = settle_bank_paths(priced(8, 46), m5_exact).unwrap();
+        assert_eq!(settled, priced(9, 25));
+        assert_eq!(value, settled.records());
+        assert!(count <= 8, "bracketed bisection settles in O(log N) steps, got {count}");
+
+        // Anti-monotone map reproducing the exact M5 16 GB observed sequence
+        // (46 -> 9 -> 37 -> 15 -> 34 -> 19 -> 32 -> 22) where integer rounding
+        // jumps across the diagonal at a discrete 2-cycle {26, 27}:
+        // f(r) = 53 - r for r in 22..=32 (so 26 <-> 27).
+        let m5_two_cycle = |p: crate::planning::BankPaths| {
+            let r = p.records().reserve;
+            let next_r = match r {
+                46.. => 9,
+                0..=9 => 37,
+                37..=45 => 15,
+                10..=15 => 34,
+                34..=36 => 19,
+                16..=19 => 32,
+                20..=22 => 30,
+                _ => 53u64.saturating_sub(r),
+            };
+            let next_a = if r <= 9 { 8 } else { 9 };
+            Ok::<_, PlanError>((p.records(), Some(priced(next_a, next_r))))
+        };
+        let (settled, value, count) = settle_bank_paths(priced(8, 46), m5_two_cycle).unwrap();
+        assert_eq!(settled, priced(9, 27), "must find tightest self-covering integer 27, not wide cycle envelope");
+        assert_eq!(value, settled.records());
+        assert!(count <= 9, "expected O(log N) steps, got {count}");
+
+        // Adjacent integer 2-cycle {k, k+1} settles in 2 steps from either side.
+        let p_26 = priced(9, 26);
+        let p_27 = priced(9, 27);
+        let (settled, value, count) = settle_bank_paths::<_, PlanError>(p_27, |p| {
+            let next = if p == p_27 { p_26 } else { p_27 };
+            Ok((p.records(), Some(next)))
+        })
+        .unwrap();
+        assert_eq!(settled, p_27);
+        assert_eq!(value, p_27.records());
+        assert_eq!(count, 2);
+
+        let (settled, value, count) = settle_bank_paths::<_, PlanError>(p_26, |p| {
+            let next = if p == p_26 { p_27 } else { p_26 };
+            Ok((p.records(), Some(next)))
+        })
+        .unwrap();
+        assert_eq!(settled, p_27);
+        assert_eq!(value, p_27.records());
+        assert_eq!(count, 2);
+
+        // Wide 2-cycle on a step threshold (r < 6 -> p_high, r >= 6 -> p_low):
+        // converges to p_high from either side.
         let p_low = priced(2, 3);
         let p_high = priced(4, 6);
-        let mut visited = Vec::new();
-        let (settled, value, count) = settle_bank_paths::<_, PlanError>(p_high, |p| {
-            visited.push(p);
-            let next = if p == p_high { p_low } else { p_high };
-            Ok((p.records(), Some(next)))
-        })
-        .unwrap();
+        let step_at_6 = |p: crate::planning::BankPaths| {
+            let next = if p.records().reserve >= 6 { p_low } else { p_high };
+            Ok::<_, PlanError>((p.records(), Some(next)))
+        };
+        let (settled, value, _) = settle_bank_paths(p_high, step_at_6).unwrap();
         assert_eq!(settled, p_high);
         assert_eq!(value, p_high.records());
-        assert_eq!(count, 3);
-        assert_eq!(visited, vec![p_high, p_low, p_high]);
 
-        // 2-cycle p_low -> p_high -> p_low: closes while already settled at
-        // envelope p_high, so returns without an extra settle.
-        let mut visited = Vec::new();
-        let (settled, value, count) = settle_bank_paths::<_, PlanError>(p_low, |p| {
-            visited.push(p);
-            let next = if p == p_low { p_high } else { p_low };
+        let (settled, value, _) = settle_bank_paths(p_low, step_at_6).unwrap();
+        assert_eq!(settled, p_high);
+        assert_eq!(value, p_high.records());
+
+        // Step threshold at r = 4 (r <= 3 -> p_high, r >= 4 -> p_low):
+        // bisection finds the strictly tighter self-covering state (4, 4)
+        // instead of the wide cycle envelope (4, 6).
+        let (settled, value, _) = settle_bank_paths::<_, PlanError>(p_low, |p| {
+            let next = if p.records().reserve <= 3 { p_high } else { p_low };
             Ok((p.records(), Some(next)))
         })
         .unwrap();
-        assert_eq!(settled, p_high);
-        assert_eq!(value, p_high.records());
-        assert_eq!(count, 2);
-        assert_eq!(visited, vec![p_low, p_high]);
+        assert_eq!(settled, priced(4, 4));
+        assert_eq!(value, settled.records());
 
         // Incomparable 2-cycle {(2, 5), (4, 3)} -> covering envelope (4, 5).
         let p_a = priced(2, 5);
         let p_b = priced(4, 3);
         let envelope = priced(4, 5);
-        let mut visited = Vec::new();
-        let (settled, value, count) = settle_bank_paths::<_, PlanError>(p_a, |p| {
-            visited.push(p);
+        let (settled, value, _) = settle_bank_paths::<_, PlanError>(p_a, |p| {
             let next = if p == p_a { p_b } else { p_a };
             Ok((p.records(), Some(next)))
         })
         .unwrap();
         assert_eq!(settled, envelope);
         assert_eq!(value, envelope.records());
-        assert_eq!(count, 3);
-        assert_eq!(visited, vec![p_a, p_b, envelope]);
+
+        // Ahead-only 2-cycle at constant reserve: (8, 20) <-> (9, 20) -> (9, 20).
+        let a_lo = priced(8, 20);
+        let a_hi = priced(9, 20);
+        let (settled, value, count) = settle_bank_paths::<_, PlanError>(a_lo, |p| {
+            let next = if p == a_lo { a_hi } else { a_lo };
+            Ok((p.records(), Some(next)))
+        })
+        .unwrap();
+        assert_eq!(settled, a_hi);
+        assert_eq!(value, a_hi.records());
+        assert_eq!(count, 2);
     }
 
     /// A `WholeForm::Resident` routed load retains its merged pass (`held_pass > 1`)

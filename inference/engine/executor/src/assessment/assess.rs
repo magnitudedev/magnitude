@@ -1452,12 +1452,11 @@ fn settle_bank_rung(
         .expert_bank()
         .expect("a bank form holds an expert bank");
     let holds = |fit: &crate::AssessmentFit| matches!(fit.verdict, AssessmentFitVerdict::Fits);
-    let mut paths = match path_pricer {
+    let initial = match path_pricer {
         Some(pricer) => pricer.paths_at(bank_plan.target_slots(ceiling_slots))?,
         None => bank_plan.paths,
     };
-    let mut seen = Vec::new();
-    loop {
+    let (paths, settled, _) = crate::planning::settle_bank_paths(initial, |paths| {
         let floor = bank_plan.floor_with_paths(paths);
         if floor > ceiling_slots {
             return Err(AssessmentError::Plan(format!(
@@ -1474,7 +1473,7 @@ fn settle_bank_rung(
         )?;
         let floor_fit = budget.fit(topology, executor, &floor_charge)?;
         if !holds(&floor_fit) {
-            return Ok(Err(floor_fit));
+            return Ok((Err(floor_fit), None));
         }
         let (mut lo, mut short) = (floor, ceiling_slots + 1);
         let mut best = (floor_charge, floor_fit);
@@ -1501,28 +1500,26 @@ fn settle_bank_rung(
             Some(pricer) => pricer.paths_at(bank_plan.target_slots(slots))?,
             None => paths,
         };
-        if next == paths {
+        Ok((Ok((slots, charge, fit)), Some(next)))
+    })?;
+    match settled {
+        Ok((slots, charge, fit)) => {
             match size_bank_with_host_tier(draft, slots, tier_places, paths, &charge, budget)? {
-                Ok(sized) => return Ok(Ok((sized, charge, fit))),
+                Ok(sized) => Ok(Ok((sized, charge, fit))),
                 Err(short) => {
                     let deficit_bytes = NonZeroU64::new(short.lacks())
                         .expect("invariant violated: host shortfall has zero deficit");
-                    return Ok(Err(crate::AssessmentFit {
+                    Ok(Err(crate::AssessmentFit {
                         verdict: AssessmentFitVerdict::DoesNotFit {
                             limiting: topology.host_ram().id(),
                             deficit_bytes,
                         },
                         domains: fit.domains,
-                    }));
+                    }))
                 }
             }
         }
-        assert!(
-            !seen.contains(&next),
-            "invariant violated: a bank's path records and slots cycle through {seen:?} without a fixed point"
-        );
-        seen.push(paths);
-        paths = next;
+        Err(shortfall) => Ok(Err(shortfall)),
     }
 }
 

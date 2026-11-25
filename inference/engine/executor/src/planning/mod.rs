@@ -45,6 +45,7 @@ pub use capabilities::{
 pub use components::{ArtifactComponent, ArtifactComponentKind, ComponentPlan, ComponentSelection};
 #[cfg(test)]
 pub(crate) use execution_plan::bank_substrate;
+pub(crate) use execution_plan::settle_bank_paths;
 pub use budget::{MemoryBudget, PlanForm, StoreBudget, WholeFit};
 pub use execution_plan::{
     BackendPlan, BankForm, ChargedDraft, ExecutionPlan, ExecutionPlanDraft, ExecutionPlanner, FloorForms, HeldForm, HeldBound, HeldCharge, NoBank, Placed, Unplaced, WeightBound, PlannedDevice,
