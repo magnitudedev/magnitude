@@ -87,9 +87,12 @@ impl Status {
             .map_err(Clone::clone)
     }
 
-    /// What is left of `path`'s grant: the runtime's reading where an
-    /// opened executor gave one, else the sample's. `None` when neither
-    /// source has one to read. The sample must be of `path`'s executor.
+    /// What is left of `path`'s grant: when both the opened executor's runtime
+    /// reading (e.g. CUDA `cuMemGetInfo`) and the sample's OS grant reading
+    /// (e.g. Windows WDDM `IDXGIAdapter3::QueryVideoMemoryInfo`) are present
+    /// and valid, the lesser of the two bounds the grant; if the sample's OS
+    /// query failed, the runtime reading stands. `None` when neither source
+    /// has one to read. The sample must be of `path`'s executor.
     pub fn grant_left(
         &self,
         path: &AccessPath,
@@ -99,14 +102,30 @@ impl Status {
             "the status is not of the path's executor"
         );
         let id = path.id();
-        if let Some((_, left)) = self.runtime.grants.iter().find(|(of, _)| *of == id) {
-            return Some(left.as_ref().copied());
-        }
-        self.sample
+        let runtime = self
+            .runtime
             .grants
             .iter()
             .find(|(of, _)| *of == id)
-            .map(|(_, left)| left.as_ref().copied())
+            .map(|(_, left)| left.as_ref().copied());
+        let sample = self
+            .sample
+            .grants
+            .iter()
+            .find(|(of, _)| *of == id)
+            .map(|(_, left)| left.as_ref().copied());
+        combine_grant_left(runtime, sample)
+    }
+}
+
+fn combine_grant_left<'a>(
+    runtime: Option<Result<Reported<u64>, &'a ObservationError>>,
+    sample: Option<Result<Reported<u64>, &'a ObservationError>>,
+) -> Option<Result<Reported<u64>, &'a ObservationError>> {
+    match (runtime, sample) {
+        (Some(Ok(rt)), Some(Ok(sm))) => Some(Ok(if sm.value < rt.value { sm } else { rt })),
+        (Some(rt), _) => Some(rt),
+        (None, sample) => sample,
     }
 }
 
@@ -184,6 +203,7 @@ fn grant_left(
             registry_id,
             before,
         } => metal_left(*registry_id, *before, grant, natives),
+        GrantSource::DxgiLocalBudget { luid } => dxgi_local_left(*luid),
     }
 }
 
@@ -267,9 +287,51 @@ fn metal_left(
     ))
 }
 
+/// WDDM's live local video memory headroom (`Budget - CurrentUsage`) for the
+/// adapter matching `luid` (`IDXGIAdapter3::QueryVideoMemoryInfo`).
+#[cfg(windows)]
+fn dxgi_local_left(luid: [u8; 8]) -> Result<Reported<u64>, ObservationError> {
+    let info = crate::adapters::local_video_memory(luid).map_err(ObservationError::Failed)?;
+    Ok(Reported::new(info.headroom(), ReportedBy::DxgiLocalBudget))
+}
+
+/// DXGI exists on Windows only, so no topology elsewhere holds a DXGI grant.
+#[cfg(not(windows))]
+fn dxgi_local_left(_luid: [u8; 8]) -> Result<Reported<u64>, ObservationError> {
+    Err(ObservationError::Unsupported(
+        "DXGI local video memory budget is Windows-only".into(),
+    ))
+}
+
 #[cfg(test)]
 mod tests {
-    use super::attributed;
+    use super::{attributed, combine_grant_left, ObservationError};
+    use seismic_topology::{Reported, ReportedBy};
+
+    #[test]
+    fn runtime_and_dxgi_grant_left_take_minimum_with_graceful_fallback() {
+        let cuda_free = Reported::new(15 << 30, ReportedBy::CudaFree);
+        let dxgi_tighter = Reported::new(14 << 30, ReportedBy::DxgiLocalBudget);
+        let dxgi_looser = Reported::new(16 << 30, ReportedBy::DxgiLocalBudget);
+        let dxgi_err = ObservationError::Failed("DXGI query failed".into());
+
+        assert_eq!(
+            combine_grant_left(Some(Ok(cuda_free)), Some(Ok(dxgi_tighter))),
+            Some(Ok(dxgi_tighter))
+        );
+        assert_eq!(
+            combine_grant_left(Some(Ok(cuda_free)), Some(Ok(dxgi_looser))),
+            Some(Ok(cuda_free))
+        );
+        assert_eq!(
+            combine_grant_left(Some(Ok(cuda_free)), Some(Err(&dxgi_err))),
+            Some(Ok(cuda_free))
+        );
+        assert_eq!(
+            combine_grant_left(None, Some(Ok(dxgi_tighter))),
+            Some(Ok(dxgi_tighter))
+        );
+    }
 
     /// A device whose memory is the host's, with 96 of its heaps' 110 bytes
     /// its own memory: usage is its own memory's first, the host path's

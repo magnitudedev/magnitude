@@ -781,6 +781,43 @@ fn a_device_no_view_states_the_memory_of_is_undecided_for_that_reason() {
     assert!(vulkan.paths(Contract::DeviceOnly).is_empty());
 }
 
+/// On Windows WDDM, a discrete CUDA device matched to a DXGI adapter with a
+/// local video memory budget caps its grant at WDDM's `Budget` and attaches a
+/// live `GrantSource::DxgiLocalBudget` so `cuMemAlloc` never spills to Sysmem.
+#[test]
+fn windows_wddm_local_budget_caps_discrete_cuda_grant_and_attaches_source() {
+    let mut reports = rtx3090_host();
+    let uuid = rtx3090_uuid();
+    let luid = [0x11, 0x22, 0x33, 0x44, 0, 0, 0, 0];
+    let mut cuda_report = rtx3090_cuda(uuid);
+    cuda_report.luid = Some(luid);
+    cuda_report.memory = crate::reports::CudaMemory::Own {
+        usable: Ok(15 * GB),
+    };
+    reports.cuda.push(cuda_report);
+    reports.adapters.push(crate::reports::AdapterReport {
+        luid,
+        dedicated: 16 * GB,
+        local_budget: Some(14 * GB),
+    });
+
+    let topology = topology(&reports);
+    assert_consistent(&topology);
+    let gpu = PhysicalIdentity::Uuid(uuid);
+    let cuda = executor(&topology, BackendName::Cuda, &gpu);
+    let device_path = topology
+        .access_path(cuda.paths(Contract::DeviceOnly)[0])
+        .expect("CUDA DeviceOnly path exists");
+    let grant = device_path.grant().expect("discrete CUDA path is granted");
+    assert_eq!(grant.bytes.value, 14 * GB);
+    assert_eq!(grant.bytes.by, ReportedBy::DxgiLocalBudget);
+    assert_eq!(grant.kind, GrantKind::DeviceOpened);
+    assert_eq!(
+        device_path.grant_source(),
+        Some((14 * GB, &crate::GrantSource::DxgiLocalBudget { luid }))
+    );
+}
+
 /// The dedicated memory the OS reports for an adapter applies to every view
 /// of a device whose memory is the host's, CUDA's included, matched by its
 /// LUID: it is placed first, under the lesser of it and the view's own
@@ -790,9 +827,11 @@ fn every_view_of_a_device_whose_memory_is_the_hosts_places_its_dedicated_memory_
     let mut reports = gb10();
     let luid = [0x42, 0x01, 0, 0, 0, 0, 0, 0];
     let dedicated = 32 * GB;
-    reports
-        .adapters
-        .push(crate::reports::AdapterReport { luid, dedicated });
+    reports.adapters.push(crate::reports::AdapterReport {
+        luid,
+        dedicated,
+        local_budget: None,
+    });
     reports.cuda[0].luid = Some(luid);
     let topology = topology(&reports);
     assert_consistent(&topology);

@@ -194,6 +194,10 @@ pub struct AdapterReport {
     /// Memory the OS reports as dedicated to the adapter, which it does not
     /// manage.
     pub dedicated: u64,
+    /// WDDM's per-process local video memory budget
+    /// (`IDXGIAdapter3::QueryVideoMemoryInfo(0, DXGI_MEMORY_SEGMENT_GROUP_LOCAL)`
+    /// `Budget`), when available on Windows.
+    pub local_budget: Option<u64>,
 }
 
 #[derive(Debug)]
@@ -558,19 +562,35 @@ pub fn build(revision: Revision, reports: &Reports) -> DeviceTopology {
                 // knows (`RuntimeStatus`).
                 |_| None,
             )),
-            Ok(Some(usable)) => KindPaths::Own {
-                device: executor.granted(
-                    own.expect("a CUDA device whose memory is its own has a store")
-                        .0,
-                    Grant {
-                        bytes: Reported::new(usable, ReportedBy::CudaUsableMemory),
-                        kind: GrantKind::DeviceOpened,
-                    },
-                    // What is left of it only the opened executor knows.
-                    None,
-                ),
-                host: executor.ungranted(host_ram),
-            },
+            Ok(Some(usable)) => {
+                // On Windows WDDM, `cuMemGetInfo` does not enforce WDDM's
+                // per-process local VRAM budget; cap usable VRAM at DXGI's
+                // `Budget` and attach a live `DxgiLocalBudget` grant source so
+                // `cuMemAlloc` never triggers silent CUDA Sysmem Fallback.
+                let wddm_budget = local_budget(&reports.adapters, cuda.luid);
+                let grant_bytes = match wddm_budget {
+                    Some(budget) if budget < usable => {
+                        Reported::new(budget, ReportedBy::DxgiLocalBudget)
+                    }
+                    _ => Reported::new(usable, ReportedBy::CudaUsableMemory),
+                };
+                let status = cuda
+                    .luid
+                    .filter(|_| wddm_budget.is_some())
+                    .map(|luid| GrantSource::DxgiLocalBudget { luid });
+                KindPaths::Own {
+                    device: executor.granted(
+                        own.expect("a CUDA device whose memory is its own has a store")
+                            .0,
+                        Grant {
+                            bytes: grant_bytes,
+                            kind: GrantKind::DeviceOpened,
+                        },
+                        status,
+                    ),
+                    host: executor.ungranted(host_ram),
+                }
+            }
             Err(_) => continue,
         };
         place_kinds(
@@ -867,6 +887,17 @@ fn dedicated(adapters: &[AdapterReport], luid: Option<[u8; 8]>) -> Option<u64> {
         .iter()
         .find(|adapter| adapter.luid == luid)
         .map(|adapter| adapter.dedicated)
+        .filter(|bytes| *bytes > 0)
+}
+
+/// WDDM's per-process local video memory budget for the adapter of `luid`,
+/// when DXGI reported a positive budget.
+fn local_budget(adapters: &[AdapterReport], luid: Option<[u8; 8]>) -> Option<u64> {
+    let luid = luid?;
+    adapters
+        .iter()
+        .find(|adapter| adapter.luid == luid)
+        .and_then(|adapter| adapter.local_budget)
         .filter(|bytes| *bytes > 0)
 }
 

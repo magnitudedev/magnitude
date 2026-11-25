@@ -640,6 +640,7 @@ pub fn strix_halo_windows() -> Reports {
     reports.adapters.push(AdapterReport {
         luid: STRIX_HALO_WINDOWS_LUID,
         dedicated: STRIX_HALO_WINDOWS_DEDICATED,
+        local_budget: None,
     });
     reports.vulkan.push(vulkan(
         uuid(STRIX_HALO_WINDOWS_UUID),

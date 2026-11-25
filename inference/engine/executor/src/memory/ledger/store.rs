@@ -495,8 +495,12 @@ impl DeviceLedgers {
                     DeviceGrant::Own { capacity, free, cache_reserve }
                 }
                 seismic::GrantKind::DeviceOpened => {
-                    let capacity = topology.store(path.store()).expect("a path's store is of its revision").capacity().value;
-                    let free = grant_from_status();
+                    let store_capacity = topology.store(path.store()).expect("a path's store is of its revision").capacity().value;
+                    let capacity = match grant.bytes.by {
+                        seismic::ReportedBy::DxgiLocalBudget => store_capacity.min(grant.bytes.value),
+                        _ => store_capacity,
+                    };
+                    let free = grant_from_status().min(capacity);
                     let cache_reserve = match device.backend() {
                         seismic::BackendName::Cuda => crate::memory::supply::cuda_context_cache_reserve(capacity),
                         _ => 0,

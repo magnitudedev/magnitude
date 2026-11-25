@@ -155,6 +155,10 @@ pub enum ReportedBy {
     /// `DedicatedSystemMemory` together: the memory the OS does not manage
     /// that it reports as the adapter's.
     DxgiDedicatedMemory,
+    /// DXGI `IDXGIAdapter3::QueryVideoMemoryInfo(DXGI_MEMORY_SEGMENT_GROUP_LOCAL)`:
+    /// WDDM's per-process local video memory budget (and remaining headroom
+    /// `Budget - CurrentUsage`) on Windows.
+    DxgiLocalBudget,
     /// The filesystem's size (`statvfs` blocks, `GetDiskFreeSpaceExW`
     /// total).
     FilesystemSize,
@@ -725,6 +729,10 @@ pub enum GrantSource {
     /// The Metal device's recommended working set less what this process
     /// has allocated on it, attributed as `VulkanHeaps` is.
     MetalWorkingSet { registry_id: u64, before: u64 },
+    /// Windows WDDM local video memory budget less current process usage
+    /// (`IDXGIAdapter3::QueryVideoMemoryInfo(0, DXGI_MEMORY_SEGMENT_GROUP_LOCAL)`),
+    /// matched by the adapter's LUID.
+    DxgiLocalBudget { luid: [u8; 8] },
 }
 
 impl DeviceTopology {

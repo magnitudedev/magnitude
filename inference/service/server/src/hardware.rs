@@ -130,7 +130,9 @@ pub fn reported_by(by: ReportedBy) -> HardwareReportedBy {
         ReportedBy::MetalRecommendedWorkingSet => HardwareReportedBy::MetalRecommendedWorkingSet,
         ReportedBy::MetalWorkingSetUnallocated => HardwareReportedBy::MetalWorkingSetUnallocated,
         ReportedBy::CudaTotalMemory => HardwareReportedBy::CudaTotalMemory,
-        ReportedBy::CudaUsableMemory => HardwareReportedBy::CudaUsableMemory,
+        ReportedBy::CudaUsableMemory | ReportedBy::DxgiLocalBudget => {
+            HardwareReportedBy::CudaUsableMemory
+        }
         ReportedBy::CudaFree => HardwareReportedBy::CudaFree,
         ReportedBy::VulkanHeap => HardwareReportedBy::VulkanHeap,
         ReportedBy::VulkanHeapBudget => HardwareReportedBy::VulkanHeapBudget,

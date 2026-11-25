@@ -26,13 +26,15 @@ pub fn open(ordinal: u32, stores: CudaStores) -> Result<OpenedCuda, TargetError>
 /// measures holds no device.
 ///
 /// Under WDDM `cuMemGetInfo` free, read once the context exists and before
-/// the process allocates, is exactly that: the process's budget less its own
-/// use, whatever other programs hold. Elsewhere (Linux) it is the whole
-/// device's free memory, which other programs' allocations lower, so the
-/// figure is NVML's total less its reserve less what this process's context
-/// holds, as NVML counts the process once its context, its first, exists:
-/// never a fall in the device's free memory, which other programs move
-/// while the context opens.
+/// the process allocates, reports physical VRAM less driver reserve and this
+/// process's context, without enforcing WDDM's per-process local video memory
+/// budget (`IDXGIAdapter3::QueryVideoMemoryInfo`), so Windows topology and
+/// live status further bound CUDA VRAM by WDDM's local budget. Elsewhere
+/// (Linux) `cuMemGetInfo` is the whole device's free memory, which other
+/// programs' allocations lower, so the figure is NVML's total less its reserve
+/// less what this process's context holds, as NVML counts the process once its
+/// context, its first, exists: never a fall in the device's free memory, which
+/// other programs move while the context opens.
 pub fn usable_memory_bytes(ordinal: u32, uuid: [u8; 16]) -> Result<u64, ExecutionError> {
     usable_memory_report(ordinal, uuid).map(|(bytes, _)| bytes)
 }
