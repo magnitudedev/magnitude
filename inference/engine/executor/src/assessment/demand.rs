@@ -46,6 +46,18 @@ const WHOLE: &Words = &[
     ("next_policy", magnitude_kernels::constants::POLICY_WHOLE, true),
 ];
 
+/// The launch-condition policy words under which a load's decode or drafter
+/// census is evaluated. Any load backed by an expert bank encodes routed
+/// streaming launch conditions (`policy[POLICY_WHOLE]`,
+/// `policy[POLICY_RESOLVED]`, `next_policy[POLICY_WHOLE]`).
+fn policy_words(load: &ModelLoadPlan, resident: bool) -> &'static Words {
+    if load.expert_bank().is_some() {
+        if resident { WHOLE } else { STREAMED }
+    } else {
+        &[]
+    }
+}
+
 /// An amount of one weight format's, summed per format.
 trait PerFormat {
     /// What the amounts are, as an overflow names them.
@@ -726,11 +738,7 @@ impl DecodeDemand {
             .map_err(|error| demand_error(error.to_string()))?;
         let layout =
             ModelStateLayout::derive(&definition.decoder, &[], codec, 0).map_err(demand_error)?;
-        let words: &'static Words = if load.expert_bank().is_some() {
-            if resident { WHOLE } else { STREAMED }
-        } else {
-            &[]
-        };
+        let words = policy_words(load, resident);
         let vocabulary = definition.decoder.vocabulary;
         let backend = target_census
             .entry_calls
@@ -876,17 +884,19 @@ impl DraftDemand {
     /// proposing widths were recorded.
     pub(crate) fn from_census(
         definition: &ModelDefinition,
+        load: &ModelLoadPlan,
         method: PlannedMethod,
         graph: &AssessmentGraphResourceBounds,
     ) -> Result<Option<Self>, AssessmentError> {
         let Some(draft_census) = &graph.draft_census else {
             return Ok(None);
         };
-        Self::from_family_census(definition, method, draft_census)
+        Self::from_family_census(definition, load, method, draft_census)
     }
 
     pub(crate) fn from_family_census(
         definition: &ModelDefinition,
+        load: &ModelLoadPlan,
         method: PlannedMethod,
         draft_census: &DraftFamilySizingCensus,
     ) -> Result<Option<Self>, AssessmentError> {
@@ -898,6 +908,7 @@ impl DraftDemand {
         if draft_census.widths.is_empty() {
             return Ok(None);
         }
+        let words = policy_words(load, false);
         let vocabulary = definition.decoder.vocabulary;
         let mut widths = Vec::with_capacity(draft_census.widths.len());
         for width in &draft_census.widths {
@@ -910,7 +921,7 @@ impl DraftDemand {
             for sized in &width.calls {
                 calls.push(call_from_sized(
                     sized,
-                    &[],
+                    words,
                     vocabulary,
                     None,
                     &mut unused_gate_up_part,
@@ -964,7 +975,7 @@ pub(crate) fn draft_demand_direct(
     else {
         return Ok(None);
     };
-    DraftDemand::from_family_census(definition, method, &draft_census)
+    DraftDemand::from_family_census(definition, load, method, &draft_census)
 }
 
 /// Outline only the target and readout families via `SizingDraft` and build
@@ -1123,6 +1134,92 @@ pub(crate) mod tests {
                     });
                 }
             }
+        }
+    }
+
+    /// A banked MoE model with a routed MTP drafter emits `routed_land` in its
+    /// drafter census; `DraftDemand` must supply the bank's launch-condition
+    /// policy words (`POLICY_WHOLE`, `POLICY_RESOLVED`, `next_policy[POLICY_WHOLE]`)
+    /// so launch-count evaluation succeeds on every GPU backend.
+    #[test]
+    fn banked_mtp_drafter_demand_supplies_policy_words() {
+        let (definition, manifest) = crate::planning::fixtures::glm_slice_b_mtp_fixture();
+        let selection = crate::ComponentSelection {
+            head: true,
+            vision: false,
+        };
+        let method = PlannedMethod::Mtp {
+            greedy_proposals: 1,
+            sampled_proposals: 1,
+            widths: crate::DraftWidths::Adaptive,
+        };
+        let limits = crate::assessment::assess::tests::LIMITS;
+        let capacity = ResourceCapacity {
+            domain_bytes: 64 * 1024 * 1024 * 1024,
+            tensor_operations: crate::TensorOperations::of(false),
+            allocations: seismic::NativeAllocations::EXACT,
+        };
+        for backend in [BackendName::Metal, BackendName::Cuda, BackendName::Vulkan] {
+            let resident = ModelLoadPlan::derive(
+                &manifest,
+                &definition,
+                selection,
+                crate::resident_layout(crate::ExecutionPath::Native, backend),
+                method,
+                limits,
+            )
+            .unwrap();
+            let host_tier = if backend == BackendName::Metal {
+                crate::planning::HostTier::Unified(crate::planning::Parking::of(backend))
+            } else {
+                crate::planning::HostTier::Linked
+            };
+            let substrate = crate::planning::BankSubstrate::new(
+                backend,
+                seismic::NativeAllocations::EXACT,
+                host_tier,
+            );
+            let banked = resident
+                .with_expert_bank(
+                    &definition,
+                    32,
+                    None,
+                    1,
+                    crate::planning::FlightDepth::SERIAL,
+                    substrate,
+                )
+                .unwrap();
+            let draft = draft_demand_direct(
+                &definition,
+                &banked,
+                KvCodec::Dense,
+                method,
+                limits,
+                capacity,
+                backend,
+            )
+            .unwrap()
+            .expect("MTP plan produces a draft demand");
+            let mut saw_routed_land = false;
+            for width in &draft.widths {
+                for call in &width.demand.calls {
+                    if call.launches.kernel().name() == "routed_land" {
+                        saw_routed_land = true;
+                    }
+                    for rows in [1, 2] {
+                        call.launches.at(rows).unwrap_or_else(|error| {
+                            panic!(
+                                "{backend:?} drafter `{}` at {rows} rows: {error}",
+                                call.launches.kernel().name()
+                            )
+                        });
+                    }
+                }
+            }
+            assert!(
+                saw_routed_land,
+                "{backend:?} banked MTP drafter census should include `routed_land`"
+            );
         }
     }
 }

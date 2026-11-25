@@ -451,7 +451,7 @@ impl PreparedExecutionAssessment {
         let method = draft_plan.policy().method();
         let load = draft_plan.load();
         let graph = primary.structure.graph();
-        let draft = DraftDemand::from_census(definition, method, graph)?;
+        let draft = DraftDemand::from_census(definition, load, method, graph)?;
         if load.expert_bank().is_some() {
             let (whole, demand) = crate::assessment::pool::join(
                 || DecodeDemand::from_census(definition, load, codec, graph, true),
