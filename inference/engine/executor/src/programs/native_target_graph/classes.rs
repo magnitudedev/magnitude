@@ -11,7 +11,7 @@ use crate::{
     },
     programs::graph::RowForm,
 };
-use magnitude_family_contracts::{Decoder, RoutedFfn, WeightScope};
+use magnitude_family_contracts::{Decoder, RoutedFfn};
 use magnitude_state::LayerRef;
 use seismic::{BackendName, Element, OperandForms, OperandRecipe};
 
@@ -127,104 +127,114 @@ pub(super) fn block_routed(geometry: &Decoder, index: usize) -> Result<Option<&R
         .and_then(|sublayer| crate::operators::routed::routed_ffn(&sublayer.op)))
 }
 
-/// Per target block, the index of its feed-forward sublayer in
-/// `load.expert_bank().layers()`, if that block's experts stream.
-pub(super) fn bank_layer_by_block(load: &ModelLoadPlan, block_count: usize) -> Vec<Option<usize>> {
-    let mut by_block = vec![None; block_count];
-    let Some(bank) = load.expert_bank() else {
-        return by_block;
-    };
-    for (layer_idx, layer) in bank.layers().iter().enumerate() {
-        let sublayer = match layer.scope {
-            WeightScope::TargetSublayer(sublayer)
-            | WeightScope::TargetBranch { sublayer, .. } => sublayer,
-            _ => continue,
-        };
-        if sublayer.sublayer == 1 {
-            if let Some(slot) = by_block.get_mut(sublayer.block as usize) {
-                if slot.is_none() {
-                    *slot = Some(layer_idx);
-                }
-            }
-        }
-    }
-    by_block
-}
-
-/// How a block is served, which decides its stages (`RunStage::served`,
-/// `RunStage::sealed`): whether the load streams its routed layer's experts
-/// and whether that layer has a resident form (`streamed::resident_form`),
-/// and the values a split layer crosses and merges over the chain's rows.
-#[derive(Clone, Debug)]
-pub(super) struct BlockServed {
+/// How a block is served, which decides the stages its graphs are sealed in
+/// (`Self::stages`, `Self::sealed_stages`) and what its streamed layer's
+/// graphs build: whether the load streams its routed layer's experts and
+/// whether that layer has a resident form (`streamed::resident_form`),
+/// whether its prompt rows split (`RunStage::Front`), and whether its decode
+/// splits around the layer's on-demand landing (`RunStage::DecodeFront`) and
+/// its hits from its misses (`RunStage::DecodeHits`). Derived once, of the
+/// outline (`Self::of_blocks`), and held by each block's shape
+/// (`BlockGraphShape`), so blocks share layouts and plans only over one form.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub(super) struct ServedForm {
     pub(super) streams: bool,
     pub(super) resident: bool,
+    pub(super) split: bool,
     pub(super) decode_split: bool,
     pub(super) decode_hits: bool,
+}
+
+impl ServedForm {
+    /// Each block's form, of a load streaming its experts through `bank`
+    /// (`ModelLoadPlan::expert_bank`) on `backend`, whose launches take at
+    /// most `largest_rows` rows (`FamilyOutline::largest_rows`) and merge
+    /// a chain's where `chain_merges` (`ResourceLimits::chain_capacity`).
+    pub(super) fn of_blocks(
+        backend: BackendName,
+        bank: Option<&crate::ExpertBankPlan>,
+        geometry: &Decoder,
+        largest_rows: u64,
+        chain_merges: bool,
+    ) -> Result<Vec<Self>, String> {
+        let bank_resident = bank.is_some_and(|bank| bank.resident);
+        let bank_decode_dma = bank.is_some_and(|bank| bank.decode_dma(backend));
+        let prompts = !crate::operators::routed::fused_graph::decodes(largest_rows);
+        (0..geometry.blocks.len())
+            .map(|index| {
+                let layer = bank.and_then(|bank| bank.block_layer(index));
+                let routed = block_routed(geometry, index)?;
+                let streams = layer.is_some();
+                let decode_split = streams && bank_decode_dma && routed.is_some();
+                let bank_decode_hits = bank
+                    .zip(layer)
+                    .is_some_and(|(bank, layer)| bank.sited(layer) && bank.splits_decode_hits(layer));
+                Ok(Self {
+                    streams,
+                    resident: streams && bank_resident,
+                    split: prompts && (chain_merges || streams) && routed.is_some(),
+                    decode_split,
+                    decode_hits: decode_split
+                        && bank_decode_hits
+                        && routed.is_some_and(|routed| {
+                            crate::operators::routed::streamed::decode_hits_supported(routed, backend)
+                        }),
+                })
+            })
+            .collect()
+    }
+
+    /// The stages its graphs of `rows` rows run in (`RunStage::served`).
+    pub(super) fn stages(self, rows: u64) -> &'static [RunStage] {
+        RunStage::served(self.split, rows)
+    }
+
+    /// The stages its graphs of `rows` rows are sealed in
+    /// (`RunStage::sealed`): its runs' stages, its resident form, and its
+    /// decode split front/hits/back where active.
+    pub(super) fn sealed_stages(self, rows: u64) -> &'static [RunStage] {
+        RunStage::sealed(self.split, self.resident, self.decode_split, self.decode_hits, rows)
+    }
+}
+
+/// How a block is served (`ServedForm`), with the values its split layer
+/// crosses and merges over the chain's rows and those its decode split
+/// crosses, each present exactly where its form splits.
+#[derive(Clone, Debug)]
+pub(super) struct BlockServed {
+    pub(super) form: ServedForm,
     pub(super) split: Option<SplitValues<Extents>>,
     pub(super) decode_crossing: Option<crate::operators::routed::split::DecodeCrossingBuffers<Extents>>,
 }
 
-/// Each block's `BlockServed`, its rows crossed over a chain of
+/// Each block's `BlockServed`, of its form in `outline`
+/// (`FamilyOutline::served`), its rows crossed over a chain of the outline's
 /// `chain_rows` rows and merged by the group's `passes`.
 pub(super) fn block_served(
-    backend: seismic::BackendName,
-    load: &ModelLoadPlan,
+    outline: &FamilyOutline,
     geometry: &Decoder,
-    limits: ResourceLimits,
-    chain_rows: u64,
     passes: Passes,
 ) -> Result<Vec<BlockServed>, String> {
-    let block_count = geometry.blocks.len();
-    let bank_layers = bank_layer_by_block(load, block_count);
-    let bank_resident = load.expert_bank().is_some_and(|bank| bank.resident);
-    let bank_decode_dma = crate::experts::decode_dma_enabled(backend)
-        && load
-            .expert_bank()
-            .is_some_and(|bank| bank.placer() == crate::planning::Placer::Tier && !bank.whole());
-    let chain_merges = limits.chain_capacity.get() > 1;
-    let prompts = magnitude_batching::row_classes(limits.max_launch_rows)
-        .last()
-        .is_some_and(|&rows| !crate::operators::routed::fused_graph::decodes(rows as u64));
-    (0..block_count)
+    (0..geometry.blocks.len())
         .map(|index| {
-            let streams = bank_layers[index].is_some();
+            let form = outline.served(index);
             let routed = block_routed(geometry, index)?;
-            let split = if prompts && (chain_merges || streams) {
-                routed
-                    .map(|routed| SplitValues::of(routed, geometry, chain_rows, passes.rows()))
-                    .transpose()?
-            } else {
-                None
+            // A form splits only a routed feed-forward (`ServedForm::of_blocks`).
+            let split_routed = |splits: bool| {
+                splits.then(|| routed.expect("invariant violated: a block that splits has no routed feed-forward"))
             };
-            let decode_split = streams && bank_decode_dma && routed.is_some();
-            let bank_decode_hits = bank_layers[index].is_some_and(|layer| {
-                load.expert_bank()
-                    .is_some_and(|bank| bank.sited(layer) && bank.splits_decode_hits(layer))
-            });
-            let decode_hits = decode_split
-                && bank_decode_hits
-                && routed.is_some_and(|routed| {
-                    crate::operators::routed::streamed::decode_hits_supported(routed, backend)
-                });
-            let decode_crossing = if decode_split {
-                routed.map(|routed| {
+            Ok(BlockServed {
+                form,
+                split: split_routed(form.split)
+                    .map(|routed| SplitValues::of(routed, geometry, outline.chain_rows, passes.rows()))
+                    .transpose()?,
+                decode_crossing: split_routed(form.decode_split).map(|routed| {
                     crate::operators::routed::split::DecodeCrossingBuffers::of(
                         routed,
                         geometry,
                         magnitude_kernels::constants::VERIFY_ROWS,
                     )
-                })
-            } else {
-                None
-            };
-            Ok(BlockServed {
-                streams,
-                resident: streams && bank_resident,
-                decode_split,
-                decode_hits,
-                split,
-                decode_crossing,
+                }),
             })
         })
         .collect()
@@ -233,20 +243,13 @@ pub(super) fn block_served(
 /// The stages of block `index`'s graphs of `rows` rows, of the blocks'
 /// `served` (`block_served`).
 pub(super) fn block_stages(served: &[BlockServed], index: usize, rows: u64) -> &'static [RunStage] {
-    RunStage::served(served[index].split.is_some(), rows)
+    served[index].form.stages(rows)
 }
 
 /// The stages block `index`'s graphs of `rows` rows are sealed in
-/// (`RunStage::sealed`): its runs' stages, its resident form, and its M7
-/// decode split front/hits/back where active.
+/// (`ServedForm::sealed_stages`).
 pub(super) fn block_sealed_stages(served: &[BlockServed], index: usize, rows: u64) -> &'static [RunStage] {
-    RunStage::sealed(
-        served[index].split.is_some(),
-        served[index].resident,
-        served[index].decode_split,
-        served[index].decode_hits,
-        rows,
-    )
+    served[index].form.sealed_stages(rows)
 }
 
 /// Whether a launch of `rows` rows splits at block `index`
@@ -321,7 +324,7 @@ impl<'s, T> LaunchRuns<'s, T> {
             .iter()
             .filter(move |&(block, _)| block_splits(self.served, *block, class.0))
             .flat_map(move |&(block, ref graphs)| {
-                let streams = self.served[block].streams;
+                let streams = self.served[block].form.streams;
                 graphs.iter().flat_map(move |(once, rows, graph)| {
                     let repeat = if streams && (*once == OnceStage::Fill || *rows == single_pass) {
                         windows as usize
@@ -1164,7 +1167,14 @@ impl FamilyOutline {
             block_carries(backend, geometry, plan, undrafted_tail)?
         };
         let undrafted = (undrafted_tail, undrafted_carries);
-        let shapes = block_graph_shapes(load, geometry, state, &tapped, &carries, residual)?;
+        let served = ServedForm::of_blocks(
+            backend,
+            load.expert_bank(),
+            geometry,
+            largest_rows,
+            limits.chain_capacity.get() > 1,
+        )?;
+        let shapes = block_graph_shapes(load, geometry, state, &tapped, &carries, residual, &served)?;
         Ok(Self {
             backend,
             row_classes,
@@ -1220,6 +1230,12 @@ impl FamilyOutline {
     /// The first block of `index`'s shape, whose layouts it holds.
     pub(super) fn first_of_shape(&self, index: usize) -> usize {
         self.firsts[index]
+    }
+
+    /// How block `index` is served, as its shape holds it
+    /// (`ServedForm::of_blocks`).
+    pub(super) fn served(&self, index: usize) -> ServedForm {
+        self.shapes[index].served()
     }
 
     /// The shape of tapped block `index`'s untapped graphs, which a launch
@@ -1514,7 +1530,7 @@ pub(super) fn enumerate_block_graphs(
                 untapped_count += n;
             }
         }
-        let once_count = once_graphs(served[index].streams, served[index].split.is_some(), passes).len();
+        let once_count = once_graphs(served[index].form.streams, served[index].form.split, passes).len();
         match shared[index] {
             Some(_) => sharing_cap += run_count + once_count,
             None => sealing_cap += run_count + once_count,
@@ -1530,7 +1546,7 @@ pub(super) fn enumerate_block_graphs(
     enumeration.untapped_sealing.reserve(untapped_sealing_cap);
     enumeration.untapped_sharing.reserve(untapped_sharing_cap);
     for index in 0..blocks.len() {
-        let mut once = once_graphs(served[index].streams, served[index].split.is_some(), passes);
+        let mut once = once_graphs(served[index].form.streams, served[index].form.split, passes);
         once.sort_unstable_by_key(|&(stage, rows)| once_class(rows, stage));
         let mut once_at = 0usize;
         let emit_once = |staged: StagedClass, sealing: &mut Vec<_>, sharing: &mut Vec<_>| match shared[index] {

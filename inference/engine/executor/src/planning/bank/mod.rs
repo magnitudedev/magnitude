@@ -572,10 +572,18 @@ impl ExpertBankPlan {
             }
     }
 
+    /// Whether a decode step lands this bank's missed experts on demand
+    /// (`DecodeFront -> DMA -> DecodeBack`, `experts::decode_dma_enabled`):
+    /// only a tier-placed bank that is not whole. Single owner shared by the
+    /// bank's transport and the blocks' served stages.
+    pub fn decode_dma(&self, backend: seismic::BackendName) -> bool {
+        crate::experts::decode_dma_enabled(backend) && self.placer() == Placer::Tier && !self.whole()
+    }
+
     /// Whether streamed layer `layer` has enough expected per-row miss-DMA
     /// bytes to justify 3-stage `DecodeHits` splitting (`expected_miss_bytes >
-    /// decode_hits_min_bytes`). Single-owner decision shared by `classes.rs`,
-    /// `certify.rs`, `block.rs`, and `routed/graph.rs`.
+    /// decode_hits_min_bytes`). Single-owner decision, read through each block's
+    /// served form (`ServedForm::of_blocks`).
     pub fn splits_decode_hits(&self, layer: usize) -> bool {
         let info = &self.layers()[layer];
         if info.experts == 0 {
@@ -1497,6 +1505,16 @@ impl ExpertBankPlan {
             (WeightScope::TargetBranch { sublayer, .. }, WeightScope::TargetSublayer(of)) => sublayer == of,
             (own, of) => own == of,
         })
+    }
+
+    /// The layer of target block `block`'s feed-forward ([`Self::feed_forward`]
+    /// of its sublayer 1: the sublayer's own or its parallel routed
+    /// branch's), and its index, when the bank holds its experts. The one
+    /// lookup of a block's streamed layer.
+    pub fn block_layer(&self, block: usize) -> Option<usize> {
+        let block = u32::try_from(block).expect("invariant violated: target block index exceeds u32");
+        self.feed_forward(WeightScope::TargetSublayer(magnitude_family_contracts::SublayerIndex { block, sublayer: 1 }))
+            .map(|(layer, _)| layer)
     }
 
     /// The resident plan of a banked expert stack: what tuning imports.

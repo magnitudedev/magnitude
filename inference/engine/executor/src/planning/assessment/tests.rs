@@ -232,7 +232,8 @@ fn checked_decoder_family_bounds_every_prepared_class_axis() {
         &load,
         &definition.decoder,
         &state,
-        plan.target().blocks()[0],
+        plan.target(),
+        limits,
         0,
         (2, 4, 2, 0, 0),
     )

@@ -8,7 +8,7 @@ use super::{
     certify::{TargetFamilyCertificate, certify_target_family},
     classes::{
         BlockGraphEnumeration, BlockListings, BlockOutputScales, BlockServed, Holder, LaunchControlLayout,
-        Passes, StagedClass, binding_key, block_sealed_stages, block_stages, carried_forms, chained_once_runs, class_topology, decode_launch, enumerate_block_graphs, LaunchRuns, once_class,
+        Passes, ServedForm, StagedClass, binding_key, block_sealed_stages, block_stages, carried_forms, chained_once_runs, class_topology, decode_launch, enumerate_block_graphs, LaunchRuns, once_class,
         slot_selection,
     },
     entry::{
@@ -362,6 +362,9 @@ pub(super) struct BlockGraphShape {
     carries: BlockCarries<MixerProgramSlot>,
     /// A streamed routed layer's bank binding.
     banked: Option<crate::BankBinding>,
+    /// How the block is served (`ServedForm::of_blocks`), which decides the
+    /// stages it is sealed in and what its streamed layer's graphs build.
+    served: ServedForm,
     /// (sublayer, branch) of each role, its resident element, shape and
     /// accumulator-scale port extent.
     weights: Vec<((u32, Option<u32>), WeightKind, Element, WeightDims, u64)>,
@@ -380,6 +383,11 @@ impl BlockGraphShape {
     /// The shape with the operand carries `carries` (`block_carries`).
     pub(super) fn carrying(self, carries: BlockCarries<MixerProgramSlot>) -> Self {
         Self { carries, ..self }
+    }
+
+    /// How the block is served (`ServedForm::of_blocks`).
+    pub(super) fn served(&self) -> ServedForm {
+        self.served
     }
 
     /// The feed-forward-only key that governs `OnceStage::Pass` and
@@ -411,6 +419,7 @@ impl BlockGraphShape {
         self.sets_step.hash(&mut h);
         (self.carries.carry_in.is_some(), self.carries.carry_out.is_some()).hash(&mut h);
         self.banked.is_some().hash(&mut h);
+        self.served.hash(&mut h);
         self.weights.hash(&mut h);
         self.state.history.hash(&mut h);
         self.state.bank.as_ref().map(|b| b.as_ref().map(Vec::len)).hash(&mut h);
@@ -908,6 +917,7 @@ pub(super) fn block_graph_shapes(
     tapped: &[BlockTaps],
     carries: &[BlockCarries<MixerProgramSlot>],
     residual: Option<usize>,
+    served: &[ServedForm],
 ) -> Result<Vec<BlockGraphShape>, String> {
     let block_count = geometry.blocks.len();
     let components = &state.target_state().recurrent_components;
@@ -935,7 +945,6 @@ pub(super) fn block_graph_shapes(
         }
     }
     let bank = load.expert_bank();
-    let bank_layers = super::classes::bank_layer_by_block(load, block_count);
     let mut bank_cursor = 0usize;
     let mut token_map_cache: Option<(&[u32], [u8; 32])> = None;
     let mut shapes = Vec::with_capacity(block_count);
@@ -994,7 +1003,7 @@ pub(super) fn block_graph_shapes(
             }),
             &mut token_map_cache,
         )?;
-        let bank_layer = bank_layers[index];
+        let bank_layer = bank.and_then(|bank| bank.block_layer(index));
         shapes.push(BlockGraphShape {
             geometry: geometry_shape,
             weights,
@@ -1009,6 +1018,7 @@ pub(super) fn block_graph_shapes(
             residual: residual == Some(index),
             sets_step: bank.zip(bank_layer).is_some_and(|(bank, layer)| bank.sets_step(layer)),
             banked: banked_layer_for(bank, bank_layer)?,
+            served: served[index],
             carries: carries[index],
         });
     }
@@ -1234,7 +1244,7 @@ impl PreparedTargetGraphs {
                 BlockGraphInputs {
                     output_scales: handles.blocks[index].output_scales,
                     residual: !untapped && outline.exports_residual(index),
-                    ..BlockGraphInputs::of_class(load, geometry, state, index, staged, capacity, outline.carries[index])
+                    ..BlockGraphInputs::of_class(load, geometry, state, index, staged, capacity, outline.carries[index], outline.served(index))
                 },
                 |reader| carried_forms(handles, plan, index + reader as usize),
                 &certified_of(index, staged, untapped)?.layout,
@@ -1577,11 +1587,18 @@ impl PreparedTargetGraphs {
         block_stages(&self.served, index, rows)
     }
 
+    /// Whether block `index`'s decode over `rows` rows was sealed split around
+    /// its streamed layer's on-demand landing (`RunStage::DecodeFront`,
+    /// `ServedForm::decode_split`): the only decode a step may split.
+    pub(crate) fn splits_decode(&self, index: usize, rows: u64) -> bool {
+        crate::operators::routed::fused_graph::decodes(rows) && self.served[index].form.decode_split
+    }
+
     /// Whether block `index` over `rows` rows was sealed with `RunStage::DecodeHits`
     /// (the single authoritative decision shared by sealing, certification, and
     /// runtime dispatch — never inferred via fallible graph lookup).
     pub(crate) fn splits_decode_hits(&self, index: usize, rows: u64) -> bool {
-        crate::operators::routed::fused_graph::decodes(rows) && self.served[index].decode_hits
+        crate::operators::routed::fused_graph::decodes(rows) && self.served[index].form.decode_hits
     }
 
     /// The stage of block `index`'s run of `rows` rows at `stage` of its
@@ -1598,7 +1615,7 @@ impl PreparedTargetGraphs {
     /// Whether the load streams block `index`'s routed experts
     /// (`block_served`).
     pub(crate) fn streams(&self, index: usize) -> bool {
-        self.served[index].streams
+        self.served[index].form.streams
     }
 
     pub(crate) fn windows(&self) -> u64 {
@@ -1712,7 +1729,7 @@ impl PreparedTargetGraphs {
         // Only a load whose blocks stream their experts holds graphs of bank
         // parts and parks, which each run of a step of its bank binds
         // (`BankRun`); a bank is held exactly there.
-        if resident.bank.is_some() != self.served.iter().any(|block| block.streams) {
+        if resident.bank.is_some() != self.served.iter().any(|block| block.form.streams) {
             return Err("the resident target's expert bank disagrees with its streamed blocks".into());
         }
         let embedding = resident.embedding.table().clone();

@@ -1,7 +1,7 @@
 #[cfg(test)]
 use super::classes::BlockClass;
 use super::{
-    classes::{StagedClass, block_routed},
+    classes::{ServedForm, StagedClass, block_routed},
     heap::owned_vectors_heap,
     weights::{BankPort, BlockWeights, GraphTimeline, PlannedWeights, WeightPart, WeightPort, activation, weight_port},
 };
@@ -348,7 +348,7 @@ impl SealedBlockGraph {
         let mut constants = Vec::new();
         let mut banks = Vec::new();
         let mut parks = Vec::new();
-        let decode_hits_allowed = inputs.bank_splits_decode_hits();
+        let decode_hits_allowed = inputs.served.decode_hits;
         let bank = layer_bank(
             stage,
             handle.bank.as_ref().map(|bank| {
@@ -480,12 +480,19 @@ pub(super) struct BlockGraphInputs<'a> {
     /// The block's operand carries (`FamilyOutline::carries`), which its
     /// graphs of a one-row class declare.
     pub(super) carries: BlockCarries<MixerProgramSlot>,
+    /// How the block is served (`FamilyOutline::served`): its streamed
+    /// layer's decode splits hits from misses (`RunStage::DecodeHits`) only
+    /// where its form does, so its graphs bind the masked-write down
+    /// projection exactly there.
+    pub(super) served: ServedForm,
 }
 
 impl<'a> BlockGraphInputs<'a> {
     /// The inputs of block `block_index`'s graph of `staged`, at unit output
     /// scales: scalar arguments leave its checked shapes and storage alone.
-    /// The block carries `carries` (`FamilyOutline::carries`).
+    /// The block carries `carries` (`FamilyOutline::carries`) and is served
+    /// as `served` (`FamilyOutline::served`).
+    #[allow(clippy::too_many_arguments)]
     pub(super) fn of_class(
         load: &'a ModelLoadPlan,
         geometry: &'a Decoder,
@@ -494,6 +501,7 @@ impl<'a> BlockGraphInputs<'a> {
         ((rows, segments, slots, listed, scored), stage): StagedClass,
         capacity: u64,
         carries: BlockCarries<MixerProgramSlot>,
+        served: ServedForm,
     ) -> Self {
         Self {
             load,
@@ -510,6 +518,7 @@ impl<'a> BlockGraphInputs<'a> {
             capacity,
             residual: false,
             carries,
+            served,
         }
     }
 }
@@ -664,6 +673,7 @@ impl<'a> BlockGraphInputs<'a> {
             capacity,
             residual,
             carries,
+            served: _,
         } = *self;
         let block = geometry.blocks.get(block_index).ok_or("target block geometry is absent")?;
         let paired = paired_block(block).map_err(|error| error.to_string())?;
@@ -753,25 +763,6 @@ impl<'a> BlockGraphInputs<'a> {
                 sublayers: numbers,
             },
         ))
-    }
-
-    /// Whether this block's streamed bank layer is sited and has enough
-    /// expected miss-DMA work to justify 3-stage `DecodeHits` splitting
-    /// (`ExpertBankPlan::splits_decode_hits`). Single-owner gate shared by
-    /// `seal`, `certify`, `probe_axes`, and `classes.rs`.
-    fn bank_splits_decode_hits(&self) -> bool {
-        let Some(bank) = self.load.expert_bank() else {
-            return false;
-        };
-        let Some(layer) = bank.layers().iter().position(|layer| {
-            matches!(
-                layer.scope,
-                magnitude_family_contracts::WeightScope::TargetSublayer(s) if s.block == self.block_index as u32
-            )
-        }) else {
-            return false;
-        };
-        bank.sited(layer) && bank.splits_decode_hits(layer)
     }
 
     /// The block graph's split (`split`) as a graph is built from it at the
@@ -1280,7 +1271,7 @@ pub(super) fn probe_block_axes(
     max_segments: u64,
     listed: bool,
 ) -> Result<super::classes::ClassAxes, GraphError> {
-    let entries = CheckedBlockEntries::new(base_inputs.state, backend, slot, base_inputs.bank_splits_decode_hits())?;
+    let entries = CheckedBlockEntries::new(base_inputs.state, backend, slot, base_inputs.served.decode_hits)?;
     let planned = base_inputs.weights()?;
     let probe = |inputs: &BlockGraphInputs<'_>| -> Result<u64, GraphError> {
         let (mut banks, mut parks) = (Vec::new(), Vec::new());
@@ -1338,7 +1329,7 @@ pub(super) fn certify_block_group<L: Certified>(
     base_inputs: &BlockGraphInputs<'_>,
     classes: &[StagedClass],
 ) -> Result<(L, Vec<(u64, Vec<GraphConstant>)>, HostHeap), GraphError> {
-    let entries = CheckedBlockEntries::new(base_inputs.state, backend, slot, base_inputs.bank_splits_decode_hits())?;
+    let entries = CheckedBlockEntries::new(base_inputs.state, backend, slot, base_inputs.served.decode_hits)?;
     let planned = base_inputs.weights()?;
     let (layout, aux) = L::certify_group(backend, classes, |draft, staged| {
         let ((rows, segments, slots, listed, scored), stage) = staged;
@@ -1378,7 +1369,7 @@ pub(super) fn checked_block_graph_draft(
     tap: Option<(u64, TapPositions)>,
     inputs: BlockGraphInputs<'_>,
 ) -> Result<(NativeGraphMetadata, Vec<GraphConstant>, HostHeap), GraphError> {
-    let entries = CheckedBlockEntries::new(inputs.state, graph.backend(), slot, inputs.bank_splits_decode_hits())?;
+    let entries = CheckedBlockEntries::new(inputs.state, graph.backend(), slot, inputs.served.decode_hits)?;
     let (mut banks, mut parks) = (Vec::new(), Vec::new());
     let bank = layer_bank(inputs.stage, entries.bank.as_ref().map(CheckedBankEntries::entries::<NativeGraphMetadata>), &mut banks, &mut parks);
     let (shape, numbers) = inputs.constant_split(slot, &bank, tap, |_| Ok(()))?;
@@ -1525,7 +1516,7 @@ pub(super) fn checked_block_graph_audit_ports(
     tap: Option<(u64, TapPositions)>,
     inputs: BlockGraphInputs<'_>,
 ) -> Result<NativeGraphMetadata, String> {
-    let entries = CheckedBlockEntries::new(inputs.state, backend, slot, inputs.bank_splits_decode_hits()).map_err(|e| e.to_string())?;
+    let entries = CheckedBlockEntries::new(inputs.state, backend, slot, inputs.served.decode_hits).map_err(|e| e.to_string())?;
     let mut graph = PortAuditDraft::new(backend);
     let (mut weights, mut constants, mut banks, mut parks) = (Vec::new(), Vec::new(), Vec::new(), Vec::new());
     let bank = layer_bank(
@@ -1692,22 +1683,28 @@ pub(super) fn checked_block_graph_audit_ports(
     Ok(graph.inner)
 }
 
+/// The storage and constants of block `block_index`'s whole graph of
+/// `class` in `plan`'s family under `limits`, served as the family serves it
+/// (`FamilyOutline::served`).
 #[cfg(test)]
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn checked_block_graph_resources(
     backend: BackendName,
     load: &ModelLoadPlan,
     geometry: &Decoder,
     state: &StateResourcePlan,
-    slot: TargetBlockProgramSlot,
+    plan: &crate::TargetProgramPlan,
+    limits: crate::ResourceLimits,
     block_index: usize,
     class: BlockClass,
 ) -> Result<(NativeGraphStorageBytes, Vec<GraphConstant>), GraphError> {
     let staged = (class, Stage::Run(RunStage::Whole));
+    let served = super::classes::FamilyOutline::of(backend, load, geometry, state, plan, limits)?.served(block_index);
     let (graph, constants, _) = checked_block_graph_draft(
         NativeGraphMetadata::new(backend),
-        slot,
+        plan.blocks()[block_index],
         None,
-        BlockGraphInputs::of_class(load, geometry, state, block_index, staged, class.0, BlockCarries::default()),
+        BlockGraphInputs::of_class(load, geometry, state, block_index, staged, class.0, BlockCarries::default(), served),
     )?;
     Ok((GraphDraft::seal(graph)?, constants))
 }

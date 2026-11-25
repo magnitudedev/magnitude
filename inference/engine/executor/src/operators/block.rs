@@ -1464,7 +1464,14 @@ impl<W: PlannedWeights + ?Sized> SublayerGraph<'_, W> {
                 Some(FeedForwardNumbers::Parallel(numbers)),
                 FeedForwardEntries::Parallel(entries),
             ) => {
-                let carry = carry.as_ref().ok_or("a parallel feed-forward reads no residual carry")?;
+                // On `DecodeHits` of a routed branch without a shared expert,
+                // no residual carry is read (`parallel`).
+                let residual = match &carry {
+                    Some(carry) => Some(&carry.rows),
+                    None if matches!(split, Some(Split::DecodeHits(_))) => None,
+                    None => return Err("a parallel feed-forward reads no residual carry".into()),
+                };
+                let pre = carry.as_ref().and_then(|carry| carry.pre.clone());
                 let (output, sequence) = parallel(
                     graph,
                     entries,
@@ -1475,12 +1482,12 @@ impl<W: PlannedWeights + ?Sized> SublayerGraph<'_, W> {
                     self.index(1),
                     weights,
                     constants,
-                    &carry.rows,
+                    residual,
                     rows,
                     epsilon,
                     split,
                 )?;
-                return Ok((carried(output, carry.pre.clone()), sequence));
+                return Ok((carried(output, pre), sequence));
             }
             _ => return Err("target block feed-forward and its kernel entries disagree".into()),
         };

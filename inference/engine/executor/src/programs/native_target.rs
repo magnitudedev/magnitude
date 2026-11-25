@@ -2464,10 +2464,17 @@ impl NativeTargetProgram {
         let stages = self.graphs.prepared.stages(index, rows);
         // M7 on-demand async DMA decode landing with deterministic same-layer
         // overlap (`DecodeFront -> DecodeHits ∥ (Host + DMA) -> DecodeBack`) on
-        // partial discrete-GPU CUDA layers.
-        if crate::operators::routed::fused_graph::decodes(rows)
-            && run.bank.as_ref().is_some_and(|bank| bank.block_dma_decode(index, rows))
-        {
+        // partial discrete-GPU CUDA layers: only where the block was sealed
+        // split (`ServedForm::decode_split`), and there only while this
+        // step's chain and the layer's gate split it (`BankRun::block_dma_decode`).
+        let sealed_split = self.graphs.prepared.splits_decode(index, rows);
+        let dma_decode = crate::operators::routed::fused_graph::decodes(rows)
+            && run.bank.as_ref().is_some_and(|bank| bank.block_dma_decode(index, rows));
+        assert!(
+            sealed_split || !dma_decode,
+            "invariant violated: block {index}'s decode of {rows} rows lands on demand where it was sealed whole"
+        );
+        if dma_decode {
             let split_hits = self.graphs.prepared.splits_decode_hits(index, rows);
             let source_lease = run
                 .bank

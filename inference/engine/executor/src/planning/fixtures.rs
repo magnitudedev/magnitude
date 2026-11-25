@@ -1156,10 +1156,7 @@ pub fn expert_stacks(definition: &ModelDefinition) -> Vec<[String; 3]> {
     definition
         .decoder
         .sublayers()
-        .filter_map(|(_, sublayer)| match &sublayer.op {
-            Operator::RoutedFfn(routed) => Some(routed),
-            _ => None,
-        })
+        .filter_map(|(_, sublayer)| crate::operators::routed::routed_ffn(&sublayer.op))
         .map(|routed| {
             let FeedForwardUp::Gated { gate, up, .. } = &routed.expert_up else {
                 unreachable!("the fixture's experts are gated");
@@ -1299,6 +1296,51 @@ pub fn routed_fixture_definition(shape: RoutedShape) -> ModelDefinition {
         }
     };
     decoder.blocks = (0..layers).map(block).collect();
+    definition
+}
+
+/// A model of `shape` whose feed-forwards are Gemma 4's: a gated dense
+/// branch beside the routed one (`Operator::Parallel`), each normalized on
+/// entry and exit, summed through the sublayer's post-norm; its experts'
+/// weights are scoped to the routed branch (`WeightScope::TargetBranch`).
+#[cfg(test)]
+pub fn parallel_routed_fixture_definition(shape: RoutedShape) -> ModelDefinition {
+    use magnitude_family_contracts::{Branch, BranchOutput};
+    let mut definition = routed_fixture_definition(shape);
+    let hidden = definition.decoder.hidden;
+    let rms = |name: String, width| RmsNorm { weight: descriptor(&name, &[width]), epsilon: 1e-6 };
+    for (block, sublayers) in definition.decoder.blocks.iter_mut().map(|block| &mut block.sublayers).enumerate() {
+        let name = |part: &str| format!("blk.{block}.{part}");
+        let Operator::RoutedFfn(routed) = sublayers[1].op.clone() else {
+            unreachable!("the routed fixture's feed-forwards are routed")
+        };
+        let dense = DenseFfn {
+            intermediate: shape.intermediate,
+            up: FeedForwardUp::Gated {
+                activation: ActivationFunction::GeluTanh,
+                limit: None,
+                gate: descriptor(&name("ffn_gate"), &[shape.intermediate, hidden]),
+                up: descriptor(&name("ffn_up"), &[shape.intermediate, hidden]),
+            },
+            down: descriptor(&name("ffn_down"), &[hidden, shape.intermediate]),
+        };
+        sublayers[1] = Sublayer {
+            input: InputNorm::None,
+            op: Operator::Parallel(vec![
+                Branch {
+                    input: InputNorm::Rms(rms(name("ffn_norm"), hidden)),
+                    op: Operator::DenseFfn(Box::new(dense)),
+                    output: BranchOutput::Norm(rms(name("post_ffw_norm_1"), hidden)),
+                },
+                Branch {
+                    input: InputNorm::Rms(rms(name("pre_ffw_norm_2"), hidden)),
+                    op: Operator::RoutedFfn(routed),
+                    output: BranchOutput::Norm(rms(name("post_ffw_norm_2"), hidden)),
+                },
+            ]),
+            output: OutputForm::PostNorm(rms(name("post_ffw_norm"), hidden)),
+        };
+    }
     definition
 }
 

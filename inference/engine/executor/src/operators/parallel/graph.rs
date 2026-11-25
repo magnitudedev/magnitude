@@ -140,7 +140,9 @@ impl CheckedParallelEntries {
 /// The parallel sublayer `sublayer` over `residual` (`[rows, D]` F32): the
 /// new residual, and the sequence input a run of a streamed routed branch
 /// writes (its `bank`, `general_routed`). A split sublayer's front is its
-/// routed branch's, and its back the rest.
+/// routed branch's, and its back the rest. Only a decode split's hits
+/// (`Split::DecodeHits`) of a routed branch without a shared expert read
+/// no residual (`general_routed`); every other graph reads it.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn parallel<'a, G: GraphDraft + 'a>(
     graph: &mut G,
@@ -152,7 +154,7 @@ pub(crate) fn parallel<'a, G: GraphDraft + 'a>(
     sublayer: SublayerIndex,
     weights: &mut Vec<(WeightPort, NativePort)>,
     constants: &mut Vec<GraphConstant>,
-    residual: &WorkflowTensor,
+    residual: Option<&WorkflowTensor>,
     rows: &Dim,
     epsilon: Argument<f32>,
     split: Option<Split<'_>>,
@@ -169,7 +171,7 @@ pub(crate) fn parallel<'a, G: GraphDraft + 'a>(
         routed_scope,
         weights,
         constants,
-        Some(residual),
+        residual,
         RoutedSum::Branch,
         rows,
         epsilon,
@@ -178,6 +180,7 @@ pub(crate) fn parallel<'a, G: GraphDraft + 'a>(
     if front {
         return Ok((routed, sequence));
     }
+    let residual = residual.ok_or("a parallel sublayer's dense branch reads no residual")?;
     let (expansion, dense_numbers) = (topology.dense, &numbers.dense);
     let dimensions = dense_numbers.dimensions(rows);
     let (hidden, features) = (&dense_numbers.hidden, &dense_numbers.features);

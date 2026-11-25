@@ -69,7 +69,7 @@ impl BankRun {
     /// Whether block `index`'s streamed layer runs its resident decode form
     /// (`RunStage::Resident`) in this chain.
     pub(crate) fn block_decode_resident(&self, index: usize) -> bool {
-        let Ok(layer) = block_layer(self.bank.plan(), index) else {
+        let Some(layer) = self.bank.plan().block_layer(index) else {
             return false;
         };
         self.serving.decode_resident(layer, self.bank.plan().sets_step(layer))
@@ -79,7 +79,7 @@ impl BankRun {
     /// in this chain, so a prompt group skips `routed_scratch_request` and
     /// `run_fill` on it.
     pub(crate) fn block_whole(&self, index: usize) -> bool {
-        let Ok(layer) = block_layer(self.bank.plan(), index) else {
+        let Some(layer) = self.bank.plan().block_layer(index) else {
             return false;
         };
         self.serving.layer_whole(layer)
@@ -88,7 +88,7 @@ impl BankRun {
     /// Whether M7 on-demand async DMA decode landing (`DecodeFront -> DMA -> DecodeBack`)
     /// is active for block `index` over `rows` rows (partial layer on CUDA `Placer::Tier`).
     pub(crate) fn block_dma_decode(&self, index: usize, rows: u64) -> bool {
-        let Ok(layer) = block_layer(self.bank.plan(), index) else {
+        let Some(layer) = self.bank.plan().block_layer(index) else {
             return false;
         };
         !self.serving.layer_whole(layer) && self.bank.dma_decode_active(layer, rows)
@@ -135,7 +135,7 @@ impl BankRun {
         source_lease: crate::experts::transport::DecodeSourceLease,
         hits_submitted: bool,
     ) -> Result<crate::experts::transport::DecodeLanding, String> {
-        let layer = block_layer(self.bank.plan(), index)?;
+        let layer = self.bank.plan().block_layer(index).ok_or_else(|| format!("target block {index} has no streamed routed layer"))?;
         self.bank.land_decode_misses(
             layer,
             self.sequence,
@@ -154,7 +154,7 @@ impl BankRun {
         if !self.bank.tier_copy_dma() {
             return Ok(None);
         }
-        block_layer(self.bank.plan(), index).map(Some)
+        self.bank.plan().block_layer(index).ok_or_else(|| format!("target block {index} has no streamed routed layer")).map(Some)
     }
 
     pub(crate) fn record_dma_host_wait(&self, elapsed: std::time::Duration) {
@@ -209,7 +209,7 @@ impl BankRun {
     pub(crate) fn block_sampled<P>(&self, graph: &PreparedTargetBlockGraph<P>, index: usize, spans: seismic::NativeSpans) -> Result<(), String> {
         // Only a graph whose ends are marked is sampled (`Self::samples`).
         let marks = graph.span.expect("a sampled run's graph is marked at its ends");
-        self.bank.block_sampled(self.sequence, block_layer(self.bank.plan(), index)?, spans, marks);
+        self.bank.block_sampled(self.sequence, self.bank.plan().block_layer(index).ok_or_else(|| format!("target block {index} has no streamed routed layer"))?, spans, marks);
         Ok(())
     }
 
@@ -217,7 +217,7 @@ impl BankRun {
     /// directly by a sibling fill on its queue
     /// (`ExpertBank::fill_followed`), at block `index`'s streamed layer.
     pub(crate) fn fill_followed(&self, index: usize, window: u64, followed: bool) -> Result<(), String> {
-        self.bank.fill_followed(self.sequence, block_layer(self.bank.plan(), index)?, window, followed);
+        self.bank.fill_followed(self.sequence, self.bank.plan().block_layer(index).ok_or_else(|| format!("target block {index} has no streamed routed layer"))?, window, followed);
         Ok(())
     }
 
@@ -272,16 +272,6 @@ impl BankRun {
         }
         Ok(())
     }
-}
-
-/// The bank's index of block `index`'s streamed layer: its feed-forward,
-/// the sublayer's own or a parallel sublayer's routed branch
-/// (`ExpertBankPlan::feed_forward`).
-pub(crate) fn block_layer(bank: &crate::ExpertBankPlan, index: usize) -> Result<usize, String> {
-    let [_, feed_forward] = super::prepared::block_scopes(index)?;
-    bank.feed_forward(feed_forward)
-        .map(|(layer, _)| layer)
-        .ok_or_else(|| format!("{feed_forward:?} has no streamed routed layer"))
 }
 
 /// The words of `bank` a run of block `index` at chain place `place` binds

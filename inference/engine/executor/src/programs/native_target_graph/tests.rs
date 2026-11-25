@@ -4,8 +4,8 @@ use super::{
     bound::{TokenRow, TokenRows},
     certify::certify_target_family,
     classes::{
-        BlockOutputScales, FamilyOutline, LaunchControl, LaunchControlLayout, Passes, StagedClass,
-        UnreadScales, block_classes, block_listings, block_routed, block_served, block_stages,
+        BlockOutputScales, FamilyOutline, LaunchControl, LaunchControlLayout, Passes, ServedForm, StagedClass,
+        UnreadScales, block_classes, block_listings, block_routed, block_sealed_stages, block_served, block_stages,
         block_upload_regions, class_topology, enumerate_block_graphs, once_class, once_graphs,
         slot_scores,
     },
@@ -27,6 +27,20 @@ use magnitude_state::LayerRef;
 use seismic::{
     BackendName, HostHeap, NativeGraphLayout, NativeGraphMetadata, NativeGraphStorageBytes,
 };
+
+/// Each block's form, as the family of `plan` on `backend` under `limits`
+/// serves it (`FamilyOutline::served`).
+fn served_forms(
+    backend: BackendName,
+    load: &ModelLoadPlan,
+    geometry: &magnitude_family_contracts::Decoder,
+    state: &crate::StateResourcePlan,
+    plan: &crate::TargetProgramPlan,
+    limits: ResourceLimits,
+) -> Vec<ServedForm> {
+    let outline = FamilyOutline::of(backend, load, geometry, state, plan, limits).unwrap();
+    (0..geometry.blocks.len()).map(|index| outline.served(index)).collect()
+}
 
 /// No block carries an operand into the next: one empty carry per block.
 fn no_carries(geometry: &magnitude_family_contracts::Decoder) -> Vec<BlockCarries<crate::MixerProgramSlot>> {
@@ -247,7 +261,6 @@ mod stateless_tail_tests {
 #[cfg(test)]
 mod shared_graph_tests {
     use super::*;
-    use super::super::bound::block_layer;
     use magnitude_family_contracts::WeightScope;
 
     /// Streamed layers at different homes of one group share a sealed
@@ -283,9 +296,10 @@ mod shared_graph_tests {
         .unwrap();
         let plan = load.program_plan(&definition, codec).unwrap();
         let (_, tapped) = block_taps(plan.target(), &definition.decoder).unwrap();
-        let shapes = block_graph_shapes(&load, &definition.decoder, &state, &tapped, &no_carries(&definition.decoder), None).unwrap();
+        let served = served_forms(BackendName::Metal, &load, &definition.decoder, &state, plan.target(), limits);
+        let shapes = block_graph_shapes(&load, &definition.decoder, &state, &tapped, &no_carries(&definition.decoder), None, &served).unwrap();
         let bank = load.expert_bank().unwrap();
-        let home = |index: usize| block_layer(bank, index).ok().map(|layer| bank.home(layer));
+        let home = |index: usize| bank.block_layer(index).map(|layer| bank.home(layer));
         assert_eq!(shapes[1], shapes[2], "the first two attention blocks share a graph");
         assert_ne!(home(1), home(2), "at different homes of one group");
         assert!(home(1).is_some());
@@ -330,7 +344,8 @@ mod shared_graph_tests {
             .unwrap();
             let plan = load.program_plan(&definition, codec).unwrap();
             let (_, tapped) = block_taps(plan.target(), &definition.decoder).unwrap();
-            let shapes = block_graph_shapes(&load, &definition.decoder, &state, &tapped, &no_carries(&definition.decoder), None).unwrap();
+            let served = served_forms(BackendName::Cpu, &load, &definition.decoder, &state, plan.target(), limits);
+            let shapes = block_graph_shapes(&load, &definition.decoder, &state, &tapped, &no_carries(&definition.decoder), None, &served).unwrap();
             assert_eq!(shapes[0] == shapes[1], shared, "second pool gated {second_gated}: the blocks share a plan");
         }
     }
@@ -366,7 +381,7 @@ mod shared_graph_tests {
     fn a_blocks_streamed_layer_is_its_feed_forwards_own_or_branch() {
         let (_, load) = streamed_fixture_load();
         let bank = load.expert_bank().unwrap();
-        let own = (0..bank.layers().len()).map(|layer| (block_layer(bank, layer_block(bank, layer)).unwrap(), layer)).collect::<Vec<_>>();
+        let own = (0..bank.layers().len()).map(|layer| (bank.block_layer(layer_block(bank, layer)).unwrap(), layer)).collect::<Vec<_>>();
         let layers = bank
             .layers()
             .iter()
@@ -384,7 +399,7 @@ mod shared_graph_tests {
             assert_eq!(found, layer);
             let block = layer_block(&branched, layer);
             assert!(branched.layer(block_scopes(block).unwrap()[1]).is_none(), "the sublayer names no branch layer");
-            assert_eq!(block_layer(&branched, block), Ok(layer), "block {block}");
+            assert_eq!(branched.block_layer(block), Some(layer), "block {block}");
         }
     }
 
@@ -570,7 +585,8 @@ mod resource_template_tests {
         let geometry = &definition.decoder;
         let plan = load.program_plan(&definition, codec).unwrap();
         let (_, tapped) = block_taps(plan.target(), geometry).unwrap();
-        let shapes = block_graph_shapes(&load, geometry, &state, &tapped, &no_carries(geometry), None).unwrap();
+        let served = served_forms(backend, &load, geometry, &state, plan.target(), limits);
+        let shapes = block_graph_shapes(&load, geometry, &state, &tapped, &no_carries(geometry), None, &served).unwrap();
         assert_ne!(shapes[0], shapes[1], "stream widening cannot be shared");
         assert_eq!(shapes[1], shapes[2], "interior graphs still share");
         assert_ne!(shapes[2], shapes[3], "the exit mix cannot be omitted");
@@ -582,7 +598,7 @@ mod resource_template_tests {
         };
         let enumeration = enumerate_block_graphs(
             &outline,
-            &block_served(BackendName::Cpu, &load, geometry, limits, 64, passes).unwrap(),
+            &block_served(&outline, geometry, passes).unwrap(),
             passes,
             &state,
             plan.target(),
@@ -730,6 +746,7 @@ mod resource_template_tests {
                     (class, Stage::Run(RunStage::Whole)),
                     class.0,
                     BlockCarries::default(),
+                    certificate.outline.served(index),
                 ),
             )
             .unwrap();
@@ -749,7 +766,8 @@ mod resource_template_tests {
                 &load,
                 &definition.decoder,
                 &state,
-                plan.target().blocks()[index],
+                plan.target(),
+                limits,
                 index,
                 (512, 1, 1, listed, 0),
             )
@@ -893,7 +911,7 @@ mod resource_template_tests {
                 .iter()
                 .enumerate()
                 .filter(|(_, block)| block.split.is_some())
-                .map(|(index, block)| (index, block.streams))
+                .map(|(index, block)| (index, block.form.streams))
                 .collect::<Vec<_>>();
             assert!(!split.is_empty());
             let further = |launches: usize, merged: usize| {
@@ -1026,8 +1044,7 @@ mod resource_template_tests {
                 // Each block drafts with the operand carries its certificate
                 // holds (`block_carries`), which its shape holds.
                 let carries = &certificate.outline.carries;
-                let (_, tapped) = block_taps(plan.target(), geometry).unwrap();
-                let shapes = block_graph_shapes(&load, geometry, &state, &tapped, carries, None).unwrap();
+                let shapes = &certificate.outline.shapes;
                 let sealed = std::cell::Cell::new((0usize, HostHeap::default()));
                 let seen_layouts = std::cell::RefCell::new(std::collections::HashSet::<u64>::new());
                 let seals = |graph: &NativeGraphMetadata, layout: &NativeGraphLayout| {
@@ -1073,7 +1090,7 @@ mod resource_template_tests {
                 let passes = certificate.passes;
                 let pass_rows = passes.rows();
                 assert!(pass_rows <= chain_rows && passes.region == 64, "{passes:?}");
-                let served = block_served(BackendName::Cpu, &load, geometry, limits, chain_rows, passes).unwrap();
+                let served = &certificate.served[..];
                 // Resident experts split only to merge a chain's launches.
                 for (index, block) in served.iter().enumerate() {
                     let routed = block_routed(geometry, index).unwrap().is_some();
@@ -1104,6 +1121,7 @@ mod resource_template_tests {
                             staged,
                             if stage == Stage::Once(OnceStage::Pass) { rows } else { pass_rows },
                             carries[index],
+                            certificate.outline.served(index),
                         ),
                     )
                     .unwrap();
@@ -1184,7 +1202,7 @@ mod resource_template_tests {
                     }
                 }
                 for (index, block) in served.iter().enumerate() {
-                    for (stage, rows) in once_graphs(block.streams, block.split.is_some(), passes) {
+                    for (stage, rows) in once_graphs(block.form.streams, block.form.split, passes) {
                         check(index, once_class(rows, stage));
                     }
                 }
@@ -1343,6 +1361,7 @@ mod sinkhorn_graph_tests {
             let capacity = ResourceCapacity { domain_bytes: 1 << 30, tensor_operations: crate::TensorOperations::Absent, allocations: seismic::NativeAllocations::EXACT };
             let state = ResourcePlanner::state_plan(&definition, &load, PlannedMethod::Plain, codec, limits, capacity).unwrap();
             let plan = load.program_plan(&definition, codec).unwrap();
+            let served = served_forms(backend, &load, &definition.decoder, &state, plan.target(), limits);
             let classes = [(1, RunStage::Whole), (512, RunStage::Whole), (512, RunStage::Front), (512, RunStage::Combine)];
             for (index, (rows, stage)) in (0..2).flat_map(|index| classes.map(|class| (index, class))) {
                 let inputs = BlockGraphInputs::of_class(
@@ -1353,6 +1372,7 @@ mod sinkhorn_graph_tests {
                     ((rows, 1, 1, 0, 0), Stage::Run(stage)),
                     rows,
                     BlockCarries::default(),
+                    served[index],
                 );
                 let checked = checked_block_graph_draft(NativeGraphMetadata::new(backend), plan.target().blocks()[index], None, inputs);
                 let label = format!("{backend:?} block {index} {rows} rows {stage:?}");
@@ -1379,6 +1399,7 @@ mod sinkhorn_graph_tests {
             let capacity = ResourceCapacity { domain_bytes: 1 << 30, tensor_operations: crate::TensorOperations::Absent, allocations: seismic::NativeAllocations::EXACT };
             let state = ResourcePlanner::state_plan(&definition, &load, PlannedMethod::Plain, codec, limits, capacity).unwrap();
             let plan = load.program_plan(&definition, codec).unwrap();
+            let served = served_forms(backend, &load, &definition.decoder, &state, plan.target(), limits);
             for (index, rows) in (0..2).flat_map(|index| [1, 5, 64, 512].map(|rows| (index, rows))) {
                 let inputs = BlockGraphInputs::of_class(
                     &load,
@@ -1388,6 +1409,7 @@ mod sinkhorn_graph_tests {
                     ((rows, 1, 1, 0, 0), Stage::Run(RunStage::Whole)),
                     rows,
                     BlockCarries::default(),
+                    served[index],
                 );
                 let checked = checked_block_graph_draft(NativeGraphMetadata::new(backend), plan.target().blocks()[index], None, inputs);
                 drop(checked.unwrap_or_else(|error| panic!("{backend:?} block {index} {rows} rows: {error}")));
@@ -1636,6 +1658,7 @@ mod sinkhorn_graph_tests {
                     ((1, 1, 1, 0, 0), Stage::Run(stage)),
                     1,
                     BlockCarries::default(),
+                    certified.outline.served(0),
                 );
                 let draft = super::super::block::checked_block_graph_audit_ports(
                     backend,
@@ -1694,6 +1717,90 @@ mod sinkhorn_graph_tests {
                         expected_joins,
                         "{label}: {stage:?} stream_join count mismatch"
                     );
+                }
+            }
+        }
+    }
+
+    /// Gemma 4's blocks, whose streamed layers are a parallel sublayer's
+    /// routed branch (`WeightScope::TargetBranch`), in a partial bank a
+    /// discrete CUDA device's tier places: each block's decode splits
+    /// (`RunStage::DecodeFront`), and certification seals each block in
+    /// exactly the stages its form reports (`block_sealed_stages`) at every
+    /// row class, each with its class axes (`StageAxes::of`), which a lookup
+    /// of a stage it did not seal panics on.
+    #[test]
+    fn a_branch_scoped_banks_blocks_seal_the_stages_they_are_served_in() {
+        use crate::planning::{HostTier, fixtures};
+        use crate::programs::graph::RowForm;
+        use magnitude_family_contracts::WeightScope;
+        let definition = fixtures::parallel_routed_fixture_definition(fixtures::RoutedShape {
+            layers: 3,
+            experts: 64,
+            selected: 4,
+            hidden: 512,
+            intermediate: 512,
+        });
+        let manifest = fixtures::gemma_moe_fixture_manifest(&definition);
+        let codec = KvCodec::Dense;
+        let limits = fixtures::LIMITS;
+        let backend = BackendName::Cuda;
+        let selection = ComponentSelection { head: false, vision: false };
+        let layout = resident_layout(ExecutionPath::Native, backend);
+        let resident = ModelLoadPlan::derive(&manifest, &definition, selection, layout, PlannedMethod::Plain, limits).unwrap();
+        let substrate = crate::planning::bank_substrate(
+            backend,
+            seismic::NativeAllocations::EXACT,
+            Some(HostTier::Linked),
+            backend.fills_beside_compute(),
+            &definition,
+        )
+        .unwrap();
+        let load = resident.with_expert_bank_at_floor(&definition, substrate).unwrap();
+        let bank = load.expert_bank().unwrap();
+        assert!(!bank.whole(), "the fixture's bank is partial, so its decode splits");
+        assert!(
+            bank.layers().iter().all(|layer| matches!(layer.scope, WeightScope::TargetBranch { .. })),
+            "the fixture's streamed layers are routed branches"
+        );
+        let geometry = &definition.decoder;
+        let capacity = ResourceCapacity {
+            domain_bytes: 1 << 30,
+            tensor_operations: crate::TensorOperations::Absent,
+            allocations: seismic::NativeAllocations::EXACT,
+        };
+        let state = ResourcePlanner::state_plan(&definition, &load, PlannedMethod::Plain, codec, limits, capacity).unwrap();
+        let plan = load.program_plan(&definition, codec).unwrap();
+        let certified = certify_target_family::<NativeGraphLayout>(
+            backend,
+            &load,
+            geometry,
+            &state,
+            plan.target(),
+            limits,
+            crate::PassLaunches::whole_chain(limits),
+        )
+        .unwrap();
+        for index in 0..geometry.blocks.len() {
+            let form = certified.outline.served(index);
+            assert!(form.streams && form.decode_split, "block {index}: {form:?}");
+            for &rows in &certified.outline.row_classes {
+                let row_form = RowForm::of(rows);
+                let sealed = certified.blocks[index]
+                    .keys()
+                    .filter_map(|&(of, _, _, stage, _)| match stage {
+                        Stage::Run(run) if of == row_form => Some(run),
+                        _ => None,
+                    })
+                    .collect::<std::collections::BTreeSet<_>>();
+                let served = block_sealed_stages(&certified.served, index, rows);
+                assert_eq!(
+                    sealed,
+                    served.iter().copied().collect(),
+                    "block {index}, {rows} rows: sealed stages against served"
+                );
+                for &stage in served {
+                    let _ = certified.stage_axes.of(index, row_form, stage);
                 }
             }
         }
@@ -1800,6 +1907,7 @@ mod sinkhorn_graph_tests {
                 ((1, 1, 1, 0, 0), Stage::Run(RunStage::DecodeHits)),
                 1,
                 BlockCarries::default(),
+                certified.outline.served(0),
             );
             match super::super::block::checked_block_graph_audit_ports(
                 non_cuda,

@@ -10,21 +10,19 @@
 
 use super::launches::{Launches, Words};
 use super::AssessmentError;
-use crate::operators::parallel::DenseBesideRouted;
-use crate::operators::routed::streamed;
 use crate::operators::streams::{BlockStreams, SinkhornBinding};
 use crate::programs::graph::sizing::{
     DraftFamilySizingCensus, ReadoutSizingCensus, SizedCall, TargetFamilySizingCensus,
 };
 use crate::{
-    AssessmentGraphResourceBounds, CandidatesBinding, FeedForwardProgramSlot, MixerProgramSlot,
+    AssessmentGraphResourceBounds, CandidatesBinding, MixerProgramSlot,
     ModelLoadPlan, PlannedMethod, ResourceCapacity, ResourceLimits, ResourcePlanner,
     TargetBlockProgramSlot,
 };
 use magnitude_cost_model::{
     Census, DraftCensus, DraftMethod, DraftWidthCensus, Kind, LaunchCounts, LayerCall, RoutedCall,
 };
-use magnitude_family_contracts::{ModelDefinition, SublayerIndex, WeightScope};
+use magnitude_family_contracts::ModelDefinition;
 use magnitude_kernels as kernels;
 use magnitude_state::{HistoryDomainLayout, KvCodec, LayerRef, ModelStateLayout};
 use seismic::measure::pricing::{Bytes, Experts, Flops, Format, HistoryRead, Layout, Work};
@@ -774,17 +772,9 @@ impl DecodeDemand {
             let streamed_layer = if resident {
                 None
             } else {
-                let block = u32::try_from(index)
-                    .map_err(|_| demand_error("block index exceeds u32"))?;
-                let ffn_sublayer = SublayerIndex { block, sublayer: 1 };
-                let routed_scope = match slot.feed_forward() {
-                    Some(FeedForwardProgramSlot::Parallel(_)) => {
-                        DenseBesideRouted::scopes(ffn_sublayer)[1]
-                    }
-                    _ => WeightScope::TargetSublayer(ffn_sublayer),
-                };
-                streamed::served(load, routed_scope)
-                    .map(|(bank, layer)| (layer, bank.routed_kinds()[layer]))
+                load.expert_bank().and_then(|bank| {
+                    bank.block_layer(index).map(|layer| (layer, bank.routed_kinds()[layer]))
+                })
             };
             let ctx = BlockContext {
                 index,

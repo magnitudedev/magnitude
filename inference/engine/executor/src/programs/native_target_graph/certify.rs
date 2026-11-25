@@ -2,10 +2,10 @@ use super::{
     GroupRows,
     block::{BlockGraphInputs, certify_block_group, probe_block_axes},
     classes::{
-        BlockListings, BlockServed, ClassAxes, FamilyOutline, Holder, Passes, PickedRead,
+        BlockListings, BlockServed, ClassAxes, FamilyOutline, Holder, Passes, PickedRead, ServedForm,
         StageAxes, Topology,
-        bank_layer_by_block, block_listings,
-        block_listings_and_controls, block_routed, block_sealed_stages, block_served,
+        block_listings,
+        block_listings_and_controls, block_sealed_stages, block_served,
         block_stages, block_upload_regions, chained_once_runs, class_topology, decode_launch,
         has_untapped_graph, once_class, once_graphs, run_task_classes, segment_classes,
         slot_classes, slot_scores,
@@ -535,31 +535,14 @@ impl EntryScope {
     }
 }
 
-#[derive(Clone, PartialEq)]
-struct LaunchKey {
-    split: bool,
-    resident: bool,
-    shape: BlockGraphShape,
-}
-
-impl LaunchKey {
-    fn fx_hash(&self) -> u64 {
-        use std::hash::Hash;
-        let mut h = FxHasher::default();
-        self.split.hash(&mut h);
-        self.resident.hash(&mut h);
-        self.shape.fx_hash().hash(&mut h);
-        h.finish()
-    }
-}
-
+/// A shape's group graphs at a group's passes; its block's own, or of a
+/// tapped block's untapped shape (`untapped`). The shape holds how its
+/// blocks are served (`BlockGraphShape::served`), which decides the stages
+/// its launches' and groups' graphs are sealed in.
 #[derive(Clone, PartialEq)]
 struct GroupKey {
     passes: Passes,
     untapped: bool,
-    split: bool,
-    resident: bool,
-    streams: bool,
     shape: BlockGraphShape,
 }
 
@@ -570,9 +553,6 @@ impl GroupKey {
         self.passes.region.hash(&mut h);
         self.passes.launches.hash(&mut h);
         self.untapped.hash(&mut h);
-        self.split.hash(&mut h);
-        self.resident.hash(&mut h);
-        self.streams.hash(&mut h);
         self.shape.fx_hash().hash(&mut h);
         h.finish()
     }
@@ -611,7 +591,9 @@ struct FamilyLayouts<L> {
     entries: BTreeMap<EntryTokens, L>,
     per_layer: Option<L>,
     empty_layouts: Arc<ShapeLayouts<L>>,
-    launches: Vec<(LaunchKey, Arc<ShapeLayouts<L>>)>,
+    /// A shape's launch graphs, keyed by the shape, which holds the stages
+    /// they are sealed in (`BlockGraphShape::served`).
+    launches: Vec<(BlockGraphShape, Arc<ShapeLayouts<L>>)>,
     launch_index: FxHashMap<u64, Vec<usize>>,
     /// A shape's group graphs at a group's passes: a block's own, its
     /// combines and its passes and fills; or, of a tapped block's untapped
@@ -682,14 +664,11 @@ struct RunTask {
 struct MissingGroup {
     index: usize,
     of_untapped: bool,
-    split: bool,
-    resident: bool,
-    streams: bool,
     key_hash: u64,
     key: GroupKey,
 }
 
-type BlockMetaMap = FxHashMap<(usize, bool), (BlockGraphShape, bool, bool, bool)>;
+type BlockMetaMap = FxHashMap<(usize, bool), BlockGraphShape>;
 
 struct ResolvedFamilyIds {
     distinct_blocks: Vec<usize>,
@@ -719,6 +698,7 @@ fn certify_once_block<L: Certified>(
         staged,
         rows,
         ctx.outline.carries[index],
+        ctx.outline.served(index),
     );
     let (layout, per_row, owned) = certify_block_group::<L>(
         ctx.outline.backend,
@@ -769,6 +749,7 @@ fn certify_run_task<L: Certified>(
             drafted,
             pass_rows,
             ctx.outline.carries[index],
+            ctx.outline.served(index),
         )
     };
     let axes = probe_block_axes(
@@ -809,41 +790,21 @@ fn certify_run_task<L: Certified>(
     ))
 }
 
+/// The run graphs of `entries`' shapes (each a block and whether of its
+/// untapped shape) to certify, in each stage its form seals
+/// (`ServedForm::sealed_stages`): the group's (`RunStage::Combine`) where
+/// `group`, else the launches'.
 fn collect_run_tasks(
     ctx: &CertifyContext<'_>,
-    entries: &[(usize, bool, bool, bool)],
+    entries: &[(usize, bool)],
     group: bool,
 ) -> Result<(Vec<BlockListings>, Vec<RunTask>), GraphError> {
     let has_prefill = !crate::operators::attention::graph::decodes(ctx.outline.largest_rows);
     let mut prefill_listings: Vec<BlockListings> = Vec::with_capacity(entries.len());
     let mut tasks: Vec<RunTask> = Vec::new();
-    let bank_decode_dma = crate::experts::decode_dma_enabled(ctx.outline.backend)
-        && ctx
-            .load
-            .expert_bank()
-            .is_some_and(|bank| bank.placer() == crate::planning::Placer::Tier && !bank.whole());
-    for (slot_idx, &(index, of_untapped, split, resident)) in entries.iter().enumerate() {
+    for (slot_idx, &(index, of_untapped)) in entries.iter().enumerate() {
         let slot = ctx.plan.blocks()[index];
-        let routed = block_routed(ctx.geometry, index)?;
-        let bank_layer = ctx.load.expert_bank().and_then(|bank| {
-            bank.layers().iter().position(|layer| {
-                matches!(
-                    layer.scope,
-                    magnitude_family_contracts::WeightScope::TargetSublayer(s) if s.block == index as u32
-                )
-            })
-        });
-        let decode_split = bank_decode_dma && bank_layer.is_some() && routed.is_some();
-        let bank_decode_hits = bank_layer.is_some_and(|layer| {
-            ctx.load
-                .expert_bank()
-                .is_some_and(|bank| bank.sited(layer) && bank.splits_decode_hits(layer))
-        });
-        let decode_hits = decode_split
-            && bank_decode_hits
-            && routed.is_some_and(|routed| {
-                crate::operators::routed::streamed::decode_hits_supported(routed, ctx.outline.backend)
-            });
+        let served = ctx.outline.served(index);
         let listings = if has_prefill {
             block_listings(ctx.state, ctx.outline.backend, slot, index, ctx.outline.largest_rows)?
         } else {
@@ -854,7 +815,7 @@ fn collect_run_tasks(
         for (regime_idx, regime_rows) in ctx.regimes.iter().enumerate() {
             let largest = *regime_rows.last().expect("a regime holds a row class");
             let is_decode = crate::operators::attention::graph::decodes(largest);
-            let stages = RunStage::sealed(split, resident, decode_split, decode_hits, largest);
+            let stages = served.sealed_stages(largest);
             let has_stage = stages.iter().any(|&stage| (stage == RunStage::Combine) == group);
             if !has_stage {
                 continue;
@@ -953,13 +914,13 @@ impl<L: Certified + Send + Sync> FamilyLayouts<L> {
         })
     }
 
-    fn find_launch(&self, hash: u64, key: &LaunchKey) -> Option<usize> {
+    fn find_launch(&self, hash: u64, key: &BlockGraphShape) -> Option<usize> {
         self.launch_index
             .get(&hash)
             .and_then(|bucket| bucket.iter().copied().find(|&id| self.launches[id].0 == *key))
     }
 
-    fn insert_launch(&mut self, hash: u64, key: LaunchKey, value: Arc<ShapeLayouts<L>>) -> usize {
+    fn insert_launch(&mut self, hash: u64, key: BlockGraphShape, value: Arc<ShapeLayouts<L>>) -> usize {
         let id = self.launches.len();
         self.launches.push((key, value));
         self.launch_index.entry(hash).or_default().push(id);
@@ -1300,7 +1261,6 @@ impl<L: Certified + Send + Sync> FamilyLayouts<L> {
             .map(|&index| (index, false))
             .chain(distinct_untapped.iter().map(|&index| (index, true)))
             .collect::<Vec<_>>();
-        let bank_layers = bank_layer_by_block(load, block_count);
         let (block_launch_ids, untapped_launch_ids, block_group_ids, untapped_group_ids) = {
             let ctx = CertifyContext {
                 outline: &outline,
@@ -1311,7 +1271,7 @@ impl<L: Certified + Send + Sync> FamilyLayouts<L> {
                 regimes: &regimes,
             };
             let (block_meta, block_launch_ids, untapped_launch_ids) =
-                self.certify_launches(&ctx, &shaped, &bank_layers, limits, passes)?;
+                self.certify_launches(&ctx, &shaped, passes)?;
             let (block_group_ids, untapped_group_ids) =
                 self.certify_groups(&ctx, &shaped, block_meta, passes)?;
             (block_launch_ids, untapped_launch_ids, block_group_ids, untapped_group_ids)
@@ -1340,32 +1300,21 @@ impl<L: Certified + Send + Sync> FamilyLayouts<L> {
         &mut self,
         ctx: &CertifyContext<'_>,
         shaped: &[(usize, bool)],
-        bank_layers: &[Option<usize>],
-        limits: ResourceLimits,
         chain: Passes,
     ) -> Result<(BlockMetaMap, FxHashMap<usize, usize>, FxHashMap<usize, usize>), GraphError> {
-        let bank_resident = ctx.load.expert_bank().is_some_and(|bank| bank.resident);
-        let chain_merges = limits.chain_capacity.get() > 1;
-        let has_prompts = !crate::operators::routed::fused_graph::decodes(ctx.outline.largest_rows);
         let mut block_meta: BlockMetaMap = fx_map();
         let mut block_launch_ids: FxHashMap<usize, usize> = fx_map();
         let mut untapped_launch_ids: FxHashMap<usize, usize> = fx_map();
-        let mut pending_launch_lookups: Vec<(usize, bool, u64, LaunchKey)> = Vec::new();
-        let mut missing_launches: Vec<(usize, bool, bool, bool, u64, LaunchKey)> = Vec::new();
+        let mut pending_launch_lookups: Vec<(usize, bool, u64, BlockGraphShape)> = Vec::new();
+        let mut missing_launches: Vec<(usize, bool, u64, BlockGraphShape)> = Vec::new();
         for &(index, of_untapped) in shaped {
-            let shape = match of_untapped {
+            let key = match of_untapped {
                 true => ctx
                     .outline
                     .untapped(index)
                     .expect("a distinct untapped shape is a tapped block's"),
                 false => ctx.outline.shapes[index].clone(),
             };
-            let streams = bank_layers[index].is_some();
-            let resident = streams && bank_resident;
-            let split = has_prompts
-                && (chain_merges || streams)
-                && block_routed(ctx.geometry, index)?.is_some();
-            let key = LaunchKey { split, resident, shape: shape.clone() };
             let key_hash = key.fx_hash();
             if let Some(id) = self.find_launch(key_hash, &key) {
                 match of_untapped {
@@ -1379,18 +1328,18 @@ impl<L: Certified + Send + Sync> FamilyLayouts<L> {
             } else {
                 if !missing_launches
                     .iter()
-                    .any(|(_, _, _, _, pending_hash, pending)| *pending_hash == key_hash && *pending == key)
+                    .any(|(_, _, pending_hash, pending)| *pending_hash == key_hash && *pending == key)
                 {
-                    missing_launches.push((index, of_untapped, split, resident, key_hash, key.clone()));
+                    missing_launches.push((index, of_untapped, key_hash, key.clone()));
                 }
-                pending_launch_lookups.push((index, of_untapped, key_hash, key));
+                pending_launch_lookups.push((index, of_untapped, key_hash, key.clone()));
             }
-            block_meta.insert((index, of_untapped), (shape, split, resident, streams));
+            block_meta.insert((index, of_untapped), key);
         }
         if !missing_launches.is_empty() {
-            let launch_entries: Vec<(usize, bool, bool, bool)> = missing_launches
+            let launch_entries: Vec<(usize, bool)> = missing_launches
                 .iter()
-                .map(|&(index, of_untapped, split, resident, _, _)| (index, of_untapped, split, resident))
+                .map(|&(index, of_untapped, _, _)| (index, of_untapped))
                 .collect();
             let (prefill_tiles, launch_tasks) = collect_run_tasks(ctx, &launch_entries, false)?;
             let mut launch_maps: Vec<ShapeLayouts<L>> = (0..missing_launches.len())
@@ -1404,7 +1353,7 @@ impl<L: Certified + Send + Sync> FamilyLayouts<L> {
                     launch_maps[slot_idx].insert(topology, (graph, included));
                 }
             }
-            for ((_, _, _, _, key_hash, key), graphs) in missing_launches.into_iter().zip(launch_maps) {
+            for ((_, _, key_hash, key), graphs) in missing_launches.into_iter().zip(launch_maps) {
                 self.insert_launch(key_hash, key, Arc::new(graphs));
             }
             for (index, of_untapped, key_hash, key) in pending_launch_lookups {
@@ -1436,12 +1385,12 @@ impl<L: Certified + Send + Sync> FamilyLayouts<L> {
         let mut pending_group_lookups: Vec<(usize, bool, u64, GroupKey)> = Vec::new();
         let mut missing_groups: Vec<MissingGroup> = Vec::new();
         for &(index, of_untapped) in shaped {
-            let (shape, split, resident, streams) = block_meta
+            let shape = block_meta
                 .remove(&(index, of_untapped))
                 .expect("shape metadata recorded in launch phase");
             // Non-split blocks have no `RunStage::Combine` and no `once_graphs`,
             // so their group layout map is always empty.
-            if !split {
+            if !shape.served().split {
                 match of_untapped {
                     true => {
                         untapped_group_ids.insert(index, None);
@@ -1455,9 +1404,6 @@ impl<L: Certified + Send + Sync> FamilyLayouts<L> {
             let key = GroupKey {
                 passes,
                 untapped: of_untapped,
-                split,
-                resident,
-                streams,
                 shape,
             };
             let key_hash = key.fx_hash();
@@ -1478,9 +1424,6 @@ impl<L: Certified + Send + Sync> FamilyLayouts<L> {
                     missing_groups.push(MissingGroup {
                         index,
                         of_untapped,
-                        split,
-                        resident,
-                        streams,
                         key_hash,
                         key: key.clone(),
                     });
@@ -1513,9 +1456,9 @@ impl<L: Certified + Send + Sync> FamilyLayouts<L> {
         missing_groups: Vec<MissingGroup>,
         passes: Passes,
     ) -> Result<(), GraphError> {
-        let group_entries: Vec<(usize, bool, bool, bool)> = missing_groups
+        let group_entries: Vec<(usize, bool)> = missing_groups
             .iter()
-            .map(|entry| (entry.index, entry.of_untapped, entry.split, entry.resident))
+            .map(|entry| (entry.index, entry.of_untapped))
             .collect();
         let (prefill_tiles, combine_tasks) = collect_run_tasks(ctx, &group_entries, true)?;
         let mut missing_once: Vec<(u64, OnceKey, usize)> = Vec::new();
@@ -1527,12 +1470,13 @@ impl<L: Certified + Send + Sync> FamilyLayouts<L> {
                 continue;
             }
             let once_shape = entry.key.shape.once_shape();
+            let served = entry.key.shape.served();
             let mut keys_for_shape = Vec::new();
-            for (stage, rows) in once_graphs(entry.streams, entry.split, passes) {
+            for (stage, rows) in once_graphs(served.streams, served.split, passes) {
                 let once_key = OnceKey {
                     stage,
                     rows,
-                    streams: entry.streams,
+                    streams: served.streams,
                     shape: once_shape.clone(),
                 };
                 let once_hash = once_key.fx_hash();
@@ -1709,7 +1653,7 @@ impl<L: Certified + Send + Sync> FamilyLayouts<L> {
                 }
             }
         }
-        let served = block_served(outline.backend, load, geometry, limits, outline.chain_rows, passes)?;
+        let served = block_served(&outline, geometry, passes)?;
         // Flat index of every distinct certified block graph by `(holder, topology)`.
         let mut by_holder: FxHashMap<(Holder, Topology), &CertifiedBlockGraph<L>> = fx_map();
         let mut holder_maps: FxHashMap<Holder, (&ShapeLayouts<L>, &ShapeLayouts<L>)> = fx_map();
@@ -2080,7 +2024,7 @@ impl TargetFamilyComposition {
                 }
             }
 
-            for (once_stage, pass_rows) in once_graphs(served[index].streams, served[index].split.is_some(), passes) {
+            for (once_stage, pass_rows) in once_graphs(served[index].form.streams, served[index].form.split, passes) {
                 let stage = Stage::Once(once_stage);
                 let topology = class_topology(once_class(pass_rows, once_stage));
                 let certified = lookup(block_holder, topology, index, false)?;
@@ -2124,7 +2068,8 @@ impl TargetFamilyComposition {
             constants,
         };
 
-        // 2. Upload regions (cached per distinct (first, untapped_holder, is_split)).
+        // 2. Upload regions (cached per distinct (first, untapped_holder): a
+        // shape holds how its blocks are served, so their stages).
         let upload = |layout: &L| layout.storage_bytes().upload;
         let largest = |layouts: &mut dyn Iterator<Item = &L>| {
             layouts.map(upload).max().filter(|&bytes| bytes > 0)
@@ -2137,13 +2082,12 @@ impl TargetFamilyComposition {
             upload_regions.push(bytes);
         }
         upload_regions.push(controls.region_bytes());
-        let mut region_cache: FxHashMap<(usize, Option<Holder>, bool), Vec<u64>> = fx_map();
+        let mut region_cache: FxHashMap<(usize, Option<Holder>), Vec<u64>> = fx_map();
         for index in 0..block_count {
             let first = outline.first_of_shape(index);
             let u_holder = untapped_holders[index];
-            let is_split = served[index].split.is_some();
             let regions = region_cache
-                .entry((first, u_holder, is_split))
+                .entry((first, u_holder))
                 .or_insert_with(|| {
                     let (b_launches, b_groups) = holder_maps[&Holder::Block(first)];
                     let u_maps = u_holder.map(|uh| holder_maps[&uh]);
@@ -2181,11 +2125,8 @@ impl TargetFamilyComposition {
             u_holder: Option<Holder>,
             keeps: BlockKeeps,
             scores: bool,
-            streams: bool,
-            resident: bool,
-            decode_split: bool,
-            decode_hits: bool,
-            is_split: bool,
+            /// How its blocks are served, which their shape (`first`) holds.
+            served: ServedForm,
             listings: &'a BlockListings,
             count: u64,
             once_runs: Vec<(u16, u64)>,
@@ -2197,11 +2138,7 @@ impl TargetFamilyComposition {
             let u_holder = untapped_holders[index];
             let block_keeps = keeps[index];
             let block_scores = scores[index];
-            let streams = served[index].streams;
-            let resident = served[index].resident;
-            let decode_split = served[index].decode_split;
-            let decode_hits = served[index].decode_hits;
-            let is_split = served[index].split.is_some();
+            let form = served[index].form;
             let listings = &prefill_listings[index];
 
             if let Some(group) = block_groups.iter_mut().find(|g| {
@@ -2209,21 +2146,16 @@ impl TargetFamilyComposition {
                     && g.u_holder == u_holder
                     && g.keeps == block_keeps
                     && g.scores == block_scores
-                    && g.streams == streams
-                    && g.resident == resident
-                    && g.decode_split == decode_split
-                    && g.decode_hits == decode_hits
-                    && g.is_split == is_split
                     && g.listings == listings
             }) {
                 group.count += 1;
             } else {
-                let once_runs = once_graphs(streams, is_split, passes)
+                let once_runs = once_graphs(form.streams, form.split, passes)
                     .into_iter()
                     .map(|(once_stage, pass_rows)| {
                         let topology = class_topology(once_class(pass_rows, once_stage));
                         let id = graphed_ids[&Graphed::Block(first, topology)];
-                        let repeat = if streams && (once_stage == OnceStage::Fill || pass_rows == single_pass) {
+                        let repeat = if form.streams && (once_stage == OnceStage::Fill || pass_rows == single_pass) {
                             windows
                         } else {
                             1
@@ -2236,11 +2168,7 @@ impl TargetFamilyComposition {
                     u_holder,
                     keeps: block_keeps,
                     scores: block_scores,
-                    streams,
-                    resident,
-                    decode_split,
-                    decode_hits,
-                    is_split,
+                    served: form,
                     listings,
                     count: 1,
                     once_runs,
@@ -2300,7 +2228,7 @@ impl TargetFamilyComposition {
                     runs[id as usize] += 1;
                 }
                 for g in &block_groups {
-                    if RunStage::served(g.is_split, rows).contains(&RunStage::Front) {
+                    if g.served.stages(rows).contains(&RunStage::Front) {
                         for &(id, repeat) in &g.once_runs {
                             runs[id as usize] += repeat * g.count;
                         }
@@ -2326,7 +2254,7 @@ impl TargetFamilyComposition {
                     if !matches {
                         continue;
                     }
-                    for &stage in RunStage::sealed(g.is_split, g.resident, g.decode_split, g.decode_hits, rows) {
+                    for &stage in g.served.sealed_stages(rows) {
                         let axes = stage_axes.of(g.first, form, stage);
                         let topo = (form, listed > 0 && axes.listed, scored && axes.segments, Stage::Run(stage), 0);
                         let id = graphed_ids[&Graphed::Block(g.first, topo)];

@@ -750,10 +750,7 @@ fn watch(
     };
     // Single owner `ExpertTransport` shared across `LinkMover` (`Copies`),
     // `Scratch` (prefill DMA plans), and `ExpertBank` (M7 decode DMA + prefill DMA).
-    let decode_dma = if crate::experts::decode_dma_enabled(charges.device().backend())
-        && plan.placer() == Placer::Tier
-        && !plan.whole()
-    {
+    let decode_dma = if plan.decode_dma(charges.device().backend()) {
         let transfer = seismic::Transfer::new(&charges.device())
             .map_err(|error| format!("M7 decode DMA transfer queue: {error}"))?;
         let selected = usize::try_from(plan.selected()).map_err(|_| "selected experts exceed host")?;
