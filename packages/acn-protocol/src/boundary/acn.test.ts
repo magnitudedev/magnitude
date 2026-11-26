@@ -6,15 +6,15 @@ import type * as Rpc from "@effect/rpc/Rpc"
 import { AcnRpcRecoveryPolicyTag } from "../transport/recovery"
 import { AcnRpcGroup, MagnitudeRpcs } from "./acn"
 import { Connection } from "./connection"
-import { Projects } from "./projects"
+import { Configuration } from "./configuration"
 
 describe("ACN boundary lifecycle policy", () => {
   const healthTag: Extract<TreeRpcs<typeof MagnitudeRpcs>["_tag"], "Health"> = "Health"
   void healthTag
   type HealthRpc = Extract<TreeRpcs<typeof Connection>, { readonly _tag: "Health" }>
-  type ProjectQueryRpc = Extract<TreeRpcs<typeof Projects>, { readonly _tag: "ListProjects" }>
+  type StorageQueryRpc = Extract<TreeRpcs<typeof Configuration>, { readonly _tag: "GetModelStorage" }>
   expectTypeOf<Rpc.Middleware<HealthRpc>>().toEqualTypeOf<never>()
-  expectTypeOf<Rpc.Middleware<ProjectQueryRpc>>().toEqualTypeOf<never>()
+  expectTypeOf<Rpc.Middleware<StorageQueryRpc>>().toEqualTypeOf<never>()
   it("derives finite recovery policy without lifecycle middleware", () => {
     for (const operation of AcnRpcGroup.requests.values()) {
       const recovery = Context.getOption(operation.annotations, AcnRpcRecoveryPolicyTag)
@@ -37,9 +37,7 @@ describe("ACN boundary lifecycle policy", () => {
       "StreamModelCandidateInspection",
       "WatchApplicationOwner",
       "WatchChat",
-      "WatchFile",
       "WatchHarnessConnections",
-      "WatchProjectFiles",
     ])
   })
 

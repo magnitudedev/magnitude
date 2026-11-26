@@ -1,13 +1,6 @@
 import { Rpc } from "@effect/rpc"
 import { atMostOnce, replaySafe } from "../transport/recovery"
 import { Schema } from "effect"
-import { ProviderIdSchema } from "@magnitudedev/ai/provider/model"
-import { OperationFailed } from "../errors"
-import {
-  CloudUsageResponse,
-  UsagePeriod,
-} from "../schemas/cloud-usage"
-import { ProviderAuthSchema } from "../schemas/provider-auth"
 import {
   DirectoryListing,
   ModelStorageChange,
@@ -18,43 +11,6 @@ import {
   ServerMachine,
   ServerSettingsFailed,
 } from "../schemas/server-settings"
-
-const GetProviderAuth = Rpc.make("GetProviderAuth", {
-  payload: Schema.Struct({
-    providerId: ProviderIdSchema,
-  }),
-  success: Schema.Struct({
-    auth: Schema.optionalWith(ProviderAuthSchema, { as: "Option", exact: true }),
-  }),
-  error: OperationFailed,
-}).pipe(replaySafe)
-
-const ListProviderAuth = Rpc.make("ListProviderAuth", {
-  payload: Schema.Struct({}),
-  success: Schema.Struct({
-    auths: Schema.Record({ key: ProviderIdSchema, value: ProviderAuthSchema }),
-  }),
-  error: OperationFailed,
-}).pipe(replaySafe)
-
-const UpdateProviderAuth = Rpc.make("UpdateProviderAuth", {
-  payload: Schema.Struct({
-    providerId: ProviderIdSchema,
-    auth: ProviderAuthSchema,
-  }),
-  success: Schema.Struct({}),
-  error: OperationFailed,
-}).pipe(replaySafe)
-
-const GetCloudUsage = Rpc.make("GetCloudUsage", {
-  payload: Schema.Struct({
-    period: Schema.optional(UsagePeriod),
-    days: Schema.optional(Schema.Number),
-    tz: Schema.optional(Schema.String),
-  }),
-  success: CloudUsageResponse,
-  error: OperationFailed,
-}).pipe(replaySafe)
 
 const GetModelStorage = Rpc.make("GetModelStorage", {
   payload: Schema.Struct({}),
@@ -115,10 +71,6 @@ const CompleteOnboarding = Rpc.make("CompleteOnboarding", {
 }).pipe(replaySafe)
 
 export const Configuration = {
-  getProviderAuth: GetProviderAuth,
-  listProviderAuth: ListProviderAuth,
-  updateProviderAuth: UpdateProviderAuth,
-  getCloudUsage: GetCloudUsage,
   getModelStorage: GetModelStorage,
   setModelStorage: SetModelStorage,
   browseDirectories: BrowseDirectories,

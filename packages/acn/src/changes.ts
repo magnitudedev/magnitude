@@ -1,9 +1,5 @@
 import { Context, Effect, Layer, Queue, Ref, Stream } from "effect"
-import {
-  Projects,
-  type Change,
-} from "@magnitudedev/acn-protocol"
-import { ProjectStore } from "./project-store"
+import type { Change } from "@magnitudedev/acn-protocol"
 
 /**
  * The ACN change registry: every change source publishes pokes in the
@@ -101,22 +97,3 @@ export const AcnChangesLive: Layer.Layer<AcnChanges> = Layer.effect(
     })
   }),
 )
-
-/** Queries whose authoritative data a project-store commit may change. */
-export const projectChangeQueries: ReadonlyArray<string> = [Projects.listProjects._tag, Projects.inspectProject._tag]
-
-/**
- * Forwards storage-level change streams into the registry: a store commit
- * names every operation it backs. Versioned snapshots publish their own pokes.
- */
-export const AcnStorageChangesLive: Layer.Layer<never, never, AcnChanges | ProjectStore> =
-  Layer.scopedDiscard(Effect.gen(function* () {
-    const changes = yield* AcnChanges
-    const projects = yield* ProjectStore
-    const forward = (source: Stream.Stream<unknown>, queries: ReadonlyArray<string>) =>
-      source.pipe(
-        Stream.runForEach(() => Effect.forEach(queries, (operation) => changes.publish({ operation }), { discard: true })),
-        Effect.forkScoped,
-      )
-    yield* forward(projects.changes, projectChangeQueries)
-  }))

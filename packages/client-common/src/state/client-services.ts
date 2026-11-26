@@ -2,10 +2,8 @@ import { ApplicationSession, ApplicationSessionLive } from "../application/sessi
 import { ApplicationHost, ApplicationHostFailed } from "../application/host"
 import { ApplicationRouter, ApplicationRouterLocation, ApplicationRouterMemory } from "../application/router"
 import { Context, Effect, Layer, Option } from "effect"
-import { Files, FilesLive } from "../files/service"
 import { LocalModels, LocalModelsLive } from "../local-models/service"
 import { ModelSlots, ModelSlotsLive } from "../model-slots/service"
-import { ProjectFiles, ProjectFilesLive } from "../project-files/service"
 import { ChangesLive } from "./changes"
 import { ClientEffectQuery } from "./client-effect-query"
 
@@ -13,10 +11,8 @@ export type ClientServices =
   | ApplicationSession
   | ApplicationRouter
   | ClientEffectQuery
-  | Files
   | LocalModels
   | ModelSlots
-  | ProjectFiles
 
 export interface ClientServicesOptions {
   readonly host?: ApplicationHost
@@ -35,10 +31,8 @@ export const clientServicesLayer = (
     Layer.provideMerge(infrastructure),
   )
   const domains = Layer.mergeAll(
-    FilesLive,
     LocalModelsLive,
     ModelSlotsLive,
-    ProjectFilesLive,
   ).pipe(
     Layer.provideMerge(observedInfrastructure),
   )

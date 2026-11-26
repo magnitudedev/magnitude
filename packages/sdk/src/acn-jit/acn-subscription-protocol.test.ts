@@ -14,11 +14,9 @@ describe("ACN subscription protocol", () => {
       "StreamModelCandidateInspection",
       "WatchApplicationOwner",
       "WatchChat",
-      "WatchFile",
       "WatchHarnessConnections",
-      "WatchProjectFiles",
     ])
-    expect(acnSubscriptionProtocol.isStream("CheckFileExists")).toBe(false)
+    expect(acnSubscriptionProtocol.isStream("Health")).toBe(false)
   })
 
   it("consumes controls and unwraps payload frames to encoded domain values", async () => {

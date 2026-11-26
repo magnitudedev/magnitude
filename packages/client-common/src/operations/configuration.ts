@@ -1,33 +1,6 @@
 import { Configuration as Rpcs } from "@magnitudedev/sdk";
-import { Effect } from "effect";
 import { Group, QueryClient } from "@magnitudedev/effect-query";
 import { mutation, query } from "./bind";
-
-const GetProviderAuth = query(
-  Rpcs.getProviderAuth,
-  (client) => client.configuration.getProviderAuth
-);
-
-const ListProviderAuth = query(
-  Rpcs.listProviderAuth,
-  (client) => client.configuration.listProviderAuth
-);
-
-const UpdateProviderAuth = mutation(
-  Rpcs.updateProviderAuth,
-  (client) => client.configuration.updateProviderAuth,
-  {
-    synchronize: (_, { providerId }) =>
-      QueryClient.invalidate(GetProviderAuth.match({ providerId })).pipe(
-        Effect.zipRight(QueryClient.invalidate(ListProviderAuth.match()))
-      ),
-  }
-);
-
-const GetCloudUsage = query(
-  Rpcs.getCloudUsage,
-  (client) => client.configuration.getCloudUsage
-);
 
 const GetModelStorage = query(Rpcs.getModelStorage, (client) => client.configuration.getModelStorage);
 const SetModelStorage = mutation(Rpcs.setModelStorage, (client) => client.configuration.setModelStorage, {
@@ -48,10 +21,6 @@ const CompleteOnboarding = mutation(Rpcs.completeOnboarding, (client) => client.
 });
 
 export const Configuration = Group.make({
-  GetProviderAuth,
-  ListProviderAuth,
-  UpdateProviderAuth,
-  GetCloudUsage,
   GetModelStorage,
   SetModelStorage,
   BrowseDirectories,

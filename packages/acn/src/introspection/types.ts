@@ -1,8 +1,36 @@
-import type { AgentIntrospection } from "@magnitudedev/agent"
-import type { SessionRuntimeSnapshot } from "../agent-runtime"
-import type { AcnDisplayViewIntrospection } from "./display-views"
+import type { AgentIntrospection, SessionWorkStatus } from "@magnitudedev/agent"
+import type { DirectoryPath, DisplayViewShape } from "@magnitudedev/acn-protocol"
 
-export type AcnIntrospectionSession = SessionRuntimeSnapshot
+export interface AcnDisplayViewIntrospection {
+  readonly sessionId: string
+  readonly viewId: string
+  readonly shape: DisplayViewShape
+  readonly subscriberCount: number
+  readonly openedAt: number
+  readonly lastActivityAt: number
+}
+
+export interface AcnIntrospectionSession {
+  readonly sessionId: string
+  readonly generation: number
+  readonly title: string
+  readonly cwd: DirectoryPath
+  readonly scratchpadPath: string
+  readonly createdAt: number
+  readonly updatedAt: number
+  readonly loadedAt: number
+  readonly workStatus: SessionWorkStatus
+  readonly phase: "open" | "retirement-claimed" | "retired"
+  readonly scopedUseCount: number
+  readonly scopedUseLabels: ReadonlyArray<string>
+  readonly idleSince: number | null
+  readonly revision: number
+  readonly retirement: {
+    readonly stage: "notifying-observers" | "closing-runtime" | "removing-generation"
+    readonly startedAt: number
+    readonly stageStartedAt: number
+  } | null
+}
 
 export interface AcnIntrospectionOverview {
   readonly schemaVersion: 3

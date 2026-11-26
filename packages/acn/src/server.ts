@@ -24,7 +24,6 @@ import {
   Effect,
   Either,
   Exit,
-  Fiber,
   Layer,
   Option,
   Queue,
@@ -37,7 +36,6 @@ import {
   ChatStoreLive,
   StorageLive,
   GlobalStorage,
-  MagnitudeStorage,
   makeGlobalStorage,
   ProjectStorageLiveFromCwd,
   VersionLive,
@@ -56,16 +54,13 @@ import {
 import type { JsonLineChannelFailed } from "@magnitudedev/utils/json-line-channel"
 import {
   MagnitudeHealthResponseSchema,
-  AcnRpcGroup, } from "@magnitudedev/acn-protocol"
+  AcnRpcGroup,
+} from "@magnitudedev/acn-protocol"
 import { IcnHardware, IcnInstances, IcnProcess, makeIcnProvider, ReleaseIcnInstallationError } from "@magnitudedev/icn"
 import { AcnBoundaryLive } from "./boundary/acn"
 import { defaultDataDir } from "./data-dir"
-import { AgentFactoryLive } from "./agent-factory"
-import { AgentRuntimeLive } from "./agent-runtime"
 import { ProviderModelCatalogLive } from "./provider-model-catalog"
-import { ProviderCredentialsLive } from "./provider-credentials"
 import { ModelSlotControllerLive } from "./model-slot-controller"
-import { MagnitudeCloudUsageLive } from "./magnitude-cloud-usage"
 import { ServingUsage, ServingUsageLive } from "./serving-usage"
 import { InferenceActivity, InferenceActivityLive, finishWithBody, type InferenceActivityApi } from "./inference-activity"
 import { makeUsageFetch, makeUsageWebSocket } from "./serving-usage-observer"
@@ -74,19 +69,6 @@ import {
   ProviderClientRegistryLive,
   SharedProviderClientLive,
 } from "./shared-client"
-import { ActiveSessionStatusesLive } from "./active-session-statuses"
-import { DisplayViewStreamsLive } from "./display-view-streams"
-import {
-  AcnDisplayViewIntrospectorLive,
-  AcnIntrospectorLive,
-  AcnIntrospector,
-  installAcnIntrospectionRoutes,
-  type AcnIntrospectorApi,
-} from "./introspection"
-import { SessionCommandsLive } from "./session-commands"
-import { SessionDraftsLive } from "./session-drafts"
-import { SessionLifecycleLive } from "./session-lifecycle"
-import { SessionRuntimeOptionsStoreLive } from "./session-runtime-options"
 import { ModelSelectionLive } from "./model-selection"
 import { makeAcnIcn } from "./icn"
 import { LocalModelSourcesLive } from "./local-model-sources"
@@ -107,14 +89,6 @@ import { HuggingFaceAccountLive, HuggingFaceOAuthConfigLive } from "./hugging-fa
 import { CustomModelCommandsLive } from "./custom-model-commands"
 import { CatalogModelSyncLive } from "./catalog-model-sync"
 import { ModelLocationsLive } from "./model-locations"
-import { FileMentionSearcherLive } from "./file-mention-searcher"
-import { FileSystemManagerLive } from "./file-system-manager"
-import { GitInspectorLive } from "./git-inspector"
-import { ProjectFileManagerLive } from "./project-file-manager"
-import { ProjectInspectorLive } from "./project-inspector"
-import { ProjectManagerLive } from "./project-manager"
-import { ProjectStoreLive } from "./project-store"
-import { SessionInspectorLive } from "./session-inspector"
 import { ACN_VERSION } from "./version"
 import { TracingLayer } from "./tracing"
 import {
@@ -126,8 +100,8 @@ import { containerNetworkConfig, readContainerInstallation, type ContainerInstal
 import { AcnHarnessConnectionsLive } from "./harness-connections"
 import { AcnOwner } from "./application-owner"
 import { resolveWebAppSource, serveWebApp } from "./web-app"
-import { fileSessionStore, installRemoteAccessRoutes, isLocalCaller, isSameOrigin, makeRemoteAccess, REMOTE_SESSIONS_FILE, type RemoteAccessApi } from "./remote-access"
-import { AcnChangesLive, AcnStorageChangesLive } from "./changes"
+import { fileSessionStore, installRemoteAccessRoutes, isSameOrigin, makeRemoteAccess, REMOTE_SESSIONS_FILE, type RemoteAccessApi } from "./remote-access"
+import { AcnChangesLive } from "./changes"
 import { AcnSubscriptions, AcnSubscriptionsLive } from "./acn-subscriptions"
 import { makeAcnSubscriptionProtocol } from "./acn-subscription-protocol"
 import {
@@ -315,53 +289,21 @@ const AcnProcessHandlersLive = Layer.scopedDiscard(
 /** A handler's defect fails only its own request; it never ends the server and every other client's requests and subscriptions. */
 export const acnRpcServerOptions = { disableFatalDefects: true } as const
 
-const makeAcnServicesBase = (debug: boolean, dataDir: string) => {
+const AcnServicesLayer = (dataDir: string) => {
   const storageBase = Layer.mergeAll(
     VersionLive(ACN_VERSION),
     ProjectStorageLiveFromCwd(process.cwd())
   )
-
   const storageLayer = StorageLive.pipe(Layer.provide(storageBase))
-
-  // The two durable read authorities plus host observation services. Platform
-  // requirements (FileSystem, Path, CommandExecutor) flow from infrastructure.
-  const domainCore = Layer.mergeAll(
-    FileSystemManagerLive,
-    GitInspectorLive,
-    ProjectStoreLive,
-    SessionInspectorLive,
-  ).pipe(Layer.provideMerge(storageLayer))
-
-  const storageServices = Layer.mergeAll(
-    SessionRuntimeOptionsStoreLive
-  ).pipe(Layer.provideMerge(domainCore))
-
-  const withSubscriptions = Layer.provideMerge(
-    AcnSubscriptionsLive,
-    storageServices
-  )
-  // The change registry serves `StreamChanges`; storage change streams are
-  // forwarded into it here, versioned snapshots publish their own pokes.
-  const withChanges = Layer.provideMerge(
-    AcnStorageChangesLive,
-    Layer.provideMerge(AcnChangesLive, withSubscriptions),
-  )
+  const withSubscriptions = Layer.provideMerge(AcnSubscriptionsLive, storageLayer)
+  const withChanges = Layer.provideMerge(AcnChangesLive, withSubscriptions)
   const withHuggingFace = Layer.provideMerge(
     HuggingFaceAccountLive.pipe(Layer.provide(HuggingFaceOAuthConfigLive)),
     withChanges,
   )
-  const localServices = addLocalInferenceServices(
-    withHuggingFace,
-    dataDir
-  )
-  const withSharedClient = Layer.provideMerge(
-    SharedProviderClientLive,
-    localServices
-  )
-  const withCatalog = Layer.provideMerge(
-    ProviderModelCatalogLive,
-    withSharedClient
-  )
+  const localServices = addLocalInferenceServices(withHuggingFace, dataDir)
+  const withSharedClient = Layer.provideMerge(SharedProviderClientLive, localServices)
+  const withCatalog = Layer.provideMerge(ProviderModelCatalogLive, withSharedClient)
   const withUsage = Layer.provideMerge(Layer.merge(ServingUsageLive, InferenceActivityLive), withCatalog)
   const withInference = Layer.provideMerge(ChatInferenceLive, withUsage)
   const withChats = Layer.provideMerge(
@@ -369,33 +311,12 @@ const makeAcnServicesBase = (debug: boolean, dataDir: string) => {
     withInference,
   )
   const withModelCatalog = Layer.provideMerge(Layer.merge(ModelCatalogLive, RecommendationsLive), withChats)
-  const withCredentials = Layer.provideMerge(
-    ProviderCredentialsLive,
-    withModelCatalog
-  )
-  const withCloudUsage = Layer.provideMerge(
-    MagnitudeCloudUsageLive,
-    withCredentials
-  )
-  const withModelSlots = Layer.provideMerge(
-    ModelSlotControllerLive,
-    withCloudUsage
-  )
+  const withModelSlots = Layer.provideMerge(ModelSlotControllerLive, withModelCatalog)
   const withCustomModelReconciliation = Layer.provideMerge(CustomModelReconcilerLive, withModelSlots)
   const withCatalogModelSync = Layer.provideMerge(CatalogModelSyncLive, withCustomModelReconciliation)
   const withCustomModelCommands = Layer.provideMerge(CustomModelCommandsLive, withCatalogModelSync)
   const withModelCommands = Layer.provideMerge(ModelCommandsLive, withCustomModelCommands)
-  const withCustomEndpointReconciliation = Layer.provideMerge(
-    CustomEndpointReconcilerLive,
-    withModelCommands,
-  )
-  const withFactory = Layer.provideMerge(
-    AgentFactoryLive({ debug, version: ACN_VERSION }),
-    withCustomEndpointReconciliation
-  )
-  const withRuntime = Layer.provideMerge(AgentRuntimeLive, withFactory)
-  const withDrafts = Layer.provideMerge(SessionDraftsLive, withRuntime)
-  return withDrafts
+  return Layer.provideMerge(CustomEndpointReconcilerLive, withModelCommands)
 }
 
 const addLocalInferenceServices = <A, E, R>(
@@ -433,38 +354,6 @@ const addLocalInferenceServices = <A, E, R>(
     withIcnProvider
   )
   return withProviderClients
-}
-
-const addCommonAcnServices = <A, E, R>(services: Layer.Layer<A, E, R>) => {
-  const withMentionSearcher = Layer.provideMerge(FileMentionSearcherLive, services)
-  const withCommands = Layer.provideMerge(SessionCommandsLive, withMentionSearcher)
-  const withLifecycle = Layer.provideMerge(SessionLifecycleLive, withCommands)
-  const withProjectManager = Layer.provideMerge(ProjectManagerLive, withLifecycle)
-  const withProjectInspector = Layer.provideMerge(ProjectInspectorLive, withProjectManager)
-  const withProjectFiles = Layer.provideMerge(ProjectFileManagerLive, withProjectInspector)
-  const withActiveSessionStatuses = Layer.provideMerge(
-    ActiveSessionStatusesLive,
-    withProjectFiles
-  )
-  const withStreams = Layer.provideMerge(
-    DisplayViewStreamsLive,
-    withActiveSessionStatuses
-  )
-  return withStreams
-}
-
-const AcnBaseServicesLayer = (dataDir: string) =>
-  addCommonAcnServices(makeAcnServicesBase(false, dataDir))
-
-const AcnDebugServicesLayer = (dataDir: string) => {
-  const services = makeAcnServicesBase(true, dataDir)
-  const withDisplayIntrospection = Layer.provideMerge(
-    AcnDisplayViewIntrospectorLive,
-    services
-  )
-  return addCommonAcnServices(
-    Layer.provideMerge(AcnIntrospectorLive, withDisplayIntrospection)
-  )
 }
 
 /**
@@ -823,7 +712,6 @@ const allInterfacesListenAddress = Effect.try(() => Bun.serve({ hostname: "::", 
 export const launchAcnServer = (options: AcnServerOptions, owner: AcnOwnerControl) =>
   Effect.scoped(Effect.gen(function* () {
     const dataDir = options.dataDir ?? defaultDataDir()
-    const debug = options.debug === true
     yield* owner.awaitStart
 
     const lifecycle = yield* makeAcnServiceLifecycle()
@@ -886,22 +774,15 @@ export const launchAcnServer = (options: AcnServerOptions, owner: AcnOwnerContro
 
     yield* lifecycle.reportStarting("Resolving", Option.none())
     const application = Effect.gen(function* () {
-      const builtServices = yield* debug
-        ? Layer.buildWithScope(withServerOwnedServices(AcnDebugServicesLayer(dataDir), { dataDir, port: options.port ?? ACN_PUBLIC_PORT, activeNetwork: network, container }, owner), applicationScope).pipe(
-            Effect.provide(infrastructure),
-            Effect.map((context) => ({
-              context,
-              introspector: Option.some(Context.get(context, AcnIntrospector)),
-            })),
-          )
-        : Layer.buildWithScope(withServerOwnedServices(AcnBaseServicesLayer(dataDir), { dataDir, port: options.port ?? ACN_PUBLIC_PORT, activeNetwork: network, container }, owner), applicationScope).pipe(
-            Effect.provide(infrastructure),
-            Effect.map((context) => ({
-              context,
-              introspector: Option.none<AcnIntrospectorApi>(),
-            })),
-          )
-      const serviceContext = Context.merge(infrastructure, builtServices.context)
+      const builtServices = yield* Layer.buildWithScope(
+        withServerOwnedServices(
+          AcnServicesLayer(dataDir),
+          { dataDir, port: options.port ?? ACN_PUBLIC_PORT, activeNetwork: network, container },
+          owner,
+        ),
+        applicationScope,
+      ).pipe(Effect.provide(infrastructure))
+      const serviceContext = Context.merge(infrastructure, builtServices)
       const handlers = yield* Layer.buildWithScope(AcnBoundaryLive, applicationScope).pipe(
         Effect.provide(serviceContext),
       )
@@ -919,9 +800,6 @@ export const launchAcnServer = (options: AcnServerOptions, owner: AcnOwnerContro
         Effect.provide(applicationContext),
         Effect.forkIn(applicationScope),
       )
-      if (Option.isSome(builtServices.introspector)) {
-        yield* installAcnIntrospectionRoutes(router, builtServices.introspector.value)
-      }
       const icn = Context.get(applicationContext, IcnProcess)
       const usage = Context.get(applicationContext, ServingUsage)
       yield* installAcnPublicRoutes(router, lifecycle, icn, remote, makeUsageFetch(icn.origin, usage), usage,

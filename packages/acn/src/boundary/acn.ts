@@ -2,33 +2,19 @@ import { ChatService } from "../chat/service";
 import { ChatModelDefaultsStore } from "../chat/model-defaults";
 import { ChatInference } from "../chat/inference";
 import { ServingUsage } from "../serving-usage";
-import {
-  AcnRpcGroup, Configuration,
-  Models,
-} from "@magnitudedev/acn-protocol";
+import { AcnRpcGroup } from "@magnitudedev/acn-protocol";
 import { Cause, Chunk, Effect, Option, Stream } from "effect";
-import { ProviderCredentials } from "../provider-credentials";
-import { ProviderModelCatalog } from "../provider-model-catalog";
 import { ModelSlotController } from "../model-slot-controller";
-import { MagnitudeCloudUsage } from "../magnitude-cloud-usage";
 import { InferenceActivity } from "../inference-activity";
 import { ACN_VERSION } from "../version";
 import { makeHealthResponse } from "../identity";
 import { AcnServiceLifecycle } from "../service-lifecycle";
-import { getSkill, listSkills } from "../skill-ops";
 import { AcnChanges } from "../changes";
 import { ModelCatalog } from "../model-catalog";
 import { Recommendations } from "../recommendations";
 import { ModelCommands } from "../model-commands";
 import { CustomModelCommands } from "../custom-model-commands";
 import { LocalInferenceHardware } from "../local-inference-hardware";
-import { FileMentionSearcher } from "../file-mention-searcher";
-import { FileSystemManager } from "../file-system-manager";
-import { GitInspector } from "../git-inspector";
-import { ProjectFileManager } from "../project-file-manager";
-import { ProjectInspector } from "../project-inspector";
-import { ProjectManager } from "../project-manager";
-import { ProjectStore } from "../project-store";
 import { ServerSettings } from "../server-settings";
 import { AcnHarnessConnections } from "../harness-connections";
 import { AcnOwner, requestOwner, watchApplicationOwner } from "../application-owner";
@@ -40,17 +26,7 @@ export const AcnBoundaryLive = AcnRpcGroup.toLayer(Effect.gen(function* () {
     const chats = yield* ChatService;
     const modelDefaults = yield* ChatModelDefaultsStore;
     const inference = yield* ChatInference;
-    const projectStore = yield* ProjectStore;
-    const projectManager = yield* ProjectManager;
-    const projectInspector = yield* ProjectInspector;
-    const projectFiles = yield* ProjectFileManager;
-    const fileSystemManager = yield* FileSystemManager;
-    const fileMentionSearcher = yield* FileMentionSearcher;
-    const gitInspector = yield* GitInspector;
-    const providerCredentials = yield* ProviderCredentials;
-    const providerModelCatalog = yield* ProviderModelCatalog;
     const modelSlots = yield* ModelSlotController;
-    const cloudUsage = yield* MagnitudeCloudUsage;
     const servingUsage = yield* ServingUsage;
     const inferenceActivity = yield* InferenceActivity;
     const changes = yield* AcnChanges;
@@ -109,71 +85,13 @@ export const AcnBoundaryLive = AcnRpcGroup.toLayer(Effect.gen(function* () {
         observeRpcDefects("SaveChatModelDefaults", modelDefaults.save(model, defaults)),
       ClearChatModelDefaults: ({ model }) =>
         observeRpcDefects("ClearChatModelDefaults", modelDefaults.clear(model)),
+
       // Connection
       Health: () => lifecycle.state.pipe(
         Effect.map((state) => makeHealthResponse(ACN_VERSION, state)),
       ),
-      ListProjects: (payload) =>
-        observeRpcDefects("ListProjects", projectStore.page(payload)),
 
-      CreateProject: (payload) =>
-        observeRpcDefects("CreateProject", projectManager.create(payload)),
-
-      EditProject: (payload) =>
-        observeRpcDefects("EditProject", projectManager.edit(payload)),
-
-      RemoveProject: ({ projectId }) =>
-        observeRpcDefects("RemoveProject", projectManager.remove(projectId)),
-
-      RestoreProject: ({ projectId }) =>
-        observeRpcDefects("RestoreProject", projectManager.restore(projectId)),
-
-      RevealProjectSource: ({ projectId }) =>
-        observeRpcDefects(
-          "RevealProjectSource",
-          projectManager.reveal(projectId).pipe(Effect.as({})),
-        ),
-
-      InspectProject: ({ projectId }) =>
-        observeRpcDefects("InspectProject", projectInspector.inspect(projectId)),
-
-      ListProjectDirectory: ({ projectId, directory }) =>
-        observeRpcDefects("ListProjectDirectory", projectFiles.listDirectory(projectId, directory)),
-
-      WatchProjectFiles: ({ projectId }) =>
-        observeRpcStreamDefects("WatchProjectFiles", projectFiles.watchChanges(projectId)),
-
-      ReadProjectFile: ({ projectId, path }) =>
-        observeRpcDefects("ReadProjectFile", projectFiles.readFile(projectId, path)),
-
-      WriteProjectFile: (payload) =>
-        observeRpcDefects("WriteProjectFile", projectFiles.writeFile(payload)),
-
-      DeleteProjectFile: (payload) =>
-        observeRpcDefects("DeleteProjectFile", projectFiles.deleteFile(payload).pipe(Effect.as({}))),
-
-      MoveProjectEntry: (payload) =>
-        observeRpcDefects("MoveProjectEntry", projectFiles.moveEntry(payload)),
-
-      // Config
-      UpdateProviderAuth: ({ providerId, auth }) =>
-        observeRpcDefects(
-          "UpdateProviderAuth",
-          providerCredentials.update(providerId, auth).pipe(Effect.as({}))
-        ),
-
-      GetProviderAuth: ({ providerId }) =>
-        observeRpcDefects(
-          "GetProviderAuth",
-          providerCredentials.get(providerId).pipe(Effect.map((auth) => ({ auth })))
-        ),
-
-      ListProviderAuth: () =>
-        observeRpcDefects(
-          "ListProviderAuth",
-          providerCredentials.list.pipe(Effect.map((auths) => ({ auths: Object.fromEntries(auths) })))
-        ),
-
+      // Models & Usage
       RefreshModelCatalog: ({ providerId }) =>
         observeRpcDefects(
           "RefreshModelCatalog",
@@ -192,6 +110,7 @@ export const AcnBoundaryLive = AcnRpcGroup.toLayer(Effect.gen(function* () {
       GetServingUsage: request => servingUsage.read(request),
       ListServableModels: () => observeRpcDefects("ListServableModels", inference.models),
 
+      // Configuration
       GetModelStorage: () => observeRpcDefects("GetModelStorage", serverSettings.modelStorage),
       SetModelStorage: ({ path }) => observeRpcDefects("SetModelStorage", serverSettings.setModelStorage(path).pipe(Effect.as({}))),
       BrowseDirectories: ({ path }) => observeRpcDefects("BrowseDirectories", serverSettings.browseDirectories(path)),
@@ -202,6 +121,7 @@ export const AcnBoundaryLive = AcnRpcGroup.toLayer(Effect.gen(function* () {
       GetOnboarding: () => observeRpcDefects("GetOnboarding", serverSettings.onboarding),
       CompleteOnboarding: () => observeRpcDefects("CompleteOnboarding", serverSettings.completeOnboarding.pipe(Effect.as({}))),
 
+      // Hugging Face
       GetHuggingFaceAccount: () => observeRpcDefects("GetHuggingFaceAccount", huggingFace.account),
       StartHuggingFaceSignIn: () => observeRpcDefects("StartHuggingFaceSignIn", huggingFace.startBrowserSignIn),
       StartHuggingFaceDeviceSignIn: () => observeRpcDefects("StartHuggingFaceDeviceSignIn", huggingFace.startDeviceSignIn),
@@ -209,12 +129,14 @@ export const AcnBoundaryLive = AcnRpcGroup.toLayer(Effect.gen(function* () {
       CancelHuggingFaceSignIn: ({ attemptId }) => observeRpcDefects("CancelHuggingFaceSignIn", huggingFace.cancelSignIn(attemptId).pipe(Effect.as({}))),
       SignOutOfHuggingFace: () => observeRpcDefects("SignOutOfHuggingFace", huggingFace.signOut.pipe(Effect.as({}))),
 
+      // Harness connections
       WatchHarnessConnections: () => observeRpcStreamDefects("WatchHarnessConnections", harnessConnections.watch),
       ConnectHarness: request => observeRpcDefects("ConnectHarness", harnessConnections.connect(request)),
       SyncHarnessConnections: ({ harness }) => observeRpcDefects("SyncHarnessConnections", harnessConnections.sync(harness).pipe(Effect.as({}))),
       DisconnectHarness: ({ harness }) => observeRpcDefects("DisconnectHarness", harnessConnections.disconnect(harness).pipe(Effect.as({}))),
       DescribeHarnessSetup: request => observeRpcDefects("DescribeHarnessSetup", harnessConnections.describe(request)),
 
+      // Application owner
       GetServiceActivity: () => observeRpcDefects("GetServiceActivity", inferenceActivity.count.pipe(
         Effect.map((inferenceRequests) => ({ inferenceRequests })),
       )),
@@ -291,7 +213,6 @@ export const AcnBoundaryLive = AcnRpcGroup.toLayer(Effect.gen(function* () {
       AddHuggingFaceModel: (request) =>
         observeRpcDefects("AddHuggingFaceModel", customModelCommands.addHuggingFaceModel(request)),
 
-
       SetModelDrafter: ({ modelId, drafter }) =>
         observeRpcDefects(
           "SetModelDrafter",
@@ -330,90 +251,6 @@ export const AcnBoundaryLive = AcnRpcGroup.toLayer(Effect.gen(function* () {
           "SetModelFavorite",
           modelSlots.setModelFavorite(model, favorite).pipe(Effect.as({})),
         ),
-
-      GetCloudUsage: (payload) =>
-        observeRpcDefects(
-          "GetCloudUsage",
-          cloudUsage.get({
-            ...(payload.period !== undefined ? { period: payload.period } : {}),
-            ...(payload.days !== undefined ? { days: payload.days } : {}),
-            ...(payload.tz !== undefined ? { tz: payload.tz } : {}),
-          })
-        ),
-
-      // Server-side operations
-      ListFiles: ({ cwd, glob, limit }) =>
-        observeRpcDefects(
-          "ListFiles",
-          fileSystemManager.normalizeDirectory(cwd).pipe(
-            Effect.flatMap((directory) =>
-              fileMentionSearcher.listFiles(directory, { glob, limit })),
-          )
-        ),
-
-      ReadFile: ({ cwd, path, format, offset }) =>
-        observeRpcDefects(
-          "ReadFile",
-          fileSystemManager.normalizeDirectory(cwd).pipe(
-            Effect.flatMap((directory) =>
-              fileMentionSearcher.readFile(directory, { path, format, offset })),
-          )
-        ),
-
-      CheckFileExists: ({ cwd, path }) =>
-        observeRpcDefects(
-          "CheckFileExists",
-          fileSystemManager.normalizeDirectory(cwd).pipe(
-            Effect.flatMap((directory) => fileMentionSearcher.checkFileExists(directory, path)),
-          )
-        ),
-
-      WatchFile: ({ cwd, path }) =>
-        observeRpcStreamDefects(
-          "WatchFile",
-          Stream.unwrap(fileSystemManager.normalizeDirectory(cwd).pipe(
-            Effect.map((directory) => fileMentionSearcher.watchFile(directory, path)),
-          ))
-        ),
-
-      ResolvePath: ({ cwd, path, checkExists }) =>
-        observeRpcDefects(
-          "ResolvePath",
-          fileSystemManager.normalizeDirectory(cwd).pipe(
-            Effect.flatMap((directory) =>
-              fileMentionSearcher.resolvePath(directory, { path, checkExists })),
-          )
-        ),
-
-      SearchMentions: ({ cwd, query, limit, visibleLimit, includeRecent }) =>
-        observeRpcDefects(
-          "SearchMentions",
-          fileSystemManager.normalizeDirectory(cwd).pipe(
-            Effect.flatMap((directory) =>
-              fileMentionSearcher.searchMentions(directory, {
-                query,
-                limit,
-                visibleLimit,
-                includeRecent,
-              })),
-          )
-        ),
-
-      SearchDirectories: ({ query, limit }) =>
-        observeRpcDefects("SearchDirectories", fileMentionSearcher.searchDirectories({ query, limit })),
-
-      GetGitRecentFiles: ({ cwd, limit }) =>
-        observeRpcDefects(
-          "GetGitRecentFiles",
-          fileSystemManager.normalizeDirectory(cwd).pipe(
-            Effect.flatMap((directory) => gitInspector.recentFiles(directory, limit)),
-          )
-        ),
-
-      ListSkills: ({ cwd }) => observeRpcDefects("ListSkills", listSkills(cwd)),
-
-      GetSkill: ({ cwd, name }) =>
-        observeRpcDefects("GetSkill", getSkill(cwd, name)),
 
       // Streams
       StreamChanges: () => observeRpcStreamDefects("StreamChanges", changes.stream),

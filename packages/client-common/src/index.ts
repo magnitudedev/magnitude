@@ -33,8 +33,6 @@ export * from './local-models/catalog-components'
 export * from './local-models/removal'
 export * from './local-models/candidate-versions'
 export * from './local-models/service'
-export * from './files/service'
-export * from './project-files/service'
 
 // Hooks
 export * from './hooks/use-local-inference-state'
