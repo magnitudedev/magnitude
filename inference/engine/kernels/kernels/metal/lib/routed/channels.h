@@ -178,38 +178,6 @@ inline void project_channels(thread const In &in, thread const projection::Weigh
     }
 }
 
-// Operands of up to MAXM rows formed by one simdgroup alone (no threadgroup
-// barrier): plain rows unchanged, or NVFP4 rows with per-row global scales in
-// registers (`projection::RegGlobals<MAXM>`).
-template <bool NVFP4, uint MAXM>
-struct lone_operands;
-
-template <uint MAXM>
-struct lone_operands<false, MAXM> {
-    template <typename In>
-    static In form(In in, uint, uint, uint) {
-        return in;
-    }
-};
-
-template <uint MAXM>
-struct lone_operands<true, MAXM> {
-    template <typename In>
-    static projection::Nvfp4Rows<In, projection::RegGlobals<MAXM>> form(In in, uint m_rows, uint columns, uint lane) {
-        projection::RegGlobals<MAXM> globals = {};
-        for (uint m = 0; m < m_rows; ++m) {
-            uint amax = 0u;
-            for (uint k = 8u * lane; k < columns; k += 256u) {
-                float4 even, odd;
-                in.load8(m, k, 0.0f, even, odd);
-                amax = packets::magnitude_peak(amax, even, odd);
-            }
-            globals.g[m] = packets::nvfp4::global_scale(as_type<float>(simd_max(amax)));
-        }
-        return projection::Nvfp4Rows<In, projection::RegGlobals<MAXM>>{in, globals};
-    }
-};
-
 // Accumulate one loaded weight packet of ROWS channels into MAXM rows'
 // accumulators, decoding each weight once across all rows.
 template <typename W, uint ROWS, uint MAXM, typename In>
@@ -326,6 +294,7 @@ struct GatheredSummedShared {
     uint4 staged[MATRIX ? 1u : (stage_rows() * 4u * stage_pkts())];
     uint products[ONE ? 1u : SEISMIC_CONST_VERIFY_ROWS];
     ulong offsets[ONE ? 1u : SEISMIC_CONST_VERIFY_ROWS];
+    float globals[ONE ? 1u : SEISMIC_CONST_VERIFY_ROWS];
 };
 
 // Maximum rows projected per weight pass in gathered summed projections:
@@ -348,7 +317,7 @@ template <typename W, uint ROWS, uint LANES, uint MAXM, uint COLUMNS, uint H, bo
     typename Published>
 inline void project_channels_published(thread const In &raw, thread const projection::Weights<W> &w, uint m_rows,
     threadgroup const uint *published_rows, uint first, uint rows, uint extent, threadgroup uint4 *staged,
-    Published published, uint tid, uint lane) {
+    threadgroup float *globals_tg, Published published, uint tid, uint lane) {
     constexpr uint G = 32u / LANES;
     constexpr uint COLUMN_PACKETS = (COLUMNS + 31u) / 32u;
     constexpr uint STAGE_PKTS = GatheredSummedShared<LANES>::stage_pkts();
@@ -356,7 +325,10 @@ inline void project_channels_published(thread const In &raw, thread const projec
     const uint P = min(COLUMN_PACKETS, (extent + 31u) / 32u);
     const uint g = lane / LANES, sub = lane % LANES;
     const bool active_sg = first < H;
-    const auto in = lone_operands<NVFP4, MAXM>::form(raw, m_rows, COLUMNS, lane);
+    const auto in = projection::operands<NVFP4>::rows(
+        raw, m_rows, COLUMNS, globals_tg, GATHERED_SUMMED_SIMDGROUPS, tid >> 5u, lane);
+    if constexpr (NVFP4)
+        threadgroup_barrier(mem_flags::mem_threadgroup);
     uint n[ROWS];
     PROJECTION_UNROLL
     for (uint r = 0; r < ROWS; ++r)
@@ -407,21 +379,21 @@ inline void project_channels_published(thread const In &raw, thread const projec
 template <typename W, uint ROWS, uint LANES, uint COLUMNS, uint H, bool NVFP4, typename In, typename Published>
 inline void project_channels_published_chunk(thread const In &raw, thread const projection::Weights<W> &w, uint chunk,
     threadgroup const uint *published_rows, uint first, uint rows, uint extent, threadgroup uint4 *staged,
-    Published published, uint tid, uint lane) {
+    threadgroup float *globals_tg, Published published, uint tid, uint lane) {
     constexpr uint MAX_CHUNK = gathered_summed_chunk<ROWS, LANES>();
     if (chunk <= 2u) {
         project_channels_published<W, ROWS, LANES, 2u, COLUMNS, H, NVFP4>(
-            raw, w, chunk, published_rows, first, rows, extent, staged, published, tid, lane);
+            raw, w, chunk, published_rows, first, rows, extent, staged, globals_tg, published, tid, lane);
     } else if (chunk <= 4u) {
         project_channels_published<W, ROWS, LANES, 4u, COLUMNS, H, NVFP4>(
-            raw, w, chunk, published_rows, first, rows, extent, staged, published, tid, lane);
+            raw, w, chunk, published_rows, first, rows, extent, staged, globals_tg, published, tid, lane);
     } else if constexpr (MAX_CHUNK > 4u) {
         if (chunk <= 8u) {
             project_channels_published<W, ROWS, LANES, 8u, COLUMNS, H, NVFP4>(
-                raw, w, chunk, published_rows, first, rows, extent, staged, published, tid, lane);
+                raw, w, chunk, published_rows, first, rows, extent, staged, globals_tg, published, tid, lane);
         } else if constexpr (MAX_CHUNK > 8u) {
             project_channels_published<W, ROWS, LANES, MAX_CHUNK, COLUMNS, H, NVFP4>(
-                raw, w, chunk, published_rows, first, rows, extent, staged, published, tid, lane);
+                raw, w, chunk, published_rows, first, rows, extent, staged, globals_tg, published, tid, lane);
         }
     }
 }
@@ -470,11 +442,12 @@ inline void project_gathered_expert(device const uchar *product, ulong p0, ulong
     if constexpr (ONE) {
         const GatheredProduct in{product, tg.offsets, p2, COLUMNS, aligned};
         project_channels_published<W, ROWS, LANES, 1u, COLUMNS, H, NVFP4>(
-            in, down, 1u, tg.products, first, H, COLUMNS, tg.staged, published, tid, lane);
+            in, down, 1u, tg.products, first, H, COLUMNS, tg.staged, tg.globals, published, tid, lane);
     } else if constexpr (MATRIX) {
         constexpr uint MATRIX_R = (TILE == 16u) ? 2u : 1u;
         const GatheredProduct in{product, tg.offsets, p2, COLUMNS, aligned};
-        const auto x = lone_operands<NVFP4, SEISMIC_CONST_VERIFY_ROWS>::form(in, m_rows, COLUMNS, lane);
+        const auto x = projection::operands<NVFP4>::rows(
+            in, m_rows, COLUMNS, tg.globals, GATHERED_SUMMED_SIMDGROUPS, sg, lane);
         const PublishedOut<H, Published> out{published, tg.products};
         projection::gemv_batch_runtime<W, MATRIX_R>(x, out, down, m_rows, H, COLUMNS, tile, shared,
             GATHERED_SUMMED_SIMDGROUPS, sg, lane);
@@ -486,7 +459,7 @@ inline void project_gathered_expert(device const uchar *product, ulong p0, ulong
                 threadgroup_barrier(mem_flags::mem_threadgroup);
             const GatheredProduct in{product, tg.offsets + base, p2, COLUMNS, aligned};
             project_channels_published_chunk<W, ROWS, LANES, COLUMNS, H, NVFP4>(
-                in, down, chunk, tg.products + base, first, H, COLUMNS, tg.staged, published, tid, lane);
+                in, down, chunk, tg.products + base, first, H, COLUMNS, tg.staged, tg.globals, published, tid, lane);
         }
     }
 }

@@ -130,8 +130,8 @@ inline void output_project_gathered(device const uchar *expert_product, device c
                 constexpr uint MATRIX_R = (TILE == 16u) ? 2u : 1u;
                 const auto in = activation(shared_product, SEISMIC_SHARED_PRODUCT_STRIDE_0,
                     SEISMIC_SHARED_PRODUCT_STRIDE_1, uint(SEISMIC_DIM_S));
-                const auto x = lone_operands<NVFP4, SEISMIC_CONST_VERIFY_ROWS>::form(in, m_rows,
-                    uint(SEISMIC_DIM_S), lane);
+                const auto x = projection::operands<NVFP4>::rows(in, m_rows,
+                    uint(SEISMIC_DIM_S), tg.globals, GATHERED_SUMMED_SIMDGROUPS, sg, lane);
                 const PublishedOut<H, Published> out{published, tg.products};
                 projection::gemv_batch_runtime<packets::W1, MATRIX_R>(x, out, down, m_rows, H, uint(SEISMIC_DIM_S),
                     tile, shared, GATHERED_SUMMED_SIMDGROUPS, sg, lane);
@@ -144,8 +144,8 @@ inline void output_project_gathered(device const uchar *expert_product, device c
                     const auto in = activation(shared_product + ulong(base) * SEISMIC_SHARED_PRODUCT_STRIDE_0 * Act::bytes,
                         SEISMIC_SHARED_PRODUCT_STRIDE_0, SEISMIC_SHARED_PRODUCT_STRIDE_1, uint(SEISMIC_DIM_S));
                     project_channels_published_chunk<packets::W1, ROWS, LANES, uint(SEISMIC_DIM_S), H, NVFP4>(
-                        in, down, chunk, tg.products + base, sg_first, H, uint(SEISMIC_DIM_S), tg.staged, published,
-                        tid, lane);
+                        in, down, chunk, tg.products + base, sg_first, H, uint(SEISMIC_DIM_S), tg.staged, tg.globals,
+                        published, tid, lane);
                 }
             }
         }

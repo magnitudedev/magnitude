@@ -890,11 +890,6 @@ struct SharedOrderedNorm {
         raw.load8(m, k, inv[m], even, odd);
     }
 };
-template <uint MAXM>
-struct RegGlobals {
-    float g[MAXM];
-    float at(uint m) const { return g[m]; }
-};
 
 struct SharedGlobals {
     threadgroup const float *g;

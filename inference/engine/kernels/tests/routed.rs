@@ -6105,6 +6105,226 @@ fn native_metal_verify_crush_matrix_and_ordered16_parity() {
     );
 }
 
+/// Metal `M in {2, 4, 8}` NVFP4 (`nvfp4g16` and `nvfp4g16a4`) verify parity:
+/// verifies `routed_gate_up` (`GATHERED=1, MATRIX=1` vs `MATRIX=0`, with
+/// second-level per-expert scales) and `routed_output` (`GATHERED=1, MATRIX=0`
+/// and `MATRIX=1` vs `GATHERED=0`) at multi-tile width (`H = 2048, F = 512,
+/// K = 8`), guarding against non-finite outputs on Metal 4 / Apple M5.
+#[test]
+fn native_metal_nvfp4_verify_gathered_matrix_parity() {
+    let Some(device) = native_device() else {
+        return;
+    };
+    if device.backend() != seismic::BackendName::Metal {
+        return;
+    }
+    let charges = seismic::Charges::tally(&device);
+    let bf16 = seismic::Element::bf16();
+    let (h, e, k, f, s) = (2048u64, 8u64, 8u64, 512u64, 512u64);
+
+    for fmt in ["nvfp4g16", "nvfp4g16a4"] {
+        let elem = element(&device, fmt);
+        let (expert_gate, _) = packed_weight(&device, fmt, &[e, f, h], 141);
+        let (expert_up, _) = packed_weight(&device, fmt, &[e, f, h], 142);
+        let (expert_down, _) = packed_weight(&device, fmt, &[e, h, f], 143);
+        let (shared_down, _) = packed_weight(&device, fmt, &[h, s], 144);
+        let gate_scale = f32_tensor(&device, &[e], &(0..e).map(|i| 0.5 + 0.05 * i as f32).collect::<Vec<_>>());
+        let up_scale = f32_tensor(&device, &[e], &(0..e).map(|i| 0.75 + 0.03 * i as f32).collect::<Vec<_>>());
+
+        for rows in [2usize, 4usize, 8usize] {
+            let m = rows as u64;
+            let residual_vals: Vec<f32> = (0..rows * h as usize)
+                .map(|i| ((i % 29) as f32 - 14.0) * 0.05)
+                .collect();
+            let norm_vals: Vec<f32> = (0..rows * h as usize)
+                .map(|i| ((i % 31) as f32 - 15.0) * 0.07)
+                .collect();
+            let residual_tensor = f32_tensor(&device, &[m, h], &residual_vals);
+            let normalized = bf16_tensor(&device, &[m, h], &norm_vals);
+
+            // Force multi-row collisions across all rows so GATHERED executes multi-row paths.
+            let mut routes_vals = Vec::with_capacity(rows * k as usize);
+            let mut scores_vals = Vec::with_capacity(rows * k as usize);
+            for r in 0..rows {
+                for c in 0..k as usize {
+                    routes_vals.push(((c + (r % 2)) % e as usize) as i32);
+                    scores_vals.push(0.25f32);
+                }
+            }
+            let routes = i32_tensor(&device, &[m, k], &routes_vals);
+            let scores = f32_tensor(&device, &[m, k], &scores_vals);
+            let coeff = f32_tensor(&device, &[m], &vec![0.5f32; rows]);
+            let shared_prod_vals: Vec<f32> = (0..rows * s as usize)
+                .map(|i| ((i % 23) as f32 - 11.0) * 0.06)
+                .collect();
+            let shared_product = bf16_tensor(&device, &[m, s], &shared_prod_vals);
+
+            // 1. routed_gate_up: GATHERED=1 MATRIX=0 vs GATHERED=1 MATRIX=1
+            let gate_up_ref = declared::prepared(
+                &device,
+                &routed_gate_up::native_entry_with(routed_gate_up::Elements {
+                    A: bf16,
+                    EGW: elem,
+                    EUW: elem,
+                }),
+                &decode_specialization::<routed_gate_up::Entry>(
+                    &device,
+                    &[("H", h), ("K", k), ("F", f), ("GS", e), ("US", e)],
+                    &[("SIMDGROUPS", 8), ("ROWS", 2), ("LANES", 16), ("GATHERED", 1), ("MATRIX", 0)],
+                ),
+            )
+            .unwrap()
+            .call(&charges, routed_gate_up::Args {
+                normalized: &normalized,
+                routes: &routes,
+                sources: &no_sources(&device, m, k),
+                expert_gate: &expert_gate,
+                expert_up: &expert_up,
+                tier_gate: &no_tier(&expert_gate),
+                tier_up: &no_tier(&expert_up),
+                activation: 0,
+                glu_limit: &no_limit(&device),
+                gate_scale: &gate_scale,
+                up_scale: &up_scale,
+            })
+            .unwrap()
+            .value;
+
+            let gate_up_mat = declared::prepared(
+                &device,
+                &routed_gate_up::native_entry_with(routed_gate_up::Elements {
+                    A: bf16,
+                    EGW: elem,
+                    EUW: elem,
+                }),
+                &decode_specialization::<routed_gate_up::Entry>(
+                    &device,
+                    &[("H", h), ("K", k), ("F", f), ("GS", e), ("US", e)],
+                    &[("SIMDGROUPS", 8), ("ROWS", 2), ("LANES", 16), ("GATHERED", 1), ("MATRIX", 1)],
+                ),
+            )
+            .unwrap()
+            .call(&charges, routed_gate_up::Args {
+                normalized: &normalized,
+                routes: &routes,
+                sources: &no_sources(&device, m, k),
+                expert_gate: &expert_gate,
+                expert_up: &expert_up,
+                tier_gate: &no_tier(&expert_gate),
+                tier_up: &no_tier(&expert_up),
+                activation: 0,
+                glu_limit: &no_limit(&device),
+                gate_scale: &gate_scale,
+                up_scale: &up_scale,
+            })
+            .unwrap()
+            .value;
+
+            let ref_gu = read_bf16(&gate_up_ref);
+            let mat_gu = read_bf16(&gate_up_mat);
+            assert!(
+                ref_gu.iter().all(|v| v.is_finite()),
+                "{fmt} M={rows} routed_gate_up MATRIX=0 produced non-finite values"
+            );
+            assert!(
+                mat_gu.iter().all(|v| v.is_finite()),
+                "{fmt} M={rows} routed_gate_up MATRIX=1 produced non-finite values"
+            );
+            let (max_gu_rel, max_gu_abs) = mat_gu
+                .iter()
+                .zip(&ref_gu)
+                .fold((0.0f32, 0.0f32), |(mr, ma), (a, b)| {
+                    let d = (a - b).abs();
+                    (mr.max(d / b.abs().max(1.0)), ma.max(d))
+                });
+            assert!(
+                max_gu_rel <= 2e-2,
+                "{fmt} M={rows} routed_gate_up MATRIX=1 max rel {max_gu_rel} (abs {max_gu_abs})"
+            );
+
+            // 2. routed_output: GATHERED=0 vs GATHERED=1 MATRIX=0 vs GATHERED=1 MATRIX=1
+            let no_inject = f32_tensor(&device, &[m, 0], &[]);
+            let no_norm = bf16_tensor(&device, &[0], &[]);
+            let run_output = |gathered: u64, matrix: u64| {
+                let out = declared::prepared(
+                    &device,
+                    &routed_output::native_entry_with(routed_output::Elements {
+                        A: bf16,
+                        EDW: elem,
+                        SDW: elem,
+                        NW: bf16,
+                    }),
+                    &decode_specialization::<routed_output::Entry>(
+                        &device,
+                        &[("H", h), ("K", k), ("F", f), ("S", s), ("SN", 1), ("IN", 0)],
+                        &[("ROWS", 2), ("LANES", 8), ("GATHERED", gathered), ("MATRIX", matrix)],
+                    ),
+                )
+                .unwrap()
+                .call(&charges, routed_output::Args {
+                    residual: &residual_tensor,
+                    inject: &no_inject,
+                    expert_product: &gate_up_ref,
+                    shared_product: &shared_product,
+                    routes: &routes,
+                    sources: &no_sources(&device, m, k),
+                    scores: &scores,
+                    coefficient: &coeff,
+                    expert_down: &expert_down,
+                    tier_down: &no_tier(&expert_down),
+                    shared_down: &shared_down,
+                    operand_norm: &no_norm,
+                    operand_epsilon: 0.0,
+                })
+                .unwrap()
+                .value;
+                read_f32(&out)
+            };
+
+            let side_out = run_output(0, 0);
+            let ref_out = run_output(1, 0);
+            let mat_out = run_output(1, 1);
+            assert!(
+                side_out.iter().all(|v| v.is_finite()),
+                "{fmt} M={rows} routed_output GATHERED=0 produced non-finite values"
+            );
+            assert!(
+                ref_out.iter().all(|v| v.is_finite()),
+                "{fmt} M={rows} routed_output GATHERED=1 MATRIX=0 produced non-finite values"
+            );
+            assert!(
+                mat_out.iter().all(|v| v.is_finite()),
+                "{fmt} M={rows} routed_output GATHERED=1 MATRIX=1 produced non-finite values"
+            );
+            let (max_ref_rel, max_ref_abs) = ref_out
+                .iter()
+                .zip(&side_out)
+                .fold((0.0f32, 0.0f32), |(mr, ma), (a, b)| {
+                    let d = (a - b).abs();
+                    (mr.max(d / b.abs().max(1.0)), ma.max(d))
+                });
+            assert!(
+                max_ref_rel == 0.0,
+                "{fmt} M={rows} routed_output GATHERED=1 MATRIX=0 vs GATHERED=0 must be bit-for-bit identical (rel {max_ref_rel}, abs {max_ref_abs})"
+            );
+            let (max_mat_rel, max_mat_abs) = mat_out
+                .iter()
+                .zip(&side_out)
+                .fold((0.0f32, 0.0f32), |(mr, ma), (a, b)| {
+                    let d = (a - b).abs();
+                    (mr.max(d / b.abs().max(1.0)), ma.max(d))
+                });
+            assert!(
+                max_mat_rel <= 3e-2,
+                "{fmt} M={rows} routed_output GATHERED=1 MATRIX=1 vs GATHERED=0 max rel {max_mat_rel} (abs {max_mat_abs})"
+            );
+            eprintln!(
+                "PASS {fmt} M={rows}: gate_up rel={max_gu_rel:.3e}, output_m0 rel={max_ref_rel:.3e}, output_m1 rel={max_mat_rel:.3e}"
+            );
+        }
+    }
+}
+
 fn native_35b_shared_route_cases(
     device: &seismic::Device,
     row_counts: &[usize],
