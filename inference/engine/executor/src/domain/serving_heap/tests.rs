@@ -798,3 +798,57 @@ fn two_row_pricing_scales_verify_overhead_with_depth_instead_of_collapsing_to_fr
         other => panic!("expected BuiltForm::Verify, got {other:?}"),
     }
 }
+
+/// A freshly retained KV prefix (`hits == 0`) has already paid its prefill cost
+/// and must receive a non-zero recompute value (`hits.max(1)`), so memory relief
+/// evicts lower-value `Bank` cache before touching the active conversation's
+/// prefix cache.
+#[test]
+fn freshly_retained_zero_hit_prefix_is_valued_ahead_of_lower_value_bank_slot() {
+    use crate::domain::fixtures::{misses_at, price_growth};
+    use crate::memory::ledger::{CacheKind, Frees, Relief, ReliefBoundary};
+
+    for backend in bank_backends() {
+        let (mut domain, mut bindings) = banked(backend, 4, 4);
+        let row = bank_row(&domain);
+        let ledger = domain.resources.ledgers().device().clone();
+        let start = Instant::now();
+        read(&ledger, start + Duration::from_millis(100));
+        read(&ledger, start + Duration::from_millis(200));
+
+        // Price both the bank's decode savings and the load's prefill rate,
+        // and record one decode step so the bank has a positive (non-zero) value.
+        price_growth(&mut domain, &mut bindings, misses_at(2, 10));
+        domain.served_round(true);
+
+        // Hold a freshly retained prefix in `state_slabs` (`CacheKind::Prefix`).
+        let prefix_bytes = domain.retained_entry_bytes();
+        assert!(prefix_bytes > 0, "{backend:?}: retained prefix entry has non-zero bytes");
+        ledger.change(|_| domain.state_slabs.settle(&ledger, prefix_bytes, prefix_bytes, 0, 0));
+        assert_eq!(ledger.estimate().cache_of(CacheKind::Prefix), prefix_bytes, "{backend:?}");
+
+        // Value caches with a freshly retained prefix (`hits == 0`).
+        domain.value_cache(Some((10_000, 0))).unwrap();
+
+        // Relief past cheaper cache (Spare/GraphSlots) by half a bank slot must
+        // take from the lower-value Bank and leave the zero-hit Prefix untouched.
+        let bank_before = ledger.estimate().cache_of(CacheKind::Bank);
+        assert!(bank_before >= row, "{backend:?}: bank holds cache above floor");
+        let need = cheaper_than_the_bank(&ledger) + row / 2;
+        let plan = ledger
+            .plan_relief(need, Relief::CacheOnly, Frees::Room)
+            .expect("cache covers the relief");
+        ledger.change(|keeping| ledger.execute(&keeping.claims(), plan, ReliefBoundary::Idle));
+
+        assert_eq!(
+            ledger.estimate().cache_of(CacheKind::Prefix),
+            prefix_bytes,
+            "{backend:?}: freshly retained zero-hit prefix must not be evicted before lower-value bank"
+        );
+        assert_eq!(domain.prefix_owed(), 0, "{backend:?}: prefix owes nothing");
+        assert!(
+            ledger.estimate().cache_of(CacheKind::Bank) < bank_before,
+            "{backend:?}: lower-value bank yields before freshly retained prefix"
+        );
+    }
+}

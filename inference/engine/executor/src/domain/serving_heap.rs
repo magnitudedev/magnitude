@@ -634,7 +634,8 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
     ///   the decode's price, over the decode steps served (`ElasticBank::value`);
     /// - the retained prefixes: the prefill of the tokens the entry worth
     ///   least saves, at the prefill rate the load's step prices, over its
-    ///   hits, `prefix` (its holder's figures: saved tokens and hits);
+    ///   hits (at least 1, since a freshly retained prefix has already paid
+    ///   its prefill), `prefix` (its holder's figures: saved tokens and hits);
     /// - an idle drafter or projector: the read of its weights a use would
     ///   pay again, along the model store's read line, over its uses.
     /// A kind whose figures are not priced yet keeps the ledger's value of a
@@ -685,7 +686,7 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
             };
             if let Some(rates) = rates {
                 let seconds = tokens as f64 / rates.prefill_tokens_per_s;
-                self.state_slabs.value_prefix(Value::recompute(seconds, hits, bytes));
+                self.state_slabs.value_prefix(Value::recompute(seconds, hits.max(1), bytes));
             }
         }
         if let Some(read) = self.expert_measures().and_then(|measures| measures.read.measured().copied()) {
