@@ -47,8 +47,8 @@ const failureMessage = (failure: Option.Option<SignInError>) => {
   if (value?._tag === "SignInThrottled") return { title: "Too many attempts", description: `Wait ${value.retryAfterSeconds === 1 ? "a second" : `${value.retryAfterSeconds} seconds`}, then try again.` }
   if (value?._tag !== "SignInRefused") return { title: "Can’t reach Magnitude", description: "Check that Magnitude is running on that computer and that this device can reach it." }
   switch (value.reason) {
-    case "WrongKey": return { title: "That key didn’t work", description: "Copy the key again from Settings → Network access on the computer running Magnitude. On a server, it is network.apiKey in ~/.magnitude/config.json." }
-    case "NoKey": return { title: "No key is set", description: "On the computer running Magnitude, open Settings → Network access and choose Regenerate to create one." }
+    case "WrongKey": return { title: "That key didn’t work", description: "Check docker logs or MAGNITUDE_NETWORK_KEY, or read network.apiKey in /data/.magnitude/config.json." }
+    case "NoKey": return { title: "No key is set", description: "Set MAGNITUDE_NETWORK_KEY or restart the container to generate a key." }
     case "NetworkAccessOff": return { title: "Network access is off", description: "Turn on Network access in Settings on the computer running Magnitude." }
     case "CrossOrigin": return { title: "Couldn’t sign in", description: "Open Magnitude using its own address, then try again." }
   }
@@ -67,12 +67,12 @@ export function SignIn({ origin, keyConfigured, onSignedIn }: { origin: string; 
       <form className="rounded-lg border border-slate-300 bg-white p-6 dark:border-slate-750 dark:bg-slate-850" onSubmit={event => { event.preventDefault(); if (key.trim()) submit(key.trim()) }}>
         <h1 className="font-heading text-xl font-semibold tracking-tight">Sign in</h1>
         {keyConfigured ? <>
-          <p className="mt-2 text-sm text-slate-500">Enter the Network access key from Settings on the computer running Magnitude. For a Docker container, it’s in <code className="font-mono">docker logs</code> or the <code className="font-mono">MAGNITUDE_NETWORK_KEY</code> you set.</p>
+          <p className="mt-2 text-sm text-slate-500">Enter the container’s network key from <code className="font-mono">docker logs</code> or the <code className="font-mono">MAGNITUDE_NETWORK_KEY</code> you set.</p>
           <label className="mt-5 block text-sm font-medium" htmlFor="network-access-key">Network access key</label>
           <Input id="network-access-key" type="password" autoComplete="current-password" autoFocus spellCheck={false} value={key} onChange={event => setKey(event.target.value)} className="mt-1.5 font-mono" />
           {error && <ErrorNotice className="mt-4" title={error.title} description={error.description} />}
           <Button type="submit" className="mt-5 w-full" disabled={!key.trim() || result.waiting}>Sign in</Button>
-        </> : <ErrorNotice className="mt-4" title="No key is set" description="On the computer running Magnitude, open Settings → Network access and choose Regenerate to create one, then reload this page." />}
+        </> : <ErrorNotice className="mt-4" title="No key is set" description="Set MAGNITUDE_NETWORK_KEY or restart the container to generate a key, then reload this page." />}
       </form>
     </div>
   </main>

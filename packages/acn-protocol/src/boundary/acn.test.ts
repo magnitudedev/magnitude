@@ -4,7 +4,7 @@ import { RpcSchema, Rpc as RpcDefinition } from "@effect/rpc"
 import { rpcGroup, type TreeRpcs } from "../rpc-tree"
 import type * as Rpc from "@effect/rpc/Rpc"
 import { AcnRpcRecoveryPolicyTag } from "../transport/recovery"
-import { AcnRpcGroup, MagnitudeRpcs } from "./acn"
+import { AcnRpcGroup, MagnitudeRpcs, RemoteAcnRpcGroup } from "./acn"
 import { Connection } from "./connection"
 import { Configuration } from "./configuration"
 
@@ -39,6 +39,33 @@ describe("ACN boundary lifecycle policy", () => {
       "WatchChat",
       "WatchHarnessConnections",
     ])
+  })
+
+  it("keeps RemoteAcnRpcGroup a strict subset of AcnRpcGroup excluding loopback-only operations", () => {
+    const localTags = new Set(AcnRpcGroup.requests.keys())
+    const remoteTags = new Set(RemoteAcnRpcGroup.requests.keys())
+    for (const tag of remoteTags) {
+      expect(localTags.has(tag)).toBe(true)
+    }
+    for (const loopbackOnly of [
+      "SetNetworkAccess",
+      "RegenerateNetworkApiKey",
+      "WatchHarnessConnections",
+      "ConnectHarness",
+      "SyncHarnessConnections",
+      "DisconnectHarness",
+      "StartHuggingFaceSignIn",
+      "GetServiceActivity",
+      "DownloadApplicationUpdate",
+      "DiscardApplicationUpdate",
+      "InstallApplicationUpdate",
+      "SetApplicationAutoDownload",
+      "SetLaunchAtLogin",
+      "QuitApplication",
+    ]) {
+      expect(localTags.has(loopbackOnly)).toBe(true)
+      expect(remoteTags.has(loopbackOnly)).toBe(false)
+    }
   })
 
   it("rejects duplicate tags and malformed namespaces", () => {

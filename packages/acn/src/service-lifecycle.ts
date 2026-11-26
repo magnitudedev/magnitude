@@ -19,6 +19,11 @@ export type AcnRpcApplication = Effect.Effect<
   HttpServerRequest.HttpServerRequest | Scope.Scope
 >
 
+export interface AcnRpcEndpoints {
+  readonly local: AcnRpcApplication
+  readonly remote: Option.Option<AcnRpcApplication>
+}
+
 export interface AcnStopRequest {
   readonly reason: AcnStoppingReason
   readonly detail?: string
@@ -27,13 +32,13 @@ export interface AcnStopRequest {
 
 interface AcnRuntimeState {
   readonly lifecycle: AcnHealthState
-  readonly rpc: Option.Option<AcnRpcApplication>
+  readonly rpc: Option.Option<AcnRpcEndpoints>
 }
 
 export interface AcnServiceLifecycleApi {
   readonly changes: Stream.Stream<AcnHealthState>
   readonly state: Effect.Effect<AcnHealthState>
-  readonly dispatchRpc: AcnRpcApplication
+  readonly dispatchRpc: (scope: "Local" | "Remote") => AcnRpcApplication
   readonly reportStarting: (
     activity: AcnStartupActivity,
     progress: Option.Option<AcnStartupProgress>,
@@ -41,7 +46,7 @@ export interface AcnServiceLifecycleApi {
   /** Keeps the current activity and progress while a failed startup step waits to run again. */
   readonly reportRetrying: (retry: AcnStartupRetry) => Effect.Effect<void>
   readonly becomeReady: (
-    rpc: AcnRpcApplication,
+    rpc: AcnRpcEndpoints,
     machine: Option.Option<{ readonly hardware: HardwareSnapshot; readonly instances: ModelInstancesSnapshot }>,
   ) => Effect.Effect<void>
   readonly beginStopping: (request: AcnStopRequest) => Effect.Effect<boolean>
@@ -61,6 +66,11 @@ const unavailable = (state: AcnHealthState) =>
       headers: { "retry-after": "1" },
     },
   )
+
+const remoteForbidden = HttpServerResponse.text(
+  "Magnitude application control is available only on this computer. Use an SSH tunnel to open Magnitude from another device.",
+  { status: 403 },
+)
 
 export const makeAcnServiceLifecycle = (): Effect.Effect<AcnServiceLifecycleApi, never, Scope.Scope> =>
   Effect.gen(function* () {
@@ -167,12 +177,17 @@ export const makeAcnServiceLifecycle = (): Effect.Effect<AcnServiceLifecycleApi,
     return AcnServiceLifecycle.of({
       state,
       changes: runtime.changes.pipe(Stream.map(value => value.lifecycle)),
-      dispatchRpc: SubscriptionRef.get(runtime).pipe(
-        Effect.flatMap((current) =>
-          current.lifecycle._tag === "Ready" && Option.isSome(current.rpc)
-            ? current.rpc.value
-            : Effect.succeed(unavailable(current.lifecycle)),
-        ),
+      dispatchRpc: (scope) => SubscriptionRef.get(runtime).pipe(
+        Effect.flatMap((current) => {
+          if (current.lifecycle._tag !== "Ready" || Option.isNone(current.rpc)) {
+            return Effect.succeed(unavailable(current.lifecycle))
+          }
+          if (scope === "Local") return current.rpc.value.local
+          return Option.match(current.rpc.value.remote, {
+            onNone: () => Effect.succeed(remoteForbidden),
+            onSome: (remoteRpc) => remoteRpc,
+          })
+        }),
       ),
       reportStarting,
       reportRetrying,

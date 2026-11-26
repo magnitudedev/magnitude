@@ -42,11 +42,12 @@ export const renderServerReach = (reach: ServerReach): readonly string[] => {
   const lines = [`On this computer:   ${reach.endpoint}`]
   const addresses = network?.enabled ? network.interfaces.filter(entry => entry.kind !== "virtual") : []
   if (network?.enabled && addresses.length > 0) {
-    lines.push("From other devices: open one of these in a browser; it asks for the network access key.")
-    for (const entry of addresses) lines.push(`  http://${host(entry.address)}:${network.port}${entry.kind === "tailscale" ? "  (Tailscale)" : ""}`)
-    lines.push(`Apps and agents:    http://${host(addresses[0]!.address)}:${network.port}/inference/v1`)
+    lines.push("From other devices (inference API, send the network access key as a Bearer token):")
+    for (const entry of addresses) lines.push(`  http://${host(entry.address)}:${network.port}/inference/v1${entry.kind === "tailscale" ? "  (Tailscale)" : ""}`)
+    lines.push(`Browser app from another device: ${sshTunnel(reach.endpoint)}`)
   } else if (network?.enabled) {
-    lines.push(`From other devices: http://<this machine>:${network.port}; the browser app asks for the network access key.`)
+    lines.push(`From other devices: http://<this machine>:${network.port}/inference/v1 (send the network access key as a Bearer token).`)
+    lines.push(`Browser app from another device: ${sshTunnel(reach.endpoint)}`)
   } else {
     lines.push(
       "Only this computer can reach it. To use it from other devices, turn on network access in the browser app",

@@ -128,7 +128,7 @@ For AMD and Intel GPUs, replace the `deploy` block with `devices: ["/dev/dri:/de
 
 ## The network key
 
-In a container, network access is on by default: Magnitude listens on all of the container's interfaces and requires a key from every caller outside the container. Requests through a published port count as coming from another device.
+In a container, network access is on by default: Magnitude listens on all of the container's interfaces and requires a key from every caller outside the container. Requests through a published port count as coming from another device. In Docker, this key authorizes both inference requests and signing in to the container's browser app at `:10100` (so bind `-p 127.0.0.1:10100:10100` if only the host should reach the container).
 
 - **Let Magnitude make one:** as in [Run it](#run-it), the first start generates a key, saves it in the volume, and prints it once in `docker logs magnitude`. Recreating the container on the same volume keeps it. Read it again with:
 

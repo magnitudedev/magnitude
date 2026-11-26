@@ -5,7 +5,12 @@ export { Connections } from "./connections"
 export { Application } from "./application"
 export { HuggingFace } from "./hugging-face"
 export { Models } from "./models"
-export { MagnitudeRpcs, AcnRpcGroup } from "./acn"
+export {
+  MagnitudeRpcs,
+  AcnRpcGroup,
+  RemoteMagnitudeRpcs,
+  RemoteAcnRpcGroup,
+} from "./acn"
 export {
   rpcGroup,
   namespaceClient,

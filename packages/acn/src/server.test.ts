@@ -121,7 +121,7 @@ describe("ACN public HTTP listener", () => {
         Effect.provideService(RpcServer.Protocol, protocol),
         Effect.forkScoped,
       )
-      yield* lifecycle.becomeReady(rpcRouter.asHttpEffect().pipe(Effect.orDie), Option.none())
+      yield* lifecycle.becomeReady({ local: rpcRouter.asHttpEffect().pipe(Effect.orDie), remote: Option.none() }, Option.none())
 
       expect((yield* http.get(`${origin}/health`)).status).toBe(200)
       expect((yield* rpc(origin, undefined)).status).toBe(409)
@@ -169,22 +169,33 @@ describe("ACN network access", () => {
       yield* installAcnPublicRoutes(publicRouter, lifecycle, { origin: new URL(icnOrigin), clientOptions: { headers: {} } }, remoteAccess)
       const port = yield* listen(publicRouter, 0, "0.0.0.0")
       const rpcRouter = yield* HttpLayerRouter.make
-      yield* lifecycle.becomeReady(rpcRouter.asHttpEffect().pipe(Effect.orDie), Option.none())
+      yield* rpcRouter.add("POST", "/rpc", Effect.succeed(HttpServerResponse.text("local-dispatched")))
+      yield* lifecycle.becomeReady({ local: rpcRouter.asHttpEffect().pipe(Effect.orDie), remote: Option.none() }, Option.none())
       const local = loopbackOrigin(port)
       const remote = `http://${external}:${port}`
       const get = (url: string, headers: Record<string, string> = {}) => http.execute(HttpClientRequest.get(url, { headers }))
-      const rpc = (base: string) => http.execute(HttpClientRequest.post(`${base}/rpc`, { headers: { "x-magnitude-acn-id": ACN_INSTANCE_ID }, body: HttpBody.text("{}\n", "application/ndjson") }))
+      const rpc = (base: string, headers: Record<string, string> = {}) => http.execute(HttpClientRequest.post(`${base}/rpc`, { headers: { "x-magnitude-acn-id": ACN_INSTANCE_ID, ...headers }, body: HttpBody.text("{}\n", "application/ndjson") }))
 
       const localHealth = yield* get(`${local}/health`)
       expect(localHealth.status).toBe(200)
       expect(yield* localHealth.text).toContain('"id"')
       expect((yield* get(`${local}/inference/v1/models`)).status).toBe(200)
-      expect((yield* rpc(local)).status).not.toBe(403)
+      expect((yield* rpc(local)).status).toBe(200)
 
+      // Native network access exposes inference and minimal readiness only; web UI, /auth, and /rpc are 403 remotely.
       const remoteHealth = yield* get(`${remote}/health`)
       expect(remoteHealth.status).toBe(200)
       expect(yield* remoteHealth.text).not.toContain('"id"')
-      expect((yield* rpc(remote)).status).toBe(401)
+      expect((yield* get(`${remote}/`)).status).toBe(403)
+      expect((yield* get(`${remote}/models`)).status).toBe(403)
+      expect((yield* get(`${remote}/auth/session`)).status).toBe(403)
+      expect((yield* http.execute(HttpClientRequest.post(`${remote}/auth/session`, {
+        headers: { origin: remote },
+        body: HttpBody.text(JSON.stringify({ key: "mag-test-key" }), "application/json"),
+      }))).status).toBe(403)
+      expect((yield* http.execute(HttpClientRequest.post(`${remote}/auth/session/end`, { headers: { origin: remote } }))).status).toBe(403)
+      expect((yield* rpc(remote)).status).toBe(403)
+      expect((yield* rpc(remote, { authorization: "Bearer mag-test-key", origin: remote })).status).toBe(403)
       const unauthenticated = yield* get(`${remote}/inference/v1/models`)
       expect(unauthenticated.status).toBe(401)
       expect(unauthenticated.headers["www-authenticate"]).toContain("Bearer")
@@ -197,7 +208,12 @@ describe("ACN network access", () => {
         expect((yield* get(`${remote}${path}`)).status).toBe(401)
       }
       expect((yield* get(`${remote}/INFERENCE/v1/models`, { authorization: "Bearer mag-test-key" })).status).toBe(200)
-      expect((yield* http.execute(HttpClientRequest.post(`${remote}/%72pc`, { headers: { "x-magnitude-acn-id": ACN_INSTANCE_ID }, body: HttpBody.text("{}\n", "application/ndjson") }))).status).toBe(401)
+      for (const rpcPath of ["/%72pc", "/RPC", "//rpc"]) {
+        expect((yield* http.execute(HttpClientRequest.post(`${remote}${rpcPath}`, { headers: { "x-magnitude-acn-id": ACN_INSTANCE_ID }, body: HttpBody.text("{}\n", "application/ndjson") }))).status).toBe(403)
+      }
+      for (const authPath of ["/%61uth/session", "/AUTH/session"]) {
+        expect((yield* get(`${remote}${authPath}`)).status).toBe(403)
+      }
 
       const preflight = yield* http.execute(HttpClientRequest.options(`${remote}/inference/v1/models`, { headers: { origin: "http://localhost:3000" } }))
       expect(preflight.status).toBe(204)
@@ -209,25 +225,64 @@ describe("ACN network access", () => {
       expect((yield* get(`${remote}/health`, { host: "mac.tail1234.ts.net" })).status).toBe(200)
     })).pipe(Effect.provide(Layer.merge(FetchHttpClient.layer, BunContext.layer))))
   })
-  it("admits a browser on another device that signed in with the key, only from its own pages", async () => {
+  it("in container mode, admits a signed-in browser only from its own pages and enforces the remote RPC allowlist", async () => {
     const external = externalAddress()
     if (external === undefined) return
     await Effect.runPromise(Effect.scoped(Effect.gen(function* () {
       const http = yield* HttpClient.HttpClient
       const lifecycle = yield* makeAcnServiceLifecycle()
       const publicRouter = yield* HttpLayerRouter.make
-      const remoteAccess = yield* makeRemoteAccess(network)
-      yield* installAcnHealthRoutes(publicRouter, lifecycle, remoteAccess)
+      const remoteAccess = yield* makeRemoteAccess(network, undefined, true)
+      yield* installAcnHealthRoutes(publicRouter, lifecycle, remoteAccess, true)
       yield* installAcnPublicRoutes(publicRouter, lifecycle, { origin: new URL("http://127.0.0.1:1"), clientOptions: { headers: {} } }, remoteAccess)
       const port = yield* listen(publicRouter, 0, "0.0.0.0")
-      const rpcRouter = yield* HttpLayerRouter.make
-      yield* rpcRouter.add("POST", "/rpc", Effect.succeed(HttpServerResponse.text("dispatched")))
-      yield* lifecycle.becomeReady(rpcRouter.asHttpEffect().pipe(Effect.orDie), Option.none())
+      const AllowedRpc = Rpc.make("Allowed", { success: Schema.String })
+      const LocalOnlyRpc = Rpc.make("LocalOnly", { success: Schema.String })
+      const LocalGroup = RpcGroup.make(AllowedRpc, LocalOnlyRpc)
+      const RemoteGroup = RpcGroup.make(AllowedRpc)
+      let localOnlyCalls = 0
+      const handlers = LocalGroup.toLayer({
+        Allowed: () => Effect.succeed("allowed-ok"),
+        LocalOnly: () => Effect.sync(() => { localOnlyCalls += 1; return "local-only-ok" }),
+      })
+      const localRpcRouter = yield* HttpLayerRouter.make
+      const localProtocol = yield* RpcServer.makeProtocolHttpRouter({ path: "/rpc" }).pipe(
+        Effect.provideService(HttpLayerRouter.HttpRouter, localRpcRouter),
+        Effect.provide(RpcSerialization.layerNdjson),
+      )
+      yield* RpcServer.make(LocalGroup, acnRpcServerOptions).pipe(
+        Effect.provide(handlers),
+        Effect.provideService(RpcServer.Protocol, localProtocol),
+        Effect.forkScoped,
+      )
+      const remoteRpcRouter = yield* HttpLayerRouter.make
+      const remoteProtocol = yield* RpcServer.makeProtocolHttpRouter({ path: "/rpc" }).pipe(
+        Effect.provideService(HttpLayerRouter.HttpRouter, remoteRpcRouter),
+        Effect.provide(RpcSerialization.layerNdjson),
+      )
+      yield* RpcServer.make(RemoteGroup, acnRpcServerOptions).pipe(
+        Effect.provide(handlers),
+        Effect.provideService(RpcServer.Protocol, remoteProtocol),
+        Effect.forkScoped,
+      )
+      yield* lifecycle.becomeReady(
+        {
+          local: localRpcRouter.asHttpEffect().pipe(Effect.orDie),
+          remote: Option.some(remoteRpcRouter.asHttpEffect().pipe(Effect.orDie)),
+        },
+        Option.none(),
+      )
       const local = loopbackOrigin(port)
       const remote = `http://${external}:${port}`
       const send = (method: "GET" | "POST", url: string, headers: Record<string, string> = {}, body?: string) => http.execute(
         (method === "GET" ? HttpClientRequest.get(url, { headers }) : HttpClientRequest.post(url, { headers, body: HttpBody.text(body ?? "{}", "application/json") })))
-      const rpc = (headers: Record<string, string>) => send("POST", `${remote}/rpc`, { "x-magnitude-acn-id": ACN_INSTANCE_ID, ...headers })
+      const rpcCall = (base: string, tag: string, headers: Record<string, string> = {}) => http.execute(
+        HttpClientRequest.post(`${base}/rpc`, {
+          headers: { "x-magnitude-acn-id": ACN_INSTANCE_ID, ...headers },
+          body: HttpBody.text(`${JSON.stringify({ _tag: "Request", id: "1", tag, payload: {}, headers: [] })}\n`, "application/ndjson"),
+        }),
+      )
+      const rpc = (headers: Record<string, string>, tag = "Allowed") => rpcCall(remote, tag, headers)
       const status = (url: string, headers: Record<string, string> = {}) => send("GET", `${url}/auth/session`, headers).pipe(Effect.flatMap(response => response.json))
 
       expect(yield* status(local)).toEqual({ _tag: "Local" })
@@ -251,7 +306,18 @@ describe("ACN network access", () => {
 
       expect(yield* status(remote, { cookie })).toEqual({ _tag: "SignedIn" })
       expect(yield* (yield* send("GET", `${remote}/health`, { cookie })).text).toContain('"id"')
-      expect((yield* rpc({ cookie, origin: remote })).status).toBe(200)
+      const allowedRemote = yield* rpc({ cookie, origin: remote }, "Allowed")
+      expect(allowedRemote.status).toBe(200)
+      expect(yield* allowedRemote.text).toContain("allowed-ok")
+      // Local-only RPCs are never dispatched through the remote RPC server, while loopback still runs them.
+      const blockedRemote = yield* rpc({ cookie, origin: remote }, "LocalOnly")
+      expect(yield* blockedRemote.text).not.toContain("local-only-ok")
+      expect(localOnlyCalls).toBe(0)
+      const allowedLocal = yield* rpcCall(local, "LocalOnly")
+      expect(allowedLocal.status).toBe(200)
+      expect(yield* allowedLocal.text).toContain("local-only-ok")
+      expect(localOnlyCalls).toBe(1)
+
       expect((yield* rpc({ cookie })).status).toBe(403)
       expect((yield* rpc({ cookie, origin: "http://evil.com" })).status).toBe(403)
       expect((yield* rpc({ cookie: "magnitude_session=forged", origin: remote })).status).toBe(401)

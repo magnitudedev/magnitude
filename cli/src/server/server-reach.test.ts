@@ -13,14 +13,14 @@ const reach = (overrides: Partial<ServerReach> = {}): ServerReach => ({
 })
 
 describe("serve ready output", () => {
-  it("lists this computer and every address other devices can use", () => {
+  it("lists this computer and every inference address other devices can use, plus the SSH tunnel for the browser app", () => {
     const output = renderServeReady(reach())
     expect(output).toContain("On this computer:   http://127.0.0.1:10100")
-    expect(output).toContain("  http://192.168.1.5:10100")
-    expect(output).toContain("  http://100.64.0.3:10100  (Tailscale)")
+    expect(output).toContain("  http://192.168.1.5:10100/inference/v1")
+    expect(output).toContain("  http://100.64.0.3:10100/inference/v1  (Tailscale)")
     expect(output).not.toContain("172.17.0.1")
-    expect(output).toContain("asks for the network access key")
-    expect(output).toContain("Apps and agents:    http://192.168.1.5:10100/inference/v1")
+    expect(output).toContain("send the network access key as a Bearer token")
+    expect(output).toContain("ssh -N -L 10100:127.0.0.1:10100")
     expect(output).toContain("Press Ctrl+C to stop.")
   })
   it("explains how to turn network access on with the profile's real config path, and the SSH tunnel", () => {

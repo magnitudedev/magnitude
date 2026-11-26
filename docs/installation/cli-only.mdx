@@ -36,7 +36,7 @@ Without the desktop app, you can still use Magnitude's app in your browser. Whil
 
 ## Serve other computers
 
-Turn on network access with a key, as described in [Network access](/api/network-access#configuration-file). Then open `http://SERVER_IP:10100` in a browser on another computer and sign in with the key to use the app there, or [connect your agent](/api/network-access#configure-the-app-or-agent) with the base URL `http://SERVER_IP:10100/inference/v1` and the key.
+Turn on network access with a key, as described in [Network access](/api/network-access#configuration-file), and [connect your agent](/api/network-access#configure-the-app-or-agent) with the base URL `http://SERVER_IP:10100/inference/v1` and the key. Network access exposes only the inference API; to open the Magnitude browser app from another computer, use an [SSH tunnel](/api/network-access#ssh-tunnel).
 
 If the machine runs a firewall, allow inbound TCP port `10100`: for example `sudo ufw allow 10100/tcp`, or `sudo firewall-cmd --permanent --add-port=10100/tcp && sudo firewall-cmd --reload`. On Windows, from an administrator PowerShell:
 

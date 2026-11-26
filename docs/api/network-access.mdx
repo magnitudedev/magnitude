@@ -3,7 +3,7 @@ title: "Network access"
 description: "Connect to Magnitude over your network or an SSH tunnel."
 ---
 
-By default the API is available only on the computer running Magnitude. Network access makes it available to other devices for inference, and lets you open the Magnitude app in a browser on another device.
+By default the API is available only on the computer running Magnitude. Network access makes the inference API available to other devices on your network. The Magnitude app itself stays local to the computer running Magnitude (or reachable through an [SSH tunnel](#ssh-tunnel)); in [Docker](/installation/docker), the container also serves the browser app with the container's network key.
 
 To set up a dedicated machine that serves other computers, install the [CLI only](/installation/cli-only) on it.
 
@@ -45,11 +45,12 @@ Select that address in Settings or use it as `network.bind`. Use `http://ADDRESS
 
 ## Open the app from another device
 
-With network access on, open `http://ADDRESS:10100` in a browser on the other device, using the same address as the base URL. Sign in with the **API key**. The app works as it does on the server: download and load models, watch usage, and change Settings. In a browser, **Connections** doesn't change any computer's agents itself: each agent has **Copy setup prompt**, which you paste into that agent, or any coding agent, on the computer you're using.
+On a computer running Magnitude directly, network access exposes only the inference endpoints (`/inference/v1` and `/inference/anthropic`), not the browser app or application control. To open the Magnitude app from another computer, use an [SSH tunnel](#ssh-tunnel).
 
-- A browser stays signed in until it goes 30 days unused. **Settings → About → Sign out** ends it sooner.
-- Browsers stay signed in when Magnitude restarts or updates. Changes to network settings apply when Magnitude restarts, so a regenerated key takes effect then and signs every browser out.
-- Turning network access off, regenerating the key, changing the address, or restarting from that browser asks first, because it disconnects the browser.
+When Magnitude runs in [Docker](/installation/docker), open `http://ADDRESS:10100` in a browser and sign in with the container's **network key**. In a container, that key authorizes both inference and the container's browser app: download and load models, chat, watch usage, and copy agent setup prompts.
+
+- A signed-in browser stays signed in until it goes 30 days unused. **Settings → About → Sign out** ends it sooner.
+- Browsers stay signed in when the container restarts, and sign out if `MAGNITUDE_NETWORK_KEY` changes.
 - After five wrong keys, each further attempt waits longer, up to one minute.
 
 The connection is plain HTTP. Use it on a network you trust or a private network such as Tailscale, or put an HTTPS reverse proxy in front of Magnitude and add its name to [`network.allowedHosts`](#custom-hostnames).

@@ -48,6 +48,9 @@ const NOT_BUILT = [
 /** The service's own routes; an unmatched path under them is never an app page. */
 const SERVICE_PATHS = ["/inference", "/rpc", "/health", "/auth"]
 
+export const isServicePath = (pathname: string): boolean =>
+  SERVICE_PATHS.some(prefix => pathname === prefix || pathname.startsWith(`${prefix}/`))
+
 /** A URL path as a relative file path, or nothing when it could escape the app's files. */
 export const webAppFilePath = (pathname: string): Option.Option<string> => {
   let decoded: string
@@ -66,7 +69,7 @@ export const webAppFilePath = (pathname: string): Option.Option<string> => {
 export const serveWebApp = (source: WebAppSource, fs: FileSystem.FileSystem): Effect.Effect<HttpServerResponse.HttpServerResponse, never, HttpServerRequest.HttpServerRequest> => Effect.gen(function* () {
   const request = yield* HttpServerRequest.HttpServerRequest
   const pathname = new URL(request.url, "http://localhost").pathname
-  if (SERVICE_PATHS.some(prefix => pathname === prefix || pathname.startsWith(`${prefix}/`))) return HttpServerResponse.text("Not found", { status: 404 })
+  if (isServicePath(pathname)) return HttpServerResponse.text("Not found", { status: 404 })
   if (source._tag === "Missing") return HttpServerResponse.text(NOT_BUILT, { status: 503 })
   const relative = webAppFilePath(pathname)
   if (Option.isNone(relative)) return HttpServerResponse.text("Not found", { status: 404 })

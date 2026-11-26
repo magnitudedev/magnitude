@@ -30,12 +30,13 @@ interface Throttle {
 }
 
 /**
- * Remote browser sessions, keyed by a digest of their token. They outlive a restart through the
- * session store, which drops them when the key changes, so regenerating the key still signs every
- * browser out once it applies.
+ * Remote browser sessions, keyed by a digest of their token. Only container installations
+ * (`allowRemoteApp: true`) admit remote browser sign-ins; native installations expose inference
+ * only over the network and keep the app and `/rpc` loopback-only.
  */
 export interface RemoteAccessApi {
   readonly network: NetworkAccess
+  readonly allowRemoteApp: boolean
   readonly access: (request: HttpServerRequest.HttpServerRequest) => Effect.Effect<CallerAccess>
   readonly signIn: (address: string, key: string) => Effect.Effect<string, SignInFailure>
   readonly signOut: (token: Option.Option<string>) => Effect.Effect<void>
@@ -106,9 +107,16 @@ export const fileSessionStore = (path: string, network: NetworkAccess) => Effect
   } satisfies RemoteSessionStore
 })
 
-export const makeRemoteAccess = (network: NetworkAccess, store: RemoteSessionStore = memorySessionStore) => Effect.gen(function* () {
+export const makeRemoteAccess = (
+  network: NetworkAccess,
+  store: RemoteSessionStore = memorySessionStore,
+  allowRemoteApp = false,
+) => Effect.gen(function* () {
   const started = yield* Clock.currentTimeMillis
-  const sessions = yield* Ref.make(new Map([...yield* store.load].filter(([, lastUsed]) => started - lastUsed <= Duration.toMillis(SESSION_IDLE_LIMIT))))
+  const initialSessions = allowRemoteApp
+    ? new Map([...yield* store.load].filter(([, lastUsed]) => started - lastUsed <= Duration.toMillis(SESSION_IDLE_LIMIT)))
+    : new Map<string, number>()
+  const sessions = yield* Ref.make(initialSessions)
   const savedAt = yield* Ref.make(started)
   const throttles = yield* Ref.make(new Map<string, Throttle>())
   const save = Effect.gen(function* () {
@@ -117,7 +125,7 @@ export const makeRemoteAccess = (network: NetworkAccess, store: RemoteSessionSto
   })
 
   const verify = (token: Option.Option<string>) => Effect.gen(function* () {
-    if (Option.isNone(token)) return false
+    if (!allowRemoteApp || Option.isNone(token)) return false
     const key = digest(token.value)
     const now = yield* Clock.currentTimeMillis
     const valid = yield* Ref.modify(sessions, current => {
@@ -147,10 +155,12 @@ export const makeRemoteAccess = (network: NetworkAccess, store: RemoteSessionSto
 
   return {
     network,
+    allowRemoteApp,
     access: request => isLocalCaller(request, network) ? Effect.succeed("Local" as const)
+      : !allowRemoteApp ? Effect.succeed("Anonymous" as const)
       : verify(sessionToken(request)).pipe(Effect.map(valid => valid ? "SignedIn" as const : "Anonymous" as const)),
     signIn: (address, key) => Effect.gen(function* () {
-      if (!network.enabled) return yield* new SignInRefused({ reason: "NetworkAccessOff" })
+      if (!allowRemoteApp || !network.enabled) return yield* new SignInRefused({ reason: "NetworkAccessOff" })
       if (Option.isNone(network.apiKey)) return yield* new SignInRefused({ reason: "NoKey" })
       const now = yield* Clock.currentTimeMillis
       const throttle = (yield* Ref.get(throttles)).get(address)
@@ -199,10 +209,16 @@ const encodeStatus = Schema.encodeSync(RemoteAccessStatus)
 const encodeFailure = Schema.encodeSync(SignInFailure)
 const decodeSignIn = Schema.decodeUnknown(SignInRequest)
 
+const REMOTE_APP_LOCAL_ONLY_MESSAGE =
+  "The Magnitude app is available only on the computer running Magnitude, or through an SSH tunnel."
+
 /** `GET` reports how this caller is admitted, `POST` signs in with the key, and `/end` signs out. */
 export const installRemoteAccessRoutes = (router: HttpLayerRouter.HttpRouter, remote: RemoteAccessApi) => Effect.gen(function* () {
   yield* router.add("GET", REMOTE_ACCESS_SESSION_PATH, Effect.gen(function* () {
     const request = yield* HttpServerRequest.HttpServerRequest
+    if (!isLocalCaller(request, remote.network) && !remote.allowRemoteApp) {
+      return HttpServerResponse.text(REMOTE_APP_LOCAL_ONLY_MESSAGE, { status: 403 })
+    }
     const access = yield* remote.access(request)
     const status: RemoteAccessStatus = access === "Local" ? { _tag: "Local" }
       : access === "SignedIn" ? { _tag: "SignedIn" }
@@ -215,6 +231,9 @@ export const installRemoteAccessRoutes = (router: HttpLayerRouter.HttpRouter, re
   yield* router.add("POST", REMOTE_ACCESS_SESSION_PATH, Effect.gen(function* () {
     const request = yield* HttpServerRequest.HttpServerRequest
     if (isLocalCaller(request, remote.network)) return HttpServerResponse.empty({ status: 204 })
+    if (!remote.allowRemoteApp) {
+      return HttpServerResponse.text(REMOTE_APP_LOCAL_ONLY_MESSAGE, { status: 403 })
+    }
     const result = yield* Effect.gen(function* () {
       if (!isSameOrigin(request)) return yield* new SignInRefused({ reason: "CrossOrigin" })
       const body = yield* request.json.pipe(Effect.flatMap(decodeSignIn), Effect.orElseFail(() => new SignInRefused({ reason: "WrongKey" })))
@@ -231,7 +250,9 @@ export const installRemoteAccessRoutes = (router: HttpLayerRouter.HttpRouter, re
   }))
   yield* router.add("POST", REMOTE_ACCESS_SIGN_OUT_PATH, Effect.gen(function* () {
     const request = yield* HttpServerRequest.HttpServerRequest
-    if (!isLocalCaller(request, remote.network) && !isSameOrigin(request)) return HttpServerResponse.empty({ status: 403 })
+    if (!isLocalCaller(request, remote.network) && (!remote.allowRemoteApp || !isSameOrigin(request))) {
+      return HttpServerResponse.empty({ status: 403 })
+    }
     yield* remote.signOut(sessionToken(request))
     return withSessionCookie(HttpServerResponse.empty({ status: 204 }), request, "", Duration.zero)
   }))

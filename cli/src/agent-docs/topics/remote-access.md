@@ -23,7 +23,7 @@ Enable Network access in Magnitude Settings, or set `network.enabled`, `network.
 }
 ```
 
-For `bind`, use an IP address assigned to the server, or omit it to serve every interface. Use a long, randomly generated key. Restart Magnitude after changes. The address can be on a local network or a private network such as Tailscale. Send the key as `Authorization: Bearer KEY` or `x-api-key: KEY`. A person can also open `http://ADDRESS:10100` in a browser on another device and sign in with the same key to use the Magnitude app there; that browser session never authorizes inference requests, and `/rpc` refuses other devices that have not signed in.
+For `bind`, use an IP address assigned to the server, or omit it to serve every interface. Use a long, randomly generated key. Restart Magnitude after changes. The address can be on a local network or a private network such as Tailscale. Send the key as `Authorization: Bearer KEY` or `x-api-key: KEY`. On native installs, network access exposes only the inference endpoints (`/inference/v1` and `/inference/anthropic`); the browser app and `/rpc` stay loopback-only (open the app remotely through an SSH tunnel). In Docker containers, the network key also signs in to the container's browser app at `:10100`.
 
 Check the connection:
 

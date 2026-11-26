@@ -55,6 +55,7 @@ import type { JsonLineChannelFailed } from "@magnitudedev/utils/json-line-channe
 import {
   MagnitudeHealthResponseSchema,
   AcnRpcGroup,
+  RemoteAcnRpcGroup,
 } from "@magnitudedev/acn-protocol"
 import { IcnHardware, IcnInstances, IcnProcess, makeIcnProvider, ReleaseIcnInstallationError } from "@magnitudedev/icn"
 import { AcnBoundaryLive } from "./boundary/acn"
@@ -99,8 +100,8 @@ import { AcnHost, ServerSettingsLive, type AcnHostApi } from "./server-settings"
 import { containerNetworkConfig, readContainerInstallation, type ContainerInstallation } from "./container"
 import { AcnHarnessConnectionsLive } from "./harness-connections"
 import { AcnOwner } from "./application-owner"
-import { resolveWebAppSource, serveWebApp } from "./web-app"
-import { fileSessionStore, installRemoteAccessRoutes, isSameOrigin, makeRemoteAccess, REMOTE_SESSIONS_FILE, type RemoteAccessApi } from "./remote-access"
+import { isServicePath, resolveWebAppSource, serveWebApp } from "./web-app"
+import { fileSessionStore, installRemoteAccessRoutes, isLocalCaller, isSameOrigin, makeRemoteAccess, memorySessionStore, REMOTE_SESSIONS_FILE, type RemoteAccessApi } from "./remote-access"
 import { AcnChangesLive } from "./changes"
 import { AcnSubscriptions, AcnSubscriptionsLive } from "./acn-subscriptions"
 import { makeAcnSubscriptionProtocol } from "./acn-subscription-protocol"
@@ -625,6 +626,17 @@ const ROOT_BODY = [
   "",
 ].join("\n")
 
+const REMOTE_WEB_APP_FORBIDDEN_BODY = [
+  "Magnitude inference service.",
+  "",
+  "OpenAI-compatible API:     /inference/v1",
+  "Anthropic-compatible API:  /inference/anthropic",
+  "",
+  "The Magnitude app is available only on the computer running Magnitude, or through an SSH tunnel.",
+  "Documentation: https://docs.magnitude.dev/api/network-access",
+  "",
+].join("\n")
+
 const invalidHostMessage = (network: NetworkAccess, container: boolean) => network.enabled
   ? `Invalid Host header. Magnitude accepts local names, IP addresses, host.docker.internal, *.ts.net, and names listed under network.allowedHosts in config.json${container ? ", and any name from a request that sends the network access key" : ""}.`
   : "Invalid Host header. Network access is off; turn it on in Magnitude Settings to reach this service from other devices."
@@ -646,10 +658,20 @@ export const installAcnHealthRoutes = (
   }))
   yield* router.add("OPTIONS", "/*", OptionsRouteHandler)
   // The browser app is served even while the service starts, so it can show that state.
+  // On native installations, network access exposes inference only; remote callers cannot load the app.
   const fs = yield* FileSystem.FileSystem
   const webApp = yield* resolveWebAppSource
-  yield* router.add("GET", "/", serveWebApp(webApp, fs))
-  yield* router.add("GET", "/*", serveWebApp(webApp, fs))
+  const webAppRoute = Effect.gen(function* () {
+    const request = yield* HttpServerRequest.HttpServerRequest
+    if (!isLocalCaller(request, network) && !remote.allowRemoteApp) {
+      const pathname = new URL(request.url, "http://localhost").pathname
+      if (isServicePath(pathname)) return HttpServerResponse.text("Not found", { status: 404 })
+      return HttpServerResponse.text(REMOTE_WEB_APP_FORBIDDEN_BODY, { status: 403 })
+    }
+    return yield* serveWebApp(webApp, fs)
+  })
+  yield* router.add("GET", "/", webAppRoute)
+  yield* router.add("GET", "/*", webAppRoute)
   yield* router.add("GET", "/inference", Effect.succeed(HttpServerResponse.text(ROOT_BODY)))
   yield* installRemoteAccessRoutes(router, remote)
   yield* router.add("GET", "/health", Effect.gen(function* () {
@@ -677,16 +699,26 @@ export const installAcnPublicRoutes = (
   const network = remote.network
   yield* router.add("POST", "/rpc", Effect.gen(function* () {
     const request = yield* HttpServerRequest.HttpServerRequest
-    // Application control from another device needs a signed-in browser on a page this service served.
     const access = yield* remote.access(request)
+    if (access === "Local") {
+      return request.headers["x-magnitude-acn-id"] === ACN_INSTANCE_ID
+        ? yield* lifecycle.dispatchRpc("Local")
+        : HttpServerResponse.empty({ status: 409 })
+    }
+    if (!remote.allowRemoteApp) {
+      return HttpServerResponse.text(
+        "Magnitude application control is available only on this computer. Use an SSH tunnel to open Magnitude from another device.",
+        { status: 403 },
+      )
+    }
     if (access === "Anonymous") {
       return HttpServerResponse.text("Sign in to Magnitude with the Network access key to control it from another device.", { status: 401 })
     }
-    if (access === "SignedIn" && !isSameOrigin(request)) {
+    if (!isSameOrigin(request)) {
       return HttpServerResponse.text("Magnitude application control accepts requests only from its own pages.", { status: 403 })
     }
     return request.headers["x-magnitude-acn-id"] === ACN_INSTANCE_ID
-      ? yield* lifecycle.dispatchRpc
+      ? yield* lifecycle.dispatchRpc("Remote")
       : HttpServerResponse.empty({ status: 409 })
   }))
   yield* router.prefixed("/inference/v1/proxies/codex").add(
@@ -737,6 +769,7 @@ export const launchAcnServer = (options: AcnServerOptions, owner: AcnOwnerContro
     ))
     yield* Effect.addFinalizer(() => closeApplicationScope)
     const container = yield* readContainerInstallation().pipe(Effect.provide(BunFileSystem.layer))
+    const inContainer = Option.isSome(container)
     const network = yield* readNetworkAccess(dataDir, container).pipe(Effect.provide(BunFileSystem.layer))
     // Loopback always listens; all-interfaces subsumes it, any other address is added beside it.
     const primaryBind = network.bind === ALL_INTERFACES_BIND ? yield* allInterfacesListenAddress : "127.0.0.1"
@@ -746,9 +779,13 @@ export const launchAcnServer = (options: AcnServerOptions, owner: AcnOwnerContro
     )
     const router = Context.get(infrastructure, HttpLayerRouter.HttpRouter)
     const server = Context.get(infrastructure, HttpServer.HttpServer)
-    const sessions = yield* fileSessionStore(join(dataDir, REMOTE_SESSIONS_FILE), network).pipe(Effect.provideService(FileSystem.FileSystem, Context.get(infrastructure, FileSystem.FileSystem)))
-    const remote = yield* makeRemoteAccess(network, sessions)
-    yield* installAcnHealthRoutes(router, lifecycle, remote, Option.isSome(container)).pipe(Effect.provideService(FileSystem.FileSystem, Context.get(infrastructure, FileSystem.FileSystem)))
+    const sessions = inContainer
+      ? yield* fileSessionStore(join(dataDir, REMOTE_SESSIONS_FILE), network).pipe(
+          Effect.provideService(FileSystem.FileSystem, Context.get(infrastructure, FileSystem.FileSystem)),
+        )
+      : memorySessionStore
+    const remote = yield* makeRemoteAccess(network, sessions, inContainer)
+    yield* installAcnHealthRoutes(router, lifecycle, remote, inContainer).pipe(Effect.provideService(FileSystem.FileSystem, Context.get(infrastructure, FileSystem.FileSystem)))
     yield* server.serve(router.asHttpEffect()).pipe(Effect.provide(infrastructure))
     if (network.enabled && network.bind !== ALL_INTERFACES_BIND && network.bind !== primaryBind) {
       const additional = yield* Layer.buildWithScope(BunHttpServer.layer({
@@ -787,19 +824,38 @@ export const launchAcnServer = (options: AcnServerOptions, owner: AcnOwnerContro
         Effect.provide(serviceContext),
       )
       const applicationContext = Context.merge(serviceContext, handlers)
-      const rpcRouter = yield* HttpLayerRouter.make
-      const rawProtocol = yield* RpcServer.makeProtocolHttpRouter({ path: "/rpc" }).pipe(
-        Effect.provideService(HttpLayerRouter.HttpRouter, rpcRouter),
+      const localRpcRouter = yield* HttpLayerRouter.make
+      const localRawProtocol = yield* RpcServer.makeProtocolHttpRouter({ path: "/rpc" }).pipe(
+        Effect.provideService(HttpLayerRouter.HttpRouter, localRpcRouter),
         Effect.provide(infrastructure),
       )
-      const protocol = yield* makeAcnSubscriptionProtocol(rawProtocol).pipe(
+      const localProtocol = yield* makeAcnSubscriptionProtocol(localRawProtocol).pipe(
         Effect.provide(applicationContext),
       )
       yield* RpcServer.make(AcnRpcGroup, acnRpcServerOptions).pipe(
-        Effect.provideService(RpcServer.Protocol, protocol),
+        Effect.provideService(RpcServer.Protocol, localProtocol),
         Effect.provide(applicationContext),
         Effect.forkIn(applicationScope),
       )
+      // Container browser sessions get a separate RpcServer built strictly from RemoteAcnRpcGroup.
+      const remoteRpc = inContainer
+        ? yield* Effect.gen(function* () {
+            const remoteRpcRouter = yield* HttpLayerRouter.make
+            const remoteRawProtocol = yield* RpcServer.makeProtocolHttpRouter({ path: "/rpc" }).pipe(
+              Effect.provideService(HttpLayerRouter.HttpRouter, remoteRpcRouter),
+              Effect.provide(infrastructure),
+            )
+            const remoteProtocol = yield* makeAcnSubscriptionProtocol(remoteRawProtocol).pipe(
+              Effect.provide(applicationContext),
+            )
+            yield* RpcServer.make(RemoteAcnRpcGroup, acnRpcServerOptions).pipe(
+              Effect.provideService(RpcServer.Protocol, remoteProtocol),
+              Effect.provide(applicationContext),
+              Effect.forkIn(applicationScope),
+            )
+            return Option.some(remoteRpcRouter.asHttpEffect().pipe(Effect.orDie))
+          })
+        : Option.none()
       const icn = Context.get(applicationContext, IcnProcess)
       const usage = Context.get(applicationContext, ServingUsage)
       yield* installAcnPublicRoutes(router, lifecycle, icn, remote, makeUsageFetch(icn.origin, usage), usage,
@@ -809,8 +865,13 @@ export const launchAcnServer = (options: AcnServerOptions, owner: AcnOwnerContro
         Effect.catchAll(() => Effect.succeed(Option.none())),
       )
       const instances = yield* Context.get(applicationContext, IcnInstances).get
-      yield* lifecycle.becomeReady(rpcRouter.asHttpEffect().pipe(Effect.orDie),
-        Option.map(hardware, snapshot => ({ hardware: snapshot, instances })))
+      yield* lifecycle.becomeReady(
+        {
+          local: localRpcRouter.asHttpEffect().pipe(Effect.orDie),
+          remote: remoteRpc,
+        },
+        Option.map(hardware, snapshot => ({ hardware: snapshot, instances })),
+      )
       return {
         subscriptions: Context.get(applicationContext, AcnSubscriptions),
         icn,
