@@ -1297,6 +1297,7 @@ struct HistoryDomain {
     row_bytes: u64,
     slab_rows: usize,
     page_rows: usize,
+    window_reservation_rows: Option<usize>,
     /// Row addresses reserved for the domain and sealed into graphs.
     capacity: usize,
     span_limit: usize,
@@ -1692,6 +1693,9 @@ impl StateStore {
                 row_bytes: domain.row_bytes,
                 slab_rows: geometry.slab_rows,
                 page_rows: geometry.page_rows,
+                window_reservation_rows: domain::window_reservation_rows(
+                    domain.kind, geometry.page_rows, context_capacity, max_advance,
+                )?,
                 capacity: domain.logical_rows,
                 span_limit: geometry.span_limit,
                 arena: Rc::new(RefCell::new(Arena::new(
@@ -2696,6 +2700,19 @@ impl SequenceState {
             })
             .collect()
     }
+    /// Free rows to back or keep for a reservation. Unlike a launch queue,
+    /// a reservation can cover the entire prompt; a window prebacks only its
+    /// priced bound. Launch provisioning separately covers tentative rows.
+    pub fn reservation_demands(&self, rows: usize) -> Vec<RowDemand> {
+        let mut demands = self.demands(rows);
+        for demand in &mut demands {
+            if let Some(cap) = self.snapshot.store.domains[demand.domain.0].window_reservation_rows {
+                demand.rows = demand.rows.min(cap);
+            }
+        }
+        demands
+    }
+
     /// The rows this history references in one domain, in logical order:
     /// positions `[history_start(domain), position)` (for Block, blocks
     /// `[history_start(domain), position / rate)`).

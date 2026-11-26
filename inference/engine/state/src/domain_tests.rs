@@ -1101,6 +1101,34 @@ fn a_window_historys_pages_stay_within_its_capped_state_bytes() {
     assert_eq!(state_bytes(&single, context, max_advance, granule, 1, context as u64).unwrap(), cap.div_ceil(slab_rows) as u64 * granule);
 }
 
+#[test]
+fn a_window_history_reservation_releases_excess_slabs() {
+    let (context, window, max_advance) = (4096, 300, 16);
+    let device = cpu_device();
+    let granule = device.pool.granule() as usize;
+    // Use wide rows so the uncapped demand needs more than one slab.
+    let width = (granule / (2 * std::mem::size_of::<f32>() * 256)).max(2);
+    let mut bindings = windowed_store(device, context, window, max_advance, context, width);
+    let store = Rc::clone(&bindings);
+    let state = store.create().unwrap();
+    let raw = state.queued_demands(0, context);
+    let opening = state.reservation_demands(context);
+    let page = store.history_page_rows(WINDOW);
+    let cap = window_pages(page, window + max_advance) * page;
+    let rows = |demands: &[RowDemand], domain| {
+        demands.iter().find(|entry| entry.domain == domain).unwrap().rows
+    };
+    assert!(rows(&raw, WINDOW) > cap);
+    assert_eq!(rows(&opening, WINDOW), cap);
+    assert_eq!(rows(&opening, TOKEN), rows(&raw, TOKEN));
+    bindings.provision(&raw, 0).unwrap();
+    let before = store.backed_slab_bytes();
+    bindings.shrink_by_pool(&NextSteps { rows: opening.clone(), banks: 0 }).unwrap();
+    assert!(store.backed_slab_bytes() < before, "empty window slabs should be released");
+    assert_eq!(bindings.growth_claim(&[], &opening, 0).unwrap().minimum_bytes, 0);
+    assert!(bindings.growth_claim(&[], &raw, 0).unwrap().minimum_bytes > 0);
+}
+
 /// Selected-read (indexed) target domains and draft head domains read earlier
 /// rows of their launch/advance as stored history (`cached_causal_domain`,
 /// `SlotAppends::every_domain`), so their `span_limit` must budget those

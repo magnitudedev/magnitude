@@ -617,11 +617,11 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
             .target
             .as_ref()
             .expect("invariant violated: a reserved request holds no target state")
-            .queued_demands(0, unwritten);
+            .reservation_demands(unwritten);
         let head = self
             .head_store
             .is_some()
-            .then(|| resident.head.as_ref().map(|head| head.queued_demands(0, unwritten)))
+            .then(|| resident.head.as_ref().map(|head| head.reservation_demands(unwritten)))
             .flatten();
         self.grant_state_growth(bindings, false, &[], &target, 0)?;
         if let Some(head) = head {
@@ -1424,7 +1424,7 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
         let mut count = 0usize;
         for (_, resident) in self.resident_requests() {
             if let Some(state) = resident.lane(head) {
-                rows.extend(state.demands(resident.unwritten_rows().max(steps)));
+                rows.extend(state.reservation_demands(resident.unwritten_rows().max(steps)));
                 count += 1;
             }
         }
