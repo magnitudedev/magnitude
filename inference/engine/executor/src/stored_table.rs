@@ -1094,8 +1094,22 @@ impl Shared {
         // A row outside the table fails the step that names it.
         for &row in rows.iter().filter(|row| **row < self.rows && seen.insert(**row)) {
             if let Some(slot) = state.directory.use_slot(row) {
-                state.named[slot as usize] = Named::HELD;
-                hold(&mut state.holds, row, holder);
+                let slot = slot as usize;
+                if state.named[slot].is_held() {
+                    hold(&mut state.holds, row, holder);
+                    continue;
+                }
+                if state.holds.len() + absent.len() + reserve >= slots {
+                    more = false;
+                    break;
+                }
+                // Never overwrite an in-flight GPU step's retention tag with
+                // `Named::HELD`, otherwise `release(holder)` could flip the
+                // slot to `Named::FREE` before the device finishes reading it.
+                if state.named[slot].free(&self.read).unwrap_or(false) {
+                    state.named[slot] = Named::HELD;
+                    hold(&mut state.holds, row, holder);
+                }
                 continue;
             }
             if state.holds.len() + absent.len() + reserve >= slots {
@@ -1219,6 +1233,7 @@ impl Shared {
                     named,
                     slots: held,
                     directory,
+                    holds,
                     ..
                 } = &mut *state;
                 let read = &self.read;
@@ -1236,8 +1251,26 @@ impl Shared {
                 if let Some((slot, _)) = free {
                     break slot;
                 }
-                // Every slot holds a row a step still reads, or a prefetch
-                // holds: wait for the oldest such read.
+                // Speculative prefetch holds (`Named::HELD`) are never read by
+                // an in-flight device step and must never starve a real step
+                // (for example after a table shrink reduces held slots).
+                let kept_live = |slot: usize| {
+                    Ok(claimed.contains(&slot)
+                        || !held.holds(slot)
+                        || named[slot].is_step(step)
+                        || (!named[slot].is_held() && !named[slot].free(read)?))
+                };
+                let reclaimed = directory
+                    .try_free(kept_live)
+                    .map_err(|error: seismic::ExecutionError| format!("the stored table's reads: {error}"))?;
+                if let Some((slot, evicted_row)) = reclaimed {
+                    if let Some(row) = evicted_row {
+                        holds.remove(&row);
+                    }
+                    break slot;
+                }
+                // Every remaining slot holds a row a step still reads: wait for
+                // the oldest such read.
                 let oldest = state.named
                     .iter()
                     .filter_map(|named| named.step().filter(|&n| n != step))
@@ -2228,5 +2261,58 @@ mod tests {
             assert!(!named.is_step(step.wrapping_sub(1)));
             assert_eq!(named.step(), Some(step));
         }
+    }
+
+    #[test]
+    fn a_step_reclaims_prefetched_holds_when_no_unheld_slot_is_free() {
+        let (path, table) = table("reclaim-prefetch", 4, DirectoryForm::Hashed);
+        // Prefetch 3 of the 4 slots (leaving reserve=1), then fill all 4 slots
+        // with a step that names 4 completely different rows. Even if every
+        // slot were held by prefetches (as happens after a table shrink),
+        // `bring` must reclaim `Named::HELD` slots rather than failing.
+        table.prefetch(1, vec![10, 11, 12], 1).unwrap().wait();
+        {
+            let mut state = table.shared.state.lock().unwrap();
+            // Simulate a shrink leaving all 4 remaining slots `Named::HELD`.
+            let free_slot = (0..4)
+                .find(|&slot| !state.named[slot].is_held())
+                .expect("one slot left unheld by reserve");
+            state.directory.hold(13, free_slot, true);
+            state.named[free_slot] = Named::HELD;
+            hold(&mut state.holds, 13, 1);
+        }
+        let step = table.queue(StepRows::Known(vec![vec![1, 2, 3, 4]])).unwrap();
+        assert!(step.gate.wait_signalled(step.value, Duration::from_secs(10)).unwrap());
+        assert_eq!(table.failure(step.value), None);
+        for row in [1, 2, 3, 4] {
+            assert_eq!(found(&table, row), Some(slot_row(row)));
+        }
+        assert!(table.shared.state.lock().unwrap().holds.is_empty());
+        read_done(&step);
+        drop(table);
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn prefetch_does_not_overwrite_in_flight_step_slot_retention() {
+        let (path, table) = table("prefetch-in-flight", 4, DirectoryForm::Hashed);
+        let first = table.queue(StepRows::Known(vec![vec![1, 2, 3, 4]])).unwrap();
+        assert!(first.gate.wait_signalled(first.value, Duration::from_secs(10)).unwrap());
+        // Step 1's GPU read has not completed yet. Prefetching its rows and
+        // releasing the prefetch holder must not flip step 1's slots to FREE.
+        table.prefetch(7, vec![1, 2, 3, 4], 1).unwrap().wait();
+        table.release(7).unwrap();
+        let second = table.queue(StepRows::Known(vec![vec![5]])).unwrap();
+        assert!(!second.gate.wait_signalled(second.value, Duration::from_millis(100)).unwrap());
+        for row in [1, 2, 3, 4] {
+            assert_eq!(found(&table, row), Some(slot_row(row)));
+        }
+        read_done(&first);
+        assert!(second.gate.wait_signalled(second.value, Duration::from_secs(10)).unwrap());
+        assert_eq!(table.failure(second.value), None);
+        assert_eq!(found(&table, 5), Some(slot_row(5)));
+        read_done(&second);
+        drop(table);
+        std::fs::remove_file(path).unwrap();
     }
 }
