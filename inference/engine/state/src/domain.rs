@@ -241,21 +241,32 @@ pub fn state_bytes(
             let kind = domain.kind();
             let taken = crate::layout::page_demand_rows(page_rows, 0, kind.most_advance_rows(rows))
                 .ok_or_else(overflow)?;
-            let taken = match kind {
-                HistoryDomainKind::Window { .. } => {
-                    let cap = crate::layout::window_pages(page_rows, kind.row_limit(context, max_advance)?)
-                        .checked_mul(page_rows)
-                        .ok_or_else(overflow)?;
-                    taken.min(cap)
-                }
-                HistoryDomainKind::Token | HistoryDomainKind::Shared { .. } | HistoryDomainKind::Block { .. } => taken,
-            };
+            let taken = window_reservation_rows(kind, page_rows, context, max_advance)?
+                .map_or(taken, |cap| taken.min(cap));
             let taken = u64::try_from(taken).ok().and_then(|taken| taken.checked_mul(sequences)).ok_or_else(overflow)?;
             let slab_rows = domain.geometry(domains, context, max_advance, granule)?.slab_rows;
             let slab_rows = u64::try_from(slab_rows).map_err(|_| overflow())?;
             let bytes = taken.div_ceil(slab_rows).checked_mul(granule);
             bytes.and_then(|bytes| total.checked_add(bytes)).ok_or_else(overflow)
         })
+}
+
+/// The page-rounded bound used to price and back a window reservation.
+/// Launch provisioning still accounts for all simultaneously tentative rows.
+pub(crate) fn window_reservation_rows(
+    kind: HistoryDomainKind,
+    page_rows: usize,
+    context: usize,
+    max_advance: usize,
+) -> Result<Option<usize>, Error> {
+    if !matches!(kind, HistoryDomainKind::Window { .. }) {
+        return Ok(None);
+    }
+    let limit = kind.row_limit(context, max_advance)?;
+    let rows = crate::layout::window_pages(page_rows, limit)
+        .checked_mul(page_rows)
+        .ok_or(LayoutError::ArithmeticOverflow("window reservation rows"))?;
+    Ok(Some(rows))
 }
 
 /// Whether a domain of `kind` holding `components` holds produced rows:
