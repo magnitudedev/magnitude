@@ -1,5 +1,15 @@
 # @magnitudedev/cli
 
+## 0.3.5
+
+### Patch Changes
+
+- [`80058fe`](https://github.com/magnitudedev/magnitude/commit/80058fead4cc41ad68d96a8ccb277b1f4721949b) Thanks [@anerli](https://github.com/anerli)! - Preserve multi-turn reasoning history and KV prefix cache across chat templates and multi-step tool loops.
+
+- [`e56de29`](https://github.com/magnitudedev/magnitude/commit/e56de29efb5e87e93fd1e5d5cb9f1213849c13d0) Thanks [@anerli](https://github.com/anerli)! - Fix non-finite NVFP4 verify outputs on Apple M5 ([#284](https://github.com/magnitudedev/magnitude/issues/284)).
+
+- [#285](https://github.com/magnitudedev/magnitude/pull/285) [`66af400`](https://github.com/magnitudedev/magnitude/commit/66af4001ea076bee8d76508c56470317c15f1c70) Thanks [@dongreer](https://github.com/dongreer)! - Fix assessment of streamed Gemma 4 26B GGUFs failing with "a plan's tiers hold more than its weights" instead of Fits or DoesNotFit. Placement now counts each row slice of a stored tensor, so fused gate and up experts sum to the tensor's stored bytes.
+
 ## 0.3.4
 
 ### Patch Changes
