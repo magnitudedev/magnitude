@@ -119,6 +119,8 @@ impl PrefixKey {
 
     /// Whether `self` is an exact numerical prefix of `longer`.
     fn is_prefix_of(&self, longer: &Self) -> bool {
+        #[cfg(test)]
+        PREFIX_KEY_COMPARISONS.with(|c| c.set(c.get() + 1));
         let position = self.tokens.len();
         longer.tokens.starts_with(&self.tokens)
             && longer.coordinates.starts_with(&self.coordinates)
@@ -247,6 +249,8 @@ impl<'a> PrefixPath<'a> {
         other_spans: &[InputSpan],
         other_boundary: impl Fn(usize) -> bool,
     ) -> usize {
+        #[cfg(test)]
+        PREFIX_SHARED_CALLS.with(|c| c.set(c.get() + 1));
         // Conditioning spans are ordered by `start`, so `conditioning_at(p) ==
         // other_conditioning(p)` holds iff `p <= cond_limit`, where `cond_limit`
         // is the start of the first diverging span (or unbounded when identical).
@@ -320,14 +324,40 @@ impl PrefixHit {
     }
 }
 
+/// Result of [`PrefixCache::retain`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RetainOutcome {
+    /// The cache is disabled or full of submitted entries; nothing was cached.
+    Skipped,
+    /// An identical subsuming entry was already cached and its recency was refreshed.
+    Refreshed(u64),
+    /// A new entry was inserted with this identity.
+    Inserted(u64),
+}
+
+impl RetainOutcome {
+    pub const fn inserted(self) -> bool {
+        matches!(self, Self::Inserted(_))
+    }
+
+    pub const fn id(self) -> Option<u64> {
+        match self {
+            Self::Skipped => None,
+            Self::Refreshed(id) | Self::Inserted(id) => Some(id),
+        }
+    }
+}
+
 pub struct CachedPrefix<S> {
     id: u64,
     point: CachePoint,
     state: S,
     method: MethodCheckpoint,
     key: PrefixKey,
-    /// Cached tokens this entry saves beyond the deepest shorter prefix entry
-    /// under the same method at depth >= [`MIN_PREFIX_HIT`]. Maintained on
+    /// Entry ID of the deepest shorter prefix entry under the same method at
+    /// depth >= [`MIN_PREFIX_HIT`] that a hit on this path would fall back to.
+    fallback_id: Option<u64>,
+    /// Cached tokens this entry saves beyond its fallback entry. Maintained on
     /// every insertion and removal in [`PrefixCache::entries`].
     saved_tokens: usize,
     last_use: u64,
@@ -362,6 +392,10 @@ pub struct PrefixCache<S> {
     /// Every lookup the cache answered, hit or miss.
     lookups: u64,
     entries: Vec<CachedPrefix<S>>,
+    /// Cached IDs of [`Self::conversation_checkpoints`] (at most 3),
+    /// recomputed only on `push_entry`, `remove_entry`, and `evict_all`.
+    checkpoints: [u64; 3],
+    checkpoints_len: usize,
 }
 
 impl<S> PrefixCache<S> {
@@ -372,6 +406,8 @@ impl<S> PrefixCache<S> {
             next_id: 1,
             lookups: 0,
             entries: Vec::new(),
+            checkpoints: [0; 3],
+            checkpoints_len: 0,
         }
     }
 
@@ -448,12 +484,22 @@ impl<S: PrefixState> PrefixCache<S> {
         };
         let mut best: Option<(usize, usize, u64)> = None;
         for (index, entry) in self.entries.iter().enumerate() {
+            let entry_pos = entry.position();
+            if entry_pos < MIN_PREFIX_HIT {
+                continue;
+            }
+            if let Some((_, best_position, best_last_use)) = best {
+                if entry_pos < best_position
+                    || (entry_pos == best_position && entry.last_use <= best_last_use)
+                {
+                    continue;
+                }
+            }
             let lcp = path.shared_boundary(&entry.key);
             let max_pos = lcp.min(limit);
             if max_pos < MIN_PREFIX_HIT {
                 continue;
             }
-            let entry_pos = entry.position();
             let position = if entry_pos <= max_pos {
                 if !entry
                     .method
@@ -524,12 +570,12 @@ impl<S> PrefixCache<S> {
         point: CachePoint,
         state: S,
         method: MethodCheckpoint,
-    ) -> Result<bool, String> {
+    ) -> Result<RetainOutcome, String> {
         if position == 0 || !path.exact_boundary(position) {
             return Err("a cached prefix must end at an exact boundary of its path".into());
         }
         if self.capacity.max_entries == 0 {
-            return Ok(false);
+            return Ok(RetainOutcome::Skipped);
         }
         let key = path.key(position);
         let compatibility = method.compatibility();
@@ -541,11 +587,13 @@ impl<S> PrefixCache<S> {
             })
         {
             let last_use = self.tick()?;
+            let existing_id = self.entries[existing].id;
             self.entries[existing].last_use = last_use;
             if point == CachePoint::UserBranch && self.entries[existing].point == CachePoint::Branch {
                 self.entries[existing].point = CachePoint::UserBranch;
+                self.refresh_checkpoints();
             }
-            return Ok(false);
+            return Ok(RetainOutcome::Refreshed(existing_id));
         }
         let last_use = self.tick()?;
         let id = self.next_id;
@@ -559,6 +607,7 @@ impl<S> PrefixCache<S> {
             state,
             method,
             key,
+            fallback_id: None,
             saved_tokens: 0,
             last_use,
             submitted: 0,
@@ -570,10 +619,10 @@ impl<S> PrefixCache<S> {
                 if let Some(index) = self.entries.iter().position(|entry| entry.id == id) {
                     self.remove_entry(index);
                 }
-                return Ok(false);
+                return Ok(RetainOutcome::Skipped);
             }
         }
-        Ok(true)
+        Ok(RetainOutcome::Inserted(id))
     }
 
     pub fn begin_submitted(&mut self, id: u64) -> Result<(), String> {
@@ -706,34 +755,42 @@ impl<S> PrefixCache<S> {
         entry.saved_tokens as f64 * chance
     }
 
-    /// Compute the exact tokens `target` holds beyond the deepest other entry
-    /// in `entries` a hit on its path would resume from instead: one retained
-    /// under the same method, at least [`MIN_PREFIX_HIT`] deep, whose path is
-    /// a prefix of its own.
-    fn compute_saved_tokens(entries: &[CachedPrefix<S>], target: &CachedPrefix<S>) -> usize {
+    /// Compute the fallback entry ID and exact tokens `target` holds beyond
+    /// the deepest other entry in `entries` a hit on its path would resume
+    /// from instead: one retained under the same method, at least
+    /// [`MIN_PREFIX_HIT`] deep, whose path is a prefix of its own.
+    fn compute_fallback(entries: &[CachedPrefix<S>], target: &CachedPrefix<S>) -> (Option<u64>, usize) {
         let target_pos = target.position();
         let target_method = std::mem::discriminant(&target.method);
-        let fallback = entries
-            .iter()
-            .filter(|other| {
-                other.id != target.id
-                    && other.position() >= MIN_PREFIX_HIT
-                    && other.position() < target_pos
-                    && std::mem::discriminant(&other.method) == target_method
-                    && other.key.is_prefix_of(&target.key)
-            })
-            .map(CachedPrefix::position)
-            .max()
-            .unwrap_or(0);
-        target_pos - fallback
+        let mut best_id = None;
+        let mut best_pos = 0usize;
+        for other in entries {
+            let pos = other.position();
+            if other.id == target.id
+                || pos < MIN_PREFIX_HIT
+                || pos >= target_pos
+                || pos <= best_pos
+                || std::mem::discriminant(&other.method) != target_method
+            {
+                continue;
+            }
+            if other.key.is_prefix_of(&target.key) {
+                best_id = Some(other.id);
+                best_pos = pos;
+            }
+        }
+        (best_id, target_pos - best_pos)
     }
 
-    /// Push `entry` into `self.entries`, initializing its `saved_tokens` and
-    /// tightening `saved_tokens` on any deeper existing entries it becomes the
-    /// new fallback for.
+    /// Push `entry` into `self.entries`, initializing its fallback and
+    /// `saved_tokens` and tightening any deeper existing entries it becomes
+    /// the new fallback for.
     fn push_entry(&mut self, mut entry: CachedPrefix<S>) {
-        entry.saved_tokens = Self::compute_saved_tokens(&self.entries, &entry);
+        let (fallback_id, saved_tokens) = Self::compute_fallback(&self.entries, &entry);
+        entry.fallback_id = fallback_id;
+        entry.saved_tokens = saved_tokens;
         let new_pos = entry.position();
+        let new_id = entry.id;
         if new_pos >= MIN_PREFIX_HIT {
             let new_method = std::mem::discriminant(&entry.method);
             for existing in &mut self.entries {
@@ -744,31 +801,44 @@ impl<S> PrefixCache<S> {
                     && entry.key.is_prefix_of(&existing.key)
                 {
                     existing.saved_tokens = candidate;
+                    existing.fallback_id = Some(new_id);
                 }
             }
         }
         self.entries.push(entry);
+        self.refresh_checkpoints();
     }
 
-    /// Remove `self.entries[index]` and recompute `saved_tokens` for any
-    /// remaining entry whose fallback depth equaled the removed entry's.
+    /// Remove `self.entries[index]` and re-parent any remaining entry whose
+    /// `fallback_id` was the removed entry directly to its equal-key sibling
+    /// or its own fallback (zero prefix rescans because prefixes form a tree).
     fn remove_entry(&mut self, index: usize) {
         let removed = self.entries.remove(index);
         let removed_pos = removed.position();
-        if removed_pos < MIN_PREFIX_HIT {
-            return;
-        }
-        let removed_method = std::mem::discriminant(&removed.method);
-        for i in 0..self.entries.len() {
-            let entry = &self.entries[i];
-            if entry.position() > removed_pos
-                && entry.position() - entry.saved_tokens == removed_pos
-                && std::mem::discriminant(&entry.method) == removed_method
-                && removed.key.is_prefix_of(&entry.key)
-            {
-                self.entries[i].saved_tokens = Self::compute_saved_tokens(&self.entries, &self.entries[i]);
+        if removed_pos >= MIN_PREFIX_HIT {
+            let removed_method = std::mem::discriminant(&removed.method);
+            let removed_fallback_pos = removed_pos - removed.saved_tokens;
+            let sibling = self
+                .entries
+                .iter()
+                .find(|other| {
+                    other.position() == removed_pos
+                        && std::mem::discriminant(&other.method) == removed_method
+                        && other.key == removed.key
+                })
+                .map(|other| other.id);
+            for entry in &mut self.entries {
+                if entry.fallback_id == Some(removed.id) {
+                    if let Some(sibling_id) = sibling {
+                        entry.fallback_id = Some(sibling_id);
+                    } else {
+                        entry.fallback_id = removed.fallback_id;
+                        entry.saved_tokens = entry.position() - removed_fallback_pos;
+                    }
+                }
             }
         }
+        self.refresh_checkpoints();
     }
 
     /// The checkpoints the plan charges the most recently cached
@@ -778,7 +848,11 @@ impl<S> PrefixCache<S> {
     /// the deepest regular branch when no user-turn branch is marked), so
     /// multi-step tool loops keep their pre-loop fallback checkpoint spared
     /// within the conversation checkpoint budget.
-    fn conversation_checkpoints(&self) -> Vec<u64> {
+    fn conversation_checkpoints(&self) -> &[u64] {
+        &self.checkpoints[..self.checkpoints_len]
+    }
+
+    fn refresh_checkpoints(&mut self) {
         let latest = |point: CachePoint| {
             self.entries
                 .iter()
@@ -806,11 +880,12 @@ impl<S> PrefixCache<S> {
                         .max_by_key(|entry| (entry.position(), entry.id))
                 })
         });
-        [terminal, boundary, branch]
-            .into_iter()
-            .flatten()
-            .map(|entry| entry.id)
-            .collect()
+        let mut len = 0;
+        for entry in [terminal, boundary, branch].into_iter().flatten() {
+            self.checkpoints[len] = entry.id;
+            len += 1;
+        }
+        self.checkpoints_len = len;
     }
 
     /// Drop every entry without submitted uses.
@@ -819,8 +894,12 @@ impl<S> PrefixCache<S> {
         self.entries.retain(|entry| entry.submitted != 0);
         if self.entries.len() != before {
             for i in 0..self.entries.len() {
-                self.entries[i].saved_tokens = Self::compute_saved_tokens(&self.entries, &self.entries[i]);
+                let (fallback_id, saved_tokens) =
+                    Self::compute_fallback(&self.entries, &self.entries[i]);
+                self.entries[i].fallback_id = fallback_id;
+                self.entries[i].saved_tokens = saved_tokens;
             }
+            self.refresh_checkpoints();
         }
     }
 
@@ -979,6 +1058,7 @@ mod tests {
         cache
             .retain(owned.path(), position, CachePoint::Branch, state, MethodCheckpoint::Plain)
             .unwrap()
+            .inserted()
     }
 
     fn lookup_any(cache: &mut PrefixCache<Rows>, owned: &Owned) -> Option<PrefixHit> {
@@ -1001,7 +1081,8 @@ mod tests {
             ] {
                 assert!(cache
                     .retain(owned.path(), position, point, state, MethodCheckpoint::Plain)
-                    .unwrap());
+                    .unwrap()
+                    .inserted());
             }
         };
         conversation(&mut cache, "a", 0);
@@ -1417,11 +1498,13 @@ mod tests {
 
         assert!(cache
             .retain(branch_a.under(mtp), 80, CachePoint::Branch, rows(0..80), entered_a.clone())
-            .unwrap());
+            .unwrap()
+            .inserted());
         // Different entered successor must NOT be suppressed by entered_a.
         assert!(cache
             .retain(branch_b.under(mtp), 80, CachePoint::Branch, rows(0..80), entered_b)
-            .unwrap());
+            .unwrap()
+            .inserted());
         assert_eq!(cache.len(), 2);
         assert_eq!(cache.lookup(branch_a.under(mtp), usize::MAX).unwrap().unwrap().position(), 80);
         assert_eq!(cache.lookup(branch_b.under(mtp), usize::MAX).unwrap().unwrap().position(), 80);
@@ -1430,7 +1513,8 @@ mod tests {
         // by entered_a or entered_b.
         assert!(cache
             .retain(branch_a.under(mtp), 80, CachePoint::Branch, rows(0..80), trailing)
-            .unwrap());
+            .unwrap()
+            .inserted());
         assert_eq!(cache.len(), 3);
         let branch_c = tokens((0..80).chain([3000]).collect());
         assert_eq!(cache.lookup(branch_c.under(mtp), usize::MAX).unwrap().unwrap().position(), 80);
@@ -1439,7 +1523,8 @@ mod tests {
         // refreshes instead of adding a duplicate.
         assert!(!cache
             .retain(branch_a.under(mtp), 80, CachePoint::Branch, rows(0..80), entered_a)
-            .unwrap());
+            .unwrap()
+            .inserted());
         assert_eq!(cache.len(), 3);
     }
 
@@ -1573,7 +1658,8 @@ mod tests {
             let owned = tokens(path.to_vec());
             assert!(cache
                 .retain(owned.path(), position, point, state, MethodCheckpoint::Plain)
-                .unwrap());
+                .unwrap()
+                .inserted());
             cache.release_beyond_workload(&BTreeSet::new(), occupied);
         };
         // Each request's prompt, what it resumed at, and its reply.
@@ -1646,7 +1732,7 @@ mod tests {
             for entry in &cache.entries {
                 assert_eq!(
                     entry.saved_tokens,
-                    PrefixCache::compute_saved_tokens(&cache.entries, entry),
+                    PrefixCache::compute_fallback(&cache.entries, entry).1,
                     "cached saved_tokens drifted for entry id={} at position={}",
                     entry.id,
                     entry.position(),
@@ -1690,7 +1776,8 @@ mod tests {
                 rows(5..6),
                 MethodCheckpoint::Mtp(magnitude_generation::DraftCheckpoint::trailing_at(120)),
             )
-            .unwrap());
+            .unwrap()
+            .inserted());
         assert_invariants(&cache);
 
         // Evict one by one and verify saved_tokens updates as fallbacks disappear.
@@ -1782,11 +1869,11 @@ mod tests {
         let path = tokens((0..500).collect());
         // Turn 1 user branch at 100, tool step 1 branch at 200, tool step 2 branch at 300,
         // prompt boundary at 400, terminal at 500.
-        assert!(cache.retain(path.path(), 100, CachePoint::UserBranch, rows(0..10), MethodCheckpoint::Plain).unwrap());
-        assert!(cache.retain(path.path(), 200, CachePoint::Branch, rows(10..20), MethodCheckpoint::Plain).unwrap());
-        assert!(cache.retain(path.path(), 300, CachePoint::Branch, rows(20..30), MethodCheckpoint::Plain).unwrap());
-        assert!(cache.retain(path.path(), 400, CachePoint::PromptBoundary, rows(30..40), MethodCheckpoint::Plain).unwrap());
-        assert!(cache.retain(path.path(), 500, CachePoint::Terminal, rows(40..50), MethodCheckpoint::Plain).unwrap());
+        assert!(cache.retain(path.path(), 100, CachePoint::UserBranch, rows(0..10), MethodCheckpoint::Plain).unwrap().inserted());
+        assert!(cache.retain(path.path(), 200, CachePoint::Branch, rows(10..20), MethodCheckpoint::Plain).unwrap().inserted());
+        assert!(cache.retain(path.path(), 300, CachePoint::Branch, rows(20..30), MethodCheckpoint::Plain).unwrap().inserted());
+        assert!(cache.retain(path.path(), 400, CachePoint::PromptBoundary, rows(30..40), MethodCheckpoint::Plain).unwrap().inserted());
+        assert!(cache.retain(path.path(), 500, CachePoint::Terminal, rows(40..50), MethodCheckpoint::Plain).unwrap().inserted());
 
         let held = BTreeSet::new();
         let released = cache.release_beyond_workload(&held, || 1);
@@ -1817,6 +1904,7 @@ mod tests {
                     MethodCheckpoint::Plain,
                 )
                 .unwrap()
+                .inserted()
         );
 
         // Plain request diverging at 180 forks the deeper Plain KV entry at 180.
@@ -1842,15 +1930,128 @@ mod tests {
                     MethodCheckpoint::Mtp(magnitude_generation::DraftCheckpoint::trailing_at(260)),
                 )
                 .unwrap()
+                .inserted()
         );
         assert!(mtp_cache.lookup(diverged.path(), diverged.prompt.len()).unwrap().is_none());
         assert!(mtp_cache.lookup(diverged.under(mtp), diverged.prompt.len()).unwrap().is_none());
 
         // Endpoint-only deeper entry beyond LCP is a miss, falling back to an older shorter entry.
         let mut hybrid_cache: PrefixCache<Rows> = PrefixCache::new(capacity(4));
-        assert!(hybrid_cache.retain(base.path(), 120, CachePoint::Branch, rows(0..12), MethodCheckpoint::Plain).unwrap());
-        assert!(hybrid_cache.retain(base.path(), 260, CachePoint::Terminal, rows(0..26), MethodCheckpoint::Plain).unwrap());
+        assert!(hybrid_cache.retain(base.path(), 120, CachePoint::Branch, rows(0..12), MethodCheckpoint::Plain).unwrap().inserted());
+        assert!(hybrid_cache.retain(base.path(), 260, CachePoint::Terminal, rows(0..26), MethodCheckpoint::Plain).unwrap().inserted());
         let hit = hybrid_cache.lookup(diverged.path(), diverged.prompt.len()).unwrap();
         assert_eq!(hit.map(PrefixHit::position), Some(120));
     }
+
+    #[test]
+    fn work_bound_prefix_cache_cached_checkpoints_reparenting_and_best_pruning() {
+        let run_case = |unrelated_count: usize| {
+            let mut cache = PrefixCache::new(capacity(64));
+            // Seed `unrelated_count` independent conversations (Terminal entries).
+            for i in 0..unrelated_count {
+                let base = (i as u32 + 1) * 10_000;
+                let conv = tokens((base..base + 256).collect());
+                assert!(cache
+                    .retain(
+                        conv.path(),
+                        256,
+                        CachePoint::Terminal,
+                        rows(0..1),
+                        MethodCheckpoint::Plain,
+                    )
+                    .unwrap()
+                    .inserted());
+            }
+            // Seed a 4-level chain (deepest inserted FIRST so best() sees it first).
+            let chain = text(512, "chain");
+            for pos in [512, 256, 128, 64] {
+                assert!(cache
+                    .retain(
+                        chain.path(),
+                        pos,
+                        CachePoint::PromptBoundary,
+                        rows(1..2),
+                        MethodCheckpoint::Plain,
+                    )
+                    .unwrap()
+                    .inserted());
+            }
+
+            // 1. `holds_unspared` must perform 0 prefix key comparisons (checkpoints cached).
+            PREFIX_KEY_COMPARISONS.with(|c| c.set(0));
+            assert!(cache.holds_unspared(&BTreeSet::new()));
+            assert_eq!(
+                PREFIX_KEY_COMPARISONS.with(|c| c.get()),
+                0,
+                "holds_unspared must not rescan prefixes"
+            );
+
+            // 2. `best()` must prune shorter entries before calling `shared_boundary`:
+            //    512 matches first, so 256, 128, 64 are skipped without `shared` calls.
+            //    (Unrelated entries have position 256 < 512, so they are skipped too
+            //    once 512 is matched; note unrelated entries appear before 512 in `entries`,
+            //    so test with a cache where deepest is first!)
+            let mut ordered = PrefixCache::new(capacity(64));
+            assert!(ordered
+                .retain(
+                    chain.path(),
+                    512,
+                    CachePoint::PromptBoundary,
+                    rows(1..2),
+                    MethodCheckpoint::Plain,
+                )
+                .unwrap()
+                .inserted());
+            for pos in (64..=64 + unrelated_count * 8).step_by(8) {
+                assert!(ordered
+                    .retain(
+                        chain.path(),
+                        pos,
+                        CachePoint::PromptBoundary,
+                        rows(1..2),
+                        MethodCheckpoint::Plain,
+                    )
+                    .unwrap()
+                    .inserted());
+            }
+            PREFIX_SHARED_CALLS.with(|c| c.set(0));
+            assert_eq!(ordered.deepest(chain.path(), usize::MAX), 512);
+            assert_eq!(
+                PREFIX_SHARED_CALLS.with(|c| c.get()),
+                1,
+                "best() must skip all shorter entries before calling shared_boundary"
+            );
+
+            // 3. Removing an internal fallback entry (128) re-parents 256 -> 64
+            //    with 0 prefix key comparisons (tree re-parenting, independent of
+            //    unrelated_count).
+            let idx_128 = cache
+                .entries
+                .iter()
+                .position(|e| e.position() == 128)
+                .expect("128 entry");
+            PREFIX_KEY_COMPARISONS.with(|c| c.set(0));
+            cache.remove_entry(idx_128);
+            assert_eq!(
+                PREFIX_KEY_COMPARISONS.with(|c| c.get()),
+                0,
+                "remove_entry must re-parent dependents with 0 prefix comparisons"
+            );
+            let entry_256 = cache
+                .entries
+                .iter()
+                .find(|e| e.position() == 256 && e.key.tokens[0] == chain.prompt[0])
+                .expect("256 entry");
+            assert_eq!(entry_256.saved_tokens, 256 - 64);
+        };
+
+        run_case(1);
+        run_case(16);
+    }
+}
+
+#[cfg(test)]
+thread_local! {
+    static PREFIX_KEY_COMPARISONS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    static PREFIX_SHARED_CALLS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }

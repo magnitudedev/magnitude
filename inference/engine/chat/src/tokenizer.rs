@@ -3,7 +3,10 @@ use magnitude_generation::TokenId;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeSet, HashMap, HashSet};
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use tokenizers::{
+    decoders::DecoderWrapper,
     models::bpe::BPE,
     normalizers::{replace::Replace, unicode::NFC, NormalizerWrapper},
     pre_tokenizers::{
@@ -12,8 +15,55 @@ use tokenizers::{
         split::{Split as SplitStage, SplitPattern},
         PreTokenizerWrapper,
     },
-    AddedToken, Encoding, SplitDelimiterBehavior, Tokenizer,
+    processors::PostProcessorWrapper,
+    AddedToken, Encoding, Model, SplitDelimiterBehavior, Token, TokenizerImpl,
 };
+
+/// Shared handle to a single [`BPE`] model so the recognize-special and
+/// literal-special encoders share one vocabulary and merge table instead of
+/// cloning the full BPE maps.
+#[derive(Clone)]
+struct SharedBpe(Arc<BPE>);
+
+impl Model for SharedBpe {
+    type Trainer = <BPE as Model>::Trainer;
+
+    fn tokenize(&self, sequence: &str) -> tokenizers::Result<Vec<Token>> {
+        self.0.tokenize(sequence)
+    }
+
+    fn token_to_id(&self, token: &str) -> Option<u32> {
+        self.0.token_to_id(token)
+    }
+
+    fn id_to_token(&self, id: u32) -> Option<String> {
+        self.0.id_to_token(id)
+    }
+
+    fn get_vocab(&self) -> HashMap<String, u32> {
+        self.0.get_vocab()
+    }
+
+    fn get_vocab_size(&self) -> usize {
+        self.0.get_vocab_size()
+    }
+
+    fn save(&self, folder: &Path, prefix: Option<&str>) -> tokenizers::Result<Vec<PathBuf>> {
+        self.0.save(folder, prefix)
+    }
+
+    fn get_trainer(&self) -> Self::Trainer {
+        self.0.get_trainer()
+    }
+}
+
+type BpeEncoder = TokenizerImpl<
+    SharedBpe,
+    NormalizerWrapper,
+    Sequence,
+    PostProcessorWrapper,
+    DecoderWrapper,
+>;
 
 /// A model input sequence's tokens, and where its added tokens end.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -155,7 +205,7 @@ pub struct BpeConfig {
 }
 
 pub struct ByteBpeTokenizer {
-    encoders: [Tokenizer; 2],
+    encoders: [BpeEncoder; 2],
     pieces: Vec<Vec<u8>>,
     kinds: Vec<PieceKind>,
     implicit_bos: Option<TokenId>,
@@ -195,21 +245,12 @@ fn fallback_byte(piece: &str) -> Option<u8> {
 impl ByteBpeTokenizer {
     pub fn new(config: BpeConfig) -> Result<Self, TokenizerError> {
         let pieces = config.checked_pieces()?;
-        let model = BPE::builder()
-            .vocab_and_merges(
-                config
-                    .pieces
-                    .iter()
-                    .enumerate()
-                    .map(|(i, s)| (s.clone(), i as u32))
-                    .collect::<tokenizers::models::bpe::Vocab>(),
-                config.merges.clone(),
-            )
-            .fuse_unk(false)
-            .byte_fallback(config.encoding == PieceEncoding::MetaspaceByteFallback)
-            .ignore_merges(config.ignore_merges)
-            .build()
-            .map_err(|e| TokenizerError::Invalid(e.to_string()))?;
+        let identity = Sha256::digest(
+            serde_json::to_vec(&config).map_err(|e| TokenizerError::Invalid(e.to_string()))?,
+        )
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect();
         let normalizer: Option<NormalizerWrapper> = match config.normalization {
             Normalization::None => None,
             Normalization::Nfc => Some(NFC.into()),
@@ -223,8 +264,25 @@ impl ByteBpeTokenizer {
         if config.encoding == PieceEncoding::ByteLevel {
             stages.push(ByteLevel::new(false, false, false).into());
         }
-        let make = |recognize| -> Result<Tokenizer, TokenizerError> {
-            let mut encoder = Tokenizer::new(model.clone());
+        let model = Arc::new(
+            BPE::builder()
+                .vocab_and_merges(
+                    config
+                        .pieces
+                        .iter()
+                        .enumerate()
+                        .map(|(i, s)| (s.clone(), i as u32))
+                        .collect::<tokenizers::models::bpe::Vocab>(),
+                    config.merges,
+                )
+                .fuse_unk(false)
+                .byte_fallback(config.encoding == PieceEncoding::MetaspaceByteFallback)
+                .ignore_merges(config.ignore_merges)
+                .build()
+                .map_err(|e| TokenizerError::Invalid(e.to_string()))?,
+        );
+        let make = |recognize, model: Arc<BPE>| -> Result<BpeEncoder, TokenizerError> {
+            let mut encoder = BpeEncoder::new(SharedBpe(model));
             encoder.with_normalizer(normalizer.clone());
             if !stages.is_empty() {
                 encoder.with_pre_tokenizer(Some(Sequence::new(stages.clone())));
@@ -250,13 +308,7 @@ impl ByteBpeTokenizer {
             }
             Ok(encoder)
         };
-        let encoders = [make(true)?, make(false)?];
-        let identity = Sha256::digest(
-            serde_json::to_vec(&config).map_err(|e| TokenizerError::Invalid(e.to_string()))?,
-        )
-        .iter()
-        .map(|b| format!("{b:02x}"))
-        .collect();
+        let encoders = [make(true, Arc::clone(&model))?, make(false, model)?];
         Ok(Self {
             encoders,
             pieces,

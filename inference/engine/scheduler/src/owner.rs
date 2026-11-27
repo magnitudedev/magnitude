@@ -417,6 +417,9 @@ struct PrefixParticipation {
     /// The cached prefix the request's residency forked, protected while
     /// work derived from it is submitted.
     source: Option<u64>,
+    /// The most recent cached prefix entry retained (or refreshed) by this
+    /// request, tracked in O(1) so `held_entries` never rescans prefix tokens.
+    last_retained: Option<u64>,
     prefill_retained: bool,
     terminal_retention: TerminalRetention,
     /// Planned branch points, in prompt order: where this request diverges
@@ -433,6 +436,7 @@ impl PrefixParticipation {
     fn new(branches: BTreeSet<usize>, user_branch: Option<usize>) -> Self {
         Self {
             source: None,
+            last_retained: None,
             prefill_retained: false,
             terminal_retention: TerminalRetention::Pending,
             branches,
@@ -2033,13 +2037,8 @@ impl<F: ProgramFamily> Service<F> {
                     .map(|member| (&member.record, member.state.generation())),
             )
             .filter(|(_, generation)| generation.is_resident() && generation.finish_reason().is_none())
-            .flat_map(|(record, generation)| {
-                self.prefix_cache.held(
-                    record.prefix.as_ref().and_then(|prefix| prefix.source),
-                    PrefixPath::of(generation),
-                    generation.resident_position(),
-                )
-            })
+            .filter_map(|(record, _)| record.prefix.as_ref())
+            .flat_map(|prefix| [prefix.source, prefix.last_retained].into_iter().flatten())
             .collect()
     }
 
@@ -3468,14 +3467,16 @@ impl<F: ProgramFamily> Service<F> {
         // state the plan charges: the group takes the rows and banks of the
         // least recently used ones instead. Once none is left to release,
         // `fits` sets no ceiling.
-        let held = self.held_entries(Some(&round.members));
-        while matches!(current, Err(DomainError::StateCeiling { .. })) {
-            let released = self.prefix_cache.release_unspared(&held);
-            assert!(
-                released,
-                "invariant violated: StateCeiling returned with no unspared prefix entry left to release"
-            );
-            current = self.fits(bindings, round, &group_);
+        if matches!(current, Err(DomainError::StateCeiling { .. })) {
+            let held = self.held_entries(Some(&round.members));
+            while matches!(current, Err(DomainError::StateCeiling { .. })) {
+                let released = self.prefix_cache.release_unspared(&held);
+                assert!(
+                    released,
+                    "invariant violated: StateCeiling returned with no unspared prefix entry left to release"
+                );
+                current = self.fits(bindings, round, &group_);
+            }
         }
         let Relieved { mut current, mut pending } = self.relieve(bindings, current, true, |this, bindings| Ok(this.fits(bindings, round, &group_)))?;
         // A request's state growing short with nothing else to free: the
@@ -4075,11 +4076,20 @@ impl<F: ProgramFamily> Service<F> {
         let method = generation
             .method_checkpoint()
             .map_err(invariant("prefix retention"))?;
-        let retained = self
+        let outcome = self
             .prefix_cache
             .retain(PrefixPath::of(generation), position, point, state, method)
             .map_err(invariant("prefix retention"))?;
-        if retained {
+        if let Some(retained_id) = outcome.id() {
+            if let Some(prefix) = self
+                .requests
+                .get_mut(&id)
+                .and_then(|request| request.record.prefix.as_mut())
+            {
+                prefix.last_retained = Some(retained_id);
+            }
+        }
+        if outcome.inserted() {
             let held = self.held_entries(None);
             let domain = &self.domain;
             // The state every holder occupies, the cached prefixes included,
@@ -4343,6 +4353,9 @@ impl<F: ProgramFamily> Service<F> {
         for &id in set {
             let Request { mut record, state } = self.requests.remove(&id).expect("an evicted request");
             record.preemption_debt = record.preemption_debt.saturating_add(1);
+            if let Some(prefix) = record.prefix.as_mut() {
+                prefix.last_retained = None;
+            }
             // A round parked on memory is discarded with its state: the
             // request replays from its committed history.
             let generation = match state {
