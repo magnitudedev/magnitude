@@ -46,3 +46,21 @@ The engine CLI is `magnitude-engine` (`engine/cli`); the production service
 binary is `magnitude-inference` (`service/server`). Platform support and
 qualification floors are in [compatibility](docs/compatibility.md). A passing
 local build does not establish qualification on every release host.
+
+### Diagnosing GPU expert-cache headroom
+
+`magnitude-engine --device-room BYTES` limits device weight placement to the
+smaller of the supplied budget and the room available to the plan. It does not
+cap total device memory, which also holds request state and execution buffers.
+`--weight-cap BYTES` also limits host weights. Omit both flags for the stock
+comparison.
+
+To compare a change in device weight room, use the same model, input and
+generation settings. Start a fresh engine for each measured run and alternate
+stock and override order. Record wall time, prompt and generated token counts,
+resident expert slots, and the residency watcher's per-request DMA bytes and
+wait time. The request counters combine prefill and decode; summed DMA wait is
+not time on the request's critical path, and a bank reclamation is not a count
+of evicted or reloaded experts. Report a timing change separately unless the
+cache observations support an explanation. A useful budget on one device or
+workload is not a portable default.
