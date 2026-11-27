@@ -43,7 +43,7 @@ pub mod streamed;
 pub mod terms;
 pub mod wall_model;
 
-pub use bank::{BankPrices, PassLayers, PathRecords, Prior, PriorOverflow, WorkloadRates};
+pub use bank::{BankPrices, PassLayers, PathRecords, Prior, PriorOverflow, ROUTED_TILE_ROWS, WorkloadRates};
 pub use census::{Census, Kind, LayerCall, LaunchCounts, RoutedCall, RoutedKind};
 pub use compute::{step_seconds, ExpertPass, HostReads};
 pub use expert_lines::{

@@ -508,6 +508,33 @@ fn a_last_step_expiring_before_its_request_is_taken_seeds_nothing_there() {
     assert!(matches!(step.complete(), Err(StepFailure::Interrupted(_))));
 }
 
+/// In a multi-step scratch-served prompt group, all steps share merged
+/// scratch fills and passes. When a later step's wait expires on a still
+/// pulse, earlier steps of the same group must also return
+/// `StepFailure::Interrupted` so none of their corrupted outputs can be
+/// reconciled or committed into the chain or prefix cache.
+#[test]
+fn a_later_steps_expiry_in_a_merged_prompt_group_interrupts_earlier_steps() {
+    let harness = hosted_prompted("merged-expiry", 4, 2, TIER);
+    let pulse = harness.watcher.shared().steps.pulse();
+    let mut steps = harness.group(&[StepRoute::Grouped; 2]);
+    let (s0, s1) = (steps.remove(0), steps.remove(0));
+    harness.scratch(&s0, 0, &[3]);
+    harness.scratch(&s1, 0, &[4]);
+    pulse.beat_after(Duration::from_millis(4 * constants::PULSE_SPINS as u64 * 70 / 1_000_000));
+    // Only the second step's wait expired on the still pulse; s0's own
+    // SLOT_EXPIRED was never written.
+    harness.expire(&s1, 0);
+    assert!(
+        matches!(s0.complete(), Err(StepFailure::Interrupted(_))),
+        "s0 must be interrupted when sibling s1 in the same scratch-served prompt group expired"
+    );
+    assert!(
+        matches!(s1.complete(), Err(StepFailure::Interrupted(_))),
+        "s1 itself must be interrupted"
+    );
+}
+
 /// Beside a host tier a prompt group's scratch lies in its lender's bottom
 /// bank records, which no promotion takes: the group's lease takes them at
 /// once; no seed takes one (the bank otherwise holds only its pool, so the

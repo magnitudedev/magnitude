@@ -30,7 +30,7 @@ pub(crate) fn layer_homes(layers: impl IntoIterator<Item = (usize, u64)>) -> Vec
 /// parallel block's routed branch, an embedded causal head's routed
 /// sublayer, or a separate draft's routed sublayer, and the scope of its
 /// weights.
-pub(super) fn routed_layers(
+pub(crate) fn routed_layers(
     definition: &ModelDefinition,
 ) -> impl Iterator<Item = (magnitude_family_contracts::SublayerIndex, WeightScope, &RoutedFfn)> {
     let target = definition.decoder.sublayers().filter_map(|(sublayer, layer)| match &layer.op {

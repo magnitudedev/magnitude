@@ -1210,17 +1210,40 @@ impl Steps {
     /// every earlier step of its group, whose scratch rounds converted
     /// experts it may read (a seed copies them), running still, or all
     /// ended whole, or one tainted. A step is tainted before it ends
-    /// (`ExpertStep::drop`), so one read ended carries its taint.
+    /// (`ExpertStep::drop`), so one read ended carries its taint. In a
+    /// scratch-served merged prompt group, any tainted step of the group
+    /// taints the group's shared scratch window.
     pub(super) fn ending(&self, point: Point) -> crate::experts::directory::Ending {
         use crate::experts::directory::Ending;
         let state = self.lock();
         let steps = point.group..=point.sequence;
         let ended = steps.clone().all(|sequence| sequence < state.frontier || state.ended.contains(&sequence));
-        match (ended, state.tainted.range(steps).next().is_some()) {
+        let taint_range = state
+            .groups
+            .get(&point.group)
+            .filter(|group| group.is_scratch())
+            .map_or(point.group..point.sequence + 1, |group| point.group..point.group + group.steps);
+        match (ended, state.tainted.range(taint_range).next().is_some()) {
             (false, _) => Ending::Running,
             (true, false) => Ending::Ended,
             (true, true) => Ending::Tainted,
         }
+    }
+
+    /// The steps sharing expiry fate with `sequence` (its whole scratch-served
+    /// prompt group, whose merged passes read the shared scratch window
+    /// populated by all steps of the group; otherwise `sequence` alone), and
+    /// whether any of those steps is already recorded as tainted.
+    pub(super) fn expiry_scope(&self, sequence: Step) -> (std::ops::Range<Step>, bool) {
+        let state = self.lock();
+        let range = state
+            .groups
+            .range(..=sequence)
+            .next_back()
+            .filter(|(&first, group)| sequence - first < group.steps && group.is_scratch())
+            .map_or(sequence..sequence + 1, |(&first, group)| first..first + group.steps);
+        let tainted = state.tainted.range(range.clone()).next().is_some();
+        (range, tainted)
     }
 
     /// Residency is past every group before `group`: their taints are done
@@ -1987,7 +2010,8 @@ impl ExpertStep {
     /// rule), and a step never queued requested nothing, so none of its
     /// waits stored an expiry.
     fn expired(&self) -> bool {
-        self.shared.parks.expired(self.sequence)
+        let (range, tainted) = self.shared.steps.expiry_scope(self.sequence);
+        tainted || range.into_iter().any(|sequence| self.shared.parks.expired(sequence))
     }
 }
 

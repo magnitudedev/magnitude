@@ -156,15 +156,16 @@ impl PassLayers {
 
 /// Per-expert block height (`TILE_ROWS`) that grouped prefill pads each active
 /// expert's token list to.
-pub(crate) const ROUTED_TILE_ROWS: f64 = 32.0;
+pub const ROUTED_TILE_ROWS: u64 = 32;
 
 /// Expected GEMM rows executed for `choices` routed token-expert assignments
 /// across `experts` active experts when each active expert pads to a multiple
 /// of [`ROUTED_TILE_ROWS`]: at least one full tile per active expert, and half
 /// a tile of trailing zero-padding on average.
 pub(crate) fn routed_padded_choices(experts: f64, choices: f64) -> f64 {
+    let tile = ROUTED_TILE_ROWS as f64;
     if experts > 0.0 {
-        (choices + experts * ((ROUTED_TILE_ROWS - 1.0) / 2.0)).max(experts * ROUTED_TILE_ROWS)
+        (choices + experts * ((tile - 1.0) / 2.0)).max(experts * tile)
     } else {
         0.0
     }

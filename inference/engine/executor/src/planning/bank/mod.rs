@@ -35,6 +35,7 @@ pub use conveyor::{ConveyorCarrier, Lender, StagingPool};
 pub use counts::BankCounts;
 pub use layout::{BankAllocation, BankLayout, BankPart, BankSubstrate, BankTier, HostTier, Parking, PlacedAllocations, Placer};
 pub use records::{PoolSlab, RecordForm, RecordTensor, RecordTensors, RoutedTensor, routed_experts};
+pub(crate) use records::routed_layers;
 pub(crate) use records::{decode_set, layer_homes};
 pub use residency::ResidencyOrder;
 pub use sizing::growth_target;

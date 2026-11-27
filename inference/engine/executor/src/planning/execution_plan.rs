@@ -607,9 +607,10 @@ impl ExecutionPlanDraft {
         }
         let mut last_short = None;
         let experts = ceiling.whole.bank().slots;
+        let whole_cap = self.whole_pass_cap(definition)?;
         if ceiling.ceiling == experts {
             let mut fitting = Vec::new();
-            for pass in super::pass_ladder(ceiling.places) {
+            for pass in super::pass_ladder(ceiling.places.min(whole_cap)) {
                 let draft = ceiling.whole.resized(experts, experts, pass)?;
                 let charge = held.charge(definition, &draft)?;
                 let fit = budget.fit_whole(&draft, charge.charge())?;
@@ -718,14 +719,17 @@ impl ExecutionPlanDraft {
             Err(err @ NoBank::Unstreamed(_)) => err,
             Err(no) => return Ok(Err(no)),
         };
-        let Some(resident) = ceiling.whole.held_whole_within(definition, bound)? else {
+        let Some(chains) = ceiling.whole.whole_chains(definition, bound)? else {
             return Ok(Err(fallback_err));
         };
-        let charge = held.charge(definition, &resident)?;
-        Ok(match confirm(&resident, charge.charge())? {
-            Ok(found) => Ok((resident, charge, found)),
-            Err(_) => Err(fallback_err),
-        })
+        for places in chains {
+            let resident = ceiling.whole.held_whole_at(definition, places)?;
+            let charge = held.charge(definition, &resident)?;
+            if let Ok(found) = confirm(&resident, charge.charge())? {
+                return Ok(Ok((resident, charge, found)));
+            }
+        }
+        Ok(Err(fallback_err))
     }
 
     #[allow(clippy::type_complexity, clippy::too_many_arguments)]
@@ -839,7 +843,7 @@ impl ExecutionPlanDraft {
         let Some(chains) = self.whole_chains(definition, bound)? else {
             return Ok(Err(NoBank::Unstreamed(reason.clone())));
         };
-        // The longest chain the budget holds, each as `confirm` decides it.
+        // The longest tile-saturated chain the budget holds, each as `confirm` decides it.
         // When live headroom sits below structural capacity (e.g. an idle
         // 16 GB Mac whose OS leaves 8.9-10.7 GB below Metal's working set),
         // elastic KV history is allocated on demand after load: if no chain
@@ -1442,6 +1446,7 @@ impl ExecutionPlanDraft {
             .allocation_bytes();
         let floor_room = budget.room(&mandatory, &floor_charge)?;
         let fits_within = floor_bytes.saturating_add(floor_room);
+        let whole_cap = whole.whole_pass_cap(definition)?;
         let mut most: Option<magnitude_cost_model::HeldSlots> = None;
         let mut chosen: Option<(PassLaunches, u64, f64)> = None;
         for pass in super::pass_ladder(*places) {
@@ -1490,9 +1495,16 @@ impl ExecutionPlanDraft {
             let held = whole.bank().held_slots(bank_slots, host);
             // The smallest pass leaves the most slots.
             let most_ref = most.get_or_insert_with(|| held.clone());
+            // A bank that holds every expert whole has zero streamed prompt
+            // misses to amortize; once passes saturate one grouped-GEMM tile
+            // per expert (`whole_cap`), larger passes only grow the workspace
+            // arena linearly with context length.
+            if bank_slots >= whole.bank().widest().get() && pass > whole_cap {
+                break;
+            }
             let seconds = rates.decode_steps_per_s * prices.step_seconds(&held)
                 + rates.requests_per_s * prices.prompt_seconds(charge.held_pass.get() as u64, most_ref);
-            if chosen.as_ref().is_none_or(|(_, _, least)| seconds <= *least) {
+            if chosen.as_ref().is_none_or(|(_, _, least)| seconds < *least) {
                 chosen = Some((pass, mandatory_bytes, seconds));
             }
         }
@@ -1601,22 +1613,19 @@ impl ExecutionPlanDraft {
         }
     }
 
-    /// The draft holding its experts whole ([`Self::held_whole`]), where
-    /// the load's own bound holds its weights.
-    fn held_whole_within(&self, definition: &ModelDefinition, bound: HeldBound) -> Result<Option<Self>, PlanError> {
-        let whole = self.held_whole(definition)?;
-        let bytes = weight_bytes(&whole.load)?;
-        Ok(bound.limit.is_none_or(|limit| bytes <= limit.bytes()).then_some(whole))
+    /// The tile-saturated prompt-group pass ceiling for a whole (non-streamed)
+    /// plan, as a [`PassLaunches`].
+    fn whole_pass_cap(&self, definition: &ModelDefinition) -> Result<PassLaunches, PlanError> {
+        let max = usize::try_from(self.whole_places(definition)?)
+            .ok()
+            .and_then(std::num::NonZeroUsize::new)
+            .expect("invariant violated: whole_places is at least one launch");
+        Ok(PassLaunches::new(max))
     }
 
     /// The chains a plan holding its experts whole may run, longest first,
-    /// where the load's own bound holds its weights (which no chain
-    /// changes): a whole-context prompt's ([`Self::held_whole`]), then each
-    /// half of the one before, down to one launch a group, as a load without
-    /// routed experts runs. A shorter chain merges fewer chunks' passes and
-    /// commits less: one launch-row region per launch it runs
-    /// (`chain_rows`), and the graphs of the chains it seals. A placement
-    /// holds the longest whose plan the room holds.
+    /// starting from its tile-saturated [`Self::whole_places`] and halving
+    /// down to one launch, where `bound.limit` holds its unbanked weights.
     fn whole_chains(&self, definition: &ModelDefinition, bound: HeldBound) -> Result<Option<Vec<u64>>, PlanError> {
         if let Some(limit) = bound.limit {
             let bytes = if self.load.bank.is_some() {
@@ -1635,22 +1644,35 @@ impl ExecutionPlanDraft {
         Ok(Some(places))
     }
 
-    /// The draft with its experts held whole: its prompt groups chain every
-    /// chunk of a whole-context prompt, as a banked load's do (a chain is
-    /// what merges their passes); one launch where the load has no routed
-    /// experts, which have nothing to merge.
+    /// The draft with its experts held whole: its prompt groups chain up to
+    /// [`Self::whole_places`] launches.
     pub(crate) fn held_whole(&self, definition: &ModelDefinition) -> Result<Self, PlanError> {
         self.held_whole_at(definition, self.whole_places(definition)?)
     }
 
-    /// The most launches a group of a plan holding its experts whole
-    /// chains ([`Self::held_whole`]).
+    /// The most launches a prompt group of a whole (non-streamed) plan chains:
+    /// enough launches to fill one grouped-GEMM tile
+    /// ([`magnitude_cost_model::ROUTED_TILE_ROWS`]) per expert at the sparsest
+    /// routed layer (`ceil(experts * ROUTED_TILE_ROWS / (selected * max_launch_rows))`),
+    /// capped by `prompt_places(definition)`. Beyond one tile per expert, a
+    /// whole model has zero streaming misses to amortize, so larger passes
+    /// only grow the workspace arena linearly with context length.
     fn whole_places(&self, definition: &ModelDefinition) -> Result<u64, PlanError> {
-        match super::bank::routed_experts(definition) {
-            Ok(_) => Ok(self.prompt_places(definition)),
-            Err(PlanError::Unstreamed(UnstreamedExperts::Unrouted)) => Ok(1),
-            Err(error) => Err(error),
-        }
+        let launch_rows = (self.policy.limits.max_launch_rows as u64).max(1);
+        let needed = super::bank::routed_layers(definition)
+            .map(|(_, _, routed)| {
+                let denom = routed.selected.max(1).saturating_mul(launch_rows);
+                routed
+                    .experts
+                    .saturating_mul(magnitude_cost_model::ROUTED_TILE_ROWS)
+                    .div_ceil(denom)
+                    .max(1)
+            })
+            .max();
+        Ok(match needed {
+            Some(launches) => launches.min(self.prompt_places(definition)).max(1),
+            None => 1,
+        })
     }
 
     /// The draft with its experts held whole, its prompt groups chaining up
@@ -3916,7 +3938,7 @@ mod tests {
         match draft.placed::<AssessmentMemoryCharge>(&definition, None, &memory_alone(), &super::MemoryBudget::of_stable(&planned).unwrap()).unwrap() {
             Placed::Whole(placed) => {
                 assert!(placed.draft.load().expert_bank().is_none_or(|bank| bank.whole()), "the served load holds every expert");
-                assert_eq!(placed.draft.policy.limits.chain_capacity.get(), 8, "the served load chains every chunk of its 4,096-token prompt");
+                assert_eq!(placed.draft.policy.limits.chain_capacity.get(), 2, "the served whole load chains enough launches to saturate one 32-row tile per expert (256 experts / 8 selected / 512 rows = 2)");
             }
             Placed::Short(_) => panic!("the served load's one conversation holds the experts whole"),
         }
@@ -4204,6 +4226,81 @@ mod tests {
             .filter(|weight| crate::operators::routed::streamed::resident_form(load, weight.role.scope))
             .count();
         assert_eq!(resident, 0, "a bank starting at {} of {} slots commits resident-form graphs", held.slots, held.widest());
+    }
+
+    /// When a bank fits all experts whole (`slots == ceiling`), the planner
+    /// bounds merged passes to the tile-saturation count (`whole_pass_cap`,
+    /// 3 launches for 384 experts / top-8 / 512 rows) instead of tying upward
+    /// to the full 128-place context chain and allocating tens of gigabytes of
+    /// unused workspace arena.
+    #[test]
+    fn a_whole_bank_keeps_floor_pass_instead_of_allocating_full_chain_arena() {
+        let (_, _, device) = recorded(seismic::fixtures::recorded::m4_pro(), BackendName::Metal, 0, seismic::GraphCost::None);
+        let (definition, draft) = far_larger(device);
+        let bound = HeldBound::of(None, 512_000_000_000);
+        let BankCeiling { whole, ceiling, places, .. } = draft.bank_ceiling(&definition, bound, None).unwrap().unwrap();
+        let expected_cap = draft.whole_pass_cap(&definition).unwrap();
+        assert_eq!(expected_cap.get(), 3, "384 experts * 32 tile rows / (8 selected * 512 launch rows) = 3 launches");
+        assert!(expected_cap < places, "setup: tile-saturation cap ({expected_cap:?}) must be far below full chain ({places:?})");
+        let floor_bytes = whole
+            .resized(ceiling, ceiling, PassLaunches::FLOOR)
+            .unwrap()
+            .allocation_bytes(&definition)
+            .unwrap();
+        let budget = super::MemoryBudget::fixed(floor_bytes + 128_000_000_000, None);
+        let (planned, ()) = draft
+            .with_held_experts(
+                &definition,
+                bound,
+                &synthetic(),
+                &budget,
+                |_, _| Ok::<_, PlanError>(Ok(())),
+            )
+            .unwrap()
+            .unwrap_or_else(|no| panic!("a whole bank fits with 128 GB headroom: {no:?}"));
+        let held = planned.draft().load().expert_bank().unwrap();
+        assert_eq!(held.slots, held.widest().get(), "all experts fit whole");
+        assert_eq!(
+            held.pass,
+            expected_cap,
+            "whole bank must cap merged passes at tile saturation ({expected_cap:?}), not full chain ({places:?})"
+        );
+    }
+
+    /// A `WholeForm::Resident` large MoE load applies the exact same
+    /// tile-saturation `whole_places` cap as `WholeForm::Bank`, refusing to
+    /// scale its merged-pass workspace arena linearly with context length even
+    /// when ample free RAM is available (#294, #238).
+    #[test]
+    fn a_large_whole_resident_moe_caps_merged_pass_arena() {
+        let (_, _, device) = recorded(seismic::fixtures::recorded::m4_pro(), BackendName::Cpu, 0, seismic::GraphCost::None);
+        let (definition, draft) = far_larger(device);
+        let prompt_places = draft.prompt_places(&definition);
+        let expected_places = draft.whole_places(&definition).unwrap();
+        assert_eq!(expected_places, 3, "384 experts * 32 tile rows / (8 selected * 512 launch rows) = 3 launches");
+        assert!(expected_places < prompt_places, "setup: whole_places ({expected_places}) must be far below prompt_places ({prompt_places})");
+        let floor_bytes = draft
+            .held_whole_at(&definition, 1)
+            .unwrap()
+            .allocation_bytes(&definition)
+            .unwrap();
+        let budget = super::MemoryBudget::fixed(floor_bytes + 128_000_000_000, None);
+        let (planned, ()) = draft
+            .with_held_experts(
+                &definition,
+                HeldBound::of(None, 512_000_000_000),
+                &synthetic(),
+                &budget,
+                |_, _| Ok::<_, PlanError>(Ok(())),
+            )
+            .unwrap()
+            .unwrap_or_else(|no| panic!("whole resident fits with 128 GB headroom: {no:?}"));
+        assert!(planned.draft().load().expert_bank().is_none(), "CPU load is WholeForm::Resident");
+        assert_eq!(
+            planned.draft().policy().limits().chain_capacity.get() as u64,
+            expected_places,
+            "whole resident must cap chain_capacity at tile saturation ({expected_places}), not full prompt_places ({prompt_places})"
+        );
     }
 
     /// A DeepSeek V4.1-sized routed model (40 layers of 384 experts
@@ -4784,7 +4881,7 @@ mod tests {
         let (topology, _, device) = recorded(seismic::fixtures::recorded::m4_pro(), BackendName::Cpu, 0, seismic::GraphCost::None);
         let mut definition = routed_fixture_definition(RoutedShape {
             layers: 4,
-            experts: 32,
+            experts: 512,
             selected: 4,
             hidden: 1024,
             intermediate: 512,

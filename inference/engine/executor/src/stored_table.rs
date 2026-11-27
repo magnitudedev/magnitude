@@ -434,7 +434,7 @@ impl Slots {
 
     /// Whether the record of slot `slot` is held.
     fn holds(&self, slot: usize) -> bool {
-        self.store.slab_region(slot / self.record_rows(), 0).expect("a slot's record lies in the store").is_some()
+        self.store.is_backed(slot / self.record_rows())
     }
 
     /// The resident row of `slot`, of a record held: one slab's view.
