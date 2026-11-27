@@ -969,6 +969,7 @@ enum class specialized_handler {
     ministral_3,
     gpt_oss,
     muse_glimmer,
+    inkling2,
     functionary_v3_2,
     kimi_k2,
     kimi_k3,
@@ -999,6 +1000,13 @@ static specialized_handler match_specialized_handler(const std::string & src) {
     // Muse Glimmer format using " to=<recipient>" recipients and <|eom|>/<|eot|> message terminators.
     if (src.find("<atem:function_calls>") != std::string::npos && src.find("<|eom|>") != std::string::npos) {
         return specialized_handler::muse_glimmer;
+    }
+
+    // Inkling 2 format using <|message_model|>, <|content_invoke_tool_json|>, and <|end_message|>.
+    if (src.find("<|message_model|>") != std::string::npos &&
+        src.find("<|content_invoke_tool_json|>") != std::string::npos &&
+        src.find("<|end_message|>") != std::string::npos) {
+        return specialized_handler::inkling2;
     }
 
     // Functionary v3.2 - uses recipient-based format with >>>recipient\n{content}
@@ -1096,6 +1104,8 @@ static std::vector<std::string> specialized_handler_context_variables(specialize
     switch (handler) {
         case specialized_handler::muse_glimmer:
             return { "enable_thinking", "reasoning_effort", "reasoning_strength" };
+        case specialized_handler::inkling2:
+            return { "enable_thinking", "reasoning_effort" };
         case specialized_handler::deepseek_v3_2:
         case specialized_handler::minimax_m3:
         case specialized_handler::qwen3_coder:
@@ -1131,6 +1141,9 @@ std::optional<common_chat_params> common_chat_try_specialized_template(
         case specialized_handler::muse_glimmer:
             LOG_DBG("Using specialized template: Muse Glimmer\n");
             return common_chat_params_init_muse_glimmer(tmpl, params);
+        case specialized_handler::inkling2:
+            LOG_DBG("Using specialized template: Inkling 2\n");
+            return common_chat_params_init_inkling2(tmpl, params);
         case specialized_handler::functionary_v3_2:
             LOG_DBG("Using specialized template: Functionary v3.2\n");
             return common_chat_params_init_functionary_v3_2(tmpl, params);

@@ -8,6 +8,7 @@ use magnitude_templates::{
 use serde_json::{json, Value};
 
 const GEMMA4: &str = include_str!("assets/gemma-4-12B-it.jinja");
+const INKLING2: &str = include_str!("assets/Inkling-2-Mini.jinja");
 const LFM25: &str = include_str!("assets/LFM2.5-2.6B.jinja");
 const LFM25_MOE: &str = include_str!("assets/LFM2.5-8B-A1B.jinja");
 const LFM25_SMALL_THINKING: &str = include_str!("assets/LFM2.5-1.2B-Thinking.jinja");
@@ -103,6 +104,15 @@ fn families() -> Vec<Family> {
             enable_thinking: true,
             generation_prompt: "<|turn>model\n",
             output: "<|channel>thought\nThe user wants weather.<channel|><|tool_call>call:get_weather{city:<|\"|>Paris<|\"|>,note:<|\"|>first line\nsecond <line> & more<|\"|>}<tool_call|>",
+            reasoning: "The user wants weather.",
+        },
+        Family {
+            name: "inkling2",
+            source: INKLING2,
+            special: special("", "<|content_model_end_sampling|>"),
+            enable_thinking: false,
+            generation_prompt: "",
+            output: "<|message_model|><|content_thinking|>The user wants weather.<|end_message|><|message_model|>get_weather<|content_invoke_tool_json|>{\"name\":\"get_weather\",\"args\":{\"city\":\"Paris\",\"note\":\"first line\\nsecond <line> & more\"}}<|end_message|><|content_model_end_sampling|>",
             reasoning: "The user wants weather.",
         },
         Family {
@@ -692,4 +702,95 @@ fn lfm3_and_lfm2_closed_prefix_disable_reasoning_extraction() {
             ..Default::default()
         }
     );
+}
+
+#[test]
+fn inkling2_supports_reasoning_tools_disabled_thinking_and_media_markers() {
+    let template = Template::new(INKLING2, &special("", "<|content_model_end_sampling|>")).unwrap();
+
+    // 1. Default chat: separates reasoning and final text, strips EOS marker.
+    let chat_req = Request::new(
+        vec![json!({"role":"user","content":"What is 2+2?"})],
+        946684800,
+    );
+    let chat_prepared = template.prepare(&chat_req).unwrap();
+    assert_eq!(
+        parse(
+            &chat_prepared,
+            "<|message_model|><|content_thinking|>2+2 is 4.<|end_message|><|message_model|><|content_text|>4<|end_message|><|content_model_end_sampling|>"
+        )
+        .unwrap(),
+        Transcript {
+            reasoning: "2+2 is 4.".into(),
+            content: "4".into(),
+            ..Default::default()
+        }
+    );
+
+    // 2. Disabled thinking sets reasoning_effort=none (0) and prefills <|message_model|><|content_text|>.
+    let mut disabled_req = Request::new(
+        vec![json!({"role":"user","content":"Say hi"})],
+        946684800,
+    );
+    disabled_req
+        .template_arguments
+        .insert("enable_thinking".into(), json!(false));
+    let disabled_prepared = template.prepare(&disabled_req).unwrap();
+    assert!(disabled_prepared
+        .description()
+        .prompt
+        .contains("Thinking effort level: 0<|end_message|>"));
+    assert_eq!(
+        disabled_prepared.description().generation_prefix,
+        "<|message_model|><|content_text|>"
+    );
+    assert_eq!(
+        parse(&disabled_prepared, "Hi!<|end_message|><|content_model_end_sampling|>").unwrap(),
+        Transcript {
+            content: "Hi!".into(),
+            ..Default::default()
+        }
+    );
+
+    // 3. Multimodal user message: internal media_marker converts into Inkling 2's image message.
+    let img_req = Request::new(
+        vec![json!({
+            "role": "user",
+            "content": [
+                {"type": "media_marker", "text": "<|content_image|><|unused_200054|><|end_message|>"},
+                {"type": "text", "text": "What color is this?"}
+            ]
+        })],
+        946684800,
+    );
+    let img_prepared = template.prepare(&img_req).unwrap();
+    assert!(img_prepared
+        .description()
+        .prompt
+        .contains("<|message_user|><|content_image|><|unused_200054|><|end_message|><|message_user|><|content_text|>What color is this?<|end_message|>"));
+
+    // 4. Multi-turn tool history with string arguments parses to JSON objects cleanly.
+    let mut history_req = request(false);
+    history_req.messages = vec![
+        json!({"role":"user","content":"Weather in Paris?"}),
+        json!({
+            "role":"assistant",
+            "content":"",
+            "tool_calls":[{
+                "id":"call_1",
+                "type":"function",
+                "function":{"name":"get_weather","arguments":"{\"city\":\"Paris\",\"note\":\"ok\"}"}
+            }]
+        }),
+        json!({"role":"tool","tool_call_id":"call_1","content":"20C sunny"}),
+    ];
+    let history_prepared = template.prepare(&history_req).unwrap();
+    assert!(history_prepared
+        .description()
+        .prompt
+        .contains("<|message_model|>get_weather<|content_invoke_tool_json|>{\"name\":\"get_weather\",\"args\":{\"city\":\"Paris\",\"note\":\"ok\"}}<|end_message|>"));
+    assert!(history_prepared
+        .description()
+        .prompt
+        .contains("<|message_tool|>get_weather<|content_text|>20C sunny<|end_message|>"));
 }
