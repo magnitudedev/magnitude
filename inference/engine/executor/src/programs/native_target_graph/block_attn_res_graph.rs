@@ -44,26 +44,16 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
 /// Device-memory envelope (bytes) required by `BoundBlockAttnRes` for its
-/// per-step `BarStepBuffers` across up to `places` concurrent prefill chunks,
-/// shared `NativeGraphFamilySlot`s, and 2-slot `decode_ring` (priced directly
-/// from exact `BarStepBuffers` / `BarStepScratch` shapes).
-pub(crate) fn block_attn_res_graph_bytes(
+/// runtime scratch (`shared_slots` + 2-slot `decode_ring`), allocated from
+/// `BoundBlockAttnRes::charges` (`binding_constant_bytes`) alongside
+/// `prefill_bufs`.
+pub(crate) fn block_attn_res_runtime_scratch_bytes(
     max_rows: u64,
     hidden: u64,
     max_sources: u64,
     max_bank: u64,
-    places: usize,
 ) -> u64 {
     let row_f32 = max_rows.saturating_mul(hidden).saturating_mul(4);
-    let prefill_bank_and_prelude = if max_bank > 0 {
-        max_bank.saturating_add(1)
-    } else {
-        0
-    };
-    let per_place = max_sources
-        .saturating_add(prefill_bank_and_prelude)
-        .saturating_add(2)
-        .saturating_mul(row_f32);
     let shared_slots = 20u64.saturating_mul(row_f32);
 
     // 2-slot `decode_ring` for `m <= VERIFY_ROWS`: each slot owns one
@@ -92,10 +82,7 @@ pub(crate) fn block_attn_res_graph_bytes(
             .saturating_add(decode_ctrl_per_slot),
     );
 
-    per_place
-        .saturating_mul(places.max(1) as u64)
-        .saturating_add(shared_slots)
-        .saturating_add(decode_ring)
+    shared_slots.saturating_add(decode_ring)
 }
 
 /// Static residual-bank slot schedule for one block, derived once from
@@ -3857,6 +3844,10 @@ pub(crate) fn queue_sealed_chain(
     let mut shared_slots: HashMap<usize, (Arc<BoundBarFamily>, NativeGraphFamilySlot)> =
         HashMap::new();
     if ring_guard.is_none() {
+        let active_fids: Vec<usize> = prepped
+            .iter()
+            .map(|ps| Arc::as_ptr(&ps.family) as usize)
+            .collect();
         for ps in &prepped {
             let fid = Arc::as_ptr(&ps.family) as usize;
             if !shared_slots.contains_key(&fid) {
@@ -3868,11 +3859,35 @@ pub(crate) fn queue_sealed_chain(
                     .take();
                 let slot = match reused {
                     Some(s) => s,
-                    None => ps
-                        .family
-                        .family
-                        .new_slot(charges, &[])
-                        .map_err(|e| format!("bar shared_slot(m={}): {e}", ps.m))?,
+                    None => {
+                        // Release cached prefill slots and scratch pools held by
+                        // other chunk-size families so switching chunk sizes (e.g.
+                        // m=512 -> m=128) stays within the single-slot budget.
+                        if let Ok(families) = bound_bar.families.lock() {
+                            for other in families.values() {
+                                let ofid = Arc::as_ptr(other) as usize;
+                                if active_fids.contains(&ofid) {
+                                    continue;
+                                }
+                                if let Ok(mut g) = other.prefill_slot.lock() {
+                                    let _ = g.take();
+                                }
+                                if let Ok(mut g) = other.prefill_bufs_pool.lock() {
+                                    g.clear();
+                                }
+                                if let Ok(mut g) = other.prefill_grouped_pool.lock() {
+                                    g.clear();
+                                }
+                                if let Ok(mut g) = other.prefill_merged_pool.lock() {
+                                    g.clear();
+                                }
+                            }
+                        }
+                        ps.family
+                            .family
+                            .new_slot(charges, &[])
+                            .map_err(|e| format!("bar shared_slot(m={}): {e}", ps.m))?
+                    }
                 };
                 shared_slots.insert(fid, (ps.family.clone(), slot));
             }

@@ -164,14 +164,6 @@ fn checked_block_attn_res_family(
         .map_err(|error| GraphError::from(error.to_string()))?;
     let max_rows = limits.max_launch_rows as u64;
     let hidden = geometry.hidden;
-    // Shared sealed-graph workspace envelope for BlockAttnRes.
-    let workspace_bytes = super::block_attn_res_graph::block_attn_res_graph_bytes(
-        max_rows,
-        hidden,
-        bar.max_sources as u64,
-        bar.max_bank as u64,
-        pass.get(),
-    );
     let output_bytes = max_rows.saturating_mul(hidden).saturating_mul(4);
     let tap_count = plan.taps().map_or(0, |t| t.points.len() as u64);
     let tap_bytes = if tap_count > 0 {
@@ -187,13 +179,6 @@ fn checked_block_attn_res_family(
         0
     };
     let upload_bytes = max_rows.saturating_mul(64);
-    let storage = seismic::NativeGraphStorageBytes {
-        workspace: workspace_bytes,
-        sync: 0,
-        output: output_bytes,
-        upload: upload_bytes,
-        recorded: Default::default(),
-    };
     let prefill_exts = super::block_attn_res_graph::BarStepBuffers::extents(
         bar.max_sources as u64,
         bar.max_bank as u64,
@@ -202,7 +187,25 @@ fn checked_block_attn_res_family(
     );
     let binding_constant_bytes = super::extents_bytes(prefill_exts.iter())
         .map_err(GraphError::from)?
-        .saturating_mul(pass.get() as u64);
+        .saturating_mul(pass.get() as u64)
+        .saturating_add(
+            super::block_attn_res_graph::block_attn_res_runtime_scratch_bytes(
+                max_rows,
+                hidden,
+                bar.max_sources as u64,
+                bar.max_bank as u64,
+            ),
+        );
+    // `BoundBlockAttnRes` allocates its step buffers, shared slot, and decode
+    // ring directly from `BoundBlockAttnRes::charges` (`binding_constant_bytes`),
+    // not from the shared target-graph workspace arena (`storage.workspace`).
+    let storage = seismic::NativeGraphStorageBytes {
+        workspace: 0,
+        sync: 0,
+        output: output_bytes,
+        upload: upload_bytes,
+        recorded: Default::default(),
+    };
     let resources = CheckedGraphResources {
         storage,
         graphs: LaunchGraphs::default(),

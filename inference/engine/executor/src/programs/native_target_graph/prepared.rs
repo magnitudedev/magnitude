@@ -1044,9 +1044,18 @@ impl PreparedTargetGraphs {
                     self.passes.region,
                     bar.hidden,
                 );
-                super::extents_bytes(exts.iter())?
+                let prefill = super::extents_bytes(exts.iter())?
                     .checked_mul(self.passes.launches as u64)
-                    .ok_or_else(|| "BlockAttnRes prefill buffers overflow".to_string())?
+                    .ok_or_else(|| "BlockAttnRes prefill buffers overflow".to_string())?;
+                let scratch = super::block_attn_res_graph::block_attn_res_runtime_scratch_bytes(
+                    self.passes.region,
+                    bar.hidden,
+                    bar.schedule.max_sources,
+                    bar.schedule.max_bank,
+                );
+                prefill
+                    .checked_add(scratch)
+                    .ok_or_else(|| "BlockAttnRes runtime scratch overflow".to_string())?
             }
             None => 0,
         };
