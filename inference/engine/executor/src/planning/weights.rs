@@ -2240,7 +2240,7 @@ impl ModelLoadPlan {
                 let bytes = match weight.holding {
                     Holding::Whole => representation_bytes(weight.source, &weight.shape)?,
                     Holding::Streamed(streamed) => representation_bytes(weight.source, &[streamed.table_rows, weight.table_width()])?,
-                    Holding::Banked { .. } => representation_bytes(weight.source, &weight.shape)?,
+                    Holding::Banked { .. } => representation_bytes(weight.source, &weight.descriptor.shape)?,
                 };
                 stored = stored.checked_add(bytes).ok_or_else(overflow)?;
             }
