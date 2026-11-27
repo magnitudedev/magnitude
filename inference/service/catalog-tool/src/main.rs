@@ -1,4 +1,5 @@
 mod audit;
+mod deepseek41_legacy;
 mod fixture_header;
 mod gguf_source;
 mod slice;
@@ -147,6 +148,8 @@ enum Command {
         #[command(subcommand)]
         source: GgufSource,
     },
+    /// Convert local legacy DeepSeek V4.1 GSQ-RCO GGUFs to a verified upstream six-shard bundle.
+    ImportDeepseek41Legacy(deepseek41_legacy::Options),
     /// Write the provenance record `<OUTPUT>.json` of a local slice another tool wrote (a
     /// converter's slice of a checkpoint's main layers), in `slice`'s format.
     SliceRecord {
@@ -679,6 +682,9 @@ async fn run(command: Command) -> anyhow::Result<()> {
             list,
             parallel,
         })),
+        Command::ImportDeepseek41Legacy(options) => {
+            Box::pin(async move { deepseek41_legacy::run(options) })
+        },
         Command::SliceRecord {
             source,
             layers,

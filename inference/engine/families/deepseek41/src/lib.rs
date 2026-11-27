@@ -61,7 +61,7 @@ mod family;
 pub use family::DeepSeek41Family;
 
 use magnitude_artifacts::{
-    gguf::{Directory, Scalar, Value},
+    gguf::{Directory, Encoding, Scalar, Value},
     PackageIdentity, UnsupportedReason,
 };
 use magnitude_family_common::{
@@ -189,10 +189,45 @@ struct CandidatePool {
     block_units: u64,
 }
 
+/// Recognize the old GSQ-RCO layout by its source-list keys and Engram
+/// constant tensors, not by a missing upstream key or a file name alone.
+fn legacy_gsq_rco(directory: &Directory) -> bool {
+    [
+        "deepseek41.attention.kv_source_layers",
+        "deepseek41.attention.indexer.source_layers",
+        "deepseek41.ple.layers",
+        "deepseek41.engram.token_map",
+    ]
+    .iter()
+    .all(|key| directory.value(key).is_none())
+        && [
+            "deepseek41.kv_source_layer_ids",
+            "deepseek41.index_source_layer_ids",
+        ]
+        .iter()
+        .all(|key| matches!(directory.value(key), Some(Value::Array(_))))
+        && [
+            ("engram_token_map.weight", Encoding::I32),
+            ("engram_primes.weight", Encoding::I64),
+            ("engram_offsets.weight", Encoding::I64),
+            ("engram_multipliers.weight", Encoding::I64),
+        ]
+        .into_iter()
+        .all(|(name, encoding)| {
+            directory
+                .tensor(name)
+                .is_some_and(|tensor| tensor.encoding == encoding)
+        })
+}
+
 /// Every decoder layer's [`Compression`]. Index sources after the candidate
 /// source restrict to its pool, which therefore must index the rows they
 /// read: the latest kv source.
-fn compressions(m: &Metadata, layers: u64) -> Result<Vec<Compression>, FamilyError> {
+fn compressions(
+    m: &Metadata,
+    layers: u64,
+    directory: &Directory,
+) -> Result<Vec<Compression>, FamilyError> {
     let ratios = m.counts("attention.compress_ratios")?;
     // The entries past the decoder's layers are the DSpark drafter's, a
     // separate file, whose layers attend a window.
@@ -254,6 +289,18 @@ fn compressions(m: &Metadata, layers: u64) -> Result<Vec<Compression>, FamilyErr
             })
         })
         .transpose()?;
+    if kv.is_empty() && index.is_empty() && legacy_gsq_rco(directory) {
+        return Err(FamilyError::unsupported(
+            vec![UnsupportedReason::ArtifactLayout {
+                layout: "legacy DeepSeek V4.1 GSQ-RCO GGUF".into(),
+                replacement: "the upstream six-shard GGUF format with its Engram shard".into(),
+            }],
+            "DeepSeek V4.1 legacy GSQ-RCO GGUF cannot be loaded directly. Use the upstream-format \
+             six-shard GGUF (including its Engram shard), or run `import-deepseek41-legacy` in \
+             `magnitude-service-catalog-tool` to convert local inputs without changing them. See \
+             `magnitude docs custom-models` for download and import instructions.",
+        ));
+    }
     let latest = |sources: &[u64], layer: u64| sources.iter().copied().filter(|s| *s <= layer).max();
     (0..layers)
         .map(|layer| {
@@ -739,7 +786,7 @@ pub fn inspect_components(
     // any stray drafter tensors are still rejected by `Tensors::finish`.
     m.ignore_prefix("dspark.");
     let layers = m.bounded_block_count("block_count")?;
-    let compressions = compressions(&m, layers)?;
+    let compressions = compressions(&m, layers, directory)?;
     let engram = Engram::read(&m, layers)?;
     if compressions.iter().all(|layer| *layer == Compression::None) {
         // The converter writes compressed-layer rotary and indexer keys even

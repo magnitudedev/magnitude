@@ -1,11 +1,11 @@
 import { renderToStaticMarkup } from "react-dom/server"
 import { Option, Schema } from "effect"
 import { describe, expect, it } from "vitest"
-import { CatalogFormModelIdSchema, CatalogSupportSchema, LocalModelMutationFailed, QuantNameSchema, type LocalModel } from "@magnitudedev/sdk"
+import { CatalogFormModelIdSchema, CatalogSupportSchema, LocalModelMutationFailed, QuantNameSchema, UnsupportedLocalModelSchema, type LocalModel } from "@magnitudedev/sdk"
 import type { LocalModelCommandStatus } from "@magnitudedev/client-common"
 import { makeSetupModel, streamedReadyResidency } from "@magnitudedev/client-common/fixtures/model"
 import { modelLabs } from "../model-logo"
-import { ownedModel } from "./data"
+import { ownedModel, unrunnableFile } from "./data"
 import { modelRowAction, OwnedModels } from "./models-screen"
 import { matchingModels, YourModels } from "./your-models"
 
@@ -17,6 +17,11 @@ const model = ownedModel(baseModel, "Device")
 const EMPTY = <p>No models are downloaded yet.</p>
 const list = <YourModels models={[model]} action={() => null} onExploreQuants={() => {}} onRemove={() => {}} onDrafter={() => {}} />
 const noopActions = { loadPending: false, onLoad: () => {}, onStop: () => {}, onCancel: () => {}, onRetryInstall: () => {} }
+const legacyLayout = {
+  _tag: "ArtifactLayout",
+  layout: "legacy DeepSeek V4.1 GSQ-RCO GGUF",
+  replacement: "the upstream six-shard GGUF format with its Engram shard",
+} as const
 
 const replacementModel: LocalModel = {
   ...makeSetupModel(false),
@@ -235,7 +240,29 @@ describe("the user's models", () => {
     expect(pendingHtml).not.toContain(">Load</button>")
   })
 
-  it("shows Not supported with the engine reason instead of Doesn’t fit for unsupported downloaded models", () => {
+  it("maps a discovered legacy file from the public assessment instead of developer detail", () => {
+    const displayName = "DeepSeek V4.1 Flash GSQ-RCO"
+    const wire = Schema.decodeUnknownSync(UnsupportedLocalModelSchema)({
+      displayName,
+      origin: { _tag: "Found", source: { _tag: "Folder", path: "/models" } },
+      path: "/models/legacy-00001-of-00004.gguf",
+      reasons: [
+        { _tag: "WeightTypes", types: [{ ggmlType: "I32", tensorCount: 1 }, { ggmlType: "I64", tensorCount: 3 }] },
+        legacyLayout,
+      ],
+      detail: "private engine diagnostic",
+    })
+    const discovered = unrunnableFile(wire)
+    expect(discovered.name).toBe(displayName)
+    expect(discovered.reason).toContain("Use the upstream six-shard GGUF format with its Engram shard")
+    expect(discovered.reason).toContain("magnitude docs custom-models")
+    expect(discovered.reason).not.toContain("private engine diagnostic")
+  })
+
+  it.each([
+    [{ _tag: "UnrecognizedMetadata", key: "lfm3.attention.causal" } as const, "Has parts Magnitude doesn't recognize (lfm3.attention.causal)", "Has parts Magnitude doesn&#x27;t recognize (lfm3.attention.causal)"],
+    [legacyLayout, "Use the upstream six-shard GGUF format with its Engram shard", "magnitude docs custom-models"],
+  ])("shows Not supported with %j instead of Doesn’t fit for unsupported downloaded models", (reason, viewText, htmlText) => {
     const assessed = baseModel.servingState._tag === "Assessed" ? baseModel.servingState : (() => { throw new Error("expected assessed") })()
     const unsupported: LocalModel = {
       _tag: "Custom",
@@ -261,14 +288,14 @@ describe("the user's models", () => {
           _tag: "Unsupported",
           environmentId: assessed.assessment.environmentId,
           profile: Option.none(),
-          reasons: [{ _tag: "UnrecognizedMetadata", key: "lfm3.attention.causal" }],
-          detail: 'unknown metadata ["lfm3.attention.causal"]',
+          reasons: [reason],
+          detail: "private engine diagnostic",
         },
       },
       storageBytes: 1_480_000_000,
     }
     const view = ownedModel(unsupported, "Unified")
-    expect(view.unsupported).toBe("Has parts Magnitude doesn't recognize (lfm3.attention.causal)")
+    expect(view.unsupported).toContain(viewText)
     const html = renderToStaticMarkup(
       <YourModels
         models={[view, model]}
@@ -280,7 +307,8 @@ describe("the user's models", () => {
     )
     expect(html).toContain("2 downloaded models")
     expect(html).toContain("Not supported")
-    expect(html).toContain("Has parts Magnitude doesn&#x27;t recognize (lfm3.attention.causal)")
+    expect(html).toContain(htmlText)
+    expect(html).not.toContain("private engine diagnostic")
     expect(html).not.toContain("Doesn’t fit")
   })
 

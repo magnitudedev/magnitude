@@ -765,6 +765,9 @@ fn unsupported_reason(reason: EngineUnsupportedReason) -> UnsupportedReason {
             KnownUnsupportedReason::TargetMismatch { detail }
         }
         EngineUnsupportedReason::TiedOutputHead => KnownUnsupportedReason::TiedOutputHead,
+        EngineUnsupportedReason::ArtifactLayout { layout, replacement } => {
+            KnownUnsupportedReason::ArtifactLayout { layout, replacement }
+        }
         EngineUnsupportedReason::DraftArchitecture { architecture } => {
             KnownUnsupportedReason::DraftArchitecture { architecture }
         }
@@ -1181,6 +1184,39 @@ mod tests {
             )]
         );
         assert_eq!(detail, format!("missing metadata {key}"));
+    }
+
+    #[test]
+    fn legacy_deepseek_header_refusal_survives_native_assessment_serialization() {
+        use magnitude_artifacts::gguf::{
+            Array, Encoding, Metadata, Scalar, StoredHeader, StoredMetadata, StoredType, Value,
+            ValueType, read_header,
+        };
+        let metadata = [
+            ("general.architecture", Value::Scalar(Scalar::String("deepseek41".into())), StoredType::Scalar(ValueType::String)),
+            ("deepseek41.block_count", Value::Scalar(Scalar::Unsigned(3)), StoredType::Scalar(ValueType::U32)),
+            ("deepseek41.attention.compress_ratios", Value::Array(Array::from(vec![0_u64, 0, 2])), StoredType::Array(ValueType::U32)),
+            ("deepseek41.kv_source_layer_ids", Value::Array(Array::from(vec![2_u64])), StoredType::Array(ValueType::U32)),
+            ("deepseek41.index_source_layer_ids", Value::Array(Array::from(vec![2_u64])), StoredType::Array(ValueType::U32)),
+        ].map(|(name, value, stored)| StoredMetadata { metadata: Metadata { name: name.into(), value }, stored });
+        let tensors = [
+            ("engram_token_map.weight", Encoding::I32),
+            ("engram_primes.weight", Encoding::I64),
+            ("engram_offsets.weight", Encoding::I64),
+            ("engram_multipliers.weight", Encoding::I64),
+        ].map(|(name, encoding)| (name.into(), vec![1], encoding));
+        let stored = StoredHeader::new(3, metadata.into(), tensors).unwrap();
+        let header = read_header(stored.encode().unwrap()).unwrap();
+        let reasons = EngineHeaderVerdicts.refusal(&header, HeaderExtent::Whole);
+        let wire = serde_json::to_value(reasons).unwrap();
+        assert!(
+            wire.as_array().unwrap().contains(&serde_json::json!({
+                "_tag": "ArtifactLayout",
+                "layout": "legacy DeepSeek V4.1 GSQ-RCO GGUF",
+                "replacement": "the upstream six-shard GGUF format with its Engram shard",
+            })),
+            "{wire}"
+        );
     }
 
     fn resolved_model(path: &str) -> ResolvedModel {

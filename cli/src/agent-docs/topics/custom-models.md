@@ -48,6 +48,59 @@ its Hugging Face page (some models also need the author's approval), then try ag
 that model: an added model to its repository's newer commit, and any model to a newer revision of
 its recommended model's drafter.
 
+## Legacy DeepSeek V4.1 GSQ-RCO GGUFs
+
+The original four-shard GSQ-RCO layout with a separate Engram file cannot be loaded directly.
+If you don't have a Magnitude source checkout, use the
+[upstream-format GSQ-RCO release](https://huggingface.co/ISTA-DASLab/DeepSeek-V4.1-Flash-1017-GSQ-RCO-GGUF/tree/65d53bc8be65123e255ff02f3ded958b6dbf54fd)
+instead. Download shards `00001-of-00006` through `00005-of-00006` for one quantization, plus
+`DeepSeek-V4.1-Flash-Engram-IQ4_NL.gguf` **from the same converted revision**. In the download
+directory, name that new Engram copy `<model-prefix>-00006-of-00006.gguf`, using the prefix from the
+other five shards. Add the directory with
+`magnitude models folders add /path/to/model-directory`.
+
+To reuse an original download, run Magnitude's catalog tool from an up-to-date source checkout
+with its pinned Rust toolchain and a native build toolchain. Keep the four original backbone
+shards in one folder and supply the original `DeepSeek-V4.1-Flash-Engram-IQ4_NL.gguf`. Download
+[`chat_template.jinja`](https://huggingface.co/ISTA-DASLab/DeepSeek-V4.1-Flash-1017-GSQ-RCO-GGUF/resolve/65d53bc8be65123e255ff02f3ded958b6dbf54fd/chat_template.jinja)
+and [`exp_probs_b_vl.f32`](https://huggingface.co/ISTA-DASLab/DeepSeek-V4.1-Flash-1017-GSQ-RCO-GGUF/resolve/65d53bc8be65123e255ff02f3ded958b6dbf54fd/exp_probs_b_vl.f32)
+from that pinned release. The importer checks both hashes and does not fetch anything.
+
+Prepare `SHA256SUMS` with five `sha256sum`-format lines: each 64-digit SHA-256, two spaces, then the
+local basename of one original backbone shard or the original Engram file. No paths or duplicate
+names. Take the hashes from the publisher's trusted legacy revision, not from the already-downloaded
+files. On Hugging Face, open each file's details at its exact commit and use the LFS SHA-256, or run
+`curl -fsSI 'https://huggingface.co/OWNER/REPO/resolve/COMMIT/FILE'` and use the 64-digit
+`x-linked-etag` (without quotes) on the Hub response. Check `x-repo-commit` against the intended commit.
+Do not use a branch name, the Xet hash, or the ETag from the redirected CDN response. For an edited
+variant, use the hashes published for that exact variant, not hashes for the stock ISTA weights.
+If a trusted source cannot supply them, use the already-converted release instead.
+
+From the checkout's `inference` directory, using absolute paths:
+
+```sh
+cargo run --release --locked -p magnitude-service-catalog-tool -- import-deepseek41-legacy \
+  /path/to/legacy/MODEL-00001-of-00004.gguf \
+  --engram /path/to/legacy/DeepSeek-V4.1-Flash-Engram-IQ4_NL.gguf \
+  --chat-template /path/to/chat_template.jinja \
+  --vision-bias /path/to/exp_probs_b_vl.f32 \
+  --source-sha256 /path/to/SHA256SUMS \
+  --output /path/to/new-model-directory --dry-run
+```
+
+The dry run checks the manifest, headers, and small conversion inputs and reports the exact output
+size. Allow hundreds of GB for a full bundle. A dry run does not authenticate the full source files
+or write any output.
+Use a filesystem that supports large files and hard links, and choose a new output directory. Rerun
+without `--dry-run` to authenticate all five source files, write and reread the six output shards,
+and publish the first shard last. Keep the originals unchanged throughout the run; the importer
+refuses unfinished chat-template updates and never edits inputs. It imports only the text model,
+not an optional projector or drafter.
+
+Add the converted folder after the importer finishes successfully. Failed runs roll back their
+output when possible. Abrupt termination or power loss can leave staging or partially published
+files; publication is not crash-atomic. Use a new output directory for a retry.
+
 ## Drafters
 
 Every model that runs gets the best drafter known to work with it. Only drafters Magnitude can
