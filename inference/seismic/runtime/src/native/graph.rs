@@ -1034,7 +1034,9 @@ impl NativeGraphDraft {
         let launches = shaped
             .iter()
             .map(|(kernel, _, shape)| {
-                let active = shape.launches.geometry.iter().filter(|g| g.is_some()).count() as u64;
+                let active = kernel
+                    .implementation()
+                    .dispatch_count(shape.launches.rounds, |i| shape.launches.geometry[i].is_some());
                 SealedNodeShape::of(kernel.schema(), kernel.implementation())
                     .launch_census(backend, active)
             })

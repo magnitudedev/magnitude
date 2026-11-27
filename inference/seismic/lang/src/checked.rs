@@ -1739,6 +1739,22 @@ impl NativeImplementation {
             .chain((0..rounds).flat_map(move |_| first..end))
             .chain(end..self.launches.len())
     }
+
+    /// Total launches dispatched by one call when its repeat block runs
+    /// `rounds` times and `is_active(i)` identifies which static launch
+    /// ordinals are active (`dispatch_order(rounds).filter(is_active).count()`).
+    pub fn dispatch_count(&self, rounds: u64, is_active: impl Fn(usize) -> bool) -> u64 {
+        let (first, end) = self.repeat.as_ref().map_or((0, 0), |repeat| {
+            (repeat.first, repeat.first + repeat.launches)
+        });
+        let before = (0..first).filter(|&i| is_active(i)).count() as u64;
+        let body = (first..end).filter(|&i| is_active(i)).count() as u64;
+        let after = (end..self.launches.len()).filter(|&i| is_active(i)).count() as u64;
+        before
+            .checked_add(body.checked_mul(rounds).expect("repeat launch count fits u64"))
+            .and_then(|n| n.checked_add(after))
+            .expect("dispatch launch count fits u64")
+    }
 }
 
 /// A native tensor port bound through a table of its records' device

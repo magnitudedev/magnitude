@@ -2472,6 +2472,18 @@ fn launch_when_outer_indices(
             }
         }
     }
+    if let Some(repeat) = &native.repeat {
+        let mut names = Vec::new();
+        repeat.count.parameters(&mut names);
+        for name in &names {
+            if let Some(k) = slots
+                .iter()
+                .position(|s| s.launch.is_none() && s.param.name == *name)
+            {
+                indices.insert(k);
+            }
+        }
+    }
     indices.into_iter().collect()
 }
 
@@ -3885,13 +3897,14 @@ fn render_contract_launch_configs(
         return;
     }
     out.push_str("      match backend {\n");
-    for &(backend, _) in natives {
+    for &(backend, native) in natives {
         let variant = backend_variant(backend);
-        if backend == BackendName::Cuda {
+        if backend == BackendName::Cuda || native.repeat.is_some() {
+            let slug = backend_slug(backend);
             out.push_str(&backend_cfg(backend, "        ", cfg_gate));
             let _ = writeln!(
                 out,
-                "        seismic::BackendName::Cuda => {prefix}::launch_configs_cuda(device, elements, dims),"
+                "        seismic::BackendName::{variant} => {prefix}::launch_configs_{slug}(device, elements, dims),"
             );
         } else {
             let _ = writeln!(
@@ -3915,13 +3928,14 @@ fn render_contract_launch_configs_helpers(
     cfg_gate: bool,
 ) {
     for &(backend, native) in natives {
-        if backend != BackendName::Cuda {
+        if backend != BackendName::Cuda && native.repeat.is_none() {
             continue;
         }
+        let slug = backend_slug(backend);
         out.push_str(&backend_cfg(backend, "    ", cfg_gate));
         let _ = writeln!(
             out,
-            "    {vis} fn launch_configs_cuda(__device: Option<&dyn seismic::device::DeviceValues>, elements: &[(&str, seismic::Element)], dims: &[(&str, u64)]) -> Result<Vec<Vec<u64>>, seismic::ContractError> {{"
+            "    {vis} fn launch_configs_{slug}(__device: Option<&dyn seismic::device::DeviceValues>, elements: &[(&str, seismic::Element)], dims: &[(&str, u64)]) -> Result<Vec<Vec<u64>>, seismic::ContractError> {{"
         );
         out.push_str("      let _ = __device;\n");
         emit_element_binding(out, entry, "      ");
@@ -4094,13 +4108,14 @@ fn render_contract_launch_mask(
     }
     out.push_str("      let _ = device;\n");
     out.push_str("      match backend {\n");
-    for &(backend, _) in natives {
+    for &(backend, native) in natives {
         let variant = backend_variant(backend);
-        if backend == BackendName::Cuda {
+        if backend == BackendName::Cuda || native.repeat.is_some() {
+            let slug = backend_slug(backend);
             out.push_str(&backend_cfg(backend, "        ", cfg_gate));
             let _ = writeln!(
                 out,
-                "        seismic::BackendName::Cuda => {prefix}::launch_mask_cuda(device, elements, dims, params),"
+                "        seismic::BackendName::{variant} => {prefix}::launch_mask_{slug}(device, elements, dims, params),"
             );
         } else {
             let _ = writeln!(out, "        seismic::BackendName::{variant} => Ok(0u64),");
@@ -4121,19 +4136,22 @@ fn render_contract_launch_mask_helpers(
     cfg_gate: bool,
 ) {
     for &(backend, native) in natives {
-        if backend != BackendName::Cuda {
+        if backend != BackendName::Cuda && native.repeat.is_none() {
             continue;
         }
-        assert!(
-            native.launches.len() <= 64,
-            "entry `{}` CUDA implementation declares {} launches (at most 64 supported)",
-            entry.name,
-            native.launches.len()
-        );
+        if backend == BackendName::Cuda {
+            assert!(
+                native.launches.len() <= 64,
+                "entry `{}` CUDA implementation declares {} launches (at most 64 supported)",
+                entry.name,
+                native.launches.len()
+            );
+        }
+        let slug = backend_slug(backend);
         out.push_str(&backend_cfg(backend, "    ", cfg_gate));
         let _ = writeln!(
             out,
-            "    {vis} fn launch_mask_cuda(__device: Option<&dyn seismic::device::DeviceValues>, elements: &[(&str, seismic::Element)], dims: &[(&str, u64)], params: &[u64]) -> Result<u64, seismic::ContractError> {{"
+            "    {vis} fn launch_mask_{slug}(__device: Option<&dyn seismic::device::DeviceValues>, elements: &[(&str, seismic::Element)], dims: &[(&str, u64)], params: &[u64]) -> Result<u64, seismic::ContractError> {{"
         );
         out.push_str("      let _ = __device;\n");
         emit_element_binding(out, entry, "      ");
@@ -4149,18 +4167,64 @@ fn render_contract_launch_mask_helpers(
         for (i, &k) in outer_indices.iter().enumerate() {
             let _ = writeln!(out, "      let __p_{k}: u64 = params[{i}usize];");
         }
-        let mut static_mask = 0u64;
-        for (launch_idx, launch) in native.launches.iter().enumerate() {
-            if launch.when.is_none() {
-                static_mask |= 1u64 << launch_idx;
-            }
-        }
-        let has_conditional = native.launches.iter().any(|l| l.when.is_some());
-        if !has_conditional {
-            let _ = writeln!(out, "      Ok({static_mask}u64)");
-        } else {
-            let _ = writeln!(out, "      let mut __mask: u64 = {static_mask}u64;");
+        if backend == BackendName::Cuda {
+            let mut static_mask = 0u64;
             for (launch_idx, launch) in native.launches.iter().enumerate() {
+                if launch.when.is_none() {
+                    static_mask |= 1u64 << launch_idx;
+                }
+            }
+            let has_conditional = native.launches.iter().any(|l| l.when.is_some());
+            if !has_conditional {
+                let _ = writeln!(out, "      Ok({static_mask}u64)");
+            } else {
+                let _ = writeln!(out, "      let mut __mask: u64 = {static_mask}u64;");
+                for (launch_idx, launch) in native.launches.iter().enumerate() {
+                    if let Some(when) = &launch.when {
+                        let lctx = ExprCtx {
+                            backend,
+                            elements: &entry.element_parameters,
+                            dims: &entry.dimensions,
+                            params: &slots,
+                            launch: Some(launch_idx),
+                            param_binding: ParamBinding::Loop,
+                        };
+                        let w = lctx.lower_cond(when);
+                        let _ = writeln!(
+                            out,
+                            "      if (|| -> Result<bool, seismic::ContractError> {{ Ok({w}) }})()? {{ __mask |= 1u64 << {launch_idx}u32; }}"
+                        );
+                    }
+                }
+                out.push_str("      Ok(__mask)\n");
+            }
+        } else {
+            // Non-CUDA implementation with a `repeat (ROUNDS)` block: return
+            // the repeat-expanded active launch count (`before + body * rounds + after`).
+            let repeat = native.repeat.as_ref().expect("non-CUDA helper has repeat block");
+            let first = repeat.first;
+            let end = repeat.first + repeat.launches;
+            let rctx = ExprCtx {
+                backend,
+                elements: &entry.element_parameters,
+                dims: &entry.dimensions,
+                params: &slots,
+                launch: None,
+                param_binding: ParamBinding::Loop,
+            };
+            let rounds_expr = rctx.lower_nat(&repeat.count);
+            let _ = writeln!(out, "      let __rounds: u64 = {rounds_expr};");
+            out.push_str("      let mut __before: u64 = 0u64;\n");
+            out.push_str("      let mut __body: u64 = 0u64;\n");
+            out.push_str("      let mut __after: u64 = 0u64;\n");
+            for (launch_idx, launch) in native.launches.iter().enumerate() {
+                let bucket = if launch_idx < first {
+                    "__before"
+                } else if launch_idx < end {
+                    "__body"
+                } else {
+                    "__after"
+                };
                 if let Some(when) = &launch.when {
                     let lctx = ExprCtx {
                         backend,
@@ -4173,11 +4237,13 @@ fn render_contract_launch_mask_helpers(
                     let w = lctx.lower_cond(when);
                     let _ = writeln!(
                         out,
-                        "      if (|| -> Result<bool, seismic::ContractError> {{ Ok({w}) }})()? {{ __mask |= 1u64 << {launch_idx}u32; }}"
+                        "      if (|| -> Result<bool, seismic::ContractError> {{ Ok({w}) }})()? {{ {bucket} += 1u64; }}"
                     );
+                } else {
+                    let _ = writeln!(out, "      {bucket} += 1u64;");
                 }
             }
-            out.push_str("      Ok(__mask)\n");
+            out.push_str("      Ok(__before.saturating_add(__body.saturating_mul(__rounds)).saturating_add(__after))\n");
         }
         out.push_str("    }\n");
     }

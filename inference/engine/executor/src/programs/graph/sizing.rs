@@ -1443,7 +1443,9 @@ pub(crate) struct SizingOutline {
     launches: Arc<[SizedCall]>,
     kernels: Arc<[KernelRequest]>,
     timeline_count: usize,
-    cuda_node_launches: Option<Arc<[u64]>>,
+    /// Per-node launch accounting: active launch bitmasks on CUDA, or maximum
+    /// repeat-expanded active launch counts on non-CUDA backends.
+    node_launches: Arc<[u64]>,
 }
 
 impl SizingOutline {
@@ -1481,26 +1483,30 @@ impl SizingOutline {
 
     /// Compose the recorded `GraphCensus` for a subset of nodes (by index into
     /// this outline's node sequence) using this outline's exact per-node
-    /// launch accounting (active CUDA launches on CUDA, static contract
-    /// launches elsewhere).
+    /// launch accounting (active launch bitmasks on CUDA, repeat-expanded
+    /// active launch counts elsewhere).
     pub(crate) fn compose_recorded(
         &self,
         backend: BackendName,
         nodes: &[(usize, (usize, usize, usize))],
         timelines: &[TimelineNode],
     ) -> seismic::GraphCensus {
-        match &self.cuda_node_launches {
-            Some(masks) => {
-                let launches: Vec<u64> = nodes.iter().map(|&(idx, _)| u64::from(masks[idx].count_ones())).collect();
-                let positioned: Vec<(usize, TimelineNode)> =
-                    timelines.iter().copied().map(|t| (1, t)).collect();
-                seismic::cuda_recorded_census(nodes.len(), &launches, &positioned, &[])
-            }
-            None => {
-                let census: Vec<(usize, usize, usize)> =
-                    nodes.iter().map(|&(_, triple)| triple).collect();
-                recorded_census_of(backend, &census, timelines)
-            }
+        if backend == BackendName::Cuda {
+            let launches: Vec<u64> = nodes
+                .iter()
+                .map(|&(idx, _)| u64::from(self.node_launches[idx].count_ones()))
+                .collect();
+            let positioned: Vec<(usize, TimelineNode)> =
+                timelines.iter().copied().map(|t| (1, t)).collect();
+            seismic::cuda_recorded_census(nodes.len(), &launches, &positioned, &[])
+        } else {
+            let census: Vec<(usize, usize, usize)> = nodes
+                .iter()
+                .map(|&(idx, (arguments, words, _))| {
+                    (arguments, words, self.node_launches[idx] as usize)
+                })
+                .collect();
+            recorded_census_of(backend, &census, timelines)
         }
     }
 }
@@ -1892,7 +1898,7 @@ impl SizingDraft {
     /// in a group: compiles storage placement once, records the expected
     /// topology signature, and evaluates the first class's concrete bounds.
     pub(crate) fn begin_group(self) -> Result<SizingGroup, GraphError> {
-        let (base_scratch, links, plan_heap, topology_heap, bound_heap, static_recorded) =
+        let (base_scratch, links, plan_heap, topology_heap, bound_heap, node_census_shapes) =
             stage_timer::time_stage(
                 |t, ns| t.sd_operand_links_ns += ns,
                 || -> Result<_, GraphError> {
@@ -1917,7 +1923,11 @@ impl SizingDraft {
                     let port_ranks: Vec<usize> =
                         self.ports.iter().map(|port| port.extents.len()).collect();
                     let mut heap_nodes = Vec::with_capacity(self.nodes.len());
-                    let mut census_nodes = Vec::with_capacity(self.nodes.len());
+                    let mut node_census_shapes = Vec::with_capacity(if self.backend == BackendName::Cuda {
+                        0
+                    } else {
+                        self.nodes.len()
+                    });
                     let mut result_ranks: Vec<&[Option<usize>]> =
                         Vec::with_capacity(self.nodes.len());
                     for node in &self.nodes {
@@ -1934,11 +1944,7 @@ impl SizingDraft {
                                 },
                         });
                         if self.backend != BackendName::Cuda {
-                            census_nodes.push((
-                                node.shape.arguments,
-                                node.shape.words,
-                                node.shape.launches,
-                            ));
+                            node_census_shapes.push((node.shape.arguments, node.shape.words));
                         }
                         result_ranks.push(node.shape.result_ranks);
                     }
@@ -1954,14 +1960,7 @@ impl SizingDraft {
                         self.marks.len(),
                     );
                     let bound_heap = bindings_heap(self.ports.len(), self.timelines.len());
-                    let static_recorded = if self.backend == BackendName::Cuda {
-                        None
-                    } else {
-                        let timeline_nodes: Vec<TimelineNode> =
-                            self.timelines.iter().map(|&(_, node)| node).collect();
-                        Some(recorded_census_of(self.backend, &census_nodes, &timeline_nodes))
-                    };
-                    Ok((base_scratch, links, plan_heap, topology_heap, bound_heap, static_recorded))
+                    Ok((base_scratch, links, plan_heap, topology_heap, bound_heap, node_census_shapes))
                 },
             )?;
 
@@ -2017,8 +2016,7 @@ impl SizingDraft {
             self.ports.iter().map(|p| (p.local, p.owned_input)).collect();
         let mut result_bytes: Vec<Vec<Option<u64>>> = Vec::with_capacity(self.nodes.len());
         let mut scratch_needs: Vec<Vec<ScratchNeed>> = base_scratch;
-        let mut cuda_node_launches: Option<Vec<u64>> = (self.backend == BackendName::Cuda)
-            .then(|| Vec::with_capacity(self.nodes.len()));
+        let mut node_launches: Vec<u64> = Vec::with_capacity(self.nodes.len());
         let mut expected_nodes = Vec::with_capacity(self.nodes.len());
 
         let mut launch_configs_cache: HashMap<
@@ -2060,9 +2058,7 @@ impl SizingDraft {
             for (need, bytes) in scratch_needs[node_idx].iter_mut().zip(node_scratch_bytes) {
                 need.bytes = bytes;
             }
-            if let Some(cuda) = &mut cuda_node_launches {
-                cuda.push(active_launches);
-            }
+            node_launches.push(active_launches);
 
             let arg_refs: Vec<Option<(u32, u32)>> = node
                 .args
@@ -2170,7 +2166,7 @@ impl SizingDraft {
             plan_heap,
             topology_heap,
             bound_heap,
-            static_recorded,
+            node_census_shapes,
             launches: Arc::from(launches),
             kernels: Arc::from(kernels),
             timelines: self.timelines,
@@ -2178,7 +2174,7 @@ impl SizingDraft {
             port_bytes,
             result_bytes,
             scratch_needs,
-            cuda_node_launches,
+            node_launches,
             expected_ports,
             expected_nodes,
             expected_exports,
@@ -2346,7 +2342,7 @@ fn eval_concrete_node(
         .map(|(rank, len)| rank.map(|_| len))
         .collect();
 
-    let active_launches = if backend == BackendName::Cuda {
+    let active_launches = {
         let statics_key: Vec<u64> = shape
             .statics
             .iter()
@@ -2369,17 +2365,31 @@ fn eval_concrete_node(
                 slot.insert(computed)
             }
         };
-        let mut launch_mask = 0u64;
-        for config in lconfigs.iter() {
-            let mask = eval_with_device(backend, |dev| {
-                eval_launch_mask(backend, Some(dev), elements, dims, config)
-            })
-            .map_err(|error| contract_error(entry_name, backend, shape.statics, dims, error))?;
-            launch_mask |= mask;
+        if backend == BackendName::Cuda {
+            let mut launch_mask = 0u64;
+            for config in lconfigs.iter() {
+                let mask = eval_with_device(backend, |dev| {
+                    eval_launch_mask(backend, Some(dev), elements, dims, config)
+                })
+                .map_err(|error| contract_error(entry_name, backend, shape.statics, dims, error))?;
+                launch_mask |= mask;
+            }
+            launch_mask
+        } else {
+            let mut max_launches = 0u64;
+            for config in lconfigs.iter() {
+                let count = eval_with_device(backend, |dev| {
+                    eval_launch_mask(backend, Some(dev), elements, dims, config)
+                })
+                .map_err(|error| contract_error(entry_name, backend, shape.statics, dims, error))?;
+                max_launches = max_launches.max(count);
+            }
+            if max_launches > 0 {
+                max_launches
+            } else {
+                shape.launches as u64
+            }
         }
-        launch_mask
-    } else {
-        shape.launches as u64
     };
 
     Ok((results, scratch, active_launches))
@@ -2395,7 +2405,7 @@ pub(crate) struct SizingGroup {
     plan_heap: HostHeap,
     topology_heap: HostHeap,
     bound_heap: HostHeap,
-    static_recorded: Option<seismic::GraphCensus>,
+    node_census_shapes: Vec<(usize, usize)>,
     launches: Arc<[SizedCall]>,
     kernels: Arc<[KernelRequest]>,
     timelines: Vec<(usize, TimelineNode)>,
@@ -2403,7 +2413,7 @@ pub(crate) struct SizingGroup {
     port_bytes: Vec<u64>,
     result_bytes: Vec<Vec<Option<u64>>>,
     scratch_needs: Vec<Vec<ScratchNeed>>,
-    cuda_node_launches: Option<Vec<u64>>,
+    node_launches: Vec<u64>,
     expected_ports: Vec<(bool, bool)>,
     expected_nodes: Vec<ExpectedNode>,
     expected_exports: Vec<(u32, u32)>,
@@ -2442,21 +2452,28 @@ impl SizingGroup {
                 )
             },
         );
-        let (recorded, cuda_node_launches) = match self.static_recorded {
-            Some(recorded) => (recorded, None),
-            None => {
-                let node_masks = self
-                    .cuda_node_launches
-                    .expect("CUDA sizing group tracks per-node active launch masks");
-                let node_launches: Vec<u64> = node_masks.iter().map(|&m| u64::from(m.count_ones())).collect();
-                let recorded = seismic::cuda_recorded_census(
-                    self.expected_nodes.len(),
-                    &node_launches,
-                    &self.timelines,
-                    &self.marks,
-                );
-                (recorded, Some(Arc::from(node_masks)))
-            }
+        let recorded = if self.backend == BackendName::Cuda {
+            let counts: Vec<u64> = self
+                .node_launches
+                .iter()
+                .map(|&m| u64::from(m.count_ones()))
+                .collect();
+            seismic::cuda_recorded_census(
+                self.expected_nodes.len(),
+                &counts,
+                &self.timelines,
+                &self.marks,
+            )
+        } else {
+            let census_nodes: Vec<(usize, usize, usize)> = self
+                .node_census_shapes
+                .iter()
+                .zip(&self.node_launches)
+                .map(|(&(arguments, words), &launches)| (arguments, words, launches as usize))
+                .collect();
+            let timeline_nodes: Vec<TimelineNode> =
+                self.timelines.iter().map(|&(_, node)| node).collect();
+            recorded_census_of(self.backend, &census_nodes, &timeline_nodes)
         };
         Ok(SizingOutline {
             identity: NEXT_SIZING_OUTLINE.fetch_add(1, Ordering::Relaxed),
@@ -2473,7 +2490,7 @@ impl SizingGroup {
             launches: self.launches,
             kernels: self.kernels,
             timeline_count: self.timelines.len(),
-            cuda_node_launches,
+            node_launches: Arc::from(self.node_launches),
         })
     }
 }
@@ -2647,8 +2664,10 @@ impl SizingBoundsDraft {
         {
             need.bytes = need.bytes.max(bytes);
         }
-        if let Some(cuda) = &mut self.group.cuda_node_launches {
-            cuda[idx] |= active_launches;
+        if self.group.backend == BackendName::Cuda {
+            self.group.node_launches[idx] |= active_launches;
+        } else {
+            self.group.node_launches[idx] = self.group.node_launches[idx].max(active_launches);
         }
         self.next_node += 1;
         let result_count =
