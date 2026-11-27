@@ -87,6 +87,7 @@ pub fn describe_projector(
         positions: Some(positions),
         norm: None,
         registers: None,
+        register_positions: None,
     };
     let mut blocks = Vec::with_capacity(depth as usize);
     for layer in 0..depth {

@@ -476,8 +476,8 @@ struct VisionGraphPorts {
     pixels: NativePort,
     indices: NativePort,
     coefficients: NativePort,
-    /// The register rows' blend of the register table.
-    register_blend: Option<(NativePort, NativePort)>,
+    /// The register rows' blends of the register (and optional register-position) tables.
+    register_blends: Vec<(NativePort, NativePort)>,
     coordinates: Option<NativePort>,
     window_spans: Option<NativePort>,
     image_spans: Option<NativePort>,
@@ -500,7 +500,7 @@ struct Draft<'b, G: GraphDraft, B: VisionBindings<G>, W: PlannedWeights + ?Sized
     values: Vec<WorkflowTensor>,
     pixels: Option<NativePort>,
     indices: Option<(NativePort, NativePort)>,
-    register_blend: Option<(NativePort, NativePort)>,
+    register_blends: Vec<(NativePort, NativePort)>,
     coordinates: Option<NativePort>,
     window_spans: Option<NativePort>,
     image_spans: Option<NativePort>,
@@ -754,7 +754,7 @@ impl<G: GraphDraft, B: VisionBindings<G>, W: PlannedWeights + ?Sized> Draft<'_, 
                             bias: (&bias).into(),
                             order: (&order).into(),
                             epsilon: epsilon.f32(),
-                            centered: i32::from(kind.centered()).into(),
+                            centered: kind.centered_code().into(),
                             interleave: i32::from(*interleave).into(),
                             activation: vision_activation_code(*activation).into(),
                         },
@@ -1002,7 +1002,7 @@ impl<G: GraphDraft, B: VisionBindings<G>, W: PlannedWeights + ?Sized> Draft<'_, 
             }
             VisionOperands::Registers { source, table } => {
                 let (value, blend) = self.blend(index, *source, *table)?;
-                self.register_blend = Some(blend);
+                self.register_blends.push(blend);
                 value
             }
             VisionOperands::PostNormResidual {
@@ -1137,7 +1137,7 @@ fn vision_graph_draft<G: GraphDraft, B: VisionBindings<G>, W: PlannedWeights + ?
         values: Vec::with_capacity(topology.ops.len()),
         pixels: None,
         indices: None,
-        register_blend: None,
+        register_blends: Vec::new(),
         coordinates: None,
         window_spans: None,
         image_spans: None,
@@ -1163,7 +1163,7 @@ fn vision_graph_draft<G: GraphDraft, B: VisionBindings<G>, W: PlannedWeights + ?
     if draft.coordinates.is_some() != topology.coordinates
         || draft.window_spans.is_some() != topology.windows
         || draft.order.is_some() != topology.windows
-        || draft.register_blend.is_some() != !numbers.registers.is_zero()
+        || !draft.register_blends.is_empty() != !numbers.registers.is_zero()
         || draft.neighbors.is_some() != topology.convolution
     {
         return Err("the vision program's inputs disagree with its invocations".into());
@@ -1174,7 +1174,7 @@ fn vision_graph_draft<G: GraphDraft, B: VisionBindings<G>, W: PlannedWeights + ?
             pixels,
             indices,
             coefficients,
-            register_blend: draft.register_blend,
+            register_blends: draft.register_blends,
             coordinates: draft.coordinates,
             window_spans: draft.window_spans,
             image_spans: draft.image_spans,
@@ -1225,6 +1225,7 @@ enum RelativeValue {
 enum RelativeNormKind {
     Layer,
     Rms { weighted: bool },
+    Identity,
 }
 
 #[derive(Clone, PartialEq, Eq, Hash)]
@@ -1625,6 +1626,7 @@ fn block_signature(
                     VisionNormKind::Rms { weight } => RelativeNormKind::Rms {
                         weighted: weight.is_some(),
                     },
+                    VisionNormKind::Identity => RelativeNormKind::Identity,
                 },
                 gathered: *gathered,
                 epsilon_bits: epsilon.to_bits(),
@@ -2559,16 +2561,18 @@ impl PreparedVisionGraphs {
         let ports = &variant.ports;
         let bindings = bound.bindings();
         let mut active = slot.activate(&variant.plan).map_err(device)?;
-        let register_blend = ports.register_blend.as_ref();
+        for (indices, coefficients) in &ports.register_blends {
+            active
+                .write_input(indices, uploads.register_indices)
+                .map_err(device)?;
+            active
+                .write_input(coefficients, uploads.register_coefficients)
+                .map_err(device)?;
+        }
         for (port, bytes) in [
             (Some(&ports.pixels), uploads.pixels),
             (Some(&ports.indices), uploads.indices),
             (Some(&ports.coefficients), uploads.coefficients),
-            (register_blend.map(|(indices, _)| indices), uploads.register_indices),
-            (
-                register_blend.map(|(_, coefficients)| coefficients),
-                uploads.register_coefficients,
-            ),
             (ports.coordinates.as_ref(), uploads.coordinates),
             (ports.window_spans.as_ref(), uploads.window_spans),
             (ports.image_spans.as_ref(), uploads.image_spans),
@@ -2770,6 +2774,7 @@ mod tests {
             }),
             norm: None,
             registers: None,
+            register_positions: None,
         };
         let base_merger = VisionMerger {
             norm: Some(layer_norm("post", 128)),
@@ -2845,6 +2850,7 @@ mod tests {
                 }),
                 norm: None,
                 registers: Some(stored("registers", &[3, 128])),
+                register_positions: None,
             },
             window: None,
             blocks: (0..12)

@@ -158,6 +158,10 @@ pub enum VisionNormKind {
     Rms {
         weight: Option<WeightRole>,
     },
+    /// Identity pass-through: gathers/concatenates and casts F32 rows to `Y`
+    /// without normalization (used when a vision merger concatenates cells with
+    /// neither a tower post-norm nor a projection norm, e.g. Inkling 2).
+    Identity,
 }
 
 impl VisionNormKind {
@@ -165,18 +169,29 @@ impl VisionNormKind {
         match self {
             Self::Layer { weight, .. } => Some(weight),
             Self::Rms { weight } => weight,
+            Self::Identity => None,
         }
     }
 
     pub fn bias(self) -> Option<WeightRole> {
         match self {
             Self::Layer { bias, .. } => Some(bias),
-            Self::Rms { .. } => None,
+            Self::Rms { .. } | Self::Identity => None,
         }
     }
 
     pub fn centered(self) -> bool {
         matches!(self, Self::Layer { .. })
+    }
+
+    /// `vision_norm`'s `centered` scalar argument: `1` for LayerNorm, `0` for
+    /// RMSNorm, `-1` for identity cast/concatenation pass-through.
+    pub fn centered_code(self) -> i32 {
+        match self {
+            Self::Layer { .. } => 1,
+            Self::Rms { .. } => 0,
+            Self::Identity => -1,
+        }
     }
 }
 
@@ -529,6 +544,48 @@ impl Builder<'_> {
                 epsilon: norm.epsilon() as f32,
                 interleave,
                 activation,
+            },
+        ))
+    }
+
+    /// Gather/concatenate `members` F32 rows of width `width` and cast directly
+    /// to `output` without normalization.
+    #[allow(clippy::too_many_arguments)]
+    fn identity_cast(
+        &mut self,
+        source: VisionValue,
+        rows: VisionRows,
+        members: u64,
+        width: u64,
+        output: Element,
+        gathered: bool,
+        interleave: bool,
+    ) -> Result<VisionValue, PlanError> {
+        let elements = vec![
+            ("NWE", self.element(None)?),
+            ("NBE", self.element(None)?),
+            ("Y", output),
+        ];
+        let statics = vec![
+            ("G", members),
+            ("H", width),
+            ("NW", 0),
+            ("NB", 0),
+            ("NO", u64::from(gathered)),
+        ];
+        Ok(self.push(
+            VisionEntry::Norm,
+            elements,
+            statics,
+            members * width,
+            VisionOperands::Norm {
+                source,
+                rows,
+                kind: VisionNormKind::Identity,
+                gathered,
+                epsilon: 0.0,
+                interleave,
+                activation: None,
             },
         ))
     }
@@ -1084,15 +1141,14 @@ pub(crate) fn vision_program(
             positions,
             norm,
             registers: register_table,
+            register_positions,
         } => {
             // Register rows enter the stem as zero pixels with no position
-            // blend and receive their table rows after it: exact only for a
-            // stem without a bias (which would reach them) or a norm (which
-            // would precede their rows).
-            if register_table.is_some() && (bias.is_some() || norm.is_some()) {
-                return Err(unsupported(
-                    "vision register rows with a patch bias or stem norm",
-                ));
+            // blend and receive their table rows (and optional register
+            // position embeddings) before any stem norm: exact only for a stem
+            // without a patch bias (which would reach the zero register rows).
+            if register_table.is_some() && bias.is_some() {
+                return Err(unsupported("vision register rows with a patch bias"));
             }
             let frame = role(WeightScope::VisionPatch(0), VisionWeight::PatchFrame);
             let next_frame = match frames.len() {
@@ -1116,7 +1172,7 @@ pub(crate) fn vision_program(
                 ("NB", u64::from(bias.is_some())),
                 ("NT", u64::from(table.is_some())),
             ];
-            let h = b.push(
+            let mut h = b.push(
                 VisionEntry::PatchStem,
                 elements,
                 statics,
@@ -1128,7 +1184,29 @@ pub(crate) fn vision_program(
                     table,
                 },
             );
-            let h = match norm {
+            if register_table.is_some() {
+                let table = role(vision, VisionWeight::Registers);
+                let elements = vec![("PE", b.element(Some(table))?)];
+                h = b.push(
+                    VisionEntry::Position,
+                    elements,
+                    vec![("H", hidden)],
+                    hidden,
+                    VisionOperands::Registers { source: h, table },
+                );
+            }
+            if register_positions.is_some() {
+                let table = role(vision, VisionWeight::RegisterPosition);
+                let elements = vec![("PE", b.element(Some(table))?)];
+                h = b.push(
+                    VisionEntry::Position,
+                    elements,
+                    vec![("H", hidden)],
+                    hidden,
+                    VisionOperands::Registers { source: h, table },
+                );
+            }
+            match norm {
                 None => h,
                 Some(norm) => b.norm(
                     h,
@@ -1143,20 +1221,6 @@ pub(crate) fn vision_program(
                     false,
                     None,
                 )?,
-            };
-            match register_table {
-                None => h,
-                Some(_) => {
-                    let table = role(vision, VisionWeight::Registers);
-                    let elements = vec![("PE", b.element(Some(table))?)];
-                    b.push(
-                        VisionEntry::Position,
-                        elements,
-                        vec![("H", hidden)],
-                        hidden,
-                        VisionOperands::Registers { source: h, table },
-                    )
-                }
             }
         }
         VisionStem::NormalizedPatch {
@@ -1344,6 +1408,15 @@ pub(crate) fn vision_program(
                     windows,
                     interleave,
                     None,
+                )?,
+                (None, None) => b.identity_cast(
+                    patch_rows(h),
+                    VisionRows::Cells,
+                    cell_rows,
+                    hidden,
+                    activation,
+                    windows,
+                    interleave,
                 )?,
                 _ => {
                     return Err(unsupported(

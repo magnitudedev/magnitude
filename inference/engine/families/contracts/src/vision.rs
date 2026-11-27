@@ -362,10 +362,15 @@ pub enum VisionStem {
         bias: Option<WeightDescriptor>,
         positions: Option<VisionPositions>,
         norm: Option<VisionNorm>,
-        /// Learned rows `[R, H]` ahead of the image's patch rows (C-RADIO's
-        /// class and register tokens): every block attends over them with
-        /// the patches, and the merger reads only the patch rows.
+        /// Learned rows `[R, H]` (or `[H]` for a single CLS token) ahead of
+        /// the image's patch rows: every block attends over them with the
+        /// patches, and the merger reads only the patch rows.
         registers: Option<WeightDescriptor>,
+        /// Optional learned position embeddings `[R, H]` (or `[H]` for a single
+        /// CLS token) added to `registers` before any stem norm (e.g. Inkling 2's
+        /// `v.class_position_embd.weight`).
+        #[serde(default)]
+        register_positions: Option<WeightDescriptor>,
     },
     /// A norm of the flattened patch pixels, a linear to the tower width, a
     /// norm, the position table and a norm (Gemma 4 unified).
@@ -401,7 +406,11 @@ impl VisionStem {
             Self::Patch {
                 registers: Some(registers),
                 ..
-            } => registers.shape.first().copied().unwrap_or(0),
+            } => match registers.shape.as_slice() {
+                [_] => 1,
+                [rows, _] => *rows,
+                _ => 0,
+            },
             Self::Patch { .. } | Self::NormalizedPatch { .. } => 0,
         }
     }
@@ -665,6 +674,8 @@ pub enum VisionWeight {
     Position,
     /// The learned rows ahead of the patch rows.
     Registers,
+    /// Optional learned position embeddings added to the register rows.
+    RegisterPosition,
     Norm {
         site: VisionNormSite,
         part: NormPart,
@@ -826,6 +837,7 @@ impl VisionDescription {
                 positions,
                 norm,
                 registers,
+                register_positions,
             } => {
                 if frames.is_empty() || frames.len() > 2 {
                     return Err(DefinitionError::new(
@@ -848,12 +860,35 @@ impl VisionDescription {
                 if let Some(norm) = norm {
                     norm.validate(hidden, "vision stem norm")?;
                 }
-                if let Some(registers) = registers {
-                    let rows = registers.shape.first().copied().unwrap_or(0);
-                    if rows == 0 {
-                        return Err(DefinitionError::new("vision register table has no rows"));
+                let register_rows = if let Some(registers) = registers {
+                    match registers.shape.as_slice() {
+                        [cols] if *cols == hidden => 1,
+                        [rows, cols] if *rows > 0 && *cols == hidden => *rows,
+                        _ => {
+                            return Err(DefinitionError::new(
+                                "vision register table shape does not match [H] or [R, H]",
+                            ));
+                        }
                     }
-                    expect_shape(registers, &[rows, hidden], "vision register table")?;
+                } else {
+                    0
+                };
+                if let Some(reg_pos) = register_positions {
+                    if register_rows == 0 {
+                        return Err(DefinitionError::new(
+                            "vision register positions require register rows",
+                        ));
+                    }
+                    let valid = match reg_pos.shape.as_slice() {
+                        [cols] => register_rows == 1 && *cols == hidden,
+                        [rows, cols] => *rows == register_rows && *cols == hidden,
+                        _ => false,
+                    };
+                    if !valid {
+                        return Err(DefinitionError::new(
+                            "vision register position table shape disagrees with registers",
+                        ));
+                    }
                 }
             }
             VisionStem::NormalizedPatch {
@@ -1044,6 +1079,7 @@ impl VisionDescription {
                 positions,
                 norm,
                 registers,
+                register_positions,
             } => {
                 for (index, frame) in frames.iter().enumerate() {
                     out.push((
@@ -1065,6 +1101,12 @@ impl VisionDescription {
                 }
                 if let Some(registers) = registers {
                     out.push((role(vision, VisionWeight::Registers), registers));
+                }
+                if let Some(register_positions) = register_positions {
+                    out.push((
+                        role(vision, VisionWeight::RegisterPosition),
+                        register_positions,
+                    ));
                 }
             }
             VisionStem::NormalizedPatch {

@@ -2312,16 +2312,34 @@ impl NativeTargetProgram {
             };
 
             let cond_sources = self.conditioning_sources(&state, &batch)?;
-            let mut overlay_bufs: Vec<(usize, usize, Vec<f32>)> =
-                Vec::with_capacity(cond_sources.len());
-            for (src_tensor, dst_start, dst_end) in cond_sources {
-                let bytes = src_tensor.read_to_host().map_err(device)?;
-                let vals: Vec<f32> = bytes
-                    .chunks_exact(4)
-                    .map(|b| f32::from_le_bytes(b.try_into().unwrap()))
-                    .collect();
-                overlay_bufs.push((dst_start, dst_end, vals));
+            for (source, start, end) in cond_sources {
+                let overlay = self.overlay((end - start) as u64)?;
+                let destination = entry_hidden
+                    .slice_leading(start as u64, end as u64)
+                    .map_err(device)?;
+                let mut bindings = overlay.plan.bindings();
+                bindings
+                    .set(&self.unallocating(), &overlay.source, &source)
+                    .map_err(device)?;
+                bindings
+                    .set(&self.unallocating(), &overlay.destination, &destination)
+                    .map_err(device)?;
+                let mut slot = overlay
+                    .plan
+                    .new_slot(&self.unallocating())
+                    .map_err(device)?;
+                let ready = slot
+                    .attach(
+                        bindings,
+                        overlay
+                            .plan
+                            .new_outputs(&self.unallocating())
+                            .map_err(device)?,
+                    )
+                    .map_err(device)?;
+                submitter.queue(ready, |_| {})?;
             }
+            let overlay_bufs: Vec<(usize, usize, Vec<f32>)> = Vec::new();
 
             let arenas = state.recurrent_arenas().unwrap_or(&[]);
             let mut arena_cursor = 0usize;

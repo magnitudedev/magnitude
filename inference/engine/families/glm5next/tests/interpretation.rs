@@ -755,7 +755,7 @@ fn the_published_projector_is_the_glm5v_tower_and_merger() {
     assert_eq!((p.channels, p.patch, p.merge), (3, 14, 2));
     assert_eq!(vision.max_cells().unwrap(), 8000);
     assert_eq!(vision.patch_row_width().unwrap(), 1176);
-    let VisionStem::Patch { frames, bias, positions, norm, registers } = &vision.stem else {
+    let VisionStem::Patch { frames, bias, positions, norm, registers, .. } = &vision.stem else {
         panic!("a patch convolution stem");
     };
     assert_eq!(frames.len(), 2);

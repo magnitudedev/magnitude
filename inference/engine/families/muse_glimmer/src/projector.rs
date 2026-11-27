@@ -173,6 +173,7 @@ pub fn describe_projector(
             }),
             norm: Some(pre_norm),
             registers: None,
+            register_positions: None,
         },
         window: Some(side),
         blocks,

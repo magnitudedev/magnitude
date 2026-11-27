@@ -129,6 +129,7 @@ fn released_projector_binds_the_lfm3_vl_tower() {
         positions,
         norm,
         registers,
+        ..
     } = &vision.stem
     else {
         panic!("a patch stem");

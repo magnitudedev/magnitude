@@ -256,6 +256,7 @@ fn encoder(reader: &mut Reader, output_hidden: u64) -> Result<Box<VisionDescript
             positions: Some(table),
             norm: None,
             registers: None,
+            register_positions: None,
         },
         window: None,
         blocks,

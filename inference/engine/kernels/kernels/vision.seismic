@@ -163,9 +163,10 @@ fn vision_activate[N](values: &tensor[N] f32, code: i32) -> tensor[N] f32:
 # one row of G · H per cell. With NO = 1 row r of the result normalizes source
 # row order[r] (cell-major row numbers of `source`). The G normalized rows of
 # a cell are laid side by side (value c of member s at s · H + c), or, with
-# `interleave` nonzero, channel by channel (at c · G + s). A nonzero
-# `activation` (`vision_activate`'s codes) applies to each normalized value
-# in F32 before it is published.
+# `interleave` nonzero, channel by channel (at c · G + s). When `centered < 0`
+# (pass-through), the source values are cast to `Y` without normalization. A
+# nonzero `activation` (`vision_activate`'s codes) applies to each value in F32
+# before it is published.
 fn vision_norm[C, G, H, NW, NB, NO](source: &tensor[C, G, H] f32,
     weight: &tensor[NW, H] NWE, bias: &tensor[NB, H] NBE, order: &tensor[NO, C * G] i32,
     epsilon: f32, centered: i32, interleave: i32, activation: i32) -> tensor[C, G * H] Y
@@ -177,17 +178,20 @@ fn vision_norm[C, G, H, NW, NB, NO](source: &tensor[C, G, H] f32,
             for gathered in 0..NO:
                 let from = order[gathered, cell * G + member]
                 values = f32(source[from / G, from % G])
-            let mut mean = f32(0.0)
-            if centered != 0:
-                mean = reduce(values, 0, sum) / f32(H)
-            let centered_values = values - mean
-            let inverse = rsqrt(reduce(centered_values * centered_values, 0, sum) / f32(H) + epsilon)
-            let mut row = centered_values * inverse
-            for weight_row in 0..NW:
-                row = row * f32(weight[weight_row])
-            for bias_row in 0..NB:
-                row = row + f32(bias[bias_row])
-            normalized[cell, member] = vision_activate(row, activation)
+            if centered < 0:
+                normalized[cell, member] = vision_activate(values, activation)
+            else:
+                let mut mean = f32(0.0)
+                if centered != 0:
+                    mean = reduce(values, 0, sum) / f32(H)
+                let centered_values = values - mean
+                let inverse = rsqrt(reduce(centered_values * centered_values, 0, sum) / f32(H) + epsilon)
+                let mut row = centered_values * inverse
+                for weight_row in 0..NW:
+                    row = row * f32(weight[weight_row])
+                for bias_row in 0..NB:
+                    row = row + f32(bias[bias_row])
+                normalized[cell, member] = vision_activate(row, activation)
     let mut result = tensor[C, G * H] Y
     parallel for cell in 0..C:
         for member in 0..G:

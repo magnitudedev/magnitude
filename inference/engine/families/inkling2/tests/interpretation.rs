@@ -672,5 +672,38 @@ fn inkling2_vision_projector_validates() {
     let vision = magnitude_family_inkling2::projector::describe_projector(&proj_dir, out_h)
         .expect("Inkling 2 vision projector validates");
     assert_eq!(vision.blocks.len(), 23);
+    assert_eq!(vision.stem.registers(), 1);
     assert!(vision.blocks.iter().all(|b| b.ls1.is_some() && b.ls2.is_some()));
+}
+
+#[test]
+fn image_markers_use_official_inkling2_tokens_with_shared_end() {
+    use magnitude_artifacts::TokenId;
+    use magnitude_family_contracts::{ImageMarkers, MarkerTokens};
+
+    struct FakeMarkers;
+    impl MarkerTokens for FakeMarkers {
+        fn marker(&self, text: &str) -> Result<TokenId, magnitude_family_contracts::FamilyError> {
+            match text {
+                "<|content_image|>" => Ok(TokenId(200005)),
+                "<|unused_200054|>" => Ok(TokenId(200054)),
+                "<|end_message|>" => Ok(TokenId(200010)),
+                other => Err(magnitude_family_contracts::FamilyError::invalid(format!(
+                    "unexpected marker {other}"
+                ))),
+            }
+        }
+    }
+
+    let markers = ImageMarkers::new_with_shared_end(
+        FakeMarkers.marker("<|content_image|>").unwrap(),
+        FakeMarkers.marker("<|unused_200054|>").unwrap(),
+        FakeMarkers.marker("<|end_message|>").unwrap(),
+    )
+    .expect("shared-end image markers validate");
+    assert_eq!(
+        markers,
+        ImageMarkers::new_with_shared_end(TokenId(200005), TokenId(200054), TokenId(200010))
+            .unwrap()
+    );
 }

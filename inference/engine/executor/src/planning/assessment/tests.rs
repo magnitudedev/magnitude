@@ -1411,6 +1411,7 @@ fn checked_vision_family_bounds_exact_patch_classes() {
             }),
             norm: None,
             registers: None,
+            register_positions: None,
         },
         window: None,
         blocks: vec![VisionBlock {
@@ -1475,6 +1476,7 @@ fn checked_vision_family_bounds_exact_patch_classes() {
         }),
         norm: None,
         registers: Some(stored("registers", &[3, 128])),
+        register_positions: None,
     };
     let VisionOperator::Attention(attention) = &mut radio.blocks[0].operator else {
         unreachable!("the fixture block attends")

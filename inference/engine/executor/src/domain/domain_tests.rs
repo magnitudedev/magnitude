@@ -1710,6 +1710,7 @@ fn vision_definition() -> ModelDefinition {
             }),
             norm: None,
             registers: None,
+            register_positions: None,
         },
         window: None,
         blocks: Vec::new(),

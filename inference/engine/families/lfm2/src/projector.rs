@@ -219,6 +219,7 @@ pub fn describe_projector(
             positions: None,
             norm: Some(stem_norm),
             registers: None,
+            register_positions: None,
         },
         window: None,
         blocks,

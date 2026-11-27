@@ -3,13 +3,13 @@
 //! LayerScale (`ls1`/`ls2`), and a 2-layer MLP spatial merger.
 
 use magnitude_artifacts::gguf::Directory;
-use magnitude_family_common::{ProjectorMetadata, Tensors, projector_type};
+use magnitude_family_common::{ProjectorMetadata, Tensors, projector_type, rotary};
 use magnitude_family_contracts::{
-    ActivationDType, CellReduction, FamilyError, MergerStage, PositionSampling, VisionActivation,
-    VisionAttention, VisionAttentionScale, VisionAttentionSpan, VisionBlock, VisionDescription,
-    VisionFeedForward, VisionLinear, VisionMerger, VisionNorm, VisionOperator, VisionPositions,
-    VisionPreprocessing, VisionResampling, VisionResize, VisionStem, VisionUp, WeightDescriptor,
-    checked_product,
+    ActivationDType, CellReduction, FamilyError, ImportTransform, MergerStage, PositionSampling,
+    VisionActivation, VisionAttention, VisionAttentionScale, VisionAttentionSpan, VisionBlock,
+    VisionDescription, VisionFeedForward, VisionLinear, VisionMerger, VisionNorm, VisionOperator,
+    VisionPositions, VisionPreprocessing, VisionResampling, VisionResize, VisionStem, VisionUp,
+    WeightDescriptor, checked_product,
 };
 
 const PROJECTOR_TYPE: &str = "inkling2v";
@@ -23,22 +23,19 @@ fn product(dimensions: &[u64]) -> Result<u64, FamilyError> {
     checked_product(dimensions).map_err(|error| invalid(error.to_string()))
 }
 
-/// Validates and ignores an optional single-token class embedding or class
-/// position tensor, accepting only `[hidden]` or `[1, hidden]` consistently.
+/// Binds an optional single-token class embedding or class position tensor,
+/// accepting `[hidden]` or `[1, hidden]` consistently.
 fn bind_optional_class_vector(
     tensors: &mut Tensors<'_>,
     name: &str,
     hidden: u64,
-) -> Result<(), FamilyError> {
+) -> Result<Option<WeightDescriptor>, FamilyError> {
     if !tensors.contains(name) {
-        return Ok(());
+        return Ok(None);
     }
     let shape = tensors.shape(name)?.to_vec();
     match shape.as_slice() {
-        [cols] | [1, cols] if *cols == hidden => {
-            tensors.bind_unused(name, &[hidden])?;
-            Ok(())
-        }
+        [cols] | [1, cols] if *cols == hidden => Ok(Some(tensors.bind(name, &[hidden])?)),
         _ => Err(invalid(format!(
             "inkling2v {name} has unexpected shape {shape:?}, expected [{hidden}] or [1, {hidden}]"
         ))),
@@ -112,33 +109,54 @@ pub fn describe_projector(
     let biased = |tensors: &mut Tensors,
                   stem: &str,
                   outputs: u64,
-                  inputs: u64|
+                  inputs: u64,
+                  transforms: Vec<ImportTransform>|
      -> Result<VisionLinear, FamilyError> {
         Ok(VisionLinear {
-            weight: tensors.bind(&format!("{stem}.weight"), &[outputs, inputs])?,
-            bias: Some(tensors.bind(&format!("{stem}.bias"), &[outputs])?),
+            weight: tensors.bind_transformed(
+                &format!("{stem}.weight"),
+                &[outputs, inputs],
+                transforms.clone(),
+            )?,
+            bias: Some(tensors.bind_transformed(
+                &format!("{stem}.bias"),
+                &[outputs],
+                transforms,
+            )?),
             clamp: None,
         })
     };
+    // Inkling 2's vision tower uses adjacent-pair 2-D axial RoPE (GGUF `mode=0`:
+    // first half of each head rotates by column, second half by row); our vision
+    // rotary kernel pairs column `i < W/2` with `i + W/2`, so deinterleave Q/K.
+    let rotary = vec![rotary::half_split_rows(width, width)];
 
     let patch_frame = tensors.bind("v.patch_embd.weight", &[hidden, 3, patch, patch])?;
     let positions = VisionPositions {
         table: tensors.bind("v.position_embd.weight", &[max_patches, hidden])?,
-        sampling: PositionSampling::AlignedCorners { side },
+        sampling: PositionSampling::PixelCenters { side },
     };
     let pre_norm = layer_norm(&mut tensors, "v.pre_ln")?;
 
-    // Optional unused class token & its position embedding: both `[hidden]`
-    // and `[1, hidden]` are validated identically from `hidden`.
-    bind_optional_class_vector(&mut tensors, "v.class_embd", hidden)?;
-    bind_optional_class_vector(&mut tensors, "v.class_position_embd.weight", hidden)?;
+    // Active CLS token & its position embedding (`cls = class_embd + class_position_embd`),
+    // prepended at row 0 before `v.pre_ln`, attended by all ViT blocks at RoPE `(0, 0)`,
+    // and sliced off before the spatial merger.
+    let registers = bind_optional_class_vector(&mut tensors, "v.class_embd", hidden)?;
+    let register_positions =
+        bind_optional_class_vector(&mut tensors, "v.class_position_embd.weight", hidden)?;
+    if register_positions.is_some() && registers.is_none() {
+        return Err(invalid(
+            "inkling2v v.class_position_embd.weight requires v.class_embd",
+        ));
+    }
 
     let stem = VisionStem::Patch {
         frames: vec![patch_frame],
         bias: None,
         positions: Some(positions),
         norm: Some(pre_norm),
-        registers: None,
+        registers,
+        register_positions,
     };
 
     let mut blocks = Vec::with_capacity(depth as usize);
@@ -160,16 +178,16 @@ pub fn describe_projector(
                 heads,
                 kv_heads: heads,
                 width,
-                query: biased(&mut tensors, &format!("{p}attn_q"), hidden, hidden)?,
-                key: biased(&mut tensors, &format!("{p}attn_k"), hidden, hidden)?,
-                value: biased(&mut tensors, &format!("{p}attn_v"), hidden, hidden)?,
+                query: biased(&mut tensors, &format!("{p}attn_q"), hidden, hidden, rotary.clone())?,
+                key: biased(&mut tensors, &format!("{p}attn_k"), hidden, hidden, rotary.clone())?,
+                value: biased(&mut tensors, &format!("{p}attn_v"), hidden, hidden, Vec::new())?,
                 query_norm: None,
                 key_norm: None,
                 value_norm: None,
                 rotary_base: Some(rotary_base),
                 scale: VisionAttentionScale::InverseSqrtWidth,
                 span: VisionAttentionSpan::Full,
-                output: biased(&mut tensors, &format!("{p}attn_out"), hidden, hidden)?,
+                output: biased(&mut tensors, &format!("{p}attn_out"), hidden, hidden, Vec::new())?,
             }),
             operator_post_norm: None,
             feedforward_norm: layer_norm(&mut tensors, &format!("{p}ln2"))?,
@@ -179,9 +197,10 @@ pub fn describe_projector(
                     &format!("{p}ffn_up"),
                     intermediate,
                     hidden,
+                    Vec::new(),
                 )?),
                 activation: VisionActivation::GeluErf,
-                down: biased(&mut tensors, &format!("{p}ffn_down"), hidden, intermediate)?,
+                down: biased(&mut tensors, &format!("{p}ffn_down"), hidden, intermediate, Vec::new())?,
             },
             feedforward_post_norm: None,
             ls1,
@@ -395,8 +414,13 @@ mod tests {
             .expect("2-D [1, hidden] class tensors");
 
         assert_eq!(none.stem.registers(), 0);
-        assert_eq!(flat, none);
-        assert_eq!(batched, none);
+        assert_eq!(flat.stem.registers(), 1);
+        assert_eq!(batched.stem.registers(), 1);
+        assert_eq!(
+            flat.stem.registers(),
+            batched.stem.registers(),
+            "1-D and 2-D [1, hidden] class tensors both register 1 CLS row"
+        );
     }
 
     #[test]

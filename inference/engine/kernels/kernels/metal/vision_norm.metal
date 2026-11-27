@@ -26,8 +26,20 @@ kernel void vision_norm(device const float *source [[buffer(SEISMIC_BUFFER_SOURC
     const uint cell = row / g, member = row % g;
     const bool interleave = int(SEISMIC_PARAM_INTERLEAVE) != 0;
     const ulong first = ulong(cell) * SEISMIC_RESULT_0_STRIDE_0 + (interleave ? member : ulong(member) * h);
+    const int centered_code = int(SEISMIC_PARAM_CENTERED);
+    const int activation = int(SEISMIC_PARAM_ACTIVATION);
+    if (centered_code < 0) {
+        auto out = element::Out<output_element>(result).offset(first);
+        const ulong stride = interleave ? g : 1;
+        const device float *src = source + ulong(from) * h;
+        for (uint i = thread_index; i < h; i += NORM_THREADS) {
+            const float v = src[i];
+            out.put(ulong(i) * stride, activation != 0 ? vision::activate(activation, v) : v);
+        }
+        return;
+    }
     vision::norm<NORM_THREADS, output_element, weight_element, bias_element, SEISMIC_DIM_NW == 1,
         SEISMIC_DIM_NB == 1>(source + ulong(from) * h, element::Out<output_element>(result).offset(first), interleave ? g : 1,
-        weight, bias, h, int(SEISMIC_PARAM_CENTERED) != 0, as_type<float>(uint(SEISMIC_PARAM_EPSILON)),
-        int(SEISMIC_PARAM_ACTIVATION), partials, thread_index, sg, lane);
+        weight, bias, h, centered_code != 0, as_type<float>(uint(SEISMIC_PARAM_EPSILON)),
+        activation, partials, thread_index, sg, lane);
 }
