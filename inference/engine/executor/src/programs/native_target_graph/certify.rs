@@ -50,6 +50,36 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use std::hash::{BuildHasher, Hasher};
 use std::sync::{Arc, Mutex};
 
+/// Intern a layout without admitting an unrepresentable packed layout ID.
+fn intern_graphed_layout<K, S>(
+    ids: &mut HashMap<K, u16, S>,
+    table: &mut Vec<K>,
+    layout: K,
+    phase: &str,
+) -> Result<u16, GraphError>
+where
+    K: Copy + Eq + std::hash::Hash,
+    S: BuildHasher,
+{
+    use std::collections::hash_map::Entry;
+
+    match ids.entry(layout) {
+        Entry::Occupied(entry) => Ok(*entry.get()),
+        Entry::Vacant(entry) => {
+            let next = table.len();
+            let id = u16::try_from(next).map_err(|_| {
+                GraphError::from(format!(
+                    "too many distinct graphed layouts during {phase}: next layout ID {next} exceeds the maximum u16 ID {}",
+                    u16::MAX
+                ))
+            })?;
+            table.push(layout);
+            entry.insert(id);
+            Ok(id)
+        }
+    }
+}
+
 #[derive(Clone, Copy, Default)]
 pub(super) struct FxHasher {
     hash: u64,
@@ -1877,19 +1907,15 @@ impl TargetFamilyComposition {
         // Intern table for `LaunchGraphs` layouts.
         let mut graphed_table: Vec<Graphed> = Vec::new();
         let mut graphed_ids: FxHashMap<Graphed, u16> = fx_map();
-        let mut intern = |graphed: Graphed| -> u16 {
-            *graphed_ids.entry(graphed).or_insert_with(|| {
-                let id = u16::try_from(graphed_table.len()).expect("distinct graphed layouts exceed u16");
-                graphed_table.push(graphed);
-                id
-            })
+        let mut intern = |graphed: Graphed| {
+            intern_graphed_layout(&mut graphed_ids, &mut graphed_table, graphed, "target-family composition")
         };
         let mut entry_ids: Vec<u16> = Vec::with_capacity(entries.len() + usize::from(per_layer.is_some()));
         for &source in entries.keys() {
-            entry_ids.push(intern(Graphed::Entry(source)));
+            entry_ids.push(intern(Graphed::Entry(source))?);
         }
         if per_layer.is_some() {
-            entry_ids.push(intern(Graphed::PerLayer));
+            entry_ids.push(intern(Graphed::PerLayer)?);
         }
 
         // 1. Sealed & bound host heaps (closed-form O(B × R × T) arithmetic).
@@ -1996,7 +2022,7 @@ impl TargetFamilyComposition {
                             planned_least.seal_block_many(certified, count)?;
                             add_count(&mut sealed_least, run_stage, count_usize);
                         }
-                        intern(Graphed::Block(first, topology));
+                        intern(Graphed::Block(first, topology))?;
 
                         if has_untapped {
                             let uh = u_holder.expect("checked is_some");
@@ -2018,7 +2044,7 @@ impl TargetFamilyComposition {
                                 Holder::Block(block) => Graphed::Block(outline.first_of_shape(block), topology),
                                 Holder::Untapped(first_u) => Graphed::Untapped(first_u, topology),
                             };
-                            intern(u_graphed);
+                            intern(u_graphed)?;
                         }
                     }
                 }
@@ -2041,7 +2067,7 @@ impl TargetFamilyComposition {
                     planned_least.seal_block_many(certified, 1)?;
                     add_count(&mut sealed_least, stage, 1);
                 }
-                let id = intern(Graphed::Block(first, topology));
+                let id = intern(Graphed::Block(first, topology))?;
                 once_staged.push((id, once_stage, pass_rows));
             }
         }
@@ -2532,19 +2558,15 @@ fn verify_composition_against_enumeration<L: Certified>(
 
     let mut graphed_table: Vec<Graphed> = Vec::new();
     let mut graphed_ids: HashMap<Graphed, u16> = HashMap::new();
-    let mut intern = |graphed: Graphed| -> u16 {
-        *graphed_ids.entry(graphed).or_insert_with(|| {
-            let id = u16::try_from(graphed_table.len()).expect("distinct graphed layouts exceed u16");
-            graphed_table.push(graphed);
-            id
-        })
+    let mut intern = |graphed: Graphed| {
+        intern_graphed_layout(&mut graphed_ids, &mut graphed_table, graphed, "enumeration verification")
     };
     let mut entry_ids = Vec::new();
     for &source in entries.keys() {
-        entry_ids.push(intern(Graphed::Entry(source)));
+        entry_ids.push(intern(Graphed::Entry(source))?);
     }
     if per_layer.is_some() {
-        entry_ids.push(intern(Graphed::PerLayer));
+        entry_ids.push(intern(Graphed::PerLayer)?);
     }
     let mut once_staged: Vec<(u16, OnceStage, u64)> = Vec::new();
     let mut run_entries: Vec<(usize, StagedClass, u16)> = Vec::new();
@@ -2554,7 +2576,7 @@ fn verify_composition_against_enumeration<L: Certified>(
         .copied()
         .chain(enumeration.sharing.iter().map(|&(index, class, _)| (index, class)))
     {
-        let id = intern(Graphed::Block(outline.first_of_shape(index), class_topology(staged)));
+        let id = intern(Graphed::Block(outline.first_of_shape(index), class_topology(staged)))?;
         if let Stage::Once(once) = staged.1 {
             once_staged.push((id, once, staged.0.0));
         }
@@ -2571,7 +2593,7 @@ fn verify_composition_against_enumeration<L: Certified>(
             Holder::Block(block) => Graphed::Block(outline.first_of_shape(block), topology),
             Holder::Untapped(first) => Graphed::Untapped(first, topology),
         };
-        let id = intern(graphed);
+        let id = intern(graphed)?;
         run_entries.push((index, staged, id));
     }
     let launch_runs = LaunchRuns::of(served, stage_axes_fn, run_entries);
@@ -2758,5 +2780,33 @@ mod cache_scope_tests {
         assert_eq!(base, base.clone());
         assert_ne!(base, different_binding);
         assert_ne!(base, different_weight);
+    }
+}
+
+#[cfg(test)]
+mod graphed_layout_interner_tests {
+    use super::intern_graphed_layout;
+    use std::collections::HashMap;
+
+    #[test]
+    fn graphed_layout_interner_checks_u16_capacity() {
+        let mut ids = HashMap::new();
+        let mut table = Vec::new();
+        let phase = "enumeration verification";
+        for id in 0..=u16::MAX {
+            assert_eq!(intern_graphed_layout(&mut ids, &mut table, u32::from(id), phase).unwrap(), id);
+        }
+        let last = u32::from(u16::MAX);
+        let overflow = last + 1;
+        assert_eq!(intern_graphed_layout(&mut ids, &mut table, last, phase).unwrap(), u16::MAX);
+        let error = intern_graphed_layout(&mut ids, &mut table, overflow, phase).unwrap_err();
+        let diagnostic = error.to_string();
+        assert!(diagnostic.contains(phase), "{diagnostic}");
+        assert!(diagnostic.contains("next layout ID 65536"), "{diagnostic}");
+        assert!(diagnostic.contains("maximum u16 ID 65535"), "{diagnostic}");
+        assert_eq!(ids.len(), overflow as usize);
+        assert_eq!(table.len(), overflow as usize);
+        assert!(!ids.contains_key(&overflow));
+        assert_eq!(table.last(), Some(&last));
     }
 }
