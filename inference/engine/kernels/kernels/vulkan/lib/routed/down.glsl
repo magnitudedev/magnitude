@@ -60,6 +60,10 @@ void routed_down_choice(const uint64_t m, const uint64_t k, const uint tile, out
         down, down, 1u, hidden, uint(SEISMIC_DIM_F), tile, totals, unused);
 }
 
+#ifndef ROUTED_DOWN_MODE
+#define ROUTED_DOWN_MODE 0
+#endif
+
 #ifdef ROUTED_PROJECTED_PUT
 // Workgroup (x, m)'s projections of every choice, each channel's by one lane.
 void routed_down_publish() {
@@ -69,7 +73,18 @@ void routed_down_publish() {
     const uint first = projection_gemv_first_row(DOWN_R, DOWN_LANES, tile);
     float totals[PROJECTION_GEMV_SUMS];
     for (uint64_t k = 0ul; k < SEISMIC_DIM_K; ++k) {
-        routed_down_choice(m, k, tile, totals);
+        const slab_source src = routed_decode_source(SEISMIC_PTR(SEISMIC_BUFFER_SOURCES), ROUTED_SOURCE_ROWS,
+            SEISMIC_SOURCES_STRIDE_0, SEISMIC_SOURCES_STRIDE_1, SEISMIC_SOURCES_STRIDE_2, m, k,
+            element_i32_at(SEISMIC_PTR(SEISMIC_BUFFER_ROUTES)
+                + (m * SEISMIC_ROUTES_STRIDE_0 + k * SEISMIC_ROUTES_STRIDE_1) * 4ul));
+        if (!ROUTED_CHOICE_ACTIVE(uint(m * SEISMIC_DIM_K + k), src))
+            continue;
+        if (ROUTED_DOWN_MODE == 1 && src.code < 0) {
+            [[unroll]] for (uint sum = 0u; sum < PROJECTION_GEMV_SUMS; ++sum)
+                totals[sum] = 0.0;
+        } else {
+            routed_down_choice(m, k, tile, totals);
+        }
         [[unroll]] for (uint r = 0u; r < PROJECTION_GEMV_MAX_R; ++r) {
             const uint n = first + r;
             if (r < DOWN_R && n < hidden && SEISMIC_LANE % DOWN_LANES == r)
@@ -98,7 +113,7 @@ void routed_down_gathered_bounded(const uint maxm) {
     const uint first = projection_gemv_first_row(DOWN_R, DOWN_LANES, tile);
     const routed_work_entry entry =
         routed_worklist_entry(SEISMIC_PTR(SEISMIC_BUFFER_SCRATCH_WORKLIST), gl_WorkGroupID.y);
-    if (slab_source_none(entry.source)) {
+    if (slab_source_none(entry.source) || (ROUTED_DOWN_MODE == 1 && entry.source.code < 0)) {
         for (uint i = 0u; i < entry.count; ++i) {
             const uint packed = uint(element_i32_at(entry.outputs + uint64_t(i) * 4ul));
             const uint64_t m = uint64_t(packed >> 16u);

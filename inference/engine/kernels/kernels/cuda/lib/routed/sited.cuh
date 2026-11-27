@@ -18,7 +18,8 @@
     __shared__ u64 site_slot;                                                                              \
     if (threadIdx.x == 0) {                                                                                \
         const int *sources = reinterpret_cast<const int *>(SEISMIC_PTR(SEISMIC_BUFFER_SOURCES));           \
-        if (streaming_site_any(sources, SEISMIC_SOURCES_STRIDE_0, SEISMIC_SOURCES_STRIDE_1,                \
+        if (SEISMIC_DIM_FLIGHT > 0 &&                                                                      \
+            streaming_site_any(sources, SEISMIC_SOURCES_STRIDE_0, SEISMIC_SOURCES_STRIDE_1,                \
                 SEISMIC_SOURCES_STRIDE_2, (unsigned)(SEISMIC_DIM_M * SEISMIC_DIM_K))) {                    \
             const u64 site_step = ROUTED_SITE_STEP;                                                        \
             const u64 slot = site_step % (u64)SEISMIC_DIM_FLIGHT;                                          \

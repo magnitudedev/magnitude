@@ -319,6 +319,17 @@ kernel void attention_decode_partial_multi(
 #endif
 }
 
+// Effective partition count matching `EFF_PARTS` in attention.seismic:
+// unchanged for M == 1 or MATRIX < 2; scaled by M for MATRIX == 2, M >= 2.
+inline uint decode_eff_parts(uint m) {
+    constexpr uint PARTS = SEISMIC_TUNE_PARTS;
+#if SEISMIC_TUNE_MATRIX == 2
+    if (m >= 2)
+        return metal::max(1u, (PARTS + m - 1) / m);
+#endif
+    return PARTS;
+}
+
 // L1 of the shared-tile matrix form (MATRIX = 2, attention::decode_shared):
 // threadgroup (kv head, partition, row), its ceil(G / 8) row blocks by
 // column slices of simdgroups holding all G query heads of its kv head.
@@ -353,6 +364,7 @@ kernel void attention_decode_shared(
     const uint kv_head = group.x;
     const uint partition = group.y;
     const ulong row = group.z;
+    const uint eff_parts = decode_eff_parts(uint(SEISMIC_DIM_M));
     const rounding::Rounding key_rounding = attention::key_rounding(SEISMIC_DIM_KR != 0,
         uint(SEISMIC_PARAM_KEY_BLOCK), uint(SEISMIC_PARAM_KEY_ELEMENT), uint(SEISMIC_PARAM_KEY_SCALE),
         uint(SEISMIC_PARAM_KEY_AMAX_FLOOR));
@@ -362,15 +374,70 @@ kernel void attention_decode_shared(
             row, kv_head, simd, lane);
     if (int(uint(SEISMIC_PARAM_GATE_FUNCTION)) == -1)
         return;
-    attention::decode_shared<SEISMIC_TUNE_KEYS, SEISMIC_TUNE_PARTS, SEISMIC_DIM_KS, SEISMIC_TUNE_SPAN>(
+    attention::decode_shared<SEISMIC_TUNE_KEYS, SEISMIC_DIM_KS, SEISMIC_TUNE_SPAN, false, SEISMIC_DIM_RO != 0>(
         attention::dense_planes{history_key, attention::values_plane(history_key, history_value),
             ulong(SEISMIC_PARAM_SLAB_ROWS)}.reads(),
         query, key, value, query_norm, key_norm, value_norm, rotary_components, rotary_frequencies,
         rotary_amplitudes, coordinates, visible, fresh, partials, statistics,
         reinterpret_cast<threadgroup uchar *>(shared), SEISMIC_DIM_R, as_type<float>(uint(SEISMIC_PARAM_EPSILON)),
-        as_type<float>(uint(SEISMIC_PARAM_SCALE)) * ATTENTION_LOG2E, kv_head, partition, row,
+        as_type<float>(uint(SEISMIC_PARAM_SCALE)) * ATTENTION_LOG2E, kv_head, partition, eff_parts, row,
         thread_index, simd, lane,
         attention::decode_picks{selected_rows, selected, ulong(SEISMIC_PARAM_SELECTED_SLAB_ROWS)}, key_rounding);
+#endif
+}
+
+// Single-partition direct publication of the shared-tile form (MATRIX = 2,
+// M >= 2, EFF_PARTS == 1): skips partials write and attention_decode_merge.
+kernel void attention_decode_shared_direct(
+    device const attention::Scalar *query [[buffer(SEISMIC_BUFFER_QUERY)]],
+    device const attention::Scalar *gate [[buffer(SEISMIC_BUFFER_GATE)]],
+    device const attention::Scalar *key [[buffer(SEISMIC_BUFFER_KEY)]],
+    device const attention::Scalar *value [[buffer(SEISMIC_BUFFER_VALUE)]],
+    device const float *query_norm [[buffer(SEISMIC_BUFFER_QUERY_NORM)]],
+    device const float *key_norm [[buffer(SEISMIC_BUFFER_KEY_NORM)]],
+    device const float *value_norm [[buffer(SEISMIC_BUFFER_VALUE_NORM)]],
+    device const float *sinks [[buffer(SEISMIC_BUFFER_SINKS)]],
+    device const int *rotary_components [[buffer(SEISMIC_BUFFER_ROTARY_COMPONENTS)]],
+    device const float *rotary_frequencies [[buffer(SEISMIC_BUFFER_ROTARY_FREQUENCIES)]],
+    device const float *rotary_amplitudes [[buffer(SEISMIC_BUFFER_ROTARY_AMPLITUDES)]],
+    device const int *coordinates [[buffer(SEISMIC_BUFFER_COORDINATES)]],
+    device const int *visible [[buffer(SEISMIC_BUFFER_VISIBLE)]],
+    device const int *fresh [[buffer(SEISMIC_BUFFER_FRESH)]],
+    device const int *destinations [[buffer(SEISMIC_BUFFER_DESTINATIONS)]],
+    SEISMIC_OUT_HISTORY_KEY_PARAM(history_key),
+    SEISMIC_OUT_HISTORY_VALUE_PARAM(history_value),
+    device const int *selected_rows [[buffer(SEISMIC_BUFFER_SELECTED_ROWS)]],
+    device const ulong *selected [[buffer(SEISMIC_BUFFER_SELECTED)]],
+    SEISMIC_RESULT_0_PARAM(result_cells),
+    constant ulong *seismic_words [[buffer(SEISMIC_BUFFER_WORDS)]],
+    threadgroup float *shared [[threadgroup(0)]],
+    uint3 group [[threadgroup_position_in_grid]],
+    uint thread_index [[thread_index_in_threadgroup]],
+    uint simd [[simdgroup_index_in_threadgroup]],
+    uint lane [[thread_index_in_simdgroup]]) {
+#if SEISMIC_TUNE_MATRIX == 2
+    const uint kv_head = group.x;
+    const ulong row = group.z;
+    const rounding::Rounding key_rounding = attention::key_rounding(SEISMIC_DIM_KR != 0,
+        uint(SEISMIC_PARAM_KEY_BLOCK), uint(SEISMIC_PARAM_KEY_ELEMENT), uint(SEISMIC_PARAM_KEY_SCALE),
+        uint(SEISMIC_PARAM_KEY_AMAX_FLOOR));
+    if (ATTENTION_FRESH)
+        append_rows<attention::shared_simdgroups(), 1>(key, value, key_norm, value_norm, rotary_components, rotary_frequencies,
+            rotary_amplitudes, coordinates, destinations, history_key, history_value, seismic_words, key_rounding,
+            row, kv_head, simd, lane);
+    if (int(uint(SEISMIC_PARAM_GATE_FUNCTION)) == -1)
+        return;
+    attention::decode_shared<SEISMIC_TUNE_KEYS, SEISMIC_DIM_KS, SEISMIC_TUNE_SPAN, true, SEISMIC_DIM_RO != 0>(
+        attention::dense_planes{history_key, attention::values_plane(history_key, history_value),
+            ulong(SEISMIC_PARAM_SLAB_ROWS)}.reads(),
+        query, key, value, query_norm, key_norm, value_norm, rotary_components, rotary_frequencies,
+        rotary_amplitudes, coordinates, visible, fresh, nullptr, nullptr,
+        reinterpret_cast<threadgroup uchar *>(shared), SEISMIC_DIM_R, as_type<float>(uint(SEISMIC_PARAM_EPSILON)),
+        as_type<float>(uint(SEISMIC_PARAM_SCALE)) * ATTENTION_LOG2E, kv_head, 0, 1u, row,
+        thread_index, simd, lane,
+        attention::decode_picks{selected_rows, selected, ulong(SEISMIC_PARAM_SELECTED_SLAB_ROWS)}, key_rounding,
+        attention::shared_result{query, gate, sinks, element::Out<activation::Act>(result_cells),
+            SEISMIC_PARAM_GATE_FUNCTION != 0});
 #endif
 }
 
@@ -398,6 +465,7 @@ kernel void attention_decode_merge(
     if (int(uint(SEISMIC_PARAM_GATE_FUNCTION)) == -1)
         return;
     constexpr bool ROTATED = SEISMIC_DIM_RO != 0;
+    const uint eff_parts = decode_eff_parts(uint(SEISMIC_DIM_M));
     const element::Out<activation::Act> result(result_cells);
     threadgroup float weights[SEISMIC_TUNE_PARTS];
     threadgroup uint shared_active;
@@ -407,5 +475,5 @@ kernel void attention_decode_merge(
         SEISMIC_DIM_KS, ROTATED>(
         query, gate, visible, fresh, result, partials, statistics, weights, shared_active, shared_inv_divisor,
         SEISMIC_DIM_R, group.x, group.y, thread_index, lane, SEISMIC_PARAM_GATE_FUNCTION != 0, sinks,
-        row_values, coordinates, rotary_components, rotary_frequencies, rotary_amplitudes);
+        row_values, coordinates, rotary_components, rotary_frequencies, rotary_amplitudes, eff_parts);
 }

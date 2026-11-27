@@ -538,11 +538,11 @@ projection dense for cuda:
     params (arithmetic INT8 in [0, 1] default greatest where INT8 == 0 or (ORDERED_ANY == 0 and G == 1 and each(W, form(W, INT8) == 1) and agree(W, form(W, S8_ENTRIES))) reference 0 for paired | single,
         arithmetic INT8 in [0, 1] default greatest where INT8 == 0 or (ORDERED_ANY == 0 and PARTED == 0 and any(W, N > 0 and form(W, INT8) == 1) and (each(W, N == 0 or form(W, INT8) == 0 or form(W, S8_ENTRIES) == 0) or each(W, N == 0 or form(W, INT8) == 0 or form(W, S8_ENTRIES) == 1))) reference 0 for segmented,
         arithmetic OPERAND in [0, 1] default 0,
-        arithmetic SPLIT in [2, 1, 4] default least where (ORDERED_ANY == 1 and SPLIT == 1) or (ORDERED_ANY == 0 and ((SPLIT == 1 and (PLANES == 1 or K < 512 or GEMM_TILES * 4 * G >= device.units)) or (SPLIT == 2 and (K < 2048 or GEMM_TILES * 4 * G * 2 >= device.units)) or SPLIT == 4)) for single,
+        arithmetic SPLIT in [2, 1, 4] default least where (ORDERED_ANY == 1 and SPLIT == 1) or (ORDERED_ANY == 0 and ((SPLIT == 1 and (PLANES == 1 or K < 512 or (GEMM_TILES * 4 * G >= device.units and (K < 8192 or GEMM_TILES * G >= device.units)))) or (SPLIT == 2 and (K < 2048 or GEMM_TILES * 4 * G * 2 >= device.units)) or SPLIT == 4)) for single,
         arithmetic GEMM_SPLIT in [1, 2, 4, 8] default least where (PARTED == 0 and GEMM_SPLIT == 1) or (PARTED == 1 and (GEMM_TILES * 2 * GEMM_SPLIT >= device.units or GEMM_SPLIT * 512 > K or GEMM_SPLIT == 8)) for segmented,
         TPW in [1, 2] default 1 for ordered,
         form STAGING in [0, 1] default 0 for single | segmented, form STAGING in [0] default 0 for paired,
-        arithmetic KSPLIT in [4, 2, 8, 1] default least where (ORDERED_ALL == 1 and KSPLIT == 1) or (ORDERED_ALL == 0 and K / P <= 256 and KSPLIT == 1) or (ORDERED_ALL == 0 and K / P > 256 and KSPLIT != 1 and (P * G * tiles(W, ceil_div(ceil_div(N, 16), 8 / KSPLIT)) >= 2 * device.units or K / P < KSPLIT * 512 or KSPLIT == (8 - 4 * ORDERED_ANY))))
+        arithmetic KSPLIT in [4, 2, 8, 1] default least where (ORDERED_ALL == 1 and KSPLIT == 1) or (ORDERED_ALL == 0 and K / P <= 256 and KSPLIT == 1) or (ORDERED_ALL == 0 and K / P > 256 and KSPLIT != 1 and (P * G * tiles(W, ceil_div(ceil_div(N, 16), 8 / KSPLIT)) >= 3 * device.units or K / P < KSPLIT * 512 or KSPLIT == (8 - 4 * ORDERED_ANY))))
     where dense_bytes(A) == 2
     where (GEMM_SPLIT == 1 or (PARTED == 1 and K >= GEMM_SPLIT * 256)) for segmented
     where (ORDERED_ANY == 1 or K / P <= 256 or KSPLIT != 1)

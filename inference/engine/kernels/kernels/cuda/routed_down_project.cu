@@ -9,6 +9,26 @@
 #define ROUTED_PROJECTED_S1 SEISMIC_PUBLISHED_STRIDE_1
 #define ROUTED_PROJECTED_S2 SEISMIC_PUBLISHED_STRIDE_2
 #define ROUTED_DOWN_MODE ((int)SEISMIC_PARAM_MODE)
+#include "lib/streaming/control.cuh"
+
+// `ROUTING_SOURCE` is written by the layer's route kernel earlier in the same
+// CUDA stream and never modified by the host, so L2-cached `__ldcg` reads it
+// coherently without serializing uncached system-scope `volatile` loads.
+__device__ __forceinline__ bool routed_down_left_absent(const int *step, unsigned long long step0,
+                                                        const int *routing, unsigned long long routing0,
+                                                        unsigned long long routing1, unsigned flight,
+                                                        unsigned width, unsigned choice) {
+    const unsigned long long q = streaming_step(step, step0);
+    const unsigned long long at = (q % (unsigned long long)flight) * routing0 +
+                                  (unsigned long long)SEISMIC_CONST_ROUTING_SOURCE(width, choice) * routing1;
+    return __ldcg(routing + at) == -1;
+}
+
+#define ROUTED_DOWN_LEFT_ABSENT(c)                                                                                    \
+    routed_down_left_absent(reinterpret_cast<const int *>(SEISMIC_PTR(SEISMIC_BUFFER_STEP)), SEISMIC_STEP_STRIDE_0,   \
+                            reinterpret_cast<const int *>(SEISMIC_PTR(SEISMIC_BUFFER_ROUTING)),                       \
+                            SEISMIC_ROUTING_STRIDE_0, SEISMIC_ROUTING_STRIDE_1, SEISMIC_DIM_FLIGHT, SEISMIC_DIM_P,    \
+                            (c))
 #include "lib/routed/down.cuh"
 
 #ifdef SEISMIC_FORMING_ROUTED_DOWN_PROJECT_STAGE

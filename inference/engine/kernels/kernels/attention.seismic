@@ -738,9 +738,15 @@ native attention_decode for metal from "metal/attention_decode.metal":
         arithmetic PARTS in [16, 8, 32, 64, 128, 256, 512] default least where (MATRIX < 2 and KV * PARTS >= 2 * device.units) or (MATRIX == 2 and KV * PARTS * max(1, ceil_div(G, 8) * max(1, (2 * P + S) / 128) / (2 * SIMDS)) >= 2 * device.units) or PARTS == 512,
         arithmetic KEYS in [16, 8, 32] default 16, arithmetic TOKENS in [1, 2, 4, 8] default 1,
         arithmetic HEADS in [1, 2, 4, 8, 16, 32, 64, 128] default least where HEADS >= G)
+    let COLS = max(1, (2 * P + S) / 128)
+    let T_CAP = ceil_div(G, 8)
+    let SHARED_MULTI = min(1, MATRIX / 2) * min(1, M / 2)
+    let SHARED_DIVISOR = SHARED_MULTI * M + (1 - SHARED_MULTI)
+    let EFF_PARTS = max(1, ceil_div(PARTS, SHARED_DIVISOR))
+    let SHARED_DIRECT = SHARED_MULTI * (1 - min(1, EFF_PARTS - 1))
     where KR <= 1 and (KS == 0 or MATRIX >= 1) and ((HEADS >= G and HEADS / 2 < G) or (MATRIX == 1 and HEADS >= 8 and HEADS < G and G % HEADS == 0 and G * (2 * P + S) * 2 > device.shared_bytes_per_group and (ceil_div(G, 8) * max(1, (2 * P + S) / 128) * device.subgroup_width > device.max_group_threads or (2 * P + S) % max(1, (2 * P + S) / 128) != 0 or ((2 * P + S) / max(1, (2 * P + S) / 128)) % 32 != 0 or 4 * 8 * ((2 * P + S) + 8) + min(1, max(1, (2 * P + S) / 128) - 1) * max(1, (2 * P + S) / 128) * ceil_div(G, 8) * 8 * 8 * 4 > device.shared_bytes_per_group))) and NQ <= 1 and RA <= 1 and RT <= 1 and (RA == 0 or (2 * P + S) % 64 == 0 or 2 * P + S == 32) and 2 * P + S <= device.max_group_threads and RO <= 1 and (RO == 0 or (P > 0 and I == 0 and U == 0)) and VK <= 1 and SK <= 1 and (I == 0 or I == 2 * P + S) and (U == 0 or U == 1 or U == 2 * P + S) and (I == 0 or U == 0) and F <= 1 and N <= 1 and NV <= 1 and (2 * P + S) % 32 == 0 and P % ((2 * P + S) / 32) == 0 and G % SLICES == 0 and SIMDS % SLICES == 0 and (MATRIX >= 1 or (KEYS == 16 and TOKENS == 1)) and (MATRIX < 2 or (TOKENS == 1 and SIMDS == 4 and HEADS >= G and ceil_div(G, 8) * max(1, (2 * P + S) / 128) * device.subgroup_width <= device.max_group_threads and (2 * P + S) % max(1, (2 * P + S) / 128) == 0 and ((2 * P + S) / max(1, (2 * P + S) / 128)) % 32 == 0 and 4 * KEYS * ((2 * P + S) + 8) + min(1, max(1, (2 * P + S) / 128) - 1) * max(1, (2 * P + S) / 128) * ceil_div(G, 8) * 8 * KEYS * 4 <= device.shared_bytes_per_group)) and (MATRIX >= 1 or SIMDS * (G / SLICES) * 8 + max(SIMDS * (2 * P + S) * 4, G * (2 * P + S) * 2) <= device.shared_bytes_per_group) and (MATRIX == 0 or SLICES == 1) and (MATRIX != 1 or ((2 * P + S) % max(1, ceil_div(TOKENS * min(HEADS, G), 8) * (2 * P + S) / 128) == 0 and ((2 * P + S) / max(1, ceil_div(TOKENS * min(HEADS, G), 8) * (2 * P + S) / 128)) % 32 == 0 and SIMDS % max(1, ceil_div(TOKENS * min(HEADS, G), 8) * (2 * P + S) / 128) == 0 and ceil_div(TOKENS * min(HEADS, G), 8) * 8 * (2 * P + S) * 2 + max(SIMDS * KEYS * (((2 * P + S) / max(1, ceil_div(TOKENS * min(HEADS, G), 8) * (2 * P + S) / 128)) + 8) * 2 + min(1, max(1, ceil_div(TOKENS * min(HEADS, G), 8) * (2 * P + S) / 128) - 1) * 2 * SIMDS * ceil_div(TOKENS * min(HEADS, G), 8) * 8 * KEYS * 4, ceil_div(TOKENS * min(HEADS, G), 8) * 8 * (2 * P + S) * 4) + SIMDS / max(1, ceil_div(TOKENS * min(HEADS, G), 8) * (2 * P + S) / 128) * ceil_div(TOKENS * min(HEADS, G), 8) * 8 * 8 <= device.shared_bytes_per_group))
-    scratch partials bytes (M * KV * G * PARTS * (2 * P + S) * 4)
-    scratch statistics bytes (M * KV * G * PARTS * 8)
+    scratch partials bytes (M * KV * G * EFF_PARTS * (2 * P + S) * 4)
+    scratch statistics bytes (M * KV * G * EFF_PARTS * 8)
     launch attention_decode_partial when MATRIX < 2 and (M == 1 or MATRIX == 0 or TOKENS != 1 or HEADS < G or KS > 0 or (2 * P + S != 64 and 2 * P + S != 128 and 2 * P + S != 256) or KEYS % 8 != 0 or max(4 * 8 * (2 * P + S) * 2, KEYS * (2 * P + S) * 4) + 64 > device.shared_bytes_per_group):
         threadgroups (KV * ceil_div(G, HEADS), PARTS, ceil_div(M, TOKENS))
         threads_per_threadgroup (SIMDS * 32, 1, 1)
@@ -749,11 +755,15 @@ native attention_decode for metal from "metal/attention_decode.metal":
         threadgroups (KV * ceil_div(G, 8), PARTS, ceil_div(M, 8))
         threads_per_threadgroup (8 * 32, 1, 1)
         shared_bytes (max(4 * 8 * (2 * P + S) * 2, KEYS * (2 * P + S) * 4) + 64)
-    launch attention_decode_shared when MATRIX == 2:
-        threadgroups (KV, PARTS, M)
-        threads_per_threadgroup (ceil_div(G, 8) * max(1, (2 * P + S) / 128) * 32, 1, 1)
-        shared_bytes (4 * KEYS * ((2 * P + S) + 8) + min(1, max(1, (2 * P + S) / 128) - 1) * max(1, (2 * P + S) / 128) * ceil_div(G, 8) * 8 * KEYS * 4)
-    launch attention_decode_merge:
+    launch attention_decode_shared when MATRIX == 2 and SHARED_DIRECT == 0:
+        threadgroups (KV, EFF_PARTS, M)
+        threads_per_threadgroup (T_CAP * COLS * 32, 1, 1)
+        shared_bytes ((2 - VK) * 2 * KEYS * ((2 * P + S) + 8) + min(1, COLS - 1) * COLS * T_CAP * 8 * KEYS * 4)
+    launch attention_decode_shared_direct when SHARED_DIRECT == 1:
+        threadgroups (KV, 1, M)
+        threads_per_threadgroup (T_CAP * COLS * 32, 1, 1)
+        shared_bytes (max((2 - VK) * 2 * KEYS * ((2 * P + S) + 8) + min(1, COLS - 1) * COLS * T_CAP * 8 * KEYS * 4, 8 * (2 * P + S) * 4))
+    launch attention_decode_merge when SHARED_DIRECT == 0:
         threadgroups (KV * G, M, 1)
         threads_per_threadgroup (2 * P + S, 1, 1)
 
@@ -986,7 +996,7 @@ native attention_prefill for metal from "metal/attention_prefill.metal":
     launch attention_prefill_shared when KS > 0:
         threadgroups (KV, M, 1)
         threads_per_threadgroup (ceil_div(G, 8) * max(1, (2 * P + S) / 128) * 32, 1, 1)
-        shared_bytes (4 * KEYS * ((2 * P + S) + 8) + min(1, max(1, (2 * P + S) / 128) - 1) * max(1, (2 * P + S) / 128) * ceil_div(G, 8) * 8 * KEYS * 4)
+        shared_bytes (max((2 - VK) * 2 * KEYS * ((2 * P + S) + 8) + min(1, max(1, (2 * P + S) / 128) - 1) * max(1, (2 * P + S) / 128) * ceil_div(G, 8) * 8 * KEYS * 4, 8 * (2 * P + S) * 4))
     launch attention_prefill_merge when KS == 0 and ceil_div(SPLIT_GROUPS, ceil_div(M, QT) * KV * ceil_div(G, HEADS)) > 1:
         threadgroups (ceil_div(M, QT), KV * G, 1)
         threads_per_threadgroup (2 * P + S, 1, 1)
@@ -1029,8 +1039,14 @@ native attention_prefill for cuda from "cuda/attention_prefill.cu":
         QREG in [0, 1] default least where ATTEND_REGION + (65 + min(1, KS)) * 16 <= device.shared_bytes_per_group or QREG == 1)
     # The key partitions of a query tile: SPLIT_GROUPS over the query tiles
     # and kv heads, and for the decode row classes (M <= VERIFY_ROWS, no
-    # WorkList) over the kv heads alone, as one row's.
-    let PARTITIONS = max(1, ceil_div(SPLIT_GROUPS, max(1, ceil_div(M, WARPS * 16 / G) * min(1, M / (VERIFY_ROWS + 1) + B)) * KV))
+    # WorkList): for M >= 2 and G > WARPS * 8, over head groups (G / 8, KS == 0
+    # and G % 8 == 0) or tokens (M, KS > 0); otherwise over kv heads alone.
+    let VERIFY_MULTI = min(1, M / 2) * (1 - min(1, M / (VERIFY_ROWS + 1))) * (1 - min(1, B)) * min(1, G / (WARPS * 8 + 1))
+    let VERIFY_GROUPED = VERIFY_MULTI * (1 - min(1, KS)) * (1 - min(1, G % 8))
+    let VERIFY_TOKENS = VERIFY_MULTI * min(1, KS)
+    let G_GROUPS = max(1, VERIFY_GROUPED * (G / 8))
+    let VERIFY_X = VERIFY_GROUPED * G_GROUPS + VERIFY_TOKENS * M + (1 - VERIFY_GROUPED - VERIFY_TOKENS)
+    let PARTITIONS = max(1, ceil_div(SPLIT_GROUPS, max(VERIFY_X, ceil_div(M, WARPS * 16 / G) * min(1, M / (VERIFY_ROWS + 1) + B)) * KV))
     let WIDTH = 2 * P + S
     let WIDE = min(1, WIDTH / 257)
     let SPLIT = WIDE * min(1, COLUMNS - 1)
@@ -1059,8 +1075,16 @@ native attention_prefill for cuda from "cuda/attention_prefill.cu":
         threadgroups (ceil_div(M, WARPS * 16 / G), KV, PARTITIONS)
         threads_per_threadgroup (COLUMNS * WARPS * 32, 1, 1)
         shared_bytes (ATTEND_REGION + (R + 1 + min(1, KS)) * 16)
-    launch attention_prefill_attend_rows when M <= VERIFY_ROWS and B == 0:
+    launch attention_prefill_attend_rows when M <= VERIFY_ROWS and B == 0 and VERIFY_GROUPED == 0 and VERIFY_TOKENS == 0:
         threadgroups (1, KV, PARTITIONS)
+        threads_per_threadgroup (COLUMNS * WARPS * 32, 1, 1)
+        shared_bytes (ATTEND_REGION + (36 + 28 * min(1, KS)) * 16)
+    launch attention_prefill_attend_rows_grouped when VERIFY_GROUPED == 1:
+        threadgroups (G_GROUPS, KV, PARTITIONS)
+        threads_per_threadgroup (COLUMNS * WARPS * 32, 1, 1)
+        shared_bytes (ATTEND_REGION + (36 + 28 * min(1, KS)) * 16)
+    launch attention_prefill_attend_rows_tokens when VERIFY_TOKENS == 1:
+        threadgroups (M, KV, PARTITIONS)
         threads_per_threadgroup (COLUMNS * WARPS * 32, 1, 1)
         shared_bytes (ATTEND_REGION + (36 + 28 * min(1, KS)) * 16)
     launch attention_prefill_merge when PARTITIONS > 1:

@@ -664,11 +664,12 @@ inline void decode_output(device const Scalar *query, device const Scalar *gate,
     threadgroup float &shared_inv_divisor, ulong spans, ulong head, ulong row, uint column, uint lane,
     bool softplus, device const float *sinks = nullptr, threadgroup float *row_values = nullptr,
     device const int *coordinates = nullptr, device const int *components = nullptr,
-    device const float *frequencies = nullptr, device const float *amplitudes = nullptr) {
+    device const float *frequencies = nullptr, device const float *amplitudes = nullptr,
+    uint eff_parts = PARTS) {
     constexpr uint W = ATTENTION_W;
     constexpr uint KV = SEISMIC_DIM_KV;
     constexpr uint G = ATTENTION_QUERY_GROUP;
-    const ulong first = (row * KV * G + head) * PARTS;
+    const ulong first = (row * KV * G + head) * eff_parts;
     const float g = gate_logit(query, gate, row, head, column);
     if (column < 32) {
         // The row's partitions that hold its keys (`decode_active`): the matrix
@@ -680,9 +681,9 @@ inline void decode_output(device const Scalar *query, device const Scalar *gate,
         if constexpr (GRID_KEYS > 0) {
             static_assert(SPAN % GRID_KEYS == 0, "a partition's floor is whole key tiles");
             const uint tiles = (total + GRID_KEYS - 1) / GRID_KEYS + (PICKS + GRID_KEYS - 1) / GRID_KEYS;
-            active = decode_active(tiles, SPAN / GRID_KEYS, PARTS);
+            active = decode_active(tiles, SPAN / GRID_KEYS, eff_parts);
         } else {
-            active = decode_active(total + PICKS, SPAN, PARTS);
+            active = decode_active(total + PICKS, SPAN, eff_parts);
         }
         float maximum = -INFINITY;
         for (uint p = lane; p < active; p += 32) {
@@ -4704,13 +4705,13 @@ struct shared_result {
 // `shared_result`.
 struct no_shared_result {};
 
-template <uint KEYS, uint PARTS, uint PICKS, uint SPAN, bool DIRECT = false, bool ROTATED = false>
+template <uint KEYS, uint PICKS, uint SPAN, bool DIRECT = false, bool ROTATED = false>
 inline void decode_shared(dense_history history, device const Scalar *query, device const Scalar *key,
     device const Scalar *value, device const float *query_norm, device const float *key_norm,
     device const float *value_norm, device const int *rotary_components, device const float *rotary_frequencies,
     device const float *rotary_amplitudes, device const int *coordinates, device const int *visible,
     device const int *fresh, device float *partials, device float *statistics, threadgroup uchar *shared,
-    ulong R, float epsilon, float scale, uint kv_head, uint partition, ulong row,
+    ulong R, float epsilon, float scale, uint kv_head, uint partition, uint eff_parts, ulong row,
     uint thread_index, uint simd, uint lane, decode_picks picks, rounding::Rounding key_rounding,
     typename metal::conditional<DIRECT, shared_result, no_shared_result>::type direct = {}) {
     typedef dense_history::KeyOperand KeyOperand;
@@ -4730,18 +4731,17 @@ inline void decode_shared(dense_history history, device const Scalar *query, dev
     // A tile row's 16-byte pieces, and each thread's share of a tile's.
     constexpr uint PIECES = W / 8;
     constexpr uint LOADS = (KEYS * PIECES + THREADS - 1) / THREADS;
+    constexpr uint KV_TILES = ATTENTION_STORED_KEY ? 1 : 2;
     constexpr uint TILE_BYTES = KEYS * PITCH * 2;
     constexpr uint EXCHANGE_BYTES = COLS > 1 ? COLS * ROWS * KEYS * 4 : 0;
     // Query heads prepared per round: whole row blocks within the tiles and
-    // the exchange (at least one block: 2 * TILE_BYTES >= 16 W).
-    constexpr uint CHUNK = (2 * TILE_BYTES + EXCHANGE_BYTES) / (W * 2) / 8 * 8;
+    // the exchange (at least one block: TILE_BYTES >= 8 W * 2).
+    constexpr uint CHUNK = (KV_TILES * TILE_BYTES + EXCHANGE_BYTES) / (W * 2) / 8 * 8;
     static_assert(sizeof(KeyOperand) == 2, "tiles hold 2-byte operands");
     static_assert(KEYS % 8 == 0 && KEYS <= 32, "a key tile is whole 8-key fragments, a row a lane");
     static_assert(W % COLS == 0 && WC % 32 == 0, "column slices are whole code groups");
     static_assert(THREADS <= 1024, "a threadgroup holds every row block's column slices");
     static_assert(CHUNK >= 8, "a staging round holds a row block");
-    static_assert(!DIRECT || (PARTS == 1 && 8 * W * 4 <= 2 * TILE_BYTES + EXCHANGE_BYTES),
-        "a direct publication is one partition's, a row block's finished rows within the tiles");
 
     const uint block = simd / COLS;
     const uint slice = simd % COLS;
@@ -4749,7 +4749,7 @@ inline void decode_shared(dense_history history, device const Scalar *query, dev
 
     // The row's key sequence: its visible keys, then its picks.
     const uint total = form_total(visible, fresh, row, R, lane);
-    const uint span_keys = partition_span(total + PICKS, SPAN, PARTS);
+    const uint span_keys = partition_span(total + PICKS, SPAN, eff_parts);
     const uint partition_lo = partition * span_keys;
     // An empty partition publishes nothing (`decode_output` skips it); a
     // direct row that sees no key still publishes its zero output.
@@ -4759,8 +4759,9 @@ inline void decode_shared(dense_history history, device const Scalar *query, dev
     const uint visible_hi = metal::min(partition_hi, total);
 
     threadgroup KeyOperand *keys = reinterpret_cast<threadgroup KeyOperand *>(shared);
-    threadgroup KeyOperand *values = reinterpret_cast<threadgroup KeyOperand *>(shared + TILE_BYTES);
-    threadgroup float *exchange = reinterpret_cast<threadgroup float *>(shared + 2 * TILE_BYTES);
+    threadgroup KeyOperand *values = ATTENTION_STORED_KEY
+        ? keys : reinterpret_cast<threadgroup KeyOperand *>(shared + TILE_BYTES);
+    threadgroup float *exchange = reinterpret_cast<threadgroup float *>(shared + KV_TILES * TILE_BYTES);
 
     // Queries are rotary-prepared and rounded to the activation dtype (as the
     // contract publishes them), CHUNK heads a round staged in threadgroup
@@ -4853,7 +4854,7 @@ inline void decode_shared(dense_history history, device const Scalar *query, dev
     // A tile's loaded rows, this thread's pieces of them (zero past the
     // rows), into registers: a stored-key or picked row's value is its key.
     uint4 key_piece[LOADS];
-    uint4 value_piece[LOADS];
+    uint4 value_piece[ATTENTION_STORED_KEY ? 1 : LOADS];
     auto load = [&](tile t) {
         const dense_history plane = t.picked ? picks_plane<PICKS>(picks) : history;
         device const ulong *key_table = plane.key;
@@ -4867,14 +4868,16 @@ inline void decode_shared(dense_history history, device const Scalar *query, dev
             const uint k = item / PIECES;
             const int r = t.rows.at(k);
             key_piece[n] = uint4(0);
-            value_piece[n] = uint4(0);
+            if constexpr (!ATTENTION_STORED_KEY)
+                value_piece[n] = uint4(0);
             if (item < KEYS * PIECES && k < t.rows.count) {
                 const ulong column = ulong(kv_head) * W + (item % PIECES) * 8;
                 key_piece[n] = *reinterpret_cast<device const uint4 *>(
                     t.rows.of(key_slab, key_table, rows_per_slab, k, r, KV * W) + column);
-                value_piece[n] = ATTENTION_STORED_KEY || t.picked ? key_piece[n]
-                    : *reinterpret_cast<device const uint4 *>(
-                        t.rows.of(value_slab, value_table, rows_per_slab, k, r, KV * W) + column);
+                if constexpr (!ATTENTION_STORED_KEY)
+                    value_piece[n] = t.picked ? key_piece[n]
+                        : *reinterpret_cast<device const uint4 *>(
+                            t.rows.of(value_slab, value_table, rows_per_slab, k, r, KV * W) + column);
             }
         }
     };
@@ -4892,7 +4895,8 @@ inline void decode_shared(dense_history history, device const Scalar *query, dev
                 continue;
             const uint at = (item / PIECES) * PITCH + (item % PIECES) * 8;
             *reinterpret_cast<threadgroup uint4 *>(keys + at) = key_piece[n];
-            *reinterpret_cast<threadgroup uint4 *>(values + at) = value_piece[n];
+            if constexpr (!ATTENTION_STORED_KEY)
+                *reinterpret_cast<threadgroup uint4 *>(values + at) = value_piece[n];
         }
         if (t.fresh_count == 0)
             return;
@@ -4902,9 +4906,10 @@ inline void decode_shared(dense_history history, device const Scalar *query, dev
             decode_matrix_fresh<true, 1, W, PITCH, dense_history>(keys + k * PITCH, key, value, key_norm, value_norm,
                 coordinates, rotary_components, rotary_frequencies, rotary_amplitudes, token, held, kv_head, 0, epsilon,
                 key_rounding, lane);
-            decode_matrix_fresh<false, 1, W, PITCH, dense_history>(values + k * PITCH, key, value, key_norm, value_norm,
-                coordinates, rotary_components, rotary_frequencies, rotary_amplitudes, token, held, kv_head, 0, epsilon,
-                key_rounding, lane);
+            if constexpr (!ATTENTION_STORED_KEY)
+                decode_matrix_fresh<false, 1, W, PITCH, dense_history>(values + k * PITCH, key, value, key_norm, value_norm,
+                    coordinates, rotary_components, rotary_frequencies, rotary_amplitudes, token, held, kv_head, 0, epsilon,
+                    key_rounding, lane);
         }
     };
 
@@ -5011,7 +5016,7 @@ inline void decode_shared(dense_history history, device const Scalar *query, dev
     // The block's rows below G publish their partition result: each lane its
     // two columns of each fragment, the first slice the statistics.
     if (head < G) {
-        const ulong slot = (row * KV + kv_head) * G * PARTS + head * PARTS + partition;
+        const ulong slot = (row * KV + kv_head) * G * eff_parts + head * eff_parts + partition;
         ATTENTION_UNROLL
         for (uint d = 0; d < DB; ++d) {
             const uint column = col0 + d * 8 + fn;

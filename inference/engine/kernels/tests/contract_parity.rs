@@ -211,10 +211,12 @@ fn assert_contract_parity<E: EntryContract>(
                 .copied()
                 .filter(|(name, _)| *name != first_static.as_str())
                 .collect();
-            assert_eq!(
-                E::contract_admit(backend, None, elements, &missing_dims, &params),
-                Err(ContractError::MissingDimension(first_static.as_str())),
-                "{label} ({backend:?}): missing static must fail"
+            assert!(
+                matches!(
+                    E::contract_admit(backend, None, elements, &missing_dims, &params),
+                    Err(ContractError::MissingDimension(dim)) if dim == first_static.as_str()
+                ),
+                "{label} ({backend:?}): missing static `{first_static}` must fail"
             );
         }
 
@@ -899,6 +901,7 @@ fn contract_node_shape_presence_matches_native_implementation_all_entries() {
         name_entry,
         publish_front,
         routed_gate_up_part,
+        routed_stage_host,
         select_route,
         stands,
         weight_word,
@@ -948,7 +951,9 @@ fn param_value(params: &[(&str, u64)], name: &str) -> u64 {
 fn canonical_default_gaps_are_closed() {
     let bf16 = Element::bf16();
 
-    // 1. CUDA routed choice|summed: GATHER_TPW defaults to 1 even when N is wide.
+    // 1. CUDA routed summed: GATHER_TPW defaults to 2 when 2-tile blocks still saturate
+    //    2 * device.units (halving activation row reloads in gathered down projections),
+    //    and falls back to 1 on wider-SM devices where 2-tile blocks would under-occupy.
     let cuda_dev = OverrideDevice {
         backend: BackendName::Cuda,
         overrides: &[("units", 48)],
@@ -972,7 +977,28 @@ fn canonical_default_gaps_are_closed() {
         ],
     )
     .expect("CUDA routed_output defaults resolve");
-    assert_eq!(param_value(&routed_params, "GATHER_TPW"), 1);
+    assert_eq!(param_value(&routed_params, "GATHER_TPW"), 2);
+
+    let cuda_wide = OverrideDevice {
+        backend: BackendName::Cuda,
+        overrides: &[("units", 170)],
+    };
+    let routed_down_wide = magnitude_kernels::routed_down::Entry::contract_default_params(
+        BackendName::Cuda,
+        Some(&cuda_wide),
+        &[("A", bf16), ("EDW", bf16), ("R", bf16)],
+        &[
+            ("M", 4),
+            ("H", 5120),
+            ("E", 384),
+            ("K", 6),
+            ("F", 2304),
+            ("XS", 0),
+            ("TR", 0),
+        ],
+    )
+    .expect("CUDA routed_down wide-SM defaults resolve");
+    assert_eq!(param_value(&routed_down_wide, "GATHER_TPW"), 1);
 
     // 2. Metal dense single: TALL defaults to 0 when G > 1 (e.g. project_rows G=64),
     //    and stays 1 when G == 1 and K % 64 == 0.
@@ -1136,6 +1162,95 @@ fn canonical_default_gaps_are_closed() {
     .expect("CUDA routed_gate_up defaults resolve");
     assert_eq!(param_value(&cuda_gate_up, "GATHERED"), 1);
     assert_eq!(param_value(&cuda_gate_up, "GATHER_TPW"), 1);
+    assert_eq!(param_value(&cuda_gate_up, "KSPLIT"), 4);
+
+    // 5b. CUDA routed choice with wide K (WIDTH >= 4096) defaults to KSPLIT=4 across SM counts,
+    //     while short-K choice (WIDTH < 4096) and summed (routed_down) keep the occupancy rule.
+    let cuda_3090 = OverrideDevice {
+        backend: BackendName::Cuda,
+        overrides: &[("units", 82)],
+    };
+    let cuda_3060 = OverrideDevice {
+        backend: BackendName::Cuda,
+        overrides: &[("units", 28)],
+    };
+    let cuda_gate_up_5120 = magnitude_kernels::routed_gate_up::Entry::contract_default_params(
+        BackendName::Cuda,
+        Some(&cuda_3090),
+        &[("A", bf16), ("EGW", bf16), ("EUW", bf16)],
+        &[
+            ("M", 2),
+            ("H", 5120),
+            ("E", 384),
+            ("K", 6),
+            ("F", 2304),
+            ("GS", 0),
+            ("US", 0),
+            ("XS", 0),
+            ("TR", 0),
+            ("LB", 0),
+        ],
+    )
+    .expect("CUDA routed_gate_up H=5120 defaults resolve");
+    assert_eq!(param_value(&cuda_gate_up_5120, "KSPLIT"), 4);
+
+    let cuda_gate_up_2560 = magnitude_kernels::routed_gate_up::Entry::contract_default_params(
+        BackendName::Cuda,
+        Some(&cuda_3060),
+        &[("A", bf16), ("EGW", bf16), ("EUW", bf16)],
+        &[
+            ("M", 2),
+            ("H", 2560),
+            ("E", 512),
+            ("K", 10),
+            ("F", 640),
+            ("GS", 0),
+            ("US", 0),
+            ("XS", 0),
+            ("TR", 0),
+            ("LB", 0),
+        ],
+    )
+    .expect("CUDA routed_gate_up H=2560 defaults resolve");
+    assert_eq!(param_value(&cuda_gate_up_2560, "KSPLIT"), 1);
+
+    let cuda_down = magnitude_kernels::routed_down::Entry::contract_default_params(
+        BackendName::Cuda,
+        Some(&cuda_3090),
+        &[("A", bf16), ("EDW", bf16), ("R", bf16)],
+        &[
+            ("M", 2),
+            ("H", 5120),
+            ("E", 384),
+            ("K", 6),
+            ("F", 2304),
+            ("XS", 0),
+            ("TR", 0),
+        ],
+    )
+    .expect("CUDA routed_down defaults resolve");
+    assert_eq!(param_value(&cuda_down, "KSPLIT"), 1);
+
+    // 5c. CUDA dense single: long-K under-tiled projections (K >= 8192, GEMM_TILES * G < units)
+    //     default to SPLIT=2, and GEMV KSPLIT targets 3 * units blocks.
+    let cuda_attn_out = magnitude_kernels::attention_output::Entry::contract_default_params(
+        BackendName::Cuda,
+        Some(&cuda_dev),
+        &[("A", bf16), ("OW", bf16)],
+        &[("M", 512), ("D", 5120), ("SN", 4), ("IN", 20), ("Q", 8), ("W", 1024), ("OS", 0), ("OB", 0)],
+    )
+    .expect("CUDA attention_output defaults resolve");
+    assert_eq!(param_value(&cuda_attn_out, "SPLIT"), 2);
+
+    let cuda_proj_g8 = magnitude_kernels::project_rows::Entry::contract_default_params(
+        BackendName::Cuda,
+        Some(&cuda_dev),
+        &[("A", bf16), ("W", bf16), ("Y", bf16)],
+        &[("M", 4), ("G", 8), ("K", 4096), ("N", 1024), ("WS", 0), ("WB", 0)],
+    )
+    .expect("CUDA project_rows G=8 defaults resolve");
+    assert_eq!(param_value(&cuda_proj_g8, "KSPLIT"), 4);
+    assert_eq!(param_value(&cuda_proj_g8, "SPLIT"), 1);
 
     let metal_down_k8 = magnitude_kernels::routed_down::Entry::contract_default_params(
         BackendName::Metal,

@@ -38,6 +38,15 @@ template <class E, class Rows> struct Plain {
         const u16 *values = reinterpret_cast<const u16 *>(at);
         return (u32)values[0] | (u32)values[1] << 16;
     }
+    // The operand bits of x[m, k .. k + 3], k a multiple of 4 (`gemv_entries_kblock`).
+    __device__ __forceinline__ uint2 quad(const float *, u32 m, u64 k) const {
+        static_assert(!STAGED, "a GEMV reads staged rows");
+        const u8 *at = x + (rows(m) * stride + k) * 2;
+        if (stride % 4 == 0 && ((u64)x & 7) == 0)
+            return *reinterpret_cast<const uint2 *>(at);
+        const u16 *values = reinterpret_cast<const u16 *>(at);
+        return make_uint2((u32)values[0] | (u32)values[1] << 16, (u32)values[2] | (u32)values[3] << 16);
+    }
     // The operand bits of x[m, k .. k + 7], k a multiple of 8 (`gemv_rows`).
     __device__ __forceinline__ uint4 octet(const float *, u32 m, u64 k) const {
         static_assert(!STAGED, "a GEMV reads staged rows");

@@ -492,8 +492,11 @@ projection routed for cuda:
     let ROW_TILES = STACKED * ceil_div(T, TILE) + (1 - STACKED) * ceil_div(M, TILE) for grouped
     let TILE_BLOCKS = STACKED * B + (1 - STACKED) for grouped
     let PRODUCT_ROWS = STACKED * B * T + (1 - STACKED) * M for grouped
-    params (TPW in [1, 2] default 1 for choice | summed, arithmetic KSPLIT in [1, 2, 4] default least where (KSPLIT == 1 and (most(W, WIDTH) / (64 * 2) < 8 or ceil_div(ceil_div(most(W, N), 16), 4) * (K + SHARED) >= 2 * device.units)) or (KSPLIT == 2 and (most(W, WIDTH) / (64 * 4) < 8 or ceil_div(ceil_div(most(W, N), 16), 4 / 2) * (K + SHARED) >= 2 * device.units)) or KSPLIT == 4 for choice | summed,
-        GATHER_TPW in [1, 2] default 1 for choice | summed,
+    params (TPW in [1, 2] default 1 for choice | summed,
+        arithmetic KSPLIT in [1, 2, 4] default least where (KSPLIT == 1 and (most(W, WIDTH) / (64 * 2) < 8 or (most(W, WIDTH) < 4096 and ceil_div(ceil_div(most(W, N), 16), 4) * (K + SHARED) >= 2 * device.units))) or (KSPLIT == 2 and (most(W, WIDTH) / (64 * 4) < 8 or (most(W, WIDTH) < 4096 and ceil_div(ceil_div(most(W, N), 16), 4 / 2) * (K + SHARED) >= 2 * device.units))) or KSPLIT == 4 for choice,
+        arithmetic KSPLIT in [1, 2, 4] default least where (KSPLIT == 1 and (most(W, WIDTH) / (64 * 2) < 8 or ceil_div(ceil_div(most(W, N), 16), 4) * (K + SHARED) >= 2 * device.units)) or (KSPLIT == 2 and (most(W, WIDTH) / (64 * 4) < 8 or ceil_div(ceil_div(most(W, N), 16), 4 / 2) * (K + SHARED) >= 2 * device.units)) or KSPLIT == 4 for summed,
+        GATHER_TPW in [1, 2] default 1 for choice,
+        GATHER_TPW in [1, 2] default greatest where GATHER_TPW == 1 or ceil_div(ceil_div(ceil_div(most(W, N), 16), 2), 4 / KSPLIT) * (K + SHARED) >= 2 * device.units for summed,
         form GATHERED in [0, 1] default 1 for choice,
         arithmetic INT8 in [0, 1] default greatest where INT8 == 0 or each(W, form(W, INT8) == 1) reference 0 for grouped,
         arithmetic OPERAND in [0, 1] default 0 for grouped,
@@ -2672,14 +2675,26 @@ fn any_sited[M, K](sources: &tensor[SOURCE_ROWS, M, K] i32) -> bool:
 # - 1 (`DecodeHits`): project only VRAM hits (`record >= 0`), zeroing all others.
 # - 2 (`DecodeBack`): project only sourced choices (`record != -1`), leaving
 #   unsourced (`record == -1`) choices untouched in `published`.
-fn routed_down_project[M, H, E, K, F, TR](product: &tensor[M, K, F] A, routes: &tensor[M, K] i32,
+# - 3 (`Whole` late pass): project only choices the route left absent
+#   (`routing[slot, ROUTING_SOURCE(P, row * K + choice)] == -1`) that the
+#   landing has since sourced (`record != -1`), leaving every other choice
+#   untouched in `published`.
+fn routed_down_project[M, H, E, K, F, TR, FLIGHT, P](product: &tensor[M, K, F] A, routes: &tensor[M, K] i32,
     sources: &tensor[SOURCE_ROWS, M, K] i32, expert_down: &tensor[E, H, F] EDW,
-    tier_down: &tensor[TR, H, F] EDW, mode: i32, published: &mut tensor[M, K, H] A)
-    where TR >= 0 and M <= VERIFY_ROWS:
+    tier_down: &tensor[TR, H, F] EDW, routing: &tensor[FLIGHT, ROUTING_WORDS(P)] i32,
+    step: &tensor[STEP_WORDS] i32, mode: i32, published: &mut tensor[M, K, H] A)
+    where TR >= 0 and FLIGHT > 0 and FLIGHT < 65536 and P >= M * K and M <= VERIFY_ROWS:
+    let slot = flight_slot[FLIGHT = FLIGHT](step_sequence(step))
     for row in 0..M:
         for choice in 0..K:
             let record = decode_source(sources, i32(row), i32(choice), routes[row, choice])
-            if mode != 2 or record != -1:
+            let absent = routing[slot, ROUTING_SOURCE(P, row * K + choice)] == -1
+            let mut active = true
+            if mode == 2:
+                active = record != -1
+            if mode == 3:
+                active = absent and record != -1
+            if active:
                 let mut down_row = tensor[F] f32
                 operand_row(product[row, choice], operands(expert_down), down_row)
                 for column in 0..H:
@@ -2696,11 +2711,16 @@ fn routed_down_sited[M, H, K, FLIGHT, SW](base: &tensor[M, H] f32,
     published: &tensor[M, K, H] A, sources: &tensor[SOURCE_ROWS, M, K] i32, weights: &tensor[M, K] f32,
     step: &tensor[STEP_WORDS] i32, site: &await mut tensor[FLIGHT, SW] i32,
     site_output: &await tensor[FLIGHT, VERIFY_ROWS, H] f32) -> tensor[M, H] R
-    where FLIGHT > 0 and FLIGHT < 65536 and M <= VERIFY_ROWS and SW % 2 == 0 and SW >= SLOT_PAYLOAD:
+    where FLIGHT >= 0 and FLIGHT < 65536 and M <= VERIFY_ROWS and ((FLIGHT == 0 and SW == 0) or (FLIGHT > 0 and SW % 2 == 0 and SW >= SLOT_PAYLOAD)):
     let mut value = tensor[M, H] R
     let q = step_sequence(step)
-    let slot = flight_slot[FLIGHT = FLIGHT](q)
-    decode_join(base, published, weights, site_output, slot, any_sited(sources) and slot_succeeded(site, slot, q), value)
+    let mut slot = i32(0)
+    let mut answered = false
+    if FLIGHT > 0:
+        slot = flight_slot[FLIGHT = FLIGHT](q)
+        if any_sited(sources):
+            answered = slot_succeeded(site, slot, q)
+    decode_join(base, published, weights, site_output, slot, answered, value)
     return value
 
 # A streamed decode layer's combine, Qwen's fused form, in two entries by
@@ -2779,15 +2799,16 @@ const WINDOW_BYTES = 20480
 const WINDOW_THREADS = 256
 
 # A landing launch's group words (`streaming/land.hpp`): the claim its
-# threadgroup took and the from and to of the claim's entry, four words,
-# so a window after them starts 16-byte aligned.
-const LAND_GROUP_WORDS = 4
+# threadgroup took, the from/to/landed flag, and per-tensor byte lead offsets
+# (gate, up, down) of the claim's entry, padded to eight words so a window
+# after them starts 16-byte aligned.
+const LAND_GROUP_WORDS = 8
 
 # The byte at which a landing workgroup's window follows its group words
 # (4 * LAND_GROUP_WORDS), on a backend whose window lies in group memory
 # beside them (Vulkan): a literal, since the seismic language holds no
 # constant expressions, which `vulkan/lib/streaming/land.glsl` checks.
-const LAND_WINDOW_AT = 16
+const LAND_WINDOW_AT = 32
 
 # The entries of landing list `landing` (streaming_words.seismic) landed
 # for step `step`: its head's count where its head names the step, else
@@ -3170,3 +3191,36 @@ fn routed_seed_commit[X, BANK, FLIGHT, LANES](list: &tensor[LIST_ENTRY(X)] i32,
             let record = list[LIST_ENTRY(entry) + LIST_TO]
             if entry < list[LIST_COUNT]:
                 commits[record] = step[STEP_LOW]
+
+
+# Unified device-classified 3-tier decode staging (`routed_stage_host`):
+# classifies `front_sources` into VRAM_HIT, HOST_STAGE (coalesced 4-CTA SM
+# copy into bounded per-flight VRAM scratch `stage_base + s`), or HOST_WORK
+# (NVMe file miss, CPU-sited, or CE DMA burst >= `policy[POLICY_CE_MIN_EXPERTS]`),
+# populates `back_sources`, self-gates `land_gate` on-device when `host_work == 0`
+# (zero CPU wakeup), or publishes `ready_slot` to wake `DecodeReactor` when
+# `host_work > 0`.
+fn routed_stage_host[M, K, GV, TR, GD, E, F, H](
+    front_sources: &tensor[SOURCE_ROWS, M, K] i32,
+    back_sources: &mut tensor[SOURCE_ROWS, M, K] i32,
+    policy: &tensor[POLICY_WORDS] i32,
+    step: &tensor[STEP_WORDS] i32,
+    land_grid: &tensor[3] i32,
+    ready_slot: &mut tensor[READY_RING_WORDS] i32,
+    tier_gate: &tensor[GV, F, H] UG,
+    tier_up: &tensor[TR, F, H] UU,
+    tier_down: &tensor[TR, H, F] UD,
+    expert_gate: &mut tensor[GD, F, H] UG,
+    expert_up: &mut tensor[E, F, H] UU,
+    expert_down: &mut tensor[E, H, F] UD)
+    where M <= VERIFY_ROWS and TR > 0 and E > 0 and ((GV == TR and GD == E) or (GV == 0 and GD == 0)):
+    let mask_hits = ready_slot[READY_RING_MASK_HITS]
+    for row in 0..M:
+        for choice in 0..K:
+            let src = front_sources[SOURCE_RECORD, row, choice]
+            let site = front_sources[SOURCE_SITE, row, choice]
+            let mut back_rec = i32(-1)
+            if src >= 0 and mask_hits == 0:
+                back_rec = src
+            back_sources[SOURCE_RECORD, row, choice] = back_rec
+            back_sources[SOURCE_SITE, row, choice] = site

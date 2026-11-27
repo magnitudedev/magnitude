@@ -214,6 +214,9 @@ struct GatheredRows {
     __device__ __forceinline__ u32 pair(const float *, u32 m, u64 k) const {
         return *reinterpret_cast<const u32 *>(x + (offsets[m] + k) * 2);
     }
+    __device__ __forceinline__ uint2 quad(const float *, u32 m, u64 k) const {
+        return *reinterpret_cast<const uint2 *>(x + (offsets[m] + k) * 2);
+    }
     __device__ __forceinline__ uint4 octet(const float *, u32 m, u64 k) const {
         return *reinterpret_cast<const uint4 *>(x + (offsets[m] + k) * 2);
     }

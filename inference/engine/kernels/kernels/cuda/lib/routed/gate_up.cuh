@@ -55,7 +55,10 @@ constexpr bool NVFP4 = projection::OperandRecipe<packets::W0_OPERANDS_NVFP4, pac
     const projection::u64 m = blockIdx.y / SEISMIC_DIM_K, k = blockIdx.y % SEISMIC_DIM_K;                       \
     const projection::u64 expert = (projection::u64)routes[m * SEISMIC_ROUTES_STRIDE_0 + k * SEISMIC_ROUTES_STRIDE_1]; \
     const slab::Source source = CHOICE_SOURCE(m, k, (int)expert);                                               \
-    if (ROUTED_GATE_UP_SKIPS((unsigned)blockIdx.y, source))                                                     \
+    if (__shfl_sync(0xffffffffu, (threadIdx.x & 31u) == 0u                                                      \
+                                     ? (ROUTED_GATE_UP_SKIPS((unsigned)blockIdx.y, source) ? 1 : 0)             \
+                                     : 0,                                                                       \
+                    0) != 0)                                                                                    \
         return;                                                                                                 \
     /* Block-collective: before any warp leaves. */                                                             \
     const projection::SharedRow pro = projection::shared_row(                                                   \

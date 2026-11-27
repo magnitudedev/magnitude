@@ -46,8 +46,9 @@ inline bool site_answered(device const int *sources, SYSTEM int *slot, ulong q, 
     constant ulong *seismic_words) {
     if (tid == 0) {
         const uint choices = uint(SEISMIC_DIM_M) * uint(SEISMIC_DIM_K);
-        *ready = streaming_site_any(sources, SEISMIC_SOURCES_STRIDE_0, SEISMIC_SOURCES_STRIDE_1,
-                     SEISMIC_SOURCES_STRIDE_2, choices)
+        *ready = SEISMIC_DIM_FLIGHT > 0
+            && streaming_site_any(sources, SEISMIC_SOURCES_STRIDE_0, SEISMIC_SOURCES_STRIDE_1,
+                   SEISMIC_SOURCES_STRIDE_2, choices)
             && streaming_await_slot(slot, SEISMIC_SITE_STRIDE_1, q);
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);

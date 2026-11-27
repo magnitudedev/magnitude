@@ -156,3 +156,12 @@ native routed_output_streamed for cuda from "cuda/routed_output_streamed.cu":
     project routed summed (expert_down) shared (shared_down)
     scratch published bytes (M * (K + 1) * H * 2)
     scratch arrivals bytes (M * ceil_div(H, 16) * 4) sync
+
+# CUDA: unified device-classified 3-tier staging + on-device self-gate.
+# Locked hardware-verified launch geometry: 4 CTAs x 256 threads (uint4 __ldcs, UNROLL=4).
+native routed_stage_host for cuda from "cuda/routed_stage_host.cu":
+    static (K)
+    records (tier_gate, tier_up, tier_down, expert_gate, expert_up, expert_down)
+    launch routed_stage_host:
+        threadgroups (4, 1, 1)
+        threads_per_threadgroup (256, 1, 1)

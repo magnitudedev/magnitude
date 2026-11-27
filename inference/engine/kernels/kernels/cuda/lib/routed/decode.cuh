@@ -7,15 +7,16 @@
 namespace routed {
 
 // The decode GEMV kernels' block: DECODE_WARPS warps (the declarations' 128 threads).
-// Records weights (`GemvRecords`, e.g. iq2xxs) and NB=1 entry-order weights (`GemvEntries`,
-// e.g. iq1m/iq2xs) need multi-block SM residency (`16 / DECODE_WARPS` = 4 blocks/SM,
-// <=128 regs/thread) to hide memory latency; NB>1 entry-order and MMA/hier weights spill
-// if capped below their natural register count.
+// Records weights (`GemvRecords`, e.g. iq2xxs) and NB=1 or unpaired entry-order weights
+// (`GemvEntries`, e.g. iq1m/iq2xs) need multi-block SM residency (`16 / DECODE_WARPS` =
+// 4 blocks/SM, <=128 regs/thread) to hide memory latency; paired NB>1 entry-order and
+// MMA/hier weights spill if capped below their natural register count.
 constexpr int DECODE_WARPS = 4;
 constexpr int DECODE_THREADS = DECODE_WARPS * 32;
 template <int NB, class... W> __host__ __device__ constexpr int decode_min_blocks() {
+    constexpr int LIVE_WEIGHTS = ((!projection::Same<W, projection::NoWeight>::value ? 1 : 0) + ...);
     constexpr bool HIGH_OCCUPANCY = ((projection::GemvRecords<W>::value
-                                      || (NB == 1 && projection::GemvEntries<W>::value)
+                                      || ((NB == 1 || LIVE_WEIGHTS == 1) && projection::GemvEntries<W>::value)
                                       || projection::Same<W, projection::NoWeight>::value)
                                      && ...);
     return HIGH_OCCUPANCY ? (16 / DECODE_WARPS) : 1;

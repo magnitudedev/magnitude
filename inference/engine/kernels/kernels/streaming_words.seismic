@@ -155,7 +155,33 @@ const POLICY_HIT_ROW_NS = 9
 const POLICY_RESOLVED = 10
 const POLICY_LINK_BUSY_NS = 11
 const POLICY_LINK_CONTENDED_NS = 12
-const POLICY_WORDS = 13
+# Minimum unique host-RAM miss experts to prefer Copy-Engine H2D DMA over
+# on-device coalesced SM staging (`routed_stage_host`). Written by
+# `TierServicePrices::ce_min_experts()`; 0 disables SM staging.
+const POLICY_CE_MIN_EXPERTS = 13
+const POLICY_WORDS = 14
+
+# Per-flight VRAM scratch capacity (in expert slots) for coalesced on-device
+# SM staging (`routed_stage_host`, 4 CTAs x 256 threads).
+const DECODE_STAGE_SLOTS = 16
+
+# Per-flight ready_ring slot (`ready_ring[DECODE_SOURCE_SLOTS, READY_RING_WORDS]`),
+# 128-byte aligned (32 i32 words per slot) so slots sit on disjoint cache lines.
+const READY_RING_GEN = 0
+const READY_RING_LAYER = 2
+const READY_RING_ROWS = 3
+const READY_RING_SEQUENCE = 4
+const READY_RING_FLAGS = 6
+const READY_RING_SLOT = 7
+const READY_RING_GATE_ADDR = 8
+const READY_RING_STAGE_BASE = 10
+const READY_RING_MASK_HITS = 11
+const READY_RING_READY_GEN = 12
+const READY_RING_WORDS = 32
+
+const READY_FLAG_FILE_PENDING = 1
+const READY_FLAG_CPU_SITED = 2
+const READY_FLAG_CE_DMA = 4
 
 # A routing weight as the words carry it (a ring entry's HINT_WEIGHT): its
 # magnitude's f32 bits, the sign cleared on the device where the entry is
@@ -333,10 +359,13 @@ const FILE_ENTRY(C) = FILE_ENTRIES + FILE_ENTRY_WORDS * C
 # only the last record's conversion remains.
 const LANDING_HEAD = 0
 const LANDING_ENTRIES = 2
-const LANDING_ENTRY_WORDS = 3
+const LANDING_ENTRY_WORDS = 6
 const LANDING_FROM = 0
 const LANDING_TO = 1
 const LANDING_DONE = 2
+const LANDING_LEAD_GATE = 3
+const LANDING_LEAD_UP = 4
+const LANDING_LEAD_DOWN = 5
 
 # The first word of a landing list's entry `E`: a list of E entries ends
 # there.

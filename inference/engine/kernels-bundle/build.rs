@@ -63,6 +63,11 @@ const ENTRY_EXCEPTIONS: &[(&str, &[BackendName], &str)] = &[
         &[BackendName::Cuda],
         "single-launch streamed fused decode output with inline CPU-site await in the last-arriving block",
     ),
+    (
+        "routed_stage_host",
+        &[BackendName::Cuda],
+        "unified device-classified 3-tier decode staging (4 CTAs x 256 threads) and on-device self-gate",
+    ),
 ];
 
 /// Expert streaming's entries (routed.seismic's streaming section), on the

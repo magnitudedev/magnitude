@@ -12,7 +12,11 @@ pub mod recurrent_bound;
 /// file a kernel comes to depend on needs no test to name it.
 #[allow(dead_code)]
 pub fn kernels() -> &'static CheckedModule {
-    magnitude_kernels::module().expect("the kernel bundle decodes").checked()
+    static MODULE: std::sync::OnceLock<std::sync::Arc<seismic::generated::Module>> =
+        std::sync::OnceLock::new();
+    MODULE
+        .get_or_init(|| magnitude_kernels::module().expect("the kernel bundle decodes"))
+        .checked()
 }
 
 /// The granule pool of `device`'s device store, its granules each the

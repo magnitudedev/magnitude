@@ -56,10 +56,9 @@ template <class Pro, bool S8, class Operands> __host__ __device__ constexpr bool
     return S8 || Operands::MATERIALIZE || Pro::STAGED;
 }
 
-// The weights' coefficient staging of a GEMV block over K columns, where
-// STAGING is 1: only an unpaired staged weight stages (`gemv_mma_group`).
+// Tile-packed factors are loaded coalesced per superblock without shared staging.
 template <int STAGING, class Shape, u64 K, class WA, class WB> __host__ __device__ constexpr u64 gemv_staged_bytes() {
-    return STAGING == 1 && Same<WB, NoWeight>::value ? gemv_staging<Shape, WA>(K / 64) : 0;
+    return 0;
 }
 
 // The launch's grid where it states it (RESIDENCY 1 or 2), else 0.
@@ -262,7 +261,7 @@ template <unsigned OPERAND, class... Ws> struct OperandsOf<OPERAND, Types<Ws...>
 
 template <int STAGING, class Shape, u64 K, class List> struct StagingOf;
 template <int STAGING, class Shape, u64 K, class... Ws> struct StagingOf<STAGING, Shape, K, Types<Ws...>> {
-    __host__ __device__ static constexpr u64 bytes() { return STAGING == 1 ? gemv_staging<Shape, Ws...>(K / 64) : 0; }
+    __host__ __device__ static constexpr u64 bytes() { return 0; }
 };
 
 template <int I, class Segments> __device__ __forceinline__ const auto &weight_of(const Segments &s) {

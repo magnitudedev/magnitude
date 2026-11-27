@@ -22,7 +22,7 @@ fn weight_slots_take_every_resident_representation() {
                 continue;
             }
         };
-        for found in untaken(module, &toolchain).unwrap() {
+        for found in untaken(&module, &toolchain).unwrap() {
             untaken_by_backend.push(format!("{}: {found}", backend.as_str()));
         }
     }

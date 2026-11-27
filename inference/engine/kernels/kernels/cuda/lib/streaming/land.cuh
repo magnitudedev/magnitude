@@ -58,10 +58,10 @@ typedef typename element::Select<
 // record of `tensor` through binding `B` into the thread's registers.
 template <class B>
 __device__ __forceinline__ void land_load(Lander &land, const repack::Geometry &geometry, u32 tensor, int from, int to,
-                                          u64 row_tile, u64 window_index) {
+                                          u32 lead, u64 row_tile, u64 window_index) {
     const Window<B> window(geometry);
     const Placed<B> placed =
-        place_of<B>(window, land.source[tensor], land.destination[tensor], geometry, from, to, row_tile, window_index);
+        place_of<B>(window, land.source[tensor], land.destination[tensor], geometry, from, to, lead, row_tile, window_index);
     land.span = span_of(window, placed);
     land.pitch = window.pitch;
     land.held.load<min_load_unit<B>()>(land.span);
@@ -85,39 +85,39 @@ template <class B> __device__ __forceinline__ u32 land_items(const repack::Geome
 // the widest unit its address and size admit (the last item's rest may narrow it).
 template <class B>
 __device__ __forceinline__ Span dense_span_of(Lander &land, const repack::Geometry &geometry, u32 tensor, int from,
-                                              u32 item) {
+                                              u32 lead, u32 item) {
     const DenseItem span = dense_item_of<B>(geometry, item);
     const u32 bytes = span.count * dense_element<B>();
-    const u8 *at = listed_source(land.source[tensor], land.destination[tensor], from) +
+    const u8 *at = listed_source(land.source[tensor], land.destination[tensor], from, lead) +
                    (u64)span.first * dense_element<B>();
     return Span{at, 0, 1, bytes, load_unit(u32(reinterpret_cast<u64>(at)) | bytes)};
 }
 
 template <class B>
 __device__ __forceinline__ void land_begin(Lander &land, const repack::Geometry &geometry, u32 tensor, int from, int to,
-                                           u32 item) {
+                                           u32 lead, u32 item) {
     if constexpr (B::dense()) {
-        land.span = dense_span_of<B>(land, geometry, tensor, from, item);
+        land.span = dense_span_of<B>(land, geometry, tensor, from, lead, item);
         land.pitch = land.span.bytes;
         land.held.load<min_load_unit<B>()>(land.span);
         land.scale_span = ScaleSpan{nullptr, 0, 0, 1, 0, 0, 0};
         land.scales.load(land.scale_span);
     } else {
-        land_load<B>(land, geometry, tensor, from, to, item, 0);
+        land_load<B>(land, geometry, tensor, from, to, lead, item, 0);
     }
 }
 
 template <class B>
 __device__ __forceinline__ void land_stage(Lander &land, const repack::Geometry &geometry, u32 tensor, int from, int to,
-                                           u32 item) {
+                                           u32 lead, u32 item) {
     if constexpr (B::dense()) {
         land_store<B>(land);
     } else {
         const Window<B> window(geometry);
         for (u32 at = 0; at + 1 < window.windows; ++at) {
             land_store<B>(land);
-            land_load<B>(land, geometry, tensor, from, to, item, at + 1);
-            convert_window<B>(window, land.source[tensor], land.destination[tensor], geometry, from, to, item, at,
+            land_load<B>(land, geometry, tensor, from, to, lead, item, at + 1);
+            convert_window<B>(window, land.source[tensor], land.destination[tensor], geometry, from, to, lead, item, at,
                               land.shared);
         }
         land_store<B>(land);
@@ -126,13 +126,13 @@ __device__ __forceinline__ void land_stage(Lander &land, const repack::Geometry 
 
 template <class B>
 __device__ __forceinline__ void land_place(Lander &land, const repack::Geometry &geometry, u32 tensor, int from, int to,
-                                           u32 item) {
+                                           u32 lead, u32 item) {
     __syncthreads();
     if constexpr (B::dense()) {
         convert_span<B>(land.shared.window, land.destination[tensor], geometry, (u64)to, item);
     } else {
         const Window<B> window(geometry);
-        convert_window<B>(window, land.source[tensor], land.destination[tensor], geometry, from, to, item,
+        convert_window<B>(window, land.source[tensor], land.destination[tensor], geometry, from, to, lead, item,
                           window.windows - 1, land.shared);
     }
     __syncthreads();
@@ -192,20 +192,20 @@ template <class B> struct LandItemsOp {
 };
 template <class B> struct LandBeginOp {
     __device__ static __forceinline__ void run(Lander &land, const repack::Geometry &geometry, u32 tensor, int from,
-                                               int to, u32 item) {
-        land_begin<B>(land, geometry, tensor, from, to, item);
+                                               int to, u32 lead, u32 item) {
+        land_begin<B>(land, geometry, tensor, from, to, lead, item);
     }
 };
 template <class B> struct LandStageOp {
     __device__ static __forceinline__ void run(Lander &land, const repack::Geometry &geometry, u32 tensor, int from,
-                                               int to, u32 item) {
-        land_stage<B>(land, geometry, tensor, from, to, item);
+                                               int to, u32 lead, u32 item) {
+        land_stage<B>(land, geometry, tensor, from, to, lead, item);
     }
 };
 template <class B> struct LandPlaceOp {
     __device__ static __forceinline__ void run(Lander &land, const repack::Geometry &geometry, u32 tensor, int from,
-                                               int to, u32 item) {
-        land_place<B>(land, geometry, tensor, from, to, item);
+                                               int to, u32 lead, u32 item) {
+        land_place<B>(land, geometry, tensor, from, to, lead, item);
     }
 };
 
@@ -218,17 +218,17 @@ __device__ __forceinline__ u32 streaming_land_items(STREAMING_LAND_PARAM, u32 te
     return streaming::dispatch_tensor<streaming::LandItemsOp>(tensor, geometry);
 }
 
-__device__ __forceinline__ void streaming_land_load(STREAMING_LAND_PARAM, u32 tensor, int from, int to, u32 item) {
+__device__ __forceinline__ void streaming_land_load(STREAMING_LAND_PARAM, u32 tensor, int from, int to, u32 lead, u32 item) {
     const repack::Geometry geometry = streaming::land_geometry(land.words, tensor);
-    streaming::dispatch_tensor<streaming::LandBeginOp>(tensor, land, geometry, tensor, from, to, item);
+    streaming::dispatch_tensor<streaming::LandBeginOp>(tensor, land, geometry, tensor, from, to, lead, item);
 }
 
-__device__ __forceinline__ void streaming_land_stage(STREAMING_LAND_PARAM, u32 tensor, int from, int to, u32 item) {
+__device__ __forceinline__ void streaming_land_stage(STREAMING_LAND_PARAM, u32 tensor, int from, int to, u32 lead, u32 item) {
     const repack::Geometry geometry = streaming::land_geometry(land.words, tensor);
-    streaming::dispatch_tensor<streaming::LandStageOp>(tensor, land, geometry, tensor, from, to, item);
+    streaming::dispatch_tensor<streaming::LandStageOp>(tensor, land, geometry, tensor, from, to, lead, item);
 }
 
-__device__ __forceinline__ void streaming_land_place(STREAMING_LAND_PARAM, u32 tensor, int from, int to, u32 item) {
+__device__ __forceinline__ void streaming_land_place(STREAMING_LAND_PARAM, u32 tensor, int from, int to, u32 lead, u32 item) {
     const repack::Geometry geometry = streaming::land_geometry(land.words, tensor);
-    streaming::dispatch_tensor<streaming::LandPlaceOp>(tensor, land, geometry, tensor, from, to, item);
+    streaming::dispatch_tensor<streaming::LandPlaceOp>(tensor, land, geometry, tensor, from, to, lead, item);
 }

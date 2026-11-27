@@ -118,7 +118,7 @@ fn vulkan_priming_abi_forms() {
         }
     }
     let results = form_requests(
-        module,
+        &module,
         &toolchain,
         &InProcess,
         &requests,
@@ -204,7 +204,7 @@ fn vulkan_staged_table_projections_form() {
             ],
         ));
     }
-    let results = form_requests(module, &toolchain, &InProcess, &requests, &Progress::default());
+    let results = form_requests(&module, &toolchain, &InProcess, &requests, &Progress::default());
     let failed = requests
         .iter()
         .zip(results)

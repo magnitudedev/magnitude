@@ -29,9 +29,9 @@ struct Lander {
 // binding `B`: from source record `from`, or for a negative `from` the
 // stored bytes the host read into destination record -1 - from (a round's
 // scratch slot no pass reads), into destination record `to`.
-template <class B> inline void land_item(thread const Lander &land, uint tensor, int from, int to, uint item) {
-    STAGED *source = from >= 0 ? source_record(land.source[tensor], ulong(from))
-                               : source_record(land.destination[tensor], ulong(-1 - from));
+template <class B> inline void land_item(thread const Lander &land, uint tensor, int from, int to, uint lead, uint item) {
+    STAGED *source = (from >= 0 ? source_record(land.source[tensor], ulong(from))
+                                : source_record(land.destination[tensor], ulong(-1 - from))) + ulong(lead);
     convert_item<B>(source, ItemOut<B>::of(slab::region<uchar>(land.destination[tensor], ulong(to))), land.words, item, land.window,
         land.tid, land.threads, land.simd, land.simdgroups, land.lane);
 }
@@ -51,15 +51,15 @@ inline u32 streaming_land_items(STREAMING_LAND_PARAM, u32 tensor) {
     return u32(streaming::record_items<DownBinding>(land.words, land.threads));
 }
 
-inline void streaming_land_load(STREAMING_LAND_PARAM, u32, int, int, u32) {}
+inline void streaming_land_load(STREAMING_LAND_PARAM, u32, int, int, u32, u32) {}
 
-inline void streaming_land_stage(STREAMING_LAND_PARAM, u32, int, int, u32) {}
+inline void streaming_land_stage(STREAMING_LAND_PARAM, u32, int, int, u32, u32) {}
 
-inline void streaming_land_place(STREAMING_LAND_PARAM, u32 tensor, int from, int to, u32 item) {
+inline void streaming_land_place(STREAMING_LAND_PARAM, u32 tensor, int from, int to, u32 lead, u32 item) {
     if (tensor == STREAMING_LAND_GATE)
-        streaming::land_item<GateBinding>(land, tensor, from, to, item);
+        streaming::land_item<GateBinding>(land, tensor, from, to, lead, item);
     else if (tensor == STREAMING_LAND_UP)
-        streaming::land_item<UpBinding>(land, tensor, from, to, item);
+        streaming::land_item<UpBinding>(land, tensor, from, to, lead, item);
     else
-        streaming::land_item<DownBinding>(land, tensor, from, to, item);
+        streaming::land_item<DownBinding>(land, tensor, from, to, lead, item);
 }

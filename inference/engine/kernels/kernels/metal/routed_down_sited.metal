@@ -76,7 +76,7 @@ kernel void routed_down_sited(
     ulong slot = 0ul;
     if (tid == 0u) {
         q = streaming_step(step, SEISMIC_STEP_STRIDE_0);
-        slot = q % ulong(SEISMIC_DIM_FLIGHT);
+        slot = SEISMIC_DIM_FLIGHT > 0 ? (q % ulong(SEISMIC_DIM_FLIGHT)) : 0ul;
         slot_shared = slot;
     }
     const bool answered = routed::site_answered(sources, site + slot * SEISMIC_SITE_STRIDE_0, q, &ready, tid, seismic_words);

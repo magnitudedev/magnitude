@@ -354,6 +354,7 @@ struct Block {
     int kv;
     int partition;
     int parts;
+    int head_group = 0;
 };
 
 // This lane's DPL columns of a W-vector, as operands, into row `row` of a
@@ -443,11 +444,14 @@ struct Selection {
 // classes (DECODE) take their keys on the position grid (POSITIONS, `attend`)
 // and publish a partial per partition that holds any, the merge reading
 // `counts` of them.
-template <bool DECODE>
+template <bool DECODE, int HEAD_TILE = G, bool MULTI = DECODE>
 struct PrefillRows {
     static constexpr bool POSITIONS = DECODE;
-    static constexpr bool MULTI_TILE = DECODE;
-    static constexpr int MIN_TILES = DECODE ? 2 : 16;
+    static constexpr bool MULTI_TILE = MULTI;
+    static constexpr int H_TILE = HEAD_TILE;
+    static constexpr int TILE_QT = ROWS / H_TILE;
+    static constexpr int MIN_TILES = DECODE ? ((H_TILE < G || !MULTI) ? 4 : 2) : 16;
+    static_assert(G % H_TILE == 0 && TILE_QT >= 1, "head tile divides G and fits a block");
     const u8 *queries;
     const u8 *keys;
     const u8 *values;
@@ -467,13 +471,14 @@ struct PrefillRows {
         const int t = lane % 4;
         const int r0 = row_block * 16 + g;
         const int r1 = r0 + 8;
-        const long long tok0 = first_token + r0 / G;
-        const long long tok1 = first_token + r1 / G;
-        const u32 *q_row0 = (r0 < QT * G && tok0 < rows_total)
-            ? reinterpret_cast<const u32 *>(queries + ((tok0 * KV * G + block.kv * G + r0 % G) * W) * 2)
+        const long long tok0 = first_token + r0 / H_TILE;
+        const long long tok1 = first_token + r1 / H_TILE;
+        const int head_base = block.kv * G + block.head_group * H_TILE;
+        const u32 *q_row0 = (r0 < TILE_QT * H_TILE && tok0 < rows_total)
+            ? reinterpret_cast<const u32 *>(queries + ((tok0 * KV * G + head_base + r0 % H_TILE) * W) * 2)
             : nullptr;
-        const u32 *q_row1 = (r1 < QT * G && tok1 < rows_total)
-            ? reinterpret_cast<const u32 *>(queries + ((tok1 * KV * G + block.kv * G + r1 % G) * W) * 2)
+        const u32 *q_row1 = (r1 < TILE_QT * H_TILE && tok1 < rows_total)
+            ? reinterpret_cast<const u32 *>(queries + ((tok1 * KV * G + head_base + r1 % H_TILE) * W) * 2)
             : nullptr;
         const int col_base = SPLIT_SCORES ? (warp / WARPS) * SPAN : 0;
 #pragma unroll
@@ -486,24 +491,25 @@ struct PrefillRows {
         }
     }
 
-    // The query tile (MMA warps): matrix row i is token first_token + i / G,
-    // head kv * G + i % G; padding rows are zero.
+    // The query tile (MMA warps): matrix row i is token first_token + i / H_TILE,
+    // head kv * G + head_group * H_TILE + i % H_TILE; padding rows are zero.
     template <class History>
     __device__ __forceinline__ void stage_queries(const Inputs &in, const History &, u8 *q_tile,
                                                   float *, Block block, long long first_token,
                                                   int, int) const {
         [[maybe_unused]] const seismic_words_t &seismic_words_value = *in.words;
         const long long rows_total = static_cast<long long>(SEISMIC_DIM_M);
+        const int head_base = block.kv * G + block.head_group * H_TILE;
         stage<false, CHUNKS>(q_tile, queries, ROWS, [&](int i) -> long long {
-            const long long token = first_token + i / G;
-            if (i >= QT * G || token >= rows_total) return -1;
-            return (token * KV * G + block.kv * G + i % G) * W;
+            const long long token = first_token + i / H_TILE;
+            if (i >= TILE_QT * H_TILE || token >= rows_total) return -1;
+            return (token * KV * G + head_base + i % H_TILE) * W;
         }, threadIdx.x, MMA_THREADS);
         seismic_cp_async_commit();
     }
 
     __device__ __forceinline__ void partitioned(Block block, int active) const {
-        if (block.parts > 1 && block.partition == 0 && block.kv == 0 && threadIdx.x == 0)
+        if (block.parts > 1 && block.partition == 0 && block.kv == 0 && block.head_group == 0 && threadIdx.x == 0)
             split.counts[block.tile] = active;
     }
 
@@ -511,12 +517,13 @@ struct PrefillRows {
         if (active > 0 || block.partition != 0) return;
         [[maybe_unused]] const seismic_words_t &seismic_words_value = *in.words;
         const long long rows_total = static_cast<long long>(SEISMIC_DIM_M);
-        const long long stop = min(first_token + QT, rows_total);
-        const u64 elements = static_cast<u64>(stop - first_token) * G * W;
+        const long long stop = min(first_token + TILE_QT, rows_total);
+        const int head_base = block.kv * G + block.head_group * H_TILE;
+        const u64 elements = static_cast<u64>(stop - first_token) * H_TILE * W;
         for (u64 i = threadIdx.x; i < elements; i += blockDim.x) {
-            const long long token = first_token + static_cast<long long>(i / (G * W));
-            const int rem = static_cast<int>(i % (G * W));
-            const int query_head = block.kv * G + rem / W;
+            const long long token = first_token + static_cast<long long>(i / (H_TILE * W));
+            const int rem = static_cast<int>(i % (H_TILE * W));
+            const int query_head = head_base + rem / W;
             const int column = rem % W;
             gated.put(static_cast<u64>(token) * SEISMIC_RESULT_0_STRIDE_0 +
                           static_cast<u64>(query_head) * SEISMIC_RESULT_0_STRIDE_1 +
@@ -599,6 +606,8 @@ template <int PARTS>
 struct DecodeRows {
     static constexpr bool POSITIONS = true;
     static constexpr bool MULTI_TILE = false;
+    static constexpr int H_TILE = G;
+    static constexpr int TILE_QT = QT;
     static constexpr int MIN_TILES = 1;
     float *partials;
     float *statistics;
@@ -1080,16 +1089,18 @@ __device__ __forceinline__ void attend(const Inputs &in, const History &history,
     [[maybe_unused]] float *split_exchange =
         (Rows::POSITIONS && PRODUCED) ? exchange + WARPS * COLUMNS * W : exchange;
 
-    // Multi-tile decode verify (`Rows::MULTI_TILE`): one CTA per (kv, partition)
-    // loops over all ceil(M / QT) query tiles, reusing K/V tiles already staged
+    // Multi-tile decode verify (`Rows::MULTI_TILE`): one CTA per (head_group, kv, partition)
+    // loops over all ceil(M / TILE_QT) query tiles, reusing K/V tiles already staged
     // in shared memory whenever `units <= STAGES` and the walk matches.
-    const int num_tiles = Rows::MULTI_TILE ? static_cast<int>((rows_total + QT - 1) / QT) : 1;
+    constexpr int H_TILE = Rows::H_TILE;
+    constexpr int TILE_QT = Rows::TILE_QT;
+    const int num_tiles = Rows::MULTI_TILE ? static_cast<int>((rows_total + TILE_QT - 1) / TILE_QT) : 1;
     bool cached_valid = false;
     PositionWalk cached_walk{};
 
     for (int tile_idx = 0; tile_idx < num_tiles; ++tile_idx) {
     if constexpr (Rows::MULTI_TILE) block.tile = tile_idx;
-    const long long first_token = static_cast<long long>(block.tile) * QT;
+    const long long first_token = static_cast<long long>(block.tile) * TILE_QT;
     // Picks span key `ordinal`'s selected row: its token's pick, -1 for none.
     auto pick_row = [&](int ordinal) {
         constexpr int LIST = PICKS ? PICK_COUNT : 1;
@@ -1102,7 +1113,7 @@ __device__ __forceinline__ void attend(const Inputs &in, const History &history,
     for (int index = threadIdx.x; !Rows::POSITIONS && index <= spans; index += THREADS) {
         int union_lo = 0x7fffffff, union_hi = -0x7fffffff, common_lo = -0x7fffffff,
             common_hi = 0x7fffffff;
-        for (long long token = first_token; token < min(first_token + QT, rows_total); ++token) {
+        for (long long token = first_token; token < min(first_token + TILE_QT, rows_total); ++token) {
             const Span s = span(in, token, index, spans);
             common_lo = max(common_lo, s.lo);
             common_hi = min(common_hi, s.hi);
@@ -1127,7 +1138,7 @@ __device__ __forceinline__ void attend(const Inputs &in, const History &history,
         }
         __syncthreads();
         int named = 0;
-        for (int ordinal = threadIdx.x; ordinal < QT * PICK_COUNT; ordinal += THREADS)
+        for (int ordinal = threadIdx.x; ordinal < TILE_QT * PICK_COUNT; ordinal += THREADS)
             if (pick_row(ordinal) >= 0) named = ordinal + 1;
         if (named > 0) atomicMax(&table[last * 4 + 1], named);
     }
@@ -1149,7 +1160,7 @@ __device__ __forceinline__ void attend(const Inputs &in, const History &history,
             const auto run_of = [parts, tiles_of](int total) {
                 return static_cast<int>(partition_run(tiles_of(total) + PICK_TILES, Rows::MIN_TILES, parts));
             };
-            const int valid = max(0, static_cast<int>(min(static_cast<long long>(QT), rows_total - first_token)));
+            const int valid = max(0, static_cast<int>(min(static_cast<long long>(TILE_QT), rows_total - first_token)));
             int row_totals = 0, row_historicals = 0, row_freshes = 0, row_runs = 0;
             int row_shift0 = 0, row_end0 = 0;
             int row_starts = 0, row_ends = 0;
@@ -1858,13 +1869,13 @@ __device__ __forceinline__ void attend(const Inputs &in, const History &history,
     const float query_scale = in.scale * LOG2E;
     const int row_block = warp % WARPS;
     const int n0 = (warp / WARPS) * OUT;
-    const long long token_a = first_token + (row_block * 16 + g) / G;
-    const long long token_b = first_token + (row_block * 16 + g + 8) / G;
-    const bool valid_a = row_block * 16 + g < QT * G && token_a < rows_total;
-    const bool valid_b = row_block * 16 + g + 8 < QT * G && token_b < rows_total;
+    const long long token_a = first_token + (row_block * 16 + g) / H_TILE;
+    const long long token_b = first_token + (row_block * 16 + g + 8) / H_TILE;
+    const bool valid_a = row_block * 16 + g < TILE_QT * H_TILE && token_a < rows_total;
+    const bool valid_b = row_block * 16 + g + 8 < TILE_QT * H_TILE && token_b < rows_total;
     // A block of padding rows only (the tile's last rows, or with decode rows
     // most blocks) makes every call of the others and skips the products.
-    const bool computes = row_block * 16 < QT * G && first_token + row_block * 16 / G < rows_total;
+    const bool computes = row_block * 16 < TILE_QT * H_TILE && first_token + row_block * 16 / H_TILE < rows_total;
 
     // Produced affine history: the producers stage every K/V tile, so the MMA
     // warps complete their query tile copy here.
@@ -2288,7 +2299,7 @@ __device__ __forceinline__ void attend(const Inputs &in, const History &history,
         for (int half = 0; half < 2; ++half) {
             const long long token = half == 0 ? token_a : token_b;
             if (!(half == 0 ? valid_a : valid_b)) continue;
-            const int query_head = kv * G + (row_block * 16 + g + 8 * half) % G;
+            const int query_head = kv * G + block.head_group * H_TILE + (row_block * 16 + g + 8 * half) % H_TILE;
             rows.store(in, block, active, token, query_head, column0 + 8 * n0, o, half, t, maximum[half],
                        denominator[half]);
         }
@@ -2302,12 +2313,13 @@ __device__ __forceinline__ void attend(const Inputs &in, const History &history,
 // Prefill L3: block (query tile, query head), one thread per column. A tile whose
 // keys took several partitions merges each of its rows' partitions in
 // partition order and applies the gate; other tiles were stored by L2.
-__device__ __forceinline__ void merge_partitions(const Inputs &in, const Split &split, element::Out<Act> gated) {
+__device__ __forceinline__ void merge_partitions(const Inputs &in, const Split &split, element::Out<Act> gated,
+                                                 int tile_group = 1) {
     [[maybe_unused]] const seismic_words_t &seismic_words_value = *in.words;
     const int tile = static_cast<int>(blockIdx.x);
     const int query_head = static_cast<int>(blockIdx.y);
     const int column = static_cast<int>(threadIdx.x);
-    const int count = static_cast<int>(split.counts[tile]);
+    const int count = static_cast<int>(split.counts[tile / tile_group]);
     if (count <= 1) return;
     const long long rows_total = static_cast<long long>(SEISMIC_DIM_M);
     const u64 heads = KV * G;

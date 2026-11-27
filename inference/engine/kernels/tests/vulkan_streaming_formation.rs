@@ -131,7 +131,7 @@ fn vulkan_streaming_forms() {
         &unnormalized_route.into_iter().chain([("TM", 256)]).collect::<Vec<_>>(),
     ));
     let results = form_requests(
-        module,
+        &module,
         &toolchain,
         &InProcess,
         &requests,

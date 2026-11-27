@@ -103,8 +103,50 @@ extern "C" __global__ void __launch_bounds__(attention::prefill::MMA_THREADS, 1)
                                PICKED());
 }
 
+// Multi-token verify rows (2 <= M <= VERIFY_ROWS, B == 0, KS == 0) when
+// G > WARPS * 8 and G % 8 == 0: tile G into head groups of H_TILE = 8 so each
+// CTA batches ROWS / 8 tokens over one KV scan and G / 8 head groups
+// co-schedule in L2.
+extern "C" __global__ void __launch_bounds__(attention::prefill::MMA_THREADS, 1)
+    attention_prefill_attend_rows_grouped(SEISMIC_KERNEL_PARAMS) {
+    constexpr bool GROUPED = attention::G > attention::prefill::WARPS * 8 && attention::G % 8 == 0;
+    constexpr int GROUPED_H_TILE = GROUPED ? 8 : attention::G;
+    if constexpr (GROUPED) {
+        attention::prefill::attend(
+            ATTENTION_INPUTS(), HISTORY().reads(),
+            attention::prefill::PrefillRows<true, GROUPED_H_TILE>{SEISMIC_PTR(SEISMIC_BUFFER_SCRATCH_QUERIES),
+                                                                  SEISMIC_PTR(SEISMIC_BUFFER_SCRATCH_KEYS),
+                                                                  SEISMIC_PTR(SEISMIC_BUFFER_SCRATCH_VALUES),
+                                                                  SEISMIC_RESULT_0_OUT, SPLIT()},
+            attention::prefill::Block{0, static_cast<int>(blockIdx.y), static_cast<int>(blockIdx.z),
+                                      static_cast<int>(gridDim.z), static_cast<int>(blockIdx.x)},
+            SELECTION(), PICKED());
+    }
+}
+
+// Multi-token verify rows with per-token picks (KS > 0, 2 <= M <= VERIFY_ROWS,
+// B == 0) when G > WARPS * 8: parallelize across M tokens in blockIdx.x while
+// keeping all G query heads in one CTA so each token's picks are read once.
+extern "C" __global__ void __launch_bounds__(attention::prefill::MMA_THREADS, 1)
+    attention_prefill_attend_rows_tokens(SEISMIC_KERNEL_PARAMS) {
+    attention::prefill::attend(
+        ATTENTION_INPUTS(), HISTORY().reads(),
+        attention::prefill::PrefillRows<true, attention::G, false>{
+            SEISMIC_PTR(SEISMIC_BUFFER_SCRATCH_QUERIES),
+            SEISMIC_PTR(SEISMIC_BUFFER_SCRATCH_KEYS),
+            SEISMIC_PTR(SEISMIC_BUFFER_SCRATCH_VALUES),
+            SEISMIC_RESULT_0_OUT, SPLIT()},
+        PREFILL_BLOCK(), SELECTION(), PICKED());
+}
+
 extern "C" __global__ void attention_prefill_merge(SEISMIC_KERNEL_PARAMS) {
-    attention::prefill::merge_partitions(ATTENTION_INPUTS(), SPLIT(), SEISMIC_RESULT_0_OUT);
+    int tile_group = 1;
+    if constexpr (attention::G > attention::prefill::WARPS * 8 && attention::G % 8 == 0 &&
+                  SEISMIC_DIM_B == 0 && SEISMIC_DIM_KS == 0) {
+        if (SEISMIC_DIM_M >= 2 && SEISMIC_DIM_M <= SEISMIC_CONST_VERIFY_ROWS)
+            tile_group = attention::prefill::ROWS / 8;
+    }
+    attention::prefill::merge_partitions(ATTENTION_INPUTS(), SPLIT(), SEISMIC_RESULT_0_OUT, tile_group);
 }
 
 // The output rotary (RO = 1): block (row, query head), thread per pair.

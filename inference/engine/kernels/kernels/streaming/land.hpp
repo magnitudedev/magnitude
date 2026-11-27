@@ -98,16 +98,20 @@
 #define STREAMING_LAND_ITEMS SEISMIC_CONST_LAND_ITEMS
 
 // The group words (LAND_GROUP_WORDS): the claim in hand (-1: stop), its
-// entry's from and to, and whether its entry is known landed.
+// entry's from, to, landed flag, and per-tensor byte lead offsets
+// (gate, up, down) inside the staged record.
 #define STREAMING_LAND_CLAIM 0
 #define STREAMING_LAND_FROM 1
 #define STREAMING_LAND_TO 2
 #define STREAMING_LAND_LANDED 3
+#define STREAMING_LAND_LEAD_GATE 4
+#define STREAMING_LAND_LEAD_UP 5
+#define STREAMING_LAND_LEAD_DOWN 6
 
 STREAMING_FN u32 streaming_land_items(STREAMING_LAND_PARAM, u32 tensor);
-STREAMING_FN void streaming_land_load(STREAMING_LAND_PARAM, u32 tensor, int from, int to, u32 item);
-STREAMING_FN void streaming_land_stage(STREAMING_LAND_PARAM, u32 tensor, int from, int to, u32 item);
-STREAMING_FN void streaming_land_place(STREAMING_LAND_PARAM, u32 tensor, int from, int to, u32 item);
+STREAMING_FN void streaming_land_load(STREAMING_LAND_PARAM, u32 tensor, int from, int to, u32 lead, u32 item);
+STREAMING_FN void streaming_land_stage(STREAMING_LAND_PARAM, u32 tensor, int from, int to, u32 lead, u32 item);
+STREAMING_FN void streaming_land_place(STREAMING_LAND_PARAM, u32 tensor, int from, int to, u32 lead, u32 item);
 
 // The count of entries the landing list at `landing` (word stride
 // `stride`) holds for step `q`: its head's, read by one 64-bit acquire load,
@@ -258,7 +262,8 @@ STREAMING_FN u32 streaming_land_item_of(u32 within, u32 gate, u32 up, u32 tensor
     return within - (tensor == STREAMING_LAND_GATE ? 0u : tensor == STREAMING_LAND_UP ? gate : gate + up);
 }
 
-// Entry `entry`'s from and to, read from its landed words into the group's.
+// Entry `entry`'s from, to, and per-tensor byte lead offsets, read from its
+// landed words into the group's.
 STREAMING_FN void streaming_land_entry(STREAMING_SYSTEM_WORDS landing, u64 landing_stride, u32 entry,
     STREAMING_GROUP_PARAM) {
     const u64 words = SEISMIC_CONST_LANDING_ENTRY(u64(entry));
@@ -266,6 +271,12 @@ STREAMING_FN void streaming_land_entry(STREAMING_SYSTEM_WORDS landing, u64 landi
         streaming_load(STREAMING_AT(landing, (words + SEISMIC_CONST_LANDING_FROM) * landing_stride));
     STREAMING_GROUP(STREAMING_LAND_TO) =
         streaming_load(STREAMING_AT(landing, (words + SEISMIC_CONST_LANDING_TO) * landing_stride));
+    STREAMING_GROUP(STREAMING_LAND_LEAD_GATE) =
+        streaming_load(STREAMING_AT(landing, (words + SEISMIC_CONST_LANDING_LEAD_GATE) * landing_stride));
+    STREAMING_GROUP(STREAMING_LAND_LEAD_UP) =
+        streaming_load(STREAMING_AT(landing, (words + SEISMIC_CONST_LANDING_LEAD_UP) * landing_stride));
+    STREAMING_GROUP(STREAMING_LAND_LEAD_DOWN) =
+        streaming_load(STREAMING_AT(landing, (words + SEISMIC_CONST_LANDING_LEAD_DOWN) * landing_stride));
 }
 
 // The landing launch's loop, by every thread `tid` of threadgroup `group`
@@ -321,10 +332,11 @@ STREAMING_FN void streaming_land(STREAMING_LAND_PARAM, STREAMING_SYSTEM_WORDS la
         const u32 entry = claim / per_entry;
         const u32 within = claim % per_entry;
         const u32 tensor = streaming_land_tensor_of(within, gate, up);
+        const u32 lead = u32(STREAMING_GROUP(STREAMING_LAND_LEAD_GATE + int(tensor)));
         const u32 item = streaming_land_item_of(within, gate, up, tensor);
         if (STREAMING_GROUP(STREAMING_LAND_LANDED) == 0)
-            streaming_land_load(STREAMING_LAND_ARG, tensor, from, to, item);
-        streaming_land_stage(STREAMING_LAND_ARG, tensor, from, to, item);
+            streaming_land_load(STREAMING_LAND_ARG, tensor, from, to, lead, item);
+        streaming_land_stage(STREAMING_LAND_ARG, tensor, from, to, lead, item);
         // Every thread has read the claim's group words before thread 0
         // takes the next.
         streaming_barrier();
@@ -347,10 +359,11 @@ STREAMING_FN void streaming_land(STREAMING_LAND_PARAM, STREAMING_SYSTEM_WORDS la
         if (STREAMING_GROUP(STREAMING_LAND_LANDED) != 0) {
             const u32 next = u32(STREAMING_GROUP(STREAMING_LAND_CLAIM)) % per_entry;
             const u32 next_tensor = streaming_land_tensor_of(next, gate, up);
+            const u32 next_lead = u32(STREAMING_GROUP(STREAMING_LAND_LEAD_GATE + int(next_tensor)));
             streaming_land_load(STREAMING_LAND_ARG, next_tensor, STREAMING_GROUP(STREAMING_LAND_FROM),
-                STREAMING_GROUP(STREAMING_LAND_TO), streaming_land_item_of(next, gate, up, next_tensor));
+                STREAMING_GROUP(STREAMING_LAND_TO), next_lead, streaming_land_item_of(next, gate, up, next_tensor));
         }
-        streaming_land_place(STREAMING_LAND_ARG, tensor, from, to, item);
+        streaming_land_place(STREAMING_LAND_ARG, tensor, from, to, lead, item);
         // The item's stores, every thread's, before thread 0's count of it;
         // the entry's last item's count, before its DONE.
         streaming_publish_barrier();

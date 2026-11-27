@@ -285,8 +285,8 @@ __device__ __forceinline__ void convert_span(const u8 *window, const u8 *destina
 // record `from` of `conveyor`, or, negative, scratch slot -1 - from of
 // `destination`, a slot no pass reads, which the host read the stored bytes
 // into at its base (`routed_round` in routed.seismic).
-__device__ __forceinline__ const u8 *listed_source(const u8 *conveyor, const u8 *destination, int from) {
-    return from >= 0 ? slab::region(conveyor, (u64)from) : slab::region(destination, (u64)(-1 - from));
+__device__ __forceinline__ const u8 *listed_source(const u8 *conveyor, const u8 *destination, int from, u32 lead = 0u) {
+    return (from >= 0 ? slab::region(conveyor, (u64)from) : slab::region(destination, (u64)(-1 - from))) + (u64)lead;
 }
 
 // Where item `item` of a packed record lies (`window`'s windowing): its row
@@ -670,9 +670,9 @@ template <u32 ITERS> struct HeldScales {
 // `listed_source`'s scratch slot) into record `to` of `destination`.
 template <class B, class W = seismic_words_t>
 __device__ __forceinline__ Placed<B> place_of(const Window<B> &window, const u8 *source, const u8 *destination,
-                                              const W &seismic_words_value, int from, int to,
+                                              const W &seismic_words_value, int from, int to, u32 lead,
                                               u64 row_tile, u64 window_index) {
-    return Placed<B>(window, listed_source(source, destination, from), slab::region(destination, (u64)to),
+    return Placed<B>(window, listed_source(source, destination, from, lead), slab::region(destination, (u64)to),
                      seismic_words_value, row_tile * window.windows + window_index);
 }
 
@@ -684,10 +684,10 @@ __device__ __forceinline__ Placed<B> place_of(const Window<B> &window, const u8 
 // binding type rather than inlining duplicate `convert_tile` graphs.
 template <class B, class Sh, class W = seismic_words_t>
 __device__ __noinline__ void convert_window(const Window<B> &window, const u8 *source, const u8 *destination,
-                                            const W &seismic_words_value, int from, int to,
+                                            const W &seismic_words_value, int from, int to, u32 lead,
                                             u64 row_tile, u64 window_index, Sh &shared) {
     const Placed<B> placed =
-        place_of<B>(window, source, destination, seismic_words_value, from, to, row_tile, window_index);
+        place_of<B>(window, source, destination, seismic_words_value, from, to, lead, row_tile, window_index);
     if (!mirrored<B>(seismic_words_value)) {
         convert_tiles<B, repack::Rows<B>>(window, placed, placed.out, seismic_words_value, shared);
     } else {

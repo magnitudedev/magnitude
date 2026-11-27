@@ -49,6 +49,9 @@ struct ChoiceProjectedEpi {
 #ifndef ROUTED_DOWN_MODE
 #define ROUTED_DOWN_MODE 0
 #endif
+#ifndef ROUTED_DOWN_LEFT_ABSENT
+#define ROUTED_DOWN_LEFT_ABSENT(c) true
+#endif
 
 #define ROUTED_DOWN_SUMMED_BODY(TPW, KSPLIT)                                                                       \
     using Shape = routed::DecodeShape<TPW, KSPLIT>;                                                                \
@@ -62,7 +65,15 @@ struct ChoiceProjectedEpi {
     const projection::u64 s2 = ROUTED_PROJECTED_S2;                                                                \
     const element::Out<activation::Act> projected =                                                                \
         ROUTED_PROJECTED_OUT.offset(m * (ROUTED_PROJECTED_S0) + k * (ROUTED_PROJECTED_S1));                        \
-    if (mode == 2 && src.none()) {                                                                                 \
+    const bool skip = (mode == 2 && src.none()) ||                                                                 \
+                      (mode == 3 &&                                                                                \
+                       (src.none() ||                                                                              \
+                        !__shfl_sync(0xffffffffu,                                                                  \
+                                     (threadIdx.x & 31) == 0                                                       \
+                                         ? (int)ROUTED_DOWN_LEFT_ABSENT((unsigned)(m * SEISMIC_DIM_K + k))         \
+                                         : 0,                                                                      \
+                                     0)));                                                                         \
+    if (skip) {                                                                                                    \
         seismic_dependency_start();                                                                                \
     } else {                                                                                                       \
         const slab::Matrix down = (mode == 1 && src.code < 0)                                                      \
@@ -115,7 +126,9 @@ struct ChoiceProjectedEpi {
         const int ex = routed::route(routes, SEISMIC_ROUTES_STRIDE_0, SEISMIC_ROUTES_STRIDE_1, slots, c);          \
         const slab::Source src = DOWN_SOURCE(c / slots, c % slots, ex);                                            \
         const int code = (mode == 1 && src.code < 0) ? -1 : src.code;                                              \
-        const bool active = (mode != 2) || !src.none();                                                            \
+        const bool active = (mode == 0 || mode == 1) ||                                                            \
+                            (mode == 2 && !src.none()) ||                                                          \
+                            (mode == 3 && !src.none() && ROUTED_DOWN_LEFT_ABSENT(c));                              \
         return routed::ChoiceKey{ex, code, active};                                                                \
     };                                                                                                             \
     const projection::u64 row0 = NVFP4 ? SEISMIC_DIM_K * SEISMIC_DIM_F : SEISMIC_PRODUCT_STRIDE_0;                 \

@@ -12,7 +12,8 @@
 // workgroup through its group memory. A step with no CPU choice reads
 // neither table. Every invocation calls it.
 bool routed_site_answered(const uint64_t q, const uint64_t slot) {
-    if (!streaming_site_any(SEISMIC_PTR(SEISMIC_BUFFER_SOURCES), SEISMIC_SOURCES_STRIDE_0,
+    if (SEISMIC_DIM_FLIGHT == 0ul
+        || !streaming_site_any(SEISMIC_PTR(SEISMIC_BUFFER_SOURCES), SEISMIC_SOURCES_STRIDE_0,
             SEISMIC_SOURCES_STRIDE_1, SEISMIC_SOURCES_STRIDE_2, uint(SEISMIC_DIM_M) * uint(SEISMIC_DIM_K)))
         return false;
     if (gl_LocalInvocationIndex == 0u)

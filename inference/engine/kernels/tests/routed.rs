@@ -14,7 +14,8 @@ use common::bound::{self, Float, Form, Library, Products};
 use seismic::BackendName;
 
 use magnitude_kernels::{
-    SlotTable, constants, routed_combine, routed_copy, routed_down, routed_expand,
+    SlotTable, constants, routed_combine, routed_copy, routed_down, routed_down_project, routed_down_sited,
+    routed_expand,
     gated_delta_project, routed_experts, routed_experts_up, routed_gate_up, routed_gate_up_part, routed_group,
     routed_land, routed_list_grid, routed_output, routed_pass_map, routed_round,
     routed_route, routed_route_shared, routed_route_streamed, routed_scratch_grids, routed_scratch_request,
@@ -2579,8 +2580,12 @@ fn decode_specialization<E: seismic::Entry>(
         .unwrap();
     let statics = single_stream_statics(&implementation.statics, statics);
     // The per-choice decode expansion, for an entry with a gathered form
-    // the mapping does not name (`GATHERED`, `MATRIX`).
-    let forms = [("GATHERED", 0), ("MATRIX", 0)].into_iter().filter(|(name, _)| {
+    // the mapping does not name (`GATHERED`, `MATRIX`, `GATHER_TPW`).
+    let gather_tpw = mapping
+        .iter()
+        .find(|(name, _)| *name == "TPW")
+        .map_or(1, |(_, value)| *value);
+    let forms = [("GATHERED", 0), ("MATRIX", 0), ("GATHER_TPW", gather_tpw)].into_iter().filter(|(name, _)| {
         implementation.params.iter().any(|parameter| parameter.name == *name)
             && !mapping.iter().any(|(given, _)| given == name)
     });
@@ -7196,6 +7201,183 @@ fn gate_up_in_two_passes_forms_the_one_pass_product() {
     }
     assert!(fronts.iter().all(|&count| count > 0), "a front row's absent choices were skipped and waited for {fronts:?} times");
     println!("gate/up passes on {:?}: {cases} cases against one pass", device.backend());
+}
+
+/// Native GPU verification of `routed_down_project` two-pass (`mode=0` early +
+/// `mode=3` late) and `routed_down_sited` with empty site ports (`FLIGHT=0, SW=0`)
+/// against single-pass `routed_down_project(mode=0)` and `routed_down`, across
+/// both summed (`GATHERED=0`) and gathered (`GATHERED=1`) forms and M in {1, 4}.
+#[test]
+fn down_project_in_two_passes_and_unsited_join_match_one_pass() {
+    let Some(device) = streaming_device() else {
+        return;
+    };
+    let charges = seismic::Charges::tally(&device);
+    let impl_info = routed_down_project::native_implementation(&device)
+        .unwrap()
+        .expect("a streaming backend implements routed_down_project");
+    let has_param = |name: &str| {
+        impl_info.params.iter().any(|p| p.name == name)
+            || impl_info.launches.iter().any(|l| l.params.iter().any(|p| p.name == name))
+    };
+    let declared = has_param("GATHERED");
+    let forms: &[u64] = if declared { &[0, 1] } else { &[0] };
+    let decode = decode_mappings(&device);
+    let mappings: Vec<Vec<(&'static str, u64)>> = [&decode[0], &decode[decode.len() - 1]]
+        .into_iter()
+        .flat_map(|mapping| {
+            let filtered: Vec<(&'static str, u64)> =
+                mapping.iter().copied().filter(|(name, _)| has_param(name)).collect();
+            forms.iter().map(move |&form| {
+                let mut m = filtered.clone();
+                if declared {
+                    m.push(("GATHERED", form));
+                }
+                if has_param("GATHER_TPW") && !m.iter().any(|(name, _)| *name == "GATHER_TPW") {
+                    m.push(("GATHER_TPW", 2));
+                }
+                m
+            })
+        })
+        .collect();
+    let (bf16, f32_el) = (seismic::Element::bf16(), seismic::Element::f32());
+    let bits = |values: &[f32]| values.iter().map(|value| value.to_bits()).collect::<Vec<_>>();
+    let kinds = StreamedKind::qwen35b(&device);
+    let (h, f, k, e) = (Qwen35b::HIDDEN as u64, Qwen35b::FEATURES as u64, Qwen35b::CHOICES as u64, 16u64);
+    let serving = TierServing::new(&device, &kinds, e);
+    let (down_stack, tier_down) = serving.stores(2, Served::Bank);
+    let sited_join = routed_down_sited::native_for_device_with(
+        &device,
+        routed_down_sited::Elements { A: bf16, R: f32_el },
+        &decode_specialization::<routed_down_sited::Entry>(&device, &[("H", h), ("K", k)], &[]),
+    )
+    .unwrap();
+    let empty_site = seismic::Tensor::zeros(&charges, seismic::Element::i32(), &[0, 0]).unwrap();
+    let empty_site_output =
+        seismic::Tensor::zeros(&charges, f32_el, &[0, constants::VERIFY_ROWS, h]).unwrap();
+    let policy = shared_i32(&device, &[constants::POLICY_WORDS], &[0; constants::POLICY_WORDS as usize]);
+    let mut cases = 0usize;
+    let mut forms_tested = [false; 2];
+    for mapping in &mappings {
+        let Ok(one_down) = routed_down::native_for_device_with(
+            &device,
+            routed_down::Elements { A: bf16, EDW: kinds[2].resident, R: f32_el },
+            &decode_specialization::<routed_down::Entry>(&device, &[("H", h), ("K", k), ("F", f)], mapping),
+        ) else {
+            continue;
+        };
+        let project = routed_down_project::native_for_device_with(
+            &device,
+            routed_down_project::Elements { A: bf16, EDW: kinds[2].resident },
+            &decode_specialization::<routed_down_project::Entry>(&device, &[("H", h), ("K", k), ("F", f)], mapping),
+        )
+        .unwrap();
+        let form = mapping.iter().find(|(name, _)| *name == "GATHERED").map_or(0, |(_, v)| *v as usize);
+        forms_tested[form] = true;
+        for m in [1u64, 4u64] {
+            let routes_values = front_sharing_routes(m, k, e);
+            let routes = i32_tensor(&device, &[m, k], &routes_values);
+            let product = bf16_tensor(&device, &[m, k, f], &pattern((m * k * f) as usize, 41, 1.0));
+            let base = f32_tensor(&device, &[m, h], &pattern((m * h) as usize, 19, 1.0));
+            let weights = f32_tensor(&device, &[m, k], &pattern((m * k) as usize, 11, 0.25));
+            let choices = (m * k) as usize;
+            let records = routes_values.iter().map(|&expert| serving.bank_record(expert as u64) as i32).collect::<Vec<_>>();
+            for (label, absent_expert) in [
+                ("none absent", (|_: i32| false) as fn(i32) -> bool),
+                ("alternate experts absent", |expert| expert % 2 == 1),
+                ("all absent", |_| true),
+            ] {
+                let label = format!("rows {m} {mapping:?} {label}");
+                let early_records = (0..choices)
+                    .map(|choice| if absent_expert(routes_values[choice]) { -1 } else { records[choice] })
+                    .collect::<Vec<_>>();
+                let (early, full) = (decode_sources(&device, m, k, &early_records), decode_sources(&device, m, k, &records));
+                let flight = 2u64;
+                let sequence = 3u64;
+                let width = constants::ROUTING_WORDS(choices as u64) as usize;
+                let mut ring = vec![0; flight as usize * width];
+                let slot = (sequence % flight) as usize;
+                for choice in 0..choices {
+                    ring[slot * width + constants::ROUTING_SOURCE(choices as u64, choice as u64) as usize] = early_records[choice];
+                }
+                let routing = shared_i32(&device, &[flight, width as u64], &ring);
+                let step = shared_i32(&device, &[constants::STEP_WORDS], &step_words(sequence));
+                let mut split_pub = bf16_tensor(&device, &[m, k, h], &vec![0.375; (m * k * h) as usize]);
+                for (mode, sources) in [(0, &early), (3, &full)] {
+                    project
+                        .call(&charges, routed_down_project::Args {
+                            product: &product,
+                            routes: &routes,
+                            sources,
+                            expert_down: down_stack,
+                            tier_down,
+                            routing: &routing,
+                            step: &step,
+                            mode,
+                            published: &mut split_pub,
+                        })
+                        .unwrap();
+                }
+                let mut single_pub = bf16_tensor(&device, &[m, k, h], &vec![0.375; (m * k * h) as usize]);
+                project
+                    .call(&charges, routed_down_project::Args {
+                        product: &product,
+                        routes: &routes,
+                        sources: &full,
+                        expert_down: down_stack,
+                        tier_down,
+                        routing: &routing,
+                        step: &step,
+                        mode: 0,
+                        published: &mut single_pub,
+                    })
+                    .unwrap();
+                assert_eq!(
+                    bits(&read_bf16(&split_pub)),
+                    bits(&read_bf16(&single_pub)),
+                    "{label}: two-pass mode=0+mode=3 published vs single-pass mode=0"
+                );
+                let mut empty_site_mut = empty_site.clone();
+                let joined = sited_join
+                    .call(&charges, routed_down_sited::Args {
+                        base: &base,
+                        published: &split_pub,
+                        sources: &full,
+                        weights: &weights,
+                        step: &step,
+                        site: &mut empty_site_mut,
+                        site_output: &empty_site_output,
+                    })
+                    .unwrap()
+                    .value;
+                let direct = one_down
+                    .call(&charges, routed_down::Args {
+                        base: &base,
+                        product: &product,
+                        routes: &routes,
+                        sources: &full,
+                        weights: &weights,
+                        expert_down: down_stack,
+                        tier_down,
+                        policy: &policy,
+                    })
+                    .unwrap()
+                    .value;
+                assert_eq!(
+                    bits(&read_f32(&joined)),
+                    bits(&read_f32(&direct)),
+                    "{label}: unsited FLIGHT=0 routed_down_sited vs routed_down"
+                );
+                cases += 1;
+            }
+        }
+    }
+    assert!(cases > 0, "at least one down_project case must run");
+    assert!(forms_tested[0], "summed (GATHERED=0) form must run");
+    if declared {
+        assert!(forms_tested[1], "gathered (GATHERED=1) form must run");
+    }
+    println!("down_project mode=3 + unsited join on {:?}: {cases} cases bit-exact", device.backend());
 }
 
 /// Decode rows `rows` of `choices` choices over `experts` experts (at least
@@ -11907,7 +12089,10 @@ fn routed_down_project_and_sited_join_split_bit_exact_with_whole_boundary_cases(
         }
     }
 
-    let run_project = |sources: &[i32], mode: i32, published: &[f32]| -> Vec<f32> {
+    let p = m * k;
+    let routing_words = magnitude_kernels::constants::ROUTING_WORDS(p as u64) as usize;
+    let routing_all_present = vec![0i32; flight * routing_words];
+    let run_project = |sources: &[i32], routing: &[i32], mode: i32, published: &[f32]| -> Vec<f32> {
         let outcome = interpret(
             module,
             "routed_down_project",
@@ -11918,11 +12103,13 @@ fn routed_down_project_and_sited_join_split_bit_exact_with_whole_boundary_cases(
                 ints(&[2, m, k], sources),
                 floats(&[e, h, f], &expert_down),
                 floats(&[tr, h, f], &tier_down),
+                ints(&[flight, routing_words], routing),
+                ints(&[step.len()], &step),
                 Input::I32(mode),
                 floats(&[m, k, h], published),
             ],
         );
-        input(&outcome, 6).into_iter().map(|v| v as f32).collect()
+        input(&outcome, 8).into_iter().map(|v| v as f32).collect()
     };
 
     let run_join = |published: &[f32], sources: &[i32]| -> Vec<f32> {
@@ -11999,9 +12186,9 @@ fn routed_down_project_and_sited_join_split_bit_exact_with_whole_boundary_cases(
         ("mixed_hits_repeated_misses_overflow_cpu_partial_row", &mixed_front, &mixed_back, &mixed_whole),
         ("all_hit_empty_dma", &all_hit_front, &all_hit_back, &all_hit_front),
     ] {
-        let whole_pub = run_project(whole, 0, &sentinel);
-        let hits_pub = run_project(front, 1, &sentinel);
-        let split_pub = run_project(back, 2, &hits_pub);
+        let whole_pub = run_project(whole, &routing_all_present, 0, &sentinel);
+        let hits_pub = run_project(front, &routing_all_present, 1, &sentinel);
+        let split_pub = run_project(back, &routing_all_present, 2, &hits_pub);
         assert_eq!(
             split_pub.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
             whole_pub.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
@@ -12015,4 +12202,67 @@ fn routed_down_project_and_sited_join_split_bit_exact_with_whole_boundary_cases(
             "{label}: final routed_down_sited join must be bit-exact between Split and Whole"
         );
     }
+
+    // Case C (`RunStage::Whole` UMA layer-local overlap):
+    // Early `mode=0` over route-time sources (hits + absent=-1), then late
+    // `mode=3` over settled sources (hits + landed misses), with `routing`
+    // recording which choices were absent (-1) at route time. Must be bit-exact
+    // with single-pass `mode=0`, and `routed_down_sited` with empty site ports
+    // (`FLIGHT=0, SW=0`) must match.
+    let uma_early: Vec<i32> = vec![
+        // SOURCE_RECORD (hits present, misses absent=-1):
+        0, -1, -1, -1,
+        -1, 1, -1, 0,
+        1, -1, -1, 0,
+        // SOURCE_SITE (all -1 on UMA):
+        -1, -1, -1, -1,
+        -1, -1, -1, -1,
+        -1, -1, -1, -1,
+    ];
+    let uma_settled: Vec<i32> = vec![
+        // SOURCE_RECORD (misses landed at slot 4 and slot 2, one failed=-1):
+        0, 4, 2, -1,
+        4, 1, 4, 0,
+        1, -1, 4, 0,
+        // SOURCE_SITE (all -1 on UMA):
+        -1, -1, -1, -1,
+        -1, -1, -1, -1,
+        -1, -1, -1, -1,
+    ];
+    let mut routing_uma = vec![0i32; flight * routing_words];
+    for c in 0..p {
+        let word = slot * routing_words + (magnitude_kernels::constants::ROUTING_SOURCE(p as u64, c as u64) as usize);
+        routing_uma[word] = uma_early[c];
+    }
+    let uma_whole_pub = run_project(&uma_settled, &routing_uma, 0, &sentinel);
+    let uma_early_pub = run_project(&uma_early, &routing_uma, 0, &sentinel);
+    let uma_split_pub = run_project(&uma_settled, &routing_uma, 3, &uma_early_pub);
+    assert_eq!(
+        uma_split_pub.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+        uma_whole_pub.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+        "uma_whole_mode0_plus_mode3: published cells must be bit-exact with single-pass mode=0"
+    );
+    let uma_whole_out = run_join(&uma_whole_pub, &uma_settled);
+    let uma_empty_site_out: Vec<f32> = {
+        let outcome = interpret(
+            module,
+            "routed_down_sited",
+            &[("A", DType::F32), ("R", DType::F32)],
+            vec![
+                floats(&[m, h], &base),
+                floats(&[m, k, h], &uma_split_pub),
+                ints(&[2, m, k], &uma_settled),
+                floats(&[m, k], &weights),
+                ints(&[step.len()], &step),
+                ints(&[0, 0], &[]),
+                floats(&[0, verify_rows, h], &[]),
+            ],
+        );
+        result(&outcome, 0).into_iter().map(|v| v as f32).collect()
+    };
+    assert_eq!(
+        uma_empty_site_out.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+        uma_whole_out.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+        "uma_empty_site_join: FLIGHT=0, SW=0 routed_down_sited must be bit-exact"
+    );
 }

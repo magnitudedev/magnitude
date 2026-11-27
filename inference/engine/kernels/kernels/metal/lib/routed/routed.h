@@ -152,7 +152,7 @@ template <typename Active>
 inline void build_worklist(device const int *routes, ulong r0, ulong r1, device const int *sources, ulong source_rows,
     ulong src1, ulong src2, uint m_rows, uint slots, uint x_groups_one, uint x_groups_multi, uint extra_y,
     device Worklist *worklist, device int *gather_grid, device int *gather_one_grid, threadgroup int *cache, uint lane,
-    Active active) {
+    Active active, bool hits_only = false) {
     constexpr uint CACHE = WORKLIST_CACHE;
     threadgroup int *cached_expert = cache;
     threadgroup int *cached_source = cache + CACHE;
@@ -186,7 +186,9 @@ inline void build_worklist(device const int *routes, ulong r0, ulong r1, device 
             if (c < total) {
                 const uint m = c / slots, k = c % slots;
                 const int ex = routes[ulong(m) * r0 + ulong(k) * r1];
-                const slab::Source src = decode_source(sources, source_rows, src1, src2, m, k, ex);
+                slab::Source src = decode_source(sources, source_rows, src1, src2, m, k, ex);
+                if (hits_only && src.code < 0)
+                    src = slab::Source{-1};
                 cached_expert[c] = ex;
                 cached_source[c] = src.code;
                 is_active = active(c, src);
@@ -235,7 +237,9 @@ inline void build_worklist(device const int *routes, ulong r0, ulong r1, device 
         for (uint at = 0u; at < total; ++at) {
             const uint at_m = at / slots, at_k = at % slots;
             const int ex = routes[ulong(at_m) * r0 + ulong(at_k) * r1];
-            const slab::Source at_src = decode_source(sources, source_rows, src1, src2, at_m, at_k, ex);
+            slab::Source at_src = decode_source(sources, source_rows, src1, src2, at_m, at_k, ex);
+            if (hits_only && at_src.code < 0)
+                at_src = slab::Source{-1};
             if (!active(at, at_src))
                 continue;
             if (at_src.none()) {
@@ -257,7 +261,9 @@ inline void build_worklist(device const int *routes, ulong r0, ulong r1, device 
                         const uint m = c / slots, k = c % slots;
                         const int oex = routes[ulong(m) * r0 + ulong(k) * r1];
                         if (oex == ex) {
-                            const slab::Source osrc = decode_source(sources, source_rows, src1, src2, m, k, oex);
+                            slab::Source osrc = decode_source(sources, source_rows, src1, src2, m, k, oex);
+                            if (hits_only && osrc.code < 0)
+                                osrc = slab::Source{-1};
                             match = osrc.code == at_src.code && active(c, osrc);
                         }
                     }
@@ -299,9 +305,10 @@ inline void build_worklist(device const int *routes, ulong r0, ulong r1, device 
 template <typename Active>
 inline void build_worklist(device const int *routes, ulong r0, ulong r1, device const int *sources, ulong source_rows,
     ulong src1, ulong src2, uint m_rows, uint slots, uint x_groups, uint extra_y, device Worklist *worklist,
-    device int *gather_grid, device int *gather_one_grid, threadgroup int *cache, uint lane, Active active) {
+    device int *gather_grid, device int *gather_one_grid, threadgroup int *cache, uint lane, Active active,
+    bool hits_only = false) {
     build_worklist(routes, r0, r1, sources, source_rows, src1, src2, m_rows, slots, x_groups, x_groups, extra_y,
-        worklist, gather_grid, gather_one_grid, cache, lane, active);
+        worklist, gather_grid, gather_one_grid, cache, lane, active, hits_only);
 }
 
 inline void build_worklist(device const int *routes, ulong r0, ulong r1, device const int *sources, ulong source_rows,

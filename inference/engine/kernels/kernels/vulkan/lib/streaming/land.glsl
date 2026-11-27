@@ -70,8 +70,9 @@ STREAMING_LAND_PACKED(land_down, SEISMIC_ELEMENT_SD, LAND_SOURCE_DOWN, SEISMIC_D
 // beside destination buffer `destination`: source record `from`, or for a
 // negative `from` destination record -1 - from, which holds the stored
 // bytes the host read there (a round's scratch slot no pass reads).
-uint64_t streaming_land_source(uint64_t source, uint64_t destination, int from) {
-    return from >= 0 ? slab_region(source, uint64_t(from)) : slab_region(destination, uint64_t(-1 - from));
+uint64_t streaming_land_source(uint64_t source, uint64_t destination, int from, uint lead) {
+    return (from >= 0 ? slab_region(source, uint64_t(from)) : slab_region(destination, uint64_t(-1 - from)))
+        + uint64_t(lead);
 }
 
 uint streaming_land_items(uint land_window, uint tensor) {
@@ -82,24 +83,24 @@ uint streaming_land_items(uint land_window, uint tensor) {
     return uint(land_down_items());
 }
 
-void streaming_land_load(uint land_window, uint tensor, int from, int to, uint item) {
+void streaming_land_load(uint land_window, uint tensor, int from, int to, uint lead, uint item) {
 }
 
-void streaming_land_stage(uint land_window, uint tensor, int from, int to, uint item) {
+void streaming_land_stage(uint land_window, uint tensor, int from, int to, uint lead, uint item) {
 }
 
-void streaming_land_place(uint land_window, uint tensor, int from, int to, uint item) {
+void streaming_land_place(uint land_window, uint tensor, int from, int to, uint lead, uint item) {
     if (tensor == STREAMING_LAND_GATE) {
         const uint64_t destination = SEISMIC_PTR(SEISMIC_BUFFER_GATE);
-        land_gate_convert(streaming_land_source(SEISMIC_PTR(LAND_SOURCE_GATE_BUFFER), destination, from),
+        land_gate_convert(streaming_land_source(SEISMIC_PTR(LAND_SOURCE_GATE_BUFFER), destination, from, lead),
             slab_region(destination, uint64_t(to)), uint64_t(item), land_window);
     } else if (tensor == STREAMING_LAND_UP) {
         const uint64_t destination = SEISMIC_PTR(SEISMIC_BUFFER_UP);
-        land_up_convert(streaming_land_source(SEISMIC_PTR(LAND_SOURCE_UP_BUFFER), destination, from),
+        land_up_convert(streaming_land_source(SEISMIC_PTR(LAND_SOURCE_UP_BUFFER), destination, from, lead),
             slab_region(destination, uint64_t(to)), uint64_t(item), land_window);
     } else {
         const uint64_t destination = SEISMIC_PTR(SEISMIC_BUFFER_DOWN);
-        land_down_convert(streaming_land_source(SEISMIC_PTR(LAND_SOURCE_DOWN_BUFFER), destination, from),
+        land_down_convert(streaming_land_source(SEISMIC_PTR(LAND_SOURCE_DOWN_BUFFER), destination, from, lead),
             slab_region(destination, uint64_t(to)), uint64_t(item), land_window);
     }
 }
