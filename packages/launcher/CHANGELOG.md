@@ -1,5 +1,26 @@
 # @magnitudedev/cli
 
+## 0.3.6
+
+### Patch Changes
+
+- [#273](https://github.com/magnitudedev/magnitude/pull/273) [`9af6ef3`](https://github.com/magnitudedev/magnitude/commit/9af6ef389cd66e729c00b4f26a8df2daf0c17b76) Thanks [@najibninaba](https://github.com/najibninaba)! - Declare Apache-2.0 in the Rust workspace and package manifests, so `cargo metadata`, `cargo deny` and SBOM tools no longer report the engine as `UNLICENSED`.
+
+- [`5bece14`](https://github.com/magnitudedev/magnitude/commit/5bece14cf35369f9f00d0724f0e440e969b98f2d) Thanks [@anerli](https://github.com/anerli)! - Fix excessive GPU memory allocation on large resident MoE models and non-finite outputs on long prompts ([#294](https://github.com/magnitudedev/magnitude/issues/294), [#238](https://github.com/magnitudedev/magnitude/issues/238)):
+
+  - **Bounded whole-model prefill workspace arenas:** Caps merged prefill pass sizing for resident MoE models to tile saturation instead of scaling linearly with full context length, eliminating 16–57 GB of unused workspace/graph allocations on 64K–256K context models (such as DeepSeek-V4.1-Flash on 256 GB Apple Silicon and Qwen3.8-Flash-Next NVFP4 on 128 GB Apple Silicon).
+  - **Consistent merged prompt-group cancellation:** Shares pulse-expiry and taint state across all steps of a scratch-served merged prompt group so mid-group interruptions cannot produce non-finite outputs or poisoned prefix cache checkpoints.
+
+- [#291](https://github.com/magnitudedev/magnitude/pull/291) [`1d5c25d`](https://github.com/magnitudedev/magnitude/commit/1d5c25de7ed5b8d3dadd23cacd8003c0a65d4982) Thanks [@rohan-patra](https://github.com/rohan-patra)! - Use the sliding-window history limit when backing and reclaiming request memory, so long prompts are not rejected for requesting window storage they do not need.
+
+- [`9a314a9`](https://github.com/magnitudedev/magnitude/commit/9a314a99dae3506fc966043ea6de28880047175d) Thanks [@anerli](https://github.com/anerli)! - Give freshly retained zero-hit KV prefix cache entries their initial prefill recompute value so memory relief does not evict active conversation prefixes before lower-value cache tiers.
+
+- [`6498b5a`](https://github.com/magnitudedev/magnitude/commit/6498b5ac67dbd0a26ca34d8f4faae37fa4bcf951) Thanks [@anerli](https://github.com/anerli)! - Major performance and memory upgrades for streamed MoE inference across Apple Silicon and NVIDIA GPUs — delivering up to 1.88× faster decode, up to 2.07× faster prefill, and ~2.6 GB lower host memory usage on large MoE models (DeepSeek-V4.1-Flash, Qwen3.8-Flash-Next, and GLM-5.3 Flash):
+
+  - **Unified VRAM / RAM / SSD expert streaming:** Replaces the old dual-mode streaming path with a single 3-tier pipeline that overlaps resident expert compute with host transfers, uses marginal-value residency, and consolidates staging pools (~2.2 GB host RAM saved).
+  - **Faster GPU execution:** Adds on-device CUDA host staging, zero-rebind CUDA graph replay, coalesced quantized tile packing across all 29 CUDA formats, Metal command-batch coalescing, and better canonical kernel defaults.
+  - **Faster storage I/O and scheduling:** Unifies storage and transfer admission with batched Linux `io_uring` direct I/O (with automatic fallback), eliminates super-linear prefix-cache and residency scans, and reclaims ~350 MB of tokenizer host memory.
+
 ## 0.3.5
 
 ### Patch Changes
