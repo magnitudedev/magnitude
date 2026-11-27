@@ -142,7 +142,7 @@ impl TransferQueue {
     /// unrecorded event. The caller keeps every run's bytes untouched until
     /// the batch is complete or the faulted stream has drained.
     pub fn copy(&self, items: &[TransferItem<'_>], value: u32) -> Result<(), CopyError> {
-        self.copy_inner(items, value, false).map(|_| ())
+        self.copy_after_events(items, value, &[], false).map(|_| ())
     }
 
     /// [`Self::copy`], also recording a device-only CUDA [`Event`] on the
@@ -150,11 +150,20 @@ impl TransferQueue {
     /// [`crate::direct::DirectBatch::follow_event`] can wait on it via
     /// `cuStreamWaitEvent` with zero host round-trip and zero `cuStreamWaitValue32`.
     pub fn copy_event(&self, items: &[TransferItem<'_>], value: u32) -> Result<Arc<Event>, CopyError> {
-        self.copy_inner(items, value, true)
-            .map(|event| event.expect("copy_inner with record_event=true returns an event"))
+        self.copy_after_events(items, value, &[], true)
+            .map(|event| event.expect("copy_after_events with record_event=true returns an event"))
     }
 
-    fn copy_inner(&self, items: &[TransferItem<'_>], value: u32, record_event: bool) -> Result<Option<Arc<Event>>, CopyError> {
+    /// [`Self::copy`], first ordering the transfer stream after every device
+    /// [`Event`] in `wait_events` via `cuStreamWaitEvent` (e.g., `Compute ->
+    /// Transfer` synchronization) and optionally recording a completion [`Event`].
+    pub fn copy_after_events(
+        &self,
+        items: &[TransferItem<'_>],
+        value: u32,
+        wait_events: &[&Event],
+        record_event: bool,
+    ) -> Result<Option<Arc<Event>>, CopyError> {
         let checked = items
             .iter()
             .map(Self::check)
@@ -178,8 +187,22 @@ impl TransferQueue {
                     "the transfer queue faulted: {reason}"
                 ))));
             }
-            let queued = self
-                .queue(&checked, value)
+            let wait_result = if wait_events.is_empty() {
+                Ok(())
+            } else {
+                let context = self.device.context();
+                context.enter().and_then(|_current| {
+                    for ev in wait_events {
+                        // SAFETY: both `self.stream` and `ev` belong to `context`
+                        // and `ev` was recorded before publishing.
+                        let status = unsafe { context.enqueue().stream_wait_event(self.stream.raw(), ev.raw()) };
+                        context.driver.check(status, "cuStreamWaitEvent (transfer wait)")?;
+                    }
+                    Ok(())
+                })
+            };
+            let queued = wait_result
+                .and_then(|()| self.queue(&checked, value))
                 .and_then(|()| {
                     if let Some(ev) = &event {
                         ev.record(&self.stream)?;
@@ -255,6 +278,51 @@ impl TransferQueue {
         }
         self.done.wait(|done| reached(done) || self.faulted(), timeout);
         self.completed(value)
+    }
+
+    /// Write `value` to mapped/device 32-bit word `device_address` on this
+    /// transfer stream in FIFO order behind all previously queued copies
+    /// (`cuStreamWriteValue32` + flush). Used to open a `TimelineHost<Gate>`
+    /// directly from the GPU copy engine without any host wait on DMA.
+    pub fn write_word(&self, device_address: u64, value: u32) -> Result<(), ExecutionError> {
+        let mut faulted_now = false;
+        let mut failure = None;
+        {
+            let mut state = self.state.lock().expect("transfer queue lock is never poisoned");
+            if let Some(reason) = state.fault.as_deref() {
+                return Err(ExecutionError::SubmissionFailed(format!(
+                    "the transfer queue faulted: {reason}"
+                )));
+            }
+            let context = self.device.context();
+            let result = context
+                .enter()
+                .and_then(|_current| {
+                    let issue = context.enqueue();
+                    let status = unsafe { issue.write_value_32(self.stream.raw(), device_address, value, 0) }
+                        .ok_or_else(|| crate::driver::DriverError {
+                            operation: "transfer signal gate",
+                            code: 0,
+                            description: PREDATES_STREAM_VALUES.into(),
+                        })?;
+                    context.driver.check(status, "transfer signal gate")
+                })
+                .and_then(|()| self.stream.flush_submission())
+                .map_err(submission);
+            if let Err(error) = result {
+                state.fault = Some(error.to_string());
+                self.faulted.store(true, Ordering::Release);
+                faulted_now = true;
+                failure = Some(error);
+            }
+        }
+        if faulted_now {
+            self.done.wake();
+        }
+        if let Some(error) = failure {
+            return Err(error);
+        }
+        Ok(())
     }
 
     fn faulted(&self) -> bool {

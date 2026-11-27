@@ -841,6 +841,42 @@ impl Wake {
     }
 }
 
+/// Host callback run on `stream.wakes()` once a `WordKind::Wait` graph finishes
+/// on the GPU, releasing its `HostGatedFlightGuard` so any waiting
+/// `Context::changing_memory()` call can proceed.
+unsafe extern "system" fn drop_host_gated_flight(data: *mut c_void) {
+    // SAFETY: `release_host_gated_behind` boxed one `HostGatedFlightGuard`.
+    drop(unsafe { Box::from_raw(data.cast::<driver::HostGatedFlightGuard>()) });
+}
+
+fn release_host_gated_behind(
+    guard: driver::HostGatedFlightGuard,
+    stream: &driver::Stream,
+    finished: &Event,
+) -> Result<(), ExecutionError> {
+    let context = stream.context();
+    let wakes_stream = stream.wakes().map_err(submission)?;
+    let wakes = wakes_stream.raw();
+    let _current = context.enter().map_err(submission)?;
+    let issue = context.enqueue();
+    unsafe {
+        context
+            .driver
+            .check(issue.stream_wait_event(wakes, finished.raw()), "host-gated release wait")
+            .map_err(submission)?;
+        let boxed = Box::into_raw(Box::new(guard)).cast::<c_void>();
+        let status = issue.launch_host_function(wakes, drop_host_gated_flight, boxed);
+        if status != 0 {
+            drop(Box::from_raw(boxed.cast::<driver::HostGatedFlightGuard>()));
+        }
+        context
+            .driver
+            .check(status, "host-gated release launch")
+            .map_err(submission)?;
+    }
+    wakes_stream.flush_submission().map_err(submission)
+}
+
 /// The host function a stream runs behind a device write of a word: `data`
 /// is the word's [`Wake`], an `Arc` leaked for it ([`Wake::behind`]).
 unsafe extern "system" fn wake_after_write(data: *mut c_void) {
@@ -1256,9 +1292,22 @@ impl DirectBatch {
             "DirectBatch::replay precondition: a timed batch times each launch"
         );
         self.ensure_started()?;
+        // Acquire the device's host-gated flight permit AFTER `replays.replay`
+        // has finished any lazy `Graph::instantiate` / `GraphExec::drop`
+        // (`Context::changing_memory()`), and immediately BEFORE launching a
+        // graph containing `WordKind::Wait` (`BatchMemOp(WAIT_VALUE_32)`).
+        // Released via `stream.wakes()` once `graph.launched` completes on GPU.
+        let host_gated = graph
+            .words
+            .iter()
+            .any(|node| matches!(node.kind, WordKind::Wait))
+            .then(|| self.device.begin_host_gated_flight());
         graph.exec.launch(&self.stream).map_err(submission)?;
         self.fence.arm(&self.stream);
         graph.launched.record(&self.stream).map_err(submission)?;
+        if let Some(guard) = host_gated {
+            release_host_gated_behind(guard, &self.stream, &graph.launched)?;
+        }
         for node in &graph.words {
             if let WordKind::Write { written, wake } = &node.kind {
                 wake.behind(&self.stream, written)?;
@@ -1401,6 +1450,12 @@ impl DirectSubmission {
         self.end
             .as_ref()
             .expect("DirectSubmission end event is present until drop")
+    }
+
+    /// Completion event recorded at the end of this submission, for cross-stream
+    /// `cuStreamWaitEvent` synchronization (`Compute -> Transfer` / `Compute -> Compute`).
+    pub fn completion_event(&self) -> &Event {
+        self.end()
     }
 
     /// Whether the work completed, without waiting: `Ok(false)` while it

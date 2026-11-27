@@ -898,7 +898,8 @@ mod tests {
                     registry::RowPlaneContent::Codes { .. }
                     | registry::RowPlaneContent::Grids { .. }
                     | registry::RowPlaneContent::GridHigh { .. } => codes += per(plane, 64),
-                    registry::RowPlaneContent::Groups { .. } => words += per(plane, 256).div_ceil(4),
+                    registry::RowPlaneContent::Groups { .. }
+                    | registry::RowPlaneContent::TileFactors { .. } => words += per(plane, 256).div_ceil(4),
                     registry::RowPlaneContent::Records { .. } => {
                         codes += per(plane, 64);
                         words += per(plane, 256).div_ceil(4);

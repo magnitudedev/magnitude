@@ -781,6 +781,11 @@ impl Device {
     pub fn staff(&self, workers: Option<Arc<Workers>>) {
         self.inner.staff(workers)
     }
+    /// Drop cached program-store lookup entries held by this device's program
+    /// formers once load-time kernel formation has completed.
+    pub fn release_formation_cache(&self) {
+        self.inner.release_formation_cache()
+    }
     /// Whether this opened device forms Metal tensor operations (false on
     /// every other backend).
     pub fn forms_tensor_operations(&self) -> bool {
@@ -1472,6 +1477,13 @@ impl Timeline<timeline::Gate> {
     pub fn wait_signalled(&self, value: u64, timeout: std::time::Duration) -> Result<bool, ExecutionError> {
         self.host.wait_signalled(value, timeout)
     }
+
+    /// The device address of the gate word on CUDA (`HostWord`), allowing
+    /// device kernels to self-gate (`st.release.sys.global.u32`) when zero
+    /// host work is required; `None` on other backends.
+    pub fn device_address(&self) -> Option<u64> {
+        self.host.device_address()
+    }
 }
 
 impl Timeline<timeline::Reached> {
@@ -1500,6 +1512,12 @@ impl Timeline<timeline::Reached> {
     /// signal of the timeline is pending.
     pub fn reach(&self, value: u64) -> Result<(), ExecutionError> {
         self.host.reach(value)
+    }
+
+    /// The device address of the reached word on CUDA (`HostWord`); `None` on
+    /// other backends.
+    pub fn device_address(&self) -> Option<u64> {
+        self.host.device_address()
     }
 }
 
@@ -1590,19 +1608,59 @@ pub enum TransferItem<'a> {
     },
 }
 
-/// A device-side completion handle for a [`Transfer`] batch, which a
-/// [`NativeGraphSequence`] can wait on via cross-stream event synchronization
-/// (`cuStreamWaitEvent` on CUDA) without blocking the host.
+pub use seismic_runtime::native::transfer::{
+    FenceCapability, FenceError, TimelineObserver, TimelinePoint,
+};
+
+/// Unified typed timeline fence alias for [`TransferSync`].
+pub type TimelineFence = TransferSync;
+
+/// A device-side completion handle for a [`Transfer`] batch or signaled
+/// [`NativeGraphSequence`], bridging CUDA `CUevent`, Metal `MTLSharedEvent`,
+/// Vulkan `VK_KHR_timeline_semaphore`, and CPU `HostOnly` timelines with
+/// `seismic-io` v2's [`TimelinePoint`] and [`TimelineObserver`].
 #[derive(Clone)]
 pub struct TransferSync {
     inner: seismic_runtime::native::transfer::TransferSync,
 }
 
 impl TransferSync {
+    /// Typed [`TimelinePoint`] carrying `(DeviceId, ProducerId, value, capability)`.
+    pub fn timeline_point(&self) -> TimelinePoint {
+        self.inner.timeline_point()
+    }
+
+    /// Non-blocking host check whether this fence has been reached.
+    pub fn is_reached(&self) -> Result<bool, FenceError> {
+        self.inner.is_reached()
+    }
+
+    /// Block the host up to `timeout` waiting for this fence to be reached.
+    pub fn wait(&self, timeout: std::time::Duration) -> Result<bool, FenceError> {
+        self.inner.wait(timeout)
+    }
+
     /// Whether `self` and `other` are one batch's handle, so following
     /// one follows the other.
     pub fn same_batch(&self, other: &Self) -> bool {
         self.inner.same_batch(&other.inner)
+    }
+}
+
+impl TimelineObserver for TransferSync {
+    fn is_reached(&self, point: TimelinePoint) -> Result<bool, FenceError> {
+        <seismic_runtime::native::transfer::TransferSync as TimelineObserver>::is_reached(
+            &self.inner,
+            point,
+        )
+    }
+
+    fn wait(&self, point: TimelinePoint, timeout: std::time::Duration) -> Result<bool, FenceError> {
+        <seismic_runtime::native::transfer::TransferSync as TimelineObserver>::wait(
+            &self.inner,
+            point,
+            timeout,
+        )
     }
 }
 
@@ -1612,6 +1670,13 @@ impl Transfer {
         seismic_runtime::native::transfer::TransferInner::new(device.inner()).map(|inner| Self {
             inner: Arc::new(inner),
         })
+    }
+
+    /// Raise `gate` to `value` once all previously queued copies on this
+    /// transfer queue have landed (on CUDA via `cuStreamWriteValue32` directly
+    /// on the copy stream with zero host wait on DMA).
+    pub fn signal_gate(&self, gate: &Timeline<timeline::Gate>, value: u64) -> Result<(), TransferError> {
+        self.inner.signal_gate(&gate.host, value)
     }
 
     /// Queue `items` as one batch: the value it completes at. The caller
@@ -1626,6 +1691,23 @@ impl Transfer {
     pub fn copy_synced(&self, items: &[TransferItem<'_>]) -> Result<(u64, TransferSync), TransferError> {
         self.copy_with(items, |inner, items| {
             inner.copy_synced(items).map(|(value, sync)| (value, TransferSync { inner: sync }))
+        })
+    }
+
+    /// [`Self::copy_synced`], first ordering this transfer batch after every
+    /// [`TransferSync`] fence in `wait_fences` (`cuStreamWaitEvent` on CUDA,
+    /// `vkQueueSubmit2` timeline wait on Vulkan, host wait on CPU).
+    pub fn copy_after(
+        &self,
+        items: &[TransferItem<'_>],
+        wait_fences: &[&TransferSync],
+    ) -> Result<(u64, TransferSync), TransferError> {
+        let inner_fences: Vec<&seismic_runtime::native::transfer::TransferSync> =
+            wait_fences.iter().map(|f| &f.inner).collect();
+        self.copy_with(items, |inner, items| {
+            inner
+                .copy_after(items, &inner_fences)
+                .map(|(value, sync)| (value, TransferSync { inner: sync }))
         })
     }
 
@@ -1802,6 +1884,21 @@ impl Tensor {
             })
     }
 
+    /// A strided-record view of another element carried by this contiguous
+    /// tensor (`TensorInner::carried_records`).
+    pub fn carried_records(
+        &self,
+        element: Element,
+        extents: &[u64],
+        slot_bytes: u64,
+    ) -> Result<Tensor, TensorError> {
+        self.inner
+            .carried_records(element.id(), extents, slot_bytes)
+            .map(|inner| Tensor {
+                inner: Arc::new(inner),
+            })
+    }
+
     /// Records `start..end` of this tensor (its leading-axis rows) as a
     /// region of their own (`TensorInner::record_region`).
     pub fn record_region(&self, start: u64, end: u64) -> Result<Tensor, TensorError> {
@@ -1861,6 +1958,23 @@ impl Tensor {
             .map(|inner| Tensor {
                 inner: Arc::new(inner),
             })
+    }
+
+    pub fn shared_records(
+        charges: &Charges,
+        element: Element,
+        extents: &[u64],
+        slot_bytes: u64,
+    ) -> Result<Tensor, TensorError> {
+        seismic_runtime::api::tensor::TensorInner::shared_records(
+            charges.inner(),
+            element.id(),
+            extents,
+            slot_bytes,
+        )
+        .map(|inner| Tensor {
+            inner: Arc::new(inner),
+        })
     }
 
     /// A zero-filled tensor of coherent words the host and running device
@@ -2417,7 +2531,7 @@ pub unsafe trait Entry: 'static {
     /// scalar-result slots, none without scalar results.
     const NATIVE_SCALAR_RESULT_BYTES: u64;
     /// The checked module this entry belongs to.
-    fn module() -> Result<&'static generated::Module, CheckedBundleError>;
+    fn module() -> Result<Arc<generated::Module>, CheckedBundleError>;
     fn resolve(module: &generated::Module) -> Result<generated::EntryToken, CheckedBundleError>;
     fn encode(args: Self::Args<'_>) -> generated::EncodedArgs;
     fn encode_outputs(outputs: Self::OutputArgs<'_>) -> generated::EncodedOutputs;
@@ -2458,7 +2572,7 @@ impl<'device, E: Entry> FeedbackPreparation<'device, E> {
         bindings: seismic_lang::entry::ElementBindings,
     ) -> Result<(Self, Kernel<E>), LoadError> {
         let module = E::module().map_err(LoadError::Bundle)?;
-        let entry = E::resolve(module).map_err(LoadError::Bundle)?;
+        let entry = E::resolve(&module).map_err(LoadError::Bundle)?;
         let (inner, kernel) = seismic_runtime::api::kernel::start_feedback(
             module.checked(),
             entry.id(),
@@ -2634,14 +2748,14 @@ impl<'a, E: Entry> seismic_runtime::native::tune::PointSource<'a> for TypedPoint
 /// price fits the budget left ([`Quote::fits`]); a piece begun
 /// ([`NativeSearch::perform`]) runs to its end.
 pub struct NativeSearch<'a, E: Entry> {
-    inner: seismic_runtime::native::tune::UnitSearch<'static, 'a>,
+    inner: seismic_runtime::native::tune::UnitSearch<'a>,
     entry: std::marker::PhantomData<E>,
 }
 
 /// The compile of a unit's next piece of work ([`NativeSearch::forming`]).
-pub type Forming = seismic_runtime::native::tune::Forming<'static>;
+pub type Forming = seismic_runtime::native::tune::Forming;
 /// The compile of a unit's canonical program ([`NativeSearch::grounding`]).
-pub type Grounding = seismic_runtime::native::tune::Grounding<'static>;
+pub type Grounding = seismic_runtime::native::tune::Grounding;
 pub use seismic_runtime::native::tune::GroundingKey;
 impl<'a, E: Entry> NativeSearch<'a, E> {
     /// The unit's mandatory work: form the declared canonical program and
@@ -2902,6 +3016,26 @@ struct PlanningCaches {
     checked_calls: std::sync::RwLock<CheckedCallsCache>,
     scratch_walked: std::sync::RwLock<WalkedConfigsCache>,
     launch_walked: std::sync::RwLock<WalkedConfigsCache>,
+    modules: std::sync::Mutex<Vec<Arc<generated::Module>>>,
+}
+
+/// Pin `module` in the active [`PlanningSession`] wave's caches so repeated
+/// `E::module()` calls during planning share one decoded [`generated::Module`]
+/// and drop it automatically when the last active planning session ends.
+/// Outside any active planning session this is a no-op, so one-off post-load
+/// lookups drop their decoded module immediately when their caller finishes.
+fn pin_module_in_active_planning(module: &Arc<generated::Module>) {
+    let caches = PLANNING_STATE
+        .lock()
+        .expect("planning session state poisoned")
+        .caches
+        .clone();
+    if let Some(caches) = caches {
+        let mut pinned = caches.modules.lock().expect("planning modules poisoned");
+        if !pinned.iter().any(|existing| Arc::ptr_eq(existing, module)) {
+            pinned.push(Arc::clone(module));
+        }
+    }
 }
 
 struct ActivePlanningState {
@@ -3441,7 +3575,7 @@ impl NativeGraphMetadata {
         let module = E::module().map_err(NativeGraphMetadataError::Bundle)?;
         Ok((
             self.backend,
-            std::ptr::from_ref(module) as usize,
+            Arc::as_ptr(&module) as usize,
             E::NAME,
             elements
                 .iter()
@@ -4573,6 +4707,44 @@ impl NativeGraphFamily {
             .new_slot_in(charges.inner(), &arena.inner, regions)
             .map(|inner| NativeGraphFamilySlot { inner })
     }
+    /// Like [`Self::new_slot_in`], requiring `arena` to cover only plans up to
+    /// `workspace_limit` bytes.
+    pub fn new_slot_in_bounded(
+        &self,
+        charges: &Charges,
+        arena: &NativeExecutionArena,
+        regions: &[u64],
+        workspace_limit: u64,
+    ) -> Result<NativeGraphFamilySlot, WorkflowError> {
+        self.inner
+            .new_slot_in_bounded(charges.inner(), &arena.inner, regions, workspace_limit)
+            .map(|inner| NativeGraphFamilySlot { inner })
+    }
+    /// Allocate an elastic workspace arena of `bytes` bound to this family.
+    pub fn new_arena(
+        &self,
+        charges: &Charges,
+        bytes: u64,
+    ) -> Result<NativeGraphArena, WorkflowError> {
+        self.inner
+            .new_arena(charges.inner(), bytes)
+            .map(|inner| NativeGraphArena { inner })
+    }
+}
+
+/// An elastic workspace arena bound to one [`NativeGraphFamily`].
+pub struct NativeGraphArena {
+    inner: seismic_runtime::native::graph::NativeGraphArena,
+}
+
+impl NativeGraphArena {
+    pub fn bytes(&self) -> u64 {
+        self.inner.bytes()
+    }
+
+    pub fn charged_bytes(&self) -> u64 {
+        self.inner.charged_bytes()
+    }
 }
 
 /// One device's graph workspace, shared by the family slots created in it.
@@ -4617,6 +4789,18 @@ impl NativeGraphFamilySlot {
     ) -> Result<NativeGraphFamilyActive<'a>, WorkflowError> {
         self.inner
             .activate(&plan.inner)
+            .map(|inner| NativeGraphFamilyActive { inner })
+    }
+
+    /// Activate `plan` against an elastic [`NativeGraphArena`] bound to this
+    /// slot's family.
+    pub fn activate_in<'a>(
+        &'a mut self,
+        plan: &NativeGraphPlan,
+        arena: &NativeGraphArena,
+    ) -> Result<NativeGraphFamilyActive<'a>, WorkflowError> {
+        self.inner
+            .activate_in(&plan.inner, &arena.inner)
             .map(|inner| NativeGraphFamilyActive { inner })
     }
 
@@ -4838,10 +5022,22 @@ impl NativeGraphSequence {
     pub fn is_empty(&self) -> bool {
         self.inner.is_empty()
     }
-    /// Wait on `sync` (`cuStreamWaitEvent` on CUDA) before running any work
-    /// queued in this sequence.
+    /// Wait on `fence` (`cuStreamWaitEvent` on CUDA, `MTLSharedEvent` on Metal,
+    /// timeline semaphore on Vulkan) before running any work queued in this
+    /// sequence.
+    pub fn wait_fence(&mut self, fence: TransferSync) -> Result<(), CallError> {
+        self.inner.wait_fence(fence.inner)
+    }
+    /// Wait on `sync` before running any work queued in this sequence
+    /// (delegates to [`Self::wait_fence`]).
     pub fn follow_transfer(&mut self, sync: TransferSync) -> Result<(), CallError> {
-        self.inner.follow_transfer(sync.inner)
+        self.wait_fence(sync)
+    }
+    /// Insert a `Timeline<Gate>` wait at the current point in the sequence
+    /// (before the next queued run), enabling non-blocking submission ahead of
+    /// asynchronous host/DMA completion.
+    pub fn wait_gate(&mut self, gate: &Timeline<timeline::Gate>, value: u64) -> Result<(), CallError> {
+        self.inner.wait_gate(&gate.host, value)
     }
     /// Submit every queued run without waiting; the completion reports all
     /// of them.
@@ -4849,6 +5045,14 @@ impl NativeGraphSequence {
         self.inner
             .submit()
             .map(|inner| NativeGraphCompletion { inner })
+    }
+    /// Submit every queued run and return both its [`NativeGraphCompletion`]
+    /// and a [`TransferSync`] signal fence (`DeviceAndHost` on GPU backends,
+    /// `HostOnly` on CPU).
+    pub fn submit_signaled(self) -> Result<(NativeGraphCompletion, TransferSync), CallError> {
+        self.inner
+            .submit_signaled()
+            .map(|(inner, sync)| (NativeGraphCompletion { inner }, TransferSync { inner: sync }))
     }
 }
 
@@ -4954,7 +5158,7 @@ impl<E: Entry> Kernel<E> {
         bindings: seismic_lang::entry::ElementBindings,
     ) -> Result<Self, LoadError> {
         let module = E::module().map_err(LoadError::Bundle)?;
-        let entry = E::resolve(module).map_err(LoadError::Bundle)?;
+        let entry = E::resolve(&module).map_err(LoadError::Bundle)?;
         seismic_runtime::api::kernel::prepare(
             module.checked(),
             entry.id(),
@@ -5002,7 +5206,7 @@ impl<E: Entry> NativeKernel<E> {
         cpu: Option<&'static native_cpu::CpuNativeKernels>,
     ) -> Result<Self, LoadError> {
         let module = E::module().map_err(LoadError::Bundle)?;
-        let entry = E::resolve(module).map_err(LoadError::Bundle)?;
+        let entry = E::resolve(&module).map_err(LoadError::Bundle)?;
         seismic_runtime::api::kernel::prepare_native(
             module.checked(),
             entry.id(),
@@ -5139,7 +5343,7 @@ pub mod generated {
     /// can name the type because Rust trait implementations must, but cannot
     /// inspect or construct the compiler artifact it owns.
     pub struct Module {
-        checked: seismic_lang::checked::CheckedModule,
+        checked: Arc<seismic_lang::checked::CheckedModule>,
         /// The contract of every entry and element binding graph metadata
         /// has bound in this process (`EntryContract`), each formed once:
         /// graphs bind the same few over and over, and forming one per graph
@@ -5195,7 +5399,7 @@ pub mod generated {
 
     pub fn invocation_scope<E: Entry>() -> Result<InvocationScope, CheckedBundleError> {
         let module = E::module()?;
-        let entry = E::resolve(module)?;
+        let entry = E::resolve(&module)?;
         let stable = module
             .checked()
             .entries()
@@ -5215,7 +5419,7 @@ pub mod generated {
     impl Module {
         fn new(checked: seismic_lang::checked::CheckedModule) -> Self {
             Self {
-                checked,
+                checked: Arc::new(checked),
                 entry_contracts: std::sync::Mutex::new(Vec::new()),
             }
         }
@@ -5225,6 +5429,10 @@ pub mod generated {
         /// prepare and interpret it.
         pub fn checked(&self) -> &seismic_lang::checked::CheckedModule {
             &self.checked
+        }
+
+        fn checked_arc(&self) -> Arc<seismic_lang::checked::CheckedModule> {
+            Arc::clone(&self.checked)
         }
         #[doc(hidden)]
         pub fn entry_named(&self, name: &str) -> Option<EntryToken> {
@@ -5641,7 +5849,7 @@ pub mod generated {
         cpu: Option<&'static native_cpu::CpuNativeKernels>,
     ) -> Result<NativeAdmission, CheckedBundleError> {
         let module = E::module()?;
-        let entry = E::resolve(module)?;
+        let entry = E::resolve(&module)?;
         Ok(seismic_runtime::native::admission(
             module.checked(),
             entry.id(),
@@ -5662,7 +5870,7 @@ pub mod generated {
         backend: BackendName,
     ) -> Result<Option<NativeImplementation>, CheckedBundleError> {
         let module = E::module()?;
-        let entry = E::resolve(module)?;
+        let entry = E::resolve(&module)?;
         Ok(module
             .checked()
             .native_implementation(entry.id(), backend)
@@ -5677,14 +5885,14 @@ pub mod generated {
     pub fn native_implementation_at<E: Entry>(
         backend: BackendName,
         elements: &[(&str, Element)],
-    ) -> Result<Option<&'static NativeImplementation>, CheckedBundleError> {
+    ) -> Result<Option<Arc<NativeImplementation>>, CheckedBundleError> {
         let module = E::module()?;
-        let entry = E::resolve(module)?;
-        Ok(module.checked().native_implementation_at(
-            entry.id(),
-            backend,
-            &element_bindings(elements),
-        ))
+        let entry = E::resolve(&module)?;
+        Ok(module
+            .checked()
+            .native_implementation_at(entry.id(), backend, &element_bindings(elements))
+            .cloned()
+            .map(Arc::new))
     }
 
     /// Resolve one metadata graph call from one checked entry and one set of
@@ -5706,10 +5914,9 @@ pub mod generated {
     pub struct NativeGraphCheckedEntry {
         shapes: Arc<seismic_lang::entry::CompiledEntryShapes>,
         /// The module's declaration at these element bindings (its element
-        /// reads substituted, `native_implementation_at`): bound for
-        /// every node and port a graph makes, so it is borrowed, never
-        /// copied.
-        implementation: &'static NativeImplementation,
+        /// reads substituted, `native_implementation_at`), shared via `Arc`
+        /// so `CheckedModule` can drop after planning completes.
+        implementation: Arc<NativeImplementation>,
         /// The lengths of the vectors a sealed node calling the entry holds.
         sealed_node: seismic_runtime::native::graph::SealedNodeShape,
     }
@@ -5720,12 +5927,13 @@ pub mod generated {
             elements: &[(&str, Element)],
         ) -> Result<Result<Self, String>, CheckedBundleError> {
             let module = E::module()?;
-            let entry = E::resolve(module)?;
+            let entry = E::resolve(&module)?;
             let bindings = element_bindings(elements);
-            let Some(implementation) =
-                module
-                    .checked()
-                    .native_implementation_at(entry.id(), backend, &bindings)
+            let Some(implementation) = module
+                .checked()
+                .native_implementation_at(entry.id(), backend, &bindings)
+                .cloned()
+                .map(Arc::new)
             else {
                 return Ok(Err(format!(
                     "`{}` has no native implementation for `{}`",
@@ -5739,16 +5947,16 @@ pub mod generated {
             };
             Ok(Ok(Self {
                 shapes,
-                implementation,
                 sealed_node: seismic_runtime::native::graph::SealedNodeShape::of(
                     &schema,
-                    implementation,
+                    &implementation,
                 ),
+                implementation,
             }))
         }
 
-        pub fn implementation(&self) -> &'static NativeImplementation {
-            self.implementation
+        pub fn implementation(&self) -> &NativeImplementation {
+            &self.implementation
         }
 
         pub(crate) fn sealed_node(&self) -> &seismic_runtime::native::graph::SealedNodeShape {
@@ -5878,7 +6086,7 @@ pub mod generated {
             Err(reason) => return Ok(CheckedNativeGraphCall::Unsupported(reason)),
         };
         Ok(CheckedNativeGraphCall::Checked {
-            implementation: checked.implementation.clone(),
+            implementation: (*checked.implementation).clone(),
             parameters,
             results,
         })
@@ -5893,7 +6101,7 @@ pub mod generated {
         elements: &[(&str, Element)],
     ) -> Result<NativeBindingCheck, CheckedBundleError> {
         let module = E::module()?;
-        let entry = E::resolve(module)?;
+        let entry = E::resolve(&module)?;
         if module
             .checked()
             .native_implementation(entry.id(), backend)
@@ -5923,7 +6131,7 @@ pub mod generated {
         dimensions: &[(&str, u64)],
     ) -> Result<NativeTensorParameterCheck, CheckedBundleError> {
         let module = E::module()?;
-        let entry = E::resolve(module)?;
+        let entry = E::resolve(&module)?;
         if module
             .checked()
             .native_implementation(entry.id(), backend)
@@ -5966,7 +6174,7 @@ pub mod generated {
         dimensions: &[(&str, u64)],
     ) -> Result<NativeTensorResultsCheck, CheckedBundleError> {
         let module = E::module()?;
-        let entry = E::resolve(module)?;
+        let entry = E::resolve(&module)?;
         if module
             .checked()
             .native_implementation(entry.id(), backend)
@@ -6021,7 +6229,7 @@ pub mod generated {
         use seismic_lang::entry::ParameterKind;
 
         let module = E::module()?;
-        let entry = E::resolve(module)?;
+        let entry = E::resolve(&module)?;
         if module
             .checked()
             .native_implementation(entry.id(), backend)
@@ -6089,7 +6297,7 @@ pub mod generated {
         elements: &[(&str, Element)],
     ) -> Result<Option<OnDevice>, CheckedBundleError> {
         let module = E::module()?;
-        let entry = E::resolve(module)?;
+        let entry = E::resolve(&module)?;
         Ok(seismic_runtime::native::offered(
             device.inner(),
             module.checked(),
@@ -6108,7 +6316,7 @@ pub mod generated {
         elements: &[(&str, Element)],
     ) -> Result<Option<NativeSpecialization>, CheckedBundleError> {
         let module = E::module()?;
-        let entry = E::resolve(module)?;
+        let entry = E::resolve(&module)?;
         Ok(seismic_runtime::native::default_specialization(
             device.inner(),
             module.checked(),
@@ -6126,7 +6334,7 @@ pub mod generated {
         elements: &[(&str, Element)],
     ) -> Result<Option<NativeSpecialization>, CheckedBundleError> {
         let module = E::module()?;
-        let entry = E::resolve(module)?;
+        let entry = E::resolve(&module)?;
         Ok(seismic_runtime::native::reference_specialization(
             device.inner(),
             module.checked(),
@@ -6146,7 +6354,7 @@ pub mod generated {
         elements: &[(&str, Element)],
     ) -> Result<bool, CheckedBundleError> {
         let module = E::module()?;
-        let entry = E::resolve(module)?;
+        let entry = E::resolve(&module)?;
         Ok(seismic_runtime::native::specialization_valid(
             device.inner(),
             module.checked(),
@@ -6166,7 +6374,7 @@ pub mod generated {
     ) -> Result<String, TuneError> {
         let module = E::module().map_err(|error| TuneError::Declaration(error.to_string()))?;
         let entry =
-            E::resolve(module).map_err(|error| TuneError::Declaration(error.to_string()))?;
+            E::resolve(&module).map_err(|error| TuneError::Declaration(error.to_string()))?;
         seismic_runtime::native::tune::implementation_digest(
             device.inner(),
             module.checked(),
@@ -6188,10 +6396,10 @@ pub mod generated {
     ) -> Result<TuningResult, TuneError> {
         let module = E::module().map_err(|error| TuneError::Declaration(error.to_string()))?;
         let entry =
-            E::resolve(module).map_err(|error| TuneError::Declaration(error.to_string()))?;
+            E::resolve(&module).map_err(|error| TuneError::Declaration(error.to_string()))?;
         seismic_runtime::native::tune::tune(seismic_runtime::native::tune::TuneRequest {
             charges: charges.inner(),
-            module: module.checked(),
+            module: module.checked_arc(),
             entry: entry.id(),
             bindings: element_bindings(elements),
             statics: statics.clone(),
@@ -6213,12 +6421,12 @@ pub mod generated {
     ) -> Result<NativeSearch<'a, E>, TuneError> {
         let module = E::module().map_err(|error| TuneError::Declaration(error.to_string()))?;
         let entry =
-            E::resolve(module).map_err(|error| TuneError::Declaration(error.to_string()))?;
+            E::resolve(&module).map_err(|error| TuneError::Declaration(error.to_string()))?;
         Ok(NativeSearch {
             inner: seismic_runtime::native::tune::UnitSearch::open(
                 seismic_runtime::native::tune::UnitRequest {
                     charges: charges.inner(),
-                    module: module.checked(),
+                    module: module.checked_arc(),
                     entry: entry.id(),
                     bindings: element_bindings(elements),
                     statics: statics.clone(),
@@ -6265,16 +6473,53 @@ pub mod generated {
         }
     }
 
-    pub fn module_from_bundle(
-        cell: &'static OnceLock<Result<Module, CheckedBundleError>>,
-        bytes: &'static [u8],
-    ) -> Result<&'static Module, CheckedBundleError> {
-        match cell
-            .get_or_init(|| seismic_lang::bundle::decode_checked_bundle(bytes).map(Module::new))
-        {
-            Ok(module) => Ok(module),
-            Err(error) => Err(error.clone()),
+    /// Weak static cache for a generated bundle's decoded [`Module`].
+    ///
+    /// Decodes on demand and stays resident for the lifetime of any active
+    /// [`crate::PlanningSession`] wave (which holds strong `Arc<Module>` pins
+    /// inside `PlanningCaches`). When the last active planning session ends,
+    /// those pins drop and the `CheckedModule` ASTs, `entry_contracts`, and
+    /// bound declarations are reclaimed automatically. Any one-off lookup
+    /// outside a planning session holds its `Arc<Module>` only for the call's
+    /// duration and never leaks permanently.
+    pub struct ModuleSlot {
+        module: std::sync::Mutex<std::sync::Weak<Module>>,
+    }
+
+    impl ModuleSlot {
+        pub const fn new() -> Self {
+            Self {
+                module: std::sync::Mutex::new(std::sync::Weak::new()),
+            }
         }
+    }
+
+    pub fn module_from_bundle(
+        slot: &'static ModuleSlot,
+        bytes: &'static [u8],
+    ) -> Result<Arc<Module>, CheckedBundleError> {
+        {
+            let weak = slot.module.lock().expect("module slot poisoned");
+            if let Some(module) = weak.upgrade() {
+                drop(weak);
+                crate::pin_module_in_active_planning(&module);
+                return Ok(module);
+            }
+        }
+        let decoded = Arc::new(Module::new(seismic_lang::bundle::decode_checked_bundle(
+            bytes,
+        )?));
+        let module = {
+            let mut weak = slot.module.lock().expect("module slot poisoned");
+            if let Some(existing) = weak.upgrade() {
+                existing
+            } else {
+                *weak = Arc::downgrade(&decoded);
+                decoded
+            }
+        };
+        crate::pin_module_in_active_planning(&module);
+        Ok(module)
     }
 }
 

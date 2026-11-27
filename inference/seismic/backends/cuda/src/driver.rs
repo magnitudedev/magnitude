@@ -17,7 +17,64 @@
 use libloading::Library;
 use std::ffi::{c_char, c_int, c_uchar, c_uint, c_void, CStr};
 use std::fmt;
-use std::sync::{Arc, OnceLock};
+use std::sync::{Arc, Condvar, Mutex, OnceLock};
+
+#[derive(Default)]
+struct MemoryGateState {
+    /// Active compute-stream flights that may park on a host-signaled
+    /// `WAIT_VALUE_32` (`DecodeReactor` unified decode flights).
+    active_host_gated: u32,
+    /// Threads waiting to enter `Context::changing_memory()`.
+    changing_memory_waiting: u32,
+    /// True while a thread holds `Context::changing_memory()`.
+    changing_memory_active: bool,
+}
+
+#[derive(Default)]
+struct MemoryGate {
+    state: Mutex<MemoryGateState>,
+    changed: Condvar,
+}
+
+pub(crate) struct ChangingMemoryGuard<'a> {
+    gate: &'a MemoryGate,
+}
+
+impl Drop for ChangingMemoryGuard<'_> {
+    fn drop(&mut self) {
+        let mut state = self
+            .gate
+            .state
+            .lock()
+            .expect("a device's driver memory gate lock is never poisoned");
+        state.changing_memory_active = false;
+        self.gate.changed.notify_all();
+    }
+}
+
+/// RAII permit held while a GPU compute stream has an unresolved host-signaled
+/// `WAIT_VALUE_32` gate in flight. Defers background CUDA memory-management
+/// calls (`Context::changing_memory`: `cuMemAlloc`, `cuMemFree`,
+/// `cuMemHostRegister`, `cuMemHostUnregister`, etc.) until the gate is
+/// signaled or self-gated, preventing `libcuda.so` context-lock deadlocks.
+pub struct HostGatedFlightGuard {
+    stack: Arc<StackGrowth>,
+}
+
+impl Drop for HostGatedFlightGuard {
+    fn drop(&mut self) {
+        let mut state = self
+            .stack
+            .memory_gate
+            .state
+            .lock()
+            .expect("a device's driver memory gate lock is never poisoned");
+        state.active_host_gated = state.active_host_gated.saturating_sub(1);
+        if state.active_host_gated == 0 && state.changing_memory_waiting > 0 {
+            self.stack.memory_gate.changed.notify_all();
+        }
+    }
+}
 
 use seismic_memory::entry::{Backed, Change, Charge, DropInChange, Entry, ScopedDrop, Wiring};
 
@@ -102,6 +159,7 @@ driver! {
     event_query: unsafe extern "system" fn(Handle) -> ResultCode => "cuEventQuery",
     event_elapsed_time: unsafe extern "system" fn(*mut f32, Handle, Handle) -> ResultCode => "cuEventElapsedTime",
     allocate: unsafe extern "system" fn(*mut u64, usize) -> ResultCode => "cuMemAlloc_v2",
+    allocate_managed: unsafe extern "system" fn(*mut u64, usize, c_uint) -> ResultCode => "cuMemAllocManaged",
     free: unsafe extern "system" fn(u64) -> ResultCode => "cuMemFree_v2",
     allocate_host: unsafe extern "system" fn(*mut *mut c_void, usize) -> ResultCode => "cuMemAllocHost_v2",
     free_host: unsafe extern "system" fn(*mut c_void) -> ResultCode => "cuMemFreeHost",
@@ -154,6 +212,8 @@ driver! {
         function_load: unsafe extern "system" fn(Handle) -> ResultCode => "cuFuncLoad",
         // Driver API 12.3+: typed graph edges (programmatic dependent launch).
         graph_add_dependencies: unsafe extern "system" fn(Handle, *const Handle, *const Handle, *const EdgeData, usize) -> ResultCode => "cuGraphAddDependencies_v2",
+        // Driver API 8.0+: managed memory placement and page-table hints.
+        memory_advise: unsafe extern "system" fn(u64, usize, c_int, c_int) -> ResultCode => "cuMemAdvise",
         // Driver API 10.2+: virtual memory management and host-NUMA physical blocks (CUDA 12.2+).
         memory_granularity: unsafe extern "system" fn(*mut usize, *const AllocationProperties, c_uint) -> ResultCode => "cuMemGetAllocationGranularity",
         address_reserve: unsafe extern "system" fn(*mut u64, usize, usize, u64, u64) -> ResultCode => "cuMemAddressReserve",
@@ -485,10 +545,50 @@ impl Context {
     /// this context's device (`cuMemAlloc` and `cuMemFree`, pinned and
     /// registered host memory, a module's load and unload, a graph's
     /// instantiation and destruction, a stack raise): one at a time on the
-    /// device in the process, so none of ours runs inside another's
-    /// measurement ([`Self::taken_by`]).
-    pub(crate) fn changing_memory(&self) -> std::sync::MutexGuard<'_, ()> {
-        self.stack.measuring.lock().expect("a device's driver memory lock is never poisoned")
+    /// device in the process, and never while a compute stream has an
+    /// unresolved host-signaled `WAIT_VALUE_32` gate in flight (which would
+    /// deadlock inside `libcuda.so`'s context lock).
+    pub(crate) fn changing_memory(&self) -> ChangingMemoryGuard<'_> {
+        let gate = &self.stack.memory_gate;
+        let mut state = gate
+            .state
+            .lock()
+            .expect("a device's driver memory gate lock is never poisoned");
+        state.changing_memory_waiting += 1;
+        while state.changing_memory_active || state.active_host_gated > 0 {
+            state = gate
+                .changed
+                .wait(state)
+                .expect("a device's driver memory gate lock is never poisoned");
+        }
+        state.changing_memory_waiting -= 1;
+        state.changing_memory_active = true;
+        drop(state);
+        ChangingMemoryGuard { gate }
+    }
+
+    /// Acquire a shared permit before submitting a compute-stream flight that
+    /// may park on a host-signaled `WAIT_VALUE_32` gate. Waits for any active
+    /// or waiting `changing_memory()` call first, then blocks subsequent
+    /// `changing_memory()` calls until this guard is dropped (when the gate is
+    /// signaled on the Copy stream or self-gated on GPU).
+    pub(crate) fn begin_host_gated_flight(&self) -> HostGatedFlightGuard {
+        let gate = &self.stack.memory_gate;
+        let mut state = gate
+            .state
+            .lock()
+            .expect("a device's driver memory gate lock is never poisoned");
+        while state.changing_memory_active || state.changing_memory_waiting > 0 {
+            state = gate
+                .changed
+                .wait(state)
+                .expect("a device's driver memory gate lock is never poisoned");
+        }
+        state.active_host_gated += 1;
+        drop(state);
+        HostGatedFlightGuard {
+            stack: Arc::clone(&self.stack),
+        }
     }
 
     /// Charge the driver memory of this context's device that no
@@ -681,11 +781,12 @@ pub(crate) const RESERVED_STACK_BYTES: usize = 2048;
 #[derive(Default)]
 pub(crate) struct StackGrowth {
     bytes: std::sync::atomic::AtomicU64,
-    /// Held across every driver call of the process that takes or frees
-    /// memory on the device, and across a measurement of one from the
-    /// device's free memory (`Context::changing_memory`,
-    /// `Context::taken_by`): one at a time on the device in the process.
-    measuring: std::sync::Mutex<()>,
+    /// Coordinates exclusive driver memory calls (`Context::changing_memory`,
+    /// `Context::taken_by`) with active host-gated `WAIT_VALUE_32` flights
+    /// (`Context::begin_host_gated_flight`): one memory change at a time on
+    /// the device in the process, and never concurrent with an unresolved
+    /// host-signaled GPU gate.
+    memory_gate: MemoryGate,
 }
 
 impl StackGrowth {
@@ -1139,6 +1240,136 @@ fn device_memory_granularity(
 fn virtual_memory(driver: &Driver, ordinal: c_int) -> Result<bool, DriverError> {
     const VIRTUAL_MEMORY_MANAGEMENT: c_int = 102;
     Ok(driver.attribute(VIRTUAL_MEMORY_MANAGEMENT, ordinal)? != 0)
+}
+
+/// `CU_DEVICE_ATTRIBUTE_MANAGED_MEMORY`.
+const MANAGED_MEMORY: c_int = 83;
+/// `CU_DEVICE_ATTRIBUTE_CONCURRENT_MANAGED_ACCESS`.
+const CONCURRENT_MANAGED_ACCESS: c_int = 89;
+/// `CU_MEM_ATTACH_GLOBAL`.
+const MEM_ATTACH_GLOBAL: c_uint = 1;
+/// `CU_MEM_ADVISE_SET_PREFERRED_LOCATION`.
+const MEM_ADVISE_SET_PREFERRED_LOCATION: c_int = 3;
+/// `CU_MEM_ADVISE_SET_ACCESSED_BY`.
+const MEM_ADVISE_SET_ACCESSED_BY: c_int = 5;
+/// `CUDA_ERROR_NOT_SUPPORTED`.
+const NOT_SUPPORTED: c_int = 801;
+
+/// Whether `context`'s device supports concurrent host/device managed memory
+/// (`cuMemAllocManaged`). On unified-memory CUDA hosts (Grace Blackwell GB10),
+/// managed memory is host-addressable and pageable while sustaining full
+/// strided GEMV bandwidth (`~163 GB/s` vs `~55-117 GB/s` for `cuMemCreate`
+/// `HOST_NUMA`), without the driver-pinned exhaustion of `cuMemAlloc`.
+pub(crate) fn can_alloc_managed(context: &Context) -> Result<bool, DriverError> {
+    let driver = &context.driver;
+    let ordinal = context.ordinal();
+    Ok(driver.attribute(MANAGED_MEMORY, ordinal)? != 0
+        && driver.attribute(CONCURRENT_MANAGED_ACCESS, ordinal)? != 0)
+}
+
+/// One concurrent-access managed allocation (`cuMemAllocManaged` with
+/// `CU_MEM_ATTACH_GLOBAL`) shared between host and device at one virtual
+/// address: zeroed when made, charged to its entry while it lives, and freed
+/// in one change when dropped.
+pub(crate) struct ManagedBlock(Backed<Managed>);
+
+impl std::ops::Deref for ManagedBlock {
+    type Target = Managed;
+
+    fn deref(&self) -> &Managed {
+        &self.0
+    }
+}
+
+pub(crate) struct Managed {
+    base: u64,
+    bytes: usize,
+    context: Arc<Context>,
+}
+
+unsafe impl Send for Managed {}
+unsafe impl Sync for Managed {}
+
+impl ManagedBlock {
+    pub fn new(
+        context: &Arc<Context>,
+        entry: &Arc<dyn Entry>,
+        bytes: u64,
+    ) -> Result<Self, seismic_compiler::errors::ExecutionError> {
+        use seismic_compiler::errors::{ExecutionError, RefusalReading};
+        let failed = |error: DriverError| crate::executor::allocation_error(bytes, || RefusalReading::Host)(error);
+        let whole = bytes
+            .max(1)
+            .checked_next_multiple_of(4096)
+            .ok_or_else(|| ExecutionError::AllocationFailed("CUDA managed block size overflows".into()))?;
+        let whole_usize = usize::try_from(whole).map_err(|_| {
+            ExecutionError::AllocationFailed("CUDA managed block exceeds host address space".into())
+        })?;
+        Backed::take(entry, whole, Wiring::Pageable, |_| {
+            let driver = &context.driver;
+            let managed = {
+                let _current = context.enter().map_err(failed)?;
+                let _changing = context.changing_memory();
+                let mut base = 0u64;
+                unsafe {
+                    driver.check(
+                        (driver.allocate_managed)(&mut base, whole_usize, MEM_ATTACH_GLOBAL),
+                        "managed allocation",
+                    )
+                }
+                .map_err(failed)?;
+                context.driver_allocated(whole);
+                let managed = Managed {
+                    base,
+                    bytes: whole_usize,
+                    context: context.clone(),
+                };
+                if let Some(advise) = driver.memory_advise {
+                    let ordinal = context.ordinal();
+                    for advice in [MEM_ADVISE_SET_PREFERRED_LOCATION, MEM_ADVISE_SET_ACCESSED_BY] {
+                        let code = unsafe { advise(base, whole_usize, advice, ordinal) };
+                        if code != 0 && code != NOT_SUPPORTED {
+                            driver.check(code, "managed memory advise").map_err(failed)?;
+                        }
+                    }
+                }
+                managed
+            };
+            zero(context, managed.base, managed.bytes).map_err(failed)?;
+            Ok::<_, ExecutionError>(managed)
+        })
+        .map(Self)
+    }
+}
+
+impl Managed {
+    pub fn device(&self) -> u64 {
+        self.base
+    }
+
+    pub fn host(&self) -> std::ptr::NonNull<u8> {
+        std::ptr::NonNull::new(self.base as *mut u8).expect("managed address is non-null")
+    }
+
+    pub fn bytes(&self) -> usize {
+        self.bytes
+    }
+}
+
+impl Drop for Managed {
+    fn drop(&mut self) {
+        let Ok(_current) = self.context.enter() else {
+            tracing::warn!("CUDA managed block drop: failed to enter context; skipping teardown");
+            return;
+        };
+        let _changing = self.context.changing_memory();
+        unsafe {
+            if let Err(error) = self.context.driver.check((self.context.driver.free)(self.base), "managed free") {
+                tracing::warn!("CUDA managed block drop: {error}");
+            }
+        }
+        self.context.driver_freed(self.bytes as u64);
+    }
 }
 
 /// The first driver API that places virtual-memory allocations on a host NUMA

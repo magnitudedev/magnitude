@@ -53,7 +53,7 @@
 //! word (`cuStreamWaitValue32`) or writes a signal's
 //! (`cuStreamWriteValue32`).
 
-use super::graph_replays::{Replays, Shaped};
+use super::graph_replays::{ReplayUpdate, Replays, Shaped};
 use super::timeline::{TimelineAction, TimelineKind, TimelineNode, TimelineOperation};
 use super::{graph_segments, DispatchList, EncodeFailure, Encoding, NativeRoute, ReplayKeys};
 use crate::api::CallError;
@@ -178,6 +178,7 @@ pub(super) fn encode_moves(
     address: impl Fn(&Arc<Allocation>, u64) -> u64,
 ) -> Result<Committed, ExecutionError> {
     use super::moves::MoveStep;
+    let _no_host_gated = device.drain_host_gated_flights();
     let mut batch = DirectBatch::unobserved(device, NativeStream::Compute)?;
     follow_fences(&mut batch, after)?;
     for (index, step) in steps.iter().enumerate() {
@@ -442,9 +443,8 @@ fn replay_segment(
         // The graph's launches, in the order its nodes were added, bound to
         // this run's storage and run where encoded, unless they bind what
         // they bound before; then its words, to this run's.
-        |graph, before| {
-            let launches = segment.shaped.bound.len() - 2 * segment.words.len();
-            if before.is_none_or(|before| before.get(..launches) != segment.shaped.bound.get(..launches)) {
+        |graph, update| {
+            if update == ReplayUpdate::Launches {
                 bind_launches(device, graph, list, keys, &segment.calls, encoded)?;
             }
             assert_eq!(segment.words.len(), graph.words(), "a run's timeline nodes are its graph's words");
@@ -567,18 +567,21 @@ fn launch(batch: &mut DirectBatch, list: &impl DispatchList, calls: Range<usize>
 
 /// The graph of the segment `calls` of `list`'s run: keyed by its run's
 /// layout, its place in the run and the launches the layout's graph holds
-/// of each call (`LayoutForms`), bound to every parameter a replay sets
-/// (the run's plan, its launches' functions, geometry and words; the
-/// launches it encodes; the buffers' addresses; the stamps its marks
-/// record), and last, two words each, its word nodes' words and values
+/// of each call (`LayoutForms`), with `launch_bound` holding every launch
+/// parameter a replay sets (the run's plan, its launches' functions, geometry
+/// and words; the launches it encodes; the buffers' addresses; the stamps its
+/// marks record) and `word_bound` holding two words per timeline-word node
 /// (`words`, [`held_operations`]).
 fn shaped(list: &impl DispatchList, keys: &ReplayKeys<'_>, calls: &Range<usize>, encoded: &[Vec<bool>], words: &[(&HostWord, u32)]) -> Shaped {
-    let mut bound = vec![keys.plan(calls)];
-    bound.extend(super::encoded_words(encoded, calls.clone()));
-    bound.extend(addresses(list, calls.clone()));
-    bound.push(keys.stamps(list, calls).first().map_or(0, |stamp| cuda_stamps(stamp).identity()));
-    bound.extend(words.iter().flat_map(|&(word, value)| [word.device_address(), u64::from(value)]));
-    keys.shaped(calls, keys.form(calls).iter().copied(), bound)
+    let mut launch_bound = vec![keys.plan(calls)];
+    launch_bound.extend(super::encoded_words(encoded, calls.clone()));
+    launch_bound.extend(addresses(list, calls.clone()));
+    launch_bound.push(keys.stamps(list, calls).first().map_or(0, |stamp| cuda_stamps(stamp).identity()));
+    let word_bound = words
+        .iter()
+        .flat_map(|&(word, value)| [word.device_address(), u64::from(value)])
+        .collect();
+    keys.shaped(calls, keys.form(calls).iter().copied(), launch_bound, word_bound)
 }
 
 /// Whether a call's word of a layout's graph (`LayoutForms`) holds launch

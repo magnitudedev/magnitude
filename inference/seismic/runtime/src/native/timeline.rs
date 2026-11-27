@@ -218,6 +218,16 @@ impl TimelineHost<Gate> {
     pub fn wait_signalled(&self, value: u64, timeout: Duration) -> Result<bool, ExecutionError> {
         self.inner.wait_gated(value, timeout)
     }
+
+    /// The device address of the gate word on backends whose device kernels
+    /// can write the gate directly (CUDA mapped pinned `HostWord`); `None` on
+    /// backends whose gates are host-only semaphores or events.
+    pub fn device_address(&self) -> Option<u64> {
+        match &self.inner.kind {
+            TimelineKind::Cuda(sides) => Some(sides.gate.device_address()),
+            _ => None,
+        }
+    }
 }
 
 impl TimelineHost<Reached> {
@@ -246,6 +256,16 @@ impl TimelineHost<Reached> {
     /// signal of the timeline is pending, so none raises it at once.
     pub fn reach(&self, value: u64) -> Result<(), ExecutionError> {
         self.inner.reach(value)
+    }
+
+    /// The device address of the reached word on backends whose device kernels
+    /// can address it directly (CUDA mapped pinned `HostWord`); `None` on
+    /// backends whose timelines are semaphores or events.
+    pub fn device_address(&self) -> Option<u64> {
+        match &self.inner.kind {
+            TimelineKind::Cuda(sides) => Some(sides.reached.device_address()),
+            _ => None,
+        }
     }
 }
 

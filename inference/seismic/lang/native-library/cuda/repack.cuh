@@ -510,11 +510,13 @@ __device__ __forceinline__ void zero_bytes(u8 *out, u64 count) {
     for (u64 byte = 0; byte < count; ++byte) out[byte] = 0;
 }
 
-// Entry `e` of row `r` of a group (`value`) at the group's entries.
+// Entry `e` of row `r` of a group (`value`) at the group's entries (16-bit).
 template <class B> __device__ __forceinline__ void place_entry(u8 *entries, u32 r, u32 e, u32 value) {
     static_assert(B::records_entry_bits() == 16, "a word is two u16 entries");
     constexpr u32 ENTRIES = B::records_kblock_entries();
-    *reinterpret_cast<u16 *>(entries + B::record_entry(r, e / ENTRIES, e % ENTRIES)) = u16(value);
+    const u32 offset = B::records_group() == 32 ? B::record_entry(r, e / ENTRIES, e % ENTRIES)
+                                                : B::record16_entry(r, e / ENTRIES, e % ENTRIES);
+    *reinterpret_cast<u16 *>(entries + offset) = u16(value);
 }
 
 // The placement of a tile in each layout (`convert_tile`).
@@ -624,7 +626,7 @@ struct Place {
         typedef Shape<B> S;
         constexpr u64 ENTRY_BYTES = B::records_entry_bytes();
         // The codes role is a group's entries (its units' words), then its factors.
-        constexpr u32 ENTRIES_BYTES = S::GROUP * B::records_code_bits() / 8u;
+        constexpr u32 ENTRIES_BYTES = u32(ENTRY_BYTES / S::MMA_ROWS);
         constexpr u32 FACTOR_BYTES = B::role_bytes(Role::codes) - ENTRIES_BYTES;
         constexpr u32 FACTORS_WORD = B::role_word(Role::codes) + ENTRIES_BYTES / 4u;
         static_assert(B::codes_first() + S::UNITS * S::CODES_WORDS == FACTORS_WORD,
@@ -651,10 +653,34 @@ struct Place {
         tile.unit_record(words);
         if (lane < rows) {
             u8 *entries = mma + tile.packet * ENTRY_BYTES;
-            for (u32 word = 0; word < S::UNIT_WORDS; ++word) {
-                const u32 e = 2 * (tile.unit * S::UNIT_WORDS + word);
-                place_entry<B>(entries, r, e, words[word]);
-                place_entry<B>(entries, r, e + 1, words[word] >> B::records_entry_bits());
+            if constexpr (B::records_entry_bits() == 16) {
+                for (u32 word = 0; word < S::UNIT_WORDS; ++word) {
+                    const u32 e = 2 * (tile.unit * S::UNIT_WORDS + word);
+                    place_entry<B>(entries, r, e, words[word]);
+                    place_entry<B>(entries, r, e + 1, words[word] >> 16);
+                }
+            } else {
+                static_assert(B::records_entry_bits() == 12 && B::records_group() == 16 && S::UNIT_WORDS == 3 &&
+                                  S::TILE_COLUMNS == 64,
+                              "12-bit records pack one 8-entry k-block (3 words) per unit");
+                const u32 e0 = words[0] & 0xFFFu;
+                const u32 e1 = (words[0] >> 12) & 0xFFFu;
+                const u32 e2 = ((words[0] >> 24) | (words[1] << 8)) & 0xFFFu;
+                const u32 e3 = (words[1] >> 4) & 0xFFFu;
+                const u32 e4 = (words[1] >> 16) & 0xFFFu;
+                const u32 e5 = ((words[1] >> 28) | (words[2] << 4)) & 0xFFFu;
+                const u32 e6 = (words[2] >> 8) & 0xFFFu;
+                const u32 e7 = (words[2] >> 20) & 0xFFFu;
+                const u32 lo0 = (e0 & 0xFFu) | ((e2 & 0xFFu) << 8) | ((e4 & 0xFFu) << 16) | ((e6 & 0xFFu) << 24);
+                const u32 lo1 = (e1 & 0xFFu) | ((e3 & 0xFFu) << 8) | ((e5 & 0xFFu) << 16) | ((e7 & 0xFFu) << 24);
+                const u32 hi0 = ((e0 >> 8) & 0xFu) | (((e2 >> 8) & 0xFu) << 4) | (((e4 >> 8) & 0xFu) << 8) |
+                                (((e6 >> 8) & 0xFu) << 12);
+                const u32 hi1 = ((e1 >> 8) & 0xFu) | (((e3 >> 8) & 0xFu) << 4) | (((e5 >> 8) & 0xFu) << 8) |
+                                (((e7 >> 8) & 0xFu) << 12);
+                *reinterpret_cast<u32 *>(entries + B::record16_low(r, tile.unit, 0)) = lo0;
+                *reinterpret_cast<u32 *>(entries + B::record16_low(r, tile.unit, 1)) = lo1;
+                *reinterpret_cast<u16 *>(entries + B::record16_high(r, tile.unit, 0)) = u16(hi0);
+                *reinterpret_cast<u16 *>(entries + B::record16_high(r, tile.unit, 1)) = u16(hi1);
             }
         }
         if (tile.unit == 0) {
@@ -678,15 +704,23 @@ struct Place {
 
     // ---- rows16 / mma16 planes ---------------------------------------------
 
-    // Destination of byte `position` of an mma16 tile's code-plane sequence V:
-    // the tile's rows' plane payloads (`row_bytes` each) concatenated in row
-    // order.
-    template <class O, class W = seismic_words_t>
+    // Destination of byte `position` of an mma16 tile's contiguous plane at
+    // row offset `offset`: `tile_base + offset * 16 + position`.
+    template <class B, class O, class W = seismic_words_t>
     __device__ static __forceinline__ u8 *tile_plane_byte(u8 *destination, const W &seismic_words_value,
-                                                          u64 b, u64 tile_row0, u64 position, u64 row_bytes,
-                                                          u64 offset) {
-        return O::row(destination, seismic_words_value, b, tile_row0 + position / row_bytes) + offset +
-               position % row_bytes;
+                                                          u64 b, u64 tile_row0, u64 position, u64 offset) {
+        return O::row(destination, seismic_words_value, b, tile_row0) + offset * Shape<B>::MMA_ROWS + position;
+    }
+
+    // Zero the alignment tail of `role`'s contiguous plane in an mma16 tile,
+    // across `LANES` lanes.
+    template <class B, u32 LANES, class W = seismic_words_t>
+    __device__ static __forceinline__ void zero_tile_tail(u8 *mma, Role role, u32 lane,
+                                                          const W &seismic_words_value) {
+        const u64 tail = B::row_plane_tail(role, seismic_words_value) * Shape<B>::MMA_ROWS;
+        u8 *at = mma + (B::row_plane(role, seismic_words_value) + B::row_plane_bytes(role, seismic_words_value)) *
+                           Shape<B>::MMA_ROWS;
+        for (u64 byte = lane; byte < tail; byte += LANES) at[byte] = 0;
     }
 
     // A code role, `bits` a column (a constant), whose words of the warp's rows
@@ -698,7 +732,7 @@ struct Place {
     template <class B, class A, class O, u32 LANES, class W>
     __device__ static __forceinline__ void place_fragments(const Tile<B, A, LANES, W> &tile, u8 *destination, u64 rows,
                                                            u32 column0, const u32 *staged, u32 bits, u32 at, u64 offset,
-                                                           u64 row_bytes, u32 unit) {
+                                                           u32 unit) {
         typedef Shape<B> S;
         if (bits == 0) return;
         const u32 lane = tile.lane;
@@ -716,8 +750,8 @@ struct Place {
                     const u32 bit = (B::step_slots() * half_step + slot) * bits;
                     value[bit / 32] |= code << (bit % 32);
                 }
-            store(tile_plane_byte<O>(destination, tile.seismic_words_value, tile.b, tile.row0 + tile_row,
-                                     B::fragment_byte(block, lane, bits, step0), row_bytes, offset),
+            store(tile_plane_byte<B, O>(destination, tile.seismic_words_value, tile.b, tile.row0 + tile_row,
+                                        B::fragment_byte(block, lane, bits, step0), offset),
                   value, 2 * bits, unit);
         }
     }
@@ -757,11 +791,10 @@ struct Place {
                 const u32 r = lane % S::MMA_ROWS;
                 const u32 block = column0 / B::kblock_columns();
                 const u32 step0 = (column0 % B::kblock_columns()) / B::step_columns();
-                store(tile_plane_byte<O>(destination, seismic_words_value, b, row0 + lane - r,
-                                         (u64(block) * S::MMA_ROWS + r) * B::kblock_bytes() +
-                                             step0 / 2 * 4 * S::CODES_WORDS,
-                                         B::row_plane_bytes(Role::codes, seismic_words_value),
-                                         B::row_plane(Role::codes, seismic_words_value)),
+                store(tile_plane_byte<B, O>(destination, seismic_words_value, b, row0 + lane - r,
+                                            (u64(block) * S::MMA_ROWS + r) * B::kblock_bytes() +
+                                                step0 / 2 * 4 * S::CODES_WORDS,
+                                            B::row_plane(Role::codes, seismic_words_value)),
                       words, 4 * S::CODES_WORDS, B::role_alignment(Role::codes));
             }
         } else if constexpr (B::mma16() && B::grids()) {
@@ -778,20 +811,18 @@ struct Place {
     #pragma unroll
                 for (u32 span = 0; span < SPANS; ++span) {
                     const u64 block = column0 / B::kblock_columns() + span;
-                    store(tile_plane_byte<O>(destination, seismic_words_value, b, row0 + lane - r,
-                                             (block * S::MMA_ROWS + r) * KBLOCK,
-                                             B::row_plane_bytes(Role::codes, seismic_words_value),
-                                             B::row_plane(Role::codes, seismic_words_value)),
+                    store(tile_plane_byte<B, O>(destination, seismic_words_value, b, row0 + lane - r,
+                                                (block * S::MMA_ROWS + r) * KBLOCK,
+                                                B::row_plane(Role::codes, seismic_words_value)),
                           words + span * KBLOCK / 4, KBLOCK, B::kblock_alignment());
                     if constexpr (B::grid_high_bits() > 0) {
                         constexpr u32 HIGH = B::grid_high_bits(); // bytes a row's k-block
                         static_assert(4 * S::HIGH_WORDS == SPANS * HIGH && (HIGH == 2 || HIGH == 4),
                                       "a k-block's high bits");
                         const u32 high = words[S::CODES_WORDS + span * HIGH / 4] >> (8 * (span * HIGH % 4));
-                        store(tile_plane_byte<O>(destination, seismic_words_value, b, row0 + lane - r,
-                                                 (block * S::MMA_ROWS + r) * HIGH,
-                                                 B::row_plane_bytes(Role::high, seismic_words_value),
-                                                 B::row_plane(Role::high, seismic_words_value)),
+                        store(tile_plane_byte<B, O>(destination, seismic_words_value, b, row0 + lane - r,
+                                                    (block * S::MMA_ROWS + r) * HIGH,
+                                                    B::row_plane(Role::high, seismic_words_value)),
                               &high, HIGH, HIGH);
                     }
                 }
@@ -802,11 +833,9 @@ struct Place {
                 for (u32 word = 0; word < S::UNIT_WORDS; ++word) staged[lane * S::UNIT_WORDS + word] = words[word];
             __syncwarp(mask);
             place_fragments<B, A, O, LANES>(tile, destination, rows, column0, staged, S::CODES_WORDS, 0,
-                            B::row_plane(Role::codes, seismic_words_value),
-                            B::row_plane_bytes(Role::codes, seismic_words_value), B::fragment_alignment(Role::codes));
+                            B::row_plane(Role::codes, seismic_words_value), B::fragment_alignment(Role::codes));
             place_fragments<B, A, O, LANES>(tile, destination, rows, column0, staged, S::HIGH_WORDS, S::CODES_WORDS,
-                            B::row_plane(Role::high, seismic_words_value),
-                            B::row_plane_bytes(Role::high, seismic_words_value), B::fragment_alignment(Role::high));
+                            B::row_plane(Role::high, seismic_words_value), B::fragment_alignment(Role::high));
         } else {
             // The tile's columns of a row are one unit of each code plane (rows16).
             if (lane < rows) {
@@ -819,25 +848,52 @@ struct Place {
             }
         }
 
-        // Group planes, at the group's first tile: a row's groups are
-        // contiguous.
+        // Coefficient planes, at the group's first tile: mma16 packs scales and
+        // supers into one tile-contiguous TileFactors plane in
+        // `[sb][record_factor(r)][scales || supers]` order; rows16 keeps each
+        // row's groups contiguous.
         if (tile.unit == 0) {
             tile.fixed_record(loaded, words);
             if (lane < rows) {
-                store(row + B::row_plane(Role::scales, seismic_words_value) + tile.packet * B::role_bytes(Role::scales),
-                      words + B::role_word(Role::scales), B::role_bytes(Role::scales), B::role_alignment(Role::scales));
-                store(row + B::row_plane(Role::supers, seismic_words_value) + tile.packet * B::role_bytes(Role::supers),
-                      words + B::role_word(Role::supers), B::role_bytes(Role::supers), B::role_alignment(Role::supers));
+                if constexpr (B::mma16()) {
+                    constexpr u32 PACKETS_PER_SB = 256u / S::GROUP;
+                    constexpr u32 GROUP_BYTES = B::role_bytes(Role::supers);
+                    const u64 row_groups = B::out_row_groups(seismic_words_value);
+                    const u64 sb = tile.packet / PACKETS_PER_SB;
+                    const u64 within_sb = tile.packet % PACKETS_PER_SB;
+                    const u64 rem = row_groups - sb * PACKETS_PER_SB;
+                    const u64 sb_packets = rem < PACKETS_PER_SB ? rem : PACKETS_PER_SB;
+                    const u32 r = lane % S::MMA_ROWS;
+                    u8 *mma = O::row(destination, seismic_words_value, b, row0 + lane - r);
+                    u8 *dst = mma + B::row_plane(Role::supers, seismic_words_value) * S::MMA_ROWS +
+                              sb * PACKETS_PER_SB * GROUP_BYTES * S::MMA_ROWS +
+                              B::record_factor(r) * (sb_packets * GROUP_BYTES) + within_sb * GROUP_BYTES;
+                    store(dst, words + B::role_word(Role::supers), GROUP_BYTES, B::role_alignment(Role::supers));
+                } else {
+                    store(row + B::row_plane(Role::scales, seismic_words_value) + tile.packet * B::role_bytes(Role::scales),
+                          words + B::role_word(Role::scales), B::role_bytes(Role::scales), B::role_alignment(Role::scales));
+                    store(row + B::row_plane(Role::supers, seismic_words_value) + tile.packet * B::role_bytes(Role::supers),
+                          words + B::role_word(Role::supers), B::role_bytes(Role::supers), B::role_alignment(Role::supers));
+                }
             }
         }
 
         // Alignment tails of every plane, from its end to the next plane's start
         // (or the row's end), at the row's last stored tile.
-        if (column0 + S::TILE_COLUMNS == stored_columns && lane < rows) {
-            zero_tail<B>(row, Role::codes, seismic_words_value);
-            zero_tail<B>(row, Role::high, seismic_words_value);
-            zero_tail<B>(row, Role::scales, seismic_words_value);
-            zero_tail<B>(row, Role::supers, seismic_words_value);
+        if (column0 + S::TILE_COLUMNS == stored_columns) {
+            if constexpr (B::mma16()) {
+                for (u64 tile_row = 0; tile_row < rows; tile_row += S::MMA_ROWS) {
+                    u8 *mma = O::row(destination, seismic_words_value, b, row0 + tile_row);
+                    zero_tile_tail<B, LANES>(mma, Role::codes, lane, seismic_words_value);
+                    zero_tile_tail<B, LANES>(mma, Role::high, lane, seismic_words_value);
+                    zero_tile_tail<B, LANES>(mma, Role::supers, lane, seismic_words_value);
+                }
+            } else if (lane < rows) {
+                zero_tail<B>(row, Role::codes, seismic_words_value);
+                zero_tail<B>(row, Role::high, seismic_words_value);
+                zero_tail<B>(row, Role::scales, seismic_words_value);
+                zero_tail<B>(row, Role::supers, seismic_words_value);
+            }
         }
     }
 };
@@ -959,9 +1015,9 @@ __device__ __forceinline__ void convert_tile(const A &source, u8 *destination,
             return ELEMENT_WHEN(D, _PLANE_RECORDS,                                           \
                                (repack::u64)ELEMENT_CAT(D, _PLANE_RECORDS_ENTRY_BYTES), 0ull); \
         }                                                                                                   \
-        __host__ __device__ static constexpr repack::u32 records_code_bits() {                              \
+        __host__ __device__ static constexpr repack::u32 records_group() {                                  \
             return ELEMENT_WHEN(D, _PLANE_RECORDS,                                           \
-                               (repack::u32)ELEMENT_CAT(D, _PLANE_RECORDS_CODE_BITS), 0u);  \
+                               (repack::u32)ELEMENT_CAT(D, _COEFF_GROUP), 0u);  \
         }                                                                                                   \
         __host__ __device__ static constexpr repack::u32 records_entry_bits() {                             \
             return ELEMENT_WHEN(D, _PLANE_RECORDS,                                           \
@@ -995,6 +1051,18 @@ __device__ __forceinline__ void convert_tile(const A &source, u8 *destination,
         __device__ static __forceinline__ repack::u32 record_entry(repack::u32 r, repack::u32 block,        \
                                                                    repack::u32 entry) {                     \
             return ELEMENT_WHEN(D, _LAYOUT_MMA16, ELEMENT_CAT(D, _RECORD_ENTRY)(r, block, entry), 0u);       \
+        }                                                                                                   \
+        __device__ static __forceinline__ repack::u32 record16_entry(repack::u32 r, repack::u32 block,      \
+                                                                     repack::u32 entry) {                   \
+            return ELEMENT_WHEN(D, _LAYOUT_MMA16, ELEMENT_CAT(D, _RECORD16_ENTRY)(r, block, entry), 0u);     \
+        }                                                                                                   \
+        __device__ static __forceinline__ repack::u32 record16_low(repack::u32 r, repack::u32 block,        \
+                                                                   repack::u32 entry) {                     \
+            return ELEMENT_WHEN(D, _LAYOUT_MMA16, ELEMENT_CAT(D, _RECORD16_LOW)(r, block, entry), 0u);       \
+        }                                                                                                   \
+        __device__ static __forceinline__ repack::u32 record16_high(repack::u32 r, repack::u32 block,       \
+                                                                    repack::u32 entry) {                    \
+            return ELEMENT_WHEN(D, _LAYOUT_MMA16, ELEMENT_CAT(D, _RECORD16_HIGH)(r, block, entry), 0u);      \
         }                                                                                                   \
         __device__ static __forceinline__ repack::u32 record_factor(repack::u32 r) {                        \
             return ELEMENT_WHEN(D, _LAYOUT_MMA16, ELEMENT_CAT(D, _RECORD_FACTOR)(r), 0u);                    \

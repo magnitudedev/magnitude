@@ -106,7 +106,7 @@ fn form(backend: BackendName, ledger: &Path, catalog: &Path) -> anyhow::Result<b
                 "entries searched",
                 &progress,
                 &forming,
-                || seismic::coverage::cover(module, &toolchain, &forming, &progress),
+                || seismic::coverage::cover(&module, &toolchain, &forming, &progress),
             )
             .map_err(|error| anyhow::anyhow!("{name} coverage did not run: {error}"))?;
             println!("{name}: {coverage}");
@@ -135,7 +135,7 @@ fn form(backend: BackendName, ledger: &Path, catalog: &Path) -> anyhow::Result<b
         "requests formed",
         &progress,
         &forming,
-        || seismic::coverage::form_requests(module, &toolchain, &forming, &requests, &progress),
+        || seismic::coverage::form_requests(&module, &toolchain, &forming, &requests, &progress),
     );
     let mut failures = 0;
     for (request, result) in catalog.requests.iter().zip(results) {

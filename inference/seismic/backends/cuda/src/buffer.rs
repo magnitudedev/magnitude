@@ -4,7 +4,7 @@
 //! pages.
 
 use crate::blocks::{DeviceBlock, Range};
-use crate::driver::{DriverError, HostMapped, HostNodeBlock};
+use crate::driver::{DriverError, HostMapped, HostNodeBlock, ManagedBlock};
 use crate::registered::RegisteredBlock;
 use std::sync::Arc;
 
@@ -20,6 +20,9 @@ enum Memory {
     Mapped(HostMapped),
     /// A block of device memory of its own (`Device::allocate_block`).
     Block(DeviceBlock),
+    /// A block of concurrent-access managed memory for a unified-memory
+    /// device (`Device::allocate_block`).
+    Managed(ManagedBlock),
     /// A block of host-NUMA memory created by the driver for a unified-memory
     /// device (`Device::allocate_block`).
     HostNode(HostNodeBlock),
@@ -38,6 +41,9 @@ impl Buffer {
     pub(crate) fn block(block: DeviceBlock) -> Self {
         Self { memory: Arc::new(Memory::Block(block)) }
     }
+    pub(crate) fn managed(block: ManagedBlock) -> Self {
+        Self { memory: Arc::new(Memory::Managed(block)) }
+    }
     pub(crate) fn host_node(block: HostNodeBlock) -> Self {
         Self { memory: Arc::new(Memory::HostNode(block)) }
     }
@@ -49,16 +55,18 @@ impl Buffer {
             Memory::Device(range) => range.bytes(),
             Memory::Mapped(mapped) => mapped.bytes as u64,
             Memory::Block(block) => block.bytes(),
+            Memory::Managed(block) => block.bytes() as u64,
             Memory::HostNode(block) => block.bytes() as u64,
             Memory::Registered(block) => block.bytes() as u64,
         }
     }
-    /// The host address of host memory's first byte (mapped, host-node or
-    /// registered memory); device memory has none (the host reaches it by
-    /// driver copies).
+    /// The host address of host memory's first byte (mapped, managed,
+    /// host-node or registered memory); device memory has none (the host
+    /// reaches it by driver copies).
     pub(crate) fn host_address(&self) -> Option<std::ptr::NonNull<u8>> {
         match &*self.memory {
             Memory::Mapped(mapped) => std::ptr::NonNull::new(mapped.host()),
+            Memory::Managed(block) => Some(block.host()),
             Memory::HostNode(block) => Some(block.host()),
             Memory::Registered(block) => Some(block.host()),
             Memory::Device(_) | Memory::Block(_) => None,
@@ -70,6 +78,7 @@ impl Buffer {
             Memory::Device(range) => range.pointer(),
             Memory::Mapped(mapped) => mapped.device,
             Memory::Block(block) => block.pointer(),
+            Memory::Managed(block) => block.device(),
             Memory::HostNode(block) => block.device(),
             Memory::Registered(block) => block.device(),
         }
@@ -83,6 +92,12 @@ impl Buffer {
             Memory::Block(block) => block.upload_at(offset, bytes),
             Memory::Mapped(mapped) => {
                 mapped.write_at(offset, bytes);
+                Ok(())
+            }
+            Memory::Managed(block) => {
+                assert_within(offset, bytes.len(), block.bytes(), "upload_at");
+                // SAFETY: within the block, which the host maps.
+                unsafe { std::ptr::copy_nonoverlapping(bytes.as_ptr(), block.host().as_ptr().add(offset), bytes.len()) };
                 Ok(())
             }
             Memory::HostNode(block) => {
@@ -105,6 +120,12 @@ impl Buffer {
             Memory::Block(block) => block.download_at(offset, bytes),
             Memory::Mapped(mapped) => {
                 mapped.read_at(offset, bytes);
+                Ok(())
+            }
+            Memory::Managed(block) => {
+                assert_within(offset, bytes.len(), block.bytes(), "download_at");
+                // SAFETY: within the block, which the host maps.
+                unsafe { std::ptr::copy_nonoverlapping(block.host().as_ptr().add(offset), bytes.as_mut_ptr(), bytes.len()) };
                 Ok(())
             }
             Memory::HostNode(block) => {

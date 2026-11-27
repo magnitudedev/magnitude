@@ -302,7 +302,7 @@ pub(super) fn encode(
             .map(|(calls, _)| {
                 let (bound, grids) = bindings(list, calls.clone(), &encoded);
                 let placement = hazard::relative_placement_with(&mut scratch, list, calls.clone());
-                (calls.clone(), keys.shaped(calls, grids.into_iter().chain(placement), bound))
+                (calls.clone(), keys.shaped(calls, grids.into_iter().chain(placement), bound, Vec::new()))
             })
             .unzip()
     };
@@ -1331,12 +1331,16 @@ pub(super) fn encode_fill_copies(
         .iter()
         .map(|wait| (wait.semaphore, wait.value))
         .collect();
+    let wait_owners: Vec<Arc<dyn std::any::Any + Send + Sync>> = device_waits
+        .into_iter()
+        .filter_map(|wait| wait.owner)
+        .collect();
     // Caller holds `device.native.order`, serializing value assignment and
     // submission on `fill_queue` so timeline values are strictly increasing.
     let value = fill_queue.next.load(std::sync::atomic::Ordering::Relaxed);
     fill_queue
         .queue
-        .copy_after(&items, value, &raw_waits)
+        .copy_after(&items, value, &raw_waits, wait_owners)
         .map_err(|error| EncodeFailure::uncommitted(CallError::Execution(error)))?;
     fill_queue
         .next

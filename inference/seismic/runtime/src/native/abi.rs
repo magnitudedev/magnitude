@@ -1552,6 +1552,9 @@ fn render_representation(
                     ("MMA_FRAGMENT_COLUMN", Rows::MMA_FRAGMENT_COLUMN_RULE),
                     ("MMA_FRAGMENT_BYTE", Rows::MMA_FRAGMENT_BYTE_RULE),
                     ("RECORD_ENTRY", Rows::RECORD_ENTRY_RULE),
+                    ("RECORD16_ENTRY", Rows::RECORD16_ENTRY_RULE),
+                    ("RECORD16_LOW", Rows::RECORD16_LOW_RULE),
+                    ("RECORD16_HIGH", Rows::RECORD16_HIGH_RULE),
                     ("RECORD_FACTOR", Rows::RECORD_FACTOR_RULE),
                 ] {
                     // A long rule's text may hold line breaks; a macro's can't.
@@ -1568,20 +1571,23 @@ fn render_representation(
                     registry::RowPlaneContent::Codes { bits, .. } => {
                         out.push_str(&format!("#define {plane_prefix}_CODE_BITS {bits}\n"))
                     }
-                    registry::RowPlaneContent::Grids { bits, .. }
-                    | registry::RowPlaneContent::Records { bits, .. } => {
+                    registry::RowPlaneContent::Grids { bits, .. } => {
                         out.push_str(&format!("#define {plane_prefix}_CODE_BITS {bits}\n"));
-                        // A records tile's factors follow every group's
-                        // entries (`PackedRowLayout::record_byte`).
-                        if matches!(plane.content, registry::RowPlaneContent::Records { .. }) {
+                        if let Some((_, carried)) = rows.carried() {
                             out.push_str(&format!(
-                                "#define {plane_prefix}_ENTRY_BYTES {}\n#define {plane_prefix}_FACTORS_OFFSET ({prefix}_ROW_GROUPS * {})\n#define {plane_prefix}_ENTRY_BITS {}\n#define {plane_prefix}_KBLOCK_ENTRIES {}\n",
-                                rows.record_entry_bytes(),
-                                rows.record_entry_bytes(),
-                                registry::GRID_VALUES * bits,
-                                registry::MMA_KBLOCK / u64::from(registry::GRID_VALUES),
+                                "#define {plane_prefix}_CARRIED_BIT {carried}\n"
                             ));
                         }
+                    }
+                    registry::RowPlaneContent::Records { entry_bits, .. } => {
+                        // A records tile's factors follow every group's
+                        // entries (`PackedRowLayout::record_byte`).
+                        out.push_str(&format!(
+                            "#define {plane_prefix}_ENTRY_BYTES {}\n#define {plane_prefix}_FACTORS_OFFSET ({prefix}_ROW_GROUPS * {})\n#define {plane_prefix}_ENTRY_BITS {entry_bits}\n#define {plane_prefix}_KBLOCK_ENTRIES {}\n",
+                            rows.record_entry_bytes(),
+                            rows.record_entry_bytes(),
+                            registry::MMA_KBLOCK / u64::from(registry::GRID_VALUES),
+                        ));
                         // The entry bit carrying the coefficient codes.
                         if let Some((_, carried)) = rows.carried() {
                             out.push_str(&format!(
@@ -1594,7 +1600,8 @@ fn render_representation(
                     registry::RowPlaneContent::GridHigh { bits, .. } => {
                         out.push_str(&format!("#define {plane_prefix}_ENTRY_BITS {bits}\n"))
                     }
-                    registry::RowPlaneContent::Groups { .. } => {}
+                    registry::RowPlaneContent::Groups { .. }
+                    | registry::RowPlaneContent::TileFactors { .. } => {}
                 }
             }
         }

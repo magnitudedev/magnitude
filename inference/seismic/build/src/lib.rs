@@ -1833,9 +1833,9 @@ mod internals {
             "static __BUNDLE: &[u8] = include_bytes!({:?});\n",
             format!("{name}.seismicbundle")
         ));
-        out.push_str("static __MODULE: seismic::generated::OnceLock<Result<seismic::generated::Module, seismic::CheckedBundleError>> = seismic::generated::OnceLock::new();\n");
+        out.push_str("static __MODULE: seismic::generated::ModuleSlot = seismic::generated::ModuleSlot::new();\n");
         out.push_str("/// The checked module, an opaque token for Seismic's module-wide services.\n");
-        out.push_str("pub fn module() -> Result<&'static seismic::generated::Module, seismic::CheckedBundleError> { seismic::generated::module_from_bundle(&__MODULE, __BUNDLE) }\n");
+        out.push_str("pub fn module() -> Result<std::sync::Arc<seismic::generated::Module>, seismic::CheckedBundleError> { seismic::generated::module_from_bundle(&__MODULE, __BUNDLE) }\n");
         out.push_str("/// The embedded checked bundle bytes.\n");
         out.push_str("pub fn bundle_bytes() -> &'static [u8] { __BUNDLE }\n");
         out.push_str("/// Hex digest of sources plus compiler semantic version.\n");
@@ -1938,11 +1938,11 @@ mod internals {
             "static __BUNDLE: &[u8] = include_bytes!({:?});\n",
             format!("{name}.seismicbundle")
         ));
-        out.push_str("static __MODULE: seismic::generated::OnceLock<Result<seismic::generated::Module, seismic::CheckedBundleError>> = seismic::generated::OnceLock::new();\n");
+        out.push_str("static __MODULE: seismic::generated::ModuleSlot = seismic::generated::ModuleSlot::new();\n");
         out.push_str(
             "/// The checked module, an opaque token for Seismic's module-wide services.\n",
         );
-        out.push_str("pub fn module() -> Result<&'static seismic::generated::Module, seismic::CheckedBundleError> { seismic::generated::module_from_bundle(&__MODULE, __BUNDLE) }\n");
+        out.push_str("pub fn module() -> Result<std::sync::Arc<seismic::generated::Module>, seismic::CheckedBundleError> { seismic::generated::module_from_bundle(&__MODULE, __BUNDLE) }\n");
         out.push_str("/// The embedded checked bundle bytes.\n");
         out.push_str("pub fn bundle_bytes() -> &'static [u8] { __BUNDLE }\n");
         out.push_str(&format!("pub const IDENTITY: &str = {:?};\n", identity));
@@ -2101,7 +2101,7 @@ mod internals {
             "    const NATIVE_SCALAR_RESULT_BYTES: u64 = {};\n",
             scalar_words * ResultClass::WORD_BYTES
         ));
-        out.push_str("    fn module() -> Result<&'static seismic::generated::Module, seismic::CheckedBundleError> { super::module() }\n");
+        out.push_str("    fn module() -> Result<std::sync::Arc<seismic::generated::Module>, seismic::CheckedBundleError> { super::module() }\n");
         out.push_str(&format!(
             "    fn resolve(module: &seismic::generated::Module) -> Result<seismic::generated::EntryToken, seismic::CheckedBundleError> {{ module.entry_named({:?}).ok_or(seismic::CheckedBundleError::Corrupt) }}\n",
             entry.name

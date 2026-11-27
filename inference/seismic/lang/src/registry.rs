@@ -1363,15 +1363,23 @@ pub enum RowPlaneContent {
     /// The bytes of the listed packet planes of one packet, concatenated in
     /// list order, per storage group: the local or the super coefficients.
     Groups { level: CoefficientLevel, planes: Vec<u32> },
-    /// `mma16` of a carried grid representation: the tile's whole storage
-    /// groups as records of its 16 rows (`record_byte`), every group's
-    /// carried entries in GEMV lane order, then every group's `factors`
+    /// `mma16` tile-packed coefficient factors: a single plane per 16-row tile
+    /// holding `scales` (if any) followed by `supers`, laid out contiguously by
+    /// 256-column superblock in `[sb][record_factor(r)][scales || supers]`
+    /// order so every GEMV warp loads all 16 rows' factors coalesced.
+    TileFactors { scales: Vec<u32>, supers: Vec<u32> },
+    /// `mma16` of a grid representation packed as superblock records: the
+    /// tile's whole storage groups as records of its 16 rows (`record_byte`),
+    /// every group's entries in GEMV lane order, then every group's `factors`
     /// packet planes. The only plane of its layout. `grid` is the entries'
-    /// grid.
+    /// grid; `carried` is the packet plane carried in the entries when the
+    /// representation carries its local codes (`iq2xxs`), or `None` when
+    /// `factors` holds both `scales` and `supers` (`iq1m`, `iq2xs`).
     Records {
-        bits: u32,
         grid: &'static GridCodes,
-        carried: u32,
+        carried: Option<u32>,
+        group: u32,
+        entry_bits: u32,
         factors: Vec<u32>,
     },
 }
@@ -1457,7 +1465,8 @@ impl RowPlaneInfo {
             | RowPlaneContent::Records { .. } => RowPlaneRole::Codes,
             RowPlaneContent::Codes { .. } | RowPlaneContent::GridHigh { .. } => RowPlaneRole::High,
             RowPlaneContent::Groups { level: CoefficientLevel::Local, .. } => RowPlaneRole::Scales,
-            RowPlaneContent::Groups { level: CoefficientLevel::Super, .. } => RowPlaneRole::Supers,
+            RowPlaneContent::Groups { level: CoefficientLevel::Super, .. }
+            | RowPlaneContent::TileFactors { .. } => RowPlaneRole::Supers,
         }
     }
 }
@@ -1475,7 +1484,9 @@ impl PackedRowLayout {
                 RowPlaneContent::Codes { .. } | RowPlaneContent::Grids { .. } | RowPlaneContent::GridHigh { .. } => {
                     part == RowPart::Codes
                 }
-                RowPlaneContent::Groups { .. } => part == RowPart::Coefficients,
+                RowPlaneContent::Groups { .. } | RowPlaneContent::TileFactors { .. } => {
+                    part == RowPart::Coefficients
+                }
             })
             .map(|plane| {
                 let bytes = (u64::from(plane.bytes_per_group) * values).div_ceil(group);
@@ -1622,15 +1633,32 @@ impl PackedRowLayout {
             RowPlaneContent::Codes { bits, .. } => (bits, false, 1),
             RowPlaneContent::Grids { bits, .. } => (bits, true, 1),
             RowPlaneContent::GridHigh { bits, .. } => (bits, true, u64::from(GRID_VALUES)),
-            RowPlaneContent::Records { bits, .. } => {
+            RowPlaneContent::Records {
+                group, entry_bits, ..
+            } => {
                 let entry = column % u64::from(self.packet.group) / u64::from(GRID_VALUES);
                 let packet = column / u64::from(self.packet.group);
+                let (block, within_block) = (entry / 8, entry % 8);
+                if entry_bits == 16 {
+                    let byte = self.record_byte(geometry, row, packet, Record::Entries, |r| {
+                        if group == 32 {
+                            Self::record_entry(r, block, within_block)
+                        } else {
+                            Self::record16_entry(r, block, within_block)
+                        }
+                    });
+                    return byte * 8 + column % u64::from(GRID_VALUES) * 2;
+                }
+                assert!(
+                    entry_bits == 12 && group == 16 && column.is_multiple_of(u64::from(GRID_VALUES)),
+                    "12-bit records entries are addressed by whole entry"
+                );
                 let byte = self.record_byte(geometry, row, packet, Record::Entries, |r| {
-                    Self::record_entry(r, entry / 8, entry % 8)
+                    Self::record16_low(r, block, within_block)
                 });
-                return byte * 8 + column % u64::from(GRID_VALUES) * u64::from(bits);
+                return byte * 8;
             }
-            RowPlaneContent::Groups { .. } => {
+            RowPlaneContent::Groups { .. } | RowPlaneContent::TileFactors { .. } => {
                 panic!(
                     "row plane `{}` holds no column's codes",
                     self.planes[plane].name
@@ -1667,7 +1695,6 @@ impl PackedRowLayout {
                 bits,
             ),
             Layout::Mma16 => {
-                let row_bytes = geometry.bytes_per_row[plane];
                 let (tile, r) = (row / MMA_TILE_ROWS, row % MMA_TILE_ROWS);
                 let (block, c) = (column / MMA_KBLOCK, column % MMA_KBLOCK);
                 let bit = if grids {
@@ -1678,9 +1705,7 @@ impl PackedRowLayout {
                     let slot = (k / 8) * 2 + r / 8 + 4 * (k % 2);
                     Self::mma_fragment_byte(block, lane, bits, step) * 8 + bits * slot
                 };
-                let (byte, within) = (bit / 8, bit % 8);
-                let stored = tile * MMA_TILE_ROWS + byte / row_bytes;
-                (stored * stride + offset + byte % row_bytes) * 8 + within
+                (tile * MMA_TILE_ROWS * stride + offset * MMA_TILE_ROWS) * 8 + bit
             }
             Layout::Packet => unreachable!("a row layout is never `packet`"),
         }
@@ -1736,6 +1761,20 @@ impl PackedRowLayout {
                     + row % tile * geometry.bytes_per_row[plane]
                     + packet * group_bytes
             }
+            Layout::Mma16 if matches!(self.planes[plane].content, RowPlaneContent::TileFactors { .. }) => {
+                let group = u64::from(self.packet.group);
+                let packets_per_sb = 256 / group;
+                let row_groups = geometry.bytes_per_row[plane] / group_bytes;
+                let (sb, within_sb) = (packet / packets_per_sb, packet % packets_per_sb);
+                let sb_packets = packets_per_sb.min(row_groups - sb * packets_per_sb);
+                let sb_row_bytes = sb_packets * group_bytes;
+                let (tile_idx, r) = (row / MMA_TILE_ROWS, row % MMA_TILE_ROWS);
+                tile_idx * MMA_TILE_ROWS * stride
+                    + offset * MMA_TILE_ROWS
+                    + sb * packets_per_sb * group_bytes * MMA_TILE_ROWS
+                    + Self::record_factor(r) * sb_row_bytes
+                    + within_sb * group_bytes
+            }
             Layout::Mma16 if groups => row * stride + offset + packet * group_bytes,
             Layout::Rows32 | Layout::Mma16 => return None,
             Layout::Packet => unreachable!("a row layout is never `packet`"),
@@ -1752,11 +1791,41 @@ impl PackedRowLayout {
     placement_rule! {
         /// The byte of entry `entry` (of eight) of k-block `block` (of four) of
         /// row `r` of its tile within a storage group's entries of a `records`
-        /// tile (`record_byte`'s GEMV lane order): half `block / 2`, lane
-        /// `4 (r % 8) + entry % 4`, word `2 (block % 2) + r / 8`, its low or
-        /// high half by `entry / 4`.
+        /// tile (`record_byte`'s GEMV lane order, group 32, 16-bit entries):
+        /// half `block / 2`, lane `4 (r % 8) + entry % 4`, word
+        /// `2 (block % 2) + r / 8`, its low or high half by `entry / 4`.
         record_entry, RECORD_ENTRY_RULE(r, block, entry) =
             (block) / 2 * 512 + (4 * ((r) % 8) + (entry) % 4) * 16 + ((block) % 2 * 2 + (r) / 8) * 4 + (entry) / 4 * 2
+    }
+
+    placement_rule! {
+        /// The byte of entry `entry` (of eight) of k-block `block` (of four) of
+        /// row `r` of its tile within a storage group's entries of a group-16,
+        /// 16-bit `records` tile (`iq2xs`): half `block / 2`, lane
+        /// `4 (r % 8) + 2 (entry % 2) + entry / 4`, word
+        /// `2 (block % 2) + r / 8`, its low or high half by `(entry % 4) / 2`.
+        record16_entry, RECORD16_ENTRY_RULE(r, block, entry) =
+            (block) / 2 * 512 + (4 * ((r) % 8) + (entry) % 2 * 2 + (entry) / 4) * 16 + ((block) % 2 * 2 + (r) / 8) * 4 + ((entry) % 4) / 2 * 2
+    }
+
+    placement_rule! {
+        /// The byte of the low 8 bits of entry `entry` (of eight) of k-block
+        /// `block` (of four) of row `r` of its tile within a storage group's
+        /// entries of a group-16, 12-bit `records` tile (`iq1m`, first 512 B):
+        /// lane `4 (r % 8) + 2 (entry % 2) + block / 2`, word
+        /// `2 (block % 2) + r / 8`, byte `entry / 2`.
+        record16_low, RECORD16_LOW_RULE(r, block, entry) =
+            (4 * ((r) % 8) + (entry) % 2 * 2 + (block) / 2) * 16 + ((block) % 2 * 2 + (r) / 8) * 4 + (entry) / 2
+    }
+
+    placement_rule! {
+        /// The byte holding the high 4 bits of entry `entry` (of eight) of
+        /// k-block `block` (of four) of row `r` of its tile within a storage
+        /// group's entries of a group-16, 12-bit `records` tile (`iq1m`, bytes
+        /// 512..768): lane `4 (r % 8) + block`, parity `entry % 2`, row half
+        /// `r / 8`, byte `entry / 4` (nibble `(entry % 4) / 2`).
+        record16_high, RECORD16_HIGH_RULE(r, block, entry) =
+            512 + (4 * ((r) % 8) + (block)) * 8 + (entry) % 2 * 4 + (r) / 8 * 2 + (entry) / 4
     }
 
     placement_rule! {
@@ -1876,10 +1945,9 @@ impl PackedRowLayout {
                     carried,
                     factors,
                     ..
-                } => (*grid, Some(*carried), Some(factors)),
+                } => (*grid, *carried, Some(factors)),
                 _ => unreachable!(),
             };
-            let bits = self.column_bits(index);
             if carried == Some(plane as u32) {
                 let codes = &self.packet.planes[plane];
                 let (field, j) = (bit / codes.entry_bits, bit % codes.entry_bits);
@@ -1889,7 +1957,7 @@ impl PackedRowLayout {
             if let Some(factors) = factors {
                 let prefix = prefix(factors)
                     .expect("every packet plane of a records layout is in its record");
-                return (index, self.packet.group * bits + prefix * 8 + bit);
+                return (index, self.code_bits(index) + prefix * 8 + bit);
             }
         }
         self.planes
@@ -1897,6 +1965,17 @@ impl PackedRowLayout {
             .enumerate()
             .find_map(|(index, candidate)| match &candidate.content {
                 RowPlaneContent::Groups { planes, .. } => Some((index, prefix(planes)? * 8 + bit)),
+                RowPlaneContent::TileFactors { scales, supers } => {
+                    if let Some(p) = prefix(scales) {
+                        Some((index, p * 8 + bit))
+                    } else {
+                        let scales_bytes: u32 = scales
+                            .iter()
+                            .map(|member| self.packet.planes[*member as usize].bytes_per_group)
+                            .sum();
+                        Some((index, (scales_bytes + prefix(supers)?) * 8 + bit))
+                    }
+                }
                 RowPlaneContent::Codes { .. }
                 | RowPlaneContent::Grids { .. }
                 | RowPlaneContent::GridHigh { .. }
@@ -1909,6 +1988,10 @@ impl PackedRowLayout {
     /// of a storage group, whose whole bytes are in entries plane `entries`
     /// (`group_bit`) and the rest in the grid high plane.
     fn entry_bit(&self, entries: usize, entry: u32, bit: u32) -> (usize, u32) {
+        if let RowPlaneContent::Records { entry_bits, .. } = self.planes[entries].content {
+            assert!(bit < entry_bits, "records entry bit {bit} past {entry_bits}");
+            return (entries, entry * entry_bits + bit);
+        }
         let low = GRID_VALUES * self.column_bits(entries);
         if bit < low {
             return (entries, entry * low + bit);
@@ -1932,11 +2015,14 @@ impl PackedRowLayout {
     /// factors are not codes).
     pub fn code_bits(&self, plane: usize) -> u32 {
         match self.planes[plane].content {
-            RowPlaneContent::Codes { .. }
-            | RowPlaneContent::Grids { .. }
-            | RowPlaneContent::Records { .. } => self.column_bits(plane) * self.packet.group,
+            RowPlaneContent::Codes { .. } | RowPlaneContent::Grids { .. } => {
+                self.column_bits(plane) * self.packet.group
+            }
+            RowPlaneContent::Records { entry_bits, .. } => {
+                self.packet.group / GRID_VALUES * entry_bits
+            }
             RowPlaneContent::GridHigh { bits, .. } => bits * self.packet.group / GRID_VALUES,
-            RowPlaneContent::Groups { .. } => {
+            RowPlaneContent::Groups { .. } | RowPlaneContent::TileFactors { .. } => {
                 panic!("row plane `{}` holds no codes", self.planes[plane].name)
             }
         }
@@ -1945,10 +2031,11 @@ impl PackedRowLayout {
     /// Bits a column of code plane `plane` holds.
     pub(crate) fn column_bits(&self, plane: usize) -> u32 {
         match self.planes[plane].content {
-            RowPlaneContent::Codes { bits, .. }
-            | RowPlaneContent::Grids { bits, .. }
-            | RowPlaneContent::Records { bits, .. } => bits,
-            RowPlaneContent::GridHigh { .. } | RowPlaneContent::Groups { .. } => {
+            RowPlaneContent::Codes { bits, .. } | RowPlaneContent::Grids { bits, .. } => bits,
+            RowPlaneContent::Records { .. }
+            | RowPlaneContent::GridHigh { .. }
+            | RowPlaneContent::Groups { .. }
+            | RowPlaneContent::TileFactors { .. } => {
                 panic!(
                     "row plane `{}` holds no column's codes",
                     self.planes[plane].name
@@ -1984,24 +2071,64 @@ impl PackedRowLayout {
                     packet * u64::from(self.packet.group) + u64::from(share / bits * GRID_VALUES);
                 self.code_bit(geometry, index, row, column) + u64::from(share % bits)
             }
-            RowPlaneContent::Records { bits, .. } if share < self.packet.group * bits => {
-                code(*bits)
-            }
-            RowPlaneContent::Records { bits, factors, .. } => {
-                let width = factors
-                    .iter()
-                    .map(|member| u64::from(self.packet.planes[*member as usize].bytes_per_group))
-                    .sum::<u64>();
-                let within = share - self.packet.group * bits;
-                let byte = self.record_byte(geometry, row, packet, Record::Factors, |r| {
-                    Self::record_factor(r) * width + u64::from(within / 8)
-                });
-                byte * 8 + u64::from(within % 8)
+            RowPlaneContent::Records {
+                group,
+                entry_bits,
+                factors,
+                ..
+            } => {
+                let entries_bits = self.packet.group / GRID_VALUES * entry_bits;
+                if share < entries_bits {
+                    let entry = u64::from(share / entry_bits);
+                    let entry_bit = u64::from(share % entry_bits);
+                    let (block, within_block) = (entry / 8, entry % 8);
+                    match (*group, *entry_bits) {
+                        (32, 16) => {
+                            let byte =
+                                self.record_byte(geometry, row, packet, Record::Entries, |r| {
+                                    Self::record_entry(r, block, within_block)
+                                });
+                            byte * 8 + entry_bit
+                        }
+                        (16, 16) => {
+                            let byte =
+                                self.record_byte(geometry, row, packet, Record::Entries, |r| {
+                                    Self::record16_entry(r, block, within_block)
+                                });
+                            byte * 8 + entry_bit
+                        }
+                        (16, 12) if entry_bit < 8 => {
+                            let byte =
+                                self.record_byte(geometry, row, packet, Record::Entries, |r| {
+                                    Self::record16_low(r, block, within_block)
+                                });
+                            byte * 8 + entry_bit
+                        }
+                        (16, 12) => {
+                            let byte =
+                                self.record_byte(geometry, row, packet, Record::Entries, |r| {
+                                    Self::record16_high(r, block, within_block)
+                                });
+                            byte * 8 + ((within_block % 4) / 2) * 4 + (entry_bit - 8)
+                        }
+                        _ => unreachable!("unsupported records geometry ({group}, {entry_bits})"),
+                    }
+                } else {
+                    let width = factors
+                        .iter()
+                        .map(|member| u64::from(self.packet.planes[*member as usize].bytes_per_group))
+                        .sum::<u64>();
+                    let within = share - entries_bits;
+                    let byte = self.record_byte(geometry, row, packet, Record::Factors, |r| {
+                        Self::record_factor(r) * width + u64::from(within / 8)
+                    });
+                    byte * 8 + u64::from(within % 8)
+                }
             }
             RowPlaneContent::Groups { planes, .. } if self.layout == Layout::Rows8 => {
                 self.span_byte(geometry, row, packet, index) * 8 + self.record_bit(planes, row % 8, share)
             }
-            RowPlaneContent::Groups { .. } => {
+            RowPlaneContent::Groups { .. } | RowPlaneContent::TileFactors { .. } => {
                 let byte = self
                     .share_byte(geometry, row, packet, index)
                     .expect("a group plane's share is its bytes");
@@ -2066,7 +2193,7 @@ impl PackedRowLayout {
             }
             | RowPlaneContent::Records {
                 grid,
-                carried: plane,
+                carried: Some(plane),
                 ..
             } => Some((plane, grid.carried_bit())),
             _ => None,
@@ -3961,24 +4088,35 @@ pub(crate) mod internals {
             content: RowPlaneContent::Codes { shift, bits },
         };
         let mut planes = match (&words.encoding, words.entry_bits) {
-            // A carried grid representation's `mma16` tile of whole-byte
-            // entries is records.
+            // `mma16` of a grid representation packed as superblock records:
+            // carried 16-bit entries (`iq2xxs`), or group-16 12/16-bit entries
+            // (`iq1m`, `iq2xs`) with `scales` and `supers` packed in `factors`.
             (PlaneEncoding::Grid(grid), bits)
-                if layout == Layout::Mma16 && carried.is_some() && bits % 8 == 0 =>
+                if layout == Layout::Mma16
+                    && ((carried.is_some() && bits == 16)
+                        || (carried.is_none() && repr.group == 16 && matches!(bits, 12 | 16))) =>
             {
                 assert!(
-                    bits == 16 && group == 256 && repr.group == 32,
-                    "`{}` records hold 256 values of 16-bit entries, groups of 32",
+                    group == 256
+                        && ((carried.is_some() && repr.group == 32)
+                            || (carried.is_none() && repr.group == 16)),
+                    "`{}` records hold 256 values of 12- or 16-bit entries",
                     repr.name
                 );
+                let mut factors = Vec::new();
+                if carried.is_none() {
+                    factors.extend_from_slice(&scales);
+                }
+                factors.extend_from_slice(&supers);
                 vec![RowPlaneInfo {
                     name: "records",
-                    bytes_per_group: words.bytes_per_group + group_bytes(&supers),
+                    bytes_per_group: words.bytes_per_group + group_bytes(&factors),
                     content: RowPlaneContent::Records {
-                        bits: bits / GRID_VALUES,
                         grid,
-                        carried: carried.unwrap(),
-                        factors: supers.clone(),
+                        carried,
+                        group: repr.group,
+                        entry_bits: bits,
+                        factors,
                     },
                 }]
             }
@@ -4027,31 +4165,51 @@ pub(crate) mod internals {
                 }
             }
         };
-        if !scales.is_empty() && carried.is_none() {
-            planes.push(RowPlaneInfo {
-                name: CoefficientLevel::Local.plane(),
-                bytes_per_group: group_bytes(&scales),
-                content: RowPlaneContent::Groups {
-                    level: CoefficientLevel::Local,
-                    planes: scales,
-                },
-            });
-        }
         if !matches!(planes[0].content, RowPlaneContent::Records { .. }) {
-            planes.push(RowPlaneInfo {
-                name: CoefficientLevel::Super.plane(),
-                bytes_per_group: group_bytes(&supers),
-                content: RowPlaneContent::Groups {
-                    level: CoefficientLevel::Super,
-                    planes: supers,
-                },
-            });
+            if layout == Layout::Mma16 {
+                assert!(
+                    256u32.is_multiple_of(group),
+                    "`{}` storage group {group} does not divide 256",
+                    repr.name
+                );
+                let scales_planes = if carried.is_none() { scales } else { Vec::new() };
+                planes.push(RowPlaneInfo {
+                    name: "factors",
+                    bytes_per_group: group_bytes(&scales_planes) + group_bytes(&supers),
+                    content: RowPlaneContent::TileFactors {
+                        scales: scales_planes,
+                        supers,
+                    },
+                });
+            } else {
+                if !scales.is_empty() && carried.is_none() {
+                    planes.push(RowPlaneInfo {
+                        name: CoefficientLevel::Local.plane(),
+                        bytes_per_group: group_bytes(&scales),
+                        content: RowPlaneContent::Groups {
+                            level: CoefficientLevel::Local,
+                            planes: scales,
+                        },
+                    });
+                }
+                planes.push(RowPlaneInfo {
+                    name: CoefficientLevel::Super.plane(),
+                    bytes_per_group: group_bytes(&supers),
+                    content: RowPlaneContent::Groups {
+                        level: CoefficientLevel::Super,
+                        planes: supers,
+                    },
+                });
+            }
         }
         // The row planes together cover every packet plane once.
         let mut covered: Vec<u32> = planes
             .iter()
             .flat_map(|plane| match &plane.content {
                 RowPlaneContent::Groups { planes, .. } => planes.clone(),
+                RowPlaneContent::TileFactors { scales, supers } => {
+                    scales.iter().chain(supers.iter()).copied().collect()
+                }
                 RowPlaneContent::Codes { .. }
                 | RowPlaneContent::Grids { carried: None, .. }
                 | RowPlaneContent::GridHigh { .. } => Vec::new(),
@@ -4061,7 +4219,7 @@ pub(crate) mod internals {
                 } => vec![*carried],
                 RowPlaneContent::Records {
                     carried, factors, ..
-                } => std::iter::once(*carried).chain(factors.iter().copied()).collect(),
+                } => carried.into_iter().copied().chain(factors.iter().copied()).collect(),
             })
             .collect();
         if planes.iter().any(|plane| {
@@ -4133,6 +4291,7 @@ pub(crate) mod internals {
                             RowPlaneContent::Grids { .. }
                             | RowPlaneContent::GridHigh { .. }
                             | RowPlaneContent::Groups { .. }
+                            | RowPlaneContent::TileFactors { .. }
                             | RowPlaneContent::Records { .. } => multiple,
                         }
                     })
@@ -5893,14 +6052,13 @@ mod tests {
         let layout = row_layout("q4k@mma16");
         let k = 256u64;
         let geometry = layout.geometry(k).unwrap();
-        let stride = geometry.stride;
         let row_bytes = geometry.bytes_per_row[0];
         let mut seen = std::collections::HashSet::new();
         for row in 0..16u64 {
             for column in 0..k {
                 let bit = layout.code_bit(&geometry, 0, row, column);
-                // Every code lands inside some row's codes_lo payload.
-                assert!(bit / 8 % stride < row_bytes);
+                // Every code lands inside the tile's contiguous codes_lo plane.
+                assert!(bit / 8 < 16 * row_bytes);
                 assert!(seen.insert(bit), "codes collide");
             }
         }
@@ -5915,9 +6073,7 @@ mod tests {
                                 64 * block + 16 * step + 2 * t + 8 * (register >> 1) + half;
                             let v =
                                 (block * 32 + lane) * 128 + 32 * step + 4 * (register + 4 * half);
-                            let expected =
-                                (v / 8 / row_bytes * stride + v / 8 % row_bytes) * 8 + v % 8;
-                            assert_eq!(layout.code_bit(&geometry, 0, row, column), expected);
+                            assert_eq!(layout.code_bit(&geometry, 0, row, column), v);
                         }
                     }
                 }
@@ -5927,12 +6083,12 @@ mod tests {
 
     /// A `grids` plane keeps each entry's bytes together and interleaves
     /// whole chunks of a row's columns across a tile: in `mma16` a tile's
-    /// k-block is its 16 rows' 64 columns, row by row, inside the rows' own
-    /// plane payloads; in `rows32` a chunk is its 32 rows' 32 columns.
+    /// k-block is its 16 rows' 64 columns, row by row, inside the tile's
+    /// contiguous plane; in `rows32` a chunk is its 32 rows' 32 columns.
     #[test]
     fn grids_interleave_whole_entries_row_by_row() {
         for (name, entry_bytes, layouts) in [
-            ("iq2xs", 2u64, &["mma16", "rows32"][..]),
+            ("iq2xs", 2u64, &["rows32"][..]),
             ("iq3xxs", 3, &["mma16", "rows32"]),
             ("iq2xxs", 2, &["rows32"]),
         ] {
@@ -5944,17 +6100,12 @@ mod tests {
                 let k = 512u64;
                 let geometry = layout.geometry(k).unwrap();
                 let (stride, offset) = (geometry.stride, geometry.offsets[0]);
-                let row_bytes = geometry.bytes_per_row[0];
                 for row in 0..2 * tile {
                     for column in (0..k).step_by(8) {
                         let unit = chunk / 8 * entry_bytes;
                         let v = (column / chunk * tile + row % tile) * unit
                             + column % chunk / 8 * entry_bytes;
-                        let expected = if layout_name == "mma16" {
-                            (row / tile * tile + v / row_bytes) * stride + offset + v % row_bytes
-                        } else {
-                            row / tile * tile * stride + offset * tile + v
-                        };
+                        let expected = row / tile * tile * stride + offset * tile + v;
                         assert_eq!(layout.code_bit(&geometry, 0, row, column), expected * 8);
                     }
                 }
@@ -6034,6 +6185,34 @@ mod tests {
                 rows.packet_bit(&geometry, 3, 1, 1, bit),
                 rows.code_bit(&geometry, 0, 3, 256 + (4 * f + j) * 8) + 15
             );
+        }
+        // Group-16 superblock-packed records (`iq2xs@mma16`, `iq1m@mma16`):
+        // Metal/Vulkan/CPU layouts keep separate planes, while `mma16` packs
+        // entries + scales + supers into one `records` plane.
+        for layout in ["rows16", "rows8", "rows32"] {
+            assert_eq!(
+                plane_set(&format!("iq2xs@{layout}")),
+                [("grids", 64), ("scales", 8), ("supers", 4)]
+            );
+            assert_eq!(
+                plane_set(&format!("iq1m@{layout}")),
+                [("grids", 32), ("grid_high", 16), ("scales", 6), ("supers", 2)]
+            );
+        }
+        assert_eq!(plane_set("iq2xs@mma16"), [("records", 76)]);
+        assert_eq!(plane_set("iq1m@mma16"), [("records", 56)]);
+        for (name, expected_entry_bytes) in [("iq2xs@mma16", 1024u64), ("iq1m@mma16", 768u64)] {
+            let layout = row_layout(name);
+            assert!(layout.records());
+            assert_eq!(layout.carried(), None);
+            assert_eq!(layout.record_entry_bytes(), expected_entry_bytes);
+            let extents = [32u64, 512u64];
+            let packets = pseudo_random_bytes(
+                expected_entry_bytes,
+                (32 * 2 * layout.packet.packet_size) as usize,
+            );
+            let placed = layout.place(&extents, &packets);
+            assert_eq!(layout.packets(&extents, &placed), packets);
         }
     }
 

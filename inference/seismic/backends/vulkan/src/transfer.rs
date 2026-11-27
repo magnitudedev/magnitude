@@ -28,7 +28,8 @@ use crate::device::{barrier, call, Device};
 use crate::Buffer;
 use ash::vk;
 use seismic_compiler::errors::ExecutionError;
-use std::sync::Mutex;
+use std::any::Any;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 /// One end of a run: a buffer's bytes from an offset.
@@ -67,10 +68,13 @@ enum Command {
     Fill(vk::Buffer, u64, u32),
 }
 
+type WaitOwner = Arc<dyn Any + Send + Sync>;
+
 struct State {
     pool: vk::CommandPool,
-    /// Command buffers of batches submitted, by value, and free ones.
-    flying: Vec<(u64, vk::CommandBuffer)>,
+    /// Command buffers and foreign wait-semaphore owners of batches submitted,
+    /// retained until `self.semaphore` reaches `value`, and free command buffers.
+    flying: Vec<(u64, vk::CommandBuffer, Vec<WaitOwner>)>,
     free: Vec<vk::CommandBuffer>,
 }
 
@@ -131,17 +135,19 @@ impl TransferQueue {
     /// bytes no queued work reaches, and keeps the sources' bytes until
     /// then.
     pub fn copy(&self, items: &[TransferItem<'_>], value: u64) -> Result<(), ExecutionError> {
-        self.copy_after(items, value, &[])
+        self.copy_after(items, value, &[], Vec::new())
     }
 
     /// [`Self::copy`], waiting on device-signalled `waits` (at `TRANSFER`)
     /// before executing the copies (e.g. waiting for compute readers to retire
-    /// before overwriting a scratch slot).
+    /// before overwriting a scratch slot), keeping `wait_owners` alive until
+    /// `self.semaphore` reaches `value`.
     pub fn copy_after(
         &self,
         items: &[TransferItem<'_>],
         value: u64,
         waits: &[(vk::Semaphore, u64)],
+        wait_owners: Vec<WaitOwner>,
     ) -> Result<(), ExecutionError> {
         let mut regions: Vec<Command> = Vec::new();
         for item in items {
@@ -250,11 +256,12 @@ impl TransferQueue {
             state.free.push(command);
             return Err(error);
         }
-        state.flying.push((value, command));
+        state.flying.push((value, command, wait_owners));
         Ok(())
     }
 
-    /// The command buffers of completed batches, free again.
+    /// The command buffers of completed batches, free again, and their
+    /// foreign wait-semaphore owners released once the GPU has retired them.
     fn reclaim(&self, state: &mut State) -> Result<(), ExecutionError> {
         let reached = self
             .device
@@ -262,9 +269,9 @@ impl TransferQueue {
             .vk("vkGetSemaphoreCounterValue", |device| unsafe {
                 device.get_semaphore_counter_value(self.semaphore)
             })?;
-        let (done, flying): (Vec<_>, Vec<_>) = state.flying.drain(..).partition(|&(value, _)| value <= reached);
+        let (done, flying): (Vec<_>, Vec<_>) = state.flying.drain(..).partition(|(value, _, _)| *value <= reached);
         state.flying = flying;
-        state.free.extend(done.into_iter().map(|(_, command)| command));
+        state.free.extend(done.into_iter().map(|(_, command, _owners)| command));
         Ok(())
     }
 
@@ -292,7 +299,7 @@ impl Drop for TransferQueue {
             return;
         }
         let state = self.state.get_mut().expect("transfer lock is never poisoned");
-        let last = state.flying.iter().map(|&(value, _)| value).max().unwrap_or(0);
+        let last = state.flying.iter().map(|(value, _, _)| *value).max().unwrap_or(0);
         let semaphores = [self.semaphore];
         let values = [last];
         let raw = &self.device.inner.device;
@@ -459,6 +466,7 @@ mod tests {
                     })],
                     2,
                     &[compute_sub.timeline_wait()],
+                    Vec::new(),
                 )
                 .unwrap();
 

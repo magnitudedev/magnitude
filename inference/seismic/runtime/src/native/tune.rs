@@ -1129,7 +1129,7 @@ pub struct Standing {
 pub struct TuneRequest<'r, 'a> {
     /// What the tuning allocates through: its device's charges.
     pub charges: &'r Charges,
-    pub module: &'r CheckedModule,
+    pub module: Arc<CheckedModule>,
     pub entry: EntryId,
     pub bindings: ElementBindings,
     /// Values of every static dimension.
@@ -1142,9 +1142,9 @@ pub struct TuneRequest<'r, 'a> {
 }
 
 /// Forms configurations of one entry's implementation.
-struct Formation<'s, 'm> {
+struct Formation<'s> {
     charges: &'s Charges,
-    module: &'m CheckedModule,
+    module: &'s Arc<CheckedModule>,
     entry: EntryId,
     logical: &'s Arc<LogicalEntry>,
     bindings: &'s ElementBindings,
@@ -1317,9 +1317,9 @@ impl FormationPrice {
 /// whole programs of its challengers. It reads nothing of the unit's
 /// search and submits nothing to the device, so it runs on any thread
 /// while the device measures other work.
-pub struct Forming<'m> {
+pub struct Forming {
     charges: Charges,
-    module: &'m CheckedModule,
+    module: Arc<CheckedModule>,
     entry: EntryId,
     logical: Arc<LogicalEntry>,
     bindings: ElementBindings,
@@ -1332,7 +1332,7 @@ pub struct Forming<'m> {
     work: Vec<(Formable, Rendered)>,
 }
 
-impl Forming<'_> {
+impl Forming {
     /// The threads the compile's calls run on at once: what its consumer
     /// counts against the threads the host has, so that every compile in
     /// flight runs on threads of its own, as it was priced
@@ -1364,7 +1364,7 @@ impl Forming<'_> {
                 Formable::Launches(sources) => Product::Launches(
                     NativePrepared::hold_launch_variants(
                         self.charges.device(),
-                        self.module,
+                        &self.module,
                         self.entry,
                         &self.bindings,
                         &self.default,
@@ -1376,7 +1376,7 @@ impl Forming<'_> {
                 Formable::Program(specialization) => Product::Program(
                     NativePrepared::prepare_implementation(
                         self.charges.device(),
-                        self.module,
+                        &self.module,
                         self.entry,
                         &self.logical,
                         self.bindings.clone(),
@@ -1427,7 +1427,7 @@ struct FormedCall {
     elapsed: Duration,
 }
 
-impl UnitSearch<'_, '_> {
+impl UnitSearch<'_> {
     /// What building the inputs the unit holds took, each point's at its
     /// class's price: what giving them up is held to before the load has
     /// observed inputs given up. It frees what building them allocated and
@@ -1478,9 +1478,9 @@ pub struct GroundingKey {
 }
 
 /// The compile of a unit's canonical program ([`UnitSearch::grounding`]).
-pub struct Grounding<'m> {
+pub struct Grounding {
     charges: Charges,
-    module: &'m CheckedModule,
+    module: Arc<CheckedModule>,
     entry: EntryId,
     logical: Arc<LogicalEntry>,
     bindings: ElementBindings,
@@ -1491,7 +1491,7 @@ pub struct Grounding<'m> {
     served: Vec<BTreeMap<String, u64>>,
 }
 
-impl Grounding<'_> {
+impl Grounding {
     /// The canonical program identity this grounding forms.
     pub fn canonical_key(&self) -> GroundingKey {
         GroundingKey {
@@ -1511,7 +1511,7 @@ impl Grounding<'_> {
         let began = Instant::now();
         let kernel = NativePrepared::prepare_implementation(
             self.charges.device(),
-            self.module,
+            &self.module,
             self.entry,
             &self.logical,
             self.bindings.clone(),
@@ -1528,7 +1528,7 @@ impl Grounding<'_> {
                 let ref_began = Instant::now();
                 let formed = NativePrepared::prepare_implementation(
                     self.charges.device(),
-                    self.module,
+                    &self.module,
                     self.entry,
                     &self.logical,
                     self.bindings,
@@ -1580,7 +1580,7 @@ fn serving(
     Ok(kernel)
 }
 
-impl<'m> Formation<'_, 'm> {
+impl Formation<'_> {
     /// What the one call forming `formable` does, read from the device's
     /// live programs and the artifact store before it starts.
     fn class(&self, formable: &Formable) -> Formative {
@@ -1602,7 +1602,7 @@ impl<'m> Formation<'_, 'm> {
             .or_insert_with(|| match formable {
                 Formable::Launches(sources) => NativePrepared::launch_variants_rendered(
                     self.charges.device(),
-                    self.module,
+                    self.module.as_ref(),
                     self.entry,
                     self.bindings,
                     &self.default,
@@ -1611,7 +1611,7 @@ impl<'m> Formation<'_, 'm> {
                 ),
                 Formable::Program(specialization) => NativePrepared::implementation_rendered(
                     self.charges.device(),
-                    self.module,
+                    self.module.as_ref(),
                     self.entry,
                     self.logical,
                     self.bindings,
@@ -1657,10 +1657,10 @@ impl<'m> Formation<'_, 'm> {
 
     /// The compile of `formables`, each classed as it is priced, to run on
     /// any thread; none when they are none.
-    fn forming(&self, formables: Vec<Formable>) -> Option<Forming<'m>> {
+    fn forming(&self, formables: Vec<Formable>) -> Option<Forming> {
         (!formables.is_empty()).then(|| Forming {
             charges: self.charges.clone(),
-            module: self.module,
+            module: Arc::clone(self.module),
             entry: self.entry,
             logical: self.logical.clone(),
             bindings: self.bindings.clone(),
@@ -3508,10 +3508,10 @@ pub fn tune(request: TuneRequest<'_, '_>) -> Result<TuningResult, TuneError> {
 }
 
 /// What opening a unit's search needs.
-pub struct UnitRequest<'r, 'm> {
+pub struct UnitRequest<'r> {
     /// What the tuning allocates through: its device's charges.
     pub charges: &'r Charges,
-    pub module: &'m CheckedModule,
+    pub module: Arc<CheckedModule>,
     pub entry: EntryId,
     pub bindings: ElementBindings,
     /// Values of every static dimension.
@@ -3789,9 +3789,9 @@ struct Run {
 ///   before any further challenger is measured;
 /// - [`Stage::Confirm`]: more matched rounds for the leader among those
 ///   whose lead is nominal, and its conversion if they resolve it.
-pub struct UnitSearch<'m, 'a> {
+pub struct UnitSearch<'a> {
     charges: Charges,
-    module: &'m CheckedModule,
+    module: Arc<CheckedModule>,
     entry: EntryId,
     bindings: ElementBindings,
     statics: NativeSpecialization,
@@ -3854,15 +3854,15 @@ pub struct UnitSearch<'m, 'a> {
     offer: std::cell::RefCell<OfferCache>,
 }
 
-impl<'m, 'a> UnitSearch<'m, 'a> {
-    pub fn open(request: UnitRequest<'_, 'm>) -> Result<Self, TuneError> {
+impl<'a> UnitSearch<'a> {
+    pub fn open(request: UnitRequest<'_>) -> Result<Self, TuneError> {
         Self::open_over(request, &BTreeMap::new())
     }
 
     /// Open the unit with `domains` replacing the declared value lists of
     /// the parameters they name (a survey's widened space).
     fn open_over(
-        request: UnitRequest<'_, 'm>,
+        request: UnitRequest<'_>,
         domains: &BTreeMap<String, Vec<u64>>,
     ) -> Result<Self, TuneError> {
         let UnitRequest {
@@ -3876,8 +3876,8 @@ impl<'m, 'a> UnitSearch<'m, 'a> {
         } = request;
         let device = charges.device();
         let backend = super::backend_name(&device.kind);
-        let entry_name = super::entry_name(module, entry);
-        let implementation = super::offered(device, module, entry, &bindings)
+        let entry_name = super::entry_name(&module, entry);
+        let implementation = super::offered(device, &module, entry, &bindings)
             .ok_or_else(|| {
                 TuneError::Declaration(format!(
                     "`{entry_name}` has no native implementation for `{}`",
@@ -3898,7 +3898,7 @@ impl<'m, 'a> UnitSearch<'m, 'a> {
         );
         let mutable = mutable_parameters(&logical);
         let implementation_identity =
-            implementation_digest(device, module, entry, &bindings, &statics, cpu)?;
+            implementation_digest(device, &module, entry, &bindings, &statics, cpu)?;
         let default = implementation
             .default_specialization(&statics)
             .map_err(|error| TuneError::Declaration(error.to_string()))?;
@@ -4005,7 +4005,7 @@ impl<'m, 'a> UnitSearch<'m, 'a> {
     pub fn grounding(
         &mut self,
         source: &dyn PointSource<'a>,
-    ) -> Result<Option<Grounding<'m>>, TuneError> {
+    ) -> Result<Option<Grounding>, TuneError> {
         self.describe(source)?;
         let distinct_reference = !same_work_on_served(
             self.implementation.implementation(),
@@ -4015,7 +4015,7 @@ impl<'m, 'a> UnitSearch<'m, 'a> {
         );
         Ok(matches!(self.progress, Progress::Ungrounded { .. }).then(|| Grounding {
             charges: self.charges.clone(),
-            module: self.module,
+            module: Arc::clone(&self.module),
             entry: self.entry,
             logical: self.logical.clone(),
             bindings: self.bindings.clone(),
@@ -4115,7 +4115,7 @@ impl<'m, 'a> UnitSearch<'m, 'a> {
     /// ([`Work::forming`]), to run ahead of it on any thread while the
     /// device does other work; none when the piece compiles nothing ahead.
     /// The piece then forms nothing ([`UnitSearch::formed`]).
-    pub fn forming(&self) -> Option<Forming<'m>> {
+    pub fn forming(&self) -> Option<Forming> {
         let searching = self.searching()?;
         if !matches!(self.next()?.stage, Stage::Form | Stage::Measure) {
             return None;
@@ -4170,10 +4170,10 @@ impl<'m, 'a> UnitSearch<'m, 'a> {
         self.invalidate_offer();
     }
 
-    fn formation(&self) -> Formation<'_, 'm> {
+    fn formation(&self) -> Formation<'_> {
         Formation {
             charges: &self.charges,
-            module: self.module,
+            module: &self.module,
             entry: self.entry,
             logical: &self.logical,
             bindings: &self.bindings,
@@ -5000,7 +5000,7 @@ impl<'m, 'a> UnitSearch<'m, 'a> {
                     }
                     let formation = Formation {
                         charges,
-                        module: *module,
+                        module,
                         entry: *entry,
                         logical,
                         bindings,
@@ -5372,7 +5372,7 @@ impl<'m, 'a> UnitSearch<'m, 'a> {
         self.unit.parameters = entry_parameters(&domain.implementation);
         let formation = Formation {
             charges: &self.charges,
-            module: self.module,
+            module: &self.module,
             entry: self.entry,
             logical: &self.logical,
             bindings: &self.bindings,
@@ -5815,7 +5815,7 @@ fn plan_next(
 /// Form the planned challengers, measure and admit them at the timed points,
 /// and plan the next piece. Each is recorded, whatever it measures.
 fn measure_piece<'a>(
-    formation: &Formation<'_, '_>,
+    formation: &Formation<'_>,
     programs: &mut Programs,
     searching: &mut Searching<'a>,
     time: &mut TuningTime,
@@ -5880,7 +5880,7 @@ fn measure_piece<'a>(
 /// promoted; what the rounds showed is recorded either way.
 #[allow(clippy::too_many_arguments)]
 fn promote_leader<'a>(
-    formation: &Formation<'_, '_>,
+    formation: &Formation<'_>,
     programs: &mut Programs,
     point_states: &mut [PointState],
     ground: &Ground,
@@ -6378,7 +6378,7 @@ impl Programs {
     /// held.
     fn form(
         &mut self,
-        formation: &Formation<'_, '_>,
+        formation: &Formation<'_>,
         specializations: &[NativeSpecialization],
         ahead: &[NativeSpecialization],
     ) -> Result<Vec<Result<Arc<NativePrepared>, Exclusion>>, TuneError> {
@@ -7239,7 +7239,7 @@ impl Run {
         &mut self,
         piece: Piece,
         programs: &mut Programs,
-        formation: &Formation<'_, '_>,
+        formation: &Formation<'_>,
         points: &[PreparedPoint<'_>],
         settings: &SearchSettings,
         min_sample_seconds: f64,
@@ -8348,7 +8348,7 @@ struct Records {
 
 /// One entry's survey.
 struct Tuned<'s> {
-    formation: &'s Formation<'s, 's>,
+    formation: &'s Formation<'s>,
     domain: &'s SurveyDomain,
     statics: &'s NativeSpecialization,
     default: &'s NativeSpecialization,
@@ -11351,16 +11351,18 @@ mod tests {
         let Ok(device) = devices.open_own(metal, options, vec![Arc::new(tally)]) else {
             return;
         };
-        let module = check_source_with(
-            SourceSet::new(vec![SourceFile {
-                path: "copy.seismic".into(),
-                text: "fn copy[N](x: &tensor[N] f32) -> tensor[N] f32:\n    return to_owned(x)\n\nnative copy for metal from \"copy.metal\":\n    launch copy:\n        threadgroups (1, 1, 1)\n        threads_per_threadgroup (1, 1, 1)\n".into(),
-            }]),
-            &mut |_entry: &str, _native: &NativeImplementation| {
-                Ok::<_, std::convert::Infallible>(Some("kernel void copy() {}\n".into()))
-            },
-        )
-        .expect("copy source checks");
+        let module = Arc::new(
+            check_source_with(
+                SourceSet::new(vec![SourceFile {
+                    path: "copy.seismic".into(),
+                    text: "fn copy[N](x: &tensor[N] f32) -> tensor[N] f32:\n    return to_owned(x)\n\nnative copy for metal from \"copy.metal\":\n    launch copy:\n        threadgroups (1, 1, 1)\n        threads_per_threadgroup (1, 1, 1)\n".into(),
+                }]),
+                &mut |_entry: &str, _native: &NativeImplementation| {
+                    Ok::<_, std::convert::Infallible>(Some("kernel void copy() {}\n".into()))
+                },
+            )
+            .expect("copy source checks"),
+        );
         let entry = module.entry_named("copy").expect("copy entry");
         let bindings = ElementBindings::default();
         let logical = Arc::new(module.entry(entry, &bindings).expect("copy entry binds"));

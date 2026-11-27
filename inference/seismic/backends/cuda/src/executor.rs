@@ -192,6 +192,20 @@ impl Device {
         self.context.ordinal() as u32
     }
 
+    /// Acquire a shared permit before submitting a compute-stream flight that
+    /// may park on a host-signaled `WAIT_VALUE_32` gate.
+    pub(crate) fn begin_host_gated_flight(&self) -> crate::driver::HostGatedFlightGuard {
+        self.context.begin_host_gated_flight()
+    }
+
+    /// Wait until every active host-gated `WAIT_VALUE_32` flight on the compute
+    /// stream has completed before submitting compute-stream slab moves
+    /// (`Slots::adopt` -> `encode_moves`), so an unordered transfer's
+    /// `wait_adopted()` can never block behind a parked `WAIT_VALUE_32` gate.
+    pub fn drain_host_gated_flights(&self) -> impl Drop + '_ {
+        self.context.changing_memory()
+    }
+
     /// The device's memory as a refusal reads it ([`device_free`]).
     pub(crate) fn refusal_reading(&self) -> RefusalReading {
         device_free(&self.context)
@@ -300,6 +314,10 @@ impl Device {
             crate::topology::DEVICE_KIND => self.blocks.allocate_block(bytes, entry, fill).map(Buffer::block),
             crate::topology::PINNED_KIND => {
                 if self.allocations_in_process_footprint()
+                    && crate::driver::can_alloc_managed(&self.context).map_err(submission_error)?
+                {
+                    crate::driver::ManagedBlock::new(&self.context, entry, bytes).map(Buffer::managed)
+                } else if self.allocations_in_process_footprint()
                     && crate::driver::can_create_host_node(&self.context).map_err(submission_error)?
                 {
                     crate::driver::HostNodeBlock::new(&self.context, entry, bytes).map(Buffer::host_node)

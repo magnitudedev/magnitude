@@ -658,6 +658,7 @@ impl Lattice {
                                     RowPlaneContent::Grids { .. }
                                     | RowPlaneContent::GridHigh { .. }
                                     | RowPlaneContent::Groups { .. }
+                                    | RowPlaneContent::TileFactors { .. }
                                     | RowPlaneContent::Records { .. } => None,
                                 })
                                 .collect();

@@ -917,6 +917,11 @@ pub mod device {
         pub fn staff(&self, workers: Option<Arc<seismic_native_target::workers::Workers>>) {
             self.programs.staff(workers);
         }
+        /// Drop cached program-store lookup entries held by this device's
+        /// program formers once load-time formation has completed.
+        pub fn release_formation_cache(&self) {
+            self.programs.release_formation_cache();
+        }
         /// Whether this device forms Metal tensor operations: what its
         /// executor reports ([`seismic_topology::Executor::forms_tensor_operations`]),
         /// false on every other backend.
@@ -1177,6 +1182,10 @@ pub mod tensor {
         extents: Vec<u64>,
         strides: Vec<u64>,
         backing: TensorBacking,
+        /// Byte stride between leading-axis records when padded beyond
+        /// canonical `record_bytes` (e.g. page-aligned staging slots for
+        /// zero-bounce direct I/O); `None` for canonical contiguous tensors.
+        record_stride: Option<u64>,
         /// This view's records as a native record port binds them, formed
         /// at its first such binding ([`TensorInner::forming_records`]).
         records: OnceLock<Arc<Records>>,
@@ -1714,6 +1723,7 @@ pub mod tensor {
                     view: SlabView::new(slots.clone(), region, 0, slots.capacity(), rows_per_slab, slab_extents, slab_bytes),
                     alias_identity,
                 },
+                record_stride: None,
                 records: OnceLock::new(),
             })
         }
@@ -1939,6 +1949,84 @@ pub mod tensor {
             self.region_as(representation, extents, offset, true)
         }
 
+        /// A strided-record view of another representation carried by this
+        /// contiguous allocation (e.g. a unified byte-typed staging pool
+        /// carrying multiple stored quant forms at a shared `slot_bytes`
+        /// stride). Zero-copy: shares the backing allocation and reuses any
+        /// matching record address table.
+        pub fn carried_records(
+            &self,
+            representation: RepresentationId,
+            extents: &[u64],
+            slot_bytes: u64,
+        ) -> Result<Self, TensorError> {
+            if !self.device.supports_representation(representation) {
+                return Err(TensorError::UnsupportedRepresentation {
+                    backend: self.device.info().backend(),
+                    representation: representation_info(representation).name,
+                });
+            }
+            let from = representation_info(self.representation);
+            let to = representation_info(representation);
+            let carries_packed = !matches!(to.kind, RepresentationKind::Dense(_));
+            if matches!(from.kind, RepresentationKind::Dense(dtype) if dtype.is_float())
+                && representation != self.representation
+                && !carries_packed
+            {
+                return Err(TensorError::Region(RegionError::FloatingReinterpret {
+                    from: from.name,
+                    to: to.name,
+                }));
+            }
+            let TensorBacking::Plain { hold } = &self.backing else {
+                return Err(TensorError::Region(RegionError::NotContiguous));
+            };
+            if layout::canonical(self.representation, &self.extents)?.strides != self.strides {
+                return Err(TensorError::Region(RegionError::NotContiguous));
+            }
+            let layout = layout::canonical(representation, extents)?;
+            let count = *extents
+                .first()
+                .ok_or_else(|| TensorError::SlabLayout("carried_records requires a leading record axis".into()))?;
+            let record = seismic_lang::registry::record_bytes(representation, extents)
+                .ok_or(TensorError::Region(RegionError::Unrecorded { offset: self.byte_offset }))?
+                .get();
+            if slot_bytes < record || !slot_bytes.is_multiple_of(layout.alignment) {
+                return Err(TensorError::SlabLayout(format!(
+                    "carried_records slot_bytes ({slot_bytes}) must be >= record ({record}) and aligned to {}",
+                    layout.alignment,
+                )));
+            }
+            let total_bytes = count
+                .checked_mul(slot_bytes)
+                .ok_or_else(|| TensorError::SlabLayout("carried_records total bytes overflowed".into()))?;
+            if total_bytes > self.byte_len {
+                return Err(TensorError::Region(RegionError::Outside {
+                    offset: 0,
+                    bytes: total_bytes,
+                    view_bytes: self.byte_len,
+                }));
+            }
+            if self.byte_offset % layout.alignment != 0 {
+                return Err(TensorError::Region(RegionError::Unaligned {
+                    offset: self.byte_offset,
+                    alignment: layout.alignment,
+                }));
+            }
+            let mut inner = Self::new_plain(
+                self.device.clone(),
+                self.allocation.clone(),
+                self.byte_offset,
+                total_bytes,
+                representation,
+                extents.to_vec(),
+                layout.strides,
+                hold.clone(),
+            );
+            inner.record_stride = Some(slot_bytes);
+            Ok(inner)
+        }
+
         fn region_as(
             &self,
             representation: RepresentationId,
@@ -2042,10 +2130,18 @@ pub mod tensor {
         /// [`record_bytes`]: seismic_lang::registry::record_bytes
         pub fn record_placement(&self) -> Option<RecordPlacement> {
             let record = seismic_lang::registry::record_bytes(self.representation, &self.extents)?;
+            let record = self
+                .record_stride
+                .and_then(std::num::NonZeroU64::new)
+                .unwrap_or(record);
             Some(RecordPlacement {
                 start: self.byte_offset,
                 record,
             })
+        }
+
+        pub(crate) fn record_stride(&self) -> Option<u64> {
+            self.record_stride
         }
 
         /// This canonical view's records as a native record port binds them:
@@ -2089,12 +2185,13 @@ pub mod tensor {
                     ))
                 }
                 TensorBacking::Plain { .. } => {
-                    let (table, table_offset) = self.record_table(record, charges)?;
+                    let stride = self.record_stride.unwrap_or(record);
+                    let (table, table_offset) = self.record_table(stride, charges)?;
                     Records {
                         table,
                         table_offset,
                         count: self.extents[0],
-                        record,
+                        record: stride,
                         storage: Some((self.allocation.clone(), self.byte_offset)),
                     }
                 }
@@ -2146,6 +2243,58 @@ pub mod tensor {
             Self::canonical_in(charges, representation, extents, |charges, bytes, alignment| {
                 charges.allocate_mapped_zeroed(Contract::Shared, bytes, alignment)
             })
+        }
+
+        /// A zero-filled host-shared tensor (`Contract::Shared`) whose
+        /// leading-axis records are spaced `slot_bytes` apart (at least
+        /// `record_bytes` and aligned to `slot_bytes`'s power-of-two/4096
+        /// boundary) so each record slot has direct-I/O alignment headroom
+        /// while binding to native record ports with logical shape `extents`.
+        pub fn shared_records(
+            charges: &Charges,
+            representation: RepresentationId,
+            extents: &[u64],
+            slot_bytes: u64,
+        ) -> Result<Self, TensorError> {
+            let device = charges.device();
+            if !device.supports_representation(representation) {
+                return Err(TensorError::UnsupportedRepresentation {
+                    backend: device.info().backend(),
+                    representation: representation_info(representation).name,
+                });
+            }
+            let layout = layout::canonical(representation, extents)?;
+            let count = *extents
+                .first()
+                .ok_or_else(|| TensorError::SlabLayout("shared_records requires a leading record axis".into()))?;
+            let record = seismic_lang::registry::record_bytes(representation, extents)
+                .ok_or(TensorError::Region(RegionError::Unrecorded { offset: 0 }))?
+                .get();
+            if slot_bytes < record || !slot_bytes.is_multiple_of(layout.alignment) {
+                return Err(TensorError::SlabLayout(format!(
+                    "shared_records slot_bytes ({slot_bytes}) must be >= record ({record}) and aligned to {}",
+                    layout.alignment,
+                )));
+            }
+            let total_bytes = count
+                .checked_mul(slot_bytes)
+                .ok_or_else(|| TensorError::SlabLayout("shared_records total bytes overflowed".into()))?;
+            let alloc_align = layout
+                .alignment
+                .max(1u64 << slot_bytes.trailing_zeros().min(8));
+            let allocation = charges.allocate_mapped_zeroed(Contract::Shared, total_bytes, alloc_align)?;
+            let mut inner = Self::new_plain(
+                device.clone(),
+                allocation,
+                0,
+                total_bytes,
+                representation,
+                extents.to_vec(),
+                layout.strides,
+                None,
+            );
+            inner.record_stride = Some(slot_bytes);
+            Ok(inner)
         }
 
         /// A zero-filled tensor of coherent words the host and device work
@@ -2514,6 +2663,7 @@ pub mod tensor {
                 extents,
                 strides,
                 backing: TensorBacking::Plain { hold },
+                record_stride: None,
                 records: OnceLock::new(),
             }
         }
@@ -2865,6 +3015,7 @@ pub mod tensor {
                     ),
                     alias_identity,
                 },
+                record_stride: None,
                 records: OnceLock::new(),
             })
         }
@@ -2937,10 +3088,46 @@ pub mod tensor {
                     let local_start = start % slabs.rows_per_slab;
                     region.slice_leading(local_start, local_start + end - start)
                 }
-                TensorBacking::Plain { hold } => self.view(
-                    &crate::api::kernel::ViewOperation::LeadingSlice { start, end },
-                    hold.clone(),
-                ),
+                TensorBacking::Plain { hold } => {
+                    if let Some(stride) = self.record_stride {
+                        let extent = *self
+                            .extents
+                            .first()
+                            .ok_or_else(|| TensorError::SlabLayout("strided record tensor lacks leading axis".into()))?;
+                        if start > end || end > extent {
+                            return Err(TensorError::SliceOutOfBounds { extent, start, end });
+                        }
+                        let mut extents = self.extents.clone();
+                        extents[0] = end - start;
+                        let byte_offset = self
+                            .byte_offset
+                            .checked_add(
+                                start
+                                    .checked_mul(stride)
+                                    .ok_or_else(|| TensorError::SlabLayout("strided slice offset overflowed".into()))?,
+                            )
+                            .ok_or_else(|| TensorError::SlabLayout("strided slice byte_offset overflowed".into()))?;
+                        let byte_len = (end - start)
+                            .checked_mul(stride)
+                            .ok_or_else(|| TensorError::SlabLayout("strided slice byte_len overflowed".into()))?;
+                        let mut inner = Self::new_plain(
+                            self.device.clone(),
+                            self.allocation.clone(),
+                            byte_offset,
+                            byte_len,
+                            self.representation,
+                            extents,
+                            self.strides.clone(),
+                            hold.clone(),
+                        );
+                        inner.record_stride = Some(stride);
+                        return Ok(inner);
+                    }
+                    self.view(
+                        &crate::api::kernel::ViewOperation::LeadingSlice { start, end },
+                        hold.clone(),
+                    )
+                }
             }
         }
         pub fn reshape(&self, extents: &[u64]) -> Result<Self, TensorError> {
@@ -2989,6 +3176,7 @@ pub mod tensor {
                             ),
                             alias_identity: *alias_identity,
                         },
+                        record_stride: None,
                         records: OnceLock::new(),
                     })
                 }

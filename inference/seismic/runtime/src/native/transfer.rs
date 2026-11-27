@@ -32,9 +32,10 @@
 use crate::api::device::DeviceInner;
 use crate::api::tensor::TensorInner;
 use crate::backends::OpenedKind;
-use crate::completion::DeviceCompletion;
+use crate::completion::{Committed, DeviceCompletion, RouteSubmission};
 use crate::driver::{typed_buffer, DeviceQueue};
 use seismic_compiler::errors::ExecutionError;
+pub use seismic_io::{DeviceId, FenceCapability, FenceError, ProducerId, TimelineObserver, TimelinePoint};
 use std::fmt;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
@@ -182,27 +183,73 @@ pub struct TransferSyncId {
 
 #[derive(Clone)]
 enum TransferSyncHandle {
-    Cpu,
-    Cuda(Option<Arc<seismic_cuda::Event>>),
+    /// Host-only timeline (CPU transfer or CPU compute submission).
+    Cpu(Option<Arc<seismic_io::HostTimeline>>),
+    /// CUDA transfer-stream completion event (and optional backing queue for host wait).
+    Cuda {
+        event: Option<Arc<seismic_cuda::Event>>,
+        queue: Option<Arc<Queue>>,
+    },
+    /// CUDA compute-stream completion event retained inside `RouteSubmission`.
+    CudaSubmission(Arc<RouteSubmission>),
+    /// Metal 64-bit monotonic `MTLSharedEvent` shared across compute/blit/host.
+    #[cfg(target_os = "macos")]
+    Metal(Arc<seismic_metal::SharedEvent>),
+    /// Vulkan transfer-queue `VK_KHR_timeline_semaphore`.
     #[cfg(not(target_os = "macos"))]
     Vulkan(Arc<seismic_vulkan::transfer::TransferQueue>),
+    /// Vulkan compute-queue `VK_KHR_timeline_semaphore` retained inside `RouteSubmission`.
+    #[cfg(not(target_os = "macos"))]
+    VulkanSubmission {
+        semaphore: seismic_vulkan::vk::Semaphore,
+        route: Arc<RouteSubmission>,
+    },
 }
 
-/// A device-side completion handle for a transfer batch, which a
-/// [`super::graph::NativeGraphSequence`] can wait on via cross-queue device
-/// synchronization (`cuStreamWaitEvent` on CUDA, timeline semaphore wait in
-/// `vkQueueSubmit2` on Vulkan) without blocking the host.
+/// Unified typed timeline fence handle (`TimelineFence`) bridging
+/// `seismic-runtime` queues (CUDA `CUevent` pool, Metal `MTLSharedEvent`,
+/// Vulkan `VK_KHR_timeline_semaphore`, CPU `HostOnly`) with `seismic-io` v2's
+/// [`TimelinePoint`] and [`TimelineObserver`].
 #[derive(Clone)]
 pub struct TransferSync {
     id: TransferSyncId,
     handle: TransferSyncHandle,
 }
 
+/// Unified alias for [`TransferSync`] matching the `seismic-io` v2 architecture.
+pub type TimelineFence = TransferSync;
+
 impl TransferSync {
     /// The unique `(device_id, producer_queue_id, value)` identity of this
-    /// transfer batch.
+    /// transfer batch or compute submission.
     pub fn id(&self) -> TransferSyncId {
         self.id
+    }
+
+    /// Typed [`TimelinePoint`] carrying `(DeviceId, ProducerId, value, capability)`.
+    /// CPU fences and unrecorded CUDA handles are explicitly typed
+    /// [`FenceCapability::HostOnly`]; GPU-waitable handles are
+    /// [`FenceCapability::DeviceAndHost`].
+    pub fn timeline_point(&self) -> TimelinePoint {
+        let capability = match &self.handle {
+            TransferSyncHandle::Cpu(_) | TransferSyncHandle::Cuda { event: None, .. } => {
+                FenceCapability::HostOnly
+            }
+            TransferSyncHandle::Cuda { event: Some(_), .. }
+            | TransferSyncHandle::CudaSubmission(_) => FenceCapability::DeviceAndHost,
+            #[cfg(target_os = "macos")]
+            TransferSyncHandle::Metal(_) => FenceCapability::DeviceAndHost,
+            #[cfg(not(target_os = "macos"))]
+            TransferSyncHandle::Vulkan(_) | TransferSyncHandle::VulkanSubmission { .. } => {
+                FenceCapability::DeviceAndHost
+            }
+        };
+        TimelinePoint::new(
+            DeviceId(self.id.device_id),
+            ProducerId(self.id.producer_queue_id),
+            self.id.value,
+            capability,
+        )
     }
 
     /// Whether `self` and `other` are one batch's handle, so following
@@ -212,9 +259,9 @@ impl TransferSync {
         self.id == other.id
     }
 
-    /// Validate that this transfer sync belongs to `device` and carries a
-    /// completion handle supported by `device`'s backend/queue. Rejects
-    /// foreign-device or unsupported handles loudly rather than silently
+    /// Validate that this fence belongs to `device` and carries a completion
+    /// handle supported by `device`'s backend/queue. Rejects foreign-device,
+    /// `HostOnly`-on-GPU, or unsupported handles loudly rather than silently
     /// ignoring them.
     pub(super) fn validate_for_device(&self, device: &DeviceInner) -> Result<(), ExecutionError> {
         let expected = device.device_id();
@@ -224,11 +271,22 @@ impl TransferSync {
                 self.id, self.id.device_id,
             )));
         }
+        // On GPU backends, enforce `TimelinePoint::validate_for_device_wait` so
+        // `FenceCapability::HostOnly` is rejected by construction.
+        if !matches!(device.kind, OpenedKind::Cpu(_)) {
+            self.timeline_point()
+                .validate_for_device_wait(DeviceId(expected))
+                .map_err(|err| ExecutionError::SubmissionFailed(err.to_string()))?;
+        }
         match (&device.kind, &self.handle) {
-            (OpenedKind::Cpu(_), TransferSyncHandle::Cpu) => Ok(()),
-            (OpenedKind::Cuda(_), TransferSyncHandle::Cuda(Some(_))) => Ok(()),
+            (OpenedKind::Cpu(_), TransferSyncHandle::Cpu(_)) => Ok(()),
+            (OpenedKind::Cuda(_), TransferSyncHandle::Cuda { event: Some(_), .. })
+            | (OpenedKind::Cuda(_), TransferSyncHandle::CudaSubmission(_)) => Ok(()),
+            #[cfg(target_os = "macos")]
+            (OpenedKind::Metal(_), TransferSyncHandle::Metal(_)) => Ok(()),
             #[cfg(not(target_os = "macos"))]
-            (OpenedKind::Vulkan(_), TransferSyncHandle::Vulkan(_)) => Ok(()),
+            (OpenedKind::Vulkan(_), TransferSyncHandle::Vulkan(_))
+            | (OpenedKind::Vulkan(_), TransferSyncHandle::VulkanSubmission { .. }) => Ok(()),
             _ => Err(ExecutionError::SubmissionFailed(format!(
                 "transfer sync {:?} is not supported on backend {:?}",
                 self.id,
@@ -237,25 +295,115 @@ impl TransferSync {
         }
     }
 
+    /// Construct a host-only CPU fence already reached at `value`.
+    pub(super) fn from_cpu_reached(device_id: u64, producer_queue_id: u64, value: u64) -> Self {
+        let tl = seismic_io::HostTimeline::new(DeviceId(device_id), ProducerId(producer_queue_id));
+        tl.advance(value);
+        Self {
+            id: TransferSyncId {
+                device_id,
+                producer_queue_id,
+                value,
+            },
+            handle: TransferSyncHandle::Cpu(Some(tl)),
+        }
+    }
+
+    /// Construct a `TransferSync` from a committed compute [`RouteSubmission`].
+    pub(super) fn from_compute_submission(
+        device: &DeviceInner,
+        route: &Arc<RouteSubmission>,
+        producer_queue_id: u64,
+        value: u64,
+        #[cfg(target_os = "macos")] metal_event: Option<Arc<seismic_metal::SharedEvent>>,
+    ) -> Self {
+        let device_id = device.device_id();
+        match route.committed() {
+            Committed::Cpu { .. } => Self::from_cpu_reached(device_id, producer_queue_id, value),
+            Committed::Cuda(_) => Self {
+                id: TransferSyncId {
+                    device_id,
+                    producer_queue_id,
+                    value,
+                },
+                handle: TransferSyncHandle::CudaSubmission(Arc::clone(route)),
+            },
+            #[cfg(target_os = "macos")]
+            Committed::Metal(_) => Self {
+                id: TransferSyncId {
+                    device_id,
+                    producer_queue_id,
+                    value,
+                },
+                handle: TransferSyncHandle::Metal(
+                    metal_event.expect("Metal signaled submission must attach SharedEvent"),
+                ),
+            },
+            #[cfg(not(target_os = "macos"))]
+            Committed::Vulkan(submission) => {
+                if let Some((semaphore, sem_val, _)) = submission.ready_timeline_wait() {
+                    Self {
+                        id: TransferSyncId {
+                            device_id,
+                            producer_queue_id,
+                            value: sem_val,
+                        },
+                        handle: TransferSyncHandle::VulkanSubmission {
+                            semaphore,
+                            route: Arc::clone(route),
+                        },
+                    }
+                } else {
+                    Self::from_cpu_reached(device_id, producer_queue_id, value)
+                }
+            }
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    pub(super) fn from_metal_event(
+        device_id: u64,
+        producer_queue_id: u64,
+        value: u64,
+        event: Arc<seismic_metal::SharedEvent>,
+    ) -> Self {
+        Self {
+            id: TransferSyncId {
+                device_id,
+                producer_queue_id,
+                value,
+            },
+            handle: TransferSyncHandle::Metal(event),
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    pub(super) fn metal_wait(&self) -> Option<(&seismic_metal::SharedEvent, u64)> {
+        match &self.handle {
+            TransferSyncHandle::Metal(event) => Some((event.as_ref(), self.id.value)),
+            _ => None,
+        }
+    }
+
     #[cfg(all(test, not(target_os = "macos")))]
     pub(super) fn cpu_for_test(device_id: u64, value: u64) -> Self {
-        Self {
-            id: TransferSyncId { device_id, producer_queue_id: 1, value },
-            handle: TransferSyncHandle::Cpu,
-        }
+        Self::from_cpu_reached(device_id, 1, value)
     }
 
     pub(super) fn cuda_event(&self) -> Option<&seismic_cuda::Event> {
         match &self.handle {
-            TransferSyncHandle::Cuda(event) => event.as_deref(),
+            TransferSyncHandle::Cuda { event, .. } => event.as_deref(),
+            TransferSyncHandle::CudaSubmission(route) => match route.committed() {
+                Committed::Cuda(sub) => Some(sub.completion_event()),
+                _ => None,
+            },
             _ => None,
         }
     }
 
     /// On Vulkan, the `(semaphore, value, owner)` timeline wait that signals
     /// when this batch completes (allocation-free fast path; `owner` retains
-    /// the `TransferQueue` alive inside `DirectBatch`/`Retired` until the
-    /// waiting submission retires on the GPU).
+    /// the backing queue/submission alive until the waiting submission retires).
     #[cfg(not(target_os = "macos"))]
     pub(super) fn vulkan_wait(
         &self,
@@ -265,6 +413,11 @@ impl TransferSync {
                 queue.semaphore(),
                 self.id.value,
                 Arc::clone(queue) as Arc<dyn std::any::Any + Send + Sync>,
+            )),
+            TransferSyncHandle::VulkanSubmission { semaphore, route } => Some((
+                *semaphore,
+                self.id.value,
+                Arc::clone(route) as Arc<dyn std::any::Any + Send + Sync>,
             )),
             _ => None,
         }
@@ -280,6 +433,107 @@ impl TransferSync {
         Self {
             id: TransferSyncId { device_id, producer_queue_id, value },
             handle: TransferSyncHandle::Vulkan(queue),
+        }
+    }
+
+    /// Non-blocking host check whether this fence has been reached.
+    pub fn is_reached(&self) -> Result<bool, FenceError> {
+        <Self as TimelineObserver>::is_reached(self, self.timeline_point())
+    }
+
+    /// Block the host up to `timeout` waiting for this fence to be reached.
+    pub fn wait(&self, timeout: Duration) -> Result<bool, FenceError> {
+        <Self as TimelineObserver>::wait(self, self.timeline_point(), timeout)
+    }
+}
+
+impl TimelineObserver for TransferSync {
+    fn is_reached(&self, point: TimelinePoint) -> Result<bool, FenceError> {
+        let expected = self.timeline_point();
+        if point.device != expected.device {
+            return Err(FenceError::DeviceMismatch {
+                expected: expected.device,
+                got: point.device,
+            });
+        }
+        if point.producer != expected.producer {
+            return Err(FenceError::UnknownProducer {
+                device: point.device,
+                producer: point.producer,
+            });
+        }
+        match &self.handle {
+            TransferSyncHandle::Cpu(Some(tl)) => tl.is_reached(point),
+            TransferSyncHandle::Cpu(None) => Ok(true),
+            TransferSyncHandle::Cuda { queue: Some(q), .. } => {
+                q.completed(point.value).map_err(|e| FenceError::Faulted(e.to_string()))
+            }
+            TransferSyncHandle::Cuda { event: Some(ev), queue: None } => {
+                ev.query().map_err(|e| FenceError::Faulted(e.to_string()))
+            }
+            TransferSyncHandle::Cuda { event: None, queue: None } => Ok(false),
+            TransferSyncHandle::CudaSubmission(route) => {
+                route.completed().map_err(|e| FenceError::Faulted(e.to_string()))
+            }
+            #[cfg(target_os = "macos")]
+            TransferSyncHandle::Metal(event) => Ok(event.value() >= point.value),
+            #[cfg(not(target_os = "macos"))]
+            TransferSyncHandle::Vulkan(queue) => {
+                queue.reached(point.value).map_err(|e| FenceError::Faulted(e.to_string()))
+            }
+            #[cfg(not(target_os = "macos"))]
+            TransferSyncHandle::VulkanSubmission { route, .. } => {
+                route.completed().map_err(|e| FenceError::Faulted(e.to_string()))
+            }
+        }
+    }
+
+    fn wait(&self, point: TimelinePoint, timeout: Duration) -> Result<bool, FenceError> {
+        let expected = self.timeline_point();
+        if point.device != expected.device {
+            return Err(FenceError::DeviceMismatch {
+                expected: expected.device,
+                got: point.device,
+            });
+        }
+        if point.producer != expected.producer {
+            return Err(FenceError::UnknownProducer {
+                device: point.device,
+                producer: point.producer,
+            });
+        }
+        match &self.handle {
+            TransferSyncHandle::Cpu(Some(tl)) => tl.wait(point, timeout),
+            TransferSyncHandle::Cpu(None) => Ok(true),
+            TransferSyncHandle::Cuda { queue: Some(q), .. } => {
+                q.wait(point.value, timeout).map_err(|e| FenceError::Faulted(e.to_string()))
+            }
+            TransferSyncHandle::Cuda { event: Some(ev), queue: None } => {
+                ev.synchronize().map_err(|e| FenceError::Faulted(e.to_string()))?;
+                Ok(true)
+            }
+            TransferSyncHandle::Cuda { event: None, queue: None } => Ok(false),
+            TransferSyncHandle::CudaSubmission(route) => {
+                if route.completed().map_err(|e| FenceError::Faulted(e.to_string()))? {
+                    return Ok(true);
+                }
+                route.ended().map_err(|e| FenceError::Faulted(e.to_string()))?;
+                Ok(true)
+            }
+            #[cfg(target_os = "macos")]
+            TransferSyncHandle::Metal(event) => Ok(event.wait(point.value, timeout)),
+            #[cfg(not(target_os = "macos"))]
+            TransferSyncHandle::Vulkan(queue) => {
+                queue.wait(point.value, timeout).map_err(|e| FenceError::Faulted(e.to_string()))
+            }
+            #[cfg(not(target_os = "macos"))]
+            TransferSyncHandle::VulkanSubmission { route, .. } => {
+                if route.completed().map_err(|e| FenceError::Faulted(e.to_string()))? {
+                    return Ok(true);
+                }
+                route.ended().map_err(|e| FenceError::Faulted(e.to_string()))?;
+                Ok(true)
+            }
         }
     }
 }
@@ -339,18 +593,83 @@ impl TransferInner {
     /// (written) and every signal's word (written): host access to them,
     /// and their storage's release, wait for it.
     pub fn copy(&self, items: &[TransferItem<'_>]) -> Result<u64, TransferError> {
-        self.copy_inner(items, false).map(|(value, _)| value)
+        self.copy_inner(items, &[], false).map(|(value, _)| value)
     }
 
     /// [`Self::copy`], also returning a [`TransferSync`] event handle so a
     /// [`super::graph::NativeGraphSequence`] can wait on the batch via
-    /// cross-stream event synchronization (`cuStreamWaitEvent` on CUDA).
+    /// cross-stream event synchronization (`cuStreamWaitEvent` on CUDA,
+    /// timeline semaphore wait on Vulkan).
     pub fn copy_synced(&self, items: &[TransferItem<'_>]) -> Result<(u64, TransferSync), TransferError> {
-        self.copy_inner(items, true)
+        self.copy_inner(items, &[], true)
     }
 
-    fn copy_inner(&self, items: &[TransferItem<'_>], record_event: bool) -> Result<(u64, TransferSync), TransferError> {
+    /// [`Self::copy_synced`], first ordering this transfer batch after every
+    /// [`TransferSync`] fence in `wait_fences` (`cuStreamWaitEvent` on CUDA,
+    /// `vkQueueSubmit2` timeline semaphore wait on Vulkan, host wait on CPU)
+    /// and returning this batch's signal [`TransferSync`]. Rejects foreign
+    /// devices or `HostOnly` fences on GPU backends as
+    /// [`TransferError::RefusedBeforeIssue`].
+    pub fn copy_after(
+        &self,
+        items: &[TransferItem<'_>],
+        wait_fences: &[&TransferSync],
+    ) -> Result<(u64, TransferSync), TransferError> {
+        self.copy_inner(items, wait_fences, true)
+    }
+
+    /// Raise `gate` to `value` once all previously queued copies on this
+    /// transfer queue have landed. On CUDA this emits `cuStreamWriteValue32`
+    /// directly on the copy stream (zero host wait on DMA completion); on
+    /// other backends it waits for the latest queued batch and raises `gate`
+    /// from the host.
+    pub fn signal_gate(
+        &self,
+        gate: &super::timeline::TimelineHost<super::timeline::Gate>,
+        value: u64,
+    ) -> Result<(), TransferError> {
+        if gate.inner().device().device_id() != self.device.device_id() {
+            return Err(TransferError::RefusedBeforeIssue(ExecutionError::SubmissionFailed(
+                format!(
+                    "timeline gate belongs to device {}, not transfer device {}",
+                    gate.inner().device().device_id(),
+                    self.device.device_id(),
+                ),
+            )));
+        }
+        let _issuing = self.issuing.lock().expect("transfer queue lock is never poisoned");
+        match (&self.queue.kind, gate.inner().kind()) {
+            (TransferKind::Cuda(queue), super::timeline::TimelineKind::Cuda(sides)) => queue
+                .write_word(sides.gate.device_address(), value as u32)
+                .map_err(TransferError::Execution),
+            _ => {
+                let latest = self.next.load(Ordering::Relaxed).saturating_sub(1);
+                if latest > 0 {
+                    while !self
+                        .queue
+                        .wait(latest, Duration::from_secs(1))
+                        .map_err(TransferError::Execution)?
+                    {
+                        std::thread::yield_now();
+                    }
+                }
+                gate.signal(value).map_err(TransferError::Execution)
+            }
+        }
+    }
+
+    fn copy_inner(
+        &self,
+        items: &[TransferItem<'_>],
+        wait_fences: &[&TransferSync],
+        record_event: bool,
+    ) -> Result<(u64, TransferSync), TransferError> {
         seismic_memory::assert_blocking_allocation_allowed("TransferInner::copy");
+        for fence in wait_fences {
+            fence
+                .validate_for_device(&self.device)
+                .map_err(TransferError::RefusedBeforeIssue)?;
+        }
         for item in items {
             match item {
                 TransferItem::Run(run) => self.check(run)?,
@@ -423,6 +742,11 @@ impl TransferInner {
                         TransferItem::Signal { word, offset, value } => Ok(Step::Signal(write_at(word, *offset)?, *value)),
                     })
                     .collect::<Result<Vec<_>, TransferError>>()?;
+                for fence in wait_fences {
+                    fence
+                        .wait(Duration::from_secs(60))
+                        .map_err(|e| TransferError::RefusedBeforeIssue(ExecutionError::SubmissionFailed(e.to_string())))?;
+                }
                 for step in steps {
                     match step {
                         // SAFETY: both ranges lie in live views (checked);
@@ -437,11 +761,26 @@ impl TransferInner {
                     }
                 }
                 done.store(value, Ordering::Release);
-                TransferSyncHandle::Cpu
+                let tl = seismic_io::HostTimeline::new(
+                    DeviceId(self.device.device_id()),
+                    ProducerId(self.producer_queue_id),
+                );
+                tl.advance(value);
+                TransferSyncHandle::Cpu(Some(tl))
             }
             TransferKind::Cuda(queue) => {
                 type Cuda = seismic_cuda::Cuda;
                 type Executor = seismic_cuda::Executor;
+                let wait_events: Vec<&seismic_cuda::Event> = wait_fences
+                    .iter()
+                    .map(|fence| {
+                        fence.cuda_event().ok_or_else(|| {
+                            TransferError::RefusedBeforeIssue(ExecutionError::SubmissionFailed(
+                                format!("wait fence {:?} carries no CUDA event", fence.id()),
+                            ))
+                        })
+                    })
+                    .collect::<Result<_, _>>()?;
                 let items = items
                     .iter()
                     .map(|item| match item {
@@ -460,11 +799,7 @@ impl TransferInner {
                     })
                     .collect::<Vec<_>>();
                 // The word holds a value's low 32 bits, compared cyclically.
-                let result = if record_event {
-                    queue.copy_event(&items, value as u32).map(Some)
-                } else {
-                    queue.copy(&items, value as u32).map(|()| None)
-                };
+                let result = queue.copy_after_events(&items, value as u32, &wait_events, record_event);
                 let cuda_event = match self.handle_cuda_copy_outcome(result, value, &access) {
                     Ok(event) => event,
                     Err(error) => {
@@ -472,11 +807,27 @@ impl TransferInner {
                         return Err(error);
                     }
                 };
-                TransferSyncHandle::Cuda(cuda_event)
+                TransferSyncHandle::Cuda {
+                    event: cuda_event,
+                    queue: Some(Arc::clone(&self.queue)),
+                }
             }
             #[cfg(not(target_os = "macos"))]
             TransferKind::Vulkan(queue) => {
                 use crate::backends::vulkan_transfer_end;
+                let mut wait_sems: Vec<(seismic_vulkan::vk::Semaphore, u64)> =
+                    Vec::with_capacity(wait_fences.len());
+                let mut wait_owners: Vec<Arc<dyn std::any::Any + Send + Sync>> =
+                    Vec::with_capacity(wait_fences.len());
+                for fence in wait_fences {
+                    let Some((sem, val, owner)) = fence.vulkan_wait() else {
+                        return Err(TransferError::RefusedBeforeIssue(ExecutionError::SubmissionFailed(
+                            format!("wait fence {:?} carries no Vulkan timeline semaphore", fence.id()),
+                        )));
+                    };
+                    wait_sems.push((sem, val));
+                    wait_owners.push(owner);
+                }
                 let items = items
                     .iter()
                     .map(|item| match item {
@@ -494,7 +845,7 @@ impl TransferInner {
                         },
                     })
                     .collect::<Vec<_>>();
-                queue.copy(&items, value).map_err(TransferError::Execution)?;
+                queue.copy_after(&items, value, &wait_sems, wait_owners).map_err(TransferError::Execution)?;
                 TransferSyncHandle::Vulkan(Arc::clone(queue))
             }
         };
@@ -980,7 +1331,10 @@ mod tests {
                 producer_queue_id: 99,
                 value: 1,
             },
-            handle: TransferSyncHandle::Cuda(None),
+            handle: TransferSyncHandle::Cuda {
+                event: None,
+                queue: None,
+            },
         };
         let err = seq_a
             .follow_transfer(unsupported)
@@ -990,5 +1344,248 @@ mod tests {
             msg.contains("is not supported on backend"),
             "unexpected unsupported-handle error: {msg}"
         );
+    }
+
+    /// Stage 1: `TransferSync` bridges directly to `seismic_io::TimelinePoint`
+    /// (`HostOnly` on CPU, `DeviceAndHost` on Metal/GPU), implements
+    /// `TimelineObserver` (usable directly by `IoPlane::reserve_bus_until_fence`),
+    /// and `TransferInner::copy_after` orders a transfer after upstream fences
+    /// while rejecting foreign-device handles as `RefusedBeforeIssue`.
+    #[test]
+    fn timeline_point_bridge_copy_after_and_io_plane_integration() {
+        use crate::devices::Devices;
+        use crate::memory::Charges;
+        use crate::native::graph::NativeGraphSequence;
+        use crate::native::NativeQueue;
+        use seismic_lang::registry::BackendName;
+
+        let device_a = cpu();
+        let device_b = cpu();
+
+        let alloc = |dev: &Arc<DeviceInner>| {
+            let charges = Charges::tally(dev);
+            let i32s = seismic_lang::registry::dense(seismic_lang::types::DType::I32);
+            TensorInner::from_host(&charges, i32s, &[1], &[1, 2, 3, 4]).unwrap()
+        };
+        let src_a = alloc(&device_a);
+        let mid_a = alloc(&device_a);
+        let dst_a = alloc(&device_a);
+        let src_b = alloc(&device_b);
+        let dst_b = alloc(&device_b);
+
+        let queue_a = TransferInner::new(&device_a).unwrap();
+        let queue_b = TransferInner::new(&device_b).unwrap();
+
+        let (_, sync1) = queue_a
+            .copy_synced(&[TransferItem::Run(TransferRun {
+                source: &src_a,
+                source_offset: 0,
+                destination: &mid_a,
+                destination_offset: 0,
+                bytes: 4,
+            })])
+            .unwrap();
+
+        // CPU TransferSync exposes `FenceCapability::HostOnly` and is reached.
+        let pt1 = sync1.timeline_point();
+        assert_eq!(pt1.device, DeviceId(device_a.device_id()));
+        assert_eq!(pt1.capability, FenceCapability::HostOnly);
+        assert!(sync1.is_reached().unwrap());
+        assert!(sync1.wait(Duration::from_millis(10)).unwrap());
+
+        // `copy_after` chains a second transfer after `sync1`.
+        let (_, sync2) = queue_a
+            .copy_after(
+                &[TransferItem::Run(TransferRun {
+                    source: &mid_a,
+                    source_offset: 0,
+                    destination: &dst_a,
+                    destination_offset: 0,
+                    bytes: 4,
+                })],
+                &[&sync1],
+            )
+            .unwrap();
+        assert_eq!(sync2.timeline_point().value, pt1.value + 1);
+        assert!(sync2.is_reached().unwrap());
+
+        // Foreign-device wait fence is rejected as `RefusedBeforeIssue`.
+        let (_, sync_b) = queue_b
+            .copy_synced(&[TransferItem::Run(TransferRun {
+                source: &src_b,
+                source_offset: 0,
+                destination: &dst_b,
+                destination_offset: 0,
+                bytes: 4,
+            })])
+            .unwrap();
+        let err = queue_a
+            .copy_after(
+                &[TransferItem::Run(TransferRun {
+                    source: &mid_a,
+                    source_offset: 0,
+                    destination: &dst_a,
+                    destination_offset: 0,
+                    bytes: 4,
+                })],
+                &[&sync_b],
+            )
+            .err()
+            .expect("foreign-device wait_fence must fail");
+        assert!(err.refused_before_issue(), "foreign wait fence must be RefusedBeforeIssue: {err}");
+
+        // `NativeGraphSequence::wait_fence` accepts same-device fence.
+        let mut seq = NativeGraphSequence::new(&device_a, NativeQueue::Compute);
+        assert!(seq.wait_fence(sync2.clone()).is_ok());
+
+        // `TransferSync` plugs directly into `seismic_io::IoPlane::reserve_bus_until_fence`.
+        let ddr = seismic_io::SharedBusId::HostDdr(seismic_io::NumaNodeId(0));
+        let fabric = seismic_io::Fabric::build(seismic_io::FabricSpec {
+            revision: 1,
+            buses: vec![seismic_io::SharedBusSpec {
+                id: ddr,
+                peak_bps: 60e9,
+                uncertainty_rel: 0.03,
+            }],
+            links: Vec::new(),
+        })
+        .unwrap();
+        let plane = seismic_io::IoPlane::new(fabric);
+        let _res = plane
+            .reserve_bus_until_fence(
+                ddr,
+                10e9,
+                sync2.timeline_point(),
+                Arc::new(sync2),
+            )
+            .unwrap();
+        plane.poll_fence_reservations();
+        assert_eq!(plane.bus_ledger(ddr).unwrap().active_reservations, 0);
+
+        // On macOS Metal: `MTLSharedEvent` produces `DeviceAndHost` and rejects
+        // `HostOnly` CPU fences on GPU `wait_fence`.
+        #[cfg(target_os = "macos")]
+        {
+            let devices = Devices::discover(&[]).unwrap();
+            if let Ok(metal_exec) = devices.executor_of(BackendName::Metal) {
+                if let Ok(metal_dev) = devices.open(metal_exec) {
+                let OpenedKind::Metal(opened) = &metal_dev.kind else {
+                    unreachable!();
+                };
+                let ev = Arc::new(seismic_metal::SharedEvent::new(opened.service()).unwrap());
+                let metal_fence = TransferSync::from_metal_event(
+                    metal_dev.device_id(),
+                    next_queue_id(),
+                    1,
+                    Arc::clone(&ev),
+                );
+                assert_eq!(metal_fence.timeline_point().capability, FenceCapability::DeviceAndHost);
+                assert!(!metal_fence.is_reached().unwrap());
+                ev.signal(1);
+                assert!(metal_fence.is_reached().unwrap());
+
+                let mut mseq = NativeGraphSequence::new(&metal_dev, NativeQueue::Compute);
+                assert!(mseq.wait_fence(metal_fence).is_ok());
+
+                // HostOnly CPU fence (even with matching device_id) is rejected on Metal!
+                let host_only = TransferSync::from_cpu_reached(metal_dev.device_id(), 77, 1);
+                assert!(
+                    mseq.wait_fence(host_only).is_err(),
+                    "Metal GPU wait_fence must reject HostOnly fence"
+                );
+            }
+            }
+        }
+    }
+
+    #[test]
+    fn cuda_transfer_signal_gate_unblocks_compute_wait_word_alternating() {
+        let devices = crate::devices::Devices::discover(&[]).unwrap();
+        let Ok(exec) = devices.executor_of(seismic_lang::registry::BackendName::Cuda) else {
+            return;
+        };
+        let device = devices.open(exec).unwrap();
+        let OpenedKind::Cuda(opened) = &device.kind else {
+            unreachable!();
+        };
+        let transfer = TransferInner::new(&device).unwrap();
+        let gate = crate::native::timeline::TimelineHost::<crate::native::timeline::Gate>::new(&device)
+            .unwrap();
+        let super::super::timeline::TimelineKind::Cuda(sides) = gate.inner().kind() else {
+            unreachable!();
+        };
+        let charges = crate::memory::Charges::tally(&device);
+        let i32s = seismic_lang::registry::dense(seismic_lang::types::DType::I32);
+        let elems = 64 * 1024u64;
+        let bytes = (elems * 4) as usize;
+        let dev_src = TensorInner::from_host(&charges, i32s, &[elems], &vec![0x5Au8; bytes]).unwrap();
+        let dev_dst = TensorInner::from_host(&charges, i32s, &[elems], &vec![0u8; bytes]).unwrap();
+
+        // Pre-queue 32 alternating compute waits ahead of copy-stream and host signals,
+        // mirroring `DecodeReactor` + `StepSubmitter` across >8 layers.
+        let mut completions = Vec::new();
+        for step in 1u64..=32 {
+            let mut batch = seismic_cuda::direct::DirectBatch::unobserved(
+                opened.service(),
+                seismic_cuda::NativeStream::Compute,
+            )
+            .unwrap();
+            batch.wait_word(&sides.gate, step as u32).unwrap();
+            let committed = batch.commit().unwrap();
+            completions.push((step, committed));
+        }
+        for (step, committed) in completions {
+            if step % 2 == 1 {
+                let (_val, _sync) = transfer
+                    .copy_synced(&[TransferItem::Run(TransferRun {
+                        source: &dev_src,
+                        source_offset: 0,
+                        destination: &dev_dst,
+                        destination_offset: 0,
+                        bytes: bytes as u64,
+                    })])
+                    .unwrap();
+                transfer.signal_gate(&gate, step).unwrap();
+            } else {
+                gate.signal(step).unwrap();
+            }
+            let deadline = std::time::Instant::now() + Duration::from_secs(5);
+            while !committed.completed().unwrap() {
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "CUDA Compute wait_word hung at step {step}, gate word={}",
+                    sides.gate.load()
+                );
+                std::thread::yield_now();
+            }
+        }
+        assert_eq!(sides.gate.load(), 32);
+
+        // Also test whether `opened.service().drain()` (`cuEventSynchronize`) on Thread A
+        // while `Compute` is blocked on `wait_word(33)` allows Thread B to call
+        // `transfer.copy_synced` + `transfer.signal_gate(33)` without deadlocking on
+        // the CUDA driver context mutex!
+        let mut batch = seismic_cuda::direct::DirectBatch::unobserved(
+            opened.service(),
+            seismic_cuda::NativeStream::Compute,
+        )
+        .unwrap();
+        batch.wait_word(&sides.gate, 33).unwrap();
+        let _committed = batch.commit().unwrap();
+        let dev_clone = opened.service().clone();
+        let drainer = std::thread::spawn(move || dev_clone.drain());
+        std::thread::sleep(Duration::from_millis(50));
+        let (_val, _sync) = transfer
+            .copy_synced(&[TransferItem::Run(TransferRun {
+                source: &dev_src,
+                source_offset: 0,
+                destination: &dev_dst,
+                destination_offset: 0,
+                bytes: bytes as u64,
+            })])
+            .unwrap();
+        transfer.signal_gate(&gate, 33).unwrap();
+        drainer.join().unwrap().unwrap();
+        assert_eq!(sides.gate.load(), 33);
     }
 }

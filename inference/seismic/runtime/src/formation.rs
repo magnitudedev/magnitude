@@ -247,6 +247,16 @@ impl<T: Toolchain> ProgramFormer<T> {
         *self.workers.lock().expect("worker slot lock is never poisoned") = workers;
     }
 
+    /// Drop cached program-store lookup entries once load-time formation ends.
+    /// Any later lookup transparently reads the store again.
+    pub(crate) fn clear_stored(&self) {
+        let old = {
+            let mut stored = self.stored.lock().expect("stored map lock is never poisoned");
+            std::mem::take(&mut *stored)
+        };
+        drop(old);
+    }
+
     /// The threads lent to the former, if any.
     pub(crate) fn workers(&self) -> Option<Arc<Workers>> {
         self.workers

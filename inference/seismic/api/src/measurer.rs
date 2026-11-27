@@ -188,7 +188,7 @@ impl KernelIdentity {
         statics: &NativeSpecialization,
     ) -> Result<Self, LoadError> {
         let module = E::module().map_err(LoadError::Bundle)?;
-        let resolved = E::resolve(module).map_err(LoadError::Bundle)?;
+        let resolved = E::resolve(&module).map_err(LoadError::Bundle)?;
         let bindings = entry.elements.iter().fold(
             seismic_lang::entry::ElementBindings::new(),
             |bindings, (name, element)| bindings.bind(name, element.id()),

@@ -264,10 +264,21 @@ impl SubmissionTrace {
             #[cfg(target_os = "macos")]
             (Committed::Metal(submission), _) => {
                 submission.finish().map_err(execution)?;
+                let queue = submission
+                    .queue_submissions()
+                    .map_err(execution)?
+                    .into_iter()
+                    .map(|(handed, taken, device)| TracedQueueSubmission {
+                        handed,
+                        taken,
+                        opened: None,
+                        device,
+                    })
+                    .collect();
                 (
                     submission.device_interval().map_err(execution)?,
                     submission.launch_intervals().map_err(execution)?,
-                    Vec::new(),
+                    queue,
                 )
             }
             (Committed::Cuda(submission), Timeline::Cuda(anchor)) => {

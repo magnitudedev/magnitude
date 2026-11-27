@@ -54,16 +54,23 @@ pub enum Placement {
     /// shares row by row, a code plane each packet's 32 columns of its rows
     /// together (`[packet][row][packet bytes]`).
     Rows32,
-    /// `mma16`: group planes as `rows16`'s; a tile's code plane spread over
-    /// its rows' code planes, each k-block of 64 columns of the tile its
-    /// GEMV lanes (codes: `[k-block][lane 4g + t][4 steps of 16 columns]`,
-    /// row `g` and `g + 8` sharing each lane) or rows (grids: `[k-block][row]`).
-    Mma16,
-    /// `mma16` of a carried grid representation: its one `records` plane, a
-    /// tile's bytes whole (`PackedRowLayout::record_byte`), each storage
-    /// group's `entries` bytes of its rows' grid entries in GEMV lane order
-    /// (`PackedRowLayout::record_entry`), then every group's factors.
-    Records { entries: usize },
+    /// `mma16`: tile-contiguous planes (`tile_base + offset * 16`), with code
+    /// planes laid out by GEMV lanes (`[k-block][lane 4g + t][4 steps]`) or
+    /// grid rows (`[k-block][row]`), and one `TileFactors` plane packing
+    /// `scales` (`scales_bytes`) followed by `supers` in
+    /// `[sb][record_factor(r)][scales || supers]` order.
+    Mma16 { scales_bytes: usize },
+    /// `mma16` of a grid representation packed as superblock records: its one
+    /// `records` plane, a tile's bytes whole (`PackedRowLayout::record_byte`),
+    /// each storage group's `entries` bytes of its rows' grid entries in GEMV
+    /// lane order, then every group's factors (`scales_bytes` of local scales,
+    /// when not carried, followed by the super factor).
+    Records {
+        entries: usize,
+        scales_bytes: usize,
+        group: u32,
+        entry_bits: u32,
+    },
 }
 
 impl Placement {
@@ -73,7 +80,7 @@ impl Placement {
             Self::Rows => 1,
             Self::Rows8 => 8,
             Self::Rows32 => 32,
-            Self::Mma16 | Self::Records { .. } => 16,
+            Self::Mma16 { .. } | Self::Records { .. } => 16,
         }
     }
 
@@ -84,7 +91,7 @@ impl Placement {
     /// its dot block too).
     pub const fn row_block(self) -> usize {
         match self {
-            Self::Mma16 => 16,
+            Self::Mma16 { .. } => 16,
             Self::Rows | Self::Rows8 | Self::Rows32 | Self::Records { .. } => 8,
         }
     }
@@ -183,10 +190,9 @@ pub struct RowGeometry {
     /// Row addressing of the bound tensor. Zero base is used for unbound geometry.
     pub base: usize,
     pub matrix_rows: usize,
-    /// Per code role of an `mma16` layout, the bytes of one unit of a
-    /// tile's `V`, the units of one row's payload and their division by
-    /// multiplication (`Mma16Plane`): derived once, not per row.
-    pub mma16_units: [(usize, usize, u64); 2],
+    /// Per code role of an `mma16` layout, the bytes of one unit of a tile's
+    /// contiguous code plane (`Mma16Plane`).
+    pub mma16_units: [usize; 2],
 }
 
 impl RowGeometry {
@@ -207,7 +213,7 @@ impl RowGeometry {
             grids: false,
             base: 0,
             matrix_rows: 0,
-            mma16_units: [(0, 0, 0); 2],
+            mma16_units: [0; 2],
         };
         match &element.kind {
             RepresentationKind::Dense(_) => {}
@@ -228,18 +234,47 @@ impl RowGeometry {
                     }
                 }
                 geometry.group_packets = rows.group() as usize / PACKET;
-                let records = rows
-                    .planes
-                    .iter()
-                    .any(|plane| matches!(plane.content, RowPlaneContent::Records { .. }));
+                let records = rows.planes.iter().find_map(|plane| match &plane.content {
+                    RowPlaneContent::Records {
+                        carried,
+                        group,
+                        entry_bits,
+                        factors,
+                        ..
+                    } => {
+                        let scales_bytes = if carried.is_none() && factors.len() >= 2 {
+                            rows.packet.planes[factors[0] as usize].bytes_per_group as usize
+                        } else {
+                            0
+                        };
+                        Some((scales_bytes, *group, *entry_bits))
+                    }
+                    _ => None,
+                });
+                let tile_factors_scales = rows.planes.iter().find_map(|plane| match &plane.content {
+                    RowPlaneContent::TileFactors { scales, .. } => Some(
+                        scales
+                            .iter()
+                            .map(|p| rows.packet.planes[*p as usize].bytes_per_group as usize)
+                            .sum(),
+                    ),
+                    _ => None,
+                });
                 geometry.placement = match element.layout {
                     Layout::Rows16 => Placement::Rows,
                     Layout::Rows8 => Placement::Rows8,
                     Layout::Rows32 => Placement::Rows32,
-                    Layout::Mma16 if records => {
-                        Placement::Records { entries: rows.record_entry_bytes() as usize }
-                    }
-                    Layout::Mma16 => Placement::Mma16,
+                    Layout::Mma16 => match records {
+                        Some((scales_bytes, group, entry_bits)) => Placement::Records {
+                            entries: rows.record_entry_bytes() as usize,
+                            scales_bytes,
+                            group,
+                            entry_bits,
+                        },
+                        None => Placement::Mma16 {
+                            scales_bytes: tile_factors_scales.unwrap_or(0),
+                        },
+                    },
                     Layout::Packet => unreachable!("a row layout is never `packet`"),
                 };
             }
@@ -247,16 +282,14 @@ impl RowGeometry {
                 panic!("`{}` is no CPU weight element", element.name)
             }
         }
-        if geometry.placement == Placement::Mma16 {
+        if matches!(geometry.placement, Placement::Mma16 { .. }) {
             for role in RowPlaneRole::CODES {
                 let role = role as usize;
                 // A lane holds a packet's bytes of one k-block (four steps
                 // of 16 columns, two rows); a grid row's k-block is two
                 // packets.
                 let packet = geometry.packet_bytes(role);
-                let unit = if geometry.grids { 2 * packet } else { packet };
-                let units = (geometry.row_bytes[role] / unit.max(1)).max(1);
-                geometry.mma16_units[role] = (unit, units, (1u64 << 40) / units as u64 + 1);
+                geometry.mma16_units[role] = if geometry.grids { 2 * packet } else { packet };
             }
         }
         geometry
@@ -363,31 +396,66 @@ impl RowGeometry {
                     tile.wrapping_add(offset * 32 + r * packet)
                 }
                 Placement::Rows32 => tile.wrapping_add(offset * 32 + r * self.row_bytes[plane]),
-                Placement::Mma16 if code => std::ptr::null(),
-                Placement::Mma16 => tile.wrapping_add(r * self.stride + offset),
+                Placement::Mma16 { .. } if code => std::ptr::null(),
+                Placement::Mma16 { scales_bytes } => {
+                    let factors_offset = self.offsets[RowPlaneRole::Supers as usize];
+                    let group_bytes = self.groups[RowPlaneRole::Supers as usize];
+                    if self.group_packets == 8 {
+                        let place = registry::PackedRowLayout::record_factor(r as u64) as usize;
+                        steps[plane] = registry::MMA_TILE_ROWS as usize * group_bytes;
+                        match RowPlaneRole::ALL[plane] {
+                            RowPlaneRole::Scales if scales_bytes > 0 => tile.wrapping_add(
+                                factors_offset * registry::MMA_TILE_ROWS as usize + place * group_bytes,
+                            ),
+                            RowPlaneRole::Supers => tile.wrapping_add(
+                                factors_offset * registry::MMA_TILE_ROWS as usize
+                                    + place * group_bytes
+                                    + scales_bytes,
+                            ),
+                            _ => std::ptr::null(),
+                        }
+                    } else {
+                        // Direct formats with storage_group < 256: Row::group resolves each
+                        // storage group's tile-superblock slot; steps[Supers] is the
+                        // intra-superblock step used by Block::at.
+                        steps[plane] = group_bytes;
+                        std::ptr::null()
+                    }
+                }
                 // The one plane's storage groups: their entries (at
-                // `record_entry` of each), and, past every stored group's
-                // entries, their factors, the row's at `record_factor`.
-                Placement::Records { entries } => {
+                // `record_entry` / `record16_*` of each), and, past every
+                // stored group's entries, their factors, the row's at
+                // `record_factor`.
+                Placement::Records {
+                    entries,
+                    scales_bytes,
+                    ..
+                } => {
                     let record = self.groups[RowPlaneRole::Codes as usize];
                     let factors = registry::MMA_TILE_ROWS as usize * record - entries;
+                    let stored = self.row_bytes[RowPlaneRole::Codes as usize] / record;
+                    let width = factors / registry::MMA_TILE_ROWS as usize;
+                    let place = registry::PackedRowLayout::record_factor(r as u64) as usize;
                     match RowPlaneRole::ALL[plane] {
                         RowPlaneRole::Codes => {
                             steps[plane] = entries;
                             tile
                         }
+                        RowPlaneRole::Scales if scales_bytes > 0 => {
+                            steps[plane] = factors;
+                            tile.wrapping_add(stored * entries + place * width)
+                        }
                         RowPlaneRole::Supers => {
                             steps[plane] = factors;
-                            let stored = self.row_bytes[RowPlaneRole::Codes as usize] / record;
-                            let width = factors / registry::MMA_TILE_ROWS as usize;
-                            let place = registry::PackedRowLayout::record_factor(r as u64) as usize;
-                            tile.wrapping_add(stored * entries + place * width)
+                            tile.wrapping_add(stored * entries + place * width + scales_bytes)
                         }
                         RowPlaneRole::High | RowPlaneRole::Scales => std::ptr::null(),
                     }
                 }
             };
-            planes[plane] = planes[plane].wrapping_add(self.first_group * steps[plane]);
+            if !planes[plane].is_null() {
+                planes[plane] = planes[plane].wrapping_add(self.first_group * steps[plane]);
+            }
         }
         Row {
             start: row,
@@ -396,39 +464,43 @@ impl RowGeometry {
             packet_steps,
             tile: (self.placement == Placement::Rows8).then_some((tile as usize, r)),
             panel: self.placement == Placement::Rows8 && !self.grids,
-            mma16: (self.placement == Placement::Mma16).then(|| Mma16Row::of(self, tile, r)),
-            record: matches!(self.placement, Placement::Records { .. }).then_some(r),
+            mma16: matches!(self.placement, Placement::Mma16 { .. }).then(|| Mma16Row::of(self, tile, r)),
+            record: match self.placement {
+                Placement::Records {
+                    group, entry_bits, ..
+                } => Some((r, group, entry_bits)),
+                _ => None,
+            },
         }
     }
 }
 
-/// A row's code planes of an `mma16` tile: each plane's bytes of the tile,
-/// `V`, are its 16 rows' plane payloads one after another
-/// (`PackedRowLayout::code_bit`), so `V`'s units (a lane's or a row's bytes
-/// of one k-block) lie in the rows' planes in turn.
+/// A row's code planes and (when `storage_group < 256`) `TileFactors` plane of
+/// an `mma16` tile: every plane is contiguous across the tile's 16 rows
+/// (`tile_base + offset * 16`).
 #[derive(Clone, Copy, Debug)]
 struct Mma16Row {
     /// The row within its tile.
     row: usize,
-    /// The view's first packet of a row, and the packets of a storage group.
+    /// The view's first storage group and first packet of a row, and the
+    /// packets of a storage group.
+    first_group: usize,
     first_packet: usize,
     group_packets: usize,
     planes: [Mma16Plane; 2],
+    /// For `Direct` `TileFactors` with `group_packets < 8` (`storage_group < 256`):
+    /// `(factors_plane_start, group_bytes, row_groups)`.
+    tile_factors: Option<(*const u8, usize, usize)>,
 }
 
-/// One code plane of an `mma16` tile (`Mma16Row`).
+/// One contiguous code plane of an `mma16` tile (`Mma16Row`).
 #[derive(Clone, Copy, Debug)]
 struct Mma16Plane {
-    /// The plane's first byte in the tile's first row.
+    /// The plane's first byte in the tile (`tile_base + offset * 16`).
     start: *const u8,
-    stride: usize,
-    /// Bytes of one unit of `V`: a lane's bytes of one k-block (codes), or
-    /// a row's (grids); and the units of one row's payload, with its
-    /// division by multiplication (`units * magic` within `2^40` of a
-    /// multiple of `2^40`, exact for every unit of a tile).
+    /// Bytes of one unit of the tile's contiguous plane: a lane's bytes of one
+    /// k-block (codes), or a row's (grids).
     unit: usize,
-    units: usize,
-    magic: u64,
     /// Whether it holds grid entries or their further bits (`[k-block][row]`,
     /// a grid high plane placed as its grids plane), else codes by lanes.
     grid: bool,
@@ -436,62 +508,45 @@ struct Mma16Plane {
 
 impl Mma16Row {
     fn of(geometry: &RowGeometry, tile: *const u8, row: usize) -> Self {
-        let plane = |role: usize| {
-            let (unit, units, magic) = geometry.mma16_units[role];
-            Mma16Plane {
-                start: tile.wrapping_add(geometry.offsets[role]),
-                stride: geometry.stride,
-                unit,
-                units,
-                magic,
-                grid: geometry.grids,
-            }
+        let plane = |role: usize| Mma16Plane {
+            start: tile.wrapping_add(geometry.offsets[role] * registry::MMA_TILE_ROWS as usize),
+            unit: geometry.mma16_units[role],
+            grid: geometry.grids,
         };
+        let tile_factors = (geometry.group_packets < 8).then(|| {
+            let supers = RowPlaneRole::Supers as usize;
+            let group_bytes = geometry.groups[supers];
+            let row_groups = geometry.row_bytes[supers] / group_bytes;
+            (
+                tile.wrapping_add(geometry.offsets[supers] * registry::MMA_TILE_ROWS as usize),
+                group_bytes,
+                row_groups,
+            )
+        });
         Self {
             row,
+            first_group: geometry.first_group,
             first_packet: geometry.first_group * geometry.group_packets,
             group_packets: geometry.group_packets,
             planes: [plane(0), plane(1)],
+            tile_factors,
         }
     }
 }
 
 impl Mma16Plane {
-    /// The first byte of unit `unit` of the tile's `V`.
+    /// The first byte of unit `unit` of the tile's contiguous plane.
     #[inline(always)]
     fn unit(&self, unit: usize) -> *const u8 {
-        self.at(self.place(unit))
+        self.start.wrapping_add(unit * self.unit)
     }
 
-    /// The row of the tile and the unit within its payload holding unit
-    /// `unit` of `V`: the same in every code plane of the tile with as many
-    /// units a row (a codes plane and its high plane).
-    #[inline(always)]
-    fn place(&self, unit: usize) -> (usize, usize) {
-        let row = ((unit as u64 * self.magic) >> 40) as usize;
-        (row, unit - row * self.units)
-    }
-
-    /// The first bytes of lane quads `4g ..4g + 4` of the k-block whose
-    /// lane 0 is unit `first` of `V` (each quad together: `Row::lanes_whole`),
-    /// with one division where the k-block lies in one row's payload. The
-    /// x86 tile path's alone.
+    /// The first bytes of lane quads `4g .. 4g + 4` of the k-block whose lane 0
+    /// is unit `first` of the tile's contiguous plane. The x86 tile path's alone.
     #[cfg(target_arch = "x86_64")]
     #[inline(always)]
     fn quads(&self, first: usize) -> [*const u8; 8] {
-        let (row, within) = self.place(first);
-        if within + 32 <= self.units {
-            let base = self.at((row, within));
-            std::array::from_fn(|g| base.wrapping_add(4 * g * self.unit))
-        } else {
-            std::array::from_fn(|g| self.unit(first + 4 * g))
-        }
-    }
-
-    /// The first byte of unit `within` of the tile's row `row`'s payload.
-    #[inline(always)]
-    fn at(&self, (row, within): (usize, usize)) -> *const u8 {
-        self.start.wrapping_add(row * self.stride + within * self.unit)
+        std::array::from_fn(|g| self.unit(first + 4 * g))
     }
 }
 
@@ -516,8 +571,8 @@ pub struct Row {
     panel: bool,
     /// An `mma16` row's code planes.
     mma16: Option<Mma16Row>,
-    /// A `records` row's place in its tile.
-    record: Option<usize>,
+    /// A `records` row's `(row_in_tile, coeff_group, entry_bits)`.
+    record: Option<(usize, u32, u32)>,
 }
 
 impl Row {
@@ -548,17 +603,20 @@ impl Row {
             for plane in &mut mma16.planes {
                 plane.start = plane.start.wrapping_add(bytes);
             }
+            if let Some((base, _, _)) = mma16.tile_factors.as_mut() {
+                *base = base.wrapping_add(bytes);
+            }
         }
         row
     }
 
-    /// Whether every four lanes `4g ..4g + 4` of a k-block of this `mma16`
-    /// row's code planes lie together in one row's payload: a row's payload
-    /// being whole lane quads. The x86 tile path's alone.
+    /// Whether every four lanes `4g .. 4g + 4` of a k-block of this `mma16`
+    /// row's code planes lie together: always true for contiguous code planes.
+    /// The x86 tile path's alone.
     #[cfg(target_arch = "x86_64")]
     #[inline(always)]
     fn lanes_whole(&self) -> bool {
-        self.mma16.as_ref().is_some_and(|mma16| !mma16.planes[0].grid && mma16.planes[0].units % 4 == 0)
+        self.mma16.as_ref().is_some_and(|mma16| !mma16.planes[0].grid)
     }
 
     /// Whether sixteen rows are rows 0..16 of one `mma16` tile whose code
@@ -579,6 +637,21 @@ impl Row {
         let mut planes = self.planes;
         for plane in 0..4 {
             planes[plane] = planes[plane].wrapping_add(index * self.steps[plane]);
+        }
+        if let Some(mma16) = &self.mma16 {
+            if let Some((base, group_bytes, row_groups)) = mma16.tile_factors {
+                let g = mma16.first_group + index;
+                let packets_per_sb = 8 / mma16.group_packets;
+                let sb = g / packets_per_sb;
+                let within_sb = g % packets_per_sb;
+                let sb_packets = packets_per_sb.min(row_groups - sb * packets_per_sb);
+                let place = registry::PackedRowLayout::record_factor(mma16.row as u64) as usize;
+                planes[RowPlaneRole::Supers as usize] = base.wrapping_add(
+                    sb * packets_per_sb * group_bytes * registry::MMA_TILE_ROWS as usize
+                        + place * sb_packets * group_bytes
+                        + within_sb * group_bytes,
+                );
+            }
         }
         planes
     }
@@ -941,13 +1014,17 @@ impl<'a> At<'a> {
     /// tile's at `record_entry`.
     #[inline(always)]
     fn entry(self, e: usize, bytes: usize) -> *const u8 {
-        let Some(row) = self.row.record else {
+        let Some((row, group, _)) = self.row.record else {
             return packet_bytes(self, RowPlaneRole::Codes).wrapping_add(bytes * e);
         };
         // The packet's half of its k-block holds the k-block's entries
         // 4 half..4 half + 4.
         let (block, half) = (self.packet / 2, self.packet % 2);
-        let within = registry::PackedRowLayout::record_entry(row as u64, block as u64, (4 * half + e) as u64);
+        let within = if group == 32 {
+            registry::PackedRowLayout::record_entry(row as u64, block as u64, (4 * half + e) as u64)
+        } else {
+            registry::PackedRowLayout::record16_entry(row as u64, block as u64, (4 * half + e) as u64)
+        };
         self.planes[RowPlaneRole::Codes as usize].wrapping_add(within as usize)
     }
 
@@ -977,9 +1054,8 @@ impl<'a> At<'a> {
         // apart, a row's payload being whole lane pairs).
         let first = 32 * block + 4 * (mma16.row % 8);
         let [low, high] = &mma16.planes;
-        let places = [low.place(first), low.place(first + 2)];
         let lanes = |plane: &Mma16Plane| Lanes {
-            pairs: places.map(|place| plane.at(place)),
+            pairs: [plane.unit(first), plane.unit(first + 2)],
             unit: plane.unit,
             half,
             upper: mma16.row >= 8,
@@ -2089,6 +2165,27 @@ unsafe fn grid_entries<const BYTES: usize, const HIGH: u32>(at: At) -> [u32; 4] 
             "an entry's whole bytes fit a word with its further bits, a packet's further bits whole bytes"
         )
     };
+    if let Some((row, _, 12)) = at.row.record {
+        let (block, half) = (at.packet / 2, at.packet % 2);
+        let base = at.planes[RowPlaneRole::Codes as usize];
+        return std::array::from_fn(|e| {
+            let entry = (4 * half + e) as u64;
+            let lo = u32::from(unsafe {
+                *base.wrapping_add(
+                    registry::PackedRowLayout::record16_low(row as u64, block as u64, entry)
+                        as usize,
+                )
+            });
+            let hi_byte = u32::from(unsafe {
+                *base.wrapping_add(
+                    registry::PackedRowLayout::record16_high(row as u64, block as u64, entry)
+                        as usize,
+                )
+            });
+            let hi = (hi_byte >> (4 * ((entry % 4) / 2))) & 0xf;
+            lo | (hi << 8)
+        });
+    }
     let mut entries = if at.row.record.is_none() {
         let ptr = at.entry(0, BYTES);
         match BYTES {
@@ -3883,7 +3980,7 @@ impl<F: Scale, const EXPONENT: i32, const CODE_EXPONENT: i32, L: Locals, const G
                 // the matrix is a hint, never a fault).
                 let next = plane.quads(lanes + 128);
                 for g in 0..8 {
-                    for at in [next[g], quads[g].wrapping_add(16 * plane.stride)] {
+                    for at in [next[g], quads[g].wrapping_add(16 * stride)] {
                         unsafe { _mm_prefetch::<_MM_HINT_T0>(at.cast()) };
                     }
                 }
@@ -3972,11 +4069,18 @@ impl<F: Scale, const EXPONENT: i32, const CODE_EXPONENT: i32, L: Locals, const G
         // into one vector of 8 packet sums in packet order [p0..p7].
         let group = At::group(row, b);
         let (scales_plane, supers) = (group.plane(RowPlaneRole::Scales), group.plane(RowPlaneRole::Supers));
+        let mma16 = row.mma16.is_some();
+        let factor_width = row.steps[RowPlaneRole::Supers as usize] / registry::MMA_TILE_ROWS as usize;
         let mut scaled = [0.0f32; 16];
         let mut minimums = [0.0f32; 16];
         for r in 0..16 {
             unsafe {
-                let [scales, minimum_codes] = L::x86_groups::<GROUP>(scales_plane.add(r * stride)).expect("vector coefficient codes");
+                let scales_offset = if mma16 {
+                    registry::PackedRowLayout::record_factor(r as u64) as usize * factor_width
+                } else {
+                    r * stride
+                };
+                let [scales, minimum_codes] = L::x86_groups::<GROUP>(scales_plane.add(scales_offset)).expect("vector coefficient codes");
                 // Each step's scale code: a group of 32 is two steps.
                 let step_scales = if GROUP == 16 {
                     scales
@@ -4027,8 +4131,12 @@ impl<F: Scale, const EXPONENT: i32, const CODE_EXPONENT: i32, L: Locals, const G
         let mut out = [0.0f32; 16];
         for eight in 0..2 {
             unsafe {
-                let supers = supers.add(8 * eight * stride);
-                let factor = F::read8(supers, stride);
+                let (supers_eight, super_stride) = if mma16 {
+                    (supers.add(eight * factor_width), 2 * factor_width)
+                } else {
+                    (supers.add(8 * eight * stride), stride)
+                };
+                let factor = F::read8(supers_eight, super_stride);
                 let scale = if CODE_EXPONENT == 0 && EXPONENT == 0 {
                     factor
                 } else {
@@ -4040,7 +4148,7 @@ impl<F: Scale, const EXPONENT: i32, const CODE_EXPONENT: i32, L: Locals, const G
                 if Self::BIASED {
                     let bias = match L::BIAS {
                         Some(LocalBias::Minimum(_)) => {
-                            let minimum = F::read8(supers.add(F::BYTES), stride);
+                            let minimum = F::read8(supers_eight.add(F::BYTES), super_stride);
                             if EXPONENT == 0 { minimum } else { _mm256_mul_ps(minimum, _mm256_set1_ps(Self::BIAS_POWER)) }
                         }
                         Some(LocalBias::Signed { .. }) => _mm256_mul_ps(factor, _mm256_set1_ps(Self::BIAS_POWER)),
@@ -4300,7 +4408,7 @@ impl<F: Scale, const EXPONENT: i32, const CODE_EXPONENT: i32, L: Locals, const G
         #[cfg(target_arch = "x86_64")]
         if V::QUANTIZED_DOTS >= 1 && L::X86_GROUPS && (GROUP == 16 || GROUP == 32) && k % 64 == 0 && out.len() % 16 == 0 {
             match geometry.placement {
-                Placement::Mma16 if C::NIBBLE_LANES.is_some() && geometry.matrix_rows % 16 == 0 => {
+                Placement::Mma16 { .. } if C::NIBBLE_LANES.is_some() && geometry.matrix_rows % 16 == 0 => {
                     let row = geometry.row(first);
                     if row.lanes_whole() && row.mma16.as_ref().is_some_and(|mma16| mma16.row == 0) {
                         unsafe { Self::tiles16::<C>(&row, geometry.stride, x, k, out) };

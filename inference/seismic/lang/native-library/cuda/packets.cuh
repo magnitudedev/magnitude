@@ -241,35 +241,31 @@ template <> struct NativeOperand<OpF16, element::F16> {
 // 64-code k-block; a coefficient group spanning k-blocks is GROUP = 64 here,
 // each k-block's share of it).
 
-// One code plane: rows of a tile are contiguous in the virtual concatenation,
-// and a lane chunk never straddles a row (plane bytes per row are whole
-// k-blocks). A tile's rows hold under 2^32 bytes
-// (`PackedRowLayout::row_stride_bytes`), so a virtual byte's row and byte
-// within it are a 32-bit quotient and remainder (a 64-bit division by bytes
-// per row not a power of two, such as 24-byte k-blocks', costs a dozen
-// instructions an address).
+// One code plane: every plane of an mma16 tile is contiguous across its 16
+// rows, starting at `tile * 16 * stride + offset * 16`.
 struct CodePlane {
     u64 offset;
-    u32 bytes_per_row;
     __device__ __forceinline__ const u8 *chunk(const u8 *base, u64 stride, u64 tile, u32 virtual_byte) const {
-        const u64 row = tile * 16 + virtual_byte / bytes_per_row;
-        return base + row * stride + offset + virtual_byte % bytes_per_row;
+        return base + tile * 16 * stride + offset * 16 + virtual_byte;
     }
 };
 
+// The place of row `r` (0..15) of its tile among a superblock's tile-packed
+// factors (`PackedRowLayout::record_factor`: `[g = 0..7][row g, row g + 8]`).
+__device__ __forceinline__ u32 record_factor_place(u32 r) { return 2u * (r % 8u) + r / 8u; }
+
 // A tensor's rows in the mma16 row layout (the emitted `_ROW_*` roles):
-// its base, row stride and planes (offset 0 and no bytes for those its
-// representation lacks).
+// its base, row stride and contiguous tile planes (`supers` holds the merged
+// `TileFactors` plane, 0 where absent).
 struct Rows {
     const u8 *base;
     u64 stride;
     CodePlane low;
     CodePlane high;
-    u64 scales;
     u64 supers;
-    u64 supers_bytes; // payload bytes of a row's supers plane
-    // Where tile `tile`'s rows begin: row 16 tile, every plane of a row at
-    // its offset from the row (`CodePlane::chunk`, the decoders' `super_word`).
+    u64 supers_bytes; // payload bytes per row of the TileFactors plane
+    // Where tile `tile`'s rows begin: row 16 tile, every plane of the tile at
+    // `offset * 16` from the tile base.
     __device__ __forceinline__ const u8 *tile_base(u64 tile) const { return base + 16 * tile * stride; }
 };
 
@@ -786,10 +782,9 @@ struct E8M0Scale {
     }
 };
 // UE4M3 (sign bit ignored; 0x7f is NaN): (1 + m/8) 2^(e - 7), or m 2^-9 when
-// e = 0. The GEMV stages a tile's scales in shared memory (`Direct::stage`).
+// e = 0.
 struct UE4M3Scale {
     static constexpr int BYTES = 1;
-    static constexpr bool GEMV_STAGED = true;
     __device__ static __forceinline__ float decode(u32 raw) {
         raw &= 0x7Fu;
         const u32 e = raw >> 3, m = raw & 7u;
@@ -842,15 +837,8 @@ struct UE4M3Scale {
     }
 };
 
-// Whether a scale's GEMV stages a tile's scales (`S::GEMV_STAGED`), and the
-// four consecutive scales of a word times 2^N (`S::decode4` where it has
-// one).
-template <class S, class = void> struct StagedScales {
-    static constexpr bool value = false;
-};
-template <class S> struct StagedScales<S, decltype((void)S::GEMV_STAGED)> {
-    static constexpr bool value = S::GEMV_STAGED;
-};
+// `S::decode_scaled` / `S::read_scaled` where `S` implements them (`E8M0Scale`),
+// else `times_power2<N>(S::decode / read)`.
 template <class S, class = void> struct DecodeScaled {
     template <int N> __device__ static __forceinline__ float decode(u32 bits) {
         return times_power2<N>(S::decode(bits));
@@ -1151,6 +1139,103 @@ template <class C, bool BIAS> __device__ __forceinline__ float coded_value(u32 c
 // carry the codes' exponent CODE_EXPONENT; a bias is the value subtracted
 // (value = scale * code - bias).
 
+// Coalesced warp loader for an mma16 tile's `TileFactors` plane: one
+// superblock holds `16 * ROW_BYTES` contiguous bytes in
+// `[g = 0..7][row g (ROW_BYTES B), row g+8 (ROW_BYTES B)]` order.
+// Split into `fetch` (coalesced global loads ONLY — zero shuffles, so
+// double-buffered `load(next, sb + 1)` stays 100% asynchronous and overlaps
+// with `compute(current, sb)`) and `unpack` (warp shuffles at consume time,
+// once per superblock).
+template <int ROW_BYTES> struct TileFactors {
+    static_assert(ROW_BYTES >= 2 && ROW_BYTES % 2 == 0, "tile factors are whole half words per row");
+    static constexpr int ROW_WORDS = (ROW_BYTES + 3) / 4;
+    static constexpr int QUAD_WORDS = ROW_BYTES / 2;
+    static constexpr int TILE_WORDS = 4 * ROW_BYTES;
+    static constexpr int PASSES = (TILE_WORDS + 31) / 32;
+    static constexpr int RAW_WORDS = ROW_BYTES == 32 ? 4 : ROW_BYTES == 16 ? 2 : ROW_BYTES == 8 ? 1 : PASSES;
+
+    struct Raw {
+        u32 v[RAW_WORDS];
+    };
+
+    __device__ static __forceinline__ Raw fetch(const u8 *base, u32 lane) {
+        Raw raw;
+        if constexpr (ROW_BYTES == 32) {
+            const uint4 x = seismic_ld_nc_v4(base + 16 * lane);
+            raw.v[0] = x.x, raw.v[1] = x.y, raw.v[2] = x.z, raw.v[3] = x.w;
+        } else if constexpr (ROW_BYTES == 16) {
+            const uint2 x = seismic_ld_nc_v2(base + 8 * lane);
+            raw.v[0] = x.x, raw.v[1] = x.y;
+        } else if constexpr (ROW_BYTES == 8) {
+            raw.v[0] = seismic_ld_nc_u32(base + 4 * lane);
+        } else {
+#pragma unroll
+            for (int p = 0; p < PASSES; ++p) {
+                const u32 idx = (u32)(32 * p) + lane;
+                raw.v[p] = idx < (u32)TILE_WORDS ? seismic_ld_nc_u32(base + 4 * idx) : 0u;
+            }
+        }
+        return raw;
+    }
+
+    __device__ static __forceinline__ void unpack(const Raw &raw, u32 lane, u32 (&out)[2][ROW_WORDS]) {
+        u32 q[QUAD_WORDS];
+        if constexpr (ROW_BYTES == 32) {
+            const u32 quad = lane & ~3u;
+#pragma unroll
+            for (int t = 0; t < 4; ++t) {
+                q[4 * t + 0] = seismic_shfl_idx_u32(raw.v[0], quad + (u32)t);
+                q[4 * t + 1] = seismic_shfl_idx_u32(raw.v[1], quad + (u32)t);
+                q[4 * t + 2] = seismic_shfl_idx_u32(raw.v[2], quad + (u32)t);
+                q[4 * t + 3] = seismic_shfl_idx_u32(raw.v[3], quad + (u32)t);
+            }
+        } else if constexpr (ROW_BYTES == 16) {
+            const u32 quad = lane & ~3u;
+#pragma unroll
+            for (int t = 0; t < 4; ++t) {
+                q[2 * t + 0] = seismic_shfl_idx_u32(raw.v[0], quad + (u32)t);
+                q[2 * t + 1] = seismic_shfl_idx_u32(raw.v[1], quad + (u32)t);
+            }
+        } else if constexpr (ROW_BYTES == 8) {
+            const u32 quad = lane & ~3u;
+#pragma unroll
+            for (int t = 0; t < 4; ++t)
+                q[t] = seismic_shfl_idx_u32(raw.v[0], quad + (u32)t);
+        } else {
+            const u32 g = lane / 4;
+#pragma unroll
+            for (int i = 0; i < QUAD_WORDS; ++i) {
+                const u32 idx = g * (u32)QUAD_WORDS + (u32)i;
+                const u32 src = idx & 31u;
+                const u32 pass = idx >> 5;
+                u32 val = 0u;
+#pragma unroll
+                for (int p = 0; p < PASSES; ++p) {
+                    const u32 s = seismic_shfl_idx_u32(raw.v[p], src);
+                    if (pass == (u32)p)
+                        val = s;
+                }
+                q[i] = val;
+            }
+        }
+        if constexpr (ROW_BYTES % 4 == 0) {
+#pragma unroll
+            for (int w = 0; w < ROW_WORDS; ++w) {
+                out[0][w] = q[w];
+                out[1][w] = q[ROW_WORDS + w];
+            }
+        } else {
+#pragma unroll
+            for (int w = 0; w < ROW_WORDS - 1; ++w) {
+                out[0][w] = q[w];
+                out[1][w] = __funnelshift_r(q[ROW_WORDS - 1 + w], q[ROW_WORDS + w], 16);
+            }
+            out[0][ROW_WORDS - 1] = q[ROW_WORDS - 1] & 0xFFFFu;
+            out[1][ROW_WORDS - 1] = q[QUAD_WORDS - 1] >> 16;
+        }
+    }
+};
+
 // Direct coefficients: a scale S (with BIAS a bias after it) per GROUP
 // codes, rows holding whole storage groups of STORAGE codes. A 64-code
 // k-block holds GROUPS whole groups, or lies in one group of whole k-blocks
@@ -1173,26 +1258,28 @@ template <class S, int GROUP_, bool BIAS_, int STORAGE, int CODE_EXPONENT> struc
         else
             return kblock / (GROUP / 64);
     }
-    // Bytes of a group's coefficients, and of a superblock's,
-    // loaded at most a word, 8 B or 16 B at a time (`load`, and
-    // `staged_block`) and staged 4 B a word (`super_word`).
+    // Bytes of a group's coefficients, and of a full superblock's per row.
     static_assert(!BIAS || STORAGE == GROUP, "a group's bias follows its scale");
     static constexpr int GROUP_BYTES = S::BYTES * (BIAS ? 2 : 1);
     static constexpr int BLOCK_BYTES = SUPER / GROUP * GROUP_BYTES;
-    // Staged where its scales stage (`StagedScales`) and its words copy in
-    // 16 B chunks.
-    static constexpr bool GEMV_STAGED = StagedScales<S>::value && BLOCK_BYTES % 16 == 0;
-    static_assert(BLOCK_BYTES <= 4 || BLOCK_BYTES == 8 || BLOCK_BYTES % 16 == 0,
-                  "a superblock's coefficients are at most a word, 8 B or whole 16 B");
-    // A superblock's coefficients smaller than a word lie in the aligned
-    // word holding them, at byte `phase` of it.
-    static constexpr bool SUBWORD = BLOCK_BYTES < 4;
-    static constexpr int BLOCK_WORDS = SUBWORD ? 1 : BLOCK_BYTES / 4;
-    __host__ __device__ static constexpr u64 phase(u64 superblock) { return superblock * BLOCK_BYTES % 4; }
-    // Byte offset of group g's scale; its bias follows it.
+    static_assert(BLOCK_BYTES == 2 || BLOCK_BYTES == 4 || BLOCK_BYTES == 8 || BLOCK_BYTES % 16 == 0,
+                  "a superblock's coefficients are 2, 4, 8 or whole 16 bytes");
+    static constexpr int BLOCK_WORDS = (BLOCK_BYTES + 3) / 4;
+    // Bytes per row held by superblock `sb` in `TileFactors` (`BLOCK_BYTES`
+    // for every full superblock, smaller only for a partial last superblock
+    // when `!WHOLE`).
+    __device__ static __forceinline__ u32 sb_row_bytes(u64 supers_bytes, u64 sb) {
+        if constexpr (WHOLE)
+            return (u32)BLOCK_BYTES;
+        const u64 rem = supers_bytes - sb * BLOCK_BYTES;
+        return rem < (u64)BLOCK_BYTES ? (u32)rem : (u32)BLOCK_BYTES;
+    }
+    template <class W> __device__ static __forceinline__ const u8 *sb_base(const W &w, u64 tile, u64 sb) {
+        return w.base + tile * 16 * w.stride + w.supers * 16 + sb * 16 * BLOCK_BYTES;
+    }
+    // Byte offset of group g's scale within a superblock; its bias follows it.
     __host__ __device__ static constexpr u64 scale_offset(u64 g) { return g * GROUP_BYTES; }
-    // Group g (of the row's) of the row's planes at `scales` and `supers`
-    // (direct coefficients are all in the supers plane).
+    // Group `g` of a row's (or superblock's) factors at `supers` (also called by `rows16.cuh`).
     __device__ static __forceinline__ void at(const u8 *, const u8 *supers, u64 g, float &scale, float &bias) {
         scale = DecodeScaled<S>::template read<CODE_EXPONENT>(supers + scale_offset(g));
         bias = BIAS ? -S::read(supers + scale_offset(g) + S::BYTES) : 0.0f;
@@ -1200,8 +1287,10 @@ template <class S, int GROUP_, bool BIAS_, int STORAGE, int CODE_EXPONENT> struc
     template <class W>
     __device__ static __forceinline__ void coefficient(const W &w, u64 row, u64 kblock, int group, float &scale,
                                                        float &bias) {
-        at(w.base + row * w.stride + w.scales, w.base + row * w.stride + w.supers, group_of(kblock, group), scale,
-           bias);
+        const u64 sb = kblock / KBLOCKS;
+        const u32 rb = sb_row_bytes(w.supers_bytes, sb);
+        const u8 *row_sb = sb_base(w, row / 16, sb) + record_factor_place((u32)(row % 16)) * (u64)rb;
+        at(nullptr, row_sb, group_of(kblock % KBLOCKS, group), scale, bias);
     }
     // The scale (and bias) at byte `at` of a superblock's coefficient
     // words, and group g of them (its first group's at byte 0).
@@ -1217,43 +1306,76 @@ template <class S, int GROUP_, bool BIAS_, int STORAGE, int CODE_EXPONENT> struc
     __device__ static __forceinline__ void decode(const u32 *words, int g, float &scale, float &bias) {
         decode_at(words, scale_offset((u64)g), scale, bias);
     }
-    // The coefficient words of one superblock of rows g, g+8: one load of a
-    // sub-word or word block, else 16 B a load (8 B for 8), past the first
-    // 16 B where the row's supers plane holds them (unless WHOLE, a row's
-    // last superblock may end inside its final 16 B).
+    // The coefficient words of one superblock of rows g, g+8.
     struct Block {
         u32 words[2][BLOCK_WORDS];
     };
-    __device__ static __forceinline__ void put(u32 (&words)[BLOCK_WORDS], int c, uint4 v) {
-        words[4 * c] = v.x, words[4 * c + 1] = v.y, words[4 * c + 2] = v.z, words[4 * c + 3] = v.w;
-    }
-    __device__ static __forceinline__ void load(const u8 *fields, u64 superblock, u64 supers_bytes, u32 (&words)[BLOCK_WORDS]) {
-        if constexpr (BLOCK_BYTES == 1) {
-            words[0] = *fields;
-        } else if constexpr (BLOCK_BYTES == 2) {
+    __device__ static __forceinline__ void load_row(const u8 *fields, u32 rb, u32 (&words)[BLOCK_WORDS]) {
+        if constexpr (BLOCK_BYTES == 2) {
             words[0] = *reinterpret_cast<const u16 *>(fields);
         } else if constexpr (BLOCK_BYTES == 4) {
-            words[0] = seismic_ld_nc_u32(fields);
-        } else if constexpr (BLOCK_BYTES == 8) {
-            const uint2 v = seismic_ld_nc_v2(fields);
-            words[0] = v.x;
-            words[1] = v.y;
-        } else {
+            words[0] = rb == 4u ? seismic_ld_nc_u32(fields) : (u32)*reinterpret_cast<const u16 *>(fields);
+        } else if constexpr (WHOLE) {
 #pragma unroll
-            for (int c = 0; c < BLOCK_BYTES / 16; ++c)
-                put(words, c,
-                    c == 0 || WHOLE || superblock * BLOCK_BYTES + 16 * c < supers_bytes
-                        ? seismic_ld_nc_v4(fields + 16 * c)
-                        : make_uint4(0, 0, 0, 0));
+            for (int w = 0; w < BLOCK_WORDS; ++w)
+                words[w] = seismic_ld_nc_u32(fields + 4 * w);
+        } else {
+            if (rb == (u32)BLOCK_BYTES) {
+                if constexpr (BLOCK_BYTES == 8) {
+                    const uint2 v = seismic_ld_nc_v2(fields);
+                    words[0] = v.x;
+                    words[1] = v.y;
+                } else {
+#pragma unroll
+                    for (int c = 0; c < BLOCK_BYTES / 16; ++c) {
+                        const uint4 v = seismic_ld_nc_v4(fields + 16 * c);
+                        words[4 * c] = v.x, words[4 * c + 1] = v.y, words[4 * c + 2] = v.z, words[4 * c + 3] = v.w;
+                    }
+                }
+            } else {
+#pragma unroll
+                for (int w = 0; w < BLOCK_WORDS; ++w)
+                    words[w] = 0u;
+#pragma unroll
+                for (int h = 0; h < BLOCK_BYTES / 2; ++h)
+                    if ((u32)(2 * h) < rb)
+                        words[h / 2] |= (u32)reinterpret_cast<const u16 *>(fields)[h] << (16 * (h % 2));
+            }
         }
     }
+    typedef typename TileFactors<BLOCK_BYTES>::Raw SuperBlock;
+    template <class W>
+    __device__ static __forceinline__ SuperBlock block(const W &w, u64 tile, u64 superblock, u32 lane) {
+        const u32 rb = sb_row_bytes(w.supers_bytes, superblock);
+        if (WHOLE || rb == (u32)BLOCK_BYTES)
+            return TileFactors<BLOCK_BYTES>::fetch(sb_base(w, tile, superblock), lane);
+        return SuperBlock{};
+    }
+    template <class W>
+    __device__ static __forceinline__ Block unpack_block(const W &w, const SuperBlock &raw, u64 tile, u64 superblock,
+                                                         u32 lane) {
+        Block blk;
+        const u32 rb = sb_row_bytes(w.supers_bytes, superblock);
+        if (WHOLE || rb == (u32)BLOCK_BYTES) {
+            TileFactors<BLOCK_BYTES>::unpack(raw, lane, blk.words);
+        } else {
+            const u8 *base = sb_base(w, tile, superblock);
+            const u32 g = lane / 4;
+            load_row(base + (2u * g) * rb, rb, blk.words[0]);
+            load_row(base + (2u * g + 1u) * rb, rb, blk.words[1]);
+        }
+        return blk;
+    }
     template <class W> __device__ static __forceinline__ Block block_rows(const W &w, u64 a, u64 b, u64 superblock) {
-        Block block;
+        Block blk;
+        const u32 rb = sb_row_bytes(w.supers_bytes, superblock);
 #pragma unroll
-        for (int r = 0; r < 2; ++r)
-            load(w.base + (r == 0 ? a : b) * w.stride + w.supers + superblock * BLOCK_BYTES, superblock,
-                 w.supers_bytes, block.words[r]);
-        return block;
+        for (int r = 0; r < 2; ++r) {
+            const u64 row = r == 0 ? a : b;
+            load_row(sb_base(w, row / 16, superblock) + record_factor_place((u32)(row % 16)) * (u64)rb, rb,
+                     blk.words[r]);
+        }
+        return blk;
     }
     template <class W>
     __device__ static __forceinline__ void coefficients(const W &, const Block &block, int q, Coefficients<GROUPS> &c) {
@@ -1272,61 +1394,24 @@ template <class S, int GROUP_, bool BIAS_, int STORAGE, int CODE_EXPONENT> struc
             }
         }
     }
-    // GEMV staging of a tile's coefficient words where the scales ask for it
-    // (`S::GEMV_STAGED`): a row's words are one contiguous run, while a
-    // superblock's are 16 B pieces of 16 rows, so the tile's group copies
-    // the 16 runs whole into shared memory (`stage`, its threads `thread`
-    // of `threads`) and each k-block reads its rows' words there
-    // (`staged_block`). Measured on GB10 (NVFP4 4096 -> 18560 and
-    // 8192 -> 4096, weights not in L2): 1-7% faster than per-superblock
-    // loads. A staged row is its words and 16 B more, so the eight rows of a
-    // fragment read fall in distinct banks.
-    __host__ __device__ static constexpr u64 staged_pitch(u64 kblocks) {
-        return (kblocks + KBLOCKS - 1) / KBLOCKS * BLOCK_BYTES + 16;
-    }
-    __host__ __device__ static constexpr u64 staged_bytes(u64 kblocks) { return 16 * staged_pitch(kblocks); }
-    template <class W>
-    __device__ static __forceinline__ void stage(const W &w, u64 tile, u64 kblocks, u8 *shared, u32 thread,
-                                                 u32 threads) {
-        const u64 pitch = staged_pitch(kblocks);
-        const u64 chunks = (pitch - 16) / 16;
-        for (u64 c = thread; c < 16 * chunks; c += threads) {
-            const u64 row = c / chunks, chunk = c % chunks;
-            seismic_cp_async_16(shared + row * pitch + chunk * 16,
-                                w.base + (tile * 16 + row) * w.stride + w.supers + chunk * 16);
-        }
-        seismic_cp_async_commit();
-    }
-    __device__ static __forceinline__ Block staged_block(const u8 *shared, u64 kblocks, u64 superblock, u32 lane) {
-        const u64 pitch = staged_pitch(kblocks);
-        Block block;
-#pragma unroll
-        for (int r = 0; r < 2; ++r)
-#pragma unroll
-            for (int c = 0; c < BLOCK_BYTES / 16; ++c)
-                put(block.words[r], c,
-                    reinterpret_cast<const uint4 *>(shared + (lane / 4 + 8 * r) * pitch + superblock * BLOCK_BYTES)[c]);
-        return block;
-    }
-    // GEMM staging: the superblock's coefficient words (a sub-word block's
-    // aligned word). A word's first k-block is that of the first group whose
+    // GEMM staging: the superblock's aligned 4-byte coefficient words in
+    // `TileFactors`. A word's first k-block is that of the first group whose
     // scale or bias it holds.
     static constexpr int SUPER_WORDS = BLOCK_WORDS;
     template <class W> __device__ static __forceinline__ const u8 *super_word(const W &w, u64 row, u64 superblock, int word) {
-        if constexpr (SUBWORD)
-            return w.base + row * w.stride + w.supers + (superblock * BLOCK_BYTES & ~3ull);
-        else
-            return w.base + row * w.stride + w.supers + superblock * BLOCK_BYTES + 4 * word;
+        const u32 rb = sb_row_bytes(w.supers_bytes, superblock);
+        const u32 off = (record_factor_place((u32)(row % 16)) * rb) & ~3u;
+        return sb_base(w, row / 16, superblock) + off + 4 * word;
     }
     __host__ __device__ static constexpr int word_kblock(int word) {
         return (int)((u64)(4 * word) / GROUP_BYTES * GROUP / 64);
     }
-    __device__ static __forceinline__ void staged_coefficient(const u32 *words, u64 kblock, int group, float &scale,
-                                                              float &bias) {
-        if constexpr (SUBWORD)
-            decode_at(words, phase(kblock / KBLOCKS) + scale_offset(group_of(kblock % KBLOCKS, group)), scale, bias);
-        else
-            decode(words, group_of((int)(kblock % KBLOCKS), group), scale, bias);
+    template <class W>
+    __device__ static __forceinline__ void staged_coefficient(const W &w, const u32 *words, u32 r, u64 kblock,
+                                                              int group, float &scale, float &bias) {
+        const u32 rb = sb_row_bytes(w.supers_bytes, kblock / KBLOCKS);
+        const u32 phase = (record_factor_place(r) * rb) & 3u;
+        decode_at(words, phase + scale_offset(group_of(kblock % KBLOCKS, group)), scale, bias);
     }
 };
 
@@ -1378,7 +1463,6 @@ struct HierFactors {
     static constexpr int KBLOCKS = FACTOR_GROUP / 64;
     static constexpr bool BIAS = B::minimum() || B::signed_bias();
     static constexpr bool WHOLE = true;
-    static constexpr bool GEMV_STAGED = false;
     // Bits of a group's codes.
     static constexpr u32 WIDTH = LOCAL_BITS * (B::minimum() ? 2 : 1);
     // Bytes of a superblock's factors, and of the aligned word holding them.
@@ -1460,16 +1544,15 @@ struct Hier : HierFactors<FS, EXPONENT, CODE_EXPONENT, LOCAL_BITS, L, GROUP_, FA
     using F::factors;
     static_assert(FACTOR_GROUP / GROUP * WIDTH % 16 == 0, "a factor group's fields fill whole half words");
     __host__ __device__ static constexpr u64 field_bytes() { return FACTOR_GROUP / GROUP * WIDTH / 8; }
-    __host__ __device__ static constexpr bool whole_words() { return field_bytes() % 4 == 0; }
-    // Superblock sb's fields start at byte `phase(sb)` of their aligned word
-    // (2 at most: they are whole half words).
-    __host__ __device__ static constexpr u64 phase(u64 sb) { return sb * field_bytes() % 4; }
-    // Words that hold a superblock's fields from their aligned word, past a
-    // phase of up to 2 bytes where they are not whole words.
-    static constexpr int WORDS = (int)((field_bytes() + (whole_words() ? 0 : 2) + 3) / 4);
-    // Group g (of a row's) of the scales plane at `scales` and the supers
-    // plane at `supers`. Superblocks' fields are whole words one after
-    // another, so group g's are at bit `WIDTH` g, addressed from g alone.
+    static constexpr int ROW_FACTOR_BYTES = (int)field_bytes() + FACTOR_BYTES;
+    static_assert(FACTOR_BYTES == 2 || field_bytes() % 4 == 0, "a 4-byte super factor starts on a word boundary");
+    static constexpr int WORDS = (int)((field_bytes() + 3) / 4);
+    static constexpr int SUPER_WORDS = (ROW_FACTOR_BYTES + 3) / 4;
+    template <class W> __device__ static __forceinline__ const u8 *sb_base(const W &w, u64 tile, u64 sb) {
+        return w.base + tile * 16 * w.stride + w.supers * 16 + sb * 16 * ROW_FACTOR_BYTES;
+    }
+    // Group `g` of a row's (or superblock's) local codes at `scales` and super
+    // factors at `supers` (also called by `rows16.cuh`).
     __device__ static __forceinline__ void at(const u8 *scales, const u8 *supers, u64 g, float &scale, float &bias) {
         const u64 bit = g * WIDTH;
         const u32 shift = (u32)(bit % 8);
@@ -1483,8 +1566,9 @@ struct Hier : HierFactors<FS, EXPONENT, CODE_EXPONENT, LOCAL_BITS, L, GROUP_, FA
     template <class W>
     __device__ static __forceinline__ void coefficient(const W &w, u64 row, u64 kblock, int group, float &scale,
                                                        float &bias) {
-        const u8 *line = w.base + row * w.stride;
-        at(line + w.scales, line + w.supers, kblock * GROUPS + (u64)group, scale, bias);
+        const u64 sb = kblock / KBLOCKS;
+        const u8 *p = sb_base(w, row / 16, sb) + record_factor_place((u32)(row % 16)) * ROW_FACTOR_BYTES;
+        at(p, p + field_bytes(), (kblock % KBLOCKS) * GROUPS + (u64)group, scale, bias);
     }
     // A superblock's factors as a Block holds them: a single factor decoded
     // once (in the one register its word takes), two as their word, decoded
@@ -1509,31 +1593,50 @@ struct Hier : HierFactors<FS, EXPONENT, CODE_EXPONENT, LOCAL_BITS, L, GROUP_, FA
         u32 fields[2][WORDS];
         Held factors[2];
     };
-    template <class W> __device__ static __forceinline__ Block block_rows(const W &w, u64 a, u64 b, u64 superblock) {
-        Block block;
+    typedef typename TileFactors<ROW_FACTOR_BYTES>::Raw SuperBlock;
+    template <class W>
+    __device__ static __forceinline__ SuperBlock block(const W &w, u64 tile, u64 superblock, u32 lane) {
+        return TileFactors<ROW_FACTOR_BYTES>::fetch(sb_base(w, tile, superblock), lane);
+    }
+    template <class W>
+    __device__ static __forceinline__ Block unpack_block(const W &, const SuperBlock &raw_sb, u64, u64, u32 lane) {
+        u32 raw[2][SUPER_WORDS];
+        TileFactors<ROW_FACTOR_BYTES>::unpack(raw_sb, lane, raw);
+        Block blk;
 #pragma unroll
         for (int r = 0; r < 2; ++r) {
-            const u8 *line = w.base + (r == 0 ? a : b) * w.stride;
-            const u8 *fields = line + w.scales + superblock * field_bytes();
-            if constexpr (!whole_words()) {
-                // Half words, the superblock's first at bit 0.
+#pragma unroll
+            for (int i = 0; i < WORDS; ++i)
+                blk.fields[r][i] = raw[r][i];
+            const u32 fword = raw[r][field_bytes() / 4] >> (8 * (field_bytes() % 4));
+            blk.factors[r] = hold(fword);
+        }
+        return blk;
+    }
+    template <class W> __device__ static __forceinline__ Block block_rows(const W &w, u64 a, u64 b, u64 superblock) {
+        Block blk;
+#pragma unroll
+        for (int r = 0; r < 2; ++r) {
+            const u64 row = r == 0 ? a : b;
+            const u8 *p = sb_base(w, row / 16, superblock) + record_factor_place((u32)(row % 16)) * ROW_FACTOR_BYTES;
+            if constexpr (ROW_FACTOR_BYTES % 4 != 0 || field_bytes() % 4 != 0) {
 #pragma unroll
                 for (int i = 0; i < WORDS; ++i)
-                    block.fields[r][i] = 0u;
+                    blk.fields[r][i] = 0u;
 #pragma unroll
                 for (int h = 0; h < (int)field_bytes() / 2; ++h)
-                    block.fields[r][h / 2] |= (u32)reinterpret_cast<const u16 *>(fields)[h] << (16 * (h % 2));
+                    blk.fields[r][h / 2] |= (u32)reinterpret_cast<const u16 *>(p)[h] << (16 * (h % 2));
             } else if constexpr (WORDS == 4) {
-                const uint4 v = seismic_ld_nc_v4(fields);
-                block.fields[r][0] = v.x, block.fields[r][1] = v.y, block.fields[r][2] = v.z, block.fields[r][3] = v.w;
+                const uint4 v = seismic_ld_nc_v4(p);
+                blk.fields[r][0] = v.x, blk.fields[r][1] = v.y, blk.fields[r][2] = v.z, blk.fields[r][3] = v.w;
             } else {
 #pragma unroll
                 for (int i = 0; i < WORDS; ++i)
-                    block.fields[r][i] = seismic_ld_nc_u32(fields + 4 * i);
+                    blk.fields[r][i] = seismic_ld_nc_u32(p + 4 * i);
             }
-            block.factors[r] = hold(factor_word(line + w.supers, superblock));
+            blk.factors[r] = hold(factor_word(p + field_bytes(), 0));
         }
-        return block;
+        return blk;
     }
     template <class W>
     __device__ static __forceinline__ void coefficients(const W &, const Block &block, int q, Coefficients<GROUPS> &c) {
@@ -1545,40 +1648,30 @@ struct Hier : HierFactors<FS, EXPONENT, CODE_EXPONENT, LOCAL_BITS, L, GROUP_, FA
                 F::template form<WORDS>(block.fields[r], q * GROUPS + group, factor, c.scale[r][group], c.bias[r][group]);
         }
     }
-    // GEMM staging: the superblock's code words and the aligned word holding
-    // its factors (the supers plane is padded to 16 B).
-    static constexpr int SUPER_WORDS = WORDS + 1;
+    // GEMM staging: the superblock's aligned 4-byte factor words in `TileFactors`.
     template <class W> __device__ static __forceinline__ const u8 *super_word(const W &w, u64 row, u64 superblock, int word) {
-        const u8 *line = w.base + row * w.stride;
-        return word < WORDS ? line + w.scales + (superblock * field_bytes() & ~3ull) + 4 * word
-                            : line + w.supers + (superblock * FACTOR_BYTES & ~3ull);
+        const u32 off = (record_factor_place((u32)(row % 16)) * ROW_FACTOR_BYTES) & ~3u;
+        return sb_base(w, row / 16, superblock) + off + 4 * word;
     }
-    // (Phased fields stage every word: rows hold whole superblocks.)
-    __host__ __device__ static constexpr int word_kblock(int word) {
-        return word < WORDS && whole_words() ? (int)((u32)(32 * word) / (GROUPS * WIDTH)) : 0;
-    }
+    __host__ __device__ static constexpr int word_kblock(int) { return 0; }
     // Group `group` of k-block `kblock` of a staged record's words: its
     // codes, and the bits of its superblock's factors from bit 0.
-    __device__ static __forceinline__ u32 staged_codes(const u32 *words, u64 kblock, int group, u32 &factor) {
-        const u64 sb = kblock / KBLOCKS;
-        factor = words[WORDS] >> (8 * (sb * FACTOR_BYTES % 4));
-        // The record's words are read in place (in shared memory): a register
-        // copy of them all would be indexed dynamically, through local
-        // memory. The field's word, and the next only where a field can
-        // cross into it (`bits_of`).
-        u32 bit = (u32)((kblock % KBLOCKS) * GROUPS + group) * WIDTH;
-        if constexpr (!whole_words())
-            bit += 8 * (u32)phase(sb);
+    __device__ static __forceinline__ u32 staged_codes(const u32 *words, u32 r, u64 kblock, int group, u32 &factor) {
+        const u32 phase = (ROW_FACTOR_BYTES % 4 != 0 && r >= 8u) ? 2u : 0u;
+        const u32 fbyte = phase + (u32)field_bytes();
+        factor = words[fbyte / 4] >> (8 * (fbyte % 4));
+        const u32 bit = 8u * phase + (u32)((kblock % KBLOCKS) * GROUPS + group) * WIDTH;
         const u32 *at = words + bit / 32;
         u32 two[2] = {at[0], 0u};
-        if constexpr (32 % WIDTH != 0)
-            two[1] = bit / 32 + 1 < (u32)WORDS ? at[1] : 0u;
+        if constexpr (32 % WIDTH != 0 || ROW_FACTOR_BYTES % 4 != 0)
+            two[1] = bit / 32 + 1 < (u32)SUPER_WORDS ? at[1] : 0u;
         return bits_of<WIDTH>(two, bit % 32);
     }
-    __device__ static __forceinline__ void staged_coefficient(const u32 *words, u64 kblock, int group, float &scale,
-                                                              float &bias) {
+    template <class W>
+    __device__ static __forceinline__ void staged_coefficient(const W &, const u32 *words, u32 r, u64 kblock, int group,
+                                                              float &scale, float &bias) {
         u32 factor;
-        const u32 codes[1] = {staged_codes(words, kblock, group, factor)};
+        const u32 codes[1] = {staged_codes(words, r, kblock, group, factor)};
         F::template form<1>(codes, 0, factors(factor), scale, bias);
     }
     // Group `group` of k-block `kblock` of a staged record's words, for its
@@ -1586,11 +1679,11 @@ struct Hier : HierFactors<FS, EXPONENT, CODE_EXPONENT, LOCAL_BITS, L, GROUP_, FA
     // -1): that product's multiplier, and the superblock's factor times
     // SIGN. Local codes without a bias.
     template <int SIGN>
-    __device__ static __forceinline__ void staged_local(const u32 *words, u64 kblock, int group, float &factor,
+    __device__ static __forceinline__ void staged_local(const u32 *words, u32 r, u64 kblock, int group, float &factor,
                                                         u32 &multiplier) {
         static_assert(!F::BIAS, "a local code multiplies the codes of groups without a bias");
         u32 bits;
-        const u32 code = staged_codes(words, kblock, group, bits);
+        const u32 code = staged_codes(words, r, kblock, group, bits);
         factor = (float)SIGN * factors(bits).x;
         multiplier = (u32)(SIGN * L::integer(code)) & 0xFFu;
     }
@@ -1612,14 +1705,16 @@ template <class K, class P> struct CarriedPlanes;
 // a record's words alone, or (`CarriedPlanes`) with row r's staged codes of
 // the k-block.
 template <class K> struct StagedCoefficient {
-    __device__ static __forceinline__ void of(const u32 *words, const u8 *, u32, u64 kblock, int group, float &scale,
-                                              float &bias) {
-        K::staged_coefficient(words, kblock, group, scale, bias);
+    template <class W>
+    __device__ static __forceinline__ void of(const W &w, const u32 *words, const u8 *, u32 r, u64 kblock, int group,
+                                              float &scale, float &bias) {
+        K::staged_coefficient(w, words, r, kblock, group, scale, bias);
     }
 };
 template <class K, class P> struct StagedCoefficient<CarriedPlanes<K, P>> {
-    __device__ static __forceinline__ void of(const u32 *words, const u8 *codes, u32 r, u64 kblock, int group,
-                                              float &scale, float &bias) {
+    template <class W>
+    __device__ static __forceinline__ void of(const W &, const u32 *words, const u8 *codes, u32 r, u64 kblock,
+                                              int group, float &scale, float &bias) {
         CarriedPlanes<K, P>::staged_coefficient(words, codes, r, kblock, group, scale, bias);
     }
 };
@@ -1644,10 +1739,10 @@ struct Packed : Rows, Select<K::BIAS, None, typename OrderOf<P, K::GROUP>::type>
     static constexpr bool DENSE = false;
     static constexpr bool SCALED_GEMM = SCALED;
     static constexpr bool NVFP4_OPERANDS = OPERANDS;
-    static constexpr bool GEMV_STAGED = K::GEMV_STAGED;
     typedef typename P::Raw Raw;
     typedef typename P::Super Super;
     typedef typename K::Block Block;
+    typedef typename K::SuperBlock SuperBlock;
 
     __device__ __forceinline__ Raw fetch(u64 tile, u64 kblock, u32 lane) const { return P::fetch(*this, tile, kblock, lane); }
     __device__ __forceinline__ Super fetch_superblock(u64 tile, u64 superblock, u64 kblocks, u32 lane) const {
@@ -1698,21 +1793,17 @@ struct Packed : Rows, Select<K::BIAS, None, typename OrderOf<P, K::GROUP>::type>
     __device__ __forceinline__ void coefficient(u64 row, u64 kblock, int group, float &scale, float &bias) const {
         K::coefficient(*this, row, kblock, group, scale, bias);
     }
-    __device__ __forceinline__ Block block(u64 tile, u64 superblock, u32 lane) const {
-        return K::block_rows(*this, tile * 16 + lane / 4, tile * 16 + lane / 4 + 8, superblock);
+    __device__ __forceinline__ SuperBlock block(u64 tile, u64 superblock, u32 lane) const {
+        return K::block(*this, tile, superblock, lane);
+    }
+    __device__ __forceinline__ Block unpack_block(const SuperBlock &sb, u64 tile, u64 superblock, u32 lane) const {
+        return K::unpack_block(*this, sb, tile, superblock, lane);
     }
     __device__ __forceinline__ Raw fetch_rows(u64 a, u64 b, u64 kblock, u32 t) const {
         return P::fetch_rows(*this, a, b, kblock, t);
     }
     __device__ __forceinline__ Block block_rows(u64 a, u64 b, u64 superblock) const {
         return K::block_rows(*this, a, b, superblock);
-    }
-    __host__ __device__ static constexpr u64 staged_bytes(u64 kblocks) { return K::staged_bytes(kblocks); }
-    __device__ __forceinline__ void stage(u64 tile, u64 kblocks, u8 *shared, u32 thread, u32 threads) const {
-        K::stage(*this, tile, kblocks, shared, thread, threads);
-    }
-    __device__ __forceinline__ Block staged_block(const u8 *shared, u64 kblocks, u64 superblock, u32 lane) const {
-        return K::staged_block(shared, kblocks, superblock, lane);
     }
     static constexpr int SUPER_WORDS = K::SUPER_WORDS;
     __device__ __forceinline__ const u8 *super_word(u64 row, u64 superblock, int word) const {
@@ -1721,7 +1812,7 @@ struct Packed : Rows, Select<K::BIAS, None, typename OrderOf<P, K::GROUP>::type>
     __device__ static __forceinline__ int word_kblock(int word) { return K::word_kblock(word); }
     __device__ __forceinline__ void staged_coefficient(const u32 *words, const u8 *codes, u32 r, u64 kblock,
                                                        int group, float &scale, float &bias) const {
-        StagedCoefficient<K>::of(words, codes, r, kblock, group, scale, bias);
+        StagedCoefficient<K>::of(*this, words, codes, r, kblock, group, scale, bias);
     }
     __device__ __forceinline__ void coefficients(const Block &block, int q, Coefficients<GROUPS> &c) const {
         K::coefficients(*this, block, q, c);
@@ -1735,9 +1826,9 @@ struct Packed : Rows, Select<K::BIAS, None, typename OrderOf<P, K::GROUP>::type>
     static_assert(LOCAL == 0 ||
                       producers::INT8_LOCAL(0u, 0u, 0u, IsCarried<K>::value ? producers::CARRIED : producers::PLANE),
                   "the int8 GEMM's local scale codes are read where a producer is declared");
-    __device__ static __forceinline__ void staged_local(const u32 *words, u64 kblock, int group, float &factor,
+    __device__ static __forceinline__ void staged_local(const u32 *words, u32 r, u64 kblock, int group, float &factor,
                                                         u32 &multiplier) {
-        K::template staged_local<LOCAL>(words, kblock, group, factor, multiplier);
+        K::template staged_local<LOCAL>(words, r, kblock, group, factor, multiplier);
     }
     __device__ __forceinline__ u32 code(const Raw &raw, int step, u32 slot) const { return P::code(raw, step, slot); }
     __device__ static __forceinline__ float apply(u32 code, float scale, float bias) {
@@ -1919,6 +2010,10 @@ template <u32 GRID_, int INDEX_BITS> struct Points<GRID_, INDEX_BITS, 8> {
     template <class Src> __device__ static __forceinline__ u32 lanes(u32 entry, u32 t) {
         return Src::template word<GRID>(2 * (entry & MASK) + t / 2) >> (16 * (t % 2));
     }
+    // Lanes 4h .. 4h + 3's magnitudes (bytes 0..3).
+    template <class Src> __device__ static __forceinline__ u32 half(u32 entry, int h) {
+        return Src::template word<GRID>(2 * (entry & MASK) + (u32)h);
+    }
     template <class Src> __device__ static __forceinline__ uint2 point(u32 entry) {
         return Src::template pair<GRID>(entry & MASK);
     }
@@ -1929,6 +2024,9 @@ template <u32 GRID_, int INDEX_BITS> struct Points<GRID_, INDEX_BITS, 4> {
     static constexpr u32 MASK = (1u << INDEX_BITS) - 1u;
     template <class Src> __device__ static __forceinline__ u32 lanes(u32 entry, u32 t) {
         return Src::template word<GRID>((entry >> (INDEX_BITS * (t / 2))) & MASK) >> (16 * (t % 2));
+    }
+    template <class Src> __device__ static __forceinline__ u32 half(u32 entry, int h) {
+        return Src::template word<GRID>((entry >> (INDEX_BITS * h)) & MASK);
     }
     template <class Src> __device__ static __forceinline__ uint2 point(u32 entry) {
         return make_uint2(Src::template word<GRID>(entry & MASK),
@@ -2052,9 +2150,9 @@ struct GridCodes {
     }
     // The values of lanes 4h .. 4h + 3 of `entry` (bytes 0..3).
     template <class Src> __device__ static __forceinline__ u32 entry_values(u32 entry, int h) {
-        const uint2 point = Pts::template point<Src>(entry);
+        const u32 bytes = Pts::template half<Src>(entry, h);
         const u32 delta = DELTA >= 0 ? (entry >> delta_bit()) & 1u : 0u;
-        return values(h ? point.y : point.x, signs(entry) >> (4 * h), delta);
+        return values(bytes, signs(entry) >> (4 * h), delta);
     }
     // The values of all eight lanes of `entry` from one point: lanes 0..3
     // (`low`) and 4..7 (`high`), s8 bytes.
@@ -2364,44 +2462,75 @@ template <class G> struct GridPlanes {
             }
             return raw;
         }
+        // Pre-broadcast k-block entries across the quad once per k-block when
+        // multiple groups reuse the same words (e.g. IQ1_M: 6 shuffles instead
+        // of 16 per k-block); pass through unchanged otherwise.
+        struct PreparedCompact {
+            u32 v[2][2];
+            u32 high[2];
+        };
+        static constexpr bool COMPACT_PREPARE = (G::entries::BYTES == 1 && G::high_bits() != 0);
+        typedef typename Select<COMPACT_PREPARE, PreparedCompact, EntryRaw>::type PreparedEntries;
+        __device__ static __forceinline__ PreparedEntries prepare_entries(const EntryRaw &raw) {
+            if constexpr (COMPACT_PREPARE) {
+                const u32 quad = (threadIdx.x % 32) & ~3u;
+                PreparedCompact p;
+#pragma unroll
+                for (int r = 0; r < 2; ++r) {
+                    p.v[r][0] = seismic_shfl_idx_u32(raw.v[r], quad);
+                    p.v[r][1] = seismic_shfl_idx_u32(raw.v[r], quad + 1u);
+                    p.high[r] = seismic_shfl_idx_u32(raw.high, quad + (u32)r);
+                }
+                return p;
+            } else {
+                return raw;
+            }
+        }
         // Entry of coefficient group `group` for row g (`row` 0) or g + 8 (1)
         // of lane t's k-block entries (quad-collective).
-        __device__ static __forceinline__ u32 entry_of(const EntryRaw &raw, int row, int group, u32 t) {
+        __device__ static __forceinline__ u32 entry_of(const PreparedEntries &raw, int row, int group, u32 t) {
             constexpr int BYTES = G::entries::BYTES;
-            const u32 quad = (threadIdx.x % 32) & ~3u;
             const u32 e = (u32)gemv_entry(group, t);
-            u32 entry;
-            if constexpr (BYTES == 1) {
-                const u32 low_word = seismic_shfl_idx_u32(raw.v[row], quad + e / 4);
-                entry = (low_word >> (8 * (e % 4))) & 0xFFu;
-            } else if constexpr (BYTES == 2) {
-                const u32 word = seismic_shfl_idx_u32(raw.v[row], quad + e / 2);
-                entry = (word >> (16 * (e % 2))) & 0xFFFFu;
+            if constexpr (COMPACT_PREPARE) {
+                const u32 low_word = raw.v[row][e / 4];
+                u32 entry = (low_word >> (8 * (e % 4))) & 0xFFu;
+                entry |= ((raw.high[row] >> (G::high_bits() * e)) & ((1u << G::high_bits()) - 1u)) << 8;
+                return entry;
             } else {
-                const u32 first = 3u * e, last = first + 2u;
-                const u32 w0 = first / 4, w1 = last / 4;
-                // Since BYTES == 3, w1 - w0 is 0 or 1, so {w0, w1} contains at
-                // most one even word (in v.x) and at most one odd word (in v.y).
-                const u32 even_w = (w0 & 1u) ? w1 : w0;
-                const u32 odd_w = (w0 & 1u) ? w0 : w1;
-                const uint2 v = raw.v[row];
-                const u32 even_val = seismic_shfl_idx_u32(v.x, quad + even_w / 2);
-                const u32 odd_val = seismic_shfl_idx_u32(v.y, quad + odd_w / 2);
-                const u32 lo = (w0 & 1u) ? odd_val : even_val;
-                const u32 hi = (w0 & 1u) ? even_val : odd_val;
-                entry = __funnelshift_r(lo, hi, 8 * (first % 4)) & 0xFFFFFFu;
+                const u32 quad = (threadIdx.x % 32) & ~3u;
+                u32 entry;
+                if constexpr (BYTES == 1) {
+                    const u32 low_word = seismic_shfl_idx_u32(raw.v[row], quad + e / 4);
+                    entry = (low_word >> (8 * (e % 4))) & 0xFFu;
+                } else if constexpr (BYTES == 2) {
+                    const u32 word = seismic_shfl_idx_u32(raw.v[row], quad + e / 2);
+                    entry = (word >> (16 * (e % 2))) & 0xFFFFu;
+                } else {
+                    const u32 first = 3u * e, last = first + 2u;
+                    const u32 w0 = first / 4, w1 = last / 4;
+                    // Since BYTES == 3, w1 - w0 is 0 or 1, so {w0, w1} contains at
+                    // most one even word (in v.x) and at most one odd word (in v.y).
+                    const u32 even_w = (w0 & 1u) ? w1 : w0;
+                    const u32 odd_w = (w0 & 1u) ? w0 : w1;
+                    const uint2 v = raw.v[row];
+                    const u32 even_val = seismic_shfl_idx_u32(v.x, quad + even_w / 2);
+                    const u32 odd_val = seismic_shfl_idx_u32(v.y, quad + odd_w / 2);
+                    const u32 lo = (w0 & 1u) ? odd_val : even_val;
+                    const u32 hi = (w0 & 1u) ? even_val : odd_val;
+                    entry = __funnelshift_r(lo, hi, 8 * (first % 4)) & 0xFFFFFFu;
+                }
+                if constexpr (G::high_bits() != 0) {
+                    const u32 hw = seismic_shfl_idx_u32(raw.high, quad + (u32)row);
+                    entry |= ((hw >> (G::high_bits() * e)) & ((1u << G::high_bits()) - 1u)) << (8 * BYTES);
+                }
+                return entry;
             }
-            if constexpr (G::high_bits() != 0) {
-                const u32 hw = seismic_shfl_idx_u32(raw.high, quad + (u32)row);
-                entry |= ((hw >> (G::high_bits() * e)) & ((1u << G::high_bits()) - 1u)) << (8 * BYTES);
-            }
-            return entry;
         }
         // The A pairs of values (4 h, 4 h + 1) and (4 h + 2, 4 h + 3) of
         // coefficient group `group`'s entry of row g (`row` 0) or g + 8 (1)
         // of lane t's k-block entries, signed, as O operands.
         template <class O, class Src = GlobalPoints>
-        __device__ static __forceinline__ void entry_pairs(const EntryRaw &raw, int row, int group, u32 t, int h,
+        __device__ static __forceinline__ void entry_pairs(const PreparedEntries &raw, int row, int group, u32 t, int h,
                                                            u32 &low, u32 &high) {
             entry_pairs_of<O, Src>(entry_of(raw, row, group, t), h, low, high);
         }
@@ -2409,6 +2538,29 @@ template <class G> struct GridPlanes {
         template <class O, class Src = GlobalPoints>
         __device__ static __forceinline__ void entry_pairs_of(u32 entry, int h, u32 &low, u32 &high) {
             if constexpr (!G::magnitudes()) {
+                if constexpr (G::points::GRID == SEISMIC_GRID_IQ1S && G::delta_bit() == 11 &&
+                              (Same<O, OpBF16>::value || Same<O, OpF16>::value)) {
+                    // IQ1_M: points are trits in {-1, 0, +1}, so 8*g +/- 1 takes
+                    // only 3 values per delta bit; select BF16/F16 bytes directly
+                    // via PRMT without s8-to-float FMAs.
+                    const u32 bytes = G::points::template half<Src>(entry, h);
+                    const u32 c = __vadd4(bytes, 0x01010101u);
+                    const u32 p01 = (c & 0x0303u) * 0x11u + 0x4040u;
+                    const u32 p23 = (c >> 16) * 0x11u + 0x4040u;
+                    const bool d = ((entry >> G::delta_bit()) & 1u) != 0u;
+                    if constexpr (Same<O, OpBF16>::value) {
+                        const u32 lo_tbl = d ? 0x00E08010u : 0x001080E0u;
+                        const u32 hi_tbl = d ? 0x0040BFC1u : 0x00413FC0u;
+                        low = prmt(lo_tbl, hi_tbl, p01);
+                        high = prmt(lo_tbl, hi_tbl, p23);
+                    } else {
+                        const u32 lo_tbl = d ? 0x00000080u : 0x00800000u;
+                        const u32 hi_tbl = d ? 0x0047BCC8u : 0x00483CC7u;
+                        low = prmt(lo_tbl, hi_tbl, p01);
+                        high = prmt(lo_tbl, hi_tbl, p23);
+                    }
+                    return;
+                }
                 // Signed points or a delta: the half's values as s8 bytes.
                 const u32 v = G::template entry_values<Src>(entry, h);
                 low = O::bytes(v, v >> 8, 0);
@@ -2416,8 +2568,7 @@ template <class G> struct GridPlanes {
                 return;
             }
             const u32 signs = G::signs(entry);
-            const uint2 magnitudes = G::points::template point<Src>(entry);
-            const u32 bytes = h ? magnitudes.y : magnitudes.x;
+            const u32 bytes = G::points::template half<Src>(entry, h);
             // sign bit j of the half to bit 8 j + 7, then to the pairs' bits 15 and 31
             const u32 negate = (((signs >> (4 * h)) & 15u) * 0x10204080u) & 0x80808080u;
             low = O::template codes<0>(prmt(bytes, 0u, 0x4140u)) ^ prmt(negate, 0u, 0x1404u);
@@ -2427,7 +2578,7 @@ template <class G> struct GridPlanes {
         // 0) or g + 8 (1): pairs[0..1] for half 0 (values 0..3), pairs[2..3]
         // for half 1 (values 4..7), from a single point lookup and sign decode.
         template <class O, class Src = GlobalPoints>
-        __device__ static __forceinline__ void entry_all_pairs(const EntryRaw &raw, int row, int group, u32 t,
+        __device__ static __forceinline__ void entry_all_pairs(const PreparedEntries &raw, int row, int group, u32 t,
                                                                u32 (&pairs)[4]) {
             entry_all_pairs_of<O, Src>(entry_of(raw, row, group, t), pairs);
         }
@@ -2470,17 +2621,51 @@ template <class K, class P> struct CarriedPlanes : K {
         u32 high[2][K::KBLOCKS];
         float2 factor[2];
     };
+    struct SuperBlock {
+        u32 high[2][K::KBLOCKS];
+        typename TileFactors<K::FACTOR_BYTES>::Raw factor;
+    };
+    template <class W> __device__ static __forceinline__ const u8 *sb_base(const W &w, u64 tile, u64 sb) {
+        return w.base + tile * 16 * w.stride + w.supers * 16 + sb * 16 * K::FACTOR_BYTES;
+    }
+    template <class W>
+    __device__ static __forceinline__ SuperBlock block(const W &w, u64 tile, u64 superblock, u32 lane) {
+        SuperBlock sb;
+        sb.factor = TileFactors<K::FACTOR_BYTES>::fetch(sb_base(w, tile, superblock), lane);
+        const u32 g = lane / 4;
+#pragma unroll
+        for (int r = 0; r < 2; ++r)
+#pragma unroll
+            for (int q = 0; q < K::KBLOCKS; ++q)
+                sb.high[r][q] = P::high_word(w, tile, K::KBLOCKS * superblock + q, g + 8u * (u32)r);
+        return sb;
+    }
+    template <class W>
+    __device__ static __forceinline__ Block unpack_block(const W &, const SuperBlock &sb, u64, u64, u32 lane) {
+        u32 raw[2][1];
+        TileFactors<K::FACTOR_BYTES>::unpack(sb.factor, lane, raw);
+        Block blk;
+#pragma unroll
+        for (int r = 0; r < 2; ++r) {
+            blk.factor[r] = K::factors(raw[r][0]);
+#pragma unroll
+            for (int q = 0; q < K::KBLOCKS; ++q)
+                blk.high[r][q] = sb.high[r][q];
+        }
+        return blk;
+    }
     template <class W> __device__ static __forceinline__ Block block_rows(const W &w, u64 a, u64 b, u64 superblock) {
-        Block block;
+        Block blk;
 #pragma unroll
         for (int r = 0; r < 2; ++r) {
             const u64 row = r == 0 ? a : b;
-            block.factor[r] = K::factors(K::factor_word(w.base + row * w.stride + w.supers, superblock));
+            const u8 *p = sb_base(w, row / 16, superblock) + record_factor_place((u32)(row % 16)) * K::FACTOR_BYTES;
+            blk.factor[r] = K::factors(K::factor_word(p, 0));
 #pragma unroll
             for (int q = 0; q < K::KBLOCKS; ++q)
-                block.high[r][q] = P::high_word(w, row / 16, K::KBLOCKS * superblock + q, (u32)(row % 16));
+                blk.high[r][q] = P::high_word(w, row / 16, K::KBLOCKS * superblock + q, (u32)(row % 16));
         }
-        return block;
+        return blk;
     }
     __device__ static __forceinline__ void form(u32 high, int group, float2 factor, float &scale, float &bias) {
         const u32 codes[1] = {P::template carried<K::CARRIED, K::WIDTH>(high, group * ENTRIES)};
@@ -2498,44 +2683,63 @@ template <class K, class P> struct CarriedPlanes : K {
     template <class W>
     __device__ static __forceinline__ void coefficient(const W &w, u64 row, u64 kblock, int group, float &scale,
                                                        float &bias) {
-        const float2 factor = K::factors(K::factor_word(w.base + row * w.stride + w.supers, kblock / K::KBLOCKS));
+        const u8 *p =
+            sb_base(w, row / 16, kblock / K::KBLOCKS) + record_factor_place((u32)(row % 16)) * K::FACTOR_BYTES;
+        const float2 factor = K::factors(K::factor_word(p, 0));
         form(P::high_word(w, row / 16, kblock, (u32)(row % 16)), group, factor, scale, bias);
     }
     // GEMM staging: the aligned word holding the factor group's factors.
     static constexpr int SUPER_WORDS = 1;
     template <class W> __device__ static __forceinline__ const u8 *super_word(const W &w, u64 row, u64 superblock, int) {
-        return w.base + row * w.stride + w.supers + (superblock * K::FACTOR_BYTES & ~3ull);
+        const u32 off = (record_factor_place((u32)(row % 16)) * K::FACTOR_BYTES) & ~3u;
+        return sb_base(w, row / 16, superblock) + off;
     }
     __host__ __device__ static constexpr int word_kblock(int) { return 0; }
     __device__ static __forceinline__ void staged_coefficient(const u32 *words, const u8 *codes, u32 r, u64 kblock,
                                                               int group, float &scale, float &bias) {
-        const float2 factor = K::factors(words[0] >> (8 * (kblock / K::KBLOCKS * K::FACTOR_BYTES % 4)));
+        const u32 phase = (K::FACTOR_BYTES % 4 != 0 && r >= 8u) ? 2u : 0u;
+        const float2 factor = K::factors(words[0] >> (8u * phase));
         form(P::staged_high_word(codes, r), group, factor, scale, bias);
     }
 };
 
-// A carried grid code (iq2xxs), its `mma16` storage records (the registry's
-// `PackedRowLayout::record_byte`): a tile's rows hold one record per 256
-// columns over the 16 rows' bytes, every record's entries first, 1024 bytes
-// each, then every record's factors, 32 bytes each. A record's entries are
-// [half h][lane l = 4g + t][16 bytes]; its factors are the 16 rows' f16 d as
-// eight words (word g: row g low, row g + 8 high). Word w of a lane's 16 bytes is
-// row g + 8 (w % 2) of k-block 2h + w / 2: its entries t (low half) and 4 + t
-// (high half), the two entries of each group the lane reads in the GEMV's
-// entry order (`projection::gemv_records_group`), so a lane loads exactly its
-// bytes of a record, 16 at a time, and one word of factors. An entry carries
-// at bit CARRIED bit (entry % 4) of its group's scale code s, under the
-// carried hierarchical coefficients K (`CarriedHier`): value = factor L(s) code, every product exact
-// in F32.
+// Helpers to query carried bit and per-row factor bytes across `CarriedHier`
+// (`iq2xxs`) and `Hier` (`iq1m`, `iq2xs`) without requiring `CARRIED` or
+// `field_bytes()` on the other.
+template <class K, bool = IsCarried<K>::value> struct CarriedBitOf {
+    static constexpr u32 value = 0u;
+};
+template <class K> struct CarriedBitOf<K, true> {
+    static constexpr u32 value = K::CARRIED;
+};
+template <class K, bool = IsCarried<K>::value> struct RecordFactorBytesOf {
+    static constexpr u32 value = (u32)(K::field_bytes() + K::FACTOR_BYTES);
+};
+template <class K> struct RecordFactorBytesOf<K, true> {
+    static constexpr u32 value = (u32)K::FACTOR_BYTES;
+};
+
+// Spread 4 nibbles in bits 0..15 to even nibbles (bits 0..3, 8..11, 16..19, 24..27).
+__device__ __forceinline__ u32 spread_nibbles(u32 x) {
+    x = (x | (x << 8)) & 0x00FF00FFu;
+    return (x | (x << 4)) & 0x0F0F0F0Fu;
+}
+
+// Grid codes packed as superblock records in `mma16` (`PackedRowLayout::record_byte`):
+// - `iq2xxs` (`CARRIED_COEFFS`, `GROUP == 32`, 16-bit entries, 1024 B entries + 32 B factors)
+// - `iq2xs`  (`!CARRIED_COEFFS`, `GROUP == 16`, 16-bit entries, 1024 B entries + 192 B factors)
+// - `iq1m`   (`!CARRIED_COEFFS`, `GROUP == 16`, 12-bit entries, 768 B entries [512 B low + 256 B high] + 128 B factors)
 template <class G, class K> struct Records {
     typedef typename G::points Pts;
     typedef typename K::local L;
-    static_assert(IsCarried<K>::value, "records carry their coefficient codes (`CarriedHier`)");
-    static constexpr u32 CARRIED = K::CARRIED;
-    static_assert(G::WORDS == 4 && Pts::LANES == 8 && K::GROUP == 32 && K::WIDTH == 4 && !K::BIAS &&
-                      K::FACTOR_BYTES == 2,
-                  "records hold sixteen-bit entries of 8-value points and a 16-bit factor a row, a 4-bit scale code "
-                  "per 32 values");
+    static constexpr bool CARRIED_COEFFS = IsCarried<K>::value;
+    static constexpr u32 CARRIED = CarriedBitOf<K>::value;
+    static constexpr bool COMPACT12 = (G::entries::BYTES == 1 && G::high_bits() == 4);
+    static_assert(Pts::LANES == 8 && !K::BIAS, "records hold 8-value points without bias");
+    static_assert((CARRIED_COEFFS && G::WORDS == 4 && K::GROUP == 32 && K::WIDTH == 4 && K::FACTOR_BYTES == 2) ||
+                      (!CARRIED_COEFFS && K::GROUP == 16 &&
+                       ((G::entries::BYTES == 2 && G::high_bits() == 0) || COMPACT12)),
+                  "records hold carried group-32 16-bit entries or explicit group-16 12/16-bit entries");
     const u8 *base;
     u64 stride;
     // Offset within a tile of its factors, past every group's entries.
@@ -2548,9 +2752,10 @@ template <class G, class K> struct Records {
     static constexpr bool SCALED_GEMM = true;
     // The GEMV reads the weight as records (`projection::gemv_records_group`).
     static constexpr bool GEMV_RECORDS = true;
-    // Bytes of one group's entries (16 rows of 64) and of its factors.
-    static constexpr u64 ENTRIES = 1024;
-    static constexpr u64 FACTORS = 32;
+    // Bytes of one group's entries and of its factors.
+    static constexpr u64 ENTRIES = COMPACT12 ? 768 : 1024;
+    static constexpr u32 ROW_FACTOR_BYTES = RecordFactorBytesOf<K>::value;
+    static constexpr u64 FACTORS = 16ull * ROW_FACTOR_BYTES;
 
     // Where tile `tile`'s records begin: every group's entries, then its
     // factors (`factors`), each row's at its place within the tile.
@@ -2571,72 +2776,193 @@ template <class G, class K> struct Records {
     }
 
     // ---- GEMV in records (`gemv_records_group`).
-    // A lane's bytes of one record: w[2q + r] row half r of k-block q.
-    struct Record {
+    struct RecordCarried {
         u32 w[8];
         u32 factors;
     };
+    struct Record16 {
+        u32 w[8];
+        uint2 f;
+    };
+    struct Record12 {
+        u32 lo[4];
+        u32 hi[2];
+        u32 factors;
+    };
+    typedef typename Select<CARRIED_COEFFS, RecordCarried, typename Select<COMPACT12, Record12, Record16>::type>::type
+        Record;
+
     __device__ __forceinline__ Record record(u64 tile, u64 superblock, u32 lane) const {
         const u8 *at = entries_at(tile, superblock);
-        const uint4 low = seismic_ld_nc_na_v4(at + 16 * lane), high = seismic_ld_nc_na_v4(at + 512 + 16 * lane);
-        Record record;
-        record.w[0] = low.x, record.w[1] = low.y, record.w[2] = low.z, record.w[3] = low.w;
-        record.w[4] = high.x, record.w[5] = high.y, record.w[6] = high.z, record.w[7] = high.w;
-        record.factors = seismic_ld_nc_u32(factors_at(tile, superblock) + 4 * (lane / 4));
-        return record;
+        Record rec;
+        if constexpr (CARRIED_COEFFS) {
+            const uint4 low = seismic_ld_nc_na_v4(at + 16 * lane), high = seismic_ld_nc_na_v4(at + 512 + 16 * lane);
+            rec.w[0] = low.x, rec.w[1] = low.y, rec.w[2] = low.z, rec.w[3] = low.w;
+            rec.w[4] = high.x, rec.w[5] = high.y, rec.w[6] = high.z, rec.w[7] = high.w;
+            rec.factors = seismic_ld_nc_u32(factors_at(tile, superblock) + 4 * (lane / 4));
+        } else if constexpr (COMPACT12) {
+            const uint4 lo = seismic_ld_nc_na_v4(at + 16 * lane);
+            const uint2 hi = seismic_ld_nc_na_v2(at + 512 + 8 * lane);
+            rec.lo[0] = lo.x, rec.lo[1] = lo.y, rec.lo[2] = lo.z, rec.lo[3] = lo.w;
+            rec.hi[0] = hi.x, rec.hi[1] = hi.y;
+            rec.factors = seismic_ld_nc_u32(factors_at(tile, superblock) + 4 * lane);
+        } else {
+            const uint4 low = seismic_ld_nc_na_v4(at + 16 * lane), high = seismic_ld_nc_na_v4(at + 512 + 16 * lane);
+            rec.w[0] = low.x, rec.w[1] = low.y, rec.w[2] = low.z, rec.w[3] = low.w;
+            rec.w[4] = high.x, rec.w[5] = high.y, rec.w[6] = high.z, rec.w[7] = high.w;
+            const u32 g = lane / 4, t = lane % 4;
+            rec.f = t < 3 ? seismic_ld_nc_v2(factors_at(tile, superblock) + 24 * g + 8 * t) : make_uint2(0u, 0u);
+        }
+        return rec;
     }
-    // Rows a and b as the lane's rows g and g + 8: each row's words of its
-    // own lane's record (`row_lane`), and its half of that lane's factor word.
+
+    // Rows a and b as the lane's rows g and g + 8.
     __device__ __forceinline__ Record record_rows(u64 a, u64 b, u64 superblock, u32 t) const {
         const Record x = record(a / 16, superblock, row_lane(a, t)), y = record(b / 16, superblock, row_lane(b, t));
         const u32 ua = row_half(a), ub = row_half(b);
         Record rows;
+        if constexpr (CARRIED_COEFFS) {
 #pragma unroll
-        for (int q = 0; q < 4; ++q) {
-            rows.w[2 * q] = ua != 0 ? x.w[2 * q + 1] : x.w[2 * q];
-            rows.w[2 * q + 1] = ub != 0 ? y.w[2 * q + 1] : y.w[2 * q];
+            for (int q = 0; q < 4; ++q) {
+                rows.w[2 * q] = ua != 0 ? x.w[2 * q + 1] : x.w[2 * q];
+                rows.w[2 * q + 1] = ub != 0 ? y.w[2 * q + 1] : y.w[2 * q];
+            }
+            rows.factors = ((ua != 0 ? x.factors >> 16 : x.factors) & 0xFFFFu) |
+                           (ub != 0 ? y.factors & 0xFFFF0000u : y.factors << 16);
+        } else if constexpr (COMPACT12) {
+            rows.lo[0] = ua != 0 ? x.lo[1] : x.lo[0];
+            rows.lo[1] = ub != 0 ? y.lo[1] : y.lo[0];
+            rows.lo[2] = ua != 0 ? x.lo[3] : x.lo[2];
+            rows.lo[3] = ub != 0 ? y.lo[3] : y.lo[2];
+            rows.hi[0] = ((ua != 0 ? x.hi[0] >> 16 : x.hi[0]) & 0xFFFFu) |
+                         (ub != 0 ? y.hi[0] & 0xFFFF0000u : y.hi[0] << 16);
+            rows.hi[1] = ((ua != 0 ? x.hi[1] >> 16 : x.hi[1]) & 0xFFFFu) |
+                         (ub != 0 ? y.hi[1] & 0xFFFF0000u : y.hi[1] << 16);
+            const u8 *fa = factors_at(a / 16, superblock) + record_factor_place((u32)(a % 16)) * 8;
+            const u8 *fb = factors_at(b / 16, superblock) + record_factor_place((u32)(b % 16)) * 8;
+            rows.factors = seismic_ld_nc_u32((t < 2 ? fa : fb) + 4 * (t % 2));
+        } else {
+#pragma unroll
+            for (int q = 0; q < 4; ++q) {
+                rows.w[2 * q] = ua != 0 ? x.w[2 * q + 1] : x.w[2 * q];
+                rows.w[2 * q + 1] = ub != 0 ? y.w[2 * q + 1] : y.w[2 * q];
+            }
+            const u8 *fa = factors_at(a / 16, superblock) + record_factor_place((u32)(a % 16)) * 12;
+            const u8 *fb = factors_at(b / 16, superblock) + record_factor_place((u32)(b % 16)) * 12;
+            if (t == 0)
+                rows.f = make_uint2(seismic_ld_nc_u32(fa), seismic_ld_nc_u32(fa + 4));
+            else if (t == 1)
+                rows.f = make_uint2(seismic_ld_nc_u32(fa + 8), seismic_ld_nc_u32(fb));
+            else if (t == 2)
+                rows.f = make_uint2(seismic_ld_nc_u32(fb + 4), seismic_ld_nc_u32(fb + 8));
+            else
+                rows.f = make_uint2(0u, 0u);
         }
-        rows.factors = ((ua != 0 ? x.factors >> 16 : x.factors) & 0xFFFFu) |
-                       (ub != 0 ? y.factors & 0xFFFF0000u : y.factors << 16);
         return rows;
     }
-    // The scales of the record's groups of the lane's rows, held as the
-    // groups' codes and the rows' factors and formed where used: `(r, n)` is
-    // the scale of row half r, group n (k-block n / 2), exact. Lane t holds
-    // bit t of every scale code; its four lanes' OR is the code
-    // (warp-collective). Four registers rather than sixteen keep a records
-    // GEMV warp within the registers its SM residency allows
-    // (`projection::GemvResidency`).
-    struct Scales {
+
+    // Per-k-block entry preparation for GROUP == 16 records GEMV.
+    struct Kblock16 {
+        u32 g01, g23, g8_01, g8_23;
+    };
+    struct Kblock12 {
+        u32 lo_g, lo_g8, hi;
+    };
+    typedef typename Select<COMPACT12, Kblock12, Kblock16>::type KblockEntries;
+
+    __device__ static __forceinline__ KblockEntries kblock_entries(const Record &rec, int q, u32 lane) {
+        if constexpr (COMPACT12) {
+            const u32 src_lo = (lane & ~1u) | (u32)(q / 2);
+            const u32 src_hi = (lane & ~3u) + (u32)q;
+            const u32 lo_g = seismic_shfl_idx_u32(rec.lo[2 * (q % 2)], src_lo);
+            const u32 lo_g8 = seismic_shfl_idx_u32(rec.lo[2 * (q % 2) + 1], src_lo);
+            const u32 hi0 = seismic_shfl_idx_u32(rec.hi[0], src_hi);
+            const u32 hi1 = seismic_shfl_idx_u32(rec.hi[1], src_hi);
+            return Kblock12{lo_g, lo_g8, (lane % 4) < 2 ? hi0 : hi1};
+        } else {
+            const u32 w0 = rec.w[2 * q], w1 = rec.w[2 * q + 1];
+            const u32 o0 = seismic_shfl_xor_u32(w0, 1);
+            const u32 o1 = seismic_shfl_xor_u32(w1, 1);
+            const bool odd = (lane & 1u) != 0u;
+            return Kblock16{odd ? o0 : w0, odd ? w0 : o0, odd ? o1 : w1, odd ? w1 : o1};
+        }
+    }
+    __device__ static __forceinline__ void group_entries(const KblockEntries &kb, int group, u32 &e_g, u32 &e_g8) {
+        if constexpr (COMPACT12) {
+            e_g = ((kb.lo_g >> (8 * group)) & 0xFFu) | (((kb.hi >> (4 * group)) & 0xFu) << 8);
+            e_g8 = ((kb.lo_g8 >> (8 * group)) & 0xFFu) | (((kb.hi >> (16 + 4 * group)) & 0xFu) << 8);
+        } else {
+            const u32 shift = 16u * (u32)(group & 1);
+            e_g = ((group < 2 ? kb.g01 : kb.g23) >> shift) & 0xFFFFu;
+            e_g8 = ((group < 2 ? kb.g8_01 : kb.g8_23) >> shift) & 0xFFFFu;
+        }
+    }
+
+    // The scales of the record's groups of the lane's rows.
+    struct ScalesCarried {
         u32 codes[2];
         float d[2];
         __device__ __forceinline__ float operator()(int r, int n) const {
-            // The code of group 2q + h at nibble q + 4h.
             const u32 code = (codes[r] >> (4 * (n / 2 + 4 * (n % 2)))) & 15u;
             return d[r] * L::value(code);
         }
     };
-    __device__ static __forceinline__ Scales scales(const Record &record, u32 t) {
-        Scales scales;
-#pragma unroll
-        for (int r = 0; r < 2; ++r) {
-            u32 codes = 0u;
-#pragma unroll
-            for (int q = 0; q < 4; ++q)
-                codes |= ((record.w[2 * q + r] >> CARRIED) & 0x00010001u) << (4 * q);
-            codes <<= t;
-            codes |= seismic_shfl_xor_u32(codes, 1);
-            codes |= seismic_shfl_xor_u32(codes, 2);
-            scales.codes[r] = codes;
-            scales.d[r] = K::factors(record.factors >> (16 * r)).x;
+    struct ScalesHier {
+        u32 codes[2][2];
+        float d[2];
+        __device__ __forceinline__ float operator()(int r, int n) const {
+            if constexpr (COMPACT12) {
+                return d[r] * L::value(bits_of<3>(codes[r], 3u * (u32)n));
+            } else {
+                const u32 code = (codes[r][n / 8] >> (4 * (n % 8))) & 15u;
+                return d[r] * L::value(code);
+            }
         }
-        return scales;
+    };
+    typedef typename Select<CARRIED_COEFFS, ScalesCarried, ScalesHier>::type Scales;
+
+    __device__ static __forceinline__ Scales scales(const Record &rec, u32 t) {
+        Scales sc;
+        if constexpr (CARRIED_COEFFS) {
+#pragma unroll
+            for (int r = 0; r < 2; ++r) {
+                u32 codes = 0u;
+#pragma unroll
+                for (int q = 0; q < 4; ++q)
+                    codes |= ((rec.w[2 * q + r] >> CARRIED) & 0x00010001u) << (4 * q);
+                codes <<= t;
+                codes |= seismic_shfl_xor_u32(codes, 1);
+                codes |= seismic_shfl_xor_u32(codes, 2);
+                sc.codes[r] = codes;
+                sc.d[r] = K::factors(rec.factors >> (16 * r)).x;
+            }
+        } else if constexpr (COMPACT12) {
+            const u32 quad = (threadIdx.x % 32) & ~3u;
+            const u32 w0 = seismic_shfl_idx_u32(rec.factors, quad + 0u);
+            const u32 w1 = seismic_shfl_idx_u32(rec.factors, quad + 1u);
+            const u32 w2 = seismic_shfl_idx_u32(rec.factors, quad + 2u);
+            const u32 w3 = seismic_shfl_idx_u32(rec.factors, quad + 3u);
+            sc.codes[0][0] = w0, sc.codes[0][1] = w1;
+            sc.codes[1][0] = w2, sc.codes[1][1] = w3;
+            sc.d[0] = K::factors(w1 >> 16).x;
+            sc.d[1] = K::factors(w3 >> 16).x;
+        } else {
+            const u32 quad = (threadIdx.x % 32) & ~3u;
+            sc.codes[0][0] = seismic_shfl_idx_u32(rec.f.x, quad + 0u);
+            sc.codes[0][1] = seismic_shfl_idx_u32(rec.f.y, quad + 0u);
+            sc.d[0] = K::factors(seismic_shfl_idx_u32(rec.f.x, quad + 1u)).x;
+            sc.codes[1][0] = seismic_shfl_idx_u32(rec.f.y, quad + 1u);
+            sc.codes[1][1] = seismic_shfl_idx_u32(rec.f.x, quad + 2u);
+            sc.d[1] = K::factors(seismic_shfl_idx_u32(rec.f.y, quad + 2u)).x;
+        }
+        return sc;
     }
-    // Each point's eight magnitude codes (`grids::magnitudes`: a magnitude
-    // shifted right by `SHIFT`), value i at nibble i. The GEMV block's threads
-    // form one copy in shared memory.
+
+    // Shared-memory point table:
+    // - magnitude grids (`iq2xxs` 1 KiB, `iq2xs` 2 KiB): 8 × 4-bit magnitude codes per point (`u32`)
+    // - trit grid (`iq1m` 4 KiB): 8 × 2-bit `(trit + 1)` codes per point (`u16`)
     struct Table {
-        u32 points[Pts::MASK + 1];
+        typename Select<G::magnitudes(), u32, u16>::type points[Pts::MASK + 1];
     };
     // The magnitude codes of a point word's four lanes, lane i at nibble i.
     __device__ static __forceinline__ u32 magnitude_codes(u32 magnitudes) {
@@ -2646,62 +2972,95 @@ template <class G, class K> struct Records {
     __device__ static __forceinline__ void form_table(Table &table, u32 thread, u32 threads) {
         for (u32 i = thread; i <= Pts::MASK; i += threads) {
             const uint2 point = Pts::template point<GlobalPoints>(i);
-            table.points[i] = magnitude_codes(point.x) | (magnitude_codes(point.y) << 16);
+            if constexpr (G::magnitudes()) {
+                table.points[i] = magnitude_codes(point.x) | (magnitude_codes(point.y) << 16);
+            } else {
+                const u32 c0 = __vadd4(point.x, 0x01010101u);
+                const u32 c1 = __vadd4(point.y, 0x01010101u);
+                const u32 lo = (c0 & 3u) | ((c0 >> 6) & 0xCu) | ((c0 >> 12) & 0x30u) | ((c0 >> 18) & 0xC0u);
+                const u32 hi = (c1 & 3u) | ((c1 >> 6) & 0xCu) | ((c1 >> 12) & 0x30u) | ((c1 >> 18) & 0xC0u);
+                table.points[i] = u16(lo | (hi << 8));
+            }
         }
     }
-    // The operand pairs (values 2j, 2j + 1 in a[j]) of `entry` (its low 16
-    // bits), signed: each half is formed by one PRMT from the operand bytes
-    // of the grid's magnitudes (`GridOperands`), its selector bytes looked
-    // up by magnitude code.
+    // All four operand pairs (values 2j, 2j + 1 in a[j]) of `entry` (group 32).
     template <class O> __device__ static __forceinline__ void operands(const Table &table, u32 entry, u32 (&a)[4]);
+    // One half (values 4h..4h+3 in `low`, `high`) of `entry` (group 16).
+    template <class O>
+    __device__ static __forceinline__ void operands_half(const Table &table, u32 entry, int h, u32 &low, u32 &high);
 
     // ---- GEMV in fragment order (`gemv_mma_group`, a pair with another
-    // representation): the k-block's entries of rows g and g + 8 gathered
-    // from the quad, and the record's scales.
+    // representation or INT8 GEMV): the k-block's entries of rows g and g + 8
+    // gathered from the quad, and the record's scales.
     typedef typename GridPlanes<G>::Raw Raw;
     typedef Record Super;
     __device__ __forceinline__ Super fetch_superblock(u64 tile, u64 superblock, u64, u32 lane) const {
         return record(tile, superblock, lane);
     }
-    // Rows g, g + 8 of k-block q: entries 2i, 2i + 1 in word i (warp-collective).
+    // Rows g, g + 8 of k-block q (warp-collective).
     __device__ __forceinline__ Raw raw(const Super &super, int q, u32 lane) const {
         Raw raw;
-        u32 e[2][4];
+        const u32 quad = lane & ~3u;
+        if constexpr (COMPACT12) {
+            const u32 src0 = quad + (u32)(q / 2);
+            const u32 src1 = quad + 2u + (u32)(q / 2);
+            const u32 hi0 = seismic_shfl_idx_u32(super.hi[0], quad + (u32)q);
+            const u32 hi1 = seismic_shfl_idx_u32(super.hi[1], quad + (u32)q);
 #pragma unroll
-        for (int r = 0; r < 2; ++r)
+            for (int r = 0; r < 2; ++r) {
+                const u32 lo0 = seismic_shfl_idx_u32(super.lo[2 * (q % 2) + r], src0);
+                const u32 lo1 = seismic_shfl_idx_u32(super.lo[2 * (q % 2) + r], src1);
+                u32 *row = r == 0 ? raw.g : raw.g8;
+                row[0] = prmt(lo0, lo1, 0x5140u);
+                row[1] = prmt(lo0, lo1, 0x7362u);
+                row[2] = spread_nibbles((hi0 >> (16 * r)) & 0xFFFFu) |
+                         (spread_nibbles((hi1 >> (16 * r)) & 0xFFFFu) << 4);
+            }
+        } else {
+            u32 e[2][4];
 #pragma unroll
-            for (int j = 0; j < 4; ++j)
-                e[r][j] = seismic_shfl_idx_u32(super.w[2 * q + r], (lane & ~3u) + (u32)j);
+            for (int r = 0; r < 2; ++r)
 #pragma unroll
-        for (int r = 0; r < 2; ++r) {
-            u32 *row = r == 0 ? raw.g : raw.g8;
-            row[0] = prmt(e[r][0], e[r][1], 0x5410u);
-            row[1] = prmt(e[r][2], e[r][3], 0x5410u);
-            row[2] = prmt(e[r][0], e[r][1], 0x7632u);
-            row[3] = prmt(e[r][2], e[r][3], 0x7632u);
+                for (int j = 0; j < 4; ++j)
+                    e[r][j] = seismic_shfl_idx_u32(super.w[2 * q + r], quad + (u32)j);
+#pragma unroll
+            for (int r = 0; r < 2; ++r) {
+                u32 *row = r == 0 ? raw.g : raw.g8;
+                if constexpr (GROUP == 32) {
+                    row[0] = prmt(e[r][0], e[r][1], 0x5410u);
+                    row[1] = prmt(e[r][2], e[r][3], 0x5410u);
+                    row[2] = prmt(e[r][0], e[r][1], 0x7632u);
+                    row[3] = prmt(e[r][2], e[r][3], 0x7632u);
+                } else {
+                    row[0] = prmt(e[r][0], e[r][2], 0x5410u);
+                    row[1] = prmt(e[r][0], e[r][2], 0x7632u);
+                    row[2] = prmt(e[r][1], e[r][3], 0x5410u);
+                    row[3] = prmt(e[r][1], e[r][3], 0x7632u);
+                }
+            }
         }
         raw.t = lane % 4;
         return raw;
     }
     struct Block {
-        float scale[2][8];
+        float scale[2][4 * GROUPS];
     };
     __device__ __forceinline__ Block block(u64 tile, u64 superblock, u32 lane) const {
         const Scales scale = scales(record(tile, superblock, lane), lane % 4);
-        Block block;
+        Block blk;
 #pragma unroll
         for (int r = 0; r < 2; ++r)
 #pragma unroll
-            for (int n = 0; n < 8; ++n)
-                block.scale[r][n] = scale(r, n);
-        return block;
+            for (int n = 0; n < 4 * GROUPS; ++n)
+                blk.scale[r][n] = scale(r, n);
+        return blk;
     }
-    __device__ __forceinline__ void coefficients(const Block &block, int q, Coefficients<GROUPS> &c) const {
+    __device__ __forceinline__ void coefficients(const Block &blk, int q, Coefficients<GROUPS> &c) const {
 #pragma unroll
         for (int r = 0; r < 2; ++r)
 #pragma unroll
             for (int group = 0; group < GROUPS; ++group)
-                c.scale[r][group] = block.scale[r][2 * q + group];
+                c.scale[r][group] = blk.scale[r][GROUPS * q + group];
     }
     template <class O, class Src = GlobalPoints>
     __device__ __forceinline__ void decode(const Raw &raw, int step, u32 (&a)[4]) const {
@@ -2723,86 +3082,161 @@ template <class G, class K> struct Records {
         }
     }
 
-    // ---- GEMM: a k-block's chunks are its eight bytes of each lane of the
-    // record, staged [lane][8 bytes].
-    static constexpr int CHUNKS = 32;
+    // ---- GEMM: 8-byte chunks per k-block (32 chunks for 16b, 24 for 12b).
+    static constexpr int CHUNKS = COMPACT12 ? 24 : 32;
     static constexpr int CHUNK_BYTES = 8;
     __device__ __forceinline__ const u8 *chunk_source(u64 tile, u64 kblock, u32 chunk) const {
-        return entries_at(tile, kblock / 4) + kblock % 4 / 2 * 512 + chunk * 16 + kblock % 2 * 8;
+        if constexpr (COMPACT12) {
+            const u64 sb = kblock / 4;
+            const u32 q = (u32)(kblock % 4);
+            if (chunk < 16) {
+                const u32 g = chunk / 2, par = chunk % 2;
+                const u32 lane = 4 * g + 2 * par + q / 2;
+                return entries_at(tile, sb) + lane * 16 + (q % 2) * 8;
+            }
+            const u32 g = chunk - 16;
+            return entries_at(tile, sb) + 512 + (4 * g + q) * 8;
+        } else {
+            return entries_at(tile, kblock / 4) + kblock % 4 / 2 * 512 + chunk * 16 + kblock % 2 * 8;
+        }
     }
     __device__ __forceinline__ Raw from_shared(const u8 *staged, u32 lane) const {
         Raw raw;
-        // Lanes 4g .. 4g + 3's staged bytes: rows g, g + 8 of entries j, 4 + j.
-        const uint4 low = *reinterpret_cast<const uint4 *>(staged + 32 * (lane / 4));
-        const uint4 high = *reinterpret_cast<const uint4 *>(staged + 32 * (lane / 4) + 16);
-        const uint2 e[4] = {make_uint2(low.x, low.y), make_uint2(low.z, low.w), make_uint2(high.x, high.y),
-                            make_uint2(high.z, high.w)};
-        raw.g[0] = prmt(e[0].x, e[1].x, 0x5410u), raw.g[1] = prmt(e[2].x, e[3].x, 0x5410u);
-        raw.g[2] = prmt(e[0].x, e[1].x, 0x7632u), raw.g[3] = prmt(e[2].x, e[3].x, 0x7632u);
-        raw.g8[0] = prmt(e[0].y, e[1].y, 0x5410u), raw.g8[1] = prmt(e[2].y, e[3].y, 0x5410u);
-        raw.g8[2] = prmt(e[0].y, e[1].y, 0x7632u), raw.g8[3] = prmt(e[2].y, e[3].y, 0x7632u);
-        raw.t = lane % 4;
-        return raw;
-    }
-    // A row's record word: its factors word (rows g, g + 8).
-    static constexpr int SUPER_WORDS = 1;
-    __device__ __forceinline__ const u8 *super_word(u64 row, u64 superblock, int) const {
-        return factors_at(row / 16, superblock) + 4 * (row % 8);
-    }
-    __device__ static __forceinline__ int word_kblock(int) { return 0; }
-    // Row r's scale code of `group` from its four entries' carried bits in
-    // the staged chunks of the k-block.
-    __device__ __forceinline__ void staged_coefficient(const u32 *words, const u8 *codes, u32 r, u64, int group,
-                                                       float &scale, float &bias) const {
-        // Lanes 4 (r % 8) + j's chunks: word 2j + r / 8 is row r's entries j, 4 + j.
-        const uint4 low = *reinterpret_cast<const uint4 *>(codes + 32 * (r % 8));
-        const uint4 high = *reinterpret_cast<const uint4 *>(codes + 32 * (r % 8) + 16);
-        const u32 half = r / 8, shift = CARRIED + 16 * group;
-        const u32 code = (((half ? low.y : low.x) >> shift) & 1u) | ((((half ? low.w : low.z) >> shift) & 1u) << 1) |
-                         ((((half ? high.y : high.x) >> shift) & 1u) << 2) |
-                         ((((half ? high.w : high.z) >> shift) & 1u) << 3);
-        scale = K::factors(words[0] >> (16 * (r / 8))).x * L::value(code);
-        bias = 0.0f;
-    }
-
-    // ---- One row's values (`row_values16`), read by a lane alone: word r
-    // of the 16 bytes of lane `l` holding row g + 8 r's entries of k-block
-    // `kblock` (entries l % 4, low half, and 4 + l % 4, high half).
-    __device__ __forceinline__ u32 entry_word(u64 tile, u64 kblock, u32 lane, u32 r) const {
-        return seismic_ld_nc_u32(entries_at(tile, kblock / 4) + kblock % 4 / 2 * 512 + 16 * lane +
-                                 4 * (kblock % 2 * 2 + r));
-    }
-    // Rows g, g + 8 of k-block `kblock`: entries 2i, 2i + 1 in word i, as
-    // `raw` gathers them from the quad.
-    __device__ __forceinline__ Raw fetch(u64 tile, u64 kblock, u32 lane) const {
-        Raw raw;
-        const u32 quad = lane & ~3u;
-#pragma unroll
-        for (int r = 0; r < 2; ++r) {
-            u32 e[4];
-#pragma unroll
-            for (int j = 0; j < 4; ++j)
-                e[j] = entry_word(tile, kblock, quad + (u32)j, (u32)r);
-            u32 *row = r == 0 ? raw.g : raw.g8;
-            row[0] = prmt(e[0], e[1], 0x5410u);
-            row[1] = prmt(e[2], e[3], 0x5410u);
-            row[2] = prmt(e[0], e[1], 0x7632u);
-            row[3] = prmt(e[2], e[3], 0x7632u);
+        if constexpr (COMPACT12) {
+            const u32 g = lane / 4;
+            const uint4 lo = *reinterpret_cast<const uint4 *>(staged + 16 * g);
+            const uint2 hi = *reinterpret_cast<const uint2 *>(staged + 128 + 8 * g);
+            raw.g[0] = prmt(lo.x, lo.z, 0x5140u);
+            raw.g[1] = prmt(lo.x, lo.z, 0x7362u);
+            raw.g[2] = spread_nibbles(hi.x & 0xFFFFu) | (spread_nibbles(hi.y & 0xFFFFu) << 4);
+            raw.g8[0] = prmt(lo.y, lo.w, 0x5140u);
+            raw.g8[1] = prmt(lo.y, lo.w, 0x7362u);
+            raw.g8[2] = spread_nibbles(hi.x >> 16) | (spread_nibbles(hi.y >> 16) << 4);
+        } else {
+            // Lanes 4g .. 4g + 3's staged bytes.
+            const uint4 low = *reinterpret_cast<const uint4 *>(staged + 32 * (lane / 4));
+            const uint4 high = *reinterpret_cast<const uint4 *>(staged + 32 * (lane / 4) + 16);
+            const uint2 e[4] = {make_uint2(low.x, low.y), make_uint2(low.z, low.w), make_uint2(high.x, high.y),
+                                make_uint2(high.z, high.w)};
+            if constexpr (GROUP == 32) {
+                raw.g[0] = prmt(e[0].x, e[1].x, 0x5410u), raw.g[1] = prmt(e[2].x, e[3].x, 0x5410u);
+                raw.g[2] = prmt(e[0].x, e[1].x, 0x7632u), raw.g[3] = prmt(e[2].x, e[3].x, 0x7632u);
+                raw.g8[0] = prmt(e[0].y, e[1].y, 0x5410u), raw.g8[1] = prmt(e[2].y, e[3].y, 0x5410u);
+                raw.g8[2] = prmt(e[0].y, e[1].y, 0x7632u), raw.g8[3] = prmt(e[2].y, e[3].y, 0x7632u);
+            } else {
+                raw.g[0] = prmt(e[0].x, e[2].x, 0x5410u), raw.g[1] = prmt(e[0].x, e[2].x, 0x7632u);
+                raw.g[2] = prmt(e[1].x, e[3].x, 0x5410u), raw.g[3] = prmt(e[1].x, e[3].x, 0x7632u);
+                raw.g8[0] = prmt(e[0].y, e[2].y, 0x5410u), raw.g8[1] = prmt(e[0].y, e[2].y, 0x7632u);
+                raw.g8[2] = prmt(e[1].y, e[3].y, 0x5410u), raw.g8[3] = prmt(e[1].y, e[3].y, 0x7632u);
+            }
         }
         raw.t = lane % 4;
         return raw;
     }
-    // Group `group` of k-block `kblock` of stored row `row`: factor L(s), s's
-    // bit j at bit CARRIED of the group's entry j.
+    // A row's staged factor words per superblock: 1 (iq2xxs), 2 (iq1m), 3 (iq2xs).
+    static constexpr int SUPER_WORDS = CARRIED_COEFFS ? 1 : (int)(ROW_FACTOR_BYTES / 4);
+    __device__ __forceinline__ const u8 *super_word(u64 row, u64 superblock, int word) const {
+        if constexpr (CARRIED_COEFFS) {
+            return factors_at(row / 16, superblock) + 4 * (row % 8);
+        } else {
+            return factors_at(row / 16, superblock) + record_factor_place((u32)(row % 16)) * ROW_FACTOR_BYTES +
+                   4 * (u32)word;
+        }
+    }
+    __device__ static __forceinline__ int word_kblock(int) { return 0; }
+    __device__ __forceinline__ void staged_coefficient(const u32 *words, const u8 *codes, u32 r, u64 kblock, int group,
+                                                       float &scale, float &bias) const {
+        if constexpr (CARRIED_COEFFS) {
+            const uint4 low = *reinterpret_cast<const uint4 *>(codes + 32 * (r % 8));
+            const uint4 high = *reinterpret_cast<const uint4 *>(codes + 32 * (r % 8) + 16);
+            const u32 half = r / 8, shift = CARRIED + 16 * group;
+            const u32 code = (((half ? low.y : low.x) >> shift) & 1u) | ((((half ? low.w : low.z) >> shift) & 1u) << 1) |
+                             ((((half ? high.y : high.x) >> shift) & 1u) << 2) |
+                             ((((half ? high.w : high.z) >> shift) & 1u) << 3);
+            scale = K::factors(words[0] >> (16 * (r / 8))).x * L::value(code);
+        } else if constexpr (COMPACT12) {
+            const u32 g = (u32)(kblock % 4) * 4u + (u32)group;
+            const u32 w[2] = {words[0], words[1]};
+            const u32 code = bits_of<3>(w, 3u * g);
+            scale = K::factors(words[1] >> 16).x * L::value(code);
+        } else {
+            const u32 g = (u32)(kblock % 4) * 4u + (u32)group;
+            const u32 code = (words[g / 8] >> (4 * (g % 8))) & 15u;
+            scale = K::factors(words[2]).x * L::value(code);
+        }
+        bias = 0.0f;
+    }
+
+    // ---- One row's values (`row_values16`), read by a lane alone.
+    __device__ __forceinline__ u32 entry_word(u64 tile, u64 kblock, u32 lane, u32 r) const {
+        return seismic_ld_nc_u32(entries_at(tile, kblock / 4) + kblock % 4 / 2 * 512 + 16 * lane +
+                                 4 * (kblock % 2 * 2 + r));
+    }
+    __device__ __forceinline__ Raw fetch(u64 tile, u64 kblock, u32 lane) const {
+        Raw raw;
+        if constexpr (COMPACT12) {
+            const u64 sb = kblock / 4;
+            const u32 q = (u32)(kblock % 4), g = lane / 4;
+            const u8 *at = entries_at(tile, sb);
+            const u32 l0 = 4 * g + q / 2, l1 = 4 * g + 2 + q / 2;
+            const u32 lo0_g = seismic_ld_nc_u32(at + l0 * 16 + (q % 2) * 8);
+            const u32 lo0_g8 = seismic_ld_nc_u32(at + l0 * 16 + (q % 2) * 8 + 4);
+            const u32 lo1_g = seismic_ld_nc_u32(at + l1 * 16 + (q % 2) * 8);
+            const u32 lo1_g8 = seismic_ld_nc_u32(at + l1 * 16 + (q % 2) * 8 + 4);
+            const uint2 hi = seismic_ld_nc_v2(at + 512 + (4 * g + q) * 8);
+            raw.g[0] = prmt(lo0_g, lo1_g, 0x5140u);
+            raw.g[1] = prmt(lo0_g, lo1_g, 0x7362u);
+            raw.g[2] = spread_nibbles(hi.x & 0xFFFFu) | (spread_nibbles(hi.y & 0xFFFFu) << 4);
+            raw.g8[0] = prmt(lo0_g8, lo1_g8, 0x5140u);
+            raw.g8[1] = prmt(lo0_g8, lo1_g8, 0x7362u);
+            raw.g8[2] = spread_nibbles(hi.x >> 16) | (spread_nibbles(hi.y >> 16) << 4);
+        } else {
+            const u32 quad = lane & ~3u;
+#pragma unroll
+            for (int r = 0; r < 2; ++r) {
+                u32 e[4];
+#pragma unroll
+                for (int j = 0; j < 4; ++j)
+                    e[j] = entry_word(tile, kblock, quad + (u32)j, (u32)r);
+                u32 *row = r == 0 ? raw.g : raw.g8;
+                if constexpr (GROUP == 32) {
+                    row[0] = prmt(e[0], e[1], 0x5410u);
+                    row[1] = prmt(e[2], e[3], 0x5410u);
+                    row[2] = prmt(e[0], e[1], 0x7632u);
+                    row[3] = prmt(e[2], e[3], 0x7632u);
+                } else {
+                    row[0] = prmt(e[0], e[2], 0x5410u);
+                    row[1] = prmt(e[0], e[2], 0x7632u);
+                    row[2] = prmt(e[1], e[3], 0x5410u);
+                    row[3] = prmt(e[1], e[3], 0x7632u);
+                }
+            }
+        }
+        raw.t = lane % 4;
+        return raw;
+    }
     __device__ __forceinline__ void coefficient(u64 row, u64 kblock, int group, float &scale, float &bias) const {
         const u64 tile = row / 16;
-        const u32 g = (u32)(row % 8), r = (u32)(row % 16 / 8);
-        u32 s = 0;
+        if constexpr (CARRIED_COEFFS) {
+            const u32 g = (u32)(row % 8), r = (u32)(row % 16 / 8);
+            u32 s = 0;
 #pragma unroll
-        for (u32 j = 0; j < 4; ++j)
-            s |= ((entry_word(tile, kblock, 4 * g + j, r) >> (CARRIED + 16 * group)) & 1u) << j;
-        const u32 d = seismic_ld_nc_u32(factors_at(tile, kblock / 4) + 4 * g);
-        scale = K::factors(d >> (16 * r)).x * L::value(s);
+            for (u32 j = 0; j < 4; ++j)
+                s |= ((entry_word(tile, kblock, 4 * g + j, r) >> (CARRIED + 16 * group)) & 1u) << j;
+            const u32 d = seismic_ld_nc_u32(factors_at(tile, kblock / 4) + 4 * g);
+            scale = K::factors(d >> (16 * r)).x * L::value(s);
+        } else if constexpr (COMPACT12) {
+            const u8 *f = factors_at(tile, kblock / 4) + record_factor_place((u32)(row % 16)) * 8;
+            const u32 w[2] = {seismic_ld_nc_u32(f), seismic_ld_nc_u32(f + 4)};
+            const u32 g = (u32)(kblock % 4) * 4u + (u32)group;
+            scale = K::factors(w[1] >> 16).x * L::value(bits_of<3>(w, 3u * g));
+        } else {
+            const u8 *f = factors_at(tile, kblock / 4) + record_factor_place((u32)(row % 16)) * 12;
+            const u32 g = (u32)(kblock % 4) * 4u + (u32)group;
+            const u32 sw = seismic_ld_nc_u32(f + 4 * (g / 8));
+            const u32 d = seismic_ld_nc_u32(f + 8);
+            scale = K::factors(d).x * L::value((sw >> (4 * (g % 8))) & 15u);
+        }
         bias = 0.0f;
     }
     __device__ __forceinline__ u32 code(const Raw &raw, int step, u32 slot) const {
@@ -2847,6 +3281,45 @@ __device__ __forceinline__ void Records<G, K>::operands(const Table &table, u32 
 #pragma unroll
         for (int j = 0; j < 4; ++j)
             a[j] ^= (((signs >> (2 * j)) & 1u) << 15) | (((signs >> (2 * j + 1)) & 1u) << 31);
+    }
+}
+
+template <class G, class K>
+template <class O>
+__device__ __forceinline__ void Records<G, K>::operands_half(const Table &table, u32 entry, int h, u32 &low,
+                                                             u32 &high) {
+    if constexpr (G::magnitudes()) {
+        using P = GridOperands<Pts::GRID, O>;
+        const u32 codes = table.points[entry & Pts::MASK];
+        const u32 signs = G::signs(entry);
+        u32 sel = prmt(P::SELECTORS, 0u, h ? (codes >> 16) : codes);
+        if constexpr (P::SIGNED_SELECTORS) {
+            sel |= (((h ? (signs >> 4) : (signs & 15u)) * (0x00204081u << 6)) & 0x40404040u);
+        }
+        low = prmt(P::LOW, P::HIGH, sel);
+        high = prmt(P::LOW, P::HIGH, sel >> 16);
+        if constexpr (!P::SIGNED_SELECTORS) {
+            const u32 hs = signs >> (4 * h);
+            low ^= ((hs & 1u) << 15) | (((hs >> 1) & 1u) << 31);
+            high ^= (((hs >> 2) & 1u) << 15) | (((hs >> 3) & 1u) << 31);
+        }
+    } else {
+        // IQ1_M: 8 × 2-bit (trit + 1) in `u16`; half h is byte h.
+        const u32 packed = (u32)table.points[entry & Pts::MASK] >> (8 * h);
+        const u32 p01 = ((packed & 3u) | ((packed & 0xCu) << 6)) * 0x11u + 0x4040u;
+        const u32 p23 = (((packed >> 4) & 3u) | (((packed >> 4) & 0xCu) << 6)) * 0x11u + 0x4040u;
+        const bool d = ((entry >> G::delta_bit()) & 1u) != 0u;
+        if constexpr (Same<O, OpBF16>::value) {
+            const u32 lo_tbl = d ? 0x00E08010u : 0x001080E0u;
+            const u32 hi_tbl = d ? 0x0040BFC1u : 0x00413FC0u;
+            low = prmt(lo_tbl, hi_tbl, p01);
+            high = prmt(lo_tbl, hi_tbl, p23);
+        } else {
+            const u32 lo_tbl = d ? 0x00000080u : 0x00800000u;
+            const u32 hi_tbl = d ? 0x0047BCC8u : 0x00483CC7u;
+            low = prmt(lo_tbl, hi_tbl, p01);
+            high = prmt(lo_tbl, hi_tbl, p23);
+        }
     }
 }
 
@@ -3132,7 +3605,6 @@ struct Decoder<SEISMIC_CODES_GRID, LOW, HIGH, OFFSET, TABLE, GRID, INDEX_BITS, L
     static_assert(!OPERANDS, "grid codes have no NVFP4 operands");
     static_assert(FOLD, "grid codes are admitted to the scaled GEMM only");
     static_assert(S8_ENTRIES, "grid codes' int8 codes are in entry order (`GridPlanes::s8_half`)");
-    static_assert(!RECORDS || IsCarried<K>::value, "mma16 records hold carried coefficient codes");
     typedef typename GridCodesOf<LOW, HIGH, GRID, INDEX_BITS, LANES, SIGNS, DELTA, DELTA_EXPONENT, SIGN_BIT,
                                  SIGN_BITS, DELTA_BIT>::type Codes;
     typedef GridPlanes<Codes> P;
@@ -3308,9 +3780,9 @@ __device__ __forceinline__ void row_packet8(const W &w, u64 row, u64 rows, u64 p
     TYPE {                                                                                               \
         packets::detail::Rows {                                                                          \
             (const packets::u8 *)(pointer), ELEMENT_CAT(P, _ROW_STRIDE_BYTES),                            \
-                packets::detail::CodePlane{ELEMENT_CAT(P, _ROW_CODES), (packets::u32)ELEMENT_CAT(P, _ROW_CODES_BYTES)}, \
-                packets::detail::CodePlane{ELEMENT_CAT(P, _ROW_HIGH), (packets::u32)ELEMENT_CAT(P, _ROW_HIGH_BYTES)},   \
-                ELEMENT_CAT(P, _ROW_SCALES), ELEMENT_CAT(P, _ROW_SUPERS), ELEMENT_CAT(P, _ROW_SUPERS_BYTES) \
+                packets::detail::CodePlane{ELEMENT_CAT(P, _ROW_CODES)},                                  \
+                packets::detail::CodePlane{ELEMENT_CAT(P, _ROW_HIGH)},                                   \
+                ELEMENT_CAT(P, _ROW_SUPERS), ELEMENT_CAT(P, _ROW_SUPERS_BYTES)                           \
         }                                                                                                \
     }
 

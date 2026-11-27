@@ -3592,6 +3592,9 @@ pub struct NativeSubmission {
     gates: Vec<(Arc<timeline::TimelineInner>, u64)>,
     /// Each resident launch's barrier, whose give-up fails the work.
     barriers: Vec<ResidentBarrier>,
+    /// Immutable read-only allocations whose per-submission mutex locks were
+    /// skipped; kept alive until `Drop` retires `route` first.
+    _read_only_held: Vec<Arc<Allocation>>,
     _retained: Arc<dyn std::any::Any + Send + Sync>,
 }
 
@@ -3719,18 +3722,55 @@ pub(crate) fn submit_after_transfers(
     queue: NativeQueue,
     after_transfers: &[transfer::TransferSync],
 ) -> Result<NativeSubmission, CallError> {
+    submit_after_transfers_inner(list, access, retained, repetitions, observed, queue, after_transfers, false)
+        .map(|(sub, _)| sub)
+}
+
+fn submit_signaled_after_transfers(
+    list: &impl DispatchList,
+    access: &[(Arc<Allocation>, bool)],
+    retained: Arc<dyn std::any::Any + Send + Sync>,
+    repetitions: usize,
+    observed: bool,
+    queue: NativeQueue,
+    after_transfers: &[transfer::TransferSync],
+) -> Result<(NativeSubmission, transfer::TransferSync), CallError> {
+    submit_after_transfers_inner(list, access, retained, repetitions, observed, queue, after_transfers, true)
+        .map(|(sub, fence)| (sub, fence.expect("signal=true always produces a TransferSync")))
+}
+
+fn submit_after_transfers_inner(
+    list: &impl DispatchList,
+    access: &[(Arc<Allocation>, bool)],
+    retained: Arc<dyn std::any::Any + Send + Sync>,
+    repetitions: usize,
+    observed: bool,
+    queue: NativeQueue,
+    after_transfers: &[transfer::TransferSync],
+    signal: bool,
+) -> Result<(NativeSubmission, Option<transfer::TransferSync>), CallError> {
     if list.count() == 0 {
         return Err(CallError::Workflow(crate::api::WorkflowError::Empty));
     }
+    // Immutable read-only allocations kept alive until after `issued` retires
+    // (declared before `issued` so unwind drops `issued` first).
+    let mut read_only_held = Vec::new();
     // Owns retirement until the submission takes it. Declared before the
     // submission's permits and order lock so that unwinding releases them
     // before it waits.
     let mut issued = IssuedWork(None);
-    // Host access is excluded while the work is encoded.
-    let permits = access
-        .iter()
-        .map(|(allocation, write)| allocation.acquire_for_device(*write))
-        .collect::<Vec<_>>();
+    // Host access is excluded while the work is encoded. Immutable read-only
+    // allocations cannot conflict with host or device writes and stay alive via
+    // `read_only_held` until after retirement, so they skip all three access
+    // mutexes.
+    let mut permits = Vec::with_capacity(access.len());
+    for (allocation, write) in access {
+        if !*write && allocation.storage().read_only() {
+            read_only_held.push(allocation.clone());
+        } else {
+            permits.push(allocation.acquire_for_device(*write));
+        }
+    }
     let first = list.dispatch(0, &mut Vec::new()).kernel;
     for sync in after_transfers {
         sync.validate_for_device(&first.public_device)
@@ -3749,6 +3789,9 @@ pub(crate) fn submit_after_transfers(
     // submission used waits for it once.
     let mut after: Vec<Arc<dyn DeviceCompletion>> = Vec::new();
     for (allocation, write) in access {
+        if !*write && allocation.storage().read_only() {
+            continue;
+        }
         for fence in allocation.queue_order(queue, *write).map_err(CallError::Execution)? {
             if !after.iter().any(|known| Arc::ptr_eq(known, &fence)) {
                 after.push(fence);
@@ -3769,6 +3812,18 @@ pub(crate) fn submit_after_transfers(
     // Work committed before an issue failure runs on as this submission:
     // its caller receives it, and can answer a park it reached, before the
     // failure is reported by its outcome.
+    #[cfg(target_os = "macos")]
+    let metal_signal_event = if signal {
+        if let NativeRoute::Metal { opened, .. } = &first.route {
+            Some(Arc::new(
+                seismic_metal::SharedEvent::new(opened.service()).map_err(CallError::Execution)?,
+            ))
+        } else {
+            None
+        }
+    } else {
+        None
+    };
     let work = Encoding {
         device_id: first.public_device.device_id(),
         list,
@@ -3779,6 +3834,8 @@ pub(crate) fn submit_after_transfers(
         queue,
         after: &after,
         after_transfers,
+        #[cfg(target_os = "macos")]
+        signal_metal: metal_signal_event.as_deref().map(|ev| (ev, 1u64)),
     };
     let route = Arc::new(
         encode(first, &work)
@@ -3790,6 +3847,9 @@ pub(crate) fn submit_after_transfers(
     // later host access and the storage's release order after the work.
     let completion: Arc<dyn DeviceCompletion> = route.clone();
     for (allocation, write) in access {
+        if !*write && allocation.storage().read_only() {
+            continue;
+        }
         allocation.record_device_use(crate::driver::DeviceQueue::Native(queue), completion.clone(), *write);
     }
     #[cfg(test)]
@@ -3810,12 +3870,27 @@ pub(crate) fn submit_after_transfers(
     } else {
         Vec::new()
     };
-    Ok(NativeSubmission {
-        route: issued.take(),
-        gates,
-        barriers,
-        _retained: retained,
-    })
+    let route = issued.take();
+    let fence = signal.then(|| {
+        transfer::TransferSync::from_compute_submission(
+            &first.public_device,
+            &route,
+            transfer::next_queue_id(),
+            1,
+            #[cfg(target_os = "macos")]
+            metal_signal_event,
+        )
+    });
+    Ok((
+        NativeSubmission {
+            route,
+            gates,
+            barriers,
+            _read_only_held: read_only_held,
+            _retained: retained,
+        },
+        fence,
+    ))
 }
 
 /// One byte-identical copy in [`submit_fill_copies`].
@@ -3942,6 +4017,7 @@ pub fn submit_fill_copies(
         route: issued.take(),
         gates: Vec::new(),
         barriers: Vec::new(),
+        _read_only_held: Vec::new(),
         _retained: Arc::new(retained),
     }))
 }
@@ -4074,10 +4150,15 @@ struct Encoding<'a, L> {
     queue: NativeQueue,
     after: &'a [Arc<dyn DeviceCompletion>],
     after_transfers: &'a [transfer::TransferSync],
+    #[cfg(target_os = "macos")]
+    signal_metal: Option<(&'a seismic_metal::SharedEvent, u64)>,
 }
 
 /// Encode and commit `work`.
 fn encode(first: &NativePrepared, work: &Encoding<'_, impl DispatchList>) -> Result<Committed, EncodeFailure> {
+    #[cfg(target_os = "macos")]
+    let Encoding { device_id: _, list, repetitions, timed, observed, retained: _, queue, after: _, after_transfers, signal_metal } = *work;
+    #[cfg(not(target_os = "macos"))]
     let Encoding { device_id: _, list, repetitions, timed, observed, retained: _, queue, after: _, after_transfers: _ } = *work;
     #[cfg(target_os = "macos")]
     let mut buffers = Vec::new();
@@ -4103,6 +4184,14 @@ fn encode(first: &NativePrepared, work: &Encoding<'_, impl DispatchList>) -> Res
             }
             .map_err(CallError::Execution)
             .map_err(EncodeFailure::uncommitted)?;
+            for sync in after_transfers {
+                if let Some((event, value)) = sync.metal_wait() {
+                    batch
+                        .wait_event(event, value)
+                        .map_err(CallError::Execution)
+                        .map_err(EncodeFailure::uncommitted)?;
+                }
+            }
             let mut typed = Vec::new();
             let timelines = |batch: &mut seismic_metal::DirectBatch, boundary: usize| {
                 for operation in list.timelines(boundary) {
@@ -4225,7 +4314,12 @@ fn encode(first: &NativePrepared, work: &Encoding<'_, impl DispatchList>) -> Res
                 Ok::<(), CallError>(())
             };
             match encode_all(&mut batch) {
-                Ok(()) => Ok(Committed::Metal(batch.commit())),
+                Ok(()) => {
+                    if let Some((event, value)) = signal_metal {
+                        batch.signal_event(event, value);
+                    }
+                    Ok(Committed::Metal(batch.commit()))
+                }
                 Err(error) => Err(EncodeFailure {
                     error,
                     committed: batch.abandon().map(Committed::Metal),
@@ -4694,9 +4788,20 @@ pub(super) struct ReplayKeys<'a> {
 
 impl ReplayKeys<'_> {
     /// The graph of the segment of `calls`, which lies in one run, with the
-    /// backend's words `form` and the storage it binds, `bound`.
-    pub(super) fn shaped(&self, calls: &Range<usize>, form: impl IntoIterator<Item = u64>, bound: Vec<u64>) -> graph_replays::Shaped {
-        graph_replays::Shaped { key: self.key(calls, form), bound }
+    /// backend's words `form`, the launch parameters `launch_bound`, and any
+    /// timeline-word parameters `word_bound`.
+    pub(super) fn shaped(
+        &self,
+        calls: &Range<usize>,
+        form: impl IntoIterator<Item = u64>,
+        launch_bound: Vec<u64>,
+        word_bound: Vec<u64>,
+    ) -> graph_replays::Shaped {
+        graph_replays::Shaped {
+            key: self.key(calls, form),
+            launch_bound,
+            word_bound,
+        }
     }
 
     /// The plan of the run `calls` lie in.

@@ -4617,7 +4617,9 @@ struct SealedTopology {
     exports: Box<[(u32, u32)]>,
     port_placements: Box<[Option<Placement>]>,
     placements: Box<[Placement]>,
+    has_exports: bool,
     external_writes: Box<[bool]>,
+    written_external_ports: Box<[usize]>,
     upload_written: bool,
     exclusive: Option<u32>,
     timelines: Box<[(usize, TimelineNode)]>,
@@ -4749,6 +4751,20 @@ impl SealedTopology {
         }
         debug_assert_eq!(flat_placements.len(), result_entries.len());
 
+        let has_exports = port_placements
+            .iter()
+            .any(|placement| matches!(placement, Some(Placement::Export(_))))
+            || flat_placements
+                .iter()
+                .zip(&result_entries)
+                .any(|(placement, entry)| entry.is_some() && matches!(placement, Placement::Export(_)));
+        let written_external_ports: Box<[usize]> = executable
+            .external_writes
+            .iter()
+            .enumerate()
+            .filter_map(|(port, &writes)| writes.then_some(port))
+            .collect();
+
         let topology = Self {
             ports: port_meta.into_boxed_slice(),
             nodes: static_nodes.into_boxed_slice(),
@@ -4763,7 +4779,9 @@ impl SealedTopology {
                 .into_boxed_slice(),
             port_placements: port_placements.into_boxed_slice(),
             placements: flat_placements.into_boxed_slice(),
+            has_exports,
             external_writes: executable.external_writes.into_boxed_slice(),
+            written_external_ports,
             upload_written: executable.upload_written,
             exclusive: executable.exclusive,
             timelines: executable.timelines.into_boxed_slice(),
@@ -5098,11 +5116,17 @@ impl NativeGraphPlan {
         let extents = self.extents(&meta.extents);
         let strides = self.strides(&meta.extents);
         let byte_len = self.port_byte_lens[port];
+        let uses = self.port_uses[port];
+        let len_ok = if tensor.record_stride().is_some() {
+            uses.records && !uses.direct && tensor.byte_len() >= byte_len
+        } else {
+            tensor.byte_len() == byte_len
+        };
         let matches = Arc::ptr_eq(tensor.device(), &self.device)
             && tensor.representation() == meta.representation
             && tensor.extents() == extents
             && tensor.strides() == strides
-            && tensor.byte_len() == byte_len;
+            && len_ok;
         if !matches || (self.topology.external_writes[port] && tensor.allocation().storage().read_only()) {
             return Err(WorkflowError::NativePortBinding {
                 port,
@@ -5217,10 +5241,7 @@ impl NativeGraphPlan {
     /// because the recorded layout DAG assumes distinct external ports do not
     /// alias).
     fn has_cross_port_alias(&self, bindings: &NativeGraphBindings) -> bool {
-        for (written_port, &writes) in self.topology.external_writes.iter().enumerate() {
-            if !writes {
-                continue;
-            }
+        for &written_port in &self.topology.written_external_ports {
             let Some(written_bound) = bindings.inputs[written_port].as_ref() else {
                 continue;
             };
@@ -5371,18 +5392,7 @@ impl NativeGraphPlan {
         arena: Option<Arc<Allocation>>,
         family: Option<Arc<NativeGraphFamily>>,
     ) -> NativeGraphOutputs {
-        let has_exports = self
-            .topology
-            .port_placements
-            .iter()
-            .any(|placement| matches!(placement, Some(Placement::Export(_))))
-            || self
-                .topology
-                .placements
-                .iter()
-                .zip(&self.topology.results.entries)
-                .any(|(placement, entry)| entry.is_some() && matches!(placement, Placement::Export(_)));
-        let (locals, outputs) = if has_exports {
+        let (locals, outputs) = if self.topology.has_exports {
             let export_arena = arena.as_ref().expect("planned output arena absent");
             let locals = (0..self.topology.ports.len())
                 .map(|ordinal| {
@@ -5421,15 +5431,7 @@ impl NativeGraphPlan {
                 .collect();
             (locals, outputs)
         } else {
-            let locals = vec![None; self.topology.ports.len()];
-            let outputs = self
-                .topology
-                .results
-                .nodes
-                .iter()
-                .map(|row_range| vec![None; row_range.len()])
-                .collect();
-            (locals, outputs)
+            (Vec::new(), Vec::new())
         };
         NativeGraphOutputs {
             plan: self.clone(),
@@ -6035,10 +6037,13 @@ impl NativeGraphFamily {
         let scratch = zeroed_region(charges, self.workspace_bytes)?;
         Ok(NativeGraphFamilySlot {
             family: self.clone(),
-            workspace_records: self.workspace_record_tables(charges, scratch.as_ref())?,
+            workspace_records: self.workspace_record_tables(charges, scratch.as_ref(), self.workspace_bytes)?,
             scratch,
+            scratch_bytes: self.workspace_bytes,
             sync: zeroed_region(charges, self.sync_bytes)?,
             uploads: self.upload_regions(charges, regions)?,
+            preferred_upload: vec![None; self.plans.len()],
+            preferred_shared_upload: None,
             lent_locals: Vec::new(),
             hold: self.slot_hold()?,
         })
@@ -6060,13 +6065,27 @@ impl NativeGraphFamily {
         arena: &NativeExecutionArena,
         regions: &[u64],
     ) -> Result<NativeGraphFamilySlot, WorkflowError> {
+        self.new_slot_in_bounded(charges, arena, regions, self.workspace_bytes)
+    }
+
+    /// Like [`Self::new_slot_in`], but requires `arena` to cover only plans up
+    /// to `workspace_limit` bytes; larger plans in the family must be activated
+    /// against an elastic [`NativeGraphArena`] via
+    /// [`NativeGraphFamilySlot::activate_in`].
+    pub fn new_slot_in_bounded(
+        self: &Arc<Self>,
+        charges: &Charges,
+        arena: &NativeExecutionArena,
+        regions: &[u64],
+        workspace_limit: u64,
+    ) -> Result<NativeGraphFamilySlot, WorkflowError> {
         charges.of_device(&self.device);
         if !Arc::ptr_eq(&arena.device, &self.device) {
             return Err(WorkflowError::NativeGraphSlotMismatch);
         }
-        if self.workspace_bytes > arena.bytes {
+        if workspace_limit > arena.bytes {
             return Err(WorkflowError::NativeArenaTooSmall {
-                required: self.workspace_bytes,
+                required: workspace_limit,
                 capacity: arena.bytes,
             });
         }
@@ -6077,33 +6096,70 @@ impl NativeGraphFamily {
         {
             return Err(WorkflowError::NativeArenaPrewrittenPort);
         }
-        let scratch = (self.workspace_bytes != 0)
+        let scratch = (workspace_limit != 0)
             .then(|| arena.allocation.clone())
             .flatten();
+        let scratch_bytes = if scratch.is_some() { arena.bytes } else { 0 };
         Ok(NativeGraphFamilySlot {
             family: self.clone(),
             workspace_records: self
-                .workspace_record_tables(charges, scratch.as_ref())
+                .workspace_record_tables(charges, scratch.as_ref(), scratch_bytes)
                 .map_err(WorkflowError::TensorView)?,
             scratch,
+            scratch_bytes,
             sync: zeroed_region(charges, self.sync_bytes).map_err(WorkflowError::TensorView)?,
             uploads: self
                 .upload_regions(charges, regions)
                 .map_err(WorkflowError::TensorView)?,
+            preferred_upload: vec![None; self.plans.len()],
+            preferred_shared_upload: None,
             lent_locals: Vec::new(),
             hold: self.slot_hold().map_err(WorkflowError::TensorView)?,
         })
     }
 
-    /// Each plan's workspace record table over `scratch`, in plan order.
+    /// Allocate a standalone workspace arena of `bytes` bound to this family
+    /// (with workspace record tables prebuilt for every plan fitting in
+    /// `bytes`), for elastic activation via
+    /// [`NativeGraphFamilySlot::activate_in`].
+    pub fn new_arena(
+        self: &Arc<Self>,
+        charges: &Charges,
+        bytes: u64,
+    ) -> Result<NativeGraphArena, WorkflowError> {
+        charges.of_device(&self.device);
+        if self
+            .plans
+            .iter()
+            .any(|plan| plan.topology.ports.iter().any(|port| port.prewritten))
+        {
+            return Err(WorkflowError::NativeArenaPrewrittenPort);
+        }
+        let arena = NativeExecutionArena::new(charges, bytes).map_err(WorkflowError::TensorView)?;
+        let workspace_records = self
+            .workspace_record_tables(charges, arena.allocation.as_ref(), bytes)
+            .map_err(WorkflowError::TensorView)?;
+        Ok(NativeGraphArena {
+            family: self.clone(),
+            workspace_records,
+            arena,
+        })
+    }
+
+    /// Each family plan's workspace record table over `scratch`, in plan order,
+    /// skipping plans whose workspace exceeds `limit`.
     fn workspace_record_tables(
         &self,
         charges: &Charges,
         scratch: Option<&Arc<Allocation>>,
+        limit: u64,
     ) -> Result<Vec<Option<Arc<Allocation>>>, TensorError> {
         self.plans
             .iter()
             .map(|plan| {
+                if plan.workspace_bytes() > limit {
+                    return Ok(None);
+                }
                 scratch
                     .map(|scratch| plan.workspace_record_table(charges, scratch))
                     .transpose()
@@ -6204,9 +6260,30 @@ impl NativeGraphFamilyOutputSlot {
     }
 }
 
+/// A standalone workspace arena bound to one [`NativeGraphFamily`], holding
+/// prebuilt workspace record tables for every plan that fits in `arena.bytes()`.
+/// Used by elastic callers (such as multi-launch prefill passes) that allocate
+/// a larger workspace on demand and release it when idle.
+pub struct NativeGraphArena {
+    family: Arc<NativeGraphFamily>,
+    workspace_records: Vec<Option<Arc<Allocation>>>,
+    arena: NativeExecutionArena,
+}
+
+impl NativeGraphArena {
+    pub fn bytes(&self) -> u64 {
+        self.arena.bytes()
+    }
+
+    pub fn charged_bytes(&self) -> u64 {
+        self.arena.charged_bytes()
+    }
+}
+
 pub struct NativeGraphFamilySlot {
     family: Arc<NativeGraphFamily>,
     scratch: Option<Arc<Allocation>>,
+    scratch_bytes: u64,
     /// Its own sync region ([`NativeGraphFamily::sync_bytes`]).
     sync: Option<Arc<Allocation>>,
     /// Each family plan's workspace record table over `scratch`, in plan
@@ -6216,6 +6293,14 @@ pub struct NativeGraphFamilySlot {
     /// launch writes input for. Activation takes one no run or view of the
     /// launch holds, idle by construction ([`idle_upload`]).
     uploads: Vec<Arc<Allocation>>,
+    /// Last upload region index taken by each family plan (indexed by member
+    /// ordinal in `family.plans`), kept as a tie-breaker among equal-sized
+    /// smallest free regions so optional runs (e.g. `Host` vs `Selected` entry)
+    /// do not shift upload pointers across subsequent blocks.
+    preferred_upload: Vec<Option<usize>>,
+    /// Last upload region index taken by [`Self::upload`] (shared launch
+    /// control uploads).
+    preferred_shared_upload: Option<usize>,
     lent_locals: Vec<Weak<TensorInner>>,
     /// A launch's graphs in the device's graph budget, held by every run
     /// queued from the slot while it lives.
@@ -6229,7 +6314,16 @@ impl NativeGraphFamilySlot {
     /// ([`released`]) and what its family's graph hold shrank by
     /// ([`super::SlotGraphs::release`]).
     pub fn release(self) -> u64 {
-        let Self { scratch, sync, workspace_records, uploads, hold, .. } = self;
+        let Self {
+            scratch,
+            sync,
+            workspace_records,
+            uploads,
+            preferred_upload: _,
+            preferred_shared_upload: _,
+            hold,
+            ..
+        } = self;
         let charged: u64 =
             workspace_records.into_iter().flatten().chain(uploads).chain(scratch).chain(sync).map(released).sum();
         charged + super::SlotGraphs::release(hold)
@@ -6238,6 +6332,42 @@ impl NativeGraphFamilySlot {
     pub fn activate(
         &mut self,
         plan: &Arc<NativeGraphPlan>,
+    ) -> Result<NativeGraphFamilyActive<'_>, WorkflowError> {
+        if plan.workspace_bytes() > self.scratch_bytes {
+            return Err(WorkflowError::NativeArenaTooSmall {
+                required: plan.workspace_bytes(),
+                capacity: self.scratch_bytes,
+            });
+        }
+        let workspace = self.scratch.clone();
+        self.activate_with_workspace(plan, workspace, |slot, member| slot.workspace_records[member].clone())
+    }
+
+    /// Activate `plan` using an elastic [`NativeGraphArena`] bound to this
+    /// slot's family instead of the slot's default scratch arena.
+    pub fn activate_in(
+        &mut self,
+        plan: &Arc<NativeGraphPlan>,
+        arena: &NativeGraphArena,
+    ) -> Result<NativeGraphFamilyActive<'_>, WorkflowError> {
+        if !Arc::ptr_eq(&arena.family, &self.family) {
+            return Err(WorkflowError::NativeGraphSlotMismatch);
+        }
+        if plan.workspace_bytes() > arena.arena.bytes {
+            return Err(WorkflowError::NativeArenaTooSmall {
+                required: plan.workspace_bytes(),
+                capacity: arena.arena.bytes,
+            });
+        }
+        let workspace = arena.arena.allocation.clone();
+        self.activate_with_workspace(plan, workspace, |_, member| arena.workspace_records[member].clone())
+    }
+
+    fn activate_with_workspace(
+        &mut self,
+        plan: &Arc<NativeGraphPlan>,
+        workspace: Option<Arc<Allocation>>,
+        records: impl FnOnce(&Self, usize) -> Option<Arc<Allocation>>,
     ) -> Result<NativeGraphFamilyActive<'_>, WorkflowError> {
         if self
             .lent_locals
@@ -6258,12 +6388,16 @@ impl NativeGraphFamilySlot {
         // A run whose plan writes no input takes no region.
         let upload = match plan.upload_bytes {
             0 => None,
-            bytes => Some(idle_upload(&self.uploads, bytes)?),
+            bytes => {
+                let (index, region) = idle_upload(&self.uploads, bytes, self.preferred_upload[member])?;
+                self.preferred_upload[member] = Some(index);
+                Some(region)
+            }
         };
         let slot = NativeGraphSlot {
             plan: plan.clone(),
-            workspace: self.scratch.clone(),
-            workspace_records: self.workspace_records[member].clone(),
+            workspace,
+            workspace_records: records(self, member),
             sync: self.sync.clone(),
             upload,
             hold: self.hold.clone(),
@@ -6286,7 +6420,8 @@ impl NativeGraphFamilySlot {
             .map(|&(representation, extents, _)| (representation, extents))
             .collect::<Vec<_>>();
         let (placed, bytes) = upload_placement(&layouts)?;
-        let region = idle_upload(&self.uploads, bytes)?;
+        let (index, region) = idle_upload(&self.uploads, bytes, self.preferred_shared_upload)?;
+        self.preferred_shared_upload = Some(index);
         tensors
             .iter()
             .zip(placed)
@@ -6308,7 +6443,8 @@ impl NativeGraphFamilySlot {
 }
 
 /// The smallest region of `uploads` (a slot's) that holds `bytes` and that
-/// no run or view of the slot's launch has taken, the first such in slot
+/// no run or view of the slot's launch has taken, preferring `preferred` when
+/// it is free and tied for that smallest size, else the first such in slot
 /// order. The slot is one launch in flight (its family's activations are
 /// `FlightDepth::launches`): its lease returns only once its launch's
 /// completion was observed, and every submitted run holds its region until
@@ -6319,22 +6455,33 @@ impl NativeGraphFamilySlot {
 /// assignment gives each a region of its own holding its input, every run
 /// gets one: were the smallest region holding a run's input another run's in
 /// that assignment, the two can swap, as that other run's input fits the
-/// first run's assigned region, no smaller. The same sequence binds the same
-/// regions every time, and replays its graphs.
-fn idle_upload(uploads: &[Arc<Allocation>], bytes: u64) -> Result<Arc<Allocation>, WorkflowError> {
-    let holding = || uploads.iter().filter(|upload| upload.bytes() >= bytes);
+/// first run's assigned region, no smaller. Preferring a prior index only
+/// among equal-sized smallest free regions preserves that swap proof while
+/// keeping upload pointers stable across optional runs (such as `Host` vs
+/// `Selected` entry).
+fn idle_upload(
+    uploads: &[Arc<Allocation>],
+    bytes: u64,
+    preferred: Option<usize>,
+) -> Result<(usize, Arc<Allocation>), WorkflowError> {
+    let holding = || uploads.iter().enumerate().filter(|(_, upload)| upload.bytes() >= bytes);
     if holding().next().is_none() {
         return Err(WorkflowError::UploadRegionTooSmall {
             bytes,
             largest: uploads.iter().map(|upload| upload.bytes()).max().unwrap_or(0),
         });
     }
-    let region = holding()
-        .filter(|upload| Arc::strong_count(upload) == 1)
-        .min_by_key(|upload| upload.bytes())
+    let (first_index, first_region) = holding()
+        .filter(|(_, upload)| Arc::strong_count(upload) == 1)
+        .min_by_key(|(_, upload)| upload.bytes())
         .expect("a launch's runs take no more upload regions than its slot holds");
+    let min_bytes = first_region.bytes();
+    let (index, region) = preferred
+        .and_then(|idx| uploads.get(idx).map(|upload| (idx, upload)))
+        .filter(|(_, upload)| Arc::strong_count(upload) == 1 && upload.bytes() == min_bytes)
+        .unwrap_or((first_index, first_region));
     assert!(region.device_idle(), "an upload region no run holds was released by its last run's completion");
-    Ok(region.clone())
+    Ok((index, region.clone()))
 }
 
 pub struct NativeGraphFamilyActive<'a> {
@@ -6449,11 +6596,12 @@ impl NativeGraphSlot {
                 WorkflowError::NativeOutputLeaseConsumed,
             ));
         }
-        let owned = [&self.workspace, &self.sync, &self.upload, &exports.arena]
-            .into_iter()
-            .flatten()
-            .map(|allocation| allocation.identity())
-            .collect::<Vec<_>>();
+        let owned = [
+            self.workspace.as_ref().map(|allocation| allocation.identity()),
+            self.sync.as_ref().map(|allocation| allocation.identity()),
+            self.upload.as_ref().map(|allocation| allocation.identity()),
+            exports.arena.as_ref().map(|allocation| allocation.identity()),
+        ];
         for (port, spec) in self.plan.topology.ports.iter().enumerate() {
             if spec.local {
                 continue;
@@ -6463,7 +6611,7 @@ impl NativeGraphSlot {
             ))?.tensor;
             // An external binding never names this run's own storage: the
             // plan placed every graph buffer apart from external tensors.
-            if owned.contains(&tensor.allocation().identity()) {
+            if owned.contains(&Some(tensor.allocation().identity())) {
                 return Err(CallError::Workflow(WorkflowError::NativePortMismatch {
                     port,
                 }));
@@ -7076,6 +7224,11 @@ pub struct NativeGraphSequence {
     /// Device-side transfer completion events this sequence waits on via
     /// cross-stream `cuStreamWaitEvent` before running any graph.
     after_transfers: Vec<super::transfer::TransferSync>,
+    /// Host/copy-stream `TimelineHost<Gate>` waits inserted before the run at
+    /// `run_index` (`cuStreamWaitValue32` on CUDA, timeline semaphore on Vulkan,
+    /// `MTLSharedEvent` on Metal), enabling non-blocking submission ahead of
+    /// asynchronous host/DMA completion.
+    gate_waits: Vec<(usize, TimelineOperation)>,
 }
 
 impl NativeGraphSequence {
@@ -7088,17 +7241,53 @@ impl NativeGraphSequence {
             access: Vec::new(),
             binding_leases: Vec::new(),
             after_transfers: Vec::new(),
+            gate_waits: Vec::new(),
         }
     }
 
-    /// Wait on a transfer batch's completion event (`cuStreamWaitEvent` on
-    /// CUDA, timeline semaphore wait on Vulkan) before running any work queued
-    /// in this sequence. Rejects foreign-device or unsupported handles loudly.
-    pub fn follow_transfer(&mut self, sync: super::transfer::TransferSync) -> Result<(), CallError> {
-        sync.validate_for_device(&self.device)
-            .map_err(CallError::Execution)?;
-        self.after_transfers.push(sync);
+    /// Insert a `TimelineHost<Gate>` wait at the current point in the sequence
+    /// (before the next run queued into `self`), allowing the GPU compute queue
+    /// to pause on `gate >= value` while an async host/DMA reactor populates
+    /// buffers and signals `gate` without blocking the host submitter.
+    pub fn wait_gate(
+        &mut self,
+        gate: &TimelineHost<super::timeline::Gate>,
+        value: u64,
+    ) -> Result<(), CallError> {
+        if gate.inner().device().device_id() != self.device.device_id() {
+            return Err(CallError::Execution(ExecutionError::SubmissionFailed(format!(
+                "timeline gate belongs to device {}, not sequence device {}",
+                gate.inner().device().device_id(),
+                self.device.device_id(),
+            ))));
+        }
+        self.gate_waits.push((
+            self.runs.len(),
+            TimelineOperation {
+                action: TimelineAction::Wait,
+                timeline: gate.inner().clone(),
+                value,
+            },
+        ));
         Ok(())
+    }
+
+    /// Wait on a transfer or compute fence (`cuStreamWaitEvent` on CUDA,
+    /// `MTLSharedEvent` wait on Metal, timeline semaphore wait on Vulkan)
+    /// before running any work queued in this sequence. Rejects foreign-device,
+    /// `HostOnly`-on-GPU, or unsupported handles loudly.
+    pub fn wait_fence(&mut self, fence: super::transfer::TransferSync) -> Result<(), CallError> {
+        fence
+            .validate_for_device(&self.device)
+            .map_err(CallError::Execution)?;
+        self.after_transfers.push(fence);
+        Ok(())
+    }
+
+    /// Wait on a transfer batch's completion event before running any work
+    /// queued in this sequence (delegates to [`Self::wait_fence`]).
+    pub fn follow_transfer(&mut self, sync: super::transfer::TransferSync) -> Result<(), CallError> {
+        self.wait_fence(sync)
     }
 
     pub fn is_empty(&self) -> bool {
@@ -7111,10 +7300,33 @@ impl NativeGraphSequence {
         self.submit_observed(false)
     }
 
+    /// Submit every queued run and return both its [`NativeGraphCompletion`]
+    /// and a [`super::transfer::TransferSync`] signal fence (`DeviceAndHost` on
+    /// CUDA/Metal/Vulkan, `HostOnly` on CPU) usable by downstream
+    /// `Transfer::copy_after`, `NativeGraphSequence::wait_fence`, or
+    /// `seismic_io::IoPlane::reserve_bus_until_fence`.
+    pub fn submit_signaled(
+        self,
+    ) -> Result<(NativeGraphCompletion, super::transfer::TransferSync), CallError> {
+        self.submit_inner(false, true)
+            .map(|(completion, fence)| (completion, fence.expect("signal=true yields a fence")))
+    }
+
     /// [`Self::submit`], observing the work's device interval where
     /// `observed` (a measurement's).
     pub(super) fn submit_observed(self, observed: bool) -> Result<NativeGraphCompletion, CallError> {
-        let access = merge_access(self.access.iter().cloned());
+        self.submit_inner(observed, false).map(|(completion, _)| completion)
+    }
+
+    fn submit_inner(
+        self,
+        observed: bool,
+        signal: bool,
+    ) -> Result<(NativeGraphCompletion, Option<super::transfer::TransferSync>), CallError> {
+        let access = merge_access(self.access);
+        for (_, operation) in &self.gate_waits {
+            operation.timeline.await_at(operation.value);
+        }
         // The work keeps its plans and the timelines it waits on or signals.
         let retained: Arc<dyn std::any::Any + Send + Sync> = Arc::new((
             self.runs
@@ -7125,6 +7337,7 @@ impl NativeGraphSequence {
                 .iter()
                 .flat_map(|run| run.timelines.iter())
                 .map(|(_, operation)| operation.timeline.clone())
+                .chain(self.gate_waits.iter().map(|(_, op)| op.timeline.clone()))
                 .collect::<Vec<_>>(),
         ));
         let nodes = self
@@ -7139,8 +7352,10 @@ impl NativeGraphSequence {
         // that node's dispatch; the runs' dispatches follow one another.
         let mut boundaries = vec![Vec::new(); nodes.len() + 1];
         let mut stamps = vec![Vec::new(); nodes.len() + 1];
+        let mut run_starts = Vec::with_capacity(self.runs.len() + 1);
         let mut first = 0;
         for run in &self.runs {
+            run_starts.push(first);
             for (position, operation) in &run.timelines {
                 boundaries[first + position].push(operation.clone());
             }
@@ -7149,6 +7364,11 @@ impl NativeGraphSequence {
             }
             first += run.plan.topology.nodes.len();
         }
+        run_starts.push(first);
+        for (run_idx, operation) in &self.gate_waits {
+            let boundary = run_starts[(*run_idx).min(self.runs.len())];
+            boundaries[boundary].push(operation.clone());
+        }
         let list = SequenceList {
             runs: &self.runs,
             nodes,
@@ -7156,7 +7376,29 @@ impl NativeGraphSequence {
             stamps,
             access_summary: std::sync::OnceLock::new(),
         };
-        let mut submission = super::submit_after_transfers(&list, &access, retained, 1, observed, self.queue, &self.after_transfers)?;
+        let (mut submission, fence) = if signal {
+            let (sub, fence) = super::submit_signaled_after_transfers(
+                &list,
+                &access,
+                retained,
+                1,
+                observed,
+                self.queue,
+                &self.after_transfers,
+            )?;
+            (sub, Some(fence))
+        } else {
+            let sub = super::submit_after_transfers(
+                &list,
+                &access,
+                retained,
+                1,
+                observed,
+                self.queue,
+                &self.after_transfers,
+            )?;
+            (sub, None)
+        };
         // The runs own the storage their work reaches; it retires with this
         // completion, never with the replay caches the plans' retention
         // reaches, GraphPoint conversion included. The binding leases only
@@ -7165,7 +7407,7 @@ impl NativeGraphSequence {
         // released physically once the work completes (allocation fences).
         submission._retained = Arc::new(GraphRetention { _runs: self.runs });
         drop(self.binding_leases);
-        Ok(NativeGraphCompletion { submission })
+        Ok((NativeGraphCompletion { submission }, fence))
     }
 }
 
@@ -9027,14 +9269,47 @@ mod upload_region_tests {
             .map(|bytes| crate::memory::Charges::tally(&device).allocate_mapped(seismic_topology::Contract::Upload, bytes, BUFFER_ALIGNMENT).unwrap())
             .to_vec();
         assert!(matches!(
-            idle_upload(&uploads, 512),
+            idle_upload(&uploads, 512, None),
             Err(WorkflowError::UploadRegionTooSmall { bytes: 512, largest: 256 })
         ));
         // The free region holding it, the smallest such; a taken one is
         // passed over.
-        let taken = idle_upload(&uploads, 100).unwrap();
+        let (idx_large, taken) = idle_upload(&uploads, 100, None).unwrap();
+        assert_eq!(idx_large, 1);
         assert_eq!(taken.bytes(), 256);
-        assert_eq!(idle_upload(&uploads, 10).unwrap().bytes(), 64);
+        let (idx_small, small) = idle_upload(&uploads, 10, None).unwrap();
+        assert_eq!(idx_small, 0);
+        assert_eq!(small.bytes(), 64);
+    }
+
+    /// Preferring a prior index among equal-sized smallest free regions keeps
+    /// block upload pointers stable when an optional earlier upload (such as
+    /// `Host` vs `Selected` entry) is skipped, while never picking a strictly
+    /// larger region than the smallest free fit.
+    #[test]
+    fn preferred_upload_keeps_block_pointers_stable_across_optional_entry() {
+        let device = crate::devices::Devices::discover(&[])
+            .unwrap()
+            .open_backend(seismic_lang::registry::BackendName::Cpu)
+            .unwrap();
+        let uploads = [64, 64, 64, 256]
+            .map(|bytes| crate::memory::Charges::tally(&device).allocate_mapped(seismic_topology::Contract::Upload, bytes, BUFFER_ALIGNMENT).unwrap())
+            .to_vec();
+        // Step 1 (`Host` entry): entry takes 0, block0 takes 1, block1 takes 2.
+        let (e_idx, e_reg) = idle_upload(&uploads, 32, None).unwrap();
+        let (b0_idx, b0_reg) = idle_upload(&uploads, 32, None).unwrap();
+        let (b1_idx, b1_reg) = idle_upload(&uploads, 32, None).unwrap();
+        assert_eq!((e_idx, b0_idx, b1_idx), (0, 1, 2));
+        drop((e_reg, b0_reg, b1_reg));
+        // Step 2 (`Selected` entry — entry takes no upload): block0 and block1
+        // still get their preferred regions 1 and 2 instead of shifting to 0, 1.
+        let (b0_next, _r0) = idle_upload(&uploads, 32, Some(b0_idx)).unwrap();
+        let (b1_next, _r1) = idle_upload(&uploads, 32, Some(b1_idx)).unwrap();
+        assert_eq!((b0_next, b1_next), (1, 2));
+        // A strictly larger preferred region (index 3, 256B) is NOT chosen when
+        // a smaller free region (index 0, 64B) fits 32B.
+        let (small_idx, _) = idle_upload(&uploads, 32, Some(3)).unwrap();
+        assert_eq!(small_idx, 0);
     }
 
     /// A launch whose runs take more regions than its slot holds breaks the
@@ -9047,8 +9322,8 @@ mod upload_region_tests {
             .open_backend(seismic_lang::registry::BackendName::Cpu)
             .unwrap();
         let uploads = vec![crate::memory::Charges::tally(&device).allocate_mapped(seismic_topology::Contract::Upload, 64, BUFFER_ALIGNMENT).unwrap()];
-        let _taken = idle_upload(&uploads, 10).unwrap();
-        let _ = idle_upload(&uploads, 10);
+        let _taken = idle_upload(&uploads, 10, None).unwrap();
+        let _ = idle_upload(&uploads, 10, None);
     }
 }
 

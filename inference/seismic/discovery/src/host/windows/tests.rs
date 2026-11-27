@@ -1,4 +1,4 @@
-use super::super::{beyond, ColdPages, Limit, ProcessLimitKind, Supply};
+use super::super::{beyond, ColdPages, Limit, PressureLevel, ProcessLimitKind, Supply};
 use super::limits::job_limits;
 use super::memory::{windows_floor, Counters};
 use super::*;

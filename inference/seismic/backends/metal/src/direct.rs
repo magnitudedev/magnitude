@@ -644,6 +644,8 @@ enum BatchMode {
 struct CommandRecord<S> {
     /// The host clock immediately before its commit.
     committed: f64,
+    /// The host clock immediately after its commit.
+    taken: f64,
     /// The values of the host gates it waited on before its first launch.
     gates: Vec<u64>,
     samples: Option<S>,
@@ -686,9 +688,10 @@ impl<S> Recording<S> {
         Self { calibration: sample_timestamps(device), committed: Vec::new(), gates: Vec::new() }
     }
 
-    fn record(&mut self, samples: Option<S>) {
+    fn record(&mut self, committed: f64, taken: f64, samples: Option<S>) {
         self.committed.push(CommandRecord {
-            committed: host_seconds(),
+            committed,
+            taken,
             gates: std::mem::take(&mut self.gates),
             samples,
         });
@@ -710,23 +713,30 @@ impl BatchMode {
         command: Retained<ProtocolObject<dyn MTLCommandBuffer>>,
     ) -> Retained<ProtocolObject<dyn MTLCommandBuffer>> {
         match self {
-            Self::Grouped(_) => {}
+            Self::Grouped(_) => {
+                crate::pooled(|| command.commit());
+            }
             Self::Observed { span, recording, .. } => {
                 let samples = span.take().map(|pair| {
                     pair.hold_until_completed(&command);
                     pair
                 });
-                recording.record(samples);
+                let committed = host_seconds();
+                crate::pooled(|| command.commit());
+                let taken = host_seconds();
+                recording.record(committed, taken, samples);
             }
             Self::Timed { timing, lease, recording, .. } => {
                 let samples = lease.take().map(|lease| {
                     timing.parts.push(timing.timestamps.commit(lease, &command));
                     timing.parts.len() - 1
                 });
-                recording.record(samples);
+                let committed = host_seconds();
+                crate::pooled(|| command.commit());
+                let taken = host_seconds();
+                recording.record(committed, taken, samples);
             }
         }
-        crate::pooled(|| command.commit());
         command
     }
 
@@ -1390,6 +1400,25 @@ fn resolve_interval<S>(
     })
 }
 
+fn resolve_queue_submissions<S>(
+    commands: &[CommandRecord<S>],
+    host: &HostClock,
+    mut resolve: impl FnMut(&S) -> Result<(u64, u64), ExecutionError>,
+) -> Result<Vec<(f64, f64, (f64, f64))>, ExecutionError> {
+    if commands.len() <= 1 {
+        return Ok(Vec::new());
+    }
+    let mut out = Vec::with_capacity(commands.len());
+    for command in commands {
+        let Some(samples) = &command.samples else {
+            continue;
+        };
+        let (start, end) = resolve(samples)?;
+        out.push((command.committed, command.taken, (host.seconds(start), host.seconds(end))));
+    }
+    Ok(out)
+}
+
 // Waiting on and querying a committed command buffer is thread-safe.
 unsafe impl Send for DirectSubmission {}
 unsafe impl Sync for DirectSubmission {}
@@ -1475,6 +1504,41 @@ impl DirectSubmission {
             Observed::Timed { calibration, commands, timing } => {
                 let host = host_clock(&self.device, *calibration)?;
                 resolve_interval(commands, &host, |&part| {
+                    let ticks = timing
+                        .timestamps
+                        .resolved(&timing.parts[part])
+                        .ok_or_else(|| {
+                            failed("Metal did not resolve the timed batch's samples".into())
+                        })?;
+                    match (ticks.first(), ticks.last()) {
+                        (Some(&start), Some(&end)) if start != u64::MAX && end != u64::MAX => {
+                            Ok((start, end))
+                        }
+                        _ => Err(failed("Metal dropped a timed launch's timestamp".into())),
+                    }
+                })
+            }
+        }
+    }
+
+    /// Each sampled command buffer's `(handed, taken, (start, end))` on the
+    /// [`host_seconds`] clock, in commit order, when the batch was split across
+    /// multiple command buffers (e.g. at `wait_event` or timed-page boundaries).
+    /// Empty for single-command-buffer batches.
+    pub fn queue_submissions(&self) -> Result<Vec<(f64, f64, (f64, f64))>, ExecutionError> {
+        self.finish()?;
+        let failed = |detail: String| ExecutionError::SubmissionFailed(detail);
+        let Some(observed) = &self.observed else {
+            return Ok(Vec::new());
+        };
+        match observed {
+            Observed::Span { calibration, commands } => {
+                let host = host_clock(&self.device, *calibration)?;
+                resolve_queue_submissions(commands, &host, |pair| pair.resolve())
+            }
+            Observed::Timed { calibration, commands, timing } => {
+                let host = host_clock(&self.device, *calibration)?;
+                resolve_queue_submissions(commands, &host, |&part| {
                     let ticks = timing
                         .timestamps
                         .resolved(&timing.parts[part])

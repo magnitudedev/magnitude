@@ -526,6 +526,22 @@ impl DevicePrograms {
         }
     }
 
+    /// Release cached program-store lookup entries held by this device's
+    /// program formers once load-time formation has finished.
+    pub(crate) fn release_formation_cache(&self) {
+        match self {
+            Self::Cpu { cpu } => cpu.clear_stored(),
+            #[cfg(target_os = "macos")]
+            Self::Metal { metal } => metal.clear_stored(),
+            Self::Cuda { cuda, cuda_ptx } => {
+                cuda.clear_stored();
+                cuda_ptx.clear_stored();
+            }
+            #[cfg(not(target_os = "macos"))]
+            Self::Vulkan { vulkan } => vulkan.clear_stored(),
+        }
+    }
+
     /// `sources` as the former of this device's native entries reads them
     /// ([`ProgramFormer::keyed`]). The CPU backend forms no native entries.
     pub(crate) fn keyed(
