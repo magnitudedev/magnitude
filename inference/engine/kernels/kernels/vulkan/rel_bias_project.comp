@@ -1,0 +1,96 @@
+// rel_bias_project: `[M, H, D] A @ [E, D]^T W -> [M, H, E] f32`, with optional
+// fused `head_l2_clip` when `threshold > 0.0` (rounding clipped R to `A` before
+// the projection to preserve the exact intermediate dtype boundary).
+// One 64-thread workgroup per (head, row, 64-extent tile).
+// Shared: floats [0..32) for reduce_group_sum, floats [32..96) for r_sh[64].
+#include <seismic/element.glsl>
+#include "lib/core/reduce.glsl"
+
+#define REL_BIAS_A ELEMENT_OF(SEISMIC_ELEMENT_A)
+#define REL_BIAS_W ELEMENT_OF(SEISMIC_ELEMENT_W)
+
+void rel_bias_project() {
+    const uint64_t head = uint64_t(gl_WorkGroupID.x);
+    const uint thread = SEISMIC_THREAD;
+    const uint64_t ext = uint64_t(gl_WorkGroupID.z) * 64ul + uint64_t(thread);
+    const uint64_t D = SEISMIC_DIM_D;
+    const uint64_t E = SEISMIC_DIM_E;
+    const bool has_scale = SEISMIC_DIM_SC > 0ul;
+    const uint64_t scale_base = (SEISMIC_DIM_SC > 1ul ? head : 0ul) * SEISMIC_SCALE_STRIDE_0;
+    const float threshold = element_word_f32(SEISMIC_PARAM_THRESHOLD);
+    const float eps = element_word_f32(SEISMIC_PARAM_EPSILON);
+    const float log_floor = element_word_f32(SEISMIC_PARAM_LOG_FLOOR);
+    const float log_alpha = element_word_f32(SEISMIC_PARAM_LOG_ALPHA);
+    const bool do_clip = threshold > 0.0;
+
+    const uint64_t r = SEISMIC_PTR(SEISMIC_BUFFER_R);
+    const uint64_t weight = SEISMIC_PTR(SEISMIC_BUFFER_WEIGHT);
+    const uint64_t scale = SEISMIC_PTR(SEISMIC_BUFFER_SCALE);
+    const uint64_t coordinates = SEISMIC_PTR(SEISMIC_BUFFER_COORDINATES);
+    const uint64_t w_base = ext * SEISMIC_WEIGHT_STRIDE_0;
+
+    for (uint64_t row = uint64_t(gl_WorkGroupID.y); row < SEISMIC_DIM_M; row += uint64_t(gl_NumWorkGroups.y)) {
+        const uint64_t r_base = row * SEISMIC_R_STRIDE_0 + head * SEISMIC_R_STRIDE_1;
+        float factor = 1.0;
+        if (do_clip) {
+            float tau = 1.0;
+            if (log_alpha != 0.0) {
+                const float pos = float(element_i32_index(coordinates, row * SEISMIC_COORDINATES_STRIDE_0));
+                const float ratio = seismic_div_rn(pos + 1.0, log_floor);
+                tau = 1.0 + log_alpha * log(max(1.0, ratio));
+            }
+            float sq = 0.0;
+            seismic_strided(uint64_t, d, thread, D, gl_WorkGroupSize.x) {
+                float v = element_at(REL_BIAS_A, r, r_base + d * SEISMIC_R_STRIDE_2);
+                if (has_scale)
+                    v *= element_f32_at(scale + (scale_base + d * SEISMIC_SCALE_STRIDE_1) * 4ul);
+                sq = seismic_fma_rn(v, v, sq);
+            }
+            const float total_sq = reduce_group_sum(sq, 0u);
+            const float clip = min(1.0, seismic_div_rn(threshold, sqrt(total_sq) + eps));
+            factor = clip * tau;
+        }
+
+        if (D <= 64ul) {
+            seismic_strided(uint64_t, d, thread, D, gl_WorkGroupSize.x) {
+                float v = element_at(REL_BIAS_A, r, r_base + d * SEISMIC_R_STRIDE_2);
+                if (do_clip) {
+                    if (has_scale)
+                        v *= element_f32_at(scale + (scale_base + d * SEISMIC_SCALE_STRIDE_1) * 4ul);
+                    v = element_round(REL_BIAS_A, v * factor);
+                }
+                seismic_shared_f32[32u + uint(d)] = v;
+            }
+            barrier();
+            if (ext < E) {
+                float acc = 0.0;
+                for (uint64_t d = 0ul; d < D; ++d) {
+                    const float wv = element_at(REL_BIAS_W, weight, w_base + d * SEISMIC_WEIGHT_STRIDE_1);
+                    acc = seismic_fma_rn(seismic_shared_f32[32u + uint(d)], wv, acc);
+                }
+                const Out result = out_offset(SEISMIC_RESULT_0_OUT,
+                    row * SEISMIC_RESULT_0_STRIDE_0 + head * SEISMIC_RESULT_0_STRIDE_1);
+                out_put(result, ext * SEISMIC_RESULT_0_STRIDE_2, acc);
+            }
+            barrier();
+        } else {
+            if (ext < E) {
+                float acc = 0.0;
+                for (uint64_t d = 0ul; d < D; ++d) {
+                    float rv = element_at(REL_BIAS_A, r, r_base + d * SEISMIC_R_STRIDE_2);
+                    if (do_clip) {
+                        if (has_scale)
+                            rv *= element_f32_at(scale + (scale_base + d * SEISMIC_SCALE_STRIDE_1) * 4ul);
+                        rv = element_round(REL_BIAS_A, rv * factor);
+                    }
+                    const float wv = element_at(REL_BIAS_W, weight, w_base + d * SEISMIC_WEIGHT_STRIDE_1);
+                    acc = seismic_fma_rn(rv, wv, acc);
+                }
+                const Out result = out_offset(SEISMIC_RESULT_0_OUT,
+                    row * SEISMIC_RESULT_0_STRIDE_0 + head * SEISMIC_RESULT_0_STRIDE_1);
+                out_put(result, ext * SEISMIC_RESULT_0_STRIDE_2, acc);
+            }
+            barrier();
+        }
+    }
+}

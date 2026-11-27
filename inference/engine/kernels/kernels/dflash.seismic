@@ -445,3 +445,51 @@ native draft_path_step for cpu from "cpu/draft_path_step.rs":
         threadgroups (S, 1, 1)
         threads_per_threadgroup (1, 1, 1)
         shared_bytes (R * 12)
+
+
+# One recurrent gate step of Inkling 2 DSpark's `MarkovHead::RnnHidden`:
+# combines the four pre-projected `[S, 3 * R]` gate contributions
+# (`base_frnn`, `base_x`, `he_h`, `he_e`), updates the F32 recurrent state
+# `h_next = sigmoid(g0) * h_prev + (1 - sigmoid(g0)) * tanh(g1)`, and
+# publishes `(h_next, A(h_next), A(tanh(g2)))` using the stable identity
+# `tanh(x) = 2 / (1 + exp(-2x)) - 1`, so the entire multi-step Markov chain
+# stays device-resident inside one sealed graph.
+fn rnn_markov_gate[S, R](h_prev: &tensor[S, R] f32,
+    base_frnn: &tensor[S, 3 * R] f32, base_x: &tensor[S, 3 * R] f32,
+    he_h: &tensor[S, 3 * R] f32, he_e: &tensor[S, 3 * R] f32)
+    -> (tensor[S, R] f32, tensor[S, R] A, tensor[S, R] A):
+    let mut h_next = tensor[S, R] f32
+    let mut h_next_a = tensor[S, R] A
+    let mut latent = tensor[S, R] A
+    parallel for s in 0..S:
+        parallel for r in 0..R:
+            let g0 = base_frnn[s, r] + base_x[s, r] + he_h[s, r] + he_e[s, r]
+            let g1 = base_frnn[s, R + r] + base_x[s, R + r] + he_h[s, R + r] + he_e[s, R + r]
+            let g2 = base_frnn[s, 2 * R + r] + base_x[s, 2 * R + r] + he_h[s, 2 * R + r] + he_e[s, 2 * R + r]
+            let gate = 1.0 / (1.0 + exp(-g0))
+            let cand = 2.0 / (1.0 + exp(-2.0 * g1)) - 1.0
+            let next = gate * h_prev[s, r] + (1.0 - gate) * cand
+            h_next[s, r] = next
+            h_next_a[s, r] = next
+            latent[s, r] = 2.0 / (1.0 + exp(-2.0 * g2)) - 1.0
+    return h_next, h_next_a, latent
+
+native rnn_markov_gate for metal from "metal/rnn_markov_gate.metal":
+    launch rnn_markov_gate:
+        threadgroups (ceil_div(S * R, 256), 1, 1)
+        threads_per_threadgroup (256, 1, 1)
+
+native rnn_markov_gate for cuda from "cuda/rnn_markov_gate.cu":
+    launch rnn_markov_gate:
+        threadgroups (ceil_div(S * R, 256), 1, 1)
+        threads_per_threadgroup (256, 1, 1)
+
+native rnn_markov_gate for vulkan from "vulkan/rnn_markov_gate.comp":
+    launch rnn_markov_gate:
+        threadgroups (ceil_div(R, 256), min(S, device.max_grid_y), 1)
+        threads_per_threadgroup (256, 1, 1)
+
+native rnn_markov_gate for cpu from "cpu/rnn_markov_gate.rs":
+    launch rnn_markov_gate:
+        threadgroups (S, 1, 1)
+        threads_per_threadgroup (1, 1, 1)

@@ -1,0 +1,69 @@
+// block_attn_res_mix: depth-wise softmax attention over S F32 residual sources
+// `[S, M, H]` using Q F32 query vectors `[Q, H]`. One workgroup per (row, q).
+#include <seismic/element.glsl>
+#include "lib/core/reduce.glsl"
+
+void block_attn_res_mix() {
+    const uint64_t row = uint64_t(gl_WorkGroupID.x);
+    const uint64_t q = uint64_t(gl_WorkGroupID.y);
+    const uint64_t S = SEISMIC_DIM_S;
+    const uint64_t H = SEISMIC_DIM_H;
+    const uint thread = SEISMIC_THREAD;
+    const float eps = element_word_f32(SEISMIC_PARAM_EPSILON);
+    const float scale = element_word_f32(SEISMIC_PARAM_SCALE);
+    const bool norm_v = SEISMIC_PARAM_NORMALIZE_VALUES != 0;
+
+    const uint inv_base = 32u;
+    const uint coeff_base = 32u + uint(S);
+
+    const uint64_t sources = SEISMIC_PTR(SEISMIC_BUFFER_SOURCES);
+    const uint64_t q_row = SEISMIC_PTR(SEISMIC_BUFFER_QUERIES) + q * SEISMIC_QUERIES_STRIDE_0 * 4ul;
+
+    float maximum = -1.0 / 0.0;
+    for (uint64_t s = 0ul; s < S; ++s) {
+        const uint64_t src = sources + (s * SEISMIC_SOURCES_STRIDE_0 + row * SEISMIC_SOURCES_STRIDE_1) * 4ul;
+        float sq = 0.0;
+        float dot = 0.0;
+        seismic_strided(uint64_t, i, thread, H, gl_WorkGroupSize.x) {
+            const float v = element_f32_at(src + i * SEISMIC_SOURCES_STRIDE_2 * 4ul);
+            const float qv = element_f32_at(q_row + i * SEISMIC_QUERIES_STRIDE_1 * 4ul);
+            sq = seismic_fma_rn(v, v, sq);
+            dot = seismic_fma_rn(qv, v, dot);
+        }
+        const float total_sq = reduce_group_sum(sq, 0u);
+        const float total_dot = reduce_group_sum(dot, 0u);
+        const float r = inversesqrt(seismic_div_rn(total_sq, float(H)) + eps);
+        const float l = total_dot * r * scale;
+        if (thread == 0u) {
+            seismic_shared_f32[inv_base + uint(s)] = r;
+            seismic_shared_f32[coeff_base + uint(s)] = l;
+        }
+        maximum = max(maximum, l);
+    }
+    barrier();
+    if (thread == 0u) {
+        float total = 0.0;
+        for (uint s = 0u; s < uint(S); ++s) {
+            const float e = exp(seismic_shared_f32[coeff_base + s] - maximum);
+            seismic_shared_f32[coeff_base + s] = e;
+            total += e;
+        }
+        for (uint s = 0u; s < uint(S); ++s) {
+            const float w = seismic_div_rn(seismic_shared_f32[coeff_base + s], total);
+            seismic_shared_f32[coeff_base + s] = norm_v ? w * seismic_shared_f32[inv_base + s] : w;
+        }
+    }
+    barrier();
+
+    const Out result = out_offset(SEISMIC_RESULT_0_OUT,
+        q * SEISMIC_RESULT_0_STRIDE_0 + row * SEISMIC_RESULT_0_STRIDE_1);
+    seismic_strided(uint64_t, i, thread, H, gl_WorkGroupSize.x) {
+        float acc = 0.0;
+        for (uint64_t s = 0ul; s < S; ++s) {
+            const float v = element_f32_at(sources
+                + (s * SEISMIC_SOURCES_STRIDE_0 + row * SEISMIC_SOURCES_STRIDE_1 + i * SEISMIC_SOURCES_STRIDE_2) * 4ul);
+            acc = seismic_fma_rn(seismic_shared_f32[coeff_base + uint(s)], v, acc);
+        }
+        out_put(result, i * SEISMIC_RESULT_0_STRIDE_2, acc);
+    }
+}

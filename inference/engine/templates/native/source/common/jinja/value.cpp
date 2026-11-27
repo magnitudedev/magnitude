@@ -877,9 +877,16 @@ const func_builtins & global_builtins() {
             return mk_val<value_bool>(res);
         }},
         {"test_is_sameas", [](const func_args & args) -> value {
-            // Check if an object points to the same memory address as another object
-            (void)args;
-            throw not_implemented_exception("sameas test not implemented");
+            args.ensure_count(2);
+            const auto & a = args.get_pos(0);
+            const auto & b = args.get_pos(1);
+            if (is_val<value_none>(a) && is_val<value_none>(b)) {
+                return mk_val<value_bool>(true);
+            }
+            if (is_val<value_bool>(a) && is_val<value_bool>(b)) {
+                return mk_val<value_bool>(a->as_bool() == b->as_bool());
+            }
+            return mk_val<value_bool>(a.get() == b.get());
         }},
         {"test_is_escaped", [](const func_args & args) -> value {
             (void)args;

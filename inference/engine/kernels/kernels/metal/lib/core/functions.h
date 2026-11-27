@@ -18,6 +18,7 @@ namespace functions {
 constant constexpr int silu = 0;
 constant constexpr int gelu_tanh = 1;
 constant constexpr int relu_squared = 2;
+constant constexpr int situ = 3;
 
 inline float activate(int function, float x) {
     if (function == gelu_tanh) {

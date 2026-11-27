@@ -322,14 +322,21 @@ void projection_put_pair(projection_epilogue out_, uint m, uint n, float gate_su
         return;
     }
 #if defined(PROJECTION_GLU_LIMIT)
-    // PROJECTION_GLU_LIMIT, the entry's nonzero LB: the F32 bits of its
-    // expansion's limit L. A Glu clamps the rounded gate to (-inf, L] and up
-    // to [-L, L], each written `x > L ? L : x` so a NaN stays NaN. An entry
-    // without one compiles none.
-    const float limit = uintBitsToFloat(uint(PROJECTION_GLU_LIMIT));
+    // PROJECTION_GLU_LIMIT, the entry's nonzero LB: for function 0/1/2 the F32
+    // bits of its clamp limit L; for function 3 (SITU) two packed BF16 caps
+    // `(gate_cap_bf16 << 16) | up_cap_bf16`.
     float gate = element_round(out_.act, gate_sum);
     float up = element_round(out_.act, up_sum);
     if (out_.kind == PROJECTION_GLU) {
+        if (out_.function == FUNCTIONS_SITU) {
+            const uint bits = uint(PROJECTION_GLU_LIMIT);
+            const float gate_cap = uintBitsToFloat(bits & 0xFFFF0000u);
+            const float up_cap = uintBitsToFloat((bits & 0x0000FFFFu) << 16u);
+            const float sig = seismic_div_rn(1.0, 1.0 + exp(-gate));
+            out_put(out_.y, at, functions_softcap(gate_cap, gate) * sig * functions_softcap(up_cap, up));
+            return;
+        }
+        const float limit = uintBitsToFloat(uint(PROJECTION_GLU_LIMIT));
         gate = gate > limit ? limit : gate;
         up = up > limit ? limit : up;
         up = up < -limit ? -limit : up;

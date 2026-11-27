@@ -19,6 +19,7 @@
 #define FUNCTIONS_SILU 0
 #define FUNCTIONS_GELU_TANH 1
 #define FUNCTIONS_RELU_SQUARED 2
+#define FUNCTIONS_SITU 3
 
 // The function is a launch word, so every form is compiled wherever this is
 // inlined: SiLU and GELU share one division, whose correctly rounded form is

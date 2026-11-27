@@ -426,6 +426,26 @@ private:
         return left;
     }
 
+    bool starts_bare_test_arg() const {
+        if (current >= tokens.size()) return false;
+        const auto & t = peek();
+        switch (t.t) {
+            case token::numeric_literal:
+            case token::string_literal:
+            case token::open_square_bracket:
+            case token::open_curly_bracket:
+                return true;
+            case token::identifier:
+                return t.value != "and" && t.value != "or" && t.value != "not"
+                    && t.value != "in" && t.value != "is" && t.value != "if"
+                    && t.value != "else" && t.value != "elif" && t.value != "endif"
+                    && t.value != "for" && t.value != "endfor" && t.value != "as"
+                    && t.value != "with" && t.value != "without";
+            default:
+                return false;
+        }
+    }
+
     statement_ptr parse_test_expression() {
         auto operand = parse_filter_expression();
         while (is_identifier("is")) {
@@ -434,8 +454,14 @@ private:
             bool negate = false;
             if (is_identifier("not")) { ++current; negate = true; }
             auto test_id = parse_primary_expression();
-            // FIXME: tests can also be expressed like this: if x is eq 3
-            if (is(token::open_paren)) test_id = parse_call_expression(std::move(test_id));
+            if (is(token::open_paren)) {
+                test_id = parse_call_expression(std::move(test_id));
+            } else if (starts_bare_test_arg()) {
+                size_t arg_pos = current;
+                statements args;
+                args.push_back(parse_call_member_expression());
+                test_id = mk_stmt<call_expression>(arg_pos, std::move(test_id), std::move(args));
+            }
             operand = mk_stmt<test_expression>(start_pos, std::move(operand), negate, std::move(test_id));
         }
         return operand;

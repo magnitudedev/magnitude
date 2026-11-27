@@ -18,6 +18,7 @@ namespace functions {
 constexpr int silu = 0;
 constexpr int gelu_tanh = 1;
 constexpr int relu_squared = 2;
+constexpr int situ = 3;
 
 __device__ __forceinline__ float activate(int function, float x) {
     if (function == gelu_tanh) {

@@ -23,29 +23,46 @@ fn activate[M, N](x: &tensor[M, N] T, result: &mut tensor[M, N] U, function: i32
 # The gated expansion, the one formula of every gate/up pair (dense, routed
 # and shared experts) and of its natives (the projection library's `Glu`
 # epilogue): with `gate` and `up` the F32 accumulators times their scales,
-# published in A, result = A(A(act(min(gate, L))) * clamp(up, -L, L))
-# (`activate`'s codes; L = `limit`). The clamp is written `x > L ? L : x`
-# (and `x < -L ? -L : x`), so a NaN stays NaN and L = inf is the identity,
-# which every unclamped caller passes (DeepSeek V4.1's `swiglu_limit`: the
-# gate above only, up on both sides, in F32 before the activation).
+# published in A:
+#   - function 0/1/2: result = A(A(act(min(gate, L))) * clamp(up, -L, L))
+#     (`activate`'s codes; L = `limit`). The clamp is written `x > L ? L : x`
+#     (and `x < -L ? -L : x`), so a NaN stays NaN and L = inf is the identity,
+#     which every unclamped caller passes (DeepSeek V4.1's `swiglu_limit`: the
+#     gate above only, up on both sides, in F32 before the activation).
+#   - function 3 (SITU, Inkling 2): `limit`'s F32 bits pack two positive BF16
+#     softcaps `(gate_cap_bf16 << 16) | up_cap_bf16`, and
+#     result = A(softcap(gate_cap, g) * sigmoid(g) * softcap(up_cap, u))
+#     with sigmoid evaluated on the uncapped gate `g`.
 fn glu[M, N](gate: &tensor[M, N] A, up: &tensor[M, N] A, result: &mut tensor[M, N] A, function: i32,
     limit: f32):
-    let mut clamped = tensor[M, N] f32
-    parallel for rows in 0..M:
-        parallel for cols in 0..N:
-            let mut g = f32(gate[rows, cols])
-            if g > limit:
-                g = limit
-            clamped[rows, cols] = g
-    activate(clamped, result, function)
-    parallel for rows in 0..M:
-        parallel for cols in 0..N:
-            let mut u = f32(up[rows, cols])
-            if u > limit:
-                u = limit
-            if u < -limit:
-                u = -limit
-            result[rows, cols] = f32(result[rows, cols]) * u
+    if function == 3:
+        let bits = bitcast_u32(limit)
+        let gate_cap = bitcast_f32(bits & u32(4294901760))
+        let up_cap = bitcast_f32((bits & u32(65535)) << u32(16))
+        parallel for rows in 0..M:
+            parallel for cols in 0..N:
+                let g = f32(gate[rows, cols])
+                let u = f32(up[rows, cols])
+                let g_cap = cap_logit(g, gate_cap)
+                let u_cap = cap_logit(u, up_cap)
+                result[rows, cols] = g_cap * (1.0 / (1.0 + exp(-g))) * u_cap
+    else:
+        let mut clamped = tensor[M, N] f32
+        parallel for rows in 0..M:
+            parallel for cols in 0..N:
+                let mut g = f32(gate[rows, cols])
+                if g > limit:
+                    g = limit
+                clamped[rows, cols] = g
+        activate(clamped, result, function)
+        parallel for rows in 0..M:
+            parallel for cols in 0..N:
+                let mut u = f32(up[rows, cols])
+                if u > limit:
+                    u = limit
+                if u < -limit:
+                    u = -limit
+                result[rows, cols] = f32(result[rows, cols]) * u
 
 # A projection entry's input rows, rounded to the result's element: the
 # RMS-normalized residual (`N = H`, `P = 1`), or the sum in part order of the

@@ -1,0 +1,351 @@
+// attention_rel_bias (contract and portable body in attention.seismic):
+// attention with in-kernel relative-position bias, LSE-fused static/dynamic
+// per-token sinks, and optional output gate.
+#define KERNEL_A SEISMIC_ELEMENT_A
+#include "lib/core/activation.glsl"
+#include "lib/core/reduce.glsl"
+#include <seismic/slab.glsl>
+
+#define REL_BIAS_MAX_REGS ((SEISMIC_CONST_REL_BIAS_MAX_WIDTH + 63) / 64)
+
+float rel_bias_gated(float attended, float g, int gate_function) {
+    if (gate_function != 0)
+        return attended * (max(g, 0.0) + log(1.0 + exp(-abs(g))));
+    return seismic_div_rn(attended, 1.0 + exp(-g));
+}
+
+int rel_bias_total_keys(uint64_t row, uint64_t R) {
+    const uint64_t visible = SEISMIC_PTR(SEISMIC_BUFFER_VISIBLE);
+    const uint64_t fresh = SEISMIC_PTR(SEISMIC_BUFFER_FRESH);
+    int total = 0;
+    for (uint64_t span = 0ul; span < R; ++span) {
+        const uint64_t base = row * SEISMIC_VISIBLE_STRIDE_0 + span * SEISMIC_VISIBLE_STRIDE_1;
+        const int lo = element_i32_index(visible, base);
+        const int hi = element_i32_index(visible, base + SEISMIC_VISIBLE_STRIDE_2);
+        if (hi > lo && lo >= 0)
+            total += hi - lo;
+    }
+    const int flo = element_i32_index(fresh, row * SEISMIC_FRESH_STRIDE_0);
+    const int fhi = element_i32_index(fresh, row * SEISMIC_FRESH_STRIDE_0 + SEISMIC_FRESH_STRIDE_1);
+    if (fhi > flo && flo >= 0)
+        total += fhi - flo;
+    return total;
+}
+
+void rel_bias_append_kv(uint64_t row, uint64_t kv_head, uint64_t W, uint tid) {
+    const int dest = element_i32_index(SEISMIC_PTR(SEISMIC_BUFFER_DESTINATIONS), row * SEISMIC_DESTINATIONS_STRIDE_0);
+    if (dest < 0)
+        return;
+    const uint slab_rows = uint(SEISMIC_PARAM_SLAB_ROWS);
+    const Out hk = slab_out_row(SEISMIC_OUT_HISTORY_KEY, uint(dest), slab_rows, SEISMIC_HISTORY_KEY_STRIDE_0);
+    const Out hv = slab_out_row(SEISMIC_OUT_HISTORY_VALUE, uint(dest), slab_rows, SEISMIC_HISTORY_VALUE_STRIDE_0);
+    const uint64_t key_buf = SEISMIC_PTR(SEISMIC_BUFFER_KEY);
+    const uint64_t val_buf = SEISMIC_PTR(SEISMIC_BUFFER_VALUE);
+    const uint64_t k_base = row * SEISMIC_KEY_STRIDE_0 + kv_head * SEISMIC_KEY_STRIDE_1;
+    const uint64_t v_base = row * SEISMIC_VALUE_STRIDE_0 + kv_head * SEISMIC_VALUE_STRIDE_1;
+    for (int r_i = 0; r_i < REL_BIAS_MAX_REGS; ++r_i) {
+        const uint64_t c = uint64_t(tid) + uint64_t(r_i) * 64ul;
+        if (c < W) {
+            out_put(hk, kv_head * SEISMIC_HISTORY_KEY_STRIDE_1 + c * SEISMIC_HISTORY_KEY_STRIDE_2,
+                element_at(ACTIVATION_A, key_buf, k_base + c * SEISMIC_KEY_STRIDE_2));
+            out_put(hv, kv_head * SEISMIC_HISTORY_VALUE_STRIDE_1 + c * SEISMIC_HISTORY_VALUE_STRIDE_2,
+                element_at(ACTIVATION_A, val_buf, v_base + c * SEISMIC_VALUE_STRIDE_2));
+        }
+    }
+}
+
+void rel_bias_scan(
+    in float q_reg[REL_BIAS_MAX_REGS],
+    inout float acc[REL_BIAS_MAX_REGS],
+    inout float maximum,
+    inout float denominator,
+    uint64_t row, uint64_t q_head, uint64_t kv_head,
+    uint64_t W, uint64_t R, uint64_t EXT,
+    int total_keys, int lo_k, int hi_k, float scale, uint tid) {
+    const uint slab_rows = uint(SEISMIC_PARAM_SLAB_ROWS);
+    const uint64_t visible = SEISMIC_PTR(SEISMIC_BUFFER_VISIBLE);
+    const uint64_t fresh = SEISMIC_PTR(SEISMIC_BUFFER_FRESH);
+    const uint64_t key_buf = SEISMIC_PTR(SEISMIC_BUFFER_KEY);
+    const uint64_t val_buf = SEISMIC_PTR(SEISMIC_BUFFER_VALUE);
+    const uint64_t rb_buf = SEISMIC_PTR(SEISMIC_BUFFER_REL_BIAS);
+    const uint64_t rb_base = row * SEISMIC_REL_BIAS_STRIDE_0 + q_head * SEISMIC_REL_BIAS_STRIDE_1;
+    int ordinal = 0;
+
+    for (uint64_t span = 0ul; span < R; ++span) {
+        const uint64_t sbase = row * SEISMIC_VISIBLE_STRIDE_0 + span * SEISMIC_VISIBLE_STRIDE_1;
+        const int lo = element_i32_index(visible, sbase);
+        const int hi = element_i32_index(visible, sbase + SEISMIC_VISIBLE_STRIDE_2);
+        if (hi <= lo || lo < 0)
+            continue;
+        const int span_len = hi - lo;
+        const int start = max(0, lo_k - ordinal);
+        const int end = min(span_len, hi_k - ordinal);
+        for (int idx = start; idx < end; ++idx) {
+            const uint tok = uint(lo + idx);
+            const Out hk = slab_out_row(SEISMIC_OUT_HISTORY_KEY, tok, slab_rows, SEISMIC_HISTORY_KEY_STRIDE_0);
+            const Out hv = slab_out_row(SEISMIC_OUT_HISTORY_VALUE, tok, slab_rows, SEISMIC_HISTORY_VALUE_STRIDE_0);
+            float dot = 0.0;
+            for (int r_i = 0; r_i < REL_BIAS_MAX_REGS; ++r_i) {
+                const uint64_t c = uint64_t(tid) + uint64_t(r_i) * 64ul;
+                if (c < W) {
+                    const float kv = out_at(hk, kv_head * SEISMIC_HISTORY_KEY_STRIDE_1 + c * SEISMIC_HISTORY_KEY_STRIDE_2);
+                    dot = seismic_fma_rn(q_reg[r_i], kv, dot);
+                }
+            }
+            float score = reduce_group_sum(dot, 0u) * scale;
+            const int d = (total_keys - 1) - (ordinal + idx);
+            if (EXT > 0ul && d >= 0 && uint64_t(d) < EXT)
+                score += element_f32_at(rb_buf + (rb_base + uint64_t(d) * SEISMIC_REL_BIAS_STRIDE_2) * 4ul);
+            const float next = max(maximum, score);
+            const float p = exp(score - next);
+            const float carry = exp(maximum - next);
+            denominator = seismic_fma_rn(denominator, carry, p);
+            for (int r_i = 0; r_i < REL_BIAS_MAX_REGS; ++r_i) {
+                const uint64_t c = uint64_t(tid) + uint64_t(r_i) * 64ul;
+                if (c < W) {
+                    const float vv = out_at(hv, kv_head * SEISMIC_HISTORY_VALUE_STRIDE_1 + c * SEISMIC_HISTORY_VALUE_STRIDE_2);
+                    acc[r_i] = seismic_fma_rn(p, vv, acc[r_i] * carry);
+                }
+            }
+            maximum = next;
+        }
+        ordinal += span_len;
+    }
+
+    const int flo = element_i32_index(fresh, row * SEISMIC_FRESH_STRIDE_0);
+    const int fhi = element_i32_index(fresh, row * SEISMIC_FRESH_STRIDE_0 + SEISMIC_FRESH_STRIDE_1);
+    if (fhi > flo && flo >= 0) {
+        const int span_len = fhi - flo;
+        const int start = max(0, lo_k - ordinal);
+        const int end = min(span_len, hi_k - ordinal);
+        for (int idx = start; idx < end; ++idx) {
+            const uint64_t tok = uint64_t(flo + idx);
+            if (tok >= SEISMIC_DIM_M)
+                continue;
+            const uint64_t k_base = tok * SEISMIC_KEY_STRIDE_0 + kv_head * SEISMIC_KEY_STRIDE_1;
+            const uint64_t v_base = tok * SEISMIC_VALUE_STRIDE_0 + kv_head * SEISMIC_VALUE_STRIDE_1;
+            float dot = 0.0;
+            for (int r_i = 0; r_i < REL_BIAS_MAX_REGS; ++r_i) {
+                const uint64_t c = uint64_t(tid) + uint64_t(r_i) * 64ul;
+                if (c < W) {
+                    const float kv = element_at(ACTIVATION_A, key_buf, k_base + c * SEISMIC_KEY_STRIDE_2);
+                    dot = seismic_fma_rn(q_reg[r_i], kv, dot);
+                }
+            }
+            float score = reduce_group_sum(dot, 0u) * scale;
+            const int d = (total_keys - 1) - (ordinal + idx);
+            if (EXT > 0ul && d >= 0 && uint64_t(d) < EXT)
+                score += element_f32_at(rb_buf + (rb_base + uint64_t(d) * SEISMIC_REL_BIAS_STRIDE_2) * 4ul);
+            const float next = max(maximum, score);
+            const float p = exp(score - next);
+            const float carry = exp(maximum - next);
+            denominator = seismic_fma_rn(denominator, carry, p);
+            for (int r_i = 0; r_i < REL_BIAS_MAX_REGS; ++r_i) {
+                const uint64_t c = uint64_t(tid) + uint64_t(r_i) * 64ul;
+                if (c < W) {
+                    const float vv = element_at(ACTIVATION_A, val_buf, v_base + c * SEISMIC_VALUE_STRIDE_2);
+                    acc[r_i] = seismic_fma_rn(p, vv, acc[r_i] * carry);
+                }
+            }
+            maximum = next;
+        }
+    }
+}
+
+void attention_rel_bias_partial() {
+    const uint q_head_u = gl_WorkGroupID.x;
+    const uint64_t q_head = uint64_t(q_head_u);
+    const uint64_t part = uint64_t(gl_WorkGroupID.y);
+    const uint64_t row = uint64_t(gl_WorkGroupID.z);
+    const uint tid = SEISMIC_THREAD;
+    const uint G_u = uint(SEISMIC_DIM_G);
+    const uint64_t kv_head = uint64_t(q_head_u / G_u);
+    const uint64_t W = SEISMIC_DIM_W;
+    const uint64_t R = SEISMIC_DIM_R;
+    const uint64_t EXT = SEISMIC_DIM_EXT;
+    const uint64_t parts = uint64_t(SEISMIC_CONST_REL_BIAS_PARTS);
+    const float scale = element_word_f32(SEISMIC_PARAM_SCALE);
+
+    if (part == 0ul && (q_head_u % G_u) == 0u)
+        rel_bias_append_kv(row, kv_head, W, tid);
+
+    const int total_keys = rel_bias_total_keys(row, R);
+    const int chunk = max(32, (total_keys + int(parts) - 1) / int(parts));
+    const int lo_k = int(part) * chunk;
+    const int hi_k = min(lo_k + chunk, total_keys);
+
+    float q_reg[REL_BIAS_MAX_REGS];
+    float acc[REL_BIAS_MAX_REGS];
+    const uint64_t query_buf = SEISMIC_PTR(SEISMIC_BUFFER_QUERY);
+    const uint64_t q_base = row * SEISMIC_QUERY_STRIDE_0 + q_head * SEISMIC_QUERY_STRIDE_1;
+    for (int r_i = 0; r_i < REL_BIAS_MAX_REGS; ++r_i) {
+        const uint64_t c = uint64_t(tid) + uint64_t(r_i) * 64ul;
+        q_reg[r_i] = c < W ? element_at(ACTIVATION_A, query_buf, q_base + c * SEISMIC_QUERY_STRIDE_2) : 0.0;
+        acc[r_i] = 0.0;
+    }
+    float maximum = -1.0 / 0.0;
+    float denominator = 0.0;
+
+    if (lo_k < hi_k) {
+        rel_bias_scan(q_reg, acc, maximum, denominator,
+            row, q_head, kv_head, W, R, EXT, total_keys, lo_k, hi_k, scale, tid);
+    }
+
+    const uint64_t partials_out = SEISMIC_PTR(SEISMIC_BUFFER_SCRATCH_PARTIALS);
+    const uint64_t stats_out = SEISMIC_PTR(SEISMIC_BUFFER_SCRATCH_STATISTICS);
+    const uint64_t slot = (row * (SEISMIC_DIM_KV * uint64_t(G_u)) + q_head) * parts + part;
+    if (tid == 0u) {
+        element_put(ELEMENT_F32, stats_out, slot * 2ul, maximum);
+        element_put(ELEMENT_F32, stats_out, slot * 2ul + 1ul, denominator);
+    }
+    for (int r_i = 0; r_i < REL_BIAS_MAX_REGS; ++r_i) {
+        const uint64_t c = uint64_t(tid) + uint64_t(r_i) * 64ul;
+        if (c < W)
+            element_put(ELEMENT_F32, partials_out, slot * W + c, acc[r_i]);
+    }
+}
+
+void attention_rel_bias_merge() {
+    const uint64_t q_head = uint64_t(gl_WorkGroupID.x);
+    const uint row_u = gl_WorkGroupID.y;
+    const uint64_t row = uint64_t(row_u);
+    const uint tid = SEISMIC_THREAD;
+    const uint64_t W = SEISMIC_DIM_W;
+    const uint U_u = uint(SEISMIC_DIM_U);
+    const uint SK_u = uint(SEISMIC_DIM_SK);
+    const uint64_t parts = uint64_t(SEISMIC_CONST_REL_BIAS_PARTS);
+    const int gate_function = int(SEISMIC_PARAM_GATE_FUNCTION);
+    const uint64_t base_slot = (row * (SEISMIC_DIM_KV * SEISMIC_DIM_G) + q_head) * parts;
+
+    const uint64_t gate_buf = SEISMIC_PTR(SEISMIC_BUFFER_GATE);
+    const uint64_t sinks_buf = SEISMIC_PTR(SEISMIC_BUFFER_SINKS);
+    const uint64_t partials_in = SEISMIC_PTR(SEISMIC_BUFFER_SCRATCH_PARTIALS);
+    const uint64_t stats_in = SEISMIC_PTR(SEISMIC_BUFFER_SCRATCH_STATISTICS);
+
+    float overall_m = -1.0 / 0.0;
+    for (uint64_t p = 0ul; p < parts; ++p)
+        overall_m = max(overall_m, element_f32_at(stats_in + ((base_slot + p) * 2ul) * 4ul));
+
+    float total = 0.0;
+    float acc[REL_BIAS_MAX_REGS];
+    for (int r_i = 0; r_i < REL_BIAS_MAX_REGS; ++r_i)
+        acc[r_i] = 0.0;
+
+    for (uint64_t p = 0ul; p < parts; ++p) {
+        const float pm = element_f32_at(stats_in + ((base_slot + p) * 2ul) * 4ul);
+        const float pl = element_f32_at(stats_in + ((base_slot + p) * 2ul + 1ul) * 4ul);
+        if (pl > 0.0) {
+            const float w = exp(pm - overall_m);
+            total = seismic_fma_rn(pl, w, total);
+            const uint64_t p_off = (base_slot + p) * W;
+            for (int r_i = 0; r_i < REL_BIAS_MAX_REGS; ++r_i) {
+                const uint64_t c = uint64_t(tid) + uint64_t(r_i) * 64ul;
+                if (c < W)
+                    acc[r_i] = seismic_fma_rn(element_f32_at(partials_in + (p_off + c) * 4ul), w, acc[r_i]);
+            }
+        }
+    }
+
+    if (SK_u > 0u) {
+        const uint64_t s_row = uint64_t(row_u % SK_u);
+        const float sink = element_f32_at(sinks_buf
+            + (s_row * SEISMIC_SINKS_STRIDE_0 + q_head * SEISMIC_SINKS_STRIDE_1) * 4ul);
+        if (sink > overall_m) {
+            const float rescale = overall_m > -3.4028234e38 ? exp(overall_m - sink) : 0.0;
+            total = total * rescale + 1.0;
+            for (int r_i = 0; r_i < REL_BIAS_MAX_REGS; ++r_i)
+                acc[r_i] *= rescale;
+        } else if (overall_m > -3.4028234e38) {
+            total += exp(sink - overall_m);
+        }
+    }
+    const float denom = max(total, 1e-30);
+    const Out result = out_offset(SEISMIC_RESULT_0_OUT,
+        row * SEISMIC_RESULT_0_STRIDE_0 + q_head * SEISMIC_RESULT_0_STRIDE_1);
+    const uint64_t g_base = row * SEISMIC_GATE_STRIDE_0 + q_head * SEISMIC_GATE_STRIDE_1;
+    for (int r_i = 0; r_i < REL_BIAS_MAX_REGS; ++r_i) {
+        const uint c_u = tid + uint(r_i) * 64u;
+        const uint64_t c = uint64_t(c_u);
+        if (c < W) {
+            float val = seismic_div_rn(acc[r_i], denom);
+            if (U_u > 0u) {
+                const float gv = element_at(ACTIVATION_A, gate_buf, g_base + uint64_t(c_u % U_u) * SEISMIC_GATE_STRIDE_2);
+                val = rel_bias_gated(val, gv, gate_function);
+            }
+            out_put(result, c * SEISMIC_RESULT_0_STRIDE_2, val);
+        }
+    }
+}
+
+void attention_rel_bias_prefill() {
+    const uint q_head_u = gl_WorkGroupID.x;
+    const uint64_t q_head = uint64_t(q_head_u);
+    const uint tid = SEISMIC_THREAD;
+    const uint G_u = uint(SEISMIC_DIM_G);
+    const uint64_t kv_head = uint64_t(q_head_u / G_u);
+    const uint64_t W = SEISMIC_DIM_W;
+    const uint64_t R = SEISMIC_DIM_R;
+    const uint64_t EXT = SEISMIC_DIM_EXT;
+    const uint U_u = uint(SEISMIC_DIM_U);
+    const uint SK_u = uint(SEISMIC_DIM_SK);
+    const float scale = element_word_f32(SEISMIC_PARAM_SCALE);
+    const int gate_function = int(SEISMIC_PARAM_GATE_FUNCTION);
+    const uint64_t query_buf = SEISMIC_PTR(SEISMIC_BUFFER_QUERY);
+    const uint64_t gate_buf = SEISMIC_PTR(SEISMIC_BUFFER_GATE);
+    const uint64_t sinks_buf = SEISMIC_PTR(SEISMIC_BUFFER_SINKS);
+
+    for (uint row_u = gl_WorkGroupID.y; uint64_t(row_u) < SEISMIC_DIM_M; row_u += gl_NumWorkGroups.y) {
+        const uint64_t row = uint64_t(row_u);
+        if ((q_head_u % G_u) == 0u)
+            rel_bias_append_kv(row, kv_head, W, tid);
+
+        const int total_keys = rel_bias_total_keys(row, R);
+        float q_reg[REL_BIAS_MAX_REGS];
+        float acc[REL_BIAS_MAX_REGS];
+        const uint64_t q_base = row * SEISMIC_QUERY_STRIDE_0 + q_head * SEISMIC_QUERY_STRIDE_1;
+        for (int r_i = 0; r_i < REL_BIAS_MAX_REGS; ++r_i) {
+            const uint64_t c = uint64_t(tid) + uint64_t(r_i) * 64ul;
+            q_reg[r_i] = c < W ? element_at(ACTIVATION_A, query_buf, q_base + c * SEISMIC_QUERY_STRIDE_2) : 0.0;
+            acc[r_i] = 0.0;
+        }
+        float maximum = -1.0 / 0.0;
+        float denominator = 0.0;
+
+        if (total_keys > 0) {
+            rel_bias_scan(q_reg, acc, maximum, denominator,
+                row, q_head, kv_head, W, R, EXT, total_keys, 0, total_keys, scale, tid);
+        }
+
+        float total = denominator;
+        if (SK_u > 0u) {
+            const uint64_t s_row = uint64_t(row_u % SK_u);
+            const float sink = element_f32_at(sinks_buf
+                + (s_row * SEISMIC_SINKS_STRIDE_0 + q_head * SEISMIC_SINKS_STRIDE_1) * 4ul);
+            if (sink > maximum) {
+                const float rescale = maximum > -3.4028234e38 ? exp(maximum - sink) : 0.0;
+                total = total * rescale + 1.0;
+                for (int r_i = 0; r_i < REL_BIAS_MAX_REGS; ++r_i)
+                    acc[r_i] *= rescale;
+            } else if (maximum > -3.4028234e38) {
+                total += exp(sink - maximum);
+            }
+        }
+        const float denom = max(total, 1e-30);
+        const Out result = out_offset(SEISMIC_RESULT_0_OUT,
+            row * SEISMIC_RESULT_0_STRIDE_0 + q_head * SEISMIC_RESULT_0_STRIDE_1);
+        const uint64_t g_base = row * SEISMIC_GATE_STRIDE_0 + q_head * SEISMIC_GATE_STRIDE_1;
+        for (int r_i = 0; r_i < REL_BIAS_MAX_REGS; ++r_i) {
+            const uint c_u = tid + uint(r_i) * 64u;
+            const uint64_t c = uint64_t(c_u);
+            if (c < W) {
+                float val = seismic_div_rn(acc[r_i], denom);
+                if (U_u > 0u) {
+                    const float gv = element_at(ACTIVATION_A, gate_buf, g_base + uint64_t(c_u % U_u) * SEISMIC_GATE_STRIDE_2);
+                    val = rel_bias_gated(val, gv, gate_function);
+                }
+                out_put(result, c * SEISMIC_RESULT_0_STRIDE_2, val);
+            }
+        }
+        barrier();
+    }
+}

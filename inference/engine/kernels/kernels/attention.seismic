@@ -1987,5 +1987,208 @@ native attention_prefill_k8v4 for cpu from "cpu/attention_prefill_k8v4.rs":
 
 
 
+# Per-head optional channel scale (`SC == 0` none, `SC == 1` shared across
+# heads, `SC == H` per-head), L2 norm clipping, and optional position-
+# dependent logarithmic scaling (Inkling 2 Q/K/R preparation):
+#   s[c]   = f32(x[m, h, c]) * (SC > 0 ? scale[h % SC, c] : 1.0)
+#   clip   = min(1.0, threshold / (sqrt(sum_c s[c]^2) + epsilon))
+#   tau    = log_alpha != 0 ? 1.0 + log_alpha * log(max(1.0, (pos + 1) / log_floor)) : 1.0
+#   out[c] = s[c] * (clip * tau)
+# where `pos = coordinates[m, 0]`.
+fn head_l2_clip[M, H, W, SC](x: &tensor[M, H, W] A, scale: &tensor[SC, W] f32,
+    coordinates: &tensor[M, 4] i32, threshold: f32, epsilon: f32,
+    log_floor: f32, log_alpha: f32) -> tensor[M, H, W] Y
+    where SC >= 0 and (SC == 0 or SC == 1 or SC == H):
+    let mut result = tensor[M, H, W] Y
+    parallel for row in 0..M:
+        let mut tau = f32(1.0)
+        if log_alpha != 0.0:
+            let ratio = (f32(coordinates[row, 0]) + 1.0) / log_floor
+            tau = 1.0 + log_alpha * log(max(1.0, ratio))
+        parallel for head in 0..H:
+            let mut sq = f32(0.0)
+            for c in 0..W:
+                let mut v = f32(x[row, head, c])
+                if SC > 0:
+                    v = v * scale[head % SC, c]
+                sq = fma(v, v, sq)
+            let clip = min(1.0, threshold / (sqrt(sq) + epsilon))
+            let factor = clip * tau
+            for c in 0..W:
+                let mut v = f32(x[row, head, c])
+                if SC > 0:
+                    v = v * scale[head % SC, c]
+                result[row, head, c] = v * factor
+    return result
+
+native head_l2_clip for metal from "metal/head_l2_clip.metal":
+    launch head_l2_clip:
+        threadgroups (H, M, 1)
+        threads_per_threadgroup (64, 1, 1)
+
+native head_l2_clip for cuda from "cuda/head_l2_clip.cu":
+    launch head_l2_clip:
+        threadgroups (H, min(M, 65535), 1)
+        threads_per_threadgroup (64, 1, 1)
+
+native head_l2_clip for vulkan from "vulkan/head_l2_clip.comp":
+    launch head_l2_clip:
+        threadgroups (H, min(M, 65535), 1)
+        threads_per_threadgroup (64, 1, 1)
+        shared_bytes (128)
+
+native head_l2_clip for cpu from "cpu/head_l2_clip.rs":
+    launch head_l2_clip:
+        threadgroups (M * H, 1, 1)
+        threads_per_threadgroup (1, 1, 1)
+        shared_bytes (W * 4)
+
+const REL_BIAS_PARTS = 16
+const REL_BIAS_MAX_WIDTH = 256
+
+# Attention with in-kernel relative-position bias (`rel_bias [M, KV * G, EXT]`),
+# LSE-fused static (`SK = 1`) or dynamic per-token (`SK = M`) attention sinks,
+# and optional output gate (`gate [M, KV * G, U]`, U in {0, 1, W}).
+#
+# For query row `row` with `total_keys` keys across its `visible` and `fresh`
+# spans, key at ordinal `o` has causal distance `d = (total_keys - 1) - o`;
+# when `EXT > 0` and `0 <= d < EXT`, `rel_bias[row, head, d]` is added directly
+# to `dot * scale` in registers without materializing an `[H, N_kv]` bias table.
+# When `SK > 0`, `sinks[row % SK, head]` is folded into the softmax denominator
+# in the epilogue (`out *= sigmoid(lse - sink)`), followed by the output gate.
+fn attention_rel_bias[M, T, KV, G, W, EXT, U, SK, R](
+    query: &tensor[M, KV * G, W] A, gate: &tensor[M, KV * G, U] A,
+    key: &tensor[M, KV, W] A, value: &tensor[M, KV, W] A,
+    rel_bias: &tensor[M, KV * G, EXT] f32, sinks: &tensor[SK, KV * G] f32,
+    visible: &tensor[M, R, 2] i32, fresh: &tensor[M, 2] i32,
+    destinations: &tensor[M] i32,
+    history_key: &slab mut tensor[T, KV, W] A,
+    history_value: &slab mut tensor[T, KV, W] A,
+    scale: f32, gate_function: i32, slab_rows: u32) -> tensor[M, KV * G, W] A
+    where W <= REL_BIAS_MAX_WIDTH and EXT >= 0 and U >= 0 and (U == 0 or U == 1 or U == W) and SK >= 0 and (SK == 0 or SK == 1 or SK == M):
+    let mut result = tensor[M, KV * G, W] A
+    for row in 0..M:
+        let mut total_keys = 0
+        for span in 0..R:
+            let lo = visible[row, span, 0]
+            let hi = visible[row, span, 1]
+            if hi > lo and lo >= 0:
+                total_keys = total_keys + (hi - lo)
+        let fresh_lo = fresh[row, 0]
+        let fresh_hi = fresh[row, 1]
+        if fresh_hi > fresh_lo and fresh_lo >= 0:
+            total_keys = total_keys + (fresh_hi - fresh_lo)
+        for kv_head in 0..KV:
+            for head in 0..G:
+                let q_head = kv_head * G + head
+                let mut maximum = -inf
+                let mut denominator = f32(0.0)
+                let mut acc = tensor[W] f32
+                for c in 0..W:
+                    acc[c] = 0.0
+                let mut ordinal = 0
+                for span in 0..R:
+                    let lo = visible[row, span, 0]
+                    let hi = visible[row, span, 1]
+                    if hi > lo and lo >= 0:
+                        for token in lo..hi:
+                            let mut dot = f32(0.0)
+                            for c in 0..W:
+                                dot = fma(f32(query[row, q_head, c]), f32(history_key[token, kv_head, c]), dot)
+                            let mut score = dot * scale
+                            let d = (total_keys - 1) - ordinal
+                            if EXT > 0 and d >= 0 and d < EXT:
+                                score = score + rel_bias[row, q_head, d]
+                            let next = max(maximum, score)
+                            let p = exp(score - next)
+                            let carry = exp(maximum - next)
+                            denominator = fma(denominator, carry, p)
+                            for c in 0..W:
+                                acc[c] = fma(p, f32(history_value[token, kv_head, c]), acc[c] * carry)
+                            maximum = next
+                            ordinal = ordinal + 1
+                if fresh_hi > fresh_lo and fresh_lo >= 0:
+                    for token in fresh_lo..fresh_hi:
+                        if token < M:
+                            let mut dot = f32(0.0)
+                            for c in 0..W:
+                                dot = fma(f32(query[row, q_head, c]), f32(key[token, kv_head, c]), dot)
+                            let mut score = dot * scale
+                            let d = (total_keys - 1) - ordinal
+                            if EXT > 0 and d >= 0 and d < EXT:
+                                score = score + rel_bias[row, q_head, d]
+                            let next = max(maximum, score)
+                            let p = exp(score - next)
+                            let carry = exp(maximum - next)
+                            denominator = fma(denominator, carry, p)
+                            for c in 0..W:
+                                acc[c] = fma(p, f32(value[token, kv_head, c]), acc[c] * carry)
+                            maximum = next
+                            ordinal = ordinal + 1
+                let mut total = denominator
+                if SK > 0:
+                    let sink = sinks[row % SK, q_head]
+                    total = total + exp(sink - maximum)
+                let denom = max(total, 1e-30)
+                for c in 0..W:
+                    let mut out_val = acc[c] / denom
+                    if U > 0:
+                        out_val = gated_column(out_val, f32(gate[row, q_head, c % U]), gate_function)
+                    result[row, q_head, c] = out_val
+    for row in 0..M:
+        if destinations[row] >= 0:
+            for kv_head in 0..KV:
+                history_key[destinations[row], kv_head] = key[row, kv_head]
+                history_value[destinations[row], kv_head] = value[row, kv_head]
+    return result
+
+native attention_rel_bias for metal from "metal/attention_rel_bias.metal":
+    scratch partials bytes (M * KV * G * REL_BIAS_PARTS * W * 4) when M <= VERIFY_ROWS
+    scratch statistics bytes (M * KV * G * REL_BIAS_PARTS * 8) when M <= VERIFY_ROWS
+    launch attention_rel_bias_partial when M <= VERIFY_ROWS:
+        threadgroups (KV * G, REL_BIAS_PARTS, M)
+        threads_per_threadgroup (32, 1, 1)
+    launch attention_rel_bias_merge when M <= VERIFY_ROWS:
+        threadgroups (KV * G, M, 1)
+        threads_per_threadgroup (32, 1, 1)
+    launch attention_rel_bias_prefill when M > VERIFY_ROWS:
+        threadgroups (KV * G, M, 1)
+        threads_per_threadgroup (32, 1, 1)
+
+native attention_rel_bias for cuda from "cuda/attention_rel_bias.cu":
+    scratch partials bytes (M * KV * G * REL_BIAS_PARTS * W * 4) when M <= VERIFY_ROWS
+    scratch statistics bytes (M * KV * G * REL_BIAS_PARTS * 8) when M <= VERIFY_ROWS
+    launch attention_rel_bias_partial when M <= VERIFY_ROWS:
+        threadgroups (KV * G, REL_BIAS_PARTS, M)
+        threads_per_threadgroup (32, 1, 1)
+    launch attention_rel_bias_merge when M <= VERIFY_ROWS:
+        threadgroups (KV * G, M, 1)
+        threads_per_threadgroup (32, 1, 1)
+    launch attention_rel_bias_prefill when M > VERIFY_ROWS:
+        threadgroups (KV * G, min(M, 65535), 1)
+        threads_per_threadgroup (32, 1, 1)
+
+native attention_rel_bias for vulkan from "vulkan/attention_rel_bias.comp":
+    scratch partials bytes (M * KV * G * REL_BIAS_PARTS * W * 4) when M <= VERIFY_ROWS
+    scratch statistics bytes (M * KV * G * REL_BIAS_PARTS * 8) when M <= VERIFY_ROWS
+    launch attention_rel_bias_partial when M <= VERIFY_ROWS:
+        threadgroups (KV * G, REL_BIAS_PARTS, M)
+        threads_per_threadgroup (64, 1, 1)
+        shared_bytes (128)
+    launch attention_rel_bias_merge when M <= VERIFY_ROWS:
+        threadgroups (KV * G, M, 1)
+        threads_per_threadgroup (64, 1, 1)
+    launch attention_rel_bias_prefill when M > VERIFY_ROWS:
+        threadgroups (KV * G, min(M, 65535), 1)
+        threads_per_threadgroup (64, 1, 1)
+        shared_bytes (128)
+
+native attention_rel_bias for cpu from "cpu/attention_rel_bias.rs":
+    launch attention_rel_bias:
+        threadgroups (M * KV, 1, 1)
+        threads_per_threadgroup (1, 1, 1)
+        shared_bytes (G * (2 + W) * 4)
+
+
 # Complete direct numerical computation; caller admission names this whole body.
 

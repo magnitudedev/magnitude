@@ -170,3 +170,81 @@ native short_conv_project for cpu from "cpu/short_conv_project.rs":
     launch short_conv_project_rows:
         threadgroups (2 * ceil_div(CH, ROWS), 1, 1)
         threads_per_threadgroup (1, 1, 1)
+
+# Generalized causal depthwise short convolution with residual add, optional
+# input-dependent per-head dynamic taps, and variance normalization (Inkling 2):
+#   y = residual_scale * (x + static_conv(x) + dyn_conv(x))
+# Uses the same versioned window arena contract as `short_conv_rows`:
+# `window[S, C - 1 + T, CH] f32` holds C - 1 past F32 frames plus up to T tape
+# rows per bank. `HD = 0` is static-only; `HD > 0` (`CH % HD == 0`) broadcasts
+# `dynamic_taps[row, channel / (CH / HD), lag]` (lag 0 = current token, lag
+# C - 1 = oldest token) across each head's channels.
+# Works uniformly for 1-row decode, multi-row verify, and prefill.
+fn causal_short_conv[M, B, S, CH, C, T, HD](input: &tensor[M, CH] A,
+    convolution: &tensor[CH, C] f32,
+    dynamic_taps: &tensor[M, HD, C] f32,
+    segments: &tensor[B + 1, 2] i32, stop: &tensor[B] i32,
+    previous_bank: &tensor[B] i32, previous_tape: &tensor[B] i32, following_bank: &tensor[B] i32,
+    window: &slab mut tensor[S, C - 1 + T, CH] f32,
+    residual_scale: f32, slab_banks: u32) -> tensor[M, CH] Y
+    where T >= 0 and HD >= 0 and (HD == 0 or CH % HD == 0):
+    let mut output = tensor[M, CH] Y
+    for row in 0..M:
+        for channel in 0..CH:
+            output[row, channel] = 0.0
+    for slot in 0..B:
+        let lo = segments[slot, 0]
+        let hi = segments[slot, 1]
+        let source = previous_bank[slot]
+        let taped = previous_tape[slot]
+        let target = following_bank[slot]
+        let publish = lo + stop[slot]
+        for row in 0..M:
+            if row >= lo and row < hi:
+                let local = row - lo
+                for channel in 0..CH:
+                    let mut static_sum = f32(0.0)
+                    let mut dyn_sum = f32(0.0)
+                    for tap in 0..C:
+                        let mut value = f32(0.0)
+                        if local + tap < C - 1:
+                            value = window[source, taped + local + tap, channel]
+                        else:
+                            value = f32(input[lo + local + tap - (C - 1), channel])
+                        static_sum = fma(convolution[channel, tap], value, static_sum)
+                        if HD > 0:
+                            let head = channel / (CH / HD)
+                            if head < HD:
+                                dyn_sum = fma(dynamic_taps[row, head, C - 1 - tap], value, dyn_sum)
+                    let x = f32(input[row, channel])
+                    output[row, channel] = (x + static_sum + dyn_sum) * residual_scale
+        if lo < hi:
+            for tap in 0..C - 1 + T:
+                if tap < C - 1 or publish + tap - (C - 1) < hi:
+                    for channel in 0..CH:
+                        if stop[slot] + tap < C - 1:
+                            window[target, tap, channel] = window[source, taped + stop[slot] + tap, channel]
+                        else:
+                            window[target, tap, channel] = f32(input[publish + tap - (C - 1), channel])
+    return output
+
+native causal_short_conv for metal from "metal/causal_short_conv.metal":
+    launch causal_short_conv:
+        threadgroups (ceil_div(CH, 256), M + B, 1)
+        threads_per_threadgroup (256, 1, 1)
+
+native causal_short_conv for cuda from "cuda/causal_short_conv.cu":
+    launch causal_short_conv:
+        threadgroups (ceil_div(CH, 256), min(M + B, 65535), 1)
+        threads_per_threadgroup (256, 1, 1)
+
+native causal_short_conv for vulkan from "vulkan/causal_short_conv.comp":
+    launch causal_short_conv:
+        threadgroups (ceil_div(CH, 256), min(M + B, 65535), 1)
+        threads_per_threadgroup (256, 1, 1)
+
+native causal_short_conv for cpu from "cpu/causal_short_conv.rs":
+    launch causal_short_conv:
+        threadgroups (M + B, 1, 1)
+        threads_per_threadgroup (1, 1, 1)
+        shared_bytes (CH * 12)

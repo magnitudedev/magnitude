@@ -17,6 +17,7 @@ use seismic::cpu::{Dense, F32, Store};
 pub const SILU: i32 = 0;
 pub const GELU_TANH: i32 = 1;
 pub const RELU_SQUARED: i32 = 2;
+pub const SITU: i32 = 3;
 
 #[inline(always)]
 pub fn activate(function: i32, x: f32) -> f32 {
@@ -63,14 +64,22 @@ pub fn glu_limit(word: u64) -> Option<f32> {
     (word != 0).then(|| f32::from_bits(u32::try_from(word).expect("LB is the bits of an F32")))
 }
 
-/// [`glu`] clamped at `limit`: the published gate to (-inf, limit] and the
-/// published up to [-limit, limit], each written `x > L ? L : x` so a NaN
-/// stays NaN.
+/// [`glu`] clamped at `limit` (or SITU softcapped when `function == SITU`,
+/// where `limit`'s bits pack `(gate_cap_bf16 << 16) | up_cap_bf16`): the
+/// published gate to (-inf, limit] and the published up to [-limit, limit],
+/// each written `x > L ? L : x` so a NaN stays NaN.
 #[inline(always)]
 pub fn clamped_glu<A: Dense>(function: i32, limit: f32, gate: f32, up: f32) -> f32 {
     let gate = activation::publish::<A>(gate);
-    let gate = if gate > limit { limit } else { gate };
     let up = activation::publish::<A>(up);
+    if function == SITU {
+        let bits = limit.to_bits();
+        let gate_cap = f32::from_bits(bits & 0xFFFF_0000);
+        let up_cap = f32::from_bits((bits & 0x0000_FFFF) << 16);
+        let sig = 1.0 / (1.0 + (-gate).exp());
+        return activation::publish::<A>(softcap(gate_cap, gate) * sig * softcap(up_cap, up));
+    }
+    let gate = if gate > limit { limit } else { gate };
     let up = if up > limit { limit } else { up };
     let up = if up < -limit { -limit } else { up };
     activation::publish::<A>(A::widen(A::narrow(activate(function, gate))) * up)
