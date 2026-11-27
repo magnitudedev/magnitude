@@ -1117,6 +1117,11 @@ impl Steps {
         self.lock().groups.values().any(|group| group.is_prompt() && group.ended < group.steps)
     }
 
+    /// Whether any running group is a decode/verify group (not a prompt group).
+    pub(super) fn decode_running(&self) -> bool {
+        self.lock().groups.values().any(|group| !group.is_prompt() && group.ended < group.steps)
+    }
+
     /// Steps through `last` begun, each a group of one run whole, where a
     /// test plays them without launches: what an entry stored from the
     /// first step not yet begun is stored from.
@@ -1483,7 +1488,7 @@ impl Shared {
             let work = work(&launch);
             let step_route = route(&launch);
             let form = match step_route {
-                StepRoute::Grouped => StepForm::Grouped,
+                StepRoute::Grouped => StepForm::Grouped { prompt_routes: None },
                 StepRoute::Decode => StepForm::Decode(DecodeStep {
                     domain: DecodeDomain::TargetDecode,
                     launch: None,
@@ -1553,8 +1558,16 @@ pub(crate) struct ExpertStep {
 /// A step's route form and its form-specific state: a grouped step carries
 /// none; a decode step owns its launch, recording flag, site flight, and
 /// block-timing sample lines.
+/// Per-row prompt routes exported from grouped prefill (`SplitValues::crossing.routes`)
+/// to seed `TokenRoutes` before decode step 1.
+pub(crate) struct PromptRoutes {
+    pub(crate) tokens: Box<[crate::operation::TokenId]>,
+    pub(crate) layer_routes: Vec<Vec<u16>>,
+    pub(crate) selected: usize,
+}
+
 enum StepForm {
-    Grouped,
+    Grouped { prompt_routes: Option<PromptRoutes> },
     Decode(DecodeStep),
 }
 
@@ -1591,7 +1604,10 @@ struct DecodeStep {
 /// ran, whatever its outputs), with a decode step's routing.
 enum Ending {
     Unrun,
-    Completed(Option<DecodeRouting>),
+    Completed {
+        decode: Option<DecodeRouting>,
+        prompt: Option<PromptRoutes>,
+    },
 }
 
 /// A completed decode step's routing (`interest::Told::Completed`): at each
@@ -1812,10 +1828,19 @@ impl ExpertStep {
     /// Its rows name nothing ahead. Nothing is told of a launch without
     /// one (a prompt chunk's).
     pub fn guessing(self, requests: impl Iterator<Item = RequestId>) -> Self {
-        assert!(matches!(self.form, StepForm::Grouped), "a decode launch's rows ahead are its rows' (`Self::decoding`)");
+        assert!(matches!(self.form, StepForm::Grouped { .. }), "a decode launch's rows ahead are its rows' (`Self::decoding`)");
         let requests = requests.collect::<Box<[_]>>();
         if !requests.is_empty() {
             self.shared.tell(crate::experts::interest::Told::Began { step: self.sequence, launch: crate::experts::interest::Launched::Grouped(requests) });
+        }
+        self
+    }
+
+    /// Attach per-row prompt routes exported from grouped prefill to this
+    /// grouped step so completion emits `Told::PromptRoutes` to `NameLedger`.
+    pub fn with_prompt_routes(mut self, routes: PromptRoutes) -> Self {
+        if let StepForm::Grouped { prompt_routes } = &mut self.form {
+            *prompt_routes = Some(routes);
         }
         self
     }
@@ -1825,7 +1850,7 @@ impl ExpertStep {
     pub fn front(&self) -> u32 {
         match &self.form {
             StepForm::Decode(decode) => decode.launch.map_or(0, |launch| launch.front()),
-            StepForm::Grouped => 0,
+            StepForm::Grouped { .. } => 0,
         }
     }
 
@@ -1845,8 +1870,12 @@ impl ExpertStep {
     pub fn complete(mut self) -> Result<(), StepFailure> {
         let shared = &self.shared;
         let (group, begun) = shared.steps.begun(self.sequence);
+        let mut prompt = None;
         let route = match &mut self.form {
-            StepForm::Grouped => CompletedRoute::Grouped,
+            StepForm::Grouped { prompt_routes } => {
+                prompt = prompt_routes.take();
+                CompletedRoute::Grouped
+            }
             StepForm::Decode(decode) => CompletedRoute::Decode(Decoded {
                 domain: decode.domain,
                 recording: decode.recorded.take(),
@@ -1859,15 +1888,14 @@ impl ExpertStep {
         let completion = CompletedStep { work: self.work, begun, resized, route };
         let sequence = self.sequence;
         // Told as the step ends, once its group's reads are feedable.
-        self.ending = Ending::Completed(
-            match shared.telemetry.complete_step(&shared.steps, sequence, completion, &|layer| shared.compute.sited(layer, sequence), shared.priced().as_deref()) {
-                Ok(routed) => routed,
-                Err(error) => {
-                    shared.failed_completion(error);
-                    None
-                }
-            },
-        );
+        let decode = match shared.telemetry.complete_step(&shared.steps, sequence, completion, &|layer| shared.compute.sited(layer, sequence), shared.priced().as_deref()) {
+            Ok(routed) => routed,
+            Err(error) => {
+                shared.failed_completion(error);
+                None
+            }
+        };
+        self.ending = Ending::Completed { decode, prompt };
         if let Some(reason) = shared.life.ended() {
             shared.cancel_verify(self.sequence);
             return Err(StepFailure::Watcher(reason));
@@ -1943,7 +1971,7 @@ impl Drop for ExpertStep {
             self.shared.steps.lock().tainted.insert(self.sequence);
         }
         let ending = std::mem::replace(&mut self.ending, Ending::Unrun);
-        if matches!(ending, Ending::Unrun) {
+        if matches!(ending, Ending::Unrun) && !std::thread::panicking() {
             self.shared.cancel_verify(self.sequence);
         }
         self.shared.end_step(self.sequence, ending);
@@ -1996,16 +2024,25 @@ impl Shared {
             }
             self.telemetry.ended(ended);
         });
-        let completed = matches!(ending, Ending::Completed(_));
-        if let Ending::Completed(Some(DecodeRouting { chose, guesses, row_experts, physical_rows, layer_misses })) = ending {
-            self.tell(crate::experts::interest::Told::Completed {
-                step: sequence,
-                chose,
-                guesses,
-                row_experts,
-                physical_rows,
-                layer_misses,
-            });
+        let completed = matches!(ending, Ending::Completed { .. });
+        if let Ending::Completed { decode, prompt } = ending {
+            if let Some(DecodeRouting { chose, guesses, row_experts, physical_rows, layer_misses }) = decode {
+                self.tell(crate::experts::interest::Told::Completed {
+                    step: sequence,
+                    chose,
+                    guesses,
+                    row_experts,
+                    physical_rows,
+                    layer_misses,
+                });
+            }
+            if let Some(PromptRoutes { tokens, layer_routes, selected }) = prompt {
+                self.tell(crate::experts::interest::Told::PromptRoutes {
+                    tokens,
+                    layer_routes,
+                    selected,
+                });
+            }
         }
         // Told once the steps know it ended, so a ring of it read after this
         // is drained finds it ended (`Steps::of_low_word`).
@@ -2031,6 +2068,11 @@ impl ExpertStep {
         let shared = Self::unbanked(FlightDepth::PIPELINED, 1);
         let begun = shared.begin(Chain::one(()), |_| StepRoute::Decode, |_| LaunchWork::Generation, || Ok(false));
         let ((_, step), _) = begun.map_err(|(error, _)| error).unwrap().0.split_first();
+        shared.register_step(
+            step.sequence,
+            crate::experts::horizon::Advance::Known(crate::experts::horizon::Tokens::new(1.0)),
+            &[],
+        );
         step
     }
 
@@ -2072,6 +2114,7 @@ impl ExpertStep {
                 super::telemetry::GroupReadWords { layers: Vec::new(), places: 1 },
                 extents,
                 Arc::new(std::sync::atomic::AtomicU64::new(0)),
+                None,
                 Arc::new(std::sync::atomic::AtomicU64::new(0)),
                 Vec::new(),
                 None,
@@ -2107,6 +2150,7 @@ impl ExpertStep {
             prices: std::sync::Mutex::new(None),
             settled: Default::default(),
             transport: crate::experts::transport::ExpertTransport::new_registry_only(),
+            read_line: None,
             policy: Default::default(),
             promoted: Default::default(),
             copy: std::sync::Mutex::new(None),
@@ -2121,8 +2165,17 @@ mod slot_tests {
     fn begin(shared: &Arc<Shared>, labels: &[usize]) -> Vec<ExpertStep> {
         let mut chain = Chain::one(labels[0]);
         for &label in &labels[1..] { chain.push(label); }
-        shared.begin(chain, |_| StepRoute::Decode, |_| LaunchWork::Generation, || Ok(false))
-            .map_err(|(error, _)| error).unwrap().0.into_iter().map(|(_, step)| step).collect()
+        let steps: Vec<ExpertStep> = shared
+            .begin(chain, |_| StepRoute::Decode, |_| LaunchWork::Generation, || Ok(false))
+            .map_err(|(error, _)| error).unwrap().0.into_iter().map(|(_, step)| step).collect();
+        for step in &steps {
+            shared.register_step(
+                step.sequence,
+                crate::experts::horizon::Advance::Known(crate::experts::horizon::Tokens::new(1.0)),
+                &[],
+            );
+        }
+        steps
     }
 
     /// The load's traffic is held while any hold stands: each holder

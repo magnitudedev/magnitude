@@ -129,11 +129,9 @@ pub(super) fn block_routed(geometry: &Decoder, index: usize) -> Result<Option<&R
 
 /// How a block is served, which decides the stages its graphs are sealed in
 /// (`Self::stages`, `Self::sealed_stages`) and what its streamed layer's
-/// graphs build: whether the load streams its routed layer's experts and
-/// whether that layer has a resident form (`streamed::resident_form`),
-/// whether its prompt rows split (`RunStage::Front`), and whether its decode
-/// splits around the layer's on-demand landing (`RunStage::DecodeFront`) and
-/// its hits from its misses (`RunStage::DecodeHits`). Derived once, of the
+/// graphs build: whether the load streams its routed layer's experts,
+/// whether that layer has a resident form (`streamed::resident_form`), and
+/// whether its prompt rows split (`RunStage::Front`). Derived once, of the
 /// outline (`Self::of_blocks`), and held by each block's shape
 /// (`BlockGraphShape`), so blocks share layouts and plans only over one form.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -141,8 +139,6 @@ pub(super) struct ServedForm {
     pub(super) streams: bool,
     pub(super) resident: bool,
     pub(super) split: bool,
-    pub(super) decode_split: bool,
-    pub(super) decode_hits: bool,
 }
 
 impl ServedForm {
@@ -151,34 +147,23 @@ impl ServedForm {
     /// most `largest_rows` rows (`FamilyOutline::largest_rows`) and merge
     /// a chain's where `chain_merges` (`ResourceLimits::chain_capacity`).
     pub(super) fn of_blocks(
-        backend: BackendName,
+        _backend: BackendName,
         bank: Option<&crate::ExpertBankPlan>,
         geometry: &Decoder,
         largest_rows: u64,
         chain_merges: bool,
     ) -> Result<Vec<Self>, String> {
         let bank_resident = bank.is_some_and(|bank| bank.resident);
-        let bank_decode_dma = bank.is_some_and(|bank| bank.decode_dma(backend));
         let prompts = !crate::operators::routed::fused_graph::decodes(largest_rows);
         (0..geometry.blocks.len())
             .map(|index| {
                 let layer = bank.and_then(|bank| bank.block_layer(index));
                 let routed = block_routed(geometry, index)?;
                 let streams = layer.is_some();
-                let decode_split = streams && bank_decode_dma && routed.is_some();
-                let bank_decode_hits = bank
-                    .zip(layer)
-                    .is_some_and(|(bank, layer)| bank.sited(layer) && bank.splits_decode_hits(layer));
                 Ok(Self {
                     streams,
                     resident: streams && bank_resident,
                     split: prompts && (chain_merges || streams) && routed.is_some(),
-                    decode_split,
-                    decode_hits: decode_split
-                        && bank_decode_hits
-                        && routed.is_some_and(|routed| {
-                            crate::operators::routed::streamed::decode_hits_supported(routed, backend)
-                        }),
                 })
             })
             .collect()
@@ -190,21 +175,19 @@ impl ServedForm {
     }
 
     /// The stages its graphs of `rows` rows are sealed in
-    /// (`RunStage::sealed`): its runs' stages, its resident form, and its
-    /// decode split front/hits/back where active.
+    /// (`RunStage::sealed`): its runs' stages and its resident form.
     pub(super) fn sealed_stages(self, rows: u64) -> &'static [RunStage] {
-        RunStage::sealed(self.split, self.resident, self.decode_split, self.decode_hits, rows)
+        RunStage::sealed(self.split, self.resident, rows)
     }
 }
 
 /// How a block is served (`ServedForm`), with the values its split layer
-/// crosses and merges over the chain's rows and those its decode split
-/// crosses, each present exactly where its form splits.
+/// crosses and merges over the chain's rows, present exactly where its form
+/// splits.
 #[derive(Clone, Debug)]
 pub(super) struct BlockServed {
     pub(super) form: ServedForm,
     pub(super) split: Option<SplitValues<Extents>>,
-    pub(super) decode_crossing: Option<crate::operators::routed::split::DecodeCrossingBuffers<Extents>>,
 }
 
 /// Each block's `BlockServed`, of its form in `outline`
@@ -228,13 +211,6 @@ pub(super) fn block_served(
                 split: split_routed(form.split)
                     .map(|routed| SplitValues::of(routed, geometry, outline.chain_rows, passes.rows()))
                     .transpose()?,
-                decode_crossing: split_routed(form.decode_split).map(|routed| {
-                    crate::operators::routed::split::DecodeCrossingBuffers::of(
-                        routed,
-                        geometry,
-                        magnitude_kernels::constants::VERIFY_ROWS,
-                    )
-                }),
             })
         })
         .collect()

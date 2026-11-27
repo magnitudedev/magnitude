@@ -332,7 +332,19 @@ impl LinkMover {
                 }
             }
         }
-        if !pause_promote && !defer_promote(admission, shared.transport.demand_active(), drive_in_flight) {
+        let coupled_blocking = shared.transport.demand_active()
+            || (admission.host_memory_binds()
+                && copier
+                    .copies
+                    .plane()
+                    .has_coupled_blocking_waiting(crate::experts::copies::LINK_H2D));
+        if !pause_promote
+            && magnitude_cost_model::WallModel::admits_background_promote(
+                admission,
+                coupled_blocking,
+                drive_in_flight,
+            )
+        {
             moved |= self.ask(core, shared, copier, &copy, progress);
             let mut queued = core.directory.queued();
             queued.retain(|&(group, record, (layer, expert))| {
@@ -490,6 +502,13 @@ impl LinkMover {
                                 continue;
                             }
                             let target_step = if step < frontier || core.steps.ended(step) { next_step } else { step };
+                            // Never stage an expert for a `(target_step, layer)`
+                            // already past `progress`: `drain_staging_with` would
+                            // immediately drain it on completion, causing an
+                            // infinite re-issue PCIe copy storm.
+                            if core.steps.step_served(target_step, layer, progress) {
+                                continue;
+                            }
                             let Some(slot) = core.directory.free_stage_slot_with(group, target_step, |slot| {
                                 shared
                                     .transport
@@ -752,15 +771,6 @@ fn post_back(
     };
     directory.back_copy(group, record, ticket);
     Ok(true)
-}
-
-/// Whether `LinkMover::advance` should defer `TransferPriority::Promote`
-/// copies so they do not contend on a binding Link or shared `HostMemory`
-/// domain with active decode demand DMA or in-flight Drive reads/landings.
-/// `TransferPriority::WriteBack` is never gated by this check so releases and
-/// prompt leases can never deadlock.
-fn defer_promote(admission: PathAdmission, demand_active: bool, drive_in_flight: usize) -> bool {
-    admission.binds() && (demand_active || (admission.host_memory_binds() && drive_in_flight > 0))
 }
 
 /// Remaining permanent copy-engine promotion budget, excluding in-flight
@@ -1030,7 +1040,10 @@ mod tests {
     /// `defer_promote`, preventing deadlock).
     #[test]
     fn host_memory_binds_defers_promote_during_demand_or_drive_flight_without_blocking_writeback() {
-        use super::defer_promote;
+        let admits = |adm, demand, drive| {
+            magnitude_cost_model::WallModel::admits_background_promote(adm, demand, drive)
+        };
+        let defer_promote = |adm, demand, drive| !admits(adm, demand, drive);
         use crate::experts::transport::ExpertTransport;
 
         let bytes = 8_000_000u64;

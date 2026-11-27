@@ -302,7 +302,7 @@ mod tests {
         assert!(call.compute_bound());
         assert_eq!(call.compute, 8.0 * 8e9 / 2e12);
         assert_eq!(call.total(), call.compute + call.launch);
-        assert!(step(&demand, &costs, true, 9, 1_000).is_err());
+        assert!(step(&demand, &costs, true, magnitude_kernels::constants::VERIFY_ROWS + 1, 1_000).is_err());
         assert!(step(&demand, &costs, true, 0, 1_000).is_err());
     }
 

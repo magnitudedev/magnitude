@@ -1270,14 +1270,47 @@ struct DriveClock {
     burst_wall_ns: u64,
     active_since: Option<Instant>,
     active_ns: u64,
+    /// Instant when the last in-flight demand read for a layer finished during
+    /// an active decode step, cleared when the next layer's `FILE_REQUEST`
+    /// arrives or the decode step ends. Measuring demand-idle -> next-request
+    /// avoids feedback collapse when speculative reads fill the gap.
+    demand_idle_since: Option<Instant>,
+    /// Smoothed EWMA (seconds) of the per-layer inter-park compute gap between
+    /// layer `L`'s last demand read finishing and layer `L+1`'s `FILE_REQUEST`.
+    c_layer_tail_ewma: Option<f64>,
 }
 
 impl DriveClock {
+    /// EWMA smoothing factor for per-layer inter-park compute gap `c_layer_tail`.
+    const LAYER_TAIL_ALPHA: f64 = 0.25;
+    /// Upper bound (50 ms) on a single inter-layer compute gap sample to reject
+    /// scheduler pauses or inter-request spans.
+    const MAX_LAYER_TAIL_SECS: f64 = 0.050;
+
     fn is_burst_active(&self) -> bool {
         self.active_decode_steps > 0 || self.in_draft_window
     }
 
+    fn is_decode_active(&self) -> bool {
+        self.active_decode_steps > 0 && !self.in_draft_window
+    }
+
+    fn observe_layer_tail(&mut self, now: Instant) {
+        if let Some(since) = self.demand_idle_since.take() {
+            let gap = now.saturating_duration_since(since).as_secs_f64();
+            if gap > 0.0 && gap <= Self::MAX_LAYER_TAIL_SECS {
+                self.c_layer_tail_ewma = Some(match self.c_layer_tail_ewma {
+                    Some(prev) => prev * (1.0 - Self::LAYER_TAIL_ALPHA) + gap * Self::LAYER_TAIL_ALPHA,
+                    None => gap,
+                });
+            }
+        }
+    }
+
     fn sync_burst(&mut self, now: Instant, reads_active: bool) {
+        if !self.is_decode_active() {
+            self.demand_idle_since = None;
+        }
         if self.is_burst_active() {
             if self.burst_since.is_none() {
                 self.burst_since = Some(now);
@@ -1477,6 +1510,7 @@ impl RequestEngagementDelta {
 /// and once per completed request for delta snapshotting).
 pub(super) struct DriveEngagement {
     active_reads: AtomicUsize,
+    active_demand_reads: AtomicUsize,
     clock: Mutex<DriveClock>,
     last_request: Mutex<RequestBaseline>,
     bytes_hidden: AtomicU64,
@@ -1498,6 +1532,7 @@ impl Default for DriveEngagement {
     fn default() -> Self {
         Self {
             active_reads: AtomicUsize::new(0),
+            active_demand_reads: AtomicUsize::new(0),
             clock: Mutex::new(DriveClock::default()),
             last_request: Mutex::new(RequestBaseline::default()),
             bytes_hidden: AtomicU64::new(0),
@@ -1562,6 +1597,49 @@ impl DriveEngagement {
                 clock.active_ns = clock.active_ns.saturating_add(since.elapsed().as_nanos().min(u64::MAX as u128) as u64);
             }
         }
+    }
+
+    /// Number of drive reads currently in flight (demand + ahead).
+    pub(super) fn active_reads(&self) -> usize {
+        self.active_reads.load(Ordering::Acquire)
+    }
+
+    /// Record a demand drive read starting (paired 1:1 with [`Self::demand_read_finished`]).
+    pub(super) fn demand_read_started(&self) {
+        self.active_demand_reads.fetch_add(1, Ordering::AcqRel);
+        self.read_started();
+    }
+
+    /// Record a demand drive read finishing (paired 1:1 with [`Self::demand_read_started`]).
+    /// When the last in-flight demand read for a layer finishes during active
+    /// decode, marks the start of the inter-park compute gap `c_layer_tail`.
+    pub(super) fn demand_read_finished(&self) {
+        let prev_demand = self.active_demand_reads.fetch_sub(1, Ordering::AcqRel);
+        debug_assert!(prev_demand > 0, "invariant violated: DriveEngagement::demand_read_finished without matching demand_read_started");
+        if prev_demand == 1 {
+            let mut clock = self.clock.lock().expect("drive engagement clock");
+            if clock.is_decode_active() {
+                clock.demand_idle_since = Some(Instant::now());
+            }
+        }
+        self.read_finished();
+    }
+
+    /// Record a new layer's `FILE_REQUEST` arriving at `now`, closing any
+    /// open inter-park compute gap from the previous layer's last demand read.
+    pub(super) fn on_layer_request(&self, now: Instant) {
+        let mut clock = self.clock.lock().expect("drive engagement clock");
+        if clock.is_decode_active() {
+            clock.observe_layer_tail(now);
+        } else {
+            clock.demand_idle_since = None;
+        }
+    }
+
+    /// Smoothed live per-layer inter-park compute gap `c_layer_tail` in seconds
+    /// (`0.0` before the first inter-layer gap is observed).
+    pub(super) fn c_layer_tail(&self) -> f64 {
+        self.clock.lock().expect("drive engagement clock").c_layer_tail_ewma.unwrap_or(0.0)
     }
 
     /// Record a demand-stalled miss (`bytes_exposed`).
@@ -2022,10 +2100,14 @@ pub(super) struct Telemetry {
     /// (`Reuse::far_deciles`).
     ranking: Ranking,
     recorded: Mutex<Recorded>,
-    /// The slots each layer commits, as the bank commits them
-    /// (`Commitment::slots`, its one owner): every resize of every
-    /// placer's, as it happens.
+    /// Raw 1D bank coordinate committed by the bank (`Commitment::slots`, its
+    /// one owner): every resize of every placer's, as it happens. Mapped to
+    /// per-layer target VRAM slots via `target_vram_slots` before reporting.
     slots: Arc<AtomicU64>,
+    /// Precomputed lookup mapping raw 1D bank coordinate `slots` to mean
+    /// per-layer target VRAM slots (`0..=widest`); `None` when raw `slots` is
+    /// already a per-layer count (single-group / test harnesses).
+    target_vram_slots: Option<Arc<[u64]>>,
     /// The host slots each layer commits, as the host tier commits them
     /// (`HostTier::commitment.slots`, its one owner); always 0 without a host tier.
     host_slots: Arc<AtomicU64>,
@@ -2071,7 +2153,10 @@ pub(super) struct Telemetry {
     /// Cumulative `seismic_io::Totals` across `LaunchWork::Generation` steps
     /// only, keeping `Telemetry::line()` pure decode bandwidth (unpolluted by
     /// weight import or prompt prefill).
-    decode_storage: Mutex<seismic_io::Totals>,
+    /// Sliding window of the last `DECODE_STORAGE_WINDOW` decode steps' volume
+    /// totals so `Telemetry::line()` tracks live active SSD throughput instead
+    /// of being anchored to stale cold-start or load-time probe rates.
+    decode_storage: Mutex<VecDeque<seismic_io::Totals>>,
     /// The break-even reads ahead are admitted at in place of the measured
     /// one ([`Self::admit_at`]).
     #[cfg(test)]
@@ -2270,11 +2355,13 @@ impl Telemetry {
     /// committing the bank's `slots` slots and each group `records` records,
     /// each layer's pull of `resident`
     /// bytes where prompt groups pull from a host tier, nothing recorded.
+    #[allow(clippy::too_many_arguments)]
     pub(super) fn new(
         layers: &[Layer],
         reads: GroupReadWords,
         extents: Extents,
         slots: Arc<AtomicU64>,
+        target_vram_slots: Option<Arc<[u64]>>,
         host_slots: Arc<AtomicU64>,
         records: Vec<usize>,
         resident: Option<Vec<u64>>,
@@ -2356,6 +2443,7 @@ impl Telemetry {
                 records,
             }),
             slots,
+            target_vram_slots,
             host_slots,
             live_steps: AtomicU64::new(0),
             stack: Mutex::new(stack),
@@ -2367,7 +2455,7 @@ impl Telemetry {
             feedable: AtomicU64::new(0),
             resize_generation: AtomicU64::new(0),
             storage_baseline,
-            decode_storage: Mutex::new(seismic_io::Totals::default()),
+            decode_storage: Mutex::new(VecDeque::with_capacity(16)),
             #[cfg(test)]
             even: Mutex::new(None),
             spans,
@@ -2388,9 +2476,16 @@ impl Telemetry {
             .and_then(|stats| stats.lock().expect("route stats").take_summary_line(residency))
     }
 
+    fn target_slots(&self, raw: u64) -> u64 {
+        match &self.target_vram_slots {
+            Some(table) if !table.is_empty() => table[(raw as usize).min(table.len() - 1)],
+            _ => raw,
+        }
+    }
+
     pub(super) fn residency(&self) -> ResidencySnapshot {
         ResidencySnapshot {
-            vram_slots: self.slots.load(Ordering::Relaxed),
+            vram_slots: self.target_slots(self.slots.load(Ordering::Relaxed)),
             host_slots: self.host_slots.load(Ordering::Relaxed),
             total_experts: self.routing.experts.first().copied().unwrap_or(0) as u64,
             ..Default::default()
@@ -2433,7 +2528,14 @@ impl Telemetry {
     /// below none and its rate is a busy volume's, so that is an invariant
     /// violation.
     pub(super) fn line(&self) -> Option<ReadLine> {
-        let decode_line = self.decode_storage.lock().expect("watcher decode storage").line();
+        let decode_line = self
+            .decode_storage
+            .lock()
+            .expect("watcher decode storage")
+            .iter()
+            .copied()
+            .sum::<seismic_io::Totals>()
+            .line();
         let line = decode_line.or_else(|| {
             self.routing
                 .volumes
@@ -2566,9 +2668,9 @@ impl Telemetry {
         }
     }
 
-    /// The slots the bank commits.
+    /// Mean per-layer target VRAM slots the bank commits.
     fn slots(&self) -> usize {
-        usize::try_from(self.slots.load(Ordering::Acquire)).expect("bank slots fit the host")
+        usize::try_from(self.target_slots(self.slots.load(Ordering::Acquire))).expect("bank slots fit the host")
     }
 
     /// Each group's decode capacity is `records` from now
@@ -3022,10 +3124,15 @@ impl Telemetry {
                 }
                 cost.storage = self.delivered(costs);
                 {
-                    let mut decode_storage = self.decode_storage.lock().expect("watcher decode storage");
-                    *decode_storage = std::iter::once(*decode_storage)
-                        .chain(cost.storage.iter().map(|&(_, span)| span))
-                        .sum();
+                    const DECODE_STORAGE_WINDOW: usize = 16;
+                    let step_totals: seismic_io::Totals = cost.storage.iter().map(|&(_, span)| span).sum();
+                    if step_totals.busy > 0.0 {
+                        let mut decode_storage = self.decode_storage.lock().expect("watcher decode storage");
+                        if decode_storage.len() >= DECODE_STORAGE_WINDOW {
+                            decode_storage.pop_front();
+                        }
+                        decode_storage.push_back(step_totals);
+                    }
                 }
                 let line = self.line();
                 let (used, used_bytes) = std::mem::take(&mut costs.used_ahead);
@@ -3946,7 +4053,11 @@ mod tests {
         close(service.link, 0.5e-3 + 2. * 86e-6);
         close(service.cpu, 50e-6);
         close(service.memory, (3. + 1.) * 38e-6 + 4. * 38e-6 * 2. / 3.);
-        close(service.served, 84e-6 - 40e-6);
+        // Under shared HostRam contention (`memory = 38 µs`, `link = 86 µs`),
+        // `effective_cpu()` throttles CPU to `t_spare ≈ 68.1 µs`, so 2 misses
+        // split 1 on GPU link (`30 + 86 = 116 µs`) + 1 on CPU (`4 + 68.1 = 72.1 µs`),
+        // exposing `116 - 30 = 86 µs`.
+        close(service.served, 86e-6);
 
         // Hidden Drive prefetch landings and LinkMover staged records also
         // consume shared HostMemory bandwidth.
@@ -4357,6 +4468,27 @@ mod served_tests {
         engagement.on_decode_began(t0);
         engagement.on_decode_ended(t0 + std::time::Duration::from_millis(10));
         assert_eq!(engagement.drive_busy_fraction(), Some(0.0));
+    }
+
+    #[test]
+    fn c_layer_tail_measures_demand_idle_gap_even_when_speculative_reads_overlap() {
+        let engagement = super::DriveEngagement::default();
+        assert_eq!(engagement.c_layer_tail(), 0.0);
+        let t0 = std::time::Instant::now();
+        engagement.on_decode_began(t0);
+        // Layer L demand read starts and finishes.
+        engagement.demand_read_started();
+        engagement.demand_read_finished();
+        assert_eq!(engagement.active_reads(), 0);
+        // Speculative ahead read runs during the inter-layer compute gap.
+        engagement.read_started();
+        assert_eq!(engagement.active_reads(), 1);
+        // Layer L+1 FILE_REQUEST arrives 2 ms after layer L demand finished.
+        engagement.on_layer_request(std::time::Instant::now() + std::time::Duration::from_millis(2));
+        engagement.read_finished();
+        let tail = engagement.c_layer_tail();
+        assert!((1.5e-3..=5.0e-3).contains(&tail), "expected ~2 ms inter-layer tail despite overlapping ahead read, got {tail}");
+        engagement.on_decode_ended(std::time::Instant::now());
     }
 
     /// Fix 3: `Feed::flush_verify` holds a completed speculative verify step

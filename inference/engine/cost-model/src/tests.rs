@@ -390,22 +390,23 @@ fn bank_prices_step_accounts_for_host_tier_and_prompt_uses_group_stage() {
     let rates = WorkloadRates::prior(0.012, 100., 512., 0.1);
     let prices = BankPrices::new(layers, pass, routed, 1, read, compute, rates, 256, 512, 8);
 
-    // Host tier holds all 32 experts while VRAM holds 8: decode step is strictly
-    // faster with host tier credited than with `HeldSlots::bank(8)` (file misses).
-    let with_host = HeldSlots { slots: 8, host: 32 };
+    // Host tier holds all 24 remaining experts (disjoint from the 8 in VRAM):
+    // decode step is strictly faster with host tier credited than with
+    // `HeldSlots::bank(8)` (file misses).
+    let with_host = HeldSlots::tiered(8, 24);
     let without_host = HeldSlots::bank(8);
     assert!(
-        prices.step_seconds(with_host) < prices.step_seconds(without_host),
+        prices.step_seconds(&with_host) < prices.step_seconds(&without_host),
         "host tier must reduce decode step time: {} vs {}",
-        prices.step_seconds(with_host),
-        prices.step_seconds(without_host)
+        prices.step_seconds(&with_host),
+        prices.step_seconds(&without_host)
     );
 
     // Prompt seconds at 2 launches (512 rows, 1 pass) equals routed compute
     // (the whole-bank prompt seconds) plus `Pass::Group` staging of the 24
     // host-tier misses per layer.
-    let whole_prompt = prices.prompt_seconds(2, HeldSlots::bank(32));
-    let tiered_prompt = prices.prompt_seconds(2, with_host);
+    let whole_prompt = prices.prompt_seconds(2, &HeldSlots::bank(32));
+    let tiered_prompt = prices.prompt_seconds(2, &with_host);
     let expected_stage = 2. * lines.group_stage(&read, 24, 0);
     close(tiered_prompt - whole_prompt, expected_stage);
 }
@@ -429,17 +430,21 @@ fn path_records_scales_ahead_for_multi_row_verify_without_inflating_reserve() {
     let held = HeldSlots::bank(355);
 
     let saturation_bytes = 32 * 1024 * 1024u64;
-    let single = layers.path_records(read, compute, record_bytes, held, num_layers as u64, 1, saturation_bytes).unwrap();
-    let verify = layers.path_records(read, compute, record_bytes, held, num_layers as u64, 8, saturation_bytes).unwrap();
+    let single = layers.path_records(read, compute, record_bytes, &held, num_layers as u64, 1, saturation_bytes).unwrap();
+    let verify = layers.path_records(read, compute, record_bytes, &held, num_layers as u64, 8, saturation_bytes).unwrap();
 
     let expected_knee = saturation_bytes.div_ceil(record_bytes);
+    assert!(
+        single.ahead >= expected_knee,
+        "single-row decode must also size ahead >= volume storage saturation knee ({expected_knee}): single={single:?}"
+    );
     assert!(
         verify.ahead >= expected_knee,
         "multi-row verify must size ahead >= volume storage saturation knee ({expected_knee}): verify={verify:?}"
     );
     assert!(
-        verify.ahead > single.ahead,
-        "multi-row verify must size more ahead staging records than M=1: verify={verify:?} single={single:?}"
+        verify.ahead >= single.ahead,
+        "multi-row verify must size at least as many ahead staging records as M=1: verify={verify:?} single={single:?}"
     );
     assert!(
         verify.reserve >= verify.ahead,
@@ -480,8 +485,8 @@ fn release_load_bounds_reserve_by_actual_step_misses() {
     let compute = FormSeconds { resident: 0.060, streamed: 0.065 };
     let held = HeldSlots::bank(66);
     let saturation_bytes = 32 * 1024 * 1024u64;
-    let single = layers.path_records(read, compute, record_bytes, held, num_layers as u64, 1, saturation_bytes).unwrap();
-    let verify = layers.path_records(read, compute, record_bytes, held, num_layers as u64, 4, saturation_bytes).unwrap();
+    let single = layers.path_records(read, compute, record_bytes, &held, num_layers as u64, 1, saturation_bytes).unwrap();
+    let verify = layers.path_records(read, compute, record_bytes, &held, num_layers as u64, 4, saturation_bytes).unwrap();
     // Old formula on compute=65ms, transfer=0.75ms gave reserve >= 40;
     // release_load keeps single.reserve strictly bounded by actual step misses.
     assert!(

@@ -665,8 +665,8 @@ pub fn finish_model_assessment(
                     execution,
                     bank,
                     &request,
-                    shares.held(shares.slots()),
-                    shares.held(shares.floor()),
+                    bank.held_slots(bank.slots, bank.host_slots),
+                    bank.held_slots_runtime(bank.floor(), bank.host_slots),
                     priced_bank.as_ref(),
                 )?;
                 ModelResidency::Streamed {
@@ -792,14 +792,14 @@ fn streamed_estimates<const N: usize>(
     let seq_u64 = u64::from(request.sequences);
     let seq_f64 = f64::from(request.sequences);
     let read = figures.read;
-    let mut unique_holdings = Vec::with_capacity(N);
+    let mut unique_holdings: Vec<&magnitude_cost_model::HeldSlots> = Vec::with_capacity(N);
     let mut holding_index = [0usize; N];
     for i in 0..N {
-        holding_index[i] = if let Some(prev) = holdings[..i].iter().position(|&h| h == holdings[i]) {
+        holding_index[i] = if let Some(prev) = holdings[..i].iter().position(|h| h == &holdings[i]) {
             holding_index[prev]
         } else {
             let idx = unique_holdings.len();
-            unique_holdings.push(holdings[i]);
+            unique_holdings.push(&holdings[i]);
             idx
         };
     }

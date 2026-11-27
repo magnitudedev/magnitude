@@ -258,6 +258,10 @@ impl BankPart {
 pub enum BankAllocation {
     /// Host-shared (`Tensor::shared`): its bytes.
     Shared { element: Element, extents: Vec<u64> },
+    /// Host-shared padded records (`Tensor::shared_records`): leading-axis
+    /// records spaced `slot_bytes` apart for aligned zero-bounce direct I/O
+    /// while binding to native record ports with logical shape `extents`.
+    SharedRecords { element: Element, extents: Vec<u64>, slot_bytes: u64 },
     /// Coherent words the host and the device exchange (`Tensor::words`):
     /// its bytes.
     Words { element: Element, extents: Vec<u64> },
@@ -456,6 +460,11 @@ impl BankAllocation {
             Self::Shared { element, extents } | Self::Words { element, extents } | Self::Protocol { element, extents } => {
                 ClaimDemand { shared: representation_bytes(*element, extents)?, ..ClaimDemand::default() }
             }
+            Self::SharedRecords { extents, slot_bytes, .. } => {
+                let count = extents.first().copied().unwrap_or(0);
+                let bytes = count.checked_mul(*slot_bytes).ok_or_else(|| "shared records bytes overflow".to_owned())?;
+                ClaimDemand { shared: bytes, ..ClaimDemand::default() }
+            }
             Self::Device { element, extents } => ClaimDemand { device: representation_bytes(*element, extents)?, ..ClaimDemand::default() },
             Self::Imported(scale) => ClaimDemand { device: scale.resident_bytes, ..ClaimDemand::default() },
             Self::Records { .. } => ClaimDemand::default(),
@@ -485,8 +494,9 @@ pub struct BankLayout<T> {
     pub load: LoadAllocations<T>,
     pub groups: Vec<GroupAllocations<T>>,
     pub layers: Vec<LayerAllocations<T>>,
-    /// Each staging pool (`ExpertBankPlan::staging_pools`).
-    pub staging: Vec<T>,
+    /// One unified byte-typed staging buffer per routed tensor (`RecordForm`),
+    /// shared across every quant/shape staging pool of that tensor kind.
+    pub staging: RecordTensors<T>,
     /// Each group's host tier record tensors, where the bank has a tier
     /// (`ExpertBankPlan::host`).
     pub host: Option<Vec<RecordTensors<T>>>,
@@ -681,7 +691,7 @@ impl<T> BankLayout<T> {
             owned.extend([("layer: tier list", tiered), ("layer: seeds", seeds)]);
             owned.extend(windows.iter().map(|w| ("layer: window table", w)));
         }
-        owned.extend(staging.iter().map(|pool| ("staging", pool)));
+        owned.extend(staging.iter().map(|(_, pool)| ("staging", pool)));
         owned.extend(host.iter().flatten().flat_map(|tier| tier.iter().map(|(_, records)| ("host tier", records))));
         owned.extend(lent.iter().flat_map(|lent| lent.iter().map(|(_, records)| ("lent records", records))));
         owned
@@ -736,7 +746,7 @@ impl<T> BankLayout<T> {
                 windows: layer.windows.iter().map(&mut make).collect::<Result<Vec<_>, E>>()?,
             });
         }
-        let staging = self.staging.iter().map(&mut make).collect::<Result<Vec<_>, E>>()?;
+        let staging = each(&self.staging, &mut make)?;
         let host = match &self.host {
             Some(tiers) => Some(tiers.iter().map(|tier| each(tier, &mut make)).collect::<Result<Vec<_>, E>>()?),
             None => None,
@@ -968,16 +978,7 @@ impl ExpertBankPlan {
             grids: device(0, BankPart::ScratchGrids)?,
             window: (0..self.windows()).map(|_| device(0, BankPart::Window)).collect::<Result<Vec<_>, String>>()?,
         };
-        let (staging_pools, pool_of) = self.staging_pools();
-        let pool_hints = self.structure().pool_has_target(&pool_of, staging_pools.len());
-        let staging = staging_pools
-            .iter()
-            .zip(pool_hints)
-            .map(|(pool, has_hints)| {
-                let count = self.pool_staging_records_with_paths(has_hints, self.paths);
-                self.staging_allocation(pool, count)
-            })
-            .collect::<Result<Vec<_>, String>>()?;
+        let staging = self.unified_staging_allocations(self.paths)?;
         let host = self.tiered().then(|| {
             self.groups()
                 .iter()
@@ -1132,10 +1133,7 @@ impl ExpertBankPlan {
                 .checked_plus(commits.storage_demand(self.host())?)
                 .ok_or_else(|| "bank paths storage demand overflows".to_owned())?;
         }
-        let (staging_pools, pool_of) = self.staging_pools();
-        let pool_hints = self.structure().pool_has_target(&pool_of, staging_pools.len());
-        for (pool, has_hints) in staging_pools.iter().zip(pool_hints) {
-            let staging = self.staging_allocation(pool, self.pool_staging_records_with_paths(has_hints, paths))?;
+        for (_, staging) in self.unified_staging_allocations(paths)?.iter() {
             total = total
                 .checked_plus(staging.storage_demand(self.host())?)
                 .ok_or_else(|| "bank staging storage demand overflows".to_owned())?;
@@ -1143,41 +1141,61 @@ impl ExpertBankPlan {
         Ok(total)
     }
 
-    /// Bytes per staging record slot for `pool`: on `Placer::Tier` (discrete
-    /// GPUs where the host converts staging into `HostTier` and `routed_land`
-    /// never binds `BankPart::Staging`), includes `ALIGNED_HEADROOM + ALIGNMENT`
-    /// rounded up to `ALIGNMENT` so every staging record lands 100% zero-bounce
-    /// via `AlignedRange`; on `Placer::Bank` (unified memory where `routed_land`
-    /// binds `BankPart::Staging` directly), keeps the exact `pool.record_bytes()`.
+    /// Bytes per staging record slot for `pool`: includes
+    /// `ALIGNED_HEADROOM + ALIGNMENT` rounded up to `ALIGNMENT` on both
+    /// `Placer::Tier` and `Placer::Bank` so every staging record lands 100%
+    /// zero-bounce via `AlignedRange` (`ReadAlignment::AllowAlignedLead`).
     pub fn staging_slot_bytes(&self, pool: &super::StagingPool) -> Result<u64, String> {
         let base = pool.record_bytes()?;
-        if self.placer() == Placer::Tier {
-            let headroom = seismic_io::ALIGNED_HEADROOM as u64 + seismic_io::ALIGNMENT;
-            let padded = base
-                .checked_add(headroom)
-                .ok_or_else(|| "staging slot bytes overflow".to_owned())?;
-            Ok(padded.next_multiple_of(seismic_io::ALIGNMENT))
-        } else {
-            Ok(base)
-        }
+        let headroom = seismic_io::ALIGNED_HEADROOM as u64 + seismic_io::ALIGNMENT;
+        let padded = base
+            .checked_add(headroom)
+            .ok_or_else(|| "staging slot bytes overflow".to_owned())?;
+        Ok(padded.next_multiple_of(seismic_io::ALIGNMENT))
     }
 
-    /// The `BankAllocation` for `pool`'s staging buffer of `records` slots,
-    /// shared between [`Self::layout`] and [`Self::paths_layout_demand`] so
-    /// memory budgeting and allocation have a single owner.
-    fn staging_allocation(&self, pool: &super::StagingPool, records: u64) -> Result<BankAllocation, String> {
-        if self.placer() == Placer::Tier {
-            let slot_bytes = self.staging_slot_bytes(pool)?;
+    /// Unified staging slot stride (bytes) for routed tensor `kind`: the
+    /// maximum [`Self::staging_slot_bytes`] across every quant/shape staging
+    /// pool of `kind`, aligned to both `seismic_io::ALIGNMENT` and every
+    /// pool's canonical representation alignment so every quant form can bind
+    /// a zero-copy strided view (`Tensor::carried_records`) over the same
+    /// backing buffer.
+    pub fn unified_staging_slot_bytes(&self, kind: RoutedTensor) -> Result<u64, String> {
+        let (staging_pools, _) = self.staging_pools();
+        let mut max_bytes = 0u64;
+        let mut max_align = seismic_io::ALIGNMENT.max(4);
+        for pool in staging_pools.iter().filter(|pool| pool.kind == kind) {
+            max_bytes = max_bytes.max(self.staging_slot_bytes(pool)?);
+            let (_, alignment) =
+                seismic::Tensor::canonical_layout(pool.source, &[1, pool.matrix[0], pool.matrix[1]])
+                    .map_err(|error| format!("{} staging layout: {error}", pool.source.name()))?;
+            max_align = max_align.max(alignment.max(1));
+        }
+        Ok(max_bytes.next_multiple_of(max_align))
+    }
+
+    /// Slot count of the unified staging pool at `paths`: includes
+    /// `ahead` hint records whenever at least one target (non-draft) layer
+    /// exists; draft-only banks hold `demand_records()` only.
+    pub fn unified_staging_records_with_paths(&self, paths: BankPaths) -> u64 {
+        let has_target = self.layers().iter().any(|layer| !layer.is_draft());
+        self.pool_staging_records_with_paths(has_target, paths)
+    }
+
+    /// Unified byte-typed staging allocations (one per routed tensor in
+    /// [`Self::form`]), shared between [`Self::layout`] and
+    /// [`Self::paths_layout_demand`] so memory budgeting and allocation have a
+    /// single owner.
+    fn unified_staging_allocations(&self, paths: BankPaths) -> Result<RecordTensors<BankAllocation>, String> {
+        let records = self.unified_staging_records_with_paths(paths);
+        self.form().each(|kind| {
+            let slot_bytes = self.unified_staging_slot_bytes(kind)?;
             debug_assert!(slot_bytes.is_multiple_of(4));
-            Ok(BankAllocation::Shared {
+            Ok(BankAllocation::SharedRecords {
                 element: Element::i32(),
                 extents: vec![records, slot_bytes / 4],
+                slot_bytes,
             })
-        } else {
-            Ok(BankAllocation::Shared {
-                element: pool.source,
-                extents: vec![records, pool.matrix[0], pool.matrix[1]],
-            })
-        }
+        })
     }
 }

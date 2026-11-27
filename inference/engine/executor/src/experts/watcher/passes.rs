@@ -208,6 +208,18 @@ impl horizon::Tally for Sums {
 /// holds past an exact row.
 pub(crate) const DEPTHS: usize = magnitude_kernels::constants::VERIFY_ROWS as usize;
 
+/// Minimum number of verify pass samples at a depth before empirical verify
+/// compute overrides the `LaunchPrices`-scaled front/plain prior. Prevents a
+/// single cold first-ever `Verify(1)` pass from permanently poisoning verify
+/// pricing across all depths.
+pub(crate) const MIN_VERIFY_SAMPLES: u64 = 2;
+
+/// Number of consecutive plain decode passes (`depth == 0, !verifies`) after
+/// which `TwoRowPricing` re-probes `Verify(1)` and `Passes` clears stale
+/// verify compute samples so a transient spike cannot permanently lock out
+/// speculative drafting.
+pub(crate) const PLAIN_REPROBE_INTERVAL: u64 = 16;
+
 impl AddAssign for Sums {
     fn add_assign(&mut self, other: Self) {
         self.add(&other);
@@ -221,6 +233,7 @@ impl AddAssign for Sums {
 pub(super) struct Passes {
     time: Time,
     latest: Option<(RegimeEpoch, Pass)>,
+    plain_streak: u64,
     all: RegimeWindow<Sums>,
     sums: [Box<[RegimeWindow<Sums>]>; 2],
 }
@@ -263,6 +276,8 @@ pub struct Measured {
     pub verifying: bool,
     pub terms: [Option<Terms>; DEPTHS],
     pub verify_terms: [Option<Terms>; DEPTHS],
+    pub verify_samples: [u64; DEPTHS],
+    pub plain_streak: u64,
     pub paths: Option<Vec<magnitude_cost_model::PathTerm>>,
     pub stall: Option<f64>,
     pub front_stall: [Option<f64>; FRONT_DEPTHS],
@@ -276,12 +291,23 @@ pub struct Measured {
 
 impl Measured {
     /// Mean terms for `(verify, depth)`: verify passes use their own form's
-    /// measurements and extrapolate from front passes when verify has no
-    /// samples yet at `depth`.
+    /// measurements once proven (`>= MIN_VERIFY_SAMPLES`) and otherwise
+    /// extrapolate from front/plain passes so a single cold first-ever
+    /// `Verify(1)` pass cannot permanently poison verify pricing.
     pub fn terms_for(&self, verify: bool, depth: usize) -> Option<Terms> {
         match verify {
             false => self.terms[depth],
-            true => self.verify_terms[depth].or(self.terms[depth]),
+            true => {
+                if self.verify_samples[depth] >= MIN_VERIFY_SAMPLES {
+                    self.verify_terms[depth].or(self.terms[depth])
+                } else {
+                    self.terms[depth].or_else(|| {
+                        (!self.terms.iter().any(Option::is_some))
+                            .then_some(self.verify_terms[depth])
+                            .flatten()
+                    })
+                }
+            }
         }
     }
 
@@ -304,6 +330,7 @@ impl Passes {
         Self {
             time,
             latest: None,
+            plain_streak: 0,
             all: RegimeWindow::new(regime, epoch),
             sums: std::array::from_fn(|_| (0..DEPTHS).map(|_| RegimeWindow::new(regime, epoch)).collect()),
         }
@@ -319,6 +346,22 @@ impl Passes {
     pub fn timed(&mut self, pass: Pass) {
         assert!(pass.depth < DEPTHS, "a pass of depth {} past the decode form's rows", pass.depth);
         let (regime, epoch) = self.regime_and_epoch();
+        if self.latest.is_some_and(|(prev_regime, _)| prev_regime != regime) {
+            self.plain_streak = 0;
+        }
+        // When a verify re-probe arrives after a sustained plain-decode
+        // streak, clear stale verify depth windows so the fresh probe
+        // replaces any earlier transient spike immediately.
+        if pass.verifies && self.plain_streak >= PLAIN_REPROBE_INTERVAL {
+            for window in self.sums[1].iter_mut() {
+                *window = RegimeWindow::new(regime, epoch);
+            }
+        }
+        if pass.depth == 0 && !pass.verifies {
+            self.plain_streak = self.plain_streak.saturating_add(1);
+        } else {
+            self.plain_streak = 0;
+        }
         let one = Sums::of(&pass);
         *self.all.count(regime, epoch) += one;
         *self.sums[usize::from(pass.verifies)][pass.depth].count(regime, epoch) += one;
@@ -465,15 +508,28 @@ impl Passes {
         let plain = self.depth(false, 0, regime, epoch).pass;
         let front_terms: [Option<Terms>; DEPTHS] =
             std::array::from_fn(|depth| self.depth(false, depth, regime, epoch).terms());
+        let verify_sums: [Sums; DEPTHS] =
+            std::array::from_fn(|depth| self.depth(true, depth, regime, epoch));
         let verify_terms: [Option<Terms>; DEPTHS] =
-            std::array::from_fn(|depth| self.depth(true, depth, regime, epoch).terms());
-        let terms = std::array::from_fn(|depth| front_terms[depth].or(verify_terms[depth]));
+            std::array::from_fn(|depth| verify_sums[depth].terms());
+        let verify_samples: [u64; DEPTHS] =
+            std::array::from_fn(|depth| verify_sums[depth].passes as u64);
+        let has_front = front_terms.iter().any(Option::is_some);
+        let terms = std::array::from_fn(|depth| {
+            front_terms[depth].or_else(|| {
+                (!has_front || verify_samples[depth] >= MIN_VERIFY_SAMPLES)
+                    .then_some(verify_terms[depth])
+                    .flatten()
+            })
+        });
         Some(Measured {
             layers,
             depth: latest.depth,
             verifying: latest.verifies,
             terms,
             verify_terms,
+            verify_samples,
+            plain_streak: self.plain_streak,
             paths,
             stall: (plain.missed > 0.).then(|| plain.parked / plain.missed),
             front_stall: std::array::from_fn(|idx| {
@@ -659,7 +715,8 @@ mod tests {
         assert!((measured.verify_terms[1].unwrap().compute - 0.06).abs() < 1e-12, "verify depth 1 compute alone: {measured:?}");
         assert_eq!(measured.verify_terms[2], None, "no verify pass at depth 2");
         assert!((measured.terms_for(true, 2).unwrap().compute - 0.05).abs() < 1e-12, "verify extrapolates from front at unmeasured depth 2");
-        assert_eq!(measured.verify_stall[0], None, "no verify misses yet -> verify_stall[0] is None");
+        assert!((measured.verify_stall[0].expect("verify depth 1 parked 0.01 over 10 missed") - 1e-3).abs() < 1e-12, "{measured:?}");
+        assert_eq!(measured.verify_stall[1], None, "no verify pass at depth 2 -> verify_stall[1] is None");
         let wasted = &measured.paths.as_ref().expect("a miss counted")[0].wasted;
         let (front_w, verify_w) = (wasted.front[1].expect("a front pass ran depth 1"), wasted.verify[1].expect("a verify pass ran depth 1"));
         assert!((front_w - 4. * 1e-3).abs() < 1e-15, "the front pass's four unused reads over its two passes (depth 1 and 2): {front_w}");
@@ -895,7 +952,7 @@ mod tests {
 
         let mut needed_verify = [None; DEPTHS];
         needed_verify[0] = Some(Needed::Shadow(100.0));
-        needed_verify[1] = Some(Needed::Executed(100.0));
+        needed_verify[1] = Some(Needed::Executed(95.0));
         for k in 2..DEPTHS {
             needed_verify[k] = Some(Needed::Shadow(98.0));
         }
@@ -914,8 +971,8 @@ mod tests {
                 accepts: measured.accepts[..5].to_vec(),
                 stall: Some(2e-3),
                 front_stall: measured.front_stall.to_vec(),
-            verify_stall: measured.verify_stall.to_vec(),
-                overhead: Some(magnitude_cost_model::VerifyOverhead::fixed(0.010)),
+                verify_stall: measured.verify_stall.to_vec(),
+                overhead: Some(magnitude_cost_model::VerifyOverhead::fixed(0.005)),
                 paths: measured.paths.expect("NVMe drive path"),
                 routes: VerifyRoutes { layers: 42, fresh: vec![5.0, 4.2, 3.7, 3.3, 3.0] },
             }
@@ -1142,5 +1199,45 @@ mod tests {
             regime.verify_time(7),
             regime.verify_time(5),
         );
+    }
+
+    /// A single cold `Verify(1)` pass does not leak into `terms[1]` or
+    /// `terms_for(true, 1)` when a plain pass exists, and a verify re-probe
+    /// after `PLAIN_REPROBE_INTERVAL` consecutive plain passes clears stale
+    /// verify compute samples so recovery is immediate.
+    #[test]
+    fn single_cold_verify_sample_is_unproven_and_reprobe_clears_stale_verify_window() {
+        let (mut passes, time) = passes();
+        let needed = [[None; DEPTHS]; 2];
+        let stands = unjudged(time);
+
+        // Plain pass at 30 ms, then 1 cold Verify(1) pass at 200 ms.
+        passes.timed(Pass { rows: 1, depth: 0, verifies: false, seconds: 0.030, ..Pass::default() });
+        passes.timed(Pass { rows: 2, depth: 1, verifies: true, seconds: 0.200, ..Pass::default() });
+        let measured = passes.measured(48, needed, &stands).expect("passes timed");
+        assert_eq!(measured.verify_samples[1], 1);
+        assert_eq!(measured.plain_streak, 0);
+        assert_eq!(measured.terms[1], None, "unproven verify sample must not leak into terms[1]");
+        assert_eq!(measured.terms_for(true, 1), None, "unproven verify sample must not override plain prior");
+
+        // Second slow Verify(1) pass proves depth 1 at 200 ms.
+        passes.timed(Pass { rows: 2, depth: 1, verifies: true, seconds: 0.200, ..Pass::default() });
+        let measured = passes.measured(48, needed, &stands).expect("passes timed");
+        assert_eq!(measured.verify_samples[1], 2);
+        assert!((measured.terms_for(true, 1).unwrap().compute - 0.200).abs() < 1e-12);
+
+        // `PLAIN_REPROBE_INTERVAL` consecutive plain passes increment `plain_streak`.
+        for _ in 0..PLAIN_REPROBE_INTERVAL {
+            passes.timed(Pass { rows: 1, depth: 0, verifies: false, seconds: 0.030, ..Pass::default() });
+        }
+        let measured = passes.measured(48, needed, &stands).expect("passes timed");
+        assert_eq!(measured.plain_streak, PLAIN_REPROBE_INTERVAL);
+
+        // Re-probe Verify(1) at warm 35 ms clears stale 200 ms samples and resets `plain_streak`.
+        passes.timed(Pass { rows: 2, depth: 1, verifies: true, seconds: 0.035, ..Pass::default() });
+        let measured = passes.measured(48, needed, &stands).expect("passes timed");
+        assert_eq!(measured.plain_streak, 0);
+        assert_eq!(measured.verify_samples[1], 1);
+        assert!((measured.verify_terms[1].unwrap().compute - 0.035).abs() < 1e-12);
     }
 }

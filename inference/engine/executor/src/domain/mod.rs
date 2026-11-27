@@ -673,6 +673,8 @@ pub(super) struct ResidentRequest {
     pub(super) tokens: input::TokenHistory,
     /// Boundary feature of the last reconciled target forward.
     pub(super) boundary: Option<FeatureRef>,
+    /// Cumulative graph-replay counts when this request opened residency.
+    pub(super) graph_replays_at_open: seismic::GraphReplays,
     /// Encoded image features for this residency, keyed by image identity.
     pub(super) image_features: BTreeMap<String, FeatureRef>,
     /// Next target launch is this round's verification: its drafter proposed
@@ -790,7 +792,7 @@ pub enum MemoryStanding {
 /// invalidated automatically whenever `measures_generation`, `held`, or
 /// `live_steps` moves, avoiding repeated `LiveDecode` clones and `DecodePrice`
 /// evaluations on flight boundaries that changed none of them (e.g. `Head`).
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Debug)]
 struct BankValueCache {
     measures_generation: u64,
     held: magnitude_cost_model::HeldSlots,
@@ -2025,7 +2027,14 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
     /// behind it (`ModelLoadPlan::fronts`): a load whose experts stream and
     /// whose drafter is an embedded head of its own history.
     pub fn fronts(&self) -> bool {
-        self.execution.load().fronts()
+        self.execution.load().chains_front()
+    }
+
+    /// Whether the loaded target graph carries host-supplied front-row guesses
+    /// (`routed_step`, `kept_guesses`), including banked separate drafters
+    /// (DSpark / DFlash) as well as embedded fronting heads.
+    pub fn fronts_target(&self) -> bool {
+        self.execution.load().fronts_target()
     }
 
     /// The most rows a launch of chained decode passes holds

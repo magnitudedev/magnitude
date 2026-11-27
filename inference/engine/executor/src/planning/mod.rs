@@ -642,7 +642,7 @@ pub(crate) mod tests {
         )
         .unwrap();
         assert_eq!(
-            target.family().workspace_bytes(),
+            target.workspace_bytes(),
             assessed_target.storage.workspace
         );
         assert_eq!(

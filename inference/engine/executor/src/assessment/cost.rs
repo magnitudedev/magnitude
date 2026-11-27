@@ -219,7 +219,7 @@ mod tests {
         // The link's in-place rate is not what a copy takes: the transfer
         // queue's is.
         let transfer = ReadLine::new(5e-6, 1e-10).unwrap();
-        let copy = super::super::TierCopyCosts { blocks: 1, whole_seconds: (records * bytes) as f64 * 3e-10, stall_share: 0.5, transfer, back: transfer, concurrent_host_byte_seconds: None, concurrent_dma_byte_seconds: None };
+        let copy = super::super::TierCopyCosts { blocks: 1, whole_seconds: (records * bytes) as f64 * 3e-10, stall_share: 0.5, transfer, back: transfer, concurrent_host_byte_seconds: None, concurrent_dma_byte_seconds: None, routed_zerocopy_byte_seconds: None };
         let saved = lines.host.cpu.unwrap().expert.nanoseconds(1.).min(lines.gpu.link.nanoseconds(1.)) - lines.gpu.resident.nanoseconds(1.);
         let link = lines.host.record_bytes as f64 * 1e-10 * 1e9;
         let memory = lines.host.memory.unwrap().get();

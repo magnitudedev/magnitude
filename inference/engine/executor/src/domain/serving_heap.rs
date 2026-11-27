@@ -67,9 +67,20 @@ pub struct StreamedVerifyPrior {
     /// Live path I/O seconds `I/O(k, 0)` for `k = 0..=max_k`
     /// (from `regime.verify_io_seconds(k)`).
     pub io_seconds: Vec<f64>,
-    /// Live expected stall seconds saved per standing trailing front row
-    /// (`regime.front_stall_saved_per_row()`).
+    /// Live expected stall seconds saved by the first standing trailing front
+    /// row (`regime.front_stall_saved_per_row()`).
     pub front_stall_saved_per_row: f64,
+    /// Live marginal exposed future wait (in seconds) that front row `m`
+    /// (`index m`, 0-indexed: `m = 0` is the first front row at depth `K + 1`)
+    /// eliminates if its branch survives (`regime.front_stall_saved_by_row(max_front)`).
+    /// When empty (e.g. fixtures that only populate `front_stall_saved_per_row`),
+    /// `PassCostModel::from_streamed_prior` derives the diminishing curve via
+    /// `magnitude_cost_model::diminishing_front_stall_saved`.
+    pub front_stall_saved_by_row: Vec<f64>,
+    /// Live exposed future demand wait (in seconds) at front row `m` already
+    /// covered by existing carryover / in-flight prefetch. Subtracted before
+    /// crediting `F`.
+    pub carryover_covered_by_front: Vec<f64>,
     /// Live expected wasted path seconds per falling trailing front row at
     /// depth `d >= 1` (`index d - 1`, from `regime.front_waste_per_row(d)`).
     pub front_waste_per_row: Vec<f64>,
@@ -111,9 +122,13 @@ impl TwoRowPricing {
         let Some(FrontRegime { running, pass, .. }) = self.regime(requests.len(), fronted.len())? else {
             return Ok(crate::FrontPass::Built { form: crate::BuiltForm::Front, depths: std::collections::BTreeMap::new() });
         };
-        let verifying = self.measured.as_ref().is_some_and(|measured| measured.verifying);
+        let measured = self.measured.as_ref();
+        let verifying = measured.is_some_and(|measured| measured.verifying);
+        let reprobe = self.verifies > 0
+            && measured.is_some_and(|measured| measured.plain_streak >= crate::experts::PLAIN_REPROBE_INTERVAL);
         let reach = |depth: usize| if verifying { depth } else { depth.min(running + 1) };
         let (form, depth) = match pass {
+            magnitude_cost_model::Form::Front(0) if reprobe => (crate::BuiltForm::Verify, 1),
             magnitude_cost_model::Form::Front(0) => (crate::BuiltForm::Plain, 0),
             magnitude_cost_model::Form::Front(depth) => (crate::BuiltForm::Front, reach(depth)),
             magnitude_cost_model::Form::Verify(depth) => (crate::BuiltForm::Verify, reach(depth)),
@@ -611,12 +626,11 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
         let Some(bank) = self.family.expert_bank() else {
             return Ok(None);
         };
-        let slots = self
-            .expert_bank_plan()
-            .map_or_else(|| bank.slots(), |plan| plan.target_slots(bank.slots()));
+        if let Some(plan) = self.expert_bank_plan() {
+            return Ok(Some(plan.held_slots_runtime(bank.slots(), bank.host_slots())));
+        }
         let count = |value: u64| usize::try_from(value).expect("invariant violated: a bank's slots exceed the host's");
-        let host = bank.host_slots();
-        Ok(Some(magnitude_cost_model::HeldSlots { slots: count(slots), host: count(host) }))
+        Ok(Some(magnitude_cost_model::HeldSlots::tiered(count(bank.slots()), count(bank.host_slots()))))
     }
 
     /// The workload prior of the load's planned context and limits
@@ -651,7 +665,7 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
             if let Some(held) = self.held_slots()? {
                 let live_steps = bank.live_steps();
                 let measures_generation = self.measures_generation;
-                if let Some(cached) = self.bank_value_cache.filter(|c| {
+                if let Some(cached) = self.bank_value_cache.as_ref().filter(|c| {
                     c.measures_generation == measures_generation
                         && c.held == held
                         && c.live_steps == live_steps
@@ -659,13 +673,13 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
                     held_step_seconds = cached.held_step_seconds;
                     bank.value(Value::recompute(cached.saved.max(0.0), self.served.decode_steps, bytes));
                 } else if let Some(price) = self.decode_price()? {
-                    let floor = usize::try_from(plan.target_slots(plan.floor())).expect("invariant violated: a bank's slots exceed the host's");
-                    let saved = if floor.min(held.slots) == held.slots {
+                    let floor_held = plan.held_slots_runtime(plan.floor(), bank.host_slots());
+                    let saved = if floor_held == held {
                         0.0
                     } else {
-                        let at_held = price.step(held).total_seconds;
+                        let at_held = price.step(&held).total_seconds;
                         held_step_seconds = Some(at_held);
-                        price.step(magnitude_cost_model::HeldSlots { slots: floor, ..held }).total_seconds - at_held
+                        price.step(&floor_held).total_seconds - at_held
                     };
                     bank.value(Value::recompute(saved.max(0.0), self.served.decode_steps, bytes));
                     self.bank_value_cache = Some(super::BankValueCache {
@@ -879,7 +893,7 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
             return Ok(None);
         }
         let priced = match self.family.expert_bank() {
-            Some(_) => self.decode_price()?.zip(self.held_slots()?).map(|(price, held)| price.step(held).total_seconds),
+            Some(_) => self.decode_price()?.zip(self.held_slots()?).map(|(price, held)| price.step(&held).total_seconds),
             None => None,
         };
         self.serving_prior_at(priced)
@@ -919,7 +933,7 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
             depth: price.depth(),
             rows: self.chained_rows(),
             verifies: self.execution.policy().method().draft_rows(),
-            whole: price.whole(held),
+            whole: price.whole(&held),
             overhead: self.verify_turns.overhead(bank.regime_epoch(), bank.bank_epoch()),
         }))
     }
@@ -966,6 +980,8 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
             })
         });
         let vram_knee_rows = vram.and_then(|v| regime.vram_knee_rows(verifies, v));
+        let front_stall_saved_by_row = regime.front_stall_saved_by_row(max_front);
+        let front_stall_saved_per_row = front_stall_saved_by_row.first().copied().unwrap_or(0.0);
         Ok(Some(StreamedVerifyPrior {
             regime_epoch: bank.regime_epoch(),
             verify_seconds: regime.verify_prior_in_vram(verifies, vram),
@@ -973,7 +989,9 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
             io_seconds: (0..=verifies)
                 .map(|k| regime.verify_io_seconds_in_vram(k, vram))
                 .collect(),
-            front_stall_saved_per_row: regime.front_stall_saved_per_row(),
+            front_stall_saved_per_row,
+            front_stall_saved_by_row,
+            carryover_covered_by_front: Vec::new(),
             front_waste_per_row: (1..=max_front)
                 .map(|depth| regime.front_waste_per_row(depth))
                 .collect(),
@@ -1014,6 +1032,56 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
             Some(pricing) => pricing.built(requests, fronted)?,
             None => crate::FrontPass::Built { form: crate::BuiltForm::Front, depths: std::collections::BTreeMap::new() },
         })
+    }
+
+    /// Take a settled post-startup reading (`after_idle = true`) and grow the
+    /// device expert bank synchronously into any headroom freed by releasing
+    /// transient startup reserves (`head_upload_reserve`, `drafter_reserve`)
+    /// and head import kernels after [`Self::bind_head`] (while
+    /// `recorded_graphs_reserve` remains held on the ledger).
+    ///
+    /// Runs before `measure_load` and `warm_up` so the first request starts
+    /// with the full post-startup bank capacity rather than waiting for
+    /// background runtime growth.
+    pub fn settle_bank_after_startup(&mut self) -> Result<(), DomainError> {
+        if self.family.expert_bank().is_none() {
+            return Ok(());
+        }
+        self.memory.borrow().settled_read_after(self.resources.ledgers(), true);
+        loop {
+            let Some(bank) = self.family.expert_bank() else {
+                return Ok(());
+            };
+            let Some((BankHolding::Experts, BankMove::Grow { to })) = self.next_bank_move(bank)? else {
+                break;
+            };
+            let (tx, rx) = std::sync::mpsc::channel();
+            let wake = crate::CompletionWake::new(move || {
+                let _ = tx.send(());
+            });
+            let BankStep::Begun(_) = self.grow_expert_bank(BankHolding::Experts, to, wake, crate::CompletionWake::new(|| {}))? else {
+                break;
+            };
+            let mut current_rx = rx;
+            let finished = loop {
+                let _ = current_rx.recv_timeout(std::time::Duration::from_millis(10));
+                let (next_tx, next_rx) = std::sync::mpsc::channel();
+                let next_wake = crate::CompletionWake::new(move || {
+                    let _ = next_tx.send(());
+                });
+                if let Some((done, _)) = self.advance_expert_bank(next_wake)? {
+                    break done;
+                }
+                current_rx = next_rx;
+            };
+            match finished {
+                super::BankResized::Grown { refused: None, .. } => {
+                    self.memory.borrow().settled_read_after(self.resources.ledgers(), true);
+                }
+                _ => break,
+            }
+        }
+        Ok(())
     }
 
     /// A test's growth toward the bank's target, at a fresh probe: what the

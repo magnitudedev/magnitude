@@ -120,6 +120,29 @@ pub(crate) fn cuda_context_cache_reserve(capacity: u64) -> u64 {
     (capacity / 32).clamp(384 * MIB, 512 * MIB)
 }
 
+/// Elastic bank headroom reserved below `budget()` on unified GPU host stores
+/// without a wired ceiling (`HostGrant::Limit` / `HostGrant::Budget` on
+/// Linux/Windows UMA): high-order GPU/DMA page allocations (`cuMemAlloc`,
+/// Vulkan `DEVICE_LOCAL`) trigger kernel page compaction and direct reclaim
+/// when free RAM falls below the compaction floor, stalling claims for seconds
+/// and evicting engine RSS.
+///
+/// `clamp(total / 64, 512 MiB, 2 GiB)` matches Metal's
+/// [`Ceiling::execution_reserve_for`] 2 GiB cap (~1.90 GiB on 122 GiB DGX
+/// Spark, staying well above the < 0.8 GiB direct-reclaim cliff while
+/// preserving `cold_reclaimable` in `budget()` for pageable unified banks).
+///
+/// Applied via [`Reading::cache_reserve`] strictly to elastic bank sizing
+/// (`bank_budget`, `import_room`, `hold_room`, `grow_room`, `target`), never
+/// to `budget()` / `room()` / resident model admission, and without excluding
+/// `cold_reclaimable` (which belongs strictly to unreclaimable pinned host
+/// banks via `pinned_budget()`).
+pub(crate) fn unified_gpu_bank_reserve(total: u64) -> u64 {
+    const MIN_RESERVE: u64 = 512 << 20;
+    const MAX_RESERVE: u64 = 2 << 30;
+    (total / 64).clamp(MIN_RESERVE, MAX_RESERVE).min(total)
+}
+
 /// One store's figures at one sample: the ledger's one OS input
 /// ([`super::ledger::Ledger::read`]). Fields are private: `supply ≤ total`
 /// holds by construction.
@@ -333,8 +356,24 @@ impl Reading {
         self
     }
 
+    /// Elastic-cache-only headroom reserved below `budget()`:
+    /// - explicit device reserve attached via [`Self::with_cache_reserve`]
+    ///   (e.g. discrete CUDA primary-context reserve), and
+    /// - [`unified_gpu_bank_reserve`] on unified GPU host stores without a
+    ///   wired ceiling (`HostGrant::Limit` / `HostGrant::Budget` on a
+    ///   host-paged store, e.g. Linux/Windows unified CUDA or Vulkan).
+    ///
+    /// Never subtracted from `budget()` or resident admission `room()`, and
+    /// never excludes `cold_reclaimable`.
     pub(crate) fn cache_reserve(&self) -> u64 {
-        self.cache_reserve
+        let unified = if self.paging.is_some()
+            && matches!(self.grant, Some(HostGrant::Limit(_) | HostGrant::Budget { .. }))
+        {
+            unified_gpu_bank_reserve(self.total)
+        } else {
+            0
+        };
+        self.cache_reserve.max(unified)
     }
 
     pub fn total(&self) -> u64 {

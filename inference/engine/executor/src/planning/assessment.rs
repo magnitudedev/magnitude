@@ -808,17 +808,17 @@ pub struct AssessmentGraphResourceBounds {
 
 impl AssessmentGraphResourceBounds {
     /// Additional device bytes held warm in `IdleClass` (`CacheKind::GraphSlots`)
-    /// after a prompt group of `places` places closes: the extra activations
-    /// and output slots beyond the 1-place floor across target, readout, and
-    /// head graph pools. Since `IdleClass` stays warm across decode under the
-    /// Ledger's single-owner policy, `settle_bank` subtracts these bytes when
-    /// pricing steady-state decode expert slots for each candidate `pass`.
+    /// after a prompt group of `pass` places closes: the extra activations and
+    /// output slots beyond the 1-place floor across target, readout, and head
+    /// graph pools, plus `GroupBuffers` and its elastic multi-launch pass
+    /// workspace arena (`target.group_bytes.at(pass)`).
     pub fn idle_class_bytes(
         &self,
-        places: usize,
+        pass: super::PassLaunches,
         limits: super::ResourceLimits,
         fronts: bool,
     ) -> Result<u64, String> {
+        let places = pass.get();
         if places <= 1 {
             return Ok(0);
         }
@@ -839,9 +839,11 @@ impl AssessmentGraphResourceBounds {
             .head
             .as_ref()
             .map_or(Ok(0), |charge| delta(charge, floor.head, grown.head))?;
+        let group = *self.target.group_bytes.at(pass);
         target
             .checked_add(readout)
             .and_then(|bytes| bytes.checked_add(head))
+            .and_then(|bytes| bytes.checked_add(group))
             .ok_or_else(|| "idle class byte count overflows".to_owned())
     }
 
@@ -923,7 +925,7 @@ impl AssessmentGraphResourceBounds {
                 )?,
             };
             let handle = target.cache_handle();
-            Ok((TargetGraphBounds::of(target, limits.startup_slots(load.fronts()).target)?, handle))
+            Ok((TargetGraphBounds::of(target, limits.startup_slots(load.chains_front()).target)?, handle))
         })
     }
 
@@ -1031,7 +1033,7 @@ impl AssessmentGraphResourceBounds {
                 },
             )?;
         let state_charge =
-            NativeGraphCharge::serial(state_storage, state_graphs, limits.startup_slots(load.fronts()).state)?;
+            NativeGraphCharge::serial(state_storage, state_graphs, limits.startup_slots(load.chains_front()).state)?;
         Ok((state_charge, sealed_state_graphs, state_kernels))
     }
 
@@ -1068,7 +1070,7 @@ impl AssessmentGraphResourceBounds {
         cache: Option<&std::sync::Arc<dyn std::any::Any + Send + Sync>>,
     ) -> Result<(Self, UndraftedBounds, std::sync::Arc<dyn std::any::Any + Send + Sync>), GraphError> {
         Self::validate_program_plan(plan, method)?;
-        let slots = limits.startup_slots(load.fronts()).target;
+        let slots = limits.startup_slots(load.chains_front()).target;
         let (bounds, vision, undrafted_readout, (undrafted, cache)) = Self::derive_parallel(
             definition,
             load,
@@ -1220,7 +1222,7 @@ impl AssessmentGraphResourceBounds {
                             patch_rows,
                         )?;
                     Ok(Some(VisionGraphBounds {
-                        charge: NativeGraphCharge::serial(vision_graph.storage, vision_graph.graphs, limits.startup_slots(load.fronts()).vision)?,
+                        charge: NativeGraphCharge::serial(vision_graph.storage, vision_graph.graphs, limits.startup_slots(load.chains_front()).vision)?,
                         binding_constant_bytes: vision_graph.binding_constant_bytes,
                         kernels,
                     }))
@@ -1266,7 +1268,7 @@ impl AssessmentGraphResourceBounds {
             |t, ns| t.readout_ns += ns,
             || crate::programs::graph::readout::checked_readout_storage_with_census(backend, load, &definition.decoder, limits),
         )?;
-        let readout = NativeGraphCharge::serial(readout_storage, readout_graphs, limits.startup_slots(load.fronts()).readout)?;
+        let readout = NativeGraphCharge::serial(readout_storage, readout_graphs, limits.startup_slots(load.chains_front()).readout)?;
         Ok((readout, readout_census))
     }
 
@@ -1296,7 +1298,7 @@ impl AssessmentGraphResourceBounds {
         let drafted = NativeGraphCharge::serial(
             drafted_storage,
             drafted_graphs,
-            limits.startup_slots(load.fronts()).readout,
+            limits.startup_slots(load.chains_front()).readout,
         )?;
         let plain = NativeGraphCharge::serial(
             plain_storage,
@@ -1331,7 +1333,7 @@ impl AssessmentGraphResourceBounds {
         limits: super::ResourceLimits,
         backend: BackendName,
     ) -> Result<DrafterBounds, GraphError> {
-        let slots = limits.startup_slots(load.fronts());
+        let slots = limits.startup_slots(load.chains_front());
         match (plan.drafter(), state.head_state()) {
             // A head reading target history keeps no state of its own.
             (Some(super::DrafterProgramPlan::SharedHead(shared)), None) => {
@@ -1413,7 +1415,7 @@ impl AssessmentGraphResourceBounds {
                             limits,
                             head_state.head_geometry()?,
                             method.draft_rows(),
-                            load.fronts(),
+                            load.chains_front(),
                             has_bank,
                         )?,
                     )?;

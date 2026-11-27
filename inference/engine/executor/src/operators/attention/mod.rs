@@ -2482,7 +2482,7 @@ pub(crate) mod tests {
                 limits,
             )
             .unwrap();
-            assert_eq!(target.family().workspace_bytes(), checked.storage.workspace);
+            assert_eq!(target.workspace_bytes(), checked.storage.workspace);
         }
 
         /// A selected read binds its indexer at the served context, keeps

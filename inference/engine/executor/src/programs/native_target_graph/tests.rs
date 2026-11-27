@@ -142,11 +142,7 @@ mod upload_region_tests {
             }
         };
         let upload = |rows: u64, stage: RunStage| match stage {
-            RunStage::Whole
-            | RunStage::Resident
-            | RunStage::DecodeFront
-            | RunStage::DecodeHits
-            | RunStage::DecodeBack => 40,
+            RunStage::Whole | RunStage::Resident => 40,
             RunStage::Front => 100 * rows,
             RunStage::Combine => 4,
         };
@@ -1154,7 +1150,7 @@ mod resource_template_tests {
                             load.notifies_selection(),
                             landing.as_ref().map(CheckedLandingEntries::entries),
                             load.keeps_token_rows(),
-                            load.fronts(),
+                            load.fronts_target(),
                             &weight,
                             EntryWidth {
                                 hidden: &seismic::Dim::from(geometry.hidden),
@@ -1274,14 +1270,18 @@ mod resource_template_tests {
         let held = certificate.group.extents(&certificate.served, 1).pass_bytes().unwrap();
         assert_eq!(certificate.passes.launches(), budget.get(), "resident load must honor planned pass {budget:?}");
         assert!(held > 0, "routed fixture must allocate merged pass buffers");
-        assert!(
-            certificate.resources.storage.workspace > floor_cert.resources.storage.workspace,
-            "merged pass ({} bytes) must grow workspace arena above 1-launch floor ({} bytes)",
+        assert_eq!(
             certificate.resources.storage.workspace,
+            floor_cert.resources.storage.workspace,
+            "merged pass must keep startup floor workspace ({} bytes) unchanged while moving pass workspace to elastic group_bytes",
             floor_cert.resources.storage.workspace,
         );
         let checked = super::super::certify::checked_target_family(backend, &derived, &definition.decoder, &state, plan.target(), limits, budget).unwrap();
         assert_eq!(checked.group_bytes.most(), budget, "checked family must charge the full resident pass {budget:?}");
+        assert!(
+            *checked.group_bytes.at(budget) > *checked.group_bytes.at(crate::PassLaunches::FLOOR),
+            "multi-launch pass must charge its elastic pass workspace in group_bytes",
+        );
 
         // A pass budget above `chain_capacity` is bounded by `chain_capacity`.
         let over = crate::PassLaunches::new(std::num::NonZeroUsize::new(chain + 8).unwrap());
@@ -1535,16 +1535,16 @@ mod sinkhorn_graph_tests {
         );
     }
 
-    /// M7 `RunStage::DecodeFront` and `RunStage::DecodeBack` graphs must seal
+    /// Unified zero-switch 3-tier streamed decode (`RunStage::Whole`) must seal
     /// with zero unbound ports (`NativePortUnbound`) on CUDA discrete-GPU
     /// (`HostTier::Linked`, `Placer::Tier`, partial bank `!whole`) for general
     /// (`routed_fixture_definition`), fused (`qwen4exp`), and Sinkhorn-streamed
-    /// general (`sinkhorn_fixture_definition`) routed blocks. On Sinkhorn blocks,
-    /// `DecodeFront` must export the mixer's carry without joining the
-    /// feed-forward branch (`stream_join` count == 0, matching `Front`), while
-    /// `DecodeBack` performs the single feed-forward `stream_join` (`== 1`).
+    /// general (`sinkhorn_fixture_definition`) routed blocks. Every such CUDA
+    /// decode block runs `routed_stage_host` inline inside the single `Whole`
+    /// graph (zero separate `DecodeFront`/`DecodeHits`/`DecodeBack` stages),
+    /// while non-CUDA backends (Metal, Vulkan) never emit `routed_stage_host`.
     #[test]
-    fn decode_front_and_back_bind_every_port_on_cuda_discrete_tier() {
+    fn unified_streamed_decode_binds_every_port_on_cuda_discrete_tier() {
         use crate::planning::{HostTier, fixtures};
         let general_def = fixtures::routed_fixture_definition(fixtures::RoutedShape {
             layers: 3,
@@ -1589,7 +1589,7 @@ mod sinkhorn_graph_tests {
                 .unwrap_or_else(|e| panic!("{label}: with_expert_bank_at_floor failed: {e}"));
             assert!(
                 !load.expert_bank().expect("bank").whole(),
-                "{label}: test fixture must be a partial bank so DecodeFront/DecodeBack are sealed"
+                "{label}: test fixture must be a partial bank so unified decode is sealed"
             );
             let capacity = ResourceCapacity {
                 domain_bytes: 1 << 30,
@@ -1611,121 +1611,47 @@ mod sinkhorn_graph_tests {
                 crate::PassLaunches::whole_chain(limits),
             )
             .unwrap_or_else(|e| panic!("{label}: certify_target_family failed: {e}"));
-            let mut saw_front = false;
-            let mut saw_hits = false;
-            let mut saw_back = false;
-            for block in &certified.blocks {
-                for &(_, _, _, stage, _) in block.keys() {
-                    if stage == Stage::Run(RunStage::DecodeFront) {
-                        saw_front = true;
-                    }
-                    if stage == Stage::Run(RunStage::DecodeHits) {
-                        saw_hits = true;
-                    }
-                    if stage == Stage::Run(RunStage::DecodeBack) {
-                        saw_back = true;
-                    }
-                }
-            }
-            let sited = load.expert_bank().expect("bank").sited(0);
-            let is_fused = label.contains("fused");
-            let has_shared = label.contains("shared");
-            let expected_front_site = if is_fused { 0usize } else { usize::from(sited) };
-            let splits_hits = !is_fused && sited;
             assert!(
-                saw_front && saw_back && saw_hits == splits_hits,
-                "{label}: expected DecodeFront={saw_front}, DecodeBack={saw_back}, DecodeHits={saw_hits} (want {splits_hits})"
+                certified.blocks[0]
+                    .keys()
+                    .any(|&(_, _, _, stage, _)| stage == Stage::Run(RunStage::Whole)),
+                "{label}: expected RunStage::Whole to be sealed"
             );
-            // Verify `routed_site_request` runs at the tail of `DecodeFront`
-            // for general form (fused form folds site publish inline into
-            // `routed_route_streamed` / `routed_land`) and never in `DecodeHits`/`DecodeBack`,
-            // and that general sited blocks split `routed_gate_up_part` + `routed_down_project`
-            // across `DecodeHits` and `DecodeBack` with zero unbound ports.
-            for (stage, expected_site_requests, expected_joins) in [
-                (RunStage::Whole, expected_front_site, 1usize),
-                (RunStage::DecodeFront, expected_front_site, 0usize),
-                (RunStage::DecodeHits, 0usize, 0usize),
-                (RunStage::DecodeBack, 0usize, 1usize),
-            ] {
-                if stage == RunStage::DecodeHits && !splits_hits {
-                    continue;
-                }
-                let inputs = BlockGraphInputs::of_class(
-                    &load,
-                    &definition.decoder,
-                    &state,
-                    0,
-                    ((1, 1, 1, 0, 0), Stage::Run(stage)),
-                    1,
-                    BlockCarries::default(),
-                    certified.outline.served(0),
-                );
-                let draft = super::super::block::checked_block_graph_audit_ports(
-                    backend,
-                    plan.target().blocks()[0],
-                    None,
-                    inputs,
-                )
-                .unwrap_or_else(|e| panic!("{label}: {stage:?} runtime port audit failed: {e}"));
+            let inputs = BlockGraphInputs::of_class(
+                &load,
+                &definition.decoder,
+                &state,
+                0,
+                ((1, 1, 1, 0, 0), Stage::Run(RunStage::Whole)),
+                1,
+                BlockCarries::default(),
+                certified.outline.served(0),
+            );
+            let draft = super::super::block::checked_block_graph_audit_ports(
+                backend,
+                plan.target().blocks()[0],
+                None,
+                inputs,
+            )
+            .unwrap_or_else(|e| panic!("{label}: Whole runtime port audit failed: {e}"));
+            assert_eq!(
+                draft.entry_count("routed_stage_host"),
+                1,
+                "{label}: unified CUDA decode graph must dispatch routed_stage_host exactly once"
+            );
+            if is_sinkhorn {
                 assert_eq!(
-                    draft.entry_count("routed_site_request"),
-                    expected_site_requests,
-                    "{label}: {stage:?} routed_site_request count mismatch"
+                    draft.entry_count("stream_join"),
+                    1,
+                    "{label}: Sinkhorn unified decode graph must perform 1 stream_join"
                 );
-                if stage == RunStage::DecodeHits {
-                    assert_eq!(
-                        draft.entry_count("routed_gate_up_part"),
-                        1,
-                        "{label}: DecodeHits routed_gate_up_part count mismatch"
-                    );
-                    assert_eq!(
-                        draft.entry_count("routed_down_project"),
-                        1,
-                        "{label}: DecodeHits routed_down_project count mismatch"
-                    );
-                    assert_eq!(
-                        draft.entry_count("dense_output"),
-                        usize::from(has_shared),
-                        "{label}: DecodeHits dense_output (shared expert) count mismatch"
-                    );
-                }
-                if stage == RunStage::DecodeBack && splits_hits {
-                    assert_eq!(
-                        draft.entry_count("routed_gate_up_part"),
-                        1,
-                        "{label}: DecodeBack split_hits must run routed_gate_up_part"
-                    );
-                    assert_eq!(
-                        draft.entry_count("dense_output"),
-                        0,
-                        "{label}: DecodeBack split_hits must not re-run shared expert dense_output"
-                    );
-                    assert_eq!(
-                        draft.entry_count("routed_down_project"),
-                        1,
-                        "{label}: DecodeBack split_hits must run routed_down_project"
-                    );
-                    assert_eq!(
-                        draft.entry_count("routed_down_sited"),
-                        1,
-                        "{label}: DecodeBack split_hits must run routed_down_sited"
-                    );
-                }
-                if is_sinkhorn {
-                    assert_eq!(
-                        draft.entry_count("stream_join"),
-                        expected_joins,
-                        "{label}: {stage:?} stream_join count mismatch"
-                    );
-                }
             }
         }
     }
 
     /// Gemma 4's blocks, whose streamed layers are a parallel sublayer's
     /// routed branch (`WeightScope::TargetBranch`), in a partial bank a
-    /// discrete CUDA device's tier places: each block's decode splits
-    /// (`RunStage::DecodeFront`), and certification seals each block in
+    /// discrete CUDA device's tier places: certification seals each block in
     /// exactly the stages its form reports (`block_sealed_stages`) at every
     /// row class, each with its class axes (`StageAxes::of`), which a lookup
     /// of a stage it did not seal panics on.
@@ -1758,7 +1684,7 @@ mod sinkhorn_graph_tests {
         .unwrap();
         let load = resident.with_expert_bank_at_floor(&definition, substrate).unwrap();
         let bank = load.expert_bank().unwrap();
-        assert!(!bank.whole(), "the fixture's bank is partial, so its decode splits");
+        assert!(!bank.whole(), "the fixture's bank is partial");
         assert!(
             bank.layers().iter().all(|layer| matches!(layer.scope, WeightScope::TargetBranch { .. })),
             "the fixture's streamed layers are routed branches"
@@ -1783,7 +1709,7 @@ mod sinkhorn_graph_tests {
         .unwrap();
         for index in 0..geometry.blocks.len() {
             let form = certified.outline.served(index);
-            assert!(form.streams && form.decode_split, "block {index}: {form:?}");
+            assert!(form.streams, "block {index}: {form:?}");
             for &rows in &certified.outline.row_classes {
                 let row_form = RowForm::of(rows);
                 let sealed = certified.blocks[index]
@@ -1806,19 +1732,11 @@ mod sinkhorn_graph_tests {
         }
     }
 
-    /// Contract test (`astra` `mpppad` #1 & #4):
-    /// 1. `DecodeHits` is strictly gated on masked-write support (CUDA only);
-    ///    Metal (`routed_down_project.metal:23`), Vulkan (`routed_down_project.comp:11`),
-    ///    and CPU NEVER report `decode_hits_supported == true` and NEVER seal
-    ///    `RunStage::DecodeHits` or `DecodeBack` in split-hits mode.
-    /// 2. Attempting to build `RunStage::DecodeHits` on a non-masked-write backend
-    ///    (Metal / Vulkan) fails loudly with `Err(...)` instead of silently falling
-    ///    back to unsplit.
+    /// Non-CUDA backends (Metal, Vulkan) must NOT emit `routed_stage_host` in
+    /// `RunStage::Whole` and must seal cleanly with zero unbound ports.
     #[test]
-    fn decode_hits_gated_strictly_on_masked_write_backend_and_fails_loudly_when_unsupported() {
-        use crate::operators::routed::streamed::{
-            decode_hits_supported, routed_down_project_supports_masked_write,
-        };
+    fn unified_stage_host_is_cuda_only() {
+        use crate::operators::routed::streamed::routed_down_project_supports_masked_write;
         use crate::planning::{HostTier, fixtures};
 
         assert!(routed_down_project_supports_masked_write(BackendName::Cuda));
@@ -1834,24 +1752,6 @@ mod sinkhorn_graph_tests {
             intermediate: 512,
         });
         let manifest = fixtures::gemma_moe_fixture_manifest(&definition);
-        let magnitude_family_contracts::Operator::RoutedFfn(routed) = &definition.decoder.blocks[0].sublayers[1].op
-        else {
-            panic!("expected RoutedFfn sublayer");
-        };
-        assert!(decode_hits_supported(routed, BackendName::Cuda));
-        assert!(!decode_hits_supported(routed, BackendName::Metal));
-        assert!(!decode_hits_supported(routed, BackendName::Vulkan));
-        assert!(!decode_hits_supported(routed, BackendName::Cpu));
-
-        // Verify `RunStage::sealed` never includes `DecodeHits` when `decode_hits == false`.
-        let unsplit_stages = RunStage::sealed(false, false, true, false, 1);
-        assert!(!unsplit_stages.contains(&RunStage::DecodeHits));
-        assert!(unsplit_stages.contains(&RunStage::DecodeFront));
-        assert!(unsplit_stages.contains(&RunStage::DecodeBack));
-
-        // Verify Metal and Vulkan NEVER seal `DecodeHits` and attempting to build
-        // `RunStage::DecodeHits` on them fails loudly with `Err(...)` instead of
-        // silently falling back to unsplit while `DecodeBack` runs.
         let codec = KvCodec::Dense;
         let limits = fixtures::LIMITS;
         let selection = ComponentSelection { head: false, vision: false };
@@ -1880,51 +1780,36 @@ mod sinkhorn_graph_tests {
             let plan = load
                 .program_plan(&definition, codec)
                 .unwrap_or_else(|e| panic!("{non_cuda:?}: program_plan failed: {e}"));
-            let certified = certify_target_family::<NativeGraphLayout>(
+            let served = super::super::classes::ServedForm::of_blocks(
                 non_cuda,
-                &load,
+                load.expert_bank(),
                 &definition.decoder,
-                &state,
-                plan.target(),
-                limits,
-                crate::PassLaunches::whole_chain(limits),
+                1,
+                false,
             )
-            .unwrap_or_else(|e| panic!("{non_cuda:?}: certify_target_family failed: {e}"));
-            for block in &certified.blocks {
-                for &(_, _, _, stage, _) in block.keys() {
-                    assert_ne!(
-                        stage,
-                        Stage::Run(RunStage::DecodeHits),
-                        "{non_cuda:?} must NEVER seal DecodeHits (lacks masked-write skip semantics)"
-                    );
-                }
-            }
+            .unwrap();
             let inputs = BlockGraphInputs::of_class(
                 &load,
                 &definition.decoder,
                 &state,
                 0,
-                ((1, 1, 1, 0, 0), Stage::Run(RunStage::DecodeHits)),
+                ((1, 1, 1, 0, 0), Stage::Run(RunStage::Whole)),
                 1,
                 BlockCarries::default(),
-                certified.outline.served(0),
+                served[0],
             );
-            match super::super::block::checked_block_graph_audit_ports(
+            let draft = super::super::block::checked_block_graph_audit_ports(
                 non_cuda,
                 plan.target().blocks()[0],
                 None,
                 inputs,
-            ) {
-                Ok(_) => panic!(
-                    "{non_cuda:?}: DecodeHits MUST fail loudly on backends without masked-write support"
-                ),
-                Err(err) => {
-                    assert!(
-                        err.contains("does not split hits") || err.contains("disagrees"),
-                        "{non_cuda:?}: unexpected DecodeHits error: {err}"
-                    );
-                }
-            }
+            )
+            .unwrap_or_else(|e| panic!("{non_cuda:?}: Whole runtime port audit failed: {e}"));
+            assert_eq!(
+                draft.entry_count("routed_stage_host"),
+                0,
+                "{non_cuda:?} must never emit routed_stage_host"
+            );
         }
     }
 }

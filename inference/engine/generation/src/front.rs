@@ -413,6 +413,18 @@ impl MethodState for FrontState {
             )
     }
 
+    fn can_front(&self) -> bool {
+        self.trails()
+            || (self.skipped > 0
+                && matches!(
+                    self.tail,
+                    DraftTail::Trailing {
+                        pending: None,
+                        open: None,
+                    }
+                ))
+    }
+
     /// A pass committed from the token the head entered. A plain depth-0 pass
     /// skipped head entry (`skipped` advances). A front pass committed its
     /// exact row alone, and its head launch entered the pass's selection with
@@ -832,5 +844,50 @@ mod tests {
         assert_eq!((state.position, state.skipped), (6, 2));
         let MethodCheckpoint::Mtp(after_verify) = state.checkpoint().unwrap() else { panic!("mtp") };
         assert_eq!((after_verify.position(), after_verify.target_rows()), (6, 8));
+    }
+
+    /// Reproduces the `Front(0) <-> Claim(0)->Plain` livelock on `FrontMtp`:
+    /// after a `FrontGrant::Plain` pass clears `tail` to `DraftTail::EMPTY` and
+    /// increments `skipped`, `trails()` is false, yet `can_front()` must remain
+    /// true so `Generation::front_guess()` returns `Some(GuessKind::Head)` and
+    /// `TwoRowPricing::built()` is invoked instead of looping `Front(0)` forever.
+    #[test]
+    fn front_mtp_can_front_after_plain_pass_breaks_front_zero_livelock() {
+        let req = RequestId(1);
+        let mut reader = CountingReader { reads: 0, row_bytes: 4 };
+        let mut state = FrontState {
+            position: 5,
+            skipped: 0,
+            tail: DraftTail::Entered(TokenId(10)),
+            pending_device: None,
+            round: FrontRound::Idle,
+        };
+        assert!(!state.trails());
+        assert!(!state.can_front());
+
+        // Step 1: Plain pass (e.g. cold start with unmeasured bank -> Claim(0) -> Plain).
+        let entry = state.front(req, TokenId(10), FrontGrant::Plain, &[]).unwrap();
+        assert_eq!(entry, FrontEntry::Plain);
+        state
+            .observe(
+                req,
+                Verification {
+                    inputs: &[TokenId(10)],
+                    accepted: 1,
+                    next: TokenId(11),
+                    features: None,
+                },
+                &mut reader,
+            )
+            .unwrap();
+        assert_eq!(state.skipped, 1);
+        assert!(!state.trails(), "Plain pass leaves no trailing pairs");
+        assert!(state.can_front(), "skipped > 0 with empty tail must remain eligible to re-enter drafting");
+
+        // Step 2: Re-entering Verify(1) succeeds without livelock.
+        let verify = state
+            .front(req, TokenId(11), FrontGrant::Verify(1), &[select()])
+            .unwrap();
+        assert_eq!(verify, FrontEntry::Verify);
     }
 }

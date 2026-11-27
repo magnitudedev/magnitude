@@ -58,12 +58,12 @@ fn a_front_read_whose_layer_has_passed_is_cancelled_at_the_pass() {
     next.complete().unwrap();
 }
 
-/// A front row's read lands ranked as read at the step that skipped it,
-/// the newest the tier has seen, though its front row ran without it: the
-/// reserve's refill, which unmaps the kept records no step holds least
-/// recently read first, takes every older record before it, so it stays
-/// for the next step's exact row. Here the next step's misses make the
-/// refill unmap records kept before the skip landed, and it keeps the skip.
+/// A front row's read lands protected for the next step's exact row at its
+/// layer (`is_future_read`): the reserve's refill unmaps older kept records
+/// before it while its target `(step, layer)` is still ahead, so it stays for
+/// the next step's exact row. Here `step` skips `(1, 5)` at layer 1, and
+/// `next`'s misses at layer 0 trigger a refill that unmaps older kept records
+/// while keeping `(1, 5)` ready for `next`'s layer 1.
 #[test]
 fn a_landed_front_read_outlasts_every_older_kept_record() {
     let harness = layered("front-ranked", EXPERTS, 12, 2, 4 + 4);
@@ -81,21 +81,21 @@ fn a_landed_front_read_outlasts_every_older_kept_record() {
         .filter(|&(layer, expert)| harness.in_tier(layer, expert).is_some())
         .collect::<Vec<_>>();
     let step = harness.two_row_step();
-    harness.front_at(&step, 0, &[5]);
-    harness.tiering(0, &[5]);
+    harness.front_at(&step, 1, &[5]);
+    harness.tiering(1, &[5]);
     harness.route_at(&step, 0, &[]);
     harness.route_at(&step, 1, &[]);
     step.complete().unwrap();
     let lacking = (0..EXPERTS).filter(|&expert| harness.in_tier(0, expert).is_none()).take(WORDS.choices as usize).collect::<Vec<_>>();
-    assert!(!lacking.is_empty() && !lacking.contains(&5), "{lacking:?}");
+    assert!(!lacking.is_empty(), "{lacking:?}");
     let next = harness.step();
     harness.request_at(&next, 0, &lacking);
-    harness.route_at(&next, 1, &[]);
-    next.complete().unwrap();
     harness.tier_ready();
     let unmapped = older.iter().filter(|&&(layer, expert)| harness.in_tier(layer, expert).is_none()).count();
     assert!(unmapped > 0, "the refill unmapped nothing older: {older:?}");
-    assert!(harness.in_tier(0, 5).is_some(), "the skip was unmapped before {} older records still kept", older.len() - unmapped);
+    assert!(harness.in_tier(1, 5).is_some(), "the skip was unmapped before {} older records still kept", older.len() - unmapped);
+    harness.route_at(&next, 1, &[5]);
+    next.complete().unwrap();
 }
 
 /// A front row's names resolve against the exact row of the step they were

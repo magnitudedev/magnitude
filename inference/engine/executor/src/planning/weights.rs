@@ -3432,28 +3432,32 @@ impl ModelLoadPlan {
     /// Whether its steps of host tokens keep them in the bound token rows,
     /// so a graph past the entry reads the step's token rows as a device
     /// tensor whatever their source: an n-gram input's, or the chain's
-    /// (`Self::fronts`), whose head launch behind each pass reads the pass's
-    /// token rows (`guess_chain`).
+    /// (`Self::chains_front`), whose head launch behind each pass reads the
+    /// pass's token rows (`guess_chain`).
     pub(crate) fn keeps_token_rows(&self) -> bool {
-        self.weights().any(|weight| weight.role.kind == WeightKind::NGramTable) || self.fronts()
+        self.weights().any(|weight| weight.role.kind == WeightKind::NGramTable) || self.chains_front()
     }
 
-    /// Whether its decode passes run front rows (two-row decode,
-    /// `crate::TwoRowDecode`): a load whose experts stream (a front row
-    /// names the experts of the pass a guess will be exact in) and whose
-    /// drafter is an embedded head of its own history, whose launch behind
-    /// each pass makes the next pass's chain (`guess_chain`). A host-token
-    /// step's front rows run on the host's guesses, whose kinds its step
-    /// words read (`routed_step`).
-    pub(crate) fn fronts(&self) -> bool {
+    /// Whether the target graph carries host-supplied front-row guesses into
+    /// `routed_step` (`kept_guesses`, `GroupRows::guesses`): any banked load
+    /// with a drafter (embedded head or separate drafter such as DSpark /
+    /// DFlash) can run front rows on verify passes.
+    pub(crate) fn fronts_target(&self) -> bool {
+        self.bank.is_some() && self.head.is_some()
+    }
+
+    /// Whether its decode passes chain an embedded head behind each pass
+    /// (`crate::TwoRowDecode`, `guess_chain`, `TableFlights::fronts`): a banked
+    /// load whose drafter is an embedded head of its own history.
+    pub(crate) fn chains_front(&self) -> bool {
         self.bank.is_some() && self.head.as_ref().is_some_and(|head| head.own_history)
     }
 
     /// The plan with each streamed table's stagings counting the front head
-    /// launch where it fronts (`TableFlights::fronts`): what attaching or
+    /// launch where it chains (`TableFlights::fronts`): what attaching or
     /// removing the expert bank decides.
     pub(super) fn with_front_stagings(mut self) -> Self {
-        let fronts = self.fronts();
+        let fronts = self.chains_front();
         let weights = self
             .target
             .iter_mut()
@@ -3469,10 +3473,11 @@ impl ModelLoadPlan {
 
     /// Whether its steps' entries hold the token row copy
     /// (`selection_notice`): it notifies selections
-    /// ([`Self::notifies_selection`]) or keeps host token rows
-    /// ([`Self::keeps_token_rows`]).
+    /// ([`Self::notifies_selection`]), keeps host token rows
+    /// ([`Self::keeps_token_rows`]), or keeps host front-row guesses
+    /// ([`Self::fronts_target`]).
     pub(crate) fn copies_token_rows(&self) -> bool {
-        self.notifies_selection() || self.keeps_token_rows()
+        self.notifies_selection() || self.keeps_token_rows() || self.fronts_target()
     }
 }
 

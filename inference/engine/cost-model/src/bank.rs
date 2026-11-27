@@ -257,14 +257,14 @@ impl BankPrices {
     }
 
     /// A decode step's seconds holding `held` of each layer's experts.
-    pub fn step_seconds(&self, held: HeldSlots) -> f64 {
+    pub fn step_seconds(&self, held: &HeldSlots) -> f64 {
         self.layers.step_seconds(None, self.read, held, 1.0, self.compute).total_seconds
     }
 
     /// A whole-context prompt's routed seconds in passes of `launches`
     /// launches holding `held`: each pass's compute and the reads of its
     /// misses ([`StreamedLayers::pass_reads`]).
-    pub fn prompt_seconds(&self, launches: u64, held: HeldSlots) -> f64 {
+    pub fn prompt_seconds(&self, launches: u64, held: &HeldSlots) -> f64 {
         let reads = |rows: u64| self.layers.pass_reads(self.read, held, rows as f64);
         routed_prompt_seconds(&self.pass, &self.routed, self.windows, self.region_rows, self.prompt_rows, launches, &reads)
     }
@@ -296,7 +296,7 @@ impl BankPrices {
     /// Neither marginal is priced before the load runs, so the plan holds
     /// the mean release's records and leaves that trade to the running
     /// load.
-    pub fn paths(&self, bytes: u64, held: HeldSlots, saturation_bytes: u64) -> Option<PathRecords> {
+    pub fn paths(&self, bytes: u64, held: &HeldSlots, saturation_bytes: u64) -> Option<PathRecords> {
         let layers: u64 = self.routed.iter().map(|kind| kind.layers).sum();
         self.layers.path_records(self.read, self.compute, bytes, held, layers, self.decode_rows, saturation_bytes)
     }

@@ -72,6 +72,18 @@ impl<T> Yielding<T> {
         again(self.background(poisoned))
     }
 
+    /// Yield a foreground holder's `held` guard once when another foreground
+    /// holder is waiting, then re-acquire as a foreground holder ([`Self::hold`])
+    /// so a tight-looping background holder can never starve this caller.
+    pub(crate) fn yield_to_waiters<'a, H>(&'a self, held: H, poisoned: &str, again: impl FnOnce(MutexGuard<'a, T>) -> H) -> H {
+        if self.waiting.load(Ordering::Acquire) == 0 {
+            return held;
+        }
+        drop(held);
+        std::thread::yield_now();
+        again(self.hold(poisoned))
+    }
+
     /// The holders waiting for it now, besides the background: a test's
     /// sign that one waits.
     #[cfg(test)]
@@ -82,5 +94,56 @@ impl<T> Yielding<T> {
     /// The value if no one holds it now, for a report that must not wait.
     pub(crate) fn try_hold(&self) -> TryLockResult<MutexGuard<'_, T>> {
         self.value.try_lock()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::atomic::AtomicBool;
+    use std::sync::Arc;
+    use std::time::{Duration, Instant};
+
+    /// A foreground holder calling `yield_to_waiters` must re-acquire via
+    /// `hold` (`waiting += 1`) rather than `background`, so a tight-looping
+    /// background thread can never starve it on a non-fair mutex.
+    #[test]
+    fn yield_to_waiters_reacquires_as_foreground_without_background_starvation() {
+        let lock = Arc::new(Yielding::new(0u64));
+        let stop = Arc::new(AtomicBool::new(false));
+        let bg_lock = Arc::clone(&lock);
+        let bg_stop = Arc::clone(&stop);
+        let bg = std::thread::spawn(move || {
+            while !bg_stop.load(Ordering::Relaxed) {
+                let mut guard = bg_lock.background("bg");
+                *guard += 1;
+            }
+        });
+
+        let waiter_lock = Arc::clone(&lock);
+        let waiter_stop = Arc::clone(&stop);
+        let waiter = std::thread::spawn(move || {
+            while !waiter_stop.load(Ordering::Relaxed) {
+                let mut guard = waiter_lock.hold("waiter");
+                *guard += 1;
+                drop(guard);
+                std::thread::yield_now();
+            }
+        });
+
+        let started = Instant::now();
+        for _ in 0..200 {
+            let guard = lock.hold("fg");
+            let guard = lock.yield_to_waiters(guard, "fg", |g| g);
+            drop(guard);
+        }
+        let elapsed = started.elapsed();
+        stop.store(true, Ordering::Relaxed);
+        bg.join().unwrap();
+        waiter.join().unwrap();
+        assert!(
+            elapsed < Duration::from_secs(2),
+            "yield_to_waiters starved behind tight background loop: {elapsed:?}"
+        );
     }
 }

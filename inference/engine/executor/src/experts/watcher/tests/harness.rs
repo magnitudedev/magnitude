@@ -669,6 +669,7 @@ pub(super) fn lending_windowed_passes(
             recording: false,
         },
         slots: Arc::new(std::sync::atomic::AtomicU64::new(slots as u64)),
+        target_vram_slots: None,
         host_slots: Arc::new(std::sync::atomic::AtomicU64::new(0)),
         whole,
         staging: staging_records,
@@ -697,7 +698,7 @@ pub(super) fn lending_windowed_passes(
     // Its promotions copy at a measured transfer queue's line, as a
     // discrete load's do: one record at a time, its latency none.
     let transfer = magnitude_cost_model::ReadLine::new(0., 1e-10).unwrap();
-    watcher.shared().price_copy(&crate::assessment::TierCopyCosts { blocks: 1, whole_seconds: 1e-3, stall_share: 0., transfer, back: transfer, concurrent_host_byte_seconds: None, concurrent_dma_byte_seconds: None });
+    watcher.shared().price_copy(&crate::assessment::TierCopyCosts { blocks: 1, whole_seconds: 1e-3, stall_share: 0., transfer, back: transfer, concurrent_host_byte_seconds: None, concurrent_dma_byte_seconds: None, routed_zerocopy_byte_seconds: None });
     {
         let mut state = residency::lock(&watcher.state);
         for layer in 0..state.core.layers.len() {

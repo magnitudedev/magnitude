@@ -99,8 +99,19 @@ pub fn run_worker(
     unprepared: UnpreparedUnits,
     transport: impl WorkerTransport,
 ) -> WorkerExit {
+    run_worker_with_tokenizer(manifest, unprepared, transport, None)
+}
+
+/// In-process variant of [`run_worker`] that reuses the host's already-built
+/// [`ByteBpeTokenizer`] instead of constructing a second copy of the BPE tables.
+pub(crate) fn run_worker_with_tokenizer(
+    manifest: ExecutionManifest,
+    unprepared: UnpreparedUnits,
+    transport: impl WorkerTransport,
+    shared_tokenizer: Option<Arc<ByteBpeTokenizer>>,
+) -> WorkerExit {
     let (receiver, sender) = transport.split();
-    serve(manifest, unprepared, receiver, Box::new(sender)).exit
+    serve(manifest, unprepared, receiver, Box::new(sender), shared_tokenizer).exit
 }
 
 /// A worker process's entry: accept the host's `Hello`, then either run the
@@ -137,7 +148,7 @@ pub fn serve_worker(transport: impl WorkerTransport) -> Served {
         Ok(None) => return WorkerExit::HostLost { reason: None }.into(),
         Err(error) => return WorkerExit::HostLost { reason: Some(error.to_string()) }.into(),
     };
-    serve(manifest, unprepared, receiver, Box::new(sender))
+    serve(manifest, unprepared, receiver, Box::new(sender), None)
 }
 
 /// How a worker's serving ended: its exit, and what its work still holds
@@ -252,6 +263,7 @@ fn serve(
     unprepared: UnpreparedUnits,
     receiver: impl MessageReceiver<HostMessage>,
     sender: Box<dyn MessageSender<WorkerMessage>>,
+    shared_tokenizer: Option<Arc<ByteBpeTokenizer>>,
 ) -> Served {
     let outbound: Outbound = Arc::new(Mutex::new(sender));
     let hello = WorkerMessage::Hello {
@@ -263,7 +275,7 @@ fn serve(
     let signal = Arc::new(Signal::default());
     // Host messages that arrive during the load wait in the session inbox.
     let _reader = session::spawn_reader(receiver, signal.clone());
-    match load(manifest, unprepared, &outbound) {
+    match load(manifest, unprepared, &outbound, shared_tokenizer) {
         Ok(LoadAttempt::Loaded(attempt)) => {
             let (loaded, ready) = *attempt;
             if let Err(error) = outbound.lock().unwrap().send(WorkerMessage::Ready { ready }) {
@@ -315,6 +327,7 @@ fn load(
     manifest: ExecutionManifest,
     unprepared: UnpreparedUnits,
     outbound: &Outbound,
+    shared_tokenizer: Option<Arc<ByteBpeTokenizer>>,
 ) -> Result<LoadAttempt<(Loaded, ReadyInfo)>, LoadError> {
     /// Why the worker's two halves stopped constructing.
     enum Stopped {
@@ -417,14 +430,17 @@ fn load(
                 .fingerprint,
             modalities: InputModalities::of(family, &definition),
         };
-        let tokenizer = Arc::new(
-            gguf_byte_bpe(
-                host_package.tokenizer(),
-                definition.artifact_identity.target.to_string(),
-            )
-            .and_then(ByteBpeTokenizer::new)
-            .map_err(|error| LoadError::Unsupported(error.into()))?,
-        );
+        let tokenizer = match shared_tokenizer {
+            Some(tokenizer) => tokenizer,
+            None => Arc::new(
+                gguf_byte_bpe(
+                    host_package.tokenizer(),
+                    definition.artifact_identity.target.to_string(),
+                )
+                .and_then(ByteBpeTokenizer::new)
+                .map_err(|error| LoadError::Unsupported(error.into()))?,
+            ),
+        };
         let projection = usize::try_from(definition.decoder.vocabulary)
             .map_err(|_| internal("model vocabulary exceeds the host domain"))?;
         let binding =

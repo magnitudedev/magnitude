@@ -164,12 +164,19 @@ impl Ledger {
                 allow_guarantee: true,
             })?,
             PoolClass::Records => {
-                let reclaim_graph = self.state().graph_slots_yield_to_bank();
+                let (reclaim_graph, reclaim_prefix) = {
+                    let state = self.state();
+                    (state.graph_slots_yield_to_bank(), state.prefix_yields_to_bank())
+                };
                 self.admit_or_reclaim(AdmitPolicy {
                     at: None,
                     kind,
                     bytes,
-                    of: |ck: CacheKind| ck == CacheKind::Spare || (reclaim_graph && ck == CacheKind::GraphSlots),
+                    of: |ck: CacheKind| {
+                        ck == CacheKind::Spare
+                            || (reclaim_graph && ck == CacheKind::GraphSlots)
+                            || (reclaim_prefix && ck == CacheKind::Prefix)
+                    },
                     within_boundary: false,
                     allow_guarantee: false,
                 })?

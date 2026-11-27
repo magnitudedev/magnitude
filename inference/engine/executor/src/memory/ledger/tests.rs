@@ -2,6 +2,7 @@
 //! representation for. No OS: readings are handed in.
 
 use super::*;
+use crate::memory::supply::Ceiling;
 use seismic::memory::Wiring::Pageable;
 use std::num::NonZeroU64;
 use std::time::{Duration, Instant};
@@ -1768,8 +1769,8 @@ fn a_loads_claims_find_the_room_its_search_priced() {
 #[test]
 fn the_m4_pros_recorded_sample_prices_the_wired_grant() {
     const STORE: u64 = 51_539_607_552;
-    const RESERVE: u64 = seismic::fixtures::M4_PRO_WORKING_SET / 12;
-    const GRANT: u64 = 36_858_904_576 - RESERVE;
+    let reserve = Ceiling::execution_reserve_for(seismic::fixtures::M4_PRO_WORKING_SET);
+    let grant = 36_858_904_576 - reserve;
     let scope = Ledgers::new();
     let recorded = seismic::host_samples::m4_pro();
     assert_eq!(recorded.total, STORE);
@@ -1778,9 +1779,9 @@ fn the_m4_pros_recorded_sample_prices_the_wired_grant() {
     let ledger = ledgers.device();
     let held = &reading.device;
     assert_eq!((held.supply(), held.others()), (47_779_758_080, 3_759_849_472), "free above the target and clean cache; others' the rest");
-    assert_eq!(held.budget(), GRANT, "the working set less others' wired bytes and Metal's execution reserve");
+    assert_eq!(held.budget(), grant, "the working set less others' wired bytes and Metal's execution reserve");
     let room = reading.room_after(&ledgers).device.room();
-    assert_eq!(room, GRANT, "the grant");
+    assert_eq!(room, grant, "the grant");
     let _plan = ledger.change(|keeping| ledger.claim_at(&keeping.claims(), Some(held), CommittedKind::Load, room)).expect("the room the load prices is admitted");
     assert_eq!(reading.room_after(&ledgers).device.room(), 0, "the claim takes the whole room");
     let past = 1;
@@ -1826,7 +1827,7 @@ fn planning_room_capacity_is_structural_not_momentary_free() {
     assert_eq!(budget.available(), FREE_20G, "momentary free room at load is 20 GiB");
     assert_eq!(
         budget.capacity(),
-        WORKING_SET_48G - WORKING_SET_48G / 12,
+        WORKING_SET_48G - Ceiling::execution_reserve_for(WORKING_SET_48G),
         "structural capacity is 48 GiB working set less Metal execution reserve, not momentary 20 GiB free"
     );
 
@@ -2015,7 +2016,7 @@ fn a_settled_idle_sleep_opens_a_fresh_baseline_at_the_next_reading() {
         wired: Some(seismic::WiredFigures { limit: seismic::WiredLimit::Set(22 * GB), wire_count: 4 * GB, at: wake }),
         ..host_sample(48 * GB, 20 * GB)
     };
-    let reserve = (22 * GB) / 12;
+    let reserve = Ceiling::execution_reserve_for(22 * GB);
     let woken = ledger.read_after(ledger.sampled(wake), Reading::unified(&woken_sample, u64::MAX), true);
     assert_eq!(woken.guarantee(), 0, "an unmonitored sleep is not one step's supply rise");
     assert_eq!(woken.budget(), 18 * GB - reserve, "wired ceiling takes the new wired baseline less execution reserve");
@@ -2777,6 +2778,38 @@ fn graph_slots_yield_to_bank_only_when_bank_value_exceeds_rebuild_value() {
     drop(backing);
 }
 
+#[test]
+fn prefix_yields_to_bank_only_when_bank_value_exceeds_prefix_value() {
+    let (_scope, ledger, _pool) = host();
+    let mut clock = Clock::new();
+    read(&ledger, &mut clock, 64 * GB, 64 * GB, None);
+    let _weights = commit(&ledger, 40 * GB);
+    let bank = ledger.cached(CacheKind::Bank, 20 * GB).expect("bank fits");
+    let prefix = ledger.cached(CacheKind::Prefix, 4 * GB).expect("prefix fits");
+    read(&ledger, &mut clock, 64 * GB, 0, None);
+
+    // Hot prefix value > Bank value: prefix stays warm out of bank room.
+    bank.value(Value::per_byte(0.80, NonZeroU64::new(20 * GB).unwrap()));
+    prefix.value(Value::per_byte(4.00, NonZeroU64::new(4 * GB).unwrap()));
+    let est = ledger.estimate();
+    assert_eq!(est.import_room(), 20 * GB, "high-value Prefix stays warm out of bank room");
+    assert!(
+        ledger.change(|keeping| ledger.backing(&keeping.claims(), PoolClass::Records, 2 * GB)).is_err(),
+        "Records backing does not evict higher-value Prefix"
+    );
+
+    // Actively streaming Bank value > cold Prefix value: Prefix yields to bank growth.
+    bank.value(Value::per_byte(8.20, NonZeroU64::new(20 * GB).unwrap()));
+    prefix.value(Value::per_byte(0.40, NonZeroU64::new(4 * GB).unwrap()));
+    let est = ledger.estimate();
+    assert_eq!(est.import_room(), 24 * GB, "lower-value Prefix counts toward bank room");
+    let backing = ledger
+        .change(|keeping| ledger.backing(&keeping.claims(), PoolClass::Records, 2 * GB))
+        .expect("Records backing reclaims lower-value Prefix");
+    assert_eq!(prefix.bytes(), 2 * GB, "Prefix yielded 2 GB to Records backing");
+    drop(backing);
+}
+
 /// Reproduces the `m4-pro-01` unified Metal slot ping-pong regression:
 /// on Apple Silicon, `WiredFigures::wire_count` is read live from IOGPU
 /// (`wired.at == sample.at`) while `host_statistics64` (`sample.counted.at`)
@@ -2789,7 +2822,7 @@ fn graph_slots_yield_to_bank_only_when_bank_value_exceeds_rebuild_value() {
 fn live_iogpu_wire_count_does_not_attribute_own_growth_to_others_while_counted_lags() {
     const LAG_1S: Duration = Duration::from_secs(1);
     const WORKING_SET: u64 = 36 * GB;
-    const RESERVE: u64 = WORKING_SET / 12;
+    let reserve = Ceiling::execution_reserve_for(WORKING_SET);
     const OTHERS_WIRED: u64 = 142 << 20;
     const GROWTH: u64 = 750 << 20;
 
@@ -2816,7 +2849,7 @@ fn live_iogpu_wire_count_does_not_attribute_own_growth_to_others_while_counted_l
     let t1 = t0 + Duration::from_secs(2);
     let counted_t1 = t1 - Duration::from_millis(200);
     let est1 = ledger.read(ledger.sampled(t1), Reading::unified(&sample_at(t1, counted_t1, 32 * GB, 9 * GB), WORKING_SET));
-    assert_eq!(est1.budget(), WORKING_SET - OTHERS_WIRED - RESERVE);
+    assert_eq!(est1.budget(), WORKING_SET - OTHERS_WIRED - reserve);
     assert_eq!(est1.unwired_shortfall(), 0);
 
     // Grow wired bank by +750 MiB, then read 25 ms later while `counted.at` is
@@ -2828,14 +2861,14 @@ fn live_iogpu_wire_count_does_not_attribute_own_growth_to_others_while_counted_l
     let est2 = ledger.read(ledger.sampled(t2), Reading::unified(&sample_at(t2, counted_t1, 32 * GB + GROWTH, 9 * GB - GROWTH), WORKING_SET));
     assert_eq!(
         est2.budget(),
-        WORKING_SET - OTHERS_WIRED - RESERVE,
+        WORKING_SET - OTHERS_WIRED - reserve,
         "live IOGPU wire_count must not misattribute own wired growth as others_wired when counted.at lags"
     );
     assert_eq!(est2.unwired_shortfall(), 0);
 }
 
 /// On Apple Silicon Metal (`HostGrant::Wired`), `Read::grant` subtracts
-/// `Ceiling::execution_reserve()` (`max(512 MiB, limit / 12)`) directly so
+/// `Ceiling::execution_reserve()` (`clamp(limit / 12, 512 MiB, 2 GiB)`) directly so
 /// committed claims (`PromptScratch`, KV slabs) cannot eat the execution
 /// reserve, while `bank_budget()` keeps an additional `block_unit` cushion
 /// below `grant` for elastic banks, and host-RAM-tight readings waste zero
@@ -2844,7 +2877,7 @@ fn live_iogpu_wire_count_does_not_attribute_own_growth_to_others_while_counted_l
 fn metal_wired_ceiling_reserves_command_buffer_headroom_for_elastic_bank() {
     const TOTAL_16G: u64 = 16 * GB;
     const WORKING_SET: u64 = 11_453_251_584; // 16 GB M1 recommendedMaxWorkingSetSize
-    const RESERVE_16G: u64 = WORKING_SET / 12; // ~954.4 MB (> 512 MiB floor)
+    let reserve_16g = Ceiling::execution_reserve_for(WORKING_SET); // ~954.4 MB (> 512 MiB floor)
     const BLOCK_512M: u64 = 512 << 20;
     const COMMITTED: u64 = 6 * GB;
 
@@ -2876,20 +2909,20 @@ fn metal_wired_ceiling_reserves_command_buffer_headroom_for_elastic_bank() {
     ledger.read(ledger.sampled(t1), Reading::unified(&sample_with(t1, COMMITTED, 8 * GB), WORKING_SET));
     let t2 = clock.next();
     let est = ledger.read(ledger.sampled(t2), Reading::unified(&sample_with(t2, COMMITTED, 8 * GB), WORKING_SET));
-    assert_eq!(est.budget(), WORKING_SET - RESERVE_16G, "committed budget preserves Metal execution reserve");
-    assert_eq!(est.import_room(), WORKING_SET - RESERVE_16G - COMMITTED);
-    assert_eq!(est.hold_room(), WORKING_SET - RESERVE_16G - COMMITTED);
-    assert_eq!(est.target(), WORKING_SET - RESERVE_16G - COMMITTED);
+    assert_eq!(est.budget(), WORKING_SET - reserve_16g, "committed budget preserves Metal execution reserve");
+    assert_eq!(est.import_room(), WORKING_SET - reserve_16g - COMMITTED);
+    assert_eq!(est.hold_room(), WORKING_SET - reserve_16g - COMMITTED);
+    assert_eq!(est.target(), WORKING_SET - reserve_16g - COMMITTED);
 
     // Opening a pool with a 512 MiB block preserves an additional full block_unit
     // cushion below `budget()` for elastic bank targets.
     let _records = ledger.pool_block(PoolClass::Records, NonZeroU64::new(BLOCK_512M).unwrap()).blocks;
     let t3 = clock.next();
     let est_pool = ledger.read(ledger.sampled(t3), Reading::unified(&sample_with(t3, COMMITTED, 8 * GB), WORKING_SET));
-    assert_eq!(est_pool.budget(), WORKING_SET - RESERVE_16G);
-    assert_eq!(est_pool.import_room(), WORKING_SET - RESERVE_16G - BLOCK_512M - COMMITTED);
-    assert_eq!(est_pool.hold_room(), WORKING_SET - RESERVE_16G - BLOCK_512M - COMMITTED);
-    assert_eq!(est_pool.target(), WORKING_SET - RESERVE_16G - BLOCK_512M - COMMITTED);
+    assert_eq!(est_pool.budget(), WORKING_SET - reserve_16g);
+    assert_eq!(est_pool.import_room(), WORKING_SET - reserve_16g - BLOCK_512M - COMMITTED);
+    assert_eq!(est_pool.hold_room(), WORKING_SET - reserve_16g - BLOCK_512M - COMMITTED);
+    assert_eq!(est_pool.target(), WORKING_SET - reserve_16g - BLOCK_512M - COMMITTED);
 
     // When host RAM supply is tighter than `grant - block_unit`, zero bytes are wasted.
     let t4 = clock.next();
@@ -2898,13 +2931,13 @@ fn metal_wired_ceiling_reserves_command_buffer_headroom_for_elastic_bank() {
     assert_eq!(est_tight.hold_room(), 9 * GB - COMMITTED);
 
     // On a 32 GiB Metal 4 M2 Pro (`26,800,603,136` recommended working set) with
-    // ~516 MB `others_wired`, execution_reserve (~1.34 GB) sits below `grant`
+    // ~516 MB `others_wired`, execution_reserve (capped at 2 GiB) sits below `grant`
     // for all claims, and opening a records pool adds a dedicated block_unit
     // cushion on top for elastic banks.
     const TOTAL_32G: u64 = 32 * GB;
     const WORKING_SET_M2PRO: u64 = 26_800_603_136;
     const OTHERS_WIRED_M2PRO: u64 = 515_842_180;
-    const RESERVE_M2PRO: u64 = WORKING_SET_M2PRO / 12;
+    let reserve_m2pro = Ceiling::execution_reserve_for(WORKING_SET_M2PRO);
     const COMMITTED_M2PRO: u64 = 7 * GB;
     let scope32 = Ledgers::new();
     let ledger32 = scope32.ledger(seismic::StoreIdentity::HostRam, shape());
@@ -2931,7 +2964,7 @@ fn metal_wired_ceiling_reserves_command_buffer_headroom_for_elastic_bank() {
     ledger32.read(ledger32.sampled(s1), Reading::unified(&sample32(s1, COMMITTED_M2PRO, 21 * GB), WORKING_SET_M2PRO));
     let s2 = clock.next();
     let est32 = ledger32.read(ledger32.sampled(s2), Reading::unified(&sample32(s2, COMMITTED_M2PRO, 21 * GB), WORKING_SET_M2PRO));
-    let wired_grant = WORKING_SET_M2PRO - OTHERS_WIRED_M2PRO - RESERVE_M2PRO;
+    let wired_grant = WORKING_SET_M2PRO - OTHERS_WIRED_M2PRO - reserve_m2pro;
     assert_eq!(est32.budget(), wired_grant);
     assert_eq!(est32.target(), wired_grant - BLOCK_512M - COMMITTED_M2PRO);
     assert!(
@@ -2949,7 +2982,7 @@ fn metal_wired_ceiling_reserves_command_buffer_headroom_for_elastic_bank() {
 fn metal_working_set_left_reconciles_uncharged_metal_allocations() {
     const TOTAL_16G: u64 = 16 * GB;
     const WORKING_SET: u64 = 11_453_251_584;
-    const RESERVE: u64 = WORKING_SET / 12;
+    let reserve = Ceiling::execution_reserve_for(WORKING_SET);
     const COMMITTED: u64 = 8 * GB;
     const UNCHARGED_METAL: u64 = 400 << 20;
 
@@ -2992,12 +3025,12 @@ fn metal_working_set_left_reconciles_uncharged_metal_allocations() {
     );
     assert_eq!(
         est.budget(),
-        WORKING_SET - UNCHARGED_METAL - RESERVE,
+        WORKING_SET - UNCHARGED_METAL - reserve,
         "uncharged Metal allocations in currentAllocatedSize must reduce wired grant byte-for-byte while preserving execution reserve"
     );
     assert_eq!(
         est.target(),
-        WORKING_SET - UNCHARGED_METAL - RESERVE - COMMITTED,
+        WORKING_SET - UNCHARGED_METAL - reserve - COMMITTED,
         "elastic bank target must stay below remaining Metal working set minus execution reserve"
     );
 }
@@ -3185,7 +3218,7 @@ fn in_flight_relief_defers_backed_reclaimer_and_idle_reclaims_synchronously() {
 fn metal_execution_reserve_bank_cushion_and_wired_jitter_stability() {
     const TOTAL_32G: u64 = 32 * GB;
     const WORKING_SET: u64 = 26_800_603_136; // M2 Pro 32 GB
-    const RESERVE: u64 = WORKING_SET / 12; // ~2.23 GB
+    let reserve = Ceiling::execution_reserve_for(WORKING_SET); // capped at 2 GiB
     const BLOCK_UNIT: u64 = 256 << 20; // 256 MiB records pool block
     const COMMITTED: u64 = 10 * GB;
     const OTHERS_WIRED: u64 = 512 << 20;
@@ -3220,7 +3253,7 @@ fn metal_execution_reserve_bank_cushion_and_wired_jitter_stability() {
     let t2 = clock.next();
     let est = ledger.read(ledger.sampled(t2), Reading::unified(&sample_with(t2, COMMITTED, OTHERS_WIRED, 18 * GB), WORKING_SET));
 
-    let expected_grant = WORKING_SET - OTHERS_WIRED - RESERVE;
+    let expected_grant = WORKING_SET - OTHERS_WIRED - reserve;
     assert_eq!(est.budget(), expected_grant, "grant excludes execution_reserve");
     assert_eq!(
         est.hold_room(),

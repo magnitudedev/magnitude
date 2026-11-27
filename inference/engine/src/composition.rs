@@ -383,8 +383,14 @@ pub fn start_in_process(
     let attempt = |unprepared| -> Result<LoadAttempt<ReadyEngine>, LoadError> {
         let (host_end, worker_end) = channel_pair();
         let worker_manifest = manifest.clone();
+        let worker_tokenizer = host.shared_tokenizer();
         let worker = seismic::threads::spawn("magnitude-worker", move || {
-            let exit = run_worker(worker_manifest, unprepared, worker_end);
+            let exit = crate::worker::run_worker_with_tokenizer(
+                worker_manifest,
+                unprepared,
+                worker_end,
+                Some(worker_tokenizer),
+            );
             tracing::info!("in-process worker exited: {exit:?}");
         })
         .map_err(|error| LoadError::Internal {

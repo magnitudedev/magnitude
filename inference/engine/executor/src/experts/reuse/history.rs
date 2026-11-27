@@ -98,18 +98,36 @@ pub(super) struct HistoryRank {
     order: u64,
 }
 
+/// Sentinel index in `Measure::pos` when an expert is not currently in the
+/// layer's live min-heap cache.
+const NOT_IN_HEAP: u32 = u32::MAX;
+
+#[cfg(test)]
+thread_local! {
+    static HISTORY_HEAP_STEPS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
 /// Decode history measured at one half-life: per-layer scores, equivalent step
-/// across all decode steps, and per-layer Mattson stacks with decayed misses.
+/// across all decode steps, and per-layer indexed min-heaps of the live
+/// `slots`-sized cache with decayed misses (`O(K log slots)` per step,
+/// independent of total expert count `E`, zero per-step allocations).
 struct Measure {
     half_life: f64,
     miss_decay: f64,
     layers: Vec<Vec<Logged>>,
     steps_score: Vec<Score>,
     logged: u64,
-    stacks: Vec<Vec<usize>>,
+    /// Per-layer min-heap of resident expert IDs ordered by ascending
+    /// [`HistoryRank`] (root = coldest victim), pre-allocated to `n` experts.
+    heaps: Vec<Vec<usize>>,
+    /// Per-layer inverse index `pos[layer][expert] -> heap index` (or
+    /// [`NOT_IN_HEAP`] when absent), giving `O(1)` hit/miss and key-update
+    /// lookup.
+    pos: Vec<Vec<u32>>,
     misses: Vec<f64>,
-    /// Pre-allocated scratch buffer (fixed capacity `max_experts`, zero per-call allocs).
+    /// Pre-allocated scratch buffers (fixed capacity `max_experts`, zero per-call allocs).
     scratch_entering: Vec<usize>,
+    scratch_reinsert: Vec<usize>,
 }
 
 impl Measure {
@@ -122,9 +140,11 @@ impl Measure {
             layers: experts.iter().map(|&n| vec![Logged::NONE; n]).collect(),
             steps_score: vec![Score::NEVER; experts.len()],
             logged: 0,
-            stacks: experts.iter().map(|&n| Vec::with_capacity(n)).collect(),
+            heaps: experts.iter().map(|&n| Vec::with_capacity(n)).collect(),
+            pos: experts.iter().map(|&n| vec![NOT_IN_HEAP; n]).collect(),
             misses: vec![0.0; experts.len()],
             scratch_entering: Vec::with_capacity(max_experts),
+            scratch_reinsert: Vec::with_capacity(max_experts),
         }
     }
 
@@ -134,9 +154,98 @@ impl Measure {
         HistoryRank { score, last, order }
     }
 
-    fn depth(&self, layer: usize, expert: usize) -> usize {
-        let stack = &self.stacks[layer];
-        stack.iter().position(|&above| above == expert).unwrap_or(self.layers[layer].len())
+    #[inline]
+    fn sift_up(&mut self, layer: usize, mut idx: usize) {
+        let expert = self.heaps[layer][idx];
+        let rank = self.rank(layer, expert);
+        while idx > 0 {
+            #[cfg(test)]
+            HISTORY_HEAP_STEPS.with(|c| c.set(c.get() + 1));
+            let parent = (idx - 1) / 2;
+            let p_expert = self.heaps[layer][parent];
+            if rank < self.rank(layer, p_expert) {
+                self.heaps[layer][idx] = p_expert;
+                self.pos[layer][p_expert] = idx as u32;
+                idx = parent;
+            } else {
+                break;
+            }
+        }
+        self.heaps[layer][idx] = expert;
+        self.pos[layer][expert] = idx as u32;
+    }
+
+    #[inline]
+    fn sift_down(&mut self, layer: usize, mut idx: usize) {
+        let len = self.heaps[layer].len();
+        let expert = self.heaps[layer][idx];
+        let rank = self.rank(layer, expert);
+        loop {
+            let left = 2 * idx + 1;
+            if left >= len {
+                break;
+            }
+            #[cfg(test)]
+            HISTORY_HEAP_STEPS.with(|c| c.set(c.get() + 1));
+            let mut smallest = left;
+            let mut smallest_expert = self.heaps[layer][left];
+            let mut smallest_rank = self.rank(layer, smallest_expert);
+            let right = left + 1;
+            if right < len {
+                let r_expert = self.heaps[layer][right];
+                let r_rank = self.rank(layer, r_expert);
+                if r_rank < smallest_rank {
+                    smallest = right;
+                    smallest_expert = r_expert;
+                    smallest_rank = r_rank;
+                }
+            }
+            if smallest_rank < rank {
+                self.heaps[layer][idx] = smallest_expert;
+                self.pos[layer][smallest_expert] = idx as u32;
+                idx = smallest;
+            } else {
+                break;
+            }
+        }
+        self.heaps[layer][idx] = expert;
+        self.pos[layer][expert] = idx as u32;
+    }
+
+    #[inline]
+    fn heap_push(&mut self, layer: usize, expert: usize) {
+        let idx = self.heaps[layer].len();
+        self.heaps[layer].push(expert);
+        self.pos[layer][expert] = idx as u32;
+        self.sift_up(layer, idx);
+    }
+
+    #[inline]
+    fn heap_pop_min(&mut self, layer: usize) {
+        let popped = self.heaps[layer].swap_remove(0);
+        self.pos[layer][popped] = NOT_IN_HEAP;
+        if !self.heaps[layer].is_empty() {
+            let moved = self.heaps[layer][0];
+            self.pos[layer][moved] = 0;
+            self.sift_down(layer, 0);
+        }
+    }
+
+    #[inline]
+    fn heap_remove(&mut self, layer: usize, expert: usize) {
+        let idx = self.pos[layer][expert] as usize;
+        let removed = self.heaps[layer].swap_remove(idx);
+        debug_assert_eq!(removed, expert);
+        self.pos[layer][expert] = NOT_IN_HEAP;
+        if idx < self.heaps[layer].len() {
+            let moved = self.heaps[layer][idx];
+            self.pos[layer][moved] = idx as u32;
+            if idx > 0 && self.rank(layer, moved) < self.rank(layer, self.heaps[layer][(idx - 1) / 2]) {
+                self.sift_up(layer, idx);
+            } else {
+                self.sift_down(layer, idx);
+            }
+        }
     }
 
     fn fill_entering(&mut self, layer: usize, experts: &[usize]) {
@@ -150,13 +259,28 @@ impl Measure {
     }
 
     fn read_decode(&mut self, layer: usize, token_step: u64, step: Step, experts: &[usize], slots: usize) {
+        // Trim heap if live slot share shrank since the previous step.
+        while self.heaps[layer].len() > slots {
+            self.heap_pop_min(layer);
+        }
+
         let mut misses = 0u64;
         for &expert in experts {
-            if self.depth(layer, expert) >= slots {
+            if self.pos[layer][expert] == NOT_IN_HEAP {
                 misses += 1;
             }
         }
         self.misses[layer] = self.misses[layer] * self.miss_decay + misses as f64;
+
+        // Remove already-resident experts before mutating their ranks so every
+        // heap operation sees a valid min-heap invariant.
+        self.scratch_reinsert.clear();
+        for &expert in experts {
+            if self.pos[layer][expert] != NOT_IN_HEAP {
+                self.heap_remove(layer, expert);
+                self.scratch_reinsert.push(expert);
+            }
+        }
 
         self.fill_entering(layer, experts);
         for i in 0..self.scratch_entering.len() {
@@ -188,35 +312,22 @@ impl Measure {
                 logged.last = logged.last.max(Some(step));
             }
         }
-        self.fill_entering(layer, experts);
-        for i in 0..self.scratch_entering.len() {
-            let expert = self.scratch_entering[i];
-            self.promote(layer, expert);
-        }
-    }
 
-    /// Mattson's priority stack update: move `expert` to the top of `layer`'s
-    /// stack, settling each passed expert below the more reused above it.
-    fn promote(&mut self, layer: usize, expert: usize) {
-        let at = self.stacks[layer].iter().position(|&above| above == expert);
-        let to = at.unwrap_or(self.stacks[layer].len());
-        if to == 0 {
-            if at.is_none() {
-                self.stacks[layer].push(expert);
+        if slots > 0 {
+            for i in 0..self.scratch_reinsert.len() {
+                let expert = self.scratch_reinsert[i];
+                self.heap_push(layer, expert);
             }
-            return;
-        }
-        let mut carried = std::mem::replace(&mut self.stacks[layer][0], expert);
-        for depth in 1..to {
-            let held = self.stacks[layer][depth];
-            if self.rank(layer, carried) > self.rank(layer, held) {
-                self.stacks[layer][depth] = carried;
-                carried = held;
+            self.fill_entering(layer, experts);
+            for i in 0..self.scratch_entering.len() {
+                let expert = self.scratch_entering[i];
+                if self.pos[layer][expert] == NOT_IN_HEAP {
+                    if self.heaps[layer].len() >= slots {
+                        self.heap_pop_min(layer);
+                    }
+                    self.heap_push(layer, expert);
+                }
             }
-        }
-        match at {
-            Some(at) => self.stacks[layer][at] = carried,
-            None => self.stacks[layer].push(carried),
         }
     }
 
@@ -250,10 +361,11 @@ impl Measure {
     fn bytes(&self) -> u64 {
         let layers: usize = self.layers.iter().map(|l| l.capacity() * size_of::<Logged>()).sum();
         let steps = self.steps_score.capacity() * size_of::<Score>();
-        let stacks: usize = self.stacks.iter().map(|s| s.capacity() * size_of::<usize>()).sum();
+        let heaps: usize = self.heaps.iter().map(|h| h.capacity() * size_of::<usize>()).sum();
+        let pos: usize = self.pos.iter().map(|p| p.capacity() * size_of::<u32>()).sum();
         let misses = self.misses.capacity() * size_of::<f64>();
-        let scratch = self.scratch_entering.capacity() * size_of::<usize>();
-        (size_of::<Self>() + layers + steps + stacks + misses + scratch) as u64
+        let scratch = (self.scratch_entering.capacity() + self.scratch_reinsert.capacity()) * size_of::<usize>();
+        (size_of::<Self>() + layers + steps + heaps + pos + misses + scratch) as u64
     }
 }
 
@@ -537,5 +649,41 @@ mod tests {
         assert!((inf.rate(0, 1, 1.0).unwrap() - 0.1).abs() < 1e-12);
         assert!((inf.rate(0, 2, 1.0).unwrap() - 0.025).abs() < 1e-12);
         assert_eq!(history.half_life(0), f64::INFINITY);
+    }
+
+    #[test]
+    fn work_bound_history_read_decode_independent_of_total_experts_1x_vs_16x() {
+        let measure = |num_experts: usize| -> usize {
+            let mut history = History::new(&[num_experts]);
+            let slots = 16usize;
+            // Warm up the 16-slot cache.
+            for step in 1..=32u64 {
+                let base = ((step as usize) * 7) % num_experts;
+                let mut experts = Vec::with_capacity(8);
+                for k in 0..8 {
+                    experts.push((base + k) % num_experts);
+                }
+                history.read_decode(0, step, &experts, slots);
+            }
+            HISTORY_HEAP_STEPS.with(|c| c.set(0));
+            for step in 33..=64u64 {
+                let base = ((step as usize) * 13) % num_experts;
+                let mut experts = Vec::with_capacity(8);
+                for k in 0..8 {
+                    experts.push((base + k) % num_experts);
+                }
+                history.read_decode(0, step, &experts, slots);
+            }
+            HISTORY_HEAP_STEPS.with(|c| c.get())
+        };
+
+        let steps_1x = measure(64);
+        let steps_16x = measure(1024);
+        // With an indexed min-heap of size `slots = 16`, heap work per step is
+        // `O(13 * K * log2(slots))` — completely independent of total experts `E`.
+        assert!(
+            steps_16x <= steps_1x.saturating_mul(2),
+            "expected O(K log slots) independent of E: 1x(E=64)={steps_1x}, 16x(E=1024)={steps_16x}"
+        );
     }
 }

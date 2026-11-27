@@ -704,6 +704,9 @@ pub struct Reuse {
     changed: BTreeSet<(usize, usize)>,
     /// The reads logged ([`Self::reads`]).
     reads: u64,
+    /// Active maximum decode depth (`1..=DEPTHS`), sizing per-layer calibration
+    /// rings and shadow depth pools to the load's actual decode width.
+    max_depths: usize,
     /// What the shadows have yet to read of the log ([`Self::shadows`]),
     /// none before they are made.
     shadowed: Option<Vec<ShadowFeed>>,
@@ -734,12 +737,19 @@ impl<'a> Ranker<'a> {
     /// [`Reuse::expected`] for `layer` (a member of this ranker's group)
     /// using the snapshotted `(horizon, a_bar, epoch, rates)`.
     pub fn expected(&self, layer: usize, expert: usize, read: Option<Unlogged>) -> Expected {
+        self.expected_with_override(layer, expert, read.map(|read| (read.step, 1.0)))
+    }
+
+    /// [`Reuse::expected`] for `layer` with an optional `(step, p)` lead
+    /// probability override (e.g. `p = 1.0` for unlogged future/prompt reads
+    /// or `p >= 0.70` for high-confidence `Source::Token` predictions).
+    pub fn expected_with_override(&self, layer: usize, expert: usize, read: Option<(Step, f64)>) -> Expected {
         debug_assert_eq!(
             self.reuse.groups[layer], self.group,
             "ranker for group {} called on layer {layer} of group {}",
             self.group, self.reuse.groups[layer],
         );
-        let override_lead = read.and_then(|read| self.reuse.lead_of(layer, read.step)).map(|lead| (lead, 1.0));
+        let override_lead = read.and_then(|(step, p)| self.reuse.lead_of(layer, step).map(|lead| (lead, p)));
         expected_for(
             &self.reuse.layers[layer],
             expert,
@@ -770,7 +780,19 @@ impl Reuse {
     /// No read logged of layers of `experts` experts each, in bank groups
     /// `groups`, whose pools hold `records` records each, timed by `time`.
     pub fn new(experts: &[usize], groups: &[usize], records: &[usize], time: horizon::Time) -> Self {
+        Self::with_depth(experts, groups, records, time, DEPTHS)
+    }
+
+    /// [`Self::new`] sized to `max_depths` (`1..=DEPTHS`).
+    pub fn with_depth(
+        experts: &[usize],
+        groups: &[usize],
+        records: &[usize],
+        time: horizon::Time,
+        max_depths: usize,
+    ) -> Self {
         assert_eq!(experts.len(), groups.len(), "each layer has its group");
+        let max_depths = max_depths.clamp(1, DEPTHS);
         let mut members = vec![0; records.len()];
         groups.iter().for_each(|&group| members[group] += 1);
         let none = Rank::new(Expected::ZERO, None);
@@ -786,7 +808,7 @@ impl Reuse {
         let layers = experts
             .iter()
             .zip(groups)
-            .map(|(&experts, &group)| Calibration::new(experts, 1, epochs[group]))
+            .map(|(&experts, &group)| Calibration::with_depth(experts, 1, epochs[group], max_depths))
             .collect();
         let stands = Stands::new(time.clone());
         let history = History::new(experts);
@@ -806,13 +828,25 @@ impl Reuse {
             top_count: vec![0; experts.len()],
             changed: BTreeSet::new(),
             reads: 0,
+            max_depths,
             shadowed: None,
         }
     }
 
     /// [`Self::new`], shared.
     pub fn ranking(experts: &[usize], groups: &[usize], records: &[usize], time: horizon::Time) -> Ranking {
-        Ranking(Arc::new(Yielding::new(Self::new(experts, groups, records, time))))
+        Self::ranking_with_depth(experts, groups, records, time, DEPTHS)
+    }
+
+    /// [`Self::with_depth`], shared.
+    pub fn ranking_with_depth(
+        experts: &[usize],
+        groups: &[usize],
+        records: &[usize],
+        time: horizon::Time,
+        max_depths: usize,
+    ) -> Ranking {
+        Ranking(Arc::new(Yielding::new(Self::with_depth(experts, groups, records, time, max_depths))))
     }
 
     /// The ranking `ranking` holds now, held ahead of its feed.
@@ -1413,7 +1447,7 @@ impl Reuse {
     pub fn bytes(&self) -> u64 {
         let calibration: u64 = self.layers.iter().map(Calibration::bytes).sum();
         let experts: Vec<usize> = self.layers.iter().map(Calibration::experts).collect();
-        let shadows = Shadows::calibration_bytes(&experts);
+        let shadows = Shadows::calibration_bytes(&experts, self.max_depths);
         let pools = self.pools.bytes();
         let order: usize = self.order.iter().map(|group| group.len() * std::mem::size_of::<Placed>()).sum();
         let ranks: usize = self.ranks.iter().map(|layer| layer.len() * std::mem::size_of::<Rank>()).sum();
@@ -1433,7 +1467,7 @@ impl Reuse {
     /// suffering a cold-start empty-pool miss cliff.
     pub(crate) fn build_shadows(&self) -> Shadows {
         let experts = self.layers.iter().map(Calibration::experts).collect::<Vec<_>>();
-        Shadows::new_with_pools(&experts, &self.groups, &self.pools)
+        Shadows::new_with_pools_and_depth(&experts, &self.groups, &self.pools, self.max_depths)
     }
 
     /// The shadows of its pools at every depth of foresight, as they stand
@@ -1664,12 +1698,14 @@ pub(super) mod tests {
     }
 
     /// Design §6: memory size of calibration & ranking is constant in run
-    /// length (equal after 10 steps and after 10,000 steps).
+    /// length once the ring and exercised lead tables warm up (equal after
+    /// `DEPTHS + 2` steps and after 10,000 steps).
     #[test]
     fn the_calibrations_size_is_set_by_experts_and_depths() {
         let time = time_for(&[4]);
         let mut reuse = Reuse::new(&[16], &[0], &[4], time.clone());
-        let mut bytes_at_10 = 0;
+        let warmup_step = (DEPTHS + 2) as u64;
+        let mut bytes_at_warmup = 0;
         for step in 1..=10_000 {
             register_front(&time, step);
             let e0 = (step as usize) % 16;
@@ -1682,13 +1718,13 @@ pub(super) mod tests {
             if step % 5 == 0 {
                 time.lock().moved(0, Tier::COMPUTE);
             }
-            if step == 10 {
-                bytes_at_10 = reuse.bytes();
+            if step == warmup_step {
+                bytes_at_warmup = reuse.bytes();
             }
         }
         let bytes_at_10k = reuse.bytes();
-        assert!(bytes_at_10 > 0);
-        assert_eq!(bytes_at_10, bytes_at_10k, "size must be constant over 10,000 steps");
+        assert!(bytes_at_warmup > 0);
+        assert_eq!(bytes_at_warmup, bytes_at_10k, "size must be constant over 10,000 steps");
     }
 
     /// Design §6: `p_g` decomposes over the first fallen row `f` using the
@@ -1748,13 +1784,21 @@ pub(super) mod tests {
     fn cold_start_priors_are_finite() {
         let time = time_for(&[4]);
         let mut reuse = Reuse::new(&[8], &[0], &[4], time.clone());
-        // Prompt read sets k = 2 while decode step count S_W = 0.
-        reuse.read(&RoutedRead { sequence: 1, layer: 0, experts: vec![0, 1], choices: 2 }, None, Evidence::Prompt);
+        // Before any prompt or decode read, history prior is finite.
         for e in 0..8 {
             let p_inf = reuse.layers[0].history_prob(e, 0);
             assert!(p_inf.is_finite(), "cold-start history_prob must be finite");
-            assert!((p_inf - 2.0 / 8.0).abs() < 1e-12, "expected k/E = 0.25, got {p_inf}");
         }
+        // Prompt read sets k = 2 while decode step count S_W = 0: prompt prior
+        // elevates prompt-seen experts (0, 1) above unseen experts (2..8) before decode step 1.
+        reuse.read(&RoutedRead { sequence: 1, layer: 0, experts: vec![0, 1], choices: 2 }, None, Evidence::Prompt);
+        let p_seen = reuse.layers[0].history_prob(0, 0);
+        let p_unseen = reuse.layers[0].history_prob(7, 0);
+        for e in 0..8 {
+            let p_inf = reuse.layers[0].history_prob(e, 0);
+            assert!(p_inf.is_finite(), "prompt-seeded cold-start history_prob must be finite");
+        }
+        assert!(p_seen > p_unseen, "prompt-seen expert ({p_seen}) must outrank unseen expert ({p_unseen})");
         // First decode step: ā = 1.0.
         register_front(&time, 2);
         assert_eq!(time.lock().tokens_per_step(0), Some(1.0));
@@ -2174,5 +2218,88 @@ pub(super) mod tests {
         assert_eq!(reuse.history.rate(0, 3), Some(0.0));
         assert_eq!(reuse.last(0, 2), None);
         assert_eq!(reuse.last(0, 3), None);
+    }
+
+    /// Under `Form::Verify` with `ā = 5.4`, `τ = 65` (`h_steps ≈ 12.0 < DEPTHS`),
+    /// leads `g >= 2` use `p_∞` (and `self.history` settles starting at `lead = 2`),
+    /// so a high-`p_∞` resident expert strictly outranks a 1-shot cold tail miss
+    /// from the immediately preceding verify burst.
+    #[test]
+    fn verify_short_horizon_preserves_p_inf_over_one_shot_cold_miss() {
+        let experts = 64;
+        let time = time_for(&[16]);
+        let mut reuse = Reuse::new(&[experts], &[0], &[16], time.clone());
+
+        // Seed 6 verify bursts (`ā ≈ 5.4`) where hot expert 0 appears in every burst,
+        // while rotating cold experts appear once.
+        for step in 1..=6u64 {
+            time.lock().register(step, Advance::Known(Tokens::new(5.4)));
+            let c1 = 10 + (step as usize) * 4;
+            let c2 = c1 + 1;
+            let c3 = c1 + 2;
+            let c4 = c1 + 3;
+            let full_keys = StepKeys {
+                choices: 1,
+                depths: vec![0, 1, 2, 3, 4],
+                verifies: true,
+                positions: Arc::from([(1, step * 5)]),
+                layers: vec![[
+                    keys(experts, &[0]),
+                    keys(experts, &[c1]),
+                    keys(experts, &[c2]),
+                    keys(experts, &[c3]),
+                    keys(experts, &[c4]),
+                ]
+                .concat()],
+            };
+            let mut chosen = vec![0, c1, c2, c3, c4];
+            chosen.sort_unstable();
+            reuse.read(
+                &RoutedRead { sequence: step, layer: 0, experts: chosen, choices: 1 },
+                Some(Arc::new(full_keys.rows(0))),
+                Evidence::Decode,
+            );
+        }
+
+        // Step 7: hot expert 0 is NOT touched in this single verify burst, while
+        // brand-new 1-shot cold tail expert 63 IS touched.
+        time.lock().register(7, Advance::Known(Tokens::new(5.4)));
+        let step7_keys = StepKeys {
+            choices: 1,
+            depths: vec![0, 1, 2, 3, 4],
+            verifies: true,
+            positions: Arc::from([(1, 35)]),
+            layers: vec![[
+                keys(experts, &[59]),
+                keys(experts, &[60]),
+                keys(experts, &[61]),
+                keys(experts, &[62]),
+                keys(experts, &[63]),
+            ]
+            .concat()],
+        };
+        reuse.read(
+            &RoutedRead { sequence: 7, layer: 0, experts: vec![59, 60, 61, 62, 63], choices: 1 },
+            Some(Arc::new(step7_keys.rows(0))),
+            Evidence::Decode,
+        );
+
+        let epoch = time.lock().group_epoch(0);
+        let rates = front_rates(&reuse.stands);
+        let cal = &reuse.layers[0];
+        // Verify history table already settled (at lead = 2, not waiting until lead = 17).
+        let deciles = cal.far_deciles(epoch).expect("live calibration");
+        let history_seen: f64 = deciles.iter().map(|d| d.history_seen).sum();
+        assert!(history_seen > 0.0, "history table must settle from lead 2 under Form::Verify");
+
+        // Evaluate at τ = 65, ā = 5.4 (h_steps ≈ 12.04 < DEPTHS = 16).
+        let tau = H::Tokens(Tokens::new(65.0));
+        let a_bar = 5.4;
+        let exp_hot = expected_for(cal, 0, &rates, tau, a_bar, epoch, None);
+        let exp_cold = expected_for(cal, 63, &rates, tau, a_bar, epoch, None);
+        assert!(
+            exp_hot > exp_cold,
+            "high-p_inf resident expert 0 ({exp_hot:?}) must strictly outrank 1-shot cold miss 63 ({exp_cold:?}) at h_steps < DEPTHS"
+        );
     }
 }

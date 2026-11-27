@@ -218,18 +218,32 @@ impl MemoryBudget {
     }
 
     /// Credit the worker process's already-resident untracked host footprint
-    /// (`phys_footprint - ledger_allocated`) back onto `unified_host_ram.available`
+    /// (`phys_footprint - ledger_allocated`) back onto the host-RAM budget
     /// (clamped to `capacity`). At live load (`device opened`), OS `supply`
     /// already excludes the worker's own resident host memory, while
     /// `AssessmentMemoryCharge::host_bytes()` accounts for the worker's total
-    /// host memory rather than only its post-open delta. Never alters the
-    /// Metal wired ceiling (`self.device`).
+    /// host memory rather than only its post-open delta.
+    ///
+    /// - On wired-ceiling unified Metal (`self.unified_host_ram.is_some()`),
+    ///   credits `unified_host_ram.available` without altering the Metal wired
+    ///   ceiling (`self.device`).
+    /// - On unwired unified memory (`self.host.is_none()` and
+    ///   `self.unified_host_ram.is_none()`, e.g. Linux/Windows CUDA or Vulkan
+    ///   UMA), `self.device` IS host RAM, so credits `self.device.available`.
+    /// - On split discrete GPUs (`self.host.is_some()`), leaves `self.device`
+    ///   (VRAM) untouched.
     pub fn credit_own_host_footprint(mut self, own_untracked: u64) -> Self {
         if let Some(ram) = self.unified_host_ram.as_mut() {
             ram.available = ram
                 .available
                 .saturating_add(own_untracked)
                 .min(ram.capacity);
+        } else if self.host.is_none() {
+            self.device.available = self
+                .device
+                .available
+                .saturating_add(own_untracked)
+                .min(self.device.capacity);
         }
         self
     }

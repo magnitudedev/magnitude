@@ -1006,8 +1006,8 @@ impl MethodState for DrafterState {
         let generated = match &mut self.round {
             RoundStage::Proposed { proposal, verified } => {
                 // The verified prefix is all a round may accept; trailing
-                // proposals beyond `count` run as front rows when the live
-                // cost function `DraftController::front_rows` picks `F* > 0`.
+                // proposals beyond `count` run as front rows when the sealed
+                // `DecodePassPlan` picks `F > 0` on a fronting target graph.
                 let count = match (&mut self.width, *verified) {
                     (_, Some(verified)) => verified,
                     (WidthPolicy::Adaptive(control), None) => control.verify(selects.len()),
@@ -1016,12 +1016,28 @@ impl MethodState for DrafterState {
                 .min(proposal.len())
                 .min(selects.len());
                 *verified = Some(count);
-                // Speculative verify passes run on non-fronting target graphs
-                // (`load.fronts() == false`, `inputs.guesses == None`), so
-                // trailing front rows must stay empty.
+                let front_count = if count == 0 {
+                    0
+                } else {
+                    match &self.width {
+                        WidthPolicy::Adaptive(control) => {
+                            control.sealed_plan().map_or(0, |plan| plan.front)
+                        }
+                        WidthPolicy::Fixed(_) => 0,
+                    }
+                    .min(proposal.len().saturating_sub(count))
+                    .min(selects.len().saturating_sub(count))
+                };
                 return Propose::Tokens {
                     acceptable: proposal[..count].to_vec(),
-                    front: Vec::new(),
+                    front: proposal[count..count + front_count]
+                        .iter()
+                        .copied()
+                        .map(|token| Guess {
+                            token,
+                            kind: GuessKind::Chained,
+                        })
+                        .collect(),
                 };
             }
             RoundStage::Declined | RoundStage::Entering { .. } | RoundStage::Drafting(_) => {

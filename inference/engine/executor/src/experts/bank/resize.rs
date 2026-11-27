@@ -96,6 +96,11 @@ pub(in crate::experts) struct Stores {
     group_pool: Vec<usize>,
     groups: Vec<SlabTensor>,
     lent: Vec<u64>,
+    /// Dedicated tail VRAM scratch slots (`stage_base .. stage_base + 4`) backed
+    /// at open for unified zero-switch 3-tier decode (`routed_stage_host`).
+    /// Charged to the load ledger in `charged_per_pool()`, excluded from
+    /// directory-usable `present()` and `claim_to()`.
+    reserved_tail: Vec<AtomicU64>,
     record_bytes: Vec<Vec<u64>>,
     rise_gate: Arc<RiseGate>,
 }
@@ -117,7 +122,8 @@ impl Stores {
             lent.push(leading);
             record_bytes.push(bytes);
         }
-        Self { pools, group_pool, groups: stores, lent, record_bytes, rise_gate: Arc::new(RiseGate::new()) }
+        let reserved_tail = (0..stores.len()).map(|_| AtomicU64::new(0)).collect();
+        Self { pools, group_pool, groups: stores, lent, reserved_tail, record_bytes, rise_gate: Arc::new(RiseGate::new()) }
     }
 
     /// The pool at index `pool`.
@@ -134,9 +140,11 @@ impl Stores {
         &self.groups[group]
     }
 
-    /// The records group `group` holds: its slabs, lent ones included.
+    /// The directory-usable records group `group` holds: its slabs, lent ones
+    /// included, excluding dedicated tail decode stage scratch slots.
     pub(super) fn present(&self, group: usize) -> u64 {
-        self.group(group).backed_count() as u64
+        (self.group(group).backed_count() as u64)
+            .saturating_sub(self.reserved_tail[group].load(Ordering::Acquire))
     }
 
     /// Count of device-ordered table repoints (`moves::submit`) submitted for
@@ -146,11 +154,13 @@ impl Stores {
     }
 
     /// Per-pool whole-block charge (`BlockSize::charge`) holding a granule for
-    /// each record beyond the lent ones in every group mapped to that pool.
+    /// each backed record beyond the lent ones in every group mapped to that
+    /// pool (including dedicated tail decode stage scratch slots).
     pub(super) fn charged_per_pool(&self) -> Vec<u64> {
         let mut per_pool = vec![0u64; self.pools.len()];
         for group in 0..self.groups.len() {
-            per_pool[self.group_pool[group]] += self.present(group) - self.lent[group];
+            per_pool[self.group_pool[group]] +=
+                (self.group(group).backed_count() as u64) - self.lent[group];
         }
         self.pools
             .iter()
@@ -192,10 +202,33 @@ impl Stores {
     pub(in crate::experts) fn claim_to(&self, group: usize, records: u64) -> Result<Vec<usize>, TensorError> {
         seismic::memory::assert_blocking_allocation_allowed("Stores::claim_to");
         let store = self.group(group);
-        let have = store.backed_count() as u64;
+        let have = self.present(group);
         let need = usize::try_from(records.saturating_sub(have))
             .map_err(|_| TensorError::SlabLayout("requested records exceed host domain".into()))?;
         store.add_slabs(need, seismic::SlabFill::Unwritten)
+    }
+
+    /// Back `count` dedicated tail decode-stage scratch slots starting at
+    /// `start_slot` (`plan.records(group)`), charged to the pool/load ledger
+    /// and excluded from `present()` / `claim_to()`.
+    pub(in crate::experts) fn claim_tail_stage(
+        &self,
+        group: usize,
+        start_slot: u64,
+        count: u64,
+    ) -> Result<Vec<usize>, TensorError> {
+        if count == 0 {
+            return Ok(Vec::new());
+        }
+        seismic::memory::assert_blocking_allocation_allowed("Stores::claim_tail_stage");
+        let store = self.group(group);
+        let start = usize::try_from(start_slot)
+            .map_err(|_| TensorError::SlabLayout("stage_base exceeds host domain".into()))?;
+        let count_usize = usize::try_from(count)
+            .map_err(|_| TensorError::SlabLayout("stage count exceeds host domain".into()))?;
+        let claimed = store.add_slabs_from(start, count_usize, seismic::SlabFill::Unwritten)?;
+        self.reserved_tail[group].fetch_add(claimed.len() as u64, Ordering::AcqRel);
+        Ok(claimed)
     }
 
     /// Free `claimed` of group `group`, which nothing read: a refusal

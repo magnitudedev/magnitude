@@ -8,6 +8,7 @@
 //! granule at a time.
 
 use super::*;
+use crate::memory::supply::Ceiling;
 use seismic::memory::Wiring;
 use std::sync::Mutex as Lock;
 use std::time::{Duration, Instant};
@@ -354,7 +355,18 @@ impl Machine {
         let shape = crate::experts::derived::BankShape::new(GRANULE, 0, u64::MAX / GRANULE, u64::MAX / GRANULE);
         let held = self.bank.len() as u64;
         let est = self.ledger.estimate();
-        let slots = crate::experts::derived::held_target_in(est.hold_room(), est.target(), held, 0, &shape, &|slots| slots * GRANULE);
+        let budget = est.budget();
+        let limit = est.cap().map_or(budget, |cap| budget.min(cap));
+        let external_over = est.held().saturating_sub(limit);
+        let slots = crate::experts::derived::held_target_with_pressure(
+            est.hold_room(),
+            est.target(),
+            held,
+            0,
+            external_over,
+            &shape,
+            &|slots| slots * GRANULE,
+        );
         let at = self.at();
         if slots > held {
             for _ in held..slots {
@@ -642,7 +654,7 @@ fn wired_stays_under_the_ceiling() {
     os.wired = Some((40 * GB, 6 * GB));
     os.hot = 4 * GB;
     let mut machine = filled(os, 0);
-    let reserve = (40 * GB) / 12;
+    let reserve = Ceiling::execution_reserve_for(40 * GB);
     let cushion = GRANULE;
     for _ in 0..10 {
         machine.step(300);
@@ -850,7 +862,7 @@ fn wired(machine: &Machine) -> (Option<u64>, Option<u64>) {
 /// (with `wired_rise` applied to growth targets rather than baked into `grant`).
 #[test]
 fn only_wired_memory_is_the_processs_in_the_wire_count() {
-    let reserve = (40 * GB) / 12;
+    let reserve = Ceiling::execution_reserve_for(40 * GB);
     let mut os = Os::new();
     os.wired = Some((40 * GB, 6 * GB));
     os.hot = 4 * GB;
@@ -963,7 +975,7 @@ fn an_exact_count_leaves_no_bytes_unobserved_but_an_accounting_error() {
 /// snapshot.
 #[test]
 fn a_wire_count_short_of_the_processs_is_a_shortfall() {
-    let reserve = (40 * GB) / 12;
+    let reserve = Ceiling::execution_reserve_for(40 * GB);
     let mut os = Os::new();
     os.wired = Some((40 * GB, 0));
     let mut machine = Machine::load(os, 20 * GB, 0);
@@ -991,7 +1003,7 @@ fn a_wire_count_short_of_the_processs_is_a_shortfall() {
 /// idle for 3 s.
 #[test]
 fn an_idle_span_past_the_residency_lapse_moves_nothing() {
-    let reserve = (40 * GB) / 12;
+    let reserve = Ceiling::execution_reserve_for(40 * GB);
     let mut os = Os::new();
     os.wired = Some((40 * GB, 6 * GB));
     os.hot = 4 * GB;

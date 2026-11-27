@@ -729,14 +729,17 @@ pub(crate) struct Times {
     /// [`Times::decided`], so every turnover counts each step it registers.
     pub(crate) clock: Clock,
     /// Per group, per tier present (one on unified memory, two beside a
-    /// host tier): the turnover and the tier's records now (its K).
-    tiers: Vec<Vec<(Turnover, u64)>>,
+    /// host tier): the turnover, the tier's records now (its K), the tier's
+    /// records at the last `regime_epoch` advance (its regime anchor), and
+    /// whether the tier currently holds every expert (`whole`).
+    tiers: Vec<Vec<(Turnover, u64, u64, bool)>>,
     /// Every tier-0 record of the load, every tier-0 move: global rates
     /// (σ, Δ_j, the regime's and gate's terms) roll on its epochs. Its K
     /// is the sum of the groups' tier-0 records.
     bank: (Turnover, u64),
-    /// Physical tier/residency regime epoch: advances on any tier resize
-    /// (compute or host) or [`ResidencyState`] change.
+    /// Physical tier/residency regime epoch: advances on any tier shrink,
+    /// material tier growth (>= 20% from the last regime anchor), or
+    /// [`ResidencyState`] change.
     regime: RegimeEpoch,
     /// Latest physical residency/tier state.
     residency: ResidencyState,
@@ -748,11 +751,14 @@ impl Time {
     /// `behind` steps ([`Clock::new`]).
     pub(crate) fn new(records: &[Vec<u64>], behind: usize) -> Self {
         let clock = Clock::new(behind);
-        let tiers: Vec<Vec<(Turnover, u64)>> = records
+        let tiers: Vec<Vec<(Turnover, u64, u64, bool)>> = records
             .iter()
             .map(|tiers| {
                 assert!(!tiers.is_empty() && tiers.len() <= usize::from(u8::MAX), "a group has 1..=255 tiers: {tiers:?}");
-                tiers.iter().map(|&records| (Turnover::new(&clock), records)).collect()
+                tiers
+                    .iter()
+                    .map(|&records| (Turnover::new(&clock), records, records, false))
+                    .collect()
             })
             .collect();
         let bank = (Turnover::new(&clock), records.iter().map(|tiers| tiers[0]).sum());
@@ -777,7 +783,7 @@ impl Times {
     /// S.
     pub(crate) fn register(&mut self, step: Step, advance: Advance) {
         self.clock.register(step, advance);
-        for (turnover, _) in self.tiers.iter_mut().flatten() {
+        for (turnover, _, _, _) in self.tiers.iter_mut().flatten() {
             turnover.stepped();
         }
         self.bank.0.stepped();
@@ -794,7 +800,7 @@ impl Times {
     /// T. A tier-0 move is also a bank-wide move.
     pub(crate) fn moved(&mut self, group: usize, tier: TierId) {
         let Self { clock, tiers, bank, .. } = self;
-        let (turnover, records) = Self::tier(tiers, group, tier);
+        let (turnover, records, _, _) = Self::tier(tiers, group, tier);
         turnover.moved(clock, *records);
         if tier == TierId::COMPUTE {
             bank.0.moved(clock, bank.1);
@@ -803,19 +809,41 @@ impl Times {
 
     /// `group`'s `tier` resized to `records`: its turnover closes its epoch
     /// and restarts `Unturned`; a tier-0 resize does so for the bank-wide
-    /// turnover too, at the bank's new sum. Any actual capacity change on any
-    /// tier advances [`Self::regime_epoch`].
+    /// turnover too, at the bank's new sum.
+    ///
+    /// Any shrink (`records < before`) or partial <-> whole residency
+    /// transition advances [`Self::regime_epoch`] immediately. Elastic growth
+    /// within partial residency advances [`Self::regime_epoch`] once
+    /// cumulative growth from the last regime anchor reaches >= 20% (or from
+    /// 0), preventing small mid-request bank grows (e.g. +2..10%) from wiping
+    /// proven target decode costs and triggering M = 1 probe storms.
     pub(crate) fn resized(&mut self, group: usize, tier: TierId, records: u64) {
+        let whole = self.tiers[group][Self::index(&self.tiers[group], group, tier)].3;
+        self.resized_with_whole(group, tier, records, whole);
+    }
+
+    /// [`Self::resized`] with the tier's updated `whole` residency status:
+    /// crossing the partial <-> whole boundary always advances
+    /// [`Self::regime_epoch`] even when the slot delta is `< 20%` (e.g.
+    /// `509 -> 512`).
+    pub(crate) fn resized_with_whole(&mut self, group: usize, tier: TierId, records: u64, whole: bool) {
         let Self { clock, tiers, bank, regime, .. } = self;
-        let (turnover, held) = Self::tier(tiers, group, tier);
+        let (turnover, held, anchor, was_whole) = Self::tier(tiers, group, tier);
         let before = std::mem::replace(held, records);
+        let crossed_whole = std::mem::replace(was_whole, whole) != whole;
         turnover.resized(clock);
         if tier == TierId::COMPUTE {
             bank.1 = bank.1 - before + records;
             bank.0.resized(clock);
         }
-        if before != records {
-            *regime = regime.next();
+        if before != records || crossed_whole {
+            let shrunk = records < before;
+            let material_growth = records > before
+                && (*anchor == 0 || records.saturating_sub(*anchor) >= (*anchor / 5).max(1));
+            if shrunk || material_growth || crossed_whole {
+                *anchor = records;
+                *regime = regime.next();
+            }
         }
     }
 
@@ -827,6 +855,9 @@ impl Times {
         if next != self.residency {
             self.residency = next;
             self.regime = self.regime.next();
+            for (_, held, anchor, _) in self.tiers.iter_mut().flatten() {
+                *anchor = *held;
+            }
             true
         } else {
             false
@@ -840,7 +871,7 @@ impl Times {
 
     /// τ of `group`'s `tier` for `reader` ([`Turnover::horizon`]).
     pub(crate) fn horizon(&self, group: usize, tier: TierId, reader: Reader) -> Option<Horizon> {
-        let (turnover, records) = &self.tiers[group][Self::index(&self.tiers[group], group, tier)];
+        let (turnover, records, _, _) = &self.tiers[group][Self::index(&self.tiers[group], group, tier)];
         turnover.horizon(reader, *records, &self.clock)
     }
 
@@ -860,14 +891,14 @@ impl Times {
         self.bank.0.epoch()
     }
 
-    fn tier(tiers: &mut [Vec<(Turnover, u64)>], group: usize, tier: TierId) -> &mut (Turnover, u64) {
+    fn tier(tiers: &mut [Vec<(Turnover, u64, u64, bool)>], group: usize, tier: TierId) -> &mut (Turnover, u64, u64, bool) {
         let index = Self::index(&tiers[group], group, tier);
         &mut tiers[group][index]
     }
 
     /// `tier`'s index in `group`'s tiers. Panics where the group has no
     /// such tier.
-    fn index(tiers: &[(Turnover, u64)], group: usize, tier: TierId) -> usize {
+    fn index(tiers: &[(Turnover, u64, u64, bool)], group: usize, tier: TierId) -> usize {
         let index = tier.index();
         assert!(index < tiers.len(), "group {group} has no {tier:?} tier");
         index
@@ -1168,5 +1199,49 @@ mod tests {
     fn sub_one_token_advance_still_panics() {
         let mut clock = Clock::new(4);
         clock.register(1, Advance::Known(Tokens::new(0.9999999999998863)));
+    }
+
+    /// Reproduces `471c62` (`rtx3090-64g-gen4`): small elastic bank grows
+    /// (`297 -> 325 -> 331`, +11.4% cumulative) must not bump `regime_epoch`,
+    /// whereas material growth (>= 20%) or any shrink advances `regime_epoch`
+    /// immediately.
+    #[test]
+    fn small_elastic_bank_growth_preserves_regime_epoch_while_shrink_or_large_growth_advances_it() {
+        let time = Time::new(&[vec![297, 512]], 8);
+        let mut times = time.lock();
+        let initial = times.regime_epoch();
+        // +9.4% and +1.8% elastic grows (cumulative +11.4% < 20%): regime_epoch stays fixed.
+        times.resized(0, Tier::COMPUTE, 325);
+        assert_eq!(times.regime_epoch(), initial, "297 -> 325 (+9.4%) must not bump regime_epoch");
+        times.resized(0, Tier::COMPUTE, 331);
+        assert_eq!(times.regime_epoch(), initial, "325 -> 331 (+11.4% cumulative) must not bump regime_epoch");
+        // Reaching >= 20% cumulative growth (297 + 59 = 356) advances regime_epoch and re-anchors.
+        times.resized(0, Tier::COMPUTE, 356);
+        let after_large_grow = times.regime_epoch();
+        assert_eq!(after_large_grow, initial.next(), "297 -> 356 (+20%) must advance regime_epoch");
+        // Any shrink immediately advances regime_epoch.
+        times.resized(0, Tier::COMPUTE, 355);
+        assert_eq!(times.regime_epoch(), after_large_grow.next(), "any shrink must advance regime_epoch");
+    }
+
+    /// Crossing the partial <-> whole residency boundary must advance
+    /// `regime_epoch` immediately even when the slot growth is `< 20%`
+    /// (e.g. `509 -> 512`), so stale partial-bank pricing is never retained
+    /// once whole residency is reached.
+    #[test]
+    fn partial_to_whole_residency_crossing_advances_regime_epoch_under_20_percent() {
+        let time = Time::new(&[vec![509]], 8);
+        let mut times = time.lock();
+        let initial = times.regime_epoch();
+        // +0.2% partial growth (509 -> 510, still partial): stays on same epoch.
+        times.resized_with_whole(0, Tier::COMPUTE, 510, false);
+        assert_eq!(times.regime_epoch(), initial, "509 -> 510 partial growth must not bump regime_epoch");
+        // +0.4% growth crossing into whole (510 -> 512, whole=true): must bump regime_epoch.
+        times.resized_with_whole(0, Tier::COMPUTE, 512, true);
+        let at_whole = times.regime_epoch();
+        assert_eq!(at_whole, initial.next(), "crossing into whole residency must advance regime_epoch");
+        // Shrinking back to partial (512 -> 509, whole=false): must bump regime_epoch.
+        times.resized_with_whole(0, Tier::COMPUTE, 509, false);
+        assert_eq!(times.regime_epoch(), at_whole.next(), "leaving whole residency must advance regime_epoch");
     }
 }

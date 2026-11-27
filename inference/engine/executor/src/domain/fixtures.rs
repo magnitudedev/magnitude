@@ -1983,7 +1983,8 @@ impl ProgramFamily for TestFamily {
                     stored_reads: STORED_READS
                         .with(|reads| std::mem::take(&mut *reads.borrow_mut())),
                     expert_step: EXPERT_STEPS.with(|steps| steps.borrow_mut().take()),
-                    decode_landings: Vec::new(),
+                    decode_reactor_banks: Vec::new(),
+                    prompt_routes: None,
                 },
             )
         }))

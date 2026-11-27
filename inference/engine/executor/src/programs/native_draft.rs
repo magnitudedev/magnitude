@@ -1284,6 +1284,7 @@ impl<'d> DraftSplit<'d> {
                     entries: checked_bank.entries::<NativeGraphMetadata>(),
                     ports: &mut split_banks,
                     parks: &mut split_parks,
+                    unified: None,
                 }),
                 None => LayerBank::<NativeGraphMetadata>::Held,
             };
@@ -2621,6 +2622,7 @@ impl<'r, 'a, G: GraphDraft + 'a> BlockPass<'r, 'a, G> {
                             entries,
                             ports: banks,
                             parks,
+                            unified: None,
                         }),
                         None => LayerBank::Held,
                     };
@@ -2670,6 +2672,7 @@ impl<'r, 'a, G: GraphDraft + 'a> BlockPass<'r, 'a, G> {
                                 entries,
                                 ports: banks,
                                 parks,
+                                unified: None,
                             }),
                             None => LayerBank::Held,
                         };
@@ -2709,6 +2712,7 @@ impl<'r, 'a, G: GraphDraft + 'a> BlockPass<'r, 'a, G> {
                                 entries,
                                 ports: banks,
                                 parks,
+                                unified: None,
                             }),
                             None => LayerBank::Held,
                         };
@@ -5879,29 +5883,22 @@ mod composition_tests {
         assert_ne!(target_group, draft_group);
         assert!(draft_layers.iter().all(|(_, layer)| layer.group == draft_group));
 
-        // On discrete CUDA (`Placer::Tier`), once `slots` exceeds the target
-        // decode/verify working set (`draft_pin_threshold()`), draft layers ramp
-        // smoothly 1 slot at a time to `layer.experts` (32/32 -> whole draft
-        // group) while target layers hold at `threshold`, then target resumes
-        // growing 1:1. On tight VRAM (`slots <= threshold`), both grow together.
-        let threshold = bank.draft_pin_threshold().expect("discrete bank has draft pin threshold");
-        let extra = bank.draft_extra_slots();
-        for (_, layer) in &draft_layers {
-            assert_eq!(bank.layer_vram_slots(layer, threshold), threshold.min(layer.experts));
-            assert_eq!(bank.layer_vram_slots(layer, threshold + 1), (threshold + 1).min(layer.experts));
-            assert_eq!(bank.layer_vram_slots(layer, threshold + extra), layer.experts);
+        // Under the unified marginal-value residency allocator, every single
+        // step `s -> s + 1` in `0..max_slots()` is smooth (adds 1 slot to one
+        // group), reaches whole at `max_slots()`, and disjointly sizes host
+        // tier records to `E - V` (plus landing reserve / lent).
+        assert_eq!(bank.max_slots(), 32 + 32, "2 groups of 32 experts -> 64 total steps");
+        for s in 0..bank.max_slots() {
+            let t_delta = bank.group_vram_slots(target_group, s + 1) - bank.group_vram_slots(target_group, s);
+            let d_delta = bank.group_vram_slots(draft_group, s + 1) - bank.group_vram_slots(draft_group, s);
+            assert_eq!(t_delta + d_delta, 1, "each step advances exactly one group by 1 slot");
         }
-        for (_, layer) in &target_layers {
-            assert_eq!(bank.layer_vram_slots(layer, threshold), threshold.min(layer.experts));
-            assert_eq!(bank.layer_vram_slots(layer, threshold + extra), threshold.min(layer.experts));
-            assert_eq!(bank.layer_vram_slots(layer, threshold + extra + 1), (threshold + 1).min(layer.experts));
-        }
-        assert_eq!(bank.records_at(draft_group, threshold + extra), 3 * 32);
-        assert_eq!(bank.records_at(draft_group, 45), 3 * 32);
         assert!(bank.whole_at(bank.max_slots()), "bank must reach whole at max_slots");
+        let draft_vram = bank.group_vram_slots(draft_group, bank.slots);
+        let draft_rem = 32 - draft_vram;
         assert!(
-            bank.host_records(draft_group, 32) >= 3 * 32,
-            "all 3×32 draft experts must be backed in pinned Host RAM"
+            bank.host_records(draft_group, 32) >= 3 * draft_rem,
+            "all remaining 3×{draft_rem} non-VRAM draft experts must be backed in pinned Host RAM"
         );
 
         // First draft layer sets its own step word.

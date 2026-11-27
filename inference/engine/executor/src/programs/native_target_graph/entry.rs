@@ -158,7 +158,7 @@ impl PreparedTargetEntryGraph {
             load.notifies_selection(),
             landing.map(LandingEntries::native),
             load.keeps_token_rows(),
-            load.fronts(),
+            load.fronts_target(),
             &load.weight(TARGET_TABLE).map_err(|error| error.to_string())?,
             EntryWidth { hidden: &Dim::from(geometry.hidden), transform: transform_arguments(embedding_transform(geometry)) },
             &Dim::from(rows),
@@ -253,11 +253,8 @@ pub(super) fn entry_graph_topology<'a, G: GraphDraft + 'a>(
     rows: &Dim,
     source: EntryTokens,
 ) -> Result<EntryGraphDraft<G>, GraphError> {
-    if copy.is_some() != (notifies || keeps_tokens) {
+    if copy.is_some() != (notifies || keeps_tokens || keeps_guesses) {
         return Err("the token row copy entry is given exactly where token rows are copied".into());
-    }
-    if keeps_guesses && !keeps_tokens {
-        return Err("a load that fronts keeps its token rows".into());
     }
     let table = graph.weight_port(weight.resident, &weight.shape)?;
     let two = Dim::from(2);
@@ -395,7 +392,7 @@ pub(super) fn certify_entry<L: Certified>(
             load.notifies_selection(),
             landing.as_ref().map(CheckedLandingEntries::entries),
             load.keeps_token_rows(),
-            load.fronts(),
+            load.fronts_target(),
             &weight,
             EntryWidth {
                 hidden: &Dim::from(geometry.hidden),
@@ -457,7 +454,7 @@ pub(crate) fn checked_entry_graph_storage(
         load.notifies_selection(),
         landing.as_ref().map(CheckedLandingEntries::entries),
         load.keeps_token_rows(),
-        load.fronts(),
+        load.fronts_target(),
         &weight,
         EntryWidth { hidden: &Dim::from(geometry.hidden), transform: transform_arguments(embedding_transform(geometry)) },
         &Dim::from(rows),

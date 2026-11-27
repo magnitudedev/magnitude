@@ -214,7 +214,13 @@ mod tests {
     const RECORD: u64 = ExpertLines::REFERENCE_RECORD;
 
     fn lines() -> ExpertLines {
-        ExpertLines::reference(RECORD)
+        let mut base = ExpertLines::reference(RECORD);
+        // Keep a host tier present (`memory: Some(...)`) with effectively
+        // uncontended HostRam bandwidth so this test exercises pure two-queue
+        // makespan arithmetic without shared-bus CPU throttling.
+        base.host.memory = Some(magnitude_cost_model::Nanoseconds::try_from(1).unwrap());
+        base.host.joint_memory = None;
+        base
     }
 
     /// A step routing 8 experts at each of four layers, one choice each.

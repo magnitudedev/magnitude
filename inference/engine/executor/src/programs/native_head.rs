@@ -474,7 +474,7 @@ impl CheckedHeadEntries {
                 .shortlist
                 .map(|coarse| [("OW", coarse), ("A", binding.activation)]),
             selection: [],
-            fronts: load.fronts(),
+            fronts: load.chains_front(),
         })
     }
 
@@ -831,6 +831,7 @@ impl<'h> HeadSplit<'h> {
                 entries: checked_bank.entries::<NativeGraphMetadata>(),
                 ports: &mut split_banks,
                 parks: &mut split_parks,
+                unified: None,
             }),
             None => LayerBank::<NativeGraphMetadata>::Held,
         };
@@ -1779,6 +1780,7 @@ fn head_feed_forward<'a, G: GraphDraft + 'a>(
             entries,
             ports: banks,
             parks: &mut pass_parks,
+            unified: None,
         }),
         None => LayerBank::Held,
     };
@@ -3420,7 +3422,7 @@ mod composition_tests {
         let head_block = CausalHeadBlock::of(&head, &head.blocks[0]).unwrap();
         let geometry = state.head_state().unwrap().head_geometry().unwrap();
         let classes =
-            head_graph_classes(limits, geometry, method.draft_rows(), load.fronts(), false).unwrap();
+            head_graph_classes(limits, geometry, method.draft_rows(), load.chains_front(), false).unwrap();
         assert!(classes
             .iter()
             .any(|c| c.steps() == 4 && HeadPasses::of(c.launch).shaped));
@@ -3565,7 +3567,7 @@ mod composition_tests {
         }
     }
 
-    /// Regression for `f81c51` (GLM-5.3-Flash with `load.fronts() == true`):
+    /// Regression for `f81c51` (GLM-5.3-Flash with `load.chains_front() == true`):
     /// a banked `HeadSublayer` graph must never declare a target front-row
     /// `guesses` port in `routed_step`, so every port in a banked `Front` or
     /// `Transaction` head graph is bound at submission.
@@ -3612,7 +3614,7 @@ mod composition_tests {
             substrate,
         )
         .unwrap();
-        assert!(load.fronts(), "MTP load enables fronts");
+        assert!(load.chains_front(), "MTP load enables fronts");
 
         let plan = load
             .program_plan(&definition, magnitude_state::KvCodec::Dense)

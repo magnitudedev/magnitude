@@ -131,6 +131,9 @@ impl ExpertBank {
             };
             match allocation {
                 BankAllocation::Shared { element, extents } => held(seismic::Contract::Shared, Tensor::shared(charges, *element, extents)),
+                BankAllocation::SharedRecords { element, extents, slot_bytes } => {
+                    held(seismic::Contract::Shared, Tensor::shared_records(charges, *element, extents, *slot_bytes))
+                }
                 BankAllocation::Words { element, extents } => held(seismic::Contract::Words, Tensor::words(charges, *element, extents)),
                 BankAllocation::Protocol { element, extents } => held(seismic::Contract::Words, Tensor::protocol_words(charges, *element, extents)),
                 BankAllocation::Device { element, extents } => held(seismic::Contract::DeviceOnly, Tensor::zeros(charges, *element, extents)),
@@ -177,7 +180,7 @@ impl ExpertBank {
                 .map(|group| {
                     let pool = &pools[plan.group_pool(group)];
                     let (extent, lent) = match tier {
-                        BankTier::Bank => (plan.records(group), plan.lent(group)),
+                        BankTier::Bank => (plan.slab_records(group), plan.lent(group)),
                         BankTier::Host => (plan.host_extent(group), plan.host_lent(group)),
                     };
                     let record = &plan.groups()[group].record;
@@ -221,10 +224,18 @@ impl ExpertBank {
         // the fill, `ExpertBank::back_host`), claimed lowest first, so each
         // group holds records 0 onward. The pool charges their granules,
         // so the claims are one change.
+        let decode_stage_active = crate::experts::decode_dma_enabled(charges.device().backend())
+            && plan.placer() == Placer::Tier
+            && !plan.whole();
         changes.change(|_| {
             (0..plan.groups().len()).try_for_each(|group| {
                 let claimed = |tier: BankTier| move |error: seismic::TensorError| WeightImportError::allocating(plan.host().contract(tier), &error);
                 bank_stores.claim_to(group, counts.records_at(group, plan.slots)).map_err(claimed(BankTier::Bank))?;
+                if decode_stage_active {
+                    bank_stores
+                        .claim_tail_stage(group, plan.records(group), plan.decode_stage_slots())
+                        .map_err(claimed(BankTier::Bank))?;
+                }
                 if let Some(host) = &host_stores {
                     host.claim_to(group, counts.host_records(group, 0)).map_err(claimed(BankTier::Host))?;
                 }
@@ -256,6 +267,23 @@ impl ExpertBank {
             tensor.clone().write_from_host(&word).map_err(|error| format!("a window index: {error}"))?;
         }
         let (staging_pools, pool_of) = plan.staging_pools();
+        let staging_views = if plan.placer() == Placer::Bank {
+            let count = plan.unified_staging_records_with_paths(plan.paths);
+            staging_pools
+                .iter()
+                .map(|pool| {
+                    let slot_bytes = plan.unified_staging_slot_bytes(pool.kind)?;
+                    layout
+                        .staging
+                        .get(pool.kind)
+                        .ok_or("a staging pool of a tensor the record lacks")?
+                        .carried_records(pool.source, &[count, pool.matrix[0], pool.matrix[1]], slot_bytes)
+                        .map_err(|error| format!("staging view failed: {error}"))
+                })
+                .collect::<Result<Vec<_>, String>>()?
+        } else {
+            Vec::new()
+        };
         let conveyor = plan.conveyor();
         // Each pool's conveyor: its view of the lender's lent records as the
         // conveyor's layout lays it there, plainly: the one store's on
@@ -355,12 +383,17 @@ impl ExpertBank {
                 }))
             })
             .transpose()?;
+        let decode_reactor = transport
+            .has_decode_dma()
+            .then(|| super::DecodeReactor::start(&charges.device(), transport.clone()))
+            .transpose()?;
         let bank = Self {
             layout,
             floor,
             held: Mutex::new(None),
             device: charges.device(),
             pool_of,
+            staging_views,
             conveyors,
             scratch,
             homes,
@@ -382,8 +415,12 @@ impl ExpertBank {
             counts,
             cache: Arc::new(super::cache::BankCache::new(changes)),
             transport,
+            decode_reactor,
         };
         let bank = Arc::new(bank);
+        if let Some(reactor) = &bank.decode_reactor {
+            reactor.attach_bank(Arc::downgrade(&bank));
+        }
         bank.cache.set_reclaimer(BankTier::Bank, super::resize::BankReclaimer::new(&bank, BankTier::Bank));
         if bank.host.is_some() {
             bank.cache.set_reclaimer(BankTier::Host, super::resize::BankReclaimer::new(&bank, BankTier::Host));
@@ -591,21 +628,27 @@ fn watch(
     }
     // A staging or conveyor record is one contiguous range of its pool's,
     // one after another (a conveyor's in the lender's lent records), which
-    // reads land in in place.
+    // reads land in in place. All staging pools of the same routed tensor
+    // share one unified byte-typed backing buffer (`layout.staging`).
     let (staging_pools, _) = plan.staging_pools();
-    let pool_hints = plan.staging_pool_has_hints();
     let pool_records = |pool: &StagingPool, name: &str, tensor: &Tensor, record_bytes: u64, records| {
         Records::rows(tensor, record_bytes, records)
             .map_err(|error| format!("the {} {name}: {error}", pool.source.name()))
     };
+    let staging_count = plan.unified_staging_records_with_paths(plan.paths);
+    let unified_staging = layout.staging.as_ref().try_map(|kind, tensor| {
+        let slot_bytes = plan.unified_staging_slot_bytes(kind)?;
+        Records::rows(tensor, slot_bytes, staging_count)
+            .map_err(|error| format!("the {kind:?} unified staging: {error}"))
+    })?;
     let pools = staging_pools
         .iter()
-        .zip(&layout.staging)
-        .zip(pool_hints)
-        .map(|((pool, tensor), has_hints)| {
-            let count = plan.pool_staging_records_with_paths(has_hints, plan.paths);
-            let slot_bytes = plan.staging_slot_bytes(pool)?;
-            Ok(Pool { staging: pool_records(pool, "staging", tensor, slot_bytes, count)? })
+        .map(|pool| {
+            let staging = unified_staging
+                .get(pool.kind)
+                .ok_or("a staging pool of a tensor the record lacks")?
+                .clone();
+            Ok(Pool { staging })
         })
         .collect::<Result<Vec<_>, String>>()?;
     // What carries the conveyor's experts: the records its lender lends it,
@@ -748,36 +791,51 @@ fn watch(
         let reserve = group_tier_reserve(global_reserve, tiers.len(), selected);
         TierStart { records, lent, reserve, placement }
     };
+    // Single hardware transfer queue shared across `Copies` (`LinkMover` +
+    // `Scratch`) and `DecodeDmaState` (`land_decode_misses`) via one `IoPlane`.
+    let shared_transfer = match plan.placer() {
+        Placer::Tier => Some(
+            seismic::Transfer::new(&device)
+                .map_err(|error| format!("the device's transfers: {error}"))?,
+        ),
+        Placer::Bank => None,
+    };
     // Single owner `ExpertTransport` shared across `LinkMover` (`Copies`),
     // `Scratch` (prefill DMA plans), and `ExpertBank` (M7 decode DMA + prefill DMA).
     let decode_dma = if plan.decode_dma(charges.device().backend()) {
-        let transfer = seismic::Transfer::new(&charges.device())
-            .map_err(|error| format!("M7 decode DMA transfer queue: {error}"))?;
+        let transfer = shared_transfer
+            .clone()
+            .expect("Placer::Tier initializes shared_transfer");
         let selected = usize::try_from(plan.selected()).map_err(|_| "selected experts exceed host")?;
         let words_count = magnitude_kernels::constants::SOURCE_ROWS
             * magnitude_kernels::constants::VERIFY_ROWS
             * plan.selected();
-        let alloc_words = || -> Result<(Tensor, Words), crate::residency::WeightImportError> {
-            let tensor = Tensor::words(charges, seismic::Element::i32(), &[words_count]).map_err(|error| {
+        let ready_words_count = magnitude_kernels::constants::READY_RING_WORDS;
+        let alloc_words = |count: u64| -> Result<(Tensor, Words), crate::residency::WeightImportError> {
+            let tensor = Tensor::words(charges, seismic::Element::i32(), &[count]).map_err(|error| {
                 crate::residency::WeightImportError::of_allocation(
                     seismic::Contract::Words,
                     crate::resources::AllocationError::Tensor(error),
                 )
             })?;
-            let words = Words::new(tensor.clone(), words_count, 0)?;
+            let words = Words::new(tensor.clone(), count, 0)?;
             Ok((tensor, words))
         };
         let mut source_slots = Vec::with_capacity(crate::experts::transport::DECODE_SOURCE_SLOTS);
         for _ in 0..crate::experts::transport::DECODE_SOURCE_SLOTS {
-            let (front_sources, front_sources_words) = alloc_words()?;
-            let (back_sources, back_sources_words) = alloc_words()?;
+            let (front_sources, front_sources_words) = alloc_words(words_count)?;
+            let (back_sources, back_sources_words) = alloc_words(words_count)?;
+            let (ready_slot, ready_slot_words) = alloc_words(ready_words_count)?;
             source_slots.push(crate::experts::transport::DecodeSourceSlot {
                 front_sources,
                 front_sources_words,
                 back_sources,
                 back_sources_words,
+                ready_slot,
+                ready_slot_words,
             });
         }
+        let stage_bases: Vec<u64> = (0..plan.groups().len()).map(|g| plan.records(g)).collect();
         let file_tables: Vec<ExchangeTable> = watched.iter().map(|layer| layer.file.clone()).collect();
         let draft_layers: Vec<bool> = watched.iter().map(|layer| layer.draft).collect();
         Some(crate::experts::transport::DecodeDmaState::new(
@@ -785,6 +843,7 @@ fn watch(
             landed.clone(),
             bank.clone(),
             source_slots,
+            stage_bases,
             selected,
             &draft_layers,
             file_tables,
@@ -797,14 +856,17 @@ fn watch(
     // What promotions and opportunistic staging copy with, beside a host tier:
     // the device's transfer queue, wired to `transport` so decode demand joins
     // in-flight staging copies.
-    let copier = match plan.placer() {
-        Placer::Tier => {
-            let copies = seismic::Transfer::new(&device)
-                .map(|transfer| super::copies::Copies::with_transport(transfer, steps.events().clone(), transport.clone()))
-                .map_err(|error| format!("the device's transfers: {error}"))?;
+    let copier = match shared_transfer {
+        Some(transfer) => {
+            let copies = super::copies::Copies::with_transport(
+                transfer,
+                steps.events().clone(),
+                transport.clone(),
+            );
+            transport.attach_copies(copies.clone());
             Some(Copier { copies })
         }
-        Placer::Bank => None,
+        None => None,
     };
     // A group's commits span its ceiling, as its entries bind them, so a
     // resize keeps them. For `Placer::Tier`, `Group::bank` resolves bank slab
@@ -858,6 +920,7 @@ fn watch(
             recording: plan.recording,
         },
         slots,
+        target_vram_slots: Some(plan.target_vram_slots_table()),
         host_slots,
         whole: plan.whole(),
         staging: u32::try_from(binding.staging).map_err(|_| "staging records exceed u32")?,

@@ -853,3 +853,280 @@ fn derive_at_ceiling_512_is_sub_100us() {
         "derived target evaluation at ceiling=512 took {per_call:?} per call"
     );
 }
+
+/// Regression test for DGX Spark GB10 (`sparky`) `320 <-> 323` multi-slot UMA
+/// oscillation:
+/// - Bank at `323` slots (`230 MB` per slot), Linux UMA `others` pulses by
+///   `+700 MB` (~3 slots), shrinking `323 -> 320`.
+/// - Across 10 cycles of recurring 3-slot pulses (`0 <-> 700 MB` every 2 s):
+///   without a 1-slot `max_pulse` clamp, `peak_rise` reserves the full 700 MB
+///   pulse so **zero** `320 <-> 323` oscillations occur.
+/// - A genuine exogenous memory release (`+1.5 GB`) regrows immediately without
+///   waiting for peak decay.
+/// - Over sustained calm readings (`rise == 0`, zero active shrink, > 10 s hold
+///   + 30 s half-life), `peak_rise` decays smoothly toward 0 so a one-time
+///   spike never permanently pins memory.
+#[test]
+fn multi_slot_uma_pulse_never_oscillates_and_decays_after_sustained_calm() {
+    use crate::memory::ledger::{CacheKind, CommittedKind, DeviceGrant, DeviceLedgers, Ledgers, LoadShape, PoolClass, Sample};
+    use crate::memory::supply::Reading;
+    use std::num::NonZeroU64;
+    use std::time::{Duration, Instant};
+
+    const MB: u64 = 1_000_000;
+    const TOTAL: u64 = 128_000 * MB;
+    const SLOT_BYTES: u64 = 230 * MB;
+    const POOL_BLOCK: u64 = 8 * MB;
+    const FLOOR_SLOTS: u64 = 8;
+    const CEILING_SLOTS: u64 = 384;
+    const PULSE_3_SLOTS: u64 = 700 * MB;
+
+    let lag = seismic::Lag { release: Duration::ZERO, growth: Duration::ZERO };
+    let scope = Ledgers::new();
+    let start = Instant::now();
+    let sample_at = |at: Instant, free_beyond_target: i64| seismic::HostSample {
+        at,
+        page_bytes: 4096,
+        total: TOTAL,
+        supply: seismic::Supply { free_beyond_target, clean_cache: 0, cold_reclaimable: 0 },
+        reclaim_band: 0,
+        counted: seismic::Counted { at, lag: Duration::ZERO },
+        cold: seismic::ColdPages { machine: 0, own: None },
+        own_reclaimed: None,
+        wired: None,
+        harm: None,
+        pressure: Some(seismic::PressureLevel::Normal),
+        lag,
+    };
+
+    let bank_above_323 = (323 - FLOOR_SLOTS) * SLOT_BYTES;
+    let committed_bytes = 20_000 * MB;
+    let init_supply = (committed_bytes + bank_above_323 + 100 * MB) as i64;
+
+    let (ledgers, _) = DeviceLedgers::unified_in(&scope, std::sync::Arc::new(LoadShape { stores: Vec::new() }))
+        .read_granted(&Sample::scripted(scope.changes(), sample_at(start, init_supply)), DeviceGrant::Host);
+    let ledger = ledgers.device().clone();
+    let records_pool = ledger.pool_block(PoolClass::Records, NonZeroU64::new(POOL_BLOCK).unwrap()).blocks;
+
+    let base_claim = ledger
+        .change(|keeping| ledger.claim_at(&keeping.claims(), None, CommittedKind::Load, committed_bytes))
+        .expect("committed fits");
+    ledger
+        .change(|_| base_claim.entry().take(&base_claim.entry().change(), committed_bytes, seismic::memory::Wiring::Pageable))
+        .expect("committed allocates");
+    let bank_320 = ledger.cached(CacheKind::Bank, (320 - FLOOR_SLOTS) * SLOT_BYTES).expect("320 slots fit");
+    let bank_top3 = Some(ledger.cached(CacheKind::Bank, 3 * SLOT_BYTES).expect("top 3 slots fit"));
+    let mut at_slots = 323u64;
+    let mut t = start;
+
+    let read_supply = |t: &mut Instant, dt: Duration, supply_bytes: i64| {
+        *t += dt;
+        let s = sample_at(*t, supply_bytes);
+        ledger.read(ledger.sampled(*t), Reading::host(&s));
+    };
+
+    let target_for = |slots: u64| {
+        let targets = vec![HoldingTarget {
+            holding: BankHolding::Experts,
+            tier: BankTier::Bank,
+            at: slots,
+            owed: 0,
+            shape: BankShape::new(POOL_BLOCK, FLOOR_SLOTS, CEILING_SLOTS, CEILING_SLOTS),
+            charge: Box::new(|s| s * SLOT_BYTES),
+        }];
+        derive(&ledgers, &targets)[0].1
+    };
+
+    // Settle calm at 323 slots with 100 MB supply.
+    read_supply(&mut t, Duration::from_millis(200), 100 * MB as i64);
+    read_supply(&mut t, Duration::from_millis(200), 100 * MB as i64);
+    assert_eq!(target_for(at_slots), 323);
+
+    // 1. Linux UMA pulses +700 MB (~3 slots): supply drops 100 MB -> -600 MB.
+    //    Bank must shrink 323 -> 320.
+    read_supply(&mut t, Duration::from_millis(200), -(600 * MB as i64));
+    assert_eq!(ledger.estimate().guarantee(), PULSE_3_SLOTS);
+    assert_eq!(ledger.estimate().peak_guarantee(), PULSE_3_SLOTS);
+    assert_eq!(target_for(at_slots), 320, "700 MB pulse must shrink 323 -> 320");
+    drop(bank_top3);
+    ledger.change(|_| records_pool.freed(&records_pool.change(), 3 * SLOT_BYTES, seismic::memory::Wiring::Pageable));
+    at_slots = 320;
+
+    // 2. Across 10 cycles of recurring 3-slot pulses (supply 790 MB <-> 90 MB
+    //    every 2 s): ZERO 320 <-> 323 oscillations!
+    let mut resizes = 0u64;
+    for cycle in 0..10u32 {
+        read_supply(&mut t, Duration::from_secs(2), 790 * MB as i64);
+        assert_eq!(ledger.estimate().guarantee(), 0, "cycle {cycle}: calm down-swing");
+        assert_eq!(ledger.estimate().peak_guarantee(), PULSE_3_SLOTS, "cycle {cycle}: full 3-slot pulse stays reserved");
+        let next = target_for(at_slots);
+        if next != at_slots {
+            resizes += 1;
+        }
+        assert_eq!(next, 320, "cycle {cycle}: must not regrow into 3-slot pulse band");
+
+        read_supply(&mut t, Duration::from_millis(200), 90 * MB as i64);
+        assert_eq!(ledger.estimate().guarantee(), PULSE_3_SLOTS, "cycle {cycle}: 3-slot pulse recurs");
+        let next = target_for(at_slots);
+        if next != at_slots {
+            resizes += 1;
+        }
+        assert_eq!(next, 320, "cycle {cycle}: 320 slots survive 700 MB pulse");
+    }
+    assert_eq!(resizes, 0, "zero 320 <-> 323 oscillations across 10 multi-slot pulse cycles");
+
+    // 3. Sustained calm (> 10 s hold + 30 s half-life) at supply = 790 MB:
+    //    peak_rise holds flat through 10 s, then decays smoothly so a one-time
+    //    spike never permanently pins memory.
+    read_supply(&mut t, Duration::from_secs(10), 790 * MB as i64);
+    assert_eq!(ledger.estimate().guarantee(), 0);
+    assert_eq!(ledger.estimate().peak_guarantee(), PULSE_3_SLOTS, "held flat through 10 s calm hold window");
+    assert_eq!(target_for(at_slots), 320);
+    read_supply(&mut t, Duration::from_secs(30), 790 * MB as i64);
+    let half = ledger.estimate().peak_guarantee();
+    assert!(
+        (340 * MB..=360 * MB).contains(&half),
+        "after one 30 s half-life past hold window, 700 MB peak must decay to ~350 MB, got {half}"
+    );
+    assert!(target_for(at_slots) > 320, "decayed peak frees room to regrow after sustained calm");
+
+    // 4. Genuine exogenous memory release (+1.5 GB -> supply = 1.59 GB) right
+    //    after a fresh 700 MB pulse regrows immediately without waiting for decay.
+    read_supply(&mut t, Duration::from_millis(200), 90 * MB as i64);
+    assert_eq!(ledger.estimate().peak_guarantee(), PULSE_3_SLOTS);
+    read_supply(&mut t, Duration::from_secs(1), 1_590 * MB as i64);
+    assert_eq!(ledger.estimate().peak_guarantee(), PULSE_3_SLOTS);
+    assert_eq!(target_for(at_slots), 323, "genuine exogenous release regrows immediately");
+
+    drop(bank_320);
+}
+
+/// Regression test for Linux UMA (`sparky`) compaction floor vs `cold_reclaimable`:
+/// - On a unified GPU host store without a wired ceiling (`DeviceGrant::HostLimit`
+///   / `HostBudget`, e.g. Linux unified CUDA), `Reading::cache_reserve()` reserves
+///   `unified_gpu_bank_reserve(total)` (`clamp(total / 64, 512 MiB, 2 GiB)`)
+///   below `budget()` for elastic bank sizing (`import_room`, `hold_room`,
+///   `grow_room`) so bank growth never pushes below the Linux compaction floor
+///   into direct reclaim.
+/// - Unlike pinned host tiers (`BankTier::Host`), pageable unified GPU banks do
+///   NOT exclude `cold_reclaimable` from `budget()`: when `cold_reclaimable`
+///   provides real supply above the compaction floor (e.g. ~5.1 GB on DGX Spark),
+///   the bank retains those slots instead of silently dropping ~17 slots.
+#[test]
+fn linux_uma_bank_reserves_compaction_floor_without_excluding_cold_reclaimable() {
+    use crate::memory::ledger::{CacheKind, CommittedKind, DeviceGrant, DeviceLedgers, Ledgers, LoadShape, PoolClass, Sample};
+    use std::num::NonZeroU64;
+    use std::time::{Duration, Instant};
+
+    const MB: u64 = 1_000_000;
+    const TOTAL: u64 = 130_000 * MB;
+    const SLOT_BYTES: u64 = 333 * MB;
+    const POOL_BLOCK: u64 = 333 * MB;
+    const RECLAIM_BAND: u64 = 130 * MB;
+    const FLOOR_SLOTS: u64 = 10;
+    const CEILING_SLOTS: u64 = 450;
+
+    let lag = seismic::Lag { release: Duration::ZERO, growth: Duration::ZERO };
+    let scope = Ledgers::new();
+    let start = Instant::now();
+    let sample = |at: Instant, free_beyond_target: i64, cold_reclaimable: u64| seismic::HostSample {
+        at,
+        page_bytes: 4_096,
+        total: TOTAL,
+        supply: seismic::Supply { free_beyond_target, clean_cache: 0, cold_reclaimable },
+        reclaim_band: RECLAIM_BAND,
+        counted: seismic::Counted { at, lag: Duration::ZERO },
+        cold: seismic::ColdPages { machine: cold_reclaimable, own: Some(0) },
+        own_reclaimed: None,
+        wired: None,
+        harm: Some(seismic::Harm { machine: 0, own: 0 }),
+        pressure: None,
+        lag,
+    };
+
+    let bank_at = 300u64;
+    let charge = |slots: u64| slots * SLOT_BYTES;
+    let bank_bytes = charge(bank_at) - charge(FLOOR_SLOTS);
+    let committed_bytes = 5_000 * MB;
+    let shape = std::sync::Arc::new(LoadShape { stores: Vec::new() });
+    let expected_reserve = crate::memory::supply::unified_gpu_bank_reserve(TOTAL);
+    assert_eq!(expected_reserve, TOTAL / 64);
+
+    // Start with exact free_beyond_target = committed + bank + 1.9 GB and
+    // cold_reclaimable = 0 so `others` stays constant (guarantee == 0,
+    // peak_rise == 0) across s0 -> s1.
+    let s0 = Sample::scripted(
+        scope.changes(),
+        sample(start, (committed_bytes + bank_bytes + 1_900 * MB) as i64, 0),
+    );
+    let (ledgers, _) = DeviceLedgers::unified_in(&scope, shape)
+        .read_granted(&s0, DeviceGrant::HostLimit { limit: TOTAL, dedicated: 0 });
+    let ledger = ledgers.device().clone();
+    let _records_pool = ledger.pool_block(PoolClass::Records, NonZeroU64::new(POOL_BLOCK).unwrap()).blocks;
+
+    let bank_shape = BankShape::new(POOL_BLOCK, FLOOR_SLOTS, CEILING_SLOTS, CEILING_SLOTS);
+
+    let committed = ledger
+        .change(|keeping| ledger.claim_at(&keeping.claims(), None, CommittedKind::Load, committed_bytes))
+        .expect("committed fits");
+    ledger
+        .change(|_| committed.entry().take(&committed.entry().change(), committed_bytes, seismic::memory::Wiring::Pageable))
+        .expect("committed allocated");
+    let bank_entry = ledger.cached(CacheKind::Bank, bank_bytes).expect("bank fits");
+
+    // 1. Total supply = 1.9 GB (< unified_gpu_bank_reserve = 130 GB / 64 =
+    //    2.031 GB on 130 GB RAM): `cache_reserve()` holds the compaction floor
+    //    so `derive` refuses to grow below 2 GiB headroom.
+    let s1 = Sample::scripted(scope.changes(), sample(start + Duration::from_secs(1), 1_900 * MB as i64, 0));
+    ledgers.read_granted(&s1, DeviceGrant::HostLimit { limit: TOTAL, dedicated: 0 });
+    assert_eq!(ledger.estimate().cache_reserve(), expected_reserve);
+    let targets = [HoldingTarget {
+        holding: BankHolding::Experts,
+        tier: BankTier::Bank,
+        at: bank_at,
+        owed: 0,
+        shape: bank_shape,
+        charge: Box::new(charge),
+    }];
+    assert_eq!(
+        derive(&ledgers, &targets)[0].1,
+        bank_at,
+        "must not grow below unified GPU 2 GiB compaction floor"
+    );
+
+    // 2. Once total supply rises above 2.031 GB + 1 slot (2.4 GB), growth
+    //    proceeds cleanly by 1 slot.
+    let s2 = Sample::scripted(scope.changes(), sample(start + Duration::from_secs(2), 2_400 * MB as i64, 0));
+    ledgers.read_granted(&s2, DeviceGrant::HostLimit { limit: TOTAL, dedicated: 0 });
+    assert_eq!(
+        derive(&ledgers, &targets)[0].1,
+        bank_at + 1,
+        "must grow by 1 slot once supply exceeds unified GPU compaction floor + 1 slot"
+    );
+
+    // 3. DGX Spark scenario: free_beyond_target = 1.35 GB + cold_reclaimable =
+    //    5.10 GB (total supply = 6.45 GB). Because unified CUDA banks are
+    //    pageable (not Wiring::Pinned), `budget()` includes `cold_reclaimable`
+    //    while `cache_reserve()` still preserves the 2.031 GB compaction floor,
+    //    leaving (6.45 - 2.031) GB = 4.419 GB -> +13 slots instead of 0!
+    let s3 = Sample::scripted(
+        scope.changes(),
+        sample(start + Duration::from_secs(3), 1_350 * MB as i64, 5_100 * MB),
+    );
+    ledgers.read_granted(&s3, DeviceGrant::HostLimit { limit: TOTAL, dedicated: 0 });
+    let est3 = ledger.estimate();
+    let expected_extra = (1_350 * MB + 5_100 * MB - expected_reserve) / SLOT_BYTES;
+    assert_eq!(
+        derive(&ledgers, &targets)[0].1,
+        bank_at + expected_extra,
+        "pageable unified GPU bank must include cold_reclaimable while keeping compaction floor"
+    );
+    assert_eq!(
+        est3.pinned_import_room(),
+        bank_bytes + (1_350 * MB - (RECLAIM_BAND + POOL_BLOCK)),
+        "pinned host bank path must still exclude cold_reclaimable"
+    );
+
+    drop(bank_entry);
+    drop(committed);
+}

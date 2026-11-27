@@ -266,21 +266,25 @@ struct PendingReentry {
 /// gap `Δ_j`. They read apart from the live ranking, under no lock of its, from
 /// what it logged for them ([`Self::read_log`]).
 pub(crate) struct Shadows {
-    /// True-route calibration per layer (`Calibration::new_shadow`: route and
-    /// sample ring only; no `fell`, `history`, or `far` tables).
+    /// Active maximum decode depth (`1..=DEPTHS`), sizing per-depth shadow
+    /// pools, delta trackers, and per-layer calibration rings to the load's
+    /// actual decode width.
+    max_depths: usize,
+    /// True-route calibration per layer (`Calibration::new_shadow_with_depth`:
+    /// route and sample ring only; no `fell` or `far` tables).
     layers: Vec<Calibration>,
     /// Measured exponential-decay half-life history selector for true routes.
     history: History,
     groups: Vec<usize>,
     /// The steps logged the shadows have yet to read, the latest still logging.
     log: VecDeque<Behind>,
-    /// Per-depth shadow pools, turnovers, and `U_shadow` windows.
-    depths: [DepthShadow; DEPTHS],
+    /// Per-depth shadow pools, turnovers, and `U_shadow` windows (`0..max_depths`).
+    depths: Vec<DepthShadow>,
     /// Per-depth front-pass `Δ_j = U_real − U_shadow(j)` keyed to the physical
     /// [`RegimeEpoch`] it was measured in and rolling on the bank-wide epoch.
     /// Any physical regime transition makes prior-regime deltas inapplicable
     /// by construction.
-    deltas: [RegimeAged<DeltaTally>; DEPTHS],
+    deltas: Vec<RegimeAged<DeltaTally>>,
     /// Single shared live verify-pass per-row delta
     /// `Δ_verify = (missed_total / (1 + k)) − U_shadow(k)` across all verify
     /// depths in the current physical [`RegimeEpoch`]. Aggregating across every
@@ -292,8 +296,8 @@ pub(crate) struct Shadows {
     /// call, for within-regime A9 re-entry detection.
     last_executed: Option<(RegimeEpoch, usize)>,
     /// Pending and latest completed A9 re-entry comparison per front depth.
-    pending_reentry: [Option<PendingReentry>; DEPTHS],
-    reentries: [Option<Reentry>; DEPTHS],
+    pending_reentry: Vec<Option<PendingReentry>>,
+    reentries: Vec<Option<Reentry>>,
     /// Fixed-size scratch buffers reused across layers/steps in `prepare_shadow`.
     scratch: ShadowScratch,
 }
@@ -305,31 +309,50 @@ impl Shadows {
     }
 
     /// Construct [`Shadows`] seeded with the live ranking's current resident
-    /// `pools` so `U_shadow` starts warm beside the live bank instead of
-    /// suffering cold-start empty-pool misses.
+    /// `pools` at full `DEPTHS`.
+    #[cfg_attr(not(test), allow(dead_code))]
     pub(super) fn new_with_pools(experts: &[usize], groups: &[usize], pools: &Pools) -> Self {
+        Self::new_with_pools_and_depth(experts, groups, pools, DEPTHS)
+    }
+
+    /// Construct [`Shadows`] seeded with the live ranking's current resident
+    /// `pools`, sized to `max_depths` (`1..=DEPTHS`).
+    pub(super) fn new_with_pools_and_depth(
+        experts: &[usize],
+        groups: &[usize],
+        pools: &Pools,
+        max_depths: usize,
+    ) -> Self {
         assert_eq!(experts.len(), groups.len(), "each layer has a group");
         assert!(groups.iter().all(|&group| group < pools.records.len()), "group out of range");
+        let max_depths = max_depths.clamp(1, DEPTHS);
         let max_experts = experts.iter().copied().max().unwrap_or(0);
         Self {
-            layers: experts.iter().map(|&count| Calibration::new_shadow(count, 1, 0)).collect(),
+            max_depths,
+            layers: experts
+                .iter()
+                .map(|&count| Calibration::new_shadow_with_depth(count, 1, 0, max_depths))
+                .collect(),
             history: History::new(experts),
             groups: groups.to_vec(),
             log: VecDeque::new(),
-            depths: std::array::from_fn(|_| DepthShadow::with_pools(pools.clone())),
-            deltas: std::array::from_fn(|_| RegimeAged::new(RegimeEpoch::ZERO, 0)),
+            depths: (0..max_depths).map(|_| DepthShadow::with_pools(pools.clone())).collect(),
+            deltas: (0..max_depths).map(|_| RegimeAged::new(RegimeEpoch::ZERO, 0)).collect(),
             verify_delta: RegimeWindow::new(RegimeEpoch::ZERO, 0),
             last_executed: None,
-            pending_reentry: [None; DEPTHS],
-            reentries: [None; DEPTHS],
-            scratch: ShadowScratch::new(max_experts),
+            pending_reentry: vec![None; max_depths],
+            reentries: vec![None; max_depths],
+            scratch: ShadowScratch::new(max_experts, max_depths),
         }
     }
 
     /// Fixed memory charge of the shadows' calibration tables and history
     /// selector for `experts` layers (constant in run length, design §1 bar 2, §4).
-    pub(super) fn calibration_bytes(experts: &[usize]) -> u64 {
-        let cal: u64 = experts.iter().map(|&count| Calibration::new_shadow(count, 1, 0).bytes()).sum();
+    pub(super) fn calibration_bytes(experts: &[usize], max_depths: usize) -> u64 {
+        let cal: u64 = experts
+            .iter()
+            .map(|&count| Calibration::new_shadow_with_depth(count, 1, 0, max_depths).bytes())
+            .sum();
         cal + History::new(experts).bytes()
     }
 
@@ -362,6 +385,9 @@ impl Shadows {
     pub(crate) fn executed(&mut self, verifies: bool, depth: usize, real: f64, regime: RegimeEpoch, epoch: u64, now: Tokens) {
         assert!(depth < DEPTHS, "depth {depth} past {DEPTHS}");
         assert!(real.is_finite() && real >= 0.0, "invalid real misses a token: {real}");
+        if depth >= self.max_depths {
+            return;
+        }
         let Some(shadow) = self.shadow_misses(depth) else {
             return;
         };
@@ -378,7 +404,7 @@ impl Shadows {
         // comparing deltas across different tier/residency regimes.
         if let Some((prev_regime, prev_depth)) = self.last_executed {
             if prev_regime != regime {
-                self.pending_reentry = [None; DEPTHS];
+                self.pending_reentry.fill(None);
             } else if prev_depth != depth {
                 self.finalize_reentry(prev_depth);
                 if let Some(((prev_t, cur_t), age)) = self.deltas[depth].read(regime, epoch, now) {
@@ -477,7 +503,7 @@ impl Shadows {
     }
 
     fn shadow_misses(&mut self, depth: usize) -> Option<f64> {
-        let shadow = &mut self.depths[depth];
+        let shadow = self.depths.get_mut(depth)?;
         let epoch = shadow.time.lock().bank_epoch();
         let (previous, current) = shadow.missed.read(epoch)?;
         let tokens = previous.tokens + current.tokens;
@@ -495,9 +521,9 @@ impl Shadows {
         // Additive deltas `Δ = U_real − U_shadow` measured at the previous slot
         // count are invalid after a resize; clearing them returns unexecuted
         // depths to `Needed::Shadow(U_shadow(k))` priced at the new bank size.
-        self.deltas = std::array::from_fn(|_| RegimeAged::new(RegimeEpoch::ZERO, 0));
+        self.deltas = (0..self.max_depths).map(|_| RegimeAged::new(RegimeEpoch::ZERO, 0)).collect();
         self.verify_delta = RegimeWindow::new(RegimeEpoch::ZERO, 0);
-        self.pending_reentry = [None; DEPTHS];
+        self.pending_reentry.fill(None);
         self.last_executed = None;
     }
 
@@ -538,7 +564,7 @@ impl Shadows {
             .take(self.log.len() - 2)
             .filter(|step| step.is_decode())
             .count();
-        complete_decode_ahead >= BEHIND
+        complete_decode_ahead >= self.max_depths.saturating_sub(1)
     }
 
     /// Step the front of `self.log` across all depths on true routes.
@@ -585,7 +611,7 @@ impl Shadows {
         // Register the decode step on every depth shadow's clock & turnovers,
         // and snapshot each depth's (τ, ā) per group once for the step (§3.2).
         let group_count = self.depths[0].pools.records.len();
-        let mut step_params: Vec<Vec<(Horizon, f64)>> = Vec::with_capacity(DEPTHS);
+        let mut step_params: Vec<Vec<(Horizon, f64)>> = Vec::with_capacity(self.max_depths);
         for shadow in &mut self.depths {
             let mut times = shadow.time.lock();
             times.register(step.sequence, Advance::Known(emitted));
@@ -638,8 +664,8 @@ impl Shadows {
                 layer,
             );
 
-            // True routes for tokens `at + 1 .. at + DEPTHS` at this layer.
-            let truths: Vec<TrueRoute<'_>> = (1..DEPTHS)
+            // True routes for tokens `at + 1 .. at + max_depths` at this layer.
+            let truths: Vec<TrueRoute<'_>> = (1..self.max_depths)
                 .map_while(|ahead| {
                     let token = at + ahead as u64;
                     let &(first, _, log_idx) = spans
@@ -842,8 +868,12 @@ mod tests {
         assert!((reentries[0].observed - 0.40).abs() < 1e-9);
         assert_eq!(reentries[0].samples, 1);
 
-        // Memory charge is constant in run length.
-        assert_eq!(shadows.bytes(), initial_bytes);
+        // Memory charge is constant in run length once the shadow ring and
+        // exercised lead tables are warmed up (past `BEHIND + DEPTHS + 1` steps).
+        let bytes_after_warmup = shadows.bytes();
+        assert!(initial_bytes <= bytes_after_warmup);
+        feed_cycle(&mut shadows, 61..=100, 6, 8);
+        assert_eq!(shadows.bytes(), bytes_after_warmup);
     }
 
     #[test]

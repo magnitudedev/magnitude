@@ -176,17 +176,49 @@ impl<'a> Tuning<'a> {
         }
     }
 
+    fn record_demand<U: EntryTuning>(
+        &mut self,
+        case: &U,
+        key: super::tuning::DemandKey,
+        launches: usize,
+    ) {
+        let Self::Demand {
+            model,
+            invocations,
+            current,
+            repeat_case,
+            ..
+        } = self
+        else {
+            return;
+        };
+        let mut representatives = case
+            .points(model.limits)
+            .into_iter()
+            .map(|point| point.rows)
+            .collect::<Vec<_>>();
+        representatives.sort_unstable();
+        representatives.dedup();
+        let calls = current
+            .represented(|launch| case.invocation_rows(launch, &representatives))
+            .scaled(if *repeat_case { launches } else { 1 });
+        invocations.units.entry(key).or_default().add(&calls);
+    }
+
     /// `fixed`, the static values of the entry `entry` at `bindings`, with
     /// `implementation`'s arithmetic parameters at the choice of the unit
-    /// of `prerequisite`'s case ([`Tuner::following`]). A walk without
-    /// choices leaves them free: a demand walk, which collects a unit's
-    /// launches by its static values alone, and a listing.
+    /// of `prerequisite`'s case ([`Tuner::following`]). A demand walk
+    /// propagates the dependant's invocation demand onto `prerequisite` so
+    /// its arithmetic parameters are tuned even when only the dependant runs
+    /// (e.g. `routed_gate_up_part` on fully-streamed models). A listing
+    /// leaves them free.
     fn following<P: EntryTuning>(
         &mut self,
         prerequisite: &P,
         (entry, bindings): (&'static str, &str),
         implementation: &NativeImplementation,
         fixed: NativeSpecialization,
+        dependant_launches: usize,
     ) -> Result<NativeSpecialization, CatalogFailure> {
         match self {
             Self::Tuner(tuner) => {
@@ -195,7 +227,16 @@ impl<'a> Tuning<'a> {
                     .following(&key, implementation, fixed)
                     .map_err(|outcome| failure(entry, bindings, outcome))
             }
-            Self::Demand { .. } | Self::Listing(_) => Ok(fixed),
+            Self::Demand { model, device, .. } => {
+                let key = unit_of(device, model, prerequisite)?;
+                self.record_demand(
+                    prerequisite,
+                    (key.0, key.1, key.2.statics),
+                    dependant_launches,
+                );
+                Ok(fixed)
+            }
+            Self::Listing(_) => Ok(fixed),
         }
     }
 
@@ -654,6 +695,7 @@ impl<'a> Specializer<'a> {
             (<T::Entry as Entry>::NAME, &bindings),
             implementation.implementation(),
             fixed,
+            case.launches(),
         )?;
         self.chosen(tuning, case, implementation.implementation(), fixed)
     }
@@ -669,32 +711,16 @@ impl<'a> Specializer<'a> {
     ) -> Result<NativeSpecialization, CatalogFailure> {
         let entry = <T::Entry as Entry>::NAME;
         let bindings = case.bindings();
-        let tuning_model = tuning.model();
         Ok(match tuning {
             Tuning::Tuner(tuner) if implementation.has_tuning_parameters() => {
                 tuner.tune(case, implementation, &fixed)?
             }
-            Tuning::Demand {
-                invocations,
-                current,
-                repeat_case,
-                ..
-            } => {
-                let mut representatives = case
-                    .points(tuning_model.limits)
-                    .into_iter()
-                    .map(|point| point.rows)
-                    .collect::<Vec<_>>();
-                representatives.sort_unstable();
-                representatives.dedup();
-                let calls = current
-                    .represented(|launch| case.invocation_rows(launch, &representatives))
-                    .scaled(if *repeat_case { case.launches() } else { 1 });
-                invocations
-                    .units
-                    .entry((entry, bindings, fixed.statics().clone()))
-                    .or_default()
-                    .add(&calls);
+            Tuning::Demand { .. } => {
+                tuning.record_demand(
+                    case,
+                    (entry, bindings, fixed.statics().clone()),
+                    case.launches(),
+                );
                 fixed
             }
             Tuning::Tuner(_) | Tuning::Listing(_) => fixed,

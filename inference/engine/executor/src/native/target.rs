@@ -102,22 +102,29 @@ pub struct ExpertBankKernels {
     /// qualified, the precision system admits its arithmetic
     /// ([`BankSite::admitted`]).
     pub site: Option<BankSite>,
+    /// Its split decode combine (`BankCombine`), decoupled from `BankSite`
+    /// for general routed layers so UMA (`bank.tier == 0`) layers can overlap
+    /// early-hit `routed_down_project(mode=0)` with `routed_land` and finish
+    /// landed misses in `routed_down_project(mode=3)` + `routed_down_sited`.
+    pub combine: Option<BankCombine>,
     /// A gated layer's decode gate/up in two passes over one product
     /// (`routed_gate_up_part`): its held choices before its tier wait, the
     /// choices the wait sourced after it. None of up-only experts, whose
     /// expansion (`routed_up`) runs once after the wait.
     pub gate_up: Option<RangedKernels<magnitude_kernels::routed_gate_up_part::Entry>>,
+    /// Unified device-classified 3-tier decode staging + on-device self-gate
+    /// (`routed_stage_host`, 4 CTAs x 256 threads), prepared on CUDA discrete
+    /// (`bank.tier > 0`) banks.
+    pub stage_host: Option<NativeKernel<magnitude_kernels::routed_stage_host::Entry>>,
 }
 
-/// A streamed layer's CPU site entries (streaming_words.seismic's request
+/// A streamed layer's CPU site entry (streaming_words.seismic's request
 /// and answer): its request (`routed_site_request`), after the route or its
-/// landing launch and before gate/up, and its combine in its routed form (the
-/// GPU's projections, then the sum waiting for the CPU's answer); and the
-/// form the site's pool computes in.
+/// landing launch and before gate/up, and the form the site's pool computes
+/// in. Its split combine lives on [`ExpertBankKernels::combine`].
 #[derive(Clone, Debug)]
 pub struct BankSite {
     pub request: NativeKernel<magnitude_kernels::routed_site_request::Entry>,
-    pub combine: BankCombine,
     pub form: SiteForm,
     /// What the precision system admitted of the site, as the measurement
     /// job stored it; none until it has (`SiteRequest`), when the site is
@@ -131,6 +138,42 @@ pub struct BankSite {
 #[derive(Clone, Copy, Debug)]
 pub struct SiteAdmission;
 
+impl BankCombine {
+    /// Whether a streamed layer of feed-forward `slot` whose bank is `bank`
+    /// prepares a split decode combine on `backend`:
+    /// - General routed / parallel: any streamed layer whose backend declares
+    ///   `routed_down_project` and `routed_down_sited` (independent of
+    ///   `bank.tier > 0`, enabling layer-local overlap on UMA `Placer::Bank`).
+    /// - Fused routed: only where the bank has a host tier (`bank.tier > 0`)
+    ///   and the backend declares `routed_site_request` and its fused combine.
+    pub(crate) fn served(
+        slot: crate::planning::BankedFeedForward,
+        bank: crate::BankBinding,
+        backend: seismic::BackendName,
+    ) -> bool {
+        use crate::planning::BankedFeedForward;
+        use magnitude_kernels::{
+            routed_down_project, routed_down_sited, routed_output_project, routed_output_sited,
+            routed_output_streamed, routed_site_request,
+        };
+        fn declares<E: seismic::EntryContract>(backend: seismic::BackendName) -> bool {
+            E::contract_node_shape(backend).is_ok()
+        }
+        match slot {
+            BankedFeedForward::Routed(_) => {
+                bank.tier > 0
+                    && declares::<routed_site_request::Entry>(backend)
+                    && (declares::<routed_output_streamed::Entry>(backend)
+                        || (declares::<routed_output_project::Entry>(backend)
+                            && declares::<routed_output_sited::Entry>(backend)))
+            }
+            BankedFeedForward::GeneralRouted(_) | BankedFeedForward::Parallel(_) => {
+                declares::<routed_down_project::Entry>(backend) && declares::<routed_down_sited::Entry>(backend)
+            }
+        }
+    }
+}
+
 impl BankSite {
     /// Whether a streamed layer of feed-forward `slot` whose bank is `bank`
     /// has a CPU site on `backend`: the bank has a host tier (across a link;
@@ -143,27 +186,12 @@ impl BankSite {
         bank: crate::BankBinding,
         backend: seismic::BackendName,
     ) -> Result<bool, String> {
-        use crate::planning::BankedFeedForward;
-        use magnitude_kernels::{
-            routed_down_project, routed_down_sited, routed_output_project, routed_output_sited,
-            routed_output_streamed, routed_site_request,
-        };
-        fn declares<E: seismic::EntryContract>(backend: seismic::BackendName) -> bool {
-            E::contract_node_shape(backend).is_ok()
-        }
-        let combine = match slot {
-            BankedFeedForward::Routed(_) => {
-                declares::<routed_output_streamed::Entry>(backend)
-                    || (declares::<routed_output_project::Entry>(backend)
-                        && declares::<routed_output_sited::Entry>(backend))
-            }
-            BankedFeedForward::GeneralRouted(_) | BankedFeedForward::Parallel(_) => {
-                declares::<routed_down_project::Entry>(backend) && declares::<routed_down_sited::Entry>(backend)
-            }
-        };
+        use magnitude_kernels::routed_site_request;
         // The CPU computes a miss from its host tier record; unified memory
         // has no tier and no CPU site.
-        Ok(bank.tier > 0 && combine && declares::<routed_site_request::Entry>(backend))
+        Ok(bank.tier > 0
+            && BankCombine::served(slot, bank, backend)
+            && <routed_site_request::Entry as seismic::EntryContract>::contract_node_shape(backend).is_ok())
     }
 }
 

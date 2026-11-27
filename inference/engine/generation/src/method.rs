@@ -446,6 +446,13 @@ pub trait MethodState {
     fn trails(&self) -> bool {
         unreachable!("a drafting method's head drafts no chain for a front pass")
     }
+    /// Whether this state can enter a front/verify pass on its next decode
+    /// round even when its chain is empty: either its head trails the target
+    /// ([`Self::trails`]) or it is ready to re-anchor after skipped depth-0
+    /// plain passes ([`Self::front`]).
+    fn can_front(&self) -> bool {
+        self.trails()
+    }
     fn observe(
         &mut self,
         request: RequestId,

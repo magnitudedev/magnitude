@@ -939,11 +939,11 @@ mod tests {
         // A cut no point lies past joins nothing; one below every point,
         // the first range to the second.
         assert_eq!(row_ranges(decode.clone(), &[2, 5, 7], &points(512)), vec![1..2, 2..5, 5..VERIFY_ROWS + 1]);
-        assert_eq!(row_ranges(EVERY_ROW, &classes, &[16, 64]), vec![EVERY_ROW]);
+        assert_eq!(row_ranges(EVERY_ROW, &classes, &[VERIFY_ROWS + 1, 64]), vec![EVERY_ROW]);
         // An entry of the rows past the decode's alone: one range, also
         // where it is measured at its smallest row beyond the model's.
         let grouped = VERIFY_ROWS + 1..u64::MAX;
-        assert_eq!(row_ranges(grouped.clone(), &classes, &[16]), vec![grouped]);
+        assert_eq!(row_ranges(grouped.clone(), &classes, &[VERIFY_ROWS + 1]), vec![grouped]);
     }
 
     fn rows() -> Box<NativeNatExpr> {
@@ -1070,11 +1070,11 @@ mod tests {
         assert_eq!(ranges(EVERY_ROW, &points(8)), vec![1..2, 2..3, 3..5, 5..u64::MAX]);
         assert_eq!(
             ranges(1..VERIFY_ROWS + 1, &points(512)),
-            vec![1..2, 2..3, 3..5, 5..VERIFY_ROWS + 1]
+            vec![1..2, 2..3, 3..5, 5..9, 9..VERIFY_ROWS + 1]
         );
         assert_eq!(
             ranges(VERIFY_ROWS + 1..u64::MAX, &points(64)),
-            vec![VERIFY_ROWS + 1..17, 17..33, 33..u64::MAX]
+            vec![VERIFY_ROWS + 1..33, 33..u64::MAX]
         );
         assert!(seismic::BackendName::Metal.specializations_form_programs());
         assert!(!seismic::BackendName::Cpu.specializations_form_programs());
@@ -1172,7 +1172,7 @@ mod tests {
         // four-row and eight-row tiles from the wider ones past their rows.
         assert_eq!(
             tile_cuts(decode.clone(), |_| true, |row| tiling(&formed, &names, &values, "M", row, &statics)),
-            vec![2, 5, 9]
+            vec![2, 5, 9, 17]
         );
 
         // A tile wider than the decode rows cuts nothing there; nor does
@@ -1218,10 +1218,10 @@ mod tests {
         // entry monolithic; binding `"O"` partitions its row regimes.
         assert!(row_cuts(&cuda_expand, &cuda_statics, "M", &EVERY_ROW, &points(512)).is_empty());
         let cuda_cuts = row_cuts(&cuda_expand, &cuda_statics, "O", &EVERY_ROW, &points(512));
-        assert_eq!(cuda_cuts, vec![2, VERIFY_ROWS + 1, 17, 65]);
+        assert_eq!(cuda_cuts, vec![2, 9, VERIFY_ROWS + 1, 65]);
         assert_eq!(
             row_ranges(EVERY_ROW, &cuda_cuts, &points(512)),
-            vec![1..2, 2..VERIFY_ROWS + 1, VERIFY_ROWS + 1..17, 17..65, 65..u64::MAX]
+            vec![1..2, 2..9, 9..VERIFY_ROWS + 1, VERIFY_ROWS + 1..65, 65..u64::MAX]
         );
 
         let metal_expand = seismic::generated::native_implementation_at::<magnitude_kernels::dense_expand::Entry>(
@@ -1244,7 +1244,7 @@ mod tests {
     #[test]
     #[should_panic(expected = "a case is measured at rows it serves")]
     fn a_case_is_measured_where_it_serves() {
-        row_ranges(1..VERIFY_ROWS + 1, &[2], &[16]);
+        row_ranges(1..VERIFY_ROWS + 1, &[2], &[VERIFY_ROWS + 1]);
     }
 
     #[test]
@@ -1273,13 +1273,13 @@ mod tests {
         // Without merged passes > 1024, no point lies past MERGED_PASS_FROM,
         // so row_ranges keeps a single range 9.. identical to non-merged loads.
         let flat_512 = rows(512);
-        assert_eq!(flat_512, vec![16, 32, 64, 128, 256, 512]);
+        assert_eq!(flat_512, vec![32, 64, 128, 256, 512]);
         assert_eq!(
             row_ranges(GROUPED_SERVED, &[MERGED_PASS_FROM], &flat_512),
             vec![GROUPED_SERVED]
         );
         let flat_1024 = rows(1024);
-        assert_eq!(flat_1024, vec![16, 32, 64, 128, 256, 512, 1024]);
+        assert_eq!(flat_1024, vec![32, 64, 128, 256, 512, 1024]);
         assert_eq!(
             row_ranges(GROUPED_SERVED, &[MERGED_PASS_FROM], &flat_1024),
             vec![GROUPED_SERVED]
@@ -1289,13 +1289,13 @@ mod tests {
         // MERGED_PASS_FROM, splitting small-grouped (9..1025) from
         // merged-pass (1025..).
         let split_2048 = rows(2048);
-        assert_eq!(split_2048, vec![16, 32, 64, 128, 256, 512, 1024, 2048]);
+        assert_eq!(split_2048, vec![32, 64, 128, 256, 512, 1024, 2048]);
         assert_eq!(
             row_ranges(GROUPED_SERVED, &[MERGED_PASS_FROM], &split_2048),
             vec![VERIFY_ROWS + 1..MERGED_PASS_FROM, MERGED_PASS_FROM..u64::MAX]
         );
         let split_4096 = rows(4096);
-        assert_eq!(split_4096, vec![16, 32, 64, 128, 256, 512, 1024, 2048, 4096]);
+        assert_eq!(split_4096, vec![32, 64, 128, 256, 512, 1024, 2048, 4096]);
         let ranges = row_ranges(GROUPED_SERVED, &[MERGED_PASS_FROM], &split_4096);
         assert_eq!(
             ranges,

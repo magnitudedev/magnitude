@@ -205,6 +205,15 @@ impl ModelLoadPlan {
                 tables.push(table);
             }
         }
+        let tier_copy_dma = host == super::HostTier::Linked && backend.fills_beside_compute() && has_side_queue;
+        let residency = super::ResidencyOrder::default_for(
+            structured.groups(),
+            structured.layers(),
+            self.decode_rows,
+            head_steps,
+            host.placer(),
+            tier_copy_dma,
+        );
         let bank = ExpertBankPlan {
             structured,
             backend,
@@ -229,10 +238,10 @@ impl ModelLoadPlan {
             sites: BankSites::Unadmitted,
             paths: BankPaths::Unpriced,
             recording: self.recorded_routes,
-            decode_hits_min_bytes: 0,
+            residency,
         };
         for layer in bank.layers() {
-            let records = bank.records(layer.group);
+            let records = bank.slab_records(layer.group);
             for (kind, _) in layer.resident.iter() {
                 let role = WeightRole { scope: layer.scope, kind: kind.kind() };
                 if let Some(weight) = self.bank_weight_mut(role) {
@@ -315,7 +324,7 @@ impl ModelLoadPlan {
         let mut bank = self.bank.take().ok_or(PlanError::Topology("a plan without a bank has no path"))?;
         bank.paths = paths;
         for layer in bank.layers() {
-            let records = bank.records(layer.group);
+            let records = bank.slab_records(layer.group);
             for (kind, _) in layer.resident.iter() {
                 let role = WeightRole { scope: layer.scope, kind: kind.kind() };
                 if let Some(weight) = self.bank_weight_mut(role) {
@@ -329,11 +338,17 @@ impl ModelLoadPlan {
         self.with_front_stagings().with_bank_slots(slots, ceiling)
     }
 
-    pub(crate) fn with_decode_hits_min_bytes(mut self, min_bytes: u64) -> Self {
-        if let Some(bank) = self.bank.as_mut() {
-            bank.decode_hits_min_bytes = min_bytes;
-        }
-        self
+    /// Update the bank's 1D marginal-value residency schedule from measured
+    /// per-layer miss costs (seconds per byte) before `settle_bank` / `open`.
+    pub(crate) fn with_bank_residency(mut self, miss_s_per_byte: &[f64]) -> Result<Self, PlanError> {
+        let Some(mut bank) = self.bank.take() else {
+            return Ok(self);
+        };
+        bank.set_residency_costs(miss_s_per_byte);
+        let ceiling = bank.ceiling.min(bank.max_slots());
+        let slots = bank.slots.max(bank.floor()).min(ceiling);
+        self.bank = Some(bank);
+        self.with_bank_slots(slots, ceiling)
     }
 
     /// The plan with its experts banked as `bank` holds them, at its path,
@@ -344,12 +359,14 @@ impl ModelLoadPlan {
     pub(crate) fn banked_as(self, definition: &ModelDefinition, bank: &ExpertBankPlan, window_slots: u64) -> Result<Self, PlanError> {
         let mut load = self
             .unbanked()
-            .with_expert_bank(definition, bank.slots, Some(window_slots), bank.places, bank.flights, bank.substrate())?
+            .with_expert_bank(definition, bank.slots, Some(window_slots), bank.places, bank.flights, bank.substrate())?;
+        load.bank.as_mut().expect("the load was just banked").residency = bank.residency.clone();
+        let mut load = load
             .with_bank_paths(bank.paths)?
             .with_bank_slots(bank.slots, bank.ceiling)?;
         let built = load.bank.as_mut().expect("the load was just banked");
-        (built.host_slots, built.pass, built.resident, built.decode_hits_min_bytes, built.head_steps) =
-            (bank.host_slots, bank.pass, bank.resident, bank.decode_hits_min_bytes, bank.head_steps);
+        (built.host_slots, built.pass, built.resident, built.head_steps) =
+            (bank.host_slots, bank.pass, bank.resident, bank.head_steps);
         Ok(load)
     }
 

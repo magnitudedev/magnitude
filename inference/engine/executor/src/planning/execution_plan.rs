@@ -744,17 +744,9 @@ impl ExecutionPlanDraft {
             Priced::Pending(reason) => Priced::Pending(reason.clone()),
             Priced::Unavailable(reason) => Priced::Unavailable(reason.clone()),
         })?;
-        let decode_hits_min_bytes = match prices {
-            Priced::Measured(prices) => prices.decode_hits_min_bytes(ceiling.whole.bank()),
-            _ => 0,
-        };
-        if ceiling.whole.bank().paths == super::BankPaths::Unpriced
-            || ceiling.whole.bank().decode_hits_min_bytes != decode_hits_min_bytes
-        {
+        if ceiling.whole.bank().paths == super::BankPaths::Unpriced {
             let whole = ceiling.whole.clone();
-            ceiling = match self.rebuilt_from(&whole, definition, bound, CeilingPaths::Priced(&bank_prices), |load| {
-                Ok(load.with_decode_hits_min_bytes(decode_hits_min_bytes))
-            })? {
+            ceiling = match self.rebuilt_from(&whole, definition, bound, CeilingPaths::Priced(&bank_prices), Ok)? {
                 Ok(ceiling) => ceiling,
                 Err(no) => return Ok(Err(no)),
             };
@@ -765,7 +757,6 @@ impl ExecutionPlanDraft {
                 let whole = ceiling.whole.clone();
                 match self.rebuilt_from(&whole, definition, bound, CeilingPaths::Fixed, |load| {
                     load.with_bank_paths(paths)
-                        .map(|load| load.with_decode_hits_min_bytes(decode_hits_min_bytes))
                 })? {
                     Ok(rebuilt) => ceiling = rebuilt,
                     Err(no) => return Ok((Err(no), None)),
@@ -1047,6 +1038,13 @@ impl ExecutionPlanDraft {
             self.policy.limits.flights(),
             substrate,
         ).and_then(|load| {
+            let load = match prices {
+                Some(Priced::Measured(prices)) => match load.expert_bank().and_then(|bank| prices.layer_miss_s_per_byte(bank)) {
+                    Some(costs) => load.with_bank_residency(&costs)?,
+                    None => load,
+                },
+                _ => load,
+            };
             let programs = load.program_plan(definition, self.policy.codec)?;
             self.with_load_and_programs(load, programs).with_chain(places)
         }) {
@@ -1333,15 +1331,19 @@ impl ExecutionPlanDraft {
         // what it leaves beside the bank at its ceiling, its landing
         // reserve (the tier at no slots) aside, as staging is. A banked
         // draft's re-planning never raises the cap it was planned under.
-        let capped = match (bound, bank.host_ceiling()) {
-            (HeldBound { limit: Some(WeightBound::Cap(cap)), .. }, Some(_)) => {
+        let capped = match (bound, bank.tiered()) {
+            (HeldBound { limit: Some(WeightBound::Cap(cap)), .. }, true) => {
                 let left = cap - ceiling_bytes;
-                let host = |slots: u64| bank.host_charge(slots).map_err(PlanError::ResourcePlanning);
-                let (empty, widest) = (host(0)?, bank.widest().get());
-                let cap = if host(widest)? - empty <= left {
-                    widest
+                let device_ref = if bank.whole_at(ceiling) { 0 } else { ceiling };
+                let host = |slots: u64| {
+                    bank.host_charge_at_with_paths(device_ref, slots, bank.paths)
+                        .map_err(PlanError::ResourcePlanning)
+                };
+                let (empty, sat) = (host(0)?, bank.host_saturation_at(device_ref));
+                let cap = if sat == 0 || host(sat)? - empty <= left {
+                    sat
                 } else {
-                    let (mut lo, mut hi) = (0, widest);
+                    let (mut lo, mut hi) = (0, sat);
                     while lo + 1 < hi {
                         let mid = lo + (hi - lo) / 2;
                         if host(mid)? - empty <= left {
@@ -1434,15 +1436,13 @@ impl ExecutionPlanDraft {
             Priced::Unavailable(reason) => Priced::Unavailable(reason.clone()),
         })?;
         let rates = prices.rates();
-        let count = |slots: u64| usize::try_from(slots).map_err(|_| PlanError::Arithmetic("a bank's slots exceed usize"));
-        let host = count(bank.host_ceiling().unwrap_or(0))?;
         let floor_bytes = floor_charge
             .store_demands(mandatory.device.topology(), mandatory.device.executor())
             .map_err(PlanError::ResourcePlanning)?
             .allocation_bytes();
         let floor_room = budget.room(&mandatory, &floor_charge)?;
         let fits_within = floor_bytes.saturating_add(floor_room);
-        let mut most = None;
+        let mut most: Option<magnitude_cost_model::HeldSlots> = None;
         let mut chosen: Option<(PassLaunches, u64, f64)> = None;
         for pass in super::pass_ladder(*places) {
             let mandatory = whole.resized(points[0], *ceiling, pass)?;
@@ -1452,7 +1452,7 @@ impl ExecutionPlanDraft {
                     let pass_structure = structure.at_pass(definition, &mandatory).map_err(charge_error)?;
                     let charge = pass_structure.charge(definition, &mandatory).map_err(charge_error)?;
                     let idle = pass_structure
-                        .idle_class_bytes(pass.get(), mandatory.policy().limits(), mandatory.load().fronts())
+                        .idle_class_bytes(pass, mandatory.policy().limits(), mandatory.load().chains_front())
                         .map_err(charge_error)?;
                     (charge, idle)
                 }
@@ -1486,12 +1486,12 @@ impl ExecutionPlanDraft {
             // `CacheKind::Bank` growth during decode (`serving_heap::grow_expert_bank`),
             // matching `settle_bank_at`'s `room + slack` bank sizing.
             let bank_slots = slots_within(serving_room, (points[0], *ceiling), &reserved)?;
-            let slots = count(whole.bank().target_slots(bank_slots))?;
-            let held = magnitude_cost_model::HeldSlots { slots, host };
+            let host = whole.bank().host_ceiling_at(bank_slots).unwrap_or(0);
+            let held = whole.bank().held_slots(bank_slots, host);
             // The smallest pass leaves the most slots.
-            let most = *most.get_or_insert(held);
-            let seconds = rates.decode_steps_per_s * prices.step_seconds(held)
-                + rates.requests_per_s * prices.prompt_seconds(charge.held_pass.get() as u64, most);
+            let most_ref = most.get_or_insert_with(|| held.clone());
+            let seconds = rates.decode_steps_per_s * prices.step_seconds(&held)
+                + rates.requests_per_s * prices.prompt_seconds(charge.held_pass.get() as u64, most_ref);
             if chosen.as_ref().is_none_or(|(_, _, least)| seconds <= *least) {
                 chosen = Some((pass, mandatory_bytes, seconds));
             }
@@ -2004,7 +2004,7 @@ fn command_buffer_capacity(
 
     let target_cbs = decode_in_flight.max(chain_in_flight);
 
-    let slots = limits.class_slots(places, load.fronts());
+    let slots = limits.class_slots(places, load.chains_front());
     let readout_cbs = slots.readout.activations;
     let drafter_cbs = if programs.head().is_some() || programs.draft().is_some() {
         slots.head.activations
@@ -2919,10 +2919,10 @@ impl ExecutionPlanDraft {
 /// stored read line.
 fn bank_paths(prices: &magnitude_cost_model::BankPrices, bank: &super::ExpertBankPlan, slots: u64) -> Result<super::BankPaths, PlanError> {
     let bytes = bank.least_move_bytes().map_err(PlanError::ResourcePlanning)?;
-    let slots = usize::try_from(bank.target_slots(slots)).map_err(|_| PlanError::Arithmetic("a bank's slots exceed usize"))?;
+    let held = bank.held_slots(slots, 0);
     let saturation_bytes = seismic_io::disk::FULL_DEPTH * seismic_io::disk::FULL_READ;
     let records = prices
-        .paths(bytes, magnitude_cost_model::HeldSlots::bank(slots), saturation_bytes)
+        .paths(bytes, &held, saturation_bytes)
         .unwrap_or(magnitude_cost_model::PathRecords::NONE);
     Ok(super::BankPaths::Priced { line: prices.read(), records })
 }
@@ -4566,12 +4566,13 @@ mod tests {
 
         assert_eq!(SubmissionChunks::count(0), 0);
         assert_eq!(SubmissionChunks::count(1), 1);
-        assert_eq!(SubmissionChunks::count(2), 2);
-        assert_eq!(SubmissionChunks::count(3), 2);
-        assert_eq!(SubmissionChunks::count(4), 3);
-        assert_eq!(SubmissionChunks::count(7), 3);
-        assert_eq!(SubmissionChunks::count(8), 4);
-        assert_eq!(SubmissionChunks::count(50), 6);
+        assert_eq!(SubmissionChunks::count(4), 1);
+        assert_eq!(SubmissionChunks::count(5), 2);
+        assert_eq!(SubmissionChunks::count(12), 2);
+        assert_eq!(SubmissionChunks::count(13), 3);
+        assert_eq!(SubmissionChunks::count(28), 3);
+        assert_eq!(SubmissionChunks::count(29), 4);
+        assert_eq!(SubmissionChunks::count(50), 4);
 
         let (_, _, device) = recorded(seismic::fixtures::recorded::m4_pro(), BackendName::Metal, 0, seismic::GraphCost::None);
         let budget = super::MemoryBudget::of_selected_stable(&device).unwrap();
@@ -5406,7 +5407,7 @@ mod tests {
         let structure_16 = structure.at_pass(&definition, &mandatory_16).unwrap();
         let charge_16 = structure_16.charge(&definition, &mandatory_16).unwrap();
         let idle_16 = structure_16
-            .idle_class_bytes(16, mandatory_16.policy().limits(), mandatory_16.load().fronts())
+            .idle_class_bytes(pass16, mandatory_16.policy().limits(), mandatory_16.load().chains_front())
             .unwrap();
         assert!(idle_16 > 0, "pass=16 must carry nonzero extra GraphSlots beyond 1-place floor");
         let mandatory_16_bytes = charge_16
@@ -5553,8 +5554,8 @@ mod tests {
         let held = magnitude_cost_model::HeldSlots::bank(16);
         let least_move = c1.whole.bank().least_move_bytes().unwrap();
         let saturation_bytes = seismic_io::disk::FULL_DEPTH * seismic_io::disk::FULL_READ;
-        let p1 = bp1.paths(least_move, held, saturation_bytes).unwrap();
-        let p16 = bp16.paths(least_move, held, saturation_bytes).unwrap();
+        let p1 = bp1.paths(least_move, &held, saturation_bytes).unwrap();
+        let p16 = bp16.paths(least_move, &held, saturation_bytes).unwrap();
         assert!(
             p1.ahead < p16.ahead,
             "decode_rows=1 ahead ({}) must be strictly smaller than decode_rows=16 ahead ({})",

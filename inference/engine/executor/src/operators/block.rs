@@ -1284,7 +1284,7 @@ impl<W: PlannedWeights + ?Sized> SublayerGraph<'_, W> {
         let epsilon = self.topology.epsilon.f32();
         // A split layer's front exports the carry it read; the others carry
         // their output rows on with the site's pre.
-        let front = matches!(split, Some(Split::Front(_) | Split::DecodeFront(_) | Split::DecodeHits(_)));
+        let front = matches!(split, Some(Split::Front(_)));
         let carried = |output: WorkflowTensor, pre: Option<WorkflowTensor>| match (front, &carry) {
             (true, Some(carry)) => carry.clone(),
             _ => ResidualCarry { rows: output, pre },
@@ -1357,36 +1357,18 @@ impl<W: PlannedWeights + ?Sized> SublayerGraph<'_, W> {
                 let mixed = &carry.rows;
                 let read = read.ok_or("a routed feed-forward without its input source")?;
                 let mut split = split;
-                // A split layer's back (`Combine` / `DecodeBack`) never reads
-                // the sublayer input — only its `join` (and Sinkhorn `pre`),
-                // which the front already computed and crossed. Reusing them
-                // avoids running `stream_mix` twice per layer.
+                // A split layer's back (`Combine`) never reads the sublayer
+                // input — only its `join` (and Sinkhorn `pre`), which the front
+                // already computed and crossed. Reusing them avoids running
+                // `stream_mix` twice per layer.
                 let SublayerRead { input: input_rows, form, join, pre } = match &mut split {
                     Some(Split::Combine(back, _)) => {
                         self.crossed_read(read, carry, back.crossing.join.as_ref(), back.crossing.pre.as_ref())?
-                    }
-                    Some(Split::DecodeBack(crossing)) => {
-                        let (join_port, pre_port) = crossing.declare_stream_join_pre(graph)?;
-                        self.crossed_read(
-                            read,
-                            carry,
-                            join_port.as_deref(),
-                            pre_port.as_deref(),
-                        )?
                     }
                     Some(Split::Front(crossing)) => {
                         let sublayer_read = self.read(graph, read, streams, 1, carry, weights, constants)?;
                         store_crossed_read(graph, &sublayer_read, crossing.join.as_mut(), crossing.pre.as_mut())?;
                         sublayer_read
-                    }
-                    Some(Split::DecodeFront(crossing)) => {
-                        let sublayer_read = self.read(graph, read, streams, 1, carry, weights, constants)?;
-                        let (join_port, pre_port) = crossing.declare_stream_join_pre(graph)?;
-                        store_crossed_read(graph, &sublayer_read, join_port, pre_port)?;
-                        sublayer_read
-                    }
-                    Some(Split::DecodeHits(_)) => {
-                        return Err("DecodeHits is not supported for fused routed feed-forward".into());
                     }
                     None => self.read(graph, read, streams, 1, carry, weights, constants)?,
                 };
@@ -1415,7 +1397,6 @@ impl<W: PlannedWeights + ?Sized> SublayerGraph<'_, W> {
                 Some(FeedForwardNumbers::GeneralRouted(numbers)),
                 FeedForwardEntries::GeneralRouted(entries),
             ) => {
-                let is_decode_hits = matches!(split, Some(Split::DecodeHits(_)));
                 let routed = |graph: &mut G,
                               weights: &mut Vec<(WeightPort, NativePort)>,
                               constants: &mut Vec<GraphConstant>,
@@ -1433,15 +1414,8 @@ impl<W: PlannedWeights + ?Sized> SublayerGraph<'_, W> {
                         let pre = carry.as_ref().and_then(|c| c.pre.clone());
                         Ok((carried(output, pre), sequence))
                     }
-                    // Over Sinkhorn streams the routed branch sums onto
-                    // zeros (`RoutedSum::Branch`). On `DecodeHits` without a
-                    // shared expert, no residual carry or `stream_mix` is read.
+                    // Over Sinkhorn streams the routed branch sums onto zeros (`RoutedSum::Branch`).
                     Some(read @ ReadTopology::Sinkhorn(_)) => match &carry {
-                        None if is_decode_hits => {
-                            let (output, sequence) =
-                                routed(graph, weights, constants, None, RoutedSum::Branch)?;
-                            Ok((carried(output, None), sequence))
-                        }
                         Some(carry) => self.sinkhorn_branch(
                             graph,
                             read,
@@ -1464,11 +1438,8 @@ impl<W: PlannedWeights + ?Sized> SublayerGraph<'_, W> {
                 Some(FeedForwardNumbers::Parallel(numbers)),
                 FeedForwardEntries::Parallel(entries),
             ) => {
-                // On `DecodeHits` of a routed branch without a shared expert,
-                // no residual carry is read (`parallel`).
                 let residual = match &carry {
                     Some(carry) => Some(&carry.rows),
-                    None if matches!(split, Some(Split::DecodeHits(_))) => None,
                     None => return Err("a parallel feed-forward reads no residual carry".into()),
                 };
                 let pre = carry.as_ref().and_then(|carry| carry.pre.clone());

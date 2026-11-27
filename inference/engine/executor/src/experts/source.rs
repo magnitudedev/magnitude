@@ -662,17 +662,25 @@ impl ExpertSource {
             .map(|_| (0..self.files.len()).map(|_| (Vec::new(), Vec::new())).collect::<Vec<_>>())
             .collect::<Vec<_>>();
         let mut tensor_leads = vec![0usize; tensor_count];
+        let mut tensor_bytes = vec![0usize; tensor_count];
         for (at, read) in reads.into_iter().enumerate() {
             let (range, lead) = self.build_range(&read, alignment);
             if read.within == 0 {
                 tensor_leads[read.tensor] = lead;
             }
+            tensor_bytes[read.tensor] = tensor_bytes[read.tensor].saturating_add(read.bytes);
             let (ranges, served) = &mut by_tensor_file[read.tensor][read.file];
             served.push((at, read.file, read.offset, read.bytes));
             ranges.push(range);
         }
+        // Submit largest tensors first and smallest tensor last (tie-broken by
+        // tensor index) so pipelined CPU repack begins on the heaviest tensor
+        // earliest and tail repack latency after the final NVMe byte is minimal.
+        let mut order: Vec<usize> = (0..tensor_count).collect();
+        order.sort_by(|&a, &b| tensor_bytes[b].cmp(&tensor_bytes[a]).then_with(|| a.cmp(&b)));
         let mut requests = Vec::new();
-        for (tensor, by_file) in by_tensor_file.into_iter().enumerate() {
+        for tensor in order {
+            let by_file = std::mem::take(&mut by_tensor_file[tensor]);
             for (file, (ranges, served)) in self.files.iter().zip(by_file) {
                 if ranges.is_empty() {
                     continue;
@@ -746,6 +754,41 @@ mod tests {
         // made, before anything is read.
         assert!(Records::rows(&staging, 128, 3).is_err());
         drop((failed, landed));
+        std::fs::remove_file(path).unwrap();
+    }
+
+    /// `request_per_tensor` submits tensors in descending byte-size order
+    /// (largest first, smallest last, tie-broken by tensor index) while
+    /// preserving original tensor indices for per-tensor completion callbacks.
+    #[test]
+    fn request_per_tensor_submits_largest_tensor_first_and_smallest_last() {
+        let device = crate::test_support::open_backend(&seismic::Devices::discover(&[]).unwrap(), BackendName::Cpu)
+            .unwrap();
+        let path = std::env::temp_dir().join(format!("expert-source-order-{}", std::process::id()));
+        let bytes = (0..64 * 1024).map(|index| (index % 251) as u8).collect::<Vec<_>>();
+        std::fs::write(&path, &bytes).unwrap();
+        let source = ExpertSource::open(std::slice::from_ref(&path), &seismic_io::Urgent { parts: vec![512], records: 2 }).unwrap();
+        let staging = Tensor::shared(&seismic::Charges::tally(&device), Element::i32(), &[3, 128]).unwrap();
+        let records = Records::rows(&staging, 512, 3).unwrap();
+        // Tensor 0: 128 B, Tensor 1: 512 B, Tensor 2: 256 B -> order must be [1, 2, 0].
+        let reads = vec![
+            Read::new(0, 0, 128, &records, 0, 0).for_tensor(0, true),
+            Read::new(0, 1024, 512, &records, 1, 0).for_tensor(1, true),
+            Read::new(0, 2048, 256, &records, 2, 0).for_tensor(2, true),
+        ];
+        let ticket = source
+            .request_per_tensor(reads, 3, Want::now(), ReadAlignment::ExactZeroLead)
+            .unwrap();
+        let submitted_order: Vec<usize> = ticket.requests.iter().map(|(_, _, tensor, _)| *tensor).collect();
+        assert_eq!(submitted_order, vec![1, 2, 0], "largest tensor must be submitted first and smallest last");
+        let deadline = Instant::now() + std::time::Duration::from_secs(10);
+        assert!(matches!(ticket.wait_until(deadline), Some(Outcome::Read)));
+        let mut host = vec![0u8; 3 * 512];
+        unsafe { staging.read_shared(0, &mut host) }.unwrap();
+        assert_eq!(&host[0..128], &bytes[0..128]);
+        assert_eq!(&host[512..1024], &bytes[1024..1536]);
+        assert_eq!(&host[1024..1280], &bytes[2048..2304]);
+        drop(ticket);
         std::fs::remove_file(path).unwrap();
     }
 

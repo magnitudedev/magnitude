@@ -429,7 +429,6 @@ pub(super) struct ReadTable {
     source: ExpertSource,
     staging: Vec<Records>,
     stored: Vec<Arc<[StoredTensor]>>,
-    demand_alignment: Vec<crate::experts::source::ReadAlignment>,
 }
 
 impl ReadTable {
@@ -439,25 +438,15 @@ impl ReadTable {
             source,
             staging: pools.into_iter().map(|pool| pool.staging).collect(),
             stored: layers.iter().map(|layer| layer.stored.clone()).collect(),
-            demand_alignment: layers
-                .iter()
-                .map(|layer| {
-                    if layer.landing.is_some() {
-                        crate::experts::source::ReadAlignment::ExactZeroLead
-                    } else {
-                        crate::experts::source::ReadAlignment::AllowAlignedLead
-                    }
-                })
-                .collect(),
         }
     }
 
-    /// Read alignment required for demand reads of `layer`: `ExactZeroLead`
-    /// where `Placer::Bank` (`layer.landing.is_some()`) converts staging on the
-    /// device from byte offset 0, `AllowAlignedLead` where host conversion
-    /// honors `ticket.tensor_leads()`.
-    pub(super) fn demand_alignment(&self, layer: usize) -> crate::experts::source::ReadAlignment {
-        self.demand_alignment[layer]
+    /// Read alignment required for demand reads of `layer`: always
+    /// `AllowAlignedLead` — both host conversion (`Converting`) and device
+    /// landing (`routed_land`, via `LANDING_LEAD_*`) honor
+    /// `ticket.tensor_leads()` so direct `pread` lands zero-bounce.
+    pub(super) fn demand_alignment(&self, _layer: usize) -> crate::experts::source::ReadAlignment {
+        crate::experts::source::ReadAlignment::AllowAlignedLead
     }
 
     /// The model's files, read through.

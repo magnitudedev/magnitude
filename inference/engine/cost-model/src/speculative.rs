@@ -240,7 +240,7 @@ impl SpeculativePrice {
         pricing: &Pricing<'_>,
         layers: &StreamedLayers,
         read: ReadLine,
-        held: HeldSlots,
+        held: &HeldSlots,
         sequences: u64,
         depth: u32,
     ) -> Result<SpeculativeRate, PriceError> {

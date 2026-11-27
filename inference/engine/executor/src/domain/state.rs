@@ -1055,7 +1055,7 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
     ) -> Result<(), DomainError> {
         let device = self.domain.device().clone();
         let limits = self.execution.policy().limits();
-        let fronts = self.execution.load().fronts();
+        let fronts = self.execution.load().chains_front();
         let mut reclaimed_on_capacity = false;
         let mut places = chunks;
         while places >= 2 {
@@ -1791,7 +1791,7 @@ fn class_demand<F: ProgramFamily>(
     device: &seismic::Device,
     places: usize,
 ) -> Result<crate::memory::ClaimDemand, DomainError> {
-    let slots = execution.policy().limits().class_slots(places, execution.load().fronts());
+    let slots = execution.policy().limits().class_slots(places, execution.load().chains_front());
     let pools = resources.class_bytes(slots).map_err(DomainError::invariant)?;
     let graphs = resources.class_graphs(slots).map_err(DomainError::invariant)?;
     let graphs = graph_demand(device.graph_cost(), device.graph_budget(), graphs).map_err(DomainError::invariant)?;

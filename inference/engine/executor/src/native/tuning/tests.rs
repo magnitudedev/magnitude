@@ -3795,14 +3795,16 @@ fn cpu_projection_default_form_follows_the_tier_integer_dots() {
         assert_eq!(int8(case), u64::from(vector), "{}", case.down.name());
     }
     let dense = case(Element::bf16());
-    assert_eq!(int8(&dense), 0);
+    // `dense.seismic` derives CPU `INT8` via `default greatest ... reference 0`,
+    // keeping F32 (`INT8 == 0`) as the reference oracle while letting
+    // `device_defaults` pin packed weights to `INT8 == 1` on vector-dot CPUs.
     assert_eq!(
         implementation
-            .default_specialization(&statics)
+            .reference_specialization(&statics)
             .unwrap()
             .param("INT8"),
         Some(0),
-        "the declaration's own default is the F32 form"
+        "the declaration's reference oracle is the F32 form"
     );
     // A CPU digest names no binding: packed and dense weights share it
     // exactly when they share the default.
@@ -4421,8 +4423,8 @@ fn mandatory_census_longer_than_budget_still_searches() {
         context_tokens: 256,
         image_cells: 0,
     };
-    let search_budget = Duration::from_millis(50);
-    let census_sleep = Duration::from_millis(80);
+    let search_budget = Duration::from_millis(500);
+    let census_sleep = Duration::from_millis(600);
     let mut case = FakeCase::new(&implementation, &statics, "census-longer-than-budget");
     case.grounding_sleep = census_sleep;
     let recorder = Recorder::default();

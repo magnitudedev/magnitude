@@ -728,13 +728,13 @@ fn a_launch_not_measured_here_costs_no_more_than_a_larger_one_proven_here() {
         // A held-up first duration of width 3 at a short context.
         state
             .draft_costs
-            .entry((512, 1))
+            .entry((None, 512, 1))
             .or_default()
             .insert(3, Durations::settled(&[(1, 0.0795)]));
         // Width 7 proven at the request's context.
         state
             .draft_costs
-            .entry((4096, 1))
+            .entry((None, 4096, 1))
             .or_default()
             .insert(7, Durations::settled(&[(2, 0.0099), (3, 0.0099), (4, 0.0099)]));
     }
@@ -1360,7 +1360,7 @@ fn a_switch_is_measured_apart_from_its_rounds_launches() {
     let state = load.lock();
     let ctx = (CONTEXT + 1).next_power_of_two();
     let measured_target = &state.target_costs[&(None, ctx, 1)];
-    let measured_draft = &state.draft_costs[&(ctx, 1)];
+    let measured_draft = &state.draft_costs[&(None, ctx, 1)];
     let ms = |durations: &super::Durations| durations.cost() * 1000.0;
     let enter = ms(&measured_target.enter);
     let catch_up = (V710_HEADS.catch_up)(64);
@@ -1670,6 +1670,14 @@ fn streamed_verify_prior_avoids_blind_widest_first_probing_and_larger_clamp() {
 
 #[test]
 fn observe_streamed_invalidates_target_costs_on_regime_epoch_change_preserving_draft() {
+    use magnitude_cost_model::{
+        Census, DraftCensus, DraftMethod, DraftWidthCensus, Kind, LaunchCounts, LaunchPrices,
+        LayerCall, RoutedCall, RoutedKind, TargetCensus,
+    };
+    use seismic_measure::pricing::{Bytes, Figures, Flops, Format, Rates, Storage, Work};
+
+    const BF16: Format = Format("bf16");
+
     let load = Arc::new(DraftLoad::default());
     let prior_e1 = StreamedVerifyPrior {
         regime_epoch: 1,
@@ -1684,9 +1692,9 @@ fn observe_streamed_invalidates_target_costs_on_regime_epoch_change_preserving_d
         let mut state = load.lock();
         state
             .draft_costs
-            .entry((ctx_a, 1))
+            .entry((None, ctx_a, 1))
             .or_default()
-            .insert(4, super::Durations::settled(&[(1, 0.005)]));
+            .insert(4, super::Durations::settled(&[(1, 0.240)]));
         let a = state.target_costs.entry((Some(1), ctx_a, 1)).or_default();
         a.verify.insert(2, super::Durations::settled(&[(1, 0.090)]));
         a.enter = super::Durations::settled(&[(1, 0.002)]);
@@ -1701,14 +1709,14 @@ fn observe_streamed_invalidates_target_costs_on_regime_epoch_change_preserving_d
     {
         let state = load.lock();
         assert!(state.target_costs[&(Some(1), ctx_a, 1)].verify.contains_key(&2));
-        assert!(state.draft_costs[&(ctx_a, 1)].contains_key(&4));
+        assert!(state.draft_costs[&(None, ctx_a, 1)].contains_key(&4));
         assert!(state.target_costs[&(Some(1), ctx_a, 1)].enter.measured());
         assert!(state.target_costs[&(Some(1), ctx_a, 1)].leave.measured());
         assert!(state.target_costs.contains_key(&(Some(1), ctx_b, 1)));
     }
 
-    // New regime_epoch makes old-regime target costs inapplicable by construction
-    // and prunes them while preserving draft_costs.
+    // Target-only regime_epoch change invalidates prior-regime target_costs
+    // while preserving valid resident-drafter draft_costs.
     load.observe_streamed(Some(StreamedVerifyPrior {
         regime_epoch: 2,
         verify_seconds: vec![0.040, 0.075],
@@ -1716,13 +1724,119 @@ fn observe_streamed_invalidates_target_costs_on_regime_epoch_change_preserving_d
     }));
     {
         let state = load.lock();
-        assert!(state.draft_costs[&(ctx_a, 1)].contains_key(&4), "draft durations must survive regime_epoch change");
-        assert!((state.draft_costs[&(ctx_a, 1)][&4].cost() - 0.005).abs() < 1e-12);
-        assert!(state.target_costs.is_empty(), "prior-regime target costs must not survive regime_epoch change");
+        assert!(
+            state.draft_costs[&(None, ctx_a, 1)].contains_key(&4),
+            "resident drafter draft_costs must survive target-only regime_epoch change"
+        );
+        assert!(
+            state.target_costs.is_empty(),
+            "prior-regime target costs must not survive regime_epoch change"
+        );
     }
-    let state = load.lock();
-    let costs = RoundCosts::of(&state, ctx_a, 1, None);
-    assert!((costs.verify(2) - 0.075).abs() < 1e-12, "new regime prior takes effect immediately");
+    {
+        let state = load.lock();
+        let costs = RoundCosts::of(&state, ctx_a, 1, None);
+        assert!(
+            (costs.verify(2) - 0.075).abs() < 1e-12,
+            "new regime prior takes effect immediately"
+        );
+        assert!(
+            (costs.draft(4) - 0.240).abs() < 1e-12,
+            "preserved resident draft cost stays live across target bank resize"
+        );
+    }
+
+    // Conversely, when the drafter itself is banked/streamed (`is_draft_banked()`),
+    // regime_epoch changes invalidate BOTH target_costs AND draft_costs.
+    let rates = Rates {
+        activation: BF16,
+        weights: Storage::ALL
+            .iter()
+            .map(|&storage| (storage, BF16, 300e9))
+            .collect(),
+        flops: vec![(BF16, 60e12)],
+        history: Vec::new(),
+        launch: 5e-6,
+        decode: None,
+    };
+    let figures = Figures {
+        rates,
+        composition: Ok(1.0),
+        step_pipelined: 50e-6,
+        step_round_trip: 200e-6,
+    };
+    let work = Work {
+        weights: vec![Bytes { format: BF16, bytes: 1_000_000 }],
+        row_flops: vec![Flops { format: BF16, flops: 2_000_000 }],
+        ..Work::default()
+    };
+    let kind = Kind {
+        work,
+        launches: LaunchCounts::new(vec![Ok(1); 8]),
+    };
+    let target_census = Census::new(vec![(kind.clone(), None)], 0, 8);
+    let banked_draft_census = Census::new(
+        vec![(
+            kind,
+            Some(LayerCall::Routed(RoutedCall {
+                kind: RoutedKind(0),
+                layer: 0,
+            })),
+        )],
+        0,
+        8,
+    );
+    let banked_draft_prices = LaunchPrices::with_draft(
+        TargetCensus::Resident(target_census),
+        Some(DraftCensus {
+            method: DraftMethod::Block,
+            widths: vec![DraftWidthCensus {
+                proposals: 4,
+                rows_per_sequence: 5,
+                census: banked_draft_census,
+            }],
+            max_proposals: 4,
+        }),
+        figures,
+        false,
+    );
+    assert!(banked_draft_prices.is_draft_banked());
+
+    let banked_load = Arc::new(DraftLoad::default());
+    banked_load.observe_launch_prices(Some(banked_draft_prices));
+    banked_load.observe_streamed(Some(StreamedVerifyPrior {
+        regime_epoch: 1,
+        verify_seconds: vec![0.050, 0.100],
+        ..Default::default()
+    }));
+    {
+        let mut state = banked_load.lock();
+        state
+            .draft_costs
+            .entry((Some(1), ctx_a, 1))
+            .or_default()
+            .insert(4, super::Durations::settled(&[(1, 0.240)]));
+        state
+            .target_costs
+            .entry((Some(1), ctx_a, 1))
+            .or_default()
+            .verify
+            .insert(2, super::Durations::settled(&[(1, 0.090)]));
+    }
+    banked_load.observe_streamed(Some(StreamedVerifyPrior {
+        regime_epoch: 2,
+        verify_seconds: vec![0.040, 0.075],
+        ..Default::default()
+    }));
+    let state = banked_load.lock();
+    assert!(
+        state.draft_costs.is_empty(),
+        "banked drafter draft_costs must be invalidated on regime_epoch change"
+    );
+    assert!(
+        state.target_costs.is_empty(),
+        "target_costs must be invalidated on regime_epoch change"
+    );
 }
 
 /// `LaunchPrices` supplies analytical priors for both unmeasured `D(g)` and
@@ -1969,7 +2083,7 @@ fn anchored_streamed_verify_prior_widens_when_measured_narrow_beats_cold_prior()
         let mut state = load.lock();
         state
             .draft_costs
-            .entry((ctx, 1))
+            .entry((None, ctx, 1))
             .or_default()
             .insert(7, super::Durations::settled(&[(1, 0.014), (2, 0.014), (3, 0.014)]));
         state
@@ -2075,6 +2189,99 @@ fn regime_epoch_change_with_derived_plain_prior_does_not_burn_plain_look_bursts(
     );
 }
 
+/// Reproduces `471c62` (`rtx3090-64g-gen4` DS4+DSpark): during steady wide
+/// 95%-acceptance drafting, two small mid-request elastic bank grows
+/// (`297 -> 325 -> 331`, +6..11% slots, preserving `regime_epoch` while
+/// repricing `StreamedVerifyPrior`) must keep proven wide verify/draft costs
+/// intact and burn ZERO `generated = 0` (`M = 1`) probe rounds.
+#[test]
+fn mid_request_small_elastic_bank_growth_keeps_k5_drafting_without_m1_probes() {
+    let load = Arc::new(DraftLoad::default());
+    // Cold/pessimistic prior (V(8) = 1.05 s vs V(1) = 180 ms -> 5.8x ratio) that
+    // would collapse to M = 1 if target_costs were wiped, while live measured
+    // V(8) = 320 ms and D(7) = 20 ms deliver ~22 tok/s >> 5.5 tok/s plain.
+    let prior_297 = StreamedVerifyPrior {
+        regime_epoch: 1,
+        verify_seconds: vec![0.180, 0.360, 0.560, 0.750, 0.850, 0.930, 0.990, 1.050],
+        ..Default::default()
+    };
+    load.observe_streamed(Some(prior_297));
+
+    let ctx = CONTEXT.max(1).next_power_of_two();
+    {
+        let mut state = load.lock();
+        let drafts = state.draft_costs.entry((None, ctx, 1)).or_default();
+        drafts.insert(1, super::Durations::settled(&[(1, 0.012), (2, 0.012), (3, 0.012)]));
+        drafts.insert(3, super::Durations::settled(&[(1, 0.016), (2, 0.016), (3, 0.016)]));
+        drafts.insert(7, super::Durations::settled(&[(1, 0.020), (2, 0.020), (3, 0.020)]));
+        state
+            .target_costs
+            .entry((Some(1), ctx, 1))
+            .or_default()
+            .verify
+            .insert(8, super::Durations::settled(&[(1, 0.320), (2, 0.320), (3, 0.320)]));
+        state.rounds = 3;
+    }
+
+    let mut ctrl = DraftController::new(7, load.clone());
+    let mut plain_rounds = 0usize;
+    for r in 0..30usize {
+        if r == 10 {
+            // Elastic grow 297 -> 325 (+9.4%): same regime_epoch, slightly faster prior.
+            load.observe_streamed(Some(StreamedVerifyPrior {
+                regime_epoch: 1,
+                verify_seconds: vec![0.172, 0.345, 0.535, 0.720, 0.815, 0.890, 0.950, 1.005],
+                ..Default::default()
+            }));
+        } else if r == 20 {
+            // Elastic grow 325 -> 331 (+1.8%): same regime_epoch, slightly faster prior.
+            load.observe_streamed(Some(StreamedVerifyPrior {
+                regime_epoch: 1,
+                verify_seconds: vec![0.170, 0.340, 0.528, 0.710, 0.805, 0.880, 0.938, 0.992],
+                ..Default::default()
+            }));
+        }
+        let g = ctrl.generate(7, CONTEXT, true);
+        if g == 0 {
+            plain_rounds += 1;
+            ctrl.timed(
+                TimedLaunch::Target,
+                Some(LaunchDuration::settled(Duration::from_millis(180))),
+                1,
+                1,
+            );
+            ctrl.committed(&[TokenId(1)]);
+            continue;
+        }
+        assert_eq!(g, 7, "round {r}: must stay at wide drafting across small elastic bank growth");
+        ctrl.timed(
+            TimedLaunch::Draft,
+            Some(LaunchDuration::settled(Duration::from_millis(20))),
+            1,
+            g,
+        );
+        let block: Vec<TokenId> = (1..=g as u32).map(TokenId).collect();
+        ctrl.drafted(g, &block, None);
+        let v = ctrl.verify(7);
+        assert_eq!(v, 7, "round {r}: must verify all 7 proposals");
+        ctrl.timed(
+            TimedLaunch::Target,
+            Some(LaunchDuration::settled(Duration::from_millis(310))),
+            1,
+            v + 1,
+        );
+        // ~95% per-token acceptance (accept 7/7 on 3 of 4 rounds, 5/7 on 1 of 4).
+        let accepted = if r % 4 == 3 { 5 } else { 7 };
+        let mut committed = block[..accepted].to_vec();
+        committed.push(TokenId(99));
+        ctrl.committed(&committed);
+    }
+    assert_eq!(
+        plain_rounds, 0,
+        "small mid-request elastic bank grows must burn ZERO M = 1 (generated = 0) probe rounds"
+    );
+}
+
 /// Reproduces `b927c8` (M4 Pro GLM-5.3, 79.6% acceptance) and `675f0d` (5090
 /// GLM-5.3, 73.4% acceptance): a streamed MoE with ~75% draft acceptance and
 /// noisy SSD-exposed verify latencies (periodic 2.5x spikes + a lucky 0.5x
@@ -2160,7 +2367,7 @@ fn cold_wide_verify_expires_when_narrow_residency_warms_up() {
         let mut state = load.lock();
         state
             .draft_costs
-            .entry((ctx, 1))
+            .entry((None, ctx, 1))
             .or_default()
             .insert(7, super::Durations::settled(&[(1, 0.015), (2, 0.015), (3, 0.015)]));
         let target = state.target_costs.entry((Some(1), ctx, 1)).or_default();
@@ -2203,7 +2410,7 @@ fn stale_warmup_verify_reprobes_without_magic_ratio_and_clears_cold_median() {
     let ctx = CONTEXT.max(1).next_power_of_two();
     {
         let mut state = load.lock();
-        let drafts = state.draft_costs.entry((ctx, 1)).or_default();
+        let drafts = state.draft_costs.entry((None, ctx, 1)).or_default();
         drafts.insert(1, super::Durations::settled(&[(39, 0.004), (40, 0.004), (41, 0.004)]));
         drafts.insert(3, super::Durations::settled(&[(39, 0.010), (40, 0.010), (41, 0.010)]));
         let target = state.target_costs.entry((Some(1), ctx, 1)).or_default();
@@ -2249,7 +2456,7 @@ fn stale_warmup_verify_reprobes_without_magic_ratio_and_clears_cold_median() {
     }));
     {
         let mut state = slow_load.lock();
-        let drafts = state.draft_costs.entry((ctx, 1)).or_default();
+        let drafts = state.draft_costs.entry((None, ctx, 1)).or_default();
         drafts.insert(1, super::Durations::settled(&[(39, 0.004), (40, 0.004), (41, 0.004)]));
         drafts.insert(3, super::Durations::settled(&[(39, 0.010), (40, 0.010), (41, 0.010)]));
         let target = state.target_costs.entry((Some(1), ctx, 1)).or_default();
@@ -2277,6 +2484,57 @@ fn stale_warmup_verify_reprobes_without_magic_ratio_and_clears_cold_median() {
         assert!((v4.cost() - 0.243).abs() < 1e-6);
         assert_eq!(v4.reprobe_interval(), super::WARMUP_DRIFT_ROUNDS * 2);
     }
+}
+
+/// Cold-start `G = 5` (`rows = 6`) measured on a cold bank during rounds 1..3
+/// (`0.729 s`) must NOT lock out `G = 5` for 16+ rounds once `G = 3` (`rows = 4`)
+/// proves the bank has warmed (`0.250 s`, predicting `verify(6) ≈ 0.325 s`):
+/// at round 7 (`7 - 3 >= WARMUP_DRIFT_ROUNDS = 4`), `verify(6)` re-probes
+/// immediately, clears its cold samples, and unlocks `G = 5`.
+#[test]
+fn cold_start_wide_verify_reprobes_rapidly_once_narrower_width_warms() {
+    let load = Arc::new(DraftLoad::default());
+    load.observe_streamed(Some(StreamedVerifyPrior {
+        regime_epoch: 1,
+        verify_seconds: vec![0.120, 0.160, 0.200, 0.250, 0.290, 0.325],
+        ..Default::default()
+    }));
+    let ctx = CONTEXT.max(1).next_power_of_two();
+    {
+        let mut state = load.lock();
+        let drafts = state.draft_costs.entry((None, ctx, 1)).or_default();
+        drafts.insert(1, super::Durations::settled(&[(1, 0.004), (2, 0.004), (3, 0.004)]));
+        drafts.insert(3, super::Durations::settled(&[(1, 0.010), (2, 0.010), (3, 0.010)]));
+        drafts.insert(5, super::Durations::settled(&[(1, 0.016), (2, 0.016), (3, 0.016)]));
+        let target = state.target_costs.entry((Some(1), ctx, 1)).or_default();
+        // Cold-bank verify(6) recorded on rounds 1..3.
+        target
+            .verify
+            .insert(6, super::Durations::settled(&[(1, 0.729), (2, 0.729), (3, 0.729)]));
+        // Warm-bank verify(4) proven on rounds 4..6.
+        target
+            .verify
+            .insert(4, super::Durations::settled(&[(4, 0.250), (5, 0.250), (6, 0.250)]));
+        state.rounds = 7;
+    }
+
+    let mut ctrl = DraftController::new(5, load.clone());
+    let g = ctrl.generate(5, CONTEXT, true);
+    assert_eq!(g, 5, "round 7 must immediately re-probe G = 5 once verify(4) proves warm");
+    ctrl.timed(TimedLaunch::Draft, settled(Duration::from_millis(16)), 1, g);
+    ctrl.drafted(g, &[TokenId(1), TokenId(2), TokenId(3), TokenId(4), TokenId(5)], None);
+    let v = ctrl.verify(5);
+    assert_eq!(v, 5, "must verify all 5 proposals (rows = 6) on warm re-probe");
+    ctrl.timed(TimedLaunch::Target, settled(Duration::from_millis(330)), 1, v + 1);
+    ctrl.committed(&[TokenId(1), TokenId(2), TokenId(3), TokenId(4), TokenId(5), TokenId(6)]);
+
+    let state = load.lock();
+    let v6 = &state.target_costs[&(Some(1), ctx, 1)].verify[&6];
+    assert!(
+        (v6.cost() - 0.330).abs() < 1e-6,
+        "warm re-probe must clear cold 0.729 s samples immediately, got {:.4} s",
+        v6.cost()
+    );
 }
 
 /// Gate #5: Zero-toggle live cost function `T(K, F)` for trailing front rows
@@ -2320,20 +2578,20 @@ fn front_rows_cost_function_zero_in_gpu_bound_and_positive_in_high_acceptance_pa
         "unbanked resident load must choose F* == 0"
     );
 
-    // 1b. Banked but GPU-bound (io_seconds <= compute_seconds) -> F* == 0.
+    // 1b. Banked GPU-bound with exposed stall below compute step (`saved <= ΔC`) -> F* == 0.
     let gpu_bound = PassCostModel::from_streamed_prior(&StreamedVerifyPrior {
         regime_epoch: 1,
         verify_seconds: vec![0.010, 0.012, 0.014, 0.016, 0.018, 0.020, 0.022],
         compute_seconds: vec![0.010, 0.012, 0.014, 0.016, 0.018, 0.020, 0.022],
-        io_seconds: vec![0.002, 0.003, 0.004, 0.005, 0.006, 0.007, 0.008],
-        front_stall_saved_per_row: 0.005,
+        io_seconds: vec![0.001, 0.0015, 0.002, 0.0025, 0.003, 0.0035, 0.004],
+        front_stall_saved_per_row: 0.001,
         front_waste_per_row: vec![0.002; 6],
         ..Default::default()
     });
     assert_eq!(
         score_f(&gpu_bound, &high_acc),
         0,
-        "GPU-bound regime (I/O <= C) must choose F* == 0"
+        "GPU-bound regime (exposed stall < ΔC) must choose F* == 0"
     );
 
     // 2. High-acceptance + path-bound (I/O >> C, saved stall > waste) -> F* > 0.
@@ -2424,7 +2682,7 @@ fn ds4_vram_thrashing_prefers_and_probes_rows4_over_thrashing_rows6() {
         for r in 0..3 {
             entry.verify.entry(6).or_default().record(r, 0.254, false);
         }
-        let draft = state.draft_costs.entry((ctx, 1)).or_default();
+        let draft = state.draft_costs.entry((None, ctx, 1)).or_default();
         for r in 0..3 {
             draft.entry(5).or_default().record(r, 0.012, false);
             draft.entry(3).or_default().record(r, 0.008, false);
@@ -2460,7 +2718,7 @@ fn ds4_vram_thrashing_prefers_and_probes_rows4_over_thrashing_rows6() {
         for r in 0..3 {
             entry.verify.entry(6).or_default().record(r, 0.254, false);
         }
-        let draft = state.draft_costs.entry((ctx, 1)).or_default();
+        let draft = state.draft_costs.entry((None, ctx, 1)).or_default();
         for r in 0..3 {
             draft.entry(5).or_default().record(r, 0.012, false);
             draft.entry(3).or_default().record(r, 0.008, false);
@@ -2516,7 +2774,7 @@ fn ds4_vram_thrashing_prefers_and_probes_rows4_over_thrashing_rows6() {
         for r in 0..3 {
             entry.verify.entry(16).or_default().record(r, 0.045, false);
         }
-        let draft = state.draft_costs.entry((ctx, 1)).or_default();
+        let draft = state.draft_costs.entry((None, ctx, 1)).or_default();
         for r in 0..3 {
             draft.entry(15).or_default().record(r, 0.006, false);
             draft.entry(7).or_default().record(r, 0.004, false);
@@ -2610,7 +2868,7 @@ fn dspark_block_drafter_probes_verified_rows4_below_two_step_vram_knee() {
         for r in 0..3 {
             entry.verify.entry(6).or_default().record(r, 0.2746, false);
         }
-        let draft = state.draft_costs.entry((ctx, 1)).or_default();
+        let draft = state.draft_costs.entry((None, ctx, 1)).or_default();
         for r in 0..3 {
             draft.entry(5).or_default().record(r, 0.012, false);
             draft.entry(1).or_default().record(r, 0.004, false);
@@ -2734,7 +2992,7 @@ fn b97f26_inflated_p0_knee_below_4_still_probes_rows4_to_proven() {
         }
         entry.verify.entry(4).or_default().record(1, 0.1387, false);
         entry.verify.entry(4).or_default().record(2, 0.1335, false);
-        let draft = state.draft_costs.entry((ctx, 1)).or_default();
+        let draft = state.draft_costs.entry((None, ctx, 1)).or_default();
         for r in 0..3 {
             draft.entry(5).or_default().record(r, 0.012, false);
             draft.entry(1).or_default().record(r, 0.004, false);
@@ -2780,5 +3038,420 @@ fn b97f26_inflated_p0_knee_below_4_still_probes_rows4_to_proven() {
     assert_eq!(
         v2, 3,
         "once rows=4 reaches 3 proven samples (~136 ms), dspark must lock onto v=3 (rows=4), got v={v2}"
+    );
+}
+
+/// End-to-end `DraftController` + `DFlash` (`DrafterState::propose`) activation
+/// of `F > 0` front rows for separate drafters (DSpark / DFlash):
+/// - Banked streamed prior with exposed stall where `F >= 1` strictly beats
+///   `F == 0`: `DraftController::generate` picks `G >= K + F`, `verify()`
+///   seals `plan.verify >= 1 && plan.front >= 1`, `DrafterState::propose`
+///   emits non-empty `front` tokens, and `plan.build_rows` + `RoundState::pass`
+///   + `into_operation` passes `Operation::validate` with `front_rows() > 0`.
+/// - Resident (`verify_prior == None`): stays at `F == 0` with empty `front`.
+/// - Banked streamed prior where `F` does not pay (`front_stall_saved_per_row == 0.0`
+///   or waste > saved stall): stays at `F == 0` with empty `front`.
+#[test]
+fn separate_drafter_emits_front_rows_when_exposed_stall_pays_and_zero_otherwise() {
+    use crate::{DFlash, Method, RoundState};
+    use magnitude_executor::{Demand, GuessKind, Outcome, RequestId, SelectSpec, Selected};
+
+    let path_bound_prior = StreamedVerifyPrior {
+        regime_epoch: 1,
+        verify_seconds: vec![0.040, 0.055, 0.070, 0.120, 0.170, 0.220],
+        compute_seconds: vec![0.008, 0.009, 0.010, 0.011, 0.012, 0.013],
+        io_seconds: vec![0.040, 0.055, 0.070, 0.120, 0.170, 0.220],
+        front_stall_saved_per_row: 0.030,
+        front_waste_per_row: vec![0.002; 5],
+        verify_host_overhead_seconds: 0.002,
+        verify_host_overhead_per_step_seconds: 0.0,
+        ..Default::default()
+    };
+
+    // 1. Path-bound banked load where F >= 1 strictly beats F == 0.
+    let load = Arc::new(DraftLoad::default());
+    load.observe_streamed(Some(path_bound_prior.clone()));
+    let mut ctrl = DraftController::new(5, load.clone());
+    ctrl.ladder = vec![1, 5];
+    let block5 = [TokenId(10), TokenId(11), TokenId(12), TokenId(13), TokenId(14)];
+    let g = ctrl.generate(5, 64, true);
+    assert!(g >= 2, "path-bound prior with front credit must draft wide enough for K + F, got G={g}");
+    ctrl.drafted(g, &block5[..g], None);
+    let k = ctrl.verify(5);
+    let plan = ctrl.sealed_plan().expect("verify must seal DecodePassPlan");
+    assert!(k >= 1, "unchained verify pass with F > 0 requires K >= 1, got K={k}");
+    assert!(
+        plan.front >= 1,
+        "exposed stall where F >= 1 strictly beats F == 0 must seal F >= 1, got {plan:?}"
+    );
+    assert!(plan.verify + plan.front <= g);
+
+    // Verify `DFlash::adaptive()` (`DrafterState::propose`) emits non-empty `front`
+    // and builds a valid `WorkKind::Verify` operation with `front_rows() > 0`.
+    struct StubReader;
+    impl magnitude_executor::FeatureReader for StubReader {
+        fn read(
+            &mut self,
+            span: &magnitude_executor::FeatureSpan,
+        ) -> Result<magnitude_executor::FeatureRows, String> {
+            magnitude_executor::FeatureRows::new(vec![0u8; span.count * 4].into(), span.count)
+                .map_err(|e| e.to_string())
+        }
+    }
+    let dflash = DFlash::new("dspark-test", 5).unwrap().adaptive();
+    dflash.observe_streamed_prior(Some(path_bound_prior));
+    let mut state = dflash.create(None).unwrap();
+    let feat = magnitude_executor::FeatureRef::logical(
+        magnitude_executor::ResourceDomainId::new("dspark-test-feat").unwrap(),
+        8,
+        4,
+    )
+    .unwrap();
+    let mut reader = StubReader;
+    let effects = state
+        .prime(
+            RequestId(1),
+            &[TokenId(1)],
+            Some(TokenId(2)),
+            Some(feat),
+            1,
+            None,
+            &mut reader,
+        )
+        .unwrap();
+    assert!(effects.operations.is_empty());
+    let selects: Vec<SelectSpec> = (0..5)
+        .map(|i| SelectSpec {
+            sampling: magnitude_executor::Sampling::Greedy,
+            seed: 0,
+            position: 1 + i,
+            domain: 0,
+            mask: None,
+            shaping: magnitude_executor::Shaping::default(),
+            history: None,
+        })
+        .collect();
+    let pending = state.propose(RequestId(1), &selects);
+    let ops = match pending {
+        crate::Propose::Pending(ops) => ops,
+        other => panic!("expected Propose::Pending to launch draft head, got {other:?}"),
+    };
+    assert_eq!(ops.len(), 1);
+    let draft_outcome = Outcome::Head {
+        proposals: block5.iter().copied().map(Selected::Token).collect(),
+        confidence: None,
+    };
+    state.reconcile(&ops[0], draft_outcome).unwrap();
+    let proposed = state.propose(RequestId(1), &selects);
+    let (acceptable, front) = match proposed {
+        crate::Propose::Tokens { acceptable, front } => (acceptable, front),
+        other => panic!("expected Propose::Tokens after draft head outcome, got {other:?}"),
+    };
+    let sealed = state.pass_plan().expect("adaptive DFlash must expose sealed DecodePassPlan");
+    assert!(sealed.verify >= 1, "expected K >= 1, got {sealed:?}");
+    assert!(sealed.front >= 1, "expected F >= 1, got {sealed:?}");
+    assert_eq!(acceptable.len(), sealed.verify);
+    assert_eq!(front.len(), sealed.front);
+    assert!(!front.is_empty(), "DFlash propose must emit non-empty front guesses");
+    let mut all_tokens = acceptable.clone();
+    all_tokens.extend(front.iter().map(|g| g.token));
+    let rows = sealed.build_rows(&all_tokens, GuessKind::Chained).unwrap();
+    assert_eq!(rows.acceptable().len(), sealed.verify);
+    assert_eq!(rows.front_rows(), sealed.front);
+    let round = RoundState::pass(
+        TokenId(2),
+        rows,
+        1,
+        &[TokenId(2)],
+        None,
+        magnitude_executor::Sampling::Greedy,
+        magnitude_executor::Shaping::default(),
+        0,
+        Demand::FEATURES,
+        None,
+    )
+    .unwrap();
+    let op = round
+        .forward()
+        .clone()
+        .into_operation(RequestId(1), 1, None)
+        .expect("DSpark verify pass with F > 0 must pass Operation::validate");
+    assert_eq!(op.front_rows(), sealed.front);
+
+    // 2. Resident load (`verify_prior == None`) must stay at F == 0.
+    let resident_load = Arc::new(DraftLoad::default());
+    let mut resident_ctrl = DraftController::new(5, resident_load);
+    resident_ctrl.ladder = vec![1, 5];
+    let rg = resident_ctrl.generate(5, 64, true);
+    resident_ctrl.drafted(rg, &block5[..rg], None);
+    let _ = resident_ctrl.verify(5);
+    let resident_plan = resident_ctrl.sealed_plan().unwrap();
+    assert_eq!(resident_plan.front, 0, "resident load must stay at F == 0: {resident_plan:?}");
+
+    // 3. Banked load where F does not pay (`front_stall_saved_per_row == 0.0`) must stay at F == 0.
+    let zero_stall_load = Arc::new(DraftLoad::default());
+    zero_stall_load.observe_streamed(Some(StreamedVerifyPrior {
+        regime_epoch: 1,
+        verify_seconds: vec![0.040, 0.055, 0.070, 0.120, 0.170, 0.220],
+        compute_seconds: vec![0.008, 0.009, 0.010, 0.011, 0.012, 0.013],
+        io_seconds: vec![0.040, 0.055, 0.070, 0.120, 0.170, 0.220],
+        front_stall_saved_per_row: 0.0,
+        front_waste_per_row: vec![0.004; 5],
+        ..Default::default()
+    }));
+    let mut zero_ctrl = DraftController::new(5, zero_stall_load);
+    zero_ctrl.ladder = vec![1, 5];
+    let zg = zero_ctrl.generate(5, 64, true);
+    zero_ctrl.drafted(zg, &block5[..zg], None);
+    let _ = zero_ctrl.verify(5);
+    let zero_plan = zero_ctrl.sealed_plan().unwrap();
+    assert_eq!(
+        zero_plan.front, 0,
+        "banked load where F does not pay must stay at F == 0: {zero_plan:?}"
+    );
+}
+
+#[test]
+fn fronts_enabled_widest_5_evaluates_k4_f1_candidate() {
+    let load = Arc::new(DraftLoad::default());
+    // Streamed verify prior where K=4 + F=1 saves substantial stall (~25 ms)
+    // with low waste (2 ms), beating both (K=5, F=0) and (K=3, F=2).
+    load.observe_streamed(Some(StreamedVerifyPrior {
+        regime_epoch: 1,
+        verify_seconds: vec![0.040, 0.055, 0.070, 0.085, 0.100, 0.130],
+        compute_seconds: vec![0.008, 0.009, 0.010, 0.011, 0.012, 0.013],
+        io_seconds: vec![0.040, 0.055, 0.070, 0.085, 0.100, 0.130],
+        front_stall_saved_per_row: 0.025,
+        front_waste_per_row: vec![0.002; 5],
+        ..Default::default()
+    }));
+    let mut ctrl = DraftController::new(5, load);
+    ctrl.ladder = vec![1, 5];
+    assert_eq!(ctrl.verify_widths(5), vec![0, 1, 3, 5]);
+
+    let block5 = [TokenId(1), TokenId(2), TokenId(3), TokenId(4), TokenId(5)];
+    let g = ctrl.generate(5, 64, true);
+    assert_eq!(g, 5);
+    ctrl.drafted(g, &block5, None);
+    let _ = ctrl.verify(5);
+    let plan = ctrl.sealed_plan().unwrap();
+    assert_eq!(
+        (plan.verify, plan.front),
+        (4, 1),
+        "when fronts_target is enabled at widest=5, (K=4, F=1) must be selectable: {plan:?}"
+    );
+}
+
+/// Regression for the RTX 3060 `M = 1` trap:
+/// - A cold burst poisons wide verify (`rows = 4` at `450 ms`) while plain
+///   `M = 1` runs at `85 ms`, collapsing `DraftController` to `M = 1`.
+/// - When the regime subsequently warms up (`rows = 4` drops to `160 ms`,
+///   beating `M = 1` at 75% acceptance), bounded neighboring-width trials exit
+///   `M = 1` within `WARMUP_DRIFT_ROUNDS = 4` rounds instead of staying stuck
+///   for 100+ rounds.
+/// - Conversely, when wider widths remain genuinely slower (`450 ms`), `M = 1`
+///   continues to win with exponential backoff (`4 -> 8 -> 16 ...`).
+#[test]
+fn draft_controller_leaves_m1_when_regime_improves_and_keeps_m1_when_slower() {
+    let dur = |ms: u64| Some(LaunchDuration { duration: Duration::from_millis(ms), covering: false });
+    let prior = StreamedVerifyPrior {
+        regime_epoch: 1,
+        verify_seconds: vec![0.085, 0.140, 0.195, 0.250],
+        compute_seconds: vec![0.025, 0.032, 0.040, 0.048],
+        io_seconds: vec![0.085, 0.140, 0.195, 0.250],
+        accepts: vec![Some(0.75), Some(0.56), Some(0.42)],
+        stand: Some(0.75),
+        ..Default::default()
+    };
+
+    // Part A: Cold burst collapses to M=1, then regime warms up -> exits M=1 promptly.
+    let load = Arc::new(DraftLoad::default());
+    load.observe_streamed(Some(prior.clone()));
+    let mut ctrl = DraftController::new(3, Arc::clone(&load));
+    ctrl.ladder = vec![1, 3];
+    let block3 = [TokenId(10), TokenId(11), TokenId(12)];
+
+    // Seed 75% acceptance and cold slow wide verify (`450 ms` for rows=4) + fast plain (`85 ms`).
+    for _ in 0..super::COST_SAMPLES {
+        let g = ctrl.generate(3, 4096, true);
+        if g > 0 {
+            ctrl.drafted(g, &block3[..g], None);
+            ctrl.timed(TimedLaunch::Draft, dur(8), 1, g);
+            let v = ctrl.verify(3);
+            ctrl.timed(TimedLaunch::Target, dur(450), 1, 1 + v);
+            ctrl.committed(&[TokenId(10), TokenId(11), TokenId(12), TokenId(13)][..=v]);
+        } else {
+            ctrl.timed(TimedLaunch::Target, dur(85), 1, 1);
+            ctrl.committed(&[TokenId(10)]);
+        }
+    }
+    // Measure plain M=1 (85 ms) so M=1 beats cold 450 ms wide verify.
+    for _ in 0..super::COST_SAMPLES {
+        let g = ctrl.generate(0, 4096, true);
+        assert_eq!(g, 0);
+        ctrl.timed(TimedLaunch::Target, dur(85), 1, 1);
+        ctrl.committed(&[TokenId(10)]);
+    }
+
+    // Now regime warms up: wider verify takes 140 ms (3+ tokens in 148 ms >> 11.8 tok/s).
+    // Within 6 rounds, a bounded trial must probe wider and immediately exit M=1.
+    let mut exited_m1 = false;
+    for _ in 0..8 {
+        let g = ctrl.generate(3, 4096, true);
+        if g > 0 {
+            ctrl.drafted(g, &block3[..g], None);
+            ctrl.timed(TimedLaunch::Draft, dur(8), 1, g);
+            let v = ctrl.verify(3);
+            ctrl.timed(TimedLaunch::Target, dur(140), 1, 1 + v);
+            ctrl.committed(&[TokenId(10), TokenId(11), TokenId(12), TokenId(13)][..=v]);
+            // Verify subsequent round stays out of M=1.
+            let next_g = ctrl.generate(3, 4096, true);
+            if next_g > 0 {
+                exited_m1 = true;
+                break;
+            }
+            ctrl.timed(TimedLaunch::Target, dur(85), 1, 1);
+            ctrl.committed(&[TokenId(10)]);
+        } else {
+            ctrl.timed(TimedLaunch::Target, dur(85), 1, 1);
+            ctrl.committed(&[TokenId(10)]);
+        }
+    }
+    assert!(exited_m1, "DraftController must exit M=1 within a few rounds once wider verify warms up");
+
+    // Part B: When wider verify remains genuinely slow (450 ms vs 85 ms plain),
+    // M=1 stays dominant and trials back off exponentially.
+    let slow_load = Arc::new(DraftLoad::default());
+    slow_load.observe_streamed(Some(prior));
+    // Seed slow wider verify at BOTH ladder widths (rows=2 and rows=4 at 450 ms)
+    // and fast plain M=1 (85 ms) so M=1 is genuinely faster across all widths.
+    let mut slow_ctrl = DraftController::new(3, Arc::clone(&slow_load));
+    slow_ctrl.ladder = vec![1, 3];
+    for limit in [1usize, 3usize] {
+        for _ in 0..super::COST_SAMPLES {
+            let g = slow_ctrl.generate(limit, 4096, true);
+            if g > 0 {
+                slow_ctrl.drafted(g, &block3[..g], None);
+                slow_ctrl.timed(TimedLaunch::Draft, dur(8), 1, g);
+                let v = slow_ctrl.verify(limit);
+                slow_ctrl.timed(TimedLaunch::Target, dur(450), 1, 1 + v);
+                slow_ctrl.committed(&[TokenId(10), TokenId(11), TokenId(12), TokenId(13)][..=v]);
+            } else {
+                slow_ctrl.timed(TimedLaunch::Target, dur(85), 1, 1);
+                slow_ctrl.committed(&[TokenId(10)]);
+            }
+        }
+    }
+    for _ in 0..super::COST_SAMPLES {
+        let _ = slow_ctrl.generate(0, 4096, true);
+        slow_ctrl.timed(TimedLaunch::Target, dur(85), 1, 1);
+        slow_ctrl.committed(&[TokenId(10)]);
+    }
+    let mut plain_rounds = 0usize;
+    let mut trial_rounds = 0usize;
+    for _ in 0..30 {
+        let g = slow_ctrl.generate(3, 4096, true);
+        if g > 0 {
+            trial_rounds += 1;
+            slow_ctrl.drafted(g, &block3[..g], None);
+            slow_ctrl.timed(TimedLaunch::Draft, dur(8), 1, g);
+            let v = slow_ctrl.verify(3);
+            slow_ctrl.timed(TimedLaunch::Target, dur(450), 1, 1 + v);
+            slow_ctrl.committed(&[TokenId(10), TokenId(11), TokenId(12), TokenId(13)][..=v]);
+        } else {
+            plain_rounds += 1;
+            slow_ctrl.timed(TimedLaunch::Target, dur(85), 1, 1);
+            slow_ctrl.committed(&[TokenId(10)]);
+        }
+    }
+    assert!(
+        plain_rounds >= 24 && trial_rounds <= 6,
+        "M=1 must dominate with exponential backoff when wider verify stays slow (plain={plain_rounds}, trials={trial_rounds})"
+    );
+}
+
+/// Regression for Sparky `185534`: cold single-sample (`len = 1`) warmup spikes on
+/// rounds 1..3 (`verify[6] = 0.6319 s`, `verify[4] = 0.5591 s`, `verify[2] = 0.2392 s`)
+/// with `verify[1]` settling warm at `0.049 s` on round 4+ and `right = [1.0; 5]`
+/// must NOT permanently lock `DraftController` into `generated = 0` (`M = 1`):
+/// once `verify[1]` is proven and `WARMUP_DRIFT_ROUNDS` elapse, unproven cold
+/// samples expire for re-probe so `DraftController` escapes `M = 1` within a few
+/// rounds and proves warm `verify[6]`.
+#[test]
+fn sparky_185534_cold_single_sample_verify_escapes_m1_lockout() {
+    let dur_us = |us: u64| Some(LaunchDuration { duration: Duration::from_micros(us), covering: false });
+    let block5 = [TokenId(1), TokenId(2), TokenId(3), TokenId(4), TokenId(5)];
+    let commit6 = [TokenId(1), TokenId(2), TokenId(3), TokenId(4), TokenId(5), TokenId(6)];
+
+    let load = Arc::new(DraftLoad::default());
+    let mut ctrl = DraftController::new(5, load.clone());
+    ctrl.ladder = vec![1, 5];
+
+    // Round 1: cold verify[6] = 631.9 ms, cold draft[5] = 218.7 ms (100% accepted).
+    let g = ctrl.generate(5, 64, true);
+    assert_eq!(g, 5);
+    ctrl.timed(TimedLaunch::Draft, dur_us(218_700), 1, g);
+    ctrl.drafted(g, &block5, None);
+    let v = ctrl.verify(5);
+    assert_eq!(v, 5);
+    ctrl.timed(TimedLaunch::Target, dur_us(631_900), 1, 1 + v);
+    ctrl.committed(&commit6);
+
+    // Round 2: cold verify[4] = 559.1 ms, draft[5] = 94.7 ms (100% accepted).
+    let g = ctrl.generate(5, 70, true);
+    assert_eq!(g, 5);
+    ctrl.timed(TimedLaunch::Draft, dur_us(94_700), 1, g);
+    ctrl.drafted(g, &block5, None);
+    let v = ctrl.verify(5);
+    assert_eq!(v, 3);
+    ctrl.timed(TimedLaunch::Target, dur_us(559_100), 1, 1 + v);
+    ctrl.committed(&commit6[..=v]);
+
+    // Round 3: cold verify[2] = 239.2 ms, draft[1] = 37.6 ms (100% accepted).
+    let g = ctrl.generate(5, 74, true);
+    assert_eq!(g, 1);
+    ctrl.timed(TimedLaunch::Draft, dur_us(37_600), 1, g);
+    ctrl.drafted(g, &block5[..1], None);
+    let v = ctrl.verify(5);
+    assert_eq!(v, 1);
+    ctrl.timed(TimedLaunch::Target, dur_us(239_200), 1, 1 + v);
+    ctrl.committed(&commit6[..=v]);
+
+    // Rounds 4+: target is warm (`verify[1] = 49 ms`, `verify[6] = 110 ms`, `draft[5] = 15 ms`).
+    // Even if `DraftController` briefly drops to `generated = 0` while `verify[1]` proves warm,
+    // it MUST re-probe and escape back to `generated = 5, verified = 5` within a few rounds.
+    let mut escaped_at: Option<usize> = None;
+    let mut wide_rounds = 0usize;
+    for r in 4..=20 {
+        let pos = 74 + r;
+        let g = ctrl.generate(5, pos, true);
+        if g > 0 {
+            ctrl.timed(TimedLaunch::Draft, dur_us(if g == 5 { 15_000 } else { 8_000 }), 1, g);
+            ctrl.drafted(g, &block5[..g], None);
+            let v = ctrl.verify(5);
+            let target_us = match v {
+                5 => 110_000,
+                3 => 90_000,
+                1 => 65_000,
+                _ => 49_000,
+            };
+            ctrl.timed(TimedLaunch::Target, dur_us(target_us), 1, 1 + v);
+            ctrl.committed(&commit6[..=v]);
+            if g == 5 && v == 5 {
+                escaped_at.get_or_insert(r);
+                wide_rounds += 1;
+            }
+        } else {
+            ctrl.timed(TimedLaunch::Target, dur_us(49_000), 1, 1);
+            ctrl.committed(&[TokenId(99)]);
+        }
+    }
+    assert!(
+        escaped_at.is_some_and(|r| r <= 12),
+        "DraftController must escape M=1 cold-warmup lockout within a few rounds (escaped_at={escaped_at:?}, wide_rounds={wide_rounds})"
+    );
+    assert!(
+        wide_rounds >= 8,
+        "after warm re-probe confirms verify[6]=110 ms, DraftController must stay at (G=5, V=5) (wide_rounds={wide_rounds})"
     );
 }

@@ -392,6 +392,10 @@ struct Inbound {
     /// True once a parked request already counted this in-flight prefetch as a
     /// `staged_hits` hit in `Decode::serve` (prevents double-counting on land).
     counted_hit: bool,
+    /// Raw uncalibrated hit probability predicted when this speculative read
+    /// was issued (`0.0` for demand/cover reads), used to update closed-loop
+    /// [`OnlineCalibration`] on hit or eviction/waste.
+    predicted_p: f64,
 }
 
 /// Metadata for a prefetched expert that landed into the tier ahead of need,
@@ -401,6 +405,64 @@ struct Inbound {
 pub(super) struct LandedPrefetch {
     pub(super) bytes: u64,
     pub(super) carryover: bool,
+    pub(super) predicted_p: f64,
+}
+
+/// Closed-loop online probability calibration for speculative drive prefetches
+/// (`carryover` and `ahead` interest reads): tracks realized hits against the
+/// sum of raw predicted probabilities `p_raw` over a decaying window so
+/// overconfident priors (`cand.p_next` on absent experts, or uncalibrated
+/// `Source::Token` buckets) automatically converge to their true realized
+/// hit-rate multiplier `cal in [0.25, 1.0]`.
+#[derive(Clone, Debug)]
+struct OnlineCalibration {
+    hits: f64,
+    predicted: f64,
+    samples: u32,
+}
+
+impl OnlineCalibration {
+    const PRIOR_HITS: f64 = 4.0;
+    const PRIOR_PRED: f64 = 5.0;
+    const DECAY_AT: u32 = 256;
+    const MIN_FACTOR: f64 = 0.25;
+
+    fn new() -> Self {
+        Self { hits: 0.0, predicted: 0.0, samples: 0 }
+    }
+
+    fn observe(&mut self, predicted_p: f64, hit: bool) {
+        let p = predicted_p.clamp(0.0, 1.0);
+        if !p.is_finite() || p <= 0.0 {
+            return;
+        }
+        if self.samples >= Self::DECAY_AT {
+            self.hits *= 0.5;
+            self.predicted *= 0.5;
+            self.samples /= 2;
+        }
+        self.samples += 1;
+        self.predicted += p;
+        if hit {
+            self.hits += 1.0;
+        }
+    }
+
+    fn factor(&self) -> f64 {
+        ((self.hits + Self::PRIOR_HITS) / (self.predicted + Self::PRIOR_PRED)).clamp(Self::MIN_FACTOR, 1.0)
+    }
+
+    fn calibrate(&self, p: f64) -> f64 {
+        (p.clamp(0.0, 1.0) * self.factor()).clamp(0.0, 1.0)
+    }
+
+    /// Soft-reset on a request boundary so cold-start waste from a prior
+    /// request does not permanently throttle carryover on the next request.
+    fn soft_reset(&mut self) {
+        self.hits *= 0.25;
+        self.predicted *= 0.25;
+        self.samples /= 4;
+    }
 }
 
 /// Why an expert is inbound, with the read that brings it.
@@ -547,6 +609,12 @@ fn ring_entries(ring: &Words, base: usize, seen: i32, choices: u64) -> Option<Ri
     (ring.load(base + constants::RING_SEQUENCE as usize) == low).then_some((low, guesses, entries))
 }
 
+#[cfg(test)]
+thread_local! {
+    static PREFETCH_SETTLE_VISITS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    static PREFETCH_PRUNE_VISITS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
 /// The staging records and the reads into them (Path 1: NVMe -> RAM / bank).
 /// The shared `NameLedger` (`experts::interest::Ledger`) is owned by
 /// `Residency` and passed in so both Path 1 (`Prefetch`) and Path 0
@@ -558,6 +626,15 @@ pub(super) struct Prefetch {
     /// What is inbound, by expert, until the watcher learns its landing's
     /// end ([`Self::settle`]).
     inbound: HashMap<Staged, Inbound>,
+    /// Completion queue pushed by [`Ended::set`] so [`Self::settle`] processes
+    /// only ended landings (`O(completions)`), never scanning all `inbound`.
+    completed: Arc<Mutex<Vec<Staged>>>,
+    /// Lock-free fast-path flag set on [`Ended::set`] so zero-completion wakes
+    /// skip locking `completed`.
+    has_completed: Arc<AtomicBool>,
+    /// Subset of `inbound` holding a `Need::Due { device: Some(_), .. }`
+    /// device landing (empty on discrete GPUs).
+    device_due: Vec<Staged>,
     /// How far the device is known to be (`Residency::advance`), which ends
     /// the landings it converted behind it.
     past: Point,
@@ -576,13 +653,11 @@ pub(super) struct Prefetch {
     /// until routed (`landed_hits` / `carryover_hits`) or evicted unused
     /// (`carryover_wasted`).
     landed_prefetches: HashMap<Staged, LandedPrefetch>,
+    /// Closed-loop online probability calibration for carryover drive reads.
+    carryover_cal: OnlineCalibration,
     /// Currently active decode/verify steps for `DriveEngagement`'s
     /// active-burst wall clock (excludes prompt steps and inter-request idle).
     active_decode_steps: HashSet<Step>,
-    /// Row count `M` of the latest decode/verify burst (`1` for plain decode,
-    /// `4..6` for MTP verify), used to lift single-token reuse probability `p_1`
-    /// to burst hit probability `1 - (1 - p_1)^M` when pricing carryover.
-    active_decode_rows: usize,
 }
 
 /// What a read ahead is priced by, read from telemetry (under its lock) once
@@ -612,22 +687,32 @@ struct DriveIdleBudget {
     remaining_layers: usize,
     queued_bytes: Vec<u64>,
     draft_idle: f64,
+    /// Live per-layer inter-park compute gap `c_layer_tail` when the drive
+    /// currently has zero active reads (`active_reads == 0`), else `0.0`.
+    inter_layer_idle: f64,
     budget: std::cell::Cell<Option<LinkIdleBudget>>,
 }
 
 impl DriveIdleBudget {
-    fn new(layers: usize, remaining_layers: usize, queued_bytes: Vec<u64>, draft_idle: f64) -> Self {
-        Self { layers, remaining_layers, queued_bytes, draft_idle, budget: std::cell::Cell::new(None) }
+    fn new(layers: usize, remaining_layers: usize, queued_bytes: Vec<u64>, draft_idle: f64, inter_layer_idle: f64) -> Self {
+        Self { layers, remaining_layers, queued_bytes, draft_idle, inter_layer_idle, budget: std::cell::Cell::new(None) }
     }
 
     fn get(&self, price: &super::telemetry::ReadPrice) -> f64 {
         if let Some(budget) = self.budget.get() {
             return budget.remaining();
         }
+        // On a drive-bound pass, whole-step compute slack is 0.0, so only a
+        // live per-layer inter-park gap (`inter_layer_idle` when `active_reads == 0`)
+        // or a `DraftWindow` (`draft_idle`) opens free drive slack. Otherwise
+        // the remaining non-drive pass window also opens overlap headroom.
         let c_window = if self.layers == 0 {
             0.0
+        } else if price.drive_binds() {
+            self.inter_layer_idle
         } else {
-            (self.remaining_layers.clamp(1, self.layers) as f64 / self.layers as f64) * price.non_drive_pass_seconds()
+            ((self.remaining_layers.clamp(1, self.layers) as f64 / self.layers as f64) * price.non_drive_pass_seconds())
+                .max(self.inter_layer_idle)
         };
         let queued: f64 = self.queued_bytes.iter().map(|&bytes| price.transfer_seconds(bytes)).sum();
         let budget = LinkIdleBudget::new(c_window, self.draft_idle, queued);
@@ -648,6 +733,8 @@ impl DriveIdleBudget {
 /// Admission of a read ahead of an expert's `bytes`, as the ledger asks it
 /// ([`Admit`]): at the break-even of a read of them given the shared drive's
 /// remaining idle compute window (`ReadPrice::admits_with_idle`).
+/// `interest::Ledger` (`interest::Calibration`) is the single calibration owner
+/// for `Ahead::Interest` probabilities.
 struct Admitting<'a> {
     priced: &'a Priced<'a>,
     bytes: u64,
@@ -657,7 +744,8 @@ struct Admitting<'a> {
 impl Admit for Admitting<'_> {
     fn admits(&self, p: f64) -> bool {
         let price = self.priced.get();
-        let admitted = price.admits_with_idle(p, self.bytes, self.idle.get(price));
+        let p_eff = p.clamp(0.0, 1.0);
+        let admitted = price.admits_with_idle(p_eff, self.bytes, self.idle.get(price));
         if admitted {
             self.idle.consume(price, price.transfer_seconds(self.bytes));
         }
@@ -671,21 +759,21 @@ impl Prefetch {
         Self {
             staging: Arc::new(StagingPool::new(records)),
             inbound: HashMap::new(),
+            completed: Arc::new(Mutex::new(Vec::new())),
+            has_completed: Arc::new(AtomicBool::new(false)),
+            device_due: Vec::new(),
             past: Point::START,
             seen: vec![0; layers],
             step_prefetch_bytes: 0,
             reads_finished: Arc::new(AtomicBool::new(false)),
             landed_prefetches: HashMap::new(),
+            carryover_cal: OnlineCalibration::new(),
             active_decode_steps: HashSet::new(),
-            active_decode_rows: 1,
         }
     }
 
-    /// Track a decode/verify step beginning on `DriveEngagement`'s burst clock
-    /// and record its active burst row count `m_active` (`1` for plain decode,
-    /// `M > 1` for multi-row verify).
-    pub(super) fn decode_step_began(&mut self, step: Step, m_active: usize, shared: &Shared) {
-        self.active_decode_rows = m_active.max(1);
+    /// Track a decode/verify step beginning on `DriveEngagement`'s burst clock.
+    pub(super) fn decode_step_began(&mut self, step: Step, shared: &Shared) {
         if self.active_decode_steps.insert(step) {
             shared.telemetry.engagement().on_decode_began(Instant::now());
         }
@@ -726,30 +814,91 @@ impl Prefetch {
         self.step_prefetch_bytes = 0;
     }
 
-    /// Consume a previously landed prefetch record when a step routes `staged`.
+    /// Called by `Residency::learn_told` when a request closes: soft-reset
+    /// carryover calibration so cold-start waste from a prior request does not
+    /// throttle carryover on the next request.
+    pub(super) fn on_request_closed(&mut self) {
+        self.carryover_cal.soft_reset();
+    }
+
+    /// Consume a previously landed prefetch record when a step routes `staged`,
+    /// feeding realized carryover hits back into closed-loop [`OnlineCalibration`].
     pub(super) fn take_landed_prefetch(&mut self, staged: Staged) -> Option<LandedPrefetch> {
-        self.landed_prefetches.remove(&staged)
+        let lp = self.landed_prefetches.remove(&staged)?;
+        if lp.carryover {
+            self.carryover_cal.observe(lp.predicted_p, true);
+        }
+        Some(lp)
     }
 
     /// Mark an in-flight prefetch as already counted as a `staged_hits` hit so
-    /// it is not double-counted when it subsequently lands.
+    /// it is not double-counted when it subsequently lands, and feed carryover
+    /// hits into closed-loop [`OnlineCalibration`].
     pub(super) fn mark_inbound_hit(&mut self, staged: Staged) {
         if let Some(inbound) = self.inbound.get_mut(&staged) {
-            inbound.counted_hit = true;
+            if !inbound.counted_hit {
+                inbound.counted_hit = true;
+                if matches!(inbound.need, Need::Ahead { ahead: Ahead::Carryover { .. }, .. }) {
+                    self.carryover_cal.observe(inbound.predicted_p, true);
+                }
+            }
         }
     }
 
     /// Drop any landed prefetch entries that were evicted from the tier before
-    /// being used, counting evicted carryover entries as `carryover_wasted`.
-    pub(super) fn prune_evicted_prefetches(&mut self, core: &Core, shared: &Shared) {
-        self.landed_prefetches.retain(|&(layer, expert), lp| {
-            let still_present =
-                core.directory.held(layer, expert).is_some() || core.directory.located(layer, expert) != Located::Lacked;
-            if !still_present && lp.carryover {
-                shared.telemetry.engagement().record_carryover_wasted();
+    /// being used, counting evicted carryover entries as `carryover_wasted`
+    /// and feeding carryover evictions into [`OnlineCalibration`].
+    /// Runs in `O(evictions)` by draining `Directory::take_evicted()` rather
+    /// than scanning all `landed_prefetches` on every step.
+    pub(super) fn prune_evicted_prefetches(&mut self, core: &mut Core, shared: &Shared) {
+        self.prune_evicted_in(&mut core.directory, shared.telemetry.engagement());
+    }
+
+    fn prune_evicted_in(
+        &mut self,
+        directory: &mut Directory,
+        engagement: &super::telemetry::DriveEngagement,
+    ) {
+        if self.landed_prefetches.is_empty() {
+            directory.clear_evicted();
+            return;
+        }
+        let carryover_cal = &mut self.carryover_cal;
+        match directory.take_evicted() {
+            Some(evicted) => {
+                for staged in evicted {
+                    #[cfg(test)]
+                    PREFETCH_PRUNE_VISITS.with(|c| c.set(c.get() + 1));
+                    if !self.landed_prefetches.contains_key(&staged) {
+                        continue;
+                    }
+                    let (layer, expert) = staged;
+                    let still_present =
+                        directory.held(layer, expert).is_some() || directory.located(layer, expert) != Located::Lacked;
+                    if !still_present {
+                        if let Some(lp) = self.landed_prefetches.remove(&staged) {
+                            if lp.carryover {
+                                engagement.record_carryover_wasted();
+                                carryover_cal.observe(lp.predicted_p, false);
+                            }
+                        }
+                    }
+                }
             }
-            still_present
-        });
+            None => {
+                self.landed_prefetches.retain(|&(layer, expert), lp| {
+                    #[cfg(test)]
+                    PREFETCH_PRUNE_VISITS.with(|c| c.set(c.get() + 1));
+                    let still_present =
+                        directory.held(layer, expert).is_some() || directory.located(layer, expert) != Located::Lacked;
+                    if !still_present && lp.carryover {
+                        engagement.record_carryover_wasted();
+                        carryover_cal.observe(lp.predicted_p, false);
+                    }
+                    still_present
+                });
+            }
+        }
     }
 
     /// The low word of the last step `layer`'s front ring was read for.
@@ -768,7 +917,16 @@ impl Prefetch {
     /// accounted apart, once ([`account`]).
     pub(super) fn demand(&mut self, core: &Core, named: Named, naming: Naming, at: Point, landings: &Arc<Landings>, shared: &Arc<Shared>) {
         let Named { expert, posting: Posting { ticket, join }, staged, grant, rows, answer } = named;
-        let (ended, urgency, tier) = (Ended::new(shared.events()), Urgency::waited(), grant.record());
+        let (ended, urgency, tier) = (
+            Ended::new_notifying(
+                shared.events(),
+                (naming.layer, expert),
+                self.completed.clone(),
+                self.has_completed.clone(),
+            ),
+            Urgency::waited(),
+            grant.record(),
+        );
         let read_done = Arc::new(AtomicBool::new(false));
         let device = core.layers[naming.layer]
             .landing
@@ -776,7 +934,7 @@ impl Prefetch {
             .map(|list| Arc::new(DeviceLanding::new(list.clone(), at, ended.clone(), shared.landings.clone())));
         let (serving, end, done, finished) = (shared.clone(), ended.clone(), read_done.clone(), self.reads_finished.clone());
         let bytes = core.layers[naming.layer].expert_bytes();
-        shared.telemetry.engagement().read_started();
+        shared.telemetry.engagement().demand_read_started();
         match &device {
             Some(device) => {
                 let device = device.clone();
@@ -784,7 +942,7 @@ impl Prefetch {
                 join.claimed(move |outcome, failed| {
                     done.store(true, Ordering::Release);
                     finished.store(true, Ordering::Release);
-                    serving.telemetry.engagement().read_finished();
+                    serving.telemetry.engagement().demand_read_finished();
                     if !read_named(&serving, naming, (&rows, &answer), &outcome, failed, &end) {
                         serving.events().notify();
                         return;
@@ -849,7 +1007,7 @@ impl Prefetch {
                 join.claimed(move |outcome, failed| {
                     done.store(true, Ordering::Release);
                     finished.store(true, Ordering::Release);
-                    serving.telemetry.engagement().read_finished();
+                    serving.telemetry.engagement().demand_read_finished();
                     if failed.is_empty() {
                         serving.landings.read(naming.named.elapsed());
                         landings.read(&serving);
@@ -864,7 +1022,7 @@ impl Prefetch {
             }
         }
         let need = Need::Due { ticket, read: naming.sequence, device };
-        self.arrive((naming.layer, expert), Inbound { record: Some(staged), tier, bytes, need, ended, urgency, read_done, counted_hit: false });
+        self.arrive((naming.layer, expert), Inbound { record: Some(staged), tier, bytes, need, ended, urgency, read_done, counted_hit: false, predicted_p: 0.0 });
     }
 
     /// The landing of `staged` in flight a request finds, by what read it:
@@ -971,6 +1129,9 @@ impl Prefetch {
 
     /// Track `inbound`, the one landing of `staged`.
     fn arrive(&mut self, staged: Staged, inbound: Inbound) {
+        if matches!(inbound.need, Need::Due { device: Some(_), .. }) {
+            self.device_due.push(staged);
+        }
         let previous = self.inbound.insert(staged, inbound);
         assert!(previous.is_none(), "expert {staged:?} lands twice at once");
     }
@@ -1040,41 +1201,71 @@ impl Prefetch {
     /// Settle the landings that ended: returns `(settled, newly_landed)` where
     /// `newly_landed` lists every `(layer, expert)` that just landed into
     /// Tier 1 (used for Path 1 -> Path 0 pipeline chain-through to `LinkMover`).
+    /// Runs in `O(completions + device_due)` — zero `inbound` scan on empty wakes.
     pub(super) fn settle(&mut self, directory: &mut Directory, ledger: &mut Ledger, shared: &Shared) -> (bool, Vec<Staged>) {
+        self.settle_in(directory, ledger, shared.telemetry.engagement())
+    }
+
+    fn settle_in(
+        &mut self,
+        directory: &mut Directory,
+        ledger: &mut Ledger,
+        engagement: &super::telemetry::DriveEngagement,
+    ) -> (bool, Vec<Staged>) {
         let mut freed = false;
-        for inbound in self.inbound.values_mut() {
-            if let Need::Due { device: Some(device), .. } = &inbound.need {
-                if inbound.record.is_some() && device.converted() {
-                    self.staging.release(inbound.record.take().expect("checked above"));
-                    freed = true;
-                }
-                device.end(self.past);
-            }
-        }
-        let mut ended = Vec::new();
-        self.inbound.retain(|&staged, inbound| match inbound.ended.get() {
-            Some(landed) => {
-                let prefetch_kind = match &inbound.need {
-                    Need::Ahead { ahead: Ahead::Interest { .. }, .. } => Some((false, false)),
-                    Need::Ahead { ticket, ahead: Ahead::Carryover { .. } } => Some((true, ticket.begun())),
-                    Need::Due { .. } | Need::Ahead { ahead: Ahead::Cover, .. } => None,
+        if !self.device_due.is_empty() {
+            let past = self.past;
+            let staging = &self.staging;
+            let inbound_map = &mut self.inbound;
+            self.device_due.retain(|&staged| {
+                #[cfg(test)]
+                PREFETCH_SETTLE_VISITS.with(|c| c.set(c.get() + 1));
+                let Some(inbound) = inbound_map.get_mut(&staged) else {
+                    return false;
                 };
-                ended.push((inbound.record, staged, inbound.tier, inbound.read(), landed, inbound.bytes, inbound.counted_hit, prefetch_kind));
-                false
-            }
-            None => true,
-        });
+                if let Need::Due { device: Some(device), .. } = &inbound.need {
+                    if inbound.record.is_some() && device.converted() {
+                        staging.release(inbound.record.take().expect("checked above"));
+                        freed = true;
+                    }
+                    device.end(past);
+                }
+                inbound.ended.get().is_none()
+            });
+        }
+        if !self.has_completed.swap(false, Ordering::AcqRel) {
+            return (freed, Vec::new());
+        }
+        let batch = std::mem::take(&mut *self.completed.lock().expect("completed landings queue"));
+        let mut ended = Vec::with_capacity(batch.len());
+        for staged in batch {
+            #[cfg(test)]
+            PREFETCH_SETTLE_VISITS.with(|c| c.set(c.get() + 1));
+            let Some(inbound) = self.inbound.remove(&staged) else {
+                continue;
+            };
+            let Some(landed) = inbound.ended.get() else {
+                unreachable!("staged {staged:?} was pushed to completed before Ended::set");
+            };
+            let prefetch_kind = match &inbound.need {
+                Need::Ahead { ahead: Ahead::Interest { .. }, .. } => Some((false, false)),
+                Need::Ahead { ticket, ahead: Ahead::Carryover { .. } } => Some((true, ticket.begun())),
+                Need::Due { .. } | Need::Ahead { ahead: Ahead::Cover, .. } => None,
+            };
+            ended.push((inbound.record, staged, inbound.tier, inbound.read(), landed, inbound.bytes, inbound.counted_hit, inbound.predicted_p, prefetch_kind));
+        }
         let settled = freed || !ended.is_empty();
         let mut newly_landed = Vec::new();
-        for (record, staged, tier, read, landed, bytes, counted_hit, prefetch_kind) in ended {
+        for (record, staged, tier, read, landed, bytes, counted_hit, predicted_p, prefetch_kind) in ended {
             if landed {
                 newly_landed.push(staged);
             }
             if let Some((carryover, begun)) = prefetch_kind {
                 if landed && !counted_hit {
-                    self.landed_prefetches.insert(staged, LandedPrefetch { bytes, carryover });
-                } else if !landed && carryover && begun && !counted_hit {
-                    shared.telemetry.engagement().record_carryover_wasted();
+                    self.landed_prefetches.insert(staged, LandedPrefetch { bytes, carryover, predicted_p });
+                } else if !landed && begun && !counted_hit && carryover {
+                    engagement.record_carryover_wasted();
+                    self.carryover_cal.observe(predicted_p, false);
                 }
             }
             self.ended(directory, ledger, record, staged, tier, read, landed);
@@ -1384,12 +1575,17 @@ impl Prefetch {
         let mut seen = HashSet::new();
         experts.retain(|&staged| seen.insert(staged));
         let draft_idle = ledger.draft_window_remaining(Instant::now());
+        let inter_layer_idle = if shared.telemetry.engagement().active_reads() == 0 {
+            shared.telemetry.engagement().c_layer_tail()
+        } else {
+            0.0
+        };
         let (_, current_layer) = self.active_point(ledger);
         let remaining_layers = core.layers.len().saturating_sub(current_layer.saturating_add(1)).max(1);
         let scheduled = {
             let core: &Core = core;
             let queued_bytes = self.drive_queued_bytes(|layer| core.layers[layer].expert_bytes(), &seen);
-            let idle = DriveIdleBudget::new(core.layers.len(), remaining_layers, queued_bytes, draft_idle);
+            let idle = DriveIdleBudget::new(core.layers.len(), remaining_layers, queued_bytes, draft_idle, inter_layer_idle);
             // Each read's standing, taken before the ledger decides on it.
             let states = experts.iter().map(|&staged| (staged, self.read_state(core, staged))).collect::<HashMap<_, _>>();
             let read = |layer, expert| states[&(layer, expert)];
@@ -1448,14 +1644,37 @@ impl Prefetch {
                             continue;
                         }
                     }
-                    let expected = match class {
-                        Class::Expected { step, p } => Some((step, p)),
-                        Class::Due => None,
+                    let pass_remaining = if core.layers.is_empty() {
+                        0.0
+                    } else {
+                        (remaining_layers as f64 / core.layers.len() as f64) * p.non_drive_pass_seconds()
+                    };
+                    let free_slack = if in_draft {
+                        draft_idle
+                    } else if p.drive_binds() {
+                        inter_layer_idle
+                    } else {
+                        p.slack_seconds().max(pass_remaining).max(inter_layer_idle)
+                    };
+                    let (claim, predicted_p) = match class {
+                        Class::Expected { step, p: raw_p } => {
+                            let p_eff = raw_p.clamp(0.0, 1.0);
+                            let stall_credit = if free_slack > 0.0 {
+                                p.carryover_net_benefit(p_eff, core.layers[layer].expert_bytes(), free_slack).max(0.0)
+                            } else {
+                                0.0
+                            };
+                            (AheadClaim::Interest { step, p: p_eff, stall_credit }, p_eff)
+                        }
+                        Class::Due => (AheadClaim::None, 0.0),
                     };
                     let interest = leading.expect("an expected read has a leading interest");
-                    let target_step = expected.map_or(interest.from.point.sequence, |(step, _)| step);
+                    let target_step = match class {
+                        Class::Expected { step, .. } => step,
+                        Class::Due => interest.from.point.sequence,
+                    };
                     let ahead = Ahead::Interest { source: interest.source, issued: interest.from, target_step };
-                    match self.read_ahead(core, shared, staged, wanted(class), ahead, expected, reserve) {
+                    match self.read_ahead(core, shared, staged, wanted(class), ahead, claim, predicted_p, reserve) {
                         Ok(bytes) => {
                             if !in_draft {
                                 self.step_prefetch_bytes = self.step_prefetch_bytes.saturating_add(bytes);
@@ -1512,13 +1731,20 @@ impl Prefetch {
                 }
                 let bytes = core.layers[cand.layer].expert_bytes();
                 let t_bw = p.transfer_seconds(bytes);
-                let p_eff = burst_hit_probability(cand.p_next, self.active_decode_rows);
+                // During `DraftWindow` the GPU touches zero routed experts, so
+                // `budget.remaining()` is genuinely idle drive time on every
+                // host. `cand.p_next` (`Reuse::next_step_candidates` ->
+                // `Calibration::route[Form::Verify][lead=1]`) is already
+                // calibrated on the full M-row verify burst union.
+                let p_raw = cand.p_next.clamp(0.0, 1.0);
+                let p_eff = self.carryover_cal.calibrate(p_raw);
                 let net_benefit = p.carryover_net_benefit(p_eff, bytes, budget.remaining());
                 if net_benefit <= 0.0 {
                     continue;
                 }
                 let want = Want::undated(p_eff);
-                match self.read_ahead(core, shared, (cand.layer, cand.expert), want, Ahead::Carryover { target_step: 0 }, Some((0, net_benefit)), reserve) {
+                let claim = AheadClaim::Carryover { net_benefit, strict_rank: p.drive_binds() };
+                match self.read_ahead(core, shared, (cand.layer, cand.expert), want, Ahead::Carryover { target_step: 0 }, claim, p_raw, reserve) {
                     Ok(_) => {
                         read = true;
                         budget.consume(t_bw);
@@ -1533,28 +1759,40 @@ impl Prefetch {
             return read;
         }
 
-        // Continuous full-burst & cross-burst in-verify carryover: keep the
-        // drive busy across the remaining non-drive pass window (compute
-        // + RAM -> VRAM DMA) of burst `B` (`l+1..L-1`, priority 1) and into
-        // early layers of burst `B+1` (`0..=l`, priority 2), paced to at most
-        // `active_carryover_max_inflight` concurrent carryover reads on the
-        // drive (refilled immediately on `reads_finished`) so Phase B demand
-        // misses never suffer multi-expert head-of-line blocking behind
-        // already-begun, un-cancellable carryover reads or bursty DDR5 landing
-        // conversions.
+        // Continuous full-burst & per-layer inter-park carryover: keep the
+        // drive busy across any genuine idle window — either the remaining
+        // non-drive pass window (when `!drive_binds()`) or the live per-layer
+        // inter-park compute gap `c_layer_tail` when `active_reads == 0`
+        // (including when `drive_binds()`, capped at 1 in-flight next-layer
+        // read so `Want::now()` + `tau_hol` strictly preempt it).
         let (step, current_layer) = self.active_point(ledger);
         if step == 0 || shared.steps.ended(step) {
             return false;
         }
         let p = price.get();
+        let drive_binds = p.drive_binds();
+        let active_reads = shared.telemetry.engagement().active_reads();
+        let inter_layer_idle = if active_reads == 0 {
+            shared.telemetry.engagement().c_layer_tail()
+        } else {
+            0.0
+        };
+        if drive_binds && inter_layer_idle <= 0.0 {
+            return false;
+        }
         let layers = core.layers.len();
         let ref_bytes = core.layers[current_layer.min(layers - 1)].expert_bytes();
-        let max_inflight = active_carryover_max_inflight(p, layers, ref_bytes);
+        let max_inflight = if drive_binds {
+            1
+        } else {
+            active_carryover_max_inflight(core.table.source().knee(), ref_bytes)
+        };
         let mut inflight = self.inflight_carryover_reads();
         if inflight >= max_inflight {
             return false;
         }
         let binds = p.binds();
+        let needs_idle_window = binds;
         let mut remaining_budget = if binds {
             u64::MAX
         } else {
@@ -1572,14 +1810,23 @@ impl Prefetch {
             .filter(|(_, inbound)| !inbound.read_done.load(Ordering::Acquire))
             .map(|(&(layer, _), _)| p.transfer_seconds(core.layers[layer].expert_bytes()))
             .sum();
-        let idle_window = if binds { pass_remaining } else { p.slack_seconds().max(pass_remaining) };
+        let idle_window = if drive_binds {
+            inter_layer_idle
+        } else if binds {
+            pass_remaining.max(inter_layer_idle)
+        } else {
+            p.slack_seconds().max(pass_remaining).max(inter_layer_idle)
+        };
         let mut budget = LinkIdleBudget::new(idle_window, 0.0, queued_secs);
-        if binds && budget.remaining() <= 0.0 {
+        if needs_idle_window && budget.remaining() <= 0.0 {
             return false;
         }
         let mut candidates = {
             let reuse = core.directory.reuse_now();
-            reuse.next_step_candidates(room, false, |layer, expert| Self::candidate(core, (layer, expert)))
+            reuse.next_step_candidates(room, false, |layer, expert| {
+                (!drive_binds || is_interlayer_target(layer, current_layer, layers))
+                    && Self::candidate(core, (layer, expert))
+            })
         };
         // Earliest-deadline-first across the burst boundary: remaining layers
         // of burst B (`layer > current_layer`) first, then early layers of
@@ -1603,22 +1850,24 @@ impl Prefetch {
                 continue;
             }
             let t_bw = p.transfer_seconds(bytes);
-            let free_slack = active_carryover_free_slack(p, budget.remaining());
-            let p_eff = active_carryover_hit_probability(p, cand.p_next, self.active_decode_rows);
+            let free_slack = budget.remaining();
+            let p_raw = cand.p_next.clamp(0.0, 1.0);
+            let p_eff = self.carryover_cal.calibrate(p_raw);
             let net_benefit = p.carryover_net_benefit(p_eff, bytes, free_slack);
             if net_benefit <= 0.0 {
                 continue;
             }
             let target_step = if cand.layer > current_layer { step } else { step.saturating_add(1) };
             let want = Want::undated(p_eff);
-            match self.read_ahead(core, shared, (cand.layer, cand.expert), want, Ahead::Carryover { target_step }, Some((target_step, net_benefit)), reserve) {
+            let claim = AheadClaim::Carryover { net_benefit, strict_rank: drive_binds };
+            match self.read_ahead(core, shared, (cand.layer, cand.expert), want, Ahead::Carryover { target_step }, claim, p_raw, reserve) {
                 Ok(bytes) => {
                     self.step_prefetch_bytes = self.step_prefetch_bytes.saturating_add(bytes);
                     remaining_budget = remaining_budget.saturating_sub(bytes);
                     budget.consume(t_bw);
                     inflight += 1;
                     read = true;
-                    if inflight >= max_inflight || (!binds && remaining_budget == 0) || (binds && t_bw > 0.0 && budget.remaining() <= 0.0) {
+                    if inflight >= max_inflight || (!binds && remaining_budget == 0) || (needs_idle_window && t_bw > 0.0 && budget.remaining() <= 0.0) {
                         break;
                     }
                 }
@@ -1687,7 +1936,7 @@ impl Prefetch {
             if self.staging.free() <= keep {
                 break;
             }
-            match self.read_ahead(core, shared, staged, Want::undated(0.), Ahead::Cover, None, reserve) {
+            match self.read_ahead(core, shared, staged, Want::undated(0.), Ahead::Cover, AheadClaim::None, 0.0, reserve) {
                 Ok(_) => {}
                 // Refused, or its group's tier holds no record for it now:
                 // the cover goes on to the next.
@@ -1711,6 +1960,7 @@ impl Prefetch {
     /// for it hastens its read and its landing to demand
     /// ([`Self::hasten`]), and the watcher learns its end
     /// ([`Self::settle`]). Its bytes, or what it fell short of.
+    #[allow(clippy::too_many_arguments)]
     fn read_ahead(
         &mut self,
         core: &mut Core,
@@ -1718,7 +1968,8 @@ impl Prefetch {
         staged: Staged,
         want: Want,
         ahead: Ahead,
-        expected: Option<(Step, f64)>,
+        claim_kind: AheadClaim,
+        predicted_p: f64,
         (staging, ahead_staging): (usize, Option<usize>),
     ) -> Result<u64, Short> {
         let (target, expert) = staged;
@@ -1729,10 +1980,14 @@ impl Prefetch {
         // past the reads ahead's staging, whose landings it counts already;
         // none for the cover.
         let keep = ahead_staging.map_or(0, |ahead| core.directory.host(core.layers[target].group).reserve().saturating_sub(ahead));
-        let claim = match (ahead, expected) {
-            (Ahead::Interest { .. }, Some((step, p))) => core.directory.claim_ahead(target, expert, keep, ahead.taking(), step, p),
-            (Ahead::Carryover { .. }, Some((_, net_benefit))) => core.directory.claim_carryover(target, expert, keep, ahead.taking(), net_benefit),
-            _ => core.directory.claim_landing(target, expert, keep, ahead.taking(), (|_, _| (), |_, _| false)),
+        let claim = match claim_kind {
+            AheadClaim::Interest { step, p, stall_credit } => {
+                core.directory.claim_ahead(target, expert, keep, ahead.taking(), step, p, stall_credit)
+            }
+            AheadClaim::Carryover { net_benefit, strict_rank } => {
+                core.directory.claim_carryover(target, expert, keep, ahead.taking(), net_benefit, strict_rank)
+            }
+            AheadClaim::None => core.directory.claim_landing(target, expert, keep, ahead.taking(), (|_, _| (), |_, _| false)),
         };
         let Claim::Taken(grant) = claim else {
             self.staging.release(record);
@@ -1754,7 +2009,12 @@ impl Prefetch {
                 }
                 let landing = core.landing_with_leads(grant, record, ticket.tensor_leads());
                 let tensor_count = landing.tensors.len();
-                let ended = Ended::new(shared.events());
+                let ended = Ended::new_notifying(
+                    shared.events(),
+                    staged,
+                    self.completed.clone(),
+                    self.has_completed.clone(),
+                );
                 let urgency = Urgency::ahead(want);
                 let read_done = Arc::new(AtomicBool::new(false));
                 let (end, serving, urgent, done, finished) = (ended.clone(), shared.clone(), urgency.clone(), read_done.clone(), self.reads_finished.clone());
@@ -1799,7 +2059,7 @@ impl Prefetch {
                     seismic_io::timeline::note(seismic_io::timeline::Kind::Noted("ahead_read"), 0, (target as i64, expert as i64, read as i64));
                     serving.events().notify();
                 });
-                self.arrive(staged, Inbound { record: Some(record), tier, bytes, need: Need::Ahead { ticket, ahead }, ended, urgency, read_done, counted_hit: false });
+                self.arrive(staged, Inbound { record: Some(record), tier, bytes, need: Need::Ahead { ticket, ahead }, ended, urgency, read_done, counted_hit: false, predicted_p });
                 Ok(bytes)
             }
             // The engine took no request: the read stages and lands nothing and
@@ -1829,6 +2089,13 @@ pub(super) struct RingName {
     name: Name,
 }
 
+/// How [`Prefetch::read_ahead`] claims a host-tier landing from `Directory`.
+enum AheadClaim {
+    None,
+    Interest { step: Step, p: f64, stall_credit: f64 },
+    Carryover { net_benefit: f64, strict_rank: bool },
+}
+
 /// What reading one expert ahead of its request fell short of
 /// ([`Prefetch::read_ahead`]): refused by the read engine; no staging
 /// record beyond what it leaves; or no record of its group's tier it may
@@ -1839,75 +2106,31 @@ enum Short {
     Tier,
 }
 
-/// Free drive slack available to an active-step carryover read (`draft_idle == 0.0`).
-///
-/// When the NVMe drive itself is the binding resource (`price.drive_binds()`),
-/// demand misses already saturate the drive across the pass, so there is zero
-/// free drive slack: every extra speculative byte extends the critical path and
-/// must pay for its own drive transfer cost against `s_demand`. When the drive
-/// is not binding (e.g. DDR-bound or compute-bound), the remaining non-drive
-/// pass overlap window `budget_remaining` is free drive slack (while
-/// `carryover_net_benefit` still prices host DDR contention when
-/// `host_memory_binds()`).
-fn active_carryover_free_slack(price: &super::telemetry::ReadPrice, budget_remaining: f64) -> f64 {
-    if price.drive_binds() {
-        0.0
-    } else {
-        budget_remaining
+/// Whether `layer` is an immediate next-layer target (`L+1..=L+2`, wrapping
+/// modulo `layers` at the end of a step) for drive-bound inter-park carryover.
+fn is_interlayer_target(layer: usize, current_layer: usize, layers: usize) -> bool {
+    if layers == 0 {
+        return false;
     }
+    let next1 = (current_layer + 1) % layers;
+    let next2 = (current_layer + 2) % layers;
+    layer == next1 || layer == next2
 }
 
 /// Maximum concurrent in-flight `Ahead::Carryover` NVMe reads during an active
-/// decode/verify step (`draft_idle == 0.0`).
+/// decode/verify step (`draft_idle == 0.0`), derived directly from the drive's
+/// measured `knee` (`Source::knee()`).
 ///
-/// Derived from the mean layer arrival interval `(non_drive_pass_seconds / layers)`
-/// divided by one expert's drive transfer time `t_bw = transfer_seconds(bytes)`,
-/// floored at `1`: keeps the NVMe drive continuously pipelined (refilled on
-/// `reads_finished`) while bounding worst-case Phase B demand head-of-line
-/// blocking behind already-begun, un-cancellable carryover reads to at most
-/// one layer interval (or one expert when `t_bw >= layer_interval`).
-fn active_carryover_max_inflight(price: &super::telemetry::ReadPrice, layers: usize, bytes: u64) -> usize {
-    if layers == 0 || bytes == 0 {
+/// `seismic_io` (`IoPlane` + `scheduler::queue`) enforces `Blocking` demand
+/// preemption (`Want::now()` ahead of `Want::undated`), the `knee` in-flight
+/// cap, and `tau_hol` residual service-time bounding; capping active carryover
+/// at `ceil(knee_bytes / expert_bytes)` keeps the drive saturated at its
+/// measured knee without piling excess unbegun carryover reads into staging.
+fn active_carryover_max_inflight(knee_bytes: u64, bytes: u64) -> usize {
+    if knee_bytes == 0 || bytes == 0 {
         return 1;
     }
-    let t_bw = price.transfer_seconds(bytes);
-    let pass_secs = price.non_drive_pass_seconds();
-    if !t_bw.is_finite() || t_bw <= 0.0 || !pass_secs.is_finite() || pass_secs <= 0.0 {
-        return 1;
-    }
-    let layer_interval = pass_secs / layers as f64;
-    let count = (layer_interval / t_bw).floor();
-    if count.is_finite() && count >= 1.0 {
-        (count.min(usize::MAX as f64) as usize).max(1)
-    } else {
-        1
-    }
-}
-
-/// Probability that an expert with single-token reuse probability `p_single`
-/// is routed by at least one row in an `M`-row decode/verify burst:
-/// `1 - (1 - p_single)^M`.
-fn burst_hit_probability(p_single: f64, rows: usize) -> f64 {
-    let p = p_single.clamp(0.0, 1.0);
-    if rows <= 1 || p <= 0.0 || p >= 1.0 {
-        return p;
-    }
-    (1.0 - (1.0 - p).powi(rows.min(i32::MAX as usize) as i32)).clamp(0.0, 1.0)
-}
-
-/// Effective hit probability used to price active-step carryover (`draft_idle == 0.0`).
-///
-/// When `!price.drive_binds()`, the drive has idle headroom and multi-row verify
-/// bursts (`M > 1`) hit an expert if any row routes it (`1 - (1 - p_1)^M`).
-/// When `price.drive_binds()`, keep the conservative single-token `p_1` so
-/// correlated multi-row routing never over-admits speculative SSD reads on a
-/// saturated drive.
-fn active_carryover_hit_probability(price: &super::telemetry::ReadPrice, p_single: f64, rows: usize) -> f64 {
-    if price.drive_binds() {
-        p_single.clamp(0.0, 1.0)
-    } else {
-        burst_hit_probability(p_single, rows)
-    }
+    (knee_bytes.div_ceil(bytes).min(usize::MAX as u64) as usize).max(1)
 }
 
 #[cfg(test)]
@@ -1943,21 +2166,33 @@ mod tests {
         let bytes = 1_000_000_u64;
         let line = ReadLine::new(0.3e-3, 1e-9).expect("a line");
         let mut passes = Passes::new(Time::new(&[vec![1]], 8));
+        // Drive-bound pass (`drive = 0.068 > compute = 0.035`): zero free active-pass
+        // drive slack (`c_window = 0.0`) so speculative reads never congest a saturated SSD.
         passes.timed(Pass { rows: 1, depth: 0, seconds: 0.1, parked: 0.065, misses: 68., drive: 0.068, ..Pass::default() });
-        let price = ReadPrice::priced(passes.read_admission(Some(line)));
-        assert!((price.transfer_seconds(bytes) - 1e-3).abs() < 1e-12, "DriveIdleBudget uses pipelined t_bw, not lambda + t_bw");
-        assert!(!price.admits_with_idle(0.30, bytes, 0.0) && !price.admits_with_idle(0.52, bytes, 0.0) && price.admits_with_idle(1.0, bytes, 0.0));
+        let drive_bound = ReadPrice::priced(passes.read_admission(Some(line)));
+        assert!(drive_bound.drive_binds());
+        assert!((drive_bound.transfer_seconds(bytes) - 1e-3).abs() < 1e-12, "DriveIdleBudget uses pipelined t_bw, not lambda + t_bw");
+        assert!(!drive_bound.admits_with_idle(0.30, bytes, 0.0) && !drive_bound.admits_with_idle(0.52, bytes, 0.0) && drive_bound.admits_with_idle(1.0, bytes, 0.0));
+        assert_eq!(DriveIdleBudget::new(layers, 20, Vec::new(), 0.0, 0.0).get(&drive_bound), 0.0, "drive-bound pass has zero active-pass drive slack when inter_layer_idle=0");
+        assert!((DriveIdleBudget::new(layers, 20, Vec::new(), 0.0, 1.5e-3).get(&drive_bound) - 1.5e-3).abs() < 1e-12, "drive-bound pass opens live inter-layer idle window when active_reads==0");
+        assert!((DriveIdleBudget::new(layers, 20, Vec::new(), 5e-3, 0.0).get(&drive_bound) - 5e-3).abs() < 1e-12, "drive-bound pass still opens genuine DraftWindow slack");
+
+        // Non-drive-bound pass (`compute = 0.035 > drive = 0.020`): DriveIdleBudget
+        // opens `remaining_layers * c_layer` and accounts queued demand + out-of-pass reads.
+        let mut non_drive_passes = Passes::new(Time::new(&[vec![1]], 8));
+        non_drive_passes.timed(Pass { rows: 1, depth: 0, seconds: 0.055, parked: 0.020, misses: 20., drive: 0.020, ..Pass::default() });
+        let price = ReadPrice::priced(non_drive_passes.read_admission(Some(line)));
+        assert!(!price.drive_binds());
 
         let mut prefetch = Prefetch::new(4, 2);
         let events = Arc::new(Events::default());
         let seen = HashSet::from([(1, 0)]);
 
-        let idle = DriveIdleBudget::new(layers, 1, prefetch.drive_queued_bytes(|_| bytes, &seen), 0.0);
+        let idle = DriveIdleBudget::new(layers, 1, prefetch.drive_queued_bytes(|_| bytes, &seen), 0.0, 0.0);
         assert!((idle.get(&price) - 1e-3).abs() < 1e-12);
         assert!(price.admits_with_idle(0.30, bytes, idle.get(&price)));
         idle.consume(&price, price.transfer_seconds(bytes));
         assert_eq!(idle.get(&price), 0.0);
-        assert!(!price.admits_with_idle(0.30, bytes, idle.get(&price)));
 
         // Across a multi-layer remaining verify window (e.g. 20 layers left),
         // DriveIdleBudget opens `remaining_layers * c_layer`, so a single
@@ -1974,17 +2209,15 @@ mod tests {
                 urgency: Urgency::waited(),
                 read_done: due_done.clone(),
                 counted_hit: false,
+                predicted_p: 0.0,
             },
         );
         let queued = prefetch.drive_queued_bytes(|_| bytes, &seen);
         assert_eq!(queued, vec![bytes]);
-        let idle = DriveIdleBudget::new(layers, 1, queued.clone(), 0.0);
+        let idle = DriveIdleBudget::new(layers, 1, queued.clone(), 0.0, 0.0);
         assert_eq!(idle.get(&price), 0.0, "single-layer window saturated by demand read on layer l-1");
-        assert!(!price.admits_with_idle(0.30, bytes, idle.get(&price)), "low-p hint rejected when single-layer window is full");
-        assert!(!price.admits_with_idle(0.52, bytes, idle.get(&price)), "50% hint rejected on saturated drive with no park overhead");
-        assert!(price.admits_with_idle(1.0, bytes, idle.get(&price)), "certain read still admitted");
 
-        let full_burst = DriveIdleBudget::new(layers, 20, queued, 0.0);
+        let full_burst = DriveIdleBudget::new(layers, 20, queued, 0.0, 0.0);
         assert!((full_burst.get(&price) - 19e-3).abs() < 1e-12, "remaining verify compute window stays open behind 1 demand read");
         assert!(price.admits_with_idle(0.30, bytes, full_burst.get(&price)));
 
@@ -1993,7 +2226,7 @@ mod tests {
         // the shared drive is free and `DriveIdleBudget` opens `c_layer`.
         due_done.store(true, Ordering::Release);
         assert!(prefetch.drive_queued_bytes(|_| bytes, &seen).is_empty(), "finished demand read no longer occupies the drive");
-        let idle = DriveIdleBudget::new(layers, 1, prefetch.drive_queued_bytes(|_| bytes, &seen), 0.0);
+        let idle = DriveIdleBudget::new(layers, 1, prefetch.drive_queued_bytes(|_| bytes, &seen), 0.0, 0.0);
         assert!((idle.get(&price) - 1e-3).abs() < 1e-12, "full c_layer idle budget opens once demand read finishes");
         assert!(price.admits_with_idle(0.30, bytes, idle.get(&price)));
 
@@ -2009,6 +2242,7 @@ mod tests {
                 urgency: Urgency::ahead(Want::undated(0.)),
                 read_done: Arc::new(AtomicBool::new(false)),
                 counted_hit: false,
+                predicted_p: 0.0,
             },
         );
         assert!(prefetch.drive_queued_bytes(|_| bytes, &seen).is_empty(), "in-pass unbegun ahead read is not pre-counted");
@@ -2023,11 +2257,12 @@ mod tests {
                 urgency: Urgency::ahead(Want::undated(0.)),
                 read_done: Arc::new(AtomicBool::new(false)),
                 counted_hit: false,
+                predicted_p: 0.0,
             },
         );
         let queued = prefetch.drive_queued_bytes(|_| bytes, &seen);
         assert_eq!(queued, vec![bytes], "out-of-pass ahead read on layer 0 counts against shared drive");
-        assert_eq!(DriveIdleBudget::new(layers, 1, queued, 0.0).get(&price), 0.0);
+        assert_eq!(DriveIdleBudget::new(layers, 1, queued, 0.0, 0.0).get(&price), 0.0);
     }
 
     #[test]
@@ -2054,7 +2289,7 @@ mod tests {
         let rem = ledger.draft_window_remaining(Instant::now());
         assert!(rem > 0.010 && rem <= 0.019, "remaining draft window {rem}");
 
-        let idle = DriveIdleBudget::new(48, 1, Vec::new(), rem);
+        let idle = DriveIdleBudget::new(48, 1, Vec::new(), rem, 0.0);
         assert!(price.admits_with_idle(0.0, bytes, idle.get(&price)));
 
         // Insert an unbegun draft-window carryover read (`target_step == 0`).
@@ -2072,6 +2307,7 @@ mod tests {
                 urgency: Urgency::ahead(Want::undated(0.25)),
                 read_done: Arc::new(AtomicBool::new(false)),
                 counted_hit: false,
+                predicted_p: 0.25,
             },
         );
         prefetch.step_prefetch_bytes = 10_000_000;
@@ -2086,7 +2322,7 @@ mod tests {
             matches!(inbound.need, Need::Ahead { ahead: Ahead::Carryover { target_step: 2 }, .. }),
             "on_began binds untargeted draft carryover to the new step"
         );
-        let post_idle = DriveIdleBudget::new(48, 1, vec![bytes], 0.0);
+        let post_idle = DriveIdleBudget::new(48, 1, vec![bytes], 0.0, 0.0);
         assert!(!price.admits_with_idle(0.0, bytes, post_idle.get(&price)));
     }
 
@@ -2149,7 +2385,7 @@ mod tests {
         assert!((mem_bound.non_drive_pass_seconds() - 0.060).abs() < 1e-12);
 
         // DriveIdleBudget spans the remaining non-drive pass window (24/48 * 60 ms = 30 ms).
-        let idle = DriveIdleBudget::new(48, 24, vec![], 0.0);
+        let idle = DriveIdleBudget::new(48, 24, vec![], 0.0, 0.0);
         assert!((idle.get(&mem_bound) - 0.030).abs() < 1e-12);
 
         // Break-even during NVMe overlap equals measured `t_mem / s_demand = drive_bw / host_bw = 0.075`.
@@ -2212,178 +2448,76 @@ mod tests {
         assert!((secs - 0.008).abs() < 1e-9, "expected 22ms - 14ms = 8ms, got {secs}");
     }
 
-    /// Active-step carryover free slack (`draft_idle == 0.0`) depends on
-    /// whether the NVMe drive itself is the binding resource:
-    /// - DDR-bound (`!drive_binds() && host_memory_binds()`): the drive has
-    ///   idle overlap headroom `budget.remaining()` during non-drive pass time,
-    ///   while `carryover_net_benefit` still prices DDR5 contention (`bytes / host_bw`).
-    /// - SSD-bound (`drive_binds()`, unified or discrete): the drive itself is
-    ///   saturated by demand misses over the pass, so active-step carryover gets
-    ///   zero free drive slack (`0.0`) even when `budget.remaining() > 0`, and
-    ///   unprofitable speculative reads are rejected instead of competing with
-    ///   demand reads on the saturated SSD.
+    /// Continuous inter-park idle-window admission replaces the binary
+    /// `!drive_binds()` cliff: when `drive_binds()`, a live per-layer
+    /// `c_layer_tail` window (when `active_reads == 0`) feeds `DriveIdleBudget`
+    /// and `carryover_net_benefit` for immediate next-layer targets (`L+1..L+2`),
+    /// while `c_layer_tail == 0.0` (or `active_reads > 0`) keeps `free_slack == 0.0`.
     #[test]
-    fn active_carryover_uses_slack_when_ddr_bound_and_zero_slack_when_drive_binds() {
-        use super::{active_carryover_free_slack, active_carryover_hit_probability, burst_hit_probability};
-        use magnitude_cost_model::{LinkIdleBudget, PathAdmission, Terms};
+    fn interlayer_idle_window_admits_next_layer_carryover_even_when_drive_binds() {
+        use super::{is_interlayer_target, OnlineCalibration};
+        use magnitude_cost_model::{PathAdmission, Terms};
 
-        let bytes = 9_000_000u64;
-        let drive_bw = 6.0e9;
-        let host_bw = 80.0e9;
+        let bytes = 1_800_000u64; // ~0.27 ms at 6.6 GB/s
+        let drive_bw = 6.6e9;
         let line = ReadLine::new(0.15e-3, 1.0 / drive_bw).expect("a line");
-        let s_demand = 1.5e-3; // matches t_bw = 9 MB / 6 GB/s = 1.5 ms
-
-        // Multi-row burst hit probability: 1 - (1 - p_1)^M.
-        assert!((burst_hit_probability(0.20, 1) - 0.20).abs() < 1e-12);
-        assert!((burst_hit_probability(0.20, 4) - (1.0 - 0.8_f64.powi(4))).abs() < 1e-12);
-
-        // (a) DDR-bound discrete host: memory (60 ms) binds, drive (25 ms) does not.
-        let ddr_bound = ReadPrice::priced(
-            PathAdmission::drive(
-                Terms { compute: 0.050, drive: 0.025, link: 0.035, cpu: 0.010, memory: 0.060 },
-                Some(line),
-                Some(s_demand),
-                None,
-            )
-            .with_host_memory_secs_per_byte(Some(1.0 / host_bw)),
-        );
-        assert!(ddr_bound.binds());
-        assert!(ddr_bound.host_memory_binds());
-        assert!(!ddr_bound.drive_binds());
-
-        let ddr_budget = LinkIdleBudget::new(0.030, 0.0, 0.003);
-        let ddr_slack = active_carryover_free_slack(&ddr_bound, ddr_budget.remaining());
-        assert!((ddr_slack - 0.027).abs() < 1e-12, "DDR-bound host uses remaining non-drive pass slack");
-        // Single-token p = 0.20 clears DDR contention (drive_bw / host_bw = 0.075); noise p = 0.05 does not.
-        assert!(ddr_bound.carryover_net_benefit(active_carryover_hit_probability(&ddr_bound, 0.20, 1), bytes, ddr_slack) > 0.0);
-        assert!(ddr_bound.carryover_net_benefit(active_carryover_hit_probability(&ddr_bound, 0.05, 1), bytes, ddr_slack) < 0.0);
-        // Multi-row verify (M = 4): p_1 = 0.15 lifts to 1 - 0.85^4 = 0.478 for burst carryover valuation.
-        let p_ddr_m4 = active_carryover_hit_probability(&ddr_bound, 0.15, 4);
-        assert!((p_ddr_m4 - (1.0 - 0.85_f64.powi(4))).abs() < 1e-12);
-        assert!(ddr_bound.carryover_net_benefit(p_ddr_m4, bytes, ddr_slack) > ddr_bound.carryover_net_benefit(0.15, bytes, ddr_slack));
-
-        // (b) PCIe Link-bound host with Link > Drive > Compute (e.g. 5090-128g DS4):
-        // drive does NOT bind, slack_seconds = (160 - 70) = 90 ms > 0, prefetch_byte_budget > 0,
-        // and multi-row burst probability lifts carryover valuation by ~3-4x.
-        let pcie_bound = ReadPrice::priced(PathAdmission::drive(
-            Terms { compute: 0.030, drive: 0.070, link: 0.160, cpu: 0.010, memory: 0.050 },
-            Some(line),
-            Some(s_demand),
-            None,
-        ));
-        assert!(!pcie_bound.binds());
-        assert!(!pcie_bound.drive_binds());
-        assert!((pcie_bound.slack_seconds() - 0.090).abs() < 1e-12);
-        assert!(pcie_bound.prefetch_byte_budget() > bytes);
-        let pcie_slack = active_carryover_free_slack(&pcie_bound, ddr_budget.remaining());
-        assert!((pcie_slack - 0.027).abs() < 1e-12);
-        let p_pcie_m5 = active_carryover_hit_probability(&pcie_bound, 0.15, 5);
-        assert!((p_pcie_m5 - (1.0 - 0.85_f64.powi(5))).abs() < 1e-12);
-        assert!((pcie_bound.carryover_net_benefit(p_pcie_m5, bytes, pcie_slack) - p_pcie_m5).abs() < 1e-12);
-
-        // (c1) SSD-bound unified memory host (e.g. Apple M5 Pro): drive (150 ms) > compute (50 ms).
+        let s_demand = 0.50e-3;
         let ssd_unified = ReadPrice::priced(PathAdmission::drive(
             Terms { compute: 0.050, drive: 0.150, link: 0.0, cpu: 0.0, memory: 0.0 },
             Some(line),
             Some(s_demand),
             None,
         ));
-        assert!(ssd_unified.binds());
         assert!(ssd_unified.drive_binds());
-        assert!(!ssd_unified.host_memory_binds());
-        assert_eq!(ssd_unified.slack_seconds(), 0.0);
 
-        let ssd_budget = LinkIdleBudget::new(0.030, 0.0, 0.003);
-        assert!(ssd_budget.remaining() > 0.0);
-        let ssd_slack = active_carryover_free_slack(&ssd_unified, ssd_budget.remaining());
-        assert_eq!(ssd_slack, 0.0, "SSD-bound host gets zero free drive slack during active pass");
-        // Even with M = 5 verify rows, SSD-bound keeps conservative p_1 and rejects unprofitable reads.
-        assert_eq!(active_carryover_hit_probability(&ssd_unified, 0.20, 5), 0.20);
-        assert!(ssd_unified.carryover_net_benefit(active_carryover_hit_probability(&ssd_unified, 0.20, 5), bytes, ssd_slack) < 0.0);
-        assert!(ssd_unified.carryover_net_benefit(active_carryover_hit_probability(&ssd_unified, 0.45, 5), bytes, ssd_slack) < 0.0);
-        // Only genuinely profitable carryover (p > t_bw / (t_bw + s_demand) = 0.50) pays.
-        assert!(ssd_unified.carryover_net_benefit(active_carryover_hit_probability(&ssd_unified, 0.60, 5), bytes, ssd_slack) > 0.0);
+        // When active_reads > 0 (`inter_layer_idle == 0.0`), zero slack -> rejects p = 0.40.
+        let busy_budget = DriveIdleBudget::new(48, 24, Vec::new(), 0.0, 0.0);
+        assert_eq!(busy_budget.get(&ssd_unified), 0.0);
+        assert!(ssd_unified.carryover_net_benefit(0.40, bytes, busy_budget.get(&ssd_unified)) < 0.0);
 
-        // (c2) SSD-bound discrete host (e.g. RTX 5090-64g): drive (150 ms) > memory (50 ms).
-        let ssd_discrete = ReadPrice::priced(
-            PathAdmission::drive(
-                Terms { compute: 0.030, drive: 0.150, link: 0.040, cpu: 0.010, memory: 0.050 },
-                Some(line),
-                Some(s_demand),
-                None,
-            )
-            .with_host_memory_secs_per_byte(Some(1.0 / host_bw)),
-        );
-        assert!(ssd_discrete.binds());
-        assert!(ssd_discrete.drive_binds());
-        assert!(!ssd_discrete.host_memory_binds());
-        assert_eq!(ssd_discrete.slack_seconds(), 0.0);
-        let ssd_discrete_slack = active_carryover_free_slack(&ssd_discrete, ssd_budget.remaining());
-        assert_eq!(ssd_discrete_slack, 0.0, "SSD-bound discrete host also gets zero free drive slack");
-        assert!(ssd_discrete.carryover_net_benefit(active_carryover_hit_probability(&ssd_discrete, 0.20, 5), bytes, ssd_discrete_slack) < 0.0);
-        assert!(ssd_discrete.carryover_net_benefit(active_carryover_hit_probability(&ssd_discrete, 0.60, 5), bytes, ssd_discrete_slack) > 0.0);
+        // When active_reads == 0 and c_layer_tail = 1.0 ms >= t_bw (~0.27 ms),
+        // `DriveIdleBudget` opens the live inter-layer window and admits p = 0.40 cleanly.
+        let idle_budget = DriveIdleBudget::new(48, 24, Vec::new(), 0.0, 1.0e-3);
+        let slack = idle_budget.get(&ssd_unified);
+        assert!((slack - 1.0e-3).abs() < 1e-12);
+        assert!((ssd_unified.carryover_net_benefit(0.40, bytes, slack) - 0.40).abs() < 1e-12);
 
-        // (d) Compute-bound host: neither drive nor host memory binds -> uses budget slack.
-        let compute_bound = ReadPrice::priced(PathAdmission::drive(
-            Terms { compute: 0.075, drive: 0.035, link: 0.0, cpu: 0.0, memory: 0.0 },
-            Some(line),
-            Some(s_demand),
-            None,
-        ));
-        assert!(!compute_bound.binds());
-        assert!(!compute_bound.drive_binds());
-        let compute_slack = active_carryover_free_slack(&compute_bound, ddr_budget.remaining());
-        assert!((compute_slack - 0.027).abs() < 1e-12);
-        assert!(compute_bound.carryover_net_benefit(active_carryover_hit_probability(&compute_bound, 0.20, 4), bytes, compute_slack) > 0.0);
+        // Immediate next-layer target selection wraps modulo `layers`.
+        assert!(is_interlayer_target(5, 4, 48));
+        assert!(is_interlayer_target(6, 4, 48));
+        assert!(!is_interlayer_target(7, 4, 48));
+        assert!(!is_interlayer_target(4, 4, 48));
+        assert!(is_interlayer_target(0, 47, 48));
+        assert!(is_interlayer_target(1, 47, 48));
+        assert!(!is_interlayer_target(2, 47, 48));
+
+        // Request-boundary `soft_reset` recovers `OnlineCalibration` from cold-start waste.
+        let mut cal = OnlineCalibration::new();
+        for _ in 0..80 {
+            cal.observe(0.80, false);
+        }
+        let throttled = cal.factor();
+        assert!(throttled <= 0.30, "expected cold-start throttle, got {throttled}");
+        cal.soft_reset();
+        cal.soft_reset();
+        assert!(cal.factor() > throttled, "soft_reset must relax cold-start throttle ({} -> {})", throttled, cal.factor());
     }
 
-    /// Active-step carryover paces concurrent in-flight NVMe reads to
-    /// `max(1, floor((non_drive_pass_seconds / layers) / t_bw))` so Phase B
-    /// demand misses never queue behind a deep backlog of already-begun,
-    /// un-cancellable carryover reads, while `inflight_carryover_reads` counts
-    /// only active, uncompleted, uncancelled, non-waited `Ahead::Carryover`
-    /// entries.
+    /// Active-step carryover sizes concurrent in-flight NVMe reads directly to
+    /// the drive's measured `knee` (`ceil(knee_bytes / expert_bytes)`),
+    /// eliminating the `QD=1` throttle while `seismic_io` enforces `Blocking`
+    /// preemption and knee/tau_hol bounds.
     #[test]
-    fn active_carryover_paces_inflight_reads_to_layer_interval() {
+    fn active_carryover_sizes_inflight_reads_to_measured_knee() {
         use super::active_carryover_max_inflight;
-        use magnitude_cost_model::{PathAdmission, Terms};
 
-        let bytes = 9_000_000u64;
-        let line = ReadLine::new(0.15e-3, 1.0 / 6.0e9).expect("a line"); // t_bw = 1.5 ms
-
-        // 5090-128g DS4 (link = 160 ms, 58 layers -> layer_interval = 2.76 ms, t_bw = 1.5 ms):
-        // floor(2.76 / 1.5) = 1 -> at most 1 carryover read in flight at a time.
-        let pcie_bound = ReadPrice::priced(PathAdmission::drive(
-            Terms { compute: 0.030, drive: 0.070, link: 0.160, cpu: 0.010, memory: 0.050 },
-            Some(line),
-            Some(1.5e-3),
-            None,
-        ));
-        assert_eq!(active_carryover_max_inflight(&pcie_bound, 58, bytes), 1);
-
-        // Slower pass (300 ms across 48 layers -> layer_interval = 6.25 ms, t_bw = 1.5 ms):
-        // floor(6.25 / 1.5) = 4 -> 4 * 1.5 ms = 6.0 ms <= 1 layer interval.
-        let slow_pass = ReadPrice::priced(PathAdmission::drive(
-            Terms { compute: 0.030, drive: 0.070, link: 0.300, cpu: 0.010, memory: 0.050 },
-            Some(line),
-            Some(1.5e-3),
-            None,
-        ));
-        assert_eq!(active_carryover_max_inflight(&slow_pass, 48, bytes), 4);
-
-        // SSD-bound (pass = 50 ms, 58 layers -> layer_interval = 0.86 ms < t_bw): floors at 1.
-        let ssd_bound = ReadPrice::priced(PathAdmission::drive(
-            Terms { compute: 0.050, drive: 0.150, link: 0.0, cpu: 0.0, memory: 0.0 },
-            Some(line),
-            Some(1.5e-3),
-            None,
-        ));
-        assert_eq!(active_carryover_max_inflight(&ssd_bound, 58, bytes), 1);
-
-        // Unmeasured / degenerate inputs safely floor at 1.
-        assert_eq!(active_carryover_max_inflight(&ReadPrice::unpriced(), 58, bytes), 1);
-        assert_eq!(active_carryover_max_inflight(&pcie_bound, 0, bytes), 1);
-        assert_eq!(active_carryover_max_inflight(&pcie_bound, 58, 0), 1);
+        let bytes = 8_000_000u64;
+        assert_eq!(active_carryover_max_inflight(32_000_000, bytes), 4);
+        assert_eq!(active_carryover_max_inflight(48_000_000, bytes), 6);
+        assert_eq!(active_carryover_max_inflight(36_000_000, bytes), 5);
+        assert_eq!(active_carryover_max_inflight(4_000_000, bytes), 1);
+        assert_eq!(active_carryover_max_inflight(0, bytes), 1);
+        assert_eq!(active_carryover_max_inflight(32_000_000, 0), 1);
 
         // `inflight_carryover_reads` counts only active, uncompleted, uncancelled,
         // non-waited `Ahead::Carryover` reads.
@@ -2403,11 +2537,12 @@ mod tests {
                 urgency: Urgency::ahead(Want::undated(0.4)),
                 read_done: active_done.clone(),
                 counted_hit: false,
+                predicted_p: 0.4,
             },
         );
         assert_eq!(prefetch.inflight_carryover_reads(), 1);
 
-        // Demand read, Cover read, waited carryover, cancelled carryover do NOT count.
+        // Demand read, Cover read, and waited carryover do NOT count.
         prefetch.inbound.insert(
             (1, 0),
             Inbound {
@@ -2419,6 +2554,7 @@ mod tests {
                 urgency: Urgency::waited(),
                 read_done: Arc::new(AtomicBool::new(false)),
                 counted_hit: false,
+                predicted_p: 0.25,
             },
         );
         prefetch.inbound.insert(
@@ -2432,6 +2568,7 @@ mod tests {
                 urgency: Urgency::ahead(Want::undated(0.0)),
                 read_done: Arc::new(AtomicBool::new(false)),
                 counted_hit: false,
+                predicted_p: 0.25,
             },
         );
         let waited_urgency = Urgency::ahead(Want::undated(0.4));
@@ -2447,21 +2584,7 @@ mod tests {
                 urgency: waited_urgency,
                 read_done: Arc::new(AtomicBool::new(false)),
                 counted_hit: false,
-            },
-        );
-        let mut cancelled_ticket = Ticket::empty();
-        cancelled_ticket.cancel();
-        prefetch.inbound.insert(
-            (3, 1),
-            Inbound {
-                record: Some(4),
-                tier: 4,
-                bytes,
-                need: Need::Ahead { ticket: cancelled_ticket, ahead: Ahead::Carryover { target_step: 1 } },
-                ended: Ended::new(&events),
-                urgency: Urgency::ahead(Want::undated(0.4)),
-                read_done: Arc::new(AtomicBool::new(false)),
-                counted_hit: false,
+                predicted_p: 0.25,
             },
         );
         assert_eq!(prefetch.inflight_carryover_reads(), 1);
@@ -2470,5 +2593,148 @@ mod tests {
         // slot frees immediately for the next carryover read.
         active_done.store(true, Ordering::Release);
         assert_eq!(prefetch.inflight_carryover_reads(), 0);
+    }
+
+    #[test]
+    fn online_calibration_deflates_overconfident_carryover_and_ahead_probabilities() {
+        use super::OnlineCalibration;
+        use magnitude_cost_model::{PathAdmission, Terms};
+
+        let bytes = 9_000_000u64;
+        // Unpipelined demand stall (`3.0 ms = 2 * t_bw`) -> exact break-even `t_bw / s_demand = 0.50`.
+        let line = ReadLine::new(0.15e-3, 1.0 / 6.0e9).expect("a line");
+        let ssd_bound = ReadPrice::priced(PathAdmission::drive(
+            Terms { compute: 0.050, drive: 0.150, link: 0.0, cpu: 0.0, memory: 0.0 },
+            Some(line),
+            Some(3.0e-3),
+            None,
+        ));
+        assert!(ssd_bound.drive_binds());
+
+        // Simulate 100 carryover resolutions where raw `p = 0.65` only realizes 41% hits.
+        let mut cal = OnlineCalibration::new();
+        for i in 0..100 {
+            cal.observe(0.65, i < 41);
+        }
+        // Closed-loop factor converges to ~0.41 / 0.65 (~0.63 -> 0.64 with prior).
+        let p_65 = cal.calibrate(0.65);
+        assert!(p_65 < 0.45, "overconfident raw p=0.65 must deflate below 0.50 break-even, got {p_65}");
+        assert!(
+            ssd_bound.carryover_net_benefit(p_65, bytes, 0.0) < 0.0,
+            "deflated carryover (realized ~41%) must be rejected on a saturated drive"
+        );
+        // Genuinely high-probability candidates (`p_raw = 0.90 -> p_cal ~ 0.58 > 0.50`) still pass.
+        let p_90 = cal.calibrate(0.90);
+        assert!(
+            ssd_bound.carryover_net_benefit(p_90, bytes, 0.0) > 0.0,
+            "high-precision candidate must still be admitted, got p_cal={p_90}"
+        );
+
+        // Well-calibrated predictor (`p = 0.80` realizing 80% hits) stays near 1.0.
+        let mut accurate = OnlineCalibration::new();
+        for i in 0..100 {
+            accurate.observe(0.80, i < 80);
+        }
+        assert!(accurate.factor() > 0.95, "well-calibrated predictor should not be suppressed: {}", accurate.factor());
+    }
+
+    #[test]
+    fn work_bound_prefetch_settle_and_prune_evicted_are_o_completions_1x_vs_16x() {
+        use super::{PREFETCH_PRUNE_VISITS, PREFETCH_SETTLE_VISITS};
+        use crate::experts::directory::{Directory, HostTier};
+        use crate::experts::host_records::{Claim, Located, Taking};
+        use crate::experts::watcher::telemetry::DriveEngagement;
+
+        let measure = |n: usize| -> (usize, usize, usize, usize) {
+            let events = Arc::new(Events::default());
+            let mut prefetch = Prefetch::new(n as u32 + 4, 1);
+            let mut directory = Directory::new(&[4], &[0], &[n + 8], HostTier::replay(vec![n as u32 + 4]));
+            let time = Time::new(&[vec![(n + 8) as u64]], 32);
+            let stands = Stands::new(time.clone());
+            let mut ledger = Ledger::new(vec![0], 4, time, stands);
+            let engagement = DriveEngagement::default();
+
+            let mut ended_handles = Vec::with_capacity(n);
+            for e in 0..n {
+                let Claim::Taken(grant) = directory.claim_landing(0, e, 0, Taking::Ahead, (|_, _| (), |_, _| true)) else {
+                    panic!("expected host tier slot for expert {e}");
+                };
+                let tier = grant.record();
+                let record = prefetch.staging.take_beyond_within(0, u32::MAX).expect("staging slot");
+                let ended = Ended::new_notifying(
+                    &events,
+                    (0, e),
+                    prefetch.completed.clone(),
+                    prefetch.has_completed.clone(),
+                );
+                ended_handles.push(ended.clone());
+                prefetch.arrive(
+                    (0, e),
+                    Inbound {
+                        record: Some(record),
+                        tier,
+                        bytes: 1024,
+                        need: Need::Ahead { ticket: Ticket::empty(), ahead: Ahead::Carryover { target_step: 1 } },
+                        ended,
+                        urgency: Urgency::ahead(Want::undated(0.8)),
+                        read_done: Arc::new(AtomicBool::new(false)),
+                        counted_hit: false,
+                        predicted_p: 0.8,
+                    },
+                );
+            }
+
+            // 64 zero-completion wakes: must do ZERO inbound scans regardless of `n`.
+            PREFETCH_SETTLE_VISITS.with(|c| c.set(0));
+            for _ in 0..64 {
+                let (settled, newly_landed) = prefetch.settle_in(&mut directory, &mut ledger, &engagement);
+                assert!(!settled);
+                assert!(newly_landed.is_empty());
+            }
+            let settle_zero = PREFETCH_SETTLE_VISITS.with(|c| c.get());
+
+            // Complete exactly 1 landing: must visit exactly 1 entry.
+            ended_handles[0].set(true);
+            PREFETCH_SETTLE_VISITS.with(|c| c.set(0));
+            let (settled, newly_landed) = prefetch.settle_in(&mut directory, &mut ledger, &engagement);
+            assert!(settled);
+            assert_eq!(newly_landed, vec![(0, 0)]);
+            let settle_one = PREFETCH_SETTLE_VISITS.with(|c| c.get());
+
+            // Finish all remaining landings so `landed_prefetches` has `n` entries.
+            for handle in &ended_handles[1..] {
+                handle.set(true);
+            }
+            let _ = prefetch.settle_in(&mut directory, &mut ledger, &engagement);
+            assert_eq!(prefetch.landed_prefetches.len(), n);
+            directory.clear_evicted();
+
+            // Zero-eviction prune: must do ZERO work regardless of `n`.
+            PREFETCH_PRUNE_VISITS.with(|c| c.set(0));
+            for _ in 0..16 {
+                prefetch.prune_evicted_in(&mut directory, &engagement);
+            }
+            let prune_zero = PREFETCH_PRUNE_VISITS.with(|c| c.get());
+            assert_eq!(prefetch.landed_prefetches.len(), n);
+
+            // Evict 1 entry from host tier: must visit exactly 1 entry and prune it.
+            let Located::Kept(rec) = directory.located(0, 0) else {
+                panic!("expert 0 must be kept in host tier");
+            };
+            directory.evict_host(0, &[rec], |_| None);
+            PREFETCH_PRUNE_VISITS.with(|c| c.set(0));
+            prefetch.prune_evicted_in(&mut directory, &engagement);
+            let prune_one = PREFETCH_PRUNE_VISITS.with(|c| c.get());
+            assert_eq!(prefetch.landed_prefetches.len(), n - 1);
+
+            (settle_zero, settle_one, prune_zero, prune_one)
+        };
+
+        let (sz1, so1, pz1, po1) = measure(16);
+        let (sz16, so16, pz16, po16) = measure(256);
+        assert_eq!((sz1, sz16), (0, 0), "zero-completion settle wakes must do 0 visits");
+        assert_eq!((so1, so16), (1, 1), "single-completion settle must do 1 visit at 1x and 16x");
+        assert_eq!((pz1, pz16), (0, 0), "zero-eviction prune must do 0 visits");
+        assert_eq!((po1, po16), (1, 1), "single-eviction prune must do 1 visit at 1x and 16x");
     }
 }

@@ -316,16 +316,12 @@ fn a_request_between_a_turns_jobs_finds_residency_as_at_a_turns_end() {
         *request.borrow_mut() = Some(thread);
         true
     };
-    let quiet = std::cell::Cell::new(true);
-    let after = |held: &mut residency::Residency, _: &mut residency::Turn, _: Option<&super::super::link::Copier>, _: Option<&crate::experts::directory::MissCurve>| {
-        quiet.set(held.shared.traffic_quiet.load(std::sync::atomic::Ordering::Acquire));
-        true
-    };
     let turn = residency::Residency::TURN;
-    residency::Residency::turn(&state, &[&short, turn[0], turn[1], &wait, turn[2], turn[3], &after], None, None);
+    residency::Residency::turn(&state, &[&short, turn[0], turn[1], &wait, turn[2], turn[3], turn[4]], None, None);
+    let quiet = shared.traffic_quiet.load(std::sync::atomic::Ordering::Acquire);
     let (published, found, step) = request.into_inner().expect("the request ran").join().unwrap();
     assert_eq!(published, found, "the request read holdings the refill left unpublished");
-    assert!(!quiet.get(), "the hastening called the traffic quiet while a step ran");
+    assert!(!quiet, "the turn called the traffic quiet while a step ran");
     drop(grants);
     step.complete().unwrap();
 }

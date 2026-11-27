@@ -225,6 +225,14 @@ impl Structured {
         self.window_slots
     }
 
+    pub(super) fn groups(&self) -> &[BankGroup] {
+        &self.groups
+    }
+
+    pub(super) fn layers(&self) -> &BankLayers {
+        &self.layers
+    }
+
     /// Its parts, which [`Self::new`] makes a structure of again.
     #[cfg(test)]
     pub(super) fn into_parts(self) -> (u64, HostTier, Vec<BankGroup>, BankLayers) {
@@ -543,21 +551,6 @@ impl BankStructure<'_> {
             Ok::<_, String>(bytes)
         })?;
         Ok(ConveyorLayout { records, offsets, bytes })
-    }
-
-    /// For each staging pool, whether at least one non-draft (target) layer
-    /// reads into it. Draft-only pools (`false`) never receive cross-layer
-    /// hints.
-    pub(super) fn pool_has_target(self, pool_of: &[RecordTensors<usize>], pool_count: usize) -> Vec<bool> {
-        let mut has_target = vec![false; pool_count];
-        for (layer, of) in self.layers.iter().zip(pool_of) {
-            if !layer.is_draft() {
-                for (_, &pool) in of.iter() {
-                    has_target[pool] = true;
-                }
-            }
-        }
-        has_target
     }
 
     /// The staging pools, and each layer's pool of each routed tensor: one

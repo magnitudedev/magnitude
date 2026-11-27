@@ -137,7 +137,7 @@ fn idle_cache<F: crate::domain::ProgramFamily>(domain: &crate::domain::ExecutorD
 /// their release begins, and once it ends their cache is gone.
 #[test]
 fn idle_slots_a_claim_takes_are_released_with_what_yielded() {
-    use crate::memory::ledger::CommittedKind;
+    use crate::memory::ledger::{Frees, Relief, ReliefBoundary};
     for backend in bank_backends() {
         let (mut domain, mut bindings) = banked_chain(backend, 4, 3);
         let (places, _) = opened(&mut domain, 2);
@@ -145,11 +145,12 @@ fn idle_slots_a_claim_takes_are_released_with_what_yielded() {
         domain.close_group().unwrap();
         assert!(idle_cache(&domain) > 0, "{backend:?}: the closed class idles as cache");
         assert!(!domain.idle_class.taken(), "{backend:?}");
-        // A claim takes every byte that yields, the idle slots' cache among
-        // it (it yields before the bank's).
+        // Relief takes the idle slots' deferred cache so `release_yielded` frees it.
         let ledger = domain.resources.ledgers().device().clone();
-        let (_all, _) = ledger.change(|keeping| ledger.claim_units(&keeping.claims(), CommittedKind::Scratch, std::num::NonZeroU64::new(1).unwrap(), u64::MAX));
-        assert!(domain.idle_class.taken(), "{backend:?}: the claim took the idle slots' cache");
+        let need = ledger.estimate().cache();
+        let plan = ledger.plan_relief(need, Relief::CacheOnly, Frees::Room).expect("cache covers idle slots");
+        ledger.change(|keeping| ledger.execute(&keeping.claims(), plan, ReliefBoundary::Idle));
+        assert!(domain.idle_class.taken(), "{backend:?}: the relief took the idle slots' cache");
         assert_eq!(
             domain.release_yielded(&mut bindings, crate::CompletionWake::new(|| {})).unwrap(),
             crate::domain::Yielded::Pending,
@@ -172,15 +173,17 @@ fn idle_slots_a_claim_takes_are_released_with_what_yielded() {
 /// buffer freed whole), the cache holds nothing and nothing is taken.
 #[test]
 fn a_taken_idle_cache_with_no_slot_left_goes_in_a_change() {
-    use crate::memory::ledger::CommittedKind;
+    use crate::memory::ledger::{Frees, Relief, ReliefBoundary};
     for backend in bank_backends() {
         let (mut domain, mut bindings) = banked_chain(backend, 4, 3);
         let (places, _) = opened(&mut domain, 2);
         assert_eq!(places, 3, "{backend:?}");
         domain.close_group().unwrap();
         let ledger = domain.resources.ledgers().device().clone();
-        let (all, _) = ledger.change(|keeping| ledger.claim_units(&keeping.claims(), CommittedKind::Scratch, std::num::NonZeroU64::new(1).unwrap(), u64::MAX));
-        assert!(domain.idle_class.taken(), "{backend:?}: the claim took the idle slots' cache");
+        let need = ledger.estimate().cache();
+        let plan = ledger.plan_relief(need, Relief::CacheOnly, Frees::Room).expect("cache covers idle slots");
+        ledger.change(|keeping| ledger.execute(&keeping.claims(), plan, ReliefBoundary::Idle));
+        assert!(domain.idle_class.taken(), "{backend:?}: the relief took the idle slots' cache");
         // The slots are released apart from their cache, which stays taken.
         assert!(domain.resources.release_idle_slots(Vec::new(), crate::CompletionWake::new(|| {})), "{backend:?}");
         while domain.advance_slot_release().is_none() {
@@ -200,7 +203,6 @@ fn a_taken_idle_cache_with_no_slot_left_goes_in_a_change() {
             "{backend:?}: nothing left to release, a cache still lending is let go at once"
         );
         assert_eq!(idle_cache(&domain), 0, "{backend:?}: the cache is let go");
-        changes.change(|_| drop(all));
     }
 }
 
@@ -210,7 +212,7 @@ fn a_taken_idle_cache_with_no_slot_left_goes_in_a_change() {
 /// counted twice.
 #[test]
 fn a_group_opening_during_a_slot_release_claims_its_whole_class() {
-    use crate::memory::ledger::CommittedKind;
+    use crate::memory::ledger::{Frees, Relief, ReliefBoundary};
     let graph_slots = |domain: &crate::domain::ExecutorDomain<_>| -> u64 {
         domain.resources.ledgers().device().entries().into_iter().filter(|entry| entry.holding == Holding::Cache(CacheKind::GraphSlots)).map(|entry| entry.releasing).sum()
     };
@@ -222,14 +224,15 @@ fn a_group_opening_during_a_slot_release_claims_its_whole_class() {
         let idle = idle_cache(&domain);
         assert!(idle > 0, "{backend:?}");
         let ledger = domain.resources.ledgers().device().clone();
-        let (all, _) = ledger.change(|keeping| ledger.claim_units(&keeping.claims(), CommittedKind::Scratch, std::num::NonZeroU64::new(1).unwrap(), u64::MAX));
+        let need = ledger.estimate().cache();
+        let plan = ledger.plan_relief(need, Relief::CacheOnly, Frees::Room).expect("cache covers idle slots");
+        ledger.change(|keeping| ledger.execute(&keeping.claims(), plan, ReliefBoundary::Idle));
         assert_eq!(
             domain.release_yielded(&mut bindings, crate::CompletionWake::new(|| {})).unwrap(),
             crate::domain::Yielded::Pending,
             "{backend:?}"
         );
         assert_eq!(graph_slots(&domain), idle, "{backend:?}: the taken slots stay allocated while they release");
-        drop(all);
         let (places, claims) = opened(&mut domain, 2);
         assert_eq!(places, 3, "{backend:?}");
         assert_eq!(claims, first, "{backend:?}: the class claims every slot it grows again");
@@ -511,7 +514,7 @@ fn grown_rows() -> (
     let ledger = scope.ledger(seismic::StoreIdentity::HostRam, shape);
     read_at(&ledger, epoch, 2 * GIB, 0);
     let records = ledger.pool_block(crate::memory::ledger::PoolClass::Records, std::num::NonZeroU64::new(GIB).expect("a block")).blocks;
-    let pool = ledger.pool_block(crate::memory::ledger::PoolClass::State, std::num::NonZeroU64::new(GIB).expect("a block")).blocks;
+    let pool = ledger.pool_block(crate::memory::ledger::PoolClass::State, std::num::NonZeroU64::new(16 * MIB).expect("a block")).blocks;
     let floor = ledger.change(|keeping| ledger.claim(&keeping.claims(), Need::BankFloor { bytes: GIB })).expect("the floor fits");
     ledger.change(|_| { let entry = &records; entry.take(&entry.change(), GIB, seismic::memory::Wiring::Pageable) }).expect("the pool backs the floor");
     read_at(&ledger, epoch, GIB, 1);

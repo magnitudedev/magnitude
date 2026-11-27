@@ -220,6 +220,10 @@ impl QualificationReport {
     pub fn cases(&self) -> &[QualificationCase] {
         &self.cases
     }
+
+    pub(super) fn clear(&mut self) {
+        self.cases = Vec::new();
+    }
 }
 
 fn dense_binding_name(source: DType, resident: DType) -> String {

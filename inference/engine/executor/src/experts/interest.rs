@@ -686,6 +686,14 @@ pub(in crate::experts) enum Told {
     /// head launch, then drafted proposals `[y_1..y_k]` on head completion):
     /// publishes token-conditioned `Source::Token` interests for the next pass.
     DraftTokens { request: RequestId, tokens: Vec<TokenId> },
+    /// Per-row prompt routes exported from a completed grouped prefill chain
+    /// (`SplitValues::crossing.routes`), seeding `TokenRoutes` unigrams and
+    /// bigrams before decode step 1.
+    PromptRoutes {
+        tokens: Box<[TokenId]>,
+        layer_routes: Vec<Vec<u16>>,
+        selected: usize,
+    },
 }
 
 /// Outcomes counted, and how many of them hit (a name's expert chosen, a
@@ -1253,6 +1261,10 @@ pub(in crate::experts) struct Ledger {
     /// Drafted/anchor tokens buffered for each request's upcoming pass
     /// (`Told::DraftTokens`), cleared once that pass begins or closes.
     pending_draft_tokens: HashMap<RequestId, Vec<TokenId>>,
+    /// High-confidence `Source::Token` predictions (`p >= 0.70`) from the most
+    /// recent `Told::DraftTokens` or `Told::Began` publication, forwarded to
+    /// `Directory` to protect upcoming drafted tokens' residents from eviction.
+    token_protected: Vec<((usize, usize), Step, f64)>,
 }
 
 struct PendingTokenRoutes {
@@ -1295,9 +1307,9 @@ impl TokenLayerStats {
     }
 
     /// Laplace-smoothed probability `hits / (seen + 1)` for each tracked expert
-    /// once the token/bigram has been observed at least twice.
+    /// once the token/bigram has been observed at least once.
     fn probs(&self) -> impl Iterator<Item = (usize, f64)> + '_ {
-        let ready = self.seen >= 2;
+        let ready = self.seen >= 1;
         let denom = f64::from(self.seen) + 1.0;
         self.hits
             .iter()
@@ -1306,10 +1318,64 @@ impl TokenLayerStats {
     }
 }
 
-/// Bounded live per-token and bigram routing table owned by `Ledger`
-/// (`Source::Token`): learns `(token, layer) -> experts` and
-/// `((prev, token), layer) -> experts` from completed decode/verify passes and
-/// predicts burst-level union probabilities `1 - Π_j (1 - p(e | y_j))` for
+/// Bounded per-request committed token + per-layer expert route history used
+/// for exact span matching (`expert-streaming.md` §6: when the output re-emits
+/// a span of earlier tokens, the recorded routes predict the upcoming layers'
+/// experts with high precision, calibrated like any other `Source::Token`).
+#[derive(Default)]
+struct RequestRouteHistory {
+    tokens: VecDeque<TokenId>,
+    /// `experts[pos][layer]` holds the expert IDs routed for `tokens[pos]` at `layer`.
+    experts: VecDeque<Vec<Vec<u16>>>,
+}
+
+impl RequestRouteHistory {
+    const MAX_TOKENS: usize = 4096;
+
+    fn push(&mut self, token: TokenId, per_layer: Vec<Vec<u16>>) {
+        if self.tokens.len() >= Self::MAX_TOKENS {
+            self.tokens.pop_front();
+            self.experts.pop_front();
+        }
+        self.tokens.push_back(token);
+        self.experts.push_back(per_layer);
+    }
+
+    fn last_token(&self) -> Option<TokenId> {
+        self.tokens.back().copied()
+    }
+
+    /// Find the most recent position `p` in `self.tokens` where the trailing
+    /// 2-token suffix `(prev, cur)` (preferring a 3-token suffix `(prev2, prev, cur)`
+    /// when `prev2` is present) matches. Returns `(pos, matched_len)`.
+    fn match_suffix(&self, prev2: Option<TokenId>, prev: TokenId, cur: TokenId) -> Option<(usize, usize)> {
+        let len = self.tokens.len();
+        if len < 2 {
+            return None;
+        }
+        if let Some(p2) = prev2 {
+            if len >= 3 {
+                for p in (2..len).rev() {
+                    if self.tokens[p] == cur && self.tokens[p - 1] == prev && self.tokens[p - 2] == p2 {
+                        return Some((p, 3));
+                    }
+                }
+            }
+        }
+        for p in (1..len).rev() {
+            if self.tokens[p] == cur && self.tokens[p - 1] == prev {
+                return Some((p, 2));
+            }
+        }
+        None
+    }
+}
+
+/// Bounded live per-token, bigram, and per-request span routing table owned by
+/// `Ledger` (`Source::Token`): learns `(token, layer) -> experts`,
+/// `((prev, token), layer) -> experts`, and per-request committed route spans
+/// from completed decode/verify passes, and predicts burst-level union
+/// probabilities `1 - Π_j (1 - p(e | y_j))` plus exact span matches for
 /// upcoming drafted tokens (`Told::DraftTokens` / `Told::Began`).
 struct TokenRoutes {
     layers: usize,
@@ -1317,11 +1383,12 @@ struct TokenRoutes {
     unigram_order: VecDeque<TokenId>,
     bigrams: HashMap<(TokenId, TokenId), Vec<TokenLayerStats>>,
     bigram_order: VecDeque<(TokenId, TokenId)>,
+    per_request: HashMap<RequestId, RequestRouteHistory>,
 }
 
 impl TokenRoutes {
-    const MAX_UNIGRAMS: usize = 1024;
-    const MAX_BIGRAMS: usize = 2048;
+    const MAX_UNIGRAMS: usize = 4096;
+    const MAX_BIGRAMS: usize = 4096;
 
     fn new(layers: usize) -> Self {
         Self {
@@ -1330,7 +1397,12 @@ impl TokenRoutes {
             unigram_order: VecDeque::new(),
             bigrams: HashMap::new(),
             bigram_order: VecDeque::new(),
+            per_request: HashMap::new(),
         }
+    }
+
+    fn remove_request(&mut self, request: RequestId) {
+        self.per_request.remove(&request);
     }
 
     fn unigram_mut(&mut self, token: TokenId) -> &mut Vec<TokenLayerStats> {
@@ -1366,62 +1438,130 @@ impl TokenRoutes {
         if self.layers == 0 || row_experts.is_empty() {
             return;
         }
-        let mut by_row: Vec<Vec<u16>> = vec![Vec::new(); rows.len()];
+        let mut per_row: Vec<Vec<Vec<u16>>> = vec![vec![Vec::new(); self.layers]; rows.len()];
         for (layer, pairs) in row_experts.iter().enumerate().take(self.layers) {
-            if pairs.is_empty() {
+            for &(row, expert) in pairs {
+                if let Some(layers_for_row) = per_row.get_mut(usize::from(row)) {
+                    layers_for_row[layer].push(expert);
+                }
+            }
+        }
+        for (row_idx, row) in rows.iter().enumerate() {
+            if !include(row) {
                 continue;
             }
-            for list in &mut by_row {
-                list.clear();
+            let Some(token) = row.token else {
+                continue;
+            };
+            let row_layers = std::mem::take(&mut per_row[row_idx]);
+            if !row_layers.iter().any(|e| !e.is_empty()) {
+                continue;
             }
-            for &(row, expert) in pairs {
-                if let Some(list) = by_row.get_mut(usize::from(row)) {
-                    list.push(expert);
-                }
-            }
-            for (row_idx, row) in rows.iter().enumerate() {
-                if !include(row) {
+            let prev = self.per_request.get(&row.request).and_then(RequestRouteHistory::last_token);
+            for (layer, experts) in row_layers.iter().enumerate() {
+                if experts.is_empty() {
                     continue;
                 }
-                let Some(token) = row.token else {
-                    continue;
-                };
-                if by_row[row_idx].is_empty() {
-                    continue;
-                }
-                let experts = &by_row[row_idx];
                 self.unigram_mut(token)[layer].observe(experts);
-                if row_idx > 0 && rows[row_idx - 1].request == row.request && include(&rows[row_idx - 1]) {
-                    if let Some(prev) = rows[row_idx - 1].token {
-                        self.bigram_mut((prev, token))[layer].observe(experts);
-                    }
+                if let Some(prev_tok) = prev {
+                    self.bigram_mut((prev_tok, token))[layer].observe(experts);
+                }
+            }
+            self.per_request.entry(row.request).or_default().push(token, row_layers);
+        }
+    }
+
+    /// Seed unigram and bigram routing tables from a completed grouped prefill
+    /// prompt (`tokens` of length `M`, `layer_routes[layer]` of length
+    /// `M * selected` in row-major order) before decode step 1.
+    fn observe_prompt(&mut self, tokens: &[TokenId], layer_routes: &[Vec<u16>], selected: usize) {
+        if self.layers == 0 || tokens.is_empty() || selected == 0 || layer_routes.is_empty() {
+            return;
+        }
+        let expected_len = tokens.len().saturating_mul(selected);
+        for (layer, routes) in layer_routes.iter().enumerate().take(self.layers) {
+            if routes.len() < expected_len {
+                continue;
+            }
+            for (row_idx, &token) in tokens.iter().enumerate() {
+                let start = row_idx * selected;
+                let experts = &routes[start..start + selected];
+                self.unigram_mut(token)[layer].observe(experts);
+                if row_idx > 0 {
+                    self.bigram_mut((tokens[row_idx - 1], token))[layer].observe(experts);
                 }
             }
         }
     }
 
-    /// Predict `(layer, expert, confidence_bucket)` for an upcoming burst of
-    /// `tokens` using Noisy-OR union probability across all tokens in the burst
-    /// (preferring bigram stats when observed >= 2 times, else unigram stats).
-    /// Buckets: `0` for `p >= 0.85`, `1` for `0.70..0.85`, `2` for `0.55..0.70`.
-    fn predict(&self, tokens: &[TokenId]) -> Vec<(usize, usize, u8)> {
+    /// Predict `(layer, expert, confidence_bucket, p_union)` for an upcoming
+    /// burst of `tokens` for `request`, combining:
+    /// 1. Exact per-request span matching against committed route history
+    ///    (rank 0 for matched positions, rank 1 for 3-gram continuation), and
+    /// 2. Noisy-OR union probability across bigram (using `request`'s trailing
+    ///    committed token for `tokens[0]`) and unigram stats (`seen >= 1`,
+    ///    preferring `seen >= 2` before falling back to `seen >= 1`).
+    /// Buckets: `0` for `p >= 0.85` / exact span match, `1` for `0.70..0.85`,
+    /// `2` for `0.55..0.70`, `3` for `0.25..0.55` (admitted only when
+    /// `PathAdmission::break_even` allows free-slack reads).
+    fn predict(&self, request: Option<RequestId>, tokens: &[TokenId]) -> Vec<(usize, usize, u8, f64)> {
         if self.layers == 0 || tokens.is_empty() {
             return Vec::new();
         }
+        let hist = request.and_then(|r| self.per_request.get(&r));
+        let mut span_matches: Vec<(usize, u8)> = Vec::new();
+        if let Some(hist) = hist {
+            let hlen = hist.tokens.len();
+            if hlen >= 1 {
+                let mut ctx: Vec<TokenId> = Vec::with_capacity(2 + tokens.len());
+                if hlen >= 2 {
+                    ctx.push(hist.tokens[hlen - 2]);
+                }
+                ctx.push(hist.tokens[hlen - 1]);
+                let prefix_len = ctx.len();
+                ctx.extend_from_slice(tokens);
+                for q_idx in 0..tokens.len() {
+                    let c_idx = prefix_len + q_idx;
+                    let prev = ctx[c_idx - 1];
+                    let prev2 = (c_idx >= 2).then(|| ctx[c_idx - 2]);
+                    if let Some((pos, matched_len)) = hist.match_suffix(prev2, prev, ctx[c_idx]) {
+                        span_matches.push((pos, 0));
+                        // When a 3-token span matches at the end of the current
+                        // drafted prefix (e.g. anchor arrival at DraftWindow start),
+                        // predict the next token in the matched span at bucket 1.
+                        if q_idx + 1 == tokens.len() && matched_len >= 3 && pos + 1 < hlen {
+                            span_matches.push((pos + 1, 1));
+                        }
+                    }
+                }
+            }
+        }
+        let trailing_prev = hist.and_then(RequestRouteHistory::last_token);
         let mut out = Vec::new();
         let mut not_used: Vec<(usize, f64)> = Vec::new();
+        let mut span_best: Vec<(usize, u8)> = Vec::new();
         for layer in 0..self.layers {
+            span_best.clear();
+            if let Some(hist) = hist {
+                for &(pos, bucket) in &span_matches {
+                    for &expert in &hist.experts[pos][layer] {
+                        let e = usize::from(expert);
+                        if let Some(existing) = span_best.iter_mut().find(|&&mut (id, _)| id == e) {
+                            existing.1 = existing.1.min(bucket);
+                        } else {
+                            span_best.push((e, bucket));
+                        }
+                    }
+                }
+            }
             not_used.clear();
             for (idx, &token) in tokens.iter().enumerate() {
-                let stats = if idx > 0 {
-                    self.bigrams
-                        .get(&(tokens[idx - 1], token))
-                        .map(|v| &v[layer])
-                        .filter(|s| s.seen >= 2)
-                        .or_else(|| self.unigrams.get(&token).map(|v| &v[layer]).filter(|s| s.seen >= 2))
-                } else {
-                    self.unigrams.get(&token).map(|v| &v[layer]).filter(|s| s.seen >= 2)
-                };
+                let prev = if idx > 0 { Some(tokens[idx - 1]) } else { trailing_prev };
+                let stats = prev
+                    .and_then(|p| self.bigrams.get(&(p, token)).map(|v| &v[layer]).filter(|s| s.seen >= 2))
+                    .or_else(|| self.unigrams.get(&token).map(|v| &v[layer]).filter(|s| s.seen >= 2))
+                    .or_else(|| prev.and_then(|p| self.bigrams.get(&(p, token)).map(|v| &v[layer]).filter(|s| s.seen >= 1)))
+                    .or_else(|| self.unigrams.get(&token).map(|v| &v[layer]).filter(|s| s.seen >= 1));
                 let Some(stats) = stats else {
                     continue;
                 };
@@ -1434,7 +1574,14 @@ impl TokenRoutes {
                     }
                 }
             }
+            for &(expert, bucket) in &span_best {
+                let p_span = if bucket == 0 { 1.0 } else { 0.75 };
+                out.push((layer, expert, bucket, p_span));
+            }
             for &(expert, miss_p) in &not_used {
+                if span_best.iter().any(|&(e, _)| e == expert) {
+                    continue;
+                }
                 let p_union = 1.0 - miss_p;
                 let bucket = if p_union >= 0.85 {
                     0
@@ -1442,10 +1589,12 @@ impl TokenRoutes {
                     1
                 } else if p_union >= 0.55 {
                     2
+                } else if p_union >= 0.25 {
+                    3
                 } else {
                     continue;
                 };
-                out.push((layer, expert, bucket));
+                out.push((layer, expert, bucket, p_union));
             }
         }
         out
@@ -1493,6 +1642,7 @@ impl Ledger {
             token_routes: TokenRoutes::new(layers),
             pending_token_routes: BTreeMap::new(),
             pending_draft_tokens: HashMap::new(),
+            token_protected: Vec::new(),
         }
     }
 
@@ -1574,6 +1724,9 @@ impl Ledger {
                 self.draft_window = (estimated_seconds > 0.0).then(|| (Instant::now(), estimated_seconds));
             }
             Told::DraftTokens { request, tokens } => self.draft_tokens(request, &tokens),
+            Told::PromptRoutes { tokens, layer_routes, selected } => {
+                self.token_routes.observe_prompt(&tokens, &layer_routes, selected);
+            }
         }
         Learned::default()
     }
@@ -1689,8 +1842,9 @@ impl Ledger {
             }
         }
         self.launches.insert(step, Launch { rows, padding, passes });
-        for tokens in req_tokens.values() {
-            self.publish_token_routes(When::Step(step), step, tokens);
+        self.token_protected.clear();
+        for (&request, tokens) in &req_tokens {
+            self.publish_token_routes(Some(request), When::Step(step), step, tokens);
         }
     }
 
@@ -1709,21 +1863,33 @@ impl Ledger {
         let snapshot = buffered.clone();
         let next_pass = self.passes.get(&request).copied().unwrap_or(0) + 1;
         let estimate = self.latest_active_step().unwrap_or(self.reached.0).saturating_add(1);
-        self.publish_token_routes(When::Pass { request, pass: next_pass, estimate }, estimate, &snapshot);
+        self.token_protected.clear();
+        self.publish_token_routes(Some(request), When::Pass { request, pass: next_pass, estimate }, estimate, &snapshot);
     }
 
-    /// Publish `Source::Token` predictions for `tokens` into `NameLedger`.
-    fn publish_token_routes(&mut self, when: When, step: Step, tokens: &[TokenId]) {
+    /// High-confidence `Source::Token` predictions (`p >= 0.70`) from the most
+    /// recent `Told::DraftTokens` or `Told::Began` publication.
+    pub fn token_protected(&self) -> &[((usize, usize), Step, f64)] {
+        &self.token_protected
+    }
+
+    /// Publish `Source::Token` predictions for `tokens` into `NameLedger`,
+    /// recording high-confidence (`p >= 0.70`) entries for `Directory` eviction
+    /// protection.
+    fn publish_token_routes(&mut self, request: Option<RequestId>, when: When, step: Step, tokens: &[TokenId]) {
         if self.ranks == 0 || tokens.is_empty() {
             return;
         }
-        let predictions = self.token_routes.predict(tokens);
+        let predictions = self.token_routes.predict(request, tokens);
         if predictions.is_empty() {
             return;
         }
         let max_rank = (self.ranks - 1).min(u8::MAX as usize) as u8;
         let now = Instant::now();
-        for (layer, expert, bucket) in predictions {
+        for (layer, expert, bucket, p_union) in predictions {
+            if p_union >= 0.70 {
+                self.token_protected.push(((layer, expert), step, p_union));
+            }
             let name = Name {
                 source: Source::Token,
                 when,
@@ -2128,6 +2294,7 @@ impl Ledger {
     fn close(&mut self, request: RequestId) {
         self.passes.remove(&request);
         self.pending_draft_tokens.remove(&request);
+        self.token_routes.remove_request(request);
         self.pending_token_routes.retain(|_, pending| {
             pending.remaining.retain(|&id| id != request);
             !pending.remaining.is_empty()
@@ -2435,10 +2602,16 @@ impl Ledger {
                 (layer, expert, state, tier, step, p, first)
             })
             .collect();
+        // Layer-EDF ordering on both `PathKind::Drive` and `PathKind::Link`:
+        // evaluate unbegun queued moves first, then order by `(step, layer, -p, first)`
+        // so early layers (0..5) always race ahead of `routed_land` parks instead
+        // of late layers starving Layer 0.
+        let _ = path;
         candidates.sort_by(|left, right| {
             left.3
                 .cmp(&right.3)
                 .then(left.4.cmp(&right.4))
+                .then(left.0.cmp(&right.0))
                 .then(right.5.total_cmp(&left.5))
                 .then(left.6.cmp(&right.6))
         });
@@ -2463,8 +2636,8 @@ impl Ledger {
             let rank = |scheduled: &Scheduled| match scheduled.act {
                 Act::Cancel => (0u8, 0, 0, 0.),
                 Act::Reprice(Class::Due) => (1, 0, 0, 0.),
-                Act::Reprice(Class::Expected { step, p }) => (2, step, if path == magnitude_cost_model::PathKind::Link { scheduled.layer } else { 0 }, -p),
-                Act::Issue(Class::Expected { step, p }) => (3, step, if path == magnitude_cost_model::PathKind::Link { scheduled.layer } else { 0 }, -p),
+                Act::Reprice(Class::Expected { step, p }) => (2, step, scheduled.layer, -p),
+                Act::Issue(Class::Expected { step, p }) => (3, step, scheduled.layer, -p),
                 Act::Issue(Class::Due) | Act::Keep => (4, 0, 0, 0.),
             };
             let (left_rank, right_rank) = (rank(left), rank(right));
@@ -2982,11 +3155,12 @@ mod tests {
         experts.push((0, 7));
         let scheduled = ledger.schedule(experts, reading, |_| Flat { even: 0.3 });
         let order = scheduled.iter().map(|scheduled| (scheduled.layer, scheduled.expert)).collect::<Vec<_>>();
-        assert_eq!(order, [(0, 7), (0, 5), (1, 2), (1, 6), (0, 1), (1, 4), (0, 3), (0, 8)]);
+        // Layer-EDF ordering within step 6 puts Layer 0 `(0, 1)` ahead of Layer 1 `(1, 6)` and `(1, 4)`.
+        assert_eq!(order, [(0, 7), (0, 5), (1, 2), (0, 1), (1, 6), (1, 4), (0, 3), (0, 8)]);
         assert_eq!((scheduled[0].act, scheduled[1].act), (Act::Cancel, Act::Reprice(Class::Due)));
         assert!(matches!(scheduled[2].act, Act::Reprice(Class::Expected { step: 8, .. })));
         assert!(matches!(scheduled[7].act, Act::Issue(Class::Expected { step: 9, p }) if p > 0.85), "the likeliest, wanted last, is read last");
-        let front = scheduled[3];
+        let front = scheduled[4];
         assert!(matches!(front.act, Act::Issue(Class::Expected { step: 6, p }) if (p - 0.9).abs() < 1e-12), "{:?}", front.act);
         assert_eq!(front.leading.map(|interest| interest.source), Some(AHEAD), "the front row's name leads its read");
     }
@@ -3547,6 +3721,78 @@ mod tests {
         assert!(matches!(act, Act::Issue(Class::Expected { step: 7, .. })), "must schedule bound Source::Token read: {act:?}");
     }
 
+    /// Exact span matching in `TokenRoutes`: even a single prior occurrence of a
+    /// 3-token span `[100, 101, 102] -> 103` lets `DraftTokens` predict both the
+    /// matched token's experts (rank 0) and the 1-step span continuation's
+    /// experts (rank 1) during `DraftWindow`, and forgets the history on `Closed`.
+    #[test]
+    fn token_routes_span_matches_single_occurrence_and_cleans_up_on_close() {
+        let time = Time::new(&[vec![64]], 8);
+        let stands = Stands::new(time.clone());
+        let mut ledger = Ledger::new(vec![0, 0], 4, time, stands);
+        let req = RequestId(9);
+        // Commit a single 4-token span [100, 101, 102, 103] with distinct experts.
+        let rows = Box::new([
+            DecodeRow { position: 0, request: req, ahead: None, token: Some(TokenId(100)) },
+            DecodeRow { position: 1, request: req, ahead: Some(AheadOf::new(1, 1, 0)), token: Some(TokenId(101)) },
+            DecodeRow { position: 2, request: req, ahead: Some(AheadOf::new(1, 2, 0)), token: Some(TokenId(102)) },
+            DecodeRow { position: 3, request: req, ahead: Some(AheadOf::new(1, 3, 0)), token: Some(TokenId(103)) },
+        ]);
+        ledger.tell(Told::Began { step: 1, launch: Launched::Decode { rows, padding: 0 } });
+        ledger.tell(Told::Completed {
+            step: 1,
+            chose: vec![vec![], vec![]],
+            guesses: None,
+            row_experts: vec![
+                vec![(0, 10), (1, 11), (2, 12), (3, 13)],
+                vec![(0, 20), (1, 21), (2, 22), (3, 23)],
+            ],
+            physical_rows: 4,
+            layer_misses: Vec::new(),
+        });
+        ledger.tell(Told::Decided {
+            step: 1,
+            request: req,
+            verdict: Verdict { acceptable: vec![true, true, true], front: vec![], truths: vec![] },
+        });
+        ledger.tell(Told::Ended { step: 1, completed: true });
+
+        // Commit [100, 101] again so the request's trailing context is [100, 101].
+        let rows2 = Box::new([
+            DecodeRow { position: 4, request: req, ahead: None, token: Some(TokenId(100)) },
+            DecodeRow { position: 5, request: req, ahead: Some(AheadOf::new(1, 1, 0)), token: Some(TokenId(101)) },
+        ]);
+        ledger.tell(Told::Began { step: 2, launch: Launched::Decode { rows: rows2, padding: 0 } });
+        ledger.tell(Told::Completed {
+            step: 2,
+            chose: vec![vec![], vec![]],
+            guesses: None,
+            row_experts: vec![vec![(0, 10), (1, 11)], vec![(0, 20), (1, 21)]],
+            physical_rows: 2,
+            layer_misses: Vec::new(),
+        });
+        ledger.tell(Told::Decided {
+            step: 2,
+            request: req,
+            verdict: Verdict { acceptable: vec![true], front: vec![], truths: vec![] },
+        });
+        ledger.tell(Told::Ended { step: 2, completed: true });
+
+        // DraftWindow starts with anchor TokenId(102) -> matches 3-token span
+        // [100, 101, 102] (rank 0: experts 12, 22) AND predicts continuation
+        // TokenId(103) (rank 1: experts 13, 23)!
+        ledger.tell(Told::DraftWindow { estimated_seconds: 0.015 });
+        ledger.tell(Told::DraftTokens { request: req, tokens: vec![TokenId(102)] });
+        assert_eq!(ledger.leading(0, 12).expect("matched L0").rank, 0);
+        assert_eq!(ledger.leading(1, 22).expect("matched L1").rank, 0);
+        assert_eq!(ledger.leading(0, 13).expect("continuation L0").rank, 1);
+        assert_eq!(ledger.leading(1, 23).expect("continuation L1").rank, 1);
+
+        // Closing the request drops its route history cleanly.
+        ledger.tell(Told::Closed(req));
+        assert!(!ledger.token_routes.per_request.contains_key(&req));
+    }
+
     /// Gate #3: `NameLedger` hybrid verify+front lifecycle:
     /// - Early rejection at `0` or `K - 1` cancels all trailing `F` front rows.
     /// - Full acceptance with mismatching bonus (`truths[K] != front[0]`) cancels
@@ -3674,5 +3920,124 @@ mod tests {
             });
             assert_eq!(ledger.leading(0, 30).expect("bound to step 3").when, When::Step(3));
         }
+    }
+
+    #[test]
+    fn prompt_routes_seed_unigrams_and_bigrams_before_decode_step_1() {
+        assert_eq!(TokenRoutes::MAX_BIGRAMS, 4096);
+        let time = Time::new(&[vec![4, 4]], 32);
+        let stands = Stands::new(time.clone());
+        let mut ledger = Ledger::new(vec![0, 0], 4, time, stands);
+        let req = RequestId(7);
+
+        // Seed from grouped prefill BEFORE any decode step runs:
+        // prompt tokens [10, 20, 10, 20, 10, 20], K = 2.
+        // At layer 0: token 10 -> [1, 2], bigram (10, 20) -> [3, 4].
+        // At layer 1: token 10 -> [5, 6], bigram (10, 20) -> [7, 8].
+        let tokens: Box<[TokenId]> = [10, 20, 10, 20, 10, 20].into_iter().map(TokenId).collect();
+        let layer0: Vec<u16> = vec![1, 2, 3, 4, 1, 2, 3, 4, 1, 2, 3, 4];
+        let layer1: Vec<u16> = vec![5, 6, 7, 8, 5, 6, 7, 8, 5, 6, 7, 8];
+        ledger.tell(Told::PromptRoutes {
+            tokens,
+            layer_routes: vec![layer0, layer1],
+            selected: 2,
+        });
+
+        // On decode step 1 (before any decode completion!), drafting [10, 20]
+        // must immediately emit `Source::Token` predictions and high-confidence
+        // eviction protection (`p >= 0.70`) for both unigram and bigram experts.
+        ledger.tell(Told::DraftTokens { request: req, tokens: vec![TokenId(10), TokenId(20)] });
+        assert!(
+            matches!(ledger.leading(0, 1), Some(i) if i.source == Source::Token),
+            "layer 0 unigram expert 1 must be predicted on token 0"
+        );
+        assert!(
+            matches!(ledger.leading(0, 3), Some(i) if i.source == Source::Token),
+            "layer 0 bigram expert 3 must be predicted on token 0"
+        );
+        assert!(
+            matches!(ledger.leading(1, 7), Some(i) if i.source == Source::Token),
+            "layer 1 bigram expert 7 must be predicted on token 0"
+        );
+        assert!(
+            ledger.token_protected().iter().any(|&((layer, expert), _, p)| layer == 0 && expert == 3 && p >= 0.70),
+            "high-confidence prompt-seeded prediction must be exported to Directory protection"
+        );
+    }
+
+    #[test]
+    fn layer_edf_drive_sort_orders_early_layers_ahead_of_late_layers() {
+        let layers = 40usize;
+        let time = Time::new(&[vec![4, 4]], 32);
+        let stands = Stands::new(time.clone());
+        let mut ledger = Ledger::new(vec![0; layers], 4, time, stands);
+        let now = Instant::now();
+
+        // Publish Layer 39 FIRST with rank 0 (best rank), then Layer 0 SECOND
+        // with rank 1 (slightly lower rank), both for step 2.
+        ledger.publish(
+            39,
+            10,
+            Name {
+                source: Source::Token,
+                when: When::Step(2),
+                rank: 0,
+                from: At::whole(1, 0),
+                candidate: true,
+                lineage: None,
+            },
+            now,
+        );
+        ledger.publish(
+            0,
+            5,
+            Name {
+                source: Source::Token,
+                when: When::Step(2),
+                rank: 1,
+                from: At::whole(1, 0),
+                candidate: true,
+                lineage: None,
+            },
+            now,
+        );
+
+        let scheduled = ledger.schedule_for_path(
+            magnitude_cost_model::PathKind::Drive,
+            [(39, 10), (0, 5)],
+            |_, _| Read::Absent,
+            |_| Flat { even: 0.0 },
+        );
+        assert_eq!(scheduled.len(), 2);
+        assert_eq!(scheduled[0].layer, 0, "Layer-EDF Drive sort must schedule Layer 0 ahead of Layer 39");
+        assert_eq!(scheduled[0].expert, 5);
+        assert_eq!(scheduled[1].layer, 39);
+        assert_eq!(scheduled[1].expert, 10);
+    }
+
+    #[test]
+    fn token_routes_emits_seen_once_bucket_3_and_prefers_seen_at_least_two() {
+        assert_eq!(TokenRoutes::MAX_UNIGRAMS, 4096);
+        let mut routes = TokenRoutes::new(1);
+        // Single observation of token 42 -> expert 7 gives Laplace p = 1/(1+1) = 0.50 -> bucket 3.
+        routes.observe_prompt(&[TokenId(42)], &[vec![7]], 1);
+        let preds = routes.predict(None, &[TokenId(42)]);
+        assert_eq!(preds.len(), 1);
+        assert_eq!(preds[0].0, 0);
+        assert_eq!(preds[0].1, 7);
+        assert_eq!(preds[0].2, 3, "p = 0.50 must emit bucket 3");
+        assert!((preds[0].3 - 0.50).abs() < 1e-9);
+
+        // Three observations of unigram 99 -> expert 3, plus one observation of
+        // bigram (42, 99) -> expert 8 (seen == 1): unigram 99 has seen = 4,
+        // hits[3] = 3 -> p = 3/5 = 0.60 (bucket 2), so predicting [42, 99] must
+        // prefer the seen >= 2 unigram stats for token 99 over the seen == 1 bigram.
+        routes.observe_prompt(&[TokenId(99), TokenId(99), TokenId(99)], &[vec![3, 3, 3]], 1);
+        routes.observe_prompt(&[TokenId(42), TokenId(99)], &[vec![7, 8]], 1);
+        let preds = routes.predict(None, &[TokenId(42), TokenId(99)]);
+        assert!(
+            preds.iter().any(|&(layer, expert, bucket, _)| layer == 0 && expert == 3 && bucket <= 2),
+            "seen >= 2 unigram must take precedence over seen == 1 bigram: {preds:?}"
+        );
     }
 }

@@ -307,27 +307,44 @@ fn block_routed_counts(definition: &ModelDefinition, index: usize) -> Option<(u6
     Some((routed.experts, routed.selected))
 }
 
+#[derive(Default)]
+struct SeenTwoPass {
+    gate_up_part: bool,
+    down_project: bool,
+}
+
 fn call_from_sized(
     sized: &SizedCall,
     words: &'static Words,
     vocabulary: u64,
     block: Option<&BlockContext<'_>>,
-    seen_gate_up_part: &mut bool,
+    seen: &mut SeenTwoPass,
 ) -> Result<Call, AssessmentError> {
     let launches = Launches::from_sized_call(sized, words);
 
-    // A streamed gated layer runs `routed_gate_up_part` twice around
-    // `routed_land`: the early pass owns the expert slab work and routed
-    // layer tag; the late pass carries only its launch count.
+    // A streamed gated layer runs `routed_gate_up_part` and
+    // `routed_down_project` twice around `routed_land`: the early pass owns
+    // the expert slab work and routed layer tag; the late pass carries only
+    // its launch count.
     if sized.entry == "routed_gate_up_part" {
-        if *seen_gate_up_part {
+        if seen.gate_up_part {
             return Ok(Call {
                 launches,
                 work: Work::default(),
                 layer: None,
             });
         }
-        *seen_gate_up_part = true;
+        seen.gate_up_part = true;
+    }
+    if sized.entry == "routed_down_project" {
+        if seen.down_project {
+            return Ok(Call {
+                launches,
+                work: Work::default(),
+                layer: None,
+            });
+        }
+        seen.down_project = true;
     }
 
     let layer = block
@@ -747,7 +764,7 @@ impl DecodeDemand {
 
         let mut calls = Vec::new();
         let mut timelines = target_census.entry_timelines;
-        let mut unused_gate_up_part = false;
+        let mut unused_two_pass = SeenTwoPass::default();
 
         for sized in &target_census.entry_calls {
             calls.push(call_from_sized(
@@ -755,7 +772,7 @@ impl DecodeDemand {
                 words,
                 vocabulary,
                 None,
-                &mut unused_gate_up_part,
+                &mut unused_two_pass,
             )?);
         }
 
@@ -801,14 +818,14 @@ impl DecodeDemand {
                 (shape.calls.as_slice(), shape.timelines)
             };
             timelines += block_timelines;
-            let mut seen_gate_up_part = false;
+            let mut seen_two_pass = SeenTwoPass::default();
             for sized in block_calls {
                 calls.push(call_from_sized(
                     sized,
                     words,
                     vocabulary,
                     Some(&ctx),
-                    &mut seen_gate_up_part,
+                    &mut seen_two_pass,
                 )?);
             }
             recurrent_component = ngram_first + ngram_components;
@@ -820,7 +837,7 @@ impl DecodeDemand {
                 words,
                 vocabulary,
                 None,
-                &mut unused_gate_up_part,
+                &mut unused_two_pass,
             )?);
         }
 
@@ -907,14 +924,14 @@ impl DraftDemand {
             }
             let backend = width.calls[0].backend;
             let mut calls = Vec::with_capacity(width.calls.len());
-            let mut unused_gate_up_part = false;
+            let mut unused_two_pass = SeenTwoPass::default();
             for sized in &width.calls {
                 calls.push(call_from_sized(
                     sized,
                     words,
                     vocabulary,
                     None,
-                    &mut unused_gate_up_part,
+                    &mut unused_two_pass,
                 )?);
             }
             let boundaries = if !backend.parks_in_kernels() {
@@ -1170,10 +1187,11 @@ pub(crate) mod tests {
                 host_tier,
             );
             let banked = resident
+                .with_decode_rows(1)
                 .with_expert_bank(
                     &definition,
                     32,
-                    None,
+                    Some(8),
                     1,
                     crate::planning::FlightDepth::SERIAL,
                     substrate,

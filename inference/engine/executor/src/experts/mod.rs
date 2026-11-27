@@ -56,6 +56,7 @@ pub(crate) fn decode_dma_enabled(backend: seismic::BackendName) -> bool {
 }
 
 mod bank;
+pub(crate) use bank::UnifiedDecodeFlight;
 mod compute;
 mod conveyor;
 mod copies;
@@ -88,7 +89,7 @@ pub use site::{SITE_TERM_NAMES, SiteServed};
 #[cfg(test)]
 pub(crate) use site::{Answered, ExpertValues, reference as site_reference};
 pub(crate) use exchange::ExchangeTable;
-pub(crate) use watcher::{AheadOf, DecodeRow, DEPTHS, Measured, ParkKind, ParkSite, Parks, ScratchGroup, Step};
+pub(crate) use watcher::{AheadOf, DecodeRow, DEPTHS, Measured, MIN_VERIFY_SAMPLES, PLAIN_REPROBE_INTERVAL, ParkKind, ParkSite, Parks, ScratchGroup, Step};
 pub(crate) use bank::ChainServing;
 pub(crate) use bank::derived;
 #[cfg(any(test, feature = "fixtures"))]
@@ -99,7 +100,7 @@ pub use directory::{LayerCurve, MissCurve, RoutedRead};
 pub use directory::{Recency, replay};
 pub use bank::LoadPools;
 pub(crate) use bank::Places;
-pub(crate) use bank::{ExpertBank, ExpertStep, HeldTable, PooledRecords, Recording, ServedBank, StepFailure, StepRoute, fixture_pool, pooled_records, pooled_slabs};
+pub(crate) use bank::{ExpertBank, ExpertStep, HeldTable, PooledRecords, PromptRoutes, Recording, ServedBank, StepFailure, StepRoute, fixture_pool, pooled_records, pooled_slabs};
 
 use magnitude_kernels::constants;
 

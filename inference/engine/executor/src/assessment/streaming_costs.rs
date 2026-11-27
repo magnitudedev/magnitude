@@ -40,7 +40,7 @@
 use super::executor_costs::{executor_identity, failed, named, ExecutorCostsError, Formation, Walks};
 use crate::operators::routed::streamed::land_launch;
 use crate::planning::{BankBinding, ExpertBankPlan, RecordTensor, RecordTensors};
-use magnitude_kernels::{constants, dense_output, routed_copy, routed_land};
+use magnitude_kernels::{constants, dense_output, routed_copy, routed_gate_up, routed_land};
 use seismic::measure::{
     Gauge, InvalidLine, Pending, Reason, Record, RecordStore, StoreError, Sums, Terms, Timing, Unformed, Work,
 };
@@ -618,6 +618,13 @@ pub struct TierCopyCosts {
     /// `None` when the executor does not share a `HostRam` bus with the host
     /// CPU or before the concurrent probe has been recorded.
     pub concurrent_dma_byte_seconds: Option<f64>,
+    /// Measured routed quantized zero-copy read rate (`1 / B_routed_zc`, in
+    /// seconds/byte) from host-mapped shared memory using `routed_gate_up`
+    /// (`TierCopyPoint::RoutedZeroCopy`), capturing real gathered/quantized
+    /// PCIe zero-copy throughput rather than bulk contiguous BF16 reads.
+    ///
+    /// `None` on backends without a resident quantized chain element.
+    pub routed_zerocopy_byte_seconds: Option<f64>,
 }
 
 /// Which way a transfer-queue batch copies.
@@ -684,6 +691,12 @@ pub const TIER_COPY_PROBE: (u64, u64) = (32, 1 << 20);
 /// weights from VRAM and writes only a single activation row (32 KiB).
 pub const STALL_GEMV_PROBE: (u64, u64) = (8192, 8192);
 
+/// The routed quantized zero-copy probe (`(selected_experts, H, F)` = `(8, 4096, 4096)`
+/// reading `2 × 8` `Q4_K` gate+up slabs ≈ 151 MiB from host-mapped shared memory
+/// via `routed_gate_up`, exceeding even RTX 5090's 96 MiB L2 cache) used to
+/// measure real gathered/quantized PCIe zero-copy throughput (`TierCopyPoint::RoutedZeroCopy`).
+pub const ROUTED_ZC_PROBE: (u64, u64, u64) = (8, 4096, 4096);
+
 /// A point of [`TierCopyCosts`]: the probe's copy on `blocks`, the stall
 /// probe's work, alone or beside a copy on the transfer queue, or one
 /// transfer-queue batch of `records` of the probe's records.
@@ -695,6 +708,7 @@ pub enum TierCopyPoint {
     Transfer { records: u64, direction: Direction },
     ConcurrentDma,
     ConcurrentCpu,
+    RoutedZeroCopy,
 }
 
 impl fmt::Display for TierCopyPoint {
@@ -707,6 +721,7 @@ impl fmt::Display for TierCopyPoint {
             Self::Transfer { records, direction: Direction::Out } => write!(formatter, "a transfer-queue batch of {records} probe records out of the device"),
             Self::ConcurrentDma => formatter.write_str("a transfer-queue batch into the device beside concurrent CPU host-RAM reads"),
             Self::ConcurrentCpu => formatter.write_str("a host-RAM read sweep beside a concurrent transfer-queue copy"),
+            Self::RoutedZeroCopy => formatter.write_str("a routed quantized zero-copy expert pass over the link"),
         }
     }
 }
@@ -728,6 +743,9 @@ pub enum TierCopyError {
     /// The concurrent `DMA ∥ CPU` host-RAM contention probe produced a
     /// non-finite or non-positive aggregate throughput.
     ConcurrentHostRead { dma: f64, cpu: f64 },
+    /// The routed quantized zero-copy probe produced a non-finite or
+    /// non-positive timing.
+    RoutedZeroCopy { seconds: f64 },
 }
 
 impl fmt::Display for TierCopyError {
@@ -745,6 +763,10 @@ impl fmt::Display for TierCopyError {
             Self::ConcurrentHostRead { dma, cpu } => write!(
                 formatter,
                 "concurrent DMA ({dma:e} s) and CPU ({cpu:e} s) host-RAM probe produced invalid aggregate bandwidth"
+            ),
+            Self::RoutedZeroCopy { seconds } => write!(
+                formatter,
+                "routed quantized zero-copy probe produced invalid duration ({seconds:e} s)"
             ),
         }
     }
@@ -857,6 +879,75 @@ impl TierCopyCosts {
         }
     }
 
+    fn routed_zerocopy_formation(element: Element) -> Formation<routed_gate_up::Entry> {
+        let (k, h, f) = ROUTED_ZC_PROBE;
+        Formation::new(
+            routed_gate_up::native_entry_with(routed_gate_up::Elements {
+                A: Element::bf16(),
+                EGW: element,
+                EUW: element,
+            }),
+            &[
+                ("M", 1),
+                ("H", h),
+                ("E", 1),
+                ("K", k),
+                ("F", f),
+                ("GS", 0),
+                ("US", 0),
+                ("XS", constants::SOURCE_ROWS),
+                ("TR", k),
+                ("LB", 0),
+            ],
+        )
+    }
+
+    /// Key for the routed quantized zero-copy link probe (`routed_gate_up`
+    /// reading [`ROUTED_ZC_PROBE`] `Q4_K` gate+up experts from host-mapped
+    /// shared memory over PCIe zero-copy).
+    fn routed_zerocopy_key(
+        identity: &seismic::Identity,
+        backend: seismic::BackendName,
+        tensor_ops: bool,
+        element: Element,
+    ) -> Result<PointKey, ExecutorCostsError> {
+        let (k, h, f) = ROUTED_ZC_PROBE;
+        Ok(PointKey {
+            subject: seismic::PointSubject::executor(identity),
+            kernels: vec![Self::routed_zerocopy_formation(element).identity(backend, tensor_ops)?],
+            configuration: named(&[("routed_zerocopy", 1), ("selected", k), ("hidden", h), ("features", f), SCHEMA]),
+            point: named(&[("rows", 1)]),
+        })
+    }
+
+    /// Total quantized host-mapped weight bytes read by one [`ROUTED_ZC_PROBE`]
+    /// `routed_gate_up` launch (`tier_gate` + `tier_up`).
+    fn routed_zerocopy_bytes(element: Element) -> Result<u64, ExecutorCostsError> {
+        let (k, h, f) = ROUTED_ZC_PROBE;
+        let one = element
+            .canonical_byte_len(&[k, f, h])
+            .map_err(|cause| failed("routed zero-copy probe bytes")(&cause))?;
+        Ok(2 * one)
+    }
+
+    /// Effective zero-copy seconds-per-byte for routed quantized experts over
+    /// the host-device link: the slower (larger s/B) of the measured routed
+    /// zero-copy kernel probe and `fallback_s_per_byte` (from `ExpertLines`),
+    /// so bulk contiguous BF16 link rates never overstate gathered quantized
+    /// zero-copy throughput.
+    pub fn effective_zerocopy_byte_seconds(&self, fallback_s_per_byte: f64) -> f64 {
+        match self.routed_zerocopy_byte_seconds {
+            Some(measured) if measured.is_finite() && measured > 0.0 => {
+                if fallback_s_per_byte.is_finite() && fallback_s_per_byte > 0.0 {
+                    measured.max(fallback_s_per_byte)
+                } else {
+                    measured
+                }
+            }
+            _ => fallback_s_per_byte,
+        }
+    }
+
     /// Effective aggregate `HostRam` read seconds-per-byte (`1 / B_joint`)
     /// under concurrent `DMA ∥ CPU` traffic: the measured concurrent probe
     /// value when available (clamped below at `host_memory_byte_seconds`, since
@@ -925,7 +1016,30 @@ impl TierCopyCosts {
         } else {
             (None, None)
         };
-        Ok(Self { blocks, whole_seconds: whole, stall_share, transfer, back, concurrent_host_byte_seconds, concurrent_dma_byte_seconds })
+        let routed_zerocopy_byte_seconds = match super::executor_costs::chain_element(backend) {
+            Some(element) => {
+                let zc_seconds = median(
+                    Self::routed_zerocopy_key(&identity, backend, tensor_ops, element)?,
+                    TierCopyPoint::RoutedZeroCopy,
+                )?;
+                let zc_bytes = Self::routed_zerocopy_bytes(element)? as f64;
+                if !zc_seconds.is_finite() || zc_seconds <= 0. || zc_bytes <= 0. {
+                    return Err(TierCopyError::RoutedZeroCopy { seconds: zc_seconds });
+                }
+                Some(zc_seconds / zc_bytes)
+            }
+            None => None,
+        };
+        Ok(Self {
+            blocks,
+            whole_seconds: whole,
+            stall_share,
+            transfer,
+            back,
+            concurrent_host_byte_seconds,
+            concurrent_dma_byte_seconds,
+            routed_zerocopy_byte_seconds,
+        })
     }
 
     /// [`Self::stored`] in its [`Priced`] state, owning the mapping from an
@@ -941,7 +1055,8 @@ impl TierCopyCosts {
                 TierCopyError::Unrecorded { .. }
                 | TierCopyError::FasterBeside { .. }
                 | TierCopyError::Transfer(_)
-                | TierCopyError::ConcurrentHostRead { .. },
+                | TierCopyError::ConcurrentHostRead { .. }
+                | TierCopyError::RoutedZeroCopy { .. },
             ) => super::Priced::Pending(super::PendingPrices::load(super::PointRequest::TierCopy)),
             Err(error) => super::Priced::Unavailable(error.to_string()),
         }
@@ -968,9 +1083,14 @@ impl TierCopyCosts {
         let (h, f) = STALL_GEMV_PROBE;
         let gemv_weights = h * f * 2;
         let small = h * 4 + f * 2 + 4 + h * 4;
+        // Routed quantized zero-copy probe (~151 MiB Q4_K in shared host memory
+        // + ~19 MiB resident dummy slot in device memory, conservative 1 B/param bound).
+        let (zc_k, zc_h, zc_f) = ROUTED_ZC_PROBE;
+        let zc_shared = 2 * zc_k * zc_h * zc_f;
+        let zc_device = 2 * zc_h * zc_f + zc_k * zc_f * 2;
         crate::memory::ClaimDemand {
-            device: round(probe) + round(gemv_weights) + round(small),
-            shared: round(probe),
+            device: (round(probe) + round(gemv_weights) + round(small)).max(round(zc_device)),
+            shared: round(probe).max(round(zc_shared)),
             ..crate::memory::ClaimDemand::default()
         }
     }
@@ -1105,6 +1225,32 @@ impl TierCopyCosts {
                     if let Err(error @ TierCopyError::ConcurrentHostRead { .. }) = Self::stored(device.topology(), device.info(), store) {
                         let _ = store.store(&cpu_key, &Record::Unobtainable { reason: Reason::new(error.to_string()) });
                     }
+                }
+            }
+        }
+        // Measure true routed quantized zero-copy throughput over the link
+        // using `routed_gate_up` reading `Q4_K` gate+up slabs from host-mapped
+        // shared memory (`TierCopyPoint::RoutedZeroCopy`).
+        if let Some(element) = super::executor_costs::chain_element(device.backend()) {
+            let remeasuring_zc = matches!(initial, Err(TierCopyError::RoutedZeroCopy { .. }));
+            let zc_store: &dyn RecordStore<PointKey> = if remeasuring_zc { &remeasure } else { store };
+            let key = Self::routed_zerocopy_key(
+                &walks.identity(),
+                device.backend(),
+                device.info().forms_tensor_operations(),
+                element,
+            )?;
+            let zc_formed = OnceCell::<Result<NativeKernel<routed_gate_up::Entry>, ExecutorCostsError>>::new();
+            let measured = walks.time_in(key.clone(), true, zc_store, move || {
+                let kernel = zc_formed
+                    .get_or_init(|| Self::routed_zerocopy_formation(element).form(device, None))
+                    .as_ref()
+                    .map_err(|error| Unformed::Never(error.clone()))?;
+                routed_zerocopy_point(charges, kernel, element).map_err(Unformed::Now)
+            });
+            if remeasuring_zc && measured {
+                if let Err(error @ TierCopyError::RoutedZeroCopy { .. }) = Self::stored(device.topology(), device.info(), store) {
+                    let _ = store.store(&key, &Record::Unobtainable { reason: Reason::new(error.to_string()) });
                 }
             }
         }
@@ -1404,6 +1550,96 @@ fn stall_gemv_point(charges: &seismic::Charges, kernel: &NativeKernel<dense_outp
     plan.point(charges, bindings, GraphTiming::Queued).map(Point::Graph).map_err(|cause| error(&cause))
 }
 
+/// A single-row `routed_gate_up` pass reading [`ROUTED_ZC_PROBE`] distinct
+/// quantized experts (`tier_gate` and `tier_up`, both allocated in host-mapped
+/// `Tensor::shared` memory) over PCIe zero-copy, measuring real gathered
+/// quantized zero-copy throughput on the link.
+fn routed_zerocopy_point(
+    charges: &seismic::Charges,
+    kernel: &NativeKernel<routed_gate_up::Entry>,
+    element: Element,
+) -> Result<Point, ExecutorCostsError> {
+    let error = failed("routed zero-copy point");
+    let (k, h, f) = ROUTED_ZC_PROBE;
+    let k_usize = usize::try_from(k).map_err(|cause| error(&cause))?;
+    let i32_bytes = |values: &[i32]| values.iter().flat_map(|word| word.to_le_bytes()).collect::<Vec<_>>();
+    let routes_words: Vec<i32> = (0..k_usize as i32).collect();
+    // Negative sources `-2 - slot` direct `routed_gate_up` to read every choice
+    // from `tier_gate[slot]` and `tier_up[slot]` in host-mapped shared memory.
+    let tier_records: Vec<i32> = (0..k_usize as i32).map(|slot| -2 - slot).collect();
+    let sources_words = magnitude_kernels::source_words(&tier_records, &vec![-1; k_usize]);
+    let normalized = Tensor::zeros(charges, Element::bf16(), &[1, h]).map_err(|cause| error(&cause))?;
+    let routes = Tensor::from_host(charges, Element::i32(), &[1, k], &i32_bytes(&routes_words)).map_err(|cause| error(&cause))?;
+    let sources = Tensor::from_host(
+        charges,
+        Element::i32(),
+        &[constants::SOURCE_ROWS, 1, k],
+        &i32_bytes(&sources_words),
+    )
+    .map_err(|cause| error(&cause))?;
+    let expert_gate = Tensor::zeros(charges, element, &[1, f, h]).map_err(|cause| error(&cause))?;
+    let expert_up = Tensor::zeros(charges, element, &[1, f, h]).map_err(|cause| error(&cause))?;
+    let tier_gate = Tensor::shared(charges, element, &[k, f, h]).map_err(|cause| error(&cause))?;
+    let tier_up = Tensor::shared(charges, element, &[k, f, h]).map_err(|cause| error(&cause))?;
+    let gate_scale = Tensor::zeros(charges, Element::f32(), &[0]).map_err(|cause| error(&cause))?;
+    let up_scale = Tensor::zeros(charges, Element::f32(), &[0]).map_err(|cause| error(&cause))?;
+    let tensors = [
+        normalized,
+        routes,
+        sources,
+        expert_gate,
+        expert_up,
+        tier_gate,
+        tier_up,
+        gate_scale,
+        up_scale,
+    ];
+    let mut graph = charges.device().native_graph();
+    let mut ports = Vec::with_capacity(tensors.len());
+    for tensor in &tensors {
+        ports.push(graph.port(tensor.element(), &tensor.extents()).map_err(|cause| error(&cause))?);
+    }
+    let [
+        normalized_port,
+        routes_port,
+        sources_port,
+        expert_gate_port,
+        expert_up_port,
+        tier_gate_port,
+        tier_up_port,
+        gate_scale_port,
+        up_scale_port,
+    ] = &ports[..]
+    else {
+        unreachable!("nine ports");
+    };
+    let glu_limit = crate::operators::glu_limit(routes_port.tensor(), None);
+    let _product = graph
+        .enqueue(
+            kernel,
+            routed_gate_up::WorkflowArgs {
+                normalized: normalized_port.tensor().into(),
+                routes: routes_port.tensor().into(),
+                sources: sources_port.tensor().into(),
+                expert_gate: expert_gate_port.tensor().into(),
+                expert_up: expert_up_port.tensor().into(),
+                tier_gate: tier_gate_port.tensor().into(),
+                tier_up: tier_up_port.tensor().into(),
+                activation: 0i32.into(),
+                gate_scale: gate_scale_port.tensor().into(),
+                up_scale: up_scale_port.tensor().into(),
+                glu_limit: (&glu_limit).into(),
+            },
+        )
+        .map_err(|cause| error(&cause))?;
+    let plan = graph.seal().map_err(|cause| error(&cause))?;
+    let mut bindings = plan.bindings();
+    for (port, tensor) in ports.iter().zip(&tensors) {
+        bindings.set(charges, port, tensor).map_err(|cause| error(&cause))?;
+    }
+    plan.point(charges, bindings, GraphTiming::Device).map(Point::Graph).map_err(|cause| error(&cause))
+}
+
 /// The value `store` records measured at `key`, none while unrecorded. The
 /// jobs that write these records ([`GraphMemory`], [`VolumeCosts`],
 /// [`CpuCosts`]) store only measurements: one recorded unobtainable is a
@@ -1671,7 +1907,7 @@ impl StorageCosts {
         Ok(PointKey {
             subject: seismic::PointSubject::volume(topology, volume),
             kernels: Vec::new(),
-            configuration: named(&[("storage", 1)]),
+            configuration: named(&[("storage", 2)]),
             point: named(&[(point, 1)]),
         })
     }
@@ -2243,7 +2479,7 @@ mod tests {
     /// transfer hides less than its latency more.
     #[test]
     fn the_transfer_queues_depth_covers_its_latency() {
-        let costs = |latency: f64| TierCopyCosts { blocks: 2, whole_seconds: 1e-3, stall_share: 0., transfer: ReadLine::new(latency, 1. / 12e9).unwrap(), back: ReadLine::new(latency, 1. / 12e9).unwrap(), concurrent_host_byte_seconds: None, concurrent_dma_byte_seconds: None };
+        let costs = |latency: f64| TierCopyCosts { blocks: 2, whole_seconds: 1e-3, stall_share: 0., transfer: ReadLine::new(latency, 1. / 12e9).unwrap(), back: ReadLine::new(latency, 1. / 12e9).unwrap(), concurrent_host_byte_seconds: None, concurrent_dma_byte_seconds: None, routed_zerocopy_byte_seconds: None };
         assert_eq!(costs(90e-6).depth(3_000_000), 2);
         assert_eq!(costs(0.).depth(3_000_000), 2, "always keeps at least one queued behind the running transfer");
         assert_eq!(costs(300e-6).depth(3_000_000), 3);
@@ -2564,9 +2800,11 @@ mod tests {
         let probe = records * bytes;
         let (h, f) = STALL_GEMV_PROBE;
         let gemv_weights = h * f * 2;
+        let (zc_k, zc_h, zc_f) = ROUTED_ZC_PROBE;
+        let zc_shared = (2 * zc_k * zc_h * zc_f).next_multiple_of(GRANULE);
         let tier = TierCopyCosts::measure_demand(GRANULE);
         assert_eq!(tier.device, probe + gemv_weights + GRANULE, "transfer dest + GEMV weights + 1 granularity block for small tensors");
-        assert_eq!(tier.shared, probe, "1 host-shared probe buffer");
+        assert_eq!(tier.shared, probe.max(zc_shared), "host-shared probe buffer covers peak of tier-copy and routed zero-copy probes");
 
         let form = ConvertForm::reference(seismic::BackendName::Cuda)
             .expect("cuda reference convert form")
@@ -2586,7 +2824,11 @@ mod tests {
             .find(|executor| executor.backend() == seismic::BackendName::Cuda)
             .expect("rtx3090 fixture has a CUDA executor");
         let identity = executor_identity(&topology, cuda).unwrap();
-        let copy_key = TierCopyCosts::key(&identity, cuda.backend(), cuda.forms_tensor_operations(), 1).unwrap();
+        let copy_key = match TierCopyCosts::key(&identity, cuda.backend(), cuda.forms_tensor_operations(), 1) {
+            Ok(key) => key,
+            Err(err) if err.to_string().contains("NVRTC is unavailable") => return,
+            Err(err) => panic!("unexpected TierCopyCosts::key error: {err}"),
+        };
         let alone_key = TierCopyCosts::stall_key(&identity, cuda.backend(), cuda.forms_tensor_operations(), Beside::Alone).unwrap();
         let beside_key = TierCopyCosts::stall_key(&identity, cuda.backend(), cuda.forms_tensor_operations(), Beside::Copy).unwrap();
         assert_ne!(alone_key.kernels, copy_key.kernels, "stall probe must use read-only GEMV, not VRAM-write routed_copy");
@@ -2739,6 +2981,13 @@ mod tests {
             for direction in [Direction::In, Direction::Out] {
                 put(TierCopyCosts::transfer_key(&identity, 1, direction), 5e-6 + bytes as f64 / 20e9);
                 put(TierCopyCosts::transfer_key(&identity, records, direction), 5e-6 + (records * bytes) as f64 / 20e9);
+            }
+            if let Some(element) = super::super::executor_costs::chain_element(backend) {
+                let zc_bytes = TierCopyCosts::routed_zerocopy_bytes(element).unwrap() as f64;
+                put(
+                    TierCopyCosts::routed_zerocopy_key(&identity, backend, tensor_ops, element).unwrap(),
+                    zc_bytes / 18e9,
+                );
             }
             identity
         };

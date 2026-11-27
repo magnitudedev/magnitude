@@ -486,3 +486,52 @@ fn fragmented_multiblock_reclaim_vacates_one_block_without_collateral_wipeout() 
 
     changes.change(|_| drop((claim, bank_records, stores)));
 }
+
+/// Tail decode-stage scratch slots (`Stores::claim_tail_stage`) are backed at
+/// `stage_base .. stage_base + 4`, charged to the pool/load ledger in
+/// `charged_per_pool()`, excluded from directory-usable `present()`, and never
+/// collide with subsequent `claim_to()` growth.
+#[test]
+fn stores_claim_tail_stage_charges_ledger_and_excludes_present() {
+    let device = crate::test_support::open_backend(&seismic::Devices::discover(&[]).unwrap(), seismic::BackendName::Cpu).unwrap();
+    let stage_base = 16u64;
+    let stage_slots = 4u64;
+    let total_slots = stage_base + stage_slots;
+    let regions = [seismic::SlabRegion { element: seismic::Element::i32(), row_shape: vec![16] }];
+    let layout = seismic::SlabLayout::for_regions(1, total_slots, &regions).unwrap();
+    let granule = layout.slab_bytes.next_multiple_of(layout.slab_alignment);
+    let block_bytes = 4 * granule;
+    let block = seismic::BlockSize { bytes: block_bytes, held: block_bytes, absent: granule };
+
+    let scope = crate::memory::ledger::Ledgers::strict();
+    let _owner = scope.changes().own();
+    let ledger = scope.ledger(seismic::StoreIdentity::HostRam, Arc::new(crate::memory::ledger::LoadShape { stores: Vec::new() }));
+    ledger.read(ledger.sampled(Instant::now()), crate::memory::supply::Reading::device(1 << 40, 1 << 40, crate::domain::fixtures::NO_LAG));
+    let changes = scope.changes().clone();
+    let entries = ledger.pool_block(crate::memory::ledger::PoolClass::Records, std::num::NonZeroU64::new(block_bytes).unwrap());
+    let charges = seismic::Charges::tally(&device);
+    let pool = seismic::Pool::open(&entries.charges(&device, seismic::Contract::Shared), seismic::Contract::Shared, granule, block_bytes).unwrap();
+    let store = seismic::SlabTensor::in_pool(&charges, &pool, 1, total_slots, &regions).unwrap();
+    let stores = Arc::new(Stores::new(vec![(pool.clone(), block)], vec![0], vec![(store, 0, vec![64])]));
+    let claim = ledger
+        .change(|keeping| ledger.backing(&keeping.claims(), crate::memory::ledger::PoolClass::Records, total_slots * granule))
+        .expect("20 slabs fit");
+
+    changes.change(|_| {
+        let initial = stores.claim_to(0, 8).unwrap();
+        assert_eq!(initial, (0..8).collect::<Vec<_>>());
+        let tail = stores.claim_tail_stage(0, stage_base, stage_slots).unwrap();
+        assert_eq!(tail, (16..20).collect::<Vec<_>>());
+    });
+    assert_eq!(stores.present(0), 8, "present() must exclude tail decode stage scratch");
+    assert_eq!(stores.charged(), 3 * block_bytes, "charged() must include 8 + 4 = 12 slabs (3 blocks)");
+
+    changes.change(|_| {
+        let growth = stores.claim_to(0, 12).unwrap();
+        assert_eq!(growth, (8..12).collect::<Vec<_>>(), "claim_to must claim below stage_base");
+    });
+    assert_eq!(stores.present(0), 12);
+    assert_eq!(stores.charged(), 4 * block_bytes, "12 + 4 = 16 slabs (4 blocks)");
+
+    changes.change(|_| drop((claim, stores)));
+}

@@ -41,6 +41,7 @@ pub mod speculative;
 pub mod step;
 pub mod streamed;
 pub mod terms;
+pub mod wall_model;
 
 pub use bank::{BankPrices, PassLayers, PathRecords, Prior, PriorOverflow, WorkloadRates};
 pub use census::{Census, Kind, LayerCall, LaunchCounts, RoutedCall, RoutedKind};
@@ -51,13 +52,15 @@ pub use expert_lines::{
 };
 pub use launch::{FrontRoutes, LaunchPrices, TargetCensus};
 pub use lines::{FileLine, ReadLine, RecordLine};
-pub use regime::{Form, LinkIdleBudget, Needed, NeededByForm, PathAdmission, PathTerm, ReadAdmission, Regime, VerifyOverhead, VerifyRoutes, VramWorkingSet, Waste};
+pub use miss_model::MissModel;
+pub use regime::{diminishing_front_stall_saved, Form, LinkIdleBudget, Needed, NeededByForm, PathAdmission, PathTerm, ReadAdmission, Regime, VerifyOverhead, VerifyRoutes, VramWorkingSet, Waste};
 pub use speculative::{
     expected_tokens, prior_expected_tokens, sigma_prior, DraftCensus, DraftMethod, DraftWidthCensus, SpeculativePrice, SpeculativeRate,
 };
 pub use step::{LayerLoad, LayerRun, Lead, ReadAhead, StepInputs, StepTime};
 pub use terms::{ContentionDomain, PathKind, ResourceTerms, Terms};
 pub use streamed::{step_inputs, DecodePrice, FormSeconds, HeldSlots, LayerReads, LiveDecode, StreamedLayers, StreamedStep};
+pub use wall_model::{DECODE_STAGE_SLOTS, TierServicePrices, WallModel};
 
 #[cfg(test)]
 mod tests;

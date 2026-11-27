@@ -426,40 +426,121 @@ impl Regime {
             .fold(0., f64::max)
     }
 
-    /// Expected stall seconds saved by one trailing front row whose guess stands,
-    /// derived from live single-token misses and measured stall (or peak path
-    /// service time before stall is measured), less any measured exposed front
-    /// stall (`front_stall`). Returns `0.0` when resident.
-    pub fn front_stall_saved_per_row(&self) -> f64 {
-        if self.paths.is_empty() || self.needed.front.is_empty() {
-            return 0.0;
+    /// Expected marginal stall seconds saved by each trailing front row
+    /// `m = 0..max_front` (`depth = m + 1`) whose branch stands, derived from
+    /// live single-token misses, measured stall (`stall` / `front_stall`),
+    /// placement-foresight miss reduction (`needed.front`), and route-sharing
+    /// fresh-expert ratios (`routes.fresh`). Returns an empty `Vec` when
+    /// resident (`paths.is_empty()`) or `max_front == 0`.
+    ///
+    /// - When `front_stall` has measurements, depths `1..=deepest_measured`
+    ///   credit only measured incremental stall reduction (never hallucinating
+    ///   savings past a measured plateau), and unexplored deeper depths split
+    ///   any remaining unhidden stall geometrically so cumulative stall credit
+    ///   never exceeds total plain exposed stall `U(0) * plain_per_miss`.
+    /// - Before any front depth is measured (`front_stall` has no `Some`),
+    ///   applies [`diminishing_front_stall_saved`] from `U(0) * plain_per_miss`,
+    ///   scaled by `(routes.fresh[m] / routes.fresh[0]).clamp(0.0, 1.0)` when
+    ///   route-sharing stats are present.
+    pub fn front_stall_saved_by_row(&self, max_front: usize) -> Vec<f64> {
+        if max_front == 0 || self.paths.is_empty() || self.needed.front.is_empty() {
+            return Vec::new();
         }
-        let needed_0 = self.needed.front[0].misses();
-        let plain_per_miss = self.stall.unwrap_or_else(|| {
-            self.paths
-                .iter()
-                .map(|path| path.seconds)
-                .fold(0.0, f64::max)
-        });
-        let exposed_per_miss = self
+        let needed_0 = self.needed.front[0].misses().max(0.0);
+        let max_path_secs = self
+            .paths
+            .iter()
+            .map(|path| path.seconds)
+            .fold(0.0, f64::max)
+            .max(0.0);
+        let plain_per_miss = self.stall.unwrap_or(max_path_secs).max(0.0);
+        let deepest_measured = self
             .front_stall
             .iter()
-            .flatten()
-            .copied()
-            .next()
-            .unwrap_or(0.0);
-        needed_0 * (plain_per_miss - exposed_per_miss).max(0.0)
+            .enumerate()
+            .rev()
+            .find_map(|(i, s)| s.map(|_| i + 1));
+
+        let Some(deepest) = deepest_measured else {
+            let base_saved = needed_0 * plain_per_miss;
+            let mut saved = diminishing_front_stall_saved(base_saved, max_front);
+            if let Some(&f0) = self.routes.fresh.first().filter(|&&f| f > 0.0) {
+                let last_f = *self.routes.fresh.last().expect("non-empty");
+                for (m, s) in saved.iter_mut().enumerate().skip(1) {
+                    let fm = self.routes.fresh.get(m).copied().unwrap_or(last_f);
+                    *s *= (fm / f0).clamp(0.0, 1.0);
+                }
+            }
+            return saved;
+        };
+
+        let mut prev_exposed = plain_per_miss;
+        let mut out = Vec::with_capacity(max_front);
+        for d in 1..=max_front {
+            let stall_saved = if d <= deepest {
+                let cur_exposed = self.front_stall_per_miss(d).clamp(0.0, prev_exposed);
+                let delta = needed_0 * (prev_exposed - cur_exposed).max(0.0);
+                prev_exposed = cur_exposed;
+                delta
+            } else {
+                let delta = needed_0 * prev_exposed * 0.5;
+                prev_exposed *= 0.5;
+                delta
+            };
+            let u_prev = self.needed.front.get(d - 1).map_or(needed_0, |n| n.misses());
+            let u_cur = self.needed.front.get(d).map_or(u_prev, |n| n.misses());
+            let placement_saved = (u_prev - u_cur).max(0.0) * max_path_secs;
+            out.push(stall_saved + placement_saved);
+        }
+        out
+    }
+
+    /// Expected stall seconds saved by the first trailing front row (`m = 0`)
+    /// whose guess stands, derived from [`Self::front_stall_saved_by_row`].
+    /// Returns `0.0` when resident.
+    pub fn front_stall_saved_per_row(&self) -> f64 {
+        self.front_stall_saved_by_row(1).first().copied().unwrap_or(0.0)
+    }
+
+    /// Cumulative branch survival `S_d = Π_{i=1..=d} σ_i` at 1-based `depth`,
+    /// using measured `accepts` (falling back to `stand` at depth 1 and
+    /// carrying forward the last measured shallower conditional rate, or `1.0`
+    /// before any verdict).
+    fn cumulative_stand(&self, depth: usize) -> f64 {
+        let mut standing = 1.0f64;
+        let mut bound = 1.0f64;
+        for idx in 0..depth {
+            let measured = self
+                .accepts
+                .get(idx)
+                .copied()
+                .flatten()
+                .or(if idx == 0 { self.stand } else { None });
+            let row = match measured {
+                Some(accepts) => {
+                    let r = rate(Some(accepts));
+                    bound = r;
+                    r
+                }
+                None => bound,
+            };
+            standing *= row;
+        }
+        standing
     }
 
     /// Expected wasted path seconds of one trailing front row at `depth >= 1`
     /// whose guess falls, derived from measured `PathTerm::wasted.front[depth]`
-    /// (falling back to one single-token miss burst on the binding path before
-    /// waste at `depth` is measured). Returns `0.0` when resident.
+    /// (falling back to the expected wasted fraction `(1 - S_depth)` of one
+    /// single-token miss burst on the binding path before waste at `depth` is
+    /// measured — an accepted front row's read is useful work for the next
+    /// round, not waste). Returns `0.0` when resident.
     pub fn front_waste_per_row(&self, depth: usize) -> f64 {
         if self.paths.is_empty() || self.needed.front.is_empty() {
             return 0.0;
         }
         let needed_0 = self.needed.front[0].misses();
+        let fall_prob = (1.0 - self.cumulative_stand(depth)).clamp(0.0, 1.0);
         self.paths
             .iter()
             .map(|path| {
@@ -467,7 +548,7 @@ impl Regime {
                     .front
                     .get(depth)
                     .and_then(|&w| w)
-                    .unwrap_or_else(|| needed_0 * path.seconds)
+                    .unwrap_or_else(|| fall_prob * needed_0 * path.seconds)
             })
             .fold(0.0, f64::max)
     }
@@ -670,6 +751,24 @@ impl Regime {
         );
         depths
     }
+}
+
+/// Diminishing marginal stall-saved curve for `max_front` front rows given
+/// the first front row's base saving `base_saved` (in seconds):
+/// `saved[m] = base_saved * 0.5^m` for `m = 0..max_front`.
+///
+/// Monotonically non-increasing and strictly bounded (`sum < 2.0 * base_saved`).
+pub fn diminishing_front_stall_saved(base_saved: f64, max_front: usize) -> Vec<f64> {
+    if !base_saved.is_finite() || base_saved <= 0.0 || max_front == 0 {
+        return Vec::new();
+    }
+    let mut scale = 1.0;
+    let mut out = Vec::with_capacity(max_front);
+    for _ in 0..max_front {
+        out.push(base_saved * scale);
+        scale *= 0.5;
+    }
+    out
 }
 
 /// A stand rate as priced: as measured, standing before a verdict (the
@@ -894,7 +993,14 @@ impl PathAdmission {
     /// speculatively prefetching `bytes` with live-calibrated hit probability
     /// `p`, given `free_slack` seconds of genuinely idle path time (e.g. an
     /// active MTP `DraftWindow` or remaining non-drive pass overlap window):
-    /// `(p * s_demand - (1 - p) * w_net) / s_demand`.
+    /// - When `PathKind::Drive && self.drive_binds()` (bandwidth-saturated
+    ///   drive), any unhidden speculative read time `w_net` consumes
+    ///   critical-path drive bandwidth whether it hits or misses, so net
+    ///   expected savings is `(p * s_demand - w_net) / s_demand` (matching
+    ///   [`Self::break_even`] = `w_net / s_demand`).
+    /// - Otherwise, a hit avoids a demand read that would have paid `w_net`
+    ///   anyway, so only misses waste `w_net`:
+    ///   `(p * s_demand - (1 - p) * w_net) / s_demand`.
     ///
     /// When `PathKind::Drive` shares a binding `ContentionDomain::HostMemory`
     /// bus, `w_net` floors at the measured host DDR contention cost
@@ -922,7 +1028,18 @@ impl PathAdmission {
             return p;
         }
         match self.effective_stall(bytes) {
-            Some(s_demand) if s_demand > 0.0 => p - (1.0 - p) * (w_net / s_demand),
+            Some(s_demand) if s_demand > 0.0 => {
+                if self.path == PathKind::Drive && self.drive_binds() {
+                    // On a bandwidth-saturated drive, any unhidden speculative
+                    // read time `w_net` consumes critical-path drive bandwidth
+                    // whether it hits or misses, so net expected savings is
+                    // `(p * s_demand - w_net) / s_demand` (matching
+                    // `PathAdmission::break_even` = `w_net / s_demand`).
+                    (p * s_demand - w_net) / s_demand
+                } else {
+                    p - (1.0 - p) * (w_net / s_demand)
+                }
+            }
             _ => 0.0,
         }
     }
@@ -1668,24 +1785,36 @@ mod tests {
         let adm = PathAdmission::drive(drive_bound, Some(line), Some(1.00e-3), None);
         assert!(adm.binds());
 
-        // Low-p carryover (0.09, like the 10:1 waste regime) is strictly negative -> rejected.
+        // On a bandwidth-saturated drive (`drive_binds()` with `free_slack == 0.0`),
+        // every speculative read consumes `t_bw` of critical-path drive bandwidth
+        // whether it hits or misses, so net savings is `(p * s_demand - t_bw) / s_demand`
+        // (matching `break_even(bytes, 0.0) = t_bw / s_demand = 0.50`).
         assert!(adm.carryover_net_benefit(0.09, bytes, 0.0) < 0.0);
-        // Exact break-even p = 1/3 -> 0.0.
-        assert!(adm.carryover_net_benefit(1.0 / 3.0, bytes, 0.0).abs() < 1e-12);
-        // High-p carryover (0.60) -> 0.60 - 0.40 * 0.50 = +0.40 miss-equivalent benefit.
-        assert!((adm.carryover_net_benefit(0.60, bytes, 0.0) - 0.40).abs() < 1e-12);
+        assert!(adm.carryover_net_benefit(0.40, bytes, 0.0) < 0.0);
+        assert!(adm.carryover_net_benefit(0.50, bytes, 0.0).abs() < 1e-12);
+        assert!((adm.carryover_net_benefit(0.60, bytes, 0.0) - 0.10).abs() < 1e-12);
+
+        // When demand reads are already pipelined (`s_demand == t_bw`), break-even
+        // is `1.0` so no speculative carryover with `p < 1.0` can beat demand fetch.
+        let pipelined_adm = PathAdmission::drive(drive_bound, Some(line), Some(0.50e-3), None);
+        assert!(pipelined_adm.carryover_net_benefit(0.60, bytes, 0.0) < 0.0);
+        assert!(pipelined_adm.carryover_net_benefit(0.90, bytes, 0.0) < 0.0);
+        assert!(pipelined_adm.carryover_net_benefit(1.0, bytes, 0.0).abs() < 1e-12);
+        // Genuine free slack (`DraftWindow >= t_bw`) still admits cleanly.
+        assert!((pipelined_adm.carryover_net_benefit(0.25, bytes, 1.0e-3) - 0.25).abs() < 1e-12);
 
         // During genuine free slack (e.g. MTP DraftWindow >= t_bw), w_net = 0 -> net_benefit == p.
         assert!((adm.carryover_net_benefit(0.25, bytes, 1.0e-3) - 0.25).abs() < 1e-12);
 
-        // Even on a 3-tier link-bound / compute-bound host (`!binds`),
+        // On a 3-tier link-bound / compute-bound host (`!drive_binds`),
         // active-step carryover (`free_slack == 0.0`) still prices drive waste
-        // so low-p reads (0.09) are rejected instead of flooding NVMe/DDR5,
+        // against `s_demand` (`t_bw / s_demand = 0.50`, exact break-even `p* = 1/3`),
         // while genuine DraftWindow slack (`free_slack >= t_bw`) sets w_net = 0.
         let link_bound = Terms { compute: 0.050, drive: 0.015, link: 0.080, cpu: 0.0, memory: 0.0 };
         let non_binding_adm = PathAdmission::drive(link_bound, Some(line), Some(1.00e-3), None);
         assert!(!non_binding_adm.binds());
         assert!(non_binding_adm.carryover_net_benefit(0.09, bytes, 0.0) < 0.0);
+        assert!(non_binding_adm.carryover_net_benefit(1.0 / 3.0, bytes, 0.0).abs() < 1e-12);
         assert!((non_binding_adm.carryover_net_benefit(0.60, bytes, 0.0) - 0.40).abs() < 1e-12);
         assert!((non_binding_adm.carryover_net_benefit(0.25, bytes, 1.0e-3) - 0.25).abs() < 1e-12);
     }
@@ -2029,5 +2158,141 @@ mod tests {
         );
         // Without verify_stall/verify_resident, Verify(1) would falsely look cheaper than Front(0).
         assert_eq!(reg.pass(), Form::Front(0));
+    }
+
+    #[test]
+    fn front_stall_saved_by_row_covers_resident_cold_measured_plateau_and_partial() {
+        let depths = 6;
+        let misses = 100.0;
+        let path_secs = 0.0014; // 140 ms plain miss burst
+        let drive = PathTerm {
+            seconds: path_secs,
+            wasted: Waste {
+                front: vec![Some(0.0); depths],
+                verify: vec![Some(0.0); depths],
+            },
+        };
+        let base_reg = Regime {
+            resident: vec![0.030, 0.032, 0.034, 0.036, 0.038, 0.040],
+            verify_resident: Vec::new(),
+            needed: NeededByForm::both(vec![Needed::Executed(misses); depths]),
+            stand: Some(0.9),
+            accepts: vec![Some(0.9); depths - 1],
+            stall: Some(path_secs),
+            front_stall: Vec::new(),
+            verify_stall: Vec::new(),
+            overhead: None,
+            paths: vec![drive],
+            routes: VerifyRoutes::default(),
+        };
+
+        // 1. Resident (no paths) -> empty Vec.
+        let resident = Regime { paths: Vec::new(), ..base_reg.clone() };
+        assert!(resident.front_stall_saved_by_row(4).is_empty());
+        assert_eq!(resident.front_stall_saved_per_row(), 0.0);
+
+        // 2. Unmeasured `front_stall` -> geometric diminishing curve scaled by `routes.fresh`.
+        let cold = base_reg.front_stall_saved_by_row(4);
+        assert_eq!(cold.len(), 4);
+        assert!((cold[0] - 0.140).abs() < 1e-12);
+        assert!((cold[1] - 0.070).abs() < 1e-12);
+        assert!((cold[2] - 0.035).abs() < 1e-12);
+        assert!((cold[3] - 0.0175).abs() < 1e-12);
+
+        let cold_routed = Regime {
+            routes: VerifyRoutes { layers: 48, fresh: vec![8.0, 6.0, 4.0] },
+            ..base_reg.clone()
+        }
+        .front_stall_saved_by_row(3);
+        assert!((cold_routed[0] - 0.140).abs() < 1e-12);
+        assert!((cold_routed[1] - 0.070 * 0.75).abs() < 1e-12);
+        assert!((cold_routed[2] - 0.035 * 0.50).abs() < 1e-12);
+
+        // 3. Measured progressive `front_stall` (`140 -> 90 -> 50 -> 30 ms`) + placement foresight:
+        let progressive = Regime {
+            needed: NeededByForm {
+                front: vec![
+                    Needed::Executed(100.0),
+                    Needed::Executed(96.0), // -4 misses -> +5.6 ms placement saving
+                    Needed::Executed(94.0), // -2 misses -> +2.8 ms placement saving
+                    Needed::Executed(94.0),
+                    Needed::Executed(94.0),
+                    Needed::Executed(94.0),
+                ],
+                verify: vec![Needed::Executed(100.0); depths],
+            },
+            front_stall: vec![
+                Some(0.090 / misses),
+                Some(0.050 / misses),
+                Some(0.030 / misses),
+                None,
+                None,
+            ],
+            ..base_reg.clone()
+        };
+        let prog = progressive.front_stall_saved_by_row(5);
+        assert!((prog[0] - (0.050 + 4.0 * path_secs)).abs() < 1e-12);
+        assert!((prog[1] - (0.040 + 2.0 * path_secs)).abs() < 1e-12);
+        assert!((prog[2] - 0.020).abs() < 1e-12);
+        // Unexplored depths 4 and 5 split remaining 30 ms geometrically (`15 ms`, `7.5 ms`).
+        assert!((prog[3] - 0.015).abs() < 1e-12);
+        assert!((prog[4] - 0.0075).abs() < 1e-12);
+        // Stall component sum = 50 + 40 + 20 + 15 + 7.5 = 132.5 ms <= 140 ms (never double-counts!).
+        let stall_only_sum = (prog[0] - 4.0 * path_secs) + (prog[1] - 2.0 * path_secs) + prog[2] + prog[3] + prog[4];
+        assert!(stall_only_sum <= 0.140 + 1e-12);
+
+        // 4. Measured plateau (`front_stall[0] == front_stall[4]`): deeper depths get 0.0.
+        let plateau = Regime {
+            front_stall: vec![Some(0.130 / misses), None, None, None, Some(0.130 / misses)],
+            ..base_reg
+        };
+        let plat = plateau.front_stall_saved_by_row(5);
+        assert!((plat[0] - 0.010).abs() < 1e-12);
+        for &s in &plat[1..] {
+            assert!(s.abs() < 1e-12, "measured plateau must not hallucinate deeper savings: {plat:?}");
+        }
+    }
+
+    #[test]
+    fn cold_front_waste_per_row_charges_only_expected_fall_fraction() {
+        let misses = 100.0;
+        let path_secs = 0.0014; // 140 ms full single-token miss burst
+        let reg = Regime {
+            resident: vec![0.020; 6],
+            verify_resident: vec![0.020; 6],
+            needed: NeededByForm::both(vec![Needed::Executed(misses); 6]),
+            stand: Some(0.95),
+            accepts: vec![Some(0.95), Some(0.90), None, None, None],
+            stall: Some(path_secs),
+            front_stall: Vec::new(),
+            verify_stall: Vec::new(),
+            overhead: None,
+            paths: vec![PathTerm {
+                seconds: path_secs,
+                wasted: Waste {
+                    front: vec![None; 6],
+                    verify: vec![None; 6],
+                },
+            }],
+            routes: VerifyRoutes::default(),
+        };
+        // Depth 1: S_1 = 0.95 -> fall_prob = 0.05 -> waste = 0.05 * 0.140 = 7 ms (strictly < 0.95 * 140 ms credit).
+        let w1 = reg.front_waste_per_row(1);
+        assert!((w1 - 0.05 * misses * path_secs).abs() < 1e-12, "got {w1}");
+        // Depth 2: S_2 = 0.95 * 0.90 = 0.855 -> fall_prob = 0.145.
+        let w2 = reg.front_waste_per_row(2);
+        assert!((w2 - (1.0 - 0.855) * misses * path_secs).abs() < 1e-12, "got {w2}");
+        // Measured waste overrides cold fallback cleanly.
+        let measured_reg = Regime {
+            paths: vec![PathTerm {
+                seconds: path_secs,
+                wasted: Waste {
+                    front: vec![None, Some(0.012), None, None, None, None],
+                    verify: vec![None; 6],
+                },
+            }],
+            ..reg
+        };
+        assert!((measured_reg.front_waste_per_row(1) - 0.012).abs() < 1e-12);
     }
 }

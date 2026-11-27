@@ -168,7 +168,7 @@ struct RingSlot {
 }
 
 impl RingSlot {
-    fn new(experts: usize, front_slots: usize) -> Self {
+    fn new(experts: usize) -> Self {
         Self {
             occupied: false,
             decode_idx: 0,
@@ -177,9 +177,15 @@ impl RingSlot {
             front_depth: 0,
             fell_recorded: false,
             route: vec![SampleEntry::default(); experts],
-            front_rows: (0..front_slots).map(|_| vec![SampleEntry::default(); experts]).collect(),
+            front_rows: Vec::new(),
             history: vec![SampleEntry::default(); experts],
             picked: vec![false; experts],
+        }
+    }
+
+    fn ensure_front_rows(&mut self, needed: usize, experts: usize) {
+        while self.front_rows.len() < needed {
+            self.front_rows.push(vec![SampleEntry::default(); experts]);
         }
     }
 
@@ -259,32 +265,47 @@ impl FarDecile {
 pub(super) struct Calibration {
     experts: usize,
     active: usize,
-    /// `route[form][lead - 1]` for `form ∈ {Front, Verify, Prompt}`, `lead ∈ 1..=DEPTHS`.
-    route: [[CellTable; DEPTHS]; FORMS],
-    /// `fell[lead - 1]` for `lead ∈ 1..=DEPTHS`; `None` on shadow calibration.
-    fell: Option<[CellTable; DEPTHS]>,
-    /// History-order table counted at lead `DEPTHS + 1`, rolling on the group's
-    /// tier-0 epoch: calibrates `p_∞` across layers so short-`h` 1-shot spikes
-    /// calibrate down to their true far-horizon reuse rate while stationary
-    /// Zipf experts retain theirs.
-    history: CellTable,
-    /// Instrument table for §8 A1, counted at lead `⌈τ_0 / ā⌉`; `None` on
-    /// shadow calibration.
-    far: Option<CellTable>,
-    /// Fixed-length ring of the latest `DEPTHS + 1` decode steps.
+    /// Active maximum decode depth (`1..=DEPTHS`), sizing the sample ring and
+    /// carried lead tables to the load's actual decode width.
+    max_depths: usize,
+    /// Whether this calibration tracks `fell` and `far` tables (live = true,
+    /// shadow = false).
+    is_live: bool,
+    /// Initial epoch for lazily created [`CellTable`]s.
+    initial_epoch: u64,
+    /// `route[form][lead - 1]` for `form ∈ {Front, Verify, Prompt}`,
+    /// `lead ∈ 1..=max_depths`; lazily allocated on first count.
+    route: [[Option<Box<CellTable>>; DEPTHS]; FORMS],
+    /// `fell[lead - 1]` for `lead ∈ 1..=max_depths`; lazily allocated on first
+    /// count on live calibration only.
+    fell: [Option<Box<CellTable>>; DEPTHS],
+    /// History-order table counted at lead `max_depths + 1`, rolling on the
+    /// group's tier-0 epoch; lazily allocated on first count.
+    history: Option<Box<CellTable>>,
+    /// Instrument table for §8 A1, counted at lead `⌈τ_0 / ā⌉`; lazily
+    /// allocated on first count on live calibration only.
+    far: Option<Box<CellTable>>,
+    /// Decode sample ring of length at most `max_depths + 1`, grown lazily as
+    /// decode steps arrive.
     ring: Vec<RingSlot>,
-    /// Next slot index in `ring` (`decode_count % (DEPTHS + 1)`).
+    /// Next slot index in `ring` (`decode_count % (max_depths + 1)`).
     decode_count: u64,
-    /// Pending `fell` samples (fixed length `DEPTHS` on live, 0 on shadow).
+    /// Pending `fell` samples (grown lazily up to `max_depths` on live, empty
+    /// on shadow).
     pending_fell: Vec<FellSlot>,
     /// Pending prompt sample (`prompt_base = Some(decode_count_at_log)`) for
-    /// settling `route[Form::Prompt]` across leads `1..=DEPTHS`.
+    /// settling `route[Form::Prompt]` across leads `1..=max_depths`.
     prompt_base: Option<u64>,
     /// Decode step count when `prompt_sample` was last logged (decoupled from
     /// `prompt_base` so `history_prob` blends each new request's prompt union
     /// smoothly over `⌈E / k⌉` decode steps after prefill).
     prompt_logged_at: Option<u64>,
     prompt_sample: Vec<SampleEntry>,
+    /// Cumulative row-weighted per-expert prompt priors summed across all
+    /// prefill chunks of the current request (`prompt_logged_at == Some(decode_count)`),
+    /// divided by `prompt_rows` so multi-chunk prefills weight chunks by token count.
+    prompt_accum: Vec<f64>,
+    prompt_rows: f64,
     /// Single pending `far` slot (bounded, constant in τ).
     far_target: Option<u64>,
     far_sample: Vec<SampleEntry>,
@@ -294,10 +315,11 @@ pub(super) struct Calibration {
     latest_decode_step: Option<Step>,
     /// Latest step metadata (may be `Form::Prompt` before the first decode step).
     latest_meta: Option<LatestMeta>,
-    /// Cached route samples for `latest_meta` (`0..=front_depth`, pre-allocated
-    /// to `DEPTHS` rows × `experts`).
+    /// Cached route samples for `latest_meta` (`0..=front_depth`, starts with
+    /// row 0 and grows lazily up to `front_depth + 1`).
     latest_rows: Vec<Vec<SampleEntry>>,
-    /// Whether each row `0..=front_depth` of `latest_meta` chose each expert.
+    /// Whether each row `0..=front_depth` of `latest_meta` chose each expert
+    /// (starts with row 0 and grows lazily up to `front_depth + 1`).
     latest_chose: Vec<Vec<bool>>,
     /// Cached history sample for §8 A1 diagnostics (`history` and `far`).
     latest_history: Vec<SampleEntry>,
@@ -309,57 +331,96 @@ pub(super) struct Calibration {
 }
 
 impl Calibration {
-    /// Live layer calibration (with `fell` and `far` tables).
+    /// Live layer calibration (with `fell` and `far` tables) at full `DEPTHS`.
     pub(super) fn new(experts: usize, active: usize, epoch: u64) -> Self {
-        Self::build(experts, active, epoch, false)
+        Self::with_depth(experts, active, epoch, DEPTHS)
+    }
+
+    /// Live layer calibration sized to `max_depths` (`1..=DEPTHS`).
+    pub(super) fn with_depth(experts: usize, active: usize, epoch: u64, max_depths: usize) -> Self {
+        Self::build(experts, active, epoch, max_depths, false)
     }
 
     /// Shadow layer calibration (omits `fell` and `far`, since shadows run on
     /// true routes and never print A1; keeps `history` so shadows rank with the
     /// exact same calibrated `p_∞` as live).
+    #[cfg_attr(not(test), allow(dead_code))]
     pub(super) fn new_shadow(experts: usize, active: usize, epoch: u64) -> Self {
-        Self::build(experts, active, epoch, true)
+        Self::new_shadow_with_depth(experts, active, epoch, DEPTHS)
     }
 
-    fn build(experts: usize, active: usize, epoch: u64, is_shadow: bool) -> Self {
+    /// Shadow layer calibration sized to `max_depths` (`1..=DEPTHS`).
+    pub(super) fn new_shadow_with_depth(
+        experts: usize,
+        active: usize,
+        epoch: u64,
+        max_depths: usize,
+    ) -> Self {
+        Self::build(experts, active, epoch, max_depths, true)
+    }
+
+    fn build(
+        experts: usize,
+        active: usize,
+        epoch: u64,
+        max_depths: usize,
+        is_shadow: bool,
+    ) -> Self {
         assert!(experts > 0 && experts <= usize::from(u16::MAX), "experts {experts} must fit u16 (1..={})", u16::MAX);
         assert!(active > 0 && active <= experts, "active {active} must be in 1..={experts}");
-        let route = std::array::from_fn(|_| std::array::from_fn(|_| CellTable::new(experts, epoch)));
-        let fell = (!is_shadow).then(|| std::array::from_fn(|_| CellTable::new(experts, epoch)));
-        let history = CellTable::new(experts, epoch);
-        let far = (!is_shadow).then(|| CellTable::new(experts, epoch));
-        // Row 0 is stored in `RingSlot::route`; row `d` is never `f - 1`.
-        // So `front_rows` stores depths `1..DEPTHS - 1` (at most `DEPTHS - 2` rows).
-        let front_slots = if is_shadow { 0 } else { DEPTHS.saturating_sub(2) };
-        let ring = (0..DEPTHS + 1).map(|_| RingSlot::new(experts, front_slots)).collect();
-        let pending_fell = if is_shadow { Vec::new() } else { (0..DEPTHS).map(|_| FellSlot::new(experts)).collect() };
+        let max_depths = max_depths.clamp(1, DEPTHS);
         let cold_prior = (active as f64 / experts as f64) as f32;
         let cold_entry = SampleEntry { lo: 0, hi: experts as u16, prior: cold_prior };
         Self {
             experts,
             active,
-            route,
-            fell,
-            history,
-            far,
-            ring,
+            max_depths,
+            is_live: !is_shadow,
+            initial_epoch: epoch,
+            route: std::array::from_fn(|_| std::array::from_fn(|_| None)),
+            fell: std::array::from_fn(|_| None),
+            history: None,
+            far: None,
+            ring: Vec::new(),
             decode_count: 0,
-            pending_fell,
+            pending_fell: Vec::new(),
             prompt_base: None,
             prompt_logged_at: None,
             prompt_sample: vec![SampleEntry::default(); experts],
+            prompt_accum: vec![0.0; experts],
+            prompt_rows: 0.0,
             far_target: None,
             far_sample: if is_shadow { Vec::new() } else { vec![SampleEntry::default(); experts] },
             last_read: vec![None; experts],
             latest_decode_step: None,
             latest_meta: None,
-            latest_rows: (0..DEPTHS).map(|_| vec![SampleEntry::default(); experts]).collect(),
-            latest_chose: (0..DEPTHS).map(|_| vec![false; experts]).collect(),
+            latest_rows: vec![vec![SampleEntry::default(); experts]],
+            latest_chose: vec![vec![false; experts]],
             latest_history: vec![cold_entry; experts],
             scratch_order: (0..experts).collect(),
             scratch_keys: vec![0.0; experts],
             scratch_picked: vec![false; experts],
             scratch_class: vec![(0.0, 0); experts],
+        }
+    }
+
+    /// Maximum carried route lead for `form`: `Form::Verify` steps span a
+    /// multi-token verify burst (`ā ≈ 5..6`), so only lead 1 has 1-step Markov
+    /// autocorrelation; leads `g >= 2` lie `10..90` tokens ahead where
+    /// calibrated long-term history (`p_∞`) governs reuse.
+    #[inline]
+    fn route_horizon(&self, form: Form) -> usize {
+        match form {
+            Form::Verify => 1,
+            Form::Front | Form::Prompt => self.max_depths,
+        }
+    }
+
+    #[inline]
+    fn table_prob(table: &Option<Box<CellTable>>, lo: usize, hi: usize, prior: f64, epoch: u64) -> f64 {
+        match table {
+            Some(table) => table.prob(lo, hi, prior, epoch),
+            None => prior.clamp(0.0, 1.0),
         }
     }
 
@@ -401,6 +462,9 @@ impl Calibration {
         self.decode_count += 1;
 
         // 2. Settle pending samples against this step's outcome.
+        let max_depths = self.max_depths;
+        let experts = self.experts;
+        let initial_epoch = self.initial_epoch;
         let mut route_dirty = [[false; DEPTHS]; FORMS];
         let mut fell_dirty = [false; DEPTHS];
         let mut history_dirty = false;
@@ -410,19 +474,25 @@ impl Calibration {
                 continue;
             }
             let lead = (decode_idx - slot.decode_idx) as usize;
-            if (1..=DEPTHS).contains(&lead) {
+            let horizon = self.route_horizon(slot.form);
+            if (1..=horizon).contains(&lead) {
                 let fi = slot.form.index();
+                let table = self.route[fi][lead - 1]
+                    .get_or_insert_with(|| Box::new(CellTable::new(experts, initial_epoch)));
                 count_sample(
-                    &mut self.route[fi][lead - 1],
+                    table,
                     &slot.route,
                     &self.scratch_picked,
                     &mut self.scratch_class,
                     epoch,
                 );
                 route_dirty[fi][lead - 1] = true;
-            } else if lead == DEPTHS + 1 {
+            } else if lead == horizon + 1 {
+                let table = self
+                    .history
+                    .get_or_insert_with(|| Box::new(CellTable::new(experts, initial_epoch)));
                 count_sample(
-                    &mut self.history,
+                    table,
                     &slot.history,
                     &self.scratch_picked,
                     &mut self.scratch_class,
@@ -432,14 +502,16 @@ impl Calibration {
             }
         }
 
-        if let Some(fell) = &mut self.fell {
+        if self.is_live {
             for slot in &mut self.pending_fell {
                 if let Some(origin) = slot.origin_idx {
                     if decode_idx > origin {
                         let lead = (decode_idx - origin) as usize;
-                        if lead <= DEPTHS {
+                        if lead <= max_depths {
+                            let table = self.fell[lead - 1]
+                                .get_or_insert_with(|| Box::new(CellTable::new(experts, initial_epoch)));
                             count_sample(
-                                &mut fell[lead - 1],
+                                table,
                                 &slot.sample,
                                 &self.scratch_picked,
                                 &mut self.scratch_class,
@@ -447,7 +519,7 @@ impl Calibration {
                             );
                             fell_dirty[lead - 1] = true;
                         }
-                        if lead >= DEPTHS {
+                        if lead >= max_depths {
                             slot.origin_idx = None;
                         }
                     }
@@ -457,10 +529,12 @@ impl Calibration {
 
         if let Some(base) = self.prompt_base {
             let lead = (decode_idx + 1 - base) as usize;
-            if (1..=DEPTHS).contains(&lead) {
+            if (1..=max_depths).contains(&lead) {
                 let fi = Form::Prompt.index();
+                let table = self.route[fi][lead - 1]
+                    .get_or_insert_with(|| Box::new(CellTable::new(experts, initial_epoch)));
                 count_sample(
-                    &mut self.route[fi][lead - 1],
+                    table,
                     &self.prompt_sample,
                     &self.scratch_picked,
                     &mut self.scratch_class,
@@ -468,36 +542,41 @@ impl Calibration {
                 );
                 route_dirty[fi][lead - 1] = true;
             }
-            if lead >= DEPTHS {
+            if lead >= max_depths {
                 self.prompt_base = None;
             }
         }
 
-        if let (Some(far), Some(target)) = (&mut self.far, self.far_target) {
-            if decode_idx >= target {
-                count_sample(far, &self.far_sample, &self.scratch_picked, &mut self.scratch_class, epoch);
-                far.rebuild_prefix(epoch);
-                self.far_target = None;
+        if self.is_live {
+            if let Some(target) = self.far_target {
+                if decode_idx >= target {
+                    let far = self
+                        .far
+                        .get_or_insert_with(|| Box::new(CellTable::new(experts, initial_epoch)));
+                    count_sample(far, &self.far_sample, &self.scratch_picked, &mut self.scratch_class, epoch);
+                    far.rebuild_prefix(epoch);
+                    self.far_target = None;
+                }
             }
         }
 
         // Rebuild prefix sums for every table that received a count this step.
         for fi in 0..FORMS {
-            for g in 0..DEPTHS {
+            for g in 0..max_depths {
                 if route_dirty[fi][g] {
-                    self.route[fi][g].rebuild_prefix(epoch);
+                    self.route[fi][g].as_mut().expect("dirty route table exists").rebuild_prefix(epoch);
                 }
             }
         }
-        if let Some(fell) = &mut self.fell {
-            for g in 0..DEPTHS {
+        if self.is_live {
+            for g in 0..max_depths {
                 if fell_dirty[g] {
-                    fell[g].rebuild_prefix(epoch);
+                    self.fell[g].as_mut().expect("dirty fell table exists").rebuild_prefix(epoch);
                 }
             }
         }
         if history_dirty {
-            self.history.rebuild_prefix(epoch);
+            self.history.as_mut().expect("dirty history table exists").rebuild_prefix(epoch);
         }
 
         // 3. Update last_read.
@@ -517,7 +596,7 @@ impl Calibration {
             &mut self.scratch_order,
             &mut self.latest_history,
         );
-        if self.far.is_some() && self.far_target.is_none() {
+        if self.is_live && self.far_target.is_none() {
             if let Some(lead) = tau_steps {
                 if lead >= 1 {
                     self.far_sample.copy_from_slice(&self.latest_history);
@@ -535,6 +614,10 @@ impl Calibration {
             }
             _ => 0,
         };
+        while self.latest_rows.len() <= front_depth {
+            self.latest_rows.push(vec![SampleEntry::default(); self.experts]);
+            self.latest_chose.push(vec![false; self.experts]);
+        }
 
         match (form, rows) {
             (Form::Verify, Some(rows)) => {
@@ -596,8 +679,12 @@ impl Calibration {
             (Form::Prompt, _) => unreachable!(),
         }
 
-        // 6. Write this step into the fixed-length sample ring.
-        let slot_idx = (decode_idx as usize) % (DEPTHS + 1);
+        // 6. Write this step into the lazily-grown sample ring (at most `max_depths + 1` slots).
+        let ring_cap = self.max_depths + 1;
+        let slot_idx = (decode_idx as usize) % ring_cap;
+        while self.ring.len() <= slot_idx {
+            self.ring.push(RingSlot::new(self.experts));
+        }
         let slot = &mut self.ring[slot_idx];
         slot.occupied = true;
         slot.decode_idx = decode_idx;
@@ -608,8 +695,9 @@ impl Calibration {
         slot.route.copy_from_slice(&self.latest_rows[0]);
         slot.history.copy_from_slice(&self.latest_history);
         slot.picked.copy_from_slice(&self.scratch_picked);
-        if !slot.front_rows.is_empty() && front_depth > 1 {
+        if self.is_live && front_depth > 1 {
             // Rows 1..front_depth may become row `f - 1` if row `f` falls.
+            slot.ensure_front_rows(front_depth - 1, self.experts);
             for j in 1..front_depth {
                 slot.front_rows[j - 1].copy_from_slice(&self.latest_rows[j]);
             }
@@ -619,13 +707,29 @@ impl Calibration {
         self.latest_meta = Some(LatestMeta { step, form, front_depth });
     }
 
-    /// Log a prompt union sample: counted against the next `DEPTHS` decode steps
-    /// in `route[Form::Prompt]` and blended into `history_prob` for the next
-    /// `⌈E / k⌉` decode steps. Never an outcome and never enters decode history.
+    /// Log a prompt union sample: accumulated across all prefill chunks of a
+    /// request (reset cleanly when `decode_count` advances for a new request),
+    /// counted against the next `DEPTHS` decode steps in `route[Form::Prompt]`
+    /// and blended into `history_prob` for the next `⌈E / k⌉` decode steps.
+    /// Never an outcome and never enters decode history.
     pub(super) fn log_prompt(&mut self, step: Step, union: &Rows, history: &History, layer: usize) {
         assert_eq!(union.experts, self.experts, "prompt union experts {} != layer experts {}", union.experts, self.experts);
         self.set_active(union.choices);
-        extract_rows_keys(union, None, None, &mut self.scratch_keys, Some(self.latest_chose[0].as_mut_slice()));
+        if self.prompt_logged_at != Some(self.decode_count) {
+            self.prompt_accum.fill(0.0);
+            self.prompt_rows = 0.0;
+            self.latest_chose[0].fill(false);
+        }
+        extract_rows_keys(union, None, None, &mut self.scratch_keys, Some(self.scratch_picked.as_mut_slice()));
+        let chunk_rows = union.depths.len().max(1) as f64;
+        self.prompt_rows += chunk_rows;
+        let denom = self.prompt_rows;
+        for e in 0..self.experts {
+            self.prompt_accum[e] += chunk_rows * f64::from(self.scratch_keys[e]);
+            self.latest_chose[0][e] |= self.scratch_picked[e];
+            let avg = (self.prompt_accum[e] / denom).clamp(0.0, 1.0) as f32;
+            self.scratch_keys[e] = if avg == 0.0 { 0.0 } else { avg };
+        }
         build_route_sample(
             self.experts,
             &self.scratch_keys,
@@ -659,16 +763,15 @@ impl Calibration {
             (1..DEPTHS).contains(&first_fell_row),
             "first_fell_row {first_fell_row} out of range 1..{DEPTHS}"
         );
-        if self.fell.is_none() {
+        if !self.is_live {
             return;
         }
         let Some(ring_pos) = self.ring.iter().position(|s| s.occupied && s.step == step) else {
             return;
         };
-        if self.ring[ring_pos].fell_recorded {
+        if self.ring[ring_pos].fell_recorded || self.ring[ring_pos].form != Form::Front {
             return;
         }
-        assert_eq!(self.ring[ring_pos].form, Form::Front, "record_fell on non-front step {step}");
         assert!(
             first_fell_row <= self.ring[ring_pos].front_depth,
             "first_fell_row {first_fell_row} exceeds step {step}'s front_depth {}",
@@ -677,21 +780,25 @@ impl Calibration {
         self.ring[ring_pos].fell_recorded = true;
 
         let origin_idx = self.ring[ring_pos].decode_idx + (first_fell_row - 1) as u64;
+        let max_depths = self.max_depths;
+        let experts = self.experts;
+        let initial_epoch = self.initial_epoch;
 
-        // Place row `f - 1`'s sample into a free slot of `pending_fell` (or reuse
-        // an expired slot; at most `DEPTHS` active origins can exist within lead `DEPTHS`).
-        let fell_slot_idx = self
-            .pending_fell
-            .iter()
-            .position(|s| s.origin_idx.is_none())
-            .unwrap_or_else(|| {
-                self.pending_fell
-                    .iter()
-                    .enumerate()
-                    .min_by_key(|(_, s)| s.origin_idx.unwrap_or(0))
-                    .map(|(i, _)| i)
-                    .expect("pending_fell has DEPTHS slots")
-            });
+        // Place row `f - 1`'s sample into a free slot of `pending_fell` (grow
+        // lazily up to `max_depths`, or reuse the oldest slot once full).
+        let fell_slot_idx = if let Some(idx) = self.pending_fell.iter().position(|s| s.origin_idx.is_none()) {
+            idx
+        } else if self.pending_fell.len() < max_depths {
+            self.pending_fell.push(FellSlot::new(experts));
+            self.pending_fell.len() - 1
+        } else {
+            self.pending_fell
+                .iter()
+                .enumerate()
+                .min_by_key(|(_, s)| s.origin_idx.unwrap_or(0))
+                .map(|(i, _)| i)
+                .expect("pending_fell has at least 1 slot")
+        };
 
         if first_fell_row == 1 {
             self.pending_fell[fell_slot_idx].sample.copy_from_slice(&self.ring[ring_pos].route);
@@ -703,27 +810,29 @@ impl Calibration {
 
         // Retroactively settle any outcomes already logged in `ring` after `origin_idx`.
         let mut fell_dirty = [false; DEPTHS];
-        if let Some(fell) = &mut self.fell {
+        {
             let sample = &self.pending_fell[fell_slot_idx].sample;
             for other in &self.ring {
                 if !other.occupied || other.decode_idx <= origin_idx {
                     continue;
                 }
                 let lead = (other.decode_idx - origin_idx) as usize;
-                if lead <= DEPTHS {
-                    count_sample(&mut fell[lead - 1], sample, &other.picked, &mut self.scratch_class, epoch);
+                if lead <= max_depths {
+                    let table = self.fell[lead - 1]
+                        .get_or_insert_with(|| Box::new(CellTable::new(experts, initial_epoch)));
+                    count_sample(table, sample, &other.picked, &mut self.scratch_class, epoch);
                     fell_dirty[lead - 1] = true;
                 }
             }
-            for g in 0..DEPTHS {
+            for g in 0..max_depths {
                 if fell_dirty[g] {
-                    fell[g].rebuild_prefix(epoch);
+                    self.fell[g].as_mut().expect("dirty fell table exists").rebuild_prefix(epoch);
                 }
             }
         }
 
-        // Keep active if more leads `<= DEPTHS` remain in the future.
-        self.pending_fell[fell_slot_idx].origin_idx = if self.decode_count <= origin_idx + DEPTHS as u64 {
+        // Keep active if more leads `<= max_depths` remain in the future.
+        self.pending_fell[fell_slot_idx].origin_idx = if self.decode_count <= origin_idx + max_depths as u64 {
             Some(origin_idx)
         } else {
             None
@@ -735,14 +844,22 @@ impl Calibration {
     pub(super) fn route_prob(&self, form: Form, lead: usize, row: usize, expert: usize, epoch: u64) -> f64 {
         assert!((1..=DEPTHS).contains(&lead), "route lead {lead} out of range 1..={DEPTHS}");
         assert!(expert < self.experts, "expert {expert} out of range 0..{}", self.experts);
+        if lead > self.route_horizon(form) {
+            return self.history_prob(expert, epoch);
+        }
         match self.latest_meta {
             Some(meta) => {
                 assert!(row <= meta.front_depth, "row {row} exceeds latest front_depth {}", meta.front_depth);
                 let entry = self.latest_rows[row][expert];
-                self.route[form.index()][lead - 1].prob(
+                let prior = match form {
+                    Form::Verify => self.history_prob(expert, epoch),
+                    Form::Front | Form::Prompt => f64::from(entry.prior),
+                };
+                Self::table_prob(
+                    &self.route[form.index()][lead - 1],
                     usize::from(entry.lo),
                     usize::from(entry.hi),
-                    f64::from(entry.prior),
+                    prior,
                     epoch,
                 )
             }
@@ -756,20 +873,29 @@ impl Calibration {
     pub(super) fn fell_prob(&self, lead: usize, row: usize, expert: usize, epoch: u64) -> f64 {
         assert!((1..=DEPTHS).contains(&lead), "fell lead {lead} out of range 1..={DEPTHS}");
         assert!(expert < self.experts, "expert {expert} out of range 0..{}", self.experts);
-        let fell = self.fell.as_ref().expect("fell_prob called on shadow calibration");
+        assert!(self.is_live, "fell_prob called on shadow calibration");
+        if lead > self.max_depths {
+            return self.history_prob(expert, epoch);
+        }
         match self.latest_meta {
             Some(meta) => {
                 assert!(row <= meta.front_depth, "row {row} exceeds latest front_depth {}", meta.front_depth);
                 let entry = self.latest_rows[row][expert];
-                fell[lead - 1].prob(usize::from(entry.lo), usize::from(entry.hi), f64::from(entry.prior), epoch)
+                Self::table_prob(
+                    &self.fell[lead - 1],
+                    usize::from(entry.lo),
+                    usize::from(entry.hi),
+                    f64::from(entry.prior),
+                    epoch,
+                )
             }
             None => self.history_prob(expert, epoch),
         }
     }
 
-    /// Calibrated history probability `p_∞` for `expert` (past lead `DEPTHS`),
+    /// Calibrated history probability `p_∞` for `expert` (past lead `max_depths`),
     /// in O(1): routes through the epoch-rolling `history` [`CellTable`]
-    /// (settled at lead `DEPTHS + 1`) with the live measured half-life's
+    /// (settled at lead `max_depths + 1`) with the live measured half-life's
     /// decayed rate (blended with any recent prompt union) as its Laplace prior.
     /// Cold start returns exact `k / E`; short-`h` 1-shot spikes calibrate down
     /// to their true far-horizon reuse rate while stationary Zipf experts retain
@@ -777,7 +903,13 @@ impl Calibration {
     pub(super) fn history_prob(&self, expert: usize, epoch: u64) -> f64 {
         assert!(expert < self.experts, "expert {expert} out of range 0..{}", self.experts);
         let entry = self.latest_history[expert];
-        self.history.prob(usize::from(entry.lo), usize::from(entry.hi), f64::from(entry.prior), epoch)
+        Self::table_prob(
+            &self.history,
+            usize::from(entry.lo),
+            usize::from(entry.hi),
+            f64::from(entry.prior),
+            epoch,
+        )
     }
 
     /// Calibrated prompt-table probabilities at leads `1..=DEPTHS` for each
@@ -813,7 +945,7 @@ impl Calibration {
                 let lo = usize::from(entry.lo);
                 let hi = usize::from(entry.hi);
                 let prior = f64::from(entry.prior);
-                std::array::from_fn(|g| prompt_tables[g].prob(lo, hi, prior, epoch))
+                std::array::from_fn(|g| Self::table_prob(&prompt_tables[g], lo, hi, prior, epoch))
             })
             .collect()
     }
@@ -931,7 +1063,7 @@ impl Calibration {
         layer: usize,
     ) -> ShadowPrepared<'a> {
         let experts = self.experts;
-        let known = truths.len().min(DEPTHS - 1);
+        let known = truths.len().min(self.max_depths.saturating_sub(1));
         for (idx, truth) in truths.iter().take(known).enumerate() {
             let chose = &mut scratch.truth_chosen[idx][..experts];
             chose.fill(false);
@@ -972,22 +1104,23 @@ impl Calibration {
         }
     }
 
-    /// Exact memory footprint in bytes (constant in run length and τ).
+    /// Exact memory footprint in bytes (bounded in `(experts, max_depths)`,
+    /// constant in run length and τ after warmup).
     pub(super) fn bytes(&self) -> u64 {
         let mut total = size_of::<Self>() as u64;
         for form in &self.route {
-            for table in form {
-                total += table.bytes();
+            for table in form.iter().flatten() {
+                total += size_of::<CellTable>() as u64 + table.bytes();
             }
         }
-        if let Some(fell) = &self.fell {
-            for table in fell {
-                total += table.bytes();
-            }
+        for table in self.fell.iter().flatten() {
+            total += size_of::<CellTable>() as u64 + table.bytes();
         }
-        total += self.history.bytes();
+        if let Some(history) = &self.history {
+            total += size_of::<CellTable>() as u64 + history.bytes();
+        }
         if let Some(far) = &self.far {
-            total += far.bytes();
+            total += size_of::<CellTable>() as u64 + far.bytes();
         }
         total += (self.ring.capacity() * size_of::<RingSlot>()) as u64;
         for slot in &self.ring {
@@ -998,6 +1131,7 @@ impl Calibration {
             total += slot.bytes();
         }
         total += (self.prompt_sample.capacity() * size_of::<SampleEntry>()) as u64;
+        total += (self.prompt_accum.capacity() * size_of::<f64>()) as u64;
         total += (self.far_sample.capacity() * size_of::<SampleEntry>()) as u64;
         total += (self.last_read.capacity() * size_of::<Option<Step>>()) as u64;
         total += (self.latest_rows.capacity() * size_of::<Vec<SampleEntry>>()) as u64;
@@ -1020,15 +1154,22 @@ impl Calibration {
     /// `⌈τ_0 / ā⌉`) for the §8 A1 diagnostic printout; `None` on shadow
     /// calibration.
     pub(super) fn far_deciles(&self, epoch: u64) -> Option<[FarDecile; 10]> {
-        let history = &self.history;
-        let far = self.far.as_ref()?;
+        if !self.is_live {
+            return None;
+        }
         let mut out = [FarDecile::default(); 10];
         for (d, slot) in out.iter_mut().enumerate() {
             let lo = d * self.experts / 10;
             let hi = (d + 1) * self.experts / 10;
             if lo < hi {
-                let (h_seen, h_used) = history.pooled(lo, hi, epoch);
-                let (f_seen, f_used) = far.pooled(lo, hi, epoch);
+                let (h_seen, h_used) = self
+                    .history
+                    .as_deref()
+                    .map_or((0.0, 0.0), |table| table.pooled(lo, hi, epoch));
+                let (f_seen, f_used) = self
+                    .far
+                    .as_deref()
+                    .map_or((0.0, 0.0), |table| table.pooled(lo, hi, epoch));
                 *slot = FarDecile {
                     history_seen: h_seen,
                     history_used: h_used,
@@ -1050,8 +1191,8 @@ pub(super) struct ShadowScratch {
 }
 
 impl ShadowScratch {
-    pub(super) fn new(max_experts: usize) -> Self {
-        let slots = DEPTHS.saturating_sub(1);
+    pub(super) fn new(max_experts: usize, max_depths: usize) -> Self {
+        let slots = max_depths.saturating_sub(1);
         Self {
             truth_chosen: (0..slots).map(|_| vec![false; max_experts]).collect(),
             truth_samples: (0..slots).map(|_| vec![SampleEntry::default(); max_experts]).collect(),
@@ -1095,9 +1236,28 @@ impl ShadowPrepared<'_> {
             if g <= eff {
                 f64::from(u8::from(self.scratch.truth_chosen[g - 1][expert]))
             } else if eff == 0 {
-                if self.has_latest {
+                if self.has_latest && g <= self.cal.route_horizon(self.form) {
                     let entry = self.cal.latest_rows[0][expert];
-                    self.cal.route[self.form.index()][g - 1].prob(
+                    let prior = match self.form {
+                        Form::Verify => p_inf,
+                        Form::Front | Form::Prompt => f64::from(entry.prior),
+                    };
+                    Calibration::table_prob(
+                        &self.cal.route[self.form.index()][g - 1],
+                        usize::from(entry.lo),
+                        usize::from(entry.hi),
+                        prior,
+                        self.epoch,
+                    )
+                } else {
+                    p_inf
+                }
+            } else {
+                let lead = g - eff;
+                if lead <= self.cal.max_depths {
+                    let entry = self.scratch.truth_samples[eff - 1][expert];
+                    Calibration::table_prob(
+                        &self.cal.route[Form::Front.index()][lead - 1],
                         usize::from(entry.lo),
                         usize::from(entry.hi),
                         f64::from(entry.prior),
@@ -1106,15 +1266,6 @@ impl ShadowPrepared<'_> {
                 } else {
                     p_inf
                 }
-            } else {
-                let entry = self.scratch.truth_samples[eff - 1][expert];
-                let lead = g - eff;
-                self.cal.route[Form::Front.index()][lead - 1].prob(
-                    usize::from(entry.lo),
-                    usize::from(entry.hi),
-                    f64::from(entry.prior),
-                    self.epoch,
-                )
             }
         });
         let expected = super::expected_from(probs, p_inf, horizon, a_bar, None);
@@ -1227,11 +1378,13 @@ fn build_route_sample(
 }
 
 /// History probability `p_∞` for `expert`:
-/// - Cold start before the first decode step (`history.rate` is `None`):
+/// - Cold start before the first decode step with no prompt logged:
 ///   exact `k / E`.
-/// - Warmup after a logged prompt union (`decode_count - logged_at < ⌈E / k⌉`):
-///   smooth linear blend from `prompt_prior` into `history.rate` over one
-///   expert-space pass `⌈E / k⌉` with zero tuned constants.
+/// - Warmup after a logged prompt union (`decode_count - logged_at < ⌈E / k⌉`,
+///   including before decode step 1 when `history.rate` is `None`):
+///   smooth linear blend from `prompt_prior` into `history.rate` (or `k / E`
+///   before decode step 1) over one expert-space pass `⌈E / k⌉` with zero
+///   tuned constants.
 /// - Steady state (`decode_count - logged_at >= ⌈E / k⌉`, or no prompt logged):
 ///   `history.rate(layer, expert)` directly from the live measured half-life.
 #[inline]
@@ -1244,16 +1397,25 @@ fn history_prior(
     active: usize,
     experts: usize,
 ) -> f64 {
-    let Some(rate) = history.rate(layer, expert) else {
-        return active as f64 / experts as f64;
-    };
+    let uniform = active as f64 / experts as f64;
+    let rate = history.rate(layer, expert).unwrap_or(uniform);
     if let Some((prompt, logged_at)) = prompt_sample {
         let min_steps = experts.div_ceil(active) as u64;
         let steps_since_prompt = decode_count.saturating_sub(logged_at);
         if steps_since_prompt < min_steps {
             let w = (min_steps - steps_since_prompt) as f64 / min_steps as f64;
             let p = f64::from(prompt[expert].prior);
-            return ((1.0 - w) * rate + w * p).clamp(0.0, 1.0);
+            // When a prior request already populated `history` (`logged_at > 0`),
+            // discount its stale rate toward uniform `k / E` during the fresh
+            // prompt's `⌈E / k⌉` warmup so a disjoint request trusts its own
+            // `prompt_prior` cleanly just like request 1.
+            let effective_rate = if logged_at > 0 {
+                let s = steps_since_prompt as f64 / min_steps as f64;
+                s * rate + (1.0 - s) * uniform
+            } else {
+                rate
+            };
+            return ((1.0 - w) * effective_rate + w * p).clamp(0.0, 1.0);
         }
     }
     rate
@@ -1384,12 +1546,18 @@ mod tests {
 
         // Every position 0..4 received seen = 1.0 on route[Front][0].
         for cell in 0..4 {
-            let (seen, _) = cal.route[Form::Front.index()][0].pooled(cell, cell + 1, 0);
+            let (seen, _) = cal.route[Form::Front.index()][0]
+                .as_deref()
+                .expect("route[Front][0] allocated")
+                .pooled(cell, cell + 1, 0);
             approx(seen, 1.0, 1e-6);
         }
         // In tie class [2, 4), 1 of 2 members was chosen -> each cell in 2..4 gets used = 0.5.
         for cell in 2..4 {
-            let (_, used) = cal.route[Form::Front.index()][0].pooled(cell, cell + 1, 0);
+            let (_, used) = cal.route[Form::Front.index()][0]
+                .as_deref()
+                .expect("route[Front][0] allocated")
+                .pooled(cell, cell + 1, 0);
             approx(used, 0.5, 1e-6);
         }
 
@@ -1404,7 +1572,10 @@ mod tests {
         // Step 2 chooses expert 3: every cell 0..4 gets seen=1, used=0.25.
         decode(&mut tied, &mut tied_hist, 2, Form::Front, None, &[3], 0, None);
         for cell in 0..4 {
-            let (seen, used) = tied.route[Form::Front.index()][0].pooled(cell, cell + 1, 0);
+            let (seen, used) = tied.route[Form::Front.index()][0]
+                .as_deref()
+                .expect("route[Front][0] allocated")
+                .pooled(cell, cell + 1, 0);
             approx(seen, 1.0, 1e-6);
             approx(used, 0.25, 1e-6);
         }
@@ -1435,8 +1606,10 @@ mod tests {
         approx(cal.route_prob(Form::Front, 1, 0, 1, 0), 1.0 / 6.0, 1e-6);
         approx(cal.route_prob(Form::Front, 2, 0, 1, 0), 1.0, 1e-6);
 
-        // Verify form has its own separate route tables (uncounted so far -> reads prior alone).
-        approx(cal.route_prob(Form::Verify, 1, 0, 1, 0), 1.0, 1e-6);
+        // Verify form has its own separate route table at lead 1 (uncounted so far -> reads p_inf prior)
+        // and falls back directly to history_prob at leads >= 2.
+        approx(cal.route_prob(Form::Verify, 1, 0, 1, 0), cal.history_prob(1, 0), 1e-6);
+        approx(cal.route_prob(Form::Verify, 2, 0, 1, 0), cal.history_prob(1, 0), 1e-6);
 
         // Prompt union is counted into route[Prompt] against the next L decode steps,
         // and never enters decode history or counts as an outcome.
@@ -1446,7 +1619,10 @@ mod tests {
         assert_eq!(history.rate(0, 2), Some(0.0), "prompt never enters decode history");
         // Next decode step chooses expert 2 -> settles prompt lead 1.
         decode(&mut cal, &mut history, 8, Form::Front, None, &[2], 0, None);
-        let (seen, _) = cal.route[Form::Prompt.index()][0].pooled(0, 4, 0);
+        let (seen, _) = cal.route[Form::Prompt.index()][0]
+            .as_deref()
+            .expect("route[Prompt][0] allocated")
+            .pooled(0, 4, 0);
         approx(seen, 4.0, 1e-6);
 
         // `fell` is counted only on front steps whose row fell.
@@ -1458,7 +1634,10 @@ mod tests {
         cal.record_fell(9, 1, 0);
         // Step 10 settles fell lead 1 (row 0 of step 9, where expert 0 was top-ranked).
         decode(&mut cal, &mut history, 10, Form::Front, None, &[3], 0, None);
-        let (fell_seen, _) = cal.fell.as_ref().unwrap()[0].pooled(0, 4, 0);
+        let (fell_seen, _) = cal.fell[0]
+            .as_deref()
+            .expect("fell[0] allocated")
+            .pooled(0, 4, 0);
         approx(fell_seen, 4.0, 1e-6);
     }
 
@@ -1488,9 +1667,10 @@ mod tests {
         assert!(p0 > 0.0 && p0 <= 1.0, "expert 0 rate {p0} out of (0, 1]");
         assert!(p0 > p_cold, "frequent expert 0 ({p0}) must outrank less frequent expert 2 ({p_cold})");
 
-        // Memory footprint is strictly constant across 10,000 steps.
+        // Memory footprint starts minimal before warmup and stays strictly
+        // constant across 10,000 steps once exercised tables are allocated.
         let bytes_after_20 = cal.bytes() + history.bytes();
-        assert_eq!(bytes_initial, bytes_after_20);
+        assert!(bytes_initial <= bytes_after_20);
         for step in 21..=10_000u64 {
             decode(&mut cal, &mut history, step, Form::Front, None, &[0, 2], 0, Some(4));
         }
@@ -1556,5 +1736,69 @@ mod tests {
             decode(&mut cal, &mut history, step, Form::Front, None, &tail, 0, None);
         }
         approx(cal.history_prob(0, 0), cal.history_prob(2, 0), 1e-12);
+    }
+
+    #[test]
+    fn multi_chunk_log_prompt_accumulates_and_history_prior_uses_prompt_before_decode() {
+        let experts = 8;
+        let mut cal = Calibration::new(experts, 2, 0);
+        let mut history = History::new(&[experts]);
+
+        // Log 3 prefill chunks before any decode step (`decode_count == 0`).
+        // Chunk 1 routes expert 0, chunk 2 routes expert 1, chunk 3 routes expert 2.
+        cal.log_prompt(1, &Rows::union(experts, 2, &[(0, 10)]), &history, 0);
+        cal.log_prompt(2, &Rows::union(experts, 2, &[(1, 10)]), &history, 0);
+        cal.log_prompt(3, &Rows::union(experts, 2, &[(2, 10)]), &history, 0);
+
+        // Before decode step 1 (`history.rate` is None), `history_prob` must reflect
+        // ALL 3 accumulated prompt chunks rather than returning flat `k / E` or
+        // dropping chunks 1 and 2.
+        let p_unseen = cal.history_prob(7, 0);
+        for &e in &[0usize, 1, 2] {
+            let p = cal.history_prob(e, 0);
+            assert!(
+                p > p_unseen,
+                "accumulated prompt expert {e} ({p}) must strictly exceed unseen expert 7 ({p_unseen}) before decode step 1"
+            );
+        }
+        approx(cal.history_prob(0, 0), cal.history_prob(1, 0), 1e-6);
+        approx(cal.history_prob(1, 0), cal.history_prob(2, 0), 1e-6);
+
+        // After a decode step advances `decode_count`, a new request's prompt resets
+        // accumulation cleanly so the new prompt's expert 5 outranks old prompt expert 0.
+        decode(&mut cal, &mut history, 4, Form::Front, None, &[6, 7], 0, None);
+        cal.log_prompt(5, &Rows::union(experts, 2, &[(5, 10)]), &history, 0);
+        assert!(
+            cal.history_prob(5, 0) > cal.history_prob(0, 0),
+            "new request's prompt expert 5 ({}) must outrank previous request's expert 0 ({})",
+            cal.history_prob(5, 0),
+            cal.history_prob(0, 0),
+        );
+    }
+
+    #[test]
+    fn disjoint_request_discounts_stale_prior_history_during_prompt_warmup() {
+        let experts = 8;
+        let active = 2;
+        let mut cal = Calibration::new(experts, active, 0);
+        let mut history = History::new(&[experts]);
+
+        // Request 1: 20 decode steps heavily routing experts 0 and 1.
+        for step in 1..=20u64 {
+            decode(&mut cal, &mut history, step, Form::Front, None, &[0, 1], 0, None);
+        }
+        assert!(history.rate(0, 0).unwrap() > 0.8);
+
+        // Request 2: disjoint prompt routing experts 4 and 5 (`logged_at = 20 > 0`).
+        cal.log_prompt(21, &Rows::union(experts, active, &[(4, 10), (5, 10)]), &history, 0);
+        // Step 1 of req 2 (`steps_since_prompt = 1 < min_steps = 4`): stale req 1 expert 0
+        // is discounted toward uniform `k/E = 0.25`, so req 2's prompt expert 4 strongly leads.
+        decode(&mut cal, &mut history, 22, Form::Front, None, &[4, 5], 0, None);
+        let p_req2_prompt = cal.history_prob(4, 0);
+        let p_req1_stale = cal.history_prob(0, 0);
+        assert!(
+            p_req2_prompt > p_req1_stale * 2.0,
+            "req 2 prompt expert 4 ({p_req2_prompt}) must strongly outrank stale req 1 expert 0 ({p_req1_stale}) during warmup"
+        );
     }
 }

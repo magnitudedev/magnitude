@@ -7,13 +7,15 @@
 mod open;
 #[cfg(test)]
 pub(in crate::experts) use open::group_tier_reserve;
+mod reactor;
+pub(crate) use reactor::{DecodeReactor, UnifiedDecodeFlight};
 mod resize;
 mod served;
 pub(crate) mod derived;
 pub(crate) mod cache;
 
 pub use super::watcher::{GroupLend, ExpertCosts, GroupCost, GroupLayer, LayerTimeline, Span, StepTimeline, LayerCost, LayerExperts, RecordedRoutes, RoutedStep, StepCost, STEP_TRACE};
-pub(crate) use super::watcher::{ExpertStep, Recording, StepFailure, StepRoute};
+pub(crate) use super::watcher::{ExpertStep, PromptRoutes, Recording, StepFailure, StepRoute};
 use super::watcher::{PlacedLayerWords, PlacedWords, Watcher};
 use super::Words;
 use crate::planning::{BankLayout, BankPart, BankTier, ExpertBankPlan, PlacedAllocations, RecordTensors, RoutedTensor};
@@ -117,6 +119,10 @@ pub(crate) struct ExpertBank {
     /// Each layer's staging pool of each routed tensor
     /// (`ExpertBankPlan::staging_pools`).
     pool_of: Vec<RecordTensors<usize>>,
+    /// Per-pool typed strided views (`Tensor::carried_records`) over the
+    /// unified byte-typed staging buffers (`layout.staging`), populated on
+    /// `Placer::Bank` where device kernels bind `BankPart::Staging`.
+    staging_views: Vec<Tensor>,
     /// Each staging pool's conveyor views.
     conveyors: Vec<PoolConveyor>,
     /// Each layer's scratch tier view of each routed tensor: its form's view
@@ -184,6 +190,9 @@ pub(crate) struct ExpertBank {
     /// Unified copy-engine-first `ExpertTransport` owning `LinkMover` hint
     /// tracking, M7 on-demand decode DMA, and producer-enqueued prefill DMA.
     transport: Arc<super::transport::ExpertTransport>,
+    /// Dedicated async decode DMA reactor (present when M7 decode DMA is active),
+    /// eliminating per-layer synchronous host barriers from `StepSubmitter`.
+    decode_reactor: Option<DecodeReactor>,
 }
 
 /// The threads a bank's resizes keep busy beside decode: the host tier's
@@ -263,65 +272,70 @@ impl ExpertBank {
         &self.transport
     }
 
-    /// Whether M7 on-demand async DMA decode landing (`DecodeFront -> DMA -> DecodeBack`)
-    /// is active for streamed layer `layer` over `rows` rows (gated by
-    /// `ExpertTransport`'s row-aware adaptive physics threshold so narrow
-    /// `M = 1..2` cooldowns never strand wide `M >= 4` verify bursts).
-    pub(crate) fn dma_decode_active(&self, layer: usize, rows: u64) -> bool {
+    /// Prepare one unified zero-switch 3-tier streamed decode flight for
+    /// streamed layer `layer` over `rows` rows.
+    pub(crate) fn prepare_unified_decode_flight(
+        &self,
+        layer: usize,
+        sequence: u64,
+        rows: u64,
+        mask_hits_back: bool,
+    ) -> Result<UnifiedDecodeFlight, String> {
         let group = self.plan.layers()[layer].group;
-        self.transport.should_split_decode(group, layer, rows)
+        let reactor = self
+            .decode_reactor
+            .as_ref()
+            .ok_or_else(|| "prepare_unified_decode_flight called without async DecodeReactor".to_string())?;
+        reactor.prepare_flight(group, layer, sequence, rows, mask_hits_back)
     }
 
-    /// Acquire a free generation-leased [`super::transport::DecodeSourceLease`]
-    /// for one decode-split flight (`DecodeFront -> DecodeHits ∥ DMA -> DecodeBack`).
-    pub(crate) fn acquire_decode_source_slot(&self) -> Result<super::transport::DecodeSourceLease, String> {
-        self.transport.acquire_decode_source_slot()
+    /// Commit a reserved unified decode flight after its GPU submission
+    /// succeeded, publishing `submitted_gen` to `DecodeReactor`.
+    pub(crate) fn commit_unified_decode_flight(&self, gen: u64) {
+        if let Some(reactor) = &self.decode_reactor {
+            reactor.commit_flight(gen);
+        }
     }
 
-    /// Contiguous `[SOURCE_ROWS, rows, K] i32` view of the leased flight's
-    /// pinned host-mapped `front_sources` buffer (written by `DecodeFront`,
-    /// read-only by `DecodeHits` and host).
-    pub(crate) fn decode_front_sources_view(
-        &self,
-        token: super::transport::DecodeSourceToken,
-        rows: u64,
-    ) -> Result<Tensor, String> {
-        self.transport.decode_front_sources_view(token, rows)
+    /// Cancel a reserved unified decode flight that was never submitted to the
+    /// GPU (bind/attach/flush failure) so refusal drain never hangs.
+    pub(crate) fn cancel_unified_decode_flight(&self, gen: u64) {
+        if let Some(reactor) = &self.decode_reactor {
+            reactor.cancel_flight(gen);
+        }
     }
 
-    /// Contiguous `[SOURCE_ROWS, rows, K] i32` view of the leased flight's
-    /// pinned host-mapped `back_sources` buffer (written by host in
-    /// `land_decode_misses`, read-only by `DecodeBack`).
-    pub(crate) fn decode_back_sources_view(
-        &self,
-        token: super::transport::DecodeSourceToken,
-        rows: u64,
-    ) -> Result<Tensor, String> {
-        self.transport.decode_back_sources_view(token, rows)
+    /// Drain all unified decode flights through `target_gen` in the async
+    /// [`DecodeReactor`], retiring `pending_landings` with `gen <= target_gen`,
+    /// and return any reactor error.
+    pub(crate) fn drain_decode_reactor_through(&self, target_gen: u64) -> Result<(), String> {
+        match &self.decode_reactor {
+            Some(reactor) => reactor.drain_through(target_gen),
+            None => Ok(()),
+        }
     }
 
-    /// Inspect pinned `front_sources` written by `DecodeFront` for streamed
-    /// layer `layer` over `rows` rows, populate disjoint `back_sources`
-    /// (masking VRAM hits to `-1` when `split_hits` is true), pin resident
-    /// VRAM hit records, join any in-flight or landed `LinkMover`
-    /// (`Promote`/`Stage`) or demand transfers, and batch-DMA remaining fresh
-    /// host-tier misses into unified `Record::DemandLanding` slots via
-    /// [`super::transport::ExpertTransport`].
-    ///
-    /// Any completed `prev_landings` from earlier layer(s) of this bank have
-    /// their transport leases released outside `Residency` and their slot
-    /// settlement folded into the first demand-claim lock hold (or settled in
-    /// one deferred lock hold if this layer makes no claims).
-    #[allow(clippy::too_many_arguments)]
-    pub(crate) fn land_decode_misses(
+    /// Drain all unified decode flights in the async [`DecodeReactor`], retire
+    /// all pending landings, and return any reactor error.
+    pub(crate) fn drain_decode_reactor(&self) -> Result<(), String> {
+        match &self.decode_reactor {
+            Some(reactor) => reactor.drain(),
+            None => Ok(()),
+        }
+    }
+
+    /// Service residual `HOST_WORK` (`FILE_PENDING`, `CPU_SITED`, or `CE_DMA`
+    /// overflow) for one unified streamed decode flight after `routed_stage_host`
+    /// published `ready_ring[slot]`, preserving any SM-staged `back_sources`
+    /// entries (`>= stage_base`).
+    pub(crate) fn land_decode_misses_unified(
         &self,
         layer: usize,
         sequence: u64,
         rows: u64,
         prev_landings: Vec<super::transport::DecodeLanding>,
-        split_hits: bool,
-        source_lease: super::transport::DecodeSourceLease,
-        hits_submitted: bool,
+        mask_hits_back: bool,
+        slot_idx: usize,
     ) -> Result<super::transport::DecodeLanding, String> {
         let group = self.plan.layers()[layer].group;
         let shared = self.watcher.shared();
@@ -336,14 +350,16 @@ impl ExpertBank {
                 })
             })
             .collect();
-        let result = self.transport.land_decode_misses(
+        let result = self.transport.land_decode_misses_slot(
             group,
             layer,
             sequence,
             rows,
-            split_hits,
-            source_lease,
-            hits_submitted,
+            mask_hits_back,
+            slot_idx,
+            None,
+            true,
+            true,
             |g, tier_records, replenish_target| {
                 let finishes = std::mem::take(&mut prev_to_finish);
                 self.watcher.claim_demand_slots(
@@ -354,6 +370,7 @@ impl ExpertBank {
                     tier_records,
                     &finishes,
                     replenish_target,
+                    None,
                 )
             },
             |aborted| self.watcher.abort_demand_slots(aborted),
@@ -363,24 +380,8 @@ impl ExpertBank {
                 shared.record_dma_call(fast_path, experts, bytes, overflow);
             },
         );
-        match &result {
-            Ok(landing) => {
-                // Observe strictly ONE deduplicated demand sample per `(step, layer)`
-                // (including true all-hit `0`, excluding maintenance replenish calls,
-                // and aggregated across Phase A + all Phase B chunks), folding any
-                // unconsumed `prev_to_finish` into the same deferred residency lock.
-                self.watcher.finish_and_observe_decode_demand(
-                    group,
-                    landing.census.gpu_host_misses as usize,
-                    rows as usize,
-                    &prev_to_finish,
-                );
-            }
-            Err(_) => {
-                if !prev_to_finish.is_empty() {
-                    self.watcher.finish_demand_landings_batch(&prev_to_finish, false);
-                }
-            }
+        if !prev_to_finish.is_empty() {
+            self.watcher.finish_demand_landings_batch(&prev_to_finish, false);
         }
         result
     }
@@ -400,34 +401,6 @@ impl ExpertBank {
     pub(crate) fn complete_decode_landing_deferred(&self, landing: super::transport::DecodeLanding) {
         let (layer, sequence, demand_slots) = landing.release_transport(&self.transport);
         self.watcher.finish_demand_landings(layer, sequence, &demand_slots, false);
-    }
-
-    /// Explicitly abort a decode DMA landing whose `DecodeBack` was never
-    /// submitted: waits on the copy stream outside all residency locks,
-    /// returns only proven-completed slots to `Directory`, and quarantines
-    /// uncertain/timed-out slots (and `source_lease` / `hit_leases` if
-    /// `DecodeHits` was submitted and `!hits_retired`).
-    pub(crate) fn abort_decode_landing(
-        &self,
-        landing: super::transport::DecodeLanding,
-        reason: &str,
-        hits_retired: bool,
-    ) {
-        let transport = &self.transport;
-        landing.abort(
-            reason,
-            hits_retired,
-            |value| transport.wait_decode_dma(value, std::time::Duration::from_secs(5)),
-            &mut |aborted| self.watcher.abort_demand_slots(aborted),
-        );
-    }
-
-    /// Quarantine a decode DMA landing whose GPU completion is unproven (e.g.
-    /// `wait_all` failed after `DecodeBack` submission) without freeing any
-    /// uncertain slots back to `Directory`.
-    pub(crate) fn quarantine_decode_landing(&self, landing: super::transport::DecodeLanding, reason: &str) {
-        landing.quarantine(reason);
-        self.transport.drain_deferred_syncs();
     }
 
     /// Whether prefill fills copy host-tier experts into VRAM scratch via
@@ -563,9 +536,9 @@ impl ExpertBank {
         }
         Ok(ExpertResidency {
             experts: self.plan.widest(),
-            slots,
-            floor: self.counts.floor(),
-            ceiling: self.plan.ceiling,
+            slots: self.plan.target_vram_slots(slots),
+            floor: self.plan.target_vram_slots(self.counts.floor()),
+            ceiling: self.plan.target_vram_slots(self.plan.ceiling),
             stores: stores.into_iter().map(|((_, store), bytes)| (store, bytes)).collect(),
             disk_bytes,
             // A tier at its slots, up to its ceiling.
@@ -880,7 +853,9 @@ impl ExpertBank {
             BankPart::Scratch { kind } => self.scratch[index].get(kind).ok_or_else(|| format!("bank part {part:?} of a record without it"))?,
             BankPart::Staging { kind } => {
                 let pool = self.pool_of[index].get(kind).ok_or_else(|| format!("bank part {part:?} of a record without it"))?;
-                &self.layout.staging[*pool]
+                self.staging_views
+                    .get(*pool)
+                    .ok_or_else(|| format!("bank part {part:?} of a bank without device staging views"))?
             }
             BankPart::LandingList => &layer.landing,
             BankPart::LandGrid => &layer.land_grid,

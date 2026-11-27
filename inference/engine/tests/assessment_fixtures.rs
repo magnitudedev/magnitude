@@ -1040,7 +1040,7 @@ fn a_streamed_fit_is_priced_on_the_bank_it_was_held_in() {
     };
     let whole_weights = whole.draft().load().clone().unbanked().weight_bytes().unwrap();
     let mut setup = room(whole_weights - 4_000_000_000);
-    let figures = StreamedFigures { read: ReadLine::new(1e-4, 1. / 3e9).unwrap(), memory: None, site: None, convert: 1. / 100e9, transfer: None };
+    let figures = StreamedFigures { read: ReadLine::new(1e-4, 1. / 3e9).unwrap(), memory: None, site: None, convert: 1. / 100e9, transfer: None, routed_zerocopy: None };
     setup.measurements = Measurements::Measured { costs: Arc::new(synthetic::costs()), records: Arc::default(), pending: false, streamed: Priced::Measured(figures) };
     let assessed = finish_model_assessment(&prepared, &setup, &[], PROFILE_SEQUENCES).unwrap_or_else(|error| panic!("operational failure: {error}"));
     let ModelAssessment::Assessed { execution: ModelExecution::Fits { residency: ModelResidency::Streamed { performance, floor_performance, .. }, .. }, .. } = assessed else {
@@ -1297,12 +1297,12 @@ fn a_fits_placement_is_where_its_weights_are_held() {
         panic!("Qwen3.6 35B fits the RTX 3090 streamed");
     };
     let bank = fit.bank.as_ref().unwrap();
-    let tier_only = experts(&fit, &|experts, slots| bank.host_slots.min(experts).saturating_sub(slots));
+    let tier_only = experts(&fit, &|experts, slots| bank.host_slots.min(experts.saturating_sub(slots)));
     assert!(tier_only > 0, "host RAM holds experts the bank does not");
     // Beside a discrete device the table's rows are cached in host RAM or looked up on disk.
     let cached = if fit.placement.lookup_disk_bytes == 0 { rows } else { assert_eq!(fit.placement.lookup_disk_bytes, rows); 0 };
     assert_eq!(fit.placement.host_bytes, tier_only + cached);
-    assert_eq!(fit.placement.disk_bytes, experts(&fit, &|experts, _| experts - bank.slots.max(bank.host_slots).min(experts)));
+    assert_eq!(fit.placement.disk_bytes, experts(&fit, &|experts, slots| experts - (slots + bank.host_slots).min(experts)));
     assert_eq!(total(&fit), total(&resident));
 }
 

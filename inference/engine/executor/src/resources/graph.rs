@@ -19,6 +19,9 @@ pub struct NativeGraphPool {
     domain: ResourceDomainId,
     family: NativeGraphFamily,
     arena: NativeExecutionArena,
+    /// Workspace bytes required of `arena` by every slot created in this pool
+    /// (startup floor workspace for target; full family workspace otherwise).
+    workspace_bytes: u64,
     upload_regions: Vec<u64>,
     /// Upload regions of one activation.
     activation_bytes: u64,
@@ -68,6 +71,7 @@ impl NativeGraphPool {
             domain,
             family: family.clone(),
             arena: arena.clone(),
+            workspace_bytes: charge.workspace_bytes,
             upload_regions: charge.upload_regions.clone(),
             activation_bytes: charge.activation_bytes(),
             output_bytes: charge.output_bytes,
@@ -131,7 +135,7 @@ impl NativeGraphPool {
         while self.allocated.activations < slots.activations {
             let slot = self
                 .family
-                .new_slot_in(charges, &self.arena, &self.upload_regions)
+                .new_slot_in_bounded(charges, &self.arena, &self.upload_regions, self.workspace_bytes)
                 .map_err(super::AllocationError::Workflow)?;
             self.workspace.borrow_mut().push(Claimed::under_class(slot));
             self.allocated.activations += 1;

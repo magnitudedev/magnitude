@@ -9,6 +9,20 @@ use std::time::{Duration, Instant};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, Weak};
 
+/// Whether a banked stored table is small enough (`< 2%` of the bank's live
+/// resident capacity) that shrinking it while bank slots remain above floor
+/// trades negligible memory for `MTLSharedEvent` / miss-service cuts on every
+/// decode step. Single owner shared by [`TableReclaimer`] and [`ServedBank`].
+fn keep_table_resident(bank: &ExpertBank, ceiling: u64) -> Result<bool, String> {
+    let slots = bank.slots();
+    if slots <= bank.floor(BankTier::Bank) {
+        return Ok(false);
+    }
+    let table_charge = crate::planning::BankTable::charge(bank.plan.table_block(), bank.plan.table_granule(), ceiling)?;
+    let bank_charge = bank.counts.resident_charge(slots);
+    Ok(table_charge.saturating_mul(50) < bank_charge)
+}
+
 /// Synchronous [`CacheReclaimer`] for one auxiliary stored table
 /// (`BankHolding::Table`), holding only weak references so it never extends
 /// the bank's or table's lifetime. Reclaimed before `CacheKind::Bank` via the
@@ -18,6 +32,7 @@ struct TableReclaimer {
     table: Weak<crate::stored_table::StoredTable>,
     index: usize,
     floor: u64,
+    ceiling: u64,
 }
 
 impl CacheReclaimer for TableReclaimer {
@@ -28,6 +43,9 @@ impl CacheReclaimer for TableReclaimer {
         let (Some(bank), Some(table)) = (self.bank.upgrade(), self.table.upgrade()) else {
             return Err(ReclaimError::AtFloor);
         };
+        if keep_table_resident(&bank, self.ceiling).map_err(ReclaimError::Invariant)? {
+            return Err(ReclaimError::AtFloor);
+        }
         // Wait for a gap between flights before mutating a stored table's slabs.
         if !bank.watcher.shared().in_gap() {
             return Err(ReclaimError::AtFloor);
@@ -115,6 +133,7 @@ impl ServedBank {
                     table: Arc::downgrade(&held.table),
                     index,
                     floor: held.plan.floor,
+                    ceiling: held.plan.records.get(),
                 }),
             );
         }
@@ -245,12 +264,22 @@ impl ServedBank {
         crate::planning::releasing(from, self.floor(holding), bytes, |at| self.holding_charge(holding, at))
     }
 
-    /// `holding`'s floor, in slots or records.
+    /// `holding`'s floor, in slots or records. Small stored tables (`< 2%` of
+    /// live bank capacity while bank slots remain above floor) hold their full
+    /// ceiling so they are never shrunk below 100% residency.
     fn floor(&self, holding: BankHolding) -> u64 {
         match holding {
             BankHolding::Experts => self.bank.floor(BankTier::Bank),
             BankHolding::Host => self.bank.floor(BankTier::Host),
-            BankHolding::Table { table } => self.tables[table].plan.floor,
+            BankHolding::Table { table } => {
+                let held = &self.tables[table];
+                let ceiling = held.plan.records.get();
+                if keep_table_resident(&self.bank, ceiling).unwrap_or(false) {
+                    ceiling
+                } else {
+                    held.plan.floor
+                }
+            }
         }
     }
 
@@ -341,6 +370,41 @@ impl ServedBank {
         wake.complete();
         Ok(BankStep::Begun(tier))
     }
+
+    fn storage_overlap_per_layer(&self, read_line: Option<magnitude_cost_model::ReadLine>) -> Vec<f64> {
+        let read_s_per_byte = read_line.map_or(0.0, |line| line.seconds_per_byte());
+        let raw_slots = self.bank.slots();
+        let host = self.bank.host_slots().max(self.bank.plan.host_slots);
+        self.bank
+            .plan
+            .layers()
+            .iter()
+            .map(|layer| {
+                let total = layer.experts;
+                if read_s_per_byte <= 0.0 || total == 0 || layer.selected == 0 {
+                    return 0.0;
+                }
+                let vram = self.bank.plan.layer_vram_slots(layer, raw_slots).min(total);
+                let total_held = vram.saturating_add(host).min(total);
+                if total_held >= total {
+                    return 0.0;
+                }
+                // Conditional Zipf probability P(storage miss | VRAM miss) from the
+                // canonical MissModel: reflects actual NVMe-backed miss share instead
+                // of naive linear (E - V - H)/E, which severely overstates overlap
+                // when Host RAM covers the hot working set (e.g. 386/512 -> >94% hit).
+                let model = magnitude_cost_model::MissModel::of(total, layer.selected.min(total));
+                let vram_miss = model.misses(vram as f64 / total as f64);
+                let storage_miss = model.misses(total_held as f64 / total as f64);
+                let storage_given_vram_miss = if vram_miss > 0.0 {
+                    (storage_miss / vram_miss).clamp(0.0, 1.0)
+                } else {
+                    0.0
+                };
+                storage_given_vram_miss * read_s_per_byte
+            })
+            .collect()
+    }
 }
 
 impl ElasticBank for ServedBank {
@@ -366,11 +430,11 @@ impl ElasticBank for ServedBank {
 
     fn price(&self, lines: Option<std::sync::Arc<[magnitude_cost_model::ExpertLines]>>, pass: Option<magnitude_cost_model::ExpertPass>, prices: Option<magnitude_cost_model::LaunchPrices>) {
         let shared = self.bank.watcher.shared();
-        shared.price(lines, pass, prices);
-        if let (Some(copy), Some(priced)) = (shared.copy(), shared.priced()) {
-            let launch = shared.launch_prices();
-            self.bank.transport.update_decode_dma_crossover(&copy, &priced, launch.as_ref());
+        if let (Some(copy), Some(priced)) = (shared.copy(), lines.as_deref()) {
+            let launch = prices.clone().or_else(|| shared.launch_prices());
+            self.bank.transport.update_tier_service_prices(&copy, priced, launch.as_ref());
         }
+        shared.price(lines, pass, prices);
     }
 
     fn value(&self, value: crate::memory::ledger::Value) {
@@ -420,11 +484,11 @@ impl ElasticBank for ServedBank {
         // launches it with.
         self.bank.tier_copy_blocks(costs.blocks).map_err(DomainError::invariant)?;
         let shared = self.bank.watcher.shared();
-        shared.price_copy(costs);
         if let Some(priced) = shared.priced() {
             let launch = shared.launch_prices();
-            self.bank.transport.update_decode_dma_crossover(costs, &priced, launch.as_ref());
+            self.bank.transport.update_tier_service_prices(costs, &priced, launch.as_ref());
         }
+        shared.price_copy(costs);
         Ok(())
     }
 
@@ -529,9 +593,10 @@ impl ElasticBank for ServedBank {
         if let Some((host, ceiling)) = self.bank.host_tier() {
             assert!(plan.tiered(), "invariant violated: a host tier beside a plan without its pool");
             let host_block = plan.tier_block_bytes(BankTier::Host);
+            let sat = counts.host_saturation_at(at);
             let mut bound = match self.bank.host_backing() {
                 true => host,
-                false => ceiling,
+                false => ceiling.min(sat),
             };
             if let Some(device_room) = self.bank.device.host_tier_headroom() {
                 bound = bound.min(self.device_host_slots(ceiling, device_room).max(host));
@@ -541,7 +606,7 @@ impl ElasticBank for ServedBank {
                 tier: self.storage(BankHolding::Host)?,
                 at: host,
                 owed: owed_for(BankHolding::Host, self.above_floor(BankHolding::Host, host)?, host_block),
-                shape: BankShape::host(host_block, ceiling, bound, plan.whole_at(self.bank.slots())),
+                shape: BankShape::host(host_block, ceiling, bound, plan.whole_at(at)),
                 charge: Box::new(move |slots| counts.host_charge(slots)),
             });
         }
@@ -551,12 +616,13 @@ impl ElasticBank for ServedBank {
             let (block, granule) = (plan.table_block(), plan.table_granule());
             let records = held.table.records();
             let ceiling = held.plan.records.get();
+            let table_floor = self.floor(holding);
             targets.push(HoldingTarget {
                 holding,
                 tier,
                 at: records,
                 owed: owed_for(holding, self.above_floor(holding, records)?, block.held),
-                shape: BankShape::new(block.held, held.plan.floor, ceiling, ceiling),
+                shape: BankShape::new(block.held, table_floor, ceiling, ceiling),
                 charge: Box::new(move |records| {
                     crate::planning::BankTable::charge(block, granule, records).expect("invariant violated: a table's charge fits u64 at every size it holds")
                 }),

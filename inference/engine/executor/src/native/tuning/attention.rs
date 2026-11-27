@@ -1992,7 +1992,7 @@ mod tests {
         assert_eq!(dense.bindings(), affine.bindings());
         let prefill = AttentionPrefillTuning(decode_mix(), PrefillRows::Decode);
         assert_eq!(rows(prefill.points(DECODE_LIMITS)), [1, 2, 4, 8].into());
-        assert_eq!(prefill.bindings(), format!("A=bf16,M=1..9;codec={:?}", prefill.0.codec));
+        assert_eq!(prefill.bindings(), format!("A=bf16,M=1..{};codec={:?}", VERIFY_ROWS + 1, prefill.0.codec));
         let visible = AttentionPrefillTuning(decode_mix(), PrefillRows::Prefill);
         for logical in 1..=VERIFY_ROWS {
             for unit in [

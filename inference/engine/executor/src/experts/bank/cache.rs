@@ -790,15 +790,22 @@ mod tests {
             })
             .expect("floor allocates");
         let above = 20 * GB;
-        let bank_piece = ledger.cached(CacheKind::Bank, above).expect("bank fits");
+        let bank_piece = ledger
+            .cached_with(CacheKind::Bank, above, crate::memory::ledger::Reclaim::Unbacked)
+            .expect("bank fits");
         cache.hold(holding, bank_piece);
         let allocated_before = ledger.estimate().allocated();
 
-        // A transient 10 GB prefill claim takes 4 GB free room + 6 GB logically
-        // yielded from `CacheKind::Bank`.
+        // A transient 10 GB prefill allocation takes 4 GB free room + 6 GB logically
+        // yielded from `CacheKind::Bank` (via `entry.took`, the unconditional driver
+        // allocation path that sets `claimed` debt on pooled cache).
         let prefill = ledger
-            .change(|keeping| ledger.claim_at(&keeping.claims(), None, crate::memory::ledger::CommittedKind::Request(crate::operation::RequestId(1)), 10 * GB))
-            .expect("transient prefill claim takes 4 GB free + 6 GB bank cache");
+            .change(|keeping| ledger.claim_at(&keeping.claims(), None, crate::memory::ledger::CommittedKind::Load, 4 * GB))
+            .expect("4 GB claim fits free room");
+        ledger.change(|_| {
+            let entry = prefill.entry();
+            entry.took(&entry.change(), 10 * GB, seismic::memory::Wiring::Pageable);
+        });
         assert_eq!(ledger.estimate().cache_of(CacheKind::Bank), 14 * GB, "6 GB logically yielded from bank");
 
         // While the transient prefill claim is still alive (`free == 0`), `owed` MUST report 6 GB!
@@ -812,11 +819,15 @@ mod tests {
         assert_eq!(ledger.estimate().cache_of(CacheKind::Bank), above, "ledger bank cache fully restored");
         assert_eq!(ledger.estimate().allocated(), allocated_before, "total allocated invariant preserved");
 
-        // Also verify the 100%-yielded case: a 24 GB transient claim drains all 20 GB of `CacheKind::Bank`
+        // Also verify the 100%-yielded case: a 24 GB transient allocation drains all 20 GB of `CacheKind::Bank`
         // to 0 bytes while alive, `owed` keeps a 0-byte anchor, and dropping the claim restores all 20 GB.
         let full_prefill = ledger
-            .change(|keeping| ledger.claim_at(&keeping.claims(), None, crate::memory::ledger::CommittedKind::Request(crate::operation::RequestId(2)), 24 * GB))
-            .expect("24 GB transient claim drains all 20 GB bank cache");
+            .change(|keeping| ledger.claim_at(&keeping.claims(), None, crate::memory::ledger::CommittedKind::Load, 4 * GB))
+            .expect("4 GB claim fits free room");
+        ledger.change(|_| {
+            let entry = full_prefill.entry();
+            entry.took(&entry.change(), 24 * GB, seismic::memory::Wiring::Pageable);
+        });
         assert_eq!(ledger.estimate().cache_of(CacheKind::Bank), 0);
         assert_eq!(cache.owed(holding, above), above, "100%-yielded live claim reports full 20 GB owed");
         drop(full_prefill);

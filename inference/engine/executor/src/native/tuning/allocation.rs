@@ -1030,7 +1030,12 @@ pub(crate) fn allocate<U: Unit>(
     // cutoff is reached and at least one non-departed unit is discovered
     // with post-discovery work, remaining undiscovered units depart so the
     // objective freezes and discovered high-demand units proceed to tuning.
-    let discovery_cutoff = began.saturating_add(total.saturating_sub(began) / 3);
+    let discovery_budget = total.saturating_sub(began) / 3;
+    let discovery_cutoff = began.saturating_add(discovery_budget);
+    // When the objective first becomes ready for post-discovery search:
+    // used to compute each unit's proportional search budget share so no
+    // heavy unit can monopolize the budget while under-budget peers wait.
+    let mut search_began = None::<Duration>;
     let outcome = loop {
         let opening = clock.now();
         if let Some(opened) = opened {
@@ -1098,6 +1103,7 @@ pub(crate) fn allocate<U: Unit>(
             .map(|unit| !departed[unit] || units[unit].discovered())
             .collect::<Vec<_>>();
         if objective_ready {
+            search_began.get_or_insert(opening);
             U::refresh(units, &objective, context);
         }
         let offers = units
@@ -1366,11 +1372,58 @@ pub(crate) fn allocate<U: Unit>(
                 f64::INFINITY
             }
         };
+        let total_discovery_weight: f64 = (0..units.len())
+            .filter(|unit| !departed[*unit])
+            .map(|unit| units[unit].discovery_weight().max(0.))
+            .sum();
+        let active_share: f64 = (0..units.len())
+            .filter(|unit| !departed[*unit])
+            .map(|unit| units[unit].share().max(0.))
+            .sum();
+        let search_budget = total.saturating_sub(search_began.unwrap_or(began));
+        // Soft proportional per-unit budget cap: once a unit has already run
+        // at least one piece in its phase and its next piece would push it
+        // past its proportional share of that phase's budget, it yields to any
+        // peer still within its proportional share (or awaiting its first
+        // piece). Once all remaining peers are over allowance, over-allowance
+        // units resume normally so zero budget goes unused.
+        let over_allowance = |&(unit, ref work): &(usize, Work)| {
+            let price = expected.expected_work(
+                work,
+                units[unit].kind(),
+                longest,
+                compiled,
+            );
+            if work.stage == Stage::Discovery {
+                if discovery_effort[unit].is_zero() || total_discovery_weight <= 0. {
+                    return false;
+                }
+                let share = units[unit].discovery_weight().max(0.) / total_discovery_weight;
+                let allowance = Duration::try_from_secs_f64(
+                    discovery_budget.as_secs_f64() * share,
+                )
+                .unwrap_or(Duration::MAX);
+                discovery_effort[unit].saturating_add(price) > allowance
+            } else {
+                if effort[unit].is_zero() || active_share <= 0. {
+                    return false;
+                }
+                let share = units[unit].share().max(0.) / active_share;
+                let allowance = Duration::try_from_secs_f64(
+                    search_budget.as_secs_f64() * share,
+                )
+                .unwrap_or(Duration::MAX);
+                effort[unit].saturating_add(price) > allowance
+            }
+        };
         let value = |offer: &(usize, Work)| -priority(offer);
         let promoting = fitting.iter().any(|(_, work)| work.stage == Stage::Promote);
-        let choice = fitting
+        let eligible = fitting
             .iter()
-            .filter(|(_, work)| !promoting || work.stage == Stage::Promote)
+            .filter(|(_, work)| !promoting || work.stage == Stage::Promote);
+        let any_within_allowance = eligible.clone().any(|offer| !over_allowance(offer));
+        let choice = eligible
+            .filter(|offer| !any_within_allowance || !over_allowance(offer))
             .fold(None, |best: Option<&(usize, Work)>, offer| match best {
                 Some(best) if priority(best) <= priority(offer) => Some(best),
                 _ => Some(offer),
@@ -5186,5 +5239,99 @@ mod tests {
         assert_eq!(units[0].published, 0, "failing unit must not settle on abort");
         assert_eq!(units[1].published, 0, "unsearched peer must not settle on abort");
         assert!(!units[1].resident, "resident inputs are still released on abort");
+    }
+
+    /// Heavy units whose pieces exceed their proportional share of the search
+    /// budget yield to under-budget decode peers instead of burning 35%+ of
+    /// the budget while peers sit on canonical defaults; once peers finish,
+    /// over-allowance units still consume the remaining budget.
+    #[test]
+    fn proportional_search_allowance_prevents_heavy_units_starving_decode_peers() {
+        let clock = Fake::default();
+        // 2 heavy units (share 0.20 each, 4s pieces -> virtual finish 20, 40,
+        // 60) beside 10 decode units (share 0.06 each, 4s pieces -> virtual
+        // finish 66.7) in a 60s budget.
+        // Discovery takes 12s -> search_budget = 48s.
+        // Without proportional allowance, each heavy unit would run 3 pieces
+        // (12s each, 24s total) before any decode unit gets its first piece
+        // (60 < 66.7). With allowance = 0.20 * 48 = 9.6s, each heavy unit
+        // yields after 2 pieces (8s; 3rd piece 12s > 9.6s) so decode peers
+        // run ahead of any 3rd heavy piece.
+        let mut units = Vec::new();
+        for name in 0..2 {
+            units.push(Synthetic {
+                discovery: SECOND,
+                measurement: SECOND * 4,
+                ..Synthetic::new(name, &clock, 0.20, &[1.; 6])
+            });
+        }
+        for name in 2..12 {
+            units.push(Synthetic {
+                discovery: SECOND,
+                measurement: SECOND * 4,
+                ..Synthetic::new(name, &clock, 0.06, &[1.; 2])
+            });
+        }
+        let (_, report) = run(&mut units, &clock, 60);
+        let measures: Vec<usize> = report
+            .admitted
+            .iter()
+            .filter(|a| a.stage == Stage::Measure)
+            .map(|a| a.unit)
+            .collect();
+        // Neither heavy unit ran a 3rd piece before decode peers started.
+        let first_decode = measures
+            .iter()
+            .position(|&unit| unit >= 2)
+            .expect("decode peers must be measured");
+        assert!(
+            first_decode <= 4,
+            "heavy units must yield after hitting proportional allowance (2 pieces each), got first decode at index {first_decode}: {measures:?}"
+        );
+        // Most decode peers got measured instead of starved behind heavy units.
+        let decode_measured = units[2..].iter().filter(|u| !u.measured.is_empty()).count();
+        assert!(
+            decode_measured >= 8,
+            "decode peers must not be starved by heavy units: {decode_measured}/10 measured, {measures:?}"
+        );
+    }
+
+    /// A slow multi-point unit in `Stage::Discovery` yields once past its
+    /// proportional discovery allowance so fast decode units complete
+    /// discovery before `discovery_cutoff` instead of departing undiscovered.
+    #[test]
+    fn proportional_discovery_allowance_prevents_slow_unit_starving_discovery() {
+        let clock = Fake::default();
+        // 60s budget -> 20s discovery_cutoff.
+        // Unit 0: slow 6-point unit (4s/point = 24s total) with weight 0.25
+        // (allowance 5s). Units 1..6: fast 1-point decode units (1s/point)
+        // with weight 0.15 each (allowance 3s).
+        // Unit 0 runs 1 point (4s), then its 2nd point (8s > 5s) yields to
+        // units 1..6 so all 5 decode units finish discovery before 20s.
+        let mut units = vec![Synthetic {
+            discovery: SECOND * 4,
+            discovery_weight: 0.25,
+            points: 6,
+            ..Synthetic::new(0, &clock, 0.25, &[0.9])
+        }];
+        for name in 1..6 {
+            units.push(Synthetic {
+                discovery: SECOND,
+                discovery_weight: 0.15,
+                points: 1,
+                ..Synthetic::new(name, &clock, 0.15, &[0.7])
+            });
+        }
+        let (_, _) = run(&mut units, &clock, 60);
+        for unit in 1..6 {
+            assert_eq!(
+                units[unit].discovered, 1,
+                "decode unit {unit} must finish discovery before cutoff"
+            );
+            assert!(
+                !units[unit].measured.is_empty(),
+                "decode unit {unit} must be tuned after discovery"
+            );
+        }
     }
 }

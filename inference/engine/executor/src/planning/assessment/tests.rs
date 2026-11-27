@@ -331,7 +331,7 @@ fn checked_head_family_includes_chained_and_shaped_classes() {
         limits,
         geometry,
         method.draft_rows(),
-        load.fronts(),
+        load.chains_front(),
         plan.head().unwrap().has_bank(),
     )
     .unwrap();
@@ -446,7 +446,7 @@ fn checked_head_family_includes_chained_and_shaped_classes() {
             limits,
             geometry,
             method.draft_rows(),
-            load.fronts(),
+            load.chains_front(),
             plan.head().unwrap().has_bank(),
         )
         .unwrap();
@@ -572,7 +572,7 @@ fn checked_head_family_includes_chained_and_shaped_classes() {
             limits,
             geometry,
             method.draft_rows(),
-            load.fronts(),
+            load.chains_front(),
             plan.head().unwrap().has_bank(),
         )
         .unwrap(),
@@ -680,7 +680,7 @@ fn checked_head_family_includes_chained_and_shaped_classes() {
         limits,
         geometry,
         method.draft_rows(),
-        load.fronts(),
+        load.chains_front(),
         plan.head().unwrap().has_bank(),
     )
     .unwrap();
@@ -2712,7 +2712,7 @@ fn glm_mtp_heads_general_routed_graphs_certify_on_every_backend() {
             limits,
             geometry,
             method.draft_rows(),
-            load.fronts(),
+            load.chains_front(),
             plan.head().unwrap().has_bank(),
         )
         .unwrap();
@@ -2854,7 +2854,7 @@ fn head_family_certificates_cover_non_monotonic_prefill_scratch_across_backends(
             limits,
             geometry,
             method.draft_rows(),
-            load.fronts(),
+            load.chains_front(),
             plan.head().unwrap().has_bank(),
         )
         .unwrap();

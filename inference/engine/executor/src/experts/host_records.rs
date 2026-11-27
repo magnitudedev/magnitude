@@ -465,9 +465,24 @@ fn taking<K: Ord + Copy>(kept: Kept, staged: Staged, read: Option<Step>, rank: &
     (kept, rank(staged, read), staged)
 }
 
+/// Maximum number of evicted `(layer, expert)` entries buffered between
+/// `Prefetch::prune_evicted_prefetches` drains before falling back to a full
+/// scan.
+const MAX_EVICTED_LOG: usize = 4096;
+
+#[cfg(test)]
+thread_local! {
+    static HOST_DISPLACED_SCANS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
 pub(super) struct HostRecords {
     /// What each record holds, changed only by [`Self::set`].
     records: Vec<Host>,
+    /// Per-record position in whichever of `pending`, `graced`, or `answering`
+    /// currently lists it (`u32::MAX` when in none). Because `Host` is an enum,
+    /// those three states are mutually exclusive by construction, so one dense
+    /// array gives `O(1)` push and swap-remove for all three.
+    list_pos: Vec<u32>,
     /// The indexes of `records`, each kept by [`Self::set`] alone: the
     /// ready records, in order (a landing takes the lowest past the lent
     /// ones, [`Self::take_lacked`]), the graced ones, the banked ones
@@ -477,14 +492,27 @@ pub(super) struct HostRecords {
     /// keeps or lands, per layer the experts held alone and the experts
     /// kept, answering, landing or seeding, and the records claimed.
     ready: BTreeSet<u32>,
+    /// Count of `ready` records with index `>= self.lent` (`O(1)` `ready_count`).
+    ready_past_lent: usize,
     pending: Vec<u32>,
     graced: Vec<u32>,
+    /// Count of `graced` records with index `>= self.lent` (`O(1)` `reserved_for`).
+    graced_past_lent: usize,
+    /// `O(1)` lookup of graced record by expert (`Self::graced_record`).
+    graced_by_staged: HashMap<Staged, u32>,
     banked: BTreeSet<u32>,
+    /// Monotonic counter bumped whenever any record enters `self.banked`,
+    /// invalidating cached `Kept::Alone` displaced victims.
+    banked_gen: u64,
     answering: Vec<u32>,
     kept: HashMap<Staged, u32>,
     landing: HashMap<Staged, u32>,
+    writing_back: HashMap<Staged, u32>,
     ahead: usize,
     lacking: BTreeSet<Staged>,
+    /// Experts that left the tier (`old.present() -> lacking`) since the last
+    /// [`Self::take_evicted`] drain (`None` if overflowed past [`MAX_EVICTED_LOG`]).
+    evicted_log: Option<Vec<Staged>>,
     /// How many experts the group's layers have: what its records past the
     /// lent ones must hold for it to cover them ([`Self::covers`]).
     experts: usize,
@@ -527,6 +555,14 @@ pub(super) struct HostRecords {
     /// step advances, victims run below what a request needs, or the tier
     /// resizes ([`Self::unprepare`]).
     prepared: Option<Step>,
+    /// Step-cached coldest refill victims so `Residency::refill_tier` and
+    /// `displaced_for_mut` do not rescan all ~16k host records on every landing.
+    refill_cache: VecDeque<(u32, Staged)>,
+    refill_cache_key: Option<(Option<Step>, bool, u64)>,
+    /// True when the last scan at `refill_cache_key` found zero eligible kept
+    /// victims, preventing repeated full scans on subsequent claims until a
+    /// record becomes kept or unheld.
+    refill_cache_exhausted: bool,
     /// The read path's mirror of where every expert is, whose words of the
     /// group's layers these records alone clear.
     inbound: Arc<InboundTable>,
@@ -560,15 +596,22 @@ impl HostRecords {
         }
         let mut host = Self {
             records: Vec::new(),
+            list_pos: Vec::new(),
             ready: BTreeSet::new(),
+            ready_past_lent: 0,
             pending: Vec::new(),
             graced: Vec::new(),
+            graced_past_lent: 0,
+            graced_by_staged: HashMap::new(),
             banked: BTreeSet::new(),
+            banked_gen: 0,
             answering: Vec::new(),
             kept: HashMap::new(),
             landing: HashMap::new(),
+            writing_back: HashMap::new(),
             ahead: 0,
             lacking,
+            evicted_log: Some(Vec::new()),
             experts,
             alone: vec![0; layers],
             holding: vec![0; layers],
@@ -583,6 +626,9 @@ impl HostRecords {
             holdings: 0,
             victims: VecDeque::new(),
             prepared: None,
+            refill_cache: VecDeque::new(),
+            refill_cache_key: None,
+            refill_cache_exhausted: false,
             inbound,
             protected_layers: Arc::from([]),
         };
@@ -613,6 +659,25 @@ impl HostRecords {
         (0..experts).all(|expert| self.kept.contains_key(&(layer, expert)))
     }
 
+    #[inline]
+    fn list_push(list: &mut Vec<u32>, list_pos: &mut [u32], record: u32) {
+        let idx = list.len() as u32;
+        list.push(record);
+        list_pos[record as usize] = idx;
+    }
+
+    #[inline]
+    fn list_remove(list: &mut Vec<u32>, list_pos: &mut [u32], record: u32) {
+        let pos = list_pos[record as usize] as usize;
+        debug_assert!(pos < list.len() && list[pos] == record, "record {record} not at list_pos {pos}");
+        list.swap_remove(pos);
+        list_pos[record as usize] = u32::MAX;
+        if pos < list.len() {
+            let moved = list[pos];
+            list_pos[moved as usize] = pos as u32;
+        }
+    }
+
     /// Record `record` holds `content` from now: the one change of a
     /// record, which keeps every index by construction. An expert entering
     /// a record leaves the lacked ones, which it must be one of.
@@ -621,12 +686,18 @@ impl HostRecords {
         // A copy held or let go, a read ranked: no index moves.
         if let (Host::Kept(was), Host::Kept(is)) | (Host::Answering(was, _), Host::Answering(is, _)) = (old, content) {
             if (was.staged, was.kept) == (is.staged, is.kept) {
+                if was.holds > 0 && is.holds == 0 {
+                    self.refill_cache_exhausted = false;
+                }
                 return;
             }
         }
         match old {
             Host::Ready => {
                 assert!(self.ready.remove(&record), "a ready record is listed ready");
+                if record >= self.lent {
+                    self.ready_past_lent -= 1;
+                }
             }
             Host::Landing { staged, taking, .. } => {
                 self.landing.remove(&staged);
@@ -644,17 +715,32 @@ impl HostRecords {
                     Kept::Banked => assert!(self.banked.remove(&record), "a banked record is listed banked"),
                 }
                 if matches!(old, Host::Answering(..)) {
-                    self.answering.retain(|&answering| answering != record);
+                    Self::list_remove(&mut self.answering, &mut self.list_pos, record);
                 }
             }
-            Host::Graced { .. } => self.graced.retain(|&graced| graced != record),
-            Host::Pending { .. } => self.pending.retain(|&pending| pending != record),
+            Host::Graced { whole, .. } => {
+                Self::list_remove(&mut self.graced, &mut self.list_pos, record);
+                self.graced_by_staged.remove(&whole.staged);
+                if record >= self.lent {
+                    self.graced_past_lent -= 1;
+                }
+            }
+            Host::Pending { .. } => Self::list_remove(&mut self.pending, &mut self.list_pos, record),
             Host::Claimed => self.claimed -= 1,
-            Host::Seeding { staged } | Host::WritingBack { staged } => self.holding[staged.0] -= 1,
+            Host::Seeding { staged } => self.holding[staged.0] -= 1,
+            Host::WritingBack { staged } => {
+                self.writing_back.remove(&staged);
+                self.holding[staged.0] -= 1;
+            }
             Host::Absent => self.present += 1,
         }
         match content {
-            Host::Ready => assert!(self.ready.insert(record), "record {record} is listed ready once"),
+            Host::Ready => {
+                assert!(self.ready.insert(record), "record {record} is listed ready once");
+                if record >= self.lent {
+                    self.ready_past_lent += 1;
+                }
+            }
             Host::Landing { staged, taking, .. } => {
                 assert!(self.landing.insert(staged, record).is_none(), "{staged:?} lands twice");
                 self.ahead += usize::from(taking == Taking::Ahead);
@@ -663,21 +749,35 @@ impl HostRecords {
             Host::Kept(Whole { staged, kept, .. }) | Host::Answering(Whole { staged, kept, .. }, _) => {
                 assert!(self.kept.insert(staged, record).is_none(), "{staged:?} kept twice");
                 self.holding[staged.0] += 1;
+                self.refill_cache_exhausted = false;
                 match kept {
                     Kept::Alone => {
                         self.alone[staged.0] += 1;
                         self.holdings += 1;
                     }
-                    Kept::Banked => assert!(self.banked.insert(record), "record {record} is listed banked once"),
+                    Kept::Banked => {
+                        assert!(self.banked.insert(record), "record {record} is listed banked once");
+                        self.banked_gen = self.banked_gen.wrapping_add(1);
+                    }
                 }
                 if matches!(content, Host::Answering(..)) {
-                    self.answering.push(record);
+                    Self::list_push(&mut self.answering, &mut self.list_pos, record);
                 }
             }
-            Host::Graced { .. } => self.graced.push(record),
-            Host::Pending { .. } => self.pending.push(record),
+            Host::Graced { whole, .. } => {
+                Self::list_push(&mut self.graced, &mut self.list_pos, record);
+                self.graced_by_staged.insert(whole.staged, record);
+                if record >= self.lent {
+                    self.graced_past_lent += 1;
+                }
+            }
+            Host::Pending { .. } => Self::list_push(&mut self.pending, &mut self.list_pos, record),
             Host::Claimed => self.claimed += 1,
-            Host::Seeding { staged } | Host::WritingBack { staged } => self.holding[staged.0] += 1,
+            Host::Seeding { staged } => self.holding[staged.0] += 1,
+            Host::WritingBack { staged } => {
+                assert!(self.writing_back.insert(staged, record).is_none(), "{staged:?} writes back twice");
+                self.holding[staged.0] += 1;
+            }
             Host::Absent => self.present -= 1,
         }
         match (old.present(), content.present()) {
@@ -686,6 +786,13 @@ impl HostRecords {
                 if let Some(left) = left {
                     self.lacking.insert(left);
                     self.inbound.release(left);
+                    if let Some(log) = &mut self.evicted_log {
+                        if log.len() < MAX_EVICTED_LOG {
+                            log.push(left);
+                        } else {
+                            self.evicted_log = None;
+                        }
+                    }
                 }
                 // Whoever started its read claimed its word first.
                 if let Some(entered) = entered {
@@ -693,6 +800,26 @@ impl HostRecords {
                     assert!(self.inbound.claimed(entered), "{entered:?} enters a record unclaimed");
                 }
             }
+        }
+    }
+
+    /// Drain experts evicted from this host tier since the last drain (`None`
+    /// if the bounded log overflowed and the caller must rescan).
+    pub fn take_evicted(&mut self) -> Option<Vec<Staged>> {
+        match &mut self.evicted_log {
+            Some(log) => Some(std::mem::take(log)),
+            None => {
+                self.evicted_log = Some(Vec::new());
+                None
+            }
+        }
+    }
+
+    /// Discard buffered eviction entries without allocating.
+    pub fn clear_evicted(&mut self) {
+        match &mut self.evicted_log {
+            Some(log) => log.clear(),
+            None => self.evicted_log = Some(Vec::new()),
         }
     }
 
@@ -825,9 +952,9 @@ impl HostRecords {
     }
 
     /// The graced record that holds `staged`, if one does: at most one
-    /// ([`Host::present`]).
+    /// ([`Host::present`]), `O(1)`.
     fn graced_record(&self, staged: Staged) -> Option<u32> {
-        self.graced.iter().copied().find(|&record| self.records[record as usize].present() == Some(staged))
+        self.graced_by_staged.get(&staged).copied()
     }
 
     /// The posted read of `staged` that no record took ended unlanded, or
@@ -872,7 +999,9 @@ impl HostRecords {
         for record in records {
             if record >= self.extent() {
                 // Past every record: holes up to it, which `set` fills.
-                self.records.resize(record as usize + 1, Host::Absent);
+                let new_len = record as usize + 1;
+                self.records.resize(new_len, Host::Absent);
+                self.list_pos.resize(new_len, u32::MAX);
             }
             assert_eq!(self.records[record as usize], Host::Absent, "a growth backs record {record}, which the store holds");
             self.set(record, content);
@@ -921,7 +1050,7 @@ impl HostRecords {
     /// whatever its layer. An outstanding answer, a graced record, a
     /// landing, a seed and a claimed record are never taken.
     pub fn seed_order<K: Ord + Copy>(&self, rank: impl Rank<K>, pinned: impl Fn(Staged) -> bool) -> Vec<(Option<(Kept, K, Staged)>, u32)> {
-        let ready = self.ready.range(self.lent..).count().min(self.reserved().saturating_sub(self.reserve + self.pool));
+        let ready = self.ready_past_lent.min(self.reserved().saturating_sub(self.reserve + self.pool));
         let free = self.ready.range(self.lent..).take(ready).map(|&record| (None, record));
         let mut kept = (self.lent..self.extent())
             .filter(|&record| self.unheld(record) && !self.layer_protected(record))
@@ -1157,7 +1286,7 @@ impl HostRecords {
             // Whole in its record already: nothing to land.
             Located::Kept(record) | Located::Graced(record) => Claim::Kept(record),
             Located::Landing => Claim::Landing,
-            Located::Lacked if admitted(self.displaced_for(|staged, read| admit.rank(staged, read), keep, taking), |kept, key| admit.admits(kept, key)) => {
+            Located::Lacked if admitted(self.displaced_for_mut(|staged, read| admit.rank(staged, read), keep, taking), |kept, key| admit.admits(kept, key)) => {
                 match self.inbound.claim(staged) {
                     true => Claim::Taken(self.take_lacked(staged, None, taking)),
                     // A posted read claimed it since it was located.
@@ -1174,17 +1303,79 @@ impl HostRecords {
     /// [`Self::inbound`] so no parked decode step ever waits on the transfer
     /// queue. None where `staged` is already present, already writing back,
     /// or not admitted.
+    /// Number of host records currently keeping a `Kept::Banked` copy of an
+    /// expert also held in VRAM. O(1).
+    pub fn banked_count(&self) -> usize {
+        self.banked.len()
+    }
+
+    /// Whether at least one ready record lies past the cut-in pool so
+    /// [`Self::claim_back`] could possibly succeed. O(1).
+    pub fn can_claim_back(&self) -> bool {
+        self.beyond(self.ready_count(Taking::Out), self.pool)
+    }
+
     pub fn claim_back(&mut self, staged: Staged, keep: usize, admit: impl Admit) -> Option<Grant> {
-        if self.located(staged) != Located::Lacked {
+        if self.located(staged) != Located::Lacked || self.writing_back.contains_key(&staged) {
             return None;
         }
-        if self.records.iter().any(|record| matches!(record, Host::WritingBack { staged: writing } if *writing == staged)) {
-            return None;
-        }
-        if !admitted(self.displaced(|staged, read| admit.rank(staged, read), keep), |kept, key| admit.admits(kept, key)) {
+        if !admitted(self.displaced_for_mut(|staged, read| admit.rank(staged, read), keep, Taking::Out), |kept, key| admit.admits(kept, key)) {
             return None;
         }
         let record = self.ready.range(self.lent..).next().or_else(|| self.ready.first()).copied().expect("a record taken is ready");
+        self.set(record, Host::WritingBack { staged });
+        Some(self.grant(staged, record, GrantFrom::Reached(self.progress.unwrap_or(Point::START))))
+    }
+
+    /// Atomically unmap `vacating` from its `Host::Kept` slot `record` and
+    /// repurpose that exact slot directly into `Host::WritingBack { staged }`
+    /// for a paired VRAM↔Host swap (`E_miss` promoted to VRAM, `E_victim`
+    /// written back to `E_miss`'s vacated Host slot).
+    ///
+    /// Returns `Some(Grant)` ONLY when ALL lifetime safety conditions hold:
+    /// 1. `staged` is `Located::Lacked` and not already `Host::WritingBack`,
+    /// 2. `record` currently holds `Host::Kept(Whole { staged: vacating, holds: 0, from, .. })`
+    ///    (never `Host::Answering`, `holds > 0`, or `Host::Graced`),
+    /// 3. `!self.layer_protected(record)`,
+    /// 4. `!(at.lending() && record < self.lent)`,
+    /// 5. Either `immediate` (`tier_copy_dma && at.all_scratch()`, so zero GPU
+    ///    kernels read `tier_map`) OR `is_served(from.step(), at.next(), vacating.0, progress)`
+    ///    (every step in `[from, at.next())` that could have resolved `vacating`
+    ///    in `tier_map` has already passed layer `vacating.0` or ended).
+    ///
+    /// Unmaps `vacating` from `tier_map` under `at` before transitioning the
+    /// slot to `Host::WritingBack { staged }`, leaving `staged` lacked and
+    /// unclaimed in `inbound` (identical to [`Self::claim_back`]).
+    #[allow(clippy::too_many_arguments)]
+    pub fn claim_back_into_slot(
+        &mut self,
+        staged: Staged,
+        vacating: Staged,
+        record: u32,
+        at: &Unbegun,
+        progress: Point,
+        is_served: impl FnOnce(Step, Step, usize, Point) -> bool,
+        immediate: bool,
+    ) -> Option<Grant> {
+        if self.located(staged) != Located::Lacked || self.writing_back.contains_key(&staged) {
+            return None;
+        }
+        let Host::Kept(whole) = self.records.get(record as usize).copied()? else {
+            return None;
+        };
+        if whole.staged != vacating
+            || whole.holds != 0
+            || self.layer_protected(record)
+            || (at.lending() && record < self.lent)
+        {
+            return None;
+        }
+        if !immediate && !is_served(whole.from.step(), at.next(), vacating.0, progress) {
+            return None;
+        }
+        if let Some(map) = &self.maps[vacating.0] {
+            map.store_unbegun(vacating.1, None, Some(at));
+        }
         self.set(record, Host::WritingBack { staged });
         Some(self.grant(staged, record, GrantFrom::Reached(self.progress.unwrap_or(Point::START))))
     }
@@ -1259,23 +1450,20 @@ impl HostRecords {
     }
 
     /// Ready records available to `taking`: `Taking::Ahead` only considers
-    /// non-lent records (`self.lent..`).
+    /// non-lent records (`self.lent..`). `O(1)`.
     fn ready_count(&self, taking: Taking) -> usize {
         match taking {
-            Taking::Ahead => self.ready.range(self.lent..).count(),
+            Taking::Ahead => self.ready_past_lent,
             Taking::Out => self.ready.len(),
         }
     }
 
     /// Reserve records visible to `taking`: `Taking::Ahead` excludes lent
     /// records (`0..self.lent`). Every `self.ahead` landing is already in
-    /// `self.lent..` by construction (`Self::take_lacked`).
+    /// `self.lent..` by construction (`Self::take_lacked`). `O(1)`.
     fn reserved_for(&self, taking: Taking) -> usize {
         match taking {
-            Taking::Ahead => {
-                let graced = self.graced.iter().filter(|&&record| record >= self.lent).count();
-                self.ready.range(self.lent..).count() + graced + self.ahead
-            }
+            Taking::Ahead => self.ready_past_lent + self.graced_past_lent + self.ahead,
             Taking::Out => self.reserved(),
         }
     }
@@ -1405,6 +1593,80 @@ impl HostRecords {
         }
         order.sort_unstable();
         order.into_iter().map(|(_, record, staged)| (record, staged)).collect()
+    }
+
+    /// Step-cached variant of [`Self::refill_victims_for_lacked`] used by
+    /// `Residency::refill_tier`: caches the coldest `max(64, need * 4)`
+    /// candidates per `(progress_step, lending)` and validates each popped
+    /// record before returning it, avoiding a full ~16k-record host scan on
+    /// every single NVMe landing while holding the global `Residency` lock.
+    pub fn refill_victims_cached_for_lacked<K: Ord + Copy>(
+        &mut self,
+        rank: impl Rank<K>,
+        is_protected: impl Fn(Staged, Option<Step>) -> bool,
+        lending: bool,
+        lacked: usize,
+    ) -> Vec<(u32, Staged)> {
+        if !self.short_of_lacked(0, lacked) {
+            return Vec::new();
+        }
+        let need = (self.reserve + self.pool).min(lacked).saturating_sub(self.reserved());
+        if need == 0 {
+            return Vec::new();
+        }
+        let key = (self.progress.map(|p| p.sequence), lending, self.banked_gen);
+        if self.refill_cache_key != Some(key) {
+            self.refill_cache.clear();
+            self.refill_cache_key = Some(key);
+            self.refill_cache_exhausted = false;
+        }
+        let mut chosen = Vec::with_capacity(need);
+        while chosen.len() < need {
+            let Some((record, staged)) = self.refill_cache.pop_front() else {
+                break;
+            };
+            if (lending && record < self.lent) || !self.unheld(record) || self.layer_protected(record) {
+                continue;
+            }
+            let Some(whole) = self.records[record as usize].whole() else {
+                continue;
+            };
+            if whole.staged != staged || is_protected(staged, whole.read) {
+                continue;
+            }
+            chosen.push((record, staged));
+        }
+        if chosen.len() >= need {
+            return chosen;
+        }
+        let remaining = need - chosen.len();
+        let depth = (remaining * 4).max(64);
+        let mut order = (0..self.extent())
+            .filter(|&record| {
+                (!lending || record >= self.lent)
+                    && self.unheld(record)
+                    && !self.layer_protected(record)
+                    && !chosen.iter().any(|&(c, _)| c == record)
+            })
+            .filter_map(|record| {
+                let (kept, key, staged) = match self.records[record as usize] {
+                    Host::Answering(Whole { staged, kept, read, .. }, _) => taking(kept, staged, read, &rank),
+                    _ => self.place(record, &rank)?,
+                };
+                Some(((kept, key, record >= self.lent, staged), record, staged))
+            })
+            .collect::<Vec<_>>();
+        if depth < order.len() {
+            order.select_nth_unstable(depth);
+            order.truncate(depth);
+        }
+        order.sort_unstable();
+        let mut iter = order.into_iter().map(|(_, record, staged)| (record, staged));
+        for item in iter.by_ref().take(remaining) {
+            chosen.push(item);
+        }
+        self.refill_cache.extend(iter);
+        chosen
     }
 
     /// Whether the reserve's records ([`Self::reserved`]), with `unmapped`
@@ -1543,11 +1805,136 @@ impl HostRecords {
         if !self.beyond(self.ready_count(taking), self.pool) {
             return Some(None);
         }
+        // Fast path 1 (`O(1)`): when `refill_cache` was populated for the
+        // current `(step, banked_gen)`, its front valid unheld record is
+        // already the coldest victim (banked first, then alone).
+        let cur_step = self.progress.map(|p| p.sequence);
+        if self.refill_cache_key.is_some_and(|(step, _, gen)| step == cur_step && gen == self.banked_gen) {
+            for &(record, staged) in &self.refill_cache {
+                if !self.unheld(record) || self.layer_protected(record) {
+                    continue;
+                }
+                let Some(whole) = self.records[record as usize].whole() else {
+                    continue;
+                };
+                if whole.staged == staged {
+                    let (kept, key, _) = self::taking(whole.kept, whole.staged, whole.read, &rank);
+                    return Some(Some((kept, key)));
+                }
+            }
+            if self.refill_cache_exhausted {
+                return Some(None);
+            }
+        }
+        // Fast path 2 (100% exact): `Kept::Banked` strictly precedes
+        // `Kept::Alone` in `taking_order`, so if any unheld banked record
+        // exists, the displaced victim MUST come from `self.banked`.
+        if !self.banked.is_empty() {
+            let best_banked = self
+                .banked
+                .iter()
+                .copied()
+                .filter(|&record| self.unheld(record) && !self.layer_protected(record))
+                .filter_map(|record| {
+                    let whole = self.records[record as usize].whole()?;
+                    let (kept, key, staged) = self::taking(whole.kept, whole.staged, whole.read, &rank);
+                    Some(((kept, key, staged), (kept, key)))
+                })
+                .min_by(|a, b| a.0.cmp(&b.0))
+                .map(|(_, pair)| pair);
+            if best_banked.is_some() {
+                return Some(best_banked);
+            }
+        }
+        #[cfg(test)]
+        HOST_DISPLACED_SCANS.with(|c| c.set(c.get() + 1));
         let first = self
             .taking_order(&rank, true, Some(1), |record| self.unheld(record) && !self.layer_protected(record))
             .into_iter()
             .next();
         Some(first.map(|record| {
+            let whole = self.records[record as usize].whole().expect("a record in taking order keeps an expert");
+            let (kept, key, _) = self::taking(whole.kept, whole.staged, whole.read, &rank);
+            (kept, key)
+        }))
+    }
+
+    /// Mutable variant of [`Self::displaced_for`] used by [`Self::claim`] and
+    /// [`Self::claim_back`]: caches the coldest 64 unheld victims (both
+    /// `Kept::Banked` and `Kept::Alone`, plus empty-result exhaustion) keyed by
+    /// `(step, banked_gen)` so bursts of `Prefetch::derive`,
+    /// `prefetch_carryover`, `Scratch::land_conveyed`, and write-back claims
+    /// run in `O(1)` amortized without rescanning `self.banked` or all host
+    /// records on every candidate.
+    fn displaced_for_mut<K: Ord + Copy>(&mut self, rank: impl Rank<K>, keep: usize, taking: Taking) -> Option<Option<(Kept, K)>> {
+        if self.takes_for(keep, taking) {
+            return None;
+        }
+        if !self.beyond(self.ready_count(taking), self.pool) {
+            return Some(None);
+        }
+        let cur_step = self.progress.map(|p| p.sequence);
+        if self.refill_cache_key.is_some_and(|(step, _, gen)| step == cur_step && gen == self.banked_gen) {
+            while let Some(&(record, staged)) = self.refill_cache.front() {
+                if !self.unheld(record) || self.layer_protected(record) {
+                    self.refill_cache.pop_front();
+                    continue;
+                }
+                let Some(whole) = self.records[record as usize].whole() else {
+                    self.refill_cache.pop_front();
+                    continue;
+                };
+                if whole.staged != staged {
+                    self.refill_cache.pop_front();
+                    continue;
+                }
+                let (kept, key, _) = self::taking(whole.kept, whole.staged, whole.read, &rank);
+                return Some(Some((kept, key)));
+            }
+            if self.refill_cache_exhausted {
+                return Some(None);
+            }
+        }
+        #[cfg(test)]
+        HOST_DISPLACED_SCANS.with(|c| c.set(c.get() + 1));
+        if !self.banked.is_empty() {
+            let mut banked_order: Vec<_> = self
+                .banked
+                .iter()
+                .copied()
+                .filter(|&record| self.unheld(record) && !self.layer_protected(record))
+                .filter_map(|record| {
+                    let whole = self.records[record as usize].whole()?;
+                    Some((self::taking(whole.kept, whole.staged, whole.read, &rank), record, whole.staged))
+                })
+                .collect();
+            if !banked_order.is_empty() {
+                let take = 64.min(banked_order.len());
+                if take < banked_order.len() {
+                    banked_order.select_nth_unstable(take);
+                    banked_order.truncate(take);
+                }
+                banked_order.sort_unstable();
+                self.refill_cache.clear();
+                for &(_, record, staged) in &banked_order {
+                    self.refill_cache.push_back((record, staged));
+                }
+                self.refill_cache_key = Some((cur_step, false, self.banked_gen));
+                self.refill_cache_exhausted = false;
+                let ((kept, key, _), _, _) = banked_order[0];
+                return Some(Some((kept, key)));
+            }
+        }
+        let batch = self.taking_order(&rank, true, Some(64), |record| self.unheld(record) && !self.layer_protected(record));
+        self.refill_cache.clear();
+        for &record in &batch {
+            if let Some(whole) = self.records[record as usize].whole() {
+                self.refill_cache.push_back((record, whole.staged));
+            }
+        }
+        self.refill_cache_key = Some((cur_step, false, self.banked_gen));
+        self.refill_cache_exhausted = self.refill_cache.is_empty();
+        Some(batch.first().map(|&record| {
             let whole = self.records[record as usize].whole().expect("a record in taking order keeps an expert");
             let (kept, key, _) = self::taking(whole.kept, whole.staged, whole.read, &rank);
             (kept, key)
@@ -1579,13 +1966,17 @@ impl HostRecords {
     pub fn unprepare(&mut self) {
         self.victims.clear();
         self.prepared = None;
+        self.refill_cache.clear();
+        self.refill_cache_key = None;
+        self.refill_cache_exhausted = false;
     }
 
     /// Whether the victims want preparing again at step `sequence` for a
-    /// request needing up to `needed` victims: never prepared, prepared at
-    /// an earlier step, or fewer than `needed` victims remain.
+    /// request needing up to `needed` victims: never prepared, prepared at an
+    /// earlier step (so 1-shot misses from step `t` become eligible as victims
+    /// immediately on step `t + 1`), or fewer than `needed` victims remain.
     pub fn unprepared(&self, sequence: Step, needed: usize) -> bool {
-        self.prepared.is_none_or(|at| at < sequence) || self.victims.len() < needed
+        self.prepared != Some(sequence) || self.victims.len() < needed
     }
 
     /// [`Self::claim_demand`] from the prepared victims alone: the first
@@ -1594,7 +1985,14 @@ impl HostRecords {
     /// held, read by the parked step, or one an earlier group's step may
     /// still resolve), a ready record where one is, none where it needs a
     /// scan.
-    pub fn claim_prepared(&mut self, staged: Staged, demand: Demand, read: impl Fn(u32) -> bool, park: &Park) -> Option<Claim> {
+    pub fn claim_prepared(
+        &mut self,
+        staged: Staged,
+        demand: Demand,
+        read: impl Fn(u32) -> bool,
+        protected: impl Fn(Staged) -> bool,
+        park: &Park,
+    ) -> Option<Claim> {
         if let Some(claim) = self.demanded(staged, demand) {
             return Some(claim);
         }
@@ -1609,7 +2007,7 @@ impl HostRecords {
                 return self.ready_beyond(self.left_by(park)).then(|| self.take_demanded(staged, demand, park));
             };
             let keeps = self.records[record as usize].present() == Some(kept);
-            if keeps && self.reclaims(record, &read, park) {
+            if keeps && !protected(kept) && self.reclaims(record, &read, park) {
                 break record;
             }
         };
@@ -1846,6 +2244,7 @@ impl HostRecords {
             map.map_covering(whole.staged.1, dst, from);
         }
         assert!(self.ready.remove(&dst), "relocate destination {dst} is listed ready");
+        self.ready_past_lent -= 1;
         self.records[src as usize] = Host::Claimed;
         self.claimed += 1;
         self.records[dst as usize] = Host::Kept(Whole { from: whole.from.min(from), ..whole });
@@ -1854,6 +2253,7 @@ impl HostRecords {
         if whole.kept == Kept::Banked {
             assert!(self.banked.remove(&src), "banked record {src} is listed banked");
             assert!(self.banked.insert(dst), "relocate destination {dst} is listed banked once");
+            self.banked_gen = self.banked_gen.wrapping_add(1);
         }
         self.unprepare();
     }
@@ -2300,14 +2700,16 @@ mod tests {
         let [one, two, three] = [1, 2, 3].map(|expert| records.land((0, expert)));
         let ranked = [((0, 1), 5), ((0, 2), 1), ((0, 3), 3)];
         records.prepare_demand(reads(&ranked), 3, 5);
+        assert!(!records.unprepared(5, 3), "prepared for current step with enough victims");
+        assert!(records.unprepared(6, 1), "next step invalidates prepared victims immediately");
         let taken = |claim: Option<Claim>| match claim {
             Some(Claim::Taken(grant)) => Some(grant.record()),
             Some(_) => panic!("a lacked expert's claim takes a record or none"),
             None => None,
         };
-        assert_eq!(taken(records.claim_prepared((0, 4), Demand::Lacked, |_| false, &park(at(6), 1))), Some(two), "the least recently read first");
-        assert_eq!(taken(records.claim_prepared((0, 5), Demand::Lacked, |record| record == three, &park(at(6), 1))), Some(one), "the parked step's read passed over");
-        assert_eq!(taken(records.claim_prepared((0, 6), Demand::Lacked, |_| false, &park(at(6), 1))), None, "none left: the claim scans");
+        assert_eq!(taken(records.claim_prepared((0, 4), Demand::Lacked, |_| false, |_| false, &park(at(6), 1))), Some(two), "the least recently read first");
+        assert_eq!(taken(records.claim_prepared((0, 5), Demand::Lacked, |record| record == three, |_| false, &park(at(6), 1))), Some(one), "the parked step's read passed over");
+        assert_eq!(taken(records.claim_prepared((0, 6), Demand::Lacked, |_| false, |_| false, &park(at(6), 1))), None, "none left: the claim scans");
         let mut stale = tier(3, 1, ONE, Resolution::BeforeStamp);
         for expert in 1..=3 {
             stale.land((0, expert));
@@ -2315,7 +2717,7 @@ mod tests {
         stale.prepare_demand(reads(&ranked), 1, 5);
         let Claim::Taken(grant) = stale.claim_demand((0, 4), Demand::Lacked, reads(&ranked), |_| false, &park(at(6), 1)) else { panic!("a kept record frees") };
         assert_eq!(grant.record(), two, "the scan takes the prepared victim first");
-        assert_eq!(taken(stale.claim_prepared((0, 5), Demand::Lacked, |_| false, &park(at(6), 1))), None, "a victim taken since is passed over");
+        assert_eq!(taken(stale.claim_prepared((0, 5), Demand::Lacked, |_| false, |_| false, &park(at(6), 1))), None, "a victim taken since is passed over");
     }
 
     /// A shrink leaves no prepared victim behind: a claim in the same step
@@ -2329,11 +2731,13 @@ mod tests {
         }
         let ranked = [((0, 1), 5), ((0, 2), 1), ((0, 3), 3)];
         records.prepare_demand(reads(&ranked), 3, 5);
+        assert!(!records.unprepared(5, 3), "prepared for current step with enough victims");
+        assert!(records.unprepared(6, 1), "next step invalidates prepared victims immediately");
         let evicted = records.evictable(reads(&ranked));
         assert_eq!(evicted, [1, 2, 0], "the least ranked first: 2 (step 1), 3 (step 3), then 1 (step 5)");
         records.evict(&evicted[..2], |_| None);
         assert!(records.unprepared(5, 1), "the shrink's records want preparing again");
-        assert_eq!(records.claim_prepared((0, 4), Demand::Lacked, |_| false, &park(at(5), 1)).map(|_| ()), None, "no victim prepared before the shrink is taken");
+        assert_eq!(records.claim_prepared((0, 4), Demand::Lacked, |_| false, |_| false, &park(at(5), 1)).map(|_| ()), None, "no victim prepared before the shrink is taken");
         let Claim::Taken(grant) = records.claim_demand((0, 4), Demand::Lacked, reads(&ranked), |_| false, &park(at(5), 1)) else { panic!("the kept record frees") };
         assert_eq!(grant.record(), 0, "the tier's one record");
     }
@@ -2361,7 +2765,7 @@ mod tests {
         assert_eq!(tier.ready(), 1, "the reserve's ready record left");
         let Claim::Taken(ahead) = tier.claim((0, 6), 0, Taking::Ahead, Refuses) else { panic!("a read ahead takes the reserve's ready record") };
         tier.unlanded(ahead.record());
-        let Some(Claim::Taken(prepared)) = tier.claim_prepared((0, 7), Demand::Lacked, |_| true, &park(at(6), 1)) else {
+        let Some(Claim::Taken(prepared)) = tier.claim_prepared((0, 7), Demand::Lacked, |_| true, |_| false, &park(at(6), 1)) else {
             panic!("no victim prepared: the reserve's ready record, with no scan")
         };
         assert_eq!(prepared.record(), ahead.record());
@@ -3335,5 +3739,77 @@ mod tests {
         // Lent graced record 0 is NOT revived.
         assert_eq!(tier.hold_or_revive((0, 10)), None);
         assert_eq!(tier.located((0, 10)), Located::Graced(0));
+    }
+
+    #[test]
+    fn work_bound_displaced_for_mut_caches_across_1x_and_16x_records() {
+        let measure = |n_records: u32, with_banked: bool| -> usize {
+            let experts = (n_records as usize) + 256;
+            let inbound = Arc::new(InboundTable::new(&[experts]));
+            let mut tier = HostRecords::new(
+                n_records,
+                1,
+                vec![(0, experts, None)],
+                Resolution::BeforeStamp,
+                (0, 1),
+                inbound,
+            );
+            // Fill `n_records - 1` records (leaving 1 ready record for the reserve,
+            // so every subsequent claim enters `displaced_for_mut`).
+            for r in 0..(n_records - 1) {
+                tier.keep(r, (0, r as usize));
+                if with_banked && r % 4 == 0 {
+                    tier.banked((0, r as usize));
+                }
+            }
+            HOST_DISPLACED_SCANS.with(|c| c.set(0));
+            // Simulate a 128-candidate Prefetch::derive / carryover / land_conveyed
+            // burst where every candidate queries `displaced_for_mut` (rejected so
+            // the reserve stays at 1 and all 128 candidates hit the cache).
+            for i in 0..128usize {
+                let staged = (0, (n_records as usize) + i);
+                let claim = tier.claim(staged, 1, Taking::Ahead, (|s: Staged, _| s.1, |_, _| false));
+                assert!(matches!(claim, Claim::Short));
+            }
+            HOST_DISPLACED_SCANS.with(|c| c.get())
+        };
+
+        for with_banked in [false, true] {
+            let scans_1x = measure(64, with_banked);
+            let scans_16x = measure(1024, with_banked);
+            assert_eq!(scans_1x, 1, "expected 1 scan at 1x (banked={with_banked}), got {scans_1x}");
+            assert_eq!(scans_16x, 1, "expected 1 scan at 16x (banked={with_banked}), got {scans_16x}");
+        }
+    }
+
+    #[test]
+    fn work_bound_pending_grow_drain_and_evicted_log_exact_across_1x_and_16x() {
+        for n in [128u32, 2048] {
+            let experts = (n as usize) + 32;
+            let inbound = Arc::new(InboundTable::new(&[experts]));
+            let mut tier = HostRecords::new(
+                1,
+                1,
+                vec![(0, experts, None)],
+                Resolution::BeforeStamp,
+                (0, 1),
+                inbound,
+            );
+            tier.grow(1..n, 7);
+            assert_eq!(tier.pending.len(), (n - 1) as usize);
+            assert!(tier.drain_pending(7));
+            assert!(tier.pending.is_empty());
+            assert_eq!(tier.ready(), n as usize);
+            assert_eq!(tier.ready_past_lent, n as usize);
+            // Verify every `list_pos` slot was reset to `u32::MAX` after swap-remove.
+            assert!(tier.list_pos.iter().all(|&p| p == u32::MAX));
+            // Verify `take_evicted` tracks only evicted experts.
+            tier.keep(0, (0, 0));
+            tier.keep(1, (0, 1));
+            tier.clear_evicted();
+            tier.evict(&[1], |_| None);
+            assert_eq!(tier.take_evicted().expect("evicted log"), vec![(0, 1)]);
+            assert_eq!(tier.take_evicted().expect("empty after drain"), Vec::new());
+        }
     }
 }

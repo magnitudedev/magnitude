@@ -204,15 +204,24 @@ impl StreamedLayers {
     /// Whether holding `held` makes the bank whole: its slots hold every
     /// streamed layer's experts, so decode runs the resident forms and
     /// misses nothing. The one decision of which form a holding decodes in.
-    pub fn whole(&self, held: HeldSlots) -> bool {
-        self.runs.iter().all(|run| held.slots as u64 >= run.experts)
+    pub fn whole(&self, held: &HeldSlots) -> bool {
+        let mut layer = 0usize;
+        for run in &self.runs {
+            for at in layer..layer + run.layers {
+                if (held.layer(at).0 as u64) < run.experts {
+                    return false;
+                }
+            }
+            layer += run.layers;
+        }
+        true
     }
 
     /// Prepare the deduplicated step patterns of a period of `rows` rows
     /// holding `held` (and `live`'s reads where counted), reusable across
     /// compute times (such as context depths) via
     /// [`StreamedPeriod::step_seconds`].
-    pub fn prepare(&self, live: Option<&LiveDecode>, held: HeldSlots, rows: f64) -> StreamedPeriod<'_> {
+    pub fn prepare(&self, live: Option<&LiveDecode>, held: &HeldSlots, rows: f64) -> StreamedPeriod<'_> {
         if self.whole(held) {
             return StreamedPeriod { layers: self, whole: true, patterns: Vec::new() };
         }
@@ -229,7 +238,7 @@ impl StreamedLayers {
     /// widest layer's `E` steps, each spread as evenly as integers allow,
     /// priced by the one step model over the period ([`Self::period`]), with
     /// no read ahead.
-    pub fn step_seconds(&self, live: Option<&LiveDecode>, read: ReadLine, held: HeldSlots, rows: f64, compute: FormSeconds) -> StreamedStep {
+    pub fn step_seconds(&self, live: Option<&LiveDecode>, read: ReadLine, held: &HeldSlots, rows: f64, compute: FormSeconds) -> StreamedStep {
         self.prepare(live, held, rows).step_seconds(read, compute)
     }
 
@@ -240,35 +249,65 @@ impl StreamedLayers {
     /// and distinct experts `live`'s where it read and the generic model's
     /// elsewhere ([`LiveDecode::shares`], [`LiveDecode::routed`]).
     /// The generic model loads a kind's consecutive layers alike, so without
-    /// `live` a run is its kind's; a load's own reads differ layer by layer,
+    /// `live` a run is its kind's (split only where per-layer holdings differ);
+    /// a load's own reads differ layer by layer,
     /// so with it each layer is a run of its own. Within a period every group's
     /// `routed`, `rows`, `recall` and `layers` are fixed, so `(tier, file)`
     /// across groups identifies each distinct step exactly.
-    fn period(&self, live: Option<&LiveDecode>, held: HeldSlots, rows: f64) -> Vec<(Vec<LayerRun>, usize)> {
+    fn period(&self, live: Option<&LiveDecode>, held: &HeldSlots, rows: f64) -> Vec<(Vec<LayerRun>, usize)> {
         let period = self.runs.iter().map(|run| run.experts).max().expect("a streamed plan streams a layer") as usize;
+        // Pre-coalesce consecutive layers with equal `(run, held.layer)` when
+        // `live` is `None` so per-layer holdings across uniform groups still
+        // run in one column per group.
+        let sub_runs: Vec<(usize, usize, (usize, usize))> = if live.is_none() {
+            let mut out = Vec::new();
+            let mut layer = 0usize;
+            for (run_idx, run) in self.runs.iter().enumerate() {
+                if !held.is_per_layer() {
+                    out.push((run_idx, run.layers, (held.slots, held.host)));
+                } else {
+                    for at in layer..layer + run.layers {
+                        let pair = held.layer(at);
+                        match out.last_mut() {
+                            Some((last_run, count, last_pair)) if *last_run == run_idx && *last_pair == pair => {
+                                *count += 1;
+                            }
+                            _ => out.push((run_idx, 1, pair)),
+                        }
+                    }
+                }
+                layer += run.layers;
+            }
+            out
+        } else {
+            Vec::new()
+        };
         let width = match live {
-            None => self.runs.len(),
+            None => sub_runs.len(),
             Some(_) => self.layers(),
         };
         let mut flat = vec![LayerRun { load: LayerLoad::default(), layers: 0 }; period * width];
-        let mut col = 0;
-        let mut layer = 0;
-        for run in &self.runs {
-            let model = |slots: usize| generic_shares(&run.model, slots as f64 / run.experts as f64, rows);
-            match live {
-                None => {
-                    fill_layer_period(&model, run.model.routed(rows), self.choices, held, rows, period, run.layers, &mut flat, width, col);
-                    col += 1;
-                }
-                Some(live) => {
-                    for at in layer..layer + run.layers {
-                        let routed = live.routed(at).unwrap_or_else(|| run.model.routed(rows));
-                        fill_layer_period(&|slots| live.shares(at, slots, || model(slots)), routed, self.choices, held, rows, period, 1, &mut flat, width, col);
-                        col += 1;
-                    }
+        match live {
+            None => {
+                for (col, &(run_idx, layers, pair)) in sub_runs.iter().enumerate() {
+                    let run = &self.runs[run_idx];
+                    let model = |slots: usize| generic_shares(&run.model, slots as f64 / run.experts as f64, rows);
+                    fill_layer_period(&model, run.model.routed(rows), self.choices, pair, rows, period, layers, &mut flat, width, col);
                 }
             }
-            layer += run.layers;
+            Some(live) => {
+                let mut col = 0;
+                let mut layer = 0;
+                for run in &self.runs {
+                    let model = |slots: usize| generic_shares(&run.model, slots as f64 / run.experts as f64, rows);
+                    for at in layer..layer + run.layers {
+                        let routed = live.routed(at).unwrap_or_else(|| run.model.routed(rows));
+                        fill_layer_period(&|slots| live.shares(at, slots, || model(slots)), routed, self.choices, held.layer(at), rows, period, 1, &mut flat, width, col);
+                        col += 1;
+                    }
+                    layer += run.layers;
+                }
+            }
         }
         const LINEAR_LIMIT: usize = 8;
         let mut patterns = Vec::<(Vec<LayerRun>, usize)>::new();
@@ -306,7 +345,7 @@ impl StreamedLayers {
     /// holding `held`: each layer's cold experts staged via `Pass::Group`
     /// ([`ExpertLines::group_stage`], matching runtime `Stages`), averaged over
     /// the generic model's period; none where `held` makes the bank whole.
-    pub(crate) fn pass_reads(&self, read: ReadLine, held: HeldSlots, rows: f64) -> f64 {
+    pub(crate) fn pass_reads(&self, read: ReadLine, held: &HeldSlots, rows: f64) -> f64 {
         if self.whole(held) {
             return 0.;
         }
@@ -344,7 +383,7 @@ impl StreamedLayers {
         read: ReadLine,
         compute: FormSeconds,
         bytes: u64,
-        held: HeldSlots,
+        held: &HeldSlots,
         num_layers: u64,
         decode_rows: u64,
         saturation_bytes: u64,
@@ -371,12 +410,14 @@ impl StreamedLayers {
             burst_reads / num_layers as f64
         };
         let mut records = crate::PathRecords::of(read, bytes, queue, crate::PathRecords::release_load(overlapped_step, single_reads))?;
-        // Derive multi-row verify staging concurrency directly from the
-        // volume's measured storage saturation window (`saturation_bytes`,
-        // e.g. `FULL_DEPTH * FULL_READ`) divided by `bytes`, bounded by the
-        // burst's own expected miss count so small models never over-allocate
-        // staging past a single burst's reads.
-        if decode_rows > 1 && burst_reads > 0.0 && bytes > 0 && saturation_bytes > 0 {
+        // Derive staging concurrency directly from the volume's measured
+        // storage saturation window (`saturation_bytes`, e.g.
+        // `FULL_DEPTH * FULL_READ`) divided by `bytes`, bounded by the step's
+        // expected miss count so small/high-residency models never
+        // over-allocate staging past a single step's reads, while plain decode
+        // and multi-row verify alike keep the SSD saturated during compute /
+        // draft overlap windows without hitting `Short::Staging`.
+        if burst_reads > 0.0 && bytes > 0 && saturation_bytes > 0 {
             let transfer = read.transfer_seconds(bytes as f64);
             if transfer > 0.0 {
                 let burst_misses = (burst_reads / transfer).ceil() as u64;
@@ -462,12 +503,12 @@ impl DecodePrice {
     }
 
     /// Whether the bank holds every streamed layer's experts at `held`.
-    pub fn whole(&self, held: HeldSlots) -> bool {
+    pub fn whole(&self, held: &HeldSlots) -> bool {
         self.layers.whole(held)
     }
 
     /// The step holding `held`.
-    pub fn step(&self, held: HeldSlots) -> StreamedStep {
+    pub fn step(&self, held: &HeldSlots) -> StreamedStep {
         self.layers.step_seconds(self.live.as_ref(), self.read, held, self.rows, self.compute)
     }
 
@@ -486,17 +527,18 @@ fn generic_shares(model: &MissModel, share: f64, rows: f64) -> Shares {
 }
 
 /// Fill column `col` of row-major `flat` (`period × width`) with a layer's
-/// loads over `period` steps of `rows` rows holding `held`: its misses and
-/// requests as `shares` give them at a bank of some slots, as whole counts
-/// over the period, the requests spread as evenly over it as integers allow
-/// and the misses as evenly over the requests, the file's among them as evenly
-/// again.
+/// loads over `period` steps of `rows` rows holding `(vram, host)` (disjoint
+/// tiers: link misses depend on `vram`, file misses depend on `vram + host`):
+/// its misses and requests as `shares` give them at a bank of some slots, as
+/// whole counts over the period, the requests spread as evenly over it as
+/// integers allow and the misses as evenly over the requests, the file's
+/// among them as evenly again.
 #[allow(clippy::too_many_arguments)]
 fn fill_layer_period(
     shares: &dyn Fn(usize) -> Shares,
     routed: f64,
     choices: u64,
-    held: HeldSlots,
+    (vram, host): (usize, usize),
     rows: f64,
     period: usize,
     layers: usize,
@@ -505,9 +547,9 @@ fn fill_layer_period(
     col: usize,
 ) {
     let misses = |slots: usize| (shares(slots).misses * routed * period as f64).round() as usize;
-    let total = misses(held.slots);
-    let filed = misses(held.slots.max(held.host)).min(total);
-    let missing = 1. - (1. - shares(held.slots).requests).powf(rows);
+    let total = misses(vram);
+    let filed = misses(vram.saturating_add(host)).min(total);
+    let missing = 1. - (1. - shares(vram).requests).powf(rows);
     let requests = ((missing * period as f64).round() as usize).clamp(total.min(1), total.min(period));
     let quiet = LayerLoad { routed, rows: choices as f64 * rows / routed, ..LayerLoad::default() };
     let quiet_run = LayerRun { load: quiet, layers };
@@ -527,9 +569,9 @@ fn fill_layer_period(
 /// A layer routing `routed` distinct experts a step and `choices` a row, its
 /// loads over a period of `period` steps of `rows` rows holding `held`.
 #[cfg(test)]
-fn layer_period(shares: &dyn Fn(usize) -> Shares, routed: f64, choices: u64, held: HeldSlots, rows: f64, period: usize) -> Vec<LayerLoad> {
+fn layer_period(shares: &dyn Fn(usize) -> Shares, routed: f64, choices: u64, held: &HeldSlots, rows: f64, period: usize) -> Vec<LayerLoad> {
     let mut flat = vec![LayerRun { load: LayerLoad::default(), layers: 1 }; period];
-    fill_layer_period(shares, routed, choices, held, rows, period, 1, &mut flat, 1, 0);
+    fill_layer_period(shares, routed, choices, held.layer(0), rows, period, 1, &mut flat, 1, 0);
     flat.into_iter().map(|run| run.load).collect()
 }
 
@@ -544,19 +586,44 @@ pub struct StreamedStep {
 }
 
 /// What a load holds of each streamed layer's experts: `slots` in the bank,
-/// and `host` in a host tier, inclusive of the bank's (none on unified
-/// memory): the tier holds the bank's experts too, so it holds more only
-/// past `slots`.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+/// and `host` in a disjoint host tier (none on unified memory): link misses
+/// depend on `v_l` and file misses depend on `v_l + h_l`. When `layers` is
+/// `Some`, each streamed layer `i` carries its own `(v_i, h_i)` pair in
+/// decoder order.
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct HeldSlots {
     pub slots: usize,
     pub host: usize,
+    layers: Option<Vec<(usize, usize)>>,
 }
 
 impl HeldSlots {
-    /// `slots` in the bank and nothing in a host tier.
+    /// `slots` in the bank and nothing in a host tier, uniformly across layers.
     pub fn bank(slots: usize) -> Self {
-        Self { slots, host: 0 }
+        Self { slots, host: 0, layers: None }
+    }
+
+    /// `slots` in the bank and `host` disjoint slots in a host tier, uniformly
+    /// across layers.
+    pub fn tiered(slots: usize, host: usize) -> Self {
+        Self { slots, host, layers: None }
+    }
+
+    /// Explicit per-layer `(vram, host)` disjoint holdings in decoder order.
+    pub fn per_layer(layers: Vec<(usize, usize)>) -> Self {
+        assert!(!layers.is_empty(), "invariant violated: per-layer HeldSlots must be non-empty");
+        let (slots, host) = layers[0];
+        Self { slots, host, layers: Some(layers) }
+    }
+
+    /// `(vram, host)` holding for streamed layer `index`.
+    pub fn layer(&self, index: usize) -> (usize, usize) {
+        self.layers.as_ref().map_or((self.slots, self.host), |layers| layers[index])
+    }
+
+    /// Whether holdings vary per layer.
+    pub fn is_per_layer(&self) -> bool {
+        self.layers.is_some()
     }
 }
 
@@ -577,18 +644,19 @@ mod tests {
     fn a_layer_misses_as_the_generic_model_gives() {
         let model = MissModel::of(32, 4);
         let shares = |slots: usize| generic_shares(&model, slots as f64 / 32., 1.);
-        let period = |held| layer_period(&shares, 4., 4, held, 1., 320);
+        let period = |held: &HeldSlots| layer_period(&shares, 4., 4, held, 1., 320);
         // 8 of 32 experts, a quarter: 4 a row, one row.
         let misses = (model.misses(0.25) * 4. * 320.).round() as u64;
-        let loads = period(HeldSlots::bank(8));
+        let loads = period(&HeldSlots::bank(8));
         assert_eq!(loads.iter().map(|load| load.tier + load.file).sum::<u64>(), misses);
         assert!(loads.iter().all(|load| load.tier == 0), "no host tier: every miss is the file's");
         let requests = (model.requests(0.25) * 320.).round() as usize;
         assert_eq!(loads.iter().filter(|load| load.file > 0).count(), requests, "a miss's steps are the requests'");
-        let tiered = period(HeldSlots { slots: 8, host: 32 });
+        // Disjoint host tier: 8 VRAM + 24 Host covers all 32 experts (0 file misses).
+        let tiered = period(&HeldSlots::tiered(8, 24));
         assert!(tiered.iter().all(|load| load.file == 0));
         assert_eq!(tiered.iter().map(|load| load.tier).sum::<u64>(), misses);
-        assert!(period(HeldSlots::bank(32)).iter().all(|load| load.tier + load.file == 0));
+        assert!(period(&HeldSlots::bank(32)).iter().all(|load| load.tier + load.file == 0));
     }
 
     /// The last slot that makes a bank whole saves the streamed form's own
@@ -600,7 +668,7 @@ mod tests {
         let layers = StreamedLayers::new(vec![32, 32], 4, std::sync::Arc::from([lines, lines]));
         let read = READ;
         let compute = FormSeconds { resident: 0.010, streamed: 0.0115 };
-        let step = |slots| layers.step_seconds(None, read, HeldSlots::bank(slots), 1., compute).total_seconds;
+        let step = |slots| layers.step_seconds(None, read, &HeldSlots::bank(slots), 1., compute).total_seconds;
         assert_eq!(step(32), compute.resident, "a whole bank decodes the resident forms and misses nothing");
         assert!(
             step(31) - step(32) >= compute.streamed - compute.resident,
@@ -638,8 +706,8 @@ mod tests {
     fn prepared_period_deduplicates_steps_and_matches_expanded_run() {
         let lines = ExpertLines::reference(1_000_000);
         let layers = StreamedLayers::new(vec![512; 4], 8, std::sync::Arc::from([lines; 4]));
-        let held = HeldSlots { slots: 120, host: 300 };
-        let prepared = layers.prepare(None, held, 1.);
+        let held = HeldSlots::tiered(120, 300);
+        let prepared = layers.prepare(None, &held, 1.);
         assert!(!prepared.whole);
         assert!(prepared.patterns.len() <= 8, "expected few distinct patterns, got {}", prepared.patterns.len());
         assert_eq!(prepared.patterns.iter().map(|(_, count)| *count).sum::<usize>(), 512);
@@ -654,7 +722,7 @@ mod tests {
             FormSeconds { resident: 0.010, streamed: 0.012 },
             FormSeconds { resident: 0.020, streamed: 0.025 },
         ] {
-            let direct = layers.step_seconds(None, READ, held, 1., compute);
+            let direct = layers.step_seconds(None, READ, &held, 1., compute);
             let reused = prepared.step_seconds(READ, compute);
             assert_eq!(reused, direct);
             let reference = step_inputs(compute.streamed, READ, ReadAhead::NONE, &layers.lines).run(expanded.iter().copied());
@@ -662,7 +730,7 @@ mod tests {
         }
 
         // Whole bank skips period construction and returns resident compute.
-        let whole = layers.prepare(None, HeldSlots::bank(512), 1.);
+        let whole = layers.prepare(None, &HeldSlots::bank(512), 1.);
         assert!(whole.whole);
         assert!(whole.patterns.is_empty());
         let compute = FormSeconds { resident: 0.010, streamed: 0.012 };
@@ -677,11 +745,11 @@ mod tests {
     fn prompt_pass_reads_uses_group_stage_without_compute_double_count() {
         let lines = ExpertLines::reference(ExpertLines::REFERENCE_RECORD);
         let layers = StreamedLayers::new(vec![32, 32], 4, std::sync::Arc::from([lines, lines]));
-        // 8 slots in VRAM, all 32 in host tier: every miss is served from host tier.
-        let held = HeldSlots { slots: 8, host: 32 };
+        // 8 slots in VRAM, 24 disjoint in host tier: every miss is served from host tier.
+        let held = HeldSlots::tiered(8, 24);
         let rows = 512.;
-        let group_reads = layers.pass_reads(READ, held, rows);
-        let more_rows = layers.pass_reads(READ, held, 2048.);
+        let group_reads = layers.pass_reads(READ, &held, rows);
+        let more_rows = layers.pass_reads(READ, &held, 2048.);
         // At 512 rows all 32 experts are routed, 24 miss VRAM and are staged over the link.
         let expected = 2. * lines.group_stage(&READ, 24, 0);
         assert!((group_reads - expected).abs() < 1e-12, "group_reads={group_reads}, expected={expected}");
@@ -689,7 +757,7 @@ mod tests {
         // rows once all experts are routed), without charging per-row compute.
         assert!((group_reads - more_rows).abs() < 1e-12, "group_reads ({group_reads}) must stay independent of row count ({more_rows})");
         // Whole bank has zero prompt miss reads.
-        assert_eq!(layers.pass_reads(READ, HeldSlots::bank(32), rows), 0.);
+        assert_eq!(layers.pass_reads(READ, &HeldSlots::bank(32), rows), 0.);
     }
 
     /// A `LiveDecode` with zero counted steps or non-positive/non-finite rows
@@ -737,7 +805,7 @@ mod tests {
         let iq3 = StreamedLayers::new(vec![512; 48], 10, iq3_lines);
         let iq3_compute = FormSeconds { resident: 0.015, streamed: 0.017 };
         let tps = |layers: &StreamedLayers, slots: usize, compute: FormSeconds| {
-            1. / layers.step_seconds(None, m4_max_ssd, HeldSlots::bank(slots), 1., compute).total_seconds
+            1. / layers.step_seconds(None, m4_max_ssd, &HeldSlots::bank(slots), 1., compute).total_seconds
         };
         let tps_30 = tps(&iq3, 154, iq3_compute);
         let tps_50 = tps(&iq3, 256, iq3_compute);
@@ -850,11 +918,11 @@ mod tests {
         let live = LiveDecode { layers, steps: 200, rows: 4.0, depth: 2048 };
         let compute = FormSeconds { resident: 0.015, streamed: 0.018 };
         let price = DecodePrice::new(streamed, live, READ, compute);
-        let held = HeldSlots { slots: 137, host: 282 };
-        let floor = HeldSlots { slots: 10, host: 282 };
+        let held = HeldSlots::tiered(137, 282);
+        let floor = HeldSlots::tiered(10, 282);
         let t0 = std::time::Instant::now();
-        let at_held = price.step(held).total_seconds;
-        let at_floor = price.step(floor).total_seconds;
+        let at_held = price.step(&held).total_seconds;
+        let at_floor = price.step(&floor).total_seconds;
         let elapsed = t0.elapsed();
         assert!(at_floor >= at_held && at_held > 0.0);
         // Generous upper bound that holds even in unoptimized debug builds.

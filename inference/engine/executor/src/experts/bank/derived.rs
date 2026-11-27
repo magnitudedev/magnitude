@@ -113,7 +113,8 @@ pub fn target_slots(room: u64, shape: &BankShape, charge: &dyn Fn(u64) -> u64) -
 /// (`memory::ledger::DeviceReading::room_after`), of what those weights
 /// place there beside every claim the store's ledger holds (the
 /// allocations after the import claimed before it, the load's request slot
-/// among them), held at most at the plan's slots.
+/// among them), held at most at the plan's ceiling so headroom freed between
+/// initial planning and post-import bank growth is claimed immediately.
 pub fn import_slots(
     at_load: &crate::memory::ledger::LoadEstimate,
     ledgers: &DeviceLedgers,
@@ -121,7 +122,7 @@ pub fn import_slots(
     plan: &crate::planning::ExpertBankPlan,
     floor: crate::memory::ClaimDemand,
 ) -> u64 {
-    let shape = BankShape::new(plan.tier_block_bytes(BankTier::Bank), plan.floor(), plan.ceiling, plan.slots);
+    let shape = BankShape::new(plan.tier_block_bytes(BankTier::Bank), plan.floor(), plan.ceiling, plan.ceiling);
     let charge = |slots| plan.resident_charge(slots).expect("invariant violated: a bank plan charges every size within its ceiling");
     let beside = ledgers.placed_in(device, floor, BankTier::Bank);
     import_target(at_load.of(BankTier::Bank), beside, &shape, &charge)
@@ -166,9 +167,9 @@ pub fn clamped_host_slots(
 }
 
 /// The experts' target a load's import holds, `beside` the bytes the
-/// import (its bank at its floor) places in the bank's store: the target as a reading of the store derives it once
-/// they are held (the estimate's bank room, `Estimate::import_room`, held by
-/// [`target_slots`]), so a load imports what its first reading keeps.
+/// import (its bank at its floor) places in the bank's store: the target as a
+/// reading of the store derives it once they are held (`Estimate::import_room`,
+/// held by [`target_slots`]), so a load imports what its first reading keeps.
 pub fn import_target(estimate: &Estimate, beside: u64, shape: &BankShape, charge: &dyn Fn(u64) -> u64) -> u64 {
     target_slots(estimate.import_room().saturating_sub(beside), shape, charge)
 }
@@ -316,21 +317,15 @@ pub fn derive<'t>(ledgers: &DeviceLedgers, targets: &'t [HoldingTarget<'t>]) -> 
             let estimate = ledgers.of(members[0].tier).estimate();
             let shapes: Vec<(BankShape, u64, u64, &dyn Fn(u64) -> u64)> =
                 members.iter().map(|target| (target.shape, target.at, target.owed, &*target.charge)).collect();
-            let host_tier = members.iter().all(|target| target.tier == BankTier::Host);
-            let max_pulse = members
-                .iter()
-                .filter(|target| target.at < target.shape.saturation_slots())
-                .map(|target| (target.charge)(target.at + 1).saturating_sub((target.charge)(target.at)))
-                .max()
-                .unwrap_or(0);
-            let (hold_room, grow_room, limit) = if host_tier {
+            let pinned = members.iter().all(|target| target.tier == BankTier::Host);
+            let (hold_room, grow_room, limit) = if pinned {
                 let budget = estimate.pinned_budget();
                 let limit = estimate.cap().map_or(budget, |cap| budget.min(cap));
-                (estimate.pinned_hold_room(), estimate.pinned_grow_room(max_pulse), limit)
+                (estimate.pinned_hold_room(), estimate.pinned_grow_room(), limit)
             } else {
                 let budget = estimate.budget();
                 let limit = estimate.cap().map_or(budget, |cap| budget.min(cap));
-                (estimate.hold_room(), estimate.grow_room(max_pulse), limit)
+                (estimate.hold_room(), estimate.grow_room(), limit)
             };
             let external_over = estimate.held().saturating_sub(limit);
             let slots = shared_targets_with_pressure(hold_room, grow_room, external_over, &shapes);

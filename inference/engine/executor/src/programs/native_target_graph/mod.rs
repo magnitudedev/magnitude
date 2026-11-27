@@ -18,7 +18,7 @@ mod weights;
 #[cfg(test)]
 pub(crate) use block::checked_block_graph_resources;
 pub(crate) use block::CarryPorts;
-pub(crate) use bound::{BankRun, BoundTargetGraphs, GroupBuffers, TokenRow, placed_banks};
+pub(crate) use bound::{BankRun, BoundTargetGraphs, GroupBuffers, PromptRoutesLease, TokenRow, placed_banks};
 pub(crate) use certify::{CheckedTargetFamily, checked_target_and_undrafted, checked_target_family};
 #[cfg(test)]
 pub(crate) use certify::checked_target_family_storage;
@@ -201,6 +201,12 @@ fn color_intervals(
     (slot_width, by_read)
 }
 
+/// Number of double-buffered host-visible per-layer prompt route slots held by
+/// [`GroupBuffers`] (`FlightDepth::PIPELINED = 2`), so a completed grouped
+/// prefill chain can export its per-row routes to `TokenRoutes` without racing
+/// a pipelined successor chain.
+pub(super) const PROMPT_ROUTE_SLOTS: usize = 2;
+
 /// The buffers a prompt group holds over its rows, a region per place
 /// (`GroupBuffers`): the draft input rows of a tapped target, the per-layer
 /// rows, the kept token rows and guesses, its split layers' crossing and merged
@@ -214,7 +220,10 @@ struct GroupExtents {
     tokens: Option<Extents>,
     guesses: Option<Extents>,
     split: Option<SplitValues<Extents>>,
-    decode_crossing: Option<crate::operators::routed::split::DecodeCrossingBuffers<Extents>>,
+    /// Per-slot, per-streamed-split-block host-visible `[rows, K]` `i32` route
+    /// buffers (`PROMPT_ROUTE_SLOTS` copies) for zero-kernel grouped-prefill
+    /// per-row route export into `TokenRoutes`.
+    prompt_routes: Vec<Extents>,
     /// The `[rows, quantized]` extents of one operand carry and the group's
     /// places: each place holds two alternating carries.
     operand_carry: Option<([Extents; 2], usize)>,
@@ -241,20 +250,19 @@ impl GroupExtents {
         served: &[BlockServed],
         rows: u64,
     ) -> Self {
-        let decode_crossing = {
-            let mut layers = served.iter().filter_map(|block| block.decode_crossing.clone());
-            layers.next().map(|first| {
-                let rest: Vec<_> = layers.collect();
-                crate::operators::routed::split::DecodeCrossingBuffers::widest(&first, &rest)
-            })
-        };
+        let prompt_routes = served
+            .iter()
+            .filter(|block| block.form.streams)
+            .filter_map(|block| block.split.as_ref().map(|layer| layer.at_rows(rows).crossing.routes))
+            .flat_map(|ext| std::iter::repeat_n(ext, PROMPT_ROUTE_SLOTS))
+            .collect();
         Self {
             taps: taps.map(|(element, [_, width])| (element, vec![rows, width])),
             per_layer: per_layer.map(|[_, width]| (Element::f32(), vec![rows, width])),
             tokens: tokens.map(|[_, width]| (Element::i32(), vec![rows, width])),
             guesses: guesses.map(|[_, width]| (Element::i32(), vec![rows, width])),
             split: SplitLayers::of(served).map(|layers| layers.at_rows(rows)),
-            decode_crossing,
+            prompt_routes,
             operand_carry: None,
             picks: Vec::new(),
             picks_by_read: Vec::new(),
@@ -298,7 +306,6 @@ impl GroupExtents {
     /// The group's own buffers.
     fn owned(&self) -> impl Iterator<Item = &Extents> {
         let split = self.split.iter().flat_map(|split| split.crossing.iter().chain([&split.merged.inverse]));
-        let decode_crossing = self.decode_crossing.iter().flat_map(|c| c.iter());
         let operand_carry = self
             .operand_carry
             .iter()
@@ -311,7 +318,7 @@ impl GroupExtents {
             .chain(&self.tokens)
             .chain(&self.guesses)
             .chain(split)
-            .chain(decode_crossing)
+            .chain(&self.prompt_routes)
             .chain(operand_carry)
             .chain(picks)
             .chain(pool)
@@ -397,7 +404,7 @@ impl GroupRows {
             taps: tap_width.map(|width| (activation(geometry), [largest_rows, width])),
             per_layer: prepared::per_layer_rows(plan, largest_rows),
             tokens: entry::token_rows_extents(load, largest_rows),
-            guesses: load.fronts().then_some([largest_rows, 2]),
+            guesses: load.fronts_target().then_some([largest_rows, 2]),
             operand_carry: carries.then(|| operand_carry_extents(backend, geometry.hidden)),
             picked: PickedBuffers::of(geometry, state, plan, picked)?,
             max_segments,

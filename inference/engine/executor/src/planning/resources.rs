@@ -2021,7 +2021,7 @@ impl ResourcePlanner {
     ) -> Result<ResourcePlan, String> {
         let load = &state.load;
         let limits = state.limits;
-        let slots = limits.startup_slots(load.fronts());
+        let slots = limits.startup_slots(load.chains_front());
         let target_graph = NativeGraphCharge::from_prepared(target_graphs, slots.target)?;
         let target_readout_graph = NativeGraphCharge::from_footprint(
             FamilyFootprint::serial(target_readout_graphs.family()),

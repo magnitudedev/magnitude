@@ -1361,11 +1361,7 @@ impl PreparedTargetGraphs {
                 .iter()
                 .chain(&graphs.untapped)
                 .filter(|((class, stage), _)| {
-                    class.0 == 1
-                        && matches!(
-                            stage,
-                            Stage::Run(RunStage::Whole | RunStage::Resident | RunStage::DecodeBack)
-                        )
+                    class.0 == 1 && matches!(stage, Stage::Run(RunStage::Whole | RunStage::Resident))
                 })
                 .map(|(_, graph)| Arc::clone(graph))
                 .collect::<Vec<_>>()
@@ -1376,11 +1372,7 @@ impl PreparedTargetGraphs {
                 .iter()
                 .chain(&graphs.untapped)
                 .filter(|((class, stage), _)| {
-                    class.0 == 1
-                        && matches!(
-                            stage,
-                            Stage::Run(RunStage::Whole | RunStage::Resident | RunStage::DecodeFront)
-                        )
+                    class.0 == 1 && matches!(stage, Stage::Run(RunStage::Whole | RunStage::Resident))
                 })
                 .map(|(_, graph)| Arc::clone(graph))
                 .collect::<Vec<_>>()
@@ -1541,6 +1533,16 @@ impl PreparedTargetGraphs {
         );
         crate::programs::graph::assert_storage_eq("target", &family, certificate.resources.storage);
         assert_eq!(
+            family.output_bytes(),
+            certificate.resources.storage.output,
+            "invariant violated: target family output bytes differ from certified storage",
+        );
+        assert_eq!(
+            family.upload_bytes(),
+            certificate.resources.storage.upload,
+            "invariant violated: target family upload bytes differ from certified storage",
+        );
+        assert_eq!(
             max_output_bytes,
             certificate.resources.storage.output,
             "invariant violated: target family max_output_bytes differs from certified output bytes"
@@ -1585,20 +1587,6 @@ impl PreparedTargetGraphs {
     /// (`block_stages`).
     pub(crate) fn stages(&self, index: usize, rows: u64) -> &'static [RunStage] {
         block_stages(&self.served, index, rows)
-    }
-
-    /// Whether block `index`'s decode over `rows` rows was sealed split around
-    /// its streamed layer's on-demand landing (`RunStage::DecodeFront`,
-    /// `ServedForm::decode_split`): the only decode a step may split.
-    pub(crate) fn splits_decode(&self, index: usize, rows: u64) -> bool {
-        crate::operators::routed::fused_graph::decodes(rows) && self.served[index].form.decode_split
-    }
-
-    /// Whether block `index` over `rows` rows was sealed with `RunStage::DecodeHits`
-    /// (the single authoritative decision shared by sealing, certification, and
-    /// runtime dispatch — never inferred via fallible graph lookup).
-    pub(crate) fn splits_decode_hits(&self, index: usize, rows: u64) -> bool {
-        crate::operators::routed::fused_graph::decodes(rows) && self.served[index].form.decode_hits
     }
 
     /// The stage of block `index`'s run of `rows` rows at `stage` of its

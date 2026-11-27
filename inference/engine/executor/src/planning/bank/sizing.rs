@@ -148,14 +148,60 @@ impl ExpertBankPlan {
         decode_set(selected, self.widest_member(group), magnitude_kernels::constants::VERIFY_ROWS)
     }
 
-    /// The most host slots a host tier holds: the widest layer's experts, a
-    /// host slot a record of each layer of every group, as a bank slot is,
-    /// so the tier's records hold every expert (the bank's among them), or
-    /// fewer where a weight cap leaves it fewer ([`Self::host_cap`]); none
-    /// without a tier. A tier of no host slots holds its landing reserve
-    /// alone ([`Self::host_records`]).
+    /// Host-tier slots for `layer` at `(device_slots, host_slots)`:
+    /// `0` when `layer` is whole in VRAM (`vram >= layer.experts`), otherwise
+    /// `host_slots.min(layer.experts)` so a host tier with enough RAM can hold
+    /// full cover (`HostRecords::complete()` / `tier_complete()`) with zero
+    /// NVMe spills.
+    pub fn layer_host_slots(&self, layer: &super::BankLayer, device_slots: u64, host_slots: u64) -> u64 {
+        if !self.tiered() {
+            return 0;
+        }
+        if self.layer_vram_slots(layer, device_slots) >= layer.experts {
+            return 0;
+        }
+        host_slots.min(layer.experts)
+    }
+
+    /// The most host slots useful beside a device bank at `device_slots`:
+    /// the widest `layer.experts` across all partial streamed layers (`0` when
+    /// `!tiered()` or `device_slots` is whole).
+    pub fn host_saturation_at(&self, device_slots: u64) -> u64 {
+        if !self.tiered() {
+            return 0;
+        }
+        self.layers()
+            .iter()
+            .filter(|layer| self.layer_vram_slots(layer, device_slots) < layer.experts)
+            .map(|layer| layer.experts)
+            .max()
+            .unwrap_or(0)
+    }
+
+    /// The fixed device coordinate against which this plan's host-tier records
+    /// and charges are sized: `self.slots` for a partial bank (disjoint sizing
+    /// `H_l <= E_l - V_l(self.slots)`), or `0` for a bank planned whole (so
+    /// that a whole bank that later shrinks to partial can still grow its host
+    /// tier up to `host_saturation_at(current_slots)`, while `BankShape::host`
+    /// holds it at `0` whenever the device bank is whole).
+    pub fn host_reference_slots(&self) -> u64 {
+        if self.whole() { 0 } else { self.slots }
+    }
+
+    /// The most host slots a disjoint host tier holds beside a device bank at
+    /// `device_slots`: `host_saturation_at(device_slots)`, capped by
+    /// `host_cap` when set; none without a tier.
+    pub fn host_ceiling_at(&self, device_slots: u64) -> Option<u64> {
+        self.tiered().then(|| {
+            let sat = self.host_saturation_at(device_slots);
+            self.host_cap.map_or(sat, |cap| cap.min(sat))
+        })
+    }
+
+    /// The most host slots a host tier holds at this plan's reference device
+    /// coordinate ([`Self::host_reference_slots`]); none without a tier.
     pub fn host_ceiling(&self) -> Option<u64> {
-        self.tiered().then(|| self.host_cap.unwrap_or(self.widest().get()))
+        self.host_ceiling_at(self.host_reference_slots())
     }
 
     /// Records of group `group`'s host tier tensors (`TR`): every expert of
@@ -168,41 +214,60 @@ impl ExpertBankPlan {
         }
     }
 
-    /// Group `group`'s committed host tier records at `host_slots` host
-    /// slots: each of its layers' slots ([`Self::layer_slots`]), and never
-    /// fewer than the landing reserve ([`Self::landing_records`]), so a
-    /// demand landing finds a record
-    /// past its grace whatever the tier holds, beside the conveyor's lent
-    /// records ([`Self::host_lent`]), its bottom ones, which a prompt group
-    /// holds for its life; at most its extent; none without a tier.
-    pub fn host_records(&self, group: usize, host_slots: u64) -> u64 {
+    /// Single holdings-to-records owner for group `group`'s committed host
+    /// tier records at fixed `device_slots`, `host_slots`, and `paths`:
+    /// each member layer's disjoint host slots ([`Self::layer_host_slots`]),
+    /// floored by the group's landing reserve (`group_landing_records_with_paths`),
+    /// plus `host_lent`, capped at `host_extent`; none without a tier.
+    pub fn host_records_at_with_paths(
+        &self,
+        group: usize,
+        device_slots: u64,
+        host_slots: u64,
+        paths: super::BankPaths,
+    ) -> u64 {
         match self.tiered() {
             true => (self
-                .member_experts(group)
-                .map(|experts| Self::layer_slots(host_slots, experts))
+                .member_layers(group)
+                .map(|layer| self.layer_host_slots(layer, device_slots, host_slots))
                 .sum::<u64>()
-                .max(self.group_landing_records(group))
+                .max(self.group_landing_records_with_paths(group, paths))
                 + self.host_lent(group))
             .min(self.host_extent(group)),
             false => 0,
         }
     }
 
-    /// What the host tier's pools are charged at `host_slots` host slots: the
-    /// whole blocks ([`Self::pooled_charge_for`]) holding each group's granule
-    /// for each record it commits there beyond its lent ones
-    /// ([`Self::host_lent`], charged at load as the lender's lent allocation);
-    /// none without a tier.
-    pub fn host_charge(&self, host_slots: u64) -> Result<u64, String> {
+    /// Group `group`'s committed host tier records at `host_slots` host slots
+    /// beside this plan's reference device coordinate.
+    pub fn host_records(&self, group: usize, host_slots: u64) -> u64 {
+        self.host_records_at_with_paths(group, self.host_reference_slots(), host_slots, self.paths)
+    }
+
+    /// What the host tier's pools are charged at fixed `device_slots`,
+    /// `host_slots`, and `paths`: whole blocks holding each group's granule
+    /// for each record committed beyond `host_lent`; none without a tier.
+    pub fn host_charge_at_with_paths(
+        &self,
+        device_slots: u64,
+        host_slots: u64,
+        paths: super::BankPaths,
+    ) -> Result<u64, String> {
         if !self.tiered() {
             return Ok(0);
         }
         self.pooled_charge_for(self.blocks(), |group| {
-            self.host_records(group, host_slots)
+            self.host_records_at_with_paths(group, device_slots, host_slots, paths)
                 .checked_sub(self.host_lent(group))
                 .expect("a group's host records hold its lent ones")
         })
         .ok_or_else(|| "host tier bytes overflow".to_owned())
+    }
+
+    /// What the host tier's pools are charged at `host_slots` host slots
+    /// beside this plan's reference device coordinate.
+    pub fn host_charge(&self, host_slots: u64) -> Result<u64, String> {
+        self.host_charge_at_with_paths(self.host_reference_slots(), host_slots, self.paths)
     }
 
     /// What the host tier at `host_slots` holds past its floor: cache,

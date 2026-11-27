@@ -165,6 +165,7 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
             }
             (image_features, encodes)
         };
+        let graph_replays_at_open = self.graph_replays();
         self.change_state(|this, _| {
             this.requests
                 .get_mut(&request)
@@ -175,6 +176,7 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
                 head,
                 tokens,
                 boundary,
+                graph_replays_at_open,
                 image_features,
                 verifying: false,
                 publishing: false,
@@ -321,12 +323,24 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
             self.conclude_chain().map_err(|error| error.to_string())?;
         }
         let entry = self.requests.get(&request).ok_or("request is not open")?;
-        if let RequestResidency::Resident(resident) = &entry.residency {
+        let graph_replays_at_open = if let RequestResidency::Resident(resident) = &entry.residency {
             if resident.target.is_none() || (self.head_store.is_some() && resident.head.is_none()) {
                 return Err("request has unresolved work".into());
             }
-        }
+            Some(resident.graph_replays_at_open)
+        } else {
+            None
+        };
         self.release_prefetches(&[request])?;
+        if let Some(before) = graph_replays_at_open {
+            let delta = self.graph_replays().since(before);
+            tracing::info!(
+                "graph replays (request {}): recorded={} updated={}",
+                request.0,
+                delta.recorded,
+                delta.updated,
+            );
+        }
         self.change_state(|this, _| {
             this.requests.remove(&request);
         });

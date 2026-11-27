@@ -134,12 +134,19 @@ impl LandingList {
         (constants::LANDING_ENTRY(entry as u64) + word) as usize
     }
 
-    /// Append `(from, to)` for step `sequence`: its entry, then the head
-    /// counting it. None where the list lists a later step already: the
+    /// Append `(from, to)` for step `sequence` with zero per-tensor lead
+    /// offsets (used by `routed_round` scratch rounds).
+    pub fn append(&self, sequence: Step, from: i32, to: i32) -> Option<usize> {
+        self.append_with_leads(sequence, from, to, [0, 0, 0])
+    }
+
+    /// Append `(from, to, leads)` for step `sequence`: its entry and per-tensor
+    /// `[gate, up, down]` byte lead offsets inside the staged record, then the
+    /// head counting it. None where the list lists a later step already: the
     /// device is past this step's launch, which converts nothing more. An
     /// entry past the list, or a pair outside its bounds, is an invariant
     /// violation.
-    pub fn append(&self, sequence: Step, from: i32, to: i32) -> Option<usize> {
+    pub fn append_with_leads(&self, sequence: Step, from: i32, to: i32, leads: [u32; 3]) -> Option<usize> {
         let mut head = self.head.lock().expect("a landing list's head");
         if sequence < head.0 {
             return None;
@@ -152,6 +159,9 @@ impl LandingList {
         assert!(self.bounds.admits(from, to), "landing entry {entry}, ({from}, {to}), outside {:?}", self.bounds);
         self.words.store(Self::word(entry, constants::LANDING_FROM), from);
         self.words.store(Self::word(entry, constants::LANDING_TO), to);
+        self.words.store(Self::word(entry, constants::LANDING_LEAD_GATE), i32::try_from(leads[0]).expect("gate lead fits i32"));
+        self.words.store(Self::word(entry, constants::LANDING_LEAD_UP), i32::try_from(leads[1]).expect("up lead fits i32"));
+        self.words.store(Self::word(entry, constants::LANDING_LEAD_DOWN), i32::try_from(leads[2]).expect("down lead fits i32"));
         head.1 += 1;
         let low = super::watcher::low_word(sequence) as u32;
         self.words.store_u64(constants::LANDING_HEAD as usize, u64::from(low) | (head.1 as u64) << 32);
@@ -223,20 +233,25 @@ impl DeviceLanding {
         self.state.lock().expect("a device landing")
     }
 
-    /// Its read landed whole in staging record `staged` at byte offset 0
-    /// (`tensor_leads` all zero), for the bank record `grant` takes: append its
-    /// entry. Whether it did: not once the list lists a later step, the device
-    /// past this one's launch, when it ends not landed.
+    /// Its read landed whole in staging record `staged` with per-tensor byte
+    /// lead offsets `tensor_leads` (`[gate, up, down]` for gated layers,
+    /// `[up, down]` for ungated layers), for the bank record `grant` takes:
+    /// append its entry. Whether it did: not once the list lists a later step,
+    /// the device past this one's launch, when it ends not landed.
     pub fn append(&self, grant: Grant, staged: u32, tensor_leads: &[usize]) -> bool {
-        assert!(
-            tensor_leads.iter().all(|&lead| lead == 0),
-            "DeviceLanding (routed_land) reads staging from byte offset 0, got non-zero tensor leads {tensor_leads:?}",
-        );
+        let to_u32 = |lead: usize| u32::try_from(lead).expect("staging lead fits u32");
+        let leads = match tensor_leads {
+            [] => [0, 0, 0],
+            [a] => [to_u32(*a), 0, 0],
+            [up, down] => [0, to_u32(*up), to_u32(*down)],
+            [gate, up, down] => [to_u32(*gate), to_u32(*up), to_u32(*down)],
+            other => panic!("DeviceLanding expects at most 3 routed tensor leads, got {}", other.len()),
+        };
         let to = i32::try_from(grant.record()).expect("bank records fit i32");
         let from = i32::try_from(staged).expect("staging records fit i32");
         let mut state = self.state();
         assert!(matches!(*state, Device::Reading), "a device landing appends once");
-        match self.list.append(self.at.sequence, from, to) {
+        match self.list.append_with_leads(self.at.sequence, from, to, leads) {
             Some(entry) => {
                 *state = Device::Appended { entry, grant, done: false };
                 true
@@ -425,12 +440,34 @@ pub(in crate::experts) struct Landing {
 pub(in crate::experts) struct Ended {
     landed: std::sync::Arc<std::sync::OnceLock<bool>>,
     events: std::sync::Arc<super::events::Events>,
+    completed: Option<(
+        super::staging::Staged,
+        std::sync::Arc<std::sync::Mutex<Vec<super::staging::Staged>>>,
+        std::sync::Arc<std::sync::atomic::AtomicBool>,
+    )>,
 }
 
 impl Ended {
     /// A landing's end, unset, which is an event of `events` once set.
     pub fn new(events: &std::sync::Arc<super::events::Events>) -> Self {
-        Self { landed: Default::default(), events: events.clone() }
+        Self { landed: Default::default(), events: events.clone(), completed: None }
+    }
+
+    /// Like [`Self::new`], also pushing `staged` into `completed` and setting
+    /// `has_completed` with `Release` ordering when [`Self::set`] fires so
+    /// `Prefetch::settle` runs in `O(completions)` instead of scanning all
+    /// in-flight entries on empty wakes.
+    pub fn new_notifying(
+        events: &std::sync::Arc<super::events::Events>,
+        staged: super::staging::Staged,
+        completed: std::sync::Arc<std::sync::Mutex<Vec<super::staging::Staged>>>,
+        has_completed: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    ) -> Self {
+        Self {
+            landed: Default::default(),
+            events: events.clone(),
+            completed: Some((staged, completed, has_completed)),
+        }
     }
 
     /// How it ended, none while it runs.
@@ -441,6 +478,10 @@ impl Ended {
     /// It ended, landed or not.
     pub fn set(&self, landed: bool) {
         self.landed.set(landed).expect("a landing ends once");
+        if let Some((staged, queue, flag)) = &self.completed {
+            queue.lock().expect("completed landings queue").push(*staged);
+            flag.store(true, std::sync::atomic::Ordering::Release);
+        }
         self.events.notify();
     }
 }

@@ -745,10 +745,13 @@ fn seal_graphs(
     opened.device().staff(None);
     drop(workers);
     // Every graph family of the load is checked and sealed: the shapes its
-    // checked entries evaluated for them, class by class, serve nothing
-    // further and are released. The moments on either side say what they
-    // held.
+    // checked entries evaluated for them, class by class, and the decoded
+    // bundle modules, formation-store cache, and preparation metadata serve
+    // nothing further and are released. The moments on either side say what
+    // they held.
     report_load_memory("graphs sealed", opened.device());
+    programs.release_preparation_metadata();
+    opened.device().release_formation_cache();
     let released = planning.finish();
     let trimmed = seismic::return_freed_pages();
     if let Some(released) = released {
@@ -1052,6 +1055,9 @@ fn import_target(
         .map_err(|error| import_refused(&error, &device, &startup.ledgers))
     })?;
     residency.release_upload();
+    let keep_lazy_components = head_enabled || manifest.definition.vision.is_some();
+    programs.release_target_imports(execution_plan.load(), keep_lazy_components);
+    device.release_formation_cache();
     let trimmed = seismic::return_freed_pages();
     if trimmed > 0 {
         tracing::info!("returned {trimmed} freed host bytes after weight import");
@@ -1256,6 +1262,7 @@ fn assemble_domain(
         })
         .transpose()
         .map_err(|error| internal(error.to_string()))?;
+    let programs_for_release = programs.clone();
     let (mut domain, mut bindings) = ExecutorDomain::new(
         Rc::new(execution_plan),
         definition,
@@ -1274,11 +1281,13 @@ fn assemble_domain(
     .map_err(|error| domain_refused(error, &startup.ledgers))?;
     report_load_phase("state and domain allocation", &mut phase_started);
     report_load_memory("domain allocated", &device);
-    // Release the pre-claimed drafter, head-upload, and recorded-graph reserves
-    // into the ledger right before binding the head and starting background
-    // host-tier backing. Binding the head here (Phase B1b, after
-    // `release_upload()` and before host-tier backing or serving KV growth)
-    // guarantees `head_upload_peak_bytes` never coexists with
+    // Release the pre-claimed drafter and head-upload reserves into the ledger
+    // right before binding the head. Keep `recorded_graphs_reserve` held until
+    // after `settle_bank_after_startup` so post-startup bank growth reclaims
+    // transient import/upload headroom without cannibalizing the VRAM budget
+    // reserved for recorded device graphs. Binding the head here (Phase B1b,
+    // after `release_upload()` and before host-tier backing or serving KV
+    // growth) guarantees `head_upload_peak_bytes` never coexists with
     // `target_upload_peak_bytes`, background host-tier backing, or serving
     // `state_slab_bytes`.
     if let Some(reserve) = drafter_reserve {
@@ -1287,13 +1296,26 @@ fn assemble_domain(
     if let Some(reserve) = head_upload_reserve {
         startup.ledgers.changes().change(|_| drop(reserve));
     }
-    if let Some(reserve) = recorded_graphs_reserve {
-        startup.ledgers.changes().change(|_| drop(reserve));
-    }
     if head_enabled {
         domain
             .bind_head()
             .map_err(|error| domain_refused(error, &startup.ledgers))?;
+        programs_for_release.release_target_imports(
+            planned.load(),
+            manifest.definition.vision.is_some(),
+        );
+        device.release_formation_cache();
+        let trimmed = seismic::return_freed_pages();
+        if trimmed > 0 {
+            tracing::info!("returned {trimmed} freed host bytes after head import");
+        }
+    }
+    drop(programs_for_release);
+    domain
+        .settle_bank_after_startup()
+        .map_err(|error| domain_refused(error, &startup.ledgers))?;
+    if let Some(reserve) = recorded_graphs_reserve {
+        startup.ledgers.changes().change(|_| drop(reserve));
     }
     domain
         .begin_host_backing()

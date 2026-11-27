@@ -211,11 +211,22 @@ impl Records {
     }
 }
 
+/// Maximum number of evicted `(layer, expert)` entries buffered between
+/// `Prefetch::prune_evicted_prefetches` drains before falling back to a full
+/// scan (bounds memory strictly even when no pruner drains it).
+const MAX_EVICTED_LOG: usize = 4096;
+
 pub(super) struct BankRecords {
     /// Per group, its records.
     groups: Vec<Records>,
     /// Per layer, its group and the record holding each expert.
     layers: Vec<(usize, Vec<Option<usize>>)>,
+    /// Per layer, exact count of experts currently held (`O(1)` `held_count`),
+    /// maintained exclusively by [`Self::hold`] and [`Self::unhold`].
+    layer_held: Box<[usize]>,
+    /// Experts unheld since the last [`Self::take_evicted`] drain (`None` when
+    /// more than [`MAX_EVICTED_LOG`] accumulated and the caller must scan).
+    evicted_log: Option<Vec<Staged>>,
     /// The experts a promotion or a seed takes a record for: no second
     /// placement takes one, so an expert is in one record at most.
     placing: HashSet<Staged>,
@@ -303,6 +314,8 @@ impl BankRecords {
         Self {
             groups,
             layers: layers.iter().map(|&(group, experts)| (group, vec![None; experts])).collect(),
+            layer_held: vec![0; layers.len()].into_boxed_slice(),
+            evicted_log: Some(Vec::new()),
             placing: HashSet::new(),
             promoting: Vec::new(),
             releasing: Vec::new(),
@@ -362,30 +375,34 @@ impl BankRecords {
         self.layers[layer].1[expert]
     }
 
-    /// Number of experts currently held in `layer`.
+    /// Number of experts currently held in `layer` (`O(1)`).
     pub fn held_count(&self, layer: usize) -> usize {
-        self.layers[layer].1.iter().filter(|slot| slot.is_some()).count()
+        self.layer_held[layer]
+    }
+
+    /// Drain the experts unheld since the last drain; returns `None` if the
+    /// bounded log overflowed and the caller must rescan.
+    pub fn take_evicted(&mut self) -> Option<Vec<Staged>> {
+        match &mut self.evicted_log {
+            Some(log) => Some(std::mem::take(log)),
+            None => {
+                self.evicted_log = Some(Vec::new());
+                None
+            }
+        }
+    }
+
+    /// Discard any buffered unheld entries without allocating.
+    pub fn clear_evicted(&mut self) {
+        match &mut self.evicted_log {
+            Some(log) => log.clear(),
+            None => self.evicted_log = Some(Vec::new()),
+        }
     }
 
     /// Whether a promotion or a seed takes a record for `staged`.
     pub fn placing(&self, staged: Staged) -> bool {
         self.placing.contains(&staged)
-    }
-
-    /// Whether `staged` is currently being placed into a non-lent record
-    /// (`!self.lends(group, record)`) by a prompt seed or permanent promotion.
-    pub fn placing_non_lent(&self, staged: Staged) -> bool {
-        if !self.placing.contains(&staged) {
-            return false;
-        }
-        let group = self.group(staged.0);
-        self.groups[group].contents.iter().enumerate().any(|(record, content)| {
-            !self.lends(group, record)
-                && matches!(
-                    *content,
-                    Record::Filling(s, _) | Record::Promoting(s, _) if s == staged
-                )
-        })
     }
 
     /// Group `group`'s records.
@@ -693,6 +710,7 @@ impl BankRecords {
         let held = &mut self.layers[staged.0].1[staged.1];
         assert!(held.is_none(), "expert {staged:?} is held already, in record {held:?}");
         *held = Some(record);
+        self.layer_held[staged.0] += 1;
         self.holdings += 1;
         self.set(self.layers[staged.0].0, record, Record::Held(staged));
     }
@@ -707,6 +725,14 @@ impl BankRecords {
         };
         assert_eq!(exit.staged(), staged, "record {record} of group {group} is left by another expert's exit");
         self.layers[staged.0].1[staged.1] = None;
+        self.layer_held[staged.0] -= 1;
+        if let Some(log) = &mut self.evicted_log {
+            if log.len() < MAX_EVICTED_LOG {
+                log.push(staged);
+            } else {
+                self.evicted_log = None;
+            }
+        }
         self.holdings += 1;
         self.unmap(staged, until);
         staged
@@ -1904,5 +1930,29 @@ mod tests {
         bank.backed(0, BankRecord(3));
         assert!(bank.moving());
         assert!(!bank.link_moving());
+    }
+
+    #[test]
+    fn work_bound_held_count_and_evicted_log_exact_across_1x_and_16x_experts() {
+        for experts in [64usize, 1024] {
+            let mut bank = BankRecords::new(&[experts], &[(0, experts)], None);
+            assert_eq!(bank.held_count(0), 0);
+            for e in 0..16 {
+                promoted(&mut bank, e as u32, e, 1);
+                assert_eq!(bank.held_count(0), e + 1);
+            }
+            // Release 3 experts and verify `held_count` and `take_evicted` track
+            // exact transitions independent of total `experts` (64 vs 1024).
+            for e in 0..3 {
+                bank.release(0, BankRecord(e as u32), UnmapStep::at(5), Exit::to_file((0, e)));
+            }
+            assert_eq!(bank.held_count(0), 13);
+            let evicted = bank.take_evicted().expect("evicted log did not overflow");
+            assert_eq!(evicted, vec![(0, 0), (0, 1), (0, 2)]);
+            assert_eq!(bank.take_evicted().expect("empty after drain"), Vec::new());
+            // Cross-check O(1) counter against ground-truth per-expert slots.
+            let exact = (0..experts).filter(|&e| bank.held(0, e).is_some()).count();
+            assert_eq!(bank.held_count(0), exact);
+        }
     }
 }

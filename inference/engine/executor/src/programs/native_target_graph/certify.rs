@@ -529,7 +529,7 @@ impl EntryScope {
             copies_token_rows: load.copies_token_rows(),
             notifies_selection: load.notifies_selection(),
             keeps_token_rows: load.keeps_token_rows(),
-            fronts: load.fronts(),
+            fronts: load.fronts_target(),
             target_table,
         }
     }

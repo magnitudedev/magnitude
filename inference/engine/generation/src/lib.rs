@@ -599,7 +599,7 @@ impl Generation {
             return None;
         };
         let deepest = FrontGrant::UpTo(usize::MAX);
-        match self.method.trails() {
+        match self.method.can_front() {
             true => (self.granted(limit, usize::MAX, deepest).min(self.method_factory.proposals()) > 0)
                 .then_some(GuessKind::Head),
             false => Some(self.front_rows(two_row, usize::MAX, limit, deepest).guesses().first()?.kind),
@@ -903,6 +903,7 @@ impl Generation {
                     }
                 };
                 if proposal.len() > limit
+                    || proposal.len() + front.len() > limit
                     || proposal
                         .iter()
                         .chain(front.iter().map(|guess| &guess.token))
@@ -915,11 +916,22 @@ impl Generation {
                 let proposal_stopped = proposal
                     .iter()
                     .any(|token| self.options.stop_tokens.contains(token));
-                let proposal = proposal
+                let acceptable = proposal
                     .iter()
                     .take_while(|token| !self.options.stop_tokens.contains(token))
                     .copied()
                     .collect::<Vec<_>>();
+                let front_tokens: Vec<TokenId> = if proposal_stopped {
+                    Vec::new()
+                } else {
+                    front
+                        .iter()
+                        .map(|guess| guess.token)
+                        .take_while(|token| !self.options.stop_tokens.contains(token))
+                        .collect()
+                };
+                let mut all_tokens = acceptable.clone();
+                all_tokens.extend_from_slice(&front_tokens);
                 // Seal the decode pass through the single-owner `DecodePassScorer`
                 // (reusing the real `DecodePassPlan` sealed by an adaptive drafter
                 // when available, preserving measured costs, calibrated survival,
@@ -934,7 +946,7 @@ impl Generation {
                     let cap = 1 + limit;
                     let verify = sealed
                         .verify
-                        .min(proposal.len())
+                        .min(acceptable.len())
                         .min(limit)
                         .min(remaining_after_exact);
                     let front = if verify == 0 {
@@ -942,12 +954,12 @@ impl Generation {
                     } else {
                         sealed
                             .front
-                            .min(proposal.len().saturating_sub(verify))
+                            .min(front_tokens.len())
                             .min(limit.saturating_sub(verify))
                             .min(magnitude_executor::CHAINED_ROWS.saturating_sub(1 + verify))
                     };
                     sealed.pass_id = pass_id;
-                    sealed.generated = sealed.generated.max(proposal.len());
+                    sealed.generated = sealed.generated.max(all_tokens.len());
                     sealed.verify = verify;
                     sealed.front = front;
                     sealed.idle_front = 0;
@@ -956,12 +968,12 @@ impl Generation {
                 } else {
                     self.seal_verify_pass(
                         pass_id,
-                        proposal.len(),
+                        all_tokens.len(),
                         1 + limit,
                         remaining_after_exact,
                     )?
                 };
-                let rows = plan.build_rows(&proposal, GuessKind::Chained)?;
+                let rows = plan.build_rows(&all_tokens, GuessKind::Chained)?;
                 // A round that verifies nothing publishes its feature only
                 // where its method reads it.
                 let verify_demand = match rows.acceptable().is_empty() && !self.method.taps() {
@@ -980,10 +992,10 @@ impl Generation {
                     verify_demand,
                     None,
                 )?;
-                if let Some(settled) = self.pass_outcomes.feed(plan, proposal.clone()) {
+                if let Some(settled) = self.pass_outcomes.feed(plan, all_tokens.clone()) {
                     self.last_pass_outcome = Some(settled);
                 } else {
-                    self.active_pass = Some((plan, proposal));
+                    self.active_pass = Some((plan, all_tokens));
                 }
                 round
             }
@@ -1068,13 +1080,21 @@ impl Generation {
         } else {
             AcceptanceProfile::Conditional(vec![1.0; actual_generated])
         };
+        let fronts_target = self.method_factory.requires().head
+            && self
+                .pricing
+                .lock()
+                .expect("generation pricing lock poisoned")
+                .streamed_prior
+                .is_some();
+        let max_front = if fronts_target { actual_generated } else { 0 };
         DecodePassScorer::seal_unchained_plan_on_widths(
             pass_id,
             actual_generated,
             0.0,
             reserved_capacity,
             0..=actual_generated,
-            0,
+            max_front,
             &acceptance,
             HorizonLimits {
                 remaining_tokens: remaining_after_exact,

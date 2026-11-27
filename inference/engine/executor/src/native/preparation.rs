@@ -2909,7 +2909,8 @@ impl<'a> Preparation<'a> {
             routed_seed_commit::native_entry(),
         )?;
         let list_grid = spec.fixed(&bindings, &[], routed_list_grid::native_entry())?;
-        let site = self.bank_site(slot, bank, layers, &bindings)?;
+        let combine = self.bank_combine(slot, bank, layers, &bindings)?;
+        let site = self.bank_site(slot, bank, &bindings)?;
         let gate_up = self.bank_gate_up(slot, bank, layers, &bindings)?;
         /// Every tensor's kernel, or none where one is a count or a listing.
         fn formed<T>(kernels: crate::planning::RecordTensors<Option<T>>) -> Option<crate::planning::RecordTensors<T>> {
@@ -2934,6 +2935,10 @@ impl<'a> Preparation<'a> {
             return Ok(None);
         };
         let placement = super::DevicePlacement { seed, seed_commit, list_grid };
+        let combine = match combine {
+            Some(None) => return Ok(None),
+            combine => combine.flatten(),
+        };
         let site = match site {
             Some(None) => return Ok(None),
             site => site.flatten(),
@@ -2941,6 +2946,30 @@ impl<'a> Preparation<'a> {
         let gate_up = match gate_up {
             Some(None) => return Ok(None),
             gate_up => gate_up.flatten(),
+        };
+        let stage_host = if bank.tier > 0
+            && <magnitude_kernels::routed_stage_host::Entry as seismic::EntryContract>::contract_node_shape(
+                self.spec.backend(),
+            )
+            .is_ok()
+        {
+            let gate_elem = bank.record.gate.map_or(bank.record.up.resident, |g| g.resident);
+            let Some(kernel) = self.spec.fixed(
+                &bindings,
+                &[("K", bank.selected)],
+                magnitude_kernels::routed_stage_host::native_entry_with(
+                    magnitude_kernels::routed_stage_host::Elements {
+                        UG: gate_elem,
+                        UU: bank.record.up.resident,
+                        UD: bank.record.down.resident,
+                    },
+                ),
+            )? else {
+                return Ok(None);
+            };
+            Some(kernel)
+        } else {
+            None
         };
         Ok(Some(super::ExpertBankKernels {
             route,
@@ -2952,7 +2981,9 @@ impl<'a> Preparation<'a> {
             pass_map,
             placement,
             site,
+            combine,
             gate_up,
+            stage_host,
         }))
     }
 
@@ -2994,38 +3025,34 @@ impl<'a> Preparation<'a> {
         }
     }
 
-    /// The CPU site entries of a streamed layer of feed-forward `slot` whose
-    /// bank is `bank`, over its streamed `layers`: none where the bank has
-    /// no host tier or the backend serves none of the site's entries
-    /// (`routed_site_request` and the combine of the layer's form);
-    /// `Some(None)` where one is a count or a listing. The combine's
-    /// projections follow the binding's resident combine range by range
-    /// (`Specializer::tuned_ranges_following`), so they keep that combine's
-    /// bits at every row; its sum has no parameter.
-    fn bank_site(
+    /// The split decode combine of a streamed layer of feed-forward `slot`
+    /// whose bank is `bank`, over its streamed `layers`: for general routed
+    /// layers, prepared whenever the backend declares `routed_down_project`
+    /// and `routed_down_sited` (independent of `bank.tier > 0`); for fused
+    /// layers, only where `BankCombine::served` holds.
+    fn bank_combine(
         &mut self,
         slot: crate::planning::BankedFeedForward,
         bank: crate::BankBinding,
         layers: &[WeightScope],
         bindings: &str,
-    ) -> Result<Option<Option<super::BankSite>>, CatalogFailure> {
+    ) -> Result<Option<Option<super::BankCombine>>, CatalogFailure> {
         use crate::planning::BankedFeedForward;
-        use magnitude_kernels::{routed_down_sited, routed_output_sited, routed_site_request};
+        use magnitude_kernels::{routed_down_sited, routed_output_sited};
         let failure = |entry: &'static str, outcome: String| CatalogFailure::Preparation {
             entry,
             bindings: bindings.to_owned(),
             outcome,
         };
-        if !super::BankSite::served(slot, bank, self.spec.backend()).map_err(|outcome| failure("routed_bank_site", outcome))? {
+        if !super::BankCombine::served(slot, bank, self.spec.backend()) {
             return Ok(None);
         }
-        let form = super::SiteForm::of(slot);
-        let (hidden, combine) = match slot {
+        let combine = match slot {
             BankedFeedForward::Routed(b) => {
                 let resident = self.resident_outputs.get(&b).cloned().ok_or_else(|| {
                     failure("routed_output_project", "a streamed layer's output was not prepared before it".into())
                 })?;
-                let combine = if <magnitude_kernels::routed_output_streamed::Entry as seismic::EntryContract>::contract_node_shape(self.spec.backend()).is_ok() {
+                if <magnitude_kernels::routed_output_streamed::Entry as seismic::EntryContract>::contract_node_shape(self.spec.backend()).is_ok() {
                     let case = crate::native::tuning::routed::RoutedOutputStreamedTuning {
                         resident: resident.clone(),
                         layers: layers.to_vec(),
@@ -3043,14 +3070,13 @@ impl<'a> Preparation<'a> {
                         routed_output_sited::native_entry_with(routed_output_sited::Elements { A: b.activation }),
                     )?;
                     project.zip(sited).map(|(project, sited)| super::BankCombine::Fused { project, sited })
-                };
-                (b.hidden, combine)
+                }
             }
             BankedFeedForward::GeneralRouted(b) | BankedFeedForward::Parallel(crate::ParallelBinding { routed: b, .. }) => {
                 let resident = self.resident_downs.get(&b).cloned().ok_or_else(|| {
                     failure("routed_down_project", "a streamed layer's down was not prepared before it".into())
                 })?;
-                let case = RoutedDownProjectTuning { resident: resident.clone(), layers: layers.to_vec() };
+                let case = RoutedDownProjectTuning { resident: resident.clone(), layers: layers.to_vec(), bank };
                 let project = self.served_projection_following(DECODE_SERVED, case, resident)?;
                 let sited = self.spec.fixed(
                     bindings,
@@ -3060,8 +3086,37 @@ impl<'a> Preparation<'a> {
                         R: crate::operators::routed::graph::sum_element(&b),
                     }),
                 )?;
-                let combine = project.zip(sited).map(|(project, sited)| super::BankCombine::General { project, sited });
-                (b.shape.expert_hidden, combine)
+                project.zip(sited).map(|(project, sited)| super::BankCombine::General { project, sited })
+            }
+        };
+        Ok(Some(combine))
+    }
+
+    /// The CPU site request entry of a streamed layer of feed-forward `slot`
+    /// whose bank is `bank`: none where the bank has no host tier or the
+    /// backend serves none of the site's entries (`BankSite::served`);
+    /// `Some(None)` where it is a count or a listing.
+    fn bank_site(
+        &mut self,
+        slot: crate::planning::BankedFeedForward,
+        bank: crate::BankBinding,
+        bindings: &str,
+    ) -> Result<Option<Option<super::BankSite>>, CatalogFailure> {
+        use crate::planning::BankedFeedForward;
+        use magnitude_kernels::routed_site_request;
+        let failure = |entry: &'static str, outcome: String| CatalogFailure::Preparation {
+            entry,
+            bindings: bindings.to_owned(),
+            outcome,
+        };
+        if !super::BankSite::served(slot, bank, self.spec.backend()).map_err(|outcome| failure("routed_bank_site", outcome))? {
+            return Ok(None);
+        }
+        let form = super::SiteForm::of(slot);
+        let hidden = match slot {
+            BankedFeedForward::Routed(b) => b.hidden,
+            BankedFeedForward::GeneralRouted(b) | BankedFeedForward::Parallel(crate::ParallelBinding { routed: b, .. }) => {
+                b.shape.expert_hidden
             }
         };
         let request = self.spec.fixed(
@@ -3069,7 +3124,7 @@ impl<'a> Preparation<'a> {
             &[("H", hidden), ("K", bank.selected)],
             routed_site_request::native_entry_with(routed_site_request::Elements { A: form.activation }),
         )?;
-        Ok(Some(request.zip(combine).map(|(request, combine)| super::BankSite { request, combine, form, admitted: None })))
+        Ok(Some(request.map(|request| super::BankSite { request, form, admitted: None })))
     }
 
     /// The extents of a streamed layer of feed-forward `slot` (H, E, K, F:
@@ -3521,7 +3576,7 @@ impl<'a> Preparation<'a> {
         let sample = self
             .spec
             .tuned(&mut self.tuning, &SampleRowsTuning { vocabulary })?;
-        let chain = match self.tuning.model().load.fronts() {
+        let chain = match self.tuning.model().load.chains_front() {
             true => fixed!(self.spec, guess_chain, "head"),
             false => None,
         };

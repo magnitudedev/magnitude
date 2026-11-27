@@ -164,6 +164,14 @@ fn bank_of(groups: &[usize], slots: u64, experts: impl Fn(usize) -> u64, form: R
     let structured = conveyor::Structured::new(8, HostTier::Linked, groups, layers, None, VERIFY_ROWS).unwrap();
     let allocations = seismic::NativeAllocations::EXACT;
     let blocks = size_pool_blocks(structured.granules(), allocations).unwrap();
+    let residency = ResidencyOrder::default_for(
+        structured.groups(),
+        structured.layers(),
+        VERIFY_ROWS,
+        1,
+        HostTier::Linked.placer(),
+        true,
+    );
     ExpertBankPlan {
         structured,
         backend: seismic::BackendName::Cuda,
@@ -183,7 +191,7 @@ fn bank_of(groups: &[usize], slots: u64, experts: impl Fn(usize) -> u64, form: R
         sites: BankSites::Unadmitted,
         paths: BankPaths::Priced { line: LINE, records: PATHS },
         recording: false,
-        decode_hits_min_bytes: 0,
+        residency,
     }
 }
 
@@ -205,11 +213,23 @@ fn restructured(
     change: impl FnOnce(&mut HostTier, &mut Vec<BankGroup>),
 ) -> ExpertBankPlan {
     let decode_rows = plan.decode_rows();
+    let head_steps = plan.head_steps;
+    let has_side_queue = plan.has_side_queue;
+    let backend = plan.backend;
     let (selected, mut host, mut groups, layers) = plan.structured.into_parts();
     change(&mut host, &mut groups);
     let structured = conveyor::Structured::new(selected, host, groups, layers, None, decode_rows).unwrap();
     let blocks = size_pool_blocks(structured.granules(), plan.allocations).unwrap();
-    ExpertBankPlan { structured, blocks, ..plan }
+    let tier_copy_dma = host == HostTier::Linked && backend.fills_beside_compute() && has_side_queue;
+    let residency = ResidencyOrder::default_for(
+        structured.groups(),
+        structured.layers(),
+        decode_rows,
+        head_steps,
+        host.placer(),
+        tier_copy_dma,
+    );
+    ExpertBankPlan { structured, blocks, residency, ..plan }
 }
 
 /// `plan` with its scratch bounded to `window_slots` experts of a layer,
@@ -429,29 +449,39 @@ fn per_group_granules_charge_each_groups_own_slab_on_vram_and_host() {
     );
 }
 
-/// A host tier grows in one step from `from` toward every expert, its
-/// ceiling, within its room ([`growth_target`] on its charge, `BankCounts::host_growth`); a bank
-/// without a tier grows none, nor a whole one or one out of room.
+/// A disjoint host tier grows in one step from `from` toward every expert not
+/// held in VRAM (`host_saturation_at(device_slots)`), within its room
+/// ([`growth_target`] on its charge, `BankCounts::host_growth`); a bank without
+/// a tier grows none, nor a whole one or one out of room.
 #[test]
 fn a_host_tier_grows_toward_every_expert_within_its_room() {
     let without = beside(bank(&[3, 1], 26), HostTier::Unified(Parking::InKernels));
-    let plan = beside(without.clone(), HostTier::Linked);
+    // Two identical-workload target groups of 256 experts advance in lockstep
+    // (`max_slots == 256`). At `slots = 26`, each group holds 26 VRAM slots,
+    // leaving `256 - 26 = 230` disjoint host slots.
+    let mut plan = beside(without.clone(), HostTier::Linked);
+    plan.ceiling = plan.max_slots();
+    let sat = plan.host_saturation_at(26);
+    assert_eq!(sat, 256, "partial tiered bank host saturation covers all 256 experts for tier_complete()");
     let all = u64::MAX;
     let counts = plan.counts().unwrap();
-    assert_eq!(counts.host_growth(0, 26, all), Some(256), "every expert");
-    assert_eq!(counts.host_growth(256, 26, all), None, "whole");
+    assert_eq!(counts.host_growth(0, 26, all), Some(sat), "every non-VRAM expert");
+    assert_eq!(counts.host_growth(sat, 26, all), None, "saturated");
+    assert_eq!(counts.host_growth(0, plan.max_slots(), all), None, "whole device bank needs 0 host slots");
     assert_eq!(without.counts().unwrap().host_growth(0, 26, all), None, "no tier");
     let room = plan.host_charge(40).unwrap() - plan.host_charge(0).unwrap();
-    assert_eq!(counts.host_growth(0, 26, room), Some(40), "within its room");
-    // Up to 26 slots the tier holds its floor, the landing reserve.
-    assert_eq!(counts.host_growth(0, 10, 0), Some(26), "slots within the reserve cost nothing");
-    assert_eq!(counts.host_growth(26, 10, 0), None, "no room for one past it");
-    // Its first slots, up to the bank's, hold the bank's copies: a growth
-    // reaches past them, or none fits.
-    assert_eq!(counts.host_growth(0, 26, 0), None, "no room past the bank's 26 slots");
-    assert_eq!(counts.host_growth(0, 50, room), None, "a room of 40 slots holds none past the bank's 50");
-    let past = plan.host_charge(60).unwrap() - plan.host_charge(0).unwrap();
-    assert_eq!(counts.host_growth(0, 50, past), Some(60), "one step past the bank's 50");
+    let grown = counts.host_growth(0, 26, room).expect("within its room");
+    assert!(grown >= 40 && counts.host_charge(grown) - counts.host_charge(0) <= room);
+    // Disjoint host slots start covering non-VRAM experts from slot 1 (no
+    // wasted `0..=bank_slots` inclusive prefix): a room for 40 host slots fits
+    // disjointly even beside 50 device slots.
+    assert_eq!(counts.host_growth(0, 50, room), Some(grown), "disjoint host grows from 0 regardless of device slots");
+    // Up to the landing reserve, host slots cost nothing extra beyond floor.
+    let free_slots = counts.host_growth(0, 26, 0);
+    if let Some(free) = free_slots {
+        assert_eq!(counts.host_charge(free), counts.host_charge(0));
+        assert_eq!(counts.host_growth(free, 26, 0), None, "no room past free landing reserve");
+    }
 }
 
 /// A bank's counts are the plan's derivations at every count it may hold:
@@ -462,13 +492,14 @@ fn a_host_tier_grows_toward_every_expert_within_its_room() {
 fn a_banks_counts_are_its_plans_derivations_at_every_count() {
     let unified = beside(bank(&[37, 3], 1), HostTier::Unified(Parking::InKernels));
     let linked = beside(bank(&[37, 3], 0), HostTier::Linked);
-    for plan in [unified, linked] {
+    for mut plan in [unified, linked] {
         // Growth reaches every expert.
-        let plan = ExpertBankPlan { ceiling: plan.widest().get(), ..plan };
+        plan.ceiling = plan.max_slots();
         let counts = plan.counts().unwrap();
         assert_eq!(counts.floor(), plan.floor());
         for slots in 0..=plan.ceiling {
             assert_eq!(counts.resident_charge(slots), plan.resident_charge(slots).unwrap(), "{slots} slots");
+            assert_eq!(counts.host_saturation_at(slots), plan.host_saturation_at(slots), "{slots} host saturation");
             for group in 0..plan.groups().len() {
                 assert_eq!(counts.records_at(group, slots), plan.records_at(group, slots), "group {group} at {slots} slots");
                 if plan.placer() == Placer::Bank {
@@ -492,9 +523,9 @@ fn a_banks_counts_are_its_plans_derivations_at_every_count() {
 
 /// A tiered record prices the misses its host tier holds as served by
 /// the cost function at once, not after a storage read: beside a bank of
-/// one slot, a tier of the decode's saturation in host slots holds every
-/// miss, and the step costs what serving them from it does, the CPU and
-/// the link bounded together by the host memory they read
+/// one slot, a disjoint tier of `saturation - 1` host slots holds every
+/// remaining miss, and the step costs what serving them from it does, the CPU
+/// and the link bounded together by the host memory they read
 /// ([`magnitude_cost_model::StepInputs`]).
 #[test]
 fn a_tiered_records_host_held_misses_are_priced_as_served() {
@@ -503,11 +534,11 @@ fn a_tiered_records_host_held_misses_are_priced_as_served() {
     let layers = StreamedLayers::new(vec![4], 4, std::sync::Arc::from([lines]));
     let decode = crate::domain::fixtures::misses_at(3, 100);
     let price = DecodePrice::new(layers, decode, crate::domain::fixtures::READ, FormSeconds { resident: 0.015, streamed: 0.015 });
-    let host = price.saturation().expect("the decode found its reads") as usize;
-    assert_eq!(host, 4, "the misses stop falling at the decode's 4 slots");
-    let held = HeldSlots { slots: 1, host };
-    let step = |held| price.step(held);
-    let (bank_alone, tiered) = (step(HeldSlots::bank(1)), step(held));
+    let sat = price.saturation().expect("the decode found its reads") as usize;
+    assert_eq!(sat, 4, "the misses stop falling at the decode's 4 slots");
+    let held = HeldSlots::tiered(1, sat - 1);
+    let step = |held: &HeldSlots| price.step(held);
+    let (bank_alone, tiered) = (step(&HeldSlots::bank(1)), step(&held));
     assert!(tiered.total_seconds < bank_alone.total_seconds, "{tiered:?} against {bank_alone:?}");
     // Four cold tier misses of one row a step and no hit, of 1 MB
     // records: three on the CPU after its handshake (4 + 3 · 20.7 µs)
@@ -534,13 +565,21 @@ fn a_tiered_records_host_held_misses_are_priced_as_served() {
 fn a_host_tier_holds_each_groups_records_in_their_resident_form() {
     let without = beside(bank(&[3, 1], 26), HostTier::Unified(Parking::InKernels));
     let plan = beside(without.clone(), HostTier::Linked);
+    // Partial tiered bank host ceiling beside 26 VRAM slots on E=256 is full cover (256).
     assert_eq!((plan.host_ceiling(), without.host_ceiling()), (Some(256), None));
     let lent = plan.conveyor().carrier.lender().records;
     assert_eq!((plan.host_extent(0), plan.host_extent(1), without.host_extent(0)), (3 * 256 + lent, 256, 0));
-    // Never fewer than the landing reserve.
-    assert_eq!(plan.landing_records(), 80);
-    assert_eq!((plan.host_records(0, 0), plan.host_records(0, 30), plan.host_records(1, 30)), (80 + lent, 90 + lent, 80));
-    assert_eq!(plan.host_records(0, 300), 3 * 256 + lent, "a layer holds at most its experts");
+    // Never fewer than the landing reserve (`VERIFY_ROWS * selected + ahead` = 16 * 8 + 16 = 144).
+    assert_eq!(plan.landing_records(), 144);
+    assert_eq!(
+        (plan.host_records(0, 0), plan.host_records(0, 30), plan.host_records(0, 60), plan.host_records(1, 30)),
+        (144 + lent, 144 + lent, 180 + lent, 144)
+    );
+    assert_eq!(
+        plan.host_records(0, 300),
+        3 * 256 + lent,
+        "a host tier holds at most E per partial layer"
+    );
     assert_eq!(without.host_records(0, 2), 0);
     let layout = plan.layout().unwrap();
     let tiers = layout.host.as_ref().expect("a tier's record tensors");
@@ -551,13 +590,13 @@ fn a_host_tier_holds_each_groups_records_in_their_resident_form() {
         }
     }
     assert!(without.layout().unwrap().host.is_none());
-    // `Placer::Tier` adds alignment headroom for zero-bounce direct staging,
-    // whereas `Placer::Bank` (`without`) keeps tight `routed_land` tensor shape.
-    assert_eq!(layout.staging.len(), without.layout().unwrap().staging.len());
-    for (tier_staging, bank_staging) in layout.staging.iter().zip(without.layout().unwrap().staging.iter()) {
+    // Both `Placer::Tier` and `Placer::Bank` (`without`) share the same unified
+    // byte-typed staging allocations (one per routed tensor) with alignment
+    // headroom for zero-bounce direct staging (`AllowAlignedLead`).
+    for ((_, tier_staging), (_, bank_staging)) in layout.staging.iter().zip(without.layout().unwrap().staging.iter()) {
         let tier_bytes = tier_staging.storage_demand(plan.host()).unwrap().checked_bytes().unwrap();
         let bank_bytes = bank_staging.storage_demand(without.host()).unwrap().checked_bytes().unwrap();
-        assert!(tier_bytes > bank_bytes, "Placer::Tier staging ({tier_bytes}) must include alignment headroom over Placer::Bank ({bank_bytes})");
+        assert_eq!(tier_bytes, bank_bytes, "Placer::Tier and Placer::Bank staging must both include alignment headroom");
     }
     // Charged each group's granule in its host pool's blocks past the lent
     // ones, which their lent allocation holds.
@@ -567,8 +606,9 @@ fn a_host_tier_holds_each_groups_records_in_their_resident_form() {
             + blocks[1].charge(plan.group_granule(1), g1).unwrap()
     };
     assert_eq!(plan.host_lent(0), lent);
-    assert_eq!(plan.host_charge(30).unwrap(), charge_host(90, 80));
-    assert_eq!(plan.host_charge(0).unwrap(), charge_host(80, 80));
+    assert_eq!(plan.host_charge(30).unwrap(), charge_host(144, 144));
+    assert_eq!(plan.host_charge(60).unwrap(), charge_host(180, 144));
+    assert_eq!(plan.host_charge(0).unwrap(), charge_host(144, 144));
     assert_eq!(without.host_charge(2).unwrap(), 0);
     // A host tier adds its records, host memory, and the words the
     // device serves from it by: each layer's tier map; and each layer's
@@ -1047,7 +1087,8 @@ fn a_bank_plans_every_routed_layer_into_its_groups_records() {
             continue;
         };
         let tensor = *bank.groups()[group].record.get(RoutedTensor::of(weight.role.kind).unwrap()).unwrap();
-        assert_eq!(weight.shape, [64, tensor.matrix[0], tensor.matrix[1]]);
+        assert_eq!(bank.slab_records(group), 64 + u64::from(magnitude_cost_model::DECODE_STAGE_SLOTS));
+        assert_eq!(weight.shape, [bank.slab_records(group), tensor.matrix[0], tensor.matrix[1]]);
         assert_eq!(weight.resident_bytes, floor * tensor.record_bytes().unwrap());
         assert_eq!(weight.source_bytes, 0);
     }
@@ -1358,7 +1399,7 @@ fn a_bank_charges_every_allocation_of_its_layout() {
         assert_eq!(layer.front, words(BankPart::Front));
         assert_eq!(layer.rounds.len() as u64, plan.rounds(), "a round list of every round, the layer's own");
     }
-    assert_eq!(layout.staging.len(), plan.staging_pools().0.len());
+    assert_eq!(layout.staging.iter().count(), plan.form().tensors().len());
     // The floor's one chain place of each placed part, at its stride.
     let floor = plan.placed(std::num::NonZeroU64::MIN).unwrap();
     assert_eq!(floor.step, [(Element::i32(), vec![plan.place_stride(0, BankPart::Step).unwrap()])]);
@@ -1414,10 +1455,13 @@ fn layers_of_different_expert_counts_size_their_records_by_their_own() {
     assert_eq!(plan.widest().get(), 496);
     assert_eq!((plan.records(0), plan.records(1)), (240 + 496, 304));
     assert_eq!((plan.home(0), plan.home(1), plan.home(2)), (0, 240, 0));
-    // The narrowest layer holds every expert at 300 slots, the others
-    // their slots: a group that lends nothing holds no scratch.
-    assert_eq!((plan.committed_records(0), plan.committed_records(1)), (240 + 300, 300));
-    assert!(!plan.whole() && bank_of(&[2, 1], 496, |layer| experts[layer], RecordForm::Up).whole());
+    // Under marginal-value residency, groups with different expert counts
+    // advance by their own marginal hit-rate curves and reach whole at `max_slots()`.
+    let expected_g0 = (plan.layer_vram_slots(&plan.layers()[0], 300) + plan.layer_vram_slots(&plan.layers()[1], 300))
+        .max(plan.least_records(0));
+    let expected_g1 = plan.layer_vram_slots(&plan.layers()[2], 300).max(plan.least_records(1));
+    assert_eq!((plan.committed_records(0), plan.committed_records(1)), (expected_g0, expected_g1));
+    assert!(!plan.whole() && bank_of(&[2, 1], plan.max_slots(), |layer| experts[layer], RecordForm::Up).whole());
     let shape = |layer, part| plan.part_shape(layer, part).unwrap().1;
     assert_eq!(shape(0, BankPart::SlotMap), [240, constants::MAP_WORDS]);
     assert_eq!(shape(0, BankPart::Map), [240 + 496, constants::MAP_WORDS]);
@@ -1717,6 +1761,14 @@ fn target_and_draft_bank(target_layers: usize, draft_layers: usize, paths: BankP
     )
     .unwrap();
     plan.blocks = size_pool_blocks(structured.granules(), plan.allocations).unwrap();
+    plan.residency = ResidencyOrder::default_for(
+        structured.groups(),
+        structured.layers(),
+        plan.decode_rows(),
+        plan.head_steps,
+        HostTier::Linked.placer(),
+        plan.tier_copy_dma(),
+    );
     plan.structured = structured;
     plan.paths = paths;
     plan
@@ -1766,19 +1818,15 @@ fn draft_only_staging_pools_and_host_records_omit_hint_records() {
     };
     let plan = target_and_draft_bank(10, 3, paths);
     let layout = plan.layout().unwrap();
-    let has_hints = plan.staging_pool_has_hints();
-    assert!(has_hints.iter().any(|&h| h) && has_hints.iter().any(|&h| !h));
-
-    for (alloc, &pool_has_hints) in layout.staging.iter().zip(&has_hints) {
-        let BankAllocation::Shared { extents, .. } = alloc else {
-            panic!("staging allocation must be Shared");
+    // Unified byte-typed staging allocates one buffer per routed tensor
+    // (shared across both target and draft quant forms) sized to
+    // `demand_records + ahead`, so draft layers add zero extra staging buffers.
+    assert_eq!(layout.staging.iter().count(), plan.form().tensors().len());
+    for (_, alloc) in layout.staging.iter() {
+        let BankAllocation::SharedRecords { extents, .. } = alloc else {
+            panic!("unified staging allocation must be SharedRecords");
         };
-        let expected = if pool_has_hints {
-            plan.demand_records() + 103
-        } else {
-            plan.demand_records()
-        };
-        assert_eq!(extents[0], expected, "pool has_hints={pool_has_hints} staging extent mismatch");
+        assert_eq!(extents[0], plan.demand_records() + 103);
     }
 
     assert!(plan.group_has_hints(0));
@@ -1820,185 +1868,252 @@ fn draft_only_staging_pools_and_host_records_omit_hint_records() {
     );
 }
 
-/// On discrete GPUs (`Placer::Tier`), non-splitting draft layers pin all of
-/// their experts (`128/128`, `whole == true`) once `slots` exceeds the target
-/// decode/verify working set (`draft_pin_threshold()`), and fall back
-/// gracefully to shared `slots` on tight VRAM.
+/// Unified marginal-value residency allocator vs unconstrained 2D optimal split
+/// at actual RTX 5090 64 GB, RTX 3090 24 GB, and M5 Pro 48 GB byte budgets
+/// using real pooled block charges (`resident_charge` / `host_charge`).
+///
+/// Verifies:
+/// 1. Smooth single-group increments across `0..=max_slots` (zero cliff on
+///    RTX 3090 24 GB or any other budget).
+/// 2. 1D monotone prefix miss time is within `< 2%` of the unconstrained 2D
+///    global optimum `(V_t*, V_d*)` on BOTH RTX 5090 64 GB (asymmetric
+///    split-DMA target vs zero-copy draft) AND M5 Pro 48 GB (symmetric SSD).
+/// 3. Disjoint host-tier sizing (`H_d <= E_d - V_d`, `H_t <= E_t - V_t`)
+///    reclaims duplicate Host RAM without under-covering any expert.
 #[test]
-fn deepseek41_dspark_32gb_pins_draft_group_whole_and_falls_back_on_tight_vram() {
-    // Build a discrete-tier bank with 40 target layers (E=384, K=6) + 3 DSpark
-    // draft layers (E=128, K=6) at decode_rows=4 (proposals=3).
-    let mut plan = target_and_draft_bank(40, 3, BankPaths::Unpriced);
-    let mut layers: Vec<BankLayer> = plan.layers().iter().cloned().collect();
-    for layer in &mut layers {
-        layer.selected = 6;
-        layer.experts = if layer.is_draft() { 128 } else { 384 };
-    }
-    let layers = BankLayers::new(layers).unwrap();
-    plan.structured = conveyor::Structured::new(
-        6,
-        HostTier::Linked,
-        plan.groups().to_vec(),
-        layers,
-        None,
-        4,
-    )
-    .unwrap();
+fn unified_marginal_residency_matches_optimal_2d_split_on_rtx5090_and_m5_pro() {
+    use magnitude_cost_model::MissModel;
 
-    // Target decode/verify working set: decode_set(6, 384, 4) = 24.
-    assert_eq!(plan.draft_pin_threshold(), Some(24));
-    assert_eq!(plan.draft_extra_slots(), 128 - 24);
-    assert_eq!(plan.max_slots(), 384 + (128 - 24));
-
-    // Exact DeepSeek-V4.1 + DSpark 32 GB VRAM geometry:
-    //   target = 40 layers × 8.80 MB/expert = 352.0 MB/slot
-    //   draft  =  3 layers × 18.84 MB/expert = 56.52 MB/slot (128/128 = 7,235 MB)
-    //   bank VRAM budget at 097ce3's 52-slot baseline = 52 × 408.52 MB = 21,243 MB
-    let target_expert_bytes: u64 = 8_800_000;
-    let draft_expert_bytes: u64 = 18_840_000;
-    let charge_bytes = |slots: u64| -> u64 {
-        plan.records_at(0, slots) * target_expert_bytes
-            + plan.records_at(1, slots) * draft_expert_bytes
+    // Build DS4 + DSpark geometry:
+    //   Group 0 (target): 40 layers, E=384, K=6, ~8.80 MB/record
+    //   Group 1 (draft):   3 layers, E=128, K=6, ~18.84 MB/record
+    let make_ds4_dspark = |host: HostTier, decode_rows: u64, miss_s_per_byte: &[f64]| -> ExpertBankPlan {
+        let mut plan = target_and_draft_bank(40, 3, BankPaths::Unpriced);
+        let mut groups = plan.groups().to_vec();
+        for (idx, group) in groups.iter_mut().enumerate() {
+            // F16 (2 B/elem) × 3 tensors (gate, up, down):
+            //   target: 1100 × 1334 × 2 × 3 = 8,804,400 B (~8.80 MB)
+            //   draft:  1570 × 2000 × 2 × 3 = 18,840,000 B (18.84 MB)
+            let matrix = if idx == 0 { [1100u64, 1334] } else { [1570u64, 2000] };
+            let rt = RecordTensor { source: seismic::Element::f16(), resident: seismic::Element::f16(), matrix };
+            group.record = RecordTensors { gate: Some(rt), up: rt, down: rt };
+        }
+        let mut layers: Vec<BankLayer> = plan.layers().iter().cloned().collect();
+        for layer in &mut layers {
+            layer.selected = 6;
+            layer.experts = if layer.is_draft() { 128 } else { 384 };
+        }
+        let layers = BankLayers::new(layers).unwrap();
+        let structured = conveyor::Structured::new(6, host, groups, layers, None, decode_rows).unwrap();
+        let blocks = size_pool_blocks(structured.granules(), plan.allocations).unwrap();
+        plan.structured = structured;
+        plan.blocks = blocks;
+        plan.set_residency_costs(miss_s_per_byte);
+        plan.ceiling = plan.max_slots();
+        plan
     };
 
-    // 0. Smooth monotonicity: every single step `s -> s + 1` adds at most 1
-    //    slot per layer (zero multi-GB step-function cliff).
-    let max_single_step = 40 * target_expert_bytes + 3 * draft_expert_bytes;
-    for s in 0..plan.max_slots() {
-        let delta = charge_bytes(s + 1) - charge_bytes(s);
-        assert!(
-            delta <= max_single_step,
-            "step {s} -> {} jumped by {delta} bytes (exceeds 1 slot/layer = {max_single_step})",
-            s + 1,
-        );
+    let target_model = MissModel::of(384, 6);
+    let draft_model = MissModel::of(128, 6);
+    let round_miss_seconds = |v_t: u64, v_d: u64, b_t: f64, b_d: f64, s_t: f64, s_d: f64, decode_rows: u64| -> f64 {
+        let r_t = decode_rows as f64;
+        let r_d = decode_rows.saturating_sub(1).max(1) as f64;
+        let u_t = (v_t..384).map(|j| target_model.marginal_hits(j, r_t)).sum::<f64>();
+        let u_d = (v_d..128).map(|j| draft_model.marginal_hits(j, r_d)).sum::<f64>();
+        40.0 * b_t * u_t * s_t + 3.0 * b_d * u_d * s_d
+    };
+
+    // Scenario 1: RTX 5090 64 GB (Placer::Tier, split-DMA target 44 GB/s, zero-copy draft 22 GB/s)
+    let decode_rows = 6u64;
+    let s_t_5090 = 1.0 / 44e9;
+    let s_d_5090 = 1.0 / 22e9;
+    let mut costs_5090 = vec![s_t_5090; 40];
+    costs_5090.extend(std::iter::repeat_n(s_d_5090, 3));
+    let mut plan_5090 = make_ds4_dspark(HostTier::Linked, decode_rows, &costs_5090);
+    let b_t = plan_5090.group_granule(0) as f64;
+    let b_d = plan_5090.group_granule(1) as f64;
+
+    // Smooth single-group steps: every step advances exactly one group by 1 slot.
+    assert_eq!(plan_5090.max_slots(), 384 + 128);
+    for s in 0..plan_5090.max_slots() {
+        let dt = plan_5090.group_vram_slots(0, s + 1) - plan_5090.group_vram_slots(0, s);
+        let dd = plan_5090.group_vram_slots(1, s + 1) - plan_5090.group_vram_slots(1, s);
+        assert_eq!(dt + dd, 1, "step {s} must advance exactly one group by 1 slot");
     }
 
-    // 1. 32 GB RTX 5090 budget (~21.24 GB for expert records):
-    let rtx5090_budget: u64 = 52 * (40 * target_expert_bytes + 3 * draft_expert_bytes);
-    let rtx5090_slots = growth_target(0, plan.max_slots(), rtx5090_budget, |to| Ok::<_, ()>(charge_bytes(to)))
-        .unwrap()
-        .expect("32 GB budget fits above floor");
-    let target_per_layer = plan.target_slots(rtx5090_slots);
+    // Actual pool charge function for arbitrary 2D (v_t, v_d) split.
+    let pool_charge_2d = |plan: &ExpertBankPlan, v_t: u64, v_d: u64| -> u64 {
+        let recs_t = (40 * v_t).max(plan.least_records(0)).saturating_sub(plan.lent(0));
+        let recs_d = (3 * v_d).max(plan.least_records(1)).saturating_sub(plan.lent(1));
+        plan.pooled_charge_for(plan.blocks(), |g| if g == 0 { recs_t } else { recs_d })
+            .expect("2D pool charge fits u64")
+    };
+
+    // RTX 5090 32 GB VRAM budget matching baseline (41 target + 128 draft).
+    let base_5090 = plan_5090.resident_charge(0).unwrap();
+    let budget_5090_total = pool_charge_2d(&plan_5090, 41, 128);
+    let budget_5090_room = budget_5090_total.saturating_sub(base_5090);
+    let slots_5090 = growth_target(0, plan_5090.max_slots(), budget_5090_room, |to| {
+        Ok::<_, ()>(plan_5090.resident_charge(to).unwrap() - base_5090)
+    })
+    .unwrap()
+    .expect("5090 budget fits above floor");
+    let (vt_5090, vd_5090) = (plan_5090.group_vram_slots(0, slots_5090), plan_5090.group_vram_slots(1, slots_5090));
+    let cost_1d_5090 = round_miss_seconds(vt_5090, vd_5090, b_t, b_d, s_t_5090, s_d_5090, decode_rows);
+
+    // Exhaustive unconstrained 2D optimum over all feasible (v_t, v_d) at `budget_5090_total`.
+    let mut best_2d_5090 = (f64::INFINITY, 0u64, 0u64);
+    for vd in 0..=128 {
+        for vt in 0..=384 {
+            if pool_charge_2d(&plan_5090, vt, vd) <= budget_5090_total {
+                let c = round_miss_seconds(vt, vd, b_t, b_d, s_t_5090, s_d_5090, decode_rows);
+                if c < best_2d_5090.0 {
+                    best_2d_5090 = (c, vt, vd);
+                }
+            }
+        }
+    }
+    let gap_5090 = (cost_1d_5090 - best_2d_5090.0) / best_2d_5090.0;
     assert!(
-        target_per_layer >= 36,
-        "target groups must retain >= 36 slots/layer on 32 GB, got {target_per_layer}"
-    );
-    assert_eq!(
-        plan.records_at(1, rtx5090_slots),
-        3 * 128,
-        "DSpark draft group must pin 128/128 (384 total) on 32 GB"
-    );
-    assert_eq!(
-        plan.records_at(1, rtx5090_slots),
-        plan.group_experts(1),
-        "DSpark draft group must be whole (records == group_experts)"
-    );
-    assert_eq!(
-        plan.records_at(0, rtx5090_slots),
-        40 * target_per_layer,
-        "target group holds target_per_layer slots per layer"
+        gap_5090 < 0.02,
+        "RTX 5090 1D split ({vt_5090}, {vd_5090}) cost {:.4} ms must be within 2% of 2D opt ({}, {}) cost {:.4} ms (gap={:.3}%)",
+        cost_1d_5090 * 1e3,
+        best_2d_5090.1,
+        best_2d_5090.2,
+        best_2d_5090.0 * 1e3,
+        gap_5090 * 100.0,
     );
 
-    // 2. Tight VRAM budget (~9.0 GB): falls back to shared slots without starving target.
-    let tight_budget: u64 = 9_000_000_000;
-    let tight_slots = growth_target(0, plan.max_slots(), tight_budget, |to| Ok::<_, ()>(charge_bytes(to)))
-        .unwrap()
-        .expect("tight budget fits shared slots");
-    assert!(tight_slots <= 24, "tight budget should land at <= threshold, got {tight_slots}");
+    // Verify disjoint Host RAM sizing on RTX 5090 64 GB (~44 GB host budget).
+    plan_5090.slots = slots_5090;
+    let host_budget_5090 = 44_000_000_000u64;
+    let host_ceiling_5090 = plan_5090.host_ceiling().unwrap();
+    let host_5090 = growth_target(0, host_ceiling_5090, host_budget_5090, |to| {
+        Ok::<_, ()>(plan_5090.host_cache(to).unwrap())
+    })
+    .unwrap()
+    .unwrap_or(0);
+    let ht_5090 = plan_5090.layer_host_slots(&plan_5090.layers()[0], slots_5090, host_5090);
+    let hd_5090 = plan_5090.layer_host_slots(&plan_5090.layers()[40], slots_5090, host_5090);
+    assert!(ht_5090 <= 384 && ht_5090 > 0, "target Host slots bounded by E=384: {ht_5090}");
+    assert!(hd_5090 <= 128, "draft Host slots bounded by E=128: {hd_5090}");
     assert_eq!(
-        plan.records_at(1, tight_slots),
-        3 * tight_slots,
-        "on tight VRAM draft group falls back to shared slots/layer"
+        hd_5090,
+        if vd_5090 >= 128 { 0 } else { host_5090.min(128) },
+        "44 GB Host RAM fills partial DSpark host slots up to host_5090.min(128)"
+    );
+
+    // Scenario 2: RTX 3090 24 GB (tight ~11 GB VRAM budget) — cliff-free!
+    let budget_3090_room = 11_000_000_000u64.saturating_sub(base_5090);
+    let slots_3090 = growth_target(0, plan_5090.max_slots(), budget_3090_room, |to| {
+        Ok::<_, ()>(plan_5090.resident_charge(to).unwrap() - base_5090)
+    })
+    .unwrap()
+    .expect("3090 budget fits above floor");
+    let (vt_3090, vd_3090) = (plan_5090.group_vram_slots(0, slots_3090), plan_5090.group_vram_slots(1, slots_3090));
+    assert!(vt_3090 > 0 && vd_3090 > 0 && vd_3090 < 128, "RTX 3090 splits smoothly without pinning cliff: ({vt_3090}, {vd_3090})");
+
+    // Scenario 3: M5 Pro 48 GB (Unified memory, symmetric SSD 5.0 GB/s)
+    let s_ssd = 1.0 / 5e9;
+    let costs_m5 = vec![s_ssd; 43];
+    let plan_m5 = make_ds4_dspark(HostTier::Unified(Parking::InKernels), decode_rows, &costs_m5);
+    let base_m5 = plan_m5.resident_charge(0).unwrap();
+    let budget_m5_total = pool_charge_2d(&plan_m5, 77, 77);
+    let budget_m5_room = budget_m5_total.saturating_sub(base_m5);
+    let slots_m5 = growth_target(0, plan_m5.max_slots(), budget_m5_room, |to| {
+        Ok::<_, ()>(plan_m5.resident_charge(to).unwrap() - base_m5)
+    })
+    .unwrap()
+    .expect("M5 Pro budget fits above floor");
+    let (vt_m5, vd_m5) = (plan_m5.group_vram_slots(0, slots_m5), plan_m5.group_vram_slots(1, slots_m5));
+    let cost_1d_m5 = round_miss_seconds(vt_m5, vd_m5, b_t, b_d, s_ssd, s_ssd, decode_rows);
+
+    let mut best_2d_m5 = (f64::INFINITY, 0u64, 0u64);
+    for vd in 0..=128 {
+        for vt in 0..=384 {
+            if pool_charge_2d(&plan_m5, vt, vd) <= budget_m5_total {
+                let c = round_miss_seconds(vt, vd, b_t, b_d, s_ssd, s_ssd, decode_rows);
+                if c < best_2d_m5.0 {
+                    best_2d_m5 = (c, vt, vd);
+                }
+            }
+        }
+    }
+    let gap_m5 = (cost_1d_m5 - best_2d_m5.0) / best_2d_m5.0;
+    assert!(
+        gap_m5 < 0.02,
+        "M5 Pro 1D split ({vt_m5}, {vd_m5}) cost {:.4} ms must be within 2% of 2D opt ({}, {}) cost {:.4} ms (gap={:.3}%)",
+        cost_1d_m5 * 1e3,
+        best_2d_m5.1,
+        best_2d_m5.2,
+        best_2d_m5.0 * 1e3,
+        gap_m5 * 100.0,
+    );
+    eprintln!(
+        "ALLOCATIONS: 5090=(Vt={vt_5090}, Vd={vd_5090}, Ht={ht_5090}, Hd={hd_5090}, 2D_opt=({},{}), gap={:.3}%) \
+         3090=(Vt={vt_3090}, Vd={vd_3090}) \
+         M5Pro=(Vt={vt_m5}, Vd={vd_m5}, 2D_opt=({},{}), gap={:.3}%)",
+        best_2d_5090.1,
+        best_2d_5090.2,
+        gap_5090 * 100.0,
+        best_2d_m5.1,
+        best_2d_m5.2,
+        gap_m5 * 100.0,
     );
 }
 
-/// Regression for 752567 (DS4 IQ2_XXS on 32 GB RTX 5090, decode_rows=6 ->
-/// threshold=36):
-/// 1. Reclaiming 1.25 GB from target=40, draft=128 shrinks ONLY ~1.41 GB
-///    (target 40 -> 36, draft stays 128/128 whole) instead of over-reclaiming
-///    6.71 GB across a 5.67 GB cliff.
-/// 2. Reclaiming 2.50 GB dips smoothly into draft (56.5 MB/slot) instead of
-///    dropping all 3 draft layers at once.
-/// 3. Regrowth from target=36, draft=36 with 5.45 GB free headroom immediately
-///    uses >5.3 GB (growing draft smoothly 36 -> 128 + target 36 -> 37) rather
-///    than staying stuck at 36 with 5.99 GB unused.
+/// `whole -> partial -> whole` resize transitions and GPU-pressure shrink
+/// safety on a multi-group discrete bank with disjoint host-tier sizing:
+/// - Opening whole sets `host_reference_slots() == 0` so the host tier has
+///   full range if the bank later shrinks to partial, while `host_saturation_at(max)`
+///   is `0` (so `host_growth` returns `None` while whole).
+/// - Shrinking GPU under pressure (`mid -> floor`) never changes
+///   `counts.host_charge(current_host)` (no synchronous host growth required!).
+/// - Regrowing GPU back to `whole` drops `host_saturation_at(max)` back to `0`.
 #[test]
-fn deepseek41_dspark_smooth_ramp_prevents_over_reclaim_and_stuck_regrowth() {
-    let mut plan = target_and_draft_bank(40, 3, BankPaths::Unpriced);
-    let mut layers: Vec<BankLayer> = plan.layers().iter().cloned().collect();
-    for layer in &mut layers {
-        layer.selected = 6;
-        layer.experts = if layer.is_draft() { 128 } else { 384 };
-    }
-    let layers = BankLayers::new(layers).unwrap();
-    plan.structured = conveyor::Structured::new(
-        6,
-        HostTier::Linked,
-        plan.groups().to_vec(),
-        layers,
-        None,
-        6,
-    )
-    .unwrap();
+fn whole_partial_whole_disjoint_host_tier_resize_and_shrink_safety() {
+    let mut plan = target_and_draft_bank(4, 2, BankPaths::Unpriced);
+    let max = plan.max_slots();
+    plan.slots = max;
+    plan.ceiling = max;
+    plan.resident = true;
+    assert!(plan.whole());
+    assert_eq!(plan.host_reference_slots(), 0);
+    assert_eq!(plan.host_saturation_at(max), 0);
 
-    // decode_set(6, 384, 6) = 36, draft extra = 128 - 36 = 92.
-    assert_eq!(plan.draft_pin_threshold(), Some(36));
-    assert_eq!(plan.draft_extra_slots(), 92);
-    assert_eq!(plan.max_slots(), 384 + 92);
+    let counts = plan.counts().unwrap();
+    // 1. Whole: host tier wants 0 slots.
+    assert_eq!(counts.host_saturation_at(max), 0);
+    assert_eq!(counts.host_growth(0, max, u64::MAX), None);
 
-    let target_expert_bytes: u64 = 8_800_000;
-    let draft_expert_bytes: u64 = 18_840_000;
-    let charge_bytes = |slots: u64| -> u64 {
-        plan.records_at(0, slots) * target_expert_bytes
-            + plan.records_at(1, slots) * draft_expert_bytes
-    };
+    // 2. Whole -> partial: host tier can now grow up to `host_saturation_at(mid)`.
+    let mid = max / 2;
+    let sat_mid = counts.host_saturation_at(mid);
+    assert!(sat_mid > 0, "partial device bank has non-zero disjoint host saturation");
+    let grown_host = counts
+        .host_growth(0, mid, u64::MAX)
+        .expect("partial device bank admits disjoint host growth");
+    assert_eq!(grown_host, sat_mid);
+    let host_charge_at_mid = counts.host_charge(grown_host);
 
-    // Starting at target=40, draft=128 (bank coordinate 40 + 92 = 132).
-    let start = 40 + 92;
-    assert_eq!(plan.target_slots(start), 40);
-    assert_eq!(plan.records_at(1, start), 3 * 128);
-
-    // 1. Reclaim 1.25 GB: must shrink target 40 -> 36 (~1.41 GB), keeping draft 128/128 whole!
-    let need_125 = 1_250_000_000u64;
-    let to_125 = releasing(start, 0, need_125, |s| Ok::<_, ()>(charge_bytes(s)))
-        .unwrap()
-        .expect("reclaim succeeds");
-    let released_125 = charge_bytes(start) - charge_bytes(to_125);
-    assert!(
-        released_125 >= need_125 && released_125 < 2_000_000_000,
-        "1.25 GB reclaim must release ~1.41 GB, not 6.71 GB cliff; got {released_125}"
+    // 3. GPU shrinks further under pressure (`mid -> floor`):
+    //    existing host holding charge is completely unchanged (no synchronous
+    //    host growth required under GPU pressure!).
+    let floor = counts.floor();
+    assert_eq!(
+        counts.host_charge(grown_host),
+        host_charge_at_mid,
+        "GPU shrink must never force synchronous host growth"
     );
-    assert_eq!(plan.records_at(1, to_125), 3 * 128, "draft stays 128/128 whole");
-
-    // 2. Reclaim 2.50 GB: dips smoothly into draft at 56.5 MB/slot granularity.
-    let need_250 = 2_500_000_000u64;
-    let to_250 = releasing(start, 0, need_250, |s| Ok::<_, ()>(charge_bytes(s)))
-        .unwrap()
-        .expect("reclaim succeeds");
-    let released_250 = charge_bytes(start) - charge_bytes(to_250);
     assert!(
-        released_250 >= need_250 && released_250 <= need_250 + 3 * draft_expert_bytes,
-        "2.50 GB reclaim must release within 1 draft slot (56.5 MB); got {released_250}"
+        counts.host_saturation_at(floor) >= sat_mid,
+        "deeper GPU shrink can only make more host slots useful asynchronously"
     );
-    assert_eq!(plan.target_slots(to_250), 36, "target holds at verify working set 36");
 
-    // 3. Regrowth from (target=36, draft=36) with 5.45 GB free headroom:
-    //    previously stuck at 36 because 36 -> 37 was a 5.67 GB cliff!
-    let at_36 = 36u64;
-    let next_pulse = charge_bytes(at_36 + 1) - charge_bytes(at_36);
-    assert_eq!(next_pulse, 3 * draft_expert_bytes, "next slot pulse is 56.5 MB, not 5.67 GB");
-    let free_headroom = 5_450_000_000u64;
-    let regrown = growth_target(at_36, plan.max_slots(), free_headroom, |to| {
-        Ok::<_, ()>(charge_bytes(to) - charge_bytes(at_36))
-    })
-    .unwrap()
-    .expect("must regrow immediately with 5.45 GB headroom");
-    assert_eq!(plan.records_at(1, regrown), 3 * 128, "draft regrows all the way to 128/128");
-    let used = charge_bytes(regrown) - charge_bytes(at_36);
-    assert!(
-        used > 5_000_000_000,
-        "must consume >5.0 GB of the 5.45 GB headroom immediately; used {used}"
-    );
+    // 4. Partial -> whole: host saturation returns to 0 and no further host
+    //    growth is admitted.
+    assert_eq!(counts.host_saturation_at(max), 0);
+    assert_eq!(counts.host_growth(grown_host, max, u64::MAX), None);
 }
 
 /// An embedded causal MTP head's routed layer (`WeightScope::HeadSublayer`)
@@ -2033,8 +2148,8 @@ fn causal_head_sublayer_banks_when_streamable_and_falls_back_when_transformed() 
     let substrate = cuda(HostTier::Linked);
 
     // 1. Streamable HeadSublayer (raw stored records): all 3 target layers + 1
-    //    HeadSublayer are banked, and HeadSublayer streams at `slots` rather
-    //    than pinning whole above `draft_pin_threshold`.
+    //    HeadSublayer are banked and share the marginal-value schedule without
+    //    pinning whole at partial slots.
     let banked = resident
         .clone()
         .with_expert_bank(&definition, 64, None, 1, FlightDepth::PIPELINED, substrate)
@@ -2047,10 +2162,10 @@ fn causal_head_sublayer_banks_when_streamable_and_falls_back_when_transformed() 
     assert_eq!(bank.layers().len(), 4, "3 target layers + 1 HeadSublayer");
     let (_, head_layer) = bank.layer(head_scope).expect("HeadSublayer is banked");
     assert!(head_layer.is_draft());
-    assert_eq!(
-        bank.layer_vram_slots(head_layer, 64),
-        64,
-        "HeadSublayer must stream at shared slots instead of pinning whole"
+    let head_vram = bank.layer_vram_slots(head_layer, 64);
+    assert!(
+        head_vram > 0 && head_vram < head_layer.experts,
+        "HeadSublayer must stream partially at slots=64 instead of pinning whole: got {head_vram}"
     );
 
     // 2. Transformed HeadSublayer (`ImportTransform::DraftQ4_0`, upload != source):
@@ -2386,4 +2501,297 @@ fn gemma4_26b_streamed_weight_placement_sums_to_its_stored_tensors() {
     let crate::WeightPlacement { held, host, streamed, tables } = placement;
     assert!(streamed + host > 0, "the experts stream: {placement:?}");
     assert_eq!(held + host + streamed + tables, stored, "{placement:?}");
+}
+
+/// When a multi-group plan's 1D monotonic coordinate `slots` exceeds a target
+/// layer's expert count `E_target` (for example `slots = 477 > 384` across 9
+/// target groups + 1 draft group), per-layer reporting and cost-model pricing
+/// must project through `target_vram_slots` / `held_slots` rather than
+/// mistaking raw `slots` for `477/384` (100% resident). Furthermore, when all
+/// mixed-quant target groups share uniform PCIe DMA miss bandwidth, they tie
+/// identically in lockstep (`max_slots == E_target + E_draft == 512`).
+#[test]
+fn multi_group_raw_slots_exceeding_target_experts_reports_actual_target_vram_slots() {
+    use magnitude_cost_model::{ExpertLines, HeldSlots, StreamedLayers};
+    use magnitude_family_contracts::SublayerIndex;
+
+    // 9 target groups (E = 384, 4 layers each = 36 target layers) + 1 draft
+    // group (E = 128, 4 draft layers).
+    let counts = [4usize; 10];
+    let mut plan = bank_of(
+        &counts,
+        1,
+        |layer| if layer < 36 { 384 } else { 128 },
+        RecordForm::Gated,
+    );
+    let (_, _, groups, layers) = plan.structured.into_parts();
+    let mut layers_vec = layers.to_vec();
+    for (i, layer) in layers_vec.iter_mut().enumerate() {
+        layer.scope = if i < 36 {
+            WeightScope::TargetSublayer(SublayerIndex { block: i as u32, sublayer: 0 })
+        } else {
+            WeightScope::DraftSublayer(SublayerIndex { block: (i - 36) as u32, sublayer: 0 })
+        };
+    }
+    plan.structured = conveyor::Structured::new(
+        8,
+        HostTier::Linked,
+        groups,
+        BankLayers::new(layers_vec).unwrap(),
+        None,
+        VERIFY_ROWS,
+    )
+    .unwrap();
+
+    // Case 1: distinct per-group miss costs break ties across the 9 target
+    // groups so raw 1D coordinate `slots = 477 > 384` while each target layer
+    // holds only ~46/384 VRAM slots.
+    let distinct_costs: Vec<f64> = plan
+        .layers()
+        .iter()
+        .map(|layer| {
+            if layer.is_draft() {
+                1.0 / 28e9
+            } else {
+                // Slight per-group spread (1% per target group) breaks lockstep.
+                (1.0 / 50e9) * (1.0 + 0.01 * layer.group as f64)
+            }
+        })
+        .collect();
+    plan.set_residency_costs(&distinct_costs);
+    assert!(plan.max_slots() > 384, "distinct-cost multi-group max_slots {} should exceed 384", plan.max_slots());
+
+    let raw_slots = 477u64;
+    let host_slots = 132u64;
+    let target_vram = plan.target_vram_slots(raw_slots);
+    assert!(
+        target_vram > 0 && target_vram < 384,
+        "target_vram_slots({raw_slots}) = {target_vram} must reflect actual per-layer target VRAM slots (< 384), not raw coordinate",
+    );
+    let table = plan.target_vram_slots_table();
+    assert_eq!(table[raw_slots as usize], target_vram);
+    assert!(!plan.whole_at(raw_slots), "raw_slots={raw_slots} > 384 must NOT be treated as whole");
+
+    let experts: Vec<u64> = plan.layers().iter().map(|l| l.experts).collect();
+    let lines: std::sync::Arc<[ExpertLines]> = vec![ExpertLines::reference(1_000_000); experts.len()].into();
+    let streamed = StreamedLayers::new(experts, 8, lines);
+
+    let held = plan.held_slots(raw_slots, host_slots);
+    let held_runtime = plan.held_slots_runtime(raw_slots, host_slots);
+    for h in [&held, &held_runtime] {
+        for layer_idx in 0..36 {
+            let (v_t, _) = h.layer(layer_idx);
+            assert!(
+                v_t < 384,
+                "target layer {layer_idx} held VRAM {v_t} must be < 384 at raw_slots={raw_slots}",
+            );
+        }
+        assert!(
+            !streamed.whole(h),
+            "StreamedLayers::whole must be false at raw_slots={raw_slots} (target layers hold ~{target_vram}/384, not 100% resident)",
+        );
+        // Contrast with mistakenly passing raw_slots as scalar HeldSlots::tiered(477, 132):
+        let bogus_scalar = HeldSlots::tiered(raw_slots as usize, host_slots as usize);
+        assert!(
+            streamed.whole(&bogus_scalar),
+            "scalar HeldSlots::tiered({raw_slots}, {host_slots}) would falsely report 100% resident",
+        );
+    }
+
+    // Case 2: uniform PCIe DMA miss bandwidth across all 9 target groups ties
+    // them identically in lockstep (`max_slots == 384 + 128 == 512`).
+    let uniform_dma_costs: Vec<f64> = plan
+        .layers()
+        .iter()
+        .map(|layer| if layer.is_draft() { 1.0 / 28e9 } else { 1.0 / 50e9 })
+        .collect();
+    plan.set_residency_costs(&uniform_dma_costs);
+    assert_eq!(
+        plan.max_slots(),
+        384 + 128,
+        "uniform PCIe DMA target groups must advance in lockstep (max_slots == E_target + E_draft)",
+    );
+}
+
+/// A banked load with a separate drafter (`own_history == false`, e.g. DSpark
+/// or DFlash) sets `fronts_target() == true` and `chains_front() == false`,
+/// copies token rows for `kept_guesses` without keeping host token rows for
+/// `guess_chain`, and certifies target entry graphs with `kept_guesses` bound.
+#[test]
+fn banked_separate_drafter_fronts_target_without_chaining() {
+    use crate::planning::fixtures::{LIMITS, qwen4exp_fixture_definition_of, streamed_experts_manifest};
+    use crate::planning::weights::HeadWeightsPlan;
+    use crate::programs::native_target_graph::checked_entry_graph_storage;
+
+    let definition = qwen4exp_fixture_definition_of(2, 16);
+    let manifest = streamed_experts_manifest(&definition);
+    let backend = seismic::BackendName::Cpu;
+    let resident = crate::ModelLoadPlan::derive(
+        &manifest,
+        &definition,
+        crate::ComponentSelection { head: false, vision: false },
+        crate::resident_layout(crate::ExecutionPath::Native, backend),
+        crate::PlannedMethod::Plain,
+        LIMITS,
+    )
+    .unwrap();
+    let substrate = BankSubstrate {
+        backend,
+        allocations: seismic::NativeAllocations::EXACT,
+        host: HostTier::Linked,
+        has_side_queue: false,
+    };
+
+    // 1. Banked plain (no drafter): neither fronts_target nor chains_front.
+    let plain = resident.with_expert_bank_at_floor(&definition, substrate).unwrap();
+    assert!(!plain.fronts_target());
+    assert!(!plain.chains_front());
+    assert_eq!(plain.copies_token_rows(), plain.notifies_selection() || plain.keeps_token_rows());
+
+    // 2. Banked separate drafter (`own_history == false`, e.g. DSpark / DFlash):
+    //    fronts_target == true, chains_front == false, copies_token_rows == true,
+    //    keeps_token_rows unchanged from plain, and target entry graph seals
+    //    cleanly with `kept_guesses` bound.
+    let mut separate = plain.clone();
+    separate.head = Some(HeadWeightsPlan {
+        weights: Vec::new(),
+        own_history: false,
+        residual_conditioning: None,
+    });
+    assert!(separate.fronts_target(), "banked separate drafter must set fronts_target() == true");
+    assert!(!separate.chains_front(), "banked separate drafter must set chains_front() == false");
+    assert!(separate.copies_token_rows(), "banked separate drafter must copy guesses at entry");
+    assert_eq!(
+        separate.keeps_token_rows(),
+        plain.keeps_token_rows(),
+        "banked separate drafter must not force keeps_token_rows for guess_chain"
+    );
+    checked_entry_graph_storage(backend, &separate, &definition.decoder, 8, true)
+        .expect("target entry graph for banked separate drafter must seal with kept_guesses bound");
+
+    // 3. Banked embedded head (`own_history == true`): both fronts_target and chains_front.
+    let mut embedded = plain.clone();
+    embedded.head = Some(HeadWeightsPlan {
+        weights: Vec::new(),
+        own_history: true,
+        residual_conditioning: None,
+    });
+    assert!(embedded.fronts_target());
+    assert!(embedded.chains_front());
+    assert!(embedded.copies_token_rows());
+    assert!(embedded.keeps_token_rows());
+
+    // 4. Unbanked separate drafter (`bank == None`): neither fronts_target nor chains_front.
+    let mut unbanked = separate;
+    unbanked.bank = None;
+    assert!(!unbanked.fronts_target());
+    assert!(!unbanked.chains_front());
+}
+
+/// Unified byte-typed staging pools across a 9-group mixed-quant model:
+/// 1. Total staging bytes scale as `1 × max_form` per routed tensor (`Gate`,
+///    `Up`, `Down`) rather than `9 × sum(forms)` on both `HostTier::Linked`
+///    (`Placer::Tier`) and `HostTier::Unified(Parking::InKernels)` (`Placer::Bank`).
+/// 2. `Tensor::carried_records` views for distinct quant forms over the single
+///    unified backing buffer share the backing allocation while slots taken
+///    from the global `StagingPool` never alias across concurrent forms.
+#[test]
+fn unified_staging_pool_scales_with_one_max_form_across_nine_quant_groups() {
+    let quants = [
+        Element::stored("iq2xxs", Layout::Rows16).unwrap(),
+        Element::stored("iq2xs", Layout::Rows16).unwrap(),
+        Element::stored("iq2s", Layout::Rows16).unwrap(),
+        Element::stored("iq3xxs", Layout::Rows16).unwrap(),
+        Element::stored("iq3s", Layout::Rows16).unwrap(),
+        Element::stored("q2k", Layout::Rows16).unwrap(),
+        Element::stored("q3k", Layout::Rows16).unwrap(),
+        Element::stored("q4k", Layout::Rows16).unwrap(),
+        Element::stored("q6k", Layout::Rows16).unwrap(),
+    ];
+    let paths = BankPaths::Priced {
+        line: LINE,
+        records: magnitude_cost_model::PathRecords { ahead: 64, reserve: 16 },
+    };
+    let make_plan = |host: HostTier| {
+        let base = beside(bank(&[1; 9], 8), host);
+        let (selected, decode_rows) = (base.selected(), base.decode_rows());
+        let (_, _, mut groups, layers) = base.structured.into_parts();
+        for (group, &quant) in groups.iter_mut().zip(&quants) {
+            for (_, tensor) in group.record.iter_mut() {
+                tensor.source = quant;
+                tensor.resident = quant;
+            }
+        }
+        let structured = conveyor::Structured::new(selected, host, groups, layers, None, decode_rows).unwrap();
+        let blocks = structured
+            .granules()
+            .iter()
+            .map(|&granule| seismic::block_bytes(seismic::BlockSizing { granule, allocations: base.allocations }).unwrap())
+            .collect();
+        ExpertBankPlan { structured, blocks, paths, ..base }
+    };
+
+    for host in [HostTier::Linked, HostTier::Unified(Parking::InKernels)] {
+        let plan = make_plan(host);
+        let (pools, _) = plan.staging_pools();
+        assert_eq!(pools.len(), 27, "9 distinct quant groups × 3 routed tensors");
+
+        let layout = plan.layout().unwrap();
+        assert_eq!(
+            layout.staging.iter().count(),
+            3,
+            "{host:?}: unified staging must allocate 1 buffer per routed tensor, not 27",
+        );
+
+        let count = plan.unified_staging_records_with_paths(paths);
+        let sum_all_forms: u64 = pools
+            .iter()
+            .map(|pool| plan.staging_slot_bytes(pool).unwrap() * count)
+            .sum();
+        let expected_unified: u64 = RoutedTensor::ALL
+            .iter()
+            .map(|&kind| plan.unified_staging_slot_bytes(kind).unwrap() * count)
+            .sum();
+        let actual_unified: u64 = layout
+            .staging
+            .iter()
+            .map(|(_, alloc)| alloc.storage_demand(host).unwrap().checked_bytes().unwrap())
+            .sum();
+
+        assert_eq!(actual_unified, expected_unified, "{host:?}: unified staging bytes mismatch");
+        assert!(
+            actual_unified * 4 < sum_all_forms,
+            "{host:?}: unified staging ({actual_unified}) must be far smaller than per-form sum ({sum_all_forms})",
+        );
+        assert_eq!(
+            plan.storage_demand_at(plan.slots, plan.places, paths).unwrap(),
+            plan.storage_demand().unwrap(),
+            "{host:?}: storage_demand_at must match storage_demand bit-for-bit",
+        );
+    }
+
+    // Verify zero-copy `carried_records` views across distinct quant forms over
+    // one unified backing buffer never alias when slots come from the global ring.
+    let device = crate::test_support::open_backend(&seismic::Devices::discover(&[]).unwrap(), seismic::BackendName::Cpu)
+        .expect("cpu device");
+    let charges = seismic::Charges::tally(&device);
+    let plan = make_plan(HostTier::Unified(Parking::InKernels));
+    let (pools, _) = plan.staging_pools();
+    let count = 4u64;
+    let slot_bytes = plan.unified_staging_slot_bytes(RoutedTensor::Gate).unwrap();
+    let backing = seismic::Tensor::shared_records(&charges, Element::i32(), &[count, slot_bytes / 4], slot_bytes).unwrap();
+    let gate_pools: Vec<_> = pools.iter().filter(|p| p.kind == RoutedTensor::Gate).collect();
+    assert_eq!(gate_pools.len(), 9);
+
+    let views: Vec<seismic::Tensor> = gate_pools
+        .iter()
+        .map(|pool| backing.carried_records(pool.source, &[count, pool.matrix[0], pool.matrix[1]], slot_bytes).unwrap())
+        .collect();
+    // Concurrent slots 0 and 1 held by two different quant forms (iq2_xxs vs q6k)
+    // must resolve to disjoint host addresses spaced exactly `slot_bytes` apart.
+    let slot0 = views[0].slice_leading(0, 1).unwrap();
+    let slot1 = views[8].slice_leading(1, 2).unwrap();
+    let addr0 = slot0.shared_address().unwrap().as_ptr() as usize;
+    let addr1 = slot1.shared_address().unwrap().as_ptr() as usize;
+    assert_eq!(addr1 - addr0, slot_bytes as usize, "different quant forms in distinct slots must never alias");
 }

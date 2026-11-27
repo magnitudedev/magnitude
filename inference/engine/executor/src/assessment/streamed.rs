@@ -33,6 +33,9 @@ pub struct StreamedFigures {
     /// recorded on a discrete device; `None` on unified memory or before first
     /// `TierCopy` measurement.
     pub transfer: Option<ReadLine>,
+    /// Measured routed quantized zero-copy read rate (`TierCopyCosts::routed_zerocopy_byte_seconds`,
+    /// in seconds/byte) when already recorded on a discrete device.
+    pub routed_zerocopy: Option<f64>,
 }
 
 impl StreamedFigures {
@@ -66,14 +69,17 @@ impl StreamedFigures {
             Ok(None) => Priced::Unavailable(format!("{:?} streams nothing", executor.backend())),
             Ok(Some(form)) => ConvertCosts::priced(topology, executor, form, &reading).derive(|costs| form.stored_byte_seconds(costs.record_seconds)),
         };
-        let transfer = if topology.shared_ranges_lie_in_device_memory(executor) {
-            None
+        let (transfer, routed_zerocopy) = if topology.shared_ranges_lie_in_device_memory(executor) {
+            (None, None)
         } else {
-            TierCopyCosts::stored(topology, executor, &reading).ok().map(|costs| costs.transfer)
+            match TierCopyCosts::stored(topology, executor, &reading).ok() {
+                Some(costs) => (Some(costs.transfer), costs.routed_zerocopy_byte_seconds),
+                None => (None, None),
+            }
         };
         let figures = match (read, memory, site, convert) {
             (Priced::Measured(read), Priced::Measured(memory), Priced::Measured(site), Priced::Measured(convert)) => {
-                Priced::Measured(Self { read, memory, site, convert, transfer })
+                Priced::Measured(Self { read, memory, site, convert, transfer, routed_zerocopy })
             }
             (read, memory, site, convert) => {
                 let mut standing = Vec::new();

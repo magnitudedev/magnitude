@@ -60,10 +60,14 @@ struct Cached {
     bytes: usize,
 }
 
-pub struct Vocabulary {
-    table: Arc<dyn TokenTable>,
+struct CompiledVocabulary {
     factory: ParserFactory,
     usable: Arc<[u32]>,
+}
+
+pub struct Vocabulary {
+    table: Arc<dyn TokenTable>,
+    compiled: Option<CompiledVocabulary>,
     projection: usize,
     cache: VecDeque<Cached>,
     cache_bytes: usize,
@@ -106,6 +110,11 @@ pub(crate) fn mask(matcher: &mut Matcher, usable: &[u32]) -> Result<Arc<[u32]>, 
 impl Vocabulary {
     /// `projection` is the model's output width, at least the table's size;
     /// tokens beyond the table are never generated.
+    ///
+    /// Validates vocabulary invariants eagerly, while deferring construction of
+    /// the llguidance [`TokTrie`] and [`ParserFactory`] until the first
+    /// constrained [`Self::bind`] call so unconstrained serving avoids both the
+    /// startup allocation spike and permanent trie heap.
     pub fn new(
         table: Arc<dyn TokenTable>,
         projection: usize,
@@ -128,6 +137,30 @@ impl Vocabulary {
                 "a stop token must be within the token table".into(),
             ));
         }
+        if table
+            .stop_tokens()
+            .iter()
+            .any(|&token| table.bytes(token).is_none())
+        {
+            return Err(GrammarError::Binding(
+                "a stop token cannot be an unusable token".into(),
+            ));
+        }
+        Ok(Self {
+            table,
+            compiled: None,
+            projection,
+            cache: VecDeque::new(),
+            cache_bytes: 0,
+            limits,
+            cache_hits: 0,
+        })
+    }
+
+    fn compile(
+        table: &Arc<dyn TokenTable>,
+        projection: usize,
+    ) -> Result<CompiledVocabulary, GrammarError> {
         let mut words = Vec::with_capacity(projection);
         let mut usable = vec![0u32; projection.div_ceil(32)];
         for id in 0..table.len() {
@@ -171,17 +204,12 @@ impl Vocabulary {
         parser.verbose_errors = false;
         parser.initial_lexer_fuel = LEXER_FUEL;
         parser.step_lexer_fuel = LEXER_FUEL;
-        Ok(Self {
-            table,
+        Ok(CompiledVocabulary {
             factory,
             usable: usable.into(),
-            projection,
-            cache: VecDeque::new(),
-            cache_bytes: 0,
-            limits,
-            cache_hits: 0,
         })
     }
+
     pub fn projection(&self) -> usize {
         self.projection
     }
@@ -202,6 +230,10 @@ impl Vocabulary {
         grammar: &Grammar,
         prefix: &[TokenId],
     ) -> Result<GrammarConstraint, GrammarError> {
+        if self.compiled.is_none() {
+            self.compiled = Some(Self::compile(&self.table, self.projection)?);
+        }
+        let usable = self.compiled.as_ref().unwrap().usable.clone();
         if let Some(index) = self
             .cache
             .iter()
@@ -211,20 +243,23 @@ impl Vocabulary {
             self.cache_hits += 1;
             // A private lexer per request: lexer state accumulates, and must
             // not grow across requests sharing a cached grammar.
-            let state = self.constraint(entry.matcher.deep_clone(), entry.mask.clone());
+            let state = self.constraint(entry.matcher.deep_clone(), entry.mask.clone(), usable);
             self.cache.push_back(entry);
             return Ok(state);
         }
         if prefix
             .iter()
-            .any(|token| self.table.stop_tokens().contains(token) || !allowed(&self.usable, *token))
+            .any(|token| self.table.stop_tokens().contains(token) || !allowed(&usable, *token))
         {
             return Err(GrammarError::Binding(
                 "a grammar prefix must consist of usable tokens other than stop tokens".into(),
             ));
         }
         let mut matcher = Matcher::new(
-            self.factory
+            self.compiled
+                .as_ref()
+                .unwrap()
+                .factory
                 .create_parser(TopLevelGrammar::from_lark(grammar.lark().to_owned())),
         );
         check(&matcher)?;
@@ -246,7 +281,7 @@ impl Vocabulary {
                 ));
             }
         }
-        let mask = mask(&mut matcher, &self.usable)?;
+        let mask = mask(&mut matcher, &usable)?;
         let charged = grammar.lark().len() + prefix.len() * 4 + mask.len() * 4;
         if self.limits.entries > 0 && charged <= self.limits.bytes {
             while self.cache.len() >= self.limits.entries
@@ -263,10 +298,15 @@ impl Vocabulary {
             });
             self.cache_bytes += charged;
         }
-        Ok(self.constraint(matcher, mask))
+        Ok(self.constraint(matcher, mask, usable))
     }
 
-    fn constraint(&self, matcher: Matcher, mask: Arc<[u32]>) -> GrammarConstraint {
-        GrammarConstraint::new(matcher, mask, self.table.clone(), self.usable.clone())
+    fn constraint(
+        &self,
+        matcher: Matcher,
+        mask: Arc<[u32]>,
+        usable: Arc<[u32]>,
+    ) -> GrammarConstraint {
+        GrammarConstraint::new(matcher, mask, self.table.clone(), usable)
     }
 }

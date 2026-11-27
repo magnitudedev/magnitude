@@ -79,7 +79,8 @@ impl<'a> QualificationView<'a> {
             laps.push(format!("{part} {:.2} s", lap.elapsed().as_secs_f64()));
             lap = std::time::Instant::now();
         };
-        for (slot, handle) in &self.programs.imports {
+        let imports = self.programs.imports.borrow();
+        for (slot, handle) in imports.iter() {
             let (
                 ImportProgramSlot::Dense {
                     source: source_dtype,
@@ -116,7 +117,8 @@ impl<'a> QualificationView<'a> {
                 ));
             }
         }
-        for (slot, handle) in &self.programs.imports {
+        let imports = self.programs.imports.borrow();
+        for (slot, handle) in imports.iter() {
             let (
                 ImportProgramSlot::Repack {
                     source: source_element,

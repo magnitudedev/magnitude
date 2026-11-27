@@ -19,6 +19,10 @@ pub struct BankCounts {
     /// tier records ([`ExpertBankPlan::host_records`]) and their charge
     /// ([`ExpertBankPlan::host_charge`]); none without a host tier.
     host: Vec<Held>,
+    /// Indexed by device slots, `0..=ceiling`: the most disjoint host slots
+    /// useful beside a device bank at that coordinate
+    /// ([`ExpertBankPlan::host_saturation_at`]); `0` without a host tier.
+    host_saturation: Vec<u64>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -51,7 +55,10 @@ impl ExpertBankPlan {
                 .collect::<Result<_, String>>()?,
             None => Vec::new(),
         };
-        Ok(BankCounts { placer: self.placer(), floor: self.floor(), slots, host })
+        let host_saturation = (0..=self.ceiling)
+            .map(|device_slots| self.host_saturation_at(device_slots))
+            .collect();
+        Ok(BankCounts { placer: self.placer(), floor: self.floor(), slots, host, host_saturation })
     }
 }
 
@@ -84,6 +91,16 @@ impl BankCounts {
         }
     }
 
+    /// [`ExpertBankPlan::host_saturation_at`]: the most disjoint host slots
+    /// useful beside a device bank at `device_slots`.
+    pub fn host_saturation_at(&self, device_slots: u64) -> u64 {
+        let index = usize::try_from(device_slots)
+            .ok()
+            .filter(|&idx| idx < self.host_saturation.len())
+            .unwrap_or_else(|| panic!("{device_slots} bank slots lie past the ceiling, {}", self.host_saturation.len() - 1));
+        self.host_saturation[index]
+    }
+
     /// The records the host lands into of group `group` at `slots` slots: a
     /// host tier's host slots where the device places, the one store's slots
     /// where the host does.
@@ -94,22 +111,21 @@ impl BankCounts {
         }
     }
 
-    /// The host slots a host tier at `from` grows to in one step
-    /// ([`growth_target`]) beside a bank of `slots` slots: toward every
-    /// expert, its ceiling (it is inclusive of the bank: it holds the bank's
-    /// experts too), past the bank's slots, its charge beyond `from`'s
-    /// ([`Self::host_charge`]) within `room`; none without a tier, whole, or
-    /// with no room for one past the bank. What a live load's growth step
-    /// takes where the memory's budget grows; the tier's load-time size is
-    /// the plan's ([`ExpertBankPlan::host_slots`]).
-    pub fn host_growth(&self, from: u64, slots: u64, room: u64) -> Option<u64> {
-        let bound = u64::try_from(self.host.len().checked_sub(1)?).expect("host slots fit u64");
+    /// The host slots a disjoint host tier at `from` grows to in one step
+    /// ([`growth_target`]) beside a device bank at `device_slots`: toward the
+    /// lesser of its ceiling and `host_saturation_at(device_slots)` (every
+    /// expert not held in VRAM), its charge beyond `from`'s
+    /// ([`Self::host_charge`]) within `room`; none without a tier, when
+    /// already saturated (including when `device_slots` is whole), or with no
+    /// room for one more slot.
+    pub fn host_growth(&self, from: u64, device_slots: u64, room: u64) -> Option<u64> {
+        let ceiling = u64::try_from(self.host.len().checked_sub(1)?).expect("host slots fit u64");
+        let bound = ceiling.min(self.host_saturation_at(device_slots));
+        if bound <= from {
+            return None;
+        }
         let held = self.host_charge(from);
-        // An inclusive tier's first slots, up to the bank's, hold copies of
-        // the bank's experts and save nothing: a growth reaches past them in
-        // one step, or none fits.
-        let least = from.max(slots);
-        growth_target(least, bound, room, |to| Ok::<_, std::convert::Infallible>(self.host_charge(to) - held))
+        growth_target(from, bound, room, |to| Ok::<_, std::convert::Infallible>(self.host_charge(to) - held))
             .unwrap_or_else(|never| match never {})
     }
 

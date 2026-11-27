@@ -379,7 +379,11 @@ impl State {
             return 0;
         };
         let estimate = self.estimate_at(folded.read);
-        let budget = if pinned { estimate.pinned_budget() } else { estimate.budget() };
+        let budget = if pinned {
+            estimate.pinned_budget()
+        } else {
+            estimate.budget()
+        };
         let used = estimate.held().saturating_add(estimate.shed());
         let free_room = budget.saturating_sub(used.saturating_add(estimate.guarantee()));
         let cap_room = estimate.cap().map_or(u64::MAX, |cap| cap.saturating_sub(used));
@@ -411,8 +415,22 @@ impl State {
     /// growth: true when the bank's value per byte meets or exceeds idle graph
     /// slots' rebuild value per byte (or when graph slots are unvalued).
     pub(super) fn graph_slots_yield_to_bank(&self) -> bool {
+        self.cache_kind_yields_to_bank(CacheKind::GraphSlots)
+    }
+
+    /// Whether retained `CacheKind::Prefix` cache should yield to
+    /// `CacheKind::Bank` growth under the ledger's per-byte `Value` comparison:
+    /// true when the bank's value per byte meets or exceeds the prefix cache's
+    /// value per byte (or when prefix cache is unvalued), preserving hot
+    /// prefix entries while preventing lower-value cold prefixes from stealing
+    /// slots from an actively streaming expert bank.
+    pub(super) fn prefix_yields_to_bank(&self) -> bool {
+        self.cache_kind_yields_to_bank(CacheKind::Prefix)
+    }
+
+    fn cache_kind_yields_to_bank(&self, other: CacheKind) -> bool {
         let mut bank: Option<Value> = None;
-        let mut graph: Option<Value> = None;
+        let mut target: Option<Value> = None;
         for entry in self.held.values() {
             if entry.bytes == 0 {
                 continue;
@@ -421,15 +439,15 @@ impl State {
                 Holding::Cache(CacheKind::Bank) => {
                     bank = Some(bank.map_or(entry.value, |cur| cur.max(entry.value)));
                 }
-                Holding::Cache(CacheKind::GraphSlots) => {
-                    graph = Some(graph.map_or(entry.value, |cur| cur.max(entry.value)));
+                Holding::Cache(kind) if kind == other => {
+                    target = Some(target.map_or(entry.value, |cur| cur.max(entry.value)));
                 }
                 _ => {}
             }
         }
-        match (bank, graph) {
-            (Some(bank), Some(graph)) => graph <= bank,
-            (None, Some(graph)) => graph == Value::NONE,
+        match (bank, target) {
+            (Some(bank), Some(target)) => target <= bank,
+            (None, Some(target)) => target == Value::NONE,
             _ => true,
         }
     }

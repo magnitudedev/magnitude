@@ -68,7 +68,7 @@
 //! to read, and one the device reaches without the host.
 
 use super::Step;
-use super::requests::{Looked, Phase, Rest, Rested};
+use super::requests::{IDLE, Rested};
 use magnitude_kernels::constants;
 use crate::experts::ExchangeTable;
 use crate::experts::events::Events;
@@ -76,6 +76,19 @@ use std::collections::VecDeque;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread::JoinHandle;
+use std::time::{Duration, Instant};
+
+/// Brief lock-free micro-spin budget on the first empty look at an unreached
+/// head (`Keeping::empty_polls == 0`) so active decode layers that reach their
+/// park within tens of microseconds wake without paying an OS sleep.
+const ACTIVE_SPIN: Duration = Duration::from_micros(50);
+/// Number of short `IDLE` (`20 µs`) condvar waits after `ACTIVE_SPIN` before
+/// backing off to `MAX_POLL` during longer GPU runs (e.g. heavy prefill).
+const BACKOFF_AFTER_EMPTY_POLLS: u32 = 16;
+/// Upper bound on timed condvar waits while a park head is unreached.
+/// Idle periods (`Stop::Empty`) and host-wait periods (`Stop::Unanswered`)
+/// block indefinitely on `Parks::changed` with zero wakeups.
+const MAX_POLL: Duration = Duration::from_micros(200);
 
 /// Which park of a streamed layer: which slot of the exchange its call
 /// waits on.
@@ -166,37 +179,35 @@ struct Pending {
     site: ParkSite,
 }
 
-/// The keeper's rest while a head is unreached ([`Parks::look`]), and the
-/// latest step of each phase whose park it polled for, by which a phase's
-/// start is told: a park's phase is its kind's (a scratch round's is a
-/// prompt's, a landing launch's and a sited combine's a decode's), and a
-/// phase starts again where its park is of a step past the other phase's
-/// latest, which itself came past this phase's latest. Prompt groups and
-/// decode steps begun behind them interleave their parks, but not their
-/// steps' order, so the boundary is the steps', not the parks' arrival.
+/// The keeper's adaptive poll state while a head is unreached ([`Parks::look`]):
+/// micro-spin once for [`ACTIVE_SPIN`], then wait on `Parks::changed` with
+/// [`IDLE`] backing off to [`MAX_POLL`], publishing the current bound to
+/// `rested` for the exchange watchdog.
 struct Keeping {
-    rest: Rest,
-    latest: [Option<Step>; 2],
+    empty_polls: u32,
+    rested: Rested,
 }
 
 impl Keeping {
     fn new(rested: Rested) -> Self {
-        Self { rest: Rest::new(rested), latest: [None; 2] }
+        rested.set(IDLE);
+        Self { empty_polls: 0, rested }
     }
 
-    /// The phase `head`, unreached, is polled for, its start begun where
-    /// it is one.
-    fn polls(&mut self, head: &Pending) -> Phase {
-        let (phase, at, other) = match head.site.kind {
-            ParkKind::Round(_) => (Phase::Prompt, 0, 1),
-            ParkKind::Land | ParkKind::Site => (Phase::Decode, 1, 0),
+    fn reset(&mut self) {
+        self.empty_polls = 0;
+        self.rested.set(IDLE);
+    }
+
+    fn next_rest(&mut self) -> Duration {
+        self.empty_polls = self.empty_polls.saturating_add(1);
+        let rest = if self.empty_polls <= BACKOFF_AFTER_EMPTY_POLLS {
+            IDLE
+        } else {
+            MAX_POLL
         };
-        let starts = self.latest[other].is_some_and(|other| head.sequence > other && self.latest[at].is_none_or(|latest| latest < other));
-        if starts {
-            self.rest.begin(phase);
-        }
-        self.latest[at] = Some(self.latest[at].map_or(head.sequence, |latest| latest.max(head.sequence)));
-        phase
+        self.rested.set(rest);
+        rest
     }
 }
 
@@ -204,9 +215,9 @@ impl Keeping {
 enum Stop {
     /// Nothing is registered.
     Empty,
-    /// The head waits for the device to reach a value: the head's own, or
-    /// its site request's publication's while that is unreached.
-    Unreached,
+    /// The head waits for the device to reach this timeline value: the head's
+    /// own, or its site request's publication's while that is unreached.
+    Unreached(u64),
     /// The device is parked at the head, which took this value, and its
     /// slot is unanswered.
     Unanswered(u64),
@@ -289,7 +300,7 @@ impl Parks {
             state: Mutex::new(State { pending: VecDeque::new(), announced: 0, stopped: false }),
             changed: Condvar::new(),
             loss: std::sync::OnceLock::new(),
-            rested: Rested::default(),
+            rested: Rested::fixed(IDLE),
         }
     }
 
@@ -486,26 +497,23 @@ impl Parks {
         true
     }
 
-    /// Whether the device has yet to reach the value before which the host
-    /// may not read `head`'s request: the head's own, but a sited
-    /// combine's site request's publication's once registered, as the
-    /// request is the host's to read there (`Self::published`); never for a
-    /// park that waits for nothing (a layer without a site), whose answer
-    /// reads nothing.
-    fn unread(&self, held: &State, head: &Pending) -> bool {
+    /// The timeline value the device must reach before the host may read
+    /// `head`'s request: the head's own, or a sited combine's site request's
+    /// publication's once registered; none for a park that waits for nothing
+    /// (a layer without a site).
+    fn wait_value(&self, head: &Pending) -> Option<u64> {
         let layer = &self.layers[head.site.layer];
-        let value = match head.site.kind {
-            ParkKind::Site if layer.site.is_none() => return false,
+        match head.site.kind {
+            ParkKind::Site if layer.site.is_none() => None,
             ParkKind::Site => {
                 let [registered, at] = self.publication(head.site.layer, head.sequence);
-                match registered.load(Ordering::Acquire) == head.sequence {
+                Some(match registered.load(Ordering::Acquire) == head.sequence {
                     true => at.load(Ordering::Acquire),
                     false => head.value,
-                }
+                })
             }
-            ParkKind::Land | ParkKind::Round(_) => head.value,
-        };
-        !self.device_reached(held, value)
+            ParkKind::Land | ParkKind::Round(_) => Some(head.value),
+        }
     }
 
     /// [`Self::settle`] under the parks' lock: the parks it takes to
@@ -525,8 +533,10 @@ impl Parks {
             let Some(&head) = state.pending.front() else {
                 break Stop::Empty;
             };
-            if self.unread(state, &head) {
-                break Stop::Unreached;
+            if let Some(value) = self.wait_value(&head) {
+                if !self.device_reached(state, value) {
+                    break Stop::Unreached(value);
+                }
             }
             if let Some((slots, lane, arrives)) = self.layers[head.site.layer].lane(head.site.kind) {
                 if arrives && !slots.requested(head.sequence, lane) {
@@ -536,7 +546,7 @@ impl Parks {
                 if !slots.answered(head.sequence, lane) {
                     break match self.device_reached(state, head.value) {
                         true => Stop::Unanswered(head.value),
-                        false => Stop::Unreached,
+                        false => Stop::Unreached(head.value),
                     };
                 }
             }
@@ -545,56 +555,74 @@ impl Parks {
         };
         let newly_parked = match stop {
             Stop::Unanswered(value) => std::mem::replace(&mut state.announced, value) != value,
-            Stop::Empty | Stop::Unreached => false,
+            Stop::Empty | Stop::Unreached(_) => false,
         };
         Settled { answer, announces: arrived || newly_parked, stop }
     }
 
     /// One look of the keeper: settle, then answer what it took, or else
     /// wait for what may settle the parks further, decided under the same
-    /// lock as the settling, so no arrival between the two is missed: the
-    /// device reaching the value the head waits for while it is unreached
-    /// (its rest, `keeping`, after which it looks again: a settling that
-    /// found nothing is a look's price, one that found the device arrived
-    /// a notice, of the head's phase); else a registration, an answer, a retirement or the load
-    /// stopping (an answerer settles what its answer opens). False once the
-    /// load stopped or the device was lost ([`Self::lose`]): a loss is
-    /// recorded under the same lock, here last before the wait, so the
-    /// keeper either sees it or is waiting when it is notified.
+    /// lock as the settling, so no arrival between the two is missed: while
+    /// the head is unreached, micro-spin briefly on the lock-free timeline
+    /// counter on the first empty look (`ACTIVE_SPIN`) and thereafter wait
+    /// interruptibly on `changed` with bounded backoff (`IDLE` -> `MAX_POLL`);
+    /// when empty or parked unanswered, block indefinitely on `changed` with
+    /// zero CPU wakeups. False once the load stopped or the device was lost
+    /// ([`Self::lose`]).
     fn look(&self, keeping: &mut Keeping) -> bool {
         let mut state = self.state();
         if state.stopped || self.loss.get().is_some() {
             return false;
         }
-        let looking = std::time::Instant::now();
         let Settled { answer, announces, stop } = self.settle_held(&mut state);
-        let looked = match answer.is_some() || announces {
-            true => Looked::Changed { noticed: 1 },
-            false => Looked::Empty(looking.elapsed()),
-        };
-        let polls = match stop {
-            Stop::Unreached => state.pending.front().map(|head| keeping.polls(head)),
-            Stop::Unanswered(_) | Stop::Empty => None,
-        };
-        let rested = keeping.rest.looked(looked, polls);
         if announces {
             self.events.notify();
         }
         if answer.is_some() {
+            keeping.reset();
             drop(state);
             // The keeper answers what was ready before: it saw the device
             // arrive, or what a park reads become the host's.
             self.answer(answer, seismic::AnsweredBy::Arrival);
             return true;
         }
+        if announces {
+            keeping.reset();
+        }
         match stop {
-            Stop::Unreached => {
-                drop(state);
-                std::thread::sleep(rested.expect("an unreached head is looked at again by time"));
+            Stop::Unreached(target) => {
+                if self.loss.get().is_some() {
+                    return false;
+                }
+                if keeping.empty_polls == 0 {
+                    drop(state);
+                    let spin_until = Instant::now() + ACTIVE_SPIN;
+                    loop {
+                        match self.timeline.reached(target) {
+                            Ok(true) => return true,
+                            Ok(false) => {}
+                            Err(error) => {
+                                self.lose(&self.state(), format!("the device lost the parks' timeline: {error}"));
+                                return false;
+                            }
+                        }
+                        if Instant::now() >= spin_until || self.loss.get().is_some() {
+                            break;
+                        }
+                        std::hint::spin_loop();
+                    }
+                    keeping.empty_polls = 1;
+                    return true;
+                }
+                let rest = keeping.next_rest();
+                let _ = self.changed.wait_timeout(state, rest).expect("parks");
             }
             // Its own settling may have lost the device.
             Stop::Unanswered(_) | Stop::Empty if self.loss.get().is_some() => return false,
-            Stop::Unanswered(_) | Stop::Empty => drop(self.changed.wait(state).expect("parks")),
+            Stop::Unanswered(_) | Stop::Empty => {
+                keeping.reset();
+                drop(self.changed.wait(state).expect("parks"));
+            }
         }
         true
     }
@@ -1066,5 +1094,52 @@ mod tests {
         parks.kept = false;
         assert_eq!(parks.scratch_visible_end(1, false, 10), 10);
         assert_eq!(parks.scratch_visible_end(1, true, 10), 10);
+    }
+
+    /// Active decode `ParkKind::Land` arrivals are answered with microsecond
+    /// latency (no coarse millisecond sleep accumulation across layers), and
+    /// long waits keep `rested` bounded by `MAX_POLL` while remaining
+    /// immediately interruptible by `stop()`.
+    #[test]
+    fn active_land_parks_answer_without_coarse_sleep_and_rest_stays_bounded() {
+        let device = crate::test_support::open_backend(&Devices::discover(&[]).unwrap(), BackendName::Cpu).unwrap();
+        let parks = Arc::new(parks(&device));
+        let keeper = Parks::keep(parks.clone()).unwrap();
+        let land = ParkSite { layer: 0, kind: ParkKind::Land };
+        // Simulate 40 streamed layers of a decode step where each layer's
+        // GPU arrival lands shortly after registration.
+        let began = Instant::now();
+        for value in (1..80u64).step_by(2) {
+            parks.register(value, 7, land);
+            std::hint::spin_loop();
+            parks.timeline.reach(value).unwrap();
+            assert!(
+                answered_within(&parks.timeline, value, Duration::from_millis(50)),
+                "park {value} was not answered promptly"
+            );
+        }
+        let elapsed = began.elapsed();
+        assert!(
+            elapsed < Duration::from_millis(100),
+            "40 sequential Land parks took {elapsed:?}, indicating coarse sleep overhead"
+        );
+        // An unreached park backs off to at most MAX_POLL (never unbounded).
+        parks.register(81, 8, land);
+        std::thread::sleep(Duration::from_millis(5));
+        assert!(
+            parks.rested().get() <= MAX_POLL,
+            "keeper rest {:?} exceeded MAX_POLL {:?}",
+            parks.rested().get(),
+            MAX_POLL
+        );
+        // Stopping interrupts the timed condvar wait promptly.
+        let stopping = Instant::now();
+        parks.stop();
+        keeper.join().unwrap();
+        assert!(
+            stopping.elapsed() < Duration::from_millis(100),
+            "stop() did not wake keeper promptly: {:?}",
+            stopping.elapsed()
+        );
     }
 }

@@ -44,20 +44,14 @@ fn the_bank_regrows_to_its_target_once_a_prompts_claim_is_freed() {
         read(&ledger, at(1));
         read(&ledger, at(2));
         assert_eq!(domain.follow_cache_targets(&mut bindings, wake(), wake()).unwrap(), Followed::Holds, "{backend:?}: the bank holds its full target");
-        // The prompt's claim leaves the bank's cache a slot and a half of
-        // room above its floor: its target falls to two slots.
+        // The prompt's claim takes room from the bank's cache: synchronous bank
+        // reclaim shrinks the bank below its 4-slot target before admitting the claim.
         let room = ledger.estimate().target();
         let prompt = ledger.change(|keeping| ledger.claim_at(&keeping.claims(), None, crate::memory::ledger::CommittedKind::Load, room - row * 3 / 2)).expect("the prompt's claim fits");
-        read(&ledger, at(3));
-        assert_eq!(domain.follow_cache_targets(&mut bindings, wake(), wake()).unwrap(), Followed::Shrank(BankStep::Begun(crate::planning::BankTier::Bank)), "{backend:?}");
-        let shrunk = loop {
-            if let Some((resized, _)) = domain.advance_expert_bank(wake()).unwrap() {
-                break resized;
-            }
-        };
-        assert!(matches!(shrunk, BankResized::Shrunk { from: 4, to: 2, .. }), "{backend:?}: {shrunk:?}");
+        let shrunk = crate::domain::ElasticBank::slots(crate::domain::fixtures::fake_bank_mut(&mut domain));
+        assert!(shrunk < 4, "{backend:?}: synchronous reclaim shrank the bank below 4 (got {shrunk})");
         // The prompt ends: its claim is freed, and the next boundary grows
-        // the bank back to its full target.
+        // the bank back to its full 4-slot target.
         drop(prompt);
         read(&ledger, at(4));
         assert_eq!(domain.follow_cache_targets(&mut bindings, wake(), wake()).unwrap(), Followed::Grew(BankStep::Begun(crate::planning::BankTier::Bank)), "{backend:?}");
@@ -66,7 +60,7 @@ fn the_bank_regrows_to_its_target_once_a_prompts_claim_is_freed() {
                 break resized;
             }
         };
-        assert!(matches!(grown, BankResized::Grown { from: 2, to: 4, .. }), "{backend:?}: {grown:?}");
+        assert!(matches!(grown, BankResized::Grown { from, to: 4, .. } if from == shrunk), "{backend:?}: {grown:?}");
         read(&ledger, at(5));
         assert_eq!(domain.follow_cache_targets(&mut bindings, wake(), wake()).unwrap(), Followed::Holds, "{backend:?}: the full bank again");
     }
@@ -81,13 +75,9 @@ fn cheaper_than_the_bank(ledger: &Ledger) -> u64 {
 }
 
 /// A claim that takes less than one granule of the bank's cache (its
-/// granule a slot here) is the ledger's fact, not the room's jitter: the
-/// claim allocates those bytes only once the bank frees them, so the bank
-/// sheds a whole slot though its room moved by less than a block, and the
-/// claim's allocation, refused while the slot stands, is admitted once the
-/// shrink returns it. A first claim holds the free room, allocated, and the
-/// cache that yields before the bank's (CUDA's fixture holds some), so the
-/// second takes the bank's alone.
+/// granule a slot here) synchronously reclaims one whole slot before
+/// returning the claim, so the claim's allocation is admitted immediately
+/// without waiting for a separate async shrink.
 #[test]
 fn a_claim_taking_under_a_granule_of_the_bank_sheds_a_slot_and_then_allocates() {
     for backend in bank_backends() {
@@ -102,30 +92,25 @@ fn a_claim_taking_under_a_granule_of_the_bank_sheds_a_slot_and_then_allocates() 
         let estimate = ledger.estimate();
         assert_eq!(estimate.guarantee(), 0, "{backend:?}: no rise: every free byte is a claim's");
         let free = estimate.free();
-        let room = ledger.change(|keeping| ledger.claim_at(&keeping.claims(), None, crate::memory::ledger::CommittedKind::Load, free + cheaper_than_the_bank(&ledger))).expect("free room and the cheaper cache");
+        let spare = estimate.cache_of(crate::memory::ledger::CacheKind::Spare);
+        let room = ledger.change(|keeping| ledger.claim_at(&keeping.claims(), None, crate::memory::ledger::CommittedKind::Load, free + spare)).expect("free room and spare cache");
         ledger.change(|_| { let entry = room.entry(); entry.take(&entry.change(), free, seismic::memory::Wiring::Pageable) }).unwrap_or_else(|refused| panic!("{backend:?}: free room allocates: {refused}"));
         let bank = || ledger.estimate().cache_of(crate::memory::ledger::CacheKind::Bank);
         let before = bank();
+        let slots_before = crate::domain::ElasticBank::slots(crate::domain::fixtures::fake_bank_mut(&mut domain));
         let bytes = row / 2;
-        let claim = ledger.change(|keeping| ledger.claim_at(&keeping.claims(), None, crate::memory::ledger::CommittedKind::Load, bytes)).expect("the bank's cache yields to the claim");
-        assert_eq!(before - bank(), bytes, "{backend:?}: half a slot of the bank's cache, taken for the claim");
+        let claim = ledger.change(|keeping| ledger.claim_at(&keeping.claims(), None, crate::memory::ledger::CommittedKind::Load, bytes)).expect("the bank's cache synchronously reclaims a slot for the claim");
+        assert_eq!(before - bank(), row, "{backend:?}: one whole bank slot reclaimed for the sub-slot claim");
+        assert_eq!(crate::domain::ElasticBank::slots(crate::domain::fixtures::fake_bank_mut(&mut domain)), slots_before - 1, "{backend:?}: bank shrank by 1 slot");
         let allocate = || ledger.change(|_| { let entry = claim.entry(); entry.take(&entry.change(), bytes, seismic::memory::Wiring::Pageable) });
-        assert!(allocate().is_err(), "{backend:?}: the taken half slot is the bank's still");
-        assert_eq!(domain.follow_cache_targets(&mut bindings, wake(), wake()).unwrap(), Followed::Shrank(BankStep::Begun(crate::planning::BankTier::Bank)), "{backend:?}");
-        let shrunk = loop {
-            if let Some((resized, _)) = domain.advance_expert_bank(wake()).unwrap() {
-                break resized;
-            }
-        };
-        assert!(matches!(shrunk, BankResized::Shrunk { from: 4, to: 3, .. }), "{backend:?}: {shrunk:?}");
-        allocate().unwrap_or_else(|refused| panic!("{backend:?}: the shed slot admits the claim: {refused}"));
+        allocate().unwrap_or_else(|refused| panic!("{backend:?}: the reclaimed slot admits the claim immediately: {refused}"));
     }
 }
 
-/// Cache a shortage takes to fit the budget as others move owes no claim:
-/// a yield of half a slot (under the bank's block) to the room's own
-/// movement keeps the bank as it is, its threshold judging it as it judges
-/// the room, as the Metal gate's steady decode needs.
+/// Cache a shortage takes in-flight to fit the budget as others move owes no
+/// claim: a logical yield of half a slot (under the bank's block) to the
+/// room's own movement keeps the bank as it is, its threshold judging it as it
+/// judges the room, as the Metal gate's steady decode needs.
 #[test]
 fn a_shortages_yield_under_a_block_keeps_the_bank() {
     for backend in bank_backends() {
@@ -138,11 +123,11 @@ fn a_shortages_yield_under_a_block_keeps_the_bank() {
         read(&ledger, at(2));
         assert_eq!(domain.follow_cache_targets(&mut bindings, wake(), wake()).unwrap(), Followed::Holds, "{backend:?}: the bank holds its full target");
         // Cache worth no more than the bank's yields first; past it, half a
-        // slot of the bank's.
+        // slot of the bank's (in-flight logical yield, below one block).
         let bank = || ledger.estimate().cache_of(crate::memory::ledger::CacheKind::Bank);
         let before = bank();
         let plan = ledger.plan_relief(cheaper_than_the_bank(&ledger) + row / 2, Relief::CacheOnly, crate::memory::ledger::Frees::Room).expect("the cache covers the shortage");
-        ledger.change(|keeping| ledger.execute(&keeping.claims(), plan, crate::memory::ledger::ReliefBoundary::Idle));
+        ledger.change(|keeping| ledger.execute(&keeping.claims(), plan, crate::memory::ledger::ReliefBoundary::InFlight));
         let fell = before - bank();
         assert!(fell > 0 && fell < row, "{backend:?}: the shortage took {fell} bytes of the bank's cache, under a block");
         assert_eq!(domain.follow_cache_targets(&mut bindings, wake(), wake()).unwrap(), Followed::Holds, "{backend:?}: within a block, the bank keeps its slots");
@@ -182,14 +167,22 @@ fn the_loads_own_commit_never_spends_the_guarantee() {
         }
         let estimate = ledger.estimate();
         assert!(estimate.free() >= estimate.guarantee(), "{backend:?}: the bank leaves the guarantee free");
-        // The room beside the guarantee and the cache worth less than the
-        // bank's, held; then a driver takes half a slot for the load,
-        // never refused.
-        let _room = ledger.change(|keeping| ledger.claim_at(&keeping.claims(), None, crate::memory::ledger::CommittedKind::Load, estimate.free() - estimate.guarantee() + cheaper_than_the_bank(&ledger))).expect("the room beside the guarantee");
+        // Drain cheaper-than-bank cache (`Spare` + `GraphSlots`) first so the
+        // bank cannot regrow into it after shedding a slot for the load's commit.
+        let cheaper = cheaper_than_the_bank(&ledger);
+        if cheaper > 0 {
+            if let Some(plan) = ledger.plan_relief(cheaper, Relief::CacheOnly, crate::memory::ledger::Frees::Room) {
+                ledger.change(|keeping| ledger.execute(&keeping.claims(), plan, crate::memory::ledger::ReliefBoundary::InFlight));
+            }
+        }
+        let estimate = ledger.estimate();
+        // The room beside the guarantee (leaving 1 byte for the load's claim)
+        // held; then a driver takes half a slot for the load, never refused.
+        let _room = ledger.change(|keeping| ledger.claim_at(&keeping.claims(), None, crate::memory::ledger::CommittedKind::Load, (estimate.free() - estimate.guarantee()).saturating_sub(1))).expect("the room beside the guarantee");
         let bank = || ledger.estimate().cache_of(crate::memory::ledger::CacheKind::Bank);
         let before = bank();
         let commit = ledger.change(|keeping| ledger.claim_at(&keeping.claims(), None, crate::memory::ledger::CommittedKind::Load, 1)).expect("a byte");
-        ledger.change(|_| { let entry = commit.entry(); entry.took(&entry.change(), row / 2, seismic::memory::Wiring::Pageable) });
+        ledger.change(|_| { let entry = commit.entry(); entry.took(&entry.change(), row * 3 / 4, seismic::memory::Wiring::Pageable) });
         assert!(before - bank() > 0 && before - bank() < row, "{backend:?}: the bank's cache gave the commit under a block");
         let estimate = ledger.estimate();
         assert!(estimate.free() >= estimate.guarantee(), "{backend:?}: the bank's cache gave way, the guarantee unspent");
@@ -289,7 +282,9 @@ fn bank_regrows_immediately_from_ledger_valuation_after_shrink() {
         let ledger = domain.resources.ledgers().device().clone();
         let mut t = Instant::now();
         read_host(&ledger, row as i64, t);
-        t += Duration::from_millis(100);
+        // Settle the initial device-to-host fixture reading's pulse envelope
+        // before injecting the exogenous deficit.
+        t += Duration::from_secs(600);
         read_host(&ledger, row as i64, t);
         assert_eq!(domain.follow_cache_targets(&mut bindings, wake(), wake()).unwrap(), Followed::Holds, "{backend:?}");
 
@@ -301,9 +296,10 @@ fn bank_regrows_immediately_from_ledger_valuation_after_shrink() {
         let shrunk_to = domain.family.expert_bank().expect("bank").slots();
         assert!(shrunk_to < 4, "{backend:?}: shrunk_to={shrunk_to}");
 
-        // As soon as room recovers, the bank regrows immediately from the ledger's valuation.
+        // As soon as room recovers past the 3.5-row pulse envelope (100 ms later),
+        // the bank regrows immediately from the ledger's valuation without cooldown hysteresis.
         t += Duration::from_millis(100);
-        read_host(&ledger, (row * 2) as i64, t);
+        read_host(&ledger, (row * 6) as i64, t);
         assert!(
             matches!(
                 pending_move(&domain),
@@ -373,6 +369,8 @@ fn whole_bank_and_zero_miss_loads_price_verify_passes_and_transition_cleanly() {
         verifying: false,
         terms: plain_terms,
         verify_terms: [None; crate::experts::DEPTHS],
+        verify_samples: [0; crate::experts::DEPTHS],
+        plain_streak: 0,
         paths: None,
         stall: None,
         front_stall: [None; crate::experts::DEPTHS - 1],
@@ -411,6 +409,7 @@ fn whole_bank_and_zero_miss_loads_price_verify_passes_and_transition_cleanly() {
     high_accept.depth = 1;
     high_accept.verifying = true;
     high_accept.verify_terms[1] = Some(compute(0.034));
+    high_accept.verify_samples[1] = crate::experts::MIN_VERIFY_SAMPLES;
     high_accept.accepts = [Some(0.9); crate::experts::DEPTHS - 1];
     let whole_verifying = pricing(high_accept.clone(), true, 4, Some(0.005));
     let built = whole_verifying.built(&requests, &requests).unwrap();
@@ -740,11 +739,13 @@ fn two_row_pricing_scales_verify_overhead_with_depth_instead_of_collapsing_to_fr
     let compute = |seconds: f64| Terms { compute: seconds, drive: 0., link: 0., cpu: 0., memory: 0. };
     let mut terms = [None; crate::experts::DEPTHS];
     let mut verify_terms = [None; crate::experts::DEPTHS];
+    let mut verify_samples = [0; crate::experts::DEPTHS];
     for k in 0..crate::experts::DEPTHS {
         let secs = 0.060 + 0.005 * k as f64;
         terms[k] = Some(compute(secs));
         if k > 0 {
             verify_terms[k] = Some(compute(secs));
+            verify_samples[k] = crate::experts::MIN_VERIFY_SAMPLES;
         }
     }
     let accepts_vals = [0.85, 0.80, 0.75, 0.70, 0.65, 0.50, 0.40, 0.30, 0.20, 0.10, 0.05, 0.05, 0.05, 0.05, 0.05];
@@ -758,6 +759,8 @@ fn two_row_pricing_scales_verify_overhead_with_depth_instead_of_collapsing_to_fr
         verifying: true,
         terms,
         verify_terms,
+        verify_samples,
+        plain_streak: 0,
         paths: None,
         stall: None,
         front_stall: [None; crate::experts::DEPTHS - 1],
@@ -851,4 +854,95 @@ fn freshly_retained_zero_hit_prefix_is_valued_ahead_of_lower_value_bank_slot() {
             "{backend:?}: lower-value bank yields before freshly retained prefix"
         );
     }
+}
+
+/// A single cold `200 ms` `Verify(1)` sample must NOT permanently lock
+/// `TwoRowPricing` into `BuiltForm::Plain`: until `MIN_VERIFY_SAMPLES` (`2`)
+/// verify passes are recorded, `build_resident(true)` extrapolates from the
+/// plain prior (`terms[0]`). And even when `>= 2` slow verify samples do push
+/// `Regime::pass()` to `Form::Front(0)`, `PLAIN_REPROBE_INTERVAL` consecutive
+/// plain passes trigger a `Verify(1)` re-probe so a transient spike can never
+/// permanently disable speculative drafting.
+#[test]
+fn single_cold_verify_sample_does_not_lock_out_drafting_and_plain_streak_reprobes() {
+    use crate::RequestId;
+    use magnitude_cost_model::{Form, Terms};
+    let requests = [RequestId(1)];
+    let prices = crate::domain::fixtures::load_costs(None).prices;
+    let compute = |seconds: f64| Terms { compute: seconds, drive: 0., link: 0., cpu: 0., memory: 0. };
+    let mut terms = [None; crate::experts::DEPTHS];
+    terms[0] = Some(compute(0.030));
+    let mut verify_terms = [None; crate::experts::DEPTHS];
+    verify_terms[1] = Some(compute(0.200));
+    let mut verify_samples = [0; crate::experts::DEPTHS];
+    verify_samples[1] = 1;
+    let mut measured = crate::experts::Measured {
+        layers: 48,
+        depth: 1,
+        verifying: true,
+        terms,
+        verify_terms,
+        verify_samples,
+        plain_streak: 0,
+        paths: None,
+        stall: None,
+        front_stall: [None; crate::experts::DEPTHS - 1],
+        verify_stall: [None; crate::experts::DEPTHS - 1],
+        needed: [[None; crate::experts::DEPTHS]; 2],
+        stand: None,
+        accepts: [Some(0.85); crate::experts::DEPTHS - 1],
+        fresh: [None; crate::experts::DEPTHS - 1],
+        held: None,
+    };
+    let make_pricing = |measured: crate::experts::Measured| super::TwoRowPricing {
+        measured: Some(measured),
+        prices: prices.clone(),
+        depth: 1,
+        rows: crate::CHAINED_ROWS,
+        verifies: 4,
+        whole: true,
+        overhead: None,
+    };
+
+    // 1. Single cold 200 ms Verify(1) sample (`verify_samples[1] == 1`) is
+    //    ignored in favor of the LaunchPrices-scaled `terms[0]` prior -> Verify.
+    let single_cold = make_pricing(measured.clone());
+    let front = single_cold.regime(1, 1).unwrap().unwrap();
+    assert!(
+        matches!(front.pass, Form::Verify(d) if d >= 1),
+        "single cold 200 ms Verify(1) must not lock out drafting: {:?}",
+        front.pass
+    );
+    assert!(
+        matches!(
+            single_cold.built(&requests, &requests).unwrap(),
+            crate::FrontPass::Built { form: crate::BuiltForm::Verify, ref depths }
+                if depths.get(&RequestId(1)).copied().unwrap_or(0) >= 1
+        ),
+        "built pass must continue verifying after single cold sample"
+    );
+
+    // 2. Two slow 200 ms Verify(1) samples (`verify_samples[1] == 2`) are
+    //    proven -> regime chooses Plain (`Form::Front(0)`) while `plain_streak`
+    //    is below `PLAIN_REPROBE_INTERVAL`.
+    measured.verify_samples[1] = crate::experts::MIN_VERIFY_SAMPLES;
+    measured.depth = 0;
+    measured.verifying = false;
+    measured.plain_streak = crate::experts::PLAIN_REPROBE_INTERVAL - 1;
+    let locked = make_pricing(measured.clone());
+    assert_eq!(locked.regime(1, 1).unwrap().unwrap().pass, Form::Front(0));
+    assert_eq!(
+        locked.built(&requests, &requests).unwrap(),
+        crate::FrontPass::Built { form: crate::BuiltForm::Plain, depths: std::collections::BTreeMap::new() }
+    );
+
+    // 3. After `PLAIN_REPROBE_INTERVAL` consecutive plain passes, `built()`
+    //    re-probes `Verify(1)` so a transient spike cannot permanently lock out
+    //    drafting.
+    measured.plain_streak = crate::experts::PLAIN_REPROBE_INTERVAL;
+    let reprobing = make_pricing(measured);
+    assert_eq!(
+        reprobing.built(&requests, &requests).unwrap(),
+        crate::FrontPass::Built { form: crate::BuiltForm::Verify, depths: std::collections::BTreeMap::from([(RequestId(1), 1)]) }
+    );
 }

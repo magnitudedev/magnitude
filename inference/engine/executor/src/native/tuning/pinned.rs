@@ -333,7 +333,7 @@ mod tests {
                 panic!("{} runs its default where another build's configuration was recorded: {}", key.0, what(&decided));
             };
         };
-        let metal = |implementation: Result<Option<&NativeImplementation>, _>| implementation.unwrap().unwrap().clone();
+        let metal = |implementation: Result<Option<std::sync::Arc<NativeImplementation>>, _>| (*implementation.unwrap().unwrap()).clone();
         // A unit's key at the first statics its implementation admits (its
         // own search, so the key follows the declaration's statics) and
         // the parameter its call site fixes.
@@ -382,14 +382,11 @@ mod tests {
     #[test]
     fn a_parameter_moved_between_native_and_launches_replays_its_value() {
         let bf16 = seismic::Element::bf16();
-        let device_independent = |implementation: Result<Option<&NativeImplementation>, _>| {
+        let device_independent = |implementation: Result<Option<std::sync::Arc<NativeImplementation>>, _>| {
             implementation
                 .unwrap()
                 .unwrap()
-                .clone()
-                .device_independent()
-                .expect("the declaration reads no device property")
-                .owned()
+                .at_device(&seismic::device::BackendFloor(BackendName::Metal))
         };
         let unit = |entry: &'static str, implementation: &OnDevice| {
             let statics = implementation.search_statics(&[]).unwrap().expect("the implementation admits some statics");

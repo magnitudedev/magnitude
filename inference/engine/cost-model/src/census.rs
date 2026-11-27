@@ -152,6 +152,11 @@ impl Census {
         self.routed.get(&kind).unwrap_or_else(|| panic!("invariant violated: {kind:?} is none of the census's routed kinds"))
     }
 
+    /// Whether this launch contains any streamed/banked routed layers.
+    pub fn has_routed(&self) -> bool {
+        !self.routed.is_empty()
+    }
+
     /// The launch's distinct kinds.
     pub fn kinds(&self) -> &[Kind] {
         &self.kinds

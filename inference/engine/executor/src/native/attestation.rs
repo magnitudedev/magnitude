@@ -28,7 +28,7 @@ pub struct AttestedPrograms {
     pub(super) drafter: Option<AttestedDrafter>,
     pub(super) vision: Option<AttestedVision>,
     pub(super) state: AttestedState,
-    pub(super) imports: Vec<(ImportProgramSlot, AttestedImport)>,
+    pub(super) imports: std::cell::RefCell<Vec<(ImportProgramSlot, AttestedImport)>>,
     /// The copy of a step's token rows
     /// (`ProgramPlan::copies_token_rows`).
     pub(super) notice: Option<NativeKernel<selection_notice::Entry>>,
@@ -541,7 +541,7 @@ impl AttestedPrograms {
                             limits,
                             state.head_geometry()?,
                             proposals,
-                            load.fronts(),
+                            load.chains_front(),
                             head_plan.has_bank(),
                         )?;
                         let landing = self.landing(load, TARGET_TABLE)?;
@@ -1324,7 +1324,7 @@ impl AttestedPrograms {
                         .token_confidence
                         .clone()
                         .ok_or_else(|| missing("token_confidence", "head"))?,
-                    chain: match load.fronts() {
+                    chain: match load.chains_front() {
                         true => Some(
                             handles
                                 .chain
@@ -1563,7 +1563,7 @@ impl AttestedPrograms {
             drafter,
             vision,
             state,
-            imports,
+            imports: std::cell::RefCell::new(imports),
             notice: prepared.glue.selection_notice.clone(),
             target_graphs: None,
             target_readout_graphs: None,
@@ -1915,10 +1915,48 @@ impl AttestedPrograms {
     ) -> Result<AttestedImport, CatalogError> {
         let requested = ImportProgramSlot::of(weight);
         self.imports
+            .borrow()
             .iter()
             .find(|(slot, _)| *slot == requested)
             .map(|(_, handle)| handle.clone())
             .ok_or_else(|| CatalogError::native(self.backend, missing("weight_import", requested)))
+    }
+
+    /// Release load-time tuning receipts and qualification metadata once graph
+    /// sealing completes and nothing further reads them.
+    pub fn release_preparation_metadata(&mut self) {
+        self.tuned = Vec::new();
+        self.report.clear();
+    }
+
+    /// Release import-only kernels (`import_dense`, `repack_weight`,
+    /// `packing_bound`) no longer needed after target weight import completes.
+    /// When lazy components (`head` or `vision`) remain to be bound, retains
+    /// only the slots required by their non-target weights.
+    pub fn release_target_imports(&self, load: &crate::ModelLoadPlan, keep_lazy_components: bool) {
+        let mut imports = self.imports.borrow_mut();
+        if !keep_lazy_components {
+            *imports = Vec::new();
+            return;
+        }
+        let needed: std::collections::HashSet<ImportProgramSlot> = load
+            .weights()
+            .filter(|weight| {
+                !matches!(
+                    weight.role.scope,
+                    WeightScope::Target
+                        | WeightScope::TargetSublayer(_)
+                        | WeightScope::TargetBranch { .. }
+                )
+            })
+            .map(ImportProgramSlot::of)
+            .collect();
+        imports.retain(|(slot, _)| needed.contains(slot));
+        if imports.is_empty() {
+            *imports = Vec::new();
+        } else {
+            imports.shrink_to_fit();
+        }
     }
 
     /// The landing entries of the gathered table `role` of `load`; `None`

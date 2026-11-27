@@ -389,7 +389,13 @@ fn placed_chain(target: &(String, ModelDefinition, magnitude_artifacts::PackageM
     let mut definition = target.1.clone();
     definition.decoder.context_limit = context;
     match plan(&definition, &target.2, &device, service(backend, &definition)).unwrap().placed::<AssessmentMemoryCharge>(&definition, None, &crate::assessment::Priced::Unavailable("parity places from memory alone".into()), &MemoryBudget::of_selected_stable(&device).unwrap()).unwrap() {
-        Placed::Whole(placed) => Some(placed.draft().policy().limits().chain_capacity.get()),
+        Placed::Whole(placed) => Some(
+            placed
+                .draft()
+                .load()
+                .expert_bank()
+                .map_or_else(|| placed.draft().policy().limits().chain_capacity.get(), |bank| bank.pass.get()),
+        ),
         Placed::Short(_) => None,
     }
 }
@@ -407,7 +413,9 @@ fn lfm2_5_8b_on_an_a10_8q_is_placed_whole_on_the_longest_chain_its_room_holds() 
     let topology = recorded::a10_8q();
     let status = unopened(&topology);
     let executor = topology.executors().iter().find(|executor| executor.backend() == BackendName::Cuda).unwrap();
-    for (context, chain) in [(128_000, None), (SERVED_FLOOR, Some(64))] {
+    // At 128,000 and 32,768 on a10_8q (6.60 GB room vs 7.37 GB resident),
+    // the load is placed whole via its expert bank (`bank.pass = 16`).
+    for (context, chain) in [(128_000, None), (SERVED_FLOOR, Some(16))] {
         let workload = Workload { label: "service", context, limits: service(BackendName::Cuda, &target.1) };
         let row = row(&target.0, &target.1, &target.2, "a10_8q", &topology, &status, executor, workload);
         assert!(!row.regression && !row.panicked, "{}", row.line);
@@ -832,9 +840,10 @@ fn device_dependent_contracts_build_assessment_graphs_without_device_dependent_e
         fn value(&self, name: &str) -> u64 {
             match name {
                 "units" => self.units,
-                "shared_bytes_per_group" => self.shared_bytes_per_group,
+                "shared_bytes_per_group" | "shared_bytes_per_unit" => self.shared_bytes_per_group,
                 "max_group_threads" => self.max_group_threads,
                 "subgroup_width" => self.subgroup_width,
+                "tensor_ops" => 1,
                 other => panic!("unexpected device property {other:?}"),
             }
         }

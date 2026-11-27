@@ -451,7 +451,7 @@ mod tests {
             .expect("Seismic allocates the import");
 
         let ledger = ledgers.device();
-        let pool = ledger.pool_block(crate::memory::ledger::PoolClass::State, std::num::NonZeroU64::new(page).unwrap()).blocks;
+        let pool = ledger.pool_block(crate::memory::ledger::PoolClass::State, std::num::NonZeroU64::new(rounding).unwrap()).blocks;
         let slot = ledgers
             .changes()
             .change(|keeping| ledgers.claim_request_slot(&keeping.claims(), &device, ClaimDemand { device: page, ..Default::default() }))

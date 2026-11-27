@@ -1,6 +1,6 @@
 //! A reading as the ledger estimated it, and the estimate every decision reads.
 
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use crate::memory::shortage;
 use crate::memory::supply::{Ceiling, HostGrant, Observed, Reading};
@@ -8,6 +8,56 @@ use crate::memory::supply::{Ceiling, HostGrant, Observed, Reading};
 use super::changes::Sampled;
 use super::state::{FoldedReading, State};
 use super::vocabulary::CacheKind;
+
+/// Sustained calm window (`rise == 0`, zero active shrink) during which
+/// `peak_rise` and `peak_wired_rise` hold flat so recurring OS UMA pulses
+/// (every ~1-5 s) never trigger shrink/regrow oscillation.
+const PEAK_HOLD: Duration = Duration::from_secs(10);
+
+/// Exponential half-life applied to `peak_rise` / `peak_wired_rise` once
+/// sustained calm exceeds [`PEAK_HOLD`], so a one-time transient spike decays
+/// smoothly instead of permanently pinning memory.
+const PEAK_HALF_LIFE: Duration = Duration::from_secs(30);
+
+/// Sub-page floor below which a decayed peak envelope snaps to zero.
+const PEAK_DECAY_FLOOR: u64 = 4096;
+
+/// Update a time-decayed high-water pulse envelope (`peak_rise` or
+/// `peak_wired_rise`):
+/// - On idle settle (`settled`) or first reading, resets to `current`.
+/// - On any non-zero pulse (`current > 0`), raises to `prev.max(current)` and
+///   refreshes the calm timer to `now`.
+/// - While actively shrinking (`active_shrink`), holds the envelope and
+///   refreshes the calm timer so a shrink never decays the pulse it answers.
+/// - Over sustained calm readings (`current == 0`, `!active_shrink`), holds
+///   flat for [`PEAK_HOLD`] and then decays smoothly with [`PEAK_HALF_LIFE`].
+fn update_peak(prev: Option<(u64, Instant, Instant)>, current: u64, now: Instant, settled: bool, active_shrink: bool) -> (u64, Instant) {
+    let Some((prev_peak, prev_peak_at, prev_at)) = prev.filter(|_| !settled) else {
+        return (current, now);
+    };
+    if current > 0 {
+        return (prev_peak.max(current), now);
+    }
+    if active_shrink {
+        return (prev_peak, now);
+    }
+    if prev_peak == 0 {
+        return (0, now);
+    }
+    let calm = now.saturating_duration_since(prev_peak_at);
+    if calm <= PEAK_HOLD {
+        return (prev_peak, prev_peak_at);
+    }
+    let hold_end = prev_peak_at + PEAK_HOLD;
+    let dt = now.saturating_duration_since(prev_at.max(hold_end));
+    if dt.is_zero() {
+        return (prev_peak, prev_peak_at);
+    }
+    let factor = 0.5_f64.powf(dt.as_secs_f64() / PEAK_HALF_LIFE.as_secs_f64());
+    let decayed = (prev_peak as f64 * factor).floor() as u64;
+    let next = if decayed < PEAK_DECAY_FLOOR { 0 } else { decayed };
+    (next, prev_peak_at)
+}
 
 /// A reading as the ledger estimated it (§4.1-4.3): every figure of one
 /// sample's instant, the process's own as the sample shows it.
@@ -29,10 +79,10 @@ pub(super) struct Read {
     /// OS/container reserve that unreclaimable pinned host allocations must
     /// leave untouched (`Reading::pinned_reserve(unit)`): 0 on device stores.
     pinned_reserve: u64,
-    /// Elastic-cache-only headroom reserved below `budget()` on discrete
-    /// device stores (`Reading::cache_reserve`, e.g. CUDA primary-context
-    /// headroom); 0 on host stores. Never subtracted from `budget()` or
-    /// resident admission `room()`.
+    /// Elastic-cache-only headroom reserved below `budget()` (`Reading::cache_reserve`,
+    /// e.g. discrete CUDA primary-context headroom or Linux/Windows UMA
+    /// compaction floor); 0 on plain host stores and wired-ceiling Metal.
+    /// Never subtracted from `budget()` or resident admission `room()`.
     cache_reserve: u64,
     /// The store's pool block unit at the reading (`State::unit`).
     unit: u64,
@@ -56,20 +106,26 @@ pub(super) struct Read {
     others: u64,
     /// Others' rise since the reading before.
     rise: u64,
-    /// High-water single-reading `rise` observed on this store since open or
-    /// the last idle settle (`settled`): applied only to runtime growth
-    /// (`grow_room` / `pinned_grow_room`), never to `budget`, `hold_room`, or
-    /// `guarantee`, so transient `guarantee == 0` dips between OS UMA pulses do
-    /// not regrow a slot that cannot survive the next pulse.
+    /// Time-decayed high-water single-reading `rise` observed on this store:
+    /// applied only to runtime growth (`grow_room` / `pinned_grow_room`),
+    /// never to `budget`, `hold_room`, or `guarantee`, so transient
+    /// `guarantee == 0` dips between recurring multi-slot OS UMA pulses do
+    /// not regrow slots that cannot survive the next pulse.
     peak_rise: u64,
+    /// Instant `peak_rise` was last raised or refreshed by a non-zero `rise`
+    /// or active shrink.
+    peak_rise_at: Instant,
     /// Others' wired rise since the reading before; applied only to growth
     /// targets (`import_room` / `target`), never baked into `grant` or
     /// `hold_room`, so single-sample wired jitter does not trigger shrink thrash.
     wired_rise: u64,
-    /// High-water single-reading `wired_rise` observed on this store since open
-    /// or the last idle settle (`settled`); applied only to runtime growth
-    /// (`grow_room`), never to `grant` or `hold_room`.
+    /// Time-decayed high-water single-reading `wired_rise` observed on this
+    /// store; applied only to runtime growth (`grow_room`), never to `grant`
+    /// or `hold_room`.
     peak_wired_rise: u64,
+    /// Instant `peak_wired_rise` was last raised or refreshed by a non-zero
+    /// `wired_rise` or active shrink.
+    peak_wired_rise_at: Instant,
     /// The wired ceiling's grant: the limit less others' wired bytes and
     /// `Ceiling::execution_reserve()`; none where no ceiling bounds the store.
     pub(super) grant: Option<u64>,
@@ -122,6 +178,9 @@ pub struct Estimate {
     /// Whether `CacheKind::GraphSlots` yields to `CacheKind::Bank` growth
     /// under the ledger's per-byte value comparison (`Value`).
     graph_slots_yield_to_bank: bool,
+    /// Whether `CacheKind::Prefix` yields to `CacheKind::Bank` growth
+    /// under the ledger's per-byte value comparison (`Value`).
+    prefix_yields_to_bank: bool,
     /// A change of the process's no reading shows yet.
     pending: bool,
     /// The store's readings so far with some of the process's bytes
@@ -362,8 +421,9 @@ impl Estimate {
         self.pending
     }
 
-    /// Elastic-cache-only headroom reserved below `budget()` on discrete device
-    /// stores (`Reading::cache_reserve`): 0 on host stores.
+    /// Elastic-cache-only headroom reserved below `budget()`
+    /// (`Reading::cache_reserve`): discrete CUDA primary-context reserve or
+    /// unified GPU host compaction floor; 0 on plain host stores and wired Metal.
     pub fn cache_reserve(&self) -> u64 {
         self.read.cache_reserve
     }
@@ -473,12 +533,12 @@ impl Estimate {
     }
 
     /// Runtime growth room for a pinned host bank (`experts::derived::derive`):
-    /// reserves `peak_rise` capped at `max_pulse` (at least instantaneous
+    /// reserves the time-decayed `peak_rise` envelope (at least instantaneous
     /// `guarantee()`) so transient `guarantee == 0` dips between recurring OS
     /// pulses do not grow into the pulse band while large exogenous releases
     /// still regrow immediately.
-    pub fn pinned_grow_room(&self, max_pulse: u64) -> u64 {
-        let rise = self.read.rise.max(self.read.peak_rise.min(max_pulse));
+    pub fn pinned_grow_room(&self) -> u64 {
+        let rise = self.read.rise.max(self.read.peak_rise);
         self.gate_growth(self.room_in(self.pinned_budget(), rise))
     }
 
@@ -500,15 +560,27 @@ impl Estimate {
         self.graph_slots_yield_to_bank
     }
 
+    /// Whether `CacheKind::Prefix` yields to `CacheKind::Bank` growth
+    /// under the ledger's per-byte value comparison (`Value`).
+    pub fn prefix_yields_to_bank(&self) -> bool {
+        self.prefix_yields_to_bank
+    }
+
     fn room_in(&self, budget: u64, reserve: u64) -> u64 {
         let graph_slots = if self.graph_slots_yield_to_bank {
             self.cache_of(CacheKind::GraphSlots)
         } else {
             0
         };
+        let prefix = if self.prefix_yields_to_bank {
+            self.cache_of(CacheKind::Prefix)
+        } else {
+            0
+        };
         let bank = self.cache_of(CacheKind::Bank)
             + self.cache_of(CacheKind::Table)
             + graph_slots
+            + prefix
             + self.bank_spare;
         let beside = self.committed.saturating_add(self.cache - bank).saturating_add(self.shed);
         let room = budget.saturating_sub(beside.saturating_add(reserve));
@@ -520,14 +592,14 @@ impl Estimate {
     }
 
     /// Runtime growth room for an elastic bank (`experts::derived::derive`):
-    /// reserves `peak_rise` and `peak_wired_rise` capped at `max_pulse` (at
-    /// least instantaneous `rise` / `wired_rise`) so transient `guarantee == 0`
-    /// dips between recurring OS UMA pulses do not grow a slot that cannot
-    /// survive the next pulse, while large exogenous releases still regrow
-    /// immediately.
-    pub fn grow_room(&self, max_pulse: u64) -> u64 {
-        let rise = self.read.rise.max(self.read.peak_rise.min(max_pulse));
-        let wired_rise = self.read.wired_rise.max(self.read.peak_wired_rise.min(max_pulse));
+    /// reserves the time-decayed `peak_rise` and `peak_wired_rise` envelopes
+    /// (at least instantaneous `rise` / `wired_rise`) so transient
+    /// `guarantee == 0` dips between recurring multi-slot OS UMA pulses do not
+    /// grow slots that cannot survive the next pulse, while genuine exogenous
+    /// releases still regrow immediately.
+    pub fn grow_room(&self) -> u64 {
+        let rise = self.read.rise.max(self.read.peak_rise);
+        let wired_rise = self.read.wired_rise.max(self.read.peak_wired_rise);
         self.gate_growth(self.room_for_growth(rise, wired_rise))
     }
 }
@@ -553,6 +625,7 @@ impl State {
             cache_of: self.cache_of,
             bank_spare: self.spare_of(super::vocabulary::PoolClass::Records),
             graph_slots_yield_to_bank: self.graph_slots_yield_to_bank(),
+            prefix_yields_to_bank: self.prefix_yields_to_bank(),
             pending: self.journal.pending(),
             unobserved_readings: self.unobserved_readings,
             accounting_violations: self.accounting_violations,
@@ -786,14 +859,22 @@ impl State {
         let pinned_reserve = reading.pinned_reserve(unit);
         let cache_reserve = reading.cache_reserve();
         let (cap, grows) = (self.boundary.cap(), !paged || self.boundary.admits_growth());
-        let peak_rise = match prev_read.filter(|_| !settled) {
-            None => rise,
-            Some(before) => before.peak_rise.max(rise),
-        };
-        let peak_wired_rise = match prev_read.filter(|_| !settled) {
-            None => wired_rise,
-            Some(before) => before.peak_wired_rise.max(wired_rise),
-        };
+        let active_shrink = self.releasing > 0;
+        let now = at.at();
+        let (peak_rise, peak_rise_at) = update_peak(
+            prev_read.map(|before| (before.peak_rise, before.peak_rise_at, before.at.at())),
+            rise,
+            now,
+            settled,
+            active_shrink,
+        );
+        let (peak_wired_rise, peak_wired_rise_at) = update_peak(
+            prev_read.map(|before| (before.peak_wired_rise, before.peak_wired_rise_at, before.at.at())),
+            wired_rise,
+            now,
+            settled,
+            active_shrink,
+        );
         let read = Read {
             at,
             capacity: reading.capacity(),
@@ -810,8 +891,10 @@ impl State {
             others,
             rise,
             peak_rise,
+            peak_rise_at,
             wired_rise,
             peak_wired_rise,
+            peak_wired_rise_at,
             grant,
             ceiling: reading.ceiling(),
             unwired,

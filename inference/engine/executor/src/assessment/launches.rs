@@ -37,7 +37,7 @@ pub struct Kernel {
         fn(
             BackendName,
             &[(&str, Element)],
-        ) -> Result<Option<&'static NativeImplementation>, CheckedBundleError>,
+        ) -> Result<Option<std::sync::Arc<NativeImplementation>>, CheckedBundleError>,
     >,
 }
 

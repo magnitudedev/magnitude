@@ -505,18 +505,6 @@ impl FrontCreditModel {
         if max_useful_depth == 0 {
             return 0.0;
         }
-        let last_exposed = self
-            .exposed_future_wait_by_front
-            .last()
-            .copied()
-            .unwrap_or(0.0)
-            .max(0.0);
-        let last_carry = self
-            .carryover_covered_by_front
-            .last()
-            .copied()
-            .unwrap_or(0.0)
-            .max(0.0);
         let mut total = 0.0f64;
         for m in 0..f {
             // 1-based depth of this front row among proposals: `depth = k + m + 1`.
@@ -535,13 +523,13 @@ impl FrontCreditModel {
                 .exposed_future_wait_by_front
                 .get(m)
                 .copied()
-                .unwrap_or(last_exposed)
+                .unwrap_or(0.0)
                 .max(0.0);
             let carryover = self
                 .carryover_covered_by_front
                 .get(m)
                 .copied()
-                .unwrap_or(last_carry)
+                .unwrap_or(0.0)
                 .max(0.0);
             let net_useful = (exposed - carryover).max(0.0);
             total += survival * net_useful;
@@ -572,8 +560,15 @@ impl PassCostModel {
     ///   falling back to `verify_seconds` if a fixture omitted `compute_seconds`).
     /// - `io`: live compulsory demand I/O `I/O(k)` (`io_seconds`) and trailing
     ///   front waste (`front_waste_per_row`), both in seconds (`*_per_miss = 1.0`).
-    /// - `front_credit`: one pass of lead (`front_stall_saved_per_row` for `m = 0`,
-    ///   `0.0` beyond), matching `magnitude_cost_model::Regime`.
+    /// - `front_credit`: multi-row diminishing stall savings per front row
+    ///   (`front_stall_saved_by_row`, or derived via
+    ///   `magnitude_cost_model::diminishing_front_stall_saved` from
+    ///   `front_stall_saved_per_row` when the per-row vector is absent), less
+    ///   `carryover_covered_by_front`. Gated ONLY on actual exposed future
+    ///   stall (NOT on `io > compute`), so both path-bound (`D > C`) and
+    ///   compute-heavier UMA (`0 < D < C`, e.g. Sparky GB10 paying synchronous
+    ///   SSD stall) credit `F` whenever `S * saved > ΔC + waste`, while pure
+    ///   resident / zero-stall GPU-bound regimes (`saved == 0`) still get `F = 0`.
     /// - `verify_host_overhead_seconds`: measured host turn after a verify pass.
     pub fn from_streamed_prior(prior: &StreamedVerifyPrior) -> Self {
         let by_rows = if !prior.compute_seconds.is_empty() {
@@ -592,15 +587,38 @@ impl PassCostModel {
         let has_io = exact_row_misses > 0.0
             || verify_marginal_misses.iter().any(|&m| m > 0.0);
         let has_tail_waste = prior.front_waste_per_row.iter().any(|&w| w > 0.0);
-        let path_bound = prior
-            .io_seconds
-            .iter()
-            .zip(&by_rows)
-            .any(|(&io, &compute)| io > compute);
-        let front_credit = if path_bound && prior.front_stall_saved_per_row > 0.0 {
+        let max_front_cap = magnitude_executor::CHAINED_ROWS.saturating_sub(1);
+        let exposed_future_wait_by_front: Vec<f64> = if !prior.front_stall_saved_by_row.is_empty() {
+            prior
+                .front_stall_saved_by_row
+                .iter()
+                .take(max_front_cap)
+                .map(|&s| if s.is_finite() { s.max(0.0) } else { 0.0 })
+                .collect()
+        } else if prior.front_stall_saved_per_row > 0.0 {
+            let max_front = prior
+                .front_waste_per_row
+                .len()
+                .max(by_rows.len().saturating_sub(1))
+                .clamp(1, max_front_cap);
+            magnitude_cost_model::diminishing_front_stall_saved(
+                prior.front_stall_saved_per_row,
+                max_front,
+            )
+        } else {
+            Vec::new()
+        };
+        let has_front_credit = exposed_future_wait_by_front.iter().any(|&s| s > 0.0);
+        let front_credit = if has_front_credit {
+            let carryover_covered_by_front: Vec<f64> = prior
+                .carryover_covered_by_front
+                .iter()
+                .take(exposed_future_wait_by_front.len())
+                .map(|&c| if c.is_finite() { c.max(0.0) } else { 0.0 })
+                .collect();
             FrontCreditModel {
-                exposed_future_wait_by_front: vec![prior.front_stall_saved_per_row, 0.0],
-                carryover_covered_by_front: Vec::new(),
+                exposed_future_wait_by_front,
+                carryover_covered_by_front,
             }
         } else {
             FrontCreditModel::default()
@@ -1020,40 +1038,67 @@ impl DecodePassScorer {
             .min(horizon.effective_verify_horizon());
         let max_extra = actual_generated.min(reserved_capacity.saturating_sub(1));
         let cum = proposal_acceptance.cumulative_survival();
+        let has_front_credit = costs
+            .front_credit
+            .exposed_future_wait_by_front
+            .iter()
+            .any(|&s| s > 0.0);
         let mut best: Option<(usize, usize, PassPricing)> = None;
-        for k in allowed_k {
-            if k > max_k {
-                continue;
-            }
-            let max_f = match unchained_max_front {
-                Some(front_cap) => {
-                    if k == 0 || front_cap == 0 {
-                        0
+        let mut consider = |k: usize, f: usize| {
+            let pricing = Self::score_candidate(draft_seconds_paid, k, f, &cum, horizon, costs);
+            let better = match best {
+                None => true,
+                Some((bk, bf, bp)) => {
+                    if pricing.rate_tps > bp.rate_tps + 1e-12 {
+                        true
+                    } else if (pricing.rate_tps - bp.rate_tps).abs() <= 1e-12 {
+                        (k + f, f, k) < (bk + bf, bf, bk)
                     } else {
-                        front_cap
-                            .min(max_extra - k)
-                            .min(magnitude_executor::CHAINED_ROWS.saturating_sub(1 + k))
+                        false
                     }
                 }
-                None => max_extra - k,
             };
-            for f in 0..=max_f {
-                let pricing =
-                    Self::score_candidate(draft_seconds_paid, k, f, &cum, horizon, costs);
-                let better = match best {
-                    None => true,
-                    Some((bk, bf, bp)) => {
-                        if pricing.rate_tps > bp.rate_tps + 1e-12 {
-                            true
-                        } else if (pricing.rate_tps - bp.rate_tps).abs() <= 1e-12 {
-                            (k + f, f, k) < (bk + bf, bf, bk)
+            if better {
+                best = Some((k, f, pricing));
+            }
+        };
+        for w in allowed_k {
+            if w <= max_k {
+                let max_f = match unchained_max_front {
+                    Some(front_cap) => {
+                        if w == 0 || front_cap == 0 {
+                            0
                         } else {
-                            false
+                            front_cap
+                                .min(max_extra - w)
+                                .min(magnitude_executor::CHAINED_ROWS.saturating_sub(1 + w))
                         }
                     }
+                    None => max_extra - w,
                 };
-                if better {
-                    best = Some((k, f, pricing));
+                for f in 0..=max_f {
+                    consider(w, f);
+                }
+            }
+            // When trailing front rows are enabled and carry positive future-wait
+            // credit, also consider `(K, F)` splits of each legal total-row width
+            // `w = K + F <= max_extra` (`K >= 1, F >= 1`), keeping the same target
+            // launch row class `1 + w` without requiring callers to inject ad-hoc
+            // intermediate verify widths (e.g. `widest - 1`).
+            if let Some(front_cap) = unchained_max_front {
+                if has_front_credit
+                    && front_cap > 0
+                    && w >= 2
+                    && w <= max_extra
+                    && 1 + w <= magnitude_executor::CHAINED_ROWS
+                {
+                    let max_split_f = front_cap.min(w - 1);
+                    for f in 1..=max_split_f {
+                        let k = w - f;
+                        if k <= max_k {
+                            consider(k, f);
+                        }
+                    }
                 }
             }
         }
@@ -2590,5 +2635,250 @@ mod tests {
         });
         assert_eq!(grant_rows.acceptable().len(), emb_budget.projected_verify);
         assert_eq!(grant_rows.front_rows(), emb_budget.projected_front);
+    }
+
+    /// All 4 physical streaming regimes work automatically under the single
+    /// `PassCostModel::from_streamed_prior` + `DecodePassScorer` cost function,
+    /// with multi-row `F` credit, carryover suppression, and no double-counting:
+    /// - Regime 1 (GPU/DRAM-bound): picks `F = 0`.
+    /// - Regime 2 (fast link + high-acceptance drafter): picks `K in 3..=5, F in 1..=2`
+    ///   (and specifically reaches `F = 2` when link waste is low).
+    /// - Regime 3 (heavy SSD-bound + high-acceptance drafter): picks `F = 1` when
+    ///   acceptance is high, drops to `F = 0` when acceptance dips.
+    /// - Regime 4 (very SSD-bound Mac where verify hurts): picks `K = 0, F in 1..=3`
+    ///   (reaching `F = 2` and `F = 3` in chained passes).
+    #[test]
+    fn four_regimes_multi_front_credit_under_single_cost_function() {
+        // Regime 1: Pure resident / GPU-bound with zero exposed stall -> F = 0.
+        let r1_prior = StreamedVerifyPrior {
+            regime_epoch: 1,
+            verify_seconds: vec![0.015, 0.016, 0.017, 0.018, 0.019, 0.020, 0.021, 0.022],
+            compute_seconds: vec![0.015, 0.016, 0.017, 0.018, 0.019, 0.020, 0.021, 0.022],
+            io_seconds: vec![0.0; 8],
+            front_stall_saved_per_row: 0.0,
+            front_waste_per_row: vec![0.0; 7],
+            verify_host_overhead_seconds: 0.001,
+            ..Default::default()
+        };
+        let r1_costs = PassCostModel::from_streamed_prior(&r1_prior);
+        assert!(
+            r1_costs.front_credit.exposed_future_wait_by_front.is_empty(),
+            "resident zero-stall regime must grant zero front credit"
+        );
+        let r1_plan = DecodePassScorer::seal_plan(
+            pass_id(1, 1, 1),
+            6,
+            0.0,
+            7,
+            &AcceptanceProfile::Conditional(vec![0.95; 6]),
+            HorizonLimits::UNBOUNDED,
+            &r1_costs,
+        )
+        .unwrap();
+        assert_eq!(r1_plan.front, 0, "Regime 1 (GPU-bound, zero stall) must pick F = 0: {r1_plan:?}");
+
+        // Regime 1b: GPU-bound where tiny residual stall (0.5 ms) < extra row compute (2 ms) -> F = 0 automatically.
+        let r1b_prior = StreamedVerifyPrior {
+            regime_epoch: 1,
+            verify_seconds: vec![0.015, 0.017, 0.019, 0.021, 0.023, 0.025, 0.027],
+            compute_seconds: vec![0.015, 0.017, 0.019, 0.021, 0.023, 0.025, 0.027],
+            io_seconds: vec![0.0005, 0.0008, 0.001, 0.0012, 0.0014, 0.0016, 0.0018],
+            front_stall_saved_per_row: 0.0005,
+            front_waste_per_row: vec![0.0002; 6],
+            verify_host_overhead_seconds: 0.001,
+            ..Default::default()
+        };
+        let r1b_plan = DecodePassScorer::seal_plan(
+            pass_id(1, 1, 2),
+            6,
+            0.0,
+            7,
+            &AcceptanceProfile::Conditional(vec![0.95; 6]),
+            HorizonLimits::UNBOUNDED,
+            &PassCostModel::from_streamed_prior(&r1b_prior),
+        )
+        .unwrap();
+        assert_eq!(
+            r1b_plan.front, 0,
+            "GPU-bound regime with exposed stall < ΔC must pick F = 0: {r1b_plan:?}"
+        );
+
+        // Exposed-stall UMA regime (`0 < D < C`, e.g. Sparky GB10 `74fbe7`:
+        // `C = 127 ms`, `D = 37 ms` synchronous SSD stall serialized as `C + D`).
+        // Removing the broken `io > compute` gate lets `F >= 1` overlap that 37 ms stall!
+        let sparky_prior = StreamedVerifyPrior {
+            regime_epoch: 5,
+            verify_seconds: vec![0.127, 0.133, 0.139, 0.145, 0.151, 0.157, 0.163, 0.169],
+            compute_seconds: vec![0.127, 0.133, 0.139, 0.145, 0.151, 0.157, 0.163, 0.169],
+            io_seconds: vec![0.037, 0.044, 0.051, 0.058, 0.065, 0.072, 0.079, 0.086],
+            front_stall_saved_per_row: 0.037,
+            front_waste_per_row: vec![0.003; 7],
+            verify_host_overhead_seconds: 0.003,
+            ..Default::default()
+        };
+        let sparky_costs = PassCostModel::from_streamed_prior(&sparky_prior);
+        assert!(
+            !sparky_costs.front_credit.exposed_future_wait_by_front.is_empty(),
+            "0 < D < C exposed-stall UMA must retain front credit"
+        );
+        let sparky_plan = DecodePassScorer::seal_unchained_plan_on_widths(
+            pass_id(5, 1, 1),
+            7,
+            0.0,
+            8,
+            0..=5,
+            4,
+            &AcceptanceProfile::Conditional(vec![0.92; 7]),
+            HorizonLimits::UNBOUNDED,
+            &sparky_costs,
+        )
+        .unwrap();
+        assert!(
+            sparky_plan.verify == 5 && sparky_plan.front >= 1,
+            "Sparky GB10 (0 < D < C exposed-stall UMA) must pick K = 5, F >= 1 (was starved to F = 0 by path_bound gate): {sparky_plan:?}"
+        );
+
+        // Regime 2: Fast link (5090 PCIe 5) + high-acceptance drafter -> K in 3..=5, F in 1..=2.
+        let r2_prior = StreamedVerifyPrior {
+            regime_epoch: 2,
+            verify_seconds: vec![0.024, 0.030, 0.036, 0.042, 0.048, 0.068, 0.092, 0.120],
+            compute_seconds: vec![0.008, 0.009, 0.010, 0.011, 0.012, 0.013, 0.014, 0.015],
+            io_seconds: vec![0.024, 0.030, 0.036, 0.042, 0.048, 0.068, 0.092, 0.120],
+            front_stall_saved_per_row: 0.016,
+            front_waste_per_row: vec![0.003; 7],
+            verify_host_overhead_seconds: 0.002,
+            ..Default::default()
+        };
+        let r2_costs = PassCostModel::from_streamed_prior(&r2_prior);
+        let r2_acc = AcceptanceProfile::Conditional(vec![0.95; 7]);
+        let r2_plan = DecodePassScorer::seal_unchained_plan_on_widths(
+            pass_id(2, 1, 1),
+            7,
+            0.0,
+            8,
+            0..=7,
+            4,
+            &r2_acc,
+            HorizonLimits::UNBOUNDED,
+            &r2_costs,
+        )
+        .unwrap();
+        assert!(
+            (3..=5).contains(&r2_plan.verify) && (1..=2).contains(&r2_plan.front),
+            "Regime 2 (fast link + high acc) must pick K in 3..=5, F in 1..=2: {r2_plan:?}"
+        );
+        assert_eq!(
+            r2_plan.front, 2,
+            "Regime 2 with low link waste must reach F = 2 (was blocked by hardcoded [s, 0.0]): {r2_plan:?}"
+        );
+
+        // Regime 3: Heavy SSD-bound + high-acceptance drafter -> F = 1 when high, F = 0 when acc dips.
+        let r3_prior = StreamedVerifyPrior {
+            regime_epoch: 3,
+            verify_seconds: vec![0.080, 0.105, 0.130, 0.165, 0.210, 0.260, 0.315],
+            compute_seconds: vec![0.015, 0.017, 0.019, 0.021, 0.023, 0.025, 0.027],
+            io_seconds: vec![0.080, 0.105, 0.130, 0.165, 0.210, 0.260, 0.315],
+            front_stall_saved_per_row: 0.020,
+            front_waste_per_row: vec![0.010; 6],
+            verify_host_overhead_seconds: 0.003,
+            ..Default::default()
+        };
+        let r3_costs = PassCostModel::from_streamed_prior(&r3_prior);
+        let r3_high = DecodePassScorer::seal_plan(
+            pass_id(3, 1, 1),
+            6,
+            0.0,
+            7,
+            &AcceptanceProfile::Conditional(vec![0.90; 6]),
+            HorizonLimits::UNBOUNDED,
+            &r3_costs,
+        )
+        .unwrap();
+        assert_eq!(
+            r3_high.front, 1,
+            "Regime 3 (heavy SSD + high acc) must pick F = 1: {r3_high:?}"
+        );
+        let r3_dip = DecodePassScorer::seal_plan(
+            pass_id(3, 1, 2),
+            6,
+            0.0,
+            7,
+            &AcceptanceProfile::Conditional(vec![0.40; 6]),
+            HorizonLimits::UNBOUNDED,
+            &r3_costs,
+        )
+        .unwrap();
+        assert_eq!(
+            r3_dip.front, 0,
+            "Regime 3 (heavy SSD + acceptance dip) must drop to F = 0: {r3_dip:?}"
+        );
+
+        // Regime 4: Very SSD-bound Mac where verify hurts (each verify row adds
+        // a full demand miss burst + verify host turn overhead) -> K = 0, F in 1..=3.
+        let r4_prior = StreamedVerifyPrior {
+            regime_epoch: 4,
+            verify_seconds: vec![0.140, 0.280, 0.420, 0.560, 0.700, 0.840, 0.980],
+            compute_seconds: vec![0.032, 0.034, 0.036, 0.038, 0.040, 0.042, 0.044],
+            io_seconds: vec![0.140, 0.280, 0.420, 0.560, 0.700, 0.840, 0.980],
+            front_stall_saved_per_row: 0.040,
+            front_waste_per_row: vec![0.004; 6],
+            verify_host_overhead_seconds: 0.025,
+            ..Default::default()
+        };
+        let r4_costs = PassCostModel::from_streamed_prior(&r4_prior);
+        let r4_plan = DecodePassScorer::seal_plan(
+            pass_id(4, 1, 1),
+            6,
+            0.0,
+            7,
+            &AcceptanceProfile::Conditional(vec![0.88; 6]),
+            HorizonLimits::UNBOUNDED,
+            &r4_costs,
+        )
+        .unwrap();
+        assert_eq!(
+            r4_plan.verify, 0,
+            "Regime 4 (very SSD-bound Mac where verify hurts) must pick K = 0: {r4_plan:?}"
+        );
+        assert!(
+            (1..=3).contains(&r4_plan.front),
+            "Regime 4 must pick F in 1..=3: {r4_plan:?}"
+        );
+        assert_eq!(
+            r4_plan.front, 3,
+            "Regime 4 with low standing waste must reach F = 3: {r4_plan:?}"
+        );
+
+        // Carryover suppression & non-double-counting invariant:
+        let mut r4_carry = r4_prior.clone();
+        r4_carry.carryover_covered_by_front = vec![0.040, 0.020, 0.010, 0.005, 0.0025, 0.00125];
+        let r4_carry_costs = PassCostModel::from_streamed_prior(&r4_carry);
+        let r4_carry_plan = DecodePassScorer::seal_plan(
+            pass_id(4, 1, 2),
+            6,
+            0.0,
+            7,
+            &AcceptanceProfile::Conditional(vec![0.88; 6]),
+            HorizonLimits::UNBOUNDED,
+            &r4_carry_costs,
+        )
+        .unwrap();
+        assert_eq!(
+            r4_carry_plan.front, 0,
+            "carryover covering all exposed wait must suppress F to 0: {r4_carry_plan:?}"
+        );
+
+        // Credit past exposed_future_wait_by_front.len() must never exceed total_exposed_wait.
+        let cum = AcceptanceProfile::Conditional(vec![0.95; 10]).cumulative_survival();
+        let total = r4_costs
+            .front_credit
+            .total_exposed_wait(&cum, 0, HorizonLimits::UNBOUNDED);
+        let credit_over = r4_costs
+            .front_credit
+            .credit_seconds(&cum, 0, 10, HorizonLimits::UNBOUNDED);
+        assert!(
+            (credit_over - total).abs() < 1e-12 && credit_over <= total + 1e-12,
+            "credit_seconds past table end must never exceed total_exposed_wait: {credit_over} vs {total}"
+        );
     }
 }

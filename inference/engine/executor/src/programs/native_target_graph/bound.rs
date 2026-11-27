@@ -85,66 +85,24 @@ impl BankRun {
         self.serving.layer_whole(layer)
     }
 
-    /// Whether M7 on-demand async DMA decode landing (`DecodeFront -> DMA -> DecodeBack`)
-    /// is active for block `index` over `rows` rows (partial layer on CUDA `Placer::Tier`).
-    pub(crate) fn block_dma_decode(&self, index: usize, rows: u64) -> bool {
-        let Some(layer) = self.bank.plan().block_layer(index) else {
-            return false;
-        };
-        !self.serving.layer_whole(layer) && self.bank.dma_decode_active(layer, rows)
-    }
-
-    /// Acquire a free generation-leased [`crate::experts::transport::DecodeSourceLease`]
-    /// for one decode-split flight (`DecodeFront -> DecodeHits ∥ DMA -> DecodeBack`).
-    pub(crate) fn acquire_decode_source_slot(&self) -> Result<crate::experts::transport::DecodeSourceLease, String> {
-        self.bank.acquire_decode_source_slot()
-    }
-
-    /// Contiguous `[SOURCE_ROWS, rows, K] i32` view of the leased flight's
-    /// pinned `front_sources` buffer.
-    pub(crate) fn decode_front_sources_view(
-        &self,
-        token: crate::experts::transport::DecodeSourceToken,
-        rows: u64,
-    ) -> Result<seismic::Tensor, String> {
-        self.bank.decode_front_sources_view(token, rows)
-    }
-
-    /// Contiguous `[SOURCE_ROWS, rows, K] i32` view of the leased flight's
-    /// pinned `back_sources` buffer.
-    pub(crate) fn decode_back_sources_view(
-        &self,
-        token: crate::experts::transport::DecodeSourceToken,
-        rows: u64,
-    ) -> Result<seismic::Tensor, String> {
-        self.bank.decode_back_sources_view(token, rows)
-    }
-
-    /// Batch-DMA unpredicted host-tier misses (`source <= -2`) for block `index`
-    /// after `DecodeFront` completes, populate disjoint `back_sources` (masking
-    /// VRAM hits to `-1` when `split_hits` is true), pin VRAM hit records, join
-    /// any in-flight `LinkMover` hint transfers, and return the owning
-    /// [`crate::experts::transport::DecodeLanding`] for `DecodeBack`.
-    #[allow(clippy::too_many_arguments)]
-    pub(crate) fn land_decode_misses(
+    /// Prepare one unified zero-switch 3-tier streamed decode flight for block
+    /// `index` over `rows` rows: acquires the next ring slot lock-free via
+    /// `completed_gen`, populates the host-mapped `ready_slot` descriptor
+    /// header, notifies `DecodeReactor`, and returns the bound tensors and
+    /// timeline handles (`land_gate`, `completed_gen`, `gen`).
+    pub(crate) fn prepare_unified_decode_flight(
         &self,
         index: usize,
         rows: u64,
-        prev_landings: Vec<crate::experts::transport::DecodeLanding>,
-        split_hits: bool,
-        source_lease: crate::experts::transport::DecodeSourceLease,
-        hits_submitted: bool,
-    ) -> Result<crate::experts::transport::DecodeLanding, String> {
-        let layer = self.bank.plan().block_layer(index).ok_or_else(|| format!("target block {index} has no streamed routed layer"))?;
-        self.bank.land_decode_misses(
-            layer,
-            self.sequence,
-            rows,
-            prev_landings,
-            split_hits,
-            source_lease,
-            hits_submitted,
-        )
+        mask_hits_back: bool,
+    ) -> Result<crate::experts::UnifiedDecodeFlight, String> {
+        let layer = self
+            .bank
+            .plan()
+            .block_layer(index)
+            .ok_or_else(|| format!("target block {index} has no streamed routed layer"))?;
+        self.bank
+            .prepare_unified_decode_flight(layer, self.sequence, rows, mask_hits_back)
     }
 
     /// If prefill copies host-tier experts into VRAM scratch via hardware DMA
@@ -157,9 +115,6 @@ impl BankRun {
         self.bank.plan().block_layer(index).ok_or_else(|| format!("target block {index} has no streamed routed layer")).map(Some)
     }
 
-    pub(crate) fn record_dma_host_wait(&self, elapsed: std::time::Duration) {
-        self.bank.record_dma_host_wait(elapsed);
-    }
     /// Bind `graph`'s bank parts for this run as block `index` at chain
     /// place `place` (`placed_banks`), and its park and publication nodes
     /// to the bank's park timeline (`crate::experts::Parks`); the run takes
@@ -324,6 +279,43 @@ pub(super) fn zeros(charges: &seismic::Charges, (element, extents): &Extents) ->
     seismic::Tensor::zeros(charges, *element, extents).map_err(AllocationError::Tensor)
 }
 
+/// One double-buffered slot of per-block host-visible `[rows, K]` `i32` route
+/// tensors (`Tensor::shared`) for grouped-prefill per-row route export.
+struct PromptRoutesSlot {
+    in_use: Arc<std::sync::atomic::AtomicBool>,
+    blocks: Vec<Option<seismic::Tensor>>,
+}
+
+/// Exclusive lease on one [`PromptRoutesSlot`]: guarantees no pipelined chain
+/// overwrites the host-visible route buffers while the GPU writes them or
+/// while [`TargetOutput::complete`] reads them on the host.
+pub(crate) struct PromptRoutesLease {
+    in_use: Arc<std::sync::atomic::AtomicBool>,
+    blocks: Vec<Option<seismic::Tensor>>,
+}
+
+impl PromptRoutesLease {
+    /// Host-visible `[rows, K]` `i32` route tensor for block `index`, if
+    /// `index` is a streamed split routed block.
+    pub(crate) fn routes(&self, index: usize) -> Option<&seismic::Tensor> {
+        self.blocks.get(index).and_then(Option::as_ref)
+    }
+
+    /// Iterate `(block_index, tensor)` over all captured streamed blocks.
+    pub(crate) fn iter_blocks(&self) -> impl Iterator<Item = (usize, &seismic::Tensor)> {
+        self.blocks
+            .iter()
+            .enumerate()
+            .filter_map(|(index, tensor)| tensor.as_ref().map(|tensor| (index, tensor)))
+    }
+}
+
+impl Drop for PromptRoutesLease {
+    fn drop(&mut self) {
+        self.in_use.store(false, std::sync::atomic::Ordering::Release);
+    }
+}
+
 /// The buffers a prompt group of `places` places holds (`GroupExtents`),
 /// with each routed block's views of its crossing and merged positions and
 /// of the pass's merged experts and row table (`SplitValues::view`), which
@@ -353,10 +345,10 @@ pub(crate) struct GroupBuffers {
     /// buffers, of a load whose blocks split.
     split: Option<SplitValues<seismic::Tensor>>,
     blocks: Vec<Option<SplitValues<seismic::Tensor>>>,
-    /// M7 decode-split crossing buffers (~150 KiB total), reused sequentially
-    /// across layers in `DecodeFront -> DecodeBack`.
-    decode_crossing: Option<crate::operators::routed::split::DecodeCrossingBuffers<seismic::Tensor>>,
-    decode_blocks: Vec<Option<crate::operators::routed::split::DecodeCrossingBuffers<seismic::Tensor>>>,
+    /// Double-buffered host-visible per-layer `[rows, K]` `i32` route buffers
+    /// (`Tensor::shared`) for grouped-prefill per-row route export into
+    /// `TokenRoutes` (empty when no block streams).
+    prompt_routes: Vec<PromptRoutesSlot>,
     /// Per place, the two operand carries its run alternates between, of a
     /// load whose decode graphs carry (`GroupExtents::operand_carry`):
     /// a block's graph reads the one the block before wrote and writes the
@@ -408,31 +400,37 @@ impl GroupBuffers {
             // No block splits.
             None => Vec::new(),
         };
-        let decode_crossing = extents
-            .decode_crossing
-            .as_ref()
-            .map(|values| {
-                Ok::<_, AllocationError>(crate::operators::routed::split::DecodeCrossingBuffers {
-                    routes: zeros(charges, &values.routes)?,
-                    weights: zeros(charges, &values.weights)?,
-                    normalized: zeros(charges, &values.normalized)?,
-                    coefficient: values.coefficient.as_ref().map(|v| zeros(charges, v)).transpose()?,
-                    shared_product: values.shared_product.as_ref().map(|v| zeros(charges, v)).transpose()?,
-                    base: values.base.as_ref().map(|v| zeros(charges, v)).transpose()?,
-                    published: values.published.as_ref().map(|v| zeros(charges, v)).transpose()?,
-                    join: values.join.as_ref().map(|v| zeros(charges, v)).transpose()?,
-                    pre: values.pre.as_ref().map(|v| zeros(charges, v)).transpose()?,
+        let prompt_routes = if split.is_some() && prepared.served.iter().any(|block| block.form.streams && block.split.is_some()) {
+            let rows = prepared.region_start(places);
+            (0..super::PROMPT_ROUTE_SLOTS)
+                .map(|_| {
+                    let blocks = prepared
+                        .served
+                        .iter()
+                        .map(|block| {
+                            if block.form.streams {
+                                block
+                                    .split
+                                    .as_ref()
+                                    .map(|layer| {
+                                        let (element, extents) = layer.at_rows(rows).crossing.routes;
+                                        seismic::Tensor::shared(charges, element, &extents)
+                                            .map_err(AllocationError::Tensor)
+                                    })
+                                    .transpose()
+                            } else {
+                                Ok(None)
+                            }
+                        })
+                        .collect::<Result<Vec<_>, AllocationError>>()?;
+                    Ok(PromptRoutesSlot {
+                        in_use: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+                        blocks,
+                    })
                 })
-            })
-            .transpose()?;
-        let decode_blocks = match &decode_crossing {
-            Some(buffers) => prepared
-                .served
-                .iter()
-                .map(|block| block.decode_crossing.as_ref().map(|layer| buffers.view(layer)).transpose())
-                .collect::<Result<Vec<_>, String>>()
-                .map_err(invariant)?,
-            None => Vec::new(),
+                .collect::<Result<Vec<_>, AllocationError>>()?
+        } else {
+            Vec::new()
         };
         let allocate = |value: &Option<Extents>| value.as_ref().map(|value| zeros(charges, value)).transpose();
         let operands = match &extents.operand_carry {
@@ -462,8 +460,7 @@ impl GroupBuffers {
             kept_guesses: allocate(&extents.guesses)?,
             split,
             blocks,
-            decode_crossing,
-            decode_blocks,
+            prompt_routes,
             operands,
             picks_slots,
             picks_by_read: extents.picks_by_read,
@@ -519,21 +516,33 @@ impl GroupBuffers {
             .ok_or_else(|| format!("block {index} splits without a routed layer"))
     }
 
-    /// Block `index`'s routed layer's views of the M7 decode crossing buffers.
-    pub(crate) fn decode_crossing(
-        &self,
-        index: usize,
-    ) -> Result<&crate::operators::routed::split::DecodeCrossingBuffers<seismic::Tensor>, String> {
-        self.decode_blocks
-            .get(index)
-            .and_then(Option::as_ref)
-            .ok_or_else(|| format!("block {index} decode-splits without crossing buffers"))
+    /// Acquire an exclusive host-visible per-layer route buffer slot for a
+    /// grouped prefill chain, if one is configured and free.
+    pub(crate) fn acquire_prompt_routes(&self) -> Option<PromptRoutesLease> {
+        for slot in &self.prompt_routes {
+            if slot
+                .in_use
+                .compare_exchange(
+                    false,
+                    true,
+                    std::sync::atomic::Ordering::AcqRel,
+                    std::sync::atomic::Ordering::Acquire,
+                )
+                .is_ok()
+            {
+                return Some(PromptRoutesLease {
+                    in_use: Arc::clone(&slot.in_use),
+                    blocks: slot.blocks.clone(),
+                });
+            }
+        }
+        None
     }
 
     /// The buffers the group owns.
     fn storage(&self) -> impl Iterator<Item = &seismic::Tensor> {
         let split = self.split.iter().flat_map(|split| split.crossing.iter().chain([&split.merged.inverse]));
-        let decode_crossing = self.decode_crossing.iter().flat_map(|c| c.iter());
+        let prompt_routes = self.prompt_routes.iter().flat_map(|slot| slot.blocks.iter().flatten());
         let operands = self.operands.iter().flatten().flatten();
         let picks = self.picks_slots.iter();
         let pool = self.pool_slots.iter();
@@ -543,7 +552,7 @@ impl GroupBuffers {
             .chain(&self.token_rows)
             .chain(&self.kept_guesses)
             .chain(split)
-            .chain(decode_crossing)
+            .chain(prompt_routes)
             .chain(operands)
             .chain(picks)
             .chain(pool)

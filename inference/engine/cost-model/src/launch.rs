@@ -191,6 +191,11 @@ impl LaunchPrices {
         self.source.figures.step_round_trip
     }
 
+    /// Measured per-launch device submission overhead (seconds) (`Rates::launch`).
+    pub fn launch_seconds(&self) -> f64 {
+        self.source.figures.rates.launch
+    }
+
     /// Hardware-derived GPU compute duration (seconds) of one decode layer
     /// (`plain_seconds(1, 0) / layers`), pricing the minimum in-flight pipeline
     /// drain exposed by `wait_completion(router_done)` when splitting a layer
@@ -236,6 +241,15 @@ impl LaunchPrices {
     /// must not be used in place of `StreamedVerifyPrior`).
     pub fn is_banked(&self) -> bool {
         matches!(self.source.target, TargetCensus::Banked { .. })
+    }
+
+    /// Whether the drafter itself runs banked/streamed routed layers (so its
+    /// launch durations depend on the expert bank's physical `regime_epoch`).
+    pub fn is_draft_banked(&self) -> bool {
+        self.source
+            .draft
+            .as_ref()
+            .is_some_and(|draft| draft.widths.iter().any(|w| w.census.has_routed()))
     }
 
     /// Prior wall-clock seconds of an unpipelined speculative verify launch

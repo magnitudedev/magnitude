@@ -115,10 +115,10 @@ pub(in crate::experts) use self::core::{
     At, Extents, Group, Layer, ListRecords, LoadWords, PlacedLayerWords, PlacedWords, Pool, StoredPart, StoredTensor,
 };
 pub(crate) use parks::{ParkKind, ParkSite, Parks};
-pub(crate) use passes::{DEPTHS, Measured};
+pub(crate) use passes::{DEPTHS, Measured, MIN_VERIFY_SAMPLES, PLAIN_REPROBE_INTERVAL};
 pub(in crate::experts) use link::Copier;
 pub(crate) use resize::{Candidates, Evicted, Evicting, Join};
-pub(crate) use steps::{AheadOf, DecodeRow, ExpertStep, ScratchGroup, Recording, Step, StepFailure, StepRoute, low_word};
+pub(crate) use steps::{AheadOf, DecodeRow, ExpertStep, PromptRoutes, ScratchGroup, Recording, Step, StepFailure, StepRoute, low_word};
 pub use routes::{RecordedRoutes, RoutedStep};
 pub use telemetry::{ExpertCosts, GroupCost, GroupLayer, LayerTimeline, Span, StepTimeline, LayerCost, LayerExperts, StepCost, STEP_TRACE};
 
@@ -221,6 +221,9 @@ pub(crate) struct Shared {
     /// What a copy over the link costs, once measured
     /// (`assessment::TierCopyCosts`): what a promotion's copy is priced at.
     copy: Mutex<Option<crate::assessment::TierCopyCosts>>,
+    /// Measured storage read line (`WatcherParts::line`) used by async
+    /// `SplitDmaCost` overlap pricing.
+    read_line: Option<magnitude_cost_model::ReadLine>,
     /// Each group's lend and decode capacity as residency last published
     /// them ([`Self::lend`]).
     lend: Mutex<Vec<GroupLend>>,
@@ -280,6 +283,7 @@ impl Shared {
         compute: crate::experts::Compute,
         parks: Arc<Parks>,
         transport: Arc<crate::experts::transport::ExpertTransport>,
+        read_line: Option<magnitude_cost_model::ReadLine>,
     ) -> Arc<Self> {
         Arc::new(Self {
             steps,
@@ -306,6 +310,7 @@ impl Shared {
             prices: Mutex::new(None),
             settled: Default::default(),
             transport,
+            read_line,
             policy: Mutex::default(),
         })
     }
@@ -521,9 +526,18 @@ impl Shared {
     fn decide_verify(&self, step: Step, request: crate::operation::RequestId, outcome: VerifyOutcome) {
         let mut pending = self.pending_verify.lock().expect("pending verify step");
         let Some(owed) = pending.get_mut(&step) else {
+            assert!(
+                !matches!(outcome, VerifyOutcome::Committed(_)) || pending.is_empty(),
+                "invariant violated: verdict for {request:?} on step {step} while pending verify steps {:?} await verdicts",
+                pending.keys().collect::<Vec<_>>()
+            );
             return;
         };
         if !owed.remove(&request) {
+            assert!(
+                !matches!(outcome, VerifyOutcome::Committed(_)),
+                "invariant violated: verdict for {request:?} on step {step} which awaits {owed:?}"
+            );
             return;
         }
         let is_last = owed.is_empty();
@@ -583,6 +597,11 @@ impl Shared {
     /// The link copy's costs once priced ([`Self::price_copy`]); none before.
     pub(in crate::experts) fn copy(&self) -> Option<crate::assessment::TierCopyCosts> {
         self.copy.lock().expect("a copy's price").clone()
+    }
+
+    /// The bank's measured storage read line, if storage-backed.
+    pub(in crate::experts) fn read_line(&self) -> Option<magnitude_cost_model::ReadLine> {
+        self.read_line
     }
 
     /// A copy over the link costs `costs` from now on.
@@ -862,6 +881,9 @@ pub(super) struct WatcherParts {
     pub pools: Vec<Pool>,
     pub extents: Extents,
     pub slots: Arc<std::sync::atomic::AtomicU64>,
+    /// Precomputed mapping from raw 1D bank coordinate `slots` to mean
+    /// per-layer target VRAM slots (`0..=widest`), when multiple groups exist.
+    pub target_vram_slots: Option<Arc<[u64]>>,
     pub host_slots: Arc<std::sync::atomic::AtomicU64>,
     pub whole: bool,
     pub staging: u32,
@@ -904,7 +926,7 @@ impl Watcher {
         parts: WatcherParts,
         bounds: Option<Box<dyn Fn() -> crate::experts::exchange::Bounds + Send>>,
     ) -> Result<Self, String> {
-        let WatcherParts { layers, group_reads, groups, load, pools, extents, slots, host_slots, whole, staging, host, carrier, source, compute, copier, steps, spans, trip, line, transport } = parts;
+        let WatcherParts { layers, group_reads, groups, load, pools, extents, slots, target_vram_slots, host_slots, whole, staging, host, carrier, source, compute, copier, steps, spans, trip, line, transport } = parts;
         // The geometry every read lands by, checked once: each pool's
         // staging holds the staging records, and the conveyor lies in each
         // pool, at most a record of every expert of the widest layer.
@@ -967,11 +989,12 @@ impl Watcher {
             .collect::<Vec<_>>();
         let experts = layers.iter().map(|layer| layer.experts).collect::<Vec<_>>();
         let records = groups.iter().map(|group| group.records).collect::<Vec<_>>();
-        let mut directory = Directory::new(
+        let mut directory = Directory::with_decode_depths(
             &records,
             &layers.iter().map(|layer| layer.group).collect::<Vec<_>>(),
             &layers.iter().map(|layer| layer.experts).collect::<Vec<_>>(),
             host,
+            extents.decode_rows,
         );
         // A bank imported whole: every expert at its home, as its maps name
         // them, held beside a host tier and kept as the landed records
@@ -1030,6 +1053,7 @@ impl Watcher {
             reads,
             extents,
             slots,
+            target_vram_slots,
             host_slots,
             capacities.clone(),
             resident,
@@ -1068,7 +1092,7 @@ impl Watcher {
         // The ledger's queue: told from any thread, drained by `Prefetch`.
         let (told, inbox) = std::sync::mpsc::channel();
         let time = core.directory.time().clone();
-        let shared = Shared::new(steps, time.clone(), telemetry, told, compute.handle(), parks, transport);
+        let shared = Shared::new(steps, time.clone(), telemetry, told, compute.handle(), parks, transport, line);
         crate::settle::owe_shared(Arc::downgrade(&shared));
         // The transfer queue the promotions queue on, whose completions its
         // watch announces.
@@ -1092,13 +1116,14 @@ impl Watcher {
                 core.extents.selected,
                 1,
             );
-            let active_rows = core.directory.decode_rows() as u64;
+            let has_decode_dma = shared.transport.has_decode_dma();
             for group in 0..core.groups.len() {
-                let splits = core
-                    .directory
-                    .group_layers(group)
-                    .any(|layer| !core.layers[layer].draft && shared.transport.is_splitting_decode(layer, active_rows));
-                core.directory.set_group_splitting(group, splits);
+                let active = has_decode_dma
+                    && core
+                        .directory
+                        .group_layers(group)
+                        .any(|layer| !core.layers[layer].draft);
+                core.directory.set_group_splitting(group, active);
             }
         }
         // The ledger's rates are the ranking's (`Reuse::rates`).
@@ -1216,8 +1241,13 @@ impl Watcher {
         tier_records: &[u32],
         finish: &[DemandLandingToFinish],
         replenish_target: Option<usize>,
+        observe_misses: Option<usize>,
     ) -> Vec<crate::experts::directory::DemandSlotClaim> {
-        if tier_records.is_empty() && finish.is_empty() && replenish_target.is_none() {
+        if tier_records.is_empty()
+            && finish.is_empty()
+            && replenish_target.is_none()
+            && observe_misses.is_none()
+        {
             return Vec::new();
         }
         let mut held = residency::lock_deferred(&self.state);
@@ -1233,6 +1263,8 @@ impl Watcher {
         });
         let mut claims = Vec::with_capacity(tier_records.len());
         let mut landed_at_home = false;
+        let mut reclaimed_host_slots: Vec<(usize, usize)> = Vec::new();
+        let tier_copy_dma = core.extents.tier_copy_dma;
         transport.with_slot_reuse(|mut can_reuse| {
             let mut promoted_groups: Vec<usize> = Vec::new();
             for prev in finish {
@@ -1242,6 +1274,8 @@ impl Watcher {
                     prev.layer,
                     prev.sequence,
                     &prev.slots,
+                    tier_copy_dma,
+                    &mut reclaimed_host_slots,
                     &mut can_reuse,
                 );
                 if promoted {
@@ -1300,7 +1334,7 @@ impl Watcher {
                     remaining_overflows -= 1;
                 }
             }
-            if replenish_target.is_some()
+            if (directory.tier_complete() && replenish_target.is_some())
                 || remaining_overflows > 0
                 || promoted_groups.contains(&group)
             {
@@ -1328,6 +1362,13 @@ impl Watcher {
                 });
             }
         });
+        if let Some(misses) = observe_misses {
+            directory.observe_demand_misses(group, misses, rows as usize);
+        }
+        for (reclaimed_group, tier_record) in reclaimed_host_slots {
+            transport.bump_source_generation(reclaimed_group, tier_record);
+        }
+        let has_backs = !directory.backs_queued().is_empty();
         // Do NOT call `directory.surrender_banked(at)` on the decode demand-landing
         // hot path: on 3-tier (`!tier_complete`) hosts, eagerly destroying the
         // Host-RAM copy of freshly landed demand experts pumps hot Host-RAM experts
@@ -1335,6 +1376,10 @@ impl Watcher {
         // `Directory::promotions_with` remains the single owner of `surrender_banked`.
         if landed_at_home {
             held.publish_policy();
+        }
+        drop(held);
+        if has_backs {
+            self.shared.events().notify();
         }
         claims
     }
@@ -1380,11 +1425,21 @@ impl Watcher {
         };
         let transport = self.shared.transport.clone();
         let core = &mut held.core;
+        let tier_copy_dma = core.extents.tier_copy_dma;
         let (directory, steps) = (&mut core.directory, &core.steps);
         let mut landed_at_home = false;
+        let mut reclaimed_host_slots: Vec<(usize, usize)> = Vec::new();
         transport.with_slot_reuse(|mut can_reuse| {
-            let (promoted, at_home) =
-                finish_demand_landings_in_lock(directory, steps, layer, sequence, slots, &mut can_reuse);
+            let (promoted, at_home) = finish_demand_landings_in_lock(
+                directory,
+                steps,
+                layer,
+                sequence,
+                slots,
+                tier_copy_dma,
+                &mut reclaimed_host_slots,
+                &mut can_reuse,
+            );
             landed_at_home = at_home;
             if promoted {
                 let group = slots[0].group;
@@ -1395,8 +1450,16 @@ impl Watcher {
                 });
             }
         });
+        for (reclaimed_group, tier_record) in reclaimed_host_slots {
+            transport.bump_source_generation(reclaimed_group, tier_record);
+        }
+        let has_backs = !directory.backs_queued().is_empty();
         if landed_at_home {
             held.publish_policy();
+        }
+        drop(held);
+        if has_backs {
+            self.shared.events().notify();
         }
     }
 
@@ -1407,20 +1470,6 @@ impl Watcher {
         publish: bool,
     ) {
         self.finish_demand_landings_batch_inner(finishes, publish, None);
-    }
-
-    /// Observe strictly ONE deduplicated per-layer decode demand miss count
-    /// (`misses` out of `min(E, rows * K)`, including true all-hit `0`) and
-    /// fold any unconsumed previous-layer `finishes` into the same deferred
-    /// residency lock hold.
-    pub(in crate::experts) fn finish_and_observe_decode_demand(
-        &self,
-        group: usize,
-        misses: usize,
-        rows: usize,
-        finishes: &[DemandLandingToFinish],
-    ) {
-        self.finish_demand_landings_batch_inner(finishes, false, Some((group, misses, rows)));
     }
 
     fn finish_demand_landings_batch_inner(
@@ -1440,8 +1489,10 @@ impl Watcher {
         };
         let transport = self.shared.transport.clone();
         let core = &mut held.core;
+        let tier_copy_dma = core.extents.tier_copy_dma;
         let (directory, steps) = (&mut core.directory, &core.steps);
         let mut landed_at_home = false;
+        let mut reclaimed_host_slots: Vec<(usize, usize)> = Vec::new();
         if has_finishes {
             transport.with_slot_reuse(|mut can_reuse| {
                 let mut promoted_groups: Vec<usize> = Vec::new();
@@ -1452,6 +1503,8 @@ impl Watcher {
                         prev.layer,
                         prev.sequence,
                         &prev.slots,
+                        tier_copy_dma,
+                        &mut reclaimed_host_slots,
                         &mut can_reuse,
                     );
                     if promoted {
@@ -1472,12 +1525,20 @@ impl Watcher {
                 }
             });
         }
+        for (reclaimed_group, tier_record) in reclaimed_host_slots {
+            transport.bump_source_generation(reclaimed_group, tier_record);
+        }
         if let Some((group, misses, rows)) = observe_demand {
             directory.set_decode_rows(rows);
             directory.observe_demand_misses(group, misses, rows);
         }
+        let has_backs = !directory.backs_queued().is_empty();
         if landed_at_home {
             held.publish_policy();
+        }
+        drop(held);
+        if has_backs {
+            self.shared.events().notify();
         }
     }
 }
@@ -1492,18 +1553,28 @@ pub(in crate::experts) struct DemandLandingToFinish {
 
 /// Settle `slots` for `(layer, sequence)` while holding `Residency` and
 /// `transport.with_slot_reuse`. Returns `(promoted_any, landed_at_home)`.
+#[allow(clippy::too_many_arguments)]
 fn finish_demand_landings_in_lock(
     directory: &mut crate::experts::directory::Directory,
     steps: &Steps,
     layer: usize,
     sequence: u64,
     slots: &[crate::experts::transport::DemandSlot],
+    tier_copy_dma: bool,
+    reclaimed_host_slots: &mut Vec<(usize, usize)>,
     can_reuse: &mut impl FnMut(crate::experts::transport::DestSlot) -> bool,
 ) -> (bool, bool) {
     if slots.is_empty() {
         return (false, false);
     }
-    let progress = steps.point(sequence, layer, sequence);
+    // `slots` belong to a completed layer `(sequence, layer)` whose transport
+    // leases have already been released, so the device is strictly past `layer`
+    // for `sequence`.
+    let progress = if layer + 1 < directory.layers() {
+        steps.point(sequence, layer + 1, sequence)
+    } else {
+        steps.after(sequence)
+    };
     let batch: Vec<(usize, usize, Option<(usize, usize)>, bool)> = slots
         .iter()
         .map(|&slot| {
@@ -1518,6 +1589,8 @@ fn finish_demand_landings_in_lock(
         &batch,
         progress,
         steps,
+        tier_copy_dma,
+        reclaimed_host_slots,
         |g, slot| can_reuse(crate::experts::transport::DestSlot { group: g, slot }),
     );
     let landed_at_home = promoted_any

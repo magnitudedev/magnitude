@@ -1194,6 +1194,7 @@ fn a_refused_tier_copy_changes_neither_its_grid_nor_its_price() {
                 back: magnitude_cost_model::ReadLine::new(1e-5, 1e-10).unwrap(),
                 concurrent_host_byte_seconds: None,
                 concurrent_dma_byte_seconds: None,
+                routed_zerocopy_byte_seconds: None,
             })),
             convert: crate::assessment::Priced::Measured(None),
         }),

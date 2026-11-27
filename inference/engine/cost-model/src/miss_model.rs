@@ -189,6 +189,28 @@ impl MissModel {
         }
         self.probs.iter().map(|&p| 1. - (1. - p).powf(rows)).sum()
     }
+
+    /// Exact discrete expected hits gained per layer per pass of `rows` rows
+    /// by increasing residency from `slot` to `slot + 1` experts:
+    /// `D(rows) · [h((slot + 1) / E, rows) − h(slot / E, rows)] = 1 − (1 − p_slot)^rows`.
+    /// At `rows = 1`, equals `p_slot = k · [h((slot + 1) / E) − h(slot / E)]`.
+    /// Zero once `slot >= E` or `rows <= 0`.
+    pub fn marginal_hits(&self, slot: u64, rows: f64) -> f64 {
+        if !rows.is_finite() || rows <= 0. {
+            return 0.;
+        }
+        let Ok(index) = usize::try_from(slot) else {
+            return 0.;
+        };
+        let Some(&p) = self.probs.get(index) else {
+            return 0.;
+        };
+        if (rows - 1.).abs() <= f64::EPSILON {
+            p
+        } else {
+            1. - (1. - p).powf(rows)
+        }
+    }
 }
 
 #[cfg(test)]

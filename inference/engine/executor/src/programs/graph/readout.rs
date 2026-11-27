@@ -468,7 +468,7 @@ impl<'p> ReadoutSource<'p> {
 /// what a drafter-free load's readout runs, fusing nothing. A features class
 /// is demanded features, so it has no drafter-free one.
 fn readout_sources(load: &ModelLoadPlan) -> Vec<ReadoutSource<'_>> {
-    let own = ReadoutSource::whole(FeatureSource::of(load), load.fronts());
+    let own = ReadoutSource::whole(FeatureSource::of(load), load.chains_front());
     match own.fuses {
         true => vec![own, ReadoutSource { features: FeatureSource::Output, fuses: false, features_classes: false, token_rows: own.token_rows }],
         false => vec![own],
@@ -2156,7 +2156,7 @@ pub(crate) fn checked_readout_storage_with_undrafted(
         classes.extend(source_classes.into_iter().map(|class| (source, class)));
     }
     let drafted = summarize_readout_regimes(&regimes, &classes, limits)?;
-    let own = ReadoutSource::whole(FeatureSource::of(load), load.fronts());
+    let own = ReadoutSource::whole(FeatureSource::of(load), load.chains_front());
     let plain_source = ReadoutSource::whole(FeatureSource::Output, false);
     let undrafted = if matches!(own.features, FeatureSource::Output) && !own.token_rows {
         drafted.clone()
@@ -2918,7 +2918,7 @@ mod resource_regime_tests {
             (selecting, &load),
             FeatureSource::Output,
             uncertified,
-            ReadoutExports { logits: false, token_rows: load.fronts() },
+            ReadoutExports { logits: false, token_rows: load.chains_front() },
         )
         .unwrap();
         // Top-p, and a repetition penalty, at a sampling temperature.
@@ -3094,7 +3094,7 @@ mod resource_regime_tests {
                     &definition.decoder,
                     norm,
                     (head, &load),
-                    ReadoutSource::whole(FeatureSource::Output, load.fronts()),
+                    ReadoutSource::whole(FeatureSource::Output, load.chains_front()),
                     limits,
                 )
                 .unwrap();
@@ -3107,7 +3107,7 @@ mod resource_regime_tests {
                         (head, &load),
                         FeatureSource::Output,
                         class,
-                        ReadoutExports { logits: exports_logits(limits), token_rows: load.fronts() },
+                        ReadoutExports { logits: exports_logits(limits), token_rows: load.chains_front() },
                     )
                     .unwrap()
                     .seal_with_layout(layout)
@@ -3190,7 +3190,7 @@ mod resource_regime_tests {
                 decoder,
                 None,
                 (head, &load),
-                ReadoutSource::whole(FeatureSource::Output, load.fronts()),
+                ReadoutSource::whole(FeatureSource::Output, load.chains_front()),
                 limits,
             )
             .unwrap();
@@ -3205,7 +3205,7 @@ mod resource_regime_tests {
                     (head, &load),
                     FeatureSource::Output,
                     class,
-                    ReadoutExports { logits: false, token_rows: load.fronts() },
+                    ReadoutExports { logits: false, token_rows: load.chains_front() },
                 )
                 .unwrap()
                 .seal_with_layout(layout)

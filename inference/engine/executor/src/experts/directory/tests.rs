@@ -237,10 +237,12 @@ fn decode_reclaims_lent_records_and_lending_excludes_them() {
 
 /// Promoting an expert into the lent scratch slice `0..lent` retains its
 /// host-tier copy (`Kept::Alone`, not surrendered), whereas promoting into a
-/// permanent record (`>= lent`) still surrenders the host copy so permanent
-/// VRAM and Host RAM remain disjoint. When a prompt group leases `0..lent`,
-/// the lent experts vacate immediately with zero D2H write-backs and remain
-/// resident in Host RAM (never dropped to NVMe).
+/// Both non-lent (`>= lent`) and lent (`0..lent`) VRAM promotions mark their
+/// Host-RAM copies `Kept::Banked` during decode so `surrender_banked` reclaims
+/// all duplicate Host slots (`VRAM ∩ Host = ∅`). When a prompt group leases
+/// `0..lent`, hot lent experts are written back cleanly via `exit_now`
+/// (`backs_queued`), and once D2H completes and drains, the lease completes
+/// with zero experts dropped to NVMe.
 #[test]
 fn lent_vram_promotion_retains_host_copy_so_prefill_lease_has_zero_writebacks_or_drops() {
     let steps = steps();
@@ -283,15 +285,21 @@ fn lent_vram_promotion_retains_host_copy_so_prefill_lease_has_zero_writebacks_or
         assert!(directory.tier_record(0, e).is_none(), "non-lent VRAM expert {e} must be surrendered from host tier");
     }
     for &e in &lent_experts {
-        assert!(directory.tier_record(0, e).is_some(), "lent VRAM expert {e} must retain its host-tier copy");
+        assert!(directory.tier_record(0, e).is_none(), "0..lent VRAM expert {e} must be surrendered from host tier during decode");
     }
-    // Prefill lease vacates `0..lent` immediately with zero write-backs, and
-    // every vacated lent expert remains resident in Host RAM.
-    assert!(directory.lease(0, ScratchGroup::at(4, 1), false, None), "lease must complete in one pass without D2H write-backs");
-    assert!(directory.backs_queued().is_empty(), "no D2H write-backs may be queued for 0..lent");
+    // Prefill lease queues D2H write-backs for hot `0..lent` experts rather than dropping them to NVMe.
+    assert!(!directory.lease(0, ScratchGroup::at(4, 1), false, None), "lease waits for 0..lent WriteBacks");
+    let backs = directory.backs_queued();
+    assert_eq!(backs.len(), lent_experts.len(), "hot 0..lent experts must queue D2H WriteBacks on lease");
+    for (i, (group, bank_rec, _, _)) in backs.into_iter().enumerate() {
+        directory.back_copy(group, bank_rec, i as u64 + 1);
+        directory.written_back(group, bank_rec, true);
+    }
+    directory.drain(Point::whole(4, 1, 4), &steps);
+    assert!(directory.lease(0, ScratchGroup::at(4, 1), false, None), "lease completes once 0..lent WriteBacks drain");
     for &e in &lent_experts {
         assert!(directory.held(0, e).is_none(), "lent expert {e} vacated VRAM");
-        assert!(directory.tier_record(0, e).is_some(), "lent expert {e} still resident in Host RAM (zero NVMe drop)");
+        assert!(directory.tier_record(0, e).is_some(), "lent expert {e} written back to Host RAM (zero NVMe drop)");
     }
 }
 
@@ -1488,9 +1496,9 @@ fn a_read_ahead_into_a_ready_record_past_the_keep_admits() {
     log(&directory, 1, 0, &[0]);
     directory.time().lock().register(2, Advance::Known(Tokens::new(1.0)));
     assert_eq!((directory.host(0).ready(), directory.host(0).reserve()), (3, 3));
-    let admitted = directory.claim_ahead(0, 5, 2, Taking::Ahead, 2, 0.5);
+    let admitted = directory.claim_ahead(0, 5, 2, Taking::Ahead, 2, 0.5, 0.0);
     assert!(matches!(admitted, Claim::Taken(_)), "a ready record past the claim's keep admits");
-    let short = directory.claim_ahead(0, 6, 3, Taking::Ahead, 2, 1.0);
+    let short = directory.claim_ahead(0, 6, 3, Taking::Ahead, 2, 1.0, 0.0);
     assert!(matches!(short, Claim::Short), "at the whole reserve with nothing kept, short admits none");
 }
 
@@ -1535,7 +1543,7 @@ fn a_read_ahead_displaces_only_a_lower_rank() {
     hot_tier.landed(0, rec0, 0, Some(10));
     hot_tier.time().lock().register(11, Advance::Known(Tokens::new(1.0)));
     assert!(
-        matches!(hot_tier.claim_ahead(0, 2, 1, Taking::Ahead, 11, 0.5), Claim::Short),
+        matches!(hot_tier.claim_ahead(0, 2, 1, Taking::Ahead, 11, 0.5, 0.0), Claim::Short),
         "candidate with p = 0.5 must not displace hot victim (0, 0)"
     );
 
@@ -1548,7 +1556,7 @@ fn a_read_ahead_displaces_only_a_lower_rank() {
     cold_tier.landed(0, rec1, 1, Some(1));
     cold_tier.time().lock().register(11, Advance::Known(Tokens::new(1.0)));
     assert!(
-        matches!(cold_tier.claim_ahead(0, 2, 1, Taking::Ahead, 11, 1.0), Claim::Taken(_)),
+        matches!(cold_tier.claim_ahead(0, 2, 1, Taking::Ahead, 11, 1.0, 0.0), Claim::Taken(_)),
         "candidate with p = 1.0 must displace cold victim (0, 1)"
     );
 }
@@ -1687,12 +1695,13 @@ fn the_rankings_size_is_constant_in_run_length() {
             times.moved(0, Tier::HOST);
         }
     };
-    run(1..=10);
-    let after_10 = directory.reuse_now().bytes();
-    assert!(after_10 > 0);
-    run(11..=10_000);
+    let warmup = (crate::experts::DEPTHS + 2) as u64;
+    run(1..=warmup);
+    let after_warmup = directory.reuse_now().bytes();
+    assert!(after_warmup > 0);
+    run(warmup + 1..=10_000);
     let after_10k = directory.reuse_now().bytes();
-    assert_eq!(after_10, after_10k, "ranking memory must not grow with run length");
+    assert_eq!(after_warmup, after_10k, "ranking memory must not grow with run length");
 }
 
 /// Repeating the exact same prompt at a later step (`step_2 > step_1`) with
@@ -1824,12 +1833,19 @@ fn claim_carryover_prices_eviction_on_full_two_tier_bank() {
     }
 
     // 1. Non-positive net_benefit is ALWAYS rejected (even if reserve slots exist).
-    assert!(matches!(directory.claim_carryover(0, 2, 1, Taking::Ahead, 0.0), Claim::Short));
-    assert!(matches!(directory.claim_carryover(0, 2, 1, Taking::Ahead, -0.25), Claim::Short));
+    assert!(matches!(directory.claim_carryover(0, 2, 1, Taking::Ahead, 0.0, true), Claim::Short));
+    assert!(matches!(directory.claim_carryover(0, 2, 1, Taking::Ahead, -0.25, true), Claim::Short));
 
-    // 2. Positive net_benefit exceeding victim_uses - cand_uses admits on a full 2-tier bank.
-    let claim = directory.claim_carryover(0, 2, 1, Taking::Ahead, 0.5);
-    assert!(matches!(claim, Claim::Taken(_)), "profitable carryover must admit on full 2-tier bank");
+    // 2. On a full bank (`keep = 2`, zero free slots), `strict_rank = true`
+    // rejects tied candidates (`cand_uses == victim_uses`) to prevent tie-churn.
+    assert!(
+        matches!(directory.claim_carryover(0, 2, 2, Taking::Ahead, 0.5, true), Claim::Short),
+        "strict_rank carryover must reject tied eviction on full 2-tier bank"
+    );
+
+    // 3. When a free slot is available (`keep = 1`), positive net_benefit admits without evicting.
+    let claim = directory.claim_carryover(0, 2, 1, Taking::Ahead, 0.5, true);
+    assert!(matches!(claim, Claim::Taken(_)), "profitable carryover must admit into free slot");
 }
 
 #[test]
@@ -1865,8 +1881,12 @@ fn alone_excludes_lent_slot_dual_resident_experts() {
     assert!(directory.bank_lends(0, slot));
     assert!(directory.finish_demand_landing(0, slot, staged, at(1, 0), &steps, true));
     assert_eq!(directory.held_count(0), 1);
-    assert_eq!(directory.host(0).alone()[0], experts, "host copy of lent-slot expert stays retained");
-    assert_eq!(directory.alone(0), experts - 1, "Directory::alone excludes dual-resident lent-slot expert");
+    assert!(
+        !directory.host(0).holds_alone((0, 0)),
+        "0..lent decode expert must be marked Kept::Banked so Host RAM does not duplicate it"
+    );
+    assert_eq!(directory.host(0).alone()[0], experts - 1);
+    assert_eq!(directory.alone(0), experts - 1);
     assert!(directory.held_count(0) + directory.alone(0) <= experts);
 }
 
@@ -2120,10 +2140,10 @@ fn claim_ahead_and_carryover_skip_non_lent_vram_experts_on_non_covering_tier() {
     directory.retire_graces(at(3, 1), &steps);
     assert!(directory.held(0, 0).is_some() && !directory.in_tier(0, 0));
 
-    assert!(matches!(directory.claim_ahead(0, 0, 0, Taking::Ahead, 4, 1.0), Claim::Short));
-    assert!(matches!(directory.claim_carryover(0, 0, 0, Taking::Ahead, 1.0), Claim::Short));
+    assert!(matches!(directory.claim_ahead(0, 0, 0, Taking::Ahead, 4, 1.0, 0.0), Claim::Short));
+    assert!(matches!(directory.claim_carryover(0, 0, 0, Taking::Ahead, 1.0, false), Claim::Short));
     // Cold expert 1 (not in VRAM) is still admitted normally.
-    assert!(matches!(directory.claim_ahead(0, 1, 0, Taking::Ahead, 4, 1.0), Claim::Taken(_)));
+    assert!(matches!(directory.claim_ahead(0, 1, 0, Taking::Ahead, 4, 1.0, 0.0), Claim::Taken(_)));
 }
 
 /// `Directory::host_has_free_slot` is true iff the group's host tier has an
@@ -3581,8 +3601,6 @@ fn finish_demand_landings_batch_swaps_hot_miss_with_cold_held_at_and_below_free_
         placement: Placement::Tier { bank_maps, tier_maps, lent: (0, 0), stage_slots: vec![0] },
     };
     let mut directory = Directory::new(&[present], &[0, 0], &[experts, experts], host);
-    directory.configure_decode_budget(1, k, 1);
-    assert_eq!(directory.demand_free_floor(0), k);
 
     let mut tier_recs = Vec::new();
     for layer in 0..layers {
@@ -3615,6 +3633,9 @@ fn finish_demand_landings_batch_swaps_hot_miss_with_cold_held_at_and_below_free_
     directory.promoted(completed, at(step1, 0), &steps);
     assert_eq!(directory.held_count(0), 19);
     assert_eq!(directory.bank_free_count(0), 5);
+    // Enable decode demand free-floor (`k = 4`) now that 19 Held + 5 Free slots are seeded.
+    directory.configure_decode_budget(1, k, 1);
+    assert_eq!(directory.demand_free_floor(0), k);
 
     // Claim 1 Free slot for hot expert 30 -> now `free_now == 4 == free_floor`!
     let DemandSlotClaim::Allocated { staged, slot } = directory.claim_demand_landing(0, tier_recs[30], false, |_| true) else {
@@ -3656,8 +3677,11 @@ fn finish_demand_landings_batch_swaps_hot_miss_with_cold_held_at_and_below_free_
     };
     assert_eq!(directory.bank_free_count(0), 2, "free_now < free_floor");
 
-    // Expert 31 is hot (logged 4x), expert 50 was never logged (coldest possible).
-    for _ in 0..4 {
+    // Keep the 19 held experts strictly warmer than unlogged expert 50,
+    // and make expert 31 hotter than all of them (logged 6x).
+    let refresh = steps.begin_group(1, None);
+    log(&directory, refresh, 0, &cold);
+    for _ in 0..6 {
         let s = steps.begin_group(1, None);
         log(&directory, s, 0, &[31]);
     }
@@ -3673,4 +3697,583 @@ fn finish_demand_landings_batch_swaps_hot_miss_with_cold_held_at_and_below_free_
     assert!(directory.held(0, 50).is_none(), "unranked cold miss 50 must NOT evict a hotter Held expert");
     assert_eq!(directory.held_count(0), 19, "Held count remains 19");
     assert_eq!(directory.bank_free_count(0), 3, "unpromoted cold miss 50 returned its slot to Free (2 -> 3)");
+}
+
+#[test]
+fn claim_carryover_never_evicts_hotter_resident_for_colder_candidate() {
+    use crate::experts::host_records::{Claim, Taking};
+
+    let experts = 8usize;
+    let map_words = magnitude_kernels::constants::MAP_WORDS;
+    let steps = std::sync::Arc::new(steps());
+    let host = HostTier {
+        records: vec![4],
+        lent: vec![0],
+        reserve: 2,
+        placement: Placement::Bank {
+            landing_maps: vec![LandingMap::Bank {
+                map: std::sync::Arc::new(StampedMap::new(cpu_words(&[experts as u64, map_words], 0))),
+                steps: std::sync::Arc::clone(&steps),
+            }],
+        },
+    };
+    let mut directory = Directory::new(&[0], &[0], &[experts], host);
+    // Land experts 0 and 1 into the 2 non-reserve slots.
+    for expert in 0..2 {
+        let Claim::Taken(grant) = directory.claim_landing(0, expert, 0, Taking::Out, (|_, _| (), |_, _| true)) else {
+            panic!("expected free slot for resident expert {expert}");
+        };
+        directory.landed(0, HostRecord(grant.record()), expert, Some(1));
+    }
+    // Feed decode history making residents 0 and 1 strictly hotter than cold candidate 2.
+    for _ in 0..8 {
+        let s = steps.begin_group(1, None);
+        log(&directory, s, 0, &[0, 1]);
+    }
+    assert!(directory.settle_changes());
+
+    // Cold candidate 2 has lower expected uses than hotter residents 0 & 1:
+    // with `keep = 2` (matching the 2 reserve slots so zero free slots remain),
+    // strict_rank rejects it, and small net_benefit (0.15) that does not
+    // overcome the victim's expected-uses margin also rejects it.
+    assert!(
+        matches!(directory.claim_carryover(0, 2, 2, Taking::Ahead, 0.15, true), Claim::Short),
+        "strict_rank carryover must never evict a strictly hotter resident"
+    );
+    assert!(
+        matches!(directory.claim_carryover(0, 2, 2, Taking::Ahead, 0.15, false), Claim::Short),
+        "small net_benefit must not evict a much hotter resident"
+    );
+
+    // When `!strict_rank` (free drive slack hides the read) and the avoided
+    // exposed stall (`net_benefit`) exceeds the victim's turnover margin,
+    // `claim_carryover` admits on a full UMA bank (while `strict_rank = true`
+    // still rejects it to protect drive-bound hosts).
+    let tier = directory.host_tier();
+    let victim_uses = directory
+        .reuse_now()
+        .expected(0, 0, tier, crate::experts::horizon::Reader::Move, None)
+        .uses();
+    let stall_benefit = victim_uses + 0.5;
+    assert!(
+        matches!(directory.claim_carryover(0, 2, 2, Taking::Ahead, stall_benefit, true), Claim::Short),
+        "drive-bound strict_rank must still reject colder carryover"
+    );
+    assert!(
+        matches!(directory.claim_carryover(0, 2, 2, Taking::Ahead, stall_benefit, false), Claim::Taken(_)),
+        "non-drive-bound free-slack carryover must credit avoided exposed stall on full UMA bank"
+    );
+}
+
+#[test]
+fn claim_ahead_stall_credit_admits_on_full_bank_while_preserving_token_protection() {
+    use crate::experts::host_records::{Claim, Taking};
+    use crate::experts::horizon::{Advance, Reader, Tokens};
+
+    let experts = 8usize;
+    let map_words = magnitude_kernels::constants::MAP_WORDS;
+    let steps = std::sync::Arc::new(steps());
+    let host = HostTier {
+        records: vec![3],
+        lent: vec![0],
+        reserve: 1,
+        placement: Placement::Bank {
+            landing_maps: vec![LandingMap::Bank {
+                map: std::sync::Arc::new(StampedMap::new(cpu_words(&[experts as u64, map_words], 0))),
+                steps: std::sync::Arc::clone(&steps),
+            }],
+        },
+    };
+    let mut directory = Directory::new(&[0], &[0], &[experts], host);
+    for expert in 0..2 {
+        let Claim::Taken(grant) = directory.claim_landing(0, expert, 0, Taking::Out, (|_, _| (), |_, _| true)) else {
+            panic!("expected free slot for resident expert {expert}");
+        };
+        directory.landed(0, HostRecord(grant.record()), expert, None);
+    }
+    // Resident 0 is warmer (2 hits) and token-protected; resident 1 is colder (1 hit).
+    let s1 = steps.begin_group(1, None);
+    log(&directory, s1, 0, &[0, 1]);
+    let s2 = steps.begin_group(1, None);
+    log(&directory, s2, 0, &[0]);
+    let next_step = s2 + 1;
+    directory.time().lock().register(next_step, Advance::Known(Tokens::new(1.0)));
+
+    // Protect resident 0 as needed in the upcoming burst (`token_reads`, p = 0.90).
+    directory.set_token_reads([((0, 0), next_step, 0.90)]);
+
+    let tier = directory.host_tier();
+    let victim_uses = directory.reuse_now().expected(0, 1, tier, Reader::Move, None).uses();
+    let cand_uses = directory.reuse_now().expected_with(0, 2, tier, next_step, 0.5).uses();
+    let credit = (victim_uses - cand_uses).max(0.0) + 0.25;
+
+    // With stall_credit = 0.0 (drive-bound), candidate 2 (p = 0.5) cannot beat
+    // warmer residents 0 (protected) or 1 (keep = 1 matches the 1 ready reserve).
+    assert!(matches!(directory.claim_ahead(0, 2, 1, Taking::Ahead, next_step, 0.5, 0.0), Claim::Short));
+
+    // With stall_credit > 0.0 (free drive slack), candidate 2 is admitted and
+    // leaves token-protected resident 0 intact.
+    let Claim::Taken(_) = directory.claim_ahead(0, 2, 1, Taking::Ahead, next_step, 0.5, credit) else {
+        panic!("free-slack claim_ahead with stall_credit must admit on full bank");
+    };
+    assert!(directory.in_tier(0, 0), "token_reads-protected resident 0 must remain resident");
+}
+
+#[test]
+fn token_reads_protect_high_confidence_predicted_residents_from_demand_eviction() {
+    use crate::experts::host_records::{Claim, Demand, Located, Taking};
+
+    let experts = 8usize;
+    let map_words = magnitude_kernels::constants::MAP_WORDS;
+    let steps = std::sync::Arc::new(steps());
+    let host = HostTier {
+        records: vec![2],
+        lent: vec![0],
+        reserve: 0,
+        placement: Placement::Bank {
+            landing_maps: vec![LandingMap::Bank {
+                map: std::sync::Arc::new(StampedMap::new(cpu_words(&[experts as u64, map_words], 0))),
+                steps: std::sync::Arc::clone(&steps),
+            }],
+        },
+    };
+    let mut directory = Directory::new(&[0], &[0], &[experts], host);
+    // Land experts 0 and 1 with identical history so expert 0 would normally be
+    // evicted first (tie-broken by record/index order).
+    for expert in 0..2 {
+        let Claim::Taken(grant) = directory.claim_landing(0, expert, 0, Taking::Out, (|_, _| (), |_, _| true)) else {
+            panic!("expected free slot for resident expert {expert}");
+        };
+        directory.landed(0, HostRecord(grant.record()), expert, Some(1));
+    }
+    let s1 = steps.begin_group(1, None);
+    log(&directory, s1, 0, &[0, 1]);
+    assert!(directory.settle_changes());
+
+    // Protect expert 0 with a high-confidence `Source::Token` prediction for
+    // upcoming step `s1 + 1`.
+    let next_step = s1 + 1;
+    directory.set_token_reads([((0, 0), next_step, 0.85)]);
+
+    // Prepare and claim a demand landing for expert 2 at step `s1` (before
+    // `next_step` runs): expert 1 must be evicted instead of protected expert 0.
+    directory.prepare_demand(0, 1, s1);
+    let park = steps.park(at(s1, 0), 1);
+    let claim = directory.claim_demand((0, 2), Demand::Lacked, &[], &park);
+    assert!(matches!(claim, Claim::Taken(_)), "demand claim must succeed by evicting unprotected victim");
+    assert!(
+        matches!(directory.located(0, 0), Located::Kept(_)),
+        "high-confidence Source::Token predicted expert 0 must remain protected from eviction"
+    );
+    assert!(
+        !matches!(directory.located(0, 1), Located::Kept(_)),
+        "unprotected resident expert 1 must be chosen as the demand eviction victim"
+    );
+}
+
+/// On a disjoint 3-tier (`!tier_complete`) bank with `Host` 100% full (`0` ready
+/// slots) and `WriteBack::pays == true`, `finish_demand_landings_batch_with_reuse`
+/// swaps a hot `E_miss` (`DemandLanding -> Held`) with a cold VRAM-only victim
+/// `E_victim` (`Located::Lacked`) by immediately repurposing `E_miss`'s vacated
+/// Host slot `A` into `Host::WritingBack { staged: E_victim }` — maintaining
+/// `VRAM ∩ Host = ∅` without dropping `E_victim` to NVMe.
+#[test]
+fn finish_demand_landings_batch_swaps_disjoint_vram_only_victim_into_vacated_host_slot() {
+    use crate::experts::host_records::{Claim, Taking};
+
+    let layers = 2usize;
+    let experts = 16usize;
+    let present = 8usize; // 4 held + 4 free (demand_floor = 2, promote_headroom = 2, replenish_target = 4)
+    let host_slots = 4u32; // strictly non-covering: 4 host slots < 32 total experts
+    let map_words = magnitude_kernels::constants::MAP_WORDS;
+    let bank_maps = (0..layers)
+        .map(|_| StampedMap::new(cpu_words(&[experts as u64, map_words], 0)))
+        .collect::<Vec<_>>();
+    let tier_maps = (0..layers)
+        .map(|_| LandingMap::Tier(cpu_words(&[experts as u64], -1)))
+        .collect::<Vec<_>>();
+    let host = HostTier {
+        records: vec![host_slots],
+        lent: vec![0],
+        reserve: 0,
+        placement: Placement::Tier { bank_maps, tier_maps, lent: (0, 0), stage_slots: vec![0] },
+    };
+    let mut directory = Directory::new(&[present], &[0, 0], &[experts, experts], host);
+    assert!(!directory.tier_complete());
+    directory.configure_decode_budget(1, 2, 1);
+    assert_eq!(directory.demand_free_floor(0), 2);
+
+    let wb_price = Some(WriteBack {
+        terms: magnitude_cost_model::Terms { compute: 0.0, drive: 4.0, link: 0.0, cpu: 0.0, memory: 0.0 },
+        drive: 1.0,
+        link: 0.0,
+    });
+    for layer in 0..layers {
+        directory.price_copies(layer, Some(0.0));
+        directory.price_write_backs(layer, wb_price);
+    }
+
+    // 1. Land experts 0..4 (layer 0) into Host and promote all 4 into VRAM.
+    let steps = steps();
+    let step0 = steps.begin_group(1, None);
+    for expert in 0..4 {
+        let Claim::Taken(grant) = directory.claim_landing(0, expert, 0, Taking::Out, (|_, _| (), |_, _| true)) else {
+            panic!("host tier has room");
+        };
+        directory.landed(0, HostRecord(grant.record()), expert, Some(step0));
+    }
+    log(&directory, step0, 0, &[0, 1, 2, 3]);
+    assert!(directory.settle_changes());
+    let wants = steps.unbegun(|at| directory.promotions(at, 4));
+    assert_eq!(wants.promotions.len(), 4);
+    for p in &wants.promotions {
+        let tier = directory.hold_tier(p.layer, p.expert).expect("in host tier");
+        directory.copy(p.group, p.record, tier, 0);
+    }
+    let completed: Vec<(usize, BankRecord)> = wants.promotions.iter().map(|p| (p.group, p.record)).collect();
+    directory.promoted(completed, at(step0, 0), &steps);
+    steps.end_played(step0);
+
+    // 2. Surrender Host copies of 0..4 so VRAM = {0,1,2,3} (all Located::Lacked).
+    let surrendered = steps.unbegun(|at| directory.surrender_banked(at));
+    assert_eq!(surrendered.len(), 4);
+    directory.retire_graces(past(step0), &steps);
+    for expert in 0..4 {
+        assert_eq!(directory.located(0, expert), Located::Lacked);
+    }
+    assert_eq!(directory.host(0).ready(), 4);
+
+    // 3. Fill ALL 4 Host slots with distinct experts 4..8 (`0` ready slots left!).
+    let mut slot_of_miss = None;
+    for expert in 4..8 {
+        let Claim::Taken(grant) = directory.claim_landing(0, expert, 0, Taking::Out, (|_, _| (), |_, _| true)) else {
+            panic!("host tier has room for unique expert {expert}");
+        };
+        directory.landed(0, HostRecord(grant.record()), expert, Some(step0));
+        if expert == 4 {
+            slot_of_miss = Some(grant.record());
+        }
+    }
+    let slot_a = slot_of_miss.unwrap();
+    assert_eq!(directory.host(0).ready(), 0, "Host tier is 100% full (0 ready slots)");
+    // Ensure host tier horizon tau exists (`moved(0, HOST)` happened in `landed`).
+    for s in 1..=6 {
+        let step = steps.begin_group(1, None);
+        // Make expert 4 strictly hotter than 0..4, while keeping 0..4 warm enough that WriteBack::pays.
+        log(&directory, step, 0, &[1, 2, 3, 4]);
+        steps.end_played(step);
+    }
+    assert!(directory.settle_changes());
+
+    // 4. Claim a Free VRAM slot `B` for `E_miss = (0, 4)` (held_total + replenish_target == 4 + 4 == cap).
+    let DemandSlotClaim::Allocated { staged, slot: slot_b } =
+        directory.claim_demand_landing(0, slot_a, false, |_| true)
+    else {
+        panic!("expected Free VRAM slot for E_miss");
+    };
+    assert_eq!(staged, Some((0, 4)));
+    assert_eq!(directory.bank_free_count(0), 3);
+
+    // 5. Finish demand landing for `(0, 4)` at step_cur past layer 0 (`at(step_cur, 1)`):
+    //    MUST swap cold VRAM-only victim `(0, 0)` into `slot_a` via `Host::WritingBack`!
+    let step_cur = steps.begin_group(1, None);
+    let mut reclaimed_host_slots = Vec::new();
+    let promoted = directory.finish_demand_landings_batch_with_reuse(
+        &[(0, slot_b, staged, true)],
+        at(step_cur, 1),
+        &steps,
+        true,
+        &mut reclaimed_host_slots,
+        |_, _| true,
+    );
+    assert!(promoted, "hot miss (0, 4) must promote via WriteBack swap of VRAM-only victim");
+    assert_eq!(directory.held(0, 4), Some(slot_b), "E_miss must be Held in slot B");
+    assert_eq!(directory.located(0, 4), Located::Lacked, "E_miss's Host slot A must be vacated (VRAM ∩ Host = ∅)");
+    assert_eq!(reclaimed_host_slots, vec![(0, slot_a as usize)], "reclaimed Host slot A reported for generation bump");
+
+    let backs = directory.backs_queued();
+    assert_eq!(backs.len(), 1, "evicted VRAM-only victim must have WriteBack queued");
+    let (wb_group, wb_bank_rec, wb_victim, wb_host_rec) = backs[0];
+    assert_eq!(wb_group, 0);
+    assert_eq!(wb_victim, (0, 0), "coldest VRAM-only expert (0, 0) must be chosen as victim");
+    assert_eq!(wb_host_rec, HostRecord(slot_a), "WriteBack destination must be E_miss's vacated Host slot A");
+    assert!(directory.held(0, 0).is_none(), "victim is no longer Held in VRAM");
+    assert_eq!(directory.located(0, 0), Located::Lacked, "victim stays Lacked until D2H completes");
+
+    // 6. Complete D2H WriteBack and drain: victim lands in Host slot A, VRAM slot C returns to Free!
+    directory.back_copy(wb_group, wb_bank_rec, 1);
+    directory.written_back(wb_group, wb_bank_rec, true);
+    steps.end_played(step_cur);
+    assert!(directory.drain(past(step_cur), &steps), "slot C must drain to Free after WriteBack completes");
+    assert_eq!(directory.located(0, 0), Located::Kept(slot_a), "victim must now reside in Host slot A");
+    assert_eq!(directory.held_count(0), 4, "VRAM Held count preserved at 4");
+    assert_eq!(directory.alone(0), 4, "Host holds 4 unique experts (0, 5, 6, 7)");
+    // Verify strict disjointness: no expert is both Held in VRAM and Kept in Host.
+    for expert in 0..experts {
+        assert!(
+            !(directory.held(0, expert).is_some() && matches!(directory.located(0, expert), Located::Kept(_))),
+            "strict VRAM ∩ Host = ∅ violated for expert {expert}"
+        );
+    }
+}
+
+/// `0..lent` experts are marked `Kept::Banked` during decode (so Host RAM does
+/// not duplicate them once surrendered) and are cleanly written back to Host on
+/// `lease_bank_records` rather than dropped to NVMe.
+#[test]
+fn lent_slot_experts_marked_banked_during_decode_and_written_back_on_lease() {
+    use crate::experts::host_records::{Claim, Taking};
+
+    let experts = 8usize;
+    let lent = 2usize;
+    let present = 4usize; // 0..2 lent, 2..4 non-lent
+    let map_words = magnitude_kernels::constants::MAP_WORDS;
+    let host = HostTier {
+        records: vec![4], // non-covering: 4 host slots < 8 experts
+        lent: vec![0],
+        reserve: 0,
+        placement: Placement::Tier {
+            bank_maps: vec![StampedMap::new(cpu_words(&[experts as u64, map_words], 0))],
+            tier_maps: vec![LandingMap::Tier(cpu_words(&[experts as u64], -1))],
+            lent: (0, lent),
+            stage_slots: vec![0],
+        },
+    };
+    let mut directory = Directory::new(&[present], &[0], &[experts], host);
+    directory.price_copies(0, Some(0.0));
+    directory.price_write_backs(
+        0,
+        Some(WriteBack {
+            terms: magnitude_cost_model::Terms { compute: 0.0, drive: 4.0, link: 0.0, cpu: 0.0, memory: 0.0 },
+            drive: 1.0,
+            link: 0.0,
+        }),
+    );
+
+    let steps = steps();
+    let step0 = steps.begin_group(1, None);
+    let Claim::Taken(grant) = directory.claim_landing(0, 0, 0, Taking::Out, (|_, _| (), |_, _| true)) else {
+        panic!("host tier has room");
+    };
+    let host_rec0 = grant.record();
+    directory.landed(0, HostRecord(host_rec0), 0, Some(step0));
+
+    // Demand-land expert 0 into lent VRAM slot (`0..lent`) and promote it.
+    let DemandSlotClaim::Allocated { staged, slot } = directory.claim_demand_landing(0, host_rec0, false, |_| true) else {
+        panic!("expected lent VRAM slot");
+    };
+    assert!(directory.bank_lends(0, slot), "slot must be inside 0..lent");
+    log(&directory, step0, 0, &[0]);
+    assert!(directory.finish_demand_landing(0, slot, staged, at(step0, 1), &steps, true));
+    steps.end_played(step0);
+
+    // Must be marked `Kept::Banked` (NOT `Kept::Alone`) and surrendered to free its Host slot!
+    assert!(!directory.host(0).holds_alone((0, 0)), "0..lent expert must be Kept::Banked during decode");
+    let surrendered = steps.unbegun(|at| directory.surrender_banked(at));
+    assert_eq!(surrendered, vec![(0, host_rec0 as usize)], "0..lent expert's Host copy must be surrendered");
+    directory.retire_graces(past(step0), &steps);
+    assert_eq!(directory.located(0, 0), Located::Lacked, "Host slot reclaimed for unique experts");
+
+    // Warm up expert 0 so WriteBack pays when prefill leases `0..lent`.
+    for _ in 0..3 {
+        let s = steps.begin_group(1, None);
+        log(&directory, s, 0, &[0]);
+        steps.end_played(s);
+    }
+
+    // Prefill entry: `lease_bank_records` MUST write back hot `0..lent` expert 0 via `exit_now`!
+    let scratch = ScratchGroup::at(10, 1);
+    directory.lease_bank_records(0, scratch, &[true; 2]);
+    assert!(!directory.leased(0), "lease must wait while lent slot's WriteBack is in flight");
+    let backs = directory.backs_queued();
+    assert_eq!(backs.len(), 1, "lease_bank_records must queue WriteBack for hot 0..lent expert");
+    let (wb_group, wb_rec, wb_staged, _wb_tier) = backs[0];
+    assert_eq!(wb_staged, (0, 0));
+    assert_eq!(wb_rec.index(), slot);
+
+    // Complete WriteBack + drain, then re-call `lease_bank_records` -> slot transitions to `Record::Lent`!
+    directory.back_copy(wb_group, wb_rec, 1);
+    directory.written_back(wb_group, wb_rec, true);
+    assert!(directory.drain(past(10), &steps));
+    directory.lease_bank_records(0, scratch, &[true; 2]);
+    assert!(directory.leased(0), "all 0..lent slots must now be leased");
+    assert!(directory.lent(0, slot), "slot must be Record::Lent");
+    assert!(matches!(directory.located(0, 0), Located::Kept(_)), "hot 0..lent expert preserved in Host RAM");
+}
+
+/// Targeted 3-record lifetime regression test (`A` = old Host slot of `E_miss`,
+/// `B` = completed demand VRAM slot of `E_miss`, `C` = lent VRAM slot of `E_victim`):
+/// 1. While a zero-copy reader is still active on `A` (`!is_served`) and Host has
+///    no `Ready` slot, `finish_demand_landings_batch_with_reuse` MUST NOT overwrite
+///    `A` or drop `E_victim` (`A`'s simulated bytes `0xAA` remain untouched).
+/// 2. Once the zero-copy reader passes `A`'s layer, swap-on-promote succeeds:
+///    `B` becomes `Held(E_miss)`, `C` becomes `Releasing { back: Some(A) }`, and
+///    `A` becomes `Host::WritingBack { staged: E_victim }`.
+/// 3. While D2H `C -> A` is delayed in flight, a prompt lease (`lease_bank_records`)
+///    arriving on `0..lent` (covering `C`) MUST skip `C` — `C` stays `Releasing`
+///    and `E_victim` stays unmapped in Host until delayed D2H completion copies
+///    `0xCC` into `A` and calls `written_back` + `drain`.
+#[test]
+fn swap_on_promote_respects_active_zero_copy_reader_and_prompt_lease_on_releasing_victim() {
+    use crate::experts::host_records::{Claim, Taking};
+
+    let layers = 2usize;
+    let experts = 16usize;
+    let lent = 2usize; // slots 0..2 are lent (victim C will sit in 0..lent!)
+    let present = 6usize; // 2 held (0..2) + 4 free (demand_floor = 2, replenish_target = 4)
+    let host_slots = 2u32; // strictly full once 2 unique Host experts land
+    let map_words = magnitude_kernels::constants::MAP_WORDS;
+    let bank_maps = (0..layers)
+        .map(|_| StampedMap::new(cpu_words(&[experts as u64, map_words], 0)))
+        .collect::<Vec<_>>();
+    let tier_maps = (0..layers)
+        .map(|_| LandingMap::Tier(cpu_words(&[experts as u64], -1)))
+        .collect::<Vec<_>>();
+    let host = HostTier {
+        records: vec![host_slots],
+        lent: vec![0],
+        reserve: 0,
+        placement: Placement::Tier { bank_maps, tier_maps, lent: (0, lent), stage_slots: vec![0] },
+    };
+    let mut directory = Directory::new(&[present], &[0, 0], &[experts, experts], host);
+    directory.configure_decode_budget(1, 2, 1);
+
+    let wb_price = Some(WriteBack {
+        terms: magnitude_cost_model::Terms { compute: 0.0, drive: 4.0, link: 0.0, cpu: 0.0, memory: 0.0 },
+        drive: 1.0,
+        link: 0.0,
+    });
+    for layer in 0..layers {
+        directory.price_copies(layer, Some(0.0));
+        directory.price_write_backs(layer, wb_price);
+    }
+
+    // Simulated byte storage for Host slots and VRAM slots to assert distinct patterns.
+    let mut host_bytes = vec![0x00u8; host_slots as usize];
+    let mut vram_bytes = vec![0x00u8; present];
+
+    // Place cold victim E_victim = (0, 0) into lent VRAM slot C (`0..lent`) and (0, 1) into slot 1,
+    // then surrender both Host copies so VRAM = {(0,0), (0,1)} are both Located::Lacked.
+    let steps = steps();
+    let step0 = steps.begin_group(1, None);
+    let mut initial_claims = Vec::new();
+    for expert in 0..2 {
+        let Claim::Taken(grant) = directory.claim_landing(0, expert, 0, Taking::Out, (|_, _| (), |_, _| true)) else {
+            panic!("host room");
+        };
+        directory.landed(0, HostRecord(grant.record()), expert, Some(step0));
+        let DemandSlotClaim::Allocated { staged, slot } =
+            directory.claim_demand_landing(0, grant.record(), false, |_| true)
+        else {
+            panic!("lent VRAM room");
+        };
+        assert!(directory.bank_lends(0, slot));
+        vram_bytes[slot] = if expert == 0 { 0xCC } else { 0xDD };
+        initial_claims.push((0usize, slot, staged, true));
+    }
+    log(&directory, step0, 0, &[0, 1]);
+    assert!(directory.finish_demand_landings_batch(&initial_claims, at(step0, 1), &steps));
+    steps.end_played(step0);
+    let slot_c = directory.held(0, 0).expect("victim C held in 0..lent");
+    assert!(directory.bank_lends(0, slot_c));
+    assert_eq!(vram_bytes[slot_c], 0xCC);
+
+    steps.unbegun(|at| directory.surrender_banked(at));
+    directory.retire_graces(past(step0), &steps);
+    assert_eq!(directory.located(0, 0), Located::Lacked);
+    assert_eq!(directory.located(0, 1), Located::Lacked);
+
+    // Fill BOTH Host slots (`0` ready): slot A holds E_miss = (0, 4) with byte pattern `0xAA`.
+    let Claim::Taken(grant_a) = directory.claim_landing(0, 4, 0, Taking::Out, (|_, _| (), |_, _| true)) else {
+        panic!("host room for E_miss");
+    };
+    let slot_a = grant_a.record();
+    host_bytes[slot_a as usize] = 0xAA;
+    directory.landed(0, HostRecord(slot_a), 4, Some(step0));
+    let Claim::Taken(grant_other) = directory.claim_landing(0, 5, 0, Taking::Out, (|_, _| (), |_, _| true)) else {
+        panic!("host room for (0, 5)");
+    };
+    host_bytes[grant_other.record() as usize] = 0x55;
+    directory.landed(0, HostRecord(grant_other.record()), 5, Some(step0));
+    assert_eq!(directory.host(0).ready(), 0);
+
+    // Make E_miss = (0, 4) hot and (0, 1) hotter than E_victim = (0, 0).
+    for _ in 0..5 {
+        let s = steps.begin_group(1, None);
+        log(&directory, s, 0, &[1, 4]);
+        steps.end_played(s);
+    }
+    assert!(directory.settle_changes());
+
+    // 1. Active zero-copy reader step is STILL at layer 0 (`progress = at(reader_step, 0)`):
+    //    `claim_demand_landing` takes slot B, and `finish_demand_landings_batch_with_reuse`
+    //    MUST NOT immediately reuse Host slot A while the zero-copy reader is outstanding!
+    let reader_step = steps.begin_group(1, None);
+    let DemandSlotClaim::Allocated { staged, slot: slot_b } =
+        directory.claim_demand_landing(0, slot_a, false, |_| true)
+    else {
+        panic!("expected Free VRAM slot B");
+    };
+    vram_bytes[slot_b] = host_bytes[slot_a as usize]; // H2D copy `0xAA`
+    let mut reclaimed = Vec::new();
+    let promoted_while_active = directory.finish_demand_landings_batch_with_reuse(
+        &[(0, slot_b, staged, true)],
+        at(reader_step, 0), // reader_step still at layer 0 -> `!is_served`!
+        &steps,
+        true,
+        &mut reclaimed,
+        |_, _| true,
+    );
+    assert!(!promoted_while_active, "must NOT evict VRAM-only victim or overwrite A while zero-copy reader is active on A");
+    assert!(reclaimed.is_empty(), "Host slot A must NOT be reclaimed while reader is active");
+    assert_eq!(directory.located(0, 4), Located::Kept(slot_a), "E_miss stays mapped in A for active zero-copy reader");
+    assert_eq!(host_bytes[slot_a as usize], 0xAA, "A's bytes remain intact for active zero-copy reader");
+    assert_eq!(directory.held(0, 0), Some(slot_c), "VRAM-only victim C untouched");
+    assert!(directory.backs_queued().is_empty());
+
+    // 2. Reader finishes layer 0 (`progress = at(reader_step, 1)`): re-claim B and finish ->
+    //    swap-on-promote succeeds cleanly!
+    let DemandSlotClaim::Allocated { staged, slot: slot_b2 } =
+        directory.claim_demand_landing(0, slot_a, false, |_| true)
+    else {
+        panic!("expected Free VRAM slot B2");
+    };
+    vram_bytes[slot_b2] = host_bytes[slot_a as usize];
+    let promoted_after_reader = directory.finish_demand_landings_batch_with_reuse(
+        &[(0, slot_b2, staged, true)],
+        at(reader_step, 1), // reader_step is strictly past layer 0!
+        &steps,
+        true,
+        &mut reclaimed,
+        |_, _| true,
+    );
+    assert!(promoted_after_reader, "swap-on-promote must succeed once zero-copy reader passed layer 0");
+    assert_eq!(reclaimed, vec![(0, slot_a as usize)]);
+    assert_eq!(directory.held(0, 4), Some(slot_b2));
+    assert_eq!(vram_bytes[slot_b2], 0xAA);
+    let backs = directory.backs_queued();
+    assert_eq!(backs.len(), 1);
+    let (wb_group, wb_rec, wb_staged, wb_tier) = backs[0];
+    assert_eq!((wb_group, wb_rec.index(), wb_staged, wb_tier), (0, slot_c, (0, 0), HostRecord(slot_a)));
+
+    // 3. Prompt lease arrives on `0..lent` (covering C!) while D2H WriteBack is queued/delayed:
+    //    `lease_bank_records` MUST skip Releasing slot C and MUST NOT overwrite C!
+    let scratch = ScratchGroup::at(reader_step + 1, 1);
+    directory.lease_bank_records(0, scratch, &[true; 2]);
+    assert!(!directory.lent(0, slot_c), "prompt lease MUST NOT take slot C while WriteBack is queued/in-flight");
+    assert_eq!(directory.located(0, 0), Located::Lacked, "E_victim must stay unmapped in Host until D2H completes");
+    assert_eq!(vram_bytes[slot_c], 0xCC, "C's bytes remain intact until D2H completes");
+
+    // 4. Delayed D2H WriteBack now executes (`C -> A`), completes, and drains:
+    directory.back_copy(wb_group, wb_rec, 42);
+    host_bytes[wb_tier.0 as usize] = vram_bytes[slot_c]; // D2H copies `0xCC` into A
+    directory.written_back(wb_group, wb_rec, true);
+    steps.end_played(reader_step);
+    assert!(directory.drain(past(reader_step), &steps));
+
+    // Now prompt lease claims C cleanly, while E_victim is intact in Host slot A!
+    directory.lease_bank_records(0, scratch, &[true; 2]);
+    assert!(directory.lent(0, slot_c), "slot C cleanly leased after delayed WriteBack completed and drained");
+    assert_eq!(directory.located(0, 0), Located::Kept(slot_a), "E_victim published in Host slot A after D2H");
+    assert_eq!(host_bytes[slot_a as usize], 0xCC, "Host slot A holds E_victim's exact byte pattern");
 }

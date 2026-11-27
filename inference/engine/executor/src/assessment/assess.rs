@@ -257,9 +257,9 @@ impl ExpertShares {
     /// its slots, so computing it again cannot fail.
     pub fn of(bank: &crate::planning::ExpertBankPlan) -> Self {
         Self::new(
-            bank.target_slots(bank.floor()),
-            bank.target_slots(bank.slots),
-            bank.widest(),
+            bank.floor(),
+            bank.slots,
+            NonZeroU64::new(bank.max_slots()).expect("a bank has positive max_slots"),
             match bank.host() {
                 crate::planning::HostTier::Linked if bank.host_slots > 0 => {
                     let cache_bytes = bank
@@ -315,7 +315,7 @@ impl ExpertShares {
             ColdSource::HostTier { slots, .. } => slots,
             ColdSource::File(_) => 0,
         };
-        HeldSlots { slots: count(slots), host: count(host) }
+        HeldSlots::tiered(count(slots), count(host))
     }
 
     /// The share of each routed layer's experts a load holds at least.
@@ -900,12 +900,12 @@ impl StructuralCharge {
     /// (`AssessmentGraphResourceBounds::at_pass_with_cache`), which no pass moves.
     pub fn idle_class_bytes(
         &self,
-        places: usize,
+        pass: crate::PassLaunches,
         limits: crate::ResourceLimits,
         fronts: bool,
     ) -> Result<u64, AssessmentError> {
         self.graph
-            .idle_class_bytes(places, limits, fronts)
+            .idle_class_bytes(pass, limits, fronts)
             .map_err(AssessmentError::Plan)
     }
 
@@ -1339,10 +1339,7 @@ impl<'a> BankPathPricer<'a> {
         })
     }
 
-    fn paths_at(&self, slots: u64) -> Result<crate::planning::BankPaths, AssessmentError> {
-        let slots = usize::try_from(slots)
-            .map_err(|_| AssessmentError::Memory("a bank's slots exceed usize".into()))?;
-        let held = HeldSlots::bank(slots);
+    fn paths_at(&self, held: &HeldSlots) -> Result<crate::planning::BankPaths, AssessmentError> {
         let saturation_bytes = seismic_io::disk::FULL_DEPTH * seismic_io::disk::FULL_READ;
         let records = self
             .layers
@@ -1453,7 +1450,7 @@ fn settle_bank_rung(
         .expect("a bank form holds an expert bank");
     let holds = |fit: &crate::AssessmentFit| matches!(fit.verdict, AssessmentFitVerdict::Fits);
     let initial = match path_pricer {
-        Some(pricer) => pricer.paths_at(bank_plan.target_slots(ceiling_slots))?,
+        Some(pricer) => pricer.paths_at(&bank_plan.held_slots(ceiling_slots, 0))?,
         None => bank_plan.paths,
     };
     let (paths, settled, _) = crate::planning::settle_bank_paths(initial, |paths| {
@@ -1497,7 +1494,7 @@ fn settle_bank_rung(
         }
         let (slots, (charge, fit)) = (lo, best);
         let next = match path_pricer {
-            Some(pricer) => pricer.paths_at(bank_plan.target_slots(slots))?,
+            Some(pricer) => pricer.paths_at(&bank_plan.held_slots(slots, 0))?,
             None => paths,
         };
         Ok((Ok((slots, charge, fit)), Some(next)))
@@ -1653,7 +1650,7 @@ pub fn assess_execution_fit_with_priced_bank(
             .expert_bank()
             .expect("a bank form holds an expert bank");
         let whole_paths = match &path_pricer {
-            Some(pricer) => pricer.paths_at(bank.experts)?,
+            Some(pricer) => pricer.paths_at(&bank_plan.held_slots(bank.experts, 0))?,
             None => bank_plan.paths,
         };
         let charge = bank.form.structure.charge_at_slots_places_and_paths(

@@ -140,6 +140,7 @@ pub fn streamed_figures() -> super::StreamedFigures {
         site: None,
         convert: 1.0 / 100e9,
         transfer: None,
+        routed_zerocopy: None,
     }
 }
 

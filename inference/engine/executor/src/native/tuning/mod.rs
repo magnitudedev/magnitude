@@ -3021,10 +3021,33 @@ impl<'a> allocation::Unit for Box<dyn SearchedUnit<'a> + 'a> {
             .filter(|(_, member)| **member)
             .map(|(unit, _)| unit.times(terms))
             .collect::<Vec<_>>();
+        // Scale each term's weight by its discovered launch coverage so a
+        // partially discovered term (e.g. prefill after heavy `routed_experts`
+        // units departed undiscovered) never inflates its remaining discovered
+        // units' shares above fully-discovered decode/verify routed units.
+        let mut discovered_launches = vec![0.0_f64; terms];
+        let mut total_launches = vec![0.0_f64; terms];
+        for (unit, &member) in units.iter().zip(members) {
+            let counts = unit.launches(terms);
+            for term in 0..terms {
+                total_launches[term] += counts[term];
+                if member {
+                    discovered_launches[term] += counts[term];
+                }
+            }
+        }
         let weights = objective
             .terms
             .iter()
-            .map(|term| term.weight)
+            .enumerate()
+            .map(|(idx, term)| {
+                let coverage = if total_launches[idx] > 0.0 {
+                    discovered_launches[idx] / total_launches[idx]
+                } else {
+                    1.0
+                };
+                term.weight * coverage
+            })
             .collect::<Vec<_>>();
         objective.measured = (0..terms)
             .map(|term| times.iter().map(|unit| unit[term]).sum())

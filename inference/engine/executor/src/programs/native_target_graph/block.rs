@@ -282,6 +282,10 @@ pub(crate) struct PreparedTargetBlockGraph<P = Option<SplitPorts>> {
     /// The operand its mixer's projection reads, formed by the block before
     /// (`BlockCarries::carry_in`).
     pub operand_in: Option<CarryPorts>,
+    /// Unified CUDA 3-tier streamed decode ports and top-level `WAIT_VALUE_32`
+    /// / `WRITE_VALUE_32(completed_gen)` timeline nodes (present on `RunStage::Whole`
+    /// decode graphs of partial CUDA `Placer::Tier` banks).
+    pub unified_decode: Option<crate::operators::routed::streamed::UnifiedDecodePorts>,
 }
 
 /// A sealed block graph, by the ports its stage formed: a run's stage's or
@@ -348,16 +352,14 @@ impl SealedBlockGraph {
         let mut constants = Vec::new();
         let mut banks = Vec::new();
         let mut parks = Vec::new();
-        let decode_hits_allowed = inputs.served.decode_hits;
+        let mut unified_decode = None;
+        let use_unified = inputs.bank_unified_decode(device.backend());
         let bank = layer_bank(
             stage,
-            handle.bank.as_ref().map(|bank| {
-                let mut entries = BankGraphEntries::for_backend(bank, device.backend());
-                entries.masked_down_project &= decode_hits_allowed;
-                entries
-            }),
+            handle.bank.as_ref().map(|bank| BankGraphEntries::for_backend(bank, device.backend())),
             &mut banks,
             &mut parks,
+            use_unified.then_some(&mut unified_decode),
         );
         let (shape, numbers) = inputs
             .constant_split(slot, &bank, tap.as_ref().map(|(width, tap)| (*width, tap.positions)), forms)
@@ -387,9 +389,11 @@ impl SealedBlockGraph {
             &mut constants,
         )
         .map_err(text)?;
-        // A graph sealed once (or DecodeHits, which writes only crossing ports)
-        // stores what it computes; other runs export their carry.
-        if matches!(stage, Stage::Run(run) if run != RunStage::DecodeHits) {
+        if let Some(unified) = &mut unified_decode {
+            unified.completed_gen = Some(graph.timeline(seismic::timeline::Signal));
+        }
+        // A graph sealed once stores what it computes; other runs export their carry.
+        if matches!(stage, Stage::Run(_)) {
             graph.export(&parts.output.rows).map_err(|error| error.to_string())?;
             if let Some(pre) = &parts.output.pre {
                 graph.export(pre).map_err(|error| error.to_string())?;
@@ -432,6 +436,7 @@ impl SealedBlockGraph {
                     output: parts.output,
                     operand: parts.operand,
                     operand_in: parts.operand_in,
+                    unified_decode,
                 })
             };
         }
@@ -714,35 +719,9 @@ impl<'a> BlockGraphInputs<'a> {
         // in either form of a streamed block (`RunStage::Resident`).
         let carries = match stage {
             Stage::Run(RunStage::Whole | RunStage::Resident) if rows == CARRIED_ROWS => carries.sized(),
-            Stage::Run(RunStage::DecodeFront) if rows == CARRIED_ROWS => BlockCarries {
-                carry_in: carries.sized().carry_in,
-                carry_out: None,
-            },
-            Stage::Run(RunStage::DecodeBack) if rows == CARRIED_ROWS => BlockCarries {
-                carry_in: None,
-                carry_out: carries.sized().carry_out,
-            },
             _ => BlockCarries::default(),
         };
-        let decode_hits_shared = match &sublayers.feed_forward {
-            Some((_, crate::operators::block::FeedForwardTopology::GeneralRouted(t))) => t.form.shared.is_some(),
-            Some((_, crate::operators::block::FeedForwardTopology::Parallel(t))) => t.routed.form.shared.is_some(),
-            _ => false,
-        };
-        let decode_back_skips_hidden = matches!(stage, Stage::Run(RunStage::DecodeBack))
-            && bank.can_split_decode_hits()
-            && matches!(
-                &sublayers.feed_forward,
-                Some((
-                    None | Some(crate::operators::block::ReadTopology::Norm),
-                    crate::operators::block::FeedForwardTopology::GeneralRouted(t),
-                )) if t.form.shared.is_some()
-            );
-        let input = match stage {
-            Stage::Run(RunStage::DecodeHits) if !decode_hits_shared => None,
-            Stage::Run(RunStage::DecodeBack) if decode_back_skips_hidden => None,
-            _ => stage_input(geometry, block_index, stage)?,
-        };
+        let input = stage_input(geometry, block_index, stage)?;
         Ok((
             BlockShape {
                 stage,
@@ -765,6 +744,19 @@ impl<'a> BlockGraphInputs<'a> {
         ))
     }
 
+    /// Whether this block's streamed bank layer seals the unified CUDA 3-tier
+    /// decode graph (`RunStage::Whole` on decode rows of a partial `Placer::Tier`
+    /// bank with `routed_stage_host` + top-level `WAIT_VALUE_32` / `WRITE_VALUE_32`).
+    fn bank_unified_decode(&self, backend: BackendName) -> bool {
+        if self.stage != Stage::Run(RunStage::Whole)
+            || !crate::operators::routed::fused_graph::decodes(self.rows)
+        {
+            return false;
+        }
+        self.load
+            .expert_bank()
+            .is_some_and(|bank| bank.decode_dma(backend))
+    }
     /// The block graph's split (`split`) as a graph is built from it at the
     /// model's own numbers: its reals and tables constant, its carries in
     /// the forms `forms` gives (`BlockCarries::formed`), its numbers
@@ -810,11 +802,12 @@ fn layer_bank<'p, 'a, G: GraphDraft + 'a>(
     entries: Option<BankGraphEntries<'a, G>>,
     ports: &'p mut Vec<(BankPort, NativePort)>,
     parks: &'p mut Vec<(GraphTimeline, NativeTimelinePort<seismic::timeline::Parks>)>,
+    unified: Option<&'p mut Option<crate::operators::routed::streamed::UnifiedDecodePorts>>,
 ) -> LayerBank<'p, 'a, G> {
     match (stage, entries) {
         (Stage::Run(RunStage::Resident), Some(_)) => LayerBank::Home,
         (Stage::Run(RunStage::Resident), None) => panic!("a resident form of a block whose experts are held whole"),
-        (_, Some(entries)) => LayerBank::Streamed(BankGraph { entries, ports, parks }),
+        (_, Some(entries)) => LayerBank::Streamed(BankGraph { entries, ports, parks, unified }),
         (_, None) => LayerBank::Held,
     }
 }
@@ -836,10 +829,8 @@ pub(super) fn stage_input(geometry: &Decoder, block_index: usize, stage: Stage) 
         _ => ResidualCarry::rows(geometry.hidden),
     };
     Ok(match stage {
-        Stage::Run(RunStage::Whole | RunStage::Resident | RunStage::Front | RunStage::DecodeFront) => {
-            Some(carry(block_index > 0))
-        }
-        Stage::Run(RunStage::Combine | RunStage::DecodeHits | RunStage::DecodeBack) => Some(carry(true)),
+        Stage::Run(RunStage::Whole | RunStage::Resident | RunStage::Front) => Some(carry(block_index > 0)),
+        Stage::Run(RunStage::Combine) => Some(carry(true)),
         Stage::Once(_) => None,
     })
 }
@@ -989,10 +980,10 @@ fn block_graph<'a, G: GraphDraft + 'a>(
         return Err("a block reads a carried operand of residual streams".into());
     }
     let mut operand_in = None;
-    // A back (or DecodeHits) reads the carry its front's mixer left, if needed.
+    // A back reads the carry its front's mixer left, if needed.
     let (mixed, mut state_ports) = match stage {
-        RunStage::Combine | RunStage::DecodeHits | RunStage::DecodeBack => (hidden, BlockState::default()),
-        RunStage::Whole | RunStage::Resident | RunStage::Front | RunStage::DecodeFront => {
+        RunStage::Combine => (hidden, BlockState::default()),
+        RunStage::Whole | RunStage::Resident | RunStage::Front => {
             let hidden_ports = hidden_ports.ok_or("a block graph of no input rows")?;
             let hidden = hidden.expect("hidden ports imply hidden carry");
             if let Some(taps) = taps.as_mut().filter(|taps| taps.positions.entry) {
@@ -1065,9 +1056,8 @@ fn block_graph<'a, G: GraphDraft + 'a>(
     )?;
     let operand = operand.map(|(_, ports, _)| ports);
     let ports = StagePorts::Run(split.map(SplitBuild::into_ports));
-    // A front (or DecodeHits) ends before post-FFN sublayers: its output is
-    // the residual carry it mixed / read.
-    if matches!(stage, RunStage::Front | RunStage::DecodeFront | RunStage::DecodeHits) {
+    // A front ends before post-FFN sublayers: its output is the residual carry it mixed.
+    if matches!(stage, RunStage::Front) {
         return Ok(BlockGraphParts {
             residual: None,
             output,
@@ -1167,7 +1157,6 @@ impl CheckedBlockEntries {
         state: &StateResourcePlan,
         backend: BackendName,
         slot: TargetBlockProgramSlot,
-        decode_hits_allowed: bool,
     ) -> Result<Self, GraphError> {
         Ok(Self {
             mixer: block::CheckedMixerEntries::new(slot.mixer(), backend, slot_lists(state, backend, slot))?,
@@ -1177,13 +1166,7 @@ impl CheckedBlockEntries {
                 .transpose()?,
             bank: slot
                 .bank()
-                .map(|(feed_forward, bank)| {
-                    CheckedBankEntries::new(feed_forward, bank, backend)
-                        .map(|mut checked| {
-                            checked.set_masked_down_project(decode_hits_allowed);
-                            checked
-                        })
-                })
+                .map(|(feed_forward, bank)| CheckedBankEntries::new(feed_forward, bank, backend))
                 .transpose()?,
             per_layer: slot.per_layer().map(CheckedPerLayerEntries::new).transpose()?,
             ngram: slot.ngram().map(CheckedNGramEntries::new),
@@ -1201,6 +1184,7 @@ fn checked_block_graph<G: ElementBoundDraft + 'static>(
     shape: &BlockShape,
     numbers: &BlockNumbers,
     planned: &(impl PlannedWeights + ?Sized),
+    use_unified: bool,
 ) -> Result<(G, Vec<GraphConstant>, HostHeap), GraphError> {
     let mut weights = Vec::new();
     let mut constants = Vec::new();
@@ -1215,7 +1199,14 @@ fn checked_block_graph<G: ElementBoundDraft + 'static>(
     let tap_elements = [("A", shape.activation)];
     let mut banks = Vec::new();
     let mut parks = Vec::new();
-    let bank = layer_bank(shape.stage, entries.bank.as_ref().map(CheckedBankEntries::entries::<G>), &mut banks, &mut parks);
+    let mut unified_decode = None;
+    let bank = layer_bank(
+        shape.stage,
+        entries.bank.as_ref().map(CheckedBankEntries::entries::<G>),
+        &mut banks,
+        &mut parks,
+        use_unified.then_some(&mut unified_decode),
+    );
     let parts = block_graph(
         &mut graph,
         BlockEntries {
@@ -1244,7 +1235,10 @@ fn checked_block_graph<G: ElementBoundDraft + 'static>(
         &mut weights,
         &mut constants,
     )?;
-    if matches!(shape.stage, Stage::Run(run) if run != RunStage::DecodeHits) {
+    if let Some(unified) = &mut unified_decode {
+        unified.completed_gen = Some(graph.timeline(seismic::timeline::Signal));
+    }
+    if matches!(shape.stage, Stage::Run(_)) {
         GraphDraft::export(&mut graph, &parts.output.rows)?;
         if let Some(pre) = &parts.output.pre {
             GraphDraft::export(&mut graph, pre)?;
@@ -1271,10 +1265,12 @@ pub(super) fn probe_block_axes(
     max_segments: u64,
     listed: bool,
 ) -> Result<super::classes::ClassAxes, GraphError> {
-    let entries = CheckedBlockEntries::new(base_inputs.state, backend, slot, base_inputs.served.decode_hits)?;
+    let entries = CheckedBlockEntries::new(base_inputs.state, backend, slot)?;
     let planned = base_inputs.weights()?;
     let probe = |inputs: &BlockGraphInputs<'_>| -> Result<u64, GraphError> {
         let (mut banks, mut parks) = (Vec::new(), Vec::new());
+        let use_unified = inputs.bank_unified_decode(backend);
+        let mut unified_decode = None;
         let bank = layer_bank(
             inputs.stage,
             entries
@@ -1283,6 +1279,7 @@ pub(super) fn probe_block_axes(
                 .map(CheckedBankEntries::entries::<crate::programs::graph::sizing::AxisProbeDraft>),
             &mut banks,
             &mut parks,
+            use_unified.then_some(&mut unified_decode),
         );
         let (shape, numbers) = inputs.constant_split(slot, &bank, tap, |_| Ok(()))?;
         let (draft, _, _) = checked_block_graph(
@@ -1291,6 +1288,7 @@ pub(super) fn probe_block_axes(
             &shape,
             &numbers,
             &planned,
+            use_unified,
         )?;
         Ok(draft.fingerprint())
     };
@@ -1329,7 +1327,7 @@ pub(super) fn certify_block_group<L: Certified>(
     base_inputs: &BlockGraphInputs<'_>,
     classes: &[StagedClass],
 ) -> Result<(L, Vec<(u64, Vec<GraphConstant>)>, HostHeap), GraphError> {
-    let entries = CheckedBlockEntries::new(base_inputs.state, backend, slot, base_inputs.served.decode_hits)?;
+    let entries = CheckedBlockEntries::new(base_inputs.state, backend, slot)?;
     let planned = base_inputs.weights()?;
     let (layout, aux) = L::certify_group(backend, classes, |draft, staged| {
         let ((rows, segments, slots, listed, scored), stage) = staged;
@@ -1343,14 +1341,17 @@ pub(super) fn certify_block_group<L: Certified>(
             ..*base_inputs
         };
         let (mut banks, mut parks) = (Vec::new(), Vec::new());
+        let use_unified = inputs.bank_unified_decode(backend);
+        let mut unified_decode = None;
         let bank = layer_bank(
             inputs.stage,
             entries.bank.as_ref().map(CheckedBankEntries::entries::<L::Draft>),
             &mut banks,
             &mut parks,
+            use_unified.then_some(&mut unified_decode),
         );
         let (shape, numbers) = inputs.constant_split(slot, &bank, tap, |_| Ok(()))?;
-        let (graph, constants, owned) = checked_block_graph(draft, &entries, &shape, &numbers, &planned)?;
+        let (graph, constants, owned) = checked_block_graph(draft, &entries, &shape, &numbers, &planned, use_unified)?;
         Ok((graph, (rows, constants, owned)))
     })?;
     let owned = aux.first().map(|(_, _, owned)| *owned).unwrap_or_default();
@@ -1369,12 +1370,21 @@ pub(super) fn checked_block_graph_draft(
     tap: Option<(u64, TapPositions)>,
     inputs: BlockGraphInputs<'_>,
 ) -> Result<(NativeGraphMetadata, Vec<GraphConstant>, HostHeap), GraphError> {
-    let entries = CheckedBlockEntries::new(inputs.state, graph.backend(), slot, inputs.served.decode_hits)?;
+    let backend = graph.backend();
+    let entries = CheckedBlockEntries::new(inputs.state, backend, slot)?;
     let (mut banks, mut parks) = (Vec::new(), Vec::new());
-    let bank = layer_bank(inputs.stage, entries.bank.as_ref().map(CheckedBankEntries::entries::<NativeGraphMetadata>), &mut banks, &mut parks);
+    let use_unified = inputs.bank_unified_decode(backend);
+    let mut unified_decode = None;
+    let bank = layer_bank(
+        inputs.stage,
+        entries.bank.as_ref().map(CheckedBankEntries::entries::<NativeGraphMetadata>),
+        &mut banks,
+        &mut parks,
+        use_unified.then_some(&mut unified_decode),
+    );
     let (shape, numbers) = inputs.constant_split(slot, &bank, tap, |_| Ok(()))?;
     let planned = inputs.weights()?;
-    checked_block_graph(graph, &entries, &shape, &numbers, &planned)
+    checked_block_graph(graph, &entries, &shape, &numbers, &planned, use_unified)
 }
 
 #[cfg(test)]
@@ -1516,14 +1526,17 @@ pub(super) fn checked_block_graph_audit_ports(
     tap: Option<(u64, TapPositions)>,
     inputs: BlockGraphInputs<'_>,
 ) -> Result<NativeGraphMetadata, String> {
-    let entries = CheckedBlockEntries::new(inputs.state, backend, slot, inputs.served.decode_hits).map_err(|e| e.to_string())?;
+    let entries = CheckedBlockEntries::new(inputs.state, backend, slot).map_err(|e| e.to_string())?;
     let mut graph = PortAuditDraft::new(backend);
     let (mut weights, mut constants, mut banks, mut parks) = (Vec::new(), Vec::new(), Vec::new(), Vec::new());
+    let use_unified = inputs.bank_unified_decode(backend);
+    let mut unified_decode = None;
     let bank = layer_bank(
         inputs.stage,
         entries.bank.as_ref().map(CheckedBankEntries::entries::<PortAuditDraft>),
         &mut banks,
         &mut parks,
+        use_unified.then_some(&mut unified_decode),
     );
     let (shape, numbers) = inputs.constant_split(slot, &bank, tap, |_| Ok(())).map_err(|e| e.to_string())?;
     let planned = inputs.weights().map_err(|e| e.to_string())?;
@@ -1593,26 +1606,6 @@ pub(super) fn checked_block_graph_audit_ports(
             bound.insert(b.experts.ordinal());
             bound.insert(b.inverse.ordinal());
         }
-        StagePorts::Run(Some(
-            SplitPorts::DecodeFront(p) | SplitPorts::DecodeHits(p) | SplitPorts::DecodeBack(p),
-        )) => {
-            for opt in [
-                &p.routes,
-                &p.weights,
-                &p.normalized,
-                &p.coefficient,
-                &p.shared_product,
-                &p.base,
-                &p.published,
-                &p.join,
-                &p.pre,
-                &p.sources,
-            ] {
-                if let Some(port) = opt {
-                    bound.insert(port.ordinal());
-                }
-            }
-        }
         StagePorts::Run(None) => {}
         StagePorts::Pass(p, _) => {
             for port in p.crossing.iter() {
@@ -1623,6 +1616,11 @@ pub(super) fn checked_block_graph_audit_ports(
             bound.insert(p.rows.ordinal());
             bound.insert(p.first.ordinal());
         }
+    }
+    if let Some(unified) = &unified_decode {
+        bound.insert(unified.front_sources.ordinal());
+        bound.insert(unified.back_sources.ordinal());
+        bound.insert(unified.ready_slot.ordinal());
     }
     if let Some(history) = &parts.state.history {
         for p in &history.planes {

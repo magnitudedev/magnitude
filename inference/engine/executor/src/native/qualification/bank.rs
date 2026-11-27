@@ -82,7 +82,9 @@ pub(super) fn qualify_bank(
         pass_map,
         placement,
         site,
+        combine: _,
         gate_up,
+        stage_host: _,
     } = kernels;
     let served = Served::of(banked, route, feed_forward, label)?;
     let mut records = binding
@@ -1091,6 +1093,7 @@ mod tests {
         ExpertBankKernels {
             route,
             land,
+            stage_host: None,
             step: prepare(device, routed_step::native_entry(), &[]),
             scratch_request: prepare(device, routed_scratch_request::native_entry(), &[&[("K", bank.selected), ("E", bank.widest)], scratch.as_slice()].concat()),
             round: prepare(device, routed_round::native_entry_with(routed_round::Elements {
@@ -1111,6 +1114,7 @@ mod tests {
                 list_grid: prepare(device, routed_list_grid::native_entry(), &[]),
             },
             site: None,
+            combine: None,
             // A gated record's passes, at the activations the fixtures
             // route in.
             gate_up: gated.map(|gate| {
@@ -1350,14 +1354,14 @@ mod tests {
             };
             kernels.site = Some(BankSite {
                 request: prepare(&device, routed_site_request::native_entry_with(routed_site_request::Elements { A: bf16 }), &statics),
-                combine: BankCombine::General {
-                    project: every_row(
-                        prepare(&device, routed_down_project::native_entry_with(routed_down_project::Elements { EDW: q8, A: bf16 }), &statics),
-                    ),
-                    sited: prepare(&device, routed_down_sited::native_entry_with(routed_down_sited::Elements { A: bf16, R: f32 }), &statics),
-                },
                 form,
                 admitted: None,
+            });
+            kernels.combine = Some(BankCombine::General {
+                project: every_row(
+                    prepare(&device, routed_down_project::native_entry_with(routed_down_project::Elements { EDW: q8, A: bf16 }), &statics),
+                ),
+                sited: prepare(&device, routed_down_sited::native_entry_with(routed_down_sited::Elements { A: bf16, R: f32 }), &statics),
             });
         }
         let site = kernels.site.as_ref().map(|site| site.form);

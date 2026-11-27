@@ -174,9 +174,17 @@ impl<'a> Held<'a> {
 
     /// Given first to every holder waiting for it (the keeper's, between
     /// its jobs: [`Yielding::give_way`]), released as every holder is.
-    fn give_way(self, residency: &'a Yielding<Residency>) -> Self {
+    pub(super) fn give_way(self, residency: &'a Yielding<Residency>) -> Self {
         let publish = self.publish_on_drop;
         residency.give_way(self, POISONED, |held| Self::new(held, publish))
+    }
+
+    /// Yield a foreground holder (`Requests::serve`) once when another
+    /// foreground holder (e.g. `DecodeReactor`) is waiting, re-acquiring as a
+    /// foreground holder so `Residency::keep` can never starve it.
+    pub(super) fn yield_to_waiters(self, residency: &'a Yielding<Residency>) -> Self {
+        let publish = self.publish_on_drop;
+        residency.yield_to_waiters(self, POISONED, |held| Self::new(held, publish))
     }
 }
 
@@ -429,6 +437,7 @@ impl Residency {
                 _ => None,
             };
             let draft = matches!(&event, Told::DraftWindow { .. });
+            let draft_tokens = matches!(&event, Told::DraftTokens { .. });
             let closed_request = match &event {
                 Told::Closed(request) => Some(*request),
                 _ => None,
@@ -441,26 +450,14 @@ impl Residency {
                 let engagement = self.shared.telemetry.engagement();
                 for (layer, choices) in chose.iter_mut().enumerate() {
                     let layer_bytes = self.core.layers[layer].expert_bytes();
-                    let (gpu_host_misses, cpu_sited) =
+                    let (gpu_host_misses, _) =
                         layer_misses.get(layer).copied().unwrap_or((0, 0));
-                    let census = crate::experts::transport::DecodeLayerCensus {
-                        mode: crate::experts::transport::DecodeLayerMode::Whole,
-                        rows: physical_rows,
-                        gpu_host_misses,
-                        cpu_sited,
-                        dma_landed: 0,
-                        dma_joined: 0,
-                        dma_overflow: 0,
-                        expert_bytes: layer_bytes,
-                    };
-                    if self.shared.transport.observe_decode_layer_census(step, layer, census) {
-                        let group = self.core.directory.layer_groups()[layer];
-                        self.core.directory.observe_demand_misses(
-                            group,
-                            gpu_host_misses as usize,
-                            physical_rows as usize,
-                        );
-                    }
+                    let group = self.core.directory.layer_groups()[layer];
+                    self.core.directory.observe_demand_misses(
+                        group,
+                        gpu_host_misses as usize,
+                        physical_rows as usize,
+                    );
                     for chosen in choices.iter_mut() {
                         if let Some(lp) = self.prefetch.take_landed_prefetch((layer, chosen.expert)) {
                             engagement.record_landed_hit(lp.bytes, lp.carryover);
@@ -471,13 +468,18 @@ impl Residency {
                         }
                     }
                 }
-                self.prefetch.prune_evicted_prefetches(&self.core, &self.shared);
+                self.prefetch.prune_evicted_prefetches(&mut self.core, &self.shared);
             }
             let _ = self.ledger.tell(event);
+            if began_step.is_some() || draft_tokens {
+                self.core
+                    .directory
+                    .set_token_reads(self.ledger.token_protected().iter().copied());
+            }
             if let Some(step) = began_step {
                 if let Some((step, m_active)) = decode_began {
                     self.core.directory.set_decode_rows(m_active);
-                    self.prefetch.decode_step_began(step, m_active, &self.shared);
+                    self.prefetch.decode_step_began(step, &self.shared);
                 }
                 self.prefetch.on_began(step);
             } else if draft {
@@ -489,12 +491,14 @@ impl Residency {
             }
             let _ = completed;
             if let Some(request) = closed_request {
+                self.core.directory.clear_token_reads();
                 self.shared.telemetry.engagement().on_draft_window(false, Instant::now());
-                self.prefetch.prune_evicted_prefetches(&self.core, &self.shared);
+                self.prefetch.prune_evicted_prefetches(&mut self.core, &self.shared);
+                self.prefetch.on_request_closed();
                 let site_served = self.shared.compute.site_served();
                 let mut residency = self.shared.telemetry.residency();
                 residency.vram_held = (0..self.core.layers.len())
-                    .map(|layer| self.core.directory.held_count(layer) as u64)
+                    .map(|layer| self.core.directory.tier0_held_count(layer) as u64)
                     .sum();
                 residency.vram_capacity = self
                     .core
@@ -781,7 +785,7 @@ impl Residency {
         if !directory.refill_short() {
             return false;
         }
-        let victims = directory.refill_victims(steps.lending());
+        let victims = directory.refill_victims_cached(steps.lending());
         if victims.iter().all(Vec::is_empty) {
             return false;
         }
@@ -1079,15 +1083,15 @@ impl Residency {
         // served one (`Telemetry::refined`), the job's before; the
         // assignment weighs it against the GPU's at those prices alone.
         let all_groups_whole = self.core.directory.all_groups_whole();
-        let active_rows = self.core.directory.decode_rows() as u64;
+        let has_decode_dma = !all_groups_whole && self.shared.transport.has_decode_dma();
         for group in 0..self.core.groups.len() {
-            let splits = !all_groups_whole
+            let active = has_decode_dma
                 && self
                     .core
                     .directory
                     .group_layers(group)
-                    .any(|layer| !self.core.layers[layer].draft && self.shared.transport.is_splitting_decode(layer, active_rows));
-            self.core.directory.set_group_splitting(group, splits);
+                    .any(|layer| !self.core.layers[layer].draft);
+            self.core.directory.set_group_splitting(group, active);
         }
         let mut initial_log = None;
         let words = self
@@ -1096,25 +1100,27 @@ impl Residency {
             .iter()
             .enumerate()
             .map(|(index, layer)| {
-                let layer_decode_dma = !all_groups_whole && self.shared.transport.is_splitting_decode(index, active_rows);
+                let layer_decode_dma = has_decode_dma && !layer.draft;
                 let adjusted = priced.as_ref().map(|lines| decode_dma_lines(lines[index], copy.as_ref(), layer_decode_dma));
                 let site = match (&layer.site, adjusted.as_ref().and_then(|lines| lines.host.cpu.as_ref())) {
                     (None, _) => SiteLines::Unsited,
                     (Some(_), None) => SiteLines::Pending,
                     (Some(_), Some(cpu)) => SiteLines::Measured(cpu),
                 };
-                let policy_words = ExpertLines::policy(&crate::assessment::POLICY_LAYOUT, site, adjusted.as_ref());
+                let mut policy_words = ExpertLines::policy(&crate::assessment::POLICY_LAYOUT, site, adjusted.as_ref());
+                let ce_min = self.shared.transport.tier_ce_min_experts(index) as i32;
+                policy_words.push((magnitude_kernels::constants::POLICY_CE_MIN_EXPERTS as usize, ce_min));
                 if index == 0 && !self.logged_initial_lines && adjusted.is_some() {
                     let word = |of: usize| policy_words.iter().find_map(|&(word, value)| (word == of).then_some(value));
                     let layout = &crate::assessment::POLICY_LAYOUT;
-                    initial_log = Some((layer_decode_dma, word(layout.link), word(layout.link_contended), word(layout.cpu)));
+                    initial_log = Some((layer_decode_dma, ce_min, word(layout.link), word(layout.link_contended), word(layout.cpu)));
                 }
                 policy_words
             })
             .collect::<Vec<_>>();
-        if let Some((split_dma, link_ns, link_contended_ns, cpu_ns)) = initial_log {
+        if let Some((unified_dma, ce_min, link_ns, link_contended_ns, cpu_ns)) = initial_log {
             self.logged_initial_lines = true;
-            tracing::info!("expert pricing (layer 0): split_dma={split_dma} POLICY_LINK_NS={link_ns:?} POLICY_LINK_CONTENDED_NS={link_contended_ns:?} POLICY_CPU_NS={cpu_ns:?}");
+            tracing::info!("expert pricing (layer 0): unified_dma={unified_dma} POLICY_CE_MIN_EXPERTS={ce_min} POLICY_LINK_NS={link_ns:?} POLICY_LINK_CONTENDED_NS={link_contended_ns:?} POLICY_CPU_NS={cpu_ns:?}");
         }
         if self.lines.as_ref() == Some(&words) {
             return;
@@ -1238,8 +1244,20 @@ fn decode_dma_lines(mut lines: ExpertLines, copy: Option<&crate::assessment::Tie
         .filter(|ns| ns.is_finite() && *ns > 0.0)
         .map(|ns| ns.max(dma_ns));
     let mut dma_priced = lines;
+    let zc_ns = copy
+        .routed_zerocopy_byte_seconds
+        .filter(|bs| bs.is_finite() && *bs > 0.0)
+        .map_or(lines.gpu.link.weights.get(), |bs| {
+            (lines.host.record_bytes as f64 * bs * 1e9).max(lines.gpu.link.weights.get())
+        });
+    if zc_ns > lines.gpu.link.weights.get() {
+        if let Ok(ns) = magnitude_cost_model::Nanoseconds::try_from(zc_ns.round() as u32) {
+            lines.gpu.link.weights = ns;
+            dma_priced.gpu.link.weights = ns;
+        }
+    }
     let landed_ns = dma_ns + lines.gpu.resident.weights.get();
-    let uses_dma_link = landed_ns.is_finite() && landed_ns > 0.0 && landed_ns < lines.gpu.link.weights.get();
+    let uses_dma_link = landed_ns.is_finite() && landed_ns > 0.0 && landed_ns < zc_ns;
     if uses_dma_link {
         if let Ok(ns) = magnitude_cost_model::Nanoseconds::try_from(landed_ns.round() as u32) {
             dma_priced.gpu.link.weights = ns;
@@ -1357,7 +1375,7 @@ mod tests {
             },
         };
         let line = ReadLine::new(0.0, 1.0 / 48e9).unwrap();
-        let copy = crate::assessment::TierCopyCosts { blocks: 0, whole_seconds: 0.0, stall_share: 0.0, transfer: line, back: line, concurrent_host_byte_seconds: None, concurrent_dma_byte_seconds: None };
+        let copy = crate::assessment::TierCopyCosts { blocks: 0, whole_seconds: 0.0, stall_share: 0.0, transfer: line, back: line, concurrent_host_byte_seconds: None, concurrent_dma_byte_seconds: None, routed_zerocopy_byte_seconds: None };
         let landed = decode_dma_lines(lines, Some(&copy), true);
         assert_eq!(landed.gpu.link.weights.get() as u64, 77_500);
         assert_eq!(landed.host, lines.host);
@@ -1377,6 +1395,7 @@ mod tests {
             back: gen5_line,
             concurrent_host_byte_seconds: Some(1.0 / 42.0e9),
             concurrent_dma_byte_seconds: None,
+            routed_zerocopy_byte_seconds: None,
         };
         let gen5_lines = ExpertLines {
             gpu: GpuLines {
@@ -1422,6 +1441,7 @@ mod tests {
             back: gen5_transfer,
             concurrent_host_byte_seconds: Some(1.0 / 42.0e9),
             concurrent_dma_byte_seconds: None,
+            routed_zerocopy_byte_seconds: None,
         };
         // DSpark draft layer: 18.84 MB/expert MXFP4, SM zero-copy link ~1.7 ms, resident ~40 µs.
         let dspark_bytes = 18_840_000u64;
@@ -1483,6 +1503,7 @@ mod tests {
             back: gen4_transfer,
             concurrent_host_byte_seconds: Some(1.0 / 36.9e9),
             concurrent_dma_byte_seconds: None,
+            routed_zerocopy_byte_seconds: None,
         };
         for layer_decode_dma in [true, false] {
             let adjusted = decode_dma_lines(draft_lines, Some(&gen4_copy), layer_decode_dma);
@@ -1506,6 +1527,7 @@ mod tests {
             back: ddr4_transfer,
             concurrent_host_byte_seconds: Some(1.0 / 26.0e9),
             concurrent_dma_byte_seconds: Some(1.0 / 11.0e9),
+            routed_zerocopy_byte_seconds: None,
         };
         let ddr4_lines = ExpertLines {
             gpu: GpuLines {

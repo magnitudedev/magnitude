@@ -161,7 +161,9 @@ impl Look {
         (0..self.layers.len())
             .filter_map(|layer| {
                 let sequence = self.request(shared, layer)?;
-                Some(self.post(sequence, layer, began))
+                let posted = self.post(sequence, layer, began);
+                shared.telemetry.engagement().on_layer_request(posted.noticed);
+                Some(posted)
             })
             .collect()
     }

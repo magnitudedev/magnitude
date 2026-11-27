@@ -10,16 +10,16 @@
 //! The device's request is a word it writes, which the host sees only by
 //! reading it: where kernels wait in place (CUDA, Metal, the CPU) nothing
 //! announces it, so while a step that may ask anything runs, the service
-//! looks again within its rest ([`Rest`]) of its last look: the one poll of
-//! serving, which the hardware forces. Each turn looks at the decode requests first,
-//! before residency's lock: the look posts each request's reads with no
-//! decision of residency's before them (`decode::Look`), and the pass under
-//! the lock then serves what it took. Everything else it waits for is an
-//! event of the load (a landing's or a read's end, a copy's completion, a
-//! step's begin or end), which ends the rest at once. Where parks are submission
-//! boundaries (Vulkan) the device's words are the host's only at a park,
-//! and the parks' keeper announces each change it sees: there the service
-//! never polls.
+//! looks again within a bounded rest ([`IDLE`] backing off to `MAX_IDLE_POLL`)
+//! of its last look: the one poll of serving, which the hardware forces. Each
+//! turn looks at the decode requests first, before residency's lock: the look
+//! posts each request's reads with no decision of residency's before them
+//! (`decode::Look`), and the pass under the lock then serves what it took.
+//! Everything else it waits for is an event of the load (a landing's or a
+//! read's end, a copy's completion, a step's begin or end), which ends the
+//! rest at once. Where parks are submission boundaries (Vulkan) the device's
+//! words are the host's only at a park, and the parks' keeper announces each
+//! change it sees: there the service never polls.
 
 use super::decode::{Began, Decode, Look, Posted};
 use super::liveness;
@@ -42,81 +42,20 @@ use std::time::{Duration, Instant};
 /// rests are precise (`seismic_io::waited_on`): no timer slack lengthens them.
 pub(super) const IDLE: Duration = Duration::from_micros(20);
 
-/// A poller's rest between two looks at what the device writes and no
-/// event announces: the request service's at the device's words where
-/// kernels wait in place (module documentation), the parks' keeper's at
-/// the device's timeline (`parks`). Each is priced as the run measures it,
-/// so no rest is a constant.
-///
-/// Polling at rest `r` costs, per second polled, its looks, `l / r` (`l`,
-/// what a look costs: its measured time, [`Looked::Empty`]), and its
-/// notices' wait: each thing the device writes and then waits on is
-/// noticed on average `r / 2` after it is written, at `λ` of them a
-/// second, `λ · r / 2` of stall. Their sum is least at
-/// `r = √(2 · l / λ)`.
-///
-/// - **`l`**: a look's line (`seismic::measure::Line`, one fixed term)
-///   through every look that found and changed nothing, from the poller's
-///   first, before any step: until one is measured the rest is none.
-/// - **`λ`**: the notices of the phase polled ([`Phase`]) counted over its
-///   seconds polled, the notice that may come now among them:
-///   `(n + 1) / T`, never below the measured rate `n / T`, so the rest
-///   never exceeds the optimum at it, and bounded before the phase's first
-///   notice (`√(2 · l · T)`, growing only as nothing is noticed). Before
-///   any time of the phase is polled the rest is none (`T = 0`): the
-///   poller looks again at once, its stall bounded by a look. A prompt and
-///   a decode ask at their own rates, so each phase counts apart, from its
-///   own start ([`Rest::begin`], a boundary each poller derives from its
-///   steps), never from a window, whose length would be a tuned constant.
-///   A notice is what the poller waits for: the request service's each
-///   decode request and scratch round it found, the keeper's each look
-///   that found the device arrived.
-///
-/// So `r = √(2 · l · T / (n + 1))`, of the phase polled. Its thread's rests
-/// are precise (`seismic_io::waited_on`): no timer slack lengthens them.
-pub(super) struct Rest {
-    looks: seismic::measure::Line<1>,
-    /// Each phase's count since its start, by [`Phase::index`].
-    counts: [Count; 2],
-    /// When the last look ended and the phase it polls, where the poller
-    /// looks next by time.
-    polling: Option<(Instant, Phase)>,
-    rested: Rested,
-}
-
-/// What a poller polls for: the requests of a prompt (its groups' scratch
-/// rounds and requests, many steps at once) or a decode's.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(super) enum Phase {
-    Prompt,
-    Decode,
-}
-
-impl Phase {
-    fn index(self) -> usize {
-        match self {
-            Self::Prompt => 0,
-            Self::Decode => 1,
-        }
-    }
-}
-
-/// A phase's notices and seconds polled since its start.
-#[derive(Clone, Copy, Default)]
-struct Count {
-    noticed: u64,
-    polled: f64,
-}
-
-/// A poller's rest now ([`Rest`]), as others read it: the exchange's
-/// watchdog bounds an answer by it (`liveness::Answers::longest`).
+/// A poller's rest now, as others read it: the exchange's watchdog bounds an
+/// answer by it (`liveness::Answers::longest`).
 #[derive(Clone, Default)]
 pub(super) struct Rested(Arc<AtomicU64>);
 
 impl Rested {
     /// A fixed rest, for pollers with a constant bound ([`IDLE`]).
-    fn fixed(duration: Duration) -> Self {
+    pub(super) fn fixed(duration: Duration) -> Self {
         Self(Arc::new(AtomicU64::new(u64::try_from(duration.as_nanos()).unwrap_or(u64::MAX))))
+    }
+
+    /// Publish the poller's current bounded rest.
+    pub(super) fn set(&self, duration: Duration) {
+        self.0.store(u64::try_from(duration.as_nanos()).unwrap_or(u64::MAX), Ordering::Relaxed);
     }
 
     /// The rest the poller last set.
@@ -125,62 +64,14 @@ impl Rested {
     }
 }
 
-/// What a look did ([`Rest::looked`]).
-pub(super) enum Looked {
-    /// It found and changed nothing, in its time: a look's price.
-    Empty(Duration),
-    /// It changed something, noticing `noticed` of what the device wrote.
-    Changed { noticed: u64 },
-}
-
-impl Rest {
-    /// A poller's rest, none measured, published to `rested`.
-    pub(super) fn new(rested: Rested) -> Self {
-        Self { looks: seismic::measure::Line::new(), counts: [Count::default(); 2], polling: None, rested }
-    }
-
-    /// `phase` starts again: its count begins anew, what it counted before
-    /// another phase ran not its own. A look's price is every phase's.
-    pub(super) fn begin(&mut self, phase: Phase) {
-        self.counts[phase.index()] = Count::default();
-    }
-
-    /// A look ended: what it did, `looked`, and the phase the poller looks
-    /// again by time for (`polls`), none where it waits on events. The
-    /// seconds since the last look count as polled, and this look's
-    /// notices among them, of the phase that look polled, where it was
-    /// followed by time. The rest until the next look, where it polls.
-    ///
-    /// # Panics
-    /// Where the looks' times make no line: each is a duration, so that is
-    /// an invariant violation.
-    pub(super) fn looked(&mut self, looked: Looked, polls: Option<Phase>) -> Option<Duration> {
-        let now = Instant::now();
-        let noticed = match looked {
-            Looked::Empty(look) => {
-                self.looks.observe([1.], look.as_secs_f64());
-                0
-            }
-            Looked::Changed { noticed } => noticed,
-        };
-        if let Some((since, phase)) = self.polling.take() {
-            let count = &mut self.counts[phase.index()];
-            count.polled += now.saturating_duration_since(since).as_secs_f64();
-            count.noticed += noticed;
-        }
-        let phase = polls?;
-        let look = self
-            .looks
-            .state()
-            .unwrap_or_else(|error| panic!("invariant violated: a look's durations make no line: {error:?}"))
-            .line()
-            .map_or(0., |terms| terms.costs()[0]);
-        let Count { noticed, polled } = self.counts[phase.index()];
-        let rest = Duration::from_secs_f64((2. * look * polled / (noticed + 1) as f64).sqrt());
-        self.rested.0.store(u64::try_from(rest.as_nanos()).unwrap_or(u64::MAX), Ordering::Relaxed);
-        self.polling = Some((now, phase));
-        Some(rest)
-    }
+/// Polling cadence for [`Requests::serve`]: during active decode we stay at
+/// [`IDLE`] (20 µs) so inter-layer compute gaps (~1–2 ms) never trigger the
+/// 200 µs backoff; during long prefill/clearing spans we allow backoff.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Poll {
+    Off,
+    Decode,
+    Backoff,
 }
 
 /// The request service: what it serves through, and its own state.
@@ -309,7 +200,7 @@ impl Requests {
                     seismic_io::timeline::note(seismic_io::timeline::Kind::Noted("held"), request.sequence, (request.layer as i64, 0, 0));
                 }
                 let mut service = self.service.lock().expect("the request service is never left by a panic");
-                let progressed = released_passes
+                let mut progressed = released_passes
                     | match self.shared.life.ended() {
                         // Serving ended: each request the look posted is given
                         // up, its reads' staging freed as they end, and refused.
@@ -320,6 +211,16 @@ impl Requests {
                         }
                         None => self.pass(&mut service, &mut held, posted, &mut scratch_arrived, released_passes),
                     };
+                if self.shared.life.ended().is_none() && self.shared.parks.settled() {
+                    // Yield `Residency` to any waiting `DecodeReactor` before
+                    // running ring/prefetch/promotion maintenance, re-acquiring
+                    // as a foreground holder so `Residency::keep` can never
+                    // starve `expert-requests`.
+                    held = held.yield_to_waiters(&residency);
+                    if self.shared.life.ended().is_none() {
+                        progressed |= held.rings(&self.shared, service.look.served(), progressed, self.copier.as_ref());
+                    }
+                }
                 (progressed, self.polls(&held))
             };
             ended = Instant::now();
@@ -329,7 +230,11 @@ impl Requests {
                 continue;
             }
             match polls {
-                true => {
+                Poll::Decode => {
+                    empty_polls = 0;
+                    events.wait_at_most(seen, IDLE);
+                }
+                Poll::Backoff => {
                     if events.seen() != seen {
                         empty_polls = 0;
                     } else {
@@ -342,7 +247,7 @@ impl Requests {
                     };
                     events.wait_at_most(seen, rest);
                 }
-                false => {
+                Poll::Off => {
                     empty_polls = 0;
                     events.wait(seen);
                 }
@@ -383,16 +288,24 @@ impl Requests {
     /// so `poll_completed_passes` and `settle_prefill_copies` keep retiring
     /// `Pass(L)` completions and `PrefillFill` DMA batches even when parks
     /// are kept at submission boundaries.
-    fn polls(&self, residency: &Residency) -> bool {
+    fn polls(&self, residency: &Residency) -> Poll {
         if self.shared.life.ended().is_some() {
-            return false;
+            return Poll::Off;
         }
         let steps = &self.shared.steps;
-        (!self.shared.parks.kept
+        let should_poll = (!self.shared.parks.kept
             && steps.in_flight() > 0
             && (!residency.all_resolved() || steps.scratch_running()))
             || (residency.core.extents.tier_copy_dma
-                && ((steps.in_flight() > 0 && steps.scratch_running()) || residency.scratch.clearing()))
+                && ((steps.in_flight() > 0 && steps.scratch_running()) || residency.scratch.clearing()));
+        if !should_poll {
+            return Poll::Off;
+        }
+        if steps.decode_running() {
+            Poll::Decode
+        } else {
+            Poll::Backoff
+        }
     }
 
     /// One pass: the misses waiting resumed, the conveyor carried, then
@@ -438,16 +351,11 @@ impl Requests {
             residency,
             posted,
             scratch_arrived,
-            joined | released | refilled | resumed | conveyed,
         );
-        released | refilled | resumed | conveyed | served
+        joined | released | refilled | resumed | conveyed | served
     }
 
-    /// Each layer's decode and scratch requests, served in step order, then
-    /// the hints. The device's words (its requests and hints) are read only
-    /// once they are in place: where a park is a submission boundary, while
-    /// the device is parked (`Parks::parked`, the look's alike), its hints,
-    /// which only ever advise, once they may be (`Parks::settled`). What the
+    /// Each layer's decode and scratch requests, served in step order. What the
     /// host alone holds (a scratch request taken, its rounds, the decode
     /// requests the look took, `posted`) is carried every pass. Whether it
     /// served any.
@@ -457,7 +365,6 @@ impl Requests {
         residency: &mut Residency,
         posted: Vec<Posted>,
         scratch_arrived: &mut [Option<Instant>],
-        freed: bool,
     ) -> bool {
         let parked = self.shared.parks.parked();
         let tier_copy_dma = residency.core.extents.tier_copy_dma;
@@ -484,9 +391,6 @@ impl Requests {
             progressed |= self.scratch(service, residency, layer, arrived);
         }
         assert!(posted.next().is_none(), "the look takes requests of the load's layers, in order");
-        if self.shared.parks.settled() {
-            progressed |= residency.rings(&self.shared, service.look.served(), freed | progressed, self.copier.as_ref());
-        }
         progressed
     }
 
@@ -621,30 +525,6 @@ fn apply_polled_passes_with(
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    /// The rest is `√(2 · l · T / (n + 1))` of the phase polled (`Rest`):
-    /// none before any time of it is polled, at least that of the time
-    /// polled with nothing noticed, shorter once many notices are counted;
-    /// each phase counts apart, and from its start again once it begins.
-    #[test]
-    fn a_rest_is_priced_on_its_looks_and_its_phases_notices() {
-        let decode = Some(Phase::Decode);
-        let look = Duration::from_micros(4);
-        let rested = Rested::default();
-        let mut rest = Rest::new(rested.clone());
-        assert_eq!(rest.looked(Looked::Empty(look), decode), Some(Duration::ZERO), "nothing polled: the rest is none");
-        let polled = Duration::from_millis(1);
-        std::thread::sleep(polled);
-        let quiet = rest.looked(Looked::Empty(look), decode).unwrap();
-        assert!(quiet >= Duration::from_secs_f64((2. * look.as_secs_f64() * polled.as_secs_f64()).sqrt()), "{quiet:?} after {polled:?} polled");
-        assert_eq!(rested.get(), quiet, "the rest is published as set");
-        let busy = rest.looked(Looked::Changed { noticed: 1000 }, decode).unwrap();
-        assert!(busy < quiet, "notices shorten the rest: {busy:?} against {quiet:?}");
-        assert_eq!(rest.looked(Looked::Empty(look), Some(Phase::Prompt)), Some(Duration::ZERO), "the prompt's count is its own: nothing of it polled");
-        assert_eq!(rest.looked(Looked::Empty(look), None), None, "no rest where the poller waits on events");
-        rest.begin(Phase::Decode);
-        assert_eq!(rest.looked(Looked::Empty(look), decode), Some(Duration::ZERO), "a decode begun again counts from its start");
-    }
 
     /// Regression test (`m8ked4`): a failed GPU `Pass` poll emits
     /// `PassReaderEvent::Quarantined` alongside `Some(error)`. Drained pass

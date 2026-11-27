@@ -818,12 +818,20 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
         } = flight;
         let completed = submission.finish().map_err(DomainError::Device)?;
         let finished_wait = Instant::now();
+        let timed = self.timed(epoch);
         let head_requests: Vec<RequestId> = requests.iter().map(|(request, ..)| *request).collect();
-        self.verify_turns.head_finished(
-            &head_requests,
-            steps,
-            finished_wait.saturating_duration_since(entered_submit),
-        );
+        if matches!(timed, Timed::Untimed) {
+            // A head launch that recorded graphs or spanned a bank resize is
+            // not steady-state drafting latency: drop the open verify turn so
+            // cold graph-recording time never poisons `VerifyTurns::overhead`.
+            self.verify_turns.interrupt();
+        } else {
+            self.verify_turns.head_finished(
+                &head_requests,
+                steps,
+                finished_wait.saturating_duration_since(entered_submit),
+            );
+        }
         if let Some(trace) = &launch_trace {
             let submissions = trace
                 .collect()
@@ -1002,7 +1010,6 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
         // Include the existing selection read and host materialization in
         // completed service; request timing must not omit width-dependent work.
         let duration = started.elapsed();
-        let timed = self.timed(epoch);
         for item in &mut pending {
             item.physical_duration = duration;
             item.timed = timed;

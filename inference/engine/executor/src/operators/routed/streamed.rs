@@ -75,7 +75,7 @@ use magnitude_kernels::{
     routed_land, routed_list_grid, routed_output_project,
     routed_output_sited, routed_output_streamed, routed_pass_map, routed_round, routed_route_streamed,
     routed_scratch_grids, routed_scratch_request, routed_seed_commit, routed_select_streamed,
-    routed_site_request, routed_step,
+    routed_site_request, routed_stage_host, routed_step,
 };
 use seismic::{
     Dim, Element, NativeGraph, NativePort, NativeTimelinePort, WorkflowTensor,
@@ -114,8 +114,12 @@ pub(crate) struct BankGraphEntries<'a, G: GraphDraft + 'a> {
     /// The device's seed copy into the bank's records, whoever places
     /// (`DevicePlacement`).
     pub seeding: BankSeedingEntries<'a, G>,
-    /// The CPU site's request and combine, where the layer has a site.
+    /// The CPU site's request, where the layer has a site.
     pub site: Option<BankSiteEntries<'a, G>>,
+    /// The split decode combine (`native::ExpertBankKernels::combine`),
+    /// decoupled from `site` for general routed layers so UMA layers can
+    /// overlap early-hit `routed_down_project` with `routed_land`.
+    pub combine: Option<BankCombineEntry<'a, G>>,
     /// A gated layer's gate/up passes, its held choices' before the tier
     /// wait and the wait's after it (`native::ExpertBankKernels::gate_up`);
     /// none of up-only experts.
@@ -124,13 +128,14 @@ pub(crate) struct BankGraphEntries<'a, G: GraphDraft + 'a> {
     /// masked-write skip semantics (`mode == 1` hit-only / `mode == 2` skip
     /// `code == -1` without overwriting `published`).
     pub masked_down_project: bool,
+    /// Unified device-classified 3-tier decode staging + self-gate
+    /// (`routed_stage_host`, 4 CTAs x 256 threads), present on CUDA `Placer::Tier`.
+    pub stage_host: Option<G::Binding<'a, routed_stage_host::Entry>>,
 }
 
-/// A streamed layer's CPU site entries (`native::BankSite`): its request
-/// and its combine waiting for the CPU's answer, by its routed form.
+/// A streamed layer's CPU site request entry (`native::BankSite`).
 pub(crate) struct BankSiteEntries<'a, G: GraphDraft + 'a> {
     pub request: G::Binding<'a, routed_site_request::Entry>,
-    pub combine: BankCombineEntry<'a, G>,
 }
 
 /// A streamed layer's combine with the CPU's answer, by its routed form: its
@@ -195,33 +200,14 @@ pub(crate) fn routed_down_project_supports_masked_write(backend: seismic::Backen
     matches!(backend, seismic::BackendName::Cuda)
 }
 
-/// Whether a streamed routed layer of `routed` on `backend` (when `tier > 0`
-/// and sited) supports `RunStage::DecodeHits` splitting (`routed_gate_up_part`
-/// + general sited combine with masked-write `routed_down_project`). The single
-/// capability rule shared by `classes.rs`, `certify.rs`, and graph construction.
-pub(crate) fn decode_hits_supported(
-    routed: &magnitude_family_contracts::RoutedFfn,
-    backend: seismic::BackendName,
-) -> bool {
-    routed_down_project_supports_masked_write(backend)
-        && !super::is_fused(routed)
-        && matches!(routed.expert_up, magnitude_family_contracts::FeedForwardUp::Gated { .. })
-        && <routed_down_project::Entry as seismic::EntryContract>::contract_node_shape(backend).is_ok()
-        && <routed_down_sited::Entry as seismic::EntryContract>::contract_node_shape(backend).is_ok()
-        && <routed_site_request::Entry as seismic::EntryContract>::contract_node_shape(backend).is_ok()
-}
-
 impl<'a, G: GraphDraft + 'a> BankGraphEntries<'a, G> {
-    /// Whether this layer's entries and backend support `RunStage::DecodeHits`
-    /// splitting (`masked_down_project` + `routed_gate_up_part` +
-    /// `BankCombineEntry::General { project, sited }`).
-    pub(crate) fn can_split_decode_hits(&self) -> bool {
+    /// Whether this layer's entries support split hit/miss down projection
+    /// (`DecodeHits` + `DecodeBack` inside the unified streamed decode graph).
+    pub(crate) fn can_split_hits(&self) -> bool {
         self.masked_down_project
             && self.gate_up.is_some()
-            && matches!(
-                self.site.map(|site| site.combine),
-                Some(BankCombineEntry::General { .. })
-            )
+            && self.site.is_some()
+            && matches!(self.combine, Some(BankCombineEntry::General { .. }))
     }
 }
 
@@ -251,14 +237,15 @@ impl<'a> BankGraphEntries<'a, NativeGraph> {
             },
             site: kernels.site.as_ref().map(|site| BankSiteEntries {
                 request: &site.request,
-                combine: match &site.combine {
-                    crate::native::BankCombine::FusedInline(inline) => BankCombineEntry::FusedInline(inline),
-                    crate::native::BankCombine::Fused { project, sited } => BankCombineEntry::Fused { project, sited },
-                    crate::native::BankCombine::General { project, sited } => BankCombineEntry::General { project, sited },
-                },
+            }),
+            combine: kernels.combine.as_ref().map(|combine| match combine {
+                crate::native::BankCombine::FusedInline(inline) => BankCombineEntry::FusedInline(inline),
+                crate::native::BankCombine::Fused { project, sited } => BankCombineEntry::Fused { project, sited },
+                crate::native::BankCombine::General { project, sited } => BankCombineEntry::General { project, sited },
             }),
             gate_up: kernels.gate_up.as_ref(),
             masked_down_project: routed_down_project_supports_masked_write(backend),
+            stage_host: kernels.stage_host.as_ref(),
         }
     }
 }
@@ -287,22 +274,24 @@ pub(crate) struct CheckedBankEntries {
     none: [(&'static str, Element); 0],
     /// The seed copy's.
     seed: RecordTensors<[(&'static str, Element); 1]>,
-    /// The CPU site's request's and combine's, where the layer has a site
+    /// The CPU site's request, where the layer has a site
     /// (`native::BankSite::served`).
     site: Option<CheckedSite>,
+    /// The split decode combine (`native::BankCombine::served`).
+    combine: Option<CheckedCombine>,
     /// The gate/up passes', of gated experts.
     gate_up: Option<[(&'static str, Element); 3]>,
     /// Whether the target backend's `routed_down_project` supports masked-write
     /// skip semantics (`routed_down_project_supports_masked_write`).
     masked_down_project: bool,
+    /// Unified device-classified 3-tier decode staging (`routed_stage_host`).
+    stage_host: Option<[(&'static str, Element); 3]>,
 }
 
-/// A CPU site's element assignments: its request's, and its combine's by
-/// the layer's routed form.
+/// A CPU site's request element assignments.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 struct CheckedSite {
     request: [(&'static str, Element); 1],
-    combine: CheckedCombine,
 }
 
 /// A combine's projections' and sum's element assignments.
@@ -379,10 +368,12 @@ impl CheckedBankEntries {
             BankedFeedForward::GeneralRouted(binding) => general(binding),
             BankedFeedForward::Parallel(binding) => general(binding.routed),
         };
-        let site = crate::native::BankSite::served(slot, bank, backend)?.then(|| match slot {
-            BankedFeedForward::Routed(binding) => CheckedSite {
-                request: [("A", binding.activation)],
-                combine: if <routed_output_streamed::Entry as seismic::EntryContract>::contract_node_shape(backend).is_ok() {
+        let site = crate::native::BankSite::served(slot, bank, backend)?.then(|| CheckedSite {
+            request: [("A", activation)],
+        });
+        let combine = crate::native::BankCombine::served(slot, bank, backend).then(|| match slot {
+            BankedFeedForward::Routed(binding) => {
+                if <routed_output_streamed::Entry as seismic::EntryContract>::contract_node_shape(backend).is_ok() {
                     CheckedCombine::FusedInline([
                         ("EDW", binding.expert_down),
                         ("SDW", binding.shared_down),
@@ -393,17 +384,23 @@ impl CheckedBankEntries {
                         [("EDW", binding.expert_down), ("SDW", binding.shared_down), ("A", binding.activation)],
                         [("A", binding.activation)],
                     )
-                },
-            },
-            BankedFeedForward::GeneralRouted(binding) | BankedFeedForward::Parallel(crate::ParallelBinding { routed: binding, .. }) => {
-                CheckedSite {
-                    request: [("A", binding.activation)],
-                    combine: CheckedCombine::General(
-                        [("EDW", binding.expert_down), ("A", binding.activation)],
-                        [("A", binding.activation), ("R", super::graph::sum_element(&binding))],
-                    ),
                 }
             }
+            BankedFeedForward::GeneralRouted(binding) | BankedFeedForward::Parallel(crate::ParallelBinding { routed: binding, .. }) => {
+                CheckedCombine::General(
+                    [("EDW", binding.expert_down), ("A", binding.activation)],
+                    [("A", binding.activation), ("R", super::graph::sum_element(&binding))],
+                )
+            }
+        });
+        let stage_host = (bank.tier > 0
+            && <routed_stage_host::Entry as seismic::EntryContract>::contract_node_shape(backend).is_ok())
+        .then(|| {
+            [
+                ("UG", gate.map_or(up.resident, |g| g.resident)),
+                ("UU", up.resident),
+                ("UD", down.resident),
+            ]
         });
         Ok(Self {
             route,
@@ -412,13 +409,11 @@ impl CheckedBankEntries {
             none: [],
             seed: bank.record.map(|_, tensor| [("U", tensor.resident)]),
             site,
+            combine,
             gate_up,
             masked_down_project: routed_down_project_supports_masked_write(backend),
+            stage_host,
         })
-    }
-
-    pub(crate) fn set_masked_down_project(&mut self, allowed: bool) {
-        self.masked_down_project &= allowed;
     }
 
     pub(crate) fn entries<G: crate::programs::graph::draft::ElementBoundDraft>(
@@ -448,24 +443,40 @@ impl CheckedBankEntries {
             },
             site: self.site.as_ref().map(|site| BankSiteEntries {
                 request: G::bind(&site.request[..]),
-                combine: match &site.combine {
-                    CheckedCombine::FusedInline(inline) => {
-                        BankCombineEntry::FusedInline(G::bind_ranged(&inline[..]))
-                    }
-                    CheckedCombine::Fused(project, sited) => BankCombineEntry::Fused {
-                        project: G::bind_ranged(&project[..]),
-                        sited: G::bind(&sited[..]),
-                    },
-                    CheckedCombine::General(project, sited) => BankCombineEntry::General {
-                        project: G::bind_ranged(&project[..]),
-                        sited: G::bind(&sited[..]),
-                    },
+            }),
+            combine: self.combine.as_ref().map(|combine| match combine {
+                CheckedCombine::FusedInline(inline) => {
+                    BankCombineEntry::FusedInline(G::bind_ranged(&inline[..]))
+                }
+                CheckedCombine::Fused(project, sited) => BankCombineEntry::Fused {
+                    project: G::bind_ranged(&project[..]),
+                    sited: G::bind(&sited[..]),
+                },
+                CheckedCombine::General(project, sited) => BankCombineEntry::General {
+                    project: G::bind_ranged(&project[..]),
+                    sited: G::bind(&sited[..]),
                 },
             }),
             gate_up: self.gate_up.as_ref().map(|gate_up| G::bind_ranged(&gate_up[..])),
             masked_down_project: self.masked_down_project,
+            stage_host: self.stage_host.as_ref().map(|sh| G::bind(&sh[..])),
         }
     }
+}
+
+/// Ports and timeline nodes declared by a unified CUDA 3-tier streamed decode
+/// graph (`RunStage::Whole` with `routed_stage_host` + top-level `WAIT_VALUE_32`
+/// + tail `WRITE_VALUE_32(completed_gen)`).
+#[derive(Clone, Debug)]
+pub(crate) struct UnifiedDecodePorts {
+    pub front_sources: NativePort,
+    pub back_sources: NativePort,
+    pub ready_slot: NativePort,
+    pub land_gate: NativeTimelinePort<seismic::timeline::Gate>,
+    pub completed_gen: Option<NativeTimelinePort<seismic::timeline::Reached>>,
+    /// `true` when `DecodeHits` runs before `land_gate` and `back_sources`
+    /// masks VRAM hits to `-1` (general routed with `can_split_hits()`).
+    pub mask_hits_back: bool,
 }
 
 /// A streamed layer's bank as its block's graph binds it: its entries, and
@@ -477,6 +488,9 @@ pub(crate) struct BankGraph<'p, 'a, G: GraphDraft + 'a> {
     /// publication after each site request, each with its layer's scope and
     /// kind (`crate::experts::Parks`).
     pub parks: &'p mut Vec<(GraphTimeline, NativeTimelinePort<seismic::timeline::Parks>)>,
+    /// Slot populated when this block seals the unified CUDA 3-tier streamed
+    /// decode graph (`RunStage::Whole` on partial `Placer::Tier`).
+    pub unified: Option<&'p mut Option<UnifiedDecodePorts>>,
 }
 
 /// How a routed layer's graph reads its experts: from the stacks a load
@@ -504,11 +518,6 @@ impl<'a, G: GraphDraft + 'a> LayerBank<'_, 'a, G> {
     /// Whether the layer's experts are its bank's.
     pub(crate) fn banked(&self) -> bool {
         !matches!(self, Self::Held)
-    }
-
-    /// Whether this layer supports `RunStage::DecodeHits` splitting.
-    pub(crate) fn can_split_decode_hits(&self) -> bool {
-        matches!(self, Self::Streamed(bank) if bank.entries.can_split_decode_hits())
     }
 }
 
@@ -611,6 +620,14 @@ pub(crate) struct BankTopology {
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub(crate) struct BankNumbers<D = Dim> {
     pub records: D,
+    /// Resident record count before the tail VRAM decode-stage scratch slots
+    /// (`plan.records(group)`). `DecodeHits` reads `[0 .. stage_base)` while
+    /// `routed_stage_host` writes `[stage_base .. records)` as disjoint slices
+    /// so `DagOrder` forks them concurrently in the CUDA graph.
+    pub stage_base: D,
+    /// Tail VRAM scratch slots (`plan.decode_stage_slots()` = `16` on discrete
+    /// `Placer::Tier`, `0` otherwise), equal to `records - stage_base`.
+    pub stage_slots: D,
     pub experts: D,
     pub layer_experts: D,
     pub selected: D,
@@ -642,6 +659,8 @@ impl<D> Numbers<D> for BankNumbers<D> {
     fn map<E>(self, f: &mut impl FnMut(D) -> E) -> BankNumbers<E> {
         BankNumbers {
             records: f(self.records),
+            stage_base: f(self.stage_base),
+            stage_slots: f(self.stage_slots),
             experts: f(self.experts),
             layer_experts: f(self.layer_experts),
             selected: f(self.selected),
@@ -693,7 +712,7 @@ pub(crate) fn split<G: GraphDraft>(
         // Only target decode passes carry front-row guesses into `routed_step`;
         // drafter layers (`DraftSublayer`, `HeadSublayer`) run with `front = 0`
         // and never bind a `guesses` port.
-        fronts: load.fronts() && !layer.is_draft(),
+        fronts: load.fronts_target() && !layer.is_draft(),
         placer: binding.placer,
         tier_copy_dma: plan.tier_copy_dma(),
         record: binding.record.map(|_, tensor| tensor.resident),
@@ -701,6 +720,8 @@ pub(crate) fn split<G: GraphDraft>(
     };
     let numbers = BankNumbers {
         records: binding.records,
+        stage_base: plan.records(layer.group),
+        stage_slots: plan.decode_stage_slots(),
         experts: binding.experts,
         layer_experts: layer.experts,
         selected: binding.selected,
@@ -739,6 +760,7 @@ pub(crate) struct StreamedLayer<'p, 'a, G: GraphDraft + 'a, W: PlannedWeights + 
     entries: BankGraphEntries<'a, G>,
     ports: &'p mut Vec<(BankPort, NativePort)>,
     parks: &'p mut Vec<(GraphTimeline, NativeTimelinePort<seismic::timeline::Parks>)>,
+    unified: Option<&'p mut Option<UnifiedDecodePorts>>,
 }
 
 /// A gated layer's resident gate/up, which its streamed decode gate/up
@@ -769,15 +791,24 @@ impl<'p, 'a, G: GraphDraft + 'a, W: PlannedWeights + ?Sized> StreamedLayer<'p, '
     ) -> Result<Option<Self>, GraphError> {
         match (form, numbers, bank) {
             (BankForm::Home, None, LayerBank::Home) | (BankForm::Held, None, LayerBank::Held) => Ok(None),
-            (BankForm::Streamed(topology), Some(numbers), LayerBank::Streamed(BankGraph { mut entries, ports, parks })) => {
+            (BankForm::Streamed(topology), Some(numbers), LayerBank::Streamed(BankGraph { mut entries, ports, parks, unified })) => {
                 // The plan alone says which layers have a CPU site
                 // (`ExpertBankPlan::sited`): a layer encodes the load's site
                 // entries exactly there, and a sited layer needs them.
+                // General split combine (`routed_down_project` +
+                // `routed_down_sited`) is kept even when unsited so UMA layers
+                // overlap early-hit down projections with `routed_land`.
                 entries.site = match (topology.sited, entries.site) {
                     (true, None) => return Err("a layer with a CPU site lacks its site entries".into()),
                     (sited, site) => site.filter(|_| sited),
                 };
-                Ok(Some(Self { planned, topology, numbers, scope, entries, ports, parks }))
+                if topology.sited && entries.combine.is_none() {
+                    return Err("a layer with a CPU site lacks its combine entries".into());
+                }
+                entries.combine = entries.combine.filter(|combine| {
+                    topology.sited || matches!(combine, BankCombineEntry::General { .. })
+                });
+                Ok(Some(Self { planned, topology, numbers, scope, entries, ports, parks, unified }))
             }
             _ => Err("a routed layer's bank entries disagree with its plan".into()),
         }
@@ -821,20 +852,154 @@ impl<'p, 'a, G: GraphDraft + 'a, W: PlannedWeights + ?Sized> StreamedLayer<'p, '
         })
     }
 
-    /// [`Self::route_tier`] for [`DecodeFrontPorts`].
-    pub(crate) fn front_route_tier(
+    /// Whether this layer is sealing the unified CUDA 3-tier streamed decode
+    /// graph (`routed_stage_host` + top-level `WAIT_VALUE_32` + tail
+    /// `WRITE_VALUE_32(completed_gen)`).
+    pub(crate) fn is_unified_decode(&self) -> bool {
+        self.unified.is_some()
+            && self.entries.stage_host.is_some()
+            && self.topology.placer == crate::planning::Placer::Tier
+            && !self.numbers.tier.is_zero()
+    }
+
+    /// Whether this layer's entries support split hit/miss down projection
+    /// (`DecodeHits` before `land_gate` and `DecodeBack` after `land_gate`).
+    pub(crate) fn can_split_hits(&self) -> bool {
+        self.entries.can_split_hits()
+    }
+
+    /// Record the unified decode ports and top-level `WAIT_VALUE_32` gate node
+    /// into the block graph's `UnifiedDecodePorts` slot.
+    pub(crate) fn record_unified_decode(
+        &mut self,
+        front_sources: NativePort,
+        back_sources: NativePort,
+        ready_slot: NativePort,
+        land_gate: NativeTimelinePort<seismic::timeline::Gate>,
+        mask_hits_back: bool,
+    ) {
+        if let Some(slot) = &mut self.unified {
+            **slot = Some(UnifiedDecodePorts {
+                front_sources,
+                back_sources,
+                ready_slot,
+                land_gate,
+                completed_gen: None,
+                mask_hits_back,
+            });
+        }
+    }
+
+    /// Enqueue the unified 4-CTA x 256-thread `routed_stage_host` kernel that
+    /// classifies `front_sources` into `VRAM_HIT` / `HOST_STAGE` / `HOST_WORK`,
+    /// copies SM-staged host-tier experts into VRAM scratch `stage_base + s`,
+    /// populates `back_sources`, and either self-gates `land_gate` (when
+    /// `host_work == 0`, zero CPU wakeup) or publishes `ready_slot`.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn enqueue_stage_host(
         &mut self,
         graph: &mut G,
-        ports: &DecodeFrontPorts,
+        ports: &DecodePorts,
+        rows: &Dim,
+        front_sources: &WorkflowTensor,
+        back_sources: &mut WorkflowTensor,
+        ready_slot: &mut WorkflowTensor,
+        records: RecordTensors<&mut NativePort>,
         constants: &mut Vec<GraphConstant>,
-    ) -> Result<RouteTier, GraphError> {
-        Ok(match &ports.tier_map {
-            Some(map) => RouteTier { experts: self.numbers.layer_experts.clone(), map: map.tensor().clone() },
-            None => RouteTier {
-                experts: Dim::from(0),
-                map: GraphConstant::empty_of(graph, Element::i32(), &[0], constants)?,
+    ) -> Result<(), GraphError> {
+        let entry = self
+            .entries
+            .stage_host
+            .ok_or("enqueue_stage_host called without routed_stage_host entry")?;
+        let tier = ports
+            .tier
+            .as_ref()
+            .ok_or("enqueue_stage_host requires host tier records")?;
+        let numbers = self.numbers;
+        let [f_dim, h_dim] = numbers.matrix.up.clone();
+        // Bind `routed_stage_host` to the disjoint tail VRAM scratch slice
+        // `[stage_base .. records)` (`E = stage_slots`) so `DagOrder`
+        // sees zero RAW/WAR conflict with `DecodeHits` reading `[0 .. stage_base)`
+        // and forks them as parallel sibling branches before `WAIT_VALUE_32`.
+        let (tier_gate, mut expert_gate_view, gv, gd) = match (&tier.records.gate, records.gate) {
+            (Some(tg), Some(eg)) => (
+                tg.tensor().clone(),
+                eg.tensor().slice_leading(&numbers.stage_base, &numbers.records),
+                numbers.tier.clone(),
+                numbers.stage_slots.clone(),
+            ),
+            _ => {
+                let empty_t = GraphConstant::empty_of(
+                    graph,
+                    self.topology.record.up,
+                    &[Dim::from(0), f_dim.clone(), h_dim.clone()],
+                    constants,
+                )?;
+                let empty_e = GraphConstant::empty_of(
+                    graph,
+                    self.topology.record.up,
+                    &[Dim::from(0), f_dim.clone(), h_dim.clone()],
+                    constants,
+                )?
+                .slice_leading(0, 0);
+                (empty_t, empty_e, Dim::from(0), Dim::from(0))
+            }
+        };
+        let mut expert_up_view = records
+            .up
+            .tensor()
+            .slice_leading(&numbers.stage_base, &numbers.records);
+        let mut expert_down_view = records
+            .down
+            .tensor()
+            .slice_leading(&numbers.stage_base, &numbers.records);
+        let dims = [
+            ("M", rows.clone()),
+            ("K", numbers.selected.clone()),
+            ("GV", gv),
+            ("TR", numbers.tier.clone()),
+            ("GD", gd),
+            ("E", numbers.stage_slots.clone()),
+            ("F", f_dim),
+            ("H", h_dim),
+        ];
+        graph.enqueue(
+            entry,
+            &dims,
+            routed_stage_host::WorkflowArgs {
+                front_sources: front_sources.into(),
+                back_sources: back_sources.into(),
+                policy: ports.policy.tensor().into(),
+                step: ports.step.tensor().into(),
+                land_grid: ports.land_grid.tensor().into(),
+                ready_slot: ready_slot.into(),
+                tier_gate: (&tier_gate).into(),
+                tier_up: tier.records.up.tensor().into(),
+                tier_down: tier.records.down.tensor().into(),
+                expert_gate: (&mut expert_gate_view).into(),
+                expert_up: (&mut expert_up_view).into(),
+                expert_down: (&mut expert_down_view).into(),
             },
-        })
+        )?;
+        Ok(())
+    }
+
+    /// Construct [`DecodeReads`] over an explicit `sources` view (`front_sources`
+    /// for `DecodeHits`, or `back_sources` for `DecodeBack`).
+    pub(crate) fn reads_for_sources(
+        &self,
+        graph: &mut G,
+        ports: &DecodePorts,
+        sources: WorkflowTensorView,
+        constants: &mut Vec<GraphConstant>,
+    ) -> Result<DecodeReads, GraphError> {
+        self.reads_inner(
+            graph,
+            ports.tier.as_ref().map(|tier| &tier.records),
+            sources,
+            Some(ports.policy.tensor().clone()),
+            constants,
+        )
     }
 
     /// The key records its decode route writes (`keys`): every row's key of
@@ -864,15 +1029,10 @@ impl<'p, 'a, G: GraphDraft + 'a, W: PlannedWeights + ?Sized> StreamedLayer<'p, '
         )
     }
 
-    /// Whether this streamed layer supports `RunStage::DecodeHits` splitting
-    /// (`masked_down_project` + `routed_gate_up_part` + `BankCombineEntry::General`).
-    pub(crate) fn can_split_decode_hits(&self) -> bool {
-        self.entries.can_split_decode_hits()
-    }
-
-    /// Run `routed_gate_up_part` for a single split-decode pass (`late == 2`
-    /// VRAM hits in `DecodeHits`, or `late == 3` sourced misses in `DecodeBack`)
-    /// into a graph-local `product`.
+    /// Run `routed_gate_up_part` for a single decode pass (`late == 2` VRAM
+    /// hits reading `front_sources`, `late == 3` sourced misses reading masked
+    /// `back_sources`, or `late == 4` sourced non-hits reading unmasked
+    /// `back_sources`) into `product` (allocating a new local if `into` is `None`).
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn gate_up_part_mode<'x>(
         &mut self,
@@ -883,6 +1043,7 @@ impl<'p, 'a, G: GraphDraft + 'a, W: PlannedWeights + ?Sized> StreamedLayer<'p, '
         step: &WorkflowTensor,
         routing: &WorkflowTensor,
         late: i32,
+        into: Option<WorkflowTensor>,
     ) -> Result<WorkflowTensor, GraphError> {
         let entry = G::pick(
             self.entries
@@ -893,7 +1054,18 @@ impl<'p, 'a, G: GraphDraft + 'a, W: PlannedWeights + ?Sized> StreamedLayer<'p, '
         let numbers = self.numbers;
         let dimensions =
             [dimensions, &[("FLIGHT", numbers.flight.clone()), ("P", numbers.choices.clone())]].concat();
-        let mut product = graph.local_for(entry, "product", &dimensions)?;
+        let mut product_local;
+        let mut product_existing;
+        let product_ref: &mut WorkflowTensor = match into {
+            Some(existing) => {
+                product_existing = existing;
+                &mut product_existing
+            }
+            None => {
+                product_local = graph.local_for(entry, "product", &dimensions)?;
+                product_local.tensor_mut()
+            }
+        };
         let routed_gate_up::WorkflowArgs {
             normalized,
             routes,
@@ -925,39 +1097,10 @@ impl<'p, 'a, G: GraphDraft + 'a, W: PlannedWeights + ?Sized> StreamedLayer<'p, '
                 routing: routing.into(),
                 step: step.into(),
                 late: late.into(),
-                product: product.tensor_mut().into(),
+                product: product_ref.into(),
             },
         )?;
-        Ok(product.tensor().clone())
-    }
-
-    /// [`Self::reads`] for `RunStage::DecodeHits`: reads only VRAM hits
-    /// (`code >= 0`) from read-only `front_sources`, so `tier` is empty (`TR = 0`).
-    pub(crate) fn reads_hits(
-        &self,
-        graph: &mut G,
-        sources: WorkflowTensorView,
-        constants: &mut Vec<GraphConstant>,
-    ) -> Result<DecodeReads, GraphError> {
-        self.reads_inner(graph, None, sources, None, constants)
-    }
-
-    /// [`Self::reads`] for `RunStage::DecodeBack` using its minimal
-    /// [`DecodeBackPorts`] and host-patched `DecodeSources` view.
-    pub(crate) fn reads_back(
-        &self,
-        graph: &mut G,
-        ports: &DecodeBackPorts,
-        sources: WorkflowTensorView,
-        constants: &mut Vec<GraphConstant>,
-    ) -> Result<DecodeReads, GraphError> {
-        self.reads_inner(
-            graph,
-            ports.tier_records.as_ref(),
-            sources,
-            ports.policy.as_ref().map(|p| p.tensor().clone()),
-            constants,
-        )
+        Ok(product_ref.clone())
     }
 
     fn reads_inner(
@@ -1093,52 +1236,6 @@ impl<'p, 'a, G: GraphDraft + 'a, W: PlannedWeights + ?Sized> StreamedLayer<'p, '
             .zip(site_choices)
             .map(|(site, choices)| (&mut site.table, &mut site.rows, choices));
         self.land_inner(graph, step, policy, file, land_grid, sources, records, inline_site, shape, constants)
-    }
-
-    /// Whether `RunStage::DecodeFront` must run `routed_land` on the device.
-    ///
-    /// On discrete-GPU `Placer::Tier`, `routed_land` performs zero GPU weight
-    /// conversion (the host converts NVMe reads into `HostTier` and `routed_land`
-    /// only parks the GPU polling `file` before copying `FILE_RECORD` into
-    /// `DecodeSources`). Skipping `routed_land` here lets `DecodeFront` finish
-    /// immediately so `ExpertTransport::land_decode_misses` fires Phase A PCIe
-    /// DMA for already-in-RAM misses concurrently with NVMe landing (Phase B).
-    pub(crate) fn needs_front_land(&self) -> bool {
-        self.topology.placer != crate::planning::Placer::Tier
-    }
-
-    /// [`Self::land`] for `RunStage::DecodeFront`'s minimal [`DecodeFrontPorts`].
-    #[allow(clippy::too_many_arguments)]
-    pub(crate) fn land_front(
-        &mut self,
-        graph: &mut G,
-        ports: &mut DecodeFrontPorts,
-        sources: &mut WorkflowTensor,
-        records: RecordTensors<&mut NativePort>,
-        site_choices: Option<&StepChoices<'_>>,
-        shape: &DecodeShape,
-        constants: &mut Vec<GraphConstant>,
-    ) -> Result<(), GraphError> {
-        if !self.needs_front_land() {
-            return Ok(());
-        }
-        let inline_site = ports
-            .site
-            .as_mut()
-            .zip(site_choices)
-            .map(|(site, choices)| (&mut site.table, &mut site.rows, choices));
-        self.land_inner(
-            graph,
-            &ports.step,
-            &ports.policy,
-            &mut ports.file,
-            &ports.land_grid,
-            sources,
-            records,
-            inline_site,
-            shape,
-            constants,
-        )
     }
 
     /// Publishes a site request already written by `routed_route_streamed` or
@@ -1330,38 +1427,6 @@ impl<'p, 'a, G: GraphDraft + 'a, W: PlannedWeights + ?Sized> StreamedLayer<'p, '
         )
     }
 
-    /// [`Self::site_request`] for `RunStage::DecodeFront`'s minimal [`DecodeFrontPorts`]:
-    /// publishes CPU-sited choices at the tail of `DecodeFront` so `expert-compute`
-    /// runs 100% concurrently with host-driven `DecodeDma` (`cuMemcpyHtoDAsync`).
-    #[allow(clippy::too_many_arguments)]
-    pub(crate) fn site_request_front(
-        &mut self,
-        graph: &mut G,
-        ports: &mut DecodeFrontPorts,
-        routes: &WorkflowTensor,
-        weights: &WorkflowTensor,
-        sources: &WorkflowTensorView,
-        normalized: &WorkflowTensor,
-        shape: &DecodeShape,
-    ) -> Result<(), GraphError> {
-        let (Some(entries), Some(site)) = (self.entries.site, &mut ports.site) else {
-            return Ok(());
-        };
-        self.site_request_inner(
-            graph,
-            entries,
-            &ports.step,
-            &ports.policy,
-            &mut site.table,
-            &mut site.rows,
-            routes,
-            weights,
-            sources,
-            normalized,
-            shape,
-        )
-    }
-
     #[allow(clippy::too_many_arguments)]
     fn site_request_inner(
         &mut self,
@@ -1514,14 +1579,159 @@ impl<'p, 'a, G: GraphDraft + 'a, W: PlannedWeights + ?Sized> StreamedLayer<'p, '
         Ok(product.tensor().clone())
     }
 
+    /// A gated general layer's decode `gate_up` AND `down_project` around its
+    /// landing ([`Self::settle`]), overlapping both hits' gate/up AND hits'
+    /// down projections with the host's SSD read:
+    /// `routed_gate_up_part(late=0)` ->
+    /// `routed_down_project(mode=0) [WhileClear(combine_policy)]` ->
+    /// `self.settle` ->
+    /// `routed_gate_up_part(late=1) [WhileClear(POLICY_RESOLVED)]` ->
+    /// `routed_down_project(mode=3) [WhileClear(POLICY_RESOLVED)]`.
+    /// On `POLICY_RESOLVED` (unsited) or `POLICY_WHOLE` (sited) layers, zero
+    /// split-down launches are encoded and the caller runs `routed_down` alone.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn gate_up_and_down_project<'x>(
+        &mut self,
+        graph: &mut G,
+        step: &mut RoutedStep,
+        ResidentGateUp { args, dimensions }: ResidentGateUp<'_, impl Fn() -> routed_gate_up::WorkflowArgs<'x>>,
+        down_dimensions: &[(&str, Dim)],
+        expert_down: &WorkflowTensor,
+        tier_down: &WorkflowTensorView,
+        sources: &WorkflowTensorView,
+        records: RecordTensors<&mut NativePort>,
+        choices: &StepChoices<'_>,
+        constants: &mut Vec<GraphConstant>,
+    ) -> Result<(WorkflowTensor, WorkflowTensor), GraphError> {
+        let gate_up_entry = G::pick(
+            self.entries
+                .gate_up
+                .expect("a gated streamed layer's bank holds its gate/up passes (`bank_gate_up`)"),
+            choices.rows,
+        );
+        let Some(BankCombineEntry::General { project, .. }) = self.entries.combine else {
+            return Err("gate_up_and_down_project requires general combine entries".into());
+        };
+        let project_entry = G::pick(project, choices.rows);
+        let numbers = self.numbers;
+        let routing_dims = [("FLIGHT", numbers.flight.clone()), ("P", numbers.choices.clone())];
+        let gate_up_dims = [dimensions, &routing_dims].concat();
+        let down_dims = [down_dimensions, &routing_dims].concat();
+        let mut product = graph.local_for(gate_up_entry, "product", &gate_up_dims)?;
+        let mut published = graph.local_for(project_entry, "published", &down_dims)?;
+        let combine_policy = if step.ports.site.is_some() {
+            magnitude_kernels::constants::POLICY_WHOLE
+        } else {
+            magnitude_kernels::constants::POLICY_RESOLVED
+        };
+        let gate_up_pass = |graph: &mut G, step: &RoutedStep, late: bool, product: &mut NativePort| {
+            let routed_gate_up::WorkflowArgs {
+                normalized,
+                routes,
+                sources,
+                expert_gate,
+                expert_up,
+                tier_gate,
+                tier_up,
+                activation,
+                gate_scale,
+                up_scale,
+                glu_limit,
+            } = args();
+            let args = routed_gate_up_part::WorkflowArgs {
+                normalized,
+                routes,
+                sources,
+                expert_gate,
+                expert_up,
+                tier_gate,
+                tier_up,
+                activation,
+                gate_scale,
+                up_scale,
+                glu_limit,
+                routing: step.routing.tensor().into(),
+                step: step.ports.step.tensor().into(),
+                late: i32::from(late).into(),
+                product: product.tensor_mut().into(),
+            };
+            match late {
+                false => graph.enqueue(gate_up_entry, &gate_up_dims, args).map(drop),
+                true => graph
+                    .enqueue_under(
+                        gate_up_entry,
+                        &gate_up_dims,
+                        args,
+                        &step.ports.policy,
+                        magnitude_kernels::constants::POLICY_RESOLVED,
+                        seismic::LaunchEncoding::WhileClear,
+                    )
+                    .map(drop),
+            }
+        };
+        let down_pass = |graph: &mut G,
+                         step: &RoutedStep,
+                         mode: i32,
+                         policy_word: u64,
+                         product: &NativePort,
+                         published: &mut NativePort| {
+            graph
+                .enqueue_under(
+                    project_entry,
+                    &down_dims,
+                    routed_down_project::WorkflowArgs {
+                        product: product.tensor().into(),
+                        routes: choices.routes.into(),
+                        sources: sources.into(),
+                        expert_down: expert_down.into(),
+                        tier_down: tier_down.into(),
+                        routing: step.routing.tensor().into(),
+                        step: step.ports.step.tensor().into(),
+                        mode: mode.into(),
+                        published: published.tensor_mut().into(),
+                    },
+                    &step.ports.policy,
+                    policy_word,
+                    seismic::LaunchEncoding::WhileClear,
+                )
+                .map(drop)
+        };
+        gate_up_pass(graph, step, false, &mut product)?;
+        down_pass(graph, step, 0, combine_policy, &product, &mut published)?;
+        self.settle(graph, step, records, choices, constants)?;
+        gate_up_pass(graph, step, true, &mut product)?;
+        down_pass(
+            graph,
+            step,
+            3,
+            magnitude_kernels::constants::POLICY_RESOLVED,
+            &product,
+            &mut published,
+        )?;
+        Ok((product.tensor().clone(), published.tensor().clone()))
+    }
+
     /// The layer's combine with the CPU's answer and the dimensions of its
     /// site table (`FLIGHT`, `SW`), where the layer has a site: its
     /// projections, then its sum, which waits for the answer when a choice
     /// of the step is the CPU's.
     pub(crate) fn site_combine(&self) -> Option<(BankCombineEntry<'a, G>, [(&'static str, Dim); 2])> {
-        let entries = self.entries.site?;
+        self.entries.site?;
+        let combine = self.entries.combine?;
         let numbers = self.numbers;
-        Some((entries.combine, [("FLIGHT", numbers.site_slots.clone()), ("SW", numbers.site_width.clone())]))
+        Some((combine, [("FLIGHT", numbers.site_slots.clone()), ("SW", numbers.site_width.clone())]))
+    }
+
+    /// The layer's general split combine (`routed_down_project` +
+    /// `routed_down_sited`), available on any streamed general layer whose
+    /// backend declares both entries (including unsited UMA layers).
+    pub(crate) fn general_combine(
+        &self,
+    ) -> Option<(G::Ranged<'a, routed_down_project::Entry>, G::Binding<'a, routed_down_sited::Entry>)> {
+        match self.entries.combine {
+            Some(BankCombineEntry::General { project, sited }) => Some((project, sited)),
+            _ => None,
+        }
     }
 
     /// The site's park, between the combine's projections and its sum
@@ -1952,16 +2162,8 @@ impl SitePorts {
     }
 }
 
-/// Minimal site ports for `routed_site_request` (`RunStage::DecodeFront`):
-/// binds only `SiteTable` and `SiteRows` (no `SiteOutput`).
-pub(crate) struct SiteRequestPorts {
-    pub table: NativePort,
-    pub rows: NativePort,
-}
-
-/// Minimal site ports for `routed_output_sited` / `routed_down_sited`
-/// (`RunStage::DecodeBack`): binds only `SiteTable` and `SiteOutput` (no
-/// `SiteRows`).
+/// Minimal site ports for `routed_output_sited` / `routed_down_sited`:
+/// binds only `SiteTable` and `SiteOutput` (no `SiteRows`).
 pub(crate) struct SiteCombinePorts {
     pub table: NativePort,
     pub output: NativePort,
@@ -2080,99 +2282,7 @@ pub(crate) fn resident_form(load: &ModelLoadPlan, scope: WeightScope) -> bool {
     streams(load, scope) && load.expert_bank().is_some_and(|bank| bank.resident)
 }
 
-/// Minimal bank ports for `RunStage::DecodeFront`: only the ports consumed by
-/// `routed_route_streamed` / `routed_select_streamed`, `routed_hint_*`,
-/// `routed_land`, and `routed_site_request` (no `Tier { kind }` records and no
-/// `SiteOutput`, so `seismic::seal()` sees zero unbound ports).
-pub(crate) struct DecodeFrontPorts {
-    pub step: NativePort,
-    pub inputs: Option<StepInputs>,
-    pub map: NativePort,
-    pub tier_map: Option<NativePort>,
-    pub policy: NativePort,
-    pub file: NativePort,
-    pub land_grid: NativePort,
-    pub site: Option<SiteRequestPorts>,
-}
-
-impl DecodeFrontPorts {
-    pub(crate) fn sited(&self) -> i32 {
-        i32::from(self.site.is_some())
-    }
-}
-
-/// Minimal bank ports for `RunStage::DecodeBack`: only the ports consumed by
-/// `routed_gate_up` / `routed_up` and `routed_output` / `routed_down` (plus
-/// `routed_output_sited` / `routed_down_sited` via `SiteTable` + `SiteOutput`;
-/// no `Map`, `TierMap`, `FileTable`, `LandGrid`, or `SiteRows`).
-pub(crate) struct DecodeBackPorts {
-    pub step: Option<NativePort>,
-    pub tier_records: Option<RecordTensors<NativePort>>,
-    pub policy: Option<NativePort>,
-    pub site: Option<SiteCombinePorts>,
-}
-
 impl<'p, 'a, G: GraphDraft + 'a, W: PlannedWeights + ?Sized> StreamedLayer<'p, 'a, G, W> {
-    /// Minimal bank ports for `RunStage::DecodeFront`.
-    pub(crate) fn decode_front_ports(
-        &mut self,
-        graph: &mut G,
-        rows: &Dim,
-        constants: &mut Vec<GraphConstant>,
-    ) -> Result<DecodeFrontPorts, GraphError> {
-        let (step, inputs) = self.step(graph, Some(rows), constants)?;
-        let tier_map = (!self.numbers.tier.is_zero())
-            .then(|| self.part(graph, BankPart::TierMap))
-            .transpose()?;
-        let site = self
-            .entries
-            .site
-            .is_some()
-            .then(|| {
-                Ok::<_, GraphError>(SiteRequestPorts {
-                    table: self.part(graph, BankPart::SiteTable)?,
-                    rows: self.part(graph, BankPart::SiteRows)?,
-                })
-            })
-            .transpose()?;
-        Ok(DecodeFrontPorts {
-            step,
-            inputs,
-            map: self.part(graph, BankPart::Map)?,
-            tier_map,
-            policy: self.part(graph, BankPart::Policy)?,
-            file: self.part(graph, BankPart::FileTable)?,
-            land_grid: self.part(graph, BankPart::LandGrid)?,
-            site,
-        })
-    }
-
-    /// Minimal bank ports for `RunStage::DecodeBack`: reads `BankPart::Step`
-    /// only when sited (without re-enqueueing `routed_step`), `BankPart::Policy`
-    /// only when the sited combine is split (`Fused`/`General`) or `needs_policy`
-    /// (general `routed_down`), `BankPart::Tier { kind }` records only when a
-    /// host tier exists, and `BankPart::SiteTable` + `BankPart::SiteOutput`
-    /// only when sited.
-    pub(crate) fn decode_back_ports(&mut self, graph: &mut G, needs_policy: bool) -> Result<DecodeBackPorts, GraphError> {
-        let sited = self.entries.site.is_some();
-        let step = sited.then(|| self.part(graph, BankPart::Step)).transpose()?;
-        let tier_records = (!self.numbers.tier.is_zero())
-            .then(|| self.parts(graph, |kind| BankPart::Tier { kind }))
-            .transpose()?;
-        let policy = needs_policy
-            .then(|| self.part(graph, BankPart::Policy))
-            .transpose()?;
-        let site = sited
-            .then(|| {
-                Ok::<_, GraphError>(SiteCombinePorts {
-                    table: self.part(graph, BankPart::SiteTable)?,
-                    output: self.part(graph, BankPart::SiteOutput)?,
-                })
-            })
-            .transpose()?;
-        Ok(DecodeBackPorts { step, tier_records, policy, site })
-    }
-
     pub(crate) fn decode_ports(
         &mut self,
         graph: &mut G,

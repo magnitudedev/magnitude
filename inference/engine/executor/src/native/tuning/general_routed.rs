@@ -631,10 +631,13 @@ pub(crate) struct RoutedDownProjectTuning {
     pub resident: RoutedDownTuning,
     /// The streamed layers that launch it.
     pub layers: Vec<WeightScope>,
+    pub bank: crate::BankBinding,
 }
 
 pub(crate) struct RoutedDownProjectCase {
     down: RoutedDownCase,
+    routing: Tensor,
+    step: Tensor,
     published: CaseState,
 }
 
@@ -666,20 +669,24 @@ impl EntryTuning for RoutedDownProjectTuning {
         let mut over = self.resident.clone();
         over.scopes = self.layers.clone();
         let shape = self.resident.binding.shape;
-        let routing = RoutedShape { experts: self.resident.experts, ..routing_shape(&self.resident.binding) };
-        let table = routes(point.rows, routing);
+        let routing_shape_cfg = RoutedShape { experts: self.resident.experts, ..routing_shape(&self.resident.binding) };
+        let table = routes(point.rows, routing_shape_cfg);
+        let region = self.bank.words;
+        let step_words = magnitude_kernels::constants::STEP_WORDS;
         over.rotation(inputs, point)?
             .into_iter()
             .enumerate()
             .map(|(index, mut down)| {
                 down.sources = bank_sources(inputs, point.rows, shape.selected, &table)?;
+                let routing = Tensor::words(&inputs.charges, Element::i32(), &[region.flight, region.routing_words()])?;
+                let step = Tensor::words(&inputs.charges, Element::i32(), &[step_words])?;
                 let published = inputs.activation(
                     self.resident.binding.activation,
                     &[point.rows, shape.selected, shape.expert_hidden],
                     100 + index as u64,
                 )?;
                 let published = inputs.state(published, 0..point.rows)?;
-                Ok(RoutedDownProjectCase { down, published })
+                Ok(RoutedDownProjectCase { down, routing, step, published })
             })
             .collect()
     }
@@ -691,6 +698,8 @@ impl EntryTuning for RoutedDownProjectTuning {
             sources: &case.down.sources,
             expert_down: &case.down.expert_down,
             tier_down: &case.down.tier_down,
+            routing: &case.routing,
+            step: &case.step,
             mode: 0,
             published: case.published.tensor_mut(),
         }

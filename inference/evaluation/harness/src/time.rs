@@ -2401,7 +2401,7 @@ fn estimated(
     let bank = execution.draft().load().expert_bank().filter(|bank| !bank.whole()).ok_or_else(|| unavailable("the plan holds its experts whole"))?;
     let mut by_slots = Vec::new();
     for slots in 1..=costs.experts {
-        let held = magnitude_cost_model::HeldSlots { slots, host };
+        let held = magnitude_cost_model::HeldSlots::tiered(slots, host);
         let performance = streamed_estimate(machine, figures, execution, bank, &request, held)
             .map_err(|error| error.to_string())?;
         let Performance::Estimated(estimates) = performance else {

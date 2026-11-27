@@ -31,8 +31,7 @@
 
 use crate::decode_pass_plan::{
     AcceptanceProfile, BatchPlanCandidate, ComputePricing, DecodePassPlan, DecodePassScorer,
-    DrafterSpec, FrontCreditModel, HorizonLimits, PassCostModel, PassId, RowMissPricing,
-    seal_batch_plans,
+    FrontCreditModel, HorizonLimits, PassCostModel, PassId, RowMissPricing, seal_batch_plans,
 };
 use magnitude_cost_model::LaunchPrices;
 use magnitude_executor::{draft_ladder, LaunchDuration, RequestId, StreamedVerifyPrior, TokenId};
@@ -65,10 +64,10 @@ const MAX_COST_BUCKETS: usize = 64;
 const STALE_ROUNDS: u64 = 100;
 /// Minimum rounds before an older streamed verify width whose cost exceeds
 /// what a more recent, warmed-up narrower width predicts via
-/// `StreamedVerifyPrior` is re-probed (backing off exponentially up to
-/// `STALE_ROUNDS` if the re-probe confirms the wider width is still slow),
-/// preventing cold-start residency timings from locking out wider widths.
-const WARMUP_DRIFT_ROUNDS: u64 = 16;
+/// `StreamedVerifyPrior` is re-probed (`COST_SAMPLES + 1 = 4`, so a cold-bank
+/// wider width re-probes immediately once a narrower width proves warm, then
+/// backs off exponentially `4 -> 8 -> 16 -> 32 -> 64 -> 100` if confirmed slow).
+const WARMUP_DRIFT_ROUNDS: u64 = 4;
 /// The share of decode time spent on looks: wider and plain, each scaled
 /// down where little can be gained.
 const LOOK_SHARE: f64 = 0.01;
@@ -162,7 +161,7 @@ impl Durations {
     }
 
     fn reprobe_interval(&self) -> u64 {
-        (WARMUP_DRIFT_ROUNDS << self.stale_probes.min(3)).min(STALE_ROUNDS)
+        (WARMUP_DRIFT_ROUNDS << self.stale_probes.min(5)).min(STALE_ROUNDS)
     }
 
     fn record(&mut self, round: u64, seconds: f64, covering: bool) {
@@ -381,17 +380,6 @@ impl LaunchCosts {
     fn record(costs: &mut BTreeMap<usize, Durations>, round: u64, size: usize, seconds: f64, covering: bool) {
         costs.entry(size).or_default().record(round, seconds, covering);
     }
-
-    /// The most the measurements prove a launch of `size` costs at least: a
-    /// larger launch costs no less than a smaller one. A larger launch
-    /// proves nothing about a smaller one (a 16-row launch costs more than
-    /// twice an 8-row one where the rows cross a class).
-    fn at_least(costs: &BTreeMap<usize, Durations>, size: usize) -> f64 {
-        costs
-            .range(..=size)
-            .map(|(_, durations)| durations.cost())
-            .fold(0.0, f64::max)
-    }
 }
 
 /// Measured target launch costs at one `(regime_epoch, context_class, sequences)`:
@@ -456,11 +444,11 @@ impl TargetCosts {
     }
 }
 
-/// Evict the least-recently-updated `(context_class, sequences)` draft buckets
-/// whenever `costs` exceeds [`MAX_COST_BUCKETS`], never evicting `keep`.
+/// Evict the least-recently-updated `(regime_epoch, context_class, sequences)`
+/// draft buckets whenever `costs` exceeds [`MAX_COST_BUCKETS`], never evicting `keep`.
 fn prune_draft_costs(
-    costs: &mut BTreeMap<(usize, usize), BTreeMap<usize, Durations>>,
-    keep: (usize, usize),
+    costs: &mut BTreeMap<(Option<u64>, usize, usize), BTreeMap<usize, Durations>>,
+    keep: (Option<u64>, usize, usize),
 ) {
     while costs.len() > MAX_COST_BUCKETS {
         let Some(victim) = costs
@@ -498,11 +486,12 @@ fn prune_target_costs(
 /// requests sharing a launch. Borrows `DraftLoadState`'s draft and target cost
 /// tables under the load's lock with zero cloning.
 struct RoundCosts<'a> {
-    draft_costs: &'a BTreeMap<(usize, usize), BTreeMap<usize, Durations>>,
+    draft_costs: &'a BTreeMap<(Option<u64>, usize, usize), BTreeMap<usize, Durations>>,
     target_costs: &'a BTreeMap<(Option<u64>, usize, usize), TargetCosts>,
     verify_prior: Option<&'a StreamedVerifyPrior>,
     launch_prices: Option<&'a LaunchPrices>,
-    regime_epoch: Option<u64>,
+    draft_regime_epoch: Option<u64>,
+    target_regime_epoch: Option<u64>,
     round: u64,
     context_class: usize,
     /// Requests sharing each launch.
@@ -514,7 +503,7 @@ struct RoundCosts<'a> {
 impl<'a> RoundCosts<'a> {
     #[allow(clippy::too_many_arguments)]
     fn from_parts(
-        draft_costs: &'a BTreeMap<(usize, usize), BTreeMap<usize, Durations>>,
+        draft_costs: &'a BTreeMap<(Option<u64>, usize, usize), BTreeMap<usize, Durations>>,
         target_costs: &'a BTreeMap<(Option<u64>, usize, usize), TargetCosts>,
         verify_prior: Option<&'a StreamedVerifyPrior>,
         launch_prices: Option<&'a LaunchPrices>,
@@ -523,13 +512,18 @@ impl<'a> RoundCosts<'a> {
         sequences: usize,
         after_drafting: Option<bool>,
     ) -> Self {
-        let regime_epoch = verify_prior.map(|p| p.regime_epoch);
+        let target_regime_epoch = verify_prior.map(|p| p.regime_epoch);
+        let draft_regime_epoch = launch_prices
+            .is_some_and(LaunchPrices::is_draft_banked)
+            .then_some(target_regime_epoch)
+            .flatten();
         Self {
             draft_costs,
             target_costs,
             verify_prior,
             launch_prices,
-            regime_epoch,
+            draft_regime_epoch,
+            target_regime_epoch,
             round,
             context_class,
             sequences,
@@ -557,20 +551,24 @@ impl<'a> RoundCosts<'a> {
     }
 
     fn own_draft(&self) -> Option<&BTreeMap<usize, Durations>> {
-        self.draft_costs.get(&(self.context_class, self.sequences))
+        self.draft_costs
+            .get(&(self.draft_regime_epoch, self.context_class, self.sequences))
     }
 
     fn own_target(&self) -> Option<&TargetCosts> {
-        self.target_costs.get(&(self.regime_epoch, self.context_class, self.sequences))
+        self.target_costs
+            .get(&(self.target_regime_epoch, self.context_class, self.sequences))
     }
 
-    /// Draft measurements at no longer a context and of no more requests.
+    /// Draft measurements in the current regime at no longer a context and of
+    /// no more requests.
     fn lesser_draft(&self) -> impl Iterator<Item = &BTreeMap<usize, Durations>> + '_ {
-        let (context_class, sequences) = (self.context_class, self.sequences);
+        let (regime, context_class, sequences) = (self.draft_regime_epoch, self.context_class, self.sequences);
         self.draft_costs
-            .range(..=(context_class, sequences))
-            .filter(move |&(&(context, shared), _)| {
-                context <= context_class
+            .range((regime, 0, 0)..=(regime, context_class, sequences))
+            .filter(move |&(&(r, context, shared), _)| {
+                r == regime
+                    && context <= context_class
                     && shared <= sequences
                     && (context, shared) != (context_class, sequences)
             })
@@ -580,7 +578,7 @@ impl<'a> RoundCosts<'a> {
     /// Target measurements in the current regime at no longer a context and of
     /// no more requests.
     fn lesser_target(&self) -> impl Iterator<Item = &TargetCosts> + '_ {
-        let (regime, context_class, sequences) = (self.regime_epoch, self.context_class, self.sequences);
+        let (regime, context_class, sequences) = (self.target_regime_epoch, self.context_class, self.sequences);
         self.target_costs
             .range((regime, 0, 0)..=(regime, context_class, sequences))
             .filter(move |&(&(r, context, shared), _)| {
@@ -592,20 +590,20 @@ impl<'a> RoundCosts<'a> {
             .map(|(_, costs)| costs)
     }
 
-    /// Draft measurements of as many requests at a shorter context, with how
-    /// many times longer this context class is.
+    /// Draft measurements in the current regime of as many requests at a
+    /// shorter context, with how many times longer this context class is.
     fn shorter_draft(&self) -> impl Iterator<Item = (f64, &BTreeMap<usize, Durations>)> + '_ {
-        let (context_class, sequences) = (self.context_class, self.sequences);
+        let (regime, context_class, sequences) = (self.draft_regime_epoch, self.context_class, self.sequences);
         self.draft_costs
-            .range(..(context_class, 0))
-            .filter(move |&(&(context, shared), _)| context < context_class && shared == sequences)
-            .map(move |(&(context, _), costs)| (context_class as f64 / context as f64, costs))
+            .range((regime, 0, 0)..(regime, context_class, 0))
+            .filter(move |&(&(r, context, shared), _)| r == regime && context < context_class && shared == sequences)
+            .map(move |(&(_, context, _), costs)| (context_class as f64 / context as f64, costs))
     }
 
     /// Target measurements in the current regime of as many requests at a
     /// shorter context, with how many times longer this context class is.
     fn shorter_target(&self) -> impl Iterator<Item = (f64, &TargetCosts)> + '_ {
-        let (regime, context_class, sequences) = (self.regime_epoch, self.context_class, self.sequences);
+        let (regime, context_class, sequences) = (self.target_regime_epoch, self.context_class, self.sequences);
         self.target_costs
             .range((regime, 0, 0)..(regime, context_class, 0))
             .filter(move |&(&(r, context, shared), _)| r == regime && context < context_class && shared == sequences)
@@ -621,15 +619,59 @@ impl<'a> RoundCosts<'a> {
         }
     }
 
+    /// Whether the target table is in a total cold-start `M = 1` lockout:
+    /// plain decode (`verify[sequences]`) has proven fresh more recently than
+    /// every measured non-plain width, and every measured non-plain width is
+    /// still unproven (`!d.proven()`) and super-linear (`d.cost() > scale * plain.cost()`).
+    ///
+    /// When true, any non-plain width at least `d.reprobe_interval()` rounds
+    /// old is superseded for re-probe so cold JIT/warmup spikes on rounds 1..3
+    /// cannot permanently lock out drafting once plain decode settles warm,
+    /// without re-probing a genuinely slow wide cliff when narrower widths
+    /// already draft cleanly.
+    fn unproven_superseded(&self, d: &Durations, scale: f64) -> bool {
+        if d.proven() || self.round.saturating_sub(d.latest()) < d.reprobe_interval() {
+            return false;
+        }
+        let plain_rows = self.sequences.max(1);
+        self.own_target().is_some_and(|own| {
+            own.verify.get(&plain_rows).is_some_and(|plain| {
+                plain.proven()
+                    && plain.is_fresh(self.round)
+                    && plain.latest() > d.latest()
+                    && d.cost() > plain.cost() * scale
+                    && own.verify.iter().all(|(&r, other)| {
+                        r <= plain_rows
+                            || (!other.proven()
+                                && plain.latest() > other.latest()
+                                && other.cost() > plain.cost() * (r as f64 / plain_rows as f64))
+                    })
+            })
+        })
+    }
+
+    fn at_least_live(
+        costs: &BTreeMap<usize, Durations>,
+        size: usize,
+        mut is_live: impl FnMut(usize, &Durations) -> bool,
+    ) -> f64 {
+        costs
+            .range(..=size)
+            .filter(|&(&rows, durations)| is_live(rows, durations))
+            .map(|(_, durations)| durations.cost())
+            .fold(0.0, f64::max)
+    }
+
     fn draft_seconds_from_table(&self, size: usize) -> f64 {
         let own = self.own_draft();
-        let unproven = match own.and_then(|own| own.get(&size)) {
+        let is_live = |generated: usize, d: &Durations| !self.unproven_superseded(d, generated.max(1) as f64);
+        let unproven = match own.and_then(|own| own.get(&size)).filter(|d| is_live(size, d)) {
             Some(durations) if durations.proven() => return durations.cost(),
             Some(durations) => durations.cost(),
             None => own
                 .into_iter()
-                .map(|own| LaunchCosts::at_least(own, size))
-                .chain(self.lesser_draft().map(|measured| LaunchCosts::at_least(measured, size)))
+                .map(|own| Self::at_least_live(own, size, is_live))
+                .chain(self.lesser_draft().map(|measured| Self::at_least_live(measured, size, is_live)))
                 .fold(0.0, f64::max),
         };
         let larger = own
@@ -648,15 +690,25 @@ impl<'a> RoundCosts<'a> {
 
     fn verify_seconds_from_table(&self, size: usize) -> f64 {
         let own = self.own_target().map(|t| &t.verify);
-        let is_non_plain = size > self.sequences.max(1);
-        let fresh_or_plain = |durations: &Durations| !is_non_plain || durations.is_fresh(self.round);
-        let unproven = match own.and_then(|own| own.get(&size)).filter(|d| fresh_or_plain(d)) {
+        let plain_rows = self.sequences.max(1);
+        let is_non_plain = size > plain_rows;
+        let not_superseded = |rows: usize, durations: &Durations| {
+            rows <= plain_rows
+                || !self.unproven_superseded(durations, rows as f64 / plain_rows as f64)
+        };
+        let unproven = match own
+            .and_then(|own| own.get(&size))
+            .filter(|d| (!is_non_plain || d.is_fresh(self.round)) && not_superseded(size, d))
+        {
             Some(durations) if durations.proven() => return durations.cost(),
             Some(durations) => durations.cost(),
             None => own
                 .into_iter()
-                .map(|own| LaunchCosts::at_least(own, size))
-                .chain(self.lesser_target().map(|measured| LaunchCosts::at_least(&measured.verify, size)))
+                .map(|own| Self::at_least_live(own, size, not_superseded))
+                .chain(
+                    self.lesser_target()
+                        .map(|measured| Self::at_least_live(&measured.verify, size, not_superseded)),
+                )
                 .fold(0.0, f64::max),
         };
         let larger = own
@@ -668,7 +720,7 @@ impl<'a> RoundCosts<'a> {
             measured
                 .verify
                 .get(&size)
-                .filter(|durations| durations.proven() && fresh_or_plain(durations))
+                .filter(|durations| durations.proven() && (size <= plain_rows || durations.is_fresh(self.round)))
                 .map(|durations| ratio * durations.cost())
         });
         larger.chain(shorter).fold(unproven, f64::min)
@@ -678,7 +730,11 @@ impl<'a> RoundCosts<'a> {
         if generated == 0 {
             return 0.0;
         }
-        if self.own_draft().is_none_or(|own| !own.contains_key(&generated)) {
+        let has_live_draft = self.own_draft().is_some_and(|own| {
+            own.get(&generated)
+                .is_some_and(|d| !self.unproven_superseded(d, generated as f64))
+        });
+        if !has_live_draft {
             if let Some(prior) = self
                 .launch_prices
                 .filter(|prices| self.verify_prior.is_some() || !prices.is_banked())
@@ -767,9 +823,13 @@ impl<'a> RoundCosts<'a> {
         // so one noisy verify spike or one lucky low-miss plain round cannot
         // collapse draft width to M = 1.
         let streamed = self.verify_prior.is_some();
+        let plain_rows = self.sequences.max(1);
         let has_live = self.own_target().is_some_and(|own| {
             own.verify.get(&rows).is_some_and(|d| {
-                let valid = (!streamed || d.proven()) && (!is_non_plain || d.is_fresh(self.round));
+                let valid = (!streamed || d.proven())
+                    && (!is_non_plain || d.is_fresh(self.round))
+                    && (!is_non_plain
+                        || !self.unproven_superseded(d, rows as f64 / plain_rows as f64));
                 if !valid {
                     return false;
                 }
@@ -782,7 +842,13 @@ impl<'a> RoundCosts<'a> {
                     if let Some(prior) = self.verify_prior {
                         if let Some(prior_rows) = Self::prior_verify_seconds(prior, self.sequences, rows) {
                             let warmed_up = own.verify.iter().any(|(&ref_rows, ref_dur)| {
-                                ref_rows < rows
+                                // A below-knee width fitting in VRAM does not
+                                // imply an above-knee width stopped thrashing.
+                                let crosses_vram_knee = prior
+                                    .vram_knee_rows
+                                    .is_some_and(|knee| ref_rows <= knee && rows > knee);
+                                !crosses_vram_knee
+                                    && ref_rows < rows
                                     && ref_dur.proven()
                                     && ref_dur.is_fresh(self.round)
                                     && ref_dur.latest() > d.latest()
@@ -818,7 +884,23 @@ impl<'a> RoundCosts<'a> {
                         if let Some(prior_ref) =
                             Self::prior_verify_seconds(prior, self.sequences, ref_rows).filter(|&p| p > 0.0)
                         {
-                            return ref_dur.cost() * (prior_rows / prior_ref);
+                            let anchored = ref_dur.cost() * (prior_rows / prior_ref);
+                            // When anchoring a wider width from plain `M = 1`
+                            // decode (`ref_rows == self.sequences`), if a fresh
+                            // re-probe already measured strictly faster than
+                            // the anchored prior, trust it immediately so one
+                            // successful trial exits `M = 1` without waiting
+                            // for 3 separate trials.
+                            if is_non_plain && ref_rows == self.sequences.max(1) {
+                                if let Some(live) = self
+                                    .own_target()
+                                    .and_then(|own| own.verify.get(&rows))
+                                    .filter(|d| d.measured() && d.is_fresh(self.round) && d.cost() < anchored)
+                                {
+                                    return live.cost();
+                                }
+                            }
+                            return anchored;
                         }
                     }
                     return prior_rows;
@@ -901,11 +983,58 @@ impl<'a> RoundCosts<'a> {
     /// Build a [`PassCostModel`] representing this round's target verify and
     /// switch costs for `verified in 0..=max_v` so `DraftController` and
     /// `share_rows` score exclusively through [`DecodePassScorer`].
+    ///
+    /// When `self.verify_prior` is present (banked streamed MoE), builds from
+    /// [`PassCostModel::from_streamed_prior`] anchored to live `self.verify(..)`
+    /// while keeping `compute` vs `io` separated so front rows (`F > 0`) pay
+    /// `ΔC + front_waste` and earn `front_credit` rather than full compulsory
+    /// I/O.
     fn pass_cost_model(&self, generated: usize, max_v: usize) -> PassCostModel {
         let switch = self
             .switching(generated > 0)
             .and_then(|switch| self.switch(switch))
             .map_or(0.0, |switch| self.switch_weight * switch);
+        if let Some(prior) = self.verify_prior {
+            let mut model = PassCostModel::from_streamed_prior(prior);
+            let row_count = 1 + max_v;
+            let mut by_rows = Vec::with_capacity(row_count);
+            let mut anchored_io = Vec::with_capacity(row_count);
+            for r in 1..=row_count {
+                let prior_c = model.compute.seconds(r);
+                let prior_io = model.io.compulsory_io_seconds(r - 1);
+                let prior_total = prior_c.max(prior_io);
+                let live_total = self.verify(self.sequences * r);
+                if prior_total > 0.0 && live_total.is_finite() && live_total > 0.0 {
+                    let scale = live_total / prior_total;
+                    by_rows.push(prior_c * scale);
+                    anchored_io.push(prior_io * scale);
+                } else {
+                    by_rows.push(live_total.max(0.0));
+                    anchored_io.push(prior_io);
+                }
+            }
+            model.compute = ComputePricing { by_rows };
+            if let RowMissPricing::ExpectedRates {
+                exact_row_misses,
+                verify_marginal_misses,
+                demand_seconds_per_miss,
+                ..
+            } = &mut model.io
+            {
+                let exact = anchored_io.first().copied().unwrap_or(0.0).max(0.0);
+                let marginals: Vec<f64> = anchored_io
+                    .windows(2)
+                    .map(|w| (w[1] - w[0]).max(0.0))
+                    .collect();
+                let has_io = exact > 0.0 || marginals.iter().any(|&m| m > 0.0);
+                *exact_row_misses = exact;
+                *verify_marginal_misses = marginals;
+                *demand_seconds_per_miss = if has_io { 1.0 } else { 0.0 };
+            }
+            model.verify_host_overhead_seconds += switch;
+            model.non_verify_host_overhead_seconds += switch;
+            return model;
+        }
         let by_rows = (0..=max_v)
             .map(|v| self.verify(self.sequences * (v + 1)))
             .collect();
@@ -1035,9 +1164,11 @@ pub fn share_rows(outlooks: &[DraftOutlook], rows: usize) -> Option<Vec<usize>> 
 /// with no nested locks.
 #[derive(Clone, Debug)]
 struct DraftLoadState {
-    /// Drafter launch costs by `(context_class, sequences)`: independent of
-    /// target expert-bank residency regimes.
-    draft_costs: BTreeMap<(usize, usize), BTreeMap<usize, Durations>>,
+    /// Drafter launch costs by `(draft_regime_epoch, context_class, sequences)`:
+    /// `draft_regime_epoch` is `None` for resident drafters (so target-bank
+    /// resizes never wipe valid resident drafter measurements) and `Some(epoch)`
+    /// only when the drafter itself is banked/streamed (`LaunchPrices::is_draft_banked`).
+    draft_costs: BTreeMap<(Option<u64>, usize, usize), BTreeMap<usize, Durations>>,
     /// Target verify/switch costs by `(regime_epoch, context_class, sequences)`:
     /// keyed to the target bank's physical `regime_epoch` so prior-regime
     /// measurements are inapplicable by construction.
@@ -1049,6 +1180,13 @@ struct DraftLoadState {
     look_seconds: f64,
     /// The decode time set aside for the next plain look.
     plain_seconds: f64,
+    /// Consecutive rounds where `fastest == 0` (`M = 1` plain decode) on a
+    /// streamed MoE load, used to schedule bounded neighboring-width trials
+    /// so stale cold samples or transfer-regime shifts cannot trap `M = 1`.
+    plain_streak: u64,
+    /// Exponential backoff counter (`4 -> 8 -> 16 -> 32 -> 64 -> 100` rounds)
+    /// when bounded neighboring-width trials confirm `M = 1` still wins.
+    plain_trial_backoff: u8,
     /// Whether `draft_costs` / `target_costs` hold a duration measured beside
     /// the expert bank's cover read ([`Self::settle`]).
     beside_cover: bool,
@@ -1071,6 +1209,8 @@ impl Default for DraftLoadState {
             look_run: 1,
             look_seconds: 0.0,
             plain_seconds: 0.0,
+            plain_streak: 0,
+            plain_trial_backoff: 0,
             beside_cover: false,
             verify_prior: None,
             launch_prices: None,
@@ -1100,6 +1240,18 @@ impl DraftLoadState {
     fn regime_epoch(&self) -> Option<u64> {
         self.verify_prior.as_ref().map(|p| p.regime_epoch)
     }
+
+    fn is_draft_banked(&self) -> bool {
+        self.launch_prices
+            .as_ref()
+            .is_some_and(LaunchPrices::is_draft_banked)
+    }
+
+    fn draft_regime_epoch(&self) -> Option<u64> {
+        self.is_draft_banked()
+            .then(|| self.regime_epoch())
+            .flatten()
+    }
 }
 
 /// What a load's requests share: launch costs by context class and sequence
@@ -1119,15 +1271,29 @@ impl DraftLoad {
     }
 
     /// Observe the streamed target verify prior for the current round.
-    /// Target verify/enter/leave durations are keyed directly by
-    /// `regime_epoch`, so any regime change makes prior-regime target costs
-    /// inapplicable by construction; older-regime entries are also pruned to
-    /// bound memory while preserving `draft_costs`.
+    /// Target verify/enter/leave durations are keyed directly by `regime_epoch`,
+    /// so any target-bank regime change makes prior-regime target measurements
+    /// inapplicable by construction and prunes them. Resident drafter
+    /// `draft_costs` are preserved across target-only bank resizes; `draft_costs`
+    /// are invalidated on `regime_epoch` transitions only when the drafter
+    /// itself is banked/streamed (`LaunchPrices::is_draft_banked`).
     pub fn observe_streamed(&self, prior: Option<StreamedVerifyPrior>) {
         let mut state = self.lock();
         let next_regime = prior.as_ref().map(|p| p.regime_epoch);
+        let next_draft_regime = state
+            .is_draft_banked()
+            .then_some(next_regime)
+            .flatten();
         if state.regime_epoch() != next_regime {
             state.target_costs.retain(|&(regime, ..), _| regime == next_regime);
+            state.plain_seconds = 0.0;
+            state.plain_streak = 0;
+            state.plain_trial_backoff = 0;
+        }
+        if state.draft_regime_epoch() != next_draft_regime {
+            state
+                .draft_costs
+                .retain(|&(regime, ..), _| regime == next_draft_regime);
         }
         state.verify_prior = prior;
     }
@@ -1136,7 +1302,15 @@ impl DraftLoad {
     /// `D(g)` and `V(v+1)` launches and unscored proposal depths start from
     /// the cost model's prior rather than zero-cost `UNSCORED` probing.
     pub fn observe_launch_prices(&self, prices: Option<LaunchPrices>) {
-        self.lock().launch_prices = prices;
+        let mut state = self.lock();
+        let prev_draft_regime = state.draft_regime_epoch();
+        state.launch_prices = prices;
+        let next_draft_regime = state.draft_regime_epoch();
+        if prev_draft_regime != next_draft_regime {
+            state
+                .draft_costs
+                .retain(|&(regime, ..), _| regime == next_draft_regime);
+        }
     }
 }
 
@@ -1406,14 +1580,16 @@ impl DraftController {
     /// physical regime.
     pub fn measured(&self) -> LaunchCosts {
         let state = self.load.lock();
+        let draft_regime = state.draft_regime_epoch();
+        let target_regime = state.regime_epoch();
         let draft = state
             .draft_costs
-            .get(&(self.context_class, self.sequences))
+            .get(&(draft_regime, self.context_class, self.sequences))
             .cloned()
             .unwrap_or_default();
         let target = state
             .target_costs
-            .get(&(state.regime_epoch(), self.context_class, self.sequences))
+            .get(&(target_regime, self.context_class, self.sequences))
             .cloned()
             .unwrap_or_default();
         LaunchCosts {
@@ -1536,9 +1712,19 @@ impl DraftController {
         limit: usize,
     ) -> (usize, f64) {
         let max_v = limit.min(generated).min(right.len());
+        let horizon_len = limit.min(right.len());
         let pass_costs = costs.pass_cost_model(generated, max_v);
-        let acceptance = AcceptanceProfile::Cumulative(right[..max_v].to_vec());
-        let plan = DecodePassScorer::seal_plan_on_widths(
+        // Use the full population survival horizon `right[..horizon_len]` across
+        // all candidate `generated` widths so `FrontCreditModel::total_exposed_wait`
+        // is evaluated on a consistent time horizon when comparing `G = 0`, narrow
+        // `G`, and wider `G` with `F > 0`.
+        let acceptance = AcceptanceProfile::Cumulative(right[..horizon_len].to_vec());
+        // Pass `horizon_len` (not `max_v`) as `max_front` so `G = 0` does not
+        // trip the `max_front == 0` verify-only suppression of `front_credit`:
+        // `seal_unchained_plan_on_widths` already enforces `F == 0` for `K == 0`
+        // while keeping `total_exposed_wait` consistent across `G = 0` and `G > 0`.
+        let max_front = if costs.verify_prior.is_some() { horizon_len } else { 0 };
+        let plan = DecodePassScorer::seal_unchained_plan_on_widths(
             PassId {
                 request: RequestId(0),
                 generation: 0,
@@ -1548,6 +1734,7 @@ impl DraftController {
             costs.draft(generated),
             1 + max_v,
             self.verify_widths(max_v),
+            max_front,
             &acceptance,
             HorizonLimits::UNBOUNDED,
             &pass_costs,
@@ -1603,31 +1790,8 @@ impl DraftController {
         .sharing_switches(self.depths.first().map_or(MEMORY, |slot| slot.means.weight()));
         let right = self.right();
         // Decision Time 1 (Pre-Draft): choose the fastest legal generation
-        // budget `G` through the single-owner `DecodePassScorer::choose_generation_budget`
-        // (and align `verified` to the drafter's discrete ladder).
-        let drafter_widths: Vec<(usize, f64)> = self
-            .ladder
-            .iter()
-            .copied()
-            .filter(|&w| w <= limit)
-            .map(|w| (w, costs.draft(w)))
-            .collect();
-        let drafter_spec = DrafterSpec::Block { widths: drafter_widths };
-        let pass_costs = costs.pass_cost_model(limit, limit.min(right.len()));
-        let acceptance = AcceptanceProfile::Cumulative(right.clone());
-        let _budget_plan = DecodePassScorer::choose_generation_budget(
-            PassId {
-                request: RequestId(0),
-                generation: 0,
-                pass: state.rounds,
-            },
-            &drafter_spec,
-            1 + limit,
-            &acceptance,
-            HorizonLimits::UNBOUNDED,
-            &pass_costs,
-        );
-        // The fastest pair on the drafter's discrete ladder. Of equal rates the narrowest.
+        // budget `G` on the drafter's discrete ladder using the full
+        // `(K, F)`-aware rate from `DecodePassScorer`. Of equal rates the narrowest.
         let mut fastest = (0, 0, f64::NEG_INFINITY);
         for generated in self.widths(limit) {
             let (verified, rate) = self.verified(&right, &costs, generated, limit);
@@ -1735,11 +1899,35 @@ impl DraftController {
                 let worth = |(_, gain, lost): &(usize, f64, f64)| gain / lost.max(1e-12);
                 worth(a).total_cmp(&worth(b)).then(a.0.cmp(&b.0))
             });
+        // On streamed MoE, when `fastest == 0` (`M = 1`), `accepted_run` is
+        // always 0 and `LOOK_SHARE = 0.01` can starve recovery for 100+ rounds
+        // after a cold burst or transfer-regime shift. Permit a bounded
+        // neighboring-width trial with exponential backoff (`4 -> 8 -> 16 ->
+        // 32 -> 64 -> 100` rounds) whenever a wider width has positive
+        // plausible gain, while still letting `M = 1` win when genuinely faster.
+        let plain_escape_trial = if fastest > 0 {
+            state.plain_streak = 0;
+            state.plain_trial_backoff = 0;
+            false
+        } else if costs.verify_prior.is_some() && look.is_some() {
+            state.plain_streak = state.plain_streak.saturating_add(1);
+            let interval =
+                (WARMUP_DRIFT_ROUNDS << state.plain_trial_backoff.min(5)).min(STALE_ROUNDS);
+            if state.plain_streak >= interval {
+                state.plain_streak = 0;
+                state.plain_trial_backoff = state.plain_trial_backoff.saturating_add(1);
+                true
+            } else {
+                false
+            }
+        } else {
+            false
+        };
         let generated = match look {
             Some((generated, gain, lost)) => {
                 self.run_look = false;
                 state.look_seconds += LOOK_SHARE * gain.min(1.0) * costs.round(fastest, verified);
-                if state.look_seconds >= lost {
+                if state.look_seconds >= lost || plain_escape_trial {
                     state.look_seconds = 0.0;
                     generated
                 } else if self.accepted_run >= self.look_run {
@@ -1889,12 +2077,14 @@ impl DraftController {
             };
             let draft_seconds = costs.draft(self.choice.generated);
             let reserved = 1 + limit.min(right.len());
-            let mut plan = DecodePassScorer::seal_plan_on_widths(
+            let max_front = if costs.verify_prior.is_some() { max_v } else { 0 };
+            let mut plan = DecodePassScorer::seal_unchained_plan_on_widths(
                 pass_id,
                 right.len(),
                 draft_seconds,
                 reserved,
                 self.verify_widths(max_v),
+                max_front,
                 &acceptance,
                 HorizonLimits::UNBOUNDED,
                 &pass_costs,
@@ -1903,12 +2093,13 @@ impl DraftController {
             if let Some(probe_v) =
                 self.knee_probe_verify(&costs, max_v, plan.verify, state.rounds)
             {
-                plan = DecodePassScorer::seal_plan_on_widths(
+                plan = DecodePassScorer::seal_unchained_plan_on_widths(
                     pass_id,
                     right.len(),
                     draft_seconds,
                     reserved,
                     std::iter::once(probe_v),
+                    max_front,
                     &acceptance,
                     HorizonLimits::UNBOUNDED,
                     &pass_costs,
@@ -2079,9 +2270,8 @@ impl DraftController {
             load.rounds += 1;
         }
         let round = load.rounds;
-        let draft_key = (self.context_class, self.sequences);
-        let regime = load.regime_epoch();
-        let target_key = (regime, self.context_class, self.sequences);
+        let draft_key = (load.draft_regime_epoch(), self.context_class, self.sequences);
+        let target_key = (load.regime_epoch(), self.context_class, self.sequences);
         if launch == TimedLaunch::Draft {
             self.timing.drafter = match took {
                 Some(seconds) => DrafterTiming::Replayed(seconds),

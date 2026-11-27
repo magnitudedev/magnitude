@@ -22,7 +22,7 @@ _PROMO_LINK_RE = re.compile(
     r"(?:, and (?P<stall>[0-9]+(?:\.[0-9]+)?)% of that in device time beside it)?"
 )
 _STORAGE_FULL_RE = re.compile(
-    r'configuration:\s*\{"storage":\s*1\},\s*point:\s*\{"full":\s*1\}\s*\}:\s*'
+    r'configuration:\s*\{"storage":\s*\d+\},\s*point:\s*\{"full":\s*1\}\s*\}:\s*'
     r"Measured\(Timing\s*\{\s*median:\s*(?P<median>[0-9.eE+-]+)"
 )
 _BANK_SLOTS_RE = re.compile(r"the expert bank's growth ended at (?P<slots>\d+) slots")

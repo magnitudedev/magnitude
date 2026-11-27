@@ -19,6 +19,7 @@ mod conveyor;
 mod counts;
 mod layout;
 mod records;
+mod residency;
 mod sizing;
 mod table;
 
@@ -35,6 +36,7 @@ pub use counts::BankCounts;
 pub use layout::{BankAllocation, BankLayout, BankPart, BankSubstrate, BankTier, HostTier, Parking, PlacedAllocations, Placer};
 pub use records::{PoolSlab, RecordForm, RecordTensor, RecordTensors, RoutedTensor, routed_experts};
 pub(crate) use records::{decode_set, layer_homes};
+pub use residency::ResidencyOrder;
 pub use sizing::growth_target;
 pub(crate) use sizing::releasing;
 pub use table::BankTable;
@@ -223,10 +225,9 @@ pub struct ExpertBankPlan {
     /// routing records (`BankPart::Keys`) whatever it traces, since
     /// placement ranks by them.
     pub recording: bool,
-    /// Derived minimum expected per-row miss-DMA bytes for 3-stage `DecodeHits`
-    /// splitting (`overhead_s / transfer_s_per_byte` from measured
-    /// `ExecutorCosts` and `TierCopyCosts::transfer`); `0` when unpriced.
-    pub decode_hits_min_bytes: u64,
+    /// Precomputed 1D marginal-value VRAM residency schedule across all bank
+    /// groups (`0..=max_slots`), frozen into `BankCounts` when the bank opens.
+    residency: ResidencyOrder,
 }
 
 /// A bank's model store's path as its plan priced it: its stored read line
@@ -572,40 +573,12 @@ impl ExpertBankPlan {
             }
     }
 
-    /// Whether a decode step lands this bank's missed experts on demand
-    /// (`DecodeFront -> DMA -> DecodeBack`, `experts::decode_dma_enabled`):
-    /// only a tier-placed bank that is not whole. Single owner shared by the
-    /// bank's transport and the blocks' served stages.
+    /// Whether a decode step runs the unified zero-switch 3-tier pipeline on
+    /// this bank (`experts::decode_dma_enabled`): only a tier-placed bank that
+    /// is not whole. Single owner shared by the bank's transport and graphs.
     pub fn decode_dma(&self, backend: seismic::BackendName) -> bool {
         crate::experts::decode_dma_enabled(backend) && self.placer() == Placer::Tier && !self.whole()
     }
-
-    /// Whether streamed layer `layer` has enough expected per-row miss-DMA
-    /// bytes to justify 3-stage `DecodeHits` splitting (`expected_miss_bytes >
-    /// decode_hits_min_bytes`). Single-owner decision, read through each block's
-    /// served form (`ServedForm::of_blocks`).
-    pub fn splits_decode_hits(&self, layer: usize) -> bool {
-        let info = &self.layers()[layer];
-        if info.experts == 0 {
-            return false;
-        }
-        let vram = info.vram_slots(self.slots);
-        if vram >= info.experts {
-            return false;
-        }
-        let Ok(record_bytes) = self.groups()[info.group]
-            .record
-            .iter()
-            .map(|(_, tensor)| tensor.stored_bytes())
-            .sum::<Result<u64, String>>()
-        else {
-            return false;
-        };
-        let miss_fraction = (info.experts - vram) as f64 / info.experts as f64;
-        let expected_miss_bytes = info.selected as f64 * miss_fraction * record_bytes as f64;
-        expected_miss_bytes > self.decode_hits_min_bytes as f64
-    }
-
     /// The streamed layers whose CPU site their qualification refused, and
     /// why ([`LayerSite::Refused`]): each reads every miss over the link.
     pub fn refused_sites(&self) -> Vec<(usize, String)> {
@@ -640,15 +613,12 @@ impl ExpertBankPlan {
     pub fn binding(&self, layer: usize) -> Result<BankBinding, String> {
         let group = self.layers()[layer].group;
         let conveyor = &self.conveyor().conveyor;
-        let (staging_pools, pool_of) = self.staging_pools();
-        let pool_hints = self.structure().pool_has_target(&pool_of, staging_pools.len());
-        let layer_has_hints = pool_of[layer].iter().any(|(_, &pool)| pool_hints[pool]);
         Ok(BankBinding {
             record: self.groups()[group].record,
-            records: self.records(group),
+            records: self.slab_records(group),
             experts: self.layers()[layer].experts,
             selected: self.layers()[layer].selected,
-            staging: self.pool_staging_records_with_paths(layer_has_hints, self.paths),
+            staging: self.unified_staging_records_with_paths(self.paths),
             round_records: self.round_records(),
             widest: self.widest().get(),
             window_slots: self.window_slots(),
@@ -704,6 +674,26 @@ impl ExpertBankPlan {
             Placer::Bank => experts + self.tier_reserve(),
         };
         records.max(self.least_records(group))
+    }
+
+    /// Dedicated per-flight VRAM scratch slots appended to each group's bank
+    /// `SlabTensor` for on-device 4-CTA coalesced SM staging (`routed_stage_host`)
+    /// on discrete (`Placer::Tier`) banks (`DECODE_STAGE_SLOTS = 16`).
+    /// Only physically backed when unified 3-tier decode is active (`!whole` on
+    /// CUDA); never managed by `Directory`.
+    pub fn decode_stage_slots(&self) -> u64 {
+        if self.placer() == Placer::Tier {
+            u64::from(magnitude_cost_model::DECODE_STAGE_SLOTS)
+        } else {
+            0
+        }
+    }
+
+    /// Total logical slab extent of group `group`'s bank `SlabTensor`:
+    /// `self.records(group)` (owned by `Directory`) plus `self.decode_stage_slots()`
+    /// (tail VRAM scratch at `stage_base = self.records(group)`).
+    pub fn slab_records(&self, group: usize) -> u64 {
+        self.records(group) + self.decode_stage_slots()
     }
 
     /// Each member layer of group `group`, in its order.
@@ -794,13 +784,6 @@ impl ExpertBankPlan {
         }
     }
 
-    /// Whether each staging pool is used by at least one non-draft (target)
-    /// layer and therefore carries hint staging records.
-    pub fn staging_pool_has_hints(&self) -> Vec<bool> {
-        let (pools, pool_of) = self.staging_pools();
-        self.structure().pool_has_target(&pool_of, pools.len())
-    }
-
     /// Whether group `group` contains any non-draft (target) layer and
     /// therefore can receive cross-layer hints.
     pub fn group_has_hints(&self, group: usize) -> bool {
@@ -819,13 +802,17 @@ impl ExpertBankPlan {
         self.table_choices() + self.ahead_records()
     }
 
-    /// Group `group`'s host tier landing floor at `paths`: draft-only groups
-    /// never receive cross-layer hints and hold `table_choices()` only.
+    /// Group `group`'s host tier landing floor at `paths`: bounded by
+    /// `request_records(group)` (`min(widest_member(group), VERIFY_ROWS * group_selected)`)
+    /// so short `VERIFY_ROWS` prompts never deadlock at floor while narrow or
+    /// smaller-`K` groups are never over-allocated; draft-only groups omit
+    /// cross-layer hint records.
     pub fn group_landing_records_with_paths(&self, group: usize, paths: BankPaths) -> u64 {
+        let demand = self.request_records(group);
         if self.group_has_hints(group) {
-            self.table_choices() + paths.records().ahead
+            demand + paths.records().ahead
         } else {
-            self.table_choices()
+            demand
         }
     }
 
@@ -841,8 +828,12 @@ impl ExpertBankPlan {
         let Some(tier) = self.holding_storage(crate::BankHolding::Host) else {
             return Ok(None);
         };
-        let uniform_hints = (0..self.groups().len()).all(|group| self.group_has_hints(group));
-        if uniform_hints {
+        let uniform_landing = (0..self.groups().len()).all(|group| {
+            self.group_has_hints(group)
+                && self.group_landing_records(group) == self.landing_records()
+                && self.member_experts(group).sum::<u64>() >= self.landing_records()
+        });
+        if uniform_landing {
             let slot_bytes = self.groups().iter().try_fold(0u64, |total, group| {
                 Self::record_sum(&group.record, RecordTensor::record_bytes)
                     .and_then(|bytes| total.checked_add(bytes).ok_or_else(|| "landing row bytes overflow".to_owned()))
@@ -1137,111 +1128,116 @@ impl ExpertBankPlan {
         self.whole_at(self.slots)
     }
 
-    /// Minimum per-layer target VRAM working set (`decode_set(K, E, decode_rows)`
-    /// across target layers) that must be satisfied before non-splitting discrete
-    /// draft layers ramp above target layers toward full VRAM residency.
-    ///
-    /// Returns `None` on unified memory (`Placer::Bank`) or when there are no
-    /// target layers.
-    pub fn draft_pin_threshold(&self) -> Option<u64> {
-        if self.placer() != Placer::Tier {
-            return None;
-        }
-        let (selected, widest) = self
-            .layers()
-            .iter()
-            .filter(|layer| !layer.is_draft())
-            .fold((0u64, 0u64), |(sel, max_e), layer| {
-                (sel.max(layer.selected), max_e.max(layer.experts))
-            });
-        (widest > 0).then(|| decode_set(selected, widest, self.decode_rows()))
-    }
-
-    /// Extra bank slots dedicated to smoothly ramping discrete-tier separate
-    /// draft MoE layers (`WeightScope::DraftSublayer`) from
-    /// [`Self::draft_pin_threshold`] up to their full expert count (`1` slot
-    /// per step, eliminating any multi-GB step-function cliff) before target
-    /// layers grow beyond `draft_pin_threshold`. Embedded causal head layers
-    /// (`WeightScope::HeadSublayer`) share target layer width and stream at
-    /// `target_slots` rather than ramping whole. Zero when there are no
-    /// discrete-tier separate draft layers exceeding the threshold.
-    pub fn draft_extra_slots(&self) -> u64 {
-        let Some(threshold) = self.draft_pin_threshold() else {
-            return 0;
-        };
-        let widest_draft = self
-            .layers()
-            .iter()
-            .filter(|layer| matches!(layer.scope, WeightScope::DraftSublayer(_)))
-            .map(|layer| layer.experts)
-            .max()
-            .unwrap_or(0);
-        widest_draft.saturating_sub(threshold)
-    }
-
-    /// Maximum bank slot coordinate where every layer holds all of its experts
-    /// (`whole_at(max_slots()) == true`). Equals [`Self::widest`] whenever
-    /// [`Self::draft_extra_slots`] is zero.
+    /// Maximum 1D bank slot coordinate where every group holds all of its
+    /// experts (`whole_at(max_slots()) == true`). Equals [`Self::widest`] for
+    /// single-group banks and `Σ_g max_{l ∈ g} E_l` for multi-group banks.
     pub fn max_slots(&self) -> u64 {
-        let extra = self.draft_extra_slots();
-        if extra == 0 {
-            return self.widest().get();
+        self.residency.max_slots()
+    }
+
+    /// O(1) lookup of VRAM slots per layer committed for `group` at 1D bank
+    /// coordinate `slots`.
+    pub fn group_vram_slots(&self, group: usize, slots: u64) -> u64 {
+        self.residency.group_slots(group, slots)
+    }
+
+    /// O(1) lookup of VRAM records `layer` commits at 1D bank coordinate
+    /// `slots`, ordered by decreasing marginal miss-time reduction per VRAM
+    /// byte ([`ResidencyOrder`]).
+    pub fn layer_vram_slots(&self, layer: &BankLayer, slots: u64) -> u64 {
+        self.residency.layer_slots(layer, slots)
+    }
+
+    /// Mean per-layer VRAM slots across target streamed layers (or all layers
+    /// when every layer is a drafter) at 1D bank coordinate `slots`, always in
+    /// `0..=self.widest().get()`.
+    pub fn target_vram_slots(&self, slots: u64) -> u64 {
+        let mut sum = 0u64;
+        let mut count = 0u64;
+        for layer in self.layers() {
+            if !layer.is_draft() {
+                sum += self.layer_vram_slots(layer, slots);
+                count += 1;
+            }
         }
-        let threshold = self.draft_pin_threshold().expect("draft_extra_slots > 0 implies threshold");
-        let widest_target = self
+        if count == 0 {
+            for layer in self.layers() {
+                sum += self.layer_vram_slots(layer, slots);
+                count += 1;
+            }
+        }
+        if count == 0 { 0 } else { (sum + count / 2) / count }
+    }
+
+    /// Precomputed O(1) lookup table mapping raw 1D bank coordinate
+    /// `0..=self.max_slots()` to [`Self::target_vram_slots`], for lock-free
+    /// reporting in [`crate::experts::watcher::Telemetry`].
+    pub fn target_vram_slots_table(&self) -> std::sync::Arc<[u64]> {
+        (0..=self.max_slots()).map(|s| self.target_vram_slots(s)).collect::<Vec<_>>().into()
+    }
+
+    /// Recompute the 1D marginal-value residency schedule from measured
+    /// per-layer miss costs (seconds per byte) before `settle_bank` / `open`.
+    pub fn set_residency_costs(&mut self, miss_s_per_byte: &[f64]) {
+        self.residency = ResidencyOrder::compute(
+            self.groups(),
+            self.layers(),
+            self.decode_rows(),
+            self.head_steps,
+            miss_s_per_byte,
+        );
+    }
+
+    /// Per-layer `(vram, host)` disjoint holdings at `(device_slots, host_slots)`
+    /// for cost-model pricing (`BankPrices`, `DecodePrice`, `assessment`).
+    pub fn held_slots(&self, device_slots: u64, host_slots: u64) -> magnitude_cost_model::HeldSlots {
+        let count = |value: u64| usize::try_from(value).expect("a layer's experts fit usize");
+        if self.groups().len() == 1 && self.layers().iter().all(|l| l.experts == self.widest().get()) {
+            let layer = &self.layers()[0];
+            let vram = self.layer_vram_slots(layer, device_slots);
+            let host = self.layer_host_slots(layer, device_slots, host_slots);
+            return magnitude_cost_model::HeldSlots::tiered(count(vram), count(host));
+        }
+        let per_layer = self
             .layers()
             .iter()
-            .filter(|layer| !matches!(layer.scope, WeightScope::DraftSublayer(_)))
-            .map(|layer| layer.experts)
-            .max()
-            .unwrap_or(0);
-        widest_target.max(threshold) + extra
+            .map(|layer| {
+                let vram = self.layer_vram_slots(layer, device_slots);
+                let host = self.layer_host_slots(layer, device_slots, host_slots);
+                (count(vram), count(host))
+            })
+            .collect();
+        magnitude_cost_model::HeldSlots::per_layer(per_layer)
     }
 
-    /// Per-layer VRAM slots committed for target (and embedded head) layers at
-    /// bank coordinate `slots`: equals `slots` whenever
-    /// [`Self::draft_extra_slots`] is zero; otherwise holds at `threshold`
-    /// during the smooth draft-ramp phase `(threshold, threshold + extra]` and
-    /// resumes growing `1:1` thereafter.
-    pub fn target_slots(&self, slots: u64) -> u64 {
-        let extra = self.draft_extra_slots();
-        if extra == 0 {
-            return slots;
+    /// Per-layer `(vram, host)` disjoint holdings for a live bank at
+    /// `device_slots` whose host tier was sized against `host_reference_slots()`
+    /// and currently holds `host_slots`: clamps each layer's disjoint host
+    /// contribution to `layer.experts - v_l(device_slots)` so `v_l + h_l <= E_l`
+    /// always holds even after runtime device resizes.
+    pub fn held_slots_runtime(&self, device_slots: u64, host_slots: u64) -> magnitude_cost_model::HeldSlots {
+        let count = |value: u64| usize::try_from(value).expect("a layer's experts fit usize");
+        let host_ref = self.host_reference_slots();
+        if self.groups().len() == 1 && self.layers().iter().all(|l| l.experts == self.widest().get()) {
+            let layer = &self.layers()[0];
+            let vram = self.layer_vram_slots(layer, device_slots);
+            let host = self
+                .layer_host_slots(layer, host_ref, host_slots)
+                .min(layer.experts.saturating_sub(vram));
+            return magnitude_cost_model::HeldSlots::tiered(count(vram), count(host));
         }
-        let threshold = self.draft_pin_threshold().expect("draft_extra_slots > 0 implies threshold");
-        if slots <= threshold {
-            slots
-        } else if slots <= threshold + extra {
-            threshold
-        } else {
-            slots - extra
-        }
-    }
-
-    /// The VRAM records `layer` commits at bank coordinate `slots`:
-    /// - When [`Self::draft_extra_slots`] is zero (no discrete-tier separate
-    ///   draft layers above threshold), every layer (target and embedded head)
-    ///   commits `slots.min(layer.experts)`.
-    /// - On discrete-tier banks with non-splitting separate draft layers
-    ///   (`WeightScope::DraftSublayer` on `Placer::Tier`), commits a smooth
-    ///   3-phase monotonic curve (at most +1 slot per layer per step, zero
-    ///   step-function cliff):
-    ///   1. `slots <= threshold`: target and draft grow together (`slots`).
-    ///   2. `threshold < slots <= threshold + extra`: target (and any embedded
-    ///      head) holds at `threshold` while draft ramps smoothly 1 slot at a
-    ///      time to `layer.experts` (`POLICY_WHOLE = 1`).
-    ///   3. `slots > threshold + extra`: draft stays pinned whole at
-    ///      `layer.experts` while target (and any embedded head) resumes
-    ///      growing 1 slot at a time (`slots - extra`).
-    pub fn layer_vram_slots(&self, layer: &BankLayer, slots: u64) -> u64 {
-        if self.draft_extra_slots() == 0 {
-            return layer.vram_slots(slots);
-        }
-        if matches!(layer.scope, WeightScope::DraftSublayer(_)) {
-            layer.vram_slots(slots)
-        } else {
-            layer.vram_slots(self.target_slots(slots))
-        }
+        let per_layer = self
+            .layers()
+            .iter()
+            .map(|layer| {
+                let vram = self.layer_vram_slots(layer, device_slots);
+                let host = self
+                    .layer_host_slots(layer, host_ref, host_slots)
+                    .min(layer.experts.saturating_sub(vram));
+                (count(vram), count(host))
+            })
+            .collect();
+        magnitude_cost_model::HeldSlots::per_layer(per_layer)
     }
 
     /// Whether a device bank of `slots` holds every expert of every streamed
@@ -1255,10 +1251,9 @@ impl ExpertBankPlan {
                 .all(|layer| self.layer_vram_slots(layer, slots) >= layer.experts)
     }
 
-    /// The stored bytes of the experts neither the bank's slots nor its host
-    /// tier's host slots hold (the tier's slots include the bank's), each
-    /// as its model file stores it: what the plan's misses read from the
-    /// file. None of a whole bank.
+    /// The stored bytes of the experts neither the bank's slots nor its
+    /// disjoint host tier's host slots hold, each as its model file stores it:
+    /// what the plan's misses read from the file. None of a whole bank.
     pub fn unheld_bytes(&self) -> Result<u64, String> {
         let overflow = || "unheld expert bytes overflow".to_owned();
         self.layers().iter().try_fold(0u64, |total, layer| {
@@ -1266,13 +1261,15 @@ impl ExpertBankPlan {
                 .record
                 .iter()
                 .try_fold(0u64, |bytes, (_, tensor)| bytes.checked_add(tensor.stored_bytes()?).ok_or_else(overflow))?;
-            let held = self.layer_vram_slots(layer, self.slots).max(Self::layer_slots(self.host_slots, layer.experts));
+            let vram = self.layer_vram_slots(layer, self.slots);
+            let host = self.layer_host_slots(layer, self.slots, self.host_slots);
+            let held = (vram + host).min(layer.experts);
             (layer.experts - held).checked_mul(expert).and_then(|bytes| total.checked_add(bytes)).ok_or_else(overflow)
         })
     }
 
-    /// The stored bytes of the experts the host tier's host slots hold that
-    /// the bank's slots do not: what the plan holds in host RAM alone. None
+    /// The stored bytes of the experts the disjoint host tier holds that the
+    /// bank's slots do not: what the plan holds in host RAM alone. None
     /// without a tier.
     pub fn host_only_bytes(&self) -> Result<u64, String> {
         let overflow = || "host tier expert bytes overflow".to_owned();
@@ -1281,7 +1278,7 @@ impl ExpertBankPlan {
                 .record
                 .iter()
                 .try_fold(0u64, |bytes, (_, tensor)| bytes.checked_add(tensor.stored_bytes()?).ok_or_else(overflow))?;
-            let alone = Self::layer_slots(self.host_slots, layer.experts).saturating_sub(self.layer_vram_slots(layer, self.slots));
+            let alone = self.layer_host_slots(layer, self.slots, self.host_slots);
             alone.checked_mul(expert).and_then(|bytes| total.checked_add(bytes)).ok_or_else(overflow)
         })
     }
@@ -1475,17 +1472,28 @@ impl ExpertBankPlan {
     }
 
     /// The plan with its streamed layers replaced by `layers`, its
-    /// structure's lending derived again ([`conveyor::Structured::new`]).
+    /// structure's lending and residency schedule derived again
+    /// ([`conveyor::Structured::new`], [`ResidencyOrder::default_for`]).
     #[cfg(test)]
     pub(crate) fn with_layers(self, layers: BankLayers) -> Self {
         let window_slots = self.window_slots().min(layers.widest().get());
         let decode_rows = self.decode_rows();
+        let head_steps = self.head_steps;
+        let tier_copy_dma = self.tier_copy_dma();
         let (selected, host, groups, _) = self.structured.into_parts();
         let structured = conveyor::Structured::new(selected, host, groups, layers, Some(window_slots), decode_rows)
             .expect("the layers keep the bank's lending");
         let blocks = size_pool_blocks(structured.granules(), self.allocations)
             .expect("the layers size valid bank blocks");
-        Self { structured, blocks, ..self }
+        let residency = ResidencyOrder::default_for(
+            structured.groups(),
+            structured.layers(),
+            decode_rows,
+            head_steps,
+            host.placer(),
+            tier_copy_dma,
+        );
+        Self { structured, blocks, residency, ..self }
     }
 
     /// The layer whose weights are of `scope` and its index, when the bank
@@ -1597,30 +1605,13 @@ impl ExpertBankPlan {
     /// Group `group`'s committed host tier records ([`Self::host_records`])
     /// at `host_slots` and `paths`.
     pub fn host_records_with_paths(&self, group: usize, host_slots: u64, paths: BankPaths) -> u64 {
-        match self.tiered() {
-            true => (self
-                .member_experts(group)
-                .map(|experts| Self::layer_slots(host_slots, experts))
-                .sum::<u64>()
-                .max(self.group_landing_records_with_paths(group, paths))
-                + self.host_lent(group))
-            .min(self.host_extent(group)),
-            false => 0,
-        }
+        self.host_records_at_with_paths(group, self.host_reference_slots(), host_slots, paths)
     }
 
     /// What the host tier's pools are charged ([`Self::host_charge`]) at
     /// `host_slots` and `paths`.
     pub fn host_charge_with_paths(&self, host_slots: u64, paths: BankPaths) -> Result<u64, String> {
-        if !self.tiered() {
-            return Ok(0);
-        }
-        self.pooled_charge_for(&self.blocks, |group| {
-            self.host_records_with_paths(group, host_slots, paths)
-                .checked_sub(self.host_lent(group))
-                .expect("a group's host records hold its lent ones")
-        })
-        .ok_or_else(|| "host tier bytes overflow".to_owned())
+        self.host_charge_at_with_paths(self.host_reference_slots(), host_slots, paths)
     }
 
     /// The pools' granules demanded at `slots` and `paths` (matching
