@@ -2,7 +2,8 @@
 // This module is substituted only by the test Vite server, never the desktop build.
 export * from "../../../packages/client-common/src/index"
 import { Atom, Registry, Result, useAtomValue } from "@effect-atom/atom-react"
-import { Effect, Option } from "effect"
+import { DateTime, Effect, Option, Schema } from "effect"
+import { InferenceModelsResponseSchema, SessionId } from "@magnitudedev/sdk"
 import { makeSetupModel, servingAllocation, streamingStatus } from "@magnitudedev/client-common/fixtures/model"
 import { hardware as makeHardware } from "../hardware/fixtures"
 import { useSyncExternalStore } from "react"
@@ -15,7 +16,26 @@ const models = ['Qwen3.6 35B-A3B','Gemma 4 26B-A4B','Nemotron 3.5 Lightning 30B-
 const preferenceModels = models.map((model, index) => ({ ...model,
  catalogData: { ...model.catalogData, intelligence: 10 + index * 20 },
 }))
-const modelState = {models, preparation:{assessment:{complete:true,settledModels:5,totalModels:5}}}
+const modelState = {models, preparation:{discovery:{complete:true,modelsFound:5},assessment:{complete:true,settledModels:5,totalModels:5},measurement:{_tag:'Measured' as const}},unsupported:[],hidden:[]}
+const servableModels = Schema.decodeUnknownSync(InferenceModelsResponseSchema)({
+ object:'list',
+ data:models.map((model,index)=>({
+  id:model.modelId,name:model.presentation.displayName,description:'',created:0,object:'model',owned_by:'local',context_length:32768,
+  architecture:{input_modalities:['text'],output_modalities:['text']},
+  top_provider:{context_length:32768,max_completion_tokens:32768},
+  supported_parameters:['tools'],
+  reasoning:index===0?{mandatory:false,default_enabled:true,default_effort:'medium',supported_efforts:['none','low','medium','high']}:null,
+ })),
+})
+const chatTime = { created: DateTime.unsafeMake(0), updated: DateTime.unsafeMake(0) }
+const fixtureChats = {
+ chats:[
+  {id:SessionId.make('chat-1'),title:'Summarize Q3 notes',time:chatTime,messageCount:4,running:false},
+  {id:SessionId.make('chat-2'),title:'Compare Metal and Vulkan',time:chatTime,messageCount:2,running:false},
+  {id:SessionId.make('chat-3'),title:'Draft release changelog',time:chatTime,messageCount:6,running:false},
+ ],
+ hasMore:false,
+}
 const hardware = makeHardware('Apple M4 Max', 64, 16, [{ name: 'Apple M4 Max', memory: 64, shared: true }])
 const usePhase = () => useSyncExternalStore(callback => {listeners.add(callback);return()=>listeners.delete(callback)},()=>phase)
 const failureModels = () => models.map((model, index) => index !== 0 ? model : {...model, acquisitionState: phase === 'disk-error' ? {_tag:'InstallFailed',failure:{_tag:'InsufficientDiskSpace',requiredBytes:20000000000,availableBytes:5000000000,message:'private diagnostic bytes'}} : {...model.acquisitionState,residencyState:phase === 'load-pending' ? {_tag:'Requested'} : phase === 'memory-error' ? {_tag:'Failed',failure:{_tag:'MemoryShortage',code:'memory_shortage',message:'not enough memory right now: the model requires 32358673408 bytes and 26869900903 bytes are available',retryable:true,shortage:{_tag:'Blocked',requiredBytes:32358673408,availableBytes:26869900903}}} : model.acquisitionState.residencyState}})
@@ -28,6 +48,7 @@ const memoryStateModels = () => models.map((model, index) => ({...model, acquisi
  : model.acquisitionState.residencyState}}))
 export const useCatalogModels = () => {const value=usePhase();if (value === 'memory-states') return Result.success({...modelState,models:memoryStateModels()});if (['memory-error','disk-error','load-pending'].includes(value)) return Result.success({...modelState,models:failureModels()});return value === 'loading' ? Result.initial() : value === 'error' ? Result.fail('offline') : Result.success({...modelState,preparation:{assessment:{complete:!value.startsWith("assessing"),settledModels:value==="assessing"?2:value==="assessing-more"?4:5,totalModels:5}},models:page === "models" ? models : (value === "preference" ? preferenceModels : models).map(model=>({...model,acquisitionState:value.startsWith("optimize-") ? {_tag:"Optimizing",installation:{_tag:"Resolved",installedBytes:2300000000,primaryPath:"/models/fixture.gguf",ownership:"Magnitude"},residencyState:{_tag:"Unloaded"},progress:value === "optimize-preparing" ? {stage:"preparing",completed:0,total:0,device:Option.none()} : {stage:"tuning",completed:Number(value.slice("optimize-tuning-".length)),total:400,device:Option.some({deviceId:"gpu-0",backend:"metal"})}} : value.startsWith("download-") ? {_tag:"Installing",progress:{stage:value === "download-verifying" ? "verifying" : "downloading",bytesPerSecond:value === "download-unknown" ? Option.none() : Option.some(12500000),completedBytes:value === "download-unknown" ? 0 : value === "download-complete" ? 2300000000 : 295000000,totalBytes:value === "download-unknown" ? 0 : 2300000000}} : {_tag:"NotInstalled"}}))})}
 export const useLocalModels = () => {const value=usePhase();if (value === 'memory-states') return Result.success({...modelState,models:memoryStateModels()});return value === "loading" ? Result.initial() : value === "error" ? Result.fail("offline") : Result.success(value === "status-ready" ? {...modelState,models:models.map((model,index)=>index === 0 ? {...model,acquisitionState:{...model.acquisitionState,residencyState:{_tag:"Ready",allocation:{contextWindowTokens:4096,memoryDomains:[{memoryDomainId:"system",modelBytes:2300000000,contextBytes:100000000,computeBytes:100000000,auxiliaryBytes:0}],...servingAllocation,streaming:Option.none()}}}} : model)} : modelState,{waiting:value==="refreshing"})}
+export const useLocalModelsSelector = <A,>(selector: (state: any) => A) => { const result = useLocalModels(); return Result.isSuccess(result) ? Option.some(selector(result.value)) : Option.none() }
 export const useLocalInferenceHardware = () => {const value=usePhase();return value === 'loading' || value === 'hardware-loading' ? Result.initial() : value === 'error' ? Result.fail('offline') : Result.success(hardware,{waiting:value==="refreshing"})}
 export const useLocalModelMutations = () => ({ install(){setPhase("download-unknown")},load(){setPhase("load-pending")},stop(){},cancel(){setPhase("ready")},remove(){},dismissFailure(){setPhase("ready")} })
 export const useLocalModelCommandStatus = () => ({pending:false,pendingOperations:[],failures:[]})
@@ -41,9 +62,13 @@ const idle = () => Atom.keepAlive(Atom.make(Result.initial()))
 const action = () => Atom.fn(() => Effect.void)
 const errorPhase = params.get('phase')
 const fixtureSettings = <A,>(value: A) => Atom.keepAlive(Atom.make(errorPhase === 'error' ? Result.fail('PRIVATE host diagnostics') : Result.success(value)))
+const mainPageOf = (value: string) => value === 'chat' || value === 'models' || value === 'connections' ? value : 'models'
 export const service: any = {
  page:Atom.keepAlive(Atom.make(page)),
- navigate:(value:string)=>Effect.sync(()=>{page=value;registry.set(service.page,value)}),
+ mainPage:Atom.keepAlive(Atom.make(mainPageOf(page))),
+ visit:Atom.keepAlive(Atom.make(0)),
+ onboardingPending:Atom.keepAlive(Atom.make(Option.some(false))),
+ navigate:(value:string)=>Effect.sync(()=>{page=value;registry.set(service.page,value);if(value==='chat'||value==='models'||value==='connections') registry.set(service.mainPage,value)}),
  completeOnboarding:action(),addModelRequest:Atom.keepAlive(Atom.make(Option.none())),clearAddModelRequest:Effect.void,
  notices:Atom.keepAlive(Atom.make([])),dismissNotice:()=>Effect.void,quitFailed:Atom.keepAlive(Atom.make(false)),resolveQuitFailure:action(),retryService:action(),
  readAppearance:Effect.succeed('system'),saveAppearance:()=>Effect.void,clientWindow:params.get('entry') === 'browser' ? Option.none() : Option.some({platform:'darwin'}),openPathDialog:Option.none(),serverPlatform:Option.some('darwin'),
@@ -54,10 +79,11 @@ const session = Atom.make(Result.success(service))
 const usage = Atom.keepAlive(Atom.make({result:Result.initial()}))
 // Each query reads a writable source, so a refresh recomputes the current fixture value as a refetch would.
 const querySource = () => Atom.keepAlive(Atom.make<any>({result:Result.initial()}))
-const sources = { modelStorage: querySource(), networkAccess: querySource(), machine: querySource(), connections: querySource(), owner: querySource(), health: querySource(), folders: querySource() }
+const sources = { modelStorage: querySource(), networkAccess: querySource(), machine: querySource(), connections: querySource(), owner: querySource(), health: querySource(), folders: querySource(), servableModels: querySource(), chats: querySource(), chatDefaults: querySource() }
 const derived = (source: Atom.Writable<any>) => Atom.keepAlive(Atom.make(get => get(source)))
 const queries = Object.fromEntries(Object.entries(sources).map(([key, source]) => [key, derived(source)])) as Record<keyof typeof sources, Atom.Atom<any>>
-const client = {runtime:{atom:()=>session,fn:(f:any)=>Atom.fn((input:any)=>f(input))},Models:{GetServingUsage:()=>usage},
+const client = {runtime:{atom:()=>session,fn:(f:any)=>Atom.fn((input:any)=>f(input))},Models:{GetServingUsage:()=>usage,ListServableModels:()=>queries.servableModels,ListModelLocations:()=>querySource(),GetRecommendations:()=>querySource()},
+ Chat:{ListChats:()=>queries.chats,WatchChat:()=>querySource(),ListChatModelDefaults:()=>queries.chatDefaults,StartChat:action(),SendChatMessage:action(),RetryChatResponse:action(),StopChatResponse:action(),RenameChat:action(),RemoveChat:action(),SaveChatModelDefaults:action(),ClearChatModelDefaults:action()},
  Configuration:{GetModelStorage:()=>queries.modelStorage,GetNetworkAccess:()=>queries.networkAccess,GetServerMachine:()=>queries.machine,BrowseDirectories:()=>queries.folders,SetModelStorage:action(),SetNetworkAccess:action(),RegenerateNetworkApiKey:action()},
  Connections:{WatchHarnessConnections:()=>queries.connections,ConnectHarness:action(),DisconnectHarness:action(),SyncHarnessConnections:action()},
  Application:{WatchApplicationOwner:()=>queries.owner,CheckApplicationUpdate:action(),DownloadApplicationUpdate:action(),DiscardApplicationUpdate:action(),InstallApplicationUpdate:action(),SetApplicationAutoDownload:action(),SetLaunchAtLogin:action(),RestartApplication:Atom.fn(()=>Effect.fail('PRIVATE host diagnostics')),QuitApplication:action()},
@@ -80,8 +106,11 @@ export function setPhase(value:string) {
  registry.set(sources.networkAccess,{result:settingsResult(remoteViewer
   ?{enabled:true,bind:Option.none(),requireApiKey:true,apiKey:Option.some("mag-fixture-key-0000000000000000"),interfaces:[{name:"en0",address:"192.168.1.20",kind:"lan"}],port:10100,reachableAddresses:["192.168.1.20"],pending:false,warning:Option.none()}
   :{enabled:false,bind:Option.none(),requireApiKey:true,apiKey:Option.none(),interfaces:[],port:10100,reachableAddresses:[],pending:false,warning:Option.none()})})
+ registry.set(sources.servableModels,{result:result(servableModels)})
+ registry.set(sources.chats,{result:result(fixtureChats)})
+ registry.set(sources.chatDefaults,{result:result({})})
  registry.set(usage,{result:result({_tag:'Available',dailyActivity:Array.from({length:368},(_,index)=>({date:new Date(Date.UTC(2025,8,14+index)).toISOString().slice(0,10),totalTokens:index%5===0?0:Math.round((Math.sin(index*7)+1)*50000)})),requests:2,inputTokens:100,cachedInputTokens:40,outputTokens:20,totalTokens:120,cachedInputRequests:2,tokensPerSecond:80,timeToFirstTokenMs:125,incompleteRequests:0,recordingFailures:0,speedSamples:2,latencySamples:2,models:[],since:null})})
  for (const listener of listeners) listener()
 }
 setPhase(phase)
-window.loadingFixture={setPhase,navigate:(value:string)=>{page=value;registry.set(service.page,value)}}
+window.loadingFixture={setPhase,navigate:(value:string)=>{page=value;registry.set(service.page,value);if(value==='chat'||value==='models'||value==='connections') registry.set(service.mainPage,value)}}

@@ -7,8 +7,11 @@ import type { ChatSummary } from "@magnitudedev/sdk"
 import { CircleNotchIcon, DotsThreeIcon, PencilSimpleIcon, TrashIcon } from "@phosphor-icons/react"
 import { ConfirmDialog } from "../confirm-dialog"
 import { CHAT_TITLE_MAX_LENGTH, renameOf } from "./rename"
+import { ChatListSkeleton } from "./skeletons"
 
 const PAGE = 30
+
+export type SidebarServiceState = "starting" | "ready" | "unavailable"
 
 function Row({ chat, current, open }: { chat: ChatSummary; current: boolean; open: () => void }) {
   const client = useAgentClient()
@@ -108,8 +111,16 @@ export function ChatTabStatus({ page }: { page: MainPage }) {
  * What the sidebar shows under its Chat tab: the recent chats while Chat is the page in the main area, Settings open
  * over it or not, and nothing while Models or Connections is.
  */
-export function SidebarChats({ page, navigate, onNavigate }: { page: MainPage; navigate: (page: ApplicationPage) => void; onNavigate?: () => void }) {
-  return page === "chat" ? <ChatList navigate={navigate} onNavigate={onNavigate} /> : null
+export function SidebarChats({ page, navigate, onNavigate, serviceState = "ready" }: {
+  page: MainPage
+  navigate?: (page: ApplicationPage) => void
+  onNavigate?: () => void
+  serviceState?: SidebarServiceState
+}) {
+  if (page !== "chat") return null
+  if (serviceState === "starting") return <ChatListSkeleton />
+  if (serviceState !== "ready" || !navigate) return null
+  return <ChatList navigate={navigate} onNavigate={onNavigate} />
 }
 
 /** The recent chats, newest first, a page at a time, loading the next page as the list's end comes into view; the open chat is marked. */
@@ -144,6 +155,8 @@ function ChatListPage({ offset, last, more, navigate, onNavigate }: {
     observer.observe(node)
     return () => observer.disconnect()
   }, [last, hasMore])
+  if (Result.isInitial(listed)) return offset === 0 ? <ChatListSkeleton /> : <ChatListSkeleton rows={2} />
+  if (Result.isFailure(listed)) return offset === 0 ? <p className="chat-list-empty">Couldn’t load chats.</p> : null
   if (!Result.isSuccess(listed)) return null
   if (offset === 0 && listed.value.chats.length === 0) return <p className="chat-list-empty">No chats yet.</p>
   return <>

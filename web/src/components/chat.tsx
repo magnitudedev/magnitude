@@ -44,20 +44,32 @@ import {
 import { Button } from "./ui/button"
 import { MagnitudeMark } from "./magnitude-mark"
 import { ErrorNotice } from "./error-notice"
+import { SkeletonLine } from "./page-skeletons"
 import { CopyText, SentAt, errorText, none, number } from "./chat/shared"
 import { ComposerAlert, composerError } from "./chat/composer-alert"
 import { ChatResponse } from "./chat/response"
 import { ChatRequestStatus } from "./chat/activity"
 import { ChatTitle } from "./chat/chat-title"
 import { ModelPicker, type PickerModel } from "./chat/model-picker"
-import { useChatModels } from "./chat/served-models"
+import { chatModelsPending, useChatModels } from "./chat/served-models"
+import { ChatSkeleton, ChatTranscriptSkeleton, ModelPickerSkeleton } from "./chat/skeletons"
 import { submitBlocked } from "./chat/submit-blocked"
 import { MESSAGE_CHARS, PASTE_TOO_LONG, noticeAfterEdit, pasteTooLong } from "./chat/paste"
 import { useNavigate } from "../session"
+import type { ServiceObservation } from "../service-view"
 
-export function ChatPage() {
+export function ChatPage({ observation }: { observation?: ServiceObservation }) {
   const id = useAtomValue(selectedChat)
   const select = useAtomSet(selectedChat)
+  if (observation !== undefined) {
+    const service = Result.isSuccess(observation.service) ? observation.service.value : null
+    if (service?._tag !== "Ready") {
+      if (Result.isFailure(observation.service)) {
+        return <ErrorNotice title="Magnitude needs your attention" description="The inference service is unavailable." />
+      }
+      return <ChatSkeleton startingService />
+    }
+  }
   return <ChatView key={id ?? "new"} id={id} select={select} />
 }
 function ChatView({
@@ -101,7 +113,7 @@ function ChatView({
         (error) => error._tag === "ChatNotFound"
       ))
   const messages = chat ? chatMessages(chat) : []
-  const { result: modelResult, models, preferred, localFor, nameOf, contextFor, contextLimitFor } = useChatModels()
+  const { result: modelResult, local, models, preferred, localFor, nameOf, contextFor, contextLimitFor } = useChatModels()
   const savedResult = useAtomValue(client.Chat.ListChatModelDefaults({})).result
   const saved = Result.isSuccess(savedResult) ? savedResult.value : {}
   const transcript = chatRequestSettings(chat?.messages ?? [])
@@ -268,10 +280,18 @@ function ChatView({
     context: contextFor(m),
     note: pickerNote(m),
   }))
+  if (chatModelsPending({ servable: modelResult, local, defaults: savedResult, models })) {
+    return <ChatSkeleton />
+  }
+  const loadingConversation = id !== null && Result.isInitial(watched)
   return (
     <section aria-label="Chat" className="flex min-h-0 flex-1 flex-col">
       <div className="mb-4 flex shrink-0 items-center justify-between gap-3">
-        <ChatTitle chat={chat?.chat ?? null} />
+        {loadingConversation ? (
+          <SkeletonLine className="h-7 text-[17px]" width="12rem" />
+        ) : (
+          <ChatTitle chat={chat?.chat ?? null} />
+        )}
         <Button variant="ghost" className="shrink-0" disabled={pending} onClick={() => startNewChat()}>
           <PlusIcon />
           New chat
@@ -284,13 +304,8 @@ function ChatView({
             onScroll={followScroll}
             className="chat-scroll min-h-0 flex-1 overflow-y-auto"
           >
-            {id && Result.isInitial(watched) ? (
-              <div
-                role="status"
-                className="py-10 text-center text-xs text-slate-500"
-              >
-                Loading conversation…
-              </div>
+            {loadingConversation ? (
+              <ChatTranscriptSkeleton />
             ) : id && removed ? (
               <p className="py-10 text-sm text-slate-500">
                 This conversation was deleted.
@@ -406,15 +421,19 @@ function ChatView({
                 className="block max-h-48 min-h-14 w-full resize-none bg-transparent px-1 py-1 text-sm leading-6 outline-none dark:placeholder:text-slate-500"
               />
               <div className="mt-3 flex items-end justify-end gap-2">
-                <ModelPicker
-                  models={pickerModels}
-                  model={model}
-                  name={model ? nameOf(model) : modelId ? "Model unavailable" : "Select model"}
-                  selected={settings.reasoningEffort}
-                  onModel={(m) => patch({ model: Option.some(ServingModelId.make(m.id)), reasoningEffort: chatStartingSettings(m, saved).reasoningEffort })}
-                  onEffort={(next) => patch({ reasoningEffort: Option.some(next) })}
-                  onManage={() => navigate("models")}
-                />
+                {loadingConversation ? (
+                  <ModelPickerSkeleton />
+                ) : (
+                  <ModelPicker
+                    models={pickerModels}
+                    model={model}
+                    name={model ? nameOf(model) : modelId ? "Model unavailable" : "Select model"}
+                    selected={settings.reasoningEffort}
+                    onModel={(m) => patch({ model: Option.some(ServingModelId.make(m.id)), reasoningEffort: chatStartingSettings(m, saved).reasoningEffort })}
+                    onEffort={(next) => patch({ reasoningEffort: Option.some(next) })}
+                    onManage={() => navigate("models")}
+                  />
+                )}
                 {active ? (
                   <Button
                     type="button"

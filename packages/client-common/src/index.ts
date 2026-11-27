@@ -39,6 +39,7 @@ export * from './hooks/use-local-inference-state'
 
 // Application
 export * from "./application/session"
+export { readyToChat } from "./application/landing"
 export * from "./application/host"
 export * from "./application/service-client"
 export * from "./application/router"

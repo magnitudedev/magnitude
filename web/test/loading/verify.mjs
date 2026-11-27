@@ -11,14 +11,15 @@ for(const theme of ['light','dark']) for(const width of (process.env.FIXTURE_WID
  await page.goto('http://127.0.0.1:6091/loading.html'+(process.env.FIXTURE_QUERY ?? ''))
  await page.locator('main').waitFor()
  await page.evaluate(theme=>document.documentElement.dataset.theme=theme,theme)
- for(const name of (process.argv.length>2 ? process.argv.slice(2) : ['models','connections','usage','status','settings'])) {
+ for(const name of (process.argv.length>2 ? process.argv.slice(2) : ['chat','models','connections','usage','status','settings'])) {
   await page.evaluate(name=>{window.loadingFixture.setPhase('loading');window.loadingFixture.navigate(name)},name)
   await page.waitForTimeout(100)
   assert.ok(await page.locator('[data-slot="skeleton"]').count(),`${name}: skeleton missing`)
-  assert.equal(await page.locator('[data-loading-region] button,[data-loading-region] input,[data-loading-region] a').count(),0,`${name}: interactive placeholder`)
+  assert.equal(await page.locator('[data-loading-region] button,[data-loading-region] input,[data-loading-region] textarea,[data-loading-region] a').count(),0,`${name}: interactive placeholder`)
   const geometry=async()=>page.locator('main').evaluate(el=>({width:el.clientWidth,scrollWidth:el.scrollWidth,sections:[...el.querySelectorAll('article,section')].map(n=>{const b=n.getBoundingClientRect();return {tag:n.tagName,label:n.getAttribute('aria-label'),x:b.x,y:b.y,width:b.width,height:b.height}})}))
   const stableFrames=async()=>page.evaluate(name=>{
    const main=document.querySelector('main'); let nodes=[];
+   if(name==='chat') nodes=[main.querySelector('section[aria-label="Chat"]'), main.querySelector('section[aria-label="Chat"] .chat-scroll img')?.parentElement];
    if(name==='usage') nodes=[main.querySelector('[aria-label="Token activity"]'),...main.querySelectorAll('[data-usage]')];
    if(name==='status') nodes=[...main.querySelectorAll('section')];
    if(name==='settings') nodes=[...main.querySelectorAll('h2')].map(n=>n.closest('section,[aria-busy]'));

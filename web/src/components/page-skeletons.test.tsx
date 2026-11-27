@@ -2,17 +2,28 @@ import { renderToStaticMarkup } from "react-dom/server"
 import { expect, it } from "vitest"
 import { Option } from "effect"
 import { ConnectionsSkeleton, HardwarePending, LoginSkeleton, UpdatesSkeleton } from "./page-skeletons"
+import { ChatListSkeleton, ChatModelSettingsSkeleton, ChatSkeleton, ChatTranscriptSkeleton } from "./chat/skeletons"
 import { ModelsSkeleton } from "./models/skeletons"
 import { UsageFigures } from "./serving-usage"
 import { MemoryFigures } from "./memory-breakdown"
 
 it("marks loading regions and keeps decorative placeholders out of the accessibility tree", () => {
-  for (const component of [<ConnectionsSkeleton />, <LoginSkeleton />, <UpdatesSkeleton />, <ModelsSkeleton />]) {
+  for (const component of [
+    <ConnectionsSkeleton />,
+    <LoginSkeleton />,
+    <UpdatesSkeleton />,
+    <ModelsSkeleton />,
+    <ChatListSkeleton />,
+    <ChatSkeleton />,
+    <ChatSkeleton startingService />,
+    <ChatTranscriptSkeleton />,
+    <ChatModelSettingsSkeleton />,
+  ]) {
     const html = renderToStaticMarkup(component)
     expect(html).toContain('aria-busy="true"')
     expect(html).toContain('role="status"')
     expect(html).toContain('aria-hidden="true"')
-    expect(html).not.toMatch(/<(button|input|a)\b/)
+    expect(html).not.toMatch(/<(button|input|textarea|form|a)\b/)
     expect(html).toContain('motion-safe:animate-pulse')
   }
 })
@@ -39,4 +50,10 @@ it("reports hardware detection and service start inline without inventing progre
   const starting = renderToStaticMarkup(<ModelsSkeleton startingService />)
   expect(starting).toContain("Starting Magnitude…")
   expect(starting).not.toContain("<progress")
+  const chatStarting = renderToStaticMarkup(<ChatSkeleton startingService />)
+  expect(chatStarting).toContain("Starting Magnitude…")
+  expect(chatStarting).not.toContain("<textarea")
+  const chatLoading = renderToStaticMarkup(<ChatSkeleton />)
+  expect(chatLoading).toContain("Loading chat…")
+  expect(chatLoading).not.toContain("<textarea")
 })

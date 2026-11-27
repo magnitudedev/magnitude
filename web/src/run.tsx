@@ -14,6 +14,7 @@ import { appearanceReadError } from "./appearance"
 import { SessionProvider } from "./session"
 import { ServiceConnectionProvider } from "./service-view"
 import { App, AppShell } from "./app"
+import { ChatSkeleton } from "./components/chat/skeletons"
 import { OnboardingStarting } from "./components/models/onboarding"
 import { onboardingCompletedHere } from "./components/models/onboarding-record"
 import { ErrorNotice } from "./components/error-notice"
@@ -30,9 +31,15 @@ export interface ApplicationEntry<E> {
   readonly reconnect: "Automatic" | "OnConnect"
 }
 
-/** The app before it has reached the service, which decides the page: an empty main area, with onboarding already open when this window hasn’t finished it. */
+/** The app before it has reached the service: a non-interactive Chat skeleton for returning users, or onboarding when this window hasn’t finished it. */
 function BootShell({ platform }: { platform: string | undefined }) {
-  return <><AppShell page="chat" platform={platform}>{null}</AppShell>{!onboardingCompletedHere() && <OnboardingStarting />}</>
+  const onboarded = onboardingCompletedHere()
+  return <>
+    <AppShell page="chat" platform={platform} serviceState={onboarded ? "starting" : "unavailable"}>
+      {onboarded ? <ChatSkeleton startingService /> : null}
+    </AppShell>
+    {!onboarded && <OnboardingStarting />}
+  </>
 }
 
 function SessionGate({ platform }: { platform: string | undefined }) {

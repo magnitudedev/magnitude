@@ -15,7 +15,8 @@ import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from ".
 import { SettingsGroup, SettingsRow } from "../settings-row"
 import { ErrorNotice } from "../error-notice"
 import { ChatSettingsFields } from "./settings"
-import { useChatModels } from "./served-models"
+import { chatModelsPending, useChatModels } from "./served-models"
+import { ChatModelSettingsSkeleton } from "./skeletons"
 import { errorText } from "./shared"
 
 const SAVE_DELAY_MS = 400
@@ -26,11 +27,12 @@ const SAVE_DELAY_MS = 400
  */
 export function ChatModelSettings() {
   const client = useAgentClient()
-  const { result, models, nameOf, contextFor, contextLimitFor } = useChatModels()
+  const { result, local, models, nameOf, contextFor, contextLimitFor } = useChatModels()
   const savedResult = useAtomValue(client.Chat.ListChatModelDefaults({})).result
   const [chosen, setChosen] = useState<string | undefined>(undefined)
   const model = models.find(entry => entry.id === chosen) ?? models[0]
   if (Result.isFailure(result) || Result.isFailure(savedResult)) return <ErrorNotice title="Couldn’t read chat settings" description={errorText(Result.isFailure(result) ? result : savedResult) ?? "Try again."} />
+  if (chatModelsPending({ servable: result, local, defaults: savedResult, models })) return <ChatModelSettingsSkeleton />
   if (!Result.isSuccess(result) || !Result.isSuccess(savedResult)) return null
   if (!model) return <p className="text-sm text-slate-500">Download a model to set its chat settings.</p>
   return <>

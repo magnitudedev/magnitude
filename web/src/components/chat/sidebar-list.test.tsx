@@ -5,25 +5,37 @@ import { describe, expect, it } from "vitest"
 import { AgentClientProvider, selectedChat, type AgentClient } from "@magnitudedev/client-common"
 import { SessionId, type ChatPage } from "@magnitudedev/sdk"
 import type { MainPage } from "@magnitudedev/client-common"
-import { ChatTabStatus, SidebarChats } from "./sidebar-list"
+import { ChatTabStatus, SidebarChats, type SidebarServiceState } from "./sidebar-list"
 
 const time = { created: DateTime.unsafeMake(0), updated: DateTime.unsafeMake(0) }
 const chat = (id: string, title: string, running = false) => ({ id: SessionId.make(id), title, time, messageCount: 2, running })
 
-const render = (page: ChatPage, selected: string | null = null, shown: MainPage = "chat", part: "list" | "tab" = "list") => {
+const renderResult = (
+  listed: Result.Result<ChatPage, unknown>,
+  selected: string | null = null,
+  shown: MainPage = "chat",
+  part: "list" | "tab" = "list",
+  serviceState: SidebarServiceState = "ready",
+) => {
   const client = {
     Chat: {
-      ListChats: () => Atom.make({ result: Result.success(page) }),
+      ListChats: () => Atom.make({ result: listed }),
       RenameChat: Atom.make(Result.initial()),
       RemoveChat: Atom.make(Result.initial()),
     },
   } as unknown as AgentClient
   return renderToStaticMarkup(
     <RegistryProvider initialValues={[[selectedChat, selected === null ? null : SessionId.make(selected)]]}>
-      <AgentClientProvider tag={client}>{part === "list" ? <SidebarChats page={shown} navigate={() => {}} /> : <ChatTabStatus page={shown} />}</AgentClientProvider>
+      <AgentClientProvider tag={client}>
+        {part === "list"
+          ? <SidebarChats page={shown} navigate={() => {}} serviceState={serviceState} />
+          : <ChatTabStatus page={shown} />}
+      </AgentClientProvider>
     </RegistryProvider>
   )
 }
+const render = (page: ChatPage, selected: string | null = null, shown: MainPage = "chat", part: "list" | "tab" = "list") =>
+  renderResult(Result.success(page), selected, shown, part)
 
 describe("sidebar chat list", () => {
   it("lists the recent chats and marks the open one", () => {
@@ -50,7 +62,27 @@ describe("sidebar chat list", () => {
     for (const shown of ["models", "connections"] as const) {
       expect(render({ chats: [chat("b", "Summarize notes")], hasMore: false }, "b", shown)).toBe("")
       expect(render({ chats: [], hasMore: false }, null, shown)).toBe("")
+      expect(renderResult(Result.initial(), null, shown, "list", "starting")).toBe("")
     }
+  })
+
+  it("shows a non-interactive loading skeleton while the service starts or the chat list is initially loading", () => {
+    for (const html of [
+      renderResult(Result.initial(), null, "chat", "list", "starting"),
+      renderResult(Result.initial(), null, "chat", "list", "ready"),
+    ]) {
+      expect(html).toContain('aria-busy="true"')
+      expect(html).toContain('data-slot="skeleton"')
+      expect(html).toContain("Loading chats")
+      expect(html).not.toMatch(/<(button|input|a)\b/)
+    }
+  })
+
+  it("never leaves a skeleton when the service is unavailable or loading chats fails", () => {
+    expect(renderResult(Result.initial(), null, "chat", "list", "unavailable")).toBe("")
+    const failed = renderResult(Result.fail("offline"), null, "chat", "list", "ready")
+    expect(failed).toContain("Couldn’t load chats.")
+    expect(failed).not.toContain('data-slot="skeleton"')
   })
 })
 

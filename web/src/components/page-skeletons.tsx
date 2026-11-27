@@ -3,10 +3,10 @@ import { CircleNotchIcon } from "@phosphor-icons/react"
 import { Skeleton } from "./ui/skeleton"
 import { pageLayout } from "./page-layout"
 
-export function LoadingRegion({ label, children, className }: { label: string; children: ReactNode; className?: string }) {
+export function LoadingRegion({ label, children, className, innerClassName }: { label: string; children: ReactNode; className?: string; innerClassName?: string }) {
   return <div aria-busy="true" aria-label={label} className={className} data-loading-region="">
     <span role="status" className="sr-only">{label}</span>
-    <div aria-hidden="true">{children}</div>
+    <div aria-hidden="true" className={innerClassName}>{children}</div>
   </div>
 }
 

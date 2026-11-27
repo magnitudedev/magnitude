@@ -1,15 +1,44 @@
 import { Option } from "effect"
 import { Result, useAtomValue } from "@effect-atom/atom-react"
-import type { InferenceModel } from "@magnitudedev/sdk"
+import type { InferenceModel, LocalModelsState } from "@magnitudedev/sdk"
 import {
   activeLocalModel,
   formatLocalModelDisplayName,
   localModelContextLimit,
   localModelProviderModelId,
   localModelServingProfile,
+  readyToChat,
   useAgentClient,
   useLocalModels,
 } from "@magnitudedev/client-common"
+
+/**
+ * Whether Chat's startup model and settings data is still arriving: before servable models, local
+ * model discovery, or saved per-model defaults have settled. Failures settle immediately so errors
+ * never stay behind a skeleton.
+ */
+export const chatModelsPending = ({
+  servable,
+  local,
+  defaults,
+  models,
+}: {
+  readonly servable: Result.Result<unknown, unknown>
+  readonly local: Result.Result<LocalModelsState, unknown>
+  readonly defaults: Result.Result<unknown, unknown>
+  readonly models: readonly InferenceModel[]
+}): boolean => {
+  if (Result.isFailure(servable) || Result.isFailure(defaults)) return false
+  if (Result.isInitial(servable) || Result.isInitial(defaults) || Result.isInitial(local)) return true
+  if (!Result.isSuccess(local)) return false
+  if (local.value.preparation?.discovery?.complete === false) return true
+  return (
+    Result.isSuccess(servable) &&
+    servable.waiting &&
+    models.length === 0 &&
+    local.value.models.some(readyToChat)
+  )
+}
 
 /**
  * The models chats can use: every served model that reads and writes text, with what this computer knows about the
@@ -45,5 +74,5 @@ export function useChatModels() {
   }
   const active = Result.isSuccess(local) ? Option.flatMap(activeLocalModel(local.value), ({ model }) => localModelProviderModelId(model)) : Option.none<string>()
   const preferred = Option.getOrUndefined(Option.filter(active, (id) => models.some((model) => model.id === id))) ?? models[0]?.id
-  return { result, models, preferred, localFor, nameOf, contextFor, contextLimitFor }
+  return { result, local, models, preferred, localFor, nameOf, contextFor, contextLimitFor }
 }

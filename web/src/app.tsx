@@ -80,7 +80,7 @@ import { onThisComputer } from "./components/models/data"
 import { onboardingCompletedHere, recordOnboardingCompleted } from "./components/models/onboarding-record"
 import { useRecommendations } from "./components/models/recommendations"
 import { ChatModelSettings } from "./components/chat/model-settings"
-import { ChatTabStatus, SidebarChats } from "./components/chat/sidebar-list"
+import { ChatTabStatus, SidebarChats, type SidebarServiceState } from "./components/chat/sidebar-list"
 import { SidebarUpdatePill, SidebarUpdateProvider, automaticUpdates, useApplicationOwner, useApplicationUpdateActions, useApplicationUpdateObservation, useSidebarUpdate, type UpdateTransfer } from "./components/application-update"
 
 const ALL_INTERFACES = "all"
@@ -472,12 +472,15 @@ export function App() {
   const onboarding = Option.getOrElse(known, () => !onboardingCompletedHere())
   const navigate = useNavigate()
   const service = Result.isSuccess(observation.service) ? observation.service.value : null
+  const sidebarServiceState: SidebarServiceState = service?._tag === "Ready" ? "ready"
+    : (service === null && !Result.isFailure(observation.service)) || service?._tag === "Starting" ? "starting"
+    : "unavailable"
   const platform = Option.getOrUndefined(Option.map(session.clientWindow, window => window.platform))
-  return <><HostNotices /><QuitFailureDialog />{onboarding && <OnboardingScreen />}<SidebarUpdateProvider><AppShell page={main} navigate={navigate} platform={platform} footer={<RestartRequiredBar />}>
+  return <><HostNotices /><QuitFailureDialog />{onboarding && <OnboardingScreen />}<SidebarUpdateProvider><AppShell page={main} navigate={navigate} platform={platform} serviceState={sidebarServiceState} footer={<RestartRequiredBar />}>
       {service?._tag === "Unreachable" ? <CannotReachMagnitude />
       : service?._tag === "Reconnecting" ? <ReconnectingToMagnitude />
       : service?._tag === "Failed" || service?._tag === "CleanupFailed" ? <MagnitudeCouldNotStart service={service} canRetry={observation.canRetry} onOpenStatus={() => navigate("settings")} />
-      : main === "chat" ? <ChatPage />
+      : main === "chat" ? <ChatPage observation={observation} />
       : main === "connections" ? <><h1 className={`${pageLayout.pageTitle} mb-6`}>Connections</h1><Connections serviceReady={service?._tag === "Ready"} selectedModel={Option.none()} /></>
       : <ModelsPage key={visit} observation={observation} />}
     </AppShell>
@@ -540,13 +543,13 @@ function QuitFailureDialog() {
     </AlertDialogContent>
   </AlertDialog>
 }
-export function AppShell({ page, navigate, platform, footer, children }: { page: MainPage; navigate?: (page: ApplicationPage) => void; platform: string | undefined; footer?: ReactNode; children: ReactNode }) {
+export function AppShell({ page, navigate, platform, serviceState, footer, children }: { page: MainPage; navigate?: (page: ApplicationPage) => void; platform: string | undefined; serviceState?: SidebarServiceState; footer?: ReactNode; children: ReactNode }) {
   const narrow = useNarrowViewport()
   const [open, setOpen] = useState(false)
   useEffect(() => { if (!narrow) setOpen(false) }, [narrow])
   // Only the navigation chrome changes across `md`; the page stays mounted, so resizing keeps its state.
   return <div className={narrow ? "relative flex h-screen flex-col bg-slate-50 font-sans text-slate-900 dark:bg-slate-925 dark:text-slate-200" : "relative flex h-screen bg-slate-50 font-sans text-slate-900 dark:bg-slate-925 dark:text-slate-200"}>
-    {narrow ? <NarrowBar open={open} onOpen={() => setOpen(true)} /> : <DockedSidebar page={page} navigate={navigate} platform={platform} />}
+    {narrow ? <NarrowBar open={open} onOpen={() => setOpen(true)} /> : <DockedSidebar page={page} navigate={navigate} platform={platform} serviceState={serviceState} />}
     <div className="flex min-h-0 min-w-0 flex-1 flex-col" inert={narrow && open}>
       <main key={page} className="min-h-0 flex-1 overflow-y-auto">
         <div data-page-content className={page === "chat" ? `mx-auto flex h-full w-full max-w-[min(100%,72rem)] flex-col px-4 pb-0 pt-5 md:px-10 ${platform === "win32" ? "md:pt-14" : "md:pt-9"}` : narrow ? "mx-auto w-full max-w-6xl px-4 pb-8 pt-5" : `mx-auto w-[calc(100vw-224px)] max-w-[min(100%,72rem)] px-10 pb-9 ${platform === "win32" ? "pt-14" : "pt-9"}`}>
@@ -555,7 +558,7 @@ export function AppShell({ page, navigate, platform, footer, children }: { page:
       </main>
       {footer}
     </div>
-    {narrow && open && <NavigationDrawer page={page} navigate={navigate} onClose={() => setOpen(false)} />}
+    {narrow && open && <NavigationDrawer page={page} navigate={navigate} serviceState={serviceState} onClose={() => setOpen(false)} />}
   </div>
 }
 /** Models on this computer: the user's own, and catalog models installed or on their way. */
@@ -604,7 +607,7 @@ function DocsLink({ onNavigate }: { onNavigate?: () => void }) {
   </a>
 }
 /** The sidebar: the Models, Connections and Chat tabs, the recent chats, the update when there is one, then a bar with Docs and Settings. */
-function Navigation({ page, navigate, onNavigate }: { page: MainPage; navigate?: (page: ApplicationPage) => void; onNavigate?: () => void }) {
+function Navigation({ page, navigate, onNavigate, serviceState }: { page: MainPage; navigate?: (page: ApplicationPage) => void; onNavigate?: () => void; serviceState?: SidebarServiceState }) {
   const open = navigate && ((target: ApplicationPage) => () => { navigate(target); onNavigate?.() })
   return <nav id="desktop-navigation" className="flex min-h-0 flex-1 flex-col">
     <div className="flex shrink-0 flex-col gap-2 px-4">
@@ -612,7 +615,9 @@ function Navigation({ page, navigate, onNavigate }: { page: MainPage; navigate?:
       <NavTab label="Connections" icon={<PlugIcon className="size-4 shrink-0" />} current={page === "connections"} onClick={open?.("connections")} />
       <ChatTab page={page} onClick={open?.("chat")} />
     </div>
-    <div className="mt-2 flex min-h-0 flex-1 flex-col px-4">{navigate && <SidebarChats page={page} navigate={navigate} onNavigate={onNavigate} />}</div>
+    <div className="mt-2 flex min-h-0 flex-1 flex-col px-4">
+      <SidebarChats page={page} navigate={navigate} onNavigate={onNavigate} serviceState={serviceState ?? (navigate ? "ready" : "unavailable")} />
+    </div>
     <div className="shrink-0 px-4 pb-2.5 empty:hidden"><SidebarUpdatePill navigate={navigate} onNavigate={onNavigate} /></div>
     <div className="flex shrink-0 items-center justify-between gap-1 border-t border-slate-200 px-3 pt-2.5 dark:border-slate-750">
       <DocsLink onNavigate={onNavigate} />
@@ -629,7 +634,7 @@ function NarrowBar({ open, onOpen }: { open: boolean; onOpen: () => void }) {
     <span className="flex items-center gap-2 font-heading text-base font-semibold"><MagnitudeMark className="h-7 w-7 shrink-0" />Magnitude</span>
   </header>
 }
-export function NavigationDrawer({ page, navigate, onClose }: { page: MainPage; navigate?: (page: ApplicationPage) => void; onClose: () => void }) {
+export function NavigationDrawer({ page, navigate, serviceState, onClose }: { page: MainPage; navigate?: (page: ApplicationPage) => void; serviceState?: SidebarServiceState; onClose: () => void }) {
   return <div className="fixed inset-0 z-50 flex" onKeyDown={event => { if (event.key === "Escape") onClose() }}>
     <button type="button" aria-label="Close navigation" className="absolute inset-0 cursor-default bg-black/45 dark:bg-black/70" onClick={onClose} />
     <aside aria-label="Navigation" className="relative flex h-full w-64 max-w-[85vw] flex-col border-r border-slate-200 bg-slate-50 pb-3 pt-4 shadow-xl dark:border-slate-750 dark:bg-slate-925 motion-safe:animate-[slide-in-left_150ms_ease-out]">
@@ -637,12 +642,12 @@ export function NavigationDrawer({ page, navigate, onClose }: { page: MainPage; 
         <span className="flex items-center gap-3 px-3 font-heading text-base font-semibold"><MagnitudeMark className="h-8 w-8 shrink-0" />Magnitude</span>
         <button type="button" autoFocus className="inline-flex size-10 items-center justify-center rounded-md text-slate-500 hover:bg-slate-100 focus-visible:outline-2 focus-visible:outline-blue-500 dark:hover:bg-slate-800" aria-label="Close navigation" onClick={onClose}><XIcon className="size-5" /></button>
       </div>
-      <Navigation page={page} navigate={navigate} onNavigate={onClose} />
+      <Navigation page={page} navigate={navigate} onNavigate={onClose} serviceState={serviceState} />
     </aside>
   </div>
 }
 /** From `md` up: the collapsible sidebar with the window's integrated controls and drag regions. */
-function DockedSidebar({ page, navigate, platform }: { page: MainPage; navigate?: (page: ApplicationPage) => void; platform: string | undefined }) {
+function DockedSidebar({ page, navigate, platform, serviceState }: { page: MainPage; navigate?: (page: ApplicationPage) => void; platform: string | undefined; serviceState?: SidebarServiceState }) {
   const [collapsed, setCollapsed] = useState(false)
   const updatePending = useSidebarUpdate().update._tag !== "None"
   const integratedControls = platform === "darwin" || platform === "win32"
@@ -660,7 +665,7 @@ function DockedSidebar({ page, navigate, platform }: { page: MainPage; navigate?
       <div className="mb-8 mt-4 flex h-8 shrink-0 items-center gap-3 px-7 font-heading text-base font-semibold">
         <MagnitudeMark className="h-8 w-8 shrink-0" />Magnitude
       </div>
-      <Navigation page={page} navigate={navigate} />
+      <Navigation page={page} navigate={navigate} serviceState={serviceState} />
       </div>
     </aside>
   </>
