@@ -15,7 +15,8 @@
     { "id": "deepseek", "name": "DeepSeek", "country": "CN", "huggingFaceOrganizations": ["deepseek-ai"] },
     { "id": "poolside", "name": "Poolside", "country": "US", "huggingFaceOrganizations": ["poolside"] },
     { "id": "zai", "name": "Z.ai", "country": "CN", "huggingFaceOrganizations": ["zai-org"] },
-    { "id": "prismml", "name": "PrismML", "country": "US", "huggingFaceOrganizations": ["prism-ml"] }
+    { "id": "prismml", "name": "PrismML", "country": "US", "huggingFaceOrganizations": ["prism-ml"] },
+    { "id": "thinkingmachines", "name": "Thinking Machines Lab", "country": "US", "huggingFaceOrganizations": ["thinkingmachines"] }
   ],
   "families": [
     { "name": "Qwen 3.5–3.8", "lab": "alibaba", "architectures": ["qwen35", "qwen35moe", "qwen4exp"], "status": "supported" },
@@ -23,6 +24,7 @@
     { "name": "LFM 2.5 and 3", "lab": "liquid", "architectures": ["lfm2", "lfm2moe", "lfm3"], "status": "supported" },
     { "name": "Nemotron 3 and 3.5", "lab": "nvidia", "architectures": ["nemotron_h_moe"], "status": "supported" },
     { "name": "Muse Glimmer", "lab": "meta", "architectures": ["muse-glimmer"], "status": "supported" },
+    { "name": "Inkling 2", "lab": "thinkingmachines", "architectures": ["inkling2", "inkling2_loop"], "status": "supported" },
     { "name": "DeepSeek V4.1", "lab": "deepseek", "architectures": ["deepseek41"], "status": "supported" },
     { "name": "GLM-5.3 Flash", "lab": "zai", "architectures": ["glm5-next"], "status": "supported" }
   ],
@@ -710,6 +712,82 @@
         }
       ],
       "speculativeDecoding": { "method": "mtp", "draft": { "type": "embedded" } }
+    },
+    {
+      "id": "inkling-2-mini",
+      "displayName": "Inkling 2 Mini",
+      "lab": "thinkingmachines",
+      "description": "Compact multimodal MoE model with looped core layers, block attention residuals, and low active compute.",
+      "releaseDate": "2026-11-20",
+      "parameterization": { "architecture": "mixtureOfExperts", "totalParameters": 26400000000, "activeParameters": 5400000000 },
+      "support": { "level": "supported" },
+      "sources": [
+        {
+          "repository": "ISTA-DASLab/Inkling-2-Mini-GSQ-RCO-GGUF",
+          "variants": [
+            {"variantId": "gguf:q2", "format": "Q2_K_XL", "path": "Inkling-2-Mini-GSQ-RCO-Q2_K_XL.gguf", "variantLabel": "Q2", "quantizationAware": false},
+            {"variantId": "gguf:iq3", "format": "IQ3_S", "path": "Inkling-2-Mini-GSQ-RCO-IQ3_S.gguf", "variantLabel": "IQ3", "quantizationAware": false}
+          ],
+          "projector": { "path": "mmproj-Inkling-2-Mini-BF16.gguf" },
+          "license": "apache-2.0"
+        },
+        {
+          "repository": "magnitudedev/Inkling-2-Mini-GGUF",
+          "variants": [{"variantId": "gguf:nvfp4", "format": "NVFP4", "path": "Inkling-2-Mini-NVFP4.gguf", "variantLabel": "NVFP4 QAT", "quantizationAware": true}],
+          "projector": { "path": "mmproj-Inkling-2-Mini-BF16.gguf" },
+          "license": "apache-2.0"
+        }
+      ],
+      "speculativeDecoding": { "method": "dspark", "draft": { "type": "file", "repository": "magnitudedev/Inkling-2-Mini-GGUF", "path": "Inkling-2-Mini-DSpark.gguf" } },
+      "intelligence": {
+        "eci": 145.0,
+        "percent": 33,
+        "provenance": {
+          "kind": "bridged",
+          "method": "Provisional pre-Epoch estimate from Thinking Machines Lab's Inkling 2 Mini release card pending Epoch ECI publication.",
+          "evidenceUrls": [
+            "https://huggingface.co/thinkingmachines/Inkling-2-Mini"
+          ]
+        }
+      }
+    },
+    {
+      "id": "inkling-2-small",
+      "displayName": "Inkling 2 Small",
+      "lab": "thinkingmachines",
+      "description": "Large multimodal MoE model with block attention residuals, dynamic short convolutions, and 17B active parameters.",
+      "releaseDate": "2026-11-20",
+      "parameterization": { "architecture": "mixtureOfExperts", "totalParameters": 594000000000, "activeParameters": 17000000000 },
+      "support": { "level": "supported" },
+      "sources": [
+        {
+          "repository": "unsloth/Inkling-2-Small-GGUF",
+          "variants": [
+            {"variantId": "gguf:iq2", "format": "UD-IQ2_XXS", "variantLabel": "IQ2", "quantizationAware": false},
+            {"variantId": "gguf:q3", "format": "UD-Q3_K_XL", "variantLabel": "Q3", "quantizationAware": false}
+          ],
+          "projector": { "path": "mmproj-BF16.gguf" },
+          "license": "apache-2.0"
+        },
+        {
+          "repository": "magnitudedev/Inkling-2-Small-GGUF",
+          "variants": [{"variantId": "gguf:nvfp4", "format": "NVFP4", "path": "Inkling-2-Small-NVFP4-00001-of-00010.gguf", "variantLabel": "NVFP4 QAT", "quantizationAware": true}],
+          "projector": { "path": "mmproj-Inkling-2-Small-BF16.gguf" },
+          "license": "apache-2.0"
+        }
+      ],
+      "speculativeDecoding": { "method": "dspark", "draft": { "type": "file", "repository": "magnitudedev/Inkling-2-Small-GGUF", "path": "Inkling-2-Small-DSpark.gguf" } },
+      "intelligence": {
+        "eci": 154.0,
+        "percent": 52,
+        "provenance": {
+          "kind": "bridged",
+          "method": "Provisional pre-Epoch estimate from Thinking Machines Lab's Inkling 2 Small release card pending Epoch ECI publication.",
+          "evidenceUrls": [
+            "https://huggingface.co/thinkingmachines/Inkling-2-Small"
+          ]
+        }
+      }
     }
   ]
 }
