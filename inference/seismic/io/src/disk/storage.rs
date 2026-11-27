@@ -19,7 +19,8 @@ use super::ALIGNMENT;
 use crate::{Buffer, Durability, Error, Privacy, Store};
 use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::sync::Mutex;
+use std::sync::{Arc, Condvar, Mutex};
+use std::thread::JoinHandle;
 
 /// The bytes of the probe file: 256 MiB, far past what a lone or a full
 /// read touches, so random offsets rarely meet, and written once.
@@ -33,10 +34,154 @@ pub const LONE_READ: u64 = LEAST_READ;
 pub const FULL_READ: u64 = 1 << 20;
 pub const FULL_DEPTH: u64 = WIDEST_WINDOW / FULL_READ;
 
+/// Fault every 4 KiB page of `buffer` into the process page table before timed
+/// I/O so page-fault overhead never contaminates storage throughput measurements.
+fn fault_buffer(buffer: &mut Buffer) {
+    for page in buffer.bytes_mut().chunks_mut(4096) {
+        page[0] = 1;
+    }
+}
+
+/// Shared synchronization state for [`FullWorkers`].
+struct WorkerShared {
+    state: Mutex<WorkerState>,
+    start: Condvar,
+    done: Condvar,
+}
+
+struct WorkerState {
+    ready: usize,
+    epoch: u64,
+    offsets: Vec<Vec<u64>>,
+    completed: usize,
+    error: Option<Error>,
+    shutdown: bool,
+}
+
+/// Persistent pool of [`FULL_DEPTH`] reader threads, each owning a pre-allocated
+/// and pre-faulted [`FULL_READ`] aligned buffer, spawned and warmed outside any
+/// timed [`StorageProbe::full`] span.
+struct FullWorkers {
+    run_lock: Mutex<()>,
+    shared: Arc<WorkerShared>,
+    handles: Vec<JoinHandle<()>>,
+}
+
+impl FullWorkers {
+    fn new(file: Arc<SourceFile>) -> Result<Self, Error> {
+        let depth = FULL_DEPTH as usize;
+        let shared = Arc::new(WorkerShared {
+            state: Mutex::new(WorkerState {
+                ready: 0,
+                epoch: 0,
+                offsets: Vec::new(),
+                completed: 0,
+                error: None,
+                shutdown: false,
+            }),
+            start: Condvar::new(),
+            done: Condvar::new(),
+        });
+        let mut handles: Vec<JoinHandle<()>> = Vec::with_capacity(depth);
+        for worker_idx in 0..depth {
+            let file = Arc::clone(&file);
+            let worker_shared = Arc::clone(&shared);
+            let handle = seismic_threads::spawn(format!("seismic-storage-{worker_idx}"), move || {
+                let mut buffer = Buffer::new(FULL_READ as usize);
+                fault_buffer(&mut buffer);
+                {
+                    let mut state = worker_shared.state.lock().expect("storage probe worker state");
+                    state.ready += 1;
+                    if state.ready == depth {
+                        worker_shared.done.notify_one();
+                    }
+                }
+                let mut seen_epoch = 0u64;
+                loop {
+                    let offsets = {
+                        let mut state = worker_shared.state.lock().expect("storage probe worker state");
+                        while state.epoch == seen_epoch && !state.shutdown {
+                            state = worker_shared.start.wait(state).expect("storage probe worker wait");
+                        }
+                        if state.shutdown {
+                            return;
+                        }
+                        seen_epoch = state.epoch;
+                        std::mem::take(&mut state.offsets[worker_idx])
+                    };
+                    let result = offsets.iter().try_for_each(|&at| file.read_block(at, buffer.bytes_mut()));
+                    let mut state = worker_shared.state.lock().expect("storage probe worker state");
+                    if let Err(err) = result {
+                        if state.error.is_none() {
+                            state.error = Some(err);
+                        }
+                    }
+                    state.completed += 1;
+                    if state.completed == depth {
+                        worker_shared.done.notify_one();
+                    }
+                }
+            })
+            .map_err(|cause| {
+                {
+                    let mut state = shared.state.lock().expect("storage probe worker state");
+                    state.shutdown = true;
+                    shared.start.notify_all();
+                }
+                for handle in handles.drain(..) {
+                    let _ = handle.join();
+                }
+                Error::ThreadStart(cause)
+            })?;
+            handles.push(handle);
+        }
+        // Wait until every worker thread has spawned, allocated, and faulted its buffer.
+        let mut state = shared.state.lock().expect("storage probe worker state");
+        while state.ready < depth {
+            state = shared.done.wait(state).expect("storage probe worker ready");
+        }
+        drop(state);
+        Ok(Self { run_lock: Mutex::new(()), shared, handles })
+    }
+
+    fn run(&self, offsets: Vec<Vec<u64>>) -> Result<(), Error> {
+        let depth = FULL_DEPTH as usize;
+        let _run_guard = self.run_lock.lock().expect("storage probe run lock");
+        let mut state = self.shared.state.lock().expect("storage probe worker state");
+        state.offsets = offsets;
+        state.completed = 0;
+        state.error = None;
+        state.epoch += 1;
+        self.shared.start.notify_all();
+        while state.completed < depth {
+            state = self.shared.done.wait(state).expect("storage probe worker done");
+        }
+        match state.error.take() {
+            Some(err) => Err(err),
+            None => Ok(()),
+        }
+    }
+}
+
+impl Drop for FullWorkers {
+    fn drop(&mut self) {
+        {
+            let mut state = self.shared.state.lock().expect("storage probe worker state");
+            state.shutdown = true;
+            self.shared.start.notify_all();
+        }
+        for handle in self.handles.drain(..) {
+            let _ = handle.join();
+        }
+    }
+}
+
 /// The probe file the measurement job reads a volume through.
 pub struct StorageProbe {
-    file: SourceFile,
+    file: Arc<SourceFile>,
     state: Mutex<u64>,
+    lone_buffer: Mutex<Buffer>,
+    workers: FullWorkers,
 }
 
 impl StorageProbe {
@@ -49,8 +194,11 @@ impl StorageProbe {
         }
         let file = std::fs::File::open(&path)?;
         evict(&file, STORAGE_PROBE_BYTES)?;
-        let file = SourceFile { path: path.as_path().into(), size: STORAGE_PROBE_BYTES, through: uncached(&file, &path)? };
-        Ok(Self { file, state: Mutex::new(0x9e37_79b9_7f4a_7c15) })
+        let file = Arc::new(SourceFile { path: path.as_path().into(), size: STORAGE_PROBE_BYTES, through: uncached(&file, &path)? });
+        let mut lone_buffer = Buffer::new(LONE_READ as usize);
+        fault_buffer(&mut lone_buffer);
+        let workers = FullWorkers::new(Arc::clone(&file))?;
+        Ok(Self { file, state: Mutex::new(0x9e37_79b9_7f4a_7c15), lone_buffer: Mutex::new(lone_buffer), workers })
     }
 
     /// Where the probe file of `directory` lies.
@@ -85,9 +233,10 @@ impl StorageProbe {
         Ok(())
     }
 
-    /// `passes` lone reads, one after another.
+    /// `passes` lone reads, one after another, into the pre-allocated,
+    /// pre-faulted lone buffer.
     pub fn lone(&self, passes: usize) -> Result<(), Error> {
-        let mut buffer = Buffer::new(LONE_READ as usize);
+        let mut buffer = self.lone_buffer.lock().expect("storage probe lone buffer");
         for _ in 0..passes {
             let at = self.offset(LONE_READ);
             self.file.read_block(at, buffer.bytes_mut())?;
@@ -95,23 +244,12 @@ impl StorageProbe {
         Ok(())
     }
 
-    /// `passes` full reads: [`FULL_DEPTH`] readers, each reading `passes`
-    /// reads of [`FULL_READ`], one after another.
+    /// `passes` full reads: [`FULL_DEPTH`] persistent pre-spawned readers,
+    /// each reading `passes` reads of [`FULL_READ`] into its pre-allocated,
+    /// pre-faulted buffer.
     pub fn full(&self, passes: usize) -> Result<(), Error> {
         let offsets = (0..FULL_DEPTH).map(|_| (0..passes).map(|_| self.offset(FULL_READ)).collect::<Vec<_>>()).collect::<Vec<_>>();
-        std::thread::scope(|scope| {
-            let readers = offsets
-                .iter()
-                .map(|offsets| {
-                    seismic_threads::spawn_scoped(scope, "seismic-storage", move || {
-                        let mut buffer = Buffer::new(FULL_READ as usize);
-                        offsets.iter().try_for_each(|&at| self.file.read_block(at, buffer.bytes_mut()))
-                    })
-                })
-                .collect::<Result<Vec<_>, _>>()
-                .map_err(Error::ThreadStart)?;
-            readers.into_iter().try_for_each(|reader| reader.join().unwrap_or_else(|panic| std::panic::resume_unwind(panic)))
-        })
+        self.workers.run(offsets)
     }
 
     /// A random aligned offset a read of `length` bytes lies within the
@@ -129,4 +267,21 @@ fn next(mut state: u64) -> u64 {
     state ^= state >> 7;
     state ^= state << 17;
     state
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn persistent_workers_run_repeated_lone_and_full_passes() {
+        let dir = std::env::temp_dir().join(format!("seismic-storage-probe-test-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        let probe = StorageProbe::open(&dir).expect("open storage probe");
+        probe.lone(2).expect("lone pass");
+        probe.full(1).expect("first full pass");
+        probe.full(2).expect("second full pass");
+        drop(probe);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }

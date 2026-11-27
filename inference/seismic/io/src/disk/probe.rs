@@ -147,6 +147,27 @@ pub(crate) const WIDEST_WINDOW: u64 = 64 * 1024 * 1024;
 /// tracks its reads in flight (an M4 Pro's internal drive, 3 to 4).
 const EVERY_DEPTH_TO: u64 = 8;
 
+/// Minimum window in bytes (`32 MiB`) before [`range_line`] may early-stop
+/// when `depth < EVERY_DEPTH_TO`, so multi-channel NVMe saturation is
+/// measured even for large multi-MiB ranges.
+const MIN_RANGE_PROBE_WINDOW: u64 = 32 * 1024 * 1024;
+
+/// Minimum fraction of peak throughput a point must reach to qualify as a
+/// knee, preventing wide `spread` noise bars from collapsing `range_knee` or
+/// `at_best` to `depth = 1`.
+const RANGE_KNEE_FRACTION: f64 = 0.95;
+
+/// Minimum fraction of the probed `points` lines' peak throughput that a
+/// request's `ranges` line must reach; below this, the range line is treated
+/// as collapsed/under-saturated and `knee` is floored to the `points` knee.
+const RANGE_POINTS_MIN_FRACTION: f64 = 0.70;
+
+/// Minimum preferred `due_read` when tie-breaking lone timings within
+/// measurement noise: avoids 128–256 KiB fragmentation without collapsing
+/// flat/noisy curves to `whole_range()` (e.g. 8 MiB), so multi-MB expert
+/// parts still stripe across parallel reads and sustain NVMe QD.
+const PREFERRED_MIN_DUE_READ: u64 = 512 * 1024;
+
 /// The alignment grain a model file stores tensors at.
 const TENSOR_GRAIN: u64 = 32;
 
@@ -433,7 +454,10 @@ impl Shape {
     /// range line's knee; with none, at the size read ahead to its knee.
     pub(crate) fn of(points: &[Point], request: Option<Request>) -> Self {
         let top = *points.iter().max_by(|a, b| a.rate.total_cmp(&b.rate)).expect("a probed point");
-        let at_best = |point: &Point| point.rate + point.spread + top.spread >= top.rate;
+        let at_best = |point: &Point| {
+            point.rate >= RANGE_KNEE_FRACTION * top.rate
+                && point.rate + point.spread + top.spread >= top.rate
+        };
         let line = |read: u64| {
             let mut line = points.iter().copied().filter(|point| point.read == read).collect::<Vec<_>>();
             line.sort_by_key(|point| point.window);
@@ -443,21 +467,25 @@ impl Shape {
         reads.sort_unstable();
         reads.dedup();
         let cores_at = |line: &[Point], window: u64| line.iter().filter(|point| point.window <= window).map(|point| point.cores).fold(0., f64::max);
+        let (points_read, points_knee) = reads
+            .iter()
+            .filter_map(|&read| line(read).iter().find(|point| at_best(point)).map(|knee| (read, knee.window)))
+            .min_by_key(|&(read, knee)| (knee, std::cmp::Reverse(read)))
+            .expect("the best point reaches its own rate");
         let (ahead_read, knee, ahead_cores) = match &request {
-            // The range line's measured knee, its reads ahead whole ranges.
+            // The range line's measured knee, its reads ahead whole ranges;
+            // cross-checked against `points` so a noisy/stalled range line can
+            // never collapse `knee` below the drive's measured saturation depth.
             Some(request) => {
-                let knee = range_knee(request.ranges);
+                let mut knee = range_knee(request.ranges);
+                let ranges_top = request.ranges.iter().max_by(|a, b| a.rate.total_cmp(&b.rate)).expect("a probed range line");
+                if ranges_top.rate < RANGE_POINTS_MIN_FRACTION * top.rate {
+                    knee = knee.max(points_knee.next_multiple_of(request.urgent.span()));
+                }
                 (request.urgent.whole_range(), knee, cores_at(request.ranges, knee))
             }
             // Each size reaching the best rate, at its knee.
-            None => {
-                let (read, knee) = reads
-                    .iter()
-                    .filter_map(|&read| line(read).iter().find(|point| at_best(point)).map(|knee| (read, knee.window)))
-                    .min_by_key(|&(read, knee)| (knee, std::cmp::Reverse(read)))
-                    .expect("the best point reaches its own rate");
-                (read, knee, cores_at(&line(read), knee))
-            }
+            None => (points_read, points_knee, cores_at(&line(points_read), points_knee)),
         };
         let due_read = request.as_ref().map_or(ahead_read, |request| {
             let best = request
@@ -465,12 +493,15 @@ impl Shape {
                 .iter()
                 .min_by(|a, b| a.seconds.total_cmp(&b.seconds))
                 .expect("a request's lone times");
-            request
+            let tied = request
                 .lone
                 .iter()
                 .filter(|lone| lone.seconds <= best.seconds + best.error + lone.error)
-                .map(|lone| lone.read)
-                .max()
+                .map(|lone| lone.read);
+            tied.clone()
+                .filter(|&read| read >= PREFERRED_MIN_DUE_READ)
+                .min()
+                .or_else(|| tied.max())
                 .expect("the best lone time is within its own error")
         });
         let due_line = line(due_read);
@@ -496,7 +527,10 @@ impl Shape {
 fn range_knee(line: &[Point]) -> u64 {
     let top = line.iter().max_by(|a, b| a.rate.total_cmp(&b.rate)).expect("a probed range line");
     line.iter()
-        .filter(|point| point.rate + point.spread + top.spread >= top.rate)
+        .filter(|point| {
+            point.rate >= RANGE_KNEE_FRACTION * top.rate
+                && point.rate + point.spread + top.spread >= top.rate
+        })
         .map(|point| point.window)
         .min()
         .expect("the best point reaches its own rate")
@@ -694,9 +728,13 @@ fn range_line(key: Volume, file: &Arc<SourceFile>, urgent: &Urgent) -> Result<Ve
             let base = Curve::range_point(urgent, depth, 0., 0., 0.);
             point = Point::of_precise(base.read, base.window, &passes);
         }
-        let plateau = best.is_some_and(|best| {
-            point.window >= 2 * best.window && point.rate <= best.rate + best.spread + point.spread
-        });
+        let min_probed = depth >= EVERY_DEPTH_TO || point.window >= MIN_RANGE_PROBE_WINDOW;
+        let plateau = min_probed
+            && best.is_some_and(|best| {
+                point.window >= 2 * best.window
+                    && point.rate <= best.rate + best.spread + point.spread
+                    && best.rate >= RANGE_KNEE_FRACTION * point.rate
+            });
         if best.is_none_or(|best| point.rate > best.rate) {
             best = Some(point);
         }
@@ -809,5 +847,105 @@ mod tests {
         let p8 = super::Point::of_precise(p8_base.read, p8_base.window, &d8_passes);
         assert!(p2.spread / p2.rate < 0.02, "robust spread should stay tight despite 1 outlier: {:?}", p2);
         assert_eq!(range_knee(&[p2, p8]), p8.window);
+    }
+
+    /// On a flat/noisy `lone` curve (like RTX 5090 `0dc511` with 6 MiB ranges),
+    /// `due_read` must not collapse to `whole_range()` (`8192 KiB`): it picks
+    /// the smallest tied size `>= 512 KiB` so multi-MB expert parts stripe
+    /// across parallel reads and `queue_depth()` stays well above 10.
+    #[test]
+    fn flat_noisy_lone_curve_does_not_collapse_due_read_to_whole_range() {
+        const KIB: u64 = 1024;
+        const MIB: u64 = 1024 * 1024;
+        let urgent = Urgent { parts: vec![6_120_000; 3], records: 8 };
+        assert_eq!(urgent.whole_range(), 8 * MIB);
+        let reads = urgent.reads();
+        let points: Vec<super::Point> = reads
+            .iter()
+            .flat_map(|&read| {
+                [1u64, 2, 4, 8, 16, 32]
+                    .into_iter()
+                    .filter(move |&d| d * read <= WIDEST_WINDOW)
+                    .map(move |d| {
+                        let window = d * read;
+                        let rate = if window >= 32 * MIB { 8.11e9 } else { 8.11e9 * (window as f64 / (32 * MIB) as f64).sqrt() };
+                        super::Point { read, window, rate, spread: 0.1e9, cores: 0.5 }
+                    })
+            })
+            .collect();
+        // Flat/noisy lone timings across all sizes from 128 KiB to 8192 KiB.
+        let lone: Vec<super::Lone> = reads
+            .iter()
+            .enumerate()
+            .map(|(i, &read)| super::Lone { read, seconds: 5.0e-3 + (i as f64) * 0.01e-3, error: 0.3e-3 })
+            .collect();
+        let ranges = vec![
+            Curve::range_point(&urgent, 1, 2.0e9, 0.2e9, 0.2),
+            Curve::range_point(&urgent, 4, 6.0e9, 0.2e9, 0.4),
+            Curve::range_point(&urgent, 6, 7.9e9, 0.2e9, 0.5),
+            Curve::range_point(&urgent, 8, 8.1e9, 0.2e9, 0.6),
+        ];
+        let shape = super::Shape::of(&points, Some(super::Request { urgent: &urgent, lone: &lone, ranges: &ranges }));
+        assert_eq!(shape.due_read, 512 * KIB, "flat lone curve must pick smallest tied size >= 512 KiB, not 8192 KiB");
+        assert!(shape.due_read < 8 * MIB);
+        assert!(shape.queue_depth() > 10, "queue_depth must not starve pread pool: {}", shape.queue_depth());
+    }
+
+    /// Wide noise `spread` at `depth = 1` must never collapse `range_knee` to
+    /// `depth = 1` when deeper depths reach much higher throughput.
+    #[test]
+    fn noisy_range_line_does_not_collapse_range_knee_to_depth_one() {
+        let urgent = Urgent { parts: vec![6_120_000; 3], records: 8 };
+        let line = vec![
+            Curve::range_point(&urgent, 1, 1.5e9, 4.5e9, 0.2),
+            Curve::range_point(&urgent, 2, 3.0e9, 3.5e9, 0.3),
+            Curve::range_point(&urgent, 4, 5.8e9, 2.0e9, 0.4),
+            Curve::range_point(&urgent, 8, 8.1e9, 0.5e9, 0.6),
+        ];
+        assert_eq!(range_knee(&line), 8 * urgent.span());
+    }
+
+    /// When a noisy/stalled `ranges` line never approaches the drive's
+    /// saturation rate measured in `points`, `Shape::of` cross-checks against
+    /// `points` and floors `knee` to the `points` saturation window (in whole
+    /// ranges) so `knee` never collapses to `depth = 1`.
+    #[test]
+    fn collapsed_range_line_cross_checks_against_points_saturation_depth() {
+        const MIB: u64 = 1024 * 1024;
+        let urgent = Urgent { parts: vec![6_120_000; 3], records: 8 };
+        let points = vec![
+            super::Point { read: 512 * 1024, window: 4 * MIB, rate: 2.5e9, spread: 0.1e9, cores: 0.3 },
+            super::Point { read: 512 * 1024, window: 16 * MIB, rate: 6.2e9, spread: 0.1e9, cores: 0.4 },
+            super::Point { read: 512 * 1024, window: 32 * MIB, rate: 8.11e9, spread: 0.1e9, cores: 0.5 },
+            super::Point { read: 512 * 1024, window: 64 * MIB, rate: 8.10e9, spread: 0.1e9, cores: 0.5 },
+        ];
+        let lone = vec![super::Lone { read: 512 * 1024, seconds: 5.0e-3, error: 0.2e-3 }];
+        // Stalled range line peaking at 1.55 GB/s at depth 1 (vs 8.11 GB/s in points).
+        let ranges = vec![
+            Curve::range_point(&urgent, 1, 1.55e9, 0.4e9, 0.2),
+            Curve::range_point(&urgent, 2, 1.50e9, 0.4e9, 0.2),
+        ];
+        let shape = super::Shape::of(&points, Some(super::Request { urgent: &urgent, lone: &lone, ranges: &ranges }));
+        assert!(shape.knee >= 32 * MIB, "stalled range line must floor knee to points saturation (32 MiB), got {}", shape.knee);
+        assert_eq!(shape.knee % urgent.span(), 0, "floored knee stays a multiple of urgent.span()");
+        assert!(shape.queue_depth() > 10, "queue_depth must stay well above 10, got {}", shape.queue_depth());
+    }
+
+    /// `Shape::queue_depth()` decouples worker pool concurrency from large
+    /// `due_read` / `ahead_read` sizes so even a poisoned 8 MiB shape never
+    /// starves the `pread` pool to `queue_depth = 10`.
+    #[test]
+    fn queue_depth_stays_high_when_read_sizes_are_large() {
+        const KIB: u64 = 1024;
+        const MIB: u64 = 1024 * 1024;
+        let poisoned = super::Shape {
+            due: 64 * MIB,
+            knee: 6124 * KIB,
+            due_read: 8 * MIB,
+            ahead_read: 8 * MIB,
+            cores: 0.5,
+        };
+        assert_eq!(poisoned.queue_depth(), 64 + 6 + 1);
+        assert!(poisoned.queue_depth() > 10);
     }
 }

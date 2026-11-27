@@ -54,13 +54,17 @@ pub struct EngineWork {
 /// look misses a piece between them.
 pub fn engine_work() -> EngineWork {
     let engine = engine();
-    let reading = engine
+    let mut reading: Vec<Flight> = engine
         .flights
         .lock()
         .expect("read workers' flights")
         .iter()
         .filter_map(|flight| flight.lock().expect("a read worker's flight").clone())
         .collect();
+    #[cfg(target_os = "linux")]
+    if let Backend::Uring(ctl) = &engine.backend {
+        ctl.snapshot_flights(&mut reading);
+    }
     let queue = engine.queue();
     let ended = queue.links.values().map(|link| link.book.requests()).sum();
     let last_ended = queue.links.iter().filter_map(|(volume, link)| Some((*volume, link.book.last_ended()?))).collect();
@@ -108,6 +112,14 @@ impl Drop for FlightSlot {
     }
 }
 
+/// Dispatch backend for [`Engine`]: Linux `io_uring` (1 batched ring thread)
+/// when supported by the kernel, otherwise the blocking `pread` worker pool.
+enum Backend {
+    ThreadPool,
+    #[cfg(target_os = "linux")]
+    Uring(super::uring::UringCtl),
+}
+
 /// The process's pool: its queue, the condition its workers wait on, its
 /// workers and what its readers and probes need of them ([`Pool`]), each
 /// worker's piece in flight, and the buffers pieces that do not land straight
@@ -124,6 +136,20 @@ pub(crate) struct Engine {
     /// Each worker's piece in flight ([`engine_work`]).
     pub(crate) flights: Mutex<Vec<InFlight>>,
     pub(crate) buffers: Buffers,
+    backend: Backend,
+}
+
+/// Whether the process's read engine is currently using Linux `io_uring`.
+#[doc(hidden)]
+pub fn io_uring_active() -> bool {
+    #[cfg(target_os = "linux")]
+    {
+        matches!(engine().backend, Backend::Uring(_))
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        false
+    }
 }
 
 /// The bytes the process's read engine keeps in buffers between pieces:
@@ -155,18 +181,50 @@ pub fn read_workers() -> usize {
 /// submit ([`Need`]).
 pub(crate) fn engine() -> &'static Engine {
     static ENGINE: OnceLock<Engine> = OnceLock::new();
-    ENGINE.get_or_init(Engine::new)
+    let engine = ENGINE.get_or_init(|| Engine::with_plane(Arc::clone(crate::global_plane())));
+    static HOOK: OnceLock<crate::BlockingClearedHookGuard> = OnceLock::new();
+    let _ = HOOK.get_or_init(|| {
+        crate::global_plane().register_blocking_cleared_hook(
+            crate::LINK_STORAGE_NVME,
+            Arc::new(move || {
+                // Acquire & release `engine.queue()` first so no storage worker
+                // can slip between checking `queue.take() == None` and entering
+                // `engine.work.wait(queue)`. Deadlock-free because the hook only
+                // fires when a *different* link clears `Blocking`.
+                drop(engine.queue());
+                engine.wake_all();
+            }),
+        )
+    });
+    engine
 }
 
 impl Engine {
-    /// A pool with no workers and nothing queued.
+    /// A pool with no workers and nothing queued (isolated `IoPlane` for tests).
+    #[cfg(test)]
     pub(crate) fn new() -> Self {
+        Self::with_plane_and_backend(crate::IoPlane::new_default(), Backend::ThreadPool)
+    }
+
+    pub(crate) fn with_plane(plane: Arc<crate::IoPlane>) -> Self {
+        #[cfg(target_os = "linux")]
+        let backend = match super::uring::UringCtl::try_new() {
+            Some(ctl) => Backend::Uring(ctl),
+            None => Backend::ThreadPool,
+        };
+        #[cfg(not(target_os = "linux"))]
+        let backend = Backend::ThreadPool;
+        Self::with_plane_and_backend(plane, backend)
+    }
+
+    fn with_plane_and_backend(plane: Arc<crate::IoPlane>, backend: Backend) -> Self {
         Engine {
-            queue: Mutex::new(Queue::default()),
+            queue: Mutex::new(Queue::with_plane(plane)),
             work: Condvar::new(),
             pool: Mutex::new(Pool::default()),
             flights: Mutex::new(Vec::new()),
             buffers: Buffers::default(),
+            backend,
         }
     }
 
@@ -192,10 +250,64 @@ impl Engine {
         drop(need);
     }
 
-    /// Wake `count` workers.
+    /// End `returned` from the `io_uring` ring thread (no condvar notify needed
+    /// because the ring thread loops directly back to `queue.take()`).
+    #[cfg(target_os = "linux")]
+    pub(crate) fn read_returned_uring(&self, returned: Returned) {
+        let need = {
+            let mut queue = self.queue();
+            let (_, need) = queue.ended(returned);
+            need
+        };
+        drop(need);
+    }
+
+    /// Wake `count` workers (or signal the `io_uring` ring thread once).
     pub(crate) fn wake(&self, count: usize) {
-        for _ in 0..count {
-            self.work.notify_one();
+        if count == 0 {
+            return;
+        }
+        match &self.backend {
+            Backend::ThreadPool => {
+                for _ in 0..count {
+                    self.work.notify_one();
+                }
+            }
+            #[cfg(target_os = "linux")]
+            Backend::Uring(ctl) if !ctl.is_failed() => ctl.wake(),
+            #[cfg(target_os = "linux")]
+            Backend::Uring(_) => {
+                for _ in 0..count {
+                    self.work.notify_one();
+                }
+            }
+        }
+    }
+
+    /// Wake all idle workers (or signal the `io_uring` ring thread).
+    pub(crate) fn wake_all(&self) {
+        match &self.backend {
+            Backend::ThreadPool => self.work.notify_all(),
+            #[cfg(target_os = "linux")]
+            Backend::Uring(ctl) if !ctl.is_failed() => ctl.wake(),
+            #[cfg(target_os = "linux")]
+            Backend::Uring(_) => self.work.notify_all(),
+        }
+    }
+
+    /// Request async cancellation of any in-flight pieces of `request_id`
+    /// (effective on Linux `io_uring`; no-op on the blocking `pread` pool).
+    pub(crate) fn cancel_inflight(&self, request_id: u64) {
+        match &self.backend {
+            Backend::ThreadPool => {
+                let _ = request_id;
+            }
+            #[cfg(target_os = "linux")]
+            Backend::Uring(ctl) if !ctl.is_failed() => ctl.cancel_inflight(request_id),
+            #[cfg(target_os = "linux")]
+            Backend::Uring(_) => {
+                let _ = request_id;
+            }
         }
     }
 
@@ -216,6 +328,41 @@ impl Engine {
     /// Start the workers the pool counted out for its target under its
     /// lock (`pool`, released here), each past it ([`Pool::starting`]).
     fn grow(&'static self, mut pool: MutexGuard<'_, Pool>) -> Result<(), Error> {
+        match &self.backend {
+            #[cfg(target_os = "linux")]
+            Backend::Uring(ctl) if !ctl.is_failed() => {
+                if pool.started == 0 && pool.target() > 0 {
+                    let ring = ctl.open_ring().map_err(Error::ThreadStart)?;
+                    pool.started = 1;
+                    pool.named += 1;
+                    let name = pool.named;
+                    drop(pool);
+                    let started = seismic_threads::spawn(format!("seismic-uring-{name}"), move || {
+                        super::uring::run_ring(self, ctl, ring);
+                    });
+                    if let Err(error) = started {
+                        self.pool.lock().expect("read pool").started = 0;
+                        return Err(Error::ThreadStart(error));
+                    }
+                }
+                Ok(())
+            }
+            #[cfg(target_os = "linux")]
+            Backend::Uring(_) => self.grow_thread_pool(pool),
+            Backend::ThreadPool => self.grow_thread_pool(pool),
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    pub(crate) fn fallback_from_uring(&'static self) {
+        let mut pool = self.pool.lock().expect("read pool");
+        pool.started = 0;
+        if pool.target() > 0 {
+            let _ = self.grow_thread_pool(pool);
+        }
+    }
+
+    fn grow_thread_pool(&'static self, mut pool: MutexGuard<'_, Pool>) -> Result<(), Error> {
         let names = pool.starting();
         drop(pool);
         for (index, name) in names.clone().enumerate() {
@@ -230,6 +377,19 @@ impl Engine {
             }
         }
         Ok(())
+    }
+
+    /// Retire the single `io_uring` ring thread once all claims have ended and
+    /// no pieces remain queued or in flight. Caller holds `self.queue`'s lock.
+    #[cfg(target_os = "linux")]
+    pub(crate) fn retire_uring(&self, _queue: &Queue) -> bool {
+        let mut pool = self.pool.lock().expect("read pool");
+        if pool.target() == 0 {
+            pool.started = 0;
+            true
+        } else {
+            false
+        }
     }
 
     /// Whether a worker that found nothing to take leaves the pool: while
@@ -489,7 +649,7 @@ impl Drop for Need {
         // the condition, or will see the target as it now is.
         if shrunk {
             drop(self.engine.queue());
-            self.engine.work.notify_all();
+            self.engine.wake_all();
         }
     }
 }
@@ -734,12 +894,12 @@ mod tests {
     const KIB: u64 = 1 << 10;
     const MIB: u64 = 1 << 20;
 
-    /// Expected per-device worker count for `decode`: 68 (`64 + 3 + 1`), capped
+    /// Expected per-device worker count for `decode`: 71 (`64 + 6 + 1`), capped
     /// at `MAX_WORKERS` (16 on macOS, 32 on Linux/Windows).
     const DECODE_WORKERS: usize = super::MAX_WORKERS;
 
     /// A measured M4 Pro decode link: due 32 MiB in 512 KiB reads, a knee
-    /// of 5200 KiB in 2 MiB reads (64 + 3 + 1 pieces).
+    /// of 5200 KiB in 2 MiB reads (64 + 6 + 1 pieces with 1 MiB QD cap).
     fn decode(volume: u64) -> VolumeReads {
         VolumeReads {
             id: Volume(volume),
@@ -794,7 +954,7 @@ mod tests {
             let shard = round % 4;
             started += submit(&mut pool, ids[shard], &shards[shard], 1, 4 * KIB);
         }
-        assert_eq!(pool.cap(), 68, "four shards on one device share its depth");
+        assert_eq!(pool.cap(), 71, "four shards on one device share its depth");
         assert_eq!(pool.target(), DECODE_WORKERS, "4 KiB pieces hold the device's worker cap");
         assert_eq!(started, DECODE_WORKERS, "the burst started its target's workers once");
         assert!(!pool.release(ids[0]), "a claim ending beside its device's others shrinks nothing");
@@ -839,7 +999,7 @@ mod tests {
         assert_eq!(submit(&mut pool, small, &small_live, 10, 512 * KIB), 0);
         assert_eq!(pool.target(), DECODE_WORKERS);
         assert!(pool.release(big), "dropping the deeper claim must shrink target");
-        assert_eq!(pool.target(), 6, "remaining claim needs 4 due + 1 knee + 1 = 6 workers");
+        assert_eq!(pool.target(), 7, "remaining claim needs 4 due + 2 knee + 1 = 7 workers");
         assert!(pool.release(small));
         assert_eq!(pool.target(), 0);
     }

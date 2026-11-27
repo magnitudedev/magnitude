@@ -480,29 +480,36 @@ fn queued(pieces: usize) -> (Queued, Arc<RequestState>) {
         .unwrap()
         .file;
     let volume = volume(0, (u64::MAX, u64::MAX), LEAST_READ);
-    let mut request = Queued {
-        state: state.clone(),
+    let mut request = Queued::new(
+        state.clone(),
         file,
-        need: crate::scheduler::need(&volume),
-        volume,
-        pieces: (0..pieces as u64)
+        volume.clone(),
+        crate::scheduler::need(&volume),
+        (0..pieces as u64)
             .map(|index| Piece {
                 start: index,
                 end: index + 1,
                 parts: Vec::new(),
             })
             .collect(),
-    };
+    );
     request.need.submitted(request.pieces.make_contiguous()).unwrap();
     (request, state)
 }
 
 /// A queued request on `volume`'s link of pieces `[start, end)`.
 fn queued_on(volume: &VolumeReads, spans: &[(u64, u64)]) -> Queued {
-    let (mut request, _) = queued(0);
-    request.volume = volume.clone();
-    request.need = crate::scheduler::need(volume);
-    request.pieces = spans.iter().map(|&(start, end)| Piece { start, end, parts: Vec::new() }).collect();
+    let (request, _) = queued(0);
+    let mut request = Queued::new(
+        request.state,
+        request.file,
+        volume.clone(),
+        crate::scheduler::need(volume),
+        spans
+            .iter()
+            .map(|&(start, end)| Piece { start, end, parts: Vec::new() })
+            .collect(),
+    );
     request.need.submitted(request.pieces.make_contiguous()).unwrap();
     request
 }
@@ -1235,6 +1242,105 @@ fn a_piece_read_ahead_starts_only_while_everything_in_flight_fits_the_knee() {
     assert!(queue.take().is_none(), "past the knee");
 }
 
+/// Tail-phase `Standing::Ahead` fill across layer boundaries:
+/// 1. While any `Parked` piece is still queued, `Ahead` is strictly held back.
+/// 2. Once all `Parked` pieces of layer `L` are in flight (ready `due` queue
+///    empty) and `flight.parked` drains below `shape.knee`, `Link::next()`
+///    immediately dispatches `Standing::Ahead` pieces up to `shape.knee` so
+///    the drive stays saturated across the layer boundary instead of draining
+///    to QD = 0.
+/// 3. The instant a new `Parked` demand piece arrives (layer `L+1`),
+///    `Link::next()` strictly prioritizes it ahead of any queued `Ahead`
+///    pieces and starts it immediately beside in-flight `Ahead` pieces.
+/// 4. On discrete PCIe (`IoPlane::default_fabric()`), a `Blocking` H2D DMA op
+///    on `LINK_COPY_H2D` does not falsely block `Standing::Ahead` on
+///    `LINK_STORAGE_NVME`.
+#[test]
+fn ahead_fills_parked_tail_while_strictly_prioritizing_new_parked_and_ignoring_uncoupled_h2d_blocking() {
+    use crate::{
+        BatchCompatibility, BufferLease, GlobalUrgency, IoPlane, PlacementRequirement, ScheduleKey,
+        TransferRequest, DOMAIN_DEVICE_VRAM, LINK_COPY_H2D, LINK_STORAGE_NVME,
+    };
+
+    let plane = IoPlane::new_default();
+    // Submit a Blocking H2D DMA op on LINK_COPY_H2D: on discrete PCIe, H2D
+    // full-duplex lanes are independent of NVMe D2H and Host DDR (31 < 60 GB/s)
+    // is unsaturated, so NVMe Ahead must NOT be coupled-blocked.
+    let _h2d_handle = plane
+        .submit(TransferRequest {
+            link: LINK_COPY_H2D,
+            key: ScheduleKey::blocking(GlobalUrgency(0), 0, 0, 1),
+            bytes: 4 * 1024 * 1024,
+            content_key: None,
+            placement: PlacementRequirement::FixedDestination,
+            compatibility: BatchCompatibility::Isolated,
+            src_lease: None,
+            dst_lease: BufferLease::unmanaged(
+                DOMAIN_DEVICE_VRAM,
+                NonNull::dangling(),
+                0,
+                0,
+                4 * 1024 * 1024,
+                256,
+                0,
+            ),
+            direct: true,
+        })
+        .expect("submit blocking H2D op");
+    assert!(
+        !plane.has_coupled_blocking_waiting(LINK_STORAGE_NVME),
+        "independent discrete H2D Blocking op must not couple-block LINK_STORAGE_NVME"
+    );
+
+    // Link with due = 16, knee = 8, piece size = 2: layer L submits 6 Parked
+    // pieces (12 bytes > knee = 8, <= due = 16).
+    let link = volume(22, (16, 8), 2);
+    let mut queue = Queue::with_plane(plane);
+    queue.push(
+        queued_on(&link, &[(0, 2), (2, 4), (4, 6), (6, 8), (8, 10), (10, 12)]),
+        Want::now(),
+    );
+    queue.push(
+        queued_on(&link, &[(20, 22), (22, 24), (24, 26), (26, 28), (28, 30)]),
+        Want::expected(1, 0.85),
+    );
+
+    // Dispatch all 6 Parked pieces of layer L: Ahead is never taken while any
+    // Parked piece remains queued.
+    let mut parked = Vec::new();
+    for expected_start in [0, 2, 4, 6, 8, 10] {
+        let taken = queue.take().expect("parked piece");
+        assert_eq!((taken.piece.start, taken.standing), (expected_start, Standing::Parked));
+        parked.push(taken);
+    }
+    // flight.parked = 12 > knee = 8 -> no Ahead yet.
+    assert!(queue.take().is_none(), "12 parked in flight exceeds knee 8");
+
+    // Drain 3 Parked pieces -> flight.parked drops 12 -> 10 -> 8 -> 6 (< knee 8).
+    queue.ended(parked.remove(0).returned(Instant::now(), true)); // parked = 10
+    assert!(queue.take().is_none(), "10 + 2 > knee 8");
+    queue.ended(parked.remove(0).returned(Instant::now(), true)); // parked = 8
+    assert!(queue.take().is_none(), "8 + 2 > knee 8");
+    queue.ended(parked.remove(0).returned(Instant::now(), true)); // parked = 6
+
+    // Tail phase: 6 + 2 == knee (8) -> Ahead piece 20 immediately fills the tail!
+    let ahead_0 = queue.take().expect("Ahead must fill parked tail once flight.parked < knee");
+    assert_eq!((ahead_0.piece.start, ahead_0.standing), (20, Standing::Ahead));
+    assert!(queue.take().is_none(), "6 parked + 2 ahead == knee 8");
+
+    // Drain another Parked piece (parked = 4, ahead = 2) -> Ahead piece 22 fills!
+    queue.ended(parked.remove(0).returned(Instant::now(), true));
+    let ahead_1 = queue.take().expect("second Ahead piece fills tail");
+    assert_eq!((ahead_1.piece.start, ahead_1.standing), (22, Standing::Ahead));
+
+    // Layer L+1 demand arrives while Ahead pieces 20, 22 are in flight and
+    // 24, 26, 28 remain queued: new Parked piece MUST preempt queued Ahead
+    // immediately and start beside in-flight Ahead pieces.
+    queue.push(queued_on(&link, &[(40, 42)]), Want::now());
+    let next_parked = queue.take().expect("new Parked demand must immediately preempt queued Ahead");
+    assert_eq!((next_parked.piece.start, next_parked.standing), (40, Standing::Parked));
+}
+
 /// Due pieces join the due bytes in flight up to the due depth, whatever
 /// is read ahead: a due piece arriving at a link full of reads ahead starts
 /// at once, which bounds its wait by what was in flight.
@@ -1578,7 +1684,7 @@ fn aligned_range_with_headroom_eliminates_bounce_copies() {
     // 4) Edge cases: empty range and out-of-bounds range via AlignedRange.
     let sink = Arc::new(Buffer::with_headroom(64));
     let empty = reader.aligned_range(32, 0, sink.clone(), 0);
-    assert_eq!(empty.slice(unsafe { sink.bytes() }), &[]);
+    assert!(empty.slice(unsafe { sink.bytes() }).is_empty());
     let oob = reader.aligned_range(total as u64 - 16, 64, sink, 0);
     let handle = unsafe { reader.request(vec![oob.range], Want::now()) }.unwrap();
     assert!(matches!(handle.wait(), Ended::Read { failed } if failed.len() == 1));
@@ -1641,6 +1747,57 @@ fn contiguous_aligned_multipart_piece_lands_direct_via_preadv() {
     );
     assert!(gap_span.bounced_bytes > 0, "gapped coalesced piece must bounce safely: {gap_span:?}");
 
+    drop(reader);
+    std::fs::remove_file(path).unwrap();
+}
+
+/// Dropping a queued `Handle` releases `engine.queue()` before running its
+/// synchronous `on_end` callback (and before dropping `Need`), so a callback
+/// that re-enters the read queue via `Reader::request` never deadlocks.
+#[test]
+fn dropping_queued_handle_runs_on_end_callback_outside_queue_lock() {
+    let _volume = temporary_volume();
+    let piece_bytes = LEAST_READ as usize;
+    let payload = vec![0xABu8; 32 * piece_bytes];
+    let path = temporary("drop-reenter-queue", &payload);
+    let reader = Arc::new(Reader::open(&path, CachePolicy::Cached).unwrap());
+    let sink = Arc::new(Buffer::new(32 * piece_bytes));
+    let ranges: Vec<Range> = (0..32)
+        .map(|i| Range {
+            offset: (i * piece_bytes) as u64,
+            length: piece_bytes,
+            into: sink.clone(),
+            at: i * piece_bytes,
+        })
+        .collect();
+    let cancelled = unsafe { reader.request(ranges, Want::undated(0.)) }.unwrap();
+    let ending = cancelled.ending();
+    let (tx, rx) = std::sync::mpsc::channel();
+    let reader_cb = Arc::clone(&reader);
+    let sink_cb = Arc::new(Buffer::new(piece_bytes));
+    cancelled.on_end(move |_| {
+        // Re-entering `engine.queue()` via `Reader::request` inside `on_end`
+        // during `Handle::drop` would deadlock immediately if `Handle::drop`
+        // held the queue lock across `pieces_ended`.
+        let follow = unsafe {
+            reader_cb.request(
+                vec![Range {
+                    offset: 0,
+                    length: piece_bytes,
+                    into: sink_cb,
+                    at: 0,
+                }],
+                Want::undated(0.),
+            )
+        }
+        .unwrap();
+        drop(follow);
+        tx.send(()).unwrap();
+    });
+    drop(cancelled);
+    let _ = ending.wait();
+    rx.recv_timeout(Duration::from_secs(5))
+        .expect("on_end callback must run and re-enter engine.queue() without deadlocking");
     drop(reader);
     std::fs::remove_file(path).unwrap();
 }

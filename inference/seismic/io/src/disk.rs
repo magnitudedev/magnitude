@@ -23,6 +23,12 @@ pub use storage::{StorageProbe, FULL_DEPTH, FULL_READ, LONE_READ, STORAGE_PROBE_
 pub use volume::{adopt_earlier, adopt_volume, link_shape, probe_volume, read_cores, EarlierChoice, Shape};
 
 pub(crate) use file::{Fetched, SourceFile, Through};
+#[cfg(unix)]
+pub(crate) use file::build_iovecs;
+#[cfg(target_os = "linux")]
+pub(crate) use file::truncated;
+#[cfg(target_os = "linux")]
+pub(crate) use platform::{refuses_direct, refuses_direct_sink};
 pub(crate) use probe::LEAST_READ;
 pub(crate) use volume::VolumeReads;
 

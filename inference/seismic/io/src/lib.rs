@@ -138,6 +138,12 @@ pub mod accounting;
 pub mod destination;
 pub mod disk;
 mod error;
+pub mod fabric;
+pub mod fence;
+pub mod lease;
+pub mod metrics;
+pub mod plane;
+pub mod schedule;
 pub mod scheduler;
 pub mod store;
 pub mod timeline;
@@ -148,8 +154,31 @@ pub use accounting::{Class, Line, Totals, Waits};
 pub use destination::{Buffer, Destination, ALIGNED_HEADROOM};
 pub use disk::{adopt_earlier, adopt_volume, cached_pages, link_shape, probe_volume, read_cores, CachePolicy, Curve, EarlierChoice, Lone, OpenError, OpenFile, Point, Reader, Shape, Urgent, Volume, ALIGNMENT};
 pub use error::Error;
+pub use fabric::{
+    BusCoupling, BusDirection, CoupledSetId, CoupledSetSpec, DeviceId, DomainId, Fabric,
+    FabricError, FabricSpec, LinkCurve, LinkId, LinkKind, LinkSpec, NumaNodeId, ProducerId,
+    RepresentationId, RootComplexId, RoutePlan, RouteStage, SharedBusId, SharedBusSpec, SocId,
+    VolumeId,
+};
+pub use fence::{FenceCapability, FenceError, HostTimeline, MultiProducerTimeline, TimelineObserver, TimelinePoint};
+pub use lease::{BufferLease, LeasePool, ReaderPin, ReaderRetirementTracker, SlotKey};
+pub use metrics::{
+    BusLedger, BusMetrics, BusReservation, FabricMetricsStore, FenceReservationId, LinkLedger,
+    LinkMetrics, TransferQuote,
+};
+pub use plane::{
+    global_plane, BatchId, BlockingClearedHook, BlockingClearedHookGuard, ClaimedBatch, ClaimedOp, IntermediateSlotGuard,
+    IntermediateSlotReserve, IoPlane, OpState, OwnerTag, PhysicalOpId, PipelineHandle, SubmitError,
+    SubscriberId, TransferHandle, TransferOutcome, TransferRequest, TransformTask, BUS_HOST_DDR,
+    BUS_PCIE_ROOT, BUS_UNIFIED_FABRIC, DOMAIN_DEVICE_VRAM, DOMAIN_HOST_RAM, DOMAIN_STORAGE,
+    LINK_COPY_D2H, LINK_COPY_H2D, LINK_STORAGE_NVME,
+};
+pub use schedule::{
+    BatchCompatibility, ContentKey, GlobalUrgency, LocalDeadline, PlacementRequirement,
+    PriorityClass, ScheduleKey,
+};
 pub use store::{Durability, Eviction, Examining, Exclusive, Held, Layout, Lease, OwnedRecord, Privacy, Record, Shared, Staged, Store, StoreError, Temporary, ABANDONED};
-pub use scheduler::{engine_work, read_buffers, read_workers, AlignedRange, Deadline, Ended, Ending, EngineWork, Flight, Handle, Outstanding, Panic, Range, Want};
+pub use scheduler::{engine_work, io_uring_active, read_buffers, read_workers, AlignedRange, Deadline, Ended, Ending, EngineWork, Flight, Handle, Outstanding, Panic, Range, Want};
 pub use volume::{volume_space, VolumeSpace};
 pub use waited::waited_on;
 

@@ -3,7 +3,7 @@ use super::handle::{first_failures, RequestState};
 use super::{Deadline, Ended, Standing, Want, COALESCE_GAP};
 use crate::accounting::{Book, Wait};
 use crate::disk::{Shape, SourceFile, VolumeReads};
-use crate::{Volume, ALIGNMENT};
+use crate::{IoPlane, PriorityClass, Volume, ALIGNMENT, LINK_STORAGE_NVME};
 use std::collections::hash_map::Entry;
 use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::ptr::NonNull;
@@ -86,28 +86,43 @@ pub(crate) fn pieces(ranges: &[(usize, Span)], size: u64, read: u64) -> Vec<Piec
     let mut pieces = Vec::new();
     for (start, end, served) in reads {
         let mut at = start;
+        let mut cursor = 0usize;
         while at < end {
             let stop = (at + read).min(end);
-            let parts = served
-                .iter()
-                .filter_map(|served| {
-                    let (index, range) = ranges[*served];
-                    let from = range.offset.max(at);
-                    let to = (range.offset + range.length as u64).min(stop);
-                    (from < to || (range.length == 0 && (at..stop).contains(&range.offset))).then(
-                        || Part {
-                            range: index,
-                            from: (from - at) as usize,
-                            length: to.saturating_sub(from) as usize,
-                            // SAFETY: within the range's sink, `from - offset`
-                            // bytes in.
-                            sink: unsafe {
-                                range.sink.add((from - range.offset) as usize)
-                            },
-                        },
-                    )
-                })
-                .collect::<Vec<_>>();
+            while cursor < served.len() {
+                let (_, range) = ranges[served[cursor]];
+                let past = if range.length == 0 {
+                    range.offset < at
+                } else {
+                    range.offset + range.length as u64 <= at
+                };
+                if past {
+                    cursor += 1;
+                } else {
+                    break;
+                }
+            }
+            let mut parts = Vec::new();
+            for &served_idx in &served[cursor..] {
+                #[cfg(test)]
+                PIECES_RANGE_VISITS.with(|c| c.set(c.get() + 1));
+                let (index, range) = ranges[served_idx];
+                if range.offset >= stop {
+                    break;
+                }
+                let from = range.offset.max(at);
+                let to = (range.offset + range.length as u64).min(stop);
+                if from < to || (range.length == 0 && (at..stop).contains(&range.offset)) {
+                    parts.push(Part {
+                        range: index,
+                        from: (from - at) as usize,
+                        length: to.saturating_sub(from) as usize,
+                        // SAFETY: within the range's sink, `from - offset`
+                        // bytes in.
+                        sink: unsafe { range.sink.add((from - range.offset) as usize) },
+                    });
+                }
+            }
             if !parts.is_empty() {
                 pieces.push(Piece {
                     start: at,
@@ -129,6 +144,31 @@ pub(crate) struct Queued {
     pub(crate) volume: VolumeReads,
     pub(crate) need: Arc<Need>,
     pub(crate) pieces: VecDeque<Piece>,
+    /// Running sum of `(piece.end - piece.start).max(1)` across `pieces`.
+    pub(crate) remaining_bytes: u64,
+}
+
+impl Queued {
+    pub(crate) fn new(
+        state: Arc<RequestState>,
+        file: Arc<SourceFile>,
+        volume: VolumeReads,
+        need: Arc<Need>,
+        pieces: VecDeque<Piece>,
+    ) -> Self {
+        let remaining_bytes = pieces
+            .iter()
+            .map(|piece| (piece.end - piece.start).max(1))
+            .sum();
+        Self {
+            state,
+            file,
+            volume,
+            need,
+            pieces,
+            remaining_bytes,
+        }
+    }
 }
 
 /// A piece a worker took, with its request (by its submission, its state
@@ -142,6 +182,7 @@ pub(crate) struct Taken {
     pub(crate) need: Arc<Need>,
     pub(crate) piece: Piece,
     pub(crate) standing: Standing,
+    pub(crate) class: PriorityClass,
 }
 
 impl Taken {
@@ -151,6 +192,7 @@ impl Taken {
             id: self.id,
             volume: self.volume.id,
             standing: self.standing,
+            class: self.class,
             bytes: self.piece.end - self.piece.start,
             direct,
             at,
@@ -165,17 +207,17 @@ pub(crate) struct Returned {
     id: u64,
     volume: Volume,
     standing: Standing,
+    class: PriorityClass,
     bytes: u64,
     direct: bool,
     at: Instant,
     need: Arc<Need>,
 }
 
-/// Every volume's link, and each request's wait. Every count of a piece
-/// taken or ended is kept here, under the lock the queue is held by
-/// wherever one is, so none takes a lock of its own.
-#[derive(Default)]
+/// Every volume's link, and each request's wait, backed by [`IoPlane`] for
+/// coupled-bus admission and wire/bus accounting.
 pub(crate) struct Queue {
+    plane: Arc<IoPlane>,
     submitted: u64,
     /// The pieces taken and not yet ended, on every link.
     taken: usize,
@@ -186,6 +228,25 @@ pub(crate) struct Queue {
     /// The wait of each request with a piece queued or in flight, by its
     /// submission.
     waits: HashMap<u64, Wait>,
+}
+
+impl Default for Queue {
+    fn default() -> Self {
+        Self::with_plane(IoPlane::new_default())
+    }
+}
+
+impl Queue {
+    pub(crate) fn with_plane(plane: Arc<IoPlane>) -> Self {
+        Self {
+            plane,
+            submitted: 0,
+            taken: 0,
+            links: HashMap::new(),
+            wants: HashMap::new(),
+            waits: HashMap::new(),
+        }
+    }
 }
 
 /// A volume's link, the one authority on what of it is in flight ("Order
@@ -253,7 +314,7 @@ impl Link {
     /// head read ahead, where the parked bytes and those read ahead in
     /// flight leave it room ([`admits`]). Any due head held back at the due
     /// depth holds back everything behind it, including read-ahead work.
-    fn next(&self) -> Option<((Want, u64), Standing)> {
+    fn next(&self, plane: &IoPlane) -> Option<((Want, u64), Standing)> {
         let head = self.requests.first_key_value().map(|(key, request)| (*key, request, key.0.standing()));
         let streamed = self.streamed.first_key_value().map(|(key, request)| (*key, request, key.0.standing()));
         let due = [head, streamed].into_iter().flatten().filter(|(_, _, standing)| standing.due()).min_by_key(|(key, ..)| *key);
@@ -261,7 +322,9 @@ impl Link {
             return self.admits(request, standing).then_some((key, standing));
         }
         match head {
-            Some((key, request, Standing::Ahead)) => self.admits(request, Standing::Ahead).then_some((key, Standing::Ahead)),
+            Some((key, request, Standing::Ahead)) => (!plane.has_coupled_blocking_waiting(LINK_STORAGE_NVME)
+                && self.admits(request, Standing::Ahead))
+            .then_some((key, Standing::Ahead)),
             _ => None,
         }
     }
@@ -272,15 +335,15 @@ impl Link {
     }
 
     /// Whether a piece of it may start now.
-    fn ready(&self) -> bool {
-        self.next().is_some()
+    fn ready(&self, plane: &IoPlane) -> bool {
+        self.next(plane).is_some()
     }
 
     /// How many pieces, in order, of the request [`Self::next`] names, then
     /// of the head read ahead where nothing parked is queued, may start
     /// now beside what is in flight: the workers to wake for them.
-    fn room(&self) -> usize {
-        let Some((key, standing)) = self.next() else {
+    fn room(&self, plane: &IoPlane) -> usize {
+        let Some((key, standing)) = self.next(plane) else {
             return 0;
         };
         let mut flight = self.flight;
@@ -348,6 +411,13 @@ impl Queue {
             return (id, 0);
         }
         let now = Instant::now();
+        let class = want.to_schedule_key(id).class;
+        self.plane.direct_enqueue(
+            LINK_STORAGE_NVME,
+            class,
+            u32::try_from(request.pieces.len()).unwrap_or(u32::MAX),
+            request.remaining_bytes,
+        );
         let volume = request.volume.id;
         let link = self.links.entry(volume).or_insert_with(|| Link::new(now));
         self.waits.insert(id, Wait::new(request.pieces.len(), want.due(), &mut link.book, now));
@@ -357,7 +427,7 @@ impl Queue {
         }
         self.wants.insert(id, (volume, want));
         link.map(&want).insert((want, id), request);
-        (id, link.room())
+        (id, link.room(&self.plane))
     }
 
     /// The most urgent piece of every link's that its link may start now
@@ -371,7 +441,7 @@ impl Queue {
         let (volume, key, standing) = self
             .links
             .iter()
-            .filter_map(|(volume, link)| link.next().map(|(key, standing)| (*volume, key, standing)))
+            .filter_map(|(volume, link)| link.next(&self.plane).map(|(key, standing)| (*volume, key, standing)))
             .min_by_key(|(_, key, _)| *key)?;
         let link = self.links.get_mut(&volume).expect("a ready link");
         let flight = link.flight.total();
@@ -379,6 +449,9 @@ impl Queue {
         let request = map.get_mut(&key).expect("the chosen request");
         let piece = request.pieces.pop_front().expect("a queued request has a piece");
         let bytes = piece.end - piece.start;
+        request.remaining_bytes = request.remaining_bytes.saturating_sub(bytes.max(1));
+        let class = key.0.to_schedule_key(key.1).class;
+        self.plane.direct_begin(LINK_STORAGE_NVME, class, bytes.max(1));
         crate::timeline::note_at(now, crate::timeline::Kind::Take, key.1, (piece.start as i64, bytes as i64, flight as i64));
         request.state.started.get_or_init(|| now);
         let taken = Taken {
@@ -389,6 +462,7 @@ impl Queue {
             need: request.need.clone(),
             piece,
             standing,
+            class,
         };
         self.taken += 1;
         if request.pieces.is_empty() {
@@ -410,14 +484,16 @@ impl Queue {
     /// took one wakes another for, so a link's depth fills one piece after
     /// another however many its last change freed.
     pub(crate) fn ready(&self) -> bool {
-        self.links.values().any(Link::ready)
+        self.links.values().any(|link| link.ready(&self.plane))
     }
 
     /// `returned`'s piece ended as its read returned, counted in its link's
     /// book and its request's wait: whether the link holds a request
     /// queued, whose next piece the room it freed may admit.
     pub(crate) fn ended(&mut self, returned: Returned) -> (bool, Arc<Need>) {
-        let Returned { id, volume, standing, bytes, direct, at, need } = returned;
+        let Returned { id, volume, standing, class, bytes, direct, at, need } = returned;
+        self.plane
+            .direct_complete(LINK_STORAGE_NVME, class, bytes.max(1), direct);
         need.ended(1);
         let link = self.links.get_mut(&volume).expect("an ended piece was in flight");
         self.taken -= 1;
@@ -436,12 +512,23 @@ impl Queue {
         if *current == want {
             return 0;
         }
+        let old_class = current.to_schedule_key(id).class;
+        let new_class = want.to_schedule_key(id).class;
         let link = self.links.get_mut(volume).expect("a queued request's link");
         let request = link.map(current).remove(&(*current, id)).expect("a queued request");
         *current = want;
+        if old_class != new_class {
+            self.plane.direct_reprice(
+                LINK_STORAGE_NVME,
+                old_class,
+                new_class,
+                u32::try_from(request.pieces.len()).unwrap_or(u32::MAX),
+                request.remaining_bytes,
+            );
+        }
         crate::timeline::note(crate::timeline::Kind::Reprice, id, (i64::from(!want.due()), request.pieces.len() as i64, 0));
         link.map(&want).insert((want, id), request);
-        link.room()
+        link.room(&self.plane)
     }
 
     /// Cancel request `id`: its pieces no worker took and the workers to wake
@@ -450,9 +537,70 @@ impl Queue {
         let (volume, want) = self.wants.remove(&id)?;
         let link = self.links.get_mut(&volume).expect("a queued request's link");
         let request = link.map(&want).remove(&(want, id)).expect("a queued request");
+        self.plane.direct_cancel(
+            LINK_STORAGE_NVME,
+            want.to_schedule_key(id).class,
+            u32::try_from(request.pieces.len()).unwrap_or(u32::MAX),
+            request.remaining_bytes,
+        );
         crate::timeline::note(crate::timeline::Kind::Cancel, id, (request.pieces.len() as i64, 0, 0));
         settle(&mut self.waits, id, |wait| wait.cancelled(&mut link.book, Instant::now()));
         request.need.ended(request.pieces.len());
-        Some((request, link.room()))
+        Some((request, link.room(&self.plane)))
+    }
+}
+
+#[cfg(test)]
+thread_local! {
+    static PIECES_RANGE_VISITS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+#[cfg(test)]
+mod work_bound_tests {
+    use super::*;
+
+    #[test]
+    fn work_bound_pieces_two_pointer_linear_in_p_plus_r() {
+        let measure = |num_ranges: usize| -> (usize, usize) {
+            let mut backing = vec![0u8; num_ranges * (ALIGNMENT as usize)];
+            let base = NonNull::new(backing.as_mut_ptr()).expect("non-null");
+            let ranges: Vec<(usize, Span)> = (0..num_ranges)
+                .map(|i| {
+                    let off = (i as u64) * ALIGNMENT;
+                    (
+                        i,
+                        Span {
+                            offset: off,
+                            length: ALIGNMENT as usize,
+                            sink: unsafe { base.add(i * (ALIGNMENT as usize)) },
+                        },
+                    )
+                })
+                .collect();
+            let size = (num_ranges as u64) * ALIGNMENT;
+            let read = 16 * ALIGNMENT; // 16 ranges per piece -> P = num_ranges / 16
+            PIECES_RANGE_VISITS.with(|c| c.set(0));
+            let out = pieces(&ranges, size, read);
+            let visits = PIECES_RANGE_VISITS.with(|c| c.get());
+            // Verify every range is covered exactly once with exact offsets.
+            let total_parts: usize = out.iter().map(|p| p.parts.len()).sum();
+            assert_eq!(total_parts, num_ranges);
+            (out.len(), visits)
+        };
+
+        let (p_small, v_small) = measure(32);
+        let (p_large, v_large) = measure(512);
+        assert_eq!(p_small, 2);
+        assert_eq!(p_large, 32);
+        // Two-pointer sliding window does at most P + R visits (one break per
+        // piece + one visit per range), never O(P * R) = 16_384.
+        assert!(
+            v_small <= p_small + 32,
+            "expected O(P+R) visits for R=32, got {v_small}"
+        );
+        assert!(
+            v_large <= p_large + 512,
+            "expected O(P+R) visits for R=512, got {v_large}"
+        );
     }
 }

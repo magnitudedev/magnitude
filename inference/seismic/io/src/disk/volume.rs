@@ -99,11 +99,16 @@ impl Shape {
     }
 
     /// Its queue depth, in pieces: each depth in the pieces its reads are
-    /// cut in, and one piece past them. The read pool holds no more workers
-    /// for a device than the deepest of its claims' links' queue depths, so
-    /// pieces submitted past it, however many, start no worker.
+    /// cut in (capped at 1 MiB per piece so large `due_read`/`ahead_read`
+    /// sizes never starve the worker pool on NVMe volumes), and one piece
+    /// past them. The read pool holds no more workers for a device than the
+    /// deepest of its claims' links' queue depths, so pieces submitted past
+    /// it, however many, start no worker.
     pub fn queue_depth(&self) -> u64 {
-        self.due.div_ceil(self.due_read) + self.knee.div_ceil(self.ahead_read) + 1
+        const MAX_PIECE_FOR_QD: u64 = 1 << 20;
+        self.due.div_ceil(self.due_read.min(MAX_PIECE_FOR_QD))
+            + self.knee.div_ceil(self.ahead_read.min(MAX_PIECE_FOR_QD))
+            + 1
     }
 }
 
@@ -134,14 +139,16 @@ impl EarlierChoice {
 
 impl Curve {
     /// The rule a curve is kept by, a term of a stored curve's key, so a
-    /// curve probed by another is probed again: 8, range lines probed until a
-    /// doubling plateau (never stopping on a single noisy step) and the
-    /// measured range knee taken directly (7 stopped on the first flat step
-    /// and approximated the knee as `⌈D/R₁⌉`; 6 held the line by a thread a
-    /// range and counted a range by its bytes; 5 had none and took the knee
-    /// of the power-of-two read sizes; 4 timed one record of a request;
-    /// [`EarlierChoice`] the rule before).
-    pub const SCHEMA: u64 = 8;
+    /// curve probed by another is probed again: 9, minimum probe depth/window
+    /// for range lines, 95% peak-rate floor on `range_knee` with cross-check
+    /// against `points`, and non-collapsing `due_read` tie-break (8 allowed
+    /// premature plateau / noisy `range_knee` collapse to depth 1 and
+    /// `due_read` `.max()` collapse to `whole_range()`; 7 stopped on the first
+    /// flat step and approximated the knee as `⌈D/R₁⌉`; 6 held the line by a
+    /// thread a range and counted a range by its bytes; 5 had none and took
+    /// the knee of the power-of-two read sizes; 4 timed one record of a
+    /// request; [`EarlierChoice`] the rule before).
+    pub const SCHEMA: u64 = 9;
 }
 
 /// Each volume's lines, by volume.

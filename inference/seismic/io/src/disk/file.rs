@@ -180,6 +180,70 @@ impl SourceFile {
         }
     }
 
+    /// Transition a `Through::Direct` file to cached fallback with page
+    /// eviction after the filesystem refused direct I/O. Returns the cached
+    /// fallback descriptor (shared across concurrent readers via `OnceLock`).
+    pub(crate) fn activate_direct_fallback(&self, error: &io::Error) -> Result<&File, Error> {
+        match &self.through {
+            Through::Direct { file, fallback } => {
+                if let Some(cached) = fallback.get() {
+                    return Ok(cached);
+                }
+                let reopened = reopen(file, false)?;
+                let mut initialized = false;
+                let cached = fallback.get_or_init(|| {
+                    initialized = true;
+                    reopened
+                });
+                if initialized {
+                    tracing::warn!(
+                        path = %self.path.display(),
+                        error = %error,
+                        "direct I/O refused on read; falling back to cached reads with page eviction"
+                    );
+                }
+                Ok(cached)
+            }
+            Through::Dropped(file) | Through::Cache(file) => Ok(file),
+        }
+    }
+
+    /// Raw file descriptor and mode flags `(fd, direct, drop_after)` for
+    /// Linux `io_uring` submission. The returned descriptor remains valid for
+    /// as long as `self` (owned inside `Arc<SourceFile>`) is kept alive.
+    #[cfg(target_os = "linux")]
+    pub(crate) fn fd_and_mode(&self) -> (std::os::fd::RawFd, bool, bool) {
+        use std::os::fd::AsRawFd;
+        match &self.through {
+            Through::Cache(file) => (file.as_raw_fd(), false, false),
+            Through::Dropped(file) => (file.as_raw_fd(), false, true),
+            Through::Direct { file, fallback } => match fallback.get() {
+                Some(cached) => (cached.as_raw_fd(), false, true),
+                None => (file.as_raw_fd(), true, false),
+            },
+        }
+    }
+
+    /// Evict cached pages for `[start, end.min(self.size))` after a fallback
+    /// or `Through::Dropped` read completes.
+    #[cfg(target_os = "linux")]
+    pub(crate) fn drop_cached_pages(&self, start: u64, end: u64) -> Result<(), Error> {
+        let clamped_end = end.min(self.size);
+        if clamped_end <= start {
+            return Ok(());
+        }
+        let file = match &self.through {
+            Through::Direct { fallback, .. } => match fallback.get() {
+                Some(cached) => cached,
+                None => return Ok(()),
+            },
+            Through::Dropped(file) => file,
+            Through::Cache(_) => return Ok(()),
+        };
+        drop_pages(file, start, clamped_end)?;
+        Ok(())
+    }
+
     /// Dispatch an aligned read of `span` bytes at `start` through
     /// `self.through`: cached reads run directly, direct reads fall back once
     /// on `refuses_direct`, and dropped/fallback reads evict their pages.
@@ -195,24 +259,7 @@ impl SourceFile {
             Through::Direct { file, fallback } => match fallback.get() {
                 Some(cached) => cached,
                 None => match read(file, true) {
-                    Err(Error::Io(error)) if refuses_direct(&error) => {
-                        let file = reopen(file, false)?;
-                        // A concurrent read may have fallen back first:
-                        // either file reads the same bytes.
-                        let mut initialized = false;
-                        let cached = fallback.get_or_init(|| {
-                            initialized = true;
-                            file
-                        });
-                        if initialized {
-                            tracing::warn!(
-                                path = %self.path.display(),
-                                error = %error,
-                                "direct I/O refused on read; falling back to cached reads with page eviction"
-                            );
-                        }
-                        cached
-                    }
+                    Err(Error::Io(error)) if refuses_direct(&error) => self.activate_direct_fallback(&error)?,
                     result => return result,
                 },
             },
@@ -248,21 +295,7 @@ impl SourceFile {
     ) -> Result<(), Error> {
         let end = start + span as u64;
         let wanted = (end.min(self.size) - start) as usize;
-        let mut iovecs = [libc::iovec { iov_base: std::ptr::null_mut(), iov_len: 0 }; IOV_MAX_DIRECT];
-        let mut count = 0usize;
-        for part in parts {
-            let base = part.sink.as_ptr() as *mut libc::c_void;
-            if count > 0 {
-                let prev = &mut iovecs[count - 1];
-                // SAFETY: comparing end of previous part's sink with next part's sink.
-                if unsafe { (prev.iov_base as *const u8).add(prev.iov_len) } == base as *const u8 {
-                    prev.iov_len += part.length;
-                    continue;
-                }
-            }
-            iovecs[count] = libc::iovec { iov_base: base, iov_len: part.length };
-            count += 1;
-        }
+        let (mut iovecs, count) = build_iovecs(parts);
         match read_positioned_vectored(file, start, &mut iovecs[..count], wanted) {
             Ok(done) if done < wanted => Err(truncated().into()),
             Ok(_) => Ok(()),
@@ -324,10 +357,31 @@ pub(crate) fn read_positioned(file: &File, start: u64, into: &mut [u8], wanted: 
     Ok(done)
 }
 
-/// Maximum parts in a single direct `preadv` scatter-gather read (stack-sized,
-/// well below `IOV_MAX` = 1024 on Linux and macOS).
+/// Maximum parts in a single direct `preadv` / `io_uring` scatter-gather read
+/// (stack-sized, well below `IOV_MAX` = 1024 on Linux and macOS).
 #[cfg(unix)]
-const IOV_MAX_DIRECT: usize = 64;
+pub(crate) const IOV_MAX_DIRECT: usize = 64;
+
+/// Build coalesced `libc::iovec` entries for contiguous aligned `parts`.
+#[cfg(unix)]
+pub(crate) fn build_iovecs(parts: &[crate::scheduler::Part]) -> ([libc::iovec; IOV_MAX_DIRECT], usize) {
+    let mut iovecs = [libc::iovec { iov_base: std::ptr::null_mut(), iov_len: 0 }; IOV_MAX_DIRECT];
+    let mut count = 0usize;
+    for part in parts {
+        let base = part.sink.as_ptr() as *mut libc::c_void;
+        if count > 0 {
+            let prev = &mut iovecs[count - 1];
+            // SAFETY: comparing end of previous part's sink with next part's sink.
+            if unsafe { (prev.iov_base as *const u8).add(prev.iov_len) } == base as *const u8 {
+                prev.iov_len += part.length;
+                continue;
+            }
+        }
+        iovecs[count] = libc::iovec { iov_base: base, iov_len: part.length };
+        count += 1;
+    }
+    (iovecs, count)
+}
 
 /// Scatter-gather positional read from `start` into `iovecs` until `wanted`
 /// bytes land or EOF, handling `EINTR` and partial reads.

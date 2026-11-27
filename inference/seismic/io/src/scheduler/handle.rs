@@ -2,6 +2,7 @@ use super::engine::Engine;
 use super::{Ended, Panic, Want};
 use super::Range;
 use crate::Error;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Condvar, Mutex, OnceLock};
 use std::time::Instant;
 
@@ -54,18 +55,27 @@ impl std::ops::Deref for Handle {
 }
 
 impl Drop for Handle {
-    /// Cancel what no worker has taken; what one has reads on.
+    /// Cancel what no worker has taken; on Linux `io_uring`, also issue async
+    /// cancellation for pieces already in flight.
     fn drop(&mut self) {
-        let Some((queued, wake)) = self.engine.queue().cancel(self.id) else {
+        if self.ending.0.is_ended() {
             return;
-        };
-        if wake > 0 {
-            self.engine.wake(wake);
         }
-        let cancelled = Arc::new(Error::Cancelled);
-        let ranges = queued.pieces.iter().flat_map(|piece| piece.parts.iter().map(|part| part.range));
-        let failed = ranges.collect::<std::collections::BTreeSet<_>>().into_iter().map(|range| (range, cancelled.clone()));
-        self.ending.0.pieces_ended(queued.pieces.len(), failed, None);
+        let cancelled = self.engine.queue().cancel(self.id);
+        if let Some((queued, wake)) = cancelled {
+            if wake > 0 {
+                self.engine.wake(wake);
+            }
+            let cancelled = Arc::new(Error::Cancelled);
+            let ranges = queued.pieces.iter().flat_map(|piece| piece.parts.iter().map(|part| part.range));
+            let failed = ranges.collect::<std::collections::BTreeSet<_>>().into_iter().map(|range| (range, cancelled.clone()));
+            let count = queued.pieces.len();
+            drop(queued);
+            self.ending.0.pieces_ended(count, failed, None);
+        }
+        if !self.ending.0.is_ended() {
+            self.engine.cancel_inflight(self.id);
+        }
     }
 }
 
@@ -141,6 +151,8 @@ pub(crate) struct RequestState {
     /// Its ranges, which hold their destinations while any piece may write
     /// them.
     _ranges: Vec<Range>,
+    /// Lock-free flag set once [`Self::finish`] transitions the request to ended.
+    ended_flag: AtomicBool,
     /// Its submitter, as whose a panic reading its pieces ends.
     pub(crate) submitter: seismic_threads::Submitter,
 }
@@ -172,8 +184,14 @@ impl RequestState {
             outstanding,
             started: Arc::default(),
             _ranges: ranges,
+            ended_flag: AtomicBool::new(false),
             submitter: seismic_threads::Submitter::here(),
         })
+    }
+
+    /// Whether the request has already transitioned to ended.
+    pub(crate) fn is_ended(&self) -> bool {
+        self.ended_flag.load(Ordering::Acquire)
     }
 
     /// End the request now: it has no piece.
@@ -194,6 +212,7 @@ impl RequestState {
             return;
         }
         progress.ended = Some(ended.clone());
+        self.ended_flag.store(true, Ordering::Release);
         self.outstanding.fetch_sub(1, std::sync::atomic::Ordering::AcqRel);
         let hook = progress.hook.take();
         drop(progress);

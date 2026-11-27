@@ -11,8 +11,10 @@ use std::time::Instant;
 mod engine;
 mod handle;
 mod queue;
+#[cfg(target_os = "linux")]
+mod uring;
 
-pub use engine::{engine_work, read_buffers, read_workers, EngineWork, Flight, Outstanding};
+pub use engine::{engine_work, io_uring_active, read_buffers, read_workers, EngineWork, Flight, Outstanding};
 pub use handle::{Ending, Handle};
 
 pub(crate) use engine::{need, reading, totals, Buffers, Need, Reading};
@@ -169,6 +171,22 @@ impl Want {
             Deadline::Parked(_) => Standing::Parked,
             Deadline::Streamed(_) => Standing::Streamed,
             Deadline::Expected(_) | Deadline::None => Standing::Ahead,
+        }
+    }
+
+    /// Translate into a total-ordered, NaN-free [`crate::ScheduleKey`] for `IoPlane`.
+    pub fn to_schedule_key(&self, seq: u64) -> crate::ScheduleKey {
+        match self.deadline {
+            Deadline::Parked(_) => {
+                crate::ScheduleKey::blocking(crate::GlobalUrgency(0), 0, 0, seq)
+            }
+            Deadline::Streamed(_) => {
+                crate::ScheduleKey::streaming(crate::GlobalUrgency(0), 0, 0, seq)
+            }
+            Deadline::Expected(step) => {
+                crate::ScheduleKey::prefetch(crate::GlobalUrgency(0), step, 0, self.value, seq)
+            }
+            Deadline::None => crate::ScheduleKey::background(crate::GlobalUrgency(0), seq),
         }
     }
 }
@@ -368,7 +386,13 @@ pub(crate) unsafe fn request(
     // One worker per piece the link may start now: a worker woken with no
     // piece it may take would only contend for the queue with the
     // submitter's next request.
-    let queued = Queued { state: state.clone(), file: file.clone(), volume: volume.clone(), need: need.clone(), pieces: pieces.into() };
+    let queued = Queued::new(
+        state.clone(),
+        file.clone(),
+        volume.clone(),
+        need.clone(),
+        pieces.into(),
+    );
     let (id, woken) = engine.queue().push(queued, want);
     engine.wake(woken);
     Ok(Handle { id, ending: handle::Ending(state), engine })
