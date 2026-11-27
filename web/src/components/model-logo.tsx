@@ -10,6 +10,7 @@ import zai from "../../../assets/brand/model-providers/zai.svg"
 import prism from "../../../assets/brand/model-providers/prismml.svg"
 import meta from "../../../assets/brand/model-providers/meta.svg"
 import openbmb from "../../../assets/brand/model-providers/openbmb.svg"
+import thinkingmachines from "../../../assets/brand/model-providers/thinkingmachines.svg"
 import huggingFace from "../../../assets/brand/hugging-face.svg"
 
 export interface ModelLab {
@@ -32,6 +33,7 @@ export const modelLabs: readonly ModelLab[] = [
   { id: "prismml", name: "PrismML", prefixes: ["bonsai"], src: prism, theme: "invert dark:invert-0" },
   { id: "meta", name: "Meta", prefixes: ["llama", "muse", "glimmer"], src: meta, theme: "" },
   { id: "openbmb", name: "OpenBMB", prefixes: ["minicpm"], src: openbmb, theme: "" },
+  { id: "thinkingmachines", name: "Thinking Machines Lab", prefixes: ["inkling"], src: thinkingmachines, theme: "dark:invert" },
 ]
 
 /** The artwork for a developer the service names, by its lab id. */
