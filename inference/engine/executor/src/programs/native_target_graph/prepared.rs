@@ -1047,6 +1047,10 @@ impl PreparedTargetGraphs {
                 let prefill = super::extents_bytes(exts.iter())?
                     .checked_mul(self.passes.launches as u64)
                     .ok_or_else(|| "BlockAttnRes prefill buffers overflow".to_string())?;
+                let floor_split = super::block_attn_res_graph::bar_floor_split_bytes(
+                    &bar.split_shapes,
+                    self.passes.region,
+                )?;
                 let scratch = super::block_attn_res_graph::block_attn_res_runtime_scratch_bytes(
                     self.passes.region,
                     bar.hidden,
@@ -1054,7 +1058,8 @@ impl PreparedTargetGraphs {
                     bar.schedule.max_bank,
                 );
                 prefill
-                    .checked_add(scratch)
+                    .checked_add(floor_split)
+                    .and_then(|v| v.checked_add(scratch))
                     .ok_or_else(|| "BlockAttnRes runtime scratch overflow".to_string())?
             }
             None => 0,
@@ -1098,8 +1103,9 @@ impl PreparedTargetGraphs {
                 let slot_bytes = super::extents_bytes(exts.iter())?;
                 let mut split_bytes = 0u64;
                 if self.passes.region > 0 {
-                    use crate::operators::routed::split::{Crossing, Merged};
+                    use crate::operators::routed::split::Crossing;
                     let rows_dim = seismic::Dim::from(self.passes.region);
+                    let extra_places = (places - 1) as u64;
                     for (split_layer, split_form) in &bar.split_shapes {
                         let split_layer_dim = crate::programs::graph::facts::constant(split_layer.clone());
                         let crossing_ext = Crossing::at(split_form, &split_layer_dim, &rows_dim);
@@ -1111,21 +1117,11 @@ impl PreparedTargetGraphs {
                                 .checked_add(b)
                                 .ok_or_else(|| "BlockAttnRes crossing bytes overflow".to_string())?;
                         }
-                        let all_crossings = one_crossing
-                            .checked_mul(places as u64)
+                        let extra_crossings = one_crossing
+                            .checked_mul(extra_places)
                             .ok_or_else(|| "BlockAttnRes crossing bytes overflow".to_string())?;
-                        let merged_ext = Merged::at(split_form, &split_layer_dim, &rows_dim)?;
-                        let mut one_merged = 0u64;
-                        for (elem, dims) in [&merged_ext.experts, &merged_ext.inverse, &merged_ext.table] {
-                            let shape: Vec<u64> = dims.iter().map(seismic::Dim::fixed).collect();
-                            let b = super::extents_bytes(std::iter::once(&(*elem, shape)))?;
-                            one_merged = one_merged
-                                .checked_add(b)
-                                .ok_or_else(|| "BlockAttnRes merged bytes overflow".to_string())?;
-                        }
                         split_bytes = split_bytes
-                            .checked_add(all_crossings)
-                            .and_then(|v| v.checked_add(one_merged))
+                            .checked_add(extra_crossings)
                             .ok_or_else(|| "BlockAttnRes split bytes overflow".to_string())?;
                     }
                 }

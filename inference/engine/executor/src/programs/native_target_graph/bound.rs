@@ -797,16 +797,23 @@ impl TokenRows {
 }
 
 impl BoundTargetGraphs {
-    pub(crate) fn constant_bytes(&self) -> Result<u64, &'static str> {
-        let mut bytes = Some(0u64);
-        self.visit_constants(&mut |tensor| bytes = bytes.and_then(|bytes| bytes.checked_add(tensor.storage_bytes())));
-        if let Some(bar) = &self.prepared.block_attn_res {
-            let scratch = super::block_attn_res_graph::block_attn_res_runtime_scratch_bytes(
+    pub(crate) fn runtime_scratch_bytes(&self) -> u64 {
+        match &self.prepared.block_attn_res {
+            Some(bar) => super::block_attn_res_graph::block_attn_res_runtime_scratch_bytes(
                 self.prepared.passes.region,
                 bar.hidden,
                 bar.schedule.max_sources,
                 bar.schedule.max_bank,
-            );
+            ),
+            None => 0,
+        }
+    }
+
+    pub(crate) fn constant_bytes(&self) -> Result<u64, &'static str> {
+        let mut bytes = Some(0u64);
+        self.visit_constants(&mut |tensor| bytes = bytes.and_then(|bytes| bytes.checked_add(tensor.storage_bytes())));
+        let scratch = self.runtime_scratch_bytes();
+        if scratch > 0 {
             bytes = bytes.and_then(|b| b.checked_add(scratch));
         }
         bytes.ok_or("target graph constant charge overflows")

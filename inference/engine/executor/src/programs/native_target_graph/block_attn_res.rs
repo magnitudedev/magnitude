@@ -221,6 +221,17 @@ pub(crate) struct BoundBlockAttnRes {
     _streamed_constants: Vec<Tensor>,
     pub(super) prefill_rows: u64,
     pub(super) prefill_bufs: Vec<super::block_attn_res_graph::BarStepBuffers>,
+    /// Pre-allocated 1-place floor streamed grouped-prefill buffers at
+    /// `prefill_rows` (committed in `CommittedKind::Arena` so single-place
+    /// prefill never lazily OOMs against elastic expert-bank growth).
+    pub(super) prefill_floor_grouped: HashMap<
+        crate::operators::routed::split::SplitLayer<u64>,
+        super::block_attn_res_graph::GroupedStepBuf,
+    >,
+    pub(super) prefill_floor_merged: HashMap<
+        crate::operators::routed::split::SplitLayer<u64>,
+        super::block_attn_res_graph::GroupedMergedBuf,
+    >,
     pub(super) families: std::sync::Mutex<
         HashMap<
             super::block_attn_res_graph::BarLayoutKey,
@@ -1689,6 +1700,49 @@ impl BoundBlockAttnRes {
                 prepared.hidden,
             )?);
         }
+        let mut prefill_floor_grouped = HashMap::new();
+        let mut prefill_floor_merged = HashMap::new();
+        if prefill_rows > 0 && !prepared.split_shapes.is_empty() {
+            use crate::operators::routed::split::{Crossing, Merged};
+            let rows_dim = Dim::from(prefill_rows);
+            for (split_layer, split_form) in &prepared.split_shapes {
+                let split_layer_dim = constant(split_layer.clone());
+                let crossing_ext = Crossing::at(split_form, &split_layer_dim, &rows_dim);
+                let crossing_bufs = crossing_ext.try_map(|(elem, dims)| {
+                    let exts: Vec<u64> = dims.iter().map(Dim::fixed).collect();
+                    Tensor::zeros(charges, *elem, &exts)
+                        .map_err(|e| format!("bar floor crossing(m={prefill_rows}, exts={exts:?}): {e}"))
+                })?;
+                prefill_floor_grouped.insert(split_layer.clone(), crossing_bufs);
+
+                let merged_ext = Merged::at(split_form, &split_layer_dim, &rows_dim)?;
+                let exts_of = |dims: &[Dim]| -> Vec<u64> { dims.iter().map(Dim::fixed).collect() };
+                let merged_experts = Tensor::zeros(
+                    charges,
+                    merged_ext.experts.0,
+                    &exts_of(&merged_ext.experts.1),
+                )
+                .map_err(|e| format!("bar floor merged_experts(m={prefill_rows}): {e}"))?;
+                let merged_inverse = Tensor::zeros(
+                    charges,
+                    merged_ext.inverse.0,
+                    &exts_of(&merged_ext.inverse.1),
+                )
+                .map_err(|e| format!("bar floor merged_inverse(m={prefill_rows}): {e}"))?;
+                let table_vals: Vec<i32> = (0..=prefill_rows as i32).collect();
+                let table_bytes: Vec<u8> =
+                    table_vals.iter().flat_map(|v| v.to_le_bytes()).collect();
+                let merged_table = Tensor::from_host(
+                    charges,
+                    merged_ext.table.0,
+                    &exts_of(&merged_ext.table.1),
+                    &table_bytes,
+                )
+                .map_err(|e| format!("bar floor merged_table(m={prefill_rows}): {e}"))?;
+                prefill_floor_merged
+                    .insert(split_layer.clone(), (merged_experts, merged_inverse, merged_table));
+            }
+        }
         Ok(Self {
             prepared,
             weights,
@@ -1696,6 +1750,8 @@ impl BoundBlockAttnRes {
             _streamed_constants: constants.into_tensors(),
             prefill_rows,
             prefill_bufs,
+            prefill_floor_grouped,
+            prefill_floor_merged,
             families: std::sync::Mutex::new(HashMap::new()),
             fused_proj_cache: std::sync::Mutex::new(HashMap::new()),
             charges: clone_charges(charges),
@@ -1703,7 +1759,15 @@ impl BoundBlockAttnRes {
     }
 
     pub(super) fn constant_tensors(&self) -> impl Iterator<Item = &Tensor> {
-        self.prefill_bufs.iter().flat_map(|b| b.tensors())
+        self.prefill_bufs
+            .iter()
+            .flat_map(|b| b.tensors())
+            .chain(self.prefill_floor_grouped.values().flat_map(|c| c.iter()))
+            .chain(
+                self.prefill_floor_merged
+                    .values()
+                    .flat_map(|(experts, inverse, table)| [experts, inverse, table]),
+            )
     }
 
     #[cfg(test)]
@@ -1723,6 +1787,8 @@ impl BoundBlockAttnRes {
             _streamed_constants: Vec::new(),
             prefill_rows: 0,
             prefill_bufs: Vec::new(),
+            prefill_floor_grouped: HashMap::new(),
+            prefill_floor_merged: HashMap::new(),
             families: std::sync::Mutex::new(HashMap::new()),
             fused_proj_cache: std::sync::Mutex::new(HashMap::new()),
             charges: Charges::tally(device),

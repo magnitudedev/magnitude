@@ -239,12 +239,24 @@ impl Claim {
     /// # Panics
     /// For a pooled claim: the pool's entry allocates its granules.
     pub fn fit_allocated(&mut self) {
+        self.fit_allocated_with_reserve(0);
+    }
+
+    /// Like [`Self::fit_allocated`], while preserving up to `reserve`
+    /// unallocated bytes inside the claim (returning the bytes actually
+    /// preserved). Used for `BlockAttnRes` lazy runtime scratch that is
+    /// budgeted in `binding_constant_bytes` and allocated on first launch.
+    pub fn fit_allocated_with_reserve(&mut self, reserve: u64) -> u64 {
         let mut state = self.ledger().state();
         let entry = *state.entry(self.id());
         assert!(!entry.holding.pooled(), "invariant violated: a {:?} claim is fitted; the pool's entry allocates its granules", entry.holding);
-        if entry.bytes > entry.allocated {
-            state.resize(self.id(), entry.allocated);
+        let unallocated = entry.bytes.saturating_sub(entry.allocated);
+        let kept = unallocated.min(reserve);
+        let target = entry.allocated.saturating_add(kept);
+        if entry.bytes > target {
+            state.resize(self.id(), target);
         }
+        kept
     }
 
     /// Its entry, which Seismic charges what it allocates for the claim

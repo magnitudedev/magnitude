@@ -520,6 +520,13 @@ pub trait ProgramFamily: 'static {
         Ok(0)
     }
 
+    /// Unallocated runtime-scratch reserve kept committed inside the target's
+    /// `CommittedKind::Arena` claim after load (non-zero for `BlockAttnRes`
+    /// lazy prefill/decode workspace slots).
+    fn target_runtime_scratch_bytes(&self) -> u64 {
+        0
+    }
+
     fn optional_constant_bytes(&self) -> Result<u64, &'static str> {
         Ok(0)
     }
@@ -894,6 +901,10 @@ impl ProgramFamily for NativeFamily {
 
     fn target_constant_bytes(&self) -> Result<u64, &'static str> {
         self.target.constant_bytes()
+    }
+
+    fn target_runtime_scratch_bytes(&self) -> u64 {
+        self.target.runtime_scratch_bytes()
     }
 
     /// A group's graph buffers and, of a streamed load, its places' bank

@@ -350,7 +350,8 @@ fn call_from_sized(
     let layer = block
         .and_then(|ctx| ctx.streamed_layer)
         .and_then(|(layer, kind)| match sized.entry {
-            "routed_gate_up_part"
+            "routed_gate_up"
+            | "routed_gate_up_part"
             | "routed_up"
             | "routed_output"
             | "routed_output_project"
@@ -549,7 +550,10 @@ fn call_from_sized(
     // 3. Per-block history reads and recurrent state advances.
     if let Some(ctx) = block {
         match sized.entry {
-            "attention_decode" | "attention_prefill" | "attention_decode_k8v4" => {
+            "attention_decode"
+            | "attention_prefill"
+            | "attention_decode_k8v4"
+            | "attention_rel_bias" => {
                 if let MixerProgramSlot::Attention(binding) = ctx.slot.mixer() {
                     let layer = u32::try_from(ctx.index)
                         .map_err(|_| demand_error("block index exceeds u32"))?;

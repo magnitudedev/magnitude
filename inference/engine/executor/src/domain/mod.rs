@@ -3287,7 +3287,7 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
         // them) as their allocations charged them, with groups of one
         // place; a group's class beyond it is claimed as the group opens
         // (`Self::open_group`).
-        let arena = recorded.claim_arena(resources.ledgers().device());
+        let arena = recorded.claim_arena(resources.ledgers().device(), family.target_runtime_scratch_bytes());
         let id = resources.domain().clone();
         let domain = Box::new(Self {
             execution,

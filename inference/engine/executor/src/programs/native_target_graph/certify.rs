@@ -185,9 +185,15 @@ fn checked_block_attn_res_family(
         max_rows,
         hidden,
     );
+    let floor_split_bytes = super::block_attn_res_graph::bar_floor_split_bytes(
+        &super::block_attn_res_graph::bar_split_shapes(load, geometry),
+        max_rows,
+    )
+    .map_err(GraphError::from)?;
     let binding_constant_bytes = super::extents_bytes(prefill_exts.iter())
         .map_err(GraphError::from)?
         .saturating_mul(pass.get() as u64)
+        .saturating_add(floor_split_bytes)
         .saturating_add(
             super::block_attn_res_graph::block_attn_res_runtime_scratch_bytes(
                 max_rows,
@@ -239,6 +245,23 @@ fn checked_block_attn_res_family(
     }
     let mut per_block_calls: Vec<Vec<crate::programs::graph::sizing::SizedCall>> =
         vec![Vec::new(); geometry.blocks.len()];
+    for (b_idx, block) in geometry.blocks.iter().enumerate() {
+        if matches!(
+            block.sublayers.first().map(|s| &s.op),
+            Some(magnitude_family_contracts::Operator::Attention(_))
+        ) {
+            per_block_calls[b_idx].push(crate::programs::graph::sizing::SizedCall {
+                entry: "attention_rel_bias",
+                backend,
+                elements: Vec::new(),
+                dimensions: Vec::new(),
+                bound_ports: Vec::new(),
+                timeline_before: 0,
+                eval_launches: |_, _, _, _| Ok(2),
+            });
+        }
+    }
+    let mut routed_blocks_seen = vec![false; geometry.blocks.len()];
     for w in load.weights() {
         let magnitude_family_contracts::WeightScope::TargetSublayer(sub) = w.role.scope else {
             continue;
@@ -248,10 +271,13 @@ fn checked_block_attn_res_family(
             continue;
         }
         let entry = match w.shape.len() {
-            3 => match w.role.kind {
-                magnitude_family_contracts::WeightKind::ExpertDown => "routed_down",
-                _ => "routed_gate_up",
-            },
+            3 => {
+                routed_blocks_seen[b_idx] = true;
+                match w.role.kind {
+                    magnitude_family_contracts::WeightKind::ExpertDown => "routed_down",
+                    _ => "routed_gate_up",
+                }
+            }
             2 => "project_rows",
             _ => continue,
         };
@@ -271,6 +297,47 @@ fn checked_block_attn_res_family(
             timeline_before: 0,
             eval_launches: |_, _, _, _| Ok(1),
         });
+    }
+    if let Some(bank) = load.expert_bank() {
+        for b_idx in 0..geometry.blocks.len() {
+            if routed_blocks_seen[b_idx] {
+                continue;
+            }
+            let ffn_scope = magnitude_family_contracts::WeightScope::TargetSublayer(
+                magnitude_family_contracts::SublayerIndex {
+                    block: b_idx as u32,
+                    sublayer: 1,
+                },
+            );
+            let Some((_, layer)) = bank.layer(ffn_scope) else {
+                continue;
+            };
+            for (rt, entry) in [
+                (crate::planning::RoutedTensor::Gate, "routed_gate_up"),
+                (crate::planning::RoutedTensor::Up, "routed_gate_up"),
+                (crate::planning::RoutedTensor::Down, "routed_down"),
+            ] {
+                let Some(w) = layer.resident.get(rt) else {
+                    continue;
+                };
+                per_block_calls[b_idx].push(crate::programs::graph::sizing::SizedCall {
+                    entry,
+                    backend,
+                    elements: Vec::new(),
+                    dimensions: Vec::new(),
+                    bound_ports: vec![crate::programs::graph::sizing::SizedBoundPort {
+                        parameter_ordinal: 0,
+                        element: w.resident,
+                        extents: w.shape.clone(),
+                        bytes: w.resident_bytes,
+                        is_weight: true,
+                        is_upload: false,
+                    }],
+                    timeline_before: 0,
+                    eval_launches: |_, _, _, _| Ok(1),
+                });
+            }
+        }
     }
     let mut block_shapes: Vec<crate::programs::graph::sizing::BlockDecodeCensus> = Vec::new();
     let mut block_map = Vec::with_capacity(geometry.blocks.len());

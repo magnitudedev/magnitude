@@ -1323,6 +1323,10 @@ impl NativeTargetProgram {
         self.graphs.constant_bytes()
     }
 
+    pub(crate) fn runtime_scratch_bytes(&self) -> u64 {
+        self.graphs.runtime_scratch_bytes()
+    }
+
     pub(crate) fn group_bytes(&self, places: usize) -> Result<u64, String> {
         self.graphs.group_bytes(places)
     }

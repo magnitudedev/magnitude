@@ -85,6 +85,75 @@ pub(crate) fn block_attn_res_runtime_scratch_bytes(
     shared_slots.saturating_add(decode_ring)
 }
 
+/// Unique `(SplitLayer, SplitForm)` pairs across banked routed blocks of `geometry`,
+/// matching `PreparedBlockAttnRes::split_shapes` so certification, preparation,
+/// and binding charge identical floor grouped-prefill scratch bytes.
+pub(crate) fn bar_split_shapes(
+    load: &crate::ModelLoadPlan,
+    geometry: &Decoder,
+) -> HashMap<
+    crate::operators::routed::split::SplitLayer<u64>,
+    crate::operators::routed::split::SplitForm,
+> {
+    let mut split_shapes = HashMap::new();
+    let Some(bank) = load.expert_bank() else {
+        return split_shapes;
+    };
+    for (b_idx, block) in geometry.blocks.iter().enumerate() {
+        let ffn_scope = WeightScope::TargetSublayer(SublayerIndex {
+            block: b_idx as u32,
+            sublayer: 1,
+        });
+        if bank.layer(ffn_scope).is_some() {
+            if let Some(sub) = block.sublayers.get(1) {
+                if let Operator::RoutedFfn(routed) = &sub.op {
+                    let (sf, sl) = split_shape(routed, geometry);
+                    split_shapes.entry(sl).or_insert(sf);
+                }
+            }
+        }
+    }
+    split_shapes
+}
+
+/// Exact device bytes for the 1-place floor streamed grouped-prefill buffers
+/// (one `Crossing` + one `Merged` per distinct `(SplitLayer, SplitForm)` at
+/// `max_rows`), pre-allocated in `BoundBlockAttnRes::bind` and committed in
+/// `CommittedKind::Arena` so single-place prefill (`places == 1`) never OOMs.
+pub(crate) fn bar_floor_split_bytes(
+    split_shapes: &HashMap<
+        crate::operators::routed::split::SplitLayer<u64>,
+        crate::operators::routed::split::SplitForm,
+    >,
+    max_rows: u64,
+) -> Result<u64, String> {
+    if max_rows == 0 || split_shapes.is_empty() {
+        return Ok(0);
+    }
+    let rows_dim = Dim::from(max_rows);
+    let mut total = 0u64;
+    for (split_layer, split_form) in split_shapes {
+        let split_layer_dim = constant(split_layer.clone());
+        let crossing_ext = Crossing::at(split_form, &split_layer_dim, &rows_dim);
+        for (elem, dims) in crossing_ext.iter() {
+            let shape: Vec<u64> = dims.iter().map(Dim::fixed).collect();
+            let b = super::extents_bytes(std::iter::once(&(*elem, shape)))?;
+            total = total
+                .checked_add(b)
+                .ok_or_else(|| "BlockAttnRes floor crossing bytes overflow".to_string())?;
+        }
+        let merged_ext = Merged::at(split_form, &split_layer_dim, &rows_dim)?;
+        for (elem, dims) in [&merged_ext.experts, &merged_ext.inverse, &merged_ext.table] {
+            let shape: Vec<u64> = dims.iter().map(Dim::fixed).collect();
+            let b = super::extents_bytes(std::iter::once(&(*elem, shape)))?;
+            total = total
+                .checked_add(b)
+                .ok_or_else(|| "BlockAttnRes floor merged bytes overflow".to_string())?;
+        }
+    }
+    Ok(total)
+}
+
 /// Static residual-bank slot schedule for one block, derived once from
 /// `BlockAttnResPlan`.
 #[derive(Clone, Copy, Debug)]
@@ -455,8 +524,8 @@ struct BoundBarEntry {
     sources_buf: NativePort,
 }
 
-type GroupedStepBuf = Crossing<Tensor>;
-type GroupedMergedBuf = (Tensor, Tensor, Tensor);
+pub(super) type GroupedStepBuf = Crossing<Tensor>;
+pub(super) type GroupedMergedBuf = (Tensor, Tensor, Tensor);
 
 struct BoundBarAttnAndMix {
     plan: NativeGraphPlan,
@@ -3218,10 +3287,15 @@ fn build_bound_family(
         &mut all_plans,
     )?;
 
-    // One step executes every plan in `all_plans`; pass the full sequence so
-    // `NativeGraphFamily`'s CUDA graph budget holds and pins every plan for
-    // each concurrent flight (avoiding mid-flight graph eviction under lookahead).
-    let sequences: Vec<Vec<NativeGraphPlan>> = vec![all_plans.clone()];
+    // One step executes every plan in `all_plans`; for decode (`m <= VERIFY_ROWS`),
+    // `decode_ring` alternates across 2 distinct scratch slots, so declare 2 runs
+    // of `all_plans` in the decode launch to pin both ring slots' CUDA graphs
+    // simultaneously (avoiding per-token `cudaGraphExecUpdate` churn).
+    let mut launch_plans = all_plans.clone();
+    if decodes(m) {
+        launch_plans.extend(all_plans.iter().cloned());
+    }
+    let sequences: Vec<Vec<NativeGraphPlan>> = vec![launch_plans];
     let decodes_count = usize::from(decodes(m));
     let family = NativeGraphFamily::with_launches(&all_plans, &sequences, decodes_count, &[])
         .map_err(|e| format!("BlockAttnRes NativeGraphFamily: {e}"))?;
@@ -3838,8 +3912,8 @@ pub(crate) fn queue_sealed_chain(
     )> = Vec::new();
     let mut cached_grouped_bufs: Option<(
         crate::operators::routed::split::SplitLayer<u64>,
-        Vec<GroupedStepBuf>,
-        HashMap<usize, (Arc<BoundBarFamily>, GroupedMergedBuf)>,
+        Vec<(GroupedStepBuf, bool)>,
+        HashMap<usize, (Arc<BoundBarFamily>, GroupedMergedBuf, bool)>,
     )> = None;
     let mut shared_slots: HashMap<usize, (Arc<BoundBarFamily>, NativeGraphFamilySlot)> =
         HashMap::new();
@@ -4027,19 +4101,30 @@ pub(crate) fn queue_sealed_chain(
                 // allocating N * ~37 MiB per prefill chain.
                 if cached_grouped_bufs.as_ref().is_none_or(|(sl, _, _)| *sl != split_layer) {
                     if let Some((old_sl, old_vec, old_merged)) = cached_grouped_bufs.take() {
-                        for (ps, buf) in prepped.iter().zip(old_vec.into_iter()) {
-                            returned_grouped_bufs.push((ps.family.clone(), old_sl.clone(), buf));
+                        for (ps, (buf, owned)) in prepped.iter().zip(old_vec.into_iter()) {
+                            if owned {
+                                returned_grouped_bufs.push((ps.family.clone(), old_sl.clone(), buf));
+                            }
                         }
-                        for (_, (fam, mbuf)) in old_merged {
-                            returned_merged_bufs.push((fam, old_sl.clone(), mbuf));
+                        for (_, (fam, mbuf, owned)) in old_merged {
+                            if owned {
+                                returned_merged_bufs.push((fam, old_sl.clone(), mbuf));
+                            }
                         }
                     }
                     let mut bufs = Vec::with_capacity(steps.len());
-                    let mut merged_map: HashMap<usize, (Arc<BoundBarFamily>, GroupedMergedBuf)> =
+                    let mut merged_map: HashMap<usize, (Arc<BoundBarFamily>, GroupedMergedBuf, bool)> =
                         HashMap::new();
+                    let mut floor_grouped_taken = false;
                     for ps in &prepped {
                         let m = ps.m;
-                        let crossing_bufs = {
+                        let (crossing_bufs, crossing_owned) = if m == bound_bar.prefill_rows
+                            && !floor_grouped_taken
+                            && bound_bar.prefill_floor_grouped.contains_key(&split_layer)
+                        {
+                            floor_grouped_taken = true;
+                            (bound_bar.prefill_floor_grouped[&split_layer].clone(), false)
+                        } else {
                             let reused = ps
                                 .family
                                 .prefill_grouped_pool
@@ -4047,7 +4132,7 @@ pub(crate) fn queue_sealed_chain(
                                 .expect("bar prefill_grouped_pool lock")
                                 .get_mut(&split_layer)
                                 .and_then(Vec::pop);
-                            match reused {
+                            let b = match reused {
                                 Some(b) => b,
                                 None => {
                                     let crossing_ext =
@@ -4059,41 +4144,49 @@ pub(crate) fn queue_sealed_chain(
                                         })
                                     })?
                                 }
-                            }
+                            };
+                            (b, true)
                         };
-                        bufs.push(crossing_bufs);
+                        bufs.push((crossing_bufs, crossing_owned));
                         let fid = Arc::as_ptr(&ps.family) as usize;
                         if !merged_map.contains_key(&fid) {
-                            let reused = ps
-                                .family
-                                .prefill_merged_pool
-                                .lock()
-                                .expect("bar prefill_merged_pool lock")
-                                .get_mut(&split_layer)
-                                .and_then(Vec::pop);
-                            let mbuf = match reused {
-                                Some(b) => b,
-                                None => {
-                                    let merged_ext = Merged::of(routed, decoder, m)?;
-                                    let merged_experts = Tensor::zeros(
-                                        charges,
-                                        merged_ext.experts.0,
-                                        &merged_ext.experts.1,
-                                    )
-                                    .map_err(|e| format!("bar merged_experts(m={m}): {e}"))?;
-                                    let merged_inverse = Tensor::zeros(
-                                        charges,
-                                        merged_ext.inverse.0,
-                                        &merged_ext.inverse.1,
-                                    )
-                                    .map_err(|e| format!("bar merged_inverse(m={m}): {e}"))?;
-                                    let table_vals: Vec<i32> = (0..=m as i32).collect();
-                                    let merged_table =
-                                        upload_i32(&merged_ext.table.1, &table_vals)?;
-                                    (merged_experts, merged_inverse, merged_table)
-                                }
+                            let (mbuf, merged_owned) = if m == bound_bar.prefill_rows
+                                && bound_bar.prefill_floor_merged.contains_key(&split_layer)
+                            {
+                                (bound_bar.prefill_floor_merged[&split_layer].clone(), false)
+                            } else {
+                                let reused = ps
+                                    .family
+                                    .prefill_merged_pool
+                                    .lock()
+                                    .expect("bar prefill_merged_pool lock")
+                                    .get_mut(&split_layer)
+                                    .and_then(Vec::pop);
+                                let b = match reused {
+                                    Some(b) => b,
+                                    None => {
+                                        let merged_ext = Merged::of(routed, decoder, m)?;
+                                        let merged_experts = Tensor::zeros(
+                                            charges,
+                                            merged_ext.experts.0,
+                                            &merged_ext.experts.1,
+                                        )
+                                        .map_err(|e| format!("bar merged_experts(m={m}): {e}"))?;
+                                        let merged_inverse = Tensor::zeros(
+                                            charges,
+                                            merged_ext.inverse.0,
+                                            &merged_ext.inverse.1,
+                                        )
+                                        .map_err(|e| format!("bar merged_inverse(m={m}): {e}"))?;
+                                        let table_vals: Vec<i32> = (0..=m as i32).collect();
+                                        let merged_table =
+                                            upload_i32(&merged_ext.table.1, &table_vals)?;
+                                        (merged_experts, merged_inverse, merged_table)
+                                    }
+                                };
+                                (b, true)
                             };
-                            merged_map.insert(fid, (ps.family.clone(), mbuf));
+                            merged_map.insert(fid, (ps.family.clone(), mbuf, merged_owned));
                         }
                     }
                     cached_grouped_bufs = Some((split_layer.clone(), bufs, merged_map));
@@ -4169,7 +4262,7 @@ pub(crate) fn queue_sealed_chain(
                         .grouped
                         .get(&m)
                         .ok_or_else(|| format!("streamed grouped bindings missing for block {b_idx} rows {m}"))?;
-                    let crossing_bufs = &per_step_bufs[s_idx];
+                    let (crossing_bufs, _) = &per_step_bufs[s_idx];
                     let mut bindings = front_b.bindings();
                     if let Some(port) = &front_s.residual {
                         bindings.set(charges, port, ffn_in_buf).map_err(|e| e.to_string())?;
@@ -4223,8 +4316,8 @@ pub(crate) fn queue_sealed_chain(
                     let br = step.bank_run.as_ref().ok_or("missing BlockAttnResBankRun")?;
                     let (_, pass_s, back_s) = prep_routed.grouped.get(&m).unwrap();
                     let (_, pass_b, back_b) = bound_routed.grouped.get(&m).unwrap();
-                    let crossing_bufs = &per_step_bufs[s_idx];
-                    let (_, (ref merged_experts, ref merged_inverse, ref merged_table)) =
+                    let (crossing_bufs, _) = &per_step_bufs[s_idx];
+                    let (_, (ref merged_experts, ref merged_inverse, ref merged_table), _) =
                         shared_merged_bufs[&fid];
                     let layer_idx = br.bank.streamed_layer(ffn_scope)?;
                     let tier_copy_dma = br.bank.tier_copy_dma();
@@ -4346,11 +4439,15 @@ pub(crate) fn queue_sealed_chain(
     // FFN scratch to their `BoundBarFamily` on drop (once the submitted sequence
     // completes) so subsequent prefills reuse them with zero alloc/free churn.
     if let Some((sl, vec, merged_map)) = cached_grouped_bufs.take() {
-        for (ps, buf) in prepped.iter().zip(vec.into_iter()) {
-            returned_grouped_bufs.push((ps.family.clone(), sl.clone(), buf));
+        for (ps, (buf, owned)) in prepped.iter().zip(vec.into_iter()) {
+            if owned {
+                returned_grouped_bufs.push((ps.family.clone(), sl.clone(), buf));
+            }
         }
-        for (_, (fam, mbuf)) in merged_map {
-            returned_merged_bufs.push((fam, sl.clone(), mbuf));
+        for (_, (fam, mbuf, owned)) in merged_map {
+            if owned {
+                returned_merged_bufs.push((fam, sl.clone(), mbuf));
+            }
         }
     }
     let returned_bufs: Vec<(Arc<BoundBarFamily>, BarStepBuffers)> = prepped
