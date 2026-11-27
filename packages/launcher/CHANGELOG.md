@@ -1,5 +1,21 @@
 # @magnitudedev/cli
 
+## 0.3.7
+
+### Patch Changes
+
+- [`7e287aa`](https://github.com/magnitudedev/magnitude/commit/7e287aa1a7bf14b608978dc463968e8f59cb8823) Thanks [@anerli](https://github.com/anerli)! - Fix a streamed MoE expert-watcher panic (`scratch.rs`) when mid-layer host-record lease extensions evict an expert already routed as a hit in the same prompt group ([#292](https://github.com/magnitudedev/magnitude/issues/292)).
+
+- [`5e4bab1`](https://github.com/magnitudedev/magnitude/commit/5e4bab140f7b4a11bc811c5a671c5495c403f330) Thanks [@anerli](https://github.com/anerli)! - Fix a panic in expert shadow tracking (`shadows.rs`) when running streamed MoE models without speculative drafting.
+
+- [`b621376`](https://github.com/magnitudedev/magnitude/commit/b621376996a8500f719886362b68e9abadf7feb1) Thanks [@anerli](https://github.com/anerli)! - Fix foreground `magnitude serve` printing systemd shutdown instructions when launched from a shell inheriting `INVOCATION_ID` ([#296](https://github.com/magnitudedev/magnitude/issues/296)).
+
+- [`656920a`](https://github.com/magnitudedev/magnitude/commit/656920a2735def43e105b14f09123cde29ec81ab) Thanks [@anerli](https://github.com/anerli)! - Fix Vulkan device initialization failing on GPUs where memory type 0 cannot back storage buffers (such as Intel Arc Pro B70 on Mesa ANV) by resolving allocations against buffer `memoryTypeBits` ([#297](https://github.com/magnitudedev/magnitude/issues/297)).
+
+- [`5515ddf`](https://github.com/magnitudedev/magnitude/commit/5515ddfc4c7548bbad40e4e548ab69b4db49d465) Thanks [@anerli](https://github.com/anerli)! - Fix a Vulkan long-context prefill panic (`graph_replays.rs`) where `GraphCensus` under-counted repeated launch arguments for multi-round prefill kernels ([#303](https://github.com/magnitudedev/magnitude/issues/303)).
+
+- [`df6e671`](https://github.com/magnitudedev/magnitude/commit/df6e67172412882e9c14c860e9cb48d3847b3753) Thanks [@anerli](https://github.com/anerli)! - Allow stored-table steps to reclaim speculative prefetch holds after table shrinks and prevent prefetches from overwriting in-flight step slot retention.
+
 ## 0.3.6
 
 ### Patch Changes
