@@ -564,7 +564,9 @@ impl Shadows {
             .take(self.log.len() - 2)
             .filter(|step| step.is_decode())
             .count();
-        complete_decode_ahead >= self.max_depths.saturating_sub(1)
+        // `step()` always needs at least one decode step ahead of `front` to
+        // read `next_clock` and compute `emitted = next_clock.since(step.clock)`.
+        complete_decode_ahead >= self.max_depths.saturating_sub(1).max(1)
     }
 
     /// Step the front of `self.log` across all depths on true routes.
@@ -1025,6 +1027,26 @@ mod tests {
         }
         shadows.read_log(fed);
         assert!(time.lock().clock.through_latest().whole() > 3000);
+        assert!(shadows.misses()[0].is_some());
+    }
+
+    /// When `max_depths == 1` (plain decode without drafting), `Shadows::ready`
+    /// must still wait for at least one complete decode step ahead of `front`
+    /// so `Shadows::step` never indexes an empty `decode_indices` when the next
+    /// step begins logging.
+    #[test]
+    fn max_depths_one_waits_for_next_decode_step_without_panicking() {
+        let pools = Pools::new(&[8], &[2]);
+        let mut shadows = Shadows::new_with_pools_and_depth(&[8], &[0], &pools, 1);
+        let fed: Vec<ShadowFeed> = (1u64..=5)
+            .map(|step| ShadowFeed::Read {
+                read: RoutedRead { sequence: step, layer: 0, experts: vec![(step as usize) % 4], choices: 1 },
+                rows: Some(Arc::new(Rows::of(1, &[0], &keys(8, &[(step as usize) % 4])))),
+                evidence: Evidence::Decode,
+                clock: Tokens::new(step as f64),
+            })
+            .collect();
+        shadows.read_log(fed);
         assert!(shadows.misses()[0].is_some());
     }
 }
