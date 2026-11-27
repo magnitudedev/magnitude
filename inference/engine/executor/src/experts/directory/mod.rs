@@ -3545,6 +3545,7 @@ impl Directory {
     /// all `0..lent` when `None`) of group `lender`'s host records, optionally
     /// copying kept experts out of the lent zone via `copy`. Runs outside any
     /// transport registry lock so host-record memcpy never contends on it.
+    /// Returns every expert unmapped without relocation during this lease step.
     pub fn lease_host_records(
         &mut self,
         lender: usize,
@@ -3552,22 +3553,25 @@ impl Directory {
         target_records: Option<&[u32]>,
         may_evict: bool,
         copy: Option<&mut dyn FnMut(u32, u32) -> bool>,
-    ) {
+    ) -> Vec<Staged> {
         let before = self.host[lender].claimed();
-        if !self.host[lender].leased_records(target_records) {
+        let unmapped = if !self.host[lender].leased_records(target_records) {
             let tier = self.host_tier();
             if copy.is_some() && self.host[lender].capacity() > 0 {
                 let reuse = Reuse::of(&self.ranking);
                 let at = self.host[lender].progress().map(|p| (p.sequence, p.layer));
                 let rank = store_rank(reuse.ranker(lender, tier, Reader::Move), &self.prompt_reads, &self.token_reads, at);
-                self.host[lender].lease_records(scratch_group, target_records, rank, may_evict, copy);
+                self.host[lender].lease_records(scratch_group, target_records, rank, may_evict, copy).1
             } else {
-                self.host[lender].lease_records(scratch_group, target_records, |_, _| 0u64, false, None);
+                self.host[lender].lease_records(scratch_group, target_records, |_, _| 0u64, false, None).1
             }
-        }
+        } else {
+            Vec::new()
+        };
         if self.host[lender].claimed() != before {
             self.resize_pool(lender);
         }
+        unmapped
     }
 
     /// The `(group, lent_records)` range of the bank's lent scratch slice, if

@@ -765,6 +765,13 @@ impl Lease<'_> {
 /// tier the bank's records assert it (`BankRecords::resolve`), on the one
 /// store unleased records in `0..lent` (and every record of non-lender groups)
 /// remain resident hits while leased records of the lender are asserted absent.
+fn mapped_hit(core: &Core, layer: usize, expert: usize, step: Step) -> bool {
+    match core.extents.placer {
+        crate::planning::Placer::Tier => core.directory.resolve(layer, expert, step).is_some(),
+        crate::planning::Placer::Bank => core.layers[layer].map.resolve(expert, step).is_some(),
+    }
+}
+
 fn hit(core: &Core, layer: usize, expert: usize, step: Step, lease: Lease<'_>) -> Option<usize> {
     match core.extents.placer {
         crate::planning::Placer::Tier => core.directory.resolve(layer, expert, step).map(BankRecord::index),
@@ -2397,13 +2404,16 @@ impl Scratch {
         let copy = tier.is_some().then_some(&mut copy_fn as &mut dyn FnMut(u32, u32) -> bool);
         // Host-record leasing (including any host-record memcpy via `copy`) runs
         // completely outside `transport.registry` lock.
-        core.directory.lease_host_records(
+        let unmapped = core.directory.lease_host_records(
             lender,
             serving.group,
             self.lease_records.as_deref(),
             may_evict,
             copy,
         );
+        for (owner, expert) in unmapped {
+            self.demote(owner, expert);
+        }
         // Snapshot bank slot reuse in O(lent) under a narrow `transport.registry`
         // guard, then release the guard before exit/unmap/bank-lease work.
         if let Some((group, records)) = core.directory.bank_lent_range() {
@@ -2429,7 +2439,46 @@ impl Scratch {
     fn claim_scratch(&mut self, index: usize, set_idx: usize, window: u64, sequence: Step, opened: &mut Opened, core: &mut Core, shared: &Shared) -> bool {
         let layer = self.tiers[index].layer;
         let lw = self.tiers[index].layer_window;
+        let win_start = window as usize * lw;
+        let win_end = (win_start + lw).min(self.tiers[index].sets[set_idx].experts.len());
         loop {
+            // Reconcile any expert in this pass set & window whose host record
+            // was unmapped (e.g., by an earlier partial lease extension or
+            // delayed claim) or whose cold assignment has no scratch slot yet.
+            let mut adopted = false;
+            for expert in win_start..win_end {
+                let needs_adopt = match &self.tiers[index].sets[set_idx].experts[expert] {
+                    SetSlot::Hit => !mapped_hit(core, layer, expert, sequence),
+                    SetSlot::Cold(cold) => {
+                        !cold.has_scratch()
+                            && !opened.cold.contains(&expert)
+                            && (cold.reader <= sequence || opened.routed.contains(&expert))
+                    }
+                    SetSlot::Unrouted => false,
+                };
+                if needs_adopt {
+                    if let Some(at) = opened.hits.iter().position(|&(hit, _)| hit == expert) {
+                        opened.hits.swap_remove(at);
+                    }
+                    let range = self.tiers[index].sets[set_idx].range.clone();
+                    for request in self.tiers[index].places[range].iter_mut().flatten() {
+                        if let Some(at) = request.hits.iter().position(|&(hit, _)| hit == expert) {
+                            request.hits.swap_remove(at);
+                        }
+                        if let Some(at) = request.cold.iter().position(|&c| c == expert) {
+                            request.cold.swap_remove(at);
+                        }
+                    }
+                    if !opened.cold.contains(&expert) {
+                        opened.cold.push(expert);
+                    }
+                    let carried = self.conveyor.state(layer, expert).is_some()
+                        && !self.tiers[index].sets[..set_idx].iter().any(|earlier| earlier.experts[expert].is_cold());
+                    self.tiers[index].sets[set_idx].assign(expert, sequence, carried);
+                    adopted = true;
+                }
+            }
+
             let mut extra = Vec::new();
             if let Some(target) = self.lease_records.as_ref() {
                 let lending = self.conveyor.lending();
@@ -2449,51 +2498,26 @@ impl Scratch {
                     }
                 }
             }
-            if extra.is_empty() {
-                break;
-            }
-            extra.sort_unstable();
-            extra.dedup();
-            let lender = self.conveyor.lending().group;
-            let kept: Vec<(usize, usize)> = extra
-                .iter()
-                .filter_map(|&r| core.directory.host_kept_at(lender, r))
-                .collect();
-            if let Some(target) = self.lease_records.as_mut() {
-                target.extend_from_slice(&extra);
-                target.sort_unstable();
-                target.dedup();
-            }
-            self.lease(core, shared);
-            // Extending a partial lease mid-group runs with `may_evict == false`:
-            // if a newly leased record had no ready relocation destination, its
-            // kept expert was unmapped and must be demoted from any pending hit
-            // (including this opened request, whose newly-cold expert may in
-            // turn require its own scratch record in the next loop iteration).
-            for (owner, expert) in kept {
-                if !matches!(core.directory.located(owner, expert), crate::experts::host_records::Located::Kept(_)) {
-                    self.demote(owner, expert);
-                    if owner == layer {
-                        if let Some(at) = opened.hits.iter().position(|&(hit, _)| hit == expert) {
-                            opened.hits.swap_remove(at);
-                        }
-                        if expert / lw == window as usize
-                            && opened.routed.contains(&expert)
-                            && !opened.cold.contains(&expert)
-                        {
-                            opened.cold.push(expert);
-                            let carried = self.conveyor.state(layer, expert).is_some()
-                                && !self.tiers[index].sets[..set_idx].iter().any(|earlier| earlier.experts[expert].is_cold());
-                            self.tiers[index].sets[set_idx].assign(expert, sequence, carried);
-                        }
-                    }
+            if !extra.is_empty() {
+                extra.sort_unstable();
+                extra.dedup();
+                if let Some(target) = self.lease_records.as_mut() {
+                    target.extend_from_slice(&extra);
+                    target.sort_unstable();
+                    target.dedup();
                 }
+                self.lease(core, shared);
+                continue;
             }
-        }
-        if !self.leased(core) {
-            self.lease(core, shared);
             if !self.leased(core) {
-                return false;
+                self.lease(core, shared);
+                if !self.leased(core) {
+                    return false;
+                }
+                continue;
+            }
+            if !adopted {
+                break;
             }
         }
         for &expert in &opened.cold {
@@ -3511,21 +3535,49 @@ impl Scratch {
         let Some(tier) = self.tiers.iter_mut().find(|tier| tier.layer == layer) else {
             return;
         };
-        for set_idx in 0..tier.sets.len() {
+        let open_set = tier.open_set;
+        for set_idx in open_set..tier.sets.len() {
             let range = tier.sets[set_idx].range.clone();
             let mut reader = None;
-            for request in tier.places[range].iter_mut().flatten() {
+            for request in tier.places[range.clone()].iter_mut().flatten() {
                 if let Some(at) = request.hits.iter().position(|&(hit, _)| hit == expert) {
                     request.hits.swap_remove(at);
-                    request.cold.push(expert);
-                    reader = Some(request.sequence);
+                    if !request.cold.contains(&expert) {
+                        request.cold.push(expert);
+                    }
+                    reader.get_or_insert(request.sequence);
                 }
+            }
+            if !matches!(tier.sets[set_idx].experts[expert], SetSlot::Hit) {
+                continue;
             }
             if let Some(reader) = reader {
                 let carried = self.conveyor.state(layer, expert).is_some()
                     && !tier.sets[..set_idx].iter().any(|earlier| earlier.experts[expert].is_cold());
                 tier.sets[set_idx].assign(expert, reader, carried);
+            } else if set_idx > open_set {
+                // First router is no longer in `hits`; assign to the earliest
+                // remaining router in this future pass set, or reset to
+                // `Unrouted` so later `ingest_place` classifies it as cold.
+                let fallback = tier.places[range]
+                    .iter_mut()
+                    .flatten()
+                    .find(|request| request.routed.contains(&expert));
+                if let Some(request) = fallback {
+                    if !request.cold.contains(&expert) {
+                        request.cold.push(expert);
+                    }
+                    let seq = request.sequence;
+                    let carried = self.conveyor.state(layer, expert).is_some()
+                        && !tier.sets[..set_idx].iter().any(|earlier| earlier.experts[expert].is_cold());
+                    tier.sets[set_idx].assign(expert, seq, carried);
+                } else {
+                    tier.sets[set_idx].experts[expert] = SetSlot::Unrouted;
+                }
             }
+            // When `set_idx == open_set` and no pending `request.hits` holds
+            // `expert`, leave `SetSlot::Hit` intact so `claim_scratch` on the
+            // active/next request of `open_set` adopts and converts it.
         }
     }
 

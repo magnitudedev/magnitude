@@ -2272,13 +2272,17 @@ impl HostRecords {
         may_evict: bool,
         copy: Option<&mut dyn FnMut(u32, u32) -> bool>,
     ) -> bool {
-        self.lease_records(scratch_group, None, rank, may_evict, copy)
+        self.lease_records(scratch_group, None, rank, may_evict, copy).0
     }
 
     /// Grant scratch group `scratch_group` its lease of `target_records` (or
     /// all `0..self.lent` when `None`), relocating hot kept experts out of the
     /// target records into `self.lent..` before claiming them and leaving all
     /// unrequested records in `0..self.lent` resident and untouched.
+    ///
+    /// Returns `(all_leased, unmapped)` where `unmapped` lists every expert
+    /// unmapped without relocation (either evicted as a victim or dropped from
+    /// a lent record that could not be relocated).
     pub fn lease_records<K: Ord + Copy>(
         &mut self,
         scratch_group: ScratchGroup,
@@ -2286,10 +2290,11 @@ impl HostRecords {
         rank: impl Rank<K>,
         may_evict: bool,
         mut copy: Option<&mut dyn FnMut(u32, u32) -> bool>,
-    ) -> bool {
+    ) -> (bool, Vec<Staged>) {
         if self.leased_records(target_records) {
-            return true;
+            return (true, Vec::new());
         }
+        let mut unmapped = Vec::new();
         let mut kept_in_lent = Vec::new();
         let records: Vec<u32> = match target_records {
             Some(subset) => subset.iter().copied().filter(|&r| r < self.lent).collect(),
@@ -2357,6 +2362,7 @@ impl HostRecords {
                         if copy_fn(src, dst) {
                             victim_used[pos] = true;
                             self.unmap_from(victim_staged, dst, Some(scratch_group.into()));
+                            unmapped.push(victim_staged);
                             self.set(dst, Host::Ready);
                             self.relocate(src, dst, scratch_group);
                             relocated[idx] = true;
@@ -2369,6 +2375,7 @@ impl HostRecords {
                 if !relocated[idx] {
                     let staged = self.unkeep(record);
                     self.unmap_from(staged, record, Some(scratch_group.into()));
+                    unmapped.push(staged);
                     self.set(record, Host::Claimed);
                 }
             }
@@ -2376,10 +2383,11 @@ impl HostRecords {
             for (_, record) in kept_in_lent {
                 let staged = self.unkeep(record);
                 self.unmap_from(staged, record, Some(scratch_group.into()));
+                unmapped.push(staged);
                 self.set(record, Host::Claimed);
             }
         }
-        self.leased_records(target_records)
+        (self.leased_records(target_records), unmapped)
     }
 
     /// Whether the prompt group holds every lent record claimed: its whole
@@ -3682,7 +3690,7 @@ mod tests {
         tier.lent = 12;
         // Only 2 lent records (`0` and `5`) are needed for the prompt group.
         let subset = [0u32, 5u32];
-        assert!(tier.lease_records(scratch_group, Some(&subset), |_, _| 0u64, false, None));
+        assert!(tier.lease_records(scratch_group, Some(&subset), |_, _| 0u64, false, None).0);
         assert!(tier.leased_records(Some(&subset)), "requested subset is fully leased");
         assert!(!tier.leased(), "full 0..lent lease was not taken");
         assert_eq!(tier.claimed(), 2, "only the 2 requested records are claimed");
