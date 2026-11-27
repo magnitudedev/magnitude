@@ -198,20 +198,38 @@ fn run_with_cache_points(
     requests: &[(Vec<TokenId>, Vec<usize>)],
     max_tokens: usize,
 ) -> Vec<Turn> {
+    let requests = requests
+        .iter()
+        .map(|(prompt, cache_points)| {
+            let retention = PrefixRetention::Retain {
+                cache_points: cache_points.clone(),
+                user_branch: None,
+                partition: None,
+            };
+            (prompt.clone(), retention)
+        })
+        .collect::<Vec<_>>();
+    run_retained(host, vocabulary, &requests, max_tokens)
+}
+
+/// [`run`] with each prompt's own prefix retention.
+fn run_retained(
+    host: &mut Host,
+    vocabulary: usize,
+    requests: &[(Vec<TokenId>, PrefixRetention)],
+    max_tokens: usize,
+) -> Vec<Turn> {
     let prompts = requests
         .iter()
         .map(|(prompt, _)| prompt.clone())
         .collect::<Vec<_>>();
     let mut streams = requests
         .iter()
-        .map(|(prompt, cache_points)| {
+        .map(|(prompt, retention)| {
             host.admit(
                 greedy(prompt, vocabulary, max_tokens),
                 text_input(prompt),
-                PrefixRetention::Retain {
-                    cache_points: cache_points.clone(),
-                    user_branch: None,
-                },
+                retention.clone(),
                 max_tokens,
             )
             .unwrap()
@@ -253,7 +271,7 @@ fn an_abandoned_request_resumes_where_it_stopped() {
     let (mut host, vocabulary, tokenizer) = owner();
     let prompt = (7..10).flat_map(|seed| text(&tokenizer, seed * 10, 600)).collect::<Vec<_>>();
     let mut stream = host
-        .admit(greedy(&prompt, vocabulary, 12), text_input(&prompt), PrefixRetention::Retain { cache_points: Vec::new(), user_branch: None }, 12)
+        .admit(greedy(&prompt, vocabulary, 12), text_input(&prompt), PrefixRetention::Retain { cache_points: Vec::new(), user_branch: None, partition: None }, 12)
         .unwrap();
     let id = stream.id;
     host.step_until(&mut [&mut stream], Duration::from_secs(300), |host, _| {
@@ -272,7 +290,7 @@ fn an_abandoned_request_resumes_where_it_stopped() {
 
     let longer = text(&tokenizer, 8, 400);
     let mut stream = host
-        .admit(greedy(&longer, vocabulary, 200), text_input(&longer), PrefixRetention::Retain { cache_points: Vec::new(), user_branch: None }, 200)
+        .admit(greedy(&longer, vocabulary, 200), text_input(&longer), PrefixRetention::Retain { cache_points: Vec::new(), user_branch: None, partition: None }, 200)
         .unwrap();
     let id = stream.id;
     host.step_until(&mut [&mut stream], Duration::from_secs(300), |_, streams| streams[0].output.len() >= 40);
@@ -520,6 +538,75 @@ fn an_undeclared_divergence_is_retained_by_the_request_that_finds_it() {
     });
     assert_eq!(turns[..2], [0, 0]);
     assert!(turns[2] >= system.len());
+}
+
+/// Different partitions (`cache_salt`) never resume from each other's cached
+/// prompts, in turn or at once; within a partition, both still resume, and
+/// unpartitioned requests still share. That a request never waits on another
+/// partition's prefill is the owner's `AwaitingPrefix` test's to show.
+#[test]
+#[ignore = "requires a device and MAGNITUDE_TEST_GGUF"]
+fn partitions_never_resume_from_each_other() {
+    let (mut host, vocabulary, tokenizer) = owner();
+    let in_partition = |partition: Option<&str>| PrefixRetention::Retain {
+        cache_points: Vec::new(),
+        user_branch: None,
+        partition: partition.map(str::to_owned),
+    };
+    let cached = |host: &mut Host, requests: &[(&Vec<TokenId>, Option<&str>)]| {
+        let requests = requests
+            .iter()
+            .map(|(prompt, partition)| ((*prompt).clone(), in_partition(*partition)))
+            .collect::<Vec<_>>();
+        run_retained(host, vocabulary, &requests, 8)
+            .into_iter()
+            .map(|turn| turn.cached)
+            .collect::<Vec<_>>()
+    };
+    let (a, b) = (Some("salt-a"), Some("salt-b"));
+
+    // Cached: the same prompt in turn.
+    let prompt = text(&tokenizer, 50, 1000);
+    assert_eq!(cached(&mut host, &[(&prompt, a)]), [0]);
+    assert_eq!(
+        cached(&mut host, &[(&prompt, b)]),
+        [0],
+        "b resumes from none of a's"
+    );
+    assert_eq!(
+        cached(&mut host, &[(&prompt, None)]),
+        [0],
+        "nor does an unpartitioned request"
+    );
+    let again = cached(&mut host, &[(&prompt, a)]);
+    assert!(
+        again[0] >= MIN_PREFIX_HIT,
+        "a resumes from its own: {again:?}"
+    );
+    let again = cached(&mut host, &[(&prompt, None)]);
+    assert!(
+        again[0] >= MIN_PREFIX_HIT,
+        "unpartitioned requests share: {again:?}"
+    );
+
+    // Concurrent: a branch point must be strictly inside both prompts.
+    let branch_at = 1000;
+    let branching_prompts = |seed| {
+        let prefix = text(&tokenizer, seed, branch_at);
+        [TokenId(1), TokenId(2)].map(|tail| {
+            let mut prompt = prefix.clone();
+            prompt.push(tail);
+            prompt
+        })
+    };
+    let [left, right] = branching_prompts(70);
+    let isolated = cached(&mut host, &[(&left, a), (&right, b)]);
+    eprintln!("concurrent across partitions: {isolated:?}");
+    assert_eq!(isolated, [0, 0]);
+    let [left, right] = branching_prompts(80);
+    let shared = cached(&mut host, &[(&left, a), (&right, a)]);
+    eprintln!("concurrent within a partition: {shared:?}");
+    assert_eq!(shared, [0, branch_at], "the second waits on the first");
 }
 
 /// A tiny deterministic generator, so a failing sequence reproduces.

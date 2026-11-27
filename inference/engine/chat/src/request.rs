@@ -326,9 +326,13 @@ pub struct SamplingControls {
 }
 
 /// Whether the request's prompt may reuse and publish retained prefix state.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub enum PromptCache {
-    Allowed,
+    /// Shared with requests of the same `partition` alone (a `cache_salt`),
+    /// or with every unpartitioned request when `None`.
+    Allowed {
+        partition: Option<String>,
+    },
     Disabled,
 }
 

@@ -183,6 +183,11 @@ mod schema {
         #[serde(default = "default_true")]
         #[schema(default = true)]
         pub cache_prompt: bool,
+        /// Confines prefix-cache sharing to requests with the same salt, as
+        /// vLLM's and SGLang's `cache_salt`. At most 1024 characters
+        /// (Unicode scalar values).
+        #[schema(nullable = false, min_length = 1)]
+        pub cache_salt: Option<String>,
         #[serde(default, deserialize_with = "deserialize_bool_or_false")]
         #[schema(default = false)]
         pub ignore_eos: bool,
@@ -914,6 +919,7 @@ pub(crate) fn validate_apply_template_request(
         stream: true,
         stream_options: None,
         cache_prompt: true,
+        cache_salt: None,
         ignore_eos: false,
         timings_per_token: false,
     })?;
@@ -974,7 +980,7 @@ pub(crate) struct ValidatedChatRequest {
     stop: Vec<String>,
     max_tokens: Option<NonZeroU32>,
     sampling: SamplingControls,
-    cache_prompt: bool,
+    prompt_cache: PromptCache,
     ignore_eos: bool,
     pub(crate) delivery: ChatDelivery,
 }
@@ -1046,6 +1052,14 @@ pub(crate) fn validate_request(
         frequency_penalty: request.frequency_penalty,
         seed: request.seed,
     })?;
+    // A request that does not cache its prompt shares nothing, so its salt
+    // is moot once validated.
+    let partition = cache_salt(request.cache_salt)?;
+    let prompt_cache = if request.cache_prompt {
+        PromptCache::Allowed { partition }
+    } else {
+        PromptCache::Disabled
+    };
     let conversation = chat_context(request.messages)?;
     let (tools, tool_names) = tools(request.tools.unwrap_or_default())?;
     let tool_choice = tool_choice(request.tool_choice, &tool_names)?;
@@ -1082,7 +1096,7 @@ pub(crate) fn validate_request(
         stop,
         max_tokens,
         sampling,
-        cache_prompt: request.cache_prompt,
+        prompt_cache,
         ignore_eos: request.ignore_eos,
         delivery,
     })
@@ -1123,11 +1137,7 @@ pub(crate) fn finalize_request(
                 EndOfGeneration::Stop
             },
             reasoning_budget: budget,
-            prompt_cache: if validated.cache_prompt {
-                PromptCache::Allowed
-            } else {
-                PromptCache::Disabled
-            },
+            prompt_cache: validated.prompt_cache,
         },
     })
 }
@@ -1536,6 +1546,24 @@ fn require_known_tool(name: &str, tool_names: &BTreeSet<String>) -> Result<(), A
             "tool_choice references undefined tool: {name}"
         )))
     }
+}
+
+/// The longest `cache_salt` accepted.
+const MAX_CACHE_SALT_CHARS: usize = 1024;
+
+/// A request's validated `cache_salt`, the partition its prompt cache is
+/// shared within: when given, a non-empty string of at most
+/// [`MAX_CACHE_SALT_CHARS`] characters. Every protocol validates it here.
+pub(crate) fn cache_salt(salt: Option<String>) -> Result<Option<String>, ApiError> {
+    if let Some(salt) = &salt {
+        require_non_empty(salt, "cache_salt")?;
+        if salt.chars().count() > MAX_CACHE_SALT_CHARS {
+            return Err(ApiError::invalid(format!(
+                "cache_salt must be at most {MAX_CACHE_SALT_CHARS} characters"
+            )));
+        }
+    }
+    Ok(salt)
 }
 
 pub(crate) fn require_non_empty(value: &str, field: &str) -> Result<(), ApiError> {

@@ -153,6 +153,7 @@ fn admit(
         PrefixRetention::Retain {
             cache_points: Vec::new(),
             user_branch: None,
+            partition: None,
         }
     } else {
         PrefixRetention::Transient
