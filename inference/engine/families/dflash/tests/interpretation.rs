@@ -5,11 +5,12 @@ use magnitude_artifacts::{
 };
 use magnitude_family_common::headers::{self, Header};
 use magnitude_family_contracts::{
-    AttentionGate, BlockAttention, BlockLayout, DraftDefinition, DraftEmbedding, DraftMethod,
-    DraftVariant, HeadNorm, HistoryDomain, HistoryRows, ImportTransform, ModelDefinition, ModelFamily,
-    Operator, OutputRotary, Rotary, RotaryLayout, ScaledActivations, SublayerIndex, TapPoint,
+    AttentionGate, BlockAttention, BlockLayout, DraftDefinition, DraftEmbedding, DraftFusion,
+    DraftMask, DraftMethod, DraftVariant, HeadNorm, HistoryDomain, HistoryRows, ImportTransform,
+    MarkovHead, ModelDefinition, ModelFamily, Operator, OutputRotary, Rotary, RotaryLayout,
+    ScaledActivations, SublayerIndex, TapPoint,
 };
-use magnitude_family_dflash::{inspect, recognize, recognizes, Error};
+use magnitude_family_dflash::{inspect, recognizes, Error};
 use magnitude_family_lfm2::Lfm2Family;
 use magnitude_family_llama::LlamaFamily;
 use magnitude_family_muse_glimmer::MuseGlimmerFamily;
@@ -174,9 +175,12 @@ fn qwen_dflash_taps_eight_layers_with_five_sliding_windows() {
     assert_eq!(draft.method, DraftMethod::DFlash);
     assert_eq!(draft.layout, BlockLayout::MaskSlots);
     assert_eq!((draft.block_size, draft.max_proposals()), (16, 15));
-    assert_eq!(draft.mask_token, TokenId(248077));
+    assert_eq!(draft.mask, DraftMask::Token(TokenId(248077)));
     assert_eq!(draft.taps, block_taps(&[2, 7, 12, 17, 23, 28, 33, 38]));
-    assert_eq!(draft.fusion.shape, [2048, 8 * 2048]);
+    let DraftFusion::Linear { projection, .. } = &draft.fusion else {
+        panic!("expected linear fusion");
+    };
+    assert_eq!(projection.shape, [2048, 8 * 2048]);
     assert_eq!(draft.embedding, DraftEmbedding::Target);
     // A draft's window of W keeps q − k < W: W positions, its own included.
     let window = HistoryDomain::Window { tokens: 4096 };
@@ -238,8 +242,11 @@ fn muse_dflash_windows_every_layer() {
         draft.block_attention,
         vec![BlockAttention::Bidirectional; 5]
     );
-    assert_eq!(draft.fusion.shape, [6656, 5 * 6656]);
-    assert_eq!(draft.mask_token, TokenId(201818));
+    let DraftFusion::Linear { projection, .. } = &draft.fusion else {
+        panic!("expected linear fusion");
+    };
+    assert_eq!(projection.shape, [6656, 5 * 6656]);
+    assert_eq!(draft.mask, DraftMask::Token(TokenId(201818)));
 }
 
 #[test]
@@ -254,8 +261,11 @@ fn nemotron_dflash_has_yarn_its_own_embedding_and_second_level_scales() {
     );
     assert_eq!(draft.taps.len(), 6);
     assert_eq!(draft.taps.last(), Some(&TapPoint::Exit));
+    let DraftFusion::Linear { projection, .. } = &draft.fusion else {
+        panic!("expected linear fusion");
+    };
     assert_eq!(
-        draft.fusion.transforms,
+        projection.transforms,
         [ImportTransform::ScaleByTensor {
             tensor: "fc.scale".into(),
             activations: ScaledActivations::Rounded,
@@ -292,13 +302,22 @@ fn lfm2_dspark_samples_from_the_anchor_with_markov_and_confidence() {
         let definition = draft_of(*draft, *target_file).unwrap();
         assert_eq!(definition.layout, BlockLayout::AnchorFirst);
         assert_eq!((definition.block_size, definition.max_proposals()), (9, 9));
-        assert_eq!(definition.mask_token, TokenId(125017));
+        assert_eq!(definition.mask, DraftMask::Token(TokenId(125017)));
         let DraftMethod::DSpark { markov, confidence } = &definition.method else {
             panic!("{draft}: DSpark");
         };
-        assert_eq!(markov.rank, 256);
-        assert_eq!(markov.embedding.shape, [128000, 256]);
-        assert_eq!(markov.projection.shape, [128000, 256]);
+        let MarkovHead::Bilinear {
+            rank,
+            embedding,
+            projection,
+        } = markov
+        else {
+            panic!("expected bilinear Markov head");
+        };
+        assert_eq!(*rank, 256);
+        assert_eq!(embedding.shape, [128000, 256]);
+        assert_eq!(projection.shape, [128000, 256]);
+        let confidence = confidence.as_ref().expect("confidence head");
         assert_eq!(confidence.weight.shape, [2048 + 256]);
         assert!(confidence.weight.transforms.is_empty());
         assert_eq!(confidence.bias.as_ref().unwrap().shape, [1]);
@@ -321,12 +340,19 @@ fn lfm2_dspark_samples_from_the_anchor_with_markov_and_confidence() {
 fn minicpm5_dspark_flattens_its_stored_confidence_row() {
     let draft = draft_of(PAIRS[5].0, PAIRS[5].1).unwrap();
     assert_eq!(draft.layout, BlockLayout::AnchorFirst);
-    assert_eq!((draft.block_size, draft.mask_token), (7, TokenId(75982)));
+    assert_eq!(
+        (draft.block_size, &draft.mask),
+        (7, &DraftMask::Token(TokenId(75982)))
+    );
     assert_eq!(draft.taps, block_taps(&[2, 11, 21, 31, 40]));
     let DraftMethod::DSpark { markov, confidence } = &draft.method else {
         panic!("DSpark");
     };
-    assert_eq!(markov.embedding.shape, [130560, 256]);
+    let MarkovHead::Bilinear { embedding, .. } = markov else {
+        panic!("expected bilinear Markov head");
+    };
+    assert_eq!(embedding.shape, [130560, 256]);
+    let confidence = confidence.as_ref().expect("confidence head");
     assert_eq!(confidence.weight.shape, [2304]);
     assert_eq!(confidence.weight.transforms, [ImportTransform::Flatten]);
 }
@@ -539,7 +565,7 @@ fn qwen38_dspark_drafts_seven_from_the_anchor_with_yarn() {
     assert_eq!(draft.method.variant(), DraftVariant::DSpark);
     assert_eq!(draft.layout, BlockLayout::AnchorFirst);
     assert_eq!((draft.block_size, draft.max_proposals()), (7, 7));
-    assert_eq!(draft.mask_token, TokenId(248077));
+    assert_eq!(draft.mask, DraftMask::Token(TokenId(248077)));
     assert_eq!(draft.taps, block_taps(&[5, 17, 29, 41, 53]));
     let Operator::Attention(attention) = &draft.blocks[0].sublayers[0].op else {
         unreachable!()
@@ -565,7 +591,7 @@ fn qwen38_dflash2_convolves_every_sublayer_and_selects_a_path() {
     assert_eq!(draft.embedding_scale, 1.0);
     assert_eq!(draft.layout, BlockLayout::MaskSlots);
     assert_eq!((draft.block_size, draft.max_proposals()), (8, 7));
-    assert_eq!(draft.mask_token, TokenId(248070));
+    assert_eq!(draft.mask, DraftMask::Token(TokenId(248070)));
     assert_eq!(draft.taps, block_taps(&[6, 20, 34, 48, 62]));
     assert_eq!(
         domains(&draft),

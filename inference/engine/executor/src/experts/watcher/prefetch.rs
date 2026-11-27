@@ -489,11 +489,13 @@ enum Ahead {
     /// issued during an MTP `DraftWindow` (`target_step == 0`, bound to the
     /// next step on `Told::Began`) or continuously across the remaining
     /// non-drive pass window of an active verify/decode burst (`target_step`
-    /// = current burst `B` for layers `l+1..L-1` or `B+1` for layers `0..=l`).
+    /// = current burst `B` for remaining visits `target_visit > current_layer`
+    /// or `B+1` for `target_visit = first_visit`).
     /// Unbegun carryover reads are cancelled by `Prefetch::pass` once their
-    /// `(target_step, layer)` has passed, while `seismic_io` strictly serves
-    /// `Want::now()` demand reads ahead of `Want::undated` carryover.
-    Carryover { target_step: Step },
+    /// exact logical deadline `(target_step, target_visit)` has passed, while
+    /// `seismic_io` strictly serves `Want::now()` demand reads ahead of
+    /// `Want::undated` carryover.
+    Carryover { target_step: Step, target_visit: usize },
 }
 
 impl Ahead {
@@ -560,6 +562,7 @@ impl Fate {
         let lead = match source {
             Source::Ahead(row) => usize::from(row.index),
             Source::Token => crate::experts::DEPTHS,
+            Source::CrossPass => crate::experts::DEPTHS + 1,
             Source::Exact => unreachable!("no ring names an exact request"),
         };
         let packed = (free as i64) << 32 | (self as i64) << 16 | (lead as i64) << 8 | i64::from(rank);
@@ -623,9 +626,15 @@ pub(super) struct Prefetch {
     /// Staging record indices, valid in every pool, under their own lock:
     /// the request service's look takes a request's beside residency.
     pub(super) staging: Arc<StagingPool>,
-    /// What is inbound, by expert, until the watcher learns its landing's
-    /// end ([`Self::settle`]).
+    /// What is inbound, by `(physical_stack, expert)`, until the watcher
+    /// learns its landing's end ([`Self::settle`]).
     inbound: HashMap<Staged, Inbound>,
+    /// For each physical stack, its visit layer indices in decoder order.
+    stack_visits: Vec<Vec<usize>>,
+    /// Whether any physical stack is visited more than once per step.
+    has_shared_stacks: bool,
+    /// Whether `stack_visits` frequencies have been synced to `Directory`/`Reuse`.
+    visit_counts_synced: bool,
     /// Completion queue pushed by [`Ended::set`] so [`Self::settle`] processes
     /// only ended landings (`O(completions)`), never scanning all `inbound`.
     completed: Arc<Mutex<Vec<Staged>>>,
@@ -754,11 +763,16 @@ impl Admit for Admitting<'_> {
 }
 
 impl Prefetch {
-    /// `records` staging records, every one free, for `layers` streamed layers.
-    pub(super) fn new(records: u32, layers: usize) -> Self {
+    /// `records` staging records, every one free, for `layers` streamed layers
+    /// sharing physical stacks mapped by `stack_visits`.
+    pub(super) fn new(records: u32, layers: usize, stack_visits: Vec<Vec<usize>>) -> Self {
+        let has_shared_stacks = stack_visits.iter().any(|visits| visits.len() > 1);
         Self {
             staging: Arc::new(StagingPool::new(records)),
             inbound: HashMap::new(),
+            stack_visits,
+            has_shared_stacks,
+            visit_counts_synced: !has_shared_stacks,
             completed: Arc::new(Mutex::new(Vec::new())),
             has_completed: Arc::new(AtomicBool::new(false)),
             device_due: Vec::new(),
@@ -769,6 +783,17 @@ impl Prefetch {
             landed_prefetches: HashMap::new(),
             carryover_cal: OnlineCalibration::new(),
             active_decode_steps: HashSet::new(),
+        }
+    }
+
+    /// Sync per-stack logical visit frequencies into `Directory`/`Reuse` once
+    /// when shared (looped) physical stacks exist.
+    #[inline]
+    fn sync_visit_counts(&mut self, core: &mut Core) {
+        if !self.visit_counts_synced {
+            let counts: Vec<usize> = self.stack_visits.iter().map(|visits| visits.len().max(1)).collect();
+            core.directory.set_visit_counts(&counts);
+            self.visit_counts_synced = true;
         }
     }
 
@@ -801,7 +826,7 @@ impl Prefetch {
     pub(super) fn on_began(&mut self, step: Step) {
         self.step_prefetch_bytes = 0;
         for inbound in self.inbound.values_mut() {
-            if let Need::Ahead { ahead: Ahead::Carryover { target_step }, .. } = &mut inbound.need {
+            if let Need::Ahead { ahead: Ahead::Carryover { target_step, .. }, .. } = &mut inbound.need {
                 if *target_step == 0 {
                     *target_step = step;
                 }
@@ -917,10 +942,11 @@ impl Prefetch {
     /// accounted apart, once ([`account`]).
     pub(super) fn demand(&mut self, core: &Core, named: Named, naming: Naming, at: Point, landings: &Arc<Landings>, shared: &Arc<Shared>) {
         let Named { expert, posting: Posting { ticket, join }, staged, grant, rows, answer } = named;
+        let staged_key = (core.stack(naming.layer), expert);
         let (ended, urgency, tier) = (
             Ended::new_notifying(
                 shared.events(),
-                (naming.layer, expert),
+                staged_key,
                 self.completed.clone(),
                 self.has_completed.clone(),
             ),
@@ -1022,7 +1048,7 @@ impl Prefetch {
             }
         }
         let need = Need::Due { ticket, read: naming.sequence, device };
-        self.arrive((naming.layer, expert), Inbound { record: Some(staged), tier, bytes, need, ended, urgency, read_done, counted_hit: false, predicted_p: 0.0 });
+        self.arrive(staged_key, Inbound { record: Some(staged), tier, bytes, need, ended, urgency, read_done, counted_hit: false, predicted_p: 0.0 });
     }
 
     /// The landing of `staged` in flight a request finds, by what read it:
@@ -1079,10 +1105,14 @@ impl Prefetch {
     /// and due, no read here is priced or scheduled through `derive`.
     pub(super) fn want(&mut self, core: &Core, ledger: &mut Ledger, shared: &Arc<Shared>, at: At, experts: &[usize]) {
         let (sequence, layer) = (at.point.sequence, at.point.layer);
+        let stack = core.stack(layer);
+        let next_visit = core.layers[layer].next_visit;
+        let from_ord = next_visit.and_then(|_| self.stack_visits[stack].iter().position(|&v| v == layer));
+        let max_rank = core.extents.selected.saturating_sub(1);
         ledger.reach(sequence, layer);
         let now = Instant::now();
-        for &expert in experts {
-            let staged = (layer, expert);
+        for (idx, &expert) in experts.iter().enumerate() {
+            let staged = (stack, expert);
             let reading = matches!(self.read_state(core, staged), ReadState::Reading { .. });
             ledger.requested(layer, expert, reading);
             let name = Name { source: Source::Exact, when: When::Step(sequence), rank: 0, from: at, candidate: false, lineage: None };
@@ -1090,11 +1120,37 @@ impl Prefetch {
             if reading {
                 self.hasten(staged);
             }
+            // Cross-pass intra-token foresight: when this physical stack has a
+            // subsequent visit later in the same step, emit a calibrated
+            // `Source::CrossPass` interest for `next_visit` (exact logical
+            // deadline) and protect the active expert from self-eviction in
+            // `Reuse` until `next_visit` runs, using the learned ordered
+            // visit-pair carry rate (`Pass 1 -> Pass 2`, `Pass 2 -> Pass 3`)
+            // once observed.
+            if let Some(next) = next_visit {
+                let rank = idx.min(max_rank) as u8;
+                let cross = Name {
+                    source: Source::CrossPass,
+                    when: When::Step(sequence),
+                    rank,
+                    from: at,
+                    candidate: Self::candidate(core, staged),
+                    lineage: None,
+                };
+                if let Some(p_ledger) = ledger.publish(next, expert, cross, now) {
+                    let mut reuse = core.directory.reuse_now();
+                    let p_eff = from_ord
+                        .and_then(|ord| reuse.cross_pass_rate(stack, ord))
+                        .unwrap_or(p_ledger);
+                    reuse.set_intra_step(stack, expert, sequence, next, p_eff);
+                }
+            }
         }
         Self::spend(ledger, shared);
     }
 
     pub(super) fn pass(&mut self, core: &mut Core, ledger: &mut Ledger, shared: &Arc<Shared>, served: Option<(Step, usize)>) {
+        self.sync_visit_counts(core);
         let steps = &shared.steps;
         let mut changed = Vec::new();
         for layer in 0..core.layers.len() {
@@ -1107,19 +1163,30 @@ impl Prefetch {
             });
             changed.extend(passed.into_iter().map(|expert| (layer, expert)));
         }
+        if self.has_shared_stacks {
+            let mut reuse = core.directory.reuse_now();
+            if let Some((sequence, at)) = served {
+                let stack = core.stack(at);
+                if self.stack_visits[stack].len() > 1 {
+                    reuse.clear_intra_step(stack, sequence, at);
+                }
+            }
+            reuse.expire_intra_step(|step| steps.ended(step));
+        }
         if !changed.is_empty() {
             self.derive(core, ledger, shared, Some(changed.as_slice()));
         }
-        // Cancel any unbegun carryover reads whose `(target_step, layer)`
-        // the device has already passed, freeing staging for upcoming layers.
-        for (&(layer, _), inbound) in &mut self.inbound {
-            let Need::Ahead { ticket, ahead: Ahead::Carryover { target_step } } = &mut inbound.need else {
+        // Cancel any unbegun carryover reads whose exact logical deadline
+        // `(target_step, target_visit)` the device has already passed, freeing
+        // staging for upcoming layers.
+        for inbound in self.inbound.values_mut() {
+            let Need::Ahead { ticket, ahead: Ahead::Carryover { target_step, target_visit } } = &mut inbound.need else {
                 continue;
             };
             if *target_step == 0 || inbound.urgency.is_waited() || ticket.begun() || ticket.cancelled() {
                 continue;
             }
-            let passed = served.is_some_and(|(sequence, at)| (*target_step, layer) <= (sequence, at))
+            let passed = served.is_some_and(|(sequence, at)| (*target_step, *target_visit) <= (sequence, at))
                 || steps.ended(*target_step);
             if passed {
                 ticket.cancel();
@@ -1277,13 +1344,16 @@ impl Prefetch {
     /// already) into tier record `tier`, read at step `read` (none for the
     /// cover's), ended: landed or not.
     fn ended(&mut self, directory: &mut Directory, ledger: &mut Ledger, record: Option<u32>, staged: Staged, tier: u32, read: Option<Step>, landed: bool) {
-        let (layer, expert) = staged;
+        let (stack, expert) = staged;
         match landed {
             true => {
-                directory.landed(layer, HostRecord(tier), expert, read);
-                ledger.landed(layer, expert, Instant::now());
+                directory.landed(stack, HostRecord(tier), expert, read);
+                let now = Instant::now();
+                for &visit in &self.stack_visits[stack] {
+                    ledger.landed(visit, expert, now);
+                }
             }
-            false => directory.unlanded(layer, HostRecord(tier)),
+            false => directory.unlanded(stack, HostRecord(tier)),
         }
         if let Some(record) = record {
             self.staging.release(record);
@@ -1461,7 +1531,7 @@ impl Prefetch {
                 note(Fate::Repeated, expert, &name);
                 continue;
             }
-            let candidate = Self::candidate(core, (target, expert));
+            let candidate = Self::candidate(core, (core.stack(target), expert));
             if !candidate {
                 note(Fate::Held, expert, &name);
             }
@@ -1584,10 +1654,14 @@ impl Prefetch {
         let remaining_layers = core.layers.len().saturating_sub(current_layer.saturating_add(1)).max(1);
         let scheduled = {
             let core: &Core = core;
-            let queued_bytes = self.drive_queued_bytes(|layer| core.layers[layer].expert_bytes(), &seen);
+            let seen_stacks: HashSet<Staged> = seen.iter().map(|&(layer, expert)| (core.stack(layer), expert)).collect();
+            let queued_bytes = self.drive_queued_bytes(|stack| core.layers[core.stack_rep(stack)].expert_bytes(), &seen_stacks);
             let idle = DriveIdleBudget::new(core.layers.len(), remaining_layers, queued_bytes, draft_idle, inter_layer_idle);
             // Each read's standing, taken before the ledger decides on it.
-            let states = experts.iter().map(|&staged| (staged, self.read_state(core, staged))).collect::<HashMap<_, _>>();
+            let states = experts
+                .iter()
+                .map(|&(layer, expert)| ((layer, expert), self.read_state(core, (core.stack(layer), expert))))
+                .collect::<HashMap<_, _>>();
             let read = |layer, expert| states[&(layer, expert)];
             ledger.schedule_for_path(
                 magnitude_cost_model::PathKind::Drive,
@@ -1606,7 +1680,8 @@ impl Prefetch {
         let in_draft = ledger.in_draft_window();
         let (mut read, mut staging_full) = (false, false);
         for Scheduled { layer, expert, act, leading, .. } in scheduled {
-            let staged = (layer, expert);
+            let stack = core.stack(layer);
+            let staged = (stack, expert);
             match act {
                 Act::Keep | Act::Issue(Class::Due) => {}
                 Act::Reprice(Class::Due) => self.hasten(staged),
@@ -1680,7 +1755,7 @@ impl Prefetch {
                                 self.step_prefetch_bytes = self.step_prefetch_bytes.saturating_add(bytes);
                             }
                             ledger.issued(layer, expert, &interest, bytes, Instant::now());
-                            shared.telemetry.read_ahead(interest.source, interest.step(), staged, interest.from.point.layer, bytes);
+                            shared.telemetry.read_ahead(interest.source, interest.step(), (layer, expert), interest.from.point.layer, bytes);
                             read = true;
                             if seismic_io::timeline::recording() {
                                 Fate::Read.note(interest.from.point.sequence, layer, interest.source, (expert, interest.rank), self.staging.free());
@@ -1714,7 +1789,7 @@ impl Prefetch {
                 .inbound
                 .iter()
                 .filter(|(_, inbound)| !inbound.read_done.load(Ordering::Acquire))
-                .map(|(&(layer, _), _)| p.transfer_seconds(core.layers[layer].expert_bytes()))
+                .map(|(&(stack, _), _)| p.transfer_seconds(core.layers[core.stack_rep(stack)].expert_bytes()))
                 .sum();
             let mut budget = LinkIdleBudget::new(0.0, draft_idle, queued_secs);
             if budget.remaining() <= 0.0 {
@@ -1722,14 +1797,14 @@ impl Prefetch {
             }
             let candidates = {
                 let reuse = core.directory.reuse_now();
-                reuse.next_step_candidates(room, true, |layer, expert| Self::candidate(core, (layer, expert)))
+                reuse.next_step_candidates(room, true, |stack, expert| Self::candidate(core, (stack, expert)))
             };
             let mut read = false;
             for cand in candidates {
                 if self.staging.free() <= reserve.0 {
                     break;
                 }
-                let bytes = core.layers[cand.layer].expert_bytes();
+                let bytes = core.layers[core.stack_rep(cand.layer)].expert_bytes();
                 let t_bw = p.transfer_seconds(bytes);
                 // During `DraftWindow` the GPU touches zero routed experts, so
                 // `budget.remaining()` is genuinely idle drive time on every
@@ -1742,9 +1817,10 @@ impl Prefetch {
                 if net_benefit <= 0.0 {
                     continue;
                 }
+                let target_visit = self.stack_visits[cand.layer][0];
                 let want = Want::undated(p_eff);
                 let claim = AheadClaim::Carryover { net_benefit, strict_rank: p.drive_binds() };
-                match self.read_ahead(core, shared, (cand.layer, cand.expert), want, Ahead::Carryover { target_step: 0 }, claim, p_raw, reserve) {
+                match self.read_ahead(core, shared, (cand.layer, cand.expert), want, Ahead::Carryover { target_step: 0, target_visit }, claim, p_raw, reserve) {
                     Ok(_) => {
                         read = true;
                         budget.consume(t_bw);
@@ -1808,7 +1884,7 @@ impl Prefetch {
             .inbound
             .iter()
             .filter(|(_, inbound)| !inbound.read_done.load(Ordering::Acquire))
-            .map(|(&(layer, _), _)| p.transfer_seconds(core.layers[layer].expert_bytes()))
+            .map(|(&(stack, _), _)| p.transfer_seconds(core.layers[core.stack_rep(stack)].expert_bytes()))
             .sum();
         let idle_window = if drive_binds {
             inter_layer_idle
@@ -1823,29 +1899,36 @@ impl Prefetch {
         }
         let mut candidates = {
             let reuse = core.directory.reuse_now();
-            reuse.next_step_candidates(room, false, |layer, expert| {
-                (!drive_binds || is_interlayer_target(layer, current_layer, layers))
-                    && Self::candidate(core, (layer, expert))
+            let stack_visits = &self.stack_visits;
+            reuse.next_step_candidates(room, false, |stack, expert| {
+                (!drive_binds || stack_visits[stack].iter().any(|&visit| is_interlayer_target(visit, current_layer, layers)))
+                    && Self::candidate(core, (stack, expert))
             })
         };
-        // Earliest-deadline-first across the burst boundary: remaining layers
-        // of burst B (`layer > current_layer`) first, then early layers of
-        // burst B+1 (`layer <= current_layer`), each ascending by layer,
+        // Earliest-deadline-first across the burst boundary: remaining visits
+        // of burst B (`visit > current_layer`) first, then early visits of
+        // burst B+1 (`visit <= current_layer`), each ascending by next visit,
         // tie-broken by calibrated `p_next` descending.
-        candidates.sort_unstable_by(|a, b| {
-            let a_next_burst = a.layer <= current_layer;
-            let b_next_burst = b.layer <= current_layer;
-            a_next_burst
-                .cmp(&b_next_burst)
-                .then_with(|| a.layer.cmp(&b.layer))
-                .then_with(|| b.p_next.total_cmp(&a.p_next))
-        });
+        {
+            let stack_visits = &self.stack_visits;
+            let deadline = |stack: usize| -> (bool, usize) {
+                match stack_visits[stack].iter().copied().find(|&v| v > current_layer) {
+                    Some(visit) => (false, visit),
+                    None => (true, stack_visits[stack][0]),
+                }
+            };
+            candidates.sort_unstable_by(|a, b| {
+                deadline(a.layer)
+                    .cmp(&deadline(b.layer))
+                    .then_with(|| b.p_next.total_cmp(&a.p_next))
+            });
+        }
         let mut read = false;
         for cand in candidates {
             if self.staging.free() <= reserve.0 {
                 break;
             }
-            let bytes = core.layers[cand.layer].expert_bytes();
+            let bytes = core.layers[core.stack_rep(cand.layer)].expert_bytes();
             if !binds && bytes > remaining_budget {
                 continue;
             }
@@ -1857,10 +1940,13 @@ impl Prefetch {
             if net_benefit <= 0.0 {
                 continue;
             }
-            let target_step = if cand.layer > current_layer { step } else { step.saturating_add(1) };
+            let (target_step, target_visit) = match self.stack_visits[cand.layer].iter().copied().find(|&v| v > current_layer) {
+                Some(visit) => (step, visit),
+                None => (step.saturating_add(1), self.stack_visits[cand.layer][0]),
+            };
             let want = Want::undated(p_eff);
             let claim = AheadClaim::Carryover { net_benefit, strict_rank: drive_binds };
-            match self.read_ahead(core, shared, (cand.layer, cand.expert), want, Ahead::Carryover { target_step }, claim, p_raw, reserve) {
+            match self.read_ahead(core, shared, (cand.layer, cand.expert), want, Ahead::Carryover { target_step, target_visit }, claim, p_raw, reserve) {
                 Ok(bytes) => {
                     self.step_prefetch_bytes = self.step_prefetch_bytes.saturating_add(bytes);
                     remaining_budget = remaining_budget.saturating_sub(bytes);
@@ -1973,13 +2059,14 @@ impl Prefetch {
         (staging, ahead_staging): (usize, Option<usize>),
     ) -> Result<u64, Short> {
         let (target, expert) = staged;
-        let Some(record) = self.staging.take_beyond_within(staging, core.table.staging_limit(target)) else {
+        let rep = core.stack_rep(target);
+        let Some(record) = self.staging.take_beyond_within(staging, core.table.staging_limit(rep)) else {
             return Err(Short::Staging);
         };
         // Beyond what its group's reserve (`HostRecords::reserve`) holds
         // past the reads ahead's staging, whose landings it counts already;
         // none for the cover.
-        let keep = ahead_staging.map_or(0, |ahead| core.directory.host(core.layers[target].group).reserve().saturating_sub(ahead));
+        let keep = ahead_staging.map_or(0, |ahead| core.directory.host(core.layers[rep].group).reserve().saturating_sub(ahead));
         let claim = match claim_kind {
             AheadClaim::Interest { step, p, stall_credit } => {
                 core.directory.claim_ahead(target, expert, keep, ahead.taking(), step, p, stall_credit)
@@ -1994,12 +2081,12 @@ impl Prefetch {
             return Err(Short::Tier);
         };
         let tier = grant.record();
-        let reads = core.table.reads(target, expert, record);
+        let reads = core.table.reads(rep, expert, record);
         let bytes = reads.iter().map(crate::experts::source::Read::bytes).sum::<u64>();
         match post(
             &core.table,
             reads,
-            core.table.tensor_count(target),
+            core.table.tensor_count(rep),
             want,
             crate::experts::source::ReadAlignment::AllowAlignedLead,
         ) {
@@ -2152,7 +2239,7 @@ mod tests {
 
     #[test]
     fn a_read_holding_staging_outside_the_landings_is_outstanding() {
-        let prefetch = Prefetch::new(2, 1);
+        let prefetch = Prefetch::new(2, 1, vec![vec![0]]);
         assert!(!prefetch.outstanding(), "nothing read");
         let posted = prefetch.staging.take_up_to(1);
         assert!(prefetch.outstanding(), "a posted read's staging record is taken");
@@ -2184,7 +2271,7 @@ mod tests {
         let price = ReadPrice::priced(non_drive_passes.read_admission(Some(line)));
         assert!(!price.drive_binds());
 
-        let mut prefetch = Prefetch::new(4, 2);
+        let mut prefetch = Prefetch::new(4, 2, vec![vec![0], vec![1]]);
         let events = Arc::new(Events::default());
         let seen = HashSet::from([(1, 0)]);
 
@@ -2281,7 +2368,7 @@ mod tests {
         let time = Time::new(&[vec![4, 4]], 32);
         let stands = Stands::new(time.clone());
         let mut ledger = Ledger::new(vec![0, 0], 4, time, stands);
-        let mut prefetch = Prefetch::new(8, 2);
+        let mut prefetch = Prefetch::new(8, 2, vec![vec![0], vec![1]]);
         let events = Arc::new(Events::default());
 
         ledger.tell(Told::DraftWindow { estimated_seconds: 0.019 });
@@ -2302,7 +2389,7 @@ mod tests {
                 record: Some(0),
                 tier: 0,
                 bytes,
-                need: Need::Ahead { ticket: Ticket::empty(), ahead: Ahead::Carryover { target_step: 0 } },
+                need: Need::Ahead { ticket: Ticket::empty(), ahead: Ahead::Carryover { target_step: 0, target_visit: 1 } },
                 ended: Ended::new(&events),
                 urgency: Urgency::ahead(Want::undated(0.25)),
                 read_done: Arc::new(AtomicBool::new(false)),
@@ -2319,7 +2406,7 @@ mod tests {
         let inbound = prefetch.inbound.get(&(1, 0)).expect("draft carryover stays queued across on_began");
         assert!(!inbound.ticket().cancelled(), "on_began must not cancel unbegun draft carryover reads");
         assert!(
-            matches!(inbound.need, Need::Ahead { ahead: Ahead::Carryover { target_step: 2 }, .. }),
+            matches!(inbound.need, Need::Ahead { ahead: Ahead::Carryover { target_step: 2, target_visit: 1 }, .. }),
             "on_began binds untargeted draft carryover to the new step"
         );
         let post_idle = DriveIdleBudget::new(48, 1, vec![bytes], 0.0, 0.0);
@@ -2521,7 +2608,7 @@ mod tests {
 
         // `inflight_carryover_reads` counts only active, uncompleted, uncancelled,
         // non-waited `Ahead::Carryover` reads.
-        let mut prefetch = Prefetch::new(8, 4);
+        let mut prefetch = Prefetch::new(8, 4, vec![vec![0], vec![1], vec![2], vec![3]]);
         let events = Arc::new(Events::default());
         assert_eq!(prefetch.inflight_carryover_reads(), 0);
 
@@ -2532,7 +2619,7 @@ mod tests {
                 record: Some(0),
                 tier: 0,
                 bytes,
-                need: Need::Ahead { ticket: Ticket::empty(), ahead: Ahead::Carryover { target_step: 1 } },
+                need: Need::Ahead { ticket: Ticket::empty(), ahead: Ahead::Carryover { target_step: 1, target_visit: 0 } },
                 ended: Ended::new(&events),
                 urgency: Urgency::ahead(Want::undated(0.4)),
                 read_done: active_done.clone(),
@@ -2579,7 +2666,7 @@ mod tests {
                 record: Some(3),
                 tier: 3,
                 bytes,
-                need: Need::Ahead { ticket: Ticket::empty(), ahead: Ahead::Carryover { target_step: 1 } },
+                need: Need::Ahead { ticket: Ticket::empty(), ahead: Ahead::Carryover { target_step: 1, target_visit: 0 } },
                 ended: Ended::new(&events),
                 urgency: waited_urgency,
                 read_done: Arc::new(AtomicBool::new(false)),
@@ -2647,7 +2734,7 @@ mod tests {
 
         let measure = |n: usize| -> (usize, usize, usize, usize) {
             let events = Arc::new(Events::default());
-            let mut prefetch = Prefetch::new(n as u32 + 4, 1);
+            let mut prefetch = Prefetch::new(n as u32 + 4, 1, vec![vec![0]]);
             let mut directory = Directory::new(&[4], &[0], &[n + 8], HostTier::replay(vec![n as u32 + 4]));
             let time = Time::new(&[vec![(n + 8) as u64]], 32);
             let stands = Stands::new(time.clone());
@@ -2674,7 +2761,7 @@ mod tests {
                         record: Some(record),
                         tier,
                         bytes: 1024,
-                        need: Need::Ahead { ticket: Ticket::empty(), ahead: Ahead::Carryover { target_step: 1 } },
+                        need: Need::Ahead { ticket: Ticket::empty(), ahead: Ahead::Carryover { target_step: 1, target_visit: 0 } },
                         ended,
                         urgency: Urgency::ahead(Want::undated(0.8)),
                         read_done: Arc::new(AtomicBool::new(false)),

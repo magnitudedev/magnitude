@@ -148,6 +148,159 @@ pub(super) fn fx_set<T>() -> FxHashSet<T> {
 }
 
 /// The same decoder class ladder as `PreparedTargetGraphs::prepare`. The
+/// Certified resource envelope for a `ResidualForm::BlockAttention` target
+/// (Inkling 2): sizes the F32 source stack (`blocks`, `bank`, `partial`,
+/// `prelude`), scratch activations, and optional DSpark tap buffer without
+/// building sealed per-block graphs.
+fn checked_block_attn_res_family(
+    backend: BackendName,
+    load: &ModelLoadPlan,
+    geometry: &Decoder,
+    plan: &TargetProgramPlan,
+    limits: ResourceLimits,
+    pass: PassLaunches,
+) -> Result<CheckedTargetFamily, GraphError> {
+    let bar = crate::operators::block_attn_res::BlockAttnResPlan::of(geometry)
+        .map_err(|error| GraphError::from(error.to_string()))?;
+    let max_rows = limits.max_launch_rows as u64;
+    let hidden = geometry.hidden;
+    // Shared sealed-graph workspace envelope for BlockAttnRes.
+    let workspace_bytes = super::block_attn_res_graph::block_attn_res_graph_bytes(
+        max_rows,
+        hidden,
+        bar.max_sources as u64,
+        bar.max_bank as u64,
+        pass.get(),
+    );
+    let output_bytes = max_rows.saturating_mul(hidden).saturating_mul(4);
+    let tap_count = plan.taps().map_or(0, |t| t.points.len() as u64);
+    let tap_bytes = if tap_count > 0 {
+        let act_bytes = match geometry.activation_dtype {
+            magnitude_family_contracts::ActivationDType::F16
+            | magnitude_family_contracts::ActivationDType::BF16 => 2u64,
+        };
+        max_rows
+            .saturating_mul(tap_count)
+            .saturating_mul(hidden)
+            .saturating_mul(act_bytes)
+    } else {
+        0
+    };
+    let upload_bytes = max_rows.saturating_mul(64);
+    let storage = seismic::NativeGraphStorageBytes {
+        workspace: workspace_bytes,
+        sync: 0,
+        output: output_bytes,
+        upload: upload_bytes,
+        recorded: Default::default(),
+    };
+    let prefill_exts = super::block_attn_res_graph::BarStepBuffers::extents(
+        bar.max_sources as u64,
+        bar.max_bank as u64,
+        max_rows,
+        hidden,
+    );
+    let binding_constant_bytes = super::extents_bytes(prefill_exts.iter())
+        .map_err(GraphError::from)?
+        .saturating_mul(pass.get() as u64);
+    let resources = CheckedGraphResources {
+        storage,
+        graphs: LaunchGraphs::default(),
+        binding_constant_bytes,
+        host_heap: HostHeap::default(),
+    };
+    let group_bytes = crate::planning::ByPass::of(pass, |places| {
+        Ok::<u64, GraphError>(tap_bytes.saturating_mul(places.get() as u64))
+    })?;
+    let mut entry_calls = Vec::new();
+    if let Some(emb) = load.weight_by_role(magnitude_family_contracts::WeightRole {
+        scope: magnitude_family_contracts::WeightScope::Target,
+        kind: magnitude_family_contracts::WeightKind::Embedding,
+    }) {
+        entry_calls.push(crate::programs::graph::sizing::SizedCall {
+            entry: "embedding_rows",
+            backend,
+            elements: Vec::new(),
+            dimensions: Vec::new(),
+            bound_ports: vec![crate::programs::graph::sizing::SizedBoundPort {
+                parameter_ordinal: 0,
+                element: emb.resident,
+                extents: emb.shape.clone(),
+                bytes: emb.resident_bytes,
+                is_weight: true,
+                is_upload: false,
+            }],
+            timeline_before: 0,
+            eval_launches: |_, _, _, _| Ok(1),
+        });
+    }
+    let mut per_block_calls: Vec<Vec<crate::programs::graph::sizing::SizedCall>> =
+        vec![Vec::new(); geometry.blocks.len()];
+    for w in load.weights() {
+        let magnitude_family_contracts::WeightScope::TargetSublayer(sub) = w.role.scope else {
+            continue;
+        };
+        let b_idx = sub.block as usize;
+        if b_idx >= per_block_calls.len() {
+            continue;
+        }
+        let entry = match w.shape.len() {
+            3 => match w.role.kind {
+                magnitude_family_contracts::WeightKind::ExpertDown => "routed_down",
+                _ => "routed_gate_up",
+            },
+            2 => "project_rows",
+            _ => continue,
+        };
+        per_block_calls[b_idx].push(crate::programs::graph::sizing::SizedCall {
+            entry,
+            backend,
+            elements: Vec::new(),
+            dimensions: Vec::new(),
+            bound_ports: vec![crate::programs::graph::sizing::SizedBoundPort {
+                parameter_ordinal: 0,
+                element: w.resident,
+                extents: w.shape.clone(),
+                bytes: w.resident_bytes,
+                is_weight: true,
+                is_upload: false,
+            }],
+            timeline_before: 0,
+            eval_launches: |_, _, _, _| Ok(1),
+        });
+    }
+    let mut block_shapes: Vec<crate::programs::graph::sizing::BlockDecodeCensus> = Vec::new();
+    let mut block_map = Vec::with_capacity(geometry.blocks.len());
+    for calls in per_block_calls {
+        let shape = crate::programs::graph::sizing::BlockDecodeCensus {
+            calls,
+            timelines: 0,
+            resident: None,
+        };
+        let idx = if let Some(pos) = block_shapes.iter().position(|s| s == &shape) {
+            pos
+        } else {
+            block_shapes.push(shape);
+            block_shapes.len() - 1
+        };
+        block_map.push(idx);
+    }
+    Ok(CheckedTargetFamily {
+        resources,
+        sealed: PlannedSealedGraphs::default(),
+        upload_regions: vec![upload_bytes.max(1)],
+        graphs: LaunchGraphs::default(),
+        group_bytes,
+        census: TargetFamilySizingCensus {
+            entry_calls,
+            block_shapes,
+            block_map,
+            ..TargetFamilySizingCensus::default()
+        },
+        cache: Arc::new(()),
+    })
+}
+
 /// family takes independent maxima because its workspace, output and upload
 /// holdings may peak in different members.
 #[cfg(test)]
@@ -159,6 +312,20 @@ pub(crate) fn checked_target_family_storage(
     plan: &TargetProgramPlan,
     limits: ResourceLimits,
 ) -> Result<CheckedGraphResources, GraphError> {
+    if matches!(
+        geometry.residual,
+        magnitude_family_contracts::ResidualForm::BlockAttention { .. }
+    ) {
+        return checked_block_attn_res_family(
+            backend,
+            load,
+            geometry,
+            plan,
+            limits,
+            PassLaunches::whole_chain(limits),
+        )
+        .map(|certificate| certificate.resources);
+    }
     certify_target_family::<NativeGraphLayout>(
         backend,
         load,
@@ -183,6 +350,12 @@ pub(crate) fn checked_target_family(
     limits: ResourceLimits,
     pass: PassLaunches,
 ) -> Result<CheckedTargetFamily, GraphError> {
+    if matches!(
+        geometry.residual,
+        magnitude_family_contracts::ResidualForm::BlockAttention { .. }
+    ) {
+        return checked_block_attn_res_family(backend, load, geometry, plan, limits, pass);
+    }
     let outline = FamilyOutline::of(backend, load, geometry, state, plan, limits)?;
     let layouts = FamilyLayouts::<SizingOutline>::of_entries(backend, load, geometry, plan, &outline)?;
     let cache = Arc::new(Mutex::new(layouts));
@@ -202,6 +375,14 @@ pub(crate) fn checked_target_and_undrafted(
     limits: ResourceLimits,
     pass: PassLaunches,
 ) -> Result<[CheckedTargetFamily; 2], GraphError> {
+    if matches!(
+        geometry.residual,
+        magnitude_family_contracts::ResidualForm::BlockAttention { .. }
+    ) {
+        let a = checked_block_attn_res_family(backend, load, geometry, plan, limits, pass)?;
+        let b = a.clone_checked();
+        return Ok([a, b]);
+    }
     let outline = FamilyOutline::of(backend, load, geometry, state, plan, limits)?;
     let layouts = FamilyLayouts::<SizingOutline>::of_entries(backend, load, geometry, plan, &outline)?;
     let cache = Arc::new(Mutex::new(layouts));
@@ -275,6 +456,12 @@ impl CheckedTargetFamily {
         limits: ResourceLimits,
         pass: PassLaunches,
     ) -> Result<CheckedTargetFamily, GraphError> {
+        if matches!(
+            geometry.residual,
+            magnitude_family_contracts::ResidualForm::BlockAttention { .. }
+        ) {
+            return checked_block_attn_res_family(backend, load, geometry, plan, limits, pass);
+        }
         let outline = FamilyOutline::of(backend, load, geometry, state, plan, limits)?;
         let mutex = cache
             .as_ref()

@@ -241,6 +241,7 @@ impl Extensions {
                     dilation: site.dilation,
                 }),
             })),
+            post_conv: None,
             output: OutputForm::Residual,
         })
     }
@@ -277,14 +278,19 @@ fn block(
     sublayers.push(Sublayer {
         input: mix_input(extensions.site(geometry, &mut weight, "hc_attn", true)?),
         op: mixer,
+        post_conv: None,
         output: OutputForm::Scatter,
     });
     sublayers.push(Sublayer {
         input: mix_input(extensions.site(geometry, &mut weight, "hc_ffn", true)?),
         op: geometry.feed_forward(&mut weight, geometry.intermediate)?,
+        post_conv: None,
         output: OutputForm::Scatter,
     });
-    Ok(Block { sublayers })
+    Ok(Block {
+        sublayers,
+        transition: None,
+    })
 }
 
 /// Inspect already-opened package components. This exists for composition roots
@@ -379,6 +385,7 @@ pub fn inspect_components(
                 norm: exit_norm(exit),
                 output,
                 softcap: None,
+                unpadded_vocabulary: None,
             },
         },
         head: None,

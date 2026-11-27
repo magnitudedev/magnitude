@@ -780,6 +780,7 @@ fn split_selected(
         indexer: IndexedReals {
             query_norm: match &indexer.query.norm {
                 HeadNorm::Rms(norm) => Some(norm.epsilon),
+                HeadNorm::L2Clip { epsilon, .. } => Some(*epsilon),
                 HeadNorm::None => None,
             },
             // `pool_rows` writes the keys; the indexer writes none.
@@ -833,6 +834,7 @@ fn split_picked(picked: PickedBlock<'_>) -> (PickedSource<u64>, PickedReals<f64>
     let reals = IndexedReals {
         query_norm: match &indexer.query.norm {
             HeadNorm::Rms(norm) => Some(norm.epsilon),
+            HeadNorm::L2Clip { epsilon, .. } => Some(*epsilon),
             HeadNorm::None => None,
         },
         key_norm: match &indexer.keys {

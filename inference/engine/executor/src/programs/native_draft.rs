@@ -1361,7 +1361,7 @@ impl<'d> DraftSplit<'d> {
         let mut real = |value: f64| facts.real(value);
         let method = match &draft.method {
             DraftMethod::DFlash => MethodNumbers::DFlash,
-            DraftMethod::DSpark { markov, .. } => MethodNumbers::DSpark { rank: markov.rank },
+            DraftMethod::DSpark { markov, .. } => MethodNumbers::DSpark { rank: markov.rank() },
             DraftMethod::DFlash2 { selector } => MethodNumbers::DFlash2 { top_k: selector.top_k, rank: selector.rank },
             DraftMethod::LiLiCorr { corrector } => MethodNumbers::LiLiCorr {
                 topology: CorrectorTopology {
@@ -1386,7 +1386,7 @@ impl<'d> DraftSplit<'d> {
         };
         let numbers = DraftModelNumbers {
             hidden: decoder.hidden,
-            vocabulary: decoder.vocabulary,
+            vocabulary: decoder.active_vocabulary(),
             feed_forward: feed_forward_numbers,
             streams: streams_numbers,
             convolution: draft.convolutions.as_ref().map(|convolutions| [convolutions.kernel, convolutions.group]),
@@ -1581,6 +1581,26 @@ pub(crate) fn checked_draft_family_storage(
         .map(|(resources, _, _)| resources)
 }
 
+/// Whether `draft` uses the admitted Inkling 2 RNN DSpark form
+/// (`DraftFusion::SoftmaxMix`, `DraftMask::Learned`, and
+/// `MarkovHead::RnnHidden`). Partial combinations are rejected by
+/// `operators::draft::admit`.
+pub(crate) fn is_rnn_dspark(draft: &DraftDefinition) -> bool {
+    matches!(
+        draft.fusion,
+        magnitude_family_contracts::DraftFusion::SoftmaxMix { .. }
+    ) && matches!(
+        draft.mask,
+        magnitude_family_contracts::DraftMask::Learned(_)
+    ) && matches!(
+        draft.method,
+        DraftMethod::DSpark {
+            markov: magnitude_family_contracts::MarkovHead::RnnHidden(_),
+            ..
+        }
+    )
+}
+
 pub(crate) fn checked_draft_family_with_kernels(
     backend: BackendName,
     load: &ModelLoadPlan,
@@ -1596,6 +1616,36 @@ pub(crate) fn checked_draft_family_with_kernels(
     GraphError,
 > {
     let classes = classes.into_iter().collect::<Vec<_>>();
+    if is_rnn_dspark(geometry.draft) {
+        let max_entry = classes.iter().map(|c| c.entry_rows).max().unwrap_or(1);
+        let max_slots = classes.iter().map(|c| c.slots).max().unwrap_or(1);
+        let max_proposals = classes.iter().map(|c| c.proposals).max().unwrap_or(1);
+        let hidden = geometry.definition.decoder.hidden;
+        let layers = geometry.draft.blocks.len() as u64;
+        let workspace = max_entry
+            .saturating_mul(hidden)
+            .saturating_mul(4)
+            .saturating_mul(layers + 4)
+            .saturating_add(max_slots.saturating_mul(max_proposals + 1).saturating_mul(hidden).saturating_mul(4));
+        let output = max_slots
+            .saturating_mul(max_proposals)
+            .saturating_mul(12)
+            .max(64);
+        let upload = max_entry.saturating_mul(64).max(64);
+        let resources = CheckedGraphResources {
+            storage: seismic::NativeGraphStorageBytes {
+                workspace,
+                sync: 0,
+                output,
+                upload,
+                recorded: Default::default(),
+            },
+            graphs: seismic::LaunchGraphs::default(),
+            binding_constant_bytes: 0,
+            host_heap: seismic::HostHeap::default(),
+        };
+        return Ok((resources, std::collections::HashSet::new(), Default::default()));
+    }
     let split = DraftSplit::of(backend, load, plan, geometry)?;
     DraftFamilyComposition::evaluate(&split, &classes)
 }
@@ -4159,11 +4209,14 @@ fn correct_candidates<'a, G: GraphDraft + 'a>(
 
 type PreparedDraftGraph = DraftGraphParts<NativeGraphPlan>;
 
+use super::native_draft_rnn::{BoundRnnDraft, PreparedRnnDraft};
+
 pub struct PreparedDraftGraphs {
     classes: BTreeMap<DraftGraphClass, PreparedDraftGraph>,
     family: NativeGraphFamily,
     /// The block pass's visible spans.
     segments: u64,
+    dspark_rnn: Option<PreparedRnnDraft>,
 }
 
 pub(crate) struct BoundDraftGraphs {
@@ -4172,6 +4225,7 @@ pub(crate) struct BoundDraftGraphs {
     constants: Vec<Tensor>,
     /// The block embedding as the block's tokens gather it.
     embedding: crate::device_table::ResidentTable,
+    dspark_rnn: Option<BoundRnnDraft>,
 }
 
 impl PreparedDraftGraphs {
@@ -4200,6 +4254,26 @@ impl PreparedDraftGraphs {
             *target_device.properties(),
         ));
         let classes = classes.into_iter().collect::<Vec<_>>();
+        if is_rnn_dspark(geometry.draft) {
+            let hidden = geometry.definition.decoder.hidden;
+            let family = super::native_target_graph::block_attn_res::minimal_stream_join_family(
+                target_device,
+                hidden,
+            )
+            .map_err(invalid)?;
+            return Ok(Self {
+                classes: BTreeMap::new(),
+                family,
+                segments: geometry.segments,
+                dspark_rnn: Some(PreparedRnnDraft::new(
+                    target_device,
+                    geometry.draft.clone(),
+                    geometry.definition.decoder.active_vocabulary(),
+                    geometry.definition.decoder.hidden,
+                    geometry.layers.clone(),
+                )),
+            });
+        }
         let split = DraftSplit::of(target_device.backend(), load, plan, geometry)
             .map_err(|error| invalid(error.to_string()))?;
         let (resources, layouts) = certify_draft_family::<NativeGraphLayout>(&split, &classes)
@@ -4241,6 +4315,7 @@ impl PreparedDraftGraphs {
             classes: prepared,
             family,
             segments: geometry.segments,
+            dspark_rnn: None,
         })
     }
 
@@ -4258,6 +4333,16 @@ impl PreparedDraftGraphs {
         resident: &ResidentHead,
         bank: Option<&crate::experts::ExpertBank>,
     ) -> Result<BoundDraftGraphs, SubmitError> {
+        if let Some(prepared_rnn) = &self.dspark_rnn {
+            let bound_rnn = prepared_rnn.bind(charges, resident)?;
+            return Ok(BoundDraftGraphs {
+                prepared: self.clone(),
+                bound: BTreeMap::new(),
+                constants: Vec::new(),
+                embedding: resident.embedding.table().clone(),
+                dspark_rnn: Some(bound_rnn),
+            });
+        }
         let mut uploaded = ConstantTensors::new(charges);
         let mut bound = BTreeMap::new();
         for (class, graph) in &self.classes {
@@ -4327,6 +4412,7 @@ impl PreparedDraftGraphs {
             bound,
             constants: uploaded.into_tensors(),
             embedding: resident.embedding.table().clone(),
+            dspark_rnn: None,
         })
     }
 }
@@ -4552,6 +4638,21 @@ impl NativeDraftProgram {
             unallocating,
             waiter,
         })
+    }
+
+    /// Execute one Inkling 2 DSpark step on GPU via [`BoundRnnDraft`].
+    fn execute_rnn_dspark(
+        &self,
+        rnn: &BoundRnnDraft,
+        core: &HeadLaunchCore,
+    ) -> Result<HeadOutput, SubmitError> {
+        let slots = if core.batch().chain().next().is_some() {
+            row_class(core.batch().actual_slots())
+                .ok_or_else(|| invalid("draft slots have no class"))?
+        } else {
+            0
+        };
+        rnn.execute(core, &self.graphs.embedding, slots)
     }
 
     fn queue(
@@ -4998,6 +5099,23 @@ impl HeadProgram for NativeDraftProgram {
         &mut self,
         mut launch: ValidatedHeadLaunch,
     ) -> Result<Self::Submission, (SubmitError, ValidatedHeadLaunch)> {
+        if let Some(rnn) = &self.graphs.dspark_rnn {
+            let outcome = {
+                let (core, _, _) = launch.execution_parts_mut();
+                self.execute_rnn_dspark(rnn, core)
+            };
+            let output = match outcome {
+                Ok(out) => out,
+                Err(error) => return Err((error, launch)),
+            };
+            let (core, workspace, _) = launch.into_submission_parts();
+            return Ok(DeviceSubmission::new(
+                self.waiter.completion(Vec::new()),
+                core,
+                workspace,
+                output,
+            ));
+        }
         let queued = {
             let (core, workspace, output) = launch.execution_parts_mut();
             self.queue(core, workspace, output)
@@ -5143,7 +5261,7 @@ mod composition_tests {
         };
         let (mut definition, mut manifest) = crate::planning::fixtures::separate_draft_fixture(false);
         let hidden = definition.decoder.hidden;
-        let vocabulary = definition.decoder.vocabulary;
+        let vocabulary = definition.decoder.active_vocabulary();
         let template = definition.draft.as_ref().unwrap().blocks[0].clone();
         let rename_block = |layer: usize| {
             let mut block = template.clone();
@@ -5499,6 +5617,8 @@ mod composition_tests {
                             &[width, hidden],
                         ),
                         value: ValueSource::StoredKey,
+                        key_conv: None,
+                        value_conv: None,
                         key_norm: HeadNorm::Rms(rms(format!("{prefix}attn_kv_a_norm.weight"), width)),
                         value_norm: ValueNorm::None,
                         domain: TokenDomain::Window { tokens: 128 },
@@ -5506,12 +5626,13 @@ mod composition_tests {
                     }),
                 ))],
                 rotary: rotary.clone(),
+                relative_bias: None,
+                log_scale: None,
                 scale: (width as f64).powf(-0.5),
                 media_rows: MediaRowAttention::Causal,
-                sinks: Some(WeightDescriptor::stored(
-                    format!("{prefix}attn_sinks.weight"),
-                    &[heads],
-                )),
+                sinks: magnitude_family_contracts::AttentionSinks::Static(
+                    WeightDescriptor::stored(format!("{prefix}attn_sinks.weight"), &[heads]),
+                ),
                 output: OutputProjection::GroupedLowRank {
                     groups,
                     rank: o_rank,
@@ -5596,14 +5717,17 @@ mod composition_tests {
                     Sublayer {
                         input: site("attn", "attn_norm"),
                         op: Operator::Attention(Box::new(attention)),
+                        post_conv: None,
                         output: OutputForm::Scatter,
                     },
                     Sublayer {
                         input: site("ffn", "ffn_norm"),
                         op: Operator::RoutedFfn(Box::new(routed)),
+                        post_conv: None,
                         output: OutputForm::Scatter,
                     },
                 ],
+                transition: None,
             }
         };
 
@@ -5648,6 +5772,7 @@ mod composition_tests {
                         norm: Some(rms("output_norm.weight".into(), hidden)),
                     }),
                     output: WeightDescriptor::stored("output.weight", &[vocab, hidden]),
+                    unpadded_vocabulary: None,
                     softcap: None,
                 },
             },
@@ -5655,7 +5780,7 @@ mod composition_tests {
             vision: None,
             draft: Some(DraftDefinition {
                 method: DraftMethod::DSpark {
-                    markov: MarkovHead {
+                    markov: MarkovHead::Bilinear {
                         rank: markov_rank,
                         embedding: WeightDescriptor::stored(
                             "markov_w1.weight",
@@ -5666,31 +5791,34 @@ mod composition_tests {
                             &[vocab, markov_rank],
                         ),
                     },
-                    confidence: ConfidenceHead {
+                    confidence: Some(ConfidenceHead {
                         weight: WeightDescriptor::stored(
                             "conf_proj.weight",
                             &[1, hidden + markov_rank],
                         ),
                         bias: None,
-                    },
+                    }),
                 },
                 taps: vec![TapPoint::Sublayer(SublayerIndex {
                     block: 1,
                     sublayer: 0,
                 })],
-                fusion: WeightDescriptor::stored("fc.weight", &[hidden, hidden]),
-                fusion_norm: rms("enc.output_norm.weight".into(), hidden),
+                fusion: magnitude_family_contracts::DraftFusion::Linear {
+                    projection: WeightDescriptor::stored("fc.weight", &[hidden, hidden]),
+                    norm: rms("enc.output_norm.weight".into(), hidden),
+                },
                 embedding: DraftEmbedding::Target,
                 output: None,
                 embedding_scale: 1.0,
                 residual,
                 blocks: draft_blocks,
+                context_projections: None,
                 block_attention: vec![BlockAttention::Bidirectional; layers],
                 convolutions: None,
                 output_norm: rms("draft_output_norm.weight".into(), hidden),
                 logit_softcap: None,
                 block_size: 6,
-                mask_token: TokenId(42),
+                mask: magnitude_family_contracts::DraftMask::Token(TokenId(42)),
                 layout: BlockLayout::AnchorFirst,
             }),
         };

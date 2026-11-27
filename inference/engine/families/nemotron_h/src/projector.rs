@@ -215,6 +215,8 @@ pub fn describe_projector(
                 down: r.linear(&format!("{p}.ffn_down"), hidden, intermediate)?,
             },
             feedforward_post_norm: None,
+            ls1: None,
+            ls2: None,
         });
     }
 

@@ -976,8 +976,11 @@ fn a_separate_draft_reads_the_projection_as_it_is_stored() {
             method: DraftMethod::DFlash,
             convolutions: None,
             taps: vec![TapPoint::Exit],
-            fusion: WeightDescriptor::stored("draft_fusion", &[hidden, hidden]),
-            fusion_norm: norm("draft_fusion_norm"),
+            fusion: magnitude_family_contracts::DraftFusion::Linear {
+                projection: WeightDescriptor::stored("draft_fusion", &[hidden, hidden]),
+                norm: norm("draft_fusion_norm"),
+            },
+            context_projections: None,
             embedding: DraftEmbedding::Target,
             output: owns_output
                 .then(|| WeightDescriptor::stored("draft_output", &[vocabulary, hidden])),
@@ -988,7 +991,7 @@ fn a_separate_draft_reads_the_projection_as_it_is_stored() {
             output_norm: norm("draft_output_norm"),
             logit_softcap: Some(0.1),
             block_size: 2,
-            mask_token: TokenId(0),
+            mask: magnitude_family_contracts::DraftMask::Token(TokenId(0)),
             layout: BlockLayout::MaskSlots,
         });
         definition.validate().unwrap();
@@ -1428,6 +1431,7 @@ fn checked_vision_family_bounds_exact_patch_classes() {
                 output: linear("o", 128, 128),
             }),
             operator_post_norm: None,
+            ls1: None,
             feedforward_norm: layer_norm("ln2", 128),
             feedforward: VisionFeedForward {
                 up: VisionUp::Plain(linear("up", 128, 128)),
@@ -1435,6 +1439,7 @@ fn checked_vision_family_bounds_exact_patch_classes() {
                 down: linear("down", 128, 128),
             },
             feedforward_post_norm: None,
+            ls2: None,
         }],
         merger: VisionMerger {
             norm: Some(layer_norm("post", 128)),

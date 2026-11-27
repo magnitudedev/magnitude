@@ -760,8 +760,7 @@ impl GraphOutputTensor {
         &self.tensor
     }
 
-    #[cfg(test)]
-    pub(crate) fn from_test_tensor(tensor: Tensor) -> Self {
+    pub(crate) fn standalone(tensor: Tensor) -> Self {
         Self {
             tensor,
             claim: Rc::new(GraphOutputClaim {
@@ -770,6 +769,11 @@ impl GraphOutputTensor {
                 free: Rc::new(RefCell::new(Vec::new())),
             }),
         }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn from_test_tensor(tensor: Tensor) -> Self {
+        Self::standalone(tensor)
     }
 
     pub fn slice_leading(&self, start: u64, end: u64) -> Result<Self, seismic::TensorError> {

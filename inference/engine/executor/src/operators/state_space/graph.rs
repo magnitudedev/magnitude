@@ -443,6 +443,7 @@ mod tests {
                     norm_group: inner / GROUPS,
                     output: tensor(name("ssm_out"), vec![HIDDEN, inner]),
                 })),
+                post_conv: None,
                 output: OutputForm::Residual,
             }
         };
@@ -491,6 +492,7 @@ mod tests {
                         gate: SharedExpertGate::None,
                     }),
                 })),
+                post_conv: None,
                 output: OutputForm::Residual,
             }
         };
@@ -516,16 +518,21 @@ mod tests {
                             )),
                             key_norm: HeadNorm::None,
                             value_norm: ValueNorm::None,
+                            key_conv: None,
+                            value_conv: None,
                             domain: TokenDomain::Token,
                             rounding: RowRounding::None,
                         }),
                     ))],
                     rotary: Rotary::None,
+                    relative_bias: None,
                     scale: 1.0 / 128f64.sqrt(),
+                    log_scale: None,
                     media_rows: MediaRowAttention::Causal,
-                    sinks: None,
+                    sinks: magnitude_family_contracts::AttentionSinks::None,
                     output: OutputProjection::Full(tensor(name("attn_output"), vec![HIDDEN, 512])),
                 })),
+                post_conv: None,
                 output: OutputForm::Residual,
             }
         };
@@ -533,12 +540,15 @@ mod tests {
         let [first_dense, second_dense] = feed_forwards;
         let blocks = vec![
             Block {
+                transition: None,
                 sublayers: vec![lone],
             },
             Block {
+                transition: None,
                 sublayers: vec![paired, first_dense],
             },
             Block {
+                transition: None,
                 sublayers: vec![attention, second_dense],
             },
         ];
@@ -569,6 +579,7 @@ mod tests {
                 exit: ExitForm {
                     norm: ExitNorm::Rms(rms(output_norm)),
                     output,
+                    unpadded_vocabulary: None,
                     softcap: None,
                 },
             },

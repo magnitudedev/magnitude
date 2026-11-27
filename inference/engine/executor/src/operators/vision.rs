@@ -32,6 +32,9 @@ pub enum VisionEntry {
     Position,
     /// The decoder's sandwich-norm tail (`post_norm_residual`).
     PostNormResidual,
+    /// F32 residual add (`stream_join` with `SN = 1, IN = 0`), used after
+    /// LayerScale (`ls1` / `ls2`).
+    ResidualAdd,
 }
 
 /// One specialization of a vision entry: its element bindings and the static
@@ -236,7 +239,8 @@ pub enum VisionOperands<R = f32> {
     },
     Pool {
         source: VisionValue,
-        standard: Option<(WeightRole, WeightRole)>,
+        rows: VisionRows,
+        standard: Option<(Option<WeightRole>, WeightRole)>,
         weight: R,
         scale: R,
     },
@@ -256,6 +260,10 @@ pub enum VisionOperands<R = f32> {
         projected: VisionValue,
         norm: WeightRole,
         epsilon: R,
+    },
+    ResidualAdd {
+        residual: VisionValue,
+        branch: VisionValue,
     },
 }
 
@@ -308,14 +316,17 @@ impl<R> Numbers<R> for VisionOperands<R> {
                 }
             }
             Self::GatedConvolution { value, gate, kernel } => VisionOperands::GatedConvolution { value, gate, kernel },
-            Self::Pool { source, standard, weight, scale } => {
+            Self::Pool { source, rows, standard, weight, scale } => {
                 let weight = f(weight);
-                VisionOperands::Pool { source, standard, weight, scale: f(scale) }
+                VisionOperands::Pool { source, rows, standard, weight, scale: f(scale) }
             }
             Self::Position { source, table } => VisionOperands::Position { source, table },
             Self::Registers { source, table } => VisionOperands::Registers { source, table },
             Self::PostNormResidual { residual, projected, norm, epsilon } => {
                 VisionOperands::PostNormResidual { residual, projected, norm, epsilon: f(epsilon) }
+            }
+            Self::ResidualAdd { residual, branch } => {
+                VisionOperands::ResidualAdd { residual, branch }
             }
         }
     }
@@ -341,11 +352,13 @@ impl<R> VisionOperands<R> {
                 query_norm.iter().chain(key_norm).copied().collect()
             }
             Self::GatedConvolution { kernel, .. } => vec![*kernel],
-            Self::Pool { standard, .. } => {
-                standard.iter().flat_map(|&(bias, scale)| [bias, scale]).collect()
-            }
+            Self::Pool { standard, .. } => standard
+                .iter()
+                .flat_map(|&(bias, scale)| bias.into_iter().chain(std::iter::once(scale)))
+                .collect(),
             Self::Position { table, .. } | Self::Registers { table, .. } => vec![*table],
             Self::PostNormResidual { norm, .. } => vec![*norm],
+            Self::ResidualAdd { .. } => Vec::new(),
         }
     }
 
@@ -640,6 +653,41 @@ impl Builder<'_> {
         ))
     }
 
+    /// `residual + gamma ⊙ projected` (LayerScale residual add in F32).
+    fn layer_scale_residual(
+        &mut self,
+        residual: VisionValue,
+        projected: VisionValue,
+        width: u64,
+        gamma: WeightRole,
+    ) -> Result<VisionValue, PlanError> {
+        let elements = vec![("SB", Element::f32()), ("SS", self.element(Some(gamma))?)];
+        let statics = vec![("G", 1), ("H", width), ("NS", 1)];
+        let scaled = self.push(
+            VisionEntry::Pool,
+            elements,
+            statics,
+            width,
+            VisionOperands::Pool {
+                source: projected,
+                rows: VisionRows::Patches,
+                standard: Some((None, gamma)),
+                weight: 1.0,
+                scale: 1.0,
+            },
+        );
+        Ok(self.push(
+            VisionEntry::ResidualAdd,
+            Vec::new(),
+            vec![("H", width), ("SN", 1), ("IN", 0)],
+            width,
+            VisionOperands::ResidualAdd {
+                residual,
+                branch: scaled,
+            },
+        ))
+    }
+
     /// `C ⊙ conv(B ⊙ X)` of `normalized`: the gated input published by the
     /// value projection's gate epilogue, the output gate, then the
     /// convolution.
@@ -878,8 +926,8 @@ impl Builder<'_> {
                 VisionLinearSite::ConvolutionOutput,
             ),
         };
-        let h = match &block.operator_post_norm {
-            None => self.linear(
+        let h = match (&block.operator_post_norm, &block.ls1) {
+            (None, None) => self.linear(
                 mixed,
                 patches,
                 inner,
@@ -889,7 +937,25 @@ impl Builder<'_> {
                 f32e,
                 Epilogue { tail: LinearTail::Residual(h), limit: None },
             )?,
-            Some(norm) => {
+            (None, Some(_)) => {
+                let projected = self.linear(
+                    mixed,
+                    patches,
+                    inner,
+                    output,
+                    scope,
+                    site,
+                    f32e,
+                    Epilogue::default(),
+                )?;
+                self.layer_scale_residual(
+                    h,
+                    projected,
+                    hidden,
+                    role(scope, VisionWeight::OperatorLayerScale),
+                )?
+            }
+            (Some(norm), None) => {
                 let projected = self.linear(
                     mixed,
                     patches,
@@ -909,6 +975,11 @@ impl Builder<'_> {
                     VisionNormSite::OperatorOutput,
                 )?
             }
+            (Some(_), Some(_)) => {
+                return Err(unsupported(
+                    "vision block with both post-norm and LayerScale",
+                ));
+            }
         };
         let feedforward = &block.feedforward;
         let intermediate = feedforward.intermediate();
@@ -926,8 +997,8 @@ impl Builder<'_> {
             None,
         )?;
         let up = self.feed_forward_up(normalized, patches, hidden, feedforward, scope)?;
-        Ok(match &block.feedforward_post_norm {
-            None => self.linear(
+        Ok(match (&block.feedforward_post_norm, &block.ls2) {
+            (None, None) => self.linear(
                 up,
                 patches,
                 intermediate,
@@ -937,7 +1008,25 @@ impl Builder<'_> {
                 f32e,
                 Epilogue { tail: LinearTail::Residual(h), limit: None },
             )?,
-            Some(norm) => {
+            (None, Some(_)) => {
+                let projected = self.linear(
+                    up,
+                    patches,
+                    intermediate,
+                    &feedforward.down,
+                    scope,
+                    VisionLinearSite::Down,
+                    f32e,
+                    Epilogue::default(),
+                )?;
+                self.layer_scale_residual(
+                    h,
+                    projected,
+                    hidden,
+                    role(scope, VisionWeight::FeedForwardLayerScale),
+                )?
+            }
+            (Some(norm), None) => {
                 let projected = self.linear(
                     up,
                     patches,
@@ -956,6 +1045,11 @@ impl Builder<'_> {
                     scope,
                     VisionNormSite::FeedForwardOutput,
                 )?
+            }
+            (Some(_), Some(_)) => {
+                return Err(unsupported(
+                    "vision block with both post-norm and LayerScale",
+                ));
             }
         })
     }
@@ -1289,7 +1383,8 @@ pub(crate) fn vision_program(
                 hidden,
                 VisionOperands::Pool {
                     source: patch_rows(h),
-                    standard,
+                    rows: VisionRows::Cells,
+                    standard: standard.map(|(bias, scale)| (Some(bias), scale)),
                     weight: (1.0 / cell_rows as f64) as f32,
                     scale: scale as f32,
                 },

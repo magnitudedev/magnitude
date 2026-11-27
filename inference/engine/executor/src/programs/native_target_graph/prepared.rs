@@ -43,11 +43,11 @@ use crate::{
 use magnitude_family_contracts::{
     ActivationFunction, Decoder, DenseFfn, ExitNorm, GateFunction, HeadNorm, HeadWeights, Indexer,
     IndexerInput, IndexerKeys, NGramGate, NGramMedia, Pool, PoolNorm, RecurrentHeadMapping, Rotary,
-    RouteNormalization, RowRounding, SublayerIndex, TapPoint, WeightKind, WeightScope,
+    RouteNormalization, RowRounding, SublayerIndex, TapPoint, WeightKind, WeightRole, WeightScope,
 };
 use magnitude_kernels::selection_notice;
 use magnitude_state::{CodecSpec, ComponentSpec, LayerRef};
-use seismic::{Device, Element, HostHeap, NativeGraphFamily};
+use seismic::{Device, Element, HostHeap, NativeGraphFamily, NativePort};
 use std::{cell::RefCell, collections::BTreeMap, rc::Rc, sync::Arc, time::Instant};
 
 #[derive(Clone)]
@@ -101,6 +101,9 @@ pub struct PreparedTargetGraphs {
     /// The passes a group runs (`group_pass_rows`).
     pub(super) passes: Passes,
     seal: SealReport,
+    /// Prepared `ResidualForm::BlockAttention` executor when the target uses
+    /// Block Attention Residuals (Inkling 2); `None` for standard sealed graphs.
+    pub(super) block_attn_res: Option<Arc<super::block_attn_res::PreparedBlockAttnRes>>,
 }
 
 /// Sealing cost of a graph set: shape classes, graphs actually sealed after
@@ -676,7 +679,7 @@ fn dense_shape_key(dense: &DenseFfn) -> DenseShapeKey {
     DenseShapeKey {
         intermediate: dense.intermediate,
         activation: dense.up.activation(),
-        limit: dense.up.limit().map(|limit| f64::from(limit).to_bits()),
+        limit: dense.up.limit().map(|limit| operators::glu_limit_word(Some(limit))),
     }
 }
 
@@ -755,6 +758,7 @@ fn block_geometry_shape<'a>(
                     };
                     let query_norm_epsilon = match &read.indexer.query.norm {
                         HeadNorm::Rms(norm) => Some(norm.epsilon.to_bits()),
+                        HeadNorm::L2Clip { epsilon, .. } => Some(epsilon.to_bits()),
                         HeadNorm::None => None,
                     };
                     Ok(SelectionShapeKey {
@@ -1032,13 +1036,33 @@ impl PreparedTargetGraphs {
     pub fn binding_constant_bytes(&self) -> Result<u64, String> {
         let floor = self.group_extents(1);
         let (group, pass, notice) = (floor.bytes()?, floor.pass_bytes()?, notice_bytes(self.notice_rows)?);
-        distinct_storage_bytes(self.blocks_by_class.iter().flat_map(|graphs| {
-            let runs = graphs.runs.iter().flat_map(|(_, graph)| graph.constants.iter());
-            runs.chain(graphs.passes.iter().flat_map(|(_, graph)| graph.constants.iter()))
-        }))?
+        let bar_prefill_bytes = match &self.block_attn_res {
+            Some(bar) => {
+                let exts = super::block_attn_res_graph::BarStepBuffers::extents(
+                    bar.schedule.max_sources,
+                    bar.schedule.max_bank,
+                    self.passes.region,
+                    bar.hidden,
+                );
+                super::extents_bytes(exts.iter())?
+                    .checked_mul(self.passes.launches as u64)
+                    .ok_or_else(|| "BlockAttnRes prefill buffers overflow".to_string())?
+            }
+            None => 0,
+        };
+        distinct_storage_bytes(
+            self.entries
+                .values()
+                .flat_map(|entry| entry.constants.iter())
+                .chain(self.blocks_by_class.iter().flat_map(|graphs| {
+                    let runs = graphs.runs.iter().flat_map(|(_, graph)| graph.constants.iter());
+                    runs.chain(graphs.passes.iter().flat_map(|(_, graph)| graph.constants.iter()))
+                })),
+        )?
         .checked_add(group)
         .and_then(|bytes| bytes.checked_add(pass))
         .and_then(|bytes| bytes.checked_add(notice))
+        .and_then(|bytes| bytes.checked_add(bar_prefill_bytes))
         .ok_or_else(|| "target binding charge overflows".into())
     }
 
@@ -1050,7 +1074,66 @@ impl PreparedTargetGraphs {
     /// The bytes a prompt group of `places` places' own buffers hold beside
     /// the floor's (`GroupRows::group_bytes`).
     pub(crate) fn group_bytes(&self, places: usize) -> Result<u64, String> {
-        self.group.group_bytes(&self.served, places)
+        let base = self.group.group_bytes(&self.served, places)?;
+        if places <= 1 {
+            return Ok(base);
+        }
+        let bar_group_bytes = match &self.block_attn_res {
+            Some(bar) => {
+                let exts = super::block_attn_res_graph::BarStepBuffers::extents(
+                    bar.schedule.max_sources,
+                    bar.schedule.max_bank,
+                    self.passes.region,
+                    bar.hidden,
+                );
+                let slot_bytes = super::extents_bytes(exts.iter())?;
+                let mut split_bytes = 0u64;
+                if self.passes.region > 0 {
+                    use crate::operators::routed::split::{Crossing, Merged};
+                    let rows_dim = seismic::Dim::from(self.passes.region);
+                    for (split_layer, split_form) in &bar.split_shapes {
+                        let split_layer_dim = crate::programs::graph::facts::constant(split_layer.clone());
+                        let crossing_ext = Crossing::at(split_form, &split_layer_dim, &rows_dim);
+                        let mut one_crossing = 0u64;
+                        for (elem, dims) in crossing_ext.iter() {
+                            let shape: Vec<u64> = dims.iter().map(seismic::Dim::fixed).collect();
+                            let b = super::extents_bytes(std::iter::once(&(*elem, shape)))?;
+                            one_crossing = one_crossing
+                                .checked_add(b)
+                                .ok_or_else(|| "BlockAttnRes crossing bytes overflow".to_string())?;
+                        }
+                        let all_crossings = one_crossing
+                            .checked_mul(places as u64)
+                            .ok_or_else(|| "BlockAttnRes crossing bytes overflow".to_string())?;
+                        let merged_ext = Merged::at(split_form, &split_layer_dim, &rows_dim)?;
+                        let mut one_merged = 0u64;
+                        for (elem, dims) in [&merged_ext.experts, &merged_ext.inverse, &merged_ext.table] {
+                            let shape: Vec<u64> = dims.iter().map(seismic::Dim::fixed).collect();
+                            let b = super::extents_bytes(std::iter::once(&(*elem, shape)))?;
+                            one_merged = one_merged
+                                .checked_add(b)
+                                .ok_or_else(|| "BlockAttnRes merged bytes overflow".to_string())?;
+                        }
+                        split_bytes = split_bytes
+                            .checked_add(all_crossings)
+                            .and_then(|v| v.checked_add(one_merged))
+                            .ok_or_else(|| "BlockAttnRes split bytes overflow".to_string())?;
+                    }
+                }
+                // Reserve 2 step-equivalents for lazy `BoundBarFamily` prefill
+                // + tail workspace slots, plus exact crossing/merged buffers
+                // and CUDA allocator slab + fused-weight headroom so admission
+                // reclaims enough 64 MiB slabs on tight-VRAM GPUs (e.g. 12 GB).
+                slot_bytes
+                    .checked_mul(2)
+                    .and_then(|v| v.checked_add(split_bytes))
+                    .and_then(|v| v.checked_add(576 << 20))
+                    .ok_or_else(|| "BlockAttnRes group bytes overflow".to_string())?
+            }
+            None => 0,
+        };
+        base.checked_add(bar_group_bytes)
+            .ok_or_else(|| "BlockAttnRes group bytes overflow".into())
     }
 
     /// `notice`: the selection notice of a load that has one; `landing`: the
@@ -1091,6 +1174,156 @@ impl PreparedTargetGraphs {
         let _sizing = crate::programs::graph::sizing::SizingScope::enter_with_device(Some(
             *device.properties(),
         ));
+        if matches!(
+            geometry.residual,
+            magnitude_family_contracts::ResidualForm::BlockAttention { .. }
+        ) {
+            let started = Instant::now();
+            let tap_points = plan
+                .taps()
+                .map(|t| t.points.clone())
+                .unwrap_or_default();
+            let row_classes: Vec<u64> = magnitude_batching::row_classes(limits.max_launch_rows)
+                .into_iter()
+                .map(|c| c as u64)
+                .collect();
+            let prepared_bar = super::block_attn_res::PreparedBlockAttnRes::prepare_from_load(
+                device,
+                load,
+                geometry,
+                handles,
+                &row_classes,
+                tap_points,
+            )?;
+            let max_rows = limits.max_launch_rows as u64;
+            let tap_count = plan.taps().map_or(0, |t| t.points.len() as u64);
+            let taps_spec = (tap_count > 0).then(|| {
+                (
+                    Element::dense(crate::planning::activation_dtype(geometry.activation_dtype)),
+                    [max_rows, tap_count * geometry.hidden],
+                )
+            });
+            let group = GroupRows {
+                taps: taps_spec,
+                per_layer: None,
+                tokens: None,
+                guesses: load.fronts_target().then_some([max_rows, 2]),
+                operand_carry: None,
+                picked: super::PickedBuffers::default(),
+                max_segments: 0,
+                region_rows: max_rows,
+            };
+            let served = (0..geometry.blocks.len())
+                .map(|index| BlockServed {
+                    form: super::classes::ServedForm {
+                        streams: load.expert_bank().is_some_and(|b| {
+                            b.layer(WeightScope::TargetSublayer(SublayerIndex {
+                                block: index as u32,
+                                sublayer: 1,
+                            }))
+                            .is_some()
+                        }),
+                        resident: load.expert_bank().is_some_and(|b| b.resident),
+                        split: false,
+                    },
+                    split: None,
+                })
+                .collect();
+            let passes = Passes {
+                region: max_rows,
+                launches: pass.get(),
+            };
+            let notice_entry = match load.copies_token_rows() {
+                true => Some(notice.ok_or("a load copying token rows without the copy entry")?),
+                false => None,
+            };
+            let mut entries = BTreeMap::new();
+            for &rows in &row_classes {
+                for source in [EntryTokens::Uploaded, EntryTokens::Selected] {
+                    let entry = PreparedTargetEntryGraph::prepare(
+                        device,
+                        &handles.embedding,
+                        handles.entry_norm.as_ref(),
+                        notice_entry,
+                        landing,
+                        load,
+                        geometry,
+                        rows,
+                        source,
+                        None,
+                    )?;
+                    entries.insert((rows, source), entry);
+                }
+            }
+            let family = prepared_bar.minimal_family(device, geometry.hidden, &entries)?;
+            let seal = SealReport {
+                classes: 0,
+                sealed_graphs: entries.len(),
+                seconds: started.elapsed().as_secs_f64(),
+                planned: PlannedSealedGraphs::default(),
+                heap: HostHeap::default(),
+                storage: HostHeap::default(),
+                owned: HostHeap::default(),
+                constants: HostHeap::default(),
+            };
+            let max_output_bytes = max_rows
+                .saturating_mul(geometry.hidden)
+                .saturating_mul(4)
+                .max(entries.values().map(|e| e.plan.output_bytes()).max().unwrap_or(0));
+            let entry_upload_bytes = entries
+                .values()
+                .map(|e| e.plan.upload_bytes())
+                .max()
+                .unwrap_or(0)
+                .max(max_rows.saturating_mul(64))
+                .max(1);
+            // One upload region for the entry graph plus one per streamed routed
+            // block whose decode or grouped-front stage writes `step_inputs`.
+            let mut upload_regions = vec![entry_upload_bytes];
+            for block in prepared_bar.streamed_routed.values() {
+                let stage_upload = block
+                    .decode
+                    .values()
+                    .map(|s| s.plan.upload_bytes())
+                    .chain(block.grouped.values().map(|(f, _, _)| f.plan.upload_bytes()))
+                    .max()
+                    .unwrap_or(0);
+                if stage_upload > 0 {
+                    upload_regions.push(stage_upload);
+                }
+            }
+            return Ok(Self {
+                entries,
+                blocks_by_class: Vec::new(),
+                listings: Vec::new(),
+                controls: LaunchControlLayout {
+                    padded: Vec::new(),
+                    picked: Vec::new(),
+                    units: Vec::new(),
+                    max_segments: 1,
+                    region_bytes: 0,
+                },
+                windows: 0,
+                upload_regions,
+                max_segments: 1,
+                keeps: Vec::new(),
+                stage_axes: super::classes::StageAxes::new(Vec::new()),
+                untapped_rows: 0,
+                selections: vec![None; geometry.blocks.len()],
+                family,
+                max_output_bytes,
+                taps: vec![BlockTaps::default(); geometry.blocks.len()],
+                pooled: vec![None; geometry.blocks.len()],
+                stateless_tail: geometry.blocks.len(),
+                per_layer_entries: BTreeMap::new(),
+                notice_rows: notice_rows(load, max_rows),
+                group,
+                served,
+                passes,
+                seal,
+                block_attn_res: Some(Arc::new(prepared_bar)),
+            });
+        }
         let certificate =
             certify_target_family::<seismic::NativeGraphLayout>(
                 device.backend(),
@@ -1161,13 +1394,14 @@ impl PreparedTargetGraphs {
                 let entry = PreparedTargetEntryGraph::prepare(
                     device,
                     &handles.embedding,
+                    handles.entry_norm.as_ref(),
                     notice,
                     landing,
                     load,
                     geometry,
                     rows,
                     source,
-                    layout,
+                    Some(layout),
                 )?;
                 sealed_graphs += 1;
                 held.seal(&entry.plan, layout, || {
@@ -1580,6 +1814,7 @@ impl PreparedTargetGraphs {
             served,
             passes,
             seal,
+            block_attn_res: None,
         })
     }
 
@@ -1714,6 +1949,90 @@ impl PreparedTargetGraphs {
         charges: &seismic::Charges,
         resident: &ResidentTarget,
     ) -> Result<BoundTargetGraphs, String> {
+        if let Some(prepared_bar) = &self.block_attn_res {
+            let bound_bar = super::block_attn_res::BoundBlockAttnRes::bind(
+                Arc::clone(prepared_bar),
+                charges,
+                resident,
+                self.passes.region,
+                self.passes.launches,
+            )?;
+            let embedding = resident.embedding.table().clone();
+            let direct = seismic::Tensor::from_host(
+                charges,
+                Element::i32(),
+                &[0, 1],
+                &[],
+            )
+            .map_err(|error| error.to_string())?;
+            let mut constants = ConstantTensors::new(charges);
+            let mut entry_bound = BTreeMap::new();
+            for (key, entry) in &self.entries {
+                let directory = match (key.1, embedding.directory()) {
+                    (EntryTokens::Selected, Some(directory)) => directory,
+                    _ => &direct,
+                };
+                let entry_norm_tensor = entry
+                    .entry_norm
+                    .as_ref()
+                    .map(|port| {
+                        let role = WeightRole {
+                            scope: WeightScope::Target,
+                            kind: WeightKind::EntryNorm,
+                        };
+                        resident
+                            .sublayers
+                            .get(role)
+                            .map(|weight| (port, weight.tensor()))
+                            .map_err(|error| format!("missing resident weight {role:?}: {error}"))
+                    })
+                    .transpose()?;
+                let bound_constants = entry
+                    .constants
+                    .iter()
+                    .map(|constant| Ok::<_, String>((constant.port(), constants.tensor(constant)?)))
+                    .collect::<Result<Vec<_>, String>>()?;
+                let mut fixed: Vec<(&NativePort, &seismic::Tensor)> = vec![
+                    (&entry.table, resident.embedding.tensor()),
+                    (&entry.directory, directory),
+                ];
+                if let Some((port, tensor)) = entry_norm_tensor {
+                    fixed.push((port, tensor));
+                }
+                for (port, tensor) in &bound_constants {
+                    fixed.push((*port, tensor));
+                }
+                entry_bound.insert(
+                    *key,
+                    entry
+                        .plan
+                        .bind_static(charges, &fixed)
+                        .map_err(|error| format!("target embedding graph class {key:?}: {error}"))?,
+                );
+            }
+            let notice = self
+                .notice_rows
+                .map(|rows| SelectionNotice::new(charges, rows))
+                .transpose()?;
+            let floor = Rc::new(
+                GroupBuffers::new(self, charges, 1, None).map_err(|e| e.to_string())?,
+            );
+            return Ok(BoundTargetGraphs {
+                prepared: self.clone(),
+                entry_bound,
+                bound: Vec::new(),
+                constants: constants.into_tensors(),
+                per_layer: None,
+                pass: None,
+                floor,
+                held: RefCell::new(None),
+                embedding,
+                stored: BTreeMap::new(),
+                notice,
+                bank: resident.bank.clone(),
+                block_attn_res: Some(Arc::new(bound_bar)),
+            });
+        }
         // Only a load whose blocks stream their experts holds graphs of bank
         // parts and parks, which each run of a step of its bank binds
         // (`BankRun`); a bank is held exactly there.
@@ -1728,16 +2047,43 @@ impl PreparedTargetGraphs {
             &[],
         )
         .map_err(|error| error.to_string())?;
+        let mut constants = ConstantTensors::new(charges);
         let mut entry_bound = BTreeMap::new();
         for (key, entry) in &self.entries {
             let directory = match (key.1, embedding.directory()) {
                 (EntryTokens::Selected, Some(directory)) => directory,
                 _ => &direct,
             };
-            let fixed = [
+            let entry_norm_tensor = entry
+                .entry_norm
+                .as_ref()
+                .map(|port| {
+                    let role = WeightRole {
+                        scope: WeightScope::Target,
+                        kind: WeightKind::EntryNorm,
+                    };
+                    resident
+                        .sublayers
+                        .get(role)
+                        .map(|weight| (port, weight.tensor()))
+                        .map_err(|error| format!("missing resident weight {role:?}: {error}"))
+                })
+                .transpose()?;
+            let bound_constants = entry
+                .constants
+                .iter()
+                .map(|constant| Ok::<_, String>((constant.port(), constants.tensor(constant)?)))
+                .collect::<Result<Vec<_>, _>>()?;
+            let mut fixed: Vec<(&NativePort, &seismic::Tensor)> = vec![
                 (&entry.table, resident.embedding.tensor()),
                 (&entry.directory, directory),
             ];
+            if let Some((port, tensor)) = entry_norm_tensor {
+                fixed.push((port, tensor));
+            }
+            for (port, tensor) in &bound_constants {
+                fixed.push((*port, tensor));
+            }
             entry_bound.insert(
                 *key,
                 entry
@@ -1746,7 +2092,6 @@ impl PreparedTargetGraphs {
                     .map_err(|error| format!("target embedding graph class {key:?}: {error}"))?,
             );
         }
-        let mut constants = ConstantTensors::new(charges);
         let mut bound = Vec::with_capacity(self.blocks_by_class.len());
         if resident.blocks != self.blocks_by_class.len() {
             return Err("resident target blocks disagree with the prepared graphs".into());
@@ -1843,6 +2188,7 @@ impl PreparedTargetGraphs {
             stored,
             notice,
             bank: resident.bank.clone(),
+            block_attn_res: None,
         };
         // A binding that holds another heap than the plan counted is a
         // defect of the plan's accounting, which refuses the load.

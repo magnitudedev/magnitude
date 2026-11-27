@@ -441,8 +441,11 @@ impl Calibration {
         layer: usize,
     ) {
         assert!(form != Form::Prompt, "log_decode called with Form::Prompt");
+        // Looped architectures (e.g. Inkling 2 Mini) visit the same physical
+        // expert stack multiple times within a single decode step, so equal
+        // step numbers are valid; only strictly decreasing steps are out of order.
         assert!(
-            self.latest_decode_step.is_none_or(|prev| step > prev),
+            self.latest_decode_step.is_none_or(|prev| step >= prev),
             "decode step {step} logged out of order after {:?}",
             self.latest_decode_step
         );

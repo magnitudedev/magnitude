@@ -158,11 +158,15 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
                     )),
                     None => None,
                 };
+                let mask_token_id = match &draft.mask {
+                    magnitude_family_contracts::DraftMask::Token(token) => token.0,
+                    magnitude_family_contracts::DraftMask::Learned(_) => 0,
+                };
                 block.push(Row {
                     token: if row == 0 {
                         i32::try_from(anchor.0).map_err(|_| "draft token exceeds i32")?
                     } else {
-                        i32::try_from(draft.mask_token.0).map_err(|_| "mask token exceeds i32")?
+                        i32::try_from(mask_token_id).map_err(|_| "mask token exceeds i32")?
                     },
                     coordinates: coordinates(row_position)?,
                     histories,

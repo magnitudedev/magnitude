@@ -173,12 +173,14 @@ pub fn inspect_assistant(draft: &Directory, target: &ModelDefinition) -> Result<
                         shape.rms(b.bind(&format!("{p}ffn_norm.weight"), &[width])?),
                     ),
                     op: dense(&mut b, &p, width, feed_forward[index])?,
+                    post_conv: None,
                     output: OutputForm::ScaledPostNorm {
                         norm: shape.rms(b.bind(&format!("{p}post_ffw_norm.weight"), &[width])?),
                         layer_scale: b.bind(&format!("{p}layer_output_scale.weight"), &[1])?,
                     },
                 },
             ],
+            transition: None,
         });
     }
     m.finish()?;

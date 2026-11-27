@@ -10,24 +10,45 @@ use super::{FeedForward, Mixer, PairedBlock, paired_block, role, sublayer_weight
 use crate::error::PlanError;
 use magnitude_family_contracts::{
     AffinePart, AttentionGate, Block, CorrectorSite, CorrectorWeight, DraftDefinition,
-    DraftEmbedding, DraftMethod, HeadHistory, HyperConnectionMixing, ModelDefinition, OutputForm,
-    ProjectedRows, ResidualForm, SublayerIndex, TapPoint, ValueSource, WeightDescriptor,
-    WeightKind, WeightRole, WeightScope,
+    DraftEmbedding, DraftFusion, DraftMask, DraftMethod, HeadHistory, HeadNorm,
+    HyperConnectionMixing, MarkovHead, ModelDefinition, OutputForm, ProjectedRows, ResidualForm,
+    SublayerIndex, TapPoint, ValueSource, WeightDescriptor, WeightKind, WeightRole, WeightScope,
 };
 
-/// The draft weights a target step reads: the fusion projection and the
-/// fusion norm.
-pub(crate) fn fusion_weights(draft: &DraftDefinition) -> [(WeightRole, &WeightDescriptor); 2] {
-    [
-        (
-            role(WeightScope::Draft, WeightKind::DraftFusion),
-            &draft.fusion,
-        ),
-        (
-            role(WeightScope::Draft, WeightKind::DraftFusionNorm),
-            &draft.fusion_norm.weight,
-        ),
-    ]
+/// The draft weights a target step reads: the fusion projection (or softmax
+/// mix weights) and the fusion norm(s).
+pub(crate) fn fusion_weights(draft: &DraftDefinition) -> Vec<(WeightRole, &WeightDescriptor)> {
+    match &draft.fusion {
+        DraftFusion::Linear { projection, norm } => vec![
+            (role(WeightScope::Draft, WeightKind::DraftFusion), projection),
+            (
+                role(WeightScope::Draft, WeightKind::DraftFusionNorm),
+                &norm.weight,
+            ),
+        ],
+        DraftFusion::SoftmaxMix { weights, norms } => {
+            let mut out = Vec::with_capacity(1 + norms.len());
+            out.push((role(WeightScope::Draft, WeightKind::DraftFusion), weights));
+            // Per-layer fusion norms live in `DraftSublayer(block, 0)` (and the
+            // extra `f_rnn` norm, when present, in `WeightScope::Draft`).
+            let layer_count = draft.blocks.len();
+            for (index, norm) in norms.iter().enumerate() {
+                if index < layer_count {
+                    let scope = WeightScope::DraftSublayer(SublayerIndex {
+                        block: u32::try_from(index).expect("draft block index fits u32"),
+                        sublayer: 0,
+                    });
+                    out.push((role(scope, WeightKind::DraftFusionNorm), &norm.weight));
+                } else {
+                    out.push((
+                        role(WeightScope::Draft, WeightKind::DraftFusionNorm),
+                        &norm.weight,
+                    ));
+                }
+            }
+            out
+        }
+    }
 }
 
 /// Every drafter weight of a draft (all but its fusion), in model order.
@@ -37,6 +58,9 @@ pub(crate) fn draft_weights(
     let mut weights = Vec::new();
     if let DraftEmbedding::Own(table) = &draft.embedding {
         weights.push((role(WeightScope::Draft, WeightKind::Embedding), table));
+    }
+    if let DraftMask::Learned(mask) = &draft.mask {
+        weights.push((role(WeightScope::Draft, WeightKind::DraftMaskEmbedding), mask));
     }
     if let Some(output) = &draft.output {
         weights.push((role(WeightScope::Draft, WeightKind::Output), output));
@@ -57,6 +81,28 @@ pub(crate) fn draft_weights(
             );
         }
     }
+    if let Some(context_projections) = &draft.context_projections {
+        for (block, ctx) in context_projections.iter().enumerate() {
+            let scope = WeightScope::DraftSublayer(SublayerIndex {
+                block: u32::try_from(block)
+                    .map_err(|_| PlanError::Arithmetic("draft block index"))?,
+                sublayer: 0,
+            });
+            weights.push((role(scope, WeightKind::DraftContextKey), &ctx.key));
+            weights.push((role(scope, WeightKind::DraftContextValue), &ctx.value));
+            match &ctx.key_norm {
+                HeadNorm::Rms(norm) => {
+                    weights.push((role(scope, WeightKind::DraftContextKeyNorm), &norm.weight));
+                }
+                HeadNorm::L2Clip {
+                    scale: Some(scale), ..
+                } => {
+                    weights.push((role(scope, WeightKind::DraftContextKeyNorm), scale));
+                }
+                HeadNorm::L2Clip { scale: None, .. } | HeadNorm::None => {}
+            }
+        }
+    }
     weights.push((
         role(WeightScope::Draft, WeightKind::OutputNorm),
         &draft.output_norm.weight,
@@ -64,14 +110,41 @@ pub(crate) fn draft_weights(
     // DSpark's confidence head is never evaluated (the service threshold is
     // zero), so no entry reads its weights and they are not imported.
     if let DraftMethod::DSpark { markov, .. } = &draft.method {
-        weights.push((
-            role(WeightScope::Draft, WeightKind::MarkovEmbedding),
-            &markov.embedding,
-        ));
-        weights.push((
-            role(WeightScope::Draft, WeightKind::MarkovProjection),
-            &markov.projection,
-        ));
+        match markov {
+            MarkovHead::Bilinear {
+                embedding,
+                projection,
+                ..
+            } => {
+                weights.push((role(WeightScope::Draft, WeightKind::MarkovEmbedding), embedding));
+                weights.push((
+                    role(WeightScope::Draft, WeightKind::MarkovProjection),
+                    projection,
+                ));
+            }
+            MarkovHead::RnnHidden(rnn) => {
+                weights.push((
+                    role(WeightScope::Draft, WeightKind::MarkovEmbedding),
+                    &rnn.embedding,
+                ));
+                weights.push((
+                    role(WeightScope::Draft, WeightKind::MarkovRnnWeight),
+                    &rnn.rnn_proj.weight,
+                ));
+                weights.push((
+                    role(WeightScope::Draft, WeightKind::MarkovRnnBias),
+                    &rnn.rnn_proj.bias,
+                ));
+                weights.push((
+                    role(WeightScope::Draft, WeightKind::MarkovHiddenOutWeight),
+                    &rnn.hidden_out.weight,
+                ));
+                weights.push((
+                    role(WeightScope::Draft, WeightKind::MarkovHiddenOutBias),
+                    &rnn.hidden_out.bias,
+                ));
+            }
+        }
     }
     if let Some(convolutions) = &draft.convolutions {
         for (block, layer) in convolutions.layers.iter().enumerate() {
@@ -159,7 +232,7 @@ pub(crate) fn admit(definition: &ModelDefinition) -> Result<(), PlanError> {
         }
     }
     let expected_output = match &draft.residual {
-        ResidualForm::Single => OutputForm::Residual,
+        ResidualForm::Single | ResidualForm::BlockAttention { .. } => OutputForm::Residual,
         ResidualForm::HyperConnections(form) => match form.mixing {
             HyperConnectionMixing::Sinkhorn { .. } => OutputForm::Scatter,
             HyperConnectionMixing::LowRankGated { .. } => {
@@ -175,7 +248,7 @@ pub(crate) fn admit(definition: &ModelDefinition) -> Result<(), PlanError> {
         ));
     }
     let epsilon = draft.output_norm.epsilon;
-    if draft.fusion_norm.epsilon != epsilon {
+    if draft.fusion.norms().iter().any(|norm| norm.epsilon != epsilon) {
         return Err(PlanError::Unsupported(
             "normalization epsilons differing within a draft",
         ));
@@ -249,6 +322,37 @@ pub(crate) fn admit(definition: &ModelDefinition) -> Result<(), PlanError> {
             return Err(PlanError::Topology("corrector heads do not divide its width"));
         }
     }
+    let has_softmax_mix = matches!(draft.fusion, DraftFusion::SoftmaxMix { .. });
+    let has_learned_mask = matches!(draft.mask, DraftMask::Learned(_));
+    let has_context_proj = draft.context_projections.is_some();
+    let has_rnn_markov = matches!(
+        draft.method,
+        DraftMethod::DSpark {
+            markov: MarkovHead::RnnHidden(_),
+            ..
+        }
+    );
+    if has_softmax_mix || has_learned_mask || has_context_proj || has_rnn_markov {
+        if !(has_softmax_mix && has_learned_mask && has_rnn_markov) {
+            return Err(PlanError::Unsupported(
+                "RNN DSpark requires SoftmaxMix fusion, Learned mask, and RnnHidden Markov head",
+            ));
+        }
+        if let DraftFusion::SoftmaxMix { norms, .. } = &draft.fusion {
+            if norms.len() != draft.blocks.len() + 1 {
+                return Err(PlanError::Topology(
+                    "RNN DSpark SoftmaxMix fusion requires one norm per draft block plus f_rnn",
+                ));
+            }
+        }
+        if let Some(ctx) = &draft.context_projections {
+            if ctx.len() != draft.blocks.len() {
+                return Err(PlanError::Topology(
+                    "draft context projections count must match draft block count",
+                ));
+            }
+        }
+    }
     Ok(())
 }
 
@@ -269,5 +373,242 @@ pub(crate) fn corrector_reads_f32(weight: CorrectorWeight) -> bool {
         | CorrectorWeight::AnchorNorm
         | CorrectorWeight::AttentionNorm
         | CorrectorWeight::MlpNorm => false,
+    }
+}
+
+/// Fuse `taps` target residuals (`[taps, M, hidden]` F32) via
+/// `DraftFusion::SoftmaxMix`: for each output `o`, compute
+/// `w = softmax(weights[o, :])`, `y = sum_t w[t] * taps[t]`, and apply
+/// `norms[o]` RMSNorm (`[hidden]`) in F32.
+#[allow(dead_code)]
+pub(crate) fn softmax_mix_fuse(
+    taps: &[&[f32]],
+    weights: &[f32],
+    norms: &[(&[f32], f32)],
+    rows: usize,
+    hidden: usize,
+) -> Result<Vec<Vec<f32>>, PlanError> {
+    let n_taps = taps.len();
+    let n_out = norms.len();
+    if weights.len() != n_out * n_taps {
+        return Err(PlanError::Topology("softmax-mix weights shape mismatch"));
+    }
+    let mut outputs = Vec::with_capacity(n_out);
+    for (o, &(gamma, eps)) in norms.iter().enumerate() {
+        let row_w = &weights[o * n_taps..(o + 1) * n_taps];
+        let max_w = row_w.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+        let exps: Vec<f32> = row_w.iter().map(|&v| (v - max_w).exp()).collect();
+        let sum_e: f32 = exps.iter().sum();
+        let coeffs: Vec<f32> = exps.iter().map(|&e| e / sum_e).collect();
+
+        let mut fused = vec![0.0f32; rows * hidden];
+        for r in 0..rows {
+            let base = r * hidden;
+            for (t, &c) in coeffs.iter().enumerate() {
+                let src = &taps[t][base..base + hidden];
+                for i in 0..hidden {
+                    fused[base + i] = c.mul_add(src[i], fused[base + i]);
+                }
+            }
+            let sq: f32 = fused[base..base + hidden].iter().map(|&v| v * v).sum();
+            let inv = 1.0 / (sq / hidden as f32 + eps).sqrt();
+            for i in 0..hidden {
+                fused[base + i] *= inv * gamma[i];
+            }
+        }
+        outputs.push(fused);
+    }
+    Ok(outputs)
+}
+
+/// One recurrent slot step of `MarkovHead::RnnHidden` (matching SGLang's
+/// `Inkling2MTPHead._rnn_step` / `_rnn_gates`):
+///   `proj = rnn_proj([h_prev ; markov_w1[prev_token] ; hidden_i ; f_rnn])`
+///   `gate = sigmoid(proj[0..R])`
+///   `h_next = gate * h_prev + (1 - gate) * tanh(proj[R..2R])`
+///   `latent = tanh(proj[2R..3R])`
+/// Returns `(h_next [rank], latent [rank])`.
+#[allow(clippy::too_many_arguments)]
+#[inline]
+pub(crate) fn dot_f32_simd(a: &[f32], b: &[f32]) -> f32 {
+    let mut s0 = 0.0f32;
+    let mut s1 = 0.0f32;
+    let mut s2 = 0.0f32;
+    let mut s3 = 0.0f32;
+    let mut s4 = 0.0f32;
+    let mut s5 = 0.0f32;
+    let mut s6 = 0.0f32;
+    let mut s7 = 0.0f32;
+    let mut ac = a.chunks_exact(8);
+    let mut bc = b.chunks_exact(8);
+    for (x, y) in ac.by_ref().zip(bc.by_ref()) {
+        s0 = x[0].mul_add(y[0], s0);
+        s1 = x[1].mul_add(y[1], s1);
+        s2 = x[2].mul_add(y[2], s2);
+        s3 = x[3].mul_add(y[3], s3);
+        s4 = x[4].mul_add(y[4], s4);
+        s5 = x[5].mul_add(y[5], s5);
+        s6 = x[6].mul_add(y[6], s6);
+        s7 = x[7].mul_add(y[7], s7);
+    }
+    let mut sum = ((s0 + s1) + (s2 + s3)) + ((s4 + s5) + (s6 + s7));
+    for (&x, &y) in ac.remainder().iter().zip(bc.remainder().iter()) {
+        sum = x.mul_add(y, sum);
+    }
+    sum
+}
+
+/// Precompute `rnn_proj_b + W_frnn @ f_rnn` once per slot per draft cycle,
+/// eliminating 40% of the RNN gate matvec work on steps `1..steps`.
+pub(crate) fn precompute_rnn_frnn_bias(
+    f_rnn: &[f32],
+    rank: usize,
+    hidden: usize,
+    rnn_proj_w: &[f32],
+    rnn_proj_b: &[f32],
+) -> Vec<f32> {
+    let in_dim = 2 * rank + 2 * hidden;
+    let frnn_off = 2 * rank + hidden;
+    let mut base = vec![0.0f32; 3 * rank];
+    for o in 0..3 * rank {
+        let row = &rnn_proj_w[o * in_dim..(o + 1) * in_dim];
+        base[o] = rnn_proj_b[o] + dot_f32_simd(&row[frnn_off..], f_rnn);
+    }
+    base
+}
+
+pub(crate) fn step_rnn_markov_gates_precomputed(
+    h_prev: &[f32],
+    prev_emb: &[f32],
+    hidden_i: &[f32],
+    base_bias: &[f32],
+    rnn_proj_w: &[f32],
+) -> (Vec<f32>, Vec<f32>) {
+    let rank = h_prev.len();
+    let hidden = hidden_i.len();
+    let in_dim = 2 * rank + 2 * hidden;
+    let mut gates = vec![0.0f32; 3 * rank];
+    for o in 0..3 * rank {
+        let row = &rnn_proj_w[o * in_dim..(o + 1) * in_dim];
+        let d_h = dot_f32_simd(&row[0..rank], h_prev);
+        let d_e = dot_f32_simd(&row[rank..2 * rank], prev_emb);
+        let d_x = dot_f32_simd(&row[2 * rank..2 * rank + hidden], hidden_i);
+        gates[o] = base_bias[o] + d_h + d_e + d_x;
+    }
+
+    let mut h_next = vec![0.0f32; rank];
+    let mut latent = vec![0.0f32; rank];
+    for r in 0..rank {
+        let gate = 1.0 / (1.0 + (-gates[r]).exp());
+        let cand = gates[rank + r].tanh();
+        h_next[r] = gate * h_prev[r] + (1.0 - gate) * cand;
+        latent[r] = gates[2 * rank + r].tanh();
+    }
+    (h_next, latent)
+}
+
+/// One recurrent slot step of `MarkovHead::RnnHidden` when
+/// `step_bias = rnn_proj_b + W_frnn @ f_rnn + W_x @ hidden_i` has already been
+/// computed (e.g. on GPU via `vision_linear`), using the contiguous
+/// `[3 * rank, 2 * rank]` recurrent/embedding slice `w_he = [W_h | W_e]`.
+pub(crate) fn step_rnn_markov_gates_he(
+    h_prev: &[f32],
+    prev_emb: &[f32],
+    step_bias: &[f32],
+    w_he: &[f32],
+) -> (Vec<f32>, Vec<f32>) {
+    let rank = h_prev.len();
+    let he_dim = 2 * rank;
+    let mut gates = vec![0.0f32; 3 * rank];
+    for o in 0..3 * rank {
+        let row = &w_he[o * he_dim..(o + 1) * he_dim];
+        let d_h = dot_f32_simd(&row[0..rank], h_prev);
+        let d_e = dot_f32_simd(&row[rank..he_dim], prev_emb);
+        gates[o] = step_bias[o] + d_h + d_e;
+    }
+
+    let mut h_next = vec![0.0f32; rank];
+    let mut latent = vec![0.0f32; rank];
+    for r in 0..rank {
+        let gate = 1.0 / (1.0 + (-gates[r]).exp());
+        let cand = gates[rank + r].tanh();
+        h_next[r] = gate * h_prev[r] + (1.0 - gate) * cand;
+        latent[r] = gates[2 * rank + r].tanh();
+    }
+    (h_next, latent)
+}
+
+#[allow(dead_code)]
+pub(crate) fn step_rnn_markov_gates(
+    h_prev: &[f32],
+    prev_emb: &[f32],
+    hidden_i: &[f32],
+    f_rnn: &[f32],
+    rnn_proj_w: &[f32],
+    rnn_proj_b: &[f32],
+) -> (Vec<f32>, Vec<f32>) {
+    let base = precompute_rnn_frnn_bias(f_rnn, h_prev.len(), hidden_i.len(), rnn_proj_w, rnn_proj_b);
+    step_rnn_markov_gates_precomputed(h_prev, prev_emb, hidden_i, &base, rnn_proj_w)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn dspark_softmax_mix_and_folded_rnn_markov_parity() {
+        let (rows, hidden, rank, vocab) = (2, 8, 4, 12);
+        let tap0: Vec<f32> = (0..rows * hidden).map(|i| (i as f32 + 1.0) * 0.1).collect();
+        let tap1: Vec<f32> = (0..rows * hidden).map(|i| -(i as f32 + 1.0) * 0.05).collect();
+        let weights = vec![0.0f32, 0.0, 1.0, -1.0]; // 2 outputs over 2 taps
+        let gamma = vec![1.0f32; hidden];
+        let fused = softmax_mix_fuse(
+            &[&tap0, &tap1],
+            &weights,
+            &[(&gamma, 1e-6), (&gamma, 1e-6)],
+            rows,
+            hidden,
+        )
+        .unwrap();
+        assert_eq!(fused.len(), 2);
+        assert!(fused.iter().flatten().all(|v| v.is_finite()));
+
+        let in_dim = 2 * rank + 2 * hidden;
+        let rnn_w: Vec<f32> = (0..3 * rank * in_dim)
+            .map(|i| ((i % 17) as f32 - 8.0) * 0.02)
+            .collect();
+        let rnn_b: Vec<f32> = (0..3 * rank).map(|i| (i as f32) * 0.01).collect();
+        let h_prev = vec![0.1f32; rank];
+        let prev_emb = vec![0.2f32; rank];
+        let hidden_i = &fused[0][..hidden];
+        let f_rnn = &fused[1][..hidden];
+
+        let (h_next, latent) = step_rnn_markov_gates(
+            &h_prev, &prev_emb, hidden_i, f_rnn, &rnn_w, &rnn_b,
+        );
+        assert_eq!(h_next.len(), rank);
+        assert_eq!(latent.len(), rank);
+        assert!(h_next.iter().all(|v| v.is_finite()));
+        assert!(latent.iter().all(|v| v.is_finite() && v.abs() <= 1.0));
+
+        // Verify split `step_rnn_markov_gates_he` matches full `step_rnn_markov_gates`.
+        let mut w_he = Vec::with_capacity(3 * rank * 2 * rank);
+        let mut step_bias = vec![0.0f32; 3 * rank];
+        for o in 0..3 * rank {
+            let row = &rnn_w[o * in_dim..(o + 1) * in_dim];
+            w_he.extend_from_slice(&row[0..2 * rank]);
+            let d_x = dot_f32_simd(&row[2 * rank..2 * rank + hidden], hidden_i);
+            let d_f = dot_f32_simd(&row[2 * rank + hidden..], f_rnn);
+            step_bias[o] = rnn_b[o] + d_x + d_f;
+        }
+        let (h_next_he, latent_he) =
+            step_rnn_markov_gates_he(&h_prev, &prev_emb, &step_bias, &w_he);
+        for (a, b) in h_next.iter().zip(&h_next_he) {
+            assert!((a - b).abs() < 1e-6, "h_next mismatch: {a} vs {b}");
+        }
+        for (a, b) in latent.iter().zip(&latent_he) {
+            assert!((a - b).abs() < 1e-6, "latent mismatch: {a} vs {b}");
+        }
+        let _ = vocab;
     }
 }

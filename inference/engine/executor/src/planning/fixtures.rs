@@ -71,6 +71,8 @@ pub(crate) fn fixture_definition_of(hidden: u64) -> ModelDefinition {
                 value: ValueSource::Projected(descriptor("v", &[WIDTH, hidden])),
                 key_norm: HeadNorm::Rms(rms("kn", WIDTH)),
                 value_norm: ValueNorm::None,
+                key_conv: None,
+                value_conv: None,
                 domain: TokenDomain::Token,
                 rounding: RowRounding::None,
             },
@@ -81,9 +83,11 @@ pub(crate) fn fixture_definition_of(hidden: u64) -> ModelDefinition {
             sections: vec![WIDTH / 4],
             axis_pattern: vec![0],
         },
+        relative_bias: None,
         scale: 1.0 / (WIDTH as f64).sqrt(),
+        log_scale: None,
         media_rows: MediaRowAttention::Causal,
-        sinks: None,
+        sinks: magnitude_family_contracts::AttentionSinks::None,
         output: OutputProjection::Full(descriptor("o", &[hidden, 2 * WIDTH])),
     };
     let dense = DenseFfn {
@@ -116,15 +120,18 @@ pub(crate) fn fixture_definition_of(hidden: u64) -> ModelDefinition {
                 per_layer: None,
             },
             blocks: vec![Block {
+                transition: None,
                 sublayers: vec![
                     Sublayer {
                         input: InputNorm::Rms(rms("input_norm", hidden)),
                         op: Operator::Attention(Box::new(attention)),
+                        post_conv: None,
                         output: OutputForm::Residual,
                     },
                     Sublayer {
                         input: InputNorm::Rms(rms("ffn_norm", hidden)),
                         op: Operator::DenseFfn(Box::new(dense)),
+                        post_conv: None,
                         output: OutputForm::Residual,
                     },
                 ],
@@ -132,6 +139,7 @@ pub(crate) fn fixture_definition_of(hidden: u64) -> ModelDefinition {
             exit: ExitForm {
                 norm: ExitNorm::Rms(rms("output_norm", hidden)),
                 output: descriptor("output", &[VOCABULARY, hidden]),
+                unpadded_vocabulary: None,
                 softcap: None,
             },
         },
@@ -289,8 +297,11 @@ pub(crate) fn separate_draft_fixture(owns_output: bool) -> (ModelDefinition, Pac
         method: DraftMethod::DFlash,
         convolutions: None,
         taps: vec![TapPoint::Exit],
-        fusion: WeightDescriptor::stored("draft_fusion", &[hidden, hidden]),
-        fusion_norm: norm("draft_fusion_norm"),
+        fusion: magnitude_family_contracts::DraftFusion::Linear {
+            projection: WeightDescriptor::stored("draft_fusion", &[hidden, hidden]),
+            norm: norm("draft_fusion_norm"),
+        },
+        context_projections: None,
         embedding: DraftEmbedding::Target,
         output: owns_output
             .then(|| WeightDescriptor::stored("draft_output", &[vocabulary, hidden])),
@@ -301,7 +312,7 @@ pub(crate) fn separate_draft_fixture(owns_output: bool) -> (ModelDefinition, Pac
         output_norm: norm("draft_output_norm"),
         logit_softcap: Some(0.1),
         block_size: 2,
-        mask_token: TokenId(0),
+        mask: magnitude_family_contracts::DraftMask::Token(TokenId(0)),
         layout: BlockLayout::MaskSlots,
     });
     definition.validate().unwrap();
@@ -506,6 +517,7 @@ pub fn sinkhorn_fixture_definition_over(
             norm: Some(rms(&format!("{prefix}_norm"))),
         }),
         op,
+        post_conv: None,
         output: OutputForm::Scatter,
     };
     let attention = decoder.blocks[0].sublayers[0].op.clone();
@@ -536,7 +548,7 @@ pub fn sinkhorn_fixture_definition_over(
                 latent: None,
                 shared: None,
             }));
-            Block { sublayers: vec![sited(&name("attn"), attention.clone()), sited(&name("ffn"), routed)] }
+            Block { transition: None, sublayers: vec![sited(&name("attn"), attention.clone()), sited(&name("ffn"), routed)] }
         })
         .collect();
     decoder.exit.norm = ExitNorm::HyperConnectionHead(HyperConnectionExit {
@@ -706,15 +718,19 @@ pub fn glm_slice_b_fixture() -> (ModelDefinition, PackageManifest) {
                 value: ValueSource::StoredKey,
                 key_norm: HeadNorm::Rms(rms("attn_kv_a_norm", LATENT)),
                 value_norm: ValueNorm::None,
+                key_conv: None,
+                value_conv: None,
                 domain: TokenDomain::Token,
                 rounding: RowRounding::None,
             })),
             reads: HistoryReads::Selected(Selection::Own(Box::new(indexer))),
         }],
         rotary: Rotary::None,
+        relative_bias: None,
         scale: (HEAD as f64).powf(-0.5),
+        log_scale: None,
         media_rows: MediaRowAttention::Causal,
-        sinks: None,
+        sinks: magnitude_family_contracts::AttentionSinks::None,
         output: OutputProjection::GroupedLowRank {
             groups: HEADS,
             rank: HEAD,
@@ -883,9 +899,10 @@ pub fn glm_slice_b_mtp_fixture_of(own_indexer: bool) -> (ModelDefinition, Packag
     let plain = |norm: &str, sublayer: &Sublayer| {
         let mut op = sublayer.op.clone();
         rename_indexer_weights(&mut op, &|name| format!("head_{name}"));
-        Sublayer { input: InputNorm::Rms(rms(norm)), op, output: OutputForm::Residual }
+        Sublayer { input: InputNorm::Rms(rms(norm)), op, post_conv: None, output: OutputForm::Residual }
     };
     let head_block = Block {
+        transition: None,
         sublayers: vec![plain("attn_norm", &trunk.sublayers[0]), plain("ffn_norm", &trunk.sublayers[1])],
     };
     definition.head = Some(Head {
@@ -961,6 +978,7 @@ pub fn qwen4exp_fixture_definition_of(attention_blocks: u64, experts: u64) -> Mo
     let mixing = |prefix: &str, op: Operator| Sublayer {
         input: mix_input(site(prefix, true, hidden)),
         op,
+        post_conv: None,
         output: OutputForm::Scatter,
     };
     let routed = |block: u64| {
@@ -1060,12 +1078,14 @@ pub fn qwen4exp_fixture_definition_of(attention_blocks: u64, experts: u64) -> Mo
     let attention = decoder.blocks[0].sublayers[0].op.clone();
     decoder.blocks = vec![
         Block {
+            transition: None,
             sublayers: vec![
                 mixing("blk.0.attn_hc", gated_delta),
                 mixing("blk.0.ffn_hc", routed(0)),
                 Sublayer {
                     input: InputNorm::None,
                     op: ngram,
+                    post_conv: None,
                     output: OutputForm::Residual,
                 },
             ],
@@ -1074,6 +1094,7 @@ pub fn qwen4exp_fixture_definition_of(attention_blocks: u64, experts: u64) -> Mo
     // Each attention block's mixer and mix sites are block 1's (tied), its
     // experts its own.
     decoder.blocks.extend((1..=attention_blocks).map(|block| Block {
+        transition: None,
         sublayers: vec![
             mixing("blk.1.attn_hc", attention.clone()),
             mixing("blk.1.ffn_hc", routed(block)),
@@ -1121,6 +1142,7 @@ pub fn engram_fixture_definition() -> ModelDefinition {
     decoder.blocks[0].sublayers.push(Sublayer {
         input: InputNorm::None,
         op: ngram,
+        post_conv: None,
         output: OutputForm::Residual,
     });
     definition
@@ -1247,13 +1269,17 @@ pub fn routed_fixture_definition(shape: RoutedShape) -> ModelDefinition {
                 value: ValueSource::Projected(descriptor(&name("attn_v"), &[KV_HEADS * WIDTH, hidden])),
                 key_norm: HeadNorm::Rms(rms(name("attn_k_norm"), WIDTH)),
                 value_norm: ValueNorm::None,
+                key_conv: None,
+                value_conv: None,
                 domain: TokenDomain::Token,
                 rounding: RowRounding::None,
             })))],
             rotary: Rotary::Interleaved { width: WIDTH / 2, base: 10_000.0, sections: vec![WIDTH / 4], axis_pattern: vec![0] },
+            relative_bias: None,
             scale: 1.0 / (WIDTH as f64).sqrt(),
+            log_scale: None,
             media_rows: MediaRowAttention::Causal,
-            sinks: None,
+            sinks: magnitude_family_contracts::AttentionSinks::None,
             output: OutputProjection::Full(descriptor(&name("attn_output"), &[hidden, HEADS * WIDTH])),
         };
         let routed = RoutedFfn {
@@ -1281,15 +1307,18 @@ pub fn routed_fixture_definition(shape: RoutedShape) -> ModelDefinition {
             shared: None,
         };
         Block {
+            transition: None,
             sublayers: vec![
                 Sublayer {
                     input: InputNorm::Rms(rms(name("attn_norm"), hidden)),
                     op: Operator::Attention(Box::new(attention)),
+                    post_conv: None,
                     output: OutputForm::Residual,
                 },
                 Sublayer {
                     input: InputNorm::Rms(rms(name("ffn_norm"), hidden)),
                     op: Operator::RoutedFfn(Box::new(routed)),
+                    post_conv: None,
                     output: OutputForm::Residual,
                 },
             ],
@@ -1338,6 +1367,7 @@ pub fn parallel_routed_fixture_definition(shape: RoutedShape) -> ModelDefinition
                     output: BranchOutput::Norm(rms(name("post_ffw_norm_2"), hidden)),
                 },
             ]),
+            post_conv: None,
             output: OutputForm::PostNorm(rms(name("post_ffw_norm"), hidden)),
         };
     }

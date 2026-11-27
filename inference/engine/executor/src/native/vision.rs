@@ -1,8 +1,8 @@
 use super::RangedKernels;
 use crate::{CatalogFailure, VisionEntry, VisionKernel};
 use magnitude_kernels::{
-    post_norm_residual, vision_attention, vision_clamp, vision_gated_convolution, vision_linear,
-    vision_norm, vision_patch_stem, vision_pool, vision_position,
+    post_norm_residual, stream_join, vision_attention, vision_clamp, vision_gated_convolution,
+    vision_linear, vision_norm, vision_patch_stem, vision_pool, vision_position,
 };
 use seismic::{Element, NativeKernel};
 use std::collections::HashMap;
@@ -40,6 +40,7 @@ pub struct VisionKernels {
     pub(crate) pool: HashMap<VisionKernel, NativeKernel<vision_pool::Entry>>,
     pub(crate) position: HashMap<VisionKernel, NativeKernel<vision_position::Entry>>,
     pub(crate) post_norm: HashMap<VisionKernel, NativeKernel<post_norm_residual::Entry>>,
+    pub(crate) residual_add: HashMap<VisionKernel, NativeKernel<stream_join::Entry>>,
 }
 
 impl VisionKernels {
@@ -55,6 +56,7 @@ impl VisionKernels {
             VisionEntry::Pool => self.pool.contains_key(kernel),
             VisionEntry::Position => self.position.contains_key(kernel),
             VisionEntry::PostNormResidual => self.post_norm.contains_key(kernel),
+            VisionEntry::ResidualAdd => self.residual_add.contains_key(kernel),
         }
     }
 }

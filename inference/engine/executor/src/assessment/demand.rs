@@ -760,6 +760,8 @@ impl DecodeDemand {
             .first()
             .or_else(|| readout_census.decode_calls.first())
             .map(|c| c.backend)
+            .or_else(|| target_census.kernels.iter().next().map(|k| k.backend))
+            .or_else(|| readout_census.kernels.iter().next().map(|k| k.backend))
             .ok_or_else(|| demand_error("sizing census recorded no decode calls"))?;
 
         let mut calls = Vec::new();

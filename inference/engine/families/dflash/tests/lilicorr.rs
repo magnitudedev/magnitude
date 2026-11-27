@@ -10,9 +10,9 @@ use magnitude_artifacts::{
 };
 use magnitude_family_common::headers;
 use magnitude_family_contracts::{
-    BlockAttention, BlockLayout, CandidateCorrector, DraftDefinition, DraftEmbedding, DraftMethod,
-    DraftVariant, HistoryDomain, HistoryRows, ImportTransform, ModelDefinition, ModelFamily, Operator,
-    Rotary, CORRECTOR_FEATURES,
+    AttentionSinks, BlockAttention, BlockLayout, CandidateCorrector, DraftDefinition,
+    DraftEmbedding, DraftFusion, DraftMask, DraftMethod, DraftVariant, HistoryDomain, HistoryRows,
+    ImportTransform, ModelDefinition, ModelFamily, Operator, Rotary, CORRECTOR_FEATURES,
 };
 use magnitude_family_dflash::{inspect, recognize, Error};
 use magnitude_family_nemotron_h::NemotronHFamily;
@@ -90,10 +90,13 @@ fn bolt_reads_a_selectorless_convolved_backbone_with_sinks() {
     for proposals in 1..=7 {
         assert_eq!(draft.block_rows(proposals), 8);
     }
-    assert_eq!(draft.mask_token, TokenId(990));
+    assert_eq!(draft.mask, DraftMask::Token(TokenId(990)));
     assert_eq!(draft.taps.len(), 6);
-    assert_eq!(draft.fusion.shape, [4096, 6 * 4096]);
-    assert!(scaled(&draft.fusion));
+    let DraftFusion::Linear { projection, .. } = &draft.fusion else {
+        panic!("expected linear draft fusion");
+    };
+    assert_eq!(projection.shape, [4096, 6 * 4096]);
+    assert!(scaled(projection));
     assert_eq!(draft.embedding, DraftEmbedding::Target);
     assert!(draft.output.is_none());
     assert_eq!(draft.blocks.len(), 5);
@@ -108,7 +111,10 @@ fn bolt_reads_a_selectorless_convolved_backbone_with_sinks() {
     assert_eq!(draft.block_attention, [BlockAttention::Bidirectional; 5]);
     for layer in 0..5 {
         let attention = attention(&draft, layer);
-        assert_eq!(attention.sinks.as_ref().unwrap().shape, [32]);
+        let AttentionSinks::Static(sinks) = &attention.sinks else {
+            panic!("expected static attention sinks");
+        };
+        assert_eq!(sinks.shape, [32]);
         assert_eq!(
             (attention.heads, attention.kv_heads, attention.width),
             (32, 2, 128)
@@ -179,7 +185,7 @@ fn super_vl_reads_windowed_layers_without_sinks_and_its_own_projection() {
     assert!(scaled(output));
     for layer in 0..5 {
         let attention = attention(&draft, layer);
-        assert!(attention.sinks.is_none());
+        assert_eq!(attention.sinks, AttentionSinks::None);
         assert_eq!((attention.heads, attention.kv_heads), (32, 8));
         let HistoryRows::Own(producer) = &attention.fresh().rows else {
             panic!("a draft layer owns its history");
@@ -220,7 +226,7 @@ fn both_dspark_drafts_bind_against_their_targets() {
         let definition = read(&draft, model).unwrap();
         assert_eq!(definition.method.variant(), DraftVariant::DSpark);
         assert_eq!(definition.layout, BlockLayout::AnchorFirst);
-        assert_eq!(definition.mask_token, TokenId(mask));
+        assert_eq!(definition.mask, DraftMask::Token(TokenId(mask)));
         assert_eq!(definition.block_attention, vec![attention_kind; layers]);
         for layer in 0..layers {
             let HistoryRows::Own(producer) = &attention(&definition, layer).fresh().rows else {

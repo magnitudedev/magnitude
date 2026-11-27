@@ -2222,11 +2222,11 @@ impl ModelLoadPlan {
     /// them as it runs ([`WeightPlacement`]).
     pub fn weight_placement(&self) -> Result<WeightPlacement, String> {
         let overflow = || "weight placement bytes overflow".to_owned();
-        // Each stored extent once, however many roles or representations
-        // the load gives it (a tied embedding is a table and a head), and
-        // each row range of a stored tensor as its own extent: a fused
-        // tensor bound as slices (Gemma 4's gate‖up experts, each a half of
-        // `ffn_gate_up_exps`) is every slice's bytes, as the bank's records
+        // Each stored extent once, however many roles, looped visits, or
+        // representations the load gives it (a tied embedding is a table and a
+        // head), and each row range of a stored tensor as its own extent: a
+        // fused tensor bound as slices (Gemma 4's gate‖up experts, each a half
+        // of `ffn_gate_up_exps`) is every slice's bytes, as the bank's records
         // and the uploads charge them, not its first slice's alone.
         let capacity = self.target.len()
             + self.head().map_or(0, <[WeightPlan]>::len)
@@ -2240,7 +2240,7 @@ impl ModelLoadPlan {
                 let bytes = match weight.holding {
                     Holding::Whole => representation_bytes(weight.source, &weight.shape)?,
                     Holding::Streamed(streamed) => representation_bytes(weight.source, &[streamed.table_rows, weight.table_width()])?,
-                    Holding::Banked { .. } => representation_bytes(weight.source, &weight.descriptor.shape)?,
+                    Holding::Banked { .. } => representation_bytes(weight.source, &weight.shape)?,
                 };
                 stored = stored.checked_add(bytes).ok_or_else(overflow)?;
             }
@@ -2649,7 +2649,16 @@ impl ModelLoadPlan {
     /// output row.
     pub(crate) fn draft_fusion(&self) -> Option<&WeightPlan> {
         let role = WeightRole { scope: WeightScope::Draft, kind: WeightKind::DraftFusion };
-        self.residual_conditioning().is_none().then(|| self.target_weight(role)).flatten()
+        let norm_role = WeightRole { scope: WeightScope::Draft, kind: WeightKind::DraftFusionNorm };
+        let hidden = self.target_weight(norm_role).and_then(|n| n.shape.first().copied());
+        // Only `DraftFusion::Linear` (`[hidden, taps * hidden]`) fuses taps
+        // via target-side `project_rows`; `DraftFusion::SoftmaxMix` (`[outputs, taps]`)
+        // is fused inside `BoundRnnDraft`.
+        self.residual_conditioning()
+            .is_none()
+            .then(|| self.target_weight(role))
+            .flatten()
+            .filter(|w| hidden.is_none_or(|h| w.shape.first().copied() == Some(h)))
     }
 
     /// Resolve the ordered checked-entry topology from the same weight facts
@@ -2853,6 +2862,9 @@ impl ModelLoadPlan {
                 + exit_weights.len(),
         );
         target_weights.push((target_role(WeightKind::Embedding), &decoder.entry.embedding));
+        if let Some(magnitude_family_contracts::EntryNorm::Rms { norm, .. }) = &decoder.entry.norm {
+            target_weights.push((target_role(WeightKind::EntryNorm), &norm.weight));
+        }
         target_weights.extend(per_layer_weights);
         target_weights.extend(decoder_weights);
         target_weights.extend(exit_weights);
@@ -2862,7 +2874,9 @@ impl ModelLoadPlan {
         // (`landed_read`) between every pair of consecutive draft steps.
         let read_whole_embeddings =
             selection.head && method.draft_form() == Some(crate::DraftForm::Chained);
-        target_weights.push((target_role(WeightKind::Output), &decoder.exit.output));
+        let exit_output = operators::exit_output_descriptor(decoder)
+            .map_err(|error| error.to_string())?;
+        target_weights.push((target_role(WeightKind::Output), exit_output.as_ref()));
         push_weights(
             &mut target,
             &target_index,
@@ -4209,10 +4223,10 @@ fn push_weight(
     // f16 matrices or f32 biases to the activation dtype only loses bits.
     // A role its kernel reads in F32 alone (`is_fixed_dense_role`) is F32.
     let stored_dense = source.dtype();
-    let fixed_dense = operators::is_fixed_dense_role(kind);
+    let fixed_dense = operators::is_fixed_dense_weight(kind, descriptor);
     let dense_resident = match (role.kind, stored_dense) {
         (WeightKind::Vision(_), Some(dtype)) if !fixed_dense => dtype,
-        _ => resident_dtype(role, form.activation),
+        _ => operators::resident_dtype_for(kind, descriptor, form.activation),
     };
     // Roles whose kernels read dense weights only (fixed-f32 roles and vision
     // projector weights) cannot stay packed: the host dequantizes them exactly

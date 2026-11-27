@@ -199,6 +199,9 @@ pub struct TapProgramPlan {
     /// The extent of the fusion projection's accumulator-scale port.
     pub fusion_scale: u64,
     pub activation: Element,
+    /// True for `DraftFusion::Linear` (target-side `project_rows` matmul);
+    /// false for `DraftFusion::SoftmaxMix` (fused inside the RNN draft).
+    pub linear_fusion: bool,
     /// Stream count when tapping a multi-stream hyper-connection target
     /// (`stream_collapse` with `P = 0` computes the per-row stream mean).
     pub streams: Option<u64>,
@@ -214,6 +217,8 @@ pub struct TargetProgramPlan {
     selection: DType,
     /// The per-layer entry the blocks' per-layer inputs come from.
     per_layer: Option<PerLayerEntryBinding>,
+    /// Weighted entry RMSNorm element (`EntryNorm::Rms`), when present.
+    entry_norm: Option<Element>,
 }
 
 impl TargetProgramPlan {
@@ -233,6 +238,7 @@ impl TargetProgramPlan {
             taps,
             selection,
             per_layer: None,
+            entry_norm: None,
         }
     }
 
@@ -240,9 +246,18 @@ impl TargetProgramPlan {
         Self { per_layer, ..self }
     }
 
+    pub fn with_entry_norm(self, entry_norm: Option<Element>) -> Self {
+        Self { entry_norm, ..self }
+    }
+
     /// The per-layer entry, when the model has per-layer inputs.
     pub fn per_layer(&self) -> Option<PerLayerEntryBinding> {
         self.per_layer
+    }
+
+    /// Weighted entry RMSNorm element (`EntryNorm::Rms`), when present.
+    pub fn entry_norm(&self) -> Option<Element> {
+        self.entry_norm
     }
 
     /// The draft taps whose fusion replaces the readout's features.
@@ -295,6 +310,7 @@ impl DraftBlockBinding {
 pub struct MarkovBinding {
     pub embedding: Element,
     pub projection: Element,
+    pub projection_kind: WeightKind,
     /// The table's width.
     pub rank: u64,
 }
@@ -964,8 +980,13 @@ pub(super) fn derive_program_plan(
     let taps = separate
         .map(|draft| {
             let fusion = planned_scalable(target, WeightScope::Draft, WeightKind::DraftFusion)?;
+            let linear_fusion = matches!(
+                draft.fusion,
+                magnitude_family_contracts::DraftFusion::Linear { .. }
+            );
             let streams = match &decoder.residual {
-                magnitude_family_contracts::ResidualForm::Single => None,
+                magnitude_family_contracts::ResidualForm::Single
+                | magnitude_family_contracts::ResidualForm::BlockAttention { .. } => None,
                 magnitude_family_contracts::ResidualForm::HyperConnections(hc) => Some(hc.streams),
             };
             Ok::<_, PlanError>(TapProgramPlan {
@@ -973,10 +994,17 @@ pub(super) fn derive_program_plan(
                 fusion: fusion.element,
                 fusion_scale: fusion.scale,
                 activation: active_element,
+                linear_fusion,
                 streams,
             })
         })
         .transpose()?;
+    let entry_norm = match &decoder.entry.norm {
+        Some(magnitude_family_contracts::EntryNorm::Rms { .. }) => {
+            Some(lookup(target, WeightScope::Target, WeightKind::EntryNorm)?)
+        }
+        _ => None,
+    };
     let target_program = TargetProgramPlan::new(
         embedding,
         blocks,
@@ -988,7 +1016,8 @@ pub(super) fn derive_program_plan(
         taps,
         activation,
     )
-    .with_per_layer(per_layer_entry);
+    .with_per_layer(per_layer_entry)
+    .with_entry_norm(entry_norm);
     let drafter = match head {
         None => None,
         Some(weights) => match (definition.draft.as_ref(), definition.head.as_ref()) {
@@ -1349,14 +1378,30 @@ fn draft_program_plan(
             WeightScope::Target
         },
         markov: match &draft.method {
-            DraftMethod::DSpark { markov, .. } => Some(MarkovBinding {
-                embedding: lookup(weights, WeightScope::Draft, WeightKind::MarkovEmbedding)?,
-                // `dense_output` binds the projection's second-level scale
-                // (its DS port), so an NVFP4 projection is admitted.
-                projection: planned_scalable(weights, WeightScope::Draft, WeightKind::MarkovProjection)?
-                    .element,
-                rank: markov.rank,
-            }),
+            DraftMethod::DSpark { markov, .. } => {
+                let (projection_kind, projection) = match markov {
+                    magnitude_family_contracts::MarkovHead::Bilinear { .. } => (
+                        WeightKind::MarkovProjection,
+                        planned_scalable(weights, WeightScope::Draft, WeightKind::MarkovProjection)?
+                            .element,
+                    ),
+                    magnitude_family_contracts::MarkovHead::RnnHidden(_) => (
+                        WeightKind::MarkovHiddenOutWeight,
+                        planned_scalable(
+                            weights,
+                            WeightScope::Draft,
+                            WeightKind::MarkovHiddenOutWeight,
+                        )?
+                        .element,
+                    ),
+                };
+                Some(MarkovBinding {
+                    embedding: lookup(weights, WeightScope::Draft, WeightKind::MarkovEmbedding)?,
+                    projection,
+                    projection_kind,
+                    rank: markov.rank(),
+                })
+            }
             _ => None,
         },
         convolutions: draft

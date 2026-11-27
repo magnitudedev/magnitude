@@ -806,6 +806,8 @@ pub(crate) mod tests {
                 ProjectedRows {
                     key: weight(&format!("{p}k"), &[2, 2]),
                     value: ValueSource::Projected(weight(&format!("{p}v"), &[2, 2])),
+                    key_conv: None,
+                    value_conv: None,
                     key_norm: HeadNorm::Rms(rms(&format!("{p}kn"))),
                     value_norm: ValueNorm::None,
                     domain: TokenDomain::Token,
@@ -818,9 +820,11 @@ pub(crate) mod tests {
                 sections: vec![1],
                 axis_pattern: vec![0],
             },
+            relative_bias: None,
+            log_scale: None,
             scale: 1.0 / 2f64.sqrt(),
             media_rows: MediaRowAttention::Causal,
-            sinks: None,
+            sinks: magnitude_family_contracts::AttentionSinks::None,
             output: OutputProjection::Full(weight(&format!("{p}o"), &[2, 2])),
         };
         let dense = DenseFfn {
@@ -834,15 +838,18 @@ pub(crate) mod tests {
             down: weight(&format!("{p}d"), &[2, 4]),
         };
         Block {
+            transition: None,
             sublayers: vec![
                 Sublayer {
                     input: InputNorm::Rms(rms(&format!("{p}in"))),
                     op: Operator::Attention(Box::new(attention)),
+                    post_conv: None,
                     output: OutputForm::Residual,
                 },
                 Sublayer {
                     input: InputNorm::Rms(rms(&format!("{p}fn"))),
                     op: Operator::DenseFfn(Box::new(dense)),
+                    post_conv: None,
                     output: OutputForm::Residual,
                 },
             ],
@@ -890,6 +897,7 @@ pub(crate) mod tests {
                     norm: ExitNorm::Rms(rms("on")),
                     output: weight("out", &[8, 2]),
                     softcap: None,
+                    unpadded_vocabulary: None,
                 },
             },
             head,
@@ -1114,8 +1122,8 @@ pub(crate) mod tests {
 
     fn with_draft(method: magnitude_family_contracts::DraftMethod) -> ModelDefinition {
         use magnitude_family_contracts::{
-            BlockAttention, BlockLayout, DraftDefinition, DraftEmbedding, SublayerIndex, TapPoint,
-            TokenId,
+            BlockAttention, BlockLayout, DraftDefinition, DraftEmbedding, DraftFusion, DraftMask,
+            SublayerIndex, TapPoint, TokenId,
         };
         ModelDefinition {
             draft: Some(DraftDefinition {
@@ -1125,18 +1133,21 @@ pub(crate) mod tests {
                     block: 0,
                     sublayer: 0,
                 })],
-                fusion: weight("fc", &[2, 2]),
-                fusion_norm: rms("enc"),
+                fusion: DraftFusion::Linear {
+                    projection: weight("fc", &[2, 2]),
+                    norm: rms("enc"),
+                },
                 embedding: DraftEmbedding::Target,
                 output: None,
                 embedding_scale: 1.0,
                 residual: magnitude_family_contracts::ResidualForm::Single,
                 blocks: vec![block("d")],
+                context_projections: None,
                 block_attention: vec![BlockAttention::Bidirectional],
                 output_norm: rms("don"),
                 logit_softcap: None,
                 block_size: 4,
-                mask_token: TokenId(7),
+                mask: DraftMask::Token(TokenId(7)),
                 layout: BlockLayout::MaskSlots,
             }),
             ..definition(true)

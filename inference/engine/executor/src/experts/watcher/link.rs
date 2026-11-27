@@ -145,9 +145,11 @@ impl LinkMover {
                 match copier.copies.completed(batch) {
                     Ok(false) => {}
                     Ok(true) => {
-                        let (layer, expert) = core.directory.staged_landed(group, slot);
+                        let (stack, expert) = core.directory.staged_landed(group, slot);
                         if let Some((target_step, issued_at)) = self.stage_issued.remove(&(group, slot)) {
-                            ledger.link_landed(target_step, layer, expert, issued_at, now);
+                            for &visit in core.visits_of(stack) {
+                                ledger.link_landed(target_step, visit, expert, issued_at, now);
+                            }
                         }
                         staged_bytes += bytes[group];
                         staged_count += 1;
@@ -443,9 +445,12 @@ impl LinkMover {
             let mut seen: HashSet<Staged> = candidates.iter().copied().collect();
             for (g, slot, _) in core.directory.staging_copying() {
                 if g == group {
-                    if let Some(crate::experts::records::Record::Staging { staged, .. }) = core.directory.bank_record(g, slot) {
-                        if seen.insert(staged) {
-                            candidates.push(staged);
+                    if let Some(crate::experts::records::Record::Staging { staged: (stack, expert), .. }) = core.directory.bank_record(g, slot) {
+                        for &visit in core.visits_of(stack) {
+                            let visit_staged = (visit, expert);
+                            if seen.insert(visit_staged) {
+                                candidates.push(visit_staged);
+                            }
                         }
                     }
                 }
@@ -455,12 +460,14 @@ impl LinkMover {
                 let states: HashMap<Staged, ReadState> = candidates
                     .iter()
                     .map(|&staged @ (layer, expert)| {
-                        let state = if core.directory.held(layer, expert).is_some()
-                            || core.directory.placing(staged)
-                            || core.directory.tier_record(layer, expert).is_none()
+                        let stack = core.stack(layer);
+                        let dir_staged = (stack, expert);
+                        let state = if core.directory.held(stack, expert).is_some()
+                            || core.directory.placing(dir_staged)
+                            || core.directory.tier_record(stack, expert).is_none()
                         {
                             ReadState::Held
-                        } else if let Some((_, _, batch)) = core.directory.staged_entry(group, staged) {
+                        } else if let Some((_, _, batch)) = core.directory.staged_entry(group, dir_staged) {
                             match batch {
                                 Some(ticket) => ReadState::Reading { begun: copier.copies.is_begun(ticket) },
                                 None => ReadState::Held,
@@ -480,11 +487,11 @@ impl LinkMover {
                 );
 
                 for Scheduled { layer, expert, act, .. } in scheduled {
-                    let staged = (layer, expert);
+                    let dir_staged = (core.stack(layer), expert);
                     match act {
                         Act::Keep | Act::Issue(Class::Due) | Act::Reprice(Class::Due) => {}
                         Act::Cancel => {
-                            if let Some((slot, _, Some(ticket))) = core.directory.staged_entry(group, staged) {
+                            if let Some((slot, _, Some(ticket))) = core.directory.staged_entry(group, dir_staged) {
                                 if copier.copies.cancel(ticket) {
                                     self.stage_issued.remove(&(group, slot));
                                     core.directory.unstage(group, slot);
@@ -493,7 +500,7 @@ impl LinkMover {
                             }
                         }
                         Act::Reprice(Class::Expected { step, p }) => {
-                            if let Some((_, _, Some(ticket))) = core.directory.staged_entry(group, staged) {
+                            if let Some((_, _, Some(ticket))) = core.directory.staged_entry(group, dir_staged) {
                                 copier.copies.reprice(ticket, TransferPriority::Stage { step, layer, p });
                             }
                         }
@@ -517,10 +524,10 @@ impl LinkMover {
                                 continue;
                             };
                             let priority = TransferPriority::Stage { step: target_step, layer, p };
-                            match post_stage(core, shared, copier, stage_depth, priority, group, slot, target_step, staged) {
+                            match post_stage(core, shared, copier, stage_depth, priority, group, slot, target_step, dir_staged) {
                                 Ok(Some((tier, ticket))) => {
                                     self.stage_issued.insert((group, slot), (target_step, Instant::now()));
-                                    core.directory.stage(group, slot, staged, target_step, tier, ticket, (target_step & 1) as u8);
+                                    core.directory.stage(group, slot, dir_staged, target_step, tier, ticket, (target_step & 1) as u8);
                                     moved = true;
                                 }
                                 Ok(None) => break,
@@ -551,17 +558,17 @@ impl LinkMover {
                 let room = stage_depth.saturating_sub(copier.copies.flight()).min(max_room);
                 let mut carryover = {
                     let reuse = core.directory.reuse_now();
-                    reuse.next_step_candidates(room, false, |layer, expert| {
-                        core.layers[layer].group == group
-                            && core.directory.held(layer, expert).is_none()
-                            && !core.directory.placing((layer, expert))
-                            && core.directory.tier_record(layer, expert).is_some()
-                            && core.directory.staged_entry(group, (layer, expert)).is_none()
+                    reuse.next_step_candidates(room, false, |stack, expert| {
+                        core.layers[core.stack_rep(stack)].group == group
+                            && core.directory.held(stack, expert).is_none()
+                            && !core.directory.placing((stack, expert))
+                            && core.directory.tier_record(stack, expert).is_some()
+                            && core.directory.staged_entry(group, (stack, expert)).is_none()
                     })
                 };
                 carryover.sort_unstable_by(|a, b| {
-                    a.layer
-                        .cmp(&b.layer)
+                    core.stack_rep(a.layer)
+                        .cmp(&core.stack_rep(b.layer))
                         .then_with(|| b.p_next.total_cmp(&a.p_next))
                 });
                 for cand in carryover {
@@ -585,7 +592,7 @@ impl LinkMover {
                     }) else {
                         continue;
                     };
-                    let priority = TransferPriority::Stage { step: target_step, layer: cand.layer, p: cand.p_next.clamp(0.0, 1.0) };
+                    let priority = TransferPriority::Stage { step: target_step, layer: core.stack_rep(cand.layer), p: cand.p_next.clamp(0.0, 1.0) };
                     match post_stage(core, shared, copier, stage_depth, priority, group, slot, target_step, (cand.layer, cand.expert)) {
                         Ok(Some((tier, ticket))) => {
                             self.stage_issued.insert((group, slot), (target_step, Instant::now()));
@@ -670,10 +677,11 @@ fn post_stage(
     target_step: Step,
     (layer, expert): Staged,
 ) -> Result<Option<(HostRecord, u64)>, String> {
+    let rep = core.stack_rep(layer);
     let (directory, groups, layers) = (&mut core.directory, &core.groups, &core.layers);
     let signal_value = stage_word(target_step, slot);
     let signal_index = (expert as u64) * MAP_WORDS + MAP_STAGE;
-    let signal_word = layers[layer].map.tensor().clone();
+    let signal_word = layers[rep].map.tensor().clone();
     let posted = copier.copies.post_tracked_within(depth, priority, || {
         let tier = directory.hold_tier(layer, expert).expect("a selected staging candidate's tier record is kept");
         let transfer_id = shared.transport.register_hint(

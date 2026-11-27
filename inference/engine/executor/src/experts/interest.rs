@@ -193,13 +193,17 @@ pub(in crate::experts) enum Source {
     /// upcoming burst's exact/drafted tokens (`Told::DraftTokens` / `Told::Began`)
     /// via live per-token and bigram routing history (`TokenRoutes`).
     Token,
+    /// Cross-pass intra-token foresight: an earlier visit of the same physical
+    /// expert stack within the same step routed this expert, predicting reuse
+    /// at a subsequent visit of that physical stack in the same step.
+    CrossPass,
 }
 
 impl Source {
     /// The ahead row it is of, if any.
     pub fn row(self) -> Option<Row> {
         match self {
-            Self::Exact | Self::Token => None,
+            Self::Exact | Self::Token | Self::CrossPass => None,
             Self::Ahead(row) => Some(row),
         }
     }
@@ -472,7 +476,7 @@ impl Basis {
     pub fn of(source: Source) -> Self {
         match source {
             Source::Ahead(_) => Self::Front,
-            Source::Token => Self::Token,
+            Source::Token | Source::CrossPass => Self::Token,
             Source::Exact => panic!("no read ahead is an exact request's"),
         }
     }
@@ -751,12 +755,14 @@ impl Form {
     }
 }
 
-/// What a look saw (§3.5): its row's route, or token-conditioned routing
-/// history.
+/// What a look saw (§3.5): its row's route, token-conditioned routing
+/// history, or an earlier cross-pass visit of the same physical stack in the
+/// same step.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub(in crate::experts) enum Seen {
     Route,
     Token,
+    CrossPass,
 }
 
 /// One source of names (§3.5): what it saw, at the depth of the row it came
@@ -769,8 +775,11 @@ pub(in crate::experts) struct Look {
     pub form: Form,
 }
 
-/// The looks' domain: 2 × DEPTHS × 2.
-pub(in crate::experts) const LOOKS: usize = 2 * super::DEPTHS * 2;
+/// Distinct `Seen` values: `Route`, `Token`, and `CrossPass`.
+const SEEN_KINDS: usize = 3;
+
+/// The looks' domain: 3 × DEPTHS × 2.
+pub(in crate::experts) const LOOKS: usize = SEEN_KINDS * super::DEPTHS * 2;
 
 impl Look {
     /// The look `source` names by.
@@ -778,6 +787,7 @@ impl Look {
         let seen = match source {
             Source::Ahead(_) | Source::Exact => Seen::Route,
             Source::Token => Seen::Token,
+            Source::CrossPass => Seen::CrossPass,
         };
         Self { depth: source.depth(), seen, form: Form::of(source.verifies()) }
     }
@@ -790,8 +800,9 @@ impl Look {
         let seen = match self.seen {
             Seen::Route => 0,
             Seen::Token => 1,
+            Seen::CrossPass => 2,
         };
-        (depth * 2 + seen) * 2 + self.form as usize
+        (depth * SEEN_KINDS + seen) * 2 + self.form as usize
     }
 }
 
@@ -3920,6 +3931,52 @@ mod tests {
             });
             assert_eq!(ledger.leading(0, 30).expect("bound to step 3").when, When::Step(3));
         }
+    }
+
+    /// Cross-pass intra-token foresight (`Source::CrossPass`) registers a
+    /// same-step future `visit_layer` deadline for a shared physical stack,
+    /// schedules a read-ahead at that deadline, and calibrates its live
+    /// precision independently from token-conditioned foresight.
+    #[test]
+    fn cross_pass_foresight_registers_same_step_deadline_and_calibrates() {
+        let time = Time::new(&[vec![4]], 32);
+        let stands = Stands::new(time.clone());
+        // 4 visits (0, 1, 2, 3) all in group 0; visit 0 and visit 2 share stack 0.
+        let mut ledger = Ledger::new(vec![0, 0, 0, 0], 4, time, stands);
+        let t0 = now();
+        let cross = Name {
+            source: Source::CrossPass,
+            when: When::Step(5),
+            rank: 0,
+            from: At::whole(5, 0),
+            candidate: true,
+            lineage: None,
+        };
+        let p = ledger.publish(2, 7, cross, t0).expect("cross-pass interest publishes");
+        assert_eq!(p, 1.0, "uncalibrated cross-pass rate starts at its bound 1.0");
+        assert_eq!(ledger.wanted(), vec![(2, 7)]);
+
+        let scheduled = ledger.schedule(vec![(2, 7)], |_, _| Read::Absent, |_| PRICE);
+        assert_eq!(scheduled.len(), 1);
+        assert_eq!(scheduled[0].layer, 2);
+        assert_eq!(scheduled[0].expert, 7);
+        assert_eq!(scheduled[0].act, Act::Issue(Class::Expected { step: 5, p: 1.0 }));
+
+        // Step 5 completes: visit 2 did NOT choose expert 7, so calibration drops to 0.0,
+        // while Source::Token remains untouched at 1.0.
+        ledger.pass(2, t0 + std::time::Duration::from_millis(1), |interest| interest.step() == 5);
+        ledger.tell(Told::Completed {
+            step: 5,
+            chose: vec![vec![], vec![], vec![], vec![]],
+            guesses: None,
+            row_experts: Vec::new(),
+            physical_rows: 1,
+            layer_misses: Vec::new(),
+        });
+        let cross_key = Combination::of([Kind { source: Source::CrossPass, rank: 0 }]).unwrap();
+        let token_key = Combination::of([Kind { source: TOKEN, rank: 0 }]).unwrap();
+        assert_eq!(ledger.rate(2, cross_key), 0.0, "cross-pass calibrated from visit 2 outcome");
+        assert_eq!(ledger.rate(2, token_key), 1.0, "token-conditioned calibration is independent");
     }
 
     #[test]

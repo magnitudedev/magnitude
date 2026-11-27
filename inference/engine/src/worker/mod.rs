@@ -441,7 +441,7 @@ fn load(
                 .map_err(|error| LoadError::Unsupported(error.into()))?,
             ),
         };
-        let projection = usize::try_from(definition.decoder.vocabulary)
+        let projection = usize::try_from(definition.decoder.active_vocabulary())
             .map_err(|_| internal("model vocabulary exceeds the host domain"))?;
         let binding =
             GenerationBinding::new(tokenizer, projection, CONSTRAINT_CACHE)

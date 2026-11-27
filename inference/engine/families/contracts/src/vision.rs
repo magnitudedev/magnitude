@@ -518,17 +518,23 @@ pub enum VisionOperator {
     GatedConvolution(VisionGatedConvolution),
 }
 
-/// One tower block: `x += post(operator(norm(x)))`, then
-/// `x += post(feed_forward(norm(x)))`; an absent post-norm adds the
-/// sublayer's output directly.
+/// One tower block: `x += ls1 ⊙ post(operator(norm(x)))`, then
+/// `x += ls2 ⊙ post(feed_forward(norm(x)))`; an absent post-norm or layer
+/// scale passes the sublayer's output through unchanged.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct VisionBlock {
     pub operator_norm: VisionNorm,
     pub operator: VisionOperator,
     pub operator_post_norm: Option<VisionNorm>,
+    /// Optional per-channel LayerScale gamma `[hidden]` on the operator branch.
+    #[serde(default)]
+    pub ls1: Option<WeightDescriptor>,
     pub feedforward_norm: VisionNorm,
     pub feedforward: VisionFeedForward,
     pub feedforward_post_norm: Option<VisionNorm>,
+    /// Optional per-channel LayerScale gamma `[hidden]` on the feed-forward branch.
+    #[serde(default)]
+    pub ls2: Option<WeightDescriptor>,
 }
 
 /// How the G = `merge`² tower rows of one cell become one row.
@@ -669,6 +675,9 @@ pub enum VisionWeight {
     },
     QueryNorm,
     KeyNorm,
+    /// Per-channel LayerScale gammas (`ls1`, `ls2`) on a vision block.
+    OperatorLayerScale,
+    FeedForwardLayerScale,
     /// A gated convolution's per-channel kernel.
     ConvolutionKernel,
     StandardizeBias,
@@ -1007,12 +1016,18 @@ impl VisionDescription {
         if let Some(norm) = &block.operator_post_norm {
             norm.validate(hidden, "vision operator post-norm")?;
         }
+        if let Some(ls1) = &block.ls1 {
+            expect_shape(ls1, &[hidden], "vision operator layer scale")?;
+        }
         block
             .feedforward_norm
             .validate(hidden, "vision feed-forward norm")?;
         Self::validate_feed_forward(&block.feedforward, hidden)?;
         if let Some(norm) = &block.feedforward_post_norm {
             norm.validate(hidden, "vision feed-forward post-norm")?;
+        }
+        if let Some(ls2) = &block.ls2 {
+            expect_shape(ls2, &[hidden], "vision feed-forward layer scale")?;
         }
         Ok(())
     }
@@ -1118,12 +1133,18 @@ impl VisionDescription {
             if let Some(norm) = &block.operator_post_norm {
                 norm.weights(scope, VisionNormSite::OperatorOutput, &mut out);
             }
+            if let Some(ls1) = &block.ls1 {
+                out.push((role(scope, VisionWeight::OperatorLayerScale), ls1));
+            }
             block
                 .feedforward_norm
                 .weights(scope, VisionNormSite::FeedForwardInput, &mut out);
             block.feedforward.weights(scope, &mut out);
             if let Some(norm) = &block.feedforward_post_norm {
                 norm.weights(scope, VisionNormSite::FeedForwardOutput, &mut out);
+            }
+            if let Some(ls2) = &block.ls2 {
+                out.push((role(scope, VisionWeight::FeedForwardLayerScale), ls2));
             }
         }
         let merger = &self.merger;

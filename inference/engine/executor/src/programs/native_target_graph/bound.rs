@@ -46,6 +46,9 @@ pub(crate) struct BoundTargetGraphs {
     /// The expert bank of a load that streams its routed experts: every
     /// step is one of its steps.
     pub bank: Option<Arc<crate::experts::ExpertBank>>,
+    /// Bound `ResidualForm::BlockAttention` executor when the target uses
+    /// Block Attention Residuals (Inkling 2); `None` for standard sealed graphs.
+    pub(crate) block_attn_res: Option<Arc<super::block_attn_res::BoundBlockAttnRes>>,
 }
 
 /// A run of a step of its load's expert bank: the bank, the step's
@@ -605,6 +608,7 @@ impl BoundTargetGraphs {
             .chain(self.floor.storage())
             .chain(held.iter().flat_map(|held| held.storage()))
             .chain(self.notice.iter().map(SelectionNotice::copies))
+            .chain(self.block_attn_res.iter().flat_map(|bar| bar.constant_tensors()))
             .for_each(visit);
     }
 

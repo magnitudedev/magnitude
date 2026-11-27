@@ -44,7 +44,7 @@ impl<'a> QualificationView<'a> {
         // Exercise both cuts together, across the vocabulary's first and last
         // tokens. Equal peaks test the stable tie cutoff; unequal peaks test
         // that the maximum's fixed-point mass is exactly one unit.
-        let vocabulary = self.geometry.vocabulary;
+        let vocabulary = self.geometry.active_vocabulary();
         for (second, top_p, keep_second) in [(4.0_f32, 0.5_f32, false), (3.0, 0.8, true)] {
             let values = (0..vocabulary)
                 .map(|token| {
@@ -113,7 +113,7 @@ impl<'a> QualificationView<'a> {
         // Logits ascend with the token. Row 0 is unconstrained (its empty
         // mask is ignored) and selects the last token; row 1 admits only
         // token 0.
-        let vocabulary = self.geometry.vocabulary;
+        let vocabulary = self.geometry.active_vocabulary();
         let words = vocabulary.div_ceil(32);
         let values = (0..2 * vocabulary)
             .map(|index| (index % vocabulary) as f32)

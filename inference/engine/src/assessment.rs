@@ -1091,8 +1091,13 @@ fn prepare_model_assessment_with(
                             });
                         }
                     };
-                    let planned_res =
-                        plan_package(&pkg_headers, definition, drafter, structure, preplanned);
+                    let planned_res = plan_package(
+                        &pkg_headers,
+                        Box::new(definition),
+                        drafter,
+                        structure,
+                        preplanned,
+                    );
                     (Ok(chat), fingerprint, planned_res)
                 }
                 DeferredChat::Pending(bundle) => {
@@ -1100,7 +1105,7 @@ fn prepare_model_assessment_with(
                     let target_dir = pkg_headers.target();
                     let (((chat_res, chat_ns), (fingerprint, fp_ns)), planned_res) = pool::join(
                         move || inspect_chat_and_fingerprint(bundle, target_dir, recording),
-                        || plan_package(&pkg_headers, definition, drafter, structure, preplanned),
+                        || plan_package(&pkg_headers, Box::new(definition), drafter, structure, preplanned),
                     );
                     if recording {
                         stage_timer::record_stage(|t| {
@@ -1174,7 +1179,7 @@ fn prepare_model_assessment_with(
             // each other and with `plan_package`.
             let (((chat_res, chat_ns), (fingerprint, fp_ns)), planned_res) = pool::join(
                 move || inspect_chat_and_fingerprint(bundle, target_dir, recording),
-                || plan_package(&pkg_headers, definition, drafter, structure, None),
+                || plan_package(&pkg_headers, Box::new(definition), drafter, structure, None),
             );
             if recording {
                 stage_timer::record_stage(|t| {
@@ -1369,7 +1374,7 @@ fn apply_served_context(
 /// target's alone otherwise; or the target's refusal.
 fn plan_package(
     headers: &PackageHeaders,
-    plain_definition: ModelDefinition,
+    plain_definition: Box<ModelDefinition>,
     drafter: DrafterAdmission,
     structure: &AssessmentStructure,
     mut preplanned_plain: Option<Result<FloorForms<()>, Refusal>>,
@@ -1457,7 +1462,7 @@ fn plan_package(
                 None => {
                     package.draft = None;
                     let plain = environment
-                        .plain_with_package(package, plain_definition)
+                        .plain_with_package(package, *plain_definition)
                         .map_err(ModelAssessmentError::Configuration)?;
                     let outline = |definition: &ModelDefinition, draft: &ExecutionPlanDraft| {
                         StructuralCharge::of(definition, draft).map(|charge| (charge, ()))
@@ -1479,7 +1484,7 @@ fn plan_package(
                         Ok(planned) => planned,
                         Err(refusal) => return refused(refusal),
                     };
-                    (plain.definition, forms, demands_res, dd_ns)
+                    (Box::new(plain.definition), forms, demands_res, dd_ns)
                 }
             };
             if recording {
@@ -1491,7 +1496,7 @@ fn plan_package(
                 Err(error) => return Err(ModelAssessmentError::Assessment(error)),
             };
             let execution = PreparedExecutionAssessment::from_demands(
-                plain_definition,
+                *plain_definition,
                 forms,
                 demands,
             );
@@ -2363,7 +2368,7 @@ fn assemble_header_bundle(
 ) -> HeaderBundle {
     let mut refusals = Vec::new();
     if let (Ok((_, interpreted)), Ok(vocabulary)) = (&interpreted, &vocabulary) {
-        if u64::try_from(*vocabulary).ok() != Some(interpreted.definition.decoder.vocabulary) {
+        if u64::try_from(*vocabulary).ok() != Some(interpreted.definition.decoder.active_vocabulary()) {
             refusals.push(vocabulary_mismatch(&tokenizer));
         }
     }

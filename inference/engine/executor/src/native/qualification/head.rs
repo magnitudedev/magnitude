@@ -9,7 +9,7 @@ impl<'a> QualificationView<'a> {
         else {
             return Ok(());
         };
-        let (hidden, vocabulary) = (self.geometry.hidden, self.geometry.vocabulary);
+        let (hidden, vocabulary) = (self.geometry.hidden, self.geometry.active_vocabulary());
         for (index, (&binding, block)) in head_plan.blocks().iter().zip(&head.blocks).enumerate() {
             let label = format!("{binding:?}");
             // The head block's feed-forward sublayer.

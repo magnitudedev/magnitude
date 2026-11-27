@@ -2419,6 +2419,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "magnitude-family-inkling2"
+version = "0.1.0"
+dependencies = [
+ "magnitude-artifacts",
+ "magnitude-family-common",
+ "magnitude-family-contracts",
+ "magnitude-family-dflash",
+]
+
+[[package]]
 name = "magnitude-family-lfm2"
 version = "0.1.0"
 dependencies = [
@@ -2492,6 +2502,7 @@ dependencies = [
  "magnitude-family-deepseek41",
  "magnitude-family-gemma4",
  "magnitude-family-glm5next",
+ "magnitude-family-inkling2",
  "magnitude-family-lfm2",
  "magnitude-family-llama",
  "magnitude-family-muse-glimmer",

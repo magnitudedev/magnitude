@@ -370,7 +370,7 @@ impl<'a> QualificationView<'a> {
             .map_err(|error| qualification_dynamic("readout_features_rows", &label, error))?
             .value;
         require_finite_nonzero(&features, "readout_features_rows", &label)?;
-        let vocabulary = self.geometry.vocabulary;
+        let vocabulary = self.geometry.active_vocabulary();
         let readout = match &self.programs.target.readout.head {
             ReadoutHeadKernels::Qualified {
                 packed,

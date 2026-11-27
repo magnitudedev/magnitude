@@ -204,7 +204,10 @@ mod tests {
                 epsilon: 1e-8,
             });
         }
-        definition.decoder.entry.norm = Some(UnweightedRms { epsilon: 1e-5 });
+        definition.decoder.entry.norm =
+            Some(magnitude_family_contracts::EntryNorm::Unweighted(UnweightedRms {
+                epsilon: 1e-5,
+            }));
         definition.decoder.exit.softcap = Some(20.0);
         definition
     }

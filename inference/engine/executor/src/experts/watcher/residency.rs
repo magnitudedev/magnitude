@@ -452,14 +452,15 @@ impl Residency {
                     let layer_bytes = self.core.layers[layer].expert_bytes();
                     let (gpu_host_misses, _) =
                         layer_misses.get(layer).copied().unwrap_or((0, 0));
-                    let group = self.core.directory.layer_groups()[layer];
+                    let stack = self.core.stack(layer);
+                    let group = self.core.directory.layer_groups()[stack];
                     self.core.directory.observe_demand_misses(
                         group,
                         gpu_host_misses as usize,
                         physical_rows as usize,
                     );
                     for chosen in choices.iter_mut() {
-                        if let Some(lp) = self.prefetch.take_landed_prefetch((layer, chosen.expert)) {
+                        if let Some(lp) = self.prefetch.take_landed_prefetch((stack, chosen.expert)) {
                             engagement.record_landed_hit(lp.bytes, lp.carryover);
                         }
                         let link_landed = self.ledger.has_link_landed(step, layer, chosen.expert);
@@ -472,9 +473,13 @@ impl Residency {
             }
             let _ = self.ledger.tell(event);
             if began_step.is_some() || draft_tokens {
-                self.core
-                    .directory
-                    .set_token_reads(self.ledger.token_protected().iter().copied());
+                let core_layers = &self.core.layers;
+                self.core.directory.set_token_reads(
+                    self.ledger
+                        .token_protected()
+                        .iter()
+                        .map(|&((layer, expert), step, p)| ((core_layers[layer].stack, expert), step, p)),
+                );
             }
             if let Some(step) = began_step {
                 if let Some((step, m_active)) = decode_began {
@@ -497,8 +502,8 @@ impl Residency {
                 self.prefetch.on_request_closed();
                 let site_served = self.shared.compute.site_served();
                 let mut residency = self.shared.telemetry.residency();
-                residency.vram_held = (0..self.core.layers.len())
-                    .map(|layer| self.core.directory.tier0_held_count(layer) as u64)
+                residency.vram_held = (0..self.core.directory.layers())
+                    .map(|stack| self.core.directory.tier0_held_count(stack) as u64)
                     .sum();
                 residency.vram_capacity = self
                     .core
@@ -616,9 +621,12 @@ impl Residency {
                 }
             }
             let scratch = &self.scratch;
-            self.prefetch.cover(&mut self.core, &self.shared, |staged| scratch.carries(staged));
+            let stack_visits = self.core.stack_visits.clone();
+            self.prefetch.cover(&mut self.core, &self.shared, |staged| {
+                stack_visits[staged.0].iter().any(|&visit| scratch.carries((visit, staged.1)))
+            });
             for staged in self.scratch.awaited(&self.core) {
-                self.prefetch.hasten(staged);
+                self.prefetch.hasten((self.core.stack(staged.0), staged.1));
             }
         }
         true
@@ -849,8 +857,9 @@ impl Residency {
         if self.published.holdings != Some(holdings) {
             let Published { held, alone, .. } = &mut self.published;
             for layer in 0..self.core.layers.len() {
-                held[layer] = self.core.directory.held_count(layer);
-                alone[layer] = self.core.directory.alone(layer);
+                let stack = self.core.stack(layer);
+                held[layer] = self.core.directory.held_count(stack);
+                alone[layer] = self.core.directory.alone(stack);
             }
             self.shared.telemetry.publish_held(held, alone);
             self.published.holdings = Some(holdings);
@@ -945,7 +954,9 @@ impl Residency {
         // Per-layer residency at home: every expert `0..E` of `layer` is
         // currently kept at its home record `home + e` (so every slab in
         // `[home .. home + E)` is backed and holds its expert weight).
-        let at_home = (0..layer_count).map(|layer| directory.layer_at_home(layer)).collect::<Vec<_>>();
+        let at_home = (0..layer_count)
+            .map(|layer| directory.layer_at_home(self.core.stack(layer)))
+            .collect::<Vec<_>>();
         let every = at_home.iter().all(|&home| home);
         let lender = self.scratch.conveyor.lending().group;
         let lent = match self.core.extents.placer {
@@ -954,10 +965,10 @@ impl Residency {
         };
         // When any layer is not resident (`!every`), a prompt group may lease
         // `[0 .. lent)` of `lender` mid-flight. Only layers whose home range
-        // overlaps `[0 .. lent)` (i.e. `home(layer) < lent` in `lender`) are
+        // overlaps `[0 .. lent)` (i.e. `home(stack) < lent` in `lender`) are
         // exposed to that lease; all other layers in `lender` are disjoint.
         let mut whole = (0..layer_count)
-            .map(|layer| at_home[layer] && (every || self.core.layers[layer].group != lender || directory.home(layer) >= lent))
+            .map(|layer| at_home[layer] && (every || self.core.layers[layer].group != lender || directory.home(self.core.stack(layer)) >= lent))
             .collect::<Vec<_>>();
         // Whole layers are protected from mid-flight eviction while
         // `POLICY_WHOLE == 1`. When a group is partially whole, ensure the
@@ -968,10 +979,10 @@ impl Residency {
         // - `Placer::Tier`: at least `K` bank records beyond `lent`.
         let need = self.core.extents.selected;
         for group in 0..self.core.groups.len() {
-            let members: Vec<usize> = (0..layer_count)
-                .filter(|&layer| self.core.layers[layer].group == group)
+            let group_stacks: Vec<usize> = (0..self.core.stack_visits.len())
+                .filter(|&stack| self.core.layers[self.core.stack_rep(stack)].group == group)
                 .collect();
-            if members.iter().all(|&layer| whole[layer]) {
+            if group_stacks.iter().all(|&stack| whole[self.core.stack_rep(stack)]) {
                 continue;
             }
             let (total_records, lent_in_group, min_evictable) = match self.core.extents.placer {
@@ -987,18 +998,21 @@ impl Residency {
                 ),
             };
             let usable = total_records.saturating_sub(lent_in_group);
-            let mut whole_records: usize = members
+            let mut whole_records: usize = group_stacks
                 .iter()
-                .filter(|&&layer| whole[layer])
-                .map(|&layer| self.core.layers[layer].experts)
+                .filter(|&&stack| whole[self.core.stack_rep(stack)])
+                .map(|&stack| self.core.layers[self.core.stack_rep(stack)].experts)
                 .sum();
-            for &layer in members.iter().rev() {
+            for &stack in group_stacks.iter().rev() {
                 if usable.saturating_sub(whole_records) >= min_evictable {
                     break;
                 }
-                if whole[layer] {
-                    whole[layer] = false;
-                    whole_records -= self.core.layers[layer].experts;
+                let rep = self.core.stack_rep(stack);
+                if whole[rep] {
+                    for &visit in &self.core.stack_visits[stack] {
+                        whole[visit] = false;
+                    }
+                    whole_records -= self.core.layers[rep].experts;
                 }
             }
         }
@@ -1068,12 +1082,16 @@ impl Residency {
             let beside = self.shared.telemetry.beside();
             let terms = self.shared.telemetry.terms();
             for (layer, lines) in lines.iter().enumerate() {
-                self.core.directory.price_copies(layer, crate::assessment::copy_hits(lines, copy, beside));
+                let stack = self.core.stack(layer);
+                if layer != self.core.stack_rep(stack) {
+                    continue;
+                }
+                self.core.directory.price_copies(stack, crate::assessment::copy_hits(lines, copy, beside));
                 // A write-back holds the link its record's transfer out of
                 // the device, on the transfer queue's line that way.
                 let link = copy.back.transfer_seconds(lines.host.record_bytes as f64);
                 let price = terms.map(|(terms, drive)| crate::experts::directory::WriteBack { terms, drive, link });
-                self.core.directory.price_write_backs(layer, price);
+                self.core.directory.price_write_backs(stack, price);
             }
         }
         // A layer whose misses the transport lands by DMA beside the step
@@ -1088,9 +1106,9 @@ impl Residency {
             let active = has_decode_dma
                 && self
                     .core
-                    .directory
-                    .group_layers(group)
-                    .any(|layer| !self.core.layers[layer].draft);
+                    .layers
+                    .iter()
+                    .any(|layer| layer.group == group && !layer.draft);
             self.core.directory.set_group_splitting(group, active);
         }
         let mut initial_log = None;
@@ -1142,7 +1160,10 @@ impl Residency {
     /// and those its group's host tier holds alone.
     pub(super) fn describe(&self) -> String {
         let layers = (0..self.core.layers.len())
-            .map(|layer| (self.core.directory.held_count(layer), self.core.directory.alone(layer)))
+            .map(|layer| {
+                let stack = self.core.stack(layer);
+                (self.core.directory.held_count(stack), self.core.directory.alone(stack))
+            })
             .collect::<Vec<_>>();
         format!(
             "{}; promotions {}; {}; {}; tier keeps every expert {}; retired through {}; records taken {}; resize asked {}; \

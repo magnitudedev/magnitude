@@ -29,7 +29,7 @@ use crate::programs::native_target_graph::{
     PlannedWeights, WeightPart, WeightPort, WeightScale, packed_weight, scaled_weight, weight, weight_port,
 };
 use crate::{GeneralRoutedBinding, GeneralRoutedShape, ModelLoadPlan};
-use magnitude_family_contracts::{GluLimit, WeightKind, WeightRole, WeightScope};
+use magnitude_family_contracts::{WeightKind, WeightRole, WeightScope};
 use magnitude_kernels::{
     dense_expand, dense_output, dense_up, project_rows, routed_down, routed_down_project, routed_down_sited, routed_experts,
     routed_experts_up, routed_gate_up, routed_group, routed_scatter, routed_select,
@@ -548,6 +548,7 @@ impl SumBase {
                     (ExpansionEntry::Gated(entry), true) => {
                         let gate = packed_weight(graph, planned, scope, WeightKind::SharedGate, weights, constants)?;
                         let up = packed_weight(graph, planned, scope, WeightKind::SharedUp, weights, constants)?;
+                        let glu_limit = crate::operators::GluLimitBinding::new(&table, form.limit);
                         graph
                             .enqueue(
                                 G::pick(entry, rows),
@@ -558,7 +559,7 @@ impl SumBase {
                                         ("US", up.operands.scale.extent.clone()),
                                         ("GB", gate.operands.bound.extent.clone()),
                                         ("UB", up.operands.bound.extent.clone()),
-                                        ("LB", Dim::from(GluLimit::word(form.limit))),
+                                        glu_limit.dim(),
                                     ],
                                 ]
                                 .concat(),
@@ -574,7 +575,7 @@ impl SumBase {
                                     up_scale: (&up.operands.scale.tensor).into(),
                                     gate_bound: (&gate.operands.bound.tensor).into(),
                                     up_bound: (&up.operands.bound.tensor).into(),
-                                    glu_limit: (&crate::operators::glu_limit(&table, form.limit)).into(),
+                                    glu_limit: glu_limit.port().into(),
                                 },
                             )?
                             .value
@@ -764,6 +765,7 @@ fn expand<'a, G: GraphDraft + 'a>(
     let RecordTensors { gate, up, down } = &reads.stacks;
     Ok(match (entries, gate, &records.gate, &stacks.gate) {
         (ExpertEntries::Gated { grouped, .. }, Some(gate), Some(records_gate), Some((_, gate_scale))) => {
+            let glu_limit = crate::operators::GluLimitBinding::new(first, form.experts_expansion.limit);
             graph
                 .enqueue(
                     G::pick(grouped, rows),
@@ -772,7 +774,7 @@ fn expand<'a, G: GraphDraft + 'a>(
                         &[
                             ("GS", gate_scale.extent.clone()),
                             ("US", stacks.up_scale.extent.clone()),
-                            ("LB", Dim::from(GluLimit::word(form.experts_expansion.limit))),
+                            glu_limit.dim(),
                         ],
                     ]
                     .concat(),
@@ -794,7 +796,7 @@ fn expand<'a, G: GraphDraft + 'a>(
                         activation,
                         gate_scale: (&gate_scale.tensor).into(),
                         up_scale: (&stacks.up_scale.tensor).into(),
-                        glu_limit: (&crate::operators::glu_limit(first, form.experts_expansion.limit)).into(),
+                        glu_limit: glu_limit.port().into(),
                     },
                 )?
                 .value
@@ -1048,12 +1050,13 @@ fn unified_decode_general<'a, G: GraphDraft + 'a, W: PlannedWeights + ?Sized>(
             .ok_or("a gated unified decode layer lacks expert_gate")?;
         let mut hits_expert_dims = expert_dims.clone();
         hits_expert_dims[2] = ("E", layer.numbers().stage_base.clone());
+        let glu_limit = crate::operators::GluLimitBinding::new(routes.tensor(), form.experts_expansion.limit);
         let hit_gate_up_dims = [
             hits_expert_dims.as_slice(),
             &[
                 ("GS", gate_scale.extent.clone()),
                 ("US", stacks.up_scale.extent.clone()),
-                ("LB", Dim::from(GluLimit::word(form.experts_expansion.limit))),
+                glu_limit.dim(),
             ],
             &map_dimension,
         ]
@@ -1063,12 +1066,11 @@ fn unified_decode_general<'a, G: GraphDraft + 'a, W: PlannedWeights + ?Sized>(
             &[
                 ("GS", gate_scale.extent.clone()),
                 ("US", stacks.up_scale.extent.clone()),
-                ("LB", Dim::from(GluLimit::word(form.experts_expansion.limit))),
+                glu_limit.dim(),
             ],
             &map_dimension,
         ]
         .concat();
-        let glu_limit = crate::operators::glu_limit(routes.tensor(), form.experts_expansion.limit);
         let front_tier_gate = front_reads.tier.gate.as_ref().ok_or("a gated layer's reads lack its gate")?;
         let back_tier_gate = back_reads.tier.gate.as_ref().ok_or("a gated layer's reads lack its gate")?;
         // Disjoint resident slice `[0 .. stage_base)` so `DecodeHits` forks
@@ -1090,7 +1092,7 @@ fn unified_decode_general<'a, G: GraphDraft + 'a, W: PlannedWeights + ?Sized>(
                 activation,
                 gate_scale: (&gate_scale.tensor).into(),
                 up_scale: (&stacks.up_scale.tensor).into(),
-                glu_limit: (&glu_limit).into(),
+                glu_limit: glu_limit.port().into(),
             },
             &hit_gate_up_dims,
             rows,
@@ -1148,7 +1150,7 @@ fn unified_decode_general<'a, G: GraphDraft + 'a, W: PlannedWeights + ?Sized>(
                 activation,
                 gate_scale: (&gate_scale.tensor).into(),
                 up_scale: (&stacks.up_scale.tensor).into(),
-                glu_limit: (&glu_limit).into(),
+                glu_limit: glu_limit.port().into(),
             },
             &gate_up_dims,
             rows,
@@ -1202,17 +1204,17 @@ fn unified_decode_general<'a, G: GraphDraft + 'a, W: PlannedWeights + ?Sized>(
     layer.record_unified_decode(front_sources, back_sources, ready_slot, land_gate, false);
     let product = match (experts, stacks.gate.as_ref()) {
         (ExpertEntries::Gated { decode, .. }, Some((expert_gate, gate_scale))) => {
+            let glu_limit = crate::operators::GluLimitBinding::new(routes.tensor(), form.experts_expansion.limit);
             let gate_up_dims = [
                 expert_dims.as_slice(),
                 &[
                     ("GS", gate_scale.extent.clone()),
                     ("US", stacks.up_scale.extent.clone()),
-                    ("LB", Dim::from(GluLimit::word(form.experts_expansion.limit))),
+                    glu_limit.dim(),
                 ],
                 &map_dimension,
             ]
             .concat();
-            let glu_limit = crate::operators::glu_limit(routes.tensor(), form.experts_expansion.limit);
             let tier_gate = back_reads.tier.gate.as_ref().ok_or("a gated layer's reads lack its gate")?;
             graph
                 .enqueue(
@@ -1229,7 +1231,7 @@ fn unified_decode_general<'a, G: GraphDraft + 'a, W: PlannedWeights + ?Sized>(
                         activation,
                         gate_scale: (&gate_scale.tensor).into(),
                         up_scale: (&stacks.up_scale.tensor).into(),
-                        glu_limit: (&glu_limit).into(),
+                        glu_limit: glu_limit.port().into(),
                     },
                 )?
                 .value
@@ -1671,17 +1673,17 @@ pub(crate) fn general_routed<'a, G: GraphDraft + 'a>(
     let choices = StepChoices { routes: &routes_tensor, weights: &weights_tensor, input: &input, rows };
     let (product, split_published) = match (experts, gate) {
         (ExpertEntries::Gated { decode, .. }, Some((expert_gate, gate_scale))) => {
+            let glu_limit = crate::operators::GluLimitBinding::new(&routes_tensor, form.experts_expansion.limit);
             let dimensions = [
                 dimensions.as_slice(),
                 &[
                     ("GS", gate_scale.extent.clone()),
                     ("US", up_scale.extent.clone()),
-                    ("LB", Dim::from(GluLimit::word(form.experts_expansion.limit))),
+                    glu_limit.dim(),
                 ],
                 &map_dimension,
             ]
             .concat();
-            let glu_limit = crate::operators::glu_limit(&routes_tensor, form.experts_expansion.limit);
             let tier_gate = reads.tier.gate.as_ref().ok_or("a gated layer's reads lack its gate")?;
             let args = || routed_gate_up::WorkflowArgs {
                 normalized: (&input).into(),
@@ -1694,7 +1696,7 @@ pub(crate) fn general_routed<'a, G: GraphDraft + 'a>(
                 activation,
                 gate_scale: (&gate_scale.tensor).into(),
                 up_scale: (&up_scale.tensor).into(),
-                glu_limit: (&glu_limit).into(),
+                glu_limit: glu_limit.port().into(),
             };
             match &mut waiting {
                 Some((layer, step)) if layer.general_combine().is_some() => {

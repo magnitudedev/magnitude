@@ -64,6 +64,16 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
     /// feature in the activation representation.
     pub(super) fn head_conditioning_bytes(&self) -> usize {
         let decoder = &self.definition.decoder;
+        if let Some(draft) = &self.definition.draft {
+            if matches!(
+                draft.fusion,
+                magnitude_family_contracts::DraftFusion::SoftmaxMix { .. }
+            ) {
+                return draft.taps.len()
+                    * decoder.hidden as usize
+                    * decoder.activation_dtype.bytes();
+            }
+        }
         self.definition.head.as_ref().map_or(
             decoder.hidden as usize * decoder.activation_dtype.bytes(),
             |head| head.conditioning_width(decoder) as usize * if head.residual_conditioning() { 4 } else { decoder.activation_dtype.bytes() },
@@ -162,7 +172,7 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
                 bindings,
             ));
         }
-        let vocabulary = self.definition.decoder.vocabulary as usize;
+        let vocabulary = self.definition.decoder.active_vocabulary() as usize;
         let class_limits = self.head_class_limits();
         let batch = match form {
             DraftForm::Chained => heads
@@ -483,7 +493,7 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
             .collect::<Result<Vec<_>, _>>()?;
         let batch = crate::batching::ValidatedHeadBatch::from_slots(
             &slots,
-            self.definition.decoder.vocabulary as usize,
+            self.definition.decoder.active_vocabulary() as usize,
             self.head_class_limits(),
         )
         .map_err(|error| error.to_string())?;
@@ -691,7 +701,7 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
         ValidatedHeadBatch::from_front_slots(
             &slots,
             continuing,
-            self.definition.decoder.vocabulary as usize,
+            self.definition.decoder.active_vocabulary() as usize,
             self.head_class_limits(),
         )
         .map_err(|error| DomainError::invariant(error.to_string()))

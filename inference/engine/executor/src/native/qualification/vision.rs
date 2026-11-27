@@ -488,32 +488,74 @@ impl<'a> QualificationView<'a> {
                     require_values(&result, &expected, entry, label)?;
                 }
                 VisionEntry::PostNormResidual => {
-                    let entry = "post_norm_residual";
-                    let width = description.hidden;
-                    let input = pattern(rows * width, 9, 0);
-                    let result = prepared(&kernels.post_norm, kernel, entry, label)?
-                        .call(charges, post_norm_residual::Args {
-                            residual: &semantic_f32(charges, &[rows, width], &input, entry, label)?,
-                            projected: &zeros(entry, Element::f32(), &[rows, width])?,
-                            norm: &semantic_ones(charges, element("NW")?, &[width], entry, label)?,
-                            out_rows: &semantic_i32(
-                                charges,
-                                &[rows],
-                                &(0..rows as i32).collect::<Vec<_>>(),
-                                entry,
-                                label,
-                            )?,
-                            epsilon: 1.0e-6,
-                            scale: 1.0,
-                        })
-                        .map_err(|error| qualification_dynamic(entry, label, error))?
-                        .value;
-                    require_values(&result, &input, entry, label)?;
+                    qualify_post_norm_residual(charges, kernels, kernel, rows, description.hidden, label)?;
+                }
+                VisionEntry::ResidualAdd => {
+                    qualify_residual_add(charges, kernels, kernel, rows, description.hidden, label)?;
                 }
             }
         }
         Ok(())
     }
+}
+
+#[inline(never)]
+fn qualify_post_norm_residual(
+    charges: &seismic::Charges,
+    kernels: &crate::native::VisionKernels,
+    kernel: &VisionKernel,
+    rows: u64,
+    width: u64,
+    label: &str,
+) -> Result<(), CatalogFailure> {
+    let entry = "post_norm_residual";
+    let input = pattern(rows * width, 9, 0);
+    let result = prepared(&kernels.post_norm, kernel, entry, label)?
+        .call(
+            charges,
+            post_norm_residual::Args {
+                residual: &semantic_f32(charges, &[rows, width], &input, entry, label)?,
+                projected: &semantic_zeros(charges, Element::f32(), &[rows, width], entry, label)?,
+                norm: &semantic_ones(charges, element(kernel, "NW", label)?, &[width], entry, label)?,
+                out_rows: &semantic_i32(
+                    charges,
+                    &[rows],
+                    &(0..rows as i32).collect::<Vec<_>>(),
+                    entry,
+                    label,
+                )?,
+                epsilon: 1.0e-6,
+                scale: 1.0,
+            },
+        )
+        .map_err(|error| qualification_dynamic(entry, label, error))?
+        .value;
+    require_values(&result, &input, entry, label)
+}
+
+#[inline(never)]
+fn qualify_residual_add(
+    charges: &seismic::Charges,
+    kernels: &crate::native::VisionKernels,
+    kernel: &VisionKernel,
+    rows: u64,
+    width: u64,
+    label: &str,
+) -> Result<(), CatalogFailure> {
+    let entry = "stream_join";
+    let input = pattern(rows * width, 11, 0);
+    let result = prepared(&kernels.residual_add, kernel, entry, label)?
+        .call(
+            charges,
+            magnitude_kernels::stream_join::Args {
+                residual: &semantic_f32(charges, &[rows, width], &input, entry, label)?,
+                y: &semantic_zeros(charges, Element::f32(), &[rows, width], entry, label)?,
+                inject: &semantic_zeros(charges, Element::f32(), &[rows, 0], entry, label)?,
+            },
+        )
+        .map_err(|error| qualification_dynamic(entry, label, error))?
+        .value;
+    require_values(&result, &input, entry, label)
 }
 
 fn prepared<'a, K>(

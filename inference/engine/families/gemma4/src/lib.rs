@@ -25,7 +25,8 @@ use magnitude_artifacts::{
 };
 use magnitude_family_common::{rotary, HeaderError, Metadata, Tensors};
 use magnitude_family_contracts::{
-    checked_product, ActivationDType, ActivationFunction, Attention, AttentionGate, Block, Branch,
+    checked_product, ActivationDType, ActivationFunction, Attention, AttentionGate, AttentionSinks,
+    Block, Branch,
     BranchOutput, Decoder, DenseFfn, EmbeddingScale, EntryForm, ExitForm, ExitNorm,
     ExpertSelection, FamilyId, FeedForwardUp, HeadNorm, HistoryRows, HistorySource,
     ImportTransform, InputNorm, InputSemantics, MediaRowAttention, ModelDefinition,
@@ -355,6 +356,7 @@ pub fn inspect_components(
             None => sublayers.push(Sublayer {
                 input,
                 op,
+                post_conv: None,
                 output: OutputForm::ScaledPostNorm {
                     norm: post_feed_forward,
                     layer_scale,
@@ -364,6 +366,7 @@ pub fn inspect_components(
                 sublayers.push(Sublayer {
                     input,
                     op,
+                    post_conv: None,
                     output: OutputForm::PostNorm(post_feed_forward),
                 });
                 sublayers.push(Sublayer {
@@ -375,6 +378,7 @@ pub fn inspect_components(
                         gate: b.bind(&format!("{p}inp_gate.weight"), &[entry.width, hidden])?,
                         projection: b.bind(&format!("{p}proj.weight"), &[hidden, entry.width])?,
                     })),
+                    post_conv: None,
                     output: OutputForm::ScaledPostNorm {
                         norm: shape.rms(b.bind(&format!("{p}post_norm.weight"), &[hidden])?),
                         layer_scale,
@@ -382,7 +386,10 @@ pub fn inspect_components(
                 });
             }
         }
-        blocks.push(Block { sublayers });
+        blocks.push(Block {
+            sublayers,
+            transition: None,
+        });
     }
     if experts.is_some() && routed_layers == 0 {
         return Err(invalid("Gemma expert metadata names no routed layer"));
@@ -415,6 +422,7 @@ pub fn inspect_components(
                 norm: ExitNorm::Rms(shape.rms(output_norm)),
                 output: embedding,
                 softcap: Some(softcap),
+                unpadded_vocabulary: None,
             },
         },
         head: None,
@@ -455,6 +463,8 @@ fn attention(
                 } else {
                     ValueSource::RawKey
                 },
+                key_conv: None,
+                value_conv: None,
                 key_norm: HeadNorm::Rms(
                     shape.rms(b.bind(&format!("{p}attn_k_norm.weight"), &[width])?),
                 ),
@@ -485,13 +495,16 @@ fn attention(
             query_norm,
             history: vec![HistorySource::visible(rows)],
             rotary: geometry.rotary.clone(),
+            relative_bias: None,
+            log_scale: None,
             scale: 1.0,
             media_rows: geometry.media_rows,
-            sinks: None,
+            sinks: AttentionSinks::None,
             output: OutputProjection::Full(
                 b.bind(&format!("{p}attn_output.weight"), &[hidden, head_rows])?,
             ),
         })),
+        post_conv: None,
         output: OutputForm::PostNorm(
             shape.rms(b.bind(&format!("{p}post_attention_norm.weight"), &[hidden])?),
         ),

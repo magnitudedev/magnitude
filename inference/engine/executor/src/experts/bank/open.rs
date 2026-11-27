@@ -516,17 +516,16 @@ fn watch(
     let mut bank_maps = Vec::new();
     let mut landing_maps = Vec::new();
     let stacks = plan.stored_stacks(artifact, draft)?;
-    let scratch_forms = plan.layer_scratch_forms();
-    // Where the host addresses the scratch (the one store's on unified
-    // memory, beside the conveyor), its slots carry experts too.
-    let addressed = matches!(plan.conveyor().carrier, ConveyorCarrier::Bank(_));
-    for (index, layer) in layout.layers.iter().enumerate() {
-        let group = plan.layers()[index].group;
+    let mut stack_stored: Vec<Arc<[StoredTensor]>> = Vec::with_capacity(stacks.len());
+    let mut map_views = Vec::with_capacity(stacks.len());
+    for (stack_id, stored_stack) in stacks.iter().enumerate() {
+        let rep = plan.stack_representative(stack_id);
+        let group = plan.layers()[rep].group;
         let stored = plan.groups()[group]
             .record
             .iter()
-            .zip(stacks[index].iter())
-            .zip(pool_of[index].iter())
+            .zip(stored_stack.iter())
+            .zip(pool_of[rep].iter())
             .map(|(((_, _), (_, stack)), (_, &pool))| {
                 let parts = stack
                     .parts
@@ -545,6 +544,33 @@ fn watch(
                 Ok::<_, String>(StoredTensor { parts, pool })
             })
             .collect::<Result<Vec<_>, _>>()?;
+        stack_stored.push(stored.into());
+        // Every entry unmapped, its one writer the bank's records beside a
+        // host tier (`experts::records`), where the host places the one
+        // store's host records through their landing map
+        // (`experts::host_records`), each the one writer of its tier map.
+        // Keyed by physical stack so visits sharing a stack share one map.
+        let map = StampedMap::new(words(&slot_maps[rep], 0)?);
+        let view = map.view().clone();
+        let landing = match plan.placer() {
+            Placer::Tier => {
+                bank_maps.push(map);
+                let tier = layout.layers[rep].tier.as_ref().ok_or("a layer beside a host tier has no tier map")?;
+                LandingMap::Tier(words(tier, -1)?)
+            }
+            Placer::Bank => LandingMap::Bank { map: Arc::new(map), steps: steps.clone() },
+        };
+        landing_maps.push(landing);
+        map_views.push(view);
+    }
+    let scratch_forms = plan.layer_scratch_forms();
+    // Where the host addresses the scratch (the one store's on unified
+    // memory, beside the conveyor), its slots carry experts too.
+    let addressed = matches!(plan.conveyor().carrier, ConveyorCarrier::Bank(_));
+    for (index, layer) in layout.layers.iter().enumerate() {
+        let group = plan.layers()[index].group;
+        let stack = plan.stack_of(index);
+        let stored = stack_stored[stack].clone();
         let experts = plan.layers()[index].experts;
         let layer_window = plan.layer_window(index);
         let slots = addressed
@@ -562,21 +588,6 @@ fn watch(
             // A layer whose stored expert outgrows its slot lends none.
             .filter(|slots: &Vec<Records>| stored.iter().zip(slots).all(|(stored, records)| stored.bytes() <= records.bytes()));
         let scratch_form = scratch_forms[index].iter().map(|(_, &form)| form).collect();
-        // Every entry unmapped, its one writer the bank's records beside a
-        // host tier (`experts::records`), where the host places the one
-        // store's host records through their landing map
-        // (`experts::host_records`), each the one writer of its tier map.
-        let map = StampedMap::new(words(&slot_maps[index], 0)?);
-        let view = map.view().clone();
-        let landing = match plan.placer() {
-            Placer::Tier => {
-                bank_maps.push(map);
-                let tier = layer.tier.as_ref().ok_or("a layer beside a host tier has no tier map")?;
-                LandingMap::Tier(words(tier, -1)?)
-            }
-            Placer::Bank => LandingMap::Bank { map: Arc::new(map), steps: steps.clone() },
-        };
-        landing_maps.push(landing);
         // A round converts conveyor records, or the scratch slots the
         // layer's experts were read into where the host addresses the
         // scratch, into the scratch slot of each expert.
@@ -591,10 +602,12 @@ fn watch(
             .collect::<Result<Vec<_>, String>>()?;
         watched.push(Layer {
             group,
+            stack,
+            next_visit: plan.next_visit_of(index),
             draft: plan.layers()[index].is_draft(),
             experts: usize::try_from(experts).map_err(|_| "experts exceed the host")?,
             layer_window: usize::try_from(layer_window).map_err(|_| "layer window exceeds the host")?,
-            map: view,
+            map: map_views[stack].clone(),
             file: ExchangeTable::new(layer.file.clone(), plan.binding(index)?.words.file(), steps.pulse())?,
             scratch: ExchangeTable::new(layer.scratch.clone(), plan.binding(index)?.words.scratch(), steps.pulse())?,
             routing: words(&layer.routing, 0)?,
@@ -602,7 +615,7 @@ fn watch(
             front: words(&layer.front, 0)?,
             policy: words(&layer.policy, 0)?,
             site: site_layers.iter().find(|site| site.layer() == index).map(|site| site.slots().clone()),
-            stored: stored.into(),
+            stored,
             slots,
             scratch_tensors: plan.tier_copy_dma().then(|| {
                 scratch[index].iter().map(|(_, tensor)| tensor.clone()).collect()
@@ -838,17 +851,21 @@ fn watch(
         let stage_bases: Vec<u64> = (0..plan.groups().len()).map(|g| plan.records(g)).collect();
         let file_tables: Vec<ExchangeTable> = watched.iter().map(|layer| layer.file.clone()).collect();
         let draft_layers: Vec<bool> = watched.iter().map(|layer| layer.draft).collect();
-        Some(crate::experts::transport::DecodeDmaState::new(
-            transfer,
-            landed.clone(),
-            bank.clone(),
-            source_slots,
-            stage_bases,
-            selected,
-            &draft_layers,
-            file_tables,
-            steps.events().clone(),
-        ))
+        let stack_of: Vec<usize> = watched.iter().map(|layer| layer.stack).collect();
+        Some(
+            crate::experts::transport::DecodeDmaState::new(
+                transfer,
+                landed.clone(),
+                bank.clone(),
+                source_slots,
+                stage_bases,
+                selected,
+                &draft_layers,
+                file_tables,
+                steps.events().clone(),
+            )
+            .with_stacks(stack_of),
+        )
     } else {
         None
     };
@@ -900,6 +917,7 @@ fn watch(
     let tables = watched.iter().map(|layer| layer.scratch.clone()).collect();
     Watcher::start(WatcherParts {
         layers: watched,
+        footprints: plan.stack_record_bytes()?,
         group_reads,
         groups,
         load: LoadWords { flags },

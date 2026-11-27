@@ -131,6 +131,7 @@ pub(crate) fn prediction_head(
                     true,
                 )?),
                 op: Operator::Attention(Box::new(attention)),
+                post_conv: None,
                 output: OutputForm::Scatter,
             },
             Sublayer {
@@ -143,9 +144,11 @@ pub(crate) fn prediction_head(
                     true,
                 )?),
                 op: feed_forward,
+                post_conv: None,
                 output: OutputForm::Scatter,
             },
         ],
+        transition: None,
     };
     let output_norm = exit_norm(hyper_site(
         &geometry,

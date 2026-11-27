@@ -1,0 +1,16 @@
+[package]
+name = "magnitude-family-inkling2"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+magnitude-artifacts = { path = "../../artifacts" }
+magnitude-family-common = { path = "../common" }
+magnitude-family-contracts = { path = "../contracts" }
+
+[dev-dependencies]
+magnitude-family-dflash = { path = "../dflash" }
+
+[lints]
+workspace = true

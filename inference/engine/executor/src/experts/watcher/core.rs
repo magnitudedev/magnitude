@@ -54,9 +54,13 @@ impl StoredTensor {
     }
 }
 
-/// A streamed layer's words and records.
+/// A streamed layer's words and records (one visit in decoder order).
 pub(in crate::experts) struct Layer {
     pub group: usize,
+    /// Physical expert stack (`0..num_stacks`) this visit reads.
+    pub stack: usize,
+    /// Subsequent visit layer in decoder order sharing the same `stack`, if any.
+    pub next_visit: Option<usize>,
     /// Whether this streamed layer belongs to a separate draft model
     /// (`WeightScope::DraftSublayer`): target decode steps write routing
     /// records only for non-draft layers, and draft decode steps only for
@@ -539,6 +543,8 @@ pub(super) struct Core {
     pub(super) table: Arc<ReadTable>,
     pub(super) directory: Directory,
     pub(super) layers: Vec<Layer>,
+    /// For each physical stack `0..num_stacks`, its visit layer indices in decoder order.
+    pub(super) stack_visits: Vec<Vec<usize>>,
     pub(super) groups: Vec<Group>,
     pub(super) extents: Extents,
     /// The steps begun, under whose lock every map entry is written
@@ -552,6 +558,21 @@ pub(super) struct Core {
 }
 
 impl Core {
+    /// Physical expert stack index for visit layer `visit`.
+    pub(super) fn stack(&self, visit: usize) -> usize {
+        self.layers[visit].stack
+    }
+
+    /// Representative (first) visit layer index for physical stack `stack`.
+    pub(super) fn stack_rep(&self, stack: usize) -> usize {
+        self.stack_visits[stack][0]
+    }
+
+    /// All visit layer indices sharing physical stack `stack`, in decoder order.
+    pub(super) fn visits_of(&self, stack: usize) -> &[usize] {
+        &self.stack_visits[stack]
+    }
+
     /// The device is at `progress`: the records taken before it, now free.
     pub(super) fn take_past(&mut self, progress: Point) -> Vec<Listed> {
         let (done, kept): (Vec<_>, Vec<_>) = std::mem::take(&mut self.taken)
@@ -637,7 +658,7 @@ impl Core {
     }
 
     fn landing_from_leads<'a>(&self, grant: Grant, from: impl Fn(usize) -> (&'a Records, u64), lead: impl Fn(usize) -> usize) -> Landing {
-        let watched = &self.layers[grant.staged().0];
+        let watched = &self.layers[self.stack_rep(grant.staged().0)];
         let tensors = self.groups[watched.group].tier.as_ref().expect("a landing's group has a host tier");
         let landed = grant.record();
         Landing {

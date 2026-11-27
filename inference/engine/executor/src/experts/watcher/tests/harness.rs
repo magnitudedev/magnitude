@@ -603,11 +603,14 @@ pub(super) fn lending_windowed_passes(
     let layer_keys = (0..layers).map(|_| words(WORDS.flight * constants::VERIFY_ROWS * EXPERTS as u64, 0)).collect::<Vec<_>>();
     let watcher = Watcher::start_with_bounds(
         WatcherParts {
+        footprints: Vec::new(),
         layers: all
             .iter()
             .enumerate()
             .map(|(index, layer)| Layer {
                 group: 0,
+                stack: index,
+                next_visit: None,
                 draft: false,
                 experts: EXPERTS,
                 layer_window,

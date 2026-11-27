@@ -21,28 +21,31 @@ mod images;
 mod inputs;
 mod vision;
 pub use decoder::{
-    ActivationFunction, Attention, AttentionGate, Block, Branch, BranchOutput, Decoder,
-    DeferredForm, DenseFfn, EmbeddingScale, EntryForm, ExitForm, ExitNorm, ExpertSelection,
-    ExitSite, FeedForwardUp, GateFunction, GluLimit, GateGranularity, GatedDelta, HeadNorm, HistoryDomain,
-    BlockElement, BlockRounding, BlockScale, Candidates, HeadWeights, HistoryReads, HistoryRows,
-    HistorySource, HyperConnectionExit, HyperConnectionInput, HyperConnectionMixing,
-    HyperConnectionWeights, HyperConnections, LowRankGatedSite, Indexer, IndexerInput,
-    IndexerKeys, IndexerQuery, InputNorm, Pool, PoolNorm, PooledRows, ProjectedRows,
-    RowProducer, RowRounding, Selection, TokenDomain, LatentExperts, LayerNorm, MediaRowAttention,
-    NGramConvolution, NGramGate, NGramHash, NGramInput, NGramMedia, Operator, OutputForm, OutputProjection, OutputRotary, PerLayerEntry,
-    PerLayerInput, QueryKeys, QueryProjection, DecayGate, GateProjection, LowRank, RecurrentDecay,
-    RecurrentGate, RecurrentHeadMapping, ResidualForm, RmsNorm, Rotary,
-    RotaryDivisors, RotaryLayout, RotaryPair, RotaryPairing, RotaryPlacement,
-    RouteNormalization, RoutedFfn, Router, RouterInput, ScoreFunction, SharedExpert,
-    SharedExpertGate, ShortConv, SinkhornInput, SinkhornSite, StateSpace, Sublayer, SublayerIndex,
-    UnweightedRms, ValueNorm,
+    ActivationFunction, Attention, AttentionGate, AttentionSinks, Block, BlockAttentionInput,
+    BlockAttentionNorm, BlockAttentionQueries, BlockElement, BlockRounding, BlockScale,
+    BlockTransition, Branch, BranchOutput, Candidates, CausalShortConv, CrossPassInput,
+    CrossPassMessage, DecayGate, Decoder, DeferredForm, DenseFfn, DynamicConvTap, EmbeddingScale,
+    EntryForm, EntryNorm, ExitForm, ExitNorm, ExitSite, ExpertSelection, FeedForwardUp,
+    GateFunction, GateGranularity, GateProjection, GatedDelta, GluCap, GluLimit, HeadNorm,
+    HeadWeights, HistoryDomain, HistoryReads, HistoryRows, HistorySource, HyperConnectionExit,
+    HyperConnectionInput, HyperConnectionMixing, HyperConnectionWeights, HyperConnections,
+    Indexer, IndexerInput, IndexerKeys, IndexerQuery, InputNorm, LatentExperts, LayerNorm,
+    LogScale, LowRank, LowRankGatedSite, MediaRowAttention, MessageController, NGramConvolution,
+    NGramGate, NGramHash, NGramInput, NGramMedia, Operator, OutputForm, OutputProjection,
+    OutputRotary, PerLayerEntry, PerLayerInput, Pool, PoolNorm, PooledRows, ProjectedRows,
+    QueryKeys, QueryProjection, RecurrentDecay, RecurrentGate, RecurrentHeadMapping, RelativeBias,
+    ResidualForm, RmsNorm, Rotary, RotaryDivisors, RotaryLayout, RotaryPair, RotaryPairing,
+    RotaryPlacement, RouteNormalization, RoutedFfn, Router, RouterInput, RowProducer, RowRounding,
+    ScoreFunction, Selection, SharedExpert, SharedExpertGate, ShortConv, SinkhornInput,
+    SinkhornSite, StateSpace, Sublayer, SublayerIndex, TokenDomain, UnweightedRms, ValueNorm,
     ValueSource, grouped_output_columns,
 };
 pub use draft::{
     Affine, AffinePart, BlockAttention, BlockConvolutions, BlockLayout, CORRECTOR_FEATURES,
     CandidateCorrector, CandidateSelector, CenteredNorm, ConfidenceHead, CorrectorLayer,
-    CorrectorSite, CorrectorWeight, DraftDefinition, DraftEmbedding, DraftMethod, DraftVariant,
-    DynamicConvolution, LayerConvolutions, MarkovHead, TapPoint,
+    CorrectorSite, CorrectorWeight, DraftContextProjection, DraftDefinition, DraftEmbedding,
+    DraftFusion, DraftMask, DraftMethod, DraftVariant, DynamicConvolution, LayerConvolutions,
+    MarkovHead, RnnMarkovHead, TapPoint,
 };
 pub use family::{FamilyError, FamilyInputAdapter, MarkerTokens, ModelFamily};
 pub use images::{
@@ -695,15 +698,39 @@ pub enum WeightScope {
     CorrectorLayer(u32),
 }
 
+/// Which input stream a block-attention residual query or cross-pass message
+/// controller serves within a sublayer (or `Shared` for a single-stream site
+/// or exit query).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum BlockAttentionStream {
+    Shared,
+    Query,
+    Key,
+    Value,
+}
+
+/// Which projection of a [`MessageController`] a weight binds.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum MessageControllerPart {
+    Down,
+    Gain,
+    Forget,
+}
+
 /// Closed semantic role within a structural weight scope.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum WeightKind {
     Embedding,
+    /// Weighted entry normalization (`EntryNorm::Rms`, scope `Target`).
+    EntryNorm,
     PerLayerTable,
     PerLayerModelProjection,
     PerLayerProjectionNorm,
     /// A sublayer's or branch's input normalization.
     InputNorm,
+    /// Per-stream input normalization on split Q/K/V block-attention layers
+    /// (`BlockAttentionNorm::SplitQkv`, scope `TargetSublayer`).
+    BlockAttentionInputNorm(BlockAttentionStream),
     /// A sublayer's or branch's output normalization.
     PostNorm,
     LayerScale,
@@ -717,6 +744,16 @@ pub enum WeightKind {
     HyperConnectionFunction,
     HyperConnectionBase,
     HyperConnectionScale,
+    /// A block-attention residual query (sublayer scope, or `Shared` in
+    /// target scope for the exit query).
+    BlockAttentionQuery(BlockAttentionStream),
+    /// A cross-pass bank query (sublayer scope).
+    CrossPassQuery(BlockAttentionStream),
+    /// A low-rank cross-pass message controller weight (sublayer scope).
+    MessageController {
+        stream: BlockAttentionStream,
+        part: MessageControllerPart,
+    },
     /// The query heads' projection: a full query's, or a low-rank query's
     /// `up` (`QueryProjection`).
     Query,
@@ -731,6 +768,19 @@ pub enum WeightKind {
     Value,
     QueryNorm,
     KeyNorm,
+    /// Relative-position attention query projection, its norm/L2-clip scale,
+    /// and its bias table projection (`RelativeBias`).
+    RelativeQuery,
+    RelativeQueryNorm,
+    RelativeBiasProjection,
+    /// Causal short convolution static taps and optional dynamic tap
+    /// projection on keys, values, and sublayer outputs.
+    KeyShortConv,
+    KeyShortConvDynamic,
+    ValueShortConv,
+    ValueShortConvDynamic,
+    PostShortConv,
+    PostShortConvDynamic,
     /// The projection to the hidden width: a full output's, or a grouped
     /// output's `b` (`OutputProjection`).
     AttentionOutput,
@@ -832,11 +882,24 @@ pub enum WeightKind {
     /// A draft head's projection of its normalized output into the hidden
     /// row its next chained step conditions on (`HeadChain::Projected`).
     HeadChainProjection,
-    /// A draft's projection of the concatenated target taps.
+    /// A draft's projection of the concatenated target taps (or softmax mix
+    /// weights for `DraftFusion::SoftmaxMix`).
     DraftFusion,
     DraftFusionNorm,
+    /// Learned per-slot mask embeddings (`DraftMask::Learned`).
+    DraftMaskEmbedding,
+    /// Separate per-layer context K/V projections and K-norm
+    /// (`DraftContextProjection`, scope `DraftSublayer`).
+    DraftContextKey,
+    DraftContextValue,
+    DraftContextKeyNorm,
     MarkovEmbedding,
     MarkovProjection,
+    /// Recurrent Markov head (`RnnMarkovHead`) projections and biases.
+    MarkovRnnWeight,
+    MarkovRnnBias,
+    MarkovHiddenOutWeight,
+    MarkovHiddenOutBias,
     ConfidenceWeight,
     ConfidenceBias,
     /// A convolved draft sublayer's convolution base `[2, kernel, hidden]`
@@ -1028,7 +1091,7 @@ impl Head {
     fn checked_conditioning_width(&self, decoder: &Decoder) -> Result<u64, DefinitionError> {
         if self.residual_conditioning() {
             match &decoder.residual {
-                ResidualForm::Single => Ok(decoder.hidden),
+                ResidualForm::Single | ResidualForm::BlockAttention { .. } => Ok(decoder.hidden),
                 ResidualForm::HyperConnections(form) => decoder
                     .hidden
                     .checked_mul(form.streams)
@@ -1297,24 +1360,35 @@ mod tests {
     use super::*;
     use magnitude_artifacts::ArtifactIdentity;
 
-    /// A `GluLimit` is positive and finite at F32, and a definition's limit
-    /// deserializes only as one; it serializes as the plain number, and its
-    /// kernels' LB is L's F32 bits, 0 for none.
+    /// A `GluCap` is positive and finite at F32, and a definition's limit
+    /// deserializes only as one; `GluLimit` carries either a hard clamp or a
+    /// SITU tanh softcap.
     #[test]
     fn a_glu_limit_is_positive_and_finite_at_f32() {
         for invalid in [0.0, -0.0, -10.0, 1e-50, 1e39, f64::INFINITY, f64::NEG_INFINITY, f64::NAN] {
             assert!(GluLimit::new(invalid).is_err(), "{invalid} admitted");
+            assert!(GluLimit::softcap(invalid, 25.0).is_err(), "{invalid} admitted");
+            assert!(GluLimit::softcap(4.0, invalid).is_err(), "{invalid} admitted");
         }
         for invalid in ["0.0", "-10.0", "1e-50", "1e39"] {
-            assert!(serde_json::from_str::<GluLimit>(invalid).is_err(), "{invalid} deserialized");
+            assert!(serde_json::from_str::<GluCap>(invalid).is_err(), "{invalid} deserialized");
         }
+        let cap = GluCap::new(10.0).unwrap();
+        assert_eq!(serde_json::to_string(&Some(cap)).unwrap(), "10.0");
+        assert_eq!(serde_json::to_string(&None::<GluCap>).unwrap(), "null");
+        assert_eq!(serde_json::from_str::<Option<GluCap>>("10.0").unwrap(), Some(cap));
         let limit = GluLimit::new(10.0).unwrap();
-        assert_eq!(serde_json::to_string(&Some(limit)).unwrap(), "10.0");
-        assert_eq!(serde_json::to_string(&None::<GluLimit>).unwrap(), "null");
-        assert_eq!(serde_json::from_str::<Option<GluLimit>>("10.0").unwrap(), Some(limit));
-        assert_eq!((f64::from(limit), GluLimit::word(Some(limit))), (10.0, u64::from(10.0f32.to_bits())));
-        // No limit's word is 0, the one word no limit takes.
+        assert_eq!((f64::from(cap), GluLimit::word(Some(limit))), (10.0, u64::from(10.0f32.to_bits())));
+        assert_eq!(GluLimit::softcap_words(Some(limit)), None);
+        // No limit's word is 0, the one word no clamp takes.
         assert_eq!(GluLimit::word(None), 0);
+
+        let situ = GluLimit::softcap(4.0, 25.0).unwrap();
+        assert_eq!(GluLimit::word(Some(situ)), 0);
+        assert_eq!(
+            GluLimit::softcap_words(Some(situ)),
+            Some((u64::from(4.0f32.to_bits()), u64::from(25.0f32.to_bits())))
+        );
     }
 
     #[test]
@@ -1371,11 +1445,14 @@ mod tests {
                     divisors: None,
                     output: OutputRotary::None,
                 },
+                relative_bias: None,
+                log_scale: None,
                 scale: 0.5,
                 media_rows: MediaRowAttention::Causal,
-                sinks: None,
+                sinks: AttentionSinks::None,
                 output: OutputProjection::Full(weight(&format!("{name}.o"), &[4, 4])),
             })),
+            post_conv: None,
             output: OutputForm::Residual,
         }
     }
@@ -1384,6 +1461,8 @@ mod tests {
         ProjectedRows {
             key: weight(&format!("{name}.k"), &[2, 4]),
             value: ValueSource::Projected(weight(&format!("{name}.v"), &[2, 4])),
+            key_conv: None,
+            value_conv: None,
             key_norm: HeadNorm::None,
             value_norm: ValueNorm::None,
             domain,
@@ -1435,12 +1514,14 @@ mod tests {
                     .into_iter()
                     .map(|sublayer| Block {
                         sublayers: vec![sublayer],
+                        transition: None,
                     })
                     .collect(),
                 exit: ExitForm {
                     norm: ExitNorm::Rms(rms("output_norm", 4)),
                     output: weight("embedding", &[8, 4]),
                     softcap: None,
+                    unpadded_vocabulary: None,
                 },
             },
             head: None,
@@ -1493,7 +1574,7 @@ mod tests {
             placement: RotaryPlacement::Trailing,
         };
         *output = OutputRotary::Inverse;
-        attention.sinks = Some(weight("a.sinks", &[2]));
+        attention.sinks = AttentionSinks::Static(weight("a.sinks", &[2]));
         attention.output = OutputProjection::GroupedLowRank {
             groups: 2,
             rank: 3,
@@ -1594,6 +1675,8 @@ mod tests {
                 ProjectedRows {
                     key: weight("a.kv_a", &[LATENT, HIDDEN]),
                     value: ValueSource::StoredKey,
+                    key_conv: None,
+                    value_conv: None,
                     key_norm: HeadNorm::Rms(rms("a.kv_a_norm", LATENT)),
                     value_norm: ValueNorm::None,
                     domain: TokenDomain::Token,
@@ -1601,9 +1684,11 @@ mod tests {
                 },
             )))],
             rotary: Rotary::None,
+            relative_bias: None,
+            log_scale: None,
             scale: (HEAD as f64).powf(-0.5),
             media_rows: MediaRowAttention::Causal,
-            sinks: None,
+            sinks: AttentionSinks::None,
             output: OutputProjection::GroupedLowRank {
                 groups: HEADS,
                 rank: HEAD,
@@ -1737,6 +1822,7 @@ mod tests {
                 },
                 blocks: vec![Block {
                     sublayers: vec![attention("h", sources)],
+                    transition: None,
                 }],
                 output_norm: ExitNorm::Rms(rms("head_norm", 4)),
                 readout: HeadReadout::full(VocabularyProjection::Own {
@@ -1781,6 +1867,8 @@ mod tests {
         ProjectedRows {
             key: weight(&format!("{name}.kv"), &[2, 4]),
             value: ValueSource::StoredKey,
+            key_conv: None,
+            value_conv: None,
             key_norm: HeadNorm::Rms(rms(&format!("{name}.kv_norm"), 2)),
             value_norm: ValueNorm::None,
             domain: TokenDomain::Window { tokens: 4 },
@@ -2022,6 +2110,7 @@ mod tests {
     fn ngram() -> Sublayer {
         Sublayer {
             input: InputNorm::None,
+            post_conv: None,
             op: Operator::NGramInput(Box::new(NGramInput {
                 hash: NGramHash {
                     context: 2,
@@ -2667,6 +2756,7 @@ mod tests {
                         attention("h", owned("h", TokenDomain::Token)),
                         "h",
                     )],
+                    transition: None,
                 }],
                 output_norm: exit(low_rank("head_out", false)),
                 readout: HeadReadout::full(VocabularyProjection::Target),
@@ -2706,6 +2796,7 @@ mod tests {
         let parallel = |branches: Vec<Branch>| Sublayer {
             input: InputNorm::None,
             op: Operator::Parallel(branches),
+            post_conv: None,
             output: OutputForm::Residual,
         };
 
@@ -2759,6 +2850,393 @@ mod tests {
         assert_eq!(
             bad_rotary.validate().unwrap_err().to_string(),
             "an inverse output rotary over values other than the stored keys"
+        );
+    }
+
+    #[test]
+    fn block_attention_looped_inkling2_and_dspark_rnn_hidden_validate() {
+        const HIDDEN: u64 = 8;
+        const VOCAB: u64 = 16;
+        const UNPADDED: u64 = 14;
+        const HEADS: u64 = 2;
+        const KV_HEADS: u64 = 1;
+        const WIDTH: u64 = 4;
+        const D_REL: u64 = 2;
+        const EXTENT: u64 = 8;
+        const RANK: u64 = 4;
+
+        let cross_msg = |name: &str| {
+            Box::new(CrossPassMessage {
+                query: weight(&format!("{name}.q"), &[HIDDEN]),
+                controller: MessageController {
+                    rank: RANK,
+                    down: weight(&format!("{name}.down"), &[RANK, 2 * HIDDEN]),
+                    gain: weight(&format!("{name}.gain"), &[HIDDEN, RANK]),
+                    forget: weight(&format!("{name}.forget"), &[HIDDEN, RANK]),
+                },
+            })
+        };
+
+        let short_conv = |name: &str, channels: u64, dynamic: Option<u64>| CausalShortConv {
+            kernel_size: 4,
+            weight: weight(&format!("{name}.conv"), &[channels, 4]),
+            dynamic: dynamic.map(|heads| DynamicConvTap {
+                proj: weight(&format!("{name}.dyn"), &[heads * 4, HIDDEN]),
+                heads,
+            }),
+            residual_scale: if dynamic.is_some() {
+                1.0 / 3.0
+            } else {
+                1.0 / 5.0_f64.sqrt()
+            },
+        };
+
+        let make_attn = |name: &str,
+                         queries: BlockAttentionQueries,
+                         cross_pass: CrossPassInput,
+                         global: bool,
+                         commit: bool| Sublayer {
+            input: InputNorm::BlockAttention(BlockAttentionInput {
+                queries,
+                cross_pass,
+                norm: if global {
+                    BlockAttentionNorm::SplitQkv {
+                        query: rms(&format!("{name}.q_norm"), HIDDEN),
+                        key: rms(&format!("{name}.k_norm"), HIDDEN),
+                        value: rms(&format!("{name}.v_norm"), HIDDEN),
+                    }
+                } else {
+                    BlockAttentionNorm::Shared(rms(&format!("{name}.attn_norm"), HIDDEN))
+                },
+            }),
+            op: Operator::Attention(Box::new(Attention {
+                heads: HEADS,
+                kv_heads: KV_HEADS,
+                width: WIDTH,
+                query: QueryProjection::Full(weight(&format!("{name}.q"), &[HEADS * WIDTH, HIDDEN])),
+                query_keys: QueryKeys::Direct,
+                gate: AttentionGate::Separate {
+                    weight: weight(&format!("{name}.gate"), &[HEADS * WIDTH, HIDDEN]),
+                    function: GateFunction::Sigmoid,
+                    granularity: GateGranularity::Element,
+                },
+                query_norm: HeadNorm::L2Clip {
+                    threshold: 22.627417,
+                    epsilon: 1e-6,
+                    scale: Some(weight(&format!("{name}.q_clip"), &[HEADS, WIDTH])),
+                },
+                history: vec![HistorySource::visible(HistoryRows::Own(
+                    RowProducer::Projected(ProjectedRows {
+                        key: weight(&format!("{name}.k"), &[KV_HEADS * WIDTH, HIDDEN]),
+                        value: ValueSource::Projected(weight(
+                            &format!("{name}.v"),
+                            &[KV_HEADS * WIDTH, HIDDEN],
+                        )),
+                        key_conv: Some(short_conv(
+                            &format!("{name}.k_sconv"),
+                            KV_HEADS * WIDTH,
+                            global.then_some(KV_HEADS),
+                        )),
+                        value_conv: Some(short_conv(
+                            &format!("{name}.v_sconv"),
+                            KV_HEADS * WIDTH,
+                            global.then_some(KV_HEADS),
+                        )),
+                        key_norm: HeadNorm::L2Clip {
+                            threshold: 22.627417,
+                            epsilon: 1e-6,
+                            scale: None,
+                        },
+                        value_norm: ValueNorm::RmsUnweighted(UnweightedRms { epsilon: 1e-6 }),
+                        domain: if global {
+                            TokenDomain::Token
+                        } else {
+                            TokenDomain::Window { tokens: 8 }
+                        },
+                        rounding: RowRounding::None,
+                    }),
+                ))],
+                rotary: Rotary::None,
+                relative_bias: Some(RelativeBias {
+                    d_rel: D_REL,
+                    extent: EXTENT,
+                    query_proj: weight(&format!("{name}.r"), &[HEADS * D_REL, HIDDEN]),
+                    rel_clip: HeadNorm::L2Clip {
+                        threshold: 8.0,
+                        epsilon: 1e-6,
+                        scale: Some(weight(&format!("{name}.r_clip"), &[HEADS, D_REL])),
+                    },
+                    bias_proj: weight(&format!("{name}.rel_proj"), &[EXTENT, D_REL]),
+                }),
+                log_scale: global.then_some(LogScale {
+                    floor: 8192,
+                    alpha: 0.1,
+                }),
+                scale: 1.0 / (WIDTH as f64).sqrt(),
+                media_rows: MediaRowAttention::Causal,
+                sinks: AttentionSinks::Dynamic(weight(&format!("{name}.sink"), &[HEADS, HIDDEN])),
+                output: OutputProjection::Full(weight(
+                    &format!("{name}.o"),
+                    &[HIDDEN, HEADS * WIDTH],
+                )),
+            })),
+            post_conv: Some(short_conv(&format!("{name}.attn_sconv"), HIDDEN, None)),
+            output: if commit {
+                OutputForm::BlockCommit
+            } else {
+                OutputForm::Residual
+            },
+        };
+
+        let make_moe = |name: &str, cross_pass: CrossPassInput| Sublayer {
+            input: InputNorm::BlockAttention(BlockAttentionInput {
+                queries: BlockAttentionQueries::Single(weight(
+                    &format!("{name}.mlp_q"),
+                    &[HIDDEN],
+                )),
+                cross_pass,
+                norm: BlockAttentionNorm::Shared(rms(&format!("{name}.mlp_norm"), HIDDEN)),
+            }),
+            op: Operator::RoutedFfn(Box::new(RoutedFfn {
+                experts: 4,
+                selected: 2,
+                intermediate: 4,
+                router: Router {
+                    weight: weight(&format!("{name}.router"), &[4, HIDDEN]),
+                    input: RouterInput::Operator,
+                    score: ScoreFunction::Sigmoid,
+                    selection: ExpertSelection::TopK {
+                        bias: Some(weight(&format!("{name}.bias"), &[4])),
+                    },
+                    media_bias: None,
+                    normalization: RouteNormalization::SumPlusEpsilon(1e-20),
+                    scale: 8.0,
+                },
+                expert_up: FeedForwardUp::Gated {
+                    activation: ActivationFunction::Silu,
+                    limit: Some(GluLimit::softcap(4.0, 25.0).unwrap()),
+                    gate: weight(&format!("{name}.gate"), &[4, 4, HIDDEN]),
+                    up: weight(&format!("{name}.up"), &[4, 4, HIDDEN]),
+                },
+                expert_down: weight(&format!("{name}.down"), &[4, HIDDEN, 4]),
+                expert_scale: None,
+                latent: None,
+                shared: None,
+            })),
+            post_conv: Some(short_conv(&format!("{name}.mlp_sconv"), HIDDEN, None)),
+            output: OutputForm::Residual,
+        };
+
+        let mut model = ModelDefinition {
+            family: FamilyId("inkling2".into()),
+            artifact_identity: PackageIdentity {
+                target: ArtifactIdentity([0; 32]),
+                projector: None,
+            },
+            inputs: InputSemantics { coordinate_axes: 1 },
+            decoder: Decoder {
+                activation_dtype: ActivationDType::BF16,
+                hidden: HIDDEN,
+                vocabulary: VOCAB,
+                context_limit: 64,
+                residual: ResidualForm::BlockAttention {
+                    block_size: 2,
+                    normalize_values: true,
+                    norm_epsilon: 1e-6,
+                },
+                entry: EntryForm {
+                    embedding: weight("embed", &[VOCAB, HIDDEN]),
+                    scale: EmbeddingScale::Unit,
+                    norm: Some(EntryNorm::Rms {
+                        norm: rms("token_embd_norm", HIDDEN),
+                        text_only: true,
+                    }),
+                    per_layer: None,
+                },
+                blocks: vec![
+                    // Block 0: prelude local layer (Partial query, BlockCommit).
+                    Block {
+                        transition: None,
+                        sublayers: vec![
+                            make_attn("b0", BlockAttentionQueries::Partial, CrossPassInput::None, false, true),
+                            make_moe("b0", CrossPassInput::None),
+                        ],
+                    },
+                    // Block 1: core pass 0 (SnapshotPrelude, global SplitQkv).
+                    Block {
+                        transition: Some(BlockTransition::SnapshotPrelude),
+                        sublayers: vec![
+                            make_attn(
+                                "b1",
+                                BlockAttentionQueries::SplitQkv {
+                                    query: weight("b1.q_res", &[HIDDEN]),
+                                    key: weight("b1.k_res", &[HIDDEN]),
+                                    value: weight("b1.v_res", &[HIDDEN]),
+                                },
+                                CrossPassInput::None,
+                                true,
+                                false,
+                            ),
+                            make_moe("b1", CrossPassInput::None),
+                        ],
+                    },
+                    // Block 2: core pass 1 (ResetToPreludeAndBank, local Single + SplitQkv cross-pass).
+                    Block {
+                        transition: Some(BlockTransition::ResetToPreludeAndBank),
+                        sublayers: vec![
+                            make_attn(
+                                "b2",
+                                BlockAttentionQueries::Single(weight("b2.res", &[HIDDEN])),
+                                CrossPassInput::SplitQkv {
+                                    query: cross_msg("b2.xq"),
+                                    key: cross_msg("b2.xk"),
+                                    value: cross_msg("b2.xv"),
+                                },
+                                false,
+                                true,
+                            ),
+                            make_moe("b2", CrossPassInput::Single(cross_msg("b2.xmlp"))),
+                        ],
+                    },
+                ],
+                exit: ExitForm {
+                    norm: ExitNorm::BlockAttention {
+                        query: weight("out_q", &[HIDDEN]),
+                        norm: rms("out_norm", HIDDEN),
+                    },
+                    output: weight("lm_head", &[VOCAB, HIDDEN]),
+                    softcap: Some(30.0),
+                    unpadded_vocabulary: Some(UNPADDED),
+                },
+            },
+            head: None,
+            vision: None,
+            draft: None,
+        };
+        assert_eq!(model.decoder.active_vocabulary(), UNPADDED);
+        model.validate().unwrap();
+
+        // Attach an Inkling 2 DSpark (`rnn_hidden`) draft model.
+        let draft_attn = Sublayer {
+            input: InputNorm::Rms(rms("d0.attn_norm", HIDDEN)),
+            op: Operator::Attention(Box::new(Attention {
+                heads: HEADS,
+                kv_heads: KV_HEADS,
+                width: WIDTH,
+                query: QueryProjection::Full(weight("d0.q", &[HEADS * WIDTH, HIDDEN])),
+                query_keys: QueryKeys::Direct,
+                gate: AttentionGate::None,
+                query_norm: HeadNorm::Rms(rms("d0.qn", WIDTH)),
+                history: vec![HistorySource::visible(HistoryRows::Own(
+                    RowProducer::Projected(ProjectedRows {
+                        key: weight("d0.k", &[KV_HEADS * WIDTH, HIDDEN]),
+                        value: ValueSource::Projected(weight("d0.v", &[KV_HEADS * WIDTH, HIDDEN])),
+                        key_conv: None,
+                        value_conv: None,
+                        key_norm: HeadNorm::Rms(rms("d0.kn", WIDTH)),
+                        value_norm: ValueNorm::None,
+                        domain: TokenDomain::Token,
+                        rounding: RowRounding::None,
+                    }),
+                ))],
+                rotary: Rotary::None,
+                relative_bias: None,
+                log_scale: None,
+                scale: 1.0 / (WIDTH as f64).sqrt(),
+                media_rows: MediaRowAttention::Causal,
+                sinks: AttentionSinks::None,
+                output: OutputProjection::Full(weight("d0.o", &[HIDDEN, HEADS * WIDTH])),
+            })),
+            post_conv: None,
+            output: OutputForm::Residual,
+        };
+        model.draft = Some(DraftDefinition {
+            residual: ResidualForm::Single,
+            method: DraftMethod::DSpark {
+                markov: MarkovHead::RnnHidden(RnnMarkovHead {
+                    rank: RANK,
+                    embedding: weight("markov_w1", &[VOCAB, RANK]),
+                    rnn_proj: Affine {
+                        weight: weight("rnn_proj.w", &[3 * RANK, 2 * RANK + 2 * HIDDEN]),
+                        bias: weight("rnn_proj.b", &[3 * RANK]),
+                    },
+                    hidden_out: Affine {
+                        weight: weight("hidden_out.w", &[HIDDEN, RANK]),
+                        bias: weight("hidden_out.b", &[HIDDEN]),
+                    },
+                }),
+                confidence: None,
+            },
+            taps: vec![
+                TapPoint::Sublayer(SublayerIndex {
+                    block: 1,
+                    sublayer: 0,
+                }),
+                TapPoint::Exit,
+            ],
+            fusion: DraftFusion::SoftmaxMix {
+                weights: weight("fuse_weight", &[2, 2]), // 1 draft layer + 1 f_rnn, 2 taps
+                norms: vec![
+                    rms("d0.dflare_norm", HIDDEN),
+                    rms("rnn.dflare_norm", HIDDEN),
+                ],
+            },
+            embedding: DraftEmbedding::Target,
+            output: None,
+            embedding_scale: 1.0,
+            blocks: vec![Block {
+                sublayers: vec![draft_attn],
+                transition: None,
+            }],
+            block_attention: vec![BlockAttention::Bidirectional],
+            context_projections: Some(vec![DraftContextProjection {
+                key: weight("d0.k_ctx", &[KV_HEADS * WIDTH, HIDDEN]),
+                value: weight("d0.v_ctx", &[KV_HEADS * WIDTH, HIDDEN]),
+                key_norm: HeadNorm::Rms(rms("d0.k_norm_ctx", WIDTH)),
+            }]),
+            convolutions: None,
+            output_norm: rms("d.out_norm", HIDDEN),
+            logit_softcap: Some(30.0),
+            block_size: 4,
+            mask: DraftMask::Learned(weight("mask_embd", &[HIDDEN])),
+            layout: BlockLayout::AnchorFirst,
+        });
+        model.validate().unwrap();
+
+        // Reject ResetToPreludeAndBank before SnapshotPrelude.
+        let mut bad_transition = model.clone();
+        bad_transition.decoder.blocks[0].transition = Some(BlockTransition::ResetToPreludeAndBank);
+        assert_eq!(
+            bad_transition.validate().unwrap_err().to_string(),
+            "reset-to-prelude transition without an earlier prelude snapshot"
+        );
+
+        // Reject cross-pass input before bank is populated.
+        let mut bad_cross = model.clone();
+        bad_cross.decoder.blocks[2].transition = None;
+        assert_eq!(
+            bad_cross.validate().unwrap_err().to_string(),
+            "cross-pass message input without an earlier reset-to-prelude bank transition"
+        );
+
+        // Reject unpadded_vocabulary > vocabulary.
+        let mut bad_vocab = model.clone();
+        bad_vocab.decoder.exit.unpadded_vocabulary = Some(VOCAB + 1);
+        assert_eq!(
+            bad_vocab.validate().unwrap_err().to_string(),
+            "invalid unpadded vocabulary size"
+        );
+
+        // Reject SITU softcap with non-SiLU activation.
+        let mut bad_situ = model.clone();
+        if let Operator::RoutedFfn(routed) = &mut bad_situ.decoder.blocks[0].sublayers[1].op {
+            if let FeedForwardUp::Gated { activation, .. } = &mut routed.expert_up {
+                *activation = ActivationFunction::GeluTanh;
+            }
+        }
+        assert_eq!(
+            bad_situ.validate().unwrap_err().to_string(),
+            "softcapped gated expansion requires SiLU activation"
         );
     }
 }

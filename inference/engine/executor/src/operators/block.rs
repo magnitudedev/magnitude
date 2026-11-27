@@ -189,6 +189,9 @@ impl<'a> From<&'a AttestedMixer> for MixerEntries<'a, NativeGraph> {
     fn from(kernels: &'a AttestedMixer) -> Self {
         match kernels {
             AttestedMixer::Attention(kernels) => Self::Attention(kernels.into()),
+            AttestedMixer::BlockAttention => {
+                unreachable!("ResidualForm::BlockAttention executes via PreparedBlockAttnRes")
+            }
             AttestedMixer::Recurrent(kernels) => Self::Recurrent(kernels.into()),
             AttestedMixer::StateSpace(kernels) => Self::StateSpace(kernels.into()),
             AttestedMixer::ShortConv(kernels) => Self::ShortConv(kernels.into()),
@@ -335,7 +338,7 @@ impl ReadTopology<f64> {
     /// The read of `source` over the decoder's `streams`.
     fn of(source: SublayerSource<'_>, streams: Option<&StreamsGeometry>) -> Result<Self, GraphError> {
         Ok(match source {
-            SublayerSource::Norm(_) => Self::Norm,
+            SublayerSource::Norm(_) | SublayerSource::BlockAttention(_) => Self::Norm,
             SublayerSource::Mix(_) => Self::Mix { epsilon: source.epsilon() },
             SublayerSource::Sinkhorn(_) => Self::Sinkhorn(
                 streams

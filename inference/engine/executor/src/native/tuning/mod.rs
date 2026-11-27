@@ -2344,7 +2344,9 @@ impl ModelInputs<'_> {
     fn streams(residual: &ResidualForm) -> Result<u64, String> {
         match residual {
             ResidualForm::HyperConnections(form) => Ok(form.streams),
-            ResidualForm::Single => Err("the sublayer has a single residual stream".into()),
+            ResidualForm::Single | ResidualForm::BlockAttention { .. } => {
+                Err("the sublayer has a single residual stream".into())
+            }
         }
     }
 
@@ -2767,7 +2769,7 @@ impl TuningInputs<'_, '_> {
                 }
             })
             .collect::<Vec<_>>();
-        let vocabulary = usize::try_from(self.definition.decoder.vocabulary)
+        let vocabulary = usize::try_from(self.definition.decoder.active_vocabulary())
             .map_err(|_| "vocabulary exceeds usize")?;
         // The span class a store seals for the most spans a row sees.
         let limits = ClassLimits {

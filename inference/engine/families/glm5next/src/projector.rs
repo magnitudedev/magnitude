@@ -170,6 +170,8 @@ pub fn describe_projector(
                 ),
             },
             feedforward_post_norm: None,
+            ls1: None,
+            ls2: None,
         });
     }
 

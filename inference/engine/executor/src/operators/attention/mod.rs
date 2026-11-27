@@ -16,12 +16,12 @@ use crate::{
     PooledBinding, ScalableWeight, SelectionBinding, SelectionKeysBinding, SelectionShape,
 };
 use magnitude_family_contracts::{
-    Attention, AttentionGate, Candidates, Decoder, GateFunction, GateGranularity, HeadNorm, HeadWeights,
-    HistoryReads, HistoryRows, Indexer, IndexerInput, IndexerKeys, MediaRowAttention,
-    Operator, OutputForm, OutputProjection, OutputRotary, Pool, PoolNorm, PooledRows, ProjectedRows,
-    QueryKeys, QueryProjection, RmsNorm, Rotary, RotaryPair, RotaryPairing,
-    RotaryPlacement, RowProducer, RowRounding, Selection, SublayerIndex, TokenDomain, ValueNorm,
-    ValueSource, WeightKind,
+    Attention, AttentionGate, AttentionSinks, Candidates, Decoder, GateFunction, GateGranularity,
+    HeadNorm, HeadWeights, HistoryReads, HistoryRows, Indexer, IndexerInput, IndexerKeys,
+    MediaRowAttention, Operator, OutputForm, OutputProjection, OutputRotary, Pool, PoolNorm,
+    PooledRows, ProjectedRows, QueryKeys, QueryProjection, RmsNorm, Rotary, RotaryPair,
+    RotaryPairing, RotaryPlacement, RowProducer, RowRounding, Selection, SublayerIndex,
+    TokenDomain, ValueNorm, ValueSource, WeightKind,
 };
 use magnitude_state::{CodecSpec, HistoryEncoding, KvCodec};
 use seismic::{DType, Element};
@@ -668,7 +668,7 @@ fn geometry(hidden: u64, attention: &Attention) -> Result<AttentionShape, PlanEr
             query_norm,
             key_norm,
             value_norm,
-            sinks: attention.sinks.is_some(),
+            sinks: matches!(attention.sinks, AttentionSinks::Static(_)),
             rotary_adjacent,
             rotary_trailing,
             output_rotary,
@@ -789,9 +789,25 @@ pub(super) fn weights<'a>(attention: &'a Attention, push: &mut WeightPush<'_, 'a
         if let ValueSource::Projected(value) = &rows.value {
             push(WeightKind::Value, value);
         }
+        if let Some(conv) = &rows.key_conv {
+            push(WeightKind::KeyShortConv, &conv.weight);
+            if let Some(dynamic) = &conv.dynamic {
+                push(WeightKind::KeyShortConvDynamic, &dynamic.proj);
+            }
+        }
+        if let Some(conv) = &rows.value_conv {
+            push(WeightKind::ValueShortConv, &conv.weight);
+            if let Some(dynamic) = &conv.dynamic {
+                push(WeightKind::ValueShortConvDynamic, &dynamic.proj);
+            }
+        }
     }
-    if let HeadNorm::Rms(norm) = &attention.query_norm {
-        push(WeightKind::QueryNorm, &norm.weight);
+    match &attention.query_norm {
+        HeadNorm::Rms(norm) => push(WeightKind::QueryNorm, &norm.weight),
+        HeadNorm::L2Clip {
+            scale: Some(scale), ..
+        } => push(WeightKind::QueryNorm, scale),
+        HeadNorm::L2Clip { scale: None, .. } | HeadNorm::None => {}
     }
     if let Rotary::Table {
         divisors: Some(divisors),
@@ -800,12 +816,25 @@ pub(super) fn weights<'a>(attention: &'a Attention, push: &mut WeightPush<'_, 'a
     {
         push(WeightKind::RotaryDivisors, &divisors.weight);
     }
-    if let Some(ProjectedRows {
-        key_norm: HeadNorm::Rms(norm),
-        ..
-    }) = own
-    {
-        push(WeightKind::KeyNorm, &norm.weight);
+    if let Some(rows) = own {
+        match &rows.key_norm {
+            HeadNorm::Rms(norm) => push(WeightKind::KeyNorm, &norm.weight),
+            HeadNorm::L2Clip {
+                scale: Some(scale), ..
+            } => push(WeightKind::KeyNorm, scale),
+            HeadNorm::L2Clip { scale: None, .. } | HeadNorm::None => {}
+        }
+    }
+    if let Some(rel) = &attention.relative_bias {
+        push(WeightKind::RelativeQuery, &rel.query_proj);
+        match &rel.rel_clip {
+            HeadNorm::Rms(norm) => push(WeightKind::RelativeQueryNorm, &norm.weight),
+            HeadNorm::L2Clip {
+                scale: Some(scale), ..
+            } => push(WeightKind::RelativeQueryNorm, scale),
+            HeadNorm::L2Clip { scale: None, .. } | HeadNorm::None => {}
+        }
+        push(WeightKind::RelativeBiasProjection, &rel.bias_proj);
     }
     // Every later source's own pooled rows, then each source's own indexer.
     for source in &attention.history {
@@ -868,8 +897,11 @@ pub(super) fn weights<'a>(attention: &'a Attention, push: &mut WeightPush<'_, 'a
             push(WeightKind::IndexerHeadWeights, weight);
         }
     }
-    if let Some(sinks) = &attention.sinks {
-        push(WeightKind::AttentionSinks, sinks);
+    match &attention.sinks {
+        AttentionSinks::None => {}
+        AttentionSinks::Static(sinks) | AttentionSinks::Dynamic(sinks) => {
+            push(WeightKind::AttentionSinks, sinks);
+        }
     }
     match &attention.output {
         OutputProjection::Full(output) => push(WeightKind::AttentionOutput, output),
@@ -944,6 +976,7 @@ fn selection_key(attention: &Attention) -> Result<Option<String>, PlanError> {
             };
             let query_norm = match &read.indexer.query.norm {
                 HeadNorm::Rms(norm) => Some(norm.epsilon),
+                HeadNorm::L2Clip { epsilon, .. } => Some(*epsilon),
                 HeadNorm::None => None,
             };
             Ok(format!(
@@ -1369,6 +1402,8 @@ pub(crate) mod tests {
                                     vec![64],
                                 ))),
                                 value_norm: ValueNorm::None,
+                                key_conv: None,
+                                value_conv: None,
                                 domain: TokenDomain::Token,
                                 rounding: RowRounding::None,
                             })),
@@ -1408,9 +1443,11 @@ pub(crate) mod tests {
                             divisors: None,
                             output: OutputRotary::None,
                         },
+                        relative_bias: None,
                         scale: 1.0 / 8.0,
+                        log_scale: None,
                         media_rows: MediaRowAttention::Causal,
-                        sinks: None,
+                        sinks: magnitude_family_contracts::AttentionSinks::None,
                         output: if grouped {
                             OutputProjection::GroupedLowRank {
                                 groups: 2,
@@ -1425,6 +1462,7 @@ pub(crate) mod tests {
                             ))
                         },
                     })),
+                    post_conv: None,
                     output: OutputForm::Residual,
                 };
                 let dense = Sublayer {
@@ -1439,9 +1477,11 @@ pub(crate) mod tests {
                         },
                         down: tensor(name("ffn_down"), vec![HIDDEN, 512]),
                     })),
+                    post_conv: None,
                     output: OutputForm::Residual,
                 };
                 Block {
+                    transition: None,
                     sublayers: vec![attention, dense],
                 }
             };
@@ -1472,6 +1512,7 @@ pub(crate) mod tests {
                     exit: ExitForm {
                         norm: ExitNorm::Rms(rms(output_norm)),
                         output: embedding,
+                        unpadded_vocabulary: None,
                         softcap: None,
                     },
                 },
@@ -1632,14 +1673,18 @@ pub(crate) mod tests {
                                 epsilon: 1e-6,
                             }),
                             value_norm: ValueNorm::None,
+                            key_conv: None,
+                            value_conv: None,
                             domain: TokenDomain::Token,
                             rounding: RowRounding::None,
                         },
                     )))],
                     rotary: Rotary::None,
+                    relative_bias: None,
                     scale: 1.0 / 8.0,
+                    log_scale: None,
                     media_rows: MediaRowAttention::Causal,
-                    sinks: None,
+                    sinks: magnitude_family_contracts::AttentionSinks::None,
                     output: OutputProjection::GroupedLowRank {
                         groups: 4,
                         rank: 64,
@@ -2025,6 +2070,8 @@ pub(crate) mod tests {
                         value: ValueSource::StoredKey,
                         key_norm: HeadNorm::Rms(rms(tensor(name("attn_kv_norm"), vec![64]))),
                         value_norm: ValueNorm::None,
+                        key_conv: None,
+                        value_conv: None,
                         domain: TokenDomain::Window { tokens: 128 },
                         rounding: RowRounding::Block(BlockRounding {
                             element: BlockElement::E4M3,
@@ -2621,6 +2668,8 @@ pub(crate) mod tests {
                     value: ValueSource::RawKey,
                     key_norm: HeadNorm::None,
                     value_norm: ValueNorm::None,
+                    key_conv: None,
+                    value_conv: None,
                     domain: TokenDomain::Window { tokens: 128 },
                     rounding: RowRounding::None,
                 },
@@ -2631,9 +2680,11 @@ pub(crate) mod tests {
                 divisors: None,
                 output: OutputRotary::None,
             },
+            relative_bias: None,
             scale: 0.125,
+            log_scale: None,
             media_rows: MediaRowAttention::Causal,
-            sinks: Some(weight("sinks", &[2])),
+            sinks: magnitude_family_contracts::AttentionSinks::Static(weight("sinks", &[2])),
             output: OutputProjection::Full(weight("o", &[32, 128])),
         };
         admit(&base, 1e-6).unwrap();

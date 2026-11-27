@@ -79,7 +79,13 @@ fn every_catalog_variant_binds_to_the_released_geometry() {
             (decoder.hidden, decoder.vocabulary, decoder.context_limit),
             (6656, 202048, 131072)
         );
-        assert_eq!(decoder.entry.norm.map(|norm| norm.epsilon), Some(epsilon));
+        assert_eq!(
+            decoder.entry.norm.as_ref().map(|norm| match norm {
+                magnitude_family_contracts::EntryNorm::Unweighted(u) => u.epsilon,
+                magnitude_family_contracts::EntryNorm::Rms { norm, .. } => norm.epsilon,
+            }),
+            Some(epsilon)
+        );
         assert_eq!(decoder.exit.output.name, "output.weight");
         assert_eq!(decoder.exit.softcap, Some(20.0));
         let ExitNorm::Rms(norm) = &decoder.exit.norm else {

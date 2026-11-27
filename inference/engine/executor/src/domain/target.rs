@@ -389,7 +389,7 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
             .map(|readout| readout.features.clone())
             .expect("invariant violated: a primed prompt chunk publishes no features");
         let store = self.head_store.clone().expect("invariant violated: a drafter entry without a drafter store");
-        let vocabulary = self.definition.decoder.vocabulary as usize;
+        let vocabulary = self.definition.decoder.active_vocabulary() as usize;
         let class_limits = self.head_class_limits();
         let batch = match self.execution.policy().method().draft_form() {
             Some(crate::DraftForm::Block) => self
@@ -729,7 +729,7 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
         let (slots, conditioning_slices): (Vec<_>, Vec<_>) = prepared.into_iter().unzip();
         let batch = match ValidatedTargetBatch::covering(
             &slots,
-            self.definition.decoder.vocabulary as usize,
+            self.definition.decoder.active_vocabulary() as usize,
             class_limits,
             segments,
         ) {

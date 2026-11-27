@@ -36,8 +36,8 @@ use magnitude_family_contracts::{
     VisionActivation, VisionAttentionSpan, VisionDescription, WeightKind, WeightRole, WeightScope,
 };
 use magnitude_kernels::{
-    post_norm_residual, vision_attention, vision_clamp, vision_gated_convolution, vision_linear,
-    vision_norm, vision_patch_stem, vision_pool, vision_position,
+    post_norm_residual, stream_join, vision_attention, vision_clamp, vision_gated_convolution,
+    vision_linear, vision_norm, vision_patch_stem, vision_pool, vision_position,
 };
 #[cfg(test)]
 use seismic::NativeGraphMetadata;
@@ -268,6 +268,8 @@ trait VisionBindings<G: GraphDraft> {
     -> Result<G::Binding<'_, vision_position::Entry>, GraphError>;
     fn post_norm(&self, index: usize)
     -> Result<G::Binding<'_, post_norm_residual::Entry>, GraphError>;
+    fn residual_add(&self, index: usize)
+    -> Result<G::Binding<'_, stream_join::Entry>, GraphError>;
 }
 
 /// The prepared kernels of a program's invocations.
@@ -330,6 +332,9 @@ impl VisionBindings<NativeGraph> for PreparedBindings<'_> {
     fn post_norm(&self, index: usize) -> Result<&NativeKernel<post_norm_residual::Entry>, GraphError> {
         prepared(&self.kernels.post_norm, self.kernel(index)?)
     }
+    fn residual_add(&self, index: usize) -> Result<&NativeKernel<stream_join::Entry>, GraphError> {
+        prepared(&self.kernels.residual_add, self.kernel(index)?)
+    }
 }
 
 impl<R> VisionTopology<R> {
@@ -370,6 +375,9 @@ impl<G: ElementBoundDraft, R> VisionBindings<G> for VisionTopology<R> {
     fn post_norm(&self, index: usize) -> Result<G::Binding<'_, post_norm_residual::Entry>, GraphError> {
         Ok(G::bind(self.elements(index)?))
     }
+    fn residual_add(&self, index: usize) -> Result<G::Binding<'_, stream_join::Entry>, GraphError> {
+        Ok(G::bind(self.elements(index)?))
+    }
 }
 
 /// A constant of a vision graph, uploaded once at binding.
@@ -382,6 +390,8 @@ enum Constant {
     EmptyI32,
     /// The unit rows of a weightless value norm of one head width.
     Unit(Dim),
+    /// A `[1, width]` F32 zero row (e.g., LayerScale's zero standardization bias).
+    Zero(Dim),
     /// The row identity of the post-norms' output rows.
     Identity,
     /// One F32 value (a feed-forward limit's bound), as its bits.
@@ -396,7 +406,9 @@ impl Constant {
             (Self::EmptyF32, Self::EmptyF32)
             | (Self::EmptyI32, Self::EmptyI32)
             | (Self::Identity, Self::Identity) => true,
-            (Self::Unit(width), Self::Unit(other)) => width.equals(other),
+            (Self::Unit(width), Self::Unit(other)) | (Self::Zero(width), Self::Zero(other)) => {
+                width.equals(other)
+            }
             (Self::Bound(bits), Self::Bound(other)) => bits == other,
             _ => false,
         }
@@ -411,6 +423,10 @@ impl Constant {
                 VisionOperands::Attention { value_norm: true, .. } => {
                     vec![Self::Unit(static_value(topology, numbers, index, "P")? * 4u64)]
                 }
+                VisionOperands::Pool {
+                    standard: Some((None, _)),
+                    ..
+                } => vec![Self::Zero(static_value(topology, numbers, index, "H")?)],
                 VisionOperands::PostNormResidual { .. } => vec![Self::Identity],
                 VisionOperands::Linear {
                     bounds: Some(LinearBounds::Fixed { minimum, maximum }),
@@ -433,6 +449,7 @@ impl Constant {
             Self::EmptyF32 => GraphConstant::f32_shaped(graph, &[1], &[0.0]),
             Self::EmptyI32 => GraphConstant::i32(graph, &[0]),
             Self::Unit(width) => GraphConstant::f32_filled(graph, &[Dim::from(1u64), width.clone()], 1.0),
+            Self::Zero(width) => GraphConstant::f32_filled(graph, &[Dim::from(1u64), width.clone()], 0.0),
             Self::Identity => GraphConstant::row_identity(graph, rows.clone(), Some("O")),
             Self::Bound(bits) => GraphConstant::f32_shaped(graph, &[1], &[f32::from_bits(*bits)]),
         }
@@ -938,21 +955,31 @@ impl<G: GraphDraft, B: VisionBindings<G>, W: PlannedWeights + ?Sized> Draft<'_, 
             }
             VisionOperands::Pool {
                 source,
+                rows: pool_rows,
                 standard,
                 weight,
                 scale,
             } => {
                 let (g, h) = (statics("G")?, statics("H")?);
-                let cells = self.cells.clone();
+                let m = match pool_rows {
+                    VisionRows::Patches => rows,
+                    VisionRows::Cells => self.cells.clone(),
+                };
                 let dims = [
-                    ("M", cells.clone()),
+                    ("M", m.clone()),
                     ("G", g.clone()),
                     ("H", h.clone()),
                     ("NS", statics("NS")?),
                 ];
                 let binding = self.bindings.pool(index)?;
-                let source = self.value(*source, &[cells, g, h.clone()])?;
-                let standard_bias = self.rows_of(standard.map(|(bias, _)| bias), &[h.clone()])?;
+                let source = self.value(*source, &[m, g, h.clone()])?;
+                let standard_bias = match standard {
+                    Some((Some(bias), _)) => self.rows_of(Some(*bias), &[h.clone()])?,
+                    Some((None, _)) => self
+                        .constant(&Constant::Zero(h.clone()))?
+                        .reshape(&[Dim::from(1u64), h.clone()]),
+                    None => self.rows_of(None, &[h.clone()])?,
+                };
                 let standard_scale = self.rows_of(standard.map(|(_, scale)| scale), &[h])?;
                 self.graph
                     .enqueue::<vision_pool::Entry>(
@@ -1002,6 +1029,33 @@ impl<G: GraphDraft, B: VisionBindings<G>, W: PlannedWeights + ?Sized> Draft<'_, 
                             out_rows: (&out_rows).into(),
                             epsilon: epsilon.f32(),
                             scale: 1.0f32.into(),
+                        },
+                    )?
+                    .value
+            }
+            VisionOperands::ResidualAdd { residual, branch } => {
+                let width = self.width(*branch)?;
+                let dims = [
+                    ("M", rows.clone()),
+                    ("H", width.clone()),
+                    ("SN", Dim::from(1u64)),
+                    ("IN", Dim::from(0u64)),
+                ];
+                let binding = self.bindings.residual_add(index)?;
+                let residual = self.value(*residual, &[rows.clone(), width.clone()])?;
+                let branch = self.value(*branch, &[rows.clone(), width])?;
+                let inject = self
+                    .constant(&Constant::EmptyF32)?
+                    .slice_leading(0u64, 0u64)
+                    .reshape(&[rows, Dim::from(0u64)]);
+                self.graph
+                    .enqueue::<stream_join::Entry>(
+                        binding,
+                        &dims,
+                        stream_join::WorkflowArgs {
+                            residual: (&residual).into(),
+                            y: (&branch).into(),
+                            inject: (&inject).into(),
                         },
                     )?
                     .value
@@ -1239,6 +1293,10 @@ enum RelativeOperands {
         projected: RelativeValue,
         epsilon_bits: u32,
     },
+    ResidualAdd {
+        residual: RelativeValue,
+        branch: RelativeValue,
+    },
 }
 
 #[derive(Clone, PartialEq, Eq, Hash)]
@@ -1276,6 +1334,10 @@ fn for_each_operand_value(operands: &VisionOperands, mut f: impl FnMut(VisionVal
         VisionOperands::PostNormResidual { residual, projected, .. } => {
             f(*residual);
             f(*projected);
+        }
+        VisionOperands::ResidualAdd { residual, branch } => {
+            f(*residual);
+            f(*branch);
         }
     }
 }
@@ -1349,8 +1411,8 @@ fn remap_operand_values(
         VisionOperands::GatedConvolution { value, gate, kernel } => {
             VisionOperands::GatedConvolution { value: remap(value), gate: remap(gate), kernel }
         }
-        VisionOperands::Pool { source, standard, weight, scale } => {
-            VisionOperands::Pool { source: remap(source), standard, weight, scale }
+        VisionOperands::Pool { source, rows, standard, weight, scale } => {
+            VisionOperands::Pool { source: remap(source), rows, standard, weight, scale }
         }
         VisionOperands::Position { source, table } => {
             VisionOperands::Position { source: remap(source), table }
@@ -1366,6 +1428,10 @@ fn remap_operand_values(
                 epsilon,
             }
         }
+        VisionOperands::ResidualAdd { residual, branch } => VisionOperands::ResidualAdd {
+            residual: remap(residual),
+            branch: remap(branch),
+        },
     }
 }
 
@@ -1388,7 +1454,8 @@ fn op_output_element(op: &VisionOp) -> Element {
         VisionEntry::PatchStem
         | VisionEntry::Pool
         | VisionEntry::Position
-        | VisionEntry::PostNormResidual => Element::f32(),
+        | VisionEntry::PostNormResidual
+        | VisionEntry::ResidualAdd => Element::f32(),
     }
 }
 
@@ -1403,7 +1470,15 @@ fn partition_vision_stages(program: &VisionOps) -> Option<VisionStages> {
                 if block >= last_op.len() {
                     last_op.resize(block + 1, None);
                 }
-                last_op[block] = Some(idx);
+                let end = if matches!(
+                    program.ops.get(idx + 1).map(|next| &next.operands),
+                    Some(VisionOperands::ResidualAdd { .. })
+                ) {
+                    idx + 1
+                } else {
+                    idx
+                };
+                last_op[block] = Some(end);
             }
         }
     }
@@ -1425,7 +1500,8 @@ fn partition_vision_stages(program: &VisionOps) -> Option<VisionStages> {
                 .operands
                 .weights()
                 .into_iter()
-                .any(|role| role.scope == WeightScope::VisionBlock(0));
+                .any(|role| role.scope == WeightScope::VisionBlock(0))
+                || matches!(op.operands, VisionOperands::ResidualAdd { .. });
             if !is_block0 {
                 return None;
             }
@@ -1435,6 +1511,7 @@ fn partition_vision_stages(program: &VisionOps) -> Option<VisionStages> {
                     ..
                 }
                 | VisionOperands::PostNormResidual { residual: VisionValue::Result(r), .. }
+                | VisionOperands::ResidualAdd { residual: VisionValue::Result(r), .. }
                     if r < idx =>
                 {
                     Some(r)
@@ -1602,7 +1679,7 @@ fn block_signature(
             VisionOperands::GatedConvolution { value, gate, .. } => {
                 RelativeOperands::GatedConvolution { value: rel(*value)?, gate: rel(*gate)? }
             }
-            VisionOperands::Pool { source, standard, weight, scale } => RelativeOperands::Pool {
+            VisionOperands::Pool { source, standard, weight, scale, .. } => RelativeOperands::Pool {
                 source: rel(*source)?,
                 has_standard: standard.is_some(),
                 weight_bits: weight.to_bits(),
@@ -1621,6 +1698,10 @@ fn block_signature(
                     epsilon_bits: epsilon.to_bits(),
                 }
             }
+            VisionOperands::ResidualAdd { residual, branch } => RelativeOperands::ResidualAdd {
+                residual: rel(*residual)?,
+                branch: rel(*branch)?,
+            },
         };
         let mut weight_specs = Vec::new();
         for role in op.operands.weights() {
@@ -1846,6 +1927,7 @@ fn vision_entry_node_shape(
         VisionEntry::Pool => vision_pool::Entry::contract_node_shape(backend),
         VisionEntry::Position => vision_position::Entry::contract_node_shape(backend),
         VisionEntry::PostNormResidual => post_norm_residual::Entry::contract_node_shape(backend),
+        VisionEntry::ResidualAdd => stream_join::Entry::contract_node_shape(backend),
     };
     result.map_err(|error| GraphError::Invalid(format!("vision entry {entry:?}: {error}")))
 }
@@ -2646,6 +2728,7 @@ mod tests {
                 }),
                 operator_post_norm: sandwich
                     .then(|| rms_norm(&format!("{prefix}.op_post"), 128)),
+                ls1: None,
                 feedforward_norm: layer_norm(&format!("{prefix}.ln2"), 128),
                 feedforward: VisionFeedForward {
                     up: if gated {
@@ -2662,6 +2745,7 @@ mod tests {
                 },
                 feedforward_post_norm: sandwich
                     .then(|| rms_norm(&format!("{prefix}.ff_post"), 128)),
+                ls2: None,
             }
         };
 

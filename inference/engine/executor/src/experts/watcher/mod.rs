@@ -875,6 +875,9 @@ pub(super) struct Watcher {
 /// What a streamed load hands its watcher to serve.
 pub(super) struct WatcherParts {
     pub layers: Vec<Layer>,
+    /// Per-physical-stack record footprint (bytes or granule count) for
+    /// hits-per-byte eviction ranking; empty defaults to uniform `1`.
+    pub footprints: Vec<u64>,
     pub group_reads: Vec<PlacedLayerWords>,
     pub groups: Vec<Group>,
     pub load: LoadWords,
@@ -926,7 +929,7 @@ impl Watcher {
         parts: WatcherParts,
         bounds: Option<Box<dyn Fn() -> crate::experts::exchange::Bounds + Send>>,
     ) -> Result<Self, String> {
-        let WatcherParts { layers, group_reads, groups, load, pools, extents, slots, target_vram_slots, host_slots, whole, staging, host, carrier, source, compute, copier, steps, spans, trip, line, transport } = parts;
+        let WatcherParts { layers, footprints, group_reads, groups, load, pools, extents, slots, target_vram_slots, host_slots, whole, staging, host, carrier, source, compute, copier, steps, spans, trip, line, transport } = parts;
         // The geometry every read lands by, checked once: each pool's
         // staging holds the staging records, and the conveyor lies in each
         // pool, at most a record of every expert of the widest layer.
@@ -989,10 +992,21 @@ impl Watcher {
             .collect::<Vec<_>>();
         let experts = layers.iter().map(|layer| layer.experts).collect::<Vec<_>>();
         let records = groups.iter().map(|group| group.records).collect::<Vec<_>>();
-        let mut directory = Directory::with_decode_depths(
+        let num_stacks = layers.iter().map(|layer| layer.stack).max().map_or(0, |max| max + 1);
+        let mut stack_visits = vec![Vec::new(); num_stacks];
+        for (visit, layer) in layers.iter().enumerate() {
+            stack_visits[layer.stack].push(visit);
+        }
+        let stack_groups: Vec<usize> = stack_visits.iter().map(|visits| layers[visits[0]].group).collect();
+        let stack_experts: Vec<usize> = stack_visits.iter().map(|visits| layers[visits[0]].experts).collect();
+        let last_visits: Vec<usize> = stack_visits.iter().map(|visits| *visits.last().expect("every physical stack has a visit")).collect();
+        let footprints = if footprints.is_empty() { vec![1u64; num_stacks] } else { footprints };
+        let mut directory = Directory::new_with_stacks_and_depths(
             &records,
-            &layers.iter().map(|layer| layer.group).collect::<Vec<_>>(),
-            &layers.iter().map(|layer| layer.experts).collect::<Vec<_>>(),
+            &stack_groups,
+            &stack_experts,
+            &last_visits,
+            &footprints,
             host,
             extents.decode_rows,
         );
@@ -1005,10 +1019,11 @@ impl Watcher {
                 crate::planning::Placer::Bank => directory.keep_homes(),
             }
         }
-        // Each layer's home as the device reads it (`policy[POLICY_HOME]`):
-        // the directory's, by which the host places and names map words.
+        // Each visit layer's home as the device reads it (`policy[POLICY_HOME]`):
+        // its physical stack's home in the directory, so visits sharing a stack
+        // bind the same map slice and home records.
         let homes = (0..layers.len())
-            .map(|layer| i32::try_from(directory.home(layer)).map_err(|_| "a layer's map words exceed i32".to_owned()))
+            .map(|layer| i32::try_from(directory.home(layers[layer].stack)).map_err(|_| "a layer's map words exceed i32".to_owned()))
             .collect::<Result<Vec<_>, _>>()?;
         let LoadWords { flags } = load;
         let count = layers.len();
@@ -1026,6 +1041,7 @@ impl Watcher {
             table: Arc::new(ReadTable::new(source, pools, &layers)),
             directory,
             layers,
+            stack_visits,
             groups,
             extents,
             retired: steps.frontier(),
@@ -1120,25 +1136,26 @@ impl Watcher {
             for group in 0..core.groups.len() {
                 let active = has_decode_dma
                     && core
-                        .directory
-                        .group_layers(group)
-                        .any(|layer| !core.layers[layer].draft);
+                        .layers
+                        .iter()
+                        .any(|layer| layer.group == group && !layer.draft);
                 core.directory.set_group_splitting(group, active);
             }
         }
-        // The ledger's rates are the ranking's (`Reuse::rates`).
+        // The ledger's rates are the ranking's (`Reuse::rates`), keyed by visit layer.
         let ranking = core.directory.ranking();
-        let groups = core.directory.layer_groups();
+        let visit_groups: Vec<usize> = core.layers.iter().map(|layer| layer.group).collect();
+        let stack_visits = core.stack_visits.clone();
         let ranks = core.extents.selected;
         let (_, stands) = crate::experts::reuse::Reuse::of(&ranking).rates();
-        let ledger = crate::experts::interest::Ledger::new(groups, ranks, time, stands);
+        let ledger = crate::experts::interest::Ledger::new(visit_groups, ranks, time, stands);
         let mut residency = Residency {
             homes,
             shared: shared.clone(),
             core,
             ledger,
             inbox,
-            prefetch: Prefetch::new(staging, count),
+            prefetch: Prefetch::new(staging, count, stack_visits),
             scratch: Scratch::new(
                 count,
                 flags,
@@ -1253,6 +1270,7 @@ impl Watcher {
         let mut held = residency::lock_deferred(&self.state);
         let transport = self.shared.transport.clone();
         let core = &mut held.core;
+        let visit_count = core.layers.len();
         let (directory, steps) = (&mut core.directory, &core.steps);
         let progress = steps.point(sequence, layer, sequence);
         directory.set_decode_rows(rows as usize);
@@ -1316,7 +1334,7 @@ impl Watcher {
             }
             let mut remaining_overflows = overflows.len();
             if !overflows.is_empty() {
-                let reclaimed = steps.unbegun_with_served(progress, directory.layers(), |at, park, is_served| {
+                let reclaimed = steps.unbegun_with_served(progress, visit_count, |at, park, is_served| {
                     directory.reclaim_served_demand_landings(
                         group,
                         &overflows,

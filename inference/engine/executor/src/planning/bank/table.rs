@@ -158,25 +158,37 @@ pub(super) fn stored_table_heads(definition: &ModelDefinition, role: WeightRole)
 
 /// The first row of each stored expert's matrix an expert stack takes: 0
 /// for a stack stored whole, the range's first for a range of each expert's
-/// rows (`ImportTransform::Rows`, Gemma's gate‖up halves); `None` for a
-/// stack whose host-prepared bytes are not one range of each stored expert.
-/// A second-level scale leaves the bytes as stored, as does a grid of block
-/// scales (`ScaleBlocks`: the source's own second part), which no range of
-/// rows is taken under: its grid is not rows of the stack.
+/// rows (`ImportTransform::Rows`, Gemma's / Inkling 2's gate‖up halves);
+/// `None` for a stack whose host-prepared bytes are not one range of each
+/// stored expert. A second-level scale leaves the bytes as stored, as does
+/// a grid of block scales (`ScaleBlocks`: the source's own second part)
+/// whenever any row range aligns with the grid's row tile (`tile[0]`).
 pub(super) fn stored_rows(descriptor: &magnitude_family_contracts::WeightDescriptor) -> Option<u64> {
     let mut start = 0;
+    let mut rows = 0;
     let mut ranges = 0;
-    let mut grid = false;
+    let mut grid_row_tile: Option<u64> = None;
     for transform in &descriptor.transforms {
         match transform {
             ImportTransform::ScaleByTensor { .. } => {}
-            ImportTransform::ScaleBlocks { .. } => grid = true,
+            ImportTransform::ScaleBlocks { tile, .. } => grid_row_tile = Some(tile[0]),
             ImportTransform::Rows(range) => {
                 start = range.start;
+                rows = range.rows;
                 ranges += 1;
             }
             _ => return None,
         }
     }
-    (ranges <= 1 && !(grid && ranges == 1)).then_some(start)
+    if ranges > 1 {
+        return None;
+    }
+    if ranges == 1 {
+        if let Some(tile_rows) = grid_row_tile {
+            if tile_rows == 0 || start % tile_rows != 0 || rows % tile_rows != 0 {
+                return None;
+            }
+        }
+    }
+    Some(start)
 }

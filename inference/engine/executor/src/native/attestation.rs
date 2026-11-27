@@ -43,6 +43,7 @@ pub struct AttestedPrograms {
 pub(crate) struct AttestedTarget {
     pub residual_features: Option<NativeKernel<feature_rows::Entry>>,
     pub embedding: NativeKernel<embedding_rows::Entry>,
+    pub entry_norm: Option<NativeKernel<post_norm_residual::Entry>>,
     pub blocks: Vec<AttestedTargetBlock>,
     pub readout: ReadoutKernels,
     pub features: Option<NativeKernel<readout_features_rows::Entry>>,
@@ -208,6 +209,7 @@ fn output_scale(
 #[derive(Clone)]
 pub(crate) enum AttestedMixer {
     Attention(AttentionKernels),
+    BlockAttention,
     Recurrent(RecurrentKernels),
     StateSpace(StateSpaceKernels),
     ShortConv(ShortConvKernels),
@@ -879,6 +881,53 @@ impl AttestedPrograms {
         .map_err(|failure| CatalogError::native(charges.device().backend(), failure))
     }
 
+    #[inline(never)]
+    fn qualification_report(topology: &ProgramPlan, is_block_attn_res: bool) -> QualificationReport {
+        let mut cases = Vec::new();
+        let mut include = |case| {
+            if !cases.contains(&case) {
+                cases.push(case);
+            }
+        };
+        if !topology.imports().is_empty() {
+            include(QualificationCase::Import);
+        }
+        if !topology.state().copies().is_empty() {
+            include(QualificationCase::State);
+        }
+        include(QualificationCase::TargetEmbedding);
+        for block in topology.target().blocks() {
+            match block.mixer() {
+                MixerProgramSlot::Attention(_) if is_block_attn_res => {}
+                MixerProgramSlot::Attention(_) => include(QualificationCase::TargetAttention),
+                MixerProgramSlot::Recurrent(_) => include(QualificationCase::TargetRecurrent),
+                MixerProgramSlot::StateSpace(_) => include(QualificationCase::TargetStateSpace),
+                MixerProgramSlot::ShortConv(_) => include(QualificationCase::TargetShortConv),
+            }
+            match block.feed_forward() {
+                Some(FeedForwardProgramSlot::Dense(_)) => include(QualificationCase::TargetDense),
+                Some(FeedForwardProgramSlot::Routed(_)) => include(QualificationCase::TargetRouted),
+                Some(FeedForwardProgramSlot::GeneralRouted(_)) => {
+                    include(QualificationCase::TargetGeneralRouted)
+                }
+                Some(FeedForwardProgramSlot::Parallel(_)) => {
+                    include(QualificationCase::TargetDense);
+                    include(QualificationCase::TargetGeneralRouted)
+                }
+                None => {}
+            }
+        }
+        include(QualificationCase::Readout);
+        include(QualificationCase::Sampling);
+        if topology.head().is_some() {
+            include(QualificationCase::Head);
+        }
+        if topology.vision().is_some() {
+            include(QualificationCase::Vision);
+        }
+        QualificationReport { cases }
+    }
+
     #[allow(clippy::too_many_arguments)]
     fn prepare_for(
         path: ExecutionPath,
@@ -909,48 +958,11 @@ impl AttestedPrograms {
             unprepared,
         )?;
         let tuned = std::mem::take(&mut prepared.tuned);
-        let mut cases = Vec::new();
-        let mut include = |case| {
-            if !cases.contains(&case) {
-                cases.push(case);
-            }
-        };
-        if !topology.imports().is_empty() {
-            include(QualificationCase::Import);
-        }
-        if !topology.state().copies().is_empty() {
-            include(QualificationCase::State);
-        }
-        include(QualificationCase::TargetEmbedding);
-        for block in topology.target().blocks() {
-            include(match block.mixer() {
-                MixerProgramSlot::Attention(_) => QualificationCase::TargetAttention,
-                MixerProgramSlot::Recurrent(_) => QualificationCase::TargetRecurrent,
-                MixerProgramSlot::StateSpace(_) => QualificationCase::TargetStateSpace,
-                MixerProgramSlot::ShortConv(_) => QualificationCase::TargetShortConv,
-            });
-            match block.feed_forward() {
-                Some(FeedForwardProgramSlot::Dense(_)) => include(QualificationCase::TargetDense),
-                Some(FeedForwardProgramSlot::Routed(_)) => include(QualificationCase::TargetRouted),
-                Some(FeedForwardProgramSlot::GeneralRouted(_)) => {
-                    include(QualificationCase::TargetGeneralRouted)
-                }
-                Some(FeedForwardProgramSlot::Parallel(_)) => {
-                    include(QualificationCase::TargetDense);
-                    include(QualificationCase::TargetGeneralRouted)
-                }
-                None => {}
-            }
-        }
-        include(QualificationCase::Readout);
-        include(QualificationCase::Sampling);
-        if topology.head().is_some() {
-            include(QualificationCase::Head);
-        }
-        if topology.vision().is_some() {
-            include(QualificationCase::Vision);
-        }
-        let report = QualificationReport { cases };
+        let is_block_attn_res = matches!(
+            definition.decoder.residual,
+            magnitude_family_contracts::ResidualForm::BlockAttention { .. }
+        );
+        let report = Self::qualification_report(topology, is_block_attn_res);
         let target_plan = topology.target();
         check_rotary_divisors(load, tuning)?;
         // The decoder blocks of `slots`, whose sublayers' weights `scope`
@@ -987,6 +999,9 @@ impl AttestedPrograms {
                     })
                     .transpose()?;
                 let mixer = match block.mixer() {
+                    MixerProgramSlot::Attention(_) if is_block_attn_res => {
+                        AttestedMixer::BlockAttention
+                    }
                     MixerProgramSlot::Attention(binding) => AttestedMixer::Attention(
                         prepared
                             .target
@@ -1101,6 +1116,10 @@ impl AttestedPrograms {
             Ok(blocks)
         };
         let blocks = attest_blocks(target_plan.blocks(), WeightScope::TargetSublayer)?;
+        let entry_norm = target_plan
+            .entry_norm()
+            .map(|nw| slot(&prepared.target.entry_norm, nw, "post_norm_residual"))
+            .transpose()?;
         let target = AttestedTarget {
             residual_features: prepared.target.residual_features.clone(),
             embedding: slot(
@@ -1108,6 +1127,7 @@ impl AttestedPrograms {
                 target_plan.embedding(),
                 "embedding_rows",
             )?,
+            entry_norm,
             blocks,
             readout: prepared
                 .target
@@ -1132,6 +1152,7 @@ impl AttestedPrograms {
             token_copy: prepared.glue.selection_notice.clone(),
             taps: target_plan
                 .taps()
+                .filter(|t| t.linear_fusion)
                 .map(|taps| {
                     prepared
                         .target
