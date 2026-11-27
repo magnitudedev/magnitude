@@ -818,6 +818,47 @@ impl Residency {
         unmapped | directory.retire_graces(self.prefetch.reached(), steps)
     }
 
+    /// Reclaim `Host::Ready` slots for active `tier_copy_dma` prefill demand
+    /// when `ready.len() <= pool` (e.g. when `vram_slots == total_experts` and
+    /// `host_slots == 0` so `refill_short()` is gated by `vram_lacked_in_group`
+    /// or `Host::Graced` records).
+    pub(super) fn reclaim_for_scratch_dma(&mut self) -> bool {
+        if !self.core.extents.tier_copy_dma || !self.core.directory.needs_scratch_dma_reclaim() {
+            return false;
+        }
+        let steps = &self.shared.steps;
+        let directory = &mut self.core.directory;
+        let mut freed = false;
+        steps.unbegun(|at| {
+            if at.all_scratch() {
+                freed |= directory.retire_graces_immediate();
+            }
+        });
+        if !directory.needs_scratch_dma_reclaim() {
+            return freed;
+        }
+        let victims = directory.scratch_dma_victims(steps.lending());
+        if victims.iter().all(Vec::is_empty) {
+            return freed;
+        }
+        let evicted_records: Vec<(usize, usize)> = victims
+            .iter()
+            .enumerate()
+            .flat_map(|(group, records)| records.iter().map(move |&(record, _)| (group, record as usize)))
+            .collect();
+        let mut unmapped = false;
+        steps.unbegun(|at| {
+            let immediate = at.all_scratch();
+            unmapped = directory.refill_with(victims, at, immediate);
+        });
+        if unmapped {
+            for (group, tier_record) in evicted_records {
+                self.shared.transport.bump_source_generation(group, tier_record);
+            }
+        }
+        freed | unmapped | directory.retire_graces(self.prefetch.reached(), steps)
+    }
+
     /// Take `layer`'s scratch requests published since, in step order,
     /// reading what each needs as its records free; none while the conveyor
     /// still clears a group past (`Scratch::clearing`), whose clearing is an
@@ -1166,12 +1207,13 @@ impl Residency {
             })
             .collect::<Vec<_>>();
         format!(
-            "{}; promotions {}; {}; {}; tier keeps every expert {}; retired through {}; records taken {}; resize asked {}; \
+            "{}; promotions {}; {}; {}; host {:?}; tier keeps every expert {}; retired through {}; records taken {}; resize asked {}; \
              per layer (bank holds, tier holds alone) {layers:?}",
             self.prefetch.describe(),
             self.core.directory.describe_promotions(),
             self.scratch.describe(),
             self.scratch.describe_tables(&self.core),
+            self.core.directory.describe_host(),
             self.complete,
             self.core.retired,
             self.core.taken.len(),

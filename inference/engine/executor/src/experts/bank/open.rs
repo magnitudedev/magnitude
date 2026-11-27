@@ -940,7 +940,7 @@ fn watch(
         slots,
         target_vram_slots: Some(plan.target_vram_slots_table()),
         host_slots,
-        whole: plan.whole(),
+        whole: plan.resident,
         staging: u32::try_from(binding.staging).map_err(|_| "staging records exceed u32")?,
         host,
         carrier,

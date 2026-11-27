@@ -1730,8 +1730,7 @@ impl HostRecords {
             if at.lending() && record < self.lent {
                 continue;
             }
-            if immediate && matches!(self.records[record as usize], Host::Kept(_)) {
-                self.unkeep(record);
+            if immediate && matches!(self.records[record as usize], Host::Kept(_) | Host::Answering(_, _)) {
                 if let Some(map) = &self.maps[chosen.0] {
                     map.store_unbegun(chosen.1, None, Some(at));
                 }
@@ -1742,6 +1741,74 @@ impl HostRecords {
             unmapped = true;
         }
         unmapped
+    }
+
+    /// Whether at least one ready record lies past the cut-in pool so a demand
+    /// `claim(_, 0, Taking::Out, _)` can acquire a slot without `Claim::Short`.
+    pub fn has_ready_beyond_pool(&self) -> bool {
+        self.beyond(self.ready.len(), self.pool)
+    }
+
+    /// Immediately release all `Host::Graced` records to `Host::Ready`.
+    /// Valid ONLY under `tier_copy_dma && at.all_scratch()` where zero GPU
+    /// decode kernels read `tier_map` and every active `HostTier` copy pins its
+    /// record with `whole.holds > 0`.
+    pub fn retire_immediate(&mut self) -> bool {
+        if self.graced.is_empty() {
+            return false;
+        }
+        let freed = self.graced.clone();
+        for record in freed {
+            self.set(record, Host::Ready);
+        }
+        true
+    }
+
+    /// Select up to `self.reserve.max(1)` coldest unheld records (never lent
+    /// records while `lending`) to immediately free for active `tier_copy_dma`
+    /// prefill demand when `self.ready.len() <= self.pool`, bypassing
+    /// `file_lacked` and `graced.len()` reserve gating.
+    pub fn reclaim_victims_for_scratch_dma<K: Ord + Copy>(&self, rank: impl Rank<K>, lending: bool) -> Vec<(u32, Staged)> {
+        if self.has_ready_beyond_pool() {
+            return Vec::new();
+        }
+        let need = self.reserve.max(1);
+        let mut order = (0..self.extent())
+            .filter(|&record| (!lending || record >= self.lent) && self.unheld(record) && !self.layer_protected(record))
+            .filter_map(|record| {
+                let (kept, key, staged) = match self.records[record as usize] {
+                    Host::Answering(Whole { staged, kept, read, .. }, _) => taking(kept, staged, read, &rank),
+                    _ => self.place(record, &rank)?,
+                };
+                Some(((kept, key, record >= self.lent, staged), record, staged))
+            })
+            .collect::<Vec<_>>();
+        if need < order.len() {
+            order.select_nth_unstable(need);
+            order.truncate(need);
+        }
+        order.sort_unstable();
+        order.into_iter().map(|(_, record, staged)| (record, staged)).collect()
+    }
+
+    /// Concise diagnostic snapshot for watchdog / SIGUSR1 reports.
+    pub fn describe(&self) -> String {
+        format!(
+            "ready={}(past={}) graced={} kept={} banked={} ans={} land={} claimed={} ext={} lent={} res={} pool={} lacked={}",
+            self.ready.len(),
+            self.ready_past_lent,
+            self.graced.len(),
+            self.kept.len(),
+            self.banked.len(),
+            self.answering.len(),
+            self.landing.len(),
+            self.claimed,
+            self.extent(),
+            self.lent,
+            self.reserve,
+            self.pool,
+            self.lacked(),
+        )
     }
 
     /// Unmap kept record `record`, which no copy holds, from `at`, the

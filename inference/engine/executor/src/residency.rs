@@ -1240,7 +1240,7 @@ impl ResidencyStore {
         let bank = crate::experts::ExpertBank::open(charges, plan, artifact, draft, &sites, lines, &self.cpu_site, self.pools.clone(), (self.changes.clone(), self.host_backing.take()))?;
         // Each stack through the entry a resident load imports it with, from
         // a read around the file cache: no expert byte stays in it.
-        if plan.whole() {
+        if plan.resident {
             bank.import_whole(&mut |weight, records, record_at| {
                 let entry = self.programs.import_entry(weight).map_err(|error| error.to_string())?;
                 let source_artifact = match weight.role.scope {

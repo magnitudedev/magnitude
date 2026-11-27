@@ -1881,6 +1881,39 @@ impl Directory {
             .fold(false, |unmapped, (records, victims)| unmapped | records.refill_with(victims, at, immediate))
     }
 
+    /// Whether any host tier lacks a ready record beyond its cut-in pool for an
+    /// active `tier_copy_dma` prefill demand landing.
+    pub fn needs_scratch_dma_reclaim(&self) -> bool {
+        self.host.iter().any(|records| !records.has_ready_beyond_pool())
+    }
+
+    /// Immediately release all `Host::Graced` records across every host tier
+    /// (valid strictly under `tier_copy_dma && at.all_scratch()`).
+    pub fn retire_graces_immediate(&mut self) -> bool {
+        self.host.iter_mut().fold(false, |freed, records| freed | records.retire_immediate())
+    }
+
+    /// Victims to evict immediately into `Host::Ready` for active
+    /// `tier_copy_dma` prefill demand that is blocked on `ready.len() <= pool`.
+    pub fn scratch_dma_victims(&self, lending: bool) -> Vec<Vec<(u32, Staged)>> {
+        let reuse = self.reuse_now();
+        let tier = self.host_tier();
+        self.host
+            .iter()
+            .enumerate()
+            .map(|(group, records)| {
+                let at = records.progress().map(|p| (p.sequence, p.layer));
+                let rank = store_rank(reuse.ranker(group, tier, Reader::Move), &self.prompt_reads, &self.token_reads, &self.last_visits, at);
+                records.reclaim_victims_for_scratch_dma(rank, lending)
+            })
+            .collect()
+    }
+
+    /// Concise per-group host-tier state for watchdog / SIGUSR1 reports.
+    pub fn describe_host(&self) -> Vec<String> {
+        self.host.iter().map(HostRecords::describe).collect()
+    }
+
     /// Group `group`'s host tier sets `records` ready records aside for
     /// the decode steps cut in during a prompt pass from now, none once
     /// the pass ends ([`HostRecords::set_pool`]): one decode step's

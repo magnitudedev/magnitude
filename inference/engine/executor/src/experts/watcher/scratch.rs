@@ -1257,6 +1257,13 @@ impl Scratch {
         self.conveyor.serving.is_some_and(|serving| serving.past)
     }
 
+    /// Whether the conveyor holds any NVMe-read expert awaiting a `HostTier`
+    /// landing claim (used under `tier_copy_dma` to reclaim host-tier slots
+    /// even when `refill_short()` is gated by VRAM holdings or graces).
+    pub(super) fn has_held_demand(&self) -> bool {
+        !self.conveyor.held_without_landing().is_empty()
+    }
+
     /// Layer `layer`'s next `(place, window, step)` taken and not yet served,
     /// in `(set, window, place)` device order, left in its tier until its
     /// last window is taken; none while there is none, those of steps ended

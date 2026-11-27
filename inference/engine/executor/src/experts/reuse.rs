@@ -1331,12 +1331,21 @@ impl Reuse {
     }
 
     /// Record that `step`'s front row `first_fall` (1-based, `1..DEPTHS`) was
-    /// the first guessed row to fall at `layer`: counts its `fell` table
-    /// against the outcomes following `step` (design §3.4).
+    /// the first guessed row to fall at physical stack `layer`: counts its
+    /// `fell` table against the outcomes following `step` (design §3.4).
     pub fn fell(&mut self, layer: usize, step: Step, first_fall: usize) {
         let group = self.groups[layer];
         let epoch = self.time.lock().group_epoch(group);
         self.layers[layer].record_fell(step, first_fall, epoch);
+    }
+
+    /// Record that `step`'s front row `first_fall` fell across every physical
+    /// stack tracked by this ranking (safe for looped models where visit count
+    /// exceeds physical stack count).
+    pub fn fell_all(&mut self, step: Step, first_fall: usize) {
+        for stack in 0..self.layers.len() {
+            self.fell(stack, step, first_fall);
+        }
     }
 
     /// Rebuild `self.order[group]` and `self.top` once for every dirty layer

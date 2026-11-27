@@ -3641,9 +3641,7 @@ impl Telemetry {
         if !fallen.is_empty() {
             let mut reuse = crate::experts::reuse::Reuse::of(&self.ranking);
             for (step, first_fall) in fallen {
-                for layer in 0..self.routing.experts.len() {
-                    reuse.fell(layer, step, first_fall);
-                }
+                reuse.fell_all(step, first_fall);
             }
         }
     }

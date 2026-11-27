@@ -336,11 +336,17 @@ impl Requests {
         // reader lifecycle events were already applied in `apply_polled_passes`).
         let released = released_passes
             | residency.scratch.settle_prefill_copies(&mut residency.core, &self.shared);
-        let refilled = if residency.core.extents.tier_copy_dma && residency.core.directory.refill_short() {
+        let mut refilled = if residency.core.extents.tier_copy_dma && residency.core.directory.refill_short() {
             residency.refill_tier()
         } else {
             false
         };
+        if residency.core.extents.tier_copy_dma
+            && residency.scratch.has_held_demand()
+            && residency.core.directory.needs_scratch_dma_reclaim()
+        {
+            refilled |= residency.reclaim_for_scratch_dma();
+        }
         // The misses waiting for a tier or staging record, or a read
         // ahead's landing.
         let resumed = service.decode.resume(residency.serving());
