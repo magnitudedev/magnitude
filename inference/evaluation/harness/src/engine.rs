@@ -469,7 +469,7 @@ impl Engine {
         load: &Load,
     ) -> Result<Self, String> {
         let resolved = configuration(artifacts, options, load)?;
-        let vocabulary = usize::try_from(resolved.manifest.definition.decoder.vocabulary)
+        let vocabulary = usize::try_from(resolved.manifest.definition.decoder.active_vocabulary())
             .map_err(|_| "vocabulary exceeds the host domain")?;
         let method = resolved.manifest.model.method;
         let package = std::sync::Arc::new(

@@ -1,7 +1,8 @@
 """magnitude-conversion: convert a checkpoint to Magnitude GGUFs, check a converted file against it, and verify that a
 file alone does what its users need before it is published. The family is the checkpoint's `config.json`
-`model_type`: DeepSeek V4.1 (`deepseek_v41`, parts text, dspark and vision) or GLM-5.3-Flash (`glm5_next`, Z.ai's
-FP8 release or NVIDIA's ModelOpt one, parts text and vision).
+`model_type`: DeepSeek V4.1 (`deepseek_v41`, parts text, dspark and vision), GLM-5.3-Flash (`glm5_next`, Z.ai's
+FP8 release or NVIDIA's ModelOpt one, parts text and vision), or Inkling 2 (`inkling2`, `inkling2_text`,
+`inkling2_loop`, parts text, dspark and vision).
 
   convert <checkpoint> <out.gguf> --part text|dspark|vision --source-repo R --source-revision H [--layers 0,1] [--pool 8,2,8] [--split-max-size 50G] [--shards 1|''] [--upstream-f32]
   check   <checkpoint> <out.gguf or first shard> --part ... --source-repo R --source-revision H [--layers ...] [--pool ...]
@@ -30,7 +31,7 @@ from pathlib import Path
 import numpy as np
 import torch
 
-from . import check, deepseek41, glm5next, llama, verify
+from . import check, deepseek41, glm5next, inkling2, llama, verify
 
 logger = logging.getLogger("magnitude_conversion")
 
@@ -47,7 +48,7 @@ def main() -> None:
         command = commands.add_parser(name)
         command.add_argument("checkpoint", type=Path)
         command.add_argument("gguf", type=Path)
-        command.add_argument("--part", default="text", help="text, vision, or (DeepSeek V4.1) dspark")
+        command.add_argument("--part", default="text", help="text, vision, or (DeepSeek V4.1 / Inkling 2) dspark")
         command.add_argument("--layers", type=lambda s: [int(x) for x in s.split(",")])
         command.add_argument("--pool", type=lambda s: tuple(int(x) for x in s.split(",")),
                              help="BLOCKS,BLOCK_ROWS,TOP_K of the indexer's candidate pool")
@@ -103,6 +104,12 @@ def main() -> None:
                 model = glm5next.upstream_f32(args.checkpoint, args.gguf, layers=args.layers)
             else:
                 model = glm5next.build(args.part, args.checkpoint, args.gguf, **common)
+        elif model_type in inkling2.MODEL_TYPES:
+            if args.pool is not None:
+                parser.error("--pool is a DeepSeek V4.1 option")
+            if args.upstream_f32:
+                parser.error("--upstream-f32 is a GLM-5.3-Flash option")
+            model = inkling2.build(args.part, args.checkpoint, args.gguf, **common)
         else:
             parser.error(f"no converter for model_type {model_type!r}")
         if args.command == "convert":

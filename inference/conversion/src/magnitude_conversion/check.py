@@ -34,14 +34,25 @@ from conversion.base import LazyTorchTensor, gguf
 from .exact import negative_exp_f32
 from .deepseek41 import DeepseekV41, DeepseekV41DSpark, DeepseekV41Vision
 from .glm5next import Glm5Next, Glm5NextVision
+from .inkling2 import (
+    Inkling2DSpark,
+    Inkling2Text,
+    Inkling2Vision,
+    map_dspark_tensor_name,
+    map_text_tensor_name,
+    map_vision_tensor_name,
+)
 from .native import ALIGNMENT, Native, scale_name
 
 logger = logging.getLogger(__name__)
 
 T = gguf.GGMLQuantizationType
 _CHUNK = 1 << 28
-_RAW = {torch.bfloat16: T.BF16, torch.float32: T.F32}  # checkpoint types stored as they are
-Model = DeepseekV41 | DeepseekV41DSpark | DeepseekV41Vision | Glm5Next | Glm5NextVision
+_RAW = {torch.bfloat16: T.BF16, torch.float16: T.F16, torch.float32: T.F32}  # checkpoint types stored as they are
+Model = (
+    DeepseekV41 | DeepseekV41DSpark | DeepseekV41Vision | Glm5Next | Glm5NextVision
+    | Inkling2Text | Inkling2DSpark | Inkling2Vision
+)
 
 
 @dataclass
@@ -282,6 +293,103 @@ RULES: dict[type, Rules] = {
 }
 
 
+def _inkling2_expected(model: Inkling2Text | Inkling2DSpark | Inkling2Vision,
+                       add: Callable[[str, Expected], None]) -> None:
+    """Independent byte-exact expectations for Inkling 2 text, DSpark, and vision GGUFs."""
+    if isinstance(model, Inkling2Text):
+        for name, ref in model.dense_tensors.items():
+            gguf_name, _ = map_text_tensor_name(name)
+            qtype = _RAW[ref.dtype]
+            if name.endswith(".w13_weight"):
+                add(gguf_name, Expected(
+                    qtype,
+                    ref.shape,
+                    _once(lambda r=ref: _raw(torch.cat([(t := r.load())[:, 0::2, :], t[:, 1::2, :]], dim=1))),
+                ))
+            elif name.endswith((".static_weight", ".static_w")):
+                add(gguf_name, Expected(
+                    qtype,
+                    (ref.shape[1], ref.shape[0]),
+                    _once(lambda r=ref: _raw((t := r.load())[torch.arange(t.shape[0] - 1, -1, -1)].transpose(0, 1))),
+                ))
+            elif name.endswith((".conv1d.weight", "sconv.weight")) and len(ref.shape) == 3 and ref.shape[1] == 1:
+                add(gguf_name, Expected(
+                    qtype,
+                    (ref.shape[0], ref.shape[2]),
+                    _once(lambda r=ref: _raw(r.load()[:, 0, :])),
+                ))
+            elif name.endswith(".rel_logits_proj.proj"):
+                add(gguf_name, Expected(
+                    qtype,
+                    (ref.shape[1], ref.shape[0]),
+                    _once(lambda r=ref: _raw(r.load().transpose(0, 1))),
+                ))
+            else:
+                add(gguf_name, Expected(
+                    qtype,
+                    ref.shape,
+                    _once(lambda r=ref: _raw(r.load())),
+                ))
+        for spec in model.nvfp4_experts.values():
+            experts = spec.shape[0]
+
+            def nvfp4_chunks(s=spec, n_exp=experts) -> Iterator[np.ndarray]:
+                for e in range(n_exp):
+                    packed = s.weight.load_expert(e).view(torch.uint8).numpy()
+                    scales = s.scale.load_expert(e).view(torch.uint8).numpy()
+                    if s.w13:
+                        yield nvfp4_blocks(packed[0::2], scales[0::2])
+                        yield nvfp4_blocks(packed[1::2], scales[1::2])
+                    else:
+                        yield nvfp4_blocks(packed, scales)
+
+            def scale_chunk(s=spec) -> np.ndarray:
+                a = s.amax.load().numpy().astype(np.float32)
+                d = s.denominator.load().numpy().astype(np.float32)
+                return np.ascontiguousarray((a / d).astype(np.float32)).view(np.uint8).reshape(-1)
+
+            add(spec.gguf_name, Expected(T.NVFP4, spec.shape, nvfp4_chunks))
+            add(scale_name(spec.gguf_name), Expected(T.F32, (experts,), _once(scale_chunk)))
+        for spec in model.mxfp8_experts.values():
+            experts = spec.shape[0]
+
+            def mxfp8_w_chunks(s=spec, n_exp=experts) -> Iterator[np.ndarray]:
+                for e in range(n_exp):
+                    arr = s.weight.load_expert(e).view(torch.uint8).numpy()
+                    if s.w13:
+                        arr = np.concatenate([arr[0::2], arr[1::2]], axis=0)
+                    yield np.ascontiguousarray(arr).reshape(-1)
+
+            def mxfp8_s_chunks(s=spec, n_exp=experts) -> Iterator[np.ndarray]:
+                for e in range(n_exp):
+                    arr = s.scale.load_expert(e).view(torch.uint8).numpy()
+                    if s.w13:
+                        arr = np.concatenate([arr[0::2], arr[1::2]], axis=0)
+                    yield np.ascontiguousarray(arr).reshape(-1)
+
+            add(spec.gguf_name, Expected(T.F8_E4M3, spec.shape, mxfp8_w_chunks))
+            add(scale_name(spec.gguf_name), Expected(T.I8, spec.scale_shape, mxfp8_s_chunks))
+        return
+
+    if isinstance(model, Inkling2DSpark):
+        for name, ref in model.tensors.items():
+            add(map_dspark_tensor_name(name), Expected(T.BF16, ref.shape, _once(lambda r=ref: _raw(r.load()))))
+        return
+
+    ps = int(model.vision_config["patch_size"])
+    for name, ref in model.tensors.items():
+        gguf_name = map_vision_tensor_name(name)
+        qtype = _RAW[ref.dtype]
+        if name.endswith(".patch_embedding.weight"):
+            add(gguf_name, Expected(
+                qtype,
+                (ref.shape[0], 3, ps, ps),
+                _once(lambda r=ref, p=ps: _raw(r.load().reshape(r.shape[0], p, p, 3).permute(0, 3, 1, 2))),
+            ))
+        else:
+            add(gguf_name, Expected(qtype, ref.shape, _once(lambda r=ref: _raw(r.load()))))
+
+
 def expected_tensors(model: Model) -> dict[str, Expected]:
     out: dict[str, Expected] = {}
 
@@ -289,6 +397,10 @@ def expected_tensors(model: Model) -> dict[str, Expected]:
         if name in out:
             raise ValueError(f"two sources for {name}")
         out[name] = e
+
+    if isinstance(model, (Inkling2Text, Inkling2DSpark, Inkling2Vision)):
+        _inkling2_expected(model, add)
+        return out
 
     rules = RULES[type(model)]
     # upstream's modify_tensors: names only, without the writes this package's classes make inside it
@@ -400,7 +512,13 @@ def check(model: Model, first_shard: Path, only: frozenset[int] | None = None) -
 
     if field(gguf.Keys.General.SOURCE_REPO_URL) != model._source_repo_url:
         raise ValueError(f"general.source.repo_url is {field(gguf.Keys.General.SOURCE_REPO_URL)!r}")
-    if (file_type := RULES[type(model)].file_type) is not None:
+    if isinstance(model, Inkling2Text):
+        if field(gguf.Keys.General.FILE_TYPE) != model.file_type:
+            raise ValueError(f"general.file_type is {field(gguf.Keys.General.FILE_TYPE)}, {model.file_type!r} expected")
+    elif isinstance(model, (Inkling2DSpark, Inkling2Vision)):
+        if field(gguf.Keys.General.FILE_TYPE) != gguf.LlamaFileType.MOSTLY_BF16:
+            raise ValueError(f"general.file_type is {field(gguf.Keys.General.FILE_TYPE)}, MOSTLY_BF16 expected")
+    elif (file_type := RULES[type(model)].file_type) is not None:
         # upstream's rule: a ModelOpt config with any NVFP4 layer makes the file NVFP4
         layers = model.hparams.get("quantization_config", {}).get("quantized_layers", {})
         if any(str(entry.get("quant_algo")).endswith("NVFP4") for entry in layers.values()):

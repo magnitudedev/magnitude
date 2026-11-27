@@ -30,6 +30,7 @@ from gguf.constants import GGMLQuantizationType as Q
 VARIANT = "perturbed:"
 CHANCES = 24  # a value moves down on draw 0, up on draw 1, of 24 equally likely
 MXFP4_BLOCK, MXFP4_BYTES = 32, 17  # values per block; one E8M0 byte, then 16 bytes of nibble pairs
+NVFP4_SUBS, NVFP4_SUB_BLOCK, NVFP4_BYTES = 4, 16, 36  # 4 sub-blocks of 16: 4 UE4M3 scales + 4*8 nibble-pair bytes
 
 
 @dataclass(frozen=True)
@@ -47,6 +48,7 @@ F32 = Format("F32", 32, True, 0x7F7F_FFFF)
 F16 = Format("F16", 16, True, 0x7BFF)
 BF16 = Format("BF16", 16, True, 0x7F7F)
 E4M3 = Format("E4M3", 8, True, 0x7E)  # FN: 0x7F and 0xFF are NaN; 448 is 0x7E
+UE4M3 = Format("UE4M3", 8, False, 0x7E)  # unsigned E4M3FN scale (NVFP4): 0..448, 0x7F+ is NaN
 E2M1 = Format("E2M1", 4, True, 0x7)  # 0, 0.5, 1, 1.5, 2, 3, 4, 6
 E8M0 = Format("E8M0", 8, False, 254)  # 2^(b - 127); 255 is NaN (OCP MX)
 # An FP8 weight's UE8M0 tile exponent, within the range where its products are exact in float32
@@ -131,6 +133,28 @@ def mxfp4_moved(blocks: np.ndarray, rows: np.ndarray, scale_key: np.uint64, valu
                 out[r, b, 1 + k] = low | (high << 4)
 
 
+@numba.njit(nogil=True, cache=True)
+def nvfp4_moved(blocks: np.ndarray, rows: np.ndarray, scale_key: np.uint64, value_key: np.uint64,
+                scale_moves: np.ndarray, value_moves: np.ndarray, out: np.ndarray) -> None:
+    """NVFP4 super-blocks [n, super-blocks a row, 36] of GGUF rows `rows` [n], moved into `out`:
+    4 UE4M3 sub-block scales in bytes 0..4, then 4 sub-blocks of 8 nibble-pair bytes (low nibbles 0..7,
+    high nibbles 8..15)."""
+    count = blocks.shape[1]
+    for r in range(blocks.shape[0]):
+        for b in range(count):
+            super_block = rows[r] * count + b
+            for s in range(NVFP4_SUBS):
+                sub = super_block * NVFP4_SUBS + s
+                out[r, b, s] = scale_moves[draw(scale_key, sub), blocks[r, b, s]]
+                first = sub * NVFP4_SUB_BLOCK
+                base = NVFP4_SUBS + s * (NVFP4_SUB_BLOCK // 2)
+                for k in range(NVFP4_SUB_BLOCK // 2):
+                    pair = blocks[r, b, base + k]
+                    low = value_moves[draw(value_key, first + k), pair & 0x0F]
+                    high = value_moves[draw(value_key, first + NVFP4_SUB_BLOCK // 2 + k), pair >> 4]
+                    out[r, b, base + k] = low | (high << 4)
+
+
 @cache
 def moves(format: Format) -> np.ndarray:
     """`move` tabulated for a format of at most 16 bits: [draw (0 down, 1 stay, 2 up), code] -> moved code."""
@@ -181,6 +205,11 @@ class Perturbation:
             blocks = data.reshape(len(rows), -1, MXFP4_BYTES)
             moved = np.empty_like(blocks)
             mxfp4_moved(blocks, rows, self.key(name + "/scales"), self.key(name), moves(E8M0), moves(E2M1), moved)
+            return moved.reshape(data.shape)
+        if kind == Q.NVFP4:
+            blocks = data.reshape(len(rows), -1, NVFP4_BYTES)
+            moved = np.empty_like(blocks)
+            nvfp4_moved(blocks, rows, self.key(name + "/scales"), self.key(name), moves(UE4M3), moves(E2M1), moved)
             return moved.reshape(data.shape)
         if kind == Q.I8 and encoding is not None:
             format, dtype = encoding, np.uint8
