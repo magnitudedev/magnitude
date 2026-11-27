@@ -5,9 +5,9 @@ use magnitude_executor::{
 use magnitude_generation::{
     BoundaryRule, Constraint, DFlash, Demand, EndOfGeneration, FinishReason, Generation,
     InputLayout, InputSpan, Method, MethodCheckpoint, MethodCheckpointError, MethodChoice,
-    MethodEffects, MethodRequirements, MethodState, Mtp, Options, Propose, ReasoningBudget,
-    RequestId, RoundForward, RoundStart, Sampling, SelectSpec, Shaping, StartedRound, TokenId,
-    Verification, WorkKind,
+    MethodEffects, MethodRequirements, MethodState, Mtp, Options, PrefixReuse, Propose,
+    ReasoningBudget, RequestId, RoundForward, RoundStart, Sampling, SelectSpec, Shaping,
+    StartedRound, TokenId, Verification, WorkKind,
 };
 use std::{
     cell::RefCell,
@@ -1549,9 +1549,11 @@ fn reusable_draft_prefixes_keep_each_intermediate_history_complete() {
 #[test]
 fn transient_draft_priming_preserves_its_final_prompt_horizon() {
     let mut generation = dflash_fresh(&(1..=16).collect::<Vec<_>>(), 2);
-    generation.set_prefix_reuse(false).unwrap();
+    generation.set_prefix_reuse(PrefixReuse::Transient).unwrap();
     generation.resume_at(None).unwrap();
-    assert!(generation.set_prefix_reuse(true).is_err());
+    assert!(generation
+        .set_prefix_reuse(PrefixReuse::Reusable { partition: None })
+        .is_err());
     assert!(generation.method_checkpoint().is_err());
     let first = start(generation, 4);
     assert_eq!(first.round_forward().prime.as_ref().unwrap().draft_from, 16);

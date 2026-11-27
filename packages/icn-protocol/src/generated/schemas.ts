@@ -712,6 +712,7 @@ export type ChatCompletionProgressEncoded = S.Schema.Encoded<typeof ChatCompleti
 
 export const ChatCompletionRequest = S.Struct({
   cache_prompt: S.optionalWith(S.Boolean, { exact: true, as: "Option" }),
+  cache_salt: S.optionalWith(S.String.pipe(S.minLength(1)), { exact: true, as: "Option" }),
   chat_template_kwargs: S.optionalWith(
     S.extend(S.Struct({}), S.Record({ key: S.String, value: S.suspend((): S.Schema<Value, ValueEncoded> => Value) })),
     { exact: true, as: "Option" },
@@ -2308,6 +2309,7 @@ export type MessageResponse = S.Schema.Type<typeof MessageResponse>
 export type MessageResponseEncoded = S.Schema.Encoded<typeof MessageResponse>
 
 export const MessagesRequest = S.Struct({
+  cache_salt: S.optionalWith(S.String.pipe(S.minLength(1)), { exact: true, as: "Option" }),
   max_tokens: S.Number.pipe(S.int(), S.greaterThanOrEqualTo(0)),
   messages: S.Array(S.suspend((): S.Schema<Message, MessageEncoded> => Message)),
   metadata: S.optionalWith(JsonValue, { exact: true, as: "Option" }),
@@ -3340,6 +3342,7 @@ export type ResponseContentPart = S.Schema.Type<typeof ResponseContentPart>
 export type ResponseContentPartEncoded = S.Schema.Encoded<typeof ResponseContentPart>
 
 export const ResponseCreateRequest = S.Struct({
+  cache_salt: S.optionalWith(S.String.pipe(S.minLength(1)), { exact: true, as: "Option" }),
   client_metadata: S.optionalWith(
     S.Union(S.extend(S.Struct({}), S.Record({ key: S.String, value: JsonValue })), S.Null),
     { exact: true, as: "Option" },

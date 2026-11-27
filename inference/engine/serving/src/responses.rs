@@ -91,6 +91,11 @@ mod schema {
         pub previous_response_id: Option<String>,
         pub prompt_cache_key: Option<String>,
         pub truncation: Option<String>,
+        /// Confines prefix-cache sharing to requests with the same salt, as
+        /// vLLM's and SGLang's `cache_salt`. At most 1024 characters
+        /// (Unicode scalar values).
+        #[schema(nullable = false, min_length = 1)]
+        pub cache_salt: Option<String>,
     }
 
     #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
@@ -1190,6 +1195,7 @@ pub fn adapt(request: ResponseCreateRequest) -> Result<AdaptedResponseRequest, A
     {
         return Err(ApiError::invalid("automatic truncation is not supported"));
     }
+    let partition = crate::chat::cache_salt(request.cache_salt)?;
     let conversation = context(request.instructions, request.input)?;
     let mut definitions = Vec::new();
     for tool in request.tools.unwrap_or_default() {
@@ -1269,7 +1275,7 @@ pub fn adapt(request: ResponseCreateRequest) -> Result<AdaptedResponseRequest, A
                 stops: Vec::new(),
                 end_of_generation: EndOfGeneration::Stop,
                 reasoning_budget: None,
-                prompt_cache: PromptCache::Allowed,
+                prompt_cache: PromptCache::Allowed { partition },
             },
         },
         projection,

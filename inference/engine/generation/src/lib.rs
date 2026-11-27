@@ -48,6 +48,17 @@ use std::{
     sync::{Arc, Mutex},
 };
 
+/// Whether another request may reuse a generation's intermediate prefixes,
+/// and with whom.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum PrefixReuse {
+    /// No other request reuses them.
+    Transient,
+    /// Requests of the same `partition` reuse them: with `None`, every
+    /// unpartitioned request.
+    Reusable { partition: Option<Arc<str>> },
+}
+
 /// Live runtime pricing observed from the executor domain for this generation.
 #[derive(Default)]
 struct ObservedPricing {
@@ -333,7 +344,7 @@ pub struct Generation {
     accepted_position: usize,
     reconciliation_target: usize,
     resident: bool,
-    reusable_prefixes: bool,
+    prefix_reuse: PrefixReuse,
     finish: Option<FinishReason>,
     method_factory: Arc<dyn Method>,
     method: Box<dyn MethodState>,
@@ -444,7 +455,7 @@ impl Generation {
             accepted_position: 0,
             reconciliation_target: 0,
             resident: false,
-            reusable_prefixes: true,
+            prefix_reuse: PrefixReuse::Reusable { partition: None },
             finish,
             method_factory,
             method,
@@ -518,19 +529,32 @@ impl Generation {
     pub fn method_reclaimable(&self) -> u64 {
         self.method.reclaimable()
     }
-    /// Declare before residency whether another request may reuse an intermediate
-    /// prefix. Reusable histories must be complete at every boundary: a peer can
-    /// introduce a branch point after this request has begun prefilling.
-    pub fn set_prefix_reuse(&mut self, reusable: bool) -> Result<(), String> {
+    /// Declare before residency whether, and with whom, another request may
+    /// reuse an intermediate prefix. Reusable histories must be complete at
+    /// every boundary: a peer can introduce a branch point after this request
+    /// has begun prefilling.
+    pub fn set_prefix_reuse(&mut self, reuse: PrefixReuse) -> Result<(), String> {
         if self.resident || self.resident_position != 0 || !self.generated.is_empty() {
             return Err("prefix reuse must be declared before generation starts".into());
         }
-        self.reusable_prefixes = reusable;
+        self.prefix_reuse = reuse;
         Ok(())
     }
 
+    /// The partition this request shares prefixes within, if any.
+    pub fn prefix_partition(&self) -> Option<&Arc<str>> {
+        match &self.prefix_reuse {
+            PrefixReuse::Reusable { partition } => partition.as_ref(),
+            PrefixReuse::Transient => None,
+        }
+    }
+
+    fn reusable_prefixes(&self) -> bool {
+        matches!(self.prefix_reuse, PrefixReuse::Reusable { .. })
+    }
+
     fn priming_horizon(&self, boundary: usize) -> usize {
-        if self.reusable_prefixes {
+        if self.reusable_prefixes() {
             boundary
         } else {
             self.prompt.len() + self.generated.len()
@@ -538,7 +562,7 @@ impl Generation {
     }
     /// Export owned method state for prefix retention.
     pub fn method_checkpoint(&self) -> Result<MethodCheckpoint, String> {
-        if !self.reusable_prefixes {
+        if !self.reusable_prefixes() {
             return Err("request does not retain reusable prefixes".into());
         }
         if !self.resident {

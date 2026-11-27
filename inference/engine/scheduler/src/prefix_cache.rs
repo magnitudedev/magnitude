@@ -27,6 +27,7 @@ use magnitude_family_contracts::{InputLayout, InputSpan, PromptCoordinates, Toke
 use magnitude_generation::{Generation, MethodCheckpoint, MethodChoice};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeSet;
+use std::sync::Arc;
 
 pub const MIN_PREFIX_HIT: usize = 64;
 
@@ -49,10 +50,15 @@ pub enum PrefixRetention {
     /// `user_branch`, when set, marks the opening boundary of the latest
     /// user turn so multi-step tool loops keep that pre-loop fallback
     /// checkpoint spared within the conversation checkpoint budget.
+    /// `partition`, when set, confines the request's sharing to requests of
+    /// the same partition: it resumes from, waits on, and plans branch points
+    /// with no other. Unpartitioned requests share with each other alone.
     Retain {
         cache_points: Vec<usize>,
         #[serde(default)]
         user_branch: Option<usize>,
+        #[serde(default)]
+        partition: Option<String>,
     },
 }
 
@@ -104,9 +110,10 @@ impl PrefixCacheCapacity {
 
 /// The exact numerical prefix identity of a retained state: its tokens,
 /// 3-axis rotary coordinates, and every positioned conditioning span before
-/// the entry's boundary.
+/// the entry's boundary, within the partition that retained it.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PrefixKey {
+    partition: Option<Arc<str>>,
     tokens: Vec<TokenId>,
     coordinates: Vec<[i32; 3]>,
     conditioning: Vec<InputSpan>,
@@ -122,7 +129,8 @@ impl PrefixKey {
         #[cfg(test)]
         PREFIX_KEY_COMPARISONS.with(|c| c.set(c.get() + 1));
         let position = self.tokens.len();
-        longer.tokens.starts_with(&self.tokens)
+        self.partition == longer.partition
+            && longer.tokens.starts_with(&self.tokens)
             && longer.coordinates.starts_with(&self.coordinates)
             && longer
                 .conditioning
@@ -134,10 +142,12 @@ impl PrefixKey {
 
 /// A request's input path: its prompt, then its accepted output, with the
 /// numerical rotary coordinates and positioned media conditioning spans owned
-/// by its prepared input, and the method it generates under. Derived from the
-/// generation that owns them, never stored.
+/// by its prepared input, the method it generates under, and the partition it
+/// shares prefixes within. Derived from the generation that owns them, never
+/// stored.
 #[derive(Clone, Copy)]
 pub struct PrefixPath<'a> {
+    partition: Option<&'a Arc<str>>,
     prompt: &'a [TokenId],
     generated: &'a [TokenId],
     layout: &'a InputLayout,
@@ -147,6 +157,7 @@ pub struct PrefixPath<'a> {
 
 impl<'a> PrefixPath<'a> {
     pub fn new(
+        partition: Option<&'a Arc<str>>,
         prompt: &'a [TokenId],
         generated: &'a [TokenId],
         layout: &'a InputLayout,
@@ -154,6 +165,7 @@ impl<'a> PrefixPath<'a> {
         method: MethodChoice,
     ) -> Self {
         Self {
+            partition,
             prompt,
             generated,
             layout,
@@ -164,6 +176,7 @@ impl<'a> PrefixPath<'a> {
 
     pub fn of(generation: &'a Generation) -> Self {
         Self::new(
+            generation.prefix_partition(),
             generation.prompt(),
             generation.generated(),
             generation.layout(),
@@ -207,6 +220,7 @@ impl<'a> PrefixPath<'a> {
     /// Snapshot the exact numerical prefix identity ending at `position`.
     fn key(&self, position: usize) -> PrefixKey {
         PrefixKey {
+            partition: self.partition.cloned(),
             tokens: self.tokens().take(position).copied().collect(),
             coordinates: self.coordinates().take(position).collect(),
             conditioning: self.conditioning_at(position).cloned().collect(),
@@ -215,9 +229,10 @@ impl<'a> PrefixPath<'a> {
 
     /// The deepest exact boundary of this path up to which a retained prefix
     /// key (its tokens, rotary coordinates, and positioned conditioning spans)
-    /// is the exact same numerical input.
+    /// is the exact same numerical input, or zero in another partition.
     pub fn shared_boundary(&self, key: &PrefixKey) -> usize {
         self.shared(
+            key.partition.as_ref(),
             key.tokens.iter(),
             key.coordinates.iter().copied(),
             &key.conditioning,
@@ -235,6 +250,7 @@ impl<'a> PrefixPath<'a> {
     /// its path it can cache at a branch point.
     pub fn shared_with_prompt_of(&self, live: PrefixPath) -> usize {
         self.shared(
+            live.partition,
             live.prompt.iter(),
             live.coordinates.coordinates().iter().copied(),
             live.layout.spans(),
@@ -244,6 +260,7 @@ impl<'a> PrefixPath<'a> {
 
     fn shared<'b>(
         &self,
+        other_partition: Option<&Arc<str>>,
         tokens: impl Iterator<Item = &'b TokenId>,
         coordinates: impl Iterator<Item = [i32; 3]>,
         other_spans: &[InputSpan],
@@ -251,6 +268,13 @@ impl<'a> PrefixPath<'a> {
     ) -> usize {
         #[cfg(test)]
         PREFIX_SHARED_CALLS.with(|c| c.set(c.get() + 1));
+        // Lookup, branch planning and a live peer's in-flight prefill read the
+        // shared prefix from here; retention's deduplication (key equality)
+        // and valuation (`PrefixKey::is_prefix_of`) compare the partition
+        // themselves.
+        if self.partition != other_partition {
+            return 0;
+        }
         // Conditioning spans are ordered by `start`, so `conditioning_at(p) ==
         // other_conditioning(p)` holds iff `p <= cond_limit`, where `cond_limit`
         // is the start of the first diverging span (or unbounded when identical).
@@ -538,6 +562,7 @@ impl<S: PrefixState> PrefixCache<S> {
     pub fn holds(&self, path: PrefixPath, position: usize) -> bool {
         self.entries.iter().any(|entry| {
             entry.position() == position
+                && entry.key.partition.as_ref() == path.partition
                 && entry
                     .method
                     .resumes(path.method, position, path.tokens().nth(position).copied())
@@ -1020,11 +1045,24 @@ mod tests {
 
         fn under(&self, method: MethodChoice) -> PrefixPath<'_> {
             PrefixPath::new(
+                None,
                 &self.prompt,
                 &self.generated,
                 &self.layout,
                 &self.coordinates,
                 method,
+            )
+        }
+
+        /// [`Self::path`] within `partition`.
+        fn within<'a>(&'a self, partition: &'a Arc<str>) -> PrefixPath<'a> {
+            PrefixPath::new(
+                Some(partition),
+                &self.prompt,
+                &self.generated,
+                &self.layout,
+                &self.coordinates,
+                MethodChoice::Plain,
             )
         }
     }
@@ -1315,6 +1353,167 @@ mod tests {
             assert_eq!(lookup_any(&mut cache, &next).unwrap().position(), 200);
         }
         assert!(!cache.holds(text(260, "other").path(), 200));
+    }
+
+    /// Two callers sending the same prompt under different partitions share
+    /// nothing: neither resumes from, holds, branches against, or values its
+    /// entries by the other's, and an identical path is cached once per
+    /// partition. Within a partition, and among unpartitioned requests,
+    /// sharing is unchanged.
+    #[test]
+    fn partitions_share_no_prefix_state() {
+        let mut cache = PrefixCache::new(capacity(8));
+        let (a, b): (Arc<str>, Arc<str>) = ("salt-a".into(), "salt-b".into());
+        let first = chat(200, 1, 260);
+        let point = CachePoint::Branch;
+        let plain = || MethodCheckpoint::Plain;
+        assert!(
+            cache
+                .retain(first.within(&a), 200, point, rows(0..200), plain())
+                .unwrap()
+                .inserted()
+        );
+        assert!(
+            cache
+                .retain(first.within(&a), 260, point, rows(0..260), plain())
+                .unwrap()
+                .inserted()
+        );
+
+        // The same prompt in another partition, and unpartitioned.
+        for path in [first.within(&b), first.path()] {
+            assert!(cache.lookup(path, usize::MAX).unwrap().is_none());
+            assert_eq!(cache.deepest(path, usize::MAX), 0);
+            assert!(!cache.holds(path, 200) && !cache.holds(path, 260));
+            assert_eq!(cache.shared_boundary(path), 0);
+            assert_eq!(path.shared_with_prompt_of(first.within(&a)), 0);
+            assert_eq!(first.within(&a).shared_with_prompt_of(path), 0);
+        }
+        // Its own partition resumes as before, and branches with a live peer.
+        let second = chat(200, 2, 250);
+        let hit = cache.lookup(second.within(&a), usize::MAX).unwrap();
+        assert_eq!(hit.map(PrefixHit::position), Some(200));
+        assert_eq!(
+            second.within(&a).shared_with_prompt_of(first.within(&a)),
+            200
+        );
+        // An equal salt held in another allocation is the same partition.
+        let again: Arc<str> = "salt-a".into();
+        assert_eq!(cache.deepest(first.within(&again), usize::MAX), 260);
+
+        // The identical path retains under `b` rather than refreshing `a`'s,
+        // and `a`'s shallower entry is no fallback in `b`'s valuation.
+        assert!(
+            cache
+                .retain(first.within(&b), 260, point, rows(1000..1260), plain())
+                .unwrap()
+                .inserted()
+        );
+        assert_eq!(cache.len(), 3);
+        let in_b = |entry: &&CachedPrefix<Rows>| entry.key.partition.as_ref() == Some(&b);
+        assert_eq!(cache.entries.iter().find(in_b).unwrap().saved_tokens, 260);
+        let hit = cache.lookup(first.within(&b), usize::MAX).unwrap();
+        assert_eq!(hit.map(PrefixHit::position), Some(260));
+        assert!(lookup_any(&mut cache, &first).is_none());
+
+        // Unpartitioned requests share with each other alone.
+        assert!(retain(&mut cache, &first, 200, rows(2000..2200)));
+        assert_eq!(lookup_any(&mut cache, &second).unwrap().position(), 200);
+        assert_eq!(second.path().shared_with_prompt_of(first.path()), 200);
+        assert_eq!(cache.deepest(second.within(&b), usize::MAX), 0);
+    }
+
+    /// On a long prompt cached under two partitions, an entry's fallback,
+    /// its re-parenting when the fallback is evicted, an interior fork of a
+    /// deeper entry, and a user-branch refresh each stay within the
+    /// entry's own partition, even past an identical path in another.
+    #[test]
+    fn partitions_stay_apart_in_fallbacks_forks_and_user_branches() {
+        let (a, b): (Arc<str>, Arc<str>) = ("salt-a".into(), "salt-b".into());
+        let long = text(4096, "long");
+        let forkable = || ForkableRows {
+            rows: rows(0..1),
+            min_forkable: 0,
+        };
+        let mut cache: PrefixCache<ForkableRows> = PrefixCache::new(capacity(16));
+        let mut keep = |path, position, point| {
+            cache
+                .retain(path, position, point, forkable(), MethodCheckpoint::Plain)
+                .unwrap()
+        };
+        for position in [64, 1024, 4096] {
+            assert!(keep(long.within(&a), position, CachePoint::Branch).inserted());
+        }
+        // Inserted after `a`'s deeper entry: no `a` entry takes it as fallback.
+        assert!(keep(long.within(&b), 1024, CachePoint::Branch).inserted());
+        let find = |cache: &PrefixCache<ForkableRows>, partition: &Arc<str>, position| {
+            let entry = cache.entries.iter().find(|entry| {
+                entry.key.partition.as_ref() == Some(partition) && entry.position() == position
+            });
+            let entry = entry.expect("an entry at that position");
+            (entry.id, entry.fallback_id, entry.saved_tokens)
+        };
+        let (a_64, ..) = find(&cache, &a, 64);
+        let (a_1024, ..) = find(&cache, &a, 1024);
+        assert_eq!(find(&cache, &a, 4096).1, Some(a_1024));
+        assert_eq!(find(&cache, &b, 1024).1, None);
+        assert_eq!(find(&cache, &b, 1024).2, 1024);
+
+        // Evicting `a`'s 1024 re-parents its 4096 to `a`'s 64, not to `b`'s
+        // entry at the same tokens.
+        let index = cache
+            .entries
+            .iter()
+            .position(|entry| entry.id == a_1024)
+            .unwrap();
+        cache.remove_entry(index);
+        assert_eq!(find(&cache, &a, 4096).1, Some(a_64));
+        assert_eq!(find(&cache, &a, 4096).2, 4096 - 64);
+        for entry in &cache.entries {
+            let (fallback_id, saved_tokens) = PrefixCache::compute_fallback(&cache.entries, entry);
+            assert_eq!(
+                (entry.fallback_id, entry.saved_tokens),
+                (fallback_id, saved_tokens)
+            );
+        }
+
+        // A request diverging at 3000 forks the deeper entry of its own
+        // partition only; `b` resumes from its own shallower entry, and an
+        // unpartitioned request from nothing.
+        let mut diverged = text(4096, "long");
+        diverged.prompt[3000] = TokenId(99_999);
+        let at = |cache: &mut PrefixCache<ForkableRows>, path| {
+            cache
+                .lookup(path, usize::MAX)
+                .unwrap()
+                .map(PrefixHit::position)
+        };
+        assert_eq!(at(&mut cache, diverged.within(&a)), Some(3000));
+        assert_eq!(at(&mut cache, diverged.within(&b)), Some(1024));
+        assert_eq!(at(&mut cache, diverged.path()), None);
+
+        // A user branch on `a`'s path in `b` is a new entry: `a`'s branch is
+        // neither refreshed nor promoted. In `b`, its own entry is.
+        let (a_4096, ..) = find(&cache, &a, 4096);
+        let (b_1024, ..) = find(&cache, &b, 1024);
+        let mut keep = |path, position, point| {
+            cache
+                .retain(path, position, point, forkable(), MethodCheckpoint::Plain)
+                .unwrap()
+        };
+        let user = keep(long.within(&b), 4096, CachePoint::UserBranch);
+        assert!(user.inserted());
+        assert_ne!(user.id(), Some(a_4096));
+        let refreshed = keep(long.within(&b), 1024, CachePoint::UserBranch);
+        assert_eq!(refreshed, RetainOutcome::Refreshed(b_1024));
+        let point = |partition: &Arc<str>, position| {
+            let entry = cache.entries.iter().find(|entry| {
+                entry.key.partition.as_ref() == Some(partition) && entry.position() == position
+            });
+            entry.unwrap().point
+        };
+        assert_eq!(point(&a, 4096), CachePoint::Branch);
+        assert_eq!(point(&b, 1024), CachePoint::UserBranch);
     }
 
     #[test]

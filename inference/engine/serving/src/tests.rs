@@ -1407,11 +1407,62 @@ fn preserves_model_defaults_when_optional_controls_are_omitted() {
     assert_eq!(request.input.output, OutputFormat::Text);
     assert!(request.input.template_arguments.is_empty());
     assert!(request.controls.stops.is_empty());
-    assert_eq!(request.controls.prompt_cache, PromptCache::Allowed);
+    assert_eq!(
+        request.controls.prompt_cache,
+        PromptCache::Allowed { partition: None }
+    );
     assert_eq!(request.controls.end_of_generation, EndOfGeneration::Stop);
     assert_eq!(request.controls.sampling.temperature, 1.0);
     assert_eq!(request.controls.sampling.top_p, 0.95);
     assert_eq!(request.controls.sampling.top_k, 20);
+}
+
+// Every protocol partitions its prompt cache by `cache_salt`, rejects an
+// empty or overlong salt, and shares globally without one.
+#[test]
+fn every_protocol_partitions_the_prompt_cache_by_cache_salt() {
+    let with = |mut body: Value, fields: Value| {
+        let fields = fields.as_object().unwrap().clone();
+        body.as_object_mut().unwrap().extend(fields);
+        body
+    };
+    let user = json!([{"role": "user", "content": "hi"}]);
+    let chat = |fields: Value| {
+        let body = with(json!({"model": "m", "messages": user}), fields);
+        chat_request(body).map(|request| request.controls.prompt_cache)
+    };
+    let responses = |fields: Value| {
+        let body = with(json!({"model": "m", "input": "hi"}), fields);
+        responses_request(body).map(|request| request.controls.prompt_cache)
+    };
+    let anthropic = |fields: Value| {
+        let body = with(
+            json!({"model": "m", "max_tokens": 16, "messages": user}),
+            fields,
+        );
+        anthropic_request(body).map(|request| request.controls.prompt_cache)
+    };
+    let salted = |salt: &str| PromptCache::Allowed {
+        partition: Some(salt.into()),
+    };
+    for adapt in [
+        &chat as &dyn Fn(Value) -> Result<PromptCache, crate::ApiError>,
+        &responses,
+        &anthropic,
+    ] {
+        let unsalted = PromptCache::Allowed { partition: None };
+        assert_eq!(adapt(json!({})).unwrap(), unsalted);
+        let salt = json!({"cache_salt": "salt-a"});
+        assert_eq!(adapt(salt).unwrap(), salted("salt-a"));
+        assert!(adapt(json!({"cache_salt": ""})).is_err());
+        // The bound counts characters, not bytes or UTF-16 units.
+        assert!(adapt(json!({"cache_salt": "é".repeat(1024)})).is_ok());
+        assert!(adapt(json!({"cache_salt": "😀".repeat(1024)})).is_ok());
+        assert!(adapt(json!({"cache_salt": "é".repeat(1025)})).is_err());
+    }
+    // A request that does not cache its prompt shares nothing, salted or not.
+    let uncached = json!({"cache_prompt": false, "cache_salt": "salt-a"});
+    assert_eq!(chat(uncached).unwrap(), PromptCache::Disabled);
 }
 
 // Every protocol samples with the same defaults, and each keeps the fields

@@ -39,8 +39,8 @@ use magnitude_executor::{
 use magnitude_executor::memory::ledger::Relief;
 use magnitude_family_contracts::PreparedModelInput;
 use magnitude_generation::{
-    FinishReason, Generation, InputLayout, MethodCheckpoint, OutputToken, RoundStart, StartedRound,
-    TimedLaunch,
+    FinishReason, Generation, InputLayout, MethodCheckpoint, OutputToken, PrefixReuse, RoundStart,
+    StartedRound, TimedLaunch,
 };
 use std::{
     collections::{BTreeMap, BTreeSet, VecDeque},
@@ -1863,20 +1863,28 @@ impl<F: ProgramFamily> Service<F> {
                 "only a fresh generation can be admitted".into(),
             ));
         }
-        let (prefix_cache, mut cache_points, user_branch) = match retention {
-            PrefixRetention::Transient => (false, Vec::new(), None),
+        let (reuse, mut cache_points, user_branch) = match retention {
+            PrefixRetention::Transient => (PrefixReuse::Transient, Vec::new(), None),
             PrefixRetention::Retain {
                 cache_points,
                 user_branch,
-            } => (true, cache_points, user_branch),
+                partition,
+            } => (
+                PrefixReuse::Reusable {
+                    partition: partition.map(Arc::from),
+                },
+                cache_points,
+                user_branch,
+            ),
         };
+        let prefix_cache = matches!(reuse, PrefixReuse::Reusable { .. });
         if let Some(point) = user_branch {
             if !cache_points.contains(&point) {
                 cache_points.push(point);
             }
         }
         generation
-            .set_prefix_reuse(prefix_cache)
+            .set_prefix_reuse(reuse)
             .map_err(AdmissionError::invariant("admission"))?;
         if !input.tokens().is_empty()
             && (input.tokens() != generation.prompt()
@@ -5218,7 +5226,7 @@ let Ok(residency) = service.make_resident(id, &mut record, generation, bindings)
         };
         let capacity = PrefixCacheCapacity { max_entries: 4, workload_state_bytes: u64::MAX };
         let mut owner = Some(Owner::with_prefix_cache_capacity(domain, bindings, limits(), capacity, Arc::new(NoWakes)).unwrap());
-        let retain = PrefixRetention::Retain { cache_points: Vec::new(), user_branch: None };
+        let retain = PrefixRetention::Retain { cache_points: Vec::new(), user_branch: None, partition: None };
         let (id, mut receiver) = owner.as_mut().unwrap().admit(prompt(), PreparedModelInput::continuation_only(), retain, 4, 0).unwrap();
         let mut now = 0u64;
         let mut run = |owner: &mut Option<Owner<magnitude_executor::NativeFamily>>| {
@@ -5443,7 +5451,7 @@ let Ok(residency) = service.make_resident(id, &mut record, generation, bindings)
         };
         let generation = Generation::new(vec![TokenId(1), TokenId(2)], InputLayout::new(2, vec![]).unwrap(), options, None).unwrap();
         let (id, mut receiver) = owner
-            .admit(generation, PreparedModelInput::continuation_only(), PrefixRetention::Retain { cache_points: Vec::new(), user_branch: None }, 4, 0)
+            .admit(generation, PreparedModelInput::continuation_only(), PrefixRetention::Retain { cache_points: Vec::new(), user_branch: None, partition: None }, 4, 0)
             .unwrap();
         let Pipeline::Idle(bindings) = &mut owner.pipeline else { panic!("an idle owner") };
         let service = &mut owner.service;
@@ -5545,17 +5553,17 @@ let Ok(residency) = service.make_resident(id, &mut record, generation, bindings)
         waiter_tokens.resize(PROMPT, TokenId(3));
         let unrelated_tokens = vec![TokenId(4); PROMPT];
         let (producer, _rx_producer) = owner
-            .admit(make_gen(producer_tokens), PreparedModelInput::continuation_only(), PrefixRetention::Retain { cache_points: Vec::new(), user_branch: None }, 4, 0)
+            .admit(make_gen(producer_tokens), PreparedModelInput::continuation_only(), PrefixRetention::Retain { cache_points: Vec::new(), user_branch: None, partition: None }, 4, 0)
             .unwrap();
         let (waiter, _rx_waiter) = owner
-            .admit(make_gen(waiter_tokens), PreparedModelInput::continuation_only(), PrefixRetention::Retain { cache_points: Vec::new(), user_branch: None }, 4, 0)
+            .admit(make_gen(waiter_tokens), PreparedModelInput::continuation_only(), PrefixRetention::Retain { cache_points: Vec::new(), user_branch: None, partition: None }, 4, 0)
             .unwrap();
         assert!(matches!(
             owner.service.requests[&waiter].state,
             State::Between(_, Stage::AwaitingPrefix { producer: p, through }) if p == producer && through == THROUGH
         ));
         let (unrelated, _rx_unrelated) = owner
-            .admit(make_gen(unrelated_tokens), PreparedModelInput::continuation_only(), PrefixRetention::Retain { cache_points: vec![THROUGH], user_branch: None }, 4, 0)
+            .admit(make_gen(unrelated_tokens), PreparedModelInput::continuation_only(), PrefixRetention::Retain { cache_points: vec![THROUGH], user_branch: None, partition: None }, 4, 0)
             .unwrap();
         assert!(owner.service.requests[&unrelated].record.prefix.as_ref().unwrap().branches.contains(&THROUGH));
         owner.cancel(producer);
@@ -5565,6 +5573,83 @@ let Ok(residency) = service.make_resident(id, &mut record, generation, bindings)
         assert!(selectable.contains(&waiter), "waiter releases immediately when its real producer exits");
         assert!(matches!(owner.service.requests[&waiter].state, State::Between(_, Stage::NonResident(None))));
         assert!(selectable.contains(&unrelated));
+    }
+
+    /// Two callers send the same prompt at once under different partitions:
+    /// neither waits on the other as its prefix producer nor plans a branch
+    /// point in the other's prefill. A third request in the first caller's
+    /// partition still waits on it, and two unpartitioned requests still
+    /// share as before.
+    #[test]
+    fn partitioned_requests_neither_wait_on_nor_branch_each_other() {
+        const THROUGH: usize = MIN_BRANCH_GAIN;
+        const PROMPT: usize = THROUGH + 32;
+        let mut definition = fixtures::tiny_definition();
+        definition.decoder.context_limit = 512;
+        let vocabulary = definition.decoder.vocabulary as usize;
+        let (domain, bindings) = fixtures::fixture_of(
+            definition,
+            fixtures::limits(2, 1, false),
+            None,
+            false,
+            magnitude_executor::platform::DeviceRequest::Automatic,
+        );
+        let capacity = PrefixCacheCapacity { max_entries: 8, workload_state_bytes: u64::MAX };
+        let mut owner = Owner::with_prefix_cache_capacity(domain, bindings, limits(), capacity, Arc::new(NoWakes)).unwrap();
+        let make_gen = |question: u32| {
+            let options = Options {
+                max_tokens: 2,
+                output_capacity: 4,
+                context_limit: 512,
+                vocabulary,
+                stop_tokens: BTreeSet::new(),
+                suppressed_tokens: BTreeSet::new(),
+                sampling: Sampling::Greedy,
+                shaping: Shaping { temperature: 0.0, ..Default::default() },
+                seed: 0,
+                forced_quantum: 0,
+                method: MethodChoice::Plain,
+                end_of_generation: EndOfGeneration::Stop,
+                reasoning_budget: None,
+            };
+            let mut tokens = vec![TokenId(1); THROUGH];
+            tokens.resize(PROMPT, TokenId(question));
+            Generation::new(tokens, InputLayout::new(PROMPT, vec![]).unwrap(), options, None).unwrap()
+        };
+        let retain = |partition: Option<&str>| PrefixRetention::Retain {
+            cache_points: Vec::new(),
+            user_branch: None,
+            partition: partition.map(str::to_owned),
+        };
+        let mut receivers = Vec::new();
+        let mut admit = |owner: &mut Owner<_>, question, partition| {
+            let (id, receiver) = owner
+                .admit(make_gen(question), PreparedModelInput::continuation_only(), retain(partition), 4, 0)
+                .unwrap();
+            receivers.push(receiver);
+            id
+        };
+        let branches = |owner: &Owner<_>, id: RequestId| owner.service.requests[&id].record.prefix.as_ref().unwrap().branches.clone();
+        let awaits = |owner: &Owner<_>, id: RequestId| match owner.service.requests[&id].state {
+            State::Between(_, Stage::AwaitingPrefix { producer, through }) => Some((producer, through)),
+            _ => None,
+        };
+
+        let a = admit(&mut owner, 2, Some("salt-a"));
+        let b = admit(&mut owner, 3, Some("salt-b"));
+        assert_eq!(awaits(&owner, b), None, "another partition never waits on a's prefill");
+        assert!(branches(&owner, a).is_empty(), "nor plans a branch point in it");
+        assert!(branches(&owner, b).is_empty());
+        let unpartitioned = admit(&mut owner, 4, None);
+        assert_eq!(awaits(&owner, unpartitioned), None, "an unpartitioned request shares with no partition");
+        assert!(branches(&owner, a).is_empty() && branches(&owner, b).is_empty());
+
+        let a_again = admit(&mut owner, 5, Some("salt-a"));
+        assert_eq!(awaits(&owner, a_again), Some((a, THROUGH)), "the same partition shares a's prefill");
+        assert!(branches(&owner, a).contains(&THROUGH));
+        assert!(branches(&owner, b).is_empty(), "b's prefill is untouched");
+        let shared = admit(&mut owner, 6, None);
+        assert_eq!(awaits(&owner, shared), Some((unpartitioned, THROUGH)), "unpartitioned requests share as before");
     }
 
     /// When a pre-reservation handoff inside `Service::select` fails, every

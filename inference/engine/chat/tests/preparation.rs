@@ -124,7 +124,7 @@ fn controls(sampling: SamplingControls) -> GenerationControls {
         stops: Vec::new(),
         end_of_generation: EndOfGeneration::Stop,
         reasoning_budget: None,
-        prompt_cache: PromptCache::Allowed,
+        prompt_cache: PromptCache::Allowed { partition: None },
     }
 }
 

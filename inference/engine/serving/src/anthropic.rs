@@ -73,6 +73,11 @@ mod schema {
         pub thinking: Option<Thinking>,
         pub metadata: Option<Value>,
         pub output_config: Option<OutputConfig>,
+        /// Confines prefix-cache sharing to requests with the same salt, as
+        /// vLLM's and SGLang's `cache_salt`. At most 1024 characters
+        /// (Unicode scalar values).
+        #[schema(nullable = false, min_length = 1)]
+        pub cache_salt: Option<String>,
     }
 
     /// `count_tokens` takes only what renders the prompt; generation controls
@@ -340,6 +345,7 @@ pub fn adapt(request: MessagesRequest) -> Result<AdaptedRequest, ApiError> {
         thinking: request.thinking,
         output_config: request.output_config,
     })?;
+    let partition = crate::chat::cache_salt(request.cache_salt)?;
     let max_tokens = NonZeroU32::new(request.max_tokens)
         .ok_or_else(|| ApiError::invalid("max_tokens must be greater than zero"))?;
     if request
@@ -369,7 +375,7 @@ pub fn adapt(request: MessagesRequest) -> Result<AdaptedRequest, ApiError> {
                 stops: request.stop_sequences,
                 end_of_generation: EndOfGeneration::Stop,
                 reasoning_budget: adapted.reasoning_budget,
-                prompt_cache: PromptCache::Allowed,
+                prompt_cache: PromptCache::Allowed { partition },
             },
         },
         stream: request.stream,

@@ -4288,6 +4288,11 @@
             "type": "boolean",
             "default": true
           },
+          "cache_salt": {
+            "type": "string",
+            "description": "Confines prefix-cache sharing to requests with the same salt, as\nvLLM's and SGLang's `cache_salt`. At most 1024 characters\n(Unicode scalar values).",
+            "minLength": 1
+          },
           "ignore_eos": {
             "type": "boolean",
             "default": false
@@ -8171,6 +8176,11 @@
                 "$ref": "#/components/schemas/OutputConfig"
               }
             ]
+          },
+          "cache_salt": {
+            "type": "string",
+            "description": "Confines prefix-cache sharing to requests with the same salt, as\nvLLM's and SGLang's `cache_salt`. At most 1024 characters\n(Unicode scalar values).",
+            "minLength": 1
           }
         },
         "additionalProperties": false
@@ -10819,6 +10829,11 @@
               "string",
               "null"
             ]
+          },
+          "cache_salt": {
+            "type": "string",
+            "description": "Confines prefix-cache sharing to requests with the same salt, as\nvLLM's and SGLang's `cache_salt`. At most 1024 characters\n(Unicode scalar values).",
+            "minLength": 1
           }
         },
         "additionalProperties": false

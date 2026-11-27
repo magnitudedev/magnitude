@@ -161,9 +161,10 @@ async fn run(
         options,
         constraint: chat.input().constraint.clone(),
         retention: match request.controls.prompt_cache {
-            PromptCache::Allowed => PrefixRetention::Retain {
+            PromptCache::Allowed { partition } => PrefixRetention::Retain {
                 cache_points,
                 user_branch,
+                partition,
             },
             PromptCache::Disabled => PrefixRetention::Transient,
         },
