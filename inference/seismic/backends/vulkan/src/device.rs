@@ -1868,7 +1868,7 @@ impl Inner {
             .then(|| ash::khr::pipeline_executable_properties::Device::new(raw, &device));
         // The tables: the device's own block on the device placement's
         // first kind, held as the driver's memory (`Inner::tables`).
-        let formed = Memory::new(&info, instance.clone(), physical, usage_before)
+        let formed = Memory::new(&info, &device, instance.clone(), physical, usage_before)
             .map_err(|reason| OpenError::Creation(reason.into()))
             .and_then(|memory| {
                 let tables = memory

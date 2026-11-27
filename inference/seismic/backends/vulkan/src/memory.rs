@@ -60,7 +60,7 @@ impl MemoryStores {
     fn pool(&self, pool: &Pool, candidate: &PoolType) -> &Arc<dyn Store> {
         match pool.charged {
             Charged::Staging => &self.host,
-            Charged::Kind => self.kind(candidate.memory_type),
+            Charged::Kind => self.kind(candidate.kind),
         }
     }
 
@@ -74,7 +74,11 @@ impl MemoryStores {
 }
 
 pub(crate) struct Block {
-    /// The memory type its memory is of: the kind it lies in.
+    /// The topology kind this block serves (the store/path identity).
+    kind: u32,
+    /// The Vulkan memory type index backing this block (may differ from
+    /// `kind` when `kind` cannot back a buffer and resolved to a compatible
+    /// memory type on the same heap).
     memory_type: u32,
     heap: u32,
     memory: vk::DeviceMemory,
@@ -228,8 +232,11 @@ impl Charged {
 }
 
 /// One memory type a pool allocates blocks from.
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct PoolType {
+    /// The topology kind this entry serves (used for store/path accounting).
+    kind: u32,
+    /// The Vulkan memory type index used for `vkAllocateMemory`.
     memory_type: u32,
     heap: u32,
     /// Host-visible and coherent: its blocks are persistently mapped.
@@ -275,9 +282,9 @@ pub(crate) struct DevicePools {
 
 impl DevicePools {
     pub(crate) fn new(memory: &Memory) -> Result<Self, String> {
-        let device = Arc::new(new_pool(&memory.layout, &memory.device_kinds, Charged::Kind)?);
-        let upload = Arc::new(new_pool(&memory.layout, &memory.upload_kinds, Charged::Kind)?);
-        let staging = Arc::new(new_pool(&memory.layout, &[memory.staging_kind], Charged::Staging)?);
+        let device = Arc::new(new_pool(&memory.layout, &memory.device_kinds, Charged::Kind, memory.storage_memory_type_bits)?);
+        let upload = Arc::new(new_pool(&memory.layout, &memory.upload_kinds, Charged::Kind, memory.storage_memory_type_bits)?);
+        let staging = Arc::new(new_pool(&memory.layout, &[memory.staging_kind], Charged::Staging, memory.staging_memory_type_bits)?);
         Ok(Self {
             pools: Mutex::new(vec![device.clone(), upload.clone()]),
             staging,
@@ -292,7 +299,10 @@ impl DevicePools {
         if let Some(pool) = pools.iter().find(|pool| pool.kinds == kinds) {
             return Ok(pool.clone());
         }
-        let pool = Arc::new(new_pool(&memory.layout, kinds, Charged::Kind).map_err(ExecutionError::AllocationFailed)?);
+        let pool = Arc::new(
+            new_pool(&memory.layout, kinds, Charged::Kind, memory.storage_memory_type_bits)
+                .map_err(ExecutionError::AllocationFailed)?,
+        );
         pools.push(pool.clone());
         Ok(pool)
     }
@@ -318,6 +328,11 @@ pub(crate) struct Memory {
     staging_kind: u32,
     /// The memory types pools are made of.
     layout: crate::MemoryLayout,
+    /// `VkMemoryRequirements::memoryTypeBits` for shader-addressable storage
+    /// buffers and for host staging buffers, queried once at device open via
+    /// `vkGetDeviceBufferMemoryRequirements` (Vulkan 1.3 `maintenance4`).
+    storage_memory_type_bits: u32,
+    staging_memory_type_bits: u32,
     /// The queue families that reach each buffer: the work queue's, and the
     /// second queue's where that is a family of its own.
     families: Vec<u32>,
@@ -501,19 +516,23 @@ impl Memory {
     /// placement rule gives them, and staging on `info.allocation`'s type.
     pub(crate) fn new(
         info: &crate::DeviceInfo,
+        device: &ash::Device,
         instance: Arc<Instance>,
         physical: vk::PhysicalDevice,
         baseline: u64,
     ) -> Result<Self, String> {
         let layout = &info.memory;
-        let staging_kind = info
-            .allocation
-            .staging
-            .ok_or("no host staging memory type")?;
+        let families: Vec<u32> = std::iter::once(info.queue_family)
+            .chain(info.side_family.filter(|&family| family != info.queue_family))
+            .collect();
+        let storage_memory_type_bits = buffer_memory_type_bits(device, &families, true);
+        let staging_memory_type_bits = buffer_memory_type_bits(device, &families, false);
+        let staging_kind = select_staging_kind(&info.allocation.host, staging_memory_type_bits)
+            .ok_or("no host staging memory type can back a staging buffer")?;
         let kinds = crate::topology::kinds(info);
         let placed = |contract| {
             let kinds = seismic_topology::place(&kinds, info.device_type.memory_is_host(), contract);
-            let _ = new_pool(layout, &kinds, Charged::Kind)?;
+            let _ = new_pool(layout, &kinds, Charged::Kind, storage_memory_type_bits)?;
             Ok::<Vec<u32>, String>(kinds)
         };
         let (device_kinds, upload_kinds) = (
@@ -531,7 +550,7 @@ impl Memory {
             !info.allocation.device_heaps.contains(heap)
                 && !layout.heaps[*heap as usize].device_local
         });
-        let _ = new_pool(layout, &[staging_kind], Charged::Staging)?;
+        let _ = new_pool(layout, &[staging_kind], Charged::Staging, staging_memory_type_bits)?;
         let (heaps, object_limit) = (heap_bytes(layout)?, info.limits.max_memory_allocations);
         let least_object = least_object(info)?;
         let block_cap = info.limits.max_allocation_bytes.min(BLOCK_CAP_BYTES);
@@ -546,7 +565,9 @@ impl Memory {
             upload_kinds,
             staging_kind,
             layout: layout.clone(),
-            families: std::iter::once(info.queue_family).chain(info.side_family.filter(|&family| family != info.queue_family)).collect(),
+            storage_memory_type_bits,
+            staging_memory_type_bits,
+            families,
             device_heaps: info.allocation.device_heaps.clone(),
             host_tier_heap,
             block_cap,
@@ -851,7 +872,9 @@ impl Memory {
         if kind as usize >= self.layout.types.len() {
             return Err(ExecutionError::AllocationFailed(format!("Vulkan allocates no block of kind {kind}")));
         }
-        Ok((bytes, pool_type(&self.layout, kind)))
+        let resolved = pool_type(&self.layout, kind, self.storage_memory_type_bits)
+            .map_err(ExecutionError::AllocationFailed)?;
+        Ok((bytes, resolved))
     }
 
     /// Return `range` to its block, and free the block once it holds no
@@ -873,24 +896,101 @@ impl Memory {
     }
 }
 
-/// The memory type `memory_type` of `layout`, as a pool allocates from it.
-fn pool_type(layout: &crate::MemoryLayout, memory_type: u32) -> PoolType {
+fn memory_type_allowed(allowed_bits: u32, memory_type: u32) -> bool {
+    1u32.checked_shl(memory_type)
+        .is_some_and(|bit| allowed_bits & bit != 0)
+}
+
+/// First host memory type in `candidates` allowed by `staging_memory_type_bits`.
+fn select_staging_kind(candidates: &[u32], staging_memory_type_bits: u32) -> Option<u32> {
+    candidates
+        .iter()
+        .copied()
+        .find(|&kind| memory_type_allowed(staging_memory_type_bits, kind))
+}
+
+/// Resolve topology `kind` to a Vulkan `memoryTypeIndex` allowed by
+/// `allowed_bits` on the same heap.
+///
+/// Some drivers (e.g. Mesa ANV on Intel Battlemage / Arc Pro B70) expose a
+/// compressed `DEVICE_LOCAL` memory type at index 0 whose `VkMemoryPropertyFlags`
+/// match uncompressed `DEVICE_LOCAL` memory on the same heap, but whose bit is
+/// clear in `VkMemoryRequirements::memoryTypeBits` for storage buffers. Keeping
+/// `kind` as the topology/ledger identity while resolving `memory_type` on the
+/// same heap preserves exact store/budget accounting and avoids failing open.
+fn resolve_memory_type(
+    layout: &crate::MemoryLayout,
+    kind: u32,
+    allowed_bits: u32,
+) -> Result<u32, String> {
+    let Some(requested) = layout.types.get(kind as usize).copied() else {
+        return Err(format!("memory type {kind} is outside the device's {} types", layout.types.len()));
+    };
+    if memory_type_allowed(allowed_bits, kind) {
+        return Ok(kind);
+    }
+    // Exact property match on the same heap (e.g. uncompressed sibling of a
+    // compressed DEVICE_LOCAL type).
+    if let Some(index) = layout.types.iter().enumerate().find_map(|(i, ty)| {
+        let mt = i as u32;
+        (memory_type_allowed(allowed_bits, mt)
+            && ty.heap == requested.heap
+            && ty.device_local == requested.device_local
+            && ty.mappable() == requested.mappable()
+            && ty.host_cached == requested.host_cached)
+            .then_some(mt)
+    }) {
+        return Ok(index);
+    }
+    // Compatible superset on the same heap: preserve locality and never
+    // downgrade mappability or cached host reads.
+    if let Some(index) = layout.types.iter().enumerate().find_map(|(i, ty)| {
+        let mt = i as u32;
+        let reach_ok = !requested.mappable()
+            || (ty.mappable() && (!requested.host_cached || ty.host_cached));
+        (memory_type_allowed(allowed_bits, mt)
+            && ty.heap == requested.heap
+            && ty.device_local == requested.device_local
+            && reach_ok)
+            .then_some(mt)
+    }) {
+        return Ok(index);
+    }
+    Err(format!(
+        "memory type {kind} on heap {} cannot back a buffer (allowed bits {allowed_bits:#x})",
+        requested.heap
+    ))
+}
+
+/// The memory type `kind` of `layout`, resolved against `allowed_bits`, as a
+/// pool allocates from it.
+fn pool_type(layout: &crate::MemoryLayout, kind: u32, allowed_bits: u32) -> Result<PoolType, String> {
+    let memory_type = resolve_memory_type(layout, kind, allowed_bits)?;
     let reported = layout.types[memory_type as usize];
-    PoolType {
+    Ok(PoolType {
+        kind,
         memory_type,
         heap: reported.heap,
         mapped: reported.mappable(),
-    }
+    })
 }
 
 /// An empty pool of memory types `kinds`, in order, charged as `charged`.
-fn new_pool(layout: &crate::MemoryLayout, kinds: &[u32], charged: Charged) -> Result<Pool, String> {
+fn new_pool(
+    layout: &crate::MemoryLayout,
+    kinds: &[u32],
+    charged: Charged,
+    allowed_bits: u32,
+) -> Result<Pool, String> {
     let (&last, passable) = kinds.split_last().ok_or("no memory type for the storage")?;
     Ok(Pool {
         kinds: kinds.to_vec(),
         charged,
-        passable: passable.iter().map(|&memory_type| pool_type(layout, memory_type)).collect(),
-        last: pool_type(layout, last),
+        passable: passable
+            .iter()
+            .map(|&kind| pool_type(layout, kind, allowed_bits))
+            .collect::<Result<Vec<_>, _>>()?,
+        last: pool_type(layout, last, allowed_bits)?,
         blocks: Mutex::new(Vec::new()),
     })
 }
@@ -954,6 +1054,33 @@ fn block_buffer_usage(shader_addressable: bool) -> vk::BufferUsageFlags {
     usage
 }
 
+fn block_buffer_create_info<'a>(
+    bytes: u64,
+    shader_addressable: bool,
+    families: &'a [u32],
+) -> vk::BufferCreateInfo<'a> {
+    vk::BufferCreateInfo::default()
+        .size(bytes)
+        .usage(block_buffer_usage(shader_addressable))
+        .sharing_mode(if families.len() > 1 {
+            vk::SharingMode::CONCURRENT
+        } else {
+            vk::SharingMode::EXCLUSIVE
+        })
+        .queue_family_indices(if families.len() > 1 { families } else { &[] })
+}
+
+/// Query `VkMemoryRequirements::memoryTypeBits` for a block buffer using
+/// Vulkan 1.3 `maintenance4` (`vkGetDeviceBufferMemoryRequirements`), without
+/// creating a `VkBuffer`.
+fn buffer_memory_type_bits(device: &ash::Device, families: &[u32], shader_addressable: bool) -> u32 {
+    let info = block_buffer_create_info(4, shader_addressable, families);
+    let query = vk::DeviceBufferMemoryRequirements::default().create_info(&info);
+    let mut requirements = vk::MemoryRequirements2::default();
+    unsafe { device.get_device_buffer_memory_requirements(&query, &mut requirements) };
+    requirements.memory_requirements.memory_type_bits
+}
+
 /// A block of `charge`'s bytes on `pool`'s type, mapped persistently where
 /// the type is mappable. The memory the buffer requires beyond them (its
 /// allocation's rounding) is charged to the same entry before the memory is
@@ -973,12 +1100,7 @@ fn create_block(
         holding.grow(short)?;
     }
     let bytes = holding.bytes();
-    let families = memory_owner.families.as_slice();
-    let info = vk::BufferCreateInfo::default()
-        .size(bytes)
-        .usage(block_buffer_usage(shader_addressable))
-        .sharing_mode(if families.len() > 1 { vk::SharingMode::CONCURRENT } else { vk::SharingMode::EXCLUSIVE })
-        .queue_family_indices(if families.len() > 1 { families } else { &[] });
+    let info = block_buffer_create_info(bytes, shader_addressable, memory_owner.families.as_slice());
     let buffer = crate::device::memory_call(
         unsafe { device.create_buffer(&info, None) },
         "vkCreateBuffer",
@@ -1057,6 +1179,7 @@ fn create_block(
         device.get_buffer_device_address(&vk::BufferDeviceAddressInfo::default().buffer(buffer))
     });
     let block = Arc::new(Block {
+        kind: pool.kind,
         memory_type: pool.memory_type,
         heap: pool.heap,
         memory,
@@ -1181,10 +1304,11 @@ impl Buffer {
         self.range.bytes()
     }
 
-    /// The kind the allocation lies in: its block's memory type, the one of
-    /// the kinds it was asked for that it landed on.
+    /// The kind the allocation lies in: the topology kind it was asked for
+    /// (preserving store/path accounting even when resolved to a sibling
+    /// Vulkan memory type on the same heap).
     pub fn kind(&self) -> u32 {
-        self.range.block.memory_type
+        self.range.block.kind
     }
 
     /// The host address of the allocation's first byte through its
@@ -1259,6 +1383,7 @@ mod tests {
 
     fn block(bytes: u64) -> Arc<Block> {
         Arc::new(Block {
+            kind: 0,
             memory_type: 0,
             heap: 0,
             memory: vk::DeviceMemory::null(),
@@ -1315,6 +1440,7 @@ mod tests {
             charged: Charged::Kind,
             passable: Vec::new(),
             last: PoolType {
+                kind: 0,
                 memory_type: 0,
                 heap: 0,
                 mapped: false,
@@ -1457,5 +1583,57 @@ mod tests {
             non_device_local_block_room(8 * GIB, 0, 1 * GIB, 0),
             6 * GIB
         );
+    }
+
+    #[test]
+    fn resolve_memory_type_skips_non_storage_type_on_same_heap_and_preserves_kind() {
+        use crate::device_info::{MemoryHeap, MemoryLayout, MemoryType};
+        const GIB: u64 = 1 << 30;
+        // Intel Arc Pro B70 (Mesa ANV BMG): type 0 is compressed DEVICE_LOCAL
+        // on heap 0 (bit 0 clear in storage memoryTypeBits), type 1 is
+        // uncompressed DEVICE_LOCAL on heap 0 (bit 1 set).
+        let layout = MemoryLayout {
+            heaps: vec![
+                MemoryHeap { bytes: 32 * GIB, device_local: true },
+                MemoryHeap { bytes: 64 * GIB, device_local: false },
+            ],
+            types: vec![
+                MemoryType { heap: 0, device_local: true, host_visible: false, host_coherent: false, host_cached: false },
+                MemoryType { heap: 0, device_local: true, host_visible: false, host_coherent: false, host_cached: false },
+                MemoryType { heap: 0, device_local: true, host_visible: true, host_coherent: true, host_cached: false },
+                MemoryType { heap: 1, device_local: false, host_visible: true, host_coherent: true, host_cached: false },
+                MemoryType { heap: 1, device_local: false, host_visible: true, host_coherent: true, host_cached: true },
+            ],
+        };
+
+        // ANV BMG: kind 0 resolves to memory_type 1 while keeping kind == 0 for store/path accounting.
+        let resolved = pool_type(&layout, 0, 0b11110).unwrap();
+        assert_eq!(resolved, PoolType { kind: 0, memory_type: 1, heap: 0, mapped: false });
+
+        // Identity fast path when requested bit is set.
+        let identity = pool_type(&layout, 1, 0b11110).unwrap();
+        assert_eq!(identity, PoolType { kind: 1, memory_type: 1, heap: 0, mapped: false });
+
+        // Superset fallback on same heap: unmappable DL falls back to mappable DL (type 2).
+        let rebar = pool_type(&layout, 0, 0b11100).unwrap();
+        assert_eq!(rebar, PoolType { kind: 0, memory_type: 2, heap: 0, mapped: true });
+
+        // Upload (uncached mappable) falls back to cached mappable on same heap.
+        let upload = pool_type(&layout, 3, 0b10000).unwrap();
+        assert_eq!(upload, PoolType { kind: 3, memory_type: 4, heap: 1, mapped: true });
+
+        // Cached mappable refuses to downgrade to uncached mappable.
+        assert!(pool_type(&layout, 4, 0b01000).is_err());
+
+        // Never crosses heaps when heap 0 has no allowed memory types.
+        assert!(pool_type(&layout, 0, 0b11000).is_err());
+
+        // Staging selection skips incompatible host[0] and picks next compatible host type.
+        assert_eq!(select_staging_kind(&[3, 4], 0b10000), Some(4));
+        assert_eq!(select_staging_kind(&[3, 4], 0b00111), None);
+
+        // Out-of-range kind or zero mask returns Err cleanly.
+        assert!(pool_type(&layout, 99, u32::MAX).is_err());
+        assert!(pool_type(&layout, 0, 0).is_err());
     }
 }
