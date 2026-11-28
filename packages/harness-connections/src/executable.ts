@@ -10,6 +10,21 @@ export class HarnessCommandUnsupported extends Schema.TaggedError<HarnessCommand
 const DEFAULT_PATHEXT = ".COM;.EXE;.BAT;.CMD"
 
 /**
+ * Whether `candidate` is an existing file runnable on `platform` without invoking it.
+ */
+export const isExecutableFile = (
+  candidate: string,
+  platform: NodeJS.Platform = process.platform,
+): boolean => {
+  try {
+    accessSync(candidate, platform === "win32" ? constants.F_OK : constants.X_OK)
+    return statSync(candidate).isFile()
+  } catch {
+    return false
+  }
+}
+
+/**
  * Resolve an installed executable without invoking a shell or starting the harness.
  * Windows only launches files with a PATHEXT extension, so an extensionless sibling
  * such as npm's POSIX shim is never a Windows installation.
@@ -27,10 +42,7 @@ export const findExecutable = (
   for (const directory of searchPath.split(windows ? ";" : delimiter).filter(Boolean)) {
     for (const suffix of suffixes) {
       const candidate = resolve(directory, `${name}${suffix}`)
-      try {
-        accessSync(candidate, windows ? constants.F_OK : constants.X_OK)
-        if (statSync(candidate).isFile()) return candidate
-      } catch { /* Missing or inaccessible executable is not an installation. */ }
+      if (isExecutableFile(candidate, platform)) return candidate
     }
   }
   return undefined

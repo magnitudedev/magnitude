@@ -217,10 +217,17 @@ export const writeIfChanged = (file: string, source: string, next: string) => ne
   ? Effect.void
   : writeFileAtomic(file, next)
 
+export interface FallbackInstallation {
+  readonly executable: string
+  /** Whether invoking `versionArguments` on `executable` is safe (false for GUI desktop binaries). */
+  readonly probeVersion: boolean
+}
+
 interface ConnectorDefinition extends Omit<HarnessConnector, "id" | "detect"> {
   readonly id: Parameters<typeof HarnessIdSchema.make>[0]
   readonly executable: string
   readonly versionArguments?: ReadonlyArray<string>
+  readonly fallbackInstallation?: () => FallbackInstallation | undefined
 }
 
 /** The version an installed executable reports, for a harness whose command line differs between versions. */
@@ -245,12 +252,20 @@ export const defineConnector = (definition: ConnectorDefinition): HarnessConnect
     selectedModel: definition.selectedModel,
     connect: definition.connect,
     disconnect: definition.disconnect,
-    detect: (searchPath) => Option.match(Option.fromNullable(findExecutable(definition.executable, searchPath)), {
-      onNone: () => Effect.succeed(Option.none()),
-      onSome: (executable) => definition.versionArguments === undefined
-        ? Effect.succeed(Option.some({ executable }))
-        : installedVersion(executable, definition.versionArguments).pipe(Effect.map((version) =>
-          Option.some(version === undefined ? { executable } : { executable, version }))),
-    }),
+    detect: (searchPath) => {
+      const onPath = findExecutable(definition.executable, searchPath)
+      const resolved: FallbackInstallation | undefined = onPath !== undefined
+        ? { executable: onPath, probeVersion: true }
+        : definition.fallbackInstallation?.()
+      if (resolved === undefined) return Effect.succeed(Option.none())
+      if (!resolved.probeVersion || definition.versionArguments === undefined) {
+        return Effect.succeed(Option.some({ executable: resolved.executable }))
+      }
+      return installedVersion(resolved.executable, definition.versionArguments).pipe(
+        Effect.map((version) => Option.some(
+          version === undefined ? { executable: resolved.executable } : { executable: resolved.executable, version },
+        )),
+      )
+    },
   }
 }

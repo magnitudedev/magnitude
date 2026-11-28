@@ -1,5 +1,8 @@
 import { Effect, Option } from "effect"
+import { homedir } from "node:os"
+import { join } from "node:path"
 import type { HarnessConnectionSpec } from "../contract"
+import { isExecutableFile } from "../executable"
 import type { HarnessConnectionPaths } from "../paths"
 import { modelInput, modelMaxTokens } from "../model-fields"
 import {
@@ -14,7 +17,62 @@ import {
   updateJsonc,
   valueAt,
   writeIfChanged,
+  type FallbackInstallation,
 } from "../shared"
+
+/**
+ * Well-known OpenCode Desktop and standalone CLI install locations when `opencode` is not on `PATH` (#312).
+ * CLI sidecars (`opencode-cli` / `opencode`) are checked before GUI binaries so version probing stays safe
+ * and GUI desktop executables are never spawned with `--version`.
+ */
+export const findOpenCodeDesktopInstallation = (options?: {
+  readonly platform?: NodeJS.Platform
+  readonly environment?: Readonly<Record<string, string | undefined>>
+  readonly home?: string
+}): FallbackInstallation | undefined => {
+  const platform = options?.platform ?? process.platform
+  const environment = options?.environment ?? process.env
+  const home = options?.home ?? homedir()
+  const candidates: Array<FallbackInstallation> = []
+  if (platform === "win32") {
+    const localAppData = environment.LOCALAPPDATA?.trim() || join(home, "AppData", "Local")
+    const programFiles = environment.ProgramFiles?.trim()
+    const installRoots = [
+      join(localAppData, "OpenCode"),
+      join(localAppData, "Programs", "OpenCode"),
+      join(localAppData, "Programs", "@opencode-aidesktop"),
+      ...(programFiles ? [join(programFiles, "OpenCode")] : []),
+    ]
+    for (const root of installRoots) {
+      candidates.push({ executable: join(root, "opencode-cli.exe"), probeVersion: true })
+    }
+    candidates.push({ executable: join(home, ".opencode", "bin", "opencode.exe"), probeVersion: true })
+    for (const root of installRoots) {
+      candidates.push({ executable: join(root, "OpenCode.exe"), probeVersion: false })
+    }
+  } else if (platform === "darwin") {
+    const appRoots = [
+      "/Applications/OpenCode.app/Contents/MacOS",
+      join(home, "Applications", "OpenCode.app", "Contents", "MacOS"),
+    ]
+    for (const root of appRoots) {
+      candidates.push({ executable: join(root, "opencode-cli"), probeVersion: true })
+    }
+    candidates.push({ executable: join(home, ".opencode", "bin", "opencode"), probeVersion: true })
+    for (const root of appRoots) {
+      candidates.push({ executable: join(root, "OpenCode"), probeVersion: false })
+    }
+  } else if (platform === "linux") {
+    candidates.push(
+      { executable: join(home, ".opencode", "bin", "opencode"), probeVersion: true },
+      { executable: "/usr/lib/OpenCode/opencode-cli", probeVersion: true },
+      { executable: "/opt/OpenCode/opencode-cli", probeVersion: true },
+      { executable: "/usr/bin/OpenCode", probeVersion: false },
+      { executable: "/opt/OpenCode/OpenCode", probeVersion: false },
+    )
+  }
+  return candidates.find((candidate) => isExecutableFile(candidate.executable, platform))
+}
 
 const reasoningVariants = (model: HarnessConnectionSpec["models"][number]) => Object.fromEntries(
   model.capabilities.reasoning.efforts.map((effort) => [
@@ -68,6 +126,7 @@ export const makeOpenCodeConnector = (paths: HarnessConnectionPaths, baseUrl = O
   name: "OpenCode",
   executable: "opencode",
   versionArguments: ["--version"],
+  fallbackInstallation: () => findOpenCodeDesktopInstallation(),
   skillInstallationTarget: "shared-agents",
   configurationFiles: openCodeConfigurationFiles(paths),
   selectedModel: readOpenCodeConfiguration(paths).pipe(Effect.map((configuration) =>
