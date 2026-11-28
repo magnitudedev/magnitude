@@ -1170,3 +1170,227 @@ fn device_certified_layout_covers_above_floor_shared_memory_scratch() {
     };
     assert_eq!(outline.storage_bytes(), device_layout.storage_bytes());
 }
+
+/// Regression test for `#314` / `#310` / `#308` / `#303`: Vulkan and Metal
+/// kernels with `repeat (ROUNDS)` (`attention_prefill`, `attention_prefill_k8v4`)
+/// expand launches by `ROUNDS` at seal time (`NativeGraphDraft::seal`) and in
+/// assessment (`SizingOutline`). Load-time certification (`NativeGraphLayout` via
+/// `NativeGraphMetadata`) must charge the exact same repeat-expanded launch
+/// census—even when `ROUNDS` exceeds 64 (e.g. Intel Arc iGPUs with `units = 1`,
+/// where `ROUNDS = 516` at 256K context).
+#[test]
+fn vulkan_and_metal_repeat_prefill_parity_between_sizing_outline_and_native_graph_layout() {
+    use super::catalog::{LIMITS, SELECTION};
+    use crate::programs::graph::sizing::SizingScope;
+    use crate::{ModelLoadPlan, ResourceCapacity, ResourcePlanner, TensorOperations, resident_layout};
+    use seismic::device::{DeviceProperties, vulkan};
+
+    struct SyntheticVulkan {
+        amd_units: Option<u64>,
+        nv_units: Option<u64>,
+        fallback_units: u64,
+        shared_bytes: u64,
+    }
+    impl vulkan::Queries for SyntheticVulkan {
+        fn amd_compute_units(&self) -> Option<u64> { self.amd_units }
+        fn nv_shader_sm_count(&self) -> Option<u64> { self.nv_units }
+        fn fallback_units(&self) -> Option<u64> { Some(self.fallback_units) }
+        fn required_subgroup_32(&self) -> Option<u64> { Some(32) }
+        fn fixed_subgroup_size(&self) -> Option<u64> { Some(32) }
+        fn max_compute_work_group_invocations(&self) -> Option<u64> { Some(1024) }
+        fn max_compute_shared_memory_size(&self) -> Option<u64> { Some(self.shared_bytes) }
+        fn max_compute_work_group_count_x(&self) -> Option<u64> { Some(65_535) }
+        fn max_compute_work_group_count_y(&self) -> Option<u64> { Some(65_535) }
+        fn max_compute_work_group_count_z(&self) -> Option<u64> { Some(65_535) }
+        fn shader_float16(&self) -> Option<bool> { Some(true) }
+        fn shader_rounding_mode_rte_float16(&self) -> Option<bool> { Some(true) }
+        fn shader_signed_zero_inf_nan_preserve_float16(&self) -> Option<bool> { Some(true) }
+        fn cooperative_matrix(&self) -> Option<bool> { Some(true) }
+        fn cooperative_matrix_f16_16x16x16(&self) -> Option<bool> { Some(true) }
+        fn integer_dot_product_4x8_mixed_signedness_accelerated(&self) -> Option<bool> { Some(true) }
+        fn shader_buffer_float32_atomic_add(&self) -> Option<bool> { Some(true) }
+        fn shader_shared_int64_atomics(&self) -> Option<bool> { Some(true) }
+        fn shader_denorm_preserve_float32(&self) -> Option<bool> { Some(true) }
+        fn shader_fma_float32(&self) -> Option<bool> { Some(true) }
+        fn shader_rounding_mode_rte_float32(&self) -> Option<bool> { Some(true) }
+        fn shader_subgroup_uniform_control_flow(&self) -> Option<bool> { Some(true) }
+        fn shader_maximal_reconvergence(&self) -> Option<bool> { Some(true) }
+    }
+
+    let make_vulkan = |amd_units, nv_units, fallback_units, shared_bytes| {
+        DeviceProperties::Vulkan(
+            vulkan::describe(
+                &SyntheticVulkan { amd_units, nv_units, fallback_units, shared_bytes },
+                &vulkan::Probed::default(),
+            )
+            .unwrap(),
+        )
+    };
+    let intel_arc = make_vulkan(None, None, 1, 32_768);
+    let strix_halo = make_vulkan(Some(40), None, 40, 65_536);
+    let rtx_a4000 = make_vulkan(None, Some(48), 48, 49_152);
+    let m4_pro_metal = recorded::m4_pro()
+        .executors()
+        .iter()
+        .find(|executor| executor.backend() == BackendName::Metal)
+        .and_then(Executor::properties);
+
+    let mut definition = crate::planning::fixtures::fixture_definition();
+    definition.decoder.context_limit = 262_144;
+    let manifest = crate::planning::fixtures::fixture_manifest(&definition);
+    let devices = [
+        ("intel-arc-vulkan", BackendName::Vulkan, Some(intel_arc)),
+        ("strix-halo-vulkan", BackendName::Vulkan, Some(strix_halo)),
+        ("rtx-a4000-vulkan", BackendName::Vulkan, Some(rtx_a4000)),
+        ("m4-pro-metal", BackendName::Metal, m4_pro_metal),
+    ];
+
+    for codec in [KvCodec::Dense, KvCodec::AffineK8V4] {
+        for (label, backend, properties) in devices {
+            let layout = resident_layout(ExecutionPath::Native, backend);
+            let load = ModelLoadPlan::derive(
+                &manifest,
+                &definition,
+                SELECTION,
+                layout,
+                PlannedMethod::Plain,
+                LIMITS,
+            )
+            .unwrap_or_else(|e| panic!("{codec:?} on {label}: derive failed: {e}"));
+            let program = load
+                .program_plan(&definition, codec)
+                .unwrap_or_else(|e| panic!("{codec:?} on {label}: program_plan failed: {e}"));
+            let state = ResourcePlanner::state_plan(
+                &definition,
+                &load,
+                PlannedMethod::Plain,
+                codec,
+                LIMITS,
+                ResourceCapacity {
+                    domain_bytes: 64 << 30,
+                    tensor_operations: TensorOperations::Absent,
+                    allocations: seismic::NativeAllocations::EXACT,
+                },
+            )
+            .unwrap_or_else(|e| panic!("{codec:?} on {label}: state_plan failed: {e}"));
+
+            let _scope = SizingScope::enter_with_device(properties);
+            let (differences, _, _) = crate::programs::native_target_graph::target_outline_differences(
+                backend,
+                &load,
+                &definition.decoder,
+                &state,
+                program.target(),
+                LIMITS,
+                load.pass(LIMITS),
+            );
+            assert!(
+                differences.is_empty(),
+                "{codec:?} on {label}: SizingOutline and NativeGraphLayout must match:\n{}",
+                differences.join("\n"),
+            );
+            if label == "intel-arc-vulkan" {
+                let checked = crate::programs::native_target_graph::checked_target_family(
+                    backend,
+                    &load,
+                    &definition.decoder,
+                    &state,
+                    program.target(),
+                    LIMITS,
+                    load.pass(LIMITS),
+                )
+                .unwrap();
+                assert!(
+                    checked.graphs.union.launches > 64 * checked.graphs.union.graphs,
+                    "{codec:?} on {label}: expected repeat expansion well above 64 launches/graph, got {:?}",
+                    checked.graphs.union,
+                );
+            }
+        }
+    }
+}
+
+/// Real-device Vulkan regression test for `#314` / `#310` / `#308` / `#303`:
+/// seals the full target graph family via `AttestedPrograms::prepare_target_graphs`
+/// at long context (`context_limit = 262_144`) on a live Vulkan GPU (skipped when
+/// no Vulkan device is present on the host). Verifies `prepared.rs`'s
+/// `sealed.within(&bound)` invariant holds for both `Dense` (`attention_prefill`)
+/// and `AffineK8V4` (`attention_prefill_k8v4`) multi-round repeat graphs.
+#[test]
+fn vulkan_long_context_repeat_prefill_prepares_target_graphs_on_device() {
+    use super::catalog::LIMITS;
+    use crate::{ResourceCapacity, ResourcePlanner, TensorOperations};
+
+    let catalog = seismic::Devices::discover(&[]).unwrap();
+    let Ok(chosen) = crate::platform::select_device(
+        &catalog,
+        ExecutionPath::Native,
+        crate::platform::DeviceRequest::Backend(BackendName::Vulkan),
+        &crate::platform::ReleaseRate::of_machine(None),
+    ) else {
+        return;
+    };
+    let device = catalog
+        .open(catalog.resolve(chosen.info.selector()).unwrap())
+        .unwrap();
+    let mut definition = crate::planning::fixtures::fixture_definition();
+    definition.decoder.context_limit = 262_144;
+    let manifest = crate::planning::fixtures::fixture_manifest(&definition);
+    let limits = LIMITS;
+
+    for codec in [KvCodec::Dense, KvCodec::AffineK8V4] {
+        let draft = ExecutionPlanner::prepare(
+            &chosen,
+            &manifest,
+            &definition,
+            ComponentSelection { head: false, vision: false },
+            ExecutionPath::Native,
+            PlannedMethod::Plain,
+            codec,
+            limits,
+        )
+        .unwrap_or_else(|e| panic!("Vulkan {codec:?}: prepare failed: {e}"));
+        let state = ResourcePlanner::state_plan(
+            &definition,
+            draft.load(),
+            PlannedMethod::Plain,
+            codec,
+            limits,
+            ResourceCapacity {
+                domain_bytes: MemoryBudget::of_selected_stable(&chosen)
+                    .unwrap()
+                    .capacity()
+                    .min(4 << 30),
+                tensor_operations: TensorOperations::of(chosen.info.forms_tensor_operations()),
+                allocations: seismic::NativeAllocations::EXACT,
+            },
+        )
+        .unwrap_or_else(|e| panic!("Vulkan {codec:?}: state_plan failed: {e}"));
+        let programs = AttestedPrograms::prepare_draft(
+            &draft,
+            &seismic::Charges::tally(&device),
+            crate::TuningContext {
+                definition: &definition,
+                weights: &crate::ZeroTuningWeights,
+                observer: &crate::UnreportedTuning,
+                cache: None,
+                numerical_profile: crate::ResolvedNumericalProfile::standard(),
+                settings: crate::TuningSettings::STANDARD,
+            },
+            crate::UnpreparedUnits::ServeDefaults,
+        )
+        .unwrap_or_else(|e| panic!("Vulkan {codec:?}: prepare_draft failed: {e}"));
+        programs
+            .prepare_target_graphs(
+                &device,
+                draft.load(),
+                &definition.decoder,
+                &state,
+                draft.programs().target(),
+                limits,
+                draft.load().pass(limits),
+                &seismic::Workers::new(seismic::threads::quota().get().min(8)),
+            )
+            .unwrap_or_else(|e| panic!("Vulkan {codec:?}: prepare_target_graphs failed: {e}"));
+    }
+}

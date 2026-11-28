@@ -1294,7 +1294,7 @@ impl<I: std::borrow::Borrow<NativeImplementation>> DeviceBound<I> {
         self.implementation().scratch_bound_over(configurations, dimension)
     }
 
-    /// Admitted configurations distinct on launch-guard parameters at `statics`.
+    /// Admitted configurations distinct on launch-guard and repeat-count parameters at `statics`.
     pub fn launch_configurations(
         &self,
         statics: &NativeSpecialization,
@@ -1309,6 +1309,16 @@ impl<I: std::borrow::Borrow<NativeImplementation>> DeviceBound<I> {
         dimension: &impl Fn(&str) -> Option<u64>,
     ) -> Result<Vec<u64>, NativeScratchBoundError> {
         self.implementation().launch_masks_over(configurations, dimension)
+    }
+
+    /// Repeat-expanded active launch counts (`before + body * rounds + after`)
+    /// per configuration in `configurations` at `dimension`.
+    pub fn launch_counts_over(
+        &self,
+        configurations: &[NativeSpecialization],
+        dimension: &impl Fn(&str) -> Option<u64>,
+    ) -> Result<Vec<u64>, NativeScratchBoundError> {
+        self.implementation().launch_counts_over(configurations, dimension)
     }
 
     /// Visit the admissible specializations at `statics` until `visit` returns false.
@@ -3752,7 +3762,8 @@ impl NativeImplementation {
         Ok(bound)
     }
 
-    /// Every dimension name referenced in any launch's `when` guard.
+    /// Every dimension name referenced in any launch's `when` guard or in the
+    /// implementation's `repeat` count.
     pub fn launch_dimensions(&self) -> Vec<String> {
         let mut names = Vec::new();
         for launch in &self.launches {
@@ -3760,15 +3771,19 @@ impl NativeImplementation {
                 when.dimensions(&mut names);
             }
         }
+        if let Some(repeat) = &self.repeat {
+            repeat.count.dimensions(&mut names);
+        }
         names
     }
 
-    /// The configurations [`Self::launch_masks_over`] evaluates at `statics`:
-    /// one admitted configuration for each admitted assignment of the
-    /// parameters any launch's `when` guard reads (entry-wide or
-    /// launch-scoped), in the walk's order. A function of the statics alone,
-    /// so a caller may keep it for every call at them; `Inadmissible` where
-    /// none is admitted.
+    /// The configurations [`Self::launch_masks_over`] and
+    /// [`Self::launch_counts_over`] evaluate at `statics`: one admitted
+    /// configuration for each admitted assignment of the parameters any
+    /// launch's `when` guard or the implementation's `repeat` count reads
+    /// (entry-wide or launch-scoped), in the walk's order. A function of the
+    /// statics alone, so a caller may keep it for every call at them;
+    /// `Inadmissible` where none is admitted.
     fn launch_configurations(
         &self,
         statics: &NativeSpecialization,
@@ -3787,6 +3802,15 @@ impl NativeImplementation {
                     } else if !entry_read.contains(&name) {
                         entry_read.push(name);
                     }
+                }
+            }
+        }
+        if let Some(repeat) = &self.repeat {
+            let mut names = Vec::new();
+            repeat.count.parameters(&mut names);
+            for name in names {
+                if !entry_read.contains(&name) {
+                    entry_read.push(name);
                 }
             }
         }
@@ -3871,6 +3895,52 @@ impl NativeImplementation {
             masks.push(mask);
         }
         Ok(masks)
+    }
+
+    /// For each configuration in `configurations`
+    /// ([`Self::launch_configurations`] at the statics `dimension` holds), the
+    /// repeat-expanded active launch count at `dimension`:
+    /// `before + body * rounds + after` ([`Self::dispatch_count`]).
+    fn launch_counts_over(
+        &self,
+        configurations: &[NativeSpecialization],
+        dimension: &impl Fn(&str) -> Option<u64>,
+    ) -> Result<Vec<u64>, NativeScratchBoundError> {
+        let mut counts = Vec::with_capacity(configurations.len());
+        let mut active = Vec::with_capacity(self.launches.len());
+        for configuration in configurations {
+            let rounds = match &self.repeat {
+                Some(repeat) => repeat
+                    .count
+                    .evaluate(dimension, &|name| configuration.param(name))
+                    .map_err(|error| NativeScratchBoundError::Charge {
+                        scratch: "repeat".to_owned(),
+                        params: configuration.params().clone(),
+                        error,
+                    })?,
+                None => 1,
+            };
+            active.clear();
+            for (ordinal, launch) in self.launches.iter().enumerate() {
+                let is_active = match &launch.when {
+                    None => true,
+                    Some(when) => when
+                        .holds(dimension, &|name| {
+                            configuration
+                                .launch_param(ordinal, name)
+                                .or_else(|| configuration.param(name))
+                        })
+                        .map_err(|error| NativeScratchBoundError::Charge {
+                            scratch: launch.kernel.clone(),
+                            params: configuration.params().clone(),
+                            error,
+                        })?,
+                };
+                active.push(is_active);
+            }
+            counts.push(self.dispatch_count(rounds, |i| active[i]));
+        }
+        Ok(counts)
     }
 
     /// Evaluate each parameter's chosen default or reference sequentially in
@@ -5837,6 +5907,56 @@ mod native_tests {
         assert_eq!(native.launch_masks_over(&configs, &at(1)), Ok(vec![0b001, 0b011]));
         // At M = 4: bit 2 also set.
         assert_eq!(native.launch_masks_over(&configs, &at(4)), Ok(vec![0b101, 0b111]));
+    }
+
+    #[test]
+    fn launch_counts_over_expands_repeat_rounds_and_walks_repeat_params() {
+        let mut sources = SourceSet::default();
+        sources.push(SourceFile {
+            path: "ops.seismic".to_owned(),
+            text: "fn prefill[M, T, N](x: &tensor[M, N] f32, output: &mut tensor[M, N] f32):\n\
+                   \x20\x20\x20\x20parallel for i in 0..M:\n\
+                   \x20\x20\x20\x20\x20\x20\x20\x20parallel for j in 0..N:\n\
+                   \x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20output[i, j] = x[i, j]\n\n\
+                   native prefill for vulkan from \"prefill.comp\":\n\
+                   \x20\x20\x20\x20static (N)\n\
+                   \x20\x20\x20\x20params (arithmetic STEP in [1, 2] default 1, arithmetic UNUSED in [1, 2] default 1)\n\
+                   \x20\x20\x20\x20let ROUNDS = max(1, ceil_div(T, STEP * 16))\n\
+                   \x20\x20\x20\x20where N >= 16\n\
+                   \x20\x20\x20\x20launch prepare:\n\
+                   \x20\x20\x20\x20\x20\x20\x20\x20threadgroups (1, 1, 1)\n\
+                   \x20\x20\x20\x20\x20\x20\x20\x20threads_per_threadgroup (32, 1, 1)\n\
+                   \x20\x20\x20\x20repeat (ROUNDS):\n\
+                   \x20\x20\x20\x20\x20\x20\x20\x20launch attend:\n\
+                   \x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20threadgroups (1, 1, 1)\n\
+                   \x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20threads_per_threadgroup (32, 1, 1)\n\
+                   \x20\x20\x20\x20\x20\x20\x20\x20launch advance when ROUNDS > 1:\n\
+                   \x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20threadgroups (1, 1, 1)\n\
+                   \x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20threads_per_threadgroup (32, 1, 1)\n\
+                   \x20\x20\x20\x20launch merge:\n\
+                   \x20\x20\x20\x20\x20\x20\x20\x20threadgroups (1, 1, 1)\n\
+                   \x20\x20\x20\x20\x20\x20\x20\x20threads_per_threadgroup (32, 1, 1)\n"
+                .to_owned(),
+        });
+        let module = check_source(sources).expect("repeat launches check");
+        let native = module
+            .native_implementation(module.entries()[0].id, BackendName::Vulkan)
+            .unwrap();
+        assert!(native.launch_dimensions().contains(&"T".to_owned()));
+        let statics = NativeSpecialization::new().with_static("N", 32);
+        // STEP is read by `repeat (ROUNDS)` and `when ROUNDS > 1`, UNUSED is not.
+        let configs = native.launch_configurations(&statics).unwrap();
+        assert_eq!(configs.len(), 2);
+        let at = |t: u64| move |name: &str| match name {
+            "N" => Some(32),
+            "M" => Some(16),
+            "T" => Some(t),
+            _ => None,
+        };
+        // At T = 16: ROUNDS = 1 for both STEP=1 and STEP=2 -> before(1) + body(1)*1 + after(1) = 3.
+        assert_eq!(native.launch_counts_over(&configs, &at(16)), Ok(vec![3, 3]));
+        // At T = 1600: STEP=1 -> ROUNDS=100 (1 + 2*100 + 1 = 202), STEP=2 -> ROUNDS=50 (1 + 2*50 + 1 = 102).
+        assert_eq!(native.launch_counts_over(&configs, &at(1600)), Ok(vec![202, 102]));
     }
 
     /// Each buffer's largest charge over every configuration of the full

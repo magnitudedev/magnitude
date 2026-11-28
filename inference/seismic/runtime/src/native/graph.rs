@@ -1131,6 +1131,52 @@ impl NativeGraphDraft {
     }
 }
 
+/// Per-node active-launch accounting for metadata graph certification:
+/// - [`Self::Mask`]: bitmask of active static launch ordinals (used on CUDA,
+///   where one layout graph holds the bitwise union of active launch ordinals
+///   across every class sealed into it).
+/// - [`Self::Count`]: active dispatched launch count, expanding any
+///   `repeat (ROUNDS)` block (`before + body * rounds + after`; merged via
+///   element-wise maximum across classes on non-CUDA backends).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum NodeLaunches {
+    Mask(u64),
+    Count(u64),
+}
+
+impl NodeLaunches {
+    /// Conservative default when a caller supplies no active-launch bound: all
+    /// declared static launches (as a bitmask on CUDA, or a count elsewhere).
+    pub fn default_for(backend: BackendName, static_launches: usize) -> Self {
+        match backend {
+            BackendName::Cuda => {
+                let mask = if static_launches >= 64 { u64::MAX } else { (1u64 << static_launches) - 1 };
+                Self::Mask(mask)
+            }
+            BackendName::Vulkan | BackendName::Metal | BackendName::Cpu => Self::Count(static_launches as u64),
+        }
+    }
+
+    /// Number of launches recorded for one run of this node.
+    pub fn count(self) -> u64 {
+        match self {
+            Self::Mask(mask) => u64::from(mask.count_ones()),
+            Self::Count(count) => count,
+        }
+    }
+
+    /// Combine active-launch bounds across two concrete classes in one
+    /// certified layout group: bitwise union for CUDA launch masks, maximum
+    /// count for non-CUDA launch counts.
+    pub fn merge(self, other: Self) -> Self {
+        match (self, other) {
+            (Self::Mask(a), Self::Mask(b)) => Self::Mask(a | b),
+            (Self::Count(a), Self::Count(b)) => Self::Count(a.max(b)),
+            (a, b) => Self::Count(a.count().max(b.count())),
+        }
+    }
+}
+
 /// Per-node metadata recorded in [`NativeGraphMetadataDraft`].
 struct MetadataNode {
     planned: PlannedNode,
@@ -1139,9 +1185,9 @@ struct MetadataNode {
     /// The lengths of this node's sealed form's vectors.
     shape: SealedNodeShape,
     results: Vec<Option<NativeTensorSpec>>,
-    /// The active-launch bitmask at this node's enqueued dimensions
+    /// The active-launch bound at this node's enqueued dimensions
     /// ([`recorded_census`]).
-    active_launches: u64,
+    active_launches: NodeLaunches,
 }
 
 impl MetadataNode {
@@ -1851,7 +1897,7 @@ impl NativeGraphMetadataDraft {
         scratch: Vec<ScratchNeed>,
         activation: Option<RepresentationId>,
         shape: SealedNodeShape,
-        active_launches: Option<u64>,
+        active_launches: Option<NodeLaunches>,
     ) -> Result<PendingWorkflowResults, CallError> {
         let node = u32::try_from(self.nodes.len()).expect("native graph node ordinal exhausted");
         validate_node_references(self.identity, self.ports.len(), node, &args)
@@ -1875,7 +1921,7 @@ impl NativeGraphMetadataDraft {
             })
             .collect::<Result<Vec<_>, CallError>>()?;
         let count = u32::try_from(results.len()).expect("native result ordinal exhausted");
-        let default_mask = if shape.launches >= 64 { u64::MAX } else { (1u64 << shape.launches) - 1 };
+        let default_launches = NodeLaunches::default_for(self.backend, shape.launches);
         self.nodes.push(MetadataNode {
             planned: PlannedNode {
                 args: Arc::new(args),
@@ -1887,7 +1933,7 @@ impl NativeGraphMetadataDraft {
             entry,
             shape,
             results,
-            active_launches: active_launches.unwrap_or(default_mask),
+            active_launches: active_launches.unwrap_or(default_launches),
         });
         Ok(PendingWorkflowResults::new(self.identity, node, count))
     }
@@ -1909,7 +1955,7 @@ impl NativeGraphMetadataDraft {
         scratch: Vec<ScratchNeed>,
         activation: Option<RepresentationId>,
         shape: SealedNodeShape,
-        active_launches: Option<u64>,
+        active_launches: Option<NodeLaunches>,
         condition: NodeCondition,
     ) -> Result<PendingWorkflowResults, CallError> {
         let port = condition_port(self.identity, &self.ports, self.nodes.len(), condition).map_err(CallError::Workflow)?;
@@ -1983,23 +2029,23 @@ impl NativeGraphMetadataDraft {
     }
 
     /// What recording one run of this graph takes when each node makes the
-    /// launches in `masks` ([`recorded_census`]).
-    fn recorded_with(&self, masks: impl Iterator<Item = u64>) -> GraphCensus {
+    /// launches in `node_launches` ([`recorded_census`]).
+    fn recorded_with(&self, node_launches: impl Iterator<Item = NodeLaunches>) -> GraphCensus {
         let launches = self
             .nodes
             .iter()
-            .zip(masks)
-            .map(|(node, mask)| node.shape.launch_census(self.backend, u64::from(mask.count_ones())))
+            .zip(node_launches)
+            .map(|(node, active)| node.shape.launch_census(self.backend, active.count()))
             .try_fold(GraphCensus::default(), GraphCensus::plus)
             .expect("a graph's launch census fits u64");
         recorded_census(self.backend, self.nodes.len(), launches, &self.timelines, &self.marks)
     }
 
     /// What recording one run of this graph takes when each node makes the
-    /// launches in `masks` ([`recorded_census`]).
-    fn recorded_for(&self, masks: &[u64]) -> GraphCensus {
-        debug_assert_eq!(masks.len(), self.nodes.len());
-        self.recorded_with(masks.iter().copied())
+    /// launches in `node_launches` ([`recorded_census`]).
+    fn recorded_for(&self, node_launches: &[NodeLaunches]) -> GraphCensus {
+        debug_assert_eq!(node_launches.len(), self.nodes.len());
+        self.recorded_with(node_launches.iter().copied())
     }
 
     /// What recording one run of this graph takes ([`recorded_census`]).
@@ -2196,7 +2242,7 @@ impl ValidatedMetadataDraft {
             .iter()
             .map(|node| node.planned.scratch.clone())
             .collect();
-        let mut active_launches: Vec<u64> = validated
+        let mut active_launches: Vec<NodeLaunches> = validated
             .draft
             .nodes
             .iter()
@@ -2248,7 +2294,7 @@ impl ValidatedMetadataDraft {
                 }
             }
             for (cap, node) in active_launches.iter_mut().zip(&draft.nodes) {
-                *cap |= node.active_launches;
+                *cap = cap.merge(node.active_launches);
             }
         }
         validated.capacity_layout(&ports, &results, scratch, Some(&active_launches))
@@ -2264,11 +2310,11 @@ impl ValidatedMetadataDraft {
         ports: &[u64],
         results: &[Vec<u64>],
         scratch: Vec<Vec<ScratchNeed>>,
-        active_launches: Option<&[u64]>,
+        active_launches: Option<&[NodeLaunches]>,
     ) -> Result<NativeGraphLayout, WorkflowError> {
         let (ports, nodes, results) = self.at_capacities(ports, results, scratch)?;
         let recorded = match active_launches {
-            Some(masks) => self.draft.recorded_for(masks),
+            Some(launches) => self.draft.recorded_for(launches),
             None => self.census,
         };
         Ok(make_layout(
@@ -2293,12 +2339,12 @@ impl ValidatedMetadataDraft {
         ports: &[u64],
         results: &[Vec<u64>],
         scratch: Vec<Vec<ScratchNeed>>,
-        active_launches: Option<&[u64]>,
+        active_launches: Option<&[NodeLaunches]>,
     ) -> Result<NativeGraphStorageBytes, WorkflowError> {
         let (ports, nodes, results) = self.at_capacities(ports, results, scratch)?;
         let storage = plan_storage(&ports, &nodes, &self.links, &results, &self.draft.exports, &self.draft.stores);
         let recorded = match active_launches {
-            Some(masks) => self.draft.recorded_for(masks),
+            Some(launches) => self.draft.recorded_for(launches),
             None => self.census,
         };
         Ok(NativeGraphStorageBytes {
@@ -8112,7 +8158,7 @@ mod layout_certificate_tests {
             conditions: 0,
             parks: false,
         };
-        let build = |backend: BackendName, active_mask: Option<u64>| {
+        let build = |backend: BackendName, active: Option<NodeLaunches>| {
             let mut draft = NativeGraphMetadataDraft::new(backend);
             let input = draft.port(f32s, &[4], false, false).unwrap();
             let mut args = EncodedWorkflowArgs::new();
@@ -8126,7 +8172,7 @@ mod layout_certificate_tests {
                     Vec::new(),
                     None,
                     shape.clone(),
-                    active_mask,
+                    active,
                 )
                 .unwrap();
             draft.export(pending.take()).unwrap();
@@ -8134,7 +8180,7 @@ mod layout_certificate_tests {
         };
 
         // Metal: 1 active launch out of 4 declared -> launches == 1, not 4.
-        let metal_single = build(BackendName::Metal, Some(0b0010)).seal().unwrap();
+        let metal_single = build(BackendName::Metal, Some(NodeLaunches::Mask(0b0010))).seal().unwrap();
         assert_eq!(
             metal_single.recorded,
             GraphCensus { graphs: 1, launches: 1, arguments: 0, largest: 0 }
@@ -8142,8 +8188,8 @@ mod layout_certificate_tests {
 
         // Metal certify_group: union of 0b0001 and 0b0100 -> 2 active launches, not 4.
         let metal_group = ValidatedMetadataDraft::certify_group([
-            build(BackendName::Metal, Some(0b0001)),
-            build(BackendName::Metal, Some(0b0100)),
+            build(BackendName::Metal, Some(NodeLaunches::Mask(0b0001))),
+            build(BackendName::Metal, Some(NodeLaunches::Mask(0b0100))),
         ])
         .unwrap();
         assert_eq!(
@@ -8153,7 +8199,7 @@ mod layout_certificate_tests {
 
         // Vulkan: 2 active launches out of 4 declared -> 2 launches and 2x argument_bytes.
         let arg_bytes = argument_bytes(BackendName::Vulkan, 2, 8 * 4);
-        let vulkan = build(BackendName::Vulkan, Some(0b1010)).seal().unwrap();
+        let vulkan = build(BackendName::Vulkan, Some(NodeLaunches::Count(2))).seal().unwrap();
         assert_eq!(
             vulkan.recorded,
             GraphCensus {
@@ -8164,14 +8210,30 @@ mod layout_certificate_tests {
             }
         );
 
+        // Vulkan repeat-expanded counts exceeding 64 launches merge via max, never popcount or bitwise OR.
+        let vulkan_repeat = ValidatedMetadataDraft::certify_group([
+            build(BackendName::Vulkan, Some(NodeLaunches::Count(12))),
+            build(BackendName::Vulkan, Some(NodeLaunches::Count(516))),
+        ])
+        .unwrap();
+        assert_eq!(
+            vulkan_repeat.storage_bytes().recorded,
+            GraphCensus {
+                graphs: 1,
+                launches: 516,
+                arguments: 516 * arg_bytes,
+                largest: arg_bytes,
+            }
+        );
+
         // Zero active launches (all branches inactive): 0 launches, 0 arguments, 0 largest.
-        let none_active = build(BackendName::Vulkan, Some(0)).seal().unwrap();
+        let none_active = build(BackendName::Vulkan, Some(NodeLaunches::Count(0))).seal().unwrap();
         assert_eq!(
             none_active.recorded,
             GraphCensus { graphs: 1, launches: 0, arguments: 0, largest: 0 }
         );
 
-        // CPU: None mask falls back to all declared launches (4).
+        // CPU: None falls back to all declared launches (4).
         let cpu_all = build(BackendName::Cpu, None).seal().unwrap();
         assert_eq!(
             cpu_all.recorded,

@@ -3127,7 +3127,7 @@ struct CheckedNode {
     parameters: Vec<Option<(RepresentationId, Vec<u64>)>>,
     results: Vec<Option<(RepresentationId, Vec<u64>)>>,
     scratch: Vec<seismic_runtime::native::ScratchNeed>,
-    cuda_launches: Option<u64>,
+    active_launches: Option<seismic_runtime::native::graph::NodeLaunches>,
 }
 
 fn borrowed(dimensions: &[(String, u64)]) -> Vec<(&str, u64)> {
@@ -3726,7 +3726,7 @@ impl NativeGraphMetadata {
                 scratch,
                 activation,
                 sealed,
-                node.cuda_launches,
+                node.active_launches,
                 condition,
             ),
             None => self.inner.enqueue(
@@ -3737,7 +3737,7 @@ impl NativeGraphMetadata {
                 scratch,
                 activation,
                 sealed,
-                node.cuda_launches,
+                node.active_launches,
             ),
         }
         .map_err(NativeGraphMetadataError::Call)?;
@@ -3947,14 +3947,15 @@ fn scratch_bound(
 /// Active-launch bitmasks per admitted launch-guard configuration at `dimension`
 /// ([`OnDevice::launch_masks_over`]), with the declaration's
 /// admitted configurations cached for the active [`PlanningSession`] wave for
-/// each value of its statics ([`OnDevice::launch_configurations`]).
-fn launch_masks_bound(
+/// Cached admitted launch configurations at the call's statics
+/// (`OnDevice::launch_configurations`).
+fn launch_configurations_bound(
     caches: &PlanningCaches,
     implementation_key: usize,
     device: Option<crate::device::DeviceProperties>,
     bound: &seismic_lang::checked::OnDevice,
     dimension: &impl Fn(&str) -> Option<u64>,
-) -> Result<Vec<u64>, String> {
+) -> Result<Arc<Vec<NativeSpecialization>>, String> {
     let statics = bound
         .statics
         .iter()
@@ -3962,26 +3963,53 @@ fn launch_masks_bound(
         .collect::<Result<Vec<_>, _>>()?;
     let key = (implementation_key, device, statics);
     let walked = &caches.launch_walked;
-    let known = walked.read().expect("walked launch configurations are never poisoned").get(&key).cloned();
-    let configurations = match known {
-        Some(configurations) => configurations,
-        None => {
-            let statics = bound
-                .statics
-                .iter()
-                .zip(&key.2)
-                .fold(NativeSpecialization::new(), |statics, (name, &value)| statics.with_static(name.clone(), value));
-            let configurations =
-                Arc::new(bound.launch_configurations(&statics).map_err(|error| error.to_string())?);
-            walked
-                .write()
-                .expect("walked launch configurations are never poisoned")
-                .insert(key, Arc::clone(&configurations));
-            configurations
-        }
-    };
+    if let Some(configurations) = walked
+        .read()
+        .expect("walked launch configurations are never poisoned")
+        .get(&key)
+        .cloned()
+    {
+        return Ok(configurations);
+    }
+    let statics = bound
+        .statics
+        .iter()
+        .zip(&key.2)
+        .fold(NativeSpecialization::new(), |statics, (name, &value)| statics.with_static(name.clone(), value));
+    let configurations =
+        Arc::new(bound.launch_configurations(&statics).map_err(|error| error.to_string())?);
+    walked
+        .write()
+        .expect("walked launch configurations are never poisoned")
+        .insert(key, Arc::clone(&configurations));
+    Ok(configurations)
+}
+
+/// Active-launch bitmasks across all admissible launch-guard configurations.
+fn launch_masks_bound(
+    caches: &PlanningCaches,
+    implementation_key: usize,
+    device: Option<crate::device::DeviceProperties>,
+    bound: &seismic_lang::checked::OnDevice,
+    dimension: &impl Fn(&str) -> Option<u64>,
+) -> Result<Vec<u64>, String> {
+    let configurations = launch_configurations_bound(caches, implementation_key, device, bound, dimension)?;
     bound
         .launch_masks_over(&configurations, dimension)
+        .map_err(|error| error.to_string())
+}
+
+/// Repeat-expanded active launch counts across all admissible configurations.
+fn launch_counts_bound(
+    caches: &PlanningCaches,
+    implementation_key: usize,
+    device: Option<crate::device::DeviceProperties>,
+    bound: &seismic_lang::checked::OnDevice,
+    dimension: &impl Fn(&str) -> Option<u64>,
+) -> Result<Vec<u64>, String> {
+    let configurations = launch_configurations_bound(caches, implementation_key, device, bound, dimension)?;
+    bound
+        .launch_counts_over(&configurations, dimension)
         .map_err(|error| error.to_string())
 }
 
@@ -4060,7 +4088,7 @@ fn check_node(
         .zip(&bound.scratch)
         .map(|(bytes, buffer)| seismic_runtime::native::ScratchNeed::of(buffer, bytes))
         .collect();
-    let cuda_launches = if backend == BackendName::Cuda {
+    let active_launches = if backend == BackendName::Cuda {
         let masks = launch_masks_bound(caches, implementation_key, device, &bound, &dim_lookup)
             .map_err(|reason| {
                 NativeGraphMetadataError::Unsupported(format!(
@@ -4070,7 +4098,24 @@ fn check_node(
             })?;
         // Union of active launch bits across every admissible specialization:
         // matches `NativeGraphFamily::with_launches` bitwise-OR layout form.
-        Some(masks.into_iter().fold(0u64, |acc, m| acc | m))
+        Some(seismic_runtime::native::graph::NodeLaunches::Mask(
+            masks.into_iter().fold(0u64, |acc, m| acc | m),
+        ))
+    } else if bound.repeat.is_some() {
+        let counts = launch_counts_bound(caches, implementation_key, device, &bound, &dim_lookup)
+            .map_err(|reason| {
+                NativeGraphMetadataError::Unsupported(format!(
+                    "`{}` launch counts at {dimensions:?}: {reason}",
+                    entry
+                ))
+            })?;
+        // Maximum repeat-expanded active launch count across every admissible
+        // specialization: matches `SizingDraft` and `NativeGraphDraft::seal`.
+        counts
+            .into_iter()
+            .max()
+            .filter(|&count| count > 0)
+            .map(seismic_runtime::native::graph::NodeLaunches::Count)
     } else {
         None
     };
@@ -4086,7 +4131,7 @@ fn check_node(
             .map(|result| result.map(|metadata| (metadata.element.id(), metadata.extents)))
             .collect(),
         scratch,
-        cuda_launches,
+        active_launches,
         checked,
     })
 }
