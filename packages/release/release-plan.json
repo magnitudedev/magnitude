@@ -1,16 +1,16 @@
 {
   "format": 2,
   "baseline": {
-    "tag": "@magnitudedev/cli@0.3.6",
-    "sourceCommit": "0398a89206dc3fbdb3f35846050972b2169cc4b8",
-    "cliVersion": "0.3.6",
+    "tag": "@magnitudedev/cli@0.3.7",
+    "sourceCommit": "90a4db1c5746366fbbf4db5636ddf7ee79e98464",
+    "cliVersion": "0.3.7",
     "rpc": {
       "version": 20,
       "fingerprint": "607ed6e2290ffa37662f4d23ee8666cf0366439a1a19b4456ed9aae35cf9c974"
     }
   },
-  "cliVersion": "0.3.7",
-  "revision": 78,
+  "cliVersion": "0.3.8",
+  "revision": 79,
   "rpc": {
     "version": 20,
     "fingerprint": "607ed6e2290ffa37662f4d23ee8666cf0366439a1a19b4456ed9aae35cf9c974"
