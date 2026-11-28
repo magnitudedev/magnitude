@@ -127,7 +127,7 @@ function ModelsPage({ observation }: { observation: ServiceObservation }) {
       <h1 className={`${pageLayout.pageTitle} min-w-0 flex-1 truncate`}>Explore models</h1>
       <div className="shrink-0"><WhatRuns families={recommendations.families} /></div>
     </div>
-    <Explore query={Option.getOrElse(linkedQuery, () => typed)} memory={memory} families={recommendations.families}
+    <Explore query={Option.getOrElse(linkedQuery, () => typed)} memory={memory} recommendations={recommendations}
       first={Option.isNone(linkedQuery) && first !== null && first.query === typed ? exploreFirst(first.repository, recommendations.offered) : null}
       owned={new Set(Result.isSuccess(models) ? models.value.models.filter(onThisComputer).map(model => String(model.modelId)) : [])}
       setQuery={next => { if (Option.isSome(linked)) clearLinked(); setTyped(next) }} />

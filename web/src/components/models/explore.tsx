@@ -10,7 +10,15 @@ import { downloadContents, transferLabel, methodName, onThisComputer, quantView,
 import { AUTO_DRAFTER, DrafterSection, drafterChoice, useDrafters, type DrafterSelection } from "./drafter-picker"
 import type { QuantView } from "./view"
 import type { OfferedModel } from "./expanding-model"
-import { ExploreView, type ExploreMore, type ExploreResults, type ExploreRow, type RunnableFamily } from "./explore-view"
+import { ExploreView, type ExploreMore, type ExploreResults, type ExploreRow } from "./explore-view"
+import {
+  downloadableRecommendations,
+  recommendationsSettled,
+  recommendedForYourMachine,
+  type OfferedRecommendation,
+  type Recommendation,
+  type RecommendationsView,
+} from "./recommendations"
 
 /** Consecutive pages with zero runnable models before auto-pagination pauses for an explicit click. */
 const MAX_AUTO_EMPTY_PAGES = 2
@@ -276,12 +284,86 @@ export const exploreFirst = (repository: string, offered: readonly { readonly mo
   return model ? { _tag: "Offered", model } : { _tag: "Repository", repository }
 }
 
+/** Maximum curated Magnitude Picks pinned above Hugging Face search results. */
+const MAX_MATCHING_PICKS = 3
+
+/** Splits text into lowercase search tokens, separating punctuation and letter↔digit boundaries (`qwen3.8` → `["qwen", "3.8"]`). */
+const searchTokens = (text: string): readonly string[] =>
+  text
+    .toLowerCase()
+    .replace(/([a-z])(\d)/g, "$1 $2")
+    .replace(/(\d)([a-z])/g, "$1 $2")
+    .split(/[^a-z0-9.]+/)
+    .map(token => token.replace(/^\.+|\.+$/g, ""))
+    .filter(Boolean)
+
+const tokenMatches = (queryToken: string, haystackToken: string): boolean => {
+  if (/^\d+$/.test(queryToken)) return haystackToken === queryToken || haystackToken.startsWith(`${queryToken}.`)
+  if (/^\d+\.\d+$/.test(queryToken)) return haystackToken === queryToken
+  if (queryToken.length === 1) return haystackToken === queryToken
+  return haystackToken.startsWith(queryToken)
+}
+
+/** Extracts a normalized `owner/repo` pair if the query looks like a Hugging Face repository reference or URL. */
+const queryRepository = (query: string): string | null => {
+  const cleaned = query
+    .trim()
+    .replace(/^https?:\/\/(?:www\.)?huggingface\.co\//i, "")
+    .replace(/[?#].*$/, "")
+    .replace(/\/+$/, "")
+  const parts = cleaned.split("/")
+  if (parts.length < 2 || !parts[0] || !parts[1] || /\s/.test(parts[0]) || /\s/.test(parts[1])) return null
+  return `${parts[0]}/${parts[1]}`.toLowerCase()
+}
+
+const ownedNoteFor = (model: OfferedModel, owned: ReadonlySet<string>): string | undefined => {
+  const have = model.quants.find(quant => owned.has(quant.key))
+  return have ? (have.bits > 0 ? `You have the ${have.bits}-bit quant` : `You have ${have.name}`) : undefined
+}
+
+/**
+ * Curated recommendations that run on this machine and match `query`, ranked in recommendation order to pin above
+ * Hugging Face search results. Also keeps an explicit `first` offered model leading without duplicates.
+ */
+export const matchingRecommendations = (
+  query: string,
+  offered: readonly OfferedRecommendation[],
+  owned: ReadonlySet<string>,
+  first: ExploreFirst | null = null,
+): readonly Recommendation[] => {
+  const picks: Recommendation[] = []
+  const seen = new Set<string>()
+  if (first?._tag === "Offered") {
+    picks.push({ model: first.model, note: ownedNoteFor(first.model, owned) })
+    seen.add(first.model.key)
+  }
+  const trimmed = query.trim()
+  if (trimmed.length < 2) return picks
+  const repo = queryRepository(trimmed)
+  const queryTerms = repo === null ? searchTokens(trimmed) : []
+  if (repo === null && queryTerms.length === 0) return picks
+  for (const entry of downloadableRecommendations(offered)) {
+    if (picks.length >= MAX_MATCHING_PICKS) break
+    if (seen.has(entry.model.key)) continue
+    const matches = repo !== null
+      ? entry.model.quants.some(quant => quant.repository?.toLowerCase() === repo)
+      : (() => {
+          const haystack = searchTokens(`${entry.recommendation.name} ${entry.recommendation.base} ${entry.recommendation.developer.name}`)
+          return queryTerms.every(term => haystack.some(candidate => tokenMatches(term, candidate)))
+        })()
+    if (!matches) continue
+    picks.push({ model: entry.model, note: ownedNoteFor(entry.model, owned) })
+    seen.add(entry.model.key)
+  }
+  return picks
+}
+
 interface ExploreProps {
   readonly query: string
   readonly first: ExploreFirst | null
   readonly setQuery: (value: string) => void
   readonly memory: ServingMemory
-  readonly families: readonly RunnableFamily[]
+  readonly recommendations: RecommendationsView
   readonly owned: ReadonlySet<string>
 }
 
@@ -534,17 +616,14 @@ function useSearchResults(
   const byKey = new Map<string, HuggingFaceSearchResult>(listed.map(result => [result.repository, result]))
   const showUnchecked = (result: HuggingFaceSearchResult) =>
     result.gated || result.repository === pinnedRepository || listed.length === 1
-  const rows: ExploreRow[] = [
-    ...(first?._tag === "Offered" ? [{ _tag: "Offered" as const, model: first.model, prefetched: false }] : []),
-    ...schedule.revealed.flatMap((key) => {
-      const result = byKey.get(key)
-      const check = schedule.checks.get(key)
-      if (!result || !check) return []
-      const retry = () => registry.refresh(client.Models.CheckHuggingFaceRepository(checkInput(result)))
-      const row = searchRow(result, check, schedule.full.has(key), showUnchecked(result), retry, memory)
-      return row ? [row] : []
-    }),
-  ]
+  const rows: ExploreRow[] = schedule.revealed.flatMap((key) => {
+    const result = byKey.get(key)
+    const check = schedule.checks.get(key)
+    if (!result || !check) return []
+    const retry = () => registry.refresh(client.Models.CheckHuggingFaceRepository(checkInput(result)))
+    const row = searchRow(result, check, schedule.full.has(key), showUnchecked(result), retry, memory)
+    return row ? [row] : []
+  })
 
   const hasMoreLocal = frontier < listed.length
   const hasMoreRemote = Option.isSome(nextCursor)
@@ -558,23 +637,33 @@ function useSearchResults(
   return { _tag: "Results", rows, more }
 }
 
-/** Explore models on the service's data: a Hugging Face search, and what to show before one. */
+/** Explore models on the service's data: curated Magnitude Picks in idle & matching search, plus Hugging Face search. */
 export function Explore(props: ExploreProps) {
-  const settled = useDebounced(props.query.trim(), 350)
+  const trimmed = props.query.trim()
+  const settled = useDebounced(trimmed, 350)
   const tooLong = new TextEncoder().encode(settled).length > HUGGING_FACE_SEARCH_QUERY_MAXIMUM_BYTES
   const opened = useMemo(() => Atom.make<string | null>(null), [])
   const hovered = useMemo(() => Atom.make<string | null>(null), [])
   const setOpened = useAtomSet(opened)
   const setHovered = useAtomSet(hovered)
-  const searched = useSearchResults(tooLong ? "" : settled, props.query.trim(), props.first, props.memory, opened, hovered)
+  const searched = useSearchResults(tooLong ? "" : settled, trimmed, props.first, props.memory, opened, hovered)
   const [selections, setSelections] = useState<Readonly<Record<string, DrafterSelection>>>({})
   const download = useDownload(selections)
   const drafters = drafterFor(selections, (key, selection) => setSelections(current => ({ ...current, [key]: selection })))
-  const results: ExploreResults = props.query.trim() === ""
-    ? { _tag: "Idle" }
-    : tooLong ? { _tag: "Failed", message: "This search is longer than Hugging Face accepts. Shorten it." }
-    : searched
+  const idlePicks = useMemo(
+    () => recommendedForYourMachine(props.recommendations.offered, props.owned),
+    [props.recommendations.offered, props.owned],
+  )
+  const matchedPicks = useMemo(
+    () => trimmed === "" ? [] : matchingRecommendations(trimmed, props.recommendations.offered, props.owned, props.first),
+    [trimmed, props.recommendations.offered, props.owned, props.first],
+  )
+  const results: ExploreResults = trimmed === ""
+    ? { _tag: "Idle", picks: idlePicks, loadingPicks: !recommendationsSettled(props.recommendations) }
+    : tooLong ? { _tag: "Failed", picks: matchedPicks, message: "This search is longer than Hugging Face accepts. Shorten it." }
+    : { ...searched, picks: matchedPicks }
   const useOpened = useMemo(() => useRepositoryQuants(props.memory), [props.memory])
-  return <ExploreView {...props} results={results} download={download} drafters={drafters} useOpened={useOpened}
+  return <ExploreView query={props.query} setQuery={props.setQuery} families={props.recommendations.families} owned={props.owned}
+    results={results} download={download} drafters={drafters} useOpened={useOpened}
     onExpand={setOpened} onPrefetch={setHovered} />
 }

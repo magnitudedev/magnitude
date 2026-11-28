@@ -3,8 +3,9 @@ import { Atom, Registry, Result } from "@effect-atom/atom-react"
 import { Option } from "effect"
 import type { AgentClient } from "@magnitudedev/client-common"
 import type { HuggingFaceRepositoryCheck, HuggingFaceSearchResult } from "@magnitudedev/sdk"
-import { dedupeResults, exploreFirst, inspectReference, listedFirst, quickState, searchSchedule } from "./explore"
+import { dedupeResults, exploreFirst, inspectReference, listedFirst, matchingRecommendations, quickState, searchSchedule } from "./explore"
 import type { OfferedModel } from "./expanding-model"
+import type { OfferedRecommendation } from "./recommendations"
 
 type CheckState = { readonly result: Result.Result<HuggingFaceRepositoryCheck, unknown>; readonly isStale: boolean }
 
@@ -180,5 +181,65 @@ describe("what leads a search for a model's other quants", () => {
 
   it("is any other repository looked up by name", () => {
     expect(exploreFirst("bartowski/LFM3-1.7B-GGUF", [{ model: lfm3 }])).toEqual({ _tag: "Repository", repository: "bartowski/LFM3-1.7B-GGUF" })
+  })
+})
+
+describe("matchingRecommendations", () => {
+  const makeOffered = (
+    base: string,
+    name: string,
+    developerName: string,
+    repository: string,
+    downloadable = true,
+  ): OfferedRecommendation => ({
+    recommendation: {
+      base,
+      name,
+      developer: { lab: developerName.toLowerCase(), name: developerName, country: "US" },
+      chosen: downloadable ? Option.some(`${base}:gguf:q4`) : Option.none(),
+      rungs: [`${base}:gguf:q4`],
+      meetsTarget: downloadable,
+    } as unknown as OfferedRecommendation["recommendation"],
+    model: {
+      key: base,
+      catalog: true,
+      name,
+      quants: [{ key: `${base}:gguf:q4`, bits: 4, name: "UD-Q4_K_XL", repository }],
+    } as unknown as OfferedModel,
+  })
+
+  const offered = [
+    makeOffered("qwen3.8-27b", "Qwen3.8 27B", "Alibaba", "unsloth/Qwen3.8-27B-GGUF"),
+    makeOffered("gemma-4-12b-it-qat", "Gemma 4 12B", "Google", "unsloth/gemma-4-12B-it-qat-GGUF"),
+    makeOffered("lfm3-1.7b", "Liquid LFM3 1.7B", "Liquid AI", "LiquidAI/LFM3-1.7B-GGUF"),
+    makeOffered("qwen3.8-flash-next", "Qwen3.8 Flash Next", "Alibaba", "unsloth/Qwen3.8-Flash-Next-GGUF", false),
+    makeOffered("qwen3.6-35b-a3b", "Qwen3.6 35B-A3B", "Alibaba", "unsloth/Qwen3.6-35B-A3B-MTP-GGUF"),
+    makeOffered("qwen3.5-4b", "Qwen3.5 4B", "Alibaba", "unsloth/Qwen3.5-4B-MTP-GGUF"),
+    makeOffered("qwen3.5-9b", "Qwen3.5 9B", "Alibaba", "unsloth/Qwen3.5-9B-MTP-GGUF"),
+  ]
+
+  it("matches across letter-digit boundaries and spaces while ignoring non-downloadable models", () => {
+    expect(matchingRecommendations("gemma4", offered, new Set()).map(entry => entry.model.key)).toEqual(["gemma-4-12b-it-qat"])
+    expect(matchingRecommendations("qwen 3.8", offered, new Set()).map(entry => entry.model.key)).toEqual(["qwen3.8-27b"])
+    expect(matchingRecommendations("google", offered, new Set()).map(entry => entry.model.key)).toEqual(["gemma-4-12b-it-qat"])
+  })
+
+  it("does not falsely match different version numbers or quantizer names like unsloth", () => {
+    expect(matchingRecommendations("gemma 3", offered, new Set())).toEqual([])
+    expect(matchingRecommendations("qwen 2", offered, new Set())).toEqual([])
+    expect(matchingRecommendations("unsloth", offered, new Set())).toEqual([])
+    expect(matchingRecommendations("llama", offered, new Set())).toEqual([])
+  })
+
+  it("matches pasted Hugging Face repository references and URLs", () => {
+    expect(matchingRecommendations("https://huggingface.co/LiquidAI/LFM3-1.7B-GGUF", offered, new Set()).map(entry => entry.model.key)).toEqual(["lfm3-1.7b"])
+    expect(matchingRecommendations("unsloth/gemma-4-12b-it-qat-gguf", offered, new Set()).map(entry => entry.model.key)).toEqual(["gemma-4-12b-it-qat"])
+  })
+
+  it("caps pinned results at three, notes already-owned quants, and deduplicates an explicit first offered model", () => {
+    const owned = new Set(["qwen3.8-27b:gguf:q4"])
+    const picks = matchingRecommendations("qwen", offered, owned, { _tag: "Offered", model: offered[4]!.model })
+    expect(picks.map(entry => entry.model.key)).toEqual(["qwen3.6-35b-a3b", "qwen3.8-27b", "qwen3.5-4b"])
+    expect(picks[1]!.note).toBe("You have the 4-bit quant")
   })
 })

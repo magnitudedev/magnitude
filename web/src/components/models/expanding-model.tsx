@@ -1,7 +1,7 @@
 import { Fragment, type ReactNode } from "react"
-import { CircleNotchIcon } from "@phosphor-icons/react"
+import { CircleNotchIcon, StarIcon } from "@phosphor-icons/react"
 import type { ModelLab } from "../model-logo"
-import { ContextText, DownloadsCount, ModelCardShell, PlacementBar, QuantLadder, QuantList, RepositoryLink, quantSource } from "./parts"
+import { ContextText, DownloadsCount, ModelCardShell, PlacementBar, QuantLadder, QuantList, RepositoryLink, bitWidthLabel, quantSource } from "./parts"
 import type { QuantView } from "./view"
 
 /** A model offered for download: its quant ladder, the rung chosen for this machine, and what it pairs with. */
@@ -31,8 +31,8 @@ function DetailItems({ items }: { items: readonly (ReactNode | null | false | un
 }
 
 /** A model that opens in place to its quant ladder and how the chosen quant runs here. */
-export function ExpandingModel({ model, note, expanded, onToggle, quantChoice, onQuantChoice, owned, drafter, footer }: {
-  model: OfferedModel; note?: string | undefined; expanded: boolean; onToggle: () => void
+export function ExpandingModel({ model, note, featured = false, expanded, onToggle, quantChoice, onQuantChoice, owned, drafter, footer }: {
+  model: OfferedModel; note?: string | undefined; featured?: boolean; expanded: boolean; onToggle: () => void
   quantChoice: string | null; onQuantChoice: (key: string) => void; owned: ReadonlySet<string>
   drafter?: ((quant: QuantView) => ReactNode) | undefined; footer?: (quant: QuantView) => ReactNode
 }) {
@@ -41,20 +41,32 @@ export function ExpandingModel({ model, note, expanded, onToggle, quantChoice, o
   const totalQuants = model.quantCount ?? model.quants.length
   const multiQuantRepo = !model.catalog && totalQuants > 1
   const isRecommended = current.key === model.recommended
+  const currentBitsOrName = bitWidthLabel(current.bits) ?? current.name
   const sizeLabel = model.catalog
-    ? "on disk"
+    ? featured
+      ? model.quants.length > 1 && isRecommended
+        ? `Best: ${currentBitsOrName}`
+        : currentBitsOrName
+      : "on disk"
     : multiQuantRepo && isRecommended
       ? `Best: ${current.name}`
       : current.name
   const detail = model.catalog
-    ? <DetailItems items={[
-        current.bits > 0 && <span className="font-medium text-slate-700 dark:text-slate-300">{current.bits}-bit</span>,
-        current.repository ? <RepositoryLink repository={current.repository}>{quantSource(current)}</RepositoryLink> : quantSource(current),
-        model.fineTuneOf && `Fine-tune of ${model.fineTuneOf}`,
-        model.drafter && !current.drafterWithheld && model.drafter.method,
-        current.servedContext !== null && <ContextText quant={current} limit={model.contextLimit} modelName={model.name} />,
-        model.country === "US" && "🇺🇸",
-      ]} />
+    ? featured
+      ? <DetailItems items={[
+          model.quants.length > 1 && <span className="whitespace-nowrap">{model.quants.length} quants</span>,
+          model.drafter && !current.drafterWithheld && <span className="whitespace-nowrap">{model.drafter.method} drafter</span>,
+          current.repository ? <RepositoryLink repository={current.repository}>{quantSource(current)}</RepositoryLink> : quantSource(current),
+          model.country === "US" && "🇺🇸",
+        ]} />
+      : <DetailItems items={[
+          current.bits > 0 && <span className="font-medium text-slate-700 dark:text-slate-300">{current.bits}-bit</span>,
+          current.repository ? <RepositoryLink repository={current.repository}>{quantSource(current)}</RepositoryLink> : quantSource(current),
+          model.fineTuneOf && `Fine-tune of ${model.fineTuneOf}`,
+          model.drafter && !current.drafterWithheld && model.drafter.method,
+          current.servedContext !== null && <ContextText quant={current} limit={model.contextLimit} modelName={model.name} />,
+          model.country === "US" && "🇺🇸",
+        ]} />
     : <DetailItems items={[
         model.downloads != null && model.downloads > 0 && <DownloadsCount count={model.downloads} />,
         current.repository
@@ -64,8 +76,11 @@ export function ExpandingModel({ model, note, expanded, onToggle, quantChoice, o
         model.fineTuneOf && <span className="truncate">Fine-tune of {model.fineTuneOf}</span>,
         model.country === "US" && "🇺🇸",
       ]} />
-  return <ModelCardShell lab={model.lab} title={model.name} note={note} quant={current} sizeLabel={sizeLabel}
-    disclosure={model.catalog ? "check" : "chevron"} active={expanded} onSelect={onToggle} detail={detail}>
+  const badge = featured
+    ? <span className="inline-flex shrink-0 items-center gap-1 whitespace-nowrap rounded-full border border-blue-200 bg-blue-50 px-2 py-0.5 text-[11px] font-medium leading-4 text-blue-700 dark:border-blue-500/35 dark:bg-blue-900/35 dark:text-blue-300"><StarIcon weight="fill" aria-hidden="true" className="size-3 shrink-0" />Magnitude Pick</span>
+    : undefined
+  return <ModelCardShell lab={model.lab} title={model.name} badge={badge} note={note} quant={current} sizeLabel={sizeLabel}
+    disclosure={model.catalog && !featured ? "check" : "chevron"} featured={featured} active={expanded} onSelect={onToggle} detail={detail}>
     {expanded && <div className="border-t border-slate-200 bg-slate-50/60 px-4 py-4 dark:border-slate-750 dark:bg-slate-900/40">
       {model.catalog
         ? <QuantLadder quants={model.quants} selected={current.key} recommended={model.recommended} owned={owned} limit={model.contextLimit} onSelect={onQuantChoice} />

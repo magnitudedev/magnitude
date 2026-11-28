@@ -7,6 +7,7 @@ import { HuggingFaceLogo, LabLogo, type ModelLab } from "../model-logo"
 import { Badge, LabMark, cardClass } from "./parts"
 import { OfferedModelsSkeleton } from "./skeletons"
 import { ExpandingModel, type OfferedModel } from "./expanding-model"
+import type { Recommendation } from "./recommendations"
 import type { QuantView } from "./view"
 
 /** A family Magnitude runs, as the "What runs in Magnitude" list names it. */
@@ -61,10 +62,10 @@ export type ExploreMore =
   | null
 
 export type ExploreResults =
-  | { readonly _tag: "Idle" }
-  | { readonly _tag: "Searching" }
-  | { readonly _tag: "Results"; readonly rows: readonly ExploreRow[]; readonly more: ExploreMore }
-  | { readonly _tag: "Failed"; readonly message: string }
+  | { readonly _tag: "Idle"; readonly picks?: readonly Recommendation[]; readonly loadingPicks?: boolean }
+  | { readonly _tag: "Searching"; readonly picks?: readonly Recommendation[] }
+  | { readonly _tag: "Results"; readonly picks?: readonly Recommendation[]; readonly rows: readonly ExploreRow[]; readonly more: ExploreMore }
+  | { readonly _tag: "Failed"; readonly picks?: readonly Recommendation[]; readonly message: string }
 
 /** The end of a batch of results: reaching it asks for the next batch. */
 function NextPage({ onReach }: { onReach: () => void }) {
@@ -137,14 +138,20 @@ function UncheckedCard({ name, lab, gated, retrying, retry }: { name: string; la
 }
 
 /** Before a search: what the results will be and where they come from. */
-export function ExploreIdle() {
+export function ExploreIdle({ withPicks = false }: { withPicks?: boolean }) {
+  if (withPicks) {
+    return <div className="mt-3 flex flex-col items-center gap-2 rounded-xl border border-dashed border-slate-200 px-6 py-8 text-center dark:border-slate-750">
+      <HuggingFaceLogo className="size-6" />
+      <p className="text-[13px] text-slate-500">Or search for anything else — Hugging Face results show here</p>
+    </div>
+  }
   return <div className={cn(cardClass, "flex flex-col items-center gap-3 px-6 py-12 text-center")}>
     <HuggingFaceLogo className="size-8" />
     <p className="text-[13px] text-slate-500">Results from Hugging Face show here</p>
   </div>
 }
 
-/** Explore models, a view of the Models page: a search of Hugging Face, each result opening in place to its quants. */
+/** Explore models, a view of the Models page: curated Magnitude Picks in idle & matching search, plus Hugging Face search. */
 export function ExploreView({ query, setQuery, results, families, owned, download, drafters, useOpened, onExpand, onPrefetch }: {
   query: string; setQuery: (value: string) => void
   results: ExploreResults; families: readonly RunnableFamily[]; owned: ReadonlySet<string>; download: (model: OfferedModel, quant: QuantView) => ReactNode
@@ -161,17 +168,37 @@ export function ExploreView({ query, setQuery, results, families, owned, downloa
     setExpanded(next)
     onExpand?.(next !== null && !model.catalog ? next : null)
   }
-  const card = (model: OfferedModel, note?: string, prefetched = false) => <OfferedCard key={model.key} model={model} note={note} expanded={expanded === model.key} owned={owned}
+  const card = (model: OfferedModel, note?: string, prefetched = false, featured = false) => <OfferedCard key={model.key} model={model} note={note} featured={featured} expanded={expanded === model.key} owned={owned}
     prefetched={prefetched} onPrefetch={onPrefetch} onToggle={() => toggleExpanded(model)} quantChoice={quantChoices[model.key] ?? null}
     onQuantChoice={key => setQuantChoices(choices => ({ ...choices, [model.key]: key }))} download={download} drafters={drafters} useOpened={useOpened} />
+  const picks = results.picks ?? []
+  const pickCards = picks.length > 0
+    ? <div className="space-y-2">{picks.map(({ model, note }) => card(model, note, false, true))}</div>
+    : null
+  const selectQuery = (next: string) => {
+    setQuery(next)
+    setExpanded(undefined)
+    onExpand?.(null)
+  }
   const body = <>
-    {results._tag === "Idle" && <ExploreIdle />}
+    {results._tag === "Idle" && (
+      results.loadingPicks ? <OfferedModelsSkeleton count={3} />
+        : pickCards ? <>
+          {pickCards}
+          <ExploreIdle withPicks />
+        </> : <ExploreIdle />
+    )}
     {results._tag === "Searching" && <>
+      {pickCards && <div className="mb-4">{pickCards}</div>}
       <SearchStatus>Searching Hugging Face…</SearchStatus>
-      <OfferedModelsSkeleton />
+      <OfferedModelsSkeleton count={pickCards ? 2 : 3} />
     </>}
-    {results._tag === "Failed" && <p className="text-[13px] text-red-600 dark:text-red-400">{results.message}</p>}
+    {results._tag === "Failed" && <>
+      {pickCards && <div className="mb-4">{pickCards}</div>}
+      <p className="text-[13px] text-red-600 dark:text-red-400">{results.message}</p>
+    </>}
     {results._tag === "Results" && <>
+      {pickCards && <div className={results.rows.length > 0 ? "mb-2" : "mb-4"}>{pickCards}</div>}
       {results.rows.length > 0 ? <>
         <div className="space-y-2">{results.rows.map(row => row._tag === "Unchecked"
           ? <UncheckedCard key={row.key} name={row.name} lab={row.lab} gated={row.gated} retrying={row.retrying} retry={row.retry} />
@@ -182,23 +209,27 @@ export function ExploreView({ query, setQuery, results, families, owned, downloa
           : results.more?._tag === "Manual" ? <div className="mt-2 flex justify-center"><Button variant="ghost" size="sm" onClick={results.more.onMore}>More results</Button></div>
           : null}
       </> : results.more?._tag === "Loading" || results.more?._tag === "Checking" ? <>
-        <SearchStatus>Checking models…</SearchStatus>
-        <OfferedModelsSkeleton />
+        <SearchStatus>{pickCards ? "Checking Hugging Face models…" : "Checking models…"}</SearchStatus>
+        <OfferedModelsSkeleton count={pickCards ? 2 : 3} />
       </> : results.more?._tag === "Manual" ? <div>
         <p className="max-w-lg text-[13px] text-slate-500">
-          No models in the most downloaded Hugging Face results for “{query.trim()}” run in Magnitude yet. {runnableSummary(families)}
+          {pickCards
+            ? `No other models in the most downloaded Hugging Face results for “${query.trim()}” run in Magnitude yet.`
+            : `No models in the most downloaded Hugging Face results for “${query.trim()}” run in Magnitude yet. ${runnableSummary(families)}`}
         </p>
         <div className="mt-3"><Button variant="outline" size="sm" onClick={results.more.onMore}>Check more results</Button></div>
       </div> : <p className="max-w-lg text-[13px] text-slate-500">
-        No models on Hugging Face that run in Magnitude match “{query.trim()}”. {runnableSummary(families)}
+        {pickCards
+          ? `No other models on Hugging Face match “${query.trim()}”.`
+          : `No models on Hugging Face that run in Magnitude match “${query.trim()}”. ${runnableSummary(families)}`}
       </p>}
     </>}
   </>
   return <div>
     <div className="relative mb-5">
       <MagnifyingGlassIcon className="pointer-events-none absolute left-3 top-1/2 size-4 -translate-y-1/2 text-slate-400" />
-      <Input autoFocus value={query} onChange={event => { setQuery(event.target.value); setExpanded(undefined); onExpand?.(null) }} placeholder="Search Hugging Face, or paste a link" className="h-10 bg-white pl-9 text-sm dark:bg-slate-850" />
-      {query && <button type="button" aria-label="Clear search" onClick={() => { setQuery(""); setExpanded(undefined); onExpand?.(null) }} className="absolute right-3 top-1/2 -translate-y-1/2 text-slate-400 hover:text-slate-700 dark:hover:text-slate-200"><XIcon className="size-4" /></button>}
+      <Input autoFocus value={query} onChange={event => selectQuery(event.target.value)} placeholder="Search Hugging Face, or paste a link" className="h-10 bg-white pl-9 text-sm dark:bg-slate-850" />
+      {query && <button type="button" aria-label="Clear search" onClick={() => selectQuery("")} className="absolute right-3 top-1/2 -translate-y-1/2 text-slate-400 hover:text-slate-700 dark:hover:text-slate-200"><XIcon className="size-4" /></button>}
     </div>
     {body}
   </div>

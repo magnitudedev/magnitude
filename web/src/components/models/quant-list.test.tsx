@@ -192,4 +192,49 @@ describe("visibleLadderRungs", () => {
     expect(html.indexOf("16.8M")).toBeLessThan(html.indexOf("unsloth"))
     expect(html.indexOf("unsloth")).toBeLessThan(html.indexOf("25 quants"))
   })
+
+  it("renders featured Magnitude Pick cards with an accent border, badge, quant count, drafter, and Best bit-width label", () => {
+    const q4: QuantView = {
+      key: "qwen3.8-27b:gguf:q4",
+      bits: 4,
+      publisher: "unsloth",
+      name: "UD-Q4_K_XL",
+      repository: "unsloth/Qwen3.8-27B-GGUF",
+      sizeBytes: 16.2e9,
+      downloadBytes: 16.2e9,
+      drafterBytes: 1.1e9,
+      drafterTarget: null,
+      fits: true,
+      measuring: false,
+      speed: 42,
+      phrase: "Fits in memory",
+      placement: [{ kind: "Unified", bytes: 16.2e9 }],
+      servedContext: 131_072,
+      quality: null,
+      missingDiskBytes: 0,
+    }
+    const q6: QuantView = { ...q4, key: "qwen3.8-27b:gguf:q6", bits: 6, name: "UD-Q6_K_XL", sizeBytes: 22e9, downloadBytes: 22e9 }
+    const offered: OfferedModel = {
+      key: "qwen3.8-27b",
+      catalog: true,
+      name: "Qwen3.8 27B",
+      lab: undefined,
+      country: "CN",
+      fineTuneOf: null,
+      drafter: { method: "DFlash 2", sizeBytes: 1.1e9 },
+      contextLimit: 131_072,
+      quants: [q4, q6],
+      recommended: q4.key,
+      checking: false,
+    }
+    const html = renderToStaticMarkup(
+      <ExpandingModel model={offered} note="Smartest that runs well here" featured expanded={false} onToggle={() => {}} quantChoice={null} onQuantChoice={() => {}} owned={new Set()} />,
+    )
+    expect(html).toContain("Magnitude Pick")
+    expect(html).toContain("border-blue-300")
+    expect(html).toContain("Smartest that runs well here")
+    expect(html).toContain("2 quants")
+    expect(html).toContain("DFlash 2 drafter")
+    expect(html).toContain("Best: 4-bit")
+  })
 })

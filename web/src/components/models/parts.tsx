@@ -301,17 +301,24 @@ export function MachineCard({ machine }: { machine: MachineView }) {
 }
 
 /** A selectable model card whose header summarizes the chosen quant and whose body opens in place. */
-export function ModelCardShell({ lab, title, note, detail, quant, sizeLabel = "on disk", disclosure = "check", active, onSelect, children }: {
-  lab: ModelLab | undefined; title: string; note?: string | undefined; detail: ReactNode; quant: QuantView
-  sizeLabel?: ReactNode; disclosure?: "check" | "chevron"; active: boolean; onSelect: () => void; children?: ReactNode
+export function ModelCardShell({ lab, title, badge, note, detail, quant, sizeLabel = "on disk", disclosure = "check", featured = false, active, onSelect, children }: {
+  lab: ModelLab | undefined; title: string; badge?: ReactNode; note?: string | undefined; detail: ReactNode; quant: QuantView
+  sizeLabel?: ReactNode; disclosure?: "check" | "chevron"; featured?: boolean; active: boolean; onSelect: () => void; children?: ReactNode
 }) {
-  return <div className={cn("overflow-hidden rounded-xl border bg-white dark:bg-slate-850", active ? "border-blue-600 ring-1 ring-blue-600/30 dark:border-blue-400" : "border-slate-200 hover:border-slate-300 dark:border-slate-750 dark:hover:border-slate-700")}>
+  return <div className={cn(
+    "overflow-hidden rounded-xl border bg-white transition-colors dark:bg-slate-850",
+    active
+      ? "border-blue-600 ring-1 ring-blue-600/30 dark:border-blue-400"
+      : featured
+        ? "border-blue-300 hover:border-blue-400 dark:border-blue-500/45 dark:hover:border-blue-400/70"
+        : "border-slate-200 hover:border-slate-300 dark:border-slate-750 dark:hover:border-slate-700",
+  )}>
     {/* The card opens from a button laid over it, so the repository link in its line is beside the button, not inside it. */}
     <div className="relative grid w-full grid-cols-[auto_minmax(0,1fr)_auto] items-center gap-4 px-4 py-3 text-left [&_a]:relative [&_a]:z-10">
       <button type="button" aria-expanded={active} aria-label={title} onClick={onSelect} className="absolute inset-0 cursor-pointer rounded-[inherit] focus-visible:outline-2 focus-visible:-outline-offset-2 focus-visible:outline-blue-500" />
       <LabMark lab={lab} className="size-10" />
       <span className="min-w-0">
-        <span className="flex items-center gap-2 text-[14px] font-medium"><span className="max-w-full shrink-0 truncate">{title}</span>{note && <span className="min-w-0 truncate text-xs font-normal text-slate-500">{note}</span>}</span>
+        <span className="flex items-center gap-2 text-[14px] font-medium"><span className="max-w-full shrink-0 truncate">{title}</span>{badge}{note && <span className="min-w-0 truncate text-xs font-normal text-slate-500">{note}</span>}</span>
         <span className="mt-0.5 flex min-w-0 items-center gap-1.5 truncate text-xs text-slate-500">{detail}</span>
       </span>
       <span className="flex items-center gap-4">
