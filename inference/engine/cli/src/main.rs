@@ -62,7 +62,9 @@ const USAGE: &str = "magnitude-engine --model TARGET.gguf [--projector PROJECTOR
 [--output-capacity N] [--prefill-tokens N] [--method auto|plain|mtp|dflash|dspark|dflash2|lilicorr] [--mtp-proposals N] [--draft-budget JSON|adaptive] \
 [--kv-codec dense|affine-k8v4] [--numerical-profile JSON_FILE] [--lookahead on|off] [--weight-cap BYTES | --device-room BYTES] [--telemetry URL] \
 [--device auto|metal|cuda|vulkan|cpu|SELECTOR] [--cache-dir DIR] \
-[--tuning-budget SECONDS] [--fresh-tuning] [--tuning-trace FILE]";
+[--tuning-budget SECONDS] [--fresh-tuning] [--tuning-trace FILE]\n\
+  --device-room BYTES  Limit device weight placement, not total device memory.\n\
+  --weight-cap BYTES   Limit weight placement across device and host memory.";
 
 /// The load's one weight bound, `given`: `--weight-cap` and `--device-room`
 /// bound the weights in ways of their own, so a load takes one of them.
