@@ -1,7 +1,8 @@
 import { chmodSync, mkdirSync, mkdtempSync, writeFileSync } from "node:fs"
 import { tmpdir } from "node:os"
 import { dirname, join } from "node:path"
-import { describe, expect, it } from "vitest"
+import { afterEach, describe, expect, it, vi } from "vitest"
+import * as executable from "../executable"
 import { findOpenCodeDesktopInstallation } from "./opencode"
 
 const touch = (file: string, executable = false) => {
@@ -9,6 +10,17 @@ const touch = (file: string, executable = false) => {
   writeFileSync(file, "")
   if (executable) chmodSync(file, 0o755)
 }
+
+const restrictTo = (root: string) => {
+  const real = executable.isExecutableFile
+  vi.spyOn(executable, "isExecutableFile").mockImplementation((path, platform) =>
+    path.startsWith(root) && real(path, platform),
+  )
+}
+
+afterEach(() => {
+  vi.restoreAllMocks()
+})
 
 describe("findOpenCodeDesktopInstallation", () => {
   it("detects OpenCode Windows desktop app in LOCALAPPDATA without probing GUI --version", () => {
@@ -78,6 +90,7 @@ describe("findOpenCodeDesktopInstallation", () => {
 
   it("detects OpenCode macOS app bundle sidecar and GUI fallback in ~/Applications", () => {
     const home = mkdtempSync(join(tmpdir(), "magnitude-opencode-mac-"))
+    restrictTo(home)
     const gui = join(home, "Applications", "OpenCode.app", "Contents", "MacOS", "OpenCode")
     touch(gui, true)
 
@@ -95,6 +108,7 @@ describe("findOpenCodeDesktopInstallation", () => {
 
   it("detects standalone ~/.opencode/bin/opencode on Linux and returns undefined when absent", () => {
     const home = mkdtempSync(join(tmpdir(), "magnitude-opencode-linux-"))
+    restrictTo(home)
     expect(findOpenCodeDesktopInstallation({ platform: "linux", environment: {}, home })).toBeUndefined()
 
     const cli = join(home, ".opencode", "bin", "opencode")
