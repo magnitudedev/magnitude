@@ -116,6 +116,8 @@ pub(crate) struct HeaderCache {
     written: Arc<AtomicU64>,
     /// Whether this process's cache has evicted once.
     evicted: Arc<AtomicBool>,
+    /// Whether a background eviction is already in flight for this cache.
+    evicting: Arc<AtomicBool>,
     /// This cache's pins as the store holds them, from the first [`HeaderCache::pin`].
     pins: Arc<Mutex<Option<Pins>>>,
 }
@@ -146,6 +148,7 @@ impl HeaderCache {
             grace,
             written: Arc::new(AtomicU64::new(0)),
             evicted: Arc::new(AtomicBool::new(false)),
+            evicting: Arc::new(AtomicBool::new(false)),
             pins: Arc::new(Mutex::new(None)),
         }
     }
@@ -201,7 +204,25 @@ impl HeaderCache {
     /// the store's lock held shared.
     fn assemble(&self, shared: &seismic_io::Shared<'_>, recipe: &[u8]) -> Option<Vec<u8>> {
         let (segments, mut inline) = parse_recipe(recipe)?;
-        let mut header = Vec::new();
+        let mut total = 0_usize;
+        let mut inline_total = 0_usize;
+        for segment in &segments {
+            let length = match *segment {
+                Segment::Inline(length) => {
+                    inline_total = inline_total.checked_add(length)?;
+                    length
+                }
+                Segment::Chunk { length, .. } => length,
+            };
+            total = total.checked_add(length)?;
+            if total > HEADER_LIMIT {
+                return None;
+            }
+        }
+        if inline_total != inline.len() {
+            return None;
+        }
+        let mut header = Vec::with_capacity(total);
         for segment in segments {
             match segment {
                 Segment::Inline(length) => {
@@ -216,9 +237,6 @@ impl HeaderCache {
                     }
                     header.extend_from_slice(&chunk);
                 }
-            }
-            if header.len() > HEADER_LIMIT {
-                return None;
             }
         }
         inline.is_empty().then_some(header)
@@ -341,10 +359,40 @@ impl HeaderCache {
             }
             self.written.fetch_add(written, Ordering::Relaxed);
         }
-        if !self.evicted.load(Ordering::Relaxed) || self.written.load(Ordering::Relaxed) >= self.capacity / 8 {
-            self.evict();
+        if !self.evicted.load(Ordering::Relaxed)
+            || self.written.load(Ordering::Relaxed) >= self.capacity / 8
+        {
+            self.schedule_eviction();
         }
         digest
+    }
+
+    /// Runs eviction off the write path when inside a Tokio runtime so callers never hold
+    /// shared-tokenizer claims or block incoming search checks on cache housekeeping; falls back
+    /// to synchronous eviction outside an async runtime.
+    fn schedule_eviction(&self) {
+        let Ok(handle) = tokio::runtime::Handle::try_current() else {
+            self.evict();
+            return;
+        };
+        if self
+            .evicting
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_err()
+        {
+            return;
+        }
+        let cache = self.clone();
+        handle.spawn_blocking(move || {
+            struct Reset(Arc<AtomicBool>);
+            impl Drop for Reset {
+                fn drop(&mut self) {
+                    self.0.store(false, Ordering::Release);
+                }
+            }
+            let _reset = Reset(Arc::clone(&cache.evicting));
+            cache.evict();
+        });
     }
 
     /// Headers holding a large entry whose fixed part (key, type and element count) is `head`, from
@@ -366,7 +414,7 @@ impl HeaderCache {
         String::from_utf8_lossy(&list)
             .lines()
             .filter_map(|digest| self.read(digest))
-            .take(MAX_HEAD_REFERENCES)
+            .take(1)
             .collect()
     }
 
@@ -497,15 +545,16 @@ impl HeaderCache {
 /// which entries share; a file in the recipes that names no header, unreachable. A recipe whose
 /// table does not parse (a damaged one, or one of another recipe version a build sharing the cache
 /// writes) references nothing and is evicted as any other, least recently used first. The kernel
-/// cache under the root is a store of its own, apart; everything else under the root (the head
-/// lists, the indexes, the workspaces) is kept.
+/// cache under the root is a store of its own, apart; `indexes` is not managed by header eviction
+/// and can hold tens of thousands of entries, so it is left apart too rather than walked under the
+/// exclusive store lock. Everything else under the root (head lists, pins, workspaces) is kept.
 struct Headers<'a> {
     pinned: &'a BTreeSet<String>,
 }
 
 impl Layout for Headers<'_> {
     fn place(&self, path: &Path, _: &Examining<'_>) -> Eviction {
-        if path == Path::new(KERNELS) {
+        if path == Path::new(KERNELS) || path == Path::new("indexes") {
             return Eviction::Apart;
         }
         if path == Path::new("blobs") || path == Path::new(RECIPES) || path == Path::new(CHUNKS) {
@@ -1052,5 +1101,18 @@ mod tests {
         });
         let list = second.store.read(&record, HEADS_INDEX_BYTES).unwrap().unwrap();
         assert_eq!(String::from_utf8(list).unwrap(), format!("{b}\n{a}"), "the second lists itself before the first, which it read");
+    }
+
+    #[test]
+    fn eviction_leaves_indexes_apart_without_walking_them() {
+        let directory = tempfile::tempdir().unwrap();
+        let indexes = directory.path().join("indexes").join("inspections");
+        fs::create_dir_all(&indexes).unwrap();
+        let marker = indexes.join("stale.tmp");
+        fs::write(&marker, b"untouched").unwrap();
+        let cache = cache(directory.path(), 0, Duration::ZERO);
+        let digest = cache.write(&header("Model A", 20_000));
+        assert!(!cache.contains(&digest), "header itself is evicted at zero capacity");
+        assert!(marker.exists(), "indexes directory is left apart and never walked by header eviction");
     }
 }

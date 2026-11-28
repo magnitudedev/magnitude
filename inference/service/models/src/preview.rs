@@ -112,6 +112,7 @@ impl HuggingFaceDiscovery {
             "sha",
             "lastModified",
             "downloads",
+            "downloadsAllTime",
             "likes",
             "tags",
             "private",
@@ -549,6 +550,8 @@ struct HubSearchModel {
     last_modified: Option<String>,
     #[serde(default)]
     downloads: Option<u64>,
+    #[serde(default, rename = "downloadsAllTime")]
+    downloads_all_time: Option<u64>,
     #[serde(default)]
     likes: Option<u64>,
     #[serde(default)]
@@ -594,7 +597,7 @@ impl HubSearchModel {
             repository: self.id,
             commit: immutable_commit(self.sha?)?,
             last_modified: self.last_modified,
-            downloads: self.downloads,
+            downloads: self.downloads_all_time.or(self.downloads),
             likes: self.likes,
             gated: hub_gated(self.gated.as_ref()),
             private: self.private.unwrap_or(false),
@@ -1275,13 +1278,21 @@ impl ManagedModelStore {
             .workspace()
             .map_err(|error| InventoryError::Io(error.to_string()))?;
         for cached in &artifact.components {
-            let bytes = self
-                .cache
-                .read_header(&cached.header_digest)
-                .or_else(|| cached.acquired_header.clone())
-                .ok_or_else(|| InventoryError::Internal("preview header cache miss".to_owned()))?;
+            let loaded;
+            let bytes: &[u8] = match &cached.acquired_header {
+                Some(bytes) => bytes,
+                None => {
+                    loaded = self
+                        .cache
+                        .read_header(&cached.header_digest)
+                        .ok_or_else(|| {
+                            InventoryError::Internal("preview header cache miss".to_owned())
+                        })?;
+                    &loaded
+                }
+            };
             write_header_file(
-                &bytes,
+                bytes,
                 cached.component.size_bytes,
                 &workspace.path().join(&cached.component.path),
             )?;

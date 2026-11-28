@@ -456,12 +456,18 @@ fn read_bounded(path: &Path, largest: u64) -> Result<Option<Vec<u8>>, StoreError
     if !metadata.is_file() {
         return Err(StoreError::NotAFile { path: path.to_owned() });
     }
+    if metadata.len() > largest {
+        return Err(StoreError::TooLarge { path: path.to_owned(), len: metadata.len(), limit: largest });
+    }
     let file = match File::open(path).map_err(PathError::classify) {
         Ok(file) => file,
         Err(PathError::Absent(_)) => return Ok(None),
         Err(error) => return Err(StoreError::io("open", path, error.into_io())),
     };
-    let mut bytes = Vec::new();
+    // Pre-size from the file's length (+ 1 for the final EOF read) so large blobs never cascade
+    // through `realloc` / `vm_copy` growth steps under `Take::read_to_end`.
+    let initial = usize::try_from(metadata.len()).unwrap_or(0).saturating_add(1);
+    let mut bytes = Vec::with_capacity(initial);
     file.take(largest.saturating_add(1))
         .read_to_end(&mut bytes)
         .map_err(|source| StoreError::io("read", path, source))?;

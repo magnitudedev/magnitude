@@ -1967,62 +1967,116 @@ impl ManagedModelCandidates {
             .into_iter()
             .filter(|group| !is_projector_name(&group.primary().path))
             .collect::<Vec<_>>();
-        order.sort_by_key(|group| std::cmp::Reverse(group.size_bytes()));
+        // Quantized versions first (largest first), then full precision (largest first):
+        // `recommended_version` prefers any fitting quant over BF16/F16/F32, so assessing quants
+        // first settles in the opening batch instead of spending it on unquantized files.
+        order.sort_by_key(|group| {
+            (
+                full_precision_name(&group.primary().path),
+                std::cmp::Reverse(group.size_bytes()),
+            )
+        });
+        let mut reference: Option<Vec<u8>> = {
+            let store = Arc::clone(self.models());
+            let repository = snapshot.repository.clone();
+            let commit = snapshot.commit.clone();
+            let files = snapshot.gguf_files.clone();
+            magnitude_service_utils::blocking::run(move || {
+                files.iter().find_map(|file| {
+                    store.hugging_face_reference_header(&repository, &commit, file)
+                })
+            })
+            .await
+        };
         let mut assessed: Vec<(ClassifiedGroup, Option<CachedModelAssessment>)> = Vec::new();
         for batch in order.chunks(SEARCH_RECOMMENDATION_BATCH) {
-            let checks = batch.iter().cloned().map(|group| async {
-                let read = std::time::Instant::now();
-                let classified = self
-                    .classify_hugging_face_group(&snapshot, group, &[])
-                    .await
-                    .ok()?;
-                let read_ms = read.elapsed().as_millis();
-                if !matches!(classified.role, CandidateFileRole::Target { .. }) {
-                    return None;
+            let references = reference.as_deref().into_iter().collect::<Vec<_>>();
+            let snapshot_ref = &snapshot;
+            let checks = batch.iter().cloned().map(|group| {
+                let references = &references;
+                async move {
+                    let read = std::time::Instant::now();
+                    let classified = self
+                        .classify_hugging_face_group(snapshot_ref, group, references)
+                        .await
+                        .ok()?;
+                    let read_ms = read.elapsed().as_millis();
+                    if !matches!(classified.role, CandidateFileRole::Target { .. }) {
+                        return None;
+                    }
+                    let assess = std::time::Instant::now();
+                    let shard_paths = classified
+                        .group
+                        .files
+                        .iter()
+                        .map(|file| file.path.clone())
+                        .collect::<Vec<_>>();
+                    let identity = self
+                        .cached_hugging_face_identity(snapshot_ref, &classified.group, None)
+                        .await;
+                    let assessment = self
+                        .version_assessment(
+                            &classified,
+                            identity,
+                            self.hugging_face_target(snapshot_ref, shard_paths, None),
+                        )
+                        .await;
+                    tracing::debug!(
+                        repository = %snapshot_ref.repository,
+                        version = %classified.group.primary().path.display(),
+                        read_ms,
+                        assess_ms = assess.elapsed().as_millis(),
+                        "search recommendation version"
+                    );
+                    Some((classified, assessment))
                 }
-                let assess = std::time::Instant::now();
-                let shard_paths = classified
-                    .group
-                    .files
-                    .iter()
-                    .map(|file| file.path.clone())
-                    .collect::<Vec<_>>();
-                let identity = self
-                    .cached_hugging_face_identity(&snapshot, &classified.group, None)
-                    .await;
-                let assessment = self
-                    .version_assessment(
-                        &classified,
-                        identity,
-                        self.hugging_face_target(&snapshot, shard_paths, None),
-                    )
-                    .await;
-                tracing::debug!(
-                    repository = %snapshot.repository,
-                    version = %classified.group.primary().path.display(),
-                    read_ms,
-                    assess_ms = assess.elapsed().as_millis(),
-                    "search recommendation version"
-                );
-                Some((classified, assessment))
             });
             assessed.extend(futures_util::future::join_all(checks).await.into_iter().flatten());
+            if reference.is_none()
+                && let Some(first_file) = assessed
+                    .iter()
+                    .find_map(|(group, _)| snapshot_file(&snapshot, &group.group.primary().path).ok().cloned())
+            {
+                let store = Arc::clone(self.models());
+                let repository = snapshot.repository.clone();
+                let commit = snapshot.commit.clone();
+                reference = magnitude_service_utils::blocking::run(move || {
+                    store.hugging_face_reference_header(&repository, &commit, &first_file)
+                })
+                .await;
+            }
             let best = recommended_version(
                 assessed.iter().map(|(group, assessment)| (group, assessment.as_ref())),
             );
             // Largest first: once the best so far is a quant held in memory, served at a working
-            // context, that keeps up, every version not yet assessed is smaller, so none can beat
-            // it.
+            // context, that keeps up (or, before speed measurements exist, is Q4_K-class, matching
+            // `recommended_version`), every version not yet assessed is smaller, so none can beat
+            // it. Likewise, when every target in the opening batch is refused for a model-wide
+            // header reason (architecture, unrecognized tensor, tied output head, etc.), smaller
+            // quants of the same model carry the same refusal.
             let settled = best.is_some_and(|index| {
                 !full_precision(&assessed[index].0)
                     && matches!(
                         assessed[index].1.as_ref().map(|assessment| &assessment.profile),
                         Some(ModelAssessment::Fits { profile, served, residency: residency @ ModelResidency::Resident { .. }, .. })
                             if working_context(profile, served)
-                                && comparison_speed(served, residency).is_some_and(|speed| speed >= TARGET_TOKENS_PER_SECOND)
+                                && match comparison_speed(served, residency) {
+                                    Some(speed) => speed >= TARGET_TOKENS_PER_SECOND,
+                                    None => assessed[index]
+                                        .0
+                                        .quantization
+                                        .as_deref()
+                                        .is_some_and(is_q4_k_class),
+                                }
                     )
             });
-            if settled {
+            let refused_model_wide = !assessed.is_empty()
+                && assessed.iter().all(|(_, assessment)| {
+                    assessment
+                        .as_ref()
+                        .is_some_and(|assessment| is_model_wide_unsupported(&assessment.profile))
+                });
+            if settled || refused_model_wide {
                 break;
             }
         }
@@ -5214,10 +5268,65 @@ fn recommended_version<'a>(
         .map(|candidate| candidate.0)
 }
 
+/// Whether a version label names unquantized floats: 16 or 32 bits.
+fn is_full_precision_label(label: &str) -> bool {
+    let label = label.to_ascii_uppercase();
+    ["BF16", "F16", "FP16", "F32", "FP32"]
+        .iter()
+        .any(|kind| label == *kind || label.ends_with(&format!("-{kind}")))
+}
+
 /// Whether a version's weights are unquantized floats: 16 or 32 bits.
 fn full_precision(group: &ClassifiedGroup) -> bool {
-    let label = version_label(&group.group.primary().path, group.quantization.as_deref()).to_ascii_uppercase();
-    ["BF16", "F16", "FP16", "F32", "FP32"].iter().any(|kind| label == *kind || label.ends_with(&format!("-{kind}")))
+    is_full_precision_label(&version_label(
+        &group.group.primary().path,
+        group.quantization.as_deref(),
+    ))
+}
+
+/// Whether a GGUF's filename labels it as unquantized floats, used only to order search reads
+/// after quantized candidates; headers still decide every version's classification and verdict.
+fn full_precision_name(path: &Path) -> bool {
+    is_full_precision_label(&version_label(path, None))
+}
+
+/// Whether `reason` holds for every quantization of a model (architecture, tensor layout,
+/// metadata, tokenizer, chat template, backend) rather than a single file's weight types or
+/// corruption.
+fn is_model_wide_refusal(
+    reason: &magnitude_service_contracts::models::UnsupportedReason,
+) -> bool {
+    use magnitude_service_contracts::models::{KnownUnsupportedReason, UnsupportedReason};
+    match reason {
+        UnsupportedReason::Known(known) => match known {
+            KnownUnsupportedReason::Architecture { .. }
+            | KnownUnsupportedReason::RopeScaling { .. }
+            | KnownUnsupportedReason::UnrecognizedTensor { .. }
+            | KnownUnsupportedReason::UnrecognizedMetadata { .. }
+            | KnownUnsupportedReason::MissingMetadata { .. }
+            | KnownUnsupportedReason::Tokenizer { .. }
+            | KnownUnsupportedReason::ChatTemplate
+            | KnownUnsupportedReason::Backend { .. }
+            | KnownUnsupportedReason::TiedOutputHead
+            | KnownUnsupportedReason::DraftArchitecture { .. } => true,
+            KnownUnsupportedReason::WeightTypes { .. }
+            | KnownUnsupportedReason::KernelDomain { .. }
+            | KnownUnsupportedReason::TargetMismatch { .. }
+            | KnownUnsupportedReason::Unreadable
+            | KnownUnsupportedReason::UnsupportedFormat => false,
+        },
+        UnsupportedReason::Unrecognized(_) => false,
+    }
+}
+
+/// Whether `assessment` is a model-wide header refusal rather than a per-quant weight or file
+/// failure.
+fn is_model_wide_unsupported(assessment: &ModelAssessment) -> bool {
+    matches!(
+        assessment,
+        ModelAssessment::Unsupported { reasons, .. }
+            if reasons.iter().any(is_model_wide_refusal)
+    )
 }
 
 /// The decode speed recommendations compare: the estimate at the depth nearest
@@ -6109,5 +6218,45 @@ mod tests {
             resolve_fingerprint_match(&qwen36_different_tok, &catalog, &matched),
             Some(qwen35)
         );
+    }
+
+    #[test]
+    fn full_precision_name_orders_quantized_files_before_reference_floats() {
+        assert!(full_precision_name(Path::new("BF16/model-BF16-00001-of-00002.gguf")));
+        assert!(full_precision_name(Path::new("model-f16.gguf")));
+        assert!(full_precision_name(Path::new("model-FP32.gguf")));
+        assert!(!full_precision_name(Path::new("model-Q8_0.gguf")));
+        assert!(!full_precision_name(Path::new("model-UD-Q4_K_XL.gguf")));
+    }
+
+    #[test]
+    fn model_wide_unsupported_distinguishes_header_refusals_from_weight_types() {
+        use magnitude_service_contracts::models::{
+            KnownUnsupportedReason, UnsupportedReason, WeightTypeCount,
+        };
+        let unsupported = |reason: KnownUnsupportedReason| ModelAssessment::Unsupported {
+            profile: None,
+            reasons: vec![UnsupportedReason::Known(reason)],
+            detail: String::new(),
+        };
+        assert!(is_model_wide_unsupported(&unsupported(
+            KnownUnsupportedReason::TiedOutputHead
+        )));
+        assert!(is_model_wide_unsupported(&unsupported(
+            KnownUnsupportedReason::UnrecognizedTensor {
+                name: "rope_freqs.weight".to_owned(),
+            }
+        )));
+        assert!(!is_model_wide_unsupported(&unsupported(
+            KnownUnsupportedReason::WeightTypes {
+                types: vec![WeightTypeCount {
+                    ggml_type: "IQ1_M".to_owned(),
+                    tensor_count: 1,
+                }],
+            }
+        )));
+        assert!(!is_model_wide_unsupported(&unsupported(
+            KnownUnsupportedReason::Unreadable
+        )));
     }
 }
