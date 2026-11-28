@@ -1,5 +1,17 @@
 # @magnitudedev/cli
 
+## 0.3.8
+
+### Patch Changes
+
+- [`070e365`](https://github.com/magnitudedev/magnitude/commit/070e36597f7f4c5316cd6225ea4c4ef9743a3aec) Thanks [@thrgreenwald](https://github.com/thrgreenwald)! - Improve Desktop Explore and Chat UI: show Magnitude Picks in Explore idle and search views, add Hugging Face sign-in and accept-terms actions on gated cards, show 30-day monthly downloads while fixing HF search stalls and card/quant stability, and add startup loading states for Chat and sidebar.
+
+- [`070e365`](https://github.com/magnitudedev/magnitude/commit/070e36597f7f4c5316cd6225ea4c4ef9743a3aec) Thanks [@thrgreenwald](https://github.com/thrgreenwald)! - Detect OpenCode desktop installations in harness connections even when `opencode` is not on `PATH` ([#312](https://github.com/magnitudedev/magnitude/issues/312)).
+
+- [#309](https://github.com/magnitudedev/magnitude/pull/309) [`5360997`](https://github.com/magnitudedev/magnitude/commit/5360997a3baace64c704cf8982ba12676d4419ef) Thanks [@najibninaba](https://github.com/najibninaba)! - Accept a per-request `cache_salt` that confines KV prefix cache reuse and in-flight prefill sharing to requests with the same salt.
+
+- [`070e365`](https://github.com/magnitudedev/magnitude/commit/070e36597f7f4c5316cd6225ea4c4ef9743a3aec) Thanks [@thrgreenwald](https://github.com/thrgreenwald)! - Fix Vulkan and Metal inference stability: expand repeat-block launch counts in `NativeGraphMetadata` ([#303](https://github.com/magnitudedev/magnitude/issues/303), [#308](https://github.com/magnitudedev/magnitude/issues/308), [#310](https://github.com/magnitudedev/magnitude/issues/310), [#314](https://github.com/magnitudedev/magnitude/issues/314)), charge first-block Vulkan allocations to the caller entry, and apply the discrete GPU elastic context cache reserve on Vulkan.
+
 ## 0.3.7
 
 ### Patch Changes
