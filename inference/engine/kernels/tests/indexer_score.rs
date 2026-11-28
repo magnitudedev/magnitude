@@ -637,3 +637,137 @@ fn indexer_score_at_deepseek_v41_prefill_shape_times() {
         );
     }
 }
+
+/// Check causal, ordered spans before timing and count the actual scores rather than padded output slots.
+fn checked_late_prefill_candidates(listed: &[Vec<[i32; 2]>], base: usize, width: usize) -> usize {
+    listed.iter().enumerate().map(|(row, spans)| {
+        let mut previous = 0;
+        let mut padded = false;
+        let mut candidates = 0;
+        for &[lo, hi] in spans {
+            if [lo, hi] == [-1, -1] {
+                padded = true;
+            } else {
+                assert!(!padded && previous <= lo && lo < hi && hi as usize <= base + row + 1);
+                candidates += (hi - lo) as usize;
+                previous = hi;
+            }
+        }
+        assert!(candidates <= width);
+        candidates
+    }).sum()
+}
+
+/// Native CUDA score time for contiguous causal rows and a bounded synthetic candidate pool.
+/// This measures the score kernel, not top-k or end-to-end prefill.
+#[test]
+#[ignore = "times native CUDA indexer scoring at late prefill; run it under a timed hold"]
+fn indexer_score_cuda_at_deepseek_v41_late_prefill_shape_times() {
+    let device = devices().into_iter().find(|device| device.backend() == seismic::BackendName::Cuda)
+        .expect("late-prefill CUDA indexer benchmark requires a CUDA device");
+    let charges = seismic::Charges::tally(&device);
+    let (blocks, block) = (2048usize, 8usize);
+    for (m, n) in [(768usize, 16_384usize), (768, 100_000), (768, 200_000),
+                   (1024, 16_384), (1024, 100_000), (1024, 200_000)] {
+        let base = n - m;
+        let own = |t: usize| vec![[0, (base + t + 1) as i32]];
+        let pool = |t: usize| {
+            let end = base + t + 1;
+            let covered = end.div_ceil(block);
+            let count = blocks.min(covered);
+            let recent = 32.min(count);
+            let historical = count - recent;
+            let historical_end = covered - recent;
+            let mut spans = (0..historical).map(|i| {
+                let lo = i * historical_end / historical;
+                let hi = (i + 1) * historical_end / historical;
+                let b = lo + (i.wrapping_mul(7919) % (hi - lo));
+                [(b * block) as i32, ((b + 1) * block) as i32]
+            }).collect::<Vec<_>>();
+            spans.extend((historical_end..covered).map(|b| [(b * block) as i32, ((b + 1) * block).min(end) as i32]));
+            spans.resize(blocks + 1, [-1, -1]);
+            spans
+        };
+        let lists: [(&str, usize, &dyn Fn(usize) -> Vec<[i32; 2]>); 2] = [
+            ("contiguous", n, &own), ("pooled", blocks * block, &pool),
+        ];
+        let mut random = Random(41);
+        let query = (0..m * H * W).map(|_| bf16_round(random.next() * 3.0)).collect::<Vec<_>>();
+        let weights = (0..m * H).map(|_| bf16_round(random.next())).collect::<Vec<_>>();
+        let keys = (0..n * W).map(|_| random.next()).collect::<Vec<_>>();
+        let coordinates = (n - m..n).flat_map(coordinates).collect::<Vec<_>>();
+        let (_slabs, plane) = plane(&device, Element::f32(), n, &keys);
+        let statics = [("H", H as u64), ("P", P as u64), ("S", S as u64), ("NQ", 0), ("HW", H as u64), ("RA", 1), ("RT", 1)]
+            .iter()
+            .fold(NativeSpecialization::new(), |spec, (name, value)| spec.with_static(*name, *value));
+        let query = tensor(&device, Element::bf16(), &[m as u64, H as u64, W as u64], &query);
+        let query_norm = tensor(&device, Element::f32(), &[0, W as u64], &[]);
+        let head_weights = tensor(&device, Element::bf16(), &[m as u64, H as u64], &weights);
+        let components = ints(&device, &[P as u64], &[0; P]);
+        let frequencies = tensor(&device, Element::f32(), &[P as u64], &frequencies());
+        let amplitudes = tensor(&device, Element::f32(), &[P as u64], &[1.0; P]);
+        let coordinates = ints(&device, &[m as u64, 4], &coordinates);
+        let form = Tensor::from_host(&charges, Element::i32(), &[0, 1, 1], &[]).unwrap();
+        for (name, width, list) in lists {
+            let listed = (0..m).map(list).collect::<Vec<_>>();
+            let candidates = checked_late_prefill_candidates(&listed, n - m, width);
+            let score_slots = ints(&device, &[0, width as u64], &[]);
+            let (spans, r) = span_table(&listed);
+            let spans = ints(&device, &[m as u64, r as u64, 2], &spans);
+            let point = seismic::TuningPoint {
+                label: format!("m{m}-n{n}-{name}"),
+                weight: 1.0,
+                class: None,
+                cost: 1.0,
+                workload: seismic::WorkloadRotation::All,
+                rotation: vec![indexer_score::Args {
+                    query: &query,
+                    query_norm: &query_norm,
+                    head_weights: &head_weights,
+                    rotary_components: &components,
+                    rotary_frequencies: &frequencies,
+                    rotary_amplitudes: &amplitudes,
+                    coordinates: &coordinates,
+                    keys: &plane,
+                    spans: &spans,
+                    score_slots: &score_slots,
+                    form: &form,
+                    scale: 1.0 / ((W * H) as f32).sqrt(),
+                    epsilon: EPSILON,
+                    block: INDEX.block,
+                    element: INDEX.element,
+                    rounding_scale: INDEX.scale,
+                    amax_floor: INDEX.amax_floor,
+                    slab_rows: SLAB_ROWS as u32,
+                }],
+                initialize: None,
+                written: Default::default(),
+            };
+            let result = indexer_score::native_tune_with(
+                &charges,
+                indexer_score::Elements { A: Element::bf16() },
+                &statics,
+                vec![point],
+                seismic::NumericalRequirement::RoundingSteps { alpha: 8., activation: Some(seismic::DType::BF16) },
+                seismic::Strategy::Survey(seismic::SurveyPlan {
+                    samples: 15,
+                    min_sample_seconds: 0.001,
+                    domains: Default::default(),
+                }),
+            )
+            .unwrap();
+            let [record] = &result.configurations[..] else {
+                panic!("{name}: the entry's one configuration surveys itself alone");
+            };
+            let seismic::Outcome::Measured { points, .. } = &record.outcome else {
+                panic!("{name}: the default is measured");
+            };
+            let median = points[0].median_seconds;
+            assert!(median.is_finite() && median > 0.0);
+            println!(
+                "indexer_score CUDA m={m} n={n} h={H} w={W} {name} width={width} spans={r} candidates={candidates}: {:.3} ms",
+                median * 1e3,
+            );
+        }
+    }
+}
