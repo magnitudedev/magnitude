@@ -102,16 +102,21 @@ pub(crate) fn scarcity_threshold(reclaim_band: u64, unit: u64, others_step: u64)
     reclaim_band.saturating_add(unit).saturating_add(others_step)
 }
 
-/// Elastic VRAM cache reserve for discrete CUDA devices so background
-/// expert-bank growth leaves enough free VRAM for an external process to
-/// retain a CUDA primary context (`cuDevicePrimaryCtxRetain`, ~258 MiB on A10G
-/// and ~300–450 MiB on RTX 4090/5090 or Seismic device open) and trigger
-/// Magnitude's live shrink path instead of failing immediately with
-/// `CUDA_ERROR_OUT_OF_MEMORY` (F-050).
+/// Elastic VRAM cache reserve for discrete GPU devices (CUDA and Vulkan) so
+/// background expert-bank growth leaves enough free VRAM for:
+/// - discrete CUDA: an external process retaining a CUDA primary context
+///   (`cuDevicePrimaryCtxRetain`, ~258 MiB on A10G and ~300–450 MiB on
+///   RTX 4090/5090 or Seismic device open) to trigger live shrink instead of
+///   failing immediately with `CUDA_ERROR_OUT_OF_MEMORY` (F-050);
+/// - discrete Vulkan: serving-time `Contract::Upload` argument chunks on
+///   ReBAR VRAM (`256 KiB` per chunk), driver pipeline/command-pool/scratch
+///   growth, and external graphics/compute clients instead of exhausting
+///   `allocatable()` right after post-load bank growth and failing with
+///   `device_lost`.
 ///
 /// Applied strictly to elastic bank cache sizing (`import_room`, `hold_room`,
 /// `target`), never to `budget()` / `room()` / resident model admission.
-pub(crate) fn cuda_context_cache_reserve(capacity: u64) -> u64 {
+pub(crate) fn discrete_device_cache_reserve(capacity: u64) -> u64 {
     const MIB: u64 = 1 << 20;
     const GIB: u64 = 1 << 30;
     if capacity < 4 * GIB {
@@ -154,9 +159,9 @@ pub struct Reading {
     /// `supply.free_beyond_target` (`0` on non-host device stores).
     reclaim_band: u64,
     /// Elastic-cache-only headroom reserved below `budget()` on discrete device
-    /// stores (e.g. CUDA primary-context headroom for external processes); `0`
-    /// on host stores and non-CUDA devices. Never subtracted from `budget()` or
-    /// resident admission `room()`.
+    /// stores (CUDA primary-context and Vulkan ReBAR upload/driver headroom);
+    /// `0` on host stores. Never subtracted from `budget()` or resident
+    /// admission `room()`.
     cache_reserve: u64,
     /// A unified device's grant over host RAM (§4.3).
     grant: Option<HostGrant>,

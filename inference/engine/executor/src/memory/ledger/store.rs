@@ -1299,7 +1299,9 @@ pub(crate) fn device_grant(
                 let capacity = topology.store(first.store()).expect("a path's store is of its revision").capacity().value;
                 let free = sample.grant.map_or_else(grant_from_status, |grant| grant.left);
                 let cache_reserve = match executor.backend() {
-                    seismic::BackendName::Cuda => crate::memory::supply::cuda_context_cache_reserve(capacity),
+                    seismic::BackendName::Cuda | seismic::BackendName::Vulkan => {
+                        crate::memory::supply::discrete_device_cache_reserve(capacity)
+                    }
                     _ => 0,
                 };
                 DeviceGrant::Own { capacity, free, cache_reserve }
@@ -1312,7 +1314,9 @@ pub(crate) fn device_grant(
                 };
                 let free = grant_from_status().min(capacity);
                 let cache_reserve = match executor.backend() {
-                    seismic::BackendName::Cuda => crate::memory::supply::cuda_context_cache_reserve(capacity),
+                    seismic::BackendName::Cuda | seismic::BackendName::Vulkan => {
+                        crate::memory::supply::discrete_device_cache_reserve(capacity)
+                    }
                     _ => 0,
                 };
                 DeviceGrant::Own { capacity, free, cache_reserve }

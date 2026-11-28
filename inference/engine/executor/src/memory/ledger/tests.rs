@@ -3035,15 +3035,17 @@ fn metal_working_set_left_reconciles_uncharged_metal_allocations() {
     );
 }
 
-/// Reproduces F-050 on discrete CUDA GPUs (A10G 23 GiB / RTX 4090 24.6 GiB):
-/// `Reading::with_cache_reserve` reserves `cuda_context_cache_reserve(capacity)`
-/// strictly from elastic bank cache sizing (`import_room`, `hold_room`,
-/// `target`) so background VRAM bank growth leaves enough free VRAM for an
-/// external CUDA process's `cuDevicePrimaryCtxRetain`, while leaving `budget`,
-/// `room`, `free`, and `allocatable` untouched for resident model admission.
+/// Reproduces F-050 on discrete CUDA/Vulkan GPUs (A10G 23 GiB / RTX 4090 /
+/// RTX A4000 16 GiB): `Reading::with_cache_reserve` reserves
+/// `discrete_device_cache_reserve(capacity)` strictly from elastic bank cache
+/// sizing (`import_room`, `hold_room`, `target`) so background VRAM bank growth
+/// leaves enough free VRAM for external CUDA primary contexts and Vulkan
+/// serving-time ReBAR `argument_chunk` / driver allocations, while leaving
+/// `budget`, `room`, `free`, and `allocatable` untouched for resident model
+/// admission.
 #[test]
-fn cuda_device_cache_reserve_bounds_elastic_bank_without_reducing_resident_admission() {
-    use crate::memory::supply::cuda_context_cache_reserve;
+fn discrete_device_cache_reserve_bounds_elastic_bank_without_reducing_resident_admission() {
+    use crate::memory::supply::discrete_device_cache_reserve;
 
     const MIB: u64 = 1 << 20;
     const VRAM: u64 = 23 * GB; // A10G 23 GiB
@@ -3051,9 +3053,10 @@ fn cuda_device_cache_reserve_bounds_elastic_bank_without_reducing_resident_admis
     const COMMITTED: u64 = 10 * GB;
     const EXTERNAL_CTX: u64 = 260 * MIB;
 
-    assert_eq!(cuda_context_cache_reserve(VRAM), RESERVE);
-    assert_eq!(cuda_context_cache_reserve(12 * GB), 384 * MIB);
-    assert_eq!(cuda_context_cache_reserve(8 * GB), 384 * MIB);
+    assert_eq!(discrete_device_cache_reserve(VRAM), RESERVE);
+    assert_eq!(discrete_device_cache_reserve(16 * GB), 512 * MIB);
+    assert_eq!(discrete_device_cache_reserve(12 * GB), 384 * MIB);
+    assert_eq!(discrete_device_cache_reserve(8 * GB), 384 * MIB);
 
     let (_scope, ledger, _pool) = host();
     let mut clock = Clock::new();
