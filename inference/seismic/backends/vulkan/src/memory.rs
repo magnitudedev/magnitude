@@ -25,8 +25,8 @@ use crate::device::Inner;
 use crate::instance::Instance;
 use ash::vk;
 use seismic_compiler::blocks::{
-    charge_block, first_fit, largest_shared, takes_own_block, FreeRanges, PackedBlock,
-    BLOCK_CAP_BYTES,
+    charge_block, charge_block_for, first_fit, largest_shared, takes_own_block, FreeRanges,
+    PackedBlock, BLOCK_CAP_BYTES,
 };
 use seismic_compiler::errors::ExecutionError;
 use seismic_memory::entry::{CarvableCharge, Carved, Change, Charge, Entry, Store, Wiring};
@@ -116,6 +116,10 @@ enum Held {
 /// driver's, of these bytes, admitted by none.
 enum Holding<'c> {
     Charged(&'c Change, Charge),
+    /// A pool block whose first allocation's `bytes` are charged directly to
+    /// the caller's entry (`first`, drawing on its already-committed claim)
+    /// and whose uncarved remainder is charged to the store's `own` entry.
+    ChargedWithFirst(&'c Change, Charge, Charge),
     Driver(u64),
 }
 
@@ -123,14 +127,26 @@ impl Holding<'_> {
     fn bytes(&self) -> u64 {
         match self {
             Self::Charged(_, charge) => charge.bytes(),
+            Self::ChargedWithFirst(_, remainder, first) => {
+                remainder
+                    .bytes()
+                    .checked_add(first.bytes())
+                    .expect("carvable block bytes overflow")
+            }
             Self::Driver(bytes) => *bytes,
         }
     }
 
     /// Take `bytes` more.
     fn grow(&mut self, bytes: u64) -> Result<(), ExecutionError> {
+        if bytes == 0 {
+            return Ok(());
+        }
         match self {
             Self::Charged(change, charge) => charge.grow(*change, bytes).map_err(ExecutionError::from),
+            Self::ChargedWithFirst(change, remainder, _) => {
+                remainder.grow(*change, bytes).map_err(ExecutionError::from)
+            }
             Self::Driver(held) => {
                 *held += bytes;
                 Ok(())
@@ -138,10 +154,38 @@ impl Holding<'_> {
         }
     }
 
-    fn held(self) -> Held {
+    /// Charge mandatory driver alignment padding (`VkMemoryRequirements::size`
+    /// beyond usable buffer bytes). When the first allocation is already
+    /// admitted (`ChargedWithFirst`), fall back to recording the padding on
+    /// the block's `own` entry rather than refusing the admitted allocation
+    /// (matching CUDA's `charge_block_for` granularity rounding).
+    fn grow_padding(&mut self, bytes: u64) -> Result<(), ExecutionError> {
+        if bytes == 0 {
+            return Ok(());
+        }
         match self {
-            Self::Charged(_, charge) => Held::Charged(charge.into_carvable()),
-            Self::Driver(_) => Held::Driver,
+            Self::Charged(change, charge) => charge.grow(*change, bytes).map_err(ExecutionError::from),
+            Self::ChargedWithFirst(change, remainder, _) => {
+                if remainder.grow(*change, bytes).is_err() {
+                    remainder.took_more(*change, bytes);
+                }
+                Ok(())
+            }
+            Self::Driver(held) => {
+                *held += bytes;
+                Ok(())
+            }
+        }
+    }
+
+    fn held(self) -> (Held, Option<Carved>) {
+        match self {
+            Self::Charged(_, charge) => (Held::Charged(charge.into_carvable()), None),
+            Self::ChargedWithFirst(_, remainder, first) => {
+                let (carvable, carved) = remainder.into_carvable_with_first(first);
+                (Held::Charged(carvable), Some(carved))
+            }
+            Self::Driver(_) => (Held::Driver, None),
         }
     }
 }
@@ -192,6 +236,15 @@ impl Block {
         self.free
             .lock()
             .expect("block free list lock is never poisoned")
+    }
+
+    /// Carve `bytes` for `entry` from this pool block's charge, which its
+    /// store's own entry holds.
+    fn carve(&self, entry: &Arc<dyn Entry>, bytes: u64) -> Carved {
+        let Held::Charged(charge) = &self.held else {
+            panic!("a range carved from a block the driver holds: only a pool's ranges are carved");
+        };
+        charge.carve(entry, bytes)
     }
 }
 
@@ -696,11 +749,8 @@ impl Memory {
     }
 
     /// A range of `bytes` of `pool`, on a block of its own where it takes
-    /// one (`takes_own_block`); a new block is charged to its store's own
-    /// entry ([`Self::create`]). The caller carves an allocation's bytes
-    /// from that entry for its own ([`Range::carve`]); the device's own
-    /// ranges (argument chunks, staging) stay the store's own, until the
-    /// device is destroyed.
+    /// one (`takes_own_block`), kept on its store's own entry (argument
+    /// chunks, staging) until the device is destroyed.
     pub(crate) fn allocate(
         &self,
         device: &ash::Device,
@@ -709,6 +759,37 @@ impl Memory {
         alignment: u64,
         stores: &MemoryStores,
     ) -> Result<Range, ExecutionError> {
+        let (range, carved) = self.allocate_inner(device, pool, bytes, alignment, stores, None)?;
+        debug_assert!(carved.is_none());
+        Ok(range)
+    }
+
+    /// A range of `bytes` of `pool` charged to `entry`: carved from an
+    /// existing shared block when one fits, or charged directly to `entry`
+    /// (`charge_block_for`) when opening a new block so an already-committed
+    /// claim is never double-charged against the store's own entry.
+    pub(crate) fn allocate_for(
+        &self,
+        device: &ash::Device,
+        pool: &Arc<Pool>,
+        bytes: u64,
+        alignment: u64,
+        stores: &MemoryStores,
+        entry: &Arc<dyn Entry>,
+    ) -> Result<(Range, Carved), ExecutionError> {
+        let (range, carved) = self.allocate_inner(device, pool, bytes, alignment, stores, Some(entry))?;
+        Ok((range, carved.expect("an entry-backed allocation always returns a carved charge")))
+    }
+
+    fn allocate_inner(
+        &self,
+        device: &ash::Device,
+        pool: &Arc<Pool>,
+        bytes: u64,
+        alignment: u64,
+        stores: &MemoryStores,
+        entry: Option<&Arc<dyn Entry>>,
+    ) -> Result<(Range, Option<Carved>), ExecutionError> {
         if bytes > self.max_allocation {
             return Err(ExecutionError::AllocationCapacity {
                 required: bytes.into(),
@@ -720,32 +801,43 @@ impl Memory {
         let mut blocks = pool.blocks.lock().expect("pool lock is never poisoned");
         let found = first_fit(&blocks, bytes, alignment)
             .map(|(index, offset)| (blocks[index].clone(), offset));
-        let (block, offset) = match found {
-            Some(found) => found,
+        let (block, offset, carved) = match found {
+            Some((block, offset)) => {
+                let carved = entry.map(|entry| block.carve(entry, bytes));
+                (block, offset, carved)
+            }
             None => {
-                let block = self.create(device, pool, largest_shared(&blocks), bytes, stores)?;
+                let (block, carved) =
+                    self.create(device, pool, largest_shared(&blocks), bytes, stores, entry)?;
                 let offset = block
                     .take(bytes, alignment)
                     .expect("a new block holds its first allocation");
                 blocks.push(block.clone());
-                (block, offset)
+                (block, offset, carved)
             }
         };
-        Ok(Range {
-            pool: Some(pool.clone()),
-            block,
-            offset,
-            bytes,
-        })
+        Ok((
+            Range {
+                pool: Some(pool.clone()),
+                block,
+                offset,
+                bytes,
+            },
+            carved,
+        ))
     }
 
-    /// A new block of `pool` for an allocation of `bytes`, its memory's
-    /// bytes charged to its store's own entry
-    /// ([`seismic_compiler::blocks::charge_block`]), sized by its heaps'
-    /// budgets as the driver reports them now. A passable type is passed over when
-    /// its heap's budget cannot hold the allocation or its heap refuses the
-    /// block, and a non-dedicated block holds only the allocation where its
-    /// heap's budget cannot hold the grown slab (including on `pool.last`).
+    /// A new block of `pool` for an allocation of `bytes`, sized by its heaps'
+    /// budgets as the driver reports them now. When `entry` is `Some`, the
+    /// first allocation's `bytes` are charged directly to `entry`
+    /// ([`seismic_compiler::blocks::charge_block_for`]) and only the uncarved
+    /// remainder is charged to the store's own entry; otherwise the whole block
+    /// is charged to the store's own entry
+    /// ([`seismic_compiler::blocks::charge_block`]). A passable type is passed
+    /// over when its heap's budget cannot hold the allocation or its heap
+    /// refuses the block, and a non-dedicated block holds only the allocation
+    /// where its heap's budget cannot hold the grown slab (including on
+    /// `pool.last`).
     fn create(
         &self,
         device: &ash::Device,
@@ -753,45 +845,67 @@ impl Memory {
         largest: Option<u64>,
         bytes: u64,
         stores: &MemoryStores,
-    ) -> Result<Arc<Block>, ExecutionError> {
+        entry: Option<&Arc<dyn Entry>>,
+    ) -> Result<(Arc<Block>, Option<Carved>), ExecutionError> {
         // Each charge, the memory its block takes and the record of it are
         // one change.
         let change = stores.pool(pool, &pool.last).own().change();
         let budgets = crate::device::heap_budgets(&self.instance, self.physical);
         let dedicated = takes_own_block(bytes, self.block_cap);
         let shader_addressable = pool.charged.shader_addressable();
-        let charge = |candidate: &PoolType| charge_block(&change, &stores.pool(pool, candidate).own(), largest, self.block_cap, bytes, 1);
         // The least a new block of the allocation holds.
         let least = bytes.max(self.least_object);
+        let charge = |candidate: &PoolType, room: u64| -> Result<Holding<'_>, ExecutionError> {
+            let own = stores.pool(pool, candidate).own();
+            match entry {
+                Some(entry) => {
+                    let (mut remainder, first) = charge_block_for(
+                        &change,
+                        &own,
+                        entry,
+                        largest,
+                        self.block_cap,
+                        bytes,
+                        1,
+                    )?;
+                    let total = remainder.bytes() + first.bytes();
+                    let trim = trim_for_room(total, least, room, dedicated);
+                    if trim > 0 {
+                        remainder.shrink(&change, trim);
+                    }
+                    Ok(Holding::ChargedWithFirst(&change, remainder, first))
+                }
+                None => {
+                    let mut charged = charge_block(&change, &own, largest, self.block_cap, bytes, 1)?;
+                    let trim = trim_for_room(charged.bytes(), least, room, dedicated);
+                    if trim > 0 {
+                        charged.shrink(&change, trim);
+                    }
+                    Ok(Holding::Charged(&change, charged))
+                }
+            }
+        };
         for candidate in &pool.passable {
             let heap = budgets[candidate.heap as usize];
             let room = heap.budget.saturating_sub(heap.usage);
             if least > room {
                 continue;
             }
-            let mut charged = match charge(candidate) {
-                Ok(charged) => charged,
+            let holding = match charge(candidate, room) {
+                Ok(holding) => holding,
                 Err(error) if error.capacity_refusal().is_some() => continue,
                 Err(error) => return Err(error),
             };
-            let trim = trim_for_room(charged.bytes(), least, room, dedicated);
-            if trim > 0 {
-                charged.shrink(&change, trim);
-            }
-            match create_block(self, device, *candidate, dedicated, shader_addressable, Holding::Charged(&change, charged)) {
-                Ok(block) => return Ok(block),
+            match create_block(self, device, *candidate, dedicated, shader_addressable, holding) {
+                Ok(created) => return Ok(created),
                 Err(error) if error.capacity_refusal().is_some() => {}
                 Err(error) => return Err(error),
             }
         }
-        let mut charged = charge(&pool.last)?;
         let heap = budgets[pool.last.heap as usize];
         let room = heap.budget.saturating_sub(heap.usage);
-        let trim = trim_for_room(charged.bytes(), least, room, dedicated);
-        if trim > 0 {
-            charged.shrink(&change, trim);
-        }
-        create_block(self, device, pool.last, dedicated, shader_addressable, Holding::Charged(&change, charged))
+        let holding = charge(&pool.last, room)?;
+        create_block(self, device, pool.last, dedicated, shader_addressable, holding)
     }
 
     /// Live headroom for additional dedicated pool blocks on a discrete
@@ -845,7 +959,9 @@ impl Memory {
         // The charge, the memory and the record of it are one change.
         let change = entry.change();
         let charge = Charge::take(&change, entry, bytes, Wiring::Pageable)?;
-        let block = create_block(self, device, pool, true, true, Holding::Charged(&change, charge))?;
+        let (block, carved) =
+            create_block(self, device, pool, true, true, Holding::Charged(&change, charge))?;
+        debug_assert!(carved.is_none());
         Ok(Range { pool: None, block, offset: 0, bytes })
     }
 
@@ -855,7 +971,8 @@ impl Memory {
     /// ([`Held::Driver`]), freed when its range is released.
     pub(crate) fn driver_block(&self, device: &ash::Device, kind: u32, bytes: u64) -> Result<Range, ExecutionError> {
         let (bytes, pool) = self.own_block(kind, bytes)?;
-        let block = create_block(self, device, pool, true, true, Holding::Driver(bytes))?;
+        let (block, carved) = create_block(self, device, pool, true, true, Holding::Driver(bytes))?;
+        debug_assert!(carved.is_none());
         Ok(Range { pool: None, block, offset: 0, bytes })
     }
 
@@ -1092,7 +1209,7 @@ fn create_block(
     dedicated: bool,
     shader_addressable: bool,
     mut holding: Holding<'_>,
-) -> Result<Arc<Block>, ExecutionError> {
+) -> Result<(Arc<Block>, Option<Carved>), ExecutionError> {
     // Every memory object holds at least the device's least
     // (`Memory::least_object`), its free space a pool block's to use and
     // a block of its own's to strand.
@@ -1109,7 +1226,7 @@ fn create_block(
         ExecutionError::AllocationFailed,
     )?;
     let requirements = unsafe { device.get_buffer_memory_requirements(buffer) };
-    let refuse = |error: ExecutionError| -> Result<Arc<Block>, ExecutionError> {
+    let refuse = |error: ExecutionError| -> Result<(Arc<Block>, Option<Carved>), ExecutionError> {
         unsafe { device.destroy_buffer(buffer, None) };
         Err(error)
     };
@@ -1120,7 +1237,7 @@ fn create_block(
         )));
     }
     let allocated_bytes = requirements.size.max(bytes);
-    if let Err(refused) = holding.grow(allocated_bytes - bytes) {
+    if let Err(refused) = holding.grow_padding(allocated_bytes - bytes) {
         return refuse(refused);
     }
     // The charge taken, the block's memory joins the heap within one
@@ -1178,6 +1295,7 @@ fn create_block(
     let address = shader_addressable.then(|| unsafe {
         device.get_buffer_device_address(&vk::BufferDeviceAddressInfo::default().buffer(buffer))
     });
+    let (held, carved) = holding.held();
     let block = Arc::new(Block {
         kind: pool.kind,
         memory_type: pool.memory_type,
@@ -1190,10 +1308,10 @@ fn create_block(
         mapped,
         dedicated,
         free: Mutex::new(FreeRanges::new(bytes)),
-        held: holding.held(),
+        held,
     });
     memory_owner.count(&block);
-    Ok(block)
+    Ok((block, carved))
 }
 
 /// A range of a block. [`Buffer`] releases it on drop; the device's own
@@ -1221,15 +1339,6 @@ impl Range {
 
     pub(crate) fn raw(&self) -> vk::Buffer {
         self.block.buffer
-    }
-
-    /// The range's bytes carved for `entry` from its pool block's, which
-    /// its store's own entry holds.
-    pub(crate) fn carve(&self, entry: &Arc<dyn Entry>) -> Carved {
-        let Held::Charged(charge) = &self.block.held else {
-            panic!("a range carved from a block the driver holds: only a pool's ranges are carved");
-        };
-        charge.carve(entry, self.bytes)
     }
 
     /// Offset of the range in its block's `VkBuffer`.
@@ -1635,5 +1744,94 @@ mod tests {
         // Out-of-range kind or zero mask returns Err cleanly.
         assert!(pool_type(&layout, 99, u32::MAX).is_err());
         assert!(pool_type(&layout, 0, 0).is_err());
+    }
+
+    #[test]
+    fn charged_with_first_avoids_double_charging_own_and_tolerates_padding() {
+        const MIB: u64 = 1 << 20;
+        let identity = seismic_topology::StoreIdentity::HostRam;
+        // Mirrors a tight 16 GB Vulkan store after bank growth: `own` has less
+        // free room than the 300 MiB dedicated allocation, while `entry`
+        // (`constants_claim`) already covers the full 300 MiB.
+        let own_tally = seismic_memory::entry::Tally::limited(identity.clone(), 0);
+        let entry_tally = seismic_memory::entry::Tally::limited(identity, 300 * MIB);
+        let own: Arc<dyn Entry> = Arc::new(own_tally.clone());
+        let entry: Arc<dyn Entry> = Arc::new(entry_tally.clone());
+        let change = own.change();
+
+        let (remainder, first) = charge_block_for(
+            &change,
+            &own,
+            &entry,
+            None,
+            BLOCK_CAP_BYTES,
+            300 * MIB,
+            1,
+        )
+        .expect("dedicated block draws directly from entry even with 0 own room");
+        assert_eq!(first.bytes(), 300 * MIB);
+        assert_eq!(remainder.bytes(), 0);
+
+        let mut holding = Holding::ChargedWithFirst(&change, remainder, first);
+        assert_eq!(holding.bytes(), 300 * MIB);
+        // Mandatory VkMemoryRequirements::size rounding (e.g. 64 KiB) is
+        // recorded on `own` without refusing the already-admitted allocation.
+        holding.grow_padding(65_536).unwrap();
+        assert_eq!(holding.bytes(), 300 * MIB + 65_536);
+
+        let (Held::Charged(carvable), Some(carved)) = holding.held() else {
+            panic!("ChargedWithFirst must yield Held::Charged and Carved");
+        };
+        assert_eq!(carvable.bytes(), 300 * MIB + 65_536);
+        assert_eq!(carvable.uncarved_bytes(), 65_536);
+        assert_eq!(carved.bytes(), 300 * MIB);
+        assert_eq!(entry_tally.held(), 300 * MIB);
+        assert_eq!(own_tally.held(), 65_536);
+
+        // Buffer::drop drops `carved` first, then Block::free releases `carvable`.
+        drop(carved);
+        assert_eq!(entry_tally.held(), 0);
+        assert_eq!(own_tally.held(), 300 * MIB + 65_536);
+        carvable.release(&change);
+        assert_eq!(own_tally.held(), 0);
+        assert_eq!(entry_tally.held(), 0);
+    }
+
+    #[test]
+    fn charged_with_first_trim_for_room_only_shrinks_uncarved_remainder() {
+        const MIB: u64 = 1 << 20;
+        let identity = seismic_topology::StoreIdentity::HostRam;
+        let own_tally = seismic_memory::entry::Tally::unbounded(identity.clone());
+        let entry_tally = seismic_memory::entry::Tally::unbounded(identity);
+        let own: Arc<dyn Entry> = Arc::new(own_tally.clone());
+        let entry: Arc<dyn Entry> = Arc::new(entry_tally.clone());
+        let change = own.change();
+
+        let (mut remainder, first) = charge_block_for(
+            &change,
+            &own,
+            &entry,
+            Some(64 * MIB),
+            BLOCK_CAP_BYTES,
+            4 * MIB,
+            1,
+        )
+        .unwrap();
+        assert_eq!(first.bytes(), 4 * MIB);
+        assert_eq!(remainder.bytes(), 124 * MIB);
+
+        let total = remainder.bytes() + first.bytes();
+        let trim = trim_for_room(total, 4 * MIB, 32 * MIB, false);
+        assert_eq!(trim, 124 * MIB);
+        remainder.shrink(&change, trim);
+        assert_eq!(remainder.bytes(), 0);
+        assert_eq!(first.bytes(), 4 * MIB);
+        assert_eq!(own_tally.held(), 0);
+        assert_eq!(entry_tally.held(), 4 * MIB);
+
+        drop(remainder);
+        drop(first);
+        assert_eq!(own_tally.held(), 0);
+        assert_eq!(entry_tally.held(), 0);
     }
 }

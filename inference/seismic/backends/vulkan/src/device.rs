@@ -1121,7 +1121,8 @@ impl Device {
         self.allocate_in(self.opened.pools.pool(&self.inner.memory, kinds)?, bytes, alignment, entry)
     }
 
-    /// A range of `pool`, its bytes carved from its block for `entry`.
+    /// A range of `pool`, its bytes charged to `entry` directly on a new block
+    /// or carved from an existing shared block.
     fn allocate_in(
         &self,
         pool: Arc<Pool>,
@@ -1129,11 +1130,10 @@ impl Device {
         alignment: u64,
         entry: &Arc<dyn Entry>,
     ) -> Result<Buffer, ExecutionError> {
-        let range = self
+        let (range, carved) = self
             .inner
             .memory
-            .allocate(&self.inner.device, &pool, bytes, alignment, &self.opened.stores)?;
-        let carved = range.carve(entry);
+            .allocate_for(&self.inner.device, &pool, bytes, alignment, &self.opened.stores, entry)?;
         Ok(Buffer::new(self.inner.clone(), range, Some(carved)))
     }
 
@@ -2303,6 +2303,49 @@ mod reconcile_tests {
             let charged = device.driver_charged();
             assert_eq!(charged, unheld, "the charge is what the driver holds");
             assert!(charged.abs_diff(before) < BLOCK / 2, "a block charged as the driver's: moved {}", charged.abs_diff(before));
+        }
+    }
+
+    /// A dedicated pool allocation (`> 32 MiB`) draws directly from its
+    /// caller's `entry` rather than double-charging the store's `own` entry,
+    /// so it succeeds even when `own` has less free room than the allocation
+    /// (e.g. `target_binding_constants` allocated after bank growth leaves
+    /// tight free room on a 16 GB discrete Vulkan GPU).
+    #[test]
+    fn allocate_dedicated_block_under_tight_own_room_draws_from_entry() {
+        const MIB: u64 = 1 << 20;
+        let Ok(discovered) = crate::discover() else {
+            return;
+        };
+        for description in discovered.into_iter().filter(|d| d.floor.is_ok()) {
+            let own_tally = seismic_memory::entry::Tally::unbounded(
+                seismic_topology::StoreIdentity::HostRam,
+            );
+            let store: Arc<dyn seismic_memory::entry::Store> = Arc::new(own_tally.clone());
+            let stores = crate::MemoryStores {
+                kinds: (0..description.info.memory.types.len() as u32)
+                    .map(|kind| (kind, store.clone()))
+                    .collect(),
+                host: store,
+            };
+            let device = Device::open(description.info.uuid, stores, &Default::default())
+                .expect("a device meeting the floor opens");
+            let baseline_own = own_tally.held();
+            own_tally.bound(baseline_own + 16 * MIB);
+
+            let entry_tally = seismic_memory::entry::Tally::limited(
+                seismic_topology::StoreIdentity::HostRam,
+                128 * MIB,
+            );
+            let entry: Arc<dyn Entry> = Arc::new(entry_tally.clone());
+            let buf = device
+                .allocate(64 * MIB, 256, &entry)
+                .expect("dedicated allocation draws from entry instead of double-charging own");
+            assert_eq!(entry_tally.held(), 64 * MIB);
+            assert!(own_tally.held() < baseline_own + 16 * MIB);
+            drop(buf);
+            assert_eq!(entry_tally.held(), 0);
+            assert_eq!(own_tally.held(), baseline_own);
         }
     }
 
