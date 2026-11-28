@@ -184,13 +184,41 @@ pub struct StorageProbe {
     workers: FullWorkers,
 }
 
+#[derive(Debug)]
+struct StorageProbePrepareError {
+    path: PathBuf,
+    source: std::io::Error,
+}
+
+impl std::fmt::Display for StorageProbePrepareError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "cannot prepare storage calibration probe at {}: {}; calibration needs a probe on the model-store filesystem; check that the store is writable",
+            self.path.display(),
+            self.source,
+        )
+    }
+}
+
+impl std::error::Error for StorageProbePrepareError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(&self.source)
+    }
+}
+
 impl StorageProbe {
     /// The probe file in `directory`, written there first where it is not
     /// whole, its pages then dropped from the host's file cache.
     pub fn open(directory: &Path) -> Result<Self, Error> {
         let path = Self::path(directory);
         if std::fs::metadata(&path).map_or(true, |metadata| metadata.len() != STORAGE_PROBE_BYTES) {
-            Self::write(directory, &path)?;
+            Self::write(directory, &path).map_err(|source| {
+                let kind = source.kind();
+                let error = StorageProbePrepareError { path: path.clone(), source };
+                tracing::warn!(error = %error, "storage calibration probe could not be prepared");
+                std::io::Error::new(kind, error)
+            })?;
         }
         let file = std::fs::File::open(&path)?;
         evict(&file, STORAGE_PROBE_BYTES)?;
@@ -211,8 +239,8 @@ impl StorageProbe {
     /// ([`crate::Shared::publish`]), so a job killed while writing, or two
     /// writing at once, leave no short probe file, and the temporary file of
     /// one killed is the store's to sweep.
-    fn write(directory: &Path, path: &Path) -> Result<(), Error> {
-        let store = Store::open(directory.to_owned(), Privacy::Shared).map_err(|e| Error::Io(std::io::Error::other(e)))?;
+    fn write(directory: &Path, path: &Path) -> std::io::Result<()> {
+        let store = Store::open(directory.to_owned(), Privacy::Shared).map_err(std::io::Error::other)?;
         store
             .shared()
             .and_then(|shared| {
@@ -229,7 +257,7 @@ impl StorageProbe {
                     Ok(())
                 })
             })
-            .map_err(|e| Error::Io(std::io::Error::other(e)))?;
+            .map_err(std::io::Error::other)?;
         Ok(())
     }
 
@@ -272,6 +300,32 @@ fn next(mut state: u64) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn storage_probe_prepare_error_preserves_store_failure() {
+        // A file cannot be used as a directory, even when tests run as root.
+        let store = Path::new(env!("CARGO_MANIFEST_DIR")).join("Cargo.toml");
+        let path = StorageProbe::path(&store);
+        let Err(error) = StorageProbe::open(&store) else {
+            panic!("a regular file must not be accepted as a model store");
+        };
+        let message = error.to_string();
+        assert!(message.contains(&path.display().to_string()), "{message}");
+        assert!(message.contains("model-store filesystem"), "{message}");
+        let Error::Io(error) = error else {
+            panic!("expected a probe I/O error");
+        };
+        let context = error
+            .get_ref()
+            .and_then(|error| error.downcast_ref::<StorageProbePrepareError>())
+            .expect("expected typed probe context");
+        let source = std::error::Error::source(context)
+            .and_then(|error| error.downcast_ref::<std::io::Error>())
+            .expect("expected the original I/O source");
+        assert_eq!(error.kind(), source.kind());
+        let store_error = source.get_ref().expect("expected the original store error");
+        assert!(message.contains(&store_error.to_string()), "{message}");
+    }
 
     #[test]
     fn persistent_workers_run_repeated_lone_and_full_passes() {
