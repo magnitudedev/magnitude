@@ -1,6 +1,6 @@
 import { renderToStaticMarkup } from "react-dom/server"
 import { describe, expect, it } from "vitest"
-import { ExploreView, type RunnableFamily } from "./explore-view"
+import { ExploreView, type ExploreHuggingFaceAccess, type RunnableFamily } from "./explore-view"
 import type { OfferedModel } from "./expanding-model"
 import type { QuantView } from "./view"
 
@@ -8,9 +8,10 @@ const render = (
   query: string,
   results: Parameters<typeof ExploreView>[0]["results"],
   families: readonly RunnableFamily[] = [],
+  huggingFace?: ExploreHuggingFaceAccess,
 ) => renderToStaticMarkup(
   <ExploreView query={query} setQuery={() => {}} results={results} families={families} owned={new Set()}
-    download={() => null} useOpened={model => model} />,
+    download={() => null} useOpened={model => model} huggingFace={huggingFace} />,
 )
 
 const makePick = (key: string, name: string, note?: string) => {
@@ -119,5 +120,38 @@ describe("Explore models", () => {
     const html = render("phi", { _tag: "Results", rows: [], more: { _tag: "Manual", onMore: () => {} } })
     expect(html).toContain("No models in the most downloaded Hugging Face results")
     expect(html).toContain("Check more results")
+  })
+
+  it("offers Sign in and an accept-terms link on gated rows when signed out of Hugging Face", () => {
+    const html = render(
+      "gemma",
+      {
+        _tag: "Results",
+        rows: [{ _tag: "Unchecked", key: "google/gemma-4-31B-it", name: "Gemma 4 31B It", lab: undefined, gated: true, retrying: false, retry: () => {} }],
+        more: null,
+      },
+      [],
+      { state: "SignedOut", starting: false, onSignIn: () => {} },
+    )
+    expect(html).toContain("Sign in")
+    expect(html).toContain("https://huggingface.co/google/gemma-4-31B-it")
+    expect(html).not.toContain("Try again")
+  })
+
+  it("offers Accept terms and Check again on gated rows when already signed in to Hugging Face", () => {
+    const html = render(
+      "gemma",
+      {
+        _tag: "Results",
+        rows: [{ _tag: "Unchecked", key: "google/gemma-4-31B-it", name: "Gemma 4 31B It", lab: undefined, gated: true, retrying: false, retry: () => {} }],
+        more: null,
+      },
+      [],
+      { state: "SignedIn", starting: false, onSignIn: () => {} },
+    )
+    expect(html).toContain("Accept terms")
+    expect(html).toContain("Check again")
+    expect(html).toContain("https://huggingface.co/google/gemma-4-31B-it")
+    expect(html).not.toContain("Try again")
   })
 })

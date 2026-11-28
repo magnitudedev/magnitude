@@ -1,16 +1,17 @@
-import { useContext, useEffect, useMemo, useState } from "react"
+import { useContext, useEffect, useMemo, useRef, useState } from "react"
 import { Equal, Option } from "effect"
 import { Atom, RegistryContext, Result, useAtomSet, useAtomValue } from "@effect-atom/atom-react"
 import { CheckIcon, CircleNotchIcon, DownloadSimpleIcon, LightningIcon } from "@phosphor-icons/react"
 import { HUGGING_FACE_SEARCH_QUERY_MAXIMUM_BYTES, repositoryDisplayName, type CatalogFormModelId, type DrafterChoice, type HuggingFaceRepositoryCheck, type HuggingFaceRepositoryId, type HuggingFaceSearchResponse, type HuggingFaceSearchResult, type LocalModel } from "@magnitudedev/sdk"
 import { SEARCH_BATCH_SIZE, drafterCandidateDownloadBytes, formatStorageSize, readSearchChecks, useAgentClient, useLocalModelMutations, useLocalModels, type AgentClient, type QuickSearchCheck, type SearchChecksProgress, type ServingMemory } from "@magnitudedev/client-common"
 import { Button } from "../ui/button"
+import { useHuggingFaceSignIn, visibleDeviceCode } from "../hugging-face"
 import { labForDeveloper } from "../model-logo"
 import { downloadContents, transferLabel, methodName, onThisComputer, quantView, transferOf } from "./data"
 import { AUTO_DRAFTER, DrafterSection, drafterChoice, useDrafters, type DrafterSelection } from "./drafter-picker"
 import type { QuantView } from "./view"
 import type { OfferedModel } from "./expanding-model"
-import { ExploreView, type ExploreMore, type ExploreResults, type ExploreRow } from "./explore-view"
+import { ExploreView, type ExploreHuggingFaceAccess, type ExploreMore, type ExploreResults, type ExploreRow } from "./explore-view"
 import {
   downloadableRecommendations,
   recommendationsSettled,
@@ -501,6 +502,7 @@ function useSearchResults(
   memory: ServingMemory,
   opened: Atom.Writable<string | null>,
   hovered: Atom.Writable<string | null>,
+  signedIn: boolean,
 ): ExploreResults {
   const client = useAgentClient()
   const registry = useContext(RegistryContext)
@@ -511,6 +513,7 @@ function useSearchResults(
   const setReleasedFrontier = useAtomSet(releasedFrontier)
   const setOpened = useAtomSet(opened)
   const setHovered = useAtomSet(hovered)
+  const wasSignedIn = useRef(signedIn)
 
   useEffect(() => {
     setPaging(initialPaging(settled))
@@ -590,6 +593,21 @@ function useSearchResults(
     })
   }, [canAutoAdvance, pageValue, nextCursor, settled, revealedCount, setPaging])
 
+  useEffect(() => {
+    if (signedIn && !wasSignedIn.current) {
+      const resultsByKey = new Map<string, HuggingFaceSearchResult>(listed.map(result => [result.repository, result]))
+      for (const key of schedule.revealed) {
+        const result = resultsByKey.get(key)
+        const check = schedule.checks.get(key)
+        if (!result || !result.gated || !check) continue
+        if (quickState(check, true) === "Unchecked") {
+          registry.refresh(client.Models.CheckHuggingFaceRepository(checkInput(result)))
+        }
+      }
+    }
+    wasSignedIn.current = signedIn
+  }, [signedIn, listed, schedule, registry, client])
+
   const loadMore = () => {
     setPaging((state) => {
       const base = state.query === settled ? state : initialPaging(settled)
@@ -639,6 +657,27 @@ function useSearchResults(
 
 /** Explore models on the service's data: curated Magnitude Picks in idle & matching search, plus Hugging Face search. */
 export function Explore(props: ExploreProps) {
+  const client = useAgentClient()
+  const account = useAtomValue(client.HuggingFace.GetHuggingFaceAccount({})).result
+  const { signIn, starting, failure, deviceCode, copyCode, openVerification } = useHuggingFaceSignIn()
+  const accountValue = Result.isSuccess(account) ? account.value : null
+  const hfState: ExploreHuggingFaceAccess["state"] = accountValue?._tag === "SignedIn"
+    ? "SignedIn"
+    : accountValue?._tag === "SigningIn"
+      ? "SigningIn"
+      : "SignedOut"
+  const activeDeviceCode = accountValue
+    ? Option.getOrUndefined(visibleDeviceCode(accountValue, deviceCode, Date.now()))
+    : undefined
+  const huggingFace: ExploreHuggingFaceAccess = {
+    state: hfState,
+    starting,
+    failure,
+    deviceCode: activeDeviceCode,
+    onSignIn: signIn,
+    onCopyCode: copyCode,
+    onOpenVerification: openVerification,
+  }
   const trimmed = props.query.trim()
   const settled = useDebounced(trimmed, 350)
   const tooLong = new TextEncoder().encode(settled).length > HUGGING_FACE_SEARCH_QUERY_MAXIMUM_BYTES
@@ -646,7 +685,7 @@ export function Explore(props: ExploreProps) {
   const hovered = useMemo(() => Atom.make<string | null>(null), [])
   const setOpened = useAtomSet(opened)
   const setHovered = useAtomSet(hovered)
-  const searched = useSearchResults(tooLong ? "" : settled, trimmed, props.first, props.memory, opened, hovered)
+  const searched = useSearchResults(tooLong ? "" : settled, trimmed, props.first, props.memory, opened, hovered, hfState === "SignedIn")
   const [selections, setSelections] = useState<Readonly<Record<string, DrafterSelection>>>({})
   const download = useDownload(selections)
   const drafters = drafterFor(selections, (key, selection) => setSelections(current => ({ ...current, [key]: selection })))
@@ -664,6 +703,6 @@ export function Explore(props: ExploreProps) {
     : { ...searched, picks: matchedPicks }
   const useOpened = useMemo(() => useRepositoryQuants(props.memory), [props.memory])
   return <ExploreView query={props.query} setQuery={props.setQuery} families={props.recommendations.families} owned={props.owned}
-    results={results} download={download} drafters={drafters} useOpened={useOpened}
+    results={results} download={download} drafters={drafters} useOpened={useOpened} huggingFace={huggingFace}
     onExpand={setOpened} onPrefetch={setHovered} />
 }

@@ -1,10 +1,13 @@
 import { useEffect, useRef, useState, type ReactNode } from "react"
-import { CircleNotchIcon, InfoIcon, MagnifyingGlassIcon, XIcon } from "@phosphor-icons/react"
+import { ArrowUpRightIcon, CircleNotchIcon, InfoIcon, MagnifyingGlassIcon, XIcon } from "@phosphor-icons/react"
+import { huggingFaceRepositoryUrl } from "@magnitudedev/sdk"
 import { cn } from "@/lib/utils"
-import { Button } from "../ui/button"
+import { Button, buttonVariants } from "../ui/button"
 import { Input } from "../ui/input"
+import { DeviceCodePanel, type DeviceCode } from "../hugging-face"
+import type { NoticeContent } from "../error-notice"
 import { HuggingFaceLogo, LabLogo, type ModelLab } from "../model-logo"
-import { Badge, LabMark, cardClass } from "./parts"
+import { Badge, LabMark, RepositoryLink, cardClass } from "./parts"
 import { OfferedModelsSkeleton } from "./skeletons"
 import { ExpandingModel, type OfferedModel } from "./expanding-model"
 import type { Recommendation } from "./recommendations"
@@ -121,19 +124,75 @@ function OfferedCard({ model, expanded, prefetched, onPrefetch, download, drafte
   </div>
 }
 
-/** A search result whose check failed or ran out of time: its name, why when it is gated, and a way to check it again. */
-function UncheckedCard({ name, lab, gated, retrying, retry }: { name: string; lab: ModelLab | undefined; gated: boolean; retrying: boolean; retry: () => void }) {
-  return <div className={cn(cardClass, "grid grid-cols-[auto_minmax(0,1fr)_auto] items-center gap-4 px-4 py-3")}>
-    <LabMark lab={lab} className="size-10" />
-    <span className="min-w-0">
-      <span className="block truncate text-[14px] font-medium">{name}</span>
-      <span className="mt-0.5 block text-xs text-slate-500">{gated
-        ? "Gated on Hugging Face. Accept its terms there, signed in to Hugging Face in Magnitude, to check how it runs here."
-        : "Couldn't check how this runs here."}</span>
-    </span>
-    <Button size="sm" variant="outline" disabled={retrying} onClick={retry}>
-      {retrying ? <><CircleNotchIcon aria-hidden="true" className="motion-safe:animate-spin" />Checking…</> : "Try again"}
-    </Button>
+/** Hugging Face account state and sign-in trigger for gated search result cards. */
+export interface ExploreHuggingFaceAccess {
+  readonly state: "SignedOut" | "SigningIn" | "SignedIn"
+  readonly starting: boolean
+  readonly failure?: NoticeContent | undefined
+  readonly deviceCode?: DeviceCode | undefined
+  readonly onSignIn: () => void
+  readonly onCopyCode?: () => Promise<boolean>
+  readonly onOpenVerification?: () => void
+}
+
+/** A search result whose check failed or ran out of time: its name, why when it is gated, and the action to unblock it. */
+function UncheckedCard({ repository, name, lab, gated, retrying, retry, huggingFace, showSignInFeedback, onStartSignIn }: {
+  repository: string; name: string; lab: ModelLab | undefined; gated: boolean; retrying: boolean; retry: () => void
+  huggingFace?: ExploreHuggingFaceAccess | undefined
+  showSignInFeedback: boolean
+  onStartSignIn: () => void
+}) {
+  const hfState = huggingFace?.state ?? "SignedIn"
+  const description = !gated
+    ? "Couldn't check how this runs here."
+    : hfState === "SignedOut"
+      ? <>Gated on Hugging Face. Sign in and <RepositoryLink repository={repository}>accept its terms</RepositoryLink> to check this model.</>
+      : hfState === "SigningIn"
+        ? <>Gated on Hugging Face. Finish signing in, then <RepositoryLink repository={repository}>accept its terms</RepositoryLink> to check this model.</>
+        : "Gated on Hugging Face. Accept its terms on Hugging Face to check this model."
+  const actions = !gated
+    ? <Button size="sm" variant="outline" disabled={retrying} onClick={retry}>
+        {retrying ? <><CircleNotchIcon aria-hidden="true" className="motion-safe:animate-spin" />Checking…</> : "Try again"}
+      </Button>
+    : hfState === "SignedOut" && huggingFace
+      ? <Button size="sm" variant="outline" disabled={retrying || huggingFace.starting} onClick={onStartSignIn}>
+          {retrying
+            ? <><CircleNotchIcon aria-hidden="true" className="motion-safe:animate-spin" />Checking…</>
+            : huggingFace.starting
+              ? <><CircleNotchIcon aria-hidden="true" className="motion-safe:animate-spin" />Signing in…</>
+              : "Sign in"}
+        </Button>
+      : hfState === "SigningIn"
+        ? <Button size="sm" variant="outline" disabled>
+            <CircleNotchIcon aria-hidden="true" className="motion-safe:animate-spin" />Signing in…
+          </Button>
+        : <span className="flex shrink-0 items-center gap-1.5">
+            <a href={huggingFaceRepositoryUrl(repository)} target="_blank" rel="noreferrer" className={buttonVariants({ variant: "outline", size: "sm" })}>
+              Accept terms<ArrowUpRightIcon aria-hidden="true" />
+            </a>
+            <Button size="sm" variant="ghost" disabled={retrying} onClick={retry}>
+              {retrying ? <><CircleNotchIcon aria-hidden="true" className="motion-safe:animate-spin" />Checking…</> : "Check again"}
+            </Button>
+          </span>
+  return <div className={cn(cardClass, "px-4 py-3")}>
+    <div className="grid grid-cols-[auto_minmax(0,1fr)_auto] items-center gap-4">
+      <LabMark lab={lab} className="size-10" />
+      <span className="min-w-0">
+        <span className="block truncate text-[14px] font-medium">{name}</span>
+        <span className="mt-0.5 block text-xs text-slate-500">{description}</span>
+      </span>
+      {actions}
+    </div>
+    {gated && showSignInFeedback && hfState === "SignedOut" && huggingFace?.failure && (
+      <p role="alert" className="mt-2 pl-14 text-xs text-red-600 dark:text-red-400">
+        {huggingFace.failure.title}. {huggingFace.failure.description}
+      </p>
+    )}
+    {gated && showSignInFeedback && hfState === "SigningIn" && huggingFace?.deviceCode && huggingFace.onCopyCode && huggingFace.onOpenVerification && (
+      <div className="pl-14">
+        <DeviceCodePanel key={huggingFace.deviceCode.attemptId} code={huggingFace.deviceCode} onCopy={huggingFace.onCopyCode} onOpen={huggingFace.onOpenVerification} />
+      </div>
+    )}
   </div>
 }
 
@@ -152,16 +211,18 @@ export function ExploreIdle({ withPicks = false }: { withPicks?: boolean }) {
 }
 
 /** Explore models, a view of the Models page: curated Magnitude Picks in idle & matching search, plus Hugging Face search. */
-export function ExploreView({ query, setQuery, results, families, owned, download, drafters, useOpened, onExpand, onPrefetch }: {
+export function ExploreView({ query, setQuery, results, families, owned, download, drafters, useOpened, huggingFace, onExpand, onPrefetch }: {
   query: string; setQuery: (value: string) => void
   results: ExploreResults; families: readonly RunnableFamily[]; owned: ReadonlySet<string>; download: (model: OfferedModel, quant: QuantView) => ReactNode
   drafters?: (model: OfferedModel, quant: QuantView) => ReactNode
   useOpened: (model: OfferedModel, open: boolean) => OfferedModel
+  huggingFace?: ExploreHuggingFaceAccess | undefined
   onExpand?: (key: string | null) => void
   onPrefetch?: (key: string) => void
 }) {
   const [chosen, setExpanded] = useState<string | null | undefined>(undefined)
   const [quantChoices, setQuantChoices] = useState<Readonly<Record<string, string>>>({})
+  const [signInSource, setSignInSource] = useState<string | null>(null)
   const expanded = chosen ?? null
   const toggleExpanded = (model: OfferedModel) => {
     const next = expanded === model.key ? null : model.key
@@ -201,7 +262,9 @@ export function ExploreView({ query, setQuery, results, families, owned, downloa
       {pickCards && <div className={results.rows.length > 0 ? "mb-2" : "mb-4"}>{pickCards}</div>}
       {results.rows.length > 0 ? <>
         <div className="space-y-2">{results.rows.map(row => row._tag === "Unchecked"
-          ? <UncheckedCard key={row.key} name={row.name} lab={row.lab} gated={row.gated} retrying={row.retrying} retry={row.retry} />
+          ? <UncheckedCard key={row.key} repository={row.key} name={row.name} lab={row.lab} gated={row.gated} retrying={row.retrying} retry={row.retry}
+              huggingFace={huggingFace} showSignInFeedback={signInSource === row.key}
+              onStartSignIn={() => { setSignInSource(row.key); huggingFace?.onSignIn() }} />
           : card(row.model, undefined, row.prefetched))}</div>
         {results.more?._tag === "Loading" ? <div className="mt-2"><SearchStatus className="mt-4">Loading more results…</SearchStatus><OfferedModelsSkeleton count={2} /></div>
           : results.more?._tag === "Checking" ? <div className="mt-2"><SearchStatus className="mt-4">Checking more models…</SearchStatus><OfferedModelsSkeleton count={2} /></div>
